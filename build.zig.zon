@@ -1,0 +1,12 @@
+.{
+    .name = .zpm,
+    .version = "0.0.1",
+    .fingerprint = 0x61f1f4a69fb73bda,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
