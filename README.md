@@ -1,12 +1,18 @@
 <p align="center">
-  <img src="zpm.png" alt="ZPM" width="200" />
+  <img src="zpm.png" alt="zpm" width="180" />
 </p>
 
-<h1 align="center">ZPM</h1>
+<h1 align="center">zpm</h1>
 
 <p align="center">
-  <em>Über alles.</em><br/>
-  <sub>Hermetic Efficiency Interference Layer</sub>
+  <strong>The Zig package manager.</strong><br/>
+  <sub>Hermetic Efficiency Interference Layer — Über alles.</sub>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/zig-0.16%2B-f7a41d?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16+" />
+  <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT" />
+  <img src="https://img.shields.io/badge/platform-windows%20%7C%20macos%20%7C%20linux-lightgrey?style=flat-square" alt="Platform" />
 </p>
 
 <p align="center">
@@ -14,171 +20,197 @@
 </p>
 
 <p align="center">
-  A coherent family of low-level Zig modules for building native Windows applications with OpenGL rendering.
+  Officially supports <strong>Zig 0.16+</strong> and <a href="https://github.com/sb0-trade/sig"><strong>sig</strong></a>
 </p>
 
 ---
 
-## Principles
+## Quick Start
 
-- No hidden allocations — all storage is stack or comptime-sized
-- No implicit work — every cost is visible
-- No standard library I/O at runtime — pure Win32 + OpenGL extern calls
-- Explicit over convenient
-- Zero-cost abstractions only
+```bash
+# Install zpm (or build from source — see Contributing)
+zpm --version
+
+# Scaffold a new project
+zpm init --template cli-app --name my-app
+cd my-app
+
+# Install packages
+zpm i @zpm/core @zpm/json
+
+# Build and run
+zpm run
+```
+
+---
+
+## Commands
+
+| Command | Alias | Description |
+|---------|-------|-------------|
+| `zpm init` | | Scaffold a new project from a template |
+| `zpm install <pkg...>` | `i` | Install packages and resolve dependencies |
+| `zpm uninstall <pkg...>` | `rm` | Remove packages and orphaned transitive deps |
+| `zpm list` | `ls` | List installed zpm packages |
+| `zpm search <query>` | | Search the registry for packages |
+| `zpm publish` | `pub` | Publish a package to the registry |
+| `zpm validate` | `val` | Validate `zpm.pkg.zon` before publishing |
+| `zpm update [pkg...]` | `up` | Update packages to latest versions |
+| `zpm doctor` | | Check environment health |
+| `zpm run [args...]` | | Build and run via `zig build run` |
+| `zpm build [args...]` | | Build via `zig build` |
+
+### Global Flags
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--verbose` | `-v` | Detailed output |
+| `--quiet` | `-q` | Suppress non-error output |
+| `--offline` | | No network requests |
+| `--registry <url>` | | Override registry URL |
+| `--transport quic` | | Use QUIC transport for registry ops |
+| `--help` | `-h` | Show help |
+| `--version` | `-V` | Show version |
+
+---
+
+## Templates
+
+`zpm init --template <name> --name <project>`
+
+| Template | Description |
+|----------|-------------|
+| `empty` | Minimal Zig project (default) |
+| `cli-app` | Cross-platform CLI with argument parsing |
+| `web-server` | Zig HTTP server project |
+| `gui-app` | Platform-abstracted window + GL rendering |
+| `library` | Reusable Zig module with `src/root.zig` and tests |
+| `package` | Library + `zpm.pkg.zon` manifest for publishing |
+| `window` | Native window creation with OpenGL context |
+| `gl-app` | OpenGL application with render loop |
+| `trading` | Trading application scaffold |
+
+---
 
 ## Architecture
 
 Four layers, strictly ordered — lower layers never import from higher layers.
 
-### Layer 0: Core
+```
+Layer 2: Render      Drawing primitives, text, icons (color, primitives, text, icon)
+Layer 1: Transport   QUIC stack — RFC 9000/9001/9002/9221 (conn, streams, packet, ...)
+Layer 1: Platform    OS bindings, system services (win32, gl, window, http, crypto, ...)
+Layer 0: Core        Pure data types, math, logic — no platform deps (core, math, json)
+```
 
-Pure data types, math, storage, and logic. No platform dependencies, no I/O.
+### Principles
 
-| Module | Source | Description |
-|--------|--------|-------------|
-| `core` | `src/core/root.zig` | Coarse-grained re-export of all core subsystems |
-| `math` | `src/core/math.zig` | Sin/cos approximations, lerp, interpolation, pure math |
-| `json` | `src/core/json.zig` | Minimal JSON parser |
+- No hidden allocations — all storage is stack or comptime-sized
+- No implicit work — every cost is visible
+- No standard library I/O at runtime — pure platform-native extern calls
+- Explicit over convenient
+- Zero-cost abstractions only
 
+---
 
-Core also contains (accessed via `core.*`):
+## QUIC Transport
 
-| Submodule | Source | Description |
-|-----------|--------|-------------|
-| `core.types` | `src/core/types.zig` | OHLCV, candle types, fundamental data structures |
-| `core.fmt` | `src/core/fmt.zig` | Number/price formatting utilities |
-| `core.config` | `src/core/config.zig` | Config parsing logic |
-| `core.config_types` | `src/core/config_types.zig` | Config struct definitions (Subscription, Credentials) |
-| `core.metadata` | `src/core/metadata.zig` | SourceMetadata — available symbols/intervals |
-| `core.aggregator` | `src/core/aggregator.zig` | 1m → higher TF candle aggregation (pure math) |
-| `core.trading.order` | `src/core/trading/order.zig` | Order types and structures |
-| `core.trading.order_entry_state` | `src/core/trading/order_entry_state.zig` | Order entry panel state |
-| `core.trading.orderbook` | `src/core/trading/orderbook.zig` | Order book depth data |
-| `core.trading.position` | `src/core/trading/position.zig` | Position and balance types |
-| `core.ui.action` | `src/core/ui/action.zig` | Action enum for dispatch |
-| `core.ui.debug_state` | `src/core/ui/debug_state.zig` | Debug console state |
-| `core.ui.settings_state` | `src/core/ui/settings_state.zig` | Settings overlay state |
-| `core.ui.frame_state` | `src/core/ui/frame_state.zig` | Per-frame render state |
-| `core.ui.ring_log` | `src/core/ui/ring_log.zig` | Fixed-size ring buffer log |
-| `core.data.manager` | `src/core/data/manager.zig` | DataManager — candle storage and access |
-| `core.data.data_types` | `src/core/data/types.zig` | Data layer type definitions |
-| `core.data.cache_reader` | `src/core/data/cache_reader.zig` | Binary cache file reader |
-
-### Layer 1: Platform
-
-OS bindings and system services. Windows-only (Win32 API). May import from core.
-
-| Module | Source | Description |
-|--------|--------|-------------|
-| `platform` | `src/platform/root.zig` | Coarse-grained re-export of all platform subsystems |
-| `win32` | `src/platform/win32.zig` | Hand-written Win32 type/constant/extern bindings |
-| `gl` | `src/platform/gl.zig` | OpenGL 1.x constants and function externs |
-| `window` | `src/platform/window.zig` | Borderless WS_POPUP window creation and management |
-| `input` | `src/platform/input/run.zig` | Keyboard + mouse input handling (directory module) |
-| `timer` | `src/platform/timer.zig` | High-precision timer via QueryPerformanceCounter |
-| `threading` | `src/platform/thread/run.zig` | Thread pool and worker management (directory module) |
-| `http` | `src/platform/http.zig` | HTTP client via WinHTTP |
-| `crypto` | `src/platform/crypto.zig` | HMAC-SHA256 via BCrypt |
-| `file_io` | `src/platform/file.zig` | File I/O via Win32 CreateFile/ReadFile/WriteFile |
-| `seqlock` | `src/platform/seqlock.zig` | Sequence lock for lock-free concurrent reads |
-| `screenshot` | `src/platform/screenshot.zig` | GL framebuffer capture |
-| `logging` | `src/platform/log/run.zig` | Logging subsystem (directory module) |
-| `png` | `src/platform/png/encode.zig` | PNG encoder with deflate compression (directory module) |
-| `mcp` | `src/platform/mcp/run.zig` | Embedded MCP server on 127.0.0.1:3001 (directory module) |
-
-System libraries linked transitively: `kernel32`, `gdi32`, `user32`, `shell32`, `opengl32`, `winhttp`, `bcrypt`, `ws2_32`
-
-### Layer 1: Transport
-
-QUIC transport stack — a generic, reusable QUIC implementation that knows nothing about packages, registries, or zpm semantics. The core modules can be reused for any custom binary protocol. Only `appmap.zig` bridges zpm-specific operations to QUIC lanes.
-
-Implements RFCs 9000 (QUIC v1), 9001 (QUIC-TLS), 9002 (loss detection/congestion control, NewReno), 9221 (DATAGRAM frames), 9368 (compatible version negotiation), and 9369 (QUIC v2). Cryptographic operations use Windows BCrypt (AES-128-GCM, HKDF-SHA256) and SChannel (TLS 1.3) — platform-native, FIPS-validated primitives.
-
-Minimum OS requirement: Windows 10 version 1903+ (SChannel TLS 1.3 support).
-
-| Module | Source | Description |
-|--------|--------|-------------|
-| `transport` | `src/transport/root.zig` | Coarse-grained re-export of all transport sub-modules |
-| `udp` | `src/transport/udp.zig` | Win32 UDP socket I/O (non-blocking send/receive via Winsock2) |
-| `packet` | `src/transport/packet.zig` | QUIC packet parsing and serialization (RFC 9000 §17, §19) |
-| `transport_crypto` | `src/transport/crypto.zig` | TLS 1.3 integration and packet protection (RFC 9001, BCrypt/SChannel) |
-| `recovery` | `src/transport/recovery.zig` | Loss detection and congestion control (RFC 9002, NewReno) |
-| `streams` | `src/transport/streams.zig` | Stream management with flow control (RFC 9000 §2) |
-| `datagram` | `src/transport/datagram.zig` | DATAGRAM frame handling (RFC 9221) |
-| `scheduler` | `src/transport/scheduler.zig` | Packet assembly and pacing |
-| `conn` | `src/transport/conn.zig` | Connection state machine (RFC 9000 §10) |
-| `telemetry` | `src/transport/telemetry.zig` | Per-connection counters and diagnostics |
-| `appmap` | `src/transport/appmap.zig` | Application protocol mapping (zpm-specific, maps registry ops to QUIC lanes) |
-
-System libraries linked transitively: `ws2_32`, `bcrypt`, `secur32`, `kernel32`
-
-#### Lane Architecture
+zpm includes a full QUIC implementation (RFC 9000, 9001, 9002, 9221) for high-performance registry access. Enable with `--transport quic`.
 
 Three application lanes map to QUIC primitives:
 
 | Lane | QUIC Primitive | Semantics | Use Cases |
 |------|---------------|-----------|-----------|
-| Control | Bidirectional stream 0 | Reliable, ordered | Handshake, auth, resolve, publish, search, close |
-| Bulk | Bidirectional streams 4+ | Reliable, ordered, parallel | Tarball download, snapshot transfer |
-| Hot | DATAGRAM frames (RFC 9221) | Unreliable, latest-wins | Invalidation, version announcements, telemetry |
-
-Stream ID allocation: stream 0 for Control, streams 4/8/12/… for Bulk (client-initiated bidirectional, one per transfer), DATAGRAM frames for Hot (no stream ID).
-
-### Layer 2: Render
-
-Drawing primitives and text rendering. May import from platform and core.
-
-| Module | Source | Description |
-|--------|--------|-------------|
-| `render` | `src/render/root.zig` | Coarse-grained re-export of all render subsystems |
-| `color` | `src/render/color.zig` | Color types and constants |
-| `primitives` | `src/render/primitives.zig` | GL immediate-mode drawing: rect, line, candle, glow |
-| `text` | `src/render/text.zig` | Bitmap font rasterization (Win32 GDI → GL texture atlas) |
-| `icon` | `src/render/icon.zig` | ICO file loading → GL texture |
-
-## Usage
-
-The app depends on `zpm` as a path dependency. Modules are imported by name:
-
-```zig
-// Granular imports (preferred)
-const math = @import("math");
-const gl = @import("gl");
-const primitives = @import("primitives");
-
-// Coarse-grained imports
-const core = @import("core");
-const platform = @import("platform");
-const transport = @import("transport");
-const render = @import("render");
-```
-
-### QUIC Transport Example
+| Control | Bidirectional stream 0 | Reliable, ordered | Resolve, publish, search, auth |
+| Bulk | Bidirectional streams 4+ | Reliable, parallel | Tarball download |
+| Hot | DATAGRAM frames | Unreliable, latest-wins | Invalidation, version announcements |
 
 ```zig
 const conn = @import("conn");
 const appmap = @import("appmap");
 
-// Create a QUIC connection (client-initiated)
 var connection = conn.Connection.initClient(server_addr);
-
-// Drive the connection — call tick() in your event loop
-// tick() processes incoming packets, drives the TLS handshake,
-// runs loss detection, and assembles outgoing packets
-const result = connection.tick(recv_buf[0..bytes_read], &send_buf);
-
-// Use the application protocol mapping for registry operations
-// appmap translates resolve/publish/search into lane-appropriate messages:
-//   Control lane (stream 0)  — resolve, publish, search, auth
-//   Bulk lane (streams 4+)   — tarball download, snapshots
-//   Hot lane (DATAGRAM)      — invalidation, version announcements
-var app = appmap.AppMap.init(&connection);
+var app = appmap.AppMap.init(&connection.stream_mgr, &connection.dgram_handler);
 app.sendResolveRequest(scope, name, version);
 ```
 
-```
-zig build run
+---
+
+## Official @zpm/ Packages
+
+34 packages derived from the existing zpm module library.
+
+### Layer 0 — Core
+
+| Package | Description |
+|---------|-------------|
+| `@zpm/core` | Core data types, storage, and logic |
+| `@zpm/math` | Sin/cos approximations, lerp, interpolation, pure math |
+| `@zpm/json` | Minimal JSON parser |
+
+### Layer 1 — Platform
+
+| Package | Description |
+|---------|-------------|
+| `@zpm/win32` | Hand-written Win32 type/constant/extern bindings |
+| `@zpm/gl` | OpenGL 1.x constants and function externs |
+| `@zpm/window` | Borderless window creation and management |
+| `@zpm/timer` | High-precision timer |
+| `@zpm/seqlock` | Sequence lock for lock-free concurrent reads |
+| `@zpm/http` | HTTP client |
+| `@zpm/crypto` | HMAC-SHA256 cryptographic operations |
+| `@zpm/file-io` | File I/O operations |
+| `@zpm/threading` | Thread pool and worker management |
+| `@zpm/logging` | Logging subsystem |
+| `@zpm/input` | Keyboard and mouse input handling |
+| `@zpm/png` | PNG encoder with deflate compression |
+| `@zpm/screenshot` | GL framebuffer capture |
+| `@zpm/mcp` | Embedded MCP server |
+| `@zpm/platform` | Coarse-grained re-export of all platform subsystems |
+
+### Layer 1 — Transport
+
+| Package | Description |
+|---------|-------------|
+| `@zpm/udp` | UDP socket I/O (non-blocking send/receive) |
+| `@zpm/packet` | QUIC packet parsing and serialization (RFC 9000) |
+| `@zpm/transport-crypto` | TLS 1.3 integration and packet protection (RFC 9001) |
+| `@zpm/recovery` | Loss detection and congestion control (RFC 9002, NewReno) |
+| `@zpm/streams` | Stream management with flow control |
+| `@zpm/datagram` | DATAGRAM frame handling (RFC 9221) |
+| `@zpm/telemetry` | Per-connection counters and diagnostics |
+| `@zpm/scheduler` | Packet assembly and pacing |
+| `@zpm/conn` | QUIC connection state machine |
+| `@zpm/appmap` | Application protocol mapping (registry ops to QUIC lanes) |
+| `@zpm/transport` | Coarse-grained re-export of all transport sub-modules |
+
+### Layer 2 — Render
+
+| Package | Description |
+|---------|-------------|
+| `@zpm/color` | Color types and constants |
+| `@zpm/primitives` | GL immediate-mode drawing: rect, line, candle, glow |
+| `@zpm/text` | Bitmap font rasterization |
+| `@zpm/icon` | ICO file loading to GL texture |
+| `@zpm/render` | Coarse-grained re-export of all render subsystems |
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, code style, and PR process.
+
+```bash
+# Build from source
+cd zpm/cli
+zig build
+
+# Run all tests
+zig build test --summary all
+
+# Run root-level tests (transport, core, platform)
+cd zpm
+zig build test --summary all
 ```
 
 ---
@@ -188,5 +220,7 @@ zig build run
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/tXwz7dAt">Discord</a> · <a href="https://ko-fi.com/shadovvbeast">Ko-fi</a>
+  <a href="https://discord.gg/tXwz7dAt">Discord</a> ·
+  <a href="https://ko-fi.com/shadovvbeast">Ko-fi</a> ·
+  <a href="https://github.com/sb0-trade/zpm">GitHub</a>
 </p>

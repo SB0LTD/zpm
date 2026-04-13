@@ -13,6 +13,10 @@ pub const Template = enum {
     gl_app,
     trading,
     package,
+    cli_app,
+    web_server,
+    gui_app,
+    library,
 
     pub fn fromString(s: []const u8) ?Template {
         const map = .{
@@ -22,6 +26,13 @@ pub const Template = enum {
             .{ "gl_app", Template.gl_app },
             .{ "trading", Template.trading },
             .{ "package", Template.package },
+            .{ "cli-app", Template.cli_app },
+            .{ "cli_app", Template.cli_app },
+            .{ "web-server", Template.web_server },
+            .{ "web_server", Template.web_server },
+            .{ "gui-app", Template.gui_app },
+            .{ "gui_app", Template.gui_app },
+            .{ "library", Template.library },
         };
         inline for (map) |entry| {
             if (strEql(s, entry[0])) return entry[1];
@@ -36,12 +47,17 @@ pub const Template = enum {
             .gl_app => "gl-app",
             .trading => "trading",
             .package => "package",
+            .cli_app => "cli-app",
+            .web_server => "web-server",
+            .gui_app => "gui-app",
+            .library => "library",
         };
     }
 };
 
 pub const available_templates = [_][]const u8{
-    "empty", "window", "gl-app", "trading", "package",
+    "empty",   "window",     "gl-app",  "trading", "package",
+    "cli-app", "web-server", "gui-app", "library",
 };
 
 pub const InitConfig = struct {
@@ -128,7 +144,7 @@ pub fn scaffold(vtable: *const InitVtable, config: *const InitConfig) InitResult
     }
 
     var main_buf: [4096]u8 = undefined;
-    const src_filename = if (tmpl == .package) "src/root.zig" else "src/main.zig";
+    const src_filename = if (tmpl == .package or tmpl == .library) "src/root.zig" else "src/main.zig";
     const main_content = generateMainZig(project, tmpl, &main_buf) orelse {
         cleanup(vtable, project);
         return .failed;
@@ -239,6 +255,10 @@ fn generateBuildZigZon(project_name: []const u8, tmpl: Template, buf: *[4096]u8)
         .gl_app => build_zig_zon_gl_app,
         .trading => build_zig_zon_trading,
         .package => build_zig_zon_package,
+        .cli_app => build_zig_zon_cli_app,
+        .web_server => build_zig_zon_web_server,
+        .gui_app => build_zig_zon_gui_app,
+        .library => build_zig_zon_library,
     };
     return replacePlaceholder(template_str, project_name, buf);
 }
@@ -409,6 +429,113 @@ const build_zig_zon_package =
     \\
 ;
 
+const build_zig_zon_cli_app =
+    \\.{
+    \\    .name = .@"{{project_name}}",
+    \\    .version = "0.1.0",
+    \\    .minimum_zig_version = "0.16.0",
+    \\    .dependencies = .{
+    \\        .@"zpm-core" = .{
+    \\            .url = "https://registry.zpm.dev/pkg/@zpm/core/0.1.0.tar.gz",
+    \\            .hash = "1220placeholder",
+    \\        },
+    \\    },
+    \\    .paths = .{
+    \\        "build.zig",
+    \\        "build.zig.zon",
+    \\        "src",
+    \\    },
+    \\}
+    \\
+;
+
+const build_zig_zon_web_server =
+    \\.{
+    \\    .name = .@"{{project_name}}",
+    \\    .version = "0.1.0",
+    \\    .minimum_zig_version = "0.16.0",
+    \\    .dependencies = .{
+    \\        .@"zpm-core" = .{
+    \\            .url = "https://registry.zpm.dev/pkg/@zpm/core/0.1.0.tar.gz",
+    \\            .hash = "1220placeholder",
+    \\        },
+    \\        .@"zpm-http" = .{
+    \\            .url = "https://registry.zpm.dev/pkg/@zpm/http/0.1.0.tar.gz",
+    \\            .hash = "1220placeholder",
+    \\        },
+    \\    },
+    \\    .paths = .{
+    \\        "build.zig",
+    \\        "build.zig.zon",
+    \\        "src",
+    \\    },
+    \\}
+    \\
+;
+
+const build_zig_zon_gui_app =
+    \\.{
+    \\    .name = .@"{{project_name}}",
+    \\    .version = "0.1.0",
+    \\    .minimum_zig_version = "0.16.0",
+    \\    .dependencies = .{
+    \\        .@"zpm-core" = .{
+    \\            .url = "https://registry.zpm.dev/pkg/@zpm/core/0.1.0.tar.gz",
+    \\            .hash = "1220placeholder",
+    \\        },
+    \\        .@"zpm-win32" = .{
+    \\            .url = "https://registry.zpm.dev/pkg/@zpm/win32/0.1.0.tar.gz",
+    \\            .hash = "1220placeholder",
+    \\        },
+    \\        .@"zpm-gl" = .{
+    \\            .url = "https://registry.zpm.dev/pkg/@zpm/gl/0.1.0.tar.gz",
+    \\            .hash = "1220placeholder",
+    \\        },
+    \\        .@"zpm-window" = .{
+    \\            .url = "https://registry.zpm.dev/pkg/@zpm/window/0.1.0.tar.gz",
+    \\            .hash = "1220placeholder",
+    \\        },
+    \\        .@"zpm-color" = .{
+    \\            .url = "https://registry.zpm.dev/pkg/@zpm/color/0.1.0.tar.gz",
+    \\            .hash = "1220placeholder",
+    \\        },
+    \\        .@"zpm-primitives" = .{
+    \\            .url = "https://registry.zpm.dev/pkg/@zpm/primitives/0.1.0.tar.gz",
+    \\            .hash = "1220placeholder",
+    \\        },
+    \\        .@"zpm-timer" = .{
+    \\            .url = "https://registry.zpm.dev/pkg/@zpm/timer/0.1.0.tar.gz",
+    \\            .hash = "1220placeholder",
+    \\        },
+    \\        .@"zpm-input" = .{
+    \\            .url = "https://registry.zpm.dev/pkg/@zpm/input/0.1.0.tar.gz",
+    \\            .hash = "1220placeholder",
+    \\        },
+    \\    },
+    \\    .paths = .{
+    \\        "build.zig",
+    \\        "build.zig.zon",
+    \\        "src",
+    \\    },
+    \\}
+    \\
+;
+
+const build_zig_zon_library =
+    \\.{
+    \\    .name = .@"{{project_name}}",
+    \\    .version = "0.1.0",
+    \\    .minimum_zig_version = "0.16.0",
+    \\    .dependencies = .{},
+    \\    .paths = .{
+    \\        "build.zig",
+    \\        "build.zig.zon",
+    \\        "src",
+    \\    },
+    \\}
+    \\
+;
+
 // ── build.zig Generator ──
 
 fn generateBuildZig(project_name: []const u8, tmpl: Template, buf: *[8192]u8) ?[]const u8 {
@@ -418,6 +545,10 @@ fn generateBuildZig(project_name: []const u8, tmpl: Template, buf: *[8192]u8) ?[
         .gl_app => build_zig_gl_app,
         .trading => build_zig_trading,
         .package => build_zig_package,
+        .cli_app => build_zig_cli_app,
+        .web_server => build_zig_web_server,
+        .gui_app => build_zig_gui_app,
+        .library => build_zig_library,
     };
     return replacePlaceholder(template_str, project_name, buf);
 }
@@ -606,6 +737,140 @@ const build_zig_package =
     \\
 ;
 
+const build_zig_cli_app =
+    \\const std = @import("std");
+    \\
+    \\pub fn build(b: *std.Build) void {
+    \\    const target = b.standardTargetOptions(.{});
+    \\    const optimize = b.standardOptimizeOption(.{});
+    \\
+    \\    const core_dep = b.dependency("zpm-core", .{ .target = target, .optimize = optimize });
+    \\
+    \\    const exe = b.addExecutable(.{
+    \\        .name = "{{project_name}}",
+    \\        .root_module = b.createModule(.{
+    \\            .root_source_file = b.path("src/main.zig"),
+    \\            .target = target,
+    \\            .optimize = optimize,
+    \\        }),
+    \\    });
+    \\
+    \\    exe.root_module.addImport("core", core_dep.module("core"));
+    \\
+    \\    b.installArtifact(exe);
+    \\
+    \\    const run_cmd = b.addRunArtifact(exe);
+    \\    run_cmd.step.dependOn(b.getInstallStep());
+    \\    if (b.args) |args| run_cmd.addArgs(args);
+    \\    const run_step = b.step("run", "Run the application");
+    \\    run_step.dependOn(&run_cmd.step);
+    \\}
+    \\
+;
+
+const build_zig_web_server =
+    \\const std = @import("std");
+    \\
+    \\pub fn build(b: *std.Build) void {
+    \\    const target = b.standardTargetOptions(.{});
+    \\    const optimize = b.standardOptimizeOption(.{});
+    \\
+    \\    const core_dep = b.dependency("zpm-core", .{ .target = target, .optimize = optimize });
+    \\    const http_dep = b.dependency("zpm-http", .{ .target = target, .optimize = optimize });
+    \\
+    \\    const exe = b.addExecutable(.{
+    \\        .name = "{{project_name}}",
+    \\        .root_module = b.createModule(.{
+    \\            .root_source_file = b.path("src/main.zig"),
+    \\            .target = target,
+    \\            .optimize = optimize,
+    \\        }),
+    \\    });
+    \\
+    \\    exe.root_module.addImport("core", core_dep.module("core"));
+    \\    exe.root_module.addImport("http", http_dep.module("http"));
+    \\
+    \\    b.installArtifact(exe);
+    \\
+    \\    const run_cmd = b.addRunArtifact(exe);
+    \\    run_cmd.step.dependOn(b.getInstallStep());
+    \\    const run_step = b.step("run", "Run the server");
+    \\    run_step.dependOn(&run_cmd.step);
+    \\}
+    \\
+;
+
+const build_zig_gui_app =
+    \\const std = @import("std");
+    \\
+    \\pub fn build(b: *std.Build) void {
+    \\    const target = b.standardTargetOptions(.{});
+    \\    const optimize = b.standardOptimizeOption(.{});
+    \\
+    \\    const core_dep = b.dependency("zpm-core", .{ .target = target, .optimize = optimize });
+    \\    const win32_dep = b.dependency("zpm-win32", .{ .target = target, .optimize = optimize });
+    \\    const gl_dep = b.dependency("zpm-gl", .{ .target = target, .optimize = optimize });
+    \\    const window_dep = b.dependency("zpm-window", .{ .target = target, .optimize = optimize });
+    \\    const color_dep = b.dependency("zpm-color", .{ .target = target, .optimize = optimize });
+    \\    const primitives_dep = b.dependency("zpm-primitives", .{ .target = target, .optimize = optimize });
+    \\    const timer_dep = b.dependency("zpm-timer", .{ .target = target, .optimize = optimize });
+    \\    const input_dep = b.dependency("zpm-input", .{ .target = target, .optimize = optimize });
+    \\
+    \\    const exe = b.addExecutable(.{
+    \\        .name = "{{project_name}}",
+    \\        .root_module = b.createModule(.{
+    \\            .root_source_file = b.path("src/main.zig"),
+    \\            .target = target,
+    \\            .optimize = optimize,
+    \\        }),
+    \\    });
+    \\
+    \\    exe.root_module.addImport("core", core_dep.module("core"));
+    \\    exe.root_module.addImport("win32", win32_dep.module("win32"));
+    \\    exe.root_module.addImport("gl", gl_dep.module("gl"));
+    \\    exe.root_module.addImport("window", window_dep.module("window"));
+    \\    exe.root_module.addImport("color", color_dep.module("color"));
+    \\    exe.root_module.addImport("primitives", primitives_dep.module("primitives"));
+    \\    exe.root_module.addImport("timer", timer_dep.module("timer"));
+    \\    exe.root_module.addImport("input", input_dep.module("input"));
+    \\
+    \\    b.installArtifact(exe);
+    \\
+    \\    const run_cmd = b.addRunArtifact(exe);
+    \\    run_cmd.step.dependOn(b.getInstallStep());
+    \\    const run_step = b.step("run", "Run the application");
+    \\    run_step.dependOn(&run_cmd.step);
+    \\}
+    \\
+;
+
+const build_zig_library =
+    \\const std = @import("std");
+    \\
+    \\pub fn build(b: *std.Build) void {
+    \\    const target = b.standardTargetOptions(.{});
+    \\    const optimize = b.standardOptimizeOption(.{});
+    \\
+    \\    _ = b.addModule("{{project_name}}", .{
+    \\        .root_source_file = b.path("src/root.zig"),
+    \\        .target = target,
+    \\        .optimize = optimize,
+    \\    });
+    \\
+    \\    const tests = b.addTest(.{
+    \\        .root_module = b.createModule(.{
+    \\            .root_source_file = b.path("src/root.zig"),
+    \\            .target = target,
+    \\            .optimize = optimize,
+    \\        }),
+    \\    });
+    \\
+    \\    const test_step = b.step("test", "Run unit tests");
+    \\    test_step.dependOn(&b.addRunArtifact(tests).step);
+    \\}
+    \\
+;
+
 // ── src/main.zig (or src/root.zig) Generator ──
 
 fn generateMainZig(project_name: []const u8, tmpl: Template, buf: *[4096]u8) ?[]const u8 {
@@ -615,6 +880,10 @@ fn generateMainZig(project_name: []const u8, tmpl: Template, buf: *[4096]u8) ?[]
         .gl_app => main_zig_gl_app,
         .trading => main_zig_trading,
         .package => main_zig_package,
+        .cli_app => main_zig_cli_app,
+        .web_server => main_zig_web_server,
+        .gui_app => main_zig_gui_app,
+        .library => main_zig_library,
     };
     return replacePlaceholder(template_str, project_name, buf);
 }
@@ -719,6 +988,80 @@ const main_zig_package =
     \\
 ;
 
+const main_zig_cli_app =
+    \\const std = @import("std");
+    \\
+    \\pub fn main() void {
+    \\    // Cross-platform CLI application — {{project_name}}
+    \\    const args = std.process.argsWithAllocator(std.heap.page_allocator) catch return;
+    \\    defer args.deinit();
+    \\
+    \\    var count: usize = 0;
+    \\    while (args.next()) |_| count += 1;
+    \\
+    \\    var buf: [256]u8 = undefined;
+    \\    const msg = std.fmt.bufPrint(&buf, "{{project_name}}: {d} argument(s)\n", .{count}) catch return;
+    \\    std.debug.print("{s}", .{msg});
+    \\}
+    \\
+;
+
+const main_zig_web_server =
+    \\const std = @import("std");
+    \\
+    \\pub fn main() void {
+    \\    // Zig HTTP server — {{project_name}}
+    \\    std.debug.print("{{project_name}} server starting on :8080\n", .{});
+    \\    // TODO: Initialize HTTP listener and route handlers
+    \\    std.debug.print("{{project_name}} server ready\n", .{});
+    \\}
+    \\
+;
+
+const main_zig_gui_app =
+    \\const gl = @import("gl");
+    \\const win = @import("window");
+    \\const prim = @import("primitives");
+    \\const color = @import("color");
+    \\const timer = @import("timer");
+    \\const input = @import("input");
+    \\
+    \\pub fn main() void {
+    \\    // Platform-abstracted GUI application — {{project_name}}
+    \\    var t = timer.Timer.init();
+    \\    var window = win.Window.init("{{project_name}}", 1280, 720);
+    \\    defer window.deinit();
+    \\
+    \\    while (window.isOpen()) {
+    \\        const dt = t.tick();
+    \\        _ = dt;
+    \\
+    \\        input.poll(&window);
+    \\        if (input.isKeyPressed(.escape)) window.close();
+    \\
+    \\        gl.glClearColor(0.08, 0.08, 0.12, 1.0);
+    \\        gl.glClear(gl.GL_COLOR_BUFFER_BIT);
+    \\
+    \\        prim.rect(340, 210, 600, 300, color.accent);
+    \\
+    \\        window.swap();
+    \\    }
+    \\}
+    \\
+;
+
+const main_zig_library =
+    \\/// {{project_name}} — a reusable Zig module.
+    \\
+    \\pub fn init() void {}
+    \\
+    \\test "{{project_name}} basic test" {
+    \\    const std = @import("std");
+    \\    try std.testing.expect(true);
+    \\}
+    \\
+;
+
 // ── .gitignore Content ──
 
 const gitignore_content =
@@ -737,6 +1080,10 @@ fn generateReadme(project_name: []const u8, tmpl: Template, buf: *[2048]u8) ?[]c
         .gl_app => "A GL application with render loop and basic drawing.",
         .trading => "A trading chart application skeleton.",
         .package => "A publishable zpm-compatible package.",
+        .cli_app => "A cross-platform command-line application with argument parsing.",
+        .web_server => "A Zig HTTP server project.",
+        .gui_app => "A platform-abstracted GUI application with window and GL rendering.",
+        .library => "A reusable Zig module with test infrastructure.",
     };
     const template_str = readme_template;
     // Two-pass: first replace {{project_name}}, then {{description}}
@@ -1233,6 +1580,10 @@ test "Template.fromString: valid templates" {
     try testing.expectEqual(Template.gl_app, Template.fromString("gl-app").?);
     try testing.expectEqual(Template.trading, Template.fromString("trading").?);
     try testing.expectEqual(Template.package, Template.fromString("package").?);
+    try testing.expectEqual(Template.cli_app, Template.fromString("cli-app").?);
+    try testing.expectEqual(Template.web_server, Template.fromString("web-server").?);
+    try testing.expectEqual(Template.gui_app, Template.fromString("gui-app").?);
+    try testing.expectEqual(Template.library, Template.fromString("library").?);
 }
 
 test "Template.fromString: unknown template returns null" {
@@ -1269,7 +1620,7 @@ test "replacePlaceholder: no placeholder" {
 
 test "property 16: init atomicity — failures at each step trigger cleanup" {
     // **Validates: Requirements 16.6, 16.8**
-    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package };
+    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package, .cli_app, .web_server, .gui_app, .library };
 
     // Test failure on create_dir (project dir creation)
     for (templates) |tmpl| {
@@ -1295,8 +1646,8 @@ test "property 16: init atomicity — failures at each step trigger cleanup" {
 
     for (fail_targets) |target| {
         for (templates) |tmpl| {
-            // For package template, src file is root.zig not main.zig
-            if (tmpl == .package and containsSubstr(target, "src/main.zig")) continue;
+            // For package and library templates, src file is root.zig not main.zig
+            if ((tmpl == .package or tmpl == .library) and containsSubstr(target, "src/main.zig")) continue;
 
             resetInitMocks();
             mock_write_file_fail_on = target;
@@ -1314,7 +1665,7 @@ test "property 16: init atomicity — failures at each step trigger cleanup" {
         }
     }
 
-    // Also test package-specific: fail on src/root.zig
+    // Also test package/library-specific: fail on src/root.zig
     {
         resetInitMocks();
         mock_write_file_fail_on = "src/root.zig";
@@ -1323,6 +1674,20 @@ test "property 16: init atomicity — failures at each step trigger cleanup" {
             .project_name = "test-proj",
             .template = .package,
             .package_layer = 0,
+        };
+        const result = scaffold(&mock_init_vtable, &config);
+        try testing.expectEqual(InitResult.failed, result);
+        try testing.expect(mock_removed_dir_count > 0);
+    }
+
+    // Also test library: fail on src/root.zig
+    {
+        resetInitMocks();
+        mock_write_file_fail_on = "src/root.zig";
+
+        const config = InitConfig{
+            .project_name = "test-proj",
+            .template = .library,
         };
         const result = scaffold(&mock_init_vtable, &config);
         try testing.expectEqual(InitResult.failed, result);
@@ -1352,13 +1717,13 @@ test "property 16: init atomicity — failures at each step trigger cleanup" {
 
 test "property 17: template placeholder substitution — no remaining placeholders" {
     // **Validates: Requirements 16.10**
-    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package };
+    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package, .cli_app, .web_server, .gui_app, .library };
     const project_names = [_][]const u8{
-        "a",          "my-app",     "cool-project", "x1",
-        "test-pkg",   "hello",      "zig-lib",      "render",
-        "ab",         "my-tool",    "demo",         "widget",
-        "core-lib",   "platform",   "gl-render",    "timer",
-        "http-client","crypto-lib", "input-mgr",    "color-pkg",
+        "a",           "my-app",     "cool-project", "x1",
+        "test-pkg",    "hello",      "zig-lib",      "render",
+        "ab",          "my-tool",    "demo",         "widget",
+        "core-lib",    "platform",   "gl-render",    "timer",
+        "http-client", "crypto-lib", "input-mgr",    "color-pkg",
     };
 
     var iter: usize = 0;
@@ -1391,13 +1756,13 @@ test "property 17: template placeholder substitution — no remaining placeholde
 
 test "property 18: init determinism — identical inputs produce identical outputs" {
     // **Validates: Requirements 22.1**
-    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package };
+    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package, .cli_app, .web_server, .gui_app, .library };
     const project_names = [_][]const u8{
-        "det-app",    "my-proj",    "test-lib",   "cool-thing",
-        "zig-tool",   "render-pkg", "gl-demo",    "trade-bot",
-        "core-util",  "platform-x", "timer-lib",  "http-svc",
-        "crypto-pkg", "input-lib",  "color-util", "window-app",
-        "widget-lib", "icon-pkg",   "text-render","math-core",
+        "det-app",    "my-proj",    "test-lib",    "cool-thing",
+        "zig-tool",   "render-pkg", "gl-demo",     "trade-bot",
+        "core-util",  "platform-x", "timer-lib",   "http-svc",
+        "crypto-pkg", "input-lib",  "color-util",  "window-app",
+        "widget-lib", "icon-pkg",   "text-render", "math-core",
     };
 
     var iter: usize = 0;
@@ -1455,7 +1820,7 @@ test "property 18: init determinism — identical inputs produce identical outpu
 
 test "property 23: init file completeness — all required files present" {
     // **Validates: Requirements 16.4**
-    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package };
+    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package, .cli_app, .web_server, .gui_app, .library };
 
     for (templates) |tmpl| {
         resetInitMocks();
@@ -1474,8 +1839,8 @@ test "property 23: init file completeness — all required files present" {
         try testing.expect(findWrittenFile(".gitignore") != null);
         try testing.expect(findWrittenFile("README.md") != null);
 
-        // Source file: package uses root.zig, others use main.zig
-        if (tmpl == .package) {
+        // Source file: package and library use root.zig, others use main.zig
+        if (tmpl == .package or tmpl == .library) {
             try testing.expect(findWrittenFile("src/root.zig") != null);
         } else {
             try testing.expect(findWrittenFile("src/main.zig") != null);

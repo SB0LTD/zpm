@@ -833,7 +833,7 @@ pub fn initCmd(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandR
     const template = init_mod.Template.fromString(template_str) orelse {
         ctx.stderr("init: unknown template '");
         ctx.stderr(template_str);
-        ctx.stderr("'\navailable templates: empty, window, gl-app, trading, package\n");
+        ctx.stderr("'\navailable templates: empty, window, gl-app, trading, package, cli-app, web-server, gui-app, library\n");
         return .not_found;
     };
 
