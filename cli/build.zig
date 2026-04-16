@@ -100,7 +100,7 @@ pub fn build(b: *std.Build) void {
 
     // ── zpm CLI executable ──
     const exe = b.addExecutable(.{ .name = "zpm", .root_module = b.createModule(.{
-        .root_source_file = b.path("../src/pkg/zpm_main.zig"),
+        .root_source_file = b.path("../src/pkg/zpm_main.sig"),
         .target = target,
         .optimize = optimize,
     }) });
