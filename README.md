@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  Officially supports <strong>Zig 0.16+</strong> and <a href="https://github.com/sb0-trade/sig"><strong>sig</strong></a>
+  Officially supports <strong>Zig 0.16+</strong> and <a href="https://github.com/SB0LTD/sig"><strong>Sig 0.1.2</strong></a>
 </p>
 
 ---
