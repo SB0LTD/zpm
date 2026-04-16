@@ -293,7 +293,9 @@ pub fn classifyUrl(url: []const u8) UrlOp {
     if (path.len >= 13 and eql(path[0..13], "/v1/packages/")) {
         const rest = path[13..];
         var slash_count: usize = 0;
-        for (rest) |c| { if (c == '/') slash_count += 1; }
+        for (rest) |c| {
+            if (c == '/') slash_count += 1;
+        }
         if (slash_count >= 2) return .resolve_version;
         if (slash_count >= 1) return .resolve;
         return .unknown;
@@ -311,7 +313,11 @@ pub fn parsePackageUrl(url: []const u8) ?UrlParts {
     var at_pos: usize = 0;
     var found = false;
     while (i + 14 <= url.len) : (i += 1) {
-        if (eql(url[i .. i + 14], "/v1/packages/@")) { at_pos = i + 14; found = true; break; }
+        if (eql(url[i .. i + 14], "/v1/packages/@")) {
+            at_pos = i + 14;
+            found = true;
+            break;
+        }
     }
     if (!found) return null;
     var scope_end = at_pos;
@@ -360,8 +366,8 @@ pub fn parseLayerFilter(url: []const u8) ?u2 {
 /// QUIC-backed implementation of HttpVtable.get.
 /// Uses @import("conn") and @import("appmap") lazily inside the function body.
 fn quicGet(url: []const u8, response_buf: []u8) GetResult {
-    const c: *Connection = @alignCast(@ptrCast(active_quic_conn orelse return .{ .err = error.ConnectionFailed }));
-    const am: *AppMap = @alignCast(@ptrCast(active_quic_appmap orelse return .{ .err = error.ConnectionFailed }));
+    const c: *Connection = @ptrCast(@alignCast(active_quic_conn orelse return .{ .err = error.ConnectionFailed }));
+    const am: *AppMap = @ptrCast(@alignCast(active_quic_appmap orelse return .{ .err = error.ConnectionFailed }));
 
     if (c.state == .closed or c.state == .idle) return .{ .err = error.ConnectionFailed };
 
@@ -391,8 +397,8 @@ fn quicGet(url: []const u8, response_buf: []u8) GetResult {
 
 /// QUIC-backed implementation of HttpVtable.post.
 fn quicPost(url: []const u8, body: []const u8, response_buf: []u8) PostResult {
-    const c: *Connection = @alignCast(@ptrCast(active_quic_conn orelse return .{ .err = error.ConnectionFailed }));
-    const am: *AppMap = @alignCast(@ptrCast(active_quic_appmap orelse return .{ .err = error.ConnectionFailed }));
+    const c: *Connection = @ptrCast(@alignCast(active_quic_conn orelse return .{ .err = error.ConnectionFailed }));
+    const am: *AppMap = @ptrCast(@alignCast(active_quic_appmap orelse return .{ .err = error.ConnectionFailed }));
 
     if (c.state == .closed or c.state == .idle) return .{ .err = error.ConnectionFailed };
     if (classifyUrl(url) != .publish) return .{ .err = error.InvalidResponse };
@@ -437,8 +443,8 @@ fn quicPoll(c: *Connection, _: *AppMap, timeout_ms: u64) bool {
 }
 
 pub const QuicTransportVtable = struct {
-    conn: *anyopaque,
-    appmap: *anyopaque,
+    conn: ?*anyopaque,
+    appmap: ?*anyopaque,
 
     /// Store conn/appmap into module-level vars so bare function pointers can access them.
     pub fn activate(self: *QuicTransportVtable) void {
@@ -454,10 +460,11 @@ pub const QuicTransportVtable = struct {
 
 fn eql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
-    for (a, b) |ca, cb| { if (ca != cb) return false; }
+    for (a, b) |ca, cb| {
+        if (ca != cb) return false;
+    }
     return true;
 }
-
 
 // ── Tests ──
 

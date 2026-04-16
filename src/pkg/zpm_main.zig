@@ -252,8 +252,8 @@ fn dispatch(parsed: *const cli.ParsedArgs) void {
         // For now, create a vtable with null pointers — the QUIC get/post
         // functions check for null conn and return ConnectionFailed gracefully.
         quic_vtable = registry.QuicTransportVtable{
-            .conn = @ptrFromInt(0),
-            .appmap = @ptrFromInt(0),
+            .conn = null,
+            .appmap = null,
         };
         // Activate stores conn/appmap into module-level state for bare fn ptrs
         quic_vtable.activate();
