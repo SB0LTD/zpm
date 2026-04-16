@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>The Zig package manager.</strong><br/>
-  <sub>Zig Package Manager — zero allocations, all platforms.</sub>
+  <sub>Zig Package Manager — Über alles. Zero allocations, all platforms.</sub>
 </p>
 
 <p align="center">
