@@ -18,6 +18,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const sha256_mod = b.addModule("sha256", .{
+        .root_source_file = b.path("src/core/sha256.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const jsonl_mod = b.addModule("jsonl", .{
+        .root_source_file = b.path("src/core/jsonl.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    jsonl_mod.addImport("json", json_mod);
+
     const core_mod = b.addModule("core", .{
         .root_source_file = b.path("src/core/root.zig"),
         .target = target,
@@ -25,6 +38,8 @@ pub fn build(b: *std.Build) void {
     });
     core_mod.addImport("math", math_mod);
     core_mod.addImport("json", json_mod);
+    core_mod.addImport("sha256", sha256_mod);
+    core_mod.addImport("jsonl", jsonl_mod);
 
     // ── Granular modules (Layer 1: Platform) ──
     // Ordered so that dependencies are declared before dependents.
@@ -156,6 +171,12 @@ pub fn build(b: *std.Build) void {
     mcp_mod.linkSystemLibrary("ws2_32", .{});
     mcp_mod.linkSystemLibrary("kernel32", .{});
 
+    const subprocess_mod = b.addModule("subprocess", .{
+        .root_source_file = b.path("src/platform/subprocess.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── Granular modules (Layer 2: Render) ──
 
     const color_mod = b.addModule("color", .{
@@ -224,8 +245,9 @@ pub fn build(b: *std.Build) void {
     platform_mod.addImport("logging", logging_mod);
     platform_mod.addImport("png", png_mod);
     platform_mod.addImport("mcp", mcp_mod);
+    platform_mod.addImport("subprocess", subprocess_mod);
     for ([_][]const u8{
-        "kernel32", "gdi32", "user32", "shell32",
+        "kernel32", "gdi32",   "user32", "shell32",
         "opengl32", "winhttp", "bcrypt", "ws2_32",
     }) |lib| {
         platform_mod.linkSystemLibrary(lib, .{});
@@ -234,6 +256,27 @@ pub fn build(b: *std.Build) void {
     // ── Test step ──
     // Transport module tests will be wired here as modules are added.
     const test_step = b.step("test", "Run zpm package tests");
+
+    // sha256 tests
+    const sha256_tests = b.addTest(.{ .root_module = sha256_mod });
+    const sha256_run = b.addRunArtifact(sha256_tests);
+    test_step.dependOn(&sha256_run.step);
+    const sha256_test_step = b.step("test-sha256", "Run SHA-256 module tests");
+    sha256_test_step.dependOn(&sha256_run.step);
+
+    // jsonl tests
+    const jsonl_tests = b.addTest(.{ .root_module = jsonl_mod });
+    const jsonl_run = b.addRunArtifact(jsonl_tests);
+    test_step.dependOn(&jsonl_run.step);
+    const jsonl_test_step = b.step("test-jsonl", "Run JSONL module tests");
+    jsonl_test_step.dependOn(&jsonl_run.step);
+
+    // subprocess tests
+    const subprocess_tests = b.addTest(.{ .root_module = subprocess_mod });
+    const subprocess_run = b.addRunArtifact(subprocess_tests);
+    test_step.dependOn(&subprocess_run.step);
+    const subprocess_test_step = b.step("test-subprocess", "Run subprocess module tests");
+    subprocess_test_step.dependOn(&subprocess_run.step);
 
     // ── Granular modules (Layer 1: Transport) ──
 
@@ -532,5 +575,4 @@ pub fn build(b: *std.Build) void {
     const integration_run = b.addRunArtifact(integration_tests);
     const integration_test_step = b.step("test-integration", "Run QUIC transport integration tests");
     integration_test_step.dependOn(&integration_run.step);
-
 }

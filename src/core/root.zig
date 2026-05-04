@@ -7,6 +7,8 @@
 
 pub const math = @import("math");
 pub const json = @import("json");
+pub const sha256 = @import("sha256");
+pub const jsonl = @import("jsonl");
 pub const types = @import("types.zig");
 pub const fmt = @import("fmt.zig");
 pub const config = @import("config.zig");
