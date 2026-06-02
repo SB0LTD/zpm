@@ -829,6 +829,19 @@ pub const Connection = struct {
                     if (data_end <= buf.len) {
                         const crypto_data = buf[crypto_frame.data_offset..data_end];
                         const hs_result = self.tls.feedCryptoData(level, crypto_data);
+
+                        // Route TLS handshake output to send buffer for next assembleSendPacket
+                        if (hs_result.output.has_data and hs_result.output.data_len > 0) {
+                            const out_len = hs_result.output.data_len;
+                            if (out_len <= self.tls.send_buf.len - self.tls.send_len) {
+                                @memcpy(
+                                    self.tls.send_buf[self.tls.send_len .. self.tls.send_len + out_len],
+                                    hs_result.output.data[0..out_len],
+                                );
+                                self.tls.send_len += out_len;
+                            }
+                        }
+
                         if (hs_result.complete) {
                             // Handshake complete
                             if (self.state == .handshaking) {
@@ -1285,7 +1298,14 @@ pub const Connection = struct {
     /// Returns total bytes written to send_buf (0 if nothing to send).
     fn assembleSendPacket(self: *Connection, now_tick: u64) u16 {
         // Determine which space/level to use
-        const space: PktNumSpace = if (self.state == .handshaking) .handshake else .application;
+        // During handshaking, we may need to send in Initial space (ACK to client Initial)
+        // OR handshake space (ServerHello). Check Initial first if ack_needed.
+        const space: PktNumSpace = if (self.state == .handshaking and self.ack_needed[@intFromEnum(PktNumSpace.initial)])
+            .initial
+        else if (self.state == .handshaking)
+            .handshake
+        else
+            .application;
         const level = self.levelFromSpace(space);
         const space_idx = @intFromEnum(space);
 
