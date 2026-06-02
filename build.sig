@@ -46,7 +46,10 @@ pub fn build(b: *std.Build) void {
     // Ordered so that dependencies are declared before dependents.
 
     const win32_mod = b.addModule("win32", .{
-        .root_source_file = b.path("src/platform/win32.sig"),
+        .root_source_file = if (os_tag == .windows)
+            b.path("src/platform/win32.sig")
+        else
+            b.path("src/transport/linux_platform.sig"),
         .target = target,
         .optimize = optimize,
     });

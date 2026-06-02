@@ -79,7 +79,7 @@ pub const Order = struct {
 
 /// Open orders snapshot — pure data, no I/O. Lives in core so platform layer can reference it.
 pub const OrderInfo = struct {
-    orders: [MAX_OPEN_ORDERS]Order = [_]Order{.{} } ** MAX_OPEN_ORDERS,
+    orders: [MAX_OPEN_ORDERS]Order = @as([MAX_OPEN_ORDERS]Order, @splat(.{})),
     count: u32 = 0,
     ready: u32 = 0,
     loading: u32 = 0,

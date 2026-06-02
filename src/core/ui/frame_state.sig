@@ -72,7 +72,7 @@ pub const FrameState = struct {
     // ── Slots ───────────────────────────────────────────────
     display_idx: usize = 0,
     slot_count: usize = 0,
-    slots: [MAX_SUBS]SlotSummary = [_]SlotSummary{.{} } ** MAX_SUBS,
+    slots: [MAX_SUBS]SlotSummary = @as([MAX_SUBS]SlotSummary, @splat(.{})),
 
     // ── UI toggles ──────────────────────────────────────────
     debug_open: bool = false,

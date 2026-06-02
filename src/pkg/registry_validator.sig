@@ -319,7 +319,7 @@ test "property: registry publish dependency existence — non-existent deps reje
         prop19_existing_count = 0;
 
         // Pick unique existing deps
-        var used: [16]bool = .{ false } ** 16;
+        var used: [16]bool = @as([16]bool, @splat(false));
         for (0..num_existing) |_| {
             var idx = rand.intRangeLessThan(usize, 0, dep_pool.len);
             // Find next unused slot

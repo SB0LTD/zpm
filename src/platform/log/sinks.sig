@@ -25,7 +25,7 @@ pub const Level = enum(u8) {
 const SinkFn = *const fn (level: u8, line: []const u8) void;
 const MAX_SINKS = 4;
 
-var sinks: [MAX_SINKS]?SinkFn = [_]?SinkFn{null} ** MAX_SINKS;
+var sinks: [MAX_SINKS]?SinkFn = @as([MAX_SINKS]?SinkFn, @splat(null));
 var sink_count: usize = 0;
 pub var current_level: Level = .info;
 pub var initialized: bool = false;

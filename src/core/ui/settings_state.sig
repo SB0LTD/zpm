@@ -46,7 +46,7 @@ pub const SettingsState = struct {
     // Symbol filter state
     filter_buf: [20]u8 = @as([20]u8, @splat(0)),
     filter_len: usize = 0,
-    filter_results: [MAX_FILTERED]u16 = [_]u16{ 0 } ** MAX_FILTERED,
+    filter_results: [MAX_FILTERED]u16 = @as([MAX_FILTERED]u16, @splat(0)),
     filter_count: usize = 0,
     filter_cursor: usize = 0,
     filter_active: bool = false,

@@ -18,7 +18,7 @@ pub const Entry = struct {
 };
 
 /// Global ring buffer — written by log.sig, read by debug console.
-pub var entries: [MAX_ENTRIES]Entry = [_]Entry{.{} } ** MAX_ENTRIES;
+pub var entries: [MAX_ENTRIES]Entry = @as([MAX_ENTRIES]Entry, @splat(.{}));
 
 /// Monotonic write cursor. Always increments; readers use modulo.
 pub var write_pos: u32 = 0;

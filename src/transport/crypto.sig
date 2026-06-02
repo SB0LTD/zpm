@@ -80,7 +80,7 @@ pub const TlsEngine = struct {
     state: State = .idle,
 
     // Key material per encryption level
-    keys: [4]KeySet = [_]KeySet{.{} } ** 4,
+    keys: [4]KeySet = @as([4]KeySet, @splat(.{})),
 
     // Session ticket for 0-RTT resumption
     ticket: [512]u8 = @as([512]u8, @splat(0)),
@@ -349,7 +349,7 @@ pub const TlsEngine = struct {
         }
 
         // Convert server_name to UTF-16 (simple ASCII→UTF-16 into stack buffer)
-        var name_w: [256:0]u16 = [_:0]u16{ 0 } ** 256;
+        var name_w: [256:0]u16 = @as([256:0]u16, @splat(0));
         const name_len = if (server_name.len > 255) 255 else server_name.len;
         for (0..name_len) |i| {
             name_w[i] = @intCast(server_name[i]);

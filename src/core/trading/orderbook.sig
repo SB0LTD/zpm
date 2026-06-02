@@ -12,8 +12,8 @@ pub const Level = struct {
 /// Full order book snapshot — 50 bids + 50 asks
 /// bids[0] = best bid (highest price), asks[0] = best ask (lowest price)
 pub const OrderBook = struct {
-    bids: [DEPTH]Level = [_]Level{.{} } ** DEPTH,
-    asks: [DEPTH]Level = [_]Level{.{} } ** DEPTH,
+    bids: [DEPTH]Level = @as([DEPTH]Level, @splat(.{})),
+    asks: [DEPTH]Level = @as([DEPTH]Level, @splat(.{})),
     bid_count: u8 = 0,
     ask_count: u8 = 0,
     /// Sequence number / last update ID for delta merging

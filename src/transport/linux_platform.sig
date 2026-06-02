@@ -37,7 +37,9 @@ pub const WSADATA = struct {};
 // Timing Types
 // ============================================================================
 
-pub const LARGE_INTEGER = i64;
+pub const LARGE_INTEGER = extern struct {
+    QuadPart: i64 = 0,
+};
 
 // ============================================================================
 // Misc Types
@@ -205,7 +207,7 @@ pub fn ntohs(val: u16) u16 {
 // ============================================================================
 
 /// Reads CLOCK_MONOTONIC in nanoseconds.
-pub fn QueryPerformanceCounter(out: *i64) i32 {
+pub fn QueryPerformanceCounter(out: *LARGE_INTEGER) i32 {
     var ts: linux.timespec = undefined;
     const rc = linux.syscall2(
         .clock_gettime,
@@ -213,13 +215,13 @@ pub fn QueryPerformanceCounter(out: *i64) i32 {
         @intFromPtr(&ts),
     );
     if (@as(isize, @bitCast(rc)) < 0) return 0;
-    out.* = @as(i64, ts.sec) * 1_000_000_000 + ts.nsec;
+    out.QuadPart = @as(i64, ts.sec) * 1_000_000_000 + ts.nsec;
     return 1; // non-zero = success (matches Windows convention)
 }
 
 /// Returns 1,000,000,000 (nanosecond resolution).
-pub fn QueryPerformanceFrequency(out: *i64) i32 {
-    out.* = 1_000_000_000;
+pub fn QueryPerformanceFrequency(out: *LARGE_INTEGER) i32 {
+    out.QuadPart = 1_000_000_000;
     return 1;
 }
 
@@ -244,9 +246,11 @@ pub const BCRYPT_KEY_HANDLE = ?*anyopaque;
 
 /// Algorithm identifier placeholders (wide strings on Windows, unused on Linux).
 pub const BCRYPT_AES_ALGORITHM: [*:0]const u16 = &[_:0]u16{ 'A', 'E', 'S' };
+pub const BCRYPT_HMAC_SHA256_ALG: [*:0]const u16 = &[_:0]u16{ 'H', 'M', 'A', 'C' };
 pub const BCRYPT_CHAIN_MODE_GCM: [*:0]const u16 = &[_:0]u16{ 'G', 'C', 'M' };
 pub const BCRYPT_CHAINING_MODE: [*:0]const u16 = &[_:0]u16{ 'C', 'h', 'M' };
 pub const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x00000002;
+pub const BCRYPT_ALG_HANDLE_HMAC_FLAG: u32 = 0x00000008;
 
 /// AES-GCM authenticated cipher mode info.
 pub const BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO = struct {
@@ -271,8 +275,8 @@ const KeySlot = struct {
     key_len: u8 = 0,
 };
 
-var key_slots: [16]KeySlot = [_]KeySlot{.{} } ** 16;
-var key_slot_used: [16]bool = [_]bool{ false } ** 16;
+var key_slots: [16]KeySlot = @as([16]KeySlot, @splat(.{}));
+var key_slot_used: [16]bool = @as([16]bool, @splat(false));
 
 fn allocKeySlot() ?usize {
     for (0..16) |i| {
@@ -571,7 +575,7 @@ pub const SEC_APPLICATION_PROTOCOL_LIST = struct {
 /// Application protocols container.
 pub const SEC_APPLICATION_PROTOCOLS = struct {
     ProtocolListsSize: u32 = 0,
-    ProtocolList: SEC_APPLICATION_PROTOCOL_LIST = .{},
+    ProtocolLists: SEC_APPLICATION_PROTOCOL_LIST = .{},
 };
 
 /// Query result for negotiated ALPN.
@@ -617,8 +621,8 @@ const TlsContext = struct {
     initialized: bool = false,
 };
 
-var tls_contexts: [8]TlsContext = [_]TlsContext{.{} } ** 8;
-var tls_ctx_used: [8]bool = [_]bool{ false } ** 8;
+var tls_contexts: [8]TlsContext = @as([8]TlsContext, @splat(.{}));
+var tls_ctx_used: [8]bool = @as([8]bool, @splat(false));
 
 fn allocTlsCtx(is_server: bool) ?usize {
     for (0..8) |i| {

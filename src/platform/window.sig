@@ -144,7 +144,7 @@ pub const Window = struct {
         // Set tooltip: "SB0 Trade"
         const tip = comptime blk: {
             const s = "SB0 Trade";
-            var buf: [128]u16 = [_]u16{ 0 } ** 128;
+            var buf: [128]u16 = @as([128]u16, @splat(0));
             for (s, 0..) |c, i| {
                 buf[i] = c;
             }

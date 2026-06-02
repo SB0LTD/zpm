@@ -35,11 +35,11 @@ pub const DatagramHandler = struct {
             .enabled = false,
             .max_size = 0,
             .peer_max_size = 0,
-            .out_queue = [_]QueueSlot{.{
+            .out_queue = @as([queue_capacity]QueueSlot, @splat(QueueSlot{
                 .data = @as([max_datagram_size]u8, @splat(0)),
                 .len = 0,
                 .valid = false,
-            }} ** queue_capacity,
+            })),
             .out_head = 0,
             .out_tail = 0,
         };
@@ -118,7 +118,7 @@ test "oversized datagram rejected" {
     var h = DatagramHandler.init();
     h.peer_max_size = 10;
 
-    const big = [_]u8{0xAA} ** 11;
+    const big = @as([11]u8, @splat(0xAA));
     try testing.expect(!h.queueSend(&big));
 }
 

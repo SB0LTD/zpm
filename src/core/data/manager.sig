@@ -23,7 +23,7 @@ pub const ReadFn = t.ReadFn;
 
 pub const DataManager = struct {
     // ── Cache-backed storage ────────────────────────────────
-    cache_path: [128]u16 = [_]u16{ 0 } ** 128,
+    cache_path: [128]u16 = @as([128]u16, @splat(0)),
     cache_valid: bool = false,
     cache_1m_count: usize = 0,
     period_secs: i64 = 60,

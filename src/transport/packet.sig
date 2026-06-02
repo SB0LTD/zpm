@@ -96,7 +96,7 @@ pub const Frame = union(enum) {
         ack_delay: u64 = 0,
         range_count: u16 = 0,
         first_range: u64 = 0,
-        ranges: [max_ack_ranges]AckRange = [_]AckRange{.{} } ** max_ack_ranges,
+        ranges: [max_ack_ranges]AckRange = @as([max_ack_ranges]AckRange, @splat(.{})),
     },
     reset_stream: struct { stream_id: u64 = 0, error_code: u64 = 0, final_size: u64 = 0 },
     stop_sending: struct { stream_id: u64 = 0, error_code: u64 = 0 },
@@ -558,7 +558,7 @@ fn parseAckFrame(buf: []const u8, off: usize, start: usize) FrameResult {
     const first_range = vr.val;
     pos += vr.len;
 
-    var ranges: [max_ack_ranges]AckRange = [_]AckRange{.{} } ** max_ack_ranges;
+    var ranges: [max_ack_ranges]AckRange = @as([max_ack_ranges]AckRange, @splat(.{}));
     const count = @min(range_count, max_ack_ranges);
     for (0..count) |i| {
         // gap

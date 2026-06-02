@@ -35,6 +35,6 @@ pub const DebugState = struct {
     scroll: i32 = 0,
     frame_time_us: u32 = 0,
     fps: u16 = 0,
-    slot_stats: [MAX_DEBUG_SLOTS]SlotStats = [_]SlotStats{.{} } ** MAX_DEBUG_SLOTS,
+    slot_stats: [MAX_DEBUG_SLOTS]SlotStats = @as([MAX_DEBUG_SLOTS]SlotStats, @splat(.{})),
     slot_count: u8 = 0,
 };

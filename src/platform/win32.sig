@@ -359,7 +359,7 @@ pub const NOTIFYICONDATAW = extern struct {
     uFlags: u32 = 0,
     uCallbackMessage: u32 = 0,
     hIcon: HICON = null,
-    szTip: [128]u16 = [_]u16{ 0 } ** 128,
+    szTip: [128]u16 = @as([128]u16, @splat(0)),
 };
 
 pub extern "shell32" fn Shell_NotifyIconW(DWORD, *NOTIFYICONDATAW) callconv(.c) BOOL;
@@ -453,7 +453,7 @@ pub extern "kernel32" fn GetCommandLineW() callconv(.c) LPCWSTR;
 // ============================================================
 pub fn L(comptime s: []const u8) LPCWSTR {
     const w = comptime blk: {
-        var buf: [s.len:0]u16 = .{ 0 } ** s.len;
+        var buf: [s.len:0]u16 = @as([s.len:0]u16, @splat(0));
         for (s, 0..) |c, i| {
             buf[i] = c;
         }
@@ -556,7 +556,7 @@ pub const sockaddr_in = extern struct {
 
 pub const fd_set = extern struct {
     fd_count: u32 = 0,
-    fd_array: [64]SOCKET = [_]SOCKET{ 0 } ** 64,
+    fd_array: [64]SOCKET = @as([64]SOCKET, @splat(0)),
 };
 
 pub const timeval = extern struct {

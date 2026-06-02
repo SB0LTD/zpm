@@ -279,7 +279,7 @@ pub const TicketEntry = struct {
 /// Fixed-size cache of session tickets for 0-RTT resumption.
 /// Uses LRU eviction by overwriting the oldest slot when full.
 pub const TicketCache = struct {
-    entries: [max_ticket_slots]TicketEntry = [_]TicketEntry{.{} } ** max_ticket_slots,
+    entries: [max_ticket_slots]TicketEntry = @as([max_ticket_slots]TicketEntry, @splat(.{})),
     count: u8 = 0,
 
     /// Store a session ticket for a server address. Evicts oldest if full.
