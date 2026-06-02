@@ -243,6 +243,7 @@ pub fn Sleep(ms: u32) void {
 /// Opaque handle types (no-op on Linux -- we use std.crypto directly).
 pub const BCRYPT_ALG_HANDLE = ?*anyopaque;
 pub const BCRYPT_KEY_HANDLE = ?*anyopaque;
+pub const BCRYPT_HASH_HANDLE = ?*anyopaque;
 
 /// Algorithm identifier placeholders (wide strings on Windows, unused on Linux).
 pub const BCRYPT_AES_ALGORITHM: [*:0]const u16 = &[_:0]u16{ 'A', 'E', 'S' };
@@ -359,6 +360,87 @@ pub fn BCryptDestroyKey(hKey: BCRYPT_KEY_HANDLE) i32 {
     }
     return 0;
 }
+
+// ── BCrypt Hash functions (HMAC via std.crypto) ──
+
+const HashSlot = struct {
+    key: [64]u8 = undefined,
+    key_len: u8 = 0,
+    data: [8192]u8 = undefined,
+    data_len: u32 = 0,
+    active: bool = false,
+};
+
+var hash_slots: [8]HashSlot = @as([8]HashSlot, @splat(HashSlot{}));
+
+fn allocHashSlot() ?usize {
+    for (0..8) |i| {
+        if (!hash_slots[i].active) {
+            hash_slots[i] = .{};
+            hash_slots[i].active = true;
+            return i;
+        }
+    }
+    return null;
+}
+
+pub fn BCryptCreateHash(
+    hAlgorithm: BCRYPT_ALG_HANDLE,
+    phHash: *BCRYPT_HASH_HANDLE,
+    pbHashObject: ?[*]u8,
+    cbHashObject: u32,
+    pbSecret: [*]const u8,
+    cbSecret: u32,
+    dwFlags: u32,
+) i32 {
+    _ = hAlgorithm;
+    _ = pbHashObject;
+    _ = cbHashObject;
+    _ = dwFlags;
+    const idx = allocHashSlot() orelse return -1;
+    const len: usize = @intCast(cbSecret);
+    if (len > 64) return -1;
+    @memcpy(hash_slots[idx].key[0..len], pbSecret[0..len]);
+    hash_slots[idx].key_len = @intCast(len);
+    hash_slots[idx].data_len = 0;
+    phHash.* = @ptrFromInt(idx + 100); // offset to distinguish from key handles
+    return 0;
+}
+
+pub fn BCryptHashData(hHash: BCRYPT_HASH_HANDLE, pbInput: [*]const u8, cbInput: u32, dwFlags: u32) i32 {
+    _ = dwFlags;
+    const ptr_val = @intFromPtr(hHash);
+    if (ptr_val < 100 or ptr_val >= 108) return -1;
+    const idx = ptr_val - 100;
+    const input_len: usize = @intCast(cbInput);
+    const cur: usize = hash_slots[idx].data_len;
+    if (cur + input_len > hash_slots[idx].data.len) return -1;
+    @memcpy(hash_slots[idx].data[cur .. cur + input_len], pbInput[0..input_len]);
+    hash_slots[idx].data_len = @intCast(cur + input_len);
+    return 0;
+}
+
+pub fn BCryptFinishHash(hHash: BCRYPT_HASH_HANDLE, pbOutput: *[32]u8, cbOutput: u32, dwFlags: u32) i32 {
+    _ = cbOutput;
+    _ = dwFlags;
+    const ptr_val = @intFromPtr(hHash);
+    if (ptr_val < 100 or ptr_val >= 108) return -1;
+    const idx = ptr_val - 100;
+    const Hmac = crypto.auth.hmac.sha2.HmacSha256;
+    const klen: usize = hash_slots[idx].key_len;
+    const dlen: usize = hash_slots[idx].data_len;
+    Hmac.create(pbOutput, hash_slots[idx].data[0..dlen], hash_slots[idx].key[0..klen]);
+    return 0;
+}
+
+pub fn BCryptDestroyHash(hHash: BCRYPT_HASH_HANDLE) i32 {
+    const ptr_val = @intFromPtr(hHash);
+    if (ptr_val >= 100 and ptr_val < 108) {
+        hash_slots[ptr_val - 100].active = false;
+    }
+    return 0;
+}
+
 /// AES-128/256-GCM encrypt using std.crypto.
 pub fn BCryptEncrypt(
     hKey: BCRYPT_KEY_HANDLE,
@@ -535,6 +617,7 @@ pub const ISC_REQ_CONFIDENTIALITY: u32 = 0x00000010;
 pub const ISC_REQ_ALLOCATE_MEMORY: u32 = 0x00000100;
 pub const ISC_REQ_STREAM: u32 = 0x00008000;
 pub const ISC_REQ_USE_SUPPLIED_CREDS: u32 = 0x00000080;
+pub const ISC_REQ_MANUAL_CRED_VALIDATION: u32 = 0x00080000;
 
 pub const ASC_REQ_SEQUENCE_DETECT: u32 = 0x00000008;
 pub const ASC_REQ_REPLAY_DETECT: u32 = 0x00000004;
@@ -568,7 +651,7 @@ pub const SCH_CREDENTIALS = struct {
 /// Application protocol negotiation list.
 pub const SEC_APPLICATION_PROTOCOL_LIST = struct {
     ProtoNegoExt: u32 = SecApplicationProtocolNegotiationExt_ALPN,
-    usProtocolListSize: u16 = 0,
+    ProtocolListSize: u16 = 0,
     ProtocolList: [256]u8 = @as([256]u8, @splat(0)),
 };
 

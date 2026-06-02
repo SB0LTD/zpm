@@ -109,7 +109,7 @@ pub const ProcessResult = struct {
     /// Error, if any.
     err: HandshakeError = .none,
     /// Negotiated ALPN protocol.
-    alpn: [32]u8 = @as([32]u8, @splat(0)),
+    alpn: [64]u8 = @as([64]u8, @splat(0)),
     alpn_len: u8 = 0,
     /// Derived key material for QUIC packet protection.
     handshake_keys_available: bool = false,
@@ -189,9 +189,10 @@ pub const Tls13Engine = struct {
         e.is_server = true;
 
         // Generate server ephemeral X25519 keypair
-        const kp = X25519.KeyPair.generate();
-        e.eph_private = kp.secret_key;
-        e.eph_public = kp.public_key;
+        var seed: [32]u8 = undefined;
+        _ = std.os.linux.getrandom(@ptrCast(&seed), 32, 0);
+        e.eph_private = seed;
+        e.eph_public = X25519.recoverPublicKey(seed) catch @as([32]u8, @splat(0));
 
         return e;
     }
@@ -430,7 +431,7 @@ pub const Tls13Engine = struct {
 
         // random (32 bytes)
         if (p + 32 > buf.len) return .buffer_overflow;
-        crypto.random.bytes(buf[p..][0..32]);
+        _ = std.os.linux.getrandom(@ptrCast(buf[p..][0..32]), 32, 0);
         p += 32;
 
         // legacy_session_id_echo (empty)
@@ -590,8 +591,9 @@ pub const Tls13Engine = struct {
             return .signature_failed;
         const signature = key_pair.sign(sign_content[0..sign_len], null) catch
             return .signature_failed;
-        const sig_der = signature.toDer();
-        const sig_len: u16 = sig_der.len;
+        var sig_der_buf: [72]u8 = undefined;
+        const sig_der = signature.toDer(&sig_der_buf);
+        const sig_len: u16 = @intCast(sig_der.len);
 
         const hdr_start = p;
         p += 4;
@@ -601,7 +603,7 @@ pub const Tls13Engine = struct {
         p += 2;
         writeU16(buf[p..][0..2], sig_len);
         p += 2;
-        @memcpy(buf[p..][0..sig_len], sig_der.data[0..sig_len]);
+        @memcpy(buf[p..][0..sig_len], sig_der[0..sig_len]);
         p += sig_len;
 
         buf[hdr_start] = HsMsgType.certificate_verify;
@@ -674,7 +676,8 @@ pub const Tls13Engine = struct {
         Hmac.create(&self.early_secret, &zero_psk, &zero_salt);
 
         var derived_secret: [HASH_LEN]u8 = undefined;
-        const empty_hash = Sha256.hash(&.{}, .{});
+        var empty_hash: [HASH_LEN]u8 = undefined;
+        Sha256.hash(&.{}, &empty_hash, .{});
         hkdfExpandLabel(&self.early_secret, "derived", &empty_hash, &derived_secret);
 
         Hmac.create(&self.handshake_secret, &self.shared_secret, &derived_secret);
@@ -690,7 +693,8 @@ pub const Tls13Engine = struct {
 
     fn deriveApplicationSecrets(self: *Tls13Engine) void {
         var derived_secret: [HASH_LEN]u8 = undefined;
-        const empty_hash = Sha256.hash(&.{}, .{});
+        var empty_hash: [HASH_LEN]u8 = undefined;
+        Sha256.hash(&.{}, &empty_hash, .{});
         hkdfExpandLabel(&self.handshake_secret, "derived", &empty_hash, &derived_secret);
 
         const zero_ikm: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0));

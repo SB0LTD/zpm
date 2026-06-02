@@ -134,7 +134,7 @@ pub const TlsEngine = struct {
 
         const cred_use: w32.DWORD = if (is_server) w32.SECPKG_CRED_INBOUND else w32.SECPKG_CRED_OUTBOUND;
 
-        var cred_handle: w32.CredHandle = .{};
+        var cred_handle: w32.CredHandle = .{ 0, 0 };
         const status = w32.AcquireCredentialsHandleW(
             null, // principal
             w32.UNISP_NAME_W, // package
@@ -395,7 +395,7 @@ pub const TlsEngine = struct {
             w32.ISC_REQ_MANUAL_CRED_VALIDATION;
 
         var cred_h: w32.CredHandle = @bitCast(self.cred_handle);
-        var ctx_h: w32.CtxtHandle = .{};
+        var ctx_h: w32.CtxtHandle = .{ 0, 0 };
         var out_flags: w32.DWORD = 0;
 
         const status = w32.InitializeSecurityContextW(
