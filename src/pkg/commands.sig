@@ -48,7 +48,7 @@ pub const CommandContext = struct {
 };
 
 /// Pre-computed transport health snapshot for doctor display.
-/// Populated from TelemetryCounters by the caller (zpm_main.zig).
+/// Populated from TelemetryCounters by the caller (zpm_main.sig).
 pub const TransportHealth = struct {
     packets_sent: u64,
     packets_lost: u64,
@@ -73,7 +73,7 @@ pub const CommandResult = enum {
 
 // ── Constants ──
 
-const zon_path = "build.zig.zon";
+const zon_path = "build.sig.zon";
 const manifest_path = "zpm.pkg.zon";
 const max_zon_buf = 64 * 1024;
 
@@ -81,7 +81,7 @@ const max_zon_buf = 64 * 1024;
 var update_name_store: [128][130]u8 = undefined;
 
 // ── Install Command ──
-// Resolves packages via resolver, validates layers, writes to build.zig.zon.
+// Resolves packages via resolver, validates layers, writes to build.sig.zon.
 // Requirements: 8.1, 8.2, 8.3, 8.4, 8.5
 
 pub fn install(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandResult {
@@ -91,10 +91,10 @@ pub fn install(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandR
         return .not_found;
     }
 
-    // Read current build.zig.zon
+    // Read current build.sig.zon
     var file_buf: [max_zon_buf]u8 = undefined;
     const zon_source = ctx.read_file(zon_path, &file_buf) orelse {
-        ctx.stderr("install: cannot read build.zig.zon\n");
+        ctx.stderr("install: cannot read build.sig.zon\n");
         return .file_error;
     };
 
@@ -137,15 +137,15 @@ pub fn install(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandR
         dep_count += 1;
     }
 
-    // Write deps to build.zig.zon
+    // Write deps to build.sig.zon
     var out_buf: [max_zon_buf]u8 = undefined;
     const new_zon = zon.addDeps(zon_source, zon_deps_buf[0..dep_count], &out_buf) catch {
-        ctx.stderr("install: failed to update build.zig.zon\n");
+        ctx.stderr("install: failed to update build.sig.zon\n");
         return .file_error;
     };
 
     if (!ctx.write_file(zon_path, new_zon)) {
-        ctx.stderr("install: failed to write build.zig.zon\n");
+        ctx.stderr("install: failed to write build.sig.zon\n");
         return .file_error;
     }
 
@@ -156,7 +156,7 @@ pub fn install(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandR
 }
 
 // ── Uninstall Command ──
-// Removes a package from build.zig.zon, cleans up orphaned transitive deps.
+// Removes a package from build.sig.zon, cleans up orphaned transitive deps.
 // Requirements: 9.1, 9.2, 9.3
 
 pub fn uninstall(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandResult {
@@ -166,17 +166,17 @@ pub fn uninstall(ctx: *const CommandContext, args: *const cli.ParsedArgs) Comman
         return .not_found;
     }
 
-    // Read current build.zig.zon
+    // Read current build.sig.zon
     var file_buf: [max_zon_buf]u8 = undefined;
     const zon_source = ctx.read_file(zon_path, &file_buf) orelse {
-        ctx.stderr("uninstall: cannot read build.zig.zon\n");
+        ctx.stderr("uninstall: cannot read build.sig.zon\n");
         return .file_error;
     };
 
     // Parse existing deps (validate format before proceeding)
     var validate_buf: [256]zon.ZonDep = undefined;
     _ = zon.parseDeps(zon_source, &validate_buf) catch {
-        ctx.stderr("uninstall: failed to parse build.zig.zon\n");
+        ctx.stderr("uninstall: failed to parse build.sig.zon\n");
         return .file_error;
     };
 
@@ -229,7 +229,7 @@ pub fn uninstall(ctx: *const CommandContext, args: *const cli.ParsedArgs) Comman
                     break :blk .dependency_required;
                 },
                 error.DependencyNotFound => blk: {
-                    ctx.stderr("uninstall: package not found in build.zig.zon\n");
+                    ctx.stderr("uninstall: package not found in build.sig.zon\n");
                     break :blk .not_found;
                 },
                 else => blk: {
@@ -245,7 +245,7 @@ pub fn uninstall(ctx: *const CommandContext, args: *const cli.ParsedArgs) Comman
     }
 
     if (!ctx.write_file(zon_path, current_source)) {
-        ctx.stderr("uninstall: failed to write build.zig.zon\n");
+        ctx.stderr("uninstall: failed to write build.sig.zon\n");
         return .file_error;
     }
 
@@ -254,19 +254,19 @@ pub fn uninstall(ctx: *const CommandContext, args: *const cli.ParsedArgs) Comman
 }
 
 // ── List Command ──
-// Reads build.zig.zon and displays installed zpm packages with scoped names.
+// Reads build.sig.zon and displays installed zpm packages with scoped names.
 // Requirements: 10.1, 10.2
 
 pub fn listCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) CommandResult {
     var file_buf: [max_zon_buf]u8 = undefined;
     const zon_source = ctx.read_file(zon_path, &file_buf) orelse {
-        ctx.stderr("list: cannot read build.zig.zon\n");
+        ctx.stderr("list: cannot read build.sig.zon\n");
         return .file_error;
     };
 
     var deps_buf: [256]zon.ZonDep = undefined;
     const deps_count = zon.parseDeps(zon_source, &deps_buf) catch {
-        ctx.stderr("list: failed to parse build.zig.zon\n");
+        ctx.stderr("list: failed to parse build.sig.zon\n");
         return .file_error;
     };
     const deps = deps_buf[0..deps_count];
@@ -363,7 +363,7 @@ pub fn publishCmd(ctx: *const CommandContext, args: *const cli.ParsedArgs) Comma
         return .validation_failed;
     }
 
-    // Run layer validator (with empty inputs since we don't have build.zig scanning here)
+    // Run layer validator (with empty inputs since we don't have build.sig scanning here)
     const val_result = validator.validate(&parsed_manifest, &.{}, &.{}, &.{}, &.{});
     if (!val_result.ok()) {
         for (val_result.slice()) |err| {
@@ -444,7 +444,7 @@ pub fn validateCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) Command
         }
     }
 
-    // Run layer validator (with empty inputs — real impl would scan build.zig and sources)
+    // Run layer validator (with empty inputs — real impl would scan build.sig and sources)
     const val_result = validator.validate(&parsed_manifest, &.{}, &.{}, &.{}, &.{});
     if (!val_result.ok()) {
         has_errors = true;
@@ -470,23 +470,23 @@ pub fn validateCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) Command
 }
 
 // ── Update Command ──
-// Checks registry for newer versions, re-validates layers, updates build.zig.zon.
+// Checks registry for newer versions, re-validates layers, updates build.sig.zon.
 // Requirements: 14.1, 14.2, 14.3
 
 pub fn update(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandResult {
     const positionals = args.positional[0..args.positional_count];
 
-    // Read current build.zig.zon
+    // Read current build.sig.zon
     var file_buf: [max_zon_buf]u8 = undefined;
     const zon_source = ctx.read_file(zon_path, &file_buf) orelse {
-        ctx.stderr("update: cannot read build.zig.zon\n");
+        ctx.stderr("update: cannot read build.sig.zon\n");
         return .file_error;
     };
 
     // Parse existing deps to find what to update
     var deps_buf: [256]zon.ZonDep = undefined;
     const deps_count = zon.parseDeps(zon_source, &deps_buf) catch {
-        ctx.stderr("update: failed to parse build.zig.zon\n");
+        ctx.stderr("update: failed to parse build.sig.zon\n");
         return .file_error;
     };
     const deps = deps_buf[0..deps_count];
@@ -512,7 +512,7 @@ pub fn update(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandRe
                 }
             }
             if (!found) {
-                ctx.stderr("update: package not found in build.zig.zon\n");
+                ctx.stderr("update: package not found in build.sig.zon\n");
                 return .not_found;
             }
             if (to_update_count < to_update_buf.len) {
@@ -578,12 +578,12 @@ pub fn update(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandRe
     // Write updated deps
     var out_buf: [max_zon_buf]u8 = undefined;
     const new_zon = zon.addDeps(zon_source, zon_deps_buf[0..dep_count], &out_buf) catch {
-        ctx.stderr("update: failed to update build.zig.zon\n");
+        ctx.stderr("update: failed to update build.sig.zon\n");
         return .file_error;
     };
 
     if (!ctx.write_file(zon_path, new_zon)) {
-        ctx.stderr("update: failed to write build.zig.zon\n");
+        ctx.stderr("update: failed to write build.sig.zon\n");
         return .file_error;
     }
 
@@ -678,33 +678,33 @@ pub fn doctorCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) CommandRe
         }
     }
 
-    // Check 4: build.zig.zon presence
+    // Check 4: build.sig.zon presence
     var zon_found = false;
     {
         var file_buf: [max_zon_buf]u8 = undefined;
         if (ctx.read_file(zon_path, &file_buf) != null) {
-            ctx.stdout("\xe2\x9c\x93 build.zig.zon found\n");
+            ctx.stdout("\xe2\x9c\x93 build.sig.zon found\n");
             zon_found = true;
         } else {
-            ctx.stderr("\xe2\x9c\x97 build.zig.zon not found\n");
+            ctx.stderr("\xe2\x9c\x97 build.sig.zon not found\n");
             ctx.stderr("  run `zpm init` to create a project\n");
             all_passed = false;
         }
     }
 
-    // Check 5: build.zig presence
+    // Check 5: build.sig presence
     {
         var file_buf: [max_zon_buf]u8 = undefined;
-        if (ctx.read_file("build.zig", &file_buf) != null) {
-            ctx.stdout("\xe2\x9c\x93 build.zig found\n");
+        if (ctx.read_file("build.sig", &file_buf) != null) {
+            ctx.stdout("\xe2\x9c\x93 build.sig found\n");
         } else {
-            ctx.stderr("\xe2\x9c\x97 build.zig not found\n");
+            ctx.stderr("\xe2\x9c\x97 build.sig not found\n");
             ctx.stderr("  run `zpm init` to create a project\n");
             all_passed = false;
         }
     }
 
-    // Check 6: Count installed zpm packages (only if build.zig.zon was found)
+    // Check 6: Count installed zpm packages (only if build.sig.zon was found)
     if (zon_found) {
         var zon_buf: [max_zon_buf]u8 = undefined;
         if (ctx.read_file(zon_path, &zon_buf)) |zon_source| {
@@ -719,8 +719,8 @@ pub fn doctorCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) CommandRe
                 const count_msg = std.fmt.bufPrint(&count_buf, "\xe2\x9c\x93 {d} zpm package(s) installed\n", .{zpm_count}) catch "\xe2\x9c\x93 zpm packages counted\n";
                 ctx.stdout(count_msg);
             } else |_| {
-                ctx.stderr("\xe2\x9c\x97 Failed to parse build.zig.zon dependencies\n");
-                ctx.stderr("  check build.zig.zon for syntax errors\n");
+                ctx.stderr("\xe2\x9c\x97 Failed to parse build.sig.zon dependencies\n");
+                ctx.stderr("  check build.sig.zon for syntax errors\n");
                 all_passed = false;
             }
         }
@@ -1120,8 +1120,8 @@ const sample_zon =
     \\        },
     \\    },
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
@@ -1136,8 +1136,8 @@ const empty_deps_zon =
     \\    .minimum_zig_version = "0.16.0",
     \\    .dependencies = .{},
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
@@ -1188,10 +1188,10 @@ fn getStderr() []const u8 {
 
 // ── Install Tests ──
 
-test "install: resolves and writes deps to build.zig.zon" {
+test "install: resolves and writes deps to build.sig.zon" {
     resetMocks();
     MockHttp.reset();
-    addMockFile("build.zig.zon", empty_deps_zon);
+    addMockFile("build.sig.zon", empty_deps_zon);
 
     const reg = testRegistryClient(false);
     const ctx = testContext(&reg, &mockFetchSingle);
@@ -1210,7 +1210,7 @@ test "install: resolves and writes deps to build.zig.zon" {
 test "install: reports layer violation" {
     resetMocks();
     MockHttp.reset();
-    addMockFile("build.zig.zon", empty_deps_zon);
+    addMockFile("build.sig.zon", empty_deps_zon);
 
     const reg = testRegistryClient(false);
     const ctx = testContext(&reg, &mockFetchLayerViolation);
@@ -1241,10 +1241,10 @@ test "install: no packages specified returns not_found" {
     try testing.expectEqual(CommandResult.not_found, result);
 }
 
-test "install: missing build.zig.zon returns file_error" {
+test "install: missing build.sig.zon returns file_error" {
     resetMocks();
     MockHttp.reset();
-    // Don't add build.zig.zon to mock files
+    // Don't add build.sig.zon to mock files
 
     const reg = testRegistryClient(false);
     const ctx = testContext(&reg, &mockFetchSingle);
@@ -1260,10 +1260,10 @@ test "install: missing build.zig.zon returns file_error" {
 
 // ── Uninstall Tests ──
 
-test "uninstall: removes dep from build.zig.zon" {
+test "uninstall: removes dep from build.sig.zon" {
     resetMocks();
     MockHttp.reset();
-    addMockFile("build.zig.zon", sample_zon);
+    addMockFile("build.sig.zon", sample_zon);
 
     const reg = testRegistryClient(false);
     const ctx = testContext(&reg, null);
@@ -1281,7 +1281,7 @@ test "uninstall: removes dep from build.zig.zon" {
 test "uninstall: not found returns not_found" {
     resetMocks();
     MockHttp.reset();
-    addMockFile("build.zig.zon", sample_zon);
+    addMockFile("build.sig.zon", sample_zon);
 
     const reg = testRegistryClient(false);
     const ctx = testContext(&reg, null);
@@ -1300,7 +1300,7 @@ test "uninstall: not found returns not_found" {
 test "list: displays installed zpm deps" {
     resetMocks();
     MockHttp.reset();
-    addMockFile("build.zig.zon", sample_zon);
+    addMockFile("build.sig.zon", sample_zon);
 
     const reg = testRegistryClient(false);
     const ctx = testContext(&reg, null);
@@ -1317,7 +1317,7 @@ test "list: displays installed zpm deps" {
 test "list: empty deps shows no packages" {
     resetMocks();
     MockHttp.reset();
-    addMockFile("build.zig.zon", empty_deps_zon);
+    addMockFile("build.sig.zon", empty_deps_zon);
 
     const reg = testRegistryClient(false);
     const ctx = testContext(&reg, null);
@@ -1494,7 +1494,7 @@ test "search: offline mode returns registry_error" {
 test "update: re-resolves and writes updated deps" {
     resetMocks();
     MockHttp.reset();
-    addMockFile("build.zig.zon", sample_zon);
+    addMockFile("build.sig.zon", sample_zon);
 
     const reg = testRegistryClient(false);
     const ctx = testContext(&reg, &mockFetchWithTransitive);
@@ -1512,7 +1512,7 @@ test "update: re-resolves and writes updated deps" {
 test "update: specific package not found returns not_found" {
     resetMocks();
     MockHttp.reset();
-    addMockFile("build.zig.zon", sample_zon);
+    addMockFile("build.sig.zon", sample_zon);
 
     const reg = testRegistryClient(false);
     const ctx = testContext(&reg, &mockFetchSingle);
@@ -1824,7 +1824,7 @@ test "initCmd: scaffolds project with --name and --template" {
     const result = initCmd(&ctx, &args);
     try testing.expectEqual(CommandResult.success, result);
     try testing.expect(std.mem.indexOf(u8, getStdout(), "created my-app/") != null);
-    try testing.expect(mock_init_file_count >= 5); // build.zig.zon, build.zig, main.zig, .gitignore, README.md
+    try testing.expect(mock_init_file_count >= 5); // build.sig.zon, build.sig, main.sig, .gitignore, README.md
 }
 
 test "initCmd: missing --name returns not_found" {
@@ -2007,8 +2007,8 @@ test "doctorCmd: all checks pass with healthy environment" {
     MockHttp.get_response = "ok";
     mock_boot_exec_result = .{ .exit_code = 0, .stdout = "0.16.0\n" };
 
-    addMockFile("build.zig.zon", sample_zon);
-    addMockFile("build.zig", "// build file");
+    addMockFile("build.sig.zon", sample_zon);
+    addMockFile("build.sig", "// build file");
 
     const bootstrapper = bootstrap.ZigBootstrapper{
         .vtable = mock_boot_vtable,
@@ -2029,8 +2029,8 @@ test "doctorCmd: all checks pass with healthy environment" {
     try testing.expect(std.mem.indexOf(u8, out, "zpm v0.1.0") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Zig installed") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Registry reachable") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "build.zig.zon found") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "build.zig found") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "build.sig.zon found") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "build.sig found") != null);
     try testing.expect(std.mem.indexOf(u8, out, "1 zpm package(s)") != null);
 }
 
@@ -2041,7 +2041,7 @@ test "doctorCmd: reports failures but runs all checks" {
     MockHttp.get_should_fail = true;
     mock_boot_exec_result = null; // zig not found
 
-    // No build.zig.zon or build.zig files
+    // No build.sig.zon or build.sig files
 
     const bootstrapper = bootstrap.ZigBootstrapper{
         .vtable = mock_boot_vtable,
@@ -2062,8 +2062,8 @@ test "doctorCmd: reports failures but runs all checks" {
     const err_out = getStderr();
     try testing.expect(std.mem.indexOf(u8, err_out, "Zig not found") != null);
     try testing.expect(std.mem.indexOf(u8, err_out, "Registry unreachable") != null);
-    try testing.expect(std.mem.indexOf(u8, err_out, "build.zig.zon not found") != null);
-    try testing.expect(std.mem.indexOf(u8, err_out, "build.zig not found") != null);
+    try testing.expect(std.mem.indexOf(u8, err_out, "build.sig.zon not found") != null);
+    try testing.expect(std.mem.indexOf(u8, err_out, "build.sig not found") != null);
     // zpm version should still be in stdout
     try testing.expect(std.mem.indexOf(u8, getStdout(), "zpm v0.1.0") != null);
 }
@@ -2072,8 +2072,8 @@ test "doctorCmd: works without bootstrapper" {
     resetMocks();
     MockHttp.reset();
     MockHttp.get_response = "ok";
-    addMockFile("build.zig.zon", empty_deps_zon);
-    addMockFile("build.zig", "// build");
+    addMockFile("build.sig.zon", empty_deps_zon);
+    addMockFile("build.sig", "// build");
 
     const reg = testRegistryClient(false);
     const ctx = testContext(&reg, null);
@@ -2145,8 +2145,8 @@ test "doctorCmd: displays transport health with mock telemetry" {
     resetMocks();
     MockHttp.reset();
     MockHttp.get_response = "ok";
-    addMockFile("build.zig.zon", empty_deps_zon);
-    addMockFile("build.zig", "// build");
+    addMockFile("build.sig.zon", empty_deps_zon);
+    addMockFile("build.sig", "// build");
 
     const health = TransportHealth{
         .packets_sent = 1000,
@@ -2189,8 +2189,8 @@ test "doctorCmd: no QUIC connection shows graceful message" {
     resetMocks();
     MockHttp.reset();
     MockHttp.get_response = "ok";
-    addMockFile("build.zig.zon", empty_deps_zon);
-    addMockFile("build.zig", "// build");
+    addMockFile("build.sig.zon", empty_deps_zon);
+    addMockFile("build.sig", "// build");
 
     const reg = testRegistryClient(false);
     const ctx = testContext(&reg, null);
@@ -2210,8 +2210,8 @@ test "doctorCmd: transport health with QUIC v2 version" {
     resetMocks();
     MockHttp.reset();
     MockHttp.get_response = "ok";
-    addMockFile("build.zig.zon", empty_deps_zon);
-    addMockFile("build.zig", "// build");
+    addMockFile("build.sig.zon", empty_deps_zon);
+    addMockFile("build.sig", "// build");
 
     const health = TransportHealth{
         .packets_sent = 500,
@@ -2241,8 +2241,8 @@ test "doctorCmd: transport health with zero packets sent" {
     resetMocks();
     MockHttp.reset();
     MockHttp.get_response = "ok";
-    addMockFile("build.zig.zon", empty_deps_zon);
-    addMockFile("build.zig", "// build");
+    addMockFile("build.sig.zon", empty_deps_zon);
+    addMockFile("build.sig", "// build");
 
     const health = TransportHealth{
         .packets_sent = 0,

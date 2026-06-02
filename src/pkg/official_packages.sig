@@ -31,7 +31,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{},
         .description = "Sin/cos approximations, lerp, interpolation, pure math",
-        .source = "src/core/math.zig",
+        .source = "src/core/math.sig",
     },
     .{
         .scope = "zpm",
@@ -42,7 +42,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{},
         .description = "Minimal JSON parser",
-        .source = "src/core/json.zig",
+        .source = "src/core/json.sig",
     },
     .{
         .scope = "zpm",
@@ -53,7 +53,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{ "math", "json" },
         .description = "Core data types, storage, and logic",
-        .source = "src/core/root.zig",
+        .source = "src/core/root.sig",
     },
     // ── Layer 1: Platform ──
     .{
@@ -65,7 +65,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{"kernel32"},
         .zpm_dependencies = &.{},
         .description = "Hand-written Win32 type/constant/extern bindings",
-        .source = "src/platform/win32.zig",
+        .source = "src/platform/win32.sig",
     },
     .{
         .scope = "zpm",
@@ -76,7 +76,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{"opengl32"},
         .zpm_dependencies = &.{},
         .description = "OpenGL 1.x constants and function externs",
-        .source = "src/platform/gl.zig",
+        .source = "src/platform/gl.sig",
     },
     .{
         .scope = "zpm",
@@ -87,7 +87,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{ "kernel32", "gdi32", "user32", "shell32" },
         .zpm_dependencies = &.{ "win32", "gl" },
         .description = "Borderless WS_POPUP window creation and management",
-        .source = "src/platform/window.zig",
+        .source = "src/platform/window.sig",
     },
     .{
         .scope = "zpm",
@@ -98,7 +98,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{"kernel32"},
         .zpm_dependencies = &.{"win32"},
         .description = "High-precision timer via QueryPerformanceCounter",
-        .source = "src/platform/timer.zig",
+        .source = "src/platform/timer.sig",
     },
     .{
         .scope = "zpm",
@@ -109,7 +109,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{"kernel32"},
         .zpm_dependencies = &.{"win32"},
         .description = "Sequence lock for lock-free concurrent reads",
-        .source = "src/platform/seqlock.zig",
+        .source = "src/platform/seqlock.sig",
     },
     .{
         .scope = "zpm",
@@ -120,7 +120,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{"winhttp"},
         .zpm_dependencies = &.{"win32"},
         .description = "HTTP client via WinHTTP",
-        .source = "src/platform/http.zig",
+        .source = "src/platform/http.sig",
     },
     .{
         .scope = "zpm",
@@ -131,7 +131,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{ "bcrypt", "kernel32" },
         .zpm_dependencies = &.{"win32"},
         .description = "HMAC-SHA256 via BCrypt",
-        .source = "src/platform/crypto.zig",
+        .source = "src/platform/crypto.sig",
     },
     .{
         .scope = "zpm",
@@ -142,7 +142,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{"kernel32"},
         .zpm_dependencies = &.{"win32"},
         .description = "File I/O via Win32 CreateFile/ReadFile/WriteFile",
-        .source = "src/platform/file.zig",
+        .source = "src/platform/file.sig",
     },
     .{
         .scope = "zpm",
@@ -153,7 +153,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{"kernel32"},
         .zpm_dependencies = &.{"win32"},
         .description = "Thread pool and worker management",
-        .source = "src/platform/thread/run.zig",
+        .source = "src/platform/thread/run.sig",
     },
     .{
         .scope = "zpm",
@@ -164,7 +164,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{"kernel32"},
         .zpm_dependencies = &.{ "win32", "core" },
         .description = "Logging subsystem",
-        .source = "src/platform/log/run.zig",
+        .source = "src/platform/log/run.sig",
     },
     .{
         .scope = "zpm",
@@ -175,7 +175,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{"user32"},
         .zpm_dependencies = &.{ "win32", "gl", "logging", "core" },
         .description = "Keyboard and mouse input handling",
-        .source = "src/platform/input/run.zig",
+        .source = "src/platform/input/run.sig",
     },
     .{
         .scope = "zpm",
@@ -186,7 +186,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{ "kernel32", "opengl32" },
         .zpm_dependencies = &.{ "win32", "gl", "logging" },
         .description = "PNG encoder with deflate compression",
-        .source = "src/platform/png/encode.zig",
+        .source = "src/platform/png/encode.sig",
     },
     .{
         .scope = "zpm",
@@ -197,7 +197,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{"png"},
         .description = "GL framebuffer capture",
-        .source = "src/platform/screenshot.zig",
+        .source = "src/platform/screenshot.sig",
     },
     .{
         .scope = "zpm",
@@ -208,7 +208,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{ "ws2_32", "kernel32" },
         .zpm_dependencies = &.{ "win32", "json", "core", "seqlock", "logging", "png" },
         .description = "Embedded MCP server on 127.0.0.1:3001",
-        .source = "src/platform/mcp/run.zig",
+        .source = "src/platform/mcp/run.sig",
     },
     .{
         .scope = "zpm",
@@ -219,7 +219,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{ "kernel32", "gdi32", "user32", "shell32", "opengl32", "winhttp", "bcrypt", "ws2_32" },
         .zpm_dependencies = &.{ "core", "win32", "gl", "window", "input", "timer", "threading", "http", "crypto", "file-io", "seqlock", "screenshot", "logging", "png", "mcp" },
         .description = "Coarse-grained re-export of all platform subsystems",
-        .source = "src/platform/root.zig",
+        .source = "src/platform/root.sig",
     },
     // ── Layer 1: Transport ──
     .{
@@ -231,7 +231,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{ "ws2_32", "kernel32" },
         .zpm_dependencies = &.{"win32"},
         .description = "Win32 UDP socket I/O (non-blocking send/receive via Winsock2)",
-        .source = "src/transport/udp.zig",
+        .source = "src/transport/udp.sig",
     },
     .{
         .scope = "zpm",
@@ -242,7 +242,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{},
         .description = "QUIC packet parsing and serialization (RFC 9000)",
-        .source = "src/transport/packet.zig",
+        .source = "src/transport/packet.sig",
     },
     .{
         .scope = "zpm",
@@ -253,7 +253,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{ "bcrypt", "secur32", "kernel32" },
         .zpm_dependencies = &.{ "win32", "packet", "crypto" },
         .description = "TLS 1.3 integration and packet protection (RFC 9001)",
-        .source = "src/transport/crypto.zig",
+        .source = "src/transport/crypto.sig",
     },
     .{
         .scope = "zpm",
@@ -264,7 +264,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{"packet"},
         .description = "Loss detection and congestion control (RFC 9002, NewReno)",
-        .source = "src/transport/recovery.zig",
+        .source = "src/transport/recovery.sig",
     },
     .{
         .scope = "zpm",
@@ -275,7 +275,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{"packet"},
         .description = "Stream management with flow control (RFC 9000)",
-        .source = "src/transport/streams.zig",
+        .source = "src/transport/streams.sig",
     },
     .{
         .scope = "zpm",
@@ -286,7 +286,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{"packet"},
         .description = "DATAGRAM frame handling (RFC 9221)",
-        .source = "src/transport/datagram.zig",
+        .source = "src/transport/datagram.sig",
     },
     .{
         .scope = "zpm",
@@ -297,7 +297,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{},
         .description = "Per-connection counters and diagnostics",
-        .source = "src/transport/telemetry.zig",
+        .source = "src/transport/telemetry.sig",
     },
     .{
         .scope = "zpm",
@@ -308,7 +308,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{ "kernel32", "ws2_32", "bcrypt", "secur32" },
         .zpm_dependencies = &.{ "win32", "packet", "streams", "datagram", "recovery", "transport-crypto", "udp", "telemetry" },
         .description = "Packet assembly and pacing",
-        .source = "src/transport/scheduler.zig",
+        .source = "src/transport/scheduler.sig",
     },
     .{
         .scope = "zpm",
@@ -319,7 +319,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{ "ws2_32", "bcrypt", "secur32", "kernel32" },
         .zpm_dependencies = &.{ "win32", "packet", "transport-crypto", "recovery", "streams", "datagram", "telemetry", "udp" },
         .description = "QUIC connection state machine (RFC 9000)",
-        .source = "src/transport/conn.zig",
+        .source = "src/transport/conn.sig",
     },
     .{
         .scope = "zpm",
@@ -330,7 +330,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{ "streams", "datagram", "packet" },
         .description = "Application protocol mapping (registry ops to QUIC lanes)",
-        .source = "src/transport/appmap.zig",
+        .source = "src/transport/appmap.sig",
     },
     .{
         .scope = "zpm",
@@ -341,7 +341,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{ "ws2_32", "bcrypt", "secur32", "kernel32" },
         .zpm_dependencies = &.{ "udp", "packet", "transport-crypto", "recovery", "streams", "datagram", "scheduler", "conn", "telemetry", "appmap" },
         .description = "Coarse-grained re-export of all transport sub-modules",
-        .source = "src/transport/root.zig",
+        .source = "src/transport/root.sig",
     },
     // ── Layer 2: Render ──
     .{
@@ -353,7 +353,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{},
         .description = "Color types and constants",
-        .source = "src/render/color.zig",
+        .source = "src/render/color.sig",
     },
     .{
         .scope = "zpm",
@@ -364,7 +364,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{ "gl", "color" },
         .description = "GL immediate-mode drawing: rect, line, candle, glow",
-        .source = "src/render/primitives.zig",
+        .source = "src/render/primitives.sig",
     },
     .{
         .scope = "zpm",
@@ -375,7 +375,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{ "gl", "win32", "color" },
         .description = "Bitmap font rasterization (Win32 GDI to GL texture atlas)",
-        .source = "src/render/text.zig",
+        .source = "src/render/text.sig",
     },
     .{
         .scope = "zpm",
@@ -386,7 +386,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{},
         .zpm_dependencies = &.{ "gl", "win32" },
         .description = "ICO file loading to GL texture",
-        .source = "src/render/icon.zig",
+        .source = "src/render/icon.sig",
     },
     .{
         .scope = "zpm",
@@ -397,7 +397,7 @@ pub const packages = [_]OfficialPackage{
         .system_libraries = &.{ "opengl32", "gdi32", "user32" },
         .zpm_dependencies = &.{ "color", "primitives", "text", "icon" },
         .description = "Coarse-grained re-export of all render subsystems",
-        .source = "src/render/root.zig",
+        .source = "src/render/root.sig",
     },
 };
 

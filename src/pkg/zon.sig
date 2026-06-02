@@ -1,6 +1,6 @@
-// Layer 0 — String-based ZON manipulation for build.zig.zon.
+// Layer 0 — String-based ZON manipulation for build.sig.zon.
 //
-// Operates on build.zig.zon content as a byte buffer. Parses the
+// Operates on build.sig.zon content as a byte buffer. Parses the
 // .dependencies field, adds/removes entries, and outputs valid ZON.
 // No full AST — just enough string matching for the well-structured
 // ZON format that Zig produces.
@@ -573,8 +573,8 @@ const sample_zon =
     \\        },
     \\    },
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
@@ -589,8 +589,8 @@ const empty_deps_zon =
     \\    .minimum_zig_version = "0.16.0",
     \\    .dependencies = .{},
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
@@ -614,8 +614,8 @@ const mixed_deps_zon =
     \\        },
     \\    },
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
@@ -760,8 +760,8 @@ test "removeDep: removes orphaned transitive deps" {
         \\        },
         \\    },
         \\    .paths = .{
-        \\        "build.zig",
-        \\        "build.zig.zon",
+        \\        "build.sig",
+        \\        "build.sig.zon",
         \\        "src",
         \\    },
         \\}
@@ -860,7 +860,7 @@ test "removeDep: preserves non-zpm deps during removal" {
 
 test "Property 6: Build Manifest Mutation Preserves Non-Zpm Dependencies" {
     // **Validates: Requirements 5.3, 5.4**
-    // Generate build.zig.zon with mixed zpm/non-zpm deps, call addDeps to
+    // Generate build.sig.zon with mixed zpm/non-zpm deps, call addDeps to
     // add/update zpm deps, verify non-zpm entries are unchanged in the output
     // and output is valid (can be re-parsed).
     var prng = std.Random.DefaultPrng.init(0xBEEF_CAFE_0006);
@@ -924,8 +924,8 @@ test "Property 6: Build Manifest Mutation Preserves Non-Zpm Dependencies" {
         const footer =
             \\    },
             \\    .paths = .{
-            \\        "build.zig",
-            \\        "build.zig.zon",
+            \\        "build.sig",
+            \\        "build.sig.zon",
             \\        "src",
             \\    },
             \\}
@@ -1136,8 +1136,8 @@ test "Property 8: Removal Safety" {
         const footer =
             \\    },
             \\    .paths = .{
-            \\        "build.zig",
-            \\        "build.zig.zon",
+            \\        "build.sig",
+            \\        "build.sig.zon",
             \\        "src",
             \\    },
             \\}

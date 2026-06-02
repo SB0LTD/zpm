@@ -110,29 +110,29 @@ pub fn scaffold(vtable: *const InitVtable, config: *const InitConfig) InitResult
         return .failed;
     }
 
-    // Step 3: Generate build.zig.zon
+    // Step 3: Generate build.sig.zon
     var zon_buf: [4096]u8 = undefined;
     const zon_content = generateBuildZigZon(project, tmpl, &zon_buf) orelse {
         cleanup(vtable, project);
         return .failed;
     };
-    if (!writeProjectFile(vtable, project, "build.zig.zon", zon_content)) {
+    if (!writeProjectFile(vtable, project, "build.sig.zon", zon_content)) {
         cleanup(vtable, project);
         return .failed;
     }
 
-    // Step 4: Generate build.zig
+    // Step 4: Generate build.sig
     var build_buf: [8192]u8 = undefined;
     const build_content = generateBuildZig(project, tmpl, &build_buf) orelse {
         cleanup(vtable, project);
         return .failed;
     };
-    if (!writeProjectFile(vtable, project, "build.zig", build_content)) {
+    if (!writeProjectFile(vtable, project, "build.sig", build_content)) {
         cleanup(vtable, project);
         return .failed;
     }
 
-    // Step 5: Create src/ dir and generate src/main.zig (or src/root.zig for package)
+    // Step 5: Create src/ dir and generate src/main.sig (or src/root.sig for package)
     var src_path_buf: [512]u8 = undefined;
     const src_dir = joinPath(project, "src", &src_path_buf) orelse {
         cleanup(vtable, project);
@@ -144,7 +144,7 @@ pub fn scaffold(vtable: *const InitVtable, config: *const InitConfig) InitResult
     }
 
     var main_buf: [4096]u8 = undefined;
-    const src_filename = if (tmpl == .package or tmpl == .library) "src/root.zig" else "src/main.zig";
+    const src_filename = if (tmpl == .package or tmpl == .library) "src/root.sig" else "src/main.sig";
     const main_content = generateMainZig(project, tmpl, &main_buf) orelse {
         cleanup(vtable, project);
         return .failed;
@@ -246,7 +246,7 @@ fn replacePlaceholder(template: []const u8, project_name: []const u8, buf: []u8)
     return buf[0..out_pos];
 }
 
-// ── build.zig.zon Generator ──
+// ── build.sig.zon Generator ──
 
 fn generateBuildZigZon(project_name: []const u8, tmpl: Template, buf: *[4096]u8) ?[]const u8 {
     const template_str = switch (tmpl) {
@@ -270,8 +270,8 @@ const build_zig_zon_empty =
     \\    .minimum_zig_version = "0.16.0",
     \\    .dependencies = .{},
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
@@ -302,8 +302,8 @@ const build_zig_zon_window =
     \\        },
     \\    },
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
@@ -350,8 +350,8 @@ const build_zig_zon_gl_app =
     \\        },
     \\    },
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
@@ -406,8 +406,8 @@ const build_zig_zon_trading =
     \\        },
     \\    },
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
@@ -421,8 +421,8 @@ const build_zig_zon_package =
     \\    .minimum_zig_version = "0.16.0",
     \\    .dependencies = .{},
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
@@ -441,8 +441,8 @@ const build_zig_zon_cli_app =
     \\        },
     \\    },
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
@@ -465,8 +465,8 @@ const build_zig_zon_web_server =
     \\        },
     \\    },
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
@@ -513,8 +513,8 @@ const build_zig_zon_gui_app =
     \\        },
     \\    },
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
@@ -528,15 +528,15 @@ const build_zig_zon_library =
     \\    .minimum_zig_version = "0.16.0",
     \\    .dependencies = .{},
     \\    .paths = .{
-    \\        "build.zig",
-    \\        "build.zig.zon",
+    \\        "build.sig",
+    \\        "build.sig.zon",
     \\        "src",
     \\    },
     \\}
     \\
 ;
 
-// ── build.zig Generator ──
+// ── build.sig Generator ──
 
 fn generateBuildZig(project_name: []const u8, tmpl: Template, buf: *[8192]u8) ?[]const u8 {
     const template_str = switch (tmpl) {
@@ -563,7 +563,7 @@ const build_zig_empty =
     \\    const exe = b.addExecutable(.{
     \\        .name = "{{project_name}}",
     \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.zig"),
+    \\            .root_source_file = b.path("src/main.sig"),
     \\            .target = target,
     \\            .optimize = optimize,
     \\        }),
@@ -595,7 +595,7 @@ const build_zig_window =
     \\    const exe = b.addExecutable(.{
     \\        .name = "{{project_name}}",
     \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.zig"),
+    \\            .root_source_file = b.path("src/main.sig"),
     \\            .target = target,
     \\            .optimize = optimize,
     \\        }),
@@ -636,7 +636,7 @@ const build_zig_gl_app =
     \\    const exe = b.addExecutable(.{
     \\        .name = "{{project_name}}",
     \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.zig"),
+    \\            .root_source_file = b.path("src/main.sig"),
     \\            .target = target,
     \\            .optimize = optimize,
     \\        }),
@@ -683,7 +683,7 @@ const build_zig_trading =
     \\    const exe = b.addExecutable(.{
     \\        .name = "{{project_name}}",
     \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.zig"),
+    \\            .root_source_file = b.path("src/main.sig"),
     \\            .target = target,
     \\            .optimize = optimize,
     \\        }),
@@ -718,14 +718,14 @@ const build_zig_package =
     \\    const optimize = b.standardOptimizeOption(.{});
     \\
     \\    _ = b.addModule("{{project_name}}", .{
-    \\        .root_source_file = b.path("src/root.zig"),
+    \\        .root_source_file = b.path("src/root.sig"),
     \\        .target = target,
     \\        .optimize = optimize,
     \\    });
     \\
     \\    const tests = b.addTest(.{
     \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/root.zig"),
+    \\            .root_source_file = b.path("src/root.sig"),
     \\            .target = target,
     \\            .optimize = optimize,
     \\        }),
@@ -749,7 +749,7 @@ const build_zig_cli_app =
     \\    const exe = b.addExecutable(.{
     \\        .name = "{{project_name}}",
     \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.zig"),
+    \\            .root_source_file = b.path("src/main.sig"),
     \\            .target = target,
     \\            .optimize = optimize,
     \\        }),
@@ -781,7 +781,7 @@ const build_zig_web_server =
     \\    const exe = b.addExecutable(.{
     \\        .name = "{{project_name}}",
     \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.zig"),
+    \\            .root_source_file = b.path("src/main.sig"),
     \\            .target = target,
     \\            .optimize = optimize,
     \\        }),
@@ -819,7 +819,7 @@ const build_zig_gui_app =
     \\    const exe = b.addExecutable(.{
     \\        .name = "{{project_name}}",
     \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.zig"),
+    \\            .root_source_file = b.path("src/main.sig"),
     \\            .target = target,
     \\            .optimize = optimize,
     \\        }),
@@ -852,14 +852,14 @@ const build_zig_library =
     \\    const optimize = b.standardOptimizeOption(.{});
     \\
     \\    _ = b.addModule("{{project_name}}", .{
-    \\        .root_source_file = b.path("src/root.zig"),
+    \\        .root_source_file = b.path("src/root.sig"),
     \\        .target = target,
     \\        .optimize = optimize,
     \\    });
     \\
     \\    const tests = b.addTest(.{
     \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/root.zig"),
+    \\            .root_source_file = b.path("src/root.sig"),
     \\            .target = target,
     \\            .optimize = optimize,
     \\        }),
@@ -871,7 +871,7 @@ const build_zig_library =
     \\
 ;
 
-// ── src/main.zig (or src/root.zig) Generator ──
+// ── src/main.sig (or src/root.sig) Generator ──
 
 fn generateMainZig(project_name: []const u8, tmpl: Template, buf: *[4096]u8) ?[]const u8 {
     const template_str = switch (tmpl) {
@@ -1065,7 +1065,7 @@ const main_zig_library =
 // ── .gitignore Content ──
 
 const gitignore_content =
-    \\.zig-cache/
+    \\.sig-cache/
     \\zig-out/
     \\config.json
     \\
@@ -1364,18 +1364,18 @@ test "scaffold: empty template creates all expected files" {
     // Should have created project dir + src dir = 2 dirs
     try testing.expectEqual(@as(usize, 2), mock_dir_count);
 
-    // Should have written: build.zig.zon, build.zig, src/main.zig, .gitignore, README.md = 5 files
+    // Should have written: build.sig.zon, build.sig, src/main.sig, .gitignore, README.md = 5 files
     try testing.expectEqual(@as(usize, 5), mock_file_write_count);
 
     // Verify each expected file exists
-    try testing.expect(findWrittenFile("build.zig.zon") != null);
-    try testing.expect(findWrittenFile("build.zig") != null);
-    try testing.expect(findWrittenFile("src/main.zig") != null);
+    try testing.expect(findWrittenFile("build.sig.zon") != null);
+    try testing.expect(findWrittenFile("build.sig") != null);
+    try testing.expect(findWrittenFile("src/main.sig") != null);
     try testing.expect(findWrittenFile(".gitignore") != null);
     try testing.expect(findWrittenFile("README.md") != null);
 }
 
-test "scaffold: package template creates zpm.pkg.zon and src/root.zig" {
+test "scaffold: package template creates zpm.pkg.zon and src/root.sig" {
     resetInitMocks();
     const config = InitConfig{
         .project_name = "my-pkg",
@@ -1388,9 +1388,9 @@ test "scaffold: package template creates zpm.pkg.zon and src/root.zig" {
     // 5 standard files + zpm.pkg.zon = 6
     try testing.expectEqual(@as(usize, 6), mock_file_write_count);
     try testing.expect(findWrittenFile("zpm.pkg.zon") != null);
-    try testing.expect(findWrittenFile("src/root.zig") != null);
-    // Should NOT have src/main.zig
-    try testing.expect(findWrittenFile("src/main.zig") == null);
+    try testing.expect(findWrittenFile("src/root.sig") != null);
+    // Should NOT have src/main.sig
+    try testing.expect(findWrittenFile("src/main.sig") == null);
 }
 
 // ── Test: {{project_name}} replacement works ──
@@ -1404,20 +1404,20 @@ test "scaffold: project_name placeholder replaced in all files" {
     const result = scaffold(&mock_init_vtable, &config);
     try testing.expectEqual(InitResult.success, result);
 
-    // Check build.zig.zon contains project name, not placeholder
-    const zon_idx = findWrittenFile("build.zig.zon").?;
+    // Check build.sig.zon contains project name, not placeholder
+    const zon_idx = findWrittenFile("build.sig.zon").?;
     const zon_content = getWrittenFileContent(zon_idx);
     try testing.expect(containsSubstr(zon_content, "cool-project"));
     try testing.expect(!containsSubstr(zon_content, "{{project_name}}"));
 
-    // Check build.zig
-    const build_idx = findWrittenFile("build.zig").?;
+    // Check build.sig
+    const build_idx = findWrittenFile("build.sig").?;
     const build_content = getWrittenFileContent(build_idx);
     try testing.expect(containsSubstr(build_content, "cool-project"));
     try testing.expect(!containsSubstr(build_content, "{{project_name}}"));
 
-    // Check src/main.zig
-    const main_idx = findWrittenFile("src/main.zig").?;
+    // Check src/main.sig
+    const main_idx = findWrittenFile("src/main.sig").?;
     const main_content = getWrittenFileContent(main_idx);
     try testing.expect(containsSubstr(main_content, "cool-project"));
     try testing.expect(!containsSubstr(main_content, "{{project_name}}"));
@@ -1486,7 +1486,7 @@ test "scaffold: window template produces correct deps" {
     const result = scaffold(&mock_init_vtable, &config);
     try testing.expectEqual(InitResult.success, result);
 
-    const zon_idx = findWrittenFile("build.zig.zon").?;
+    const zon_idx = findWrittenFile("build.sig.zon").?;
     const zon_content = getWrittenFileContent(zon_idx);
     try testing.expect(containsSubstr(zon_content, "zpm-core"));
     try testing.expect(containsSubstr(zon_content, "zpm-window"));
@@ -1503,7 +1503,7 @@ test "scaffold: gl-app template produces correct deps" {
     const result = scaffold(&mock_init_vtable, &config);
     try testing.expectEqual(InitResult.success, result);
 
-    const zon_idx = findWrittenFile("build.zig.zon").?;
+    const zon_idx = findWrittenFile("build.sig.zon").?;
     const zon_content = getWrittenFileContent(zon_idx);
     try testing.expect(containsSubstr(zon_content, "zpm-color"));
     try testing.expect(containsSubstr(zon_content, "zpm-primitives"));
@@ -1520,7 +1520,7 @@ test "scaffold: trading template produces correct deps" {
     const result = scaffold(&mock_init_vtable, &config);
     try testing.expectEqual(InitResult.success, result);
 
-    const zon_idx = findWrittenFile("build.zig.zon").?;
+    const zon_idx = findWrittenFile("build.sig.zon").?;
     const zon_content = getWrittenFileContent(zon_idx);
     try testing.expect(containsSubstr(zon_content, "zpm-text"));
     try testing.expect(containsSubstr(zon_content, "zpm-http"));
@@ -1637,17 +1637,17 @@ test "property 16: init atomicity — failures at each step trigger cleanup" {
 
     // Test failure on each file write step by failing on specific file suffixes
     const fail_targets = [_][]const u8{
-        "build.zig.zon",
-        "build.zig",
-        "src/main.zig",
+        "build.sig.zon",
+        "build.sig",
+        "src/main.sig",
         ".gitignore",
         "README.md",
     };
 
     for (fail_targets) |target| {
         for (templates) |tmpl| {
-            // For package and library templates, src file is root.zig not main.zig
-            if ((tmpl == .package or tmpl == .library) and containsSubstr(target, "src/main.zig")) continue;
+            // For package and library templates, src file is root.sig not main.sig
+            if ((tmpl == .package or tmpl == .library) and containsSubstr(target, "src/main.sig")) continue;
 
             resetInitMocks();
             mock_write_file_fail_on = target;
@@ -1665,10 +1665,10 @@ test "property 16: init atomicity — failures at each step trigger cleanup" {
         }
     }
 
-    // Also test package/library-specific: fail on src/root.zig
+    // Also test package/library-specific: fail on src/root.sig
     {
         resetInitMocks();
-        mock_write_file_fail_on = "src/root.zig";
+        mock_write_file_fail_on = "src/root.sig";
 
         const config = InitConfig{
             .project_name = "test-proj",
@@ -1680,10 +1680,10 @@ test "property 16: init atomicity — failures at each step trigger cleanup" {
         try testing.expect(mock_removed_dir_count > 0);
     }
 
-    // Also test library: fail on src/root.zig
+    // Also test library: fail on src/root.sig
     {
         resetInitMocks();
-        mock_write_file_fail_on = "src/root.zig";
+        mock_write_file_fail_on = "src/root.sig";
 
         const config = InitConfig{
             .project_name = "test-proj",
@@ -1814,8 +1814,8 @@ test "property 18: init determinism — identical inputs produce identical outpu
 
 // **Property 23: Init File Completeness**
 // Validates: Requirement 16.4
-// For each template, verify scaffolded directory contains build.zig.zon,
-// build.zig, src/ file (main.zig or root.zig), .gitignore, README.md.
+// For each template, verify scaffolded directory contains build.sig.zon,
+// build.sig, src/ file (main.sig or root.sig), .gitignore, README.md.
 // Package template also has zpm.pkg.zon.
 
 test "property 23: init file completeness — all required files present" {
@@ -1834,16 +1834,16 @@ test "property 23: init file completeness — all required files present" {
         try testing.expectEqual(InitResult.success, result);
 
         // All templates must have these files
-        try testing.expect(findWrittenFile("build.zig.zon") != null);
-        try testing.expect(findWrittenFile("build.zig") != null);
+        try testing.expect(findWrittenFile("build.sig.zon") != null);
+        try testing.expect(findWrittenFile("build.sig") != null);
         try testing.expect(findWrittenFile(".gitignore") != null);
         try testing.expect(findWrittenFile("README.md") != null);
 
-        // Source file: package and library use root.zig, others use main.zig
+        // Source file: package and library use root.sig, others use main.sig
         if (tmpl == .package or tmpl == .library) {
-            try testing.expect(findWrittenFile("src/root.zig") != null);
+            try testing.expect(findWrittenFile("src/root.sig") != null);
         } else {
-            try testing.expect(findWrittenFile("src/main.zig") != null);
+            try testing.expect(findWrittenFile("src/main.sig") != null);
         }
 
         // Package template must also have zpm.pkg.zon

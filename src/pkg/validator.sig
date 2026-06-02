@@ -98,9 +98,9 @@ const allowed_windows_syslibs = [_][]const u8{
 /// Parameters:
 ///   - pkg: The package manifest being validated.
 ///   - dep_metas: Resolved metadata for each zpm dependency (scope, name, layer).
-///   - build_syslibs: System library names found via linkSystemLibrary in build.zig.
+///   - build_syslibs: System library names found via linkSystemLibrary in build.sig.
 ///   - source_scans: Scan results for source files (std.io/fs imports, allocator params).
-///   - build_modules: Module names declared in build.zig (for export validation).
+///   - build_modules: Module names declared in build.sig (for export validation).
 pub fn validate(
     pkg: *const PackageManifest,
     dep_metas: []const DepMeta,
@@ -121,12 +121,12 @@ pub fn validate(
         }
     }
 
-    // Rule 2: System library completeness — build.zig syslibs ⊆ manifest syslibs
+    // Rule 2: System library completeness — build.sig syslibs ⊆ manifest syslibs
     for (build_syslibs) |lib| {
         if (!containsStr(pkg.system_libraries, lib)) {
             result.add(
                 .missing_syslib,
-                "system library linked in build.zig but not declared in manifest",
+                "system library linked in build.sig but not declared in manifest",
                 lib,
             );
         }
@@ -158,12 +158,12 @@ pub fn validate(
         }
     }
 
-    // Rule 5: Export-module consistency — every export must match a build.zig module
+    // Rule 5: Export-module consistency — every export must match a build.sig module
     for (pkg.exports) |export_name| {
         if (!containsStr(build_modules, export_name)) {
             result.add(
                 .export_mismatch,
-                "export entry has no matching module in build.zig",
+                "export entry has no matching module in build.sig",
                 export_name,
             );
         }
@@ -327,7 +327,7 @@ test "validate: no_std_io false ignores std.io imports" {
     var pkg = testManifest();
     pkg.constraints.no_std_io = false;
     const scans = [_]SourceScanResult{
-        .{ .file_path = "src/foo.zig", .has_std_io_import = true },
+        .{ .file_path = "src/foo.sig", .has_std_io_import = true },
     };
     const result = validate(&pkg, &.{}, pkg.system_libraries, &scans, &.{"window"});
     try testing.expect(result.ok());
@@ -337,19 +337,19 @@ test "validate: no_std_io true rejects std.io import" {
     var pkg = testManifest();
     pkg.constraints.no_std_io = true;
     const scans = [_]SourceScanResult{
-        .{ .file_path = "src/foo.zig", .has_std_io_import = true },
+        .{ .file_path = "src/foo.sig", .has_std_io_import = true },
     };
     const result = validate(&pkg, &.{}, pkg.system_libraries, &scans, &.{"window"});
     try testing.expect(!result.ok());
     try testing.expectEqual(ValidationErrorTag.std_io_violation, result.slice()[0].tag);
-    try testing.expectEqualStrings("src/foo.zig", result.slice()[0].detail);
+    try testing.expectEqualStrings("src/foo.sig", result.slice()[0].detail);
 }
 
 test "validate: no_std_io true rejects std.fs import" {
     var pkg = testManifest();
     pkg.constraints.no_std_io = true;
     const scans = [_]SourceScanResult{
-        .{ .file_path = "src/bar.zig", .has_std_fs_import = true },
+        .{ .file_path = "src/bar.sig", .has_std_fs_import = true },
     };
     const result = validate(&pkg, &.{}, pkg.system_libraries, &scans, &.{"window"});
     try testing.expect(!result.ok());
@@ -360,7 +360,7 @@ test "validate: no_std_io true with clean sources passes" {
     var pkg = testManifest();
     pkg.constraints.no_std_io = true;
     const scans = [_]SourceScanResult{
-        .{ .file_path = "src/clean.zig" },
+        .{ .file_path = "src/clean.sig" },
     };
     const result = validate(&pkg, &.{}, pkg.system_libraries, &scans, &.{"window"});
     try testing.expect(result.ok());
@@ -372,7 +372,7 @@ test "validate: no_allocator false ignores allocator params" {
     var pkg = testManifest();
     pkg.constraints.no_allocator = false;
     const scans = [_]SourceScanResult{
-        .{ .file_path = "src/alloc.zig", .has_allocator_param = true },
+        .{ .file_path = "src/alloc.sig", .has_allocator_param = true },
     };
     const result = validate(&pkg, &.{}, pkg.system_libraries, &scans, &.{"window"});
     try testing.expect(result.ok());
@@ -382,19 +382,19 @@ test "validate: no_allocator true rejects allocator param" {
     var pkg = testManifest();
     pkg.constraints.no_allocator = true;
     const scans = [_]SourceScanResult{
-        .{ .file_path = "src/alloc.zig", .has_allocator_param = true },
+        .{ .file_path = "src/alloc.sig", .has_allocator_param = true },
     };
     const result = validate(&pkg, &.{}, pkg.system_libraries, &scans, &.{"window"});
     try testing.expect(!result.ok());
     try testing.expectEqual(ValidationErrorTag.allocator_violation, result.slice()[0].tag);
-    try testing.expectEqualStrings("src/alloc.zig", result.slice()[0].detail);
+    try testing.expectEqualStrings("src/alloc.sig", result.slice()[0].detail);
 }
 
 test "validate: no_allocator true with clean sources passes" {
     var pkg = testManifest();
     pkg.constraints.no_allocator = true;
     const scans = [_]SourceScanResult{
-        .{ .file_path = "src/clean.zig" },
+        .{ .file_path = "src/clean.sig" },
     };
     const result = validate(&pkg, &.{}, pkg.system_libraries, &scans, &.{"window"});
     try testing.expect(result.ok());
@@ -498,7 +498,7 @@ test "validate: multiple rule violations reported together" {
     };
     const build_syslibs = [_][]const u8{"opengl32"};
     const scans = [_]SourceScanResult{
-        .{ .file_path = "src/io.zig", .has_std_io_import = true, .has_allocator_param = true },
+        .{ .file_path = "src/io.sig", .has_std_io_import = true, .has_allocator_param = true },
     };
     const result = validate(&pkg, &deps, &build_syslibs, &scans, &.{});
     // Expect: layer_violation, missing_syslib (opengl32 not in manifest syslibs for layer 0 pkg),
@@ -582,7 +582,7 @@ test "property: layer monotonicity — rejects all upward-layer edges (randomize
 
 test "property: system library completeness — reports all missing libs (randomized)" {
     // Property 5: For any package, the set of system_libraries declared in
-    // the manifest must be a superset of the libraries linked in build.zig.
+    // the manifest must be a superset of the libraries linked in build.sig.
     // Every library in build_syslibs but not in manifest.system_libraries
     // must be reported as missing_syslib.
     //
@@ -605,7 +605,7 @@ test "property: system library completeness — reports all missing libs (random
             }
         }
 
-        // Pick a random subset of libs for build.zig linkSystemLibrary calls
+        // Pick a random subset of libs for build.sig linkSystemLibrary calls
         var build_libs: [8][]const u8 = undefined;
         var build_count: usize = 0;
         for (all_libs) |lib| {
@@ -659,7 +659,7 @@ test "property: constraint adherence — detects std.io and allocator violations
     var prng = std.Random.DefaultPrng.init(0xC005_7BA1);
     const rand = prng.random();
 
-    const file_paths = [_][]const u8{ "src/a.zig", "src/b.zig", "src/c.zig", "src/d.zig" };
+    const file_paths = [_][]const u8{ "src/a.sig", "src/b.sig", "src/c.sig", "src/d.sig" };
 
     const iterations = 400;
     for (0..iterations) |_| {
@@ -712,7 +712,7 @@ test "property: constraint adherence — detects std.io and allocator violations
 
 test "property: export-module consistency — reports all mismatches (randomized)" {
     // Property 10: Every entry in exports must match a module name in
-    // build.zig. The validator must report every export that has no
+    // build.sig. The validator must report every export that has no
     // matching module.
     //
     // Validates: Requirement 6.7

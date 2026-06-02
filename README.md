@@ -103,6 +103,19 @@ Layer 1: Platform    OS bindings, system services (win32, gl, window, http, cryp
 Layer 0: Core        Pure data types, math, logic — no platform deps (core, math, json)
 ```
 
+### Implementation Language
+
+zpm is implemented entirely in **Sig** (`.sig` files). Sig is source-compatible with Zig — same syntax, same semantics — compiled by the [Sig compiler](https://github.com/SB0LTD/sig).
+
+**zpm fully supports both Zig and Sig projects:**
+
+- `build.sig` — recommended build file for Sig projects
+- `build.zig` — supported for Zig projects
+- `build.sig.zon` — recommended package manifest
+- `build.zig.zon` — supported for Zig projects
+
+All `zpm` commands (`install`, `build`, `run`, etc.) work identically regardless of which extension your project uses.
+
 ### Principles
 
 - No hidden allocations — all storage is stack or comptime-sized

@@ -1,14 +1,14 @@
 // Layer 0 — Source file scanner for zpm package protocol.
 // No I/O, no allocator. Operates on byte slices passed by the caller.
 //
-// Scans .zig source files for constraint violations (std.io/fs imports,
-// allocator params) and extracts module/syslib declarations from build.zig.
+// Scans .sig source files for constraint violations (std.io/fs imports,
+// allocator params) and extracts module/syslib declarations from build.sig.
 
 const validator = @import("validator.sig");
 
 // ── Source File Scanning ──
 
-/// Scan a single .zig source file for constraint violations.
+/// Scan a single .sig source file for constraint violations.
 /// Returns a SourceScanResult with flags for std.io/fs imports and allocator params.
 pub fn scanSourceFile(file_path: []const u8, content: []const u8) validator.SourceScanResult {
     return .{
@@ -19,9 +19,9 @@ pub fn scanSourceFile(file_path: []const u8, content: []const u8) validator.Sour
     };
 }
 
-// ── Build.zig Extraction ──
+// ── Build.sig Extraction ──
 
-/// Extract module names from build.zig content.
+/// Extract module names from build.sig content.
 /// Looks for patterns like: addModule("name", ...) and addImport("name", ...)
 /// Returns the number of names written to `out`.
 pub fn extractModuleNames(build_content: []const u8, out: [][]const u8) usize {
@@ -51,7 +51,7 @@ pub fn extractModuleNames(build_content: []const u8, out: [][]const u8) usize {
     return dedup(out, count);
 }
 
-/// Extract system library names from build.zig content.
+/// Extract system library names from build.sig content.
 /// Looks for patterns like: linkSystemLibrary("name", ...)
 /// Returns the number of names written to `out`.
 pub fn extractSystemLibraries(build_content: []const u8, out: [][]const u8) usize {
@@ -194,46 +194,46 @@ const testing = std.testing;
 
 test "scanSourceFile: detects @import(\"std\").io" {
     const content = "const std = @import(\"std\").io;\n";
-    const result = scanSourceFile("src/foo.zig", content);
+    const result = scanSourceFile("src/foo.sig", content);
     try testing.expect(result.has_std_io_import);
     try testing.expect(!result.has_std_fs_import);
     try testing.expect(!result.has_allocator_param);
-    try testing.expectEqualStrings("src/foo.zig", result.file_path);
+    try testing.expectEqualStrings("src/foo.sig", result.file_path);
 }
 
 test "scanSourceFile: detects std.io usage" {
     const content = "const writer = std.io.getStdOut();\n";
-    const result = scanSourceFile("src/bar.zig", content);
+    const result = scanSourceFile("src/bar.sig", content);
     try testing.expect(result.has_std_io_import);
 }
 
 test "scanSourceFile: detects @import(\"std\").fs" {
     const content = "const fs = @import(\"std\").fs;\n";
-    const result = scanSourceFile("src/fs.zig", content);
+    const result = scanSourceFile("src/fs.sig", content);
     try testing.expect(result.has_std_fs_import);
 }
 
 test "scanSourceFile: detects std.fs usage" {
     const content = "const dir = std.fs.cwd();\n";
-    const result = scanSourceFile("src/dir.zig", content);
+    const result = scanSourceFile("src/dir.sig", content);
     try testing.expect(result.has_std_fs_import);
 }
 
 test "scanSourceFile: detects allocator param in pub fn" {
     const content = "pub fn init(allocator: std.mem.Allocator) void {}\n";
-    const result = scanSourceFile("src/alloc.zig", content);
+    const result = scanSourceFile("src/alloc.sig", content);
     try testing.expect(result.has_allocator_param);
 }
 
 test "scanSourceFile: detects allocator param with leading whitespace" {
     const content = "    pub fn create(alloc: std.mem.Allocator, n: usize) !void {}\n";
-    const result = scanSourceFile("src/alloc2.zig", content);
+    const result = scanSourceFile("src/alloc2.sig", content);
     try testing.expect(result.has_allocator_param);
 }
 
 test "scanSourceFile: ignores allocator in non-pub fn" {
     const content = "fn helper(allocator: std.mem.Allocator) void {}\n";
-    const result = scanSourceFile("src/priv.zig", content);
+    const result = scanSourceFile("src/priv.sig", content);
     try testing.expect(!result.has_allocator_param);
 }
 
@@ -245,14 +245,14 @@ test "scanSourceFile: clean file returns all false" {
         \\    return a + b;
         \\}
     ;
-    const result = scanSourceFile("src/clean.zig", content);
+    const result = scanSourceFile("src/clean.sig", content);
     try testing.expect(!result.has_std_io_import);
     try testing.expect(!result.has_std_fs_import);
     try testing.expect(!result.has_allocator_param);
 }
 
 test "scanSourceFile: empty content returns all false" {
-    const result = scanSourceFile("src/empty.zig", "");
+    const result = scanSourceFile("src/empty.sig", "");
     try testing.expect(!result.has_std_io_import);
     try testing.expect(!result.has_std_fs_import);
     try testing.expect(!result.has_allocator_param);
@@ -265,7 +265,7 @@ test "scanSourceFile: detects multiple violations" {
         \\
         \\pub fn doStuff(alloc: std.mem.Allocator) void {}
     ;
-    const result = scanSourceFile("src/multi.zig", content);
+    const result = scanSourceFile("src/multi.sig", content);
     try testing.expect(result.has_std_io_import);
     try testing.expect(result.has_std_fs_import);
     try testing.expect(result.has_allocator_param);
