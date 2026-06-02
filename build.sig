@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const os_tag = target.result.os.tag;
 
     // ── Granular modules (Layer 0: Core) ──
 
@@ -49,14 +50,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    win32_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) win32_mod.linkSystemLibrary("kernel32", .{});
 
     const gl_mod = b.addModule("gl", .{
         .root_source_file = b.path("src/platform/gl.sig"),
         .target = target,
         .optimize = optimize,
     });
-    gl_mod.linkSystemLibrary("opengl32", .{});
+    if (os_tag == .windows) gl_mod.linkSystemLibrary("opengl32", .{});
 
     const window_mod = b.addModule("window", .{
         .root_source_file = b.path("src/platform/window.sig"),
@@ -65,10 +66,10 @@ pub fn build(b: *std.Build) void {
     });
     window_mod.addImport("win32", win32_mod);
     window_mod.addImport("gl", gl_mod);
-    window_mod.linkSystemLibrary("kernel32", .{});
-    window_mod.linkSystemLibrary("gdi32", .{});
-    window_mod.linkSystemLibrary("user32", .{});
-    window_mod.linkSystemLibrary("shell32", .{});
+    if (os_tag == .windows) window_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) window_mod.linkSystemLibrary("gdi32", .{});
+    if (os_tag == .windows) window_mod.linkSystemLibrary("user32", .{});
+    if (os_tag == .windows) window_mod.linkSystemLibrary("shell32", .{});
 
     const timer_mod = b.addModule("timer", .{
         .root_source_file = b.path("src/platform/timer.sig"),
@@ -76,7 +77,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     timer_mod.addImport("win32", win32_mod);
-    timer_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) timer_mod.linkSystemLibrary("kernel32", .{});
 
     const seqlock_mod = b.addModule("seqlock", .{
         .root_source_file = b.path("src/platform/seqlock.sig"),
@@ -84,7 +85,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     seqlock_mod.addImport("win32", win32_mod);
-    seqlock_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) seqlock_mod.linkSystemLibrary("kernel32", .{});
 
     const http_mod = b.addModule("http", .{
         .root_source_file = b.path("src/platform/http.sig"),
@@ -92,7 +93,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     http_mod.addImport("win32", win32_mod);
-    http_mod.linkSystemLibrary("winhttp", .{});
+    if (os_tag == .windows) http_mod.linkSystemLibrary("winhttp", .{});
 
     const crypto_mod = b.addModule("crypto", .{
         .root_source_file = b.path("src/platform/crypto.sig"),
@@ -100,8 +101,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     crypto_mod.addImport("win32", win32_mod);
-    crypto_mod.linkSystemLibrary("bcrypt", .{});
-    crypto_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) crypto_mod.linkSystemLibrary("bcrypt", .{});
+    if (os_tag == .windows) crypto_mod.linkSystemLibrary("kernel32", .{});
 
     const file_io_mod = b.addModule("file_io", .{
         .root_source_file = b.path("src/platform/file.sig"),
@@ -109,7 +110,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     file_io_mod.addImport("win32", win32_mod);
-    file_io_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) file_io_mod.linkSystemLibrary("kernel32", .{});
 
     const threading_mod = b.addModule("threading", .{
         .root_source_file = b.path("src/platform/thread/run.sig"),
@@ -117,7 +118,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     threading_mod.addImport("win32", win32_mod);
-    threading_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) threading_mod.linkSystemLibrary("kernel32", .{});
 
     const logging_mod = b.addModule("logging", .{
         .root_source_file = b.path("src/platform/log/run.sig"),
@@ -126,7 +127,7 @@ pub fn build(b: *std.Build) void {
     });
     logging_mod.addImport("win32", win32_mod);
     logging_mod.addImport("core", core_mod);
-    logging_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) logging_mod.linkSystemLibrary("kernel32", .{});
 
     const input_mod = b.addModule("input", .{
         .root_source_file = b.path("src/platform/input/run.sig"),
@@ -137,7 +138,7 @@ pub fn build(b: *std.Build) void {
     input_mod.addImport("gl", gl_mod);
     input_mod.addImport("logging", logging_mod);
     input_mod.addImport("core", core_mod);
-    input_mod.linkSystemLibrary("user32", .{});
+    if (os_tag == .windows) input_mod.linkSystemLibrary("user32", .{});
 
     const png_mod = b.addModule("png", .{
         .root_source_file = b.path("src/platform/png/encode.sig"),
@@ -147,8 +148,8 @@ pub fn build(b: *std.Build) void {
     png_mod.addImport("win32", win32_mod);
     png_mod.addImport("gl", gl_mod);
     png_mod.addImport("logging", logging_mod);
-    png_mod.linkSystemLibrary("kernel32", .{});
-    png_mod.linkSystemLibrary("opengl32", .{});
+    if (os_tag == .windows) png_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) png_mod.linkSystemLibrary("opengl32", .{});
 
     const screenshot_mod = b.addModule("screenshot", .{
         .root_source_file = b.path("src/platform/screenshot.sig"),
@@ -168,8 +169,8 @@ pub fn build(b: *std.Build) void {
     mcp_mod.addImport("seqlock", seqlock_mod);
     mcp_mod.addImport("logging", logging_mod);
     mcp_mod.addImport("png", png_mod);
-    mcp_mod.linkSystemLibrary("ws2_32", .{});
-    mcp_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) mcp_mod.linkSystemLibrary("ws2_32", .{});
+    if (os_tag == .windows) mcp_mod.linkSystemLibrary("kernel32", .{});
 
     const subprocess_mod = b.addModule("subprocess", .{
         .root_source_file = b.path("src/platform/subprocess.sig"),
@@ -219,9 +220,9 @@ pub fn build(b: *std.Build) void {
     render_mod.addImport("primitives", primitives_mod);
     render_mod.addImport("text", text_mod);
     render_mod.addImport("icon", icon_mod);
-    render_mod.linkSystemLibrary("opengl32", .{});
-    render_mod.linkSystemLibrary("gdi32", .{});
-    render_mod.linkSystemLibrary("user32", .{});
+    if (os_tag == .windows) render_mod.linkSystemLibrary("opengl32", .{});
+    if (os_tag == .windows) render_mod.linkSystemLibrary("gdi32", .{});
+    if (os_tag == .windows) render_mod.linkSystemLibrary("user32", .{});
 
     // ── Coarse-grained layer modules ──
 
@@ -246,11 +247,12 @@ pub fn build(b: *std.Build) void {
     platform_mod.addImport("png", png_mod);
     platform_mod.addImport("mcp", mcp_mod);
     platform_mod.addImport("subprocess", subprocess_mod);
-    for ([_][]const u8{
+    if (os_tag == .windows) { for ([_][]const u8{
         "kernel32", "gdi32",   "user32", "shell32",
         "opengl32", "winhttp", "bcrypt", "ws2_32",
     }) |lib| {
         platform_mod.linkSystemLibrary(lib, .{});
+    }
     }
 
     // ── Test step ──
@@ -286,8 +288,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     udp_mod.addImport("win32", win32_mod);
-    udp_mod.linkSystemLibrary("ws2_32", .{});
-    udp_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) udp_mod.linkSystemLibrary("ws2_32", .{});
+    if (os_tag == .windows) udp_mod.linkSystemLibrary("kernel32", .{});
 
     const packet_mod = b.addModule("packet", .{
         .root_source_file = b.path("src/transport/packet.sig"),
@@ -303,9 +305,9 @@ pub fn build(b: *std.Build) void {
     transport_crypto_mod.addImport("win32", win32_mod);
     transport_crypto_mod.addImport("packet", packet_mod);
     transport_crypto_mod.addImport("crypto", crypto_mod);
-    transport_crypto_mod.linkSystemLibrary("bcrypt", .{});
-    transport_crypto_mod.linkSystemLibrary("secur32", .{});
-    transport_crypto_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) transport_crypto_mod.linkSystemLibrary("bcrypt", .{});
+    if (os_tag == .windows) transport_crypto_mod.linkSystemLibrary("secur32", .{});
+    if (os_tag == .windows) transport_crypto_mod.linkSystemLibrary("kernel32", .{});
 
     const tls13_mod = b.addModule("tls13", .{
         .root_source_file = b.path("src/transport/tls13.sig"),
@@ -354,10 +356,10 @@ pub fn build(b: *std.Build) void {
     conn_mod.addImport("datagram", datagram_mod);
     conn_mod.addImport("telemetry", telemetry_mod);
     conn_mod.addImport("udp", udp_mod);
-    conn_mod.linkSystemLibrary("ws2_32", .{});
-    conn_mod.linkSystemLibrary("bcrypt", .{});
-    conn_mod.linkSystemLibrary("secur32", .{});
-    conn_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) conn_mod.linkSystemLibrary("ws2_32", .{});
+    if (os_tag == .windows) conn_mod.linkSystemLibrary("bcrypt", .{});
+    if (os_tag == .windows) conn_mod.linkSystemLibrary("secur32", .{});
+    if (os_tag == .windows) conn_mod.linkSystemLibrary("kernel32", .{});
 
     const scheduler_mod = b.addModule("scheduler", .{
         .root_source_file = b.path("src/transport/scheduler.sig"),
@@ -372,10 +374,10 @@ pub fn build(b: *std.Build) void {
     scheduler_mod.addImport("transport_crypto", transport_crypto_mod);
     scheduler_mod.addImport("udp", udp_mod);
     scheduler_mod.addImport("telemetry", telemetry_mod);
-    scheduler_mod.linkSystemLibrary("kernel32", .{});
-    scheduler_mod.linkSystemLibrary("ws2_32", .{});
-    scheduler_mod.linkSystemLibrary("bcrypt", .{});
-    scheduler_mod.linkSystemLibrary("secur32", .{});
+    if (os_tag == .windows) scheduler_mod.linkSystemLibrary("kernel32", .{});
+    if (os_tag == .windows) scheduler_mod.linkSystemLibrary("ws2_32", .{});
+    if (os_tag == .windows) scheduler_mod.linkSystemLibrary("bcrypt", .{});
+    if (os_tag == .windows) scheduler_mod.linkSystemLibrary("secur32", .{});
 
     const appmap_mod = b.addModule("appmap", .{
         .root_source_file = b.path("src/transport/appmap.sig"),
@@ -403,10 +405,11 @@ pub fn build(b: *std.Build) void {
     transport_mod.addImport("conn", conn_mod);
     transport_mod.addImport("telemetry", telemetry_mod);
     transport_mod.addImport("appmap", appmap_mod);
-    for ([_][]const u8{
+    if (os_tag == .windows) { for ([_][]const u8{
         "ws2_32", "bcrypt", "secur32", "kernel32",
     }) |lib| {
         transport_mod.linkSystemLibrary(lib, .{});
+    }
     }
 
     // ── Test wiring ──
@@ -570,10 +573,11 @@ pub fn build(b: *std.Build) void {
     integration_mod.addImport("udp", udp_mod);
     integration_mod.addImport("win32", win32_mod);
     integration_mod.addImport("appmap", appmap_mod);
-    for ([_][]const u8{
+    if (os_tag == .windows) { for ([_][]const u8{
         "ws2_32", "bcrypt", "secur32", "kernel32",
     }) |lib| {
         integration_mod.linkSystemLibrary(lib, .{});
+    }
     }
     const integration_tests = b.addTest(.{
         .root_module = integration_mod,
@@ -597,10 +601,11 @@ pub fn build(b: *std.Build) void {
     server_initial_mod.addImport("datagram", datagram_mod);
     server_initial_mod.addImport("udp", udp_mod);
     server_initial_mod.addImport("win32", win32_mod);
-    for ([_][]const u8{
+    if (os_tag == .windows) { for ([_][]const u8{
         "ws2_32", "bcrypt", "secur32", "kernel32",
     }) |lib| {
         server_initial_mod.linkSystemLibrary(lib, .{});
+    }
     }
     const server_initial_tests = b.addTest(.{
         .root_module = server_initial_mod,

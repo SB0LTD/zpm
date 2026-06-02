@@ -359,7 +359,7 @@ pub const NOTIFYICONDATAW = extern struct {
     uFlags: u32 = 0,
     uCallbackMessage: u32 = 0,
     hIcon: HICON = null,
-    szTip: [128]u16 = [_]u16{0} ** 128,
+    szTip: [128]u16 = [_]u16{ 0 } ** 128,
 };
 
 pub extern "shell32" fn Shell_NotifyIconW(DWORD, *NOTIFYICONDATAW) callconv(.c) BOOL;
@@ -453,7 +453,7 @@ pub extern "kernel32" fn GetCommandLineW() callconv(.c) LPCWSTR;
 // ============================================================
 pub fn L(comptime s: []const u8) LPCWSTR {
     const w = comptime blk: {
-        var buf: [s.len:0]u16 = .{0} ** s.len;
+        var buf: [s.len:0]u16 = .{ 0 } ** s.len;
         for (s, 0..) |c, i| {
             buf[i] = c;
         }
@@ -543,20 +543,20 @@ pub const WSADATA = extern struct {
     iMaxSockets: u16 = 0,
     iMaxUdpDg: u16 = 0,
     lpVendorInfo: ?[*]u8 = null,
-    szDescription: [257]u8 = [_]u8{0} ** 257,
-    szSystemStatus: [129]u8 = [_]u8{0} ** 129,
+    szDescription: [257]u8 = @as([257]u8, @splat(0)),
+    szSystemStatus: [129]u8 = @as([129]u8, @splat(0)),
 };
 
 pub const sockaddr_in = extern struct {
     sin_family: i16 = AF_INET,
     sin_port: u16 = 0,
     sin_addr: u32 = 0,
-    sin_zero: [8]u8 = [_]u8{0} ** 8,
+    sin_zero: [8]u8 = @as([8]u8, @splat(0)),
 };
 
 pub const fd_set = extern struct {
     fd_count: u32 = 0,
-    fd_array: [64]SOCKET = [_]SOCKET{0} ** 64,
+    fd_array: [64]SOCKET = [_]SOCKET{ 0 } ** 64,
 };
 
 pub const timeval = extern struct {
@@ -649,7 +649,7 @@ pub const TLS_PARAMETERS = extern struct {
 pub const SEC_APPLICATION_PROTOCOL_LIST = extern struct {
     ProtoNegoExt: u32 = 0, // SecApplicationProtocolNegotiationExt
     ProtocolListSize: u16 = 0,
-    ProtocolList: [256]u8 = [_]u8{0} ** 256,
+    ProtocolList: [256]u8 = @as([256]u8, @splat(0)),
 };
 
 pub const SEC_APPLICATION_PROTOCOLS = extern struct {
@@ -706,7 +706,7 @@ pub const SecPkgContext_ApplicationProtocol = extern struct {
     ProtoNegoStatus: u32 = 0,
     ProtoNegoExt: u32 = 0,
     ProtocolIdSize: u8 = 0,
-    ProtocolId: [255]u8 = [_]u8{0} ** 255,
+    ProtocolId: [255]u8 = @as([255]u8, @splat(0)),
 };
 
 // SChannel extern functions

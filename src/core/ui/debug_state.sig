@@ -7,9 +7,9 @@
 /// Per-slot stats snapshot, populated each frame by app.sig.
 pub const SlotStats = struct {
     active: bool = false,
-    source_name: [16]u8 = [_]u8{0} ** 16,
+    source_name: [16]u8 = @as([16]u8, @splat(0)),
     source_len: u8 = 0,
-    symbol_name: [16]u8 = [_]u8{0} ** 16,
+    symbol_name: [16]u8 = @as([16]u8, @splat(0)),
     symbol_len: u8 = 0,
     candle_count: u32 = 0,
     candle_1m_count: u32 = 0,
@@ -35,6 +35,6 @@ pub const DebugState = struct {
     scroll: i32 = 0,
     frame_time_us: u32 = 0,
     fps: u16 = 0,
-    slot_stats: [MAX_DEBUG_SLOTS]SlotStats = [_]SlotStats{.{}} ** MAX_DEBUG_SLOTS,
+    slot_stats: [MAX_DEBUG_SLOTS]SlotStats = [_]SlotStats{.{} } ** MAX_DEBUG_SLOTS,
     slot_count: u8 = 0,
 };

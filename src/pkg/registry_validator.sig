@@ -287,7 +287,7 @@ test "property: registry publish dependency existence — non-existent deps reje
     // Property 19: Submit packages with non-existent deps via validatePublish,
     // verify registry rejects with dependency_not_found error.
     //
-    // **Validates: Requirement 19.1**
+    // ** Validates: Requirement 19.1**
 
     var prng = std.Random.DefaultPrng.init(0xBAAD_CAFE);
     const rand = prng.random();
@@ -319,7 +319,7 @@ test "property: registry publish dependency existence — non-existent deps reje
         prop19_existing_count = 0;
 
         // Pick unique existing deps
-        var used: [16]bool = .{false} ** 16;
+        var used: [16]bool = .{ false } ** 16;
         for (0..num_existing) |_| {
             var idx = rand.intRangeLessThan(usize, 0, dep_pool.len);
             // Find next unused slot

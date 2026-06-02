@@ -36,7 +36,7 @@ pub const DatagramHandler = struct {
             .max_size = 0,
             .peer_max_size = 0,
             .out_queue = [_]QueueSlot{.{
-                .data = [_]u8{0} ** max_datagram_size,
+                .data = @as([max_datagram_size]u8, @splat(0)),
                 .len = 0,
                 .valid = false,
             }} ** queue_capacity,

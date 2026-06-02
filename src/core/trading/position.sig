@@ -27,7 +27,7 @@ pub const MarginMode = enum(u8) {
 
 /// A single open futures position from any exchange
 pub const Position = struct {
-    symbol: [20]u8 = [_]u8{0} ** 20,
+    symbol: [20]u8 = @as([20]u8, @splat(0)),
     symbol_len: u8 = 0,
     side: PositionSide = .long,
     margin_mode: MarginMode = .cross,

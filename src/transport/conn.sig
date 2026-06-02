@@ -53,7 +53,7 @@ pub const TransportParams = struct {
     max_udp_payload_size: u16 = 1472,
     max_datagram_frame_size: u16 = 1200,
     active_connection_id_limit: u8 = 4,
-    version_info: [32]u8 = [_]u8{0} ** 32,
+    version_info: [32]u8 = @as([32]u8, @splat(0)),
     version_info_len: u8 = 0,
 };
 
@@ -270,7 +270,7 @@ pub const max_ticket_slots: u8 = 4;
 /// A stored session ticket for 0-RTT resumption with a specific server.
 pub const TicketEntry = struct {
     server_addr: w32.sockaddr_in = w32.sockaddr_in{},
-    ticket: [512]u8 = [_]u8{0} ** 512,
+    ticket: [512]u8 = @as([512]u8, @splat(0)),
     ticket_len: u16 = 0,
     transport_params: TransportParams = .{},
     valid: bool = false,
@@ -279,7 +279,7 @@ pub const TicketEntry = struct {
 /// Fixed-size cache of session tickets for 0-RTT resumption.
 /// Uses LRU eviction by overwriting the oldest slot when full.
 pub const TicketCache = struct {
-    entries: [max_ticket_slots]TicketEntry = [_]TicketEntry{.{}} ** max_ticket_slots,
+    entries: [max_ticket_slots]TicketEntry = [_]TicketEntry{.{} } ** max_ticket_slots,
     count: u8 = 0,
 
     /// Store a session ticket for a server address. Evicts oldest if full.
@@ -525,16 +525,16 @@ pub const Connection = struct {
         self.last_recv_tick = 0;
         self.draining_end_tick = 0;
 
-        self.recv_buf = [_]u8{0} ** 1500;
-        self.send_buf = [_]u8{0} ** 1500;
+        self.recv_buf = @as([1500]u8, @splat(0));
+        self.send_buf = @as([1500]u8, @splat(0));
 
         self.close_error_code = 0;
-        self.close_reason = [_]u8{0} ** 128;
+        self.close_reason = @as([128]u8, @splat(0));
         self.close_reason_len = 0;
         self.close_sent = false;
 
         self.path_response_pending = false;
-        self.path_response_data = [_]u8{0} ** 8;
+        self.path_response_data = @as([8]u8, @splat(0));
 
         self.ticket_cache = .{};
         self.zero_rtt_state = .none;
@@ -1564,10 +1564,10 @@ fn initTestClient() *Connection {
     var conn = &test_conn_storage;
 
     // Zero-init buffers and arrays
-    conn.recv_buf = [_]u8{0} ** 1500;
-    conn.send_buf = [_]u8{0} ** 1500;
-    conn.close_reason = [_]u8{0} ** 128;
-    conn.path_response_data = [_]u8{0} ** 8;
+    conn.recv_buf = @as([1500]u8, @splat(0));
+    conn.send_buf = @as([1500]u8, @splat(0));
+    conn.close_reason = @as([128]u8, @splat(0));
+    conn.path_response_data = @as([8]u8, @splat(0));
 
     conn.state = .idle;
     conn.is_server = false;
@@ -1635,7 +1635,7 @@ test "transport params: encode then decode produces equivalent params" {
         .max_udp_payload_size = 1472,
         .max_datagram_frame_size = 1200,
         .active_connection_id_limit = 8,
-        .version_info = [_]u8{0} ** 32,
+        .version_info = @as([32]u8, @splat(0)),
         .version_info_len = 0,
     };
 
@@ -2316,7 +2316,7 @@ test "0-RTT: server rejects when no 0-RTT keys available" {
     conn.is_server = true;
 
     // No 0-RTT keys set — handleZeroRttPacket should reject
-    var buf: [64]u8 = [_]u8{0} ** 64;
+    var buf: [64]u8 = @as([64]u8, @splat(0));
     var hdr = PacketHeader{};
     hdr.is_long = true;
     hdr.pkt_type = .zero_rtt;

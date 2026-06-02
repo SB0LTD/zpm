@@ -92,15 +92,15 @@ pub const OrderEntryState = struct {
     caps: OrderEntryCaps = OrderEntryCaps.binanceFutures(),
 
     // Text input buffers (ASCII, null-terminated)
-    price_buf: [24]u8 = [_]u8{0} ** 24,
+    price_buf: [24]u8 = @as([24]u8, @splat(0)),
     price_len: u8 = 0,
-    qty_buf: [24]u8 = [_]u8{0} ** 24,
+    qty_buf: [24]u8 = @as([24]u8, @splat(0)),
     qty_len: u8 = 0,
-    stop_buf: [24]u8 = [_]u8{0} ** 24,
+    stop_buf: [24]u8 = @as([24]u8, @splat(0)),
     stop_len: u8 = 0,
-    tp_buf: [24]u8 = [_]u8{0} ** 24,
+    tp_buf: [24]u8 = @as([24]u8, @splat(0)),
     tp_len: u8 = 0,
-    sl_buf: [24]u8 = [_]u8{0} ** 24,
+    sl_buf: [24]u8 = @as([24]u8, @splat(0)),
     sl_len: u8 = 0,
 
     // Leverage (1–125)
@@ -115,7 +115,7 @@ pub const OrderEntryState = struct {
 
     // Submission state
     submitting: bool = false,
-    last_error: [64]u8 = [_]u8{0} ** 64,
+    last_error: [64]u8 = @as([64]u8, @splat(0)),
     last_error_len: u8 = 0,
     last_ok: bool = false,
 

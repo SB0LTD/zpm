@@ -26,7 +26,7 @@ pub const PacketType = enum(u2) {
 pub const max_cid_len = 20;
 
 pub const ConnectionId = struct {
-    buf: [max_cid_len]u8 = [_]u8{0} ** max_cid_len,
+    buf: [max_cid_len]u8 = @as([max_cid_len]u8, @splat(0)),
     len: u8 = 0,
 
     pub fn slice(self: *const ConnectionId) []const u8 {
@@ -44,7 +44,7 @@ pub const PacketHeader = struct {
     src_cid: ConnectionId = .{},
     pkt_number: u32 = 0,
     pkt_number_len: u2 = 0,
-    token: [256]u8 = [_]u8{0} ** 256,
+    token: [256]u8 = @as([256]u8, @splat(0)),
     token_len: u16 = 0,
     payload_offset: u16 = 0,
     payload_len: u16 = 0,
@@ -96,7 +96,7 @@ pub const Frame = union(enum) {
         ack_delay: u64 = 0,
         range_count: u16 = 0,
         first_range: u64 = 0,
-        ranges: [max_ack_ranges]AckRange = [_]AckRange{.{}} ** max_ack_ranges,
+        ranges: [max_ack_ranges]AckRange = [_]AckRange{.{} } ** max_ack_ranges,
     },
     reset_stream: struct { stream_id: u64 = 0, error_code: u64 = 0, final_size: u64 = 0 },
     stop_sending: struct { stream_id: u64 = 0, error_code: u64 = 0 },
@@ -115,11 +115,11 @@ pub const Frame = union(enum) {
         seq: u64 = 0,
         retire_prior_to: u64 = 0,
         cid: ConnectionId = .{},
-        stateless_reset_token: [16]u8 = [_]u8{0} ** 16,
+        stateless_reset_token: [16]u8 = @as([16]u8, @splat(0)),
     },
     retire_connection_id: struct { seq: u64 = 0 },
-    path_challenge: struct { data: [8]u8 = [_]u8{0} ** 8 },
-    path_response: struct { data: [8]u8 = [_]u8{0} ** 8 },
+    path_challenge: struct { data: [8]u8 = @as([8]u8, @splat(0)) },
+    path_response: struct { data: [8]u8 = @as([8]u8, @splat(0)) },
     connection_close: struct { error_code: u64 = 0, frame_type: u64 = 0, reason_offset: u16 = 0, reason_len: u16 = 0 },
     handshake_done: void,
     datagram: struct { data_offset: u16 = 0, data_len: u16 = 0 },
@@ -558,7 +558,7 @@ fn parseAckFrame(buf: []const u8, off: usize, start: usize) FrameResult {
     const first_range = vr.val;
     pos += vr.len;
 
-    var ranges: [max_ack_ranges]AckRange = [_]AckRange{.{}} ** max_ack_ranges;
+    var ranges: [max_ack_ranges]AckRange = [_]AckRange{.{} } ** max_ack_ranges;
     const count = @min(range_count, max_ack_ranges);
     for (0..count) |i| {
         // gap
@@ -1361,7 +1361,7 @@ test "header error: truncated buffer" {
 
 test "header error: oversized CID" {
     // Craft a long header with DCID length = 21 (> max_cid_len)
-    var buf: [64]u8 = [_]u8{0} ** 64;
+    var buf: [64]u8 = @as([64]u8, @splat(0));
     buf[0] = 0xC0; // long header, Initial type
     buf[1] = 0x00;
     buf[2] = 0x00;

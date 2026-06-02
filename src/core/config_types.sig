@@ -14,7 +14,7 @@ pub const MAX_SUBS = 10;
 
 /// A fixed-capacity string buffer for config values
 pub const ConfigStr = struct {
-    buf: [MAX_VAL]u8 = [_]u8{0} ** MAX_VAL,
+    buf: [MAX_VAL]u8 = @as([MAX_VAL]u8, @splat(0)),
     len: usize = 0,
 
     pub fn slice(self: *const ConfigStr) []const u8 {

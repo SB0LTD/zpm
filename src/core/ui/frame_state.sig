@@ -14,9 +14,9 @@ const MAX_SUBS = @import("../config_types.sig").MAX_SUBS;
 /// Per-slot summary — replaces duplicated reads in debug bridge, backfill bridge, MCP.
 pub const SlotSummary = struct {
     active: bool = false,
-    source_name: [16]u8 = [_]u8{0} ** 16,
+    source_name: [16]u8 = @as([16]u8, @splat(0)),
     source_len: u8 = 0,
-    symbol_name: [16]u8 = [_]u8{0} ** 16,
+    symbol_name: [16]u8 = @as([16]u8, @splat(0)),
     symbol_len: u8 = 0,
     connected: bool = false,
     last_price: f64 = 0,
@@ -40,15 +40,15 @@ pub const OrderEntrySnapshot = struct {
     side: oes.OrderSide = .buy,
     order_type: oes.OrderType = .limit,
     editing: oes.EditField = .none,
-    price_buf: [24]u8 = [_]u8{0} ** 24,
+    price_buf: [24]u8 = @as([24]u8, @splat(0)),
     price_len: u8 = 0,
-    qty_buf: [24]u8 = [_]u8{0} ** 24,
+    qty_buf: [24]u8 = @as([24]u8, @splat(0)),
     qty_len: u8 = 0,
-    stop_buf: [24]u8 = [_]u8{0} ** 24,
+    stop_buf: [24]u8 = @as([24]u8, @splat(0)),
     stop_len: u8 = 0,
-    tp_buf: [24]u8 = [_]u8{0} ** 24,
+    tp_buf: [24]u8 = @as([24]u8, @splat(0)),
     tp_len: u8 = 0,
-    sl_buf: [24]u8 = [_]u8{0} ** 24,
+    sl_buf: [24]u8 = @as([24]u8, @splat(0)),
     sl_len: u8 = 0,
     leverage: f64 = 10,
     reduce_only: bool = false,
@@ -72,7 +72,7 @@ pub const FrameState = struct {
     // ── Slots ───────────────────────────────────────────────
     display_idx: usize = 0,
     slot_count: usize = 0,
-    slots: [MAX_SUBS]SlotSummary = [_]SlotSummary{.{}} ** MAX_SUBS,
+    slots: [MAX_SUBS]SlotSummary = [_]SlotSummary{.{} } ** MAX_SUBS,
 
     // ── UI toggles ──────────────────────────────────────────
     debug_open: bool = false,

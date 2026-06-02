@@ -48,8 +48,8 @@ pub const SentPacketInfo = struct {
 pub const AckResult = struct {
     acked_count: u16 = 0,
     lost_count: u16 = 0,
-    acked: [64]u64 = [_]u64{0} ** 64,
-    lost: [64]SentPacketInfo = [_]SentPacketInfo{.{}} ** 64,
+    acked: [64]u64 = [_]u64{ 0 } ** 64,
+    lost: [64]SentPacketInfo = [_]SentPacketInfo{.{} } ** 64,
 };
 
 const max_u64 = @as(u64, 0xFFFFFFFFFFFFFFFF);
@@ -156,9 +156,9 @@ pub const RecoveryEngine = struct {
             .has_rtt_sample = false,
             .largest_sent_pkt = 0,
             .sent = [3][max_sent_packets]SentPacketInfo{
-                [_]SentPacketInfo{.{}} ** max_sent_packets,
-                [_]SentPacketInfo{.{}} ** max_sent_packets,
-                [_]SentPacketInfo{.{}} ** max_sent_packets,
+                [_]SentPacketInfo{.{} } ** max_sent_packets,
+                [_]SentPacketInfo{.{} } ** max_sent_packets,
+                [_]SentPacketInfo{.{} } ** max_sent_packets,
             },
             .sent_count = [3]u16{ 0, 0, 0 },
             .largest_acked = [3]u64{ 0, 0, 0 },

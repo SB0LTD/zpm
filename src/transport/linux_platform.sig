@@ -28,7 +28,7 @@ pub const sockaddr_in = extern struct {
     sin_family: u16 = AF_INET,
     sin_port: u16 = 0,
     sin_addr: u32 = 0,
-    sin_zero: [8]u8 = [_]u8{0} ** 8,
+    sin_zero: [8]u8 = @as([8]u8, @splat(0)),
 };
 
 pub const WSADATA = struct {};
@@ -271,8 +271,8 @@ const KeySlot = struct {
     key_len: u8 = 0,
 };
 
-var key_slots: [16]KeySlot = [_]KeySlot{.{}} ** 16;
-var key_slot_used: [16]bool = [_]bool{false} ** 16;
+var key_slots: [16]KeySlot = [_]KeySlot{.{} } ** 16;
+var key_slot_used: [16]bool = [_]bool{ false } ** 16;
 
 fn allocKeySlot() ?usize {
     for (0..16) |i| {
@@ -565,7 +565,7 @@ pub const SCH_CREDENTIALS = struct {
 pub const SEC_APPLICATION_PROTOCOL_LIST = struct {
     ProtoNegoExt: u32 = SecApplicationProtocolNegotiationExt_ALPN,
     usProtocolListSize: u16 = 0,
-    ProtocolList: [256]u8 = [_]u8{0} ** 256,
+    ProtocolList: [256]u8 = @as([256]u8, @splat(0)),
 };
 
 /// Application protocols container.
@@ -579,7 +579,7 @@ pub const SecPkgContext_ApplicationProtocol = struct {
     ProtoNegoStatus: u32 = 0,
     ProtoNegoExt: u32 = 0,
     ProtocolIdSize: u8 = 0,
-    ProtocolId: [256]u8 = [_]u8{0} ** 256,
+    ProtocolId: [256]u8 = @as([256]u8, @splat(0)),
 };
 
 /// UNISP provider name placeholder.
@@ -611,14 +611,14 @@ pub const Tls13Engine = tls13.Tls13Engine;
 const TlsContext = struct {
     is_server: bool = false,
     handshake_complete: bool = false,
-    alpn: [16]u8 = [_]u8{0} ** 16,
+    alpn: [16]u8 = @as([16]u8, @splat(0)),
     alpn_len: u8 = 0,
     engine: tls13.Tls13Engine = .{},
     initialized: bool = false,
 };
 
-var tls_contexts: [8]TlsContext = [_]TlsContext{.{}} ** 8;
-var tls_ctx_used: [8]bool = [_]bool{false} ** 8;
+var tls_contexts: [8]TlsContext = [_]TlsContext{.{} } ** 8;
+var tls_ctx_used: [8]bool = [_]bool{ false } ** 8;
 
 fn allocTlsCtx(is_server: bool) ?usize {
     for (0..8) |i| {

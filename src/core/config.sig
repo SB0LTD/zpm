@@ -27,14 +27,14 @@ pub const Config = struct {
     pub const SOURCE_COUNT: usize = 2;
 
     // Subscriptions — each is an independent (source, symbol, timeframe) stream
-    subs: [MAX_SUBS]Subscription = [_]Subscription{.{}} ** MAX_SUBS,
+    subs: [MAX_SUBS]Subscription = [_]Subscription{.{} } ** MAX_SUBS,
     sub_count: usize = 0,
 
     // Which subscription the chart displays
     display_idx: usize = 0,
 
     // Per-source credential storage
-    creds: [SOURCE_COUNT]SourceCreds = [_]SourceCreds{.{}} ** SOURCE_COUNT,
+    creds: [SOURCE_COUNT]SourceCreds = [_]SourceCreds{.{} } ** SOURCE_COUNT,
 
     // window
     window_width: i32 = 1280,

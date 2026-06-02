@@ -30,9 +30,9 @@ pub const CipherSuite = enum(u8) {
 // ── Key Material ──
 
 pub const KeySet = struct {
-    key: [16]u8 = [_]u8{0} ** 16,
-    iv: [12]u8 = [_]u8{0} ** 12,
-    hp_key: [16]u8 = [_]u8{0} ** 16,
+    key: [16]u8 = @as([16]u8, @splat(0)),
+    iv: [12]u8 = @as([12]u8, @splat(0)),
+    hp_key: [16]u8 = @as([16]u8, @splat(0)),
     valid: bool = false,
 };
 
@@ -52,7 +52,7 @@ pub const CryptoError = enum(u8) {
 
 pub const TlsOutput = struct {
     level: EncryptionLevel = .initial,
-    data: [4096]u8 = [_]u8{0} ** 4096,
+    data: [4096]u8 = @as([4096]u8, @splat(0)),
     data_len: u16 = 0,
     has_data: bool = false,
 };
@@ -61,9 +61,9 @@ pub const TlsOutput = struct {
 
 pub const HandshakeResult = struct {
     complete: bool = false,
-    alpn: [32]u8 = [_]u8{0} ** 32,
+    alpn: [32]u8 = @as([32]u8, @splat(0)),
     alpn_len: u8 = 0,
-    transport_params: [512]u8 = [_]u8{0} ** 512,
+    transport_params: [512]u8 = @as([512]u8, @splat(0)),
     transport_params_len: u16 = 0,
     output: TlsOutput = .{},
     err: CryptoError = .none,
@@ -80,21 +80,21 @@ pub const TlsEngine = struct {
     state: State = .idle,
 
     // Key material per encryption level
-    keys: [4]KeySet = [_]KeySet{.{}} ** 4,
+    keys: [4]KeySet = [_]KeySet{.{} } ** 4,
 
     // Session ticket for 0-RTT resumption
-    ticket: [512]u8 = [_]u8{0} ** 512,
+    ticket: [512]u8 = @as([512]u8, @splat(0)),
     ticket_len: u16 = 0,
     has_ticket: bool = false,
 
     // Handshake buffers
-    recv_buf: [8192]u8 = [_]u8{0} ** 8192,
+    recv_buf: [8192]u8 = @as([8192]u8, @splat(0)),
     recv_len: u16 = 0,
-    send_buf: [8192]u8 = [_]u8{0} ** 8192,
+    send_buf: [8192]u8 = @as([8192]u8, @splat(0)),
     send_len: u16 = 0,
 
     // Current application traffic secret for key updates (RFC 9001 §6)
-    app_secret: [32]u8 = [_]u8{0} ** 32,
+    app_secret: [32]u8 = @as([32]u8, @splat(0)),
 
     // Role
     is_server: bool = false,
@@ -349,7 +349,7 @@ pub const TlsEngine = struct {
         }
 
         // Convert server_name to UTF-16 (simple ASCII→UTF-16 into stack buffer)
-        var name_w: [256:0]u16 = [_:0]u16{0} ** 256;
+        var name_w: [256:0]u16 = [_:0]u16{ 0 } ** 256;
         const name_len = if (server_name.len > 255) 255 else server_name.len;
         for (0..name_len) |i| {
             name_w[i] = @intCast(server_name[i]);
@@ -665,9 +665,9 @@ pub const TlsEngine = struct {
 
         // Zero out key material
         for (0..4) |i| {
-            self.keys[i].key = [_]u8{0} ** 16;
-            self.keys[i].iv = [_]u8{0} ** 12;
-            self.keys[i].hp_key = [_]u8{0} ** 16;
+            self.keys[i].key = @as([16]u8, @splat(0));
+            self.keys[i].iv = @as([12]u8, @splat(0));
+            self.keys[i].hp_key = @as([16]u8, @splat(0));
             self.keys[i].valid = false;
         }
 
@@ -764,7 +764,7 @@ fn applyHeaderProtection(ks: *const KeySet, buf: []u8, pn_offset: u16) void {
     }
 
     // AES-CBC with zero IV on a single 16-byte block = AES-ECB
-    var zero_iv: [16]u8 = [_]u8{0} ** 16;
+    var zero_iv: [16]u8 = @as([16]u8, @splat(0));
     var mask: [16]u8 = undefined;
     var bytes_written: u32 = 0;
     const sample_ptr: [*]const u8 = buf.ptr + sample_offset;

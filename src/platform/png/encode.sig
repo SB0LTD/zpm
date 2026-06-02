@@ -108,7 +108,7 @@ pub const PNG_BUF_SIZE: usize = 1536 * 1024;
 // ── File-scope static buffers (avoids stack overflow) ───────────────
 
 var s_cur_row: [MAX_ROW_BYTES]u8 = undefined;
-var s_prev_row: [MAX_ROW_BYTES]u8 = [_]u8{0} ** MAX_ROW_BYTES;
+var s_prev_row: [MAX_ROW_BYTES]u8 = @as([MAX_ROW_BYTES]u8, @splat(0));
 var s_filtered: [MAX_ROW_BYTES]u8 = undefined;
 var s_block_buf: [BLOCK_BUF_SIZE]u8 = undefined;
 var s_deflate_buf: [DEFLATE_BUF_SIZE]u8 = undefined;

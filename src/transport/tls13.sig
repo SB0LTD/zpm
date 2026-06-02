@@ -109,7 +109,7 @@ pub const ProcessResult = struct {
     /// Error, if any.
     err: HandshakeError = .none,
     /// Negotiated ALPN protocol.
-    alpn: [32]u8 = [_]u8{0} ** 32,
+    alpn: [32]u8 = @as([32]u8, @splat(0)),
     alpn_len: u8 = 0,
     /// Derived key material for QUIC packet protection.
     handshake_keys_available: bool = false,
@@ -118,9 +118,9 @@ pub const ProcessResult = struct {
 
 /// QUIC encryption keys derived during handshake.
 pub const QuicKeys = struct {
-    key: [AES_KEY_LEN]u8 = [_]u8{0} ** AES_KEY_LEN,
-    iv: [IV_LEN]u8 = [_]u8{0} ** IV_LEN,
-    hp_key: [AES_KEY_LEN]u8 = [_]u8{0} ** AES_KEY_LEN,
+    key: [AES_KEY_LEN]u8 = @as([AES_KEY_LEN]u8, @splat(0)),
+    iv: [IV_LEN]u8 = @as([IV_LEN]u8, @splat(0)),
+    hp_key: [AES_KEY_LEN]u8 = @as([AES_KEY_LEN]u8, @splat(0)),
     valid: bool = false,
 };
 
@@ -131,21 +131,21 @@ pub const Tls13Engine = struct {
     is_server: bool = true,
 
     // ── Key Exchange ──
-    eph_private: [X25519_KEY_LEN]u8 = [_]u8{0} ** X25519_KEY_LEN,
-    eph_public: [X25519_KEY_LEN]u8 = [_]u8{0} ** X25519_KEY_LEN,
-    shared_secret: [X25519_KEY_LEN]u8 = [_]u8{0} ** X25519_KEY_LEN,
+    eph_private: [X25519_KEY_LEN]u8 = @as([X25519_KEY_LEN]u8, @splat(0)),
+    eph_public: [X25519_KEY_LEN]u8 = @as([X25519_KEY_LEN]u8, @splat(0)),
+    shared_secret: [X25519_KEY_LEN]u8 = @as([X25519_KEY_LEN]u8, @splat(0)),
 
     // ── Transcript Hash ──
     transcript: Sha256 = Sha256.init(.{}),
 
     // ── Derived Secrets ──
-    early_secret: [HASH_LEN]u8 = [_]u8{0} ** HASH_LEN,
-    handshake_secret: [HASH_LEN]u8 = [_]u8{0} ** HASH_LEN,
-    client_hs_secret: [HASH_LEN]u8 = [_]u8{0} ** HASH_LEN,
-    server_hs_secret: [HASH_LEN]u8 = [_]u8{0} ** HASH_LEN,
-    master_secret: [HASH_LEN]u8 = [_]u8{0} ** HASH_LEN,
-    client_app_secret: [HASH_LEN]u8 = [_]u8{0} ** HASH_LEN,
-    server_app_secret: [HASH_LEN]u8 = [_]u8{0} ** HASH_LEN,
+    early_secret: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0)),
+    handshake_secret: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0)),
+    client_hs_secret: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0)),
+    server_hs_secret: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0)),
+    master_secret: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0)),
+    client_app_secret: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0)),
+    server_app_secret: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0)),
 
     // ── Derived QUIC Keys ──
     client_handshake_keys: QuicKeys = .{},
@@ -154,29 +154,29 @@ pub const Tls13Engine = struct {
     server_app_keys: QuicKeys = .{},
 
     // ── Certificate (PEM-decoded DER) ──
-    cert_der: [4096]u8 = [_]u8{0} ** 4096,
+    cert_der: [4096]u8 = @as([4096]u8, @splat(0)),
     cert_der_len: u16 = 0,
-    private_key: [32]u8 = [_]u8{0} ** 32,
+    private_key: [32]u8 = @as([32]u8, @splat(0)),
     private_key_loaded: bool = false,
 
     // ── ALPN ──
-    alpn_list: [64]u8 = [_]u8{0} ** 64,
+    alpn_list: [64]u8 = @as([64]u8, @splat(0)),
     alpn_list_len: u8 = 0,
 
     // ── QUIC Transport Parameters (server's, pre-encoded) ──
-    transport_params: [512]u8 = [_]u8{0} ** 512,
+    transport_params: [512]u8 = @as([512]u8, @splat(0)),
     transport_params_len: u16 = 0,
 
     // ── Client's key share (parsed from ClientHello) ──
-    client_key_share: [X25519_KEY_LEN]u8 = [_]u8{0} ** X25519_KEY_LEN,
+    client_key_share: [X25519_KEY_LEN]u8 = @as([X25519_KEY_LEN]u8, @splat(0)),
     client_key_share_valid: bool = false,
 
     // ── Output buffer (handshake messages to send as CRYPTO frames) ──
-    output_buf: [8192]u8 = [_]u8{0} ** 8192,
+    output_buf: [8192]u8 = @as([8192]u8, @splat(0)),
     output_len: u16 = 0,
 
     // ── Client random ──
-    client_random: [32]u8 = [_]u8{0} ** 32,
+    client_random: [32]u8 = @as([32]u8, @splat(0)),
 
     // ══════════════════════════════════════════════════════════════════════
     // Public API
@@ -669,7 +669,7 @@ pub const Tls13Engine = struct {
     // ══════════════════════════════════════════════════════════════════════
 
     fn deriveHandshakeSecrets(self: *Tls13Engine) void {
-        const zero_psk: [HASH_LEN]u8 = [_]u8{0} ** HASH_LEN;
+        const zero_psk: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0));
         const zero_salt: [1]u8 = [_]u8{0};
         Hmac.create(&self.early_secret, &zero_psk, &zero_salt);
 
@@ -693,7 +693,7 @@ pub const Tls13Engine = struct {
         const empty_hash = Sha256.hash(&.{}, .{});
         hkdfExpandLabel(&self.handshake_secret, "derived", &empty_hash, &derived_secret);
 
-        const zero_ikm: [HASH_LEN]u8 = [_]u8{0} ** HASH_LEN;
+        const zero_ikm: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0));
         Hmac.create(&self.master_secret, &zero_ikm, &derived_secret);
 
         const app_transcript = self.transcript.finalResult();

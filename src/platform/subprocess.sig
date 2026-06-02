@@ -146,9 +146,9 @@ fn applyPosixLimits(config: *const SubprocessConfig) void {
 pub fn run(config: *const SubprocessConfig) SubprocessResult {
     var result = SubprocessResult{
         .exit_code = -1,
-        .stdout = [_]u8{0} ** MAX_OUTPUT,
+        .stdout = @as([MAX_OUTPUT]u8, @splat(0)),
         .stdout_len = 0,
-        .stderr = [_]u8{0} ** MAX_OUTPUT,
+        .stderr = @as([MAX_OUTPUT]u8, @splat(0)),
         .stderr_len = 0,
         .wall_time_ms = 0,
         .limit_exceeded = null,
@@ -299,9 +299,9 @@ pub fn wait(handle: *ProcessHandle, timeout_ms: u32) ?SubprocessResult {
 
     var result = SubprocessResult{
         .exit_code = -1,
-        .stdout = [_]u8{0} ** MAX_OUTPUT,
+        .stdout = @as([MAX_OUTPUT]u8, @splat(0)),
         .stdout_len = 0,
-        .stderr = [_]u8{0} ** MAX_OUTPUT,
+        .stderr = @as([MAX_OUTPUT]u8, @splat(0)),
         .stderr_len = 0,
         .wall_time_ms = 0,
         .limit_exceeded = null,
@@ -372,9 +372,9 @@ test "subprocess: SubprocessConfig defaults" {
 test "subprocess: SubprocessResult helpers" {
     var result = SubprocessResult{
         .exit_code = 0,
-        .stdout = [_]u8{0} ** MAX_OUTPUT,
+        .stdout = @as([MAX_OUTPUT]u8, @splat(0)),
         .stdout_len = 5,
-        .stderr = [_]u8{0} ** MAX_OUTPUT,
+        .stderr = @as([MAX_OUTPUT]u8, @splat(0)),
         .stderr_len = 0,
         .wall_time_ms = 100,
         .limit_exceeded = null,

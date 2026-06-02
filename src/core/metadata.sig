@@ -26,16 +26,16 @@ pub const MAX_INTERVAL_LEN = 4;
 pub const SourceMetadata = struct {
     // ── Symbols ──
     symbols: [MAX_SYMBOLS][MAX_SYM_LEN]u8 = undefined,
-    sym_lens: [MAX_SYMBOLS]u8 = [_]u8{0} ** MAX_SYMBOLS,
+    sym_lens: [MAX_SYMBOLS]u8 = @as([MAX_SYMBOLS]u8, @splat(0)),
     base_assets: [MAX_SYMBOLS][MAX_ASSET_LEN]u8 = undefined,
-    base_lens: [MAX_SYMBOLS]u8 = [_]u8{0} ** MAX_SYMBOLS,
+    base_lens: [MAX_SYMBOLS]u8 = @as([MAX_SYMBOLS]u8, @splat(0)),
     quote_assets: [MAX_SYMBOLS][MAX_ASSET_LEN]u8 = undefined,
-    quote_lens: [MAX_SYMBOLS]u8 = [_]u8{0} ** MAX_SYMBOLS,
+    quote_lens: [MAX_SYMBOLS]u8 = @as([MAX_SYMBOLS]u8, @splat(0)),
     symbol_count: u32 = 0,
 
     // ── Intervals ──
     intervals: [MAX_INTERVALS][MAX_INTERVAL_LEN]u8 = undefined,
-    interval_lens: [MAX_INTERVALS]u8 = [_]u8{0} ** MAX_INTERVALS,
+    interval_lens: [MAX_INTERVALS]u8 = @as([MAX_INTERVALS]u8, @splat(0)),
     interval_count: u32 = 0,
 
     // ── Status ──
@@ -44,7 +44,7 @@ pub const SourceMetadata = struct {
     loading: u32 = 0, // atomic: 1 = fetch in progress
 
     // ── Display ──
-    name_buf: [32]u8 = [_]u8{0} ** 32,
+    name_buf: [32]u8 = @as([32]u8, @splat(0)),
     name_len: u8 = 0,
 
     /// Get the source display name

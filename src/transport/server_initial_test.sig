@@ -65,7 +65,7 @@ test "server idle: receiving QUIC Initial transitions to handshaking" {
     if (bind_err != .none) return error.SkipZigTest;
 
     // 3. Build a minimal QUIC Initial packet (RFC 9000 §17.2.2)
-    var pkt_buf: [1200]u8 = [_]u8{0} ** 1200;
+    var pkt_buf = std.mem.zeroes([1200]u8);
     const pkt_len = buildQuicInitial(&pkt_buf);
 
     // 4. Send it to the server
@@ -125,7 +125,7 @@ test "server sends response packet after receiving Initial" {
     if (client_sock.bind(bind_addr) != .none) return error.SkipZigTest;
 
     // 3. Build and send QUIC Initial
-    var pkt_buf: [1200]u8 = [_]u8{0} ** 1200;
+    var pkt_buf = std.mem.zeroes([1200]u8);
     const pkt_len = buildQuicInitial(&pkt_buf);
 
     const dest = w32.sockaddr_in{
@@ -287,7 +287,7 @@ test "server idle ignores non-Initial packets" {
     _ = sender.bind(w32.sockaddr_in{ .sin_port = 0, .sin_addr = 0x0100007F });
 
     // Send a short header (1-RTT) packet — not an Initial
-    var short_pkt: [64]u8 = [_]u8{0} ** 64;
+    var short_pkt = std.mem.zeroes([64]u8);
     short_pkt[0] = 0x40; // short header, fixed bit set, NOT long header
     // Fill with some CID bytes
     short_pkt[1] = 0xAA;

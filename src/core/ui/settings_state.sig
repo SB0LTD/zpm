@@ -34,19 +34,19 @@ pub const SettingsState = struct {
 
     // Slot labels for display cycling: "binance BTCUSDT 1m", etc.
     slot_labels: [MAX_SUBS][48]u8 = undefined,
-    slot_label_lens: [MAX_SUBS]u8 = [_]u8{0} ** MAX_SUBS,
+    slot_label_lens: [MAX_SUBS]u8 = @as([MAX_SUBS]u8, @splat(0)),
 
     // Pointer to display slot's metadata (set by app.sig)
     metadata: ?*SourceMetadata = null,
 
     // Text input cursor for text/number fields
-    input_buf: [64]u8 = [_]u8{0} ** 64,
+    input_buf: [64]u8 = @as([64]u8, @splat(0)),
     input_len: usize = 0,
 
     // Symbol filter state
-    filter_buf: [20]u8 = [_]u8{0} ** 20,
+    filter_buf: [20]u8 = @as([20]u8, @splat(0)),
     filter_len: usize = 0,
-    filter_results: [MAX_FILTERED]u16 = [_]u16{0} ** MAX_FILTERED,
+    filter_results: [MAX_FILTERED]u16 = [_]u16{ 0 } ** MAX_FILTERED,
     filter_count: usize = 0,
     filter_cursor: usize = 0,
     filter_active: bool = false,

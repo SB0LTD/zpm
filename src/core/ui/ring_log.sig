@@ -11,14 +11,14 @@ pub const MAX_ENTRIES = 256;
 pub const MAX_LINE = 128;
 
 pub const Entry = struct {
-    buf: [MAX_LINE]u8 = [_]u8{0} ** MAX_LINE,
+    buf: [MAX_LINE]u8 = @as([MAX_LINE]u8, @splat(0)),
     /// Written last — acts as commit flag. Reader skips if 0.
     len: u8 = 0,
     level: u8 = 0,
 };
 
 /// Global ring buffer — written by log.sig, read by debug console.
-pub var entries: [MAX_ENTRIES]Entry = [_]Entry{.{}} ** MAX_ENTRIES;
+pub var entries: [MAX_ENTRIES]Entry = [_]Entry{.{} } ** MAX_ENTRIES;
 
 /// Monotonic write cursor. Always increments; readers use modulo.
 pub var write_pos: u32 = 0;

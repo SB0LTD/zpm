@@ -34,11 +34,11 @@ pub const TimeInForce = enum(u8) {
 };
 
 pub const Order = struct {
-    id: [32]u8 = [_]u8{0} ** 32,
+    id: [32]u8 = @as([32]u8, @splat(0)),
     id_len: u8 = 0,
-    client_id: [32]u8 = [_]u8{0} ** 32,
+    client_id: [32]u8 = @as([32]u8, @splat(0)),
     client_id_len: u8 = 0,
-    symbol: [20]u8 = [_]u8{0} ** 20,
+    symbol: [20]u8 = @as([20]u8, @splat(0)),
     symbol_len: u8 = 0,
     side: OrderSide = .buy,
     order_type: OrderType = .limit,
@@ -79,7 +79,7 @@ pub const Order = struct {
 
 /// Open orders snapshot — pure data, no I/O. Lives in core so platform layer can reference it.
 pub const OrderInfo = struct {
-    orders: [MAX_OPEN_ORDERS]Order = [_]Order{.{}} ** MAX_OPEN_ORDERS,
+    orders: [MAX_OPEN_ORDERS]Order = [_]Order{.{} } ** MAX_OPEN_ORDERS,
     count: u32 = 0,
     ready: u32 = 0,
     loading: u32 = 0,
@@ -92,7 +92,7 @@ pub const OrderInfo = struct {
 
 /// Pending order request — filled by UI, consumed by source thread
 pub const OrderRequest = struct {
-    symbol: [20]u8 = [_]u8{0} ** 20,
+    symbol: [20]u8 = @as([20]u8, @splat(0)),
     symbol_len: u8 = 0,
     side: OrderSide = .buy,
     order_type: OrderType = .limit,
@@ -118,9 +118,9 @@ pub const OrderRequest = struct {
 
 /// Cancel request — order ID to cancel
 pub const CancelRequest = struct {
-    order_id: [32]u8 = [_]u8{0} ** 32,
+    order_id: [32]u8 = @as([32]u8, @splat(0)),
     order_id_len: u8 = 0,
-    symbol: [20]u8 = [_]u8{0} ** 20,
+    symbol: [20]u8 = @as([20]u8, @splat(0)),
     symbol_len: u8 = 0,
 
     pub fn idSlice(self: *const CancelRequest) []const u8 {

@@ -67,7 +67,7 @@ pub const AppMap = struct {
             .stream_mgr = sm,
             .dgrams = dg,
             .last_hot_seq = 0,
-            .msg_buf = [_]u8{0} ** 65536,
+            .msg_buf = @as([65536]u8, @splat(0)),
         };
     }
 

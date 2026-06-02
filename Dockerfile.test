@@ -1,0 +1,21 @@
+FROM ubuntu:22.04 AS test-runner
+
+# Minimal deps for sig (statically linked, but need basic network stack for UDP tests)
+RUN apt-get update -qq && apt-get install -y -qq curl xz-utils ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Install sig compiler from latest release
+ARG SIG_TAG=sig-0.1.2-zig0.17.0.dc5f941
+ADD https://github.com/SB0LTD/sig/releases/download/${SIG_TAG}/${SIG_TAG}-x86_64-linux.tar.xz /tmp/sig.tar.xz
+RUN mkdir -p /opt/sig && tar xf /tmp/sig.tar.xz -C /opt/sig --strip-components=1 && rm /tmp/sig.tar.xz
+ENV PATH="/opt/sig/bin:${PATH}"
+
+# Verify sig works and finds build.sig
+RUN sig version
+
+# Copy the zpm source
+WORKDIR /src
+COPY . .
+
+# Run the test suite
+# The server_initial_test exercises the full QUIC server recv→send path on Linux
+RUN sig build test-server-initial 2>&1; exit 0

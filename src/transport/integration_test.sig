@@ -1268,11 +1268,11 @@ test "0-RTT resumption" {
 test "Version negotiation to v2" {
     // ── 1. Build version_information for client and server, both advertising v1+v2 ──
 
-    var client_vi: [32]u8 = [_]u8{0} ** 32;
+    var client_vi: [32]u8 = @as([32]u8, @splat(0));
     const client_vi_len = conn.buildVersionInfo(conn.quic_v1, &client_vi);
     try testing.expectEqual(@as(u8, 12), client_vi_len);
 
-    var server_vi: [32]u8 = [_]u8{0} ** 32;
+    var server_vi: [32]u8 = @as([32]u8, @splat(0));
     const server_vi_len = conn.buildVersionInfo(conn.quic_v1, &server_vi);
     try testing.expectEqual(@as(u8, 12), server_vi_len);
 

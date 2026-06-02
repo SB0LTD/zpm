@@ -39,9 +39,9 @@ pub const LzState = struct {
 
     const instance = struct {
         var data: LzState = .{
-            .head = [_]u32{0} ** HASH_SIZE,
-            .prev = [_]u32{0} ** MAX_DIST,
-            .window = [_]u8{0} ** MAX_DIST,
+            .head = [_]u32{ 0 } ** HASH_SIZE,
+            .prev = [_]u32{ 0 } ** MAX_DIST,
+            .window = @as([MAX_DIST]u8, @splat(0)),
             .window_len = 0,
             .global_offset = 0,
         };
