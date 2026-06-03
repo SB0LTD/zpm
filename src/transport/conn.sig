@@ -1106,13 +1106,59 @@ pub const Connection = struct {
     /// Load TLS certificate into this connection's TLS engine.
     /// cert_der: DER-encoded certificate bytes.
     /// key_raw: 32-byte raw ECDSA P-256 private key scalar.
-    pub fn loadTlsCertificate(self: *Connection, cert_der: []const u8, key_raw: []const u8) void {
+    pub fn loadTlsCertificate(self: *Connection, cert_der: []const u8, key_raw: []const u8) bool {
         if (@hasDecl(w32, "getTls13Engine")) {
             var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
             if (w32.getTls13Engine(&cred_h)) |engine| {
-                _ = engine.loadCertificate(cert_der, key_raw);
+                return engine.loadCertificate(cert_der, key_raw) == .none;
             }
         }
+        return false;
+    }
+
+    /// Load TLS certificate from PEM-encoded strings (Let's Encrypt ECDSA P-256).
+    /// Handles PEM→DER decoding internally. Returns true on success.
+    /// cert_pem: Full PEM certificate (-----BEGIN CERTIFICATE-----\n...\n-----END...).
+    /// key_pem: PKCS#8 PEM private key (-----BEGIN PRIVATE KEY-----\n...\n-----END...).
+    pub fn loadTlsCertificatePem(self: *Connection, cert_pem: []const u8, key_pem: []const u8) bool {
+        if (!@hasDecl(w32, "getTls13Engine")) return false;
+        var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
+        const engine = w32.getTls13Engine(&cred_h) orelse return false;
+
+        // Decode cert PEM → DER
+        var cert_der: [4096]u8 = undefined;
+        const cert_der_len = pemToDer(cert_pem, &cert_der) orelse return false;
+
+        // Decode key PEM → DER → extract 32-byte raw scalar
+        var key_der: [256]u8 = undefined;
+        const key_der_len = pemToDer(key_pem, &key_der) orelse return false;
+
+        // PKCS#8 ECDSA P-256 key: DER contains ASN.1 wrapping around the 32-byte scalar.
+        // Structure: SEQUENCE { SEQUENCE { OID, OID }, OCTET STRING { SEQUENCE { INTEGER version, OCTET STRING key } } }
+        // The raw 32-byte scalar is at a fixed offset in the PKCS#8 structure for P-256.
+        // For PKCS#8 ECDSA P-256: key bytes are at offset 36 (after the ASN.1 headers).
+        // For SEC1 (EC PRIVATE KEY): key bytes are at offset 7.
+        var key_raw: [32]u8 = undefined;
+        if (key_der_len >= 68 and key_der[0] == 0x30) {
+            // PKCS#8 format: find the OCTET STRING containing the key
+            // Skip outer SEQUENCE, inner SEQUENCE (algorithm), then OCTET STRING wrapper
+            // Typical P-256 PKCS#8 has the 32-byte key at various offsets depending on encoding.
+            // Search for the 32-byte key by finding 0x04 0x20 (OCTET STRING len=32)
+            var found = false;
+            var ki: usize = 0;
+            while (ki + 34 <= key_der_len) : (ki += 1) {
+                if (key_der[ki] == 0x04 and key_der[ki + 1] == 0x20) {
+                    @memcpy(&key_raw, key_der[ki + 2 ..][0..32]);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        } else {
+            return false;
+        }
+
+        return engine.loadCertificate(cert_der[0..cert_der_len], &key_raw) == .none;
     }
 
     /// Set ALPN protocol for this connection's TLS engine.
@@ -1582,6 +1628,53 @@ pub const Connection = struct {
 
 // ── Helpers ──
 
+/// Decode PEM to DER (base64 decode between -----BEGIN...-----/-----END...-----).
+/// Returns the decoded length, or null on failure.
+fn pemToDer(pem: []const u8, out: []u8) ?usize {
+    // Find the first newline after -----BEGIN...-----
+    var start: usize = 0;
+    while (start < pem.len) : (start += 1) {
+        if (pem[start] == '\n') {
+            start += 1;
+            break;
+        }
+    }
+    // Find -----END
+    var end: usize = pem.len;
+    var i: usize = start;
+    while (i + 5 < pem.len) : (i += 1) {
+        if (pem[i] == '-' and pem[i + 1] == '-' and pem[i + 2] == '-' and pem[i + 3] == '-' and pem[i + 4] == '-') {
+            end = i;
+            break;
+        }
+    }
+    // Base64 decode the content between start and end (skipping whitespace)
+    var out_pos: usize = 0;
+    var buf: u32 = 0;
+    var bits: u5 = 0;
+    var j: usize = start;
+    while (j < end) : (j += 1) {
+        const c = pem[j];
+        const val: ?u6 = if (c >= 'A' and c <= 'Z') @intCast(c - 'A')
+            else if (c >= 'a' and c <= 'z') @intCast(c - 'a' + 26)
+            else if (c >= '0' and c <= '9') @intCast(c - '0' + 52)
+            else if (c == '+') 62
+            else if (c == '/') 63
+            else null; // whitespace, padding
+        if (val) |v| {
+            buf = (buf << 6) | @as(u32, v);
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                if (out_pos >= out.len) return null;
+                out[out_pos] = @intCast((buf >> bits) & 0xFF);
+                out_pos += 1;
+            }
+        }
+    }
+    if (out_pos == 0) return null;
+    return out_pos;
+}
 /// Generate a random connection ID (8 bytes) using BCrypt.
 fn generateRandomCid(cid: *ConnectionId) void {
     _ = w32.BCryptGenRandom(
