@@ -17,6 +17,11 @@ const datagram = @import("datagram");
 const telemetry = @import("telemetry");
 const udp = @import("udp");
 
+fn writeStdout(msg: []const u8) void {
+    const linux = @import("std").os.linux;
+    _ = linux.write(1, msg.ptr, msg.len);
+}
+
 const ConnectionId = packet.ConnectionId;
 const ParseError = packet.ParseError;
 const Frame = packet.Frame;
@@ -1121,29 +1126,32 @@ pub const Connection = struct {
     /// cert_pem: Full PEM certificate (-----BEGIN CERTIFICATE-----\n...\n-----END...).
     /// key_pem: PKCS#8 PEM private key (-----BEGIN PRIVATE KEY-----\n...\n-----END...).
     pub fn loadTlsCertificatePem(self: *Connection, cert_pem: []const u8, key_pem: []const u8) bool {
-        if (!@hasDecl(w32, "getTls13Engine")) return false;
+        if (!@hasDecl(w32, "getTls13Engine")) {
+            writeStdout("CERT: no getTls13Engine decl\n");
+            return false;
+        }
         var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
-        const engine = w32.getTls13Engine(&cred_h) orelse return false;
+        const engine = w32.getTls13Engine(&cred_h) orelse {
+            writeStdout("CERT: getTls13Engine returned null\n");
+            return false;
+        };
 
         // Decode cert PEM → DER
         var cert_der: [4096]u8 = undefined;
-        const cert_der_len = pemToDer(cert_pem, &cert_der) orelse return false;
+        const cert_der_len = pemToDer(cert_pem, &cert_der) orelse {
+            writeStdout("CERT FAIL: cert PEM decode failed\n");
+            return false;
+        };
 
         // Decode key PEM → DER → extract 32-byte raw scalar
         var key_der: [256]u8 = undefined;
-        const key_der_len = pemToDer(key_pem, &key_der) orelse return false;
+        const key_der_len = pemToDer(key_pem, &key_der) orelse {
+            writeStdout("CERT FAIL: key PEM decode failed\n");
+            return false;
+        };
 
-        // PKCS#8 ECDSA P-256 key: DER contains ASN.1 wrapping around the 32-byte scalar.
-        // Structure: SEQUENCE { SEQUENCE { OID, OID }, OCTET STRING { SEQUENCE { INTEGER version, OCTET STRING key } } }
-        // The raw 32-byte scalar is at a fixed offset in the PKCS#8 structure for P-256.
-        // For PKCS#8 ECDSA P-256: key bytes are at offset 36 (after the ASN.1 headers).
-        // For SEC1 (EC PRIVATE KEY): key bytes are at offset 7.
         var key_raw: [32]u8 = undefined;
         if (key_der_len >= 68 and key_der[0] == 0x30) {
-            // PKCS#8 format: find the OCTET STRING containing the key
-            // Skip outer SEQUENCE, inner SEQUENCE (algorithm), then OCTET STRING wrapper
-            // Typical P-256 PKCS#8 has the 32-byte key at various offsets depending on encoding.
-            // Search for the 32-byte key by finding 0x04 0x20 (OCTET STRING len=32)
             var found = false;
             var ki: usize = 0;
             while (ki + 34 <= key_der_len) : (ki += 1) {
@@ -1153,12 +1161,23 @@ pub const Connection = struct {
                     break;
                 }
             }
-            if (!found) return false;
+            if (!found) {
+                writeStdout("CERT FAIL: no 0x04 0x20 in PKCS8 key\n");
+                return false;
+            }
         } else {
+            writeStdout("CERT FAIL: key_der_len < 68 or not SEQUENCE\n");
             return false;
         }
 
-        return engine.loadCertificate(cert_der[0..cert_der_len], &key_raw) == .none;
+        const result = engine.loadCertificate(cert_der[0..cert_der_len], &key_raw);
+        if (result == .none) {
+            writeStdout("CERT LOADED OK\n");
+            return true;
+        } else {
+            writeStdout("CERT FAIL: engine.loadCertificate rejected\n");
+            return false;
+        }
     }
 
     /// Set ALPN protocol for this connection's TLS engine.

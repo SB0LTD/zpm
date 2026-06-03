@@ -17,6 +17,10 @@ const Sha256 = crypto.hash.sha2.Sha256;
 const Hmac = crypto.auth.hmac.sha2.HmacSha256;
 const X25519 = crypto.dh.X25519;
 
+fn writeStdout(msg: []const u8) void {
+    _ = std.os.linux.write(1, msg.ptr, msg.len);
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Constants
 // ══════════════════════════════════════════════════════════════════════════════
@@ -366,7 +370,10 @@ pub const Tls13Engine = struct {
 
         if (!has_supported_versions) return .unsupported_version;
         if (!has_key_share) return .missing_key_share;
-        if (!self.private_key_loaded) return .cert_not_loaded;
+        if (!self.private_key_loaded) {
+            writeStdout("TLS: private_key_loaded=false, rejecting ClientHello\n");
+            return .cert_not_loaded;
+        }
 
         // X25519 key exchange
         self.shared_secret = X25519.scalarmult(self.eph_private, self.client_key_share) catch
