@@ -407,6 +407,13 @@ pub const Connection = struct {
     recv_buf: [1500]u8,
     send_buf: [1500]u8,
 
+    // CRYPTO stream reassembly (RFC 9000 §19.6)
+    // Accumulates CRYPTO frame data by offset until a complete TLS message is ready.
+    // Chrome's post-quantum ClientHello (~1400B) spans multiple QUIC packets.
+    crypto_recv_buf: [3][8192]u8, // per PktNumSpace (initial, handshake, application)
+    crypto_recv_len: [3]u16,     // bytes received contiguously from offset 0
+    crypto_recv_offset: [3]u64,  // next expected offset (= total delivered so far)
+
     // Pending close frame data
     close_error_code: u64,
     close_reason: [128]u8,
@@ -532,6 +539,11 @@ pub const Connection = struct {
 
         self.recv_buf = @as([1500]u8, @splat(0));
         self.send_buf = @as([1500]u8, @splat(0));
+
+        // Initialize CRYPTO reassembly buffers
+        self.crypto_recv_buf = @as([3][8192]u8, @splat(@as([8192]u8, @splat(0))));
+        self.crypto_recv_len = @as([3]u16, @splat(0));
+        self.crypto_recv_offset = @as([3]u64, @splat(0));
 
         self.close_error_code = 0;
         self.close_reason = @as([128]u8, @splat(0));
@@ -828,61 +840,105 @@ pub const Connection = struct {
                 },
 
                 .crypto => |crypto_frame| {
-                    // CRYPTO → TLS engine
+                    // CRYPTO stream reassembly (RFC 9000 §19.6)
+                    // Accumulate fragments by offset, deliver to TLS when contiguous.
                     const level = self.levelFromSpace(space);
+                    const s_idx = @intFromEnum(space);
                     const data_end = crypto_frame.data_offset + crypto_frame.data_len;
-                    if (data_end <= buf.len) {
-                        const crypto_data = buf[crypto_frame.data_offset..data_end];
-                        const hs_result = self.tls.feedCryptoData(level, crypto_data);
 
-                        // Route TLS handshake output to send buffer for next assembleSendPacket
-                        if (hs_result.output.has_data and hs_result.output.data_len > 0) {
-                            const out_len = hs_result.output.data_len;
-                            if (out_len <= self.tls.send_buf.len - self.tls.send_len) {
+                    if (data_end <= buf.len and crypto_frame.data_len > 0) {
+                        const frag_data = buf[crypto_frame.data_offset..data_end];
+                        const frag_offset = crypto_frame.offset;
+                        const frag_len: u16 = crypto_frame.data_len;
+
+                        // Check if this fragment fits contiguously
+                        if (frag_offset == self.crypto_recv_offset[s_idx]) {
+                            // Contiguous: append directly
+                            const cur_len = self.crypto_recv_len[s_idx];
+                            if (cur_len + frag_len <= self.crypto_recv_buf[s_idx].len) {
                                 @memcpy(
-                                    self.tls.send_buf[self.tls.send_len .. self.tls.send_len + out_len],
-                                    hs_result.output.data[0..out_len],
+                                    self.crypto_recv_buf[s_idx][cur_len .. cur_len + frag_len],
+                                    frag_data,
                                 );
-                                self.tls.send_len += out_len;
+                                self.crypto_recv_len[s_idx] += frag_len;
+                                self.crypto_recv_offset[s_idx] += frag_len;
                             }
+                        } else if (frag_offset < self.crypto_recv_offset[s_idx]) {
+                            // Duplicate/retransmit of already-received data — ignore
                         }
+                        // else: out-of-order fragment — drop for now (simplified)
 
-                        if (hs_result.complete) {
-                            // Handshake complete
-                            if (self.state == .handshaking) {
-                                self.state = .connected;
-                                @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.connected), .monotonic);
-                                // Apply peer transport params
-                                if (hs_result.transport_params_len > 0) {
-                                    const tp_result = decodeTransportParams(
-                                        hs_result.transport_params[0..hs_result.transport_params_len],
-                                    );
-                                    if (tp_result.err == .none) {
-                                        self.peer_params = tp_result.params;
-                                        self.stream_mgr.conn_send_max = tp_result.params.initial_max_data;
-                                        self.stream_mgr.max_bidi_streams = tp_result.params.initial_max_streams_bidi;
-                                        self.stream_mgr.max_uni_streams = tp_result.params.initial_max_streams_uni;
-                                        if (tp_result.params.max_datagram_frame_size > 0) {
-                                            self.datagrams.peer_max_size = tp_result.params.max_datagram_frame_size;
-                                        }
+                        // Try to deliver complete TLS message(s) to the engine.
+                        // A TLS handshake message starts with: type(1) + length(3).
+                        // We deliver once we have at least 4 bytes and length bytes are available.
+                        const total = self.crypto_recv_len[s_idx];
+                        if (total >= 4) {
+                            const msg_body_len = (@as(u32, self.crypto_recv_buf[s_idx][1]) << 16) |
+                                (@as(u32, self.crypto_recv_buf[s_idx][2]) << 8) |
+                                @as(u32, self.crypto_recv_buf[s_idx][3]);
+                            const full_msg_len: u16 = @intCast(@min(msg_body_len + 4, 8192));
 
-                                        // Check 0-RTT compatibility with new params
-                                        if (self.zero_rtt_state == .sending) {
-                                            self.zero_rtt_state = .accepted;
+                            if (total >= full_msg_len) {
+                                // Complete TLS message — deliver to TLS engine
+                                const crypto_data = self.crypto_recv_buf[s_idx][0..full_msg_len];
+                                const hs_result = self.tls.feedCryptoData(level, crypto_data);
+
+                                // Route TLS output to send buffer
+                                if (hs_result.output.has_data and hs_result.output.data_len > 0) {
+                                    const out_len = hs_result.output.data_len;
+                                    if (out_len <= self.tls.send_buf.len - self.tls.send_len) {
+                                        @memcpy(
+                                            self.tls.send_buf[self.tls.send_len .. self.tls.send_len + out_len],
+                                            hs_result.output.data[0..out_len],
+                                        );
+                                        self.tls.send_len += out_len;
+                                    }
+                                }
+
+                                if (hs_result.complete) {
+                                    if (self.state == .handshaking) {
+                                        self.state = .connected;
+                                        @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.connected), .monotonic);
+                                        if (hs_result.transport_params_len > 0) {
+                                            const tp_result = decodeTransportParams(
+                                                hs_result.transport_params[0..hs_result.transport_params_len],
+                                            );
+                                            if (tp_result.err == .none) {
+                                                self.peer_params = tp_result.params;
+                                                self.stream_mgr.conn_send_max = tp_result.params.initial_max_data;
+                                                self.stream_mgr.max_bidi_streams = tp_result.params.initial_max_streams_bidi;
+                                                self.stream_mgr.max_uni_streams = tp_result.params.initial_max_streams_uni;
+                                                if (tp_result.params.max_datagram_frame_size > 0) {
+                                                    self.datagrams.peer_max_size = tp_result.params.max_datagram_frame_size;
+                                                }
+                                                if (self.zero_rtt_state == .sending) {
+                                                    self.zero_rtt_state = .accepted;
+                                                }
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        }
-                        // Post-handshake CRYPTO frame: may contain NEW_SESSION_TICKET
-                        if (self.state == .connected and !self.is_server and crypto_data.len > 0) {
-                            self.onNewSessionTicket(crypto_data);
-                        }
-                        if (hs_result.err != .none and hs_result.err != .none) {
-                            // Handshake failure → close
-                            if (self.state == .handshaking) {
-                                self.state = .closed;
-                                @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.closed), .monotonic);
+                                if (self.state == .connected and !self.is_server and crypto_data.len > 0) {
+                                    self.onNewSessionTicket(crypto_data);
+                                }
+                                if (hs_result.err != .none) {
+                                    if (self.state == .handshaking) {
+                                        self.state = .closed;
+                                        @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.closed), .monotonic);
+                                    }
+                                }
+
+                                // Shift remaining data in reassembly buffer
+                                if (total > full_msg_len) {
+                                    const remaining = total - full_msg_len;
+                                    var ri: u16 = 0;
+                                    while (ri < remaining) : (ri += 1) {
+                                        self.crypto_recv_buf[s_idx][ri] = self.crypto_recv_buf[s_idx][full_msg_len + ri];
+                                    }
+                                    self.crypto_recv_len[s_idx] = remaining;
+                                } else {
+                                    self.crypto_recv_len[s_idx] = 0;
+                                }
                             }
                         }
                     }
