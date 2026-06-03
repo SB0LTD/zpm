@@ -1103,7 +1103,34 @@ pub const Connection = struct {
 
     /// Clean up all connection resources: close socket, release TLS handles,
     /// zero sensitive key material, and set state to closed.
-    pub fn deinit(self: *Connection) void {
+    /// Load TLS certificate into this connection's TLS engine.
+    /// cert_der: DER-encoded certificate bytes.
+    /// key_raw: 32-byte raw ECDSA P-256 private key scalar.
+    pub fn loadTlsCertificate(self: *Connection, cert_der: []const u8, key_raw: []const u8) void {
+        if (@hasDecl(w32, "getTls13Engine")) {
+            var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
+            if (w32.getTls13Engine(&cred_h)) |engine| {
+                _ = engine.loadCertificate(cert_der, key_raw);
+            }
+        }
+    }
+
+    /// Set ALPN protocol for this connection's TLS engine.
+    pub fn setTlsAlpn(self: *Connection, alpn: []const u8) void {
+        if (@hasDecl(w32, "setTlsAlpn")) {
+            var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
+            _ = w32.setTlsAlpn(&cred_h, alpn);
+        }
+    }
+
+    /// Set QUIC transport parameters for TLS engine.
+    pub fn setTlsTransportParams(self: *Connection, params: []const u8) void {
+        if (@hasDecl(w32, "setTlsTransportParams")) {
+            var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
+            _ = w32.setTlsTransportParams(&cred_h, params);
+        }
+    }
+        pub fn deinit(self: *Connection) void {
         // Close the UDP socket
         self.socket.deinit();
 
