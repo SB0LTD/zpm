@@ -459,11 +459,30 @@ pub fn BCryptEncrypt(
     _ = cbOutput;
     _ = dwFlags;
     const idx = slotFromHandle(hKey) orelse return -1;
-    const info = pPaddingInfo orelse return -1;
     const key_len: usize = key_slots[idx].key_len;
     if (key_len != 16 and key_len != 32) return -1;
-
     const input_len: usize = @intCast(cbInput);
+
+    // ECB/CBC mode (header protection): pPaddingInfo == null
+    if (pPaddingInfo == null) {
+        if (input_len != 16) return -1;
+        const output = (pbOutput orelse return -1)[0..16];
+        const input = pbInput[0..16];
+        if (key_len == 16) {
+            const key: [16]u8 = key_slots[idx].key[0..16].*;
+            const ctx = crypto.core.aes.Aes128.initEnc(key);
+            ctx.encrypt(output, input);
+        } else {
+            const key: [32]u8 = key_slots[idx].key[0..32].*;
+            const ctx = crypto.core.aes.Aes256.initEnc(key);
+            ctx.encrypt(output, input);
+        }
+        pcbResult.* = 16;
+        return 0;
+    }
+
+    // GCM mode
+    const info = pPaddingInfo.?;
     const nonce_len: usize = @intCast(info.cbNonce);
     const ad_len: usize = @intCast(info.cbAuthData);
     const tag_len: usize = @intCast(info.cbTag);
