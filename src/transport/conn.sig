@@ -52,6 +52,12 @@ const PacketHeader = packet.PacketHeader;
 
 // ── Connection State ──
 
+// CRYPTO stream received range entry (for out-of-order reassembly)
+pub const CryptoRange = struct {
+    start: u16 = 0,
+    end: u16 = 0, // exclusive
+};
+
 pub const ConnState = enum(u8) {
     idle,
     handshaking,
@@ -431,11 +437,16 @@ pub const Connection = struct {
     send_buf: [1500]u8,
 
     // CRYPTO stream reassembly (RFC 9000 §19.6)
-    // Accumulates CRYPTO frame data by offset until a complete TLS message is ready.
-    // Chrome's post-quantum ClientHello (~1400B) spans multiple QUIC packets.
-    crypto_recv_buf: [3][8192]u8, // per PktNumSpace (initial, handshake, application)
-    crypto_recv_len: [3]u16,     // bytes received contiguously from offset 0
-    crypto_recv_offset: [3]u64,  // next expected offset (= total delivered so far)
+    // Production-grade implementation following Google quiche QuicStreamSequencerBuffer
+    // and Go net/quic cryptoStream patterns:
+    //   - Buffer: flat array for random-write at any offset
+    //   - Range set: sorted intervals tracking received byte ranges
+    //   - Contiguous frontier: longest prefix from offset 0 with no gaps
+    // Supports at least 4096 bytes out-of-order (RFC 9000 requirement). We provide 8192.
+    crypto_recv_buf: [3][8192]u8, // per PktNumSpace
+    crypto_recv_len: [3]u16,     // contiguous frontier (bytes deliverable from offset 0)
+    crypto_ranges: [3][16]CryptoRange, // received ranges per space (sorted, max 16 entries)
+    crypto_range_count: [3]u8,   // number of active ranges per space
 
     // Pending close frame data
     close_error_code: u64,
@@ -566,7 +577,8 @@ pub const Connection = struct {
         // Initialize CRYPTO reassembly buffers
         self.crypto_recv_buf = @as([3][8192]u8, @splat(@as([8192]u8, @splat(0))));
         self.crypto_recv_len = @as([3]u16, @splat(0));
-        self.crypto_recv_offset = @as([3]u64, @splat(0));
+        self.crypto_ranges = @as([3][16]CryptoRange, @splat(@as([16]CryptoRange, @splat(CryptoRange{}))));
+        self.crypto_range_count = @as([3]u8, @splat(0));
 
         self.close_error_code = 0;
         self.close_reason = @as([128]u8, @splat(0));
@@ -863,81 +875,43 @@ pub const Connection = struct {
                 },
 
                 .crypto => |crypto_frame| {
-                    // CRYPTO stream reassembly (RFC 9000 §19.6)
-                    // Accumulate fragments by offset, deliver to TLS when contiguous.
+                    // CRYPTO stream reassembly — production-grade (RFC 9000 §19.6)
+                    // Pattern: random write + range set + contiguous delivery
+                    // (same as Google quiche QuicStreamSequencerBuffer, Go net/quic cryptoStream)
                     const level = self.levelFromSpace(space);
                     const s_idx = @intFromEnum(space);
                     const data_end = crypto_frame.data_offset + crypto_frame.data_len;
 
                     if (data_end <= buf.len and crypto_frame.data_len > 0) {
                         const frag_data = buf[crypto_frame.data_offset..data_end];
-                        const frag_offset = crypto_frame.offset;
+                        const frag_start: u16 = @intCast(crypto_frame.offset);
                         const frag_len: u16 = crypto_frame.data_len;
+                        const frag_end: u16 = frag_start + frag_len;
 
-                        // Diagnostic: log fragment receipt
-                        writeStdout("CRYPTO FRAG: ");
-                        writeHexU16(frag_len);
-                        writeStdout(" bytes at offset ");
-                        writeHexU64(frag_offset);
-                        writeStdout(" (expected ");
-                        writeHexU64(self.crypto_recv_offset[s_idx]);
-                        writeStdout(")\n");
-
-                        // Place fragment at its stated offset (RFC 9000 §19.6)
-                        // Industry standard: random write, in-sequence read (Google quiche pattern)
-                        const buf_offset: u16 = @intCast(frag_offset);
-                        if (buf_offset + frag_len <= self.crypto_recv_buf[s_idx].len) {
+                        // 1. Write fragment data into buffer at stated offset
+                        if (frag_end <= self.crypto_recv_buf[s_idx].len) {
                             @memcpy(
-                                self.crypto_recv_buf[s_idx][buf_offset .. buf_offset + frag_len],
+                                self.crypto_recv_buf[s_idx][frag_start..frag_end],
                                 frag_data,
                             );
-                            // Mark this range as received in the bitmap
-                            const new_end: u16 = buf_offset + frag_len;
-                            if (new_end > self.crypto_recv_offset[s_idx]) {
-                                self.crypto_recv_offset[s_idx] = new_end; // high-water mark
-                            }
-                            // Update contiguous frontier: the point up to which all bytes
-                            // have been received. We only need to advance if this fragment
-                            // starts at or before the current frontier (closes a gap).
-                            if (buf_offset <= self.crypto_recv_len[s_idx] and new_end > self.crypto_recv_len[s_idx]) {
-                                // This fragment extended the contiguous region.
-                                // Now scan forward: subsequent bytes may already be filled
-                                // by earlier out-of-order fragments. Advance frontier to
-                                // the high-water mark since within a single QUIC packet,
-                                // all CRYPTO frames collectively fill the stream without gaps.
-                                // For multi-packet scenarios, gaps ARE possible — but the
-                                // unfilled bytes remain as zeros which will cause TLS parse
-                                // failure, correctly triggering a wait for retransmission.
-                                self.crypto_recv_len[s_idx] = @intCast(self.crypto_recv_offset[s_idx]);
+
+                            // 2. Insert [frag_start, frag_end) into sorted range set, merging overlaps
+                            self.insertCryptoRange(s_idx, frag_start, frag_end);
+
+                            // 3. Update contiguous frontier from the range set
+                            //    If the first range starts at 0, the frontier is that range's end.
+                            if (self.crypto_range_count[s_idx] > 0 and self.crypto_ranges[s_idx][0].start == 0) {
+                                self.crypto_recv_len[s_idx] = self.crypto_ranges[s_idx][0].end;
                             }
                         }
 
-                        // Try to deliver complete TLS message(s) to the engine.
+                        // 4. Try to deliver complete TLS message(s)
                         const total = self.crypto_recv_len[s_idx];
                         if (total >= 4) {
                             const msg_body_len = (@as(u32, self.crypto_recv_buf[s_idx][1]) << 16) |
                                 (@as(u32, self.crypto_recv_buf[s_idx][2]) << 8) |
                                 @as(u32, self.crypto_recv_buf[s_idx][3]);
                             const full_msg_len: u16 = @intCast(@min(msg_body_len + 4, 8192));
-
-                            // Diagnostic: log reassembly state
-                            writeStdout("CRYPTO REASM: total=");
-                            writeHexU16(total);
-                            writeStdout(" hdr=[");
-                            writeHexU8(self.crypto_recv_buf[s_idx][0]);
-                            writeStdout(" ");
-                            writeHexU8(self.crypto_recv_buf[s_idx][1]);
-                            writeStdout(" ");
-                            writeHexU8(self.crypto_recv_buf[s_idx][2]);
-                            writeStdout(" ");
-                            writeHexU8(self.crypto_recv_buf[s_idx][3]);
-                            writeStdout("] need=");
-                            writeHexU16(full_msg_len);
-                            if (total >= full_msg_len) {
-                                writeStdout(" DELIVERING\n");
-                            } else {
-                                writeStdout(" WAITING\n");
-                            }
 
                             if (total >= full_msg_len) {
                                 // Complete TLS message — deliver to TLS engine
@@ -989,7 +963,7 @@ pub const Connection = struct {
                                     }
                                 }
 
-                                // Shift remaining data in reassembly buffer
+                                // Shift buffer and range set past delivered message
                                 if (total > full_msg_len) {
                                     const remaining = total - full_msg_len;
                                     var ri: u16 = 0;
@@ -997,8 +971,11 @@ pub const Connection = struct {
                                         self.crypto_recv_buf[s_idx][ri] = self.crypto_recv_buf[s_idx][full_msg_len + ri];
                                     }
                                     self.crypto_recv_len[s_idx] = remaining;
+                                    // Adjust range set offsets
+                                    self.shiftCryptoRanges(s_idx, full_msg_len);
                                 } else {
                                     self.crypto_recv_len[s_idx] = 0;
+                                    self.crypto_range_count[s_idx] = 0;
                                 }
                             }
                         }
@@ -1311,6 +1288,74 @@ pub const Connection = struct {
             var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
             _ = w32.setTlsTransportParams(&cred_h, params);
         }
+    }
+    /// Insert a received byte range into the sorted range set, merging overlaps.
+    /// This is the core of the reassembly algorithm (same pattern as quiche/quinn).
+    fn insertCryptoRange(self: *Connection, s_idx: usize, start: u16, end_val: u16) void {
+        const count = self.crypto_range_count[s_idx];
+        var ranges = &self.crypto_ranges[s_idx];
+
+        // Find insertion point (ranges are sorted by start)
+        var insert_at: u8 = count;
+        var i: u8 = 0;
+        while (i < count) : (i += 1) {
+            if (start <= ranges[i].end) {
+                insert_at = i;
+                break;
+            }
+        }
+
+        // Merge with overlapping/adjacent ranges
+        var new_start = start;
+        var new_end = end_val;
+        var merge_end: u8 = insert_at;
+
+        // Extend left: merge with previous range if adjacent/overlapping
+        if (insert_at > 0 and ranges[insert_at - 1].end >= start) {
+            insert_at -= 1;
+            new_start = @min(new_start, ranges[insert_at].start);
+            new_end = @max(new_end, ranges[insert_at].end);
+            merge_end = insert_at + 1;
+        }
+
+        // Extend right: merge with subsequent ranges if overlapping
+        while (merge_end < count and ranges[merge_end].start <= new_end) {
+            new_end = @max(new_end, ranges[merge_end].end);
+            merge_end += 1;
+        }
+
+        // Replace ranges[insert_at..merge_end] with single merged range
+        ranges[insert_at] = .{ .start = new_start, .end = new_end };
+
+        // Shift remaining ranges down
+        const removed = merge_end - insert_at - 1;
+        if (removed > 0) {
+            var j: u8 = insert_at + 1;
+            while (j + removed < count) : (j += 1) {
+                ranges[j] = ranges[j + removed];
+            }
+            self.crypto_range_count[s_idx] = count - removed;
+        } else if (insert_at == count and count < 16) {
+            // New range appended at end
+            self.crypto_range_count[s_idx] = count + 1;
+        }
+    }
+    /// Shift all ranges left after delivering a TLS message.
+    /// Shift all ranges left after delivering a TLS message.
+    fn shiftCryptoRanges(self: *Connection, s_idx: usize, amount: u16) void {
+        const count = self.crypto_range_count[s_idx];
+        var ranges = &self.crypto_ranges[s_idx];
+        var write: u8 = 0;
+        var read: u8 = 0;
+        while (read < count) : (read += 1) {
+            if (ranges[read].end <= amount) continue; // range fully consumed
+            ranges[write] = .{
+                .start = if (ranges[read].start >= amount) ranges[read].start - amount else 0,
+                .end = ranges[read].end - amount,
+            };
+            write += 1;
+        }
+        self.crypto_range_count[s_idx] = write;
     }
         pub fn deinit(self: *Connection) void {
         // Close the UDP socket
