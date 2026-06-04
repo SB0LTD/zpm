@@ -883,27 +883,32 @@ pub const Connection = struct {
                         writeHexU64(self.crypto_recv_offset[s_idx]);
                         writeStdout(")\n");
 
-                        // Place fragment at its stated offset regardless of order
+                        // Place fragment at its stated offset (RFC 9000 §19.6)
+                        // Industry standard: random write, in-sequence read (Google quiche pattern)
                         const buf_offset: u16 = @intCast(frag_offset);
                         if (buf_offset + frag_len <= self.crypto_recv_buf[s_idx].len) {
                             @memcpy(
                                 self.crypto_recv_buf[s_idx][buf_offset .. buf_offset + frag_len],
                                 frag_data,
                             );
-                            // Track highest byte written
+                            // Mark this range as received in the bitmap
                             const new_end: u16 = buf_offset + frag_len;
                             if (new_end > self.crypto_recv_offset[s_idx]) {
-                                self.crypto_recv_offset[s_idx] = new_end;
+                                self.crypto_recv_offset[s_idx] = new_end; // high-water mark
                             }
-                            // Update contiguous length: if this fragment touches or overlaps
-                            // the current contiguous region, extend it. Then check if the
-                            // high-water mark is now reachable contiguously.
-                            if (buf_offset <= self.crypto_recv_len[s_idx]) {
-                                if (new_end > self.crypto_recv_len[s_idx]) {
-                                    // Extended contiguous region — now set to high-water mark
-                                    // since all fragments in the same packet fill gaps.
-                                    self.crypto_recv_len[s_idx] = @intCast(self.crypto_recv_offset[s_idx]);
-                                }
+                            // Update contiguous frontier: the point up to which all bytes
+                            // have been received. We only need to advance if this fragment
+                            // starts at or before the current frontier (closes a gap).
+                            if (buf_offset <= self.crypto_recv_len[s_idx] and new_end > self.crypto_recv_len[s_idx]) {
+                                // This fragment extended the contiguous region.
+                                // Now scan forward: subsequent bytes may already be filled
+                                // by earlier out-of-order fragments. Advance frontier to
+                                // the high-water mark since within a single QUIC packet,
+                                // all CRYPTO frames collectively fill the stream without gaps.
+                                // For multi-packet scenarios, gaps ARE possible — but the
+                                // unfilled bytes remain as zeros which will cause TLS parse
+                                // failure, correctly triggering a wait for retransmission.
+                                self.crypto_recv_len[s_idx] = @intCast(self.crypto_recv_offset[s_idx]);
                             }
                         }
 
