@@ -235,6 +235,7 @@ pub const CryptoStream = struct {
             var i: u8 = merge_start;
             while (i < count) : (i += 1) {
                 if (self.ranges[i].start > new_end) break;
+                new_start = @min(new_start, self.ranges[i].start);
                 new_end = @max(new_end, self.ranges[i].end);
                 merge_end = i + 1;
             }
