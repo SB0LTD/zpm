@@ -883,22 +883,19 @@ pub const Connection = struct {
                         writeHexU64(self.crypto_recv_offset[s_idx]);
                         writeStdout(")\n");
 
-                        // Check if this fragment fits contiguously
-                        if (frag_offset == self.crypto_recv_offset[s_idx]) {
-                            // Contiguous: append directly
-                            const cur_len = self.crypto_recv_len[s_idx];
-                            if (cur_len + frag_len <= self.crypto_recv_buf[s_idx].len) {
-                                @memcpy(
-                                    self.crypto_recv_buf[s_idx][cur_len .. cur_len + frag_len],
-                                    frag_data,
-                                );
-                                self.crypto_recv_len[s_idx] += frag_len;
-                                self.crypto_recv_offset[s_idx] += frag_len;
+                        // Place fragment at its stated offset regardless of order
+                        const buf_offset: u16 = @intCast(frag_offset);
+                        if (buf_offset + frag_len <= self.crypto_recv_buf[s_idx].len) {
+                            @memcpy(
+                                self.crypto_recv_buf[s_idx][buf_offset .. buf_offset + frag_len],
+                                frag_data,
+                            );
+                            // Update high-water mark
+                            const new_end: u16 = buf_offset + frag_len;
+                            if (new_end > self.crypto_recv_len[s_idx]) {
+                                self.crypto_recv_len[s_idx] = new_end;
                             }
-                        } else if (frag_offset < self.crypto_recv_offset[s_idx]) {
-                            // Duplicate/retransmit of already-received data — ignore
                         }
-                        // else: out-of-order fragment — drop for now (simplified)
 
                         // Try to deliver complete TLS message(s) to the engine.
                         const total = self.crypto_recv_len[s_idx];
