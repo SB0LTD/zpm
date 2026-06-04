@@ -16,6 +16,7 @@ const streams = @import("streams");
 const datagram = @import("datagram");
 const telemetry = @import("telemetry");
 const udp = @import("udp");
+const crypto_stream = @import("crypto_stream");
 
 fn writeStdout(msg: []const u8) void {
     const linux = @import("std").os.linux;
@@ -51,12 +52,6 @@ const Frame = packet.Frame;
 const PacketHeader = packet.PacketHeader;
 
 // ── Connection State ──
-
-// CRYPTO stream received range entry (for out-of-order reassembly)
-pub const CryptoRange = struct {
-    start: u16 = 0,
-    end: u16 = 0, // exclusive
-};
 
 pub const ConnState = enum(u8) {
     idle,
@@ -437,16 +432,8 @@ pub const Connection = struct {
     send_buf: [1500]u8,
 
     // CRYPTO stream reassembly (RFC 9000 §19.6)
-    // Production-grade implementation following Google quiche QuicStreamSequencerBuffer
-    // and Go net/quic cryptoStream patterns:
-    //   - Buffer: flat array for random-write at any offset
-    //   - Range set: sorted intervals tracking received byte ranges
-    //   - Contiguous frontier: longest prefix from offset 0 with no gaps
-    // Supports at least 4096 bytes out-of-order (RFC 9000 requirement). We provide 8192.
-    crypto_recv_buf: [3][8192]u8, // per PktNumSpace
-    crypto_recv_len: [3]u16,     // contiguous frontier (bytes deliverable from offset 0)
-    crypto_ranges: [3][16]CryptoRange, // received ranges per space (sorted, max 16 entries)
-    crypto_range_count: [3]u8,   // number of active ranges per space
+    // Standalone module: 16KB buffer, 32-entry range set, zero allocation.
+    crypto_streams: [3]crypto_stream.CryptoStream,
 
     // Pending close frame data
     close_error_code: u64,
@@ -574,11 +561,10 @@ pub const Connection = struct {
         self.recv_buf = @as([1500]u8, @splat(0));
         self.send_buf = @as([1500]u8, @splat(0));
 
-        // Initialize CRYPTO reassembly buffers
-        self.crypto_recv_buf = @as([3][8192]u8, @splat(@as([8192]u8, @splat(0))));
-        self.crypto_recv_len = @as([3]u16, @splat(0));
-        self.crypto_ranges = @as([3][16]CryptoRange, @splat(@as([16]CryptoRange, @splat(CryptoRange{}))));
-        self.crypto_range_count = @as([3]u8, @splat(0));
+        // Initialize CRYPTO reassembly streams
+        for (0..3) |i| {
+            self.crypto_streams[i] = crypto_stream.CryptoStream.init();
+        }
 
         self.close_error_code = 0;
         self.close_reason = @as([128]u8, @splat(0));
@@ -875,107 +861,81 @@ pub const Connection = struct {
                 },
 
                 .crypto => |crypto_frame| {
-                    // CRYPTO stream reassembly — production-grade (RFC 9000 §19.6)
-                    // Pattern: random write + range set + contiguous delivery
-                    // (same as Google quiche QuicStreamSequencerBuffer, Go net/quic cryptoStream)
+                    // CRYPTO stream reassembly via standalone module (RFC 9000 §19.6)
                     const level = self.levelFromSpace(space);
                     const s_idx = @intFromEnum(space);
                     const data_end = crypto_frame.data_offset + crypto_frame.data_len;
 
                     if (data_end <= buf.len and crypto_frame.data_len > 0) {
                         const frag_data = buf[crypto_frame.data_offset..data_end];
-                        const frag_start: u16 = @intCast(crypto_frame.offset);
-                        const frag_len: u16 = crypto_frame.data_len;
-                        const frag_end: u16 = frag_start + frag_len;
+                        const cs = &self.crypto_streams[s_idx];
+                        const recv_result = cs.receive(crypto_frame.offset, frag_data);
 
-                        // 1. Write fragment data into buffer at stated offset
-                        if (frag_end <= self.crypto_recv_buf[s_idx].len) {
-                            @memcpy(
-                                self.crypto_recv_buf[s_idx][frag_start..frag_end],
-                                frag_data,
-                            );
+                        if (recv_result == .ok or recv_result == .duplicate) {
+                            // Check for deliverable TLS message
+                            const avail = cs.readable();
+                            if (avail >= 4) {
+                                // Read TLS header to determine message length
+                                var hdr: [4]u8 = undefined;
+                                _ = cs.read(&hdr);
+                                const msg_len: u16 = @intCast(@min(
+                                    (@as(u32, hdr[1]) << 16 | @as(u32, hdr[2]) << 8 | @as(u32, hdr[3])) + 4,
+                                    crypto_stream.buf_size,
+                                ));
 
-                            // 2. Insert [frag_start, frag_end) into sorted range set, merging overlaps
-                            self.insertCryptoRange(s_idx, frag_start, frag_end);
+                                if (avail >= msg_len) {
+                                    var msg_buf: [8192]u8 = undefined;
+                                    const read_len = cs.read(msg_buf[0..msg_len]);
+                                    cs.consume(read_len);
 
-                            // 3. Update contiguous frontier from the range set
-                            //    If the first range starts at 0, the frontier is that range's end.
-                            if (self.crypto_range_count[s_idx] > 0 and self.crypto_ranges[s_idx][0].start == 0) {
-                                self.crypto_recv_len[s_idx] = self.crypto_ranges[s_idx][0].end;
-                            }
-                        }
+                                    // Feed to TLS engine
+                                    const crypto_data = msg_buf[0..read_len];
+                                    const hs_result = self.tls.feedCryptoData(level, crypto_data);
 
-                        // 4. Try to deliver complete TLS message(s)
-                        const total = self.crypto_recv_len[s_idx];
-                        if (total >= 4) {
-                            const msg_body_len = (@as(u32, self.crypto_recv_buf[s_idx][1]) << 16) |
-                                (@as(u32, self.crypto_recv_buf[s_idx][2]) << 8) |
-                                @as(u32, self.crypto_recv_buf[s_idx][3]);
-                            const full_msg_len: u16 = @intCast(@min(msg_body_len + 4, 8192));
-
-                            if (total >= full_msg_len) {
-                                // Complete TLS message — deliver to TLS engine
-                                const crypto_data = self.crypto_recv_buf[s_idx][0..full_msg_len];
-                                const hs_result = self.tls.feedCryptoData(level, crypto_data);
-
-                                // Route TLS output to send buffer
-                                if (hs_result.output.has_data and hs_result.output.data_len > 0) {
-                                    const out_len = hs_result.output.data_len;
-                                    if (out_len <= self.tls.send_buf.len - self.tls.send_len) {
-                                        @memcpy(
-                                            self.tls.send_buf[self.tls.send_len .. self.tls.send_len + out_len],
-                                            hs_result.output.data[0..out_len],
-                                        );
-                                        self.tls.send_len += out_len;
-                                    }
-                                }
-
-                                if (hs_result.complete) {
-                                    if (self.state == .handshaking) {
-                                        self.state = .connected;
-                                        @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.connected), .monotonic);
-                                        if (hs_result.transport_params_len > 0) {
-                                            const tp_result = decodeTransportParams(
-                                                hs_result.transport_params[0..hs_result.transport_params_len],
+                                    // Route TLS output to send buffer
+                                    if (hs_result.output.has_data and hs_result.output.data_len > 0) {
+                                        const out_len = hs_result.output.data_len;
+                                        if (out_len <= self.tls.send_buf.len - self.tls.send_len) {
+                                            @memcpy(
+                                                self.tls.send_buf[self.tls.send_len .. self.tls.send_len + out_len],
+                                                hs_result.output.data[0..out_len],
                                             );
-                                            if (tp_result.err == .none) {
-                                                self.peer_params = tp_result.params;
-                                                self.stream_mgr.conn_send_max = tp_result.params.initial_max_data;
-                                                self.stream_mgr.max_bidi_streams = tp_result.params.initial_max_streams_bidi;
-                                                self.stream_mgr.max_uni_streams = tp_result.params.initial_max_streams_uni;
-                                                if (tp_result.params.max_datagram_frame_size > 0) {
-                                                    self.datagrams.peer_max_size = tp_result.params.max_datagram_frame_size;
-                                                }
-                                                if (self.zero_rtt_state == .sending) {
-                                                    self.zero_rtt_state = .accepted;
+                                            self.tls.send_len += out_len;
+                                        }
+                                    }
+
+                                    if (hs_result.complete) {
+                                        if (self.state == .handshaking) {
+                                            self.state = .connected;
+                                            @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.connected), .monotonic);
+                                            if (hs_result.transport_params_len > 0) {
+                                                const tp_result = decodeTransportParams(
+                                                    hs_result.transport_params[0..hs_result.transport_params_len],
+                                                );
+                                                if (tp_result.err == .none) {
+                                                    self.peer_params = tp_result.params;
+                                                    self.stream_mgr.conn_send_max = tp_result.params.initial_max_data;
+                                                    self.stream_mgr.max_bidi_streams = tp_result.params.initial_max_streams_bidi;
+                                                    self.stream_mgr.max_uni_streams = tp_result.params.initial_max_streams_uni;
+                                                    if (tp_result.params.max_datagram_frame_size > 0) {
+                                                        self.datagrams.peer_max_size = tp_result.params.max_datagram_frame_size;
+                                                    }
+                                                    if (self.zero_rtt_state == .sending) {
+                                                        self.zero_rtt_state = .accepted;
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                                if (self.state == .connected and !self.is_server and crypto_data.len > 0) {
-                                    self.onNewSessionTicket(crypto_data);
-                                }
-                                if (hs_result.err != .none) {
-                                    if (self.state == .handshaking) {
-                                        self.state = .closed;
-                                        @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.closed), .monotonic);
+                                    if (self.state == .connected and !self.is_server and crypto_data.len > 0) {
+                                        self.onNewSessionTicket(crypto_data);
                                     }
-                                }
-
-                                // Shift buffer and range set past delivered message
-                                if (total > full_msg_len) {
-                                    const remaining = total - full_msg_len;
-                                    var ri: u16 = 0;
-                                    while (ri < remaining) : (ri += 1) {
-                                        self.crypto_recv_buf[s_idx][ri] = self.crypto_recv_buf[s_idx][full_msg_len + ri];
+                                    if (hs_result.err != .none) {
+                                        if (self.state == .handshaking) {
+                                            self.state = .closed;
+                                            @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.closed), .monotonic);
+                                        }
                                     }
-                                    self.crypto_recv_len[s_idx] = remaining;
-                                    // Adjust range set offsets
-                                    self.shiftCryptoRanges(s_idx, full_msg_len);
-                                } else {
-                                    self.crypto_recv_len[s_idx] = 0;
-                                    self.crypto_range_count[s_idx] = 0;
                                 }
                             }
                         }
@@ -1289,75 +1249,7 @@ pub const Connection = struct {
             _ = w32.setTlsTransportParams(&cred_h, params);
         }
     }
-    /// Insert a received byte range into the sorted range set, merging overlaps.
-    /// This is the core of the reassembly algorithm (same pattern as quiche/quinn).
-    fn insertCryptoRange(self: *Connection, s_idx: usize, start: u16, end_val: u16) void {
-        const count = self.crypto_range_count[s_idx];
-        var ranges = &self.crypto_ranges[s_idx];
-
-        // Find insertion point (ranges are sorted by start)
-        var insert_at: u8 = count;
-        var i: u8 = 0;
-        while (i < count) : (i += 1) {
-            if (start <= ranges[i].end) {
-                insert_at = i;
-                break;
-            }
-        }
-
-        // Merge with overlapping/adjacent ranges
-        var new_start = start;
-        var new_end = end_val;
-        var merge_end: u8 = insert_at;
-
-        // Extend left: merge with previous range if adjacent/overlapping
-        if (insert_at > 0 and ranges[insert_at - 1].end >= start) {
-            insert_at -= 1;
-            new_start = @min(new_start, ranges[insert_at].start);
-            new_end = @max(new_end, ranges[insert_at].end);
-            merge_end = insert_at + 1;
-        }
-
-        // Extend right: merge with subsequent ranges if overlapping
-        while (merge_end < count and ranges[merge_end].start <= new_end) {
-            new_end = @max(new_end, ranges[merge_end].end);
-            merge_end += 1;
-        }
-
-        // Replace ranges[insert_at..merge_end] with single merged range
-        ranges[insert_at] = .{ .start = new_start, .end = new_end };
-
-        // Shift remaining ranges down
-        const removed = merge_end - insert_at - 1;
-        if (removed > 0) {
-            var j: u8 = insert_at + 1;
-            while (j + removed < count) : (j += 1) {
-                ranges[j] = ranges[j + removed];
-            }
-            self.crypto_range_count[s_idx] = count - removed;
-        } else if (insert_at == count and count < 16) {
-            // New range appended at end
-            self.crypto_range_count[s_idx] = count + 1;
-        }
-    }
-    /// Shift all ranges left after delivering a TLS message.
-    /// Shift all ranges left after delivering a TLS message.
-    fn shiftCryptoRanges(self: *Connection, s_idx: usize, amount: u16) void {
-        const count = self.crypto_range_count[s_idx];
-        var ranges = &self.crypto_ranges[s_idx];
-        var write: u8 = 0;
-        var read: u8 = 0;
-        while (read < count) : (read += 1) {
-            if (ranges[read].end <= amount) continue; // range fully consumed
-            ranges[write] = .{
-                .start = if (ranges[read].start >= amount) ranges[read].start - amount else 0,
-                .end = ranges[read].end - amount,
-            };
-            write += 1;
-        }
-        self.crypto_range_count[s_idx] = write;
-    }
-        pub fn deinit(self: *Connection) void {
+    pub fn deinit(self: *Connection) void {
         // Close the UDP socket
         self.socket.deinit();
 

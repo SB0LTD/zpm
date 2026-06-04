@@ -4,6 +4,7 @@
 pub const udp = @import("udp");
 pub const packet = @import("packet");
 pub const crypto = @import("transport_crypto");
+pub const crypto_stream = @import("crypto_stream");
 pub const recovery = @import("recovery");
 pub const streams = @import("streams");
 pub const datagram = @import("datagram");

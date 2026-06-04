@@ -333,7 +333,13 @@ pub fn build(b: *std.Build) void {
     });
     streams_mod.addImport("packet", packet_mod);
 
-    const datagram_mod = b.addModule("datagram", .{
+    const crypto_stream_mod = b.addModule("crypto_stream", .{
+        .root_source_file = b.path("src/transport/crypto_stream.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+        const datagram_mod = b.addModule("datagram", .{
         .root_source_file = b.path("src/transport/datagram.sig"),
         .target = target,
         .optimize = optimize,
@@ -359,6 +365,7 @@ pub fn build(b: *std.Build) void {
     conn_mod.addImport("datagram", datagram_mod);
     conn_mod.addImport("telemetry", telemetry_mod);
     conn_mod.addImport("udp", udp_mod);
+    conn_mod.addImport("crypto_stream", crypto_stream_mod);
     if (os_tag == .windows) conn_mod.linkSystemLibrary("ws2_32", .{});
     if (os_tag == .windows) conn_mod.linkSystemLibrary("bcrypt", .{});
     if (os_tag == .windows) conn_mod.linkSystemLibrary("secur32", .{});
