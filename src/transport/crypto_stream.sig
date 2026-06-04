@@ -14,6 +14,30 @@
 pub const buf_size: u16 = 16384; // 16KB — large Certificate + post-quantum ClientHello
 pub const max_ranges: u8 = 32;  // handles heavily fragmented streams
 
+const std = @import("std");
+
+fn writeStdout(msg: []const u8) void {
+    _ = std.os.linux.write(1, msg.ptr, msg.len);
+}
+
+fn writeHexU16(val: u16) void {
+    const hex = "0123456789abcdef";
+    var b: [4]u8 = .{ hex[val >> 12], hex[(val >> 8) & 0xf], hex[(val >> 4) & 0xf], hex[val & 0xf] };
+    writeStdout(&b);
+}
+
+fn writeHexU64(val: u64) void {
+    const hex = "0123456789abcdef";
+    var b: [16]u8 = undefined;
+    for (0..8) |i| {
+        const shift: u6 = @intCast(56 - i * 8);
+        const byte: u8 = @intCast((val >> shift) & 0xff);
+        b[i * 2] = hex[byte >> 4];
+        b[i * 2 + 1] = hex[byte & 0xf];
+    }
+    writeStdout(&b);
+}
+
 pub const Range = struct {
     start: u16 = 0,
     end: u16 = 0, // [start, end) exclusive
@@ -48,9 +72,20 @@ pub const CryptoStream = struct {
     pub fn receive(self: *CryptoStream, offset: u64, data: []const u8) ReceiveResult {
         if (data.len == 0) return .ok;
 
+        writeStdout("CS.recv: off=");
+        writeHexU64(offset);
+        writeStdout(" len=");
+        writeHexU16(@intCast(data.len));
+        writeStdout(" read_off=");
+        writeHexU64(self.read_offset);
+        writeStdout("\n");
+
         // Compute buffer-relative position
         // If offset < read_offset, part or all of this fragment is already consumed.
-        if (offset + data.len <= self.read_offset) return .duplicate;
+        if (offset + data.len <= self.read_offset) {
+            writeStdout("CS.recv: DUPLICATE (before read_offset)\n");
+            return .duplicate;
+        }
 
         // Trim already-consumed prefix if the fragment partially overlaps read_offset
         var effective_data = data;
@@ -66,7 +101,14 @@ pub const CryptoStream = struct {
         const buf_end_u64 = buf_start_u64 + effective_data.len;
 
         // Overflow check
-        if (buf_end_u64 > buf_size) return .overflow;
+        if (buf_end_u64 > buf_size) {
+            writeStdout("CS.recv: OVERFLOW buf_end=");
+            writeHexU16(@intCast(buf_end_u64 & 0xffff));
+            writeStdout(" > buf_size=");
+            writeHexU16(buf_size);
+            writeStdout("\n");
+            return .overflow;
+        }
 
         const buf_start: u16 = @intCast(buf_start_u64);
         const buf_end: u16 = @intCast(buf_end_u64);
@@ -79,6 +121,12 @@ pub const CryptoStream = struct {
 
         // Insert [buf_start, buf_end) into the sorted range set with merge
         self.insertRange(buf_start, buf_end);
+
+        writeStdout("CS.recv: OK ranges=");
+        writeHexU16(@as(u16, self.range_count));
+        writeStdout(" readable=");
+        writeHexU16(self.readable());
+        writeStdout("\n");
 
         return .ok;
     }

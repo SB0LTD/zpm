@@ -882,6 +882,9 @@ pub const Connection = struct {
                         if (recv_result == .ok or recv_result == .duplicate) {
                             // Check for deliverable TLS message
                             const avail = cs.readable();
+                            if (avail == 0) {
+                                writeStdout("CRYPTO: recv ok but avail=0\n");
+                            }
                             if (avail >= 4) {
                                 // Read TLS header to determine message length
                                 var hdr: [4]u8 = undefined;
