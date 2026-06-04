@@ -890,10 +890,20 @@ pub const Connection = struct {
                                 self.crypto_recv_buf[s_idx][buf_offset .. buf_offset + frag_len],
                                 frag_data,
                             );
-                            // Update high-water mark
+                            // Track highest byte written
                             const new_end: u16 = buf_offset + frag_len;
-                            if (new_end > self.crypto_recv_len[s_idx]) {
-                                self.crypto_recv_len[s_idx] = new_end;
+                            if (new_end > self.crypto_recv_offset[s_idx]) {
+                                self.crypto_recv_offset[s_idx] = new_end;
+                            }
+                            // Update contiguous length: if this fragment touches or overlaps
+                            // the current contiguous region, extend it. Then check if the
+                            // high-water mark is now reachable contiguously.
+                            if (buf_offset <= self.crypto_recv_len[s_idx]) {
+                                if (new_end > self.crypto_recv_len[s_idx]) {
+                                    // Extended contiguous region — now set to high-water mark
+                                    // since all fragments in the same packet fill gaps.
+                                    self.crypto_recv_len[s_idx] = @intCast(self.crypto_recv_offset[s_idx]);
+                                }
                             }
                         }
 
