@@ -876,6 +876,14 @@ pub const Connection = struct {
 
                     if (data_end <= buf.len and crypto_frame.data_len > 0) {
                         const frag_data = buf[crypto_frame.data_offset..data_end];
+                        writeStdout("CRYPTO DISPATCH: space=");
+                        writeHexU16(@as(u16, s_idx));
+                        writeStdout(" stream_off=");
+                        writeHexU64(crypto_frame.offset);
+                        writeStdout(" data_len=");
+                        writeHexU16(crypto_frame.data_len);
+                        writeStdout("\n");
+
                         const cs = &self.crypto_streams[s_idx];
                         const recv_result = cs.receive(crypto_frame.offset, frag_data);
 
