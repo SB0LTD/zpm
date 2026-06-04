@@ -22,6 +22,29 @@ fn writeStdout(msg: []const u8) void {
     _ = linux.write(1, msg.ptr, msg.len);
 }
 
+fn writeHexU8(val: u8) void {
+    const hex = "0123456789abcdef";
+    var buf = [2]u8{ hex[val >> 4], hex[val & 0xf] };
+    writeStdout(&buf);
+}
+
+fn writeHexU16(val: u16) void {
+    writeHexU8(@intCast(val >> 8));
+    writeHexU8(@intCast(val & 0xff));
+}
+
+fn writeHexU64(val: u64) void {
+    const hex = "0123456789abcdef";
+    var buf: [16]u8 = undefined;
+    for (0..8) |i| {
+        const shift: u6 = @intCast(56 - i * 8);
+        const byte: u8 = @intCast((val >> shift) & 0xff);
+        buf[i * 2] = hex[byte >> 4];
+        buf[i * 2 + 1] = hex[byte & 0xf];
+    }
+    writeStdout(&buf);
+}
+
 const ConnectionId = packet.ConnectionId;
 const ParseError = packet.ParseError;
 const Frame = packet.Frame;
@@ -851,6 +874,15 @@ pub const Connection = struct {
                         const frag_offset = crypto_frame.offset;
                         const frag_len: u16 = crypto_frame.data_len;
 
+                        // Diagnostic: log fragment receipt
+                        writeStdout("CRYPTO FRAG: ");
+                        writeHexU16(frag_len);
+                        writeStdout(" bytes at offset ");
+                        writeHexU64(frag_offset);
+                        writeStdout(" (expected ");
+                        writeHexU64(self.crypto_recv_offset[s_idx]);
+                        writeStdout(")\n");
+
                         // Check if this fragment fits contiguously
                         if (frag_offset == self.crypto_recv_offset[s_idx]) {
                             // Contiguous: append directly
@@ -869,14 +901,31 @@ pub const Connection = struct {
                         // else: out-of-order fragment — drop for now (simplified)
 
                         // Try to deliver complete TLS message(s) to the engine.
-                        // A TLS handshake message starts with: type(1) + length(3).
-                        // We deliver once we have at least 4 bytes and length bytes are available.
                         const total = self.crypto_recv_len[s_idx];
                         if (total >= 4) {
                             const msg_body_len = (@as(u32, self.crypto_recv_buf[s_idx][1]) << 16) |
                                 (@as(u32, self.crypto_recv_buf[s_idx][2]) << 8) |
                                 @as(u32, self.crypto_recv_buf[s_idx][3]);
                             const full_msg_len: u16 = @intCast(@min(msg_body_len + 4, 8192));
+
+                            // Diagnostic: log reassembly state
+                            writeStdout("CRYPTO REASM: total=");
+                            writeHexU16(total);
+                            writeStdout(" hdr=[");
+                            writeHexU8(self.crypto_recv_buf[s_idx][0]);
+                            writeStdout(" ");
+                            writeHexU8(self.crypto_recv_buf[s_idx][1]);
+                            writeStdout(" ");
+                            writeHexU8(self.crypto_recv_buf[s_idx][2]);
+                            writeStdout(" ");
+                            writeHexU8(self.crypto_recv_buf[s_idx][3]);
+                            writeStdout("] need=");
+                            writeHexU16(full_msg_len);
+                            if (total >= full_msg_len) {
+                                writeStdout(" DELIVERING\n");
+                            } else {
+                                writeStdout(" WAITING\n");
+                            }
 
                             if (total >= full_msg_len) {
                                 // Complete TLS message — deliver to TLS engine
