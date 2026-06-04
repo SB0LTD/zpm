@@ -441,6 +441,12 @@ pub const Connection = struct {
     close_reason_len: u8,
     close_sent: bool,
 
+    // Shared listen socket support: after tick() assembles an outgoing packet,
+    // last_send_len holds the number of valid bytes in send_buf ready to be sent.
+    // Servers with a shared listen socket should send send_buf[0..last_send_len]
+    // via the listen socket instead of relying on the internal socket.
+    last_send_len: u16,
+
     // Path challenge/response
     path_response_pending: bool,
     path_response_data: [8]u8,
@@ -570,6 +576,7 @@ pub const Connection = struct {
         self.close_reason = @as([128]u8, @splat(0));
         self.close_reason_len = 0;
         self.close_sent = false;
+        self.last_send_len = 0;
 
         self.path_response_pending = false;
         self.path_response_data = @as([8]u8, @splat(0));
@@ -774,6 +781,7 @@ pub const Connection = struct {
         // 1. ACK  2. CRYPTO  3. Control stream 0  4. DATAGRAM  5. Bulk streams 4+
         if (self.state == .handshaking or self.state == .connected) {
             const sent = self.assembleSendPacket(now_tick);
+            self.last_send_len = sent;
             if (sent > 0) {
                 const send_result = self.socket.send(self.send_buf[0..sent], self.peer_addr);
                 if (send_result.err == .none) {
@@ -1139,6 +1147,7 @@ pub const Connection = struct {
         }
         self.close_reason_len = copy_len;
         self.close_sent = false;
+        self.last_send_len = 0;
 
         // Get current time
         var now_tick: u64 = 0;
