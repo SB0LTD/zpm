@@ -911,6 +911,35 @@ pub const Connection = struct {
                                     const crypto_data = msg_buf[0..read_len];
                                     const hs_result = self.tls.feedCryptoData(level, crypto_data);
 
+                                    // Sync TLS 1.3 derived keys into the connection's key slots.
+                                    // After ClientHello processing, the engine derives handshake keys.
+                                    // After Finished, it derives application keys.
+                                    if (@hasDecl(w32, "getTls13Engine")) {
+                                        var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
+                                        if (w32.getTls13Engine(&cred_h)) |engine| {
+                                            // Install handshake keys if available
+                                            if (engine.server_handshake_keys.valid) {
+                                                const hs_lvl = @intFromEnum(transport_crypto.EncryptionLevel.handshake);
+                                                self.tls.keys[hs_lvl] = .{
+                                                    .key = engine.server_handshake_keys.key,
+                                                    .iv = engine.server_handshake_keys.iv,
+                                                    .hp_key = engine.server_handshake_keys.hp_key,
+                                                    .valid = true,
+                                                };
+                                            }
+                                            // Install application keys if available
+                                            if (engine.server_app_keys.valid) {
+                                                const app_lvl = @intFromEnum(transport_crypto.EncryptionLevel.one_rtt);
+                                                self.tls.keys[app_lvl] = .{
+                                                    .key = engine.server_app_keys.key,
+                                                    .iv = engine.server_app_keys.iv,
+                                                    .hp_key = engine.server_app_keys.hp_key,
+                                                    .valid = true,
+                                                };
+                                            }
+                                        }
+                                    }
+
                                     // Route TLS output to send buffer
                                     if (hs_result.output.has_data and hs_result.output.data_len > 0) {
                                         const out_len = hs_result.output.data_len;
