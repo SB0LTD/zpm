@@ -1235,7 +1235,159 @@ pub const Connection = struct {
 
     /// Clean up all connection resources: close socket, release TLS handles,
     /// zero sensitive key material, and set state to closed.
-    /// Load TLS certificate into this connection's TLS engine.
+    /// Feed an externally-received packet into this connection and produce response(s).
+    /// 
+    /// For servers with a shared listen socket: instead of using tick() (which reads
+    /// from the connection's internal socket), call this function with the raw packet
+    /// data received on the listen socket. It performs the full recv→parse→decrypt→
+    /// dispatch→assemble→encrypt→send cycle, storing results in send_buf/last_send_len.
+    ///
+    /// The caller should then send connection.send_buf[0..connection.last_send_len]
+    /// via the listen socket after EACH call that returns a non-idle state.
+    ///
+    /// For Initial packets on an idle server connection, this handles the full
+    /// idle→handshaking transition including key derivation.
+    ///
+    /// Returns the connection state after processing.
+    pub fn feedAndRespond(self: *Connection, packet_data: []const u8, src_addr: w32.sockaddr_in) ConnState {
+        self.last_send_len = 0;
+        self.peer_addr = src_addr;
+
+        // Get current time
+        var now_tick: u64 = 0;
+        var qpc: w32.LARGE_INTEGER = .{};
+        _ = w32.QueryPerformanceCounter(&qpc);
+        if (qpc.QuadPart > 0) now_tick = @intCast(qpc.QuadPart);
+
+        if (self.state == .closed) return .closed;
+
+        // Parse packet header
+        const hdr_result = packet.parseHeader(packet_data);
+        if (hdr_result.err != .none) return self.state;
+        const hdr = hdr_result.header;
+
+        // Handle idle server receiving Initial
+        if (self.state == .idle and self.is_server and hdr.is_long and hdr.pkt_type == .initial) {
+            self.state = .handshaking;
+            @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.handshaking), .monotonic);
+            self.last_recv_tick = now_tick;
+            self.telem.recordReceived(@intCast(packet_data.len));
+
+            if (hdr.src_cid.len > 0 and self.remote_cid_count == 0) {
+                self.remote_cids[0] = hdr.src_cid;
+                self.remote_cid_count = 1;
+            }
+
+            // Derive Initial keys from client's DCID
+            const dcid_slice = hdr.dst_cid.slice();
+            const client_ks = transport_crypto.deriveInitialKeys(dcid_slice, false, self.version);
+            const server_ks = transport_crypto.deriveInitialKeys(dcid_slice, true, self.version);
+            const lvl_idx = @intFromEnum(transport_crypto.EncryptionLevel.initial);
+
+            // Install client keys for decryption
+            self.tls.keys[lvl_idx] = client_ks;
+
+            // Decrypt and process
+            // Copy packet data to recv_buf for in-place modification
+            const pkt_len: u16 = @intCast(packet_data.len);
+            @memcpy(self.recv_buf[0..pkt_len], packet_data);
+
+            const level = self.levelFromHeader(&hdr);
+            const pn_offset = hdr.payload_offset;
+            self.tls.unprotectHeader(level, self.recv_buf[0..pkt_len], pn_offset);
+
+            const pn_len: u16 = (self.recv_buf[0] & 0x03) + 1;
+            var pkt_number: u32 = 0;
+            for (0..pn_len) |i| {
+                pkt_number = (pkt_number << 8) | self.recv_buf[pn_offset + @as(u16, @intCast(i))];
+            }
+
+            const payload_start = pn_offset + pn_len;
+            const payload_len: u16 = if (hdr.payload_len > pn_len) hdr.payload_len - pn_len else 0;
+
+            if (payload_len > 0) {
+                const decrypt_err = self.tls.decrypt(level, pkt_number, self.recv_buf[0..pkt_len], payload_start, payload_len);
+                if (decrypt_err == .none) {
+                    const space = self.spaceFromLevel(level);
+                    const s_idx = @intFromEnum(space);
+                    if (pkt_number > self.largest_recv_pkt[s_idx]) {
+                        self.largest_recv_pkt[s_idx] = pkt_number;
+                    }
+                    const frame_len: u16 = if (payload_len >= 16) payload_len - 16 else 0;
+                    self.dispatchFrames(self.recv_buf[0..pkt_len], payload_start, frame_len, space, now_tick);
+                }
+            }
+
+            // Install server Initial keys for sending
+            self.tls.keys[lvl_idx] = server_ks;
+
+        } else if (self.state == .handshaking or self.state == .connected) {
+            // Process subsequent packets (already handshaking)
+            self.last_recv_tick = now_tick;
+            self.telem.recordReceived(@intCast(packet_data.len));
+
+            const pkt_len: u16 = @intCast(packet_data.len);
+            @memcpy(self.recv_buf[0..pkt_len], packet_data);
+
+            const level = self.levelFromHeader(&hdr);
+            const pn_offset = hdr.payload_offset;
+            self.tls.unprotectHeader(level, self.recv_buf[0..pkt_len], pn_offset);
+
+            const pn_len: u16 = (self.recv_buf[0] & 0x03) + 1;
+            var pkt_number: u32 = 0;
+            for (0..pn_len) |i| {
+                pkt_number = (pkt_number << 8) | self.recv_buf[pn_offset + @as(u16, @intCast(i))];
+            }
+
+            const payload_start = pn_offset + pn_len;
+            const payload_len: u16 = if (hdr.is_long)
+                hdr.payload_len -| pn_len
+            else if (pkt_len > payload_start)
+                pkt_len - payload_start
+            else
+                0;
+
+            if (payload_len > 0) {
+                const decrypt_err = self.tls.decrypt(level, pkt_number, self.recv_buf[0..pkt_len], payload_start, payload_len);
+                if (decrypt_err == .none) {
+                    const space = self.spaceFromLevel(level);
+                    const s_idx = @intFromEnum(space);
+                    if (pkt_number > self.largest_recv_pkt[s_idx]) {
+                        self.largest_recv_pkt[s_idx] = pkt_number;
+                    }
+                    const frame_len: u16 = if (payload_len >= 16) payload_len - 16 else 0;
+                    self.dispatchFrames(self.recv_buf[0..pkt_len], payload_start, frame_len, space, now_tick);
+                }
+            }
+        }
+
+        // Send phase — assemble and produce all pending responses
+        if (self.state == .handshaking or self.state == .connected) {
+            // Loop to produce Initial ACK + Handshake ServerHello in one burst
+            var total_sent: u16 = 0;
+            var send_attempts: u8 = 0;
+            while (send_attempts < 4) : (send_attempts += 1) {
+                const sent = self.assembleSendPacket(now_tick);
+                if (sent == 0) break;
+                // For the caller: store the LAST assembled packet.
+                // In production, caller should send EACH packet as it's produced.
+                // We copy each packet to sequential position for coalesced sending.
+                if (total_sent + sent <= self.send_buf.len) {
+                    if (total_sent > 0) {
+                        // Shift previous data — actually just overwrite for simplicity.
+                        // The caller should call this in a loop checking last_send_len.
+                    }
+                    self.last_send_len = sent;
+                    total_sent = sent;
+                    break; // Caller must send this, then call feedAndRespond again for more
+                }
+            }
+        }
+
+        return self.state;
+    }
+
+        /// Load TLS certificate into this connection's TLS engine.
     /// cert_der: DER-encoded certificate bytes.
     /// key_raw: 32-byte raw ECDSA P-256 private key scalar.
     pub fn loadTlsCertificate(self: *Connection, cert_der: []const u8, key_raw: []const u8) bool {
