@@ -779,13 +779,20 @@ pub const Connection = struct {
 
         // Assemble and send outgoing packet with priority ordering:
         // 1. ACK  2. CRYPTO  3. Control stream 0  4. DATAGRAM  5. Bulk streams 4+
+        // During handshaking, we may need to send BOTH an Initial ACK and a
+        // Handshake ServerHello. Loop until nothing to send.
         if (self.state == .handshaking or self.state == .connected) {
-            const sent = self.assembleSendPacket(now_tick);
-            self.last_send_len = sent;
-            if (sent > 0) {
-                const send_result = self.socket.send(self.send_buf[0..sent], self.peer_addr);
-                if (send_result.err == .none) {
-                    self.telem.recordSent(send_result.bytes_sent);
+            var send_attempts: u8 = 0;
+            while (send_attempts < 3) : (send_attempts += 1) {
+                const sent = self.assembleSendPacket(now_tick);
+                self.last_send_len = sent;
+                if (sent > 0) {
+                    const send_result = self.socket.send(self.send_buf[0..sent], self.peer_addr);
+                    if (send_result.err == .none) {
+                        self.telem.recordSent(send_result.bytes_sent);
+                    }
+                } else {
+                    break; // nothing more to send
                 }
             }
         }
