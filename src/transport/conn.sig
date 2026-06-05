@@ -787,20 +787,42 @@ pub const Connection = struct {
 
         // Assemble and send outgoing packet with priority ordering:
         // 1. ACK  2. CRYPTO  3. Control stream 0  4. DATAGRAM  5. Bulk streams 4+
-        // During handshaking, we may need to send BOTH an Initial ACK and a
-        // Handshake ServerHello. Loop until nothing to send.
+        // During handshaking, coalesce Initial + Handshake into one UDP datagram (RFC 9001 §4.1).
         if (self.state == .handshaking or self.state == .connected) {
-            var send_attempts: u8 = 0;
-            while (send_attempts < 3) : (send_attempts += 1) {
-                const sent = self.assembleSendPacket(now_tick);
-                self.last_send_len = sent;
-                if (sent > 0) {
-                    const send_result = self.socket.send(self.send_buf[0..sent], self.peer_addr);
+            if (self.state == .handshaking) {
+                // Coalesce multiple packets for handshake
+                var coalesce_buf: [1500]u8 = @as([1500]u8, @splat(0));
+                var total: u16 = 0;
+                var send_attempts: u8 = 0;
+                while (send_attempts < 4) : (send_attempts += 1) {
+                    const sent = self.assembleSendPacket(now_tick);
+                    if (sent == 0) break;
+                    if (total + sent <= coalesce_buf.len) {
+                        @memcpy(coalesce_buf[total .. total + sent], self.send_buf[0..sent]);
+                        total += sent;
+                    } else break;
+                }
+                if (total > 0) {
+                    const send_result = self.socket.send(coalesce_buf[0..total], self.peer_addr);
                     if (send_result.err == .none) {
                         self.telem.recordSent(send_result.bytes_sent);
                     }
-                } else {
-                    break; // nothing more to send
+                    self.last_send_len = total;
+                }
+            } else {
+                // Connected: send packets individually
+                var send_attempts: u8 = 0;
+                while (send_attempts < 3) : (send_attempts += 1) {
+                    const sent = self.assembleSendPacket(now_tick);
+                    self.last_send_len = sent;
+                    if (sent > 0) {
+                        const send_result = self.socket.send(self.send_buf[0..sent], self.peer_addr);
+                        if (send_result.err == .none) {
+                            self.telem.recordSent(send_result.bytes_sent);
+                        }
+                    } else {
+                        break;
+                    }
                 }
             }
         }
@@ -982,15 +1004,48 @@ pub const Connection = struct {
                                         writeStdout("TLS: no output, no error\n");
                                     }
 
-                                    // Route TLS output to send buffer
+                                    // Route TLS output to send buffers (split Initial/Handshake per RFC 9001 §4.1)
                                     if (hs_result.output.has_data and hs_result.output.data_len > 0) {
                                         const out_len = hs_result.output.data_len;
-                                        if (out_len <= self.tls.send_buf.len - self.tls.send_len) {
-                                            @memcpy(
-                                                self.tls.send_buf[self.tls.send_len .. self.tls.send_len + out_len],
-                                                hs_result.output.data[0..out_len],
-                                            );
-                                            self.tls.send_len += out_len;
+                                        // Check if we have a ServerHello split point from Tls13Engine
+                                        var sh_len: u16 = 0;
+                                        if (@hasDecl(w32, "getTls13Engine")) {
+                                            var cred_h2: w32.CredHandle = @bitCast(self.tls.cred_handle);
+                                            if (w32.getTls13Engine(&cred_h2)) |eng| {
+                                                sh_len = eng.server_hello_len;
+                                            }
+                                        }
+                                        if (sh_len > 0 and sh_len < out_len) {
+                                            // ServerHello → Initial CRYPTO, rest → Handshake CRYPTO
+                                            if (sh_len <= self.tls.initial_send_buf.len) {
+                                                @memcpy(
+                                                    self.tls.initial_send_buf[0..sh_len],
+                                                    hs_result.output.data[0..sh_len],
+                                                );
+                                                self.tls.initial_send_len = sh_len;
+                                                writeStdout("TLS SPLIT: SH=");
+                                                writeHexU16(sh_len);
+                                            }
+                                            const hs_data_len = out_len - sh_len;
+                                            if (hs_data_len <= self.tls.send_buf.len - self.tls.send_len) {
+                                                @memcpy(
+                                                    self.tls.send_buf[self.tls.send_len .. self.tls.send_len + hs_data_len],
+                                                    hs_result.output.data[sh_len..out_len],
+                                                );
+                                                self.tls.send_len += hs_data_len;
+                                                writeStdout(" HS=");
+                                                writeHexU16(hs_data_len);
+                                            }
+                                            writeStdout("\n");
+                                        } else {
+                                            // No split info — send all at handshake level (fallback)
+                                            if (out_len <= self.tls.send_buf.len - self.tls.send_len) {
+                                                @memcpy(
+                                                    self.tls.send_buf[self.tls.send_len .. self.tls.send_len + out_len],
+                                                    hs_result.output.data[0..out_len],
+                                                );
+                                                self.tls.send_len += out_len;
+                                            }
                                         }
                                     }
 
@@ -1399,25 +1454,27 @@ pub const Connection = struct {
         }
 
         // Send phase — assemble and produce all pending responses
+        // RFC 9001 §4.1: Server SHOULD coalesce Initial + Handshake in one datagram.
         if (self.state == .handshaking or self.state == .connected) {
-            // Loop to produce Initial ACK + Handshake ServerHello in one burst
             var total_sent: u16 = 0;
             var send_attempts: u8 = 0;
+            // Use a separate coalesced buffer to combine multiple packets
+            var coalesce_buf: [1500]u8 = @as([1500]u8, @splat(0));
             while (send_attempts < 4) : (send_attempts += 1) {
                 const sent = self.assembleSendPacket(now_tick);
                 if (sent == 0) break;
-                // For the caller: store the LAST assembled packet.
-                // In production, caller should send EACH packet as it's produced.
-                // We copy each packet to sequential position for coalesced sending.
-                if (total_sent + sent <= self.send_buf.len) {
-                    if (total_sent > 0) {
-                        // Shift previous data — actually just overwrite for simplicity.
-                        // The caller should call this in a loop checking last_send_len.
-                    }
-                    self.last_send_len = sent;
-                    total_sent = sent;
-                    break; // Caller must send this, then call feedAndRespond again for more
+                // Append this packet to the coalesced buffer
+                if (total_sent + sent <= coalesce_buf.len) {
+                    @memcpy(coalesce_buf[total_sent .. total_sent + sent], self.send_buf[0..sent]);
+                    total_sent += sent;
+                } else {
+                    break; // No room to coalesce more
                 }
+            }
+            // Copy coalesced result back to send_buf for the caller
+            if (total_sent > 0) {
+                @memcpy(self.send_buf[0..total_sent], coalesce_buf[0..total_sent]);
+                self.last_send_len = total_sent;
             }
         }
 
@@ -1719,9 +1776,11 @@ pub const Connection = struct {
 
         // Check if there's anything to send
         const has_ack = self.ack_needed[space_idx];
-        // CRYPTO data from TLS engine is always at Handshake level (ServerHello)
-        // Only include it when assembling Handshake-space packets, not Initial.
-        const has_crypto = (self.tls.send_len > 0 and space != .initial);
+        // CRYPTO data: Handshake-level from send_buf, Initial-level from initial_send_buf
+        const has_crypto = if (space == .initial)
+            (self.tls.initial_send_len > 0)
+        else
+            (self.tls.send_len > 0);
         const has_path_resp = self.path_response_pending;
         const has_datagram = self.datagrams.peekSend() != null;
         var has_stream_data = false;
@@ -1797,25 +1856,44 @@ pub const Connection = struct {
             }
         }
 
-        // 2. CRYPTO frames (handshake data from TLS engine)
-        if (has_crypto and self.tls.send_len > 0) {
-            const crypto_len = self.tls.send_len;
-            // Serialize CRYPTO frame header
-            const crypto_frame = Frame{ .crypto = .{
-                .offset = 0,
-                .data_offset = 0,
-                .data_len = crypto_len,
-            } };
-            const fr = packet.serializeFrame(&crypto_frame, self.send_buf[pos..]);
-            if (fr.err == .none and fr.len > 0) {
-                pos += fr.len;
-                // Copy crypto data after frame header
-                if (pos + crypto_len <= self.send_buf.len) {
-                    @memcpy(self.send_buf[pos .. pos + crypto_len], self.tls.send_buf[0..crypto_len]);
-                    pos += crypto_len;
-                    self.tls.send_len = 0;
+        // 2. CRYPTO frames (TLS data — Initial or Handshake level)
+        if (has_crypto) {
+            if (space == .initial and self.tls.initial_send_len > 0) {
+                // Initial-level CRYPTO: ServerHello
+                const crypto_len = self.tls.initial_send_len;
+                const crypto_frame = Frame{ .crypto = .{
+                    .offset = 0,
+                    .data_offset = 0,
+                    .data_len = crypto_len,
+                } };
+                const fr = packet.serializeFrame(&crypto_frame, self.send_buf[pos..]);
+                if (fr.err == .none and fr.len > 0) {
+                    pos += fr.len;
+                    if (pos + crypto_len <= self.send_buf.len) {
+                        @memcpy(self.send_buf[pos .. pos + crypto_len], self.tls.initial_send_buf[0..crypto_len]);
+                        pos += crypto_len;
+                        self.tls.initial_send_len = 0;
+                    }
+                    is_ack_eliciting = true;
                 }
-                is_ack_eliciting = true;
+            } else if (space != .initial and self.tls.send_len > 0) {
+                // Handshake-level CRYPTO: EE + Cert + CertVerify + Finished
+                const crypto_len = self.tls.send_len;
+                const crypto_frame = Frame{ .crypto = .{
+                    .offset = 0,
+                    .data_offset = 0,
+                    .data_len = crypto_len,
+                } };
+                const fr = packet.serializeFrame(&crypto_frame, self.send_buf[pos..]);
+                if (fr.err == .none and fr.len > 0) {
+                    pos += fr.len;
+                    if (pos + crypto_len <= self.send_buf.len) {
+                        @memcpy(self.send_buf[pos .. pos + crypto_len], self.tls.send_buf[0..crypto_len]);
+                        pos += crypto_len;
+                        self.tls.send_len = 0;
+                    }
+                    is_ack_eliciting = true;
+                }
             }
         }
 

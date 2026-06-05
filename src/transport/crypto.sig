@@ -10,7 +10,7 @@ const platform_crypto = @import("crypto");
 
 // ── ALPN Protocol String ──
 
-pub const ZPM_ALPN: []const u8 = "zpm";
+pub const ZPM_ALPN: []const u8 = "h3";
 
 // ── Encryption Level ──
 
@@ -93,6 +93,10 @@ pub const TlsEngine = struct {
     send_buf: [8192]u8 = @as([8192]u8, @splat(0)),
     send_len: u16 = 0,
 
+    // Initial-level CRYPTO output (ServerHello) — separate from handshake send_buf
+    initial_send_buf: [512]u8 = @as([512]u8, @splat(0)),
+    initial_send_len: u16 = 0,
+
     // Current application traffic secret for key updates (RFC 9001 §6)
     app_secret: [32]u8 = @as([32]u8, @splat(0)),
 
@@ -125,8 +129,8 @@ pub const TlsEngine = struct {
         // ALPN wire format: 1-byte length prefix + protocol string
         var alpn_protos = w32.SEC_APPLICATION_PROTOCOLS{};
         alpn_protos.ProtocolLists.ProtoNegoExt = w32.SecApplicationProtocolNegotiationExt_ALPN;
-        // Wire format: [length_byte, 'h', 'e', 'i', 'l']
-        alpn_protos.ProtocolLists.ProtocolList[0] = @intCast(ZPM_ALPN.len); // 4
+        // Wire format: [length_byte, 'h', '3']
+        alpn_protos.ProtocolLists.ProtocolList[0] = @intCast(ZPM_ALPN.len); // 2
         @memcpy(alpn_protos.ProtocolLists.ProtocolList[1 .. 1 + ZPM_ALPN.len], ZPM_ALPN);
         alpn_protos.ProtocolLists.ProtocolListSize = @intCast(1 + ZPM_ALPN.len);
         // ProtocolListsSize = size of the SEC_APPLICATION_PROTOCOL_LIST header (4 + 2) + wire data
@@ -1250,9 +1254,9 @@ test "header protection: protection changes first byte and pn bytes" {
 
 // ── 7.12: ALPN Validation Tests ──
 
-test "ALPN: ZPM_ALPN constant equals zpm" {
-    try testing.expectEqualSlices(u8, "zpm", ZPM_ALPN);
-    try testing.expectEqual(@as(usize, 4), ZPM_ALPN.len);
+test "ALPN: ZPM_ALPN constant equals h3" {
+    try testing.expectEqualSlices(u8, "h3", ZPM_ALPN);
+    try testing.expectEqual(@as(usize, 2), ZPM_ALPN.len);
 }
 
 test "ALPN: eqlBytes matches identical slices" {
@@ -1271,9 +1275,9 @@ test "ALPN: eqlBytes rejects different slices" {
 
 test "ALPN: eqlBytes validates ZPM_ALPN against known value" {
     // Simulate what feedCryptoData does: compare negotiated ALPN with ZPM_ALPN
-    const negotiated = "zpm";
+    const negotiated = "h3";
     try testing.expect(eqlBytes(negotiated, ZPM_ALPN));
 
-    const wrong_alpn = "h3";
+    const wrong_alpn = "zpm";
     try testing.expect(!eqlBytes(wrong_alpn, ZPM_ALPN));
 }

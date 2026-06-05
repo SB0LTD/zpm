@@ -108,6 +108,10 @@ pub const HandshakeError = enum(u8) {
 pub const ProcessResult = struct {
     /// Bytes produced in the output buffer (CRYPTO frame data to send).
     output_len: u16 = 0,
+    /// Offset where the Handshake-level data starts (ServerHello ends here).
+    /// output_buf[0..server_hello_len] = Initial-level CRYPTO (ServerHello)
+    /// output_buf[server_hello_len..output_len] = Handshake-level CRYPTO (EE+Cert+CV+Fin)
+    server_hello_len: u16 = 0,
     /// Whether the handshake is now complete.
     complete: bool = false,
     /// Error, if any.
@@ -178,6 +182,8 @@ pub const Tls13Engine = struct {
     // ── Output buffer (handshake messages to send as CRYPTO frames) ──
     output_buf: [8192]u8 = @as([8192]u8, @splat(0)),
     output_len: u16 = 0,
+    /// Bytes of ServerHello in output_buf (Initial-level). Remainder is Handshake-level.
+    server_hello_len: u16 = 0,
 
     // ── Client random ──
     client_random: [32]u8 = @as([32]u8, @splat(0)),
@@ -191,6 +197,11 @@ pub const Tls13Engine = struct {
         var e = Tls13Engine{};
         e.state = .wait_client_hello;
         e.is_server = true;
+
+        // Default ALPN to "h3" for HTTP/3 / WebTransport compatibility
+        e.alpn_list[0] = 'h';
+        e.alpn_list[1] = '3';
+        e.alpn_list_len = 2;
 
         // Generate server ephemeral X25519 keypair
         var seed: [32]u8 = undefined;
@@ -240,6 +251,7 @@ pub const Tls13Engine = struct {
                     return result;
                 }
                 result.output_len = self.output_len;
+                result.server_hello_len = self.server_hello_len;
                 result.handshake_keys_available = true;
                 result.alpn = self.alpn_list;
                 result.alpn_len = self.alpn_list_len;
@@ -389,9 +401,12 @@ pub const Tls13Engine = struct {
     fn buildServerFlight(self: *Tls13Engine) HandshakeError {
         var out_pos: u16 = 0;
 
-        // 1. ServerHello
+        // 1. ServerHello (sent at Initial encryption level per RFC 9001 §4.1)
         const sh_err = self.writeServerHello(&out_pos);
         if (sh_err != .none) return sh_err;
+
+        // Record ServerHello length — everything before this is Initial-level CRYPTO
+        self.server_hello_len = out_pos;
 
         // Update transcript with ServerHello
         self.transcript.update(self.output_buf[0..out_pos]);
@@ -399,7 +414,7 @@ pub const Tls13Engine = struct {
         // 2. Derive handshake secrets (RFC 8446 §7.1)
         self.deriveHandshakeSecrets();
 
-        // 3. Encrypted flight (sent at Handshake encryption level)
+        // 3. Encrypted flight (sent at Handshake encryption level per RFC 9001 §4.1)
         const ee_start = out_pos;
 
         const ee_err = self.writeEncryptedExtensions(&out_pos);
