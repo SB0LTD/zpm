@@ -418,6 +418,9 @@ pub const Connection = struct {
     datagrams: datagram.DatagramHandler,
     telem: telemetry.TelemetryCounters,
 
+    // Client Initial keys (retained for decrypting subsequent Initial packets)
+    client_initial_ks: transport_crypto.KeySet,
+
     // Timing
     idle_timeout_ticks: u64,
     last_recv_tick: u64,
@@ -545,6 +548,8 @@ pub const Connection = struct {
         self.local_params = .{};
         self.peer_params = .{};
 
+        self.client_initial_ks = .{};
+
         self.tls = transport_crypto.TlsEngine.init(is_server);
 
         var freq: w32.LARGE_INTEGER = .{};
@@ -625,6 +630,9 @@ pub const Connection = struct {
                     const dcid_slice = idle_hdr.header.dst_cid.slice();
                     const client_ks = transport_crypto.deriveInitialKeys(dcid_slice, false, self.version);
                     const server_ks = transport_crypto.deriveInitialKeys(dcid_slice, true, self.version);
+
+                    // Retain client Initial keys for decrypting subsequent Initial packets
+                    self.client_initial_ks = client_ks;
 
                     // Install Initial encryption keys (server uses server_ks to encrypt, client_ks to decrypt)
                     const lvl_idx = @intFromEnum(transport_crypto.EncryptionLevel.initial);
@@ -1294,6 +1302,9 @@ pub const Connection = struct {
             const server_ks = transport_crypto.deriveInitialKeys(dcid_slice, true, self.version);
             const lvl_idx = @intFromEnum(transport_crypto.EncryptionLevel.initial);
 
+            // Retain client Initial keys for decrypting subsequent Initial packets
+            self.client_initial_ks = client_ks;
+
             // Install client keys for decryption
             self.tls.keys[lvl_idx] = client_ks;
 
@@ -1340,6 +1351,17 @@ pub const Connection = struct {
             @memcpy(self.recv_buf[0..pkt_len], packet_data);
 
             const level = self.levelFromHeader(&hdr);
+
+            // For incoming Initial packets during handshaking, temporarily swap to client
+            // Initial keys (server keys are installed for sending after the first Initial).
+            const need_key_swap = (level == .initial and self.client_initial_ks.valid);
+            const lvl_idx_recv = @intFromEnum(transport_crypto.EncryptionLevel.initial);
+            var saved_server_ks: transport_crypto.KeySet = .{};
+            if (need_key_swap) {
+                saved_server_ks = self.tls.keys[lvl_idx_recv];
+                self.tls.keys[lvl_idx_recv] = self.client_initial_ks;
+            }
+
             const pn_offset = hdr.payload_offset;
             self.tls.unprotectHeader(level, self.recv_buf[0..pkt_len], pn_offset);
 
@@ -1368,6 +1390,11 @@ pub const Connection = struct {
                     const frame_len: u16 = if (payload_len >= 16) payload_len - 16 else 0;
                     self.dispatchFrames(self.recv_buf[0..pkt_len], payload_start, frame_len, space, now_tick);
                 }
+            }
+
+            // Restore server Initial keys for sending
+            if (need_key_swap) {
+                self.tls.keys[lvl_idx_recv] = saved_server_ks;
             }
         }
 
@@ -1911,6 +1938,20 @@ pub const Connection = struct {
             self.send_buf[pn_offset - 1] = @as(u8, @intCast(real_payload_len & 0xFF));
         }
 
+        // Diagnostic: hex-dump first 40 bytes of packet before encryption
+        writeStdout("SEND PKT space=");
+        writeHexU8(@intCast(@intFromEnum(space)));
+        writeStdout(" pn=");
+        writeHexU64(self.next_pkt_num[space_idx]);
+        writeStdout(" total=");
+        writeHexU16(pos + 16);
+        writeStdout(" hdr:");
+        const dump_len: u16 = @min(40, pos);
+        for (0..dump_len) |di| {
+            writeHexU8(self.send_buf[di]);
+        }
+        writeStdout("\n");
+
         // Encrypt payload (in-place)
         const encrypt_err = self.tls.encrypt(
             level,
@@ -1919,11 +1960,24 @@ pub const Connection = struct {
             payload_start,
             @intCast(payload_len),
         );
-        if (encrypt_err != .none) return 0;
+        if (encrypt_err != .none) {
+            writeStdout("ENCRYPT FAILED level=");
+            writeHexU8(@intCast(@intFromEnum(level)));
+            writeStdout("\n");
+            return 0;
+        }
         pos += 16; // AEAD tag
 
         // Apply header protection
         self.tls.protectHeader(level, self.send_buf[0..pos], pn_offset);
+
+        // Diagnostic: hex-dump first 40 bytes AFTER protection
+        writeStdout("SEND PROTECTED:");
+        const pdump_len: u16 = @min(40, pos);
+        for (0..pdump_len) |di| {
+            writeHexU8(self.send_buf[di]);
+        }
+        writeStdout("\n");
 
         // Record sent packet in recovery engine
         const recovery_space: recovery.PktNumSpace = @enumFromInt(@intFromEnum(space));
@@ -2043,6 +2097,8 @@ fn initTestClient() *Connection {
 
     conn.local_params = .{};
     conn.peer_params = .{};
+
+    conn.client_initial_ks = .{};
 
     // Use default TlsEngine (no SChannel calls) — tests don't need real TLS.
     conn.tls = .{};
