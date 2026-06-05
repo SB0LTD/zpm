@@ -1692,7 +1692,9 @@ pub const Connection = struct {
 
         // Check if there's anything to send
         const has_ack = self.ack_needed[space_idx];
-        const has_crypto = (self.tls.send_len > 0);
+        // CRYPTO data from TLS engine is always at Handshake level (ServerHello)
+        // Only include it when assembling Handshake-space packets, not Initial.
+        const has_crypto = (self.tls.send_len > 0 and space != .initial);
         const has_path_resp = self.path_response_pending;
         const has_datagram = self.datagrams.peekSend() != null;
         var has_stream_data = false;
