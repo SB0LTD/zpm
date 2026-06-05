@@ -678,9 +678,11 @@ pub const Tls13Engine = struct {
     // ══════════════════════════════════════════════════════════════════════
 
     fn deriveHandshakeSecrets(self: *Tls13Engine) void {
-        const zero_psk: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0));
-        const zero_salt: [1]u8 = [_]u8{0};
-        Hmac.create(&self.early_secret, &zero_psk, &zero_salt);
+        // Early Secret = HKDF-Extract(salt=0^HashLen, IKM=0^HashLen)  (no PSK)
+        // HKDF-Extract(salt, IKM) = HMAC-SHA256(key=salt, data=IKM)
+        const zero_ikm: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0));
+        const zero_salt: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0));
+        Hmac.create(&self.early_secret, &zero_ikm, &zero_salt);
 
         var derived_secret: [HASH_LEN]u8 = undefined;
         var empty_hash: [HASH_LEN]u8 = undefined;

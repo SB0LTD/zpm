@@ -930,7 +930,17 @@ pub const Connection = struct {
                                                     .hp_key = engine.server_handshake_keys.hp_key,
                                                     .valid = true,
                                                 };
-                                                writeStdout("KEY SYNC: handshake keys installed\n");
+                                                writeStdout("KEY SYNC: handshake keys installed key=");
+                                                writeHexU8(engine.server_handshake_keys.key[0]);
+                                                writeHexU8(engine.server_handshake_keys.key[1]);
+                                                writeHexU8(engine.server_handshake_keys.key[2]);
+                                                writeHexU8(engine.server_handshake_keys.key[3]);
+                                                writeStdout(" iv=");
+                                                writeHexU8(engine.server_handshake_keys.iv[0]);
+                                                writeHexU8(engine.server_handshake_keys.iv[1]);
+                                                writeHexU8(engine.server_handshake_keys.iv[2]);
+                                                writeHexU8(engine.server_handshake_keys.iv[3]);
+                                                writeStdout("\n");
                                             } else {
                                                 writeStdout("KEY SYNC: engine.server_handshake_keys NOT valid\n");
                                             }
