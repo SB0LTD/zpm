@@ -1566,7 +1566,9 @@ pub const Connection = struct {
             if (self.local_cid_count > 0) {
                 hdr.src_cid = self.local_cids[self.active_local_cid];
             }
-            hdr.payload_len = 0; // will be filled after frame assembly
+            // Use a 2-byte varint placeholder (value >= 64 forces 2-byte encoding)
+            // This reserves the correct space so re-serialization doesn't shift data.
+            hdr.payload_len = 64; // placeholder: will be overwritten after frame assembly
         } else {
             hdr.is_long = false;
             if (self.remote_cid_count > 0) {
@@ -1734,12 +1736,15 @@ pub const Connection = struct {
         const payload_len = pos - payload_start;
         if (payload_len == 0) return 0;
 
-        // For long headers, re-serialize with correct payload_len
+        // For long headers, fix the Length field (always 2-byte varint encoding)
         if (hdr.is_long) {
-            hdr.payload_len = @intCast(pos - pn_offset + 16); // include pn + payload + AEAD tag
-            const hdr2 = packet.serializeHeader(&hdr, &self.send_buf);
-            if (hdr2.err != .none) return 0;
-            // Header length should be the same since payload_len varint size is stable for small values
+            // payload_len = pn_len + frame_bytes + AEAD_tag (RFC 9000 §17.2)
+            const real_payload_len: u16 = @intCast(pos - pn_offset + 16);
+            // Write as 2-byte varint directly at the position before pn_offset.
+            // The Length field is the last field in the long header before the PN.
+            // It's at pn_offset - 2 (since we reserved 2 bytes in the placeholder).
+            self.send_buf[pn_offset - 2] = 0x40 | @as(u8, @intCast(real_payload_len >> 8));
+            self.send_buf[pn_offset - 1] = @as(u8, @intCast(real_payload_len & 0xFF));
         }
 
         // Encrypt payload (in-place)
