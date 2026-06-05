@@ -912,12 +912,9 @@ pub const Connection = struct {
                                     const hs_result = self.tls.feedCryptoData(level, crypto_data);
 
                                     // Sync TLS 1.3 derived keys into the connection's key slots.
-                                    // After ClientHello processing, the engine derives handshake keys.
-                                    // After Finished, it derives application keys.
                                     if (@hasDecl(w32, "getTls13Engine")) {
                                         var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
                                         if (w32.getTls13Engine(&cred_h)) |engine| {
-                                            // Install handshake keys if available
                                             if (engine.server_handshake_keys.valid) {
                                                 const hs_lvl = @intFromEnum(transport_crypto.EncryptionLevel.handshake);
                                                 self.tls.keys[hs_lvl] = .{
@@ -926,8 +923,10 @@ pub const Connection = struct {
                                                     .hp_key = engine.server_handshake_keys.hp_key,
                                                     .valid = true,
                                                 };
+                                                writeStdout("KEY SYNC: handshake keys installed\n");
+                                            } else {
+                                                writeStdout("KEY SYNC: engine.server_handshake_keys NOT valid\n");
                                             }
-                                            // Install application keys if available
                                             if (engine.server_app_keys.valid) {
                                                 const app_lvl = @intFromEnum(transport_crypto.EncryptionLevel.one_rtt);
                                                 self.tls.keys[app_lvl] = .{
@@ -936,8 +935,26 @@ pub const Connection = struct {
                                                     .hp_key = engine.server_app_keys.hp_key,
                                                     .valid = true,
                                                 };
+                                                writeStdout("KEY SYNC: app keys installed\n");
                                             }
+                                        } else {
+                                            writeStdout("KEY SYNC FAIL: getTls13Engine returned null, cred[0]=");
+                                            writeHexU64(self.tls.cred_handle[0]);
+                                            writeStdout("\n");
                                         }
+                                    } else {
+                                        writeStdout("KEY SYNC FAIL: no getTls13Engine decl\n");
+                                    }
+
+                                    // Also log feedCryptoData result
+                                    if (hs_result.output.has_data) {
+                                        writeStdout("TLS OUTPUT: ");
+                                        writeHexU16(hs_result.output.data_len);
+                                        writeStdout(" bytes\n");
+                                    } else if (hs_result.err != .none) {
+                                        writeStdout("TLS ERROR after feedCrypto\n");
+                                    } else {
+                                        writeStdout("TLS: no output, no error\n");
                                     }
 
                                     // Route TLS output to send buffer
