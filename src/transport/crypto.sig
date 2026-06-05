@@ -613,13 +613,13 @@ pub const TlsEngine = struct {
     /// Apply header protection per RFC 9001 §5.4.
     /// Masks the first byte and packet number bytes using AES-ECB of a sample.
     pub fn protectHeader(self: *const TlsEngine, level: EncryptionLevel, buf: []u8, pn_offset: u16) void {
-        applyHeaderProtection(&self.keys[@intFromEnum(level)], buf, pn_offset);
+        applyHeaderProtection(&self.keys[@intFromEnum(level)], buf, pn_offset, true);
     }
 
     /// Remove header protection per RFC 9001 §5.4.
-    /// The XOR operation is its own inverse, so the algorithm is identical to protect.
+    /// Unmasks the first byte (to reveal pn_len), then unmasks the PN bytes.
     pub fn unprotectHeader(self: *const TlsEngine, level: EncryptionLevel, buf: []u8, pn_offset: u16) void {
-        applyHeaderProtection(&self.keys[@intFromEnum(level)], buf, pn_offset);
+        applyHeaderProtection(&self.keys[@intFromEnum(level)], buf, pn_offset, false);
     }
 
     /// Derive new 1-RTT keys from current application traffic secret (key update).
@@ -737,13 +737,16 @@ fn eqlBytes(a: []const u8, b: []const u8) bool {
 
 // ── Header Protection (RFC 9001 §5.4) ──
 
-/// Apply or remove header protection. XOR is self-inverse so protect and unprotect
-/// use the same algorithm. Generates a 16-byte mask by AES-ECB encrypting a 16-byte
-/// sample from the encrypted payload, then XORs the first byte and packet number bytes.
+/// Apply or remove header protection per RFC 9001 §5.4.
+/// Generates a 16-byte mask by AES-ECB encrypting a 16-byte sample from the
+/// encrypted payload, then XORs the first byte and packet number bytes.
 ///
-/// For AES-ECB on a single 16-byte block, we use AES-CBC with a zero IV — the result
-/// is identical since CBC XORs plaintext with IV (all zeros) before encrypting.
-fn applyHeaderProtection(ks: *const KeySet, buf: []u8, pn_offset: u16) void {
+/// pn_len must be read from the UNPROTECTED first byte:
+/// - Protect: buf[0] starts unprotected → read pn_len before XOR.
+/// - Unprotect: buf[0] starts masked → XOR first byte, then read pn_len.
+///
+/// AES-ECB on a single 16-byte block is implemented via AES-CBC with zero IV.
+fn applyHeaderProtection(ks: *const KeySet, buf: []u8, pn_offset: u16, is_protect: bool) void {
     if (!ks.valid) return;
 
     // Sample 16 bytes starting at pn_offset + 4
@@ -776,15 +779,26 @@ fn applyHeaderProtection(ks: *const KeySet, buf: []u8, pn_offset: u16) void {
 
     if (status != 0) return;
 
-    // XOR first byte: 4 bits for long headers, 5 bits for short headers
-    if (buf[0] & 0x80 != 0) {
-        buf[0] ^= mask[0] & 0x0f;
-    } else {
-        buf[0] ^= mask[0] & 0x1f;
-    }
+    var pn_len: u8 = undefined;
 
-    // Determine packet number length from the (now-masked/unmasked) first byte
-    const pn_len: u8 = (buf[0] & 0x03) + 1;
+    if (is_protect) {
+        // Protect: first byte is unprotected, read pn_len BEFORE masking
+        pn_len = (buf[0] & 0x03) + 1;
+        // XOR first byte
+        if (buf[0] & 0x80 != 0) {
+            buf[0] ^= mask[0] & 0x0f;
+        } else {
+            buf[0] ^= mask[0] & 0x1f;
+        }
+    } else {
+        // Unprotect: first byte is masked, XOR to reveal it, THEN read pn_len
+        if (buf[0] & 0x80 != 0) {
+            buf[0] ^= mask[0] & 0x0f;
+        } else {
+            buf[0] ^= mask[0] & 0x1f;
+        }
+        pn_len = (buf[0] & 0x03) + 1;
+    }
 
     // XOR packet number bytes with mask[1..1+pn_len]
     for (0..pn_len) |i| {

@@ -660,7 +660,8 @@ pub const Tls13Engine = struct {
         var finished_key: [HASH_LEN]u8 = undefined;
         hkdfExpandLabel(&self.client_hs_secret, "finished", "", &finished_key);
 
-        const transcript_hash = self.transcript.finalResult();
+        // Use peek() to get transcript hash WITHOUT destroying the hasher state.
+        const transcript_hash = self.transcript.peek();
 
         var expected: [HASH_LEN]u8 = undefined;
         Hmac.create(&expected, &transcript_hash, &finished_key);
@@ -686,12 +687,14 @@ pub const Tls13Engine = struct {
 
         var derived_secret: [HASH_LEN]u8 = undefined;
         var empty_hash: [HASH_LEN]u8 = undefined;
-        Sha256.hash(&.{}, &empty_hash, .{});
+        Sha256.hash("", &empty_hash, .{});
         hkdfExpandLabel(&self.early_secret, "derived", &empty_hash, &derived_secret);
 
         Hmac.create(&self.handshake_secret, &self.shared_secret, &derived_secret);
 
-        const hs_transcript = self.transcript.finalResult();
+        // Use peek() to get transcript hash WITHOUT destroying the hasher state.
+        // finalResult() is destructive — it would corrupt subsequent transcript updates.
+        const hs_transcript = self.transcript.peek();
 
         hkdfExpandLabel(&self.handshake_secret, "c hs traffic", &hs_transcript, &self.client_hs_secret);
         hkdfExpandLabel(&self.handshake_secret, "s hs traffic", &hs_transcript, &self.server_hs_secret);
@@ -703,13 +706,15 @@ pub const Tls13Engine = struct {
     fn deriveApplicationSecrets(self: *Tls13Engine) void {
         var derived_secret: [HASH_LEN]u8 = undefined;
         var empty_hash: [HASH_LEN]u8 = undefined;
-        Sha256.hash(&.{}, &empty_hash, .{});
+        Sha256.hash("", &empty_hash, .{});
         hkdfExpandLabel(&self.handshake_secret, "derived", &empty_hash, &derived_secret);
 
         const zero_ikm: [HASH_LEN]u8 = @as([HASH_LEN]u8, @splat(0));
         Hmac.create(&self.master_secret, &zero_ikm, &derived_secret);
 
-        const app_transcript = self.transcript.finalResult();
+        // Use peek() to get transcript hash WITHOUT destroying the hasher state.
+        // finalResult() is destructive — it would corrupt subsequent transcript updates.
+        const app_transcript = self.transcript.peek();
 
         hkdfExpandLabel(&self.master_secret, "c ap traffic", &app_transcript, &self.client_app_secret);
         hkdfExpandLabel(&self.master_secret, "s ap traffic", &app_transcript, &self.server_app_secret);
