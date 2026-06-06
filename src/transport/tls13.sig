@@ -188,6 +188,10 @@ pub const Tls13Engine = struct {
     // ── Client random ──
     client_random: [32]u8 = @as([32]u8, @splat(0)),
 
+    // ── Client legacy_session_id (echoed in ServerHello per RFC 8446 §4.1.3) ──
+    client_session_id: [32]u8 = @as([32]u8, @splat(0)),
+    client_session_id_len: u8 = 0,
+
     // ══════════════════════════════════════════════════════════════════════
     // Public API
     // ══════════════════════════════════════════════════════════════════════
@@ -302,6 +306,11 @@ pub const Tls13Engine = struct {
         const session_id_len: usize = body[pos];
         pos += 1;
         if (pos + session_id_len > body.len) return .decode_error;
+        // Save for echoing in ServerHello (RFC 8446 §4.1.3)
+        if (session_id_len <= 32) {
+            @memcpy(self.client_session_id[0..session_id_len], body[pos..][0..session_id_len]);
+            self.client_session_id_len = @intCast(session_id_len);
+        }
         pos += session_id_len;
 
         // cipher_suites
@@ -456,10 +465,15 @@ pub const Tls13Engine = struct {
         _ = std.os.linux.getrandom(@ptrCast(buf[p..][0..32]), 32, 0);
         p += 32;
 
-        // legacy_session_id_echo (empty)
-        if (p + 1 > buf.len) return .buffer_overflow;
-        buf[p] = 0;
+        // legacy_session_id_echo (RFC 8446 §4.1.3: MUST echo client's value)
+        const sid_len: u8 = self.client_session_id_len;
+        if (p + 1 + sid_len > buf.len) return .buffer_overflow;
+        buf[p] = sid_len;
         p += 1;
+        if (sid_len > 0) {
+            @memcpy(buf[p..][0..sid_len], self.client_session_id[0..sid_len]);
+            p += sid_len;
+        }
 
         // cipher_suite
         if (p + 2 > buf.len) return .buffer_overflow;

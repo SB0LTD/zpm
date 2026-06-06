@@ -84,6 +84,11 @@ pub const TransportParams = struct {
     active_connection_id_limit: u8 = 4,
     version_info: [32]u8 = @as([32]u8, @splat(0)),
     version_info_len: u8 = 0,
+    // RFC 9000 §18.2: Connection ID transport parameters (REQUIRED)
+    initial_source_connection_id: [20]u8 = @as([20]u8, @splat(0)),
+    initial_source_connection_id_len: u8 = 0,
+    original_destination_connection_id: [20]u8 = @as([20]u8, @splat(0)),
+    original_destination_connection_id_len: u8 = 0,
 };
 
 // ── Transport Parameter IDs (RFC 9000 §18.2) ──
@@ -99,6 +104,8 @@ const tp_max_udp_payload_size: u64 = 0x03;
 const tp_max_datagram_frame_size: u64 = 0x20;
 const tp_active_connection_id_limit: u64 = 0x0e;
 const tp_version_information: u64 = 0x11;
+const tp_original_destination_connection_id: u64 = 0x00;
+const tp_initial_source_connection_id: u64 = 0x0f;
 
 // ── Constants ──
 
@@ -131,6 +138,30 @@ pub fn encodeTransportParams(params: *const TransportParams, out: []u8) u16 {
         if (pos + params.version_info_len <= out.len) {
             @memcpy(out[pos .. pos + params.version_info_len], params.version_info[0..params.version_info_len]);
             pos += params.version_info_len;
+        }
+    }
+
+    // RFC 9000 §18.2: initial_source_connection_id (REQUIRED by both endpoints)
+    // Value is the raw CID bytes (variable length, no varint encoding of the value).
+    if (params.initial_source_connection_id_len > 0) {
+        const cid_len: u64 = params.initial_source_connection_id_len;
+        pos += packet.encodeVarint(tp_initial_source_connection_id, out[pos..]);
+        pos += packet.encodeVarint(cid_len, out[pos..]);
+        if (pos + params.initial_source_connection_id_len <= out.len) {
+            @memcpy(out[pos .. pos + params.initial_source_connection_id_len], params.initial_source_connection_id[0..params.initial_source_connection_id_len]);
+            pos += params.initial_source_connection_id_len;
+        }
+    }
+
+    // RFC 9000 §18.2: original_destination_connection_id (REQUIRED for server)
+    // This is the DCID from the client's first Initial packet.
+    if (params.original_destination_connection_id_len > 0) {
+        const cid_len: u64 = params.original_destination_connection_id_len;
+        pos += packet.encodeVarint(tp_original_destination_connection_id, out[pos..]);
+        pos += packet.encodeVarint(cid_len, out[pos..]);
+        if (pos + params.original_destination_connection_id_len <= out.len) {
+            @memcpy(out[pos .. pos + params.original_destination_connection_id_len], params.original_destination_connection_id[0..params.original_destination_connection_id_len]);
+            pos += params.original_destination_connection_id_len;
         }
     }
 
@@ -201,6 +232,14 @@ pub fn decodeTransportParams(buf: []const u8) struct { params: TransportParams, 
             const copy_len: u8 = @intCast(@min(val_len, 32));
             @memcpy(params.version_info[0..copy_len], val_slice[0..copy_len]);
             params.version_info_len = copy_len;
+        } else if (id_r.val == tp_initial_source_connection_id) {
+            const copy_len: u8 = @intCast(@min(val_len, 20));
+            @memcpy(params.initial_source_connection_id[0..copy_len], val_slice[0..copy_len]);
+            params.initial_source_connection_id_len = copy_len;
+        } else if (id_r.val == tp_original_destination_connection_id) {
+            const copy_len: u8 = @intCast(@min(val_len, 20));
+            @memcpy(params.original_destination_connection_id[0..copy_len], val_slice[0..copy_len]);
+            params.original_destination_connection_id_len = copy_len;
         }
 
         pos += val_len;
@@ -444,6 +483,9 @@ pub const Connection = struct {
     close_reason_len: u8,
     close_sent: bool,
 
+    // HANDSHAKE_DONE pending (server-only: sent once after handshake completes)
+    pending_handshake_done: bool,
+
     // Shared listen socket support: after tick() assembles an outgoing packet,
     // last_send_len holds the number of valid bytes in send_buf ready to be sent.
     // Servers with a shared listen socket should send send_buf[0..last_send_len]
@@ -492,6 +534,11 @@ pub const Connection = struct {
             &conn.local_params.version_info,
         );
 
+        // RFC 9000 §18.2: initial_source_connection_id = our local CID
+        const clen: u8 = @intCast(@min(conn.local_cids[0].len, @as(u8, 20)));
+        @memcpy(conn.local_params.initial_source_connection_id[0..clen], conn.local_cids[0].buf[0..clen]);
+        conn.local_params.initial_source_connection_id_len = clen;
+
         return conn;
     }
 
@@ -522,6 +569,12 @@ pub const Connection = struct {
             conn.version,
             &conn.local_params.version_info,
         );
+
+        // RFC 9000 §18.2: initial_source_connection_id = our local CID
+        // (original_destination_connection_id is set when the first Initial arrives)
+        const slen: u8 = @intCast(@min(conn.local_cids[0].len, @as(u8, 20)));
+        @memcpy(conn.local_params.initial_source_connection_id[0..slen], conn.local_cids[0].buf[0..slen]);
+        conn.local_params.initial_source_connection_id_len = slen;
 
         return conn;
     }
@@ -581,6 +634,7 @@ pub const Connection = struct {
         self.close_reason = @as([128]u8, @splat(0));
         self.close_reason_len = 0;
         self.close_sent = false;
+        self.pending_handshake_done = false;
         self.last_send_len = 0;
 
         self.path_response_pending = false;
@@ -624,6 +678,30 @@ pub const Connection = struct {
                     if (idle_hdr.header.src_cid.len > 0 and self.remote_cid_count == 0) {
                         self.remote_cids[0] = idle_hdr.header.src_cid;
                         self.remote_cid_count = 1;
+                    }
+
+                    // RFC 9000 §18.2: Populate required CID transport parameters.
+                    // original_destination_connection_id = DCID from client's first Initial
+                    const orig_dcid = idle_hdr.header.dst_cid;
+                    if (orig_dcid.len > 0) {
+                        const olen: u8 = @intCast(@min(orig_dcid.len, @as(u8, 20)));
+                        @memcpy(self.local_params.original_destination_connection_id[0..olen], orig_dcid.buf[0..olen]);
+                        self.local_params.original_destination_connection_id_len = olen;
+                    }
+                    // initial_source_connection_id = server's own CID
+                    if (self.local_cid_count > 0) {
+                        const scid = self.local_cids[0];
+                        const slen: u8 = @intCast(@min(scid.len, @as(u8, 20)));
+                        @memcpy(self.local_params.initial_source_connection_id[0..slen], scid.buf[0..slen]);
+                        self.local_params.initial_source_connection_id_len = slen;
+                    }
+
+                    // Encode and push transport parameters to TLS engine BEFORE
+                    // the ClientHello is processed (so EncryptedExtensions includes them).
+                    var tp_buf: [512]u8 = @as([512]u8, @splat(0));
+                    const tp_len = encodeTransportParams(&self.local_params, &tp_buf);
+                    if (tp_len > 0) {
+                        self.setTlsTransportParams(tp_buf[0..tp_len]);
                     }
 
                     // Derive Initial keys from the client's DCID (RFC 9001 §5.2)
@@ -1053,6 +1131,10 @@ pub const Connection = struct {
                                         if (self.state == .handshaking) {
                                             self.state = .connected;
                                             @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.connected), .monotonic);
+                                            // Server MUST send HANDSHAKE_DONE (RFC 9001 §4.1.2)
+                                            if (self.is_server) {
+                                                self.pending_handshake_done = true;
+                                            }
                                             if (hs_result.transport_params_len > 0) {
                                                 const tp_result = decodeTransportParams(
                                                     hs_result.transport_params[0..hs_result.transport_params_len],
@@ -1349,6 +1431,29 @@ pub const Connection = struct {
             if (hdr.src_cid.len > 0 and self.remote_cid_count == 0) {
                 self.remote_cids[0] = hdr.src_cid;
                 self.remote_cid_count = 1;
+            }
+
+            // RFC 9000 §18.2: Populate required CID transport parameters.
+            // original_destination_connection_id = DCID from client's first Initial
+            if (hdr.dst_cid.len > 0) {
+                const olen: u8 = @intCast(@min(hdr.dst_cid.len, @as(u8, 20)));
+                @memcpy(self.local_params.original_destination_connection_id[0..olen], hdr.dst_cid.buf[0..olen]);
+                self.local_params.original_destination_connection_id_len = olen;
+            }
+            // initial_source_connection_id = server's own CID
+            if (self.local_cid_count > 0) {
+                const scid = self.local_cids[0];
+                const slen: u8 = @intCast(@min(scid.len, @as(u8, 20)));
+                @memcpy(self.local_params.initial_source_connection_id[0..slen], scid.buf[0..slen]);
+                self.local_params.initial_source_connection_id_len = slen;
+            }
+
+            // Encode and push transport parameters to TLS engine BEFORE
+            // the ClientHello is processed (so EncryptedExtensions includes them).
+            var tp_buf: [512]u8 = @as([512]u8, @splat(0));
+            const tp_len = encodeTransportParams(&self.local_params, &tp_buf);
+            if (tp_len > 0) {
+                self.setTlsTransportParams(tp_buf[0..tp_len]);
             }
 
             // Derive Initial keys from client's DCID
@@ -1795,7 +1900,7 @@ pub const Connection = struct {
             }
         }
 
-        if (!has_ack and !has_crypto and !has_path_resp and !has_datagram and !has_stream_data) {
+        if (!has_ack and !has_crypto and !has_path_resp and !has_datagram and !has_stream_data and !self.pending_handshake_done) {
             return 0;
         }
 
@@ -1904,6 +2009,17 @@ pub const Connection = struct {
             if (fr.err == .none and fr.len > 0) {
                 pos += fr.len;
                 self.path_response_pending = false;
+                is_ack_eliciting = true;
+            }
+        }
+
+        // 3b. HANDSHAKE_DONE (server-only, 1-RTT, sent once after handshake completes)
+        if (self.pending_handshake_done and space == .application) {
+            const hd_frame = Frame{ .handshake_done = {} };
+            const fr = packet.serializeFrame(&hd_frame, self.send_buf[pos..]);
+            if (fr.err == .none and fr.len > 0) {
+                pos += fr.len;
+                self.pending_handshake_done = false;
                 is_ack_eliciting = true;
             }
         }
@@ -2197,6 +2313,7 @@ fn initTestClient() *Connection {
     conn.close_error_code = 0;
     conn.close_reason_len = 0;
     conn.close_sent = false;
+    conn.pending_handshake_done = false;
     conn.path_response_pending = false;
 
     conn.ticket_cache = .{};
