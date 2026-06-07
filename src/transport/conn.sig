@@ -753,7 +753,24 @@ pub const Connection = struct {
                             }
                             const frame_len: u16 = if (payload_len >= 16) payload_len - 16 else 0;
                             self.dispatchFrames(self.recv_buf[0..idle_recv.bytes_read], payload_start, frame_len, space, now_tick);
+                        } else {
+                            writeStdout("DECRYPT FAIL: Initial pkt pn_off=");
+                            writeHexU16(pn_offset);
+                            writeStdout(" pn=");
+                            writeHexU64(pkt_number);
+                            writeStdout(" pl_start=");
+                            writeHexU16(payload_start);
+                            writeStdout(" pl_len=");
+                            writeHexU16(payload_len);
+                            writeStdout(" dcid=");
+                            const dcid_s = idle_hdr.header.dst_cid.slice();
+                            for (dcid_s) |b| writeHexU8(b);
+                            writeStdout(" key_valid=");
+                            writeHexU8(if (client_ks.valid) 1 else 0);
+                            writeStdout("\n");
                         }
+                    } else {
+                        writeStdout("DECRYPT SKIP: payload_len=0\n");
                     }
 
                     // Restore server keys for sending responses
