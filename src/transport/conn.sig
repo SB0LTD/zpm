@@ -822,6 +822,16 @@ pub const Connection = struct {
                     _ = self.handleZeroRttPacket(self.recv_buf[0..recv_len], &hdr, now_tick);
                 } else {
 
+                    // For incoming Initial packets during handshaking, temporarily swap to
+                    // client Initial keys (server keys are installed for sending after first Initial).
+                    const need_key_swap = (level == .initial and self.client_initial_ks.valid);
+                    const lvl_idx_recv = @intFromEnum(transport_crypto.EncryptionLevel.initial);
+                    var saved_server_ks: transport_crypto.KeySet = .{};
+                    if (need_key_swap) {
+                        saved_server_ks = self.tls.keys[lvl_idx_recv];
+                        self.tls.keys[lvl_idx_recv] = self.client_initial_ks;
+                    }
+
                     // Unprotect header and decrypt payload
                     const pn_offset = hdr.payload_offset;
                     self.tls.unprotectHeader(level, self.recv_buf[0..recv_len], pn_offset);
@@ -865,6 +875,11 @@ pub const Connection = struct {
                             self.dispatchFrames(self.recv_buf[0..recv_len], payload_start, frame_len, space, now_tick);
                         }
                         // Decrypt failure: silently discard per RFC 9000 §12.1
+                    }
+
+                    // Restore server Initial keys for sending
+                    if (need_key_swap) {
+                        self.tls.keys[lvl_idx_recv] = saved_server_ks;
                     }
                 } // end else (non-0-RTT path)
             }
