@@ -1440,6 +1440,12 @@ pub const Connection = struct {
         self.last_send_len = 0;
         self.peer_addr = src_addr;
 
+        writeStdout("feedAndRespond: state=");
+        writeHexU8(@intFromEnum(self.state));
+        writeStdout(" len=");
+        writeHexU16(@intCast(packet_data.len));
+        writeStdout("\n");
+
         // Get current time
         var now_tick: u64 = 0;
         var qpc: w32.LARGE_INTEGER = .{};
