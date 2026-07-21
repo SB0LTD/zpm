@@ -1,0 +1,238 @@
+{
+  "communities": {
+    "0": [
+      "docref_rfc_9000",
+      "docref_rfc_9001",
+      "tools_quic_debugger_debug_handshake",
+      "tools_quic_debugger_debug_handshake_deriveinitialkeys",
+      "tools_quic_debugger_debug_handshake_hkdfexpandlabel",
+      "tools_quic_debugger_debug_handshake_port",
+      "tools_quic_debugger_debug_handshake_quic_v1_salt"
+    ],
+    "1": [
+      "tools_quic_debugger_package",
+      "tools_quic_debugger_package_description",
+      "tools_quic_debugger_package_main",
+      "tools_quic_debugger_package_name",
+      "tools_quic_debugger_package_type",
+      "tools_quic_debugger_package_version"
+    ],
+    "2": [
+      "tools_quic_debugger_debug_handshake_buildext",
+      "tools_quic_debugger_debug_handshake_buildextensions",
+      "tools_quic_debugger_debug_handshake_buildtransportparams",
+      "tools_quic_debugger_debug_handshake_encodetp",
+      "tools_quic_debugger_debug_handshake_encodevarintbuf"
+    ],
+    "3": [
+      "tools_quic_debugger_debug_handshake_buildclienthello",
+      "tools_quic_debugger_debug_handshake_buildinitialpacket",
+      "tools_quic_debugger_debug_handshake_main",
+      "tools_quic_debugger_debug_handshake_writevarint"
+    ],
+    "4": [
+      "contributing",
+      "readme",
+      "zpm_png"
+    ],
+    "5": [
+      "std_crypto_pcurves_p256_field",
+      "std_crypto_pcurves_p256_scalar",
+      "std_crypto_pcurves_tests_p256"
+    ],
+    "6": [
+      "std_crypto_pcurves_p384_field",
+      "std_crypto_pcurves_p384_scalar",
+      "std_crypto_pcurves_tests_p384"
+    ],
+    "7": [
+      "std_crypto_pcurves_secp256k1_field",
+      "std_crypto_pcurves_secp256k1_scalar",
+      "std_crypto_pcurves_tests_secp256k1"
+    ],
+    "8": [
+      "tools_quic_debugger_debug_handshake_decodeframes",
+      "tools_quic_debugger_debug_handshake_decoderesponse",
+      "tools_quic_debugger_debug_handshake_decodevarint"
+    ],
+    "9": [
+      "build",
+      "build_build"
+    ],
+    "10": [
+      "cli_build",
+      "cli_build_build"
+    ],
+    "11": [
+      "cli_zig_cache_browser_work_o_8313df8804a4a41cc2ffddc0f63f41ce_dependencies",
+      "cli_zig_cache_browser_work_o_8313df8804a4a41cc2ffddc0f63f41ce_dependencies_packages"
+    ],
+    "12": [
+      "run_tests",
+      "run_tests_run_test"
+    ],
+    "13": [
+      "tools_quic_debugger_check_server",
+      "tools_quic_debugger_check_server_sh__entry"
+    ],
+    "14": [
+      "changelog"
+    ],
+    "15": [
+      "github_workflows_ci_workflow"
+    ],
+    "16": [
+      "tools_quic_debugger_test_local"
+    ]
+  },
+  "cohesion": {
+    "0": 0.3333333333333333,
+    "1": 0.3333333333333333,
+    "2": 0.5,
+    "3": 0.5,
+    "4": 0.6666666666666666,
+    "5": 0.6666666666666666,
+    "6": 0.6666666666666666,
+    "7": 0.6666666666666666,
+    "8": 1.0,
+    "9": 1.0,
+    "10": 1.0,
+    "11": 1.0,
+    "12": 1.0,
+    "13": 1.0,
+    "14": 1.0,
+    "15": 1.0,
+    "16": 1.0
+  },
+  "gods": [
+    {
+      "id": "tools_quic_debugger_debug_handshake_main",
+      "label": "main()",
+      "degree": 5
+    },
+    {
+      "id": "tools_quic_debugger_debug_handshake_buildextensions",
+      "label": "buildExtensions()",
+      "degree": 4
+    },
+    {
+      "id": "tools_quic_debugger_debug_handshake_buildtransportparams",
+      "label": "buildTransportParams()",
+      "degree": 4
+    },
+    {
+      "id": "tools_quic_debugger_debug_handshake_decoderesponse",
+      "label": "decodeResponse()",
+      "degree": 4
+    },
+    {
+      "id": "tools_quic_debugger_debug_handshake_deriveinitialkeys",
+      "label": "deriveInitialKeys()",
+      "degree": 3
+    },
+    {
+      "id": "tools_quic_debugger_debug_handshake_buildclienthello",
+      "label": "buildClientHello()",
+      "degree": 3
+    },
+    {
+      "id": "tools_quic_debugger_debug_handshake_encodetp",
+      "label": "encodeTP()",
+      "degree": 3
+    },
+    {
+      "id": "tools_quic_debugger_debug_handshake_encodevarintbuf",
+      "label": "encodeVarintBuf()",
+      "degree": 3
+    },
+    {
+      "id": "tools_quic_debugger_debug_handshake_buildinitialpacket",
+      "label": "buildInitialPacket()",
+      "degree": 3
+    },
+    {
+      "id": "tools_quic_debugger_debug_handshake_decodevarint",
+      "label": "decodeVarint()",
+      "degree": 3
+    }
+  ],
+  "surprises": [
+    {
+      "source": "p256 tests",
+      "target": "field",
+      "source_files": [
+        "std/crypto/pcurves/tests/p256.zig",
+        "std/crypto/pcurves/p256/field.zig"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "why": "cross-file semantic connection"
+    },
+    {
+      "source": "p256 tests",
+      "target": "scalar",
+      "source_files": [
+        "std/crypto/pcurves/tests/p256.zig",
+        "std/crypto/pcurves/p256/scalar.zig"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "why": "cross-file semantic connection"
+    },
+    {
+      "source": "p384 tests",
+      "target": "field",
+      "source_files": [
+        "std/crypto/pcurves/tests/p384.zig",
+        "std/crypto/pcurves/p384/field.zig"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "why": "cross-file semantic connection"
+    },
+    {
+      "source": "p384 tests",
+      "target": "scalar",
+      "source_files": [
+        "std/crypto/pcurves/tests/p384.zig",
+        "std/crypto/pcurves/p384/scalar.zig"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "why": "cross-file semantic connection"
+    },
+    {
+      "source": "secp256k1 tests",
+      "target": "field",
+      "source_files": [
+        "std/crypto/pcurves/tests/secp256k1.zig",
+        "std/crypto/pcurves/secp256k1/field.zig"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "why": "cross-file semantic connection"
+    }
+  ],
+  "questions": [
+    {
+      "type": "bridge_node",
+      "question": "Why does `main()` connect `main` to `debug-handshake.mjs`, `decodeResponse`?",
+      "why": "High betweenness centrality (0.003) - this node is a cross-community bridge."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `buildExtensions()` connect `Community 2` to `debug-handshake.mjs`, `main`?",
+      "why": "High betweenness centrality (0.001) - this node is a cross-community bridge."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `buildTransportParams()` connect `Community 2` to `debug-handshake.mjs`?",
+      "why": "High betweenness centrality (0.001) - this node is a cross-community bridge."
+    },
+    {
+      "type": "isolated_nodes",
+      "question": "What connects `packages`, `check-server.sh script`, `PORT` to the rest of the system?",
+      "why": "19 weakly-connected nodes found - possible documentation gaps or missing edges."
+    }
+  ]
+}

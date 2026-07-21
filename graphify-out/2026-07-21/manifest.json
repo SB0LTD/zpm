@@ -1,0 +1,72 @@
+{
+  "build.zig": {
+    "mtime": 1780589853.6401417,
+    "ast_hash": "f1cb208c79452155d9a5666c5e85b171",
+    "semantic_hash": "f1cb208c79452155d9a5666c5e85b171"
+  },
+  "cli/.zig-cache-browser-work/o/8313df8804a4a41cc2ffddc0f63f41ce/dependencies.zig": {
+    "mtime": 1782780711.6666434,
+    "ast_hash": "5192d51918bee811c83657282c8d8e2a",
+    "semantic_hash": "5192d51918bee811c83657282c8d8e2a"
+  },
+  "cli/build.zig": {
+    "mtime": 1782814395.4401374,
+    "ast_hash": "5a9c57916b29c575157b0b15163dbe44",
+    "semantic_hash": "5a9c57916b29c575157b0b15163dbe44"
+  },
+  "run_tests.ps1": {
+    "mtime": 1775325169.4394226,
+    "ast_hash": "9e3100f64907f8576518dc055e5e28e1",
+    "semantic_hash": "9e3100f64907f8576518dc055e5e28e1"
+  },
+  "tools/quic-debugger/check-server.sh": {
+    "mtime": 1780837033.9534497,
+    "ast_hash": "b33e94b1f13d459547c1bfbe2850b455",
+    "semantic_hash": "b33e94b1f13d459547c1bfbe2850b455"
+  },
+  "tools/quic-debugger/debug-handshake.mjs": {
+    "mtime": 1780706695.425706,
+    "ast_hash": "a5bc041c4ed1058dd9353069f0a782fe",
+    "semantic_hash": "a5bc041c4ed1058dd9353069f0a782fe"
+  },
+  "tools/quic-debugger/package.json": {
+    "mtime": 1780706545.627589,
+    "ast_hash": "44cc6fdec9f76c801b0e5121d3f72c6a",
+    "semantic_hash": "44cc6fdec9f76c801b0e5121d3f72c6a"
+  },
+  "tools/quic-debugger/ssm-params.json": {
+    "mtime": 1780837449.7571046,
+    "ast_hash": "11526f511d629a3b51a915eb4f1f0ebb",
+    "semantic_hash": "11526f511d629a3b51a915eb4f1f0ebb"
+  },
+  "tools/quic-debugger/test_local.py": {
+    "mtime": 1780837423.4483702,
+    "ast_hash": "3c921f706bba0ce8c99b350a5fefc3c4",
+    "semantic_hash": "3c921f706bba0ce8c99b350a5fefc3c4"
+  },
+  ".github/workflows/ci.yml": {
+    "mtime": 1776370598.5699713,
+    "ast_hash": "97990114220715ffcaf44b0612de0ade",
+    "semantic_hash": "97990114220715ffcaf44b0612de0ade"
+  },
+  "CHANGELOG.md": {
+    "mtime": 1776370598.5709784,
+    "ast_hash": "2cdd26ecf1d05ddbb0f461618cfd4467",
+    "semantic_hash": "2cdd26ecf1d05ddbb0f461618cfd4467"
+  },
+  "CONTRIBUTING.md": {
+    "mtime": 1776370598.5709784,
+    "ast_hash": "cad7c6a128d8481787ad8ca0eddfa5f3",
+    "semantic_hash": "cad7c6a128d8481787ad8ca0eddfa5f3"
+  },
+  "README.md": {
+    "mtime": 1780408217.2716918,
+    "ast_hash": "306c999e1b69485718ae95623d60dc59",
+    "semantic_hash": "306c999e1b69485718ae95623d60dc59"
+  },
+  "zpm.png": {
+    "mtime": 1776371370.0270557,
+    "ast_hash": "d32a5fcaf250a35e3388bb2cc35cdd45",
+    "semantic_hash": "d32a5fcaf250a35e3388bb2cc35cdd45"
+  }
+}
