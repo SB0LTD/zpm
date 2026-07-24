@@ -44,6 +44,7 @@ const allowed_imports = [_][]const u8{
     // Zig built-ins
     "std",
     "builtin",
+    "crypto_stream",
     // Layer 0 (core)
     "math",
     "json",
