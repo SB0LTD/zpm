@@ -35,7 +35,7 @@ pub fn build(b: *std.Build) void {
     // ── Transport modules (needed by registry.sig QuicTransportVtable) ──
 
     const packet_mod = b.createModule(.{ .root_source_file = b.path("../src/transport/packet.sig"), .target = target, .optimize = optimize });
-    const win32_mod = b.createModule(.{ .root_source_file = b.path("../src/platform/win32.sig"), .target = target, .optimize = optimize });
+    const win32_mod = b.createModule(.{ .root_source_file = if (os_tag == .windows) b.path("../src/platform/win32.sig") else b.path("../src/transport/linux_platform.sig"), .target = target, .optimize = optimize });
     if (os_tag == .windows) win32_mod.linkSystemLibrary("kernel32", .{});
 
     const crypto_mod = b.createModule(.{ .root_source_file = b.path("../src/platform/crypto.sig"), .target = target, .optimize = optimize });
