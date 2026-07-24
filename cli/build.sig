@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) void {
 
     const recovery_mod = b.createModule(.{ .root_source_file = b.path("../src/transport/recovery.sig"), .target = target, .optimize = optimize });
     recovery_mod.addImport("packet", packet_mod);
+    const crypto_stream_mod = b.createModule(.{ .root_source_file = b.path("../src/transport/crypto_stream.sig"), .target = target, .optimize = optimize });
 
     const streams_mod = b.createModule(.{ .root_source_file = b.path("../src/transport/streams.sig"), .target = target, .optimize = optimize });
     streams_mod.addImport("packet", packet_mod);
@@ -82,6 +83,7 @@ pub fn build(b: *std.Build) void {
     conn_mod.addImport("datagram", datagram_mod);
     conn_mod.addImport("telemetry", telemetry_mod);
     conn_mod.addImport("udp", udp_mod);
+    conn_mod.addImport("crypto_stream", crypto_stream_mod);   
     if (os_tag == .windows) {
         conn_mod.linkSystemLibrary("ws2_32", .{});
         conn_mod.linkSystemLibrary("bcrypt", .{});
@@ -97,6 +99,7 @@ pub fn build(b: *std.Build) void {
     // ── PAL module (Platform Abstraction Layer) ──
     const pal_mod = b.createModule(.{ .root_source_file = b.path("pal.sig"), .target = target, .optimize = optimize });
     PlatformLibs.linkPlatform(pal_mod, os_tag);
+        pal_mod.link_libc = true;
 
     // ── zpm CLI executable ──
     const exe = b.addExecutable(.{ .name = "zpm", .root_module = b.createModule(.{
