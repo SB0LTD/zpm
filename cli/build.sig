@@ -115,7 +115,8 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+// NOTE: Sig's std.Build has no `args` field (upstream Zig's CLI passthrough after `--`).
+    // Run-step argument forwarding is unavailable under sig build.
     b.step("run", "Run the zpm CLI").dependOn(&run_cmd.step);
 
     // ── Test step ──
