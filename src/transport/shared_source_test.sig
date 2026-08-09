@@ -14,32 +14,33 @@ const testing = std.testing;
 const build_embed = @import("build_embed");
 const build_source: []const u8 = build_embed.content;
 
-/// Extract all `b.path("src/transport/...")` strings that appear within
-/// `addModule(` call contexts in the build source. Returns the count of
-/// paths found, writing them into `out_paths`.
+/// Extract transport module paths from either the canonical Sig graph
+/// (`ctx.addModule`) or the transitional std.Build graph (`b.path`).
 fn extractTransportPaths(
     src: []const u8,
     out_paths: [][]const u8,
 ) usize {
-    // We scan for the pattern: .root_source_file = b.path("src/transport/
-    // and extract the full path string up to the closing quote.
-    const needle = "b.path(\"src/transport/";
+    const native_needle = "ctx.addModule(";
+    const legacy_needle = "b.path(\"src/transport/";
+    const native_graph = std.mem.indexOf(u8, src, native_needle) != null;
     var count: usize = 0;
     var i: usize = 0;
 
-    while (i + needle.len < src.len) : (i += 1) {
-        if (!std.mem.eql(u8, src[i..][0..needle.len], needle)) continue;
-
-        // Check this is inside a root_source_file assignment by scanning
-        // backwards for `.root_source_file` on the same or previous line.
-        const context_start = if (i >= 120) i - 120 else 0;
-        const context = src[context_start..i];
-        if (std.mem.indexOf(u8, context, ".root_source_file") == null) {
-            continue;
-        }
-
-        // Extract the path string: starts after b.path(" and ends at the next "
-        const path_start = i + "b.path(\"".len;
+    while (i < src.len) : (i += 1) {
+        const path_start = if (native_graph) native: {
+            if (i + native_needle.len >= src.len or
+                !std.mem.eql(u8, src[i..][0..native_needle.len], native_needle)) continue;
+            const line_end = i + (std.mem.indexOfScalar(u8, src[i..], '\n') orelse (src.len - i));
+            const marker = "\"src/transport/";
+            const marker_pos = std.mem.indexOf(u8, src[i..line_end], marker) orelse continue;
+            break :native i + marker_pos + 1;
+        } else legacy: {
+            if (i + legacy_needle.len >= src.len or
+                !std.mem.eql(u8, src[i..][0..legacy_needle.len], legacy_needle)) continue;
+            const context_start = if (i >= 120) i - 120 else 0;
+            if (std.mem.indexOf(u8, src[context_start..i], ".root_source_file") == null) continue;
+            break :legacy i + "b.path(\"".len;
+        };
         var path_end = path_start;
         while (path_end < src.len and src[path_end] != '"') : (path_end += 1) {}
         if (path_end >= src.len) continue;

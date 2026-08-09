@@ -6,25 +6,81 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+env:
+  SIG_RELEASE_TAG: bootstrap-sig-v28
+  # The bootstrap binary is only the stage-0 executable. Build semantics come
+  # from this exact reviewed Sig source revision so CI cannot drift with a tag
+  # or silently use an older runner/library layout.
+  SIG_SOURCE_REF: e7cae806dceed3473c63029b83aff1a89f7478dc
+
 jobs:
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  native-sig:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig 0.16
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
+      - name: Install canonical Sig toolchain
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ASSET_URL=$(gh release view "$SIG_RELEASE_TAG" \
+            --repo "${{ github.repository_owner }}/sig" \
+            --json assets \
+            --jq '.assets[] | select(.name | startswith("bootstrap-sig-x86_64-linux")) | .url')
+          test -n "$ASSET_URL"
+          curl -fsSL "$ASSET_URL" -o /tmp/sig.tar.gz
+          mkdir -p /tmp/sig
+          tar -xf /tmp/sig.tar.gz -C /tmp/sig
+          SIG_BIN=$(find /tmp/sig -type f -name sig -perm -u+x | head -1)
+          test -n "$SIG_BIN"
+          SIG_PREFIX=$(dirname "$(dirname "$SIG_BIN")")
 
-      - name: Run root tests (transport, core, platform)
-        run: zig build test --summary all
-        working-directory: zpm
+          # Current bootstrap archives predate the canonical sibling tools/
+          # layout. Materialize an immutable reviewed source tree without a
+          # Zig fallback; future archives already contain this layout.
+          git init -q /tmp/sig-repo
+          git -C /tmp/sig-repo remote add origin \
+            "https://github.com/${{ github.repository_owner }}/sig.git"
+          git -C /tmp/sig-repo fetch -q --depth 1 origin "$SIG_SOURCE_REF"
+          git -C /tmp/sig-repo checkout -q --detach FETCH_HEAD
+          test "$(git -C /tmp/sig-repo rev-parse HEAD)" = "$SIG_SOURCE_REF"
+          mkdir -p "$SIG_PREFIX/lib" "$SIG_PREFIX/tools"
+          cp -a /tmp/sig-repo/lib/. "$SIG_PREFIX/lib/"
+          cp -a /tmp/sig-repo/tools/sig_build "$SIG_PREFIX/tools/"
 
-      - name: Run CLI tests (pkg modules)
-        run: zig build test --summary all
-        working-directory: zpm/cli
+          echo "SIG=$SIG_BIN" >> "$GITHUB_ENV"
+          echo "SIG_LIB=$SIG_PREFIX/lib" >> "$GITHUB_ENV"
+          "$SIG_BIN" version
+
+      - name: Test ZPM library and transport graph with Sig
+        run: |
+          "$SIG" build test \
+            --zig-lib-dir "$SIG_LIB" \
+            --cache-dir /tmp/zpm-root-cache \
+            --global-cache-dir /tmp/zpm-global-cache \
+            --keep-going
+          "$SIG" build test-integration test-server-initial \
+            --zig-lib-dir "$SIG_LIB" \
+            --cache-dir /tmp/zpm-network-cache \
+            --global-cache-dir /tmp/zpm-global-cache \
+            --keep-going
+
+      - name: Test and build the ZPM CLI with Sig
+        working-directory: cli
+        run: |
+          "$SIG" build test \
+            --zig-lib-dir "$SIG_LIB" \
+            --cache-dir /tmp/zpm-cli-test-cache \
+            --global-cache-dir /tmp/zpm-global-cache \
+            --keep-going
+          "$SIG" build zpm \
+            --zig-lib-dir "$SIG_LIB" \
+            --cache-dir /tmp/zpm-cli-build-cache \
+            --global-cache-dir /tmp/zpm-global-cache
+          file sig-out/bin/zpm
+          sig-out/bin/zpm --version

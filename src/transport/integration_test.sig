@@ -1514,7 +1514,7 @@ test "QuicTransportVtable end-to-end" {
     var rpos: usize = 0;
     const scope_len = payload[rpos];
     rpos += 1;
-    try testing.expectEqual(@as(u8, 4), scope_len); // "zpm"
+    try testing.expectEqual(@as(u8, 3), scope_len); // "zpm"
     try testing.expectEqualSlices(u8, "zpm", payload[rpos .. rpos + scope_len]);
     rpos += scope_len;
     const name_len = payload[rpos];

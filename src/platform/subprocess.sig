@@ -24,6 +24,7 @@ pub const LimitType = enum {
     cpu_timeout,
     memory_exceeded,
     filesystem_exceeded,
+    policy_unavailable,
 };
 
 /// Environment variable key-value pair.
@@ -87,14 +88,15 @@ pub const SubprocessResult = struct {
 pub const ProcessHandle = struct {
     child: std.process.Child,
     start_time: i64,
-    config: *const SubprocessConfig,
 };
 
 /// Read from a file descriptor into a fixed-size buffer, up to MAX_OUTPUT bytes.
-fn readPipe(pipe: std.fs.File, buf: *[MAX_OUTPUT]u8) usize {
+fn readPipe(io: std.Io, pipe: std.Io.File, buf: *[MAX_OUTPUT]u8) usize {
+    var reader_buffer: [4096]u8 = undefined;
+    var reader = pipe.readerStreaming(io, &reader_buffer);
     var total: usize = 0;
     while (total < MAX_OUTPUT) {
-        const n = pipe.read(buf[total..]) catch break;
+        const n = reader.interface.readSliceShort(buf[total..]) catch break;
         if (n == 0) break;
         total += n;
     }
@@ -102,48 +104,21 @@ fn readPipe(pipe: std.fs.File, buf: *[MAX_OUTPUT]u8) usize {
 }
 
 /// Get current timestamp in milliseconds using std.time.
-fn timestampMs() i64 {
-    return @divFloor(std.time.milliTimestamp(), 1);
+fn timestampMs(io: std.Io) i64 {
+    return std.Io.Timestamp.now(io, .awake).toMilliseconds();
 }
 
-/// Apply POSIX resource limits via setrlimit before exec.
-/// Called between fork and exec in the child process setup.
-fn applyPosixLimits(config: *const SubprocessConfig) void {
-    if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
-        // CPU time limit
-        if (config.time_limit_sec > 0) {
-            const rlim = std.posix.rlimit{
-                .cur = config.time_limit_sec,
-                .max = config.time_limit_sec + 1, // hard limit slightly above soft
-            };
-            std.posix.setrlimit(.CPU, rlim) catch {};
-        }
-
-        // Memory limit (address space)
-        if (config.memory_limit_mb > 0) {
-            const bytes: u64 = @as(u64, config.memory_limit_mb) * 1024 * 1024;
-            const rlim = std.posix.rlimit{
-                .cur = bytes,
-                .max = bytes,
-            };
-            std.posix.setrlimit(.AS, rlim) catch {};
-        }
-
-        // Filesystem write limit
-        if (config.fs_write_limit_mb > 0) {
-            const bytes: u64 = @as(u64, config.fs_write_limit_mb) * 1024 * 1024;
-            const rlim = std.posix.rlimit{
-                .cur = bytes,
-                .max = bytes,
-            };
-            std.posix.setrlimit(.FSIZE, rlim) catch {};
-        }
-    }
+/// The generic std.Io process API cannot install pre-exec rlimits or a network
+/// namespace. Reject such requests before spawn rather than silently running
+/// with weaker isolation than the caller requested.
+fn requiresUnavailablePolicy(config: *const SubprocessConfig) bool {
+    return config.env != null or config.time_limit_sec != 0 or config.memory_limit_mb != 0 or
+        config.fs_write_limit_mb != 0 or config.no_network or config.isolated_mode;
 }
 
 /// Spawn a subprocess, wait for completion, return result.
-/// Enforces resource limits via platform-specific mechanisms.
-pub fn run(config: *const SubprocessConfig) SubprocessResult {
+/// Unsupported isolation policies fail closed with `.policy_unavailable`.
+pub fn run(io: std.Io, config: *const SubprocessConfig) SubprocessResult {
     var result = SubprocessResult{
         .exit_code = -1,
         .stdout = @as([MAX_OUTPUT]u8, @splat(0)),
@@ -154,7 +129,12 @@ pub fn run(config: *const SubprocessConfig) SubprocessResult {
         .limit_exceeded = null,
     };
 
-    const start = timestampMs();
+    const start = timestampMs(io);
+
+    if (requiresUnavailablePolicy(config)) {
+        result.limit_exceeded = .policy_unavailable;
+        return result;
+    }
 
     // Build argv for std.process.Child
     var argv_buf: [MAX_ARGV][]const u8 = undefined;
@@ -163,70 +143,43 @@ pub fn run(config: *const SubprocessConfig) SubprocessResult {
         argv_buf[i] = config.argv[i];
     }
 
-    var child = std.process.Child.init(argv_buf[0..argc], std.heap.page_allocator);
-
-    // Set working directory
-    if (config.cwd) |cwd| {
-        child.cwd = cwd;
-    }
-
-    // Configure pipes for stdout/stderr capture
-    child.stdout_behavior = .pipe;
-    child.stderr_behavior = .pipe;
-
-    // Configure stdin
-    if (config.stdin_data != null) {
-        child.stdin_behavior = .pipe;
-    } else {
-        child.stdin_behavior = .close;
-    }
-
-    // Apply resource limits on POSIX via pre-exec callback
-    if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
-        child.pre_exec_callback = struct {
-            // We store the config pointer in a comptime-accessible way
-            var stored_config: ?*const SubprocessConfig = null;
-
-            fn callback(_: ?*anyopaque) callconv(.c) void {
-                if (stored_config) |cfg| {
-                    applyPosixLimits(cfg);
-                }
-            }
-        }.callback;
-        // Store config for the callback
-        @TypeOf(child.pre_exec_callback).?.stored_config = config;
-    }
-
-    // Spawn the child
-    child.spawn() catch {
-        result.wall_time_ms = @intCast(@max(0, timestampMs() - start));
+    var child = std.process.spawn(io, .{
+        .argv = argv_buf[0..argc],
+        .cwd = if (config.cwd) |cwd| .{ .path = cwd } else .inherit,
+        .stdin = if (config.stdin_data != null) .pipe else .close,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .request_resource_usage_statistics = true,
+    }) catch {
+        result.wall_time_ms = @intCast(@max(0, timestampMs(io) - start));
         return result;
     };
+    defer child.kill(io);
 
     // Write stdin data if provided
     if (config.stdin_data) |data| {
         if (child.stdin) |*stdin_pipe| {
-            stdin_pipe.writeAll(data) catch {};
-            stdin_pipe.close();
+            stdin_pipe.writeStreamingAll(io, data) catch {};
+            stdin_pipe.close(io);
             child.stdin = null;
         }
     }
 
     // Read stdout and stderr
     if (child.stdout) |stdout_pipe| {
-        result.stdout_len = readPipe(stdout_pipe, &result.stdout);
+        result.stdout_len = readPipe(io, stdout_pipe, &result.stdout);
     }
     if (child.stderr) |stderr_pipe| {
-        result.stderr_len = readPipe(stderr_pipe, &result.stderr);
+        result.stderr_len = readPipe(io, stderr_pipe, &result.stderr);
     }
 
     // Wait for child to exit
-    const term = child.wait() catch {
-        result.wall_time_ms = @intCast(@max(0, timestampMs() - start));
+    const term = child.wait(io) catch {
+        result.wall_time_ms = @intCast(@max(0, timestampMs(io) - start));
         return result;
     };
 
-    result.wall_time_ms = @intCast(@max(0, timestampMs() - start));
+    result.wall_time_ms = @intCast(@max(0, timestampMs(io) - start));
 
     // Map termination status
     switch (term) {
@@ -234,7 +187,7 @@ pub fn run(config: *const SubprocessConfig) SubprocessResult {
             result.exit_code = @intCast(code);
         },
         .signal => |sig| {
-            result.exit_code = -@as(i32, @intCast(sig));
+            result.exit_code = -@as(i32, @intCast(@intFromEnum(sig)));
             // Check if killed by resource limit signals
             if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
                 if (sig == std.posix.SIG.XCPU) {
@@ -261,41 +214,33 @@ pub fn run(config: *const SubprocessConfig) SubprocessResult {
 }
 
 /// Spawn a subprocess without waiting. Returns a handle for later wait/kill.
-pub fn spawn(config: *const SubprocessConfig) ?ProcessHandle {
+pub fn spawn(io: std.Io, config: *const SubprocessConfig) ?ProcessHandle {
+    if (requiresUnavailablePolicy(config)) return null;
     var argv_buf: [MAX_ARGV][]const u8 = undefined;
     const argc = @min(config.argv.len, MAX_ARGV);
     for (0..argc) |i| {
         argv_buf[i] = config.argv[i];
     }
 
-    var child = std.process.Child.init(argv_buf[0..argc], std.heap.page_allocator);
-
-    if (config.cwd) |cwd| {
-        child.cwd = cwd;
-    }
-
-    child.stdout_behavior = .pipe;
-    child.stderr_behavior = .pipe;
-
-    if (config.stdin_data != null) {
-        child.stdin_behavior = .pipe;
-    } else {
-        child.stdin_behavior = .close;
-    }
-
-    child.spawn() catch return null;
+    const child = std.process.spawn(io, .{
+        .argv = argv_buf[0..argc],
+        .cwd = if (config.cwd) |cwd| .{ .path = cwd } else .inherit,
+        .stdin = if (config.stdin_data != null) .pipe else .close,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .request_resource_usage_statistics = true,
+    }) catch return null;
 
     return ProcessHandle{
         .child = child,
-        .start_time = timestampMs(),
-        .config = config,
+        .start_time = timestampMs(io),
     };
 }
 
 /// Wait for a spawned process to complete.
 /// timeout_ms: maximum time to wait (0 = wait indefinitely).
-pub fn wait(handle: *ProcessHandle, timeout_ms: u32) ?SubprocessResult {
-    _ = timeout_ms; // TODO: implement timeout-based waiting
+pub fn wait(io: std.Io, handle: *ProcessHandle, timeout_ms: u32) ?SubprocessResult {
+    if (timeout_ms != 0) return null;
 
     var result = SubprocessResult{
         .exit_code = -1,
@@ -309,22 +254,22 @@ pub fn wait(handle: *ProcessHandle, timeout_ms: u32) ?SubprocessResult {
 
     // Read output pipes
     if (handle.child.stdout) |stdout_pipe| {
-        result.stdout_len = readPipe(stdout_pipe, &result.stdout);
+        result.stdout_len = readPipe(io, stdout_pipe, &result.stdout);
     }
     if (handle.child.stderr) |stderr_pipe| {
-        result.stderr_len = readPipe(stderr_pipe, &result.stderr);
+        result.stderr_len = readPipe(io, stderr_pipe, &result.stderr);
     }
 
-    const term = handle.child.wait() catch return null;
+    const term = handle.child.wait(io) catch return null;
 
-    result.wall_time_ms = @intCast(@max(0, timestampMs() - handle.start_time));
+    result.wall_time_ms = @intCast(@max(0, timestampMs(io) - handle.start_time));
 
     switch (term) {
         .exited => |code| {
             result.exit_code = @intCast(code);
         },
         .signal => |sig| {
-            result.exit_code = -@as(i32, @intCast(sig));
+            result.exit_code = -@as(i32, @intCast(@intFromEnum(sig)));
         },
         else => {
             result.exit_code = -1;
@@ -335,20 +280,10 @@ pub fn wait(handle: *ProcessHandle, timeout_ms: u32) ?SubprocessResult {
 }
 
 /// Kill a running process.
-pub fn kill(handle: *ProcessHandle) bool {
-    // Send SIGKILL on POSIX, TerminateProcess on Windows
-    const id = handle.child.id;
-    if (builtin.os.tag == .windows) {
-        if (handle.child.id) |pid| {
-            _ = std.os.windows.kernel32.TerminateProcess(pid, 1);
-            return true;
-        }
-        return false;
-    } else {
-        // POSIX: send SIGKILL
-        std.posix.kill(id, std.posix.SIG.KILL) catch return false;
-        return true;
-    }
+pub fn kill(io: std.Io, handle: *ProcessHandle) bool {
+    if (handle.child.id == null) return false;
+    handle.child.kill(io);
+    return true;
 }
 
 // ── Tests ──
@@ -404,7 +339,7 @@ test "subprocess: run echo command" {
     const config = SubprocessConfig{
         .argv = &[_][]const u8{ "/bin/echo", "hello world" },
     };
-    const result = run(&config);
+    const result = run(testing.io, &config);
     try testing.expectEqual(@as(i32, 0), result.exit_code);
     try testing.expect(result.stdout_len > 0);
 
@@ -420,7 +355,7 @@ test "subprocess: run false command returns non-zero" {
     const config = SubprocessConfig{
         .argv = &[_][]const u8{"/bin/false"},
     };
-    const result = run(&config);
+    const result = run(testing.io, &config);
     try testing.expect(result.exit_code != 0);
     try testing.expect(result.limit_exceeded == null);
 }
@@ -431,8 +366,18 @@ test "subprocess: capture stderr" {
     const config = SubprocessConfig{
         .argv = &[_][]const u8{ "/bin/sh", "-c", "echo error >&2" },
     };
-    const result = run(&config);
+    const result = run(testing.io, &config);
     try testing.expectEqual(@as(i32, 0), result.exit_code);
     try testing.expect(result.stderr_len > 0);
     try testing.expect(std.mem.startsWith(u8, result.stderrSlice(), "error"));
+}
+
+test "subprocess: unsupported isolation fails closed" {
+    const config = SubprocessConfig{
+        .argv = &.{"/bin/true"},
+        .time_limit_sec = 1,
+    };
+    const result = run(testing.io, &config);
+    try testing.expectEqual(@as(i32, -1), result.exit_code);
+    try testing.expectEqual(LimitType.policy_unavailable, result.limit_exceeded.?);
 }

@@ -1,191 +1,122 @@
-const std = @import("std");
+// Canonical bounded Sig build graph for the ZPM CLI.
+const sig_build = @import("sig_build");
+const builtin = @import("builtin");
 
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-    const os_tag = target.result.os.tag;
+fn noopStep(ctx: *sig_build.Step_Context) sig_build.SigError!void {
+    _ = ctx;
+}
 
-    // ── Helper: link platform-specific system libraries to a module ──
-    const PlatformLibs = struct {
-        fn linkWin32(mod: *std.Build.Module) void {
-            for ([_][]const u8{ "kernel32", "ws2_32", "bcrypt", "secur32", "winhttp", "shell32" }) |lib| {
-                mod.linkSystemLibrary(lib, .{});
-            }
-        }
-        fn linkMacos(mod: *std.Build.Module) void {
-            mod.linkFramework("Security", .{});
-            mod.linkFramework("SystemConfiguration", .{});
-            mod.linkFramework("CoreFoundation", .{});
-        }
-        fn linkLinux(mod: *std.Build.Module) void {
-            // Zig's built-in TLS handles most cases; link OpenSSL for completeness
-            mod.linkSystemLibrary("ssl", .{});
-            mod.linkSystemLibrary("crypto", .{});
-        }
-        fn linkPlatform(mod: *std.Build.Module, os: std.Target.Os.Tag) void {
-            switch (os) {
-                .windows => linkWin32(mod),
-                .macos => linkMacos(mod),
-                .linux => linkLinux(mod),
-                else => {},
-            }
-        }
-    };
+fn importEntry(name: []const u8, path: []const u8) sig_build.Import_Entry {
+    var entry: sig_build.Import_Entry = .{};
+    @memcpy(entry.name[0..name.len], name);
+    entry.name_len = name.len;
+    @memcpy(entry.path[0..path.len], path);
+    entry.path_len = path.len;
+    return entry;
+}
 
-    // ── Transport modules (needed by registry.sig QuicTransportVtable) ──
+fn wire(ctx: *sig_build.Build_Context, module: sig_build.Module_Handle, name: []const u8, path: []const u8) !void {
+    try ctx.addImport(module, name, path);
+}
 
-    const packet_mod = b.createModule(.{ .root_source_file = b.path("../src/transport/packet.sig"), .target = target, .optimize = optimize });
-    const win32_mod = b.createModule(.{ .root_source_file = b.path("../src/platform/win32.sig"), .target = target, .optimize = optimize });
-    if (os_tag == .windows) win32_mod.linkSystemLibrary("kernel32", .{});
+fn addPkgTest(
+    ctx: *sig_build.Build_Context,
+    aggregate: sig_build.Step_Handle,
+    name: []const u8,
+    source_path: []const u8,
+    win32_path: []const u8,
+    with_transport: bool,
+) !void {
+    const test_step = if (with_transport)
+        try ctx.addTestStep(.{
+            .name = name,
+            .source_path = source_path,
+            .imports = &.{
+            importEntry("conn", "../src/transport/conn.sig"),
+            importEntry("appmap", "../src/transport/appmap.sig"),
+            importEntry("streams", "../src/transport/streams.sig"),
+            importEntry("datagram", "../src/transport/datagram.sig"),
+            importEntry("telemetry", "../src/transport/telemetry.sig"),
+            importEntry("win32", win32_path),
+            },
+        })
+    else
+        try ctx.addTestStep(.{ .name = name, .source_path = source_path, .imports = &.{} });
+    try ctx.addDependency(aggregate, test_step);
+}
 
-    const crypto_mod = b.createModule(.{ .root_source_file = b.path("../src/platform/crypto.sig"), .target = target, .optimize = optimize });
-    crypto_mod.addImport("win32", win32_mod);
-    if (os_tag == .windows) {
-        crypto_mod.linkSystemLibrary("bcrypt", .{});
-        crypto_mod.linkSystemLibrary("kernel32", .{});
-    }
+pub fn build(ctx: *sig_build.Build_Context) !void {
+    const win32_path = if (builtin.os.tag == .windows)
+        "../src/platform/win32.sig"
+    else
+        "../src/transport/linux_platform.sig";
 
-    const transport_crypto_mod = b.createModule(.{ .root_source_file = b.path("../src/transport/crypto.sig"), .target = target, .optimize = optimize });
-    transport_crypto_mod.addImport("win32", win32_mod);
-    transport_crypto_mod.addImport("packet", packet_mod);
-    transport_crypto_mod.addImport("crypto", crypto_mod);
-    if (os_tag == .windows) {
-        transport_crypto_mod.linkSystemLibrary("bcrypt", .{});
-        transport_crypto_mod.linkSystemLibrary("secur32", .{});
-        transport_crypto_mod.linkSystemLibrary("kernel32", .{});
-    }
+    _ = try ctx.addModule("packet", "../src/transport/packet.sig");
+    _ = try ctx.addModule("win32", win32_path);
+    const crypto = try ctx.addModule("crypto", "../src/platform/crypto.sig");
+    try wire(ctx, crypto, "win32", win32_path);
+    const transport_crypto = try ctx.addModule("transport_crypto", "../src/transport/crypto.sig");
+    try wire(ctx, transport_crypto, "win32", win32_path);
+    try wire(ctx, transport_crypto, "packet", "../src/transport/packet.sig");
+    try wire(ctx, transport_crypto, "crypto", "../src/platform/crypto.sig");
+    const recovery = try ctx.addModule("recovery", "../src/transport/recovery.sig");
+    try wire(ctx, recovery, "packet", "../src/transport/packet.sig");
+    const streams = try ctx.addModule("streams", "../src/transport/streams.sig");
+    try wire(ctx, streams, "packet", "../src/transport/packet.sig");
+    _ = try ctx.addModule("crypto_stream", "../src/transport/crypto_stream.sig");
+    const datagram = try ctx.addModule("datagram", "../src/transport/datagram.sig");
+    try wire(ctx, datagram, "packet", "../src/transport/packet.sig");
+    _ = try ctx.addModule("telemetry", "../src/transport/telemetry.sig");
+    const udp = try ctx.addModule("udp", "../src/transport/udp.sig");
+    try wire(ctx, udp, "win32", win32_path);
+    const conn = try ctx.addModule("conn", "../src/transport/conn.sig");
+    try wire(ctx, conn, "win32", win32_path);
+    try wire(ctx, conn, "packet", "../src/transport/packet.sig");
+    try wire(ctx, conn, "transport_crypto", "../src/transport/crypto.sig");
+    try wire(ctx, conn, "recovery", "../src/transport/recovery.sig");
+    try wire(ctx, conn, "streams", "../src/transport/streams.sig");
+    try wire(ctx, conn, "datagram", "../src/transport/datagram.sig");
+    try wire(ctx, conn, "telemetry", "../src/transport/telemetry.sig");
+    try wire(ctx, conn, "udp", "../src/transport/udp.sig");
+    try wire(ctx, conn, "crypto_stream", "../src/transport/crypto_stream.sig");
+    const appmap = try ctx.addModule("appmap", "../src/transport/appmap.sig");
+    try wire(ctx, appmap, "streams", "../src/transport/streams.sig");
+    try wire(ctx, appmap, "datagram", "../src/transport/datagram.sig");
+    try wire(ctx, appmap, "packet", "../src/transport/packet.sig");
+    _ = try ctx.addModule("pal", "pal.sig");
 
-    const recovery_mod = b.createModule(.{ .root_source_file = b.path("../src/transport/recovery.sig"), .target = target, .optimize = optimize });
-    recovery_mod.addImport("packet", packet_mod);
+    // The executable is a first-class Sig compile step. Relative imports such
+    // as commands.sig remain in the root module; named transport/PAL imports
+    // are explicit and closure-resolved by sig_build.
+    _ = try ctx.addCompileStep(.{
+        .source_path = "../src/pkg/zpm_main.sig",
+        .output_name = "zpm",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .imports = &.{
+            importEntry("conn", "../src/transport/conn.sig"),
+            importEntry("appmap", "../src/transport/appmap.sig"),
+            importEntry("streams", "../src/transport/streams.sig"),
+            importEntry("datagram", "../src/transport/datagram.sig"),
+            importEntry("telemetry", "../src/transport/telemetry.sig"),
+            importEntry("win32", win32_path),
+            importEntry("pal", "pal.sig"),
+        },
+        .compiler_path = "",
+    });
 
-    const streams_mod = b.createModule(.{ .root_source_file = b.path("../src/transport/streams.sig"), .target = target, .optimize = optimize });
-    streams_mod.addImport("packet", packet_mod);
-
-    const datagram_mod = b.createModule(.{ .root_source_file = b.path("../src/transport/datagram.sig"), .target = target, .optimize = optimize });
-    datagram_mod.addImport("packet", packet_mod);
-
-    const telemetry_mod = b.createModule(.{ .root_source_file = b.path("../src/transport/telemetry.sig"), .target = target, .optimize = optimize });
-
-    const udp_mod = b.createModule(.{ .root_source_file = b.path("../src/transport/udp.sig"), .target = target, .optimize = optimize });
-    udp_mod.addImport("win32", win32_mod);
-    if (os_tag == .windows) {
-        udp_mod.linkSystemLibrary("ws2_32", .{});
-        udp_mod.linkSystemLibrary("kernel32", .{});
-    }
-
-    const conn_mod = b.createModule(.{ .root_source_file = b.path("../src/transport/conn.sig"), .target = target, .optimize = optimize });
-    conn_mod.addImport("win32", win32_mod);
-    conn_mod.addImport("packet", packet_mod);
-    conn_mod.addImport("transport_crypto", transport_crypto_mod);
-    conn_mod.addImport("recovery", recovery_mod);
-    conn_mod.addImport("streams", streams_mod);
-    conn_mod.addImport("datagram", datagram_mod);
-    conn_mod.addImport("telemetry", telemetry_mod);
-    conn_mod.addImport("udp", udp_mod);
-    if (os_tag == .windows) {
-        conn_mod.linkSystemLibrary("ws2_32", .{});
-        conn_mod.linkSystemLibrary("bcrypt", .{});
-        conn_mod.linkSystemLibrary("secur32", .{});
-        conn_mod.linkSystemLibrary("kernel32", .{});
-    }
-
-    const appmap_mod = b.createModule(.{ .root_source_file = b.path("../src/transport/appmap.sig"), .target = target, .optimize = optimize });
-    appmap_mod.addImport("streams", streams_mod);
-    appmap_mod.addImport("datagram", datagram_mod);
-    appmap_mod.addImport("packet", packet_mod);
-
-    // ── PAL module (Platform Abstraction Layer) ──
-    const pal_mod = b.createModule(.{ .root_source_file = b.path("pal.sig"), .target = target, .optimize = optimize });
-    PlatformLibs.linkPlatform(pal_mod, os_tag);
-
-    // ── zpm CLI executable ──
-    const exe = b.addExecutable(.{ .name = "zpm", .root_module = b.createModule(.{
-        .root_source_file = b.path("../src/pkg/zpm_main.sig"),
-        .target = target,
-        .optimize = optimize,
-    }) });
-    exe.root_module.addImport("conn", conn_mod);
-    exe.root_module.addImport("appmap", appmap_mod);
-    exe.root_module.addImport("streams", streams_mod);
-    exe.root_module.addImport("datagram", datagram_mod);
-    exe.root_module.addImport("telemetry", telemetry_mod);
-    exe.root_module.addImport("win32", win32_mod);
-    exe.root_module.addImport("pal", pal_mod);
-    b.installArtifact(exe);
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
-    b.step("run", "Run the zpm CLI").dependOn(&run_cmd.step);
-
-    // ── Test step ──
-    const test_step = b.step("test", "Run zpm CLI tests");
-
-    // Helper to create a pkg module test with transport imports wired
-    const TestHelper = struct {
-        fn addPkgTest(
-            b_: *std.Build,
-            step: *std.Build.Step,
-            src: std.Build.LazyPath,
-            tgt: std.Build.ResolvedTarget,
-            opt: std.builtin.OptimizeMode,
-            conn_m: *std.Build.Module,
-            appmap_m: *std.Build.Module,
-            streams_m: *std.Build.Module,
-            datagram_m: *std.Build.Module,
-            telemetry_m: *std.Build.Module,
-            win32_m: *std.Build.Module,
-        ) void {
-            const t = b_.addTest(.{ .root_module = b_.createModule(.{
-                .root_source_file = src,
-                .target = tgt,
-                .optimize = opt,
-            }) });
-            t.root_module.addImport("conn", conn_m);
-            t.root_module.addImport("appmap", appmap_m);
-            t.root_module.addImport("streams", streams_m);
-            t.root_module.addImport("datagram", datagram_m);
-            t.root_module.addImport("telemetry", telemetry_m);
-            t.root_module.addImport("win32", win32_m);
-            t.stack_size = 16 * 1024 * 1024;
-            const run = b_.addRunArtifact(t);
-            step.dependOn(&run.step);
-        }
-    };
-
-    // commands.sig (existing — includes most command handler tests)
-    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/commands.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
-
-    // init.sig — project scaffolding tests
-    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/init.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
-
-    // init_fs_test.sig — real filesystem scaffold smoke tests
-    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/init_fs_test.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
-
-    // zon.sig — build.sig.zon manipulation tests
-    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/zon.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
-
-    // cli.sig — argument parser tests
-    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/cli.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
-
-    // names.sig — scoped name conversion tests
-    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/names.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
-
-    // manifest.sig — package manifest parser tests
-    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/manifest.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
-
-    // validator.sig — layer/constraint validation tests
-    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/validator.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
-
-    // scanner.sig — build.sig/source scanner tests
-    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/scanner.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
-
-    // resolver.sig — dependency resolution tests
-    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/resolver.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
-
-    // bootstrap.sig — Zig bootstrapper tests
-    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/bootstrap.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
-
-    // official_packages.sig — official @zpm/ package map tests
-    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/official_packages.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
+    const test_all = try ctx.addStep("test", "Run all ZPM CLI package tests", &noopStep);
+    try addPkgTest(ctx, test_all, "test-commands", "../src/pkg/commands.sig", win32_path, true);
+    try addPkgTest(ctx, test_all, "test-init", "../src/pkg/init.sig", win32_path, false);
+    try addPkgTest(ctx, test_all, "test-init-fs", "../src/pkg/init_fs_test.sig", win32_path, false);
+    try addPkgTest(ctx, test_all, "test-zon", "../src/pkg/zon.sig", win32_path, false);
+    try addPkgTest(ctx, test_all, "test-cli", "../src/pkg/cli.sig", win32_path, false);
+    try addPkgTest(ctx, test_all, "test-names", "../src/pkg/names.sig", win32_path, false);
+    try addPkgTest(ctx, test_all, "test-manifest", "../src/pkg/manifest.sig", win32_path, false);
+    try addPkgTest(ctx, test_all, "test-validator", "../src/pkg/validator.sig", win32_path, false);
+    try addPkgTest(ctx, test_all, "test-scanner", "../src/pkg/scanner.sig", win32_path, false);
+    try addPkgTest(ctx, test_all, "test-resolver", "../src/pkg/resolver.sig", win32_path, false);
+    try addPkgTest(ctx, test_all, "test-bootstrap", "../src/pkg/bootstrap.sig", win32_path, false);
+    try addPkgTest(ctx, test_all, "test-official-packages", "../src/pkg/official_packages.sig", win32_path, false);
 }

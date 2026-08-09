@@ -47,7 +47,29 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-
+    const vector_memory_mod = b.addModule("vector_memory", .{
+        .root_source_file = b.path("src/core/vector_memory.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const moment_activation_mod = b.addModule("moment_activation", .{
+        .root_source_file = b.path("src/core/moment_activation.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const agent_runtime_mod = b.addModule("agent_runtime", .{
+        .root_source_file = b.path("src/core/agent_runtime.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cognitive_receipt_mod = b.addModule("cognitive_receipt", .{
+        .root_source_file = b.path("src/core/cognitive_receipt.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cognitive_receipt_mod.addImport("vector_memory", vector_memory_mod);
+    cognitive_receipt_mod.addImport("moment_activation", moment_activation_mod);
+    cognitive_receipt_mod.addImport("agent_runtime", agent_runtime_mod);
     const core_mod = b.addModule("core", .{
         .root_source_file = b.path("src/core/root.sig"),
         .target = target,
@@ -60,6 +82,10 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("ai_core", ai_core_mod);
     core_mod.addImport("quantized_linear", quantized_linear_mod);
     core_mod.addImport("transformer_ops", transformer_ops_mod);
+    core_mod.addImport("vector_memory", vector_memory_mod);
+    core_mod.addImport("moment_activation", moment_activation_mod);
+    core_mod.addImport("agent_runtime", agent_runtime_mod);
+    core_mod.addImport("cognitive_receipt", cognitive_receipt_mod);
 
     // ── Granular modules (Layer 1: Platform) ──
     // Ordered so that dependencies are declared before dependents.
@@ -298,6 +324,30 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&transformer_ops_run.step);
     const transformer_ops_test_step = b.step("test-transformer-ops", "Run allocation-free transformer primitive tests");
     transformer_ops_test_step.dependOn(&transformer_ops_run.step);
+
+    const vector_memory_tests = b.addTest(.{ .root_module = vector_memory_mod });
+    const vector_memory_run = b.addRunArtifact(vector_memory_tests);
+    test_step.dependOn(&vector_memory_run.step);
+    const vector_memory_test_step = b.step("test-vector-memory", "Run exact allocation-free vector memory tests");
+    vector_memory_test_step.dependOn(&vector_memory_run.step);
+
+    const moment_activation_tests = b.addTest(.{ .root_module = moment_activation_mod });
+    const moment_activation_run = b.addRunArtifact(moment_activation_tests);
+    test_step.dependOn(&moment_activation_run.step);
+    const moment_activation_test_step = b.step("test-moment-activation", "Run bounded NOW and activation tests");
+    moment_activation_test_step.dependOn(&moment_activation_run.step);
+
+    const agent_runtime_tests = b.addTest(.{ .root_module = agent_runtime_mod });
+    const agent_runtime_run = b.addRunArtifact(agent_runtime_tests);
+    test_step.dependOn(&agent_runtime_run.step);
+    const agent_runtime_test_step = b.step("test-agent-runtime", "Run capability, process, and PlanIR tests");
+    agent_runtime_test_step.dependOn(&agent_runtime_run.step);
+
+    const cognitive_receipt_tests = b.addTest(.{ .root_module = cognitive_receipt_mod });
+    const cognitive_receipt_run = b.addRunArtifact(cognitive_receipt_tests);
+    test_step.dependOn(&cognitive_receipt_run.step);
+    const cognitive_receipt_test_step = b.step("test-cognitive-receipt", "Prove reference cognitive resource bounds");
+    cognitive_receipt_test_step.dependOn(&cognitive_receipt_run.step);
 
     // sha256 tests
     const sha256_tests = b.addTest(.{ .root_module = sha256_mod });

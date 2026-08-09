@@ -969,15 +969,14 @@ test "Property 6: Build Manifest Mutation Preserves Non-Zpm Dependencies" {
         var new_hash_bufs: [3][20]u8 = undefined;
         for (0..num_new) |i| {
             const suf_len = rand.intRangeAtMost(usize, 2, 8);
-            new_name_bufs[i][0] = 'h';
-            new_name_bufs[i][1] = 'e';
-            new_name_bufs[i][2] = 'i';
-            new_name_bufs[i][3] = 'l';
-            new_name_bufs[i][4] = '-';
+            new_name_bufs[i][0] = 'z';
+            new_name_bufs[i][1] = 'p';
+            new_name_bufs[i][2] = 'm';
+            new_name_bufs[i][3] = '-';
             for (0..suf_len) |j| {
-                new_name_bufs[i][5 + j] = "abcdefghijklmnopqrstuvwxyz"[rand.intRangeAtMost(usize, 0, 25)];
+                new_name_bufs[i][4 + j] = "abcdefghijklmnopqrstuvwxyz"[rand.intRangeAtMost(usize, 0, 25)];
             }
-            const name_total = 5 + suf_len;
+            const name_total = 4 + suf_len;
             const url_res = std.fmt.bufPrint(&new_url_bufs[i], "https://new.dev/{d}.tar.gz", .{iteration * 10 + i}) catch continue;
             const hash_res = std.fmt.bufPrint(&new_hash_bufs[i], "1220new{d}{d}", .{ iteration, i }) catch continue;
             new_deps_arr[i] = .{
@@ -1042,16 +1041,15 @@ test "Property 7: Install Idempotency" {
     while (iteration < 200) : (iteration += 1) {
         // Generate a random zpm package name
         var name_buf: [20]u8 = undefined;
-        name_buf[0] = 'h';
-        name_buf[1] = 'e';
-        name_buf[2] = 'i';
-        name_buf[3] = 'l';
-        name_buf[4] = '-';
+        name_buf[0] = 'z';
+        name_buf[1] = 'p';
+        name_buf[2] = 'm';
+        name_buf[3] = '-';
         const suf_len = rand.intRangeAtMost(usize, 2, 10);
         for (0..suf_len) |j| {
-            name_buf[5 + j] = "abcdefghijklmnopqrstuvwxyz"[rand.intRangeAtMost(usize, 0, 25)];
+            name_buf[4 + j] = "abcdefghijklmnopqrstuvwxyz"[rand.intRangeAtMost(usize, 0, 25)];
         }
-        const pkg_name = name_buf[0 .. 5 + suf_len];
+        const pkg_name = name_buf[0 .. 4 + suf_len];
 
         // Generate random url and hash
         var url_buf: [64]u8 = undefined;
@@ -1093,18 +1091,17 @@ test "Property 8: Removal Safety" {
         var chain_names: [4][16]u8 = undefined;
         var chain_name_lens: [4]usize = undefined;
         for (0..chain_len) |i| {
-            chain_names[i][0] = 'h';
-            chain_names[i][1] = 'e';
-            chain_names[i][2] = 'i';
-            chain_names[i][3] = 'l';
-            chain_names[i][4] = '-';
+            chain_names[i][0] = 'z';
+            chain_names[i][1] = 'p';
+            chain_names[i][2] = 'm';
+            chain_names[i][3] = '-';
             const suf_len = rand.intRangeAtMost(usize, 2, 8);
             for (0..suf_len) |j| {
-                chain_names[i][5 + j] = "abcdefghijklmnopqrstuvwxyz"[rand.intRangeAtMost(usize, 0, 25)];
+                chain_names[i][4 + j] = "abcdefghijklmnopqrstuvwxyz"[rand.intRangeAtMost(usize, 0, 25)];
             }
             // Append index to avoid collisions
-            const idx_res = std.fmt.bufPrint(chain_names[i][5 + suf_len ..], "{d}", .{i}) catch continue;
-            chain_name_lens[i] = 5 + suf_len + idx_res.len;
+            const idx_res = std.fmt.bufPrint(chain_names[i][4 + suf_len ..], "{d}", .{i}) catch continue;
+            chain_name_lens[i] = 4 + suf_len + idx_res.len;
         }
 
         // Build ZON source with all chain deps

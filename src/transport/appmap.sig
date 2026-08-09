@@ -426,7 +426,7 @@ test "deserializeMsg: truncated buffer returns error" {
 test "deserializeMsg: payload_len exceeds buffer returns error" {
     var buf: [16]u8 = undefined;
     // Write header claiming 100 bytes of payload but only provide 8 bytes total
-    _ = AppMap.serializeMsg(.hello, 0, "x" ** 8, &buf);
+    _ = AppMap.serializeMsg(.hello, 0, "xxxxxxxx", &buf);
     // Corrupt payload_len to claim more
     buf[4] = 100;
     const result = AppMap.deserializeMsg(buf[0..16]);

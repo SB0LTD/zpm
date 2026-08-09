@@ -66,6 +66,7 @@ const allowed_imports = [_][]const u8{
     "conn",
     "telemetry",
     "appmap",
+    "crypto_stream",
 };
 
 // ── Helpers ──

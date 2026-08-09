@@ -1,664 +1,279 @@
-const std = @import("std");
+// ZPM's canonical zero-allocation Sig build graph.
+//
+// `build.zig` remains the transitional upstream-Zig graph. This file uses the
+// bounded sig_build API exclusively so `sig build` never falls back to Zig's
+// allocator-backed std.Build implementation.
+const sig_build = @import("sig_build");
+const builtin = @import("builtin");
 
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-    const os_tag = target.result.os.tag;
+fn noopStep(ctx: *sig_build.Step_Context) sig_build.SigError!void {
+    _ = ctx;
+}
 
-    // ── Granular modules (Layer 0: Core) ──
+fn importEntry(name: []const u8, path: []const u8) sig_build.Import_Entry {
+    var entry: sig_build.Import_Entry = .{};
+    @memcpy(entry.name[0..name.len], name);
+    entry.name_len = name.len;
+    @memcpy(entry.path[0..path.len], path);
+    entry.path_len = path.len;
+    return entry;
+}
 
-    const math_mod = b.addModule("math", .{
-        .root_source_file = b.path("src/core/math.sig"),
-        .target = target,
-        .optimize = optimize,
+fn wire(ctx: *sig_build.Build_Context, module: sig_build.Module_Handle, name: []const u8, path: []const u8) !void {
+    try ctx.addImport(module, name, path);
+}
+
+fn addTest(
+    ctx: *sig_build.Build_Context,
+    aggregate: sig_build.Step_Handle,
+    name: []const u8,
+    source_path: []const u8,
+    imports: []const sig_build.Import_Entry,
+) !sig_build.Step_Handle {
+    const step = try ctx.addTestStep(.{
+        .name = name,
+        .source_path = source_path,
+        .imports = imports,
+    });
+    try ctx.addDependency(aggregate, step);
+    return step;
+}
+
+pub fn build(ctx: *sig_build.Build_Context) !void {
+    const test_all = try ctx.addStep("test", "Run all ZPM unit and compliance tests", &noopStep);
+
+    // Core modules.
+    _ = try ctx.addModule("math", "src/core/math.sig");
+    _ = try ctx.addModule("json", "src/core/json.sig");
+    _ = try ctx.addModule("sha256", "src/core/sha256.sig");
+    const jsonl = try ctx.addModule("jsonl", "src/core/jsonl.sig");
+    try wire(ctx, jsonl, "json", "src/core/json.sig");
+    _ = try ctx.addModule("ai_core", "src/core/ai_core.sig");
+    _ = try ctx.addModule("quantized_linear", "src/core/quantized_linear.sig");
+    _ = try ctx.addModule("transformer_ops", "src/core/transformer_ops.sig");
+    _ = try ctx.addModule("vector_memory", "src/core/vector_memory.sig");
+    _ = try ctx.addModule("moment_activation", "src/core/moment_activation.sig");
+    _ = try ctx.addModule("agent_runtime", "src/core/agent_runtime.sig");
+    const cognitive_receipt = try ctx.addModule("cognitive_receipt", "src/core/cognitive_receipt.sig");
+    try wire(ctx, cognitive_receipt, "vector_memory", "src/core/vector_memory.sig");
+    try wire(ctx, cognitive_receipt, "moment_activation", "src/core/moment_activation.sig");
+    try wire(ctx, cognitive_receipt, "agent_runtime", "src/core/agent_runtime.sig");
+    const core = try ctx.addModule("core", "src/core/root.sig");
+    try wire(ctx, core, "math", "src/core/math.sig");
+    try wire(ctx, core, "json", "src/core/json.sig");
+    try wire(ctx, core, "sha256", "src/core/sha256.sig");
+    try wire(ctx, core, "jsonl", "src/core/jsonl.sig");
+    try wire(ctx, core, "ai_core", "src/core/ai_core.sig");
+    try wire(ctx, core, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, core, "transformer_ops", "src/core/transformer_ops.sig");
+    try wire(ctx, core, "vector_memory", "src/core/vector_memory.sig");
+    try wire(ctx, core, "moment_activation", "src/core/moment_activation.sig");
+    try wire(ctx, core, "agent_runtime", "src/core/agent_runtime.sig");
+    try wire(ctx, core, "cognitive_receipt", "src/core/cognitive_receipt.sig");
+
+    _ = try addTest(ctx, test_all, "test-ai-core", "src/core/ai_core.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-quantized-linear", "src/core/quantized_linear.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-transformer-ops", "src/core/transformer_ops.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-vector-memory", "src/core/vector_memory.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-moment-activation", "src/core/moment_activation.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-agent-runtime", "src/core/agent_runtime.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-cognitive-receipt", "src/core/cognitive_receipt.sig", &.{
+        importEntry("vector_memory", "src/core/vector_memory.sig"),
+        importEntry("moment_activation", "src/core/moment_activation.sig"),
+        importEntry("agent_runtime", "src/core/agent_runtime.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-sha256", "src/core/sha256.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-jsonl", "src/core/jsonl.sig", &.{
+        importEntry("json", "src/core/json.sig"),
     });
 
-    const json_mod = b.addModule("json", .{
-        .root_source_file = b.path("src/core/json.sig"),
-        .target = target,
-        .optimize = optimize,
+    // Platform modules used by the portable and transport layers. The native
+    // build host selects the same source split as the transitional graph.
+    const win32_path = if (builtin.os.tag == .windows)
+        "src/platform/win32.sig"
+    else
+        "src/transport/linux_platform.sig";
+    _ = try ctx.addModule("win32", win32_path);
+    _ = try ctx.addModule("gl", "src/platform/gl.sig");
+    const window = try ctx.addModule("window", "src/platform/window.sig");
+    try wire(ctx, window, "win32", win32_path);
+    try wire(ctx, window, "gl", "src/platform/gl.sig");
+    const timer = try ctx.addModule("timer", "src/platform/timer.sig");
+    try wire(ctx, timer, "win32", win32_path);
+    const seqlock = try ctx.addModule("seqlock", "src/platform/seqlock.sig");
+    try wire(ctx, seqlock, "win32", win32_path);
+    const http = try ctx.addModule("http", "src/platform/http.sig");
+    try wire(ctx, http, "win32", win32_path);
+    const crypto = try ctx.addModule("crypto", "src/platform/crypto.sig");
+    try wire(ctx, crypto, "win32", win32_path);
+    const file_io = try ctx.addModule("file_io", "src/platform/file.sig");
+    try wire(ctx, file_io, "win32", win32_path);
+    const threading = try ctx.addModule("threading", "src/platform/thread/run.sig");
+    try wire(ctx, threading, "win32", win32_path);
+    const logging = try ctx.addModule("logging", "src/platform/log/run.sig");
+    try wire(ctx, logging, "win32", win32_path);
+    try wire(ctx, logging, "core", "src/core/root.sig");
+    const input = try ctx.addModule("input", "src/platform/input/run.sig");
+    try wire(ctx, input, "win32", win32_path);
+    try wire(ctx, input, "gl", "src/platform/gl.sig");
+    try wire(ctx, input, "logging", "src/platform/log/run.sig");
+    try wire(ctx, input, "core", "src/core/root.sig");
+    const png = try ctx.addModule("png", "src/platform/png/encode.sig");
+    try wire(ctx, png, "win32", win32_path);
+    try wire(ctx, png, "gl", "src/platform/gl.sig");
+    try wire(ctx, png, "logging", "src/platform/log/run.sig");
+    const screenshot = try ctx.addModule("screenshot", "src/platform/screenshot.sig");
+    try wire(ctx, screenshot, "png", "src/platform/png/encode.sig");
+    const mcp = try ctx.addModule("mcp", "src/platform/mcp/run.sig");
+    try wire(ctx, mcp, "win32", win32_path);
+    try wire(ctx, mcp, "json", "src/core/json.sig");
+    try wire(ctx, mcp, "core", "src/core/root.sig");
+    try wire(ctx, mcp, "seqlock", "src/platform/seqlock.sig");
+    try wire(ctx, mcp, "logging", "src/platform/log/run.sig");
+    try wire(ctx, mcp, "png", "src/platform/png/encode.sig");
+    _ = try ctx.addModule("subprocess", "src/platform/subprocess.sig");
+    _ = try addTest(ctx, test_all, "test-subprocess", "src/platform/subprocess.sig", &.{});
+
+    // Render and aggregate modules are registered so dependency closure is
+    // complete for downstream package consumers even when they are not test
+    // roots in this graph.
+    _ = try ctx.addModule("color", "src/render/color.sig");
+    const primitives = try ctx.addModule("primitives", "src/render/primitives.sig");
+    try wire(ctx, primitives, "gl", "src/platform/gl.sig");
+    try wire(ctx, primitives, "color", "src/render/color.sig");
+    const text = try ctx.addModule("text", "src/render/text.sig");
+    try wire(ctx, text, "gl", "src/platform/gl.sig");
+    try wire(ctx, text, "win32", win32_path);
+    try wire(ctx, text, "color", "src/render/color.sig");
+    const icon = try ctx.addModule("icon", "src/render/icon.sig");
+    try wire(ctx, icon, "gl", "src/platform/gl.sig");
+    try wire(ctx, icon, "win32", win32_path);
+    const render = try ctx.addModule("render", "src/render/root.sig");
+    try wire(ctx, render, "color", "src/render/color.sig");
+    try wire(ctx, render, "primitives", "src/render/primitives.sig");
+    try wire(ctx, render, "text", "src/render/text.sig");
+    try wire(ctx, render, "icon", "src/render/icon.sig");
+
+    const platform = try ctx.addModule("platform", "src/platform/root.sig");
+    try wire(ctx, platform, "core", "src/core/root.sig");
+    try wire(ctx, platform, "win32", win32_path);
+    try wire(ctx, platform, "gl", "src/platform/gl.sig");
+    try wire(ctx, platform, "window", "src/platform/window.sig");
+    try wire(ctx, platform, "input", "src/platform/input/run.sig");
+    try wire(ctx, platform, "timer", "src/platform/timer.sig");
+    try wire(ctx, platform, "threading", "src/platform/thread/run.sig");
+    try wire(ctx, platform, "http", "src/platform/http.sig");
+    try wire(ctx, platform, "crypto", "src/platform/crypto.sig");
+    try wire(ctx, platform, "file_io", "src/platform/file.sig");
+    try wire(ctx, platform, "seqlock", "src/platform/seqlock.sig");
+    try wire(ctx, platform, "screenshot", "src/platform/screenshot.sig");
+    try wire(ctx, platform, "logging", "src/platform/log/run.sig");
+    try wire(ctx, platform, "png", "src/platform/png/encode.sig");
+    try wire(ctx, platform, "mcp", "src/platform/mcp/run.sig");
+    try wire(ctx, platform, "subprocess", "src/platform/subprocess.sig");
+
+    // QUIC transport modules.
+    const udp = try ctx.addModule("udp", "src/transport/udp.sig");
+    try wire(ctx, udp, "win32", win32_path);
+    _ = try ctx.addModule("packet", "src/transport/packet.sig");
+    const transport_crypto = try ctx.addModule("transport_crypto", "src/transport/crypto.sig");
+    try wire(ctx, transport_crypto, "win32", win32_path);
+    try wire(ctx, transport_crypto, "packet", "src/transport/packet.sig");
+    try wire(ctx, transport_crypto, "crypto", "src/platform/crypto.sig");
+    _ = try ctx.addModule("tls13", "src/transport/tls13.sig");
+    const recovery = try ctx.addModule("recovery", "src/transport/recovery.sig");
+    try wire(ctx, recovery, "packet", "src/transport/packet.sig");
+    const streams = try ctx.addModule("streams", "src/transport/streams.sig");
+    try wire(ctx, streams, "packet", "src/transport/packet.sig");
+    _ = try ctx.addModule("crypto_stream", "src/transport/crypto_stream.sig");
+    const datagram = try ctx.addModule("datagram", "src/transport/datagram.sig");
+    try wire(ctx, datagram, "packet", "src/transport/packet.sig");
+    _ = try ctx.addModule("telemetry", "src/transport/telemetry.sig");
+    const conn = try ctx.addModule("conn", "src/transport/conn.sig");
+    try wire(ctx, conn, "win32", win32_path);
+    try wire(ctx, conn, "packet", "src/transport/packet.sig");
+    try wire(ctx, conn, "transport_crypto", "src/transport/crypto.sig");
+    try wire(ctx, conn, "recovery", "src/transport/recovery.sig");
+    try wire(ctx, conn, "streams", "src/transport/streams.sig");
+    try wire(ctx, conn, "datagram", "src/transport/datagram.sig");
+    try wire(ctx, conn, "telemetry", "src/transport/telemetry.sig");
+    try wire(ctx, conn, "udp", "src/transport/udp.sig");
+    try wire(ctx, conn, "crypto_stream", "src/transport/crypto_stream.sig");
+    const scheduler = try ctx.addModule("scheduler", "src/transport/scheduler.sig");
+    try wire(ctx, scheduler, "win32", win32_path);
+    try wire(ctx, scheduler, "packet", "src/transport/packet.sig");
+    try wire(ctx, scheduler, "streams", "src/transport/streams.sig");
+    try wire(ctx, scheduler, "datagram", "src/transport/datagram.sig");
+    try wire(ctx, scheduler, "recovery", "src/transport/recovery.sig");
+    try wire(ctx, scheduler, "transport_crypto", "src/transport/crypto.sig");
+    try wire(ctx, scheduler, "udp", "src/transport/udp.sig");
+    try wire(ctx, scheduler, "telemetry", "src/transport/telemetry.sig");
+    const appmap = try ctx.addModule("appmap", "src/transport/appmap.sig");
+    try wire(ctx, appmap, "streams", "src/transport/streams.sig");
+    try wire(ctx, appmap, "datagram", "src/transport/datagram.sig");
+    try wire(ctx, appmap, "packet", "src/transport/packet.sig");
+
+    _ = try addTest(ctx, test_all, "test-udp", "src/transport/udp.sig", &.{importEntry("win32", win32_path)});
+    _ = try addTest(ctx, test_all, "test-packet", "src/transport/packet.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-transport-crypto", "src/transport/crypto.sig", &.{
+        importEntry("win32", win32_path),
+        importEntry("packet", "src/transport/packet.sig"),
+        importEntry("crypto", "src/platform/crypto.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-recovery", "src/transport/recovery.sig", &.{importEntry("packet", "src/transport/packet.sig")});
+    _ = try addTest(ctx, test_all, "test-streams", "src/transport/streams.sig", &.{importEntry("packet", "src/transport/packet.sig")});
+    _ = try addTest(ctx, test_all, "test-datagram", "src/transport/datagram.sig", &.{importEntry("packet", "src/transport/packet.sig")});
+    _ = try addTest(ctx, test_all, "test-telemetry", "src/transport/telemetry.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-conn", "src/transport/conn.sig", &.{
+        importEntry("win32", win32_path), importEntry("packet", "src/transport/packet.sig"),
+        importEntry("transport_crypto", "src/transport/crypto.sig"), importEntry("recovery", "src/transport/recovery.sig"),
+        importEntry("streams", "src/transport/streams.sig"), importEntry("datagram", "src/transport/datagram.sig"),
+        importEntry("telemetry", "src/transport/telemetry.sig"), importEntry("udp", "src/transport/udp.sig"),
+        importEntry("crypto_stream", "src/transport/crypto_stream.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-scheduler", "src/transport/scheduler.sig", &.{
+        importEntry("win32", win32_path), importEntry("packet", "src/transport/packet.sig"),
+        importEntry("streams", "src/transport/streams.sig"), importEntry("datagram", "src/transport/datagram.sig"),
+        importEntry("recovery", "src/transport/recovery.sig"), importEntry("transport_crypto", "src/transport/crypto.sig"),
+        importEntry("udp", "src/transport/udp.sig"), importEntry("telemetry", "src/transport/telemetry.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-appmap", "src/transport/appmap.sig", &.{
+        importEntry("streams", "src/transport/streams.sig"),
+        importEntry("datagram", "src/transport/datagram.sig"),
+        importEntry("packet", "src/transport/packet.sig"),
     });
 
-    const sha256_mod = b.addModule("sha256", .{
-        .root_source_file = b.path("src/core/sha256.sig"),
-        .target = target,
-        .optimize = optimize,
+    _ = try addTest(ctx, test_all, "test-no-alloc", "src/transport/no_alloc_test.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-comptime-sizes", "src/transport/comptime_sizes_test.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-layer", "src/transport/layer_test.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-domain-agnostic", "src/transport/domain_agnostic_test.sig", &.{});
+    _ = try ctx.addModule("build_embed", "build_embed.sig");
+    _ = try addTest(ctx, test_all, "test-shared-source", "src/transport/shared_source_test.sig", &.{
+        importEntry("build_embed", "build_embed.sig"),
     });
 
-    const jsonl_mod = b.addModule("jsonl", .{
-        .root_source_file = b.path("src/core/jsonl.sig"),
-        .target = target,
-        .optimize = optimize,
+    // Network integration tests remain explicit because they exercise sockets
+    // rather than deterministic package units.
+    _ = try ctx.addTestStep(.{
+        .name = "test-integration",
+        .source_path = "src/transport/integration_test.sig",
+        .imports = &.{
+            importEntry("conn", "src/transport/conn.sig"), importEntry("telemetry", "src/transport/telemetry.sig"),
+            importEntry("streams", "src/transport/streams.sig"), importEntry("transport_crypto", "src/transport/crypto.sig"),
+            importEntry("packet", "src/transport/packet.sig"), importEntry("recovery", "src/transport/recovery.sig"),
+            importEntry("datagram", "src/transport/datagram.sig"), importEntry("udp", "src/transport/udp.sig"),
+            importEntry("win32", win32_path), importEntry("appmap", "src/transport/appmap.sig"),
+        },
     });
-    jsonl_mod.addImport("json", json_mod);
-
-    const ai_core_mod = b.addModule("ai_core", .{
-        .root_source_file = b.path("src/core/ai_core.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const quantized_linear_mod = b.addModule("quantized_linear", .{
-        .root_source_file = b.path("src/core/quantized_linear.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const transformer_ops_mod = b.addModule("transformer_ops", .{
-        .root_source_file = b.path("src/core/transformer_ops.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const core_mod = b.addModule("core", .{
-        .root_source_file = b.path("src/core/root.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    core_mod.addImport("math", math_mod);
-    core_mod.addImport("json", json_mod);
-    core_mod.addImport("sha256", sha256_mod);
-    core_mod.addImport("jsonl", jsonl_mod);
-    core_mod.addImport("ai_core", ai_core_mod);
-    core_mod.addImport("quantized_linear", quantized_linear_mod);
-    core_mod.addImport("transformer_ops", transformer_ops_mod);
-
-    // ── Granular modules (Layer 1: Platform) ──
-    // Ordered so that dependencies are declared before dependents.
-
-    const win32_mod = b.addModule("win32", .{
-        .root_source_file = if (os_tag == .windows)
-            b.path("src/platform/win32.sig")
-        else
-            b.path("src/transport/linux_platform.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    if (os_tag == .windows) win32_mod.linkSystemLibrary("kernel32", .{});
-
-    const gl_mod = b.addModule("gl", .{
-        .root_source_file = b.path("src/platform/gl.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    if (os_tag == .windows) gl_mod.linkSystemLibrary("opengl32", .{});
-
-    const window_mod = b.addModule("window", .{
-        .root_source_file = b.path("src/platform/window.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    window_mod.addImport("win32", win32_mod);
-    window_mod.addImport("gl", gl_mod);
-    if (os_tag == .windows) window_mod.linkSystemLibrary("kernel32", .{});
-    if (os_tag == .windows) window_mod.linkSystemLibrary("gdi32", .{});
-    if (os_tag == .windows) window_mod.linkSystemLibrary("user32", .{});
-    if (os_tag == .windows) window_mod.linkSystemLibrary("shell32", .{});
-
-    const timer_mod = b.addModule("timer", .{
-        .root_source_file = b.path("src/platform/timer.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    timer_mod.addImport("win32", win32_mod);
-    if (os_tag == .windows) timer_mod.linkSystemLibrary("kernel32", .{});
-
-    const seqlock_mod = b.addModule("seqlock", .{
-        .root_source_file = b.path("src/platform/seqlock.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    seqlock_mod.addImport("win32", win32_mod);
-    if (os_tag == .windows) seqlock_mod.linkSystemLibrary("kernel32", .{});
-
-    const http_mod = b.addModule("http", .{
-        .root_source_file = b.path("src/platform/http.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    http_mod.addImport("win32", win32_mod);
-    if (os_tag == .windows) http_mod.linkSystemLibrary("winhttp", .{});
-
-    const crypto_mod = b.addModule("crypto", .{
-        .root_source_file = b.path("src/platform/crypto.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    crypto_mod.addImport("win32", win32_mod);
-    if (os_tag == .windows) crypto_mod.linkSystemLibrary("bcrypt", .{});
-    if (os_tag == .windows) crypto_mod.linkSystemLibrary("kernel32", .{});
-
-    const file_io_mod = b.addModule("file_io", .{
-        .root_source_file = b.path("src/platform/file.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    file_io_mod.addImport("win32", win32_mod);
-    if (os_tag == .windows) file_io_mod.linkSystemLibrary("kernel32", .{});
-
-    const threading_mod = b.addModule("threading", .{
-        .root_source_file = b.path("src/platform/thread/run.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    threading_mod.addImport("win32", win32_mod);
-    if (os_tag == .windows) threading_mod.linkSystemLibrary("kernel32", .{});
-
-    const logging_mod = b.addModule("logging", .{
-        .root_source_file = b.path("src/platform/log/run.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    logging_mod.addImport("win32", win32_mod);
-    logging_mod.addImport("core", core_mod);
-    if (os_tag == .windows) logging_mod.linkSystemLibrary("kernel32", .{});
-
-    const input_mod = b.addModule("input", .{
-        .root_source_file = b.path("src/platform/input/run.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    input_mod.addImport("win32", win32_mod);
-    input_mod.addImport("gl", gl_mod);
-    input_mod.addImport("logging", logging_mod);
-    input_mod.addImport("core", core_mod);
-    if (os_tag == .windows) input_mod.linkSystemLibrary("user32", .{});
-
-    const png_mod = b.addModule("png", .{
-        .root_source_file = b.path("src/platform/png/encode.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    png_mod.addImport("win32", win32_mod);
-    png_mod.addImport("gl", gl_mod);
-    png_mod.addImport("logging", logging_mod);
-    if (os_tag == .windows) png_mod.linkSystemLibrary("kernel32", .{});
-    if (os_tag == .windows) png_mod.linkSystemLibrary("opengl32", .{});
-
-    const screenshot_mod = b.addModule("screenshot", .{
-        .root_source_file = b.path("src/platform/screenshot.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    screenshot_mod.addImport("png", png_mod);
-
-    const mcp_mod = b.addModule("mcp", .{
-        .root_source_file = b.path("src/platform/mcp/run.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    mcp_mod.addImport("win32", win32_mod);
-    mcp_mod.addImport("json", json_mod);
-    mcp_mod.addImport("core", core_mod);
-    mcp_mod.addImport("seqlock", seqlock_mod);
-    mcp_mod.addImport("logging", logging_mod);
-    mcp_mod.addImport("png", png_mod);
-    if (os_tag == .windows) mcp_mod.linkSystemLibrary("ws2_32", .{});
-    if (os_tag == .windows) mcp_mod.linkSystemLibrary("kernel32", .{});
-
-    const subprocess_mod = b.addModule("subprocess", .{
-        .root_source_file = b.path("src/platform/subprocess.sig"),
-        .target = target,
-        .optimize = optimize,
+    _ = try ctx.addTestStep(.{
+        .name = "test-server-initial",
+        .source_path = "src/transport/server_initial_test.sig",
+        .imports = &.{
+            importEntry("conn", "src/transport/conn.sig"), importEntry("telemetry", "src/transport/telemetry.sig"),
+            importEntry("streams", "src/transport/streams.sig"), importEntry("transport_crypto", "src/transport/crypto.sig"),
+            importEntry("packet", "src/transport/packet.sig"), importEntry("datagram", "src/transport/datagram.sig"),
+            importEntry("udp", "src/transport/udp.sig"), importEntry("win32", win32_path),
+        },
     });
 
-    // ── Granular modules (Layer 2: Render) ──
-
-    const color_mod = b.addModule("color", .{
-        .root_source_file = b.path("src/render/color.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const primitives_mod = b.addModule("primitives", .{
-        .root_source_file = b.path("src/render/primitives.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    primitives_mod.addImport("gl", gl_mod);
-    primitives_mod.addImport("color", color_mod);
-
-    const text_mod = b.addModule("text", .{
-        .root_source_file = b.path("src/render/text.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    text_mod.addImport("gl", gl_mod);
-    text_mod.addImport("win32", win32_mod);
-    text_mod.addImport("color", color_mod);
-
-    const icon_mod = b.addModule("icon", .{
-        .root_source_file = b.path("src/render/icon.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    icon_mod.addImport("gl", gl_mod);
-    icon_mod.addImport("win32", win32_mod);
-
-    const render_mod = b.addModule("render", .{
-        .root_source_file = b.path("src/render/root.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    render_mod.addImport("color", color_mod);
-    render_mod.addImport("primitives", primitives_mod);
-    render_mod.addImport("text", text_mod);
-    render_mod.addImport("icon", icon_mod);
-    if (os_tag == .windows) render_mod.linkSystemLibrary("opengl32", .{});
-    if (os_tag == .windows) render_mod.linkSystemLibrary("gdi32", .{});
-    if (os_tag == .windows) render_mod.linkSystemLibrary("user32", .{});
-
-    // ── Coarse-grained layer modules ──
-
-    const platform_mod = b.addModule("platform", .{
-        .root_source_file = b.path("src/platform/root.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    platform_mod.addImport("core", core_mod);
-    platform_mod.addImport("win32", win32_mod);
-    platform_mod.addImport("gl", gl_mod);
-    platform_mod.addImport("window", window_mod);
-    platform_mod.addImport("input", input_mod);
-    platform_mod.addImport("timer", timer_mod);
-    platform_mod.addImport("threading", threading_mod);
-    platform_mod.addImport("http", http_mod);
-    platform_mod.addImport("crypto", crypto_mod);
-    platform_mod.addImport("file_io", file_io_mod);
-    platform_mod.addImport("seqlock", seqlock_mod);
-    platform_mod.addImport("screenshot", screenshot_mod);
-    platform_mod.addImport("logging", logging_mod);
-    platform_mod.addImport("png", png_mod);
-    platform_mod.addImport("mcp", mcp_mod);
-    platform_mod.addImport("subprocess", subprocess_mod);
-    if (os_tag == .windows) { for ([_][]const u8{
-        "kernel32", "gdi32",   "user32", "shell32",
-        "opengl32", "winhttp", "bcrypt", "ws2_32",
-    }) |lib| {
-        platform_mod.linkSystemLibrary(lib, .{});
-    }
-    }
-
-    // ── Test step ──
-    // Transport module tests will be wired here as modules are added.
-    const test_step = b.step("test", "Run zpm package tests");
-
-    const ai_core_tests = b.addTest(.{ .root_module = ai_core_mod });
-    const ai_core_run = b.addRunArtifact(ai_core_tests);
-    test_step.dependOn(&ai_core_run.step);
-    const ai_core_test_step = b.step("test-ai-core", "Run portable AI core tests");
-    ai_core_test_step.dependOn(&ai_core_run.step);
-
-    const quantized_linear_tests = b.addTest(.{ .root_module = quantized_linear_mod });
-    const quantized_linear_run = b.addRunArtifact(quantized_linear_tests);
-    test_step.dependOn(&quantized_linear_run.step);
-    const quantized_linear_test_step = b.step("test-quantized-linear", "Run allocation-free quantized linear tests");
-    quantized_linear_test_step.dependOn(&quantized_linear_run.step);
-
-    const transformer_ops_tests = b.addTest(.{ .root_module = transformer_ops_mod });
-    const transformer_ops_run = b.addRunArtifact(transformer_ops_tests);
-    test_step.dependOn(&transformer_ops_run.step);
-    const transformer_ops_test_step = b.step("test-transformer-ops", "Run allocation-free transformer primitive tests");
-    transformer_ops_test_step.dependOn(&transformer_ops_run.step);
-
-    // sha256 tests
-    const sha256_tests = b.addTest(.{ .root_module = sha256_mod });
-    const sha256_run = b.addRunArtifact(sha256_tests);
-    test_step.dependOn(&sha256_run.step);
-    const sha256_test_step = b.step("test-sha256", "Run SHA-256 module tests");
-    sha256_test_step.dependOn(&sha256_run.step);
-
-    // jsonl tests
-    const jsonl_tests = b.addTest(.{ .root_module = jsonl_mod });
-    const jsonl_run = b.addRunArtifact(jsonl_tests);
-    test_step.dependOn(&jsonl_run.step);
-    const jsonl_test_step = b.step("test-jsonl", "Run JSONL module tests");
-    jsonl_test_step.dependOn(&jsonl_run.step);
-
-    // subprocess tests
-    const subprocess_tests = b.addTest(.{ .root_module = subprocess_mod });
-    const subprocess_run = b.addRunArtifact(subprocess_tests);
-    test_step.dependOn(&subprocess_run.step);
-    const subprocess_test_step = b.step("test-subprocess", "Run subprocess module tests");
-    subprocess_test_step.dependOn(&subprocess_run.step);
-
-    // ── Granular modules (Layer 1: Transport) ──
-
-    const udp_mod = b.addModule("udp", .{
-        .root_source_file = b.path("src/transport/udp.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    udp_mod.addImport("win32", win32_mod);
-    if (os_tag == .windows) udp_mod.linkSystemLibrary("ws2_32", .{});
-    if (os_tag == .windows) udp_mod.linkSystemLibrary("kernel32", .{});
-
-    const packet_mod = b.addModule("packet", .{
-        .root_source_file = b.path("src/transport/packet.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const transport_crypto_mod = b.addModule("transport_crypto", .{
-        .root_source_file = b.path("src/transport/crypto.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    transport_crypto_mod.addImport("win32", win32_mod);
-    transport_crypto_mod.addImport("packet", packet_mod);
-    transport_crypto_mod.addImport("crypto", crypto_mod);
-    if (os_tag == .windows) transport_crypto_mod.linkSystemLibrary("bcrypt", .{});
-    if (os_tag == .windows) transport_crypto_mod.linkSystemLibrary("secur32", .{});
-    if (os_tag == .windows) transport_crypto_mod.linkSystemLibrary("kernel32", .{});
-
-    const tls13_mod = b.addModule("tls13", .{
-        .root_source_file = b.path("src/transport/tls13.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    _ = tls13_mod; // Used by linux_platform.sig via direct file import
-
-    const recovery_mod = b.addModule("recovery", .{
-        .root_source_file = b.path("src/transport/recovery.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    recovery_mod.addImport("packet", packet_mod);
-
-    const streams_mod = b.addModule("streams", .{
-        .root_source_file = b.path("src/transport/streams.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    streams_mod.addImport("packet", packet_mod);
-
-    const crypto_stream_mod = b.addModule("crypto_stream", .{
-        .root_source_file = b.path("src/transport/crypto_stream.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-        const datagram_mod = b.addModule("datagram", .{
-        .root_source_file = b.path("src/transport/datagram.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    datagram_mod.addImport("packet", packet_mod);
-
-    const telemetry_mod = b.addModule("telemetry", .{
-        .root_source_file = b.path("src/transport/telemetry.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const conn_mod = b.addModule("conn", .{
-        .root_source_file = b.path("src/transport/conn.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    conn_mod.addImport("win32", win32_mod);
-    conn_mod.addImport("packet", packet_mod);
-    conn_mod.addImport("transport_crypto", transport_crypto_mod);
-    conn_mod.addImport("recovery", recovery_mod);
-    conn_mod.addImport("streams", streams_mod);
-    conn_mod.addImport("datagram", datagram_mod);
-    conn_mod.addImport("telemetry", telemetry_mod);
-    conn_mod.addImport("udp", udp_mod);
-    conn_mod.addImport("crypto_stream", crypto_stream_mod);
-    if (os_tag == .windows) conn_mod.linkSystemLibrary("ws2_32", .{});
-    if (os_tag == .windows) conn_mod.linkSystemLibrary("bcrypt", .{});
-    if (os_tag == .windows) conn_mod.linkSystemLibrary("secur32", .{});
-    if (os_tag == .windows) conn_mod.linkSystemLibrary("kernel32", .{});
-
-    const scheduler_mod = b.addModule("scheduler", .{
-        .root_source_file = b.path("src/transport/scheduler.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    scheduler_mod.addImport("win32", win32_mod);
-    scheduler_mod.addImport("packet", packet_mod);
-    scheduler_mod.addImport("streams", streams_mod);
-    scheduler_mod.addImport("datagram", datagram_mod);
-    scheduler_mod.addImport("recovery", recovery_mod);
-    scheduler_mod.addImport("transport_crypto", transport_crypto_mod);
-    scheduler_mod.addImport("udp", udp_mod);
-    scheduler_mod.addImport("telemetry", telemetry_mod);
-    if (os_tag == .windows) scheduler_mod.linkSystemLibrary("kernel32", .{});
-    if (os_tag == .windows) scheduler_mod.linkSystemLibrary("ws2_32", .{});
-    if (os_tag == .windows) scheduler_mod.linkSystemLibrary("bcrypt", .{});
-    if (os_tag == .windows) scheduler_mod.linkSystemLibrary("secur32", .{});
-
-    const appmap_mod = b.addModule("appmap", .{
-        .root_source_file = b.path("src/transport/appmap.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    appmap_mod.addImport("streams", streams_mod);
-    appmap_mod.addImport("datagram", datagram_mod);
-    appmap_mod.addImport("packet", packet_mod);
-
-    // ── Coarse-grained transport module ──
-
-    const transport_mod = b.addModule("transport", .{
-        .root_source_file = b.path("src/transport/root.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    transport_mod.addImport("udp", udp_mod);
-    transport_mod.addImport("packet", packet_mod);
-    transport_mod.addImport("transport_crypto", transport_crypto_mod);
-    transport_mod.addImport("recovery", recovery_mod);
-    transport_mod.addImport("streams", streams_mod);
-    transport_mod.addImport("datagram", datagram_mod);
-    transport_mod.addImport("scheduler", scheduler_mod);
-    transport_mod.addImport("conn", conn_mod);
-    transport_mod.addImport("telemetry", telemetry_mod);
-    transport_mod.addImport("appmap", appmap_mod);
-    if (os_tag == .windows) { for ([_][]const u8{
-        "ws2_32", "bcrypt", "secur32", "kernel32",
-    }) |lib| {
-        transport_mod.linkSystemLibrary(lib, .{});
-    }
-    }
-
-    // ── Test wiring ──
-    // Each test reuses the existing module to avoid duplicating the dependency graph.
-    // A helper creates the test + run artifact once, then wires it to both the
-    // aggregate "test" step and a standalone step.
-
-    // udp tests
-    const udp_tests = b.addTest(.{ .root_module = udp_mod });
-    const udp_run = b.addRunArtifact(udp_tests);
-    test_step.dependOn(&udp_run.step);
-
-    // packet tests
-    const packet_tests = b.addTest(.{ .root_module = packet_mod });
-    const packet_run = b.addRunArtifact(packet_tests);
-    test_step.dependOn(&packet_run.step);
-
-    // transport_crypto tests
-    const transport_crypto_tests = b.addTest(.{ .root_module = transport_crypto_mod });
-    const transport_crypto_run = b.addRunArtifact(transport_crypto_tests);
-    test_step.dependOn(&transport_crypto_run.step);
-
-    // recovery tests
-    const recovery_tests = b.addTest(.{ .root_module = recovery_mod });
-    const recovery_run = b.addRunArtifact(recovery_tests);
-    test_step.dependOn(&recovery_run.step);
-    const recovery_test_step = b.step("test-recovery", "Run recovery module tests");
-    recovery_test_step.dependOn(&recovery_run.step);
-
-    // streams tests
-    const streams_tests = b.addTest(.{ .root_module = streams_mod });
-    streams_tests.stack_size = 16 * 1024 * 1024;
-    const streams_run = b.addRunArtifact(streams_tests);
-    test_step.dependOn(&streams_run.step);
-    const streams_test_step = b.step("test-streams", "Run streams module tests");
-    streams_test_step.dependOn(&streams_run.step);
-
-    // datagram tests
-    const datagram_tests = b.addTest(.{ .root_module = datagram_mod });
-    const datagram_run = b.addRunArtifact(datagram_tests);
-    test_step.dependOn(&datagram_run.step);
-    const datagram_test_step = b.step("test-datagram", "Run datagram module tests");
-    datagram_test_step.dependOn(&datagram_run.step);
-
-    // telemetry tests
-    const telemetry_tests = b.addTest(.{ .root_module = telemetry_mod });
-    const telemetry_run = b.addRunArtifact(telemetry_tests);
-    test_step.dependOn(&telemetry_run.step);
-    const telemetry_test_step = b.step("test-telemetry", "Run telemetry module tests");
-    telemetry_test_step.dependOn(&telemetry_run.step);
-
-    // conn tests
-    const conn_tests = b.addTest(.{ .root_module = conn_mod });
-    conn_tests.stack_size = 16 * 1024 * 1024;
-    const conn_run = b.addRunArtifact(conn_tests);
-    test_step.dependOn(&conn_run.step);
-    const conn_test_step = b.step("test-conn", "Run conn module tests");
-    conn_test_step.dependOn(&conn_run.step);
-
-    // scheduler tests
-    const scheduler_tests = b.addTest(.{ .root_module = scheduler_mod });
-    scheduler_tests.stack_size = 16 * 1024 * 1024;
-    const scheduler_run = b.addRunArtifact(scheduler_tests);
-    test_step.dependOn(&scheduler_run.step);
-    const scheduler_test_step = b.step("test-scheduler", "Run scheduler module tests");
-    scheduler_test_step.dependOn(&scheduler_run.step);
-
-    // appmap tests
-    const appmap_tests = b.addTest(.{ .root_module = appmap_mod });
-    appmap_tests.stack_size = 16 * 1024 * 1024;
-    const appmap_run = b.addRunArtifact(appmap_tests);
-    test_step.dependOn(&appmap_run.step);
-    const appmap_test_step = b.step("test-appmap", "Run appmap module tests");
-    appmap_test_step.dependOn(&appmap_run.step);
-
-    // no-allocator compliance property test
-    const no_alloc_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/transport/no_alloc_test.sig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const no_alloc_run = b.addRunArtifact(no_alloc_tests);
-    test_step.dependOn(&no_alloc_run.step);
-    const no_alloc_test_step = b.step("test-no-alloc", "Run no-allocator compliance property test");
-    no_alloc_test_step.dependOn(&no_alloc_run.step);
-
-    // comptime buffer sizes compliance property test
-    const comptime_sizes_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/transport/comptime_sizes_test.sig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    comptime_sizes_tests.stack_size = 16 * 1024 * 1024;
-    const comptime_sizes_run = b.addRunArtifact(comptime_sizes_tests);
-    test_step.dependOn(&comptime_sizes_run.step);
-    const comptime_sizes_test_step = b.step("test-comptime-sizes", "Run comptime buffer sizes compliance property test");
-    comptime_sizes_test_step.dependOn(&comptime_sizes_run.step);
-
-    // layer hierarchy compliance property test
-    const layer_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/transport/layer_test.sig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    layer_tests.stack_size = 16 * 1024 * 1024;
-    const layer_run = b.addRunArtifact(layer_tests);
-    test_step.dependOn(&layer_run.step);
-    const layer_test_step = b.step("test-layer", "Run transport module layer hierarchy compliance property test");
-    layer_test_step.dependOn(&layer_run.step);
-
-    // domain-agnostic compliance property test
-    const domain_agnostic_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/transport/domain_agnostic_test.sig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const domain_agnostic_run = b.addRunArtifact(domain_agnostic_tests);
-    test_step.dependOn(&domain_agnostic_run.step);
-    const domain_agnostic_test_step = b.step("test-domain-agnostic", "Run domain-agnostic compliance property test");
-    domain_agnostic_test_step.dependOn(&domain_agnostic_run.step);
-
-    // shared source files compliance property test
-    const shared_source_mod = b.createModule(.{
-        .root_source_file = b.path("src/transport/shared_source_test.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    shared_source_mod.addAnonymousImport("build_embed", .{
-        .root_source_file = b.path("build_embed.sig"),
-    });
-    const shared_source_tests = b.addTest(.{
-        .root_module = shared_source_mod,
-    });
-    shared_source_tests.stack_size = 16 * 1024 * 1024;
-    const shared_source_run = b.addRunArtifact(shared_source_tests);
-    test_step.dependOn(&shared_source_run.step);
-    const shared_source_test_step = b.step("test-shared-source", "Run no shared source files compliance property test");
-    shared_source_test_step.dependOn(&shared_source_run.step);
-
-    // integration tests (full client-server handshake over loopback UDP)
-    const integration_mod = b.createModule(.{
-        .root_source_file = b.path("src/transport/integration_test.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    integration_mod.addImport("conn", conn_mod);
-    integration_mod.addImport("telemetry", telemetry_mod);
-    integration_mod.addImport("streams", streams_mod);
-    integration_mod.addImport("transport_crypto", transport_crypto_mod);
-    integration_mod.addImport("packet", packet_mod);
-    integration_mod.addImport("recovery", recovery_mod);
-    integration_mod.addImport("datagram", datagram_mod);
-    integration_mod.addImport("udp", udp_mod);
-    integration_mod.addImport("win32", win32_mod);
-    integration_mod.addImport("appmap", appmap_mod);
-    if (os_tag == .windows) { for ([_][]const u8{
-        "ws2_32", "bcrypt", "secur32", "kernel32",
-    }) |lib| {
-        integration_mod.linkSystemLibrary(lib, .{});
-    }
-    }
-    const integration_tests = b.addTest(.{
-        .root_module = integration_mod,
-    });
-    integration_tests.stack_size = 16 * 1024 * 1024;
-    const integration_run = b.addRunArtifact(integration_tests);
-    const integration_test_step = b.step("test-integration", "Run QUIC transport integration tests");
-    integration_test_step.dependOn(&integration_run.step);
-
-    // server Initial reception tests (proves the idle→handshaking bug fix)
-    const server_initial_mod = b.createModule(.{
-        .root_source_file = b.path("src/transport/server_initial_test.sig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    server_initial_mod.addImport("conn", conn_mod);
-    server_initial_mod.addImport("telemetry", telemetry_mod);
-    server_initial_mod.addImport("streams", streams_mod);
-    server_initial_mod.addImport("transport_crypto", transport_crypto_mod);
-    server_initial_mod.addImport("packet", packet_mod);
-    server_initial_mod.addImport("datagram", datagram_mod);
-    server_initial_mod.addImport("udp", udp_mod);
-    server_initial_mod.addImport("win32", win32_mod);
-    if (os_tag == .windows) { for ([_][]const u8{
-        "ws2_32", "bcrypt", "secur32", "kernel32",
-    }) |lib| {
-        server_initial_mod.linkSystemLibrary(lib, .{});
-    }
-    }
-    const server_initial_tests = b.addTest(.{
-        .root_module = server_initial_mod,
-    });
-    server_initial_tests.stack_size = 16 * 1024 * 1024;
-    const server_initial_run = b.addRunArtifact(server_initial_tests);
-    const server_initial_test_step = b.step("test-server-initial", "Run server Initial packet reception tests (idle→handshaking fix)");
-    server_initial_test_step.dependOn(&server_initial_run.step);
 }
