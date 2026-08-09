@@ -10,10 +10,11 @@ permissions:
   contents: read
 
 env:
-  SIG_RELEASE_TAG: bootstrap-sig-v28
-  # The bootstrap binary is only the stage-0 executable. Build semantics come
-  # from this exact reviewed Sig source revision so CI cannot drift with a tag
-  # or silently use an older runner/library layout.
+  SIG_RELEASE_TAG: sig-0.2.0-zig0.17.0.3384d7a
+  SIG_RELEASE_ASSET: sig-0.2.0-zig0.17.0.3384d7a-x86_64-linux.tar.xz
+  SIG_RELEASE_SHA256: aed3d098ba7eefc6aa053d1a05730a2ccc34e04b3156a7c9f54dadf9d340556d
+  # The compiler and standard library remain the tested atomic release pair.
+  # Only the bounded build runner is overlaid from this reviewed revision.
   SIG_SOURCE_REF: e7cae806dceed3473c63029b83aff1a89f7478dc
 
 jobs:
@@ -21,6 +22,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo rm -rf /usr/local/graalvm /usr/local/.ghcup /usr/local/share/powershell
+          sudo rm -rf /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go
+          sudo apt-get clean
+
       - uses: actions/checkout@v4
 
       - name: Install canonical Sig toolchain
@@ -31,26 +39,27 @@ jobs:
           ASSET_URL=$(gh release view "$SIG_RELEASE_TAG" \
             --repo "${{ github.repository_owner }}/sig" \
             --json assets \
-            --jq '.assets[] | select(.name | startswith("bootstrap-sig-x86_64-linux")) | .url')
+            --jq ".assets[] | select(.name == \"$SIG_RELEASE_ASSET\") | .url")
           test -n "$ASSET_URL"
-          curl -fsSL "$ASSET_URL" -o /tmp/sig.tar.gz
+          curl -fsSL "$ASSET_URL" -o "/tmp/$SIG_RELEASE_ASSET"
+          echo "$SIG_RELEASE_SHA256  /tmp/$SIG_RELEASE_ASSET" | sha256sum -c -
           mkdir -p /tmp/sig
-          tar -xf /tmp/sig.tar.gz -C /tmp/sig
+          tar -xf "/tmp/$SIG_RELEASE_ASSET" -C /tmp/sig
           SIG_BIN=$(find /tmp/sig -type f -name sig -perm -u+x | head -1)
           test -n "$SIG_BIN"
           SIG_PREFIX=$(dirname "$(dirname "$SIG_BIN")")
 
-          # Current bootstrap archives predate the canonical sibling tools/
-          # layout. Materialize an immutable reviewed source tree without a
-          # Zig fallback; future archives already contain this layout.
+          # Preserve the release's compiler/lib epoch and overlay only the
+          # immutable native build runner. Mixing current std/compiler_rt with
+          # an older compiler is invalid even when both report Zig 0.17.
           git init -q /tmp/sig-repo
           git -C /tmp/sig-repo remote add origin \
             "https://github.com/${{ github.repository_owner }}/sig.git"
           git -C /tmp/sig-repo fetch -q --depth 1 origin "$SIG_SOURCE_REF"
           git -C /tmp/sig-repo checkout -q --detach FETCH_HEAD
           test "$(git -C /tmp/sig-repo rev-parse HEAD)" = "$SIG_SOURCE_REF"
-          mkdir -p "$SIG_PREFIX/lib" "$SIG_PREFIX/tools"
-          cp -a /tmp/sig-repo/lib/. "$SIG_PREFIX/lib/"
+          test -f "$SIG_PREFIX/lib/std/std.zig"
+          mkdir -p "$SIG_PREFIX/tools"
           cp -a /tmp/sig-repo/tools/sig_build "$SIG_PREFIX/tools/"
 
           echo "SIG=$SIG_BIN" >> "$GITHUB_ENV"
