@@ -151,7 +151,7 @@ app.sendResolveRequest(scope, name, version);
 
 ## Official @zpm/ Packages
 
-34 packages derived from the existing zpm module library.
+35 packages derived from the existing zpm module library.
 
 ### Layer 0 — Core
 
@@ -160,6 +160,7 @@ app.sendResolveRequest(scope, name, version);
 | `@zpm/core` | Core data types, storage, and logic |
 | `@zpm/math` | Sin/cos approximations, lerp, interpolation, pure math |
 | `@zpm/json` | Minimal JSON parser |
+| `@zpm/ai-core` | Caller-owned arenas, tensor bounds, deadline scheduling, device interfaces, and copy-on-write pages |
 
 ### Layer 1 — Platform
 

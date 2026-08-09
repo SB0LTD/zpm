@@ -32,6 +32,22 @@ pub fn build(b: *std.Build) void {
     });
     jsonl_mod.addImport("json", json_mod);
 
+    const ai_core_mod = b.addModule("ai_core", .{
+        .root_source_file = b.path("src/core/ai_core.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const quantized_linear_mod = b.addModule("quantized_linear", .{
+        .root_source_file = b.path("src/core/quantized_linear.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const transformer_ops_mod = b.addModule("transformer_ops", .{
+        .root_source_file = b.path("src/core/transformer_ops.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const core_mod = b.addModule("core", .{
         .root_source_file = b.path("src/core/root.sig"),
         .target = target,
@@ -41,6 +57,9 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("json", json_mod);
     core_mod.addImport("sha256", sha256_mod);
     core_mod.addImport("jsonl", jsonl_mod);
+    core_mod.addImport("ai_core", ai_core_mod);
+    core_mod.addImport("quantized_linear", quantized_linear_mod);
+    core_mod.addImport("transformer_ops", transformer_ops_mod);
 
     // ── Granular modules (Layer 1: Platform) ──
     // Ordered so that dependencies are declared before dependents.
@@ -261,6 +280,24 @@ pub fn build(b: *std.Build) void {
     // ── Test step ──
     // Transport module tests will be wired here as modules are added.
     const test_step = b.step("test", "Run zpm package tests");
+
+    const ai_core_tests = b.addTest(.{ .root_module = ai_core_mod });
+    const ai_core_run = b.addRunArtifact(ai_core_tests);
+    test_step.dependOn(&ai_core_run.step);
+    const ai_core_test_step = b.step("test-ai-core", "Run portable AI core tests");
+    ai_core_test_step.dependOn(&ai_core_run.step);
+
+    const quantized_linear_tests = b.addTest(.{ .root_module = quantized_linear_mod });
+    const quantized_linear_run = b.addRunArtifact(quantized_linear_tests);
+    test_step.dependOn(&quantized_linear_run.step);
+    const quantized_linear_test_step = b.step("test-quantized-linear", "Run allocation-free quantized linear tests");
+    quantized_linear_test_step.dependOn(&quantized_linear_run.step);
+
+    const transformer_ops_tests = b.addTest(.{ .root_module = transformer_ops_mod });
+    const transformer_ops_run = b.addRunArtifact(transformer_ops_tests);
+    test_step.dependOn(&transformer_ops_run.step);
+    const transformer_ops_test_step = b.step("test-transformer-ops", "Run allocation-free transformer primitive tests");
+    transformer_ops_test_step.dependOn(&transformer_ops_run.step);
 
     // sha256 tests
     const sha256_tests = b.addTest(.{ .root_module = sha256_mod });

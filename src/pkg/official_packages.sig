@@ -1,4 +1,4 @@
-// Official @zpm/ package map — canonical source of truth for all 34 packages.
+// Official @zpm/ package map — canonical source of truth for all packages.
 //
 // This comptime data structure defines every official package's metadata:
 // scope, name, version, layer, platform, system libraries, and zpm dependencies.
@@ -54,6 +54,17 @@ pub const packages = [_]OfficialPackage{
         .zpm_dependencies = &.{ "math", "json" },
         .description = "Core data types, storage, and logic",
         .source = "src/core/root.sig",
+    },
+    .{
+        .scope = "zpm",
+        .name = "ai-core",
+        .version = "0.1.0",
+        .layer = 0,
+        .platform = .any,
+        .system_libraries = &.{},
+        .zpm_dependencies = &.{},
+        .description = "Caller-owned arenas, tensor bounds, AI job scheduling, device interfaces, and copy-on-write pages",
+        .source = "src/core/ai_core.sig",
     },
     // ── Layer 1: Platform ──
     .{
@@ -447,8 +458,8 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 const testing = @import("std").testing;
 
-test "official_packages: exactly 34 packages" {
-    try testing.expectEqual(@as(usize, 34), package_count);
+test "official_packages: expected package count" {
+    try testing.expectEqual(@as(usize, 35), package_count);
 }
 
 test "official_packages: layer 0 packages have no platform dependencies" {
@@ -460,8 +471,9 @@ test "official_packages: layer 0 packages have no platform dependencies" {
     }
 }
 
-test "official_packages: layer 0 has 3 packages (core, math, json)" {
-    try testing.expectEqual(@as(usize, 3), layer_0_count);
+test "official_packages: layer 0 includes portable AI foundations" {
+    try testing.expectEqual(@as(usize, 4), layer_0_count);
+    try testing.expect(findByName("ai-core") != null);
 }
 
 test "official_packages: findByName returns correct package" {
