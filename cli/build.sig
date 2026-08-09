@@ -159,6 +159,9 @@ pub fn build(b: *std.Build) void {
     // init.sig — project scaffolding tests
     TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/init.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
 
+    // init_fs_test.sig — real filesystem scaffold smoke tests
+    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/init_fs_test.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
+
     // zon.sig — build.sig.zon manipulation tests
     TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/zon.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
 
@@ -173,6 +176,9 @@ pub fn build(b: *std.Build) void {
 
     // validator.sig — layer/constraint validation tests
     TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/validator.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
+
+    // scanner.sig — build.sig/source scanner tests
+    TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/scanner.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);
 
     // resolver.sig — dependency resolution tests
     TestHelper.addPkgTest(b, test_step, b.path("../src/pkg/resolver.sig"), target, optimize, conn_mod, appmap_mod, streams_mod, datagram_mod, telemetry_mod, win32_mod);

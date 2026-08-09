@@ -12,6 +12,7 @@ const validator = @import("validator.sig");
 const registry = @import("registry.sig");
 const names = @import("names.sig");
 const manifest = @import("manifest.sig");
+const scanner = @import("scanner.sig");
 const bootstrap = @import("bootstrap.sig");
 const init_mod = @import("init.sig");
 
@@ -444,8 +445,19 @@ pub fn validateCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) Command
         }
     }
 
-    // Run layer validator (with empty inputs — real impl would scan build.sig and sources)
-    const val_result = validator.validate(&parsed_manifest, &.{}, &.{}, &.{}, &.{});
+    var build_syslibs_buf: [128][]const u8 = undefined;
+    var build_modules_buf: [128][]const u8 = undefined;
+    var build_syslibs: []const []const u8 = &.{};
+    var build_modules: []const []const u8 = &.{};
+    var build_buf: [max_zon_buf]u8 = undefined;
+    if (ctx.read_file("build.sig", &build_buf)) |build_source| {
+        const syslib_count = scanner.extractSystemLibraries(build_source, &build_syslibs_buf);
+        const module_count = scanner.extractModuleNames(build_source, &build_modules_buf);
+        build_syslibs = build_syslibs_buf[0..syslib_count];
+        build_modules = build_modules_buf[0..module_count];
+    }
+
+    const val_result = validator.validate(&parsed_manifest, &.{}, build_syslibs, &.{}, build_modules);
     if (!val_result.ok()) {
         has_errors = true;
         for (val_result.slice()) |err| {
@@ -833,7 +845,7 @@ pub fn initCmd(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandR
     const template = init_mod.Template.fromString(template_str) orelse {
         ctx.stderr("init: unknown template '");
         ctx.stderr(template_str);
-        ctx.stderr("'\navailable templates: empty, window, gl-app, trading, package, cli-app, web-server, gui-app, library\n");
+        ctx.stderr("'\navailable templates: empty, window, gl-app, trading, package, cli-app, web-server, gui-app, library, browser\n");
         return .not_found;
     };
 
@@ -1165,6 +1177,32 @@ const invalid_manifest_zon =
     \\}
 ;
 
+const exported_manifest_zon =
+    \\.{
+    \\    .protocol_version = 1,
+    \\    .scope = "sb0",
+    \\    .name = "sig-browser",
+    \\    .version = "0.1.0",
+    \\    .layer = 2,
+    \\    .platform = .any,
+    \\    .exports = .{ "sig_browser", "url", "browser" },
+    \\    .constraints = .{
+    \\        .no_allocator = true,
+    \\        .no_std_io = true,
+    \\    },
+    \\}
+;
+
+const exported_build_sig =
+    \\const std = @import("std");
+    \\
+    \\pub fn build(b: *std.Build) void {
+    \\    _ = b.addModule("url", .{});
+    \\    _ = b.addModule("browser", .{});
+    \\    _ = b.addModule("sig_browser", .{});
+    \\}
+;
+
 // ── Helper to build test context ──
 
 fn testContext(reg: *const registry.RegistryClient, fetch_fn: ?resolver.FetchFn) CommandContext {
@@ -1347,6 +1385,47 @@ test "validate: valid manifest reports success without modifying files" {
     try testing.expectEqual(CommandResult.success, result);
     try testing.expect(mock_write_calls == 0); // No file modifications!
     try testing.expect(std.mem.indexOf(u8, getStdout(), "is valid") != null);
+}
+
+test "validate: exported manifest matches build.sig modules" {
+    resetMocks();
+    MockHttp.reset();
+    addMockFile("zpm.pkg.zon", exported_manifest_zon);
+    addMockFile("build.sig", exported_build_sig);
+
+    const reg = testRegistryClient(false);
+    const ctx = testContext(&reg, null);
+
+    var args = cli.ParsedArgs{};
+    args.command = .validate;
+
+    const result = validateCmd(&ctx, &args);
+    try testing.expectEqual(CommandResult.success, result);
+    try testing.expect(mock_write_calls == 0);
+    try testing.expect(std.mem.indexOf(u8, getStdout(), "is valid") != null);
+}
+
+test "validate: exported manifest fails when build.sig is missing export module" {
+    resetMocks();
+    MockHttp.reset();
+    addMockFile("zpm.pkg.zon", exported_manifest_zon);
+    addMockFile("build.sig",
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b.addModule("url", .{});
+        \\}
+    );
+
+    const reg = testRegistryClient(false);
+    const ctx = testContext(&reg, null);
+
+    var args = cli.ParsedArgs{};
+    args.command = .validate;
+
+    const result = validateCmd(&ctx, &args);
+    try testing.expectEqual(CommandResult.validation_failed, result);
+    try testing.expect(mock_write_calls == 0);
+    try testing.expect(std.mem.indexOf(u8, getStderr(), "export_mismatch") != null);
 }
 
 test "validate: invalid manifest reports errors without modifying files" {

@@ -17,6 +17,7 @@ pub const Template = enum {
     web_server,
     gui_app,
     library,
+    browser,
 
     pub fn fromString(s: []const u8) ?Template {
         const map = .{
@@ -33,6 +34,7 @@ pub const Template = enum {
             .{ "gui-app", Template.gui_app },
             .{ "gui_app", Template.gui_app },
             .{ "library", Template.library },
+            .{ "browser", Template.browser },
         };
         inline for (map) |entry| {
             if (strEql(s, entry[0])) return entry[1];
@@ -51,13 +53,14 @@ pub const Template = enum {
             .web_server => "web-server",
             .gui_app => "gui-app",
             .library => "library",
+            .browser => "browser",
         };
     }
 };
 
 pub const available_templates = [_][]const u8{
     "empty",   "window",     "gl-app",  "trading", "package",
-    "cli-app", "web-server", "gui-app", "library",
+    "cli-app", "web-server", "gui-app", "library", "browser",
 };
 
 pub const InitConfig = struct {
@@ -132,7 +135,7 @@ pub fn scaffold(vtable: *const InitVtable, config: *const InitConfig) InitResult
         return .failed;
     }
 
-    // Step 5: Create src/ dir and generate src/main.sig (or src/root.sig for package)
+    // Step 5: Create src/ dir and generate src/main.sig (or src/root.sig for package-like templates)
     var src_path_buf: [512]u8 = undefined;
     const src_dir = joinPath(project, "src", &src_path_buf) orelse {
         cleanup(vtable, project);
@@ -144,7 +147,7 @@ pub fn scaffold(vtable: *const InitVtable, config: *const InitConfig) InitResult
     }
 
     var main_buf: [4096]u8 = undefined;
-    const src_filename = if (tmpl == .package or tmpl == .library) "src/root.sig" else "src/main.sig";
+    const src_filename = if (tmpl == .package or tmpl == .library or tmpl == .browser) "src/root.sig" else "src/main.sig";
     const main_content = generateMainZig(project, tmpl, &main_buf) orelse {
         cleanup(vtable, project);
         return .failed;
@@ -171,14 +174,20 @@ pub fn scaffold(vtable: *const InitVtable, config: *const InitConfig) InitResult
         return .failed;
     }
 
-    // Step 10: For package template, generate zpm.pkg.zon
-    if (tmpl == .package) {
+    // Step 10: For publishable package templates, generate zpm.pkg.zon
+    if (tmpl == .package or tmpl == .browser) {
         var pkg_buf: [2048]u8 = undefined;
-        const pkg_content = generateZpmPkgZon(project, config.package_layer orelse 0, &pkg_buf) orelse {
-            cleanup(vtable, project);
-            return .failed;
-        };
-        if (!writeProjectFile(vtable, project, "zpm.pkg.zon", pkg_content)) {
+        const pkg_source = if (tmpl == .browser)
+            generateBrowserZpmPkgZon(project, &pkg_buf) orelse {
+                cleanup(vtable, project);
+                return .failed;
+            }
+        else
+            generateZpmPkgZon(project, config.package_layer orelse 0, &pkg_buf) orelse {
+                cleanup(vtable, project);
+                return .failed;
+            };
+        if (!writeProjectFile(vtable, project, "zpm.pkg.zon", pkg_source)) {
             cleanup(vtable, project);
             return .failed;
         }
@@ -259,6 +268,7 @@ fn generateBuildZigZon(project_name: []const u8, tmpl: Template, buf: *[4096]u8)
         .web_server => build_zig_zon_web_server,
         .gui_app => build_zig_zon_gui_app,
         .library => build_zig_zon_library,
+        .browser => build_zig_zon_browser,
     };
     return replacePlaceholder(template_str, project_name, buf);
 }
@@ -536,6 +546,23 @@ const build_zig_zon_library =
     \\
 ;
 
+const build_zig_zon_browser =
+    \\.{
+    \\    .name = .@"{{project_name}}",
+    \\    .version = "0.1.0",
+    \\    .minimum_zig_version = "0.16.0",
+    \\    .dependencies = .{},
+    \\    .paths = .{
+    \\        "build.sig",
+    \\        "build.sig.zon",
+    \\        "zpm.pkg.zon",
+    \\        "src",
+    \\        "README.md",
+    \\    },
+    \\}
+    \\
+;
+
 // ── build.sig Generator ──
 
 fn generateBuildZig(project_name: []const u8, tmpl: Template, buf: *[8192]u8) ?[]const u8 {
@@ -549,6 +576,7 @@ fn generateBuildZig(project_name: []const u8, tmpl: Template, buf: *[8192]u8) ?[
         .web_server => build_zig_web_server,
         .gui_app => build_zig_gui_app,
         .library => build_zig_library,
+        .browser => build_sig_browser,
     };
     return replacePlaceholder(template_str, project_name, buf);
 }
@@ -871,6 +899,39 @@ const build_zig_library =
     \\
 ;
 
+const build_sig_browser =
+    \\const sig_build = @import("sig_build");
+    \\
+    \\fn testAll(ctx: *sig_build.Step_Context) sig_build.SigError!void {
+    \\    const build_ctx = ctx.build_ctx;
+    \\    const compiler = if (ctx.compiler_path.len > 0) ctx.compiler_path else "sig";
+    \\    var cmd: sig_build.Command_Buffer = .{};
+    \\    try cmd.appendArg(compiler);
+    \\    try cmd.appendArg("test");
+    \\    try cmd.appendArg("src/root.sig");
+    \\    try cmd.appendArg("--cache-dir");
+    \\    try cmd.appendArg(build_ctx.cache_dir[0..build_ctx.cache_dir_len]);
+    \\    if (build_ctx.zig_lib_dir_len > 0) {
+    \\        try cmd.appendArg("--zig-lib-dir");
+    \\        try cmd.appendArg(build_ctx.zig_lib_dir[0..build_ctx.zig_lib_dir_len]);
+    \\    }
+    \\
+    \\    var stderr_buf: [sig_build.STDERR_CAPTURE_SIZE]u8 = undefined;
+    \\    var stderr_len: usize = 0;
+    \\    const exit_code = try sig_build.runCommand(&cmd, &stderr_buf, &stderr_len, ctx.io);
+    \\    if (exit_code != 0) {
+    \\        sig_build.printMsg(ctx.io, "sig test failed: {s}", .{stderr_buf[0..stderr_len]});
+    \\        return error.BufferTooSmall;
+    \\    }
+    \\}
+    \\
+    \\pub fn build(ctx: *sig_build.Build_Context) !void {
+    \\    _ = try ctx.addModule("browser", "src/root.sig");
+    \\    _ = try ctx.addStep("test", "Run browser package tests", &testAll);
+    \\}
+    \\
+;
+
 // ── src/main.sig (or src/root.sig) Generator ──
 
 fn generateMainZig(project_name: []const u8, tmpl: Template, buf: *[4096]u8) ?[]const u8 {
@@ -884,6 +945,7 @@ fn generateMainZig(project_name: []const u8, tmpl: Template, buf: *[4096]u8) ?[]
         .web_server => main_zig_web_server,
         .gui_app => main_zig_gui_app,
         .library => main_zig_library,
+        .browser => main_sig_browser,
     };
     return replacePlaceholder(template_str, project_name, buf);
 }
@@ -1062,6 +1124,92 @@ const main_zig_library =
     \\
 ;
 
+const main_sig_browser =
+    \\pub const Url = struct {
+    \\    scheme: []const u8 = "",
+    \\    host: []const u8 = "",
+    \\    path: []const u8 = "/",
+    \\
+    \\    pub fn parse(input: []const u8) ?Url {
+    \\        const marker = "://";
+    \\        var marker_pos: ?usize = null;
+    \\        var i: usize = 0;
+    \\        while (i + marker.len <= input.len) : (i += 1) {
+    \\            if (eql(input[i .. i + marker.len], marker)) {
+    \\                marker_pos = i;
+    \\                break;
+    \\            }
+    \\        }
+    \\        const split = marker_pos orelse return null;
+    \\        var path_start = input.len;
+    \\        i = split + marker.len;
+    \\        while (i < input.len) : (i += 1) {
+    \\            if (input[i] == '/') {
+    \\                path_start = i;
+    \\                break;
+    \\            }
+    \\        }
+    \\        return .{
+    \\            .scheme = input[0..split],
+    \\            .host = input[split + marker.len .. path_start],
+    \\            .path = if (path_start < input.len) input[path_start..] else "/",
+    \\        };
+    \\    }
+    \\};
+    \\
+    \\pub const Document = struct {
+    \\    title: []const u8 = "",
+    \\    body: []const u8 = "",
+    \\};
+    \\
+    \\pub const Page = struct {
+    \\    url: Url,
+    \\    document: Document,
+    \\};
+    \\
+    \\pub fn loadStatic(raw_url: []const u8, html: []const u8) ?Page {
+    \\    const url = Url.parse(raw_url) orelse return null;
+    \\    return .{ .url = url, .document = .{ .title = titleFromHtml(html), .body = html } };
+    \\}
+    \\
+    \\fn titleFromHtml(html: []const u8) []const u8 {
+    \\    const open = "<title>";
+    \\    const close = "</title>";
+    \\    const start = indexOf(html, open) orelse return "";
+    \\    const body_start = start + open.len;
+    \\    const end_rel = indexOf(html[body_start..], close) orelse return "";
+    \\    return html[body_start .. body_start + end_rel];
+    \\}
+    \\
+    \\fn indexOf(haystack: []const u8, needle: []const u8) ?usize {
+    \\    if (needle.len == 0 or haystack.len < needle.len) return null;
+    \\    var i: usize = 0;
+    \\    while (i + needle.len <= haystack.len) : (i += 1) {
+    \\        if (eql(haystack[i .. i + needle.len], needle)) return i;
+    \\    }
+    \\    return null;
+    \\}
+    \\
+    \\fn eql(a: []const u8, b: []const u8) bool {
+    \\    if (a.len != b.len) return false;
+    \\    for (a, b) |ca, cb| {
+    \\        if (ca != cb) return false;
+    \\    }
+    \\    return true;
+    \\}
+    \\
+    \\const testing = @import("std").testing;
+    \\
+    \\test "browser starter parses URL and static title" {
+    \\    const page = loadStatic("https://example.com/docs", "<title>Hello</title><p>World</p>").?;
+    \\    try testing.expectEqualStrings("https", page.url.scheme);
+    \\    try testing.expectEqualStrings("example.com", page.url.host);
+    \\    try testing.expectEqualStrings("/docs", page.url.path);
+    \\    try testing.expectEqualStrings("Hello", page.document.title);
+    \\}
+    \\
+;
+
 // ── .gitignore Content ──
 
 const gitignore_content =
@@ -1084,6 +1232,7 @@ fn generateReadme(project_name: []const u8, tmpl: Template, buf: *[2048]u8) ?[]c
         .web_server => "A Zig HTTP server project.",
         .gui_app => "A platform-abstracted GUI application with window and GL rendering.",
         .library => "A reusable Zig module with test infrastructure.",
+        .browser => "A Sig-native browser engine starter with URL parsing and static page loading.",
     };
     const template_str = readme_template;
     // Two-pass: first replace {{project_name}}, then {{description}}
@@ -1184,6 +1333,32 @@ const zpm_pkg_zon_template =
     \\        .no_allocator = true,
     \\        .no_std_io = true,
     \\    },
+    \\}
+    \\
+;
+
+fn generateBrowserZpmPkgZon(project_name: []const u8, buf: *[2048]u8) ?[]const u8 {
+    return replacePlaceholder(browser_zpm_pkg_zon_template, project_name, buf);
+}
+
+const browser_zpm_pkg_zon_template =
+    \\.{
+    \\    .protocol_version = 1,
+    \\    .scope = "sb0",
+    \\    .name = "{{project_name}}",
+    \\    .version = "0.1.0",
+    \\    .layer = 2,
+    \\    .platform = .any,
+    \\    .system_libraries = .{},
+    \\    .zpm_dependencies = .{},
+    \\    .exports = .{ "browser" },
+    \\    .constraints = .{
+    \\        .no_allocator = true,
+    \\        .no_std_io = true,
+    \\    },
+    \\    .description = "Sig-native browser engine starter.",
+    \\    .license = "MIT",
+    \\    .repository = "",
     \\}
     \\
 ;
@@ -1336,7 +1511,8 @@ fn getWrittenFileContent(index: usize) []const u8 {
 
 fn findWrittenFile(suffix: []const u8) ?usize {
     for (0..mock_file_write_count) |i| {
-        if (containsSubstr(getWrittenFilePath(i), suffix)) return i;
+        const path = getWrittenFilePath(i);
+        if (path.len >= suffix.len and strEql(path[path.len - suffix.len ..], suffix)) return i;
     }
     return null;
 }
@@ -1542,6 +1718,39 @@ test "scaffold: package template generates zpm.pkg.zon with correct layer" {
     try testing.expect(containsSubstr(pkg_content, "my-lib"));
 }
 
+test "scaffold: browser template is native Sig and publishable" {
+    resetInitMocks();
+    const config = InitConfig{
+        .project_name = "sig-browser",
+        .template = .browser,
+    };
+    const result = scaffold(&mock_init_vtable, &config);
+    try testing.expectEqual(InitResult.success, result);
+
+    try testing.expect(findWrittenFile("src/root.sig") != null);
+    try testing.expect(findWrittenFile("src/main.sig") == null);
+    try testing.expect(findWrittenFile("zpm.pkg.zon") != null);
+
+    const zon_content = getWrittenFileContent(findWrittenFile("build.sig.zon").?);
+    try testing.expect(containsSubstr(zon_content, "zpm.pkg.zon"));
+    try testing.expect(!containsSubstr(zon_content, "1220placeholder"));
+
+    const build_content = getWrittenFileContent(findWrittenFile("build.sig").?);
+    try testing.expect(containsSubstr(build_content, "@import(\"sig_build\")"));
+    try testing.expect(containsSubstr(build_content, "ctx.addModule(\"browser\""));
+    try testing.expect(!containsSubstr(build_content, "std.Build"));
+
+    const src_content = getWrittenFileContent(findWrittenFile("src/root.sig").?);
+    try testing.expect(containsSubstr(src_content, "pub const Url"));
+    try testing.expect(containsSubstr(src_content, "loadStatic"));
+
+    const pkg_content = getWrittenFileContent(findWrittenFile("zpm.pkg.zon").?);
+    try testing.expect(containsSubstr(pkg_content, ".scope = \"sb0\""));
+    try testing.expect(containsSubstr(pkg_content, ".name = \"sig-browser\""));
+    try testing.expect(containsSubstr(pkg_content, ".exports = .{ \"browser\" }"));
+    try testing.expect(containsSubstr(pkg_content, ".no_allocator = true"));
+}
+
 // ── Test: Failure cleanup removes partial dir ──
 
 test "scaffold: cleanup on write failure" {
@@ -1584,6 +1793,7 @@ test "Template.fromString: valid templates" {
     try testing.expectEqual(Template.web_server, Template.fromString("web-server").?);
     try testing.expectEqual(Template.gui_app, Template.fromString("gui-app").?);
     try testing.expectEqual(Template.library, Template.fromString("library").?);
+    try testing.expectEqual(Template.browser, Template.fromString("browser").?);
 }
 
 test "Template.fromString: unknown template returns null" {
@@ -1620,7 +1830,7 @@ test "replacePlaceholder: no placeholder" {
 
 test "property 16: init atomicity — failures at each step trigger cleanup" {
     // **Validates: Requirements 16.6, 16.8**
-    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package, .cli_app, .web_server, .gui_app, .library };
+    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package, .cli_app, .web_server, .gui_app, .library, .browser };
 
     // Test failure on create_dir (project dir creation)
     for (templates) |tmpl| {
@@ -1646,8 +1856,8 @@ test "property 16: init atomicity — failures at each step trigger cleanup" {
 
     for (fail_targets) |target| {
         for (templates) |tmpl| {
-            // For package and library templates, src file is root.sig not main.sig
-            if ((tmpl == .package or tmpl == .library) and containsSubstr(target, "src/main.sig")) continue;
+            // Package-like templates use root.sig, not main.sig.
+            if ((tmpl == .package or tmpl == .library or tmpl == .browser) and containsSubstr(target, "src/main.sig")) continue;
 
             resetInitMocks();
             mock_write_file_fail_on = target;
@@ -1694,7 +1904,21 @@ test "property 16: init atomicity — failures at each step trigger cleanup" {
         try testing.expect(mock_removed_dir_count > 0);
     }
 
-    // Also test package-specific: fail on zpm.pkg.zon
+    // Also test browser: fail on src/root.sig
+    {
+        resetInitMocks();
+        mock_write_file_fail_on = "src/root.sig";
+
+        const config = InitConfig{
+            .project_name = "test-browser",
+            .template = .browser,
+        };
+        const result = scaffold(&mock_init_vtable, &config);
+        try testing.expectEqual(InitResult.failed, result);
+        try testing.expect(mock_removed_dir_count > 0);
+    }
+
+    // Also test publishable manifest failure.
     {
         resetInitMocks();
         mock_write_file_fail_on = "zpm.pkg.zon";
@@ -1703,6 +1927,19 @@ test "property 16: init atomicity — failures at each step trigger cleanup" {
             .project_name = "test-proj",
             .template = .package,
             .package_layer = 0,
+        };
+        const result = scaffold(&mock_init_vtable, &config);
+        try testing.expectEqual(InitResult.failed, result);
+        try testing.expect(mock_removed_dir_count > 0);
+    }
+
+    {
+        resetInitMocks();
+        mock_write_file_fail_on = "zpm.pkg.zon";
+
+        const config = InitConfig{
+            .project_name = "test-browser",
+            .template = .browser,
         };
         const result = scaffold(&mock_init_vtable, &config);
         try testing.expectEqual(InitResult.failed, result);
@@ -1717,7 +1954,7 @@ test "property 16: init atomicity — failures at each step trigger cleanup" {
 
 test "property 17: template placeholder substitution — no remaining placeholders" {
     // **Validates: Requirements 16.10**
-    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package, .cli_app, .web_server, .gui_app, .library };
+    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package, .cli_app, .web_server, .gui_app, .library, .browser };
     const project_names = [_][]const u8{
         "a",           "my-app",     "cool-project", "x1",
         "test-pkg",    "hello",      "zig-lib",      "render",
@@ -1756,7 +1993,7 @@ test "property 17: template placeholder substitution — no remaining placeholde
 
 test "property 18: init determinism — identical inputs produce identical outputs" {
     // **Validates: Requirements 22.1**
-    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package, .cli_app, .web_server, .gui_app, .library };
+    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package, .cli_app, .web_server, .gui_app, .library, .browser };
     const project_names = [_][]const u8{
         "det-app",    "my-proj",    "test-lib",    "cool-thing",
         "zig-tool",   "render-pkg", "gl-demo",     "trade-bot",
@@ -1820,7 +2057,7 @@ test "property 18: init determinism — identical inputs produce identical outpu
 
 test "property 23: init file completeness — all required files present" {
     // **Validates: Requirements 16.4**
-    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package, .cli_app, .web_server, .gui_app, .library };
+    const templates = [_]Template{ .empty, .window, .gl_app, .trading, .package, .cli_app, .web_server, .gui_app, .library, .browser };
 
     for (templates) |tmpl| {
         resetInitMocks();
@@ -1839,15 +2076,15 @@ test "property 23: init file completeness — all required files present" {
         try testing.expect(findWrittenFile(".gitignore") != null);
         try testing.expect(findWrittenFile("README.md") != null);
 
-        // Source file: package and library use root.sig, others use main.sig
-        if (tmpl == .package or tmpl == .library) {
+        // Source file: package-like templates use root.sig, others use main.sig
+        if (tmpl == .package or tmpl == .library or tmpl == .browser) {
             try testing.expect(findWrittenFile("src/root.sig") != null);
         } else {
             try testing.expect(findWrittenFile("src/main.sig") != null);
         }
 
-        // Package template must also have zpm.pkg.zon
-        if (tmpl == .package) {
+        // Publishable templates must also have zpm.pkg.zon
+        if (tmpl == .package or tmpl == .browser) {
             try testing.expect(findWrittenFile("zpm.pkg.zon") != null);
         }
     }

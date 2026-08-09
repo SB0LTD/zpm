@@ -405,7 +405,7 @@ test "validate: invalid name — too long" {
     const m = PackageManifest{
         .protocol_version = 1,
         .scope = "zpm",
-        .name = "a" ** 65,
+        .name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .version = "0.1.0",
         .layer = 0,
     };

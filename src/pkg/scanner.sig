@@ -22,11 +22,12 @@ pub fn scanSourceFile(file_path: []const u8, content: []const u8) validator.Sour
 // ── Build.sig Extraction ──
 
 /// Extract module names from build.sig content.
-/// Looks for patterns like: addModule("name", ...) and addImport("name", ...)
+/// Looks for patterns like: addModule("name", ...), addImport("name", ...),
+/// and sig_build helper entries such as imp("name", "src/root.sig").
 /// Returns the number of names written to `out`.
 pub fn extractModuleNames(build_content: []const u8, out: [][]const u8) usize {
     var count: usize = 0;
-    const patterns = [_][]const u8{ "addModule(\"", "addImport(\"" };
+    const patterns = [_][]const u8{ "addModule(\"", "addImport(\"", "imp(\"" };
 
     for (patterns) |pattern| {
         var pos: usize = 0;
@@ -308,6 +309,20 @@ test "extractModuleNames: deduplicates names" {
     const count = extractModuleNames(content, &out);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqualStrings("core", out[0]);
+}
+
+test "extractModuleNames: finds sig_build import helper names" {
+    const content =
+        \\const imports = [_]sig_build.Import_Entry{
+        \\    imp("sig_browser", "src/root.sig"),
+        \\    imp("url", "src/url/root.sig"),
+        \\};
+    ;
+    var out: [16][]const u8 = undefined;
+    const count = extractModuleNames(content, &out);
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqualStrings("sig_browser", out[0]);
+    try testing.expectEqualStrings("url", out[1]);
 }
 
 test "extractModuleNames: empty content returns zero" {
