@@ -62,6 +62,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const model_observability_mod = b.addModule("model_observability", .{
+        .root_source_file = b.path("src/core/model_observability.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const multimodal_now_mod = b.addModule("multimodal_now", .{
+        .root_source_file = b.path("src/core/multimodal_now.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const cognitive_receipt_mod = b.addModule("cognitive_receipt", .{
         .root_source_file = b.path("src/core/cognitive_receipt.sig"),
         .target = target,
@@ -70,6 +80,8 @@ pub fn build(b: *std.Build) void {
     cognitive_receipt_mod.addImport("vector_memory", vector_memory_mod);
     cognitive_receipt_mod.addImport("moment_activation", moment_activation_mod);
     cognitive_receipt_mod.addImport("agent_runtime", agent_runtime_mod);
+    cognitive_receipt_mod.addImport("model_observability", model_observability_mod);
+    cognitive_receipt_mod.addImport("multimodal_now", multimodal_now_mod);
     const core_mod = b.addModule("core", .{
         .root_source_file = b.path("src/core/root.sig"),
         .target = target,
@@ -86,6 +98,8 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("moment_activation", moment_activation_mod);
     core_mod.addImport("agent_runtime", agent_runtime_mod);
     core_mod.addImport("cognitive_receipt", cognitive_receipt_mod);
+    core_mod.addImport("model_observability", model_observability_mod);
+    core_mod.addImport("multimodal_now", multimodal_now_mod);
 
     // ── Granular modules (Layer 1: Platform) ──
     // Ordered so that dependencies are declared before dependents.
@@ -342,6 +356,18 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&agent_runtime_run.step);
     const agent_runtime_test_step = b.step("test-agent-runtime", "Run capability, process, and PlanIR tests");
     agent_runtime_test_step.dependOn(&agent_runtime_run.step);
+
+    const model_observability_tests = b.addTest(.{ .root_module = model_observability_mod });
+    const model_observability_run = b.addRunArtifact(model_observability_tests);
+    test_step.dependOn(&model_observability_run.step);
+    const model_observability_test_step = b.step("test-model-observability", "Run bounded multimodal trace tests");
+    model_observability_test_step.dependOn(&model_observability_run.step);
+
+    const multimodal_now_tests = b.addTest(.{ .root_module = multimodal_now_mod });
+    const multimodal_now_run = b.addRunArtifact(multimodal_now_tests);
+    test_step.dependOn(&multimodal_now_run.step);
+    const multimodal_now_test_step = b.step("test-multimodal-now", "Run schema-bound NOW fusion tests");
+    multimodal_now_test_step.dependOn(&multimodal_now_run.step);
 
     const cognitive_receipt_tests = b.addTest(.{ .root_module = cognitive_receipt_mod });
     const cognitive_receipt_run = b.addRunArtifact(cognitive_receipt_tests);

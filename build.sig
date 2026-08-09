@@ -54,10 +54,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("vector_memory", "src/core/vector_memory.sig");
     _ = try ctx.addModule("moment_activation", "src/core/moment_activation.sig");
     _ = try ctx.addModule("agent_runtime", "src/core/agent_runtime.sig");
+    _ = try ctx.addModule("model_observability", "src/core/model_observability.sig");
+    _ = try ctx.addModule("multimodal_now", "src/core/multimodal_now.sig");
     const cognitive_receipt = try ctx.addModule("cognitive_receipt", "src/core/cognitive_receipt.sig");
     try wire(ctx, cognitive_receipt, "vector_memory", "src/core/vector_memory.sig");
     try wire(ctx, cognitive_receipt, "moment_activation", "src/core/moment_activation.sig");
     try wire(ctx, cognitive_receipt, "agent_runtime", "src/core/agent_runtime.sig");
+    try wire(ctx, cognitive_receipt, "model_observability", "src/core/model_observability.sig");
+    try wire(ctx, cognitive_receipt, "multimodal_now", "src/core/multimodal_now.sig");
     const core = try ctx.addModule("core", "src/core/root.sig");
     try wire(ctx, core, "math", "src/core/math.sig");
     try wire(ctx, core, "json", "src/core/json.sig");
@@ -70,6 +74,8 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, core, "moment_activation", "src/core/moment_activation.sig");
     try wire(ctx, core, "agent_runtime", "src/core/agent_runtime.sig");
     try wire(ctx, core, "cognitive_receipt", "src/core/cognitive_receipt.sig");
+    try wire(ctx, core, "model_observability", "src/core/model_observability.sig");
+    try wire(ctx, core, "multimodal_now", "src/core/multimodal_now.sig");
 
     _ = try addTest(ctx, test_all, "test-ai-core", "src/core/ai_core.sig", &.{});
     _ = try addTest(ctx, test_all, "test-quantized-linear", "src/core/quantized_linear.sig", &.{});
@@ -77,10 +83,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-vector-memory", "src/core/vector_memory.sig", &.{});
     _ = try addTest(ctx, test_all, "test-moment-activation", "src/core/moment_activation.sig", &.{});
     _ = try addTest(ctx, test_all, "test-agent-runtime", "src/core/agent_runtime.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-model-observability", "src/core/model_observability.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-multimodal-now", "src/core/multimodal_now.sig", &.{});
     _ = try addTest(ctx, test_all, "test-cognitive-receipt", "src/core/cognitive_receipt.sig", &.{
         importEntry("vector_memory", "src/core/vector_memory.sig"),
         importEntry("moment_activation", "src/core/moment_activation.sig"),
         importEntry("agent_runtime", "src/core/agent_runtime.sig"),
+        importEntry("model_observability", "src/core/model_observability.sig"),
+        importEntry("multimodal_now", "src/core/multimodal_now.sig"),
     });
     _ = try addTest(ctx, test_all, "test-sha256", "src/core/sha256.sig", &.{});
     _ = try addTest(ctx, test_all, "test-jsonl", "src/core/jsonl.sig", &.{

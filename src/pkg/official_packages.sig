@@ -66,6 +66,28 @@ pub const packages = [_]OfficialPackage{
         .description = "Caller-owned arenas, tensor bounds, AI job scheduling, device interfaces, and copy-on-write pages",
         .source = "src/core/ai_core.sig",
     },
+    .{
+        .scope = "zpm",
+        .name = "model-observability",
+        .version = "0.1.0",
+        .layer = 0,
+        .platform = .any,
+        .system_libraries = &.{},
+        .zpm_dependencies = &.{},
+        .description = "Fixed-capacity multimodal model and device trace with replay cursors and latency histograms",
+        .source = "src/core/model_observability.sig",
+    },
+    .{
+        .scope = "zpm",
+        .name = "multimodal-now",
+        .version = "0.1.0",
+        .layer = 0,
+        .platform = .any,
+        .system_libraries = &.{},
+        .zpm_dependencies = &.{},
+        .description = "Schema-bound confidence/freshness fusion with Matryoshka compute budgets",
+        .source = "src/core/multimodal_now.sig",
+    },
     // ── Layer 1: Platform ──
     .{
         .scope = "zpm",

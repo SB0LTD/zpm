@@ -8,6 +8,8 @@ const std = @import("std");
 const vector_memory = @import("vector_memory");
 const moment_activation = @import("moment_activation");
 const agent_runtime = @import("agent_runtime");
+const model_observability = @import("model_observability");
+const multimodal_now = @import("multimodal_now");
 
 pub const vector_capacity: usize = 256;
 pub const vector_dimension: usize = 384;
@@ -16,6 +18,9 @@ pub const moment_feature_dimension: usize = 64;
 pub const moment_rank: usize = 16;
 pub const moment_goal_dimension: usize = 4;
 pub const moment_class_count: usize = 8;
+pub const model_trace_capacity: usize = 512;
+pub const now_fusion_dimension: usize = 64;
+pub const now_fusion_minimum_prefix: usize = 16;
 
 pub const VectorIndex = vector_memory.Store(vector_capacity, vector_dimension);
 pub const MomentModel = moment_activation.MomentModel(
@@ -32,6 +37,8 @@ pub const MomentState = moment_activation.MomentState(
     moment_goal_dimension,
     moment_class_count,
 );
+pub const ModelTrace = model_observability.Trace(model_trace_capacity);
+pub const NowFusion = multimodal_now.Fusion(now_fusion_dimension, now_fusion_minimum_prefix);
 
 pub const Receipt = struct {
     vector_static_bytes: usize,
@@ -49,6 +56,15 @@ pub const Receipt = struct {
     plan_maximum_edges: usize,
     capability_maximum_validation_depth: usize,
     root_revocation_writes: usize,
+    model_trace_event_bytes: usize,
+    model_trace_payload_bytes: usize,
+    model_trace_static_bytes: usize,
+    model_trace_histogram_buckets: usize,
+    now_fusion_static_bytes: usize,
+    now_fusion_maximum_modalities: usize,
+    now_fusion_minimum_arithmetic: usize,
+    now_fusion_full_arithmetic: usize,
+    now_fusion_maximum_arithmetic: usize,
 };
 
 pub fn reference() Receipt {
@@ -86,6 +102,21 @@ pub fn reference() Receipt {
         .plan_maximum_edges = 32 * 31,
         .capability_maximum_validation_depth = 4,
         .root_revocation_writes = 1,
+        .model_trace_event_bytes = @sizeOf(model_observability.TraceEvent),
+        .model_trace_payload_bytes = model_trace_capacity * @sizeOf(model_observability.TraceEvent),
+        .model_trace_static_bytes = ModelTrace.staticBytes(),
+        .model_trace_histogram_buckets = model_observability.STAGE_COUNT * model_observability.HISTOGRAM_BUCKETS,
+        .now_fusion_static_bytes = NowFusion.staticBytes(),
+        .now_fusion_maximum_modalities = multimodal_now.MODALITY_COUNT,
+        // For one full-prefix modality, fusion performs two weighted-lane
+        // operations, one mean division, two norm operations, one normalized
+        // output multiplication per lane, and one prefix-independent inverse.
+        .now_fusion_minimum_arithmetic = 6 * now_fusion_minimum_prefix + 1,
+        .now_fusion_full_arithmetic = 6 * now_fusion_dimension + 1,
+        // With M<=5 modalities, the exact worst-case bound is
+        // 2*M*D weighted operations + 4*D normalization operations + 1.
+        .now_fusion_maximum_arithmetic =
+            (2 * multimodal_now.MODALITY_COUNT + 4) * now_fusion_dimension + 1,
     };
 }
 
@@ -111,6 +142,19 @@ test "reference efficiency receipt is exact and internally consistent" {
         receipt.dense_total_linear_multiplications * 37);
     try std.testing.expectEqual(@as(usize, 36), receipt.activation_weight_products);
     try std.testing.expectEqual(@as(usize, 1), receipt.root_revocation_writes);
+    try std.testing.expectEqual(@as(usize, 64), receipt.model_trace_event_bytes);
+    try std.testing.expectEqual(@as(usize, 32_768), receipt.model_trace_payload_bytes);
+    try std.testing.expectEqual(@as(usize, 47_928), receipt.model_trace_static_bytes);
+    try std.testing.expectEqual(@as(usize, 1_728), receipt.model_trace_histogram_buckets);
+    try std.testing.expectEqual(@as(usize, 1_472), receipt.now_fusion_static_bytes);
+    try std.testing.expectEqual(@as(usize, 5), receipt.now_fusion_maximum_modalities);
+    try std.testing.expectEqual(@as(usize, 97), receipt.now_fusion_minimum_arithmetic);
+    try std.testing.expectEqual(@as(usize, 385), receipt.now_fusion_full_arithmetic);
+    try std.testing.expectEqual(@as(usize, 897), receipt.now_fusion_maximum_arithmetic);
+    // Excluding the one prefix-independent reciprocal, reducing 64 lanes to
+    // 16 reduces every lane-dependent arithmetic operation by exactly 75%.
+    try std.testing.expect((receipt.now_fusion_minimum_arithmetic - 1) * 4 ==
+        receipt.now_fusion_full_arithmetic - 1);
 }
 
 test "bounded authority structures remain inline values" {
