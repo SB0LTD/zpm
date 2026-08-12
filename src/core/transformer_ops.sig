@@ -26,6 +26,51 @@ pub fn rmsNorm(input: []const f32, weight: []const f32, output: []f32, epsilon: 
     }
 }
 
+/// Affine layer normalization for vision encoders.  Mean and variance are
+/// accumulated in f64 to keep the fixed-order scalar reference stable across
+/// AArch64 and host differential tests; output storage remains f32.
+pub fn layerNorm(
+    input: []const f32,
+    weight: []const f32,
+    bias: []const f32,
+    output: []f32,
+    epsilon: f32,
+) Error!void {
+    if (input.len == 0 or weight.len != input.len or bias.len != input.len or
+        output.len < input.len or !std.math.isFinite(epsilon) or epsilon <= 0)
+        return error.InvalidShape;
+    var sum: f64 = 0;
+    for (input) |value| {
+        if (!std.math.isFinite(value)) return error.NonFinite;
+        sum += value;
+    }
+    const mean = sum / @as(f64, @floatFromInt(input.len));
+    var squares: f64 = 0;
+    for (input) |value| {
+        const centered = @as(f64, value) - mean;
+        squares += centered * centered;
+    }
+    const variance: f32 = @floatCast(squares / @as(f64, @floatFromInt(input.len)));
+    const inverse = 1.0 / @sqrt(variance + epsilon);
+    const mean32: f32 = @floatCast(mean);
+    for (input, weight, bias, output[0..input.len]) |value, scale, offset, *destination| {
+        if (!std.math.isFinite(scale) or !std.math.isFinite(offset)) return error.NonFinite;
+        destination.* = (value - mean32) * inverse * scale + offset;
+    }
+}
+
+/// In-place GELU using the exact tanh approximation selected by SmolVLM's
+/// `gelu_pytorch_tanh` activation.
+pub fn geluTanh(values: []f32) Error!void {
+    const coefficient: f32 = 0.7978845608028654; // sqrt(2 / pi)
+    for (values) |*value| {
+        const x = value.*;
+        if (!std.math.isFinite(x)) return error.NonFinite;
+        const inner = coefficient * (x + 0.044715 * x * x * x);
+        value.* = 0.5 * x * (1.0 + std.math.tanh(inner));
+    }
+}
+
 /// Qwen-family split-half rotary embedding, in place for all heads.
 pub fn ropeSplitHalf(values: []f32, head_count: usize, head_size: usize, position: u64, frequency_base: f32) Error!void {
     if (head_count == 0 or head_size == 0 or head_size % 2 != 0 or
@@ -147,6 +192,30 @@ test "softmax is stable and normalized" {
     try softmax(&values);
     try testing.expectApproxEqAbs(@as(f32, 1), values[0] + values[1] + values[2], 0.000001);
     try testing.expect(values[1] > values[0] and values[0] > values[2]);
+}
+
+test "affine layer norm has zero mean and unit variance" {
+    const input = [_]f32{ 1, 2, 3, 4 };
+    const weight: [4]f32 = @splat(1);
+    const bias: [4]f32 = @splat(0);
+    var output: [4]f32 = undefined;
+    try layerNorm(&input, &weight, &bias, &output, 1e-6);
+    var mean: f32 = 0;
+    for (output) |value| mean += value;
+    mean /= output.len;
+    var variance: f32 = 0;
+    for (output) |value| variance += value * value;
+    variance /= output.len;
+    try testing.expectApproxEqAbs(@as(f32, 0), mean, 0.000001);
+    try testing.expectApproxEqAbs(@as(f32, 1), variance, 0.00001);
+}
+
+test "GELU tanh preserves zero and expected signs" {
+    var values = [_]f32{ -1, 0, 1 };
+    try geluTanh(&values);
+    try testing.expect(values[0] < 0 and values[2] > 0);
+    try testing.expectEqual(@as(f32, 0), values[1]);
+    try testing.expectApproxEqAbs(@as(f32, 0.841192), values[2], 0.00001);
 }
 
 test "split-half RoPE is identity at position zero" {
