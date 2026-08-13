@@ -12,6 +12,7 @@ pub const jsonl = @import("jsonl");
 pub const ai_core = @import("ai_core");
 pub const quantized_linear = @import("quantized_linear");
 pub const transformer_ops = @import("transformer_ops");
+pub const audio_dsp = @import("audio_dsp");
 pub const vector_memory = @import("vector_memory");
 pub const moment_activation = @import("moment_activation");
 pub const agent_runtime = @import("agent_runtime");

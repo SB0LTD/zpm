@@ -51,6 +51,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("ai_core", "src/core/ai_core.sig");
     _ = try ctx.addModule("quantized_linear", "src/core/quantized_linear.sig");
     _ = try ctx.addModule("transformer_ops", "src/core/transformer_ops.sig");
+    _ = try ctx.addModule("audio_dsp", "src/core/audio_dsp.sig");
     _ = try ctx.addModule("vector_memory", "src/core/vector_memory.sig");
     _ = try ctx.addModule("moment_activation", "src/core/moment_activation.sig");
     _ = try ctx.addModule("agent_runtime", "src/core/agent_runtime.sig");
@@ -70,6 +71,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, core, "ai_core", "src/core/ai_core.sig");
     try wire(ctx, core, "quantized_linear", "src/core/quantized_linear.sig");
     try wire(ctx, core, "transformer_ops", "src/core/transformer_ops.sig");
+    try wire(ctx, core, "audio_dsp", "src/core/audio_dsp.sig");
     try wire(ctx, core, "vector_memory", "src/core/vector_memory.sig");
     try wire(ctx, core, "moment_activation", "src/core/moment_activation.sig");
     try wire(ctx, core, "agent_runtime", "src/core/agent_runtime.sig");
@@ -80,6 +82,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-ai-core", "src/core/ai_core.sig", &.{});
     _ = try addTest(ctx, test_all, "test-quantized-linear", "src/core/quantized_linear.sig", &.{});
     _ = try addTest(ctx, test_all, "test-transformer-ops", "src/core/transformer_ops.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-audio-dsp", "src/core/audio_dsp.sig", &.{});
     _ = try addTest(ctx, test_all, "test-vector-memory", "src/core/vector_memory.sig", &.{});
     _ = try addTest(ctx, test_all, "test-moment-activation", "src/core/moment_activation.sig", &.{});
     _ = try addTest(ctx, test_all, "test-agent-runtime", "src/core/agent_runtime.sig", &.{});
