@@ -42,6 +42,14 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("sha256", sha256_mod);
     core_mod.addImport("jsonl", jsonl_mod);
 
+    // ── Granular modules (Layer 0: Image) ──
+
+    const image_mod = b.addModule("image", .{
+        .root_source_file = b.path("src/image/root.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── Granular modules (Layer 1: Platform) ──
     // Ordered so that dependencies are declared before dependents.
 
@@ -153,6 +161,18 @@ pub fn build(b: *std.Build) void {
     png_mod.addImport("logging", logging_mod);
     if (os_tag == .windows) png_mod.linkSystemLibrary("kernel32", .{});
     if (os_tag == .windows) png_mod.linkSystemLibrary("opengl32", .{});
+
+    const png_decode_mod = b.addModule("png_decode", .{
+        .root_source_file = b.path("src/platform/png/decode.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const png_write_mod = b.addModule("png_write", .{
+        .root_source_file = b.path("src/platform/png/write.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const screenshot_mod = b.addModule("screenshot", .{
         .root_source_file = b.path("src/platform/screenshot.sig"),
