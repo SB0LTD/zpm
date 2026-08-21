@@ -124,6 +124,12 @@ pub const Server = struct {
     conn_active: [max_connections]bool,
     conn_count: u16,
 
+    // TLS certificate (PEM pointers — caller owns the data)
+    cert_pem_ptr: ?[*]const u8,
+    cert_pem_len: u32,
+    key_pem_ptr: ?[*]const u8,
+    key_pem_len: u32,
+
     // Stats
     total_requests: u64,
     total_connections: u64,
@@ -146,11 +152,19 @@ pub const Server = struct {
             .stream_arrays = streams_buf,
             .conn_active = @splat(false),
             .conn_count = 0,
+            .cert_pem_ptr = null,
+            .cert_pem_len = 0,
+            .key_pem_ptr = null,
+            .key_pem_len = 0,
             .total_requests = 0,
             .total_connections = 0,
             .active_connections = 0,
         };
-        _ = s.socket.bind(port);
+        const addr = udp.w32.sockaddr_in{
+            .sin_port = udp.w32.htons(port),
+            .sin_addr = 0x00000000, // INADDR_ANY
+        };
+        _ = s.socket.bind(addr);
         return s;
     }
 
@@ -187,7 +201,7 @@ pub const Server = struct {
             self.handlePacket(recv_buf[0..result.bytes_read], result.src_addr);
         }
 
-        // 2. Advance all active connections (timers, retransmits, idle)
+        // 2. Advance all active connections (timers, retransmits, idle, H3 dispatch)
         for (0..max_connections) |i| {
             if (self.conn_active[i]) {
                 self.tickConnection(@intCast(i));
@@ -195,10 +209,25 @@ pub const Server = struct {
         }
     }
 
-    /// Graceful shutdown — send GOAWAY to all connections.
+    /// Graceful shutdown — send GOAWAY to all active connections, then drain.
     pub fn shutdown(self: *Server) void {
         self.running = false;
-        // TODO: send GOAWAY on each connection's control stream
+        // Send GOAWAY on each active connection's control stream
+        for (0..max_connections) |i| {
+            if (self.conn_active[i]) {
+                var c = &self.connections[i];
+                if (c.state == .connected) {
+                    // GOAWAY with stream_id = highest client bidi stream we've processed
+                    var goaway_buf: [16]u8 = undefined;
+                    const goaway_len = h3.serializeGoaway(self.total_requests * 4, &goaway_buf);
+                    if (goaway_len > 0) {
+                        // Write GOAWAY to control stream (unidirectional stream 3 = server uni)
+                        _ = c.stream_mgr.writeToStream(3, goaway_buf[0..goaway_len]);
+                    }
+                    c.close(0, "shutdown");
+                }
+            }
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -206,50 +235,283 @@ pub const Server = struct {
     // ══════════════════════════════════════════════════════════════════════
 
     fn handlePacket(self: *Server, data: []const u8, src: udp.w32.sockaddr_in) void {
-        _ = src;
         // Parse QUIC header to route by DCID
-        const header = packet.parseHeader(data) orelse return;
+        const hdr_result = packet.parseHeader(data);
+        if (hdr_result.err != .none) return;
+        const header = hdr_result.header;
 
         // Find existing connection by DCID
         const conn_idx = self.findConnection(header.dst_cid) orelse {
+            // Only accept Initial packets for new connections
+            if (!header.is_long or header.pkt_type != .initial) return;
+
             // New connection — allocate from pool
             const idx = self.allocConnection() orelse return;
             self.conn_active[idx] = true;
             self.active_connections += 1;
             self.total_connections += 1;
-            // Initialize as server connection
+
+            // Initialize as server connection (port 0 — uses shared listen socket)
             self.connections[idx] = conn.Connection.initServer(
                 &self.stream_arrays[idx],
                 0,
             );
-            // Process the initial packet on the new connection
-            self.processPacket(idx, data);
+
+            // Load TLS certificate and set ALPN on this connection
+            var c = &self.connections[idx];
+            if (self.cert_pem_ptr) |cert| {
+                if (self.key_pem_ptr) |key| {
+                    _ = c.loadTlsCertificatePem(cert[0..self.cert_pem_len], key[0..self.key_pem_len]);
+                }
+            }
+            c.setTlsAlpn("h3");
+
+            // Feed the Initial packet — drives handshake
+            const state = c.feedAndRespond(data, src);
+            _ = state;
+
+            // Send any response produced (ServerHello, etc.) via the listen socket
+            if (c.last_send_len > 0) {
+                _ = self.socket.send(c.send_buf[0..c.last_send_len], src);
+            }
             return;
         };
 
-        self.processPacket(conn_idx, data);
+        self.processPacket(conn_idx, data, src);
     }
 
-    fn processPacket(self: *Server, idx: u16, data: []const u8) void {
-        _ = self;
-        _ = idx;
-        _ = data;
-        // TODO: feed packet into connection state machine
-        // connection.receivePacket(data) → advances handshake or delivers stream data
-        // then check for new stream data → parse H3 frames → dispatch
+    /// Feed a packet into an existing connection's state machine, then
+    /// check for completed HTTP/3 requests and dispatch them.
+    fn processPacket(self: *Server, idx: u16, data: []const u8, src: udp.w32.sockaddr_in) void {
+        var c = &self.connections[idx];
+
+        // Drive the connection: decrypt, dispatch frames, assemble response
+        const state = c.feedAndRespond(data, src);
+
+        // Send any outgoing data via the shared listen socket
+        if (c.last_send_len > 0) {
+            _ = self.socket.send(c.send_buf[0..c.last_send_len], src);
+        }
+
+        // If connected, check for HTTP/3 request data on streams
+        if (state == .connected) {
+            self.dispatchH3Requests(idx);
+        }
+
+        // Handle connection closure — return slot to pool
+        if (state == .closed) {
+            self.conn_active[idx] = false;
+            if (self.active_connections > 0) self.active_connections -= 1;
+        }
     }
 
+    /// Advance a connection's timers (idle timeout, loss detection, retransmit).
+    /// Also checks for pending stream data that may have arrived across multiple
+    /// packets and dispatches any complete H3 requests.
     fn tickConnection(self: *Server, idx: u16) void {
-        _ = self;
-        _ = idx;
-        // TODO: advance connection timers, send pending ACKs/data
+        var c = &self.connections[idx];
+
+        // Use tick() to advance timers and handle retransmissions
+        const state = c.tick();
+
+        // Send any data produced by the tick (retransmits, ACKs, keepalives)
+        if (c.last_send_len > 0) {
+            _ = self.socket.send(c.send_buf[0..c.last_send_len], c.peer_addr);
+        }
+
+        // Dispatch any pending H3 requests
+        if (state == .connected) {
+            self.dispatchH3Requests(idx);
+        }
+
+        // Handle connection closure — return slot to pool
+        if (state == .closed) {
+            self.conn_active[idx] = false;
+            if (self.active_connections > 0) self.active_connections -= 1;
+        }
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // HTTP/3 Request Dispatch
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Scan all streams on a connection for readable data, parse HTTP/3
+    /// HEADERS frames, dispatch to application handlers, and write the
+    /// response back into the stream's send buffer.
+    fn dispatchH3Requests(self: *Server, conn_idx: u16) void {
+        var c = &self.connections[conn_idx];
+        const sm = &c.stream_mgr;
+
+        // Iterate all active streams looking for client-initiated bidi streams
+        // with data to read. Client bidi stream IDs: 0, 4, 8, 12, ...
+        for (0..sm.stream_count) |i| {
+            const s = &sm.streams[i];
+
+            // Only process client-initiated bidirectional request streams
+            // Stream ID bits: 0b00 = client bidi
+            if (s.id & 0x03 != 0x00) continue;
+
+            // Need data available to parse
+            const avail = s.recv_buf.available();
+            if (avail == 0) continue;
+
+            // Only dispatch streams in open or half_closed_remote state
+            // (half_closed_remote means client sent FIN — request fully received)
+            if (s.state != .open and s.state != .half_closed_remote) continue;
+
+            // Read stream data into a scratch buffer for H3 frame parsing
+            var stream_data: [max_header_size]u8 = undefined;
+            const read_len = s.recv_buf.read(stream_data[0..@min(avail, max_header_size)]);
+            if (read_len == 0) continue;
+
+            // Parse H3 frame header
+            const frame_hdr = h3.parseFrameHeader(stream_data[0..read_len]) orelse continue;
+
+            // We only handle HEADERS frames for request dispatch
+            if (frame_hdr.frame_type != @intFromEnum(h3.FrameType.headers)) continue;
+
+            // Ensure we have the complete HEADERS payload
+            const payload_end = frame_hdr.header_len + @as(usize, @intCast(frame_hdr.payload_len));
+            if (read_len < payload_end) continue; // incomplete, need more data
+
+            // Decode QPACK headers from the HEADERS frame payload
+            const headers_payload = stream_data[frame_hdr.header_len..payload_end];
+            var decoded_headers: [32]h3.HeaderField = undefined;
+            const header_count = h3.decodeHeaders(headers_payload, &decoded_headers);
+            if (header_count == 0) continue;
+
+            // Extract pseudo-headers (:method, :path, :authority, :scheme)
+            var method: []const u8 = "GET";
+            var path: []const u8 = "/";
+            var authority: []const u8 = "";
+            var scheme: []const u8 = "https";
+
+            for (decoded_headers[0..header_count]) |hf| {
+                if (strEql(hf.name, ":method")) method = hf.value
+                else if (strEql(hf.name, ":path")) path = hf.value
+                else if (strEql(hf.name, ":authority")) authority = hf.value
+                else if (strEql(hf.name, ":scheme")) scheme = hf.value;
+            }
+
+            // Check for DATA frame following HEADERS (request body)
+            var body: []const u8 = "";
+            var body_buf: [4096]u8 = undefined;
+            if (read_len > payload_end) {
+                const remaining = stream_data[payload_end..read_len];
+                const data_hdr = h3.parseFrameHeader(remaining);
+                if (data_hdr) |dh| {
+                    if (dh.frame_type == @intFromEnum(h3.FrameType.data)) {
+                        const data_end = dh.header_len + @as(usize, @intCast(dh.payload_len));
+                        if (remaining.len >= data_end) {
+                            const body_len = @min(dh.payload_len, body_buf.len);
+                            @memcpy(body_buf[0..body_len], remaining[dh.header_len..][0..body_len]);
+                            body = body_buf[0..body_len];
+                        }
+                    }
+                }
+            }
+
+            // Build Request
+            const req = Request{
+                .method = method,
+                .path = path,
+                .authority = authority,
+                .scheme = scheme,
+                .headers = &decoded_headers,
+                .header_count = header_count,
+                .body = body,
+                .stream_id = s.id,
+                .conn_index = conn_idx,
+            };
+
+            // Match route and invoke handler
+            var resp = Response{};
+            const handler = self.matchRoute(path) orelse {
+                // No route matched — 404
+                resp.setStatus(404);
+                resp.addHeader("content-type", "text/plain");
+                resp.setBody("not found");
+                self.sendH3Response(conn_idx, s.id, &resp);
+                self.total_requests += 1;
+                continue;
+            };
+
+            handler(&req, &resp);
+            self.sendH3Response(conn_idx, s.id, &resp);
+            self.total_requests += 1;
+        }
+    }
+
+    /// Serialize an HTTP/3 response (HEADERS + DATA frames) and write it
+    /// into the stream's send buffer for the next packet assembly.
+    fn sendH3Response(self: *Server, conn_idx: u16, stream_id: u64, resp: *const Response) void {
+        var c = &self.connections[conn_idx];
+
+        // Build response headers: :status + application headers
+        var resp_headers: [34][2][]const u8 = undefined;
+        var rh_count: usize = 0;
+
+        // :status pseudo-header
+        var status_buf: [3]u8 = undefined;
+        status_buf[0] = '0' + @as(u8, @intCast(resp.status / 100));
+        status_buf[1] = '0' + @as(u8, @intCast((resp.status / 10) % 10));
+        status_buf[2] = '0' + @as(u8, @intCast(resp.status % 10));
+        resp_headers[rh_count] = .{ ":status", &status_buf };
+        rh_count += 1;
+
+        // Application headers
+        for (0..resp.header_count) |i| {
+            if (rh_count >= 34) break;
+            resp_headers[rh_count] = resp.headers[i];
+            rh_count += 1;
+        }
+
+        // Encode HEADERS frame (QPACK static-only + frame header)
+        var h3_buf: [4096]u8 = undefined;
+        var h3_len: usize = 0;
+        h3_len += h3.encodeHeadersFrame(resp_headers[0..rh_count], h3_buf[h3_len..]);
+
+        // Encode DATA frame (if body present)
+        if (resp.body.len > 0) {
+            h3_len += h3.encodeDataFrameHeader(resp.body.len, h3_buf[h3_len..]);
+            const copy_len = @min(resp.body.len, h3_buf.len - h3_len);
+            @memcpy(h3_buf[h3_len..][0..copy_len], resp.body[0..copy_len]);
+            h3_len += copy_len;
+        }
+
+        // Write the complete H3 response into the stream's send buffer
+        _ = c.stream_mgr.writeToStream(stream_id, h3_buf[0..h3_len]);
+
+        // Half-close the stream (server done sending)
+        c.stream_mgr.closeStream(stream_id);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // TLS Configuration
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Load a TLS certificate (PEM-encoded) for all future connections.
+    /// Must be called before listen(). The server stores pointers to the
+    /// PEM data — caller must ensure the data outlives the server.
+    pub fn loadCertificate(self: *Server, cert_pem: []const u8, key_pem: []const u8) void {
+        self.cert_pem_ptr = cert_pem.ptr;
+        self.cert_pem_len = @intCast(cert_pem.len);
+        self.key_pem_ptr = key_pem.ptr;
+        self.key_pem_len = @intCast(key_pem.len);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Connection Pool
+    // ══════════════════════════════════════════════════════════════════════
 
     fn findConnection(self: *Server, dcid: packet.ConnectionId) ?u16 {
         for (0..max_connections) |i| {
             if (self.conn_active[i]) {
                 const c = &self.connections[i];
-                if (cidEql(c.local_cid, dcid)) return @intCast(i);
+                // Check all local CIDs on this connection
+                for (0..c.local_cid_count) |ci| {
+                    if (cidEql(c.local_cids[ci], dcid)) return @intCast(i);
+                }
             }
         }
         return null;
@@ -271,17 +533,24 @@ pub const Server = struct {
     }
 
     /// Match a request path against registered routes.
+    /// Exact matches are checked first (in registration order), then prefix matches.
     fn matchRoute(self: *Server, path: []const u8) ?Handler {
+        // First pass: exact matches only
         for (self.routes[0..self.route_count]) |r| {
-            if (r.prefix) {
-                if (path.len >= r.path.len and strEql(path[0..r.path.len], r.path)) {
-                    return r.handler;
-                }
-            } else {
-                if (strEql(path, r.path)) return r.handler;
+            if (!r.prefix and strEql(path, r.path)) return r.handler;
+        }
+        // Second pass: longest prefix match
+        var best: ?Handler = null;
+        var best_len: usize = 0;
+        for (self.routes[0..self.route_count]) |r| {
+            if (r.prefix and path.len >= r.path.len and
+                strEql(path[0..r.path.len], r.path) and r.path.len > best_len)
+            {
+                best = r.handler;
+                best_len = r.path.len;
             }
         }
-        return null;
+        return best;
     }
 };
 

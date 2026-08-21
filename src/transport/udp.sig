@@ -3,7 +3,7 @@
 // Thin wrapper over Win32 Winsock2 for non-blocking UDP send/receive.
 // No knowledge of QUIC — just datagrams. Zero allocator usage.
 
-const w32 = @import("win32");
+pub const w32 = @import("win32");
 
 // ── Error and Result Types ──
 
