@@ -18,3 +18,4 @@ pub const hkdf = @import("hkdf.sig");
 pub const x25519 = @import("x25519.sig");
 pub const quic = @import("quic.sig");
 pub const tls13_server = @import("tls13_server.sig");
+pub const p256 = @import("p256.sig");
