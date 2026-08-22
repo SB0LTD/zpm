@@ -115,13 +115,28 @@ pub const ServerHandshake = struct {
     encrypted_exts_buf: [2048]u8 = @splat(0),
     encrypted_exts_len: u16 = 0,
 
+    // Certificate data (DER-encoded, caller-provided)
+    cert_der: [2048]u8 = @splat(0),
+    cert_der_len: u16 = 0,
+    // ECDSA P-256 signing key (32-byte scalar)
+    signing_key: [32]u8 = @splat(0),
+    has_cert: bool = false,
+
     /// Initialize with server's X25519 private key (32 random bytes).
     pub fn init(private_key: *const [32]u8) ServerHandshake {
         var hs = ServerHandshake{};
         hs.server_private = private_key.*;
-        // Compute public key
         x25519_mod.scalarmult(&hs.server_public, &hs.server_private, &x25519_mod.BASEPOINT);
         return hs;
+    }
+
+    /// Load a DER-encoded certificate and ECDSA P-256 signing key.
+    pub fn loadCertificate(self: *ServerHandshake, cert: []const u8, key: *const [32]u8) void {
+        const len = @min(cert.len, self.cert_der.len);
+        @memcpy(self.cert_der[0..len], cert[0..len]);
+        self.cert_der_len = @intCast(len);
+        self.signing_key = key.*;
+        self.has_cert = true;
     }
 
     /// Feed a ClientHello message (the raw TLS handshake message bytes).
@@ -412,8 +427,122 @@ pub const ServerHandshake = struct {
         return buf[0..pos];
     }
 
+    /// Generate a TLS Certificate message containing the server's DER cert.
+    /// Must be called after generateEncryptedExtensions.
+    /// Returns the message bytes (added to transcript).
+    pub fn generateCertificate(self: *ServerHandshake, out: []u8) usize {
+        if (!self.has_cert or self.cert_der_len == 0) return 0;
+        if (out.len < self.cert_der_len + 16) return 0;
+
+        var pos: usize = 0;
+
+        // Handshake header: Certificate (11)
+        out[pos] = MSG_CERTIFICATE;
+        pos += 1;
+        const len_pos = pos;
+        pos += 3; // length placeholder
+
+        // Certificate request context (0 length for server cert)
+        out[pos] = 0;
+        pos += 1;
+
+        // Certificate list length (3 bytes)
+        const cert_entry_len: u32 = @as(u32, self.cert_der_len) + 3 + 2;
+        out[pos] = @intCast((cert_entry_len >> 16) & 0xFF);
+        out[pos + 1] = @intCast((cert_entry_len >> 8) & 0xFF);
+        out[pos + 2] = @intCast(cert_entry_len & 0xFF);
+        pos += 3;
+
+        // Certificate entry: cert_data_length(3) + cert_data + extensions_length(2)
+        const cert_len_u32: u32 = self.cert_der_len;
+        out[pos] = @intCast((cert_len_u32 >> 16) & 0xFF);
+        out[pos + 1] = @intCast((cert_len_u32 >> 8) & 0xFF);
+        out[pos + 2] = @intCast(cert_len_u32 & 0xFF);
+        pos += 3;
+        @memcpy(out[pos..][0..self.cert_der_len], self.cert_der[0..self.cert_der_len]);
+        pos += self.cert_der_len;
+        // Extensions (none)
+        out[pos] = 0;
+        out[pos + 1] = 0;
+        pos += 2;
+
+        // Write message length
+        const msg_len = pos - 4;
+        out[len_pos] = @intCast((msg_len >> 16) & 0xFF);
+        out[len_pos + 1] = @intCast((msg_len >> 8) & 0xFF);
+        out[len_pos + 2] = @intCast(msg_len & 0xFF);
+
+        // Add to transcript
+        self.transcript.update(out[0..pos]);
+        return pos;
+    }
+
+    /// Generate CertificateVerify: ECDSA-P256 signature over the transcript.
+    /// Must be called after generateCertificate.
+    pub fn generateCertificateVerify(self: *ServerHandshake, out: []u8) usize {
+        if (!self.has_cert) return 0;
+        if (out.len < 80) return 0;
+
+        const p256 = @import("p256.sig");
+
+        // Build the content to sign per RFC 8446 §4.4.3:
+        // 64 * 0x20 (space) + "TLS 1.3, server CertificateVerify" + 0x00 + transcript_hash
+        var sign_content: [130]u8 = undefined;
+        @memset(sign_content[0..64], 0x20); // 64 spaces
+        const label = "TLS 1.3, server CertificateVerify";
+        @memcpy(sign_content[64..][0..label.len], label);
+        sign_content[64 + label.len] = 0x00;
+        // Transcript hash up to this point
+        var transcript_hash: [32]u8 = undefined;
+        var tc = self.transcript;
+        tc.final(&transcript_hash);
+        @memcpy(sign_content[64 + label.len + 1 ..][0..32], &transcript_hash);
+        const content_len = 64 + label.len + 1 + 32;
+
+        // Hash the content (ECDSA signs the hash)
+        var content_hash: [32]u8 = undefined;
+        sha256.hash(sign_content[0..content_len], &content_hash);
+
+        // Sign with ECDSA P-256
+        const sig = p256.sign(&self.signing_key, &content_hash);
+
+        // Build CertificateVerify message
+        var pos: usize = 0;
+        out[pos] = MSG_CERTIFICATE_VERIFY;
+        pos += 1;
+        const len_pos = pos;
+        pos += 3;
+
+        // Signature algorithm: ecdsa_secp256r1_sha256 (0x0403)
+        out[pos] = 0x04;
+        out[pos + 1] = 0x03;
+        pos += 2;
+
+        // Signature (DER-encoded ECDSA: 30 LEN 02 LEN r 02 LEN s)
+        // Build DER encoding of (r, s)
+        var der_sig: [72]u8 = undefined;
+        const der_len = encodeDerSignature(&sig.r, &sig.s, &der_sig);
+
+        // Signature length (2 bytes)
+        out[pos] = @intCast((der_len >> 8) & 0xFF);
+        out[pos + 1] = @intCast(der_len & 0xFF);
+        pos += 2;
+        @memcpy(out[pos..][0..der_len], der_sig[0..der_len]);
+        pos += der_len;
+
+        // Write message length
+        const msg_len = pos - 4;
+        out[len_pos] = @intCast((msg_len >> 16) & 0xFF);
+        out[len_pos + 1] = @intCast((msg_len >> 8) & 0xFF);
+        out[len_pos + 2] = @intCast(msg_len & 0xFF);
+
+        // Add to transcript
+        self.transcript.update(out[0..pos]);
+        return pos;
+    }
+
     /// Generate the Finished message (HMAC over transcript).
-    /// Call after generateEncryptedExtensions.
+    /// Call after generateCertificateVerify (or generateEncryptedExtensions if no cert).
     pub fn generateFinished(self: *ServerHandshake, out: []u8) usize {
         // finished_key = HKDF-Expand-Label(server_hs_secret, "finished", "", 32)
         var finished_key: [32]u8 = undefined;
@@ -515,3 +644,53 @@ pub const ServerHandshake = struct {
         return false;
     }
 };
+
+
+/// Encode an ECDSA (r, s) pair as DER: SEQUENCE { INTEGER r, INTEGER s }
+fn encodeDerSignature(r: *const [32]u8, s: *const [32]u8, out: *[72]u8) usize {
+    var pos: usize = 0;
+    out[pos] = 0x30; // SEQUENCE
+    pos += 1;
+    const total_len_pos = pos;
+    pos += 1; // length placeholder
+
+    // Encode r as INTEGER
+    pos += encodeDerInteger(r, out[pos..]);
+    // Encode s as INTEGER
+    pos += encodeDerInteger(s, out[pos..]);
+
+    // Write total length
+    out[total_len_pos] = @intCast(pos - 2);
+    return pos;
+}
+
+fn encodeDerInteger(val: *const [32]u8, out: []u8) usize {
+    var pos: usize = 0;
+    out[pos] = 0x02; // INTEGER
+    pos += 1;
+
+    // Find first non-zero byte (strip leading zeros)
+    var start: usize = 0;
+    while (start < 32 and val[start] == 0) start += 1;
+    if (start == 32) {
+        // Value is zero
+        out[pos] = 1;
+        pos += 1;
+        out[pos] = 0;
+        pos += 1;
+        return pos;
+    }
+
+    // If high bit is set, prepend a zero byte (positive integer)
+    const needs_pad = (val[start] & 0x80) != 0;
+    const len: u8 = @intCast(32 - start + @as(usize, if (needs_pad) 1 else 0));
+    out[pos] = len;
+    pos += 1;
+    if (needs_pad) {
+        out[pos] = 0;
+        pos += 1;
+    }
+    @memcpy(out[pos..][0..32 - start], val[start..32]);
+    pos += 32 - start;
+    return pos;
+}
