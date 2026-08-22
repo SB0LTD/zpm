@@ -61,18 +61,22 @@ pub const HandshakeState = enum(u8) {
 
 /// Key material produced by the handshake.
 pub const HandshakeKeys = struct {
-    /// Server handshake traffic key/IV (for encrypting EE+Cert+Finished)
+    /// Server handshake traffic key/IV/HP (for encrypting EE+Cert+Finished)
     server_hs_key: [16]u8 = @splat(0),
     server_hs_iv: [12]u8 = @splat(0),
-    /// Client handshake traffic key/IV (for decrypting client Finished)
+    server_hs_hp: [16]u8 = @splat(0),
+    /// Client handshake traffic key/IV/HP (for decrypting client Finished)
     client_hs_key: [16]u8 = @splat(0),
     client_hs_iv: [12]u8 = @splat(0),
+    client_hs_hp: [16]u8 = @splat(0),
     /// Server application traffic key/IV
     server_app_key: [16]u8 = @splat(0),
     server_app_iv: [12]u8 = @splat(0),
+    server_app_hp: [16]u8 = @splat(0),
     /// Client application traffic key/IV
     client_app_key: [16]u8 = @splat(0),
     client_app_iv: [12]u8 = @splat(0),
+    client_app_hp: [16]u8 = @splat(0),
 };
 
 /// Parsed ClientHello data relevant to QUIC.
@@ -334,11 +338,13 @@ pub const ServerHandshake = struct {
         // server_handshake_traffic_secret
         hkdf.expandLabel(&handshake_secret, "s hs traffic", &transcript_hash, &self.server_hs_secret);
 
-        // Derive key/IV for each
-        hkdf.expandLabel(&self.server_hs_secret, "key", &.{}, &self.keys.server_hs_key);
-        hkdf.expandLabel(&self.server_hs_secret, "iv", &.{}, &self.keys.server_hs_iv);
-        hkdf.expandLabel(&self.client_hs_secret, "key", &.{}, &self.keys.client_hs_key);
-        hkdf.expandLabel(&self.client_hs_secret, "iv", &.{}, &self.keys.client_hs_iv);
+        // Derive key/IV/HP for each (QUIC-specific labels per RFC 9001 §5.1)
+        hkdf.expandLabel(&self.server_hs_secret, "quic key", &.{}, &self.keys.server_hs_key);
+        hkdf.expandLabel(&self.server_hs_secret, "quic iv", &.{}, &self.keys.server_hs_iv);
+        hkdf.expandLabel(&self.server_hs_secret, "quic hp", &.{}, &self.keys.server_hs_hp);
+        hkdf.expandLabel(&self.client_hs_secret, "quic key", &.{}, &self.keys.client_hs_key);
+        hkdf.expandLabel(&self.client_hs_secret, "quic iv", &.{}, &self.keys.client_hs_iv);
+        hkdf.expandLabel(&self.client_hs_secret, "quic hp", &.{}, &self.keys.client_hs_hp);
     }
 
     /// Generate EncryptedExtensions message (plaintext, to be encrypted at Handshake level).
@@ -470,11 +476,13 @@ pub const ServerHandshake = struct {
         hkdf.expandLabel(&master_secret, "s ap traffic", &transcript_hash, &server_app_secret);
         hkdf.expandLabel(&master_secret, "c ap traffic", &transcript_hash, &client_app_secret);
 
-        // Derive key/IV
+        // Derive key/IV/HP
         hkdf.expandLabel(&server_app_secret, "key", &.{}, &self.keys.server_app_key);
         hkdf.expandLabel(&server_app_secret, "iv", &.{}, &self.keys.server_app_iv);
+        hkdf.expandLabel(&server_app_secret, "quic hp", &.{}, &self.keys.server_app_hp);
         hkdf.expandLabel(&client_app_secret, "key", &.{}, &self.keys.client_app_key);
         hkdf.expandLabel(&client_app_secret, "iv", &.{}, &self.keys.client_app_iv);
+        hkdf.expandLabel(&client_app_secret, "quic hp", &.{}, &self.keys.client_app_hp);
     }
 
     /// Verify the client's Finished message.
