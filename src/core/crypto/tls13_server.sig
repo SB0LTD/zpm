@@ -170,13 +170,21 @@ pub const ServerHandshake = struct {
             switch (ext_type) {
                 EXT_KEY_SHARE => {
                     // Parse key_share_extension (client)
-                    if (ext_len >= 36) {
-                        // client_shares length (2) + group(2) + key_len(2) + key(32)
-                        const group: u16 = (@as(u16, msg[pos + 2]) << 8) | msg[pos + 3];
-                        const klen: u16 = (@as(u16, msg[pos + 4]) << 8) | msg[pos + 5];
-                        if (group == GROUP_X25519 and klen == 32 and pos + 6 + 32 <= ext_end) {
-                            @memcpy(&self.client_info.client_key_share, msg[pos + 6 ..][0..32]);
-                            self.client_info.has_key_share = true;
+                    // Format: client_shares_length(2) || entries...
+                    // Entry: group(2) || key_length(2) || key(N)
+                    if (ext_len >= 6) {
+                        var ks_pos: usize = pos + 2; // skip list length
+                        const ks_end: usize = pos + ext_len;
+                        while (ks_pos + 4 <= ks_end) {
+                            const group: u16 = (@as(u16, msg[ks_pos]) << 8) | msg[ks_pos + 1];
+                            const klen: u16 = (@as(u16, msg[ks_pos + 2]) << 8) | msg[ks_pos + 3];
+                            ks_pos += 4;
+                            if (group == GROUP_X25519 and klen == 32 and ks_pos + 32 <= ks_end) {
+                                @memcpy(&self.client_info.client_key_share, msg[ks_pos..][0..32]);
+                                self.client_info.has_key_share = true;
+                                break;
+                            }
+                            ks_pos += klen; // skip this entry's key data
                         }
                     }
                 },
@@ -212,7 +220,7 @@ pub const ServerHandshake = struct {
             pos += ext_len;
         }
 
-        if (!self.client_info.has_key_share or !self.client_info.has_tls13) return false;
+        if (!self.client_info.has_key_share) return false;
 
         self.state = .client_hello_received;
         return true;
