@@ -108,6 +108,58 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         "src/transport/linux_platform.sig";
     _ = try ctx.addModule("win32", win32_path);
     _ = try ctx.addModule("gl", "src/platform/gl.sig");
+
+    // ── Network modules (Layer 0: pure computation, freestanding) ──
+    _ = try ctx.addModule("net_checksum", "src/net/checksum.sig");
+    _ = try ctx.addModule("net_ethernet", "src/net/ethernet.sig");
+    _ = try ctx.addModule("net_interface", "src/net/interface.sig");
+
+    const net_ipv4 = try ctx.addModule("net_ipv4", "src/net/ipv4.sig");
+    try wire(ctx, net_ipv4, "checksum", "src/net/checksum.sig");
+
+    const net_arp = try ctx.addModule("net_arp", "src/net/arp.sig");
+    try wire(ctx, net_arp, "ethernet", "src/net/ethernet.sig");
+    try wire(ctx, net_arp, "interface", "src/net/interface.sig");
+
+    const net_icmp = try ctx.addModule("net_icmp", "src/net/icmp.sig");
+    try wire(ctx, net_icmp, "checksum", "src/net/checksum.sig");
+    try wire(ctx, net_icmp, "ipv4", "src/net/ipv4.sig");
+
+    const net_udp = try ctx.addModule("net_udp", "src/net/udp.sig");
+    try wire(ctx, net_udp, "checksum", "src/net/checksum.sig");
+    try wire(ctx, net_udp, "ipv4", "src/net/ipv4.sig");
+
+    const net_tcp = try ctx.addModule("net_tcp", "src/net/tcp.sig");
+    try wire(ctx, net_tcp, "checksum", "src/net/checksum.sig");
+    try wire(ctx, net_tcp, "ipv4", "src/net/ipv4.sig");
+
+    const net_dhcp = try ctx.addModule("net_dhcp", "src/net/dhcp.sig");
+    try wire(ctx, net_dhcp, "ethernet", "src/net/ethernet.sig");
+    try wire(ctx, net_dhcp, "ipv4", "src/net/ipv4.sig");
+    try wire(ctx, net_dhcp, "udp", "src/net/udp.sig");
+    try wire(ctx, net_dhcp, "checksum", "src/net/checksum.sig");
+
+    const net_dns = try ctx.addModule("net_dns", "src/net/dns.sig");
+    try wire(ctx, net_dns, "udp", "src/net/udp.sig");
+    try wire(ctx, net_dns, "ipv4", "src/net/ipv4.sig");
+
+    const net_http = try ctx.addModule("net_http", "src/net/http.sig");
+    try wire(ctx, net_http, "tcp", "src/net/tcp.sig");
+
+    // Net test suite
+    _ = try addTest(ctx, test_all, "test-net", "src/net/tests.sig", &.{
+        importEntry("checksum", "src/net/checksum.sig"),
+        importEntry("ethernet", "src/net/ethernet.sig"),
+        importEntry("interface", "src/net/interface.sig"),
+        importEntry("arp", "src/net/arp.sig"),
+        importEntry("ipv4", "src/net/ipv4.sig"),
+        importEntry("icmp", "src/net/icmp.sig"),
+        importEntry("udp", "src/net/udp.sig"),
+        importEntry("tcp", "src/net/tcp.sig"),
+        importEntry("dhcp", "src/net/dhcp.sig"),
+        importEntry("dns", "src/net/dns.sig"),
+        importEntry("http", "src/net/http.sig"),
+    });
     const window = try ctx.addModule("window", "src/platform/window.sig");
     try wire(ctx, window, "win32", win32_path);
     try wire(ctx, window, "gl", "src/platform/gl.sig");
