@@ -46,6 +46,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("math", "src/core/math.sig");
     _ = try ctx.addModule("json", "src/core/json.sig");
     _ = try ctx.addModule("sha256", "src/core/sha256.sig");
+    _ = try ctx.addModule("inflate", "src/core/inflate.sig");
     const jsonl = try ctx.addModule("jsonl", "src/core/jsonl.sig");
     try wire(ctx, jsonl, "json", "src/core/json.sig");
     _ = try ctx.addModule("ai_core", "src/core/ai_core.sig");
@@ -96,6 +97,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("multimodal_now", "src/core/multimodal_now.sig"),
     });
     _ = try addTest(ctx, test_all, "test-sha256", "src/core/sha256.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-inflate", "src/core/inflate.sig", &.{
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-jsonl", "src/core/jsonl.sig", &.{
         importEntry("json", "src/core/json.sig"),
     });
