@@ -282,3 +282,89 @@ test "preset context fits in 1GB arena" {
     const mem = memoryRequired(QWEN3_0_6B, 8192);
     if (mem > 1024 * 1024 * 1024) return error.TestUnexpectedResult;
 }
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Inline Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Test allocator using a static buffer (no OS dependency)
+var test_backing: [1024 * 1024]u8 = undefined; // 1MB
+var test_offset: usize = 0;
+
+fn testAlloc(byte_count: usize, alignment: usize) ?[*]u8 {
+    const aligned = (test_offset + alignment - 1) & ~(alignment - 1);
+    if (aligned + byte_count > test_backing.len) return null;
+    test_offset = aligned + byte_count;
+    return @ptrCast(&test_backing[aligned]);
+}
+
+fn resetTestAlloc() void {
+    test_offset = 0;
+}
+
+test "init with valid config" {
+    resetTestAlloc();
+    const cache = KvCache.init(testAlloc, 4, 2, 64, 128) catch return error.TestUnexpectedResult;
+    if (cache.layer_count != 4) return error.TestUnexpectedResult;
+    if (cache.head_count != 2) return error.TestUnexpectedResult;
+    if (cache.head_dim != 64) return error.TestUnexpectedResult;
+    if (cache.max_context != 128) return error.TestUnexpectedResult;
+    if (cache.context_used != 0) return error.TestUnexpectedResult;
+}
+
+test "init with zero config returns error" {
+    resetTestAlloc();
+    if (KvCache.init(testAlloc, 0, 2, 64, 128)) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        if (err != error.InvalidConfig) return error.TestUnexpectedResult;
+    }
+}
+
+test "store advances context_used" {
+    resetTestAlloc();
+    var cache = KvCache.init(testAlloc, 2, 2, 4, 16) catch return error.TestUnexpectedResult;
+    var key = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 }; // 2 heads * 4 dim
+    var val = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+    cache.store(0, 0, &key, &val) catch return error.TestUnexpectedResult;
+    if (cache.context_used != 1) return error.TestUnexpectedResult;
+    cache.store(0, 1, &key, &val) catch return error.TestUnexpectedResult;
+    if (cache.context_used != 2) return error.TestUnexpectedResult;
+}
+
+test "context exceeded returns error" {
+    resetTestAlloc();
+    var cache = KvCache.init(testAlloc, 1, 1, 2, 2) catch return error.TestUnexpectedResult;
+    var key = [_]f32{ 1.0, 2.0 };
+    var val = [_]f32{ 0.1, 0.2 };
+    cache.store(0, 0, &key, &val) catch return error.TestUnexpectedResult;
+    cache.store(0, 1, &key, &val) catch return error.TestUnexpectedResult;
+    if (cache.store(0, 2, &key, &val)) |_| {
+        return error.TestUnexpectedResult; // Should have failed
+    } else |err| {
+        if (err != error.ContextExceeded) return error.TestUnexpectedResult;
+    }
+}
+
+test "reset clears context_used" {
+    resetTestAlloc();
+    var cache = KvCache.init(testAlloc, 1, 1, 2, 8) catch return error.TestUnexpectedResult;
+    var key = [_]f32{ 1.0, 2.0 };
+    var val = [_]f32{ 0.1, 0.2 };
+    cache.store(0, 0, &key, &val) catch return error.TestUnexpectedResult;
+    cache.store(0, 1, &key, &val) catch return error.TestUnexpectedResult;
+    if (cache.context_used != 2) return error.TestUnexpectedResult;
+    cache.reset();
+    if (cache.context_used != 0) return error.TestUnexpectedResult;
+    if (cache.remaining() != 8) return error.TestUnexpectedResult;
+}
+
+test "bytesForContext calculation" {
+    resetTestAlloc();
+    const cache = KvCache.init(testAlloc, 28, 8, 128, 2048) catch return error.TestUnexpectedResult;
+    const bytes = cache.bytesForContext(2048);
+    // 28 layers * 2 * 8 heads * 2048 positions * 128 dim * 2 bytes/f16
+    const expected: usize = 28 * 2 * 8 * 2048 * 128 * 2;
+    if (bytes != expected) return error.TestUnexpectedResult;
+}
