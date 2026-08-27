@@ -32,6 +32,12 @@ pub fn build(b: *std.Build) void {
     });
     jsonl_mod.addImport("json", json_mod);
 
+    const opus_mod = b.addModule("opus", .{
+        .root_source_file = b.path("src/core/opus.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const core_mod = b.addModule("core", .{
         .root_source_file = b.path("src/core/root.sig"),
         .target = target,
@@ -41,6 +47,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("json", json_mod);
     core_mod.addImport("sha256", sha256_mod);
     core_mod.addImport("jsonl", jsonl_mod);
+    core_mod.addImport("opus", opus_mod);
 
     // ── Granular modules (Layer 0: Image) ──
 
@@ -201,6 +208,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const android_mod = b.addModule("android", .{
+        .root_source_file = b.path("src/platform/android/root.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── Granular modules (Layer 2: Render) ──
 
     const color_mod = b.addModule("color", .{
@@ -216,6 +229,13 @@ pub fn build(b: *std.Build) void {
     });
     primitives_mod.addImport("gl", gl_mod);
     primitives_mod.addImport("color", color_mod);
+
+    const materials_mod = b.addModule("materials", .{
+        .root_source_file = b.path("src/render/materials.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    materials_mod.addImport("gl", gl_mod);
 
     const text_mod = b.addModule("text", .{
         .root_source_file = b.path("src/render/text.sig"),
@@ -241,6 +261,7 @@ pub fn build(b: *std.Build) void {
     });
     render_mod.addImport("color", color_mod);
     render_mod.addImport("primitives", primitives_mod);
+    render_mod.addImport("materials", materials_mod);
     render_mod.addImport("text", text_mod);
     render_mod.addImport("icon", icon_mod);
     if (os_tag == .windows) render_mod.linkSystemLibrary("opengl32", .{});
@@ -270,12 +291,14 @@ pub fn build(b: *std.Build) void {
     platform_mod.addImport("png", png_mod);
     platform_mod.addImport("mcp", mcp_mod);
     platform_mod.addImport("subprocess", subprocess_mod);
-    if (os_tag == .windows) { for ([_][]const u8{
-        "kernel32", "gdi32",   "user32", "shell32",
-        "opengl32", "winhttp", "bcrypt", "ws2_32",
-    }) |lib| {
-        platform_mod.linkSystemLibrary(lib, .{});
-    }
+    platform_mod.addImport("android", android_mod);
+    if (os_tag == .windows) {
+        for ([_][]const u8{
+            "kernel32", "gdi32",   "user32", "shell32",
+            "opengl32", "winhttp", "bcrypt", "ws2_32",
+        }) |lib| {
+            platform_mod.linkSystemLibrary(lib, .{});
+        }
     }
 
     // ── Test step ──
@@ -302,6 +325,128 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&subprocess_run.step);
     const subprocess_test_step = b.step("test-subprocess", "Run subprocess module tests");
     subprocess_test_step.dependOn(&subprocess_run.step);
+
+    // opus tests
+    const opus_tests = b.addTest(.{ .root_module = opus_mod });
+    const opus_run = b.addRunArtifact(opus_tests);
+    test_step.dependOn(&opus_run.step);
+    const opus_test_step = b.step("test-opus", "Run Opus codec module tests");
+    opus_test_step.dependOn(&opus_run.step);
+
+    // android tests
+    const android_tests = b.addTest(.{ .root_module = android_mod });
+    const android_run = b.addRunArtifact(android_tests);
+    test_step.dependOn(&android_run.step);
+    const android_test_step = b.step("test-android", "Run Android platform module tests");
+    android_test_step.dependOn(&android_run.step);
+
+    // ── Granular modules (Layer 0: Networking) ──
+
+    const net_checksum_mod = b.addModule("net_checksum", .{
+        .root_source_file = b.path("src/net/checksum.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const net_ethernet_mod = b.addModule("net_ethernet", .{
+        .root_source_file = b.path("src/net/ethernet.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const net_interface_mod = b.addModule("net_interface", .{
+        .root_source_file = b.path("src/net/interface.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const net_ipv4_mod = b.addModule("net_ipv4", .{
+        .root_source_file = b.path("src/net/ipv4.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    net_ipv4_mod.addImport("checksum", net_checksum_mod);
+
+    const net_arp_mod = b.addModule("net_arp", .{
+        .root_source_file = b.path("src/net/arp.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    net_arp_mod.addImport("ethernet", net_ethernet_mod);
+    net_arp_mod.addImport("interface", net_interface_mod);
+
+    const net_icmp_mod = b.addModule("net_icmp", .{
+        .root_source_file = b.path("src/net/icmp.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    net_icmp_mod.addImport("checksum", net_checksum_mod);
+    net_icmp_mod.addImport("ipv4", net_ipv4_mod);
+
+    const net_udp_mod = b.addModule("net_udp", .{
+        .root_source_file = b.path("src/net/udp.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    net_udp_mod.addImport("checksum", net_checksum_mod);
+    net_udp_mod.addImport("ipv4", net_ipv4_mod);
+
+    const net_tcp_mod = b.addModule("net_tcp", .{
+        .root_source_file = b.path("src/net/tcp.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    net_tcp_mod.addImport("checksum", net_checksum_mod);
+    net_tcp_mod.addImport("ipv4", net_ipv4_mod);
+
+    const net_dhcp_mod = b.addModule("net_dhcp", .{
+        .root_source_file = b.path("src/net/dhcp.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    net_dhcp_mod.addImport("ethernet", net_ethernet_mod);
+    net_dhcp_mod.addImport("ipv4", net_ipv4_mod);
+    net_dhcp_mod.addImport("udp", net_udp_mod);
+    net_dhcp_mod.addImport("checksum", net_checksum_mod);
+
+    const net_dns_mod = b.addModule("net_dns", .{
+        .root_source_file = b.path("src/net/dns.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    net_dns_mod.addImport("udp", net_udp_mod);
+    net_dns_mod.addImport("ipv4", net_ipv4_mod);
+
+    const net_http_mod = b.addModule("net_http", .{
+        .root_source_file = b.path("src/net/http.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    net_http_mod.addImport("tcp", net_tcp_mod);
+
+    // net test module (imports all net modules)
+    const net_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/net/tests.sig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    net_test_mod.addImport("checksum", net_checksum_mod);
+    net_test_mod.addImport("ethernet", net_ethernet_mod);
+    net_test_mod.addImport("interface", net_interface_mod);
+    net_test_mod.addImport("arp", net_arp_mod);
+    net_test_mod.addImport("ipv4", net_ipv4_mod);
+    net_test_mod.addImport("icmp", net_icmp_mod);
+    net_test_mod.addImport("udp", net_udp_mod);
+    net_test_mod.addImport("tcp", net_tcp_mod);
+    net_test_mod.addImport("dhcp", net_dhcp_mod);
+    net_test_mod.addImport("dns", net_dns_mod);
+    net_test_mod.addImport("http", net_http_mod);
+
+    const net_tests = b.addTest(.{ .root_module = net_test_mod });
+    const net_run = b.addRunArtifact(net_tests);
+    test_step.dependOn(&net_run.step);
+    const net_test_step = b.step("test-net", "Run networking module tests");
+    net_test_step.dependOn(&net_run.step);
 
     // ── Granular modules (Layer 1: Transport) ──
 
@@ -359,7 +504,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-        const datagram_mod = b.addModule("datagram", .{
+    const datagram_mod = b.addModule("datagram", .{
         .root_source_file = b.path("src/transport/datagram.sig"),
         .target = target,
         .optimize = optimize,
@@ -435,11 +580,12 @@ pub fn build(b: *std.Build) void {
     transport_mod.addImport("conn", conn_mod);
     transport_mod.addImport("telemetry", telemetry_mod);
     transport_mod.addImport("appmap", appmap_mod);
-    if (os_tag == .windows) { for ([_][]const u8{
-        "ws2_32", "bcrypt", "secur32", "kernel32",
-    }) |lib| {
-        transport_mod.linkSystemLibrary(lib, .{});
-    }
+    if (os_tag == .windows) {
+        for ([_][]const u8{
+            "ws2_32", "bcrypt", "secur32", "kernel32",
+        }) |lib| {
+            transport_mod.linkSystemLibrary(lib, .{});
+        }
     }
 
     // ── Test wiring ──
@@ -603,11 +749,12 @@ pub fn build(b: *std.Build) void {
     integration_mod.addImport("udp", udp_mod);
     integration_mod.addImport("win32", win32_mod);
     integration_mod.addImport("appmap", appmap_mod);
-    if (os_tag == .windows) { for ([_][]const u8{
-        "ws2_32", "bcrypt", "secur32", "kernel32",
-    }) |lib| {
-        integration_mod.linkSystemLibrary(lib, .{});
-    }
+    if (os_tag == .windows) {
+        for ([_][]const u8{
+            "ws2_32", "bcrypt", "secur32", "kernel32",
+        }) |lib| {
+            integration_mod.linkSystemLibrary(lib, .{});
+        }
     }
     const integration_tests = b.addTest(.{
         .root_module = integration_mod,
@@ -631,11 +778,12 @@ pub fn build(b: *std.Build) void {
     server_initial_mod.addImport("datagram", datagram_mod);
     server_initial_mod.addImport("udp", udp_mod);
     server_initial_mod.addImport("win32", win32_mod);
-    if (os_tag == .windows) { for ([_][]const u8{
-        "ws2_32", "bcrypt", "secur32", "kernel32",
-    }) |lib| {
-        server_initial_mod.linkSystemLibrary(lib, .{});
-    }
+    if (os_tag == .windows) {
+        for ([_][]const u8{
+            "ws2_32", "bcrypt", "secur32", "kernel32",
+        }) |lib| {
+            server_initial_mod.linkSystemLibrary(lib, .{});
+        }
     }
     const server_initial_tests = b.addTest(.{
         .root_module = server_initial_mod,
