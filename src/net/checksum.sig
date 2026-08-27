@@ -118,3 +118,54 @@ pub fn incrementalUpdate32(old_checksum: u16, old_value: u32, new_value: u32) u1
 pub fn verify(data: []const u8) bool {
     return fold(sum(data)) == 0;
 }
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+test "RFC 1071 example" {
+    const data = [_]u8{ 0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7 };
+    const result = compute(&data);
+    if (result != 0x220d) return error.TestUnexpectedResult;
+}
+
+test "zero data produces 0xFFFF" {
+    const data = [_]u8{ 0x00, 0x00, 0x00, 0x00 };
+    if (compute(&data) != 0xFFFF) return error.TestUnexpectedResult;
+}
+
+test "all ones produces 0x0000" {
+    const data = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF };
+    if (compute(&data) != 0x0000) return error.TestUnexpectedResult;
+}
+
+test "odd length byte" {
+    const data = [_]u8{ 0x01, 0x02, 0x03 };
+    if (compute(&data) != 0xFBFD) return error.TestUnexpectedResult;
+}
+
+test "verify valid header" {
+    var hdr = [_]u8{ 0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0xAC, 0x10, 0x0A, 0x63, 0xAC, 0x10, 0x0A, 0x0C };
+    const cksum = compute(&hdr);
+    hdr[10] = @intCast(cksum >> 8);
+    hdr[11] = @intCast(cksum & 0xFF);
+    if (!verify(&hdr)) return error.TestUnexpectedResult;
+}
+
+test "pseudo-header sum" {
+    const src = [4]u8{ 192, 168, 1, 1 };
+    const dst = [4]u8{ 192, 168, 1, 2 };
+    const acc = pseudoHeaderSum(src, dst, 17, 20);
+    const expected: u32 = 0xC0A8 + 0x0101 + 0xC0A8 + 0x0102 + 0x0011 + 0x0014;
+    if (acc != expected) return error.TestUnexpectedResult;
+}
+
+test "incremental update correctness" {
+    const data = [_]u8{ 0x45, 0x00, 0x00, 0x3c, 0x00, 0x00 };
+    const original = compute(&data);
+    const updated = incrementalUpdate(original, 0x4500, 0x4400);
+    var modified = data;
+    modified[0] = 0x44;
+    if (updated != compute(&modified)) return error.TestUnexpectedResult;
+}

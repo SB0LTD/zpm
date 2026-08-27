@@ -7,7 +7,7 @@
 //!
 //! Zero allocation — operates on caller-provided buffers.
 
-const checksum = @import("checksum");
+const checksum = @import("checksum.sig");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Constants
@@ -247,4 +247,52 @@ pub fn networkAddr(ip: [4]u8, mask: [4]u8) [4]u8 {
         ip[2] & mask[2],
         ip[3] & mask[3],
     };
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+test "build and parse round-trip" {
+    const src = [4]u8{ 192, 168, 1, 100 };
+    const dst = [4]u8{ 8, 8, 8, 8 };
+    var buf: [1500]u8 = undefined;
+    const len = buildPacket(&buf, src, dst, PROTO_UDP, "test data") orelse return error.TestUnexpectedResult;
+    if (len != 20 + 9) return error.TestUnexpectedResult;
+    const hdr = Header.parse(buf[0..len]) orelse return error.TestUnexpectedResult;
+    if (hdr.version != 4) return error.TestUnexpectedResult;
+    if (hdr.protocol != PROTO_UDP) return error.TestUnexpectedResult;
+    if (!ipEqual(hdr.src_ip, src)) return error.TestUnexpectedResult;
+    if (!ipEqual(hdr.dst_ip, dst)) return error.TestUnexpectedResult;
+    if (hdr.ttl != 64) return error.TestUnexpectedResult;
+}
+
+test "checksum validates" {
+    var buf: [1500]u8 = undefined;
+    _ = buildPacket(&buf, .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 }, PROTO_TCP, "x") orelse return error.TestUnexpectedResult;
+    if (!checksum.verify(buf[0..20])) return error.TestUnexpectedResult;
+}
+
+test "routing: same subnet direct" {
+    if (!isLocalSubnet(.{ 192, 168, 1, 50 }, .{ 192, 168, 1, 100 }, .{ 255, 255, 255, 0 })) return error.TestUnexpectedResult;
+    const hop = nextHop(.{ 192, 168, 1, 50 }, .{ 192, 168, 1, 100 }, .{ 255, 255, 255, 0 }, .{ 192, 168, 1, 1 });
+    if (!ipEqual(hop, .{ 192, 168, 1, 50 })) return error.TestUnexpectedResult;
+}
+
+test "routing: different subnet via gateway" {
+    if (isLocalSubnet(.{ 8, 8, 8, 8 }, .{ 192, 168, 1, 100 }, .{ 255, 255, 255, 0 })) return error.TestUnexpectedResult;
+    const hop = nextHop(.{ 8, 8, 8, 8 }, .{ 192, 168, 1, 100 }, .{ 255, 255, 255, 0 }, .{ 192, 168, 1, 1 });
+    if (!ipEqual(hop, .{ 192, 168, 1, 1 })) return error.TestUnexpectedResult;
+}
+
+test "routing: link-local always direct" {
+    const hop = nextHop(.{ 169, 254, 169, 254 }, .{ 10, 0, 0, 5 }, .{ 255, 255, 255, 0 }, .{ 10, 0, 0, 1 });
+    if (!ipEqual(hop, .{ 169, 254, 169, 254 })) return error.TestUnexpectedResult;
+}
+
+test "DF flag set" {
+    var buf: [1500]u8 = undefined;
+    _ = buildPacket(&buf, .{ 1, 2, 3, 4 }, .{ 5, 6, 7, 8 }, PROTO_ICMP, "x") orelse return error.TestUnexpectedResult;
+    if (buf[6] != 0x40) return error.TestUnexpectedResult;
 }

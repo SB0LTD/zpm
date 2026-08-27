@@ -7,10 +7,10 @@
 //! Zero allocation — static buffers, operates over UDP port 67/68.
 //! Uses the NetInterface abstraction for frame send/recv.
 
-const ethernet = @import("ethernet");
-const ipv4 = @import("ipv4");
-const udp = @import("udp");
-const checksum = @import("checksum");
+const ethernet = @import("ethernet.sig");
+const ipv4 = @import("ipv4.sig");
+const udp = @import("udp.sig");
+const checksum = @import("checksum.sig");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Constants

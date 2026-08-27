@@ -150,3 +150,44 @@ pub fn isForUs(frame: []const u8, our_mac: [6]u8) bool {
     if (isBroadcast(dst)) return true;
     return false;
 }
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+test "build and parse round-trip" {
+    const dst = [6]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
+    const src = [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+    const payload = "Hello, Ethernet!";
+    var buf: [1514]u8 = undefined;
+    const len = buildFrame(&buf, dst, src, ETHERTYPE_IPV4, payload) orelse return error.TestUnexpectedResult;
+    if (len != 14 + payload.len) return error.TestUnexpectedResult;
+    const hdr = Header.parse(buf[0..len]) orelse return error.TestUnexpectedResult;
+    if (hdr.ethertype != ETHERTYPE_IPV4) return error.TestUnexpectedResult;
+    if (!macEqual(hdr.dst_mac, dst)) return error.TestUnexpectedResult;
+    if (!macEqual(hdr.src_mac, src)) return error.TestUnexpectedResult;
+}
+
+test "broadcast and multicast detection" {
+    if (!isBroadcast(BROADCAST_MAC)) return error.TestUnexpectedResult;
+    if (isBroadcast(.{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 })) return error.TestUnexpectedResult;
+    if (!isMulticast(.{ 0x01, 0x00, 0x5e, 0x00, 0x00, 0x01 })) return error.TestUnexpectedResult;
+    if (isMulticast(.{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 })) return error.TestUnexpectedResult;
+}
+
+test "frame too short returns null" {
+    const short = [_]u8{ 0x00, 0x01, 0x02 };
+    if (Header.parse(&short) != null) return error.TestUnexpectedResult;
+}
+
+test "isForUs" {
+    const our = [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+    var buf: [1514]u8 = undefined;
+    _ = buildFrame(&buf, our, .{ 0, 0, 0, 0, 0, 0 }, ETHERTYPE_IPV4, "x") orelse return error.TestUnexpectedResult;
+    if (!isForUs(buf[0..15], our)) return error.TestUnexpectedResult;
+    _ = buildFrame(&buf, BROADCAST_MAC, .{ 0, 0, 0, 0, 0, 0 }, ETHERTYPE_ARP, "x") orelse return error.TestUnexpectedResult;
+    if (!isForUs(buf[0..15], our)) return error.TestUnexpectedResult;
+    _ = buildFrame(&buf, .{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, .{ 0, 0, 0, 0, 0, 0 }, ETHERTYPE_IPV4, "x") orelse return error.TestUnexpectedResult;
+    if (isForUs(buf[0..15], our)) return error.TestUnexpectedResult;
+}

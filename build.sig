@@ -136,29 +136,37 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const net_dhcp = try ctx.addModule("net_dhcp", "src/net/dhcp.sig");
     try wire(ctx, net_dhcp, "ethernet", "src/net/ethernet.sig");
     try wire(ctx, net_dhcp, "ipv4", "src/net/ipv4.sig");
-    try wire(ctx, net_dhcp, "udp", "src/net/udp.sig");
+    try wire(ctx, net_dhcp, "net_udp", "src/net/udp.sig");
     try wire(ctx, net_dhcp, "checksum", "src/net/checksum.sig");
 
     const net_dns = try ctx.addModule("net_dns", "src/net/dns.sig");
-    try wire(ctx, net_dns, "udp", "src/net/udp.sig");
+    try wire(ctx, net_dns, "net_udp", "src/net/udp.sig");
     try wire(ctx, net_dns, "ipv4", "src/net/ipv4.sig");
 
     const net_http = try ctx.addModule("net_http", "src/net/http.sig");
-    try wire(ctx, net_http, "tcp", "src/net/tcp.sig");
+    try wire(ctx, net_http, "net_tcp", "src/net/tcp.sig");
 
-    // Net test suite
-    _ = try addTest(ctx, test_all, "test-net", "src/net/tests.sig", &.{
+    // Net module tests — each module tested individually with its own imports resolved
+    _ = try addTest(ctx, test_all, "test-net-checksum", "src/net/checksum.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-net-ethernet", "src/net/ethernet.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-net-ipv4", "src/net/ipv4.sig", &.{
         importEntry("checksum", "src/net/checksum.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-net-arp", "src/net/arp.sig", &.{
         importEntry("ethernet", "src/net/ethernet.sig"),
         importEntry("interface", "src/net/interface.sig"),
-        importEntry("arp", "src/net/arp.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-net-icmp", "src/net/icmp.sig", &.{
+        importEntry("checksum", "src/net/checksum.sig"),
         importEntry("ipv4", "src/net/ipv4.sig"),
-        importEntry("icmp", "src/net/icmp.sig"),
-        importEntry("udp", "src/net/udp.sig"),
-        importEntry("tcp", "src/net/tcp.sig"),
-        importEntry("dhcp", "src/net/dhcp.sig"),
-        importEntry("dns", "src/net/dns.sig"),
-        importEntry("http", "src/net/http.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-net-udp", "src/net/udp.sig", &.{
+        importEntry("checksum", "src/net/checksum.sig"),
+        importEntry("ipv4", "src/net/ipv4.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-net-tcp", "src/net/tcp.sig", &.{
+        importEntry("checksum", "src/net/checksum.sig"),
+        importEntry("ipv4", "src/net/ipv4.sig"),
     });
     const window = try ctx.addModule("window", "src/platform/window.sig");
     try wire(ctx, window, "win32", win32_path);

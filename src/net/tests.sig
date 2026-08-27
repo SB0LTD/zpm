@@ -16,18 +16,38 @@ const ethernet = @import("ethernet");
 const arp = @import("arp");
 const ipv4 = @import("ipv4");
 const icmp = @import("icmp");
-const udp = @import("udp");
-const tcp = @import("tcp");
+const udp = @import("net_udp");
+const tcp = @import("net_tcp");
 const dhcp = @import("dhcp");
 const dns = @import("dns");
-const http = @import("http");
+const http = @import("net_http");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Test Helpers (no std dependency)
 // ══════════════════════════════════════════════════════════════════════════════
 
 fn expectEqual(comptime T: type, expected: T, actual: T) !void {
-    if (expected != actual) return error.TestExpectedEqual;
+    const ti = @typeInfo(T);
+    if (comptime ti == .optional) {
+        // For optionals: both null, or both non-null and payload equal
+        if (expected == null and actual == null) return;
+        if (expected == null or actual == null) return error.TestExpectedEqual;
+        // Can't easily compare payloads generically without recursion
+        // For our use cases (simple optionals), byte comparison works
+        const exp_bytes = @as(*const [@sizeOf(T)]u8, @ptrCast(&expected));
+        const act_bytes = @as(*const [@sizeOf(T)]u8, @ptrCast(&actual));
+        for (exp_bytes, act_bytes) |e, a| {
+            if (e != a) return error.TestExpectedEqual;
+        }
+    } else if (comptime ti == .@"struct" or ti == .@"enum") {
+        const exp_bytes = @as(*const [@sizeOf(T)]u8, @ptrCast(&expected));
+        const act_bytes = @as(*const [@sizeOf(T)]u8, @ptrCast(&actual));
+        for (exp_bytes, act_bytes) |e, a| {
+            if (e != a) return error.TestExpectedEqual;
+        }
+    } else {
+        if (expected != actual) return error.TestExpectedEqual;
+    }
 }
 
 fn expect(ok: bool) !void {

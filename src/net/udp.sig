@@ -5,8 +5,8 @@
 //!
 //! UDP header: src_port(2) + dst_port(2) + length(2) + checksum(2) = 8 bytes
 
-const checksum = @import("checksum");
-const ipv4 = @import("ipv4");
+const checksum = @import("checksum.sig");
+const ipv4 = @import("ipv4.sig");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Constants
@@ -239,4 +239,47 @@ pub fn dispatch(src_ip: [4]u8, datagram: Datagram) bool {
         }
     }
     return false;
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+test "build and parse round-trip" {
+    const src_ip = [4]u8{ 10, 0, 0, 1 };
+    const dst_ip = [4]u8{ 10, 0, 0, 2 };
+    const payload = "UDP payload";
+    var buf: [1500]u8 = undefined;
+    const udp_len = buildDatagram(&buf, 12345, 80, src_ip, dst_ip, payload) orelse return error.TestUnexpectedResult;
+    if (udp_len != 8 + payload.len) return error.TestUnexpectedResult;
+    const dgram = parseDatagram(buf[0..udp_len], src_ip, dst_ip) orelse return error.TestUnexpectedResult;
+    if (dgram.src_port != 12345) return error.TestUnexpectedResult;
+    if (dgram.dst_port != 80) return error.TestUnexpectedResult;
+    if (dgram.payload_data.len != payload.len) return error.TestUnexpectedResult;
+}
+
+test "corrupted checksum detected" {
+    const src_ip = [4]u8{ 10, 0, 0, 1 };
+    const dst_ip = [4]u8{ 10, 0, 0, 2 };
+    var buf: [1500]u8 = undefined;
+    const udp_len = buildDatagram(&buf, 1000, 2000, src_ip, dst_ip, "test") orelse return error.TestUnexpectedResult;
+    buf[8] ^= 0xFF; // Corrupt payload
+    if (parseDatagram(buf[0..udp_len], src_ip, dst_ip) != null) return error.TestUnexpectedResult;
+}
+
+test "port binding" {
+    const handler = struct {
+        fn h(_: [4]u8, _: u16, _: []const u8) void {}
+    }.h;
+    if (!bind(9999, handler)) return error.TestUnexpectedResult;
+    if (!isBound(9999)) return error.TestUnexpectedResult;
+    if (!unbind(9999)) return error.TestUnexpectedResult;
+    if (isBound(9999)) return error.TestUnexpectedResult;
+}
+
+test "buildPacket produces valid IPv4+UDP" {
+    var buf: [1500]u8 = undefined;
+    const len = buildPacket(&buf, .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 }, 5000, 80, "GET /") orelse return error.TestUnexpectedResult;
+    if (len != 20 + 8 + 5) return error.TestUnexpectedResult;
 }

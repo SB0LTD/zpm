@@ -24,8 +24,8 @@
 //! Zero allocation. Fixed connection pool. Static buffers.
 //! Designed for bare-metal kernel use (GCP metadata server, general networking).
 
-const checksum = @import("checksum");
-const ipv4 = @import("ipv4");
+const checksum = @import("checksum.sig");
+const ipv4 = @import("ipv4.sig");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Constants
@@ -1544,27 +1544,27 @@ fn allocPort() u16 {
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// a < b (accounting for wraparound)
-fn seqLt(a: u32, b: u32) bool {
+pub fn seqLt(a: u32, b: u32) bool {
     return @as(i32, @bitCast(a -% b)) < 0;
 }
 
 /// a <= b
-fn seqLeq(a: u32, b: u32) bool {
+pub fn seqLeq(a: u32, b: u32) bool {
     return @as(i32, @bitCast(a -% b)) <= 0;
 }
 
 /// a > b
-fn seqGt(a: u32, b: u32) bool {
+pub fn seqGt(a: u32, b: u32) bool {
     return @as(i32, @bitCast(a -% b)) > 0;
 }
 
 /// a >= b
-fn seqGeq(a: u32, b: u32) bool {
+pub fn seqGeq(a: u32, b: u32) bool {
     return @as(i32, @bitCast(a -% b)) >= 0;
 }
 
 /// Check if seq is in range [low, high) with wraparound.
-fn seqBetween(low: u32, seq: u32, high: u32) bool {
+pub fn seqBetween(low: u32, seq: u32, high: u32) bool {
     return seqGeq(seq, low) and seqLt(seq, high);
 }
 
@@ -1593,4 +1593,101 @@ fn writeBe32(buf: []u8, offset: usize, val: u32) void {
 
 fn ipEqual(a: [4]u8, b: [4]u8) bool {
     return a[0] == b[0] and a[1] == b[1] and a[2] == b[2] and a[3] == b[3];
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+test "sequence arithmetic: wraparound lt" {
+    if (!seqLt(0xFFFFFFFF, 0x00000001)) return error.TestUnexpectedResult;
+    if (!seqLt(0x80000000, 0x80000001)) return error.TestUnexpectedResult;
+    if (seqLt(0x00000001, 0xFFFFFFFF)) return error.TestUnexpectedResult;
+    if (seqLt(5, 5)) return error.TestUnexpectedResult;
+}
+
+test "sequence arithmetic: wraparound gt" {
+    if (!seqGt(0x00000001, 0xFFFFFFFF)) return error.TestUnexpectedResult;
+    if (seqGt(0xFFFFFFFF, 0x00000001)) return error.TestUnexpectedResult;
+    if (seqGt(5, 5)) return error.TestUnexpectedResult;
+}
+
+test "sequence arithmetic: between" {
+    if (!seqBetween(10, 15, 20)) return error.TestUnexpectedResult;
+    if (!seqBetween(10, 10, 20)) return error.TestUnexpectedResult; // inclusive left
+    if (seqBetween(10, 20, 20)) return error.TestUnexpectedResult; // exclusive right
+    // Wraparound
+    if (!seqBetween(0xFFFFFFF0, 0xFFFFFFF5, 0x00000005)) return error.TestUnexpectedResult;
+    if (!seqBetween(0xFFFFFFF0, 0x00000001, 0x00000005)) return error.TestUnexpectedResult;
+}
+
+test "sequence arithmetic: consistency" {
+    const vals = [_]u32{ 0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFE, 0xFFFFFFFF };
+    for (vals) |a| {
+        for (vals) |b| {
+            if (a == b) {
+                if (seqLt(a, b)) return error.TestUnexpectedResult;
+                if (seqGt(a, b)) return error.TestUnexpectedResult;
+            } else {
+                // Exactly one of lt/gt must be true
+                const lt = seqLt(a, b);
+                const gt = seqGt(a, b);
+                if (lt == gt) return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "congestion control: slow start" {
+    var cc = CongestionState.init(1460);
+    const initial = cc.cwnd;
+    cc.onAck(1460, 1460);
+    if (cc.cwnd != initial + 1460) return error.TestUnexpectedResult;
+    cc.onAck(1460, 1460);
+    if (cc.cwnd != initial + 2920) return error.TestUnexpectedResult;
+}
+
+test "congestion control: timeout resets" {
+    var cc = CongestionState.init(1460);
+    cc.cwnd = 50000;
+    cc.onTimeout(1460);
+    if (cc.cwnd != 1460) return error.TestUnexpectedResult;
+    if (cc.ssthresh != 25000) return error.TestUnexpectedResult;
+}
+
+test "congestion control: fast recovery entry" {
+    var cc = CongestionState.init(1460);
+    cc.cwnd = 20000;
+    cc.enterFastRecovery(15000, 50000);
+    if (cc.ssthresh != 7500) return error.TestUnexpectedResult;
+    if (cc.cwnd != 7500 + 3 * 1460) return error.TestUnexpectedResult;
+    if (!cc.in_recovery) return error.TestUnexpectedResult;
+}
+
+test "RTT estimation: first sample" {
+    var rtt = RttState.init();
+    rtt.update(100_000);
+    if (!rtt.has_sample) return error.TestUnexpectedResult;
+    if (rtt.srtt != 100_000 * 8) return error.TestUnexpectedResult;
+}
+
+test "RTT estimation: backoff capped at 60s" {
+    var rtt = RttState.init();
+    rtt.rto = 50_000_000;
+    rtt.backoff();
+    if (rtt.rto != 60_000_000) return error.TestUnexpectedResult;
+}
+
+test "connect allocates SYN_SENT" {
+    const handle = connect(.{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 }, 80) orelse return error.TestUnexpectedResult;
+    if (getState(handle) != .syn_sent) return error.TestUnexpectedResult;
+    abort(handle);
+    if (getState(handle) != .closed) return error.TestUnexpectedResult;
+}
+
+test "listen allocates LISTEN" {
+    const handle = listen(.{ 0, 0, 0, 0 }, 8080, 5) orelse return error.TestUnexpectedResult;
+    if (getState(handle) != .listen) return error.TestUnexpectedResult;
+    abort(handle);
 }

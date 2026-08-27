@@ -11,7 +11,7 @@
 //!
 //! Zero allocation — static buffers, operates over the TCP module.
 
-const tcp = @import("tcp");
+const tcp = @import("tcp.sig");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Constants
