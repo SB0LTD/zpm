@@ -106,6 +106,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
 
     // ── Inference pipeline modules (Layer 0 — pure computation, zero platform deps) ──
     _ = try ctx.addModule("gguf", "src/core/gguf.sig");
+    _ = try ctx.addModule("gguf_file", "src/core/gguf_file.sig");
     _ = try ctx.addModule("sampling", "src/core/sampling.sig");
     _ = try ctx.addModule("kv_cache", "src/core/kv_cache.sig");
     _ = try ctx.addModule("tokenizer_index", "src/core/tokenizer_index.sig");
@@ -116,6 +117,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
 
     // Inference pipeline tests
     _ = try addTest(ctx, test_all, "test-gguf", "src/core/gguf.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-gguf-file", "src/core/gguf_file.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-sampling", "src/core/sampling.sig", &.{});
     _ = try addTest(ctx, test_all, "test-kv-cache", "src/core/kv_cache.sig", &.{});
     _ = try addTest(ctx, test_all, "test-tokenizer-index", "src/core/tokenizer_index.sig", &.{
