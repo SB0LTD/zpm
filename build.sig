@@ -104,6 +104,50 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("json", "src/core/json.sig"),
     });
 
+    // ── Inference pipeline modules (Layer 0 — pure computation, zero platform deps) ──
+    _ = try ctx.addModule("gguf", "src/core/gguf.sig");
+    _ = try ctx.addModule("sampling", "src/core/sampling.sig");
+    _ = try ctx.addModule("kv_cache", "src/core/kv_cache.sig");
+    _ = try ctx.addModule("tokenizer_index", "src/core/tokenizer_index.sig");
+    _ = try ctx.addModule("tokenizer", "src/core/tokenizer.sig");
+    _ = try ctx.addModule("qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig");
+    _ = try ctx.addModule("qwen3_executor", "src/core/qwen3_executor.sig");
+    _ = try ctx.addModule("inference_session", "src/core/inference_session.sig");
+
+    // Inference pipeline tests
+    _ = try addTest(ctx, test_all, "test-gguf", "src/core/gguf.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-sampling", "src/core/sampling.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-kv-cache", "src/core/kv_cache.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-tokenizer-index", "src/core/tokenizer_index.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tokenizer", "src/core/tokenizer.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
+        importEntry("sb0_gguf_tokenizer_index", "src/core/tokenizer_index.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-qwen3-plan", "src/core/qwen3_decoder_plan.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-qwen3-executor", "src/core/qwen3_executor.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("transformer_ops", "src/core/transformer_ops.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-inference-session", "src/core/inference_session.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig"),
+        importEntry("qwen3_executor", "src/core/qwen3_executor.sig"),
+        importEntry("tokenizer", "src/core/tokenizer.sig"),
+        importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
+        importEntry("sampling", "src/core/sampling.sig"),
+        importEntry("kv_cache", "src/core/kv_cache.sig"),
+        importEntry("sb0_gguf_tokenizer_index", "src/core/tokenizer_index.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("transformer_ops", "src/core/transformer_ops.sig"),
+    });
+
     // Platform modules used by the portable and transport layers. The native
     // build host selects the same source split as the transitional graph.
     const win32_path = if (builtin.os.tag == .windows)
