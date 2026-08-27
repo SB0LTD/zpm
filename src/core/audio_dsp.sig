@@ -4,7 +4,7 @@
 //! sample cadence, and policy.  Coefficients are computed once per acoustic
 //! segment; the sample loop is fixed work and suitable for freestanding SB0.
 
-const std = @import("std");
+const math = @import("sig_math.sig");
 
 pub const Error = error{
     InvalidRate,
@@ -30,17 +30,17 @@ pub const Resonator = struct {
 
     pub fn configure(self: *Resonator, sample_rate: u32, frequency_hz: f32, bandwidth_hz: f32) Error!void {
         if (sample_rate < 8_000 or sample_rate > 384_000) return error.InvalidRate;
-        if (!std.math.isFinite(frequency_hz) or frequency_hz <= 0 or
+        if (!math.isFinite(frequency_hz) or frequency_hz <= 0 or
             frequency_hz >= @as(f32, @floatFromInt(sample_rate)) * 0.5)
             return error.InvalidFrequency;
-        if (!std.math.isFinite(bandwidth_hz) or bandwidth_hz <= 0 or
+        if (!math.isFinite(bandwidth_hz) or bandwidth_hz <= 0 or
             bandwidth_hz >= @as(f32, @floatFromInt(sample_rate)) * 0.5)
             return error.InvalidBandwidth;
         const rate: f32 = @floatFromInt(sample_rate);
-        const radius = @exp(-std.math.pi * bandwidth_hz / rate);
-        self.coefficient = 2.0 * radius * @cos(2.0 * std.math.pi * frequency_hz / rate);
+        const radius = @exp(-math.pi * bandwidth_hz / rate);
+        self.coefficient = 2.0 * radius * @cos(2.0 * math.pi * frequency_hz / rate);
         self.decay = radius * radius;
-        if (!std.math.isFinite(self.coefficient) or !std.math.isFinite(self.decay))
+        if (!math.isFinite(self.coefficient) or !math.isFinite(self.decay))
             return error.NonFinite;
     }
 
@@ -84,7 +84,7 @@ pub const ClipStats = struct {
 };
 
 pub fn toPcm16(value: f32, stats: *ClipStats) Error!i16 {
-    if (!std.math.isFinite(value)) return error.NonFinite;
+    if (!math.isFinite(value)) return error.NonFinite;
     const scaled = value * 32_767.0;
     const rounded: i32 = @intFromFloat(@round(scaled));
     const bounded = @max(PCM16_MIN, @min(PCM16_MAX, rounded));
@@ -137,12 +137,12 @@ pub fn edgeEnvelope(index: usize, length: usize, edge_samples: usize) f32 {
     if (edge == 0) return 1;
     if (index < edge) {
         const phase = @as(f32, @floatFromInt(index)) / @as(f32, @floatFromInt(edge));
-        return 0.5 - 0.5 * @cos(std.math.pi * phase);
+        return 0.5 - 0.5 * @cos(math.pi * phase);
     }
     const remaining = length - 1 - @min(index, length - 1);
     if (remaining < edge) {
         const phase = @as(f32, @floatFromInt(remaining)) / @as(f32, @floatFromInt(edge));
-        return 0.5 - 0.5 * @cos(std.math.pi * phase);
+        return 0.5 - 0.5 * @cos(math.pi * phase);
     }
     return 1;
 }
@@ -155,7 +155,7 @@ pub const WavPcm16 = struct {
         if (sample_rate < 8_000 or sample_rate > 384_000 or channels == 0 or channels > 8)
             return error.InvalidRate;
         const data_product = @mulWithOverflow(@as(u64, samples_per_channel), @as(u64, channels) * 2);
-        if (data_product[1] != 0 or data_product[0] > std.math.maxInt(u32) - 36)
+        if (data_product[1] != 0 or data_product[0] > math.maxInt(u32) - 36)
             return error.SampleCountOverflow;
         const data_bytes: u32 = @intCast(data_product[0]);
         @memset(destination[0..HEADER_BYTES], 0);
@@ -168,7 +168,7 @@ pub const WavPcm16 = struct {
         put16(destination, 22, channels);
         put32(destination, 24, sample_rate);
         const byte_rate = @as(u64, sample_rate) * channels * 2;
-        if (byte_rate > std.math.maxInt(u32)) return error.SampleCountOverflow;
+        if (byte_rate > math.maxInt(u32)) return error.SampleCountOverflow;
         put32(destination, 28, @intCast(byte_rate));
         put16(destination, 32, channels * 2);
         put16(destination, 34, 16);
@@ -189,7 +189,7 @@ fn put32(destination: []u8, offset: usize, value: u32) void {
     destination[offset + 3] = @truncate(value >> 24);
 }
 
-const testing = std.testing;
+
 
 test "resonator remains finite and deterministic" {
     var left = Resonator{};
@@ -200,8 +200,8 @@ test "resonator remains finite and deterministic" {
         const excitation: f32 = if (index % 171 == 0) 0.01 else 0;
         const a = left.process(excitation);
         const b = right.process(excitation);
-        try testing.expect(std.math.isFinite(a));
-        try testing.expectEqual(a, b);
+        try testing.expect(math.isFinite(a));
+        if (b != a) return error.TestUnexpectedResult;
     }
 }
 
@@ -214,38 +214,38 @@ test "noise is reproducible and zero seed is live" {
         try testing.expectEqual(a, right.nextSigned());
         nonzero = nonzero or a != 0;
     }
-    try testing.expect(nonzero);
+    if (!(nonzero)) return error.TestUnexpectedResult;
 }
 
 test "PCM clipping is explicit and counted" {
     var stats = ClipStats{};
     try testing.expectEqual(@as(i16, 16_384), try toPcm16(0.5, &stats));
     try testing.expectEqual(@as(i16, 32_767), try toPcm16(2.0, &stats));
-    try testing.expectEqual(@as(u64, 1), stats.clipped);
+    if (stats.clipped != 1) return error.TestUnexpectedResult;
 }
 
 test "PCM peak normalization is exact bounded and silence preserving" {
     var samples = [_]i16{ -100, 50, 0, 100 };
     const stats = try normalizePcm16(&samples, 1_000);
     try testing.expectEqualSlices(i16, &.{ -1_000, 500, 0, 1_000 }, &samples);
-    try testing.expectEqual(@as(u64, samples.len), stats.samples);
-    try testing.expectEqual(@as(u64, 0), stats.clipped);
-    try testing.expectEqual(@as(u16, 1_000), stats.peak_q15);
+    if (stats.samples != samples.len) return error.TestUnexpectedResult;
+    if (stats.clipped != 0) return error.TestUnexpectedResult;
+    if (stats.peak_q15 != 1_000) return error.TestUnexpectedResult;
 
     var silence: [8]i16 = @splat(0);
     const silent = try normalizePcm16(&silence, 24_576);
-    try testing.expectEqual(@as(u16, 0), silent.peak_q15);
+    if (silent.peak_q15 != 0) return error.TestUnexpectedResult;
     try testing.expectError(error.InvalidTarget, normalizePcm16(&samples, 0));
 }
 
 test "canonical PCM16 WAV header has exact byte rates" {
     var header: [WavPcm16.HEADER_BYTES]u8 = undefined;
     try WavPcm16.encodeHeader(&header, 24_000, 1, 24_000);
-    try testing.expectEqualStrings("RIFF", header[0..4]);
-    try testing.expectEqualStrings("WAVE", header[8..12]);
-    try testing.expectEqual(@as(u8, 0x80), header[28]);
-    try testing.expectEqual(@as(u8, 0xbb), header[29]);
-    try testing.expectEqual(@as(u8, 0x00), header[30]);
-    try testing.expectEqual(@as(u8, 0x00), header[31]);
-    try testing.expectEqualStrings("data", header[36..40]);
+    if (!mem.eql(u8, "RIFF", header[0..4])) return error.TestUnexpectedResult;
+    if (!mem.eql(u8, "WAVE", header[8..12])) return error.TestUnexpectedResult;
+    if (header[28] != 0x80) return error.TestUnexpectedResult;
+    if (header[29] != 0xbb) return error.TestUnexpectedResult;
+    if (header[30] != 0x00) return error.TestUnexpectedResult;
+    if (header[31] != 0x00) return error.TestUnexpectedResult;
+    if (!mem.eql(u8, "data", header[36..40])) return error.TestUnexpectedResult;
 }

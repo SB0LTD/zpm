@@ -16,7 +16,7 @@
 //!
 //! Zero heap allocation. All storage via caller-provided AllocFn.
 
-const std = @import("std");
+
 const gguf = @import("gguf.sig");
 const qwen3_plan = @import("qwen3_decoder_plan.sig");
 const executor = @import("qwen3_executor.sig");

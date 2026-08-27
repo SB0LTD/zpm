@@ -5,14 +5,14 @@
 // Handles nested objects by key path (e.g. find "k" then find "t" within it).
 // Sufficient for flat/shallow JSON like config files and streaming messages.
 
-const std = @import("std");
+const mem = @import("sig_mem.sig");
 
 /// Find the position just after a key match (after the closing quote of the key).
 /// Searches for "key" pattern in the data.
 pub fn findKey(data: []const u8, key: []const u8) ?usize {
     if (data.len < key.len) return null;
     for (0..data.len - key.len + 1) |i| {
-        if (std.mem.eql(u8, data[i..][0..key.len], key)) {
+        if (mem.eql(u8, data[i..][0..key.len], key)) {
             return i + key.len;
         }
     }
@@ -69,7 +69,7 @@ pub fn getBool(data: []const u8, key: []const u8) bool {
     const pos = findKey(data, key) orelse return false;
     var i = pos;
     while (i < data.len and (data[i] == ':' or data[i] == ' ' or data[i] == '\t')) : (i += 1) {}
-    if (i + 4 <= data.len and std.mem.eql(u8, data[i .. i + 4], "true")) return true;
+    if (i + 4 <= data.len and mem.eql(u8, data[i .. i + 4], "true")) return true;
     return false;
 }
 

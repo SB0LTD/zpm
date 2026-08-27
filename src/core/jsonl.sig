@@ -5,7 +5,7 @@
 // handles \r\n and \n line endings. Each non-empty line is returned as a slice
 // suitable for field extraction via @zpm/json helpers.
 
-const std = @import("std");
+
 const json = @import("json");
 
 /// Iterator over non-empty lines in a JSONL buffer.
@@ -104,7 +104,7 @@ pub fn parseLine(line: []const u8) ?[]const u8 {
 
 // ── Tests ──
 
-const testing = std.testing;
+
 
 test "jsonl: empty input" {
     var iter = JsonlIterator.init("");
@@ -118,7 +118,7 @@ test "jsonl: single line" {
     ;
     var iter = JsonlIterator.init(data);
     const line = iter.next();
-    try testing.expect(line != null);
+    if (!(line != null)) return error.TestUnexpectedResult;
     try testing.expect(iter.next() == null);
     try testing.expectEqual(@as(usize, 1), countLines(data));
 }
@@ -128,15 +128,15 @@ test "jsonl: multiple lines" {
     var iter = JsonlIterator.init(data);
 
     const l1 = iter.next().?;
-    try testing.expectEqualStrings("{\"a\": 1}", l1);
+    if (!mem.eql(u8, "{\"a\": 1}", l1)) return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 1), iter.lineNumber());
 
     const l2 = iter.next().?;
-    try testing.expectEqualStrings("{\"b\": 2}", l2);
+    if (!mem.eql(u8, "{\"b\": 2}", l2)) return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 2), iter.lineNumber());
 
     const l3 = iter.next().?;
-    try testing.expectEqualStrings("{\"c\": 3}", l3);
+    if (!mem.eql(u8, "{\"c\": 3}", l3)) return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 3), iter.lineNumber());
 
     try testing.expect(iter.next() == null);
@@ -148,10 +148,10 @@ test "jsonl: skip empty lines" {
     var iter = JsonlIterator.init(data);
 
     const l1 = iter.next().?;
-    try testing.expectEqualStrings("{\"a\": 1}", l1);
+    if (!mem.eql(u8, "{\"a\": 1}", l1)) return error.TestUnexpectedResult;
 
     const l2 = iter.next().?;
-    try testing.expectEqualStrings("{\"b\": 2}", l2);
+    if (!mem.eql(u8, "{\"b\": 2}", l2)) return error.TestUnexpectedResult;
 
     try testing.expect(iter.next() == null);
     try testing.expectEqual(@as(usize, 2), countLines(data));
@@ -162,10 +162,10 @@ test "jsonl: handle \\r\\n line endings" {
     var iter = JsonlIterator.init(data);
 
     const l1 = iter.next().?;
-    try testing.expectEqualStrings("{\"a\": 1}", l1);
+    if (!mem.eql(u8, "{\"a\": 1}", l1)) return error.TestUnexpectedResult;
 
     const l2 = iter.next().?;
-    try testing.expectEqualStrings("{\"b\": 2}", l2);
+    if (!mem.eql(u8, "{\"b\": 2}", l2)) return error.TestUnexpectedResult;
 
     try testing.expect(iter.next() == null);
     try testing.expectEqual(@as(usize, 2), countLines(data));
@@ -180,7 +180,7 @@ test "jsonl: no trailing newline" {
     const data = "{\"x\": 1}";
     var iter = JsonlIterator.init(data);
     const line = iter.next().?;
-    try testing.expectEqualStrings("{\"x\": 1}", line);
+    if (!mem.eql(u8, "{\"x\": 1}", line)) return error.TestUnexpectedResult;
     try testing.expect(iter.next() == null);
 }
 
@@ -203,11 +203,11 @@ test "jsonl: field extraction via json helpers" {
 
     const l1 = iter.next().?;
     const tid1 = json.getString(l1, "\"task_id\"");
-    try testing.expect(tid1 != null);
-    try testing.expectEqualStrings("HumanEval/0", tid1.?);
+    if (!(tid1 != null)) return error.TestUnexpectedResult;
+    if (!mem.eql(u8, "HumanEval/0", tid1.?)) return error.TestUnexpectedResult;
 
     const l2 = iter.next().?;
     const tid2 = json.getString(l2, "\"task_id\"");
-    try testing.expect(tid2 != null);
-    try testing.expectEqualStrings("HumanEval/1", tid2.?);
+    if (!(tid2 != null)) return error.TestUnexpectedResult;
+    if (!mem.eql(u8, "HumanEval/1", tid2.?)) return error.TestUnexpectedResult;
 }

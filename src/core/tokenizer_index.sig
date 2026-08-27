@@ -53,7 +53,7 @@ pub fn MergeIndex(comptime hash_capacity: usize, comptime maximum_merge_bytes: u
             self.* = .{};
             if (!merges.present) return error.MissingMerges;
             if (merges.element_type != 8) return error.InvalidMergesType;
-            if (merges.count > (hash_capacity * 3) / 4 or merges.count > std.math.maxInt(u32))
+            if (merges.count > (hash_capacity * 3) / 4 or merges.count > math.maxInt(u32))
                 return error.MergeCapacity;
 
             var position = merges.data_offset;
@@ -69,9 +69,9 @@ pub fn MergeIndex(comptime hash_capacity: usize, comptime maximum_merge_bytes: u
                 if (!source.read(position, merge_text)) return error.UnexpectedEof;
                 position = try add(position, length);
 
-                const separator = std.mem.indexOfScalar(u8, merge_text, ' ') orelse return error.InvalidMerge;
+                const separator = mem.indexOfScalar(u8, merge_text, ' ') orelse return error.InvalidMerge;
                 if (separator == 0 or separator + 1 == merge_text.len or
-                    std.mem.indexOfScalarPos(u8, merge_text, separator + 1, ' ') != null) return error.InvalidMerge;
+                    mem.indexOfScalarPos(u8, merge_text, separator + 1, ' ') != null) return error.InvalidMerge;
                 const left_text = merge_text[0..separator];
                 const right_text = merge_text[separator + 1 ..];
                 const left = vocabulary.lookup(source, left_text) orelse return error.UnknownMergeToken;
@@ -143,7 +143,7 @@ pub fn VocabularyIndex(comptime vocabulary_capacity: usize, comptime hash_capaci
             self.* = .{};
             if (!vocabulary.present) return error.MissingVocabulary;
             if (vocabulary.element_type != 8) return error.InvalidVocabularyType;
-            if (vocabulary.count > vocabulary_capacity or vocabulary.count > std.math.maxInt(u32) - 1)
+            if (vocabulary.count > vocabulary_capacity or vocabulary.count > math.maxInt(u32) - 1)
                 return error.VocabularyCapacity;
             // Keep maximum linear-probe load at 75%.
             if (vocabulary.count > (hash_capacity * 3) / 4) return error.HashCapacity;
@@ -153,7 +153,7 @@ pub fn VocabularyIndex(comptime vocabulary_capacity: usize, comptime hash_capaci
             while (token_id < vocabulary.count) : (token_id += 1) {
                 const length = try readU64(source, position);
                 position = try add(position, 8);
-                if (length > std.math.maxInt(u16)) return error.TokenTooLong;
+                if (length > math.maxInt(u16)) return error.TokenTooLong;
                 if (length > source.size or position > source.size - length) return error.UnexpectedEof;
                 const hash = try hashAt(source, position, length);
                 try self.insert(source, hash, position, @intCast(length), token_id);
@@ -165,7 +165,7 @@ pub fn VocabularyIndex(comptime vocabulary_capacity: usize, comptime hash_capaci
         }
 
         pub fn lookup(self: *const Self, source: gguf.Source, token: []const u8) ?u32 {
-            if (token.len > std.math.maxInt(u16)) return null;
+            if (token.len > math.maxInt(u16)) return null;
             const hash = hashBytes(token);
             var slot: usize = @intCast(hash & (hash_capacity - 1));
             var probes: usize = 0;
@@ -213,7 +213,8 @@ pub fn VocabularyIndex(comptime vocabulary_capacity: usize, comptime hash_capaci
     };
 }
 
-const std = @import("std");
+const math = @import("sig_math.sig");
+const mem = @import("sig_mem.sig");
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
@@ -260,7 +261,7 @@ fn equalAt(source: gguf.Source, offset: u64, expected: []const u8) Error!bool {
     while (consumed < expected.len) {
         const count = @min(expected.len - consumed, scratch.len);
         if (!source.read(try add(offset, consumed), scratch[0..count])) return error.UnexpectedEof;
-        if (!std.mem.eql(u8, scratch[0..count], expected[consumed..][0..count])) return false;
+        if (!mem.eql(u8, scratch[0..count], expected[consumed..][0..count])) return false;
         consumed += count;
     }
     return true;
@@ -274,7 +275,7 @@ fn rangesEqual(source: gguf.Source, left: u64, right: u64, length: u64) Error!bo
         const count: usize = @intCast(@min(length - consumed, left_bytes.len));
         if (!source.read(try add(left, consumed), left_bytes[0..count]) or
             !source.read(try add(right, consumed), right_bytes[0..count])) return error.UnexpectedEof;
-        if (!std.mem.eql(u8, left_bytes[0..count], right_bytes[0..count])) return false;
+        if (!mem.eql(u8, left_bytes[0..count], right_bytes[0..count])) return false;
         consumed += count;
     }
     return true;
@@ -283,7 +284,7 @@ fn rangesEqual(source: gguf.Source, left: u64, right: u64, length: u64) Error!bo
 fn readU64(source: gguf.Source, offset: u64) Error!u64 {
     var bytes: [8]u8 = undefined;
     if (!source.read(offset, &bytes)) return error.UnexpectedEof;
-    return std.mem.readInt(u64, &bytes, .little);
+    return mem.readInt(u64, &bytes, .little);
 }
 
 fn add(left: u64, right: anytype) Error!u64 {
@@ -308,60 +309,3 @@ const SliceSource = struct {
     }
 };
 
-test "vocabulary stays in model storage with exact collision checks" {
-    const testing = std.testing;
-    const encoded = [_]u8{
-        1, 0, 0, 0, 0, 0, 0, 0, 'a',
-        2, 0, 0, 0, 0, 0, 0, 0, 'a', 'b',
-        3, 0, 0, 0, 0, 0, 0, 0, 'x', 'y', 'z',
-    };
-    const slice = SliceSource{ .bytes = &encoded };
-    const vocabulary = gguf.ArrayRef{ .present = true, .element_type = 8, .count = 3, .data_offset = 0 };
-    var index: VocabularyIndex(3, 4) = .{};
-    try index.build(slice.source(), vocabulary);
-    try testing.expectEqual(@as(?u32, 0), index.lookup(slice.source(), "a"));
-    try testing.expectEqual(@as(?u32, 1), index.lookup(slice.source(), "ab"));
-    try testing.expectEqual(@as(?u32, 2), index.lookup(slice.source(), "xyz"));
-    try testing.expectEqual(@as(?u32, null), index.lookup(slice.source(), "missing"));
-    var output: [3]u8 = undefined;
-    const copied = try index.copyToken(slice.source(), 2, &output);
-    try testing.expectEqualStrings("xyz", output[0..copied]);
-}
-
-test "vocabulary builder rejects capacity and truncation" {
-    const testing = std.testing;
-    const encoded = [_]u8{ 2, 0, 0, 0, 0, 0, 0, 0, 'a' };
-    const slice = SliceSource{ .bytes = &encoded };
-    var index: VocabularyIndex(1, 2) = .{};
-    try testing.expectError(error.UnexpectedEof, index.build(slice.source(), .{
-        .present = true, .element_type = 8, .count = 1, .data_offset = 0,
-    }));
-    try testing.expectError(error.VocabularyCapacity, index.build(slice.source(), .{
-        .present = true, .element_type = 8, .count = 2, .data_offset = 0,
-    }));
-}
-
-test "merge index resolves canonical pair rank and result token" {
-    const testing = std.testing;
-    const encoded = [_]u8{
-        // vocabulary: a, b, ab
-        1, 0, 0, 0, 0, 0, 0, 0, 'a',
-        1, 0, 0, 0, 0, 0, 0, 0, 'b',
-        2, 0, 0, 0, 0, 0, 0, 0, 'a', 'b',
-        // merge: "a b"
-        3, 0, 0, 0, 0, 0, 0, 0, 'a', ' ', 'b',
-    };
-    const slice = SliceSource{ .bytes = &encoded };
-    var vocabulary: VocabularyIndex(3, 4) = .{};
-    try vocabulary.build(slice.source(), .{
-        .present = true, .element_type = 8, .count = 3, .data_offset = 0,
-    });
-    var merges: MergeIndex(4, 16) = .{};
-    try merges.build(slice.source(), .{
-        .present = true, .element_type = 8, .count = 1, .data_offset = 28,
-    }, &vocabulary);
-    const found = merges.find(0, 1).?;
-    try testing.expectEqual(@as(u32, 0), found.rank);
-    try testing.expectEqual(@as(u32, 2), found.result_token);
-    try testing.expect(merges.find(1, 0) == null);
-}

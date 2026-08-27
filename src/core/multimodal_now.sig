@@ -5,9 +5,10 @@
 //! admitted projection domain.  A VLM projector, audio adapter, or text model
 //! may publish only after numerical parity proves its mapping into that domain.
 
-const std = @import("std");
+const math = @import("sig_math.sig");
+const mem = @import("sig_mem.sig");
 
-pub const Q16_ONE: u16 = std.math.maxInt(u16);
+pub const Q16_ONE: u16 = math.maxInt(u16);
 
 pub const Modality = enum(u8) {
     text,
@@ -28,8 +29,8 @@ pub const Domain = struct {
     }
 
     pub fn eql(left: Domain, right: Domain) bool {
-        return std.mem.eql(u8, &left.encoder_family, &right.encoder_family) and
-            std.mem.eql(u8, &left.projection_schema, &right.projection_schema);
+        return mem.eql(u8, &left.encoder_family, &right.encoder_family) and
+            mem.eql(u8, &left.projection_schema, &right.projection_schema);
     }
 };
 
@@ -120,7 +121,7 @@ pub fn Fusion(comptime dimension: usize, comptime minimum_prefix: usize) type {
                 return self.reject(error.InvalidDimension);
             var candidate: [dimension]f32 = @splat(0);
             for (input.vector[0..input.prefix_dimensions], 0..) |value, lane| {
-                if (!std.math.isFinite(value)) return self.reject(error.NonFinite);
+                if (!math.isFinite(value)) return self.reject(error.NonFinite);
                 candidate[lane] = value;
             }
             self.slots[@intFromEnum(input.modality)] = .{
@@ -176,7 +177,7 @@ pub fn Fusion(comptime dimension: usize, comptime minimum_prefix: usize) type {
                 receipt.multiplications +|= 1;
                 receipt.additions +|= 1;
             }
-            if (!std.math.isFinite(squared_norm)) return error.NonFinite;
+            if (!math.isFinite(squared_norm)) return error.NonFinite;
             if (squared_norm <= 0) return error.ZeroNorm;
             const inverse: f32 = @floatCast(1.0 / @sqrt(squared_norm));
             receipt.divisions +|= 1;

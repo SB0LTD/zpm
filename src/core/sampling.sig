@@ -11,7 +11,7 @@
 //! Uses xoshiro256** PRNG — fast, high-quality, deterministic from seed.
 //! Zero allocation. All state in caller-owned structs.
 
-const std = @import("std");
+const math = @import("sig_math.sig");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Configuration
@@ -54,14 +54,14 @@ pub const Rng = struct {
 
     /// Generate next u64.
     pub fn next(self: *Rng) u64 {
-        const result = std.math.rotl(u64, self.s[1] *% 5, 7) *% 9;
+        const result = math.rotl(u64, self.s[1] *% 5, 7) *% 9;
         const t = self.s[1] << 17;
         self.s[2] ^= self.s[0];
         self.s[3] ^= self.s[1];
         self.s[1] ^= self.s[2];
         self.s[0] ^= self.s[3];
         self.s[2] ^= t;
-        self.s[3] = std.math.rotl(u64, self.s[3], 45);
+        self.s[3] = math.rotl(u64, self.s[3], 45);
         return result;
     }
 

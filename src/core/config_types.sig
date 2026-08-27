@@ -4,7 +4,7 @@
 // These types are used by Config for parsing and by other modules
 // that need to reference config values without pulling in the parser.
 
-const std = @import("std");
+const mem = @import("sig_mem.sig");
 
 /// Max length for any single config string value
 pub const MAX_VAL = 256;
@@ -22,7 +22,7 @@ pub const ConfigStr = struct {
     }
 
     pub fn eql(self: *const ConfigStr, other: []const u8) bool {
-        return self.len == other.len and std.mem.eql(u8, self.slice(), other);
+        return self.len == other.len and mem.eql(u8, self.slice(), other);
     }
 
     pub fn set(self: *ConfigStr, val: []const u8) void {

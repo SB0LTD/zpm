@@ -4,7 +4,7 @@
 //! operation IDs and resource handles only; capability leases are narrowed,
 //! expiring, use-bounded, and cascade-revocable without heap allocation.
 
-const std = @import("std");
+const math = @import("sig_math.sig");
 
 pub const Error = error{
     CapacityExhausted,
@@ -76,10 +76,10 @@ pub const AuthorityReceipt = struct {
     uses_remaining: u32 = 0,
 };
 
-const no_parent = std.math.maxInt(u16);
+const no_parent = math.maxInt(u16);
 
 pub fn CapabilityTable(comptime capacity: usize, comptime maximum_depth: u8) type {
-    if (capacity == 0 or capacity > std.math.maxInt(u16)) @compileError("invalid capability capacity");
+    if (capacity == 0 or capacity > math.maxInt(u16)) @compileError("invalid capability capacity");
     if (maximum_depth == 0) @compileError("capability delegation depth must be non-zero");
 
     return struct {
@@ -286,7 +286,7 @@ pub const ProcessView = struct {
 };
 
 pub fn ProcessTable(comptime capacity: usize, comptime checkpoint_capacity: usize) type {
-    if (capacity == 0 or capacity > std.math.maxInt(u16)) @compileError("invalid process capacity");
+    if (capacity == 0 or capacity > math.maxInt(u16)) @compileError("invalid process capacity");
     return struct {
         const Self = @This();
         const Slot = struct {
@@ -379,7 +379,7 @@ pub fn ProcessTable(comptime capacity: usize, comptime checkpoint_capacity: usiz
         pub fn release(self: *Self, handle: Handle) Error!void {
             const slot = try self.slotMutable(handle);
             if (!terminal(slot.state)) return error.InvalidTransition;
-            const next_generation = if (slot.generation == std.math.maxInt(u16)) 1 else slot.generation + 1;
+            const next_generation = if (slot.generation == math.maxInt(u16)) 1 else slot.generation + 1;
             slot.* = .{ .generation = next_generation };
             self.active_count -= 1;
         }
@@ -470,7 +470,7 @@ pub const PlanNode = struct {
     retry_limit: u8 = 0,
     risk: Risk = .read_only,
     reversible: bool = false,
-    compensation_node: u8 = std.math.maxInt(u8),
+    compensation_node: u8 = math.maxInt(u8),
 };
 
 pub const PlanReceipt = struct {
@@ -509,7 +509,7 @@ pub fn Plan(comptime capacity: usize) type {
 
         pub fn validate(self: *const Self, registry: anytype, cost_budget: u64) Error!PlanReceipt {
             if (self.count == 0) return error.InvalidPlan;
-            const valid_mask: u64 = if (self.count == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(self.count)) - 1;
+            const valid_mask: u64 = if (self.count == 64) math.maxInt(u64) else (@as(u64, 1) << @intCast(self.count)) - 1;
             var receipt = PlanReceipt{ .nodes = self.count };
             var indegree: [capacity]u8 = @splat(0);
             var longest: [capacity]u64 = @splat(0);
@@ -523,9 +523,9 @@ pub fn Plan(comptime capacity: usize) type {
                     return error.InvalidArgument;
                 if (@intFromEnum(node.risk) > @intFromEnum(schema.maximum_risk)) return error.RiskDenied;
                 if ((schema.requires_compensation or @intFromEnum(node.risk) >= @intFromEnum(Risk.consequential)) and
-                    (!node.reversible or node.compensation_node == std.math.maxInt(u8)))
+                    (!node.reversible or node.compensation_node == math.maxInt(u8)))
                     return error.MissingCompensation;
-                if (node.compensation_node != std.math.maxInt(u8) and
+                if (node.compensation_node != math.maxInt(u8) and
                     (node.compensation_node >= self.count or node.compensation_node == index))
                     return error.InvalidPlan;
                 indegree[index] = @intCast(@popCount(node.dependencies));
@@ -588,7 +588,7 @@ pub fn Plan(comptime capacity: usize) type {
     };
 }
 
-const testing = std.testing;
+
 
 fn digest(seed: u8) [16]u8 { return @splat(seed); }
 
@@ -615,7 +615,7 @@ test "capability delegation only narrows and root revocation is constant-write" 
         .subject = 2, .resource = resource,
         .rights = .{ .operations = 0b0010, .maximum_data_class = .personal },
     }, 3);
-    try testing.expectEqual(@as(u32, 1), receipt.uses_remaining);
+    if (receipt.uses_remaining != 1) return error.TestUnexpectedResult;
     try table.revokeRoot(root);
     try testing.expectError(error.LeaseRevoked, table.validate(child, .{
         .subject = 2, .resource = resource,
@@ -634,7 +634,7 @@ test "process lifecycle checkpoints and rejects stale handles" {
     try processes.wait(handle);
     var restored: [8]u8 = undefined;
     try testing.expectEqual(@as(usize, 3), try processes.recover(handle, &restored));
-    try testing.expectEqualSlices(u8, &bytes, restored[0..3]);
+    if (!mem.eql(u8, &bytes, restored[0..3])) return error.TestUnexpectedResult;
     try processes.complete(handle);
     try processes.release(handle);
     try testing.expectError(error.StaleHandle, processes.view(handle));
@@ -673,11 +673,11 @@ test "PlanIR proves DAG cost, critical path, width, and authority" {
     _ = try plan.add(third);
     plan.seal();
     const receipt = try plan.validate(&registry, 30);
-    try testing.expectEqual(@as(usize, 3), receipt.nodes);
-    try testing.expectEqual(@as(usize, 2), receipt.edges);
-    try testing.expectEqual(@as(u64, 23), receipt.estimated_cost);
-    try testing.expectEqual(@as(u64, 18), receipt.critical_path_cost);
-    try testing.expectEqual(@as(usize, 2), receipt.maximum_parallel_width);
+    if (receipt.nodes != 3) return error.TestUnexpectedResult;
+    if (receipt.edges != 2) return error.TestUnexpectedResult;
+    if (receipt.estimated_cost != 23) return error.TestUnexpectedResult;
+    if (receipt.critical_path_cost != 18) return error.TestUnexpectedResult;
+    if (receipt.maximum_parallel_width != 2) return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 3), try plan.validateAuthority(&capabilities, 77, 1));
 }
 

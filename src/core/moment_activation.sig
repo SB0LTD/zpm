@@ -4,7 +4,7 @@
 //! canonical events, capabilities, and policies remain the source of truth.
 //! All storage is fixed at compile time and every transition emits a receipt.
 
-const std = @import("std");
+const math = @import("sig_math.sig");
 
 pub const Error = error{
     InvalidClass,
@@ -104,13 +104,13 @@ pub fn MomentState(
             var prediction_error: f64 = 0;
 
             for (self.state, 0..) |value, lane| {
-                if (!std.math.isFinite(value)) return error.NonFinite;
+                if (!math.isFinite(value)) return error.NonFinite;
                 before_squared += @as(f64, value) * @as(f64, value);
                 receipt.multiplications += 1;
                 receipt.additions += 1;
                 if (lane < feature_dimension) {
                     const observed = features[lane];
-                    if (!std.math.isFinite(observed)) return error.NonFinite;
+                    if (!math.isFinite(observed)) return error.NonFinite;
                     const difference = observed - value;
                     prediction_error += @as(f64, difference) * @as(f64, difference);
                     receipt.additions += 1;
@@ -118,14 +118,14 @@ pub fn MomentState(
                     receipt.additions += 1;
                 }
             }
-            for (features) |value| if (!std.math.isFinite(value)) return error.NonFinite;
-            for (goals) |value| if (!std.math.isFinite(value)) return error.NonFinite;
+            for (features) |value| if (!math.isFinite(value)) return error.NonFinite;
+            for (goals) |value| if (!math.isFinite(value)) return error.NonFinite;
 
             var compressed: [rank]f32 = @splat(0);
             for (0..feature_dimension) |feature| {
                 for (0..rank) |component| {
                     const coefficient = model.right[event_class][feature][component];
-                    if (!std.math.isFinite(coefficient)) return error.InvalidCoefficient;
+                    if (!math.isFinite(coefficient)) return error.InvalidCoefficient;
                     compressed[component] += coefficient * features[feature];
                     receipt.multiplications += 1;
                     receipt.additions += 1;
@@ -136,30 +136,30 @@ pub fn MomentState(
             var candidate_squared: f64 = 0;
             for (0..state_dimension) |lane| {
                 const decay = model.decay[event_class][lane];
-                if (!std.math.isFinite(decay) or @abs(decay) > 1) return error.InvalidCoefficient;
+                if (!math.isFinite(decay) or @abs(decay) > 1) return error.InvalidCoefficient;
                 var value = decay * self.state[lane];
                 receipt.multiplications += 1;
                 for (0..rank) |component| {
                     const coefficient = model.left[event_class][lane][component];
-                    if (!std.math.isFinite(coefficient)) return error.InvalidCoefficient;
+                    if (!math.isFinite(coefficient)) return error.InvalidCoefficient;
                     value += coefficient * compressed[component];
                     receipt.multiplications += 1;
                     receipt.additions += 1;
                 }
                 for (0..goal_dimension) |goal_index| {
                     const coefficient = model.goal[lane][goal_index];
-                    if (!std.math.isFinite(coefficient)) return error.InvalidCoefficient;
+                    if (!math.isFinite(coefficient)) return error.InvalidCoefficient;
                     value += coefficient * goals[goal_index];
                     receipt.multiplications += 1;
                     receipt.additions += 1;
                 }
-                if (!std.math.isFinite(value)) return error.NonFinite;
+                if (!math.isFinite(value)) return error.NonFinite;
                 candidate[lane] = value;
                 candidate_squared += @as(f64, value) * @as(f64, value);
                 receipt.multiplications += 1;
                 receipt.additions += 1;
             }
-            if (!std.math.isFinite(candidate_squared)) return error.NonFinite;
+            if (!math.isFinite(candidate_squared)) return error.NonFinite;
 
             if (candidate_squared > 0) {
                 const inverse: f32 = @floatCast(1.0 / @sqrt(candidate_squared));
@@ -338,7 +338,7 @@ fn fixedScore(weights: [6]i16, bias_q16: i32, values: [6]u16) u16 {
     var accumulator: i64 = @as(i64, bias_q16) * 32_767;
     for (weights, values) |weight, value| accumulator += @as(i64, weight) * @as(i64, value);
     const scaled = @divTrunc(accumulator, 32_767);
-    return @intCast(std.math.clamp(scaled, 0, 65_535));
+    return @intCast(math.clamp(scaled, 0, 65_535));
 }
 
 fn requiredAutonomy(class_index: usize) u3 {
@@ -351,7 +351,7 @@ fn requiredAutonomy(class_index: usize) u3 {
     };
 }
 
-const testing = std.testing;
+
 
 test "low-rank NOW update is normalized and operation count is exact" {
     const Model = MomentModel(4, 2, 1, 1, 1);
@@ -364,10 +364,10 @@ test "low-rank NOW update is normalized and operation count is exact" {
     const features = [2]f32{ 2, 0 };
     const goals = [1]f32{1};
     const receipt = try state.update(&model, 0, &features, &goals);
-    try testing.expectApproxEqAbs(@as(f32, 1), receipt.state_l2_after, 0.00001);
+    if (@abs(receipt.state_l2_after - @as(f32, 1)) > 0.00001) return error.TestUnexpectedResult;
     try testing.expectEqual(Model.learnedCoreMacs(), @as(usize, 2 * 1 + 4 * 1));
     try testing.expect(receipt.multiplications >= Model.totalLinearMultiplications());
-    try testing.expectEqual(@as(u64, 1), state.updates);
+    if (state.updates != 1) return error.TestUnexpectedResult;
 }
 
 test "invalid coefficients cannot partially mutate NOW" {
@@ -380,8 +380,8 @@ test "invalid coefficients cannot partially mutate NOW" {
     const features = [1]f32{1};
     const goals = [0]f32{};
     try testing.expectError(error.InvalidCoefficient, state.update(&model, 0, &features, &goals));
-    try testing.expectEqual(before, state.state);
-    try testing.expectEqual(@as(u64, 0), state.updates);
+    if (state.state != before) return error.TestUnexpectedResult;
+    if (state.updates != 0) return error.TestUnexpectedResult;
 }
 
 fn testPolicy(level: AutonomyLevel) ActivationPolicy {
@@ -400,11 +400,11 @@ test "activation obeys autonomy and token budgets" {
     engine.buckets[@intFromEnum(ActivationClass.act)] = .{ .capacity = 2, .tokens = 2, .refill_per_tick = 0 };
     var policy = testPolicy(.answer);
     const decision = try engine.evaluate(&policy, .{ .explicit_request = 60_000, .goal_relevance = 65_535 }, 1);
-    try testing.expectEqual(ActivationClass.answer, decision.selected);
-    try testing.expect(decision.policy_rejections >= 1);
+    if (decision.selected != ActivationClass.answer) return error.TestUnexpectedResult;
+    if (!(decision.policy_rejections >= 1)) return error.TestUnexpectedResult;
     policy.autonomy = .reversible;
     const act = try engine.evaluate(&policy, .{ .goal_relevance = 65_535 }, 2);
-    try testing.expectEqual(ActivationClass.act, act.selected);
+    if (act.selected != ActivationClass.act) return error.TestUnexpectedResult;
 }
 
 test "hysteresis prevents threshold chatter and cooldown is exact" {
@@ -414,21 +414,21 @@ test "hysteresis prevents threshold chatter and cooldown is exact" {
     var policy = testPolicy(.answer);
     policy.cooldown_ticks[answer] = 3;
     const first = try engine.evaluate(&policy, .{ .explicit_request = 50_000 }, 10);
-    try testing.expectEqual(ActivationClass.answer, first.selected);
+    if (first.selected != ActivationClass.answer) return error.TestUnexpectedResult;
     // Below enter but above release: class remains active; cooldown blocks fire.
     const held = try engine.evaluate(&policy, .{ .explicit_request = 30_000 }, 11);
-    try testing.expectEqual(ActivationClass.none, held.selected);
-    try testing.expect(held.cooldown_rejections >= 1);
+    if (held.selected != ActivationClass.none) return error.TestUnexpectedResult;
+    if (!(held.cooldown_rejections >= 1)) return error.TestUnexpectedResult;
     const after = try engine.evaluate(&policy, .{ .explicit_request = 30_000 }, 13);
-    try testing.expectEqual(ActivationClass.answer, after.selected);
+    if (after.selected != ActivationClass.answer) return error.TestUnexpectedResult;
     const released = try engine.evaluate(&policy, .{ .explicit_request = 10_000 }, 16);
-    try testing.expectEqual(ActivationClass.none, released.selected);
+    if (released.selected != ActivationClass.none) return error.TestUnexpectedResult;
 }
 
 test "token refill saturates without wraparound" {
     var bucket = TokenBucket{ .capacity = 10, .tokens = 1, .refill_per_tick = 4, .last_tick = 2 };
-    try bucket.refill(std.math.maxInt(u64));
-    try testing.expectEqual(@as(u16, 10), bucket.tokens);
+    try bucket.refill(math.maxInt(u64));
+    if (bucket.tokens != 10) return error.TestUnexpectedResult;
     try testing.expectError(error.InvalidTick, bucket.refill(1));
 }
 
@@ -442,12 +442,12 @@ test "compute and interruption budgets are independent hard bounds" {
     policy.compute_cost[answer] = 2;
     policy.interruption_cost[answer] = 1;
     const first = try engine.evaluate(&policy, .{ .explicit_request = 60_000 }, 1);
-    try testing.expectEqual(ActivationClass.answer, first.selected);
-    try testing.expectEqual(@as(u16, 2), first.compute_tokens_remaining);
-    try testing.expectEqual(@as(u16, 0), first.interruption_tokens_remaining);
+    if (first.selected != ActivationClass.answer) return error.TestUnexpectedResult;
+    if (first.compute_tokens_remaining != 2) return error.TestUnexpectedResult;
+    if (first.interruption_tokens_remaining != 0) return error.TestUnexpectedResult;
     const denied = try engine.evaluate(&policy, .{ .explicit_request = 60_000 }, 2);
-    try testing.expectEqual(ActivationClass.none, denied.selected);
-    try testing.expect(denied.budget_rejections >= 1);
+    if (denied.selected != ActivationClass.none) return error.TestUnexpectedResult;
+    if (!(denied.budget_rejections >= 1)) return error.TestUnexpectedResult;
     // A denied interruption cannot drain the still-available compute bucket.
-    try testing.expectEqual(@as(u16, 2), denied.compute_tokens_remaining);
+    if (denied.compute_tokens_remaining != 2) return error.TestUnexpectedResult;
 }

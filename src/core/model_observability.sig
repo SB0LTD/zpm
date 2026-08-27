@@ -5,7 +5,7 @@
 //! path allocation-free while per-stage logarithmic histograms retain useful
 //! latency distributions after detailed events are overwritten.
 
-const std = @import("std");
+const math = @import("sig_math.sig");
 
 pub const Stage = enum(u8) {
     request_submit,
@@ -128,7 +128,7 @@ pub const StageStats = struct {
         if (self.count == 0 or denominator == 0 or numerator == 0 or numerator > denominator)
             return null;
         const scaled = @mulWithOverflow(self.count, @as(u64, numerator));
-        const product = if (scaled[1] == 0) scaled[0] else std.math.maxInt(u64);
+        const product = if (scaled[1] == 0) scaled[0] else math.maxInt(u64);
         const rank = @max(@as(u64, 1), product / denominator + @intFromBool(product % denominator != 0));
         var cumulative: u64 = 0;
         for (self.histogram, 0..) |count, bucket| {
@@ -275,7 +275,7 @@ fn histogramBucket(value: u64) usize {
 
 fn bucketUpperBound(bucket: usize) u64 {
     if (bucket == 0) return 0;
-    if (bucket >= 63) return std.math.maxInt(u64);
+    if (bucket >= 63) return math.maxInt(u64);
     return (@as(u64, 1) << @intCast(bucket)) - 1;
 }
 

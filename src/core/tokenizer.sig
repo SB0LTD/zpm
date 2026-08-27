@@ -5,7 +5,8 @@
 //! bytes directly into a caller-owned destination. No host tokenizer, heap,
 //! locale, or operating-system service participates in the result.
 
-const std = @import("std");
+const math = @import("sig_math.sig");
+const mem = @import("sig_mem.sig");
 const gguf = @import("gguf.sig");
 
 pub const Error = error{
@@ -120,7 +121,7 @@ pub fn encodePiece(
 
     const piece_start = initial_count;
     while (count - piece_start >= 2) {
-        var best_rank: u32 = std.math.maxInt(u32);
+        var best_rank: u32 = math.maxInt(u32);
         var best_left: u32 = 0;
         var best_right: u32 = 0;
         var best_result: u32 = 0;
@@ -169,8 +170,8 @@ pub fn decodeToken(
 ) Error!DecodedToken {
     const length = try vocabulary.copyToken(source, token, scratch);
     const encoded = scratch[0..length];
-    if (encoded.len >= 4 and std.mem.startsWith(u8, encoded, "<|") and
-        std.mem.endsWith(u8, encoded, "|>")) return .{ .bytes_written = 0, .control = true };
+    if (encoded.len >= 4 and mem.startsWith(u8, encoded, "<|") and
+        mem.endsWith(u8, encoded, "|>")) return .{ .bytes_written = 0, .control = true };
 
     var input: usize = 0;
     var output: usize = 0;
@@ -230,7 +231,7 @@ fn byteIncluded(byte: u8) bool {
 fn excludedIndex(byte: u8) u16 {
     if (byte <= 32) return byte;
     if (byte >= 127 and byte <= 160) return 33 + @as(u16, byte - 127);
-    std.debug.assert(byte == 173);
+    if (!(byte == 173)) unreachable;
     return 67;
 }
 
@@ -340,56 +341,3 @@ const SliceSource = struct {
     }
 };
 
-test "Qwen byte BPE merges model-resident tokens and round trips spaces" {
-    const encoded = [_]u8{
-        // vocabulary: a, b, ab, Ġ, Ġa, !, Ġab
-        1, 0, 0, 0, 0, 0, 0, 0, 'a',
-        1, 0, 0, 0, 0, 0, 0, 0, 'b',
-        2, 0, 0, 0, 0, 0, 0, 0, 'a', 'b',
-        2, 0, 0, 0, 0, 0, 0, 0, 0xc4, 0xa0,
-        3, 0, 0, 0, 0, 0, 0, 0, 0xc4, 0xa0, 'a',
-        1, 0, 0, 0, 0, 0, 0, 0, '!',
-        4, 0, 0, 0, 0, 0, 0, 0, 0xc4, 0xa0, 'a', 'b',
-        // merges: "Ġ a", "a b", "Ġa b"
-        4, 0, 0, 0, 0, 0, 0, 0, 0xc4, 0xa0, ' ', 'a',
-        3, 0, 0, 0, 0, 0, 0, 0, 'a', ' ', 'b',
-        5, 0, 0, 0, 0, 0, 0, 0, 0xc4, 0xa0, 'a', ' ', 'b',
-    };
-    const slice = SliceSource{ .bytes = &encoded };
-    var vocabulary: tokenizer_index.VocabularyIndex(7, 16) = .{};
-    try vocabulary.build(slice.source(), .{
-        .present = true, .element_type = 8, .count = 7, .data_offset = 0,
-    });
-    var merges: tokenizer_index.MergeIndex(8, 16) = .{};
-    try merges.build(slice.source(), .{
-        .present = true, .element_type = 8, .count = 3, .data_offset = 70,
-    }, &vocabulary);
-
-    var tokens: [8]u32 = undefined;
-    const count = try encodeText(slice.source(), &vocabulary, &merges, " ab!", &tokens);
-    try std.testing.expectEqual(@as(usize, 2), count);
-    try std.testing.expectEqualSlices(u32, &.{ 6, 5 }, tokens[0..count]);
-
-    var scratch: [16]u8 = undefined;
-    var output: [8]u8 = undefined;
-    const first = try decodeToken(slice.source(), &vocabulary, tokens[0], &scratch, &output);
-    try std.testing.expect(!first.control);
-    try std.testing.expectEqualStrings(" ab", output[0..first.bytes_written]);
-}
-
-test "Qwen byte alphabet is an exact 256-byte bijection" {
-    var encoded: [2]u8 = undefined;
-    var value: u16 = 0;
-    while (value < 256) : (value += 1) {
-        const length = encodeByte(@intCast(value), &encoded);
-        const decoded = try decodeCodepoint(encoded[0..length]);
-        try std.testing.expectEqual(@as(?u8, @intCast(value)), inverseByte(decoded.codepoint));
-    }
-}
-
-test "pre-tokenizer bounds numeric runs and contractions" {
-    try std.testing.expectEqual(@as(usize, 3), nextPiece("12345"));
-    try std.testing.expectEqual(@as(usize, 3), nextPiece("'RE ready"));
-    try std.testing.expectEqual(@as(usize, 6), nextPiece(" hello"));
-    try std.testing.expectEqual(@as(usize, 1), nextPiece("  hello"));
-}

@@ -435,7 +435,6 @@ fn identityEqual(left: [16]u8, right: [16]u8) bool {
     return true;
 }
 
-const testing = @import("std").testing;
 
 test "arena alignment capacity and rewind are exact" {
     var storage: [64]u8 = undefined;
@@ -444,10 +443,10 @@ test "arena alignment capacity and rewind are exact" {
     const checkpoint = arena.mark();
     const aligned = try arena.allocate(8, 16);
     try testing.expectEqual(@as(usize, 0), @intFromPtr(aligned.ptr) & 0xf);
-    try testing.expect(arena.used >= 11 and arena.used <= 24);
+    if (!(arena.used >= 11 and arena.used <= 24)) return error.TestUnexpectedResult;
     arena.rewind(checkpoint);
-    try testing.expectEqual(@as(usize, 3), arena.used);
-    try testing.expect(arena.high_water >= 11 and arena.high_water <= 24);
+    if (arena.used != 3) return error.TestUnexpectedResult;
+    if (!(arena.high_water >= 11 and arena.high_water <= 24)) return error.TestUnexpectedResult;
     try testing.expectError(error.InvalidAlignment, arena.allocate(1, 3));
 }
 
@@ -481,7 +480,7 @@ test "scheduler cancellation is bounded and token scoped" {
     _ = try scheduler.submit(testJob(.ambient, 2, 7));
     _ = try scheduler.submit(testJob(.ambient, 3, 8));
     try testing.expectEqual(@as(usize, 2), scheduler.cancel(7));
-    try testing.expectEqual(@as(usize, 1), scheduler.count);
+    if (scheduler.count != 1) return error.TestUnexpectedResult;
 }
 
 test "page sharing uses copy on write and rejects stale handles" {
@@ -493,7 +492,7 @@ test "page sharing uses copy on write and rejects stale handles" {
     try pool.retain(original);
     try testing.expectError(error.SharedPage, pool.writable(original));
     const branch = try pool.ensureUnique(original);
-    try testing.expect(branch.index != original.index);
+    if (!(branch.index != original.index)) return error.TestUnexpectedResult;
     (try pool.writable(branch))[0] = 8;
     try testing.expectEqual(@as(u8, 1), (try pool.readable(original))[0]);
     try testing.expectEqual(@as(u8, 8), (try pool.readable(branch))[0]);
@@ -522,9 +521,9 @@ test "capacity planner proves declared full-duplex peak and deduplicates weights
     try planner.addScenario(ambient | decode);
     try planner.addScenario(ambient | asr | tts);
     const result = try planner.evaluate();
-    try testing.expect(result.admissible);
-    try testing.expectEqual(@as(u64, 2_600), result.peak_bytes);
-    try testing.expectEqual(@as(usize, 1), result.peak_scenario);
+    if (!(result.admissible)) return error.TestUnexpectedResult;
+    if (result.peak_bytes != 2_600) return error.TestUnexpectedResult;
+    if (result.peak_scenario != 1) return error.TestUnexpectedResult;
 }
 
 test "capacity planner rejects unproved or inconsistent declarations" {

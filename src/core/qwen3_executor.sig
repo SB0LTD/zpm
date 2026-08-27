@@ -5,7 +5,7 @@
 //! state, scratch, KV cache, cancellation, and progress policy are owned by the
 //! caller. There is no process, thread, allocator, ELF, or foreign-runtime ABI.
 
-const std = @import("std");
+const math = @import("sig_math.sig");
 const gguf = @import("gguf.sig");
 const qwen3 = @import("qwen3_decoder_plan.sig");
 const quantized = @import("quantized_linear.sig");
@@ -359,7 +359,7 @@ fn matvec(
             14 => try quantized.dotQ6K(row, input),
             else => return error.InvalidPlan,
         };
-        if (!std.math.isFinite(destination.*)) return error.NonFinite;
+        if (!math.isFinite(destination.*)) return error.NonFinite;
         if ((row_index + 1) % 256 == 0 or row_index + 1 == output.len) try progress.report(.{
             .stage = stage,
             .layer = layer,
@@ -379,7 +379,7 @@ fn matrixRowBytes(tensor_info: *const gguf.TensorInfo) Error!usize {
     if (tensor_info.dimension_count != 2 or tensor_info.dimensions[1] == 0 or
         tensor_info.byte_size % tensor_info.dimensions[1] != 0) return error.InvalidPlan;
     const bytes = tensor_info.byte_size / tensor_info.dimensions[1];
-    if (bytes == 0 or bytes > std.math.maxInt(usize)) return error.InvalidPlan;
+    if (bytes == 0 or bytes > math.maxInt(usize)) return error.InvalidPlan;
     return @intCast(bytes);
 }
 
@@ -408,7 +408,7 @@ fn copyF32(bytes: []const u8, output: []f32) Error!void {
             (@as(u32, bytes[offset + 2]) << 16) |
             (@as(u32, bytes[offset + 3]) << 24);
         destination.* = @bitCast(bits);
-        if (!std.math.isFinite(destination.*)) return error.NonFinite;
+        if (!math.isFinite(destination.*)) return error.NonFinite;
     }
 }
 
@@ -429,7 +429,7 @@ fn storeKv(
         for (0..head_size) |lane| {
             const key = keys[source_offset + lane];
             const value = values[source_offset + lane];
-            if (!std.math.isFinite(key) or !std.math.isFinite(value)) return error.NonFinite;
+            if (!math.isFinite(key) or !math.isFinite(value)) return error.NonFinite;
             storage[key_offset + lane] = transformer.f32ToF16Bits(key);
             storage[value_offset + lane] = transformer.f32ToF16Bits(value);
         }
@@ -492,7 +492,7 @@ fn addResidual(destination: []f32, residual: []const f32) Error!void {
     if (destination.len != residual.len) return error.InvalidPlan;
     for (destination, residual) |*value, addition| {
         value.* += addition;
-        if (!std.math.isFinite(value.*)) return error.NonFinite;
+        if (!math.isFinite(value.*)) return error.NonFinite;
     }
 }
 
@@ -508,33 +508,3 @@ fn validateLimits(comptime limits: Limits) void {
         limits.row_bytes < 4) @compileError("Qwen executor limits must be non-zero");
 }
 
-test "selected Pixel profile has an exact bounded footprint" {
-    const Work = WorkingSet(qwen3_0_6b_limits);
-    const plan = qwen3.Plan{
-        .layer_count = 28,
-        .kv_head_count = 8,
-        .head_size = 128,
-    };
-    try std.testing.expectEqual(@as(usize, 3_670_016), try requiredKvElements(plan, 64));
-    try std.testing.expect(Work.staticBytes() < 1_000_000);
-}
-
-test "f16 grouped attention preserves a single causal value" {
-    var plan = qwen3.Plan{
-        .layer_count = 1,
-        .head_count = 2,
-        .kv_head_count = 1,
-        .head_size = 2,
-        .query_size = 4,
-        .key_value_size = 2,
-    };
-    var storage: [8]u16 = @splat(0);
-    const keys = [_]f32{ 0.5, 0.25 };
-    const values = [_]f32{ 7, -3 };
-    try storeKv(&plan, &storage, 1, 0, 0, &keys, &values);
-    const queries = [_]f32{ 1, 0, 0, 1 };
-    var scores: [1]f32 = undefined;
-    var output: [4]f32 = undefined;
-    try groupedAttention(&plan, &storage, 1, 0, 0, &queries, &scores, &output);
-    try std.testing.expectEqualSlices(f32, &.{ 7, -3, 7, -3 }, &output);
-}

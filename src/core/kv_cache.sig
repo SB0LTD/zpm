@@ -17,7 +17,7 @@
 //! tokens) with small models (0.6B-4B). The arena commitment granularity of
 //! 4KB pages means we only pay for positions actually used.
 
-const std = @import("std");
+
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Allocator Interface (for dynamic KV storage)

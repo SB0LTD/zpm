@@ -4,7 +4,8 @@
 //! record is tied to a canonical event and to an encoder/schema domain; a
 //! vector can suggest relevance but never becomes an authoritative fact.
 
-const std = @import("std");
+const math = @import("sig_math.sig");
+const mem = @import("sig_mem.sig");
 
 pub const Error = error{
     CapacityExhausted,
@@ -30,8 +31,8 @@ pub const Domain = struct {
     schema: [16]u8,
 
     pub fn eql(left: Domain, right: Domain) bool {
-        return std.mem.eql(u8, &left.encoder, &right.encoder) and
-            std.mem.eql(u8, &left.schema, &right.schema);
+        return mem.eql(u8, &left.encoder, &right.encoder) and
+            mem.eql(u8, &left.schema, &right.schema);
     }
 
     pub fn valid(self: Domain) bool {
@@ -149,13 +150,13 @@ pub fn Store(comptime capacity: usize, comptime dimension: usize) type {
             var converted: [dimension]u16 = undefined;
             var squared_norm: f64 = 0;
             for (candidate.vector, 0..) |value, lane| {
-                if (!std.math.isFinite(value)) return error.NonFinite;
+                if (!math.isFinite(value)) return error.NonFinite;
                 converted[lane] = f32ToF16Bits(value);
                 const restored = f16BitsToF32(converted[lane]);
-                if (!std.math.isFinite(restored)) return error.NonFinite;
+                if (!math.isFinite(restored)) return error.NonFinite;
                 squared_norm += @as(f64, restored) * @as(f64, restored);
             }
-            if (!std.math.isFinite(squared_norm) or squared_norm <= 0) return error.ZeroNorm;
+            if (!math.isFinite(squared_norm) or squared_norm <= 0) return error.ZeroNorm;
             const norm: f32 = @floatCast(@sqrt(squared_norm));
 
             var destination: ?usize = null;
@@ -237,12 +238,12 @@ pub fn Store(comptime capacity: usize, comptime dimension: usize) type {
             var receipt = SearchReceipt{};
             var query_squared_norm: f64 = 0;
             for (query) |value| {
-                if (!std.math.isFinite(value)) return error.NonFinite;
+                if (!math.isFinite(value)) return error.NonFinite;
                 query_squared_norm += @as(f64, value) * @as(f64, value);
                 receipt.multiplications += 1;
                 receipt.additions += 1;
             }
-            if (!std.math.isFinite(query_squared_norm) or query_squared_norm <= 0) return error.ZeroNorm;
+            if (!math.isFinite(query_squared_norm) or query_squared_norm <= 0) return error.ZeroNorm;
             const query_norm: f32 = @floatCast(@sqrt(query_squared_norm));
 
             var result_count: usize = 0;
@@ -297,7 +298,7 @@ pub fn Store(comptime capacity: usize, comptime dimension: usize) type {
     };
 }
 
-const testing = std.testing;
+
 
 fn testDomain(seed: u8) Domain {
     return .{ .encoder = @splat(seed), .schema = @splat(seed +% 1) };
@@ -330,7 +331,7 @@ test "insert is fail-atomic and rejects duplicate canonical events" {
         .epoch = 2,
         .vector = &valid,
     }));
-    const invalid = [_]f32{ 0, std.math.nan(f32), 0 };
+    const invalid = [_]f32{ 0, (0.0 / @as(f32, 0.0)), 0 };
     try testing.expectError(error.NonFinite, index.insert(.{
         .event_id = 8,
         .payload_digest = testDigest(8),
@@ -355,11 +356,11 @@ test "exact top-K is deterministic and domain separated" {
 
     var results: [2]Result = undefined;
     const receipt = try index.search(&first, .{ .domain = testDomain(2) }, &results);
-    try testing.expectEqual(@as(usize, 2), receipt.results);
-    try testing.expectEqual(@as(u64, 3), results[0].event_id);
-    try testing.expectEqual(@as(u64, 9), results[1].event_id);
-    try testing.expectEqual(@as(usize, 2), receipt.records_compared);
-    try testing.expectEqual(@as(usize, 3 * 2), receipt.vector_lanes_decoded);
+    if (receipt.results != 2) return error.TestUnexpectedResult;
+    if (results[0].event_id != 3) return error.TestUnexpectedResult;
+    if (results[1].event_id != 9) return error.TestUnexpectedResult;
+    if (receipt.records_compared != 2) return error.TestUnexpectedResult;
+    if (receipt.vector_lanes_decoded != 3 * 2) return error.TestUnexpectedResult;
 }
 
 test "privacy erasure zeroes live capacity and tombstones are reusable" {

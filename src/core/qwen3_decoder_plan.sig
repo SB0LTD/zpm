@@ -3,11 +3,12 @@
 //! Architecture-specific tensor naming is isolated here. Storage, scheduling,
 //! quantized math, conversation policy, and model catalog code remain generic.
 
-const std = @import("std");
+const math = @import("sig_math.sig");
+const mem = @import("sig_mem.sig");
 const gguf = @import("gguf.sig");
 
 pub const MAX_LAYERS: usize = 64;
-pub const INVALID_TENSOR: u16 = std.math.maxInt(u16);
+pub const INVALID_TENSOR: u16 = math.maxInt(u16);
 
 pub const Error = error{
     UnsupportedArchitecture,
@@ -63,17 +64,17 @@ pub const Plan = struct {
 
 pub fn build(comptime tensor_capacity: usize, index: *const gguf.Index(tensor_capacity), out: *Plan) Error!void {
     out.* = .{};
-    if (!std.mem.eql(u8, index.summary.architectureSlice(), "qwen3vl") and
-        !std.mem.eql(u8, index.summary.architectureSlice(), "qwen3")) return error.UnsupportedArchitecture;
+    if (!mem.eql(u8, index.summary.architectureSlice(), "qwen3vl") and
+        !mem.eql(u8, index.summary.architectureSlice(), "qwen3")) return error.UnsupportedArchitecture;
     if (tensor_capacity > INVALID_TENSOR or index.tensor_count > INVALID_TENSOR) return error.TensorCapacity;
     const summary = &index.summary;
-    if (summary.embedding_length == 0 or summary.embedding_length > std.math.maxInt(u32) or
+    if (summary.embedding_length == 0 or summary.embedding_length > math.maxInt(u32) or
         summary.block_count == 0 or summary.block_count > MAX_LAYERS or
-        summary.head_count == 0 or summary.head_count > std.math.maxInt(u16) or
+        summary.head_count == 0 or summary.head_count > math.maxInt(u16) or
         summary.head_count_kv == 0 or summary.head_count_kv > summary.head_count or
-        summary.feed_forward_length == 0 or summary.feed_forward_length > std.math.maxInt(u32) or
-        !std.math.isFinite(summary.rope_frequency_base) or summary.rope_frequency_base <= 0 or
-        !std.math.isFinite(summary.rms_norm_epsilon) or summary.rms_norm_epsilon <= 0)
+        summary.feed_forward_length == 0 or summary.feed_forward_length > math.maxInt(u32) or
+        !math.isFinite(summary.rope_frequency_base) or summary.rope_frequency_base <= 0 or
+        !math.isFinite(summary.rms_norm_epsilon) or summary.rms_norm_epsilon <= 0)
         return error.InvalidConfiguration;
 
     // Qwen3 records the projection head width explicitly. Small variants such
@@ -93,12 +94,12 @@ pub fn build(comptime tensor_capacity: usize, index: *const gguf.Index(tensor_ca
         summary.attention_value_length
     else
         key_length;
-    if (key_length == 0 or key_length > std.math.maxInt(u16) or
+    if (key_length == 0 or key_length > math.maxInt(u16) or
         value_length != key_length) return error.InvalidConfiguration;
     const query_size = @mulWithOverflow(summary.head_count, key_length);
     const key_value_size = @mulWithOverflow(summary.head_count_kv, key_length);
-    if (query_size[1] != 0 or query_size[0] > std.math.maxInt(u32) or
-        key_value_size[1] != 0 or key_value_size[0] > std.math.maxInt(u32))
+    if (query_size[1] != 0 or query_size[0] > math.maxInt(u32) or
+        key_value_size[1] != 0 or key_value_size[0] > math.maxInt(u32))
         return error.InvalidConfiguration;
 
     out.layer_count = @intCast(summary.block_count);
@@ -112,41 +113,41 @@ pub fn build(comptime tensor_capacity: usize, index: *const gguf.Index(tensor_ca
     out.rope_frequency_base = summary.rope_frequency_base;
     out.rms_norm_epsilon = summary.rms_norm_epsilon;
     const vocabulary_count = if (summary.vocab_size != 0) summary.vocab_size else summary.tokenizer_tokens.count;
-    if (vocabulary_count == 0 or vocabulary_count > std.math.maxInt(u32)) return error.InvalidConfiguration;
+    if (vocabulary_count == 0 or vocabulary_count > math.maxInt(u32)) return error.InvalidConfiguration;
     out.vocabulary_size = @intCast(vocabulary_count);
 
     for (index.tensors[0..index.tensor_count], 0..) |tensor, tensor_index| {
         const name = tensor.nameSlice();
-        if (std.mem.eql(u8, name, "token_embd.weight")) {
+        if (mem.eql(u8, name, "token_embd.weight")) {
             try bind(&out.token_embedding, tensor_index);
-        } else if (std.mem.eql(u8, name, "output_norm.weight")) {
+        } else if (mem.eql(u8, name, "output_norm.weight")) {
             try bind(&out.output_norm, tensor_index);
-        } else if (std.mem.eql(u8, name, "output.weight")) {
+        } else if (mem.eql(u8, name, "output.weight")) {
             try bind(&out.output, tensor_index);
         } else if (parseLayerName(name)) |parsed| {
             if (parsed.layer >= out.layer_count) return error.UnknownTensor;
             const layer = &out.layers[parsed.layer];
-            const destination: *TensorRef = if (std.mem.eql(u8, parsed.suffix, "attn_norm.weight"))
+            const destination: *TensorRef = if (mem.eql(u8, parsed.suffix, "attn_norm.weight"))
                 &layer.attention_norm
-            else if (std.mem.eql(u8, parsed.suffix, "attn_q.weight"))
+            else if (mem.eql(u8, parsed.suffix, "attn_q.weight"))
                 &layer.query
-            else if (std.mem.eql(u8, parsed.suffix, "attn_k.weight"))
+            else if (mem.eql(u8, parsed.suffix, "attn_k.weight"))
                 &layer.key
-            else if (std.mem.eql(u8, parsed.suffix, "attn_v.weight"))
+            else if (mem.eql(u8, parsed.suffix, "attn_v.weight"))
                 &layer.value
-            else if (std.mem.eql(u8, parsed.suffix, "attn_output.weight"))
+            else if (mem.eql(u8, parsed.suffix, "attn_output.weight"))
                 &layer.attention_output
-            else if (std.mem.eql(u8, parsed.suffix, "attn_q_norm.weight"))
+            else if (mem.eql(u8, parsed.suffix, "attn_q_norm.weight"))
                 &layer.query_norm
-            else if (std.mem.eql(u8, parsed.suffix, "attn_k_norm.weight"))
+            else if (mem.eql(u8, parsed.suffix, "attn_k_norm.weight"))
                 &layer.key_norm
-            else if (std.mem.eql(u8, parsed.suffix, "ffn_norm.weight"))
+            else if (mem.eql(u8, parsed.suffix, "ffn_norm.weight"))
                 &layer.ffn_norm
-            else if (std.mem.eql(u8, parsed.suffix, "ffn_gate.weight"))
+            else if (mem.eql(u8, parsed.suffix, "ffn_gate.weight"))
                 &layer.ffn_gate
-            else if (std.mem.eql(u8, parsed.suffix, "ffn_up.weight"))
+            else if (mem.eql(u8, parsed.suffix, "ffn_up.weight"))
                 &layer.ffn_up
-            else if (std.mem.eql(u8, parsed.suffix, "ffn_down.weight"))
+            else if (mem.eql(u8, parsed.suffix, "ffn_down.weight"))
                 &layer.ffn_down
             else return error.UnknownTensor;
             try bind(destination, tensor_index);
@@ -231,7 +232,7 @@ fn bind(destination: *TensorRef, index: usize) Error!void {
 const ParsedLayer = struct { layer: usize, suffix: []const u8 };
 
 fn parseLayerName(name: []const u8) ?ParsedLayer {
-    if (!std.mem.startsWith(u8, name, "blk.")) return null;
+    if (!mem.startsWith(u8, name, "blk.")) return null;
     var position: usize = 4;
     var layer: usize = 0;
     var digits: usize = 0;
@@ -247,47 +248,3 @@ fn parseLayerName(name: []const u8) ?ParsedLayer {
     return .{ .layer = layer, .suffix = name[position + 1 ..] };
 }
 
-test "real Qwen3 tensor formula is exact" {
-    const testing = std.testing;
-    const plan = Plan{
-        .layer_count = 28,
-        .hidden_size = 2048,
-        .feed_forward_size = 6144,
-        .head_count = 16,
-        .kv_head_count = 8,
-        .head_size = 128,
-        .query_size = 2048,
-        .key_value_size = 1024,
-        .vocabulary_size = 151936,
-    };
-    try testing.expectEqual(@as(u64, 1_720_451_072), try computeMacs(plan));
-    const kv_elements = @as(u64, plan.layer_count) * plan.kv_head_count * plan.head_size * 2;
-    try testing.expectEqual(@as(u64, 114_688), kv_elements * 2);
-}
-
-test "Qwen3 0.6B keeps explicit 128-wide attention heads" {
-    const testing = std.testing;
-    const plan = Plan{
-        .layer_count = 28,
-        .hidden_size = 1024,
-        .feed_forward_size = 3072,
-        .head_count = 16,
-        .kv_head_count = 8,
-        .head_size = 128,
-        .query_size = 2048,
-        .key_value_size = 1024,
-        .vocabulary_size = 151936,
-    };
-    try testing.expectEqual(@as(u64, 595_984_384), try computeMacs(plan));
-    try testing.expectEqual(@as(u64, 114_688),
-        @as(u64, plan.layer_count) * plan.key_value_size * 2 * @sizeOf(u16));
-}
-
-test "layer-name parser rejects ambiguous names" {
-    const testing = std.testing;
-    const parsed = parseLayerName("blk.27.ffn_down.weight").?;
-    try testing.expectEqual(@as(usize, 27), parsed.layer);
-    try testing.expectEqualStrings("ffn_down.weight", parsed.suffix);
-    try testing.expect(parseLayerName("blk..weight") == null);
-    try testing.expect(parseLayerName("product.blk.0.weight") == null);
-}

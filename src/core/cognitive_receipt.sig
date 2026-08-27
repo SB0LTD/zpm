@@ -4,7 +4,7 @@
 //! arithmetic bounds from the same comptime types used by the runtime, so a
 //! capacity or dimension change must update (and re-prove) the receipt.
 
-const std = @import("std");
+
 const vector_memory = @import("vector_memory");
 const moment_activation = @import("moment_activation");
 const agent_runtime = @import("agent_runtime");

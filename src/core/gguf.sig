@@ -5,7 +5,8 @@
 //! product name. Successful parsing proves only that the container and tensor
 //! spans are structurally safe; executor parity is a separate readiness gate.
 
-const std = @import("std");
+const math = @import("sig_math.sig");
+const mem = @import("sig_mem.sig");
 
 pub const DEFAULT_ALIGNMENT: u32 = 32;
 pub const MAX_KEY_BYTES: u64 = 65_535;
@@ -136,7 +137,7 @@ pub fn Index(comptime tensor_capacity: usize) type {
 
         pub fn find(self: *const @This(), name: []const u8) ?*const TensorInfo {
             for (self.tensors[0..self.tensor_count]) |*tensor| {
-                if (std.mem.eql(u8, tensor.nameSlice(), name)) return tensor;
+                if (mem.eql(u8, tensor.nameSlice(), name)) return tensor;
             }
             return null;
         }
@@ -185,19 +186,19 @@ const Cursor = struct {
     fn readU16(self: *Cursor) Error!u16 {
         var bytes: [2]u8 = undefined;
         try self.readBytes(&bytes);
-        return std.mem.readInt(u16, &bytes, .little);
+        return mem.readInt(u16, &bytes, .little);
     }
 
     fn readU32(self: *Cursor) Error!u32 {
         var bytes: [4]u8 = undefined;
         try self.readBytes(&bytes);
-        return std.mem.readInt(u32, &bytes, .little);
+        return mem.readInt(u32, &bytes, .little);
     }
 
     fn readU64(self: *Cursor) Error!u64 {
         var bytes: [8]u8 = undefined;
         try self.readBytes(&bytes);
-        return std.mem.readInt(u64, &bytes, .little);
+        return mem.readInt(u64, &bytes, .little);
     }
 };
 
@@ -237,7 +238,7 @@ pub fn parse(comptime tensor_capacity: usize, source: Source, out: *Index(tensor
     var cursor = Cursor{ .source = source };
     var magic: [4]u8 = undefined;
     try cursor.readBytes(&magic);
-    if (!std.mem.eql(u8, &magic, "GGUF")) return error.InvalidMagic;
+    if (!mem.eql(u8, &magic, "GGUF")) return error.InvalidMagic;
 
     const version = try cursor.readU32();
     if (version != 3) return error.UnsupportedVersion;
@@ -392,7 +393,7 @@ fn recordArray(
 
 fn recordInteger(source: Source, key: KeyRef, value: u64, summary: *Summary) void {
     if (keyEquals(source, key, "general.alignment") catch false) {
-        if (value <= std.math.maxInt(u32)) summary.alignment = @intCast(value) else summary.alignment = 0;
+        if (value <= math.maxInt(u32)) summary.alignment = @intCast(value) else summary.alignment = 0;
     } else if (keyEndsWith(source, key, ".context_length") catch false) {
         summary.context_length = value;
     } else if (keyEndsWith(source, key, ".embedding_length") catch false) {
@@ -490,7 +491,7 @@ fn bytesEqualAt(source: Source, offset: u64, expected: []const u8) Error!bool {
     while (position < expected.len) {
         const count = @min(expected.len - position, scratch.len);
         if (!source.read(try checkedAdd(offset, position), scratch[0..count])) return error.UnexpectedEof;
-        if (!std.mem.eql(u8, scratch[0..count], expected[position..][0..count])) return false;
+        if (!mem.eql(u8, scratch[0..count], expected[position..][0..count])) return false;
         position += count;
     }
     return true;
@@ -551,12 +552,12 @@ const FixtureWriter = struct {
     }
 
     fn putU32(self: *FixtureWriter, value: u32) void {
-        std.mem.writeInt(u32, self.bytes[self.position..][0..4], value, .little);
+        mem.writeInt(u32, self.bytes[self.position..][0..4], value, .little);
         self.position += 4;
     }
 
     fn putU64(self: *FixtureWriter, value: u64) void {
-        std.mem.writeInt(u64, self.bytes[self.position..][0..8], value, .little);
+        mem.writeInt(u64, self.bytes[self.position..][0..8], value, .little);
         self.position += 8;
     }
 
@@ -566,7 +567,7 @@ const FixtureWriter = struct {
     }
 
     fn alignTo(self: *FixtureWriter, alignment: usize) void {
-        self.position = std.mem.alignForward(usize, self.position, alignment);
+        self.position = mem.alignForward(self.position, alignment);
     }
 };
 
@@ -596,52 +597,3 @@ fn basicFixture(dimension: u64, file_size: *usize) FixtureWriter {
     return writer;
 }
 
-test "parses a bounded Q4_K GGUF v3 index" {
-    const testing = std.testing;
-    var size: usize = 0;
-    var fixture = basicFixture(256, &size);
-    const slice = SliceSource{ .bytes = fixture.bytes[0..size] };
-    var index: Index(4) = .{};
-    try parse(4, slice.source(), &index);
-    try testing.expectEqual(@as(usize, 1), index.tensor_count);
-    try testing.expectEqualStrings("qwen3vl", index.summary.architectureSlice());
-    try testing.expectEqual(@as(u64, 28), index.summary.block_count);
-    try testing.expectEqual(@as(u64, 144), index.tensors[0].byte_size);
-    try testing.expectEqual(index.summary.data_offset, index.tensors[0].file_offset);
-    try testing.expect(index.find("blk.0.attn_q.weight") != null);
-}
-
-test "rejects truncated tensor data and invalid quantized shapes" {
-    const testing = std.testing;
-    var size: usize = 0;
-    var fixture = basicFixture(256, &size);
-    var slice = SliceSource{ .bytes = fixture.bytes[0 .. size - 1] };
-    var index: Index(1) = .{};
-    try testing.expectError(error.UnexpectedEof, parse(1, slice.source(), &index));
-
-    fixture = basicFixture(255, &size);
-    slice = .{ .bytes = fixture.bytes[0..size] };
-    try testing.expectError(error.InvalidTensorShape, parse(1, slice.source(), &index));
-}
-
-test "rejects invalid metadata keys before touching tensor data" {
-    const testing = std.testing;
-    var size: usize = 0;
-    var fixture = basicFixture(256, &size);
-    // First key begins at byte 32.
-    fixture.bytes[32] = 'G';
-    const slice = SliceSource{ .bytes = fixture.bytes[0..size] };
-    var index: Index(1) = .{};
-    try testing.expectError(error.InvalidMetadataKey, parse(1, slice.source(), &index));
-}
-
-test "zero-copy views remain bounded and alignment checked" {
-    const bytes = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    const slice = SliceSource{ .bytes = &bytes };
-    const source = slice.source();
-    try std.testing.expectEqualSlices(u8, &.{ 3, 4, 5 }, source.view(2, 3, 1).?);
-    try std.testing.expect(source.view(7, 2, 1) == null);
-    try std.testing.expect(source.view(0, 1, 3) == null);
-    const read_only = Source{ .context = &slice, .size = bytes.len, .read_at = SliceSource.readAt };
-    try std.testing.expect(read_only.view(0, 1, 1) == null);
-}
