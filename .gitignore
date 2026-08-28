@@ -2,3 +2,10 @@
 .zig-cache/
 zig-out/cli/sig-out/
 cli/sig-out/
+
+# Build artifacts (added during cleanup)
+*.o
+*_out.txt
+*_err.txt
+cli/zig-out/
+
