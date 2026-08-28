@@ -7,7 +7,7 @@
 //!
 //! Zero allocation — operates on caller-provided buffers.
 
-const checksum = @import("checksum.sig");
+const checksum = @import("net_checksum");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Constants

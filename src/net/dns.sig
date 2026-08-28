@@ -6,8 +6,8 @@
 //! Zero allocation — static cache, static query/response buffers.
 //! Only supports A (IPv4 address) record type.
 
-const udp = @import("udp.sig");
-const ipv4 = @import("ipv4.sig");
+const udp = @import("net_udp");
+const ipv4 = @import("net_ipv4");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Constants

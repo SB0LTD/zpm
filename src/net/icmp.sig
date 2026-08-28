@@ -7,8 +7,8 @@
 //!   - Echo Reply (respond to pings)
 //!   - Destination Unreachable (port unreachable for closed UDP ports)
 
-const checksum = @import("checksum.sig");
-const ipv4 = @import("ipv4.sig");
+const checksum = @import("net_checksum");
+const ipv4 = @import("net_ipv4");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Constants

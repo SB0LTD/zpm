@@ -24,8 +24,8 @@
 //! Zero allocation. Fixed connection pool. Static buffers.
 //! Designed for bare-metal kernel use (GCP metadata server, general networking).
 
-const checksum = @import("checksum.sig");
-const ipv4 = @import("ipv4.sig");
+const checksum = @import("net_checksum");
+const ipv4 = @import("net_ipv4");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Constants
@@ -821,7 +821,7 @@ fn processSynSent(conn: *Connection, seg: *const Segment, tcp_data: []const u8, 
         if (seg.flags & FLAG_ACK != 0) {
             // SYN+ACK received — handshake complete
             conn.snd_una = seg.ack;
-            conn.snd_wnd = @as(u32, seg.window) << conn.snd_wscale;
+            conn.snd_wnd = @as(u32, seg.window) << @as(u5, @intCast(conn.snd_wscale));
             conn.snd_wl1 = seg.seq;
             conn.snd_wl2 = seg.ack;
             conn.state = .established;
@@ -847,7 +847,7 @@ fn processSynReceived(conn: *Connection, seg: *const Segment, reply_buf: []u8) ?
             conn.state = .established;
             conn.retransmit_active = false;
             // Window update
-            conn.snd_wnd = @as(u32, seg.window) << conn.snd_wscale;
+            conn.snd_wnd = @as(u32, seg.window) << @as(u5, @intCast(conn.snd_wscale));
             return null; // No reply needed
         }
     }
@@ -866,7 +866,7 @@ fn processEstablished(conn: *Connection, seg: *const Segment, tcp_data: []const 
         if (seqLt(conn.snd_wl1, seg.seq) or
             (conn.snd_wl1 == seg.seq and seqLeq(conn.snd_wl2, seg.ack)))
         {
-            conn.snd_wnd = @as(u32, seg.window) << conn.snd_wscale;
+            conn.snd_wnd = @as(u32, seg.window) << @as(u5, @intCast(conn.snd_wscale));
             conn.snd_wl1 = seg.seq;
             conn.snd_wl2 = seg.ack;
         }
@@ -1015,7 +1015,7 @@ fn processForListener(
 
     // Parse peer's options from SYN
     parseOptions(new_conn, tcp_data, seg.data_offset);
-    new_conn.snd_wnd = @as(u32, seg.window) << new_conn.snd_wscale;
+    new_conn.snd_wnd = @as(u32, seg.window) << @as(u5, @intCast(new_conn.snd_wscale));
 
     new_conn.cc = CongestionState.init(new_conn.mss);
     new_conn.retransmit_active = true;
@@ -1191,7 +1191,7 @@ fn buildSegmentFull(
     buf: []u8,
 ) ?usize {
     const ack_num = if (flags & FLAG_ACK != 0) conn.rcv_nxt else @as(u32, 0);
-    const window = @as(u16, @intCast(@min(conn.rcv_wnd >> conn.rcv_wscale, 0xFFFF)));
+    const window = @as(u16, @intCast(@min(conn.rcv_wnd >> @as(u5, @intCast(conn.rcv_wscale)), 0xFFFF)));
     return buildRawSegment(
         conn.local_ip,
         conn.remote_ip,

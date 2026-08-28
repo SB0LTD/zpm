@@ -4,8 +4,8 @@
 //! responder for incoming requests, and query with timeout.
 //! Zero allocation — fixed-size table, caller-provided buffers.
 
-const ethernet = @import("ethernet.sig");
-const net_iface = @import("interface.sig");
+const ethernet = @import("net_ethernet");
+const net_iface = @import("net_interface");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Constants

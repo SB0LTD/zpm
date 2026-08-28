@@ -5,8 +5,8 @@
 //!
 //! UDP header: src_port(2) + dst_port(2) + length(2) + checksum(2) = 8 bytes
 
-const checksum = @import("checksum.sig");
-const ipv4 = @import("ipv4.sig");
+const checksum = @import("net_checksum");
+const ipv4 = @import("net_ipv4");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Constants
