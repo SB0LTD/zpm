@@ -47,6 +47,11 @@ pub fn clamp(val: anytype, lower: @TypeOf(val), upper: @TypeOf(val)) @TypeOf(val
     return if (val < lower) lower else if (val > upper) upper else val;
 }
 
+/// Absolute value of an f32 without libm. Branchless-friendly.
+pub fn absF(x: f32) f32 {
+    return if (x < 0) -x else x;
+}
+
 pub fn rotl(comptime T: type, x: T, r: anytype) T {
     const bits = @typeInfo(T).int.bits;
     const shift: u6 = @intCast(@as(u32, @intCast(r)) % bits);

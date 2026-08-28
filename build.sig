@@ -44,9 +44,34 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
 
     // Core modules.
     _ = try ctx.addModule("math", "src/core/math.sig");
+    _ = try ctx.addModule("sig_math", "src/core/sig_math.sig");
+    const synth_voice = try ctx.addModule("synth_voice", "src/core/synth_voice.sig");
+    try wire(ctx, synth_voice, "math", "src/core/math.sig");
+    try wire(ctx, synth_voice, "sig_math", "src/core/sig_math.sig");
     _ = try ctx.addModule("json", "src/core/json.sig");
     _ = try ctx.addModule("sha256", "src/core/sha256.sig");
     _ = try ctx.addModule("inflate", "src/core/inflate.sig");
+
+    // ── Crypto modules (Layer 0: pure computation, freestanding) ──
+    const crypto_hmac = try ctx.addModule("hmac", "src/core/crypto/hmac.sig");
+    try wire(ctx, crypto_hmac, "sha256", "src/core/sha256.sig");
+    const crypto_hkdf = try ctx.addModule("hkdf", "src/core/crypto/hkdf.sig");
+    try wire(ctx, crypto_hkdf, "hmac", "src/core/crypto/hmac.sig");
+    _ = try ctx.addModule("aes", "src/core/crypto/aes.sig");
+    const crypto_gcm = try ctx.addModule("gcm", "src/core/crypto/gcm.sig");
+    try wire(ctx, crypto_gcm, "aes", "src/core/crypto/aes.sig");
+    _ = try ctx.addModule("x25519", "src/core/crypto/x25519.sig");
+    const crypto_p256 = try ctx.addModule("p256", "src/core/crypto/p256.sig");
+    try wire(ctx, crypto_p256, "sha256", "src/core/sha256.sig");
+    try wire(ctx, crypto_p256, "hmac", "src/core/crypto/hmac.sig");
+    const crypto_tls13 = try ctx.addModule("tls13_keys", "src/core/crypto/tls13_keys.sig");
+    try wire(ctx, crypto_tls13, "sha256", "src/core/sha256.sig");
+    try wire(ctx, crypto_tls13, "hkdf", "src/core/crypto/hkdf.sig");
+    try wire(ctx, crypto_tls13, "hmac", "src/core/crypto/hmac.sig");
+    const crypto_quic_keys = try ctx.addModule("quic_keys", "src/core/crypto/quic_keys.sig");
+    try wire(ctx, crypto_quic_keys, "sha256", "src/core/sha256.sig");
+    try wire(ctx, crypto_quic_keys, "hkdf", "src/core/crypto/hkdf.sig");
+    try wire(ctx, crypto_quic_keys, "aes", "src/core/crypto/aes.sig");
     const jsonl = try ctx.addModule("jsonl", "src/core/jsonl.sig");
     try wire(ctx, jsonl, "json", "src/core/json.sig");
     _ = try ctx.addModule("ai_core", "src/core/ai_core.sig");
@@ -84,6 +109,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-quantized-linear", "src/core/quantized_linear.sig", &.{});
     _ = try addTest(ctx, test_all, "test-transformer-ops", "src/core/transformer_ops.sig", &.{});
     _ = try addTest(ctx, test_all, "test-audio-dsp", "src/core/audio_dsp.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-math", "src/core/math.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-sig-math", "src/core/sig_math.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-synth_voice", "src/core/synth_voice.sig", &.{
+        importEntry("math", "src/core/math.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-vector-memory", "src/core/vector_memory.sig", &.{});
     _ = try addTest(ctx, test_all, "test-moment-activation", "src/core/moment_activation.sig", &.{});
     _ = try addTest(ctx, test_all, "test-agent-runtime", "src/core/agent_runtime.sig", &.{});
@@ -97,6 +128,33 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("multimodal_now", "src/core/multimodal_now.sig"),
     });
     _ = try addTest(ctx, test_all, "test-sha256", "src/core/sha256.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-hmac", "src/core/crypto/hmac.sig", &.{
+        importEntry("sha256", "src/core/sha256.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-hkdf", "src/core/crypto/hkdf.sig", &.{
+        importEntry("hmac", "src/core/crypto/hmac.sig"),
+        importEntry("sha256", "src/core/sha256.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-aes", "src/core/crypto/aes.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-gcm", "src/core/crypto/gcm.sig", &.{
+        importEntry("aes", "src/core/crypto/aes.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-x25519", "src/core/crypto/x25519.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-p256", "src/core/crypto/p256.sig", &.{
+        importEntry("sha256", "src/core/sha256.sig"),
+        importEntry("hmac", "src/core/crypto/hmac.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tls13-keys", "src/core/crypto/tls13_keys.sig", &.{
+        importEntry("sha256", "src/core/sha256.sig"),
+        importEntry("hmac", "src/core/crypto/hmac.sig"),
+        importEntry("hkdf", "src/core/crypto/hkdf.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-quic-keys", "src/core/crypto/quic_keys.sig", &.{
+        importEntry("sha256", "src/core/sha256.sig"),
+        importEntry("hmac", "src/core/crypto/hmac.sig"),
+        importEntry("hkdf", "src/core/crypto/hkdf.sig"),
+        importEntry("aes", "src/core/crypto/aes.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-inflate", "src/core/inflate.sig", &.{
         importEntry("sig_mem", "src/core/sig_mem.sig"),
     });

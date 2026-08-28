@@ -96,3 +96,47 @@ pub fn miniCandle(t: f32, dt: f32, seed: f32) MiniCandle {
         .bullish = close >= open,
     };
 }
+
+/// Square root via Newton-Raphson (4 iterations). Guards x<=0 → 0.
+/// Sufficient precision for audio/pixel work; no libm dependency.
+pub fn sqrtApprox(x: f32) f32 {
+    if (x <= 0) return 0;
+    var guess: f32 = x * 0.5;
+    guess = 0.5 * (guess + x / guess);
+    guess = 0.5 * (guess + x / guess);
+    guess = 0.5 * (guess + x / guess);
+    guess = 0.5 * (guess + x / guess);
+    return guess;
+}
+
+/// Piecewise-linear soft-clip limiter. Linear in [-0.75, 0.75], compresses
+/// above with 0.5x gain, hard-limits at [-1, 1]. Keeps summed synthesis
+/// partials from clipping harshly while preserving low-level detail.
+pub fn softClip(x: f32) f32 {
+    if (x > 1.0) return 1.0;
+    if (x < -1.0) return -1.0;
+    if (x > 0.75) return 0.75 + (x - 0.75) * 0.5;
+    if (x < -0.75) return -0.75 + (x + 0.75) * 0.5;
+    return x;
+}
+
+test "sqrtApprox matches known roots and guards non-positive" {
+    if (sqrtApprox(0.0) != 0.0) return error.TestUnexpectedResult;
+    if (sqrtApprox(-4.0) != 0.0) return error.TestUnexpectedResult;
+    const r16 = sqrtApprox(16.0);
+    if (r16 < 3.99 or r16 > 4.01) return error.TestUnexpectedResult;
+    const r2 = sqrtApprox(2.0);
+    if (r2 < 1.40 or r2 > 1.42) return error.TestUnexpectedResult;
+}
+
+test "softClip bounds and linear passthrough" {
+    // Always bounded to [-1, 1].
+    var x: f32 = -5.0;
+    while (x <= 5.0) : (x += 0.1) {
+        const c = softClip(x);
+        if (c < -1.0 or c > 1.0) return error.TestUnexpectedResult;
+    }
+    // Linear passthrough at 0.5 (inside the [-0.75, 0.75] region).
+    if (softClip(0.5) != 0.5) return error.TestUnexpectedResult;
+    if (softClip(-0.5) != -0.5) return error.TestUnexpectedResult;
+}
