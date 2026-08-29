@@ -83,6 +83,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("agent_runtime", "src/core/agent_runtime.sig");
     _ = try ctx.addModule("model_observability", "src/core/model_observability.sig");
     _ = try ctx.addModule("multimodal_now", "src/core/multimodal_now.sig");
+
+    // Platform: SB0 native image format (Layer 1, pure byte encoder).
+    _ = try ctx.addModule("sb0x_format", "src/platform/sb0x/format.sig");
+
     const cognitive_receipt = try ctx.addModule("cognitive_receipt", "src/core/cognitive_receipt.sig");
     try wire(ctx, cognitive_receipt, "vector_memory", "src/core/vector_memory.sig");
     try wire(ctx, cognitive_receipt, "moment_activation", "src/core/moment_activation.sig");
@@ -120,6 +124,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-agent-runtime", "src/core/agent_runtime.sig", &.{});
     _ = try addTest(ctx, test_all, "test-model-observability", "src/core/model_observability.sig", &.{});
     _ = try addTest(ctx, test_all, "test-multimodal-now", "src/core/multimodal_now.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-sb0x-format", "src/platform/sb0x/format.sig", &.{});
     _ = try addTest(ctx, test_all, "test-cognitive-receipt", "src/core/cognitive_receipt.sig", &.{
         importEntry("vector_memory", "src/core/vector_memory.sig"),
         importEntry("moment_activation", "src/core/moment_activation.sig"),
