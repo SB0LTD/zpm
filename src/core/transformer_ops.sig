@@ -106,7 +106,7 @@ pub fn softmax(values: []f32) Error!void {
         value.* = @exp(value.* - maximum);
         sum += value.*;
     }
-    if (!math.isFinite(sum) or sum <= 0) return error.NonFinite;
+    if (!math.isFiniteF64(sum) or sum <= 0) return error.NonFinite;
     const inverse: f32 = @floatCast(1.0 / sum);
     for (values) |*value| value.* *= inverse;
 }
@@ -221,7 +221,8 @@ test "GELU tanh preserves zero and expected signs" {
 test "split-half RoPE is identity at position zero" {
     var values = [_]f32{ 1, 2, 3, 4 };
     try ropeSplitHalf(&values, 1, 4, 0, 1_000_000);
-    { for (&.{ 1, 2, 3, 4 }, &values) |a, b| { if (a != b) return error.TestUnexpectedResult; } }
+    const expected = [_]f32{ 1, 2, 3, 4 };
+    for (expected, values) |a, b| if (a != b) return error.TestUnexpectedResult;
 }
 
 test "single-token attention returns its value" {
