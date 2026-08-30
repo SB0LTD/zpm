@@ -10,6 +10,7 @@ const moment_activation = @import("moment_activation");
 const agent_runtime = @import("agent_runtime");
 const model_observability = @import("model_observability");
 const multimodal_now = @import("multimodal_now");
+const testing = @import("sig_testing.sig");
 
 pub const vector_capacity: usize = 256;
 pub const vector_dimension: usize = 384;
@@ -122,38 +123,38 @@ pub fn reference() Receipt {
 
 test "reference efficiency receipt is exact and internally consistent" {
     const receipt = reference();
-    try std.testing.expectEqual(@as(usize, 217_104), receipt.vector_static_bytes);
-    try std.testing.expectEqual(@as(usize, 196_608), receipt.vector_payload_bytes);
-    try std.testing.expectEqual(@as(usize, 98_944), receipt.vector_query_multiplications);
-    try std.testing.expectEqual(@as(usize, 98_688), receipt.vector_query_additions);
-    try std.testing.expectEqual(@as(usize, 256), receipt.vector_query_divisions);
-    try std.testing.expectEqual(@as(usize, 5_120), receipt.low_rank_context_macs);
-    try std.testing.expectEqual(@as(usize, 6_400), receipt.low_rank_total_linear_multiplications);
-    try std.testing.expectEqual(@as(usize, 17_664), receipt.dense_total_linear_multiplications);
-    try std.testing.expectEqual(@as(usize, 176_128), receipt.low_rank_parameter_bytes);
-    try std.testing.expectEqual(@as(usize, 536_576), receipt.dense_parameter_bytes);
-    try std.testing.expectEqual(receipt.low_rank_parameter_bytes, MomentModel.staticBytes());
-    try std.testing.expect(receipt.vector_static_bytes >= receipt.vector_payload_bytes);
-    try std.testing.expect(receipt.vector_static_bytes < 256 * 1024);
+    try testing.expectEqual(@as(usize, 217_104), receipt.vector_static_bytes);
+    try testing.expectEqual(@as(usize, 196_608), receipt.vector_payload_bytes);
+    try testing.expectEqual(@as(usize, 98_944), receipt.vector_query_multiplications);
+    try testing.expectEqual(@as(usize, 98_688), receipt.vector_query_additions);
+    try testing.expectEqual(@as(usize, 256), receipt.vector_query_divisions);
+    try testing.expectEqual(@as(usize, 5_120), receipt.low_rank_context_macs);
+    try testing.expectEqual(@as(usize, 6_400), receipt.low_rank_total_linear_multiplications);
+    try testing.expectEqual(@as(usize, 17_664), receipt.dense_total_linear_multiplications);
+    try testing.expectEqual(@as(usize, 176_128), receipt.low_rank_parameter_bytes);
+    try testing.expectEqual(@as(usize, 536_576), receipt.dense_parameter_bytes);
+    try testing.expectEqual(receipt.low_rank_parameter_bytes, MomentModel.staticBytes());
+    try testing.expect(receipt.vector_static_bytes >= receipt.vector_payload_bytes);
+    try testing.expect(receipt.vector_static_bytes < 256 * 1024);
     // Cross multiplication proves >67% parameter reduction without floats.
-    try std.testing.expect(receipt.low_rank_parameter_bytes * 100 < receipt.dense_parameter_bytes * 33);
+    try testing.expect(receipt.low_rank_parameter_bytes * 100 < receipt.dense_parameter_bytes * 33);
     // Cross multiplication proves >63% total linear arithmetic reduction.
-    try std.testing.expect(receipt.low_rank_total_linear_multiplications * 100 <
+    try testing.expect(receipt.low_rank_total_linear_multiplications * 100 <
         receipt.dense_total_linear_multiplications * 37);
-    try std.testing.expectEqual(@as(usize, 36), receipt.activation_weight_products);
-    try std.testing.expectEqual(@as(usize, 1), receipt.root_revocation_writes);
-    try std.testing.expectEqual(@as(usize, 64), receipt.model_trace_event_bytes);
-    try std.testing.expectEqual(@as(usize, 32_768), receipt.model_trace_payload_bytes);
-    try std.testing.expectEqual(@as(usize, 47_928), receipt.model_trace_static_bytes);
-    try std.testing.expectEqual(@as(usize, 1_728), receipt.model_trace_histogram_buckets);
-    try std.testing.expectEqual(@as(usize, 1_472), receipt.now_fusion_static_bytes);
-    try std.testing.expectEqual(@as(usize, 5), receipt.now_fusion_maximum_modalities);
-    try std.testing.expectEqual(@as(usize, 97), receipt.now_fusion_minimum_arithmetic);
-    try std.testing.expectEqual(@as(usize, 385), receipt.now_fusion_full_arithmetic);
-    try std.testing.expectEqual(@as(usize, 897), receipt.now_fusion_maximum_arithmetic);
+    try testing.expectEqual(@as(usize, 36), receipt.activation_weight_products);
+    try testing.expectEqual(@as(usize, 1), receipt.root_revocation_writes);
+    try testing.expectEqual(@as(usize, 64), receipt.model_trace_event_bytes);
+    try testing.expectEqual(@as(usize, 32_768), receipt.model_trace_payload_bytes);
+    try testing.expectEqual(@as(usize, 47_928), receipt.model_trace_static_bytes);
+    try testing.expectEqual(@as(usize, 1_728), receipt.model_trace_histogram_buckets);
+    try testing.expectEqual(@as(usize, 1_472), receipt.now_fusion_static_bytes);
+    try testing.expectEqual(@as(usize, 5), receipt.now_fusion_maximum_modalities);
+    try testing.expectEqual(@as(usize, 97), receipt.now_fusion_minimum_arithmetic);
+    try testing.expectEqual(@as(usize, 385), receipt.now_fusion_full_arithmetic);
+    try testing.expectEqual(@as(usize, 897), receipt.now_fusion_maximum_arithmetic);
     // Excluding the one prefix-independent reciprocal, reducing 64 lanes to
     // 16 reduces every lane-dependent arithmetic operation by exactly 75%.
-    try std.testing.expect((receipt.now_fusion_minimum_arithmetic - 1) * 4 ==
+    try testing.expect((receipt.now_fusion_minimum_arithmetic - 1) * 4 ==
         receipt.now_fusion_full_arithmetic - 1);
 }
 
@@ -161,7 +162,7 @@ test "bounded authority structures remain inline values" {
     const Capabilities = agent_runtime.CapabilityTable(64, 4);
     const Processes = agent_runtime.ProcessTable(8, 128);
     const Plans = agent_runtime.Plan(32);
-    try std.testing.expectEqual(@sizeOf(Capabilities), Capabilities.staticBytes());
-    try std.testing.expectEqual(@sizeOf(Processes), Processes.staticBytes());
-    try std.testing.expectEqual(@sizeOf(Plans), Plans.staticBytes());
+    try testing.expectEqual(@sizeOf(Capabilities), Capabilities.staticBytes());
+    try testing.expectEqual(@sizeOf(Processes), Processes.staticBytes());
+    try testing.expectEqual(@sizeOf(Plans), Plans.staticBytes());
 }

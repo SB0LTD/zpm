@@ -7,6 +7,8 @@
 
 
 const json = @import("json");
+const mem = @import("sig_mem.sig");
+const testing = @import("sig_testing.sig");
 
 /// Iterator over non-empty lines in a JSONL buffer.
 pub const JsonlIterator = struct {

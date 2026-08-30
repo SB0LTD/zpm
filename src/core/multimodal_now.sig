@@ -7,6 +7,7 @@
 
 const math = @import("sig_math.sig");
 const mem = @import("sig_mem.sig");
+const testing = @import("sig_testing.sig");
 
 pub const Q16_ONE: u16 = math.maxInt(u16);
 
@@ -177,7 +178,7 @@ pub fn Fusion(comptime dimension: usize, comptime minimum_prefix: usize) type {
                 receipt.multiplications +|= 1;
                 receipt.additions +|= 1;
             }
-            if (!math.isFinite(squared_norm)) return error.NonFinite;
+            if (!math.isFiniteF64(squared_norm)) return error.NonFinite;
             if (squared_norm <= 0) return error.ZeroNorm;
             const inverse: f32 = @floatCast(1.0 / @sqrt(squared_norm));
             receipt.divisions +|= 1;
@@ -224,7 +225,7 @@ test "fusion rejects unaligned spaces and publication is atomic" {
     var fusion = Fusion(8, 2){};
     try fusion.configure(testDomain(1), 100);
     const vector = [_]f32{ 1, 0, 0, 0, 0, 0, 0, 0 };
-    try std.testing.expectError(error.DomainMismatch, fusion.publish(.{
+    try testing.expectError(error.DomainMismatch, fusion.publish(.{
         .modality = .vision,
         .domain = testDomain(2),
         .event_id = 1,
@@ -234,8 +235,8 @@ test "fusion rejects unaligned spaces and publication is atomic" {
         .prefix_dimensions = 8,
         .vector = &vector,
     }));
-    try std.testing.expectEqual(@as(u64, 0), fusion.publications);
-    try std.testing.expectEqual(@as(u64, 1), fusion.rejections);
+    try testing.expectEqual(@as(u64, 0), fusion.publications);
+    try testing.expectEqual(@as(u64, 1), fusion.rejections);
 }
 
 test "fresh multimodal representations fuse to a normalized NOW vector" {
@@ -248,10 +249,10 @@ test "fresh multimodal representations fuse to a normalized NOW vector" {
     try fusion.publish(.{ .modality = .audio_semantic, .domain = domain, .event_id = 2, .timestamp_tick = 90, .confidence_q16 = Q16_ONE, .quality_q16 = Q16_ONE, .prefix_dimensions = 8, .vector = &audio });
     var output: [8]f32 = undefined;
     const receipt = try fusion.fuse(100, 8, &output);
-    try std.testing.expectEqual(@as(u8, 2), receipt.active_modalities);
-    try std.testing.expect(receipt.normalized);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.70710677), output[0], 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.70710677), output[1], 0.0001);
+    try testing.expectEqual(@as(u8, 2), receipt.active_modalities);
+    try testing.expect(receipt.normalized);
+    try testing.expectApproxEqAbs(@as(f32, 0.70710677), output[0], 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.70710677), output[1], 0.0001);
 }
 
 test "Matryoshka prefix budget reduces exact fusion work" {
@@ -266,7 +267,7 @@ test "Matryoshka prefix budget reduces exact fusion work" {
     const full = try fusion.fuse(1, 64, &short);
     // The one reciprocal-square-root division is prefix-independent; every
     // lane operation scales exactly with D.
-    try std.testing.expect((low.arithmeticOperations() - 1) * 4 ==
+    try testing.expect((low.arithmeticOperations() - 1) * 4 ==
         full.arithmeticOperations() - 1);
 }
 
@@ -277,5 +278,5 @@ test "expired representations cannot animate stale ephemeral UI" {
     const vector = [_]f32{ 1, 0, 0, 0 };
     try fusion.publish(.{ .modality = .system, .domain = domain, .event_id = 1, .timestamp_tick = 1, .confidence_q16 = Q16_ONE, .quality_q16 = Q16_ONE, .prefix_dimensions = 4, .vector = &vector });
     var output: [4]f32 = undefined;
-    try std.testing.expectError(error.NoFreshRepresentation, fusion.fuse(11, 4, &output));
+    try testing.expectError(error.NoFreshRepresentation, fusion.fuse(11, 4, &output));
 }

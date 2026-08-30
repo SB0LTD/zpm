@@ -5,6 +5,7 @@
 // Provides streaming (init/update/final) and one-shot (hash) interfaces.
 
 const mem = @import("sig_mem.sig");
+const testing = @import("sig_testing.sig");
 
 /// SHA-256 digest length in bytes.
 pub const DIGEST_LEN = 32;
@@ -241,18 +242,22 @@ test "sha256: empty string → NIST vector" {
     const digest = hash("");
     var hex: [64]u8 = undefined;
     hexDigest(&digest, &hex);
-    { const a__=
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"; const b__=&hex,
-    ; if (a__.len!=b__.len) return error.TestUnexpectedResult; for (a__,b__)|x,y|{if(x!=y)return error.TestUnexpectedResult;} };
+    try testing.expectEqualSlices(
+        u8,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        &hex,
+    );
 }
 
 test "sha256: 'abc' → NIST vector" {
     const digest = hash("abc");
     var hex: [64]u8 = undefined;
     hexDigest(&digest, &hex);
-    { const a__=
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"; const b__=&hex,
-    ; if (a__.len!=b__.len) return error.TestUnexpectedResult; for (a__,b__)|x,y|{if(x!=y)return error.TestUnexpectedResult;} };
+    try testing.expectEqualSlices(
+        u8,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        &hex,
+    );
 }
 
 test "sha256: 448-bit message → NIST vector" {
@@ -261,9 +266,11 @@ test "sha256: 448-bit message → NIST vector" {
     const digest = hash(msg);
     var hex: [64]u8 = undefined;
     hexDigest(&digest, &hex);
-    { const a__=
-        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"; const b__=&hex,
-    ; if (a__.len!=b__.len) return error.TestUnexpectedResult; for (a__,b__)|x,y|{if(x!=y)return error.TestUnexpectedResult;} };
+    try testing.expectEqualSlices(
+        u8,
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+        &hex,
+    );
 }
 
 test "sha256: streaming matches one-shot" {
@@ -277,7 +284,7 @@ test "sha256: streaming matches one-shot" {
     streamed.update(data[20..]);
     const streamed_digest = streamed.final();
 
-    if (streamed_digest != one_shot) return error.TestUnexpectedResult;
+    if (!mem.eql(u8, &streamed_digest, &one_shot)) return error.TestUnexpectedResult;
 }
 
 test "sha256: single byte chunks" {
@@ -290,14 +297,14 @@ test "sha256: single byte chunks" {
     }
     const streamed_digest = streamed.final();
 
-    if (streamed_digest != one_shot) return error.TestUnexpectedResult;
+    if (!mem.eql(u8, &streamed_digest, &one_shot)) return error.TestUnexpectedResult;
 }
 
 test "sha256: determinism — hashing twice yields same digest" {
     const data = "deterministic input";
     const d1 = hash(data);
     const d2 = hash(data);
-    if (d2 != d1) return error.TestUnexpectedResult;
+    if (!mem.eql(u8, &d2, &d1)) return error.TestUnexpectedResult;
 }
 
 test "sha256: hexDigest format" {
@@ -306,6 +313,6 @@ test "sha256: hexDigest format" {
     hexDigest(&digest, &hex);
     // Verify all chars are valid hex
     for (hex) |c| {
-        if (!((c >= '0' and c <= '9')) return error.TestUnexpectedResult or (c >= 'a' and c <= 'f'));
+        try testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
     }
 }

@@ -5,6 +5,8 @@
 //! All storage is fixed at compile time and every transition emits a receipt.
 
 const math = @import("sig_math.sig");
+const mem = @import("sig_mem.sig");
+const testing = @import("sig_testing.sig");
 
 pub const Error = error{
     InvalidClass,
@@ -159,7 +161,7 @@ pub fn MomentState(
                 receipt.multiplications += 1;
                 receipt.additions += 1;
             }
-            if (!math.isFinite(candidate_squared)) return error.NonFinite;
+            if (!math.isFiniteF64(candidate_squared)) return error.NonFinite;
 
             if (candidate_squared > 0) {
                 const inverse: f32 = @floatCast(1.0 / @sqrt(candidate_squared));
@@ -380,7 +382,7 @@ test "invalid coefficients cannot partially mutate NOW" {
     const features = [1]f32{1};
     const goals = [0]f32{};
     try testing.expectError(error.InvalidCoefficient, state.update(&model, 0, &features, &goals));
-    if (state.state != before) return error.TestUnexpectedResult;
+    if (!mem.eql(f32, &state.state, &before)) return error.TestUnexpectedResult;
     if (state.updates != 0) return error.TestUnexpectedResult;
 }
 

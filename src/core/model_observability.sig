@@ -6,6 +6,7 @@
 //! latency distributions after detailed events are overwritten.
 
 const math = @import("sig_math.sig");
+const testing = @import("sig_testing.sig");
 
 pub const Stage = enum(u8) {
     request_submit,
@@ -295,14 +296,14 @@ test "trace replay detects overwrite gaps and preserves correlation" {
     var cursor = Cursor{ .next_sequence = 1 };
     var output: [2]TraceEvent = undefined;
     const first = trace.readDelta(&cursor, &output);
-    try std.testing.expect(first.gap_detected);
-    try std.testing.expectEqual(@as(usize, 2), first.copied);
-    try std.testing.expectEqual(@as(u64, 3), output[0].sequence);
-    try std.testing.expectEqual(@as(u64, 4), output[1].correlation_id);
+    try testing.expect(first.gap_detected);
+    try testing.expectEqual(@as(usize, 2), first.copied);
+    try testing.expectEqual(@as(u64, 3), output[0].sequence);
+    try testing.expectEqual(@as(u64, 4), output[1].correlation_id);
     const second = trace.readDelta(&cursor, &output);
-    try std.testing.expect(!second.gap_detected);
-    try std.testing.expectEqual(@as(usize, 1), second.copied);
-    try std.testing.expectEqual(@as(u64, 5), output[0].sequence);
+    try testing.expect(!second.gap_detected);
+    try testing.expectEqual(@as(usize, 1), second.copied);
+    try testing.expectEqual(@as(u64, 5), output[0].sequence);
 }
 
 test "stage histograms retain conservative p50 p95 and failure totals" {
@@ -315,15 +316,15 @@ test "stage histograms retain conservative p50 p95 and failure totals" {
         .status = if (index == 5) .deadline else .ok,
     });
     const stats = trace.stageStats(.vision_projector);
-    try std.testing.expectEqual(@as(u64, 6), stats.count);
-    try std.testing.expectEqual(@as(u64, 1), stats.failures);
-    try std.testing.expectEqual(@as(u64, 23), stats.total_duration_ticks);
-    try std.testing.expectEqual(@as(u64, 3), stats.quantileUpperBound(1, 2).?);
-    try std.testing.expectEqual(@as(u64, 15), stats.quantileUpperBound(95, 100).?);
+    try testing.expectEqual(@as(u64, 6), stats.count);
+    try testing.expectEqual(@as(u64, 1), stats.failures);
+    try testing.expectEqual(@as(u64, 23), stats.total_duration_ticks);
+    try testing.expectEqual(@as(u64, 3), stats.quantileUpperBound(1, 2).?);
+    try testing.expectEqual(@as(u64, 15), stats.quantileUpperBound(95, 100).?);
 }
 
 test "wire event and trace memory are exact fixed-capacity values" {
-    try std.testing.expectEqual(@as(usize, 64), @sizeOf(TraceEvent));
+    try testing.expectEqual(@as(usize, 64), @sizeOf(TraceEvent));
     const Tiny = Trace(4);
-    try std.testing.expectEqual(@sizeOf(Tiny), Tiny.staticBytes());
+    try testing.expectEqual(@sizeOf(Tiny), Tiny.staticBytes());
 }

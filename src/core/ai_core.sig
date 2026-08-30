@@ -5,6 +5,8 @@
 //! interface. The same code therefore runs in hosted tools and freestanding
 //! SB0 without compatibility shims.
 
+const testing = @import("sig_testing.sig");
+
 pub const CapacityError = error{
     InvalidAlignment,
     CapacityExhausted,

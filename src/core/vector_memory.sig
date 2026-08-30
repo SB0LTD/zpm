@@ -6,6 +6,7 @@
 
 const math = @import("sig_math.sig");
 const mem = @import("sig_mem.sig");
+const testing = @import("sig_testing.sig");
 
 pub const Error = error{
     CapacityExhausted,
@@ -156,7 +157,7 @@ pub fn Store(comptime capacity: usize, comptime dimension: usize) type {
                 if (!math.isFinite(restored)) return error.NonFinite;
                 squared_norm += @as(f64, restored) * @as(f64, restored);
             }
-            if (!math.isFinite(squared_norm) or squared_norm <= 0) return error.ZeroNorm;
+            if (!math.isFiniteF64(squared_norm) or squared_norm <= 0) return error.ZeroNorm;
             const norm: f32 = @floatCast(@sqrt(squared_norm));
 
             var destination: ?usize = null;
@@ -243,7 +244,7 @@ pub fn Store(comptime capacity: usize, comptime dimension: usize) type {
                 receipt.multiplications += 1;
                 receipt.additions += 1;
             }
-            if (!math.isFinite(query_squared_norm) or query_squared_norm <= 0) return error.ZeroNorm;
+            if (!math.isFiniteF64(query_squared_norm) or query_squared_norm <= 0) return error.ZeroNorm;
             const query_norm: f32 = @floatCast(@sqrt(query_squared_norm));
 
             var result_count: usize = 0;

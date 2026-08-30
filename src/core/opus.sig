@@ -10,6 +10,7 @@
 
 const math = @import("sig_math.sig");
 const mem = @import("sig_mem.sig");
+const testing = @import("sig_testing.sig");
 
 /// Opus encoder configuration.
 pub const EncoderConfig = struct {
@@ -167,14 +168,15 @@ pub const Encoder = struct {
 
         while (i < pcm.len and written < out.len) : (i += 1) {
             // LPC prediction (order 10)
-            var prediction: i32 = 0;
+            var prediction_accumulator: i64 = 0;
             const order = @min(i, @as(usize, 10));
             for (0..order) |k| {
                 if (i > k) {
-                    prediction += @as(i32, pcm[i - 1 - k]) * @as(i32, self.lpc_state[k]);
+                    prediction_accumulator +=
+                        @as(i64, pcm[i - 1 - k]) * @as(i64, self.lpc_state[k]);
                 }
             }
-            prediction >>= 12;
+            const prediction: i32 = @intCast(prediction_accumulator >> 12);
 
             // Compute residual
             const residual: i32 = @as(i32, pcm[i]) - prediction;
@@ -262,14 +264,15 @@ pub const Decoder = struct {
             const residual: i32 = @as(i32, quantized) * quant_step;
 
             // LPC synthesis (order 10)
-            var prediction: i32 = 0;
+            var prediction_accumulator: i64 = 0;
             const order = @min(written, 10);
             for (0..order) |k| {
                 if (written > k) {
-                    prediction += @as(i32, out[written - 1 - k]) * @as(i32, self.lpc_state[k]);
+                    prediction_accumulator +=
+                        @as(i64, out[written - 1 - k]) * @as(i64, self.lpc_state[k]);
                 }
             }
-            prediction >>= 12;
+            const prediction: i32 = @intCast(prediction_accumulator >> 12);
 
             // Reconstruct sample
             const sample: i32 = residual + prediction;
@@ -353,16 +356,16 @@ fn selectConfig(sample_rate: u32, frame_size_ms: u8) u5 {
 
 test "encoder config validation" {
     const valid = EncoderConfig{ .bitrate_kbps = 24, .sample_rate = 16000, .channels = 1 };
-    try std.testing.expect(valid.isValid());
+    try testing.expect(valid.isValid());
 
     const invalid_br = EncoderConfig{ .bitrate_kbps = 100, .sample_rate = 16000, .channels = 1 };
-    try std.testing.expect(!invalid_br.isValid());
+    try testing.expect(!invalid_br.isValid());
 
     const invalid_sr = EncoderConfig{ .bitrate_kbps = 24, .sample_rate = 44100, .channels = 1 };
-    try std.testing.expect(!invalid_sr.isValid());
+    try testing.expect(!invalid_sr.isValid());
 
     const invalid_ch = EncoderConfig{ .bitrate_kbps = 24, .sample_rate = 16000, .channels = 2 };
-    try std.testing.expect(!invalid_ch.isValid());
+    try testing.expect(!invalid_ch.isValid());
 }
 
 test "encode decode round-trip preserves signal structure" {
@@ -378,8 +381,8 @@ test "encode decode round-trip preserves signal structure" {
 
     var opus_buf: [1024]u8 = undefined;
     const encoded_len = encoder.encodeFrame(&pcm, &opus_buf);
-    try std.testing.expect(encoded_len > 0);
-    try std.testing.expect(encoded_len <= 1024);
+    try testing.expect(encoded_len > 0);
+    try testing.expect(encoded_len <= 1024);
 
     // Decode
     var dec_config = DecoderConfig{};
@@ -387,7 +390,7 @@ test "encode decode round-trip preserves signal structure" {
     var decoder = Decoder.init(.{});
     var decoded: [320]i16 = undefined;
     const decoded_len = decoder.decodePacket(opus_buf[0..encoded_len], &decoded);
-    try std.testing.expect(decoded_len > 0);
+    try testing.expect(decoded_len > 0);
 
     // Verify signal is roughly preserved (lossy codec, so check correlation not equality)
     var correlation: i64 = 0;
@@ -396,7 +399,7 @@ test "encode decode round-trip preserves signal structure" {
         correlation += @as(i64, pcm[i]) * @as(i64, decoded[i]);
     }
     // Positive correlation indicates signal structure is preserved
-    try std.testing.expect(correlation > 0);
+    try testing.expect(correlation > 0);
 }
 
 test "segment boundary detection" {
@@ -404,18 +407,18 @@ test "segment boundary detection" {
     var encoder = Encoder.init(config);
 
     // 5 seconds at 16kHz = 80000 samples
-    try std.testing.expectEqual(@as(u32, 80000), config.samplesPerSegment());
+    try testing.expectEqual(@as(u32, 80000), config.samplesPerSegment());
 
     // Simulate encoding frames until segment complete
     encoder.segment_samples = 79999;
-    try std.testing.expect(!encoder.isSegmentComplete());
+    try testing.expect(!encoder.isSegmentComplete());
     encoder.segment_samples = 80000;
-    try std.testing.expect(encoder.isSegmentComplete());
+    try testing.expect(encoder.isSegmentComplete());
 }
 
 test "quant step mapping" {
     // Lower bitrate → larger step
-    try std.testing.expect(computeQuantStep(16) > computeQuantStep(64));
-    try std.testing.expectEqual(@as(i16, 512), computeQuantStep(16));
-    try std.testing.expectEqual(@as(i16, 128), computeQuantStep(64));
+    try testing.expect(computeQuantStep(16) > computeQuantStep(64));
+    try testing.expectEqual(@as(i16, 512), computeQuantStep(16));
+    try testing.expectEqual(@as(i16, 128), computeQuantStep(64));
 }

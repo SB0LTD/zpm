@@ -5,6 +5,8 @@
 //! segment; the sample loop is fixed work and suitable for freestanding SB0.
 
 const math = @import("sig_math.sig");
+const mem = @import("sig_mem.sig");
+const testing = @import("sig_testing.sig");
 
 pub const Error = error{
     InvalidRate,
