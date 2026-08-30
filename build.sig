@@ -215,6 +215,53 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("transformer_ops", "src/core/transformer_ops.sig"),
     });
 
+    // ── LSP modules (Layer 0 — reusable Language Server Protocol building
+    //    blocks; pure, no allocator, no runtime std I/O). Registered under the
+    //    import names the modules use so the runner resolves the transitive
+    //    closure; a coarse `lsp` module re-exports them all. ──
+    _ = try ctx.addModule("jwrite", "src/lsp/jwrite.sig");
+    _ = try ctx.addModule("document", "src/lsp/document.sig");
+    _ = try ctx.addModule("position", "src/lsp/position.sig");
+    _ = try ctx.addModule("symbols", "src/lsp/symbols.sig");
+    const lsp_message = try ctx.addModule("message", "src/lsp/message.sig");
+    try wire(ctx, lsp_message, "json", "src/core/json.sig");
+    const lsp_server = try ctx.addModule("server", "src/lsp/server.sig");
+    try wire(ctx, lsp_server, "json", "src/core/json.sig");
+    try wire(ctx, lsp_server, "message", "src/lsp/message.sig");
+    try wire(ctx, lsp_server, "jwrite", "src/lsp/jwrite.sig");
+    try wire(ctx, lsp_server, "document", "src/lsp/document.sig");
+    try wire(ctx, lsp_server, "position", "src/lsp/position.sig");
+    try wire(ctx, lsp_server, "symbols", "src/lsp/symbols.sig");
+    const lsp_loop = try ctx.addModule("loop", "src/lsp/loop.sig");
+    try wire(ctx, lsp_loop, "message", "src/lsp/message.sig");
+    try wire(ctx, lsp_loop, "server", "src/lsp/server.sig");
+    const lsp = try ctx.addModule("lsp", "src/lsp/root.sig");
+    try wire(ctx, lsp, "message", "src/lsp/message.sig");
+    try wire(ctx, lsp, "jwrite", "src/lsp/jwrite.sig");
+    try wire(ctx, lsp, "document", "src/lsp/document.sig");
+    try wire(ctx, lsp, "position", "src/lsp/position.sig");
+    try wire(ctx, lsp, "symbols", "src/lsp/symbols.sig");
+    try wire(ctx, lsp, "server", "src/lsp/server.sig");
+    try wire(ctx, lsp, "loop", "src/lsp/loop.sig");
+
+    // LSP module tests. Each test root seeds its direct imports; the runner
+    // walks each registered module's own wired imports transitively.
+    _ = try addTest(ctx, test_all, "test-lsp-jwrite", "src/lsp/jwrite.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-lsp-document", "src/lsp/document.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-lsp-position", "src/lsp/position.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-lsp-symbols", "src/lsp/symbols.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-lsp-message", "src/lsp/message.sig", &.{
+        importEntry("json", "src/core/json.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-lsp-server", "src/lsp/server.sig", &.{
+        importEntry("json", "src/core/json.sig"),
+        importEntry("message", "src/lsp/message.sig"),
+        importEntry("jwrite", "src/lsp/jwrite.sig"),
+        importEntry("document", "src/lsp/document.sig"),
+        importEntry("position", "src/lsp/position.sig"),
+        importEntry("symbols", "src/lsp/symbols.sig"),
+    });
+
     // Platform modules used by the portable and transport layers. The native
     // build host selects the same source split as the transitional graph.
     const win32_path = if (builtin.os.tag == .windows)
