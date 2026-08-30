@@ -1,0 +1,3 @@
+# Package source digests are cross-platform release identities. Keep Sig source
+# bytes canonical so Windows and Unix hosts verify the same content locks.
+*.sig text eol=lf
