@@ -369,6 +369,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("subprocess", "src/platform/subprocess.sig");
     _ = try addTest(ctx, test_all, "test-subprocess", "src/platform/subprocess.sig", &.{});
 
+    // ── UI automation: pure detection engine (Layer 0) + capture/input (Layer 1) ──
+    _ = try ctx.addModule("ui_detect", "src/core/ui_detect.sig");
+    _ = try addTest(ctx, test_all, "test-ui-detect", "src/core/ui_detect.sig", &.{});
+    const screencap = try ctx.addModule("screencap", "src/platform/screencap.sig");
+    try wire(ctx, screencap, "win32", win32_path);
+
     // Render and aggregate modules are registered so dependency closure is
     // complete for downstream package consumers even when they are not test
     // roots in this graph.

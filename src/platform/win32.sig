@@ -723,3 +723,65 @@ pub extern "secur32" fn FreeContextBuffer(?*anyopaque) callconv(.c) i32;
 pub const SCH_CRED_NO_DEFAULT_CREDS: DWORD = 0x00000010;
 pub const SCH_CRED_MANUAL_CRED_VALIDATION: DWORD = 0x00000008;
 pub const SCH_CRED_AUTO_CRED_VALIDATION: DWORD = 0x00000020;
+
+// ============================================================
+// Window enumeration, capture, and synthetic input
+// General-purpose primitives for UI automation and screen capture.
+// ============================================================
+
+pub const WNDENUMPROC = *const fn (HWND, LPARAM) callconv(.c) BOOL;
+pub extern "user32" fn EnumWindows(WNDENUMPROC, LPARAM) callconv(.c) BOOL;
+pub extern "user32" fn EnumChildWindows(?HWND, WNDENUMPROC, LPARAM) callconv(.c) BOOL;
+pub extern "user32" fn GetWindowRect(HWND, *RECT) callconv(.c) BOOL;
+pub extern "user32" fn GetWindowTextW(HWND, [*]u16, i32) callconv(.c) i32;
+pub extern "user32" fn GetWindowTextLengthW(HWND) callconv(.c) i32;
+pub extern "user32" fn GetClassNameW(HWND, [*]u16, i32) callconv(.c) i32;
+pub extern "user32" fn IsIconic(HWND) callconv(.c) BOOL;
+pub extern "user32" fn GetWindowThreadProcessId(HWND, ?*DWORD) callconv(.c) DWORD;
+pub extern "user32" fn ClientToScreen(HWND, *POINT) callconv(.c) BOOL;
+
+// PrintWindow — renders a window (including occluded/background) into an HDC.
+pub extern "user32" fn PrintWindow(HWND, HDC, u32) callconv(.c) BOOL;
+pub const PW_CLIENTONLY: u32 = 0x00000001;
+pub const PW_RENDERFULLCONTENT: u32 = 0x00000002;
+
+// GDI blit + DIB readback.
+pub extern "gdi32" fn CreateCompatibleBitmap(HDC, i32, i32) callconv(.c) ?HBITMAP;
+pub extern "gdi32" fn BitBlt(HDC, i32, i32, i32, i32, HDC, i32, i32, DWORD) callconv(.c) BOOL;
+pub extern "gdi32" fn GetDIBits(HDC, HBITMAP, u32, u32, ?[*]u8, *BITMAPINFO, u32) callconv(.c) i32;
+pub const SRCCOPY: DWORD = 0x00CC0020;
+pub const CAPTUREBLT: DWORD = 0x40000000;
+pub const BI_RGB_COMPRESSION: DWORD = 0;
+
+// Synthetic input via SendInput.
+pub const MOUSEINPUT = extern struct {
+    dx: i32 = 0,
+    dy: i32 = 0,
+    mouseData: DWORD = 0,
+    dwFlags: DWORD = 0,
+    time: DWORD = 0,
+    dwExtraInfo: usize = 0,
+};
+
+pub const INPUT_MOUSE: DWORD = 0;
+
+// INPUT is a tagged union in C; the mouse variant is the largest we use.
+pub const INPUT = extern struct {
+    type: DWORD = INPUT_MOUSE,
+    mi: MOUSEINPUT = .{},
+    // Pad to the size of the KEYBDINPUT/HARDWAREINPUT union tail on x64.
+    _pad: u64 = 0,
+};
+
+pub const MOUSEEVENTF_MOVE: DWORD = 0x0001;
+pub const MOUSEEVENTF_LEFTDOWN: DWORD = 0x0002;
+pub const MOUSEEVENTF_LEFTUP: DWORD = 0x0004;
+pub const MOUSEEVENTF_ABSOLUTE: DWORD = 0x8000;
+pub const MOUSEEVENTF_VIRTUALDESK: DWORD = 0x4000;
+
+pub extern "user32" fn SetCursorPos(i32, i32) callconv(.c) BOOL;
+pub extern "user32" fn SendInput(u32, [*]const INPUT, i32) callconv(.c) u32;
+pub const SM_XVIRTUALSCREEN: i32 = 76;
+pub const SM_YVIRTUALSCREEN: i32 = 77;
+pub const SM_CXVIRTUALSCREEN: i32 = 78;
+pub const SM_CYVIRTUALSCREEN: i32 = 79;

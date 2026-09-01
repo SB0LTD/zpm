@@ -19,3 +19,4 @@ pub const log = @import("logging");
 pub const png = @import("png");
 pub const mcp = @import("mcp");
 pub const subprocess = @import("subprocess");
+pub const screencap = @import("screencap");
