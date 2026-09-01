@@ -35,6 +35,8 @@ const modules = .{
     .{ "scheduler.sig", @embedFile("scheduler.sig") },
     .{ "telemetry.sig", @embedFile("telemetry.sig") },
     .{ "appmap.sig", @embedFile("appmap.sig") },
+    .{ "h3.sig", @embedFile("h3.sig") },
+    .{ "server.sig", @embedFile("server.sig") },
     .{ "root.sig", @embedFile("root.sig") },
 };
 
@@ -67,6 +69,8 @@ const allowed_imports = [_][]const u8{
     "telemetry",
     "appmap",
     "crypto_stream",
+    "h3",
+    "h3_server",
 };
 
 // ── Helpers ──

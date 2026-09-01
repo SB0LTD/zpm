@@ -172,56 +172,7 @@ fn mulModN(a: U256, b: U256) U256 {
 }
 
 fn reduceModN(product: *const [8]u64) U256 {
-    // Simple reduction by repeated subtraction (adequate for crypto operations)
-    // Copy high and low parts
-    var result: U256 = .{ product[0], product[1], product[2], product[3] };
-    const high: U256 = .{ product[4], product[5], product[6], product[7] };
-
-    // If high part is zero, just reduce result mod n
-    if (isZeroU256(&high)) {
-        while (!isLessThan(&result, &N)) {
-            result = subU256(result, N);
-        }
-        return result;
-    }
-
-    // For non-zero high part, use repeated modular reduction
-    // high * 2^256 mod n, then add to low
-    // Simple: reconstruct and reduce via trial subtraction
-    // This is O(n) but n is bounded for P-256 signatures
-    var full: [8]u64 = product.*;
-    while (full[4] != 0 or full[5] != 0 or full[6] != 0 or full[7] != 0 or
-        !isLessThanArr8(&full, &N))
-    {
-        var borrow: u64 = 0;
-        for (0..4) |i| {
-            const diff: i128 = @as(i128, full[i]) - @as(i128, N[i]) - @as(i128, borrow);
-            if (diff < 0) {
-                full[i] = @intCast(@as(u128, @bitCast(diff + (1 << 64))));
-                borrow = 1;
-            } else {
-                full[i] = @intCast(@as(u128, @bitCast(diff)));
-                borrow = 0;
-            }
-        }
-        for (4..8) |i| {
-            const diff: i128 = @as(i128, full[i]) - @as(i128, borrow);
-            if (diff < 0) {
-                full[i] = @intCast(@as(u128, @bitCast(diff + (1 << 64))));
-                borrow = 1;
-            } else {
-                full[i] = @intCast(@as(u128, @bitCast(diff)));
-                borrow = 0;
-            }
-        }
-    }
-    return .{ full[0], full[1], full[2], full[3] };
-}
-
-fn isLessThanArr8(a: *const [8]u64, n: *const [4]u64) bool {
-    // Check if a[0..8] < n (treated as 256-bit, high limbs must be 0)
-    if (a[4] != 0 or a[5] != 0 or a[6] != 0 or a[7] != 0) return false;
-    return isLessThan(&.{ a[0], a[1], a[2], a[3] }, n);
+    return reduce512(product, &N);
 }
 
 fn invertModN(a: U256) U256 {
@@ -428,57 +379,7 @@ fn mulModP(a: U256, b: U256) U256 {
 }
 
 fn reduceModP(product: *const [8]u64) U256 {
-    // P-256 field reduction using the special structure of p
-    // p = 2^256 - 2^224 + 2^192 + 2^96 - 1
-    // Use Solinas reduction (fast reduction for NIST primes)
-    var result: U256 = .{ product[0], product[1], product[2], product[3] };
-
-    // Simple approach: repeated subtraction from high limbs
-    // For correctness, we do standard multi-precision modular reduction
-    const high: U256 = .{ product[4], product[5], product[6], product[7] };
-
-    if (isZeroU256(&high)) {
-        while (!isLessThan(&result, &P)) {
-            result = subU256(result, P);
-        }
-        return result;
-    }
-
-    // Reduce by computing high * 2^256 mod p and adding to low
-    // Since we're only dealing with P-256 crypto operations (bounded multiplications),
-    // iterate with subtraction
-    var full: [8]u64 = product.*;
-    while (full[4] != 0 or full[5] != 0 or full[6] != 0 or full[7] != 0 or
-        !isLessThanArr8P(&full))
-    {
-        var borrow: u64 = 0;
-        for (0..4) |i| {
-            const diff: i128 = @as(i128, full[i]) - @as(i128, P[i]) - @as(i128, borrow);
-            if (diff < 0) {
-                full[i] = @intCast(@as(u128, @bitCast(diff + (1 << 64))));
-                borrow = 1;
-            } else {
-                full[i] = @intCast(@as(u128, @bitCast(diff)));
-                borrow = 0;
-            }
-        }
-        for (4..8) |i| {
-            const diff: i128 = @as(i128, full[i]) - @as(i128, borrow);
-            if (diff < 0) {
-                full[i] = @intCast(@as(u128, @bitCast(diff + (1 << 64))));
-                borrow = 1;
-            } else {
-                full[i] = @intCast(@as(u128, @bitCast(diff)));
-                borrow = 0;
-            }
-        }
-    }
-    return .{ full[0], full[1], full[2], full[3] };
-}
-
-fn isLessThanArr8P(a: *const [8]u64) bool {
-    if (a[4] != 0 or a[5] != 0 or a[6] != 0 or a[7] != 0) return false;
-    return isLessThan(&.{ a[0], a[1], a[2], a[3] }, &P);
+    return reduce512(product, &P);
 }
 
 fn invertModP(a: U256) U256 {
@@ -520,6 +421,40 @@ fn invertModP(a: U256) U256 {
 }
 
 // ── Utility ─────────────────────────────────────────────────────────────
+
+/// Reduce a 512-bit little-endian value modulo a 256-bit modulus.
+///
+/// Bitwise long division is deliberately bounded to 512 iterations.  The old
+/// implementation subtracted the modulus from the full product until it fit;
+/// for a normal 256x256-bit product that requires on the order of 2^256
+/// iterations and therefore never completes in practice.
+fn reduce512(value: *const [8]u64, modulus: *const U256) U256 {
+    var remainder: U256 = ZERO_U256;
+
+    var bit: usize = 512;
+    while (bit != 0) {
+        bit -= 1;
+        const input_limb = bit / 64;
+        const input_shift: u6 = @intCast(bit % 64);
+        var carry = (value[input_limb] >> input_shift) & 1;
+
+        for (0..4) |i| {
+            const next_carry = remainder[i] >> 63;
+            remainder[i] = (remainder[i] << 1) | carry;
+            carry = next_carry;
+        }
+
+        // Before the shift remainder < modulus, so the shifted value is less
+        // than 2*modulus and at most one subtraction is required.  When carry
+        // is set, subU256's wraparound is exactly the low 256 bits of the
+        // 257-bit subtraction.
+        if (carry != 0 or !isLessThan(&remainder, modulus)) {
+            remainder = subU256(remainder, modulus.*);
+        }
+    }
+
+    return remainder;
+}
 
 fn subU256(a: U256, b: U256) U256 {
     var result: U256 = undefined;
@@ -670,7 +605,7 @@ test "p256: tampered signature fails verification" {
 }
 
 test "p256: sign produces deterministic output" {
-    const key = [32]u8{0x42} ** 32;
+    const key: [32]u8 = @splat(0x42);
     const msg = sha256.hash("determinism");
 
     var sig1: [64]u8 = undefined;

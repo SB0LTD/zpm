@@ -7,7 +7,6 @@
 // QUIC Initial keys use a well-known salt (not secret) so that
 // both client and server can derive them from the DCID alone.
 
-const sha256 = @import("sha256");
 const hkdf = @import("hkdf");
 
 /// QUIC v1 Initial salt (RFC 9001 §5.2).
@@ -43,18 +42,17 @@ pub const InitialKeys = struct {
 /// This is done by both client and server before any TLS messages are exchanged.
 ///
 /// initial_secret = HKDF-Extract(initial_salt, client_dst_connection_id)
-/// client_initial_secret = Derive-Secret(initial_secret, "client in", "")
-/// server_initial_secret = Derive-Secret(initial_secret, "server in", "")
+/// client_initial_secret = HKDF-Expand-Label(initial_secret, "client in", "", 32)
+/// server_initial_secret = HKDF-Expand-Label(initial_secret, "server in", "", 32)
 pub fn deriveInitialKeys(dcid: []const u8) InitialKeys {
     // Extract initial secret
     const initial_secret = hkdf.extract(&INITIAL_SALT_V1, dcid);
 
     // Derive client and server initial secrets
-    const empty_hash = sha256.hash("");
     var client_secret: [32]u8 = undefined;
     var server_secret: [32]u8 = undefined;
-    hkdf.deriveSecret(&initial_secret, "client in", &empty_hash, &client_secret);
-    hkdf.deriveSecret(&initial_secret, "server in", &empty_hash, &server_secret);
+    _ = hkdf.expandLabel(&initial_secret, "client in", "", &client_secret, 32);
+    _ = hkdf.expandLabel(&initial_secret, "server in", "", &server_secret, 32);
 
     // Derive traffic keys from secrets
     return .{
@@ -210,7 +208,7 @@ test "quic_keys: nonce construction" {
 }
 
 test "quic_keys: traffic key update produces different secret" {
-    const secret = [32]u8{0xAA} ** 32;
+    const secret: [32]u8 = @splat(0xAA);
     var new_secret: [32]u8 = undefined;
     updateTrafficSecret(&secret, &new_secret);
 

@@ -361,8 +361,19 @@ test "reset clears context_used" {
 }
 
 test "bytesForContext calculation" {
-    resetTestAlloc();
-    const cache = KvCache.init(testAlloc, 28, 8, 128, 2048) catch return error.TestUnexpectedResult;
+    var empty: [0]u16 = .{};
+    const cache = KvCache{
+        .storage = &empty,
+        .alloc_fn = testAlloc,
+        .layer_count = 28,
+        .head_count = 8,
+        .head_dim = 128,
+        .max_context = 2048,
+        .context_used = 0,
+        .elements_per_kv = 0,
+        .elements_per_layer = 0,
+        .total_elements = 0,
+    };
     const bytes = cache.bytesForContext(2048);
     // 28 layers * 2 * 8 heads * 2048 positions * 128 dim * 2 bytes/f16
     const expected: usize = 28 * 2 * 8 * 2048 * 128 * 2;

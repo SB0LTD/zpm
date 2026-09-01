@@ -5,7 +5,7 @@
 // Handles nested objects by key path (e.g. find "k" then find "t" within it).
 // Sufficient for flat/shallow JSON like config files and streaming messages.
 
-const mem = @import("sig_mem.sig");
+const mem = @import("sig_mem");
 
 /// Find the position just after a key match (after the closing quote of the key).
 /// Searches for "key" pattern in the data.

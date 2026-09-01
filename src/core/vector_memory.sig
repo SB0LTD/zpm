@@ -4,9 +4,9 @@
 //! record is tied to a canonical event and to an encoder/schema domain; a
 //! vector can suggest relevance but never becomes an authoritative fact.
 
-const math = @import("sig_math.sig");
-const mem = @import("sig_mem.sig");
-const testing = @import("sig_testing.sig");
+const math = @import("sig_math");
+const mem = @import("sig_mem");
+const testing = @import("sig_testing");
 
 pub const Error = error{
     CapacityExhausted,

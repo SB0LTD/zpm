@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  Officially supports <strong>Zig 0.16+</strong> and <a href="https://github.com/SB0LTD/sig"><strong>Sig 0.1.2</strong></a>
+  Officially supports <strong>Zig 0.16+</strong>; CI pins <a href="https://github.com/SB0LTD/sig"><strong>Sig 0.2.0</strong></a>
 </p>
 
 ---
@@ -147,11 +147,26 @@ var app = appmap.AppMap.init(&connection.stream_mgr, &connection.dgram_handler);
 app.sendResolveRequest(scope, name, version);
 ```
 
+### HTTP/3 server primitives
+
+`src/transport/h3.sig` provides bounded HTTP/3 frame parsing, static-table
+QPACK, and an incremental request-stream decoder. `src/transport/server.sig`
+adds the fixed-capacity QUIC/HTTP/3 server loop and route dispatcher. Request
+bodies are streamed into caller-provided storage and may arrive across any
+number of QUIC fragments or DATA frames.
+
+### SB0 application SDK
+
+`src/platform/sb0/app_v1.sig` is the versioned, allocator-free userspace SDK
+for the consolidated SB0 ABI. It exposes device queues plus delegated network
+and storage capabilities; the runtime supplies the concrete `sb0_abi` import.
+The SDK contract version is `1.0.0`.
+
 ---
 
 ## Official @zpm/ Packages
 
-35 packages derived from the existing zpm module library.
+37 packages derived from the existing zpm module library.
 
 ### Layer 0 — Core
 
@@ -161,6 +176,8 @@ app.sendResolveRequest(scope, name, version);
 | `@zpm/math` | Sin/cos approximations, lerp, interpolation, pure math |
 | `@zpm/json` | Minimal JSON parser |
 | `@zpm/ai-core` | Caller-owned arenas, tensor bounds, deadline scheduling, device interfaces, and copy-on-write pages |
+| `@zpm/model-observability` | Fixed-capacity model/device tracing, replay cursors, and latency histograms |
+| `@zpm/multimodal-now` | Confidence/freshness fusion with bounded compute budgets |
 
 ### Layer 1 — Platform
 

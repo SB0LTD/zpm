@@ -12,3 +12,5 @@ pub const scheduler = @import("scheduler");
 pub const conn = @import("conn");
 pub const telemetry = @import("telemetry");
 pub const appmap = @import("appmap");
+pub const h3 = @import("h3");
+pub const server = @import("h3_server");

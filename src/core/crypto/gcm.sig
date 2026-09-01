@@ -221,8 +221,8 @@ test "gcm: NIST test case - empty plaintext and AAD" {
     // PT:  (empty)
     // AAD: (empty)
     // Tag: 58e2fccefa7e3061367f1d57a4e7455a
-    const key = [16]u8{0} ** 16;
-    const nonce = [12]u8{0} ** 12;
+    const key: [16]u8 = @splat(0);
+    const nonce: [12]u8 = @splat(0);
 
     const gcm = Gcm.init(&key);
     var plaintext: [0]u8 = .{};
@@ -245,9 +245,9 @@ test "gcm: NIST test case 2 - 16 byte plaintext" {
     // AAD: (empty)
     // CT:  0388dace60b6a392f328c2b971b2fe78
     // Tag: ab6e47d42cec13bdf53a67b21257bddf
-    const key = [16]u8{0} ** 16;
-    const nonce = [12]u8{0} ** 12;
-    var pt = [16]u8{0} ** 16;
+    const key: [16]u8 = @splat(0);
+    const nonce: [12]u8 = @splat(0);
+    var pt: [16]u8 = @splat(0);
 
     const gcm = Gcm.init(&key);
     var tag: [16]u8 = undefined;

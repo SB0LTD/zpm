@@ -4,9 +4,9 @@
 //! canonical events, capabilities, and policies remain the source of truth.
 //! All storage is fixed at compile time and every transition emits a receipt.
 
-const math = @import("sig_math.sig");
-const mem = @import("sig_mem.sig");
-const testing = @import("sig_testing.sig");
+const math = @import("sig_math");
+const mem = @import("sig_mem");
+const testing = @import("sig_testing");
 
 pub const Error = error{
     InvalidClass,

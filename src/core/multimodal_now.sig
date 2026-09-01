@@ -5,9 +5,9 @@
 //! admitted projection domain.  A VLM projector, audio adapter, or text model
 //! may publish only after numerical parity proves its mapping into that domain.
 
-const math = @import("sig_math.sig");
-const mem = @import("sig_mem.sig");
-const testing = @import("sig_testing.sig");
+const math = @import("sig_math");
+const mem = @import("sig_mem");
+const testing = @import("sig_testing");
 
 pub const Q16_ONE: u16 = math.maxInt(u16);
 

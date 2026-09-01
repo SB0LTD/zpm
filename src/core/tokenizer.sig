@@ -5,9 +5,9 @@
 //! bytes directly into a caller-owned destination. No host tokenizer, heap,
 //! locale, or operating-system service participates in the result.
 
-const math = @import("sig_math.sig");
-const mem = @import("sig_mem.sig");
-const gguf = @import("gguf.sig");
+const math = @import("sig_math");
+const mem = @import("sig_mem");
+const gguf = @import("gguf");
 
 pub const Error = error{
     TokenCapacity,
@@ -323,7 +323,7 @@ fn isHorizontalWhitespace(byte: u8) bool { return byte == ' ' or byte == '\t' or
 fn isWhitespace(byte: u8) bool { return isHorizontalWhitespace(byte) or byte == '\r' or byte == '\n'; }
 fn asciiLower(byte: u8) u8 { return if (byte >= 'A' and byte <= 'Z') byte + 32 else byte; }
 
-const tokenizer_index = @import("tokenizer_index.sig");
+const tokenizer_index = @import("sb0_gguf_tokenizer_index");
 
 const SliceSource = struct {
     bytes: []const u8,

@@ -3,9 +3,9 @@
 //! Architecture-specific tensor naming is isolated here. Storage, scheduling,
 //! quantized math, conversation policy, and model catalog code remain generic.
 
-const math = @import("sig_math.sig");
-const mem = @import("sig_mem.sig");
-const gguf = @import("gguf.sig");
+const math = @import("sig_math");
+const mem = @import("sig_mem");
+const gguf = @import("gguf");
 
 pub const MAX_LAYERS: usize = 64;
 pub const INVALID_TENSOR: u16 = math.maxInt(u16);

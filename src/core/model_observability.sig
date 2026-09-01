@@ -5,8 +5,8 @@
 //! path allocation-free while per-stage logarithmic histograms retain useful
 //! latency distributions after detailed events are overwritten.
 
-const math = @import("sig_math.sig");
-const testing = @import("sig_testing.sig");
+const math = @import("sig_math");
+const testing = @import("sig_testing");
 
 pub const Stage = enum(u8) {
     request_submit,

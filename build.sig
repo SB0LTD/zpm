@@ -48,7 +48,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const synth_voice = try ctx.addModule("synth_voice", "src/core/synth_voice.sig");
     try wire(ctx, synth_voice, "math", "src/core/math.sig");
     try wire(ctx, synth_voice, "sig_math", "src/core/sig_math.sig");
-    _ = try ctx.addModule("json", "src/core/json.sig");
+    _ = try ctx.addModule("sig_mem", "src/core/sig_mem.sig");
+    _ = try ctx.addModule("sig_testing", "src/core/sig_testing.sig");
+    const json = try ctx.addModule("json", "src/core/json.sig");
+    try wire(ctx, json, "sig_mem", "src/core/sig_mem.sig");
     _ = try ctx.addModule("sha256", "src/core/sha256.sig");
     _ = try ctx.addModule("inflate", "src/core/inflate.sig");
 
@@ -74,15 +77,32 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, crypto_quic_keys, "aes", "src/core/crypto/aes.sig");
     const jsonl = try ctx.addModule("jsonl", "src/core/jsonl.sig");
     try wire(ctx, jsonl, "json", "src/core/json.sig");
+    try wire(ctx, jsonl, "sig_mem", "src/core/sig_mem.sig");
+    try wire(ctx, jsonl, "sig_testing", "src/core/sig_testing.sig");
     _ = try ctx.addModule("ai_core", "src/core/ai_core.sig");
     _ = try ctx.addModule("quantized_linear", "src/core/quantized_linear.sig");
-    _ = try ctx.addModule("transformer_ops", "src/core/transformer_ops.sig");
+    const transformer_ops = try ctx.addModule("transformer_ops", "src/core/transformer_ops.sig");
+    try wire(ctx, transformer_ops, "sig_math", "src/core/sig_math.sig");
     _ = try ctx.addModule("audio_dsp", "src/core/audio_dsp.sig");
-    _ = try ctx.addModule("vector_memory", "src/core/vector_memory.sig");
-    _ = try ctx.addModule("moment_activation", "src/core/moment_activation.sig");
-    _ = try ctx.addModule("agent_runtime", "src/core/agent_runtime.sig");
-    _ = try ctx.addModule("model_observability", "src/core/model_observability.sig");
-    _ = try ctx.addModule("multimodal_now", "src/core/multimodal_now.sig");
+    const vector_memory = try ctx.addModule("vector_memory", "src/core/vector_memory.sig");
+    try wire(ctx, vector_memory, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, vector_memory, "sig_mem", "src/core/sig_mem.sig");
+    try wire(ctx, vector_memory, "sig_testing", "src/core/sig_testing.sig");
+    const moment_activation = try ctx.addModule("moment_activation", "src/core/moment_activation.sig");
+    try wire(ctx, moment_activation, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, moment_activation, "sig_mem", "src/core/sig_mem.sig");
+    try wire(ctx, moment_activation, "sig_testing", "src/core/sig_testing.sig");
+    const agent_runtime = try ctx.addModule("agent_runtime", "src/core/agent_runtime.sig");
+    try wire(ctx, agent_runtime, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, agent_runtime, "sig_mem", "src/core/sig_mem.sig");
+    try wire(ctx, agent_runtime, "sig_testing", "src/core/sig_testing.sig");
+    const model_observability = try ctx.addModule("model_observability", "src/core/model_observability.sig");
+    try wire(ctx, model_observability, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, model_observability, "sig_testing", "src/core/sig_testing.sig");
+    const multimodal_now = try ctx.addModule("multimodal_now", "src/core/multimodal_now.sig");
+    try wire(ctx, multimodal_now, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, multimodal_now, "sig_mem", "src/core/sig_mem.sig");
+    try wire(ctx, multimodal_now, "sig_testing", "src/core/sig_testing.sig");
 
     // Platform: SB0 native image format (Layer 1, pure byte encoder).
     _ = try ctx.addModule("sb0x_format", "src/platform/sb0x/format.sig");
@@ -93,6 +113,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, cognitive_receipt, "agent_runtime", "src/core/agent_runtime.sig");
     try wire(ctx, cognitive_receipt, "model_observability", "src/core/model_observability.sig");
     try wire(ctx, cognitive_receipt, "multimodal_now", "src/core/multimodal_now.sig");
+    try wire(ctx, cognitive_receipt, "sig_testing", "src/core/sig_testing.sig");
     const core = try ctx.addModule("core", "src/core/root.sig");
     try wire(ctx, core, "math", "src/core/math.sig");
     try wire(ctx, core, "json", "src/core/json.sig");
@@ -111,7 +132,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
 
     _ = try addTest(ctx, test_all, "test-ai-core", "src/core/ai_core.sig", &.{});
     _ = try addTest(ctx, test_all, "test-quantized-linear", "src/core/quantized_linear.sig", &.{});
-    _ = try addTest(ctx, test_all, "test-transformer-ops", "src/core/transformer_ops.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-transformer-ops", "src/core/transformer_ops.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-audio-dsp", "src/core/audio_dsp.sig", &.{});
     _ = try addTest(ctx, test_all, "test-math", "src/core/math.sig", &.{});
     _ = try addTest(ctx, test_all, "test-sig-math", "src/core/sig_math.sig", &.{});
@@ -119,11 +142,26 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("math", "src/core/math.sig"),
         importEntry("sig_math", "src/core/sig_math.sig"),
     });
-    _ = try addTest(ctx, test_all, "test-vector-memory", "src/core/vector_memory.sig", &.{});
-    _ = try addTest(ctx, test_all, "test-moment-activation", "src/core/moment_activation.sig", &.{});
-    _ = try addTest(ctx, test_all, "test-agent-runtime", "src/core/agent_runtime.sig", &.{});
-    _ = try addTest(ctx, test_all, "test-model-observability", "src/core/model_observability.sig", &.{});
-    _ = try addTest(ctx, test_all, "test-multimodal-now", "src/core/multimodal_now.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-vector-memory", "src/core/vector_memory.sig", &.{
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-moment-activation", "src/core/moment_activation.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-agent-runtime", "src/core/agent_runtime.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-model-observability", "src/core/model_observability.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-multimodal-now", "src/core/multimodal_now.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-sb0x-format", "src/platform/sb0x/format.sig", &.{});
     _ = try addTest(ctx, test_all, "test-cognitive-receipt", "src/core/cognitive_receipt.sig", &.{
         importEntry("vector_memory", "src/core/vector_memory.sig"),
@@ -131,6 +169,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("agent_runtime", "src/core/agent_runtime.sig"),
         importEntry("model_observability", "src/core/model_observability.sig"),
         importEntry("multimodal_now", "src/core/multimodal_now.sig"),
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
     });
     _ = try addTest(ctx, test_all, "test-sha256", "src/core/sha256.sig", &.{});
     _ = try addTest(ctx, test_all, "test-hmac", "src/core/crypto/hmac.sig", &.{
@@ -165,49 +206,83 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     _ = try addTest(ctx, test_all, "test-jsonl", "src/core/jsonl.sig", &.{
         importEntry("json", "src/core/json.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
     });
 
     // ── Inference pipeline modules (Layer 0 — pure computation, zero platform deps) ──
-    _ = try ctx.addModule("gguf", "src/core/gguf.sig");
+    const gguf = try ctx.addModule("gguf", "src/core/gguf.sig");
+    try wire(ctx, gguf, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, gguf, "sig_mem", "src/core/sig_mem.sig");
     _ = try ctx.addModule("gguf_file", "src/core/gguf_file.sig");
-    _ = try ctx.addModule("sampling", "src/core/sampling.sig");
+    const sampling = try ctx.addModule("sampling", "src/core/sampling.sig");
+    try wire(ctx, sampling, "sig_math", "src/core/sig_math.sig");
     _ = try ctx.addModule("kv_cache", "src/core/kv_cache.sig");
-    _ = try ctx.addModule("tokenizer_index", "src/core/tokenizer_index.sig");
-    _ = try ctx.addModule("tokenizer", "src/core/tokenizer.sig");
-    _ = try ctx.addModule("qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig");
-    _ = try ctx.addModule("qwen3_executor", "src/core/qwen3_executor.sig");
-    _ = try ctx.addModule("inference_session", "src/core/inference_session.sig");
+    const tokenizer_index = try ctx.addModule("tokenizer_index", "src/core/tokenizer_index.sig");
+    try wire(ctx, tokenizer_index, "gguf", "src/core/gguf.sig");
+    try wire(ctx, tokenizer_index, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, tokenizer_index, "sig_mem", "src/core/sig_mem.sig");
+    const tokenizer = try ctx.addModule("tokenizer", "src/core/tokenizer.sig");
+    try wire(ctx, tokenizer, "gguf", "src/core/gguf.sig");
+    try wire(ctx, tokenizer, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, tokenizer, "sig_mem", "src/core/sig_mem.sig");
+    try wire(ctx, tokenizer, "sb0_gguf_tokenizer_index", "src/core/tokenizer_index.sig");
+    const qwen3_decoder_plan = try ctx.addModule("qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig");
+    try wire(ctx, qwen3_decoder_plan, "gguf", "src/core/gguf.sig");
+    try wire(ctx, qwen3_decoder_plan, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, qwen3_decoder_plan, "sig_mem", "src/core/sig_mem.sig");
+    const qwen3_executor = try ctx.addModule("qwen3_executor", "src/core/qwen3_executor.sig");
+    try wire(ctx, qwen3_executor, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, qwen3_executor, "gguf", "src/core/gguf.sig");
+    try wire(ctx, qwen3_executor, "qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig");
+    try wire(ctx, qwen3_executor, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, qwen3_executor, "transformer_ops", "src/core/transformer_ops.sig");
+    const inference_session = try ctx.addModule("inference_session", "src/core/inference_session.sig");
+    try wire(ctx, inference_session, "gguf", "src/core/gguf.sig");
+    try wire(ctx, inference_session, "qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig");
+    try wire(ctx, inference_session, "qwen3_executor", "src/core/qwen3_executor.sig");
+    try wire(ctx, inference_session, "tokenizer", "src/core/tokenizer.sig");
+    try wire(ctx, inference_session, "sb0_gguf_tokenizer_index", "src/core/tokenizer_index.sig");
+    try wire(ctx, inference_session, "sampling", "src/core/sampling.sig");
+    try wire(ctx, inference_session, "kv_cache", "src/core/kv_cache.sig");
 
     // Inference pipeline tests
-    _ = try addTest(ctx, test_all, "test-gguf", "src/core/gguf.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-gguf", "src/core/gguf.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-gguf-file", "src/core/gguf_file.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
     });
-    _ = try addTest(ctx, test_all, "test-sampling", "src/core/sampling.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-sampling", "src/core/sampling.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-kv-cache", "src/core/kv_cache.sig", &.{});
     _ = try addTest(ctx, test_all, "test-tokenizer-index", "src/core/tokenizer_index.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
     });
     _ = try addTest(ctx, test_all, "test-tokenizer", "src/core/tokenizer.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
-        importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
         importEntry("sb0_gguf_tokenizer_index", "src/core/tokenizer_index.sig"),
     });
     _ = try addTest(ctx, test_all, "test-qwen3-plan", "src/core/qwen3_decoder_plan.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
     });
     _ = try addTest(ctx, test_all, "test-qwen3-executor", "src/core/qwen3_executor.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
         importEntry("qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
         importEntry("transformer_ops", "src/core/transformer_ops.sig"),
     });
     _ = try addTest(ctx, test_all, "test-inference-session", "src/core/inference_session.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
         importEntry("qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig"),
         importEntry("qwen3_executor", "src/core/qwen3_executor.sig"),
         importEntry("tokenizer", "src/core/tokenizer.sig"),
-        importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
         importEntry("sampling", "src/core/sampling.sig"),
         importEntry("kv_cache", "src/core/kv_cache.sig"),
         importEntry("sb0_gguf_tokenizer_index", "src/core/tokenizer_index.sig"),
@@ -277,33 +352,33 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("net_interface", "src/net/interface.sig");
 
     const net_ipv4 = try ctx.addModule("net_ipv4", "src/net/ipv4.sig");
-    try wire(ctx, net_ipv4, "checksum", "src/net/checksum.sig");
+    try wire(ctx, net_ipv4, "net_checksum", "src/net/checksum.sig");
 
     const net_arp = try ctx.addModule("net_arp", "src/net/arp.sig");
-    try wire(ctx, net_arp, "ethernet", "src/net/ethernet.sig");
-    try wire(ctx, net_arp, "interface", "src/net/interface.sig");
+    try wire(ctx, net_arp, "net_ethernet", "src/net/ethernet.sig");
+    try wire(ctx, net_arp, "net_interface", "src/net/interface.sig");
 
     const net_icmp = try ctx.addModule("net_icmp", "src/net/icmp.sig");
-    try wire(ctx, net_icmp, "checksum", "src/net/checksum.sig");
-    try wire(ctx, net_icmp, "ipv4", "src/net/ipv4.sig");
+    try wire(ctx, net_icmp, "net_checksum", "src/net/checksum.sig");
+    try wire(ctx, net_icmp, "net_ipv4", "src/net/ipv4.sig");
 
     const net_udp = try ctx.addModule("net_udp", "src/net/udp.sig");
-    try wire(ctx, net_udp, "checksum", "src/net/checksum.sig");
-    try wire(ctx, net_udp, "ipv4", "src/net/ipv4.sig");
+    try wire(ctx, net_udp, "net_checksum", "src/net/checksum.sig");
+    try wire(ctx, net_udp, "net_ipv4", "src/net/ipv4.sig");
 
     const net_tcp = try ctx.addModule("net_tcp", "src/net/tcp.sig");
-    try wire(ctx, net_tcp, "checksum", "src/net/checksum.sig");
-    try wire(ctx, net_tcp, "ipv4", "src/net/ipv4.sig");
+    try wire(ctx, net_tcp, "net_checksum", "src/net/checksum.sig");
+    try wire(ctx, net_tcp, "net_ipv4", "src/net/ipv4.sig");
 
     const net_dhcp = try ctx.addModule("net_dhcp", "src/net/dhcp.sig");
-    try wire(ctx, net_dhcp, "ethernet", "src/net/ethernet.sig");
-    try wire(ctx, net_dhcp, "ipv4", "src/net/ipv4.sig");
+    try wire(ctx, net_dhcp, "net_ethernet", "src/net/ethernet.sig");
+    try wire(ctx, net_dhcp, "net_ipv4", "src/net/ipv4.sig");
     try wire(ctx, net_dhcp, "net_udp", "src/net/udp.sig");
-    try wire(ctx, net_dhcp, "checksum", "src/net/checksum.sig");
+    try wire(ctx, net_dhcp, "net_checksum", "src/net/checksum.sig");
 
     const net_dns = try ctx.addModule("net_dns", "src/net/dns.sig");
     try wire(ctx, net_dns, "net_udp", "src/net/udp.sig");
-    try wire(ctx, net_dns, "ipv4", "src/net/ipv4.sig");
+    try wire(ctx, net_dns, "net_ipv4", "src/net/ipv4.sig");
 
     const net_http = try ctx.addModule("net_http", "src/net/http.sig");
     try wire(ctx, net_http, "net_tcp", "src/net/tcp.sig");
@@ -312,23 +387,23 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-net-checksum", "src/net/checksum.sig", &.{});
     _ = try addTest(ctx, test_all, "test-net-ethernet", "src/net/ethernet.sig", &.{});
     _ = try addTest(ctx, test_all, "test-net-ipv4", "src/net/ipv4.sig", &.{
-        importEntry("checksum", "src/net/checksum.sig"),
+        importEntry("net_checksum", "src/net/checksum.sig"),
     });
     _ = try addTest(ctx, test_all, "test-net-arp", "src/net/arp.sig", &.{
-        importEntry("ethernet", "src/net/ethernet.sig"),
-        importEntry("interface", "src/net/interface.sig"),
+        importEntry("net_ethernet", "src/net/ethernet.sig"),
+        importEntry("net_interface", "src/net/interface.sig"),
     });
     _ = try addTest(ctx, test_all, "test-net-icmp", "src/net/icmp.sig", &.{
-        importEntry("checksum", "src/net/checksum.sig"),
-        importEntry("ipv4", "src/net/ipv4.sig"),
+        importEntry("net_checksum", "src/net/checksum.sig"),
+        importEntry("net_ipv4", "src/net/ipv4.sig"),
     });
     _ = try addTest(ctx, test_all, "test-net-udp", "src/net/udp.sig", &.{
-        importEntry("checksum", "src/net/checksum.sig"),
-        importEntry("ipv4", "src/net/ipv4.sig"),
+        importEntry("net_checksum", "src/net/checksum.sig"),
+        importEntry("net_ipv4", "src/net/ipv4.sig"),
     });
     _ = try addTest(ctx, test_all, "test-net-tcp", "src/net/tcp.sig", &.{
-        importEntry("checksum", "src/net/checksum.sig"),
-        importEntry("ipv4", "src/net/ipv4.sig"),
+        importEntry("net_checksum", "src/net/checksum.sig"),
+        importEntry("net_ipv4", "src/net/ipv4.sig"),
     });
     const window = try ctx.addModule("window", "src/platform/window.sig");
     try wire(ctx, window, "win32", win32_path);
@@ -453,6 +528,28 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, appmap, "streams", "src/transport/streams.sig");
     try wire(ctx, appmap, "datagram", "src/transport/datagram.sig");
     try wire(ctx, appmap, "packet", "src/transport/packet.sig");
+    _ = try ctx.addModule("h3", "src/transport/h3.sig");
+    const h3_server = try ctx.addModule("h3_server", "src/transport/server.sig");
+    try wire(ctx, h3_server, "conn", "src/transport/conn.sig");
+    try wire(ctx, h3_server, "packet", "src/transport/packet.sig");
+    try wire(ctx, h3_server, "streams", "src/transport/streams.sig");
+    try wire(ctx, h3_server, "udp", "src/transport/udp.sig");
+    try wire(ctx, h3_server, "h3", "src/transport/h3.sig");
+    try wire(ctx, h3_server, "telemetry", "src/transport/telemetry.sig");
+    const transport = try ctx.addModule("transport", "src/transport/root.sig");
+    try wire(ctx, transport, "udp", "src/transport/udp.sig");
+    try wire(ctx, transport, "packet", "src/transport/packet.sig");
+    try wire(ctx, transport, "transport_crypto", "src/transport/crypto.sig");
+    try wire(ctx, transport, "crypto_stream", "src/transport/crypto_stream.sig");
+    try wire(ctx, transport, "recovery", "src/transport/recovery.sig");
+    try wire(ctx, transport, "streams", "src/transport/streams.sig");
+    try wire(ctx, transport, "datagram", "src/transport/datagram.sig");
+    try wire(ctx, transport, "scheduler", "src/transport/scheduler.sig");
+    try wire(ctx, transport, "conn", "src/transport/conn.sig");
+    try wire(ctx, transport, "telemetry", "src/transport/telemetry.sig");
+    try wire(ctx, transport, "appmap", "src/transport/appmap.sig");
+    try wire(ctx, transport, "h3", "src/transport/h3.sig");
+    try wire(ctx, transport, "h3_server", "src/transport/server.sig");
 
     _ = try addTest(ctx, test_all, "test-udp", "src/transport/udp.sig", &.{importEntry("win32", win32_path)});
     _ = try addTest(ctx, test_all, "test-packet", "src/transport/packet.sig", &.{});
@@ -482,6 +579,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("streams", "src/transport/streams.sig"),
         importEntry("datagram", "src/transport/datagram.sig"),
         importEntry("packet", "src/transport/packet.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-h3", "src/transport/h3.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-h3-server", "src/transport/server.sig", &.{
+        importEntry("conn", "src/transport/conn.sig"), importEntry("packet", "src/transport/packet.sig"),
+        importEntry("streams", "src/transport/streams.sig"), importEntry("udp", "src/transport/udp.sig"),
+        importEntry("h3", "src/transport/h3.sig"), importEntry("telemetry", "src/transport/telemetry.sig"),
     });
 
     _ = try addTest(ctx, test_all, "test-no-alloc", "src/transport/no_alloc_test.sig", &.{});

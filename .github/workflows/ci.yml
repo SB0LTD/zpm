@@ -79,6 +79,12 @@ jobs:
             --global-cache-dir /tmp/zpm-global-cache \
             --keep-going
 
+      - name: Check generated SB0 contract fixture
+        run: |
+          python3 tools/generate_sb0_contract.py --check \
+            tools/testdata/sample_contract.json \
+            tools/testdata/sample_contract.sig
+
       - name: Test and build the ZPM CLI with Sig
         working-directory: cli
         run: |

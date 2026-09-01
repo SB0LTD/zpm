@@ -481,7 +481,7 @@ fn eql(a: []const u8, b: []const u8) bool {
 const testing = @import("std").testing;
 
 test "official_packages: expected package count" {
-    try testing.expectEqual(@as(usize, 35), package_count);
+    try testing.expectEqual(@as(usize, 37), package_count);
 }
 
 test "official_packages: layer 0 packages have no platform dependencies" {
@@ -494,7 +494,7 @@ test "official_packages: layer 0 packages have no platform dependencies" {
 }
 
 test "official_packages: layer 0 includes portable AI foundations" {
-    try testing.expectEqual(@as(usize, 4), layer_0_count);
+    try testing.expectEqual(@as(usize, 6), layer_0_count);
     try testing.expect(findByName("ai-core") != null);
 }
 

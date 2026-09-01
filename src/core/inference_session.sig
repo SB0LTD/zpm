@@ -17,13 +17,13 @@
 //! Zero heap allocation. All storage via caller-provided AllocFn.
 
 
-const gguf = @import("gguf.sig");
-const qwen3_plan = @import("qwen3_decoder_plan.sig");
-const executor = @import("qwen3_executor.sig");
-const tokenizer = @import("tokenizer.sig");
-const tokenizer_index = @import("tokenizer_index.sig");
-const sampling = @import("sampling.sig");
-const kv_cache = @import("kv_cache.sig");
+const gguf = @import("gguf");
+const qwen3_plan = @import("qwen3_decoder_plan");
+const executor = @import("qwen3_executor");
+const tokenizer = @import("tokenizer");
+const tokenizer_index = @import("sb0_gguf_tokenizer_index");
+const sampling = @import("sampling");
+const kv_cache = @import("kv_cache");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Configuration

@@ -175,7 +175,7 @@ test "tls13_keys: key schedule init with zero PSK" {
 
 test "tls13_keys: handshake secrets differ from each other" {
     var ks = KeySchedule.init(null);
-    const shared_secret = [32]u8{0x01} ** 32;
+    const shared_secret: [32]u8 = @splat(0x01);
     const transcript = sha256.hash("ClientHelloServerHello");
 
     var client_hs: [32]u8 = undefined;
@@ -192,7 +192,7 @@ test "tls13_keys: handshake secrets differ from each other" {
 
 test "tls13_keys: application secrets differ from handshake secrets" {
     var ks = KeySchedule.init(null);
-    const shared_secret = [32]u8{0xAB} ** 32;
+    const shared_secret: [32]u8 = @splat(0xAB);
     const hs_transcript = sha256.hash("CH+SH");
     const app_transcript = sha256.hash("CH+SH+EE+CERT+CV+FIN");
 
@@ -213,7 +213,7 @@ test "tls13_keys: application secrets differ from handshake secrets" {
 }
 
 test "tls13_keys: traffic key derivation produces correct lengths" {
-    const secret = [32]u8{0x42} ** 32;
+    const secret: [32]u8 = @splat(0x42);
     var key: [16]u8 = undefined;
     var iv: [12]u8 = undefined;
     deriveTrafficKeys(&secret, &key, &iv);
@@ -233,7 +233,7 @@ test "tls13_keys: traffic key derivation produces correct lengths" {
 }
 
 test "tls13_keys: Finished computation is deterministic" {
-    const base_key = [32]u8{0x11} ** 32;
+    const base_key: [32]u8 = @splat(0x11);
     const transcript = sha256.hash("some handshake data");
 
     const fin1 = KeySchedule.computeFinished(&base_key, &transcript);
@@ -245,7 +245,7 @@ test "tls13_keys: Finished computation is deterministic" {
 }
 
 test "tls13_keys: QUIC traffic keys differ from TLS traffic keys" {
-    const secret = [32]u8{0xDE} ** 32;
+    const secret: [32]u8 = @splat(0xDE);
     var tls_key: [16]u8 = undefined;
     var tls_iv: [12]u8 = undefined;
     deriveTrafficKeys(&secret, &tls_key, &tls_iv);

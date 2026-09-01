@@ -4,9 +4,9 @@
 //! operation IDs and resource handles only; capability leases are narrowed,
 //! expiring, use-bounded, and cascade-revocable without heap allocation.
 
-const math = @import("sig_math.sig");
-const mem = @import("sig_mem.sig");
-const testing = @import("sig_testing.sig");
+const math = @import("sig_math");
+const mem = @import("sig_mem");
+const testing = @import("sig_testing");
 
 pub const Error = error{
     CapacityExhausted,

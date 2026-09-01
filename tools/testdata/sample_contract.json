@@ -1,0 +1,22 @@
+{
+  "version": "1.0.0",
+  "app_id": "tech.sb0.sample",
+  "sdk_requirement": "^1.0.0",
+  "max_request_body": 4096,
+  "capabilities": {
+    "network": true,
+    "storage": true
+  },
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/health",
+      "max_body": 0
+    },
+    {
+      "method": "POST",
+      "path": "/v1/items",
+      "max_body": 4096
+    }
+  ]
+}

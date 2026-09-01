@@ -4,7 +4,7 @@
 //! only offsets, lengths, hashes, and token ids, avoiding Gotliv's 32+ MiB
 //! fixed token-text copy while retaining exact collision checks.
 
-const gguf = @import("gguf.sig");
+const gguf = @import("gguf");
 
 pub const Error = error{
     MissingVocabulary,
@@ -213,8 +213,8 @@ pub fn VocabularyIndex(comptime vocabulary_capacity: usize, comptime hash_capaci
     };
 }
 
-const math = @import("sig_math.sig");
-const mem = @import("sig_mem.sig");
+const math = @import("sig_math");
+const mem = @import("sig_mem");
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 

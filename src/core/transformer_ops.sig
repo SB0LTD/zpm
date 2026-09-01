@@ -3,7 +3,7 @@
 //! Every operation receives caller-owned storage. Shapes and capacity are
 //! validated at the boundary; model architecture and scheduling stay above.
 
-const math = @import("sig_math.sig");
+const math = @import("sig_math");
 
 pub const Error = error{
     InvalidShape,

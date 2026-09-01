@@ -594,8 +594,8 @@ pub extern "ws2_32" fn getsockname(SOCKET, *sockaddr_in, *c_int) callconv(.c) c_
 // ============================================================
 // SChannel — TLS 1.3 handshake (QUIC transport)
 // ============================================================
-pub const CredHandle = extern struct { lower: usize = 0, upper: usize = 0 };
-pub const CtxtHandle = extern struct { lower: usize = 0, upper: usize = 0 };
+pub const CredHandle = [2]usize;
+pub const CtxtHandle = [2]usize;
 
 pub const SecBuffer = extern struct {
     cbBuffer: u32 = 0,

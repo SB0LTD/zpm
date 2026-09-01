@@ -11,7 +11,7 @@
 //! Uses xoshiro256** PRNG — fast, high-quality, deterministic from seed.
 //! Zero allocation. All state in caller-owned structs.
 
-const math = @import("sig_math.sig");
+const math = @import("sig_math");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Configuration

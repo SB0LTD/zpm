@@ -5,11 +5,11 @@
 //! state, scratch, KV cache, cancellation, and progress policy are owned by the
 //! caller. There is no process, thread, allocator, ELF, or foreign-runtime ABI.
 
-const math = @import("sig_math.sig");
-const gguf = @import("gguf.sig");
-const qwen3 = @import("qwen3_decoder_plan.sig");
-const quantized = @import("quantized_linear.sig");
-const transformer = @import("transformer_ops.sig");
+const math = @import("sig_math");
+const gguf = @import("gguf");
+const qwen3 = @import("qwen3_decoder_plan");
+const quantized = @import("quantized_linear");
+const transformer = @import("transformer_ops");
 
 pub const Error = quantized.Error || transformer.Error || error{
     InvalidPlan,

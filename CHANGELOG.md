@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.1 — 2026-09-01
+
+### Added
+
+- Bounded HTTP/3 framing, static QPACK, fragmented request decoding, and a
+  fixed-capacity server API.
+- Versioned SB0 application SDK v1 for delegated network and storage device
+  queues.
+- Deterministic JSON-to-Sig contract generator with drift checking.
+
+### Fixed
+
+- QUIC v1 Initial secrets now follow RFC 9001's empty-context
+  HKDF-Expand-Label derivation and pass the Appendix A vectors.
+- P-256 modular reduction now terminates in a bounded 512 steps instead of
+  repeated subtraction over a 512-bit product.
+- X25519 serialization and the RFC 7748 Montgomery-ladder constant.
+- Zig 0.17/Sig 0.4 compatibility across crypto, inference, tokenizer, and
+  transport module wiring.
+- Official-package catalog assertions now match the 37-package catalog.
+
+### Verification
+
+- Root library/transport suite: 67 succeeded, 0 failed, 2 skipped.
+- CLI suite: 13 succeeded, 0 failed, 1 skipped.
+- Native CLI build reports `zpm v0.2.1`.
+
 ## 0.1.0 — 2025-06-20
 
 Initial release — zpm transforms from a Windows-only Zig module library into a cross-platform package manager for the Zig ecosystem.

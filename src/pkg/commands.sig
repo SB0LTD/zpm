@@ -647,7 +647,7 @@ pub fn doctorCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) CommandRe
     var all_passed = true;
 
     // Check 1: zpm CLI version (hardcoded)
-    ctx.stdout("\xe2\x9c\x93 zpm v0.1.0\n");
+    ctx.stdout("\xe2\x9c\x93 zpm v0.2.1\n");
 
     // Check 2: Zig installation via bootstrapper
     if (ctx.bootstrapper) |b| {
@@ -2105,7 +2105,7 @@ test "doctorCmd: all checks pass with healthy environment" {
     const result = doctorCmd(&ctx, &args);
     try testing.expectEqual(CommandResult.success, result);
     const out = getStdout();
-    try testing.expect(std.mem.indexOf(u8, out, "zpm v0.1.0") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "zpm v0.2.1") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Zig installed") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Registry reachable") != null);
     try testing.expect(std.mem.indexOf(u8, out, "build.sig.zon found") != null);
@@ -2144,7 +2144,7 @@ test "doctorCmd: reports failures but runs all checks" {
     try testing.expect(std.mem.indexOf(u8, err_out, "build.sig.zon not found") != null);
     try testing.expect(std.mem.indexOf(u8, err_out, "build.sig not found") != null);
     // zpm version should still be in stdout
-    try testing.expect(std.mem.indexOf(u8, getStdout(), "zpm v0.1.0") != null);
+    try testing.expect(std.mem.indexOf(u8, getStdout(), "zpm v0.2.1") != null);
 }
 
 test "doctorCmd: works without bootstrapper" {

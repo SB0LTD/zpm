@@ -80,7 +80,7 @@ inline fn gmul(a: u8, b: u8) u8 {
     var result: u8 = 0;
     var aa = a;
     var bb = b;
-    var i: u3 = 0;
+    var i: usize = 0;
     while (i < 8) : (i += 1) {
         if ((bb & 1) != 0) result ^= aa;
         aa = xtime(aa);

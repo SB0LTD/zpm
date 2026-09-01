@@ -62,7 +62,7 @@ pub fn scalarmult(scalar: *const [32]u8, point: *const [32]u8) [32]u8 {
         x_3 = feSq(feAdd(da, cb));
         z_3 = feMul(x_1, feSq(feSub(da, cb)));
         x_2 = feMul(aa, bb);
-        z_2 = feMul(e_val, feAdd(aa, feMul121666(e_val)));
+        z_2 = feMul(e_val, feAdd(aa, feMulA24(e_val)));
     }
 
     cswap(&x_2, &x_3, swap);
@@ -107,12 +107,20 @@ fn feToBytes(h: Fe) [32]u8 {
     // Reduce modulo p = 2^255 - 19
     const t = feReduce(h);
 
-    var s: [32]u8 = undefined;
-    store51(&s, 0, t[0]);
-    store51_shift(&s, 6, t[1], 3);
-    store51_shift(&s, 12, t[2], 6);
-    store51_shift(&s, 19, t[3], 1);
-    store51_shift(&s, 24, t[4], 12);
+    var s: [32]u8 = @splat(0);
+    for (t, 0..) |limb, limb_index| {
+        const bit_offset = limb_index * 51;
+        var byte_index = bit_offset / 8;
+        const initial_shift: usize = bit_offset % 8;
+        var value = limb;
+        s[byte_index] |= @truncate(value << @intCast(initial_shift));
+        value >>= @intCast(8 - initial_shift);
+        byte_index += 1;
+        while (value != 0 and byte_index < s.len) : (byte_index += 1) {
+            s[byte_index] |= @truncate(value);
+            value >>= 8;
+        }
+    }
     // Clear top bit (ensure < 2^255)
     s[31] &= 127;
     return s;
@@ -195,9 +203,9 @@ fn feSq(a: Fe) Fe {
     return feMul(a, a);
 }
 
-/// Multiply by the constant 121666 (used in the Montgomery ladder: a24 = (486662-2)/4 = 121665, but we use 121666 per RFC).
-fn feMul121666(a: Fe) Fe {
-    const c: u64 = 121666;
+/// Multiply by a24 = (486662 - 2) / 4, as specified by RFC 7748.
+fn feMulA24(a: Fe) Fe {
+    const c: u64 = 121665;
     const m: u128 = 0x7FFFFFFFFFFFF;
 
     var t: [5]u128 = undefined;
@@ -328,33 +336,11 @@ fn load51(s: *const [32]u8, offset: usize) u64 {
     var r: u64 = 0;
     const end = @min(offset + 8, 32);
     var i: usize = offset;
-    var shift: u6 = 0;
+    var shift: usize = 0;
     while (i < end) : ({ i += 1; shift += 8; }) {
-        r |= @as(u64, s[i]) << shift;
+        r |= @as(u64, s[i]) << @intCast(shift);
     }
     return r;
-}
-
-fn store51(s: *[32]u8, offset: usize, val: u64) void {
-    const end = @min(offset + 7, 32);
-    var v = val;
-    var i: usize = offset;
-    while (i < end) : (i += 1) {
-        s[i] = @intCast(v & 0xFF);
-        v >>= 8;
-    }
-}
-
-fn store51_shift(s: *[32]u8, offset: usize, val: u64, shift: u6) void {
-    // We need to OR the shifted value into the existing bytes
-    const shifted = val << shift;
-    const end = @min(offset + 7, 32);
-    var v = shifted;
-    var i: usize = offset;
-    while (i < end) : (i += 1) {
-        s[i] |= @intCast(v & 0xFF);
-        v >>= 8;
-    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

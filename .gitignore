@@ -1,5 +1,8 @@
 # Zig build artifacts
 .zig-cache/
+.sig-cache/
+.build/
+sig-out/
 zig-out/cli/sig-out/
 cli/sig-out/
 

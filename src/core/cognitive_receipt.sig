@@ -10,7 +10,7 @@ const moment_activation = @import("moment_activation");
 const agent_runtime = @import("agent_runtime");
 const model_observability = @import("model_observability");
 const multimodal_now = @import("multimodal_now");
-const testing = @import("sig_testing.sig");
+const testing = @import("sig_testing");
 
 pub const vector_capacity: usize = 256;
 pub const vector_dimension: usize = 384;

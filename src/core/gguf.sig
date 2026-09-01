@@ -5,8 +5,8 @@
 //! product name. Successful parsing proves only that the container and tensor
 //! spans are structurally safe; executor parity is a separate readiness gate.
 
-const math = @import("sig_math.sig");
-const mem = @import("sig_mem.sig");
+const math = @import("sig_math");
+const mem = @import("sig_mem");
 
 pub const DEFAULT_ALIGNMENT: u32 = 32;
 pub const MAX_KEY_BYTES: u64 = 65_535;
