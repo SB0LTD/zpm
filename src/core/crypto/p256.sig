@@ -30,6 +30,13 @@ const P: [4]u64 = .{ 0xFFFFFFFFFFFFFFFF, 0x00000000FFFFFFFF, 0x0000000000000000,
 /// n = order of the generator point
 const N: [4]u64 = .{ 0xF3B9CAC2FC632551, 0xBCE6FAADA7179E84, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF00000000 };
 
+/// Montgomery constants for R = 2^256. R2 is R^2 mod modulus and N0_INV is
+/// -modulus[0]^-1 mod 2^64.
+const P_R2: [4]u64 = .{ 0x0000000000000003, 0xFFFFFFFBFFFFFFFF, 0xFFFFFFFFFFFFFFFE, 0x00000004FFFFFFFD };
+const N_R2: [4]u64 = .{ 0x83244C95BE79EEA2, 0x4699799C49BD6FA6, 0x2845B2392B6BEC59, 0x66E12D94F3D95620 };
+const P_N0_INV: u64 = 0x0000000000000001;
+const N_N0_INV: u64 = 0xCCD1C8AAEE00BC4F;
+
 /// Generator point G (uncompressed)
 const GX: [4]u64 = .{ 0xF4A13945D898C296, 0x77037D812DEB33A0, 0xF8BCE6E563A440F2, 0x6B17D1F2E12C4247 };
 const GY: [4]u64 = .{ 0xCBB6406837BF51F5, 0x2BCE33576B315ECE, 0x8EE7EB4A7C0F9E16, 0x4FE342E2FE1A7F9B };
@@ -78,8 +85,8 @@ pub fn sign(
     if (isZeroU256(&r)) return false;
 
     // s = k^-1 * (hash + r * private_key) mod n
-    const d = bytesToU256(private_key);
-    const z = bytesToU256(message_hash);
+    const d = modN(bytesToU256(private_key));
+    const z = modN(bytesToU256(message_hash));
     const rd = mulModN(r, d);
     const z_plus_rd = addModN(z, rd);
     const k_inv = invertModN(k_scalar);
@@ -106,7 +113,7 @@ pub fn verify(
     if (isZeroU256(&r) or !isLessThan(&r, &N)) return false;
     if (isZeroU256(&s) or !isLessThan(&s, &N)) return false;
 
-    const z = bytesToU256(message_hash);
+    const z = modN(bytesToU256(message_hash));
     const s_inv = invertModN(s);
     const u1_val = mulModN(z, s_inv);
     const u2_val = mulModN(r, s_inv);
@@ -157,22 +164,10 @@ fn addModN(a: U256, b: U256) U256 {
 }
 
 fn mulModN(a: U256, b: U256) U256 {
-    // Schoolbook multiply to get 512-bit result, then Barrett reduce
-    var product: [8]u64 = @splat(0);
-    for (0..4) |i| {
-        var carry: u64 = 0;
-        for (0..4) |j| {
-            const mul: u128 = @as(u128, a[i]) * @as(u128, b[j]) + @as(u128, product[i + j]) + @as(u128, carry);
-            product[i + j] = @intCast(mul & 0xFFFFFFFFFFFFFFFF);
-            carry = @intCast(mul >> 64);
-        }
-        product[i + 4] = carry;
-    }
-    return reduceModN(&product);
-}
-
-fn reduceModN(product: *const [8]u64) U256 {
-    return reduce512(product, &N);
+    // Converting only one operand is sufficient:
+    // montMul(a, b*R) = a*b*R*R^-1 = a*b (mod n).
+    const b_mont = montMul(b, N_R2, &N, N_N0_INV);
+    return montMul(a, b_mont, &N, N_N0_INV);
 }
 
 fn invertModN(a: U256) U256 {
@@ -365,21 +360,8 @@ fn subModP(a: U256, b: U256) U256 {
 }
 
 fn mulModP(a: U256, b: U256) U256 {
-    var product: [8]u64 = @splat(0);
-    for (0..4) |i| {
-        var carry: u64 = 0;
-        for (0..4) |j| {
-            const mul: u128 = @as(u128, a[i]) * @as(u128, b[j]) + @as(u128, product[i + j]) + @as(u128, carry);
-            product[i + j] = @intCast(mul & 0xFFFFFFFFFFFFFFFF);
-            carry = @intCast(mul >> 64);
-        }
-        product[i + 4] = carry;
-    }
-    return reduceModP(&product);
-}
-
-fn reduceModP(product: *const [8]u64) U256 {
-    return reduce512(product, &P);
+    const b_mont = montMul(b, P_R2, &P, P_N0_INV);
+    return montMul(a, b_mont, &P, P_N0_INV);
 }
 
 fn invertModP(a: U256) U256 {
@@ -422,38 +404,44 @@ fn invertModP(a: U256) U256 {
 
 // ── Utility ─────────────────────────────────────────────────────────────
 
-/// Reduce a 512-bit little-endian value modulo a 256-bit modulus.
-///
-/// Bitwise long division is deliberately bounded to 512 iterations.  The old
-/// implementation subtracted the modulus from the full product until it fit;
-/// for a normal 256x256-bit product that requires on the order of 2^256
-/// iterations and therefore never completes in practice.
-fn reduce512(value: *const [8]u64, modulus: *const U256) U256 {
-    var remainder: U256 = ZERO_U256;
+/// Coarsely Integrated Operand Scanning Montgomery multiplication.
+/// Returns a*b*R^-1 mod modulus for four little-endian 64-bit limbs.
+/// Inputs must be reduced. Runtime is fixed: 32 word multiplications and one
+/// final conditional subtraction, independent of operand magnitude.
+fn montMul(a: U256, b: U256, modulus: *const U256, n0_inv: u64) U256 {
+    var t: [5]u64 = @splat(0);
 
-    var bit: usize = 512;
-    while (bit != 0) {
-        bit -= 1;
-        const input_limb = bit / 64;
-        const input_shift: u6 = @intCast(bit % 64);
-        var carry = (value[input_limb] >> input_shift) & 1;
-
-        for (0..4) |i| {
-            const next_carry = remainder[i] >> 63;
-            remainder[i] = (remainder[i] << 1) | carry;
-            carry = next_carry;
+    for (0..4) |i| {
+        var carry: u64 = 0;
+        for (0..4) |j| {
+            const product: u128 = @as(u128, a[j]) * @as(u128, b[i]) +
+                @as(u128, t[j]) + @as(u128, carry);
+            t[j] = @intCast(product & 0xFFFFFFFFFFFFFFFF);
+            carry = @intCast(product >> 64);
         }
+        const product_top: u128 = @as(u128, t[4]) + @as(u128, carry);
+        t[4] = @intCast(product_top & 0xFFFFFFFFFFFFFFFF);
 
-        // Before the shift remainder < modulus, so the shifted value is less
-        // than 2*modulus and at most one subtraction is required.  When carry
-        // is set, subU256's wraparound is exactly the low 256 bits of the
-        // 257-bit subtraction.
-        if (carry != 0 or !isLessThan(&remainder, modulus)) {
-            remainder = subU256(remainder, modulus.*);
+        // The low limb of t + q*modulus is zero by construction and is
+        // discarded while the remaining limbs shift down one word.
+        const q = t[0] *% n0_inv;
+        carry = 0;
+        for (0..4) |j| {
+            const reduced: u128 = @as(u128, q) * @as(u128, modulus[j]) +
+                @as(u128, t[j]) + @as(u128, carry);
+            if (j != 0) t[j - 1] = @intCast(reduced & 0xFFFFFFFFFFFFFFFF);
+            carry = @intCast(reduced >> 64);
         }
+        const reduced_top: u128 = @as(u128, t[4]) + @as(u128, carry);
+        t[3] = @intCast(reduced_top & 0xFFFFFFFFFFFFFFFF);
+        t[4] = @intCast(reduced_top >> 64);
     }
 
-    return remainder;
+    var result: U256 = .{ t[0], t[1], t[2], t[3] };
+    if (t[4] != 0 or !isLessThan(&result, modulus)) {
+        result = subU256(result, modulus.*);
+    }
+    return result;
 }
 
 fn subU256(a: U256, b: U256) U256 {
@@ -543,6 +531,17 @@ fn deterministicK(private_key: *const [32]u8, hash: *const [32]u8) U256 {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
+
+test "p256: Montgomery multiplication field identities" {
+    const p_minus_one = subU256(P, ONE_U256);
+    const n_minus_one = subU256(N, ONE_U256);
+    if (!u256Equal(mulModP(p_minus_one, p_minus_one), ONE_U256)) {
+        return error.TestUnexpectedResult;
+    }
+    if (!u256Equal(mulModN(n_minus_one, n_minus_one), ONE_U256)) {
+        return error.TestUnexpectedResult;
+    }
+}
 
 test "p256: sign and verify round trip" {
     // Use a known private key

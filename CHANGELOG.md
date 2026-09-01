@@ -14,8 +14,8 @@
 
 - QUIC v1 Initial secrets now follow RFC 9001's empty-context
   HKDF-Expand-Label derivation and pass the Appendix A vectors.
-- P-256 modular reduction now terminates in a bounded 512 steps instead of
-  repeated subtraction over a 512-bit product.
+- P-256 modular multiplication now uses fixed-work four-limb Montgomery CIOS
+  reduction instead of unbounded repeated subtraction.
 - X25519 serialization and the RFC 7748 Montgomery-ladder constant.
 - Zig 0.17/Sig 0.4 compatibility across crypto, inference, tokenizer, and
   transport module wiring.
