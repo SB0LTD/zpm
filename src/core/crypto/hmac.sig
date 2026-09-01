@@ -87,7 +87,7 @@ pub fn mac2(key: []const u8, data1: []const u8, data2: []const u8) [MAC_LEN]u8 {
 test "hmac-sha256: RFC 4231 Test Case 1" {
     // Key = 0x0b repeated 20 times
     // Data = "Hi There"
-    const key = [_]u8{0x0b} ** 20;
+    const key: [20]u8 = @splat(0x0b);
     const data = "Hi There";
     const expected = [_]u8{
         0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53,
@@ -121,8 +121,8 @@ test "hmac-sha256: RFC 4231 Test Case 2" {
 test "hmac-sha256: RFC 4231 Test Case 3" {
     // Key = 0xaa repeated 20 times
     // Data = 0xdd repeated 50 times
-    const key = [_]u8{0xaa} ** 20;
-    const data = [_]u8{0xdd} ** 50;
+    const key: [20]u8 = @splat(0xaa);
+    const data: [50]u8 = @splat(0xdd);
     const expected = [_]u8{
         0x77, 0x3e, 0xa9, 0x1e, 0x36, 0x80, 0x0e, 0x46,
         0x85, 0x4d, 0xb8, 0xeb, 0xd0, 0x91, 0x81, 0xa7,
@@ -138,7 +138,7 @@ test "hmac-sha256: RFC 4231 Test Case 3" {
 test "hmac-sha256: long key (> 64 bytes) is hashed" {
     // Key = 0xaa repeated 131 bytes (RFC 4231 Test Case 6)
     // Data = "Test Using Larger Than Block-Size Key - Hash Key First"
-    const key = [_]u8{0xaa} ** 131;
+    const key: [131]u8 = @splat(0xaa);
     const data = "Test Using Larger Than Block-Size Key - Hash Key First";
     const expected = [_]u8{
         0x60, 0xe4, 0x31, 0x59, 0x1e, 0xe0, 0xb6, 0x7f,

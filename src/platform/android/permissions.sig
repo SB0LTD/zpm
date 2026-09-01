@@ -155,7 +155,7 @@ pub const PermissionManager = struct {
 
     pub fn init() PermissionManager {
         return .{
-            .statuses = [_]PermissionStatus{.not_requested} ** PERMISSION_COUNT,
+            .statuses = @splat(.not_requested),
         };
     }
 

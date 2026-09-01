@@ -41,7 +41,7 @@ pub const Oscillator = struct {
 };
 
 pub const Bank = struct {
-    oscillators: [OSCILLATOR_COUNT]Oscillator = [_]Oscillator{.{}} ** OSCILLATOR_COUNT,
+    oscillators: [OSCILLATOR_COUNT]Oscillator = @splat(.{}),
     master_amplitude: f32 = 0,
 
     /// Set each oscillator's target frequency to a consonant partial of the

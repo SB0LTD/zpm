@@ -38,7 +38,7 @@ pub const StoreError = error{
 };
 
 pub const Store = struct {
-    docs: [MAX_DOCUMENTS]Document = [_]Document{.{}} ** MAX_DOCUMENTS,
+    docs: [MAX_DOCUMENTS]Document = @splat(.{}),
 
     /// Find the slot index for a URI, or null if not open.
     pub fn find(self: *Store, target: []const u8) ?usize {

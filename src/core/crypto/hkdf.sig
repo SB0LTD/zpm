@@ -126,7 +126,7 @@ test "hkdf: RFC 5869 Test Case 1" {
     // salt = 0x000102030405060708090a0b0c (13 bytes)
     // info = 0xf0f1f2f3f4f5f6f7f8f9 (10 bytes)
     // L    = 42
-    const ikm = [_]u8{0x0b} ** 22;
+    const ikm: [22]u8 = @splat(0x0b);
     const salt = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c };
     const info = [_]u8{ 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9 };
 
@@ -205,7 +205,7 @@ test "hkdf: RFC 5869 Test Case 2" {
 }
 
 test "hkdf: empty salt uses zero key" {
-    const ikm = [_]u8{0x0b} ** 22;
+    const ikm: [22]u8 = @splat(0x0b);
     const empty_salt: []const u8 = "";
     const prk = extract(empty_salt, &ikm);
     // Just verify it produces a non-zero result
@@ -217,15 +217,15 @@ test "hkdf: empty salt uses zero key" {
 }
 
 test "hkdf: expandLabel produces correct length" {
-    const secret = [_]u8{0x01} ** 32;
+    const secret: [32]u8 = @splat(0x01);
     var out: [48]u8 = undefined;
     const result = expandLabel(&secret, "key", "", &out, 16);
     if (result.len != 16) return error.TestUnexpectedResult;
 }
 
 test "hkdf: expandLabel with context" {
-    const secret = [_]u8{0xAB} ** 32;
-    const context = [_]u8{0xCD} ** 32;
+    const secret: [32]u8 = @splat(0xAB);
+    const context: [32]u8 = @splat(0xCD);
     var out1: [32]u8 = undefined;
     var out2: [32]u8 = undefined;
     _ = expandLabel(&secret, "derived", &context, &out1, 32);

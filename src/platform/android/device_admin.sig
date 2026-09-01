@@ -58,7 +58,7 @@ pub const DeviceAdminController = struct {
     pub fn init() DeviceAdminController {
         return .{
             .state = .not_admin,
-            .capabilities = [_]bool{false} ** 6,
+            .capabilities = @splat(false),
         };
     }
 

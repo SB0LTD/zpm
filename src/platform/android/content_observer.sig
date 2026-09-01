@@ -95,7 +95,7 @@ pub const ContentObserverManager = struct {
 
     pub fn init() ContentObserverManager {
         return .{
-            .registrations = [_]?ObserverRegistration{null} ** MAX_OBSERVERS,
+            .registrations = @splat(null),
             .count = 0,
         };
     }
