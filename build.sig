@@ -55,6 +55,27 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("sha256", "src/core/sha256.sig");
     _ = try ctx.addModule("inflate", "src/core/inflate.sig");
 
+    // ── Image analysis + Elementor (Layer 0: pure computation) ──
+    const png_decode = try ctx.addModule("png_decode", "src/image/png_decode.sig");
+    try wire(ctx, png_decode, "inflate", "src/core/inflate.sig");
+    _ = try addTest(ctx, test_all, "test-png-decode", "src/image/png_decode.sig", &.{
+        importEntry("inflate", "src/core/inflate.sig"),
+    });
+    _ = try ctx.addModule("image", "src/image/image.sig");
+    _ = try addTest(ctx, test_all, "test-image", "src/image/image.sig", &.{});
+    const layout = try ctx.addModule("layout", "src/image/layout.sig");
+    try wire(ctx, layout, "image", "src/image/image.sig");
+    _ = try addTest(ctx, test_all, "test-layout", "src/image/layout.sig", &.{
+        importEntry("image", "src/image/image.sig"),
+    });
+    const text_analyze = try ctx.addModule("text_analyze", "src/image/text_analyze.sig");
+    try wire(ctx, text_analyze, "image", "src/image/image.sig");
+    _ = try addTest(ctx, test_all, "test-text-analyze", "src/image/text_analyze.sig", &.{
+        importEntry("image", "src/image/image.sig"),
+    });
+    _ = try ctx.addModule("elementor_document", "src/elementor/document.sig");
+    _ = try addTest(ctx, test_all, "test-elementor-document", "src/elementor/document.sig", &.{});
+
     // ── Crypto modules (Layer 0: pure computation, freestanding) ──
     const crypto_hmac = try ctx.addModule("hmac", "src/core/crypto/hmac.sig");
     try wire(ctx, crypto_hmac, "sha256", "src/core/sha256.sig");
