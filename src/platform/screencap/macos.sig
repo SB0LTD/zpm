@@ -1,11 +1,14 @@
 // screencap macOS backend — CoreGraphics capture + CGEvent synthetic click.
 // Selected at comptime by screencap.sig on macOS targets.
 //
-// Uses the CoreGraphics window services: CGWindowListCopyWindowInfo to
-// enumerate on-screen windows, CGWindowListCreateImage to capture one, and
-// CGEvent to post a synthetic mouse click. Links the CoreGraphics /
-// CoreFoundation frameworks (resolved by the linker for macOS targets).
+// CoreGraphics / CoreFoundation are loaded at RUNTIME via std.DynLib (dlopen of
+// the framework binaries), not linked at build time — so the suite
+// cross-compiles to macOS from any host without the SDK frameworks present, and
+// degrades gracefully when they are unavailable. Screen capture on macOS also
+// requires the user to grant Screen Recording permission; without it the OS
+// returns empty images, which this backend reports as capture failure.
 
+const std = @import("std");
 const api = @import("../screencap.sig");
 
 const WindowInfo = api.WindowInfo;
@@ -18,12 +21,10 @@ const CFTypeRef = ?*anyopaque;
 const CFArrayRef = ?*anyopaque;
 const CFDictionaryRef = ?*anyopaque;
 const CFStringRef = ?*anyopaque;
-const CFNumberRef = ?*anyopaque;
 const CGImageRef = ?*anyopaque;
 const CGDataProviderRef = ?*anyopaque;
 const CFDataRef = ?*anyopaque;
 const CGEventRef = ?*anyopaque;
-const CGEventSourceRef = ?*anyopaque;
 
 const CGWindowID = u32;
 const CGWindowListOption = u32;
@@ -41,62 +42,125 @@ const kCGMouseButtonLeft: u32 = 0;
 const kCGHIDEventTap: u32 = 0;
 
 const kCFNumberIntType: c_long = 9;
-const kCFNumberFloat64Type: c_long = 6;
+const kCFStringEncodingUTF8: u32 = 0x08000100;
 
-extern "c" fn CGWindowListCopyWindowInfo(CGWindowListOption, CGWindowID) callconv(.c) CFArrayRef;
-extern "c" fn CFArrayGetCount(CFArrayRef) callconv(.c) c_long;
-extern "c" fn CFArrayGetValueAtIndex(CFArrayRef, c_long) callconv(.c) ?*anyopaque;
-extern "c" fn CFDictionaryGetValue(CFDictionaryRef, ?*anyopaque) callconv(.c) ?*anyopaque;
-extern "c" fn CFNumberGetValue(CFNumberRef, c_long, ?*anyopaque) callconv(.c) u8;
-extern "c" fn CFStringGetCString(CFStringRef, [*]u8, c_long, u32) callconv(.c) u8;
-extern "c" fn CFRelease(CFTypeRef) callconv(.c) void;
+// ── Function-pointer signatures ──
+const FnWindowListCopyInfo = *const fn (CGWindowListOption, CGWindowID) callconv(.c) CFArrayRef;
+const FnArrayGetCount = *const fn (CFArrayRef) callconv(.c) c_long;
+const FnArrayGetValueAtIndex = *const fn (CFArrayRef, c_long) callconv(.c) ?*anyopaque;
+const FnDictionaryGetValue = *const fn (CFDictionaryRef, ?*anyopaque) callconv(.c) ?*anyopaque;
+const FnNumberGetValue = *const fn (CFTypeRef, c_long, ?*anyopaque) callconv(.c) u8;
+const FnStringGetCString = *const fn (CFStringRef, [*]u8, c_long, u32) callconv(.c) u8;
+const FnRelease = *const fn (CFTypeRef) callconv(.c) void;
+const FnRectFromDict = *const fn (CFDictionaryRef, *CGRect) callconv(.c) u8;
 
-extern "c" fn CGWindowListCreateImage(CGRect, CGWindowListOption, CGWindowID, u32) callconv(.c) CGImageRef;
-extern "c" fn CGImageGetWidth(CGImageRef) callconv(.c) usize;
-extern "c" fn CGImageGetHeight(CGImageRef) callconv(.c) usize;
-extern "c" fn CGImageGetBytesPerRow(CGImageRef) callconv(.c) usize;
-extern "c" fn CGImageGetBitsPerPixel(CGImageRef) callconv(.c) usize;
-extern "c" fn CGImageGetDataProvider(CGImageRef) callconv(.c) CGDataProviderRef;
-extern "c" fn CGDataProviderCopyData(CGDataProviderRef) callconv(.c) CFDataRef;
-extern "c" fn CFDataGetLength(CFDataRef) callconv(.c) c_long;
-extern "c" fn CFDataGetBytePtr(CFDataRef) callconv(.c) ?[*]const u8;
-extern "c" fn CGImageRelease(CGImageRef) callconv(.c) void;
+const FnWindowListCreateImage = *const fn (CGRect, CGWindowListOption, CGWindowID, u32) callconv(.c) CGImageRef;
+const FnImageGetWidth = *const fn (CGImageRef) callconv(.c) usize;
+const FnImageGetHeight = *const fn (CGImageRef) callconv(.c) usize;
+const FnImageGetBytesPerRow = *const fn (CGImageRef) callconv(.c) usize;
+const FnImageGetBitsPerPixel = *const fn (CGImageRef) callconv(.c) usize;
+const FnImageGetDataProvider = *const fn (CGImageRef) callconv(.c) CGDataProviderRef;
+const FnDataProviderCopyData = *const fn (CGDataProviderRef) callconv(.c) CFDataRef;
+const FnDataGetBytePtr = *const fn (CFDataRef) callconv(.c) ?[*]const u8;
+const FnImageRelease = *const fn (CGImageRef) callconv(.c) void;
 
-extern "c" fn CGEventCreateMouseEvent(CGEventSourceRef, u32, CGPoint, u32) callconv(.c) CGEventRef;
-extern "c" fn CGEventPost(u32, CGEventRef) callconv(.c) void;
-extern "c" fn CFRunLoopRunInMode(CFStringRef, f64, u8) callconv(.c) i32;
+const FnEventCreateMouse = *const fn (?*anyopaque, u32, CGPoint, u32) callconv(.c) CGEventRef;
+const FnEventPost = *const fn (u32, CGEventRef) callconv(.c) void;
 
-// The dictionary keys are exported CFStringRef symbols from CoreGraphics.
-extern "c" const kCGWindowNumber: CFStringRef;
-extern "c" const kCGWindowName: CFStringRef;
-extern "c" const kCGWindowBounds: CFStringRef;
+const Cg = struct {
+    windowListCopyInfo: FnWindowListCopyInfo,
+    arrayGetCount: FnArrayGetCount,
+    arrayGetValueAtIndex: FnArrayGetValueAtIndex,
+    dictionaryGetValue: FnDictionaryGetValue,
+    numberGetValue: FnNumberGetValue,
+    stringGetCString: FnStringGetCString,
+    release: FnRelease,
+    rectFromDict: FnRectFromDict,
+    windowListCreateImage: FnWindowListCreateImage,
+    imageGetWidth: FnImageGetWidth,
+    imageGetHeight: FnImageGetHeight,
+    imageGetBytesPerRow: FnImageGetBytesPerRow,
+    imageGetBitsPerPixel: FnImageGetBitsPerPixel,
+    imageGetDataProvider: FnImageGetDataProvider,
+    dataProviderCopyData: FnDataProviderCopyData,
+    dataGetBytePtr: FnDataGetBytePtr,
+    imageRelease: FnImageRelease,
+    eventCreateMouse: FnEventCreateMouse,
+    eventPost: FnEventPost,
+    // Exported CFStringRef key symbols (data, dereferenced once at load).
+    keyWindowNumber: CFStringRef,
+    keyWindowName: CFStringRef,
+    keyWindowBounds: CFStringRef,
+};
 
-// CGRectMakeWithDictionaryRepresentation parses the bounds dictionary.
-extern "c" fn CGRectMakeWithDictionaryRepresentation(CFDictionaryRef, *CGRect) callconv(.c) u8;
+var g_cg: ?Cg = null;
+var g_attempted: bool = false;
 
-extern "c" fn usleep(u32) callconv(.c) c_int;
+const CG_PATH = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics";
+const CF_PATH = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
+
+fn deref(lib: *std.DynLib, name: [:0]const u8) CFStringRef {
+    const p = lib.lookup(*CFStringRef, name) orelse return null;
+    return p.*;
+}
+
+fn cg() ?*const Cg {
+    if (g_attempted) return if (g_cg) |*c| c else null;
+    g_attempted = true;
+
+    var cgl = std.DynLib.open(CG_PATH) catch return null;
+    var cfl = std.DynLib.open(CF_PATH) catch {
+        cgl.close();
+        return null;
+    };
+
+    g_cg = .{
+        .windowListCopyInfo = cgl.lookup(FnWindowListCopyInfo, "CGWindowListCopyWindowInfo") orelse return null,
+        .arrayGetCount = cfl.lookup(FnArrayGetCount, "CFArrayGetCount") orelse return null,
+        .arrayGetValueAtIndex = cfl.lookup(FnArrayGetValueAtIndex, "CFArrayGetValueAtIndex") orelse return null,
+        .dictionaryGetValue = cfl.lookup(FnDictionaryGetValue, "CFDictionaryGetValue") orelse return null,
+        .numberGetValue = cfl.lookup(FnNumberGetValue, "CFNumberGetValue") orelse return null,
+        .stringGetCString = cfl.lookup(FnStringGetCString, "CFStringGetCString") orelse return null,
+        .release = cfl.lookup(FnRelease, "CFRelease") orelse return null,
+        .rectFromDict = cgl.lookup(FnRectFromDict, "CGRectMakeWithDictionaryRepresentation") orelse return null,
+        .windowListCreateImage = cgl.lookup(FnWindowListCreateImage, "CGWindowListCreateImage") orelse return null,
+        .imageGetWidth = cgl.lookup(FnImageGetWidth, "CGImageGetWidth") orelse return null,
+        .imageGetHeight = cgl.lookup(FnImageGetHeight, "CGImageGetHeight") orelse return null,
+        .imageGetBytesPerRow = cgl.lookup(FnImageGetBytesPerRow, "CGImageGetBytesPerRow") orelse return null,
+        .imageGetBitsPerPixel = cgl.lookup(FnImageGetBitsPerPixel, "CGImageGetBitsPerPixel") orelse return null,
+        .imageGetDataProvider = cgl.lookup(FnImageGetDataProvider, "CGImageGetDataProvider") orelse return null,
+        .dataProviderCopyData = cgl.lookup(FnDataProviderCopyData, "CGDataProviderCopyData") orelse return null,
+        .dataGetBytePtr = cfl.lookup(FnDataGetBytePtr, "CFDataGetBytePtr") orelse return null,
+        .imageRelease = cgl.lookup(FnImageRelease, "CGImageRelease") orelse return null,
+        .eventCreateMouse = cgl.lookup(FnEventCreateMouse, "CGEventCreateMouseEvent") orelse return null,
+        .eventPost = cgl.lookup(FnEventPost, "CGEventPost") orelse return null,
+        .keyWindowNumber = deref(&cgl, "kCGWindowNumber") orelse return null,
+        .keyWindowName = deref(&cgl, "kCGWindowName") orelse return null,
+        .keyWindowBounds = deref(&cgl, "kCGWindowBounds") orelse return null,
+    };
+    return if (g_cg) |*c| c else null;
+}
 
 pub fn enumerate(comptime capacity: usize, list: *api.WindowList(capacity), opts: EnumOptions) usize {
     list.len = 0;
+    const c = cg() orelse return 0;
     const options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
-    const arr = CGWindowListCopyWindowInfo(options, kCGNullWindowID) orelse return 0;
-    defer CFRelease(arr);
+    const arr = c.windowListCopyInfo(options, kCGNullWindowID) orelse return 0;
+    defer c.release(arr);
 
-    const n = CFArrayGetCount(arr);
+    const n = c.arrayGetCount(arr);
     var count: usize = 0;
     var idx: c_long = 0;
     while (idx < n and count < capacity) : (idx += 1) {
-        const dict = CFArrayGetValueAtIndex(arr, idx) orelse continue;
+        const dict = c.arrayGetValueAtIndex(arr, idx) orelse continue;
 
-        // Window id
         var wid: c_int = 0;
-        const num = CFDictionaryGetValue(dict, kCGWindowNumber);
-        if (num != null) _ = CFNumberGetValue(num, kCFNumberIntType, &wid);
+        const num = c.dictionaryGetValue(dict, c.keyWindowNumber);
+        if (num != null) _ = c.numberGetValue(num, kCFNumberIntType, &wid);
 
-        // Bounds
         var rect: CGRect = .{};
-        const bounds = CFDictionaryGetValue(dict, kCGWindowBounds);
-        if (bounds != null) _ = CGRectMakeWithDictionaryRepresentation(bounds, &rect);
+        const bounds = c.dictionaryGetValue(dict, c.keyWindowBounds);
+        if (bounds != null) _ = c.rectFromDict(bounds, &rect);
         const width: i32 = @intFromFloat(rect.w);
         const height: i32 = @intFromFloat(rect.h);
         if (width < opts.min_width or height < opts.min_height) continue;
@@ -109,10 +173,9 @@ pub fn enumerate(comptime capacity: usize, list: *api.WindowList(capacity), opts
             .height = height,
         };
 
-        // Title (optional)
-        const name = CFDictionaryGetValue(dict, kCGWindowName);
+        const name = c.dictionaryGetValue(dict, c.keyWindowName);
         if (name != null) {
-            if (CFStringGetCString(name, &info.title, MAX_TITLE, 0x08000100) != 0) { // kCFStringEncodingUTF8
+            if (c.stringGetCString(name, &info.title, MAX_TITLE, kCFStringEncodingUTF8) != 0) {
                 info.title_len = cstrLen(&info.title);
             }
         }
@@ -138,33 +201,31 @@ pub fn captureWindow(win: WindowInfo, out: []u8) Capture {
     const needed = @as(usize, width) * @as(usize, height) * 4;
     if (out.len < needed) return api.captureFail(out);
 
+    const c = cg() orelse return api.captureFail(out);
     const wid: CGWindowID = @intCast(win.handle);
-    // Null rect => the window's own bounds.
-    const null_rect = CGRect{ .x = 0, .y = 0, .w = 0, .h = 0 };
-    _ = null_rect;
-    const img = CGWindowListCreateImage(
+    const img = c.windowListCreateImage(
         .{ .x = @floatFromInt(win.left), .y = @floatFromInt(win.top), .w = @floatFromInt(win.width), .h = @floatFromInt(win.height) },
         kCGWindowListOptionOnScreenOnly,
         wid,
         kCGWindowImageDefault,
     ) orelse return api.captureFail(out);
-    defer CGImageRelease(img);
+    defer c.imageRelease(img);
 
-    const img_w = CGImageGetWidth(img);
-    const img_h = CGImageGetHeight(img);
-    const stride = CGImageGetBytesPerRow(img);
-    const bpp = @divTrunc(CGImageGetBitsPerPixel(img), 8);
+    const img_w = c.imageGetWidth(img);
+    const img_h = c.imageGetHeight(img);
+    const stride = c.imageGetBytesPerRow(img);
+    const bpp = @divTrunc(c.imageGetBitsPerPixel(img), 8);
     if (bpp < 3) return api.captureFail(out);
 
-    const provider = CGImageGetDataProvider(img) orelse return api.captureFail(out);
-    const cfdata = CGDataProviderCopyData(provider) orelse return api.captureFail(out);
-    defer CFRelease(cfdata);
-    const src = CFDataGetBytePtr(cfdata) orelse return api.captureFail(out);
+    const provider = c.imageGetDataProvider(img) orelse return api.captureFail(out);
+    const cfdata = c.dataProviderCopyData(provider) orelse return api.captureFail(out);
+    defer c.release(cfdata);
+    const src = c.dataGetBytePtr(cfdata) orelse return api.captureFail(out);
 
     const cw = @min(@as(usize, width), img_w);
     const ch = @min(@as(usize, height), img_h);
 
-    // CoreGraphics gives BGRA (little-endian ARGB); normalize to RGBA.
+    // CoreGraphics gives BGRA; normalize to RGBA.
     var y: usize = 0;
     while (y < ch) : (y += 1) {
         var x: usize = 0;
@@ -183,15 +244,18 @@ pub fn captureWindow(win: WindowInfo, out: []u8) Capture {
 }
 
 pub fn clickAt(screen_x: i32, screen_y: i32) bool {
+    const c = cg() orelse return false;
     const pt = CGPoint{ .x = @floatFromInt(screen_x), .y = @floatFromInt(screen_y) };
-    const down = CGEventCreateMouseEvent(null, kCGEventLeftMouseDown, pt, kCGMouseButtonLeft) orelse return false;
-    defer CFRelease(down);
-    const up = CGEventCreateMouseEvent(null, kCGEventLeftMouseUp, pt, kCGMouseButtonLeft) orelse return false;
-    defer CFRelease(up);
-    CGEventPost(kCGHIDEventTap, down);
-    CGEventPost(kCGHIDEventTap, up);
+    const down = c.eventCreateMouse(null, kCGEventLeftMouseDown, pt, kCGMouseButtonLeft) orelse return false;
+    defer c.release(down);
+    const up = c.eventCreateMouse(null, kCGEventLeftMouseUp, pt, kCGMouseButtonLeft) orelse return false;
+    defer c.release(up);
+    c.eventPost(kCGHIDEventTap, down);
+    c.eventPost(kCGHIDEventTap, up);
     return true;
 }
+
+extern "c" fn usleep(u32) callconv(.c) c_int;
 
 pub fn sleepMs(ms: u32) void {
     _ = usleep(ms * 1000);
