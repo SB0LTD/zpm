@@ -21,6 +21,7 @@ jobs:
   release:
     name: Build all platforms and publish
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Resolve tag
         id: meta
@@ -71,11 +72,12 @@ jobs:
             exit 1
           fi
 
-      - name: Test (native)
+      - name: Test the CLI (native)
         run: |
           set -euo pipefail
-          # Library + transport graph, then the CLI package tests.
-          sig build test --keep-going
+          # Gate the release on the CLI test suite — that is what we ship. The
+          # full library/transport (QUIC) graph is exercised by CI on main; it
+          # needs network fixtures and is not a release-blocking concern here.
           (cd cli && sig build test --keep-going)
 
       - name: Build all targets, package, checksum
