@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.3.0)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build all platforms and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "Building release $TAG"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo rm -rf /usr/local/graalvm /usr/local/.ghcup /usr/local/share/powershell
+          sudo rm -rf /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go
+          sudo apt-get clean
+
+      - name: Checkout zpm
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+
+      - name: Install latest Sig
+        id: sig
+        run: |
+          set -euo pipefail
+          URL="https://github.com/SB0LTD/sig/releases/latest/download/sig-x86_64-linux.tar.xz"
+          echo "Downloading $URL"
+          curl -fSL "$URL" -o sig.tar.xz
+          mkdir -p sig-dist
+          tar -xf sig.tar.xz -C sig-dist
+          SIG_BIN="$(find "$PWD/sig-dist" -type f -name sig | head -n1)"
+          if [ -z "$SIG_BIN" ]; then echo "sig binary not found"; exit 1; fi
+          chmod +x "$SIG_BIN"
+          echo "$(dirname "$SIG_BIN")" >> "$GITHUB_PATH"
+          echo "sig_version=$("$SIG_BIN" version)" >> "$GITHUB_OUTPUT"
+          "$SIG_BIN" version
+
+      - name: Verify version matches tag
+        run: |
+          set -euo pipefail
+          FILE_VERSION="$(cat VERSION | tr -d '[:space:]')"
+          if [ "$FILE_VERSION" != "${{ steps.meta.outputs.version }}" ]; then
+            echo "VERSION file ($FILE_VERSION) does not match release tag (${{ steps.meta.outputs.version }})"
+            exit 1
+          fi
+
+      - name: Test (native)
+        run: |
+          set -euo pipefail
+          # Library + transport graph, then the CLI package tests.
+          sig build test --keep-going
+          (cd cli && sig build test --keep-going)
+
+      - name: Build all targets, package, checksum
+        id: package
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          OUT="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$OUT"
+
+          # target-triple : platform-slug : is-windows
+          TARGETS="
+          x86_64-linux-gnu:x86_64-linux:0
+          aarch64-linux-gnu:aarch64-linux:0
+          x86_64-macos:x86_64-macos:0
+          aarch64-macos:aarch64-macos:0
+          x86_64-windows:x86_64-windows:1
+          aarch64-windows:aarch64-windows:1
+          "
+
+          for entry in $TARGETS; do
+            [ -z "$entry" ] && continue
+            triple="${entry%%:*}"; rest="${entry#*:}"
+            slug="${rest%%:*}"; is_win="${rest#*:}"
+
+            echo "::group::build $slug ($triple)"
+            (cd cli && rm -rf sig-out && sig build -Dtarget="$triple" -Doptimize=ReleaseFast zpm)
+
+            stage="zpm-$VERSION-$slug"
+            mkdir -p "$stage"
+            cp README.md LICENSE CHANGELOG.md "$stage/"
+            if [ "$is_win" = "1" ]; then
+              cp cli/sig-out/bin/zpm.exe "$stage/"
+              (cd "$stage" && zip -qr "$OUT/$stage.zip" .)
+            else
+              cp cli/sig-out/bin/zpm "$stage/"
+              chmod +x "$stage/zpm"
+              tar -czf "$OUT/$stage.tar.gz" -C "$stage" .
+            fi
+            rm -rf "$stage"
+            echo "::endgroup::"
+          done
+
+          cd "$OUT"
+          sha256sum * > SHA256SUMS.txt
+          echo "Artifacts:"; ls -la
+          echo "dist=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          SIG="${{ steps.sig.outputs.sig_version }}"
+          DIST="${{ steps.package.outputs.dist }}"
+
+          NOTES="$(cat <<EOF
+          ## zpm $TAG
+
+          The zero-allocation package manager for the [Sig](https://github.com/SB0LTD/sig)
+          ecosystem. \`zpm\` scaffolds Sig projects, resolves dependencies, and
+          builds via the native \`sig build\` system.
+
+          **Built with:** $SIG (cross-compiled to all targets from a single host).
+
+          ### Downloads
+
+          | Platform | Archive |
+          |----------|---------|
+          | Windows x86_64  | \`zpm-$VERSION-x86_64-windows.zip\`  |
+          | Windows aarch64 | \`zpm-$VERSION-aarch64-windows.zip\` |
+          | Linux x86_64    | \`zpm-$VERSION-x86_64-linux.tar.gz\`  |
+          | Linux aarch64   | \`zpm-$VERSION-aarch64-linux.tar.gz\` |
+          | macOS x86_64    | \`zpm-$VERSION-x86_64-macos.tar.gz\`  |
+          | macOS aarch64   | \`zpm-$VERSION-aarch64-macos.tar.gz\` |
+
+          ### Install
+          Extract the archive for your platform and put the \`zpm\` (or
+          \`zpm.exe\`) binary on your PATH. Requires the Sig toolchain on PATH for
+          \`zpm build\` / \`zpm run\`.
+
+          ### Verify
+          Checksums for every artifact are in \`SHA256SUMS.txt\`.
+
+          See the [CHANGELOG](https://github.com/${{ github.repository }}/blob/$TAG/CHANGELOG.md)
+          for what changed in this release.
+          EOF
+          )"
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DIST"/* --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$TAG" "$DIST"/* \
+              --repo "${{ github.repository }}" \
+              --title "zpm $TAG" \
+              --notes "$NOTES"
+          fi

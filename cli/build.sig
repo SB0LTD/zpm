@@ -6,6 +6,16 @@ fn noopStep(ctx: *sig_build.Step_Context) sig_build.SigError!void {
     _ = ctx;
 }
 
+fn targetOsIsWindows(t: *const sig_build.Target_Triple) bool {
+    const os = t.os[0..t.os_len];
+    const w = "windows";
+    if (os.len < w.len) return false;
+    for (w, 0..) |c, i| {
+        if (os[i] != c) return false;
+    }
+    return true;
+}
+
 fn importEntry(name: []const u8, path: []const u8) sig_build.Import_Entry {
     var entry: sig_build.Import_Entry = .{};
     @memcpy(entry.name[0..name.len], name);
@@ -46,7 +56,14 @@ fn addPkgTest(
 }
 
 pub fn build(ctx: *sig_build.Build_Context) !void {
-    const win32_path = if (builtin.os.tag == .windows)
+    // Select the platform backend by the *target* OS when cross-compiling
+    // (-Dtarget=...), else by the host OS. The win32 module is Windows-only;
+    // every other OS uses the POSIX/linux platform shim.
+    const use_windows = if (ctx.target.arch_len > 0)
+        targetOsIsWindows(&ctx.target)
+    else
+        builtin.os.tag == .windows;
+    const win32_path = if (use_windows)
         "../src/platform/win32.sig"
     else
         "../src/transport/linux_platform.sig";
@@ -93,7 +110,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         .output_name = "zpm",
         .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
         .optimize = ctx.optimize,
-        .target = null,
+        .target = if (ctx.target.arch_len > 0) &ctx.target else null,
         .imports = &.{
             importEntry("conn", "../src/transport/conn.sig"),
             importEntry("appmap", "../src/transport/appmap.sig"),
