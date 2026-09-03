@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.0 — 2026-09-04
+
+### Changed
+
+- **Starter templates modernized to native Sig.** `zpm init` now generates
+  `build.sig` files using the allocator-free `sig_build` API
+  (`pub fn build(ctx: *sig_build.Build_Context) !void`) instead of the legacy
+  `std.Build` API. Generated `src/main.sig` uses the current
+  `main(init: std.process.Init) !void` form with `std.Io` (no allocators,
+  no `std.debug.print`).
+- **`build.sig.zon` schema updated.** Templates drop `minimum_zig_version` in
+  favor of `.fingerprint`. Projects that depend on zpm declare it as a fetched
+  GitHub tarball dependency (`.url` + `.hash`) resolved by the Sig toolchain.
+- Generated projects wire zpm modules through the new
+  `ctx.getDependency("zpm").modulePath(...)` bridge — no hardcoded paths and no
+  vendored source tree.
+- `zpm run` / `zpm build` now report and delegate to `sig build` (was
+  `zig build`). README and docs updated to the Sig-native, GitHub-source model.
+
+### Notes
+
+- The hosted registry (`registry.zpm.dev`) is planned but not yet deployed;
+  packages are distributed from `github.com/SB0LTD/zpm`. `install`/`search`/
+  `publish` target the registry and require `--registry` until it is live.
+
 ## 0.2.1 — 2026-09-01
 
 ### Added

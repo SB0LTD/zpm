@@ -35,12 +35,19 @@ zpm --version
 zpm init --template cli-app --name my-app
 cd my-app
 
-# Install packages
-zpm i @zpm/core @zpm/json
-
-# Build and run
+# Build and run. `sig build` reads build.sig.zon, fetches the declared zpm
+# dependency (a pinned github.com/SB0LTD/zpm tarball) into the Sig global
+# cache, verifies its SHA-256, and wires its modules — no separate install
+# step required for the scaffolded dependency.
 zpm run
 ```
+
+> Package source: zpm modules are distributed as the
+> [github.com/SB0LTD/zpm](https://github.com/SB0LTD/zpm) source tree. Scaffolded
+> projects pin it as a `build.sig.zon` dependency (`.url` + `.hash`) that the
+> Sig toolchain fetches and verifies on build. A hosted package registry
+> (`registry.zpm.dev`) is planned but not yet deployed; the `install`/`search`/
+> `publish` commands target it and require `--registry` until then.
 
 ---
 
@@ -57,8 +64,8 @@ zpm run
 | `zpm validate` | `val` | Validate `zpm.pkg.zon` before publishing |
 | `zpm update [pkg...]` | `up` | Update packages to latest versions |
 | `zpm doctor` | | Check environment health |
-| `zpm run [args...]` | | Build and run via `zig build run` |
-| `zpm build [args...]` | | Build via `zig build` |
+| `zpm run [args...]` | | Build and run via `sig build run` |
+| `zpm build [args...]` | | Build via `sig build` |
 
 ### Global Flags
 
@@ -80,11 +87,11 @@ zpm run
 
 | Template | Description |
 |----------|-------------|
-| `empty` | Minimal Zig project (default) |
+| `empty` | Minimal Sig project (default) |
 | `cli-app` | Cross-platform CLI with argument parsing |
-| `web-server` | Zig HTTP server project |
+| `web-server` | Sig HTTP server project |
 | `gui-app` | Platform-abstracted window + GL rendering |
-| `library` | Reusable Zig module with `src/root.zig` and tests |
+| `library` | Reusable Sig module with `src/root.sig` and tests |
 | `package` | Library + `zpm.pkg.zon` manifest for publishing |
 | `window` | Native window creation with OpenGL context |
 | `gl-app` | OpenGL application with render loop |
@@ -232,16 +239,16 @@ The SDK contract version is `1.0.0`.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, code style, and PR process.
 
 ```bash
-# Build from source
+# Build from source (requires the Sig compiler on PATH)
 cd zpm/cli
-zig build
+sig build
 
 # Run all tests
-zig build test --summary all
+sig build test --summary all
 
 # Run root-level tests (transport, core, platform)
 cd zpm
-zig build test --summary all
+sig build test --summary all
 ```
 
 ---

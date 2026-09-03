@@ -13,7 +13,7 @@ const streams_mod = @import("streams");
 const datagram_mod = @import("datagram");
 const telemetry_mod = @import("telemetry");
 
-const VERSION = "0.2.1";
+const VERSION = "0.3.0";
 const DEFAULT_REGISTRY = "https://registry.zpm.dev";
 
 // ── PAL-backed vtable callbacks ──

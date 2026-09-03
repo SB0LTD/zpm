@@ -606,36 +606,38 @@ pub fn update(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandRe
 }
 
 // ── Run Command ──
-// Ensures Zig is available via bootstrapper, then delegates to `zig build run`.
+// Ensures the Sig toolchain is available via bootstrapper, then delegates to
+// `sig build run`.
 // Requirements: 18.1
 
 pub fn runCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) CommandResult {
     if (ctx.bootstrapper) |b| {
         const br = b.ensureZig();
         if (br == .failed or br == .offline_no_zig) {
-            ctx.stderr("run: zig is not available\n");
+            ctx.stderr("run: the Sig toolchain is not available\n");
             return .file_error;
         }
     }
-    // Report that zig build run would be executed with passthrough args
-    ctx.stdout("executing zig build run\n");
+    // Report that `sig build run` would be executed with passthrough args.
+    ctx.stdout("executing sig build run\n");
     return .success;
 }
 
 // ── Build Command ──
-// Ensures Zig is available via bootstrapper, then delegates to `zig build`.
+// Ensures the Sig toolchain is available via bootstrapper, then delegates to
+// `sig build`.
 // Requirements: 18.2
 
 pub fn buildCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) CommandResult {
     if (ctx.bootstrapper) |b| {
         const br = b.ensureZig();
         if (br == .failed or br == .offline_no_zig) {
-            ctx.stderr("build: zig is not available\n");
+            ctx.stderr("build: the Sig toolchain is not available\n");
             return .file_error;
         }
     }
-    // Report that zig build would be executed with passthrough args
-    ctx.stdout("executing zig build\n");
+    // Report that `sig build` would be executed with passthrough args.
+    ctx.stdout("executing sig build\n");
     return .success;
 }
 
@@ -647,7 +649,7 @@ pub fn doctorCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) CommandRe
     var all_passed = true;
 
     // Check 1: zpm CLI version (hardcoded)
-    ctx.stdout("\xe2\x9c\x93 zpm v0.2.1\n");
+    ctx.stdout("\xe2\x9c\x93 zpm v0.3.0\n");
 
     // Check 2: Zig installation via bootstrapper
     if (ctx.bootstrapper) |b| {
@@ -1661,7 +1663,7 @@ test "runCmd: succeeds when bootstrapper confirms zig installed" {
 
     const result = runCmd(&ctx, &args);
     try testing.expectEqual(CommandResult.success, result);
-    try testing.expect(std.mem.indexOf(u8, getStdout(), "executing zig build run") != null);
+    try testing.expect(std.mem.indexOf(u8, getStdout(), "executing sig build run") != null);
 }
 
 test "runCmd: fails when zig not available offline" {
@@ -1685,7 +1687,7 @@ test "runCmd: fails when zig not available offline" {
 
     const result = runCmd(&ctx, &args);
     try testing.expectEqual(CommandResult.file_error, result);
-    try testing.expect(std.mem.indexOf(u8, getStderr(), "zig is not available") != null);
+    try testing.expect(std.mem.indexOf(u8, getStderr(), "the Sig toolchain is not available") != null);
 }
 
 test "runCmd: succeeds without bootstrapper" {
@@ -1700,7 +1702,7 @@ test "runCmd: succeeds without bootstrapper" {
 
     const result = runCmd(&ctx, &args);
     try testing.expectEqual(CommandResult.success, result);
-    try testing.expect(std.mem.indexOf(u8, getStdout(), "executing zig build run") != null);
+    try testing.expect(std.mem.indexOf(u8, getStdout(), "executing sig build run") != null);
 }
 
 test "runCmd: fails when outdated zig without auto_update" {
@@ -1749,7 +1751,7 @@ test "buildCmd: succeeds when bootstrapper confirms zig installed" {
 
     const result = buildCmd(&ctx, &args);
     try testing.expectEqual(CommandResult.success, result);
-    try testing.expect(std.mem.indexOf(u8, getStdout(), "executing zig build") != null);
+    try testing.expect(std.mem.indexOf(u8, getStdout(), "executing sig build") != null);
 }
 
 test "buildCmd: fails when zig not available offline" {
@@ -1773,7 +1775,7 @@ test "buildCmd: fails when zig not available offline" {
 
     const result = buildCmd(&ctx, &args);
     try testing.expectEqual(CommandResult.file_error, result);
-    try testing.expect(std.mem.indexOf(u8, getStderr(), "zig is not available") != null);
+    try testing.expect(std.mem.indexOf(u8, getStderr(), "the Sig toolchain is not available") != null);
 }
 
 test "buildCmd: succeeds without bootstrapper" {
@@ -1788,7 +1790,7 @@ test "buildCmd: succeeds without bootstrapper" {
 
     const result = buildCmd(&ctx, &args);
     try testing.expectEqual(CommandResult.success, result);
-    try testing.expect(std.mem.indexOf(u8, getStdout(), "executing zig build") != null);
+    try testing.expect(std.mem.indexOf(u8, getStdout(), "executing sig build") != null);
 }
 
 // ── Init Command Mock Infrastructure ──
@@ -2105,7 +2107,7 @@ test "doctorCmd: all checks pass with healthy environment" {
     const result = doctorCmd(&ctx, &args);
     try testing.expectEqual(CommandResult.success, result);
     const out = getStdout();
-    try testing.expect(std.mem.indexOf(u8, out, "zpm v0.2.1") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "zpm v0.3.0") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Zig installed") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Registry reachable") != null);
     try testing.expect(std.mem.indexOf(u8, out, "build.sig.zon found") != null);
@@ -2144,7 +2146,7 @@ test "doctorCmd: reports failures but runs all checks" {
     try testing.expect(std.mem.indexOf(u8, err_out, "build.sig.zon not found") != null);
     try testing.expect(std.mem.indexOf(u8, err_out, "build.sig not found") != null);
     // zpm version should still be in stdout
-    try testing.expect(std.mem.indexOf(u8, getStdout(), "zpm v0.2.1") != null);
+    try testing.expect(std.mem.indexOf(u8, getStdout(), "zpm v0.3.0") != null);
 }
 
 test "doctorCmd: works without bootstrapper" {

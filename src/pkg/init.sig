@@ -115,7 +115,7 @@ pub fn scaffold(vtable: *const InitVtable, config: *const InitConfig) InitResult
 
     // Step 3: Generate build.sig.zon
     var zon_buf: [4096]u8 = undefined;
-    const zon_content = generateBuildZigZon(project, tmpl, &zon_buf) orelse {
+    const zon_content = generateBuildSigZon(project, tmpl, &zon_buf) orelse {
         cleanup(vtable, project);
         return .failed;
     };
@@ -126,7 +126,7 @@ pub fn scaffold(vtable: *const InitVtable, config: *const InitConfig) InitResult
 
     // Step 4: Generate build.sig
     var build_buf: [8192]u8 = undefined;
-    const build_content = generateBuildZig(project, tmpl, &build_buf) orelse {
+    const build_content = generateBuildSig(project, tmpl, &build_buf) orelse {
         cleanup(vtable, project);
         return .failed;
     };
@@ -148,7 +148,7 @@ pub fn scaffold(vtable: *const InitVtable, config: *const InitConfig) InitResult
 
     var main_buf: [4096]u8 = undefined;
     const src_filename = if (tmpl == .package or tmpl == .library or tmpl == .browser) "src/root.sig" else "src/main.sig";
-    const main_content = generateMainZig(project, tmpl, &main_buf) orelse {
+    const main_content = generateMainSig(project, tmpl, &main_buf) orelse {
         cleanup(vtable, project);
         return .failed;
     };
@@ -257,27 +257,27 @@ fn replacePlaceholder(template: []const u8, project_name: []const u8, buf: []u8)
 
 // ── build.sig.zon Generator ──
 
-fn generateBuildZigZon(project_name: []const u8, tmpl: Template, buf: *[4096]u8) ?[]const u8 {
+fn generateBuildSigZon(project_name: []const u8, tmpl: Template, buf: *[4096]u8) ?[]const u8 {
     const template_str = switch (tmpl) {
-        .empty => build_zig_zon_empty,
-        .window => build_zig_zon_window,
-        .gl_app => build_zig_zon_gl_app,
-        .trading => build_zig_zon_trading,
-        .package => build_zig_zon_package,
-        .cli_app => build_zig_zon_cli_app,
-        .web_server => build_zig_zon_web_server,
-        .gui_app => build_zig_zon_gui_app,
-        .library => build_zig_zon_library,
-        .browser => build_zig_zon_browser,
+        .empty => build_sig_zon_empty,
+        .window => build_sig_zon_window,
+        .gl_app => build_sig_zon_gl_app,
+        .trading => build_sig_zon_trading,
+        .package => build_sig_zon_package,
+        .cli_app => build_sig_zon_cli_app,
+        .web_server => build_sig_zon_web_server,
+        .gui_app => build_sig_zon_gui_app,
+        .library => build_sig_zon_library,
+        .browser => build_sig_zon_browser,
     };
     return replacePlaceholder(template_str, project_name, buf);
 }
 
-const build_zig_zon_empty =
+const build_sig_zon_empty =
     \\.{
     \\    .name = .@"{{project_name}}",
     \\    .version = "0.1.0",
-    \\    .minimum_zig_version = "0.16.0",
+    \\    .fingerprint = 0x0,
     \\    .dependencies = .{},
     \\    .paths = .{
     \\        "build.sig",
@@ -288,27 +288,17 @@ const build_zig_zon_empty =
     \\
 ;
 
-const build_zig_zon_window =
+const build_sig_zon_window =
     \\.{
     \\    .name = .@"{{project_name}}",
     \\    .version = "0.1.0",
-    \\    .minimum_zig_version = "0.16.0",
+    \\    .fingerprint = 0x0,
     \\    .dependencies = .{
-    \\        .@"zpm-core" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/core/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-win32" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/win32/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-gl" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/gl/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-window" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/window/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
+    \\        // zpm is a fetched GitHub tarball dependency (see build.sig.zon). Its modules
+    \\        // (core, win32, gl, window, ...) are wired in build.sig.
+    \\        .zpm = .{
+    \\            .url = "https://github.com/SB0LTD/zpm/archive/53051b75873fae047a1bd2394ced12c81afe873f.tar.gz",
+    \\            .hash = "845e4ac2adf11cf9b05dc6e2a1c98804023746be6497a181c5910b75c4af4c5a",
     \\        },
     \\    },
     \\    .paths = .{
@@ -320,43 +310,18 @@ const build_zig_zon_window =
     \\
 ;
 
-const build_zig_zon_gl_app =
+const build_sig_zon_gl_app =
     \\.{
     \\    .name = .@"{{project_name}}",
     \\    .version = "0.1.0",
-    \\    .minimum_zig_version = "0.16.0",
+    \\    .fingerprint = 0x0,
     \\    .dependencies = .{
-    \\        .@"zpm-core" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/core/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-win32" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/win32/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-gl" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/gl/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-window" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/window/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-color" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/color/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-primitives" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/primitives/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-timer" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/timer/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-input" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/input/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
+    \\        // zpm is a fetched GitHub tarball dependency (see build.sig.zon). Its modules
+    \\        // (core, win32, gl, window, color, primitives, timer, input)
+    \\        // are wired in build.sig.
+    \\        .zpm = .{
+    \\            .url = "https://github.com/SB0LTD/zpm/archive/53051b75873fae047a1bd2394ced12c81afe873f.tar.gz",
+    \\            .hash = "845e4ac2adf11cf9b05dc6e2a1c98804023746be6497a181c5910b75c4af4c5a",
     \\        },
     \\    },
     \\    .paths = .{
@@ -368,51 +333,18 @@ const build_zig_zon_gl_app =
     \\
 ;
 
-const build_zig_zon_trading =
+const build_sig_zon_trading =
     \\.{
     \\    .name = .@"{{project_name}}",
     \\    .version = "0.1.0",
-    \\    .minimum_zig_version = "0.16.0",
+    \\    .fingerprint = 0x0,
     \\    .dependencies = .{
-    \\        .@"zpm-core" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/core/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-win32" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/win32/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-gl" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/gl/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-window" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/window/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-color" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/color/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-primitives" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/primitives/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-text" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/text/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-timer" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/timer/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-input" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/input/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-http" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/http/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
+    \\        // zpm is a fetched GitHub tarball dependency (see build.sig.zon). Its modules
+    \\        // (core, win32, gl, window, color, primitives, text, timer,
+    \\        // input, http) are wired in build.sig.
+    \\        .zpm = .{
+    \\            .url = "https://github.com/SB0LTD/zpm/archive/53051b75873fae047a1bd2394ced12c81afe873f.tar.gz",
+    \\            .hash = "845e4ac2adf11cf9b05dc6e2a1c98804023746be6497a181c5910b75c4af4c5a",
     \\        },
     \\    },
     \\    .paths = .{
@@ -424,11 +356,11 @@ const build_zig_zon_trading =
     \\
 ;
 
-const build_zig_zon_package =
+const build_sig_zon_package =
     \\.{
     \\    .name = .@"{{project_name}}",
     \\    .version = "0.1.0",
-    \\    .minimum_zig_version = "0.16.0",
+    \\    .fingerprint = 0x0,
     \\    .dependencies = .{},
     \\    .paths = .{
     \\        "build.sig",
@@ -439,15 +371,17 @@ const build_zig_zon_package =
     \\
 ;
 
-const build_zig_zon_cli_app =
+const build_sig_zon_cli_app =
     \\.{
     \\    .name = .@"{{project_name}}",
     \\    .version = "0.1.0",
-    \\    .minimum_zig_version = "0.16.0",
+    \\    .fingerprint = 0x0,
     \\    .dependencies = .{
-    \\        .@"zpm-core" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/core/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
+    \\        // zpm is a fetched GitHub tarball dependency (see build.sig.zon). Its `core` module
+    \\        // is wired in build.sig.
+    \\        .zpm = .{
+    \\            .url = "https://github.com/SB0LTD/zpm/archive/53051b75873fae047a1bd2394ced12c81afe873f.tar.gz",
+    \\            .hash = "845e4ac2adf11cf9b05dc6e2a1c98804023746be6497a181c5910b75c4af4c5a",
     \\        },
     \\    },
     \\    .paths = .{
@@ -459,19 +393,17 @@ const build_zig_zon_cli_app =
     \\
 ;
 
-const build_zig_zon_web_server =
+const build_sig_zon_web_server =
     \\.{
     \\    .name = .@"{{project_name}}",
     \\    .version = "0.1.0",
-    \\    .minimum_zig_version = "0.16.0",
+    \\    .fingerprint = 0x0,
     \\    .dependencies = .{
-    \\        .@"zpm-core" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/core/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-http" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/http/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
+    \\        // zpm is a fetched GitHub tarball dependency (see build.sig.zon). Its `core` and
+    \\        // `http` modules are wired in build.sig.
+    \\        .zpm = .{
+    \\            .url = "https://github.com/SB0LTD/zpm/archive/53051b75873fae047a1bd2394ced12c81afe873f.tar.gz",
+    \\            .hash = "845e4ac2adf11cf9b05dc6e2a1c98804023746be6497a181c5910b75c4af4c5a",
     \\        },
     \\    },
     \\    .paths = .{
@@ -483,43 +415,18 @@ const build_zig_zon_web_server =
     \\
 ;
 
-const build_zig_zon_gui_app =
+const build_sig_zon_gui_app =
     \\.{
     \\    .name = .@"{{project_name}}",
     \\    .version = "0.1.0",
-    \\    .minimum_zig_version = "0.16.0",
+    \\    .fingerprint = 0x0,
     \\    .dependencies = .{
-    \\        .@"zpm-core" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/core/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-win32" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/win32/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-gl" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/gl/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-window" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/window/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-color" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/color/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-primitives" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/primitives/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-timer" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/timer/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
-    \\        },
-    \\        .@"zpm-input" = .{
-    \\            .url = "https://registry.zpm.dev/pkg/@zpm/input/0.1.0.tar.gz",
-    \\            .hash = "1220placeholder",
+    \\        // zpm is a fetched GitHub tarball dependency (see build.sig.zon). Its modules
+    \\        // (core, win32, gl, window, color, primitives, timer, input)
+    \\        // are wired in build.sig.
+    \\        .zpm = .{
+    \\            .url = "https://github.com/SB0LTD/zpm/archive/53051b75873fae047a1bd2394ced12c81afe873f.tar.gz",
+    \\            .hash = "845e4ac2adf11cf9b05dc6e2a1c98804023746be6497a181c5910b75c4af4c5a",
     \\        },
     \\    },
     \\    .paths = .{
@@ -531,11 +438,11 @@ const build_zig_zon_gui_app =
     \\
 ;
 
-const build_zig_zon_library =
+const build_sig_zon_library =
     \\.{
     \\    .name = .@"{{project_name}}",
     \\    .version = "0.1.0",
-    \\    .minimum_zig_version = "0.16.0",
+    \\    .fingerprint = 0x0,
     \\    .dependencies = .{},
     \\    .paths = .{
     \\        "build.sig",
@@ -546,11 +453,11 @@ const build_zig_zon_library =
     \\
 ;
 
-const build_zig_zon_browser =
+const build_sig_zon_browser =
     \\.{
     \\    .name = .@"{{project_name}}",
     \\    .version = "0.1.0",
-    \\    .minimum_zig_version = "0.16.0",
+    \\    .fingerprint = 0x0,
     \\    .dependencies = .{},
     \\    .paths = .{
     \\        "build.sig",
@@ -565,401 +472,648 @@ const build_zig_zon_browser =
 
 // ── build.sig Generator ──
 
-fn generateBuildZig(project_name: []const u8, tmpl: Template, buf: *[8192]u8) ?[]const u8 {
+fn generateBuildSig(project_name: []const u8, tmpl: Template, buf: *[8192]u8) ?[]const u8 {
     const template_str = switch (tmpl) {
-        .empty => build_zig_empty,
-        .window => build_zig_window,
-        .gl_app => build_zig_gl_app,
-        .trading => build_zig_trading,
-        .package => build_zig_package,
-        .cli_app => build_zig_cli_app,
-        .web_server => build_zig_web_server,
-        .gui_app => build_zig_gui_app,
-        .library => build_zig_library,
+        .empty => build_sig_empty,
+        .window => build_sig_window,
+        .gl_app => build_sig_gl_app,
+        .trading => build_sig_trading,
+        .package => build_sig_package,
+        .cli_app => build_sig_cli_app,
+        .web_server => build_sig_web_server,
+        .gui_app => build_sig_gui_app,
+        .library => build_sig_library,
         .browser => build_sig_browser,
     };
     return replacePlaceholder(template_str, project_name, buf);
 }
 
-const build_zig_empty =
-    \\const std = @import("std");
+const build_sig_empty =
+    \\// Native, allocator-free Sig build graph.
+    \\const sig_build = @import("sig_build");
     \\
-    \\pub fn build(b: *std.Build) void {
-    \\    const target = b.standardTargetOptions(.{});
-    \\    const optimize = b.standardOptimizeOption(.{});
-    \\
-    \\    const exe = b.addExecutable(.{
-    \\        .name = "{{project_name}}",
-    \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.sig"),
-    \\            .target = target,
-    \\            .optimize = optimize,
-    \\        }),
+    \\pub fn build(ctx: *sig_build.Build_Context) !void {
+    \\    _ = try ctx.addCompileStep(.{
+    \\        .source_path = "src/main.sig",
+    \\        .output_name = "{{project_name}}",
+    \\        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+    \\        .optimize = ctx.optimize,
+    \\        .target = if (ctx.target.arch_len > 0) &ctx.target else null,
+    \\        .imports = &.{},
+    \\        .compiler_path = "",
     \\    });
-    \\
-    \\    b.installArtifact(exe);
-    \\
-    \\    const run_cmd = b.addRunArtifact(exe);
-    \\    run_cmd.step.dependOn(b.getInstallStep());
-    \\    const run_step = b.step("run", "Run the application");
-    \\    run_step.dependOn(&run_cmd.step);
     \\}
     \\
 ;
 
-const build_zig_window =
-    \\const std = @import("std");
+const build_sig_window =
+    \\// Native, allocator-free Sig build graph.
+    \\//
+    \\// The zpm dependency is declared in build.sig.zon and fetched into the Sig
+    \\// global cache by `sig build`. ctx.getDependency("zpm").modulePath() yields
+    \\// absolute paths into the fetched package.
+    \\const sig_build = @import("sig_build");
+    \\const builtin = @import("builtin");
     \\
-    \\pub fn build(b: *std.Build) void {
-    \\    const target = b.standardTargetOptions(.{});
-    \\    const optimize = b.standardOptimizeOption(.{});
+    \\fn importEntry(name: []const u8, path: []const u8) sig_build.Import_Entry {
+    \\    var entry: sig_build.Import_Entry = .{};
+    \\    @memcpy(entry.name[0..name.len], name);
+    \\    entry.name_len = name.len;
+    \\    @memcpy(entry.path[0..path.len], path);
+    \\    entry.path_len = path.len;
+    \\    return entry;
+    \\}
     \\
-    \\    // Zpm dependencies (auto-generated by zpm init)
-    \\    const core_dep = b.dependency("zpm-core", .{ .target = target, .optimize = optimize });
-    \\    const win32_dep = b.dependency("zpm-win32", .{ .target = target, .optimize = optimize });
-    \\    const gl_dep = b.dependency("zpm-gl", .{ .target = target, .optimize = optimize });
-    \\    const window_dep = b.dependency("zpm-window", .{ .target = target, .optimize = optimize });
+    \\pub fn build(ctx: *sig_build.Build_Context) !void {
+    \\    const zpm = ctx.getDependency("zpm") orelse {
+    \\        sig_build.printMsg(ctx.io_ctx, "run `zpm install` (or `sig build`) to fetch the zpm dependency", .{});
+    \\        return error.BufferTooSmall;
+    \\    };
+    \\    const win32_rel = if (builtin.os.tag == .windows)
+    \\        "src/platform/win32.sig"
+    \\    else
+    \\        "src/transport/linux_platform.sig";
     \\
-    \\    const exe = b.addExecutable(.{
-    \\        .name = "{{project_name}}",
-    \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.sig"),
-    \\            .target = target,
-    \\            .optimize = optimize,
-    \\        }),
+    \\    var core_buf: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    \\    var win32_buf: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    \\    var gl_buf: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    \\    var window_buf: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    \\    const core = try zpm.modulePath("src/core/root.sig", &core_buf);
+    \\    const win32 = try zpm.modulePath(win32_rel, &win32_buf);
+    \\    const gl = try zpm.modulePath("src/platform/gl.sig", &gl_buf);
+    \\    const window = try zpm.modulePath("src/platform/window.sig", &window_buf);
+    \\
+    \\    // Register the zpm modules this project imports, wiring their own
+    \\    // cross-module dependencies so the closure resolves.
+    \\    _ = try ctx.addModule("core", core);
+    \\    _ = try ctx.addModule("win32", win32);
+    \\    _ = try ctx.addModule("gl", gl);
+    \\    const window_mod = try ctx.addModule("window", window);
+    \\    try ctx.addImport(window_mod, "win32", win32);
+    \\    try ctx.addImport(window_mod, "gl", gl);
+    \\
+    \\    _ = try ctx.addCompileStep(.{
+    \\        .source_path = "src/main.sig",
+    \\        .output_name = "{{project_name}}",
+    \\        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+    \\        .optimize = ctx.optimize,
+    \\        .target = if (ctx.target.arch_len > 0) &ctx.target else null,
+    \\        .imports = &.{
+    \\            importEntry("core", core),
+    \\            importEntry("win32", win32),
+    \\            importEntry("gl", gl),
+    \\            importEntry("window", window),
+    \\        },
+    \\        .compiler_path = "",
     \\    });
-    \\
-    \\    exe.root_module.addImport("core", core_dep.module("core"));
-    \\    exe.root_module.addImport("win32", win32_dep.module("win32"));
-    \\    exe.root_module.addImport("gl", gl_dep.module("gl"));
-    \\    exe.root_module.addImport("window", window_dep.module("window"));
-    \\
-    \\    b.installArtifact(exe);
-    \\
-    \\    const run_cmd = b.addRunArtifact(exe);
-    \\    run_cmd.step.dependOn(b.getInstallStep());
-    \\    const run_step = b.step("run", "Run the application");
-    \\    run_step.dependOn(&run_cmd.step);
     \\}
     \\
 ;
 
-const build_zig_gl_app =
-    \\const std = @import("std");
+const build_sig_gl_app =
+    \\// Native, allocator-free Sig build graph.
+    \\//
+    \\// The zpm dependency is declared in build.sig.zon and fetched into the Sig
+    \\// global cache by `sig build`. Module paths are resolved from the fetched
+    \\// package via ctx.getDependency("zpm").modulePath().
+    \\const sig_build = @import("sig_build");
+    \\const builtin = @import("builtin");
     \\
-    \\pub fn build(b: *std.Build) void {
-    \\    const target = b.standardTargetOptions(.{});
-    \\    const optimize = b.standardOptimizeOption(.{});
+    \\// Resolved absolute paths to the zpm modules this project uses. Filled by
+    \\// resolvePaths(); each buffer backs one module path for the whole build.
+    \\const Paths = struct {
+    \\    core: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    core_len: usize = 0,
+    \\    win32: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    win32_len: usize = 0,
+    \\    gl: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    gl_len: usize = 0,
+    \\    color: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    color_len: usize = 0,
+    \\    window: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    window_len: usize = 0,
+    \\    primitives: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    primitives_len: usize = 0,
+    \\    timer: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    timer_len: usize = 0,
+    \\    logging: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    logging_len: usize = 0,
+    \\    input: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    input_len: usize = 0,
+    \\};
+    \\var p: Paths = .{};
     \\
-    \\    // Zpm dependencies (auto-generated by zpm init)
-    \\    const core_dep = b.dependency("zpm-core", .{ .target = target, .optimize = optimize });
-    \\    const win32_dep = b.dependency("zpm-win32", .{ .target = target, .optimize = optimize });
-    \\    const gl_dep = b.dependency("zpm-gl", .{ .target = target, .optimize = optimize });
-    \\    const window_dep = b.dependency("zpm-window", .{ .target = target, .optimize = optimize });
-    \\    const color_dep = b.dependency("zpm-color", .{ .target = target, .optimize = optimize });
-    \\    const primitives_dep = b.dependency("zpm-primitives", .{ .target = target, .optimize = optimize });
-    \\    const timer_dep = b.dependency("zpm-timer", .{ .target = target, .optimize = optimize });
-    \\    const input_dep = b.dependency("zpm-input", .{ .target = target, .optimize = optimize });
+    \\fn store(dst: []u8, len: *usize, s: []const u8) []const u8 {
+    \\    @memcpy(dst[0..s.len], s);
+    \\    len.* = s.len;
+    \\    return dst[0..s.len];
+    \\}
     \\
-    \\    const exe = b.addExecutable(.{
-    \\        .name = "{{project_name}}",
-    \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.sig"),
-    \\            .target = target,
-    \\            .optimize = optimize,
-    \\        }),
+    \\fn importEntry(name: []const u8, path: []const u8) sig_build.Import_Entry {
+    \\    var entry: sig_build.Import_Entry = .{};
+    \\    @memcpy(entry.name[0..name.len], name);
+    \\    entry.name_len = name.len;
+    \\    @memcpy(entry.path[0..path.len], path);
+    \\    entry.path_len = path.len;
+    \\    return entry;
+    \\}
+    \\
+    \\pub fn build(ctx: *sig_build.Build_Context) !void {
+    \\    const zpm = ctx.getDependency("zpm") orelse {
+    \\        sig_build.printMsg(ctx.io_ctx, "run `zpm install` (or `sig build`) to fetch the zpm dependency", .{});
+    \\        return error.BufferTooSmall;
+    \\    };
+    \\    const win32_rel = if (builtin.os.tag == .windows)
+    \\        "src/platform/win32.sig"
+    \\    else
+    \\        "src/transport/linux_platform.sig";
+    \\
+    \\    var tmp: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    \\    const core = store(&p.core, &p.core_len, try zpm.modulePath("src/core/root.sig", &tmp));
+    \\    const win32 = store(&p.win32, &p.win32_len, try zpm.modulePath(win32_rel, &tmp));
+    \\    const gl = store(&p.gl, &p.gl_len, try zpm.modulePath("src/platform/gl.sig", &tmp));
+    \\    const color = store(&p.color, &p.color_len, try zpm.modulePath("src/render/color.sig", &tmp));
+    \\    const window = store(&p.window, &p.window_len, try zpm.modulePath("src/platform/window.sig", &tmp));
+    \\    const primitives = store(&p.primitives, &p.primitives_len, try zpm.modulePath("src/render/primitives.sig", &tmp));
+    \\    const timer = store(&p.timer, &p.timer_len, try zpm.modulePath("src/platform/timer.sig", &tmp));
+    \\    const logging = store(&p.logging, &p.logging_len, try zpm.modulePath("src/platform/log/run.sig", &tmp));
+    \\    const input = store(&p.input, &p.input_len, try zpm.modulePath("src/platform/input/run.sig", &tmp));
+    \\
+    \\    _ = try ctx.addModule("core", core);
+    \\    _ = try ctx.addModule("win32", win32);
+    \\    _ = try ctx.addModule("gl", gl);
+    \\    _ = try ctx.addModule("color", color);
+    \\
+    \\    const window_mod = try ctx.addModule("window", window);
+    \\    try ctx.addImport(window_mod, "win32", win32);
+    \\    try ctx.addImport(window_mod, "gl", gl);
+    \\
+    \\    const primitives_mod = try ctx.addModule("primitives", primitives);
+    \\    try ctx.addImport(primitives_mod, "gl", gl);
+    \\    try ctx.addImport(primitives_mod, "color", color);
+    \\
+    \\    const timer_mod = try ctx.addModule("timer", timer);
+    \\    try ctx.addImport(timer_mod, "win32", win32);
+    \\
+    \\    const logging_mod = try ctx.addModule("logging", logging);
+    \\    try ctx.addImport(logging_mod, "win32", win32);
+    \\    try ctx.addImport(logging_mod, "core", core);
+    \\
+    \\    const input_mod = try ctx.addModule("input", input);
+    \\    try ctx.addImport(input_mod, "win32", win32);
+    \\    try ctx.addImport(input_mod, "gl", gl);
+    \\    try ctx.addImport(input_mod, "logging", logging);
+    \\    try ctx.addImport(input_mod, "core", core);
+    \\
+    \\    _ = try ctx.addCompileStep(.{
+    \\        .source_path = "src/main.sig",
+    \\        .output_name = "{{project_name}}",
+    \\        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+    \\        .optimize = ctx.optimize,
+    \\        .target = if (ctx.target.arch_len > 0) &ctx.target else null,
+    \\        .imports = &.{
+    \\            importEntry("core", core),
+    \\            importEntry("win32", win32),
+    \\            importEntry("gl", gl),
+    \\            importEntry("window", window),
+    \\            importEntry("color", color),
+    \\            importEntry("primitives", primitives),
+    \\            importEntry("timer", timer),
+    \\            importEntry("input", input),
+    \\        },
+    \\        .compiler_path = "",
     \\    });
-    \\
-    \\    exe.root_module.addImport("core", core_dep.module("core"));
-    \\    exe.root_module.addImport("win32", win32_dep.module("win32"));
-    \\    exe.root_module.addImport("gl", gl_dep.module("gl"));
-    \\    exe.root_module.addImport("window", window_dep.module("window"));
-    \\    exe.root_module.addImport("color", color_dep.module("color"));
-    \\    exe.root_module.addImport("primitives", primitives_dep.module("primitives"));
-    \\    exe.root_module.addImport("timer", timer_dep.module("timer"));
-    \\    exe.root_module.addImport("input", input_dep.module("input"));
-    \\
-    \\    b.installArtifact(exe);
-    \\
-    \\    const run_cmd = b.addRunArtifact(exe);
-    \\    run_cmd.step.dependOn(b.getInstallStep());
-    \\    const run_step = b.step("run", "Run the application");
-    \\    run_step.dependOn(&run_cmd.step);
     \\}
     \\
 ;
 
-const build_zig_trading =
-    \\const std = @import("std");
+const build_sig_trading =
+    \\// Native, allocator-free Sig build graph.
+    \\//
+    \\// The zpm dependency is declared in build.sig.zon and fetched into the Sig
+    \\// global cache by `sig build`. Module paths are resolved from the fetched
+    \\// package via ctx.getDependency("zpm").modulePath().
+    \\const sig_build = @import("sig_build");
+    \\const builtin = @import("builtin");
     \\
-    \\pub fn build(b: *std.Build) void {
-    \\    const target = b.standardTargetOptions(.{});
-    \\    const optimize = b.standardOptimizeOption(.{});
+    \\const Paths = struct {
+    \\    core: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    core_len: usize = 0,
+    \\    win32: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    win32_len: usize = 0,
+    \\    gl: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    gl_len: usize = 0,
+    \\    color: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    color_len: usize = 0,
+    \\    window: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    window_len: usize = 0,
+    \\    primitives: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    primitives_len: usize = 0,
+    \\    text: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    text_len: usize = 0,
+    \\    timer: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    timer_len: usize = 0,
+    \\    http: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    http_len: usize = 0,
+    \\    logging: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    logging_len: usize = 0,
+    \\    input: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    input_len: usize = 0,
+    \\};
+    \\var p: Paths = .{};
     \\
-    \\    // Zpm dependencies (auto-generated by zpm init)
-    \\    const core_dep = b.dependency("zpm-core", .{ .target = target, .optimize = optimize });
-    \\    const win32_dep = b.dependency("zpm-win32", .{ .target = target, .optimize = optimize });
-    \\    const gl_dep = b.dependency("zpm-gl", .{ .target = target, .optimize = optimize });
-    \\    const window_dep = b.dependency("zpm-window", .{ .target = target, .optimize = optimize });
-    \\    const color_dep = b.dependency("zpm-color", .{ .target = target, .optimize = optimize });
-    \\    const primitives_dep = b.dependency("zpm-primitives", .{ .target = target, .optimize = optimize });
-    \\    const text_dep = b.dependency("zpm-text", .{ .target = target, .optimize = optimize });
-    \\    const timer_dep = b.dependency("zpm-timer", .{ .target = target, .optimize = optimize });
-    \\    const input_dep = b.dependency("zpm-input", .{ .target = target, .optimize = optimize });
-    \\    const http_dep = b.dependency("zpm-http", .{ .target = target, .optimize = optimize });
+    \\fn store(dst: []u8, len: *usize, s: []const u8) []const u8 {
+    \\    @memcpy(dst[0..s.len], s);
+    \\    len.* = s.len;
+    \\    return dst[0..s.len];
+    \\}
     \\
-    \\    const exe = b.addExecutable(.{
-    \\        .name = "{{project_name}}",
-    \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.sig"),
-    \\            .target = target,
-    \\            .optimize = optimize,
-    \\        }),
+    \\fn importEntry(name: []const u8, path: []const u8) sig_build.Import_Entry {
+    \\    var entry: sig_build.Import_Entry = .{};
+    \\    @memcpy(entry.name[0..name.len], name);
+    \\    entry.name_len = name.len;
+    \\    @memcpy(entry.path[0..path.len], path);
+    \\    entry.path_len = path.len;
+    \\    return entry;
+    \\}
+    \\
+    \\pub fn build(ctx: *sig_build.Build_Context) !void {
+    \\    const zpm = ctx.getDependency("zpm") orelse {
+    \\        sig_build.printMsg(ctx.io_ctx, "run `zpm install` (or `sig build`) to fetch the zpm dependency", .{});
+    \\        return error.BufferTooSmall;
+    \\    };
+    \\    const win32_rel = if (builtin.os.tag == .windows)
+    \\        "src/platform/win32.sig"
+    \\    else
+    \\        "src/transport/linux_platform.sig";
+    \\
+    \\    var tmp: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    \\    const core = store(&p.core, &p.core_len, try zpm.modulePath("src/core/root.sig", &tmp));
+    \\    const win32 = store(&p.win32, &p.win32_len, try zpm.modulePath(win32_rel, &tmp));
+    \\    const gl = store(&p.gl, &p.gl_len, try zpm.modulePath("src/platform/gl.sig", &tmp));
+    \\    const color = store(&p.color, &p.color_len, try zpm.modulePath("src/render/color.sig", &tmp));
+    \\    const window = store(&p.window, &p.window_len, try zpm.modulePath("src/platform/window.sig", &tmp));
+    \\    const primitives = store(&p.primitives, &p.primitives_len, try zpm.modulePath("src/render/primitives.sig", &tmp));
+    \\    const text = store(&p.text, &p.text_len, try zpm.modulePath("src/render/text.sig", &tmp));
+    \\    const timer = store(&p.timer, &p.timer_len, try zpm.modulePath("src/platform/timer.sig", &tmp));
+    \\    const http = store(&p.http, &p.http_len, try zpm.modulePath("src/platform/http.sig", &tmp));
+    \\    const logging = store(&p.logging, &p.logging_len, try zpm.modulePath("src/platform/log/run.sig", &tmp));
+    \\    const input = store(&p.input, &p.input_len, try zpm.modulePath("src/platform/input/run.sig", &tmp));
+    \\
+    \\    _ = try ctx.addModule("core", core);
+    \\    _ = try ctx.addModule("win32", win32);
+    \\    _ = try ctx.addModule("gl", gl);
+    \\    _ = try ctx.addModule("color", color);
+    \\
+    \\    const window_mod = try ctx.addModule("window", window);
+    \\    try ctx.addImport(window_mod, "win32", win32);
+    \\    try ctx.addImport(window_mod, "gl", gl);
+    \\
+    \\    const primitives_mod = try ctx.addModule("primitives", primitives);
+    \\    try ctx.addImport(primitives_mod, "gl", gl);
+    \\    try ctx.addImport(primitives_mod, "color", color);
+    \\
+    \\    const text_mod = try ctx.addModule("text", text);
+    \\    try ctx.addImport(text_mod, "gl", gl);
+    \\    try ctx.addImport(text_mod, "win32", win32);
+    \\    try ctx.addImport(text_mod, "color", color);
+    \\
+    \\    const timer_mod = try ctx.addModule("timer", timer);
+    \\    try ctx.addImport(timer_mod, "win32", win32);
+    \\
+    \\    const http_mod = try ctx.addModule("http", http);
+    \\    try ctx.addImport(http_mod, "win32", win32);
+    \\
+    \\    const logging_mod = try ctx.addModule("logging", logging);
+    \\    try ctx.addImport(logging_mod, "win32", win32);
+    \\    try ctx.addImport(logging_mod, "core", core);
+    \\
+    \\    const input_mod = try ctx.addModule("input", input);
+    \\    try ctx.addImport(input_mod, "win32", win32);
+    \\    try ctx.addImport(input_mod, "gl", gl);
+    \\    try ctx.addImport(input_mod, "logging", logging);
+    \\    try ctx.addImport(input_mod, "core", core);
+    \\
+    \\    _ = try ctx.addCompileStep(.{
+    \\        .source_path = "src/main.sig",
+    \\        .output_name = "{{project_name}}",
+    \\        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+    \\        .optimize = ctx.optimize,
+    \\        .target = if (ctx.target.arch_len > 0) &ctx.target else null,
+    \\        .imports = &.{
+    \\            importEntry("core", core),
+    \\            importEntry("win32", win32),
+    \\            importEntry("gl", gl),
+    \\            importEntry("window", window),
+    \\            importEntry("color", color),
+    \\            importEntry("primitives", primitives),
+    \\            importEntry("text", text),
+    \\            importEntry("timer", timer),
+    \\            importEntry("input", input),
+    \\            importEntry("http", http),
+    \\        },
+    \\        .compiler_path = "",
     \\    });
-    \\
-    \\    exe.root_module.addImport("core", core_dep.module("core"));
-    \\    exe.root_module.addImport("win32", win32_dep.module("win32"));
-    \\    exe.root_module.addImport("gl", gl_dep.module("gl"));
-    \\    exe.root_module.addImport("window", window_dep.module("window"));
-    \\    exe.root_module.addImport("color", color_dep.module("color"));
-    \\    exe.root_module.addImport("primitives", primitives_dep.module("primitives"));
-    \\    exe.root_module.addImport("text", text_dep.module("text"));
-    \\    exe.root_module.addImport("timer", timer_dep.module("timer"));
-    \\    exe.root_module.addImport("input", input_dep.module("input"));
-    \\    exe.root_module.addImport("http", http_dep.module("http"));
-    \\
-    \\    b.installArtifact(exe);
-    \\
-    \\    const run_cmd = b.addRunArtifact(exe);
-    \\    run_cmd.step.dependOn(b.getInstallStep());
-    \\    const run_step = b.step("run", "Run the application");
-    \\    run_step.dependOn(&run_cmd.step);
     \\}
     \\
 ;
 
-const build_zig_package =
-    \\const std = @import("std");
+const build_sig_package =
+    \\// Native, allocator-free Sig build graph.
+    \\const sig_build = @import("sig_build");
     \\
-    \\pub fn build(b: *std.Build) void {
-    \\    const target = b.standardTargetOptions(.{});
-    \\    const optimize = b.standardOptimizeOption(.{});
+    \\pub fn build(ctx: *sig_build.Build_Context) !void {
+    \\    // Expose this package's root module for consumers.
+    \\    _ = try ctx.addModule("{{project_name}}", "src/root.sig");
     \\
-    \\    _ = b.addModule("{{project_name}}", .{
-    \\        .root_source_file = b.path("src/root.sig"),
-    \\        .target = target,
-    \\        .optimize = optimize,
+    \\    // `sig build test` compiles and runs the package's unit tests.
+    \\    _ = try ctx.addTestStep(.{
+    \\        .name = "test",
+    \\        .source_path = "src/root.sig",
+    \\        .imports = &.{},
     \\    });
-    \\
-    \\    const tests = b.addTest(.{
-    \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/root.sig"),
-    \\            .target = target,
-    \\            .optimize = optimize,
-    \\        }),
-    \\    });
-    \\
-    \\    const test_step = b.step("test", "Run unit tests");
-    \\    test_step.dependOn(&b.addRunArtifact(tests).step);
     \\}
     \\
 ;
 
-const build_zig_cli_app =
-    \\const std = @import("std");
+const build_sig_cli_app =
+    \\// Native, allocator-free Sig build graph.
+    \\//
+    \\// The zpm dependency is declared in build.sig.zon and fetched into the Sig
+    \\// global cache by `sig build`. ctx.getDependency("zpm") returns a handle
+    \\// whose modulePath() yields absolute paths into the fetched package.
+    \\const sig_build = @import("sig_build");
     \\
-    \\pub fn build(b: *std.Build) void {
-    \\    const target = b.standardTargetOptions(.{});
-    \\    const optimize = b.standardOptimizeOption(.{});
+    \\fn importEntry(name: []const u8, path: []const u8) sig_build.Import_Entry {
+    \\    var entry: sig_build.Import_Entry = .{};
+    \\    @memcpy(entry.name[0..name.len], name);
+    \\    entry.name_len = name.len;
+    \\    @memcpy(entry.path[0..path.len], path);
+    \\    entry.path_len = path.len;
+    \\    return entry;
+    \\}
     \\
-    \\    const core_dep = b.dependency("zpm-core", .{ .target = target, .optimize = optimize });
+    \\pub fn build(ctx: *sig_build.Build_Context) !void {
+    \\    const zpm = ctx.getDependency("zpm") orelse {
+    \\        sig_build.printMsg(ctx.io_ctx, "run `zpm install` (or `sig build`) to fetch the zpm dependency", .{});
+    \\        return error.BufferTooSmall;
+    \\    };
+    \\    var core_buf: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    \\    const core = try zpm.modulePath("src/core/root.sig", &core_buf);
     \\
-    \\    const exe = b.addExecutable(.{
-    \\        .name = "{{project_name}}",
-    \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.sig"),
-    \\            .target = target,
-    \\            .optimize = optimize,
-    \\        }),
+    \\    _ = try ctx.addModule("core", core);
+    \\
+    \\    _ = try ctx.addCompileStep(.{
+    \\        .source_path = "src/main.sig",
+    \\        .output_name = "{{project_name}}",
+    \\        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+    \\        .optimize = ctx.optimize,
+    \\        .target = if (ctx.target.arch_len > 0) &ctx.target else null,
+    \\        .imports = &.{
+    \\            importEntry("core", core),
+    \\        },
+    \\        .compiler_path = "",
     \\    });
-    \\
-    \\    exe.root_module.addImport("core", core_dep.module("core"));
-    \\
-    \\    b.installArtifact(exe);
-    \\
-    \\    const run_cmd = b.addRunArtifact(exe);
-    \\    run_cmd.step.dependOn(b.getInstallStep());
-    \\    if (b.args) |args| run_cmd.addArgs(args);
-    \\    const run_step = b.step("run", "Run the application");
-    \\    run_step.dependOn(&run_cmd.step);
     \\}
     \\
 ;
 
-const build_zig_web_server =
-    \\const std = @import("std");
+const build_sig_web_server =
+    \\// Native, allocator-free Sig build graph.
+    \\//
+    \\// The zpm dependency is declared in build.sig.zon and fetched into the Sig
+    \\// global cache by `sig build`. ctx.getDependency("zpm").modulePath() yields
+    \\// absolute paths into the fetched package.
+    \\const sig_build = @import("sig_build");
+    \\const builtin = @import("builtin");
     \\
-    \\pub fn build(b: *std.Build) void {
-    \\    const target = b.standardTargetOptions(.{});
-    \\    const optimize = b.standardOptimizeOption(.{});
+    \\fn importEntry(name: []const u8, path: []const u8) sig_build.Import_Entry {
+    \\    var entry: sig_build.Import_Entry = .{};
+    \\    @memcpy(entry.name[0..name.len], name);
+    \\    entry.name_len = name.len;
+    \\    @memcpy(entry.path[0..path.len], path);
+    \\    entry.path_len = path.len;
+    \\    return entry;
+    \\}
     \\
-    \\    const core_dep = b.dependency("zpm-core", .{ .target = target, .optimize = optimize });
-    \\    const http_dep = b.dependency("zpm-http", .{ .target = target, .optimize = optimize });
+    \\pub fn build(ctx: *sig_build.Build_Context) !void {
+    \\    const zpm = ctx.getDependency("zpm") orelse {
+    \\        sig_build.printMsg(ctx.io_ctx, "run `zpm install` (or `sig build`) to fetch the zpm dependency", .{});
+    \\        return error.BufferTooSmall;
+    \\    };
+    \\    const win32_rel = if (builtin.os.tag == .windows)
+    \\        "src/platform/win32.sig"
+    \\    else
+    \\        "src/transport/linux_platform.sig";
     \\
-    \\    const exe = b.addExecutable(.{
-    \\        .name = "{{project_name}}",
-    \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.sig"),
-    \\            .target = target,
-    \\            .optimize = optimize,
-    \\        }),
+    \\    var core_buf: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    \\    var win32_buf: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    \\    var http_buf: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    \\    const core = try zpm.modulePath("src/core/root.sig", &core_buf);
+    \\    const win32 = try zpm.modulePath(win32_rel, &win32_buf);
+    \\    const http = try zpm.modulePath("src/platform/http.sig", &http_buf);
+    \\
+    \\    _ = try ctx.addModule("core", core);
+    \\    _ = try ctx.addModule("win32", win32);
+    \\    const http_mod = try ctx.addModule("http", http);
+    \\    try ctx.addImport(http_mod, "win32", win32);
+    \\
+    \\    _ = try ctx.addCompileStep(.{
+    \\        .source_path = "src/main.sig",
+    \\        .output_name = "{{project_name}}",
+    \\        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+    \\        .optimize = ctx.optimize,
+    \\        .target = if (ctx.target.arch_len > 0) &ctx.target else null,
+    \\        .imports = &.{
+    \\            importEntry("core", core),
+    \\            importEntry("http", http),
+    \\        },
+    \\        .compiler_path = "",
     \\    });
-    \\
-    \\    exe.root_module.addImport("core", core_dep.module("core"));
-    \\    exe.root_module.addImport("http", http_dep.module("http"));
-    \\
-    \\    b.installArtifact(exe);
-    \\
-    \\    const run_cmd = b.addRunArtifact(exe);
-    \\    run_cmd.step.dependOn(b.getInstallStep());
-    \\    const run_step = b.step("run", "Run the server");
-    \\    run_step.dependOn(&run_cmd.step);
     \\}
     \\
 ;
 
-const build_zig_gui_app =
-    \\const std = @import("std");
+const build_sig_gui_app =
+    \\// Native, allocator-free Sig build graph.
+    \\//
+    \\// The zpm dependency is declared in build.sig.zon and fetched into the Sig
+    \\// global cache by `sig build`. Module paths are resolved from the fetched
+    \\// package via ctx.getDependency("zpm").modulePath().
+    \\const sig_build = @import("sig_build");
+    \\const builtin = @import("builtin");
     \\
-    \\pub fn build(b: *std.Build) void {
-    \\    const target = b.standardTargetOptions(.{});
-    \\    const optimize = b.standardOptimizeOption(.{});
+    \\const Paths = struct {
+    \\    core: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    core_len: usize = 0,
+    \\    win32: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    win32_len: usize = 0,
+    \\    gl: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    gl_len: usize = 0,
+    \\    color: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    color_len: usize = 0,
+    \\    window: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    window_len: usize = 0,
+    \\    primitives: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    primitives_len: usize = 0,
+    \\    timer: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    timer_len: usize = 0,
+    \\    logging: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    logging_len: usize = 0,
+    \\    input: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    input_len: usize = 0,
+    \\};
+    \\var p: Paths = .{};
     \\
-    \\    const core_dep = b.dependency("zpm-core", .{ .target = target, .optimize = optimize });
-    \\    const win32_dep = b.dependency("zpm-win32", .{ .target = target, .optimize = optimize });
-    \\    const gl_dep = b.dependency("zpm-gl", .{ .target = target, .optimize = optimize });
-    \\    const window_dep = b.dependency("zpm-window", .{ .target = target, .optimize = optimize });
-    \\    const color_dep = b.dependency("zpm-color", .{ .target = target, .optimize = optimize });
-    \\    const primitives_dep = b.dependency("zpm-primitives", .{ .target = target, .optimize = optimize });
-    \\    const timer_dep = b.dependency("zpm-timer", .{ .target = target, .optimize = optimize });
-    \\    const input_dep = b.dependency("zpm-input", .{ .target = target, .optimize = optimize });
+    \\fn store(dst: []u8, len: *usize, s: []const u8) []const u8 {
+    \\    @memcpy(dst[0..s.len], s);
+    \\    len.* = s.len;
+    \\    return dst[0..s.len];
+    \\}
     \\
-    \\    const exe = b.addExecutable(.{
-    \\        .name = "{{project_name}}",
-    \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.sig"),
-    \\            .target = target,
-    \\            .optimize = optimize,
-    \\        }),
+    \\fn importEntry(name: []const u8, path: []const u8) sig_build.Import_Entry {
+    \\    var entry: sig_build.Import_Entry = .{};
+    \\    @memcpy(entry.name[0..name.len], name);
+    \\    entry.name_len = name.len;
+    \\    @memcpy(entry.path[0..path.len], path);
+    \\    entry.path_len = path.len;
+    \\    return entry;
+    \\}
+    \\
+    \\pub fn build(ctx: *sig_build.Build_Context) !void {
+    \\    const zpm = ctx.getDependency("zpm") orelse {
+    \\        sig_build.printMsg(ctx.io_ctx, "run `zpm install` (or `sig build`) to fetch the zpm dependency", .{});
+    \\        return error.BufferTooSmall;
+    \\    };
+    \\    const win32_rel = if (builtin.os.tag == .windows)
+    \\        "src/platform/win32.sig"
+    \\    else
+    \\        "src/transport/linux_platform.sig";
+    \\
+    \\    var tmp: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    \\    const core = store(&p.core, &p.core_len, try zpm.modulePath("src/core/root.sig", &tmp));
+    \\    const win32 = store(&p.win32, &p.win32_len, try zpm.modulePath(win32_rel, &tmp));
+    \\    const gl = store(&p.gl, &p.gl_len, try zpm.modulePath("src/platform/gl.sig", &tmp));
+    \\    const color = store(&p.color, &p.color_len, try zpm.modulePath("src/render/color.sig", &tmp));
+    \\    const window = store(&p.window, &p.window_len, try zpm.modulePath("src/platform/window.sig", &tmp));
+    \\    const primitives = store(&p.primitives, &p.primitives_len, try zpm.modulePath("src/render/primitives.sig", &tmp));
+    \\    const timer = store(&p.timer, &p.timer_len, try zpm.modulePath("src/platform/timer.sig", &tmp));
+    \\    const logging = store(&p.logging, &p.logging_len, try zpm.modulePath("src/platform/log/run.sig", &tmp));
+    \\    const input = store(&p.input, &p.input_len, try zpm.modulePath("src/platform/input/run.sig", &tmp));
+    \\
+    \\    _ = try ctx.addModule("core", core);
+    \\    _ = try ctx.addModule("win32", win32);
+    \\    _ = try ctx.addModule("gl", gl);
+    \\    _ = try ctx.addModule("color", color);
+    \\
+    \\    const window_mod = try ctx.addModule("window", window);
+    \\    try ctx.addImport(window_mod, "win32", win32);
+    \\    try ctx.addImport(window_mod, "gl", gl);
+    \\
+    \\    const primitives_mod = try ctx.addModule("primitives", primitives);
+    \\    try ctx.addImport(primitives_mod, "gl", gl);
+    \\    try ctx.addImport(primitives_mod, "color", color);
+    \\
+    \\    const timer_mod = try ctx.addModule("timer", timer);
+    \\    try ctx.addImport(timer_mod, "win32", win32);
+    \\
+    \\    const logging_mod = try ctx.addModule("logging", logging);
+    \\    try ctx.addImport(logging_mod, "win32", win32);
+    \\    try ctx.addImport(logging_mod, "core", core);
+    \\
+    \\    const input_mod = try ctx.addModule("input", input);
+    \\    try ctx.addImport(input_mod, "win32", win32);
+    \\    try ctx.addImport(input_mod, "gl", gl);
+    \\    try ctx.addImport(input_mod, "logging", logging);
+    \\    try ctx.addImport(input_mod, "core", core);
+    \\
+    \\    _ = try ctx.addCompileStep(.{
+    \\        .source_path = "src/main.sig",
+    \\        .output_name = "{{project_name}}",
+    \\        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+    \\        .optimize = ctx.optimize,
+    \\        .target = if (ctx.target.arch_len > 0) &ctx.target else null,
+    \\        .imports = &.{
+    \\            importEntry("core", core),
+    \\            importEntry("win32", win32),
+    \\            importEntry("gl", gl),
+    \\            importEntry("window", window),
+    \\            importEntry("color", color),
+    \\            importEntry("primitives", primitives),
+    \\            importEntry("timer", timer),
+    \\            importEntry("input", input),
+    \\        },
+    \\        .compiler_path = "",
     \\    });
-    \\
-    \\    exe.root_module.addImport("core", core_dep.module("core"));
-    \\    exe.root_module.addImport("win32", win32_dep.module("win32"));
-    \\    exe.root_module.addImport("gl", gl_dep.module("gl"));
-    \\    exe.root_module.addImport("window", window_dep.module("window"));
-    \\    exe.root_module.addImport("color", color_dep.module("color"));
-    \\    exe.root_module.addImport("primitives", primitives_dep.module("primitives"));
-    \\    exe.root_module.addImport("timer", timer_dep.module("timer"));
-    \\    exe.root_module.addImport("input", input_dep.module("input"));
-    \\
-    \\    b.installArtifact(exe);
-    \\
-    \\    const run_cmd = b.addRunArtifact(exe);
-    \\    run_cmd.step.dependOn(b.getInstallStep());
-    \\    const run_step = b.step("run", "Run the application");
-    \\    run_step.dependOn(&run_cmd.step);
     \\}
     \\
 ;
 
-const build_zig_library =
-    \\const std = @import("std");
+const build_sig_library =
+    \\// Native, allocator-free Sig build graph.
+    \\const sig_build = @import("sig_build");
     \\
-    \\pub fn build(b: *std.Build) void {
-    \\    const target = b.standardTargetOptions(.{});
-    \\    const optimize = b.standardOptimizeOption(.{});
+    \\pub fn build(ctx: *sig_build.Build_Context) !void {
+    \\    // Expose this library's root module for consumers.
+    \\    _ = try ctx.addModule("{{project_name}}", "src/root.sig");
     \\
-    \\    _ = b.addModule("{{project_name}}", .{
-    \\        .root_source_file = b.path("src/root.sig"),
-    \\        .target = target,
-    \\        .optimize = optimize,
+    \\    // `sig build test` compiles and runs the library's unit tests.
+    \\    _ = try ctx.addTestStep(.{
+    \\        .name = "test",
+    \\        .source_path = "src/root.sig",
+    \\        .imports = &.{},
     \\    });
-    \\
-    \\    const tests = b.addTest(.{
-    \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/root.sig"),
-    \\            .target = target,
-    \\            .optimize = optimize,
-    \\        }),
-    \\    });
-    \\
-    \\    const test_step = b.step("test", "Run unit tests");
-    \\    test_step.dependOn(&b.addRunArtifact(tests).step);
     \\}
     \\
 ;
 
 const build_sig_browser =
+    \\// Native, allocator-free Sig build graph.
     \\const sig_build = @import("sig_build");
     \\
-    \\fn testAll(ctx: *sig_build.Step_Context) sig_build.SigError!void {
-    \\    const build_ctx = ctx.build_ctx;
-    \\    const compiler = if (ctx.compiler_path.len > 0) ctx.compiler_path else "sig";
-    \\    var cmd: sig_build.Command_Buffer = .{};
-    \\    try cmd.appendArg(compiler);
-    \\    try cmd.appendArg("test");
-    \\    try cmd.appendArg("src/root.sig");
-    \\    try cmd.appendArg("--cache-dir");
-    \\    try cmd.appendArg(build_ctx.cache_dir[0..build_ctx.cache_dir_len]);
-    \\    if (build_ctx.zig_lib_dir_len > 0) {
-    \\        try cmd.appendArg("--zig-lib-dir");
-    \\        try cmd.appendArg(build_ctx.zig_lib_dir[0..build_ctx.zig_lib_dir_len]);
-    \\    }
-    \\
-    \\    var stderr_buf: [sig_build.STDERR_CAPTURE_SIZE]u8 = undefined;
-    \\    var stderr_len: usize = 0;
-    \\    const exit_code = try sig_build.runCommand(&cmd, &stderr_buf, &stderr_len, ctx.io);
-    \\    if (exit_code != 0) {
-    \\        sig_build.printMsg(ctx.io, "sig test failed: {s}", .{stderr_buf[0..stderr_len]});
-    \\        return error.BufferTooSmall;
-    \\    }
-    \\}
-    \\
     \\pub fn build(ctx: *sig_build.Build_Context) !void {
+    \\    // Expose the browser engine's root module for consumers.
     \\    _ = try ctx.addModule("browser", "src/root.sig");
-    \\    _ = try ctx.addStep("test", "Run browser package tests", &testAll);
+    \\
+    \\    // `sig build test` compiles and runs the package's unit tests.
+    \\    _ = try ctx.addTestStep(.{
+    \\        .name = "test",
+    \\        .source_path = "src/root.sig",
+    \\        .imports = &.{},
+    \\    });
     \\}
     \\
 ;
 
 // ── src/main.sig (or src/root.sig) Generator ──
 
-fn generateMainZig(project_name: []const u8, tmpl: Template, buf: *[4096]u8) ?[]const u8 {
+fn generateMainSig(project_name: []const u8, tmpl: Template, buf: *[4096]u8) ?[]const u8 {
     const template_str = switch (tmpl) {
-        .empty => main_zig_empty,
-        .window => main_zig_window,
-        .gl_app => main_zig_gl_app,
-        .trading => main_zig_trading,
-        .package => main_zig_package,
-        .cli_app => main_zig_cli_app,
-        .web_server => main_zig_web_server,
-        .gui_app => main_zig_gui_app,
-        .library => main_zig_library,
+        .empty => main_sig_empty,
+        .window => main_sig_window,
+        .gl_app => main_sig_gl_app,
+        .trading => main_sig_trading,
+        .package => main_sig_package,
+        .cli_app => main_sig_cli_app,
+        .web_server => main_sig_web_server,
+        .gui_app => main_sig_gui_app,
+        .library => main_sig_library,
         .browser => main_sig_browser,
     };
     return replacePlaceholder(template_str, project_name, buf);
 }
 
-const main_zig_empty =
+const main_sig_empty =
     \\const std = @import("std");
     \\
-    \\pub fn main() void {
-    \\    std.debug.print("Hello from {{project_name}}!\n", .{});
+    \\pub fn main(init: std.process.Init) !void {
+    \\    const io = init.io;
+    \\    try std.Io.File.stdout().writeStreamingAll(io, "Hello from {{project_name}}!\n");
     \\}
     \\
 ;
 
-const main_zig_window =
+const main_sig_window =
     \\const gl = @import("gl");
     \\const win = @import("window");
     \\
@@ -976,7 +1130,7 @@ const main_zig_window =
     \\
 ;
 
-const main_zig_gl_app =
+const main_sig_gl_app =
     \\const gl = @import("gl");
     \\const win = @import("window");
     \\const prim = @import("primitives");
@@ -1007,7 +1161,7 @@ const main_zig_gl_app =
     \\
 ;
 
-const main_zig_trading =
+const main_sig_trading =
     \\const gl = @import("gl");
     \\const win = @import("window");
     \\const prim = @import("primitives");
@@ -1039,8 +1193,10 @@ const main_zig_trading =
     \\
 ;
 
-const main_zig_package =
-    \\/// {{project_name}} — a zpm-compatible package.
+const main_sig_package =
+    \\/// {{project_name}} — a zpm-compatible Sig package.
+    \\/// This is the package root module (src/root.sig). Re-export your public
+    \\/// API here with `pub const foo = @import("foo.sig");`.
     \\pub fn init() void {}
     \\
     \\test "{{project_name}} basic test" {
@@ -1050,37 +1206,46 @@ const main_zig_package =
     \\
 ;
 
-const main_zig_cli_app =
+const main_sig_cli_app =
     \\const std = @import("std");
     \\
-    \\pub fn main() void {
-    \\    // Cross-platform CLI application — {{project_name}}
-    \\    const args = std.process.argsWithAllocator(std.heap.page_allocator) catch return;
-    \\    defer args.deinit();
+    \\// Cross-platform CLI application — {{project_name}}
+    \\// Uses the allocator-free process init: no heap, no std.debug.print.
+    \\pub fn main(init: std.process.Init) !void {
+    \\    const io = init.io;
     \\
-    \\    var count: usize = 0;
-    \\    while (args.next()) |_| count += 1;
+    \\    // init.minimal.args is an allocation-free view over argv.
+    \\    const count = init.minimal.args.len;
     \\
-    \\    var buf: [256]u8 = undefined;
-    \\    const msg = std.fmt.bufPrint(&buf, "{{project_name}}: {d} argument(s)\n", .{count}) catch return;
-    \\    std.debug.print("{s}", .{msg});
+    \\    var stdout_buffer: [256]u8 = undefined;
+    \\    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    \\    const stdout = &stdout_writer.interface;
+    \\    try stdout.print("{{project_name}}: {d} argument(s)\n", .{count});
+    \\    try stdout.flush();
     \\}
     \\
 ;
 
-const main_zig_web_server =
+const main_sig_web_server =
     \\const std = @import("std");
+    \\const http = @import("http");
     \\
-    \\pub fn main() void {
-    \\    // Zig HTTP server — {{project_name}}
-    \\    std.debug.print("{{project_name}} server starting on :8080\n", .{});
-    \\    // TODO: Initialize HTTP listener and route handlers
-    \\    std.debug.print("{{project_name}} server ready\n", .{});
+    \\// HTTP server skeleton — {{project_name}}
+    \\pub fn main(init: std.process.Init) !void {
+    \\    const io = init.io;
+    \\    var stdout_buffer: [256]u8 = undefined;
+    \\    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    \\    const stdout = &stdout_writer.interface;
+    \\    try stdout.writeAll("{{project_name}} server starting on :8080\n");
+    \\    // TODO: initialize the http listener and route handlers using the
+    \\    // `http` module from zpm.
+    \\    try stdout.writeAll("{{project_name}} server ready\n");
+    \\    try stdout.flush();
     \\}
     \\
 ;
 
-const main_zig_gui_app =
+const main_sig_gui_app =
     \\const gl = @import("gl");
     \\const win = @import("window");
     \\const prim = @import("primitives");
@@ -1112,9 +1277,10 @@ const main_zig_gui_app =
     \\
 ;
 
-const main_zig_library =
-    \\/// {{project_name}} — a reusable Zig module.
-    \\
+const main_sig_library =
+    \\/// {{project_name}} — a reusable Sig module.
+    \\/// This is the library root module (src/root.sig). Re-export your public
+    \\/// API here with `pub const foo = @import("foo.sig");`.
     \\pub fn init() void {}
     \\
     \\test "{{project_name}} basic test" {
@@ -1214,6 +1380,8 @@ const main_sig_browser =
 
 const gitignore_content =
     \\.sig-cache/
+    \\.zig-cache/
+    \\sig-out/
     \\zig-out/
     \\config.json
     \\
@@ -1223,15 +1391,15 @@ const gitignore_content =
 
 fn generateReadme(project_name: []const u8, tmpl: Template, buf: *[2048]u8) ?[]const u8 {
     const desc = switch (tmpl) {
-        .empty => "A minimal Zig project.",
+        .empty => "A minimal Sig project.",
         .window => "A borderless GL window application.",
         .gl_app => "A GL application with render loop and basic drawing.",
         .trading => "A trading chart application skeleton.",
         .package => "A publishable zpm-compatible package.",
         .cli_app => "A cross-platform command-line application with argument parsing.",
-        .web_server => "A Zig HTTP server project.",
+        .web_server => "A Sig HTTP server project.",
         .gui_app => "A platform-abstracted GUI application with window and GL rendering.",
-        .library => "A reusable Zig module with test infrastructure.",
+        .library => "A reusable Sig module with test infrastructure.",
         .browser => "A Sig-native browser engine starter with URL parsing and static page loading.",
     };
     const template_str = readme_template;
@@ -1272,7 +1440,7 @@ const readme_template =
     \\## Build
     \\
     \\```
-    \\zig build
+    \\sig build
     \\```
     \\
     \\## Run
@@ -1664,10 +1832,22 @@ test "scaffold: window template produces correct deps" {
 
     const zon_idx = findWrittenFile("build.sig.zon").?;
     const zon_content = getWrittenFileContent(zon_idx);
-    try testing.expect(containsSubstr(zon_content, "zpm-core"));
-    try testing.expect(containsSubstr(zon_content, "zpm-window"));
-    try testing.expect(containsSubstr(zon_content, "zpm-gl"));
-    try testing.expect(containsSubstr(zon_content, "zpm-win32"));
+    // zpm is declared once as a fetched GitHub tarball dependency; the
+    // individual modules (core/win32/gl/window) are wired in build.sig from
+    // the fetched package via ctx.getDependency("zpm").
+    try testing.expect(containsSubstr(zon_content, ".zpm = .{"));
+    try testing.expect(containsSubstr(zon_content, "github.com/SB0LTD/zpm"));
+    try testing.expect(!containsSubstr(zon_content, "1220placeholder"));
+    try testing.expect(!containsSubstr(zon_content, "registry.zpm.dev"));
+
+    const build_idx = findWrittenFile("build.sig").?;
+    const build_content = getWrittenFileContent(build_idx);
+    try testing.expect(containsSubstr(build_content, "@import(\"sig_build\")"));
+    try testing.expect(!containsSubstr(build_content, "std.Build"));
+    try testing.expect(containsSubstr(build_content, "getDependency(\"zpm\")"));
+    try testing.expect(containsSubstr(build_content, "\"win32\""));
+    try testing.expect(containsSubstr(build_content, "\"window\""));
+    try testing.expect(containsSubstr(build_content, "\"gl\""));
 }
 
 test "scaffold: gl-app template produces correct deps" {
@@ -1681,10 +1861,17 @@ test "scaffold: gl-app template produces correct deps" {
 
     const zon_idx = findWrittenFile("build.sig.zon").?;
     const zon_content = getWrittenFileContent(zon_idx);
-    try testing.expect(containsSubstr(zon_content, "zpm-color"));
-    try testing.expect(containsSubstr(zon_content, "zpm-primitives"));
-    try testing.expect(containsSubstr(zon_content, "zpm-timer"));
-    try testing.expect(containsSubstr(zon_content, "zpm-input"));
+    try testing.expect(containsSubstr(zon_content, ".zpm = .{"));
+    try testing.expect(containsSubstr(zon_content, "github.com/SB0LTD/zpm"));
+
+    // The gl-app modules are wired in build.sig via native sig_build.
+    const build_idx = findWrittenFile("build.sig").?;
+    const build_content = getWrittenFileContent(build_idx);
+    try testing.expect(containsSubstr(build_content, "getDependency(\"zpm\")"));
+    try testing.expect(containsSubstr(build_content, "\"color\""));
+    try testing.expect(containsSubstr(build_content, "\"primitives\""));
+    try testing.expect(containsSubstr(build_content, "\"timer\""));
+    try testing.expect(containsSubstr(build_content, "\"input\""));
 }
 
 test "scaffold: trading template produces correct deps" {
@@ -1698,8 +1885,15 @@ test "scaffold: trading template produces correct deps" {
 
     const zon_idx = findWrittenFile("build.sig.zon").?;
     const zon_content = getWrittenFileContent(zon_idx);
-    try testing.expect(containsSubstr(zon_content, "zpm-text"));
-    try testing.expect(containsSubstr(zon_content, "zpm-http"));
+    try testing.expect(containsSubstr(zon_content, ".zpm = .{"));
+    try testing.expect(containsSubstr(zon_content, "github.com/SB0LTD/zpm"));
+
+    // The trading modules are wired in build.sig via native sig_build.
+    const build_idx = findWrittenFile("build.sig").?;
+    const build_content = getWrittenFileContent(build_idx);
+    try testing.expect(containsSubstr(build_content, "getDependency(\"zpm\")"));
+    try testing.expect(containsSubstr(build_content, "\"text\""));
+    try testing.expect(containsSubstr(build_content, "\"http\""));
 }
 
 test "scaffold: package template generates zpm.pkg.zon with correct layer" {
