@@ -5,12 +5,12 @@
 <h1 align="center">zpm</h1>
 
 <p align="center">
-  <strong>The Zig package manager.</strong><br/>
-  <sub>Zig Package Manager — Über alles. Zero allocations, all platforms.</sub>
+  <strong>The package manager for Sig.</strong><br/>
+  <sub>Zero allocations, all platforms — built by the Sig compiler itself.</sub>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/zig-0.16%2B-f7a41d?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16+" />
+  <img src="https://img.shields.io/badge/built%20with-Sig-5b6ee1?style=flat-square" alt="Built with Sig" />
   <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT" />
   <img src="https://img.shields.io/badge/platform-windows%20%7C%20macos%20%7C%20linux-lightgrey?style=flat-square" alt="Platform" />
 </p>
@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  Officially supports <strong>Zig 0.16+</strong>; CI pins <a href="https://github.com/SB0LTD/sig"><strong>Sig 0.2.0</strong></a>
+  Written entirely in <a href="https://github.com/SB0LTD/sig"><strong>Sig</strong></a> and built with <code>sig build</code>.
 </p>
 
 ---
@@ -112,16 +112,18 @@ Layer 0: Core        Pure data types, math, logic — no platform deps (core, ma
 
 ### Implementation Language
 
-zpm is implemented entirely in **Sig** (`.sig` files). Sig is source-compatible with Zig — same syntax, same semantics — compiled by the [Sig compiler](https://github.com/SB0LTD/sig).
+zpm is implemented entirely in **Sig** (`.sig` files) and built by the
+[Sig compiler](https://github.com/SB0LTD/sig) with its native, allocator-free
+`sig build` system. Sig shares Zig's syntax and semantics, so the manifest and
+build-file formats are familiar.
 
-**zpm fully supports both Zig and Sig projects:**
+- `build.sig` — the build file (canonical for Sig projects)
+- `build.sig.zon` — the package manifest
+- `build.zig` / `build.zig.zon` — legacy Zig-named equivalents are still parsed,
+  so existing projects keep working
 
-- `build.sig` — recommended build file for Sig projects
-- `build.zig` — supported for Zig projects
-- `build.sig.zon` — recommended package manifest
-- `build.zig.zon` — supported for Zig projects
-
-All `zpm` commands (`install`, `build`, `run`, etc.) work identically regardless of which extension your project uses.
+`zpm init` scaffolds `build.sig` + `build.sig.zon`, and `zpm build` / `zpm run`
+delegate to `sig build` regardless of which naming a project uses.
 
 ### Principles
 
@@ -173,7 +175,8 @@ The SDK contract version is `1.0.0`.
 
 ## Official @zpm/ Packages
 
-37 packages derived from the existing zpm module library.
+Official packages are published under the `@zpm/` scope and derived from the
+zpm module library. They are organized by the four-layer hierarchy above.
 
 ### Layer 0 — Core
 
@@ -232,6 +235,68 @@ The SDK contract version is `1.0.0`.
 | `@zpm/icon` | ICO file loading to GL texture |
 | `@zpm/render` | Coarse-grained re-export of all render subsystems |
 
+### Layer 0 — Crypto
+
+| Package | Description |
+|---------|-------------|
+| `@zpm/sha256` | SHA-256 hashing |
+| `@zpm/hmac` | HMAC-SHA256 |
+| `@zpm/hkdf` | HKDF key derivation |
+| `@zpm/aes` | AES block cipher |
+| `@zpm/gcm` | AES-GCM authenticated encryption |
+| `@zpm/x25519` | X25519 key exchange (RFC 7748) |
+| `@zpm/p256` | NIST P-256 (Montgomery CIOS) |
+
+### Layer 0 — Networking
+
+| Package | Description |
+|---------|-------------|
+| `@zpm/net-ipv4` | IPv4 packet handling |
+| `@zpm/net-tcp` | TCP segment handling |
+| `@zpm/net-udp` | UDP datagram handling |
+| `@zpm/net-dns` | DNS resolver |
+| `@zpm/net-dhcp` | DHCP client |
+| `@zpm/net-arp` | ARP |
+| `@zpm/net-icmp` | ICMP |
+| `@zpm/net-http` | Minimal HTTP over the native TCP stack |
+
+### Layer 0 — AI / Inference
+
+| Package | Description |
+|---------|-------------|
+| `@zpm/gguf` | GGUF model file parsing |
+| `@zpm/tokenizer` | Tokenizer with index |
+| `@zpm/qwen3-executor` | Qwen3 decode plan + executor |
+| `@zpm/inference-session` | Bounded inference session driver |
+| `@zpm/kv-cache` | Attention KV cache |
+| `@zpm/sampling` | Token sampling |
+| `@zpm/quantized-linear` | Quantized linear kernels |
+| `@zpm/transformer-ops` | Transformer building blocks |
+| `@zpm/vector-memory` | Bounded vector memory store |
+| `@zpm/agent-runtime` | Agent runtime primitives |
+
+### Layer 0 — Image / Document
+
+| Package | Description |
+|---------|-------------|
+| `@zpm/image` | Software image buffers and compositing |
+| `@zpm/png-decode` | PNG decoding |
+| `@zpm/layout` | Layout analysis |
+| `@zpm/text-analyze` | Text detection over image buffers |
+| `@zpm/elementor-document` | Structured document model |
+
+### Layer 0 — Language Server (LSP)
+
+| Package | Description |
+|---------|-------------|
+| `@zpm/lsp` | Coarse-grained re-export of the LSP building blocks |
+| `@zpm/message` | LSP JSON-RPC message framing |
+| `@zpm/document` | Text document + position mapping |
+| `@zpm/symbols` | Symbol model |
+| `@zpm/server` | LSP server core |
+| `@zpm/loop` | LSP event loop |
+| `@zpm/jwrite` | Bounded JSON writer |
+
 ---
 
 ## Contributing
@@ -260,5 +325,5 @@ sig build test --summary all
 <p align="center">
   <a href="https://discord.gg/tXwz7dAt">Discord</a> ·
   <a href="https://ko-fi.com/shadovvbeast">Ko-fi</a> ·
-  <a href="https://github.com/sb0-trade/zpm">GitHub</a>
+  <a href="https://github.com/SB0LTD/zpm">GitHub</a>
 </p>
