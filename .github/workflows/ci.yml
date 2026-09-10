@@ -10,12 +10,10 @@ permissions:
   contents: read
 
 env:
-  SIG_RELEASE_TAG: sig-0.2.0-zig0.17.0.3384d7a
-  SIG_RELEASE_ASSET: sig-0.2.0-zig0.17.0.3384d7a-x86_64-linux.tar.xz
-  SIG_RELEASE_SHA256: aed3d098ba7eefc6aa053d1a05730a2ccc34e04b3156a7c9f54dadf9d340556d
-  # The compiler and standard library remain the tested atomic release pair.
-  # Only the bounded build runner is overlaid from this reviewed revision.
-  SIG_SOURCE_REF: e7cae806dceed3473c63029b83aff1a89f7478dc
+  SIG_RELEASE_TAG: bootstrap-sig-v72
+  SIG_RELEASE_ASSET: bootstrap-sig-x86_64-linux.tar.zst
+  SIG_RELEASE_SHA256: 8972e90749c3e257a8bf9f6ecd7f651fd4f8d576db776d4fd5bf7de15bd18705
+  SIG_RUNTIME_REF: bc2fa64b4be94996feedc9b780eb1469c395da7d
 
 jobs:
   native-sig:
@@ -49,32 +47,26 @@ jobs:
           test -n "$SIG_BIN"
           SIG_PREFIX=$(dirname "$(dirname "$SIG_BIN")")
 
-          # Preserve the release's compiler/lib epoch and overlay only the
-          # immutable native build runner. Mixing current std/compiler_rt with
-          # an older compiler is invalid even when both report Zig 0.17.
-          git init -q /tmp/sig-repo
-          git -C /tmp/sig-repo remote add origin \
-            "https://github.com/${{ github.repository_owner }}/sig.git"
-          git -C /tmp/sig-repo fetch -q --depth 1 origin "$SIG_SOURCE_REF"
-          git -C /tmp/sig-repo checkout -q --detach FETCH_HEAD
-          test "$(git -C /tmp/sig-repo rev-parse HEAD)" = "$SIG_SOURCE_REF"
-          test -f "$SIG_PREFIX/lib/std/std.zig"
-          mkdir -p "$SIG_PREFIX/tools"
-          cp -a /tmp/sig-repo/tools/sig_build "$SIG_PREFIX/tools/"
-
+          # Keep the release compiler, std and build runner together; overlay
+          # only the reviewed process URL fix from Sig master (PR #9).
+          for source in os.sig process.sig; do
+            curl -fsSL "https://raw.githubusercontent.com/SB0LTD/sig/$SIG_RUNTIME_REF/lib/sig/$source" \
+              -o "$SIG_PREFIX/lib/sig/$source"
+          done
+          test -f "$SIG_PREFIX/lib/std/std.sig"
           echo "SIG=$SIG_BIN" >> "$GITHUB_ENV"
-          echo "SIG_LIB=$SIG_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "SIG_LIB_DIR=$SIG_PREFIX/lib" >> "$GITHUB_ENV"
           "$SIG_BIN" version
 
       - name: Test ZPM library and transport graph with Sig
         run: |
           "$SIG" build test \
-            --zig-lib-dir "$SIG_LIB" \
+            --Sig-lib-dir "$SIG_LIB_DIR" \
             --cache-dir /tmp/zpm-root-cache \
             --global-cache-dir /tmp/zpm-global-cache \
             --keep-going
           "$SIG" build test-integration test-server-initial \
-            --zig-lib-dir "$SIG_LIB" \
+            --Sig-lib-dir "$SIG_LIB_DIR" \
             --cache-dir /tmp/zpm-network-cache \
             --global-cache-dir /tmp/zpm-global-cache \
             --keep-going
@@ -89,13 +81,17 @@ jobs:
         working-directory: cli
         run: |
           "$SIG" build test \
-            --zig-lib-dir "$SIG_LIB" \
+            --Sig-lib-dir "$SIG_LIB_DIR" \
             --cache-dir /tmp/zpm-cli-test-cache \
             --global-cache-dir /tmp/zpm-global-cache \
             --keep-going
           "$SIG" build zpm \
-            --zig-lib-dir "$SIG_LIB" \
+            --Sig-lib-dir "$SIG_LIB_DIR" \
             --cache-dir /tmp/zpm-cli-build-cache \
             --global-cache-dir /tmp/zpm-global-cache
           file sig-out/bin/zpm
           sig-out/bin/zpm --version
+
+      - name: Verify real CLI argument forwarding and child failure
+        run: |
+          python3 tests/test_cli_forwarding.py --sig "$SIG" --zpm cli/sig-out/bin/zpm

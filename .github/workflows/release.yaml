@@ -17,6 +17,12 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  SIG_RELEASE_TAG: bootstrap-sig-v72
+  SIG_RELEASE_ASSET: bootstrap-sig-x86_64-linux.tar.zst
+  SIG_RELEASE_SHA256: 8972e90749c3e257a8bf9f6ecd7f651fd4f8d576db776d4fd5bf7de15bd18705
+  SIG_RUNTIME_REF: bc2fa64b4be94996feedc9b780eb1469c395da7d
+
 jobs:
   release:
     name: Build all platforms and publish
@@ -47,17 +53,25 @@ jobs:
         with:
           ref: ${{ steps.meta.outputs.tag }}
 
-      - name: Install latest Sig
+      - name: Install verified current Sig
         id: sig
         run: |
           set -euo pipefail
-          URL="https://github.com/SB0LTD/sig/releases/latest/download/sig-x86_64-linux.tar.xz"
+          URL="https://github.com/SB0LTD/sig/releases/download/$SIG_RELEASE_TAG/$SIG_RELEASE_ASSET"
           echo "Downloading $URL"
-          curl -fSL "$URL" -o sig.tar.xz
+          curl -fSL "$URL" -o "/tmp/$SIG_RELEASE_ASSET"
+          echo "$SIG_RELEASE_SHA256  /tmp/$SIG_RELEASE_ASSET" | sha256sum -c -
           mkdir -p sig-dist
-          tar -xf sig.tar.xz -C sig-dist
+          tar -xf "/tmp/$SIG_RELEASE_ASSET" -C sig-dist
           SIG_BIN="$(find "$PWD/sig-dist" -type f -name sig | head -n1)"
           if [ -z "$SIG_BIN" ]; then echo "sig binary not found"; exit 1; fi
+          SIG_PREFIX=$(dirname "$(dirname "$SIG_BIN")")
+          test -f "$SIG_PREFIX/lib/std/std.sig"
+          for source in os.sig process.sig; do
+            curl -fsSL "https://raw.githubusercontent.com/SB0LTD/sig/$SIG_RUNTIME_REF/lib/sig/$source" \
+              -o "$SIG_PREFIX/lib/sig/$source"
+          done
+          echo "SIG_LIB_DIR=$SIG_PREFIX/lib" >> "$GITHUB_ENV"
           chmod +x "$SIG_BIN"
           echo "$(dirname "$SIG_BIN")" >> "$GITHUB_PATH"
           echo "sig_version=$("$SIG_BIN" version)" >> "$GITHUB_OUTPUT"
