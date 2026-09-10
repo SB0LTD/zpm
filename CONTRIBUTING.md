@@ -5,7 +5,8 @@ Thanks for your interest in contributing to zpm.
 ## Prerequisites
 
 - **Sig compiler** — [github.com/SB0LTD/sig](https://github.com/SB0LTD/sig)
-  (put `sig` on your PATH)
+  0.5.2 or newer (put `sig` on your PATH). Validation uses bootstrap v72,
+  Sig 0.5.3, plus the current `lib/sig` Windows URL-preservation fix.
 - Git
 
 ## Building
@@ -31,6 +32,26 @@ sig build test --summary all
 cd zpm
 sig build test --summary all
 ```
+
+Native interaction contracts and actual CLI process forwarding:
+
+```bash
+# From zpm/
+sig build test-now --summary all
+python tests/test_cli_forwarding.py --sig /absolute/path/to/sig --zpm cli/sig-out/bin/zpm
+```
+
+On Windows use the `.exe` paths. The forwarding test compiles a real child
+process and checks URLs, Unicode, quotes, empty and long arguments, overflow
+and child failure. `SIG_LIB_DIR` may select the matching library source checkout
+when testing toolchain changes. Compile ZPM with `sig build zpm` before running
+it; Windows cannot replace the executable while that same ZPM process is running.
+
+For consumers, declare ZPM once in `build.sig.zon` as a pinned archive with its
+SHA-256 (or an explicit local `.path` during co-development). Resolve it through
+`ctx.getDependency("zpm")` and wire named modules from that root. Do not copy
+individual files into a consumer's `Lib` directory or silently locate a sibling
+checkout. Nexus additionally accepts the explicit `-Dzpm-root=../zpm` override.
 
 ## Code Style
 

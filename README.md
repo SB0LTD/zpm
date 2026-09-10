@@ -27,6 +27,12 @@
 
 ## Quick Start
 
+Build the CLI from current source with Sig 0.5.2 or newer (currently validated
+with SB0LTD bootstrap v72, Sig 0.5.3). The v0.3.0 release's `build` and `run`
+handlers only printed commands; current source launches Sig, forwards its
+arguments verbatim and returns its exit code. `SIG` selects an explicit compiler;
+otherwise ZPM uses `sig` on PATH. See [Contributing](CONTRIBUTING.md).
+
 ```bash
 # Install zpm (or build from source — see Contributing)
 zpm --version
@@ -100,6 +106,21 @@ zpm run
 ---
 
 ## Architecture
+
+Reusable native interaction logic lives in Layer 0 and is consumed directly
+from the resolved ZPM source tree, with named module imports:
+
+| Module | Contract |
+|--------|----------|
+| `ephemeral_scene` | Bounded SB0UI/1 scenes, turn leases, expiry, single-use actions |
+| `now_voice_output` | Committed reply ownership, complete text chunks, cancellation generations |
+| `device_control` | Typed operations dispatched through measured device adapters |
+| `english_phonemes` | Allocation-free English text frontend for learned speech |
+| `sig_text` | Bounded text splitting, ASCII helpers and UTF-8 validation |
+
+`sig build test-now` runs their executable contracts and an intentional assertion
+failure to verify the runner. Kernel queues, hardware access and rendering remain
+in the consumer. These modules do not implement ASR or conversational inference.
 
 Four layers, strictly ordered — lower layers never import from higher layers.
 

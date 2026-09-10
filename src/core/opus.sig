@@ -8,9 +8,9 @@
 // Reference: RFC 6716 (Opus Interactive Audio Codec)
 // This is a simplified implementation suitable for voice-band audio (SILK mode).
 
-const math = @import("sig_math.sig");
-const mem = @import("sig_mem.sig");
-const testing = @import("sig_testing.sig");
+const math = @import("sig_math");
+const mem = @import("sig_mem");
+const testing = @import("sig_testing");
 
 /// Opus encoder configuration.
 pub const EncoderConfig = struct {

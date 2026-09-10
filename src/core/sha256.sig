@@ -4,8 +4,8 @@
 // Implements NIST FIPS 180-4 SHA-256. All state lives in struct fields.
 // Provides streaming (init/update/final) and one-shot (hash) interfaces.
 
-const mem = @import("sig_mem.sig");
-const testing = @import("sig_testing.sig");
+const mem = @import("sig_mem");
+const testing = @import("sig_testing");
 
 /// SHA-256 digest length in bytes.
 pub const DIGEST_LEN = 32;

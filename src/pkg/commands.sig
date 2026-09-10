@@ -21,6 +21,7 @@ const init_mod = @import("init.sig");
 pub const WriteFn = *const fn (data: []const u8) void;
 pub const ReadFileFn = *const fn (path: []const u8, buf: []u8) ?[]const u8;
 pub const WriteFileFn = *const fn (path: []const u8, data: []const u8) bool;
+pub const BuildFn = *const fn (run: bool, args: []const []const u8) u8;
 
 // ── Command Context ──
 
@@ -33,9 +34,10 @@ pub const CommandContext = struct {
     /// Optional fetch function for the resolver. When set, install/update
     /// use this instead of building one from the registry client.
     fetch_fn: ?resolver.FetchFn = null,
-    /// Optional bootstrapper for run/build commands. When set, ensureZig()
+    /// Optional bootstrapper for run/build commands. When set, ensureSig()
     /// is called before delegating to zig build.
-    bootstrapper: ?*const bootstrap.ZigBootstrapper = null,
+    bootstrapper: ?*const bootstrap.SigBootstrapper = null,
+    build: ?BuildFn = null,
     /// Optional init vtable callbacks for the init command.
     init_create_dir: ?*const fn (path: []const u8) bool = null,
     init_write_file: ?*const fn (path: []const u8, content: []const u8) bool = null,
@@ -610,17 +612,19 @@ pub fn update(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandRe
 // `sig build run`.
 // Requirements: 18.1
 
-pub fn runCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) CommandResult {
+pub fn runCmd(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandResult {
     if (ctx.bootstrapper) |b| {
-        const br = b.ensureZig();
-        if (br == .failed or br == .offline_no_zig) {
+        const br = b.ensureSig();
+        if (br == .failed or br == .offline_no_sig) {
             ctx.stderr("run: the Sig toolchain is not available\n");
             return .file_error;
         }
     }
-    // Report that `sig build run` would be executed with passthrough args.
-    ctx.stdout("executing sig build run\n");
-    return .success;
+    const execute = ctx.build orelse {
+        ctx.stderr("run: no native build executor configured\n");
+        return .file_error;
+    };
+    return if (execute(true, args.positional[0..args.positional_count]) == 0) .success else .file_error;
 }
 
 // ── Build Command ──
@@ -628,17 +632,19 @@ pub fn runCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) CommandResul
 // `sig build`.
 // Requirements: 18.2
 
-pub fn buildCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) CommandResult {
+pub fn buildCmd(ctx: *const CommandContext, args: *const cli.ParsedArgs) CommandResult {
     if (ctx.bootstrapper) |b| {
-        const br = b.ensureZig();
-        if (br == .failed or br == .offline_no_zig) {
+        const br = b.ensureSig();
+        if (br == .failed or br == .offline_no_sig) {
             ctx.stderr("build: the Sig toolchain is not available\n");
             return .file_error;
         }
     }
-    // Report that `sig build` would be executed with passthrough args.
-    ctx.stdout("executing sig build\n");
-    return .success;
+    const execute = ctx.build orelse {
+        ctx.stderr("build: no native build executor configured\n");
+        return .file_error;
+    };
+    return if (execute(false, args.positional[0..args.positional_count]) == 0) .success else .file_error;
 }
 
 // ── Doctor Command ──
@@ -653,7 +659,7 @@ pub fn doctorCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) CommandRe
 
     // Check 2: Zig installation via bootstrapper
     if (ctx.bootstrapper) |b| {
-        const br = b.ensureZig();
+        const br = b.ensureSig();
         switch (br) {
             .already_installed, .installed, .updated => {
                 ctx.stdout("\xe2\x9c\x93 Zig installed\n");
@@ -663,7 +669,7 @@ pub fn doctorCmd(ctx: *const CommandContext, _: *const cli.ParsedArgs) CommandRe
                 ctx.stderr("  run any zpm command to auto-install, or install manually from https://ziglang.org\n");
                 all_passed = false;
             },
-            .offline_no_zig => {
+            .offline_no_sig => {
                 ctx.stderr("\xe2\x9c\x97 Zig not found (offline mode)\n");
                 ctx.stderr("  connect to the internet and run `zpm doctor` again, or install Zig manually\n");
                 all_passed = false;
@@ -1642,158 +1648,89 @@ fn resetBootMocks() void {
 
 // ── Run Command Tests ──
 
-test "runCmd: succeeds when bootstrapper confirms zig installed" {
+var mock_build_calls: usize = 0;
+var mock_build_run: bool = false;
+var mock_build_args: []const []const u8 = &.{};
+var mock_build_exit: u8 = 0;
+
+fn mockBuild(run: bool, args: []const []const u8) u8 {
+    mock_build_calls += 1;
+    mock_build_run = run;
+    mock_build_args = args;
+    return mock_build_exit;
+}
+
+fn resetBuildMocks() void {
     resetMocks();
     resetBootMocks();
     MockHttp.reset();
-    mock_boot_exec_result = .{ .exit_code = 0, .stdout = "0.16.0\n" };
-
-    const bootstrapper = bootstrap.ZigBootstrapper{
-        .vtable = mock_boot_vtable,
-        .offline = false,
-        .auto_update = false,
-    };
-
-    const reg = testRegistryClient(false);
-    var ctx = testContext(&reg, null);
-    ctx.bootstrapper = &bootstrapper;
-
-    var args = cli.ParsedArgs{};
-    args.command = .run;
-
-    const result = runCmd(&ctx, &args);
-    try testing.expectEqual(CommandResult.success, result);
-    try testing.expect(std.mem.indexOf(u8, getStdout(), "executing sig build run") != null);
+    mock_build_calls = 0;
+    mock_build_run = false;
+    mock_build_args = &.{};
+    mock_build_exit = 0;
 }
 
-test "runCmd: fails when zig not available offline" {
-    resetMocks();
-    resetBootMocks();
-    MockHttp.reset();
-    mock_boot_exec_result = null; // zig not found
-
-    const bootstrapper = bootstrap.ZigBootstrapper{
-        .vtable = mock_boot_vtable,
-        .offline = true,
-        .auto_update = false,
-    };
-
-    const reg = testRegistryClient(false);
-    var ctx = testContext(&reg, null);
-    ctx.bootstrapper = &bootstrapper;
-
-    var args = cli.ParsedArgs{};
-    args.command = .run;
-
-    const result = runCmd(&ctx, &args);
-    try testing.expectEqual(CommandResult.file_error, result);
-    try testing.expect(std.mem.indexOf(u8, getStderr(), "the Sig toolchain is not available") != null);
+test "build and run delegate once with exact arguments" {
+    for ([_]bool{ false, true }) |run| {
+        resetBuildMocks();
+        mock_boot_exec_result = .{ .exit_code = 0, .stdout = "sig 0.5.3 (zig 0.17.0)\n" };
+        const bootstrapper = bootstrap.SigBootstrapper{
+            .vtable = mock_boot_vtable, .offline = false, .auto_update = false,
+        };
+        const reg = testRegistryClient(false);
+        var ctx = testContext(&reg, null);
+        ctx.bootstrapper = &bootstrapper;
+        ctx.build = &mockBuild;
+        var args = cli.ParsedArgs{};
+        args.positional[0] = "test-now";
+        args.positional[1] = "-Dzpm-root=path with spaces";
+        args.positional_count = 2;
+        const result = if (run) runCmd(&ctx, &args) else buildCmd(&ctx, &args);
+        try testing.expectEqual(CommandResult.success, result);
+        try testing.expectEqual(@as(usize, 1), mock_build_calls);
+        try testing.expectEqual(run, mock_build_run);
+        try testing.expectEqual(@as(usize, 2), mock_build_args.len);
+        try testing.expectEqualStrings(args.positional[0], mock_build_args[0]);
+        try testing.expectEqualStrings(args.positional[1], mock_build_args[1]);
+    }
 }
 
-test "runCmd: succeeds without bootstrapper" {
-    resetMocks();
-    MockHttp.reset();
-
-    const reg = testRegistryClient(false);
-    const ctx = testContext(&reg, null);
-
-    var args = cli.ParsedArgs{};
-    args.command = .run;
-
-    const result = runCmd(&ctx, &args);
-    try testing.expectEqual(CommandResult.success, result);
-    try testing.expect(std.mem.indexOf(u8, getStdout(), "executing sig build run") != null);
+test "build and run reject missing executor and child failure" {
+    for ([_]bool{ false, true }) |run| {
+        resetBuildMocks();
+        const reg = testRegistryClient(false);
+        var ctx = testContext(&reg, null);
+        const args = cli.ParsedArgs{};
+        try testing.expectEqual(CommandResult.file_error, if (run) runCmd(&ctx, &args) else buildCmd(&ctx, &args));
+        try testing.expectEqual(@as(usize, 0), mock_build_calls);
+        ctx.build = &mockBuild;
+        mock_build_exit = 37;
+        try testing.expectEqual(CommandResult.file_error, if (run) runCmd(&ctx, &args) else buildCmd(&ctx, &args));
+        try testing.expectEqual(@as(usize, 1), mock_build_calls);
+        mock_build_exit = 0;
+        try testing.expectEqual(CommandResult.success, if (run) runCmd(&ctx, &args) else buildCmd(&ctx, &args));
+        try testing.expectEqual(@as(usize, 2), mock_build_calls);
+    }
 }
 
-test "runCmd: fails when outdated zig without auto_update" {
-    resetMocks();
-    resetBootMocks();
-    MockHttp.reset();
-    mock_boot_exec_result = .{ .exit_code = 0, .stdout = "0.15.0\n" };
-
-    const bootstrapper = bootstrap.ZigBootstrapper{
-        .vtable = mock_boot_vtable,
-        .offline = false,
-        .auto_update = false,
-    };
-
-    const reg = testRegistryClient(false);
-    var ctx = testContext(&reg, null);
-    ctx.bootstrapper = &bootstrapper;
-
-    var args = cli.ParsedArgs{};
-    args.command = .run;
-
-    const result = runCmd(&ctx, &args);
-    try testing.expectEqual(CommandResult.file_error, result);
+test "build and run do not execute when the toolchain is unavailable or outdated" {
+    for ([_]bool{ false, true }) |run| {
+        for ([_]?bootstrap.ExecResult{ null, .{ .exit_code = 0, .stdout = "sig 0.4.0 (zig 0.17.0)\n" } }) |version| {
+            resetBuildMocks();
+            mock_boot_exec_result = version;
+            const bootstrapper = bootstrap.SigBootstrapper{
+                .vtable = mock_boot_vtable, .offline = true, .auto_update = false,
+            };
+            const reg = testRegistryClient(false);
+            var ctx = testContext(&reg, null);
+            ctx.bootstrapper = &bootstrapper;
+            ctx.build = &mockBuild;
+            const args = cli.ParsedArgs{};
+            try testing.expectEqual(CommandResult.file_error, if (run) runCmd(&ctx, &args) else buildCmd(&ctx, &args));
+            try testing.expectEqual(@as(usize, 0), mock_build_calls);
+        }
+    }
 }
-
-// ── Build Command Tests ──
-
-test "buildCmd: succeeds when bootstrapper confirms zig installed" {
-    resetMocks();
-    resetBootMocks();
-    MockHttp.reset();
-    mock_boot_exec_result = .{ .exit_code = 0, .stdout = "0.16.0\n" };
-
-    const bootstrapper = bootstrap.ZigBootstrapper{
-        .vtable = mock_boot_vtable,
-        .offline = false,
-        .auto_update = false,
-    };
-
-    const reg = testRegistryClient(false);
-    var ctx = testContext(&reg, null);
-    ctx.bootstrapper = &bootstrapper;
-
-    var args = cli.ParsedArgs{};
-    args.command = .build;
-
-    const result = buildCmd(&ctx, &args);
-    try testing.expectEqual(CommandResult.success, result);
-    try testing.expect(std.mem.indexOf(u8, getStdout(), "executing sig build") != null);
-}
-
-test "buildCmd: fails when zig not available offline" {
-    resetMocks();
-    resetBootMocks();
-    MockHttp.reset();
-    mock_boot_exec_result = null; // zig not found
-
-    const bootstrapper = bootstrap.ZigBootstrapper{
-        .vtable = mock_boot_vtable,
-        .offline = true,
-        .auto_update = false,
-    };
-
-    const reg = testRegistryClient(false);
-    var ctx = testContext(&reg, null);
-    ctx.bootstrapper = &bootstrapper;
-
-    var args = cli.ParsedArgs{};
-    args.command = .build;
-
-    const result = buildCmd(&ctx, &args);
-    try testing.expectEqual(CommandResult.file_error, result);
-    try testing.expect(std.mem.indexOf(u8, getStderr(), "the Sig toolchain is not available") != null);
-}
-
-test "buildCmd: succeeds without bootstrapper" {
-    resetMocks();
-    MockHttp.reset();
-
-    const reg = testRegistryClient(false);
-    const ctx = testContext(&reg, null);
-
-    var args = cli.ParsedArgs{};
-    args.command = .build;
-
-    const result = buildCmd(&ctx, &args);
-    try testing.expectEqual(CommandResult.success, result);
-    try testing.expect(std.mem.indexOf(u8, getStdout(), "executing sig build") != null);
-}
-
-// ── Init Command Mock Infrastructure ──
 
 var mock_init_dirs_created: [16][512]u8 = undefined;
 var mock_init_dirs_created_lens: [16]usize = undefined;
@@ -2086,12 +2023,12 @@ test "doctorCmd: all checks pass with healthy environment" {
     resetBootMocks();
     MockHttp.reset();
     MockHttp.get_response = "ok";
-    mock_boot_exec_result = .{ .exit_code = 0, .stdout = "0.16.0\n" };
+    mock_boot_exec_result = .{ .exit_code = 0, .stdout = "sig 0.5.3 (zig 0.17.0)\n" };
 
     addMockFile("build.sig.zon", sample_zon);
     addMockFile("build.sig", "// build file");
 
-    const bootstrapper = bootstrap.ZigBootstrapper{
+    const bootstrapper = bootstrap.SigBootstrapper{
         .vtable = mock_boot_vtable,
         .offline = false,
         .auto_update = false,
@@ -2124,7 +2061,7 @@ test "doctorCmd: reports failures but runs all checks" {
 
     // No build.sig.zon or build.sig files
 
-    const bootstrapper = bootstrap.ZigBootstrapper{
+    const bootstrapper = bootstrap.SigBootstrapper{
         .vtable = mock_boot_vtable,
         .offline = true,
         .auto_update = false,

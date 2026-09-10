@@ -1,8 +1,10 @@
-// Layer 0 — Zig toolchain bootstrapper.
+// Layer 0 — Sig toolchain bootstrapper.
 // Uses vtable for all I/O (exec, download, extract, print) so the
 // core logic is pure and fully testable without real system calls.
 //
 // Requirements: 15.1, 15.2, 15.3, 15.4, 15.5, 15.6
+
+const builtin = @import("builtin");
 
 // ── Public Types ──
 
@@ -23,42 +25,64 @@ pub const BootstrapResult = enum {
     installed,
     updated,
     failed,
-    offline_no_zig,
+    offline_no_sig,
 };
 
-pub const MINIMUM_ZIG_VERSION = "0.16.0";
+/// Oldest compiler known to provide the native, bounded `sig build` API used
+/// by zpm 0.3. The installed toolchain may (and normally should) be newer.
+pub const MINIMUM_SIG_VERSION = "0.5.2";
 
-const zig_download_url = "https://ziglang.org/download/latest.tar.xz";
-const zig_install_dir = "~/.zpm/toolchain";
+const sig_install_dir = ".zpm/toolchain";
+
+fn sigDownloadUrl() []const u8 {
+    return switch (builtin.os.tag) {
+        .windows => switch (builtin.cpu.arch) {
+            .x86_64 => "https://github.com/SB0LTD/sig/releases/latest/download/sig-x86_64-windows.zip",
+            else => "https://github.com/SB0LTD/sig/releases/latest/download/sig-aarch64-windows.zip",
+        },
+        .macos => switch (builtin.cpu.arch) {
+            .x86_64 => "https://github.com/SB0LTD/sig/releases/latest/download/sig-x86_64-macos.tar.xz",
+            else => "https://github.com/SB0LTD/sig/releases/latest/download/sig-aarch64-macos.tar.xz",
+        },
+        else => switch (builtin.cpu.arch) {
+            .x86_64 => "https://github.com/SB0LTD/sig/releases/latest/download/sig-x86_64-linux.tar.xz",
+            else => "https://github.com/SB0LTD/sig/releases/latest/download/sig-aarch64-linux.tar.xz",
+        },
+    };
+}
+
+fn sigArchivePath() []const u8 {
+    return if (builtin.os.tag == .windows) "sig-latest.zip" else "/tmp/sig-latest.tar.xz";
+}
 
 // ── Bootstrapper ──
 
-pub const ZigBootstrapper = struct {
+pub const SigBootstrapper = struct {
     vtable: BootstrapVtable,
     offline: bool,
     auto_update: bool,
 
-    /// Ensure Zig is available and meets the minimum version requirement.
+    /// Ensure Sig is available and meets the minimum version requirement.
     ///
-    /// 1. exec "zig version"
-    /// 2. If found, parse version, compare >= 0.16.0
+    /// 1. exec "sig version"
+    /// 2. If found, parse version, compare >= MINIMUM_SIG_VERSION
     /// 3. If good → .already_installed
     /// 4. If outdated + auto_update → download → .updated
     /// 5. If outdated + !auto_update → print prompt → .failed
     /// 6. If not found + !offline → download → .installed
-    /// 7. If not found + offline → .offline_no_zig
-    pub fn ensureZig(self: *const ZigBootstrapper) BootstrapResult {
-        // Step 1: Try to exec "zig version"
+    /// 7. If not found + offline → .offline_no_sig
+    pub fn ensureSig(self: *const SigBootstrapper) BootstrapResult {
+        // Step 1: Try to exec "sig version"
         var stdout_buf: [256]u8 = undefined;
-        const exec_result = self.vtable.exec("zig version", &stdout_buf);
+        const exec_result = self.vtable.exec("sig version", &stdout_buf);
 
         if (exec_result) |result| {
             if (result.exit_code == 0 and result.stdout.len > 0) {
-                // Step 2: Parse version from output (e.g. "0.16.0\n" or "0.16.0-dev.123+abc")
+                // Step 2: Validate the Sig version banner without allocating.
                 const version = trimVersion(result.stdout);
 
                 // Step 3: Compare against minimum
-                const cmp = compareVersions(version, MINIMUM_ZIG_VERSION);
+                const cmp = compareVersions(version, MINIMUM_SIG_VERSION);
                 if (cmp >= 0) {
                     // Good — meets minimum version
                     return .already_installed;
@@ -70,21 +94,21 @@ pub const ZigBootstrapper = struct {
                     if (self.downloadAndInstall()) {
                         return .updated;
                     }
-                    self.vtable.print("failed to update zig\n");
+                    self.vtable.print("failed to update sig\n");
                     return .failed;
                 }
 
                 // Step 5: Not auto-updating — prompt user
-                self.vtable.print("zig version is below minimum (0.16.0). please update.\n");
+                self.vtable.print("sig version is below minimum (0.5.2). please update.\n");
                 return .failed;
             }
         }
 
-        // Zig not found
+        // Sig not found
         if (self.offline) {
             // Step 7: Offline, can't download
-            self.vtable.print("zig not found and cannot download in offline mode\n");
-            return .offline_no_zig;
+            self.vtable.print("sig not found and cannot download in offline mode\n");
+            return .offline_no_sig;
         }
 
         // Step 6: Download and install
@@ -92,16 +116,16 @@ pub const ZigBootstrapper = struct {
             return .installed;
         }
 
-        self.vtable.print("failed to download zig — check your internet connection\n");
+        self.vtable.print("failed to download sig — check your internet connection\n");
         return .failed;
     }
 
-    fn downloadAndInstall(self: *const ZigBootstrapper) bool {
-        const archive_path = "/tmp/zig-latest.tar.xz";
-        if (!self.vtable.download(zig_download_url, archive_path)) {
+    fn downloadAndInstall(self: *const SigBootstrapper) bool {
+        const archive_path = sigArchivePath();
+        if (!self.vtable.download(sigDownloadUrl(), archive_path)) {
             return false;
         }
-        if (!self.vtable.extract(archive_path, zig_install_dir)) {
+        if (!self.vtable.extract(archive_path, sig_install_dir)) {
             return false;
         }
         return true;
@@ -110,25 +134,26 @@ pub const ZigBootstrapper = struct {
 
 // ── Version Helpers ──
 
-/// Trim trailing whitespace and anything after '-' or '+' from version output.
-/// "0.16.0\n" → "0.16.0", "0.16.0-dev.123+abc\n" → "0.16.0"
-fn trimVersion(raw: []const u8) []const u8 {
-    var end: usize = raw.len;
-
-    // Trim trailing whitespace/newlines
-    while (end > 0 and (raw[end - 1] == '\n' or raw[end - 1] == '\r' or raw[end - 1] == ' ')) {
-        end -= 1;
-    }
-
-    // Trim at first '-' or '+' (pre-release/build metadata)
-    for (raw[0..end], 0..) |c, i| {
-        if (c == '-' or c == '+') {
-            end = i;
-            break;
+/// Accept only the Sig banner. A bare Zig version cannot establish that the
+/// native Sig build API is available. Invalid or overflowing versions fail closed.
+pub fn trimVersion(raw: []const u8) []const u8 {
+    if (raw.len < 5 or raw[0] != 's' or raw[1] != 'i' or raw[2] != 'g' or raw[3] != ' ') return raw[0..0];
+    var end: usize = 4;
+    var component: usize = 0;
+    while (component < 3) : (component += 1) {
+        var digits: usize = 0;
+        while (end < raw.len and raw[end] >= '0' and raw[end] <= '9') : (end += 1) {
+            digits += 1;
+            if (digits > 9) return raw[0..0];
+        }
+        if (digits == 0) return raw[0..0];
+        if (component < 2) {
+            if (end == raw.len or raw[end] != '.') return raw[0..0];
+            end += 1;
         }
     }
-
-    return raw[0..end];
+    if (end < raw.len and raw[end] != ' ' and raw[end] != '\r' and raw[end] != '\n' and raw[end] != '-' and raw[end] != '+') return raw[0..0];
+    return raw[4..end];
 }
 
 /// Parse a single numeric component from a version string starting at `start`.
@@ -218,145 +243,145 @@ const mock_vtable = BootstrapVtable{
 };
 
 
-// ── ensureZig Tests ──
+// ── ensureSig Tests ──
 
-test "ensureZig: zig at correct version returns already_installed" {
+test "ensureSig: sig at correct version returns already_installed" {
     resetBootstrapMocks();
-    mock_exec_result = .{ .exit_code = 0, .stdout = "0.16.0\n" };
+    mock_exec_result = .{ .exit_code = 0, .stdout = "sig 0.5.2 (zig 0.17.0)\n" };
 
-    const b = ZigBootstrapper{
+    const b = SigBootstrapper{
         .vtable = mock_vtable,
         .offline = false,
         .auto_update = false,
     };
 
-    const result = b.ensureZig();
+    const result = b.ensureSig();
     try testing.expectEqual(BootstrapResult.already_installed, result);
-    // No output when zig is already good
+    // No output when Sig is already good
     try testing.expectEqual(@as(usize, 0), mock_print_len);
 }
 
-test "ensureZig: zig above minimum returns already_installed" {
+test "ensureSig: sig above minimum returns already_installed" {
     resetBootstrapMocks();
-    mock_exec_result = .{ .exit_code = 0, .stdout = "0.17.0\n" };
+    mock_exec_result = .{ .exit_code = 0, .stdout = "sig 0.5.3 (zig 0.17.0)\n" };
 
-    const b = ZigBootstrapper{
+    const b = SigBootstrapper{
         .vtable = mock_vtable,
         .offline = false,
         .auto_update = false,
     };
 
-    const result = b.ensureZig();
+    const result = b.ensureSig();
     try testing.expectEqual(BootstrapResult.already_installed, result);
 }
 
-test "ensureZig: zig not found, online, download succeeds returns installed" {
+test "ensureSig: sig not found, online, download succeeds returns installed" {
     resetBootstrapMocks();
-    mock_exec_result = null; // zig not found
+    mock_exec_result = null; // sig not found
     mock_download_success = true;
     mock_extract_success = true;
 
-    const b = ZigBootstrapper{
+    const b = SigBootstrapper{
         .vtable = mock_vtable,
         .offline = false,
         .auto_update = false,
     };
 
-    const result = b.ensureZig();
+    const result = b.ensureSig();
     try testing.expectEqual(BootstrapResult.installed, result);
 }
 
-test "ensureZig: outdated zig with auto_update returns updated" {
+test "ensureSig: outdated sig with auto_update returns updated" {
     resetBootstrapMocks();
-    mock_exec_result = .{ .exit_code = 0, .stdout = "0.15.0\n" };
+    mock_exec_result = .{ .exit_code = 0, .stdout = "sig 0.2.0 (zig 0.17.0)\n" };
     mock_download_success = true;
     mock_extract_success = true;
 
-    const b = ZigBootstrapper{
+    const b = SigBootstrapper{
         .vtable = mock_vtable,
         .offline = false,
         .auto_update = true,
     };
 
-    const result = b.ensureZig();
+    const result = b.ensureSig();
     try testing.expectEqual(BootstrapResult.updated, result);
 }
 
-test "ensureZig: outdated zig without auto_update returns failed" {
+test "ensureSig: outdated sig without auto_update returns failed" {
     resetBootstrapMocks();
-    mock_exec_result = .{ .exit_code = 0, .stdout = "0.15.0\n" };
+    mock_exec_result = .{ .exit_code = 0, .stdout = "sig 0.2.0 (zig 0.17.0)\n" };
 
-    const b = ZigBootstrapper{
+    const b = SigBootstrapper{
         .vtable = mock_vtable,
         .offline = false,
         .auto_update = false,
     };
 
-    const result = b.ensureZig();
+    const result = b.ensureSig();
     try testing.expectEqual(BootstrapResult.failed, result);
     // Should have printed a message about outdated version
     const output = getPrintOutput();
     try testing.expect(output.len > 0);
 }
 
-test "ensureZig: offline with no zig returns offline_no_zig" {
+test "ensureSig: offline with no sig returns offline_no_sig" {
     resetBootstrapMocks();
-    mock_exec_result = null; // zig not found
+    mock_exec_result = null; // sig not found
 
-    const b = ZigBootstrapper{
+    const b = SigBootstrapper{
         .vtable = mock_vtable,
         .offline = true,
         .auto_update = false,
     };
 
-    const result = b.ensureZig();
-    try testing.expectEqual(BootstrapResult.offline_no_zig, result);
+    const result = b.ensureSig();
+    try testing.expectEqual(BootstrapResult.offline_no_sig, result);
     const output = getPrintOutput();
     try testing.expect(output.len > 0);
 }
 
-test "ensureZig: download failure returns failed" {
+test "ensureSig: download failure returns failed" {
     resetBootstrapMocks();
-    mock_exec_result = null; // zig not found
+    mock_exec_result = null; // sig not found
     mock_download_success = false;
 
-    const b = ZigBootstrapper{
+    const b = SigBootstrapper{
         .vtable = mock_vtable,
         .offline = false,
         .auto_update = false,
     };
 
-    const result = b.ensureZig();
+    const result = b.ensureSig();
     try testing.expectEqual(BootstrapResult.failed, result);
 }
 
-test "ensureZig: extract failure returns failed" {
+test "ensureSig: extract failure returns failed" {
     resetBootstrapMocks();
-    mock_exec_result = null; // zig not found
+    mock_exec_result = null; // sig not found
     mock_download_success = true;
     mock_extract_success = false;
 
-    const b = ZigBootstrapper{
+    const b = SigBootstrapper{
         .vtable = mock_vtable,
         .offline = false,
         .auto_update = false,
     };
 
-    const result = b.ensureZig();
+    const result = b.ensureSig();
     try testing.expectEqual(BootstrapResult.failed, result);
 }
 
-test "ensureZig: dev version with suffix still parses correctly" {
+test "ensureSig: dev version with suffix still parses correctly" {
     resetBootstrapMocks();
-    mock_exec_result = .{ .exit_code = 0, .stdout = "0.16.0-dev.123+abc\n" };
+    mock_exec_result = .{ .exit_code = 0, .stdout = "sig 0.5.3-dev.123+abc (zig 0.17.0)\n" };
 
-    const b = ZigBootstrapper{
+    const b = SigBootstrapper{
         .vtable = mock_vtable,
         .offline = false,
         .auto_update = false,
     };
 
-    const result = b.ensureZig();
+    const result = b.ensureSig();
     try testing.expectEqual(BootstrapResult.already_installed, result);
 }
 
@@ -390,7 +415,7 @@ test "compareVersions: major version differences" {
 
 // **Property 15: Bootstrap Idempotency**
 // Validates: Requirement 15.4
-// For any system state where Zig >= 0.16.0, calling ensureZig() twice shall
+// For any system state where Sig >= 0.5.2, calling ensureSig() twice shall
 // both return already_installed, produce no output, and trigger no downloads.
 
 var mock_download_call_count: usize = 0;
@@ -413,15 +438,11 @@ const counting_vtable = BootstrapVtable{
     .print = &mockPrint,
 };
 
-test "property 15: bootstrap idempotency — ensureZig twice with good version" {
+test "property 15: bootstrap idempotency — ensureSig twice with good version" {
     // **Validates: Requirements 15.4**
     const versions = [_][]const u8{
-        "0.16.0\n",  "0.17.0\n",  "0.16.1\n",  "1.0.0\n",
-        "0.20.0\n",  "0.16.0-dev.100+abc\n",
-        "2.0.0\n",   "0.16.5\n",  "0.99.0\n",  "0.16.0-rc1\n",
-        "0.18.3\n",  "0.16.2\n",  "3.1.0\n",   "0.17.1\n",
-        "0.19.0\n",  "0.16.9\n",  "1.1.0\n",   "0.21.0\n",
-        "0.16.3\n",  "0.25.0\n",
+        "sig 0.5.2 (zig 0.17.0)\n", "sig 0.5.3 (zig 0.17.0)\n",
+        "sig 0.5.3-dev.100+abc (zig 0.17.0)\n", "sig 0.6.0\n", "sig 1.0.0\n",
     };
 
     var iter: usize = 0;
@@ -433,19 +454,19 @@ test "property 15: bootstrap idempotency — ensureZig twice with good version" 
         mock_extract_call_count = 0;
         mock_exec_result = .{ .exit_code = 0, .stdout = version };
 
-        const b = ZigBootstrapper{
+        const b = SigBootstrapper{
             .vtable = counting_vtable,
             .offline = false,
             .auto_update = false,
         };
 
         // First call
-        const result1 = b.ensureZig();
+        const result1 = b.ensureSig();
         try testing.expectEqual(BootstrapResult.already_installed, result1);
         const print_after_first = mock_print_len;
 
         // Second call
-        const result2 = b.ensureZig();
+        const result2 = b.ensureSig();
         try testing.expectEqual(BootstrapResult.already_installed, result2);
 
         // No output on either call
@@ -456,4 +477,11 @@ test "property 15: bootstrap idempotency — ensureZig twice with good version" 
         try testing.expectEqual(@as(usize, 0), mock_download_call_count);
         try testing.expectEqual(@as(usize, 0), mock_extract_call_count);
     }
+}
+
+test "Sig version gate rejects unrelated and malformed output" {
+    for ([_][]const u8{ "0.17.0", "zig 0.17.0", "hello 3.0.0", "sig 0.5", "sig 0.5.3oops", "sig 9999999999999999.0.0" }) |output| {
+        try testing.expectEqual(@as(usize, 0), trimVersion(output).len);
+    }
+    try testing.expectEqualStrings("0.5.3", trimVersion("sig 0.5.3 (zig 0.17.0)"));
 }

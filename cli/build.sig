@@ -56,6 +56,14 @@ fn addPkgTest(
 }
 
 pub fn build(ctx: *sig_build.Build_Context) !void {
+    var process_path: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    const lib = ctx.sig_lib_dir[0..ctx.sig_lib_dir_len];
+    const suffix = "/sig/process.sig";
+    if (lib.len + suffix.len > process_path.len) return error.BufferTooSmall;
+    @memcpy(process_path[0..lib.len], lib);
+    @memcpy(process_path[lib.len..][0..suffix.len], suffix);
+    const process_source = process_path[0..lib.len + suffix.len];
+    _ = try ctx.addModule("sig_process", process_source);
     // Select the platform backend by the *target* OS when cross-compiling
     // (-Dtarget=...), else by the host OS. The win32 module is Windows-only;
     // every other OS uses the POSIX/linux platform shim.
@@ -119,6 +127,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("telemetry", "../src/transport/telemetry.sig"),
             importEntry("win32", win32_path),
             importEntry("pal", "pal.sig"),
+            importEntry("sig_process", process_source),
         },
         .compiler_path = "",
     });

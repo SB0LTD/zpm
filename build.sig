@@ -39,6 +39,57 @@ fn addTest(
     return step;
 }
 
+// These contracts have runnable mains and assertion counters. A compiler that
+// discovers zero `test` declarations cannot accidentally accept this suite.
+fn runContract(ctx: *sig_build.Step_Context) sig_build.SigError!void {
+    const entry = &ctx.build_ctx.steps.entries[ctx.step_handle];
+    const name = entry.desc[0..entry.desc_len];
+    const prefix = ctx.build_ctx.install_prefix[0..ctx.build_ctx.install_prefix_len];
+    const suffix = if (builtin.os.tag == .windows) ".exe" else "";
+    var path: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    const len = prefix.len + 5 + name.len + suffix.len;
+    if (len > path.len) return error.BufferTooSmall;
+    @memcpy(path[0..prefix.len], prefix);
+    @memcpy(path[prefix.len..][0..5], "/bin/");
+    @memcpy(path[prefix.len + 5..][0..name.len], name);
+    @memcpy(path[prefix.len + 5 + name.len..][0..suffix.len], suffix);
+    var cmd: sig_build.Command_Buffer = .{};
+    try cmd.appendArg(path[0..len]);
+    const step_name = entry.name[0..entry.name_len];
+    const negative = namesEqual(step_name, "prove-now-assertions");
+    if (negative) try cmd.appendArg("--prove-failure");
+    try cmd.setCwd(ctx.build_ctx.build_root[0..ctx.build_ctx.build_root_len]);
+    var errors: [sig_build.STDERR_CAPTURE_SIZE]u8 = undefined;
+    var errors_len: usize = 0;
+    const status = try sig_build.runCommand(&cmd, &errors, &errors_len, ctx.io);
+    if (negative) {
+        if (status == 0) return error.BufferTooSmall;
+        sig_build.printMsg(ctx.io, "PASS intentional assertion failure detected", .{});
+    } else {
+        if (errors_len != 0) sig_build.printMsg(ctx.io, "{s}", .{errors[0..errors_len]});
+        if (status != 0) return error.BufferTooSmall;
+    }
+}
+
+fn namesEqual(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| if (left != right) return false;
+    return true;
+}
+
+fn addContract(ctx: *sig_build.Build_Context, aggregate: sig_build.Step_Handle, comptime name: []const u8, source: []const u8, imports: []const sig_build.Import_Entry) !sig_build.Step_Handle {
+    const compiled = try ctx.addCompileStep(.{
+        .source_path = source, .output_name = name,
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len], .optimize = ctx.optimize,
+        .target = null,
+        .imports = imports, .compiler_path = "",
+    });
+    const run = try ctx.addStep("run-" ++ name, name, &runContract);
+    try ctx.addDependency(run, compiled);
+    try ctx.addDependency(aggregate, run);
+    return compiled;
+}
+
 pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_all = try ctx.addStep("test", "Run all ZPM unit and compliance tests", &noopStep);
 
@@ -50,10 +101,37 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, synth_voice, "sig_math", "src/core/sig_math.sig");
     _ = try ctx.addModule("sig_mem", "src/core/sig_mem.sig");
     _ = try ctx.addModule("sig_testing", "src/core/sig_testing.sig");
+    const sig_text = try ctx.addModule("sig_text", "src/core/sig_text.sig");
+    try wire(ctx, sig_text, "sig_mem", "src/core/sig_mem.sig");
+    inline for (.{ "ephemeral_scene", "now_voice_output", "device_control", "english_phonemes" }) |name| {
+        const module = try ctx.addModule(name, "src/core/" ++ name ++ ".sig");
+        try wire(ctx, module, "sig_mem", "src/core/sig_mem.sig");
+        try wire(ctx, module, "sig_text", "src/core/sig_text.sig");
+        try wire(ctx, module, "sig_testing", "src/core/sig_testing.sig");
+    }
+    const test_now = try ctx.addStep("test-now", "Execute bounded scene, voice, device and speech-text contracts", &noopStep);
+    try ctx.addDependency(test_all, test_now);
+    const scene_contract = try addContract(ctx, test_now, "contract-ephemeral-scene", "tests/test_ephemeral_scene.sig", &.{importEntry("ephemeral_scene", "src/core/ephemeral_scene.sig")});
+    const negative = try ctx.addStep("prove-now-assertions", "contract-ephemeral-scene", &runContract);
+    try ctx.addDependency(negative, scene_contract);
+    try ctx.addDependency(test_now, negative);
+    _ = try addContract(ctx, test_now, "contract-now-voice", "tests/test_now_voice_output.sig", &.{importEntry("now_voice_output", "src/core/now_voice_output.sig")});
+    _ = try addContract(ctx, test_now, "contract-device-control", "tests/test_device_control.sig", &.{importEntry("device_control", "src/core/device_control.sig")});
+    _ = try addContract(ctx, test_now, "contract-speech-text", "tests/test_speech_text.sig", &.{
+        importEntry("english_phonemes", "src/core/english_phonemes.sig"),
+        importEntry("sig_text", "src/core/sig_text.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
+    });
     const json = try ctx.addModule("json", "src/core/json.sig");
     try wire(ctx, json, "sig_mem", "src/core/sig_mem.sig");
-    _ = try ctx.addModule("sha256", "src/core/sha256.sig");
-    _ = try ctx.addModule("inflate", "src/core/inflate.sig");
+    const sha256 = try ctx.addModule("sha256", "src/core/sha256.sig");
+    try wire(ctx, sha256, "sig_mem", "src/core/sig_mem.sig");
+    try wire(ctx, sha256, "sig_testing", "src/core/sig_testing.sig");
+    const inflate = try ctx.addModule("inflate", "src/core/inflate.sig");
+    try wire(ctx, inflate, "sig_mem", "src/core/sig_mem.sig");
+    const opus = try ctx.addModule("opus", "src/core/opus.sig");
+    try wire(ctx, opus, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, opus, "sig_mem", "src/core/sig_mem.sig");
+    try wire(ctx, opus, "sig_testing", "src/core/sig_testing.sig");
 
     // ── Image analysis + Elementor (Layer 0: pure computation) ──
     const png_decode = try ctx.addModule("png_decode", "src/image/png_decode.sig");
@@ -100,11 +178,15 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, jsonl, "json", "src/core/json.sig");
     try wire(ctx, jsonl, "sig_mem", "src/core/sig_mem.sig");
     try wire(ctx, jsonl, "sig_testing", "src/core/sig_testing.sig");
-    _ = try ctx.addModule("ai_core", "src/core/ai_core.sig");
+    const ai_core = try ctx.addModule("ai_core", "src/core/ai_core.sig");
+    try wire(ctx, ai_core, "sig_testing", "src/core/sig_testing.sig");
     _ = try ctx.addModule("quantized_linear", "src/core/quantized_linear.sig");
     const transformer_ops = try ctx.addModule("transformer_ops", "src/core/transformer_ops.sig");
     try wire(ctx, transformer_ops, "sig_math", "src/core/sig_math.sig");
-    _ = try ctx.addModule("audio_dsp", "src/core/audio_dsp.sig");
+    const audio_dsp = try ctx.addModule("audio_dsp", "src/core/audio_dsp.sig");
+    try wire(ctx, audio_dsp, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, audio_dsp, "sig_mem", "src/core/sig_mem.sig");
+    try wire(ctx, audio_dsp, "sig_testing", "src/core/sig_testing.sig");
     const vector_memory = try ctx.addModule("vector_memory", "src/core/vector_memory.sig");
     try wire(ctx, vector_memory, "sig_math", "src/core/sig_math.sig");
     try wire(ctx, vector_memory, "sig_mem", "src/core/sig_mem.sig");
@@ -136,6 +218,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, cognitive_receipt, "multimodal_now", "src/core/multimodal_now.sig");
     try wire(ctx, cognitive_receipt, "sig_testing", "src/core/sig_testing.sig");
     const core = try ctx.addModule("core", "src/core/root.sig");
+    try wire(ctx, core, "sig_mem", "src/core/sig_mem.sig");
+    inline for (.{ "sig_text", "ephemeral_scene", "now_voice_output", "device_control", "english_phonemes" }) |name|
+        try wire(ctx, core, name, "src/core/" ++ name ++ ".sig");
     try wire(ctx, core, "math", "src/core/math.sig");
     try wire(ctx, core, "json", "src/core/json.sig");
     try wire(ctx, core, "sha256", "src/core/sha256.sig");
@@ -151,12 +236,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, core, "model_observability", "src/core/model_observability.sig");
     try wire(ctx, core, "multimodal_now", "src/core/multimodal_now.sig");
 
-    _ = try addTest(ctx, test_all, "test-ai-core", "src/core/ai_core.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-ai-core", "src/core/ai_core.sig", &.{importEntry("sig_testing", "src/core/sig_testing.sig")});
     _ = try addTest(ctx, test_all, "test-quantized-linear", "src/core/quantized_linear.sig", &.{});
     _ = try addTest(ctx, test_all, "test-transformer-ops", "src/core/transformer_ops.sig", &.{
         importEntry("sig_math", "src/core/sig_math.sig"),
     });
-    _ = try addTest(ctx, test_all, "test-audio-dsp", "src/core/audio_dsp.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-audio-dsp", "src/core/audio_dsp.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"), importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-math", "src/core/math.sig", &.{});
     _ = try addTest(ctx, test_all, "test-sig-math", "src/core/sig_math.sig", &.{});
     _ = try addTest(ctx, test_all, "test-synth_voice", "src/core/synth_voice.sig", &.{
@@ -194,7 +281,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("sig_math", "src/core/sig_math.sig"),
         importEntry("sig_mem", "src/core/sig_mem.sig"),
     });
-    _ = try addTest(ctx, test_all, "test-sha256", "src/core/sha256.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-sha256", "src/core/sha256.sig", &.{
+        importEntry("sig_mem", "src/core/sig_mem.sig"), importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-hmac", "src/core/crypto/hmac.sig", &.{
         importEntry("sha256", "src/core/sha256.sig"),
     });
