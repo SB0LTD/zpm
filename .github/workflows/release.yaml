@@ -18,9 +18,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SIG_RELEASE_TAG: bootstrap-sig-v72
-  SIG_RELEASE_ASSET: bootstrap-sig-x86_64-linux.tar.zst
-  SIG_RELEASE_SHA256: 8972e90749c3e257a8bf9f6ecd7f651fd4f8d576db776d4fd5bf7de15bd18705
+  SIG_RELEASE_TAG: sig-0.5.3-zig0.17.0.006b944
+  SIG_RELEASE_ASSET: sig-0.5.3-zig0.17.0.006b944-x86_64-linux.tar.xz
+  SIG_RELEASE_SHA256: ee8abe56d30d2e0d9cddb5c74d2b5c7ccf84f94eeaa0fe6f30fa7b0a9c2b7920
   SIG_RUNTIME_REF: bc2fa64b4be94996feedc9b780eb1469c395da7d
 
 jobs:
