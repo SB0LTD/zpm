@@ -10,7 +10,7 @@
 //   const result = state.decompress(input, output) catch |e| { ... };
 //   // result.in_consumed, result.out_produced, result.done
 
-const mem = @import("sig_mem.sig");
+const mem = @import("sig_mem");
 
 // ── Public Types ─────────────────────────────────────────────────────────────
 

@@ -3,6 +3,7 @@
 // No allocator, no std I/O. All I/O through PAL.
 
 const pal = @import("pal");
+const process = @import("sig_process");
 const cli = @import("cli.sig");
 const commands = @import("commands.sig");
 const registry = @import("registry.sig");
@@ -88,122 +89,42 @@ const pal_boot_vtable = bootstrap.BootstrapVtable{
 };
 // ── Cross-platform argument retrieval ──
 
-const builtin = @import("builtin");
-const os_tag = builtin.os.tag;
+// Minimal startup exposes native argv without initializing an allocator.
+const std = @import("std");
+var arg_store: [process.MAX_CMD_ARGS][process.MAX_ARG_LEN]u8 = undefined;
+var arg_ptrs: [process.MAX_CMD_ARGS][]const u8 = undefined;
+var decoded_arg: [98_304]u8 = undefined;
+var build_command: process.Command_Buffer = .{};
 
-var arg_store: [64][256]u8 = undefined;
-var arg_ptrs: [64][]const u8 = undefined;
-
-fn getArgs() []const []const u8 {
-    if (os_tag == .windows) {
-        return getArgsWindows();
-    } else {
-        return getArgsPosix();
-    }
-}
-
-// Windows: use CommandLineToArgvW
-const LPCWSTR = [*:0]const u16;
-const win32_args = if (os_tag == .windows) struct {
-    extern "kernel32" fn GetCommandLineW() callconv(.c) LPCWSTR;
-    extern "shell32" fn CommandLineToArgvW(LPCWSTR, *c_int) callconv(.c) ?[*][*:0]const u16;
-    extern "kernel32" fn LocalFree(?*anyopaque) callconv(.c) ?*anyopaque;
-} else struct {};
-
-fn getArgsWindows() []const []const u8 {
-    var argc: c_int = 0;
-    const argv = win32_args.CommandLineToArgvW(win32_args.GetCommandLineW(), &argc) orelse return &.{};
-    defer _ = win32_args.LocalFree(@ptrCast(argv));
-    const cnt: usize = @intCast(argc);
-    if (cnt <= 1) return &.{};
+fn getArgs(init: std.process.Init.Minimal) []const []const u8 {
+    var iterator = process.Argv_Iterator.init(init.args.vector, &decoded_arg);
+    _ = iterator.next() catch process.exit(2);
     var n: usize = 0;
-    for (1..cnt) |i| {
-        const w = argv[i];
-        var len: usize = 0;
-        while (len < 255 and w[len] != 0) : (len += 1) {
-            arg_store[n][len] = @truncate(w[len]);
+    while (iterator.next() catch process.exit(2)) |arg| {
+        if (n == arg_ptrs.len or arg.len > arg_store[n].len) {
+            pal.writeStderr("zpm: argument capacity exceeded\n");
+            process.exit(2);
         }
-        arg_ptrs[n] = arg_store[n][0..len];
+        // Windows reuses its decoding buffer. Copy before advancing,
+        // retaining empty arguments and failing on overflow, never truncating.
+        @memcpy(arg_store[n][0..arg.len], arg);
+        arg_ptrs[n] = arg_store[n][0..arg.len];
         n += 1;
-        if (n >= 64) break;
     }
     return arg_ptrs[0..n];
 }
 
-// POSIX: use /proc/self/cmdline on Linux, or __argc/__argv pattern
-// For simplicity, we use a C-compatible main and store args at startup.
-// Since Zig's entry point calls main(), we use @import("std").os for args.
-// Actually, for zero-alloc we'll use the same approach as the original but
-// with POSIX-compatible arg reading.
-
-var posix_argc: usize = 0;
-var posix_argv_set: bool = false;
-
-fn getArgsPosix() []const []const u8 {
-    // Read from /proc/self/cmdline on Linux, or use a stub
-    if (os_tag == .linux) {
-        return readProcCmdline();
-    }
-    // macOS: read from /proc not available, use _NSGetArgc/_NSGetArgv
-    if (os_tag == .macos) {
-        return getMacArgs();
-    }
-    return &.{};
-}
-
-fn readProcCmdline() []const []const u8 {
-    var cmdline_buf: [4096]u8 = undefined;
-    const content = pal.readFile("/proc/self/cmdline", &cmdline_buf) catch return &.{};
-    // Parse null-separated args, skip argv[0]
-    var n: usize = 0;
-    var start: usize = 0;
-    var skip_first = true;
-    for (content, 0..) |c, idx| {
-        if (c == 0) {
-            if (skip_first) {
-                skip_first = false;
-            } else if (idx > start) {
-                const len = idx - start;
-                if (n < 64 and len < 256) {
-                    @memcpy(arg_store[n][0..len], content[start..idx]);
-                    arg_ptrs[n] = arg_store[n][0..len];
-                    n += 1;
-                }
-            }
-            start = idx + 1;
-        }
-    }
-    return arg_ptrs[0..n];
-}
-
-const mac_args = if (os_tag == .macos) struct {
-    extern "c" fn _NSGetArgc() *c_int;
-    extern "c" fn _NSGetArgv() *[*][*:0]const u8;
-} else struct {};
-
-fn getMacArgs() []const []const u8 {
-    const argc_ptr = mac_args._NSGetArgc();
-    const argv_ptr = mac_args._NSGetArgv();
-    const argc: usize = @intCast(argc_ptr.*);
-    const argv = argv_ptr.*;
-    if (argc <= 1) return &.{};
-    var n: usize = 0;
-    for (1..argc) |i| {
-        const arg = argv[i];
-        var len: usize = 0;
-        while (len < 255 and arg[len] != 0) : (len += 1) {
-            arg_store[n][len] = arg[len];
-        }
-        arg_ptrs[n] = arg_store[n][0..len];
-        n += 1;
-        if (n >= 64) break;
-    }
-    return arg_ptrs[0..n];
-}
-// ── Entry Point ──
-
-pub fn main() void {
-    const args = getArgs();
+pub fn main(init: std.process.Init.Minimal) void {
+    const args = getArgs(init);
+    // Build flags and arguments belong to Sig, including `--` and unknown
+    // future flags. Forward their exact argv before ZPM's package parser.
+    if (args.len != 0 and (eqlStr(args[0], "build") or eqlStr(args[0], "run")))
+        process.exit(delegateBuild(eqlStr(args[0], "run"), args[1..]) catch |failure| {
+            pal.writeStderr("zpm: cannot execute Sig build: ");
+            pal.writeStderr(@errorName(failure));
+            pal.writeStderr("\nSet SIG to a working SB0LTD/Sig executable.\n");
+            process.exit(127);
+        });
     switch (cli.parse(args)) {
         .err => |e| {
             pal.writeStderr("error: ");
@@ -214,9 +135,31 @@ pub fn main() void {
                 pal.writeStderr(s);
                 pal.writeStderr("?\n");
             }
+            process.exit(2);
         },
         .ok => |parsed| dispatch(&parsed),
     }
+}
+
+fn delegateBuild(run: bool, args: []const []const u8) !u8 {
+    var compiler_buffer: [4096]u8 = undefined;
+    const configured = try process.getenv("SIG", &compiler_buffer);
+    const compiler = if (configured) |value| (if (value.len != 0) value else "sig") else "sig";
+    build_command = .{};
+    try build_command.appendArg(compiler);
+    try build_command.appendArg("build");
+    if (run) try build_command.appendArg("run");
+    for (args) |argument| try build_command.appendArg(argument);
+    var child = try process.spawn(.{}, &build_command, .{});
+    return switch (try child.wait(.{})) {
+        .exited => |code| code,
+        .signal => |signal| process.signalToExitCode(signal),
+        else => 1,
+    };
+}
+
+fn buildCb(run: bool, args: []const []const u8) u8 {
+    return delegateBuild(run, args) catch 127;
 }
 
 fn dispatch(parsed: *const cli.ParsedArgs) void {
@@ -267,7 +210,7 @@ fn dispatch(parsed: *const cli.ParsedArgs) void {
         .offline = parsed.flags.offline,
         .http = selected_http,
     };
-    const boot = bootstrap.ZigBootstrapper{
+    const boot = bootstrap.SigBootstrapper{
         .vtable = pal_boot_vtable,
         .offline = parsed.flags.offline,
         .auto_update = parsed.yes,
@@ -279,6 +222,7 @@ fn dispatch(parsed: *const cli.ParsedArgs) void {
         .read_file = &readFileCb,
         .write_file = &writeFileCb,
         .bootstrapper = &boot,
+        .build = &buildCb,
         .init_create_dir = &createDirCb,
         .init_write_file = &writeFileCb,
         .init_dir_exists = &dirExistsCb,
@@ -286,7 +230,7 @@ fn dispatch(parsed: *const cli.ParsedArgs) void {
         .init_remove_dir = &removeDirCb,
         .init_print = &pal.writeStdout,
     };
-    _ = switch (cmd) {
+    const result = switch (cmd) {
         .init => commands.initCmd(&ctx, parsed),
         .install => commands.install(&ctx, parsed),
         .uninstall => commands.uninstall(&ctx, parsed),
@@ -300,6 +244,7 @@ fn dispatch(parsed: *const cli.ParsedArgs) void {
         .build => commands.buildCmd(&ctx, parsed),
         .help, .version => unreachable,
     };
+    if (result != .success) process.exit(1);
 }
 
 fn eqlStr(a: []const u8, b: []const u8) bool {

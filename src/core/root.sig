@@ -6,6 +6,11 @@
 // share the same source files.
 
 pub const math = @import("math");
+pub const text = @import("sig_text");
+pub const ephemeral_scene = @import("ephemeral_scene");
+pub const now_voice_output = @import("now_voice_output");
+pub const device_control = @import("device_control");
+pub const english_phonemes = @import("english_phonemes");
 pub const json = @import("json");
 pub const sha256 = @import("sha256");
 pub const jsonl = @import("jsonl");

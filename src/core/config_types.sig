@@ -4,7 +4,7 @@
 // These types are used by Config for parsing and by other modules
 // that need to reference config values without pulling in the parser.
 
-const mem = @import("sig_mem.sig");
+const mem = @import("sig_mem");
 
 /// Max length for any single config string value
 pub const MAX_VAL = 256;
