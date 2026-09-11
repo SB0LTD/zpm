@@ -1,9 +1,7 @@
 // @zpm/asr — Model Integration Module
-// Full ASR pipeline: WAV → mel → encode → decode → text
-//
-// Public API:
-//   Model.init(model_dir) — load weights from safetensors
-//   Model.transcribe(audio_samples, n_samples, language) — full transcription
+// Experimental model orchestration; encoder/decoder parity and native model
+// binding are not yet admitted. The current output is packed token IDs, not
+// decoded UTF-8. Callers supply all frontend storage; no large stack buffers.
 //
 // Prompt template (Qwen3-ASR chat format):
 //   <|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>
@@ -12,7 +10,7 @@
 //
 // Decode: generate tokens until EOS, parse after <asr_text>
 
-const mel = @import("mel.sig");
+const mel = @import("asr_mel");
 const encoder = @import("encoder.sig");
 const decoder = @import("decoder.sig");
 
@@ -49,10 +47,10 @@ pub const Model = struct {
         };
     }
 
-    /// Transcribe audio samples to text.
+    /// Experimental transcription to packed little-endian token IDs.
     /// audio: pointer to f32 samples at 16kHz mono
     /// n_samples: number of samples
-    /// out_text: buffer to write UTF-8 text into
+    /// out_text: buffer for token IDs; UTF-8 detokenization is not implemented
     /// Returns: number of bytes written to out_text
     pub fn transcribe(
         self: *Model,
@@ -60,41 +58,17 @@ pub const Model = struct {
         n_samples: usize,
         out_text: [*]u8,
         out_cap: usize,
+        mel_output: []f32,
+        mel_workspace: *mel.Workspace,
     ) usize {
         if (!self.loaded) return 0;
 
-        // Step 1: Compute mel spectrogram
-        const n_frames = mel.numFrames(n_samples);
-        if (n_frames == 0) return 0;
-
-        // Allocate mel buffer (n_frames * 128 f32)
-        // For 91 min audio: ~550K frames × 128 = 70M floats = 280MB
-        // This needs external allocation. For now use a bounded static.
-        const max_mel_frames: usize = 60000; // ~10 min of audio
-        var mel_buf: [max_mel_frames * mel.N_MELS]f32 = undefined;
-        const actual_frames = @min(n_frames, max_mel_frames);
-        _ = mel.compute(audio, @min(n_samples, actual_frames * mel.HOP_LENGTH + mel.N_FFT), &mel_buf);
-
-        // Apply Qwen3-ASR mel normalization:
-        // log_spec = log10(clamp(mel_spec, min=1e-10))
-        // log_spec = max(log_spec, log_spec.max() - 8.0)
-        // log_spec = (log_spec + 4.0) / 4.0
-        var mel_max: f32 = -1000.0;
-        var mi: usize = 0;
-        while (mi < actual_frames * mel.N_MELS) : (mi += 1) {
-            // Convert from ln to log10: log10(x) = ln(x) / ln(10)
-            mel_buf[mi] = mel_buf[mi] / 2.302585093; // our mel.sig outputs ln, convert to log10
-            if (mel_buf[mi] > mel_max) mel_max = mel_buf[mi];
-        }
-        const floor = mel_max - 8.0;
-        mi = 0;
-        while (mi < actual_frames * mel.N_MELS) : (mi += 1) {
-            if (mel_buf[mi] < floor) mel_buf[mi] = floor;
-            mel_buf[mi] = (mel_buf[mi] + 4.0) / 4.0;
-        }
+        // The model frontend owns centering, frame count and normalization.
+        // Reject oversized audio/output before touching model weights.
+        const actual_frames = mel.computeBounded(audio[0..n_samples], mel_output, mel_workspace) catch return 0;
 
         // Step 2: Run encoder
-        const n_enc_tokens = encoder.encode(&mel_buf, actual_frames, &self.enc_weights, &self.enc_cfg);
+        const n_enc_tokens = encoder.encode(mel_output.ptr, actual_frames, &self.enc_weights, &self.enc_cfg);
         if (n_enc_tokens == 0) return 0;
         const enc_out = encoder.getOutput();
 

@@ -13,7 +13,7 @@
 //   - System prompt biases toward Torah terminology
 //   - Spelling preservation for common Hebrew terms
 
-const mel_mod = @import("mel.sig");
+const mel_mod = @import("asr_mel");
 const encoder_mod = @import("encoder.sig");
 const decoder_mod = @import("decoder.sig");
 
@@ -104,25 +104,21 @@ pub const StreamState = struct {
         dec_weights: *const decoder_mod.DecoderWeights,
         dec_cfg: *const decoder_mod.DecoderConfig,
         kv_cache: *decoder_mod.KVCache,
+        mel_output: []f32,
+        mel_workspace: *mel_mod.Workspace,
     ) []const u32 {
-        self.chunk_num += 1;
         const prev_fixed = self.fixed_count;
 
-        // Step 1: Encode ALL accumulated audio
-        const n_frames = mel_mod.numFrames(self.audio_len);
-        if (n_frames == 0) return self.token_history[prev_fixed..prev_fixed];
-
-        // Compute mel (uses static buffer in mel_mod)
-        var mel_buf: [60000 * 128]f32 = undefined;
-        const actual_frames = @min(n_frames, 60000);
-        _ = mel_mod.compute(self.audio_buf, self.audio_len, &mel_buf);
-
-        // Normalize mel (Qwen3-ASR style)
-        normalizeMel(&mel_buf, actual_frames * 128);
+        // Caller-owned, normalized features. Reject overflow without changing
+        // streaming state; long sessions must segment audio explicitly.
+        const actual_frames = mel_mod.computeBounded(self.audio_buf[0..self.audio_len], mel_output, mel_workspace) catch
+            return self.token_history[prev_fixed..prev_fixed];
 
         // Encode
-        const n_enc_tokens = encoder_mod.encode(&mel_buf, actual_frames, enc_weights, enc_cfg);
+        const n_enc_tokens = encoder_mod.encode(mel_output.ptr, actual_frames, enc_weights, enc_cfg);
         if (n_enc_tokens == 0) return self.token_history[prev_fixed..prev_fixed];
+
+        self.chunk_num += 1;
 
         // Step 2: Build decoder prompt with prefix
         kv_cache.seq_len = 0; // Reset KV cache each chunk (re-encode everything)
@@ -168,7 +164,10 @@ pub const StreamState = struct {
             const next = decoder_mod.forward(emb, kv_cache, dec_weights, dec_cfg);
 
             if (decoder_mod.isEos(next)) break;
-            if (next == decoder_mod.TOKEN_ASR_TEXT) { prev_token = next; continue; }
+            if (next == decoder_mod.TOKEN_ASR_TEXT) {
+                prev_token = next;
+                continue;
+            }
 
             // Replace token history from the prefix-end point
             if (self.chunk_num <= self.cfg.unfixed_chunks) {
@@ -216,21 +215,3 @@ pub const HEBREW_SYSTEM_PROMPT = "Transcribe Hebrew speech accurately. Preserve 
 
 pub const TORAH_BIASING_PROMPT = "This is a Torah shiur. Preserve Hebrew religious terminology and " ++
     "proper nouns. Use standard Israeli Hebrew orthography.";
-
-// ── Mel normalization (Qwen3-ASR specific) ──
-fn normalizeMel(mel_buf: [*]f32, total_elements: usize) void {
-    // Convert ln → log10
-    var i: usize = 0;
-    var mel_max: f32 = -1000.0;
-    while (i < total_elements) : (i += 1) {
-        mel_buf[i] = mel_buf[i] / 2.302585093;
-        if (mel_buf[i] > mel_max) mel_max = mel_buf[i];
-    }
-    // Dynamic range clamp + normalize
-    const floor = mel_max - 8.0;
-    i = 0;
-    while (i < total_elements) : (i += 1) {
-        if (mel_buf[i] < floor) mel_buf[i] = floor;
-        mel_buf[i] = (mel_buf[i] + 4.0) / 4.0;
-    }
-}

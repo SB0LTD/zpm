@@ -1,0 +1,270 @@
+{
+  "fixtures": [
+    {
+      "bytes": 248,
+      "file": "floats.bin",
+      "header_bytes": 224,
+      "reordered_header": false,
+      "sha256": "6c75c98a748cc6f29536919c8d361cb5c8d1ed5a48ced2f54158b35e6b670e29",
+      "tensors": {
+        "bf16": {
+          "data_hex": "803f00c0",
+          "data_offsets": [
+            8,
+            12
+          ],
+          "dtype": "BF16",
+          "shape": [
+            2
+          ]
+        },
+        "f16": {
+          "data_hex": "003800c4",
+          "data_offsets": [
+            12,
+            16
+          ],
+          "dtype": "F16",
+          "shape": [
+            2
+          ]
+        },
+        "f32": {
+          "data_hex": "000080be00006040",
+          "data_offsets": [
+            0,
+            8
+          ],
+          "dtype": "F32",
+          "shape": [
+            2
+          ]
+        }
+      }
+    },
+    {
+      "bytes": 630,
+      "file": "integers.bin",
+      "header_bytes": 560,
+      "reordered_header": false,
+      "sha256": "570bcd37c026a61eeffccfbce48037100daff5260246e0cc95306473f8195e2b",
+      "tensors": {
+        "bool": {
+          "data_hex": "0001",
+          "data_offsets": [
+            60,
+            62
+          ],
+          "dtype": "BOOL",
+          "shape": [
+            2
+          ]
+        },
+        "i16": {
+          "data_hex": "0080ff7f",
+          "data_offsets": [
+            52,
+            56
+          ],
+          "dtype": "I16",
+          "shape": [
+            2
+          ]
+        },
+        "i32": {
+          "data_hex": "00000080ffffff7f",
+          "data_offsets": [
+            40,
+            48
+          ],
+          "dtype": "I32",
+          "shape": [
+            2
+          ]
+        },
+        "i64": {
+          "data_hex": "0000000000000080ffffffffffffff7f",
+          "data_offsets": [
+            16,
+            32
+          ],
+          "dtype": "I64",
+          "shape": [
+            2
+          ]
+        },
+        "i8": {
+          "data_hex": "807f",
+          "data_offsets": [
+            56,
+            58
+          ],
+          "dtype": "I8",
+          "shape": [
+            2
+          ]
+        },
+        "u16": {
+          "data_hex": "0000ffff",
+          "data_offsets": [
+            48,
+            52
+          ],
+          "dtype": "U16",
+          "shape": [
+            2
+          ]
+        },
+        "u32": {
+          "data_hex": "00000000ffffffff",
+          "data_offsets": [
+            32,
+            40
+          ],
+          "dtype": "U32",
+          "shape": [
+            2
+          ]
+        },
+        "u64": {
+          "data_hex": "0000000000000000ffffffffffffffff",
+          "data_offsets": [
+            0,
+            16
+          ],
+          "dtype": "U64",
+          "shape": [
+            2
+          ]
+        },
+        "u8": {
+          "data_hex": "00ff",
+          "data_offsets": [
+            58,
+            60
+          ],
+          "dtype": "U8",
+          "shape": [
+            2
+          ]
+        }
+      }
+    },
+    {
+      "bytes": 252,
+      "file": "empty-scalar.bin",
+      "header_bytes": 232,
+      "reordered_header": false,
+      "sha256": "e0174896d42f08e68ef58cf2a3e87aa902a79d45ef49f790d687ef57f35b9203",
+      "tensors": {
+        "empty": {
+          "data_hex": "",
+          "data_offsets": [
+            12,
+            12
+          ],
+          "dtype": "F16",
+          "shape": [
+            2,
+            0,
+            3
+          ]
+        },
+        "scalar": {
+          "data_hex": "00006040",
+          "data_offsets": [
+            8,
+            12
+          ],
+          "dtype": "F32",
+          "shape": []
+        },
+        "scalar_f64": {
+          "data_hex": "000000000000f43f",
+          "data_offsets": [
+            0,
+            8
+          ],
+          "dtype": "F64",
+          "shape": []
+        }
+      }
+    },
+    {
+      "bytes": 444,
+      "file": "mixed-order.bin",
+      "header_bytes": 408,
+      "reordered_header": true,
+      "sha256": "8359ee2caf57f4e5e25343e41868752d28902580ef8d307bf6f4ddbc57ab3594",
+      "tensors": {
+        "bf16": {
+          "data_hex": "803f00c0",
+          "data_offsets": [
+            20,
+            24
+          ],
+          "dtype": "BF16",
+          "shape": [
+            2
+          ]
+        },
+        "empty": {
+          "data_hex": "",
+          "data_offsets": [
+            24,
+            24
+          ],
+          "dtype": "F16",
+          "shape": [
+            2,
+            0,
+            3
+          ]
+        },
+        "f16": {
+          "data_hex": "003800c4",
+          "data_offsets": [
+            24,
+            28
+          ],
+          "dtype": "F16",
+          "shape": [
+            2
+          ]
+        },
+        "f32": {
+          "data_hex": "000080be00006040",
+          "data_offsets": [
+            8,
+            16
+          ],
+          "dtype": "F32",
+          "shape": [
+            2
+          ]
+        },
+        "scalar": {
+          "data_hex": "00006040",
+          "data_offsets": [
+            16,
+            20
+          ],
+          "dtype": "F32",
+          "shape": []
+        },
+        "scalar_f64": {
+          "data_hex": "000000000000f43f",
+          "data_offsets": [
+            0,
+            8
+          ],
+          "dtype": "F64",
+          "shape": []
+        }
+      }
+    }
+  ],
+  "reference_package": "safetensors==0.8.0",
+  "reference_source": "https://github.com/safetensors/safetensors",
+  "schema": "zpm.safetensors.reference.v1"
+}

@@ -10,10 +10,9 @@ permissions:
   contents: read
 
 env:
-  SIG_RELEASE_TAG: sig-0.5.3-zig0.17.0.006b944
-  SIG_RELEASE_ASSET: sig-0.5.3-zig0.17.0.006b944-x86_64-linux.tar.xz
-  SIG_RELEASE_SHA256: ee8abe56d30d2e0d9cddb5c74d2b5c7ccf84f94eeaa0fe6f30fa7b0a9c2b7920
-  SIG_RUNTIME_REF: bc2fa64b4be94996feedc9b780eb1469c395da7d
+  SIG_RELEASE_TAG: sig-0.5.5-zig0.17.0.3e59dc5
+  SIG_RELEASE_ASSET: sig-0.5.5-zig0.17.0.3e59dc5-x86_64-linux.tar.xz
+  SIG_RELEASE_SHA256: 9f3e75d8d42efc68cb6f9dc50ce03c89308d09669a9e753b6cc9c0254c967cc6
 
 jobs:
   native-sig:
@@ -47,12 +46,7 @@ jobs:
           test -n "$SIG_BIN"
           SIG_PREFIX=$(dirname "$(dirname "$SIG_BIN")")
 
-          # Keep the release compiler, std and build runner together; overlay
-          # only the reviewed process URL fix from Sig master (PR #9).
-          for source in os.sig process.sig; do
-            curl -fsSL "https://raw.githubusercontent.com/SB0LTD/sig/$SIG_RUNTIME_REF/lib/sig/$source" \
-              -o "$SIG_PREFIX/lib/sig/$source"
-          done
+          # Use the complete matched release; it includes the process URL fix.
           test -f "$SIG_PREFIX/lib/std/std.sig"
           echo "SIG=$SIG_BIN" >> "$GITHUB_ENV"
           echo "SIG_LIB_DIR=$SIG_PREFIX/lib" >> "$GITHUB_ENV"
