@@ -51,8 +51,8 @@ fn runContract(ctx: *sig_build.Step_Context) sig_build.SigError!void {
     if (len > path.len) return error.BufferTooSmall;
     @memcpy(path[0..prefix.len], prefix);
     @memcpy(path[prefix.len..][0..5], "/bin/");
-    @memcpy(path[prefix.len + 5..][0..name.len], name);
-    @memcpy(path[prefix.len + 5 + name.len..][0..suffix.len], suffix);
+    @memcpy(path[prefix.len + 5 ..][0..name.len], name);
+    @memcpy(path[prefix.len + 5 + name.len ..][0..suffix.len], suffix);
     var cmd: sig_build.Command_Buffer = .{};
     try cmd.appendArg(path[0..len]);
     const step_name = entry.name[0..entry.name_len];
@@ -79,10 +79,13 @@ fn namesEqual(a: []const u8, b: []const u8) bool {
 
 fn addContract(ctx: *sig_build.Build_Context, aggregate: sig_build.Step_Handle, comptime name: []const u8, source: []const u8, imports: []const sig_build.Import_Entry) !sig_build.Step_Handle {
     const compiled = try ctx.addCompileStep(.{
-        .source_path = source, .output_name = name,
-        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len], .optimize = ctx.optimize,
+        .source_path = source,
+        .output_name = name,
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
         .target = null,
-        .imports = imports, .compiler_path = "",
+        .imports = imports,
+        .compiler_path = "",
     });
     const run = try ctx.addStep("run-" ++ name, name, &runContract);
     try ctx.addDependency(run, compiled);
@@ -103,6 +106,18 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("sig_testing", "src/core/sig_testing.sig");
     const sig_text = try ctx.addModule("sig_text", "src/core/sig_text.sig");
     try wire(ctx, sig_text, "sig_mem", "src/core/sig_mem.sig");
+    const safetensors = try ctx.addModule("safetensors", "src/core/safetensors.sig");
+    try wire(ctx, safetensors, "sig_text", "src/core/sig_text.sig");
+    _ = try ctx.addModule("asr_mel", "src/asr/mel.sig");
+    const asr = try ctx.addModule("asr", "src/asr/root.sig");
+    try wire(ctx, asr, "safetensors", "src/core/safetensors.sig");
+    try wire(ctx, asr, "asr_mel", "src/asr/mel.sig");
+    const test_asr = try ctx.addStep("test-asr", "Execute native ASR format and numerical contracts", &noopStep);
+    try ctx.addDependency(test_all, test_asr);
+    _ = try addContract(ctx, test_asr, "contract-safetensors", "tests/test_safetensors.sig", &.{importEntry("safetensors", "src/core/safetensors.sig")});
+    _ = try addContract(ctx, test_asr, "contract-asr-mel", "tests/test_asr_mel.sig", &.{importEntry("asr_mel", "src/asr/mel.sig")});
+    _ = try addContract(ctx, test_asr, "contract-asr-consumers", "tests/test_asr_frontend_consumers.sig", &.{importEntry("asr", "src/asr/root.sig")});
+
     inline for (.{ "ephemeral_scene", "now_voice_output", "device_control", "english_phonemes" }) |name| {
         const module = try ctx.addModule(name, "src/core/" ++ name ++ ".sig");
         try wire(ctx, module, "sig_mem", "src/core/sig_mem.sig");
@@ -119,13 +134,32 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_now, "contract-device-control", "tests/test_device_control.sig", &.{importEntry("device_control", "src/core/device_control.sig")});
     _ = try addContract(ctx, test_now, "contract-speech-text", "tests/test_speech_text.sig", &.{
         importEntry("english_phonemes", "src/core/english_phonemes.sig"),
-        importEntry("sig_text", "src/core/sig_text.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_text", "src/core/sig_text.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
     });
     const json = try ctx.addModule("json", "src/core/json.sig");
     try wire(ctx, json, "sig_mem", "src/core/sig_mem.sig");
     const sha256 = try ctx.addModule("sha256", "src/core/sha256.sig");
     try wire(ctx, sha256, "sig_mem", "src/core/sig_mem.sig");
     try wire(ctx, sha256, "sig_testing", "src/core/sig_testing.sig");
+    var process_path: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    const lib = ctx.sig_lib_dir[0..ctx.sig_lib_dir_len];
+    const process_suffix = "/sig/process.sig";
+    if (lib.len + process_suffix.len > process_path.len) return error.BufferTooSmall;
+    @memcpy(process_path[0..lib.len], lib);
+    @memcpy(process_path[lib.len..][0..process_suffix.len], process_suffix);
+    const process_source = process_path[0 .. lib.len + process_suffix.len];
+    _ = try ctx.addModule("sig_process", process_source);
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/inspect_safetensors.sig",
+        .output_name = "inspect-safetensors",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{ importEntry("safetensors", "src/core/safetensors.sig"), importEntry("sha256", "src/core/sha256.sig"), importEntry("sig_process", process_source) },
+    });
+
     const inflate = try ctx.addModule("inflate", "src/core/inflate.sig");
     try wire(ctx, inflate, "sig_mem", "src/core/sig_mem.sig");
     const opus = try ctx.addModule("opus", "src/core/opus.sig");
@@ -219,7 +253,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, cognitive_receipt, "sig_testing", "src/core/sig_testing.sig");
     const core = try ctx.addModule("core", "src/core/root.sig");
     try wire(ctx, core, "sig_mem", "src/core/sig_mem.sig");
-    inline for (.{ "sig_text", "ephemeral_scene", "now_voice_output", "device_control", "english_phonemes" }) |name|
+    inline for (.{ "sig_text", "safetensors", "ephemeral_scene", "now_voice_output", "device_control", "english_phonemes" }) |name|
         try wire(ctx, core, name, "src/core/" ++ name ++ ".sig");
     try wire(ctx, core, "math", "src/core/math.sig");
     try wire(ctx, core, "json", "src/core/json.sig");
@@ -256,18 +290,18 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("sig_math", "src/core/sig_math.sig"),
     });
     _ = try addTest(ctx, test_all, "test-moment-activation", "src/core/moment_activation.sig", &.{
-        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),       importEntry("sig_mem", "src/core/sig_mem.sig"),
         importEntry("sig_testing", "src/core/sig_testing.sig"),
     });
     _ = try addTest(ctx, test_all, "test-agent-runtime", "src/core/agent_runtime.sig", &.{
-        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),       importEntry("sig_mem", "src/core/sig_mem.sig"),
         importEntry("sig_testing", "src/core/sig_testing.sig"),
     });
     _ = try addTest(ctx, test_all, "test-model-observability", "src/core/model_observability.sig", &.{
         importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_testing", "src/core/sig_testing.sig"),
     });
     _ = try addTest(ctx, test_all, "test-multimodal-now", "src/core/multimodal_now.sig", &.{
-        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),       importEntry("sig_mem", "src/core/sig_mem.sig"),
         importEntry("sig_testing", "src/core/sig_testing.sig"),
     });
     _ = try addTest(ctx, test_all, "test-sb0x-format", "src/platform/sb0x/format.sig", &.{});
@@ -369,16 +403,19 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-kv-cache", "src/core/kv_cache.sig", &.{});
     _ = try addTest(ctx, test_all, "test-tokenizer-index", "src/core/tokenizer_index.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
-        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
     });
     _ = try addTest(ctx, test_all, "test-tokenizer", "src/core/tokenizer.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
-        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
         importEntry("sb0_gguf_tokenizer_index", "src/core/tokenizer_index.sig"),
     });
     _ = try addTest(ctx, test_all, "test-qwen3-plan", "src/core/qwen3_decoder_plan.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
-        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
     });
     _ = try addTest(ctx, test_all, "test-qwen3-executor", "src/core/qwen3_executor.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
@@ -389,7 +426,8 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     _ = try addTest(ctx, test_all, "test-inference-session", "src/core/inference_session.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
-        importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
         importEntry("qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig"),
         importEntry("qwen3_executor", "src/core/qwen3_executor.sig"),
         importEntry("tokenizer", "src/core/tokenizer.sig"),
@@ -673,17 +711,17 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-datagram", "src/transport/datagram.sig", &.{importEntry("packet", "src/transport/packet.sig")});
     _ = try addTest(ctx, test_all, "test-telemetry", "src/transport/telemetry.sig", &.{});
     _ = try addTest(ctx, test_all, "test-conn", "src/transport/conn.sig", &.{
-        importEntry("win32", win32_path), importEntry("packet", "src/transport/packet.sig"),
-        importEntry("transport_crypto", "src/transport/crypto.sig"), importEntry("recovery", "src/transport/recovery.sig"),
-        importEntry("streams", "src/transport/streams.sig"), importEntry("datagram", "src/transport/datagram.sig"),
-        importEntry("telemetry", "src/transport/telemetry.sig"), importEntry("udp", "src/transport/udp.sig"),
+        importEntry("win32", win32_path),                                importEntry("packet", "src/transport/packet.sig"),
+        importEntry("transport_crypto", "src/transport/crypto.sig"),     importEntry("recovery", "src/transport/recovery.sig"),
+        importEntry("streams", "src/transport/streams.sig"),             importEntry("datagram", "src/transport/datagram.sig"),
+        importEntry("telemetry", "src/transport/telemetry.sig"),         importEntry("udp", "src/transport/udp.sig"),
         importEntry("crypto_stream", "src/transport/crypto_stream.sig"),
     });
     _ = try addTest(ctx, test_all, "test-scheduler", "src/transport/scheduler.sig", &.{
-        importEntry("win32", win32_path), importEntry("packet", "src/transport/packet.sig"),
-        importEntry("streams", "src/transport/streams.sig"), importEntry("datagram", "src/transport/datagram.sig"),
+        importEntry("win32", win32_path),                      importEntry("packet", "src/transport/packet.sig"),
+        importEntry("streams", "src/transport/streams.sig"),   importEntry("datagram", "src/transport/datagram.sig"),
         importEntry("recovery", "src/transport/recovery.sig"), importEntry("transport_crypto", "src/transport/crypto.sig"),
-        importEntry("udp", "src/transport/udp.sig"), importEntry("telemetry", "src/transport/telemetry.sig"),
+        importEntry("udp", "src/transport/udp.sig"),           importEntry("telemetry", "src/transport/telemetry.sig"),
     });
     _ = try addTest(ctx, test_all, "test-appmap", "src/transport/appmap.sig", &.{
         importEntry("streams", "src/transport/streams.sig"),
@@ -692,9 +730,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     _ = try addTest(ctx, test_all, "test-h3", "src/transport/h3.sig", &.{});
     _ = try addTest(ctx, test_all, "test-h3-server", "src/transport/server.sig", &.{
-        importEntry("conn", "src/transport/conn.sig"), importEntry("packet", "src/transport/packet.sig"),
+        importEntry("conn", "src/transport/conn.sig"),       importEntry("packet", "src/transport/packet.sig"),
         importEntry("streams", "src/transport/streams.sig"), importEntry("udp", "src/transport/udp.sig"),
-        importEntry("h3", "src/transport/h3.sig"), importEntry("telemetry", "src/transport/telemetry.sig"),
+        importEntry("h3", "src/transport/h3.sig"),           importEntry("telemetry", "src/transport/telemetry.sig"),
     });
 
     _ = try addTest(ctx, test_all, "test-no-alloc", "src/transport/no_alloc_test.sig", &.{});
@@ -712,22 +750,21 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         .name = "test-integration",
         .source_path = "src/transport/integration_test.sig",
         .imports = &.{
-            importEntry("conn", "src/transport/conn.sig"), importEntry("telemetry", "src/transport/telemetry.sig"),
-            importEntry("streams", "src/transport/streams.sig"), importEntry("transport_crypto", "src/transport/crypto.sig"),
-            importEntry("packet", "src/transport/packet.sig"), importEntry("recovery", "src/transport/recovery.sig"),
+            importEntry("conn", "src/transport/conn.sig"),         importEntry("telemetry", "src/transport/telemetry.sig"),
+            importEntry("streams", "src/transport/streams.sig"),   importEntry("transport_crypto", "src/transport/crypto.sig"),
+            importEntry("packet", "src/transport/packet.sig"),     importEntry("recovery", "src/transport/recovery.sig"),
             importEntry("datagram", "src/transport/datagram.sig"), importEntry("udp", "src/transport/udp.sig"),
-            importEntry("win32", win32_path), importEntry("appmap", "src/transport/appmap.sig"),
+            importEntry("win32", win32_path),                      importEntry("appmap", "src/transport/appmap.sig"),
         },
     });
     _ = try ctx.addTestStep(.{
         .name = "test-server-initial",
         .source_path = "src/transport/server_initial_test.sig",
         .imports = &.{
-            importEntry("conn", "src/transport/conn.sig"), importEntry("telemetry", "src/transport/telemetry.sig"),
+            importEntry("conn", "src/transport/conn.sig"),       importEntry("telemetry", "src/transport/telemetry.sig"),
             importEntry("streams", "src/transport/streams.sig"), importEntry("transport_crypto", "src/transport/crypto.sig"),
-            importEntry("packet", "src/transport/packet.sig"), importEntry("datagram", "src/transport/datagram.sig"),
-            importEntry("udp", "src/transport/udp.sig"), importEntry("win32", win32_path),
+            importEntry("packet", "src/transport/packet.sig"),   importEntry("datagram", "src/transport/datagram.sig"),
+            importEntry("udp", "src/transport/udp.sig"),         importEntry("win32", win32_path),
         },
     });
-
 }

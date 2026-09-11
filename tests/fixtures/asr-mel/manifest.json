@@ -1,0 +1,57 @@
+{
+  "reference": "transformers 4.57.6 WhisperFeatureExtractor._np_extract_fbank_features",
+  "numpy": "2.3.3",
+  "layout": "frame-major f32le",
+  "absolute_tolerance": 2e-05,
+  "cases": [
+    {
+      "name": "silence",
+      "samples": 320,
+      "frames": 2,
+      "pcm_sha256": "bfe492baf731a0dbf6e1e050f5bc3fe8c1b049383194dcdf82f023bfa409f462",
+      "mel_sha256": "bc25b33a6eb3426cf4fc8de70bbc7f517437b49dacf1eba904f919e6e82e6769"
+    },
+    {
+      "name": "short-dc",
+      "samples": 201,
+      "frames": 1,
+      "pcm_sha256": "a3da7fa19f240eca202cd0b94bc9d8ae78b1f39fa949ff9c6dfd35ba103ae3e7",
+      "mel_sha256": "6af87a0b9c5ae9621de8f0f60b3a195bc32821f8da01a981e6631699f38102e4"
+    },
+    {
+      "name": "impulses",
+      "samples": 801,
+      "frames": 5,
+      "pcm_sha256": "35d06c1ad255dfda0f5a691f699fe7624e2a6d70bdea81f331d9946f4e6b7bc4",
+      "mel_sha256": "167d46e0341f03fa95022a60b216c5548afc803eb55acfb2eb047ea257f0d717"
+    },
+    {
+      "name": "tones",
+      "samples": 3207,
+      "frames": 20,
+      "pcm_sha256": "c356efb2b9ecf704082489773d9dacd41befda485d98c1b19902983dea71b1b0",
+      "mel_sha256": "edfdd94e05b9d819d25b8ece764aaa7cacdf58002ebbdd07957c5af18d5a9500"
+    },
+    {
+      "name": "noise",
+      "samples": 1601,
+      "frames": 10,
+      "pcm_sha256": "600ca16d1de631448a1254aa4bb9743558fc0f5037c319e84515e9d945f0d49f",
+      "mel_sha256": "a7bd9428add4648af9249f0fdc45fa4a330537a271a8307faaba07e30ab1e832"
+    },
+    {
+      "name": "quiet",
+      "samples": 641,
+      "frames": 4,
+      "pcm_sha256": "408beee0f13b889d33ab4888a836355c6a64b00266bef786fba4cf0e20d5c3da",
+      "mel_sha256": "91a869e122f2aded1c5ad1dcb65c36155d94e1ba5285ca2c098a5b0f5bf22712"
+    },
+    {
+      "name": "ramp",
+      "samples": 479,
+      "frames": 2,
+      "pcm_sha256": "42d1c3f60ca36727663737176a3f0c1a029faafdaf5dc61e2b39c7e8e519d313",
+      "mel_sha256": "7ba25481b28e9e3ee3297e6570fc937667a6e11c158bbb611542b254ed26635e"
+    }
+  ]
+}

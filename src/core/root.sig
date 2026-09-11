@@ -7,6 +7,7 @@
 
 pub const math = @import("math");
 pub const text = @import("sig_text");
+pub const safetensors = @import("safetensors");
 pub const ephemeral_scene = @import("ephemeral_scene");
 pub const now_voice_output = @import("now_voice_output");
 pub const device_control = @import("device_control");

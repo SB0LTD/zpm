@@ -1,281 +1,158 @@
-// @zpm/asr — Mel Spectrogram Module
-// Computes log-mel spectrogram from 16kHz PCM audio.
-//
-// Architecture:
-//   PCM f32 samples (16kHz)
-//   → Windowed frames (25ms = 400 samples, 10ms hop = 160 samples)
-//   → Hann window
-//   → FFT (512-point, radix-2 Cooley-Tukey)
-//   → Power spectrum (magnitude squared)
-//   → Mel filterbank (128 triangular filters)
-//   → Log energy (ln(max(energy, 1e-10)))
-//
-// Qwen3-ASR specific parameters:
-//   - n_fft: 400 (padded to 512 for radix-2)
-//   - hop_length: 160
-//   - n_mels: 128
-//   - sample_rate: 16000
-//   - fmin: 0 Hz, fmax: 8000 Hz (Nyquist)
-//
-// Zero allocations. All buffers are comptime-sized statics.
-
+//! Qwen3-ASR/Whisper 128-bin frontend: true 400-point STFT, periodic Hann,
+//! centered reflection, Slaney area-normalized filters and model log scaling.
+//! computeBounded owns no global state and uses caller-provided storage.
+//! Reference: transformers v4.57.6 WhisperFeatureExtractor.
+//! The older compute/computeFrame API returns uncentered natural-log energy;
+//! existing prototype consumers normalize that output themselves.
 const math = @import("std").math;
-
-// ── Constants ──
 pub const SAMPLE_RATE: u32 = 16000;
 pub const N_FFT: usize = 400;
-pub const FFT_SIZE: usize = 512; // Next power of 2 for radix-2
+pub const FFT_SIZE: usize = N_FFT;
 pub const HOP_LENGTH: usize = 160;
 pub const N_MELS: usize = 128;
-pub const FMIN: f32 = 0.0;
-pub const FMAX: f32 = 8000.0; // Nyquist for 16kHz
+pub const N_FREQ_BINS: usize = N_FFT / 2 + 1;
+pub const FMIN: f32 = 0;
+pub const FMAX: f32 = 8000;
+pub const MAX_AUDIO_SAMPLES: usize = 30 * SAMPLE_RATE;
+pub const MAX_FRAMES: usize = MAX_AUDIO_SAMPLES / HOP_LENGTH;
+pub const Error = error{ AudioTooShort, AudioTooLong, OutputTooSmall, InvalidSample, AliasedBuffers };
 
-/// Number of mel frames produced from n_samples of audio
-pub fn numFrames(n_samples: usize) usize {
-    if (n_samples < N_FFT) return 0;
-    return (n_samples - N_FFT) / HOP_LENGTH + 1;
-}
-
-// ── Hann Window (comptime-generated) ──
-const hann_window: [N_FFT]f32 = blk: {
-    @setEvalBranchQuota(2000);
-    var w: [N_FFT]f32 = undefined;
-    for (0..N_FFT) |i| {
-        const x = 2.0 * math.pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(N_FFT - 1));
-        w[i] = 0.5 * (1.0 - @cos(x));
-    }
-    break :blk w;
+const Complex = struct { re: f64 = 0, im: f64 = 0 };
+pub const Workspace = struct {
+    windowed: [N_FFT]f64 = @splat(0),
+    spectrum: [N_FFT]Complex = @splat(.{}),
+    power: [N_FREQ_BINS]f64 = @splat(0),
 };
 
-// ── Mel Filterbank (comptime-generated) ──
-// 128 triangular filters from 0Hz to 8000Hz in mel scale.
-// Each filter is defined by center frequency; we store the filter weights
-// as a 128 × 257 matrix (257 = FFT_SIZE/2 + 1 frequency bins).
-const N_FREQ_BINS: usize = FFT_SIZE / 2 + 1; // 257
-
-fn hzToMel(hz: f32) f32 {
-    return 2595.0 * math.log10(1.0 + hz / 700.0);
-}
-
-fn melToHz(mel_val: f32) f32 {
-    // 10^(mel_val/2595) using explicit formula to avoid comptime math.pow branch limits
-    const x = mel_val / 2595.0;
-    // 10^x = e^(x * ln10)
-    return 700.0 * (@exp(x * 2.302585093) - 1.0);
-}
-
-// Mel filter centers (130 points: 128 filters + 2 boundary points)
-const mel_points: [N_MELS + 2]f32 = blk: {
-    @setEvalBranchQuota(5000);
-    const mel_low = hzToMel(FMIN);
-    const mel_high = hzToMel(FMAX);
-    var pts: [N_MELS + 2]f32 = undefined;
-    for (0..N_MELS + 2) |i| {
-        const mel_val = mel_low + (mel_high - mel_low) * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(N_MELS + 1));
-        pts[i] = melToHz(mel_val);
-    }
-    break :blk pts;
+const window = blk: {
+    @setEvalBranchQuota(10000);
+    var result: [N_FFT]f64 = undefined;
+    for (&result, 0..) |*value, i|
+        value.* = 0.5 - 0.5 * @cos(2 * math.pi * @as(f64, @floatFromInt(i)) / N_FFT);
+    break :blk result;
 };
-
-// Convert Hz to FFT bin index
-fn hzToBin(hz: f32) f32 {
-    return hz * @as(f32, FFT_SIZE) / @as(f32, SAMPLE_RATE);
+const twiddles = blk: {
+    @setEvalBranchQuota(10000);
+    var result: [N_FFT]Complex = undefined;
+    for (&result, 0..) |*value, i| {
+        const angle = -2 * math.pi * @as(f64, @floatFromInt(i)) / N_FFT;
+        value.* = .{ .re = @cos(angle), .im = @sin(angle) };
+    }
+    break :blk result;
+};
+fn hzToMel(hz: f64) f64 {
+    return if (hz < 1000) hz * 3 / 200 else 15 + @log(hz / 1000) * 27 / @log(@as(f64, 6.4));
 }
-
-// Mel filterbank weights [N_MELS][N_FREQ_BINS] — comptime-generated
-const mel_filterbank: [N_MELS][N_FREQ_BINS]f32 = blk: {
+fn melToHz(value: f64) f64 {
+    return if (value < 15) value * 200 / 3 else 1000 * @exp((value - 15) * @log(@as(f64, 6.4)) / 27);
+}
+const filters = blk: {
     @setEvalBranchQuota(500000);
-    var fb: [N_MELS][N_FREQ_BINS]f32 = undefined;
-    for (0..N_MELS) |m| {
-        const f_left = hzToBin(mel_points[m]);
-        const f_center = hzToBin(mel_points[m + 1]);
-        const f_right = hzToBin(mel_points[m + 2]);
-        for (0..N_FREQ_BINS) |k| {
-            const f_k = @as(f32, @floatFromInt(k));
-            if (f_k < f_left or f_k > f_right) {
-                fb[m][k] = 0.0;
-            } else if (f_k <= f_center) {
-                const denom = f_center - f_left;
-                fb[m][k] = if (denom > 0.0) (f_k - f_left) / denom else 0.0;
-            } else {
-                const denom = f_right - f_center;
-                fb[m][k] = if (denom > 0.0) (f_right - f_k) / denom else 0.0;
+    var points: [N_MELS + 2]f64 = undefined;
+    for (&points, 0..) |*point, i|
+        point.* = melToHz(hzToMel(8000) * @as(f64, @floatFromInt(i)) / (N_MELS + 1));
+    var result: [N_MELS][N_FREQ_BINS]f64 = undefined;
+    for (&result, 0..) |*filter, m| {
+        const left = points[m];
+        const center = points[m + 1];
+        const right = points[m + 2];
+        const normalization = 2 / (right - left);
+        for (filter, 0..) |*value, k| {
+            const hz = @as(f64, @floatFromInt(k)) * SAMPLE_RATE / N_FFT;
+            value.* = @max(0, @min((hz - left) / (center - left), (right - hz) / (right - center))) * normalization;
+        }
+    }
+    break :blk result;
+};
+
+// Cooley-Tukey with fixed 5,5,2,2,2,2 radices. Comptime n bounds call depth
+// to seven and all butterfly storage to at most five complex numbers.
+fn transform(comptime n: usize, out: *[n]Complex, input: [*]const f64, stride: usize) void {
+    if (n == 1) {
+        out[0] = .{ .re = input[0] };
+        return;
+    }
+    const radix = if (n % 5 == 0) 5 else 2;
+    const part = n / radix;
+    for (0..radix) |j|
+        transform(part, @ptrCast(out[j * part ..][0..part]), input + j * stride, stride * radix);
+    for (0..part) |k| {
+        var values: [radix]Complex = undefined;
+        for (&values, 0..) |*value, j| value.* = out[j * part + k];
+        for (0..radix) |p| {
+            var sum = Complex{};
+            for (values, 0..) |value, j| {
+                const factor = twiddles[(j * (k + p * part) * (N_FFT / n)) % N_FFT];
+                sum.re += value.re * factor.re - value.im * factor.im;
+                sum.im += value.re * factor.im + value.im * factor.re;
             }
-        }
-    }
-    break :blk fb;
-};
-
-// ── FFT (Radix-2 Cooley-Tukey, in-place, 512-point) ──
-// Twiddle factors are comptime-generated for maximum performance.
-
-const twiddle_re: [FFT_SIZE / 2]f32 = blk: {
-    @setEvalBranchQuota(2000);
-    var tw: [FFT_SIZE / 2]f32 = undefined;
-    for (0..FFT_SIZE / 2) |k| {
-        tw[k] = @cos(-2.0 * math.pi * @as(f32, @floatFromInt(k)) / @as(f32, FFT_SIZE));
-    }
-    break :blk tw;
-};
-
-const twiddle_im: [FFT_SIZE / 2]f32 = blk: {
-    @setEvalBranchQuota(2000);
-    var tw: [FFT_SIZE / 2]f32 = undefined;
-    for (0..FFT_SIZE / 2) |k| {
-        tw[k] = @sin(-2.0 * math.pi * @as(f32, @floatFromInt(k)) / @as(f32, FFT_SIZE));
-    }
-    break :blk tw;
-};
-
-// Bit-reversal permutation table (comptime)
-const bit_rev: [FFT_SIZE]u16 = blk: {
-    @setEvalBranchQuota(50000);
-    const log2n = 9; // log2(512)
-    var rev: [FFT_SIZE]u16 = undefined;
-    for (0..FFT_SIZE) |i| {
-        var x: u16 = @intCast(i);
-        var r: u16 = 0;
-        for (0..log2n) |_| {
-            r = (r << 1) | (x & 1);
-            x >>= 1;
-        }
-        rev[i] = r;
-    }
-    break :blk rev;
-};
-
-/// Compute in-place FFT on re/im arrays of length FFT_SIZE.
-fn fft512(re: *[FFT_SIZE]f32, im: *[FFT_SIZE]f32) void {
-    // Bit-reversal permutation
-    for (0..FFT_SIZE) |i| {
-        const j: usize = bit_rev[i];
-        if (i < j) {
-            const tmp_r = re[i]; re[i] = re[j]; re[j] = tmp_r;
-            const tmp_i = im[i]; im[i] = im[j]; im[j] = tmp_i;
-        }
-    }
-
-    // Butterfly stages
-    var stage_size: usize = 2;
-    while (stage_size <= FFT_SIZE) : (stage_size *= 2) {
-        const half = stage_size / 2;
-        const tw_step = FFT_SIZE / stage_size;
-
-        var group: usize = 0;
-        while (group < FFT_SIZE) : (group += stage_size) {
-            var k: usize = 0;
-            while (k < half) : (k += 1) {
-                const tw_idx = k * tw_step;
-                const wr = twiddle_re[tw_idx];
-                const wi = twiddle_im[tw_idx];
-
-                const idx_a = group + k;
-                const idx_b = group + k + half;
-
-                const br = re[idx_b];
-                const bi = im[idx_b];
-
-                // Complex multiply: (br + bi*j) * (wr + wi*j)
-                const tr = br * wr - bi * wi;
-                const ti = br * wi + bi * wr;
-
-                re[idx_b] = re[idx_a] - tr;
-                im[idx_b] = im[idx_a] - ti;
-                re[idx_a] = re[idx_a] + tr;
-                im[idx_a] = im[idx_a] + ti;
-            }
+            out[k + p * part] = sum;
         }
     }
 }
+fn energies(work: *Workspace, out: *[N_MELS]f32, log10: bool) void {
+    transform(N_FFT, &work.spectrum, &work.windowed, 1);
+    for (&work.power, 0..) |*power, k| {
+        const value = work.spectrum[k];
+        power.* = value.re * value.re + value.im * value.im;
+    }
+    for (out, 0..) |*value, m| {
+        var energy: f64 = 0;
+        for (work.power, filters[m]) |power, weight| energy += power * weight;
+        const logarithm = @log(@max(energy, 1e-10));
+        value.* = @floatCast(if (log10) logarithm / @log(@as(f64, 10)) else logarithm);
+    }
+}
 
-// ── Public API ──
+/// Frame count for centered STFT with its final frame discarded.
+pub fn boundedFrames(n_samples: usize) usize {
+    return n_samples / HOP_LENGTH;
+}
 
-/// Scratch buffers for mel computation (file-scope statics, zero-init).
-/// One mel spectrogram computation can be in progress at a time.
-var fft_re: [FFT_SIZE]f32 = @splat(0.0);
-var fft_im: [FFT_SIZE]f32 = @splat(0.0);
-var power_spectrum: [N_FREQ_BINS]f32 = @splat(0.0);
+/// Output is frame-major [n_samples/160,128], fully normalized for the model.
+/// Reject short reflect-padding inputs, nonfinite PCM and overlapping buffers
+/// before writing output. Longer streams must use explicit bounded segments.
+pub fn computeBounded(audio: []const f32, output: []f32, work: *Workspace) Error!usize {
+    if (audio.len <= N_FFT / 2) return error.AudioTooShort;
+    if (audio.len > MAX_AUDIO_SAMPLES) return error.AudioTooLong;
+    const frames = boundedFrames(audio.len);
+    const elements = frames * N_MELS;
+    if (output.len < elements) return error.OutputTooSmall;
+    const source = @intFromPtr(audio.ptr);
+    const destination = @intFromPtr(output.ptr);
+    if ((source <= destination and destination - source < audio.len * @sizeOf(f32)) or
+        (destination < source and source - destination < elements * @sizeOf(f32))) return error.AliasedBuffers;
+    for (audio) |sample| if (!math.isFinite(sample)) return error.InvalidSample;
+    var maximum: f32 = -math.inf(f32);
+    for (0..frames) |frame| {
+        const center: isize = @intCast(frame * HOP_LENGTH);
+        for (&work.windowed, 0..) |*value, i| {
+            var position = center + @as(isize, @intCast(i)) - N_FFT / 2;
+            if (position < 0) position = -position;
+            if (position >= audio.len) position = 2 * @as(isize, @intCast(audio.len)) - 2 - position;
+            value.* = @as(f64, audio[@intCast(position)]) * window[i];
+        }
+        const row: *[N_MELS]f32 = @ptrCast(output[frame * N_MELS ..][0..N_MELS]);
+        energies(work, row, true);
+        for (row) |value| maximum = @max(maximum, value);
+    }
+    for (output[0..elements]) |*value| value.* = (@max(value.*, maximum - 8) + 4) / 4;
+    return frames;
+}
 
-/// Compute one mel frame from audio samples.
-/// Input: audio pointer starting at the frame's position.
-/// Output: 128-element mel vector written to `out`.
+// Legacy prototype API: natural log, no centering, externally sized output.
+// New model consumers must use computeBounded rather than normalize twice.
+var legacy_work: Workspace = .{};
+pub fn numFrames(n_samples: usize) usize {
+    return if (n_samples < N_FFT) 0 else (n_samples - N_FFT) / HOP_LENGTH + 1;
+}
 pub fn computeFrame(audio: [*]const f32, out: *[N_MELS]f32) void {
-    // Apply Hann window and zero-pad to FFT_SIZE
-    for (0..FFT_SIZE) |i| {
-        if (i < N_FFT) {
-            fft_re[i] = audio[i] * hann_window[i];
-        } else {
-            fft_re[i] = 0.0;
-        }
-        fft_im[i] = 0.0;
-    }
-
-    // FFT
-    fft512(&fft_re, &fft_im);
-
-    // Power spectrum: |X[k]|^2 for k = 0..N_FREQ_BINS-1
-    for (0..N_FREQ_BINS) |k| {
-        power_spectrum[k] = fft_re[k] * fft_re[k] + fft_im[k] * fft_im[k];
-    }
-
-    // Apply mel filterbank and compute log energy
-    for (0..N_MELS) |m| {
-        var energy: f32 = 0.0;
-        for (0..N_FREQ_BINS) |k| {
-            energy += mel_filterbank[m][k] * power_spectrum[k];
-        }
-        // Log-mel energy with floor to avoid log(0)
-        out[m] = @log(@max(energy, 1e-10));
-    }
+    for (&legacy_work.windowed, 0..) |*value, i| value.* = @as(f64, audio[i]) * window[i];
+    energies(&legacy_work, out, false);
 }
-
-/// Compute full mel spectrogram for an audio buffer.
-/// Writes `n_frames * N_MELS` f32 values into `out_mel`.
-/// Returns the number of frames computed.
 pub fn compute(audio: [*]const f32, n_samples: usize, out_mel: [*]f32) usize {
-    const n_frames = numFrames(n_samples);
-    var frame: usize = 0;
-    while (frame < n_frames) : (frame += 1) {
-        const offset = frame * HOP_LENGTH;
-        const out_ptr: *[N_MELS]f32 = @ptrCast(@alignCast(out_mel + frame * N_MELS));
-        computeFrame(audio + offset, out_ptr);
-    }
-    return n_frames;
-}
-
-// ── Tests ──
-const testing = @import("std").testing;
-
-test "numFrames basic" {
-    // 16000 samples (1 second) → (16000 - 400) / 160 + 1 = 98 frames
-    try testing.expectEqual(numFrames(16000), 98);
-}
-
-test "computeFrame silence" {
-    // Silence should produce very low mel energies
-    var silence: [N_FFT]f32 = @splat(0.0);
-    var mel_out: [N_MELS]f32 = undefined;
-    computeFrame(&silence, &mel_out);
-    // All should be log(1e-10) ≈ -23.03
-    for (0..N_MELS) |m| {
-        try testing.expect(mel_out[m] < -20.0);
-    }
-}
-
-test "computeFrame sine" {
-    // 1kHz sine at 16kHz sample rate should excite specific mel bins
-    var sine: [N_FFT]f32 = undefined;
-    for (0..N_FFT) |i| {
-        sine[i] = @sin(2.0 * math.pi * 1000.0 * @as(f32, @floatFromInt(i)) / 16000.0);
-    }
-    var mel_out: [N_MELS]f32 = undefined;
-    computeFrame(&sine, &mel_out);
-    // Find the peak bin — should be somewhere in the lower-mid range for 1kHz
-    var max_val: f32 = mel_out[0];
-    var max_bin: usize = 0;
-    for (1..N_MELS) |m| {
-        if (mel_out[m] > max_val) { max_val = mel_out[m]; max_bin = m; }
-    }
-    // 1kHz should peak around mel bin 30-50 (rough estimate)
-    try testing.expect(max_bin > 20 and max_bin < 60);
+    const frames = numFrames(n_samples);
+    for (0..frames) |frame|
+        computeFrame(audio + frame * HOP_LENGTH, @ptrCast(out_mel + frame * N_MELS));
+    return frames;
 }
