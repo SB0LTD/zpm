@@ -370,7 +370,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, tokenizer, "gguf", "src/core/gguf.sig");
     try wire(ctx, tokenizer, "sig_math", "src/core/sig_math.sig");
     try wire(ctx, tokenizer, "sig_mem", "src/core/sig_mem.sig");
-    try wire(ctx, tokenizer, "sb0_gguf_tokenizer_index", "src/core/tokenizer_index.sig");
+    try wire(ctx, tokenizer, "tokenizer_index", "src/core/tokenizer_index.sig");
     const qwen3_decoder_plan = try ctx.addModule("qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig");
     try wire(ctx, qwen3_decoder_plan, "gguf", "src/core/gguf.sig");
     try wire(ctx, qwen3_decoder_plan, "sig_math", "src/core/sig_math.sig");
@@ -386,11 +386,41 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, inference_session, "qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig");
     try wire(ctx, inference_session, "qwen3_executor", "src/core/qwen3_executor.sig");
     try wire(ctx, inference_session, "tokenizer", "src/core/tokenizer.sig");
-    try wire(ctx, inference_session, "sb0_gguf_tokenizer_index", "src/core/tokenizer_index.sig");
+    try wire(ctx, inference_session, "tokenizer_index", "src/core/tokenizer_index.sig");
     try wire(ctx, inference_session, "sampling", "src/core/sampling.sig");
     try wire(ctx, inference_session, "kv_cache", "src/core/kv_cache.sig");
 
     // Inference pipeline tests
+    const test_qwen = try ctx.addStep("test-qwen", "Execute resumable decoder numerical and cancellation contracts", &noopStep);
+    try ctx.addDependency(test_all, test_qwen);
+    _ = try addContract(ctx, test_qwen, "contract-qwen-executor", "tests/test_qwen_executor.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig"),
+        importEntry("qwen3_executor", "src/core/qwen3_executor.sig"),
+    });
+    _ = try addContract(ctx, test_qwen, "contract-inference-session", "tests/test_inference_session_contract.sig", &.{
+        importEntry("inference_session", "src/core/inference_session.sig"),
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("qwen3_executor", "src/core/qwen3_executor.sig"),
+        importEntry("kv_cache", "src/core/kv_cache.sig"),
+    });
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/probe_qwen.sig",
+        .output_name = "probe-qwen",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{
+            importEntry("gguf", "src/core/gguf.sig"),
+            importEntry("qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig"),
+            importEntry("qwen3_executor", "src/core/qwen3_executor.sig"),
+            importEntry("tokenizer", "src/core/tokenizer.sig"),
+            importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
+            importEntry("sig_process", process_source),
+            importEntry("sha256", "src/core/sha256.sig"),
+        },
+    });
     _ = try addTest(ctx, test_all, "test-gguf", "src/core/gguf.sig", &.{
         importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_mem", "src/core/sig_mem.sig"),
     });
@@ -410,7 +440,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("gguf", "src/core/gguf.sig"),
         importEntry("sig_math", "src/core/sig_math.sig"),
         importEntry("sig_mem", "src/core/sig_mem.sig"),
-        importEntry("sb0_gguf_tokenizer_index", "src/core/tokenizer_index.sig"),
+        importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
     });
     _ = try addTest(ctx, test_all, "test-qwen3-plan", "src/core/qwen3_decoder_plan.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
@@ -433,7 +463,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("tokenizer", "src/core/tokenizer.sig"),
         importEntry("sampling", "src/core/sampling.sig"),
         importEntry("kv_cache", "src/core/kv_cache.sig"),
-        importEntry("sb0_gguf_tokenizer_index", "src/core/tokenizer_index.sig"),
+        importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
         importEntry("transformer_ops", "src/core/transformer_ops.sig"),
     });
