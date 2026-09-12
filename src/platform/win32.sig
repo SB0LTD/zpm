@@ -765,12 +765,15 @@ pub const MOUSEINPUT = extern struct {
 
 pub const INPUT_MOUSE: DWORD = 0;
 
-// INPUT is a tagged union in C; the mouse variant is the largest we use.
+// INPUT is a tagged union in C; the mouse variant is the largest we use. On
+// x64 the layout is: DWORD type (offset 0) + 4 bytes alignment padding + the
+// union (MOUSEINPUT, 32 bytes) at offset 8 = 40 bytes total. The 8-byte
+// alignment of MOUSEINPUT (its dwExtraInfo is a pointer-sized usize) supplies
+// the gap after `type` automatically. NO trailing pad: an over-sized INPUT
+// makes SendInput reject every event (it validates against sizeof(INPUT)).
 pub const INPUT = extern struct {
     type: DWORD = INPUT_MOUSE,
     mi: MOUSEINPUT = .{},
-    // Pad to the size of the KEYBDINPUT/HARDWAREINPUT union tail on x64.
-    _pad: u64 = 0,
 };
 
 pub const MOUSEEVENTF_MOVE: DWORD = 0x0001;
