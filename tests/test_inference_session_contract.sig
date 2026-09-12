@@ -139,12 +139,12 @@ fn setup() !void {
 pub fn main(init: std.process.Init) !void {
     try require((api.SessionConfig{}).max_context == executor.qwen3_0_6b_limits.context);
     const empty = gguf.Source{ .context = &source_context, .size = 0, .read_at = readAt };
-    if (api.Session.init(allocate, empty, .{ .max_context = 65 })) |_| return error.InvalidContextAccepted
+    if (session.init(allocate, empty, .{ .max_context = 65 })) |_| return error.InvalidContextAccepted
     else |err| try require(err == error.ContextCapacity);
     try require(allocations == 0 and reads == 0);
-    if (api.Session.init(allocate, empty, .{ .max_context = 0 })) |_| return error.ZeroContextAccepted
+    if (session.init(allocate, empty, .{ .max_context = 0 })) |_| return error.ZeroContextAccepted
     else |err| try require(err == error.ContextCapacity);
-    if (api.Session.init(allocate, empty, .{ .progress_fn = progress })) |_| return error.MissingProgressContextAccepted
+    if (session.init(allocate, empty, .{ .progress_fn = progress })) |_| return error.MissingProgressContextAccepted
     else |err| try require(err == error.InvalidPlan);
 
     try setup();

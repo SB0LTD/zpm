@@ -9,7 +9,8 @@
 //! one at a time via an iterator interface.
 //!
 //! Usage:
-//!   var session = try Session.init(alloc_fn, model_source, config);
+//!   // Large storage belongs in a static/caller-owned region.
+//!   try session.init(alloc_fn, model_source, config);
 //!   var iter = try session.generate("What modules does this build graph need?", .{});
 //!   while (try iter.next()) |token_bytes| { ... use UTF-8 bytes ... }
 //!   session.reset(); // Ready for next generation
@@ -111,12 +112,12 @@ pub const Session = struct {
 
     /// Initialize a session from a GGUF model source.
     pub fn init(
+        session: *Session,
         alloc_fn: kv_cache.AllocFn,
         source: gguf.Source,
         config: SessionConfig,
-    ) Error!Session {
+    ) Error!void {
         try validateConfig(config);
-        var session: Session = undefined;
         session.source = source;
         session.alloc_fn = alloc_fn;
         session.config = config;
@@ -158,7 +159,6 @@ pub const Session = struct {
         // 7. Zero working set
         session.work = .{};
 
-        return session;
     }
 
     /// Encode a prompt and prepare for generation.

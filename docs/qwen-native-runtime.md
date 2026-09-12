@@ -58,6 +58,11 @@ remain explicitly bounded to 64 positions.
 
 ## High-level API migration
 
+`Session.init` initializes an existing `*Session` and returns `Error!void`.
+Place the large model state in static or caller-owned storage and call
+`try session.init(alloc_fn, source, config)`. Returning this state by value
+could overflow a normal Linux stack before validation even began.
+
 `SessionConfig.max_context` now defaults to the executor's supported 64. Larger
 contexts are rejected before allocation. The vocabulary has 151,936 token slots
 and 262,144 hash slots; these are distinct capacities. Prompt and generated
