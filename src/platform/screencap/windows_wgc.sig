@@ -77,13 +77,16 @@ fn api() ?*const Api {
     const combase = LoadLibraryW(&combase_name) orelse return null;
     const d3d11 = LoadLibraryW(&d3d11_name) orelse return null;
 
+    // GetProcAddress returns *anyopaque (align 1); function pointers have a
+    // larger alignment on some targets (e.g. aarch64-windows, align 4), so the
+    // cast must @alignCast as well as @ptrCast.
     g_api = .{
-        .RoInitialize = @ptrCast(GetProcAddress(combase, "RoInitialize") orelse return null),
-        .WindowsCreateString = @ptrCast(GetProcAddress(combase, "WindowsCreateString") orelse return null),
-        .WindowsDeleteString = @ptrCast(GetProcAddress(combase, "WindowsDeleteString") orelse return null),
-        .RoGetActivationFactory = @ptrCast(GetProcAddress(combase, "RoGetActivationFactory") orelse return null),
-        .D3D11CreateDevice = @ptrCast(GetProcAddress(d3d11, "D3D11CreateDevice") orelse return null),
-        .CreateDirect3D11DeviceFromDXGIDevice = @ptrCast(GetProcAddress(d3d11, "CreateDirect3D11DeviceFromDXGIDevice") orelse return null),
+        .RoInitialize = @ptrCast(@alignCast(GetProcAddress(combase, "RoInitialize") orelse return null)),
+        .WindowsCreateString = @ptrCast(@alignCast(GetProcAddress(combase, "WindowsCreateString") orelse return null)),
+        .WindowsDeleteString = @ptrCast(@alignCast(GetProcAddress(combase, "WindowsDeleteString") orelse return null)),
+        .RoGetActivationFactory = @ptrCast(@alignCast(GetProcAddress(combase, "RoGetActivationFactory") orelse return null)),
+        .D3D11CreateDevice = @ptrCast(@alignCast(GetProcAddress(d3d11, "D3D11CreateDevice") orelse return null)),
+        .CreateDirect3D11DeviceFromDXGIDevice = @ptrCast(@alignCast(GetProcAddress(d3d11, "CreateDirect3D11DeviceFromDXGIDevice") orelse return null)),
     };
     return if (g_api) |*a| a else null;
 }
