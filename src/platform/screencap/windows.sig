@@ -3,6 +3,7 @@
 
 const w32 = @import("win32");
 const api = @import("../screencap.sig");
+const wgc = @import("windows_wgc.sig");
 
 const WindowInfo = api.WindowInfo;
 const Capture = api.Capture;
@@ -117,6 +118,19 @@ pub fn captureWindow(win: WindowInfo, out: []u8) Capture {
     if (out.len < needed) return api.captureFail(out);
 
     const hwnd: w32.HWND = @ptrFromInt(win.handle);
+
+    // Prefer Windows Graphics Capture: it reads the window's true framebuffer,
+    // including GPU-composited apps (Electron/Chromium: VS Code, Kiro, Chrome)
+    // that PrintWindow renders black, and occluded windows. WGC returns the
+    // PHYSICAL pixel size (DPI-scaled), which may exceed the logical window
+    // size — we report those true dims so nothing is clipped; callers scale
+    // detected coordinates back to logical window space for clicking. Falls
+    // through to the classic GDI path if WGC is unavailable or fails.
+    const wr = wgc.capture(win.handle, out);
+    if (wr.ok) {
+        const wgc_bytes = @as(usize, wr.width) * @as(usize, wr.height) * 4;
+        return .{ .pixels = out[0..wgc_bytes], .width = wr.width, .height = wr.height, .ok = true };
+    }
 
     const screen_dc = w32.GetDC(null) orelse return api.captureFail(out);
     defer _ = w32.ReleaseDC(null, screen_dc);
