@@ -20,9 +20,14 @@ pub const CHUNK_CAP = 64 * 1024;
 
 /// The buffers a `run` call needs. Large — place in static storage, not stack.
 pub const Buffers = struct {
-    inbound: [INBOUND_CAP]u8 = undefined,
-    outbound: [OUTBOUND_CAP]u8 = undefined,
-    chunk: [CHUNK_CAP]u8 = undefined,
+    // Zero-initialized (not `undefined`) so that on SB0 these large buffers map
+    // into the read-write segment's mem-only BSS tail instead of being
+    // materialized as initialized `.data` (which would bloat the packed SB0X
+    // image). Semantically these are scratch buffers, so the initial contents
+    // are irrelevant on every target.
+    inbound: [INBOUND_CAP]u8 = [_]u8{0} ** INBOUND_CAP,
+    outbound: [OUTBOUND_CAP]u8 = [_]u8{0} ** OUTBOUND_CAP,
+    chunk: [CHUNK_CAP]u8 = [_]u8{0} ** CHUNK_CAP,
 };
 
 /// Run the LSP session to completion (until `exit` or EOF). Generic over the
