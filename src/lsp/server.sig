@@ -33,7 +33,9 @@ pub const Server = struct {
     info: ServerInfo = .{},
     store: document.Store = .{},
     /// Scratch for decoding JSON string escapes out of inbound document text.
-    decode_buf: [document.MAX_TEXT]u8 = undefined,
+    /// Zero-initialized (not `undefined`) so it maps to BSS on SB0 rather than
+    /// bloating the packed image as initialized `.data`.
+    decode_buf: [document.MAX_TEXT]u8 = [_]u8{0} ** document.MAX_TEXT,
     initialized: bool = false,
     shutdown_requested: bool = false,
 
