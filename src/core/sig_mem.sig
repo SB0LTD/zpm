@@ -26,6 +26,12 @@ pub fn indexOfScalar(comptime T: type, slice: []const T, value: T) ?usize {
     return null;
 }
 
+pub fn indexOfScalarPos(comptime T: type, slice: []const T, start: usize, value: T) ?usize {
+    if (start >= slice.len) return null;
+    const offset = indexOfScalar(T, slice[start..], value) orelse return null;
+    return start + offset;
+}
+
 pub fn lastIndexOfScalar(comptime T: type, slice: []const T, value: T) ?usize {
     var i = slice.len;
     while (i > 0) {

@@ -9,9 +9,10 @@
 //! one at a time via an iterator interface.
 //!
 //! Usage:
-//!   var session = try Session.init(alloc_fn, model_source, config);
+//!   // Large storage belongs in a static/caller-owned region.
+//!   try session.init(alloc_fn, model_source, config);
 //!   var iter = try session.generate("What modules does this build graph need?", .{});
-//!   while (iter.next()) |token_bytes| { ... use UTF-8 bytes ... }
+//!   while (try iter.next()) |token_bytes| { ... use UTF-8 bytes ... }
 //!   session.reset(); // Ready for next generation
 //!
 //! Zero heap allocation. All storage via caller-provided AllocFn.
@@ -21,7 +22,7 @@ const gguf = @import("gguf");
 const qwen3_plan = @import("qwen3_decoder_plan");
 const executor = @import("qwen3_executor");
 const tokenizer = @import("tokenizer");
-const tokenizer_index = @import("sb0_gguf_tokenizer_index");
+const tokenizer_index = @import("tokenizer_index");
 const sampling = @import("sampling");
 const kv_cache = @import("kv_cache");
 
@@ -38,7 +39,7 @@ pub const GenerateConfig = struct {
 };
 
 pub const SessionConfig = struct {
-    max_context: u32 = 2048,
+    max_context: u32 = executor.qwen3_0_6b_limits.context,
     /// Progress callback (optional). Return false to cancel.
     progress_fn: ?executor.ProgressFn = null,
     progress_ctx: ?*anyopaque = null,
@@ -54,14 +55,14 @@ const TENSOR_CAPACITY = 1024;
 
 /// Maximum vocabulary for the tokenizer hash table.
 const VOCAB_HASH_CAPACITY = 262144; // 256K slots (75% load → ~192K tokens max)
-const MAX_TOKEN_BYTES = 128;
+const VOCABULARY_CAPACITY = executor.qwen3_0_6b_limits.vocabulary;
 
 /// Maximum merge pairs for BPE.
 const MERGE_HASH_CAPACITY = 262144;
 const MAX_MERGE_BYTES = 256;
 
 /// Token buffer for encoding prompts.
-const MAX_PROMPT_TOKENS = 2048;
+const MAX_PROMPT_TOKENS = executor.qwen3_0_6b_limits.context;
 
 /// Decode scratch buffer (single token → UTF-8 bytes).
 const DECODE_SCRATCH_SIZE = 256;
@@ -73,7 +74,7 @@ pub const Session = struct {
     plan: qwen3_plan.Plan,
 
     // Tokenizer
-    vocabulary: tokenizer_index.VocabularyIndex(VOCAB_HASH_CAPACITY, MAX_TOKEN_BYTES),
+    vocabulary: tokenizer_index.VocabularyIndex(VOCABULARY_CAPACITY, VOCAB_HASH_CAPACITY),
     merges: tokenizer_index.MergeIndex(MERGE_HASH_CAPACITY, MAX_MERGE_BYTES),
 
     // KV cache
@@ -87,6 +88,7 @@ pub const Session = struct {
     rng: sampling.Rng,
     generated_count: u32,
     finished: bool,
+    generation: u64 = 0,
 
     // Token buffer for prompt encoding
     token_buf: [MAX_PROMPT_TOKENS]u32,
@@ -106,21 +108,24 @@ pub const Session = struct {
 
     pub const Error = gguf.Error || qwen3_plan.Error || executor.Error ||
         tokenizer.Error || tokenizer_index.Error || kv_cache.KvCache.Error ||
-        error{ ModelNotSupported, GenerationFailed };
+        error{ ModelNotSupported, GenerationFailed, StaleGeneration, InvalidSampling };
 
     /// Initialize a session from a GGUF model source.
     pub fn init(
+        session: *Session,
         alloc_fn: kv_cache.AllocFn,
         source: gguf.Source,
         config: SessionConfig,
-    ) Error!Session {
-        var session: Session = undefined;
+    ) Error!void {
+        try validateConfig(config);
         session.source = source;
         session.alloc_fn = alloc_fn;
         session.config = config;
         session.position = 0;
         session.generated_count = 0;
-        session.finished = false;
+        session.finished = true;
+        session.generation = 0;
+        session.rng = sampling.Rng.init(0);
         session.prompt_len = 0;
 
         // 1. Parse GGUF index
@@ -128,12 +133,19 @@ pub const Session = struct {
 
         // 2. Build decoder plan
         try qwen3_plan.build(TENSOR_CAPACITY, &session.index, &session.plan);
+        try validateModel(session.plan, session.index.summary, config);
 
         // 3. Build tokenizer vocabulary index
         try session.vocabulary.build(source, session.index.summary.tokenizer_tokens);
 
         // 4. Build merge index
         try session.merges.build(source, session.index.summary.tokenizer_merges, &session.vocabulary);
+
+        // Resolve model-owned stop IDs before obtaining caller arena storage.
+        session.eos_token = session.vocabulary.lookup(source, "<|endoftext|>") orelse
+            return error.MissingSpecialToken;
+        session.eot_token = session.vocabulary.lookup(source, "<|im_end|>") orelse
+            return error.MissingSpecialToken;
 
         // 5. Allocate KV cache
         session.cache = try kv_cache.KvCache.init(
@@ -144,24 +156,23 @@ pub const Session = struct {
             config.max_context,
         );
 
-        // 6. Resolve stop tokens
-        session.eos_token = session.vocabulary.lookup(source, "<|endoftext|>") orelse 151643;
-        session.eot_token = session.vocabulary.lookup(source, "<|im_end|>") orelse 151645;
-
         // 7. Zero working set
         session.work = .{};
 
-        return session;
     }
 
     /// Encode a prompt and prepare for generation.
     /// Returns an iterator that yields UTF-8 byte slices per generated token.
     pub fn generate(self: *Session, user_prompt: []const u8, gen_config: GenerateConfig) Error!TokenIterator {
-        self.position = 0;
-        self.generated_count = 0;
-        self.finished = false;
+        self.reset();
+        if (self.generation == ~@as(u64, 0)) return error.GenerationFailed;
+        try validateConfig(self.config);
+        try validateSampling(gen_config.sampling);
+        errdefer self.finished = true;
         self.rng = sampling.Rng.init(gen_config.seed);
-        self.cache.reset();
+        if (gen_config.max_tokens == 0) return .{
+            .session = self, .gen_config = gen_config, .generation = self.generation,
+        };
 
         // Encode prompt with chat template
         self.prompt_len = @intCast(try tokenizer.encodeChatTurn(
@@ -171,8 +182,11 @@ pub const Session = struct {
             gen_config.system_prompt,
             user_prompt,
             false, // no thinking block
-            &self.token_buf,
+            self.token_buf[0..self.config.max_context],
         ));
+        // Reserve at least one position for a generated token before prefill.
+        if (self.prompt_len == 0 or self.prompt_len >= self.config.max_context)
+            return error.ContextCapacity;
 
         // Prefill: run all prompt tokens through the model (no logits until last)
         const progress = executor.Progress{
@@ -198,11 +212,13 @@ pub const Session = struct {
                 progress,
             );
             self.position = i + 1;
+            self.cache.context_used = self.position;
         }
-
+        self.finished = false;
         return .{
             .session = self,
             .gen_config = gen_config,
+            .generation = self.generation,
         };
     }
 
@@ -211,7 +227,9 @@ pub const Session = struct {
         self.cache.reset();
         self.position = 0;
         self.generated_count = 0;
-        self.finished = false;
+        self.prompt_len = 0;
+        self.finished = true;
+        self.generation +|= 1;
     }
 
     /// Get the current context usage.
@@ -221,7 +239,7 @@ pub const Session = struct {
 
     /// Get remaining context capacity.
     pub fn contextRemaining(self: *const Session) u32 {
-        return self.config.max_context - self.position;
+        return self.config.max_context -| self.position;
     }
 };
 
@@ -232,6 +250,7 @@ pub const Session = struct {
 pub const TokenIterator = struct {
     session: *Session,
     gen_config: GenerateConfig,
+    generation: u64,
 
     pub const Output = struct {
         bytes: []const u8,
@@ -241,19 +260,26 @@ pub const TokenIterator = struct {
 
     /// Get the next generated token. Returns null when generation is complete
     /// (hit max_tokens, EOS, or context limit).
-    pub fn next(self: *TokenIterator) ?Output {
+    /// Errors are distinct from normal EOS and permanently stop this turn.
+    /// Token boundaries may split UTF-8; consumers join bytes before decoding.
+    pub fn next(self: *TokenIterator) Session.Error!?Output {
         const s = self.session;
+        if (self.generation != s.generation) return error.StaleGeneration;
         if (s.finished) return null;
+        errdefer s.finished = true;
         if (s.generated_count >= self.gen_config.max_tokens) { s.finished = true; return null; }
         if (s.position >= s.config.max_context) { s.finished = true; return null; }
 
         // Sample from logits (left in work.logits from the last forward pass)
         const vocab_size: usize = s.plan.vocabulary_size;
+        if (vocab_size == 0 or vocab_size > s.work.logits.len) return error.InvalidPlan;
+        for (s.work.logits[0..vocab_size]) |logit|
+            if (!finite(logit)) return error.GenerationFailed;
         const token_id: u32 = @intCast(sampling.sample(
             s.work.logits[0..vocab_size],
             self.gen_config.sampling,
             &s.rng,
-            s.token_buf[0..@min(s.position, MAX_PROMPT_TOKENS)],
+            s.token_buf[0..s.position],
         ));
 
         // Check stop conditions
@@ -265,16 +291,13 @@ pub const TokenIterator = struct {
         }
 
         // Decode token to UTF-8 bytes
-        const decoded = tokenizer.decodeToken(
+        const decoded = try tokenizer.decodeToken(
             s.source,
             &s.vocabulary,
             token_id,
             &s.decode_scratch,
             &s.decode_out,
-        ) catch {
-            s.finished = true;
-            return null;
-        };
+        );
 
         // Run forward pass for next position
         const progress = executor.Progress{
@@ -282,7 +305,7 @@ pub const TokenIterator = struct {
             .callback = s.config.progress_fn,
         };
 
-        _ = executor.forward(
+        _ = try executor.forward(
             TENSOR_CAPACITY,
             executor.qwen3_0_6b_limits,
             s.source,
@@ -295,13 +318,14 @@ pub const TokenIterator = struct {
             s.position,
             true, // always produce logits for the next sample
             progress,
-        ) catch {
-            s.finished = true;
-            return null;
-        };
+        );
 
+        s.token_buf[s.position] = token_id;
         s.position += 1;
+        s.cache.context_used = s.position;
         s.generated_count += 1;
+        if (s.generated_count >= self.gen_config.max_tokens or s.position == s.config.max_context)
+            s.finished = true;
 
         return .{
             .bytes = s.decode_out[0..decoded.bytes_written],
@@ -312,12 +336,12 @@ pub const TokenIterator = struct {
 
     /// Check if generation is complete.
     pub fn done(self: *const TokenIterator) bool {
-        return self.session.finished;
+        return self.generation != self.session.generation or self.session.finished;
     }
 
     /// Number of tokens generated so far.
     pub fn tokensGenerated(self: *const TokenIterator) u32 {
-        return self.session.generated_count;
+        return if (self.generation == self.session.generation) self.session.generated_count else 0;
     }
 };
 
@@ -335,13 +359,42 @@ pub fn generateComplete(
 ) Session.Error!usize {
     var iter = try session.generate(user_prompt, gen_config);
     var written: usize = 0;
-    while (iter.next()) |output| {
+    errdefer session.finished = true;
+    while (try iter.next()) |output| {
         if (output.is_control) continue;
         const remaining = output_buf.len - written;
-        const to_copy = @min(output.bytes.len, remaining);
-        @memcpy(output_buf[written..][0..to_copy], output.bytes[0..to_copy]);
-        written += to_copy;
-        if (to_copy < output.bytes.len) break; // Buffer full
+        if (output.bytes.len > remaining) return error.OutputCapacity;
+        @memcpy(output_buf[written..][0..output.bytes.len], output.bytes);
+        written += output.bytes.len;
     }
     return written;
+}
+
+fn validateConfig(config: SessionConfig) Session.Error!void {
+    if (config.max_context == 0 or config.max_context > executor.qwen3_0_6b_limits.context)
+        return error.ContextCapacity;
+    if (config.progress_fn != null and config.progress_ctx == null) return error.InvalidPlan;
+}
+
+fn validateModel(plan: qwen3_plan.Plan, summary: gguf.Summary, config: SessionConfig) Session.Error!void {
+    const limits = executor.qwen3_0_6b_limits;
+    if (plan.hidden_size > limits.hidden or plan.query_size > limits.query or
+        plan.key_value_size > limits.key_value or plan.feed_forward_size > limits.feed_forward or
+        plan.vocabulary_size > limits.vocabulary or
+        summary.tokenizer_tokens.count != plan.vocabulary_size or
+        (summary.context_length != 0 and config.max_context > summary.context_length))
+        return error.ModelNotSupported;
+}
+
+fn finite(value: f32) bool {
+    return @as(u32, @bitCast(value)) & 0x7f800000 != 0x7f800000;
+}
+
+fn validateSampling(config: sampling.Config) Session.Error!void {
+    if (!finite(config.temperature) or config.temperature < 0 or
+        !finite(config.top_p) or config.top_p < 0 or config.top_p > 1 or
+        !finite(config.min_p) or config.min_p < 0 or config.min_p > 1 or
+        !finite(config.repetition_penalty) or config.repetition_penalty <= 0 or
+        !finite(config.frequency_penalty) or !finite(config.presence_penalty))
+        return error.InvalidSampling;
 }

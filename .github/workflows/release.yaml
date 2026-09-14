@@ -18,9 +18,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SIG_RELEASE_TAG: sig-0.5.5-zig0.17.0.3e59dc5
-  SIG_RELEASE_ASSET: sig-0.5.5-zig0.17.0.3e59dc5-x86_64-linux.tar.xz
-  SIG_RELEASE_SHA256: 9f3e75d8d42efc68cb6f9dc50ce03c89308d09669a9e753b6cc9c0254c967cc6
+  SIG_RELEASE_TAG: sig-0.5.9-zig0.17.0.786a282
+  SIG_RELEASE_ASSET: sig-0.5.9-zig0.17.0.786a282-x86_64-linux.tar.xz
+  SIG_RELEASE_SHA256: 9f8db6dc445b40f588832b7a60d25f289ab2d4da589e0edb3f35926d9561fed1
 
 jobs:
   release:

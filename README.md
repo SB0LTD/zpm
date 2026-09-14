@@ -27,8 +27,8 @@
 
 ## Quick Start
 
-Build the CLI from current source with Sig 0.5.2 or newer (currently validated
-with SB0LTD bootstrap v72, Sig 0.5.3). The v0.3.0 release's `build` and `run`
+Build the CLI from current source with the complete SB0LTD Sig 0.5.9 release.
+The v0.3.0 release's `build` and `run`
 handlers only printed commands; current source launches Sig, forwards its
 arguments verbatim and returns its exit code. `SIG` selects an explicit compiler;
 otherwise ZPM uses `sig` on PATH. See [Contributing](CONTRIBUTING.md).

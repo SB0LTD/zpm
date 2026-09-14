@@ -5,8 +5,8 @@ Thanks for your interest in contributing to zpm.
 ## Prerequisites
 
 - **Sig compiler** — [github.com/SB0LTD/sig](https://github.com/SB0LTD/sig)
-  0.5.2 or newer (put `sig` on your PATH). Validation uses bootstrap v72,
-  Sig 0.5.3, plus the current `lib/sig` Windows URL-preservation fix.
+  0.5.9 (put `sig` on your PATH). Use the complete matched release, including
+  its library and build tools; no source overlay is needed.
 - Git
 
 ## Building

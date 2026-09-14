@@ -15,7 +15,7 @@ pub const Error = error{
     InvalidTokenEncoding,
     OutputCapacity,
     MissingSpecialToken,
-} || @import("sb0_gguf_tokenizer_index").Error;
+} || @import("tokenizer_index").Error;
 
 pub const DecodedToken = struct {
     bytes_written: usize,
@@ -323,7 +323,7 @@ fn isHorizontalWhitespace(byte: u8) bool { return byte == ' ' or byte == '\t' or
 fn isWhitespace(byte: u8) bool { return isHorizontalWhitespace(byte) or byte == '\r' or byte == '\n'; }
 fn asciiLower(byte: u8) u8 { return if (byte >= 'A' and byte <= 'Z') byte + 32 else byte; }
 
-const tokenizer_index = @import("sb0_gguf_tokenizer_index");
+const tokenizer_index = @import("tokenizer_index");
 
 const SliceSource = struct {
     bytes: []const u8,
