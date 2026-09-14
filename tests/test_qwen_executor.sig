@@ -174,6 +174,28 @@ fn numericalParity(tied: bool, rows: u32) !void {
     executed_cases += 1;
 }
 
+fn reusedCacheParity() !void {
+    var fixture: Fixture = .{};
+    try fixture.initialize(false);
+    var clean: Work = .{};
+    var reused: Work = .{};
+    var clean_kv: [KV_COUNT]u16 = @splat(0);
+    // Poison every slot with F16 NaN. Any stale read contaminates the result.
+    var reused_kv: [KV_COUNT]u16 = @splat(0x7e00);
+    for ([_]u32{ 3, 1, 5, 0 }, 0..) |token, position| {
+        const expected = try executor.forward(CAPACITY, LIMITS, fixture.source(false),
+            &fixture.index, &fixture.plan, &clean, &clean_kv, LIMITS.context,
+            token, position, true, .{});
+        const actual = try executor.forwardSliced(CAPACITY, LIMITS, fixture.source(true),
+            &fixture.index, &fixture.plan, &reused, &reused_kv, LIMITS.context,
+            token, position, true, .fused, 1, .{});
+        try check(expected == actual);
+        for (clean.logits, reused.logits) |a, b| try check(a == b and std.math.isFinite(b));
+    }
+    try check(std.mem.eql(u16, &clean_kv, &reused_kv));
+    executed_cases += 1;
+}
+
 fn boundsAndShape() !void {
     var fixture: Fixture = .{};
     try fixture.initialize(false);
@@ -291,6 +313,7 @@ pub fn main(init: std.process.Init) !void {
     }
     try boundsAndShape();
     try cancellationAndRestart();
+    try reusedCacheParity();
     var buffer: [256]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer,
         "{{\"suite\":\"qwen-executor\",\"pass\":true,\"cases\":{d},\"assertions\":{d}}}\n",
