@@ -15,9 +15,15 @@ pub const MAX_URI = 1024;
 pub const MAX_TEXT = 128 * 1024;
 
 pub const Document = struct {
-    uri_buf: [MAX_URI]u8 = undefined,
+    // Zero-initialized (not `undefined`): a document store holds many large
+    // fixed slots, and on SB0 an all-zero global maps into the read-write
+    // segment's mem-only BSS tail (no file bytes). Leaving these `undefined`
+    // makes the backend materialize every slot as initialized `.data`, bloating
+    // the packed SB0X image (32 slots x ~129 KiB here). The `*_len` fields gate
+    // all reads, so the initial buffer contents are never observed.
+    uri_buf: [MAX_URI]u8 = [_]u8{0} ** MAX_URI,
     uri_len: usize = 0,
-    text_buf: [MAX_TEXT]u8 = undefined,
+    text_buf: [MAX_TEXT]u8 = [_]u8{0} ** MAX_TEXT,
     text_len: usize = 0,
     version: i64 = 0,
     in_use: bool = false,
