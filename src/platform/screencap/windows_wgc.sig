@@ -41,6 +41,11 @@ extern "user32" fn GetWindowRect(HWND, *RECT) callconv(.c) i32;
 
 const RO_INIT_MULTITHREADED: u32 = 1;
 
+// Frame-arrival poll ceiling. Kept deliberately small so a window that never
+// produces a frame can't hold a live WGC capture session open for long.
+const FRAME_POLL_TRIES: u32 = 60;
+const FRAME_POLL_MS: u32 = 8;
+
 const PFN_RoInitialize = *const fn (u32) callconv(.c) HRESULT;
 const PFN_WindowsCreateString = *const fn ([*]const u16, u32, *HSTRING) callconv(.c) HRESULT;
 const PFN_WindowsDeleteString = *const fn (HSTRING) callconv(.c) HRESULT;
@@ -60,6 +65,23 @@ const Api = struct {
 var g_api: ?Api = null;
 var g_attempted: bool = false;
 var g_ro_inited: bool = false;
+
+// ── Cached GPU device (created once, reused across every capture) ──
+//
+// Creating a hardware D3D11 device is expensive and, when done on every frame
+// in a watch loop (~2 captures/sec × N windows), churns the GPU driver and DWM
+// hard enough to hang the graphics driver — which on Windows surfaces as a
+// whole-system freeze + TDR reset. We create the device exactly once and reuse
+// it. Only the cheap, per-window objects (capture item, frame pool, session,
+// frame, staging texture) are created and torn down per call.
+//
+// `g_device_ready` gates use; on a device-lost failure we call releaseDevice()
+// so the next capture rebuilds cleanly.
+var g_device: ?*ID3D11Device = null;
+var g_ctx: ?*ID3D11DeviceContext = null;
+var g_dxgi_dev: ?*anyopaque = null;
+var g_d3d_device: ?*IInspectable = null; // WinRT IDirect3DDevice
+var g_device_ready: bool = false;
 
 fn wstrz(comptime s: []const u8) [s.len:0]u16 {
     var arr: [s.len:0]u16 = undefined;
@@ -270,6 +292,68 @@ fn closeAndRelease(obj: ?*anyopaque) void {
     release(o);
 }
 
+/// Release the cached D3D11 device and its derived WinRT/DXGI wrappers, in
+/// reverse creation order. Called on device-lost so the next capture rebuilds.
+/// Idempotent: safe to call when nothing is initialized.
+fn releaseDevice() void {
+    if (g_d3d_device) |d| {
+        release(d);
+        g_d3d_device = null;
+    }
+    if (g_dxgi_dev) |d| {
+        release(d);
+        g_dxgi_dev = null;
+    }
+    if (g_ctx) |c| {
+        release(c);
+        g_ctx = null;
+    }
+    if (g_device) |d| {
+        release(d);
+        g_device = null;
+    }
+    g_device_ready = false;
+}
+
+/// Create the D3D11 hardware device + immediate context ONCE and wrap it as a
+/// WinRT IDirect3DDevice for the frame pool. Cached in file-scope statics and
+/// reused by every capture. Returns false on failure (caller falls back to
+/// GDI); leaves partial state cleaned up.
+fn ensureDevice(a: *const Api) bool {
+    if (g_device_ready) return true;
+
+    var device: ?*ID3D11Device = null;
+    var ctx: ?*ID3D11DeviceContext = null;
+    if (!ok(a.D3D11CreateDevice(null, D3D_DRIVER_TYPE_HARDWARE, null, D3D11_CREATE_DEVICE_BGRA_SUPPORT, null, 0, D3D11_SDK_VERSION, &device, null, &ctx)) or device == null or ctx == null) {
+        release(device);
+        release(ctx);
+        return false;
+    }
+
+    const dev_unknown: *IUnknown = @ptrCast(@alignCast(device.?));
+    var dxgi_dev: ?*anyopaque = null;
+    if (!ok(dev_unknown.vtbl.QueryInterface(dev_unknown, &IID_IDXGIDevice, &dxgi_dev)) or dxgi_dev == null) {
+        release(device);
+        release(ctx);
+        return false;
+    }
+
+    var d3d_device: ?*IInspectable = null;
+    if (!ok(a.CreateDirect3D11DeviceFromDXGIDevice(@ptrCast(@alignCast(dxgi_dev.?)), &d3d_device)) or d3d_device == null) {
+        release(dxgi_dev);
+        release(device);
+        release(ctx);
+        return false;
+    }
+
+    g_device = device;
+    g_ctx = ctx;
+    g_dxgi_dev = dxgi_dev;
+    g_d3d_device = d3d_device;
+    g_device_ready = true;
+    return true;
+}
+
 /// Result of a WGC capture: whether it succeeded and the ACTUAL pixel size
 /// written into `out` (physical pixels — may exceed the logical window size on
 /// DPI-scaled displays). The caller reports these dims and scales any detected
@@ -295,6 +379,11 @@ pub fn capture(hwnd_raw: usize, out: []u8) CaptureResult {
         g_ro_inited = true; // benign if RPC_E_CHANGED_MODE; calls still work
     }
 
+    // Create the GPU device ONCE and reuse it. This is the single most
+    // important robustness fix: it stops per-frame D3D11 device creation from
+    // hammering the graphics driver in watch mode.
+    if (!ensureDevice(a)) return fail;
+
     // GraphicsCaptureItem for the window via the interop factory.
     const cls_item = makeHString(a, RUNTIMECLASS_GraphicsCaptureItem);
     defer _ = a.WindowsDeleteString(cls_item);
@@ -318,21 +407,10 @@ pub fn capture(hwnd_raw: usize, out: []u8) CaptureResult {
     const needed = @as(usize, width) * @as(usize, height) * 4;
     if (out.len < needed) return fail;
 
-    // D3D11 device + immediate context.
-    var device: ?*ID3D11Device = null;
-    var ctx: ?*ID3D11DeviceContext = null;
-    if (!ok(a.D3D11CreateDevice(null, D3D_DRIVER_TYPE_HARDWARE, null, D3D11_CREATE_DEVICE_BGRA_SUPPORT, null, 0, D3D11_SDK_VERSION, &device, null, &ctx)) or device == null or ctx == null) return fail;
-    defer release(device);
-    defer release(ctx);
-
-    // Wrap as WinRT IDirect3DDevice.
-    const dev_unknown: *IUnknown = @ptrCast(@alignCast(device.?));
-    var dxgi_dev: ?*anyopaque = null;
-    if (!ok(dev_unknown.vtbl.QueryInterface(dev_unknown, &IID_IDXGIDevice, &dxgi_dev)) or dxgi_dev == null) return fail;
-    defer release(dxgi_dev);
-    var d3d_device: ?*IInspectable = null;
-    if (!ok(a.CreateDirect3D11DeviceFromDXGIDevice(@ptrCast(@alignCast(dxgi_dev.?)), &d3d_device)) or d3d_device == null) return fail;
-    defer release(d3d_device);
+    // Reuse the cached GPU device + WinRT wrapper (created once by ensureDevice).
+    // These are NOT released per call — they live for the process lifetime.
+    const device: *ID3D11Device = g_device.?;
+    const d3d_device: *IInspectable = g_d3d_device.?;
 
     // Frame pool + session.
     const cls_pool = makeHString(a, RUNTIMECLASS_Direct3D11CaptureFramePool);
@@ -343,7 +421,7 @@ pub fn capture(hwnd_raw: usize, out: []u8) CaptureResult {
     defer release(fps_raw);
 
     var pool_raw: ?*anyopaque = null;
-    if (!ok(fps.vtbl.Create(fps, d3d_device.?, @bitCast(DXGI_FORMAT_B8G8R8A8_UNORM), 2, item_size, &pool_raw)) or pool_raw == null) return fail;
+    if (!ok(fps.vtbl.Create(fps, d3d_device, @bitCast(DXGI_FORMAT_B8G8R8A8_UNORM), 2, item_size, &pool_raw)) or pool_raw == null) return fail;
     const pool: *IFramePool = @ptrCast(@alignCast(pool_raw.?));
     defer release(pool_raw);
 
@@ -357,13 +435,17 @@ pub fn capture(hwnd_raw: usize, out: []u8) CaptureResult {
 
     if (!ok(sess.vtbl.StartCapture(sess))) return fail;
 
-    // Frames arrive asynchronously; poll briefly.
+    // Frames arrive asynchronously; poll briefly. With the cached device the
+    // first frame is ready within a poll cycle or two, so keep the ceiling
+    // tight: a stuck/occluded window must NOT hold a live capture session open
+    // for seconds (that pins DWM/GPU work). Worst case here is
+    // FRAME_POLL_TRIES * FRAME_POLL_MS = 480ms, then we bail to GDI fallback.
     var frame_raw: ?*anyopaque = null;
     var tries: u32 = 0;
-    while (tries < 200) : (tries += 1) {
+    while (tries < FRAME_POLL_TRIES) : (tries += 1) {
         _ = pool.vtbl.TryGetNextFrame(pool, &frame_raw);
         if (frame_raw != null) break;
-        Sleep(10);
+        Sleep(FRAME_POLL_MS);
     }
     if (frame_raw == null) return fail;
     const frame: *IFrame = @ptrCast(@alignCast(frame_raw.?));
@@ -382,8 +464,8 @@ pub fn capture(hwnd_raw: usize, out: []u8) CaptureResult {
     if (!ok(ifa.vtbl.GetInterface(ifa, &IID_ID3D11Texture2D, &tex_raw)) or tex_raw == null) return fail;
     defer release(tex_raw);
 
-    // Staging texture (CPU-readable) + CopyResource.
-    const dev: *ID3D11Device = device.?;
+    // Staging texture (CPU-readable) + CopyResource. Uses the cached device.
+    const dev: *ID3D11Device = device;
     var desc = D3D11_TEXTURE2D_DESC{
         .Width = width,
         .Height = height,
@@ -398,17 +480,26 @@ pub fn capture(hwnd_raw: usize, out: []u8) CaptureResult {
         .MiscFlags = 0,
     };
     var staging: ?*ID3D11Texture2D = null;
-    if (!ok(dev.vtbl.CreateTexture2D(dev, &desc, null, &staging)) or staging == null) return fail;
+    if (!ok(dev.vtbl.CreateTexture2D(dev, &desc, null, &staging)) or staging == null) {
+        // Allocating from the device failed — most likely the device was lost
+        // (driver reset, GPU removed). Drop the cached device so the next
+        // capture rebuilds it instead of failing forever.
+        releaseDevice();
+        return fail;
+    }
     defer release(staging);
 
-    const ctxp: *ID3D11DeviceContext = ctx.?;
+    const ctxp: *ID3D11DeviceContext = g_ctx.?;
     const copyResource: PFN_CopyResource = @ptrCast(ctxp.vtbl.methods[CTX_COPYRESOURCE_INDEX]);
     copyResource(ctxp, @ptrCast(staging.?), @ptrCast(tex_raw.?));
 
     const mapFn: PFN_Map = @ptrCast(ctxp.vtbl.methods[CTX_MAP_INDEX]);
     const unmapFn: PFN_Unmap = @ptrCast(ctxp.vtbl.methods[CTX_UNMAP_INDEX]);
     var mapped: D3D11_MAPPED_SUBRESOURCE = .{};
-    if (!ok(mapFn(ctxp, @ptrCast(staging.?), 0, D3D11_MAP_READ, 0, &mapped)) or mapped.pData == null) return fail;
+    if (!ok(mapFn(ctxp, @ptrCast(staging.?), 0, D3D11_MAP_READ, 0, &mapped)) or mapped.pData == null) {
+        releaseDevice(); // map failure also indicates a lost device
+        return fail;
+    }
 
     // Copy BGRA rows (honoring RowPitch) into tightly-packed RGBA `out`.
     const src = mapped.pData.?;
