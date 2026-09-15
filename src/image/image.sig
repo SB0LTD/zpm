@@ -111,6 +111,113 @@ pub const Image = struct {
     }
 };
 
+// ── Background model (gradient-aware) ──────────────────────────────
+//
+// Many real pages use a soft gradient page background (e.g. cream -> pale
+// mint) rather than a single flat color. A single-color `backgroundColor`
+// then mislabels one side of the gradient as "ink", collapsing the whole
+// page into a few false dense regions. `BgModel` samples the background along
+// both vertical edges per scan-row so "is this pixel ink?" is answered against
+// the *local* background at that row, not one global color.
+
+pub const BgModel = struct {
+    /// Flat fallback (also used where edge sampling is unavailable).
+    flat: Rgba,
+    /// Left/right background color sampled at the top and bottom, blended per
+    /// row. Captures a vertical AND (via left/right) horizontal gradient.
+    top_left: Rgba,
+    top_right: Rgba,
+    bot_left: Rgba,
+    bot_right: Rgba,
+    height: u32,
+    width: u32,
+    /// True when edges vary enough that the local model matters.
+    is_gradient: bool,
+
+    /// Background color estimated at pixel (x, y) by bilinear blend of corners.
+    pub fn at(self: BgModel, x: u32, y: u32) Rgba {
+        if (!self.is_gradient) return self.flat;
+        const fy: u32 = if (self.height > 1) (y * 255) / (self.height - 1) else 0;
+        const fx: u32 = if (self.width > 1) (x * 255) / (self.width - 1) else 0;
+        const top = lerp(self.top_left, self.top_right, fx);
+        const bot = lerp(self.bot_left, self.bot_right, fx);
+        return lerp(top, bot, fy);
+    }
+
+    /// A pixel is ink if it differs from the LOCAL background by > threshold.
+    pub fn isInk(self: BgModel, img: Image, x: u32, y: u32, threshold: u32) bool {
+        return Rgba.dist(img.at(x, y), self.at(x, y)) > threshold;
+    }
+};
+
+fn lerp(a: Rgba, b: Rgba, t255: u32) Rgba {
+    const t = @min(t255, 255);
+    const it = 255 - t;
+    return .{
+        .r = @intCast((@as(u32, a.r) * it + @as(u32, b.r) * t) / 255),
+        .g = @intCast((@as(u32, a.g) * it + @as(u32, b.g) * t) / 255),
+        .b = @intCast((@as(u32, a.b) * it + @as(u32, b.b) * t) / 255),
+    };
+}
+
+/// Build a gradient-aware background model by sampling the four corners (a
+/// small averaged patch each, so a stray pixel doesn't skew it). Declared a
+/// gradient when the corners differ by more than a small tolerance.
+pub fn backgroundModel(img: Image) BgModel {
+    const flat = img.backgroundColor();
+    if (img.width < 4 or img.height < 4) {
+        return .{
+            .flat = flat,
+            .top_left = flat,
+            .top_right = flat,
+            .bot_left = flat,
+            .bot_right = flat,
+            .height = img.height,
+            .width = img.width,
+            .is_gradient = false,
+        };
+    }
+    const w = img.width;
+    const h = img.height;
+    const tl = cornerAvg(img, 0, 0);
+    const tr = cornerAvg(img, w - patch, 0);
+    const bl = cornerAvg(img, 0, h - patch);
+    const br = cornerAvg(img, w - patch, h - patch);
+    const spread = Rgba.dist(tl, tr) + Rgba.dist(tl, bl) + Rgba.dist(tr, br) + Rgba.dist(bl, br);
+    return .{
+        .flat = flat,
+        .top_left = tl,
+        .top_right = tr,
+        .bot_left = bl,
+        .bot_right = br,
+        .height = h,
+        .width = w,
+        .is_gradient = spread > 24,
+    };
+}
+
+const patch: u32 = 4;
+
+fn cornerAvg(img: Image, x0: u32, y0: u32) Rgba {
+    var sr: u32 = 0;
+    var sg: u32 = 0;
+    var sb: u32 = 0;
+    var n: u32 = 0;
+    var yy: u32 = 0;
+    while (yy < patch and y0 + yy < img.height) : (yy += 1) {
+        var xx: u32 = 0;
+        while (xx < patch and x0 + xx < img.width) : (xx += 1) {
+            const c = img.at(x0 + xx, y0 + yy);
+            sr += c.r;
+            sg += c.g;
+            sb += c.b;
+            n += 1;
+        }
+    }
+    if (n == 0) return img.at(x0, y0);
+    return .{ .r = @intCast(sr / n), .g = @intCast(sg / n), .b = @intCast(sb / n) };
+}
+
 /// Count ink pixels per row within `region`. `out` must have `region.h` entries.
 pub fn rowInk(img: Image, region: Rect, bg: Rgba, threshold: u32, out: []u32) void {
     var yy: u32 = 0;
@@ -208,6 +315,97 @@ pub fn averageColor(img: Image, region: Rect) Rgba {
     }
     if (n == 0) return .{ .r = 255, .g = 255, .b = 255 };
     return .{ .r = @intCast(sr / n), .g = @intCast(sg / n), .b = @intCast(sb / n) };
+}
+
+// ── Gradient-aware variants ────────────────────────────────────────
+// Same computations as above, but "ink" is judged against the LOCAL
+// background from a BgModel. The segmenter uses these so a gradient page
+// background does not read as ink.
+
+pub fn rowInkBg(img: Image, region: Rect, bg: BgModel, threshold: u32, out: []u32) void {
+    var yy: u32 = 0;
+    while (yy < region.h and yy < out.len) : (yy += 1) {
+        var count: u32 = 0;
+        var xx: u32 = 0;
+        while (xx < region.w) : (xx += 1) {
+            if (bg.isInk(img, region.x + xx, region.y + yy, threshold)) count += 1;
+        }
+        out[yy] = count;
+    }
+}
+
+pub fn colInkBg(img: Image, region: Rect, bg: BgModel, threshold: u32, out: []u32) void {
+    var xx: u32 = 0;
+    while (xx < region.w and xx < out.len) : (xx += 1) {
+        var count: u32 = 0;
+        var yy: u32 = 0;
+        while (yy < region.h) : (yy += 1) {
+            if (bg.isInk(img, region.x + xx, region.y + yy, threshold)) count += 1;
+        }
+        out[xx] = count;
+    }
+}
+
+pub fn inkBoundsBg(img: Image, region: Rect, bg: BgModel, threshold: u32) ?Rect {
+    var min_x: u32 = region.right();
+    var min_y: u32 = region.bottom();
+    var max_x: u32 = region.x;
+    var max_y: u32 = region.y;
+    var found = false;
+    var yy: u32 = 0;
+    while (yy < region.h) : (yy += 1) {
+        var xx: u32 = 0;
+        while (xx < region.w) : (xx += 1) {
+            const px = region.x + xx;
+            const py = region.y + yy;
+            if (bg.isInk(img, px, py, threshold)) {
+                found = true;
+                if (px < min_x) min_x = px;
+                if (py < min_y) min_y = py;
+                if (px > max_x) max_x = px;
+                if (py > max_y) max_y = py;
+            }
+        }
+    }
+    if (!found) return null;
+    return .{ .x = min_x, .y = min_y, .w = max_x - min_x + 1, .h = max_y - min_y + 1 };
+}
+
+pub fn inkColorBg(img: Image, region: Rect, bg: BgModel, threshold: u32) Rgba {
+    var sr: u64 = 0;
+    var sg: u64 = 0;
+    var sb: u64 = 0;
+    var n: u64 = 0;
+    var yy: u32 = 0;
+    while (yy < region.h) : (yy += 1) {
+        var xx: u32 = 0;
+        while (xx < region.w) : (xx += 1) {
+            const px = region.x + xx;
+            const py = region.y + yy;
+            if (bg.isInk(img, px, py, threshold)) {
+                const c = img.at(px, py);
+                sr += c.r;
+                sg += c.g;
+                sb += c.b;
+                n += 1;
+            }
+        }
+    }
+    if (n == 0) return bg.at(region.centerX(), region.centerY());
+    return .{ .r = @intCast(sr / n), .g = @intCast(sg / n), .b = @intCast(sb / n) };
+}
+
+pub fn inkDensityPermilleBg(img: Image, region: Rect, bg: BgModel, threshold: u32) u32 {
+    if (region.area() == 0) return 0;
+    var count: u64 = 0;
+    var yy: u32 = 0;
+    while (yy < region.h) : (yy += 1) {
+        var xx: u32 = 0;
+        while (xx < region.w) : (xx += 1) {
+            if (bg.isInk(img, region.x + xx, region.y + yy, threshold)) count += 1;
+        }
+    }
+    return @intCast((count * 1000) / region.area());
 }
 
 /// Ink density of a region: fraction (per-mille) of pixels that are ink.

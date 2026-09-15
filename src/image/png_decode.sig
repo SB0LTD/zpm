@@ -199,7 +199,12 @@ pub fn decode(data: []const u8, scratch: []u8, raw: []u8, out: []u8) PngError!De
                 1 => @intCast((x + a) & 0xff),
                 2 => @intCast((x + b) & 0xff),
                 3 => @intCast((x + @divTrunc(a + b, 2)) & 0xff),
-                4 => paeth(a, b, c),
+                // Paeth: the stored byte is the RESIDUAL to add to the
+                // predictor, exactly like the other filters. (Previously this
+                // returned only paeth(a,b,c) and dropped `x`, which blacked out
+                // any Paeth-filtered scanline whose predictor was 0 — e.g. the
+                // first row of a page.)
+                4 => @intCast((x + paeth(a, b, c)) & 0xff),
                 else => return error.BadFilter,
             };
         }
@@ -355,4 +360,42 @@ test "scaleTo8 expands bit depths" {
     try std.testing.expectEqual(@as(u8, 255), scaleTo8(1, 1));
     try std.testing.expectEqual(@as(u8, 0), scaleTo8(0, 1));
     try std.testing.expectEqual(@as(u8, 128), scaleTo8(128, 8));
+}
+
+test "Paeth filter adds residual to predictor (regression)" {
+    // A Paeth-filtered row must reconstruct as `residual + paeth(a,b,c)`.
+    // On row 0 the predictor is 0 for the first pixel, so the reconstructed
+    // value must equal the stored residual itself — not 0. This guards the bug
+    // where filter 4 returned only paeth(a,b,c) and dropped the residual,
+    // blacking out first rows.
+    //
+    // Build a 2x1 8-bit RGB PNG-shaped `raw` buffer by hand: one scanline,
+    // filter byte 4, then residuals for two pixels.
+    const width: usize = 2;
+    const stride: usize = width * 3; // RGB8
+    var raw: [(stride + 1) * 1]u8 = undefined;
+    raw[0] = 4; // Paeth
+    // pixel 0 residual = the literal color (predictor 0)
+    raw[1] = 250; raw[2] = 248; raw[3] = 244;
+    // pixel 1 residual 0 -> should copy pixel 0 (predictor picks left = a)
+    raw[4] = 0; raw[5] = 0; raw[6] = 0;
+
+    // Run the same unfilter math the decoder uses for y == 0.
+    const bpp: usize = 3;
+    const cur = raw[1 .. 1 + stride];
+    var i: usize = 0;
+    while (i < stride) : (i += 1) {
+        const a: i32 = if (i >= bpp) cur[i - bpp] else 0;
+        const b: i32 = 0;
+        const c: i32 = 0;
+        const x: i32 = cur[i];
+        cur[i] = @intCast((x + paeth(a, b, c)) & 0xff);
+    }
+    try std.testing.expectEqual(@as(u8, 250), cur[0]);
+    try std.testing.expectEqual(@as(u8, 248), cur[1]);
+    try std.testing.expectEqual(@as(u8, 244), cur[2]);
+    // pixel 1 reconstructed from residual 0 + left neighbor = pixel 0
+    try std.testing.expectEqual(@as(u8, 250), cur[3]);
+    try std.testing.expectEqual(@as(u8, 248), cur[4]);
+    try std.testing.expectEqual(@as(u8, 244), cur[5]);
 }

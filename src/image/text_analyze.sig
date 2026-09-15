@@ -24,12 +24,19 @@ const img_mod = @import("image");
 const Image = img_mod.Image;
 const Rgba = img_mod.Rgba;
 const Rect = img_mod.Rect;
+const BgModel = img_mod.BgModel;
 
 pub const Align = enum { left, center, right };
 
+/// Sane clamps for an estimated font size (px). A raster can legitimately show
+/// huge display type, but a value derived from a mis-segmented multi-line block
+/// (hundreds of px) is always a bug, so cap it.
+pub const MIN_FONT_PX: u32 = 8;
+pub const MAX_FONT_PX: u32 = 160;
+
 pub const TextStats = struct {
     line_count: u32 = 0,
-    /// Estimated font size in pixels (cap/ascender height of the largest line).
+    /// Estimated font size in pixels (median per-line ink height, clamped).
     font_px: u32 = 0,
     /// True if strokes are thick relative to glyph height.
     bold: bool = false,
@@ -52,6 +59,11 @@ pub const Glyph = struct {
 
 // ── Line grouping ──────────────────────────────────────────────────
 
+/// A row with ink at or below this count is treated as "empty" when splitting
+/// lines. A small non-zero tolerance keeps anti-aliased/gradient text from
+/// bleeding lines together (or, with ==0, never separating).
+const LINE_EMPTY: u32 = 1;
+
 /// Split a text region into lines by runs of empty rows. Writes to `out`,
 /// returns the count. `row_scratch` must hold >= region.h u32s.
 pub fn findLines(img: Image, region: Rect, bg: Rgba, ink_threshold: u32, row_scratch: []u32, out: []Line) u32 {
@@ -59,15 +71,35 @@ pub fn findLines(img: Image, region: Rect, bg: Rgba, ink_threshold: u32, row_scr
     var count: u32 = 0;
     var y: u32 = 0;
     while (y < region.h) {
-        if (row_scratch[y] == 0) {
+        if (row_scratch[y] <= LINE_EMPTY) {
             y += 1;
             continue;
         }
         const start = y;
-        while (y < region.h and row_scratch[y] > 0) : (y += 1) {}
+        while (y < region.h and row_scratch[y] > LINE_EMPTY) : (y += 1) {}
         const line_rect = Rect{ .x = region.x, .y = region.y + start, .w = region.w, .h = y - start };
-        // Tighten horizontally to ink.
         const tight = img_mod.inkBounds(img, line_rect, bg, ink_threshold) orelse continue;
+        if (count >= out.len) break;
+        out[count] = .{ .rect = tight };
+        count += 1;
+    }
+    return count;
+}
+
+/// Gradient-aware line splitting (uses a BgModel for the ink test).
+pub fn findLinesBg(img: Image, region: Rect, bg: BgModel, ink_threshold: u32, row_scratch: []u32, out: []Line) u32 {
+    img_mod.rowInkBg(img, region, bg, ink_threshold, row_scratch[0..region.h]);
+    var count: u32 = 0;
+    var y: u32 = 0;
+    while (y < region.h) {
+        if (row_scratch[y] <= LINE_EMPTY) {
+            y += 1;
+            continue;
+        }
+        const start = y;
+        while (y < region.h and row_scratch[y] > LINE_EMPTY) : (y += 1) {}
+        const line_rect = Rect{ .x = region.x, .y = region.y + start, .w = region.w, .h = y - start };
+        const tight = img_mod.inkBoundsBg(img, line_rect, bg, ink_threshold) orelse continue;
         if (count >= out.len) break;
         out[count] = .{ .rect = tight };
         count += 1;
@@ -312,56 +344,196 @@ pub fn classifyGlyph(img: Image, g: Rect, bg: Rgba, ink_threshold: u32) Glyph {
 
 // ── Aggregate typography estimate ──────────────────────────────────
 
-/// Estimate typography for a text region. `row_scratch` >= region.h u32s.
+/// Estimate typography for a text region (flat background). `row_scratch` >=
+/// region.h u32s.
 pub fn estimateText(img: Image, region: Rect, bg: Rgba, ink_threshold: u32, row_scratch: []u32) TextStats {
-    var lines_buf: [64]Line = undefined;
+    var lines_buf: [128]Line = undefined;
     const n = findLines(img, region, bg, ink_threshold, row_scratch, &lines_buf);
     if (n == 0) return .{};
 
-    // Font size ≈ the tallest line's ink height.
-    var max_h: u32 = 0;
-    for (lines_buf[0..n]) |ln| {
-        if (ln.rect.h > max_h) max_h = ln.rect.h;
-    }
-
+    const font_px = lineFontPx(lines_buf[0..n]);
     const color = img_mod.inkColor(img, region, bg, ink_threshold);
+    const bold = estimateBold(img, region, bg, ink_threshold, font_px);
+    const text_align = estimateAlignInk(img, region, bg, ink_threshold);
 
-    // Weight: stroke thickness proxy = ink density of the region. Bold text
-    // fills more of its bbox. Threshold tuned for typical UI text.
-    const density = img_mod.inkDensityPermille(img, region, bg, ink_threshold);
-    const bold = density > 320;
-
-    // Alignment: compare the ink centroid X to the region center.
-    const text_align = estimateAlign(img, region, bg, ink_threshold);
-
-    return .{
-        .line_count = n,
-        .font_px = max_h,
-        .bold = bold,
-        .color = color,
-        .alignment = text_align,
-    };
+    return .{ .line_count = n, .font_px = font_px, .bold = bold, .color = color, .alignment = text_align };
 }
 
-fn estimateAlign(img: Image, region: Rect, bg: Rgba, ink_threshold: u32) Align {
-    var sum_x: u64 = 0;
-    var n: u64 = 0;
+/// Gradient-aware variant: judges ink against the local background model. This
+/// is what the reconstruction pipeline should use for pages with a soft page
+/// gradient, so faint/low-contrast text is measured correctly.
+pub fn estimateTextBg(img: Image, region: Rect, bg: BgModel, ink_threshold: u32, row_scratch: []u32) TextStats {
+    var lines_buf: [128]Line = undefined;
+    const n = findLinesBg(img, region, bg, ink_threshold, row_scratch, &lines_buf);
+    if (n == 0) return .{};
+
+    const font_px = lineFontPx(lines_buf[0..n]);
+    const color = img_mod.inkColorBg(img, region, bg, ink_threshold);
+    const bold = estimateBoldBg(img, region, bg, ink_threshold, font_px);
+    const text_align = estimateAlignInkBg(img, region, bg, ink_threshold);
+
+    return .{ .line_count = n, .font_px = font_px, .bold = bold, .color = color, .alignment = text_align };
+}
+
+/// Robust per-line font size: the MEDIAN ink height across lines, clamped to a
+/// sane range. Median (not max) resists a single over-tall merged line, and the
+/// clamp guards against a mis-segmented block reporting hundreds of px.
+fn lineFontPx(lines: []const Line) u32 {
+    if (lines.len == 0) return 0;
+    var heights: [128]u32 = undefined;
+    const m = @min(lines.len, heights.len);
+    for (lines[0..m], 0..) |ln, i| heights[i] = ln.rect.h;
+    // Insertion sort (m is small).
+    var i: usize = 1;
+    while (i < m) : (i += 1) {
+        const key = heights[i];
+        var j: usize = i;
+        while (j > 0 and heights[j - 1] > key) : (j -= 1) heights[j] = heights[j - 1];
+        heights[j] = key;
+    }
+    const med = heights[m / 2];
+    return clampFont(med);
+}
+
+fn clampFont(px: u32) u32 {
+    if (px < MIN_FONT_PX) return MIN_FONT_PX;
+    if (px > MAX_FONT_PX) return MAX_FONT_PX;
+    return px;
+}
+
+/// Bold detection: measure the median horizontal stroke thickness on the
+/// densest text row and compare it to the font size. Thick strokes relative to
+/// glyph height => bold. This is far more reliable than whole-region density,
+/// which conflates "bold" with "lots of text".
+fn estimateBold(img: Image, region: Rect, bg: Rgba, ink_threshold: u32, font_px: u32) bool {
+    return strokeIsBold(medianStroke(img, region, bg, ink_threshold), font_px);
+}
+
+fn estimateBoldBg(img: Image, region: Rect, bg: BgModel, ink_threshold: u32, font_px: u32) bool {
+    return strokeIsBold(medianStrokeBg(img, region, bg, ink_threshold), font_px);
+}
+
+fn strokeIsBold(stroke: u32, font_px: u32) bool {
+    if (font_px == 0) return false;
+    // Regular text stroke is roughly 6–9% of cap height; bold ~11%+.
+    return stroke * 100 >= font_px * 11;
+}
+
+fn medianFromBuckets(buckets: *const [64]u32) u32 {
+    var total: u32 = 0;
+    for (buckets) |c| total += c;
+    if (total == 0) return 0;
+    var acc: u32 = 0;
+    for (buckets, 0..) |c, len| {
+        acc += c;
+        if (acc * 2 >= total) return @intCast(len);
+    }
+    return 0;
+}
+
+/// Median horizontal ink run-length (stroke-thickness proxy) — flat bg.
+fn medianStroke(img: Image, region: Rect, bg: Rgba, ink_threshold: u32) u32 {
+    var buckets: [64]u32 = @splat(0);
+    var yy: u32 = 0;
+    while (yy < region.h) : (yy += 1) {
+        var run: u32 = 0;
+        var xx: u32 = 0;
+        while (xx < region.w) : (xx += 1) {
+            if (img.isInk(region.x + xx, region.y + yy, bg, ink_threshold)) {
+                run += 1;
+            } else {
+                if (run > 0) buckets[@min(run, 63)] += 1;
+                run = 0;
+            }
+        }
+        if (run > 0) buckets[@min(run, 63)] += 1;
+    }
+    return medianFromBuckets(&buckets);
+}
+
+/// Median horizontal ink run-length — gradient-aware.
+fn medianStrokeBg(img: Image, region: Rect, bg: BgModel, ink_threshold: u32) u32 {
+    var buckets: [64]u32 = @splat(0);
+    var yy: u32 = 0;
+    while (yy < region.h) : (yy += 1) {
+        var run: u32 = 0;
+        var xx: u32 = 0;
+        while (xx < region.w) : (xx += 1) {
+            if (bg.isInk(img, region.x + xx, region.y + yy, ink_threshold)) {
+                run += 1;
+            } else {
+                if (run > 0) buckets[@min(run, 63)] += 1;
+                run = 0;
+            }
+        }
+        if (run > 0) buckets[@min(run, 63)] += 1;
+    }
+    return medianFromBuckets(&buckets);
+}
+
+fn estimateAlignInk(img: Image, region: Rect, bg: Rgba, ink_threshold: u32) Align {
+    return alignFromBounds(leftRightInk(img, region, bg, ink_threshold), region.w);
+}
+
+fn estimateAlignInkBg(img: Image, region: Rect, bg: BgModel, ink_threshold: u32) Align {
+    return alignFromBounds(leftRightInkBg(img, region, bg, ink_threshold), region.w);
+}
+
+const LR = struct { left: u32, right: u32, found: bool };
+
+/// Left/right margins of the ink bounding box (px from each edge) — flat bg.
+fn leftRightInk(img: Image, region: Rect, bg: Rgba, ink_threshold: u32) LR {
+    var min_x: u32 = region.w;
+    var max_x: u32 = 0;
+    var found = false;
     var yy: u32 = 0;
     while (yy < region.h) : (yy += 1) {
         var xx: u32 = 0;
         while (xx < region.w) : (xx += 1) {
             if (img.isInk(region.x + xx, region.y + yy, bg, ink_threshold)) {
-                sum_x += xx;
-                n += 1;
+                found = true;
+                if (xx < min_x) min_x = xx;
+                if (xx > max_x) max_x = xx;
             }
         }
     }
-    if (n == 0) return .left;
-    const centroid = sum_x / n;
-    const third = region.w / 3;
-    if (centroid < third) return .left;
-    if (centroid > third * 2) return .right;
-    return .center;
+    if (!found) return .{ .left = 0, .right = 0, .found = false };
+    return .{ .left = min_x, .right = region.w - 1 - max_x, .found = true };
+}
+
+/// Left/right margins of the ink bounding box — gradient-aware.
+fn leftRightInkBg(img: Image, region: Rect, bg: BgModel, ink_threshold: u32) LR {
+    var min_x: u32 = region.w;
+    var max_x: u32 = 0;
+    var found = false;
+    var yy: u32 = 0;
+    while (yy < region.h) : (yy += 1) {
+        var xx: u32 = 0;
+        while (xx < region.w) : (xx += 1) {
+            if (bg.isInk(img, region.x + xx, region.y + yy, ink_threshold)) {
+                found = true;
+                if (xx < min_x) min_x = xx;
+                if (xx > max_x) max_x = xx;
+            }
+        }
+    }
+    if (!found) return .{ .left = 0, .right = 0, .found = false };
+    return .{ .left = min_x, .right = region.w - 1 - max_x, .found = true };
+}
+
+fn alignFromBounds(lr: LR, width: u32) Align {
+    if (!lr.found or width == 0) return .left;
+    const tol = @max(width / 20, 6); // ~5% slack
+    const left_margin = lr.left;
+    const right_margin = lr.right;
+    const balanced = absDiff(left_margin, right_margin) <= tol;
+    if (balanced and left_margin > tol) return .center;
+    if (right_margin + tol < left_margin) return .right;
+    return .left;
+}
+
+fn absDiff(a: u32, b: u32) u32 {
+    return if (a > b) a - b else b - a;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -460,5 +632,5 @@ test "alignment: left-anchored ink reads left" {
     box(&buf, w, 2, 4, 20, 8); // ink in the left third
     const image = Image.init(&buf, w, h);
     const bg = image.backgroundColor();
-    try std.testing.expectEqual(Align.left, estimateAlign(image, .{ .x = 0, .y = 0, .w = w, .h = h }, bg, 64));
+    try std.testing.expectEqual(Align.left, estimateAlignInk(image, .{ .x = 0, .y = 0, .w = w, .h = h }, bg, 64));
 }

@@ -78,8 +78,27 @@ pub const TextOpts = struct {
     alignment: Align = .left,
 };
 
+pub const FlexDirection = enum {
+    column,
+    row,
+
+    fn str(self: FlexDirection) []const u8 {
+        return switch (self) {
+            .column => "column",
+            .row => "row",
+        };
+    }
+};
+
 pub const ContainerOpts = struct {
     bg_color: []const u8 = "", // "" = none
+    /// Flex direction of child elements. `row` places children side-by-side,
+    /// which is how a two-column hero (text beside a photo) is reconstructed.
+    direction: FlexDirection = .column,
+    /// Optional explicit content width in px (0 = default/full).
+    width_px: u32 = 0,
+    /// Vertical alignment of children ("", "center", "flex-start", ...).
+    align_items: []const u8 = "",
 };
 
 pub const Doc = struct {
@@ -116,10 +135,32 @@ pub const Doc = struct {
         self.raw("{\"id\":\"");
         self.id();
         self.raw("\",\"elType\":\"container\",\"settings\":{");
+        var wrote = false;
         if (opts.bg_color.len > 0) {
             self.raw("\"background_background\":\"classic\",\"background_color\":\"");
             self.raw(opts.bg_color);
             self.raw("\"");
+            wrote = true;
+        }
+        // Flex direction: emit for `row` (column is Elementor's default).
+        if (opts.direction == .row) {
+            if (wrote) self.raw(",");
+            self.raw("\"flex_direction\":\"row\"");
+            wrote = true;
+        }
+        if (opts.align_items.len > 0) {
+            if (wrote) self.raw(",");
+            self.raw("\"flex_align_items\":\"");
+            self.raw(opts.align_items);
+            self.raw("\"");
+            wrote = true;
+        }
+        if (opts.width_px > 0) {
+            if (wrote) self.raw(",");
+            self.raw("\"width\":{\"unit\":\"px\",\"size\":");
+            self.num(opts.width_px);
+            self.raw(",\"sizes\":[]}");
+            wrote = true;
         }
         self.raw("},\"elements\":[");
         self.need_comma = false;
