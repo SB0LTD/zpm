@@ -76,6 +76,45 @@ pub fn nextSeq() u64 {
     return g_req_seq +% 1;
 }
 
+// ── Script staging (MCP thread → main thread) ───────────────────────
+// A strategy script is larger than an Action can carry, so the MCP thread
+// stages the text here and pushes a `strategy_set_script` action; the app
+// reads the staged text when it processes that action.
+
+const SCRIPT_STAGE: usize = 8192;
+var g_script_buf: [SCRIPT_STAGE]u8 = undefined;
+var g_script_len: usize = 0;
+
+pub fn stageScript(s: []const u8) void {
+    const n = @min(s.len, SCRIPT_STAGE);
+    @memcpy(g_script_buf[0..n], s[0..n]);
+    @atomicStore(usize, &g_script_len, n, .release);
+}
+
+pub fn stagedScript() []const u8 {
+    const n = @atomicLoad(usize, &g_script_len, .acquire);
+    return g_script_buf[0..n];
+}
+
+// ── Batch result staging (main thread → MCP thread) ─────────────────
+// The app writes a JSON summary of the last parallel batch backtest here;
+// the MCP strategy_get_all tool reads it back.
+
+const BATCH_STAGE: usize = 8192;
+var g_batch_buf: [BATCH_STAGE]u8 = undefined;
+var g_batch_len: usize = 0;
+
+pub fn stageBatchResult(s: []const u8) void {
+    const n = @min(s.len, BATCH_STAGE);
+    @memcpy(g_batch_buf[0..n], s[0..n]);
+    @atomicStore(usize, &g_batch_len, n, .release);
+}
+
+pub fn stagedBatchResult() []const u8 {
+    const n = @atomicLoad(usize, &g_batch_len, .acquire);
+    return g_batch_buf[0..n];
+}
+
 // ── Shared state accessor ───────────────────────────────────────────
 
 var g_state: ?*const SeqLock(FrameState) = null;
