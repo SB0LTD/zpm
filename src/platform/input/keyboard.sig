@@ -17,6 +17,12 @@ pub fn handleKeyDown(wparam: w32.WPARAM) void {
     const vk: u32 = @truncate(@as(usize, @bitCast(wparam)));
     log.info(.{ "key down: ", vkName(vk) });
 
+    // Strategy panel is modal — capture keys while open.
+    if (g_state.strategy_open) {
+        translateStrategyKey(vk);
+        return;
+    }
+
     // Debug console — backtick toggles, ESC closes
     if (vk == 0xC0) {
         g_state.actions.push(.toggle_debug);
@@ -60,7 +66,23 @@ pub fn handleKeyDown(wparam: w32.WPARAM) void {
         0x43 => g_state.actions.push(.toggle_crosshair),
         0x52 => g_state.actions.push(.reset_view),
         0x53 => g_state.actions.push(.open_settings),
+        0x54 => g_state.actions.push(.toggle_strategy),
         0x50 => g_state.actions.push(.screenshot),
+        else => {},
+    }
+}
+
+/// Route keys while the strategy editor overlay is open.
+fn translateStrategyKey(vk: u32) void {
+    switch (vk) {
+        0x1B => g_state.actions.push(.close_strategy), // Esc
+        0x0D => g_state.actions.push(.strategy_newline), // Enter → newline
+        0x08 => g_state.actions.push(.strategy_backspace), // Backspace
+        0x25 => g_state.actions.push(.strategy_cursor_left), // Left
+        0x27 => g_state.actions.push(.strategy_cursor_right), // Right
+        0x24 => g_state.actions.push(.strategy_cursor_home), // Home
+        0x23 => g_state.actions.push(.strategy_cursor_end), // End
+        0x74 => g_state.actions.push(.strategy_run_backtest), // F5 → run backtest
         else => {},
     }
 }
@@ -73,6 +95,12 @@ pub fn handleKeyUp(wparam: w32.WPARAM) void {
 pub fn handleChar(wparam: w32.WPARAM) void {
     const ch: u8 = @truncate(@as(usize, @bitCast(wparam)));
     if (ch < 32 or ch > 126) return;
+
+    // Strategy editor is modal — capture all printable chars.
+    if (g_state.strategy_open) {
+        g_state.actions.push(.{ .strategy_type = ch });
+        return;
+    }
 
     // Order entry field takes priority
     if (g_state.order_entry_snapshot.editing != .none) {

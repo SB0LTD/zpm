@@ -12,3 +12,6 @@ cli/sig-out/
 *_err.txt
 cli/zig-out/
 
+# Tooling
+graphify-out/
+

@@ -26,6 +26,48 @@ pub fn cpuBoundWorkers(max_for_task: usize) usize {
     return @min(from_cpus, @min(max_for_task, MAX_WORKERS));
 }
 
+/// Maximal CPU worker count — uses ALL logical processors (no core reserved).
+/// For short, bursty batch compute (e.g. running a backtest matrix) where we
+/// want every thread saturated for the duration.
+pub fn cpuBoundWorkersAll(max_for_task: usize) usize {
+    return @min(cpuCount(), @min(max_for_task, MAX_WORKERS));
+}
+
+/// A snapshot of the host CPU/memory characteristics used to size work.
+pub const HwProfile = struct {
+    logical_processors: usize = 1,
+    page_size: u32 = 0,
+    allocation_granularity: u32 = 0,
+    processor_arch: u16 = 0, // 9 = x64, 5 = ARM, 12 = ARM64
+    processor_level: u16 = 0,
+    active_mask: usize = 0,
+
+    pub fn archName(self: *const HwProfile) []const u8 {
+        return switch (self.processor_arch) {
+            9 => "x64",
+            5 => "ARM",
+            12 => "ARM64",
+            6 => "IA64",
+            0 => "x86",
+            else => "unknown",
+        };
+    }
+};
+
+/// Profile the current hardware (CPU count, arch, page size, affinity mask).
+pub fn profile() HwProfile {
+    var info: w32.SYSTEM_INFO = .{};
+    w32.GetSystemInfo(&info);
+    return .{
+        .logical_processors = @max(1, info.dwNumberOfProcessors),
+        .page_size = info.dwPageSize,
+        .allocation_granularity = info.dwAllocationGranularity,
+        .processor_arch = info.wProcessorArchitecture,
+        .processor_level = info.wProcessorLevel,
+        .active_mask = info.dwActiveProcessorMask,
+    };
+}
+
 /// Optimal worker count for I/O-bound parallel work (HTTP fetches, file I/O).
 /// More threads than cores is correct — they spend most time waiting.
 /// Formula: clamp(cpus * 2, 4, MAX_WORKERS).

@@ -31,6 +31,10 @@ pub const ringRequest = channel.ringRequest;
 pub const writeResponse = channel.writeResponse;
 pub const nextSeq = channel.nextSeq;
 pub const loadFrameState = channel.loadFrameState;
+pub const stageScript = channel.stageScript;
+pub const stagedScript = channel.stagedScript;
+pub const stageBatchResult = channel.stageBatchResult;
+pub const stagedBatchResult = channel.stagedBatchResult;
 
 // ── Server state ────────────────────────────────────────────────────
 

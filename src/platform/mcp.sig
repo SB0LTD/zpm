@@ -14,3 +14,7 @@ pub const ringPush = r.ringPush;
 pub const ringRequest = r.ringRequest;
 pub const nextSeq = r.nextSeq;
 pub const loadFrameState = r.loadFrameState;
+pub const stageScript = r.stageScript;
+pub const stagedScript = r.stagedScript;
+pub const stageBatchResult = r.stageBatchResult;
+pub const stagedBatchResult = r.stagedBatchResult;
