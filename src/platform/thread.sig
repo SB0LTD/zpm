@@ -8,8 +8,11 @@ const f = @import("thread/files.sig");
 pub const MAX_WORKERS = w.MAX_WORKERS;
 pub const cpuCount = w.cpuCount;
 pub const cpuBoundWorkers = w.cpuBoundWorkers;
+pub const cpuBoundWorkersAll = w.cpuBoundWorkersAll;
 pub const ioBoundWorkers = w.ioBoundWorkers;
 pub const ioBoundWorkersPerSlot = w.ioBoundWorkersPerSlot;
+pub const HwProfile = w.HwProfile;
+pub const profile = w.profile;
 
 pub const ChunkRange = p.ChunkRange;
 pub const divideRange = p.divideRange;

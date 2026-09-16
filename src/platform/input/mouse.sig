@@ -104,6 +104,17 @@ pub fn handleMouseDown(hwnd: w32.HWND, lparam: w32.LPARAM) void {
     const titlebar_h: f32 = @floatFromInt(TITLE_BAR_HEIGHT);
     const my_gl = win_h - my_raw;
 
+    // ── Strategy panel is modal — route all clicks to it while open ──
+    if (g_state.strategy_open) {
+        g_state.actions.push(.{ .strategy_click = .{
+            .px = mx,
+            .py = my_gl,
+            .w = win_w,
+            .h = win_h,
+        } });
+        return;
+    }
+
     const bottom_strip = titlebar_h + STATUS_BAR_H + g_state.portfolio_h;
 
     // ── Open orders panel ─────────────────────────────────────────────

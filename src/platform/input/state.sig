@@ -33,4 +33,6 @@ pub const AppState = struct {
     order_entry_snapshot: oes.OrderEntryState = .{},
     /// Portfolio panel height for hit-testing (updated each frame by app)
     portfolio_h: f32 = 0,
+    /// Strategy panel open flag (updated each frame by app) — routes key input
+    strategy_open: bool = false,
 };
