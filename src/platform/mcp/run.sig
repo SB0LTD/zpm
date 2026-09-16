@@ -14,9 +14,14 @@ const rpc = @import("rpc.sig");
 
 pub const channel = @import("channel.sig");
 
-const PORT: u16 = 3001;
+const DEFAULT_PORT: u16 = 3001;
 const LISTEN_ADDR: u32 = 0x0100007F; // 127.0.0.1 in network byte order
 const BUF_SIZE: usize = 8192;
+
+// The TCP port the server binds. Configurable so multiple SB0/SB1 products can
+// each embed this server on a distinct port (SB0 Trade 3001, others 3002+)
+// without colliding. Set via initPort(); init() keeps the 3001 default.
+var g_port: u16 = DEFAULT_PORT;
 
 // ── Re-exports for backward compatibility ───────────────────────────
 
@@ -33,7 +38,15 @@ var g_listen: w32.SOCKET = w32.INVALID_SOCKET;
 var g_thread: w32.THREAD_HANDLE = null;
 var g_running: bool = false;
 
+/// Start the MCP server on the default port (3001).
 pub fn init(state: *const SeqLock(FrameState)) void {
+    initPort(state, DEFAULT_PORT);
+}
+
+/// Start the MCP server on a specific port. Use this when embedding the server
+/// in a product other than SB0 Trade so ports don't collide.
+pub fn initPort(state: *const SeqLock(FrameState), port: u16) void {
+    g_port = port;
     var wsa: w32.WSADATA = .{};
     if (w32.WSAStartup(0x0202, &wsa) != 0) {
         log.err("mcp: WSAStartup failed");
@@ -53,7 +66,7 @@ pub fn init(state: *const SeqLock(FrameState)) void {
 
     var addr = w32.sockaddr_in{
         .sin_family = @intCast(w32.AF_INET),
-        .sin_port = htons(PORT),
+        .sin_port = htons(g_port),
         .sin_addr = LISTEN_ADDR,
     };
 
@@ -81,7 +94,7 @@ pub fn init(state: *const SeqLock(FrameState)) void {
         return;
     }
 
-    log.info("mcp: listening on 127.0.0.1:3001");
+    log.info(.{ "mcp: listening on 127.0.0.1:", @as(i64, g_port) });
 }
 
 pub fn deinit() void {
