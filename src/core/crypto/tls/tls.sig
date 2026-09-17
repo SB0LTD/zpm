@@ -289,19 +289,32 @@ const Handshaker = struct {
     // (used to defer folding CertVerify into the transcript until after verify).
     lastRawTmp: [MAX_RECORD]u8 = undefined,
     lastRawLen: usize = 0,
+    // Stable storage for the Certificate message. The parsed x509.Cert values
+    // hold slices INTO this buffer, so it must outlive the rest of the flight
+    // (CertVerify + Finished reuse the shared recbuf and would otherwise clobber
+    // the cert bytes before verifyChain runs).
+    certbuf: [MAX_RECORD]u8 = undefined,
+    certlen: usize = 0,
 
     fn run(self: *Handshaker) Error!Conn {
         try self.sendClientHello();
         try self.readServerHello();
         // From here, handshake records are encrypted with handshake keys.
         try self.readEncryptedFlight();
-        try self.sendClientFinished();
 
-        // Derive application traffic secrets over the full transcript.
+        // Derive application traffic secrets over the transcript through the
+        // server Finished (RFC 8446 §7.1). This MUST happen before we append
+        // the client Finished to the transcript — the server keys its
+        // application records over Hash(ClientHello…server Finished), so
+        // including the client Finished here would desync every app record.
         var c_app: [32]u8 = undefined;
         var s_app: [32]u8 = undefined;
         const th = self.transcript.hash();
         self.ks.deriveApplicationSecrets(&th, &c_app, &s_app);
+
+        // Client Finished is sent under the handshake keys; it folds itself into
+        // the transcript but no longer affects the application secrets above.
+        try self.sendClientFinished();
 
         return Conn{
             .transport = self.transport,
@@ -345,6 +358,11 @@ const Handshaker = struct {
     fn readServerHello(self: *Handshaker) Error!void {
         const msg = try self.readPlainHandshake();
         if (msg.msg_type != HS_SERVER_HELLO) return Error.UnexpectedMessage;
+        // Fold ServerHello into the transcript BEFORE deriving handshake secrets:
+        // the handshake traffic secrets are keyed over Hash(ClientHello‖ServerHello),
+        // so the client hash must include ServerHello or every encrypted record
+        // (starting with EncryptedExtensions) fails to decrypt.
+        self.transcript.add(msg.raw);
         var r = Reader{ .buf = msg.body };
         _ = try r.getU16(); // legacy_version
         try r.skip(32); // random
@@ -397,7 +415,14 @@ const Handshaker = struct {
             switch (msg.msg_type) {
                 HS_ENCRYPTED_EXTENSIONS => {}, // no extensions we act on
                 HS_CERTIFICATE => {
-                    chain_len = try parseCertificateMsg(msg.body, &chain_buf);
+                    // Copy the Certificate body into stable storage before
+                    // parsing: the resulting x509.Cert values slice into it and
+                    // must survive the CertVerify/Finished records that reuse
+                    // the shared recbuf.
+                    if (msg.body.len > self.certbuf.len) return Error.BufferTooSmall;
+                    @memcpy(self.certbuf[0..msg.body.len], msg.body);
+                    self.certlen = msg.body.len;
+                    chain_len = try parseCertificateMsg(self.certbuf[0..self.certlen], &chain_buf);
                 },
                 HS_CERT_VERIFY => {
                     th_before_cv = self.transcriptHashExcluding(msg);
@@ -725,11 +750,12 @@ const Reader = struct {
     }
 };
 
-// ── entropy (see security note) ──
-// NOTE: X25519 client key + ClientHello.random should come from a CSPRNG. The
-// host must call setEntropy() before handshakes in production; the fixed dev
-// values below only make the handshake structurally testable. A follow-up wires
-// a real RNG (BCryptGenRandom on Windows) — flagged, not shipped as-is.
+// ── entropy ──
+// The X25519 client scalar (first 32 bytes) and ClientHello.random (last 32)
+// are drawn from this pool. Hosts MUST seed it from a CSPRNG before handshaking
+// via setEntropy() — winsock.fillEntropy() does this from BCryptGenRandom. The
+// fixed bytes below are only a fallback that keeps the handshake structurally
+// testable in hermetic unit tests; they are never used once fillEntropy() runs.
 var g_entropy: [64]u8 = [_]u8{
     0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01,
     0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x20,

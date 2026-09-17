@@ -378,6 +378,16 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("tls13_keys", "src/core/crypto/tls13_keys.sig"),
         importEntry("win32", "src/platform/win32.sig"),
     });
+    // Live network harness for the pure-Sig TLS 1.3 client. NOT wired into the
+    // `test` aggregate because it needs real egress to stream.binance.com:9443.
+    // Run it explicitly with `sig build live-tls`. It imports tls_client (the
+    // directory-module entry) plus win32 for the wall clock; tls_client pulls
+    // its crypto deps in via its own registered imports.
+    const live_all = try ctx.addStep("live-tls", "Live pure-Sig TLS 1.3 handshake against a real exchange endpoint", &noopStep);
+    _ = try addContract(ctx, live_all, "live-tls-handshake", "tests/live_tls_handshake.sig", &.{
+        importEntry("tls_client", "src/core/crypto/tls/client.sig"),
+        importEntry("win32", "src/platform/win32.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-quic-keys", "src/core/crypto/quic_keys.sig", &.{
         importEntry("sha256", "src/core/sha256.sig"),
         importEntry("hmac", "src/core/crypto/hmac.sig"),
