@@ -219,6 +219,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const tls_client = try ctx.addModule("tls_client", "src/core/crypto/tls/client.sig");
     try wire(ctx, tls_client, "sha256", "src/core/sha256.sig");
     try wire(ctx, tls_client, "p256", "src/core/crypto/p256.sig");
+    try wire(ctx, tls_client, "hkdf", "src/core/crypto/hkdf.sig");
+    try wire(ctx, tls_client, "gcm", "src/core/crypto/gcm.sig");
+    try wire(ctx, tls_client, "x25519", "src/core/crypto/x25519.sig");
+    try wire(ctx, tls_client, "tls13_keys", "src/core/crypto/tls13_keys.sig");
     const jsonl = try ctx.addModule("jsonl", "src/core/jsonl.sig");
     try wire(ctx, jsonl, "json", "src/core/json.sig");
     try wire(ctx, jsonl, "sig_mem", "src/core/sig_mem.sig");
@@ -353,6 +357,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-tls-client", "src/core/crypto/tls/client.sig", &.{
         importEntry("sha256", "src/core/sha256.sig"),
         importEntry("p256", "src/core/crypto/p256.sig"),
+        importEntry("hkdf", "src/core/crypto/hkdf.sig"),
+        importEntry("gcm", "src/core/crypto/gcm.sig"),
+        importEntry("x25519", "src/core/crypto/x25519.sig"),
+        importEntry("tls13_keys", "src/core/crypto/tls13_keys.sig"),
     });
     _ = try addTest(ctx, test_all, "test-quic-keys", "src/core/crypto/quic_keys.sig", &.{
         importEntry("sha256", "src/core/sha256.sig"),

@@ -67,6 +67,11 @@ fn verifySig(issuer: *const x509.Cert, alg: x509.SigAlg, tbs: []const u8, sig: [
 
 /// Convert a DER ECDSA-Sig-Value (SEQUENCE { r INTEGER, s INTEGER }) to the
 /// fixed 64-byte r(32)||s(32) form p256.verify expects (left-zero-padded).
+/// Public so the TLS layer can reuse it for CertificateVerify ECDSA sigs.
+pub fn ecdsaDerToRawPub(der: []const u8, out: *[64]u8) Error!void {
+    return ecdsaDerToRaw(der, out);
+}
+
 fn ecdsaDerToRaw(der: []const u8, out: *[64]u8) Error!void {
     var c = asn1.Cursor.init(der);
     const seq = c.expect(asn1.TAG_SEQUENCE) catch return Error.ParseError;

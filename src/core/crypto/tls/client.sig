@@ -19,6 +19,12 @@ pub const x509 = @import("x509.sig");
 pub const x509_verify = @import("x509_verify.sig");
 pub const ca_bundle = @import("ca_bundle.sig");
 pub const sha512 = @import("sha512.sig");
+pub const tls = @import("tls.sig");
+
+// The main public surface: a TLS 1.3 handshake + Conn for wss://.
+pub const handshake = tls.handshake;
+pub const Conn = tls.Conn;
+pub const Transport = tls.Transport;
 
 // Re-exports for the rest of the stack are added here as each piece lands.
 
@@ -33,4 +39,5 @@ test {
     @import("std").testing.refAllDecls(x509_verify);
     @import("std").testing.refAllDecls(ca_bundle);
     @import("std").testing.refAllDecls(sha512);
+    @import("std").testing.refAllDecls(tls);
 }
