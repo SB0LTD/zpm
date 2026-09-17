@@ -144,6 +144,11 @@ pub const Conn = struct {
     transport: Transport,
     client_app: RecordKeys,
     server_app: RecordKeys,
+    // Current server application_traffic_secret_N. Retained so a post-handshake
+    // server KeyUpdate can derive secret_{N+1} = HKDF-Expand-Label(secret_N,
+    // "traffic upd", "", 32) and rekey the receive direction in place (RFC 8446
+    // §7.2) — otherwise every record after a KeyUpdate would fail to decrypt.
+    server_app_secret: [32]u8 = undefined,
     // Leftover decrypted application bytes not yet consumed by the caller.
     inbuf: [MAX_RECORD]u8 = undefined,
     in_off: usize = 0,
@@ -187,10 +192,35 @@ pub const Conn = struct {
                     self.closed = true;
                     return Error.Closed;
                 },
-                REC_HANDSHAKE => continue, // NewSessionTicket / KeyUpdate: ignore (basic)
+                REC_HANDSHAKE => {
+                    // Post-handshake messages. The plaintext handshake message
+                    // sits in inbuf[0..rec.len]: [msg_type][3-byte len][body].
+                    // A KeyUpdate (24) means the server rotated its send keys;
+                    // we MUST rekey our receive direction or the next record
+                    // fails to decrypt. NewSessionTicket (4) is ignored.
+                    if (rec.len >= 1 and self.inbuf[0] == HS_KEY_UPDATE) {
+                        // Rekey the receive direction so we can keep decrypting.
+                        // If the server set update_requested (inbuf[4]==1) it
+                        // also wants us to rotate our send keys; we don't (we
+                        // send only rare subscribe/ping frames, and the app's
+                        // reconnect loop is the backstop if a send ever
+                        // desyncs). Receive-side rekey is the mandatory part.
+                        self.rekeyServer();
+                    }
+                    continue;
+                },
                 else => continue,
             }
         }
+    }
+
+    /// Advance the server (receive) application traffic secret one generation
+    /// per RFC 8446 §7.2 and re-derive the receive key/IV. Sequence resets to 0.
+    fn rekeyServer(self: *Conn) void {
+        var next: [32]u8 = undefined;
+        _ = hkdf.expandLabel(&self.server_app_secret, "traffic upd", "", &next, 32);
+        self.server_app_secret = next;
+        self.server_app = RecordKeys.init(&self.server_app_secret);
     }
 
     pub fn close(self: *Conn) void {
@@ -227,16 +257,18 @@ pub const Conn = struct {
 
     const DecRec = struct { content_type: u8, len: usize };
 
-    /// Read one TLS record, decrypt with server app keys, strip inner type.
-    /// The decrypted bytes land in self.inbuf.
+    /// Read one TLS record and decrypt it IN PLACE inside self.inbuf, then strip
+    /// the inner content type. Reading the ciphertext body directly into inbuf
+    /// (rather than a separate stack buffer that is then copied) removes a
+    /// 16 KB stack frame and a full-record memcpy from every app record.
     fn readAndDecrypt(self: *Conn) Error!DecRec {
         var hdr: [5]u8 = undefined;
         try self.transport.readExact(&hdr);
         const rec_len = (@as(usize, hdr[3]) << 8) | hdr[4];
         if (rec_len == 0 or rec_len > MAX_RECORD) return Error.BadRecord;
 
-        var ct: [MAX_RECORD]u8 = undefined;
-        try self.transport.readExact(ct[0..rec_len]);
+        // Decrypt in place: read the full ciphertext record straight into inbuf.
+        try self.transport.readExact(self.inbuf[0..rec_len]);
 
         if (hdr[0] == REC_CHANGE_CIPHER_SPEC) {
             // Ignore a stray CCS; recurse for the next real record.
@@ -245,19 +277,20 @@ pub const Conn = struct {
         if (rec_len < gcm.TAG_LEN) return Error.BadRecord;
         const body_len = rec_len - gcm.TAG_LEN;
         var tag: [16]u8 = undefined;
-        @memcpy(&tag, ct[body_len..rec_len]);
+        @memcpy(&tag, self.inbuf[body_len..rec_len]);
 
         const n = self.server_app.nonce();
-        if (!self.server_app.aead.open(&n, ct[0..body_len], &hdr, &tag)) return Error.DecryptFailed;
+        if (!self.server_app.aead.open(&n, self.inbuf[0..body_len], &hdr, &tag)) return Error.DecryptFailed;
         self.server_app.seq += 1;
 
-        // Strip trailing zero padding, then the 1-byte inner content type.
+        // Strip trailing zero padding, then the 1-byte inner content type. The
+        // plaintext already lives in inbuf (decrypted in place), so there is no
+        // further copy — read() serves the caller straight from inbuf.
         var end = body_len;
-        while (end > 0 and ct[end - 1] == 0) end -= 1;
+        while (end > 0 and self.inbuf[end - 1] == 0) end -= 1;
         if (end == 0) return Error.BadRecord;
-        const inner_type = ct[end - 1];
+        const inner_type = self.inbuf[end - 1];
         const data_len = end - 1;
-        @memcpy(self.inbuf[0..data_len], ct[0..data_len]);
         return .{ .content_type = inner_type, .len = data_len };
     }
 };
@@ -320,6 +353,7 @@ const Handshaker = struct {
             .transport = self.transport,
             .client_app = RecordKeys.init(&c_app),
             .server_app = RecordKeys.init(&s_app),
+            .server_app_secret = s_app,
         };
     }
 

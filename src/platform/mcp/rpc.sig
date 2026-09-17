@@ -590,7 +590,11 @@ fn fmtStatusResult(buf: *[RESP_SIZE]u8, id: i64) usize {
     pos = http.appendSlice(buf, pos, if (st.connected) "true" else "false");
     pos = http.appendSlice(buf, pos, ",\\\"last_price\\\":");
     pos = fmtFloat(buf, pos, st.last_price);
-    pos = http.appendSlice(buf, pos, ",\\\"display_idx\\\":");
+    pos = http.appendSlice(buf, pos, ",\\\"avail_balance\\\":");
+    pos = fmtFloat(buf, pos, st.avail_balance);
+    pos = http.appendSlice(buf, pos, ",\\\"balance_asset\\\":\\\"");
+    pos = http.appendSlice(buf, pos, st.balance_asset.slice());
+    pos = http.appendSlice(buf, pos, "\\\",\\\"display_idx\\\":");
     pos = http.appendUint(buf, pos, st.display_idx);
     pos = http.appendSlice(buf, pos, ",\\\"slot_count\\\":");
     pos = http.appendUint(buf, pos, st.slot_count);
