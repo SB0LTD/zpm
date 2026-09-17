@@ -194,6 +194,17 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     // build. They are intentionally not added to this aggregate step because
     // the fixed build graph here is already at its step capacity.
 
+    // win32 is registered here (ahead of the crypto tests) because the pure-Sig
+    // TLS client and its `test-tls-client` step import it via importEntry, which
+    // interns the module by name. Registering it up front keeps that early
+    // reference and the later platform consumers pointing at one canonical
+    // module (a second addModule would fail with a duplicate-name error).
+    const win32_path = if (builtin.os.tag == .windows)
+        "src/platform/win32.sig"
+    else
+        "src/transport/linux_platform.sig";
+    _ = try ctx.addModule("win32", win32_path);
+
     // ── Crypto modules (Layer 0: pure computation, freestanding) ──
     const crypto_hmac = try ctx.addModule("hmac", "src/core/crypto/hmac.sig");
     try wire(ctx, crypto_hmac, "sha256", "src/core/sha256.sig");
@@ -223,6 +234,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, tls_client, "gcm", "src/core/crypto/gcm.sig");
     try wire(ctx, tls_client, "x25519", "src/core/crypto/x25519.sig");
     try wire(ctx, tls_client, "tls13_keys", "src/core/crypto/tls13_keys.sig");
+    // NOTE: the tls_client → win32 edge is wired further below, next to the
+    // other platform consumers, using the win32_path/module registered up in
+    // the crypto block. Wiring it here is unnecessary and the module already
+    // exists by that point.
     const jsonl = try ctx.addModule("jsonl", "src/core/jsonl.sig");
     try wire(ctx, jsonl, "json", "src/core/json.sig");
     try wire(ctx, jsonl, "sig_mem", "src/core/sig_mem.sig");
@@ -361,6 +376,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("gcm", "src/core/crypto/gcm.sig"),
         importEntry("x25519", "src/core/crypto/x25519.sig"),
         importEntry("tls13_keys", "src/core/crypto/tls13_keys.sig"),
+        importEntry("win32", "src/platform/win32.sig"),
     });
     _ = try addTest(ctx, test_all, "test-quic-keys", "src/core/crypto/quic_keys.sig", &.{
         importEntry("sha256", "src/core/sha256.sig"),
@@ -540,11 +556,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
 
     // Platform modules used by the portable and transport layers. The native
     // build host selects the same source split as the transitional graph.
-    const win32_path = if (builtin.os.tag == .windows)
-        "src/platform/win32.sig"
-    else
-        "src/transport/linux_platform.sig";
-    _ = try ctx.addModule("win32", win32_path);
+    // (win32 / win32_path are registered up in the crypto block so the TLS
+    // client's early test import interns the same canonical module.)
+    // tls_client needs win32 for its Winsock transport.
+    try wire(ctx, tls_client, "win32", win32_path);
     _ = try ctx.addModule("gl", "src/platform/gl.sig");
 
     // ── Network modules (Layer 0: pure computation, freestanding) ──

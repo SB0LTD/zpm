@@ -590,12 +590,27 @@ pub const timeval = extern struct {
     tv_usec: c_long = 0,
 };
 
+// addrinfo for hostname resolution (getaddrinfo). ai_addr points at a sockaddr.
+pub const addrinfo = extern struct {
+    ai_flags: c_int = 0,
+    ai_family: c_int = 0,
+    ai_socktype: c_int = 0,
+    ai_protocol: c_int = 0,
+    ai_addrlen: usize = 0,
+    ai_canonname: ?[*:0]u8 = null,
+    ai_addr: ?*sockaddr_in = null,
+    ai_next: ?*addrinfo = null,
+};
+
 pub extern "ws2_32" fn WSAStartup(u16, *WSADATA) callconv(.c) c_int;
 pub extern "ws2_32" fn WSACleanup() callconv(.c) c_int;
 pub extern "ws2_32" fn socket(c_int, c_int, c_int) callconv(.c) SOCKET;
 pub extern "ws2_32" fn bind(SOCKET, *const sockaddr_in, c_int) callconv(.c) c_int;
 pub extern "ws2_32" fn listen(SOCKET, c_int) callconv(.c) c_int;
 pub extern "ws2_32" fn accept(SOCKET, ?*sockaddr_in, ?*c_int) callconv(.c) SOCKET;
+pub extern "ws2_32" fn connect(SOCKET, *const sockaddr_in, c_int) callconv(.c) c_int;
+pub extern "ws2_32" fn getaddrinfo(?[*:0]const u8, ?[*:0]const u8, ?*const addrinfo, *?*addrinfo) callconv(.c) c_int;
+pub extern "ws2_32" fn freeaddrinfo(?*addrinfo) callconv(.c) void;
 pub extern "ws2_32" fn recv(SOCKET, [*]u8, c_int, c_int) callconv(.c) c_int;
 pub extern "ws2_32" fn send(SOCKET, [*]const u8, c_int, c_int) callconv(.c) c_int;
 pub extern "ws2_32" fn closesocket(SOCKET) callconv(.c) c_int;
