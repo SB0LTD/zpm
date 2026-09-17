@@ -29,8 +29,21 @@
 const tlsc = @import("tls_client");
 const websocket = @import("websocket");
 
-pub const Error = websocket.Error;
 pub const Message = websocket.Message;
+
+/// wss client errors. Mirrors websocket.Error plus TlsFailed, so callers can
+/// tell a TLS handshake / cert-validation failure apart from a WebSocket
+/// upgrade or framing failure.
+pub const Error = error{
+    ConnectFailed,
+    TlsFailed,
+    IoFailed,
+    HandshakeFailed,
+    MessageTooBig,
+    ScratchTooSmall,
+    Closed,
+    ProtocolError,
+};
 
 pub const ConnectOptions = struct {
     /// Server hostname (resolved via getaddrinfo, used for SNI + cert + Host).
@@ -69,7 +82,7 @@ pub const WssClient = struct {
 
         // 2. TLS 1.3 handshake (validates the cert chain to the CA bundle).
         self.conn = tlsc.handshake(self.sock.transport(), opts.host, opts.now) catch
-            return Error.HandshakeFailed;
+            return Error.TlsFailed;
 
         // 3. WebSocket upgrade over the encrypted Conn.
         self.ws = websocket.Client.overTransport(connTransport(&self.conn), .{
@@ -102,6 +115,10 @@ pub const WssClient = struct {
 
     /// Close the WebSocket (best-effort close frame + TLS close_notify) and the
     /// socket. Safe to call once; a no-op if never connected.
+    ///
+    /// Call this from the SAME thread that does receive/send — it writes a WS
+    /// close frame and TLS close_notify. To unblock a receive on another thread
+    /// during shutdown, use `shutdownSocket()` first (see its note).
     pub fn close(self: *WssClient) void {
         if (!self.connected) {
             self.sock.close();
@@ -112,6 +129,19 @@ pub const WssClient = struct {
         self.ws.close();
         self.sock.close();
         self.connected = false;
+    }
+
+    /// Close ONLY the underlying TCP socket, without touching the TLS/WS layers.
+    ///
+    /// This is the cross-thread unblock primitive: a blocking `recv` on the
+    /// socket returns immediately once the fd is closed, so a controller thread
+    /// can wake a worker that is parked in `receiveMessage`. It writes nothing
+    /// to the wire (no close frame / close_notify — those would race the
+    /// worker's reads), so it is safe to call from a different thread than the
+    /// one doing I/O. The worker then observes the read failure, exits its loop,
+    /// and the controller joins it. Idempotent.
+    pub fn shutdownSocket(self: *WssClient) void {
+        self.sock.close();
     }
 };
 
@@ -128,18 +158,18 @@ fn connTransport(conn: *tlsc.Conn) websocket.Transport {
     };
 }
 
-fn connRead(ctx: *anyopaque, buf: []u8) Error!usize {
+fn connRead(ctx: *anyopaque, buf: []u8) websocket.Error!usize {
     const conn: *tlsc.Conn = @ptrCast(@alignCast(ctx));
     const n = conn.read(buf) catch |err| switch (err) {
         error.Closed => return 0, // peer close_notify → EOF for the framer
-        else => return Error.IoFailed,
+        else => return websocket.Error.IoFailed,
     };
     return n;
 }
 
-fn connWrite(ctx: *anyopaque, data: []const u8) Error!void {
+fn connWrite(ctx: *anyopaque, data: []const u8) websocket.Error!void {
     const conn: *tlsc.Conn = @ptrCast(@alignCast(ctx));
-    conn.write(data) catch return Error.IoFailed;
+    conn.write(data) catch return websocket.Error.IoFailed;
 }
 
 fn connClose(ctx: *anyopaque) void {
