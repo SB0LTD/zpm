@@ -12,7 +12,9 @@ pub const BUTTON_WIDTH: i32 = 46;
 // ── Layout constants (must match app/run.sig) ───────────────────────
 const SIDEBAR_W: f32 = 300;
 const ORDERS_H: f32 = 160;
-const OB_FRAC: f32 = 0.55;
+// MUST match OB_FRAC in the app's run.sig — the sidebar order-book/order-entry
+// split drives order-entry hit-testing. If these desync, clicks miss the fields.
+const OB_FRAC: f32 = 0.42;
 const STATUS_BAR_H: f32 = 28;
 
 var g_state: *state_mod.AppState = undefined;
@@ -116,11 +118,33 @@ pub fn handleMouseDown(hwnd: w32.HWND, lparam: w32.LPARAM) void {
     }
 
     const bottom_strip = titlebar_h + STATUS_BAR_H + g_state.portfolio_h;
+    const sidebar_x = win_w - SIDEBAR_W;
+
+    // ── Portfolio panel (position Close / Market-Close buttons) ───────
+    // Sits between the status bar and the open-orders panel:
+    //   my_gl ∈ [titlebar_h + STATUS_BAR_H, bottom_strip). Pass ABSOLUTE
+    //   coords — the widget records button rects in screen/GL space.
+    const port_bottom_gl = titlebar_h + STATUS_BAR_H;
+    if (g_state.portfolio_h > 0 and my_gl >= port_bottom_gl and my_gl < bottom_strip) {
+        g_state.actions.push(.{ .order_field_click = .none });
+        g_state.actions.push(.{ .portfolio_click = .{
+            .px = mx,
+            .py = my_gl,
+            .w = win_w,
+            .h = g_state.portfolio_h,
+        } });
+        return;
+    }
 
     // ── Open orders panel ─────────────────────────────────────────────
+    // The open-orders panel is drawn full-width (x=0..win_w) but the sidebar
+    // (order book + order entry) is drawn ON TOP of its right SIDEBAR_W column.
+    // So only treat clicks LEFT of the sidebar as open-orders — otherwise this
+    // band would steal every sidebar field/button click in the same Y range
+    // (that was the bug: order-entry fields below the buttons were unclickable).
     const oo_bottom_gl = bottom_strip;
     const oo_top_gl = oo_bottom_gl + ORDERS_H;
-    if (my_gl >= oo_bottom_gl and my_gl < oo_top_gl) {
+    if (mx < sidebar_x and my_gl >= oo_bottom_gl and my_gl < oo_top_gl) {
         // Clicking outside order entry clears field focus
         g_state.actions.push(.{ .order_field_click = .none });
         g_state.actions.push(.{ .open_orders_click = .{
@@ -133,7 +157,6 @@ pub fn handleMouseDown(hwnd: w32.HWND, lparam: w32.LPARAM) void {
     }
 
     // ── Right sidebar ─────────────────────────────────────────────────
-    const sidebar_x = win_w - SIDEBAR_W;
     if (mx >= sidebar_x) {
         const sidebar_h = win_h - titlebar_h - bottom_strip;
         const ob_h = sidebar_h * OB_FRAC;

@@ -243,6 +243,27 @@ pub extern "kernel32" fn CreateDirectoryW(LPCWSTR, ?*anyopaque) callconv(.c) BOO
 pub extern "kernel32" fn DeleteFileW(LPCWSTR) callconv(.c) BOOL;
 pub extern "kernel32" fn CloseHandle(HANDLE) callconv(.c) BOOL;
 
+// ── Directory enumeration (FindFirstFileW / FindNextFileW) ──
+pub const MAX_PATH: usize = 260;
+pub const FILE_ATTRIBUTE_DIRECTORY: DWORD = 0x10;
+
+pub const WIN32_FIND_DATAW = extern struct {
+    dwFileAttributes: DWORD = 0,
+    ftCreationTime: FILETIME = .{},
+    ftLastAccessTime: FILETIME = .{},
+    ftLastWriteTime: FILETIME = .{},
+    nFileSizeHigh: DWORD = 0,
+    nFileSizeLow: DWORD = 0,
+    dwReserved0: DWORD = 0,
+    dwReserved1: DWORD = 0,
+    cFileName: [MAX_PATH]u16 = [_]u16{0} ** MAX_PATH,
+    cAlternateFileName: [14]u16 = [_]u16{0} ** 14,
+};
+
+pub extern "kernel32" fn FindFirstFileW(LPCWSTR, *WIN32_FIND_DATAW) callconv(.c) HANDLE;
+pub extern "kernel32" fn FindNextFileW(HANDLE, *WIN32_FIND_DATAW) callconv(.c) BOOL;
+pub extern "kernel32" fn FindClose(HANDLE) callconv(.c) BOOL;
+
 // GDI font/bitmap functions
 pub const HFONT = *opaque {};
 pub const HGDIOBJ = *opaque {};
@@ -412,6 +433,11 @@ pub const HINTERNET = ?*opaque {};
 pub const WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: DWORD = 4;
 pub const WINHTTP_FLAG_SECURE: DWORD = 0x00800000;
 pub const WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET: DWORD = 114;
+
+// Returned by a blocking WinHTTP call (including WinHttpWebSocketReceive) when
+// the configured receive timeout elapses. The connection stays open — the
+// caller can retry the receive (used to drive periodic WebSocket keepalive pings).
+pub const ERROR_WINHTTP_TIMEOUT: DWORD = 12002;
 
 // WebSocket buffer types
 pub const WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE: DWORD = 0;

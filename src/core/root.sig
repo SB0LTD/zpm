@@ -27,6 +27,7 @@ pub const model_observability = @import("model_observability");
 pub const multimodal_now = @import("multimodal_now");
 pub const types = @import("types.sig");
 pub const fmt = @import("fmt.sig");
+pub const timefmt = @import("timefmt.sig");
 pub const config = @import("config.sig");
 pub const config_types = @import("config_types.sig");
 pub const metadata = @import("metadata.sig");

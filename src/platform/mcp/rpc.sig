@@ -408,6 +408,71 @@ fn handleStrategy(buf: *[RESP_SIZE]u8, id: i64, sel: ?[]const u8, pay: ?[]const 
         }
         return okPush(buf, id, .{ .strategy_set_tf = secs });
     }
+    if (http.eql(act, "walk_forward")) {
+        // Native randomized walk-forward. Runs in the app; read the aggregate
+        // JSON via get_all afterward (same staged buffer as run_all). All args
+        // optional — sensible defaults live in WalkSpec.
+        var ws = @import("core").ui.action.WalkSpec{};
+        if (pay) |a| {
+            if (json.getInt(a, "\"windows\"")) |v| {
+                if (v > 0) ws.windows = @intCast(v);
+            }
+            if (json.getInt(a, "\"seed\"")) |v| {
+                if (v >= 0) ws.seed = @intCast(v);
+            }
+            if (json.getInt(a, "\"seeds\"")) |v| {
+                if (v > 0) ws.seeds = @intCast(v);
+            }
+            if (json.getInt(a, "\"win\"")) |v| {
+                if (v > 0) ws.win_1m = @intCast(v);
+            }
+            if (json.getInt(a, "\"max_offset\"")) |v| {
+                if (v >= 0) ws.max_offset_1m = @intCast(v);
+            }
+            if (json.getInt(a, "\"tf\"")) |v| {
+                if (v >= 0) ws.tf_secs = v;
+            }
+        }
+        return okPush(buf, id, .{ .strategy_walk_forward = ws });
+    }
+    if (http.eql(act, "matrix_run")) {
+        // Score every .pine file in args.dir via walk-forward (live leaderboard).
+        // args: dir (string, required), title (string), windows, seed, seeds,
+        // win, max_offset, tf.
+        var ms = @import("core").ui.action.MatrixSpec{};
+        if (pay) |a| {
+            if (json.getString(a, "\"dir\"")) |d| {
+                const n = @min(d.len, ms.dir.len);
+                for (0..n) |i| ms.dir[i] = d[i];
+                ms.dir_len = @intCast(n);
+            }
+            if (json.getString(a, "\"title\"")) |ttl| {
+                const n = @min(ttl.len, ms.title.len);
+                for (0..n) |i| ms.title[i] = ttl[i];
+                ms.title_len = @intCast(n);
+            }
+            if (json.getInt(a, "\"windows\"")) |v| {
+                if (v > 0) ms.spec.windows = @intCast(v);
+            }
+            if (json.getInt(a, "\"seed\"")) |v| {
+                if (v >= 0) ms.spec.seed = @intCast(v);
+            }
+            if (json.getInt(a, "\"seeds\"")) |v| {
+                if (v > 0) ms.spec.seeds = @intCast(v);
+            }
+            if (json.getInt(a, "\"win\"")) |v| {
+                if (v > 0) ms.spec.win_1m = @intCast(v);
+            }
+            if (json.getInt(a, "\"max_offset\"")) |v| {
+                if (v >= 0) ms.spec.max_offset_1m = @intCast(v);
+            }
+            if (json.getInt(a, "\"tf\"")) |v| {
+                if (v >= 0) ms.spec.tf_secs = v;
+            }
+        }
+        if (ms.dir_len == 0) return fmtToolResult(buf, id, "error: matrix_run needs args.dir", true);
+        return okPush(buf, id, .{ .strategy_matrix_run = ms });
+    }
     if (http.eql(act, "set_param")) {
         if (pay) |a| {
             if (json.getString(a, "\"name\"")) |pname| {

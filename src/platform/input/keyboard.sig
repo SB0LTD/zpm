@@ -67,6 +67,7 @@ pub fn handleKeyDown(wparam: w32.WPARAM) void {
         0x52 => g_state.actions.push(.reset_view),
         0x53 => g_state.actions.push(.open_settings),
         0x54 => g_state.actions.push(.toggle_strategy),
+        0x4D => g_state.actions.push(.toggle_matrix),
         0x50 => g_state.actions.push(.screenshot),
         else => {},
     }
@@ -200,6 +201,8 @@ fn vkName(vk: u32) []const u8 {
         0x46 => "F",
         0x52 => "R",
         0x53 => "S",
+        0x54 => "T",
+        0x4D => "M",
         0x50 => "P",
         0xBB => "Plus",
         0xBD => "Minus",
