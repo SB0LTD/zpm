@@ -214,6 +214,11 @@ pub fn run(io: std.Io, config: *const SubprocessConfig) SubprocessResult {
 }
 
 /// Spawn a subprocess without waiting. Returns a handle for later wait/kill.
+///
+/// stdout/stderr are piped so a later `wait` can collect them. NOTE: because
+/// nothing drains those pipes until `wait`, a long-running child that writes a
+/// lot to stdout/stderr (e.g. a browser) can block on a full pipe and appear to
+/// hang. For fire-and-forget daemons, use `spawnDetached` instead.
 pub fn spawn(io: std.Io, config: *const SubprocessConfig) ?ProcessHandle {
     if (requiresUnavailablePolicy(config)) return null;
     var argv_buf: [MAX_ARGV][]const u8 = undefined;
@@ -229,6 +234,34 @@ pub fn spawn(io: std.Io, config: *const SubprocessConfig) ?ProcessHandle {
         .stdout = .pipe,
         .stderr = .pipe,
         .request_resource_usage_statistics = true,
+    }) catch return null;
+
+    return ProcessHandle{
+        .child = child,
+        .start_time = timestampMs(io),
+    };
+}
+
+/// Spawn a long-running background process whose output we don't collect.
+///
+/// stdout/stderr are discarded (`.ignore`) so the child is never throttled by
+/// an unread pipe — the right choice for daemons like a headless browser that
+/// stream diagnostics indefinitely. The returned handle is still usable with
+/// `kill`. `wait` on this handle will find no output (that's expected).
+pub fn spawnDetached(io: std.Io, config: *const SubprocessConfig) ?ProcessHandle {
+    if (requiresUnavailablePolicy(config)) return null;
+    var argv_buf: [MAX_ARGV][]const u8 = undefined;
+    const argc = @min(config.argv.len, MAX_ARGV);
+    for (0..argc) |i| {
+        argv_buf[i] = config.argv[i];
+    }
+
+    const child = std.process.spawn(io, .{
+        .argv = argv_buf[0..argc],
+        .cwd = if (config.cwd) |cwd| .{ .path = cwd } else .inherit,
+        .stdin = .close,
+        .stdout = .ignore,
+        .stderr = .ignore,
     }) catch return null;
 
     return ProcessHandle{
