@@ -17,6 +17,7 @@ pub const asn1 = @import("asn1.sig");
 pub const rsa = @import("rsa.sig");
 pub const x509 = @import("x509.sig");
 pub const x509_verify = @import("x509_verify.sig");
+pub const ca_bundle = @import("ca_bundle.sig");
 pub const sha512 = @import("sha512.sig");
 
 // Re-exports for the rest of the stack are added here as each piece lands.
@@ -30,5 +31,6 @@ test {
     @import("std").testing.refAllDecls(rsa);
     @import("std").testing.refAllDecls(x509);
     @import("std").testing.refAllDecls(x509_verify);
+    @import("std").testing.refAllDecls(ca_bundle);
     @import("std").testing.refAllDecls(sha512);
 }

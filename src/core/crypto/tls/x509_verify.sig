@@ -227,3 +227,17 @@ test "x509_verify: chain rejects with no trusted root" {
     const now: i64 = 1780272000;
     try testing.expectError(Error.UntrustedRoot, verifyChain(&chain, &roots, "stream.binance.com", now));
 }
+
+test "x509_verify: real Binance chain anchors to the EMBEDDED CA bundle" {
+    const tv = @import("testvec.sig");
+    const ca_bundle = @import("ca_bundle.sig");
+    const leaf = try x509.parse(&tv.binance_leaf_der);
+    const inter = try x509.parse(&tv.binance_intermediate_der);
+    const chain = [_]x509.Cert{ leaf, inter };
+
+    var root_buf: [ca_bundle.MAX_ROOTS]x509.Cert = undefined;
+    const nroots = ca_bundle.load(&root_buf);
+    const now: i64 = 1780272000;
+    // This is the true end-to-end test: server chain + shipped trust store.
+    try verifyChain(&chain, root_buf[0..nroots], "stream.binance.com", now);
+}
