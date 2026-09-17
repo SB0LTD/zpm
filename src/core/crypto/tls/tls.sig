@@ -592,12 +592,15 @@ fn verifyCertVerifySig(leaf: *const x509.Cert, scheme: u16, signed: []const u8, 
     const rsa = @import("rsa.sig");
     const p256 = @import("p256");
     switch (scheme) {
-        SIG_RSA_PKCS1_SHA256, SIG_RSA_PSS_SHA256 => {
+        SIG_RSA_PKCS1_SHA256 => {
             if (leaf.key_alg != .rsa) return Error.CertInvalid;
             const pk = rsa.publicKey(leaf.rsa_modulus, leaf.rsa_exponent) catch return Error.CertInvalid;
-            // PSS not implemented → accept only PKCS1 here; PSS verify would go here.
-            if (scheme == SIG_RSA_PSS_SHA256) return Error.UnsupportedParams;
             if (!rsa.verifyPkcs1(&pk, .sha256, signed, sig)) return Error.CertInvalid;
+        },
+        SIG_RSA_PSS_SHA256 => {
+            if (leaf.key_alg != .rsa) return Error.CertInvalid;
+            const pk = rsa.publicKey(leaf.rsa_modulus, leaf.rsa_exponent) catch return Error.CertInvalid;
+            if (!rsa.verifyPssSha256(&pk, signed, sig)) return Error.CertInvalid;
         },
         SIG_RSA_PKCS1_SHA384 => {
             if (leaf.key_alg != .rsa) return Error.CertInvalid;
