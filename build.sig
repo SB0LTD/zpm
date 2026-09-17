@@ -187,6 +187,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     _ = try ctx.addModule("elementor_document", "src/elementor/document.sig");
     _ = try addTest(ctx, test_all, "test-elementor-document", "src/elementor/document.sig", &.{});
+    // NOTE: the web-automation stack's unit tests — websocket (RFC 6455),
+    // dom_import (extractor + envelope), and cdp (target discovery, surrogate
+    // decoding) — are run directly with `sig test src/net/websocket.sig`,
+    // `sig test src/elementor/dom_import.sig`, and (with its deps) the stools
+    // build. They are intentionally not added to this aggregate step because
+    // the fixed build graph here is already at its step capacity.
 
     // ── Crypto modules (Layer 0: pure computation, freestanding) ──
     const crypto_hmac = try ctx.addModule("hmac", "src/core/crypto/hmac.sig");
@@ -208,6 +214,11 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, crypto_quic_keys, "sha256", "src/core/sha256.sig");
     try wire(ctx, crypto_quic_keys, "hkdf", "src/core/crypto/hkdf.sig");
     try wire(ctx, crypto_quic_keys, "aes", "src/core/crypto/aes.sig");
+    // Pure-Sig TLS 1.3 client (ASN.1/DER, RSA, X.509, chain verify, record layer)
+    // as one directory module — internal files import each other relatively.
+    const tls_client = try ctx.addModule("tls_client", "src/core/crypto/tls/client.sig");
+    try wire(ctx, tls_client, "sha256", "src/core/sha256.sig");
+    try wire(ctx, tls_client, "p256", "src/core/crypto/p256.sig");
     const jsonl = try ctx.addModule("jsonl", "src/core/jsonl.sig");
     try wire(ctx, jsonl, "json", "src/core/json.sig");
     try wire(ctx, jsonl, "sig_mem", "src/core/sig_mem.sig");
@@ -338,6 +349,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("sha256", "src/core/sha256.sig"),
         importEntry("hmac", "src/core/crypto/hmac.sig"),
         importEntry("hkdf", "src/core/crypto/hkdf.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tls-client", "src/core/crypto/tls/client.sig", &.{
+        importEntry("sha256", "src/core/sha256.sig"),
+        importEntry("p256", "src/core/crypto/p256.sig"),
     });
     _ = try addTest(ctx, test_all, "test-quic-keys", "src/core/crypto/quic_keys.sig", &.{
         importEntry("sha256", "src/core/sha256.sig"),
