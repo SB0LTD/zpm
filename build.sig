@@ -238,6 +238,15 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     // other platform consumers, using the win32_path/module registered up in
     // the crypto block. Wiring it here is unnecessary and the module already
     // exists by that point.
+
+    // WebSocket (RFC 6455) framer + the wss:// composition over the pure-Sig
+    // TLS stack. `websocket` is pure (std only); `wss` stacks websocket on a
+    // tls_client Conn. These unify all app WebSocket usage onto one stack.
+    _ = try ctx.addModule("websocket", "src/net/websocket.sig");
+    const wss = try ctx.addModule("wss", "src/net/wss.sig");
+    try wire(ctx, wss, "tls_client", "src/core/crypto/tls/client.sig");
+    try wire(ctx, wss, "websocket", "src/net/websocket.sig");
+
     const jsonl = try ctx.addModule("jsonl", "src/core/jsonl.sig");
     try wire(ctx, jsonl, "json", "src/core/json.sig");
     try wire(ctx, jsonl, "sig_mem", "src/core/sig_mem.sig");
@@ -378,6 +387,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("tls13_keys", "src/core/crypto/tls13_keys.sig"),
         importEntry("win32", "src/platform/win32.sig"),
     });
+    // WebSocket RFC 6455 framer unit tests (hermetic — MemTransport, no net).
+    _ = try addTest(ctx, test_all, "test-websocket", "src/net/websocket.sig", &.{});
+
     // Live network harness for the pure-Sig TLS 1.3 client. NOT wired into the
     // `test` aggregate because it needs real egress to stream.binance.com:9443.
     // Run it explicitly with `sig build live-tls`. It imports tls_client (the
@@ -386,6 +398,16 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const live_all = try ctx.addStep("live-tls", "Live pure-Sig TLS 1.3 handshake against a real exchange endpoint", &noopStep);
     _ = try addContract(ctx, live_all, "live-tls-handshake", "tests/live_tls_handshake.sig", &.{
         importEntry("tls_client", "src/core/crypto/tls/client.sig"),
+        importEntry("win32", "src/platform/win32.sig"),
+    });
+
+    // Live wss:// harness — full stack: DNS + TCP + TLS 1.3 + WebSocket upgrade
+    // + a real market-data frame from Binance. Not in the `test` aggregate.
+    const live_wss = try ctx.addStep("live-wss", "Live pure-Sig wss:// WebSocket against a real exchange stream", &noopStep);
+    _ = try addContract(ctx, live_wss, "live-wss-stream", "tests/live_wss.sig", &.{
+        importEntry("wss", "src/net/wss.sig"),
+        importEntry("tls_client", "src/core/crypto/tls/client.sig"),
+        importEntry("websocket", "src/net/websocket.sig"),
         importEntry("win32", "src/platform/win32.sig"),
     });
     _ = try addTest(ctx, test_all, "test-quic-keys", "src/core/crypto/quic_keys.sig", &.{
