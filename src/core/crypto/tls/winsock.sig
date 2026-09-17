@@ -18,8 +18,19 @@ const tls = @import("tls.sig");
 pub const Error = tls.Error;
 
 /// A live TCP socket bound to the tls.Transport interface.
+///
+/// Reads are buffered: a single `recv` fills `rbuf`, and `readFn` serves the
+/// TLS layer from it. TLS asks for a 5-byte record header then the body — two
+/// tiny reads per record — so an unbuffered socket meant ≥2 `recv` syscalls
+/// per record, most of them for a handful of bytes. With the buffer, one `recv`
+/// typically satisfies several records' worth of header+body from memory. The
+/// Socket is stored inline in a pinned owner (wss.WssClient), so `ctx = self`
+/// in the vtable stays valid.
 pub const Socket = struct {
     fd: w32.SOCKET = w32.INVALID_SOCKET,
+    rbuf: [16384]u8 = undefined,
+    r_off: usize = 0,
+    r_len: usize = 0,
 
     pub fn transport(self: *Socket) tls.Transport {
         return .{ .ctx = self, .readFn = readFn, .writeFn = writeFn };
@@ -33,11 +44,26 @@ pub const Socket = struct {
         }
     }
 
+    /// Read some bytes into `buf`. Serves from the internal buffer first; when
+    /// empty, does one `recv` to refill. Returns 0 on a clean peer close (EOF)
+    /// — the TLS/WS layers above treat 0 as end-of-stream and tear down so the
+    /// app can reconnect. A negative recv (socket error / forced close on
+    /// shutdown) surfaces as Error.Io, which also unwinds to reconnect.
     fn readFn(ctx: *anyopaque, buf: []u8) tls.Error!usize {
         const self: *Socket = @ptrCast(@alignCast(ctx));
-        const n = w32.recv(self.fd, buf.ptr, @intCast(buf.len), 0);
-        if (n < 0) return tls.Error.Io;
-        return @intCast(n);
+        if (buf.len == 0) return 0;
+        if (self.r_off >= self.r_len) {
+            const got = w32.recv(self.fd, &self.rbuf, @intCast(self.rbuf.len), 0);
+            if (got < 0) return tls.Error.Io;
+            if (got == 0) return 0; // peer closed → EOF
+            self.r_off = 0;
+            self.r_len = @intCast(got);
+        }
+        const avail = self.r_len - self.r_off;
+        const n = @min(avail, buf.len);
+        @memcpy(buf[0..n], self.rbuf[self.r_off .. self.r_off + n]);
+        self.r_off += n;
+        return n;
     }
 
     fn writeFn(ctx: *anyopaque, data: []const u8) tls.Error!void {
@@ -85,13 +111,18 @@ pub fn connectHost(host: []const u8, port: u16) Error!Socket {
     if (rc != 0 or res == null) return Error.Io;
     defer w32.freeaddrinfo(res);
 
-    // Try each resolved address until one connects.
+    // Try each resolved address until one connects. Use each addrinfo's own
+    // family/type/protocol (correct even if the hints ever widen to AF_UNSPEC).
     var ai: ?*w32.addrinfo = res;
     while (ai) |a| : (ai = a.ai_next) {
         const addr = a.ai_addr orelse continue;
-        const fd = w32.socket(w32.AF_INET, w32.SOCK_STREAM, w32.IPPROTO_TCP);
+        const fd = w32.socket(a.ai_family, a.ai_socktype, a.ai_protocol);
         if (fd == w32.INVALID_SOCKET) continue;
         if (w32.connect(fd, addr, @intCast(a.ai_addrlen)) == 0) {
+            // Disable Nagle: our TLS records (ClientHello, subscribe, ping) are
+            // small and latency-sensitive; coalescing them adds up to ~200 ms.
+            const one: c_int = 1;
+            _ = w32.setsockopt(fd, w32.IPPROTO_TCP, w32.TCP_NODELAY, @ptrCast(&one), @sizeOf(c_int));
             return .{ .fd = fd };
         }
         _ = w32.closesocket(fd);
