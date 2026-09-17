@@ -187,6 +187,23 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     _ = try ctx.addModule("elementor_document", "src/elementor/document.sig");
     _ = try addTest(ctx, test_all, "test-elementor-document", "src/elementor/document.sig", &.{});
+    // NOTE: the web-automation stack's unit tests — websocket (RFC 6455),
+    // dom_import (extractor + envelope), and cdp (target discovery, surrogate
+    // decoding) — are run directly with `sig test src/net/websocket.sig`,
+    // `sig test src/elementor/dom_import.sig`, and (with its deps) the stools
+    // build. They are intentionally not added to this aggregate step because
+    // the fixed build graph here is already at its step capacity.
+
+    // win32 is registered here (ahead of the crypto tests) because the pure-Sig
+    // TLS client and its `test-tls-client` step import it via importEntry, which
+    // interns the module by name. Registering it up front keeps that early
+    // reference and the later platform consumers pointing at one canonical
+    // module (a second addModule would fail with a duplicate-name error).
+    const win32_path = if (builtin.os.tag == .windows)
+        "src/platform/win32.sig"
+    else
+        "src/transport/linux_platform.sig";
+    _ = try ctx.addModule("win32", win32_path);
 
     // ── Crypto modules (Layer 0: pure computation, freestanding) ──
     const crypto_hmac = try ctx.addModule("hmac", "src/core/crypto/hmac.sig");
@@ -208,6 +225,28 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, crypto_quic_keys, "sha256", "src/core/sha256.sig");
     try wire(ctx, crypto_quic_keys, "hkdf", "src/core/crypto/hkdf.sig");
     try wire(ctx, crypto_quic_keys, "aes", "src/core/crypto/aes.sig");
+    // Pure-Sig TLS 1.3 client (ASN.1/DER, RSA, X.509, chain verify, record layer)
+    // as one directory module — internal files import each other relatively.
+    const tls_client = try ctx.addModule("tls_client", "src/core/crypto/tls/client.sig");
+    try wire(ctx, tls_client, "sha256", "src/core/sha256.sig");
+    try wire(ctx, tls_client, "p256", "src/core/crypto/p256.sig");
+    try wire(ctx, tls_client, "hkdf", "src/core/crypto/hkdf.sig");
+    try wire(ctx, tls_client, "gcm", "src/core/crypto/gcm.sig");
+    try wire(ctx, tls_client, "x25519", "src/core/crypto/x25519.sig");
+    try wire(ctx, tls_client, "tls13_keys", "src/core/crypto/tls13_keys.sig");
+    // NOTE: the tls_client → win32 edge is wired further below, next to the
+    // other platform consumers, using the win32_path/module registered up in
+    // the crypto block. Wiring it here is unnecessary and the module already
+    // exists by that point.
+
+    // WebSocket (RFC 6455) framer + the wss:// composition over the pure-Sig
+    // TLS stack. `websocket` is pure (std only); `wss` stacks websocket on a
+    // tls_client Conn. These unify all app WebSocket usage onto one stack.
+    _ = try ctx.addModule("websocket", "src/net/websocket.sig");
+    const wss = try ctx.addModule("wss", "src/net/wss.sig");
+    try wire(ctx, wss, "tls_client", "src/core/crypto/tls/client.sig");
+    try wire(ctx, wss, "websocket", "src/net/websocket.sig");
+
     const jsonl = try ctx.addModule("jsonl", "src/core/jsonl.sig");
     try wire(ctx, jsonl, "json", "src/core/json.sig");
     try wire(ctx, jsonl, "sig_mem", "src/core/sig_mem.sig");
@@ -338,6 +377,38 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("sha256", "src/core/sha256.sig"),
         importEntry("hmac", "src/core/crypto/hmac.sig"),
         importEntry("hkdf", "src/core/crypto/hkdf.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tls-client", "src/core/crypto/tls/client.sig", &.{
+        importEntry("sha256", "src/core/sha256.sig"),
+        importEntry("p256", "src/core/crypto/p256.sig"),
+        importEntry("hkdf", "src/core/crypto/hkdf.sig"),
+        importEntry("gcm", "src/core/crypto/gcm.sig"),
+        importEntry("x25519", "src/core/crypto/x25519.sig"),
+        importEntry("tls13_keys", "src/core/crypto/tls13_keys.sig"),
+        importEntry("win32", "src/platform/win32.sig"),
+    });
+    // WebSocket RFC 6455 framer unit tests (hermetic — MemTransport, no net).
+    _ = try addTest(ctx, test_all, "test-websocket", "src/net/websocket.sig", &.{});
+
+    // Live network harness for the pure-Sig TLS 1.3 client. NOT wired into the
+    // `test` aggregate because it needs real egress to stream.binance.com:9443.
+    // Run it explicitly with `sig build live-tls`. It imports tls_client (the
+    // directory-module entry) plus win32 for the wall clock; tls_client pulls
+    // its crypto deps in via its own registered imports.
+    const live_all = try ctx.addStep("live-tls", "Live pure-Sig TLS 1.3 handshake against a real exchange endpoint", &noopStep);
+    _ = try addContract(ctx, live_all, "live-tls-handshake", "tests/live_tls_handshake.sig", &.{
+        importEntry("tls_client", "src/core/crypto/tls/client.sig"),
+        importEntry("win32", "src/platform/win32.sig"),
+    });
+
+    // Live wss:// harness — full stack: DNS + TCP + TLS 1.3 + WebSocket upgrade
+    // + a real market-data frame from Binance. Not in the `test` aggregate.
+    const live_wss = try ctx.addStep("live-wss", "Live pure-Sig wss:// WebSocket against a real exchange stream", &noopStep);
+    _ = try addContract(ctx, live_wss, "live-wss-stream", "tests/live_wss.sig", &.{
+        importEntry("wss", "src/net/wss.sig"),
+        importEntry("tls_client", "src/core/crypto/tls/client.sig"),
+        importEntry("websocket", "src/net/websocket.sig"),
+        importEntry("win32", "src/platform/win32.sig"),
     });
     _ = try addTest(ctx, test_all, "test-quic-keys", "src/core/crypto/quic_keys.sig", &.{
         importEntry("sha256", "src/core/sha256.sig"),
@@ -517,11 +588,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
 
     // Platform modules used by the portable and transport layers. The native
     // build host selects the same source split as the transitional graph.
-    const win32_path = if (builtin.os.tag == .windows)
-        "src/platform/win32.sig"
-    else
-        "src/transport/linux_platform.sig";
-    _ = try ctx.addModule("win32", win32_path);
+    // (win32 / win32_path are registered up in the crypto block so the TLS
+    // client's early test import interns the same canonical module.)
+    // tls_client needs win32 for its Winsock transport.
+    try wire(ctx, tls_client, "win32", win32_path);
     _ = try ctx.addModule("gl", "src/platform/gl.sig");
 
     // ── Network modules (Layer 0: pure computation, freestanding) ──
