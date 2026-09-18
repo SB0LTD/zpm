@@ -188,6 +188,26 @@ pub fn circle(cx: f32, cy: f32, radius: f32, color: Color) void {
     gl.glEnd();
 }
 
+/// Draw a filled equilateral-ish triangle centered at (cx, cy).
+/// `up == true` points the apex upward (a buy/long marker); `up == false`
+/// points it downward (a sell/short marker). `size` is the half-height.
+/// Coordinates assume the app's ortho2D where +y is up.
+pub fn triangle(cx: f32, cy: f32, size: f32, up: bool, color: Color) void {
+    const half_w = size * 0.9;
+    gl.glBegin(gl.TRIANGLES);
+    gl.glColor4f(color.r, color.g, color.b, color.a);
+    if (up) {
+        gl.glVertex2f(cx, cy + size); // apex up
+        gl.glVertex2f(cx - half_w, cy - size);
+        gl.glVertex2f(cx + half_w, cy - size);
+    } else {
+        gl.glVertex2f(cx, cy - size); // apex down
+        gl.glVertex2f(cx - half_w, cy + size);
+        gl.glVertex2f(cx + half_w, cy + size);
+    }
+    gl.glEnd();
+}
+
 /// Draw a connected line strip from an array of (x,y,color) vertices.
 /// Caller builds the vertex array, this handles the GL calls.
 pub fn lineStrip(verts: []const ColorVertex, width: f32) void {

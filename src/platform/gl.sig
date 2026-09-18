@@ -6,6 +6,7 @@ pub const COLOR_BUFFER_BIT: u32 = 0x00004000;
 pub const LINES: u32 = 0x0001;
 pub const LINE_LOOP: u32 = 0x0002;
 pub const LINE_STRIP: u32 = 0x0003;
+pub const TRIANGLES: u32 = 0x0004;
 pub const TRIANGLE_STRIP: u32 = 0x0005;
 pub const TRIANGLE_FAN: u32 = 0x0006;
 pub const QUADS: u32 = 0x0007;
