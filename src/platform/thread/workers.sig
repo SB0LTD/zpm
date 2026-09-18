@@ -4,7 +4,11 @@
 const w32 = @import("win32");
 
 /// Hard ceiling on worker threads for any single parallel operation.
-pub const MAX_WORKERS: usize = 16;
+/// I/O-bound backfill spends most of its time waiting on the network, so a
+/// ceiling above core count lets many symbol fetches run concurrently. 24
+/// keeps ~3 workers/slot across an 8-symbol basket while staying well under
+/// exchange rate limits (the fetch path self-throttles on 429).
+pub const MAX_WORKERS: usize = 24;
 
 /// Cached logical processor count. Populated on first call to cpuCount().
 var g_cpu_count: usize = 0;
@@ -78,10 +82,12 @@ pub fn ioBoundWorkers(max_for_task: usize) usize {
 }
 
 /// Distribute an I/O worker budget across `n_slots` concurrent backfill slots.
-/// Each slot gets at least 2 workers; total is capped at MAX_WORKERS.
+/// Each slot gets at least 3 workers; total is capped at MAX_WORKERS. The
+/// floor of 3 keeps each symbol's history fetching in several parallel chunks
+/// even when many slots run at once (8 slots × 3 = 24 = MAX_WORKERS).
 pub fn ioBoundWorkersPerSlot(n_slots: usize) usize {
     if (n_slots == 0) return ioBoundWorkers(MAX_WORKERS);
     const total = ioBoundWorkers(MAX_WORKERS);
-    const per_slot = @max(2, total / n_slots);
+    const per_slot = @max(3, total / n_slots);
     return @min(per_slot, MAX_WORKERS);
 }
