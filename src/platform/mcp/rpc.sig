@@ -473,6 +473,43 @@ fn handleStrategy(buf: *[RESP_SIZE]u8, id: i64, sel: ?[]const u8, pay: ?[]const 
         if (ms.dir_len == 0) return fmtToolResult(buf, id, "error: matrix_run needs args.dir", true);
         return okPush(buf, id, .{ .strategy_matrix_run = ms });
     }
+    if (http.eql(act, "evolve")) {
+        // Native genetic strategy evolution. args.op = start|stop|get_status|
+        // get_champion. get_status/get_champion are synchronous reads of the
+        // staged JSON (the evolve loop stages progress each generation).
+        const op = if (pay) |a| (json.getString(a, "\"op\"") orelse "start") else "start";
+        if (http.eql(op, "get_status") or http.eql(op, "get_champion")) return fmtBatchResult(buf, id);
+        if (http.eql(op, "stop")) return okPush(buf, id, .strategy_evolve_stop);
+        // op == start (default): build the spec from optional args.
+        var es = @import("core").ui.action.EvoSpec{};
+        if (pay) |a| {
+            if (json.getInt(a, "\"generations\"")) |v| {
+                if (v > 0) es.generations = @intCast(v);
+            }
+            if (json.getInt(a, "\"population\"")) |v| {
+                if (v > 0) es.population = @intCast(v);
+            }
+            if (json.getInt(a, "\"seed\"")) |v| {
+                if (v >= 0) es.seed = @intCast(v);
+            }
+            if (json.getInt(a, "\"windows\"")) |v| {
+                if (v > 0) es.windows_per_eval = @intCast(v);
+            }
+            if (json.getInt(a, "\"win\"")) |v| {
+                if (v > 0) es.win_1m = @intCast(v);
+            }
+            if (json.getInt(a, "\"max_offset\"")) |v| {
+                if (v >= 0) es.max_offset_1m = @intCast(v);
+            }
+            if (json.getInt(a, "\"tf\"")) |v| {
+                if (v >= 0) es.tf_secs = v;
+            }
+            if (json.getInt(a, "\"elite\"")) |v| {
+                if (v >= 0) es.elite = @intCast(v);
+            }
+        }
+        return okPush(buf, id, .{ .strategy_evolve_start = es });
+    }
     if (http.eql(act, "set_param")) {
         if (pay) |a| {
             if (json.getString(a, "\"name\"")) |pname| {
