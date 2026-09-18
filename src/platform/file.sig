@@ -118,3 +118,37 @@ pub fn readFileToBuffer(path: w32.LPCWSTR) ?FileBuffer {
     buf.len = bytes_read;
     return buf;
 }
+
+/// Write `data` to `path` (UTF-16), creating/truncating the file. Returns true
+/// on success. Used to persist generated artifacts (e.g. evolved strategies).
+pub fn writeFile(path: w32.LPCWSTR, data: []const u8) bool {
+    const handle = w32.CreateFileW(
+        path,
+        w32.GENERIC_WRITE,
+        0,
+        null,
+        w32.CREATE_ALWAYS,
+        w32.FILE_ATTRIBUTE_NORMAL,
+        null,
+    );
+    if (handle == w32.INVALID_HANDLE_VALUE) return false;
+    defer _ = w32.CloseHandle(handle);
+
+    var written: u32 = 0;
+    const ok = w32.WriteFile(handle, data.ptr, @intCast(data.len), &written, null);
+    return ok != 0 and written == data.len;
+}
+
+/// Ensure a directory exists (UTF-16 path). Idempotent — succeeds if it already
+/// exists. Only creates the final component (parent must exist).
+pub fn ensureDir(path_utf16: []const u16) void {
+    var buf: [w32.MAX_PATH]u16 = undefined;
+    var n: usize = 0;
+    for (path_utf16) |c| {
+        if (c == 0 or n >= w32.MAX_PATH - 1) break;
+        buf[n] = c;
+        n += 1;
+    }
+    buf[n] = 0;
+    _ = w32.CreateDirectoryW(@ptrCast(&buf), null); // ignore "already exists"
+}
