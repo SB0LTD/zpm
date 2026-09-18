@@ -636,7 +636,49 @@ fn fmtStatusResult(buf: *[RESP_SIZE]u8, id: i64) usize {
     pos = http.appendSlice(buf, pos, if (oe.post_only) "true" else "false");
     pos = http.appendSlice(buf, pos, ",\\\"submitting\\\":");
     pos = http.appendSlice(buf, pos, if (oe.submitting) "true" else "false");
-    pos = http.appendSlice(buf, pos, "}}");
+    pos = http.appendSlice(buf, pos, "}");
+
+    // Live positions — one entry per active slot with an open position. This is
+    // the exchange-fetched ground truth for verifying live order sizing,
+    // leverage, and unrealized PnL. Flat slots are omitted.
+    pos = http.appendSlice(buf, pos, ",\\\"positions\\\":[");
+    {
+        var first = true;
+        var i: usize = 0;
+        const side_names = [3][]const u8{ "long", "short", "both" };
+        while (i < st.slot_count and i < st.positions.len) : (i += 1) {
+            const p = &st.positions[i];
+            if (!p.open) continue;
+            if (!first) pos = http.appendSlice(buf, pos, ",");
+            first = false;
+            pos = http.appendSlice(buf, pos, "{\\\"slot\\\":");
+            pos = http.appendUint(buf, pos, i);
+            pos = http.appendSlice(buf, pos, ",\\\"symbol\\\":\\\"");
+            pos = http.appendSlice(buf, pos, p.symbolSlice());
+            pos = http.appendSlice(buf, pos, "\\\",\\\"side\\\":\\\"");
+            pos = http.appendSlice(buf, pos, side_names[@min(p.side, 2)]);
+            pos = http.appendSlice(buf, pos, "\\\",\\\"size\\\":");
+            pos = fmtFloat(buf, pos, p.size);
+            pos = http.appendSlice(buf, pos, ",\\\"entry_price\\\":");
+            pos = fmtFloat(buf, pos, p.entry_price);
+            pos = http.appendSlice(buf, pos, ",\\\"mark_price\\\":");
+            pos = fmtFloat(buf, pos, p.mark_price);
+            pos = http.appendSlice(buf, pos, ",\\\"unrealized_pnl\\\":");
+            pos = fmtFloat(buf, pos, p.unrealized_pnl);
+            pos = http.appendSlice(buf, pos, ",\\\"roi_pct\\\":");
+            pos = fmtFloat(buf, pos, p.roi_pct);
+            pos = http.appendSlice(buf, pos, ",\\\"leverage\\\":");
+            pos = fmtFloat(buf, pos, p.leverage);
+            pos = http.appendSlice(buf, pos, ",\\\"liq_price\\\":");
+            pos = fmtFloat(buf, pos, p.liquidation_price);
+            pos = http.appendSlice(buf, pos, ",\\\"notional\\\":");
+            pos = fmtFloat(buf, pos, p.notional);
+            pos = http.appendSlice(buf, pos, ",\\\"margin\\\":");
+            pos = fmtFloat(buf, pos, p.margin);
+            pos = http.appendSlice(buf, pos, "}");
+        }
+    }
+    pos = http.appendSlice(buf, pos, "]}");
 
     pos = http.appendSlice(buf, pos, "\"}],\"isError\":false}}");
     return pos;
