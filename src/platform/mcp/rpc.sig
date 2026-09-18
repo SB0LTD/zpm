@@ -636,7 +636,11 @@ fn fmtStatusResult(buf: *[RESP_SIZE]u8, id: i64) usize {
     pos = http.appendSlice(buf, pos, if (oe.post_only) "true" else "false");
     pos = http.appendSlice(buf, pos, ",\\\"submitting\\\":");
     pos = http.appendSlice(buf, pos, if (oe.submitting) "true" else "false");
-    pos = http.appendSlice(buf, pos, "}");
+    pos = http.appendSlice(buf, pos, ",\\\"last_ok\\\":");
+    pos = http.appendSlice(buf, pos, if (oe.last_ok) "true" else "false");
+    pos = http.appendSlice(buf, pos, ",\\\"last_error\\\":\\\"");
+    pos = http.appendSlice(buf, pos, oe.last_error[0..oe.last_error_len]);
+    pos = http.appendSlice(buf, pos, "\\\"}");
 
     // Live positions — one entry per active slot with an open position. This is
     // the exchange-fetched ground truth for verifying live order sizing,
@@ -675,6 +679,36 @@ fn fmtStatusResult(buf: *[RESP_SIZE]u8, id: i64) usize {
             pos = fmtFloat(buf, pos, p.notional);
             pos = http.appendSlice(buf, pos, ",\\\"margin\\\":");
             pos = fmtFloat(buf, pos, p.margin);
+            pos = http.appendSlice(buf, pos, "}");
+        }
+    }
+    pos = http.appendSlice(buf, pos, "]");
+
+    // Open/resting orders — confirms stops and strategy brackets are held by
+    // the exchange (a stop_price > 0 with reduce_only true is a protective stop).
+    pos = http.appendSlice(buf, pos, ",\\\"open_orders\\\":[");
+    {
+        var oi: usize = 0;
+        const oside = [2][]const u8{ "buy", "sell" };
+        while (oi < st.open_order_count and oi < st.open_orders.len) : (oi += 1) {
+            const o = &st.open_orders[oi];
+            if (oi > 0) pos = http.appendSlice(buf, pos, ",");
+            pos = http.appendSlice(buf, pos, "{\\\"slot\\\":");
+            pos = http.appendUint(buf, pos, o.slot);
+            pos = http.appendSlice(buf, pos, ",\\\"symbol\\\":\\\"");
+            pos = http.appendSlice(buf, pos, o.symbolSlice());
+            pos = http.appendSlice(buf, pos, "\\\",\\\"side\\\":\\\"");
+            pos = http.appendSlice(buf, pos, oside[@min(o.side, 1)]);
+            pos = http.appendSlice(buf, pos, "\\\",\\\"reduce_only\\\":");
+            pos = http.appendSlice(buf, pos, if (o.reduce_only) "true" else "false");
+            pos = http.appendSlice(buf, pos, ",\\\"is_market\\\":");
+            pos = http.appendSlice(buf, pos, if (o.is_market) "true" else "false");
+            pos = http.appendSlice(buf, pos, ",\\\"price\\\":");
+            pos = fmtFloat(buf, pos, o.price);
+            pos = http.appendSlice(buf, pos, ",\\\"stop_price\\\":");
+            pos = fmtFloat(buf, pos, o.stop_price);
+            pos = http.appendSlice(buf, pos, ",\\\"qty\\\":");
+            pos = fmtFloat(buf, pos, o.qty);
             pos = http.appendSlice(buf, pos, "}");
         }
     }
