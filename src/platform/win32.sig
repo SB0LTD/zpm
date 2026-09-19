@@ -243,6 +243,19 @@ pub extern "kernel32" fn CreateDirectoryW(LPCWSTR, ?*anyopaque) callconv(.c) BOO
 pub extern "kernel32" fn DeleteFileW(LPCWSTR) callconv(.c) BOOL;
 pub extern "kernel32" fn CloseHandle(HANDLE) callconv(.c) BOOL;
 
+// ── Virtual memory (large one-shot reservations: arenas, scratch pools) ──
+// VirtualAlloc commits pages straight from the OS, OUTSIDE the PE image, so a
+// multi-hundred-MB fixed buffer lives on the heap instead of bloating .bss (a
+// too-large image fails to load). This is NOT a general allocator — callers use
+// it for a single up-front reservation carved into fixed sub-regions, never
+// freed until shutdown (an arena discipline).
+pub const MEM_COMMIT: DWORD = 0x1000;
+pub const MEM_RESERVE: DWORD = 0x2000;
+pub const MEM_RELEASE: DWORD = 0x8000;
+pub const PAGE_READWRITE: DWORD = 0x04;
+pub extern "kernel32" fn VirtualAlloc(?*anyopaque, usize, DWORD, DWORD) callconv(.c) ?*anyopaque;
+pub extern "kernel32" fn VirtualFree(*anyopaque, usize, DWORD) callconv(.c) BOOL;
+
 // ── Directory enumeration (FindFirstFileW / FindNextFileW) ──
 pub const MAX_PATH: usize = 260;
 pub const FILE_ATTRIBUTE_DIRECTORY: DWORD = 0x10;
