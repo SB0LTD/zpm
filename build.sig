@@ -323,6 +323,18 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("math", "src/core/math.sig"),
         importEntry("sig_math", "src/core/sig_math.sig"),
     });
+    // WAV (PCM16 RIFF/WAVE) container writer — pure, std-only.
+    _ = try addTest(ctx, test_all, "test-wav", "src/core/wav.sig", &.{});
+    // Phoneme → PCM16 narrator synthesizer (source-filter TTS voice).
+    const tts_voice = try ctx.addModule("tts_voice", "src/core/tts_voice.sig");
+    try wire(ctx, tts_voice, "math", "src/core/math.sig");
+    try wire(ctx, tts_voice, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, tts_voice, "english_phonemes", "src/core/english_phonemes.sig");
+    _ = try addTest(ctx, test_all, "test-tts-voice", "src/core/tts_voice.sig", &.{
+        importEntry("math", "src/core/math.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("english_phonemes", "src/core/english_phonemes.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-vector-memory", "src/core/vector_memory.sig", &.{
         importEntry("sig_mem", "src/core/sig_mem.sig"),
         importEntry("sig_testing", "src/core/sig_testing.sig"),
@@ -419,6 +431,13 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-inflate", "src/core/inflate.sig", &.{
         importEntry("sig_mem", "src/core/sig_mem.sig"),
     });
+    // PDF structure parser (xref, objects, page detection) — pure, std-only.
+    _ = try addTest(ctx, test_all, "test-pdf-parser", "src/pdf_render/parser.sig", &.{});
+    // PDF text extraction (content-stream Tj/TJ + FlateDecode). Consumes the
+    // pdf parser (relative import) and the inflate module.
+    _ = try addTest(ctx, test_all, "test-pdf-text", "src/pdf_render/text.sig", &.{
+        importEntry("inflate", "src/core/inflate.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-jsonl", "src/core/jsonl.sig", &.{
         importEntry("json", "src/core/json.sig"),
         importEntry("sig_mem", "src/core/sig_mem.sig"),
@@ -446,6 +465,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, qwen3_decoder_plan, "gguf", "src/core/gguf.sig");
     try wire(ctx, qwen3_decoder_plan, "sig_math", "src/core/sig_math.sig");
     try wire(ctx, qwen3_decoder_plan, "sig_mem", "src/core/sig_mem.sig");
+    const qwen35_plan = try ctx.addModule("qwen35_plan", "src/core/qwen35_plan.sig");
+    try wire(ctx, qwen35_plan, "gguf", "src/core/gguf.sig");
+    try wire(ctx, qwen35_plan, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, qwen35_plan, "sig_mem", "src/core/sig_mem.sig");
+    const qwen35_gdn = try ctx.addModule("qwen35_gdn", "src/core/qwen35_gdn.sig");
+    try wire(ctx, qwen35_gdn, "sig_math", "src/core/sig_math.sig");
     const qwen3_executor = try ctx.addModule("qwen3_executor", "src/core/qwen3_executor.sig");
     try wire(ctx, qwen3_executor, "sig_math", "src/core/sig_math.sig");
     try wire(ctx, qwen3_executor, "gguf", "src/core/gguf.sig");
@@ -513,6 +538,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("sig_mem", "src/core/sig_mem.sig"),
         importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
     });
+    _ = try addTest(ctx, test_all, "test-qwen35-plan", "src/core/qwen35_plan.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-qwen35-gdn", "src/core/qwen35_gdn.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-qwen3-plan", "src/core/qwen3_decoder_plan.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
         importEntry("sig_math", "src/core/sig_math.sig"),
@@ -537,6 +570,170 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
         importEntry("transformer_ops", "src/core/transformer_ops.sig"),
+    });
+
+    // ── Qwen3-TTS-12Hz-0.6B native speech synthesis (Layer 0 — pure, fixed
+    //    storage). Text -> Talker/predictor acoustic codes -> RVQ + sliding
+    //    transformer -> ConvNeXt/SnakeBeta vocoder -> 24 kHz PCM. Consumes the
+    //    SB0M model container plus quantized_linear + transformer_ops. ──
+    _ = try ctx.addModule("tts_model_container", "src/tts/model_container.sig");
+    _ = try ctx.addModule("tts_talker_plan", "src/tts/talker_plan.sig");
+
+    // Optional cuBLAS-resident weight cache (imports ../matmul/cuda.sig by
+    // relative path). Consumed by both tensor backends; degrades to a no-op
+    // when there is no CUDA device.
+    _ = try ctx.addModule("matmul_cuda", "src/matmul/cuda.sig");
+    // qwen35 GPU dequant kernels — registered after matmul_cuda so its import
+    // interns the existing module rather than pre-registering a duplicate.
+    const qwen35_kernels = try ctx.addModule("qwen35_kernels", "src/core/qwen35_kernels.sig");
+    try wire(ctx, qwen35_kernels, "matmul_cuda", "src/matmul/cuda.sig");
+    try wire(ctx, qwen35_kernels, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, qwen35_kernels, "qwen35_gdn", "src/core/qwen35_gdn.sig");
+    _ = try addTest(ctx, test_all, "test-qwen35-kernels", "src/core/qwen35_kernels.sig", &.{
+        importEntry("matmul_cuda", "src/matmul/cuda.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("qwen35_gdn", "src/core/qwen35_gdn.sig"),
+    });
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/probe_qwen35_dequant.sig",
+        .output_name = "probe-qwen35-dequant",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{
+            importEntry("gguf", "src/core/gguf.sig"),
+            importEntry("qwen35_kernels", "src/core/qwen35_kernels.sig"),
+            importEntry("matmul_cuda", "src/matmul/cuda.sig"),
+            importEntry("qwen35_gdn", "src/core/qwen35_gdn.sig"),
+            importEntry("sig_process", process_source),
+        },
+    });
+    const tts_gpu = try ctx.addModule("tts_gpu", "src/tts/gpu.sig");
+    try wire(ctx, tts_gpu, "tts_model_container", "src/tts/model_container.sig");
+    try wire(ctx, tts_gpu, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, tts_gpu, "matmul_cuda", "src/matmul/cuda.sig");
+
+    const tts_talker_native_plan = try ctx.addModule("tts_talker_native_plan", "src/tts/talker_native_plan.sig");
+    try wire(ctx, tts_talker_native_plan, "tts_model_container", "src/tts/model_container.sig");
+    try wire(ctx, tts_talker_native_plan, "tts_talker_plan", "src/tts/talker_plan.sig");
+
+    const tts_talker_backend = try ctx.addModule("tts_talker_backend", "src/tts/talker_backend.sig");
+    try wire(ctx, tts_talker_backend, "tts_model_container", "src/tts/model_container.sig");
+    try wire(ctx, tts_talker_backend, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, tts_talker_backend, "tts_gpu", "src/tts/gpu.sig");
+
+    const tts_talker_executor = try ctx.addModule("tts_talker_executor", "src/tts/talker_executor.sig");
+    try wire(ctx, tts_talker_executor, "tts_talker_plan", "src/tts/talker_plan.sig");
+    try wire(ctx, tts_talker_executor, "tts_talker_backend", "src/tts/talker_backend.sig");
+    try wire(ctx, tts_talker_executor, "transformer_ops", "src/core/transformer_ops.sig");
+
+    const tts_sampler = try ctx.addModule("tts_sampler", "src/tts/sampler.sig");
+    try wire(ctx, tts_sampler, "tts_talker_plan", "src/tts/talker_plan.sig");
+
+    const tts_synth = try ctx.addModule("tts_synth", "src/tts/synth.sig");
+    try wire(ctx, tts_synth, "tts_talker_plan", "src/tts/talker_plan.sig");
+    try wire(ctx, tts_synth, "tts_talker_backend", "src/tts/talker_backend.sig");
+    try wire(ctx, tts_synth, "tts_talker_executor", "src/tts/talker_executor.sig");
+    try wire(ctx, tts_synth, "tts_sampler", "src/tts/sampler.sig");
+
+    const tts_codec_plan = try ctx.addModule("tts_codec_plan", "src/tts/codec_plan.sig");
+    try wire(ctx, tts_codec_plan, "tts_model_container", "src/tts/model_container.sig");
+
+    const tts_codec_backend = try ctx.addModule("tts_codec_backend", "src/tts/codec_backend.sig");
+    try wire(ctx, tts_codec_backend, "tts_model_container", "src/tts/model_container.sig");
+    try wire(ctx, tts_codec_backend, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, tts_codec_backend, "tts_gpu", "src/tts/gpu.sig");
+
+    const tts_codec_transformer = try ctx.addModule("tts_codec_transformer", "src/tts/codec_transformer.sig");
+    try wire(ctx, tts_codec_transformer, "tts_model_container", "src/tts/model_container.sig");
+    try wire(ctx, tts_codec_transformer, "tts_codec_plan", "src/tts/codec_plan.sig");
+    try wire(ctx, tts_codec_transformer, "tts_codec_backend", "src/tts/codec_backend.sig");
+
+    const tts_vocoder = try ctx.addModule("tts_vocoder", "src/tts/vocoder.sig");
+    try wire(ctx, tts_vocoder, "tts_model_container", "src/tts/model_container.sig");
+    try wire(ctx, tts_vocoder, "tts_codec_plan", "src/tts/codec_plan.sig");
+    try wire(ctx, tts_vocoder, "tts_codec_backend", "src/tts/codec_backend.sig");
+
+    const tts_codec = try ctx.addModule("tts_codec", "src/tts/codec.sig");
+    try wire(ctx, tts_codec, "tts_model_container", "src/tts/model_container.sig");
+    try wire(ctx, tts_codec, "tts_codec_plan", "src/tts/codec_plan.sig");
+    try wire(ctx, tts_codec, "tts_codec_transformer", "src/tts/codec_transformer.sig");
+    try wire(ctx, tts_codec, "tts_vocoder", "src/tts/vocoder.sig");
+
+    const tts = try ctx.addModule("tts", "src/tts/root.sig");
+    inline for (.{
+        .{ "tts_model_container", "src/tts/model_container.sig" },
+        .{ "tts_talker_plan", "src/tts/talker_plan.sig" },
+        .{ "tts_talker_native_plan", "src/tts/talker_native_plan.sig" },
+        .{ "tts_talker_backend", "src/tts/talker_backend.sig" },
+        .{ "tts_talker_executor", "src/tts/talker_executor.sig" },
+        .{ "tts_sampler", "src/tts/sampler.sig" },
+        .{ "tts_synth", "src/tts/synth.sig" },
+        .{ "tts_codec_plan", "src/tts/codec_plan.sig" },
+        .{ "tts_codec_backend", "src/tts/codec_backend.sig" },
+        .{ "tts_codec_transformer", "src/tts/codec_transformer.sig" },
+        .{ "tts_vocoder", "src/tts/vocoder.sig" },
+        .{ "tts_codec", "src/tts/codec.sig" },
+    }) |pair| try wire(ctx, tts, pair[0], pair[1]);
+
+    // Per-module TTS tests. Each root seeds its direct imports; the runner
+    // walks each registered module's own wired imports transitively.
+    _ = try addTest(ctx, test_all, "test-tts-model-container", "src/tts/model_container.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-tts-talker-plan", "src/tts/talker_plan.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-tts-talker-native-plan", "src/tts/talker_native_plan.sig", &.{
+        importEntry("tts_model_container", "src/tts/model_container.sig"),
+        importEntry("tts_talker_plan", "src/tts/talker_plan.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tts-gpu", "src/tts/gpu.sig", &.{
+        importEntry("tts_model_container", "src/tts/model_container.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("matmul_cuda", "src/matmul/cuda.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tts-talker-backend", "src/tts/talker_backend.sig", &.{
+        importEntry("tts_model_container", "src/tts/model_container.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("tts_gpu", "src/tts/gpu.sig"),
+        importEntry("matmul_cuda", "src/matmul/cuda.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tts-talker-executor", "src/tts/talker_executor.sig", &.{
+        importEntry("tts_talker_plan", "src/tts/talker_plan.sig"),
+        importEntry("tts_talker_backend", "src/tts/talker_backend.sig"),
+        importEntry("transformer_ops", "src/core/transformer_ops.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tts-sampler", "src/tts/sampler.sig", &.{
+        importEntry("tts_talker_plan", "src/tts/talker_plan.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tts-synth", "src/tts/synth.sig", &.{
+        importEntry("tts_talker_plan", "src/tts/talker_plan.sig"),
+        importEntry("tts_talker_backend", "src/tts/talker_backend.sig"),
+        importEntry("tts_talker_executor", "src/tts/talker_executor.sig"),
+        importEntry("tts_sampler", "src/tts/sampler.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tts-codec-plan", "src/tts/codec_plan.sig", &.{
+        importEntry("tts_model_container", "src/tts/model_container.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tts-codec-backend", "src/tts/codec_backend.sig", &.{
+        importEntry("tts_model_container", "src/tts/model_container.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("tts_gpu", "src/tts/gpu.sig"),
+        importEntry("matmul_cuda", "src/matmul/cuda.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tts-codec-transformer", "src/tts/codec_transformer.sig", &.{
+        importEntry("tts_model_container", "src/tts/model_container.sig"),
+        importEntry("tts_codec_plan", "src/tts/codec_plan.sig"),
+        importEntry("tts_codec_backend", "src/tts/codec_backend.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tts-vocoder", "src/tts/vocoder.sig", &.{
+        importEntry("tts_model_container", "src/tts/model_container.sig"),
+        importEntry("tts_codec_plan", "src/tts/codec_plan.sig"),
+        importEntry("tts_codec_backend", "src/tts/codec_backend.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-tts-codec", "src/tts/codec.sig", &.{
+        importEntry("tts_model_container", "src/tts/model_container.sig"),
+        importEntry("tts_codec_plan", "src/tts/codec_plan.sig"),
+        importEntry("tts_codec_transformer", "src/tts/codec_transformer.sig"),
+        importEntry("tts_vocoder", "src/tts/vocoder.sig"),
     });
 
     // ── LSP modules (Layer 0 — reusable Language Server Protocol building

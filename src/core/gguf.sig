@@ -94,6 +94,17 @@ pub const Summary = struct {
     vocab_size: u64 = 0,
     rope_frequency_base: f32 = 0,
     rms_norm_epsilon: f32 = 0,
+    // Hybrid (qwen35 / Qwen3-Next Gated-DeltaNet) fields. Zero when absent
+    // (a plain attention-only model). full_attention_interval > 0 marks the
+    // model as a GDN hybrid: layers where (idx+1) % interval == 0 are full
+    // attention, the rest are Gated-DeltaNet linear-attention layers.
+    full_attention_interval: u64 = 0,
+    rope_dimension_count: u64 = 0, // partial RoPE: rotate only the first N head dims
+    ssm_conv_kernel: u64 = 0,
+    ssm_state_size: u64 = 0,
+    ssm_group_count: u64 = 0, // GDN head count
+    ssm_time_step_rank: u64 = 0,
+    ssm_inner_size: u64 = 0,
     tokenizer_tokens: ArrayRef = .{},
     tokenizer_merges: ArrayRef = .{},
     tokenizer_scores: ArrayRef = .{},
@@ -412,6 +423,20 @@ fn recordInteger(source: Source, key: KeyRef, value: u64, summary: *Summary) voi
         summary.feed_forward_length = value;
     } else if (keyEndsWith(source, key, ".vocab_size") catch false) {
         summary.vocab_size = value;
+    } else if (keyEndsWith(source, key, ".full_attention_interval") catch false) {
+        summary.full_attention_interval = value;
+    } else if (keyEndsWith(source, key, ".rope.dimension_count") catch false) {
+        summary.rope_dimension_count = value;
+    } else if (keyEndsWith(source, key, ".ssm.conv_kernel") catch false) {
+        summary.ssm_conv_kernel = value;
+    } else if (keyEndsWith(source, key, ".ssm.state_size") catch false) {
+        summary.ssm_state_size = value;
+    } else if (keyEndsWith(source, key, ".ssm.group_count") catch false) {
+        summary.ssm_group_count = value;
+    } else if (keyEndsWith(source, key, ".ssm.time_step_rank") catch false) {
+        summary.ssm_time_step_rank = value;
+    } else if (keyEndsWith(source, key, ".ssm.inner_size") catch false) {
+        summary.ssm_inner_size = value;
     }
 }
 
