@@ -20,6 +20,9 @@ const math = @import("sig_math");
 
 pub const Error = error{ InvalidDimensions, KvCapacity };
 
+/// Debug: disable RoPE to test whether the partial-RoPE impl is the fault.
+pub var dbg_disable_rope: bool = false;
+
 pub const MAX_HEADS: usize = 32;
 pub const MAX_HEAD_DIM: usize = 256;
 pub const MAX_CONTEXT: usize = 4096;
@@ -116,8 +119,10 @@ pub fn step(
     for (0..hc) |h| rmsNormHead(q[h * hd ..][0..hd], q_norm_w, rms_eps);
     for (0..kvc) |h| rmsNormHead(k[h * hd ..][0..hd], k_norm_w, rms_eps);
     // Partial RoPE.
-    ropePartial(q, hc, hd, dims.rope_dim, position, rope_base);
-    ropePartial(k, kvc, hd, dims.rope_dim, position, rope_base);
+    if (!dbg_disable_rope) {
+        ropePartial(q, hc, hd, dims.rope_dim, position, rope_base);
+        ropePartial(k, kvc, hd, dims.rope_dim, position, rope_base);
+    }
 
     // Store K,V for this position into the cache.
     const half = kvc * context * hd; // K region size; V starts at `half`.

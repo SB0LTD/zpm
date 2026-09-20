@@ -14,6 +14,7 @@ const std = @import("std");
 const process = @import("sig_process");
 const gguf = @import("gguf");
 const kernels = @import("qwen35_kernels");
+const ql = @import("quantized_linear");
 const mem = @import("sig_mem");
 
 const capacity = 2048;
@@ -112,6 +113,46 @@ pub fn main(init: std.process.Init) !void {
         }
         try out.flush();
     }
+
+    // Dump embedding L2 norm for a few tokens (content vs special) via dequant.
+    for (index.tensors[0..index.tensor_count]) |*t| {
+        if (!mem.eql(u8, t.nameSlice(), "token_embd.weight")) continue;
+        const hidden: usize = @intCast(t.dimensions[0]); // 2560
+        const rb: usize = @intCast(t.byte_size / t.dimensions[1]);
+        const toks = [_]u32{ 9338, 279, 760, 5 }; // "France"? " the" "The" ?
+        for (toks) |tok| {
+            const off = t.file_offset + @as(u64, tok) * rb;
+            const bts = Memory.map(&memory, off, rb, 1) orelse continue;
+            var emb: [2560]f32 = undefined;
+            switch (t.ggml_type) {
+                14 => ql.dequantizeQ6K(emb[0..hidden], bts[0..rb]) catch continue,
+                else => continue,
+            }
+            var s: f64 = 0;
+            for (emb[0..hidden]) |e| s += e * e;
+            try out.print("EMB tok={d} L2={d:.4}\n", .{ tok, @sqrt(s) });
+        }
+    }
+    try out.flush();
+
+    // Dump mean of output_norm.weight to decide if GGUF bakes the RMSNorm (1+w):
+    // mean near 1.0 => baked (use plain w); mean near 0.0 => need (1+w).
+    for (index.tensors[0..index.tensor_count]) |*t| {
+        const nm = t.nameSlice();
+        if (mem.eql(u8, nm, "output_norm.weight") or mem.eql(u8, nm, "blk.0.attn_norm.weight")) {
+            const cnt: usize = @intCast(t.dimensions[0]);
+            const b = Memory.map(&memory, t.file_offset, cnt * 4, 4) orelse continue;
+            var sum: f64 = 0;
+            var i: usize = 0;
+            while (i < cnt) : (i += 1) {
+                const o = i * 4;
+                const bits = @as(u32, b[o]) | (@as(u32, b[o + 1]) << 8) | (@as(u32, b[o + 2]) << 16) | (@as(u32, b[o + 3]) << 24);
+                sum += @as(f32, @bitCast(bits));
+            }
+            try out.print("NORM {s} mean={d:.4} n={d}\n", .{ nm, sum / @as(f64, @floatFromInt(cnt)), cnt });
+        }
+    }
+    try out.flush();
 
     const q4 = firstTensorOfType(12) orelse return error.NoQ4KTensor;
     const q6 = firstTensorOfType(14) orelse return error.NoQ6KTensor;

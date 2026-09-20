@@ -230,15 +230,17 @@ pub const gdn_src: [*:0]const u8 =
     \\  float beta = 1.0f/(1.0f+__expf(-b_raw[h]));
     \\  long base = (long)h*hd*hd;
     \\  float vv = v[h*hd + dv];
-    \\  // retrieved[dv] = sum_dk k[dk]*S[dk][dv]
+    \\  // Gated delta rule: decay S first, retrieve from decayed S, then update.
+    \\  //   S = g*S ; retrieved = sum_dk k*S ; delta = (v-retrieved)*beta ;
+    \\  //   S += k*delta ; o = sum_dk q*S
+    \\  for (int dk = 0; dk < hd; ++dk) state[base + (long)dk*hd + dv] *= g;
     \\  float retrieved = 0.0f;
     \\  for (int dk = 0; dk < hd; ++dk) retrieved += kn[dk]*state[base + (long)dk*hd + dv];
-    \\  float delta = vv - retrieved;
-    \\  // S[dk][dv] = g*S + beta*k[dk]*delta ; o[dv] = sum_dk q[dk]*S[dk][dv]
+    \\  float delta = (vv - retrieved) * beta;
     \\  float o = 0.0f;
     \\  for (int dk = 0; dk < hd; ++dk){
     \\    long idx = base + (long)dk*hd + dv;
-    \\    float s = g*state[idx] + beta*kn[dk]*delta;
+    \\    float s = state[idx] + kn[dk]*delta;
     \\    state[idx] = s;
     \\    o += qn[dk]*s;
     \\  }

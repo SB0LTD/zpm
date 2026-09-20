@@ -12,6 +12,7 @@ const process = @import("sig_process");
 const gguf = @import("gguf");
 const plan_mod = @import("qwen35_plan");
 const exec = @import("qwen35_executor");
+const qattn = @import("qwen35_attn");
 const tokenizer = @import("tokenizer");
 const indexes = @import("tokenizer_index");
 
@@ -70,6 +71,14 @@ pub fn main(init: std.process.Init) !void {
     @memcpy(prompt_buffer[0..raw_prompt.len], raw_prompt);
     const prompt = prompt_buffer[0..raw_prompt.len];
     const maximum = if (try argv.next()) |value| try std.fmt.parseInt(usize, value, 10) else 16;
+    // Optional 4th arg: debug mode "skipgdn" | "skipattn" | "raw" | "none".
+    var raw_mode = false;
+    if (try argv.next()) |mode| {
+        if (std.mem.indexOf(u8, mode, "skipgdn") != null) exec.dbg_skip_gdn = true;
+        if (std.mem.indexOf(u8, mode, "skipattn") != null) exec.dbg_skip_attn = true;
+        if (std.mem.indexOf(u8, mode, "raw") != null) raw_mode = true;
+        if (std.mem.indexOf(u8, mode, "norope") != null) qattn.dbg_disable_rope = true;
+    }
 
     const file = try std.Io.Dir.cwd().openFile(init.io, path, .{});
     defer file.close(init.io);
@@ -92,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
     for (0..plan.layer_count) |li| {
         if (plan.layers[li].kind == .full_attention) attn_n += 1 else gdn_n += 1;
     }
-    try out.print("layers={d} (gdn={d} attn={d}), vocab={d}, uploading weights to VRAM...\n", .{ plan.layer_count, gdn_n, attn_n, plan.vocabulary_size });
+    try out.print("layers={d} (gdn={d} attn={d}), vocab={d}, rope_base={d:.1} rope_dim={d} eps={d:.6}, uploading weights to VRAM...\n", .{ plan.layer_count, gdn_n, attn_n, plan.vocabulary_size, plan.rope_frequency_base, plan.rope_dimension_count, plan.rms_norm_epsilon });
     try out.flush();
 
     exec.init(capacity, &model, source, &index, &plan, &nvrtc_image, &nvrtc_log) catch |e| {
@@ -105,7 +114,10 @@ pub fn main(init: std.process.Init) !void {
 
     try vocabulary.build(source, index.summary.tokenizer_tokens);
     try merges.build(source, index.summary.tokenizer_merges, &vocabulary);
-    const prompt_count = try tokenizer.encodeChatTurn(source, &vocabulary, &merges, "You are a helpful assistant.", prompt, false, &tokens);
+    const prompt_count = if (raw_mode)
+        try tokenizer.encodeText(source, &vocabulary, &merges, prompt, &tokens)
+    else
+        try tokenizer.encodeChatTurn(source, &vocabulary, &merges, "You are a helpful assistant.", prompt, false, &tokens);
     if (prompt_count == 0 or prompt_count + maximum > tokens.len) return error.ContextCapacity;
 
     const kv = exec.AttnKv{ .data = &kv_data };
@@ -118,6 +130,35 @@ pub fn main(init: std.process.Init) !void {
     for (tokens[0..prompt_count], 0..) |tok, pos| {
         const last = pos + 1 == prompt_count;
         selected = try exec.forward(capacity, &model, source, &index, &plan, &work, kv, st, CONTEXT, tok, pos, last);
+    }
+
+    // Top-8 logits of the first generated token (diagnostic).
+    {
+        var ts: [512]u8 = undefined;
+        var td: [512]u8 = undefined;
+        try out.writeAll("TOP8:\n");
+        var used: [8]u32 = @splat(0xffffffff);
+        for (0..8) |r| {
+            var bi: usize = 0;
+            var bv: f32 = -1e30;
+            for (work.logits[0..plan.vocabulary_size], 0..) |lv, i| {
+                var skip = false;
+                for (used[0..r]) |u| if (u == i) {
+                    skip = true;
+                };
+                if (!skip and lv > bv) {
+                    bv = lv;
+                    bi = i;
+                }
+            }
+            used[r] = @intCast(bi);
+            const dt = tokenizer.decodeToken(source, &vocabulary, @intCast(bi), &ts, &td) catch {
+                try out.print("  {d} logit={d:.3} <ctrl>\n", .{ bi, bv });
+                continue;
+            };
+            try out.print("  {d} logit={d:.3} \"{s}\"\n", .{ bi, bv, td[0..dt.bytes_written] });
+        }
+        try out.flush();
     }
 
     try out.writeAll("response=");

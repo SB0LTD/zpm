@@ -130,22 +130,30 @@ pub fn step(
         const base = h * hd * hd; // state[base + dk*hd + dv]
         const vv = v[h * hd ..][0..hd];
 
-        // retrieved[dv] = sum_dk k[dk] * S[dk][dv]
+        // Gated delta rule (order matches torch_recurrent_gated_delta_rule):
+        //   1. decay:      S = g * S
+        //   2. retrieve:   retrieved[dv] = sum_dk k[dk] * S[dk][dv]  (DECAYED S)
+        //   3. delta:      delta[dv] = (v[dv] - retrieved[dv]) * beta
+        //   4. update:     S[dk][dv] += k[dk] * delta[dv]
+        //   5. output:     o[dv] = sum_dk q[dk] * S[dk][dv]
+        for (0..hd) |dk| {
+            const row = base + dk * hd;
+            for (0..hd) |dv| state[row + dv] *= g;
+        }
         var retrieved: [MAX_HEAD_DIM]f32 = undefined;
         for (0..hd) |dv| {
             var acc: f32 = 0;
             for (0..hd) |dk| acc += kh[dk] * state[base + dk * hd + dv];
             retrieved[dv] = acc;
         }
-        // S[dk][dv] = g*S[dk][dv] + beta*k[dk]*(v[dv]-retrieved[dv]); o[dv]=sum_dk q[dk]*S[dk][dv]
         for (0..hd) |dv| oh[dv] = 0;
         for (0..hd) |dk| {
             const kdk = kh[dk];
             const qdk = qh[dk];
             const row = base + dk * hd;
             for (0..hd) |dv| {
-                const delta = vv[dv] - retrieved[dv];
-                const s = g * state[row + dv] + beta * kdk * delta;
+                const delta = (vv[dv] - retrieved[dv]) * beta;
+                const s = state[row + dv] + kdk * delta;
                 state[row + dv] = s;
                 oh[dv] += qdk * s;
             }

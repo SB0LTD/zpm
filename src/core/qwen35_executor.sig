@@ -105,16 +105,7 @@ pub const Work = struct {
     wvec: [HIDDEN]f32 = @splat(0),
     // logits
     logits: [MAX_VOCAB]f32 = @splat(0),
-    // debug: L2 norm of the running hidden state after embedding and each layer.
-    dbg_norms: [64]f32 = @splat(0),
-    dbg_count: usize = 0,
 };
-
-fn l2(v: []const f32) f32 {
-    var s: f32 = 0;
-    for (v) |x| s += x * x;
-    return @sqrt(s);
-}
 
 // ── Init: compile kernels, upload all quantized 2-D weights to VRAM ──
 
@@ -397,6 +388,10 @@ fn embedding(
     }
 }
 
+/// Debug bisect switches (dev only): make a mixer a no-op residual pass-through.
+pub var dbg_skip_gdn: bool = false;
+pub var dbg_skip_attn: bool = false;
+
 /// Run one token through the whole decoder and return the greedy argmax token.
 /// `position` is the 0-based sequence index (must be < context).
 pub fn forward(
@@ -417,26 +412,19 @@ pub fn forward(
     if (position >= context) return error.Capacity;
 
     try embedding(tensor_capacity, source, index, plan, token, work);
-    work.dbg_count = 0;
-    work.dbg_norms[work.dbg_count] = l2(work.hidden[0..HIDDEN]);
-    work.dbg_count += 1;
 
     var attn_idx: usize = 0;
     var gdn_idx: usize = 0;
     for (0..plan.layer_count) |li| {
         const layer = &plan.layers[li];
         if (layer.kind == .full_attention) {
-            try attnLayer(tensor_capacity, model, source, index, plan, layer, attn_idx, work, kv, context, position);
+            if (!dbg_skip_attn) try attnLayer(tensor_capacity, model, source, index, plan, layer, attn_idx, work, kv, context, position);
             attn_idx += 1;
         } else {
-            try gdnLayer(tensor_capacity, model, source, index, plan, layer, gdn_idx, work, st);
+            if (!dbg_skip_gdn) try gdnLayer(tensor_capacity, model, source, index, plan, layer, gdn_idx, work, st);
             gdn_idx += 1;
         }
         try ffnLayer(tensor_capacity, model, source, index, plan, layer, work);
-        if (work.dbg_count < work.dbg_norms.len) {
-            work.dbg_norms[work.dbg_count] = l2(work.hidden[0..HIDDEN]);
-            work.dbg_count += 1;
-        }
     }
 
     // Intermediate prefill positions don't need logits — skip the huge lm_head.
