@@ -637,6 +637,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("qwen35_plan", "src/core/qwen35_plan.sig"),
             importEntry("qwen35_executor", "src/core/qwen35_executor.sig"),
             importEntry("qwen35_attn", "src/core/qwen35_attn.sig"),
+            importEntry("qwen35_gdn", "src/core/qwen35_gdn.sig"),
             importEntry("tokenizer", "src/core/tokenizer.sig"),
             importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
             importEntry("sig_process", process_source),

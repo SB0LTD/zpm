@@ -97,7 +97,6 @@ pub fn step(
 ) Error!void {
     if (!dims.valid()) return error.InvalidDimensions;
     const hd = dims.head_dim;
-    const group = dims.v_heads / dims.kq_heads; // v-heads per kq-head (2)
     if (q_in.len != dims.qkDim() or k_in.len != dims.qkDim() or v.len != dims.vDim() or
         z.len != dims.vDim() or out.len != dims.vDim() or
         a_raw.len != dims.v_heads or b_raw.len != dims.v_heads or
@@ -110,7 +109,9 @@ pub fn step(
     var oh: [MAX_HEAD_DIM]f32 = undefined;
 
     for (0..dims.v_heads) |h| {
-        const kq = h / group; // which Q/K head feeds this V head
+        // qwen35 uses a plain repeat (tile), not repeat_interleave, to expand the
+        // num_k_heads Q/K heads to num_v_heads: v-head h uses kq-head (h % kq_heads).
+        const kq = h % dims.kq_heads;
         // Copy + L2-norm this head's q and k.
         @memcpy(qh[0..hd], q_in[kq * hd ..][0..hd]);
         @memcpy(kh[0..hd], k_in[kq * hd ..][0..hd]);
@@ -165,8 +166,16 @@ pub fn step(
         const zh = z[h * hd ..][0..hd];
         const oo = out[h * hd ..][0..hd];
         for (0..hd) |dv| oo[dv] = (oh[dv] * inv * ssm_norm_w[dv]) * silu(zh[dv]);
+        if (dbg_capture_o and h == dbg_capture_head) {
+            for (0..@min(hd, dbg_o.len)) |dv| dbg_o[dv] = oh[dv];
+        }
     }
 }
+
+/// Debug: capture the raw per-head delta output `o` (pre gated-norm).
+pub var dbg_capture_o: bool = false;
+pub var dbg_capture_head: usize = 0;
+pub var dbg_o: [MAX_HEAD_DIM]f32 = @splat(0);
 
 // Tests — exercise the recurrence on a tiny deterministic case.
 

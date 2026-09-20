@@ -13,6 +13,7 @@ const gguf = @import("gguf");
 const plan_mod = @import("qwen35_plan");
 const exec = @import("qwen35_executor");
 const qattn = @import("qwen35_attn");
+const qgdn = @import("qwen35_gdn");
 const tokenizer = @import("tokenizer");
 const indexes = @import("tokenizer_index");
 
@@ -79,6 +80,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.indexOf(u8, mode, "raw") != null) raw_mode = true;
         if (std.mem.indexOf(u8, mode, "norope") != null) qattn.dbg_disable_rope = true;
         if (std.mem.indexOf(u8, mode, "plus1") != null) exec.dbg_norm_plus_one = true;
+        if (std.mem.indexOf(u8, mode, "fp") != null) exec.dbg_fp_enable = true;
     }
 
     const file = try std.Io.Dir.cwd().openFile(init.io, path, .{});
@@ -126,6 +128,24 @@ pub fn main(init: std.process.Init) !void {
 
     try out.print("prompt_tokens={d}, running prefill...\n", .{prompt_count});
     try out.flush();
+    if (exec.dbg_fp_enable) {
+        qgdn.dbg_capture_o = true;
+        qgdn.dbg_capture_head = 5;
+        // Single-token fingerprint pass for layer-by-layer diff vs llama.cpp.
+        @memset(&kv_data, 0);
+        @memset(&gdn_rec, 0);
+        @memset(&gdn_conv, 0);
+        _ = try exec.forward(capacity, &model, source, &index, &plan, &work, kv, st, CONTEXT, tokens[0], 0, false);
+        for (exec.dbg_fps[0..exec.dbg_fp_count]) |e| {
+            const ln = std.mem.indexOfScalar(u8, &e.label, 0) orelse e.label.len;
+            try out.print("FP {s} [{d:.4} {d:.4} {d:.4} ... {d:.4} {d:.4} {d:.4}] sum={d:.4}\n", .{ e.label[0..ln], e.f0, e.f1, e.f2, e.l0, e.l1, e.l2, e.sum });
+        }
+        try out.flush();
+        @memset(&kv_data, 0);
+        @memset(&gdn_rec, 0);
+        @memset(&gdn_conv, 0);
+        return;
+    }
     // Prefill (only the final prompt token needs logits).
     var selected: u32 = 0;
     for (tokens[0..prompt_count], 0..) |tok, pos| {

@@ -285,9 +285,11 @@ fn gdnLayer(
     // 1. pre-mixer RMSNorm
     try readVec(source, tref(index, layer.attn_norm), work.wvec[0..HIDDEN]);
     rmsNorm(work.hidden[0..HIDDEN], work.wvec[0..HIDDEN], work.normed[0..HIDDEN], plan.rms_norm_epsilon);
+    if (gdn_layer_idx == 0) dbgFp("g.attn_norm", work.normed[0..HIDDEN]);
     // 2. projections (GPU): qkv[8192], z[4096], a_raw[32], b_raw[32]
     try gpuMatvec(model, layer.attn_qkv, work.normed[0..HIDDEN], work.qkv[0..QKV_DIM]);
     try gpuMatvec(model, layer.attn_gate, work.normed[0..HIDDEN], work.z[0..GDN_Z]);
+    if (gdn_layer_idx == 0) dbgFp("g.z", work.z[0..GDN_Z]);
     try gpuMatvec(model, layer.ssm_alpha, work.normed[0..HIDDEN], work.a_raw[0..SSM_PROJ]);
     try gpuMatvec(model, layer.ssm_beta, work.normed[0..HIDDEN], work.b_raw[0..SSM_PROJ]);
     // 3. depthwise causal conv1d + SiLU over the 8192 qkv channels (host).
@@ -307,9 +309,12 @@ fn gdnLayer(
     // 6. GDN recurrence (host reference) mutating this layer's recurrent state.
     const rec_base = gdn_layer_idx * gdn_dims.stateElements();
     gdn.step(gdn_dims, q, k, v, work.z[0..GDN_Z], work.a_raw[0..SSM_PROJ], work.b_raw[0..SSM_PROJ], a_log_buf[0..SSM_PROJ], dt_bias_buf[0..SSM_PROJ], ssm_norm_buf[0..gdn_dims.head_dim], plan.rms_norm_epsilon, st.recurrent[rec_base..][0..gdn_dims.stateElements()], work.gdn_o[0..GDN_V]) catch return error.InvalidPlan;
+
     // 7. output projection ssm_out[4096->2560] (GPU) into tmp_hidden, add residual.
     try gpuMatvec(model, layer.ssm_out, work.gdn_o[0..GDN_V], work.tmp_hidden[0..HIDDEN]);
+    if (gdn_layer_idx == 0) dbgFp("g.linear_out", work.tmp_hidden[0..HIDDEN]);
     for (work.hidden[0..HIDDEN], work.tmp_hidden[0..HIDDEN]) |*h, o| h.* += o;
+    if (gdn_layer_idx == 0) dbgFp("g.attn_resid", work.hidden[0..HIDDEN]);
 }
 
 /// One full-attention layer (writes result added into work.hidden).
@@ -397,6 +402,31 @@ fn embedding(
 pub var dbg_skip_gdn: bool = false;
 pub var dbg_skip_attn: bool = false;
 
+/// Debug fingerprint capture: for the layer-by-layer diff against llama.cpp's
+/// eval-callback. Records first-3, last-3, and sum of a vector under a label.
+pub var dbg_fp_enable: bool = false;
+pub const DbgFp = struct { label: [24]u8 = @splat(0), f0: f32 = 0, f1: f32 = 0, f2: f32 = 0, l0: f32 = 0, l1: f32 = 0, l2: f32 = 0, sum: f32 = 0 };
+pub var dbg_fps: [80]DbgFp = @splat(.{});
+pub var dbg_fp_count: usize = 0;
+
+fn dbgFp(label: []const u8, v: []const f32) void {
+    if (!dbg_fp_enable or dbg_fp_count >= dbg_fps.len or v.len < 6) return;
+    var e = &dbg_fps[dbg_fp_count];
+    e.* = .{};
+    const n = @min(label.len, 23);
+    @memcpy(e.label[0..n], label[0..n]);
+    e.f0 = v[0];
+    e.f1 = v[1];
+    e.f2 = v[2];
+    e.l0 = v[v.len - 3];
+    e.l1 = v[v.len - 2];
+    e.l2 = v[v.len - 1];
+    var s: f32 = 0;
+    for (v) |x| s += x;
+    e.sum = s;
+    dbg_fp_count += 1;
+}
+
 /// Run one token through the whole decoder and return the greedy argmax token.
 /// `position` is the 0-based sequence index (must be < context).
 pub fn forward(
@@ -416,7 +446,9 @@ pub fn forward(
     if (!model.ready) return error.GpuUnavailable;
     if (position >= context) return error.Capacity;
 
+    if (dbg_fp_enable) dbg_fp_count = 0;
     try embedding(tensor_capacity, source, index, plan, token, work);
+    dbgFp("embed", work.hidden[0..HIDDEN]);
 
     var attn_idx: usize = 0;
     var gdn_idx: usize = 0;
@@ -430,6 +462,13 @@ pub fn forward(
             gdn_idx += 1;
         }
         try ffnLayer(tensor_capacity, model, source, index, plan, layer, work);
+        var lbl: [8]u8 = undefined;
+        lbl[0] = 'L';
+        const d0: u8 = @intCast((li / 10) % 10);
+        const d1: u8 = @intCast(li % 10);
+        lbl[1] = '0' + d0;
+        lbl[2] = '0' + d1;
+        dbgFp(lbl[0..3], work.hidden[0..HIDDEN]);
     }
 
     // Intermediate prefill positions don't need logits — skip the huge lm_head.

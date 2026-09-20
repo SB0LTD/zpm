@@ -207,7 +207,8 @@ pub const gdn_src: [*:0]const u8 =
     \\  int h  = blockIdx.x;            // v-head
     \\  int dv = threadIdx.x;           // output column, 0..hd-1
     \\  if (dv >= hd) return;
-    \\  int kq = h / group;             // Q/K head feeding this v-head
+    \\  int nkq = gridDim.x / group;    // num_k_heads = v_heads / (v_heads/kq_heads)
+    \\  int kq = h % nkq;               // qwen35 uses plain repeat (tile), so kq = h % num_k_heads
     \\  extern __shared__ float sh[];   // [0..hd) qn, [hd..2hd) kn, [2hd..3hd) red
     \\  float* qn  = sh;
     \\  float* kn  = sh + hd;
