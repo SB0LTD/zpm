@@ -88,7 +88,7 @@ pub fn step(
     z: []const f32,
     a_raw: []const f32,
     b_raw: []const f32,
-    a_log: []const f32,
+    a_coeff: []const f32, // GGUF ssm_a = -exp(A_log), the decay coefficient
     dt_bias: []const f32,
     ssm_norm_w: []const f32,
     rms_eps: f32,
@@ -101,7 +101,7 @@ pub fn step(
     if (q_in.len != dims.qkDim() or k_in.len != dims.qkDim() or v.len != dims.vDim() or
         z.len != dims.vDim() or out.len != dims.vDim() or
         a_raw.len != dims.v_heads or b_raw.len != dims.v_heads or
-        a_log.len != dims.v_heads or dt_bias.len != dims.v_heads or
+        a_coeff.len != dims.v_heads or dt_bias.len != dims.v_heads or
         ssm_norm_w.len != hd) return error.InvalidDimensions;
     if (state.len < dims.stateElements()) return error.StateCapacity;
 
@@ -116,8 +116,15 @@ pub fn step(
         @memcpy(kh[0..hd], k_in[kq * hd ..][0..hd]);
         l2normInPlace(qh[0..hd]);
         l2normInPlace(kh[0..hd]);
+        // Qwen3-Next scales the query by 1/sqrt(head_dim) after L2-norm (key is
+        // not scaled). Matches torch_recurrent_gated_delta_rule.
+        const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+        for (qh[0..hd]) |*x| x.* *= qscale;
 
-        const g = @exp(-@exp(a_log[h]) * softplus(a_raw[h] + dt_bias[h]));
+        // llama.cpp bakes ssm_a = -exp(A_log) into the GGUF (SSM_A_NOSCAN), so
+        // the log-decay is g_log = ssm_a * softplus(a_raw + dt_bias) and the
+        // per-step decay multiplier is exp(g_log). (`a_coeff` carries ssm_a.)
+        const g = @exp(a_coeff[h] * softplus(a_raw[h] + dt_bias[h]));
         const beta = 1.0 / (1.0 + @exp(-b_raw[h])); // sigmoid
 
         const base = h * hd * hd; // state[base + dk*hd + dv]

@@ -14,6 +14,7 @@ const std = @import("std");
 const process = @import("sig_process");
 const gguf = @import("gguf");
 const kernels = @import("qwen35_kernels");
+const mem = @import("sig_mem");
 
 const capacity = 2048;
 var index: gguf.Index(capacity) = .{};
@@ -76,9 +77,56 @@ pub fn main(init: std.process.Init) !void {
     var writer = std.Io.File.stdout().writer(init.io, &output_buffer);
     const out = &writer.interface;
 
+    // Dump blk.31 and blk.32 tensor names to see the last-layer structure.
+    for (index.tensors[0..index.tensor_count]) |*t| {
+        const nm = t.nameSlice();
+        if (mem.startsWith(u8, nm, "blk.31.") or mem.startsWith(u8, nm, "blk.32."))
+            try out.print("LAST {s} type={d}\n", .{ nm, t.ggml_type });
+    }
+    try out.flush();
+
+    // Dump every distinct blk.* suffix present in the model (to find any
+    // tensor the plan binder doesn't yet handle).
+    {
+        var seen: [64][48]u8 = undefined;
+        var seen_len: [64]usize = @splat(0);
+        var nseen: usize = 0;
+        for (index.tensors[0..index.tensor_count]) |*t| {
+            const nm = t.nameSlice();
+            if (!mem.startsWith(u8, nm, "blk.")) continue;
+            var p: usize = 4;
+            while (p < nm.len and nm[p] != '.') p += 1;
+            if (p + 1 >= nm.len) continue;
+            const suf = nm[p + 1 ..];
+            var dup = false;
+            for (0..nseen) |i| if (mem.eql(u8, seen[i][0..seen_len[i]], suf)) {
+                dup = true;
+                break;
+            };
+            if (!dup and nseen < seen.len and suf.len <= 48) {
+                @memcpy(seen[nseen][0..suf.len], suf);
+                seen_len[nseen] = suf.len;
+                nseen += 1;
+                try out.print("SUFFIX {s}\n", .{suf});
+            }
+        }
+        try out.flush();
+    }
+
     const q4 = firstTensorOfType(12) orelse return error.NoQ4KTensor;
     const q6 = firstTensorOfType(14) orelse return error.NoQ6KTensor;
     try out.print("tensors={d} q4k_off={d} q6k_off={d}\n", .{ index.tensor_count, q4.file_offset, q6.file_offset });
+    // Dump shapes of full-attn layer 3 (idx 3, (3+1)%4==0) + a GDN layer 0.
+    for (index.tensors[0..index.tensor_count]) |*t| {
+        const nm = t.nameSlice();
+        const is_l3 = mem.startsWith(u8, nm, "blk.3.");
+        const is_l0 = mem.startsWith(u8, nm, "blk.0.");
+        if (is_l3 or is_l0) {
+            try out.print("  {s} type={d} dims=[", .{ nm, t.ggml_type });
+            for (0..t.dimension_count) |di| try out.print("{d}{s}", .{ t.dimensions[di], if (di + 1 < t.dimension_count) "," else "" });
+            try out.writeAll("]\n");
+        }
+    }
     try out.flush();
 
     var q4_block: [kernels.Q4_K_BLOCK_BYTES]u8 = undefined;

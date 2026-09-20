@@ -471,6 +471,8 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, qwen35_plan, "sig_mem", "src/core/sig_mem.sig");
     const qwen35_gdn = try ctx.addModule("qwen35_gdn", "src/core/qwen35_gdn.sig");
     try wire(ctx, qwen35_gdn, "sig_math", "src/core/sig_math.sig");
+    const qwen35_attn = try ctx.addModule("qwen35_attn", "src/core/qwen35_attn.sig");
+    try wire(ctx, qwen35_attn, "sig_math", "src/core/sig_math.sig");
     const qwen3_executor = try ctx.addModule("qwen3_executor", "src/core/qwen3_executor.sig");
     try wire(ctx, qwen3_executor, "sig_math", "src/core/sig_math.sig");
     try wire(ctx, qwen3_executor, "gguf", "src/core/gguf.sig");
@@ -546,6 +548,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-qwen35-gdn", "src/core/qwen35_gdn.sig", &.{
         importEntry("sig_math", "src/core/sig_math.sig"),
     });
+    _ = try addTest(ctx, test_all, "test-qwen35-attn", "src/core/qwen35_attn.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-qwen3-plan", "src/core/qwen3_decoder_plan.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
         importEntry("sig_math", "src/core/sig_math.sig"),
@@ -606,6 +611,32 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("qwen35_kernels", "src/core/qwen35_kernels.sig"),
             importEntry("matmul_cuda", "src/matmul/cuda.sig"),
             importEntry("qwen35_gdn", "src/core/qwen35_gdn.sig"),
+            importEntry("sig_mem", "src/core/sig_mem.sig"),
+            importEntry("sig_process", process_source),
+        },
+    });
+    const qwen35_executor = try ctx.addModule("qwen35_executor", "src/core/qwen35_executor.sig");
+    try wire(ctx, qwen35_executor, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, qwen35_executor, "gguf", "src/core/gguf.sig");
+    try wire(ctx, qwen35_executor, "qwen35_plan", "src/core/qwen35_plan.sig");
+    try wire(ctx, qwen35_executor, "qwen35_kernels", "src/core/qwen35_kernels.sig");
+    try wire(ctx, qwen35_executor, "matmul_cuda", "src/matmul/cuda.sig");
+    try wire(ctx, qwen35_executor, "qwen35_gdn", "src/core/qwen35_gdn.sig");
+    try wire(ctx, qwen35_executor, "qwen35_attn", "src/core/qwen35_attn.sig");
+    try wire(ctx, qwen35_executor, "quantized_linear", "src/core/quantized_linear.sig");
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/probe_qwen35_gen.sig",
+        .output_name = "probe-qwen35-gen",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{
+            importEntry("gguf", "src/core/gguf.sig"),
+            importEntry("qwen35_plan", "src/core/qwen35_plan.sig"),
+            importEntry("qwen35_executor", "src/core/qwen35_executor.sig"),
+            importEntry("tokenizer", "src/core/tokenizer.sig"),
+            importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
             importEntry("sig_process", process_source),
         },
     });

@@ -222,10 +222,11 @@ pub const gdn_src: [*:0]const u8 =
     \\  red[dv] = kn[dv]*kn[dv]; __syncthreads();
     \\  for (int s = hd>>1; s > 0; s >>= 1){ if (dv < s) red[dv] += red[dv+s]; __syncthreads(); }
     \\  float kinv = rsqrtf(red[0] + 1e-6f); __syncthreads();
-    \\  qn[dv] *= qinv; kn[dv] *= kinv;
+    \\  qn[dv] *= qinv * rsqrtf((float)hd); kn[dv] *= kinv; // query scaled by 1/sqrt(hd)
     \\  __syncthreads();
     \\  // Gates (recomputed per thread; cheap and avoids extra sync).
-    \\  float g    = __expf(-__expf(a_log[h]) * (fabsf(a_raw[h]+dt_bias[h])>20.0f ? (a_raw[h]+dt_bias[h]>0?(a_raw[h]+dt_bias[h]):__expf(a_raw[h]+dt_bias[h])) : __logf(1.0f+__expf(a_raw[h]+dt_bias[h]))));
+    \\  float sp = (fabsf(a_raw[h]+dt_bias[h])>20.0f ? (a_raw[h]+dt_bias[h]>0?(a_raw[h]+dt_bias[h]):__expf(a_raw[h]+dt_bias[h])) : __logf(1.0f+__expf(a_raw[h]+dt_bias[h])));
+    \\  float g    = __expf(a_log[h] * sp); // a_log carries ssm_a = -exp(A_log)
     \\  float beta = 1.0f/(1.0f+__expf(-b_raw[h]));
     \\  long base = (long)h*hd*hd;
     \\  float vv = v[h*hd + dv];

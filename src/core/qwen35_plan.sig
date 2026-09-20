@@ -139,6 +139,11 @@ pub fn build(comptime tensor_capacity: usize, index: *const gguf.Index(tensor_ca
     while (li < out.layer_count) : (li += 1) {
         out.layers[li].kind = if (isFullAttention(out.full_attention_interval, li)) .full_attention else .gdn;
     }
+    // The interval formula is the documented default, but the concrete GGUF is
+    // authoritative — e.g. the final block of the 4B distill is full-attention
+    // (and hosts the MTP head) even though (idx+1)%interval != 0. We therefore
+    // bind every tensor first, then re-derive each layer's kind from which
+    // mixer tensors are actually present (attn_qkv => GDN, attn_q => attention).
 
     for (index.tensors[0..index.tensor_count], 0..) |tensor, tensor_index| {
         const name = tensor.nameSlice();
@@ -149,9 +154,24 @@ pub fn build(comptime tensor_capacity: usize, index: *const gguf.Index(tensor_ca
         } else if (mem.eql(u8, name, "output.weight")) {
             try bind(&out.output, tensor_index);
         } else if (parseLayerName(name)) |parsed| {
-            if (parsed.layer >= out.layer_count) return error.UnknownTensor;
+            // The qwen35 GGUF ships an extra Multi-Token-Prediction (MTP / NextN)
+            // block after the main layers, plus `nextn.*` tensors. MTP is a
+            // speculative-decoding head, not part of standard next-token decode,
+            // so we skip it (its block index is >= layer_count) and any
+            // `nextn.` tensor.
+            if (parsed.layer >= out.layer_count) continue;
+            if (mem.startsWith(u8, parsed.suffix, "nextn.")) continue;
             try bindLayerTensor(&out.layers[parsed.layer], parsed.suffix, tensor_index);
         } else return error.UnknownTensor;
+    }
+
+    // Re-derive layer kind from the tensors that actually bound.
+    for (out.layers[0..out.layer_count]) |*layer| {
+        if (layer.attn_q.present()) {
+            layer.kind = .full_attention;
+        } else if (layer.attn_qkv.present()) {
+            layer.kind = .gdn;
+        } else return error.MissingTensor;
     }
 
     if (!out.output.present()) {
