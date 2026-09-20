@@ -640,6 +640,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("qwen35_gdn", "src/core/qwen35_gdn.sig"),
             importEntry("tokenizer", "src/core/tokenizer.sig"),
             importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
+            importEntry("sampling", "src/core/sampling.sig"),
             importEntry("sig_process", process_source),
         },
     });

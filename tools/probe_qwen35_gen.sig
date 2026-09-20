@@ -16,6 +16,7 @@ const qattn = @import("qwen35_attn");
 const qgdn = @import("qwen35_gdn");
 const tokenizer = @import("tokenizer");
 const indexes = @import("tokenizer_index");
+const sampling = @import("sampling");
 
 const capacity = 2048;
 const CONTEXT: usize = 256;
@@ -72,16 +73,28 @@ pub fn main(init: std.process.Init) !void {
     @memcpy(prompt_buffer[0..raw_prompt.len], raw_prompt);
     const prompt = prompt_buffer[0..raw_prompt.len];
     const maximum = if (try argv.next()) |value| try std.fmt.parseInt(usize, value, 10) else 16;
-    // Optional 4th arg: debug mode "skipgdn" | "skipattn" | "raw" | "none".
+    // Optional 4th arg: mode flags (space/comma separated in one token).
+    //   raw       — raw text tokenization (no chat template)
+    //   sample    — stochastic sampling (temp 0.6 / top_p 0.95 / top_k 20, the
+    //               Qwen3.8-4B-Distill card defaults); omit for greedy argmax
+    //   skipgdn / skipattn / norope / plus1 / fp — layer-diff diagnostics
     var raw_mode = false;
+    var do_sample = false;
     if (try argv.next()) |mode| {
         if (std.mem.indexOf(u8, mode, "skipgdn") != null) exec.dbg_skip_gdn = true;
         if (std.mem.indexOf(u8, mode, "skipattn") != null) exec.dbg_skip_attn = true;
         if (std.mem.indexOf(u8, mode, "raw") != null) raw_mode = true;
+        if (std.mem.indexOf(u8, mode, "sample") != null) do_sample = true;
         if (std.mem.indexOf(u8, mode, "norope") != null) qattn.dbg_disable_rope = true;
         if (std.mem.indexOf(u8, mode, "plus1") != null) exec.dbg_norm_plus_one = true;
         if (std.mem.indexOf(u8, mode, "fp") != null) exec.dbg_fp_enable = true;
     }
+    // Optional 5th arg: RNG seed for reproducible sampling (default 0).
+    const seed: u64 = if (try argv.next()) |value| try std.fmt.parseInt(u64, value, 10) else 0;
+
+    // Qwen3.8-4B-Distill recommended sampling settings.
+    const sampler_cfg = sampling.Config{ .temperature = 0.6, .top_p = 0.95, .top_k = 20 };
+    var rng = sampling.Rng.init(seed);
 
     const file = try std.Io.Dir.cwd().openFile(init.io, path, .{});
     defer file.close(init.io);
@@ -146,12 +159,15 @@ pub fn main(init: std.process.Init) !void {
         @memset(&gdn_conv, 0);
         return;
     }
-    // Prefill (only the final prompt token needs logits).
+    // Prefill (only the final prompt token needs logits). forward() returns the
+    // greedy argmax and leaves the full logit vector in work.logits, so the
+    // sampler can re-select from the same distribution.
     var selected: u32 = 0;
     for (tokens[0..prompt_count], 0..) |tok, pos| {
         const last = pos + 1 == prompt_count;
         selected = try exec.forward(capacity, &model, source, &index, &plan, &work, kv, st, CONTEXT, tok, pos, last);
     }
+
 
     // Top-8 logits of the first generated token (diagnostic).
     {
@@ -182,6 +198,12 @@ pub fn main(init: std.process.Init) !void {
         try out.flush();
     }
 
+    // Sampler re-selects the first token from the (still intact) logit vector.
+    // sample() mutates logits in place, so it must run after the TOP8 readout.
+    if (do_sample)
+        selected = @intCast(sampling.sample(work.logits[0..plan.vocabulary_size], sampler_cfg, &rng, tokens[0..prompt_count]));
+
+    try out.print("mode={s} seed={d}\n", .{ if (do_sample) "sample(t=0.6,p=0.95,k=20)" else "greedy", seed });
     try out.writeAll("response=");
     try out.flush();
     var scratch: [512]u8 = undefined;
@@ -197,8 +219,11 @@ pub fn main(init: std.process.Init) !void {
         if (!text.control) try out.writeAll(decoded[0..text.bytes_written]);
         try out.flush();
         generated += 1;
-        if (generated < maximum)
+        if (generated < maximum) {
             selected = try exec.forward(capacity, &model, source, &index, &plan, &work, kv, st, CONTEXT, tok, prompt_count + generated - 1, true);
+            if (do_sample)
+                selected = @intCast(sampling.sample(work.logits[0..plan.vocabulary_size], sampler_cfg, &rng, tokens[0 .. prompt_count + generated]));
+        }
     }
     try out.print("\nGEN_DONE generated={d}\n", .{generated});
     try out.flush();
