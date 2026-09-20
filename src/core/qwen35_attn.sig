@@ -54,9 +54,9 @@ pub const AttnDims = struct {
 
 /// Per-head RMSNorm over head_dim, in place, with a shared weight vector.
 fn rmsNormHead(v: []f32, w: []const f32, eps: f32) void {
-    var ss: f32 = 0;
-    for (v) |x| ss += x * x;
-    const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(v.len)) + eps);
+    var ss: f64 = 0;
+    for (v) |x| ss += @as(f64, x) * @as(f64, x);
+    const inv: f32 = @floatCast(1.0 / @sqrt(ss / @as(f64, @floatFromInt(v.len)) + @as(f64, eps)));
     for (v, 0..) |*x, i| x.* = x.* * inv * w[i];
 }
 
@@ -143,9 +143,9 @@ pub fn step(
         // scores[t] = scale * dot(qh, K[kvh][t])
         for (0..ctx_len) |t| {
             const kt = kv_cache[kvh * context * hd + t * hd ..][0..hd];
-            var acc: f32 = 0;
-            for (0..hd) |d| acc += qh[d] * kt[d];
-            scores[t] = acc * scale;
+            var acc: f64 = 0;
+            for (0..hd) |d| acc += @as(f64, qh[d]) * @as(f64, kt[d]);
+            scores[t] = @floatCast(acc * @as(f64, scale));
         }
         // softmax over scores[0..ctx_len]
         var mx = scores[0];

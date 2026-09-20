@@ -224,9 +224,13 @@ fn readVec(source: gguf.Source, t: *const gguf.TensorInfo, out: []f32) Error!voi
 pub var dbg_norm_plus_one: bool = false;
 
 fn rmsNorm(in: []const f32, w: []const f32, out: []f32, eps: f32) void {
-    var ss: f32 = 0;
-    for (in) |x| ss += x * x;
-    const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(in.len)) + eps);
+    // Accumulate the sum-of-squares in f64 to match ggml_rms_norm (which uses
+    // ggml_float/double); f32 accumulation over 2560 elems drifts enough to
+    // compound across 33 layers.
+    var ss: f64 = 0;
+    for (in) |x| ss += @as(f64, x) * @as(f64, x);
+    const mean = ss / @as(f64, @floatFromInt(in.len));
+    const inv: f32 = @floatCast(1.0 / @sqrt(mean + @as(f64, eps)));
     const bias: f32 = if (dbg_norm_plus_one) 1.0 else 0.0;
     for (out, in, w) |*o, x, wi| o.* = x * inv * (wi + bias);
 }

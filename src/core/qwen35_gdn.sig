@@ -65,9 +65,9 @@ pub fn softplus(x: f32) f32 {
 
 /// L2-normalize `v` in place (over its own length).
 pub fn l2normInPlace(v: []f32) void {
-    var sum: f32 = 0;
-    for (v) |x| sum += x * x;
-    const inv = 1.0 / @sqrt(sum + 1.0e-6);
+    var sum: f64 = 0;
+    for (v) |x| sum += @as(f64, x) * @as(f64, x);
+    const inv: f32 = @floatCast(1.0 / @sqrt(sum + 1.0e-6));
     for (v) |*x| x.* *= inv;
 }
 
@@ -143,11 +143,12 @@ pub fn step(
         }
         var retrieved: [MAX_HEAD_DIM]f32 = undefined;
         for (0..hd) |dv| {
-            var acc: f32 = 0;
-            for (0..hd) |dk| acc += kh[dk] * state[base + dk * hd + dv];
-            retrieved[dv] = acc;
+            var acc: f64 = 0;
+            for (0..hd) |dk| acc += @as(f64, kh[dk]) * @as(f64, state[base + dk * hd + dv]);
+            retrieved[dv] = @floatCast(acc);
         }
-        for (0..hd) |dv| oh[dv] = 0;
+        var oacc: [MAX_HEAD_DIM]f64 = undefined;
+        for (0..hd) |dv| oacc[dv] = 0;
         for (0..hd) |dk| {
             const kdk = kh[dk];
             const qdk = qh[dk];
@@ -156,13 +157,14 @@ pub fn step(
                 const delta = (vv[dv] - retrieved[dv]) * beta;
                 const s = state[row + dv] + kdk * delta;
                 state[row + dv] = s;
-                oh[dv] += qdk * s;
+                oacc[dv] += @as(f64, qdk) * @as(f64, s);
             }
         }
+        for (0..hd) |dv| oh[dv] = @floatCast(oacc[dv]);
         // Gated RMSNorm: rmsnorm(o) * silu(z), per head.
-        var ss: f32 = 0;
-        for (0..hd) |dv| ss += oh[dv] * oh[dv];
-        const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(hd)) + rms_eps);
+        var ss: f64 = 0;
+        for (0..hd) |dv| ss += @as(f64, oh[dv]) * @as(f64, oh[dv]);
+        const inv: f32 = @floatCast(1.0 / @sqrt(ss / @as(f64, @floatFromInt(hd)) + @as(f64, rms_eps)));
         const zh = z[h * hd ..][0..hd];
         const oo = out[h * hd ..][0..hd];
         for (0..hd) |dv| oo[dv] = (oh[dv] * inv * ssm_norm_w[dv]) * silu(zh[dv]);
