@@ -219,11 +219,16 @@ fn readVec(source: gguf.Source, t: *const gguf.TensorInfo, out: []f32) Error!voi
     }
 }
 
+/// Qwen3-Next RMSNorm uses a zero-centered weight: multiplier = (1 + weight).
+/// If the GGUF converter did not bake the +1, set dbg_norm_plus_one=true.
+pub var dbg_norm_plus_one: bool = false;
+
 fn rmsNorm(in: []const f32, w: []const f32, out: []f32, eps: f32) void {
     var ss: f32 = 0;
     for (in) |x| ss += x * x;
     const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(in.len)) + eps);
-    for (out, in, w) |*o, x, wi| o.* = x * inv * wi;
+    const bias: f32 = if (dbg_norm_plus_one) 1.0 else 0.0;
+    for (out, in, w) |*o, x, wi| o.* = x * inv * (wi + bias);
 }
 
 fn silu(x: f32) f32 {

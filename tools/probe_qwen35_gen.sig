@@ -78,6 +78,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.indexOf(u8, mode, "skipattn") != null) exec.dbg_skip_attn = true;
         if (std.mem.indexOf(u8, mode, "raw") != null) raw_mode = true;
         if (std.mem.indexOf(u8, mode, "norope") != null) qattn.dbg_disable_rope = true;
+        if (std.mem.indexOf(u8, mode, "plus1") != null) exec.dbg_norm_plus_one = true;
     }
 
     const file = try std.Io.Dir.cwd().openFile(init.io, path, .{});
