@@ -641,6 +641,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("tokenizer", "src/core/tokenizer.sig"),
             importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
             importEntry("sampling", "src/core/sampling.sig"),
+            importEntry("win32", win32_path),
             importEntry("sig_process", process_source),
         },
     });

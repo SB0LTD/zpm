@@ -51,8 +51,19 @@ pub const MAX_TENSORS: usize = 512;
 pub const MAX_VOCAB: usize = 262_144;
 pub const MAX_CONTEXT: usize = attn.MAX_CONTEXT;
 
+// Max independent projections batched into one sync (GDN: qkv,gate,alpha,beta).
+pub const MAX_GROUP: usize = 4;
+
 pub const gdn_dims = gdn.GdnDims{ .kq_heads = 16, .v_heads = 32, .head_dim = 128 };
 pub const attn_dims = attn.AttnDims{ .head_count = 16, .kv_head_count = 4, .head_dim = 256, .rope_dim = 64 };
+
+// Host-resident cache for the small 1-D f32 tensors (norm weights, conv1d
+// weight, ssm_a / dt_bias / ssm_norm). These are constant across tokens, so we
+// parse them from the GGUF mmap ONCE at init and read from RAM every token
+// instead of bit-casting ~800K floats per token off the mmap. Sized for the 4B
+// distill: 24 conv1d (32768) + 33*2 layer norms (2560) + output_norm + small
+// ssm/qk-norm vectors ≈ 1.0M floats. Round up with headroom.
+const HOST_VEC_POOL: usize = 1_200_000;
 
 /// Per-tensor device residency: one VRAM pointer per plan tensor index.
 pub const Model = struct {
@@ -64,8 +75,19 @@ pub const Model = struct {
     // Persistent device scratch for one matvec (reused across all projections).
     d_in: cuda.CUdeviceptr = 0,
     d_out: cuda.CUdeviceptr = 0,
+    // Extra output buffers for batching independent projections that share the
+    // same input (GDN qkv/gate/alpha/beta, attn q/k/v, FFN gate/up): launch all
+    // reading d_in → distinct d_out_extra[i], then sync ONCE instead of per
+    // projection. Sized to the largest grouped output (FFN=9216).
+    d_out_extra: [MAX_GROUP - 1]cuda.CUdeviceptr = @splat(0),
     kern: kernels.DequantKernels = undefined,
     gdn_kern: kernels.GdnKernel = undefined,
+    // Host-resident 1-D f32 tensor cache. vec_off[idx]/vec_len[idx] slice into
+    // vec_pool; vec_len[idx]==0 means this tensor is not host-cached (2-D quant).
+    vec_pool: [HOST_VEC_POOL]f32 = @splat(0),
+    vec_off: [MAX_TENSORS]u32 = @splat(0),
+    vec_len: [MAX_TENSORS]u32 = @splat(0),
+    vec_used: usize = 0,
     ready: bool = false,
 };
 
@@ -101,8 +123,6 @@ pub const Work = struct {
     // FFN
     gate: [FFN]f32 = @splat(0),
     up: [FFN]f32 = @splat(0),
-    // weight-vector scratch (for f32 vectors read from GGUF)
-    wvec: [HIDDEN]f32 = @splat(0),
     // logits
     logits: [MAX_VOCAB]f32 = @splat(0),
 };
@@ -128,23 +148,52 @@ fn uploadTensor(model: *Model, source: gguf.Source, t: *const gguf.TensorInfo, i
     if (t.dimension_count == 2) {
         model.k[idx] = @intCast(t.dimensions[0]);
         model.n[idx] = @intCast(t.dimensions[1]);
-        const bytes = source.view(t.file_offset, @intCast(t.byte_size), 1) orelse return error.UploadFailed;
-        const d = cuda.gpuAlloc(@intCast(t.byte_size));
-        if (d == 0) return error.UploadFailed;
-        if (!cuda.uploadToGpu(d, bytes.ptr, @intCast(t.byte_size))) return error.UploadFailed;
-        model.dptr[idx] = d;
     } else {
-        // 1-D vector (f32 norm / ssm_a / dt_bias): keep resident too for speed.
         model.k[idx] = @intCast(t.dimensions[0]);
         model.n[idx] = 1;
-        const d = cuda.gpuAlloc(@intCast(t.byte_size));
-        if (d != 0) {
-            const bytes = source.view(t.file_offset, @intCast(t.byte_size), 1);
-            if (bytes) |b| {
-                if (cuda.uploadToGpu(d, b.ptr, @intCast(t.byte_size))) model.dptr[idx] = d;
-            }
-        }
     }
+    // Upload the raw tensor bytes to VRAM (quantized 2-D weights are consumed by
+    // the fused matvec; f32 vectors are kept resident for parity/other kernels).
+    const d = cuda.gpuAlloc(@intCast(t.byte_size));
+    if (d != 0) {
+        const bytes = source.view(t.file_offset, @intCast(t.byte_size), 1);
+        if (bytes) |b| {
+            if (cuda.uploadToGpu(d, b.ptr, @intCast(t.byte_size))) model.dptr[idx] = d;
+        }
+    } else if (t.dimension_count == 2 and ty != .f32) {
+        // A quantized 2-D weight that failed to allocate is fatal — the matvec
+        // needs it. f32 vectors can fall back to the host cache below.
+        return error.UploadFailed;
+    }
+    // Parse any f32 tensor's payload into the host cache ONCE (norm weights,
+    // conv1d weight, ssm_a / dt_bias / ssm_norm — 1-D and the 2-D conv kernel).
+    // Later tokens read straight from model.vec_pool instead of re-bit-casting
+    // ~800K floats off the mmap every step.
+    if (ty == .f32) {
+        const count: usize = @intCast(t.byte_size / @sizeOf(f32));
+        if (model.vec_used + count > HOST_VEC_POOL) return error.Capacity;
+        const bytes = source.view(t.file_offset, @intCast(t.byte_size), 1) orelse return error.UploadFailed;
+        const dst = model.vec_pool[model.vec_used..][0..count];
+        for (dst, 0..) |*dv, i| {
+            const o = i * 4;
+            const bits = @as(u32, bytes[o]) | (@as(u32, bytes[o + 1]) << 8) |
+                (@as(u32, bytes[o + 2]) << 16) | (@as(u32, bytes[o + 3]) << 24);
+            dv.* = @bitCast(bits);
+        }
+        model.vec_off[idx] = @intCast(model.vec_used);
+        model.vec_len[idx] = @intCast(count);
+        model.vec_used += count;
+    }
+}
+
+/// Host-cached f32 tensor payload for a plan tensor index, or null if the
+/// tensor was not cached (e.g. a 2-D quantized weight).
+fn cachedVec(model: *const Model, ref: plan_mod.TensorRef) ?[]const f32 {
+    if (!ref.present()) return null;
+    const idx = ref.index;
+    const len = model.vec_len[idx];
+    if (len == 0) return null;
+    return model.vec_pool[model.vec_off[idx]..][0..len];
 }
 
 /// Initialize the model: compile GPU kernels, allocate matvec scratch, and
@@ -173,6 +222,12 @@ pub fn init(
     model.d_in = cuda.gpuAlloc(@as(usize, @max(FFN, HIDDEN)) * @sizeOf(f32));
     model.d_out = cuda.gpuAlloc(@as(usize, MAX_VOCAB) * @sizeOf(f32));
     if (model.d_in == 0 or model.d_out == 0) return error.UploadFailed;
+    // Grouped-projection output scratch: each sized to the largest grouped
+    // output (FFN gate/up = 9216 floats). d_out (vocab-sized) is buffer 0.
+    for (&model.d_out_extra) |*d| {
+        d.* = cuda.gpuAlloc(@as(usize, FFN) * @sizeOf(f32));
+        if (d.* == 0) return error.UploadFailed;
+    }
     _ = plan;
     model.ready = true;
 }
@@ -194,30 +249,41 @@ fn gpuMatvec(model: *Model, ref: plan_mod.TensorRef, in: []const f32, out: []f32
     for (out) |x| if (!math.isFinite(x)) return error.NonFinite;
 }
 
-// Module-static host buffers for per-layer small f32 tensors (avoid stack).
-var conv1d_w_buf: [CONV_K * CONV_W]f32 = @splat(0);
-var a_log_buf: [SSM_PROJ]f32 = @splat(0);
-var dt_bias_buf: [SSM_PROJ]f32 = @splat(0);
-var ssm_norm_buf: [attn.MAX_HEAD_DIM]f32 = @splat(0);
-var qnorm_buf: [attn.MAX_HEAD_DIM]f32 = @splat(0);
-var knorm_buf: [attn.MAX_HEAD_DIM]f32 = @splat(0);
+/// One projection in a batched group: a weight ref and its host output slice.
+const Proj = struct { ref: plan_mod.TensorRef, out: []f32 };
+
+/// Batched fused matvec for independent projections that share the SAME input.
+/// Uploads `in` to d_in ONCE, launches every projection (each reads d_in and
+/// writes its own device buffer), syncs ONCE, then downloads all outputs. This
+/// collapses N per-projection sync stalls into a single pipeline flush.
+fn gpuMatvecGroup(model: *Model, in: []const f32, projs: []const Proj) Error!void {
+    if (projs.len == 0 or projs.len > MAX_GROUP) return error.Capacity;
+    if (!cuda.uploadToGpu(model.d_in, in.ptr, in.len * @sizeOf(f32))) return error.UploadFailed;
+    // Launch all projections onto the active stream (enqueue-only, no sync).
+    for (projs, 0..) |p, i| {
+        if (!p.ref.present()) return error.InvalidPlan;
+        const idx = p.ref.index;
+        const n = model.n[idx];
+        const k = model.k[idx];
+        if (in.len != k or p.out.len != n) return error.Capacity;
+        const d_dst = if (i == 0) model.d_out else model.d_out_extra[i - 1];
+        if (!kernels.matvecFused(model.kern, model.ty[idx], model.dptr[idx], model.d_in, d_dst, n, k))
+            return error.MatvecFailed;
+    }
+    if (!cuda.syncActiveStream()) return error.Sync;
+    // Download every output now that the whole group has completed.
+    for (projs, 0..) |p, i| {
+        const d_dst = if (i == 0) model.d_out else model.d_out_extra[i - 1];
+        if (!cuda.downloadFromGpu(p.out.ptr, d_dst, p.out.len * @sizeOf(f32))) return error.Download;
+        for (p.out) |x| if (!math.isFinite(x)) return error.NonFinite;
+    }
+}
+
+// Module-static host buffers for de-interleaving fused attn Q/gate (avoid stack).
 var q_contig_buf: [ATTN_Q]f32 = @splat(0);
 var gate_contig_buf: [ATTN_Q]f32 = @splat(0);
 
 // ── Host helpers ──
-
-/// Read a 1-D f32 vector tensor (norm weights, ssm_a, dt_bias) from the GGUF
-/// source into `out`. These are small and read straight from the mmap.
-fn readVec(source: gguf.Source, t: *const gguf.TensorInfo, out: []f32) Error!void {
-    if (t.ggml_type != 0 or t.dimensions[0] != out.len) return error.InvalidPlan;
-    const bytes = source.view(t.file_offset, out.len * @sizeOf(f32), 1) orelse return error.UploadFailed;
-    for (out, 0..) |*d, i| {
-        const o = i * 4;
-        const bits = @as(u32, bytes[o]) | (@as(u32, bytes[o + 1]) << 8) |
-            (@as(u32, bytes[o + 2]) << 16) | (@as(u32, bytes[o + 3]) << 24);
-        d.* = @bitCast(bits);
-    }
-}
 
 /// Qwen3-Next RMSNorm uses a zero-centered weight: multiplier = (1 + weight).
 /// If the GGUF converter did not bake the +1, set dbg_norm_plus_one=true.
@@ -258,61 +324,49 @@ fn conv1dSilu(x: []const f32, conv1d_w: []const f32, conv_state: []f32, conv_out
     }
 }
 
-/// Read any f32 tensor (1-D or 2-D) fully into `out` from the GGUF source.
-fn readF32Tensor(source: gguf.Source, t: *const gguf.TensorInfo, out: []f32) Error!void {
-    if (t.ggml_type != 0) return error.InvalidPlan;
-    const bytes = source.view(t.file_offset, out.len * @sizeOf(f32), 1) orelse return error.UploadFailed;
-    for (out, 0..) |*d, i| {
-        const o = i * 4;
-        const bits = @as(u32, bytes[o]) | (@as(u32, bytes[o + 1]) << 8) |
-            (@as(u32, bytes[o + 2]) << 16) | (@as(u32, bytes[o + 3]) << 24);
-        d.* = @bitCast(bits);
-    }
-}
-
 fn tref(index: anytype, ref: plan_mod.TensorRef) *const gguf.TensorInfo {
     return &index.tensors[ref.index];
 }
 
 /// One GDN mixer layer (writes result added into work.hidden).
 fn gdnLayer(
-    comptime tensor_capacity: usize,
     model: *Model,
-    source: gguf.Source,
-    index: *const gguf.Index(tensor_capacity),
     plan: *const plan_mod.Plan,
     layer: *const plan_mod.Layer,
     gdn_layer_idx: usize,
     work: *Work,
     st: GdnState,
 ) Error!void {
-    // 1. pre-mixer RMSNorm
-    try readVec(source, tref(index, layer.attn_norm), work.wvec[0..HIDDEN]);
-    rmsNorm(work.hidden[0..HIDDEN], work.wvec[0..HIDDEN], work.normed[0..HIDDEN], plan.rms_norm_epsilon);
+    // 1. pre-mixer RMSNorm (weights served from the host cache, no per-token parse)
+    const attn_norm_w = cachedVec(model, layer.attn_norm) orelse return error.InvalidPlan;
+    rmsNorm(work.hidden[0..HIDDEN], attn_norm_w, work.normed[0..HIDDEN], plan.rms_norm_epsilon);
     if (gdn_layer_idx == 0) dbgFp("g.attn_norm", work.normed[0..HIDDEN]);
-    // 2. projections (GPU): qkv[8192], z[4096], a_raw[32], b_raw[32]
-    try gpuMatvec(model, layer.attn_qkv, work.normed[0..HIDDEN], work.qkv[0..QKV_DIM]);
-    try gpuMatvec(model, layer.attn_gate, work.normed[0..HIDDEN], work.z[0..GDN_Z]);
+    // 2. projections (GPU): qkv[8192], z[4096], a_raw[32], b_raw[32]. All four
+    // read work.normed, so batch them into one upload + one sync.
+    try gpuMatvecGroup(model, work.normed[0..HIDDEN], &.{
+        .{ .ref = layer.attn_qkv, .out = work.qkv[0..QKV_DIM] },
+        .{ .ref = layer.attn_gate, .out = work.z[0..GDN_Z] },
+        .{ .ref = layer.ssm_alpha, .out = work.a_raw[0..SSM_PROJ] },
+        .{ .ref = layer.ssm_beta, .out = work.b_raw[0..SSM_PROJ] },
+    });
     if (gdn_layer_idx == 0) dbgFp("g.z", work.z[0..GDN_Z]);
-    try gpuMatvec(model, layer.ssm_alpha, work.normed[0..HIDDEN], work.a_raw[0..SSM_PROJ]);
-    try gpuMatvec(model, layer.ssm_beta, work.normed[0..HIDDEN], work.b_raw[0..SSM_PROJ]);
     // 3. depthwise causal conv1d + SiLU over the 8192 qkv channels (host).
     const conv_base = gdn_layer_idx * CONV_W * CONV_K;
-    // conv1d weight is small f32; read into up[] scratch (reused, >= 4*8192? no).
-    // Use a dedicated static buffer.
-    try readF32Tensor(source, tref(index, layer.ssm_conv1d), conv1d_w_buf[0 .. CONV_K * CONV_W]);
-    conv1dSilu(work.qkv[0..CONV_W], conv1d_w_buf[0 .. CONV_K * CONV_W], st.conv[conv_base..][0 .. CONV_W * CONV_K], work.conv_out[0..CONV_W]);
+    // conv1d weight (32768 f32) served from the host cache — this was the single
+    // biggest per-token redundant parse.
+    const conv1d_w = cachedVec(model, layer.ssm_conv1d) orelse return error.InvalidPlan;
+    conv1dSilu(work.qkv[0..CONV_W], conv1d_w, st.conv[conv_base..][0 .. CONV_W * CONV_K], work.conv_out[0..CONV_W]);
     // 4. split conv_out into Q[2048], K[2048], V[4096]
     const q = work.conv_out[0..GDN_KQ];
     const k = work.conv_out[GDN_KQ..][0..GDN_KQ];
     const v = work.conv_out[GDN_KQ * 2 ..][0..GDN_V];
-    // 5. gates need ssm_a (A_log) and ssm_dt.bias vectors (host).
-    try readVec(source, tref(index, layer.ssm_a), a_log_buf[0..SSM_PROJ]);
-    try readVec(source, tref(index, layer.ssm_dt_bias), dt_bias_buf[0..SSM_PROJ]);
-    try readVec(source, tref(index, layer.ssm_norm), ssm_norm_buf[0..gdn_dims.head_dim]);
+    // 5. gates need ssm_a (A_log), ssm_dt.bias, and ssm_norm vectors (host cache).
+    const a_log = cachedVec(model, layer.ssm_a) orelse return error.InvalidPlan;
+    const dt_bias = cachedVec(model, layer.ssm_dt_bias) orelse return error.InvalidPlan;
+    const ssm_norm_w = cachedVec(model, layer.ssm_norm) orelse return error.InvalidPlan;
     // 6. GDN recurrence (host reference) mutating this layer's recurrent state.
     const rec_base = gdn_layer_idx * gdn_dims.stateElements();
-    gdn.step(gdn_dims, q, k, v, work.z[0..GDN_Z], work.a_raw[0..SSM_PROJ], work.b_raw[0..SSM_PROJ], a_log_buf[0..SSM_PROJ], dt_bias_buf[0..SSM_PROJ], ssm_norm_buf[0..gdn_dims.head_dim], plan.rms_norm_epsilon, st.recurrent[rec_base..][0..gdn_dims.stateElements()], work.gdn_o[0..GDN_V]) catch return error.InvalidPlan;
+    gdn.step(gdn_dims, q, k, v, work.z[0..GDN_Z], work.a_raw[0..SSM_PROJ], work.b_raw[0..SSM_PROJ], a_log[0..SSM_PROJ], dt_bias[0..SSM_PROJ], ssm_norm_w[0..gdn_dims.head_dim], plan.rms_norm_epsilon, st.recurrent[rec_base..][0..gdn_dims.stateElements()], work.gdn_o[0..GDN_V]) catch return error.InvalidPlan;
 
     // 7. output projection ssm_out[4096->2560] (GPU) into tmp_hidden, add residual.
     try gpuMatvec(model, layer.ssm_out, work.gdn_o[0..GDN_V], work.tmp_hidden[0..HIDDEN]);
@@ -323,10 +377,7 @@ fn gdnLayer(
 
 /// One full-attention layer (writes result added into work.hidden).
 fn attnLayer(
-    comptime tensor_capacity: usize,
     model: *Model,
-    source: gguf.Source,
-    index: *const gguf.Index(tensor_capacity),
     plan: *const plan_mod.Plan,
     layer: *const plan_mod.Layer,
     attn_layer_idx: usize,
@@ -335,12 +386,15 @@ fn attnLayer(
     context: usize,
     position: usize,
 ) Error!void {
-    try readVec(source, tref(index, layer.attn_norm), work.wvec[0..HIDDEN]);
-    rmsNorm(work.hidden[0..HIDDEN], work.wvec[0..HIDDEN], work.normed[0..HIDDEN], plan.rms_norm_epsilon);
-    // Projections (GPU). attn_q is query+gate fused [8192]; k,v [1024].
-    try gpuMatvec(model, layer.attn_q, work.normed[0..HIDDEN], work.q[0..ATTN_QG]);
-    try gpuMatvec(model, layer.attn_k, work.normed[0..HIDDEN], work.k[0..ATTN_KV]);
-    try gpuMatvec(model, layer.attn_v, work.normed[0..HIDDEN], work.v[0..ATTN_KV]);
+    const attn_norm_w = cachedVec(model, layer.attn_norm) orelse return error.InvalidPlan;
+    rmsNorm(work.hidden[0..HIDDEN], attn_norm_w, work.normed[0..HIDDEN], plan.rms_norm_epsilon);
+    // Projections (GPU). attn_q is query+gate fused [8192]; k,v [1024]. All
+    // three read work.normed → batch into one upload + one sync.
+    try gpuMatvecGroup(model, work.normed[0..HIDDEN], &.{
+        .{ .ref = layer.attn_q, .out = work.q[0..ATTN_QG] },
+        .{ .ref = layer.attn_k, .out = work.k[0..ATTN_KV] },
+        .{ .ref = layer.attn_v, .out = work.v[0..ATTN_KV] },
+    });
     // attn_q is PER-HEAD interleaved [q_h0(hd), gate_h0(hd), q_h1(hd), ...]
     // (HF q_proj -> view(-1, head_dim*2).chunk(2)). De-interleave into
     // contiguous Q[4096] and gate[4096].
@@ -351,12 +405,12 @@ fn attnLayer(
     }
     const q = q_contig_buf[0..ATTN_Q];
     const gate = gate_contig_buf[0..ATTN_Q];
-    try readVec(source, tref(index, layer.attn_q_norm), qnorm_buf[0..attn_dims.head_dim]);
-    try readVec(source, tref(index, layer.attn_k_norm), knorm_buf[0..attn_dims.head_dim]);
+    const qnorm_w = cachedVec(model, layer.attn_q_norm) orelse return error.InvalidPlan;
+    const knorm_w = cachedVec(model, layer.attn_k_norm) orelse return error.InvalidPlan;
     // Attention (host) into attn_o; this layer's KV slice.
     const kv_layer_elems = attn_dims.kvElements(context);
     const kv_slice = kv.data[attn_layer_idx * kv_layer_elems ..][0..kv_layer_elems];
-    attn.step(attn_dims, q, work.k[0..ATTN_KV], work.v[0..ATTN_KV], gate, qnorm_buf[0..attn_dims.head_dim], knorm_buf[0..attn_dims.head_dim], plan.rms_norm_epsilon, plan.rope_frequency_base, kv_slice, context, position, work.attn_o[0..ATTN_Q]) catch return error.InvalidPlan;
+    attn.step(attn_dims, q, work.k[0..ATTN_KV], work.v[0..ATTN_KV], gate, qnorm_w[0..attn_dims.head_dim], knorm_w[0..attn_dims.head_dim], plan.rms_norm_epsilon, plan.rope_frequency_base, kv_slice, context, position, work.attn_o[0..ATTN_Q]) catch return error.InvalidPlan;
     // Output projection [4096->2560] (GPU), add residual.
     try gpuMatvec(model, layer.attn_output, work.attn_o[0..ATTN_Q], work.tmp_hidden[0..HIDDEN]);
     for (work.hidden[0..HIDDEN], work.tmp_hidden[0..HIDDEN]) |*h, o| h.* += o;
@@ -364,18 +418,18 @@ fn attnLayer(
 
 /// SwiGLU FFN (both layer kinds): post_attention_norm -> gate/up -> silu(gate)*up -> down.
 fn ffnLayer(
-    comptime tensor_capacity: usize,
     model: *Model,
-    source: gguf.Source,
-    index: *const gguf.Index(tensor_capacity),
     plan: *const plan_mod.Plan,
     layer: *const plan_mod.Layer,
     work: *Work,
 ) Error!void {
-    try readVec(source, tref(index, layer.post_attention_norm), work.wvec[0..HIDDEN]);
-    rmsNorm(work.hidden[0..HIDDEN], work.wvec[0..HIDDEN], work.normed[0..HIDDEN], plan.rms_norm_epsilon);
-    try gpuMatvec(model, layer.ffn_gate, work.normed[0..HIDDEN], work.gate[0..FFN]);
-    try gpuMatvec(model, layer.ffn_up, work.normed[0..HIDDEN], work.up[0..FFN]);
+    const post_norm_w = cachedVec(model, layer.post_attention_norm) orelse return error.InvalidPlan;
+    rmsNorm(work.hidden[0..HIDDEN], post_norm_w, work.normed[0..HIDDEN], plan.rms_norm_epsilon);
+    // gate and up both read work.normed → batch into one upload + one sync.
+    try gpuMatvecGroup(model, work.normed[0..HIDDEN], &.{
+        .{ .ref = layer.ffn_gate, .out = work.gate[0..FFN] },
+        .{ .ref = layer.ffn_up, .out = work.up[0..FFN] },
+    });
     for (work.gate[0..FFN], work.up[0..FFN]) |*g, u| g.* = silu(g.*) * u;
     try gpuMatvec(model, layer.ffn_down, work.gate[0..FFN], work.tmp_hidden[0..HIDDEN]);
     for (work.hidden[0..HIDDEN], work.tmp_hidden[0..HIDDEN]) |*h, o| h.* += o;
@@ -459,13 +513,13 @@ pub fn forward(
     for (0..plan.layer_count) |li| {
         const layer = &plan.layers[li];
         if (layer.kind == .full_attention) {
-            if (!dbg_skip_attn) try attnLayer(tensor_capacity, model, source, index, plan, layer, attn_idx, work, kv, context, position);
+            if (!dbg_skip_attn) try attnLayer(model, plan, layer, attn_idx, work, kv, context, position);
             attn_idx += 1;
         } else {
-            if (!dbg_skip_gdn) try gdnLayer(tensor_capacity, model, source, index, plan, layer, gdn_idx, work, st);
+            if (!dbg_skip_gdn) try gdnLayer(model, plan, layer, gdn_idx, work, st);
             gdn_idx += 1;
         }
-        try ffnLayer(tensor_capacity, model, source, index, plan, layer, work);
+        try ffnLayer(model, plan, layer, work);
         var lbl: [8]u8 = undefined;
         lbl[0] = 'L';
         const d0: u8 = @intCast((li / 10) % 10);
@@ -479,8 +533,8 @@ pub fn forward(
     if (!produce_logits) return 0;
 
     // Final norm + lm_head.
-    try readVec(source, tref(index, plan.output_norm), work.wvec[0..HIDDEN]);
-    rmsNorm(work.hidden[0..HIDDEN], work.wvec[0..HIDDEN], work.normed[0..HIDDEN], plan.rms_norm_epsilon);
+    const out_norm_w = cachedVec(model, plan.output_norm) orelse return error.InvalidPlan;
+    rmsNorm(work.hidden[0..HIDDEN], out_norm_w, work.normed[0..HIDDEN], plan.rms_norm_epsilon);
     try gpuMatvec(model, plan.output, work.normed[0..HIDDEN], work.logits[0..plan.vocabulary_size]);
 
     var best: u32 = 0;

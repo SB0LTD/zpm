@@ -17,6 +17,27 @@ const qgdn = @import("qwen35_gdn");
 const tokenizer = @import("tokenizer");
 const indexes = @import("tokenizer_index");
 const sampling = @import("sampling");
+const w32 = @import("win32");
+
+/// High-precision wall clock via QueryPerformanceCounter (win32). Inlined here
+/// rather than importing platform/timer.sig so the harness doesn't need the
+/// timer module's own win32 wiring in the build graph.
+const Clock = struct {
+    freq: i64,
+    start: i64,
+    fn now() Clock {
+        var f: w32.LARGE_INTEGER = .{};
+        var s: w32.LARGE_INTEGER = .{};
+        _ = w32.QueryPerformanceFrequency(&f);
+        _ = w32.QueryPerformanceCounter(&s);
+        return .{ .freq = f.QuadPart, .start = s.QuadPart };
+    }
+    fn elapsed(self: *const Clock) f64 {
+        var c: w32.LARGE_INTEGER = .{};
+        _ = w32.QueryPerformanceCounter(&c);
+        return @as(f64, @floatFromInt(c.QuadPart - self.start)) / @as(f64, @floatFromInt(self.freq));
+    }
+};
 
 const capacity = 2048;
 const CONTEXT: usize = 256;
@@ -162,11 +183,13 @@ pub fn main(init: std.process.Init) !void {
     // Prefill (only the final prompt token needs logits). forward() returns the
     // greedy argmax and leaves the full logit vector in work.logits, so the
     // sampler can re-select from the same distribution.
+    const prefill_timer = Clock.now();
     var selected: u32 = 0;
     for (tokens[0..prompt_count], 0..) |tok, pos| {
         const last = pos + 1 == prompt_count;
         selected = try exec.forward(capacity, &model, source, &index, &plan, &work, kv, st, CONTEXT, tok, pos, last);
     }
+    const prefill_s = prefill_timer.elapsed();
 
 
     // Top-8 logits of the first generated token (diagnostic).
@@ -206,6 +229,7 @@ pub fn main(init: std.process.Init) !void {
     try out.print("mode={s} seed={d}\n", .{ if (do_sample) "sample(t=0.6,p=0.95,k=20)" else "greedy", seed });
     try out.writeAll("response=");
     try out.flush();
+    const decode_timer = Clock.now();
     var scratch: [512]u8 = undefined;
     var decoded: [512]u8 = undefined;
     var generated: usize = 0;
@@ -225,6 +249,11 @@ pub fn main(init: std.process.Init) !void {
                 selected = @intCast(sampling.sample(work.logits[0..plan.vocabulary_size], sampler_cfg, &rng, tokens[0 .. prompt_count + generated]));
         }
     }
+    const decode_s = decode_timer.elapsed();
     try out.print("\nGEN_DONE generated={d}\n", .{generated});
+    // Throughput: prefill processes prompt_count tokens; decode produced `generated`.
+    const prefill_tps = if (prefill_s > 0) @as(f64, @floatFromInt(prompt_count)) / prefill_s else 0;
+    const decode_tps = if (decode_s > 0 and generated > 0) @as(f64, @floatFromInt(generated)) / decode_s else 0;
+    try out.print("PERF prefill={d:.3}s ({d} tok, {d:.2} tok/s)  decode={d:.3}s ({d} tok, {d:.2} tok/s)\n", .{ prefill_s, prompt_count, prefill_tps, decode_s, generated, decode_tps });
     try out.flush();
 }
