@@ -507,6 +507,14 @@ fn handleStrategy(buf: *[RESP_SIZE]u8, id: i64, sel: ?[]const u8, pay: ?[]const 
             if (json.getInt(a, "\"elite\"")) |v| {
                 if (v >= 0) es.elite = @intCast(v);
             }
+            // seed_mode: 0 = legacy all-random gen-0; 1 = seed from the diverse
+            // proven champion set (default). tournament_k: selection pressure.
+            if (json.getInt(a, "\"seed_mode\"")) |v| {
+                if (v >= 0) es.seed_mode = @intCast(v);
+            }
+            if (json.getInt(a, "\"tournament_k\"")) |v| {
+                if (v >= 2) es.tournament_k = @intCast(v);
+            }
         }
         return okPush(buf, id, .{ .strategy_evolve_start = es });
     }
