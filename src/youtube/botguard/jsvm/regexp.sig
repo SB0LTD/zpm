@@ -1,420 +1,330 @@
-// @zpm/youtube/botguard/jsvm/regexp — Basic Regex Engine
-//
-// Minimal regex support for BotGuard's string operations.
-// BotGuard uses regex for:
-//   - String splitting by pattern
-//   - Simple character class matching
-//   - Replacing substrings by pattern
-//
-// Supported features:
-//   - Literal character matching
-//   - . (any char)
-//   - * (zero or more)
-//   - + (one or more)
-//   - ? (zero or one)
-//   - [abc], [a-z], [^abc] (character classes)
-//   - ^ (start anchor)
-//   - $ (end anchor)
-//   - \d, \w, \s, \D, \W, \S (character class shortcuts)
-//   - | (alternation)
-//   - () (grouping, capture)
-//   - {n}, {n,}, {n,m} (repetition)
-//
-// NOT supported (BotGuard rarely uses):
-//   - Lookahead/lookbehind
-//   - Backreferences
-//   - Unicode categories
-//   - Named groups
-
-const values = @import("values.sig");
-
+// Bounded, allocator-free regex engine for the VM's byte strings.
+// Supports ASCII classes, captures, alternatives, greedy/lazy repetition and
+// g/i/m/s/y. Unsupported syntax fails compilation; no partial pattern matching.
 pub const MAX_CAPTURES: usize = 16;
-pub const MAX_PATTERN: usize = 256;
+pub const MAX_PATTERN: usize = 1024;
+const MAX_CODE = 4096;
+const NONE: u16 = 0xFFFF;
+pub const Flags = struct { global: bool = false, ignore_case: bool = false, multiline: bool = false, dot_all: bool = false, sticky: bool = false };
+pub const Capture = struct { start: u32 = 0, len: u32 = 0, matched: bool = false };
+pub const Match = struct { matched: bool = false, exhausted: bool = false, start: u32 = 0, len: u32 = 0, captures: [MAX_CAPTURES]Capture = [_]Capture{.{}} ** MAX_CAPTURES, n_captures: u8 = 0 };
+const Kind = enum { empty, literal, dot, class, start, end, boundary, nonboundary, sequence, alternate, capture, repeat };
+const Node = struct { kind: Kind, left: u16 = NONE, right: u16 = NONE, value: u16 = 0, min: u16 = 0, max: u16 = 0, lazy: bool = false };
+const Op = enum { literal, dot, class, start, end, boundary, nonboundary, save, clear_captures, split, jump, accept };
+const Inst = struct { op: Op, value: u16 = 0, x: u16 = 0, y: u16 = 0, loop_id: u8 = 0xFF };
+const Thread = struct { pc: u16 = 0, pos: u32 = 0, captures: [MAX_CAPTURES * 2]u32 = [_]u32{0xFFFFFFFF} ** (MAX_CAPTURES * 2), loops: [32]u32 = [_]u32{0xFFFFFFFF} ** 32 };
+var nodes: [MAX_PATTERN]Node = undefined;
+var node_count: u16 = 0;
+var classes: [128][32]u8 = undefined;
+var class_negated: [128]bool = undefined;
+var class_count: u16 = 0;
+var code: [MAX_CODE]Inst = undefined;
+var code_count: u16 = 0;
+var captures: u8 = 0;
+var loops: u8 = 0;
+var input: []const u8 = "";
+var cursor: usize = 0;
+var failed = false;
+var options: Flags = .{};
 
-/// A regex match result.
-pub const Match = struct {
-    matched: bool = false,
-    start: u32 = 0,
-    len: u32 = 0,
-    captures: [MAX_CAPTURES]Capture = undefined,
-    n_captures: u8 = 0,
-};
-
-pub const Capture = struct {
-    start: u32 = 0,
-    len: u32 = 0,
-};
-
-// ── Compiled pattern ──
-
-const OpCode = enum(u8) {
-    lit, // match literal byte
-    dot, // match any byte
-    class, // match character class [start..end in class_buf]
-    neg_class, // match negated class
-    start_anchor, // ^
-    end_anchor, // $
-    group_start, // ( start capture
-    group_end, // ) end capture
-    split, // alternation: try left, then jump
-    jump, // unconditional jump
-    match, // successful match
-};
-
-const Inst = struct {
-    op: OpCode = .lit,
-    ch: u8 = 0, // for .lit
-    class_start: u8 = 0,
-    class_len: u8 = 0,
-    target: u8 = 0, // jump/split target
-    capture_id: u8 = 0,
-};
-
-var program: [MAX_PATTERN]Inst = undefined;
-var prog_len: u8 = 0;
-var class_buf: [512]u8 = undefined; // character class ranges stored here
-var class_used: u16 = 0;
-
-// ── Public API ──
-
-/// Compile a regex pattern string.
-/// Returns true on success.
-pub fn compile(pattern: []const u8) bool {
-    prog_len = 0;
-    class_used = 0;
-    var i: usize = 0;
-    var capture_id: u8 = 0;
-
-    while (i < pattern.len and prog_len < MAX_PATTERN) {
-        const c = pattern[i];
-        switch (c) {
-            '.' => { emit(.dot, 0); i += 1; },
-            '^' => { emit(.start_anchor, 0); i += 1; },
-            '$' => { emit(.end_anchor, 0); i += 1; },
-            '(' => { emitGroup(.group_start, capture_id); capture_id += 1; i += 1; },
-            ')' => { emitGroup(.group_end, capture_id -| 1); i += 1; },
-            '[' => { i = compileClass(pattern, i); },
-            '\\' => { i = compileEscape(pattern, i); },
-            '|' => { emit(.split, 0); i += 1; }, // simplified
-            else => { emit(.lit, c); i += 1; },
-        }
-
-        // Quantifiers
-        if (i < pattern.len) {
-            const q = pattern[i];
-            if (q == '*' or q == '+' or q == '?') {
-                // For now: quantifiers are handled by the matcher as greedy
-                // Mark the last instruction with repetition info (stored in .target)
-                if (prog_len > 0) {
-                    program[prog_len - 1].target = switch (q) {
-                        '*' => 1,
-                        '+' => 2,
-                        '?' => 3,
-                        else => 0,
-                    };
-                }
-                i += 1;
-            }
-        }
+pub fn parseFlags(text: []const u8) ?Flags {
+    var flags = Flags{}; var seen: u16 = 0;
+    for (text) |c| {
+        const bit: u16 = switch (c) { 'g' => 1, 'i' => 2, 'm' => 4, 's' => 8, 'y' => 16, else => return null };
+        if (seen & bit != 0) return null;
+        seen |= bit;
+        switch (c) { 'g' => flags.global = true, 'i' => flags.ignore_case = true, 'm' => flags.multiline = true, 's' => flags.dot_all = true, 'y' => flags.sticky = true, else => unreachable }
     }
-    emit(.match, 0);
-    return true;
+    return flags;
 }
-
-/// Execute the compiled pattern against a string.
-/// Returns match result with captures.
-pub fn exec(text: []const u8) Match {
-    // Try matching at each position (unless anchored)
-    if (prog_len > 0 and program[0].op == .start_anchor) {
-        return tryMatch(text, 0);
-    }
-    for (0..text.len) |start| {
-        const m = tryMatch(text, start);
-        if (m.matched) return m;
+pub fn compile(pattern: []const u8) bool { return compileFlags(pattern, .{}); }
+pub fn compileFlags(pattern: []const u8, flags: Flags) bool {
+    node_count = 0; class_count = 0; code_count = 0; captures = 0; loops = 0;
+    input = pattern; cursor = 0; failed = pattern.len > MAX_PATTERN; options = flags;
+    const root = parseAlternate(0);
+    if (cursor != input.len) failed = true;
+    if (!failed) compileNode(root, 0);
+    _ = emit(.{ .op = .accept });
+    return !failed;
+}
+pub fn exec(text: []const u8) Match { return execFrom(text, 0); }
+pub fn execFrom(text: []const u8, offset: usize) Match {
+    if (failed or offset > text.len) return .{};
+    var start = offset; var budget: usize = 4 * 1024 * 1024;
+    while (start <= text.len) : (start += 1) {
+        const result = matchAt(text, start, &budget);
+        if (result.matched or result.exhausted) return result;
+        if (options.sticky) break;
     }
     return .{};
 }
-
-/// Test if pattern matches anywhere in text.
-pub fn matches(text: []const u8) bool {
-    return exec(text).matched;
+pub fn matches(text: []const u8) bool { return exec(text).matched; }
+pub fn testPattern(pattern: []const u8, text: []const u8) bool { return compile(pattern) and matches(text); }
+fn newNode(node: Node) u16 {
+    if (node_count >= nodes.len) { failed = true; return 0; }
+    const id = node_count; nodes[id] = node; node_count += 1; return id;
 }
-
-/// Simple regex test without pre-compilation (convenience).
-pub fn testPattern(pattern: []const u8, text: []const u8) bool {
-    if (!compile(pattern)) return false;
-    return matches(text);
+fn parseAlternate(depth: u16) u16 {
+    if (depth > 64) { failed = true; return newNode(.{ .kind = .empty }); }
+    var left = parseSequence(depth + 1);
+    while (cursor < input.len and input[cursor] == '|') {
+        cursor += 1; const right = parseSequence(depth + 1);
+        left = newNode(.{ .kind = .alternate, .left = left, .right = right });
+    }
+    return left;
 }
-
-/// Split a string by regex pattern.
-/// Returns number of parts written to `out`.
-pub fn split(text: []const u8, pattern: []const u8, out: *[64]u32, out_lens: *[64]u16) u8 {
-    if (!compile(pattern)) {
-        if (text.len > 0) { out[0] = 0; out_lens[0] = @intCast(text.len); return 1; }
-        return 0;
+fn parseSequence(depth: u16) u16 {
+    var left = newNode(.{ .kind = .empty });
+    while (cursor < input.len and input[cursor] != ')' and input[cursor] != '|' and !failed) {
+        const right = parseRepeated(depth + 1);
+        left = newNode(.{ .kind = .sequence, .left = left, .right = right });
     }
-    var count: u8 = 0;
-    var pos: usize = 0;
-    while (pos < text.len and count < 64) {
-        const m = tryMatch(text, pos);
-        if (m.matched and m.len > 0) {
-            out[count] = @intCast(pos);
-            out_lens[count] = @intCast(m.start - @as(u32, @intCast(pos)));
-            count += 1;
-            pos = m.start + m.len;
-        } else {
-            break;
-        }
-    }
-    // Remaining
-    if (pos <= text.len and count < 64) {
-        out[count] = @intCast(pos);
-        out_lens[count] = @intCast(text.len - pos);
-        count += 1;
-    }
-    return count;
+    return left;
 }
-
-// ── Internal Matching ──
-
-fn tryMatch(text: []const u8, start: usize) Match {
-    var result = Match{ .start = @intCast(start) };
-    var pos = start;
-    var pc: u8 = 0;
-
-    while (pc < prog_len) {
-        const inst = program[pc];
+fn parseRepeated(depth: u16) u16 {
+    const atom = parseAtom(depth + 1);
+    if (cursor == input.len) return atom;
+    var min: u16 = 0; var max: u16 = 0;
+    switch (input[cursor]) {
+        '*' => { min = 0; max = NONE; cursor += 1; },
+        '+' => { min = 1; max = NONE; cursor += 1; },
+        '?' => { min = 0; max = 1; cursor += 1; },
+        '{' => {
+            cursor += 1; min = parseInteger(); max = min;
+            if (cursor < input.len and input[cursor] == ',') {
+                cursor += 1; max = if (cursor < input.len and input[cursor] == '}') NONE else parseInteger();
+            }
+            if (cursor == input.len or input[cursor] != '}' or max < min) { failed = true; return atom; }
+            cursor += 1;
+        },
+        else => return atom,
+    }
+    var lazy = false;
+    if (cursor < input.len and input[cursor] == '?') { lazy = true; cursor += 1; }
+    return newNode(.{ .kind = .repeat, .left = atom, .min = min, .max = max, .lazy = lazy });
+}
+fn parseInteger() u16 {
+    var n: u16 = 0; const before = cursor;
+    while (cursor < input.len and input[cursor] >= '0' and input[cursor] <= '9') {
+        if (n > 400) { failed = true; return 0; }
+        n = n * 10 + input[cursor] - '0'; cursor += 1;
+    }
+    if (before == cursor or n > 1024) failed = true;
+    return n;
+}
+fn parseAtom(depth: u16) u16 {
+    if (depth > 64 or cursor >= input.len) { failed = true; return newNode(.{ .kind = .empty }); }
+    const c = input[cursor]; cursor += 1;
+    switch (c) {
+        '.' => return newNode(.{ .kind = .dot }),
+        '^' => return newNode(.{ .kind = .start }),
+        '$' => return newNode(.{ .kind = .end }),
+        '(' => {
+            var capture = true;
+            if (cursor < input.len and input[cursor] == '?') {
+                cursor += 1;
+                if (cursor == input.len or input[cursor] != ':') { failed = true; return newNode(.{ .kind = .empty }); }
+                cursor += 1; capture = false;
+            }
+            const id = captures;
+            if (capture) { if (captures == MAX_CAPTURES) failed = true else captures += 1; }
+            const child = parseAlternate(depth + 1);
+            if (cursor == input.len or input[cursor] != ')') failed = true else cursor += 1;
+            return if (capture) newNode(.{ .kind = .capture, .left = child, .value = id }) else child;
+        },
+        '[' => return parseClass(),
+        '\\' => {
+            if (cursor == input.len) { failed = true; return newNode(.{ .kind = .empty }); }
+            const e = input[cursor]; cursor += 1;
+            if (e == 'b' or e == 'B') return newNode(.{ .kind = if (e == 'b') .boundary else .nonboundary });
+            if (e >= '1' and e <= '9') { failed = true; return newNode(.{ .kind = .empty }); }
+            if (isShorthand(e)) {
+                const id = allocClass(); addShorthand(id, e);
+                return newNode(.{ .kind = .class, .value = id });
+            }
+            return newNode(.{ .kind = .literal, .value = escapedByte(e) });
+        },
+        '*', '+', '?', ')' => { failed = true; return newNode(.{ .kind = .empty }); },
+        else => return newNode(.{ .kind = .literal, .value = c }),
+    }
+}
+fn escapedByte(c: u8) u8 {
+    switch (c) {
+        'n' => return '\n', 'r' => return '\r', 't' => return '\t', 'f' => return 12, 'v' => return 11, '0' => return 0,
+        'x', 'u' => {
+            const digits: usize = if (c == 'x') 2 else 4;
+            if (cursor + digits > input.len) { failed = true; return 0; }
+            var n: u16 = 0;
+            for (input[cursor..][0..digits]) |b| {
+                const v: u16 = if (b >= '0' and b <= '9') b - '0' else if (b >= 'a' and b <= 'f') b - 'a' + 10 else if (b >= 'A' and b <= 'F') b - 'A' + 10 else blk: { failed = true; break :blk 0; };
+                n = n * 16 + v;
+            }
+            cursor += digits;
+            if (n > 255) failed = true;
+            return @truncate(n);
+        },
+        else => return c,
+    }
+}
+fn allocClass() u16 {
+    if (class_count == classes.len) { failed = true; return 0; }
+    const id = class_count; classes[id] = [_]u8{0} ** 32; class_negated[id] = false; class_count += 1; return id;
+}
+fn classAdd(id: u16, c: u8) void { classes[id][c / 8] |= @as(u8, 1) << @intCast(c % 8); }
+fn isShorthand(c: u8) bool { return c == 'd' or c == 'D' or c == 'w' or c == 'W' or c == 's' or c == 'S'; }
+fn isWord(c: u8) bool { return c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z' or c >= '0' and c <= '9' or c == '_'; }
+fn addShorthand(id: u16, shorthand: u8) void {
+    for (0..256) |n| {
+        const c: u8 = @intCast(n);
+        const base = switch (shorthand) { 'd', 'D' => c >= '0' and c <= '9', 'w', 'W' => isWord(c), else => c == ' ' or c >= 9 and c <= 13 };
+        if (base != (shorthand == 'D' or shorthand == 'W' or shorthand == 'S')) classAdd(id, c);
+    }
+}
+fn classByte() ?u8 {
+    if (cursor == input.len) { failed = true; return 0; }
+    const c = input[cursor]; cursor += 1;
+    if (c != '\\') return c;
+    if (cursor == input.len) { failed = true; return 0; }
+    const e = input[cursor]; cursor += 1;
+    if (isShorthand(e)) return null;
+    return if (e == 'b') 8 else escapedByte(e);
+}
+fn parseClass() u16 {
+    const id = allocClass(); var negate = false;
+    if (cursor < input.len and input[cursor] == '^') { negate = true; cursor += 1; }
+    while (cursor < input.len and input[cursor] != ']' and !failed) {
+        const start = classByte();
+        if (start) |a| {
+            if (cursor + 1 < input.len and input[cursor] == '-' and input[cursor + 1] != ']') {
+                cursor += 1;
+                const b = classByte() orelse { failed = true; break; };
+                if (b < a) { failed = true; break; }
+                var c: u16 = a; while (c <= b) : (c += 1) classAdd(id, @intCast(c));
+            } else classAdd(id, a);
+        } else addShorthand(id, input[cursor - 1]);
+    }
+    if (cursor == input.len) failed = true else cursor += 1;
+    class_negated[id] = negate;
+    return newNode(.{ .kind = .class, .value = id });
+}
+fn emit(inst: Inst) u16 {
+    if (code_count >= code.len) { failed = true; return 0; }
+    const at = code_count; code[at] = inst; code_count += 1; return at;
+}
+fn compileNode(id: u16, depth: u16) void {
+    if (failed or depth > MAX_PATTERN) { failed = true; return; }
+    const node = nodes[id];
+    switch (node.kind) {
+        .empty => {},
+        .literal => { _ = emit(.{ .op = .literal, .value = node.value }); },
+        .dot => { _ = emit(.{ .op = .dot }); },
+        .class => { _ = emit(.{ .op = .class, .value = node.value }); },
+        .start => { _ = emit(.{ .op = .start }); },
+        .end => { _ = emit(.{ .op = .end }); },
+        .boundary => { _ = emit(.{ .op = .boundary }); },
+        .nonboundary => { _ = emit(.{ .op = .nonboundary }); },
+        .sequence => { compileNode(node.left, depth + 1); compileNode(node.right, depth + 1); },
+        .alternate => {
+            const branch = emit(.{ .op = .split }); code[branch].x = code_count;
+            compileNode(node.left, depth + 1); const skip = emit(.{ .op = .jump });
+            code[branch].y = code_count; compileNode(node.right, depth + 1); code[skip].x = code_count;
+        },
+        .capture => {
+            _ = emit(.{ .op = .save, .value = node.value * 2 }); compileNode(node.left, depth + 1);
+            _ = emit(.{ .op = .save, .value = node.value * 2 + 1 });
+        },
+        .repeat => {
+            for (0..node.min) |_| compileRepeatedAtom(node.left, depth + 1);
+            if (node.max == NONE) {
+                if (loops == 32) { failed = true; return; }
+                const loop_id = loops; loops += 1;
+                const branch = emit(.{ .op = .split, .loop_id = loop_id }); const body = code_count;
+                compileRepeatedAtom(node.left, depth + 1); _ = emit(.{ .op = .jump, .x = branch });
+                code[branch].x = if (node.lazy) code_count else body;
+                code[branch].y = if (node.lazy) body else code_count;
+            } else for (0..node.max - node.min) |_| {
+                const branch = emit(.{ .op = .split }); const body = code_count;
+                compileRepeatedAtom(node.left, depth + 1);
+                code[branch].x = if (node.lazy) code_count else body;
+                code[branch].y = if (node.lazy) body else code_count;
+            }
+        },
+    }
+}
+fn captureMask(id: u16) u16 {
+    const node = nodes[id];
+    return switch (node.kind) {
+        .capture => (@as(u16, 1) << @intCast(node.value)) | captureMask(node.left),
+        .sequence, .alternate => captureMask(node.left) | captureMask(node.right),
+        .repeat => captureMask(node.left),
+        else => 0,
+    };
+}
+fn compileRepeatedAtom(id: u16, depth: u16) void {
+    const mask = captureMask(id);
+    if (mask != 0) _ = emit(.{ .op = .clear_captures, .value = mask });
+    compileNode(id, depth);
+}
+fn lineTerminator(c: u8) bool { return c == '\n' or c == '\r'; }
+fn lower(c: u8) u8 { return if (c >= 'A' and c <= 'Z') c + 32 else c; }
+fn classHas(id: u16, c: u8) bool { return classes[id][c / 8] & (@as(u8, 1) << @intCast(c % 8)) != 0; }
+fn classMatches(id: u16, c: u8) bool {
+    const present = classHas(id, c) or options.ignore_case and (classHas(id, lower(c)) or (c >= 'a' and c <= 'z' and classHas(id, c - 32)));
+    return present != class_negated[id];
+}
+fn matchAt(text: []const u8, start: usize, budget: *usize) Match {
+    var backtrack: [1024]Thread = undefined; var count: usize = 0;
+    var thread = Thread{ .pos = @intCast(start) };
+    while (true) {
+        if (budget.* == 0) return .{ .exhausted = true };
+        budget.* -= 1;
+        const inst = code[thread.pc]; const pos = thread.pos; var success = true;
         switch (inst.op) {
-            .match => {
-                result.matched = true;
-                result.len = @intCast(pos - start);
+            .accept => {
+                var result = Match{ .matched = true, .start = @intCast(start), .len = @intCast(pos - start), .n_captures = captures };
+                for (0..captures) |i| {
+                    const a = thread.captures[i * 2]; const b = thread.captures[i * 2 + 1];
+                    if (a != 0xFFFFFFFF and b != 0xFFFFFFFF and b >= a) result.captures[i] = .{ .start = a, .len = b - a, .matched = true };
+                }
                 return result;
             },
-            .lit => {
-                if (!matchWithQuantifier(text, &pos, inst)) return .{};
-                pc += 1;
+            .literal => { success = pos < text.len and (text[pos] == inst.value or options.ignore_case and lower(text[pos]) == lower(@intCast(inst.value))); if (success) thread.pos += 1; thread.pc += 1; },
+            .dot => { success = pos < text.len and (options.dot_all or !lineTerminator(text[pos])); if (success) thread.pos += 1; thread.pc += 1; },
+            .class => {
+                success = pos < text.len and classMatches(inst.value, text[pos]);
+                if (success) thread.pos += 1; thread.pc += 1;
             },
-            .dot => {
-                if (!matchWithQuantifier(text, &pos, inst)) return .{};
-                pc += 1;
-            },
-            .class, .neg_class => {
-                if (!matchWithQuantifier(text, &pos, inst)) return .{};
-                pc += 1;
-            },
-            .start_anchor => {
-                if (pos != 0) return .{};
-                pc += 1;
-            },
-            .end_anchor => {
-                if (pos != text.len) return .{};
-                pc += 1;
-            },
-            .group_start => {
-                if (inst.capture_id < MAX_CAPTURES) {
-                    result.captures[inst.capture_id].start = @intCast(pos);
-                    if (inst.capture_id >= result.n_captures) result.n_captures = inst.capture_id + 1;
+            .start => { success = pos == 0 or options.multiline and pos > 0 and lineTerminator(text[pos - 1]); thread.pc += 1; },
+            .end => { success = pos == text.len or options.multiline and pos < text.len and lineTerminator(text[pos]); thread.pc += 1; },
+            .boundary, .nonboundary => { const boundary = (pos > 0 and isWord(text[pos - 1])) != (pos < text.len and isWord(text[pos])); success = boundary == (inst.op == .boundary); thread.pc += 1; },
+            .save => { thread.captures[inst.value] = pos; thread.pc += 1; },
+            .clear_captures => {
+                for (0..MAX_CAPTURES) |i| {
+                    if (inst.value & (@as(u16, 1) << @intCast(i)) != 0) {
+                        thread.captures[i * 2] = 0xFFFFFFFF; thread.captures[i * 2 + 1] = 0xFFFFFFFF;
+                    }
                 }
-                pc += 1;
+                thread.pc += 1;
             },
-            .group_end => {
-                if (inst.capture_id < MAX_CAPTURES) {
-                    result.captures[inst.capture_id].len = @intCast(pos - result.captures[inst.capture_id].start);
-                }
-                pc += 1;
-            },
+            .jump => thread.pc = inst.x,
             .split => {
-                // Try next instruction; if fail, continue after split
-                pc += 1; // simplified: just continue
-            },
-            .jump => {
-                pc = inst.target;
+                if (inst.loop_id != 0xFF and thread.loops[inst.loop_id] == pos) { thread.pc = @max(inst.x, inst.y); continue; }
+                if (inst.loop_id != 0xFF) thread.loops[inst.loop_id] = pos;
+                if (count == backtrack.len) return .{ .exhausted = true };
+                backtrack[count] = thread; backtrack[count].pc = inst.y; count += 1; thread.pc = inst.x;
             },
         }
-    }
-    return .{};
-}
-
-fn matchWithQuantifier(text: []const u8, pos: *usize, inst: Inst) bool {
-    switch (inst.target) {
-        0 => { // no quantifier: exactly one
-            return matchOne(text, pos, inst);
-        },
-        1 => { // * : zero or more (greedy)
-            while (pos.* < text.len and matchOneNoAdvance(text, pos.*, inst)) pos.* += 1;
-            return true; // zero is fine
-        },
-        2 => { // + : one or more
-            if (!matchOne(text, pos, inst)) return false;
-            while (pos.* < text.len and matchOneNoAdvance(text, pos.*, inst)) pos.* += 1;
-            return true;
-        },
-        3 => { // ? : zero or one
-            if (pos.* < text.len and matchOneNoAdvance(text, pos.*, inst)) pos.* += 1;
-            return true;
-        },
-        else => return matchOne(text, pos, inst),
+        if (!success) { if (count == 0) return .{}; count -= 1; thread = backtrack[count]; }
     }
 }
-
-fn matchOne(text: []const u8, pos: *usize, inst: Inst) bool {
-    if (pos.* >= text.len) return false;
-    const c = text[pos.*];
-    const ok = switch (inst.op) {
-        .lit => c == inst.ch,
-        .dot => c != '\n',
-        .class => classContains(inst.class_start, inst.class_len, c),
-        .neg_class => !classContains(inst.class_start, inst.class_len, c),
-        else => false,
-    };
-    if (ok) pos.* += 1;
-    return ok;
-}
-
-fn matchOneNoAdvance(text: []const u8, pos: usize, inst: Inst) bool {
-    if (pos >= text.len) return false;
-    const c = text[pos];
-    return switch (inst.op) {
-        .lit => c == inst.ch,
-        .dot => c != '\n',
-        .class => classContains(inst.class_start, inst.class_len, c),
-        .neg_class => !classContains(inst.class_start, inst.class_len, c),
-        else => false,
-    };
-}
-
-fn classContains(start: u8, len: u8, c: u8) bool {
-    var i: u16 = start;
-    const end: u16 = @as(u16, start) + len;
-    while (i + 1 < end) : (i += 2) {
-        if (c >= class_buf[i] and c <= class_buf[i + 1]) return true;
+pub fn split(text: []const u8, pattern: []const u8, out: *[64]u32, out_lens: *[64]u16) u8 {
+    if (!compile(pattern)) return 0;
+    var n: u8 = 0; var from: usize = 0; var scan: usize = 0;
+    while (scan <= text.len and n < 63) {
+        const m = execFrom(text, scan); if (!m.matched) break;
+        if (m.len == 0 and m.start == from) { scan = m.start + 1; continue; }
+        out[n] = @intCast(from); out_lens[n] = @intCast(@min(m.start - from, 65535)); n += 1;
+        from = m.start + m.len; scan = from + @intFromBool(m.len == 0);
     }
-    return false;
-}
-
-// ── Pattern Compilation Helpers ──
-
-fn emit(op: OpCode, ch: u8) void {
-    if (prog_len >= MAX_PATTERN) return;
-    program[prog_len] = .{ .op = op, .ch = ch };
-    prog_len += 1;
-}
-
-fn emitGroup(op: OpCode, id: u8) void {
-    if (prog_len >= MAX_PATTERN) return;
-    program[prog_len] = .{ .op = op, .capture_id = id };
-    prog_len += 1;
-}
-
-fn compileClass(pattern: []const u8, start: usize) usize {
-    var i = start + 1; // skip [
-    var negated = false;
-    if (i < pattern.len and pattern[i] == '^') { negated = true; i += 1; }
-
-    const class_start: u8 = @intCast(class_used);
-    while (i < pattern.len and pattern[i] != ']') {
-        if (i + 2 < pattern.len and pattern[i + 1] == '-') {
-            // Range: a-z
-            if (class_used + 2 <= 512) {
-                class_buf[class_used] = pattern[i];
-                class_buf[class_used + 1] = pattern[i + 2];
-                class_used += 2;
-            }
-            i += 3;
-        } else {
-            // Single char
-            if (class_used + 2 <= 512) {
-                class_buf[class_used] = pattern[i];
-                class_buf[class_used + 1] = pattern[i];
-                class_used += 2;
-            }
-            i += 1;
-        }
-    }
-    if (i < pattern.len) i += 1; // skip ]
-
-    const class_len: u8 = @intCast(class_used - class_start);
-    if (prog_len < MAX_PATTERN) {
-        program[prog_len] = .{
-            .op = if (negated) .neg_class else .class,
-            .class_start = class_start,
-            .class_len = class_len,
-        };
-        prog_len += 1;
-    }
-    return i;
-}
-
-fn compileEscape(pattern: []const u8, start: usize) usize {
-    if (start + 1 >= pattern.len) { emit(.lit, '\\'); return start + 1; }
-    const c = pattern[start + 1];
-    switch (c) {
-        'd' => emitShorthandClass('0', '9', false),
-        'D' => emitShorthandClass('0', '9', true),
-        'w' => { emitWordClass(false); },
-        'W' => { emitWordClass(true); },
-        's' => emitWhitespaceClass(false),
-        'S' => emitWhitespaceClass(true),
-        'n' => emit(.lit, '\n'),
-        'r' => emit(.lit, '\r'),
-        't' => emit(.lit, '\t'),
-        '0' => emit(.lit, 0),
-        else => emit(.lit, c), // escaped literal
-    }
-    return start + 2;
-}
-
-fn emitShorthandClass(lo: u8, hi: u8, negated: bool) void {
-    const cs: u8 = @intCast(class_used);
-    if (class_used + 2 <= 512) {
-        class_buf[class_used] = lo;
-        class_buf[class_used + 1] = hi;
-        class_used += 2;
-    }
-    if (prog_len < MAX_PATTERN) {
-        program[prog_len] = .{
-            .op = if (negated) .neg_class else .class,
-            .class_start = cs,
-            .class_len = 2,
-        };
-        prog_len += 1;
-    }
-}
-
-fn emitWordClass(negated: bool) void {
-    const cs: u8 = @intCast(class_used);
-    // [a-zA-Z0-9_]
-    if (class_used + 8 <= 512) {
-        class_buf[class_used] = 'a'; class_buf[class_used + 1] = 'z'; class_used += 2;
-        class_buf[class_used] = 'A'; class_buf[class_used + 1] = 'Z'; class_used += 2;
-        class_buf[class_used] = '0'; class_buf[class_used + 1] = '9'; class_used += 2;
-        class_buf[class_used] = '_'; class_buf[class_used + 1] = '_'; class_used += 2;
-    }
-    if (prog_len < MAX_PATTERN) {
-        program[prog_len] = .{
-            .op = if (negated) .neg_class else .class,
-            .class_start = cs,
-            .class_len = 8,
-        };
-        prog_len += 1;
-    }
-}
-
-fn emitWhitespaceClass(negated: bool) void {
-    const cs: u8 = @intCast(class_used);
-    // [ \t\n\r]
-    if (class_used + 8 <= 512) {
-        class_buf[class_used] = ' '; class_buf[class_used + 1] = ' '; class_used += 2;
-        class_buf[class_used] = '\t'; class_buf[class_used + 1] = '\t'; class_used += 2;
-        class_buf[class_used] = '\n'; class_buf[class_used + 1] = '\n'; class_used += 2;
-        class_buf[class_used] = '\r'; class_buf[class_used + 1] = '\r'; class_used += 2;
-    }
-    if (prog_len < MAX_PATTERN) {
-        program[prog_len] = .{
-            .op = if (negated) .neg_class else .class,
-            .class_start = cs,
-            .class_len = 8,
-        };
-        prog_len += 1;
-    }
+    out[n] = @intCast(from); out_lens[n] = @intCast(@min(text.len - from, 65535)); return n + 1;
 }

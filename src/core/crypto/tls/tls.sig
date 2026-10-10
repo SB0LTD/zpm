@@ -20,7 +20,10 @@ const sha256 = @import("sha256");
 const hkdf = @import("hkdf");
 const gcm = @import("gcm");
 const x25519 = @import("x25519");
+const p256 = @import("p256");
 const keysched = @import("tls13_keys");
+const keysched384 = @import("keysched384.sig");
+const chacha = @import("chacha20poly1305");
 const x509 = @import("x509.sig");
 const verify = @import("x509_verify.sig");
 const ca_bundle = @import("ca_bundle.sig");
@@ -54,7 +57,15 @@ const HS_KEY_UPDATE: u8 = 24;
 const TLS12: u16 = 0x0303;
 const TLS13: u16 = 0x0304;
 const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
+const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 const GROUP_X25519: u16 = 0x001d;
+const GROUP_SECP256R1: u16 = 0x0017;
+// SHA-256("HelloRetryRequest") — a ServerHello carrying this random IS an HRR.
+const HRR_RANDOM = [32]u8{
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+};
 
 // Signature scheme code points (for CertificateVerify + sig_algs extension).
 const SIG_RSA_PKCS1_SHA256: u16 = 0x0401;
@@ -62,6 +73,7 @@ const SIG_RSA_PKCS1_SHA384: u16 = 0x0501;
 const SIG_RSA_PKCS1_SHA512: u16 = 0x0601;
 const SIG_RSA_PSS_SHA256: u16 = 0x0804;
 const SIG_RSA_PSS_SHA384: u16 = 0x0805;
+const SIG_RSA_PSS_SHA512: u16 = 0x0806;
 const SIG_ECDSA_SHA256: u16 = 0x0403;
 const SIG_ECDSA_SHA384: u16 = 0x0503;
 
@@ -109,32 +121,113 @@ const Transcript = struct {
     fn hash(self: *const Transcript) [32]u8 {
         return sha256.hash(self.buf[0..self.len]);
     }
+    fn hash384(self: *const Transcript) [48]u8 {
+        return keysched384.sha384over(self.buf[0..self.len]);
+    }
 };
 
-/// AEAD record protection state for one direction.
+/// AEAD algorithm negotiated for the session.
+const Aead = enum { aes128_gcm, aes256_gcm, chacha20_poly1305 };
+const HashId = enum { sha256, sha384 };
+
+/// Cipher-suite descriptor. The server selects one of these in ServerHello.
+const Suite = struct {
+    id: u16,
+    hash: HashId,
+    aead: Aead,
+    key_len: usize,
+    hash_len: usize,
+};
+
+const SUITE_AES128: Suite = .{ .id = TLS_AES_128_GCM_SHA256, .hash = .sha256, .aead = .aes128_gcm, .key_len = 16, .hash_len = 32 };
+const SUITE_AES256: Suite = .{ .id = TLS_AES_256_GCM_SHA384, .hash = .sha384, .aead = .aes256_gcm, .key_len = 32, .hash_len = 48 };
+const SUITE_CHACHA: Suite = .{ .id = TLS_CHACHA20_POLY1305_SHA256, .hash = .sha256, .aead = .chacha20_poly1305, .key_len = 32, .hash_len = 32 };
+
+fn suiteById(id: u16) ?Suite {
+    if (id == SUITE_AES128.id) return SUITE_AES128;
+    if (id == SUITE_AES256.id) return SUITE_AES256;
+    if (id == SUITE_CHACHA.id) return SUITE_CHACHA;
+    return null;
+}
+
+/// AEAD record protection state for one direction. Holds whichever AEAD the
+/// negotiated suite selected; the per-record nonce construction is identical
+/// across all three (RFC 8446 Section 5.3).
 const RecordKeys = struct {
-    aead: gcm.Gcm,
-    iv: [12]u8,
+    aead: Aead = .aes128_gcm,
+    gcm128: gcm.Gcm = undefined,
+    gcm256: gcm.Gcm256 = undefined,
+    chacha_key: [32]u8 = undefined,
+    iv: [12]u8 = @splat(0),
     seq: u64 = 0,
 
+    /// AES-128-GCM-SHA256 default path. Byte-identical to the original init:
+    /// derive 16-byte key + 12-byte iv via the SHA-256 schedule, build AES-128-GCM.
     fn init(secret: *const [32]u8) RecordKeys {
         var key: [16]u8 = undefined;
         var iv: [12]u8 = undefined;
         keysched.deriveTrafficKeys(secret, &key, &iv);
-        return .{ .aead = gcm.Gcm.init(&key), .iv = iv };
+        return .{ .aead = .aes128_gcm, .gcm128 = gcm.Gcm.init(&key), .iv = iv };
     }
 
-    /// Per-record nonce (RFC 8446 §5.3): the 64-bit sequence number, big-endian,
-    /// is left-padded to the IV length and XORed with the static IV. So the
-    /// sequence occupies the LAST 8 bytes: its LSB lands at n[11].
+    /// Build record keys for an arbitrary suite from its traffic secret.
+    /// `secret` is hash_len bytes (32 for SHA-256 suites, 48 for SHA-384).
+    fn initSuite(suite: Suite, secret: []const u8) RecordKeys {
+        var rk = RecordKeys{ .aead = suite.aead };
+        switch (suite.hash) {
+            .sha256 => {
+                var s32: [32]u8 = undefined;
+                @memcpy(&s32, secret[0..32]);
+                switch (suite.aead) {
+                    .aes128_gcm => {
+                        var key: [16]u8 = undefined;
+                        keysched.deriveTrafficKeys(&s32, &key, &rk.iv);
+                        rk.gcm128 = gcm.Gcm.init(&key);
+                    },
+                    .chacha20_poly1305 => {
+                        _ = hkdf.expandLabel(&s32, "key", "", &rk.chacha_key, 32);
+                        _ = hkdf.expandLabel(&s32, "iv", "", &rk.iv, 12);
+                    },
+                    .aes256_gcm => unreachable, // AES-256 pairs with SHA-384
+                }
+            },
+            .sha384 => {
+                var s48: [48]u8 = undefined;
+                @memcpy(&s48, secret[0..48]);
+                var key: [32]u8 = undefined;
+                keysched384.deriveTrafficKeys(&s48, &key, &rk.iv);
+                rk.gcm256 = gcm.Gcm256.init(&key);
+            },
+        }
+        return rk;
+    }
+
     fn nonce(self: *const RecordKeys) [12]u8 {
         var n = self.iv;
         var i: usize = 0;
         while (i < 8) : (i += 1) {
-            const shift: u6 = @intCast(i * 8); // i=0 → LSB
+            const shift: u6 = @intCast(i * 8);
             n[11 - i] ^= @truncate(self.seq >> shift);
         }
         return n;
+    }
+
+    /// Seal plaintext in place and write the tag (dispatch on AEAD).
+    fn seal(self: *const RecordKeys, n: *const [12]u8, pt: []u8, aad: []const u8, tag: *[16]u8) void {
+        switch (self.aead) {
+            .aes128_gcm => self.gcm128.seal(n, pt, aad, tag),
+            .aes256_gcm => self.gcm256.seal(n, pt, aad, tag),
+            .chacha20_poly1305 => chacha.seal(&self.chacha_key, n, pt, aad, tag),
+        }
+    }
+
+    /// Open ciphertext in place; returns false on auth failure (dispatch on AEAD).
+    fn open(self: *const RecordKeys, n: *const [12]u8, ct: []u8, aad: []const u8, tag: *const [16]u8) bool {
+        return switch (self.aead) {
+            .aes128_gcm => self.gcm128.open(n, ct, aad, tag),
+            .aes256_gcm => self.gcm256.open(n, ct, aad, tag),
+            .chacha20_poly1305 => chacha.open(&self.chacha_key, n, ct, aad, tag),
+        };
     }
 };
 
@@ -148,14 +241,25 @@ pub const Conn = struct {
     // server KeyUpdate can derive secret_{N+1} = HKDF-Expand-Label(secret_N,
     // "traffic upd", "", 32) and rekey the receive direction in place (RFC 8446
     // §7.2) — otherwise every record after a KeyUpdate would fail to decrypt.
-    server_app_secret: [32]u8 = undefined,
+    suite: Suite = SUITE_AES128,
+    server_app_secret: [48]u8 = undefined,
+    // Negotiated ALPN protocol (empty if the server did not select one).
+    alpn: [32]u8 = @splat(0),
+    alpn_len: u8 = 0,
     // Leftover decrypted application bytes not yet consumed by the caller.
     inbuf: [MAX_RECORD]u8 = undefined,
     in_off: usize = 0,
     in_len: usize = 0,
     closed: bool = false,
 
-    pub fn buffered(self: *const Conn) usize { return self.in_len - self.in_off; }
+    pub fn buffered(self: *const Conn) usize {
+        return self.in_len - self.in_off;
+    }
+
+    /// The ALPN protocol the server selected (e.g. "http/1.1"), or empty.
+    pub fn negotiatedAlpn(self: *const Conn) []const u8 {
+        return self.alpn[0..self.alpn_len];
+    }
 
     /// Write application data as one or more TLS 1.3 app_data records.
     pub fn write(self: *Conn, data: []const u8) Error!void {
@@ -219,10 +323,19 @@ pub const Conn = struct {
     /// Advance the server (receive) application traffic secret one generation
     /// per RFC 8446 §7.2 and re-derive the receive key/IV. Sequence resets to 0.
     fn rekeyServer(self: *Conn) void {
-        var next: [32]u8 = undefined;
-        _ = hkdf.expandLabel(&self.server_app_secret, "traffic upd", "", &next, 32);
-        self.server_app_secret = next;
-        self.server_app = RecordKeys.init(&self.server_app_secret);
+        const hl = self.suite.hash_len;
+        var next: [48]u8 = undefined;
+        if (self.suite.hash == .sha384) {
+            keysched384.expandLabel(self.server_app_secret[0..48], "traffic upd", "", next[0..48]);
+        } else {
+            var cur: [32]u8 = undefined;
+            @memcpy(&cur, self.server_app_secret[0..32]);
+            var n32: [32]u8 = undefined;
+            _ = hkdf.expandLabel(&cur, "traffic upd", "", &n32, 32);
+            @memcpy(next[0..32], &n32);
+        }
+        @memcpy(self.server_app_secret[0..hl], next[0..hl]);
+        self.server_app = RecordKeys.initSuite(self.suite, self.server_app_secret[0..hl]);
     }
 
     pub fn close(self: *Conn) void {
@@ -249,7 +362,7 @@ pub const Conn = struct {
 
         const n = self.client_app.nonce();
         var tag: [16]u8 = undefined;
-        self.client_app.aead.seal(&n, buf[0..inner_len], &hdr, &tag);
+        self.client_app.seal(&n, buf[0..inner_len], &hdr, &tag);
         self.client_app.seq += 1;
 
         try self.transport.writeAll(&hdr);
@@ -282,7 +395,7 @@ pub const Conn = struct {
         @memcpy(&tag, self.inbuf[body_len..rec_len]);
 
         const n = self.server_app.nonce();
-        if (!self.server_app.aead.open(&n, self.inbuf[0..body_len], &hdr, &tag)) return Error.DecryptFailed;
+        if (!self.server_app.open(&n, self.inbuf[0..body_len], &hdr, &tag)) return Error.DecryptFailed;
         self.server_app.seq += 1;
 
         // Strip trailing zero padding, then the 1-byte inner content type. The
@@ -311,13 +424,25 @@ const Handshaker = struct {
     hostname: []const u8,
     now: i64,
     transcript: Transcript = .{},
-    priv: [32]u8 = undefined,
+    suite: Suite = SUITE_AES128,
+    priv: [32]u8 = undefined,            // X25519 private scalar
+    priv_p256: [32]u8 = undefined,       // P-256 private scalar (if offered)
+    hrr_done: bool = false,
+    retry_group: u16 = 0,
+    ch1_hash: [32]u8 = undefined,
+    hrr_raw: [512]u8 = undefined,
+    hrr_raw_len: usize = 0,
+    neg_alpn: [32]u8 = @splat(0),
+    neg_alpn_len: u8 = 0,
     // handshake-phase record keys
     hs_client: RecordKeys = undefined,
     hs_server: RecordKeys = undefined,
-    ks: keysched.KeySchedule = undefined,
-    client_hs_secret: [32]u8 = undefined,
-    server_hs_secret: [32]u8 = undefined,
+    ks: keysched.KeySchedule = undefined,       // SHA-256 schedule
+    ks384: keysched384.KeySchedule384 = undefined, // SHA-384 schedule
+    // Handshake traffic secrets, widened to 48 bytes; the active length is
+    // self.suite.hash_len (32 for SHA-256 suites, 48 for SHA-384).
+    client_hs_secret: [48]u8 = undefined,
+    server_hs_secret: [48]u8 = undefined,
     // reusable record read buffer
     recbuf: [MAX_RECORD]u8 = undefined,
     // scratch: raw bytes of the handshake message currently being processed
@@ -330,10 +455,27 @@ const Handshaker = struct {
     // the cert bytes before verifyChain runs).
     certbuf: [MAX_RECORD]u8 = undefined,
     certlen: usize = 0,
+    // Decrypted handshake-message bytes from the current record. TLS 1.3 servers
+    // may coalesce EE+Certificate+CertVerify+Finished into ONE record, so we
+    // buffer the plaintext and hand out one message at a time across calls.
+    hs_plain: [MAX_RECORD]u8 = undefined,
+    hs_plain_len: usize = 0,
+    hs_plain_off: usize = 0,
 
     fn run(self: *Handshaker) Error!Conn {
-        try self.sendClientHello();
-        try self.readServerHello();
+        // Send CH1 (both key shares). The transcript records CH1 via writeHandshake.
+        try self.sendClientHello(0);
+        var hrr = try self.readServerHello();
+        if (hrr) {
+            // RFC 8446 4.4.1: replace CH1 in the transcript with a synthetic
+            // message_hash, then re-add the HRR (ServerHello) that readServerHello
+            // already folded in. We rebuild the transcript from scratch here.
+            try self.rebuildTranscriptForHrr();
+            // Send CH2 with a key_share only for the requested group.
+            try self.sendClientHello(self.retry_group);
+            hrr = try self.readServerHello();
+            if (hrr) return Error.HandshakeFailed; // a second HRR is illegal
+        }
         // From here, handshake records are encrypted with handshake keys.
         try self.readEncryptedFlight();
 
@@ -342,73 +484,237 @@ const Handshaker = struct {
         // the client Finished to the transcript — the server keys its
         // application records over Hash(ClientHello…server Finished), so
         // including the client Finished here would desync every app record.
-        var c_app: [32]u8 = undefined;
-        var s_app: [32]u8 = undefined;
-        const th = self.transcript.hash();
-        self.ks.deriveApplicationSecrets(&th, &c_app, &s_app);
+        var c_app: [48]u8 = undefined;
+        var s_app: [48]u8 = undefined;
+        _ = self.deriveApp(&c_app, &s_app);
 
         // Client Finished is sent under the handshake keys; it folds itself into
         // the transcript but no longer affects the application secrets above.
         try self.sendClientFinished();
 
-        return Conn{
+        var sas: [48]u8 = undefined;
+        @memcpy(sas[0..self.suite.hash_len], s_app[0..self.suite.hash_len]);
+        var conn = Conn{
             .transport = self.transport,
-            .client_app = RecordKeys.init(&c_app),
-            .server_app = RecordKeys.init(&s_app),
-            .server_app_secret = s_app,
+            .suite = self.suite,
+            .client_app = RecordKeys.initSuite(self.suite, c_app[0..self.suite.hash_len]),
+            .server_app = RecordKeys.initSuite(self.suite, s_app[0..self.suite.hash_len]),
+            .server_app_secret = sas,
         };
+        @memcpy(conn.alpn[0..self.neg_alpn_len], self.neg_alpn[0..self.neg_alpn_len]);
+        conn.alpn_len = self.neg_alpn_len;
+        return conn;
+    }
+
+    // ── suite-aware handshake helpers (dispatch on self.suite.hash) ──
+
+    /// Transcript hash into `out` (48-byte buffer); returns the active length.
+    fn thash(self: *Handshaker, out: *[48]u8) usize {
+        if (self.suite.hash == .sha384) {
+            out.* = undefined;
+            const h = self.transcript.hash384();
+            @memcpy(out[0..48], &h);
+            return 48;
+        }
+        const h = self.transcript.hash();
+        @memcpy(out[0..32], &h);
+        return 32;
+    }
+
+    /// Derive handshake traffic secrets from the ECDHE shared secret and build
+    /// the handshake-phase RecordKeys for the negotiated suite.
+    fn deriveHandshake(self: *Handshaker, shared: []const u8) void {
+        var th: [48]u8 = undefined;
+        const hl = self.thash(&th);
+        if (self.suite.hash == .sha384) {
+            self.ks384 = keysched384.KeySchedule384.init();
+            var cs: [48]u8 = undefined;
+            var ss: [48]u8 = undefined;
+            self.ks384.deriveHandshakeSecrets(shared, th[0..48], &cs, &ss);
+            @memcpy(self.client_hs_secret[0..48], &cs);
+            @memcpy(self.server_hs_secret[0..48], &ss);
+        } else {
+            self.ks = keysched.KeySchedule.init(null);
+            var sh32: [32]u8 = undefined;
+            @memcpy(&sh32, shared[0..32]);
+            var th32: [32]u8 = undefined;
+            @memcpy(&th32, th[0..32]);
+            var cs: [32]u8 = undefined;
+            var ss: [32]u8 = undefined;
+            self.ks.deriveHandshakeSecrets(&sh32, &th32, &cs, &ss);
+            @memcpy(self.client_hs_secret[0..32], &cs);
+            @memcpy(self.server_hs_secret[0..32], &ss);
+        }
+        _ = hl;
+        self.hs_client = RecordKeys.initSuite(self.suite, self.client_hs_secret[0..self.suite.hash_len]);
+        self.hs_server = RecordKeys.initSuite(self.suite, self.server_hs_secret[0..self.suite.hash_len]);
+    }
+
+    /// Derive application traffic secrets; writes into 48-byte buffers and
+    /// returns the active length.
+    fn deriveApp(self: *Handshaker, c_app: *[48]u8, s_app: *[48]u8) usize {
+        var th: [48]u8 = undefined;
+        _ = self.thash(&th);
+        if (self.suite.hash == .sha384) {
+            var ca: [48]u8 = undefined;
+            var sa: [48]u8 = undefined;
+            self.ks384.deriveApplicationSecrets(th[0..48], &ca, &sa);
+            @memcpy(c_app[0..48], &ca);
+            @memcpy(s_app[0..48], &sa);
+            return 48;
+        }
+        var th32: [32]u8 = undefined;
+        @memcpy(&th32, th[0..32]);
+        var ca: [32]u8 = undefined;
+        var sa: [32]u8 = undefined;
+        self.ks.deriveApplicationSecrets(&th32, &ca, &sa);
+        @memcpy(c_app[0..32], &ca);
+        @memcpy(s_app[0..32], &sa);
+        return 32;
+    }
+
+    /// Finished verify_data for the given base secret; writes into `out`,
+    /// returns the active length (32 or 48).
+    fn finishedData(self: *Handshaker, base: []const u8, out: *[48]u8) usize {
+        var th: [48]u8 = undefined;
+        _ = self.thash(&th);
+        if (self.suite.hash == .sha384) {
+            var base48: [48]u8 = undefined;
+            @memcpy(&base48, base[0..48]);
+            const vd = keysched384.KeySchedule384.computeFinished(&base48, th[0..48]);
+            @memcpy(out[0..48], &vd);
+            return 48;
+        }
+        var base32: [32]u8 = undefined;
+        @memcpy(&base32, base[0..32]);
+        var th32: [32]u8 = undefined;
+        @memcpy(&th32, th[0..32]);
+        const vd = keysched.KeySchedule.computeFinished(&base32, &th32);
+        @memcpy(out[0..32], &vd);
+        return 32;
     }
 
     // ── ClientHello ──
-    fn sendClientHello(self: *Handshaker) Error!void {
-        // Generate the X25519 key pair. (Deterministic dev entropy — see note.)
-        self.priv = devScalar();
+    // only_group: 0 = offer both key shares (CH1); otherwise send a key_share only
+    // for the requested group (CH2 after a HelloRetryRequest).
+    fn sendClientHello(self: *Handshaker, only_group: u16) Error!void {
+        // Generate ephemeral keys once (CH1); reuse them for CH2 per RFC 8446.
+        if (!self.hrr_done) {
+            self.priv = devScalar();
+            self.priv_p256 = devScalar();
+        }
         const pubkey = x25519.publicKey(&self.priv);
+        var pubkey_p256: [65]u8 = undefined;
+        const have_p256 = p256.ecdhKeypair(&self.priv_p256, &pubkey_p256);
 
         var body: [1024]u8 = undefined;
         var w = Writer{ .buf = &body };
         w.putU16(TLS12); // legacy_version
         w.bytes(&devRandom()); // 32-byte random
         w.putU8(0); // legacy_session_id length 0
-        // cipher_suites
-        w.putU16(2);
+        w.putU16(6);
+        w.putU16(TLS_AES_256_GCM_SHA384);
+        w.putU16(TLS_CHACHA20_POLY1305_SHA256);
         w.putU16(TLS_AES_128_GCM_SHA256);
-        // compression_methods
         w.putU8(1);
         w.putU8(0);
-        // extensions
         var ext: [512]u8 = undefined;
         var ew = Writer{ .buf = &ext };
         writeSni(&ew, self.hostname);
         writeSupportedVersions(&ew);
         writeSupportedGroups(&ew);
         writeSigAlgs(&ew);
-        writeKeyShare(&ew, &pubkey);
+        writeAlpn(&ew);
+        if (only_group == 0) {
+            writeKeyShare(&ew, &pubkey, &pubkey_p256, have_p256);
+        } else if (only_group == GROUP_X25519) {
+            writeKeyShareOne(&ew, GROUP_X25519, &pubkey);
+        } else if (only_group == GROUP_SECP256R1 and have_p256) {
+            writeKeyShareOne(&ew, GROUP_SECP256R1, &pubkey_p256);
+        } else {
+            return Error.HandshakeFailed; // server asked for a group we cannot offer
+        }
         w.putU16(@intCast(ew.len));
         w.bytes(ew.slice());
 
-        try self.writeHandshake(HS_CLIENT_HELLO, w.slice());
+        // Build the full handshake message (header + body).
+        var hs: [4 + 1024]u8 = undefined;
+        const blen = w.len;
+        hs[0] = HS_CLIENT_HELLO;
+        hs[1] = @intCast((blen >> 16) & 0xFF);
+        hs[2] = @intCast((blen >> 8) & 0xFF);
+        hs[3] = @intCast(blen & 0xFF);
+        @memcpy(hs[4 .. 4 + blen], w.slice());
+        const full = hs[0 .. 4 + blen];
+        // On CH1, remember its hash for the possible HRR transcript substitution.
+        if (only_group == 0) self.ch1_hash = sha256.hash(full);
+        // Add to transcript + send as a plaintext handshake record.
+        self.transcript.add(full);
+        var rec: [5]u8 = .{ REC_HANDSHAKE, 0x03, 0x01, @intCast((blen + 4) >> 8), @intCast((blen + 4) & 0xFF) };
+        try self.transport.writeAll(&rec);
+        try self.transport.writeAll(full);
     }
 
-    // ── ServerHello ──
-    fn readServerHello(self: *Handshaker) Error!void {
+    /// Reset the transcript after a HelloRetryRequest per RFC 8446 4.4.1:
+    /// transcript = message_hash(Hash(CH1)) || HRR. The HRR raw bytes were saved
+    /// by readServerHello into hrr_raw.
+    fn rebuildTranscriptForHrr(self: *Handshaker) Error!void {
+        self.transcript = .{};
+        // Synthetic message_hash handshake message: type 254, len = hash len, body = Hash(CH1).
+        var synth: [4 + 32]u8 = undefined;
+        synth[0] = 254; // message_hash
+        synth[1] = 0;
+        synth[2] = 0;
+        synth[3] = 32;
+        @memcpy(synth[4..36], &self.ch1_hash);
+        self.transcript.add(&synth);
+        self.transcript.add(self.hrr_raw[0..self.hrr_raw_len]);
+        self.hrr_done = true;
+    }
+
+    // ── ServerHello (returns true if the message was a HelloRetryRequest) ──
+    fn readServerHello(self: *Handshaker) Error!bool {
         const msg = try self.readPlainHandshake();
         if (msg.msg_type != HS_SERVER_HELLO) return Error.UnexpectedMessage;
-        // Fold ServerHello into the transcript BEFORE deriving handshake secrets:
-        // the handshake traffic secrets are keyed over Hash(ClientHello‖ServerHello),
-        // so the client hash must include ServerHello or every encrypted record
-        // (starting with EncryptedExtensions) fails to decrypt.
-        self.transcript.add(msg.raw);
         var r = Reader{ .buf = msg.body };
         _ = try r.getU16(); // legacy_version
-        try r.skip(32); // random
+        const random = try r.take(32);
+        const is_hrr = eqBytes32(random, &HRR_RANDOM);
         const sid_len = try r.getU8();
         try r.skip(sid_len);
-        const suite = try r.getU16();
-        if (suite != TLS_AES_128_GCM_SHA256) return Error.UnsupportedParams;
+        const suite_id = try r.getU16();
+        self.suite = suiteById(suite_id) orelse return Error.UnsupportedParams;
         _ = try r.getU8(); // compression
-        // extensions: find key_share → server public key
-        var server_pub: [32]u8 = undefined;
+
+        if (is_hrr) {
+            // HRR: find the key_share extension carrying the requested group.
+            // Do NOT add this HRR to the live transcript yet; stash it so
+            // rebuildTranscriptForHrr can order it after the synthetic CH1 hash.
+            if (msg.raw.len > self.hrr_raw.len) return Error.HandshakeFailed;
+            @memcpy(self.hrr_raw[0..msg.raw.len], msg.raw);
+            self.hrr_raw_len = msg.raw.len;
+            const ext_len = try r.getU16();
+            var ext = Reader{ .buf = try r.take(ext_len) };
+            var found = false;
+            while (ext.remaining() >= 4) {
+                const etype = try ext.getU16();
+                const elen = try ext.getU16();
+                const edata = try ext.take(elen);
+                if (etype == 51) { // key_share: HRR carries just the selected group
+                    var kr = Reader{ .buf = edata };
+                    self.retry_group = try kr.getU16();
+                    found = true;
+                }
+            }
+            if (!found) return Error.HandshakeFailed;
+            return true;
+        }
+
+        // Normal ServerHello: fold into the transcript, then derive.
+        self.transcript.add(msg.raw);
+        var server_pub: [65]u8 = undefined;
+        var server_pub_len: usize = 0;
+        var server_group: u16 = 0;
         var got_ks = false;
         const ext_len = try r.getU16();
         var ext = Reader{ .buf = try r.take(ext_len) };
@@ -418,24 +724,63 @@ const Handshaker = struct {
             const edata = try ext.take(elen);
             if (etype == 51) { // key_share
                 var kr = Reader{ .buf = edata };
-                _ = try kr.getU16(); // group
+                server_group = try kr.getU16();
                 const klen = try kr.getU16();
                 const kp = try kr.take(klen);
-                if (kp.len == 32) {
-                    @memcpy(&server_pub, kp);
+                if (kp.len <= server_pub.len) {
+                    @memcpy(server_pub[0..kp.len], kp);
+                    server_pub_len = kp.len;
                     got_ks = true;
                 }
             }
         }
         if (!got_ks) return Error.HandshakeFailed;
 
-        // ECDHE shared secret → handshake secrets over transcript(CH..SH).
-        const shared = x25519.sharedSecret(&self.priv, &server_pub);
-        self.ks = keysched.KeySchedule.init(null);
-        const th = self.transcript.hash();
-        self.ks.deriveHandshakeSecrets(&shared, &th, &self.client_hs_secret, &self.server_hs_secret);
-        self.hs_client = RecordKeys.init(&self.client_hs_secret);
-        self.hs_server = RecordKeys.init(&self.server_hs_secret);
+        var shared: [48]u8 = undefined;
+        var shared_len: usize = 0;
+        if (server_group == GROUP_X25519) {
+            if (server_pub_len != 32) return Error.HandshakeFailed;
+            var sp: [32]u8 = undefined;
+            @memcpy(&sp, server_pub[0..32]);
+            const s = x25519.sharedSecret(&self.priv, &sp);
+            @memcpy(shared[0..32], &s);
+            shared_len = 32;
+        } else if (server_group == GROUP_SECP256R1) {
+            if (server_pub_len != 65) return Error.HandshakeFailed;
+            var sp: [65]u8 = undefined;
+            @memcpy(&sp, server_pub[0..65]);
+            var secret: [32]u8 = undefined;
+            if (!p256.ecdhShared(&self.priv_p256, &sp, &secret)) return Error.HandshakeFailed;
+            @memcpy(shared[0..32], &secret);
+            shared_len = 32;
+        } else {
+            return Error.UnsupportedParams;
+        }
+        self.deriveHandshake(shared[0..shared_len]);
+        return false;
+    }
+
+    /// Parse EncryptedExtensions, extracting the server-selected ALPN protocol
+    /// (extension type 16) if present. Tolerant: unknown extensions ignored, and
+    /// an absent ALPN is not an error.
+    fn parseEncryptedExtensions(self: *Handshaker, body: []const u8) void {
+        var r = Reader{ .buf = body };
+        const ext_len = r.getU16() catch return;
+        var ext = Reader{ .buf = r.take(ext_len) catch return };
+        while (ext.remaining() >= 4) {
+            const etype = ext.getU16() catch return;
+            const elen = ext.getU16() catch return;
+            const edata = ext.take(elen) catch return;
+            if (etype == 16) { // ALPN
+                var ar = Reader{ .buf = edata };
+                _ = ar.getU16() catch return; // ProtocolNameList length
+                const plen = ar.getU8() catch return;
+                const proto = ar.take(plen) catch return;
+                const n = @min(proto.len, self.neg_alpn.len);
+                @memcpy(self.neg_alpn[0..n], proto[0..n]);
+                self.neg_alpn_len = @intCast(n);
+            }
+        }
     }
 
     // ── Encrypted flight: EE, Certificate, CertVerify, Finished ──
@@ -444,12 +789,13 @@ const Handshaker = struct {
         var chain_len: usize = 0;
         var server_finished_ok = false;
         // Transcript hash BEFORE the server Finished — needed to verify it.
-        var th_before_cv: [32]u8 = undefined;
+        var th_before_cv: [48]u8 = undefined;
+        var th_before_cv_len: usize = 32;
 
         while (!server_finished_ok) {
             const msg = try self.readEncryptedHandshake();
             switch (msg.msg_type) {
-                HS_ENCRYPTED_EXTENSIONS => {}, // no extensions we act on
+                HS_ENCRYPTED_EXTENSIONS => self.parseEncryptedExtensions(msg.body),
                 HS_CERTIFICATE => {
                     // Copy the Certificate body into stable storage before
                     // parsing: the resulting x509.Cert values slice into it and
@@ -461,8 +807,8 @@ const Handshaker = struct {
                     chain_len = try parseCertificateMsg(self.certbuf[0..self.certlen], &chain_buf);
                 },
                 HS_CERT_VERIFY => {
-                    th_before_cv = self.transcriptHashExcluding(msg);
-                    try self.verifyCertVerify(msg.body, chain_buf[0..chain_len], th_before_cv);
+                    th_before_cv_len = self.thash(&th_before_cv);
+                    try self.verifyCertVerify(msg.body, chain_buf[0..chain_len], th_before_cv[0..th_before_cv_len]);
                 },
                 HS_FINISHED => {
                     // (Server Finished MAC verification omitted for brevity is
@@ -484,15 +830,10 @@ const Handshaker = struct {
         var roots: [ca_bundle.MAX_ROOTS]x509.Cert = undefined;
         const nroots = ca_bundle.load(&roots);
         verify.verifyChain(chain_buf[0..chain_len], roots[0..nroots], self.hostname, self.now) catch
-            return Error.CertInvalid;
+        return Error.CertInvalid;
     }
 
-    fn transcriptHashExcluding(self: *Handshaker, msg: HandshakeMsg) [32]u8 {
-        _ = msg;
-        return self.transcript.hash();
-    }
-
-    fn verifyCertVerify(self: *Handshaker, body: []const u8, chain: []const x509.Cert, th: [32]u8) Error!void {
+    fn verifyCertVerify(self: *Handshaker, body: []const u8, chain: []const x509.Cert, th: []const u8) Error!void {
         if (chain.len == 0) return Error.CertInvalid;
         var r = Reader{ .buf = body };
         const scheme = try r.getU16();
@@ -500,7 +841,7 @@ const Handshaker = struct {
         const sig = try r.take(siglen);
 
         // The signed content is: 64 spaces || context string || 0x00 || transcript-hash.
-        var signed: [130]u8 = undefined;
+        var signed: [146]u8 = undefined;
         var i: usize = 0;
         while (i < 64) : (i += 1) {
             signed[i] = 0x20;
@@ -508,8 +849,8 @@ const Handshaker = struct {
         const ctx = "TLS 1.3, server CertificateVerify";
         @memcpy(signed[64 .. 64 + ctx.len], ctx);
         signed[64 + ctx.len] = 0x00;
-        @memcpy(signed[64 + ctx.len + 1 ..][0..32], &th);
-        const signed_len = 64 + ctx.len + 1 + 32;
+        @memcpy(signed[64 + ctx.len + 1 ..][0..th.len], th);
+        const signed_len = 64 + ctx.len + 1 + th.len;
 
         const leaf = &chain[0];
         try verifyCertVerifySig(leaf, scheme, signed[0..signed_len], sig);
@@ -518,30 +859,27 @@ const Handshaker = struct {
     }
 
     fn verifyServerFinished(self: *Handshaker, msg: HandshakeMsg) Error!void {
-        // verify_data = HMAC(finished_key, transcript-hash-up-to-but-not-including-Finished)
-        const th = self.transcript.hash();
-        const expected = keysched.KeySchedule.computeFinished(&self.server_hs_secret, &th);
-        if (msg.body.len != 32) return Error.HandshakeFailed;
+        var expected: [48]u8 = undefined;
+        const vl = self.finishedData(self.server_hs_secret[0..self.suite.hash_len], &expected);
+        if (msg.body.len != vl) return Error.HandshakeFailed;
         var diff: u8 = 0;
         var i: usize = 0;
-        while (i < 32) : (i += 1) diff |= expected[i] ^ msg.body[i];
+        while (i < vl) : (i += 1) diff |= expected[i] ^ msg.body[i];
         if (diff != 0) return Error.HandshakeFailed;
-        // Fold server Finished into the transcript for client Finished + app keys.
         self.transcript.add(msg.raw);
     }
 
     fn sendClientFinished(self: *Handshaker) Error!void {
-        const th = self.transcript.hash();
-        const vd = keysched.KeySchedule.computeFinished(&self.client_hs_secret, &th);
-        var body: [4 + 32]u8 = undefined;
+        var vd: [48]u8 = undefined;
+        const vl = self.finishedData(self.client_hs_secret[0..self.suite.hash_len], &vd);
+        var body: [4 + 48]u8 = undefined;
         body[0] = HS_FINISHED;
         body[1] = 0;
-        body[2] = 0;
-        body[3] = 32;
-        @memcpy(body[4..36], &vd);
-        // Client Finished is sent encrypted with client handshake keys.
-        try self.writeEncrypted(REC_HANDSHAKE, &body);
-        self.transcript.add(&body);
+        body[2] = @intCast((vl >> 8) & 0xFF);
+        body[3] = @intCast(vl & 0xFF);
+        @memcpy(body[4 .. 4 + vl], vd[0..vl]);
+        try self.writeEncrypted(REC_HANDSHAKE, body[0 .. 4 + vl]);
+        self.transcript.add(body[0 .. 4 + vl]);
     }
 
     // ── record helpers ──
@@ -572,7 +910,7 @@ const Handshaker = struct {
         var hdr: [5]u8 = .{ REC_APPDATA, 0x03, 0x03, @intCast(total >> 8), @intCast(total & 0xFF) };
         const n = self.hs_client.nonce();
         var tag: [16]u8 = undefined;
-        self.hs_client.aead.seal(&n, buf[0..inner_len], &hdr, &tag);
+        self.hs_client.seal(&n, buf[0..inner_len], &hdr, &tag);
         self.hs_client.seq += 1;
         try self.transport.writeAll(&hdr);
         try self.transport.writeAll(buf[0..inner_len]);
@@ -591,10 +929,21 @@ const Handshaker = struct {
         return sliceHandshake(self.recbuf[0..len]);
     }
 
-    /// Read the next encrypted handshake message (post-ServerHello). Skips a
-    /// possible plaintext ChangeCipherSpec record.
+    /// Read the next encrypted handshake message. Serves buffered messages from
+    /// a previously-decrypted (possibly coalesced) record first; otherwise reads
+    /// and decrypts the next record and buffers all its handshake plaintext.
     fn readEncryptedHandshake(self: *Handshaker) Error!HandshakeMsg {
         while (true) {
+            // Serve a buffered message if one remains in the current record.
+            if (self.hs_plain_off < self.hs_plain_len) {
+                const rem = self.hs_plain[self.hs_plain_off..self.hs_plain_len];
+                const m = try sliceHandshake(rem);
+                self.hs_plain_off += m.raw.len;
+                @memcpy(self.lastRawTmp[0..m.raw.len], m.raw);
+                self.lastRawLen = m.raw.len;
+                return m;
+            }
+            // Otherwise read + decrypt the next record into hs_plain.
             var hdr: [5]u8 = undefined;
             try self.transport.readExact(&hdr);
             const len = (@as(usize, hdr[3]) << 8) | hdr[4];
@@ -606,17 +955,19 @@ const Handshaker = struct {
             var tag: [16]u8 = undefined;
             @memcpy(&tag, self.recbuf[body_len..len]);
             const nc = self.hs_server.nonce();
-            if (!self.hs_server.aead.open(&nc, self.recbuf[0..body_len], &hdr, &tag)) return Error.DecryptFailed;
+            if (!self.hs_server.open(&nc, self.recbuf[0..body_len], &hdr, &tag)) return Error.DecryptFailed;
             self.hs_server.seq += 1;
             var end = body_len;
             while (end > 0 and self.recbuf[end - 1] == 0) end -= 1;
             if (end == 0) return Error.BadRecord;
             const inner_type = self.recbuf[end - 1];
             if (inner_type != REC_HANDSHAKE) continue; // alerts etc.
-            const m = try sliceHandshake(self.recbuf[0 .. end - 1]);
-            @memcpy(self.lastRawTmp[0..m.raw.len], m.raw);
-            self.lastRawLen = m.raw.len;
-            return m;
+            // Buffer all handshake-message plaintext (minus the inner type byte).
+            const plain_len = end - 1;
+            @memcpy(self.hs_plain[0..plain_len], self.recbuf[0..plain_len]);
+            self.hs_plain_len = plain_len;
+            self.hs_plain_off = 0;
+            // loop: the buffered-message branch above now yields the first message.
         }
     }
 };
@@ -651,7 +1002,6 @@ fn parseCertificateMsg(body: []const u8, out: *[MAX_CERTS]x509.Cert) Error!usize
 /// Verify the CertificateVerify signature with the leaf's public key.
 fn verifyCertVerifySig(leaf: *const x509.Cert, scheme: u16, signed: []const u8, sig: []const u8) Error!void {
     const rsa = @import("rsa.sig");
-    const p256 = @import("p256");
     switch (scheme) {
         SIG_RSA_PKCS1_SHA256 => {
             if (leaf.key_alg != .rsa) return Error.CertInvalid;
@@ -677,11 +1027,30 @@ fn verifyCertVerifySig(leaf: *const x509.Cert, scheme: u16, signed: []const u8, 
             verify.ecdsaDerToRawPub(sig, &raw) catch return Error.CertInvalid;
             if (!p256.verify(&xy, &digest, &raw)) return Error.CertInvalid;
         },
+        SIG_ECDSA_SHA384 => {
+            if (leaf.key_alg != .ecdsa_p384 or leaf.ec_point.len != 97) return Error.UnsupportedParams;
+            const sha512mod = @import("sha512.sig");
+            const p384mod = @import("p384");
+            var xy384: [96]u8 = undefined;
+            @memcpy(&xy384, leaf.ec_point[1..97]);
+            const digest384 = sha512mod.sha384(signed);
+            var raw384: [96]u8 = undefined;
+            verify.ecdsaDerToRaw384(sig, &raw384) catch return Error.CertInvalid;
+            if (!p384mod.verify(&xy384, &digest384, &raw384)) return Error.CertInvalid;
+        },
+
         else => return Error.UnsupportedParams,
     }
 }
 
 // ── ClientHello extension writers ──
+
+fn eqBytes32(a: []const u8, b: *const [32]u8) bool {
+    if (a.len != 32) return false;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) { if (a[i] != b[i]) return false; }
+    return true;
+}
 
 fn writeSni(w: *Writer, host: []const u8) void {
     w.putU16(0); // server_name
@@ -702,15 +1071,28 @@ fn writeSupportedVersions(w: *Writer) void {
 
 fn writeSupportedGroups(w: *Writer) void {
     w.putU16(10); // supported_groups
-    w.putU16(4);
-    w.putU16(2); // list len
-    w.putU16(GROUP_X25519);
+    w.putU16(6); // ext len = 2 (list len) + 2*2 (two groups)
+    w.putU16(4); // list len
+    w.putU16(GROUP_X25519); // preferred
+    w.putU16(GROUP_SECP256R1);
+}
+
+/// ALPN extension advertising http/1.1 (extensible: add h2 for HTTP/2 later).
+fn writeAlpn(w: *Writer) void {
+    const proto = "http/1.1";
+    // ext: type(16) len(2) | list_len(2) | [ proto_len(1) proto ]
+    w.putU16(16); // application_layer_protocol_negotiation
+    w.putU16(@intCast(2 + 1 + proto.len)); // ext body len
+    w.putU16(@intCast(1 + proto.len));     // ProtocolNameList length
+    w.putU8(@intCast(proto.len));
+    w.bytes(proto);
 }
 
 fn writeSigAlgs(w: *Writer) void {
     const algs = [_]u16{
-        SIG_ECDSA_SHA256, SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384,
-        SIG_RSA_PKCS1_SHA512, SIG_ECDSA_SHA384,
+        SIG_ECDSA_SHA256, SIG_ECDSA_SHA384,
+        SIG_RSA_PSS_SHA256, SIG_RSA_PSS_SHA384, SIG_RSA_PSS_SHA512,
+        SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384, SIG_RSA_PKCS1_SHA512,
     };
     w.putU16(13); // signature_algorithms
     w.putU16(@intCast(2 + algs.len * 2));
@@ -718,13 +1100,34 @@ fn writeSigAlgs(w: *Writer) void {
     for (algs) |a| w.putU16(a);
 }
 
-fn writeKeyShare(w: *Writer, pubkey: *const [32]u8) void {
+/// Write a key_share extension with a single group entry (used for CH2 after HRR).
+fn writeKeyShareOne(w: *Writer, group: u16, key: []const u8) void {
     w.putU16(51); // key_share
-    w.putU16(@intCast(2 + 2 + 2 + 32));
-    w.putU16(@intCast(2 + 2 + 32)); // client_shares length
+    const entry = 2 + 2 + key.len;
+    w.putU16(@intCast(2 + entry));
+    w.putU16(@intCast(entry));
+    w.putU16(group);
+    w.putU16(@intCast(key.len));
+    w.bytes(key);
+}
+
+fn writeKeyShare(w: *Writer, x25519_pub: *const [32]u8, p256_pub: *const [65]u8, have_p256: bool) void {
+    w.putU16(51); // key_share
+    // Each KeyShareEntry: group(2) + len(2) + key. X25519=32, P-256=65.
+    const x_entry = 2 + 2 + 32;
+    const p_entry: usize = if (have_p256) 2 + 2 + 65 else 0;
+    const list_len = x_entry + p_entry;
+    w.putU16(@intCast(2 + list_len)); // ext len = client_shares len prefix + entries
+    w.putU16(@intCast(list_len));     // client_shares length
+    // X25519 entry (listed first = our preference)
     w.putU16(GROUP_X25519);
     w.putU16(32);
-    w.bytes(pubkey);
+    w.bytes(x25519_pub);
+    if (have_p256) {
+        w.putU16(GROUP_SECP256R1);
+        w.putU16(65);
+        w.bytes(p256_pub);
+    }
 }
 
 // ── tiny buffer Writer/Reader ──
@@ -841,4 +1244,103 @@ test "tls: ClientHello writer produces a plausible structure" {
     try testing.expectEqual(@as(usize, 2), w.len);
     try testing.expectEqual(@as(u8, 0x03), body[0]);
     try testing.expectEqual(@as(u8, 0x03), body[1]);
+}
+
+test "tls: AES-128 RecordKeys init is behavior-preserving (pinned)" {
+    // A fixed traffic secret must always derive the same key+iv via the
+    // SHA-256 schedule + AES-128 path. Pins the regression invariant.
+    const secret: [32]u8 = @splat(0x5a);
+    const rk = RecordKeys.init(&secret);
+    try testing.expect(rk.aead == .aes128_gcm);
+    // nonce at seq 0 equals the raw iv (XOR with zero seq)
+    const n0 = rk.nonce();
+    try testing.expectEqualSlices(u8, &rk.iv, &n0);
+    // initSuite(SUITE_AES128, secret) must produce the identical key material
+    const rk2 = RecordKeys.initSuite(SUITE_AES128, &secret);
+    try testing.expectEqualSlices(u8, &rk.iv, &rk2.iv);
+    try testing.expect(rk2.aead == .aes128_gcm);
+}
+
+test "tls: suite table maps the three cipher ids" {
+    try testing.expect(suiteById(0x1301).?.aead == .aes128_gcm);
+    try testing.expect(suiteById(0x1302).?.aead == .aes256_gcm);
+    try testing.expect(suiteById(0x1303).?.aead == .chacha20_poly1305);
+    try testing.expect(suiteById(0x1301).?.hash == .sha256);
+    try testing.expect(suiteById(0x1302).?.hash == .sha384);
+    try testing.expect(suiteById(0x9999) == null);
+}
+
+test "tls: ChaCha20-Poly1305 RecordKeys round-trip" {
+    // Suite 0x1303: SHA-256 schedule + ChaCha20-Poly1305 AEAD.
+    const secret: [32]u8 = @splat(0x3c);
+    var sbuf: [48]u8 = undefined;
+    @memcpy(sbuf[0..32], &secret);
+    const rk = RecordKeys.initSuite(SUITE_CHACHA, sbuf[0..32]);
+    try testing.expect(rk.aead == .chacha20_poly1305);
+    const n = rk.nonce();
+    var pt = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const orig = pt;
+    const aad = [_]u8{ 0x17, 0x03, 0x03, 0x00, 0x18 };
+    var tag: [16]u8 = undefined;
+    rk.seal(&n, &pt, &aad, &tag);
+    var changed = false;
+    for (0..pt.len) |i| { if (pt[i] != orig[i]) { changed = true; break; } }
+    try testing.expect(changed);
+    const ok = rk.open(&n, &pt, &aad, &tag);
+    try testing.expect(ok);
+    try testing.expectEqualSlices(u8, &orig, &pt);
+}
+
+test "tls: AES-256-GCM-SHA384 RecordKeys round-trip" {
+    const secret48: [48]u8 = @splat(0x25);
+    const rk = RecordKeys.initSuite(SUITE_AES256, &secret48);
+    try testing.expect(rk.aead == .aes256_gcm);
+    const n = rk.nonce();
+    var pt = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2, 1 };
+    const orig = pt;
+    var tag: [16]u8 = undefined;
+    rk.seal(&n, &pt, "", &tag);
+    try testing.expect(rk.open(&n, &pt, "", &tag));
+    try testing.expectEqualSlices(u8, &orig, &pt);
+}
+
+test "tls: HRR sentinel random is recognized" {
+    try testing.expect(eqBytes32(&HRR_RANDOM, &HRR_RANDOM));
+    var not_hrr: [32]u8 = @splat(0x11);
+    try testing.expect(!eqBytes32(&not_hrr, &HRR_RANDOM));
+    // length guard
+    const short = [_]u8{ 1, 2, 3 };
+    try testing.expect(!eqBytes32(&short, &HRR_RANDOM));
+}
+
+test "tls: ALPN extension advertises http/1.1" {
+    var buf: [64]u8 = undefined;
+    var w = Writer{ .buf = &buf };
+    writeAlpn(&w);
+    const out = w.slice();
+    // ext type 16 (0x00 0x10), then body. Body = ext_len(2) list_len(2) plen(1) proto.
+    try testing.expectEqual(@as(u8, 0x00), out[0]);
+    try testing.expectEqual(@as(u8, 0x10), out[1]);
+    // the protocol string http/1.1 appears verbatim at the end
+    const proto = "http/1.1";
+    try testing.expectEqualSlices(u8, proto, out[out.len - proto.len ..]);
+    // proto length byte precedes it
+    try testing.expectEqual(@as(u8, proto.len), out[out.len - proto.len - 1]);
+}
+
+test "tls: parseEncryptedExtensions reads server ALPN selection" {
+    var hs: Handshaker = .{ .transport = undefined, .hostname = "x", .now = 0 };
+    // EncryptedExtensions body: ext_list_len(2) | ALPN ext (type 16):
+    //   type(2)=0x0010 len(2) | list_len(2) plen(1) \"http/1.1\"
+    // Build a correct ALPN EE for \"h2\" programmatically to avoid hand-count errors.
+    var b: [32]u8 = undefined;
+    var ww = Writer{ .buf = &b };
+    ww.putU16(2 + 2 + (2 + 1 + 2)); // extensions length
+    ww.putU16(16);                  // ALPN
+    ww.putU16(2 + 1 + 2);           // ext body len
+    ww.putU16(1 + 2);               // list len
+    ww.putU8(2);                    // proto len
+    ww.bytes("h2");
+    hs.parseEncryptedExtensions(ww.slice());
+    try testing.expectEqualSlices(u8, "h2", hs.neg_alpn[0..hs.neg_alpn_len]);
 }

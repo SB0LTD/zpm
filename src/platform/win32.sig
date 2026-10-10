@@ -576,6 +576,10 @@ pub const SOCK_STREAM: c_int = 1;
 pub const IPPROTO_TCP: c_int = 6;
 pub const SOL_SOCKET: c_int = 0xFFFF;
 pub const SO_REUSEADDR: c_int = 0x0004;
+pub const SO_RCVTIMEO: c_int = 0x1006; // recv timeout (ms as DWORD on Windows)
+pub const SO_SNDTIMEO: c_int = 0x1005; // send timeout (ms as DWORD on Windows)
+pub const SO_ERROR: c_int = 0x1007;    // pending socket error (connect result)
+pub const WSAEINPROGRESS: c_int = 10036;
 pub const TCP_NODELAY: c_int = 0x0001; // setsockopt level IPPROTO_TCP: disable Nagle
 pub const FIONBIO: c_long = @bitCast(@as(c_ulong, 0x8004667E));
 pub const SD_BOTH: c_int = 2;
@@ -633,6 +637,7 @@ pub extern "ws2_32" fn send(SOCKET, [*]const u8, c_int, c_int) callconv(.c) c_in
 pub extern "ws2_32" fn closesocket(SOCKET) callconv(.c) c_int;
 pub extern "ws2_32" fn shutdown(SOCKET, c_int) callconv(.c) c_int;
 pub extern "ws2_32" fn setsockopt(SOCKET, c_int, c_int, *const anyopaque, c_int) callconv(.c) c_int;
+pub extern "ws2_32" fn getsockopt(SOCKET, c_int, c_int, *anyopaque, *c_int) callconv(.c) c_int;
 pub extern "ws2_32" fn ioctlsocket(SOCKET, c_long, *c_ulong) callconv(.c) c_int;
 pub extern "ws2_32" fn select(c_int, ?*fd_set, ?*fd_set, ?*fd_set, ?*const timeval) callconv(.c) c_int;
 pub extern "ws2_32" fn WSAGetLastError() callconv(.c) c_int;
@@ -846,3 +851,17 @@ pub const SM_XVIRTUALSCREEN: i32 = 76;
 pub const SM_YVIRTUALSCREEN: i32 = 77;
 pub const SM_CXVIRTUALSCREEN: i32 = 78;
 pub const SM_CYVIRTUALSCREEN: i32 = 79;
+
+// ── CryptoAPI (crypt32) — system certificate store ──
+pub const HCERTSTORE = ?*anyopaque;
+pub const CERT_CONTEXT = extern struct {
+    dwCertEncodingType: DWORD = 0,
+    pbCertEncoded: [*]const u8 = undefined,
+    cbCertEncoded: DWORD = 0,
+    pCertInfo: ?*anyopaque = null,
+    hCertStore: HCERTSTORE = null,
+};
+pub extern "crypt32" fn CertOpenSystemStoreW(?*anyopaque, [*:0]const u16) callconv(.c) HCERTSTORE;
+pub extern "crypt32" fn CertEnumCertificatesInStore(HCERTSTORE, ?*const CERT_CONTEXT) callconv(.c) ?*const CERT_CONTEXT;
+pub extern "crypt32" fn CertCloseStore(HCERTSTORE, DWORD) callconv(.c) BOOL;
+

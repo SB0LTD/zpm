@@ -187,6 +187,24 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     _ = try ctx.addModule("elementor_document", "src/elementor/document.sig");
     _ = try addTest(ctx, test_all, "test-elementor-document", "src/elementor/document.sig", &.{});
+
+    // ── UI DSL component model + renderer (Layer 0: pure computation) ──
+    // Platform-agnostic: draws only through a caller-supplied DrawVTable, so it
+    // has no module deps and registers with an empty import list (like
+    // `image`/`sb0x_format`). NO wire(). Its hermetic test{} blocks run
+    // standalone via `sig test src/ui/ui_dsl.sig --test-filter ui_dsl` — the
+    // same step-capacity treatment websocket/dom_import/cdp get (the fixed
+    // build graph is already at its step capacity), so it is NOT added to the
+    // `test` aggregate.
+    _ = try ctx.addModule("ui_dsl", "src/ui/ui_dsl.sig");
+
+    // ── OpenRouter LLM-over-HTTP client + folded STT/Ambient (transport seam) ──
+    // All I/O crosses a caller-supplied Transport seam; the module imports no
+    // nexus kernel module and no platform transport, so it registers dep-free.
+    // NO wire(). Hermetic MockTransport test{} blocks run standalone via
+    // `sig test src/net/openrouter.sig --test-filter openrouter` (not in the
+    // `test` aggregate, per the step-capacity ceiling above).
+    _ = try ctx.addModule("openrouter", "src/net/openrouter.sig");
     // NOTE: the web-automation stack's unit tests — websocket (RFC 6455),
     // dom_import (extractor + envelope), and cdp (target discovery, surrogate
     // decoding) — are run directly with `sig test src/net/websocket.sig`,
@@ -214,7 +232,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const crypto_gcm = try ctx.addModule("gcm", "src/core/crypto/gcm.sig");
     try wire(ctx, crypto_gcm, "aes", "src/core/crypto/aes.sig");
     _ = try ctx.addModule("x25519", "src/core/crypto/x25519.sig");
+    _ = try ctx.addModule("chacha20poly1305", "src/core/crypto/chacha20poly1305.sig");
     const crypto_p256 = try ctx.addModule("p256", "src/core/crypto/p256.sig");
+    _ = try ctx.addModule("p384", "src/core/crypto/p384.sig");
     try wire(ctx, crypto_p256, "sha256", "src/core/sha256.sig");
     try wire(ctx, crypto_p256, "hmac", "src/core/crypto/hmac.sig");
     const crypto_tls13 = try ctx.addModule("tls13_keys", "src/core/crypto/tls13_keys.sig");
@@ -230,8 +250,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const tls_client = try ctx.addModule("tls_client", "src/core/crypto/tls/client.sig");
     try wire(ctx, tls_client, "sha256", "src/core/sha256.sig");
     try wire(ctx, tls_client, "p256", "src/core/crypto/p256.sig");
+    try wire(ctx, tls_client, "p384", "src/core/crypto/p384.sig");
     try wire(ctx, tls_client, "hkdf", "src/core/crypto/hkdf.sig");
     try wire(ctx, tls_client, "gcm", "src/core/crypto/gcm.sig");
+    try wire(ctx, tls_client, "chacha20poly1305", "src/core/crypto/chacha20poly1305.sig");
     try wire(ctx, tls_client, "x25519", "src/core/crypto/x25519.sig");
     try wire(ctx, tls_client, "tls13_keys", "src/core/crypto/tls13_keys.sig");
     // NOTE: the tls_client → win32 edge is wired further below, next to the
@@ -247,6 +269,23 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, wss, "tls_client", "src/core/crypto/tls/client.sig");
     try wire(ctx, wss, "websocket", "src/net/websocket.sig");
 
+    // HTTP client module - pure-Sig HTTP/1.1 client over tls_client stack
+    const zpm_http = try ctx.addModule("zpm_http", "src/net/http/client.sig");
+    try wire(ctx, zpm_http, "tls_client", "src/core/crypto/tls/client.sig");
+    try wire(ctx, zpm_http, "win32", win32_path);
+    _ = try addTest(ctx, test_all, "test-http-parse", "src/net/http/response.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-http-chunked", "src/net/http/body.sig", &.{ importEntry("tls_client", "src/core/crypto/tls/client.sig"), importEntry("win32", win32_path) });
+    _ = try addTest(ctx, test_all, "test-http-url", "src/net/http/url.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-http-errors", "src/net/http/errors.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-http-transport", "src/net/http/transport.sig", &.{ importEntry("tls_client", "src/core/crypto/tls/client.sig"), importEntry("win32", win32_path) });
+    _ = try addTest(ctx, test_all, "test-http-cookie", "src/net/http/cookie.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-http-request", "src/net/http/request.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-http-protocol", "src/net/http/protocol.sig", &.{ importEntry("tls_client", "src/core/crypto/tls/client.sig"), importEntry("win32", win32_path) });
+    _ = try addTest(ctx, test_all, "test-http-retry", "src/net/http/retry.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-http-redirect", "src/net/http/redirect.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-http-socket-ext", "src/net/http/socket_ext.sig", &.{ importEntry("tls_client", "src/core/crypto/tls/client.sig"), importEntry("win32", win32_path) });
+    _ = try addTest(ctx, test_all, "test-http-client", "src/net/http/client.sig", &.{ importEntry("tls_client", "src/core/crypto/tls/client.sig"), importEntry("win32", win32_path) });
+    _ = try addTest(ctx, test_all, "test-http-noalloc", "src/net/http/no_alloc_test.sig", &.{});
     const jsonl = try ctx.addModule("jsonl", "src/core/jsonl.sig");
     try wire(ctx, jsonl, "json", "src/core/json.sig");
     try wire(ctx, jsonl, "sig_mem", "src/core/sig_mem.sig");
@@ -416,6 +455,8 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("aes", "src/core/crypto/aes.sig"),
     });
     _ = try addTest(ctx, test_all, "test-x25519", "src/core/crypto/x25519.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-chacha20poly1305", "src/core/crypto/chacha20poly1305.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-p384", "src/core/crypto/p384.sig", &.{});
     _ = try addTest(ctx, test_all, "test-p256", "src/core/crypto/p256.sig", &.{
         importEntry("sha256", "src/core/sha256.sig"),
         importEntry("hmac", "src/core/crypto/hmac.sig"),
@@ -428,8 +469,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-tls-client", "src/core/crypto/tls/client.sig", &.{
         importEntry("sha256", "src/core/sha256.sig"),
         importEntry("p256", "src/core/crypto/p256.sig"),
+        importEntry("p384", "src/core/crypto/p384.sig"),
         importEntry("hkdf", "src/core/crypto/hkdf.sig"),
         importEntry("gcm", "src/core/crypto/gcm.sig"),
+        importEntry("chacha20poly1305", "src/core/crypto/chacha20poly1305.sig"),
         importEntry("x25519", "src/core/crypto/x25519.sig"),
         importEntry("tls13_keys", "src/core/crypto/tls13_keys.sig"),
         importEntry("win32", "src/platform/win32.sig"),
@@ -455,6 +498,21 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("wss", "src/net/wss.sig"),
         importEntry("tls_client", "src/core/crypto/tls/client.sig"),
         importEntry("websocket", "src/net/websocket.sig"),
+        importEntry("win32", "src/platform/win32.sig"),
+    });
+
+    // Live HTTP harness -- full stack: DNS + TCP + TLS 1.3 + HTTP/1.1 GET.
+    const live_http = try ctx.addStep("live-http", "Live pure-Sig HTTPS GET against a stable endpoint", &noopStep);
+    _ = try addContract(ctx, live_http, "live-http-get", "tests/live_http.sig", &.{
+        importEntry("zpm_http", "src/net/http/client.sig"),
+        importEntry("tls_client", "src/core/crypto/tls/client.sig"),
+        importEntry("win32", "src/platform/win32.sig"),
+    });
+
+    const live_http_multi = try ctx.addStep("live-http-multi", "Live HTTPS against diverse CAs/ciphers", &noopStep);
+    _ = try addContract(ctx, live_http_multi, "live-http-multi-get", "tests/live_http_multi.sig", &.{
+        importEntry("zpm_http", "src/net/http/client.sig"),
+        importEntry("tls_client", "src/core/crypto/tls/client.sig"),
         importEntry("win32", "src/platform/win32.sig"),
     });
     _ = try addTest(ctx, test_all, "test-quic-keys", "src/core/crypto/quic_keys.sig", &.{
@@ -928,8 +986,6 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, timer, "win32", win32_path);
     const seqlock = try ctx.addModule("seqlock", "src/platform/seqlock.sig");
     try wire(ctx, seqlock, "win32", win32_path);
-    const http = try ctx.addModule("http", "src/platform/http.sig");
-    try wire(ctx, http, "win32", win32_path);
     const crypto = try ctx.addModule("crypto", "src/platform/crypto.sig");
     try wire(ctx, crypto, "win32", win32_path);
     const file_io = try ctx.addModule("file_io", "src/platform/file.sig");
@@ -994,7 +1050,6 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, platform, "input", "src/platform/input/run.sig");
     try wire(ctx, platform, "timer", "src/platform/timer.sig");
     try wire(ctx, platform, "threading", "src/platform/thread/run.sig");
-    try wire(ctx, platform, "http", "src/platform/http.sig");
     try wire(ctx, platform, "crypto", "src/platform/crypto.sig");
     try wire(ctx, platform, "file_io", "src/platform/file.sig");
     try wire(ctx, platform, "seqlock", "src/platform/seqlock.sig");

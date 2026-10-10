@@ -14,10 +14,15 @@ const Value = values.Value;
 // ── Install all environment stubs ──
 
 /// Call after builtins.installGlobals().
-pub fn installEnvironment(global: u16) void {
+pub var dbg_no_document: bool = false;
+
+pub fn installEnvironment(global: u32) void {
+    // Record the global for builtins that need a realm reference (e.g. a created
+    // iframe's contentWindow, which BotGuard reads to obtain a pristine String).
+    builtins.g_global_obj = global;
     installNavigator(global);
     installWindow(global);
-    installDocument(global);
+    if (!dbg_no_document) installDocument(global);
     installScreen(global);
     installLocation(global);
     installPerformance(global);
@@ -26,7 +31,7 @@ pub fn installEnvironment(global: u16) void {
     installMisc(global);
 }
 
-fn installNavigator(global: u16) void {
+fn installNavigator(global: u32) void {
     const nav = objects.createObject();
     setPropStr(nav, "userAgent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
     setPropStr(nav, "platform", "Win32");
@@ -64,11 +69,14 @@ fn installNavigator(global: u16) void {
     // navigator.mimeTypes (empty)
     objects.setProperty(nav, values.internString("mimeTypes"), Value.object(objects.createArray(0)));
 
+    objects.dbgMarkEnvObject(nav);
+    objects.dbgMarkEnvObject(conn);
     objects.setProperty(global, values.internString("navigator"), Value.object(nav));
 }
 
-fn installWindow(global: u16) void {
+fn installWindow(global: u32) void {
     // window === global (self-reference)
+    objects.dbgMarkEnvObject(global);
     objects.setProperty(global, values.internString("window"), Value.object(global));
     objects.setProperty(global, values.internString("self"), Value.object(global));
     objects.setProperty(global, values.internString("globalThis"), Value.object(global));
@@ -92,9 +100,30 @@ fn installWindow(global: u16) void {
     const raf_func = objects.createFunction(builtins.N_SET_TIMEOUT);
     objects.setProperty(global, values.internString("requestAnimationFrame"), Value.function(raf_func));
     objects.setProperty(global, values.internString("cancelAnimationFrame"), Value.function(objects.createFunction(builtins.N_CLEAR_TIMEOUT)));
+
+    // Event registration + idle/immediate scheduling. BotGuard probes for these
+    // on window during fingerprinting; undefined there aborts feature collection.
+    setNativeMethod(global, "addEventListener", builtins.N_DOM_NOOP);
+    setNativeMethod(global, "removeEventListener", builtins.N_DOM_NOOP);
+    setNativeMethod(global, "dispatchEvent", builtins.N_DOM_NOOP);
+    setNativeMethod(global, "requestIdleCallback", builtins.N_SET_TIMEOUT);
+    setNativeMethod(global, "cancelIdleCallback", builtins.N_CLEAR_TIMEOUT);
+    setNativeMethod(global, "setImmediate", builtins.N_SET_TIMEOUT);
+    setNativeMethod(global, "clearImmediate", builtins.N_CLEAR_TIMEOUT);
+    setNativeMethod(global, "queueMicrotask", builtins.N_SET_TIMEOUT);
+    setNativeMethod(global, "matchMedia", builtins.N_DOM_NOOP);
+    setNativeMethod(global, "getComputedStyle", builtins.N_DOM_NOOP);
+
+    // window.trustedTypes (Chrome Trusted Types API). BotGuard checks for its
+    // presence; provide an object with createPolicy returning a passthrough.
+    const tt = objects.createObject();
+    setNativeMethod(tt, "createPolicy", builtins.N_TT_CREATE_POLICY);
+    setNativeMethod(tt, "isHTML", builtins.N_DOM_NOOP);
+    setNativeMethod(tt, "isScript", builtins.N_DOM_NOOP);
+    objects.setProperty(global, values.internString("trustedTypes"), Value.object(tt));
 }
 
-fn installDocument(global: u16) void {
+fn installDocument(global: u32) void {
     const doc = objects.createObject();
     setPropStr(doc, "visibilityState", "visible");
     setPropBool(doc, "hidden", false);
@@ -111,32 +140,57 @@ fn installDocument(global: u16) void {
     setPropStr(doc, "URL", "https://www.youtube.com/");
     setPropStr(doc, "cookie", "");
 
-    // document.documentElement
+    // document.documentElement — a real element node (BotGuard walks
+    // appendChild/removeChild/style when attaching probe elements).
     const html = objects.createObject();
     setPropStr(html, "lang", "en");
+    makeNodeApi(html);
     objects.setProperty(doc, values.internString("documentElement"), Value.object(html));
 
-    // document.body (stub)
+    // document.body — real element node with the child/listener API.
     const body = objects.createObject();
+    makeNodeApi(body);
     objects.setProperty(doc, values.internString("body"), Value.object(body));
 
-    // document.head
-    objects.setProperty(doc, values.internString("head"), Value.object(objects.createObject()));
+    // document.head — real element node.
+    const head = objects.createObject();
+    makeNodeApi(head);
+    objects.setProperty(doc, values.internString("head"), Value.object(head));
 
-    // Stub methods that return empty elements
-    const stub_func = objects.createFunction(builtins.N_SET_TIMEOUT); // returns 0/undefined
-    objects.setProperty(doc, values.internString("createElement"), Value.function(stub_func));
-    objects.setProperty(doc, values.internString("getElementById"), Value.function(stub_func));
-    objects.setProperty(doc, values.internString("querySelector"), Value.function(stub_func));
-    objects.setProperty(doc, values.internString("querySelectorAll"), Value.function(stub_func));
-    objects.setProperty(doc, values.internString("getElementsByTagName"), Value.function(stub_func));
-    objects.setProperty(doc, values.internString("addEventListener"), Value.function(stub_func));
+    // document-level DOM APIs BotGuard may call.
+    setNativeMethod(doc, "createElementNS", builtins.N_DOM_CREATE_ELEMENT);
+    setNativeMethod(doc, "createTextNode", builtins.N_DOM_CREATE_ELEMENT);
+    setNativeMethod(doc, "createComment", builtins.N_DOM_CREATE_ELEMENT);
+    setNativeMethod(doc, "createDocumentFragment", builtins.N_DOM_CREATE_ELEMENT);
 
+    // createElement returns a generic element object (with style/getContext/etc)
+    // so BotGuard's canvas/DOM feature paths run instead of hitting undefined.
+    objects.setProperty(doc, values.internString("createElement"), Value.function(objects.createFunction(builtins.N_DOM_CREATE_ELEMENT)));
+    // Element-returning lookups: return null (JS) rather than 0.
+    const null_func = objects.createFunction(builtins.N_DOM_NOOP);
+    objects.setProperty(doc, values.internString("getElementById"), Value.function(null_func));
+    objects.setProperty(doc, values.internString("querySelector"), Value.function(null_func));
+    // Collection-returning lookups must return an ARRAY ([]), not undefined —
+    // BotGuard does `document.getElementsByTagName(...).length`, and undefined
+    // there throws TypeError, poisoning the snapshot into an error response.
+    const empty_arr_func = objects.createFunction(builtins.N_DOM_EMPTY_ARRAY);
+    objects.setProperty(doc, values.internString("querySelectorAll"), Value.function(empty_arr_func));
+    objects.setProperty(doc, values.internString("getElementsByTagName"), Value.function(empty_arr_func));
+    objects.setProperty(doc, values.internString("getElementsByClassName"), Value.function(empty_arr_func));
+    objects.setProperty(doc, values.internString("getElementsByName"), Value.function(empty_arr_func));
+    objects.setProperty(doc, values.internString("addEventListener"), Value.function(null_func));
+    objects.setProperty(doc, values.internString("removeEventListener"), Value.function(null_func));
+
+    objects.dbgMarkEnvObject(doc);
+    objects.dbgMarkEnvObject(html);
+    objects.dbgMarkEnvObject(body);
+    objects.dbgMarkEnvObject(head);
     objects.setProperty(global, values.internString("document"), Value.object(doc));
 }
 
-fn installScreen(global: u16) void {
+fn installScreen(global: u32) void {
     const screen = objects.createObject();
+    objects.dbgMarkEnvObject(screen);
     setPropNum(screen, "width", 1920);
     setPropNum(screen, "height", 1080);
     setPropNum(screen, "availWidth", 1920);
@@ -146,8 +200,9 @@ fn installScreen(global: u16) void {
     objects.setProperty(global, values.internString("screen"), Value.object(screen));
 }
 
-fn installLocation(global: u16) void {
+fn installLocation(global: u32) void {
     const loc = objects.createObject();
+    objects.dbgMarkEnvObject(loc);
     setPropStr(loc, "href", "https://www.youtube.com/");
     setPropStr(loc, "origin", "https://www.youtube.com");
     setPropStr(loc, "protocol", "https:");
@@ -160,11 +215,26 @@ fn installLocation(global: u16) void {
     objects.setProperty(global, values.internString("location"), Value.object(loc));
 }
 
-fn installPerformance(global: u16) void {
+fn installPerformance(global: u32) void {
     const perf = objects.createObject();
-    // performance.now() — stub returns incrementing value
-    const now_func = objects.createFunction(builtins.N_DATE_NOW);
+    objects.dbgMarkEnvObject(perf);
+    // performance.now() — SMALL monotonic ms (relative to load), NOT Date epoch.
+    // BotGuard's clock is `wM + performance.now()`; using Date.now here blew up
+    // the timing budget and broke live challenges. See builtins.perfNow.
+    const now_func = objects.createFunction(builtins.N_PERF_NOW);
     objects.setProperty(perf, values.internString("now"), Value.function(now_func));
+
+    // performance.timeOrigin — ms since epoch at navigation start. BotGuard
+    // reads this as the base for its monotonic clock (timeOrigin + now()).
+    setPropNum(perf, "timeOrigin", 1703980800000);
+
+    // Additional Performance API surface BotGuard may probe.
+    setNativeMethod(perf, "mark", builtins.N_DOM_NOOP);
+    setNativeMethod(perf, "measure", builtins.N_DOM_NOOP);
+    setNativeMethod(perf, "getEntriesByType", builtins.N_DOM_EMPTY_ARRAY);
+    setNativeMethod(perf, "getEntriesByName", builtins.N_DOM_EMPTY_ARRAY);
+    setNativeMethod(perf, "clearMarks", builtins.N_DOM_NOOP);
+    setNativeMethod(perf, "clearMeasures", builtins.N_DOM_NOOP);
 
     // performance.timing (deprecated but BG might check)
     const timing = objects.createObject();
@@ -175,8 +245,9 @@ fn installPerformance(global: u16) void {
     objects.setProperty(global, values.internString("performance"), Value.object(perf));
 }
 
-fn installCrypto(global: u16) void {
+fn installCrypto(global: u32) void {
     const crypto_obj = objects.createObject();
+    objects.dbgMarkEnvObject(crypto_obj);
     const random_func = objects.createFunction(builtins.N_CRYPTO_RANDOM);
     objects.setProperty(crypto_obj, values.internString("getRandomValues"), Value.function(random_func));
 
@@ -191,7 +262,7 @@ fn installCrypto(global: u16) void {
     objects.setProperty(global, values.internString("crypto"), Value.object(crypto_obj));
 }
 
-fn installIntl(global: u16) void {
+fn installIntl(global: u32) void {
     const intl = objects.createObject();
     // Intl.DateTimeFormat().resolvedOptions().timeZone
     const dtf_func = objects.createFunction(builtins.N_SET_TIMEOUT); // constructor stub
@@ -199,14 +270,16 @@ fn installIntl(global: u16) void {
     objects.setProperty(global, values.internString("Intl"), Value.object(intl));
 }
 
-fn installMisc(global: u16) void {
-    // Error constructors
-    const error_func = objects.createFunction(builtins.N_SET_TIMEOUT);
-    objects.setProperty(global, values.internString("Error"), Value.function(error_func));
-    objects.setProperty(global, values.internString("TypeError"), Value.function(error_func));
-    objects.setProperty(global, values.internString("ReferenceError"), Value.function(error_func));
-    objects.setProperty(global, values.internString("SyntaxError"), Value.function(error_func));
-    objects.setProperty(global, values.internString("RangeError"), Value.function(error_func));
+fn installMisc(global: u32) void {
+    // NOTE: Error/TypeError/ReferenceError are installed as PROPER constructors
+    // in builtins.installGlobals (they build { name, message } objects with a
+    // working toString). Do NOT overwrite them here. Provide only the extra
+    // error subclasses BotGuard may reference, aliased to the real Error ctor.
+    const real_error = objects.getProperty(global, values.internString("Error"));
+    if (real_error.tag == .function) {
+        objects.setProperty(global, values.internString("SyntaxError"), real_error);
+        objects.setProperty(global, values.internString("RangeError"), real_error);
+    }
 
     // Map, Set, WeakMap, WeakSet (stubs)
     objects.setProperty(global, values.internString("Map"), Value.function(objects.createFunction(builtins.N_SET_TIMEOUT)));
@@ -214,8 +287,7 @@ fn installMisc(global: u16) void {
     objects.setProperty(global, values.internString("WeakMap"), Value.function(objects.createFunction(builtins.N_SET_TIMEOUT)));
     objects.setProperty(global, values.internString("WeakSet"), Value.function(objects.createFunction(builtins.N_SET_TIMEOUT)));
 
-    // RegExp constructor
-    objects.setProperty(global, values.internString("RegExp"), Value.function(objects.createFunction(builtins.N_SET_TIMEOUT)));
+    // RegExp is installed by builtins with its own matcher and prototype.
 
     // localStorage / sessionStorage (stub)
     const storage = objects.createObject();
@@ -234,14 +306,38 @@ fn installMisc(global: u16) void {
 
 // ── Property helpers ──
 
-fn setPropStr(obj: u16, name: []const u8, val: []const u8) void {
+fn setPropStr(obj: u32, name: []const u8, val: []const u8) void {
     objects.setProperty(obj, values.internString(name), Value.string(values.internString(val)));
 }
 
-fn setPropNum(obj: u16, name: []const u8, val: f64) void {
+fn setPropNum(obj: u32, name: []const u8, val: f64) void {
     objects.setProperty(obj, values.internString(name), Value.number(val));
 }
 
-fn setPropBool(obj: u16, name: []const u8, val: bool) void {
+fn setPropBool(obj: u32, name: []const u8, val: bool) void {
     objects.setProperty(obj, values.internString(name), if (val) Value.TRUE else Value.FALSE);
+}
+
+/// Install a native (no-op) method by native-builtin id on an object.
+fn setNativeMethod(obj: u32, name: []const u8, native_id: u16) void {
+    objects.setProperty(obj, values.internString(name), Value.function(objects.createFunction(native_id)));
+}
+
+/// Give a plain DOM-node object the child/listener/style API BotGuard walks
+/// when it attaches probe elements (document.body.appendChild(canvas), etc.).
+/// Mirrors builtins.makeDomElement so body/documentElement are real elements.
+fn makeNodeApi(el: u32) void {
+    const style = objects.createObject();
+    objects.setProperty(el, values.internString("style"), Value.object(style));
+    setNativeMethod(el, "appendChild", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "removeChild", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "insertBefore", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "setAttribute", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "getAttribute", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "removeAttribute", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "addEventListener", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "removeEventListener", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "contains", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "querySelector", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "getElementsByTagName", builtins.N_DOM_EMPTY_ARRAY);
 }

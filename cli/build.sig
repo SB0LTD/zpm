@@ -108,7 +108,24 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, appmap, "streams", "../src/transport/streams.sig");
     try wire(ctx, appmap, "datagram", "../src/transport/datagram.sig");
     try wire(ctx, appmap, "packet", "../src/transport/packet.sig");
-    _ = try ctx.addModule("pal", "pal.sig");
+    // Pure-Sig HTTP/1.1 client over the TLS 1.3 stack — backs the registry
+    // transport in pal.sig (replacing the old WinHTTP stub).
+    const tls_client = try ctx.addModule("tls_client", "../src/core/crypto/tls/client.sig");
+    try wire(ctx, tls_client, "sha256", "../src/core/sha256.sig");
+    try wire(ctx, tls_client, "p256", "../src/core/crypto/p256.sig");
+    try wire(ctx, tls_client, "p384", "../src/core/crypto/p384.sig");
+    try wire(ctx, tls_client, "hkdf", "../src/core/crypto/hkdf.sig");
+    try wire(ctx, tls_client, "gcm", "../src/core/crypto/gcm.sig");
+    try wire(ctx, tls_client, "chacha20poly1305", "../src/core/crypto/chacha20poly1305.sig");
+    try wire(ctx, tls_client, "x25519", "../src/core/crypto/x25519.sig");
+    try wire(ctx, tls_client, "tls13_keys", "../src/core/crypto/tls13_keys.sig");
+    try wire(ctx, tls_client, "win32", win32_path);
+    const zpm_http = try ctx.addModule("zpm_http", "../src/net/http/client.sig");
+    try wire(ctx, zpm_http, "tls_client", "../src/core/crypto/tls/client.sig");
+    try wire(ctx, zpm_http, "win32", win32_path);
+
+    const pal = try ctx.addModule("pal", "pal.sig");
+    try wire(ctx, pal, "zpm_http", "../src/net/http/client.sig");
 
     // The executable is a first-class Sig compile step. Relative imports such
     // as commands.sig remain in the root module; named transport/PAL imports
@@ -127,6 +144,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("telemetry", "../src/transport/telemetry.sig"),
             importEntry("win32", win32_path),
             importEntry("pal", "pal.sig"),
+            importEntry("zpm_http", "../src/net/http/client.sig"),
             importEntry("sig_process", process_source),
         },
         .compiler_path = "",

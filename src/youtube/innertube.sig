@@ -1,7 +1,7 @@
 // @zpm/youtube/innertube — Pure Sig InnerTube API Client
 //
 // Direct HTTP client for YouTube's private InnerTube API.
-// No yt-dlp, no Python, no external dependencies. Pure WinHTTP.
+// No yt-dlp, no Python, no external dependencies. Pure Sig via @zpm/http.
 //
 // Endpoints:
 //   /youtubei/v1/player   — Get stream URLs, metadata, captions
@@ -23,38 +23,7 @@
 // Rate limiting: YouTube allows ~500 requests/min from a single IP.
 // No API key needed for public data.
 
-// ── Win32 WinHTTP ──
-extern "kernel32" fn LoadLibraryA([*:0]const u8) ?*anyopaque;
-extern "kernel32" fn GetProcAddress(?*anyopaque, [*:0]const u8) ?*anyopaque;
-
-const HINTERNET = ?*anyopaque;
-const DWORD = u32;
-const BOOL = c_int;
-const LPCWSTR = [*]const u16;
-
-const WINHTTP_ACCESS_TYPE_DEFAULT: DWORD = 0;
-const WINHTTP_FLAG_SECURE: DWORD = 0x00800000;
-const WINHTTP_ADDREQ_FLAG_ADD: DWORD = 0x20000000;
-const WINHTTP_ADDREQ_FLAG_REPLACE: DWORD = 0x80000000;
-
-const WinHttpOpenFn = *const fn (LPCWSTR, DWORD, ?LPCWSTR, ?LPCWSTR, DWORD) callconv(.c) HINTERNET;
-const WinHttpConnectFn = *const fn (HINTERNET, LPCWSTR, u16, DWORD) callconv(.c) HINTERNET;
-const WinHttpOpenRequestFn = *const fn (HINTERNET, ?LPCWSTR, ?LPCWSTR, ?LPCWSTR, ?LPCWSTR, ?*anyopaque, DWORD) callconv(.c) HINTERNET;
-const WinHttpSendRequestFn = *const fn (HINTERNET, ?LPCWSTR, DWORD, ?*anyopaque, DWORD, DWORD, usize) callconv(.c) BOOL;
-const WinHttpReceiveResponseFn = *const fn (HINTERNET, ?*anyopaque) callconv(.c) BOOL;
-const WinHttpReadDataFn = *const fn (HINTERNET, [*]u8, DWORD, *DWORD) callconv(.c) BOOL;
-const WinHttpCloseHandleFn = *const fn (HINTERNET) callconv(.c) BOOL;
-const WinHttpAddRequestHeadersFn = *const fn (HINTERNET, LPCWSTR, DWORD, DWORD) callconv(.c) BOOL;
-
-var fn_open: ?WinHttpOpenFn = null;
-var fn_connect: ?WinHttpConnectFn = null;
-var fn_openReq: ?WinHttpOpenRequestFn = null;
-var fn_sendReq: ?WinHttpSendRequestFn = null;
-var fn_recvResp: ?WinHttpReceiveResponseFn = null;
-var fn_readData: ?WinHttpReadDataFn = null;
-var fn_closeHandle: ?WinHttpCloseHandleFn = null;
-var fn_addHeaders: ?WinHttpAddRequestHeadersFn = null;
-var http_loaded: bool = false;
+const http = @import("net.sig");
 
 // ── Response buffer (512 KB — player responses can be large) ──
 pub const RESPONSE_BUF_SIZE: usize = 512 * 1024;
@@ -89,13 +58,13 @@ fn clientName(ct: ClientType) []const u8 {
 /// Get the client version for the InnerTube context.
 fn clientVersion(ct: ClientType) []const u8 {
     return switch (ct) {
-        .web => "2.20241126.01.00",
-        .web_embedded => "2.20241126.01.00",
-        .android => "19.29.37",
+        .web => "2.20250312.04.00",
+        .web_embedded => "2.20250310.01.00",
+        .android => "20.10.38",
         .android_vr => "1.62.27",
-        .ios => "19.29.1",
+        .ios => "20.10.4",
         .tv_embedded => "2.0",
-        .mweb => "2.20241126.01.00",
+        .mweb => "2.20250311.03.00",
     };
 }
 
@@ -128,77 +97,21 @@ pub const Endpoint = enum {
 ///   e.g., "\"videoId\":\"dQw4w9WgXcQ\"" for player requests
 /// Returns: slice of the response body, or empty on failure.
 pub fn request(endpoint: Endpoint, client: ClientType, body_extra: []const u8) []const u8 {
-    if (!ensureHttp()) return "";
-
     // Build JSON body
     var body: [4096]u8 = undefined;
     const body_len = buildBody(client, body_extra, &body);
 
-    // Build URL path as UTF-16
-    const ep_path = endpoint.path();
-    var path_w: [64]u16 = undefined;
-    for (0..ep_path.len) |i| path_w[i] = ep_path[i];
-    path_w[ep_path.len] = 0;
-
-    // WinHTTP calls
-    const W_AGENT = comptime toWide("zpm-youtube/1.0");
-    const W_HOST = comptime toWide("www.youtube.com");
-    const W_POST = comptime toWide("POST");
-    const W_CT = comptime toWide("Content-Type: application/json\r\n");
-    const W_ORIGIN = comptime toWide("Origin: https://www.youtube.com\r\n");
-
-    const hSession = fn_open.?(&W_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT, null, null, 0) orelse return "";
-    const hConnect = fn_connect.?(hSession, &W_HOST, 443, 0) orelse {
-        _ = fn_closeHandle.?(hSession);
-        return "";
-    };
-    const hRequest = fn_openReq.?(hConnect, &W_POST, @ptrCast(&path_w), null, null, null, WINHTTP_FLAG_SECURE) orelse {
-        _ = fn_closeHandle.?(hConnect);
-        _ = fn_closeHandle.?(hSession);
-        return "";
+    // Content-Type + Origin always; the client-specific UA is passed as the
+    // user_agent (not a duplicate User-Agent header).
+    const hdrs = "Content-Type: application/json\r\nOrigin: https://www.youtube.com\r\n";
+    const ua: []const u8 = switch (client) {
+        .ios => "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_7_1 like Mac OS X;)",
+        .android, .android_vr => "com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip",
+        else => "zpm-youtube/1.0",
     };
 
-    // Headers
-    _ = fn_addHeaders.?(hRequest, &W_CT, @bitCast(@as(i32, -1)), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-    _ = fn_addHeaders.?(hRequest, &W_ORIGIN, @bitCast(@as(i32, -1)), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-
-    // Add User-Agent for iOS/Android clients
-    if (client == .ios) {
-        const W_UA_IOS = comptime toWide("User-Agent: com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_7_1 like Mac OS X;)\r\n");
-        _ = fn_addHeaders.?(hRequest, &W_UA_IOS, @bitCast(@as(i32, -1)), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-    } else if (client == .android or client == .android_vr) {
-        const W_UA_ANDROID = comptime toWide("User-Agent: com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip\r\n");
-        _ = fn_addHeaders.?(hRequest, &W_UA_ANDROID, @bitCast(@as(i32, -1)), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-    }
-
-    // Send
-    if (fn_sendReq.?(hRequest, null, 0, @ptrCast(@constCast(body[0..body_len].ptr)), @intCast(body_len), @intCast(body_len), 0) == 0) {
-        _ = fn_closeHandle.?(hRequest);
-        _ = fn_closeHandle.?(hConnect);
-        _ = fn_closeHandle.?(hSession);
-        return "";
-    }
-
-    if (fn_recvResp.?(hRequest, null) == 0) {
-        _ = fn_closeHandle.?(hRequest);
-        _ = fn_closeHandle.?(hConnect);
-        _ = fn_closeHandle.?(hSession);
-        return "";
-    }
-
-    // Read response
-    response_len = 0;
-    while (response_len < RESPONSE_BUF_SIZE) {
-        var n: DWORD = 0;
-        if (fn_readData.?(hRequest, response_buf[response_len..].ptr, @intCast(RESPONSE_BUF_SIZE - response_len), &n) == 0) break;
-        if (n == 0) break;
-        response_len += n;
-    }
-
-    _ = fn_closeHandle.?(hRequest);
-    _ = fn_closeHandle.?(hConnect);
-    _ = fn_closeHandle.?(hSession);
-
+    const r = http.postInto("www.youtube.com", 443, endpoint.path(), hdrs, body[0..body_len], ua, &response_buf);
+    response_len = r.len;
     return response_buf[0..response_len];
 }
 
@@ -231,6 +144,19 @@ pub fn playerWebEmbed(video_id: []const u8) []const u8 {
     var extra: [64]u8 = undefined;
     const elen = buildKV(&extra, "\"videoId\":\"", video_id, "\"");
     return request(.player, .web_embedded, extra[0..elen]);
+}
+
+/// Get player data with a PO token in serviceIntegrityDimensions (required by
+/// YouTube for most clients as of 2026). `pot` = base64url PO token.
+pub fn playerWithPot(video_id: []const u8, client: ClientType, pot: []const u8) []const u8 {
+    var extra: [512]u8 = undefined;
+    var pos: usize = 0;
+    pos = appendS(&extra, pos, "\"videoId\":\"");
+    pos = appendS(&extra, pos, video_id);
+    pos = appendS(&extra, pos, "\",\"serviceIntegrityDimensions\":{\"poToken\":\"");
+    pos = appendS(&extra, pos, pot);
+    pos = appendS(&extra, pos, "\"}");
+    return request(.player, client, extra[0..pos]);
 }
 
 /// Get player data using ANDROID_VR client (NO PO TOKEN REQUIRED).
@@ -291,8 +217,6 @@ pub fn search(query_text: []const u8) []const u8 {
 /// Fetch the raw watch page HTML for a video (needed to find player.js URL).
 /// Uses a separate GET request (not InnerTube POST).
 pub fn fetchWatchPage(video_id: []const u8) []const u8 {
-    if (!ensureHttp()) return "";
-
     // Build path: /watch?v=XXXXXXXXXXX
     var path_buf: [64]u8 = undefined;
     var plen: usize = 0;
@@ -303,50 +227,8 @@ pub fn fetchWatchPage(video_id: []const u8) []const u8 {
     @memcpy(path_buf[plen .. plen + id_len], video_id[0..id_len]);
     plen += id_len;
 
-    var path_w: [64]u16 = undefined;
-    for (0..plen) |i| path_w[i] = path_buf[i];
-    path_w[plen] = 0;
-
-    const W_AGENT = comptime toWide("Mozilla/5.0");
-    const W_HOST = comptime toWide("www.youtube.com");
-
-    const hSession = fn_open.?(&W_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT, null, null, 0) orelse return "";
-    const hConnect = fn_connect.?(hSession, &W_HOST, 443, 0) orelse {
-        _ = fn_closeHandle.?(hSession);
-        return "";
-    };
-    // GET request (verb = null defaults to GET)
-    const hRequest = fn_openReq.?(hConnect, null, @ptrCast(&path_w), null, null, null, WINHTTP_FLAG_SECURE) orelse {
-        _ = fn_closeHandle.?(hConnect);
-        _ = fn_closeHandle.?(hSession);
-        return "";
-    };
-
-    if (fn_sendReq.?(hRequest, null, 0, null, 0, 0, 0) == 0) {
-        _ = fn_closeHandle.?(hRequest);
-        _ = fn_closeHandle.?(hConnect);
-        _ = fn_closeHandle.?(hSession);
-        return "";
-    }
-    if (fn_recvResp.?(hRequest, null) == 0) {
-        _ = fn_closeHandle.?(hRequest);
-        _ = fn_closeHandle.?(hConnect);
-        _ = fn_closeHandle.?(hSession);
-        return "";
-    }
-
-    response_len = 0;
-    while (response_len < RESPONSE_BUF_SIZE) {
-        var n: DWORD = 0;
-        if (fn_readData.?(hRequest, response_buf[response_len..].ptr, @intCast(RESPONSE_BUF_SIZE - response_len), &n) == 0) break;
-        if (n == 0) break;
-        response_len += n;
-    }
-
-    _ = fn_closeHandle.?(hRequest);
-    _ = fn_closeHandle.?(hConnect);
-    _ = fn_closeHandle.?(hSession);
-
+    const r = http.getInto("www.youtube.com", 443, path_buf[0..plen], "", "Mozilla/5.0", &response_buf);
+    response_len = r.len;
     return response_buf[0..response_len];
 }
 
@@ -354,53 +236,8 @@ pub fn fetchWatchPage(video_id: []const u8) []const u8 {
 /// path: e.g., "/s/player/abcdef01/player_ias.vflset/en_US/base.js"
 /// Writes to the provided buffer. Returns bytes written.
 pub fn fetchPlayerJs(js_path: []const u8, out_buf: [*]u8, out_cap: usize) usize {
-    if (!ensureHttp()) return 0;
-
-    var path_w: [256]u16 = undefined;
-    const plen = @min(js_path.len, 255);
-    for (0..plen) |i| path_w[i] = js_path[i];
-    path_w[plen] = 0;
-
-    const W_AGENT = comptime toWide("Mozilla/5.0");
-    const W_HOST = comptime toWide("www.youtube.com");
-
-    const hSession = fn_open.?(&W_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT, null, null, 0) orelse return 0;
-    const hConnect = fn_connect.?(hSession, &W_HOST, 443, 0) orelse {
-        _ = fn_closeHandle.?(hSession);
-        return 0;
-    };
-    const hRequest = fn_openReq.?(hConnect, null, @ptrCast(&path_w), null, null, null, WINHTTP_FLAG_SECURE) orelse {
-        _ = fn_closeHandle.?(hConnect);
-        _ = fn_closeHandle.?(hSession);
-        return 0;
-    };
-
-    if (fn_sendReq.?(hRequest, null, 0, null, 0, 0, 0) == 0) {
-        _ = fn_closeHandle.?(hRequest);
-        _ = fn_closeHandle.?(hConnect);
-        _ = fn_closeHandle.?(hSession);
-        return 0;
-    }
-    if (fn_recvResp.?(hRequest, null) == 0) {
-        _ = fn_closeHandle.?(hRequest);
-        _ = fn_closeHandle.?(hConnect);
-        _ = fn_closeHandle.?(hSession);
-        return 0;
-    }
-
-    var total: usize = 0;
-    while (total < out_cap) {
-        var n: DWORD = 0;
-        if (fn_readData.?(hRequest, out_buf + total, @intCast(@min(out_cap - total, 0x7FFFFFFF)), &n) == 0) break;
-        if (n == 0) break;
-        total += n;
-    }
-
-    _ = fn_closeHandle.?(hRequest);
-    _ = fn_closeHandle.?(hConnect);
-    _ = fn_closeHandle.?(hSession);
-
-    return total;
+    const r = http.getInto("www.youtube.com", 443, js_path, "", "Mozilla/5.0", out_buf[0..out_cap]);
+    return r.len;
 }
 
 // ── JSON body builder ──
@@ -460,25 +297,3 @@ fn appendS(buf: anytype, pos: usize, s: []const u8) usize {
     return pos + len;
 }
 
-fn ensureHttp() bool {
-    if (http_loaded) return true;
-    const dll = LoadLibraryA("winhttp.dll") orelse return false;
-    fn_open = @ptrCast(GetProcAddress(dll, "WinHttpOpen"));
-    fn_connect = @ptrCast(GetProcAddress(dll, "WinHttpConnect"));
-    fn_openReq = @ptrCast(GetProcAddress(dll, "WinHttpOpenRequest"));
-    fn_sendReq = @ptrCast(GetProcAddress(dll, "WinHttpSendRequest"));
-    fn_recvResp = @ptrCast(GetProcAddress(dll, "WinHttpReceiveResponse"));
-    fn_readData = @ptrCast(GetProcAddress(dll, "WinHttpReadData"));
-    fn_closeHandle = @ptrCast(GetProcAddress(dll, "WinHttpCloseHandle"));
-    fn_addHeaders = @ptrCast(GetProcAddress(dll, "WinHttpAddRequestHeaders"));
-    if (fn_open == null or fn_sendReq == null) return false;
-    http_loaded = true;
-    return true;
-}
-
-fn toWide(comptime s: []const u8) [s.len + 1]u16 {
-    var r: [s.len + 1]u16 = undefined;
-    for (0..s.len) |i| r[i] = s[i];
-    r[s.len] = 0;
-    return r;
-}

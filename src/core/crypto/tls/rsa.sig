@@ -168,22 +168,28 @@ fn reduce(wide: *const [MAX_LIMBS * 2]u64, n: *const Big) Big {
     var bit_i = total_bits;
     while (bit_i > 0) {
         bit_i -= 1;
-        // r <<= 1
-        shl1(&r);
+        // r <<= 1 (carry_out is bit 2^(MAX_LIMBS*64) that falls off the top)
+        const carry_out = shl1(&r);
         // bring in the current bit
         const limb = bit_i / LIMB_BITS;
         const shift: u6 = @intCast(bit_i % LIMB_BITS);
         const bit: u64 = (wide[limb] >> shift) & 1;
         r.limbs[0] |= bit;
-        // if r >= n, r -= n
-        if (r.cmp(n) >= 0) r.subInPlace(n);
+        // Reduce. When shl1 overflowed (4096-bit modulus case), the true
+        // value is r + 2^(MAX_LIMBS*64) >= n, so subtract n; one subtraction
+        // suffices because 2^(MAX_LIMBS*64) < 2n for a normalized top-bit modulus.
+        if (carry_out != 0) {
+            r.subInPlace(n);
+        } else if (r.cmp(n) >= 0) {
+            r.subInPlace(n);
+        }
     }
     r.n = r.sigLimbs();
     return r;
 }
 
 /// r <<= 1 across all limbs.
-fn shl1(r: *Big) void {
+fn shl1(r: *Big) u64 {
     var carry: u64 = 0;
     var i: usize = 0;
     while (i < MAX_LIMBS) : (i += 1) {
@@ -191,6 +197,7 @@ fn shl1(r: *Big) void {
         r.limbs[i] = (r.limbs[i] << 1) | carry;
         carry = new_carry;
     }
+    return carry; // bit shifted out of the top (bit MAX_LIMBS*64)
 }
 
 /// Modular multiply: (a * b) mod n.
