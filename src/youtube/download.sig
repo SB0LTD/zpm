@@ -26,6 +26,7 @@ const minter = @import("botguard/minter.sig");
 const session_mod = @import("session.sig");
 const challenge_mod = @import("botguard/challenge.sig");
 const http = @import("net.sig");
+const sabr_mod = @import("sabr/root.sig");
 
 // Cold-start PO token for the current download (base64url). Minted from the
 // video id as content binding; YouTube accepts it while StreamProtectionStatus
@@ -44,6 +45,9 @@ const MediaKind = enum { audio, video };
 pub const DownloadOptions = struct {
     require_vm_token: bool = false,
     progress: stream_mod.ProgressFn = null,
+    // When non-empty, use this base64url content-bound PO token instead of
+    // minting one (lets a caller relay a token when a headless mint is gated).
+    pot_override: []const u8 = "",
 };
 
 // ── Win32 (for null-terminated path conversion) ──
@@ -111,7 +115,7 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
 
     print("  [download] Fetching player data...\n");
 
-    prepareTokens(video_id);
+    prepareTokens(video_id, options);
     status.token_source = g_token_source;
     if (options.require_vm_token and g_token_source != .vm) {
         print("  [download] ERROR: VM token required and minting did not succeed\n");
@@ -222,6 +226,15 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
     status.bitrate = fmt.bitrate;
     status.contains_video = fmt.is_video;
     status.contains_audio = fmt.is_audio;
+
+    // SABR branch: when the player response exposes serverAbrStreamingUrl (and
+    // the selected format lacks a direct URL), YouTube serves this media only
+    // via SABR POST delivery. Pull it through the pure-Sig SABR loop using the
+    // content-bound PO token + the session jar. The direct-URL path below stays
+    // the fallback whenever a direct URL IS present.
+    if (fmt.url_len == 0 and sabr_mod.player_fields.serverAbrStreamingUrl(resp) != null) {
+        if (trySabr(resp, fmt, kind, output_path, options, &status)) return status;
+    }
 
     // Step 5: Download the stream
     if (fmt.url_len == 0) {
@@ -398,12 +411,29 @@ fn setContainer(fmt: *const manifest_mod.StreamFormat, status: *DownloadStatus) 
     if (findStr(mime, "mp4a") != null) status.codec = .aac;
 }
 
-fn prepareTokens(video_id: *const [meta.VIDEO_ID_LEN]u8) void {
+fn prepareTokens(video_id: *const [meta.VIDEO_ID_LEN]u8, options: DownloadOptions) void {
     g_pot_len = 0;
     g_stream_pot_len = 0;
     g_token_source = .none;
     g_session = session_mod.Session.init();
     g_challenge = challenge_mod.Challenge.init();
+
+    // A relayed content-bound token short-circuits minting (the session is
+    // still bootstrapped below for the SABR jar + visitorData).
+    if (options.pot_override.len > 0 and options.pot_override.len <= g_pot_buf.len) {
+        @memcpy(g_pot_buf[0..options.pot_override.len], options.pot_override);
+        g_pot_len = options.pot_override.len;
+        _ = session_mod.bootstrap(&g_session, &g_challenge);
+        if (g_session.visitorData().len > 0) {
+            g_stream_pot_len = minter.mintColdStart(g_session.visitorData(), &g_stream_pot_buf);
+        } else {
+            g_stream_pot_len = minter.mintColdStart(video_id, &g_stream_pot_buf);
+        }
+        g_token_source = .vm; // treated as an externally-provided real token
+        print("  [download] using relayed content-bound PO token (pot_override)\n");
+        return;
+    }
+
     var integrity_result = session_mod.IntegrityResult{};
     if (session_mod.establishIntegrityToken(&g_session, &g_challenge, &integrity_result)) {
         const token = integrity_result.integrity_token[0..integrity_result.integrity_token_len];
@@ -421,6 +451,142 @@ fn prepareTokens(video_id: *const [meta.VIDEO_ID_LEN]u8) void {
     g_stream_pot_len = minter.mintColdStart(binding, &g_stream_pot_buf);
     if (g_pot_len > 0 and g_stream_pot_len > 0) g_token_source = .cold_start;
     print("  [download] VM integrity unavailable; trying cold-start tokens\n");
+}
+
+// ── SABR branch ──
+//
+// Decodes the SABR URL + ustreamer config + PO token from the player response
+// and runs the pure-Sig SABR loop (sabr/stream.sig) to pull `fmt` to disk.
+// Returns true if the loop produced a non-empty file (status is updated); false
+// to let the caller fall through to the direct-URL path. Fail-closed: a wall or
+// SABR error leaves status.success=false with the raw signals printed.
+var g_sabr_url_buf: [9216]u8 = undefined;
+var g_sabr_cfg_buf: [8192]u8 = undefined;
+var g_sabr_pot_buf: [512]u8 = undefined;
+
+fn trySabr(
+    resp: []const u8,
+    fmt: *const manifest_mod.StreamFormat,
+    kind: MediaKind,
+    output_path: [*:0]const u8,
+    options: DownloadOptions,
+    status: *DownloadStatus,
+) bool {
+    _ = options;
+    print("  [download] SABR branch: serverAbrStreamingUrl present, no direct URL\n");
+
+    // 1. serverAbrStreamingUrl (JSON-escaped) -> unescape to a real URL.
+    const url_esc = sabr_mod.player_fields.serverAbrStreamingUrl(resp) orelse return false;
+    const url_len = sabr_mod.player_fields.unescapeInto(url_esc, &g_sabr_url_buf);
+    if (url_len == 0) return false;
+    const sabr_url = g_sabr_url_buf[0..url_len];
+
+    // 2. ustreamer config (base64 string) -> raw bytes for the request field.
+    var cfg_bytes: []const u8 = "";
+    if (sabr_mod.player_fields.ustreamerConfig(resp)) |cfg_b64| {
+        const n = base64Decode(cfg_b64, &g_sabr_cfg_buf);
+        cfg_bytes = g_sabr_cfg_buf[0..n];
+    }
+
+    // 3. content-bound PO token (g_pot_buf holds base64url text) -> raw bytes.
+    var pot_bytes: []const u8 = "";
+    if (g_pot_len > 0) {
+        const n = base64Decode(g_pot_buf[0..g_pot_len], &g_sabr_pot_buf);
+        pot_bytes = g_sabr_pot_buf[0..n];
+    }
+
+    // 4. split the SABR URL into host/port/path.
+    var host: [256]u8 = undefined;
+    var path: [9216]u8 = undefined;
+    var hl: usize = 0;
+    var pl: usize = 0;
+    var port: u16 = 443;
+    if (!sabr_mod.stream.parseUrl(sabr_url, &host, &hl, &path, &pl, &port)) return false;
+
+    // 5. open the output sink + the live transport (session jar).
+    var fsink = sabr_mod.stream.FileSink.open(output_path) orelse return false;
+    defer fsink.close();
+    var transport_ctx = sabr_mod.stream.NetTransport{ .jar = &g_session.jar };
+
+    const client_version = if (g_session.clientVersion().len > 0) g_session.clientVersion() else "2.20250312.04.00";
+    const selected = sabr_mod.request.SelectedFormat{
+        .itag = @intCast(fmt.itag),
+        .last_modified = fmt.last_modified,
+        .xtags = fmt.xtags[0..fmt.xtags_len],
+    };
+
+    print("  [download] SABR loop starting itag=");
+    printNum(fmt.itag);
+    print(" lmt=");
+    printNum(fmt.last_modified);
+    print("\n");
+
+    const res = sabr_mod.stream.runLoop(
+        transport_ctx.transport(),
+        host[0..hl],
+        port,
+        path[0..pl],
+        selected,
+        kind == .audio,
+        cfg_bytes,
+        pot_bytes,
+        1, // WEB
+        client_version,
+        fsink.sink(),
+    );
+
+    status.bytes_downloaded = res.bytes_written;
+    status.success = res.success and res.bytes_written > 0;
+
+    if (status.success) {
+        setContainer(fmt, status);
+        print("  [download] SABR complete: ");
+        printNum(res.bytes_written / 1024);
+        print(" KB\n");
+        return true;
+    }
+
+    // Fail-closed: report the precise server verdict rather than faking success.
+    print("  [download] SABR did not complete. last_status=");
+    printNum(res.last_status);
+    print(" protection_status=");
+    printNum(@as(u64, @intCast(if (res.protection_status < 0) 0 else res.protection_status)));
+    if (res.sabr_error_seen) {
+        print(" sabr_error_code=");
+        printNum(@as(u64, @intCast(if (res.sabr_error_code < 0) 0 else res.sabr_error_code)));
+    }
+    print(" bytes=");
+    printNum(res.bytes_written);
+    print("\n");
+    return res.bytes_written > 0; // partial bytes still count as "handled"
+}
+
+// Decode standard OR url-safe base64 (ignoring padding/whitespace) into `out`.
+fn base64Decode(input: []const u8, out: []u8) usize {
+    var acc: u32 = 0;
+    var nbits: u5 = 0;
+    var oi: usize = 0;
+    for (input) |c| {
+        const v: i16 = b64Val(c);
+        if (v < 0) continue;
+        acc = (acc << 6) | @as(u32, @intCast(v));
+        if (nbits >= 2) {
+            nbits -= 2;
+            if (oi >= out.len) return oi;
+            out[oi] = @intCast((acc >> nbits) & 0xFF);
+            oi += 1;
+        } else nbits += 6;
+    }
+    return oi;
+}
+
+fn b64Val(c: u8) i16 {
+    if (c >= 'A' and c <= 'Z') return @as(i16, c - 'A');
+    if (c >= 'a' and c <= 'z') return @as(i16, c - 'a') + 26;
+    if (c >= '0' and c <= '9') return @as(i16, c - '0') + 52;
+    if (c == '+' or c == '-') return 62;
+    if (c == '/' or c == '_') return 63;
+    return -1;
 }
 
 fn playerInSession(video_id: *const [meta.VIDEO_ID_LEN]u8, ios: bool) []const u8 {

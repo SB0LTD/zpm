@@ -48,6 +48,17 @@ pub const StreamFormat = struct {
     quality_label: [16]u8, // "360p", "720p", etc.
     quality_len: u8,
     has_cipher: bool, // was cipher-encrypted (now decrypted)
+    // ── SABR selection fields ──
+    // SABR keys formats by (itag, lastModified), not by URL, and the request
+    // builder embeds initRange/indexRange + xtags. Populated from the same
+    // adaptiveFormats JSON object (zero/empty when the fields are absent).
+    last_modified: u64 = 0, // "lastModified" (microseconds, aka lmt)
+    xtags: [96]u8 = undefined, // "xtags" (opaque format discriminator)
+    xtags_len: u8 = 0,
+    init_start: u32 = 0, // "initRange".start
+    init_end: u32 = 0, // "initRange".end
+    index_start: u32 = 0, // "indexRange".start
+    index_end: u32 = 0, // "indexRange".end
 };
 
 pub const MAX_FORMATS: usize = 64;
@@ -108,6 +119,16 @@ pub fn selectBestAudio(formats: []const StreamFormat, n_formats: usize, codec_pr
 pub fn selectByItag(formats: []const StreamFormat, n_formats: usize, itag: u16) ?*const StreamFormat {
     for (0..n_formats) |i| {
         if (formats[i].itag == itag and formats[i].url_len != 0) return &formats[i];
+    }
+    return null;
+}
+
+/// Select a format for SABR by itag (SABR does not need a direct URL — it
+/// identifies the format by (itag, lastModified) inside the request protobuf,
+/// so unlike `selectByItag` this does NOT require `url_len != 0`).
+pub fn selectBySabr(formats: []const StreamFormat, n_formats: usize, itag: u16) ?*const StreamFormat {
+    for (0..n_formats) |i| {
+        if (formats[i].itag == itag) return &formats[i];
     }
     return null;
 }
@@ -196,6 +217,13 @@ fn parseOneFormat(obj: []const u8, fmt: *StreamFormat) bool {
         .quality_label = undefined,
         .quality_len = 0,
         .has_cipher = false,
+        .last_modified = 0,
+        .xtags = undefined,
+        .xtags_len = 0,
+        .init_start = 0,
+        .init_end = 0,
+        .index_start = 0,
+        .index_end = 0,
     };
 
     // itag
@@ -221,6 +249,29 @@ fn parseOneFormat(obj: []const u8, fmt: *StreamFormat) bool {
     // contentLength
     if (extractString(obj, "\"contentLength\"")) |v| {
         fmt.content_length = parseU64(v);
+    }
+
+    // ── SABR selection fields ──
+    // lastModified (lmt) — a bare integer or quoted string depending on client.
+    if (extractInt(obj, "\"lastModified\"")) |v| {
+        fmt.last_modified = v;
+    } else if (extractString(obj, "\"lastModified\"")) |v| {
+        fmt.last_modified = parseU64(v);
+    }
+    // xtags — opaque string discriminator used alongside (itag, lmt).
+    if (extractString(obj, "\"xtags\"")) |v| {
+        const xlen = @min(v.len, fmt.xtags.len);
+        @memcpy(fmt.xtags[0..xlen], v[0..xlen]);
+        fmt.xtags_len = @intCast(xlen);
+    }
+    // initRange / indexRange — {"start":"N","end":"M"} objects.
+    if (extractObject(obj, "\"initRange\"")) |rng| {
+        if (extractString(rng, "\"start\"")) |s| fmt.init_start = @intCast(@min(parseU64(s), 0xFFFFFFFF));
+        if (extractString(rng, "\"end\"")) |e| fmt.init_end = @intCast(@min(parseU64(e), 0xFFFFFFFF));
+    }
+    if (extractObject(obj, "\"indexRange\"")) |rng| {
+        if (extractString(rng, "\"start\"")) |s| fmt.index_start = @intCast(@min(parseU64(s), 0xFFFFFFFF));
+        if (extractString(rng, "\"end\"")) |e| fmt.index_end = @intCast(@min(parseU64(e), 0xFFFFFFFF));
     }
 
     // audioSampleRate
@@ -474,6 +525,35 @@ fn extractString(data: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Extract a JSON object value ({...}) for `key`, returning the slice spanning
+/// the braces (inclusive). Used for nested initRange/indexRange objects.
+fn extractObject(data: []const u8, key: []const u8) ?[]const u8 {
+    const kpos = findStr(data, key) orelse return null;
+    var i = kpos + key.len;
+    while (i < data.len and data[i] != '{') : (i += 1) {
+        if (data[i] == ',' or data[i] == '}' or data[i] == ']') return null;
+    }
+    if (i >= data.len) return null;
+    const start = i;
+    var depth: usize = 0;
+    var in_string = false;
+    while (i < data.len) : (i += 1) {
+        const c = data[i];
+        if (in_string) {
+            if (c == '\\') { i += 1; continue; }
+            if (c == '"') in_string = false;
+            continue;
+        }
+        if (c == '"') { in_string = true; continue; }
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) return data[start .. i + 1];
+        }
+    }
+    return null;
+}
+
 fn extractInt(data: []const u8, key: []const u8) ?u64 {
     const kpos = findStr(data, key) orelse return null;
     var i = kpos + key.len;
@@ -512,4 +592,45 @@ fn findStr(haystack: []const u8, needle: []const u8) ?usize {
         if (ok) return i;
     }
     return null;
+}
+
+// ── Tests (inline, std.testing) — SABR field parsing + selection (offline) ──
+
+const std = @import("std");
+const testing = std.testing;
+
+test "manifest: parseOneFormat captures SABR fields" {
+    const obj =
+        "{\"itag\":251,\"mimeType\":\"audio/webm; codecs=\\\"opus\\\"\"," ++
+        "\"bitrate\":160000,\"contentLength\":\"5551234\"," ++
+        "\"lastModified\":\"1700000000000000\",\"xtags\":\"acont=dubbed-auto:lang=en\"," ++
+        "\"initRange\":{\"start\":\"0\",\"end\":\"266\"}," ++
+        "\"indexRange\":{\"start\":\"267\",\"end\":\"1023\"}," ++
+        "\"audioSampleRate\":\"48000\",\"url\":\"https://x/videoplayback?e=1\"}";
+    var fmt: StreamFormat = undefined;
+    try testing.expect(parseOneFormat(obj, &fmt));
+    try testing.expectEqual(@as(u16, 251), fmt.itag);
+    try testing.expectEqual(@as(u64, 1700000000000000), fmt.last_modified);
+    try testing.expectEqualSlices(u8, "acont=dubbed-auto:lang=en", fmt.xtags[0..fmt.xtags_len]);
+    try testing.expectEqual(@as(u32, 0), fmt.init_start);
+    try testing.expectEqual(@as(u32, 266), fmt.init_end);
+    try testing.expectEqual(@as(u32, 267), fmt.index_start);
+    try testing.expectEqual(@as(u32, 1023), fmt.index_end);
+    try testing.expectEqual(@as(u64, 5551234), fmt.content_length);
+}
+
+test "manifest: selectBySabr picks the matching itag without a URL" {
+    var formats: [2]StreamFormat = undefined;
+    const a =
+        "{\"itag\":140,\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\",\"bitrate\":128000," ++
+        "\"contentLength\":\"100\",\"lastModified\":\"42\",\"url\":\"https://a/\"}";
+    const v =
+        "{\"itag\":137,\"mimeType\":\"video/mp4; codecs=\\\"avc1\\\"\",\"bitrate\":2000000," ++
+        "\"contentLength\":\"999\",\"lastModified\":\"43\"}"; // no url (SABR-only)
+    try testing.expect(parseOneFormat(a, &formats[0]));
+    try testing.expect(parseOneFormat(v, &formats[1]));
+    const sel = selectBySabr(&formats, 2, 137).?;
+    try testing.expectEqual(@as(u16, 137), sel.itag);
+    try testing.expectEqual(@as(u64, 43), sel.last_modified);
+    try testing.expectEqual(@as(u16, 0), sel.url_len);
 }
