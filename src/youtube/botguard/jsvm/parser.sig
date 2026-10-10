@@ -789,9 +789,11 @@ fn parseThrowStmt() NodeIdx {
 }
 
 fn parseBreakStmt() NodeIdx {
+    const keyword_idx = tok_pos;
     advance(); // consume 'break'
     const node = allocNode(.break_stmt);
     if (node == NULL_NODE) return NULL_NODE;
+    nodes[node].token_idx = @intCast(keyword_idx);
     if (check(.identifier) and !isNewlineBefore()) {
         nodes[node].token_idx = @intCast(tok_pos);
         advance();
@@ -801,9 +803,11 @@ fn parseBreakStmt() NodeIdx {
 }
 
 fn parseContinueStmt() NodeIdx {
+    const keyword_idx = tok_pos;
     advance(); // consume 'continue'
     const node = allocNode(.continue_stmt);
     if (node == NULL_NODE) return NULL_NODE;
+    nodes[node].token_idx = @intCast(keyword_idx);
     if (check(.identifier) and !isNewlineBefore()) {
         nodes[node].token_idx = @intCast(tok_pos);
         advance();

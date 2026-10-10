@@ -24,6 +24,12 @@ pub const winsock = @import("winsock.sig");
 
 // The main public surface: a TLS 1.3 handshake + Conn for wss://.
 pub const handshake = tls.handshake;
+// Injectable-trust-store variant + its provider type, for callers that supply
+// their own anchors instead of the embedded Mozilla bundle.
+pub const handshakeWithRoots = tls.handshakeWithRoots;
+pub const RootsFn = tls.RootsFn;
+pub const parseRootsDer = tls.parseRootsDer;
+pub const Cert = tls.Cert;
 pub const Conn = tls.Conn;
 pub const Transport = tls.Transport;
 // Windows transport + entropy.

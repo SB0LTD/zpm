@@ -146,7 +146,7 @@ fn downloadChunk(
     last_status = 0;
     var result = ChunkResult{};
 
-    const extra = "Origin: https://www.youtube.com\r\nReferer: https://www.youtube.com/\r\n";
+    const extra = "Origin: https://www.youtube.com\r\nReferer: https://www.youtube.com/\r\nAccept-Encoding: identity\r\n";
     const r = http.getRangeInto(
         host,
         port,
@@ -165,16 +165,16 @@ fn downloadChunk(
     // the full Content-Length as total).
     var expected: usize = 0;
     if (r.status == 206) {
-        if (r.total == 0) return result; // need a Content-Range total
+        const cr = parseContentRange(r.content_range) orelse return result;
+        if (cr.start != range_start or cr.end > range_end) return result;
+        const range_len = cr.end - cr.start + 1;
         const got = r.len;
-        if (got == 0 or got > CHUNK_SIZE) return result;
-        // The server must have honored the requested window.
-        if (range_start + got - 1 > range_end) return result;
+        if (got == 0 or got > CHUNK_SIZE or got != range_len) return result;
         expected = got;
-        result.total = r.total;
+        result.total = cr.total;
     } else if (r.status == 200 and range_start == 0) {
         const got = r.len;
-        if (got == 0 or got > CHUNK_SIZE) return result;
+        if (got == 0 or got > CHUNK_SIZE or (r.content_length > 0 and r.content_length != got)) return result;
         expected = got;
         result.total = got; // whole resource delivered in one shot
     } else {

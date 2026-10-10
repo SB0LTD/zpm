@@ -544,9 +544,10 @@ fn parseAttGetResponse(resp: []const u8, chal: *Challenge) bool {
         chal.interpreter_url_len = ulen;
     }
 
-    // visitorData — for session-bound PO token minting.
+    // visitorData — keep the complete server-issued visitor context.
     if (findStrVal(resp, "\"visitorData\"")) |vd| {
-        const vlen = @min(vd.len, chal.visitor_data.len);
+        if (vd.len > chal.visitor_data.len) return false;
+        const vlen = vd.len;
         @memcpy(chal.visitor_data[0..vlen], vd[0..vlen]);
         chal.visitor_data_len = vlen;
     }
@@ -606,4 +607,3 @@ fn printNum(val: usize) void {
     for (0..len) |i| rev[i] = buf[len - 1 - i];
     print(rev[0..len]);
 }
-

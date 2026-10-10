@@ -26,7 +26,13 @@ const keysched384 = @import("keysched384.sig");
 const chacha = @import("chacha20poly1305");
 const x509 = @import("x509.sig");
 const verify = @import("x509_verify.sig");
-const ca_bundle = @import("ca_bundle.sig");
+// NOTE: ca_bundle.sig (the embedded Mozilla trust store, ~776 KB, which in turn
+// pulls in ca_roots_web.sig, ~945 KB) is deliberately NOT imported at the top
+// level. It is reached ONLY through defaultRootsLoad() below — a function-body
+// @import — so a caller that injects its own roots provider (see
+// handshakeWithRoots / RootsFn) never drags the embedded bundle into its module
+// closure. The default path (handshake(), the http/wss clients) is byte-for-byte
+// unchanged: it resolves to defaultRootsLoad which calls ca_bundle.load().
 
 pub const Error = error{
     Io,
@@ -79,6 +85,54 @@ const SIG_ECDSA_SHA384: u16 = 0x0503;
 
 const MAX_RECORD: usize = 16384 + 256; // TLSPlaintext max + AEAD expansion
 const MAX_CERTS: usize = verify.MAX_CHAIN;
+
+/// Upper bound on trust-anchor certificates a roots provider may return into
+/// the handshake-local buffer. Sized for the embedded Mozilla snapshot (137
+/// roots) with headroom; mirrors the old ca_bundle.MAX_ROOTS contract without
+/// forcing ca_bundle.sig into every caller's module graph.
+pub const MAX_ROOTS: usize = 145;
+
+/// Injectable trust-root provider. The handshake calls this to populate a
+/// caller-supplied, stack-resident buffer of parsed trust anchors, then
+/// validates the server chain against roots[0..returned]. Allocator-free: the
+/// provider writes into `out` and returns how many anchors it produced.
+///
+/// Leave it null (the default) and the handshake uses the embedded Mozilla CA
+/// bundle via defaultRootsLoad — identical to the historical behavior. Supply
+/// your own (e.g. an embedded-system kernel shipping a lean root list) and the
+/// embedded bundle is never pulled into your closure.
+pub const RootsFn = *const fn (out: []x509.Cert) usize;
+
+/// Re-export so callers injecting their own roots can name the anchor type and
+/// use parseRootsDer without importing x509.sig directly.
+pub const Cert = x509.Cert;
+
+/// Parse a caller-supplied list of DER-encoded root certificates into `out`,
+/// skipping any that fail to parse. Returns the count written. This is the
+/// allocator-free building block a roots provider uses: hold your anchors as
+/// raw DER (`[]const []const u8`) and call this from a RootsFn. It touches only
+/// x509 (the parser), never ca_bundle.sig, so an injecting caller stays free of
+/// the embedded Mozilla bundle.
+pub fn parseRootsDer(ders: []const []const u8, out: []x509.Cert) usize {
+    var n: usize = 0;
+    for (ders) |der| {
+        if (n >= out.len) break;
+        out[n] = x509.parse(der) catch continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// Default trust-root provider: parse the embedded Mozilla CA bundle. The
+/// @import lives in the function body (not at module scope) so this module can
+/// compile — and callers can link — without ca_bundle.sig/ca_roots_web.sig in
+/// the closure UNLESS defaultRootsLoad is actually referenced. The http/wss
+/// clients reference it (through the null default), so their behavior and
+/// embedded trust store are unchanged.
+pub fn defaultRootsLoad(out: []x509.Cert) usize {
+    const ca_bundle = @import("ca_bundle.sig");
+    return ca_bundle.load(out);
+}
 
 /// A byte transport the TLS layer reads/writes through. The host wires this to
 /// its socket (std.Io.net.Stream, WinHTTP raw socket, a test buffer, ...).
@@ -414,7 +468,16 @@ pub const Conn = struct {
 /// the server certificate chain against the embedded CA bundle at time `now`
 /// (Unix seconds). On success returns an established Conn.
 pub fn handshake(transport: Transport, hostname: []const u8, now: i64) Error!Conn {
-    var hs = Handshaker{ .transport = transport, .hostname = hostname, .now = now };
+    return handshakeWithRoots(transport, hostname, now, null);
+}
+
+/// As `handshake`, but with an injectable trust-root provider. When `roots_fn`
+/// is null the embedded Mozilla CA bundle is used (via defaultRootsLoad), so
+/// this is a strict superset of `handshake` with identical default behavior.
+/// Pass a provider to validate against your own anchors without compiling the
+/// embedded bundle into your module closure.
+pub fn handshakeWithRoots(transport: Transport, hostname: []const u8, now: i64, roots_fn: ?RootsFn) Error!Conn {
+    var hs = Handshaker{ .transport = transport, .hostname = hostname, .now = now, .roots_fn = roots_fn };
     return hs.run();
 }
 
@@ -423,6 +486,8 @@ const Handshaker = struct {
     transport: Transport,
     hostname: []const u8,
     now: i64,
+    // Injected trust-root provider; null selects the embedded Mozilla bundle.
+    roots_fn: ?RootsFn = null,
     transcript: Transcript = .{},
     suite: Suite = SUITE_AES128,
     priv: [32]u8 = undefined,            // X25519 private scalar
@@ -825,10 +890,13 @@ const Handshaker = struct {
             }
         }
 
-        // Validate the certificate chain against the embedded trust store.
+        // Validate the certificate chain against the trust store. The anchor
+        // set comes from the injected provider when supplied, otherwise from
+        // the embedded Mozilla bundle (defaultRootsLoad). Both write parsed
+        // anchors into this handshake-local, stack-resident buffer.
         if (chain_len == 0) return Error.CertInvalid;
-        var roots: [ca_bundle.MAX_ROOTS]x509.Cert = undefined;
-        const nroots = ca_bundle.load(&roots);
+        var roots: [MAX_ROOTS]x509.Cert = undefined;
+        const nroots = if (self.roots_fn) |rf| rf(&roots) else defaultRootsLoad(&roots);
         verify.verifyChain(chain_buf[0..chain_len], roots[0..nroots], self.hostname, self.now) catch
         return Error.CertInvalid;
     }

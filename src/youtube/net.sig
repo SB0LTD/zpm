@@ -44,7 +44,7 @@ var header_scratch: [64 * 1024]u8 = undefined;
 // Serialized request head.
 var req_head: [16 * 1024]u8 = undefined;
 // Built absolute URL for a request.
-var url_buf: [4096]u8 = undefined;
+var url_buf: [zhttp.MAX_URL_BYTES]u8 = undefined;
 // Caller extra-header block, normalized to CRLF-terminated lines.
 var hdr_buf: [8 * 1024]u8 = undefined;
 
@@ -67,6 +67,7 @@ fn nowUnix() i64 {
 /// if it does not fit). Port 443 is omitted (default); anything else is
 /// appended. `path` must start with '/'.
 fn buildUrl(host: []const u8, port: u16, path: []const u8) ?[]const u8 {
+    if (host.len == 0 or path.len == 0 or path[0] != '/') return null;
     var p: usize = 0;
     const scheme = "https://";
     if (p + scheme.len > url_buf.len) return null;
@@ -102,9 +103,10 @@ fn buildUrl(host: []const u8, port: u16, path: []const u8) ?[]const u8 {
 /// header line to be CRLF-terminated; the youtube callers already pass that
 /// form ("Name: v\r\n..."), so this is a bounded copy that also guarantees a
 /// trailing CRLF. Returns the normalized slice (empty if the input was empty).
-fn normalizeHeaders(extra: []const u8) []const u8 {
+fn normalizeHeaders(extra: []const u8) ?[]const u8 {
     if (extra.len == 0) return "";
-    const n = @min(extra.len, hdr_buf.len);
+    if (extra.len > hdr_buf.len) return null;
+    const n = extra.len;
     @memcpy(hdr_buf[0..n], extra[0..n]);
     var len = n;
     // Ensure CRLF termination (callers already do this, but be defensive so
@@ -114,7 +116,7 @@ fn normalizeHeaders(extra: []const u8) []const u8 {
         hdr_buf[len] = '\r';
         hdr_buf[len + 1] = '\n';
         len += 2;
-    }
+    } else return null;
     return hdr_buf[0..len];
 }
 
@@ -133,7 +135,7 @@ pub fn request(
     user_agent: []const u8,
 ) Response {
     const url = buildUrl(host, port, path) orelse return .{};
-    const hdrs = normalizeHeaders(extra_headers);
+    const hdrs = normalizeHeaders(extra_headers) orelse return .{};
 
     const req = zhttp.Request{
         .method = if (method == .post) .POST else .GET,
@@ -202,7 +204,7 @@ fn into(
     out: []u8,
 ) IntoResult {
     const url = buildUrl(host, port, path) orelse return .{};
-    const hdrs = normalizeHeaders(extra_headers);
+    const hdrs = normalizeHeaders(extra_headers) orelse return .{};
     const req = zhttp.Request{
         .method = if (method == .post) .POST else .GET,
         .url = url,
@@ -228,6 +230,9 @@ pub const RangeResult = struct {
     status: u32 = 0,
     len: usize = 0,
     total: u64 = 0,
+    // Borrowed from shared header scratch until the next HTTP request.
+    content_range: []const u8 = "",
+    content_length: u64 = 0,
     ok: bool = false,
 };
 
@@ -259,7 +264,8 @@ pub fn getRangeInto(
     p += writeU64(hb[p..], end);
     hb[p] = '\r'; p += 1;
     hb[p] = '\n'; p += 1;
-    if (extra_headers.len > 0 and p + extra_headers.len <= hb.len) {
+    if (p + extra_headers.len + 2 > hb.len) return .{};
+    if (extra_headers.len > 0) {
         @memcpy(hb[p .. p + extra_headers.len], extra_headers);
         p += extra_headers.len;
         if (!(p >= 2 and hb[p - 2] == '\r' and hb[p - 1] == '\n') and p + 2 <= hb.len) {
@@ -280,28 +286,36 @@ pub fn getRangeInto(
     };
     const resp = zhttp.fetch(req, bufs, nowUnix()) catch return .{};
 
-    var total: u64 = 0;
-    if (resp.header("content-range")) |cr| {
-        if (parseContentRangeTotal(cr)) |t| total = t;
-    }
-    const okstatus = resp.status == 200 or resp.status == 206;
-    return .{ .status = resp.status, .len = resp.body.len, .total = total, .ok = okstatus };
+    const cr = resp.header("content-range") orelse "";
+    const total = parseContentRangeTotal(cr) orelse 0;
+    const content_length = if (resp.header("content-length")) |cl| parseDecimal(cl) orelse 0 else 0;
+    const okstatus = resp.complete and (resp.status == 200 or resp.status == 206);
+    return .{ .status = resp.status, .len = resp.body.len, .total = total, .content_range = cr, .content_length = content_length, .ok = okstatus };
 }
 
 /// Parse the total from "bytes start-end/total"; returns null if malformed.
 fn parseContentRangeTotal(cr: []const u8) ?u64 {
+    const prefix = "bytes ";
+    if (cr.len <= prefix.len) return null;
+    for (prefix, 0..) |c, j| if (cr[j] != c) return null;
     var i: usize = 0;
     while (i < cr.len and cr[i] != '/') : (i += 1) {}
     if (i >= cr.len) return null;
     i += 1;
     if (i >= cr.len or cr[i] == '*') return null;
-    var v: u64 = 0;
-    var any = false;
-    while (i < cr.len and cr[i] >= '0' and cr[i] <= '9') : (i += 1) {
-        v = v * 10 + (cr[i] - '0');
-        any = true;
+    return parseDecimal(cr[i..]);
+}
+
+fn parseDecimal(s: []const u8) ?u64 {
+    if (s.len == 0) return null;
+    var n: u64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        const digit: u64 = c - '0';
+        if (n > (0xFFFFFFFFFFFFFFFF - digit) / 10) return null;
+        n = n * 10 + digit;
     }
-    return if (any) v else null;
+    return n;
 }
 
 fn writeU64(buf: []u8, val: u64) usize {
@@ -330,17 +344,17 @@ test "net: buildUrl includes non-default port" {
 }
 
 test "net: normalizeHeaders passes through CRLF-terminated block" {
-    const h = normalizeHeaders("Content-Type: application/json\r\n");
+    const h = normalizeHeaders("Content-Type: application/json\r\n").?;
     try testing.expectEqualSlices(u8, "Content-Type: application/json\r\n", h);
 }
 
 test "net: normalizeHeaders appends missing CRLF" {
-    const h = normalizeHeaders("X-A: 1");
+    const h = normalizeHeaders("X-A: 1").?;
     try testing.expectEqualSlices(u8, "X-A: 1\r\n", h);
 }
 
 test "net: empty header block stays empty" {
-    try testing.expectEqual(@as(usize, 0), normalizeHeaders("").len);
+    try testing.expectEqual(@as(usize, 0), normalizeHeaders("").?.len);
 }
 
 test "net: Method maps to zpm_http verbs" {

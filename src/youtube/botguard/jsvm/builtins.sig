@@ -164,6 +164,7 @@ pub const N_OBJ_TOSTRING: u16 = NATIVE_BASE + 119; // Object.prototype.toString 
 pub const N_OBJ_IS_PROTO_OF: u16 = NATIVE_BASE + 120; // Object.prototype.isPrototypeOf
 pub const N_OBJ_PROP_IS_ENUM: u16 = NATIVE_BASE + 121; // Object.prototype.propertyIsEnumerable
 pub const N_OBJ_VALUE_OF: u16 = NATIVE_BASE + 122; // Object.prototype.valueOf -> this
+pub const N_OBJ_GET_OWN_DESC: u16 = NATIVE_BASE + 123;
 
 // Number / Date
 pub const N_DATE_NOW: u16 = NATIVE_BASE + 130;
@@ -433,6 +434,7 @@ pub fn installGlobals(global: u32) void {
     installNativeMethod(obj_constructor, "assign", N_OBJ_ASSIGN);
     installNativeMethod(obj_constructor, "create", N_OBJ_CREATE);
     installNativeMethod(obj_constructor, "defineProperty", N_OBJ_DEFINE_PROP);
+    installNativeMethod(obj_constructor, "getOwnPropertyDescriptor", N_OBJ_GET_OWN_DESC);
     installNativeMethod(obj_constructor, "freeze", N_OBJ_FREEZE);
     installNativeMethod(obj_constructor, "getPrototypeOf", N_OBJ_GET_PROTO);
     // Object.prototype must be the shared object_proto so that
@@ -746,6 +748,7 @@ pub fn callNative(func_id: u16, args: []const Value, argc: u8) Value {
         N_OBJ_FREEZE => if (args.len > 0) args[0] else Value.UNDEFINED,
         N_OBJ_GET_PROTO => objGetProto(args),
         N_OBJ_DEFINE_PROP => objDefineProperty(args),
+        N_OBJ_GET_OWN_DESC => objGetOwnDescriptor(args),
         N_OBJ_HAS_OWN => objHasOwn(args),
         N_OBJ_IS_PROTO_OF => objIsPrototypeOf(args),
         N_OBJ_PROP_IS_ENUM => objPropertyIsEnumerable(args),
@@ -816,7 +819,7 @@ fn objProtoToString(args: []const Value) Value {
         .array => "[object Array]",
         .object => blk: {
             const ot = objects.getObject(recv.data.obj_idx).obj_type;
-            break :blk if (ot == .array) "[object Array]" else if (ot == .function) "[object Function]" else if (ot == .regexp) "[object RegExp]" else "[object Object]";
+            break :blk if (objects.isArguments(recv.data.obj_idx)) "[object Arguments]" else if (ot == .array) "[object Array]" else if (ot == .function) "[object Function]" else if (ot == .regexp) "[object RegExp]" else "[object Object]";
         },
         else => "[object Object]",
     };
@@ -1208,9 +1211,28 @@ fn objGetProto(args: []const Value) Value {
 }
 
 /// Object.defineProperty(obj, key, descriptor). BotGuard uses this to install
-/// methods/values, so it MUST actually set the property (a no-op broke method
-/// resolution). Supports `value` and `get` (getter invoked eagerly for a
-/// snapshot value — sufficient for BotGuard's constant-ish descriptors).
+/// methods/values. Preserve omitted attributes on an existing data property;
+/// new properties use the descriptor defaults. Getter reads remain lazy.
+fn objGetOwnDescriptor(args: []const Value) Value {
+    if (args.len < 3) return Value.UNDEFINED;
+    const target = args[1];
+    if (target.tag != .object and target.tag != .array and target.tag != .function) return Value.UNDEFINED;
+    const key = if (args[2].tag == .string) args[2].data.str_idx else valueToStrIdx(args[2]);
+    var prop: objects.Property = undefined;
+    if (!objects.ownPropertyDescriptor(target.data.obj_idx, key, &prop)) return Value.UNDEFINED;
+    const desc = objects.createObject();
+    if (prop.flags.is_getter or prop.flags.is_setter) {
+        objects.setProperty(desc, values.internString("get"), if (prop.flags.is_getter) prop.value else Value.UNDEFINED);
+        objects.setProperty(desc, values.internString("set"), if (prop.flags.is_setter) prop.value else Value.UNDEFINED);
+    } else {
+        objects.setProperty(desc, values.internString("value"), prop.value);
+        objects.setProperty(desc, values.internString("writable"), if (prop.flags.writable) Value.TRUE else Value.FALSE);
+    }
+    objects.setProperty(desc, values.internString("enumerable"), if (prop.flags.enumerable) Value.TRUE else Value.FALSE);
+    objects.setProperty(desc, values.internString("configurable"), if (prop.flags.configurable) Value.TRUE else Value.FALSE);
+    return Value.object(desc);
+}
+
 fn objDefineProperty(args: []const Value) Value {
     if (args.len < 4) return if (args.len >= 2) args[1] else Value.UNDEFINED;
     const target = args[1];
@@ -1222,19 +1244,25 @@ fn objDefineProperty(args: []const Value) Value {
     const dobj: u32 = desc.data.obj_idx;
     // key -> string index
     const key_idx: u32 = if (key.tag == .string) key.data.str_idx else valueToStrIdx(key);
-    // Prefer descriptor.value; else descriptor.get (a getter) stored as-is so a
-    // later access returns the getter function value (BotGuard often reads it).
-    const val = objects.getProperty(dobj, values.internString("value"));
-    if (val.tag != .undefined) {
-        objects.setProperty(tobj, key_idx, val);
+    const existed = objects.hasOwnProperty(tobj, key_idx);
+    const value_key = values.internString("value");
+    if (objects.hasOwnProperty(dobj, value_key)) {
+        objects.setProperty(tobj, key_idx, objects.getProperty(dobj, value_key));
     } else {
         const getter = objects.getProperty(dobj, values.internString("get"));
         if (getter.tag == .function) {
             // Accessor property: mark is_getter so reads invoke the getter.
             objects.setGetterProperty(tobj, key_idx, getter);
+        } else if (!existed) {
+            objects.setProperty(tobj, key_idx, Value.UNDEFINED);
         }
     }
-    objects.setEnumerable(tobj, key_idx, objects.getProperty(dobj, values.internString("enumerable")).isTruthy());
+    const enumerable_key = values.internString("enumerable");
+    if (!existed or objects.hasOwnProperty(dobj, enumerable_key))
+        objects.setEnumerable(tobj, key_idx, objects.getProperty(dobj, enumerable_key).isTruthy());
+    const writable_key = values.internString("writable");
+    if (!existed or objects.hasOwnProperty(dobj, writable_key))
+        objects.setWritable(tobj, key_idx, objects.getProperty(dobj, writable_key).isTruthy());
     return target;
 }
 
@@ -1280,10 +1308,16 @@ fn makeDomElement() Value {
     installNativeMethod(el, "removeChild", N_DOM_NOOP);
     installNativeMethod(el, "addEventListener", N_DOM_NOOP);
     installNativeMethod(el, "removeEventListener", N_DOM_NOOP);
+    // Fresh detached elements have callable focus/blur methods, but no active
+    // document focus or layout box. Their scroll extents start at zero.
+    installNativeMethod(el, "focus", N_DOM_NOOP);
+    installNativeMethod(el, "blur", N_DOM_NOOP);
     installNativeMethod(el, "getContext", N_DOM_GET_CONTEXT);
     installNativeMethod(el, "toDataURL", N_DOM_NOOP);
     objects.setProperty(el, values.internString("width"), Value.number(0));
     objects.setProperty(el, values.internString("height"), Value.number(0));
+    objects.setProperty(el, values.internString("scrollWidth"), Value.number(0));
+    objects.setProperty(el, values.internString("scrollHeight"), Value.number(0));
     // iframe realm access: BotGuard creates an iframe and reads
     // `iframe.contentWindow` to get a fresh realm's pristine `String`/`eval`
     // (anti-tamper). jsdom returns a real Window; we return the global object

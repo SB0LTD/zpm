@@ -552,6 +552,55 @@ pub fn dbgMkuvEnclLc() u16 { return dbg_mkuv_encl_lc; }
 pub fn dbgMkuvEnclPc() u16 { return dbg_mkuv_encl_pc; }
 // Watch writes to a specific absolute stack address (Tt's K slot).
 pub var dbg_slot15_watch: u32 = 0xFFFFFFFF;
+// Func-filtered `t` write trace (483 slot 9).
+pub var dbg_twrite_func: u16 = 0xFFFF;
+pub var dbg_twrite_slot: u16 = 0xFFFF;
+pub var dbg_twrite_n: u32 = 0;
+pub var dbg_twrite_tag: [24]u8 = [_]u8{255} ** 24;
+pub var dbg_twrite_ip: [24]u32 = [_]u32{0} ** 24;
+pub var dbg_twrite_num: [24]f64 = [_]f64{-987654.0} ** 24;
+pub var dbg_twrite_objtype: [24]u8 = [_]u8{255} ** 24;
+pub var dbg_twrite_str: [24][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 24;
+pub var dbg_twrite_slen: [24]usize = [_]usize{0} ** 24;
+pub var dbg_twrite_y: [24]i32 = [_]i32{-1} ** 24;
+pub var dbg_twrite_xobj: [24]u32 = [_]u32{0xFFFFFFFF} ** 24;
+pub var dbg_badcell_captured: bool = false;
+pub var dbg_badcell_tag: u8 = 255;
+pub var dbg_badcell_obj: u32 = 0xFFFFFFFF;
+pub var dbg_badcell_objtype: u8 = 255;
+pub var dbg_badcell_create_fid: u16 = 0xFFFF;
+pub var dbg_badcell_g_tag: u8 = 255;
+pub var dbg_badcell_g_str: [32]u8 = undefined;
+pub var dbg_badcell_g_slen: usize = 0;
+pub var dbg_badcell_proto_tag: u8 = 255;
+pub var dbg_badcell_proto_hasown: u8 = 0;
+pub var dbg_badcell_proto_str: [32]u8 = undefined;
+pub var dbg_badcell_proto_slen: usize = 0;
+pub var dbg_badcell_value_tag: u8 = 255;
+pub var dbg_badcell_value_hasown: u8 = 0;
+pub var dbg_badcell_proto_fid: u16 = 0xFFFF;
+pub var dbg_badcell_proto_getter_fid: u16 = 0xFFFF;
+pub fn dbgBadcellProtoFid() u16 { return dbg_badcell_proto_fid; }
+pub fn dbgBadcellProtoGetterFid() u16 { return dbg_badcell_proto_getter_fid; }
+pub fn dbgBadcellProtoTag() u8 { return dbg_badcell_proto_tag; }
+pub fn dbgBadcellProtoHasOwn() u8 { return dbg_badcell_proto_hasown; }
+pub fn dbgBadcellProtoStr() []const u8 { return dbg_badcell_proto_str[0..dbg_badcell_proto_slen]; }
+pub fn dbgBadcellValueTag() u8 { return dbg_badcell_value_tag; }
+pub fn dbgBadcellValueHasOwn() u8 { return dbg_badcell_value_hasown; }
+pub fn dbgBadcellTag() u8 { return dbg_badcell_tag; }
+pub fn dbgBadcellObj() u32 { return dbg_badcell_obj; }
+pub fn dbgBadcellObjType() u8 { return dbg_badcell_objtype; }
+pub fn dbgBadcellCreateFid() u16 { return dbg_badcell_create_fid; }
+pub fn dbgBadcellGTag() u8 { return dbg_badcell_g_tag; }
+pub fn dbgBadcellGStr() []const u8 { return dbg_badcell_g_str[0..dbg_badcell_g_slen]; }
+pub fn dbgTwriteY(i: usize) i32 { return dbg_twrite_y[i % 24]; }
+pub fn dbgTwriteXObj(i: usize) u32 { return dbg_twrite_xobj[i % 24]; }
+pub fn dbgTwriteN() u32 { return dbg_twrite_n; }
+pub fn dbgTwriteTag(i: usize) u8 { return dbg_twrite_tag[i % 24]; }
+pub fn dbgTwriteIp(i: usize) u32 { return dbg_twrite_ip[i % 24]; }
+pub fn dbgTwriteNum(i: usize) f64 { return dbg_twrite_num[i % 24]; }
+pub fn dbgTwriteObjType(i: usize) u8 { return dbg_twrite_objtype[i % 24]; }
+pub fn dbgTwriteStr(i: usize) []const u8 { return dbg_twrite_str[i % 24][0..dbg_twrite_slen[i % 24]]; }
 pub var dbg_slot15_n: u32 = 0;
 pub var dbg_slot15_func: [16]u16 = [_]u16{0} ** 16;
 pub var dbg_slot15_slot: [16]u16 = [_]u16{0} ** 16;
@@ -1204,6 +1253,9 @@ pub fn dbgBadProtoName(i: usize) []const u8 { return if (i < dbg_badproto_names_
 pub fn dbgBankRegYTag() u8 { return dbg_bankreg_ytag; }
 pub fn dbgBankRegCellTag() u8 { return dbg_bankreg_celltag; }
 pub fn dbgBankRegHasY() u8 { return dbg_bankreg_hasY; }
+pub var dbg_reg74_target: u32 = 74;
+pub var dbg_reg74_last_cell: u32 = 0xFFFFFFFF;
+pub fn dbgReg74LastCell() u32 { return dbg_reg74_last_cell; }
 pub var dbg_reg74_valtag: [16]u8 = [_]u8{255} ** 16;
 pub var dbg_reg74_bankobj: [16]u32 = [_]u32{0xFFFFFFFF} ** 16;
 pub var dbg_reg74_func: [16]u16 = [_]u16{0xFFFF} ** 16;
@@ -1503,6 +1555,7 @@ pub fn execute() Value {
 
     // Initialize global object with builtins and browser environment stubs.
     objects.reset();
+    objects.bindRuntimeStack(stack[0..]);
     global_obj = objects.createObject();
     builtins.invoke_callback = &invokeBuiltinCallback;
     builtins.installGlobals(global_obj);
@@ -1643,6 +1696,7 @@ fn run() Value {
     var steps: u64 = 0;
     const MAX_STEPS: u64 = execution_limit; // guard against infinite loops
     while (true) {
+        if (values.exhausted) { fail("string arena exhausted"); return error_value; }
         if (had_error) break;
         if (frame_count == 0) break;
         steps += 1;
@@ -1756,6 +1810,72 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                     dbg_slot15_ip[dbg_slot15_n] = frame.ip;
                     if (pv2.tag == .string) dbg_slot15_slen[dbg_slot15_n] = @intCast(values.getStringLen(pv2.data.str_idx)) else dbg_slot15_slen[dbg_slot15_n] = 0;
                     dbg_slot15_n += 1;
+                }
+                // Func-filtered `t` write trace: record EVERY set_local to slot
+                // `dbg_twrite_slot` while executing func `dbg_twrite_func` (483),
+                // keeping the LAST N (ring), so we see what `t` was assigned and
+                // any later reassignment — ignoring unrelated frames reusing the
+                // same absolute address.
+                if (frame.func_id == dbg_twrite_func and slot == dbg_twrite_slot) {
+                    const pv3 = peek();
+                    const wi = dbg_twrite_n % dbg_twrite_tag.len;
+                    dbg_twrite_tag[wi] = @intFromEnum(pv3.tag);
+                    dbg_twrite_ip[wi] = frame.ip;
+                    dbg_twrite_num[wi] = if (pv3.tag == .number) pv3.data.number else -987654.0;
+                    dbg_twrite_objtype[wi] = if (pv3.tag == .object or pv3.tag == .array) @intFromEnum(objects.objTypeOf(pv3.data.obj_idx)) else 255;
+                    if (pv3.tag == .string) { const ss = values.getString(pv3.data.str_idx); const cn = @min(ss.len, 32); @memcpy(dbg_twrite_str[wi][0..cn], ss[0..cn]); dbg_twrite_slen[wi] = cn; } else dbg_twrite_slen[wi] = 0;
+                    // Record Y (local 4) and x (local 2 obj) for this invocation.
+                    const yv = stack[frame.bp + 4];
+                    dbg_twrite_y[wi] = if (yv.tag == .number) @intFromFloat(@floor(yv.data.number)) else -1;
+                    const xv2 = stack[frame.bp + 2];
+                    dbg_twrite_xobj[wi] = if (xv2.tag == .object or xv2.tag == .array) xv2.data.obj_idx else 0xFFFFFFFF;
+                    // On the FIRST bad (string) write, snapshot bank.Y[Y] = the
+                    // register cell, and its `.create`/`.concat` closures' g.
+                    if (pv3.tag == .string and !dbg_badcell_captured and (xv2.tag == .object or xv2.tag == .array) and yv.tag == .number) {
+                        dbg_badcell_captured = true;
+                        const bankobj = xv2.data.obj_idx;
+                        const yprop = values.internString("Y");
+                        const ybank = objects.getProperty(bankobj, yprop);
+                        if (ybank.tag == .object or ybank.tag == .array) {
+                            const cellv = objects.getArrayElement(ybank.data.obj_idx, @intFromFloat(@floor(yv.data.number)));
+                            dbg_badcell_tag = @intFromEnum(cellv.tag);
+                            if (cellv.tag == .object or cellv.tag == .array) {
+                                const cellobj = cellv.data.obj_idx;
+                                dbg_badcell_obj = cellobj;
+                                dbg_badcell_objtype = @intFromEnum(objects.objTypeOf(cellobj));
+                                // Probe `create` method's closure g (uv0).
+                                // Probe `.prototype` and `.value` on the cell.
+                                const protoname = values.internString("prototype");
+                                const protov = objects.getProperty(cellobj, protoname);
+                                dbg_badcell_proto_tag = @intFromEnum(protov.tag);
+                                dbg_badcell_proto_hasown = if (objects.hasOwnProperty(cellobj, protoname)) 1 else 0;
+                                if (protov.tag == .function) dbg_badcell_proto_fid = objects.closureFuncId(protov.data.func_idx);
+                                // Also check if `prototype` resolves as a GETTER.
+                                var pgetter: Value = Value.UNDEFINED;
+                                if (objects.getPropertyGetter(cellobj, protoname, &pgetter) and pgetter.tag == .function) {
+                                    dbg_badcell_proto_getter_fid = objects.closureFuncId(pgetter.data.func_idx);
+                                }
+                                if (protov.tag == .string) { const ps2 = values.getString(protov.data.str_idx); const cn4 = @min(ps2.len, 32); @memcpy(dbg_badcell_proto_str[0..cn4], ps2[0..cn4]); dbg_badcell_proto_slen = cn4; }
+                                const valuename = values.internString("value");
+                                dbg_badcell_value_tag = @intFromEnum(objects.getProperty(cellobj, valuename).tag);
+                                dbg_badcell_value_hasown = if (objects.hasOwnProperty(cellobj, valuename)) 1 else 0;
+                                const crname = values.internString("create");
+                                const crm = objects.getProperty(cellobj, crname);
+                                if (crm.tag == .function) {
+                                    const cfo = crm.data.func_idx;
+                                    dbg_badcell_create_fid = objects.closureFuncId(cfo);
+                                    if (objects.closureUpvalCount(cfo) > 0) {
+                                        var gv3 = Value.UNDEFINED;
+                                        if (objects.isClosureUpvalClosed(cfo, 0)) gv3 = objects.getClosureUpvalClosedVal(cfo, 0)
+                                        else { const a = objects.getClosureUpvalAddr(cfo, 0); if (a != objects.NO_UPVAL_ADDR and a < MAX_STACK) gv3 = stack[a]; }
+                                        dbg_badcell_g_tag = @intFromEnum(gv3.tag);
+                                        if (gv3.tag == .string) { const gs = values.getString(gv3.data.str_idx); const cn2 = @min(gs.len, 32); @memcpy(dbg_badcell_g_str[0..cn2], gs[0..cn2]); dbg_badcell_g_slen = cn2; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    dbg_twrite_n += 1;
                 }
                 // O-state probe: record writes to the watched func's P slot so we
                 // can see the state-machine transition sequence and pinpoint the
@@ -2446,6 +2566,13 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                     return false;
                 }
                 const ge_res = getElemFromValue(obj_val, key);
+                if (dbg_gtrace_on and dbg_gtrace_n >= 3700 and dbg_gtrace_n <= 3910 and key.tag == .string and ge_res.tag == .undefined and dbg_probe_n < dbg_probe_key.len) {
+                    dbg_probe_key[dbg_probe_n] = key.data.str_idx;
+                    dbg_probe_gn[dbg_probe_n] = dbg_gtrace_n;
+                    dbg_probe_obj[dbg_probe_n] = obj_val;
+                    dbg_probe_func[dbg_probe_n] = frame.func_id;
+                    dbg_probe_n += 1;
+                }
                 // Provenance probe: record obj + key so a callee produced by
                 // get_elem (T-bank read) can be traced to its exact index.
                 dbg_lastgetelem_objidx = if (obj_val.tag == .object or obj_val.tag == .array) obj_val.data.obj_idx else 0xFFFFFFFF;
@@ -2480,7 +2607,19 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                     // Targeted: capture EVERY write to register index 74 (the one Q reads
                     // void), recording the value tag, and if the value is a cell object,
                     // its getter's closed-over g value tag — plus the writing func/ip.
-                    if (@floor(key.data.number) == 74 and dbg_reg74_n < 16) {
+                    if (@floor(key.data.number) == dbg_reg74_target and dbg_reg74_n < 16) {
+                        // Remember the cell object installed here so we can watch
+                        // its `.concat`/`.create` later (the g-mutation path).
+                        if (val.tag == .function or val.tag == .object) {
+                            dbg_reg74_last_cell = val.data.obj_idx;
+                            // Auto-arm concat watch on the FIRST cell (object) installed
+                            // at the target register, so we capture every value written
+                            // to its closed-over g via `.concat(P)`.
+                            if (val.tag == .object and dbg_concat_watch_obj == 0xFFFFFFFF) {
+                                dbg_concat_watch_obj = val.data.obj_idx;
+                                dbg_concat_n = 0;
+                            }
+                        }
                         dbg_reg74_valtag[dbg_reg74_n] = @intFromEnum(val.tag);
                         dbg_reg74_bankobj[dbg_reg74_n] = obj_val.data.obj_idx;
                         dbg_reg74_func[dbg_reg74_n] = if (frame_count > 0) frames[frame_count - 1].func_id else 0xFFFF;
@@ -2644,7 +2783,20 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
 
             // Logical
             .not => { const a = pop(); push(boolVal(!a.isTruthy())); },
-            .typeof_op => { const a = pop(); push(typeofValue(a)); },
+            .typeof_op => {
+                const a = pop();
+                if (dbg_gtrace_on and dbg_type_n < dbg_type_gn.len) {
+                    dbg_type_gn[dbg_type_n] = dbg_gtrace_n;
+                    dbg_type_func[dbg_type_n] = frame.func_id;
+                    dbg_type_name[dbg_type_n] = last_lookup_name;
+                    dbg_type_value[dbg_type_n] = a;
+                    dbg_type_key[dbg_type_n] = values.internString(dbg_lastgetelem_keystr[0..dbg_lastgetelem_keystr_len]);
+                    dbg_type_obj[dbg_type_n] = dbg_lastgetelem_objidx;
+                    for (0..3) |di| dbg_type_callers[dbg_type_n][di] = if (frame_count > di+1) frames[frame_count-di-2].func_id else 0xFFFF;
+                    dbg_type_n += 1;
+                }
+                push(typeofValue(a));
+            },
             .void_op => { _ = pop(); push(Value.UNDEFINED); },
             .delete_op => { _ = pop(); push(Value.TRUE); },
 
@@ -2738,6 +2890,123 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
             },
             .ret => {
                 const result = pop();
+                // ── Capture the func that returns a STRING to a func-483 caller
+                // (i.e. the `v` in `t=v(x,Y)`), once — identifies the real reader.
+                if (!dbg_vcallee_captured and result.tag == .string and frame_count >= 2
+                    and frames[frame_count - 2].func_id == 483) {
+                    dbg_vcallee_captured = true;
+                    dbg_vcallee_func = frame.func_id;
+                    dbg_vcallee_ip = frames[frame_count - 2].ip;
+                    const rs2 = values.getString(result.data.str_idx);
+                    const cn3 = @min(rs2.len, dbg_vcallee_str.len);
+                    @memcpy(dbg_vcallee_str[0..cn3], rs2[0..cn3]);
+                    dbg_vcallee_str_len = cn3;
+                }
+                // ── func-40 (cell .concat) capture: it returns f = g[p]. Capture
+                // the FIRST string-return (the bad reg-116 case) and the FIRST
+                // array/object-return (a good reg) so we can diff p, g[p], the
+                // counter upvalues, and g[]. func 40 = function(P,Z,p,f){...}:
+                // locals L0=recv,L1=P,L2=Z,L3=p,L4=f ; upvalues capture F,D,r,Y,x,g,W.
+                if (frame.func_id == 40) {
+                    // Ring: record func-40 returns for the TARGET receiver cell
+                    // (reg-116 cell; deterministic obj on the pinned run). If the
+                    // target is unset (0xFFFFFFFF) record all.
+                    const recvv0 = stack[frame.bp]; // this (receiver) is bp slot 0
+                    const recvobj0: u32 = if (recvv0.tag == .object or recvv0.tag == .array) recvv0.data.obj_idx else 0xFFFFFFFF;
+                    if ((dbg_f40_target_recv == 0xFFFFFFFF or recvobj0 == dbg_f40_target_recv) and dbg_f40ring_n < dbg_f40ring_rtag.len) {
+                        const k = dbg_f40ring_n;
+                        dbg_f40ring_rtag[k] = @intFromEnum(result.tag);
+                        const recvv = stack[frame.bp]; // this (receiver) is bp slot 0
+                        dbg_f40ring_recv[k] = if (recvv.tag == .object or recvv.tag == .array) recvv.data.obj_idx else 0xFFFFFFFF;
+                        const pR = stack[frame.bp + 3];
+                        dbg_f40ring_p[k] = if (pR.tag == .number) pR.data.number else -987654.0;
+                        if (result.tag == .string) {
+                            const rsx = values.getString(result.data.str_idx);
+                            const cn = @min(rsx.len, 40); @memcpy(dbg_f40ring_str[k][0..cn], rsx[0..cn]); dbg_f40ring_slen[k] = cn;
+                        }
+                        dbg_f40ring_n += 1;
+                    }
+                    // Detailed slot[0] = first string-return FROM THE TARGET CELL
+                    // (reg-116 cell 1826); slot[1] = first array-return from any cell.
+                    const is_str = result.tag == .string;
+                    const is_arr = result.tag == .object or result.tag == .array;
+                    const on_target = (dbg_f40_target_recv == 0xFFFFFFFF or recvobj0 == dbg_f40_target_recv);
+                    const slot = if (is_str and on_target and !dbg_f40_str_done) @as(i32, 0)
+                        else if (is_arr and !dbg_f40_arr_done) @as(i32, 1) else @as(i32, -1);
+                    if (slot >= 0) {
+                        const si: usize = @intCast(slot);
+                        if (slot == 0) dbg_f40_str_done = true else dbg_f40_arr_done = true;
+                        dbg_f40_rtag[si] = @intFromEnum(result.tag);
+                        const pL3 = stack[frame.bp + 3];
+                        dbg_f40_p[si] = if (pL3.tag == .number) pL3.data.number else -987654.0;
+                        // Returned f: if string, record it; if array, its first elems.
+                        if (result.tag == .string) {
+                            const fs = values.getString(result.data.str_idx);
+                            const cn = @min(fs.len, 32); @memcpy(dbg_f40_fstr[si][0..cn], fs[0..cn]); dbg_f40_fslen[si] = cn;
+                        }
+                        // Closure upvalues (F,D,r,Y,x,g,W in some order) — snapshot
+                        // the first 12 upvalue value tags+numbers + find the g array.
+                        const clo = frame.closure_obj;
+                        const uvc = objects.closureUpvalCount(clo);
+                        dbg_f40_uvcount[si] = uvc;
+                        var ui: u16 = 0;
+                        while (ui < uvc and ui < 12) : (ui += 1) {
+                            var uv: Value = Value.UNDEFINED;
+                            if (objects.isClosureUpvalClosed(clo, ui)) uv = objects.getClosureUpvalClosedVal(clo, ui)
+                            else { const a = objects.getClosureUpvalAddr(clo, ui); if (a != objects.NO_UPVAL_ADDR and a < MAX_STACK) uv = stack[a]; }
+                            dbg_f40_uvtag[si][ui] = @intFromEnum(uv.tag);
+                            dbg_f40_uvnum[si][ui] = if (uv.tag == .number) uv.data.number else -987654.0;
+                            // If this upvalue is the g array (object/array with len>=10), snapshot it.
+                            if (uv.tag == .object or uv.tag == .array) {
+                                const gi = uv.data.obj_idx;
+                                const gl = objects.arrayLength(gi);
+                                if (gl >= 8 and dbg_f40_glen[si] == 0) {
+                                    dbg_f40_glen[si] = gl;
+                                    dbg_f40_guv[si] = ui;
+                                    var ge: usize = 0;
+                                    while (ge < 16 and ge < gl) : (ge += 1) {
+                                        const gev = objects.getArrayElement(gi, @intCast(ge));
+                                        dbg_f40_gtag[si][ge] = @intFromEnum(gev.tag);
+                                        dbg_f40_gnum[si][ge] = if (gev.tag == .number) gev.data.number else -987654.0;
+                                        if (gev.tag == .string) {
+                                            const ges = values.getString(gev.data.str_idx);
+                                            const gcn = @min(ges.len, 15); @memcpy(dbg_f40_gstr[si][ge][0..gcn], ges[0..gcn]); dbg_f40_gstrlen[si][ge] = gcn;
+                                        }
+                                    }
+                                    // Also capture g[p] directly (p may be fractional/out-of-range).
+                                    if (pL3.tag == .number) {
+                                        const pf = pL3.data.number;
+                                        if (pf >= 0 and pf < @as(f64, @floatFromInt(gl))) {
+                                            const gpv = objects.getArrayElement(gi, @intFromFloat(@floor(pf)));
+                                            dbg_f40_gp_tag[si] = @intFromEnum(gpv.tag);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // ── v()-return capture: when func 113 (the register reader `v`)
+                // returns a STRING, record which bank/reg/cell produced it, once.
+                if (!dbg_vret_captured and frame.func_id == 113
+                    and stack[frame.bp + 2].tag == .number
+                    and @floor(stack[frame.bp + 2].data.number) == @as(f64, @floatFromInt(dbg_vret_want_reg))) {
+                    dbg_vret_captured = true;
+                    dbg_vret_result_tag = @intFromEnum(result.tag);
+                    const bL1 = stack[frame.bp + 1]; // b (bank)
+                    const xL2 = stack[frame.bp + 2]; // x (reg index)
+                    const gL3 = stack[frame.bp + 3]; // g (cell object)
+                    dbg_vret_bank = if (bL1.tag == .object or bL1.tag == .array) bL1.data.obj_idx else 0xFFFFFFFF;
+                    dbg_vret_reg = if (xL2.tag == .number) @intFromFloat(@floor(xL2.data.number)) else -1;
+                    dbg_vret_cell = if (gL3.tag == .object or gL3.tag == .array or gL3.tag == .function) gL3.data.obj_idx else 0xFFFFFFFF;
+                    dbg_vret_cell_tag = @intFromEnum(gL3.tag);
+                    if (result.tag == .string) {
+                        const rs = values.getString(result.data.str_idx);
+                        const cn = @min(rs.len, dbg_vret_str.len);
+                        @memcpy(dbg_vret_str[0..cn], rs[0..cn]);
+                        dbg_vret_str_len = cn;
+                    }
+                }
                 returnFromFrame(result);
             },
             .ret_undef => {
@@ -3073,6 +3342,58 @@ fn invokeBuiltinCallback(fn_val: Value, this_val: Value, args: []const Value) Va
         if (args.len > 2) args[2] else Value.UNDEFINED, @intCast(args.len));
 }
 
+fn prepareUserLocals(bp: u16, fobj: u32, actual_count: usize) void {
+    const fid = objects.getObject(fobj).func_id;
+    const desc = compiler.getFunction(fid);
+    const end: usize = @as(usize, bp) + desc.local_count;
+    if (end > MAX_STACK or @as(usize, bp) + 1 + actual_count > sp) {
+        fail("function local capacity exceeded");
+        return;
+    }
+    var arguments_obj: u32 = objects.NULL_OBJ;
+    if (desc.arguments_slot != 0xFFFF) {
+        arguments_obj = objects.createObject();
+        objects.markArguments(arguments_obj);
+        var i: usize = 0;
+        while (i < actual_count) : (i += 1) {
+            const key = builtins.keyToNameIdx(Value.number(@floatFromInt(i)));
+            objects.setProperty(arguments_obj, key, stack[@as(usize, bp) + 1 + i]);
+        }
+        const length_key = values.internString("length");
+        objects.setProperty(arguments_obj, length_key, Value.number(@floatFromInt(actual_count)));
+        objects.setEnumerable(arguments_obj, length_key, false);
+        if (desc.arguments_mapped) {
+            const callee_key = values.internString("callee");
+            objects.setProperty(arguments_obj, callee_key, Value.function(fobj));
+            objects.setEnumerable(arguments_obj, callee_key, false);
+        }
+    }
+    // Extra supplied arguments must never initialize ordinary local variables.
+    // Missing formals and all nonparameter slots begin as undefined.
+    var slot: usize = 1;
+    while (slot < desc.local_count) : (slot += 1) {
+        if (slot > desc.param_count or slot > actual_count) stack[@as(usize, bp) + slot] = Value.UNDEFINED;
+    }
+    sp = @intCast(end);
+    if (arguments_obj == objects.NULL_OBJ) return;
+    stack[bp + desc.arguments_slot] = Value.object(arguments_obj);
+    if (!desc.arguments_mapped) return;
+    var i: usize = @min(actual_count, desc.param_count);
+    while (i > 0) {
+        i -= 1;
+        const name = compiler.funcLocalName(fid, @intCast(i + 1));
+        var repeated = false;
+        var later = i + 1;
+        while (later < desc.param_count) : (later += 1) {
+            if (compiler.funcLocalName(fid, @intCast(later + 1)) == name) { repeated = true; break; }
+        }
+        if (!repeated and name != 0xFFFFFFFF) {
+            const key = builtins.keyToNameIdx(Value.number(@floatFromInt(i)));
+            objects.bindMappedProperty(arguments_obj, key, @intCast(@as(usize, bp) + i + 1));
+        }
+    }
+}
+
 fn callValueSync(fn_val: Value, this_val: Value, a0: Value, a1: Value, a2: Value, argc: u8) Value {
     if (fn_val.tag != .function) return Value.UNDEFINED;
     const fobj: u32 = fn_val.data.func_idx;
@@ -3139,7 +3460,7 @@ fn callValueSync(fn_val: Value, this_val: Value, a0: Value, a1: Value, a2: Value
     frames[frame_count] = .{ .func_id = obj.func_id, .ip = func_desc.code_start, .bp = base, .closure_obj = fobj };
     frame_count += 1;
     const need = func_desc.local_count;
-    while (sp < base + need) push(Value.UNDEFINED);
+    prepareUserLocals(base, fobj, argc);
     if (obj.func_id == dbg_entry_watch_func and !dbg_entry_captured) {
         dbg_entry_captured = true;
         dbg_entry_bp = @intCast(base);
@@ -3195,7 +3516,7 @@ pub fn callExportedN(fn_val: Value, this_val: Value, args: []const Value) Value 
     frames[frame_count] = .{ .func_id = obj.func_id, .ip = func_desc.code_start, .bp = base, .closure_obj = fobj };
     frame_count += 1;
     const need = func_desc.local_count;
-    while (sp < base + need) push(Value.UNDEFINED);
+    prepareUserLocals(base, fobj, args.len);
     if (obj.func_id == dbg_entry_watch_func and !dbg_entry_captured) {
         dbg_entry_captured = true;
         dbg_entry_bp = @intCast(base);
@@ -3264,6 +3585,7 @@ pub var dbg_encode_len: [128]u32 = undefined;
 pub var dbg_encode_g: [128]Value = undefined;
 pub var dbg_encode_caller: [128]u16 = undefined;
 fn dbgHashEntry(frame: *CallFrame) void {
+    if (!dbg_gtrace_on) return;
     if (frame.func_id == 302 and frame.ip == compiler.getFunction(302).code_start + 1 and dbg_encode_n < 128) {
         dbg_encode_args[dbg_encode_n] = stack[frame.bp + 1]; dbg_encode_x[dbg_encode_n] = stack[frame.bp + 2]; dbg_encode_g[dbg_encode_n] = stack[frame.bp + 3];
         dbg_encode_caller[dbg_encode_n] = if (frame_count > 1) frames[frame_count-2].func_id else 0xFFFF;
@@ -3608,9 +3930,7 @@ fn callFunction(argc: u8) void {
             // Extend stack so all declared local slots exist (this + params +
             // any additional locals declared in the body).
             const locals_needed = func_desc.local_count;
-            while (sp < new_bp + locals_needed) {
-                push(Value.UNDEFINED);
-            }
+            prepareUserLocals(@intCast(new_bp), obj_idx, argc);
             // Count all calls to the J-log func (register read); capture the
             // FIRST call whose bank (slot 2) is NOT an object (the anomaly), with
             // its call index, n, bank tag, and caller.
@@ -4421,6 +4741,12 @@ pub fn dbgConcatE1(i: usize) f64 { return if (i < 64) dbg_concat_e1[i] else -987
 pub fn dbgConcatE2(i: usize) f64 { return if (i < 64) dbg_concat_e2[i] else -987654.0; }
 pub fn dbgConcatCaller(i: usize) u16 { return if (i < 64) dbg_concat_caller[i] else 0xFFFF; }
 pub fn dbgConcatCallerIp(i: usize) u32 { return if (i < 64) dbg_concat_caller_ip[i] else 0; }
+pub var dbg_concat_pnum: [64]f64 = [_]f64{-987654.0} ** 64;
+pub var dbg_concat_firststr: [64]u8 = undefined;
+pub var dbg_concat_firststr_len: usize = 0;
+pub fn dbgConcatPNum(i: usize) f64 { return if (i < 64) dbg_concat_pnum[i] else -987654.0; }
+pub fn dbgConcatFirstStr() []const u8 { return dbg_concat_firststr[0..dbg_concat_firststr_len]; }
+pub fn dbgConcatWatchObj() u32 { return dbg_concat_watch_obj; }
 fn callMethod(argc: u8) void {
     // func is below receiver+args (argc+2 slots from top).
     const need: u16 = @as(u16, argc) + 2;
@@ -4491,6 +4817,11 @@ fn callMethod(argc: u8) void {
                 dbg_concat_e1[j] = if (e1.tag == .number) e1.data.number else -987654.0;
                 dbg_concat_e2[j] = if (e2.tag == .number) e2.data.number else -987654.0;
             }
+            if (pv.tag == .string) {
+                const ps = values.getString(pv.data.str_idx);
+                dbg_concat_pnum[j] = -888888.0;
+                if (j == 0) { const cn = @min(ps.len, dbg_concat_firststr.len); @memcpy(dbg_concat_firststr[0..cn], ps[0..cn]); dbg_concat_firststr_len = cn; }
+            } else if (pv.tag == .number) dbg_concat_pnum[j] = pv.data.number;
             dbg_concat_caller[j] = if (frame_count > 0) frames[frame_count - 1].func_id else 0xFFFF;
             dbg_concat_caller_ip[j] = if (frame_count > 0) frames[frame_count - 1].ip else 0;
             dbg_concat_n += 1;
@@ -4571,7 +4902,7 @@ fn callMethod(argc: u8) void {
             };
             frame_count += 1;
             const locals_needed = func_desc.local_count;
-            while (sp < new_bp + locals_needed) push(Value.UNDEFINED);
+            prepareUserLocals(new_bp, obj_idx, argc);
             if (obj.func_id == dbg_entry_watch_func and !dbg_entry_captured) {
                 dbg_entry_captured = true;
                 dbg_entry_bp = new_bp;
@@ -4638,6 +4969,79 @@ fn callMethod(argc: u8) void {
                 dbg_ncm_prop_count += 1;
             }
             if (last_lookup_name != 0) dbg_ncm_method_present = objects.hasOwnProperty(ridx, last_lookup_name);
+        }
+    }
+    // ── Push-specific capture: when `t.push` fails, record exactly what `t` is
+    // (tag/objType/arrayLength/proto) so we can tell array-stored-as-object vs
+    // genuinely-wrong-value. Fires on the FIRST push failure only.
+    if (!dbg_pushfail_captured and eql(values.getString(last_lookup_name), "push")) {
+        dbg_pushfail_captured = true;
+        const prv = stack[recv_slot];
+        dbg_pushfail_recv_tag = @intFromEnum(prv.tag);
+        if (prv.tag == .string) {
+            dbg_pushfail_str_idx = prv.data.str_idx;
+            const s = values.getString(prv.data.str_idx);
+            const cn = @min(s.len, dbg_pushfail_str.len);
+            @memcpy(dbg_pushfail_str[0..cn], s[0..cn]);
+            dbg_pushfail_str_len = cn;
+        }
+        if (prv.tag == .object or prv.tag == .array) {
+            const pidx = prv.data.obj_idx;
+            dbg_pushfail_recv_obj = pidx;
+            dbg_pushfail_recv_objtype = @intFromEnum(objects.objTypeOf(pidx));
+            dbg_pushfail_recv_arrlen = objects.arrayLength(pidx);
+            dbg_pushfail_recv_proto = objects.getObjectPrototypeIdx(pidx);
+            dbg_pushfail_recv_propcount = objects.ownPropCount(pidx);
+            dbg_pushfail_arrayproto = objects.getArrayProto();
+            // Does the prototype chain resolve `push` as a data/getter prop?
+            var cur = pidx; var depth: u8 = 0;
+            while (cur != objects.NULL_OBJ and depth < 16) : (depth += 1) {
+                const k = objects.dbgOwnPropKind(cur, last_lookup_name);
+                if (k != 0) { dbg_pushfail_proto_has_push = k; dbg_pushfail_push_owner = cur; break; }
+                cur = objects.getObjectPrototypeIdx(cur);
+            }
+        }
+        if (frame_count > 0) {
+            dbg_pushfail_func = frames[frame_count - 1].func_id;
+            dbg_pushfail_ip = frames[frame_count - 1].ip;
+            dbg_pushfail_485_bp = frames[frame_count - 1].bp;
+            dbg_pushfail_485_lc = compiler.getFunction(frames[frame_count - 1].func_id).local_count;
+            // Capture closure 485's upvalues (t should be uv0). Report count,
+            // and for uv0: closed?/addr/value-tag — to tell capture bug vs
+            // v()-returned-wrong-value.
+            const clo = frames[frame_count - 1].closure_obj;
+            const uvc = objects.closureUpvalCount(clo);
+            dbg_pushfail_uvcount = uvc;
+            var ui: u16 = 0;
+            while (ui < uvc and ui < 8) : (ui += 1) {
+                var uv: Value = Value.UNDEFINED;
+                const closed = objects.isClosureUpvalClosed(clo, ui);
+                if (closed) uv = objects.getClosureUpvalClosedVal(clo, ui)
+                else { const a = objects.getClosureUpvalAddr(clo, ui); dbg_pushfail_uv_addr[ui] = a; if (a != objects.NO_UPVAL_ADDR and a < MAX_STACK) uv = stack[a]; }
+                dbg_pushfail_uv_tag[ui] = @intFromEnum(uv.tag);
+                dbg_pushfail_uv_closed[ui] = if (closed) 1 else 0;
+            }
+            // Find enclosing func-483 frame and read its locals around `t` (idx 8).
+            var fi: u16 = frame_count;
+            while (fi > 0) : (fi -= 1) {
+                if (frames[fi - 1].func_id == 483) {
+                    const b483 = frames[fi - 1].bp;
+                    dbg_pushfail_483_bp = b483;
+                    var li: u16 = 0;
+                    while (li < 10) : (li += 1) {
+                        const sa: u32 = @as(u32, b483) + li;
+                        const lv = if (sa < MAX_STACK) stack[sa] else Value.UNDEFINED;
+                        dbg_pushfail_483_local_tag[li] = @intFromEnum(lv.tag);
+                        dbg_pushfail_483_local_num[li] = if (lv.tag == .number) lv.data.number else -987654.0;
+                    }
+                    // x = L2 (bank), g = L3, Y = L4. Record their obj indices.
+                    const xv = stack[b483 + 2];
+                    dbg_pushfail_483_x_obj = if (xv.tag == .object or xv.tag == .array) xv.data.obj_idx else 0xFFFFFFFF;
+                    const gv2 = stack[b483 + 3];
+                    dbg_pushfail_483_g_obj = if (gv2.tag == .object or gv2.tag == .array) gv2.data.obj_idx else 0xFFFFFFFF;
+                    break;
+                }
+            }
         }
     }
     sp = func_slot;
@@ -4817,7 +5221,7 @@ fn fnMethodCall(kind: u16, invoker_idx: u32, argc: u8) void {
             ctor_is[frame_count] = false;
             frames[frame_count] = .{ .func_id = btobj.func_id, .ip = bd.code_start, .bp = @intCast(nbp), .closure_obj = target.data.func_idx };
             frame_count += 1;
-            while (sp < nbp + bd.local_count) push(Value.UNDEFINED);
+            prepareUserLocals(@intCast(nbp), target.data.func_idx, cn);
         }
         return;
     }
@@ -4845,10 +5249,15 @@ fn fnMethodCall(kind: u16, invoker_idx: u32, argc: u8) void {
         if (argc >= 2) {
             const arr = stack[sp - argc + 1];
             if (arr.tag == .array or arr.tag == .object) {
-                const alen = objects.arrayLength(@intCast(arr.data.obj_idx));
+                // apply accepts any array-like object, including an ordinary
+                // arguments object. Its length/index properties need normal
+                // reads so mapped values and accessors remain observable.
+                const lv = getPropFromValue(arr, values.internString("length"));
+                const ln = lv.toNumber();
+                const alen: u32 = if (ln > 0) @intFromFloat(@min(ln, @as(f64, @floatFromInt(fnapply_args.len)))) else 0;
                 var k: u32 = 0;
                 while (k < alen and real_argc < fnapply_args.len) : (k += 1) {
-                    fnapply_args[real_argc] = objects.getArrayElement(@intCast(arr.data.obj_idx), k);
+                    fnapply_args[real_argc] = getElemFromValue(arr, Value.number(@floatFromInt(k)));
                     real_argc += 1;
                 }
             }
@@ -4924,8 +5333,7 @@ fn fnMethodCall(kind: u16, invoker_idx: u32, argc: u8) void {
         .closure_obj = target_obj_idx,
     };
     frame_count += 1;
-    const locals_needed = func_desc.local_count;
-    while (sp < new_bp + locals_needed) push(Value.UNDEFINED);
+    prepareUserLocals(@intCast(new_bp), target_obj_idx, real_argc);
     if (tobj.func_id == dbg_entry_watch_func and !dbg_entry_captured) {
         dbg_entry_captured = true;
         dbg_entry_bp = @intCast(new_bp);
@@ -5220,6 +5628,19 @@ pub fn dbgDlLen() u32 { return dbg_dl_len; }
 pub fn dbgDlVal(i: usize) f64 { return if (i < 16) dbg_dl_vals[i] else -1; }
 pub var execution_limit: u64 = 200_000_000;
 pub var dbg_gtrace_on: bool = false;
+pub var dbg_type_n: usize = 0;
+pub var dbg_type_gn: [4096]usize = undefined;
+pub var dbg_type_func: [4096]u16 = undefined;
+pub var dbg_type_name: [4096]u32 = undefined;
+pub var dbg_type_value: [4096]Value = undefined;
+pub var dbg_type_key: [4096]u32 = undefined;
+pub var dbg_type_obj: [4096]u32 = undefined;
+pub var dbg_type_callers: [4096][3]u16 = undefined;
+pub var dbg_probe_n: usize = 0;
+pub var dbg_probe_key: [1024]u32 = undefined;
+pub var dbg_probe_gn: [1024]usize = undefined;
+pub var dbg_probe_obj: [1024]Value = undefined;
+pub var dbg_probe_func: [1024]u16 = undefined;
 pub var dbg_gtrace_func: u16 = 0xFFFF;
 pub var dbg_gtrace_val: [200000]f64 = undefined;
 pub var dbg_gtrace_sel: [200000]i32 = undefined;
@@ -5264,12 +5685,14 @@ fn dbgHkRecord(kind: u8, bank: Value, result: Value) void {
     if (dbg_hk_n >= dbg_hk_rows.len) return;
     const f = if (bank.tag == .object or bank.tag == .array) dbgHkCellValue(objects.getProperty(bank.data.obj_idx, values.internString("F"))) else Value.UNDEFINED;
     const i = if (bank.tag == .object or bank.tag == .array) dbgHkCellValue(objects.getProperty(bank.data.obj_idx, values.internString("I"))) else Value.UNDEFINED;
-    const flen = if (f.tag == .array) objects.arrayLength(f.data.obj_idx) else 0;
-    const ilen = if (i.tag == .array) objects.arrayLength(i.data.obj_idx) else 0;
+    const fa = (f.tag == .array or f.tag == .object) and objects.objTypeOf(f.data.obj_idx) == .array;
+    const ia = (i.tag == .array or i.tag == .object) and objects.objTypeOf(i.data.obj_idx) == .array;
+    const flen = if (fa) objects.arrayLength(f.data.obj_idx) else 0;
+    const ilen = if (ia) objects.arrayLength(i.data.obj_idx) else 0;
     var row = DbgHkRow{ .kind = kind, .gn = dbg_gtrace_n, .result = result, .f = f, .i = i, .flen = flen, .ilen = ilen, .fv = undefined, .iv = undefined };
     for (0..16) |j| {
-        row.fv[j] = if (f.tag == .array and j < flen) objects.getArrayElement(f.data.obj_idx, @intCast(j)) else Value.UNDEFINED;
-        row.iv[j] = if (i.tag == .array and j < ilen) objects.getArrayElement(i.data.obj_idx, @intCast(j)) else Value.UNDEFINED;
+        row.fv[j] = if (fa and j < flen) objects.getArrayElement(f.data.obj_idx, @intCast(j)) else Value.UNDEFINED;
+        row.iv[j] = if (ia and j < ilen) objects.getArrayElement(i.data.obj_idx, @intCast(j)) else Value.UNDEFINED;
     }
     dbg_hk_rows[dbg_hk_n] = row;
     dbg_hk_n += 1;
@@ -6078,6 +6501,20 @@ fn recordThrowMsg(msg: []const u8) void {
 pub fn dbgThrowMsgCount() usize { return dbg_throwmsg_n; }
 pub fn dbgThrowMsg(i: usize) []const u8 { if (i >= dbg_throwmsg_n) return ""; return dbg_throwmsg[i][0..dbg_throwmsg_len[i]]; }
 
+// Ring of ALL cannot-read-prop throws (live-challenge undefined-receiver enum).
+pub var dbg_crpring_n: usize = 0;
+pub var dbg_crpring_func: [64]u16 = [_]u16{0xFFFF} ** 64;
+pub var dbg_crpring_ip: [64]u32 = [_]u32{0} ** 64;
+pub var dbg_crpring_prop: [64][24]u8 = [_][24]u8{[_]u8{0} ** 24} ** 64;
+pub var dbg_crpring_proplen: [64]usize = [_]usize{0} ** 64;
+pub var dbg_crpring_recv: [64][24]u8 = [_][24]u8{[_]u8{0} ** 24} ** 64;
+pub var dbg_crpring_recvlen: [64]usize = [_]usize{0} ** 64;
+pub fn dbgCrpRingN() usize { return dbg_crpring_n; }
+pub fn dbgCrpRingFunc(i: usize) u16 { return dbg_crpring_func[i]; }
+pub fn dbgCrpRingIp(i: usize) u32 { return dbg_crpring_ip[i]; }
+pub fn dbgCrpRingProp(i: usize) []const u8 { return dbg_crpring_prop[i][0..dbg_crpring_proplen[i]]; }
+pub fn dbgCrpRingRecv(i: usize) []const u8 { return dbg_crpring_recv[i][0..dbg_crpring_recvlen[i]]; }
+
 pub var dbg_crp_op: [40]u8 = [_]u8{0} ** 40;
 pub var dbg_crp_op_n: usize = 0;
 pub var dbg_crp_prop: [32]u8 = undefined;
@@ -6092,6 +6529,24 @@ pub fn dbgCrpOpName(i: usize) []const u8 { if (i >= dbg_crp_op_n) return ""; ret
 pub fn dbgCrpProp() []const u8 { return dbg_crp_prop[0..dbg_crp_prop_len]; }
 
 fn throwCannotReadProp(is_null: bool, prop_name: []const u8) void {
+    dbgTraceFailure(values.internString(prop_name));
+    // RING: record EVERY cannot-read-prop (func/ip/prop/prior-lookup-name) so the
+    // intermittent live-challenge undefined-receiver reads can all be enumerated
+    // across runs (not just the first). prev_lookup_name = the lookup that
+    // produced the undefined/null receiver.
+    if (dbg_crpring_n < dbg_crpring_func.len) {
+        const k = dbg_crpring_n;
+        dbg_crpring_func[k] = if (frame_count > 0) frames[frame_count - 1].func_id else 0xFFFF;
+        dbg_crpring_ip[k] = if (frame_count > 0) frames[frame_count - 1].ip else 0;
+        const pn = @min(prop_name.len, 24);
+        @memcpy(dbg_crpring_prop[k][0..pn], prop_name[0..pn]);
+        dbg_crpring_proplen[k] = pn;
+        const rcv = if (prev_lookup_name != 0) values.getString(prev_lookup_name) else "";
+        const rn = @min(rcv.len, 24);
+        @memcpy(dbg_crpring_recv[k][0..rn], rcv[0..rn]);
+        dbg_crpring_recvlen[k] = rn;
+        dbg_crpring_n += 1;
+    }
     // Debug: record which prior lookup produced the undefined/null receiver, so
     // we can identify the env object/chain that's missing (payload-inflating).
     if (dbg_mm_probe) recordMethodMiss(if (prev_lookup_name != 0) prev_lookup_name else last_lookup_name, 200, false);
@@ -6213,8 +6668,140 @@ fn throwNotAFunction(name_idx: u32) void {
 /// non-callable methods to generate this error into its transcript, so the
 /// message MUST match. If the receiver name is unknown (0), fall back to the
 /// bare "<method> is not a function" form.
+pub var dbg_nafm_captured: bool = false;
+pub var dbg_nafm_func: u16 = 0xFFFF;
+pub var dbg_nafm_ip: u32 = 0;
+pub var dbg_nafm_recv: u32 = 0;
+pub var dbg_nafm_method: u32 = 0;
+pub fn dbgNafmFunc() u16 { return dbg_nafm_func; }
+pub fn dbgNafmIp() u32 { return dbg_nafm_ip; }
+pub fn dbgNafmRecv() []const u8 { return values.getString(dbg_nafm_recv); }
+pub fn dbgNafmMethod() []const u8 { return values.getString(dbg_nafm_method); }
+
+// Push-specific failure capture (what `t` is when `t.push` is not callable).
+pub var dbg_pushfail_captured: bool = false;
+pub var dbg_pushfail_recv_tag: u8 = 255;
+pub var dbg_pushfail_recv_obj: u32 = 0xFFFFFFFF;
+pub var dbg_pushfail_recv_objtype: u8 = 255;
+pub var dbg_pushfail_recv_arrlen: u32 = 0;
+pub var dbg_pushfail_recv_proto: u32 = 0xFFFFFFFF;
+pub var dbg_pushfail_recv_propcount: u32 = 0;
+pub var dbg_pushfail_arrayproto: u32 = 0xFFFFFFFF;
+pub var dbg_pushfail_proto_has_push: u8 = 0;
+pub var dbg_pushfail_push_owner: u32 = 0xFFFFFFFF;
+pub var dbg_pushfail_func: u16 = 0xFFFF;
+pub var dbg_pushfail_ip: u32 = 0;
+pub var dbg_pushfail_str_idx: u32 = 0;
+pub var dbg_pushfail_str: [256]u8 = undefined;
+pub var dbg_pushfail_str_len: usize = 0;
+// func-40 (cell .concat) capture: [0]=string-return (bad reg116), [1]=array-return (good reg)
+pub var dbg_f40_str_done: bool = false;
+pub var dbg_f40_arr_done: bool = false;
+pub var dbg_f40_rtag: [2]u8 = [_]u8{255} ** 2;
+pub var dbg_f40_p: [2]f64 = [_]f64{-987654.0} ** 2;
+pub var dbg_f40_fstr: [2][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 2;
+pub var dbg_f40_fslen: [2]usize = [_]usize{0} ** 2;
+pub var dbg_f40_uvcount: [2]u16 = [_]u16{0} ** 2;
+pub var dbg_f40_uvtag: [2][12]u8 = [_][12]u8{[_]u8{255} ** 12} ** 2;
+pub var dbg_f40_uvnum: [2][12]f64 = [_][12]f64{[_]f64{-987654.0} ** 12} ** 2;
+pub var dbg_f40_glen: [2]u32 = [_]u32{0} ** 2;
+pub var dbg_f40_guv: [2]u16 = [_]u16{0xFFFF} ** 2;
+pub var dbg_f40_gtag: [2][16]u8 = [_][16]u8{[_]u8{255} ** 16} ** 2;
+pub var dbg_f40_gnum: [2][16]f64 = [_][16]f64{[_]f64{-987654.0} ** 16} ** 2;
+pub var dbg_f40_gp_tag: [2]u8 = [_]u8{255} ** 2;
+pub var dbg_f40_gstr: [2][16][16]u8 = [_][16][16]u8{[_][16]u8{[_]u8{0} ** 16} ** 16} ** 2;
+pub var dbg_f40_gstrlen: [2][16]usize = [_][16]usize{[_]usize{0} ** 16} ** 2;
+pub fn dbgF40Gstr(i: usize, j: usize) []const u8 { return dbg_f40_gstr[i][j][0..dbg_f40_gstrlen[i][j]]; }
+pub var dbg_f40_target_recv: u32 = 0xFFFFFFFF;
+pub var dbg_f40ring_n: usize = 0;
+pub var dbg_f40ring_rtag: [48]u8 = [_]u8{255} ** 48;
+pub var dbg_f40ring_recv: [48]u32 = [_]u32{0xFFFFFFFF} ** 48;
+pub var dbg_f40ring_p: [48]f64 = [_]f64{-987654.0} ** 48;
+pub var dbg_f40ring_str: [48][40]u8 = [_][40]u8{[_]u8{0} ** 40} ** 48;
+pub var dbg_f40ring_slen: [48]usize = [_]usize{0} ** 48;
+pub fn dbgF40RingN() usize { return dbg_f40ring_n; }
+pub fn dbgF40RingRtag(i: usize) u8 { return dbg_f40ring_rtag[i]; }
+pub fn dbgF40RingRecv(i: usize) u32 { return dbg_f40ring_recv[i]; }
+pub fn dbgF40RingP(i: usize) f64 { return dbg_f40ring_p[i]; }
+pub fn dbgF40RingStr(i: usize) []const u8 { return dbg_f40ring_str[i][0..dbg_f40ring_slen[i]]; }
+pub fn dbgF40Rtag(i: usize) u8 { return dbg_f40_rtag[i]; }
+pub fn dbgF40P(i: usize) f64 { return dbg_f40_p[i]; }
+pub fn dbgF40Fstr(i: usize) []const u8 { return dbg_f40_fstr[i][0..dbg_f40_fslen[i]]; }
+pub fn dbgF40UvCount(i: usize) u16 { return dbg_f40_uvcount[i]; }
+pub fn dbgF40UvTag(i: usize, j: usize) u8 { return dbg_f40_uvtag[i][j]; }
+pub fn dbgF40UvNum(i: usize, j: usize) f64 { return dbg_f40_uvnum[i][j]; }
+pub fn dbgF40Glen(i: usize) u32 { return dbg_f40_glen[i]; }
+pub fn dbgF40Guv(i: usize) u16 { return dbg_f40_guv[i]; }
+pub fn dbgF40Gtag(i: usize, j: usize) u8 { return dbg_f40_gtag[i][j]; }
+pub fn dbgF40Gnum(i: usize, j: usize) f64 { return dbg_f40_gnum[i][j]; }
+pub fn dbgF40GpTag(i: usize) u8 { return dbg_f40_gp_tag[i]; }
+pub var dbg_vcallee_captured: bool = false;
+pub var dbg_vcallee_func: u16 = 0xFFFF;
+pub var dbg_vcallee_ip: u32 = 0;
+pub var dbg_vcallee_str: [64]u8 = undefined;
+pub var dbg_vcallee_str_len: usize = 0;
+pub fn dbgVcalleeFunc() u16 { return dbg_vcallee_func; }
+pub fn dbgVcalleeIp() u32 { return dbg_vcallee_ip; }
+pub fn dbgVcalleeStr() []const u8 { return dbg_vcallee_str[0..dbg_vcallee_str_len]; }
+pub var dbg_vret_captured: bool = false;
+pub var dbg_vret_want_reg: i32 = 116;
+pub var dbg_vret_result_tag: u8 = 255;
+pub var dbg_vret_bank: u32 = 0xFFFFFFFF;
+pub var dbg_vret_reg: i32 = -1;
+pub var dbg_vret_cell: u32 = 0xFFFFFFFF;
+pub var dbg_vret_cell_tag: u8 = 255;
+pub var dbg_vret_str: [64]u8 = undefined;
+pub var dbg_vret_str_len: usize = 0;
+pub fn dbgVretResultTag() u8 { return dbg_vret_result_tag; }
+pub fn dbgVretBank() u32 { return dbg_vret_bank; }
+pub fn dbgVretReg() i32 { return dbg_vret_reg; }
+pub fn dbgVretCell() u32 { return dbg_vret_cell; }
+pub fn dbgVretCellTag() u8 { return dbg_vret_cell_tag; }
+pub fn dbgVretStr() []const u8 { return dbg_vret_str[0..dbg_vret_str_len]; }
+pub var dbg_pushfail_uvcount: u16 = 0;
+pub var dbg_pushfail_uv_tag: [8]u8 = [_]u8{255} ** 8;
+pub var dbg_pushfail_uv_closed: [8]u8 = [_]u8{0} ** 8;
+pub var dbg_pushfail_uv_addr: [8]u32 = [_]u32{0xFFFFFFFF} ** 8;
+pub var dbg_pushfail_483_bp: u32 = 0xFFFFFFFF;
+pub var dbg_pushfail_483_local_tag: [10]u8 = [_]u8{255} ** 10;
+pub var dbg_pushfail_483_local_num: [10]f64 = [_]f64{-987654.0} ** 10;
+pub var dbg_pushfail_485_bp: u32 = 0xFFFFFFFF;
+pub var dbg_pushfail_485_lc: u16 = 0;
+pub fn dbgPushfail485Bp() u32 { return dbg_pushfail_485_bp; }
+pub fn dbgPushfail485Lc() u16 { return dbg_pushfail_485_lc; }
+pub var dbg_pushfail_483_x_obj: u32 = 0xFFFFFFFF;
+pub var dbg_pushfail_483_g_obj: u32 = 0xFFFFFFFF;
+pub fn dbgPushfail483XObj() u32 { return dbg_pushfail_483_x_obj; }
+pub fn dbgPushfail483GObj() u32 { return dbg_pushfail_483_g_obj; }
+pub fn dbgPushfailUvCount() u16 { return dbg_pushfail_uvcount; }
+pub fn dbgPushfailUvTag(i: usize) u8 { return dbg_pushfail_uv_tag[i]; }
+pub fn dbgPushfailUvClosed(i: usize) u8 { return dbg_pushfail_uv_closed[i]; }
+pub fn dbgPushfailUvAddr(i: usize) u32 { return dbg_pushfail_uv_addr[i]; }
+pub fn dbgPushfail483Bp() u32 { return dbg_pushfail_483_bp; }
+pub fn dbgPushfail483LocalTag(i: usize) u8 { return dbg_pushfail_483_local_tag[i]; }
+pub fn dbgPushfail483LocalNum(i: usize) f64 { return dbg_pushfail_483_local_num[i]; }
+pub fn dbgPushfailStr() []const u8 { return dbg_pushfail_str[0..dbg_pushfail_str_len]; }
+pub fn dbgPushfailTag() u8 { return dbg_pushfail_recv_tag; }
+pub fn dbgPushfailObj() u32 { return dbg_pushfail_recv_obj; }
+pub fn dbgPushfailObjType() u8 { return dbg_pushfail_recv_objtype; }
+pub fn dbgPushfailArrLen() u32 { return dbg_pushfail_recv_arrlen; }
+pub fn dbgPushfailProto() u32 { return dbg_pushfail_recv_proto; }
+pub fn dbgPushfailPropCount() u32 { return dbg_pushfail_recv_propcount; }
+pub fn dbgPushfailArrayProto() u32 { return dbg_pushfail_arrayproto; }
+pub fn dbgPushfailProtoHasPush() u8 { return dbg_pushfail_proto_has_push; }
+pub fn dbgPushfailPushOwner() u32 { return dbg_pushfail_push_owner; }
+pub fn dbgPushfailFunc() u16 { return dbg_pushfail_func; }
+pub fn dbgPushfailIp() u32 { return dbg_pushfail_ip; }
+
 fn throwNotAFunctionMethod(recv_name_idx: u32, method_name_idx: u32) void {
     dbgTraceFailure(method_name_idx);
+    // Capture the FIRST not-a-function-method throw location (func/ip) + names.
+    if (!dbg_nafm_captured) {
+        dbg_nafm_captured = true;
+        if (frame_count > 0) { dbg_nafm_func = frames[frame_count - 1].func_id; dbg_nafm_ip = frames[frame_count - 1].ip; }
+        dbg_nafm_recv = recv_name_idx;
+        dbg_nafm_method = method_name_idx;
+    }
     var buf: [160]u8 = undefined;
     var n: usize = 0;
     const recv = if (recv_name_idx != 0) values.getString(recv_name_idx) else "";
@@ -6341,6 +6928,7 @@ fn throwException(val: Value) void {
         const tf = try_frames[try_count];
 
         // Unwind call frames
+        if (frame_count > tf.frame_depth) closeUpvalues(frames[tf.frame_depth].bp);
         frame_count = tf.frame_depth;
         sp = tf.stack_depth;
 

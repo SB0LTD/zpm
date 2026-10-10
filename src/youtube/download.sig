@@ -25,11 +25,8 @@ const url_mod = @import("url.sig");
 const minter = @import("botguard/minter.sig");
 const session_mod = @import("session.sig");
 const challenge_mod = @import("botguard/challenge.sig");
-const http = @import("net.sig");
-
-// Cold-start PO token for the current download (base64url). Minted from the
-// video id as content binding; YouTube accepts it while StreamProtectionStatus
-// is 2 (enough to fetch streams). Regenerated per audio() call.
+// Video-bound web PO token for the current download (base64url). A cold-start
+// token is allowed only when the caller does not require the VM proof.
 var g_pot_buf: [256]u8 = undefined;
 var g_pot_len: usize = 0;
 var g_stream_pot_buf: [256]u8 = undefined;
@@ -44,6 +41,11 @@ const MediaKind = enum { audio, video };
 pub const DownloadOptions = struct {
     require_vm_token: bool = false,
     progress: stream_mod.ProgressFn = null,
+    // Externally-minted content-bound PO token (websafe-b64). When non-empty,
+    // prepareTokens uses it directly and skips the live Create/VM/GenerateIT
+    // establishment. Used to relay a token minted via the reliable pinned
+    // challenge (create-test --pinned <videoId>) into the live download.
+    pot_override: []const u8 = "",
 };
 
 // ── Win32 (for null-terminated path conversion) ──
@@ -111,28 +113,46 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
 
     print("  [download] Fetching player data...\n");
 
-    prepareTokens(video_id);
+    if (options.pot_override.len > 0 and options.pot_override.len <= g_stream_pot_buf.len) {
+        g_pot_len = options.pot_override.len;
+        @memcpy(g_pot_buf[0..g_pot_len], options.pot_override);
+        g_stream_pot_len = g_pot_len;
+        @memcpy(g_stream_pot_buf[0..g_pot_len], options.pot_override);
+        g_token_source = .vm;
+        print("  [download] using externally-supplied content-bound PO token\n");
+    } else {
+        prepareTokens(video_id, options.require_vm_token);
+    }
     status.token_source = g_token_source;
     if (options.require_vm_token and g_token_source != .vm) {
         print("  [download] ERROR: VM token required and minting did not succeed\n");
         return status;
     }
 
-    // Both authenticated client routes carry this session's visitor and token.
-    var resp = playerInSession(video_id, false);
-    if (resp.len == 0 or findStr(resp, "streamingData") == null) {
-        print("  [download] session WEB: no streams, trying session IOS...\n");
-        resp = playerInSession(video_id, true);
+    // MWEB retains direct adaptive URLs; WEB may return SABR-only metadata.
+    // Both use the same web visitor/cookies and video-bound BotGuard proof.
+    var resp = session_mod.playerInSession(&g_session, video_id, .mweb, g_pot_buf[0..g_pot_len]);
+    if (!hasPlayerFormats(resp)) {
+        print("  [download] session MWEB: no direct formats, trying session WEB...\n");
+        resp = session_mod.playerInSession(&g_session, video_id, .web, g_pot_buf[0..g_pot_len]);
     }
-    if (resp.len == 0 or findStr(resp, "streamingData") == null) {
-        print("  [download] session WEB: no streams, trying web_embedded...\n");
+    if (!hasPlayerFormats(resp) and options.require_vm_token) {
+        print("  [download] ERROR: Web VM token has no downloadable WEB/MWEB formats\n");
+        return status;
+    }
+    if (!hasPlayerFormats(resp)) {
+        // Optional compatibility routes have different attestation providers.
+        // They cannot claim a web VM proof or append it to their CDN URLs.
+        g_stream_pot_len = 0;
+        g_token_source = .none;
+        print("  [download] session WEB: no direct formats, trying web_embedded...\n");
         resp = innertube.playerWebEmbed(video_id);
     }
-    if (resp.len == 0 or findStr(resp, "streamingData") == null) {
+    if (!hasPlayerFormats(resp)) {
         print("  [download] web_embedded: no streams, trying android_vr...\n");
         resp = innertube.playerAndroidVr(video_id);
     }
-    if (resp.len == 0 or findStr(resp, "streamingData") == null) {
+    if (!hasPlayerFormats(resp)) {
         print("  [download] android_vr: no streams. status=");
         if (extractJsonString(resp, "\"status\"")) |st| { print(st); } else { print("?"); }
         print(" reason=");
@@ -142,18 +162,7 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
         print(", trying ios...\n");
         resp = innertube.playerIos(video_id);
     }
-    if ((resp.len == 0 or findStr(resp, "streamingData") == null) and g_pot_len > 0) {
-        print("  [download] trying WEB with PO token...\n");
-        resp = innertube.playerWithPot(video_id, .web, g_pot_buf[0..g_pot_len]);
-    }
-    if ((resp.len == 0 or findStr(resp, "streamingData") == null) and g_pot_len > 0) {
-        print("  [download] trying TVHTML5_EMBED with PO token...\n");
-        resp = innertube.playerWithPot(video_id, .tv_embedded, g_pot_buf[0..g_pot_len]);
-    }
-    if (resp.len == 0 or findStr(resp, "streamingData") == null) {
-        print("  [download] web+pot: no streams, trying web (no pot)...\n");
-        resp = innertube.player(video_id);
-    }
+    status.token_source = g_token_source;
     if (resp.len == 0) {
         print("  [download] ERROR: No player response from any client\n");
         return status;
@@ -232,22 +241,13 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
     // Append the PO token to the stream URL (&pot=...) — required by GVS for the
     // stream to serve full data (2026). Build the final URL in a local buffer.
     var url_buf: [9216]u8 = undefined;
-    var url_final: []const u8 = fmt.url[0..fmt.url_len];
+    const url_len = appendStreamToken(fmt.url[0..fmt.url_len], &url_buf);
+    if (url_len == 0) return status;
+    const url_final = url_buf[0..url_len];
     print("  [download] stream URL length=");
     printNum(@intCast(fmt.url_len));
     print("\n");
-    if (g_stream_pot_len > 0 and fmt.url_len + g_stream_pot_len + 8 < url_buf.len and findStr(fmt.url[0..fmt.url_len], "pot=") == null) {
-        var up: usize = 0;
-        @memcpy(url_buf[up .. up + fmt.url_len], fmt.url[0..fmt.url_len]);
-        up += fmt.url_len;
-        const amp = "&pot=";
-        @memcpy(url_buf[up .. up + amp.len], amp);
-        up += amp.len;
-        @memcpy(url_buf[up .. up + g_stream_pot_len], g_stream_pot_buf[0..g_stream_pot_len]);
-        up += g_stream_pot_len;
-        url_final = url_buf[0..up];
-        print("  [download] stream URL + &pot= appended\n");
-    }
+    if (url_len > fmt.url_len) print("  [download] stream URL + &pot= appended\n");
 
     print("  [download] Downloading...\n");
     const dl_result = stream_mod.downloadToFile(
@@ -273,30 +273,18 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
         printNum(stream_mod.last_status);
         print(")\n");
 
-        // PO-exempt fallback: as of 2026, adaptive audio streams (opus/m4a)
-        // require a GVS PO token and 403 without one. The muxed itag 18 (360p
-        // MP4, video+audio) is still served WITHOUT a PO token. Its AAC audio
-        // track is fine for whisper transcription, so fall back to it.
-        if (manifest_mod.selectByItag(&formats, n_formats, 18)) |mux| {
-            print("  [download] Falling back to muxed itag=18 (PO-exempt)...\n");
+        // Retry a distinct muxed representation from the same response/session.
+        if (if (fmt.itag != 18) manifest_mod.selectByItag(&formats, n_formats, 18) else null) |mux| {
+            print("  [download] Falling back to muxed itag=18...\n");
             print("  [download] itag=18 URL length=");
             printNum(@intCast(mux.url_len));
             print(", size=");
             printNum(mux.content_length);
             print("\n");
             var m_buf: [9216]u8 = undefined;
-            var m_url: []const u8 = mux.url[0..mux.url_len];
-            if (g_stream_pot_len > 0 and mux.url_len + g_stream_pot_len + 8 < m_buf.len and findStr(mux.url[0..mux.url_len], "pot=") == null) {
-                var mp: usize = 0;
-                @memcpy(m_buf[mp .. mp + mux.url_len], mux.url[0..mux.url_len]);
-                mp += mux.url_len;
-                const amp = "&pot=";
-                @memcpy(m_buf[mp .. mp + amp.len], amp);
-                mp += amp.len;
-                @memcpy(m_buf[mp .. mp + g_stream_pot_len], g_stream_pot_buf[0..g_stream_pot_len]);
-                mp += g_stream_pot_len;
-                m_url = m_buf[0..mp];
-            }
+            const m_len = appendStreamToken(mux.url[0..mux.url_len], &m_buf);
+            if (m_len == 0) return status;
+            const m_url = m_buf[0..m_len];
             const mux_result = stream_mod.downloadToFile(m_url, output_path, mux.content_length, options.progress);
             status.bytes_downloaded = mux_result.bytes_written;
             status.success = mux_result.success;
@@ -373,7 +361,7 @@ pub fn videoWithOptions(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:
 }
 
 /// Download both adaptive tracks using one player response, visitor session,
-/// and pair of PO tokens. A muxed format needs only the primary output file.
+/// and video-bound PO token. A muxed format needs only the primary output file.
 pub fn videoWithAudio(video_id: *const [meta.VIDEO_ID_LEN]u8, video_path: [*:0]const u8, audio_path: [*:0]const u8, options: DownloadOptions) VideoDownloadStatus {
     var audio_status = DownloadStatus{ .success = false, .bytes_downloaded = 0, .container = .unknown, .codec = .unknown, .bitrate = 0, .duration_sec = 0 };
     const video_status = downloadMedia(video_id, video_path, .any, .video, options, audio_path, &audio_status);
@@ -398,63 +386,52 @@ fn setContainer(fmt: *const manifest_mod.StreamFormat, status: *DownloadStatus) 
     if (findStr(mime, "mp4a") != null) status.codec = .aac;
 }
 
-fn prepareTokens(video_id: *const [meta.VIDEO_ID_LEN]u8) void {
+fn prepareTokens(video_id: *const [meta.VIDEO_ID_LEN]u8, require_vm_token: bool) void {
     g_pot_len = 0;
     g_stream_pot_len = 0;
     g_token_source = .none;
     g_session = session_mod.Session.init();
     g_challenge = challenge_mod.Challenge.init();
-    var integrity_result = session_mod.IntegrityResult{};
-    if (session_mod.establishIntegrityToken(&g_session, &g_challenge, &integrity_result)) {
-        const token = integrity_result.integrity_token[0..integrity_result.integrity_token_len];
-        g_pot_len = minter.mintContentBound(token, video_id, &g_pot_buf);
-        if (g_session.visitorData().len > 0)
-            g_stream_pot_len = minter.mintSessionBound(token, g_session.visitorData(), &g_stream_pot_buf);
-        if (g_pot_len > 0 and g_stream_pot_len > 0) {
-            g_token_source = .vm;
-            print("  [download] VM minted content and visitor PO tokens\n");
-            return;
+    if (session_mod.bootstrap(&g_session, &g_challenge)) _ = session_mod.prepareMobileClient(&g_session);
+    // The live BotGuard Create challenge carries server-side randomness: each
+    // fetch exercises different VM paths, and some paths hit residual VM/env gaps
+    // that inflate the snapshot payload → GenerateIT returns a null integrity
+    // token (no minter). A clean path (compact response, non-null token, populated
+    // minter) DOES occur frequently, so retry the whole Create→VM→GenerateIT
+    // establishment with a FRESH challenge each attempt until the minter is ready.
+    // Bounded; each attempt is independent (fresh Session challenge).
+    const MAX_VM_ATTEMPTS: u32 = 10;
+    var attempt: u32 = 0;
+    while (attempt < MAX_VM_ATTEMPTS) : (attempt += 1) {
+        var integrity_result = session_mod.IntegrityResult{};
+        // Fresh challenge per attempt (establishIntegrityToken re-fetches Create
+        // when g_challenge has no program).
+        g_challenge = challenge_mod.Challenge.init();
+        if (attempt > 0) { print("  [download] minter retry "); printNum(attempt); print("/"); printNum(MAX_VM_ATTEMPTS); print("\n"); }
+        if (session_mod.establishIntegrityToken(&g_session, &g_challenge, &integrity_result) and integrity_result.minter_ready) {
+            const token = integrity_result.integrity_token[0..integrity_result.integrity_token_len];
+            g_pot_len = minter.mintContentBound(token, video_id, &g_pot_buf);
+            g_stream_pot_len = g_pot_len;
+            if (g_pot_len > 0) {
+                @memcpy(g_stream_pot_buf[0..g_pot_len], g_pot_buf[0..g_pot_len]);
+                g_token_source = .vm;
+                print("  [download] VM minted video-bound web PO token (attempt "); printNum(attempt + 1); print(")\n");
+                return;
+            }
         }
     }
+    if (require_vm_token) return;
     g_pot_len = minter.mintColdStart(video_id, &g_pot_buf);
-    const binding = if (g_session.visitorData().len > 0) g_session.visitorData() else video_id[0..];
-    g_stream_pot_len = minter.mintColdStart(binding, &g_stream_pot_buf);
+    g_stream_pot_len = g_pot_len;
+    if (g_pot_len > 0) @memcpy(g_stream_pot_buf[0..g_pot_len], g_pot_buf[0..g_pot_len]);
     if (g_pot_len > 0 and g_stream_pot_len > 0) g_token_source = .cold_start;
     print("  [download] VM integrity unavailable; trying cold-start tokens\n");
 }
 
-fn playerInSession(video_id: *const [meta.VIDEO_ID_LEN]u8, ios: bool) []const u8 {
-    if (!g_session.bootstrapped) return "";
-    var body: [4096]u8 = undefined;
-    var p: usize = 0;
-    const version = if (ios) "20.10.4" else if (g_session.clientVersion().len > 0) g_session.clientVersion() else "2.20250312.04.00";
-    p = appendS(&body, p, "{\"context\":{\"client\":{\"clientName\":\"");
-    p = appendS(&body, p, if (ios) "IOS" else "WEB");
-    p = appendS(&body, p, "\",\"clientVersion\":\"");
-    p = appendS(&body, p, version);
-    p = appendS(&body, p, "\",\"hl\":\"en\",\"gl\":\"US\",\"visitorData\":\"");
-    p = appendS(&body, p, g_session.visitorData());
-    p = appendS(&body, p, "\"");
-    if (ios) p = appendS(&body, p, ",\"deviceMake\":\"Apple\",\"deviceModel\":\"iPhone16,2\",\"osName\":\"iOS\",\"osVersion\":\"17.7.1\"");
-    p = appendS(&body, p, "}},\"videoId\":\"");
-    p = appendS(&body, p, video_id);
-    p = appendS(&body, p, "\",\"contentCheckOk\":true,\"racyCheckOk\":true,\"serviceIntegrityDimensions\":{\"poToken\":\"");
-    p = appendS(&body, p, g_pot_buf[0..g_pot_len]);
-    p = appendS(&body, p, "\"}}");
-    var headers: [4096]u8 = undefined;
-    var h: usize = 0;
-    h = appendS(&headers, h, "Content-Type: application/json\r\nOrigin: https://www.youtube.com\r\nReferer: https://www.youtube.com/watch?v=");
-    h = appendS(&headers, h, video_id);
-    h = appendS(&headers, h, "\r\nX-Youtube-Client-Name: ");
-    h = appendS(&headers, h, if (ios) "5" else "1");
-    h = appendS(&headers, h, "\r\nX-Youtube-Client-Version: ");
-    h = appendS(&headers, h, version);
-    h = appendS(&headers, h, "\r\nX-Goog-Visitor-Id: ");
-    h = appendS(&headers, h, g_session.visitorData());
-    h = appendS(&headers, h, "\r\n");
-    const ios_ua = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 17_7_1 like Mac OS X;)";
-    const response = http.request(.post, "www.youtube.com", 443, "/youtubei/v1/player?prettyPrint=false", headers[0..h], body[0..p], &g_session.jar, if (ios) ios_ua else http.CHROME_UA);
-    return if (response.ok) response.body else "";
+fn hasPlayerFormats(resp: []const u8) bool {
+    if (resp.len == 0) return false;
+    var formats: [manifest_mod.MAX_FORMATS]manifest_mod.StreamFormat = undefined;
+    return manifest_mod.parseFormats(resp, &formats) > 0;
 }
 
 fn appendS(buf: []u8, pos: usize, s: []const u8) usize {

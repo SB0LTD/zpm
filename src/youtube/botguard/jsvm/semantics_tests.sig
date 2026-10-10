@@ -6,6 +6,8 @@ const values = @import("values.sig");
 
 const Case = struct { name: []const u8, source: []const u8, expected: f64 };
 const cases = [_]Case{
+    .{ .name = "detached-dom-focus-method", .source = "var R;var img=document.createElement('img');R=(typeof img.focus==='function'&&typeof img.blur==='function'&&img.focus()===undefined&&img.blur()===undefined)?1:0;", .expected = 1 },
+    .{ .name = "detached-dom-scroll-extents", .source = "var R;var img=document.createElement('img');R=(typeof img.scrollWidth==='number'&&typeof img.scrollHeight==='number'&&img.scrollWidth===0&&img.scrollHeight===0)?1:0;", .expected = 1 },
     // Shrinking must discard elements, including when length uses a computed key.
     .{ .name = "computed-length-shrink", .source = "var R;var a=[1,2,3,4,5];var k='length';a[k]=2;R=a.length*100+a[1]*10+(a[2]===undefined?1:0);", .expected = 221 },
     .{ .name = "computed-length-grow", .source = "var R;var a=[7];a['length']=4;R=a.length*100+a[0]*10+(a[3]===undefined?1:0);", .expected = 471 },
@@ -94,6 +96,49 @@ const cases = [_]Case{
     .{ .name = "string-concat-coerces-arguments", .source = "var R;R=('x'.concat(2.5,true,null,undefined)==='x2.5truenullundefined'?1:0);", .expected = 1 },
     .{ .name = "string-concat-reentrant-coercion", .source = "var R;var o={toString:function(){return 'A'.concat('B');}};R=('P'.concat(o,'Q')==='PABQ'?1:0);", .expected = 1 },
     .{ .name = "for-in-array-over-4096-elements", .source = "var R;var a=[];for(var i=0;i<5000;i++)a.push(i);Array.prototype[4500]=9;var n=0;for(var k in a)n++;R=n;", .expected = 5000 },
+    // BotGuard reads its local operand FIFO inside a labeled block. A named
+    // break must skip the byte-reader fallback after its inner while loop.
+    .{ .name = "labeled-break-skips-fifo-fallback", .source = "var R=0;a:{while(true){R=93;break a;if(5)break;}R=95;}", .expected = 93 },
+    .{ .name = "labeled-break-outer-block-from-nested-loops", .source = "var R=0;out:{for(var i=0;i<3;i++){for(var j=0;j<3;j++){R++;break out;}R+=10;}R+=100;}R+=1000;", .expected = 1001 },
+    .{ .name = "labeled-and-bare-breaks-stay-distinct", .source = "var R=0;out:{for(var i=0;i<3;i++){for(var j=0;j<3;j++){R++;break;}if(i===1)break out;R+=10;}R+=100;}", .expected = 12 },
+    .{ .name = "labeled-continue-outer-for-update", .source = "var R=0;out:for(var i=0;i<3;i++){for(var j=0;j<2;j++){R++;continue out;}R+=100;}", .expected = 3 },
+    .{ .name = "labeled-continue-outer-while-condition", .source = "var R=0,i=0;out:while(i<3){i++;while(true){R+=i;continue out;}R=999;}", .expected = 6 },
+    .{ .name = "labeled-continue-do-while-condition", .source = "var R=0,i=0;out:do{i++;while(true){R++;continue out;}R+=100;}while(i<3);", .expected = 3 },
+    .{ .name = "chained-labels-share-for-continue-target", .source = "var R=0;first:second:for(var i=0;i<3;i++){for(var j=0;j<2;j++){R++;continue first;}R+=100;}", .expected = 3 },
+    .{ .name = "labeled-continue-outer-for-in", .source = "var R=0;out:for(var k in {a:1,b:2,c:3}){while(true){R++;continue out;}R+=100;}", .expected = 3 },
+    .{ .name = "function-definition-preserves-enclosing-break-patch", .source = "var R=0;out:{while(true){R=7;break out;function f(){while(true){break;}}}R=99;}", .expected = 7 },
+    .{ .name = "function-definition-preserves-enclosing-continue-patch", .source = "var R=0;out:for(var i=0;i<3;i++){R++;continue out;function f(){while(true){continue;}}R+=100;}", .expected = 3 },
+    .{ .name = "labeled-continue-closes-inner-for-in", .source = "var R=0;out:for(var k in {a:1,b:2,c:3}){for(var j in {x:1,y:2}){R++;continue out;}R+=100;}", .expected = 3 },
+    .{ .name = "bare-break-closes-for-in-before-next-loop", .source = "var R=0;for(var i=0;i<100;i++){for(var k in {a:1}){R++;break;}}", .expected = 100 },
+    .{ .name = "labeled-break-closes-nested-for-in", .source = "var R=0;for(var i=0;i<100;i++){out:for(var k in {a:1}){for(var j in {b:2}){R++;break out;}}}", .expected = 100 },
+    .{ .name = "labeled-break-switch-discards-discriminant", .source = "var R=0;for(var i=0;i<20000;i++){out:{switch(1){case 1:R++;break out;}R+=100;}}", .expected = 20000 },
+    .{ .name = "bare-break-switch-discards-discriminant", .source = "var R=0;for(var i=0;i<20000;i++){switch(1){case 1:R++;break;}}", .expected = 20000 },
+    .{ .name = "labeled-continue-switch-discards-discriminant", .source = "var R=0;out:for(var i=0;i<20000;i++){switch(1){case 1:R++;continue out;}R+=100;}", .expected = 20000 },
+    .{ .name = "arguments-zero-formals-preserves-extra-actuals", .source = "var R;function f(){return arguments.length*100+arguments[0]*10+arguments[2];}R=f(4,8,2);", .expected = 342 },
+    .{ .name = "arguments-empty-and-missing-actuals", .source = "var R;function f(a,b){return arguments.length*100+(arguments.hasOwnProperty('0')?10:0)+(b===undefined?1:0);}R=f()+f(7);", .expected = 112 },
+    .{ .name = "arguments-callee-and-object-brand", .source = "var R;function f(){return (arguments.callee===f?100:0)+(Array.isArray(arguments)?0:10)+(Object.prototype.toString.call(arguments)==='[object Arguments]'?1:0);}R=f();", .expected = 111 },
+    .{ .name = "arguments-extra-values-do-not-seed-locals", .source = "var R;function f(a){var b;return (b===undefined?100:0)+arguments[1];}R=f(3,7);", .expected = 107 },
+    .{ .name = "arguments-method-call-and-apply", .source = "var R;var o={x:5,f:function(){return this.x*100+arguments.length*10+arguments[1];}};R=o.f(1,3)+o.f.call({x:2},4,6)+o.f.apply({x:1},[7,8]);", .expected = 877 },
+    .{ .name = "arguments-object-forwards-through-apply", .source = "var R;function g(a,b,c){return arguments.length*100+a*10+c;}function f(){return g.apply(null,arguments);}R=f(4,8,2);", .expected = 342 },
+    .{ .name = "apply-plain-array-like-object", .source = "var R;function f(a,b){return arguments.length*100+a*10+b;}R=f.apply(null,{length:2,0:4,1:2});", .expected = 242 },
+    .{ .name = "arguments-nested-function-has-own-object", .source = "var R;function f(){function g(){return arguments[0]+arguments.length;}return arguments[0]*10+g(7,8);}R=f(3);", .expected = 39 },
+    .{ .name = "arguments-arrow-inherits-enclosing-object", .source = "var R;function f(){return (()=>arguments[1]+arguments.length)();}R=f(4,7,9);", .expected = 10 },
+    .{ .name = "arguments-escaped-arrow-captures-enclosing-object", .source = "var R;function f(){return ()=>arguments[0]+arguments.length;}var g=f(7,8);R=g(99);", .expected = 9 },
+    .{ .name = "arguments-direct-eval-inherits-object", .source = "var R;function f(){return eval('arguments[0]+arguments.length');}R=f(7,8);", .expected = 9 },
+    .{ .name = "arguments-nested-direct-eval-in-arrow", .source = "var R;function f(){return (()=>eval('eval(\"arguments[1]+arguments.length\")'))();}R=f(1,7);", .expected = 9 },
+    .{ .name = "arguments-formal-name-shadows-implicit-binding", .source = "var R;function f(arguments){return arguments+1;}R=f(7);", .expected = 8 },
+    .{ .name = "arguments-var-initializer-replaces-binding", .source = "var R;function f(){var arguments=13;return arguments;}R=f(7);", .expected = 13 },
+    .{ .name = "arguments-local-block-shadows-implicit-binding", .source = "var R;function f(){var n=arguments[0];{let arguments=9;n+=arguments;}return n+arguments.length;}R=f(7,8);", .expected = 18 },
+    .{ .name = "arguments-sloppy-parameter-alias-both-directions", .source = "var R;function f(a){a=7;var n=arguments[0];arguments[0]=8;return n*10+a;}R=f(1);", .expected = 78 },
+    .{ .name = "arguments-unsupplied-formal-remains-unmapped", .source = "var R;function f(a,b){arguments[1]=8;return (b===undefined?10:0)+arguments[1];}R=f(1);", .expected = 18 },
+    .{ .name = "arguments-duplicate-parameter-maps-last-index", .source = "var R;function f(a,a){a=7;arguments[0]=8;return arguments[0]*100+arguments[1]*10+a;}R=f(1,2);", .expected = 877 },
+    .{ .name = "arguments-strict-parameters-are-unmapped", .source = "var R;function f(a){'use strict';a=7;var n=arguments[0];arguments[0]=8;return n*10+a;}R=f(1);", .expected = 17 },
+    .{ .name = "arguments-escaped-object-shares-closed-parameter", .source = "var R;function f(a){return [arguments,function(){return a;}];}var p=f(1);p[0][0]=7;R=p[1]();", .expected = 7 },
+    .{ .name = "arguments-exception-unwind-closes-mapped-parameter", .source = "var R;var p;function f(a){p=[arguments,function(){return a;}];throw 2;}try{f(1);}catch(e){}p[0][0]=7;R=p[1]();", .expected = 7 },
+    .{ .name = "arguments-delete-detaches-parameter-map", .source = "var R;function f(a){delete arguments[0];arguments[0]=8;return a*10+arguments[0];}R=f(1);", .expected = 18 },
+    .{ .name = "arguments-getter-detaches-parameter-map", .source = "var R;function f(a){Object.defineProperty(arguments,'0',{get:function(){return 9;}});a=7;return a*10+arguments[0];}R=f(1);", .expected = 79 },
+    .{ .name = "arguments-readonly-detaches-at-current-value", .source = "var R;function f(a){a=7;Object.defineProperty(arguments,'0',{writable:false});a=9;arguments[0]=8;return a*10+arguments[0];}R=f(1);", .expected = 97 },
+    .{ .name = "arguments-descriptor-reflects-live-parameter", .source = "var R;function f(a){a=7;var d=Object.getOwnPropertyDescriptor(arguments,'0');var l=Object.getOwnPropertyDescriptor(arguments,'length');return d.value*100+(d.writable?10:0)+(d.enumerable?1:0)+(l.enumerable?1000:0);}R=f(1);", .expected = 711 },
 };
 
 pub const case_count: usize = cases.len + 2;
