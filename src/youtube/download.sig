@@ -39,6 +39,10 @@ var g_session: session_mod.Session = session_mod.Session.init();
 var g_challenge: challenge_mod.Challenge = challenge_mod.Challenge.init();
 var g_player_copy: [innertube.RESPONSE_BUF_SIZE]u8 = undefined;
 
+// iOS InnerTube User-Agent — must match the client that minted iOS stream URLs
+// so googlevideo (GVS) accepts the CDN range requests.
+const IOS_UA = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 17_7_1 like Mac OS X;)";
+
 pub const TokenSource = enum { none, cold_start, vm };
 var g_token_source: TokenSource = .none;
 const MediaKind = enum { audio, video };
@@ -124,9 +128,37 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
         return status;
     }
 
+    // iOS-first for audio: the IOS InnerTube client returns adaptive formats
+    // whose stream URLs are already fully transformed (no signatureCipher, no
+    // throttling n-param) and whose itag-140 AAC audio is exactly what the ASR
+    // pipeline wants. Unlike WEB/MWEB — which hand back signatureCipher + an
+    // "n" param that must be run through player.js — these URLs are directly
+    // downloadable, so probe iOS before the web clients when fetching audio.
+    // Default CDN UA (Chrome) for WEB/MWEB URLs; the iOS branch overrides it.
+    stream_mod.setUserAgent("");
+    stream_mod.setWebHeaders(true);
+
+    var resp: []const u8 = "";
+    if (kind == .audio) {
+        const ios_resp = innertube.playerIos(video_id);
+        if (hasDirectAudio(ios_resp)) {
+            print("  [download] iOS client: direct audio URLs present, using iOS response\n");
+            resp = ios_resp;
+            // iOS GVS URLs carry their own attestation; appending the web
+            // content-bound PO token to them is rejected (HTTP 403). Fetch the
+            // iOS stream URL verbatim.
+            g_stream_pot_len = 0;
+            // GVS validates the stream request's User-Agent against the client
+            // that minted the URL; iOS URLs must be fetched with the iOS UA and
+            // without the web Origin/Referer headers.
+            stream_mod.setUserAgent(IOS_UA);
+            stream_mod.setWebHeaders(false);
+        }
+    }
+
     // MWEB retains direct adaptive URLs; WEB may return SABR-only metadata.
     // Both use the same web visitor/cookies and video-bound BotGuard proof.
-    var resp = session_mod.playerInSession(&g_session, video_id, .mweb, g_pot_buf[0..g_pot_len]);
+    if (resp.len == 0) resp = session_mod.playerInSession(&g_session, video_id, .mweb, g_pot_buf[0..g_pot_len]);
     if (!hasPlayerFormats(resp)) {
         print("  [download] session MWEB: no direct formats, trying session WEB...\n");
         resp = session_mod.playerInSession(&g_session, video_id, .web, g_pot_buf[0..g_pot_len]);
@@ -208,7 +240,12 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
     const best = if (kind == .video)
         manifest_mod.selectBestMuxed(&formats, n_formats) orelse manifest_mod.selectBestVideo(&formats, n_formats)
     else
-        manifest_mod.selectBestAudio(&formats, n_formats, codec_pref) orelse manifest_mod.selectBestMuxed(&formats, n_formats);
+        // opus preferred, but MWEB/WEB adaptive sets often only carry AAC
+        // (itag 140); fall back to any audio codec, then a muxed stream, rather
+        // than failing when the preferred codec is absent.
+        manifest_mod.selectBestAudio(&formats, n_formats, codec_pref) orelse
+        manifest_mod.selectBestAudio(&formats, n_formats, .any) orelse
+        manifest_mod.selectBestMuxed(&formats, n_formats);
     if (best == null) {
         print(if (kind == .video) "  [download] ERROR: No video stream found\n" else "  [download] ERROR: No audio stream found\n");
         return status;
@@ -623,6 +660,19 @@ fn hasPlayerFormats(resp: []const u8) bool {
     if (resp.len == 0) return false;
     var formats: [manifest_mod.MAX_FORMATS]manifest_mod.StreamFormat = undefined;
     return manifest_mod.parseFormats(resp, &formats) > 0;
+}
+
+/// True when `resp` has at least one audio format carrying a directly usable
+/// stream URL (populated without needing player.js cipher/nsig). The iOS client
+/// satisfies this; WEB/MWEB generally do not (their audio is signatureCipher-only).
+fn hasDirectAudio(resp: []const u8) bool {
+    if (resp.len == 0) return false;
+    var formats: [manifest_mod.MAX_FORMATS]manifest_mod.StreamFormat = undefined;
+    const n = manifest_mod.parseFormats(resp, &formats);
+    for (0..n) |i| {
+        if (formats[i].is_audio and !formats[i].is_video and formats[i].url_len > 0) return true;
+    }
+    return false;
 }
 
 fn appendS(buf: []u8, pos: usize, s: []const u8) usize {

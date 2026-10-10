@@ -58,8 +58,9 @@ pub const CipherProgram = struct {
 
 // ── Module state ──
 
-// Player.js buffer (player.js is typically 1-2 MB)
-const PLAYER_JS_SIZE: usize = 2 * 1024 * 1024;
+// Player.js buffer (player.js is ~2.6 MB in 2026 — size generously so the
+// cipher/nsig functions near the end are never truncated).
+const PLAYER_JS_SIZE: usize = 4 * 1024 * 1024;
 var player_js_buf: [PLAYER_JS_SIZE]u8 = undefined;
 var player_js_len: usize = 0;
 

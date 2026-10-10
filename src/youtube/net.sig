@@ -201,7 +201,7 @@ pub fn postInto(host: []const u8, port: u16, path: []const u8, extra_headers: []
 /// existing callers.
 pub fn postIntoJar(host: []const u8, port: u16, path: []const u8, extra_headers: []const u8, body: []const u8, user_agent: []const u8, jar: ?*CookieJar, out: []u8) IntoResult {
     const url = buildUrl(host, port, path) orelse return .{};
-    const hdrs = normalizeHeaders(extra_headers);
+    const hdrs = normalizeHeaders(extra_headers) orelse return .{};
     const req = zhttp.Request{
         .method = .POST,
         .url = url,

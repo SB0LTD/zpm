@@ -36,6 +36,35 @@ pub var last_status: u32 = 0;
 const CHUNK_SIZE: usize = 1024 * 1024;
 var chunk_buf: [CHUNK_SIZE]u8 = undefined;
 
+// User-Agent used for CDN (googlevideo) range requests. YouTube's GVS validates
+// that the stream request's UA matches the InnerTube client that minted the
+// URL — an iOS-issued stream URL fetched with a desktop UA is rejected (403).
+// Defaults to Chrome (for WEB/MWEB URLs); download.sig overrides it to the iOS
+// UA when the chosen player response came from the iOS client.
+const DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+var g_stream_ua_buf: [256]u8 = undefined;
+var g_stream_ua_len: usize = 0;
+// When true, omit the web Origin/Referer headers on CDN requests (iOS clients
+// do not send them; their presence can trigger a 403 on iOS-issued URLs).
+var g_stream_web_headers: bool = true;
+
+/// Set the User-Agent for subsequent CDN range requests. Pass an empty slice to
+/// reset to the default Chrome UA. `web_headers=false` drops Origin/Referer
+/// (used for iOS-issued stream URLs).
+pub fn setUserAgent(ua: []const u8) void {
+    if (ua.len == 0 or ua.len > g_stream_ua_buf.len) { g_stream_ua_len = 0; return; }
+    @memcpy(g_stream_ua_buf[0..ua.len], ua);
+    g_stream_ua_len = ua.len;
+}
+
+pub fn setWebHeaders(on: bool) void {
+    g_stream_web_headers = on;
+}
+
+fn streamUa() []const u8 {
+    return if (g_stream_ua_len > 0) g_stream_ua_buf[0..g_stream_ua_len] else DEFAULT_UA;
+}
+
 /// Download progress callback type.
 pub const ProgressFn = ?*const fn (downloaded: u64, total: u64) void;
 
@@ -146,13 +175,16 @@ fn downloadChunk(
     last_status = 0;
     var result = ChunkResult{};
 
-    const extra = "Origin: https://www.youtube.com\r\nReferer: https://www.youtube.com/\r\nAccept-Encoding: identity\r\n";
+    const extra = if (g_stream_web_headers)
+        "Origin: https://www.youtube.com\r\nReferer: https://www.youtube.com/\r\nAccept-Encoding: identity\r\n"
+    else
+        "Accept-Encoding: identity\r\n";
     const r = http.getRangeInto(
         host,
         port,
         path,
         extra,
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        streamUa(),
         range_start,
         range_end,
         &chunk_buf,
