@@ -17,9 +17,9 @@
 //   4. Expose the jar + visitorData + challenge to the BotGuard flow so the VM
 //      snapshot and GenerateIT run WITHIN this session (cookies + X-Goog-Visitor-Id).
 //
-// All HTTP goes through platform/http_session (persistent cookie jar).
+// All HTTP goes through the app-local @zpm/http adapter (persistent cookie jar).
 
-const http = @import("../platform/http_session.sig");
+const http = @import("net.sig");
 const challenge = @import("botguard/challenge.sig");
 
 extern "kernel32" fn GetStdHandle(u32) ?*anyopaque;

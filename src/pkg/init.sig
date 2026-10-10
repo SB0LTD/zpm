@@ -713,6 +713,8 @@ const build_sig_trading =
     \\    text_len: usize = 0,
     \\    timer: [sig_build.PATH_BUF_SIZE]u8 = undefined,
     \\    timer_len: usize = 0,
+    \\    tls_client: [sig_build.PATH_BUF_SIZE]u8 = undefined,
+    \\    tls_client_len: usize = 0,
     \\    http: [sig_build.PATH_BUF_SIZE]u8 = undefined,
     \\    http_len: usize = 0,
     \\    logging: [sig_build.PATH_BUF_SIZE]u8 = undefined,
@@ -756,7 +758,8 @@ const build_sig_trading =
     \\    const primitives = store(&p.primitives, &p.primitives_len, try zpm.modulePath("src/render/primitives.sig", &tmp));
     \\    const text = store(&p.text, &p.text_len, try zpm.modulePath("src/render/text.sig", &tmp));
     \\    const timer = store(&p.timer, &p.timer_len, try zpm.modulePath("src/platform/timer.sig", &tmp));
-    \\    const http = store(&p.http, &p.http_len, try zpm.modulePath("src/platform/http.sig", &tmp));
+    \\    const tls_client = store(&p.tls_client, &p.tls_client_len, try zpm.modulePath("src/core/crypto/tls/client.sig", &tmp));
+    \\    const http = store(&p.http, &p.http_len, try zpm.modulePath("src/net/http/client.sig", &tmp));
     \\    const logging = store(&p.logging, &p.logging_len, try zpm.modulePath("src/platform/log/run.sig", &tmp));
     \\    const input = store(&p.input, &p.input_len, try zpm.modulePath("src/platform/input/run.sig", &tmp));
     \\
@@ -781,7 +784,9 @@ const build_sig_trading =
     \\    const timer_mod = try ctx.addModule("timer", timer);
     \\    try ctx.addImport(timer_mod, "win32", win32);
     \\
+    \\    _ = try ctx.addModule("tls_client", tls_client);
     \\    const http_mod = try ctx.addModule("http", http);
+    \\    try ctx.addImport(http_mod, "tls_client", tls_client);
     \\    try ctx.addImport(http_mod, "win32", win32);
     \\
     \\    const logging_mod = try ctx.addModule("logging", logging);
@@ -810,6 +815,7 @@ const build_sig_trading =
     \\            importEntry("text", text),
     \\            importEntry("timer", timer),
     \\            importEntry("input", input),
+    \\            importEntry("tls_client", tls_client),
     \\            importEntry("http", http),
     \\        },
     \\        .compiler_path = "",
@@ -908,14 +914,18 @@ const build_sig_web_server =
     \\
     \\    var core_buf: [sig_build.PATH_BUF_SIZE]u8 = undefined;
     \\    var win32_buf: [sig_build.PATH_BUF_SIZE]u8 = undefined;
+    \\    var tls_buf: [sig_build.PATH_BUF_SIZE]u8 = undefined;
     \\    var http_buf: [sig_build.PATH_BUF_SIZE]u8 = undefined;
     \\    const core = try zpm.modulePath("src/core/root.sig", &core_buf);
     \\    const win32 = try zpm.modulePath(win32_rel, &win32_buf);
-    \\    const http = try zpm.modulePath("src/platform/http.sig", &http_buf);
+    \\    const tls_client = try zpm.modulePath("src/core/crypto/tls/client.sig", &tls_buf);
+    \\    const http = try zpm.modulePath("src/net/http/client.sig", &http_buf);
     \\
     \\    _ = try ctx.addModule("core", core);
     \\    _ = try ctx.addModule("win32", win32);
+    \\    _ = try ctx.addModule("tls_client", tls_client);
     \\    const http_mod = try ctx.addModule("http", http);
+    \\    try ctx.addImport(http_mod, "tls_client", tls_client);
     \\    try ctx.addImport(http_mod, "win32", win32);
     \\
     \\    _ = try ctx.addCompileStep(.{
@@ -926,6 +936,7 @@ const build_sig_web_server =
     \\        .target = if (ctx.target.arch_len > 0) &ctx.target else null,
     \\        .imports = &.{
     \\            importEntry("core", core),
+    \\            importEntry("tls_client", tls_client),
     \\            importEntry("http", http),
     \\        },
     \\        .compiler_path = "",
@@ -1230,16 +1241,19 @@ const main_sig_web_server =
     \\const std = @import("std");
     \\const http = @import("http");
     \\
-    \\// HTTP server skeleton — {{project_name}}
+    \\// HTTP skeleton — {{project_name}}
+    \\//
+    \\// `http` is zpm's pure-Sig HTTP/1.1 client (TLS 1.3, no WinHTTP). Use it for
+    \\// outbound requests, e.g. `http.fetch(.{ .url = "https://..." }, bufs, now)`.
     \\pub fn main(init: std.process.Init) !void {
     \\    const io = init.io;
     \\    var stdout_buffer: [256]u8 = undefined;
     \\    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     \\    const stdout = &stdout_writer.interface;
-    \\    try stdout.writeAll("{{project_name}} server starting on :8080\n");
-    \\    // TODO: initialize the http listener and route handlers using the
-    \\    // `http` module from zpm.
-    \\    try stdout.writeAll("{{project_name}} server ready\n");
+    \\    _ = http;
+    \\    try stdout.writeAll("{{project_name}} starting on :8080\n");
+    \\    // TODO: make outbound calls with the `http` client, or add a listener.
+    \\    try stdout.writeAll("{{project_name}} ready\n");
     \\    try stdout.flush();
     \\}
     \\
