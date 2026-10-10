@@ -187,6 +187,24 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     _ = try ctx.addModule("elementor_document", "src/elementor/document.sig");
     _ = try addTest(ctx, test_all, "test-elementor-document", "src/elementor/document.sig", &.{});
+
+    // ── UI DSL component model + renderer (Layer 0: pure computation) ──
+    // Platform-agnostic: draws only through a caller-supplied DrawVTable, so it
+    // has no module deps and registers with an empty import list (like
+    // `image`/`sb0x_format`). NO wire(). Its hermetic test{} blocks run
+    // standalone via `sig test src/ui/ui_dsl.sig --test-filter ui_dsl` — the
+    // same step-capacity treatment websocket/dom_import/cdp get (the fixed
+    // build graph is already at its step capacity), so it is NOT added to the
+    // `test` aggregate.
+    _ = try ctx.addModule("ui_dsl", "src/ui/ui_dsl.sig");
+
+    // ── OpenRouter LLM-over-HTTP client + folded STT/Ambient (transport seam) ──
+    // All I/O crosses a caller-supplied Transport seam; the module imports no
+    // nexus kernel module and no platform transport, so it registers dep-free.
+    // NO wire(). Hermetic MockTransport test{} blocks run standalone via
+    // `sig test src/net/openrouter.sig --test-filter openrouter` (not in the
+    // `test` aggregate, per the step-capacity ceiling above).
+    _ = try ctx.addModule("openrouter", "src/net/openrouter.sig");
     // NOTE: the web-automation stack's unit tests — websocket (RFC 6455),
     // dom_import (extractor + envelope), and cdp (target discovery, surrogate
     // decoding) — are run directly with `sig test src/net/websocket.sig`,
