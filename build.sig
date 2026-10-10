@@ -366,6 +366,41 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("sig_math", "src/core/sig_math.sig"),
         importEntry("sig_mem", "src/core/sig_mem.sig"),
     });
+    // Shared allocator-free C³ causal finance primitives.
+    _ = try ctx.addModule("c3-capital", "src/c3.sig");
+    _ = try ctx.addModule("c3-audit", "src/c3/audit.sig");
+    _ = try ctx.addModule("c3-allocation", "src/c3/allocation.sig");
+    _ = try ctx.addModule("c3-settlement", "src/c3/settlement.sig");
+    _ = try ctx.addModule("c3-entity", "src/c3/entity.sig");
+    const c3_wallet_auth = try ctx.addModule("c3-wallet-auth", "src/c3/wallet_auth.sig");
+    _ = try ctx.addModule("c3-wallet", "src/c3/wallet.sig");
+    try wire(ctx, c3_wallet_auth, "sig_testing", "src/core/sig_testing.sig");
+    const c3_protocol = try ctx.addModule("c3", "src/c3/root.sig");
+    try wire(ctx, c3_protocol, "capital", "src/c3.sig");
+    try wire(ctx, c3_protocol, "audit", "src/c3/audit.sig");
+    try wire(ctx, c3_protocol, "allocation", "src/c3/allocation.sig");
+    try wire(ctx, c3_protocol, "settlement", "src/c3/settlement.sig");
+    try wire(ctx, c3_protocol, "entity", "src/c3/entity.sig");
+    try wire(ctx, c3_protocol, "wallet_auth", "src/c3/wallet_auth.sig");
+    try wire(ctx, c3_protocol, "wallet", "src/c3/wallet.sig");
+    _ = try addTest(ctx, test_all, "test-c3-capital", "src/c3.sig", &.{
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-c3-audit", "src/c3/audit.sig", &.{
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-c3-allocation", "src/c3/allocation.sig", &.{
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-c3-settlement", "src/c3/settlement.sig", &.{
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-c3-entity", "src/c3/entity.sig", &.{
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-c3-wallet-auth", "src/c3/wallet_auth.sig", &.{
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-sha256", "src/core/sha256.sig", &.{
         importEntry("sig_mem", "src/core/sig_mem.sig"), importEntry("sig_testing", "src/core/sig_testing.sig"),
     });

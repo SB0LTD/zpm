@@ -155,6 +155,8 @@ pub const Conn = struct {
     in_len: usize = 0,
     closed: bool = false,
 
+    pub fn buffered(self: *const Conn) usize { return self.in_len - self.in_off; }
+
     /// Write application data as one or more TLS 1.3 app_data records.
     pub fn write(self: *Conn, data: []const u8) Error!void {
         var off: usize = 0;

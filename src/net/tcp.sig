@@ -440,6 +440,16 @@ var timestamp_clock: u32 = 0;
 // ══════════════════════════════════════════════════════════════════════════════
 
 var isn_counter: u32 = 0x4A17B5C3; // Seeded with non-zero value
+pub fn seed(value: u64) void { isn_counter = @truncate(value); if (isn_counter == 0) isn_counter = 1; }
+pub fn tick(_: u64, pkt_buf: []u8, send_fn: *const fn ([]const u8) void) void { tickAll(pkt_buf, send_fn); }
+pub fn pendingBytes(handle: u8) usize { return if (handle < MAX_CONNECTIONS) connections[handle].recv_len else 0; }
+pub fn writable(handle: u8) usize { return if (handle < MAX_CONNECTIONS) connections[handle].writable() else 0; }
+pub fn eof(handle: u8) bool {
+    if (handle >= MAX_CONNECTIONS) return true;
+    const c = &connections[handle];
+    return c.recv_len == 0 and (c.state == .close_wait or c.state == .closed or c.state == .closing or c.state == .time_wait);
+}
+
 
 fn generateISN() u32 {
     // RFC 6528 recommends a cryptographic ISN; we use a simple hash

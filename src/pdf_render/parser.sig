@@ -178,14 +178,14 @@ fn findTrailerRoot(data: [*]const u8, size: usize) ?usize {
 
 fn parsePages(data: [*]const u8, size: usize, doc: *PdfDoc) void {
     _ = data; _ = size;
-    // Find /Kids array in the Pages object
-    // Simple: scan all objects for /Type /Page entries
+    // Scan every in-use object for a `/Type /Page` dictionary. Real files vary
+    // in whitespace and delimiters — `/Type /Page`, `/Type/Page`, and a `/Page`
+    // followed by any name delimiter (`/`, whitespace, `>`, `[`) all count,
+    // while the page-tree root `/Type /Pages` must NOT.
     var obj: usize = 1;
     while (obj < doc.xref_count) : (obj += 1) {
         const obj_data = getObjectData(doc, obj) orelse continue;
-        if (containsStr(obj_data, "/Type /Page\n") or containsStr(obj_data, "/Type /Page ") or
-            containsStr(obj_data, "/Type /Page>"))
-        {
+        if (isPageObject(obj_data)) {
             if (doc.page_count < 1024) {
                 doc.pages[doc.page_count] = @intCast(obj);
                 doc.page_count += 1;
@@ -204,6 +204,46 @@ fn containsStr(haystack: []const u8, needle: []const u8) bool {
             if (haystack[i + j] != needle[j]) { match = false; break; }
         }
         if (match) return true;
+    }
+    return false;
+}
+
+fn isPdfWhitespace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n' or c == 0 or c == 0x0c;
+}
+
+/// True if the object dictionary declares `/Type /Page` (a leaf page), tolerant
+/// of whitespace between `/Type` and `/Page`, and NOT matching `/Type /Pages`
+/// (the page-tree root). Handles both spaced and tight name syntax.
+fn isPageObject(obj_data: []const u8) bool {
+    const type_key = "/Type";
+    var i: usize = 0;
+    while (i + type_key.len < obj_data.len) : (i += 1) {
+        // Match "/Type" at i.
+        var match = true;
+        for (type_key, 0..) |ch, k| {
+            if (obj_data[i + k] != ch) { match = false; break; }
+        }
+        if (!match) continue;
+        var p = i + type_key.len;
+        // Skip whitespace between the key and its value.
+        while (p < obj_data.len and isPdfWhitespace(obj_data[p])) p += 1;
+        // Expect "/Page".
+        const page = "/Page";
+        if (p + page.len > obj_data.len) continue;
+        var ok = true;
+        for (page, 0..) |ch, k| {
+            if (obj_data[p + k] != ch) { ok = false; break; }
+        }
+        if (!ok) continue;
+        // The next byte must be a name delimiter, and must NOT be 's' (which
+        // would make this `/Pages`, the tree root).
+        const after = p + page.len;
+        if (after >= obj_data.len) return true; // trailing /Page at EOF
+        const d = obj_data[after];
+        if (d == 's') continue; // /Pages
+        // A PDF name ends at whitespace or a delimiter.
+        if (isPdfWhitespace(d) or d == '/' or d == '>' or d == '[' or d == '(' or d == '<') return true;
     }
     return false;
 }
@@ -227,4 +267,22 @@ fn parseUintFixed(data: [*]const u8, pos: usize, digits: usize) usize {
         val = val * 10 + (data[pos + i] - '0');
     }
     return val;
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+const std = @import("std");
+
+test "isPageObject matches spaced and tight leaf pages, not the tree root" {
+    // Tight syntax (the common Ghostscript/qpdf output).
+    try std.testing.expect(isPageObject("<</Type/Page/MediaBox[0 0 612 792]>>"));
+    // Spaced syntax.
+    try std.testing.expect(isPageObject("<< /Type /Page /Contents 5 0 R >>"));
+    // Whitespace/newline between key and value.
+    try std.testing.expect(isPageObject("<</Type\n/Page>>"));
+    // The page-tree root must NOT count.
+    try std.testing.expect(!isPageObject("<</Type/Pages/Kids[3 0 R]/Count 2>>"));
+    try std.testing.expect(!isPageObject("<< /Type /Pages >>"));
+    // A non-page object.
+    try std.testing.expect(!isPageObject("<</Type/Font/Subtype/Type1>>"));
 }

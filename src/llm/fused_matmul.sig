@@ -17,8 +17,11 @@
 //
 // This is the hot inner loop. Every cycle matters.
 
-const quantize = @import("quantize.sig");
-const gguf_loader = @import("gguf_loader.sig");
+// Re-exported so downstream modules (e.g. @zpm/diffusion) can reach the GGUF
+// loader + dequant helpers through the fused-matmul module without registering
+// them as second module roots (which would put a file in two modules).
+pub const quantize = @import("quantize.sig");
+pub const gguf_loader = @import("gguf_loader.sig");
 
 /// Fused quantized matvec: output[N] = W_quant[N, K] @ input[K]
 /// W is stored in quantized format (Q4_K, Q8_0, F16, F32).
