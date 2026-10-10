@@ -296,12 +296,60 @@ zpm module library. They are organized by the four-layer hierarchy above.
 | `@zpm/vector-memory` | Bounded vector memory store |
 | `@zpm/agent-runtime` | Agent runtime primitives |
 
+### Layer 0 — Speech (Qwen3-TTS)
+
+The `@zpm/tts` stack is a complete, allocation-free, pure-Sig **neural**
+text-to-waveform decoder for the open-weight Qwen3-TTS-12Hz-0.6B Base
+architecture (Apache-2.0): a 28-layer Talker + 5-layer code predictor emit
+16-code acoustic frames, an 8-layer sliding-window RVQ codec transformer maps
+codes to a latent, and a causal ConvNeXt + SnakeBeta vocoder expands each
+latent to 1,920 samples of 24 kHz mono PCM. It consumes native SB0M model
+containers (`talker.sb0m` + `codec.sb0m`) and the Qwen BPE tokenizer; no Python,
+serving framework, or host speech engine participates.
+
+| Package | Description |
+|---------|-------------|
+| `@zpm/tts` | Coarse re-export of the whole Qwen3-TTS stack |
+| `@zpm/tts-model-container` | SB0M immutable model ABI (Source / Index / Tensor / parse) |
+| `@zpm/tts-talker-plan` | Talker architecture constants + execution-plan types |
+| `@zpm/tts-talker-native-plan` | SB0M schema binder for the 402-tensor Talker |
+| `@zpm/tts-talker-backend` | SB0-Q4 / f16 tensor kernels for the Talker |
+| `@zpm/tts-talker-executor` | Resumable, row-sliced Talker + predictor decoder |
+| `@zpm/tts-sampler` | Fixed-storage top-k / temperature acoustic sampler |
+| `@zpm/tts-synth` | Text → acoustic-code runtime (prompt scaffold + frames) |
+| `@zpm/tts-codec-plan` | 271-tensor codec + vocoder execution plan |
+| `@zpm/tts-codec-backend` | SB0-Q4 / f16 kernels for the codec + vocoder |
+| `@zpm/tts-codec-transformer` | Codes → latent (split RVQ + sliding transformer) |
+| `@zpm/tts-vocoder` | Latent → PCM (causal ConvNeXt + SnakeBeta decoder) |
+| `@zpm/tts-codec` | One frame → four 480-sample PCM16 periods via a `PcmSink` |
+| `@zpm/tts-gpu` | Optional cuBLAS weight cache — runs the matmuls on the GPU |
+
+The pure-Sig CPU decoder is exact but unaccelerated (~644x slower than realtime,
+≈51 s for 80 ms of audio). `@zpm/tts-gpu` lifts the matmul weights into VRAM once
+(dequantized to f32) and runs each matrix multiply through **cuBLAS** — the
+tensor backends consult it first and fall back to the CPU when there is no CUDA
+device, so the stack stays correct everywhere. Voice controls the model exposes
+(via `tts-synth`'s `VoiceConfig`): the codec **language** (10 languages), the
+Talker/predictor **sampling** (temperature, top-k, repetition penalty), and the
+**think** prefix. Named speaker presets require a Qwen3-TTS *CustomVoice*
+checkpoint (the Base checkpoint ships an empty speaker table).
+
+### Layer 0 — Audio
+
+| Package | Description |
+|---------|-------------|
+| `@zpm/wav` | RIFF/WAVE PCM16 container writer (mono/stereo) |
+| `@zpm/tts-voice` | Phoneme → PCM16 source-filter narrator synthesizer |
+| `@zpm/synth-voice` | Additive harmonic oscillator bank |
+| `@zpm/opus` | Opus audio primitives |
+
 ### Layer 0 — Image / Document
 
 | Package | Description |
 |---------|-------------|
 | `@zpm/image` | Software image buffers and compositing |
 | `@zpm/png-decode` | PNG decoding |
+| `@zpm/pdf-render` | PDF parse + page rasterize + **text extraction** (Tj/TJ + FlateDecode) |
 | `@zpm/layout` | Layout analysis |
 | `@zpm/text-analyze` | Text detection over image buffers |
 | `@zpm/elementor-document` | Structured document model |

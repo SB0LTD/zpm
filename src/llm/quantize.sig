@@ -84,6 +84,70 @@ pub fn dequantQ4_K(src: [*]const u8, dst: [*]f32, n_elements: usize) void {
     }
 }
 
+/// Dequantize a block of Q6_K data to f32.
+/// Q6_K: 256 values per block, 210 bytes:
+///   ql[128] (low 4 bits) + qh[64] (high 2 bits) + scales[16] (i8) + d (f16).
+/// Layout matches ggml's dequantize_row_q6_K.
+pub fn dequantQ6_K(src: [*]const u8, dst: [*]f32, n_elements: usize) void {
+    const QK_K: usize = 256;
+    const n_blocks = n_elements / QK_K;
+    var bi: usize = 0;
+    while (bi < n_blocks) : (bi += 1) {
+        const block = src + bi * 210;
+        const ql = block; // 128 bytes
+        const qh = block + 128; // 64 bytes
+        const sc: [*]const i8 = @ptrCast(block + 192); // 16 signed scales
+        const d = f16ToF32(@as(u16, block[208]) | (@as(u16, block[209]) << 8));
+        const out_base = bi * QK_K;
+
+        // ggml processes the 256 values in two 128-wide halves.
+        var n: usize = 0;
+        while (n < QK_K) : (n += 128) {
+            var l: usize = 0;
+            while (l < 32) : (l += 1) {
+                const is = l / 16;
+                const ql_ptr = ql + n / 2;
+                const qh_ptr = qh + n / 4;
+                const q1 = @as(i32, (ql_ptr[l] & 0xF) | (((qh_ptr[l] >> 0) & 3) << 4)) - 32;
+                const q2 = @as(i32, (ql_ptr[l + 32] & 0xF) | (((qh_ptr[l] >> 2) & 3) << 4)) - 32;
+                const q3 = @as(i32, (ql_ptr[l] >> 4) | (((qh_ptr[l] >> 4) & 3) << 4)) - 32;
+                const q4 = @as(i32, (ql_ptr[l + 32] >> 4) | (((qh_ptr[l] >> 6) & 3) << 4)) - 32;
+                const sc_base = (n / 128) * 8 + is;
+                dst[out_base + n + l] = d * @as(f32, @floatFromInt(sc[sc_base + 0])) * @as(f32, @floatFromInt(q1));
+                dst[out_base + n + l + 32] = d * @as(f32, @floatFromInt(sc[sc_base + 2])) * @as(f32, @floatFromInt(q2));
+                dst[out_base + n + l + 64] = d * @as(f32, @floatFromInt(sc[sc_base + 4])) * @as(f32, @floatFromInt(q3));
+                dst[out_base + n + l + 96] = d * @as(f32, @floatFromInt(sc[sc_base + 6])) * @as(f32, @floatFromInt(q4));
+            }
+        }
+    }
+}
+
+/// Dispatch dequantization by GGML type code (the numeric value stored in the
+/// GGUF tensor header). Handles the types Qwen-Image uses: F32(0), F16(1),
+/// Q8_0(8), Q4_K(12), Q6_K(14), BF16(30). Unknown types zero-fill.
+pub fn dequantByType(type_code: u32, src: [*]const u8, dst: [*]f32, n_elements: usize) void {
+    switch (type_code) {
+        0 => { // f32 — direct copy
+            const s: [*]const f32 = @ptrCast(@alignCast(src));
+            var i: usize = 0;
+            while (i < n_elements) : (i += 1) dst[i] = s[i];
+        },
+        1 => { // f16
+            const s: [*]const u16 = @ptrCast(@alignCast(src));
+            var i: usize = 0;
+            while (i < n_elements) : (i += 1) dst[i] = f16ToF32(s[i]);
+        },
+        8 => dequantQ8_0(src, dst, n_elements),
+        12 => dequantQ4_K(src, dst, n_elements),
+        14 => dequantQ6_K(src, dst, n_elements),
+        30 => dequantBf16(@ptrCast(@alignCast(src)), dst, n_elements),
+        else => {
+            var i: usize = 0;
+            while (i < n_elements) : (i += 1) dst[i] = 0;
+        },
+    }
+}
+
 /// Dequantize BF16 to F32
 pub fn dequantBf16(src: [*]const u16, dst: [*]f32, n_elements: usize) void {
     var i: usize = 0;

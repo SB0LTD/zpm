@@ -108,6 +108,18 @@ const CuStreamCreateFn = *const fn (*CUstream, c_uint) callconv(.c) CUresult;
 const CuStreamSyncFn = *const fn (CUstream) callconv(.c) CUresult;
 const CuStreamDestroyFn = *const fn (CUstream) callconv(.c) CUresult;
 const CuDevicePrimaryCtxRetainFn = *const fn (*CUcontext, CUdevice) callconv(.c) CUresult;
+const CuDeviceGetCountFn = *const fn (*c_int) callconv(.c) CUresult;
+const CuDeviceGetNameFn = *const fn ([*]u8, c_int, CUdevice) callconv(.c) CUresult;
+const CuDeviceTotalMemFn = *const fn (*usize, CUdevice) callconv(.c) CUresult;
+const CuDeviceGetAttributeFn = *const fn (*c_int, c_int, CUdevice) callconv(.c) CUresult;
+const CuDriverGetVersionFn = *const fn (*c_int) callconv(.c) CUresult;
+const CuMemGetInfoFn = *const fn (*usize, *usize) callconv(.c) CUresult;
+
+// CUDA device attribute enum values we query (from cuda.h).
+pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
+pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
+pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
+pub const CU_DEVICE_ATTRIBUTE_CLOCK_RATE: c_int = 13;
 
 // ── Custom-kernel (driver module + launch) types ──
 // A loaded PTX/cubin module and a kernel function handle inside it.
@@ -182,6 +194,12 @@ pub var fn_cuStreamCreate: ?CuStreamCreateFn = null;
 pub var fn_cuStreamSync: ?CuStreamSyncFn = null;
 pub var fn_cuStreamDestroy: ?CuStreamDestroyFn = null;
 pub var fn_cuDevicePrimaryCtxRetain: ?CuDevicePrimaryCtxRetainFn = null;
+pub var fn_cuDeviceGetCount: ?CuDeviceGetCountFn = null;
+pub var fn_cuDeviceGetName: ?CuDeviceGetNameFn = null;
+pub var fn_cuDeviceTotalMem: ?CuDeviceTotalMemFn = null;
+pub var fn_cuDeviceGetAttribute: ?CuDeviceGetAttributeFn = null;
+pub var fn_cuDriverGetVersion: ?CuDriverGetVersionFn = null;
+pub var fn_cuMemGetInfo: ?CuMemGetInfoFn = null;
 
 // Custom-kernel driver function pointers (from nvcuda.dll)
 pub var fn_cuModuleLoadData: ?CuModuleLoadDataFn = null;
@@ -336,6 +354,34 @@ pub fn matvec(output: [*]f32, weight: [*]const f32, input: [*]const f32, n: usiz
     gemm(output, input, weight, 1, k, n);
 }
 
+/// Device-pointer GEMM: C[M×N] += A[M×K] @ B[N×K]^T, all operands already in
+/// VRAM (CUdeviceptr). This is the row-major contract used by the diffusion
+/// engine: C = A @ B^T. Same column-major trick as `gemm`. beta=0 (overwrite),
+/// so the caller does not need to pre-zero C.
+pub fn gemmDev(c: CUdeviceptr, a: CUdeviceptr, b: CUdeviceptr, m: usize, k: usize, n: usize) void {
+    if (!isAvailable()) return;
+    const alpha: f32 = 1.0;
+    const beta: f32 = 0.0; // overwrite C
+    // Row-major C[m×n] = A[m×k] @ B[n×k]^T. In column-major cuBLAS this is
+    // C_cm[n×m] = B_cm^T · A_cm, i.e. sgemm(T, N, n, m, k, B(ld=k), A(ld=k), C(ld=n)).
+    _ = fn_cublasSgemm.?(
+        cublas_handle.?,
+        .T, // op(B_cm): transpose so [n×k]
+        .N, // op(A_cm): [k×m]
+        @intCast(n),
+        @intCast(m),
+        @intCast(k),
+        &alpha,
+        @ptrFromInt(b),
+        @intCast(k), // ldb (of the B operand = weight) = k
+        @ptrFromInt(a),
+        @intCast(k), // lda (of the A operand = activations) = k
+        &beta,
+        @ptrFromInt(c),
+        @intCast(n), // ldc = n
+    );
+}
+
 /// Allocate GPU memory. Returns device pointer (0 on failure).
 pub fn gpuAlloc(size_bytes: usize) CUdeviceptr {
     if (fn_cuMemAlloc) |memAlloc| {
@@ -435,6 +481,14 @@ fn loadCudaDriver() bool {
     fn_cuStreamSync = @ptrCast(GetProcAddress(dll, "cuStreamSynchronize"));
     fn_cuStreamDestroy = @ptrCast(GetProcAddress(dll, "cuStreamDestroy_v2"));
     fn_cuDevicePrimaryCtxRetain = @ptrCast(GetProcAddress(dll, "cuDevicePrimaryCtxRetain"));
+
+    // Device identification (optional — used by higher layers to report the GPU).
+    fn_cuDeviceGetCount = @ptrCast(GetProcAddress(dll, "cuDeviceGetCount"));
+    fn_cuDeviceGetName = @ptrCast(GetProcAddress(dll, "cuDeviceGetName"));
+    fn_cuDeviceTotalMem = @ptrCast(GetProcAddress(dll, "cuDeviceTotalMem_v2"));
+    fn_cuDeviceGetAttribute = @ptrCast(GetProcAddress(dll, "cuDeviceGetAttribute"));
+    fn_cuDriverGetVersion = @ptrCast(GetProcAddress(dll, "cuDriverGetVersion"));
+    fn_cuMemGetInfo = @ptrCast(GetProcAddress(dll, "cuMemGetInfo_v2"));
 
     // Custom-kernel launch (present on any modern driver; optional — a failure
     // to resolve simply leaves the custom-kernel path unavailable).
@@ -690,6 +744,33 @@ pub fn launchKernel(
     ) == CUDA_SUCCESS;
 }
 
+/// GEMM self-test: C[2×2] = A[2×3] @ B[2×3]^T on the GPU via gemmDev, verified
+/// against the CPU reference. Returns 0 on pass, else a stage code:
+/// 1=init, 2=alloc, 3=upload, 4=cublas-not-avail, 5=download, 6=wrong-result.
+pub fn gemmSelfTest() u32 {
+    if (!init()) return 1;
+    // A[2×3] row-major, B[2×3] row-major → C[2×2] = A @ B^T.
+    const A = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const B = [_]f32{ 1, 0, 1, 0, 1, 0 }; // row0=(1,0,1) row1=(0,1,0)
+    // C[0,0]=A0·B0=1+0+3=4; C[0,1]=A0·B1=2; C[1,0]=B0·A1=4+0+6=10; C[1,1]=5.
+    const want = [_]f32{ 4, 2, 10, 5 };
+    const dA = gpuAlloc(A.len * 4);
+    const dB = gpuAlloc(B.len * 4);
+    const dC = gpuAlloc(want.len * 4);
+    defer gpuFree(dA);
+    defer gpuFree(dB);
+    defer gpuFree(dC);
+    if (dA == 0 or dB == 0 or dC == 0) return 2;
+    if (!uploadToGpu(dA, &A, A.len * 4) or !uploadToGpu(dB, &B, B.len * 4)) return 3;
+    if (!isAvailable()) return 4;
+    gemmDev(dC, dA, dB, 2, 3, 2); // m=2,k=3,n=2
+    _ = syncActiveStream();
+    var got: [4]f32 = @splat(0);
+    if (!downloadFromGpu(&got, dC, want.len * 4)) return 5;
+    for (want, got) |w, g| if (@abs(w - g) > 1e-3) return 6;
+    return 0;
+}
+
 /// End-to-end smoke test of the custom-kernel pipeline on the live GPU:
 /// compile a SiLU kernel, upload a small vector, launch, download, and verify
 /// the result against the CPU reference. Returns true only if every stage
@@ -762,4 +843,73 @@ pub fn selfTestDiag(log_out: ?[]u8) u32 {
         if (@abs(got - want) > 1e-3) return 11;
     }
     return 0;
+}
+
+// ── Device identification ──────────────────────────────────────────────────
+// Surfaced so higher layers (e.g. sbai) can report exactly which GPU work runs
+// on. All fields are best-effort: a field stays at its default if the driver
+// call is unavailable or fails.
+
+pub const DeviceInfo = struct {
+    present: bool = false,
+    name: [128]u8 = @splat(0),
+    name_len: usize = 0,
+    total_mem_bytes: usize = 0,
+    free_mem_bytes: usize = 0,
+    cc_major: c_int = 0,
+    cc_minor: c_int = 0,
+    sm_count: c_int = 0,
+    clock_khz: c_int = 0,
+    driver_version: c_int = 0,
+
+    pub fn nameSlice(self: *const DeviceInfo) []const u8 {
+        return self.name[0..self.name_len];
+    }
+};
+
+/// Query device 0's identity + memory. Loads the driver if needed. Returns a
+/// DeviceInfo with present=false when no CUDA device is usable.
+pub fn queryDevice() DeviceInfo {
+    var info: DeviceInfo = .{};
+    if (!loadCudaDriver()) return info;
+    const cuInit = fn_cuInit orelse return info;
+    if (cuInit(0) != CUDA_SUCCESS) return info;
+
+    const deviceGet = fn_cuDeviceGet orelse return info;
+    var dev: CUdevice = 0;
+    if (deviceGet(&dev, 0) != CUDA_SUCCESS) return info;
+    info.present = true;
+
+    if (fn_cuDeviceGetName) |getName| {
+        if (getName(&info.name, @intCast(info.name.len), dev) == CUDA_SUCCESS) {
+            var n: usize = 0;
+            while (n < info.name.len and info.name[n] != 0) n += 1;
+            info.name_len = n;
+        }
+    }
+    if (fn_cuDeviceTotalMem) |totalMem| {
+        var bytes: usize = 0;
+        if (totalMem(&bytes, dev) == CUDA_SUCCESS) info.total_mem_bytes = bytes;
+    }
+    if (fn_cuDeviceGetAttribute) |getAttr| {
+        _ = getAttr(&info.cc_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
+        _ = getAttr(&info.cc_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
+        _ = getAttr(&info.sm_count, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev);
+        _ = getAttr(&info.clock_khz, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, dev);
+    }
+    if (fn_cuDriverGetVersion) |drvVer| {
+        _ = drvVer(&info.driver_version);
+    }
+    // Free memory needs a current context.
+    if (ensureContext()) {
+        if (fn_cuMemGetInfo) |memInfo| {
+            var free_b: usize = 0;
+            var total_b: usize = 0;
+            if (memInfo(&free_b, &total_b) == CUDA_SUCCESS) {
+                info.free_mem_bytes = free_b;
+                if (info.total_mem_bytes == 0) info.total_mem_bytes = total_b;
+            }
+        }
+    }
+    return info;
 }

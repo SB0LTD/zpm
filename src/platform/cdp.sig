@@ -280,6 +280,7 @@ pub const Page = struct {
     pub fn evaluate(self: *Page, io: std.Io, expression: []const u8, out: []u8) Error![]const u8 {
         // Build Runtime.evaluate params with the expression JSON-escaped.
         // We stream the request directly to avoid a giant params copy.
+        _ = io; // transport carries its own Io since the WebSocket unification.
         const id = self.next_id;
         self.next_id += 1;
 
@@ -315,6 +316,7 @@ pub const Page = struct {
     /// Send a command and wait for its matching reply. Returns nothing useful
     /// beyond success; the reply body is discarded.
     fn call(self: *Page, io: std.Io, method: []const u8, params: []const u8) Error!void {
+        _ = io; // transport carries its own Io since the WebSocket unification.
         const id = self.next_id;
         self.next_id += 1;
 
@@ -342,6 +344,7 @@ pub const Page = struct {
     }
 
     pub fn close(self: *Page, io: std.Io) void {
+        _ = io; // transport carries its own Io since the WebSocket unification.
         self.ws.close();
     }
 };

@@ -1,5 +1,73 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Custom CUDA kernels in `@zpm/matmul` (cuda backend).** The runtime dynamic
+  loader now binds the driver-API module/launch entry points
+  (`cuModuleLoadData`, `cuModuleGetFunction`, `cuLaunchKernel`,
+  `cuDevicePrimaryCtxRetain`) and **NVRTC** (`nvrtcCompileProgram`,
+  `nvrtcGetCUBIN`, …), so CUDA-C source can be compiled to **cubin** at runtime
+  and launched — no build-time CUDA toolkit dependency. Targets the real SM
+  (e.g. `sm_120`) so the driver never JITs PTX. `compile`, `loadModule`,
+  `getFunction`, `launchKernel`, `kernelsAvailable`, `ensureContext`.
+- **`@zpm/tts-kernels` — hand-written CUDA kernels + device weight residency for
+  the TTS decode.** Compiles one CUDA-C translation unit to cubin once at init
+  and exposes typed launch wrappers for every non-matmul op in the pipeline:
+  rmsNorm / per-head rmsNorm, split-half RoPE, grouped-query & sliding-window
+  attention (f32 KV), SiLU-gate, SnakeBeta, layerNorm, GELU, residual/scale add,
+  and causal / transposed / depthwise conv1d. Also holds an any-rank f32 device
+  weight cache (keyed by tensor offset) and device-resident cuBLAS gemm, so a
+  whole decode stage runs without per-matmul host round-trips. Every kernel is
+  numerically checked against its CPU reference. No-op when there is no GPU.
+- **GPU-resident decode across the whole `@zpm/tts` stack.** The Talker + code
+  predictor (`tts-talker-executor` `GpuForward`), the codec transformer
+  (`tts-codec-transformer`), and the ConvNeXt/SnakeBeta vocoder (`tts-vocoder`)
+  each gained a full device-resident forward: weights dequantized to f32 in VRAM
+  once, activations kept on the device across all layers, elementwise/attention/
+  conv on `tts-kernels`, matmuls on cuBLAS. Full f32 — more faithful than the
+  CPU Q4×Q8 path — and it falls back to the exact CPU decoder when no GPU is
+  present. Together these give a ~60x decode speedup over the CPU path.
+- **`@zpm/tts-gpu` — optional cuBLAS acceleration for the TTS stack.** Lifts the
+  Talker + codec matmul weights into VRAM once (dequantized to f32) and runs
+  each matrix multiply through cuBLAS, keyed by tensor file offset. The tensor
+  backends (`tts-talker-backend`, `tts-codec-backend`) consult it first and fall
+  back to the exact CPU decoder when there is no CUDA device, so the stack stays
+  buildable and correct everywhere.
+- **Voice controls in `@zpm/tts-synth` (`VoiceConfig`).** The model-supported
+  knobs are now configurable per utterance instead of hardcoded: the codec
+  **language** (10 languages via `languageToken`), the Talker/predictor
+  **sampling** (temperature, top-k, repetition penalty), and the **think**
+  prefix. Defaults reproduce the pinned Base generation config.
+- **`@zpm/tts` — native Qwen3-TTS-12Hz-0.6B neural speech synthesis.** A
+  complete, allocation-free, pure-Sig text-to-waveform stack (Apache-2.0
+  architecture): a 28-layer Talker + 5-layer code predictor emit 16-code
+  acoustic frames (`tts-talker-*`, `tts-synth`, `tts-sampler`), an 8-layer
+  sliding-window split-RVQ codec transformer maps codes to a latent
+  (`tts-codec-transformer`), and a causal ConvNeXt + SnakeBeta vocoder expands
+  each latent to 1,920 samples of 24 kHz PCM (`tts-vocoder`, `tts-codec`). Reads
+  native SB0M model containers via `tts-model-container` and consumes only
+  `quantized_linear` + `transformer_ops`. Extracted from the SB0 Nexus runtime
+  where it was first developed; every module retains its bounded fixed-storage
+  state machine and per-module tests. Exact but unaccelerated (~644x realtime).
+- **`@zpm/wav`** — an allocation-free RIFF/WAVE PCM16 container writer (mono or
+  stereo, 44-byte header, streaming or one-shot).
+- **`@zpm/tts-voice`** — a phoneme → PCM16 source-filter narrator synthesizer
+  (glottal source + formant resonators) built on the `english_phonemes`
+  frontend, for instant offline narration without a model.
+- **`@zpm/pdf-render` text extraction** (`pdf_render/text.sig`) — recover a
+  PDF's readable text from its content streams: FlateDecode via `@zpm/inflate`
+  plus the `Tj`/`TJ`/`'`/`"` text-showing operators, with string-escape and
+  kerning-gap handling and `/Contents` reference resolution.
+
+### Fixed
+- **`@zpm/pdf-render` page detection** (`pdf_render/parser.sig`): `parsePages`
+  matched only the spaced `/Type /Page` form followed by a newline/space/`>`,
+  so it found zero pages in files that emit the tight `/Type/Page` syntax (the
+  common Ghostscript/qpdf output). Replaced with a whitespace- and
+  delimiter-tolerant `isPageObject` that also correctly excludes the `/Pages`
+  page-tree root. Added regression tests.
+
 ## 0.3.0 — 2026-09-04
 
 ### Changed

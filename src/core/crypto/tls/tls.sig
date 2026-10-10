@@ -252,6 +252,10 @@ pub const Conn = struct {
     in_len: usize = 0,
     closed: bool = false,
 
+    pub fn buffered(self: *const Conn) usize {
+        return self.in_len - self.in_off;
+    }
+
     /// The ALPN protocol the server selected (e.g. "http/1.1"), or empty.
     pub fn negotiatedAlpn(self: *const Conn) []const u8 {
         return self.alpn[0..self.alpn_len];

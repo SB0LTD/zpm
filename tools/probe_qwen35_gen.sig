@@ -40,7 +40,7 @@ const Clock = struct {
 };
 
 const capacity = 2048;
-const CONTEXT: usize = 256;
+const CONTEXT: usize = 1024;
 
 var index: gguf.Index(capacity) = .{};
 var plan: plan_mod.Plan = .{};
@@ -113,8 +113,9 @@ pub fn main(init: std.process.Init) !void {
     // Optional 5th arg: RNG seed for reproducible sampling (default 0).
     const seed: u64 = if (try argv.next()) |value| try std.fmt.parseInt(u64, value, 10) else 0;
 
-    // Qwen3.8-4B-Distill recommended sampling settings.
-    const sampler_cfg = sampling.Config{ .temperature = 0.6, .top_p = 0.95, .top_k = 20 };
+    // Qwen3.8-4B-Distill recommended sampling settings, plus a mild repetition
+    // penalty so long code generations don't collapse into a token loop.
+    const sampler_cfg = sampling.Config{ .temperature = 0.6, .top_p = 0.95, .top_k = 20, .repetition_penalty = 1.15 };
     var rng = sampling.Rng.init(seed);
 
     const file = try std.Io.Dir.cwd().openFile(init.io, path, .{});

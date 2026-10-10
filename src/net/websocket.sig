@@ -117,6 +117,7 @@ pub const HandshakeOptions = struct {
     /// A 16-byte nonce for Sec-WebSocket-Key. If null, a fixed dev nonce is
     /// used (the key is not a secret; it only guards against caching proxies).
     key_nonce: ?[16]u8 = null,
+    extra_headers: []const u8 = "",
 };
 
 /// The magic GUID appended to the client key before hashing, per RFC 6455 §4.2.
@@ -129,6 +130,9 @@ pub const Client = struct {
     transport: Transport,
     recv_buf: []u8,
     got_close: bool = false,
+    close_code: u16 = 0,
+    close_reason: [123]u8 = undefined,
+    close_reason_len: usize = 0,
     /// Rolling source for the 4-byte client mask key (see `nextMaskKey`).
     mask_counter: u32 = 0x1a2b3c4d,
     /// Small buffered-read window over the transport for header byte reads.
@@ -151,6 +155,8 @@ pub const Client = struct {
         return self;
     }
 
+    pub fn pending(self: *const Client) bool { return self.r_off < self.r_len; }
+
     // ── Opening handshake ───────────────────────────────────────────────────
 
     fn handshake(self: *Client, opts: HandshakeOptions) Error!void {
@@ -168,8 +174,8 @@ pub const Client = struct {
                     "Connection: Upgrade\r\n" ++
                     "Sec-WebSocket-Key: {s}\r\n" ++
                     "Sec-WebSocket-Version: 13\r\n" ++
-                    "\r\n",
-                .{ opts.path, opts.host, key_b64 },
+                    "{s}\r\n",
+                .{ opts.path, opts.host, key_b64, opts.extra_headers },
             ) catch return Error.ScratchTooSmall
         else
             std.fmt.bufPrint(opts.scratch,
@@ -179,8 +185,8 @@ pub const Client = struct {
                     "Connection: Upgrade\r\n" ++
                     "Sec-WebSocket-Key: {s}\r\n" ++
                     "Sec-WebSocket-Version: 13\r\n" ++
-                    "\r\n",
-                .{ opts.path, opts.host, opts.port, key_b64 },
+                    "{s}\r\n",
+                .{ opts.path, opts.host, opts.port, key_b64, opts.extra_headers },
             ) catch return Error.ScratchTooSmall;
 
         self.transport.writeAll(req) catch return Error.IoFailed;
@@ -389,6 +395,9 @@ pub const Client = struct {
             .pong => {}, // unsolicited pong: ignore
             .close => {
                 self.got_close = true;
+                if (body.len >= 2) self.close_code = std.mem.readInt(u16, body[0..2], .big);
+                self.close_reason_len = @min(self.close_reason.len, body.len -| 2);
+                if (self.close_reason_len > 0) @memcpy(self.close_reason[0..self.close_reason_len], body[2..][0..self.close_reason_len]);
                 self.sendFrame(.close, body) catch {};
             },
             else => {},
@@ -467,15 +476,24 @@ pub const StreamTransport = struct {
     fn readSomeFn(ctx: *anyopaque, buf: []u8) Error!usize {
         const self: *StreamTransport = @ptrCast(@alignCast(ctx));
         const r = &self.reader.interface;
-        // Block for at least one byte; std reader fills opportunistically.
+        // Contract: return at least one byte, up to buf.len, blocking only for
+        // the first. Block for one byte via takeByte (which refills the reader
+        // from the socket once), then copy ONLY the bytes already sitting in the
+        // reader's buffer. We must not call takeByte again to "drain more":
+        // once the buffer is empty takeByte BLOCKS on the socket for a fresh
+        // fill, and a peer that has sent its whole message and is now waiting
+        // on us (e.g. a server right after the WebSocket 101 handshake) never
+        // sends more — so that second takeByte would hang forever. Using the
+        // non-blocking `buffered()` window instead is what unblocks attach.
         const b = r.takeByte() catch return Error.IoFailed;
         buf[0] = b;
         var n: usize = 1;
-        // Drain whatever else is already buffered without blocking further.
-        while (n < buf.len) {
-            const more = r.takeByte() catch break;
-            buf[n] = more;
-            n += 1;
+        const rest = r.buffered(); // already in memory; reading it never blocks
+        if (rest.len > 0 and n < buf.len) {
+            const take = @min(rest.len, buf.len - n);
+            @memcpy(buf[n .. n + take], rest[0..take]);
+            r.toss(take); // advance seek past the bytes we consumed
+            n += take;
         }
         return n;
     }

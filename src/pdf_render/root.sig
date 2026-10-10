@@ -12,6 +12,7 @@
 
 pub const parser = @import("parser.sig");
 pub const raster = @import("raster.sig");
+pub const text = @import("text.sig");
 
 pub const PdfDoc = parser.PdfDoc;
 pub const Framebuffer = raster.Framebuffer;

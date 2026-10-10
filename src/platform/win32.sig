@@ -277,6 +277,9 @@ pub extern "kernel32" fn FindFirstFileW(LPCWSTR, *WIN32_FIND_DATAW) callconv(.c)
 pub extern "kernel32" fn FindNextFileW(HANDLE, *WIN32_FIND_DATAW) callconv(.c) BOOL;
 pub extern "kernel32" fn FindClose(HANDLE) callconv(.c) BOOL;
 
+// Logical drive bitmask (bit 0 = A:, bit 1 = B:, ...). Used by file browsers.
+pub extern "kernel32" fn GetLogicalDrives() callconv(.c) DWORD;
+
 // GDI font/bitmap functions
 pub const HFONT = *opaque {};
 pub const HGDIOBJ = *opaque {};

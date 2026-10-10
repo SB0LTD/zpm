@@ -24,6 +24,8 @@ pub const MAX_NAME_LEN: usize = 128;
 pub const DirEntry = struct {
     name: [MAX_NAME_LEN]u8 = [_]u8{0} ** MAX_NAME_LEN,
     len: usize = 0,
+    /// True when this entry is a subdirectory (used by file browsers).
+    is_dir: bool = false,
     pub fn slice(self: *const DirEntry) []const u8 {
         return self.name[0..self.len];
     }
@@ -33,6 +35,101 @@ pub const DirListing = struct {
     entries: [MAX_DIR_ENTRIES]DirEntry = [_]DirEntry{.{}} ** MAX_DIR_ENTRIES,
     count: usize = 0,
 };
+
+/// Cap on the number of browsable entries (larger than the config-file lister
+/// because a real file browser lists whole directories).
+pub const MAX_BROWSE_ENTRIES: usize = 512;
+
+pub const BrowseListing = struct {
+    entries: [MAX_BROWSE_ENTRIES]DirEntry = [_]DirEntry{.{}} ** MAX_BROWSE_ENTRIES,
+    count: usize = 0,
+    /// True if the requested directory could not be opened.
+    err: bool = false,
+};
+
+/// List EVERYTHING in `dir_utf16` (a directory path with NO trailing slash):
+/// subdirectories first (is_dir=true), then files matching `ext` (empty `ext`
+/// = all files). Skips the "." entry; keeps ".." so callers can navigate up.
+/// This is the browser-facing lister (directories included), distinct from the
+/// files-only `listDir` used for config discovery. Pure Win32 FindFirstFileW —
+/// no shell "browse" dialog.
+pub fn listBrowse(dir_utf16: []const u16, ext: []const u8, out: *BrowseListing) usize {
+    out.count = 0;
+    out.err = false;
+
+    var pat: [w32.MAX_PATH]u16 = undefined;
+    var pi: usize = 0;
+    for (dir_utf16) |c| {
+        if (c == 0) break;
+        if (pi >= w32.MAX_PATH - 3) break;
+        pat[pi] = c;
+        pi += 1;
+    }
+    pat[pi] = '\\';
+    pi += 1;
+    pat[pi] = '*';
+    pi += 1;
+    pat[pi] = 0;
+
+    var fd: w32.WIN32_FIND_DATAW = .{};
+    const h = w32.FindFirstFileW(@ptrCast(&pat), &fd);
+    if (h == w32.INVALID_HANDLE_VALUE) {
+        out.err = true;
+        return 0;
+    }
+    defer _ = w32.FindClose(h);
+
+    // Two passes over the same enumeration are awkward with FindNextFile, so we
+    // collect directories and files in one pass but insert dirs before files by
+    // recording a split index. Simpler: append all, then the UI can sort. Here
+    // we append dirs and files in encounter order but tag is_dir; the caller
+    // (browser) renders dirs-first by checking the flag.
+    while (true) {
+        var name: [MAX_NAME_LEN]u8 = undefined;
+        var nl: usize = 0;
+        var k: usize = 0;
+        while (k < fd.cFileName.len and fd.cFileName[k] != 0) : (k += 1) {
+            const ch = fd.cFileName[k];
+            if (ch < 128 and nl < MAX_NAME_LEN) {
+                name[nl] = @intCast(ch);
+                nl += 1;
+            }
+        }
+        const is_dir = (fd.dwFileAttributes & w32.FILE_ATTRIBUTE_DIRECTORY) != 0;
+        const is_dot = nl == 1 and name[0] == '.';
+        const keep = !is_dot and (is_dir or ext.len == 0 or endsWith(name[0..nl], ext));
+        if (keep and out.count < MAX_BROWSE_ENTRIES) {
+            var e = &out.entries[out.count];
+            @memcpy(e.name[0..nl], name[0..nl]);
+            e.len = nl;
+            e.is_dir = is_dir;
+            out.count += 1;
+        }
+        if (w32.FindNextFileW(h, &fd) == 0) break;
+    }
+    return out.count;
+}
+
+/// Enumerate the logical drives present ("C:", "D:", …) into `out` as dir
+/// entries. Lets a browser show a drive root when navigating above a drive.
+pub fn listDrives(out: *BrowseListing) usize {
+    out.count = 0;
+    out.err = false;
+    const mask = w32.GetLogicalDrives();
+    const letter: u8 = 'A';
+    var bit: u5 = 0;
+    while (bit < 26) : (bit += 1) {
+        if ((mask >> bit) & 1 != 0 and out.count < MAX_BROWSE_ENTRIES) {
+            var e = &out.entries[out.count];
+            e.name[0] = letter + bit;
+            e.name[1] = ':';
+            e.len = 2;
+            e.is_dir = true;
+            out.count += 1;
+        }
+    }
+    return out.count;
+}
 
 /// List files in `dir_utf16` (a directory path with NO trailing slash) whose
 /// names end with `ext` (e.g. ".pine"). Files only (skips subdirectories).
