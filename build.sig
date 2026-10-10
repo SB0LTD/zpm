@@ -286,6 +286,27 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-http-socket-ext", "src/net/http/socket_ext.sig", &.{ importEntry("tls_client", "src/core/crypto/tls/client.sig"), importEntry("win32", win32_path) });
     _ = try addTest(ctx, test_all, "test-http-client", "src/net/http/client.sig", &.{ importEntry("tls_client", "src/core/crypto/tls/client.sig"), importEntry("win32", win32_path) });
     _ = try addTest(ctx, test_all, "test-http-noalloc", "src/net/http/no_alloc_test.sig", &.{});
+
+    // ── SABR streaming client (protobuf/UMP/request/player-fields/loop) ──
+    // Core protobuf codec is Layer-0 pure; the SABR youtube modules import it by
+    // relative path (../../core/protobuf.sig) and have no name-based imports, so
+    // their test steps take an empty import list.
+    _ = try addTest(ctx, test_all, "test-protobuf", "src/core/protobuf.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-sabr-ump", "src/youtube/sabr/ump.sig", &.{
+        importEntry("protobuf", "src/core/protobuf.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-sabr-request", "src/youtube/sabr/request.sig", &.{
+        importEntry("protobuf", "src/core/protobuf.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-sabr-player-fields", "src/youtube/sabr/player_fields.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-sabr-loop", "src/youtube/sabr/stream.sig", &.{
+        importEntry("protobuf", "src/core/protobuf.sig"),
+        importEntry("youtube_net", "src/youtube/net.sig"),
+        importEntry("zpm_http", "src/net/http/client.sig"),
+        importEntry("tls_client", "src/core/crypto/tls/client.sig"),
+        importEntry("win32", win32_path),
+    });
+    _ = try addTest(ctx, test_all, "test-manifest-sabr", "src/youtube/manifest.sig", &.{});
     const jsonl = try ctx.addModule("jsonl", "src/core/jsonl.sig");
     try wire(ctx, jsonl, "json", "src/core/json.sig");
     try wire(ctx, jsonl, "sig_mem", "src/core/sig_mem.sig");

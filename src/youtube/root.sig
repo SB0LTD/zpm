@@ -81,3 +81,6 @@ pub const botguard = @import("botguard/root.sig");
 
 // ── Browser-like cookied session (homepage bootstrap + session-bound tokens) ──
 pub const session = @import("session.sig");
+
+// ── SABR (Server-ABR) streaming client (protobuf/UMP/request/loop) ──
+pub const sabr = @import("sabr/root.sig");

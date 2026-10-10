@@ -193,6 +193,32 @@ pub fn postInto(host: []const u8, port: u16, path: []const u8, extra_headers: []
     return into(.post, host, port, path, extra_headers, body, user_agent, out);
 }
 
+/// POST `body` to `https://host[:port]path` into the caller buffer `out`,
+/// threading a cookie jar so a session's cookies ride the request (and any
+/// Set-Cookie is absorbed back). This is the SABR variant: the loop owns a
+/// multi-MB `out` buffer (a UMP response can exceed the 1 MB static `resp_buf`)
+/// and must send the visitor session jar. `postInto` stays jar-less for its
+/// existing callers.
+pub fn postIntoJar(host: []const u8, port: u16, path: []const u8, extra_headers: []const u8, body: []const u8, user_agent: []const u8, jar: ?*CookieJar, out: []u8) IntoResult {
+    const url = buildUrl(host, port, path) orelse return .{};
+    const hdrs = normalizeHeaders(extra_headers);
+    const req = zhttp.Request{
+        .method = .POST,
+        .url = url,
+        .headers = hdrs,
+        .body = body,
+        .user_agent = user_agent,
+        .jar = jar,
+    };
+    const bufs = zhttp.Buffers{
+        .body = out,
+        .header_scratch = &header_scratch,
+        .req_head = &req_head,
+    };
+    const resp = zhttp.fetch(req, bufs, nowUnix()) catch return .{};
+    return .{ .status = resp.status, .len = resp.body.len, .ok = resp.status >= 200 and resp.status < 400 };
+}
+
 fn into(
     method: Method,
     host: []const u8,
