@@ -752,10 +752,16 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, tts_talker_backend, "quantized_linear", "src/core/quantized_linear.sig");
     try wire(ctx, tts_talker_backend, "tts_gpu", "src/tts/gpu.sig");
 
+    const tts_kernels = try ctx.addModule("tts_kernels", "src/tts/kernels.sig");
+    try wire(ctx, tts_kernels, "matmul_cuda", "src/matmul/cuda.sig");
+    try wire(ctx, tts_kernels, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, tts_kernels, "tts_model_container", "src/tts/model_container.sig");
+
     const tts_talker_executor = try ctx.addModule("tts_talker_executor", "src/tts/talker_executor.sig");
     try wire(ctx, tts_talker_executor, "tts_talker_plan", "src/tts/talker_plan.sig");
     try wire(ctx, tts_talker_executor, "tts_talker_backend", "src/tts/talker_backend.sig");
     try wire(ctx, tts_talker_executor, "transformer_ops", "src/core/transformer_ops.sig");
+    try wire(ctx, tts_talker_executor, "tts_kernels", "src/tts/kernels.sig");
 
     const tts_sampler = try ctx.addModule("tts_sampler", "src/tts/sampler.sig");
     try wire(ctx, tts_sampler, "tts_talker_plan", "src/tts/talker_plan.sig");
