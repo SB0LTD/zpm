@@ -10,41 +10,12 @@
 //   1. WAA Create API (POST to jnn-pa.googleapis.com)
 //   2. Extract from YouTube watch page HTML (embedded in ytInitialPlayerResponse)
 
-// ── Win32 WinHTTP ──
-extern "kernel32" fn LoadLibraryA([*:0]const u8) ?*anyopaque;
-extern "kernel32" fn GetProcAddress(?*anyopaque, [*:0]const u8) ?*anyopaque;
+// ── HTTP via @zpm/http (app-local adapter) + console ──
+const http = @import("../net.sig");
+
 extern "kernel32" fn GetStdHandle(u32) ?*anyopaque;
 extern "kernel32" fn WriteFile(?*anyopaque, [*]const u8, u32, ?*u32, ?*anyopaque) c_int;
-
-const HINTERNET = ?*anyopaque;
-const DWORD = u32;
-const BOOL = c_int;
-const LPCWSTR = [*]const u16;
 const STD_OUTPUT_HANDLE: u32 = @bitCast(@as(i32, -11));
-
-const WINHTTP_ACCESS_TYPE_DEFAULT: DWORD = 0;
-const WINHTTP_FLAG_SECURE: DWORD = 0x00800000;
-const WINHTTP_ADDREQ_FLAG_ADD: DWORD = 0x20000000;
-const WINHTTP_ADDREQ_FLAG_REPLACE: DWORD = 0x80000000;
-
-const WinHttpOpenFn = *const fn (LPCWSTR, DWORD, ?LPCWSTR, ?LPCWSTR, DWORD) callconv(.c) HINTERNET;
-const WinHttpConnectFn = *const fn (HINTERNET, LPCWSTR, u16, DWORD) callconv(.c) HINTERNET;
-const WinHttpOpenRequestFn = *const fn (HINTERNET, ?LPCWSTR, ?LPCWSTR, ?LPCWSTR, ?LPCWSTR, ?*anyopaque, DWORD) callconv(.c) HINTERNET;
-const WinHttpSendRequestFn = *const fn (HINTERNET, ?LPCWSTR, DWORD, ?*anyopaque, DWORD, DWORD, usize) callconv(.c) BOOL;
-const WinHttpReceiveResponseFn = *const fn (HINTERNET, ?*anyopaque) callconv(.c) BOOL;
-const WinHttpReadDataFn = *const fn (HINTERNET, [*]u8, DWORD, *DWORD) callconv(.c) BOOL;
-const WinHttpCloseHandleFn = *const fn (HINTERNET) callconv(.c) BOOL;
-const WinHttpAddRequestHeadersFn = *const fn (HINTERNET, LPCWSTR, DWORD, DWORD) callconv(.c) BOOL;
-
-var fn_open: ?WinHttpOpenFn = null;
-var fn_connect: ?WinHttpConnectFn = null;
-var fn_openReq: ?WinHttpOpenRequestFn = null;
-var fn_sendReq: ?WinHttpSendRequestFn = null;
-var fn_recvResp: ?WinHttpReceiveResponseFn = null;
-var fn_readData: ?WinHttpReadDataFn = null;
-var fn_closeHandle: ?WinHttpCloseHandleFn = null;
-var fn_addHeaders: ?WinHttpAddRequestHeadersFn = null;
-var http_loaded: bool = false;
 
 fn print(msg: []const u8) void {
     _ = WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), msg.ptr, @intCast(msg.len), null, null);
@@ -118,8 +89,6 @@ pub fn getRawResponse() []const u8 {
 /// interpreter hash, the base64 program, and the VM global name — the exact
 /// data the reference client (youtubei.js getAttestationChallenge) consumes.
 pub fn fetch(chal: *Challenge) bool {
-    if (!ensureHttp()) return false;
-
     print("  [botguard] Fetching challenge from InnerTube att/get...\n");
 
     const resp_len = attGetPost();
@@ -139,34 +108,19 @@ pub fn fetch(chal: *Challenge) bool {
 /// POST to the InnerTube att/get endpoint with the public web API key.
 /// Response is left in resp_buf; returns its length.
 fn attGetPost() usize {
-    const W_AGENT = comptime toWide("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
-    const W_HOST = comptime toWide("www.youtube.com");
-    const W_POST = comptime toWide("POST");
-    const W_PATH = comptime toWide("/youtubei/v1/att/get?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false");
-    const W_CT = comptime toWide("Content-Type: application/json\r\n");
-
-    const hSession = fn_open.?(&W_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT, null, null, 0) orelse return 0;
-    defer _ = fn_closeHandle.?(hSession);
-    const hConnect = fn_connect.?(hSession, &W_HOST, 443, 0) orelse return 0;
-    defer _ = fn_closeHandle.?(hConnect);
-    const hRequest = fn_openReq.?(hConnect, &W_POST, &W_PATH, null, null, null, WINHTTP_FLAG_SECURE) orelse return 0;
-    defer _ = fn_closeHandle.?(hRequest);
-
-    _ = fn_addHeaders.?(hRequest, &W_CT, @bitCast(@as(i32, -1)), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-
+    const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
     const body = "{\"engagementType\":\"ENGAGEMENT_TYPE_UNBOUND\",\"context\":{\"client\":{\"clientName\":\"WEB\",\"clientVersion\":\"2.20241126.01.00\",\"hl\":\"en\",\"gl\":\"US\"}}}";
-    if (fn_sendReq.?(hRequest, null, 0, @ptrCast(@constCast(body.ptr)), body.len, body.len, 0) == 0) return 0;
-    if (fn_recvResp.?(hRequest, null) == 0) return 0;
-
-    var total: usize = 0;
-    while (total < RESP_BUF_SIZE) {
-        var n: DWORD = 0;
-        if (fn_readData.?(hRequest, resp_buf[total..].ptr, @intCast(RESP_BUF_SIZE - total), &n) == 0) break;
-        if (n == 0) break;
-        total += n;
-    }
-    resp_buf_len = total;
-    return total;
+    const r = http.postInto(
+        "www.youtube.com",
+        443,
+        "/youtubei/v1/att/get?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false",
+        "Content-Type: application/json\r\n",
+        body,
+        UA,
+        &resp_buf,
+    );
+    resp_buf_len = r.len;
+    return r.len;
 }
 
 /// POST a JSON body to the WAA (BotGuard) service at jnn-pa.googleapis.com.
@@ -174,41 +128,12 @@ fn attGetPost() usize {
 /// path (e.g. "/$rpc/google.internal.waa.v1.Waa/GenerateIT"). The response is
 /// read into resp_buf; returns the byte length (0 on failure).
 pub fn waaPost(path: []const u8, body: []const u8) usize {
-    if (!ensureHttp()) return 0;
-
-    const W_AGENT = comptime toWide("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
-    const W_HOST = comptime toWide("jnn-pa.googleapis.com");
-    const W_POST = comptime toWide("POST");
+    const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
     // WAA requires JSON+protobuf content type and the web WAA API key.
-    const W_HEADERS = comptime toWide("Content-Type: application/json+protobuf\r\nx-goog-api-key: AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw\r\nx-user-agent: grpc-web-javascript/0.1\r\n");
-
-    var path_w: [512]u16 = undefined;
-    if (path.len >= 512) return 0;
-    for (0..path.len) |i| path_w[i] = path[i];
-    path_w[path.len] = 0;
-
-    const hSession = fn_open.?(&W_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT, null, null, 0) orelse return 0;
-    defer _ = fn_closeHandle.?(hSession);
-    const hConnect = fn_connect.?(hSession, &W_HOST, 443, 0) orelse return 0;
-    defer _ = fn_closeHandle.?(hConnect);
-    const hRequest = fn_openReq.?(hConnect, &W_POST, @ptrCast(&path_w), null, null, null, WINHTTP_FLAG_SECURE) orelse return 0;
-    defer _ = fn_closeHandle.?(hRequest);
-
-    _ = fn_addHeaders.?(hRequest, &W_HEADERS, @bitCast(@as(i32, -1)), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-
-    const blen32: u32 = @intCast(body.len);
-    if (fn_sendReq.?(hRequest, null, 0, @ptrCast(@constCast(body.ptr)), blen32, blen32, 0) == 0) return 0;
-    if (fn_recvResp.?(hRequest, null) == 0) return 0;
-
-    var total: usize = 0;
-    while (total < RESP_BUF_SIZE) {
-        var n: DWORD = 0;
-        if (fn_readData.?(hRequest, resp_buf[total..].ptr, @intCast(RESP_BUF_SIZE - total), &n) == 0) break;
-        if (n == 0) break;
-        total += n;
-    }
-    resp_buf_len = total;
-    return total;
+    const headers = "Content-Type: application/json+protobuf\r\nx-goog-api-key: AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw\r\nx-user-agent: grpc-web-javascript/0.1\r\n";
+    const r = http.postInto("jnn-pa.googleapis.com", 443, path, headers, body, UA, &resp_buf);
+    resp_buf_len = r.len;
+    return r.len;
 }
 
 /// Fetch a BotGuard challenge via the WAA **Create** RPC (the flow BgUtils uses
@@ -226,7 +151,6 @@ pub fn waaPost(path: []const u8, body: []const u8) usize {
 pub const YT_REQUEST_KEY: []const u8 = "O43z0dpjhgX20SCx4KAo";
 
 pub fn fetchCreate(chal: *Challenge) bool {
-    if (!ensureHttp()) return false;
     print("  [botguard] Fetching challenge via WAA Create...\n");
 
     // Body is a JSON array with the request key: ["<key>"].
@@ -526,7 +450,6 @@ fn findLongStringElement(frag: []const u8) ?[]const u8 {
 /// //www.google.com/js/th/<hash>.js). We split host and path and GET over TLS.
 pub fn fetchScript(chal: *Challenge) bool {
     if (chal.interpreter_url_len == 0) return false;
-    if (!ensureHttp()) return false;
 
     // Parse protocol-relative URL: strip leading "//", then split at first '/'.
     var u = chal.interpreter_url[0..chal.interpreter_url_len];
@@ -547,39 +470,11 @@ pub fn fetchScript(chal: *Challenge) bool {
     print(host);
     print("...\n");
 
-    const W_AGENT = comptime toWide("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+    const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-    // Build wide host + path at runtime.
-    var host_w: [256]u16 = undefined;
-    if (host.len >= 256) return false;
-    for (0..host.len) |i| host_w[i] = host[i];
-    host_w[host.len] = 0;
-
-    var path_w: [256]u16 = undefined;
-    if (path.len >= 256) return false;
-    for (0..path.len) |i| path_w[i] = path[i];
-    path_w[path.len] = 0;
-
-    const hSession = fn_open.?(&W_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT, null, null, 0) orelse return false;
-    defer _ = fn_closeHandle.?(hSession);
-
-    const hConnect = fn_connect.?(hSession, @ptrCast(&host_w), 443, 0) orelse return false;
-    defer _ = fn_closeHandle.?(hConnect);
-
-    const hRequest = fn_openReq.?(hConnect, null, @ptrCast(&path_w), null, null, null, WINHTTP_FLAG_SECURE) orelse return false;
-    defer _ = fn_closeHandle.?(hRequest);
-
-    if (fn_sendReq.?(hRequest, null, 0, null, 0, 0, 0) == 0) return false;
-    if (fn_recvResp.?(hRequest, null) == 0) return false;
-
-    // Read into challenge script buffer
-    chal.script_len = 0;
-    while (chal.script_len < MAX_SCRIPT_SIZE) {
-        var n: DWORD = 0;
-        if (fn_readData.?(hRequest, chal.script[chal.script_len..].ptr, @intCast(MAX_SCRIPT_SIZE - chal.script_len), &n) == 0) break;
-        if (n == 0) break;
-        chal.script_len += n;
-    }
+    // GET the interpreter JS straight into the challenge's script buffer.
+    const r = http.getInto(host, 443, path, "", UA, chal.script[0..MAX_SCRIPT_SIZE]);
+    chal.script_len = if (r.ok) r.len else 0;
 
     print("  [botguard] Script: ");
     printNum(chal.script_len);
@@ -593,38 +488,20 @@ pub fn fetchScript(chal: *Challenge) bool {
 /// POST to InnerTube att/get with the public web API key and return the raw
 /// response length (contents in resp_buf, retrievable via getRawResponse()).
 pub fn debugFetchAttGet() usize {
-    if (!ensureHttp()) return 0;
-
-    const W_AGENT = comptime toWide("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
-    const W_HOST = comptime toWide("www.youtube.com");
-    const W_POST = comptime toWide("POST");
-    // InnerTube requires the web API key as a query parameter.
-    const W_PATH = comptime toWide("/youtubei/v1/att/get?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false");
-    const W_CT = comptime toWide("Content-Type: application/json\r\n");
-
-    const hSession = fn_open.?(&W_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT, null, null, 0) orelse return 0;
-    defer _ = fn_closeHandle.?(hSession);
-    const hConnect = fn_connect.?(hSession, &W_HOST, 443, 0) orelse return 0;
-    defer _ = fn_closeHandle.?(hConnect);
-    const hRequest = fn_openReq.?(hConnect, &W_POST, &W_PATH, null, null, null, WINHTTP_FLAG_SECURE) orelse return 0;
-    defer _ = fn_closeHandle.?(hRequest);
-
-    _ = fn_addHeaders.?(hRequest, &W_CT, @bitCast(@as(i32, -1)), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-
+    const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
     // engagementType UNBOUND — the shape youtubei.js sends for attestation.
     const body = "{\"engagementType\":\"ENGAGEMENT_TYPE_UNBOUND\",\"context\":{\"client\":{\"clientName\":\"WEB\",\"clientVersion\":\"2.20241126.01.00\",\"hl\":\"en\",\"gl\":\"US\"}}}";
-    if (fn_sendReq.?(hRequest, null, 0, @ptrCast(@constCast(body.ptr)), body.len, body.len, 0) == 0) return 0;
-    if (fn_recvResp.?(hRequest, null) == 0) return 0;
-
-    var total: usize = 0;
-    while (total < RESP_BUF_SIZE) {
-        var n: DWORD = 0;
-        if (fn_readData.?(hRequest, resp_buf[total..].ptr, @intCast(RESP_BUF_SIZE - total), &n) == 0) break;
-        if (n == 0) break;
-        total += n;
-    }
-    resp_buf_len = total;
-    return total;
+    const r = http.postInto(
+        "www.youtube.com",
+        443,
+        "/youtubei/v1/att/get?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false",
+        "Content-Type: application/json\r\n",
+        body,
+        UA,
+        &resp_buf,
+    );
+    resp_buf_len = r.len;
+    return r.len;
 }
 
 // ── Internal: fetch request key from YouTube attestation endpoint ──
@@ -730,25 +607,3 @@ fn printNum(val: usize) void {
     print(rev[0..len]);
 }
 
-fn ensureHttp() bool {
-    if (http_loaded) return true;
-    const dll = LoadLibraryA("winhttp.dll") orelse return false;
-    fn_open = @ptrCast(GetProcAddress(dll, "WinHttpOpen"));
-    fn_connect = @ptrCast(GetProcAddress(dll, "WinHttpConnect"));
-    fn_openReq = @ptrCast(GetProcAddress(dll, "WinHttpOpenRequest"));
-    fn_sendReq = @ptrCast(GetProcAddress(dll, "WinHttpSendRequest"));
-    fn_recvResp = @ptrCast(GetProcAddress(dll, "WinHttpReceiveResponse"));
-    fn_readData = @ptrCast(GetProcAddress(dll, "WinHttpReadData"));
-    fn_closeHandle = @ptrCast(GetProcAddress(dll, "WinHttpCloseHandle"));
-    fn_addHeaders = @ptrCast(GetProcAddress(dll, "WinHttpAddRequestHeaders"));
-    if (fn_open == null or fn_sendReq == null) return false;
-    http_loaded = true;
-    return true;
-}
-
-fn toWide(comptime s: []const u8) [s.len + 1]u16 {
-    var r: [s.len + 1]u16 = undefined;
-    for (0..s.len) |i| r[i] = s[i];
-    r[s.len] = 0;
-    return r;
-}

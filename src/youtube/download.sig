@@ -25,7 +25,7 @@ const url_mod = @import("url.sig");
 const minter = @import("botguard/minter.sig");
 const session_mod = @import("session.sig");
 const challenge_mod = @import("botguard/challenge.sig");
-const http = @import("../platform/http_session.sig");
+const http = @import("net.sig");
 
 // Cold-start PO token for the current download (base64url). Minted from the
 // video id as content binding; YouTube accepts it while StreamProtectionStatus

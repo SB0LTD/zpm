@@ -8,6 +8,10 @@
 const builtin = @import("builtin");
 const os_tag = builtin.os.tag;
 
+// Pure-Sig HTTP/1.1 client (TLS 1.3) for the registry transport. Wired as a
+// named module in cli/build.sig; only referenced on the Windows backend.
+const zhttp = @import("zpm_http");
+
 pub const FileError = error{ NotFound, PermissionDenied, IoError };
 
 pub const FileStat = struct {
@@ -390,13 +394,36 @@ fn windowsExec(cmd: []const u8, stdout_buf: []u8) ?ExecResult {
     return .{ .exit_code = @truncate(exit_code), .stdout = stdout_buf[0..total] };
 }
 
-fn windowsHttpGet(_: []const u8, _: []u8) HttpResult {
-    // WinHTTP stub — full implementation requires WinHTTP API wiring
-    return .{ .err = error.ConnectionFailed };
+// Shared scratch for the pure-Sig HTTP client (zero heap; module-static).
+var http_header_scratch: [64 * 1024]u8 = undefined;
+var http_req_head: [16 * 1024]u8 = undefined;
+
+fn httpNowUnix() i64 {
+    var ft: zhttp_ft.FILETIME = .{};
+    zhttp_ft.GetSystemTimeAsFileTime(&ft);
+    const ticks: u64 = (@as(u64, ft.high) << 32) | @as(u64, ft.low);
+    const UNIX_EPOCH_TICKS: u64 = 116444736000000000;
+    if (ticks < UNIX_EPOCH_TICKS) return 0;
+    return @intCast((ticks - UNIX_EPOCH_TICKS) / 10_000_000);
 }
 
-fn windowsHttpPost(_: []const u8, _: []const u8, _: []u8) HttpResult {
-    return .{ .err = error.ConnectionFailed };
+const zhttp_ft = struct {
+    const FILETIME = extern struct { low: u32 = 0, high: u32 = 0 };
+    extern "kernel32" fn GetSystemTimeAsFileTime(*FILETIME) void;
+};
+
+fn windowsHttpGet(url: []const u8, response_buf: []u8) HttpResult {
+    const req = zhttp.Request{ .method = .GET, .url = url };
+    const bufs = zhttp.Buffers{ .body = response_buf, .header_scratch = &http_header_scratch, .req_head = &http_req_head };
+    const resp = zhttp.fetch(req, bufs, httpNowUnix()) catch return .{ .err = error.ConnectionFailed };
+    return .{ .ok = resp.body };
+}
+
+fn windowsHttpPost(url: []const u8, body: []const u8, response_buf: []u8) HttpResult {
+    const req = zhttp.Request{ .method = .POST, .url = url, .body = body, .content_type = "application/json" };
+    const bufs = zhttp.Buffers{ .body = response_buf, .header_scratch = &http_header_scratch, .req_head = &http_req_head };
+    const resp = zhttp.fetch(req, bufs, httpNowUnix()) catch return .{ .err = error.ConnectionFailed };
+    return .{ .ok = resp.body };
 }
 
 fn windowsTimestamp() u64 {
