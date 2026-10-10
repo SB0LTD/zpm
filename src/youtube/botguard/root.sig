@@ -60,7 +60,7 @@ pub fn initialize() bool {
     }
 
     // Full initialization: fetch challenge → run VM → get integrity token
-    var bg_response: [1024]u8 = undefined;
+    var bg_response: [65536]u8 = undefined;
     var bg_response_len: usize = 0;
 
     // Step 1: Fetch challenge

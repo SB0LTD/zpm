@@ -209,6 +209,12 @@ pub fn getToken(idx: usize) Token {
     return tokens[idx];
 }
 
+/// Get a raw slice of the current source between byte offsets [start, end).
+pub fn sourceSlice(start: u32, end: u32) []const u8 {
+    if (start >= source.len or end > source.len or start >= end) return "";
+    return source[start..end];
+}
+
 /// Get the source text of a token.
 pub fn tokenText(tok: Token) []const u8 {
     if (tok.len == 0) return "";
@@ -334,7 +340,11 @@ fn identifyKeyword(text: []const u8) TokenType {
     if (eql(text, "typeof")) return .kw_typeof;
     if (eql(text, "instanceof")) return .kw_instanceof;
     if (eql(text, "in")) return .kw_in;
-    if (eql(text, "of")) return .kw_of;
+    // NOTE: `of` is a CONTEXTUAL keyword — a valid identifier everywhere except
+    // in `for (x of y)`. BotGuard's VM uses `of` as an ordinary variable name
+    // (e.g. `of||(W=d)`). Emitting `.kw_of` unconditionally broke parsing of the
+    // interpreter (the whole snapshot then failed → null token). Tokenize `of`
+    // as an identifier; the for-loop parser detects the contextual `of` by text.
     if (eql(text, "delete")) return .kw_delete;
     if (eql(text, "void")) return .kw_void;
     if (eql(text, "throw")) return .kw_throw;
@@ -382,10 +392,54 @@ fn lexStar(src: []const u8, pos: usize, start: usize) usize {
 }
 
 fn lexSlash(src: []const u8, pos: usize, start: usize) usize {
-    // Could be division or regex — for simplicity, treat as division here
-    // (regex detection requires parser context)
+    // A leading `/` is a regex literal when the previous significant token
+    // cannot end an expression (e.g. after `(`, `,`, `=`, `return`, operators);
+    // otherwise it is division. This is the standard lexer heuristic.
+    if (regexAllowed()) {
+        return lexRegex(src, pos, start);
+    }
     if (pos + 1 < src.len and src[pos + 1] == '=') { emit(.slash_assign, start, 2); return pos + 2; }
     emit(.slash, start, 1); return pos + 1;
+}
+
+/// Scan a regex literal /pattern/flags starting at pos ('/'). Handles escapes
+/// and character classes ([...] may contain '/'). Emits a .regex token.
+fn lexRegex(src: []const u8, pos: usize, start: usize) usize {
+    var p = pos + 1; // past opening '/'
+    var in_class = false;
+    while (p < src.len) : (p += 1) {
+        const c = src[p];
+        if (c == '\\') { p += 1; continue; } // skip escaped char
+        if (c == '[') { in_class = true; continue; }
+        if (c == ']') { in_class = false; continue; }
+        if (c == '/' and !in_class) { break; }
+        if (c == '\n') { // unterminated regex; bail as division to be safe
+            emit(.slash, start, 1);
+            return pos + 1;
+        }
+    }
+    if (p < src.len) p += 1; // past closing '/'
+    // Flags (letters).
+    while (p < src.len and isIdentCont(src[p])) : (p += 1) {}
+    emit(.regex, start, p - start);
+    return p;
+}
+
+/// Whether a `/` at the current position should begin a regex literal, based
+/// on the previous emitted token.
+fn regexAllowed() bool {
+    if (n_tokens == 0) return true; // start of input
+    const prev = tokens[n_tokens - 1].tt;
+    return switch (prev) {
+        // Value-ending tokens -> `/` is division.
+        .number, .string, .regex, .template, .identifier,
+        .true_lit, .false_lit, .null_lit, .undefined_lit,
+        .rparen, .rbracket, .kw_this, .kw_super,
+        .increment, .decrement => false,
+        // Everything else (operators, keywords like return/typeof, `(`, `,`,
+        // `=`, `{`, `[`, `;`, etc.) -> `/` begins a regex.
+        else => true,
+    };
 }
 
 fn lexPercent(src: []const u8, pos: usize, start: usize) usize {

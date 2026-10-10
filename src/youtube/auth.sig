@@ -14,14 +14,14 @@
 // Refresh flow is out of scope — use Google's OAuth playground or
 // a browser-based flow to obtain tokens.
 
-// ── Win32 ──
+const http = @import("net.sig");
+
+// ── Win32 (token file I/O only) ──
 extern "kernel32" fn CreateFileA([*:0]const u8, u32, u32, ?*anyopaque, u32, u32, ?*anyopaque) ?*anyopaque;
 extern "kernel32" fn ReadFile(?*anyopaque, [*]u8, u32, *u32, ?*anyopaque) c_int;
 extern "kernel32" fn WriteFile(?*anyopaque, [*]const u8, u32, ?*u32, ?*anyopaque) c_int;
 extern "kernel32" fn CloseHandle(?*anyopaque) c_int;
 extern "kernel32" fn GetFileSize(?*anyopaque, ?*u32) u32;
-extern "kernel32" fn LoadLibraryA([*:0]const u8) ?*anyopaque;
-extern "kernel32" fn GetProcAddress(?*anyopaque, [*:0]const u8) ?*anyopaque;
 
 const GENERIC_READ: u32 = 0x80000000;
 const GENERIC_WRITE: u32 = 0x40000000;
@@ -30,31 +30,6 @@ const OPEN_EXISTING: u32 = 3;
 const CREATE_ALWAYS: u32 = 2;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 const INVALID_HANDLE: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
-
-// WinHTTP for token validation
-const HINTERNET = ?*anyopaque;
-const DWORD = u32;
-const BOOL = c_int;
-const LPCWSTR = [*]const u16;
-const WINHTTP_ACCESS_TYPE_DEFAULT: DWORD = 0;
-const WINHTTP_FLAG_SECURE: DWORD = 0x00800000;
-
-const WinHttpOpenFn = *const fn (LPCWSTR, DWORD, ?LPCWSTR, ?LPCWSTR, DWORD) callconv(.c) HINTERNET;
-const WinHttpConnectFn = *const fn (HINTERNET, LPCWSTR, u16, DWORD) callconv(.c) HINTERNET;
-const WinHttpOpenRequestFn = *const fn (HINTERNET, ?LPCWSTR, ?LPCWSTR, ?LPCWSTR, ?LPCWSTR, ?*anyopaque, DWORD) callconv(.c) HINTERNET;
-const WinHttpSendRequestFn = *const fn (HINTERNET, ?LPCWSTR, DWORD, ?*anyopaque, DWORD, DWORD, usize) callconv(.c) BOOL;
-const WinHttpReceiveResponseFn = *const fn (HINTERNET, ?*anyopaque) callconv(.c) BOOL;
-const WinHttpReadDataFn = *const fn (HINTERNET, [*]u8, DWORD, *DWORD) callconv(.c) BOOL;
-const WinHttpCloseHandleFn = *const fn (HINTERNET) callconv(.c) BOOL;
-
-var fn_open: ?WinHttpOpenFn = null;
-var fn_connect: ?WinHttpConnectFn = null;
-var fn_openReq: ?WinHttpOpenRequestFn = null;
-var fn_sendReq: ?WinHttpSendRequestFn = null;
-var fn_recvResp: ?WinHttpReceiveResponseFn = null;
-var fn_readData: ?WinHttpReadDataFn = null;
-var fn_closeHandle: ?WinHttpCloseHandleFn = null;
-var http_loaded: bool = false;
 
 /// Maximum token length.
 pub const MAX_TOKEN_LEN: usize = 2048;
@@ -157,8 +132,6 @@ pub fn validate() TokenInfo {
         return info;
     }
 
-    if (!ensureHttp()) return info;
-
     // Build path: /oauth2/v3/tokeninfo?access_token=TOKEN
     var path_buf: [MAX_TOKEN_LEN + 64]u8 = undefined;
     const path_prefix = "/oauth2/v3/tokeninfo?access_token=";
@@ -166,50 +139,10 @@ pub fn validate() TokenInfo {
     @memcpy(path_buf[path_prefix.len .. path_prefix.len + current_token_len], current_token[0..current_token_len]);
     const path_len = path_prefix.len + current_token_len;
 
-    // Convert to UTF-16
-    var path_w: [MAX_TOKEN_LEN + 64]u16 = undefined;
-    for (0..path_len) |i| path_w[i] = path_buf[i];
-    path_w[path_len] = 0;
-
-    const W_AGENT = comptime toWide("zpm-youtube/1.0");
-    const W_HOST = comptime toWide("www.googleapis.com");
-
-    const hSession = fn_open.?(&W_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT, null, null, 0) orelse return info;
-    const hConnect = fn_connect.?(hSession, &W_HOST, 443, 0) orelse {
-        _ = fn_closeHandle.?(hSession);
-        return info;
-    };
-    const hRequest = fn_openReq.?(hConnect, null, @ptrCast(&path_w), null, null, null, WINHTTP_FLAG_SECURE) orelse {
-        _ = fn_closeHandle.?(hConnect);
-        _ = fn_closeHandle.?(hSession);
-        return info;
-    };
-
-    if (fn_sendReq.?(hRequest, null, 0, null, 0, 0, 0) == 0) {
-        _ = fn_closeHandle.?(hRequest);
-        _ = fn_closeHandle.?(hConnect);
-        _ = fn_closeHandle.?(hSession);
-        return info;
-    }
-    if (fn_recvResp.?(hRequest, null) == 0) {
-        _ = fn_closeHandle.?(hRequest);
-        _ = fn_closeHandle.?(hConnect);
-        _ = fn_closeHandle.?(hSession);
-        return info;
-    }
-
+    // HTTPS GET to Google's tokeninfo endpoint via @zpm/http (pure Sig TLS).
     var resp: [4096]u8 = undefined;
-    var total: usize = 0;
-    while (total < 4096) {
-        var n: DWORD = 0;
-        if (fn_readData.?(hRequest, resp[total..].ptr, @intCast(4096 - total), &n) == 0) break;
-        if (n == 0) break;
-        total += n;
-    }
-
-    _ = fn_closeHandle.?(hRequest);
-    _ = fn_closeHandle.?(hConnect);
-    _ = fn_closeHandle.?(hSession);
+    const r = http.getInto("www.googleapis.com", 443, path_buf[0..path_len], "", "zpm-youtube/1.0", &resp);
+    const total = r.len;
 
     // Parse response
     if (total == 0) return info;
@@ -309,24 +242,3 @@ fn findStr(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
-fn ensureHttp() bool {
-    if (http_loaded) return true;
-    const dll = LoadLibraryA("winhttp.dll") orelse return false;
-    fn_open = @ptrCast(GetProcAddress(dll, "WinHttpOpen"));
-    fn_connect = @ptrCast(GetProcAddress(dll, "WinHttpConnect"));
-    fn_openReq = @ptrCast(GetProcAddress(dll, "WinHttpOpenRequest"));
-    fn_sendReq = @ptrCast(GetProcAddress(dll, "WinHttpSendRequest"));
-    fn_recvResp = @ptrCast(GetProcAddress(dll, "WinHttpReceiveResponse"));
-    fn_readData = @ptrCast(GetProcAddress(dll, "WinHttpReadData"));
-    fn_closeHandle = @ptrCast(GetProcAddress(dll, "WinHttpCloseHandle"));
-    if (fn_open == null or fn_sendReq == null) return false;
-    http_loaded = true;
-    return true;
-}
-
-fn toWide(comptime s: []const u8) [s.len + 1]u16 {
-    var r: [s.len + 1]u16 = undefined;
-    for (0..s.len) |i| r[i] = s[i];
-    r[s.len] = 0;
-    return r;
-}

@@ -12,6 +12,7 @@
 // Point operations use Jacobian coordinates.
 
 const sha256 = @import("sha256");
+const testing = @import("std").testing;
 
 /// Signature size: r (32 bytes) + s (32 bytes).
 pub const SIG_LEN = 64;
@@ -615,4 +616,113 @@ test "p256: sign produces deterministic output" {
     for (0..64) |i| {
         if (sig1[i] != sig2[i]) return error.TestUnexpectedResult;
     }
+}
+
+// ── ECDH (RFC 5903 / NIST P-256) ─────────────────────────────────────────────
+//
+// For TLS 1.3 key_share. ecdhKeypair derives the SEC1 uncompressed public key
+// (0x04 || X || Y) from a 32-byte scalar; ecdhShared computes the X coordinate
+// of scalar * peer_point as the shared secret. Invalid/infinity points are
+// rejected. Coordinates are plain integers mod p (mulModP lifts to Montgomery
+// internally), so peer bytes parse directly into a JacobianPoint with z = 1.
+
+pub const ECDH_SECRET_LEN = 32;
+
+/// Full affine (X, Y) of a Jacobian point. Returns false for the point at infinity.
+fn toAffineXY(p: *const JacobianPoint, x_out: *U256, y_out: *U256) bool {
+    if (isZeroU256(&p.z)) return false;
+    const z_inv = invertModP(p.z);
+    const z_inv_sq = mulModP(z_inv, z_inv);
+    const z_inv_cu = mulModP(z_inv_sq, z_inv);
+    x_out.* = mulModP(p.x, z_inv_sq);
+    y_out.* = mulModP(p.y, z_inv_cu);
+    return true;
+}
+
+/// Derive the SEC1 uncompressed public key (65 bytes: 0x04 || X || Y) for the
+/// given 32-byte scalar (private key). Scalar must be in [1, n-1]; a zero or
+/// out-of-range scalar yields an invalid key and returns false.
+pub fn ecdhKeypair(scalar: *const [32]u8, pub_out: *[65]u8) bool {
+    const k = bytesToU256(scalar);
+    if (isZeroU256(&k)) return false;
+    const q = scalarMultG(&k);
+    var qx: U256 = undefined;
+    var qy: U256 = undefined;
+    if (!toAffineXY(&q, &qx, &qy)) return false;
+    pub_out[0] = 0x04;
+    u256ToBytes(&qx, pub_out[1..33]);
+    u256ToBytes(&qy, pub_out[33..65]);
+    return true;
+}
+
+/// Validate that (x, y) satisfies the P-256 curve equation y^2 = x^3 - 3x + b.
+fn onCurve(x: U256, y: U256) bool {
+    // b = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b
+    const B: U256 = .{ 0x3BCE3C3E27D2604B, 0x651D06B0CC53B0F6, 0xB3EBBD55769886BC, 0x5AC635D8AA3A93E7 };
+    const y2 = mulModP(y, y);
+    const x3 = mulModP(mulModP(x, x), x);
+    const three_x = addModP(addModP(x, x), x);
+    const rhs = addModP(subModP(x3, three_x), B);
+    return u256Equal(y2, rhs);
+}
+
+/// Compute the ECDH shared secret: the X coordinate of scalar * peer_point.
+/// `peer` is a 65-byte SEC1 uncompressed point (0x04 || X || Y). Returns false
+/// on a malformed/off-curve/infinity peer point or a zero scalar.
+pub fn ecdhShared(scalar: *const [32]u8, peer: *const [65]u8, secret_out: *[32]u8) bool {
+    if (peer[0] != 0x04) return false;
+    const px = bytesToU256(peer[1..33]);
+    const py = bytesToU256(peer[33..65]);
+    if (isZeroU256(&px) and isZeroU256(&py)) return false;
+    if (!onCurve(px, py)) return false;
+    const k = bytesToU256(scalar);
+    if (isZeroU256(&k)) return false;
+    const peer_point = JacobianPoint{ .x = px, .y = py, .z = ONE_U256 };
+    const s = scalarMult(&peer_point, &k);
+    var sx: U256 = undefined;
+    var sy: U256 = undefined;
+    if (!toAffineXY(&s, &sx, &sy)) return false;
+    u256ToBytes(&sx, secret_out);
+    return true;
+}
+
+test "p256 ecdh: RFC 5903 Section 8.1 shared secret" {
+    // i side
+    const i_priv = [32]u8{
+        0xC8, 0x8F, 0x01, 0xF5, 0x10, 0xD9, 0xAC, 0x3F, 0x70, 0xA2, 0x92, 0xDA, 0xA2, 0x31, 0x6D, 0xE5,
+        0x44, 0xE9, 0xAA, 0xB8, 0xAF, 0xE8, 0x40, 0x49, 0xC6, 0x2A, 0x9C, 0x57, 0x86, 0x2D, 0x14, 0x33,
+    };
+    // r side
+    const r_priv = [32]u8{
+        0xC6, 0xEF, 0x9C, 0x5D, 0x78, 0xAE, 0x01, 0x2A, 0x01, 0x11, 0x64, 0xAC, 0xB3, 0x97, 0xCE, 0x20,
+        0x88, 0x68, 0x5D, 0x8F, 0x06, 0xBF, 0x9B, 0xE0, 0xB2, 0x83, 0xAB, 0x46, 0x47, 0x6B, 0xEE, 0x53,
+    };
+    // Expected shared secret Z (X coordinate) from RFC 5903 Section 8.1
+    const expected_z = [32]u8{
+        0xD6, 0x84, 0x0F, 0x6B, 0x42, 0xF6, 0xED, 0xAF, 0xD1, 0x31, 0x16, 0xE0, 0xE1, 0x25, 0x65, 0x20,
+        0x2F, 0xEF, 0x8E, 0x9E, 0xCE, 0x7D, 0xCE, 0x03, 0x81, 0x24, 0x64, 0xD0, 0x4B, 0x94, 0x42, 0xDE,
+    };
+    var i_pub: [65]u8 = undefined;
+    var r_pub: [65]u8 = undefined;
+    try testing.expect(ecdhKeypair(&i_priv, &i_pub));
+    try testing.expect(ecdhKeypair(&r_priv, &r_pub));
+    var z_ir: [32]u8 = undefined;
+    var z_ri: [32]u8 = undefined;
+    try testing.expect(ecdhShared(&i_priv, &r_pub, &z_ir));
+    try testing.expect(ecdhShared(&r_priv, &i_pub, &z_ri));
+    // Both sides agree, and match the RFC vector.
+    try testing.expectEqualSlices(u8, &expected_z, &z_ir);
+    try testing.expectEqualSlices(u8, &z_ir, &z_ri);
+}
+
+test "p256 ecdh: rejects malformed peer" {
+    const k: [32]u8 = @splat(7);
+    var bad: [65]u8 = @splat(0);
+    bad[0] = 0x02; // not uncompressed
+    var secret: [32]u8 = undefined;
+    try testing.expect(!ecdhShared(&k, &bad, &secret));
+    // off-curve point (0x04 but junk coords)
+    var offcurve: [65]u8 = @splat(0x11);
+    offcurve[0] = 0x04;
+    try testing.expect(!ecdhShared(&k, &offcurve, &secret));
 }

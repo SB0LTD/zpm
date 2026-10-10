@@ -29,7 +29,7 @@ pub const Error = asn1.Error || error{
     TooManyNames,
 };
 
-pub const MAX_SAN_NAMES: usize = 24;
+pub const MAX_SAN_NAMES: usize = 96;
 pub const MAX_NAME_LEN: usize = 256;
 
 /// Public-key algorithm of the certificate's subject key.
@@ -245,9 +245,10 @@ fn parseSan(inner: []const u8, cert: *Cert) Error!void {
     while (!g.atEnd()) {
         const name = try g.next();
         if (name.tag == asn1.contextPrimitive(2)) { // dNSName
-            if (cert.san_count >= MAX_SAN_NAMES) return Error.TooManyNames;
-            cert.san[cert.san_count] = name.data;
-            cert.san_count += 1;
+            if (cert.san_count < MAX_SAN_NAMES) {
+                cert.san[cert.san_count] = name.data;
+                cert.san_count += 1;
+            }
         }
     }
 }

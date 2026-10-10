@@ -18,7 +18,9 @@ const asn1 = @import("asn1.sig");
 const x509 = @import("x509.sig");
 const rsa = @import("rsa.sig");
 const p256 = @import("p256");
+const p384 = @import("p384");
 const sha256 = @import("sha256");
+const sha512 = @import("sha512.sig");
 
 pub const MAX_CHAIN: usize = 8;
 
@@ -61,7 +63,17 @@ fn verifySig(issuer: *const x509.Cert, alg: x509.SigAlg, tbs: []const u8, sig: [
             try ecdsaDerToRaw(sig, &raw_sig);
             if (!p256.verify(&xy, &digest, &raw_sig)) return Error.SignatureInvalid;
         },
-        .ecdsa_sha384, .unsupported => return Error.UnsupportedAlgorithm,
+        .ecdsa_sha384 => {
+            if (issuer.key_alg != .ecdsa_p384) return Error.UnsupportedAlgorithm;
+            if (issuer.ec_point.len != 97 or issuer.ec_point[0] != 0x04) return Error.UnsupportedAlgorithm;
+            var xy384: [96]u8 = undefined;
+            @memcpy(&xy384, issuer.ec_point[1..97]);
+            const digest384 = sha512.sha384(tbs);
+            var raw384: [96]u8 = undefined;
+            try ecdsaDerToRaw384(sig, &raw384);
+            if (!p384.verify(&xy384, &digest384, &raw384)) return Error.SignatureInvalid;
+        },
+        .unsupported => return Error.UnsupportedAlgorithm,
     }
 }
 
@@ -70,6 +82,20 @@ fn verifySig(issuer: *const x509.Cert, alg: x509.SigAlg, tbs: []const u8, sig: [
 /// Public so the TLS layer can reuse it for CertificateVerify ECDSA sigs.
 pub fn ecdsaDerToRawPub(der: []const u8, out: *[64]u8) Error!void {
     return ecdsaDerToRaw(der, out);
+}
+
+pub fn ecdsaDerToRaw384(der: []const u8, out: *[96]u8) Error!void {
+    var c = asn1.Cursor.init(der);
+    const seq = c.expect(asn1.TAG_SEQUENCE) catch return Error.ParseError;
+    var s = asn1.intoSequence(seq);
+    const r_el = s.expect(asn1.TAG_INTEGER) catch return Error.ParseError;
+    const s_el = s.expect(asn1.TAG_INTEGER) catch return Error.ParseError;
+    const r_bytes = asn1.integerBytes(r_el) catch return Error.ParseError;
+    const s_bytes = asn1.integerBytes(s_el) catch return Error.ParseError;
+    if (r_bytes.len > 48 or s_bytes.len > 48) return Error.ParseError;
+    for (out) |*o| o.* = 0;
+    @memcpy(out[48 - r_bytes.len .. 48], r_bytes);
+    @memcpy(out[96 - s_bytes.len .. 96], s_bytes);
 }
 
 fn ecdsaDerToRaw(der: []const u8, out: *[64]u8) Error!void {
@@ -93,6 +119,36 @@ fn checkValidity(cert: *const x509.Cert, now: i64) Error!void {
 
 /// Full chain validation. `chain[0]` is the leaf; `chain[1..]` are intermediates
 /// in order. `roots` are trusted, pre-parsed CA certificates. `now` is Unix secs.
+/// Try to anchor the top-of-chain cert in the Windows system ROOT store.
+/// Iterates the OS trust store (auto-maintained by Windows Update), matching
+/// issuer name + verifying the signature. Returns true if anchored. This is the
+/// comprehensive public-web path; the embedded bundle is the fast fallback for
+/// the exchange endpoints. Only compiled on Windows.
+fn trySystemRoots(top: *const x509.Cert, now: i64) bool {
+    if (@import("builtin").os.tag != .windows) return false;
+    const w32 = @import("win32");
+    // "ROOT" as a null-terminated UTF-16 string.
+    const store_name = [_:0]u16{ 'R', 'O', 'O', 'T' };
+    const store = w32.CertOpenSystemStoreW(null, &store_name) orelse return false;
+    defer _ = w32.CertCloseStore(store, 0);
+    var ctx: ?*const w32.CERT_CONTEXT = null;
+    while (true) {
+        ctx = w32.CertEnumCertificatesInStore(store, ctx);
+        const c = ctx orelse break;
+        const der = c.pbCertEncoded[0..@as(usize, c.cbCertEncoded)];
+        const root = x509.parse(der) catch continue;
+        if (!root.is_ca) continue;
+        if (!x509.namesEqual(top.issuer_raw, root.subject_raw)) continue;
+        checkValidity(&root, now) catch continue;
+        if (verifySig(&root, top.sig_alg, top.tbs_raw, top.signature)) |_| {
+            return true;
+        } else |_| {
+            continue;
+        }
+    }
+    return false;
+}
+
 pub fn verifyChain(
     chain: []const x509.Cert,
     roots: []const x509.Cert,
@@ -149,6 +205,8 @@ pub fn verifyChain(
             return;
         }
     }
+    // Fallback: the comprehensive Windows system root store (auto-updated).
+    if (trySystemRoots(top, now)) return;
     return Error.UntrustedRoot;
 }
 
@@ -223,14 +281,21 @@ test "x509_verify: chain rejects when expired" {
     try testing.expectError(Error.Expired, verifyChain(&chain, &roots, "stream.binance.com", now));
 }
 
-test "x509_verify: chain rejects with no trusted root" {
+test "x509_verify: empty embedded store falls back to the OS root store" {
+    // With NO embedded roots, the chain still anchors because the Windows
+    // system ROOT store trusts DigiCert Global Root G2. This exercises the
+    // comprehensive OS-trust fallback end to end against a real chain.
     const tv = @import("testvec.sig");
     const leaf = try x509.parse(&tv.binance_leaf_der);
     const inter = try x509.parse(&tv.binance_intermediate_der);
     const chain = [_]x509.Cert{ leaf, inter };
-    const roots = [_]x509.Cert{}; // empty store
+    const roots = [_]x509.Cert{}; // empty embedded store -> OS fallback
     const now: i64 = 1780272000;
-    try testing.expectError(Error.UntrustedRoot, verifyChain(&chain, &roots, "stream.binance.com", now));
+    if (@import("builtin").os.tag == .windows) {
+        try verifyChain(&chain, &roots, "stream.binance.com", now);
+    } else {
+        try testing.expectError(Error.UntrustedRoot, verifyChain(&chain, &roots, "stream.binance.com", now));
+    }
 }
 
 test "x509_verify: real Binance chain anchors to the EMBEDDED CA bundle" {
