@@ -1,0 +1,300 @@
+{
+  "pbtResults": {},
+  "executionHistory": {
+    "1. Scaffold the module and build wiring": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606016426
+      },
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606072002
+      },
+      {
+        "executionId": "018f4a23-94d9-4e01-8b36-71356cb7f818",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606962904
+      },
+      {
+        "executionId": "018f4a23-94d9-4e01-8b36-71356cb7f818",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606968865
+      },
+      {
+        "executionId": "018f4a23-94d9-4e01-8b36-71356cb7f818",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606976843
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607044507
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607079257
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607200540
+      }
+    ],
+    "2. Error, Trace, and core enums (`errors.sig`)": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606017165
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607044660
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607207470
+      },
+      {
+        "executionId": "e6e9e148-ff65-4ae0-a32c-80adee2016ca",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791608246718
+      }
+    ],
+    "3. URL parser (`url.sig`) + tests": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606017351
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607044766
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607310548
+      }
+    ],
+    "4. Transport seam (`transport.sig`) + buffer-backed `TestTransport`": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606017474
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607044859
+      }
+    ],
+    "5. Request serialization (`request.sig`) + header-injection guard + tests": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606017579
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607044989
+      }
+    ],
+    "6. Response parser (`response.sig`) + `HeaderSet` + tests": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606017673
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607045088
+      }
+    ],
+    "7. Body decoding (`body.sig`) + tests": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606017770
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607045187
+      }
+    ],
+    "8. CookieJar (`cookie.sig`) — migrate + tests": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606017887
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607045273
+      }
+    ],
+    "9. Socket extensions (`socket_ext.sig`) + win32 additions": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606017975
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607045370
+      }
+    ],
+    "10. Protocol seam + HTTP/1.1 impl (`protocol.sig`)": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606018058
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607045488
+      }
+    ],
+    "11. One-shot `fetch` (`client.sig`) over the real stack": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606018158
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607045589
+      }
+    ],
+    "12. Redirect following": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606018247
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607045682
+      }
+    ],
+    "13. Retry policy (`retry.sig`) + wrapper": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606018348
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607045777
+      }
+    ],
+    "14. Keep-alive `Client` (pinned)": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606018517
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607045867
+      }
+    ],
+    "15. No-allocator assertion test (`no_alloc_test.sig`)": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606018620
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607045965
+      }
+    ],
+    "16. Live integration test (flagged `live-http-get`)": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606018716
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607046066
+      }
+    ],
+    "17. Migrate zpm's own callers to `@zpm/http`, then DELETE the WinHTTP modules": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606018823
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607046158
+      },
+      {
+        "executionId": "4ba1f493-1f9f-49b9-95bd-cd19501674a7",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791621811848
+      },
+      {
+        "executionId": "4ba1f493-1f9f-49b9-95bd-cd19501674a7",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791623297897
+      }
+    ],
+    "18. Migrate the sibling-repo callers directly (no shims); land zpm first": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606018913
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607046247
+      }
+    ],
+    "19. Verify end to end (repo-wide, no WinHTTP left)": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606019014
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607046339
+      }
+    ],
+    "20. (Optional, post-GA) HTTP/2 backend groundwork": [
+      {
+        "executionId": "f0a416f8-e90a-4f8e-b13a-486b25c13095",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791606019104
+      },
+      {
+        "executionId": "459c1adc-20b1-425d-841b-99cf73fb535a",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791607046437
+      }
+    ]
+  }
+}
