@@ -9946,6 +9946,43 @@ pub fn load(out_certs: []x509.Cert) usize {
     return n;
 }
 
+/// The broad web-trust root store (see ca_roots_web.sig). Additive to ROOT_DERS:
+/// the Mozilla snapshot above stays the fast path; this widens anchor coverage.
+const web = @import("ca_roots_web.sig");
+
+/// Parse the roots that could anchor `chain` — those whose subject is the
+/// issuer (or the subject) of a certificate in it — into `out`. Searches both
+/// the embedded Mozilla roots (ROOT_DERS) and the broad web store (web.DERS).
+/// Walks the whole store without holding it parsed, so a handshake needs a few
+/// entries of stack, not the store. Allocator-free; caller supplies `out`.
+pub fn loadFor(chain: []const x509.Cert, out: []x509.Cert) usize {
+    var n: usize = 0;
+    const lists = [_][]const []const u8{ &ROOT_DERS, &web.DERS };
+    for (lists) |list| for (list) |der| {
+        if (n >= out.len) return n;
+        const c = x509.parse(der) catch continue;
+        for (chain) |cc| {
+            if (eql(c.subject_raw, cc.issuer_raw) or eql(c.subject_raw, cc.subject_raw)) {
+                // Skip a duplicate (the same root in both lists).
+                var dup = false;
+                for (out[0..n]) |o| dup = dup or eql(o.tbs_raw, c.tbs_raw);
+                if (!dup) {
+                    out[n] = c;
+                    n += 1;
+                }
+                break;
+            }
+        }
+    };
+    return n;
+}
+
+fn eql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (x != y) return false;
+    return true;
+}
+
 const testing = @import("std").testing;
 
 test "ca_bundle: embedded roots parse and are CAs" {
@@ -9958,4 +9995,45 @@ test "ca_bundle: embedded roots parse and are CAs" {
     var ca_count: usize = 0;
     while (i < n) : (i += 1) { if (buf[i].is_ca) ca_count += 1; }
     try testing.expect(ca_count >= 100);
+}
+
+test "ca_bundle: the web store parses and has no unsupported keys" {
+    var parsed: usize = 0;
+    var unsupported: usize = 0;
+    for (web.DERS) |der| {
+        const c = x509.parse(der) catch continue;
+        parsed += 1;
+        if (c.key_alg == .unsupported) unsupported += 1;
+    }
+    // The web store is the broad snapshot; expect the bulk to parse cleanly.
+    try testing.expect(parsed >= 150);
+    try testing.expectEqual(@as(usize, 0), unsupported);
+}
+
+test "ca_bundle: loadFor anchors against both the Mozilla and web stores" {
+    // Pick the first parseable web root, then build a chain whose top cert
+    // names it as issuer. loadFor must surface at least that anchor, proving
+    // it searches &ROOT_DERS and &web.DERS together.
+    var anchor: x509.Cert = undefined;
+    var have_anchor = false;
+    for (web.DERS) |der| {
+        anchor = x509.parse(der) catch continue;
+        have_anchor = true;
+        break;
+    }
+    try testing.expect(have_anchor);
+
+    // Leaf whose issuer_raw matches the anchor's subject_raw (but whose own
+    // subject does not), so the match comes from issuer linkage.
+    var leaf = anchor;
+    leaf.issuer_raw = anchor.subject_raw;
+    leaf.subject_raw = "not-a-real-subject";
+    const chain = [_]x509.Cert{leaf};
+
+    // Size the out buffer for the combined store locally (do not shrink
+    // MAX_ROOTS, which the Mozilla-only load() contract depends on).
+    var out: [MAX_ROOTS + 1024]x509.Cert = undefined;
+    const found = loadFor(&chain, &out);
+    try testing.expect(found >= 1);
+    try testing.expect(eql(out[0].subject_raw, anchor.subject_raw));
 }

@@ -319,6 +319,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, multimodal_now, "sig_mem", "src/core/sig_mem.sig");
     try wire(ctx, multimodal_now, "sig_testing", "src/core/sig_testing.sig");
 
+    // Context projection + history (model-independent context retention).
+    const context_projection = try ctx.addModule("context_projection", "src/core/context_projection.sig");
+    try wire(ctx, context_projection, "sig_mem", "src/core/sig_mem.sig");
+    try wire(ctx, context_projection, "sig_testing", "src/core/sig_testing.sig");
+    const context_history = try ctx.addModule("context_history", "src/core/context_history.sig");
+    try wire(ctx, context_history, "context_projection", "src/core/context_projection.sig");
+    try wire(ctx, context_history, "sig_testing", "src/core/sig_testing.sig");
+
     // Platform: SB0 native image format (Layer 1, pure byte encoder).
     _ = try ctx.addModule("sb0x_format", "src/platform/sb0x/format.sig");
 
@@ -389,6 +397,15 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     _ = try addTest(ctx, test_all, "test-model-observability", "src/core/model_observability.sig", &.{
         importEntry("sig_math", "src/core/sig_math.sig"), importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-context-projection", "src/core/context_projection.sig", &.{
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-context-history", "src/core/context_history.sig", &.{
+        importEntry("context_projection", "src/core/context_projection.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
     });
     _ = try addTest(ctx, test_all, "test-multimodal-now", "src/core/multimodal_now.sig", &.{
         importEntry("sig_math", "src/core/sig_math.sig"),       importEntry("sig_mem", "src/core/sig_mem.sig"),
