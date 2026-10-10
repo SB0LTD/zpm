@@ -1,0 +1,214 @@
+{
+  "pbtResults": {},
+  "executionHistory": {
+    "1. AES-256 key expansion (`aes.sig`) + vectors": [
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615058799
+      },
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615104239
+      },
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615187624
+      }
+    ],
+    "2. ChaCha20-Poly1305 AEAD (`chacha20poly1305.sig`, NEW) + RFC 8439 vectors": [
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615058877
+      },
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615195235
+      },
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615430195
+      }
+    ],
+    "3. P-256 ECDH (`p256.sig` extension) + RFC 5903 vector": [
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615058942
+      },
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615484682
+      },
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615669523
+      }
+    ],
+    "4. SHA-384 key schedule (`tls/keysched384.sig`) + HKDF-SHA384": [
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615058992
+      },
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615704413
+      },
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615878406
+      }
+    ],
+    "5. Suite seam + hash-aware transcript (`tls.sig` refactor, no behavior change)": [
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615059036
+      },
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615913661
+      },
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791616220204
+      }
+    ],
+    "6. Wire AES-256-GCM-SHA384 suite (0x1302)": [
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615059082
+      },
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791616232313
+      },
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791617202568
+      },
+      {
+        "executionId": "737ba667-1a45-4a2c-9e31-35a347ffa947",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791620060418
+      }
+    ],
+    "7. Wire ChaCha20-Poly1305 suite (0x1303)": [
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615059125
+      },
+      {
+        "executionId": "737ba667-1a45-4a2c-9e31-35a347ffa947",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791620071983
+      },
+      {
+        "executionId": "737ba667-1a45-4a2c-9e31-35a347ffa947",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791620121245
+      }
+    ],
+    "8. Advertise + handle P-256 key_share (0x0017)": [
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615059173
+      },
+      {
+        "executionId": "737ba667-1a45-4a2c-9e31-35a347ffa947",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791620133710
+      },
+      {
+        "executionId": "737ba667-1a45-4a2c-9e31-35a347ffa947",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791620628736
+      }
+    ],
+    "9. HelloRetryRequest handling": [
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615059216
+      },
+      {
+        "executionId": "737ba667-1a45-4a2c-9e31-35a347ffa947",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791620640107
+      },
+      {
+        "executionId": "737ba667-1a45-4a2c-9e31-35a347ffa947",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791621093360
+      }
+    ],
+    "10. ALPN advertise + parse": [
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615059270
+      },
+      {
+        "executionId": "737ba667-1a45-4a2c-9e31-35a347ffa947",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791621101060
+      },
+      {
+        "executionId": "737ba667-1a45-4a2c-9e31-35a347ffa947",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791621352535
+      }
+    ],
+    "11. Live validation against real servers (flagged)": [
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615059382
+      },
+      {
+        "executionId": "737ba667-1a45-4a2c-9e31-35a347ffa947",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791621363034
+      },
+      {
+        "executionId": "737ba667-1a45-4a2c-9e31-35a347ffa947",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791621429810
+      }
+    ],
+    "12. Repo-wide verification": [
+      {
+        "executionId": "153d8897-d9d8-404e-834a-7bbdd45f8b56",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791615059447
+      },
+      {
+        "executionId": "737ba667-1a45-4a2c-9e31-35a347ffa947",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791621437438
+      },
+      {
+        "executionId": "737ba667-1a45-4a2c-9e31-35a347ffa947",
+        "chatSessionId": "sess_b05b2335-447b-4a55-91f8-a1b3d864c6e5",
+        "timestamp": 1791621549985
+      }
+    ]
+  }
+}

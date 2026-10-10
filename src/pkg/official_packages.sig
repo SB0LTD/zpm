@@ -146,17 +146,6 @@ pub const packages = [_]OfficialPackage{
     },
     .{
         .scope = "zpm",
-        .name = "http",
-        .version = "0.1.0",
-        .layer = 1,
-        .platform = .windows,
-        .system_libraries = &.{"winhttp"},
-        .zpm_dependencies = &.{"win32"},
-        .description = "HTTP client via WinHTTP",
-        .source = "src/platform/http.sig",
-    },
-    .{
-        .scope = "zpm",
         .name = "crypto",
         .version = "0.1.0",
         .layer = 1,
@@ -249,8 +238,8 @@ pub const packages = [_]OfficialPackage{
         .version = "0.1.0",
         .layer = 1,
         .platform = .windows,
-        .system_libraries = &.{ "kernel32", "gdi32", "user32", "shell32", "opengl32", "winhttp", "bcrypt", "ws2_32" },
-        .zpm_dependencies = &.{ "core", "win32", "gl", "window", "input", "timer", "threading", "http", "crypto", "file-io", "seqlock", "screenshot", "logging", "png", "mcp" },
+        .system_libraries = &.{ "kernel32", "gdi32", "user32", "shell32", "opengl32", "bcrypt", "ws2_32" },
+        .zpm_dependencies = &.{ "core", "win32", "gl", "window", "input", "timer", "threading", "crypto", "file-io", "seqlock", "screenshot", "logging", "png", "mcp" },
         .description = "Coarse-grained re-export of all platform subsystems",
         .source = "src/platform/root.sig",
     },
@@ -481,7 +470,7 @@ fn eql(a: []const u8, b: []const u8) bool {
 const testing = @import("std").testing;
 
 test "official_packages: expected package count" {
-    try testing.expectEqual(@as(usize, 37), package_count);
+    try testing.expectEqual(@as(usize, 36), package_count);
 }
 
 test "official_packages: layer 0 packages have no platform dependencies" {

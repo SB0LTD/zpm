@@ -58,8 +58,10 @@ var resp_buf: [8192]u8 = undefined;
 pub fn getToken(bg_response: []const u8, out_token: *[512]u8, out_len: *usize) bool {
     print("  [botguard] Exchanging BG response for integrity token...\n");
 
-    // Build request body: ["requestKey", "bgResponse"]
-    var body: [2048]u8 = undefined;
+    // Build request body: ["requestKey", "bgResponse"]. The BotGuard response
+    // can be tens of KB, so the body buffer must be large enough to hold the
+    // full JSON-escaped token plus the request-key wrapper.
+    var body: [131072]u8 = undefined;
     var blen: usize = 0;
 
     const p1 = "[\"O43z0dpjhgX20SCx4KAo\",\"";
@@ -68,7 +70,7 @@ pub fn getToken(bg_response: []const u8, out_token: *[512]u8, out_len: *usize) b
 
     // JSON-escape the BG response
     for (bg_response) |c| {
-        if (blen >= 2000) break;
+        if (blen + 2 >= body.len - 4) break; // leave room for closing "]
         switch (c) {
             '"' => { body[blen] = '\\'; blen += 1; body[blen] = '"'; blen += 1; },
             '\\' => { body[blen] = '\\'; blen += 1; body[blen] = '\\'; blen += 1; },
@@ -91,6 +93,9 @@ pub fn getToken(bg_response: []const u8, out_token: *[512]u8, out_len: *usize) b
     print("  [botguard] GenerateIT response: ");
     printNum(resp_len);
     print(" bytes\n");
+    print("  [botguard] GenerateIT raw: ");
+    print(challenge_mod.resp_buf[0..@min(resp_len, 400)]);
+    print("\n");
 
     // Parse response: [integrityToken, ttlSecs, mintRefreshThreshold, fallbackToken]
     // The response is a JSON array

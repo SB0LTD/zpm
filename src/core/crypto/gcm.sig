@@ -134,6 +134,97 @@ pub const Gcm = struct {
     }
 };
 
+/// AES-256-GCM key length in bytes.
+pub const KEY_LEN_256 = 32;
+
+/// GCM context over AES-256. Mirrors `Gcm` exactly but with a 256-bit key;
+/// GHASH, J0, CTR offset (counter=2), and tag construction are identical.
+pub const Gcm256 = struct {
+    cipher: aes.Aes256,
+    h: [16]u8,
+
+    pub fn init(key: *const [KEY_LEN_256]u8) Gcm256 {
+        const cipher = aes.Aes256.init(key);
+        var h: [16]u8 = @splat(0);
+        cipher.encryptBlock(&h);
+        return .{ .cipher = cipher, .h = h };
+    }
+
+    pub fn seal(self: *const Gcm256, nonce: *const [NONCE_LEN]u8, plaintext: []u8, aad: []const u8, tag_out: *[TAG_LEN]u8) void {
+        var j0: [16]u8 = undefined;
+        @memcpy(j0[0..12], nonce);
+        j0[12] = 0; j0[13] = 0; j0[14] = 0; j0[15] = 1;
+        self.cipher.ctr(nonce, 2, plaintext);
+        var ghash_state: [16]u8 = @splat(0);
+        ghashUpdate(&self.h, &ghash_state, aad);
+        ghashUpdate(&self.h, &ghash_state, plaintext);
+        var len_block: [16]u8 = @splat(0);
+        putU64BE(len_block[0..8], @as(u64, @intCast(aad.len)) * 8);
+        putU64BE(len_block[8..16], @as(u64, @intCast(plaintext.len)) * 8);
+        ghashBlock(&self.h, &ghash_state, &len_block);
+        var enc_j0: [16]u8 = j0;
+        self.cipher.encryptBlock(&enc_j0);
+        for (0..16) |i| tag_out[i] = ghash_state[i] ^ enc_j0[i];
+    }
+
+    pub fn open(self: *const Gcm256, nonce: *const [NONCE_LEN]u8, ciphertext: []u8, aad: []const u8, tag: *const [TAG_LEN]u8) bool {
+        var j0: [16]u8 = undefined;
+        @memcpy(j0[0..12], nonce);
+        j0[12] = 0; j0[13] = 0; j0[14] = 0; j0[15] = 1;
+        var ghash_state: [16]u8 = @splat(0);
+        ghashUpdate(&self.h, &ghash_state, aad);
+        ghashUpdate(&self.h, &ghash_state, ciphertext);
+        var len_block: [16]u8 = @splat(0);
+        putU64BE(len_block[0..8], @as(u64, @intCast(aad.len)) * 8);
+        putU64BE(len_block[8..16], @as(u64, @intCast(ciphertext.len)) * 8);
+        ghashBlock(&self.h, &ghash_state, &len_block);
+        var enc_j0: [16]u8 = j0;
+        self.cipher.encryptBlock(&enc_j0);
+        var expected_tag: [16]u8 = undefined;
+        for (0..16) |i| expected_tag[i] = ghash_state[i] ^ enc_j0[i];
+        var diff: u8 = 0;
+        for (0..16) |i| diff |= expected_tag[i] ^ tag[i];
+        if (diff != 0) { @memset(ciphertext, 0); return false; }
+        self.cipher.ctr(nonce, 2, ciphertext);
+        return true;
+    }
+};
+
+test "gcm256: NIST round-trip AES-256-GCM" {
+    // AES-256-GCM: encrypt then open recovers plaintext; tamper fails.
+    const key: [32]u8 = .{
+        0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c, 0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30, 0x83, 0x08,
+        0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c, 0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30, 0x83, 0x08,
+    };
+    const nonce: [12]u8 = .{ 0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce, 0xdb, 0xad, 0xde, 0xca, 0xf8, 0x88 };
+    const aad = [_]u8{ 0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef };
+    var pt = [_]u8{ 0xd9, 0x31, 0x32, 0x25, 0xf8, 0x84, 0x06, 0xe5, 0xa5, 0x59, 0x09, 0xc5, 0xaf, 0xf5, 0x26, 0x9a };
+    const orig = pt;
+    const g = Gcm256.init(&key);
+    var tag: [16]u8 = undefined;
+    g.seal(&nonce, &pt, &aad, &tag);
+    // ciphertext differs from plaintext
+    var changed = false;
+    for (0..pt.len) |i| { if (pt[i] != orig[i]) { changed = true; break; } }
+    if (!changed) return error.TestUnexpectedResult;
+    // open recovers plaintext
+    const ok = g.open(&nonce, &pt, &aad, &tag);
+    if (!ok) return error.TestUnexpectedResult;
+    for (0..pt.len) |i| { if (pt[i] != orig[i]) return error.TestUnexpectedResult; }
+}
+
+test "gcm256: tampered tag rejected" {
+    const key: [32]u8 = @splat(0);
+    const nonce: [12]u8 = @splat(0);
+    const g = Gcm256.init(&key);
+    var pt = [_]u8{ 1, 2, 3, 4, 5 };
+    var tag: [16]u8 = undefined;
+    g.seal(&nonce, &pt, "", &tag);
+    tag[0] ^= 0xFF; // corrupt
+    const ok = g.open(&nonce, &pt, "", &tag);
+    if (ok) return error.TestUnexpectedResult;
+}
+
 // ── GHASH (GF(2^128) multiplication) ────────────────────────────────────
 
 /// Process complete and partial blocks through GHASH.

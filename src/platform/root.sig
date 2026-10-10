@@ -10,7 +10,6 @@ pub const window = @import("window");
 pub const input = @import("input");
 pub const timer = @import("timer");
 pub const thread = @import("threading");
-pub const http = @import("http");
 pub const crypto = @import("crypto");
 pub const file = @import("file_io");
 pub const seqlock = @import("seqlock");
