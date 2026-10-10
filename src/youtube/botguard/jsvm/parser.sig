@@ -85,10 +85,12 @@ pub const Node = struct {
     flags: NodeFlags, // 1 byte
     op: u8 = 0, // operator token type (for binary/unary/assign)
     _pad: u8 = 0,
-    token_idx: u16 = 0, // index of primary token (for error reporting / literal value)
+    token_idx: u32 = 0, // index of primary token (u32: BotGuard's 63KB payload
+    // produces >65535 tokens, so a u16 token index truncated/panicked).
     left: NodeIdx = NULL_NODE, // left child / condition / first param
     right: NodeIdx = NULL_NODE, // right child / consequent
     extra: NodeIdx = NULL_NODE, // alternate / third child / extra info
+    end_pos: u32 = 0, // source byte offset just past this node (for function toString)
 };
 
 pub const NodeFlags = packed struct(u8) {
@@ -102,29 +104,38 @@ pub const NodeFlags = packed struct(u8) {
     is_static: bool = false, // static class member
 };
 
-pub const NodeIdx = u16;
-pub const NULL_NODE: NodeIdx = 0xFFFF;
+// u32: BotGuard's minified interpreter (~63KB) parses to well over 65535 AST
+// nodes and list items; a u16 NodeIdx overflowed the node/list pools, silently
+// truncating list-start offsets so late `var` declarators (e.g. the module-scope
+// function `w`) were dropped -> `w is not defined` at runtime.
+pub const NodeIdx = u32;
+pub const NULL_NODE: NodeIdx = 0xFFFFFFFF;
 
 /// Maximum AST nodes (~256KB with 20-byte nodes = ~13000 nodes).
-pub const MAX_NODES: usize = 13000;
+pub const MAX_NODES: usize = 400000;
 
 /// List pool — for variable-length child lists (params, args, stmts, etc.)
 /// Each list entry is a NodeIdx. Lists are contiguous ranges in this pool.
-pub const MAX_LIST_ITEMS: usize = 32000;
+pub const MAX_LIST_ITEMS: usize = 400000;
 
 // ── Parser State ──
 
 var nodes: [MAX_NODES]Node = undefined;
-var n_nodes: u16 = 0;
+var n_nodes: u32 = 0;
 
 /// List pool: flat array of NodeIdx values.
 /// Lists are referenced by (start, len) stored in a node's left/right fields.
 var list_pool: [MAX_LIST_ITEMS]NodeIdx = undefined;
-var list_used: u16 = 0;
+var list_used: u32 = 0;
 
 var tok_pos: usize = 0; // current token index
 var tok_count: usize = 0; // total tokens from lexer
 var had_error: bool = false;
+
+// When true, `in` is NOT treated as a relational operator. Used while parsing
+// a for-loop initializer so `for (x in obj)` detects the for-in form instead
+// of parsing `x in obj` as a binary expression (the ES "NoIn" grammar).
+var no_in: bool = false;
 
 // ── Public API ──
 
@@ -141,20 +152,27 @@ pub fn parse(num_tokens: usize) NodeIdx {
     const root = allocNode(.program);
     if (root == NULL_NODE) return NULL_NODE;
 
-    // Parse top-level statements into a list
-    const list_start = list_used;
+    // Parse top-level statements. Gather direct children into a local buffer
+    // first, then commit contiguously — nested parsing pushes into the shared
+    // pool, so we must not use a raw list_used span here.
+    var stmts: [MAX_TOP_STMTS]NodeIdx = undefined;
+    var n: usize = 0;
     while (!atEnd() and !had_error) {
         const stmt = parseStatement();
-        if (stmt != NULL_NODE) {
-            listPush(stmt);
+        if (stmt != NULL_NODE and n < MAX_TOP_STMTS) {
+            stmts[n] = stmt;
+            n += 1;
         }
     }
-    const list_len = list_used - list_start;
+    const list_start = commitList(stmts[0..n]);
 
     nodes[root].left = list_start;
-    nodes[root].right = @intCast(list_len);
+    nodes[root].right = @intCast(n);
     return root;
 }
+
+/// Maximum statements at a single block/program level.
+pub const MAX_TOP_STMTS: usize = 4096;
 
 /// Get a parsed node.
 pub fn getNode(idx: NodeIdx) Node {
@@ -163,19 +181,49 @@ pub fn getNode(idx: NodeIdx) Node {
 }
 
 /// Get a slice of the list pool.
-pub fn getList(start: u16, len: u16) []const NodeIdx {
+pub fn getList(start: u32, len: u32) []const NodeIdx {
     if (start + len > list_used) return &[_]NodeIdx{};
     return list_pool[start .. start + len];
 }
 
 /// Get total node count.
-pub fn nodeCount() u16 {
+pub fn nodeCount() u32 {
     return n_nodes;
 }
 
 /// Whether a parse error occurred.
 pub fn hasError() bool {
     return had_error;
+}
+
+/// True if a parse error occurred AND the parser ran off the end of the token
+/// stream (current token is EOF) — i.e. the input was INCOMPLETE. JS engines
+/// report this as SyntaxError "Unexpected end of input". BotGuard's anti-tamper
+/// deliberately `eval`s truncated source to force exactly this error, so our
+/// eval must throw it (not silently return undefined) for the transcript to
+/// match the reference. A non-EOF syntax error is a different message.
+pub fn errorWasUnexpectedEof() bool {
+    return had_error and peek().tt == .eof;
+}
+
+/// Current token position (how far parsing advanced). For diagnostics.
+pub fn tokenPos() usize {
+    return tok_pos;
+}
+
+/// Total token count the parser was given. For diagnostics.
+pub fn tokenCount() usize {
+    return tok_count;
+}
+
+/// Token type (enum int) at the current position. For diagnostics.
+pub fn currentTokenType() u8 {
+    return @intFromEnum(peek().tt);
+}
+
+/// Byte offset in source of the current token. For diagnostics.
+pub fn currentTokenStart() u32 {
+    return peek().start;
 }
 
 // ── Statement Parsing ──
@@ -216,16 +264,20 @@ fn parseBlock() NodeIdx {
     const node = allocNode(.block);
     if (node == NULL_NODE) return NULL_NODE;
 
-    const list_start = list_used;
+    var stmts: [MAX_TOP_STMTS]NodeIdx = undefined;
+    var n: usize = 0;
     while (!check(.rbrace) and !atEnd() and !had_error) {
         const stmt = parseStatement();
-        if (stmt != NULL_NODE) listPush(stmt);
+        if (stmt != NULL_NODE and n < MAX_TOP_STMTS) {
+            stmts[n] = stmt;
+            n += 1;
+        }
     }
     expect(.rbrace);
-    const list_len = list_used - list_start;
+    const list_start = commitList(stmts[0..n]);
 
     nodes[node].left = list_start;
-    nodes[node].right = @intCast(list_len);
+    nodes[node].right = @intCast(n);
     return node;
 }
 
@@ -241,24 +293,27 @@ fn parseVarDecl() NodeIdx {
     if (node == NULL_NODE) return NULL_NODE;
     nodes[node].flags = flags;
 
-    // Parse declarators as a list: each entry is [name, init] pair as two list items
-    const list_start = list_used;
+    // Parse declarators as [name, init] pairs into a local buffer, then commit.
+    // BotGuard's minified payload emits a SINGLE `var` statement with hundreds
+    // of declarators (its whole function table), so this buffer must be large;
+    // a small cap here would silently drop later declarators (name+init never
+    // stored) while still consuming their tokens — losing those globals.
+    const MAX_DECLARATORS: usize = 4096; // name+init pairs (BotGuard's interpreter
+    // IIFE declares its entire function table in ONE `var` — hundreds of them).
+    var items: [MAX_DECLARATORS * 2]NodeIdx = undefined;
     var count: u16 = 0;
     while (true) {
         // Name (or destructuring pattern — for now just identifiers)
         const name = parseBindingPattern();
-        listPush(name);
-        count += 1;
+        if (count < items.len) { items[count] = name; count += 1; } else had_error = true;
 
         // Optional initializer
         if (check(.assign)) {
             advance(); // consume =
             const init = parseAssignment();
-            listPush(init);
-            count += 1;
+            if (count < items.len) { items[count] = init; count += 1; } else had_error = true;
         } else {
-            listPush(NULL_NODE);
-            count += 1;
+            if (count < items.len) { items[count] = NULL_NODE; count += 1; } else had_error = true;
         }
 
         if (!check(.comma)) break;
@@ -266,10 +321,12 @@ fn parseVarDecl() NodeIdx {
     }
     consumeSemicolon();
 
-    nodes[node].left = list_start;
+    nodes[node].left = commitList(items[0..count]);
     nodes[node].right = @intCast(count);
+    if (count > dbg_max_var_items) dbg_max_var_items = count;
     return node;
 }
+pub var dbg_max_var_items: u16 = 0;
 
 fn parseBindingPattern() NodeIdx {
     // For now: just identifier. TODO: destructuring [...] and {...}
@@ -293,12 +350,14 @@ fn parseFuncDecl() NodeIdx {
 }
 
 fn parseFunctionFull(is_async: bool, is_expr: bool) NodeIdx {
+    const fn_tok = tok_pos; // token index of the `function` keyword (source pos)
     advance(); // consume 'function'
     const is_gen = check(.star);
     if (is_gen) advance(); // consume *
 
     const node = allocNode(if (is_expr) .func_expr else .func_decl);
     if (node == NULL_NODE) return NULL_NODE;
+    nodes[node].token_idx = @intCast(fn_tok);
     nodes[node].flags = .{ .is_async = is_async, .is_generator = is_gen };
 
     // Optional name
@@ -309,18 +368,19 @@ fn parseFunctionFull(is_async: bool, is_expr: bool) NodeIdx {
         nodes[node].left = name;
     }
 
-    // Parameters
+    // Parameters — gather into a local buffer, then commit before body.
     expect(.lparen);
-    const params_start = list_used;
+    var params: [64]NodeIdx = undefined;
     var param_count: u16 = 0;
     while (!check(.rparen) and !atEnd() and !had_error) {
+        var item: NodeIdx = NULL_NODE;
         if (check(.spread)) {
             advance();
             const rest = allocNode(.spread_expr);
             if (rest != NULL_NODE) {
                 nodes[rest].left = parseBindingPattern();
             }
-            listPush(rest);
+            item = rest;
         } else {
             const param = parseBindingPattern();
             // Optional default value
@@ -333,20 +393,24 @@ fn parseFunctionFull(is_async: bool, is_expr: bool) NodeIdx {
                     nodes[pair].left = param;
                     nodes[pair].right = def;
                 }
-                listPush(pair);
+                item = pair;
             } else {
-                listPush(param);
+                item = param;
             }
         }
-        param_count += 1;
+        if (param_count < 64) { params[param_count] = item; param_count += 1; }
         if (!check(.rparen)) expect(.comma);
     }
     expect(.rparen);
-    nodes[node].extra = params_start;
+    nodes[node].extra = commitList(params[0..param_count]);
     nodes[node].op = @intCast(param_count);
 
     // Body (must be a block)
     nodes[node].right = parseBlock();
+    // Record the function's source END (just past the closing `}`) so the VM can
+    // reconstruct the exact source for Function.prototype.toString. tok_pos now
+    // points at the token AFTER the block; the `}` is the previous token.
+    if (tok_pos >= 1) { const et = lexer.getToken(tok_pos - 1); nodes[node].end_pos = et.start + et.len; }
     return node;
 }
 
@@ -373,17 +437,17 @@ fn parseClassFull(is_expr: bool) NodeIdx {
         nodes[node].extra = parseLeftHandSide();
     }
 
-    // Body { ... }
+    // Body { ... } — gather members locally, then commit.
     expect(.lbrace);
-    const list_start = list_used;
+    var members: [256]NodeIdx = undefined;
     var count: u16 = 0;
     while (!check(.rbrace) and !atEnd() and !had_error) {
         if (check(.semicolon)) { advance(); continue; }
         const member = parseClassMember();
-        if (member != NULL_NODE) { listPush(member); count += 1; }
+        if (member != NULL_NODE and count < 256) { members[count] = member; count += 1; }
     }
     expect(.rbrace);
-    nodes[node].right = list_start;
+    nodes[node].right = commitList(members[0..count]);
     nodes[node].op = @intCast(@min(count, 255));
     return node;
 }
@@ -443,17 +507,19 @@ fn parseClassMember() NodeIdx {
 fn parseMethodBody(is_async: bool, is_gen: bool) NodeIdx {
     const node = allocNode(.func_expr);
     if (node == NULL_NODE) return NULL_NODE;
+    nodes[node].token_idx = @intCast(tok_pos); // at `(` of method params (approx)
     nodes[node].flags = .{ .is_async = is_async, .is_generator = is_gen };
 
     expect(.lparen);
-    const params_start = list_used;
+    var params: [64]NodeIdx = undefined;
     var param_count: u16 = 0;
     while (!check(.rparen) and !atEnd() and !had_error) {
+        var item: NodeIdx = NULL_NODE;
         if (check(.spread)) {
             advance();
             const rest = allocNode(.spread_expr);
             if (rest != NULL_NODE) nodes[rest].left = parseBindingPattern();
-            listPush(rest);
+            item = rest;
         } else {
             const param = parseBindingPattern();
             if (check(.assign)) {
@@ -461,16 +527,16 @@ fn parseMethodBody(is_async: bool, is_gen: bool) NodeIdx {
                 const def = parseAssignment();
                 const pair = allocNode(.assign_expr);
                 if (pair != NULL_NODE) { nodes[pair].left = param; nodes[pair].right = def; }
-                listPush(pair);
+                item = pair;
             } else {
-                listPush(param);
+                item = param;
             }
         }
-        param_count += 1;
+        if (param_count < 64) { params[param_count] = item; param_count += 1; }
         if (!check(.rparen)) expect(.comma);
     }
     expect(.rparen);
-    nodes[node].extra = params_start;
+    nodes[node].extra = commitList(params[0..param_count]);
     nodes[node].op = @intCast(param_count);
     nodes[node].right = parseBlock();
     return node;
@@ -499,20 +565,27 @@ fn parseForStmt() NodeIdx {
     advance(); // consume 'for'
     expect(.lparen);
 
-    // Could be: for(init;cond;update), for(x in obj), for(x of iter)
+    // Could be: for(init;cond;update), for(x in obj), for(x of iter).
+    // Parse the initializer in NoIn mode so `x in obj` is not eaten as a binary
+    // `in` expression — we need to see the `in` to detect the for-in form.
     var init: NodeIdx = NULL_NODE;
+    const saved_no_in = no_in;
+    no_in = true;
     if (check(.semicolon)) {
+        no_in = saved_no_in;
         advance(); // empty init
     } else if (check(.kw_var) or check(.kw_let) or check(.kw_const)) {
         // var decl without semicolon — check for in/of after first declarator
         init = parseForVarDecl();
-        if (init != NULL_NODE and (check(.kw_in) or check(.kw_of))) {
+        no_in = saved_no_in;
+        if (init != NULL_NODE and (check(.kw_in) or checkOf())) {
             return parseForInOf(init);
         }
         expect(.semicolon);
     } else {
         init = parseExpression();
-        if (check(.kw_in) or check(.kw_of)) {
+        no_in = saved_no_in;
+        if (check(.kw_in) or checkOf()) {
             return parseForInOf(init);
         }
         expect(.semicolon);
@@ -533,11 +606,9 @@ fn parseForStmt() NodeIdx {
     if (node == NULL_NODE) return NULL_NODE;
     nodes[node].left = init;
     nodes[node].right = body;
-    // Store cond and update in extra using list
-    const extra_start = list_used;
-    listPush(cond);
-    listPush(update);
-    nodes[node].extra = extra_start;
+    // Store cond and update in extra as a 2-item list.
+    var cu: [2]NodeIdx = .{ cond, update };
+    nodes[node].extra = commitList(cu[0..2]);
     return node;
 }
 
@@ -553,27 +624,24 @@ fn parseForVarDecl() NodeIdx {
     if (node == NULL_NODE) return NULL_NODE;
     nodes[node].flags = flags;
 
-    const list_start = list_used;
     const name = parseBindingPattern();
-    listPush(name);
-
+    var init: NodeIdx = NULL_NODE;
     if (check(.assign)) {
         advance();
-        const init = parseAssignment();
-        listPush(init);
-    } else {
-        listPush(NULL_NODE);
+        init = parseAssignment();
     }
-
-    nodes[node].left = list_start;
+    var pair: [2]NodeIdx = .{ name, init };
+    nodes[node].left = commitList(pair[0..2]);
     nodes[node].right = 2; // one declarator = 2 list items
     return node;
 }
 
 fn parseForInOf(lhs: NodeIdx) NodeIdx {
-    const is_of = check(.kw_of);
+    const is_of = checkOf();
     advance(); // consume 'in' or 'of'
-    const rhs = parseAssignment();
+    // for-in RHS is an Expression (comma sequences allowed); for-of RHS is an
+    // AssignmentExpression. BotGuard uses `for (x in a(), b, obj)` sequences.
+    const rhs = if (is_of) parseAssignment() else parseExpression();
     expect(.rparen);
     const body = parseStatement();
 
@@ -627,14 +695,14 @@ fn parseSwitchStmt() NodeIdx {
     if (node == NULL_NODE) return NULL_NODE;
     nodes[node].left = disc;
 
-    const list_start = list_used;
+    var clauses: [256]NodeIdx = undefined;
     var count: u16 = 0;
     while (!check(.rbrace) and !atEnd() and !had_error) {
         const clause = parseCaseClause();
-        if (clause != NULL_NODE) { listPush(clause); count += 1; }
+        if (clause != NULL_NODE and count < 256) { clauses[count] = clause; count += 1; }
     }
     expect(.rbrace);
-    nodes[node].right = list_start;
+    nodes[node].right = commitList(clauses[0..count]);
     nodes[node].op = @intCast(@min(count, 255));
     return node;
 }
@@ -653,13 +721,13 @@ fn parseCaseClause() NodeIdx {
     expect(.colon);
 
     // Body statements until next case/default/}
-    const list_start = list_used;
-    var count: u16 = 0;
+    var stmts: [MAX_TOP_STMTS]NodeIdx = undefined;
+    var count: usize = 0;
     while (!check(.kw_case) and !check(.kw_default) and !check(.rbrace) and !atEnd() and !had_error) {
         const stmt = parseStatement();
-        if (stmt != NULL_NODE) { listPush(stmt); count += 1; }
+        if (stmt != NULL_NODE and count < MAX_TOP_STMTS) { stmts[count] = stmt; count += 1; }
     }
-    nodes[node].right = list_start;
+    nodes[node].right = commitList(stmts[0..count]);
     nodes[node].op = @intCast(@min(count, 255));
     return node;
 }
@@ -690,11 +758,9 @@ fn parseTryStmt() NodeIdx {
     if (node == NULL_NODE) return NULL_NODE;
     nodes[node].left = try_body;
     nodes[node].right = catch_body;
-    // Pack catch_param and finally in extra via list
-    const extra_start = list_used;
-    listPush(catch_param);
-    listPush(finally_body);
-    nodes[node].extra = extra_start;
+    // Pack catch_param and finally in extra as a 2-item list.
+    var cf: [2]NodeIdx = .{ catch_param, finally_body };
+    nodes[node].extra = commitList(cf[0..2]);
     return node;
 }
 
@@ -974,7 +1040,7 @@ fn parseEquality() NodeIdx {
 
 fn parseRelational() NodeIdx {
     var left = parseShift();
-    while (check(.lt) or check(.gt) or check(.lte) or check(.gte) or check(.kw_instanceof) or check(.kw_in)) {
+    while (check(.lt) or check(.gt) or check(.lte) or check(.gte) or check(.kw_instanceof) or (check(.kw_in) and !no_in)) {
         const op = peek().tt;
         advance();
         const right = parseShift();
@@ -1233,25 +1299,26 @@ fn parseNewExpr() NodeIdx {
     if (node == NULL_NODE) return target;
     nodes[node].left = target;
 
-    // Optional arguments
+    // Optional arguments — gather locally, commit after all parsed.
     if (check(.lparen)) {
         advance();
-        const list_start = list_used;
+        var args: [255]NodeIdx = undefined;
         var arg_count: u16 = 0;
         while (!check(.rparen) and !atEnd() and !had_error) {
+            var item: NodeIdx = NULL_NODE;
             if (check(.spread)) {
                 advance();
                 const sp = allocNode(.spread_expr);
                 if (sp != NULL_NODE) nodes[sp].left = parseAssignment();
-                listPush(sp);
+                item = sp;
             } else {
-                listPush(parseAssignment());
+                item = parseAssignment();
             }
-            arg_count += 1;
+            if (arg_count < 255) { args[arg_count] = item; arg_count += 1; }
             if (!check(.rparen)) expect(.comma);
         }
         expect(.rparen);
-        nodes[node].right = list_start;
+        nodes[node].right = commitList(args[0..arg_count]);
         nodes[node].op = @intCast(@min(arg_count, 255));
     }
     return node;
@@ -1263,22 +1330,23 @@ fn parseCallArgs(callee: NodeIdx) NodeIdx {
     if (call == NULL_NODE) return callee;
     nodes[call].left = callee;
 
-    const list_start = list_used;
+    var args: [255]NodeIdx = undefined;
     var arg_count: u16 = 0;
     while (!check(.rparen) and !atEnd() and !had_error) {
+        var item: NodeIdx = NULL_NODE;
         if (check(.spread)) {
             advance();
             const sp = allocNode(.spread_expr);
             if (sp != NULL_NODE) nodes[sp].left = parseAssignment();
-            listPush(sp);
+            item = sp;
         } else {
-            listPush(parseAssignment());
+            item = parseAssignment();
         }
-        arg_count += 1;
+        if (arg_count < 255) { args[arg_count] = item; arg_count += 1; }
         if (!check(.rparen)) expect(.comma);
     }
     expect(.rparen);
-    nodes[call].right = list_start;
+    nodes[call].right = commitList(args[0..arg_count]);
     nodes[call].op = @intCast(@min(arg_count, 255));
     return call;
 }
@@ -1383,69 +1451,64 @@ fn parseParenOrArrow() NodeIdx {
         return NULL_NODE;
     }
 
-    // Try parsing params for arrow detection
-    // Parse contents — if followed by '=>' treat as arrow, else as grouped expr
-    const list_start = list_used;
+    // Parse contents into a local buffer (each may push nested items into the
+    // shared pool, so we cannot index the pool by position). If followed by
+    // '=>' treat as arrow params, else as a grouped/sequence expression.
+    var items: [64]NodeIdx = undefined;
     var param_count: u16 = 0;
     // Parse first item
     if (check(.spread)) {
         advance();
         const rest = allocNode(.spread_expr);
         if (rest != NULL_NODE) nodes[rest].left = parseBindingPattern();
-        listPush(rest);
-        param_count += 1;
-        // Rest param means this must be arrow params
+        if (param_count < 64) { items[param_count] = rest; param_count += 1; }
     } else {
         const first = parseAssignment();
-        listPush(first);
-        param_count += 1;
+        if (param_count < 64) { items[param_count] = first; param_count += 1; }
     }
 
     while (check(.comma)) {
         advance();
+        var item: NodeIdx = NULL_NODE;
         if (check(.spread)) {
             advance();
             const rest = allocNode(.spread_expr);
             if (rest != NULL_NODE) nodes[rest].left = parseBindingPattern();
-            listPush(rest);
-            param_count += 1;
+            item = rest;
         } else {
-            listPush(parseAssignment());
-            param_count += 1;
+            item = parseAssignment();
         }
+        if (param_count < 64) { items[param_count] = item; param_count += 1; }
     }
     expect(.rparen);
 
     if (check(.arrow)) {
         advance(); // consume =>
-        // Params are in list_pool[list_start..list_start+param_count]
-        // Create a "params" marker node
+        // Commit params contiguously and mark via a sequence_expr node.
+        const params_start = commitList(items[0..param_count]);
         const params_node = allocNode(.sequence_expr); // reuse as param list marker
         if (params_node != NULL_NODE) {
-            nodes[params_node].left = list_start;
+            nodes[params_node].left = params_start;
             nodes[params_node].right = @intCast(param_count);
         }
         return parseArrowBody(params_node, param_count);
     }
 
-    // Not an arrow — this was a parenthesized expression
-    // If we only had one item, it's just (expr)
+    // Not an arrow — this was a parenthesized expression.
+    _ = save_pos;
+    _ = save_nodes;
+    _ = save_list;
     if (param_count == 1) {
-        // The expression is list_pool[list_start]
-        _ = save_pos;
-        _ = save_nodes;
-        _ = save_list;
-        return list_pool[list_start];
+        return items[0];
     }
 
-    // Multiple items without => : this is a sequence expression
-    var result = list_pool[list_start];
+    // Multiple items without => : left-folded sequence expression.
+    var result = items[0];
     for (1..param_count) |i| {
-        const right = list_pool[list_start + @as(u16, @intCast(i))];
         const seq = allocNode(.sequence_expr);
         if (seq == NULL_NODE) return result;
         nodes[seq].left = result;
-        nodes[seq].right = right;
+        nodes[seq].right = items[i];
         result = seq;
     }
     return result;
@@ -1454,6 +1517,7 @@ fn parseParenOrArrow() NodeIdx {
 fn parseArrowBody(params: NodeIdx, param_count: u16) NodeIdx {
     const node = allocNode(.arrow_expr);
     if (node == NULL_NODE) return NULL_NODE;
+    nodes[node].token_idx = @intCast(tok_pos); // near `=>` (approx source pos)
     nodes[node].left = params;
     nodes[node].op = @intCast(@min(param_count, 255));
 
@@ -1463,6 +1527,7 @@ fn parseArrowBody(params: NodeIdx, param_count: u16) NodeIdx {
     } else {
         nodes[node].right = parseAssignment();
     }
+    if (tok_pos >= 1) { const et = lexer.getToken(tok_pos - 1); nodes[node].end_pos = et.start + et.len; }
     return node;
 }
 
@@ -1508,31 +1573,31 @@ fn parseArrayExpr() NodeIdx {
     const node = allocNode(.array_expr);
     if (node == NULL_NODE) return NULL_NODE;
 
-    const list_start = list_used;
+    var elems: [512]NodeIdx = undefined;
     var count: u16 = 0;
     while (!check(.rbracket) and !atEnd() and !had_error) {
         if (check(.comma)) {
             // Elision (hole)
-            listPush(NULL_NODE);
-            count += 1;
+            if (count < 512) { elems[count] = NULL_NODE; count += 1; }
             advance();
             continue;
         }
+        var item: NodeIdx = NULL_NODE;
         if (check(.spread)) {
             advance();
             const sp = allocNode(.spread_expr);
             if (sp != NULL_NODE) nodes[sp].left = parseAssignment();
-            listPush(sp);
+            item = sp;
         } else {
-            listPush(parseAssignment());
+            item = parseAssignment();
         }
-        count += 1;
+        if (count < 512) { elems[count] = item; count += 1; }
         if (!check(.rbracket)) {
             if (check(.comma)) { advance(); } else break;
         }
     }
     expect(.rbracket);
-    nodes[node].left = list_start;
+    nodes[node].left = commitList(elems[0..count]);
     nodes[node].right = @intCast(count);
     return node;
 }
@@ -1542,17 +1607,17 @@ fn parseObjectExpr() NodeIdx {
     const node = allocNode(.object_expr);
     if (node == NULL_NODE) return NULL_NODE;
 
-    const list_start = list_used;
+    var props: [512]NodeIdx = undefined;
     var count: u16 = 0;
     while (!check(.rbrace) and !atEnd() and !had_error) {
         const prop = parseObjectProperty();
-        if (prop != NULL_NODE) { listPush(prop); count += 1; }
+        if (prop != NULL_NODE and count < 512) { props[count] = prop; count += 1; }
         if (!check(.rbrace)) {
             if (check(.comma)) { advance(); } else break;
         }
     }
     expect(.rbrace);
-    nodes[node].left = list_start;
+    nodes[node].left = commitList(props[0..count]);
     nodes[node].right = @intCast(count);
     return node;
 }
@@ -1644,6 +1709,21 @@ fn listPush(item: NodeIdx) void {
     list_used += 1;
 }
 
+/// Commit a locally-gathered set of child indices contiguously into the list
+/// pool and return the start offset. This isolates a collector from any
+/// nested parsing that pushed into the pool while its children were being
+/// parsed (the flat pool is shared across all collectors, so the naive
+/// `list_used - list_start` span would incorrectly capture nested items).
+fn commitList(items: []const NodeIdx) u32 {
+    if (list_used + items.len > MAX_LIST_ITEMS) { had_error = true; return list_used; }
+    const start: u32 = list_used;
+    for (items) |it| {
+        list_pool[list_used] = it;
+        list_used += 1;
+    }
+    return start;
+}
+
 fn peek() Token {
     return lexer.getToken(tok_pos);
 }
@@ -1654,6 +1734,20 @@ fn advance() void {
 
 fn check(tt: TokenType) bool {
     return peek().tt == tt;
+}
+
+/// Contextual `of`: `of` tokenizes as an identifier (it's a valid variable name
+/// in JS), so the for-loop parser recognizes the `for (x of y)` keyword form by
+/// matching an identifier whose text is exactly "of". (`.kw_of` is also accepted
+/// for safety, though the lexer no longer emits it.)
+fn checkOf() bool {
+    const t = peek();
+    if (t.tt == .kw_of) return true;
+    if (t.tt == .identifier) {
+        const s = lexer.tokenText(t);
+        return s.len == 2 and s[0] == 'o' and s[1] == 'f';
+    }
+    return false;
 }
 
 fn atEnd() bool {
@@ -1709,7 +1803,9 @@ fn isKeywordUsableAsProperty(tt: TokenType) bool {
         .kw_case, .kw_default, .kw_new, .kw_this, .kw_typeof, .kw_instanceof,
         .kw_in, .kw_of, .kw_delete, .kw_void, .kw_throw, .kw_try, .kw_catch,
         .kw_finally, .kw_class, .kw_extends, .kw_super, .kw_import, .kw_export,
-        .kw_async, .kw_await, .kw_yield, .kw_with, .kw_debugger => true,
+        .kw_async, .kw_await, .kw_yield, .kw_with, .kw_debugger,
+        // Literal keywords are also valid property names: obj.true, x.null, etc.
+        .true_lit, .false_lit, .null_lit, .undefined_lit => true,
         else => false,
     };
 }

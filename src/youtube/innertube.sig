@@ -89,13 +89,13 @@ fn clientName(ct: ClientType) []const u8 {
 /// Get the client version for the InnerTube context.
 fn clientVersion(ct: ClientType) []const u8 {
     return switch (ct) {
-        .web => "2.20241126.01.00",
-        .web_embedded => "2.20241126.01.00",
-        .android => "19.29.37",
+        .web => "2.20250312.04.00",
+        .web_embedded => "2.20250310.01.00",
+        .android => "20.10.38",
         .android_vr => "1.62.27",
-        .ios => "19.29.1",
+        .ios => "20.10.4",
         .tv_embedded => "2.0",
-        .mweb => "2.20241126.01.00",
+        .mweb => "2.20250311.03.00",
     };
 }
 
@@ -231,6 +231,19 @@ pub fn playerWebEmbed(video_id: []const u8) []const u8 {
     var extra: [64]u8 = undefined;
     const elen = buildKV(&extra, "\"videoId\":\"", video_id, "\"");
     return request(.player, .web_embedded, extra[0..elen]);
+}
+
+/// Get player data with a PO token in serviceIntegrityDimensions (required by
+/// YouTube for most clients as of 2026). `pot` = base64url PO token.
+pub fn playerWithPot(video_id: []const u8, client: ClientType, pot: []const u8) []const u8 {
+    var extra: [512]u8 = undefined;
+    var pos: usize = 0;
+    pos = appendS(&extra, pos, "\"videoId\":\"");
+    pos = appendS(&extra, pos, video_id);
+    pos = appendS(&extra, pos, "\",\"serviceIntegrityDimensions\":{\"poToken\":\"");
+    pos = appendS(&extra, pos, pot);
+    pos = appendS(&extra, pos, "\"}");
+    return request(.player, client, extra[0..pos]);
 }
 
 /// Get player data using ANDROID_VR client (NO PO TOKEN REQUIRED).

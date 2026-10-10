@@ -48,6 +48,11 @@ const WinHttpReceiveResponseFn = *const fn (HINTERNET, ?*anyopaque) callconv(.c)
 const WinHttpReadDataFn = *const fn (HINTERNET, [*]u8, DWORD, *DWORD) callconv(.c) BOOL;
 const WinHttpCloseHandleFn = *const fn (HINTERNET) callconv(.c) BOOL;
 const WinHttpAddRequestHeadersFn = *const fn (HINTERNET, LPCWSTR, DWORD, DWORD) callconv(.c) BOOL;
+const WinHttpQueryHeadersFn = *const fn (HINTERNET, DWORD, ?LPCWSTR, ?*anyopaque, *DWORD, ?*DWORD) callconv(.c) BOOL;
+const WINHTTP_QUERY_STATUS_CODE: DWORD = 19;
+const WINHTTP_QUERY_CONTENT_LENGTH: DWORD = 5;
+const WINHTTP_QUERY_CONTENT_RANGE: DWORD = 53;
+const WINHTTP_QUERY_FLAG_NUMBER: DWORD = 0x20000000;
 
 var fn_open: ?WinHttpOpenFn = null;
 var fn_connect: ?WinHttpConnectFn = null;
@@ -57,7 +62,10 @@ var fn_recvResp: ?WinHttpReceiveResponseFn = null;
 var fn_readData: ?WinHttpReadDataFn = null;
 var fn_closeHandle: ?WinHttpCloseHandleFn = null;
 var fn_addHeaders: ?WinHttpAddRequestHeadersFn = null;
+var fn_queryHeaders: ?WinHttpQueryHeadersFn = null;
 var http_loaded: bool = false;
+// Last HTTP status code observed by downloadChunk (for diagnostics).
+pub var last_status: u32 = 0;
 
 // Download chunk buffer (1 MB)
 const CHUNK_SIZE: usize = 1024 * 1024;
@@ -90,7 +98,7 @@ pub fn downloadToFile(
 
     // Parse host and path from URL
     var host_buf: [256]u8 = undefined;
-    var path_buf: [2048]u8 = undefined;
+    var path_buf: [9216]u8 = undefined;
     var host_len: usize = 0;
     var path_len: usize = 0;
     var port: u16 = 443;
@@ -108,16 +116,16 @@ pub fn downloadToFile(
 
     // Download in chunks with Range headers
     var offset: u64 = 0;
-    const total = if (content_length > 0) content_length else 0xFFFFFFFFFFFFFFFF;
+    var total = if (content_length > 0) content_length else 0xFFFFFFFFFFFFFFFF;
     const max_retries: u16 = 5;
+    var retries_at_offset: u16 = 0;
+    var complete = false;
+    defer _ = CloseHandle(fh);
 
     while (offset < total) {
-        const chunk_end = if (content_length > 0)
-            @min(offset + CHUNK_SIZE - 1, content_length - 1)
-        else
-            offset + CHUNK_SIZE - 1;
+        const chunk_end = @min(offset + CHUNK_SIZE - 1, total - 1);
 
-        const bytes_read = downloadChunk(
+        const chunk = downloadChunk(
             &host_w,
             host_len,
             path_buf[0..path_len],
@@ -126,33 +134,51 @@ pub fn downloadToFile(
             chunk_end,
         );
 
-        if (bytes_read == 0) {
+        if (!chunk.success) {
             // Retry logic
-            if (result.retries >= max_retries) break;
-            result.retries += 1;
-            Sleep(1000 * result.retries); // exponential-ish backoff
+            if (retries_at_offset >= max_retries) break;
+            retries_at_offset += 1;
+            result.retries +|= 1;
+            Sleep(1000 * retries_at_offset);
             continue;
+        }
+        retries_at_offset = 0;
+        if (chunk.total > 0) {
+            if (content_length > 0 and chunk.total != content_length) break;
+            total = chunk.total;
+        }
+        const bytes_read = chunk.bytes;
+        if (bytes_read == 0) {
+            complete = chunk.eof and offset > 0 and (total == 0xFFFFFFFFFFFFFFFF or offset == total);
+            break;
         }
 
         // Write chunk to file
-        _ = WriteFile(fh, &chunk_buf, @intCast(bytes_read), null, null);
+        var written: usize = 0;
+        while (written < bytes_read) {
+            var n_written: DWORD = 0;
+            if (WriteFile(fh, chunk_buf[written..].ptr, @intCast(bytes_read - written), &n_written, null) == 0 or n_written == 0) {
+                result.bytes_written = offset + written;
+                return result;
+            }
+            written += n_written;
+        }
         offset += bytes_read;
         result.bytes_written = offset;
 
         // Progress callback
         if (progress) |cb| cb(offset, content_length);
 
-        // If we got less than chunk size and content_length is unknown, we're done
-        if (content_length == 0 and bytes_read < CHUNK_SIZE) break;
+        if (offset == total or (chunk.eof and total == 0xFFFFFFFFFFFFFFFF)) { complete = true; break; }
     }
 
-    _ = CloseHandle(fh);
-    result.success = (content_length == 0 and result.bytes_written > 0) or
-        (result.bytes_written >= content_length);
+    result.success = complete and result.bytes_written > 0;
     return result;
 }
 
 /// Download a single chunk via Range request.
+const ChunkResult = struct { bytes: usize = 0, total: u64 = 0, success: bool = false, eof: bool = false };
+
 fn downloadChunk(
     host_w: *const [256]u16,
     host_len: usize,
@@ -160,25 +186,31 @@ fn downloadChunk(
     port: u16,
     range_start: u64,
     range_end: u64,
-) usize {
+) ChunkResult {
     _ = host_len;
-    const W_AGENT = comptime toWide("zpm-youtube/1.0");
+    last_status = 0;
+    const W_AGENT = comptime toWide("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
 
-    const hSession = fn_open.?(&W_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT, null, null, 0) orelse return 0;
+    const hSession = fn_open.?(&W_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT, null, null, 0) orelse return .{};
     const hConnect = fn_connect.?(hSession, @ptrCast(host_w), port, 0) orelse {
         _ = fn_closeHandle.?(hSession);
-        return 0;
+        return .{};
     };
 
     // Convert path to UTF-16
-    var path_w: [2048]u16 = undefined;
+    var path_w: [9216]u16 = undefined;
+    if (path.len >= path_w.len) {
+        _ = fn_closeHandle.?(hConnect);
+        _ = fn_closeHandle.?(hSession);
+        return .{};
+    }
     for (0..path.len) |i| path_w[i] = path[i];
     path_w[path.len] = 0;
 
     const hRequest = fn_openReq.?(hConnect, null, @ptrCast(&path_w), null, null, null, WINHTTP_FLAG_SECURE) orelse {
         _ = fn_closeHandle.?(hConnect);
         _ = fn_closeHandle.?(hSession);
-        return 0;
+        return .{};
     };
 
     // Add Range header: "Range: bytes=START-END\r\n"
@@ -187,49 +219,134 @@ fn downloadChunk(
     for (0..range_str.len) |i| range_hdr[i] = range_str.buf[i];
     range_hdr[range_str.len] = 0;
     _ = fn_addHeaders.?(hRequest, @ptrCast(&range_hdr), @bitCast(@as(i32, -1)), WINHTTP_ADDREQ_FLAG_ADD);
+    const W_HEADERS = comptime toWide("Origin: https://www.youtube.com\r\nReferer: https://www.youtube.com/\r\nAccept-Encoding: identity\r\n");
+    _ = fn_addHeaders.?(hRequest, &W_HEADERS, @bitCast(@as(i32, -1)), WINHTTP_ADDREQ_FLAG_ADD);
 
     // Send
     if (fn_sendReq.?(hRequest, null, 0, null, 0, 0, 0) == 0) {
         _ = fn_closeHandle.?(hRequest);
         _ = fn_closeHandle.?(hConnect);
         _ = fn_closeHandle.?(hSession);
-        return 0;
+        return .{};
     }
     if (fn_recvResp.?(hRequest, null) == 0) {
         _ = fn_closeHandle.?(hRequest);
         _ = fn_closeHandle.?(hConnect);
         _ = fn_closeHandle.?(hSession);
-        return 0;
+        return .{};
     }
+
+    // Query HTTP status code (diagnostics + treat non-2xx as failure)
+    if (fn_queryHeaders) |qh| {
+        var status_code: DWORD = 0;
+        var sc_len: DWORD = @sizeOf(DWORD);
+        if (qh(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, null, &status_code, &sc_len, null) != 0) {
+            last_status = status_code;
+            if (status_code != 200 and status_code != 206) {
+                _ = fn_closeHandle.?(hRequest);
+                _ = fn_closeHandle.?(hConnect);
+                _ = fn_closeHandle.?(hSession);
+                return .{};
+            }
+        }
+    }
+    defer _ = fn_closeHandle.?(hRequest);
+    defer _ = fn_closeHandle.?(hConnect);
+    defer _ = fn_closeHandle.?(hSession);
+    var result = ChunkResult{};
+    var expected: usize = 0;
+    if (last_status == 206) {
+        var header: [128]u8 = undefined;
+        const len = readHeader(hRequest, WINHTTP_QUERY_CONTENT_RANGE, &header);
+        const range = parseContentRange(header[0..len]) orelse return result;
+        if (range.start != range_start or range.end > range_end or range.end < range.start) return result;
+        const n = range.end - range.start + 1;
+        if (n > CHUNK_SIZE) return result;
+        expected = @intCast(n);
+        result.total = range.total;
+    } else if (last_status == 200 and range_start == 0) {
+        var header: [32]u8 = undefined;
+        const len = readHeader(hRequest, WINHTTP_QUERY_CONTENT_LENGTH, &header);
+        if (len > 0) {
+            const n = parseDecimal(header[0..len]) orelse return result;
+            if (n == 0 or n > CHUNK_SIZE) return result;
+            expected = @intCast(n);
+            result.total = n;
+        }
+    } else return result;
 
     // Read response body
     var total: usize = 0;
     while (total < CHUNK_SIZE) {
         var n: DWORD = 0;
-        if (fn_readData.?(hRequest, chunk_buf[total..].ptr, @intCast(CHUNK_SIZE - total), &n) == 0) break;
-        if (n == 0) break;
+        if (fn_readData.?(hRequest, chunk_buf[total..].ptr, @intCast(CHUNK_SIZE - total), &n) == 0) return result;
+        if (n == 0) { result.eof = true; break; }
         total += n;
     }
+    if (expected > 0 and total != expected) return result;
+    if (expected == 0 and !result.eof) return result;
+    result.bytes = total;
+    result.success = true;
+    // EOF terminates the response range, rather than the whole resource.
+    if (result.total > 0) result.eof = range_start + total == result.total;
+    return result;
+}
 
-    _ = fn_closeHandle.?(hRequest);
-    _ = fn_closeHandle.?(hConnect);
-    _ = fn_closeHandle.?(hSession);
+fn readHeader(request: HINTERNET, kind: DWORD, out: []u8) usize {
+    var wide: [128]u16 = undefined;
+    var size: DWORD = @sizeOf(@TypeOf(wide));
+    if (fn_queryHeaders.?(request, kind, null, &wide, &size, null) == 0) return 0;
+    var n: usize = 0;
+    while (n < wide.len and wide[n] != 0 and n < out.len) : (n += 1) {
+        if (wide[n] > 127) return 0;
+        out[n] = @intCast(wide[n]);
+    }
+    return n;
+}
 
-    return total;
+pub const ContentRange = struct { start: u64, end: u64, total: u64 };
+
+/// Parse the server's complete range metadata before accepting response bytes.
+pub fn parseContentRange(header: []const u8) ?ContentRange {
+    const prefix = "bytes ";
+    if (header.len <= prefix.len) return null;
+    for (prefix, 0..) |c, i| if (header[i] != c) return null;
+    var dash: usize = prefix.len;
+    while (dash < header.len and header[dash] != '-') : (dash += 1) {}
+    var slash = dash + 1;
+    while (slash < header.len and header[slash] != '/') : (slash += 1) {}
+    if (dash >= header.len or slash >= header.len) return null;
+    const start = parseDecimal(header[prefix.len..dash]) orelse return null;
+    const end = parseDecimal(header[dash + 1..slash]) orelse return null;
+    const total = parseDecimal(header[slash + 1..]) orelse return null;
+    if (end < start or total == 0 or end >= total) return null;
+    return .{ .start = start, .end = end, .total = total };
+}
+
+fn parseDecimal(s: []const u8) ?u64 {
+    if (s.len == 0) return null;
+    var n: u64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        const digit: u64 = c - '0';
+        if (n > (0xFFFFFFFFFFFFFFFF - digit) / 10) return null;
+        n = n * 10 + digit;
+    }
+    return n;
 }
 
 // ── URL parsing ──
 
-fn parseUrl(url_str: []const u8, host: *[256]u8, host_len: *usize, path: *[2048]u8, path_len: *usize, port: *u16) bool {
-    // Skip https://
-    var i: usize = 0;
-    if (url_str.len > 8 and url_str[0] == 'h') {
-        while (i < url_str.len and !(i > 0 and url_str[i - 1] == '/' and url_str[i - 2] == '/')) : (i += 1) {}
-    }
+fn parseUrl(url_str: []const u8, host: *[256]u8, host_len: *usize, path: *[9216]u8, path_len: *usize, port: *u16) bool {
+    const scheme = "https://";
+    if (url_str.len <= scheme.len) return false;
+    for (scheme, 0..) |c, j| if (url_str[j] != c) return false;
+    var i: usize = scheme.len;
 
     // Extract host (until / or :)
     host_len.* = 0;
-    while (i < url_str.len and url_str[i] != '/' and url_str[i] != ':' and host_len.* < 256) : (i += 1) {
+    while (i < url_str.len and url_str[i] != '/' and url_str[i] != ':') : (i += 1) {
+        if (host_len.* >= host.len - 1 or url_str[i] <= 32 or url_str[i] >= 127) return false;
         host[host_len.*] = url_str[i];
         host_len.* += 1;
     }
@@ -239,16 +356,21 @@ fn parseUrl(url_str: []const u8, host: *[256]u8, host_len: *usize, path: *[2048]
     port.* = 443;
     if (i < url_str.len and url_str[i] == ':') {
         i += 1;
-        port.* = 0;
+        var value: u32 = 0;
+        const start = i;
         while (i < url_str.len and url_str[i] >= '0' and url_str[i] <= '9') : (i += 1) {
-            port.* = port.* * 10 + @as(u16, url_str[i] - '0');
+            value = value * 10 + @as(u32, url_str[i] - '0');
+            if (value > 65535) return false;
         }
+        if (i == start or value == 0) return false;
+        port.* = @intCast(value);
     }
 
     // Path (everything from / onwards)
     path_len.* = 0;
     if (i < url_str.len and url_str[i] == '/') {
-        while (i < url_str.len and path_len.* < 2048) : (i += 1) {
+        while (i < url_str.len) : (i += 1) {
+            if (path_len.* >= path.len - 1 or url_str[i] < 32 or url_str[i] >= 127) return false;
             path[path_len.*] = url_str[i];
             path_len.* += 1;
         }
@@ -307,7 +429,10 @@ fn ensureHttp() bool {
     fn_readData = @ptrCast(GetProcAddress(dll, "WinHttpReadData"));
     fn_closeHandle = @ptrCast(GetProcAddress(dll, "WinHttpCloseHandle"));
     fn_addHeaders = @ptrCast(GetProcAddress(dll, "WinHttpAddRequestHeaders"));
-    if (fn_open == null or fn_sendReq == null) return false;
+    fn_queryHeaders = @ptrCast(GetProcAddress(dll, "WinHttpQueryHeaders"));
+    if (fn_open == null or fn_connect == null or fn_openReq == null or fn_sendReq == null or
+        fn_recvResp == null or fn_readData == null or fn_closeHandle == null or
+        fn_addHeaders == null or fn_queryHeaders == null) return false;
     http_loaded = true;
     return true;
 }

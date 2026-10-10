@@ -22,6 +22,29 @@ const manifest_mod = @import("manifest.sig");
 const stream_mod = @import("stream.sig");
 const mux_mod = @import("mux.sig");
 const url_mod = @import("url.sig");
+const minter = @import("botguard/minter.sig");
+const session_mod = @import("session.sig");
+const challenge_mod = @import("botguard/challenge.sig");
+const http = @import("../platform/http_session.sig");
+
+// Cold-start PO token for the current download (base64url). Minted from the
+// video id as content binding; YouTube accepts it while StreamProtectionStatus
+// is 2 (enough to fetch streams). Regenerated per audio() call.
+var g_pot_buf: [256]u8 = undefined;
+var g_pot_len: usize = 0;
+var g_stream_pot_buf: [256]u8 = undefined;
+var g_stream_pot_len: usize = 0;
+var g_session: session_mod.Session = session_mod.Session.init();
+var g_challenge: challenge_mod.Challenge = challenge_mod.Challenge.init();
+var g_player_copy: [innertube.RESPONSE_BUF_SIZE]u8 = undefined;
+
+pub const TokenSource = enum { none, cold_start, vm };
+var g_token_source: TokenSource = .none;
+const MediaKind = enum { audio, video };
+pub const DownloadOptions = struct {
+    require_vm_token: bool = false,
+    progress: stream_mod.ProgressFn = null,
+};
 
 // ── Win32 (for null-terminated path conversion) ──
 extern "kernel32" fn GetStdHandle(u32) ?*anyopaque;
@@ -54,6 +77,14 @@ pub const DownloadStatus = struct {
     codec: mux_mod.AudioCodecId,
     bitrate: u32,
     duration_sec: u32,
+    contains_video: bool = false,
+    contains_audio: bool = false,
+    token_source: TokenSource = .none,
+};
+pub const VideoDownloadStatus = struct {
+    video: DownloadStatus,
+    audio: DownloadStatus,
+    success: bool,
 };
 
 /// Download audio for a video by ID.
@@ -61,6 +92,14 @@ pub const DownloadStatus = struct {
 /// `output_path`: null-terminated file path
 /// `codec_pref`: preferred audio codec (.opus = best quality, .aac = most compatible)
 pub fn audio(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8, codec_pref: AudioCodec) DownloadStatus {
+    return downloadMedia(video_id, output_path, codec_pref, .audio, .{}, null, null);
+}
+
+pub fn audioWithOptions(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8, codec_pref: AudioCodec, options: DownloadOptions) DownloadStatus {
+    return downloadMedia(video_id, output_path, codec_pref, .audio, options, null, null);
+}
+
+fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8, codec_pref: AudioCodec, kind: MediaKind, options: DownloadOptions, audio_path: ?[*:0]const u8, audio_status_out: ?*DownloadStatus) DownloadStatus {
     var status = DownloadStatus{
         .success = false,
         .bytes_downloaded = 0,
@@ -72,35 +111,72 @@ pub fn audio(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8,
 
     print("  [download] Fetching player data...\n");
 
-    // Step 1: Get player response
-    // Try clients that DON'T require PO tokens first:
-    //   1. web_embedded — works for embeddable videos (most public videos)
-    //   2. android_vr — works except for "made for kids" videos
-    //   3. IOS — requires PO token but sometimes works
-    //   4. WEB — requires PO token, last resort
-    var resp = innertube.playerWebEmbed(video_id);
+    prepareTokens(video_id);
+    status.token_source = g_token_source;
+    if (options.require_vm_token and g_token_source != .vm) {
+        print("  [download] ERROR: VM token required and minting did not succeed\n");
+        return status;
+    }
+
+    // Both authenticated client routes carry this session's visitor and token.
+    var resp = playerInSession(video_id, false);
+    if (resp.len == 0 or findStr(resp, "streamingData") == null) {
+        print("  [download] session WEB: no streams, trying session IOS...\n");
+        resp = playerInSession(video_id, true);
+    }
+    if (resp.len == 0 or findStr(resp, "streamingData") == null) {
+        print("  [download] session WEB: no streams, trying web_embedded...\n");
+        resp = innertube.playerWebEmbed(video_id);
+    }
     if (resp.len == 0 or findStr(resp, "streamingData") == null) {
         print("  [download] web_embedded: no streams, trying android_vr...\n");
         resp = innertube.playerAndroidVr(video_id);
     }
     if (resp.len == 0 or findStr(resp, "streamingData") == null) {
-        print("  [download] android_vr: no streams, trying ios...\n");
+        print("  [download] android_vr: no streams. status=");
+        if (extractJsonString(resp, "\"status\"")) |st| { print(st); } else { print("?"); }
+        print(" reason=");
+        if (extractJsonString(resp, "\"reason\"")) |rs| { print(rs); } else { print("?"); }
+        print(" resp_len=");
+        printNum(@intCast(resp.len));
+        print(", trying ios...\n");
         resp = innertube.playerIos(video_id);
     }
+    if ((resp.len == 0 or findStr(resp, "streamingData") == null) and g_pot_len > 0) {
+        print("  [download] trying WEB with PO token...\n");
+        resp = innertube.playerWithPot(video_id, .web, g_pot_buf[0..g_pot_len]);
+    }
+    if ((resp.len == 0 or findStr(resp, "streamingData") == null) and g_pot_len > 0) {
+        print("  [download] trying TVHTML5_EMBED with PO token...\n");
+        resp = innertube.playerWithPot(video_id, .tv_embedded, g_pot_buf[0..g_pot_len]);
+    }
     if (resp.len == 0 or findStr(resp, "streamingData") == null) {
-        print("  [download] ios: no streams, trying web...\n");
+        print("  [download] web+pot: no streams, trying web (no pot)...\n");
         resp = innertube.player(video_id);
     }
-    var need_cipher = false;
     if (resp.len == 0) {
         print("  [download] ERROR: No player response from any client\n");
         return status;
     }
+    // Debug: if still no streamingData, dump the playability status / response head
+    // so we can see WHY YouTube refused (PO required, login, unplayable, etc.).
+    if (findStr(resp, "streamingData") == null) {
+        print("  [download] no streamingData. response head:\n    ");
+        const hlen = @min(resp.len, 400);
+        _ = WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), resp.ptr, @intCast(hlen), null, null);
+        print("\n");
+        if (extractJsonString(resp, "\"status\"")) |st| { print("  [download] playabilityStatus="); print(st); print("\n"); }
+        if (extractJsonString(resp, "\"reason\"")) |rs| { print("  [download] reason="); print(rs); print("\n"); }
+    }
 
     // Step 2: Check if we need cipher decryption
-    if (findStr(resp, "\"signatureCipher\"") != null) {
-        need_cipher = true;
-        print("  [download] Cipher-protected, loading player.js...\n");
+    if (findStr(resp, "\"signatureCipher\"") != null or findStr(resp, "&n=") != null or findStr(resp, "\\u0026n=") != null) {
+        // The watch-page helper shares InnerTube's response buffer. Preserve
+        // the chosen player response before using it for another request.
+        if (resp.len > g_player_copy.len) return status;
+        @memcpy(g_player_copy[0..resp.len], resp);
+        resp = g_player_copy[0..resp.len];
+        print("  [download] Loading player.js for signature/n transforms...\n");
 
         // Fetch watch page to get player.js URL
         const watch_page = innertube.fetchWatchPage(video_id);
@@ -125,9 +201,12 @@ pub fn audio(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8,
     }
 
     // Step 4: Select best audio stream
-    const best = manifest_mod.selectBestAudio(&formats, n_formats, codec_pref);
+    const best = if (kind == .video)
+        manifest_mod.selectBestMuxed(&formats, n_formats) orelse manifest_mod.selectBestVideo(&formats, n_formats)
+    else
+        manifest_mod.selectBestAudio(&formats, n_formats, codec_pref) orelse manifest_mod.selectBestMuxed(&formats, n_formats);
     if (best == null) {
-        print("  [download] ERROR: No audio stream found\n");
+        print(if (kind == .video) "  [download] ERROR: No video stream found\n" else "  [download] ERROR: No audio stream found\n");
         return status;
     }
     const fmt = best.?;
@@ -141,6 +220,8 @@ pub fn audio(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8,
     print(" bytes\n");
 
     status.bitrate = fmt.bitrate;
+    status.contains_video = fmt.is_video;
+    status.contains_audio = fmt.is_audio;
 
     // Step 5: Download the stream
     if (fmt.url_len == 0) {
@@ -148,27 +229,39 @@ pub fn audio(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8,
         return status;
     }
 
+    // Append the PO token to the stream URL (&pot=...) — required by GVS for the
+    // stream to serve full data (2026). Build the final URL in a local buffer.
+    var url_buf: [9216]u8 = undefined;
+    var url_final: []const u8 = fmt.url[0..fmt.url_len];
+    print("  [download] stream URL length=");
+    printNum(@intCast(fmt.url_len));
+    print("\n");
+    if (g_stream_pot_len > 0 and fmt.url_len + g_stream_pot_len + 8 < url_buf.len and findStr(fmt.url[0..fmt.url_len], "pot=") == null) {
+        var up: usize = 0;
+        @memcpy(url_buf[up .. up + fmt.url_len], fmt.url[0..fmt.url_len]);
+        up += fmt.url_len;
+        const amp = "&pot=";
+        @memcpy(url_buf[up .. up + amp.len], amp);
+        up += amp.len;
+        @memcpy(url_buf[up .. up + g_stream_pot_len], g_stream_pot_buf[0..g_stream_pot_len]);
+        up += g_stream_pot_len;
+        url_final = url_buf[0..up];
+        print("  [download] stream URL + &pot= appended\n");
+    }
+
     print("  [download] Downloading...\n");
     const dl_result = stream_mod.downloadToFile(
-        fmt.url[0..fmt.url_len],
+        url_final,
         output_path,
         fmt.content_length,
-        null, // no progress callback
+        options.progress,
     );
 
     status.bytes_downloaded = dl_result.bytes_written;
     status.success = dl_result.success;
 
     if (status.success) {
-        // Detect container type
-        const mime = fmt.mime_type[0..fmt.mime_len];
-        if (findStr(mime, "webm") != null) {
-            status.container = .webm;
-            status.codec = .opus;
-        } else if (findStr(mime, "mp4") != null) {
-            status.container = .mp4;
-            status.codec = .aac;
-        }
+        setContainer(fmt, &status);
 
         print("  [download] Complete: ");
         printNum(status.bytes_downloaded / 1024);
@@ -176,12 +269,78 @@ pub fn audio(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8,
     } else {
         print("  [download] FAILED after ");
         printNum(dl_result.retries);
-        print(" retries\n");
+        print(" retries (last HTTP status=");
+        printNum(stream_mod.last_status);
+        print(")\n");
+
+        // PO-exempt fallback: as of 2026, adaptive audio streams (opus/m4a)
+        // require a GVS PO token and 403 without one. The muxed itag 18 (360p
+        // MP4, video+audio) is still served WITHOUT a PO token. Its AAC audio
+        // track is fine for whisper transcription, so fall back to it.
+        if (manifest_mod.selectByItag(&formats, n_formats, 18)) |mux| {
+            print("  [download] Falling back to muxed itag=18 (PO-exempt)...\n");
+            print("  [download] itag=18 URL length=");
+            printNum(@intCast(mux.url_len));
+            print(", size=");
+            printNum(mux.content_length);
+            print("\n");
+            var m_buf: [9216]u8 = undefined;
+            var m_url: []const u8 = mux.url[0..mux.url_len];
+            if (g_stream_pot_len > 0 and mux.url_len + g_stream_pot_len + 8 < m_buf.len and findStr(mux.url[0..mux.url_len], "pot=") == null) {
+                var mp: usize = 0;
+                @memcpy(m_buf[mp .. mp + mux.url_len], mux.url[0..mux.url_len]);
+                mp += mux.url_len;
+                const amp = "&pot=";
+                @memcpy(m_buf[mp .. mp + amp.len], amp);
+                mp += amp.len;
+                @memcpy(m_buf[mp .. mp + g_stream_pot_len], g_stream_pot_buf[0..g_stream_pot_len]);
+                mp += g_stream_pot_len;
+                m_url = m_buf[0..mp];
+            }
+            const mux_result = stream_mod.downloadToFile(m_url, output_path, mux.content_length, options.progress);
+            status.bytes_downloaded = mux_result.bytes_written;
+            status.success = mux_result.success;
+            if (status.success) {
+                status.container = .mp4;
+                status.codec = .aac;
+                status.bitrate = mux.bitrate;
+                status.contains_video = mux.is_video;
+                status.contains_audio = mux.is_audio;
+                print("  [download] Complete (itag 18 muxed): ");
+                printNum(status.bytes_downloaded / 1024);
+                print(" KB\n");
+            } else {
+                print("  [download] itag 18 fallback also FAILED (HTTP status=");
+                printNum(stream_mod.last_status);
+                print(")\n");
+            }
+        }
     }
 
     // Extract duration from player response
     if (extractJsonString(resp, "\"lengthSeconds\"")) |dur_str| {
         status.duration_sec = parseUint(dur_str);
+    }
+
+    if (status.success and kind == .video and !status.contains_audio and audio_path != null and audio_status_out != null) {
+        if (manifest_mod.selectBestAudio(&formats, n_formats, .aac) orelse manifest_mod.selectBestAudio(&formats, n_formats, .any)) |audio_fmt| {
+            print("  [download] Downloading matching adaptive audio from the same player/session...\n");
+            var a_url: [9216]u8 = undefined;
+            const a_len = appendStreamToken(audio_fmt.url[0..audio_fmt.url_len], &a_url);
+            const a_result = stream_mod.downloadToFile(a_url[0..a_len], audio_path.?, audio_fmt.content_length, options.progress);
+            var a_status = DownloadStatus{
+                .success = a_result.success,
+                .bytes_downloaded = a_result.bytes_written,
+                .container = .unknown,
+                .codec = .unknown,
+                .bitrate = audio_fmt.bitrate,
+                .duration_sec = status.duration_sec,
+                .contains_audio = true,
+                .token_source = g_token_source,
+            };
+            setContainer(audio_fmt, &a_status);
+            audio_status_out.?.* = a_status;
+        }
     }
 
     return status;
@@ -203,10 +362,105 @@ pub fn audioByUrl(video_url: []const u8, output_path: [*:0]const u8, codec_pref:
     return audio(&video_id, output_path, codec_pref);
 }
 
-/// Download video (best quality audio + video muxed) — for future use.
-/// Currently downloads best audio only (video muxing requires container writing).
+/// Download the best video stream, preferring complete audio+video when present.
+/// Check contains_audio to distinguish a separate adaptive video track.
 pub fn video(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8) DownloadStatus {
-    return audio(video_id, output_path, .any);
+    return downloadMedia(video_id, output_path, .any, .video, .{}, null, null);
+}
+
+pub fn videoWithOptions(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8, options: DownloadOptions) DownloadStatus {
+    return downloadMedia(video_id, output_path, .any, .video, options, null, null);
+}
+
+/// Download both adaptive tracks using one player response, visitor session,
+/// and pair of PO tokens. A muxed format needs only the primary output file.
+pub fn videoWithAudio(video_id: *const [meta.VIDEO_ID_LEN]u8, video_path: [*:0]const u8, audio_path: [*:0]const u8, options: DownloadOptions) VideoDownloadStatus {
+    var audio_status = DownloadStatus{ .success = false, .bytes_downloaded = 0, .container = .unknown, .codec = .unknown, .bitrate = 0, .duration_sec = 0 };
+    const video_status = downloadMedia(video_id, video_path, .any, .video, options, audio_path, &audio_status);
+    return .{ .video = video_status, .audio = audio_status, .success = video_status.success and (video_status.contains_audio or audio_status.success) };
+}
+
+fn appendStreamToken(url: []const u8, out: []u8) usize {
+    if (url.len > out.len) return 0;
+    @memcpy(out[0..url.len], url);
+    if (g_stream_pot_len == 0 or findStr(url, "pot=") != null) return url.len;
+    if (url.len + g_stream_pot_len + 5 > out.len) return 0;
+    var n = appendS(out, url.len, "&pot=");
+    n = appendS(out, n, g_stream_pot_buf[0..g_stream_pot_len]);
+    return n;
+}
+
+fn setContainer(fmt: *const manifest_mod.StreamFormat, status: *DownloadStatus) void {
+    const mime = fmt.mime_type[0..fmt.mime_len];
+    if (findStr(mime, "webm") != null) status.container = .webm;
+    if (findStr(mime, "mp4") != null) status.container = .mp4;
+    if (findStr(mime, "opus") != null) status.codec = .opus;
+    if (findStr(mime, "mp4a") != null) status.codec = .aac;
+}
+
+fn prepareTokens(video_id: *const [meta.VIDEO_ID_LEN]u8) void {
+    g_pot_len = 0;
+    g_stream_pot_len = 0;
+    g_token_source = .none;
+    g_session = session_mod.Session.init();
+    g_challenge = challenge_mod.Challenge.init();
+    var integrity_result = session_mod.IntegrityResult{};
+    if (session_mod.establishIntegrityToken(&g_session, &g_challenge, &integrity_result)) {
+        const token = integrity_result.integrity_token[0..integrity_result.integrity_token_len];
+        g_pot_len = minter.mintContentBound(token, video_id, &g_pot_buf);
+        if (g_session.visitorData().len > 0)
+            g_stream_pot_len = minter.mintSessionBound(token, g_session.visitorData(), &g_stream_pot_buf);
+        if (g_pot_len > 0 and g_stream_pot_len > 0) {
+            g_token_source = .vm;
+            print("  [download] VM minted content and visitor PO tokens\n");
+            return;
+        }
+    }
+    g_pot_len = minter.mintColdStart(video_id, &g_pot_buf);
+    const binding = if (g_session.visitorData().len > 0) g_session.visitorData() else video_id[0..];
+    g_stream_pot_len = minter.mintColdStart(binding, &g_stream_pot_buf);
+    if (g_pot_len > 0 and g_stream_pot_len > 0) g_token_source = .cold_start;
+    print("  [download] VM integrity unavailable; trying cold-start tokens\n");
+}
+
+fn playerInSession(video_id: *const [meta.VIDEO_ID_LEN]u8, ios: bool) []const u8 {
+    if (!g_session.bootstrapped) return "";
+    var body: [4096]u8 = undefined;
+    var p: usize = 0;
+    const version = if (ios) "20.10.4" else if (g_session.clientVersion().len > 0) g_session.clientVersion() else "2.20250312.04.00";
+    p = appendS(&body, p, "{\"context\":{\"client\":{\"clientName\":\"");
+    p = appendS(&body, p, if (ios) "IOS" else "WEB");
+    p = appendS(&body, p, "\",\"clientVersion\":\"");
+    p = appendS(&body, p, version);
+    p = appendS(&body, p, "\",\"hl\":\"en\",\"gl\":\"US\",\"visitorData\":\"");
+    p = appendS(&body, p, g_session.visitorData());
+    p = appendS(&body, p, "\"");
+    if (ios) p = appendS(&body, p, ",\"deviceMake\":\"Apple\",\"deviceModel\":\"iPhone16,2\",\"osName\":\"iOS\",\"osVersion\":\"17.7.1\"");
+    p = appendS(&body, p, "}},\"videoId\":\"");
+    p = appendS(&body, p, video_id);
+    p = appendS(&body, p, "\",\"contentCheckOk\":true,\"racyCheckOk\":true,\"serviceIntegrityDimensions\":{\"poToken\":\"");
+    p = appendS(&body, p, g_pot_buf[0..g_pot_len]);
+    p = appendS(&body, p, "\"}}");
+    var headers: [4096]u8 = undefined;
+    var h: usize = 0;
+    h = appendS(&headers, h, "Content-Type: application/json\r\nOrigin: https://www.youtube.com\r\nReferer: https://www.youtube.com/watch?v=");
+    h = appendS(&headers, h, video_id);
+    h = appendS(&headers, h, "\r\nX-Youtube-Client-Name: ");
+    h = appendS(&headers, h, if (ios) "5" else "1");
+    h = appendS(&headers, h, "\r\nX-Youtube-Client-Version: ");
+    h = appendS(&headers, h, version);
+    h = appendS(&headers, h, "\r\nX-Goog-Visitor-Id: ");
+    h = appendS(&headers, h, g_session.visitorData());
+    h = appendS(&headers, h, "\r\n");
+    const ios_ua = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 17_7_1 like Mac OS X;)";
+    const response = http.request(.post, "www.youtube.com", 443, "/youtubei/v1/player?prettyPrint=false", headers[0..h], body[0..p], &g_session.jar, if (ios) ios_ua else http.CHROME_UA);
+    return if (response.ok) response.body else "";
+}
+
+fn appendS(buf: []u8, pos: usize, s: []const u8) usize {
+    const n = @min(s.len, buf.len - pos);
+    @memcpy(buf[pos..pos + n], s[0..n]);
+    return pos + n;
 }
 
 // ── Helpers ──
