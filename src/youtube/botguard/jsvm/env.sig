@@ -162,6 +162,13 @@ fn installDocument(global: u32) void {
     setNativeMethod(doc, "createTextNode", builtins.N_DOM_CREATE_ELEMENT);
     setNativeMethod(doc, "createComment", builtins.N_DOM_CREATE_ELEMENT);
     setNativeMethod(doc, "createDocumentFragment", builtins.N_DOM_CREATE_ELEMENT);
+    // document.createEvent(type) -> a generic event-like object. BotGuard's live
+    // interpreter probes `document.createEvent('...')` then reads/inits it; a
+    // missing method made the result undefined → "Cannot read properties of
+    // undefined" cascades that inflate the snapshot payload. Returning the generic
+    // element object (which carries the common method surface) keeps those probes
+    // on the happy path, same rationale as createElement/createTextNode.
+    setNativeMethod(doc, "createEvent", builtins.N_DOM_CREATE_ELEMENT);
 
     // createElement returns a generic element object (with style/getContext/etc)
     // so BotGuard's canvas/DOM feature paths run instead of hitting undefined.

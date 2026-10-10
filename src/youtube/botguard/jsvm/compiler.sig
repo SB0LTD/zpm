@@ -168,6 +168,10 @@ pub const FuncDesc = struct {
     is_arrow: bool = false,
     is_async: bool = false,
     is_generator: bool = false,
+    // Implicit arguments is reserved after formals but instantiated only when
+    // referenced/captured or exposed to direct eval. Arrows inherit it.
+    arguments_slot: u16 = 0xFFFF,
+    arguments_mapped: bool = true,
     // Persisted local-name table (offset+count into name_tab_pool) so a DIRECT
     // eval can resolve free identifiers against the caller frame's locals by
     // name at runtime (JS direct-eval scope inheritance).
@@ -347,6 +351,9 @@ var func_upval_count: [MAX_FUNC_NEST]u16 = undefined;
 // Per-nesting-level flag: the function at this level contains a DIRECT eval, so
 // it must capture its FULL enclosing lexical scope (see compileCall/compileFunctionBody).
 var func_has_eval: [MAX_FUNC_NEST]bool = [_]bool{false} ** MAX_FUNC_NEST;
+var func_arguments_slot: [MAX_FUNC_NEST]u16 = [_]u16{0xFFFF} ** MAX_FUNC_NEST;
+var func_uses_arguments: [MAX_FUNC_NEST]bool = [_]bool{false} ** MAX_FUNC_NEST;
+var func_strict: [MAX_FUNC_NEST]bool = [_]bool{false} ** MAX_FUNC_NEST;
 // Peak `local_count` reached while compiling each nesting level. Block-scoped
 // locals (let/const) get popped by endScope, lowering local_count, but their
 // slot indices were already baked into get_local/set_local. The frame MUST
@@ -372,10 +379,24 @@ var func_upval_desc_count: [MAX_FUNCTIONS]u16 = undefined;
 
 // Break/continue patch lists
 var break_patches: [MAX_BREAKS]u32 = undefined;
+var break_labels: [MAX_BREAKS]u16 = undefined;
 var break_count: u16 = 0;
 var continue_patches: [MAX_CONTINUES]u32 = undefined;
+var continue_labels: [MAX_CONTINUES]u16 = undefined;
 var continue_count: u16 = 0;
 var loop_start: u32 = 0; // bytecode offset of current loop start
+const NO_LABEL: u16 = 0xFFFF;
+const LabelScope = struct { name: u32, loop_node: NodeIdx, iter_depth: u16, operand_depth: u16 };
+var label_scopes: [128]LabelScope = undefined;
+var label_count: u16 = 0;
+var label_base: u16 = 0;
+var compiling_loop_node: NodeIdx = NULL_NODE;
+var control_iter_depth: u16 = 0;
+var control_operand_depth: u16 = 0;
+var break_iter_depth: u16 = 0;
+var break_operand_depth: u16 = 0;
+var continue_iter_depth: u16 = 0;
+var continue_operand_depth: u16 = 0;
 
 // When compiling an eval body, expression statements store their result into
 // the VM completion register (via set_completion) instead of discarding it, so
@@ -432,11 +453,19 @@ pub fn compile(root: NodeIdx) u32 {
     continue_count = 0;
     loop_start = 0;
     func_depth = 0;
+    label_count = 0;
+    label_base = 0;
+    compiling_loop_node = NULL_NODE;
+    control_iter_depth = 0;
+    control_operand_depth = 0;
     cur_func = 0;
     func_ctx_local_base[0] = 0;
     func_upval_count[0] = 0;
     func_local_peak[0] = 0;
     func_has_eval[0] = false;
+    func_arguments_slot[0] = 0xFFFF;
+    func_uses_arguments[0] = false;
+    func_strict[0] = false;
     had_error = false;
 
     compileNode(root);
@@ -467,6 +496,11 @@ pub fn compileEval(root: NodeIdx, caller_func: u16) u32 {
     continue_count = 0;
     loop_start = 0;
     eval_mode = true;
+    label_count = 0;
+    label_base = 0;
+    compiling_loop_node = NULL_NODE;
+    control_iter_depth = 0;
+    control_operand_depth = 0;
     // eval body is its own top-level context: locals begin at 0. Its "upvalues"
     // are DIRECT-EVAL caller-scope captures (bound to the live caller frame by
     // the VM), accumulated in func_upvals[0] during this compile.
@@ -475,6 +509,9 @@ pub fn compileEval(root: NodeIdx, caller_func: u16) u32 {
     func_upval_count[0] = 0;
     func_local_peak[0] = 0;
     func_has_eval[0] = false;
+    func_arguments_slot[0] = 0xFFFF;
+    func_uses_arguments[0] = false;
+    func_strict[0] = false;
     // Enable caller-scope resolution when a real caller func is known and it has
     // a persisted local-name table (i.e. it is a compiled function, not the
     // top-level/sentinel). A DIRECT eval inherits the caller's lexical scope.
@@ -657,17 +694,13 @@ fn compileNode(idx: NodeIdx) void {
         .func_decl => compileFuncDecl(node),
         .class_decl => compileClassDecl(node),
         .if_stmt => compileIf(node),
-        .for_stmt => compileFor(node),
-        .for_in_stmt => compileForIn(node),
-        .for_of_stmt => compileForOf(node),
-        .while_stmt => compileWhile(node),
-        .do_while_stmt => compileDoWhile(node),
-        .switch_stmt => compileSwitch(node),
+        .for_stmt, .for_in_stmt, .for_of_stmt, .while_stmt, .do_while_stmt => compileIteration(idx, node),
+        .switch_stmt => compileSwitchScope(node),
         .try_stmt => compileTry(node),
         .return_stmt => compileReturn(node),
         .throw_stmt => compileThrow(node),
-        .break_stmt => compileBreak(),
-        .continue_stmt => compileContinue(),
+        .break_stmt => compileBreak(node),
+        .continue_stmt => compileContinue(node),
         .expr_stmt => compileExprStmt(node),
         .empty_stmt => {},
         .debugger_stmt => emitOp(.debugger_op),
@@ -1205,18 +1238,47 @@ fn compileThrow(node: Node) void {
     emitOp(.throw_op);
 }
 
-fn compileBreak() void {
-    if (break_count < MAX_BREAKS) {
-        break_patches[break_count] = emitJump(.jump);
-        break_count += 1;
+fn jumpLabel(node: Node, is_continue: bool) u16 {
+    const tok = lexer.getToken(node.token_idx);
+    if (tok.tt != .identifier) return NO_LABEL;
+    const name = values.internString(lexer.tokenText(tok));
+    var i = label_count;
+    while (i > label_base) {
+        i -= 1;
+        if (label_scopes[i].name != name) continue;
+        if (is_continue and label_scopes[i].loop_node == NULL_NODE) had_error = true;
+        return i;
     }
+    had_error = true;
+    return NO_LABEL;
 }
 
-fn compileContinue() void {
+fn compileBreak(node: Node) void {
+    const label = jumpLabel(node, false);
+    if (had_error) return;
+    emitJumpCleanup(if (label == NO_LABEL) break_iter_depth else label_scopes[label].iter_depth, if (label == NO_LABEL) break_operand_depth else label_scopes[label].operand_depth);
+    if (break_count < MAX_BREAKS) {
+        break_patches[break_count] = emitJump(.jump);
+        break_labels[break_count] = label;
+        break_count += 1;
+    } else had_error = true;
+}
+
+fn compileContinue(node: Node) void {
+    const label = jumpLabel(node, true);
+    if (had_error) return;
+    var keep_iter = continue_iter_depth;
+    if (label != NO_LABEL) {
+        const scope = label_scopes[label];
+        const tag = parser.getNode(scope.loop_node).tag;
+        keep_iter = scope.iter_depth + @as(u16, if (tag == .for_in_stmt or tag == .for_of_stmt) 1 else 0);
+    }
+    emitJumpCleanup(keep_iter, if (label == NO_LABEL) continue_operand_depth else label_scopes[label].operand_depth);
     if (continue_count < MAX_CONTINUES) {
         continue_patches[continue_count] = emitJump(.jump);
+        continue_labels[continue_count] = label;
         continue_count += 1;
-    }
+    } else had_error = true;
 }
 
 fn compileExprStmt(node: Node) void {
@@ -1231,16 +1293,68 @@ fn compileExprStmt(node: Node) void {
 }
 
 fn compileLabelStmt(node: Node) void {
-    // A labeled statement (`LABEL: stmt`) is a `break` target. `break LABEL`
-    // (and, for a labeled block, a bare labeled break) must jump to the point
-    // *after* the labeled statement. Establish a break scope so any break
-    // emitted inside that is not consumed by a nested loop/switch is patched
-    // to land here. For labeled LOOPS this is a no-op superset: the loop
-    // already patches its own breaks to just past its body, and label-directed
-    // breaks resolve to the same exit point.
+    // Named breaks remain pending through nested loops/switches until their
+    // actual label exits. Chained labels share the same iteration target.
+    if (label_count >= label_scopes.len) { had_error = true; return; }
+    var body_idx = node.left;
+    while (parser.getNode(body_idx).tag == .label_stmt) body_idx = parser.getNode(body_idx).left;
+    const body_tag = parser.getNode(body_idx).tag;
+    const iteration = body_tag == .for_stmt or body_tag == .for_in_stmt or body_tag == .for_of_stmt or body_tag == .while_stmt or body_tag == .do_while_stmt;
+    const scope = label_count;
+    label_scopes[scope] = .{ .name = values.internString(lexer.tokenText(lexer.getToken(node.token_idx))), .loop_node = if (iteration) body_idx else NULL_NODE, .iter_depth = control_iter_depth, .operand_depth = control_operand_depth };
+    label_count += 1;
     const saved_breaks = break_count;
     compileNode(node.left);
-    patchBreaks(saved_breaks);
+    patchLabelBreaks(saved_breaks, scope);
+    label_count -= 1;
+}
+
+fn compileIteration(idx: NodeIdx, node: Node) void {
+    const saved = compiling_loop_node;
+    const saved_break_iter = break_iter_depth;
+    const saved_break_operand = break_operand_depth;
+    const saved_continue_iter = continue_iter_depth;
+    const saved_continue_operand = continue_operand_depth;
+    compiling_loop_node = idx;
+    break_iter_depth = control_iter_depth;
+    break_operand_depth = control_operand_depth;
+    const uses_iter = node.tag == .for_in_stmt or node.tag == .for_of_stmt;
+    if (uses_iter) control_iter_depth += 1;
+    continue_iter_depth = control_iter_depth;
+    continue_operand_depth = control_operand_depth;
+    switch (node.tag) {
+        .for_stmt => compileFor(node),
+        .for_in_stmt => compileForIn(node),
+        .for_of_stmt => compileForOf(node),
+        .while_stmt => compileWhile(node),
+        .do_while_stmt => compileDoWhile(node),
+        else => {},
+    }
+    if (uses_iter) control_iter_depth -= 1;
+    compiling_loop_node = saved;
+    break_iter_depth = saved_break_iter;
+    break_operand_depth = saved_break_operand;
+    continue_iter_depth = saved_continue_iter;
+    continue_operand_depth = saved_continue_operand;
+}
+
+fn compileSwitchScope(node: Node) void {
+    const saved_break_iter = break_iter_depth;
+    const saved_break_operand = break_operand_depth;
+    break_iter_depth = control_iter_depth;
+    break_operand_depth = control_operand_depth;
+    control_operand_depth += 1; // discriminant retained during case bodies
+    compileSwitch(node);
+    control_operand_depth -= 1;
+    break_iter_depth = saved_break_iter;
+    break_operand_depth = saved_break_operand;
+}
+
+fn emitJumpCleanup(keep_iter: u16, keep_operand: u16) void {
+    var i = keep_iter;
+    while (i < control_iter_depth) : (i += 1) emitOp(.iter_close);
+    i = keep_operand;
+    while (i < control_operand_depth) : (i += 1) emitOp(.pop);
 }
 
 fn compileWithStmt(node: Node) void {
@@ -2048,6 +2162,22 @@ fn hoistVars(node_idx: NodeIdx) void {
     }
 }
 
+fn bodyHasStrictDirective(body_idx: NodeIdx) bool {
+    if (body_idx == NULL_NODE) return false;
+    const body = parser.getNode(body_idx);
+    if (body.tag != .block) return false;
+    const stmts = parser.getList(body.left, @intCast(body.right));
+    for (stmts) |stmt_idx| {
+        const stmt = parser.getNode(stmt_idx);
+        if (stmt.tag != .expr_stmt or stmt.left == NULL_NODE) break;
+        const expr = parser.getNode(stmt.left);
+        if (expr.tag != .literal_str) break;
+        const raw = lexer.tokenText(lexer.getToken(expr.token_idx));
+        if (eql(raw, "\"use strict\"") or eql(raw, "'use strict'")) return true;
+    }
+    return false;
+}
+
 fn compileFunctionBody(node: Node) u16 {
     if (n_functions >= MAX_FUNCTIONS) { had_error = true; return 0; }
     const func_id = n_functions;
@@ -2070,6 +2200,9 @@ fn compileFunctionBody(node: Node) u16 {
     func_upval_count[cur_func] = 0;
     func_local_peak[cur_func] = local_base;
     func_has_eval[cur_func] = false;
+    func_arguments_slot[cur_func] = 0xFFFF;
+    func_uses_arguments[cur_func] = false;
+    func_strict[cur_func] = func_strict[cur_func - 1] or bodyHasStrictDirective(node.right);
     scope_depth = 0;
     func_depth += 1;
     // Function bodies use normal expression-statement semantics (pop), even
@@ -2085,8 +2218,14 @@ fn compileFunctionBody(node: Node) u16 {
     const saved_breaks = break_count;
     const saved_continues = continue_count;
     const saved_loop_start = loop_start;
-    break_count = 0;
-    continue_count = 0;
+    const saved_label_base = label_base;
+    const saved_loop_node = compiling_loop_node;
+    const saved_jump_depths = [6]u16{ control_iter_depth, control_operand_depth, break_iter_depth, break_operand_depth, continue_iter_depth, continue_operand_depth };
+    label_base = label_count;
+    compiling_loop_node = NULL_NODE;
+    control_iter_depth = 0; control_operand_depth = 0;
+    break_iter_depth = 0; break_operand_depth = 0;
+    continue_iter_depth = 0; continue_operand_depth = 0;
     loop_start = 0;
 
     // The function body is emitted inline. Jump over it so that sequential
@@ -2094,7 +2233,9 @@ fn compileFunctionBody(node: Node) u16 {
     // the body is only entered via a call frame at code_start.
     const skip = emitJump(.jump);
 
-    // First local is 'this' (or arguments in non-arrow)
+    // Actual arguments begin after this. Reserve the ordinary function's
+    // implicit binding before compiling nested closures so arrows can capture
+    // it. The VM creates the object only when this binding is actually used.
     declareLocalDirect("this");
 
     // Params
@@ -2102,6 +2243,10 @@ fn compileFunctionBody(node: Node) u16 {
     const params = parser.getList(node.extra, @intCast(param_count));
     for (params) |p| {
         declareLocal(p);
+    }
+    if (resolveLocal("arguments") == null) {
+        declareLocalDirect("arguments");
+        func_arguments_slot[cur_func] = lastLocalSlot();
     }
 
     // Function body start in bytecode (entry point for calls).
@@ -2182,6 +2327,8 @@ fn compileFunctionBody(node: Node) u16 {
         .is_arrow = (node.tag == .arrow_expr),
         .is_async = node.flags.is_async,
         .is_generator = node.flags.is_generator,
+        .arguments_slot = if (func_uses_arguments[cur_func] or func_has_eval[cur_func]) func_arguments_slot[cur_func] else 0xFFFF,
+        .arguments_mapped = !func_strict[cur_func],
         .name_tab_start = nt_start,
         .name_tab_count = nt_count,
     };
@@ -2235,6 +2382,11 @@ fn compileFunctionBody(node: Node) u16 {
     break_count = saved_breaks;
     continue_count = saved_continues;
     loop_start = saved_loop_start;
+    label_base = saved_label_base;
+    compiling_loop_node = saved_loop_node;
+    control_iter_depth = saved_jump_depths[0]; control_operand_depth = saved_jump_depths[1];
+    break_iter_depth = saved_jump_depths[2]; break_operand_depth = saved_jump_depths[3];
+    continue_iter_depth = saved_jump_depths[4]; continue_operand_depth = saved_jump_depths[5];
     _ = saved_locals;
     _ = saved_bc;
 
@@ -2255,6 +2407,9 @@ fn compileArrowBody(node: Node) u16 {
     func_upval_count[cur_func] = 0;
     func_local_peak[cur_func] = local_base;
     func_has_eval[cur_func] = false;
+    func_arguments_slot[cur_func] = 0xFFFF;
+    func_uses_arguments[cur_func] = false;
+    func_strict[cur_func] = func_strict[cur_func - 1] or bodyHasStrictDirective(node.right);
     scope_depth = 0;
     func_depth += 1;
     const saved_eval_mode = eval_mode;
@@ -2263,8 +2418,14 @@ fn compileArrowBody(node: Node) u16 {
     const saved_breaks = break_count;
     const saved_continues = continue_count;
     const saved_loop_start = loop_start;
-    break_count = 0;
-    continue_count = 0;
+    const saved_label_base = label_base;
+    const saved_loop_node = compiling_loop_node;
+    const saved_jump_depths = [6]u16{ control_iter_depth, control_operand_depth, break_iter_depth, break_operand_depth, continue_iter_depth, continue_operand_depth };
+    label_base = label_count;
+    compiling_loop_node = NULL_NODE;
+    control_iter_depth = 0; control_operand_depth = 0;
+    break_iter_depth = 0; break_operand_depth = 0;
+    continue_iter_depth = 0; continue_operand_depth = 0;
     loop_start = 0;
 
     // Jump over the inline body so surrounding execution doesn't fall through.
@@ -2384,6 +2545,11 @@ fn compileArrowBody(node: Node) u16 {
     break_count = saved_breaks;
     continue_count = saved_continues;
     loop_start = saved_loop_start;
+    label_base = saved_label_base;
+    compiling_loop_node = saved_loop_node;
+    control_iter_depth = saved_jump_depths[0]; control_operand_depth = saved_jump_depths[1];
+    break_iter_depth = saved_jump_depths[2]; break_operand_depth = saved_jump_depths[3];
+    continue_iter_depth = saved_jump_depths[4]; continue_operand_depth = saved_jump_depths[5];
     _ = saved_locals;
     return func_id;
 }
@@ -2522,7 +2688,11 @@ fn resolveLocal(name: []const u8) ?u16 {
         i -= 1;
         const local = locals[i];
         const local_name = localName(local);
-        if (eql(local_name, name)) return i - base;
+        if (eql(local_name, name)) {
+            const slot = i - base;
+            if (eql(name, "arguments") and slot == func_arguments_slot[cur_func]) func_uses_arguments[cur_func] = true;
+            return slot;
+        }
     }
     return null;
 }
@@ -2562,6 +2732,7 @@ fn resolveUpvalue(name: []const u8, level: u16) ?u16 {
         if (eql(local_name, name)) {
             locals[i].is_captured = true;
             const rel: u16 = i - enc_base; // enclosing frame-relative slot
+            if (eql(name, "arguments") and rel == func_arguments_slot[enclosing]) func_uses_arguments[enclosing] = true;
             return addUpvalueNamed(level, rel, true, values.internString(name));
         }
     }
@@ -2790,17 +2961,43 @@ fn emitLoop(target: u32) void {
 }
 
 fn patchBreaks(saved: u16) void {
-    while (break_count > saved) {
-        break_count -= 1;
-        patchJump(break_patches[break_count]);
+    var read = saved;
+    var write = saved;
+    while (read < break_count) : (read += 1) {
+        if (break_labels[read] == NO_LABEL) patchJump(break_patches[read]) else {
+            break_patches[write] = break_patches[read];
+            break_labels[write] = break_labels[read];
+            write += 1;
+        }
     }
+    break_count = write;
+}
+
+fn patchLabelBreaks(saved: u16, label: u16) void {
+    var read = saved;
+    var write = saved;
+    while (read < break_count) : (read += 1) {
+        if (break_labels[read] == label) patchJump(break_patches[read]) else {
+            break_patches[write] = break_patches[read];
+            break_labels[write] = break_labels[read];
+            write += 1;
+        }
+    }
+    break_count = write;
 }
 
 fn patchContinues(saved: u16, target: u32) void {
-    while (continue_count > saved) {
-        continue_count -= 1;
-        patchJumpTo(continue_patches[continue_count], target);
+    var read = saved;
+    var write = saved;
+    while (read < continue_count) : (read += 1) {
+        const label = continue_labels[read];
+        if (label == NO_LABEL or label_scopes[label].loop_node == compiling_loop_node) patchJumpTo(continue_patches[read], target) else {
+            continue_patches[write] = continue_patches[read];
+            continue_labels[write] = continue_labels[read];
+            write += 1;
+        }
     }
+    continue_count = write;
 }
 
 // ── Constant Pool ──

@@ -104,6 +104,15 @@ fn fetchOnce(u: url_mod.Url, req: *const Request, bufs: Buffers, now: i64, keep_
     return resp;
 }
 
+/// Bounded URL storage for one-shot requests and each redirect hop.
+pub const MAX_URL_BYTES: usize = 8192;
+
+fn copyUrl(raw: []const u8, out: []u8) Error!usize {
+    if (raw.len > out.len) return Error.InvalidUrl;
+    @memcpy(out[0..raw.len], raw);
+    return raw.len;
+}
+
 /// One-shot fetch: resolve, connect, (TLS), request, response, cookies, close.
 /// Follows redirects up to req.max_redirects and retries transient failures
 /// per req.retry. `now` is Unix seconds for cert validity. Allocation-free.
@@ -111,10 +120,8 @@ pub fn fetch(req: Request, bufs: Buffers, now: i64) Error!Response {
     if (req.trace) |t| t.* = .{};
 
     // Mutable current-request state across redirects.
-    var cur_url_buf: [2048]u8 = undefined;
-    var cur_url_len: usize = req.url.len;
-    if (req.url.len > cur_url_buf.len) return Error.InvalidUrl;
-    @memcpy(cur_url_buf[0..req.url.len], req.url);
+    var cur_url_buf: [MAX_URL_BYTES]u8 = undefined;
+    var cur_url_len = try copyUrl(req.url, &cur_url_buf);
 
     var cur = req; // copy; we mutate method/body/url across hops
     var redirects: u8 = 0;
@@ -134,7 +141,7 @@ pub fn fetch(req: Request, bufs: Buffers, now: i64) Error!Response {
             if (redirect.isRedirect(resp.status)) {
                 if (redirects >= cur.max_redirects) return Error.TooManyRedirects;
                 const loc = resp.header("location") orelse return resp; // 3xx without Location: hand back
-                var next_buf: [2048]u8 = undefined;
+                var next_buf: [MAX_URL_BYTES]u8 = undefined;
                 const next = redirect.resolveLocation(u, cur_raw, loc, &next_buf) catch return Error.BadResponse;
                 // Parse target to enforce scheme policy.
                 var nhb: [256]u8 = undefined;
@@ -147,9 +154,7 @@ pub fn fetch(req: Request, bufs: Buffers, now: i64) Error!Response {
                 cur.method = rw.method;
                 if (rw.drop_body) { cur.body = ""; cur.content_type = ""; }
                 // Adopt the new URL.
-                if (next.len > cur_url_buf.len) return Error.InvalidUrl;
-                @memcpy(cur_url_buf[0..next.len], next);
-                cur_url_len = next.len;
+                cur_url_len = try copyUrl(next, &cur_url_buf);
                 redirects += 1;
                 if (req.trace) |t| t.redirects = redirects;
                 continue;
@@ -327,4 +332,29 @@ test "client: fresh Client is not connected" {
     const c = Client{};
     try testing.expect(!c.connected);
     try testing.expectEqual(@as(usize, 0), c.host_len);
+}
+
+test "client: long signed CDN URL survives fetch storage and redirect" {
+    const prefix = "https://r1.googlevideo.com/videoplayback?n=";
+    var raw: [3072]u8 = undefined;
+    @memcpy(raw[0..prefix.len], prefix);
+    @memset(raw[prefix.len..], 'a');
+    var current: [MAX_URL_BYTES]u8 = undefined;
+    const n = try copyUrl(&raw, &current);
+    var host: [256]u8 = undefined;
+    const u = try url_mod.Url.parse(current[0..n], &host);
+    var next: [MAX_URL_BYTES]u8 = undefined;
+    const target = try redirect.resolveLocation(u, current[0..n], current[0..n], &next);
+    try testing.expectEqualSlices(u8, &raw, target);
+    // The caller's request-head capacity is independent and remains enforced.
+    var head: [4096]u8 = undefined;
+    const serialized = try request.serializeHead(&head, u, .{ .url = current[0..n] }, false);
+    try testing.expect(std.mem.indexOf(u8, serialized, raw[prefix.len..]) != null);
+}
+
+test "client: oversized URL is rejected before network or truncated copy" {
+    const raw = [_]u8{'a'} ** (MAX_URL_BYTES + 1);
+    var current: [MAX_URL_BYTES]u8 = [_]u8{0} ** MAX_URL_BYTES;
+    try testing.expectError(Error.InvalidUrl, copyUrl(&raw, &current));
+    try testing.expectEqual(@as(u8, 0), current[0]);
 }

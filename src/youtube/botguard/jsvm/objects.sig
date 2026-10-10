@@ -76,6 +76,7 @@ pub const Object = struct {
     elem_size: u8 = 1, // 1, 2, or 4
     is_frozen: bool = false,
     is_sealed: bool = false,
+    is_arguments: bool = false,
     // Debug: tags environment objects (navigator/document/window/screen/
     // location/canvas/webgl contexts) so the VM can record which properties
     // BotGuard probes on them that our env doesn't implement (fingerprint leaks).
@@ -91,6 +92,8 @@ pub const Property = struct {
     value: Value = Value.UNDEFINED,
     next: u32 = NULL_PROP, // next property in this object, or NULL_PROP
     flags: PropFlags = .{},
+    // Non-strict arguments indexes can alias a parameter's shared cell.
+    mapped_cell: u32 = NO_CELL,
 };
 
 pub const PropFlags = packed struct(u8) {
@@ -156,6 +159,41 @@ var cell_addr: [MAX_UPVAL_CELLS]u32 = undefined;   // open: live stack addr, els
 var cell_val: [MAX_UPVAL_CELLS]Value = undefined;  // closed: snapshot value
 var cell_closed: [MAX_UPVAL_CELLS]bool = undefined;
 var n_cells: u32 = 0;
+// The VM lends its fixed operand/local storage. This keeps the object layer
+// independent of the interpreter while mapped arguments share live locals.
+var runtime_stack: []Value = &.{};
+
+pub fn bindRuntimeStack(storage: []Value) void {
+    runtime_stack = storage;
+}
+
+fn propertyValue(prop: *const Property) Value {
+    const ci = prop.mapped_cell;
+    if (ci == NO_CELL or ci >= n_cells) return prop.value;
+    if (cell_closed[ci]) return cell_val[ci];
+    const addr = cell_addr[ci];
+    return if (addr < runtime_stack.len) runtime_stack[addr] else prop.value;
+}
+
+fn writePropertyValue(prop: *Property, value: Value) void {
+    prop.value = value;
+    const ci = prop.mapped_cell;
+    if (ci == NO_CELL or ci >= n_cells) return;
+    if (cell_closed[ci]) cell_val[ci] = value
+    else if (cell_addr[ci] < runtime_stack.len) runtime_stack[cell_addr[ci]] = value;
+}
+
+/// Alias an existing own data property to a formal parameter's shared cell.
+pub fn bindMappedProperty(obj_idx: u32, name_idx: u32, addr: u32) void {
+    if (obj_idx >= n_objects or addr >= runtime_stack.len) return;
+    var p = objects[obj_idx].prop_head;
+    while (p != NULL_PROP) : (p = properties[p].next) {
+        const prop = &properties[p];
+        if (prop.name_idx != name_idx) continue;
+        if (!prop.flags.is_getter and !prop.flags.is_setter and prop.flags.writable) prop.mapped_cell = openCellFor(addr);
+        return;
+    }
+}
 // Compact list of currently-OPEN cell indices so sibling-closure sharing scans
 // only live cells (bounded by live captures), not every cell ever allocated.
 var open_cells: [MAX_UPVAL_CELLS]u32 = undefined;
@@ -554,6 +592,14 @@ pub fn getObject(idx: u32) *Object {
     return &objects[idx];
 }
 
+pub fn markArguments(obj_idx: u32) void {
+    if (obj_idx < n_objects) objects[obj_idx].is_arguments = true;
+}
+
+pub fn isArguments(obj_idx: u32) bool {
+    return obj_idx < n_objects and objects[obj_idx].is_arguments;
+}
+
 /// Debug: tag an object as an environment (browser) object for fingerprint
 /// probing. See vm.dbg_fp_probe.
 pub fn dbgMarkEnvObject(idx: u32) void {
@@ -588,7 +634,7 @@ pub fn setProperty(obj_idx: u32, name_idx: u32, val: Value) void {
     while (p != NULL_PROP) {
         if (properties[p].name_idx == name_idx) {
             dbgGuardCheck2(p, obj_idx, name_idx, val, 1);
-            if (properties[p].flags.writable) properties[p].value = val;
+            if (properties[p].flags.writable) writePropertyValue(&properties[p], val);
             return;
         }
         p = properties[p].next;
@@ -736,6 +782,7 @@ pub fn setGetterProperty(obj_idx: u32, name_idx: u32, getter: Value) void {
         if (properties[p].name_idx == name_idx) {
             dbgGuardCheck2(p, obj_idx, name_idx, getter, 3);
             properties[p].value = getter;
+            properties[p].mapped_cell = NO_CELL;
             properties[p].flags.is_getter = true;
             return;
         }
@@ -841,12 +888,40 @@ pub fn getProperty(obj_idx: u32, name_idx: u32) Value {
         if (current >= n_objects) return Value.UNDEFINED;
         var p: u32 = objects[current].prop_head;
         while (p != NULL_PROP) {
-            if (properties[p].name_idx == name_idx) return properties[p].value;
+            if (properties[p].name_idx == name_idx) return propertyValue(&properties[p]);
             p = properties[p].next;
         }
         current = objects[current].prototype;
     }
     return Value.UNDEFINED;
+}
+
+/// Copy an own descriptor, resolving mapped arguments to their current value.
+/// Reflecting the property never detaches its parameter alias.
+pub fn ownPropertyDescriptor(obj_idx: u32, name_idx: u32, out: *Property) bool {
+    if (obj_idx >= n_objects) return false;
+    var p = objects[obj_idx].prop_head;
+    while (p != NULL_PROP) : (p = properties[p].next) {
+        if (properties[p].name_idx != name_idx) continue;
+        out.* = properties[p];
+        out.value = propertyValue(&properties[p]);
+        return true;
+    }
+    const obj = &objects[obj_idx];
+    if (obj.obj_type == .array) {
+        const name = values.getString(name_idx);
+        if (name.len == 6 and name[0] == 'l' and name[1] == 'e' and name[2] == 'n' and name[3] == 'g' and name[4] == 't' and name[5] == 'h') {
+            out.* = .{ .name_idx = name_idx, .value = Value.number(@floatFromInt(obj.array_len)), .flags = .{ .enumerable = false, .configurable = false } };
+            return true;
+        }
+        if (arrayIndexName(name)) |index| {
+            if (hasArrayElement(obj_idx, index)) {
+                out.* = .{ .name_idx = name_idx, .value = getArrayElement(obj_idx, index) };
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /// Look up a property node's is_getter flag (searching the prototype chain).
@@ -944,6 +1019,7 @@ pub fn deleteProperty(obj_idx: u32, name_idx: u32) void {
     var p: u32 = obj.prop_head;
     while (p != NULL_PROP) {
         if (properties[p].name_idx == name_idx) {
+            properties[p].mapped_cell = NO_CELL;
             if (prev == NULL_PROP) obj.prop_head = properties[p].next
             else properties[prev].next = properties[p].next;
             if (obj.prop_count > 0) obj.prop_count -= 1;
@@ -966,6 +1042,22 @@ pub fn setEnumerable(obj_idx: u32, name_idx: u32, enumerable: bool) void {
     var p = objects[obj_idx].prop_head;
     while (p != NULL_PROP) : (p = properties[p].next) {
         if (properties[p].name_idx == name_idx) { properties[p].flags.enumerable = enumerable; return; }
+    }
+}
+
+/// Making a mapped index read-only first preserves its current parameter value
+/// and then detaches its alias, as required by arguments [[DefineOwnProperty]].
+pub fn setWritable(obj_idx: u32, name_idx: u32, writable: bool) void {
+    if (obj_idx >= n_objects) return;
+    var p = objects[obj_idx].prop_head;
+    while (p != NULL_PROP) : (p = properties[p].next) {
+        if (properties[p].name_idx != name_idx) continue;
+        if (!writable and properties[p].mapped_cell != NO_CELL) {
+            properties[p].value = propertyValue(&properties[p]);
+            properties[p].mapped_cell = NO_CELL;
+        }
+        properties[p].flags.writable = writable;
+        return;
     }
 }
 
@@ -1232,6 +1324,10 @@ pub var dbg_webpo_writes: u32 = 0;
 pub var dbg_webpo_last_idx: u32 = 0xFFFFFFFF;
 pub var dbg_webpo_last_tag: u8 = 255;
 pub var dbg_webpo_idx0_tag: u8 = 255; // tag of the value written to index 0
+pub fn dbgWebpoWrites() u32 { return dbg_webpo_writes; }
+pub fn dbgWebpoLastIdx() u32 { return dbg_webpo_last_idx; }
+pub fn dbgWebpoLastTag() u8 { return dbg_webpo_last_tag; }
+pub fn dbgWebpoIdx0Tag() u8 { return dbg_webpo_idx0_tag; }
 
 pub fn setArrayElement(obj_idx: u32, index: u32, val: Value) void {
     if (obj_idx == 11055 and dbg_seed_n < 128) {
@@ -1241,6 +1337,30 @@ pub fn setArrayElement(obj_idx: u32, index: u32, val: Value) void {
         dbg_seed_func[j] = dbg_active_func;
         dbg_seed_ip[j] = dbg_active_ip;
         dbg_seed_n += 1;
+    }
+    // ── Minter: catch the write of a STRING to index 3 of a register array
+    // (the reg-116 g[3]="d" bug). Record obj/func/ip/str for the first few.
+    if (index == 3 and val.tag == .string and dbg_g3w_n < dbg_g3w_obj.len) {
+        const j = dbg_g3w_n;
+        dbg_g3w_obj[j] = obj_idx;
+        dbg_g3w_func[j] = dbg_active_func;
+        dbg_g3w_ip[j] = dbg_active_ip;
+        const s = values.getString(val.data.str_idx);
+        const cn = @min(s.len, 24);
+        @memcpy(dbg_g3w_str[j][0..cn], s[0..cn]);
+        dbg_g3w_slen[j] = cn;
+        dbg_g3w_stridx[j] = val.data.str_idx;
+        dbg_g3w_n += 1;
+    }
+    // ── Minter: trace the ORIGIN of the string "d" (strIdx is run-stable; armed
+    // via dbg_dorigin_stridx) — every write of that string to any array slot.
+    if (dbg_dorigin_stridx != 0xFFFFFFFF and val.tag == .string and val.data.str_idx == dbg_dorigin_stridx and dbg_dorigin_n < dbg_dorigin_obj.len) {
+        const j = dbg_dorigin_n;
+        dbg_dorigin_obj[j] = obj_idx;
+        dbg_dorigin_index[j] = index;
+        dbg_dorigin_func[j] = dbg_active_func;
+        dbg_dorigin_ip[j] = dbg_active_ip;
+        dbg_dorigin_n += 1;
     }
     if (obj_idx >= n_objects) return;
     // Reg 450 = the interpreter BIT POSITION (advanced by `lo`). Log its first
@@ -1287,6 +1407,13 @@ pub fn setArrayElement(obj_idx: u32, index: u32, val: Value) void {
         dbg_fn_store_last_arr = obj_idx; dbg_fn_store_last_idx = index;
         if (dbg_fn_store_first_arr == 0xFFFF) { dbg_fn_store_first_arr = obj_idx; dbg_fn_store_first_idx = index; }
     }
+    // Track writes to the webPoSignalOutput array (getMinter lands at index 0).
+    if (dbg_webpo_target != 0xFFFFFFFF and obj_idx == dbg_webpo_target) {
+        dbg_webpo_writes += 1;
+        dbg_webpo_last_idx = index;
+        dbg_webpo_last_tag = @intFromEnum(val.tag);
+        if (index == 0) dbg_webpo_idx0_tag = @intFromEnum(val.tag);
+    }
     const obj = &objects[obj_idx];
 
     // If the write is beyond the reserved capacity, relocate the array to the
@@ -1324,6 +1451,34 @@ pub var dbg_seed_index: [128]u32 = undefined;
 pub var dbg_seed_value: [128]Value = undefined;
 pub var dbg_seed_func: [128]u16 = undefined;
 pub var dbg_seed_ip: [128]u32 = undefined;
+
+// Minter: trace origin of a specific interned string across all array writes.
+pub var dbg_dorigin_stridx: u32 = 0xFFFFFFFF;
+pub var dbg_dorigin_n: usize = 0;
+pub var dbg_dorigin_obj: [40]u32 = [_]u32{0} ** 40;
+pub var dbg_dorigin_index: [40]u32 = [_]u32{0} ** 40;
+pub var dbg_dorigin_func: [40]u16 = [_]u16{0xFFFF} ** 40;
+pub var dbg_dorigin_ip: [40]u32 = [_]u32{0} ** 40;
+pub fn dbgDoriginN() usize { return dbg_dorigin_n; }
+pub fn dbgDoriginObj(i: usize) u32 { return dbg_dorigin_obj[i]; }
+pub fn dbgDoriginIndex(i: usize) u32 { return dbg_dorigin_index[i]; }
+pub fn dbgDoriginFunc(i: usize) u16 { return dbg_dorigin_func[i]; }
+pub fn dbgDoriginIp(i: usize) u32 { return dbg_dorigin_ip[i]; }
+
+// Minter: writes of a STRING to array index 3 (the reg-116 g[3]="d" bug).
+pub var dbg_g3w_n: usize = 0;
+pub var dbg_g3w_obj: [32]u32 = [_]u32{0} ** 32;
+pub var dbg_g3w_func: [32]u16 = [_]u16{0xFFFF} ** 32;
+pub var dbg_g3w_ip: [32]u32 = [_]u32{0} ** 32;
+pub var dbg_g3w_str: [32][24]u8 = [_][24]u8{[_]u8{0} ** 24} ** 32;
+pub var dbg_g3w_slen: [32]usize = [_]usize{0} ** 32;
+pub var dbg_g3w_stridx: [32]u32 = [_]u32{0} ** 32;
+pub fn dbgG3wN() usize { return dbg_g3w_n; }
+pub fn dbgG3wObj(i: usize) u32 { return dbg_g3w_obj[i]; }
+pub fn dbgG3wFunc(i: usize) u16 { return dbg_g3w_func[i]; }
+pub fn dbgG3wIp(i: usize) u32 { return dbg_g3w_ip[i]; }
+pub fn dbgG3wStr(i: usize) []const u8 { return dbg_g3w_str[i][0..dbg_g3w_slen[i]]; }
+pub fn dbgG3wStrIdx(i: usize) u32 { return dbg_g3w_stridx[i]; }
 
 /// Move an array's element storage to the end of the pool, reserving `new_cap`
 /// slots. Copies existing [0,array_len) elements, zero-inits the remainder.

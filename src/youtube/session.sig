@@ -21,6 +21,7 @@
 
 const http = @import("net.sig");
 const challenge = @import("botguard/challenge.sig");
+const integrity = @import("botguard/integrity.sig");
 
 extern "kernel32" fn GetStdHandle(u32) ?*anyopaque;
 extern "kernel32" fn WriteFile(?*anyopaque, [*]const u8, u32, ?*u32, ?*anyopaque) c_int;
@@ -46,6 +47,9 @@ pub const Session = struct {
     visitor_data_len: usize = 0,
     client_version: [32]u8 = undefined,
     client_version_len: usize = 0,
+    mweb_client_version: [32]u8 = undefined,
+    mweb_client_version_len: usize = 0,
+    signature_timestamp: u32 = 0,
     bootstrapped: bool = false,
 
     pub fn init() Session {
@@ -96,11 +100,12 @@ pub fn bootstrap(sess: *Session, chal: *challenge.Challenge) bool {
         print(" cookies="); printNum(sess.jar.count()); print("\n");
     }
 
-    if (resp.body.len == 0) return false;
+    if (!resp.ok or resp.body.len == 0) return false;
 
     // Extract visitorData + client version from ytcfg.
     extractVisitorData(resp.body, sess);
     extractClientVersion(resp.body, sess);
+    sess.signature_timestamp = findJsonUint(resp.body, "\"STS\"") orelse 0;
     print("  [session] visitorData="); printNum(sess.visitor_data_len);
     print(" clientVersion='"); print(sess.clientVersion()); print("'\n");
 
@@ -115,13 +120,13 @@ pub fn bootstrap(sess: *Session, chal: *challenge.Challenge) bool {
     }
     print("\n");
 
-    // Copy visitorData into the challenge too (used for session-bound minting).
+    // Keep challenge diagnostics bound to the same complete visitor context.
     if (sess.visitor_data_len > 0 and chal.visitor_data_len == 0) {
         @memcpy(chal.visitor_data[0..sess.visitor_data_len], sess.visitor_data[0..sess.visitor_data_len]);
         chal.visitor_data_len = sess.visitor_data_len;
     }
 
-    sess.bootstrapped = sess.jar.count() > 0 or sess.visitor_data_len > 0;
+    sess.bootstrapped = sess.visitor_data_len > 0;
     return sess.bootstrapped;
 }
 
@@ -158,10 +163,36 @@ fn extractVisitorData(body: []const u8, sess: *Session) void {
 
 fn extractClientVersion(body: []const u8, sess: *Session) void {
     if (findStrVal(body, "\"INNERTUBE_CONTEXT_CLIENT_VERSION\"")) |cv| {
-        const n = @min(cv.len, 32);
+        if (cv.len > sess.client_version.len) { sess.client_version_len = 0; return; }
+        const n = cv.len;
         @memcpy(sess.client_version[0..n], cv[0..n]);
         sess.client_version_len = n;
     }
+}
+
+fn findJsonUint(body: []const u8, key: []const u8) ?u32 {
+    var i = (findStr(body, key) orelse return null) + key.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == '\r' or body[i] == '\n')) : (i += 1) {}
+    if (i >= body.len or body[i] != ':') return null;
+    i += 1;
+    while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == '\r' or body[i] == '\n')) : (i += 1) {}
+    const start = i;
+    var n: u32 = 0;
+    while (i < body.len and body[i] >= '0' and body[i] <= '9') : (i += 1) {
+        const d: u32 = body[i] - '0';
+        if (n > (0xFFFFFFFF - d) / 10) return null;
+        n = n * 10 + d;
+    }
+    return if (i == start) null else n;
+}
+
+fn writeUint(out: []u8, n: u32) usize {
+    var value = n;
+    var digits: [10]u8 = undefined;
+    var i: usize = 0;
+    while (true) { digits[i] = @intCast('0' + value % 10); i += 1; value /= 10; if (value == 0) break; }
+    for (0..i) |j| out[j] = digits[i - j - 1];
+    return i;
 }
 
 /// Parse the homepage BotGuard challenge from `window.ytAtN({...})` (or the
@@ -304,6 +335,8 @@ pub const IntegrityResult = struct {
     // The raw GenerateIT response (for diagnostics: [tok,ttl,thr,fallback]).
     minter_ready: bool = false, // webPoSignalOutput[0] populated
     valid: bool = false,
+    ttl_secs: u32 = 0,
+    mint_refresh_threshold: u32 = 0,
 };
 
 // Scratch for building request bodies + capturing the BG response.
@@ -359,9 +392,15 @@ pub fn fetchChallengeInSession(sess: *Session, chal: *challenge.Challenge) bool 
     const resp = http.post("www.youtube.com", path_buf[0..pp], hdr_buf[0..hp], att_body_buf[0..bp], &sess.jar);
     print("  [session] att/get status="); printNum(resp.status);
     print(" bytes="); printNum(resp.body.len); print("\n");
-    if (resp.body.len == 0) return false;
-
-    return parseAttGetInto(resp.body, chal);
+    if (!resp.ok or resp.body.len == 0) return false;
+    const parsed = parseAttGetInto(resp.body, chal);
+    // responseContext may refresh visitor data for the same cookie session.
+    // Echo this full value into subsequent GenerateIT and player requests.
+    if (parsed and chal.visitor_data_len > 0) {
+        @memcpy(sess.visitor_data[0..chal.visitor_data_len], chal.visitor_data[0..chal.visitor_data_len]);
+        sess.visitor_data_len = chal.visitor_data_len;
+    }
+    return parsed;
 }
 
 /// Parse an att/get JSON response into the challenge struct (program, globalName,
@@ -390,7 +429,8 @@ fn parseAttGetInto(resp: []const u8, chal: *challenge.Challenge) bool {
         chal.interpreter_url_len = ulen;
     }
     if (findStrVal(resp, "\"visitorData\"")) |vd| {
-        const vlen = @min(vd.len, chal.visitor_data.len);
+        if (vd.len > chal.visitor_data.len) return false;
+        const vlen = vd.len;
         @memcpy(chal.visitor_data[0..vlen], vd[0..vlen]);
         chal.visitor_data_len = vlen;
     }
@@ -402,6 +442,11 @@ fn parseAttGetInto(resp: []const u8, chal: *challenge.Challenge) bool {
 /// Public so callers (and validation harnesses) can relay a botguardResponse
 /// produced elsewhere through the exact session plumbing.
 pub fn generateITInSession(sess: *Session, bg_response: []const u8, out: *IntegrityResult) bool {
+    out.integrity_token_len = 0;
+    out.valid = false;
+    out.ttl_secs = 0;
+    out.mint_refresh_threshold = 0;
+    fallback_len = 0;
     print("  [session] GenerateIT (cookied) ...\n");
 
     var blen: usize = 0;
@@ -412,7 +457,7 @@ pub fn generateITInSession(sess: *Session, bg_response: []const u8, out: *Integr
     @memcpy(git_body_buf[blen .. blen + mid.len], mid); blen += mid.len;
     // JSON-escape the BG response.
     for (bg_response) |c| {
-        if (blen + 2 >= git_body_buf.len - 4) break;
+        if (blen + 2 >= git_body_buf.len - 4) return false;
         switch (c) {
             '"' => { git_body_buf[blen] = '\\'; blen += 1; git_body_buf[blen] = '"'; blen += 1; },
             '\\' => { git_body_buf[blen] = '\\'; blen += 1; git_body_buf[blen] = '\\'; blen += 1; },
@@ -445,65 +490,87 @@ pub fn generateITInSession(sess: *Session, bg_response: []const u8, out: *Integr
         print(resp.body[0..@min(resp.body.len, 400)]);
         print("\n");
     }
-    if (resp.body.len == 0) return false;
-
-    // Response is a JSON array: [integrityToken, ttl, mintRefreshThreshold,
-    // websafeFallbackToken]. Element 0 is the REAL integrity token, or `null`
-    // when the session isn't trusted enough (in which case only the fallback
-    // string is present). We MUST read element 0 positionally, not just "the
-    // first quoted string" (that would wrongly pick up the fallback).
-    const r = resp.body;
-    // Find outer '['.
-    var i: usize = 0;
-    while (i < r.len and r[i] != '[') : (i += 1) {}
-    if (i >= r.len) return false;
-    i += 1;
-    // Skip whitespace.
-    while (i < r.len and (r[i] == ' ' or r[i] == '\t' or r[i] == '\n' or r[i] == '\r')) : (i += 1) {}
-    // Element 0: either `null` or a "quoted string".
-    if (i + 4 <= r.len and r[i] == 'n' and r[i + 1] == 'u' and r[i + 2] == 'l' and r[i + 3] == 'l') {
-        // integrityToken is null — capture the fallback (element 3) separately.
-        out.integrity_token_len = 0;
-        out.valid = false;
-        // Capture fallback token for diagnostics / cold-start use.
-        captureFallback(r, out);
-        return false;
-    }
-    if (r[i] != '"') return false;
-    i += 1;
-    const start = i;
-    while (i < r.len and r[i] != '"') : (i += 1) {
-        if (r[i] == '\\' and i + 1 < r.len) i += 1;
-    }
-    const tlen = i - start;
-    if (tlen == 0 or tlen > 512) return false;
-    @memcpy(out.integrity_token[0..tlen], r[start .. start + tlen]);
-    out.integrity_token_len = tlen;
+    if (!resp.ok or resp.body.len == 0) return false;
+    const parsed = integrity.parseResponse(resp.body);
+    fallback_len = parsed.fallback_len;
+    if (fallback_len > 0) @memcpy(fallback_buf[0..fallback_len], parsed.fallback_token[0..fallback_len]);
+    out.ttl_secs = parsed.ttl_secs;
+    out.mint_refresh_threshold = parsed.mint_refresh_threshold;
+    if (!parsed.valid) return false;
+    @memcpy(out.integrity_token[0..parsed.token_len], parsed.token[0..parsed.token_len]);
+    out.integrity_token_len = parsed.token_len;
     out.valid = true;
     return true;
 }
 
-/// Capture the websafe fallback token (last string element) for diagnostics.
+/// The separately parsed element 3 is retained for diagnostics only.
 var fallback_buf: [256]u8 = undefined;
 pub var fallback_len: usize = 0;
-fn captureFallback(r: []const u8, out: *IntegrityResult) void {
-    _ = out;
-    // Last quoted string in the array.
-    var best_start: usize = 0;
-    var best_len: usize = 0;
-    var i: usize = 0;
-    while (i < r.len) : (i += 1) {
-        if (r[i] == '"') {
-            const s = i + 1;
-            var j = s;
-            while (j < r.len and r[j] != '"') : (j += 1) { if (r[j] == '\\' and j + 1 < r.len) j += 1; }
-            best_start = s; best_len = j - s;
-            i = j;
-        }
+
+/// Web BotGuard proofs are accepted by WEB/MWEB. Other platforms use their
+/// own attestation providers and must not receive these web PO tokens.
+pub const WebClient = enum { web, mweb };
+pub const MWEB_UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
+
+/// MWEB has its own rollout version. Obtain its current configuration through
+/// the existing cookie jar before running the session's attestation exchange.
+pub fn prepareMobileClient(sess: *Session) bool {
+    sess.mweb_client_version_len = 0;
+    if (!sess.bootstrapped) return false;
+    const resp = http.request(.get, "m.youtube.com", 443, "/", "Accept: text/html\r\nAccept-Language: en-US,en;q=0.9\r\n", "", &sess.jar, MWEB_UA);
+    if (!resp.ok) return false;
+    const version = findStrVal(resp.body, "\"INNERTUBE_CONTEXT_CLIENT_VERSION\"") orelse return false;
+    if (version.len == 0 or version.len > sess.mweb_client_version.len) return false;
+    @memcpy(sess.mweb_client_version[0..version.len], version);
+    sess.mweb_client_version_len = version.len;
+    if (findJsonUint(resp.body, "\"STS\"")) |sts| sess.signature_timestamp = sts;
+    extractVisitorData(resp.body, sess);
+    print("  [session] mobile clientVersion='"); print(version); print("'\n");
+    return sess.visitor_data_len > 0;
+}
+
+pub fn playerInSession(sess: *Session, video_id: []const u8, client: WebClient, po_token: []const u8) []const u8 {
+    if (!sess.bootstrapped or video_id.len != 11 or po_token.len > 256) return "";
+    const mobile = client == .mweb;
+    if (mobile and sess.mweb_client_version_len == 0) return "";
+    const version = if (mobile) sess.mweb_client_version[0..sess.mweb_client_version_len] else if (sess.clientVersion().len > 0) sess.clientVersion() else "2.20250312.04.00";
+    var body: [4096]u8 = undefined;
+    var p: usize = 0;
+    p = appendS(&body, p, "{\"context\":{\"client\":{\"clientName\":\"");
+    p = appendS(&body, p, if (mobile) "MWEB" else "WEB");
+    p = appendS(&body, p, "\",\"clientVersion\":\"");
+    p = appendS(&body, p, version);
+    p = appendS(&body, p, "\",\"hl\":\"en\",\"gl\":\"US\",\"visitorData\":\"");
+    p = appendS(&body, p, sess.visitorData());
+    p = appendS(&body, p, "\"");
+    if (mobile) p = appendS(&body, p, ",\"platform\":\"MOBILE\",\"osName\":\"Android\",\"osVersion\":\"14\"");
+    p = appendS(&body, p, "}},\"videoId\":\"");
+    p = appendS(&body, p, video_id);
+    p = appendS(&body, p, "\",\"contentCheckOk\":true,\"racyCheckOk\":true");
+    p = appendS(&body, p, ",\"playbackContext\":{\"contentPlaybackContext\":{\"html5Preference\":\"HTML5_PREF_WANTS\"");
+    if (sess.signature_timestamp > 0) {
+        p = appendS(&body, p, ",\"signatureTimestamp\":");
+        p += writeUint(body[p..], sess.signature_timestamp);
     }
-    const n = @min(best_len, fallback_buf.len);
-    if (n > 0) @memcpy(fallback_buf[0..n], r[best_start .. best_start + n]);
-    fallback_len = n;
+    p = appendS(&body, p, "}}");
+    if (po_token.len > 0) {
+        p = appendS(&body, p, ",\"serviceIntegrityDimensions\":{\"poToken\":\"");
+        p = appendS(&body, p, po_token);
+        p = appendS(&body, p, "\"}");
+    }
+    p = appendS(&body, p, "}");
+    var headers: [4096]u8 = undefined;
+    var h: usize = 0;
+    h = appendS(&headers, h, "Content-Type: application/json\r\nOrigin: https://www.youtube.com\r\nReferer: https://www.youtube.com/watch?v=");
+    h = appendS(&headers, h, video_id);
+    h = appendS(&headers, h, "\r\nX-Youtube-Client-Name: ");
+    h = appendS(&headers, h, if (mobile) "2" else "1");
+    h = appendS(&headers, h, "\r\nX-Youtube-Client-Version: ");
+    h = appendS(&headers, h, version);
+    h = appendS(&headers, h, "\r\n");
+    h = appendS(&headers, h, visitorHeader(sess));
+    const resp = http.request(.post, "www.youtube.com", 443, "/youtubei/v1/player?prettyPrint=false", headers[0..h], body[0..p], &sess.jar, if (mobile) MWEB_UA else http.CHROME_UA);
+    return if (resp.ok) resp.body else "";
 }
 
 /// End-to-end: bootstrap the session (if not already), fetch a session-bound
@@ -514,16 +581,23 @@ fn captureFallback(r: []const u8, out: *IntegrityResult) void {
 /// Returns an IntegrityResult; .valid && integrity_token_len>0 means a REAL
 /// (non-null) token was issued.
 pub fn establishIntegrityToken(sess: *Session, chal: *challenge.Challenge, out: *IntegrityResult) bool {
+    out.* = .{};
     if (!sess.bootstrapped) {
-        _ = bootstrap(sess, chal);
+        if (!bootstrap(sess, chal)) return false;
     }
 
-    // If the homepage didn't embed a challenge, fetch one within the session.
-    if (chal.program_len == 0) {
-        if (!fetchChallengeInSession(sess, chal)) {
-            print("  [session] challenge fetch failed\n");
-            return false;
-        }
+    // ALWAYS fetch the challenge via the WAA **Create** RPC for the integrity /
+    // minter path — even if the homepage embedded a `window.ytAtN` challenge.
+    // The homepage/att/get challenges are ENGAGEMENT_TYPE_UNBOUND: their snapshot
+    // never populates webPoSignalOutput[0] (getMinter), so they can only yield a
+    // cold-start token that YouTube rejects (HTTP 403) for this video. Only the
+    // Create flow's snapshot populates getMinter → a mintable content-bound PO
+    // token. create-test proves fetchCreate → VM → GenerateIT → minter works.
+    // (We overwrite any embedded challenge so program/script come from Create.)
+    chal.* = challenge.Challenge.init();
+    if (!challenge.fetchCreate(chal)) {
+        print("  [session] Create challenge fetch failed\n");
+        return false;
     }
 
     // Fetch the VM script if only a URL was provided.
@@ -550,7 +624,9 @@ pub fn establishIntegrityToken(sess: *Session, chal: *challenge.Challenge, out: 
     print(" ok="); print(if (ok) "1" else "0"); print("\n");
     if (!ok or bg_len == 0) return false;
 
-    out.minter_ready = jsvm.bg_webpo_signal.tag == .object or jsvm.bg_webpo_signal.tag == .array;
+    const signal = jsvm.bg_webpo_signal;
+    out.minter_ready = (signal.tag == .object or signal.tag == .array) and
+        jsvm.objects.getArrayElement(signal.data.obj_idx, 0).tag == .function;
 
     // Exchange for a session-bound integrity token.
     return generateITInSession(sess, bg_response_buf[0..bg_len], out);

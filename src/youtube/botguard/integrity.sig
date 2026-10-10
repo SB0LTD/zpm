@@ -48,7 +48,81 @@ pub const IntegrityTokenResponse = struct {
     }
 };
 
-var resp_buf: [8192]u8 = undefined;
+/// Parse GenerateIT positionally. A fallback in element 3 is diagnostic data;
+/// it cannot substitute for the primary integrity token in element 0.
+pub fn parseResponse(resp: []const u8) IntegrityTokenResponse {
+    var result = IntegrityTokenResponse.init();
+    var i: usize = 0;
+    skipSpace(resp, &i);
+    if (i >= resp.len or resp[i] != '[') return result;
+    i += 1;
+    const primary = readToken(resp, &i, &result.token) orelse return result;
+    if (!take(resp, &i, ',')) return result;
+    result.ttl_secs = readNumber(resp, &i) orelse return result;
+    skipSpace(resp, &i);
+    if (i < resp.len and resp[i] == ',') {
+        i += 1;
+        result.mint_refresh_threshold = readNumber(resp, &i) orelse return result;
+        skipSpace(resp, &i);
+        if (i < resp.len and resp[i] == ',') {
+            i += 1;
+            result.fallback_len = readToken(resp, &i, &result.fallback_token) orelse return result;
+        }
+    }
+    if (!take(resp, &i, ']')) return result;
+    skipSpace(resp, &i);
+    if (i != resp.len) return result;
+    result.token_len = primary;
+    result.valid = primary > 0 and result.ttl_secs > 0;
+    return result;
+}
+
+fn skipSpace(s: []const u8, i: *usize) void {
+    while (i.* < s.len and (s[i.*] == ' ' or s[i.*] == '\t' or s[i.*] == '\r' or s[i.*] == '\n')) : (i.* += 1) {}
+}
+
+fn take(s: []const u8, i: *usize, c: u8) bool {
+    skipSpace(s, i);
+    if (i.* >= s.len or s[i.*] != c) return false;
+    i.* += 1;
+    return true;
+}
+
+fn readToken(s: []const u8, i: *usize, out: []u8) ?usize {
+    skipSpace(s, i);
+    if (i.* + 4 <= s.len and s[i.*] == 'n' and s[i.* + 1] == 'u' and s[i.* + 2] == 'l' and s[i.* + 3] == 'l') {
+        i.* += 4;
+        return 0;
+    }
+    if (!take(s, i, '"')) return null;
+    var n: usize = 0;
+    while (i.* < s.len and s[i.*] != '"') : (i.* += 1) {
+        // Tokens are base64 or base64url strings. Escapes/control characters
+        // and oversized values cannot be passed to the VM as token bytes.
+        const c = s[i.*];
+        if (!((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '+' or c == '/' or c == '-' or c == '_' or c == '=') or n >= out.len) return null;
+        out[n] = c;
+        n += 1;
+    }
+    if (!take(s, i, '"')) return null;
+    return n;
+}
+
+fn readNumber(s: []const u8, i: *usize) ?u32 {
+    skipSpace(s, i);
+    if (i.* + 4 <= s.len and s[i.*] == 'n' and s[i.* + 1] == 'u' and s[i.* + 2] == 'l' and s[i.* + 3] == 'l') {
+        i.* += 4;
+        return 0;
+    }
+    const start = i.*;
+    var n: u32 = 0;
+    while (i.* < s.len and s[i.*] >= '0' and s[i.*] <= '9') : (i.* += 1) {
+        const digit: u32 = s[i.*] - '0';
+        if (n > (0xFFFFFFFF - digit) / 10) return null;
+        n = n * 10 + digit;
+    }
+    return if (i.* == start) null else n;
+}
 
 /// Exchange a BotGuard response token for an integrity token.
 /// `bg_response`: the token returned by the BotGuard VM execution
@@ -56,6 +130,8 @@ var resp_buf: [8192]u8 = undefined;
 /// `out_len`: receives the token length
 /// Returns true on success.
 pub fn getToken(bg_response: []const u8, out_token: *[512]u8, out_len: *usize) bool {
+    out_len.* = 0;
+    last_response_len = 0;
     print("  [botguard] Exchanging BG response for integrity token...\n");
 
     // Build request body: ["requestKey", "bgResponse"]. The BotGuard response
@@ -70,7 +146,7 @@ pub fn getToken(bg_response: []const u8, out_token: *[512]u8, out_len: *usize) b
 
     // JSON-escape the BG response
     for (bg_response) |c| {
-        if (blen + 2 >= body.len - 4) break; // leave room for closing "]
+        if (blen + 2 >= body.len - 4) return false;
         switch (c) {
             '"' => { body[blen] = '\\'; blen += 1; body[blen] = '"'; blen += 1; },
             '\\' => { body[blen] = '\\'; blen += 1; body[blen] = '\\'; blen += 1; },
@@ -85,6 +161,7 @@ pub fn getToken(bg_response: []const u8, out_token: *[512]u8, out_len: *usize) b
 
     // POST to WAA/GenerateIT
     const resp_len = challenge_mod.waaPost("/$rpc/google.internal.waa.v1.Waa/GenerateIT", body[0..blen]);
+    last_response_len = resp_len;
     if (resp_len == 0) {
         print("  [botguard] GenerateIT request failed\n");
         return false;
@@ -101,22 +178,13 @@ pub fn getToken(bg_response: []const u8, out_token: *[512]u8, out_len: *usize) b
     // The response is a JSON array
     const resp = challenge_mod.resp_buf[0..resp_len];
 
-    // Find the first string value (integrity token)
-    var i: usize = 0;
-    while (i < resp.len and resp[i] != '"') : (i += 1) {}
-    if (i >= resp.len) return false;
-    i += 1; // skip opening quote
-    const tok_start = i;
-    while (i < resp.len and resp[i] != '"') : (i += 1) {}
-    const tok_len = i - tok_start;
-
-    if (tok_len == 0 or tok_len > 512) return false;
-
-    @memcpy(out_token[0..tok_len], resp[tok_start .. tok_start + tok_len]);
-    out_len.* = tok_len;
+    const parsed = parseResponse(resp);
+    if (!parsed.valid) return false;
+    @memcpy(out_token[0..parsed.token_len], parsed.token[0..parsed.token_len]);
+    out_len.* = parsed.token_len;
 
     print("  [botguard] Integrity token: ");
-    printNum(tok_len);
+    printNum(parsed.token_len);
     print(" bytes\n");
 
     return true;
@@ -124,15 +192,10 @@ pub fn getToken(bg_response: []const u8, out_token: *[512]u8, out_len: *usize) b
 
 /// Get a full integrity token response with TTL info.
 pub fn getTokenFull(bg_response: []const u8) IntegrityTokenResponse {
-    var result = IntegrityTokenResponse.init();
     var token_buf: [512]u8 = undefined;
     var token_len: usize = 0;
-
-    if (getToken(bg_response, &token_buf, &token_len)) {
-        @memcpy(result.token[0..token_len], token_buf[0..token_len]);
-        result.token_len = token_len;
-        result.ttl_secs = 43200; // default 12 hours
-        result.valid = true;
-    }
-    return result;
+    _ = getToken(bg_response, &token_buf, &token_len);
+    return parseResponse(challenge_mod.resp_buf[0..last_response_len]);
 }
+
+var last_response_len: usize = 0;
