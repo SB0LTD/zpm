@@ -119,7 +119,7 @@ requirements it satisfies. Keep each step allocation-free and compiling green.
     validated; parallel to `live-tls-handshake`.
   - _Requirements: 12.1, 15.3_
 
-- [ ] 17. Migrate zpm's own callers to `@zpm/http`, then DELETE the WinHTTP modules
+- [x] 17. Migrate zpm's own callers to `@zpm/http`, then DELETE the WinHTTP modules
   - Rewrite `youtube/session.sig` (`generateITInSession`,
     `fetchChallengeInSession`, `establishIntegrityToken`) to call `@zpm/http`
     directly (import `CookieJar`/`Response`/`CHROME_UA` from `@zpm/http`).
