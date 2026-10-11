@@ -1110,7 +1110,6 @@ fn compileSwitch(node: Node) void {
 
     // For each case: compare, jump to body if match
     var case_jumps: [256]u32 = undefined;
-    var default_jump: u32 = 0;
     var has_default = false;
 
     for (cases, 0..) |case_idx, ci| {
@@ -1124,12 +1123,12 @@ fn compileSwitch(node: Node) void {
         } else {
             // default
             has_default = true;
-            default_jump = emitJump(.jump);
             case_jumps[ci] = 0;
         }
     }
 
-    // If no match, jump past all cases
+    // Choose default only after testing every case expression. Its position
+    // controls fallthrough order, but must not bypass later comparisons.
     const end_jump = emitJump(.jump);
 
     // Compile case bodies
@@ -1138,7 +1137,7 @@ fn compileSwitch(node: Node) void {
         if (case_node.left != NULL_NODE) {
             patchJump(case_jumps[ci]);
         } else {
-            patchJump(default_jump);
+            patchJump(end_jump);
         }
 
         const body_count = case_node.op;
@@ -1149,8 +1148,6 @@ fn compileSwitch(node: Node) void {
     }
 
     if (!has_default) {
-        patchJump(end_jump);
-    } else {
         patchJump(end_jump);
     }
 

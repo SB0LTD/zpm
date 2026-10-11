@@ -28,6 +28,7 @@ const http = @import("youtube_net");
 extern "kernel32" fn CreateFileA([*:0]const u8, u32, u32, ?*anyopaque, u32, u32, ?*anyopaque) ?*anyopaque;
 extern "kernel32" fn WriteFile(?*anyopaque, [*]const u8, u32, ?*u32, ?*anyopaque) c_int;
 extern "kernel32" fn CloseHandle(?*anyopaque) c_int;
+extern "kernel32" fn Sleep(u32) void;
 
 const GENERIC_WRITE: u32 = 0x40000000;
 const CREATE_ALWAYS: u32 = 2;
@@ -106,10 +107,19 @@ pub const SabrResult = struct {
 /// Per-format accumulation state updated while parsing UMP parts.
 pub const FormatProgress = struct {
     itag: i32 = 0,
+    last_modified: u64 = 0,
     bytes: u64 = 0,
     last_segment_num: i32 = -1,
     total_segments: i64 = 0,
-    content_length: i64 = 0,
+    end_time_ms: i64 = 0,
+    buffered_end_ms: i64 = 0,
+    header_id: u32 = 0,
+    header_active: bool = false,
+    segment_num: i32 = 0,
+    segment_init: bool = false,
+    segment_end_ms: i64 = 0,
+    segment_expected_bytes: i64 = 0,
+    segment_bytes: u64 = 0,
 };
 
 /// What a single UMP buffer pass reports back to the loop.
@@ -120,6 +130,7 @@ pub const ProcessOutcome = struct {
     sabr_error_code: i32 = 0,
     protection_status: i32 = 0,
     backoff_time_ms: i32 = 0,
+    playback_cookie: []const u8 = "",
     media_bytes: u64 = 0, // media bytes appended this pass
 };
 
@@ -164,7 +175,7 @@ pub fn runLoop(
     sink: Sink,
 ) SabrResult {
     var result = SabrResult{};
-    var progress = FormatProgress{ .itag = selected.itag };
+    var progress = FormatProgress{ .itag = selected.itag, .last_modified = selected.last_modified };
 
     var host: []const u8 = host_in;
     var port_cur: u16 = port;
@@ -172,6 +183,8 @@ pub fn runLoop(
 
     var state = ump.PartialState.init(&stitch_buf);
     var player_time_ms: i64 = 0;
+    var playback_cookie: [512]u8 = undefined;
+    var playback_cookie_len: usize = 0;
 
     var iter: u16 = 0;
     while (iter < MAX_ITERATIONS) : (iter += 1) {
@@ -179,6 +192,14 @@ pub fn runLoop(
         const audio: []const request.SelectedFormat = if (is_audio) &.{selected} else &.{};
         const video: []const request.SelectedFormat = if (is_audio) &.{} else &.{selected};
         var body_buf: [8192]u8 = undefined;
+        const buffered = request.BufferedRange{
+            .itag = selected.itag,
+            .last_modified = selected.last_modified,
+            .start_time_ms = 0,
+            .duration_ms = progress.buffered_end_ms,
+            .start_segment_index = 0,
+            .end_segment_index = progress.last_segment_num,
+        };
         const params = request.AbrParams{
             .player_time_ms = player_time_ms,
             .audio_formats = audio,
@@ -187,7 +208,9 @@ pub fn runLoop(
             .po_token = po_token,
             .client_name = client_name,
             .client_version = client_version,
+            .playback_cookie = playback_cookie[0..playback_cookie_len],
             .enabled_track_types_bitfield = if (is_audio) 1 else 0,
+            .buffered = if (progress.last_segment_num >= 0) &.{buffered} else &.{},
         };
         const body_len = request.buildAbrRequest(params, &body_buf) catch return result;
 
@@ -209,23 +232,24 @@ pub fn runLoop(
             applyPart(part, sink, &progress, &pass, &write_failed);
             if (write_failed) break;
         }
-        if (write_failed) break;
+        if (write_failed) { result.bytes_written = progress.bytes; break; }
         state.carry(pr.leftover());
 
         result.bytes_written = progress.bytes;
         if (pass.protection_status != 0) result.protection_status = pass.protection_status;
-        player_time_ms += 5000; // advance ~one request window; refined by headers below
+        player_time_ms = progress.buffered_end_ms;
+        if (pass.playback_cookie.len > playback_cookie.len) break;
+        if (pass.playback_cookie.len > 0) {
+            @memcpy(playback_cookie[0..pass.playback_cookie.len], pass.playback_cookie);
+            playback_cookie_len = pass.playback_cookie.len;
+        }
 
         if (pass.sabr_error_seen) {
             result.sabr_error_seen = true;
             result.sabr_error_code = pass.sabr_error_code;
             break;
         }
-        if (pass.media_end) {
-            result.media_end = true;
-            result.success = progress.bytes > 0;
-            break;
-        }
+        if (pass.media_end) result.media_end = true;
         if (pass.redirect_url.len > 0 and result.redirects < MAX_REDIRECTS) {
             // Follow SABR_REDIRECT: re-parse host/path from the new URL.
             const n = @min(pass.redirect_url.len, redirect_url_buf.len);
@@ -249,19 +273,15 @@ pub fn runLoop(
         }
 
         // Stop when the selected format is fully pulled.
-        if (progress.total_segments > 0 and progress.last_segment_num + 1 >= @as(i32, @intCast(@min(progress.total_segments, 0x7FFFFFFF)))) {
-            result.success = progress.bytes > 0;
-            break;
-        }
-        if (selected_content_length(selected, progress) > 0 and progress.bytes >= @as(u64, @intCast(progress.content_length))) {
-            result.success = progress.bytes > 0;
+        if (formatComplete(selected, progress) and state.len == 0) {
+            result.success = true;
             break;
         }
         // No media and no control signal => nothing more to pull.
         if (pass.media_bytes == 0 and pass.backoff_time_ms == 0 and pass.redirect_url.len == 0) {
-            result.success = progress.bytes > 0;
             break;
         }
+        if (pass.backoff_time_ms > 0) Sleep(@intCast(@min(pass.backoff_time_ms, 30000)));
     }
 
     return result;
@@ -270,9 +290,10 @@ pub fn runLoop(
 var redirect_host: [256]u8 = undefined;
 var redirect_path: [9216]u8 = undefined;
 
-fn selected_content_length(selected: request.SelectedFormat, progress: FormatProgress) i64 {
-    _ = selected;
-    return progress.content_length;
+fn formatComplete(selected: request.SelectedFormat, progress: FormatProgress) bool {
+    if (progress.header_active or progress.bytes == 0) return false;
+    if (selected.content_length > 0) return progress.bytes == selected.content_length;
+    return progress.end_time_ms > 0 and progress.buffered_end_ms >= progress.end_time_ms;
 }
 
 /// Shared part dispatch used by both the offline `processUmpBuffer` and the
@@ -282,25 +303,57 @@ fn applyPart(part: ump.Part, sink: Sink, progress: *FormatProgress, pass: *Proce
         ump.PartType.MEDIA_HEADER => {
             const mh = ump.decodeMediaHeader(part.payload);
             if (mh.itag != 0 and progress.itag == 0) progress.itag = mh.itag;
-            if (mh.segment_num > progress.last_segment_num) progress.last_segment_num = mh.segment_num;
-            if (mh.content_length > 0) progress.content_length = mh.content_length;
+            if (mh.itag != progress.itag or (mh.lmt != 0 and progress.last_modified != 0 and mh.lmt != progress.last_modified)) return;
+            // A second unfinished selected header would require reordering
+            // pending segment buffers. Abort rather than append corrupt bytes.
+            if (progress.header_active) { write_failed.* = true; return; }
+            if (mh.segment_num <= progress.last_segment_num) return;
+            progress.header_id = mh.header_id;
+            progress.header_active = true;
+            progress.segment_num = mh.segment_num;
+            progress.segment_init = mh.is_init_segment;
+            if (mh.start_ms < 0 or mh.duration_ms < 0 or mh.start_ms > 0x7FFFFFFFFFFFFFFF - mh.duration_ms) {
+                write_failed.* = true;
+                return;
+            }
+            progress.segment_end_ms = mh.start_ms + mh.duration_ms;
+            progress.segment_expected_bytes = mh.content_length;
+            progress.segment_bytes = 0;
         },
         ump.PartType.MEDIA => {
             var hid: u32 = 0;
             const media = ump.mediaBytes(part.payload, &hid);
+            if (!progress.header_active or hid != progress.header_id) return;
             if (media.len > 0) {
                 if (!sink.write(sink.ctx, media)) {
                     write_failed.* = true;
                     return;
                 }
                 progress.bytes += media.len;
+                progress.segment_bytes += media.len;
                 pass.media_bytes += media.len;
             }
         },
-        ump.PartType.MEDIA_END => pass.media_end = true,
+        ump.PartType.MEDIA_END => {
+            const id = ump.readUmpVarint(part.payload, 0) orelse return;
+            if (!progress.header_active or id.value != progress.header_id) return;
+            if (progress.segment_expected_bytes > 0 and progress.segment_bytes != @as(u64, @intCast(progress.segment_expected_bytes))) {
+                write_failed.* = true;
+                return;
+            }
+            progress.header_active = false;
+            if (!progress.segment_init) {
+                progress.last_segment_num = progress.segment_num;
+                progress.buffered_end_ms = @max(progress.buffered_end_ms, progress.segment_end_ms);
+            }
+            pass.media_end = true;
+        },
         ump.PartType.FORMAT_INITIALIZATION_METADATA => {
             const fim = ump.decodeFormatInit(part.payload);
-            if (fim.end_segment_num > 0) progress.total_segments = fim.end_segment_num;
+            if (fim.itag == progress.itag and (fim.lmt == 0 or progress.last_modified == 0 or fim.lmt == progress.last_modified)) {
+                progress.total_segments = fim.end_segment_num;
+                progress.end_time_ms = fim.end_time_ms;
+            }
         },
         ump.PartType.SABR_REDIRECT => {
             const red = ump.decodeSabrRedirect(part.payload);
@@ -314,6 +367,7 @@ fn applyPart(part: ump.Part, sink: Sink, progress: *FormatProgress, pass: *Proce
         ump.PartType.NEXT_REQUEST_POLICY => {
             const pol = ump.decodeNextRequestPolicy(part.payload);
             pass.backoff_time_ms = pol.backoff_time_ms;
+            pass.playback_cookie = pol.playback_cookie;
         },
         ump.PartType.STREAM_PROTECTION_STATUS => {
             const sps = ump.decodeStreamProtectionStatus(part.payload);
@@ -453,8 +507,7 @@ test "sabr-loop: processUmpBuffer collects media and terminates on MEDIA_END" {
     try testing.expectEqual(@as(i32, 251), progress.itag);
 }
 
-test "sabr-loop: runLoop pulls media via a fake transport and stops on MEDIA_END" {
-    // A fake transport that serves one UMP response: MEDIA then MEDIA_END.
+test "sabr-loop: runLoop completes only the full selected representation" {
     const Fake = struct {
         served: bool = false,
         resp: [64]u8 = undefined,
@@ -474,6 +527,11 @@ test "sabr-loop: runLoop pulls media via a fake transport and stops on MEDIA_END
     };
     var fake = Fake{};
     var fp: usize = 0;
+    var mh: [16]u8 = undefined;
+    var mw = @import("protobuf").Writer.init(&mh);
+    try mw.writeVarintField(3, 251);
+    try mw.writeVarintField(14, 3);
+    fp = appendPart(&fake.resp, fp, ump.PartType.MEDIA_HEADER, mw.bytes());
     fp = appendPart(&fake.resp, fp, ump.PartType.MEDIA, &.{ 0x00, 'X', 'Y', 'Z' });
     fp = appendPart(&fake.resp, fp, ump.PartType.MEDIA_END, &.{0x00});
     fake.resp_len = fp;
@@ -485,7 +543,7 @@ test "sabr-loop: runLoop pulls media via a fake transport and stops on MEDIA_END
         "rr5.googlevideo.com",
         443,
         "/videoplayback?sabr=1",
-        .{ .itag = 251, .last_modified = 100 },
+        .{ .itag = 251, .last_modified = 100, .content_length = 3 },
         true,
         "",
         "",
@@ -497,6 +555,18 @@ test "sabr-loop: runLoop pulls media via a fake transport and stops on MEDIA_END
     try testing.expect(res.media_end);
     try testing.expectEqual(@as(u64, 3), res.bytes_written);
     try testing.expectEqualSlices(u8, "XYZ", mem.buf[0..mem.len]);
+
+    // MEDIA_END closes this segment; it does not prove the rest of a video
+    // exists. The next HTTP failure must leave the whole file incomplete.
+    fake.served = false;
+    mem = .{};
+    const partial = runLoop(transport, "rr5.googlevideo.com", 443, "/videoplayback?sabr=1", .{ .itag = 251, .last_modified = 100, .content_length = 6 }, true, "", "", 1, "2.2025", mem.sink());
+    try testing.expect(!partial.success);
+    try testing.expectEqual(@as(u64, 3), partial.bytes_written);
+    fake.served = false;
+    mem = .{};
+    const unknown = runLoop(transport, "rr5.googlevideo.com", 443, "/videoplayback?sabr=1", .{ .itag = 251, .last_modified = 100 }, true, "", "", 1, "2.2025", mem.sink());
+    try testing.expect(!unknown.success);
 }
 
 test "sabr-loop: parseUrl splits SABR host and path" {
@@ -508,4 +578,67 @@ test "sabr-loop: parseUrl splits SABR host and path" {
     try testing.expect(parseUrl("https://rr5.googlevideo.com/videoplayback?sabr=1", &host, &hl, &path, &pl, &port));
     try testing.expectEqualSlices(u8, "rr5.googlevideo.com", host[0..hl]);
     try testing.expectEqualSlices(u8, "/videoplayback?sabr=1", path[0..pl]);
+}
+
+test "sabr-loop: two segments require two POSTs and echo buffered progress" {
+    const Fake = struct {
+        responses: [2][64]u8 = undefined,
+        lengths: [2]usize = .{ 0, 0 },
+        calls: usize = 0,
+        acknowledged: bool = false,
+        fn postImpl(ctx: *anyopaque, host: []const u8, port: u16, path: []const u8, body: []const u8, out: []u8) PostResult {
+            _ = host; _ = port; _ = path;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.calls >= 2) return .{};
+            if (self.calls == 1) {
+                var r = @import("protobuf").Reader.init(body);
+                while (!r.atEnd()) {
+                    const tag = r.readTag() catch break;
+                    if (tag.field == 3) self.acknowledged = true;
+                    r.skipField(tag.wire) catch break;
+                }
+            }
+            const n = self.lengths[self.calls];
+            @memcpy(out[0..n], self.responses[self.calls][0..n]);
+            self.calls += 1;
+            return .{ .status = 200, .ok = true, .len = n };
+        }
+    };
+    var fake = Fake{};
+    for (0..2) |i| {
+        var mh: [32]u8 = undefined;
+        var mw = @import("protobuf").Writer.init(&mh);
+        try mw.writeVarintField(3, 251);
+        try mw.writeVarintField(9, i);
+        try mw.writeVarintField(11, i * 1000);
+        try mw.writeVarintField(12, 1000);
+        try mw.writeVarintField(14, 3);
+        var p = appendPart(&fake.responses[i], 0, ump.PartType.MEDIA_HEADER, mw.bytes());
+        p = appendPart(&fake.responses[i], p, ump.PartType.MEDIA, if (i == 0) &.{ 0, 'A', 'B', 'C' } else &.{ 0, 'D', 'E', 'F' });
+        fake.lengths[i] = appendPart(&fake.responses[i], p, ump.PartType.MEDIA_END, &.{0});
+    }
+    var mem = MemSink{};
+    const res = runLoop(.{ .ctx = @ptrCast(&fake), .post = &Fake.postImpl }, "cdn.test", 443, "/videoplayback", .{ .itag = 251, .last_modified = 1, .content_length = 6 }, true, "", "", 1, "2.test", mem.sink());
+    try testing.expect(res.success);
+    try testing.expectEqual(@as(usize, 2), fake.calls);
+    try testing.expect(fake.acknowledged);
+    try testing.expectEqualSlices(u8, "ABCDEF", mem.buf[0..mem.len]);
+}
+
+test "sabr-loop: a truncated segment and unrelated track cannot complete" {
+    var buf: [64]u8 = undefined;
+    var mh: [16]u8 = undefined;
+    var mw = @import("protobuf").Writer.init(&mh);
+    try mw.writeVarintField(3, 140);
+    try mw.writeVarintField(14, 6);
+    var p = appendPart(&buf, 0, ump.PartType.MEDIA_HEADER, mw.bytes());
+    p = appendPart(&buf, p, ump.PartType.MEDIA, &.{ 0, 'A', 'B', 'C' });
+    p = appendPart(&buf, p, ump.PartType.MEDIA_END, &.{0});
+    var mem = MemSink{};
+    var unrelated = FormatProgress{ .itag = 251 };
+    const ignored = processUmpBuffer(buf[0..p], mem.sink(), &unrelated).?;
+    try testing.expect(!ignored.media_end);
+    try testing.expectEqual(@as(usize, 0), mem.len);
+    var selected = FormatProgress{ .itag = 140 };
+    try testing.expect(processUmpBuffer(buf[0..p], mem.sink(), &selected) == null);
 }

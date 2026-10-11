@@ -624,15 +624,27 @@ fn parseForVarDecl() NodeIdx {
     if (node == NULL_NODE) return NULL_NODE;
     nodes[node].flags = flags;
 
-    const name = parseBindingPattern();
-    var init: NodeIdx = NULL_NODE;
-    if (check(.assign)) {
+    // The complete declaration list belongs to the initializer. Consuming only
+    // its first binding misreads the remaining comma-separated declarations
+    // as the loop condition and shifts both semicolons.
+    var pairs: [8192]NodeIdx = undefined;
+    var count: usize = 0;
+    while (!atEnd() and !had_error) {
+        const name = parseBindingPattern();
+        var init: NodeIdx = NULL_NODE;
+        if (check(.assign)) {
+            advance();
+            init = parseAssignment();
+        }
+        if (count + 2 > pairs.len) { had_error = true; break; }
+        pairs[count] = name;
+        pairs[count + 1] = init;
+        count += 2;
+        if (!check(.comma)) break;
         advance();
-        init = parseAssignment();
     }
-    var pair: [2]NodeIdx = .{ name, init };
-    nodes[node].left = commitList(pair[0..2]);
-    nodes[node].right = 2; // one declarator = 2 list items
+    nodes[node].left = commitList(pairs[0..count]);
+    nodes[node].right = @intCast(count);
     return node;
 }
 

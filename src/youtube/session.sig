@@ -50,6 +50,8 @@ pub const Session = struct {
     mweb_client_version: [32]u8 = undefined,
     mweb_client_version_len: usize = 0,
     signature_timestamp: u32 = 0,
+    player_url: [512]u8 = undefined,
+    player_url_len: usize = 0,
     bootstrapped: bool = false,
 
     pub fn init() Session {
@@ -61,6 +63,9 @@ pub const Session = struct {
     }
     pub fn clientVersion(self: *const Session) []const u8 {
         return self.client_version[0..self.client_version_len];
+    }
+    pub fn playerUrl(self: *const Session) []const u8 {
+        return self.player_url[0..self.player_url_len];
     }
 };
 
@@ -105,6 +110,7 @@ pub fn bootstrap(sess: *Session, chal: *challenge.Challenge) bool {
     // Extract visitorData + client version from ytcfg.
     extractVisitorData(resp.body, sess);
     extractClientVersion(resp.body, sess);
+    extractPlayerUrl(resp.body, sess);
     sess.signature_timestamp = findJsonUint(resp.body, "\"STS\"") orelse 0;
     print("  [session] visitorData="); printNum(sess.visitor_data_len);
     print(" clientVersion='"); print(sess.clientVersion()); print("'\n");
@@ -167,6 +173,13 @@ fn extractClientVersion(body: []const u8, sess: *Session) void {
         const n = cv.len;
         @memcpy(sess.client_version[0..n], cv[0..n]);
         sess.client_version_len = n;
+    }
+}
+
+fn extractPlayerUrl(body: []const u8, sess: *Session) void {
+    if (findStrVal(body, "\"PLAYER_JS_URL\"")) |url| {
+        const n = jsonUnescape(url, &sess.player_url);
+        if (n > 0 and n < sess.player_url.len) sess.player_url_len = n;
     }
 }
 
@@ -524,6 +537,7 @@ pub fn prepareMobileClient(sess: *Session) bool {
     @memcpy(sess.mweb_client_version[0..version.len], version);
     sess.mweb_client_version_len = version.len;
     if (findJsonUint(resp.body, "\"STS\"")) |sts| sess.signature_timestamp = sts;
+    extractPlayerUrl(resp.body, sess);
     extractVisitorData(resp.body, sess);
     print("  [session] mobile clientVersion='"); print(version); print("'\n");
     return sess.visitor_data_len > 0;
@@ -586,17 +600,11 @@ pub fn establishIntegrityToken(sess: *Session, chal: *challenge.Challenge, out: 
         if (!bootstrap(sess, chal)) return false;
     }
 
-    // ALWAYS fetch the challenge via the WAA **Create** RPC for the integrity /
-    // minter path — even if the homepage embedded a `window.ytAtN` challenge.
-    // The homepage/att/get challenges are ENGAGEMENT_TYPE_UNBOUND: their snapshot
-    // never populates webPoSignalOutput[0] (getMinter), so they can only yield a
-    // cold-start token that YouTube rejects (HTTP 403) for this video. Only the
-    // Create flow's snapshot populates getMinter → a mintable content-bound PO
-    // token. create-test proves fetchCreate → VM → GenerateIT → minter works.
-    // (We overwrite any embedded challenge so program/script come from Create.)
-    chal.* = challenge.Challenge.init();
-    if (!challenge.fetchCreate(chal)) {
-        print("  [session] Create challenge fetch failed\n");
+    // Preserve the homepage challenge, or fetch ATT using this visitor's cookie
+    // jar. The saved native-session fixture exposes getMinter and receives a
+    // non-null primary token when its unmodified script runs in the oracle.
+    if (chal.program_len == 0 and !fetchChallengeInSession(sess, chal)) {
+        print("  [session] session challenge fetch failed\n");
         return false;
     }
 

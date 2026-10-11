@@ -48,6 +48,8 @@ pub const ObjType = enum(u8) {
 
 pub const Object = struct {
     obj_type: ObjType = .object,
+    extensible: bool = true,
+    frozen: bool = false,
     prototype: u32 = NULL_OBJ, // index into objects pool (u32: pool may exceed 65535)
     // Properties are a singly-linked list through the property pool (objects
     // are created and mutated interleaved, so a contiguous range does not work).
@@ -77,6 +79,7 @@ pub const Object = struct {
     is_frozen: bool = false,
     is_sealed: bool = false,
     is_arguments: bool = false,
+    date_value: f64 = 0,
     // Debug: tags environment objects (navigator/document/window/screen/
     // location/canvas/webgl contexts) so the VM can record which properties
     // BotGuard probes on them that our env doesn't implement (fingerprint leaks).
@@ -249,6 +252,7 @@ var error_proto: u32 = NULL_OBJ;
 
 /// Reset all object pools.
 pub fn reset() void {
+    values.object_number = numericObjectValue;
     n_objects = 0;
     n_properties = 0;
     n_array_elems = 0;
@@ -600,6 +604,20 @@ pub fn isArguments(obj_idx: u32) bool {
     return obj_idx < n_objects and objects[obj_idx].is_arguments;
 }
 
+fn numericObjectValue(obj_idx: u32) f64 {
+    if (obj_idx < n_objects and objects[obj_idx].obj_type == .date) return objects[obj_idx].date_value;
+    return @bitCast(@as(u64, 0x7FF8000000000000));
+}
+
+pub fn createDate(timestamp_ms: f64, prototype: u32) u32 {
+    const idx = allocObject(.date);
+    if (idx != NULL_OBJ) {
+        objects[idx].date_value = timestamp_ms;
+        objects[idx].prototype = prototype;
+    }
+    return idx;
+}
+
 /// Debug: tag an object as an environment (browser) object for fingerprint
 /// probing. See vm.dbg_fp_probe.
 pub fn dbgMarkEnvObject(idx: u32) void {
@@ -639,6 +657,8 @@ pub fn setProperty(obj_idx: u32, name_idx: u32, val: Value) void {
         }
         p = properties[p].next;
     }
+
+    if (!obj.extensible) return;
 
     // WATCH: capture the FIRST time a "prototype" property is added to a PLAIN
     // object (obj_type .object) — in JS only functions have own "prototype", so
@@ -1019,6 +1039,7 @@ pub fn deleteProperty(obj_idx: u32, name_idx: u32) void {
     var p: u32 = obj.prop_head;
     while (p != NULL_PROP) {
         if (properties[p].name_idx == name_idx) {
+            if (!properties[p].flags.configurable) return;
             properties[p].mapped_cell = NO_CELL;
             if (prev == NULL_PROP) obj.prop_head = properties[p].next
             else properties[prev].next = properties[p].next;
@@ -1028,6 +1049,21 @@ pub fn deleteProperty(obj_idx: u32, name_idx: u32) void {
         prev = p;
         p = properties[p].next;
     }
+}
+
+pub fn freezeObject(obj_idx: u32) void {
+    if (obj_idx >= n_objects) return;
+    objects[obj_idx].extensible = false;
+    objects[obj_idx].frozen = true;
+    var p = objects[obj_idx].prop_head;
+    while (p != NULL_PROP) : (p = properties[p].next) {
+        properties[p].flags.configurable = false;
+        if (!properties[p].flags.is_getter and !properties[p].flags.is_setter) properties[p].flags.writable = false;
+    }
+}
+
+pub fn isFrozen(obj_idx: u32) bool {
+    return obj_idx < n_objects and objects[obj_idx].frozen;
 }
 
 /// Number of own (non-prototype) properties on an object.
@@ -1330,7 +1366,7 @@ pub fn dbgWebpoLastTag() u8 { return dbg_webpo_last_tag; }
 pub fn dbgWebpoIdx0Tag() u8 { return dbg_webpo_idx0_tag; }
 
 pub fn setArrayElement(obj_idx: u32, index: u32, val: Value) void {
-    if (obj_idx == 11055 and dbg_seed_n < 128) {
+    if (obj_idx == dbg_seed_target and dbg_seed_n < 128) {
         const j = dbg_seed_n;
         dbg_seed_index[j] = index;
         dbg_seed_value[j] = val;
@@ -1446,6 +1482,7 @@ pub fn setArrayElement(obj_idx: u32, index: u32, val: Value) void {
     setElementPresent(abs_idx, true);
 }
 
+pub var dbg_seed_target: u32 = 0xFFFFFFFF;
 pub var dbg_seed_n: usize = 0;
 pub var dbg_seed_index: [128]u32 = undefined;
 pub var dbg_seed_value: [128]Value = undefined;

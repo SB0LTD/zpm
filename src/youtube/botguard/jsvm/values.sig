@@ -7,6 +7,10 @@
 /// Maximum number of live values in the VM at once.
 pub const MAX_VALUES: usize = 65536;
 
+// Runtime object coercion is supplied by the object layer, which owns internal
+// slots. Keeping this callback here avoids importing objects back into values.
+pub var object_number: ?*const fn (u32) f64 = null;
+
 /// Maximum string storage (all interned strings).
 // Source decompression creates immutable prefixes before eval consumes the
 // completed text. Keep these in a bounded arena; no string may be silently
@@ -79,6 +83,7 @@ pub const Value = extern struct {
             .boolean => if (self.data.boolean != 0) 1.0 else 0.0,
             .number => self.data.number,
             .string => parseNumberFromString(self.data.str_idx),
+            .object, .array, .function => if (object_number) |convert| convert(self.data.obj_idx) else @as(f64, @bitCast(@as(u64, 0x7FF8000000000000))),
             else => @as(f64, @bitCast(@as(u64, 0x7FF8000000000000))), // NaN
         };
     }

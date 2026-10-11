@@ -9,19 +9,29 @@
 const values = @import("values.sig");
 const objects = @import("objects.sig");
 const builtins = @import("builtins.sig");
+const browser_metadata = @import("browser_metadata.sig");
 const Value = values.Value;
 
 // ── Install all environment stubs ──
 
 /// Call after builtins.installGlobals().
 pub var dbg_no_document: bool = false;
+var navigator_proto: u32 = objects.NULL_OBJ;
 
 pub fn installEnvironment(global: u32) void {
     // Record the global for builtins that need a realm reference (e.g. a created
     // iframe's contentWindow, which BotGuard reads to obtain a pristine String).
     builtins.g_global_obj = global;
+    builtins.dom_element_proto = objects.NULL_OBJ;
+    builtins.dom_style_proto = objects.NULL_OBJ;
+    objects.setProperty(global, values.internString("DeviceOrientationEvent"), Value.function(objects.createFunction(builtins.N_DOM_ORIENTATION_EVENT)));
     installNavigator(global);
     installWindow(global);
+    const chrome = objects.createObject();
+    setNativeMethod(chrome, "loadTimes", builtins.N_OBJ_CREATE);
+    setNativeMethod(chrome, "csi", builtins.N_OBJ_CREATE);
+    objects.setProperty(chrome, values.internString("app"), Value.object(objects.createObject()));
+    objects.setProperty(global, values.internString("chrome"), Value.object(chrome));
     if (!dbg_no_document) installDocument(global);
     installScreen(global);
     installLocation(global);
@@ -29,10 +39,41 @@ pub fn installEnvironment(global: u32) void {
     installCrypto(global);
     installIntl(global);
     installMisc(global);
+    browser_metadata.installMissing(global, &browser_metadata.window_fields, builtins.N_DOM_NOOP);
+    const navigator_ctor = objects.getProperty(global, values.internString("Navigator"));
+    if (navigator_ctor.tag == .function and navigator_proto != objects.NULL_OBJ) {
+        objects.setProperty(navigator_ctor.data.func_idx, values.internString("prototype"), Value.object(navigator_proto));
+        objects.setEnumerable(navigator_ctor.data.func_idx, values.internString("prototype"), false);
+        objects.setProperty(navigator_proto, values.internString("constructor"), navigator_ctor);
+        objects.setEnumerable(navigator_proto, values.internString("constructor"), false);
+    }
+    for (browser_metadata.window_fields) |field| {
+        if (field.kind != .function or field.name.len == 0 or field.name[0] < 'A' or field.name[0] > 'Z') continue;
+        const value = objects.getProperty(global, values.internString(field.name));
+        if (value.tag != .function or objects.hasOwnProperty(value.data.func_idx, values.internString("prototype"))) continue;
+        const native_id = objects.closureFuncId(value.data.func_idx);
+        if (native_id != builtins.N_DOM_NOOP and native_id != builtins.N_DOM_IMAGE and native_id != builtins.N_DOM_ORIENTATION_EVENT) continue;
+        const proto = objects.createObject();
+        objects.setObjectPrototype(proto, builtins.dom_element_proto);
+        objects.setProperty(proto, values.internString("constructor"), value);
+        objects.setEnumerable(proto, values.internString("constructor"), false);
+        if (values.internString(field.name) == values.internString("SVGRect")) {
+            for ([_][]const u8{ "x", "y", "width", "height" }) |name|
+                objects.setProperty(proto, values.internString(name), Value.number(0));
+        }
+        if (values.internString(field.name) == values.internString("DeviceOrientationEvent")) {
+            for ([_][]const u8{ "alpha", "beta", "gamma" }) |name|
+                objects.setProperty(proto, values.internString(name), Value.NULL);
+            objects.setProperty(proto, values.internString("absolute"), Value.FALSE);
+        }
+        objects.setProperty(value.data.func_idx, values.internString("prototype"), Value.object(proto));
+        objects.setEnumerable(value.data.func_idx, values.internString("prototype"), false);
+    }
 }
 
 fn installNavigator(global: u32) void {
     const nav = objects.createObject();
+    navigator_proto = nav;
     setPropStr(nav, "userAgent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
     setPropStr(nav, "platform", "Win32");
     setPropStr(nav, "language", "en-US");
@@ -71,7 +112,9 @@ fn installNavigator(global: u32) void {
 
     objects.dbgMarkEnvObject(nav);
     objects.dbgMarkEnvObject(conn);
-    objects.setProperty(global, values.internString("navigator"), Value.object(nav));
+    const instance = objects.createObject();
+    objects.setObjectPrototype(instance, nav);
+    objects.setProperty(global, values.internString("navigator"), Value.object(instance));
 }
 
 fn installWindow(global: u32) void {
@@ -138,6 +181,7 @@ fn installDocument(global: u32) void {
     setPropStr(doc, "referrer", "");
     setPropStr(doc, "title", "YouTube");
     setPropStr(doc, "URL", "https://www.youtube.com/");
+    objects.setProperty(doc, values.internString("defaultView"), Value.object(global));
     setPropStr(doc, "cookie", "");
 
     // document.documentElement — a real element node (BotGuard walks
@@ -169,6 +213,39 @@ fn installDocument(global: u32) void {
     // element object (which carries the common method surface) keeps those probes
     // on the happy path, same rationale as createElement/createTextNode.
     setNativeMethod(doc, "createEvent", builtins.N_DOM_CREATE_ELEMENT);
+    objects.setProperty(global, values.internString("Image"), Value.function(objects.createFunction(builtins.N_DOM_IMAGE)));
+    const element_proto = objects.createObject();
+    makeNodeApi(element_proto);
+    browser_metadata.installMissing(element_proto, &browser_metadata.element_fields, builtins.N_DOM_NOOP);
+    builtins.dom_element_proto = element_proto;
+    objects.setObjectPrototype(html, element_proto);
+    objects.setObjectPrototype(body, element_proto);
+    objects.setObjectPrototype(head, element_proto);
+    const element_ctor = objects.createFunction(builtins.N_DOM_CREATE_ELEMENT);
+    objects.setProperty(element_ctor, values.internString("prototype"), Value.object(element_proto));
+    objects.setProperty(element_proto, values.internString("constructor"), Value.function(element_ctor));
+    objects.setProperty(global, values.internString("Element"), Value.function(element_ctor));
+    for ([_][]const u8{ "HTMLElement", "HTMLTableCaptionElement", "SVGElement", "SVGSVGElement" }) |name| {
+        const ctor = objects.createFunction(builtins.N_DOM_CREATE_ELEMENT);
+        objects.setProperty(ctor, values.internString("prototype"), Value.object(element_proto));
+        objects.setProperty(global, values.internString(name), Value.function(ctor));
+    }
+    const navigator = objects.getProperty(global, values.internString("navigator"));
+    if (navigator.tag == .object) {
+        const ctor = objects.createFunction(builtins.N_DOM_NOOP);
+        objects.setProperty(ctor, values.internString("prototype"), navigator);
+        objects.setProperty(global, values.internString("Navigator"), Value.function(ctor));
+    }
+    const media_proto = objects.createObject();
+    setNativeMethod(media_proto, "canPlayType", builtins.N_DOM_EMPTY_STRING);
+    const media_ctor = objects.createFunction(builtins.N_DOM_CREATE_ELEMENT);
+    objects.setProperty(media_ctor, values.internString("prototype"), Value.object(media_proto));
+    objects.setProperty(global, values.internString("HTMLMediaElement"), Value.function(media_ctor));
+    const anchor_proto = objects.createObject();
+    objects.setGetterProperty(anchor_proto, values.internString("href"), Value.function(objects.createFunction(builtins.N_DOM_EMPTY_STRING)));
+    const anchor_ctor = objects.createFunction(builtins.N_DOM_CREATE_ELEMENT);
+    objects.setProperty(anchor_ctor, values.internString("prototype"), Value.object(anchor_proto));
+    objects.setProperty(global, values.internString("HTMLAnchorElement"), Value.function(anchor_ctor));
 
     // createElement returns a generic element object (with style/getContext/etc)
     // so BotGuard's canvas/DOM feature paths run instead of hitting undefined.
@@ -220,6 +297,8 @@ fn installLocation(global: u32) void {
     setPropStr(loc, "search", "");
     setPropStr(loc, "hash", "");
     objects.setProperty(global, values.internString("location"), Value.object(loc));
+    const document = objects.getProperty(global, values.internString("document"));
+    if (document.tag == .object) objects.setProperty(document.data.obj_idx, values.internString("location"), Value.object(loc));
 }
 
 fn installPerformance(global: u32) void {
@@ -327,21 +406,28 @@ fn setPropBool(obj: u32, name: []const u8, val: bool) void {
 
 /// Install a native (no-op) method by native-builtin id on an object.
 fn setNativeMethod(obj: u32, name: []const u8, native_id: u16) void {
-    objects.setProperty(obj, values.internString(name), Value.function(objects.createFunction(native_id)));
+    builtins.installNativeMethod(obj, name, native_id);
 }
 
 /// Give a plain DOM-node object the child/listener/style API BotGuard walks
 /// when it attaches probe elements (document.body.appendChild(canvas), etc.).
 /// Mirrors builtins.makeDomElement so body/documentElement are real elements.
 fn makeNodeApi(el: u32) void {
-    const style = objects.createObject();
+    const style = builtins.makeDomStyle();
     objects.setProperty(el, values.internString("style"), Value.object(style));
     setNativeMethod(el, "appendChild", builtins.N_DOM_NOOP);
     setNativeMethod(el, "removeChild", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "replaceChild", builtins.N_DOM_REPLACE_CHILD);
+    setNativeMethod(el, "lookupNamespaceURI", builtins.N_DOM_LOOKUP_NAMESPACE);
+    objects.setProperty(el, values.internString("namespaceURI"), Value.string(values.internString("http://www.w3.org/1999/xhtml")));
     setNativeMethod(el, "insertBefore", builtins.N_DOM_NOOP);
     setNativeMethod(el, "setAttribute", builtins.N_DOM_NOOP);
     setNativeMethod(el, "getAttribute", builtins.N_DOM_NOOP);
     setNativeMethod(el, "removeAttribute", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "hasAttribute", builtins.N_DOM_FALSE);
+    setNativeMethod(el, "matches", builtins.N_DOM_FALSE);
+    setNativeMethod(el, "click", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "getBoundingClientRect", builtins.N_DOM_RECT);
     setNativeMethod(el, "addEventListener", builtins.N_DOM_NOOP);
     setNativeMethod(el, "removeEventListener", builtins.N_DOM_NOOP);
     setNativeMethod(el, "contains", builtins.N_DOM_NOOP);

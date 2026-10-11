@@ -114,8 +114,7 @@ pub fn selectBestAudio(formats: []const StreamFormat, n_formats: usize, codec_pr
     return best;
 }
 
-/// Select a specific itag by number (used for the PO-exempt muxed fallback,
-/// itag 18 = 360p MP4 video+audio, which GVS serves without a PO token as of 2026).
+/// Select a specific directly downloadable itag.
 pub fn selectByItag(formats: []const StreamFormat, n_formats: usize, itag: u16) ?*const StreamFormat {
     for (0..n_formats) |i| {
         if (formats[i].itag == itag and formats[i].url_len != 0) return &formats[i];
@@ -131,6 +130,20 @@ pub fn selectBySabr(formats: []const StreamFormat, n_formats: usize, itag: u16) 
         if (formats[i].itag == itag) return &formats[i];
     }
     return null;
+}
+
+/// Select metadata for SABR when the player supplies no direct stream URLs.
+/// A complete FormatId (itag + lastModified) is required by the POST protocol.
+pub fn selectBestSabr(formats: []const StreamFormat, n_formats: usize, audio: bool) ?*const StreamFormat {
+    var best: ?*const StreamFormat = null;
+    for (formats[0..@min(n_formats, formats.len)]) |*fmt| {
+        if (fmt.itag == 0 or fmt.last_modified == 0) continue;
+        if (audio) {
+            if (!fmt.is_audio or fmt.is_video) continue;
+        } else if (!fmt.is_video) continue;
+        if (best == null or fmt.bitrate > best.?.bitrate) best = fmt;
+    }
+    return best;
 }
 
 /// Select the best video stream.
@@ -378,6 +391,19 @@ fn decryptCipherUrl(cipher_str: []const u8, fmt: *StreamFormat) void {
     fmt.has_cipher = true;
 }
 
+/// Apply the same n transform to a SABR endpoint or another unescaped stream URL.
+/// Returns zero when its required transform cannot be produced natively.
+pub fn transformStreamUrl(url: []const u8, out: []u8) usize {
+    var fmt: StreamFormat = undefined;
+    if (url.len > fmt.url.len or url.len > out.len) return 0;
+    @memcpy(fmt.url[0..url.len], url);
+    fmt.url_len = @intCast(url.len);
+    applyNsig(&fmt);
+    if (fmt.url_len > out.len) return 0;
+    @memcpy(out[0..fmt.url_len], fmt.url[0..fmt.url_len]);
+    return fmt.url_len;
+}
+
 fn applyNsig(fmt: *StreamFormat) void {
     // Find &n= parameter in URL
     const url_slice = fmt.url[0..fmt.url_len];
@@ -389,8 +415,10 @@ fn applyNsig(fmt: *StreamFormat) void {
     // Transform
     var transformed: [nsig_mod.MAX_NSIG_LEN]u8 = undefined;
     const new_len = nsig_mod.transform(n_param, &transformed);
-    if (new_len == 0) return; // nsig transform failed, use original (throttled)
-    if (url_slice.len - n_param.len + new_len > fmt.url.len) return;
+    if (new_len == 0 or url_slice.len - n_param.len + new_len > fmt.url.len) {
+        fmt.url_len = 0;
+        return;
+    }
 
     // Replace the n parameter in the URL
     // This is complex to do in-place, so rebuild the URL

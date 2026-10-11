@@ -40,6 +40,8 @@ pub const SelectedFormat = struct {
     itag: i32,
     last_modified: u64,
     xtags: []const u8 = "",
+    // Manifest size for completion checks; never serialized as a FormatId field.
+    content_length: u64 = 0,
 };
 
 /// A client buffered range (what we already have on disk for a format).
@@ -72,6 +74,7 @@ pub const AbrParams = struct {
 
     // Content-bound PO token bytes (base64url-decoded by the caller).
     po_token: []const u8 = "",
+    playback_cookie: []const u8 = "",
 
     // StreamerContext.ClientInfo
     client_name: i32 = 1, // WEB
@@ -123,6 +126,7 @@ fn encodeStreamerContext(p: AbrParams, scratch: []u8) pb.Error![]const u8 {
     try w.writeLenDelim(1, ci.bytes());
     // po_token (field 2)
     if (p.po_token.len > 0) try w.writeLenDelim(2, p.po_token);
+    if (p.playback_cookie.len > 0) try w.writeLenDelim(3, p.playback_cookie);
     return w.bytes();
 }
 
@@ -134,6 +138,10 @@ pub fn buildAbrRequest(p: AbrParams, out: []u8) pb.Error!usize {
     var abr_scratch: [128]u8 = undefined;
     const abr = try encodeClientAbrState(p, &abr_scratch);
     try w.writeLenDelim(1, abr);
+
+    // Initialization format IDs identify which track headers the client needs.
+    for (p.audio_formats) |fmt| try writeFormatId(&w, 2, fmt);
+    for (p.video_formats) |fmt| try writeFormatId(&w, 2, fmt);
 
     // field 3: buffered_ranges (repeated)
     for (p.buffered) |br| {
@@ -225,9 +233,12 @@ test "sabr-request: golden bytes for a minimal request" {
     // Hand-computed golden:
     //   field1 client_abr_state (LEN): tag 0x0A, len 0x02, body [player_time_ms(28)=0]
     //     28<<3|0 = 224 -> varint E0 01 ; value 0 -> 00  => body = E0 01 00 (len 3)
-    //   field16 audio fmt (LEN): tag 16<<3|2=130 -> varint 82 01 ; len ; body
+    //   field2 init audio fmt id (LEN): tag 2<<3|2=0x12 ; len ; body
     //     FormatId: itag(1)=140 -> 08 8C 01 ; last_modified(2)=5 -> 10 05
-    //       body = 08 8C 01 10 05 (len 5)
+    //       body = 08 8C 01 10 05 (len 5)  => 12 05 08 8C 01 10 05
+    //   field16 selected audio fmt (LEN): tag 16<<3|2=130 -> varint 82 01 ; len ; body
+    //     FormatId: itag(1)=140 -> 08 8C 01 ; last_modified(2)=5 -> 10 05
+    //       body = 08 8C 01 10 05 (len 5)  => 82 01 05 08 8C 01 10 05
     //   field19 streamer_context (LEN): tag 19<<3|2=154 -> 9A 01 ; len ; body
     //     client_info(1) LEN: tag 0A ; body client_name(16)=1 -> 80 01 01 (len 3)
     //       -> 0A 03 80 01 01 (len 5)
@@ -235,6 +246,8 @@ test "sabr-request: golden bytes for a minimal request" {
     const golden = [_]u8{
         // field1 client_abr_state
         0x0A, 0x03, 0xE0, 0x01, 0x00,
+        // field2 initialization audio format id
+        0x12, 0x05, 0x08, 0x8C, 0x01, 0x10, 0x05,
         // field16 selected_audio_format_ids
         0x82, 0x01, 0x05, 0x08, 0x8C, 0x01, 0x10, 0x05,
         // field19 streamer_context

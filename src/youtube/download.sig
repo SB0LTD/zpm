@@ -38,12 +38,18 @@ var g_stream_pot_len: usize = 0;
 var g_session: session_mod.Session = session_mod.Session.init();
 var g_challenge: challenge_mod.Challenge = challenge_mod.Challenge.init();
 var g_player_copy: [innertube.RESPONSE_BUF_SIZE]u8 = undefined;
+var g_web_client: session_mod.WebClient = .mweb;
+// When set, the audio path skips the iOS-first probe and resolves the stream
+// through the WEB/MWEB client (signatureCipher + nsig via player.js) using the
+// session's visitorData-bound GVS PO token. Used as a one-shot fallback after an
+// iOS direct URL is rejected by GVS (HTTP 403) for a protected video.
+var g_skip_ios: bool = false;
 
 // iOS InnerTube User-Agent — must match the client that minted iOS stream URLs
 // so googlevideo (GVS) accepts the CDN range requests.
 const IOS_UA = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 17_7_1 like Mac OS X;)";
 
-pub const TokenSource = enum { none, cold_start, vm };
+pub const TokenSource = enum { none, cold_start, vm, external };
 var g_token_source: TokenSource = .none;
 const MediaKind = enum { audio, video };
 pub const DownloadOptions = struct {
@@ -139,15 +145,18 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
     stream_mod.setWebHeaders(true);
 
     var resp: []const u8 = "";
-    if (kind == .audio) {
+    var used_ios = false;
+    if (kind == .audio and !options.require_vm_token and !g_skip_ios) {
         const ios_resp = innertube.playerIos(video_id);
         if (hasDirectAudio(ios_resp)) {
             print("  [download] iOS client: direct audio URLs present, using iOS response\n");
             resp = ios_resp;
+            used_ios = true;
             // iOS GVS URLs carry their own attestation; appending the web
             // content-bound PO token to them is rejected (HTTP 403). Fetch the
             // iOS stream URL verbatim.
             g_stream_pot_len = 0;
+            g_token_source = .none;
             // GVS validates the stream request's User-Agent against the client
             // that minted the URL; iOS URLs must be fetched with the iOS UA and
             // without the web Origin/Referer headers.
@@ -158,9 +167,11 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
 
     // MWEB retains direct adaptive URLs; WEB may return SABR-only metadata.
     // Both use the same web visitor/cookies and video-bound BotGuard proof.
+    g_web_client = .mweb;
     if (resp.len == 0) resp = session_mod.playerInSession(&g_session, video_id, .mweb, g_pot_buf[0..g_pot_len]);
     if (!hasPlayerFormats(resp)) {
         print("  [download] session MWEB: no direct formats, trying session WEB...\n");
+        g_web_client = .web;
         resp = session_mod.playerInSession(&g_session, video_id, .web, g_pot_buf[0..g_pot_len]);
     }
     if (!hasPlayerFormats(resp) and options.require_vm_token) {
@@ -214,15 +225,12 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
         resp = g_player_copy[0..resp.len];
         print("  [download] Loading player.js for signature/n transforms...\n");
 
-        // Fetch watch page to get player.js URL
-        const watch_page = innertube.fetchWatchPage(video_id);
-        if (watch_page.len > 0) {
-            const player_url = cipher_mod.extractPlayerUrl(watch_page);
-            if (player_url.len > 0) {
-                if (!cipher_mod.loadCipher(player_url)) {
-                    print("  [download] WARN: Cipher extraction failed\n");
-                }
-            }
+        // Session configuration supplies the matching player without another
+        // large watch-page request. Retain the legacy discovery fallback.
+        var player_url = g_session.playerUrl();
+        if (player_url.len == 0) player_url = cipher_mod.extractPlayerUrl(innertube.fetchWatchPage(video_id));
+        if (player_url.len > 0) {
+            if (!cipher_mod.loadCipher(player_url)) print("  [download] WARN: Signature extraction unavailable; direct URLs may still use n transform\n");
         }
     }
 
@@ -237,7 +245,7 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
     }
 
     // Step 4: Select best audio stream
-    const best = if (kind == .video)
+    const direct_best = if (kind == .video)
         manifest_mod.selectBestMuxed(&formats, n_formats) orelse manifest_mod.selectBestVideo(&formats, n_formats)
     else
         // opus preferred, but MWEB/WEB adaptive sets often only carry AAC
@@ -246,6 +254,9 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
         manifest_mod.selectBestAudio(&formats, n_formats, codec_pref) orelse
         manifest_mod.selectBestAudio(&formats, n_formats, .any) orelse
         manifest_mod.selectBestMuxed(&formats, n_formats);
+    const best = direct_best orelse if (sabr_mod.player_fields.serverAbrStreamingUrl(resp) != null)
+        manifest_mod.selectBestSabr(&formats, n_formats, kind == .audio)
+    else null;
     if (best == null) {
         print(if (kind == .video) "  [download] ERROR: No video stream found\n" else "  [download] ERROR: No audio stream found\n");
         return status;
@@ -263,6 +274,7 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
     status.bitrate = fmt.bitrate;
     status.contains_video = fmt.is_video;
     status.contains_audio = fmt.is_audio;
+    if (extractJsonString(resp, "\"lengthSeconds\"")) |dur_str| status.duration_sec = parseUint(dur_str);
 
     // SABR branch: when the player response exposes serverAbrStreamingUrl (and
     // the selected format lacks a direct URL), YouTube serves this media only
@@ -270,7 +282,11 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
     // content-bound PO token + the session jar. The direct-URL path below stays
     // the fallback whenever a direct URL IS present.
     if (fmt.url_len == 0 and sabr_mod.player_fields.serverAbrStreamingUrl(resp) != null) {
-        if (trySabr(resp, fmt, kind, output_path, options, &status)) return status;
+        if (trySabr(resp, fmt, kind, output_path, options, &status)) {
+            if (status.success and kind == .video and !status.contains_audio and audio_path != null and audio_status_out != null)
+                downloadMatchingAudio(resp, &formats, n_formats, audio_path.?, options, status.duration_sec, audio_status_out.?);
+            return status;
+        }
     }
 
     // Step 5: Download the stream
@@ -346,33 +362,42 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
         }
     }
 
-    // Extract duration from player response
-    if (extractJsonString(resp, "\"lengthSeconds\"")) |dur_str| {
-        status.duration_sec = parseUint(dur_str);
+    if (status.success and kind == .video and !status.contains_audio and audio_path != null and audio_status_out != null) {
+        downloadMatchingAudio(resp, &formats, n_formats, audio_path.?, options, status.duration_sec, audio_status_out.?);
     }
 
-    if (status.success and kind == .video and !status.contains_audio and audio_path != null and audio_status_out != null) {
-        if (manifest_mod.selectBestAudio(&formats, n_formats, .aac) orelse manifest_mod.selectBestAudio(&formats, n_formats, .any)) |audio_fmt| {
-            print("  [download] Downloading matching adaptive audio from the same player/session...\n");
-            var a_url: [9216]u8 = undefined;
-            const a_len = appendStreamToken(audio_fmt.url[0..audio_fmt.url_len], &a_url);
-            const a_result = stream_mod.downloadToFile(a_url[0..a_len], audio_path.?, audio_fmt.content_length, options.progress);
-            var a_status = DownloadStatus{
-                .success = a_result.success,
-                .bytes_downloaded = a_result.bytes_written,
-                .container = .unknown,
-                .codec = .unknown,
-                .bitrate = audio_fmt.bitrate,
-                .duration_sec = status.duration_sec,
-                .contains_audio = true,
-                .token_source = g_token_source,
-            };
-            setContainer(audio_fmt, &a_status);
-            audio_status_out.?.* = a_status;
-        }
+    // iOS fallback: a protected video's iOS stream URL is served only as a ~1MB
+    // preview and then rejected (HTTP 403) because it lacks a matching GVS PO
+    // token. The WEB/MWEB path carries the session's visitorData-bound GVS token
+    // and (now that nsig runs on the jsvm) can de-throttle its URLs, so retry
+    // the audio once through the web clients when the iOS attempt failed.
+    if (!status.success and kind == .audio and used_ios and !g_skip_ios) {
+        print("  [download] iOS stream rejected; retrying via WEB/MWEB + nsig path...\n");
+        g_skip_ios = true;
+        const retry = downloadMedia(video_id, output_path, codec_pref, kind, options, audio_path, audio_status_out);
+        g_skip_ios = false;
+        if (retry.success) return retry;
     }
 
     return status;
+}
+
+fn downloadMatchingAudio(resp: []const u8, formats: []const manifest_mod.StreamFormat, n_formats: usize, path: [*:0]const u8, options: DownloadOptions, duration_sec: u32, out: *DownloadStatus) void {
+    const direct = manifest_mod.selectBestAudio(formats, n_formats, .aac) orelse manifest_mod.selectBestAudio(formats, n_formats, .any);
+    const audio_fmt = direct orelse (if (sabr_mod.player_fields.serverAbrStreamingUrl(resp) != null) manifest_mod.selectBestSabr(formats, n_formats, true) else null) orelse return;
+    print("  [download] Downloading matching adaptive audio from the same player/session...\n");
+    out.* = .{ .success = false, .bytes_downloaded = 0, .container = .unknown, .codec = .unknown, .bitrate = audio_fmt.bitrate, .duration_sec = duration_sec, .contains_audio = true, .token_source = g_token_source };
+    if (audio_fmt.url_len == 0) {
+        _ = trySabr(resp, audio_fmt, .audio, path, options, out);
+        return;
+    }
+    var a_url: [9216]u8 = undefined;
+    const a_len = appendStreamToken(audio_fmt.url[0..audio_fmt.url_len], &a_url);
+    if (a_len == 0) return;
+    const result = stream_mod.downloadToFile(a_url[0..a_len], path, audio_fmt.content_length, options.progress);
+    out.bytes_downloaded = result.bytes_written;
+    out.success = result.success;
+    if (out.success) setContainer(audio_fmt, out);
 }
 
 /// Download audio by URL (any YouTube URL format).
@@ -434,43 +459,37 @@ fn prepareTokens(video_id: *const [meta.VIDEO_ID_LEN]u8, options: DownloadOption
     g_session = session_mod.Session.init();
     g_challenge = challenge_mod.Challenge.init();
 
-    // A relayed content-bound token short-circuits minting (the session is
-    // still bootstrapped below for the SABR jar + visitorData).
+    // External proofs are diagnostic inputs, not evidence of native minting.
+    if (options.pot_override.len > 0 and options.require_vm_token) {
+        print("  [download] ERROR: External PO token cannot satisfy require_vm_token\n");
+        return;
+    }
     if (options.pot_override.len > 0 and options.pot_override.len <= g_pot_buf.len) {
         @memcpy(g_pot_buf[0..options.pot_override.len], options.pot_override);
         g_pot_len = options.pot_override.len;
-        _ = session_mod.bootstrap(&g_session, &g_challenge);
-        if (g_session.visitorData().len > 0) {
-            g_stream_pot_len = minter.mintColdStart(g_session.visitorData(), &g_stream_pot_buf);
-        } else {
-            g_stream_pot_len = minter.mintColdStart(video_id, &g_stream_pot_buf);
-        }
-        g_token_source = .vm; // treated as an externally-provided real token
+        if (!session_mod.bootstrap(&g_session, &g_challenge)) return;
+        _ = session_mod.prepareMobileClient(&g_session);
+        @memcpy(g_stream_pot_buf[0..g_pot_len], g_pot_buf[0..g_pot_len]);
+        g_stream_pot_len = g_pot_len;
+        g_token_source = .external;
         print("  [download] using relayed content-bound PO token (pot_override)\n");
         return;
     }
 
     if (session_mod.bootstrap(&g_session, &g_challenge)) _ = session_mod.prepareMobileClient(&g_session);
-    // The live BotGuard Create challenge carries server-side randomness: each
-    // fetch exercises different VM paths, and some paths hit residual VM/env gaps
-    // that inflate the snapshot payload → GenerateIT returns a null integrity
-    // token (no minter). A clean path (compact response, non-null token, populated
-    // minter) DOES occur frequently, so retry the whole Create→VM→GenerateIT
-    // establishment with a FRESH challenge each attempt until the minter is ready.
-    const MAX_VM_ATTEMPTS: u32 = 10;
+    // Each retry obtains a fresh challenge through the same visitor/cookie jar.
+    const MAX_VM_ATTEMPTS: u32 = 3;
     var attempt: u32 = 0;
     while (attempt < MAX_VM_ATTEMPTS) : (attempt += 1) {
         var integrity_result = session_mod.IntegrityResult{};
-        g_challenge = challenge_mod.Challenge.init();
+        if (attempt > 0) g_challenge = challenge_mod.Challenge.init();
         if (attempt > 0) { print("  [download] minter retry "); printNum(attempt); print("/"); printNum(MAX_VM_ATTEMPTS); print("\n"); }
         if (session_mod.establishIntegrityToken(&g_session, &g_challenge, &integrity_result) and integrity_result.minter_ready) {
             const token = integrity_result.integrity_token[0..integrity_result.integrity_token_len];
             g_pot_len = minter.mintContentBound(token, video_id, &g_pot_buf);
-            // Prefer a visitor/session-bound stream token when visitorData is
-            // present (what the SABR/stream requests use); else reuse content-bound.
-            if (g_session.visitorData().len > 0)
-                g_stream_pot_len = minter.mintSessionBound(token, g_session.visitorData(), &g_stream_pot_buf);
-            if (g_stream_pot_len == 0 and g_pot_len > 0) { @memcpy(g_stream_pot_buf[0..g_pot_len], g_pot_buf[0..g_pot_len]); g_stream_pot_len = g_pot_len; }
+            // Current web delivery tokens bind to the video ID. Reuse this
+            // proof for GVS/SABR rather than minting with a different binding.
+            if (g_pot_len > 0) { @memcpy(g_stream_pot_buf[0..g_pot_len], g_pot_buf[0..g_pot_len]); g_stream_pot_len = g_pot_len; }
             if (g_pot_len > 0 and g_stream_pot_len > 0) {
                 g_token_source = .vm;
                 print("  [download] VM minted content-bound PO token (attempt "); printNum(attempt + 1); print(")\n");
@@ -510,14 +529,20 @@ fn trySabr(
 
     // 1. serverAbrStreamingUrl (JSON-escaped) -> unescape to a real URL.
     const url_esc = sabr_mod.player_fields.serverAbrStreamingUrl(resp) orelse return false;
-    const url_len = sabr_mod.player_fields.unescapeInto(url_esc, &g_sabr_url_buf);
-    if (url_len == 0) return false;
+    const raw_url_len = sabr_mod.player_fields.unescapeInto(url_esc, &g_sabr_url_buf);
+    if (raw_url_len == 0 or raw_url_len == g_sabr_url_buf.len) return false;
+    const url_len = manifest_mod.transformStreamUrl(g_sabr_url_buf[0..raw_url_len], &g_sabr_url_buf);
+    if (url_len == 0) {
+        print("  [download] SABR endpoint n transform unavailable\n");
+        return false;
+    }
     const sabr_url = g_sabr_url_buf[0..url_len];
 
     // 2. ustreamer config (base64 string) -> raw bytes for the request field.
     var cfg_bytes: []const u8 = "";
     if (sabr_mod.player_fields.ustreamerConfig(resp)) |cfg_b64| {
         const n = base64Decode(cfg_b64, &g_sabr_cfg_buf);
+        if (n == 0) return false;
         cfg_bytes = g_sabr_cfg_buf[0..n];
     }
 
@@ -525,6 +550,7 @@ fn trySabr(
     var pot_bytes: []const u8 = "";
     if (g_pot_len > 0) {
         const n = base64Decode(g_pot_buf[0..g_pot_len], &g_sabr_pot_buf);
+        if (n == 0) return false;
         pot_bytes = g_sabr_pot_buf[0..n];
     }
 
@@ -539,13 +565,20 @@ fn trySabr(
     // 5. open the output sink + the live transport (session jar).
     var fsink = sabr_mod.stream.FileSink.open(output_path) orelse return false;
     defer fsink.close();
-    var transport_ctx = sabr_mod.stream.NetTransport{ .jar = &g_session.jar };
+    var transport_ctx = sabr_mod.stream.NetTransport{
+        .jar = &g_session.jar,
+        .user_agent = if (g_web_client == .mweb) session_mod.MWEB_UA else http.CHROME_UA,
+    };
 
-    const client_version = if (g_session.clientVersion().len > 0) g_session.clientVersion() else "2.20250312.04.00";
+    const client_version = if (g_web_client == .mweb)
+        g_session.mweb_client_version[0..g_session.mweb_client_version_len]
+    else g_session.clientVersion();
+    if (client_version.len == 0) return false;
     const selected = sabr_mod.request.SelectedFormat{
         .itag = @intCast(fmt.itag),
         .last_modified = fmt.last_modified,
         .xtags = fmt.xtags[0..fmt.xtags_len],
+        .content_length = fmt.content_length,
     };
 
     print("  [download] SABR loop starting itag=");
@@ -563,7 +596,7 @@ fn trySabr(
         kind == .audio,
         cfg_bytes,
         pot_bytes,
-        1, // WEB
+        if (g_web_client == .mweb) 2 else 1,
         client_version,
         fsink.sink(),
     );
@@ -594,22 +627,26 @@ fn trySabr(
     return res.bytes_written > 0; // partial bytes still count as "handled"
 }
 
-// Decode standard OR url-safe base64 (ignoring padding/whitespace) into `out`.
+// Decode standard or URL-safe base64, rejecting malformed or oversized values.
 fn base64Decode(input: []const u8, out: []u8) usize {
     var acc: u32 = 0;
     var nbits: u5 = 0;
     var oi: usize = 0;
+    var padding: usize = 0;
     for (input) |c| {
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') continue;
+        if (c == '=') { padding += 1; if (padding > 2) return 0; continue; }
         const v: i16 = b64Val(c);
-        if (v < 0) continue;
+        if (v < 0 or padding > 0) return 0;
         acc = (acc << 6) | @as(u32, @intCast(v));
         if (nbits >= 2) {
             nbits -= 2;
-            if (oi >= out.len) return oi;
+            if (oi >= out.len) return 0;
             out[oi] = @intCast((acc >> nbits) & 0xFF);
             oi += 1;
         } else nbits += 6;
     }
+    if (nbits == 6 or (nbits > 0 and acc & ((@as(u32, 1) << nbits) - 1) != 0)) return 0;
     return oi;
 }
 

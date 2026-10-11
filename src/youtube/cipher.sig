@@ -28,6 +28,7 @@
 // and parse the call sequence with numeric args.
 
 const innertube = @import("innertube.sig");
+const player_transform = @import("player_transform.sig");
 
 // ── Operation types ──
 
@@ -58,16 +59,17 @@ pub const CipherProgram = struct {
 
 // ── Module state ──
 
-// Player.js buffer (player.js is ~2.6 MB in 2026 — size generously so the
-// cipher/nsig functions near the end are never truncated).
-const PLAYER_JS_SIZE: usize = 4 * 1024 * 1024;
+// Bounded source storage. A response filling the capacity is rejected instead
+// of attempting to decipher signatures with a truncated player.
+const PLAYER_JS_SIZE: usize = 8 * 1024 * 1024;
 var player_js_buf: [PLAYER_JS_SIZE]u8 = undefined;
 var player_js_len: usize = 0;
 
 // Cached cipher program (reused for all videos using same player version)
 var cached_program: CipherProgram = CipherProgram.init();
-var cached_player_id: [32]u8 = undefined;
+var cached_player_id: [512]u8 = undefined;
 var cached_player_id_len: usize = 0;
+var player_generation: u32 = 0;
 
 /// Extract the player.js URL from a watch page HTML response.
 /// Looks for: "/s/player/XXXXXX/player_ias.vflset/en_US/base.js"
@@ -75,20 +77,33 @@ var cached_player_id_len: usize = 0;
 pub fn extractPlayerUrl(html: []const u8) []const u8 {
     // Pattern: /s/player/[a-f0-9]+/player_ias.vflset/
     const marker = "/s/player/";
-    const pos = findStr(html, marker) orelse return "";
-    // Find the end of the URL (terminated by " or ')
-    var end = pos;
-    while (end < html.len and html[end] != '"' and html[end] != '\'') : (end += 1) {}
-    if (end <= pos) return "";
-    return html[pos..end];
+    var search: usize = 0;
+    while (search < html.len) {
+        const rel = findStr(html[search..], marker) orelse return "";
+        const pos = search + rel;
+        var end = pos;
+        while (end < html.len and html[end] != '"' and html[end] != '\'' and html[end] != '<' and html[end] != ' ' and html[end] != '\n') : (end += 1) {}
+        if (findStr(html[pos..end], "/base.js") != null) return html[pos..end];
+        search = pos + marker.len;
+    }
+    return "";
 }
 
 /// Load and parse the cipher program from a player.js file.
 /// `player_url`: path like "/s/player/abc123/player_ias.vflset/en_US/base.js"
 /// Returns true if cipher was successfully extracted.
 pub fn loadCipher(player_url: []const u8) bool {
+    if (!loadPlayer(player_url)) return false;
+    if (cached_program.valid) return true;
+    return player_transform.prepare(getPlayerJs(), player_generation) and player_transform.isSignatureReady();
+}
+
+/// Cache complete source independently of signature availability: direct signed
+/// URLs still require this source for their n parameter.
+pub fn loadPlayer(player_url: []const u8) bool {
+    if (player_url.len == 0 or player_url.len > cached_player_id.len) return false;
     // Check cache: same player = same cipher
-    if (player_url.len == cached_player_id_len and cached_program.valid) {
+    if (player_url.len == cached_player_id_len and player_js_len != 0) {
         var same = true;
         for (0..player_url.len) |i| {
             if (player_url[i] != cached_player_id[i]) { same = false; break; }
@@ -97,15 +112,18 @@ pub fn loadCipher(player_url: []const u8) bool {
     }
 
     // Fetch player.js
+    cached_program = CipherProgram.init();
+    cached_player_id_len = 0;
+    player_generation +%= 1;
     player_js_len = innertube.fetchPlayerJs(player_url, &player_js_buf, PLAYER_JS_SIZE);
-    if (player_js_len == 0) return false;
+    // A full buffer may be a truncated response. Never parse a partial script.
+    if (player_js_len == 0 or player_js_len >= PLAYER_JS_SIZE) { player_js_len = 0; return false; }
 
     // Parse cipher function
     cached_program = parseCipherFunction(player_js_buf[0..player_js_len]);
-    if (!cached_program.valid) return false;
 
     // Cache the player ID
-    const id_len = @min(player_url.len, 32);
+    const id_len = player_url.len;
     @memcpy(cached_player_id[0..id_len], player_url[0..id_len]);
     cached_player_id_len = id_len;
 
@@ -117,11 +135,15 @@ pub fn loadCipher(player_url: []const u8) bool {
 /// `out`: buffer to write decrypted signature
 /// Returns length of decrypted signature.
 pub fn decryptSignature(sig: []const u8, out: *[256]u8) usize {
-    if (!cached_program.valid) return 0;
+    if (sig.len == 0 or sig.len > out.len) return 0;
+    if (!cached_program.valid) {
+        if (!player_transform.prepare(getPlayerJs(), player_generation)) return 0;
+        return player_transform.transformSignature(sig, out);
+    }
 
     // Copy sig to working buffer (we modify in place)
     var work: [256]u8 = undefined;
-    const slen = @min(sig.len, 256);
+    const slen = sig.len;
     @memcpy(work[0..slen], sig[0..slen]);
     var len = slen;
 
@@ -130,6 +152,7 @@ pub fn decryptSignature(sig: []const u8, out: *[256]u8) usize {
         const step = &cached_program.steps[i];
         switch (step.op) {
             .reverse => {
+                if (len < 2) continue;
                 // Reverse the array
                 var lo: usize = 0;
                 var hi: usize = len - 1;
@@ -167,8 +190,10 @@ pub fn decryptSignature(sig: []const u8, out: *[256]u8) usize {
 
 /// Check if the cipher is loaded and ready.
 pub fn isReady() bool {
-    return cached_program.valid;
+    return player_js_len != 0 and (cached_program.valid or (player_transform.isPreparedFor(player_generation) and player_transform.isSignatureReady()));
 }
+
+pub fn playerGeneration() u32 { return player_generation; }
 
 /// Get the raw player.js content (for nsig extraction).
 pub fn getPlayerJs() []const u8 {

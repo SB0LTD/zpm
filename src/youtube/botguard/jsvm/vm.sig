@@ -1455,7 +1455,11 @@ fn fail(reason: []const u8) void {
 // ── Public API ──
 
 /// Execute bytecode. Returns the final value on stack (or undefined).
+var realm_generation: u32 = 0;
+pub fn realmGeneration() u32 { return realm_generation; }
+
 pub fn execute() Value {
+    realm_generation +%= 1;
     dbg_T_name_idx = values.internString("T");
     dbg_Y_name_idx = values.internString("Y");
     dbg_ox_name_idx = values.internString("ox");
@@ -1558,6 +1562,8 @@ pub fn execute() Value {
     objects.bindRuntimeStack(stack[0..]);
     global_obj = objects.createObject();
     builtins.invoke_callback = &invokeBuiltinCallback;
+    values.object_number = &numericObjectPrimitive;
+    builtins.string_conversion = &stringObjectPrimitive;
     builtins.installGlobals(global_obj);
     env.installEnvironment(global_obj);
 
@@ -2566,7 +2572,12 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                     return false;
                 }
                 const ge_res = getElemFromValue(obj_val, key);
-                if (dbg_gtrace_on and dbg_gtrace_n >= 3700 and dbg_gtrace_n <= 3910 and key.tag == .string and ge_res.tag == .undefined and dbg_probe_n < dbg_probe_key.len) {
+                if (dbg_gtrace_on and key.tag == .string and eql(values.getString(key.data.str_idx), "webdriver") and dbg_gtrace_n < 12605) {
+                    dbg_property_receiver = obj_val;
+                    dbg_property_key = key;
+                    dbg_property_result = ge_res;
+                }
+                if (dbg_gtrace_on and key.tag == .string and dbg_gtrace_n >= 7300 and dbg_gtrace_n <= 7450 and dbg_probe_n < dbg_probe_key.len) {
                     dbg_probe_key[dbg_probe_n] = key.data.str_idx;
                     dbg_probe_gn[dbg_probe_n] = dbg_gtrace_n;
                     dbg_probe_obj[dbg_probe_n] = obj_val;
@@ -2701,7 +2712,9 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
             .sub => { const b = pop(); const a = pop(); push(Value.number(a.toNumber() - b.toNumber())); },
             .mul => { const b = pop(); const a = pop(); push(Value.number(a.toNumber() * b.toNumber())); },
             .div => { const b = pop(); const a = pop(); push(Value.number(a.toNumber() / b.toNumber())); },
-            .mod => { const b = pop(); const a = pop(); push(Value.number(@mod(a.toNumber(), b.toNumber()))); },
+            // JavaScript % is truncating remainder: its sign follows the
+            // dividend. Euclidean modulo changes negative transform operands.
+            .mod => { const b = pop(); const a = pop(); push(Value.number(jsRemainder(a.toNumber(), b.toNumber()))); },
             .pow => { const b = pop(); const a = pop(); push(Value.number(mathPow(a.toNumber(), b.toNumber()))); },
             .neg => { const a = pop(); push(Value.number(-a.toNumber())); },
             .pos => { const a = pop(); push(Value.number(a.toNumber())); },
@@ -2717,6 +2730,7 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
 
             // Comparison
             .eq => { const b = pop(); const a = pop();
+                if (dbg_gtrace_on and stack[frame.bp + 2].toNumber() == 236 and startsWith(compiler.funcSourceText(frame.func_id), "function(w,F,A,J,v,c){h1(")) { dbg_branch_a = a; dbg_branch_b = b; }
                 if (frame.func_id == 333 and dbg_guard_n < 64) {
                     const ev = stack[frame.bp+5];
                     if (ev.tag == .function and eql(compiler.funcSourceText(objects.closureFuncId(ev.data.func_idx)), "function(k){return x3.call(this,0,8,k)}")) {
@@ -2724,11 +2738,13 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                     }
                 }
                 push(boolVal(abstractEq(a, b))); },
-            .neq => { const b = pop(); const a = pop(); push(boolVal(!abstractEq(a, b))); },
+            .neq => { const b = pop(); const a = pop();
+                push(boolVal(!abstractEq(a, b))); },
             .seq => { const b = pop(); const a = pop(); push(boolVal(strictEq(a, b))); },
             .sneq => { const b = pop(); const a = pop(); push(boolVal(!strictEq(a, b))); },
             .lt => { const b = pop(); const a = pop(); push(boolVal(a.toNumber() < b.toNumber())); },
             .gt => { const b = pop(); const a = pop();
+                if (dbg_gtrace_on and dbg_branch_a.tag == .undefined and startsWith(compiler.funcSourceText(frame.func_id), "function(w,F,A,J,v,c){h1(") and stack[frame.bp + 2].toNumber() == 282) { dbg_branch_a = a; dbg_branch_b = b; }
                 // ROOT capture: the `Lt.length>4` compare in func 286 (z==96). Record
                 // the LHS (Lt.length) whenever RHS==4 and we're in the state-machine func.
                 if (dbg_gt4_watch and frame.func_id == dbg_gt4_func and b.tag == .number and b.data.number == 4 and dbg_gt4_n < dbg_gt4_val.len) {
@@ -3586,12 +3602,30 @@ pub var dbg_encode_g: [128]Value = undefined;
 pub var dbg_encode_caller: [128]u16 = undefined;
 fn dbgHashEntry(frame: *CallFrame) void {
     if (!dbg_gtrace_on) return;
+    const register_write = if (startsWith(compiler.funcSourceText(frame.func_id), "function(f,Q,E){switch(!(f==94||f==401))")) stack[frame.bp + 1].toNumber() else if (startsWith(compiler.funcSourceText(frame.func_id), "function(f,Q,E){switch(!(Q==94||Q==401))")) stack[frame.bp + 2].toNumber() else -1;
+    if (dbg_417_n < 32 and frame.ip == compiler.getFunction(frame.func_id).code_start + 1 and register_write == 94 and dbg_gtrace_n >= 16120 and dbg_gtrace_n <= 16145) {
+        dbg_417_values[dbg_417_n] = stack[frame.bp + 3];
+        dbg_417_registers[dbg_417_n] = register_write;
+        dbg_417_g[dbg_417_n] = dbg_gtrace_n;
+        const state = if (startsWith(compiler.funcSourceText(frame.func_id), "function(f,Q,E){switch(!(Q==94||Q==401))")) stack[frame.bp + 1] else stack[frame.bp + 2];
+        const bank = objects.getProperty(state.data.obj_idx, values.internString("o"));
+        dbg_94_bank[dbg_417_n] = bank;
+        dbg_94_cell[dbg_417_n] = objects.getArrayElement(bank.data.obj_idx, 94);
+        if (register_write == 153 and dbg_gtrace_n > 20000 and dbg_gtrace_n < 23000 and frame_count > 1) {
+            const caller = frames[frame_count - 2];
+            dbg_property_receiver = stack[caller.bp + 3];
+            dbg_property_key = stack[caller.bp + 2];
+        }
+        dbg_417_funcs[dbg_417_n] = if (frame_count > 1) frames[frame_count - 2].func_id else 0xFFFF;
+        dbg_417_n += 1;
+    }
     if (frame.func_id == 302 and frame.ip == compiler.getFunction(302).code_start + 1 and dbg_encode_n < 128) {
         dbg_encode_args[dbg_encode_n] = stack[frame.bp + 1]; dbg_encode_x[dbg_encode_n] = stack[frame.bp + 2]; dbg_encode_g[dbg_encode_n] = stack[frame.bp + 3];
         dbg_encode_caller[dbg_encode_n] = if (frame_count > 1) frames[frame_count-2].func_id else 0xFFFF;
         dbg_encode_len[dbg_encode_n] = objects.arrayLength(stack[frame.bp+2].data.obj_idx); dbg_encode_n += 1;
     }
-    if (!startsWith(compiler.funcSourceText(frame.func_id), "function(b,x,g,Y,L){if(b.length==3)") or frame.ip != compiler.getFunction(frame.func_id).code_start + 1 or dbg_hash_n >= 8192) return;
+    const hash_source = compiler.funcSourceText(frame.func_id);
+    if ((!startsWith(hash_source, "function(b,x,g,Y,L){if(b.length==3)") and !startsWith(hash_source, "function(f,Q,E,T,D){if(f.length==3)")) or frame.ip != compiler.getFunction(frame.func_id).code_start + 1 or dbg_hash_n >= 8192) return;
     const b = stack[frame.bp + 1];
     const x = stack[frame.bp + 2];
     if ((b.tag != .object and b.tag != .array) or (x.tag != .object and x.tag != .array) or objects.arrayLength(b.data.obj_idx) != 3) return;
@@ -4155,7 +4189,7 @@ fn callFunction(argc: u8) void {
 // Scratch buffer to hold eval/Function source while it is (re)compiled.
 // eval sources for BotGuard's unpack step are large; give generous headroom.
 var eval_src_buf: [512 * 1024]u8 = undefined;
-pub var dbg_short_eval_buf: [65536]u8 = undefined;
+pub var dbg_short_eval_buf: [262144]u8 = undefined;
 pub var dbg_short_eval_len: usize = 0;
 // Set by the .call_direct_eval opcode: the current call is a DIRECT eval, so
 // the eval'd source must inherit the caller frame's lexical scope.
@@ -5629,6 +5663,18 @@ pub fn dbgDlVal(i: usize) f64 { return if (i < 16) dbg_dl_vals[i] else -1; }
 pub var execution_limit: u64 = 200_000_000;
 pub var dbg_gtrace_on: bool = false;
 pub var dbg_type_n: usize = 0;
+pub var dbg_branch_a: Value = Value.UNDEFINED;
+pub var dbg_branch_b: Value = Value.UNDEFINED;
+pub var dbg_417_n: usize = 0;
+pub var dbg_417_values: [32]Value = undefined;
+pub var dbg_417_registers: [32]f64 = undefined;
+pub var dbg_417_g: [32]usize = undefined;
+pub var dbg_property_receiver: Value = Value.UNDEFINED;
+pub var dbg_property_key: Value = Value.UNDEFINED;
+pub var dbg_property_result: Value = Value.UNDEFINED;
+pub var dbg_94_bank: [32]Value = undefined;
+pub var dbg_94_cell: [32]Value = undefined;
+pub var dbg_417_funcs: [32]u16 = undefined;
 pub var dbg_type_gn: [4096]usize = undefined;
 pub var dbg_type_func: [4096]u16 = undefined;
 pub var dbg_type_name: [4096]u32 = undefined;
@@ -5643,11 +5689,16 @@ pub var dbg_probe_obj: [1024]Value = undefined;
 pub var dbg_probe_func: [1024]u16 = undefined;
 pub var dbg_gtrace_func: u16 = 0xFFFF;
 pub var dbg_gtrace_val: [200000]f64 = undefined;
+pub var dbg_gtrace_pos: [200000]f64 = undefined;
+pub var dbg_gtrace_cap_keyvals: [5]Value = [_]Value{Value.UNDEFINED} ** 5;
+pub var dbg_gtrace_cap_keynums: [5][32]Value = undefined;
+pub var dbg_gtrace_cap_keylens: [5]u32 = [_]u32{0} ** 5;
 pub var dbg_gtrace_sel: [200000]i32 = undefined;
 pub var dbg_gtrace_n: usize = 0;
 pub fn dbgGTraceEnable(func: u16) void { dbg_gtrace_on = true; dbg_gtrace_func = func; dbg_gtrace_n = 0; }
 pub fn dbgGTraceN() usize { return dbg_gtrace_n; }
 pub fn dbgGTraceVal(i: usize) f64 { return if (i < dbg_gtrace_n) dbg_gtrace_val[i] else -1234567890123.0; }
+pub fn dbgGTracePos(i: usize) f64 { return if (i < dbg_gtrace_n) dbg_gtrace_pos[i] else -1; }
 pub fn dbgGTraceSel(i: usize) i32 { return if (i < dbg_gtrace_n) dbg_gtrace_sel[i] else -1; }
 pub var dbg_gtrace_cap_idx: usize = 0xFFFFFFFF;
 pub var dbg_gtrace_cap_func: [32]u16 = [_]u16{0xFFFF} ** 32;
@@ -5909,6 +5960,15 @@ fn callConstructor(argc: u8) void {
     // new F(args): create an object, call F with it bound as `this`.
     if (sp < argc + 1) { fail("new: stack underflow"); return; }
 
+    const ctor_slot = sp - 1 - argc;
+    const native_ctor = stack[ctor_slot];
+    if (native_ctor.tag == .function and objects.closureFuncId(native_ctor.data.func_idx) == builtins.N_DATE_CTOR) {
+        const result = builtins.constructDate(stack[ctor_slot + 1 .. sp]);
+        sp = ctor_slot;
+        push(result);
+        return;
+    }
+
     const new_obj = objects.createObject();
     const depth_before = frame_count;
     // DIAGNOSTIC: count `new X()` calls + record the first 16 constructor func ids.
@@ -6103,15 +6163,27 @@ fn returnFromFrame(result_in: Value) void {
     }
     // Trace the G reader (func dbg_gtrace_func) return values, so the decoded
     // operand array (dL = g[1][1]) element sequence can be diffed vs the oracle.
-    if (dbg_gtrace_on and frame_count > 0 and (frames[frame_count - 1].func_id == dbg_gtrace_func or startsWith(compiler.funcSourceText(frames[frame_count - 1].func_id), "function(b,x,g,Y,L){for(null==false;")) and dbg_gtrace_n < dbg_gtrace_val.len) {
+    if (dbg_gtrace_on and frame_count > 0 and (frames[frame_count - 1].func_id == dbg_gtrace_func or startsWith(compiler.funcSourceText(frames[frame_count - 1].func_id), "function(b,x,g,Y,L){for(null==false;") or startsWith(compiler.funcSourceText(frames[frame_count - 1].func_id), "function(f,Q,E,T,D,e,H,q,P,O,I,Y,K,V,y,X){if((V=b(f,94),V)>=")) and dbg_gtrace_n < dbg_gtrace_val.len) {
         dbg_gtrace_val[dbg_gtrace_n] = if (result_in.tag == .number) result_in.data.number else -1234567890123.0;
         // Record G's selector arg x (local 2) so we can see if a divergent read
         // used a varint-triggering selector.
         const gf = frames[frame_count - 1];
+        const gsrc = compiler.funcSourceText(gf.func_id);
+        dbg_gtrace_pos[dbg_gtrace_n] = if (startsWith(gsrc, "function(f,Q,E,T,D,e,H,q,P,O,I,Y,K,V,y,X){if((V=b(f,94),V)>=") and gf.bp + 14 < MAX_STACK and stack[gf.bp + 14].tag == .number) stack[gf.bp + 14].data.number else -1;
         dbg_gtrace_sel[dbg_gtrace_n] = if (gf.bp + 2 < MAX_STACK and stack[gf.bp + 2].tag == .number) @intFromFloat(stack[gf.bp + 2].data.number) else -1;
         // At the known-divergent G index, capture the full caller stack (func@ip)
         // so we can identify the dispatch that chose the wrong selector.
         if (dbg_gtrace_n == dbg_gtrace_cap_idx) {
+            const state = stack[gf.bp + 1];
+            if (startsWith(gsrc, "function(f,Q,E,T,D,e,H,q,P,O,I,Y,K,V,y,X){if((V=b(f,94),V)>=") and (state.tag == .object or state.tag == .array)) {
+                for ([_][]const u8{ "A", "O", "KJ", "oP", "e" }, 0..) |name, ki| {
+                    const kv = if (ki == 4) stack[gf.bp + 6] else objects.getProperty(state.data.obj_idx, values.internString(name));
+                    dbg_gtrace_cap_keyvals[ki] = kv;
+                    const kl = if (kv.tag == .object or kv.tag == .array) objects.arrayLength(kv.data.obj_idx) else 0;
+                    dbg_gtrace_cap_keylens[ki] = kl;
+                    for (0..@min(kl, 32)) |kj| dbg_gtrace_cap_keynums[ki][kj] = objects.getArrayElement(kv.data.obj_idx, @intCast(kj));
+                }
+            }
             dbg_gtrace_cap_n = 0;
             var gsi: usize = frame_count;
             while (gsi > 0 and dbg_gtrace_cap_n < dbg_gtrace_cap_func.len) { gsi -= 1;
@@ -6620,7 +6692,9 @@ fn throwTypeErrorMsg(msg: []const u8) void {
 fn checkNativeThrow() bool {
     if (!builtins.native_throw) return false;
     builtins.native_throw = false;
-    throwTypeErrorMsg(builtins.nativeThrowMsg());
+    const err = makeErrorObject(builtins.native_throw_name, builtins.nativeThrowMsg());
+    had_error = true;
+    throwException(err);
     return true;
 }
 
@@ -6628,6 +6702,7 @@ fn checkNativeThrow() bool {
 /// invoked (JS semantics). BotGuard's feature detection depends on this.
 pub var dbg_failure_n: usize = 0;
 pub var dbg_failure_func: [16]u16 = undefined;
+pub var dbg_failure_gn: [16]usize = undefined;
 pub var dbg_failure_name: [16]u32 = undefined;
 pub var dbg_failure_locals: [16][32]Value = undefined;
 pub var dbg_failure_upvals: [16][64]Value = undefined;
@@ -6636,6 +6711,7 @@ fn dbgTraceFailure(name_idx: u32) void {
     const i = dbg_failure_n;
     const frame = frames[frame_count - 1];
     dbg_failure_func[i] = frame.func_id;
+    dbg_failure_gn[i] = dbg_gtrace_n;
     dbg_failure_name[i] = name_idx;
     for (0..32) |j| dbg_failure_locals[i][j] = if (frame.bp + j < sp) stack[frame.bp + j] else Value.UNDEFINED;
     for (0..64) |j| {
@@ -7096,7 +7172,9 @@ pub fn dbgPpConcatEnable() void { dbg_ppconcat_watch = true; dbg_ppconcat_done =
 pub fn dbgPpConcatBTag() u8 { return dbg_ppconcat_btag; }
 pub fn dbgPpConcatBFunc() u16 { return dbg_ppconcat_bfunc; }
 pub fn dbgPpConcatBStr() []const u8 { return dbg_ppconcat_bstr[0..dbg_ppconcat_bstr_len]; }
-fn addValues(a: Value, b: Value) Value {
+fn addValues(left: Value, right: Value) Value {
+    const a = if (left.tag == .object or left.tag == .array or left.tag == .function) objectPrimitive(left) else left;
+    const b = if (right.tag == .object or right.tag == .array or right.tag == .function) objectPrimitive(right) else right;
     // String concatenation if either operand is a string.
     if (a.tag == .string or b.tag == .string) {
         // DIAGNOSTIC: capture the operand tags when `a` is the string "PP=" (the
@@ -7145,7 +7223,7 @@ fn valueToStringIdx(v: Value) u32 {
                 const src = compiler.funcSourceText(fid);
                 if (src.len > 0 and (src[0] == 'f' or src[0] == '(' or src[0] == 'a')) break :blk values.internString(src);
             }
-            break :blk values.internString("function () { [native code] }");
+            break :blk builtins.nativeFunctionSource(v);
         },
         .object, .array => objectToStringIdx(v),
         else => values.internString("[object Object]"),
@@ -7234,6 +7312,9 @@ fn strictEq(a: Value, b: Value) bool {
 }
 
 fn abstractEq(a: Value, b: Value) bool {
+    const a_object = a.tag == .object or a.tag == .array or a.tag == .function;
+    const b_object = b.tag == .object or b.tag == .array or b.tag == .function;
+    if (a_object and b_object) return a.data.obj_idx == b.data.obj_idx;
     if (a.tag == b.tag) return strictEq(a, b);
     // null and undefined are loosely equal to EACH OTHER and to NOTHING else.
     // They must never coerce to a number — `null == false`, `null == 0`,
@@ -7243,12 +7324,42 @@ fn abstractEq(a: Value, b: Value) bool {
     if (a.tag == .null_val or a.tag == .undefined or b.tag == .null_val or b.tag == .undefined) {
         return (a.tag == .null_val or a.tag == .undefined) and (b.tag == .null_val or b.tag == .undefined);
     }
-    // Boolean operand: convert boolean to number, then compare (JS ToNumber).
-    // string<->number: numeric comparison via toNumber.
-    // object<->primitive would need ToPrimitive; BotGuard rarely relies on it,
-    // so numeric coercion is a reasonable approximation for the remaining mixed
-    // primitive cases.
+    if (a.tag == .boolean) return abstractEq(Value.number(a.toNumber()), b);
+    if (b.tag == .boolean) return abstractEq(a, Value.number(b.toNumber()));
+    if (a_object) return abstractEq(objectPrimitive(a), b);
+    if (b_object) return abstractEq(a, objectPrimitive(b));
     return a.toNumber() == b.toNumber();
+}
+
+fn objectPrimitive(value: Value) Value {
+    // OrdinaryToPrimitive with number/default hint: valueOf before toString.
+    // Calling through the VM preserves receiver binding and user side effects.
+    for ([_][]const u8{ "valueOf", "toString" }) |name| {
+        const method = getPropFromValue(value, values.internString(name));
+        if (method.tag != .function) continue;
+        const result = callValueSync(method, value, Value.UNDEFINED, Value.UNDEFINED, Value.UNDEFINED, 0);
+        if (had_error) return Value.UNDEFINED;
+        if (result.tag != .object and result.tag != .array and result.tag != .function) return result;
+    }
+    throwTypeErrorMsg("Cannot convert object to primitive value");
+    return Value.UNDEFINED;
+}
+
+fn stringObjectPrimitive(value: Value) u32 {
+    for ([_][]const u8{ "toString", "valueOf" }) |name| {
+        const method = getPropFromValue(value, values.internString(name));
+        if (method.tag != .function) continue;
+        const result = callValueSync(method, value, Value.UNDEFINED, Value.UNDEFINED, Value.UNDEFINED, 0);
+        if (had_error) return values.internString("");
+        if (result.tag != .object and result.tag != .array and result.tag != .function) return valueToStringIdx(result);
+    }
+    throwTypeErrorMsg("Cannot convert object to primitive value");
+    return values.internString("");
+}
+
+fn numericObjectPrimitive(index: u32) f64 {
+    const value = if (objects.objTypeOf(index) == .function) Value.function(index) else Value.object(index);
+    return objectPrimitive(value).toNumber();
 }
 
 /// `a instanceof B`: true if B.prototype is in a's [[Prototype]] chain.
@@ -7672,6 +7783,7 @@ fn setElemOnValue(obj_val: Value, key: Value, val: Value) void {
     const oi: u32 = obj_val.data.obj_idx;
     if (key.tag == .number) {
         if (objects.objTypeOf(oi) == .array and numIsArrayIndex(key.data.number)) {
+            if (objects.isFrozen(oi)) return;
             objects.setArrayElement(oi, @intFromFloat(@floor(key.data.number)), val);
             return;
         }
@@ -7684,6 +7796,7 @@ fn setElemOnValue(obj_val: Value, key: Value, val: Value) void {
         if (objects.objTypeOf(oi) == .array) {
             const ks = values.getString(key.data.str_idx);
             if (parseArrayIndex(ks)) |idx| {
+                if (objects.isFrozen(oi)) return;
                 objects.setArrayElement(oi, idx, val);
                 return;
             }
@@ -7701,6 +7814,14 @@ fn setElemOnValue(obj_val: Value, key: Value, val: Value) void {
 }
 
 // ── Bit operation helpers ──
+
+fn jsRemainder(a: f64, b: f64) f64 {
+    const inf = @as(f64, @bitCast(@as(u64, 0x7FF0000000000000)));
+    if (a != a or b != b or a == inf or a == -inf or b == 0)
+        return @bitCast(@as(u64, 0x7FF8000000000000));
+    if (a == 0 or b == inf or b == -inf) return a;
+    return @rem(a, b);
+}
 
 // JS ToUint32: truncate toward zero, then take modulo 2^32. Handles NaN, ±0,
 // ±Infinity, and out-of-range magnitudes without panicking on @intFromFloat.
