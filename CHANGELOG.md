@@ -1,8 +1,33 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-10-11
 
 ### Added
+- **`@zpm/youtube` native n-parameter + signature descrambling on the BotGuard
+  jsvm (`player_transform.sig`).** Replaces the old pattern-matcher stub with a
+  bounded, allocation-free extractor that lifts the player's indexed string
+  table and the real `n`/signature transform functions — plus their lexical
+  dependencies (the `typeof` guard constant, helper objects, referenced global
+  functions) — and executes them on the shared BotGuard JavaScript VM. No
+  external runtime (no Deno/Node/QuickJS). The approach keys on the player's
+  string-table structure rather than brittle function-body patterns, so it
+  survives minifier renames; it fails closed on the player's own
+  `enhanced_except`/identity sentinels. `nsig.sig` is now a thin delegate
+  (`MAX_NSIG_LEN` 64 → 256; never silently truncates). Verified against a live
+  2026 `base.js` with 9 `n` vectors + the signature transform.
+- **`@zpm/youtube` pure-Sig SABR/UMP/protobuf streaming client** (`sabr/`,
+  `core/protobuf.sig`): a `VideoPlaybackAbrRequest` encoder (initialization +
+  selected FormatIDs, buffered ranges, PO token, playback cookie), a UMP
+  response parser, and the SABR delivery loop over the session cookie jar — the
+  modern server-driven delivery path, implemented without yt-dlp or any external
+  tool.
+- **`@zpm/youtube` download client hardening.** iOS-first audio routing for
+  unprotected videos (direct, transform-free URLs), with a one-shot fallback to
+  the WEB/MWEB + nsig path when a protected video's iOS URL is rejected by GVS
+  (the ~1 MB preview then HTTP 403). GVS-aware CDN requests: per-client stream
+  User-Agent and conditional web `Origin`/`Referer` headers.
+  `@zpm/youtube/mp4_verify` sniffs MP4 track/codec counts to verify downloaded
+  media.
 - **Custom CUDA kernels in `@zpm/matmul` (cuda backend).** The runtime dynamic
   loader now binds the driver-API module/launch entry points
   (`cuModuleLoadData`, `cuModuleGetFunction`, `cuLaunchKernel`,
@@ -60,7 +85,15 @@
   plus the `Tj`/`TJ`/`'`/`"` text-showing operators, with string-escape and
   kerning-gap handling and `/Contents` reference resolution.
 
+### Changed
+- **`@zpm/youtube/cipher`** now tracks the player generation and grew its
+  player.js buffer (2 MB → 4 MB) so the ~2.6 MB 2026 `base.js` is no longer
+  truncated before the cipher/nsig functions.
+
 ### Fixed
+- **`@zpm/youtube/sabr`** golden `VideoPlaybackAbrRequest` test and the
+  `stream.sig` module import (`youtube_net`) so the SABR tests build and pass
+  under the zpm test runner.
 - **`@zpm/pdf-render` page detection** (`pdf_render/parser.sig`): `parsePages`
   matched only the spaced `/Type /Page` form followed by a newline/space/`>`,
   so it found zero pages in files that emit the tight `/Type/Page` syntax (the

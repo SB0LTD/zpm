@@ -354,6 +354,22 @@ checkpoint (the Base checkpoint ships an empty speaker table).
 | `@zpm/text-analyze` | Text detection over image buffers |
 | `@zpm/elementor-document` | Structured document model |
 
+### Layer 1 — Media / YouTube
+
+A pure-Sig YouTube client: InnerTube session + BotGuard proof-of-origin, stream
+manifest parsing, native signature/`n`-parameter descrambling executed on the
+BotGuard JavaScript VM (no external runtime), SABR/UMP delivery, and a chunked
+CDN downloader. No yt-dlp, no Python, no Node.
+
+| Package | Description |
+|---------|-------------|
+| `@zpm/youtube` | InnerTube session, player/manifest parsing, audio/video download |
+| `@zpm/youtube/botguard` | Proof-of-origin (PO) token minter + embedded pure-Sig JavaScript VM |
+| `@zpm/youtube/cipher` | Signature cipher extraction from `base.js` |
+| `@zpm/youtube/player_transform` | Native `n`-param + signature transforms run on the jsvm |
+| `@zpm/youtube/sabr` | SABR/UMP server-driven delivery (protobuf `VideoPlaybackAbrRequest`) |
+| `@zpm/youtube/mp4_verify` | MP4 track/codec sniff for download verification |
+
 ### Layer 0 — Language Server (LSP)
 
 | Package | Description |
