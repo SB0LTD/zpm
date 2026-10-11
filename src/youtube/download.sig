@@ -244,9 +244,23 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
         return status;
     }
 
-    // Step 4: Select best audio stream
+    // Step 4: Select best audio stream.
+    //
+    // Adaptive audio (itag 251/140) is smaller and preferred, but GVS only
+    // serves it with a valid session-bound attested PO token. When we are on the
+    // WEB fallback (iOS already failed) WITHOUT such a token — e.g. the live
+    // integrity-token mint was server-gated and we hold only a cold-start or
+    // relayed proof — the adaptive URL is guaranteed to 403, so skip straight to
+    // the PO-token-exempt muxed itag 18 instead of burning retries on it. With a
+    // real session-bound VM token (logged-in/residential), prefer adaptive.
+    const prefer_muxed_audio = kind == .audio and g_skip_ios and g_token_source != .vm;
     const direct_best = if (kind == .video)
         manifest_mod.selectBestMuxed(&formats, n_formats) orelse manifest_mod.selectBestVideo(&formats, n_formats)
+    else if (prefer_muxed_audio)
+        (manifest_mod.selectByItag(&formats, n_formats, 18) orelse
+            manifest_mod.selectBestMuxed(&formats, n_formats) orelse
+            manifest_mod.selectBestAudio(&formats, n_formats, codec_pref) orelse
+            manifest_mod.selectBestAudio(&formats, n_formats, .any))
     else
         // opus preferred, but MWEB/WEB adaptive sets often only carry AAC
         // (itag 140); fall back to any audio codec, then a muxed stream, rather
@@ -486,13 +500,20 @@ fn prepareTokens(video_id: *const [meta.VIDEO_ID_LEN]u8, options: DownloadOption
         if (attempt > 0) { print("  [download] minter retry "); printNum(attempt); print("/"); printNum(MAX_VM_ATTEMPTS); print("\n"); }
         if (session_mod.establishIntegrityToken(&g_session, &g_challenge, &integrity_result) and integrity_result.minter_ready) {
             const token = integrity_result.integrity_token[0..integrity_result.integrity_token_len];
+            // The /player request's serviceIntegrityDimensions.poToken is bound
+            // to the video id (content binding).
             g_pot_len = minter.mintContentBound(token, video_id, &g_pot_buf);
-            // Current web delivery tokens bind to the video ID. Reuse this
-            // proof for GVS/SABR rather than minting with a different binding.
-            if (g_pot_len > 0) { @memcpy(g_stream_pot_buf[0..g_pot_len], g_pot_buf[0..g_pot_len]); g_stream_pot_len = g_pot_len; }
+            // The GVS/stream (&pot=) token for the WEB/MWEB CDN URLs must be
+            // bound to the session's visitorData (yt-dlp: "GVS PO Token …
+            // Missing required Visitor Data" for web/mweb). Mint a session-bound
+            // GVS token when visitorData is present; otherwise reuse the
+            // content-bound proof.
+            const visitor = g_session.visitorData();
+            if (visitor.len > 0) g_stream_pot_len = minter.mintSessionBound(token, visitor, &g_stream_pot_buf);
+            if (g_stream_pot_len == 0 and g_pot_len > 0) { @memcpy(g_stream_pot_buf[0..g_pot_len], g_pot_buf[0..g_pot_len]); g_stream_pot_len = g_pot_len; }
             if (g_pot_len > 0 and g_stream_pot_len > 0) {
                 g_token_source = .vm;
-                print("  [download] VM minted content-bound PO token (attempt "); printNum(attempt + 1); print(")\n");
+                print("  [download] VM minted PO tokens (player=content-bound, GVS=session-bound) attempt "); printNum(attempt + 1); print("\n");
                 return;
             }
         }

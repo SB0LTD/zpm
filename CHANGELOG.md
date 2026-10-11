@@ -28,6 +28,14 @@
   User-Agent and conditional web `Origin`/`Referer` headers.
   `@zpm/youtube/mp4_verify` sniffs MP4 track/codec counts to verify downloaded
   media.
+- **Session-bound GVS PO token for WEB/MWEB adaptive formats.** The CDN
+  (`&pot=`) token for the web clients is now minted bound to the session's
+  `visitorData` (not the video id), matching YouTube's GVS requirement for
+  adaptive audio/video; the `/player` request keeps its content-bound token.
+  This enables adaptive downloads wherever the live integrity-token mint
+  succeeds. Where the mint is server-gated (anonymous/datacenter IPs return a
+  null integrity token) the audio path now skips the guaranteed-403 adaptive
+  retries and goes straight to the PO-exempt muxed itag-18 stream.
 - **Custom CUDA kernels in `@zpm/matmul` (cuda backend).** The runtime dynamic
   loader now binds the driver-API module/launch entry points
   (`cuModuleLoadData`, `cuModuleGetFunction`, `cuLaunchKernel`,
