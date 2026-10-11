@@ -139,6 +139,20 @@ pub const StreamProtectionStatus = struct {
     max_retries: i32 = 0,
 };
 
+/// SabrContextUpdate (sabr_context_update.proto): the server hands the client a
+/// context blob it MUST echo back inside StreamerContext on subsequent requests
+/// so attestation/validation completes (otherwise the server holds the stream at
+/// STREAM_PROTECTION_STATUS == 2). Fields: type (1, int), scope (2, enum),
+/// value (3, bytes), send_by_default (4, bool). `value` is borrowed from the
+/// part payload (copy before the next request overwrites the response buffer).
+pub const SabrContextUpdate = struct {
+    ctx_type: i32 = 0,
+    scope: i32 = 0,
+    value: []const u8 = "",
+    send_by_default: bool = false,
+    present: bool = false,
+};
+
 // ── FormatId (misc/common.proto): itag=1, last_modified=2, xtags=3 ──
 const FormatId = struct { itag: i32 = 0, last_modified: u64 = 0 };
 
@@ -303,6 +317,24 @@ pub fn decodeStreamProtectionStatus(payload: []const u8) StreamProtectionStatus 
         switch (tag.field) {
             1 => out.status = readI32(&r, tag.wire),
             2 => out.max_retries = readI32(&r, tag.wire),
+            else => r.skipField(tag.wire) catch break,
+        }
+    }
+    return out;
+}
+
+/// Decode a SABR_CONTEXT_UPDATE part. The `value` slice is borrowed from
+/// `payload` (copy it before the next response overwrites the buffer).
+pub fn decodeSabrContextUpdate(payload: []const u8) SabrContextUpdate {
+    var out = SabrContextUpdate{ .present = true };
+    var r = pb.Reader.init(payload);
+    while (!r.atEnd()) {
+        const tag = r.readTag() catch break;
+        switch (tag.field) {
+            1 => out.ctx_type = readI32(&r, tag.wire),
+            2 => out.scope = readI32(&r, tag.wire),
+            3 => out.value = r.readLenDelim() catch "",
+            4 => out.send_by_default = (r.readVarint() catch 0) != 0,
             else => r.skipField(tag.wire) catch break,
         }
     }

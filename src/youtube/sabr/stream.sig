@@ -132,6 +132,10 @@ pub const ProcessOutcome = struct {
     backoff_time_ms: i32 = 0,
     playback_cookie: []const u8 = "",
     media_bytes: u64 = 0, // media bytes appended this pass
+    // A SABR_CONTEXT_UPDATE the server wants echoed back on the next request.
+    ctx_update: []const u8 = "", // raw value bytes (borrowed from the response)
+    ctx_update_type: i32 = 0,
+    has_ctx_update: bool = false,
 };
 
 /// Parse a complete UMP buffer, routing MEDIA bytes to `sink` and recording the
@@ -157,6 +161,9 @@ var redirect_url_buf: [4096]u8 = undefined;
 
 const MAX_ITERATIONS: u16 = 2048;
 const MAX_REDIRECTS: u16 = 8;
+// How many consecutive ATTESTATION_PENDING (status 2) passes to tolerate before
+// concluding the server will not transition to OK (a genuine attestation wall).
+const MAX_PENDING_PASSES: u16 = 24;
 
 /// Run the SABR loop against `transport`, appending media to `sink`. `host`/
 /// `path` are the parsed serverAbrStreamingUrl; `selected` is the single
@@ -185,13 +192,17 @@ pub fn runLoop(
     var player_time_ms: i64 = 0;
     var playback_cookie: [512]u8 = undefined;
     var playback_cookie_len: usize = 0;
+    // Latest SABR context update the server asked us to echo (survives passes).
+    var ctx_update_len: usize = 0;
+    var ctx_update_type: i32 = 0;
 
+    var pending_passes: u16 = 0;
     var iter: u16 = 0;
     while (iter < MAX_ITERATIONS) : (iter += 1) {
         // Build the request body for this round.
         const audio: []const request.SelectedFormat = if (is_audio) &.{selected} else &.{};
         const video: []const request.SelectedFormat = if (is_audio) &.{} else &.{selected};
-        var body_buf: [8192]u8 = undefined;
+        var body_buf: [16384]u8 = undefined;
         const buffered = request.BufferedRange{
             .itag = selected.itag,
             .last_modified = selected.last_modified,
@@ -211,6 +222,8 @@ pub fn runLoop(
             .playback_cookie = playback_cookie[0..playback_cookie_len],
             .enabled_track_types_bitfield = if (is_audio) 1 else 0,
             .buffered = if (progress.last_segment_num >= 0) &.{buffered} else &.{},
+            .sabr_context = ctx_update_buf[0..ctx_update_len],
+            .sabr_context_type = ctx_update_type,
         };
         const body_len = request.buildAbrRequest(params, &body_buf) catch return result;
 
@@ -242,6 +255,13 @@ pub fn runLoop(
         if (pass.playback_cookie.len > 0) {
             @memcpy(playback_cookie[0..pass.playback_cookie.len], pass.playback_cookie);
             playback_cookie_len = pass.playback_cookie.len;
+        }
+        // Capture a SABR context update to echo on the next request (this is how
+        // the server validates and transitions STREAM_PROTECTION_STATUS 2 -> OK).
+        if (pass.has_ctx_update and pass.ctx_update.len > 0 and pass.ctx_update.len <= ctx_update_buf.len) {
+            @memcpy(ctx_update_buf[0..pass.ctx_update.len], pass.ctx_update);
+            ctx_update_len = pass.ctx_update.len;
+            ctx_update_type = pass.ctx_update_type;
         }
 
         if (pass.sabr_error_seen) {
@@ -277,6 +297,20 @@ pub fn runLoop(
             result.success = true;
             break;
         }
+        // STREAM_PROTECTION_STATUS == 2 (ATTESTATION_PENDING): the server
+        // accepted the request and is validating the PO token; it may return an
+        // empty media pass for a few round-trips before it transitions to OK and
+        // resumes delivery. Keep requesting (bounded) rather than giving up on
+        // the first empty pass, as long as the token/handshake is in flight.
+        if (pass.protection_status == 2) {
+            pending_passes += 1;
+            if (pending_passes <= MAX_PENDING_PASSES) {
+                if (pass.backoff_time_ms > 0) Sleep(@intCast(@min(pass.backoff_time_ms, 30000)));
+                continue;
+            }
+            break;
+        }
+        pending_passes = 0;
         // No media and no control signal => nothing more to pull.
         if (pass.media_bytes == 0 and pass.backoff_time_ms == 0 and pass.redirect_url.len == 0) {
             break;
@@ -289,6 +323,18 @@ pub fn runLoop(
 
 var redirect_host: [256]u8 = undefined;
 var redirect_path: [9216]u8 = undefined;
+var ctx_update_buf: [4096]u8 = undefined;
+
+// Diagnostics: counts of each interesting part type seen across the whole loop.
+pub var dbg_n_media_header: u32 = 0;
+pub var dbg_n_media: u32 = 0;
+pub var dbg_n_ctx_update: u32 = 0;
+pub var dbg_n_next_policy: u32 = 0;
+pub var dbg_n_sps: u32 = 0;
+pub var dbg_n_fim: u32 = 0;
+pub var dbg_n_passes: u32 = 0;
+pub var dbg_last_part_types: [16]u64 = [_]u64{0} ** 16;
+pub var dbg_last_part_n: usize = 0;
 
 fn formatComplete(selected: request.SelectedFormat, progress: FormatProgress) bool {
     if (progress.header_active or progress.bytes == 0) return false;
@@ -299,6 +345,16 @@ fn formatComplete(selected: request.SelectedFormat, progress: FormatProgress) bo
 /// Shared part dispatch used by both the offline `processUmpBuffer` and the
 /// live loop (so they cannot diverge).
 fn applyPart(part: ump.Part, sink: Sink, progress: *FormatProgress, pass: *ProcessOutcome, write_failed: *bool) void {
+    if (dbg_last_part_n < dbg_last_part_types.len) { dbg_last_part_types[dbg_last_part_n] = part.part_type; dbg_last_part_n += 1; }
+    switch (part.part_type) {
+        ump.PartType.MEDIA_HEADER => dbg_n_media_header += 1,
+        ump.PartType.MEDIA => dbg_n_media += 1,
+        ump.PartType.SABR_CONTEXT_UPDATE => dbg_n_ctx_update += 1,
+        ump.PartType.NEXT_REQUEST_POLICY => dbg_n_next_policy += 1,
+        ump.PartType.STREAM_PROTECTION_STATUS => dbg_n_sps += 1,
+        ump.PartType.FORMAT_INITIALIZATION_METADATA => dbg_n_fim += 1,
+        else => {},
+    }
     switch (part.part_type) {
         ump.PartType.MEDIA_HEADER => {
             const mh = ump.decodeMediaHeader(part.payload);
@@ -372,6 +428,14 @@ fn applyPart(part: ump.Part, sink: Sink, progress: *FormatProgress, pass: *Proce
         ump.PartType.STREAM_PROTECTION_STATUS => {
             const sps = ump.decodeStreamProtectionStatus(part.payload);
             pass.protection_status = sps.status;
+        },
+        ump.PartType.SABR_CONTEXT_UPDATE => {
+            const cu = ump.decodeSabrContextUpdate(part.payload);
+            if (cu.present and cu.value.len > 0) {
+                pass.ctx_update = cu.value;
+                pass.ctx_update_type = cu.ctx_type;
+                pass.has_ctx_update = true;
+            }
         },
         else => {},
     }

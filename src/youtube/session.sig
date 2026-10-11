@@ -216,11 +216,54 @@ fn writeUint(out: []u8, n: u32) usize {
 /// We locate `bgChallenge` anywhere in the HTML (it may appear unescaped in the
 /// ytInitialData/ytcfg region) and extract the fields with the same helpers
 /// challenge.sig uses for att/get.
+var homepage_region_buf: [262144]u8 = undefined;
+
+/// Decode a `\xNN` / `\uNNNN` hex-escaped segment into `out`, leaving other
+/// bytes as-is. The homepage embeds the bgChallenge JSON with its quotes and
+/// braces hex-escaped (`\x22`, `\x7b`, `\x7d`), so the plain `"key"` scans below
+/// only match once this is normalized back to real JSON punctuation.
+fn hexUnescapeRegion(src: []const u8, out: []u8) usize {
+    var i: usize = 0;
+    var o: usize = 0;
+    while (i < src.len and o < out.len) {
+        if (src[i] == '\\' and i + 1 < src.len and (src[i + 1] == 'x') and i + 3 < src.len) {
+            const hi = hexNibV(src[i + 2]);
+            const lo = hexNibV(src[i + 3]);
+            if (hi < 16 and lo < 16) { out[o] = (hi << 4) | lo; o += 1; i += 4; continue; }
+        }
+        if (src[i] == '\\' and i + 1 < src.len and src[i + 1] == 'u' and i + 5 < src.len) {
+            const h0 = hexNibV(src[i + 2]); const h1 = hexNibV(src[i + 3]);
+            const h2 = hexNibV(src[i + 4]); const h3 = hexNibV(src[i + 5]);
+            if (h0 < 16 and h1 < 16 and h2 < 16 and h3 < 16) {
+                const cp: u16 = (@as(u16, h0) << 12) | (@as(u16, h1) << 8) | (@as(u16, h2) << 4) | @as(u16, h3);
+                if (cp < 0x80) { out[o] = @intCast(cp); o += 1; i += 6; continue; }
+            }
+        }
+        out[o] = src[i]; o += 1; i += 1;
+    }
+    return o;
+}
+
+fn hexNibV(c: u8) u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return 255;
+}
+
 fn parseHomepageChallenge(body: []const u8, chal: *challenge.Challenge) bool {
     // Find a "bgChallenge" region. Search from there so keys resolve to the
     // challenge's own values.
     const bg_pos = findStr(body, "bgChallenge") orelse return false;
-    const region = body[bg_pos..@min(bg_pos + 200000, body.len)];
+    const raw_region = body[bg_pos..@min(bg_pos + 200000, body.len)];
+
+    // The homepage hex-escapes the challenge JSON (\x22 for ", \x7b/\x7d for
+    // {}). Normalize it so the "key" scans match; fall back to the raw bytes
+    // when the region is already plain JSON (older/variant homepages).
+    const region = if (findStr(raw_region, "\\x22") != null) blk: {
+        const n = hexUnescapeRegion(raw_region, homepage_region_buf[0..]);
+        break :blk homepage_region_buf[0..n];
+    } else raw_region;
 
     // program (base64) — may be escaped (\u0026 etc are rare in base64).
     if (findStrVal(region, "\"program\"")) |prog| {
@@ -481,12 +524,26 @@ pub fn generateITInSession(sess: *Session, bg_response: []const u8, out: *Integr
     const p2 = "\"]";
     @memcpy(git_body_buf[blen .. blen + p2.len], p2); blen += p2.len;
 
-    // Headers mirror what YouTube's OWN web player sends to the first-party
-    // GenerateIT endpoint (captured via CDP): the WAA api key as X-Goog-Api-Key,
-    // json+protobuf content type, sec-ch-ua client hints, Origin/Referer, and the
-    // visitor id. Cookies are carried by the jar. This first-party endpoint
-    // (www.youtube.com/api/jnn/v1/GenerateIT) returns a NON-null token for a
-    // genuine session, unlike the jnn-pa.googleapis.com RPC used headless.
+    // Two GenerateIT endpoints exist and they are NOT interchangeable:
+    //   (A) jnn-pa.googleapis.com /$rpc/google.internal.waa.v1.Waa/GenerateIT
+    //       — the WAA gRPC-web endpoint. create-test uses this and gets a
+    //         NON-null integrity token.
+    //   (B) www.youtube.com/api/jnn/v1/GenerateIT — the first-party endpoint.
+    // Empirically (2026-10-11), with the live homepage challenge in a cookied
+    // visitor session, (A) returns the real token while (B) returns a null
+    // primary + fallback. So try (A) first (jar-threaded, WAA headers), then (B).
+    const waa_hdr = "Content-Type: application/json+protobuf\r\nX-Goog-Api-Key: " ++ WAA_API_KEY ++ "\r\nx-user-agent: grpc-web-javascript/0.1\r\n";
+    var waa_hdr_buf: [1024]u8 = undefined;
+    var wp: usize = 0;
+    wp = appendS(&waa_hdr_buf, wp, waa_hdr);
+    wp = appendS(&waa_hdr_buf, wp, visitorHeader(sess));
+    const resp_a = http.post("jnn-pa.googleapis.com", "/$rpc/google.internal.waa.v1.Waa/GenerateIT", waa_hdr_buf[0..wp], git_body_buf[0..blen], &sess.jar);
+    print("  [session] GenerateIT(waa) status="); printNum(resp_a.status);
+    print(" bytes="); printNum(resp_a.body.len); print("\n");
+    if (resp_a.body.len > 0) { print("  [session] GenerateIT(waa) raw: "); print(resp_a.body[0..@min(resp_a.body.len, 300)]); print("\n"); }
+    if (resp_a.ok and resp_a.body.len > 0 and storeGenerateIT(resp_a.body, out)) return true;
+
+    // Fallback to the first-party endpoint.
     var hdr_buf: [4096]u8 = undefined;
     var hp: usize = 0;
     hp = appendS(&hdr_buf, hp, "Content-Type: application/json+protobuf\r\nX-Goog-Api-Key: ");
@@ -496,15 +553,21 @@ pub fn generateITInSession(sess: *Session, bg_response: []const u8, out: *Integr
     hp = appendS(&hdr_buf, hp, visitorHeader(sess));
 
     const resp = http.post("www.youtube.com", "/api/jnn/v1/GenerateIT", hdr_buf[0..hp], git_body_buf[0..blen], &sess.jar);
-    print("  [session] GenerateIT status="); printNum(resp.status);
+    print("  [session] GenerateIT(yt) status="); printNum(resp.status);
     print(" bytes="); printNum(resp.body.len); print("\n");
     if (resp.body.len > 0) {
-        print("  [session] GenerateIT raw: ");
+        print("  [session] GenerateIT(yt) raw: ");
         print(resp.body[0..@min(resp.body.len, 400)]);
         print("\n");
     }
     if (!resp.ok or resp.body.len == 0) return false;
-    const parsed = integrity.parseResponse(resp.body);
+    return storeGenerateIT(resp.body, out);
+}
+
+/// Parse a GenerateIT response and store a valid primary token into `out`.
+/// Returns true only when element 0 is a non-null token (fallback alone fails).
+fn storeGenerateIT(body: []const u8, out: *IntegrityResult) bool {
+    const parsed = integrity.parseResponse(body);
     fallback_len = parsed.fallback_len;
     if (fallback_len > 0) @memcpy(fallback_buf[0..fallback_len], parsed.fallback_token[0..fallback_len]);
     out.ttl_secs = parsed.ttl_secs;
@@ -600,15 +663,18 @@ pub fn establishIntegrityToken(sess: *Session, chal: *challenge.Challenge, out: 
         if (!bootstrap(sess, chal)) return false;
     }
 
-    // Preserve the homepage challenge, or fetch ATT using this visitor's cookie
-    // jar. The saved native-session fixture exposes getMinter and receives a
-    // non-null primary token when its unmodified script runs in the oracle.
-    if (chal.program_len == 0 and !fetchChallengeInSession(sess, chal)) {
-        print("  [session] session challenge fetch failed\n");
+    // Use the WAA **Create** challenge — the only flow whose VM snapshot
+    // populates getMinter AND whose botguardResponse the server exchanges for a
+    // NON-null integrity token (proven by create-test on live, fresh challenges).
+    // The homepage `bgChallenge` and att/get challenges run the VM fine but their
+    // responses are refused by GenerateIT (null primary + fallback). Always fetch
+    // a fresh Create challenge here regardless of any homepage challenge captured
+    // during bootstrap.
+    chal.* = challenge.Challenge.init();
+    if (!challenge.fetchCreate(chal)) {
+        print("  [session] Create challenge fetch failed\n");
         return false;
     }
-
-    // Fetch the VM script if only a URL was provided.
     if (chal.script_len == 0 and chal.interpreter_url_len > 0) {
         print("  [session] fetching interpreter script ...\n");
         if (!challenge.fetchScript(chal)) {
@@ -616,7 +682,8 @@ pub fn establishIntegrityToken(sess: *Session, chal: *challenge.Challenge, out: 
             return false;
         }
     }
-    print("  [session] script="); printNum(chal.script_len); print(" bytes\n");
+    print("  [session] Create challenge program="); printNum(chal.program_len);
+    print(" script="); printNum(chal.script_len); print(" bytes\n");
 
     // Run the BotGuard VM to produce the botguardResponse (this also populates
     // the minter chain in webPoSignalOutput[0]).
@@ -636,8 +703,21 @@ pub fn establishIntegrityToken(sess: *Session, chal: *challenge.Challenge, out: 
     out.minter_ready = (signal.tag == .object or signal.tag == .array) and
         jsvm.objects.getArrayElement(signal.data.obj_idx, 0).tag == .function;
 
-    // Exchange for a session-bound integrity token.
-    return generateITInSession(sess, bg_response_buf[0..bg_len], out);
+    // Exchange the Create response for an integrity token via the WAA RPC
+    // (jnn-pa.googleapis.com GenerateIT) — the endpoint create-test uses to get
+    // a non-null token. This does not need the cookie jar (the proof is in the
+    // botguardResponse), matching the proven create-test path.
+    var itoken: [512]u8 = undefined;
+    var itoken_len: usize = 0;
+    if (!integrity.getToken(bg_response_buf[0..bg_len], &itoken, &itoken_len) or itoken_len == 0) {
+        print("  [session] GenerateIT returned no primary token\n");
+        return false;
+    }
+    @memcpy(out.integrity_token[0..itoken_len], itoken[0..itoken_len]);
+    out.integrity_token_len = itoken_len;
+    out.valid = true;
+    out.ttl_secs = 43200;
+    return true;
 }
 
 fn appendS(buf: anytype, pos: usize, s: []const u8) usize {

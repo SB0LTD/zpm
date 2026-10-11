@@ -76,6 +76,11 @@ pub const AbrParams = struct {
     po_token: []const u8 = "",
     playback_cookie: []const u8 = "",
 
+    // A SABR context update the server sent (SABR_CONTEXT_UPDATE) that must be
+    // echoed back in StreamerContext.sabr_contexts so attestation completes.
+    sabr_context: []const u8 = "", // raw value bytes
+    sabr_context_type: i32 = 0,
+
     // StreamerContext.ClientInfo
     client_name: i32 = 1, // WEB
     client_version: []const u8 = "",
@@ -127,6 +132,15 @@ fn encodeStreamerContext(p: AbrParams, scratch: []u8) pb.Error![]const u8 {
     // po_token (field 2)
     if (p.po_token.len > 0) try w.writeLenDelim(2, p.po_token);
     if (p.playback_cookie.len > 0) try w.writeLenDelim(3, p.playback_cookie);
+    // sabr_contexts (field 5, repeated SabrContext{ type:1, value:2 }) — echo
+    // the server's SABR_CONTEXT_UPDATE so STREAM_PROTECTION_STATUS can clear.
+    if (p.sabr_context.len > 0) {
+        var sc_scratch: [4160]u8 = undefined;
+        var sc = pb.Writer.init(&sc_scratch);
+        try sc.writeVarintField(1, @as(u64, @bitCast(@as(i64, p.sabr_context_type))));
+        try sc.writeLenDelim(2, p.sabr_context);
+        try w.writeLenDelim(5, sc.bytes());
+    }
     return w.bytes();
 }
 
@@ -159,8 +173,8 @@ pub fn buildAbrRequest(p: AbrParams, out: []u8) pb.Error!usize {
     // field 17: selected_video_format_ids (repeated)
     for (p.video_formats) |fmt| try writeFormatId(&w, 17, fmt);
 
-    // field 19: streamer_context
-    var sc_scratch: [1024]u8 = undefined;
+    // field 19: streamer_context (can carry a multi-KB echoed SABR context)
+    var sc_scratch: [8192]u8 = undefined;
     const sc = try encodeStreamerContext(p, &sc_scratch);
     try w.writeLenDelim(19, sc);
 

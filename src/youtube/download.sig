@@ -62,6 +62,62 @@ pub const DownloadOptions = struct {
     pot_override: []const u8 = "",
 };
 
+// ── Caller-controlled media request API ───────────────────────────────────
+//
+// The convenience entry points (audio/video/videoWithAudio) are thin wrappers
+// over `fetch(video_id, MediaRequest, path)`. A caller that needs a specific
+// form drives `fetch` directly: pick the track kind, codec, an exact itag, and
+// the delivery mechanism. `probe` enumerates every available form first so a
+// caller can choose deterministically.
+
+/// Which track the caller wants out of the player response.
+pub const Track = enum {
+    audio, // adaptive audio-only (smallest; what ASR wants)
+    video, // adaptive video-only (no audio track)
+    muxed, // a single stream carrying BOTH audio and video (e.g. itag 18)
+    best_video, // best video, muxed if available else adaptive video-only
+};
+
+/// How the bytes should be fetched from the CDN. `auto` tries the robust order
+/// for the track (direct URL with PO token, then SABR, then a muxed fallback
+/// for audio); the explicit values force a single mechanism (fail-closed).
+pub const Delivery = enum { auto, direct, sabr };
+
+/// A caller-controlled download request. Zero-value = "best adaptive audio,
+/// auto delivery" (the common ASR case).
+pub const MediaRequest = struct {
+    track: Track = .audio,
+    codec: AudioCodec = .any, // audio codec preference (ignored for video)
+    itag: u16 = 0, // 0 = best match; non-zero = this exact format
+    delivery: Delivery = .auto,
+    allow_muxed_fallback: bool = true, // audio may fall back to a muxed stream
+    options: DownloadOptions = .{},
+};
+
+/// A caller-facing view of one available format (from `probe`).
+pub const FormatInfo = struct {
+    itag: u16 = 0,
+    is_audio: bool = false,
+    is_video: bool = false,
+    has_direct_url: bool = false, // a usable signed/transformed CDN URL exists
+    bitrate: u32 = 0,
+    content_length: u64 = 0,
+    last_modified: u64 = 0,
+    container: mux_mod.ContainerType = .unknown,
+    codec: mux_mod.AudioCodecId = .unknown,
+};
+
+/// Result of probing a video: how many forms, and whether SABR delivery is
+/// offered (so a caller knows adaptive formats can be pulled even when their
+/// direct URL is gated).
+pub const ProbeResult = struct {
+    count: usize = 0,
+    sabr_available: bool = false,
+    duration_sec: u32 = 0,
+    token_source: TokenSource = .none,
+    ok: bool = false,
+};
+
 // ── Win32 (for null-terminated path conversion) ──
 extern "kernel32" fn GetStdHandle(u32) ?*anyopaque;
 extern "kernel32" fn WriteFile(?*anyopaque, [*]const u8, u32, ?*u32, ?*anyopaque) c_int;
@@ -108,65 +164,176 @@ pub const VideoDownloadStatus = struct {
 /// `output_path`: null-terminated file path
 /// `codec_pref`: preferred audio codec (.opus = best quality, .aac = most compatible)
 pub fn audio(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8, codec_pref: AudioCodec) DownloadStatus {
-    return downloadMedia(video_id, output_path, codec_pref, .audio, .{}, null, null);
+    return fetch(video_id, .{ .track = .audio, .codec = codec_pref }, output_path);
 }
 
 pub fn audioWithOptions(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8, codec_pref: AudioCodec, options: DownloadOptions) DownloadStatus {
-    return downloadMedia(video_id, output_path, codec_pref, .audio, options, null, null);
+    return fetch(video_id, .{ .track = .audio, .codec = codec_pref, .options = options }, output_path);
 }
 
-fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8, codec_pref: AudioCodec, kind: MediaKind, options: DownloadOptions, audio_path: ?[*:0]const u8, audio_status_out: ?*DownloadStatus) DownloadStatus {
-    var status = DownloadStatus{
-        .success = false,
-        .bytes_downloaded = 0,
-        .container = .unknown,
-        .codec = .unknown,
-        .bitrate = 0,
-        .duration_sec = 0,
-    };
+/// Caller-controlled download. Resolves `req` against the video's player
+/// response and delivers the selected format to `output_path`, trying the
+/// delivery mechanisms per `req.delivery`. This is the primary internal API;
+/// the audio/video wrappers are expressed in terms of it.
+pub fn fetch(video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_path: [*:0]const u8) DownloadStatus {
+    var status = DownloadStatus{ .success = false, .bytes_downloaded = 0, .container = .unknown, .codec = .unknown, .bitrate = 0, .duration_sec = 0 };
 
     print("  [download] Fetching player data...\n");
-
-    prepareTokens(video_id, options);
+    prepareTokens(video_id, req.options);
     status.token_source = g_token_source;
-    if (options.require_vm_token and g_token_source != .vm) {
+    if (req.options.require_vm_token and g_token_source != .vm) {
         print("  [download] ERROR: VM token required and minting did not succeed\n");
         return status;
     }
 
-    // iOS-first for audio: the IOS InnerTube client returns adaptive formats
-    // whose stream URLs are already fully transformed (no signatureCipher, no
-    // throttling n-param) and whose itag-140 AAC audio is exactly what the ASR
-    // pipeline wants. Unlike WEB/MWEB — which hand back signatureCipher + an
-    // "n" param that must be run through player.js — these URLs are directly
-    // downloadable, so probe iOS before the web clients when fetching audio.
-    // Default CDN UA (Chrome) for WEB/MWEB URLs; the iOS branch overrides it.
+    const want_audio = req.track == .audio;
+    const ctx = acquirePlayer(video_id, req.options, want_audio);
+    status.token_source = g_token_source;
+    if (!ctx.ok) return status;
+    const resp = ctx.resp;
+    g_ctx_sabr_available = ctx.sabr_available;
+    if (extractJsonString(resp, "\"lengthSeconds\"")) |dur_str| status.duration_sec = parseUint(dur_str);
+
+    var formats: [manifest_mod.MAX_FORMATS]manifest_mod.StreamFormat = undefined;
+    const n = manifest_mod.parseFormats(resp, &formats);
+    if (n == 0) { print("  [download] ERROR: No formats found\n"); return status; }
+
+    // Build the ordered candidate list for this request.
+    var cands: [4]*const manifest_mod.StreamFormat = undefined;
+    var nc: usize = 0;
+    if (req.itag != 0) {
+        // Exact itag: honor both direct-capable and SABR-only selection.
+        if (manifest_mod.selectByItag(&formats, n, req.itag) orelse manifest_mod.selectBySabr(&formats, n, req.itag)) |f| { cands[nc] = f; nc += 1; }
+    } else switch (req.track) {
+        .audio => {
+            if (manifest_mod.selectBestAudio(&formats, n, req.codec)) |f| { cands[nc] = f; nc += 1; }
+            if (manifest_mod.selectBestAudio(&formats, n, .any)) |f| { if (nc == 0 or f != cands[0]) { cands[nc] = f; nc += 1; } }
+            if (ctx.sabr_available) { if (manifest_mod.selectBestSabr(&formats, n, true)) |f| { cands[nc] = f; nc += 1; } }
+            if (req.allow_muxed_fallback) { if (manifest_mod.selectByItag(&formats, n, 18) orelse manifest_mod.selectBestMuxed(&formats, n)) |f| { cands[nc] = f; nc += 1; } }
+        },
+        .video => {
+            if (manifest_mod.selectBestVideo(&formats, n)) |f| { cands[nc] = f; nc += 1; }
+            if (ctx.sabr_available) { if (manifest_mod.selectBestSabr(&formats, n, false)) |f| { cands[nc] = f; nc += 1; } }
+        },
+        .muxed => {
+            if (manifest_mod.selectByItag(&formats, n, 18) orelse manifest_mod.selectBestMuxed(&formats, n)) |f| { cands[nc] = f; nc += 1; }
+        },
+        .best_video => {
+            if (manifest_mod.selectBestMuxed(&formats, n)) |f| { cands[nc] = f; nc += 1; }
+            if (manifest_mod.selectBestVideo(&formats, n)) |f| { cands[nc] = f; nc += 1; }
+            if (ctx.sabr_available) { if (manifest_mod.selectBestSabr(&formats, n, false)) |f| { cands[nc] = f; nc += 1; } }
+        },
+    }
+    if (nc == 0) {
+        print(if (want_audio) "  [download] ERROR: No audio stream found\n" else "  [download] ERROR: No stream found\n");
+        return status;
+    }
+
+    const media_kind: MediaKind = if (want_audio) .audio else .video;
+    for (cands[0..nc]) |f| {
+        print("  [download] Candidate itag=");
+        printNum(f.itag);
+        print(" direct=");
+        print(if (f.url_len > 0) "yes" else "no");
+        print(" size=");
+        printNum(f.content_length);
+        print("\n");
+        if (deliverOne(resp, f, media_kind, output_path, req.delivery, req.options, &status)) {
+            if (extractJsonString(resp, "\"lengthSeconds\"")) |dur_str| status.duration_sec = parseUint(dur_str);
+            print("  [download] Complete: ");
+            printNum(status.bytes_downloaded / 1024);
+            print(" KB (itag ");
+            printNum(f.itag);
+            print(")\n");
+            return status;
+        }
+    }
+
+    // iOS one-shot fallback: a protected video's iOS URL serves only a ~1MB
+    // preview then 403s. Retry audio once through the WEB/MWEB + nsig path.
+    if (want_audio and ctx.used_ios and !g_skip_ios) {
+        print("  [download] iOS stream rejected; retrying via WEB/MWEB + nsig path...\n");
+        g_skip_ios = true;
+        const retry = fetch(video_id, req, output_path);
+        g_skip_ios = false;
+        if (retry.success) return retry;
+    }
+
+    print(if (want_audio) "  [download] ERROR: audio delivery failed on all candidates\n" else "  [download] ERROR: delivery failed on all candidates\n");
+    return status;
+}
+
+/// Enumerate every available form for `video_id` into `out`, returning a
+/// ProbeResult. Lets a caller see all forms (and whether SABR is offered)
+/// before choosing a MediaRequest. Uses one player acquisition.
+pub fn probe(video_id: *const [meta.VIDEO_ID_LEN]u8, options: DownloadOptions, out: []FormatInfo) ProbeResult {
+    var pr = ProbeResult{};
+    prepareTokens(video_id, options);
+    pr.token_source = g_token_source;
+    const ctx = acquirePlayer(video_id, options, true);
+    pr.token_source = g_token_source;
+    if (!ctx.ok) return pr;
+    pr.sabr_available = ctx.sabr_available;
+    pr.ok = true;
+    if (extractJsonString(ctx.resp, "\"lengthSeconds\"")) |dur_str| pr.duration_sec = parseUint(dur_str);
+
+    var formats: [manifest_mod.MAX_FORMATS]manifest_mod.StreamFormat = undefined;
+    const n = manifest_mod.parseFormats(ctx.resp, &formats);
+    var k: usize = 0;
+    while (k < n and k < out.len) : (k += 1) {
+        const f = &formats[k];
+        var info = FormatInfo{
+            .itag = f.itag,
+            .is_audio = f.is_audio,
+            .is_video = f.is_video,
+            .has_direct_url = f.url_len > 0,
+            .bitrate = f.bitrate,
+            .content_length = f.content_length,
+            .last_modified = f.last_modified,
+        };
+        var tmp = DownloadStatus{ .success = false, .bytes_downloaded = 0, .container = .unknown, .codec = .unknown, .bitrate = 0, .duration_sec = 0 };
+        setContainer(f, &tmp);
+        info.container = tmp.container;
+        info.codec = tmp.codec;
+        out[k] = info;
+    }
+    pr.count = k;
+    return pr;
+}
+
+// Chosen player response + the context needed to deliver its formats. The
+// `resp` slice lives in g_player_copy (stable across later innertube calls).
+const PlayerCtx = struct {
+    resp: []const u8 = "",
+    used_ios: bool = false,
+    sabr_available: bool = false,
+    ok: bool = false,
+};
+
+/// Acquire a usable player response via the client sweep, load the signature/n
+/// transforms when needed, and copy the response into g_player_copy so it stays
+/// valid across subsequent innertube requests. Tokens must already be prepared
+/// (prepareTokens). `want_audio` enables the iOS-first probe (direct audio URLs).
+fn acquirePlayer(video_id: *const [meta.VIDEO_ID_LEN]u8, options: DownloadOptions, want_audio: bool) PlayerCtx {
+    var ctx = PlayerCtx{};
+
     stream_mod.setUserAgent("");
     stream_mod.setWebHeaders(true);
 
     var resp: []const u8 = "";
-    var used_ios = false;
-    if (kind == .audio and !options.require_vm_token and !g_skip_ios) {
+    if (want_audio and !options.require_vm_token and !g_skip_ios) {
         const ios_resp = innertube.playerIos(video_id);
         if (hasDirectAudio(ios_resp)) {
             print("  [download] iOS client: direct audio URLs present, using iOS response\n");
             resp = ios_resp;
-            used_ios = true;
-            // iOS GVS URLs carry their own attestation; appending the web
-            // content-bound PO token to them is rejected (HTTP 403). Fetch the
-            // iOS stream URL verbatim.
+            ctx.used_ios = true;
             g_stream_pot_len = 0;
             g_token_source = .none;
-            // GVS validates the stream request's User-Agent against the client
-            // that minted the URL; iOS URLs must be fetched with the iOS UA and
-            // without the web Origin/Referer headers.
             stream_mod.setUserAgent(IOS_UA);
             stream_mod.setWebHeaders(false);
         }
     }
 
-    // MWEB retains direct adaptive URLs; WEB may return SABR-only metadata.
-    // Both use the same web visitor/cookies and video-bound BotGuard proof.
     g_web_client = .mweb;
     if (resp.len == 0) resp = session_mod.playerInSession(&g_session, video_id, .mweb, g_pot_buf[0..g_pot_len]);
     if (!hasPlayerFormats(resp)) {
@@ -176,11 +343,9 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
     }
     if (!hasPlayerFormats(resp) and options.require_vm_token) {
         print("  [download] ERROR: Web VM token has no downloadable WEB/MWEB formats\n");
-        return status;
+        return ctx;
     }
     if (!hasPlayerFormats(resp)) {
-        // Optional compatibility routes have different attestation providers.
-        // They cannot claim a web VM proof or append it to their CDN URLs.
         g_stream_pot_len = 0;
         g_token_source = .none;
         print("  [download] session WEB: no direct formats, trying web_embedded...\n");
@@ -195,38 +360,27 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
         if (extractJsonString(resp, "\"status\"")) |st| { print(st); } else { print("?"); }
         print(" reason=");
         if (extractJsonString(resp, "\"reason\"")) |rs| { print(rs); } else { print("?"); }
-        print(" resp_len=");
-        printNum(@intCast(resp.len));
         print(", trying ios...\n");
         resp = innertube.playerIos(video_id);
     }
-    status.token_source = g_token_source;
     if (resp.len == 0) {
         print("  [download] ERROR: No player response from any client\n");
-        return status;
+        return ctx;
     }
-    // Debug: if still no streamingData, dump the playability status / response head
-    // so we can see WHY YouTube refused (PO required, login, unplayable, etc.).
     if (findStr(resp, "streamingData") == null) {
-        print("  [download] no streamingData. response head:\n    ");
-        const hlen = @min(resp.len, 400);
-        _ = WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), resp.ptr, @intCast(hlen), null, null);
-        print("\n");
         if (extractJsonString(resp, "\"status\"")) |st| { print("  [download] playabilityStatus="); print(st); print("\n"); }
         if (extractJsonString(resp, "\"reason\"")) |rs| { print("  [download] reason="); print(rs); print("\n"); }
     }
 
-    // Step 2: Check if we need cipher decryption
-    if (findStr(resp, "\"signatureCipher\"") != null or findStr(resp, "&n=") != null or findStr(resp, "\\u0026n=") != null) {
-        // The watch-page helper shares InnerTube's response buffer. Preserve
-        // the chosen player response before using it for another request.
-        if (resp.len > g_player_copy.len) return status;
-        @memcpy(g_player_copy[0..resp.len], resp);
-        resp = g_player_copy[0..resp.len];
-        print("  [download] Loading player.js for signature/n transforms...\n");
+    // Preserve the chosen response before any further innertube requests reuse
+    // the shared response buffer (watch page / player.js fetch).
+    if (resp.len > g_player_copy.len) return ctx;
+    @memcpy(g_player_copy[0..resp.len], resp);
+    resp = g_player_copy[0..resp.len];
 
-        // Session configuration supplies the matching player without another
-        // large watch-page request. Retain the legacy discovery fallback.
+    // Load signature/n transforms when the response needs them.
+    if (findStr(resp, "\"signatureCipher\"") != null or findStr(resp, "&n=") != null or findStr(resp, "\\u0026n=") != null) {
+        print("  [download] Loading player.js for signature/n transforms...\n");
         var player_url = g_session.playerUrl();
         if (player_url.len == 0) player_url = cipher_mod.extractPlayerUrl(innertube.fetchWatchPage(video_id));
         if (player_url.len > 0) {
@@ -234,164 +388,115 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
         }
     }
 
-    // Step 3: Parse available formats
-    print("  [download] Parsing formats...\n");
-    var formats: [manifest_mod.MAX_FORMATS]manifest_mod.StreamFormat = undefined;
-    const n_formats = manifest_mod.parseFormats(resp, &formats);
+    ctx.resp = resp;
+    ctx.sabr_available = sabr_mod.player_fields.serverAbrStreamingUrl(resp) != null;
+    ctx.ok = true;
+    return ctx;
+}
 
-    if (n_formats == 0) {
-        print("  [download] ERROR: No formats found\n");
-        return status;
-    }
-
-    // Step 4: Select best audio stream.
-    //
-    // Adaptive audio (itag 251/140) is smaller and preferred, but GVS only
-    // serves it with a valid session-bound attested PO token. When we are on the
-    // WEB fallback (iOS already failed) WITHOUT such a token — e.g. the live
-    // integrity-token mint was server-gated and we hold only a cold-start or
-    // relayed proof — the adaptive URL is guaranteed to 403, so skip straight to
-    // the PO-token-exempt muxed itag 18 instead of burning retries on it. With a
-    // real session-bound VM token (logged-in/residential), prefer adaptive.
-    const prefer_muxed_audio = kind == .audio and g_skip_ios and g_token_source != .vm;
-    const direct_best = if (kind == .video)
-        manifest_mod.selectBestMuxed(&formats, n_formats) orelse manifest_mod.selectBestVideo(&formats, n_formats)
-    else if (prefer_muxed_audio)
-        (manifest_mod.selectByItag(&formats, n_formats, 18) orelse
-            manifest_mod.selectBestMuxed(&formats, n_formats) orelse
-            manifest_mod.selectBestAudio(&formats, n_formats, codec_pref) orelse
-            manifest_mod.selectBestAudio(&formats, n_formats, .any))
-    else
-        // opus preferred, but MWEB/WEB adaptive sets often only carry AAC
-        // (itag 140); fall back to any audio codec, then a muxed stream, rather
-        // than failing when the preferred codec is absent.
-        manifest_mod.selectBestAudio(&formats, n_formats, codec_pref) orelse
-        manifest_mod.selectBestAudio(&formats, n_formats, .any) orelse
-        manifest_mod.selectBestMuxed(&formats, n_formats);
-    const best = direct_best orelse if (sabr_mod.player_fields.serverAbrStreamingUrl(resp) != null)
-        manifest_mod.selectBestSabr(&formats, n_formats, kind == .audio)
-    else null;
-    if (best == null) {
-        print(if (kind == .video) "  [download] ERROR: No video stream found\n" else "  [download] ERROR: No audio stream found\n");
-        return status;
-    }
-    const fmt = best.?;
-
-    print("  [download] Selected: itag=");
-    printNum(fmt.itag);
-    print(", bitrate=");
-    printNum(fmt.bitrate);
-    print(", size=");
-    printNum(fmt.content_length);
-    print(" bytes\n");
-
+/// Deliver a single selected format to `path` per the delivery policy, updating
+/// `status`. Returns true on a non-empty written file. `auto` tries the direct
+/// signed/transformed URL (when present) and SABR (when offered) in a robust
+/// order; `.direct`/`.sabr` force one mechanism (fail-closed).
+fn deliverOne(resp: []const u8, fmt: *const manifest_mod.StreamFormat, kind: MediaKind, path: [*:0]const u8, delivery: Delivery, options: DownloadOptions, status: *DownloadStatus) bool {
     status.bitrate = fmt.bitrate;
     status.contains_video = fmt.is_video;
     status.contains_audio = fmt.is_audio;
-    if (extractJsonString(resp, "\"lengthSeconds\"")) |dur_str| status.duration_sec = parseUint(dur_str);
 
-    // SABR branch: when the player response exposes serverAbrStreamingUrl (and
-    // the selected format lacks a direct URL), YouTube serves this media only
-    // via SABR POST delivery. Pull it through the pure-Sig SABR loop using the
-    // content-bound PO token + the session jar. The direct-URL path below stays
-    // the fallback whenever a direct URL IS present.
-    if (fmt.url_len == 0 and sabr_mod.player_fields.serverAbrStreamingUrl(resp) != null) {
-        if (trySabr(resp, fmt, kind, output_path, options, &status)) {
-            if (status.success and kind == .video and !status.contains_audio and audio_path != null and audio_status_out != null)
-                downloadMatchingAudio(resp, &formats, n_formats, audio_path.?, options, status.duration_sec, audio_status_out.?);
-            return status;
+    const want_direct = (delivery == .auto or delivery == .direct) and fmt.url_len > 0;
+    const want_sabr = (delivery == .auto or delivery == .sabr) and g_ctx_sabr_available;
+
+    // SABR-first when the format has no direct URL, or when the caller forced
+    // SABR. Otherwise try the direct URL first (it is cheaper when it works).
+    if ((delivery == .sabr or fmt.url_len == 0) and want_sabr) {
+        if (trySabr(resp, fmt, kind, path, options, status)) return true;
+        if (delivery == .sabr) return false;
+    }
+
+    if (want_direct) {
+        var url_buf: [9216]u8 = undefined;
+        const url_len = appendStreamToken(fmt.url[0..fmt.url_len], &url_buf);
+        if (url_len != 0) {
+            print("  [download] Downloading (direct) itag=");
+            printNum(fmt.itag);
+            print(" size=");
+            printNum(fmt.content_length);
+            print("\n");
+            const dl = stream_mod.downloadToFile(url_buf[0..url_len], path, fmt.content_length, options.progress);
+            status.bytes_downloaded = dl.bytes_written;
+            status.success = dl.success;
+            if (dl.success) { setContainer(fmt, status); return true; }
+            print("  [download] direct FAILED (HTTP status=");
+            printNum(stream_mod.last_status);
+            print(")\n");
         }
     }
 
-    // Step 5: Download the stream
-    if (fmt.url_len == 0) {
-        print("  [download] ERROR: No stream URL (cipher failed?)\n");
+    // Direct URL failed or absent: try SABR if we have not already.
+    if (delivery == .auto and want_sabr and fmt.url_len > 0) {
+        if (trySabr(resp, fmt, kind, path, options, status)) return true;
+    }
+
+    return false;
+}
+
+// serverAbrStreamingUrl availability for the response currently being
+// delivered — set by the resolver before calling deliverOne.
+var g_ctx_sabr_available: bool = false;
+
+fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8, codec_pref: AudioCodec, kind: MediaKind, options: DownloadOptions, audio_path: ?[*:0]const u8, audio_status_out: ?*DownloadStatus) DownloadStatus {
+    // Audio delegates entirely to the caller-controlled resolver.
+    if (kind == .audio)
+        return fetch(video_id, .{ .track = .audio, .codec = codec_pref, .options = options }, output_path);
+
+    // Video path: acquire one player response, select the best video (muxed when
+    // available), deliver it, and — for videoWithAudio — pull a matching adaptive
+    // audio track from the same response/session when the video has no audio.
+    var status = DownloadStatus{ .success = false, .bytes_downloaded = 0, .container = .unknown, .codec = .unknown, .bitrate = 0, .duration_sec = 0 };
+
+    print("  [download] Fetching player data...\n");
+    prepareTokens(video_id, options);
+    status.token_source = g_token_source;
+    if (options.require_vm_token and g_token_source != .vm) {
+        print("  [download] ERROR: VM token required and minting did not succeed\n");
         return status;
     }
 
-    // Append the PO token to the stream URL (&pot=...) — required by GVS for the
-    // stream to serve full data (2026). Build the final URL in a local buffer.
-    var url_buf: [9216]u8 = undefined;
-    const url_len = appendStreamToken(fmt.url[0..fmt.url_len], &url_buf);
-    if (url_len == 0) return status;
-    const url_final = url_buf[0..url_len];
-    print("  [download] stream URL length=");
-    printNum(@intCast(fmt.url_len));
-    print("\n");
-    if (url_len > fmt.url_len) print("  [download] stream URL + &pot= appended\n");
+    const ctx = acquirePlayer(video_id, options, false);
+    status.token_source = g_token_source;
+    if (!ctx.ok) return status;
+    const resp = ctx.resp;
+    g_ctx_sabr_available = ctx.sabr_available;
+    if (extractJsonString(resp, "\"lengthSeconds\"")) |dur_str| status.duration_sec = parseUint(dur_str);
 
-    print("  [download] Downloading...\n");
-    const dl_result = stream_mod.downloadToFile(
-        url_final,
-        output_path,
-        fmt.content_length,
-        options.progress,
-    );
+    var formats: [manifest_mod.MAX_FORMATS]manifest_mod.StreamFormat = undefined;
+    const n_formats = manifest_mod.parseFormats(resp, &formats);
+    if (n_formats == 0) { print("  [download] ERROR: No formats found\n"); return status; }
 
-    status.bytes_downloaded = dl_result.bytes_written;
-    status.success = dl_result.success;
+    // Candidate order: a complete muxed stream first (one file, has audio), then
+    // adaptive video-only, then SABR.
+    var cands: [3]*const manifest_mod.StreamFormat = undefined;
+    var nc: usize = 0;
+    if (manifest_mod.selectBestMuxed(&formats, n_formats)) |f| { cands[nc] = f; nc += 1; }
+    if (manifest_mod.selectBestVideo(&formats, n_formats)) |f| { cands[nc] = f; nc += 1; }
+    if (ctx.sabr_available) { if (manifest_mod.selectBestSabr(&formats, n_formats, false)) |f| { cands[nc] = f; nc += 1; } }
+    if (nc == 0) { print("  [download] ERROR: No video stream found\n"); return status; }
 
-    if (status.success) {
-        setContainer(fmt, &status);
-
-        print("  [download] Complete: ");
-        printNum(status.bytes_downloaded / 1024);
-        print(" KB\n");
-    } else {
-        print("  [download] FAILED after ");
-        printNum(dl_result.retries);
-        print(" retries (last HTTP status=");
-        printNum(stream_mod.last_status);
-        print(")\n");
-
-        // Retry a distinct muxed representation from the same response/session.
-        if (if (fmt.itag != 18) manifest_mod.selectByItag(&formats, n_formats, 18) else null) |mux| {
-            print("  [download] Falling back to muxed itag=18...\n");
-            print("  [download] itag=18 URL length=");
-            printNum(@intCast(mux.url_len));
-            print(", size=");
-            printNum(mux.content_length);
-            print("\n");
-            var m_buf: [9216]u8 = undefined;
-            const m_len = appendStreamToken(mux.url[0..mux.url_len], &m_buf);
-            if (m_len == 0) return status;
-            const m_url = m_buf[0..m_len];
-            const mux_result = stream_mod.downloadToFile(m_url, output_path, mux.content_length, options.progress);
-            status.bytes_downloaded = mux_result.bytes_written;
-            status.success = mux_result.success;
-            if (status.success) {
-                status.container = .mp4;
-                status.codec = .aac;
-                status.bitrate = mux.bitrate;
-                status.contains_video = mux.is_video;
-                status.contains_audio = mux.is_audio;
-                print("  [download] Complete (itag 18 muxed): ");
-                printNum(status.bytes_downloaded / 1024);
-                print(" KB\n");
-            } else {
-                print("  [download] itag 18 fallback also FAILED (HTTP status=");
-                printNum(stream_mod.last_status);
-                print(")\n");
-            }
-        }
+    var delivered = false;
+    for (cands[0..nc]) |f| {
+        if (deliverOne(resp, f, .video, output_path, .auto, options, &status)) { delivered = true; break; }
     }
+    if (!delivered) { print("  [download] ERROR: video delivery failed on all candidates\n"); return status; }
 
-    if (status.success and kind == .video and !status.contains_audio and audio_path != null and audio_status_out != null) {
+    if (extractJsonString(resp, "\"lengthSeconds\"")) |dur_str| status.duration_sec = parseUint(dur_str);
+    print("  [download] Complete: ");
+    printNum(status.bytes_downloaded / 1024);
+    print(" KB\n");
+
+    // videoWithAudio: fetch a matching adaptive audio track when the delivered
+    // video carries no audio.
+    if (kind == .video and !status.contains_audio and audio_path != null and audio_status_out != null)
         downloadMatchingAudio(resp, &formats, n_formats, audio_path.?, options, status.duration_sec, audio_status_out.?);
-    }
-
-    // iOS fallback: a protected video's iOS stream URL is served only as a ~1MB
-    // preview and then rejected (HTTP 403) because it lacks a matching GVS PO
-    // token. The WEB/MWEB path carries the session's visitorData-bound GVS token
-    // and (now that nsig runs on the jsvm) can de-throttle its URLs, so retry
-    // the audio once through the web clients when the iOS attempt failed.
-    if (!status.success and kind == .audio and used_ios and !g_skip_ios) {
-        print("  [download] iOS stream rejected; retrying via WEB/MWEB + nsig path...\n");
-        g_skip_ios = true;
-        const retry = downloadMedia(video_id, output_path, codec_pref, kind, options, audio_path, audio_status_out);
-        g_skip_ios = false;
-        if (retry.success) return retry;
-    }
 
     return status;
 }
@@ -567,10 +672,13 @@ fn trySabr(
         cfg_bytes = g_sabr_cfg_buf[0..n];
     }
 
-    // 3. content-bound PO token (g_pot_buf holds base64url text) -> raw bytes.
+    // 3. GVS PO token for the SABR body. SABR is GVS delivery, so it wants the
+    // stream (session-bound) token when available, falling back to the
+    // content-bound token. g_stream_pot_buf holds base64url text -> raw bytes.
     var pot_bytes: []const u8 = "";
-    if (g_pot_len > 0) {
-        const n = base64Decode(g_pot_buf[0..g_pot_len], &g_sabr_pot_buf);
+    const sabr_pot_src = if (g_stream_pot_len > 0) g_stream_pot_buf[0..g_stream_pot_len] else g_pot_buf[0..g_pot_len];
+    if (sabr_pot_src.len > 0) {
+        const n = base64Decode(sabr_pot_src, &g_sabr_pot_buf);
         if (n == 0) return false;
         pot_bytes = g_sabr_pot_buf[0..n];
     }
@@ -606,6 +714,14 @@ fn trySabr(
     printNum(fmt.itag);
     print(" lmt=");
     printNum(fmt.last_modified);
+    print(" cfg_bytes=");
+    printNum(cfg_bytes.len);
+    print(" pot_bytes=");
+    printNum(pot_bytes.len);
+    print(" client=");
+    printNum(if (g_web_client == .mweb) 2 else 1);
+    print(" cv_len=");
+    printNum(client_version.len);
     print("\n");
 
     const res = sabr_mod.stream.runLoop(
@@ -645,7 +761,23 @@ fn trySabr(
     print(" bytes=");
     printNum(res.bytes_written);
     print("\n");
-    return res.bytes_written > 0; // partial bytes still count as "handled"
+    print("  [download] SABR parts: media_header=");
+    printNum(sabr_mod.stream.dbg_n_media_header);
+    print(" media=");
+    printNum(sabr_mod.stream.dbg_n_media);
+    print(" ctx_update=");
+    printNum(sabr_mod.stream.dbg_n_ctx_update);
+    print(" next_policy=");
+    printNum(sabr_mod.stream.dbg_n_next_policy);
+    print(" sps=");
+    printNum(sabr_mod.stream.dbg_n_sps);
+    print(" fim=");
+    printNum(sabr_mod.stream.dbg_n_fim);
+    print("\n");
+    // A gated/partial SABR response is NOT a usable stream — report failure so
+    // the resolver can fall through to the WEB/MWEB session (proper pot) or the
+    // muxed fallback. Only a completed stream counts as handled.
+    return false;
 }
 
 // Decode standard or URL-safe base64, rejecting malformed or oversized values.

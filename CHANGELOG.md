@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.1 — 2026-10-11
+
+### Added
+- **`@zpm/youtube` live integrity-token minting in the download session.** The
+  download path now mints a real content-bound + session-bound PO token on a
+  fresh visitor session (no pinned relay, no cold-start). `session.establishIntegrityToken`
+  uses the WAA **Create** flow (`challenge.fetchCreate` + `integrity.getToken` →
+  `jnn-pa.googleapis.com` GenerateIT), the only challenge/endpoint pair whose VM
+  snapshot populates getMinter AND whose response the server exchanges for a
+  non-null integrity token. `GenerateIT` returns `["<token>",43200,100]` and the
+  download logs `VM minted PO tokens (player=content-bound, GVS=session-bound)`.
+- **SABR attestation plumbing** toward adaptive-audio delivery: SabrContextUpdate
+  decode + echo (`sabr/ump.sig`, `sabr/request.sig` StreamerContext field 5,
+  `sabr/stream.sig`), a bounded `STREAM_PROTECTION_STATUS==2` pending-retry, the
+  session-bound GVS token in the SABR body, and SABR part-type counters for
+  diagnosis. (Adaptive-audio-over-SABR for fully protected videos is still
+  gated at ATTESTATION_PENDING; the muxed itag-18 path remains the working
+  fallback. See the project progress notes.)
+
+### Fixed
+- **`session.parseHomepageChallenge`** now hex-unescapes the homepage BotGuard
+  challenge (`\x22`/`\x7b`/`\x7d` → `"{}`), which the 2026 homepage uses; the old
+  literal-quote scan silently found no challenge.
+
 ## 0.4.0 — 2026-10-11
 
 ### Added
