@@ -3,6 +3,8 @@
 
 // Constants
 pub const COLOR_BUFFER_BIT: u32 = 0x00004000;
+pub const DEPTH_BUFFER_BIT: u32 = 0x00000100;
+pub const DEPTH_TEST: u32 = 0x0B71;
 pub const LINES: u32 = 0x0001;
 pub const LINE_LOOP: u32 = 0x0002;
 pub const LINE_STRIP: u32 = 0x0003;
@@ -36,6 +38,10 @@ pub extern "opengl32" fn glViewport(i32, i32, i32, i32) callconv(.c) void;
 pub extern "opengl32" fn glBegin(u32) callconv(.c) void;
 pub extern "opengl32" fn glEnd() callconv(.c) void;
 pub extern "opengl32" fn glVertex2f(f32, f32) callconv(.c) void;
+pub extern "opengl32" fn glVertex3f(f32, f32, f32) callconv(.c) void;
+pub extern "opengl32" fn glFrustum(f64, f64, f64, f64, f64, f64) callconv(.c) void;
+pub extern "opengl32" fn glRotatef(f32, f32, f32, f32) callconv(.c) void;
+pub extern "opengl32" fn glTranslatef(f32, f32, f32) callconv(.c) void;
 pub extern "opengl32" fn glColor4f(f32, f32, f32, f32) callconv(.c) void;
 pub extern "opengl32" fn glColor3f(f32, f32, f32) callconv(.c) void;
 pub extern "opengl32" fn glEnable(u32) callconv(.c) void;
