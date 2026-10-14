@@ -160,6 +160,16 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const state_wire = try ctx.addModule("state_wire", "src/game/state_wire.sig");
     try wire(ctx, state_wire, "ledger_world", "src/game/ledger_world.sig");
     _ = try ctx.addModule("action_funding", "src/game/action_funding.sig");
+    const game_token = try ctx.addModule("game_token", "src/game/game_token.sig");
+    try wire(ctx, game_token, "ledger_world", "src/game/ledger_world.sig");
+    try wire(ctx, game_token, "solana_le", "src/solana/le.sig");
+    const mesh_wire = try ctx.addModule("mesh_wire", "src/game/mesh_wire.sig");
+    try wire(ctx, mesh_wire, "ledger_world", "src/game/ledger_world.sig");
+    try wire(ctx, mesh_wire, "action_wire", "src/game/action_wire.sig");
+    try wire(ctx, mesh_wire, "solana_le", "src/solana/le.sig");
+    const checkpoint_core = try ctx.addModule("checkpoint_core", "src/game/checkpoint_core.sig");
+    try wire(ctx, checkpoint_core, "ledger_world", "src/game/ledger_world.sig");
+    _ = try ctx.addModule("receipt_verifier", "src/game/receipt_verifier.sig");
     _ = try ctx.addModule("scene3d", "src/game/scene3d.sig");
     _ = try ctx.addModule("bitmap_font", "src/core/bitmap_font.sig");
     _ = try ctx.addModule("android_native", "src/platform/android/native_activity.sig");
@@ -172,6 +182,25 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("action_funding", "src/game/action_funding.sig"),
         importEntry("scene3d", "src/game/scene3d.sig"),
         importEntry("state_wire", "src/game/state_wire.sig"),
+    });
+    _ = try addContract(ctx, test_game, "contract-game-token", "tests/test_game_token.sig", &.{
+        importEntry("ledger_world", "src/game/ledger_world.sig"),
+        importEntry("solana_le", "src/solana/le.sig"),
+        importEntry("game_token", "src/game/game_token.sig"),
+    });
+    _ = try addContract(ctx, test_game, "contract-mesh-wire", "tests/test_mesh_wire.sig", &.{
+        importEntry("ledger_world", "src/game/ledger_world.sig"),
+        importEntry("action_wire", "src/game/action_wire.sig"),
+        importEntry("solana_le", "src/solana/le.sig"),
+        importEntry("mesh_wire", "src/game/mesh_wire.sig"),
+    });
+    _ = try addContract(ctx, test_game, "contract-checkpoint-core", "tests/test_checkpoint_core.sig", &.{
+        importEntry("ledger_world", "src/game/ledger_world.sig"),
+        importEntry("action_wire", "src/game/action_wire.sig"),
+        importEntry("checkpoint_core", "src/game/checkpoint_core.sig"),
+    });
+    _ = try addContract(ctx, test_game, "contract-receipt-verifier", "tests/test_receipt_verifier.sig", &.{
+        importEntry("receipt_verifier", "src/game/receipt_verifier.sig"),
     });
     _ = try ctx.addModule("math", "src/core/math.sig");
     _ = try ctx.addModule("sig_math", "src/core/sig_math.sig");
