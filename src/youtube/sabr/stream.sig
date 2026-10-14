@@ -184,6 +184,8 @@ pub const ProcessOutcome = struct {
     // A SABR_CONTEXT_UPDATE the server wants echoed back on the next request.
     ctx_update: []const u8 = "", // raw value bytes (borrowed from the response)
     ctx_update_type: i32 = 0,
+    ctx_update_scope: i32 = 0,
+    ctx_update_send_by_default: bool = false,
     has_ctx_update: bool = false,
 };
 
@@ -251,6 +253,16 @@ pub fn runLoopWithOptions(
 ) SabrResult {
     var result = SabrResult{};
     var progress = FormatProgress{ .itag = selected.itag, .last_modified = selected.last_modified };
+
+    // Reset diagnostic per-pass trace for this run.
+    dbg_pass_n = 0;
+    dbg_n_media_header = 0;
+    dbg_n_media = 0;
+    dbg_n_ctx_update = 0;
+    dbg_n_next_policy = 0;
+    dbg_n_sps = 0;
+    dbg_n_fim = 0;
+    dbg_last_part_n = 0;
 
     var host: []const u8 = host_in;
     var port_cur: u16 = port;
@@ -354,6 +366,34 @@ pub fn runLoopWithOptions(
         }
         // Capture a SABR context update to echo on the next request (this is how
         // the server validates and transitions STREAM_PROTECTION_STATUS 2 -> OK).
+        // NOTE: capture the per-pass handshake trace BEFORE we overwrite
+        // ctx_update_* with this pass's update, so `sent_ctx_*` reflects what we
+        // actually sent INTO this request (the previous pass's captured context).
+        if (dbg_pass_n < dbg_passes.len) {
+            dbg_passes[dbg_pass_n] = .{
+                .request_no = result.requests,
+                .http_status = r.status,
+                .protection_status = pass.protection_status,
+                .media_bytes = pass.media_bytes,
+                .total_bytes = progress.bytes,
+                .has_ctx_update = pass.has_ctx_update,
+                .ctx_type = pass.ctx_update_type,
+                .ctx_scope = pass.ctx_update_scope,
+                .ctx_send_by_default = pass.ctx_update_send_by_default,
+                .ctx_len = pass.ctx_update.len,
+                .sabr_error_seen = pass.sabr_error_seen,
+                .sabr_error_code = pass.sabr_error_code,
+                .backoff_ms = pass.backoff_time_ms,
+                .sent_ctx_len = ctx_update_len,
+                .sent_ctx_type = ctx_update_type,
+                .sent_pot_len = po_token.len,
+                .sent_buffered_end_ms = buffered.duration_ms,
+                .sent_player_time_ms = player_time_ms,
+                .sent_initialized = progress.initialized,
+            };
+            dbg_pass_n += 1;
+        }
+
         if (pass.has_ctx_update and pass.ctx_update.len > 0 and pass.ctx_update.len <= ctx_update_buf.len) {
             @memcpy(ctx_update_buf[0..pass.ctx_update.len], pass.ctx_update);
             ctx_update_len = pass.ctx_update.len;
@@ -470,6 +510,35 @@ pub var dbg_n_passes: u32 = 0;
 pub var dbg_last_part_types: [16]u64 = [_]u64{0} ** 16;
 pub var dbg_last_part_n: usize = 0;
 
+// Per-pass handshake trace (diagnostic only; no production behavior change).
+// Captures, for each SABR round-trip, exactly what the server returned and what
+// the client carried INTO that request, so a protection-2 wall can be bisected.
+pub const DbgPass = struct {
+    request_no: u32 = 0,
+    http_status: u32 = 0,
+    protection_status: i32 = 0,
+    media_bytes: u64 = 0,
+    total_bytes: u64 = 0,
+    // Signals received this pass
+    has_ctx_update: bool = false,
+    ctx_type: i32 = 0,
+    ctx_scope: i32 = 0,
+    ctx_send_by_default: bool = false,
+    ctx_len: usize = 0,
+    sabr_error_seen: bool = false,
+    sabr_error_code: i32 = 0,
+    backoff_ms: i32 = 0,
+    // What the client carried INTO this request
+    sent_ctx_len: usize = 0,
+    sent_ctx_type: i32 = 0,
+    sent_pot_len: usize = 0,
+    sent_buffered_end_ms: i64 = 0,
+    sent_player_time_ms: i64 = 0,
+    sent_initialized: bool = false,
+};
+pub var dbg_passes: [256]DbgPass = undefined;
+pub var dbg_pass_n: usize = 0;
+
 fn formatComplete(selected: request.SelectedFormat, progress: FormatProgress) bool {
     if (progress.header_active or progress.bytes == 0) return false;
     if (selected.content_length > 0) return progress.bytes == selected.content_length;
@@ -568,6 +637,8 @@ fn applyPart(part: ump.Part, sink: Sink, progress: *FormatProgress, pass: *Proce
             if (cu.present and cu.value.len > 0) {
                 pass.ctx_update = cu.value;
                 pass.ctx_update_type = cu.ctx_type;
+                pass.ctx_update_scope = cu.scope;
+                pass.ctx_update_send_by_default = cu.send_by_default;
                 pass.has_ctx_update = true;
             }
         },
