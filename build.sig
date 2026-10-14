@@ -332,7 +332,16 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     // interns the module by name. Registering it up front keeps that early
     // reference and the later platform consumers pointing at one canonical
     // module (a second addModule would fail with a duplicate-name error).
-    const win32_path = if (builtin.os.tag == .windows)
+    // Select the win32 seam by the REQUESTED target OS when cross-compiling
+    // (-Dtarget=...), falling back to the host OS for a native build. A linux
+    // or android target forces the pure-syscall linux_platform.sig shim across
+    // the whole graph (that shim is the Android arm64 backend too), so a
+    // cross-build does not drag in the real Windows win32.sig.
+    const target_is_windows = if (ctx.target.os_len > 0)
+        namesEqual(ctx.target.os[0..ctx.target.os_len], "windows")
+    else
+        builtin.os.tag == .windows;
+    const win32_path = if (target_is_windows)
         "src/platform/win32.sig"
     else
         "src/transport/linux_platform.sig";
@@ -1244,6 +1253,21 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, appmap, "streams", "src/transport/streams.sig");
     try wire(ctx, appmap, "datagram", "src/transport/datagram.sig");
     try wire(ctx, appmap, "packet", "src/transport/packet.sig");
+    // Peer-to-peer mesh transport (composes conn + streams + datagram + packet,
+    // like appmap). conn's full transitive closure must be reachable (win32 via
+    // the comptime seam, packet, transport_crypto, recovery, telemetry, udp,
+    // crypto_stream, tls13) — mirror the conn registration above.
+    const mesh_transport = try ctx.addModule("mesh_transport", "src/transport/mesh_transport.sig");
+    try wire(ctx, mesh_transport, "conn", "src/transport/conn.sig");
+    try wire(ctx, mesh_transport, "streams", "src/transport/streams.sig");
+    try wire(ctx, mesh_transport, "datagram", "src/transport/datagram.sig");
+    try wire(ctx, mesh_transport, "packet", "src/transport/packet.sig");
+    try wire(ctx, mesh_transport, "win32", win32_path);
+    try wire(ctx, mesh_transport, "transport_crypto", "src/transport/crypto.sig");
+    try wire(ctx, mesh_transport, "recovery", "src/transport/recovery.sig");
+    try wire(ctx, mesh_transport, "telemetry", "src/transport/telemetry.sig");
+    try wire(ctx, mesh_transport, "udp", "src/transport/udp.sig");
+    try wire(ctx, mesh_transport, "crypto_stream", "src/transport/crypto_stream.sig");
     _ = try ctx.addModule("h3", "src/transport/h3.sig");
     const h3_server = try ctx.addModule("h3_server", "src/transport/server.sig");
     try wire(ctx, h3_server, "conn", "src/transport/conn.sig");
@@ -1296,11 +1320,60 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("datagram", "src/transport/datagram.sig"),
         importEntry("packet", "src/transport/packet.sig"),
     });
+    // Mirror the test-conn seam set (incl. win32 via win32_path) plus the mesh's
+    // direct deps so the loopback test{} blocks compile across the socket seam.
+    _ = try addTest(ctx, test_all, "test-mesh-transport", "src/transport/mesh_transport.sig", &.{
+        importEntry("conn", "src/transport/conn.sig"),                   importEntry("streams", "src/transport/streams.sig"),
+        importEntry("datagram", "src/transport/datagram.sig"),           importEntry("packet", "src/transport/packet.sig"),
+        importEntry("win32", win32_path),                                importEntry("transport_crypto", "src/transport/crypto.sig"),
+        importEntry("recovery", "src/transport/recovery.sig"),           importEntry("telemetry", "src/transport/telemetry.sig"),
+        importEntry("udp", "src/transport/udp.sig"),                     importEntry("crypto_stream", "src/transport/crypto_stream.sig"),
+    });
     _ = try addTest(ctx, test_all, "test-h3", "src/transport/h3.sig", &.{});
     _ = try addTest(ctx, test_all, "test-h3-server", "src/transport/server.sig", &.{
         importEntry("conn", "src/transport/conn.sig"),       importEntry("packet", "src/transport/packet.sig"),
         importEntry("streams", "src/transport/streams.sig"), importEntry("udp", "src/transport/udp.sig"),
         importEntry("h3", "src/transport/h3.sig"),           importEntry("telemetry", "src/transport/telemetry.sig"),
+    });
+
+    // ── Mesh-node CLI harness executables (Windows + Android arm64) ──
+    // Thin peer-to-peer mesh node over mesh_transport.Mesh. The full conn
+    // transitive closure is supplied as imports; system libs (ws2_32, bcrypt,
+    // secur32, kernel32) are auto-linked from win32.sig's `extern "<lib>"`
+    // decls on Windows, and the Android/Linux build uses linux_platform.sig
+    // (the win32 alias) which is pure kernel syscalls — no libc. The win32
+    // alias follows the host for the native build; the Android build forces the
+    // Linux shim and an aarch64-linux target (Android presents the same syscall
+    // ABI as Linux, so linux_platform.sig is the Android backend).
+    const mesh_node_imports = [_]sig_build.Import_Entry{
+        importEntry("mesh_transport", "src/transport/mesh_transport.sig"),
+        importEntry("conn", "src/transport/conn.sig"),
+        importEntry("streams", "src/transport/streams.sig"),
+        importEntry("datagram", "src/transport/datagram.sig"),
+        importEntry("packet", "src/transport/packet.sig"),
+        importEntry("win32", win32_path),
+        importEntry("transport_crypto", "src/transport/crypto.sig"),
+        importEntry("crypto", "src/platform/crypto.sig"),
+        importEntry("recovery", "src/transport/recovery.sig"),
+        importEntry("telemetry", "src/transport/telemetry.sig"),
+        importEntry("udp", "src/transport/udp.sig"),
+        importEntry("crypto_stream", "src/transport/crypto_stream.sig"),
+    };
+    // One compile step for the mesh node; the win32 seam above already follows
+    // the requested target (-Dtarget=...), so the SAME step builds:
+    //   • Windows exe:   sig build mesh-node   (native host, win32.sig backend)
+    //   • Android arm64: sig build mesh-node -Dtarget=aarch64-linux-musl
+    //       (linux_platform.sig syscall backend; musl is statically linked but
+    //        the socket/clock/random paths go through raw syscalls, so it runs
+    //        on the device from /data/local/tmp exactly like a no-libc PIE).
+    _ = try ctx.addCompileStep(.{
+        .source_path = "src/mesh_node.sig",
+        .output_name = "mesh-node",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null, // actual target comes from the global -Dtarget seam
+        .compiler_path = "",
+        .imports = &mesh_node_imports,
     });
 
     _ = try addTest(ctx, test_all, "test-no-alloc", "src/transport/no_alloc_test.sig", &.{});
