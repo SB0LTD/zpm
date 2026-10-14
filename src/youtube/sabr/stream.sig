@@ -28,7 +28,10 @@ const http = @import("youtube_net");
 extern "kernel32" fn CreateFileA([*:0]const u8, u32, u32, ?*anyopaque, u32, u32, ?*anyopaque) ?*anyopaque;
 extern "kernel32" fn WriteFile(?*anyopaque, [*]const u8, u32, ?*u32, ?*anyopaque) c_int;
 extern "kernel32" fn CloseHandle(?*anyopaque) c_int;
+extern "kernel32" fn FlushFileBuffers(?*anyopaque) c_int;
+extern "kernel32" fn MoveFileExA([*:0]const u8, [*:0]const u8, u32) c_int;
 extern "kernel32" fn Sleep(u32) void;
+extern "kernel32" fn GetTickCount64() u64;
 
 const GENERIC_WRITE: u32 = 0x40000000;
 const CREATE_ALWAYS: u32 = 2;
@@ -79,6 +82,46 @@ pub const FileSink = struct {
     }
 };
 
+/// Stages a download beside its destination. Failed/cancelled transfers leave
+/// `<path>.part` for inspection and never replace an existing complete file.
+/// The caller commits only after the streaming protocol reports completion.
+pub const StagedFileSink = struct {
+    file: FileSink,
+    destination: [1024:0]u8 = @splat(0),
+    partial: [1029:0]u8 = @splat(0),
+    committed: bool = false,
+
+    pub fn open(path: [*:0]const u8) ?StagedFileSink {
+        var self = StagedFileSink{ .file = .{} };
+        var length: usize = 0;
+        while (path[length] != 0) : (length += 1) {
+            if (length == self.destination.len) return null;
+            self.destination[length] = path[length];
+            self.partial[length] = path[length];
+        }
+        if (length == 0) return null;
+        @memcpy(self.partial[length..][0..5], ".part");
+        self.file = FileSink.open(&self.partial) orelse return null;
+        return self;
+    }
+
+    pub fn close(self: *StagedFileSink) void { self.file.close(); }
+    pub fn sink(self: *StagedFileSink) Sink { return self.file.sink(); }
+
+    pub fn commit(self: *StagedFileSink) bool {
+        if (self.committed) return true;
+        const handle = self.file.handle orelse return false;
+        const flushed = FlushFileBuffers(handle) != 0;
+        self.file.close();
+        if (!flushed) return false;
+        // Same-directory rename stays on the same volume. Replace the requested
+        // destination only after a complete transfer; propagate commit failures.
+        if (MoveFileExA(&self.partial, &self.destination, 1 | 8) == 0) return false;
+        self.committed = true;
+        return true;
+    }
+};
+
 // ── Transport seam ──
 
 pub const PostResult = struct { status: u32 = 0, len: usize = 0, ok: bool = false };
@@ -95,6 +138,7 @@ pub const Transport = struct {
 /// Outcome the loop surfaces so a caller can distinguish success from a wall.
 pub const SabrResult = struct {
     success: bool = false,
+    failure: Failure = .none,
     bytes_written: u64 = 0,
     last_status: u32 = 0,
     media_end: bool = false,
@@ -102,7 +146,11 @@ pub const SabrResult = struct {
     sabr_error_seen: bool = false,
     protection_status: i32 = 0, // last STREAM_PROTECTION_STATUS.status (0 if none)
     redirects: u16 = 0,
+    requests: u32 = 0,
+    retries: u32 = 0,
 };
+
+pub const Failure = enum { none, transport, http_status, empty_response, request_capacity, response_capacity, media_write, cancelled, sabr_error, protection, incomplete, iteration_limit };
 
 /// Per-format accumulation state updated while parsing UMP parts.
 pub const FormatProgress = struct {
@@ -120,6 +168,7 @@ pub const FormatProgress = struct {
     segment_end_ms: i64 = 0,
     segment_expected_bytes: i64 = 0,
     segment_bytes: u64 = 0,
+    initialized: bool = false,
 };
 
 /// What a single UMP buffer pass reports back to the loop.
@@ -181,6 +230,25 @@ pub fn runLoop(
     client_version: []const u8,
     sink: Sink,
 ) SabrResult {
+    return runLoopWithOptions(transport, host_in, port, path_in, selected, is_audio, ustreamer_config, po_token, client_name, client_version, sink, .{});
+}
+
+pub const LoopOptions = struct {
+    progress: ?*const fn (downloaded: u64, total: u64) void = null,
+    // Return false to cancel between HTTP requests.
+    on_response: ?*const fn (result: SabrResult) bool = null,
+    // Retry only failures with no HTTP response, or transient server statuses.
+    // Each attempt reuses the same request number/body; no media is committed.
+    max_transport_retries: u8 = 3,
+    retry_delay_ms: u32 = 250,
+};
+
+pub fn runLoopWithOptions(
+    transport: Transport, host_in: []const u8, port: u16, path_in: []const u8,
+    selected: request.SelectedFormat, is_audio: bool, ustreamer_config: []const u8,
+    po_token: []const u8, client_name: i32, client_version: []const u8,
+    sink: Sink, options: LoopOptions,
+) SabrResult {
     var result = SabrResult{};
     var progress = FormatProgress{ .itag = selected.itag, .last_modified = selected.last_modified };
 
@@ -197,6 +265,7 @@ pub fn runLoop(
     var ctx_update_type: i32 = 0;
 
     var pending_passes: u16 = 0;
+    const started = GetTickCount64();
     var iter: u16 = 0;
     while (iter < MAX_ITERATIONS) : (iter += 1) {
         // Build the request body for this round.
@@ -213,8 +282,10 @@ pub fn runLoop(
         };
         const params = request.AbrParams{
             .player_time_ms = player_time_ms,
+            .elapsed_wall_time_ms = @intCast(@min(GetTickCount64() - started, 0x7fffffffffffffff)),
             .audio_formats = audio,
             .video_formats = video,
+            .initialized_formats = if (progress.initialized) &.{selected} else &.{},
             .ustreamer_config = ustreamer_config,
             .po_token = po_token,
             .client_name = client_name,
@@ -225,16 +296,38 @@ pub fn runLoop(
             .sabr_context = ctx_update_buf[0..ctx_update_len],
             .sabr_context_type = ctx_update_type,
         };
-        const body_len = request.buildAbrRequest(params, &body_buf) catch return result;
+        const body_len = request.buildAbrRequest(params, &body_buf) catch {
+            result.failure = .request_capacity;
+            return result;
+        };
 
-        const r = transport.post(transport.ctx, host, port_cur, path, body_buf[0..body_len], &resp_buf);
-        result.last_status = r.status;
+        var request_path: [9408]u8 = undefined;
+        const request_path_len = numberedPath(path, iter, &request_path) orelse {
+            result.failure = .request_capacity;
+            break;
+        };
+        var r: PostResult = .{};
+        var attempts: u16 = 0;
+        while (true) {
+            r = transport.post(transport.ctx, host, port_cur, request_path[0..request_path_len], body_buf[0..body_len], &resp_buf);
+            result.requests += 1;
+            result.last_status = r.status;
+            const transient = r.status == 0 or r.status == 408 or r.status == 429 or r.status == 500 or r.status == 502 or r.status == 503 or r.status == 504;
+            if (r.ok or !transient or attempts >= options.max_transport_retries) break;
+            if (options.on_response) |callback| if (!callback(result)) {
+                result.failure = .cancelled;
+                return result;
+            };
+            attempts += 1;
+            result.retries += 1;
+            if (options.retry_delay_ms > 0) Sleep(@min(options.retry_delay_ms, 30000));
+        }
         if (!r.ok or r.len == 0) {
-            // No bytes / HTTP error: stop fail-closed.
+            result.failure = if (r.status == 0) .transport else if (!r.ok) .http_status else .empty_response;
             break;
         }
-
-        const combined = state.combine(resp_buf[0..r.len]) orelse break;
+        if (r.len > resp_buf.len) { result.failure = .response_capacity; break; }
+        const combined = state.combine(resp_buf[0..r.len]) orelse { result.failure = .response_capacity; break; };
         // Walk parts via the shared `applyPart` dispatch (same path as
         // processUmpBuffer) while keeping the reader cursor so a part split
         // across this and the next POST survives via state.carry(leftover).
@@ -245,11 +338,14 @@ pub fn runLoop(
             applyPart(part, sink, &progress, &pass, &write_failed);
             if (write_failed) break;
         }
-        if (write_failed) { result.bytes_written = progress.bytes; break; }
+        if (write_failed) { result.bytes_written = progress.bytes; result.failure = .media_write; break; }
         state.carry(pr.leftover());
 
         result.bytes_written = progress.bytes;
         if (pass.protection_status != 0) result.protection_status = pass.protection_status;
+        if (options.progress) |callback| callback(progress.bytes, selected.content_length);
+        if (options.on_response) |callback| if (!callback(result)) { result.failure = .cancelled; break; };
+        if (result.protection_status == 3) { result.failure = .protection; break; }
         player_time_ms = progress.buffered_end_ms;
         if (pass.playback_cookie.len > playback_cookie.len) break;
         if (pass.playback_cookie.len > 0) {
@@ -318,12 +414,50 @@ pub fn runLoop(
         if (pass.backoff_time_ms > 0) Sleep(@intCast(@min(pass.backoff_time_ms, 30000)));
     }
 
+    if (!result.success and result.failure == .none) result.failure = if (iter == MAX_ITERATIONS) .iteration_limit else if (result.sabr_error_seen) .sabr_error else if (result.protection_status == 2 or result.protection_status == 3) .protection else .incomplete;
     return result;
 }
 
 var redirect_host: [256]u8 = undefined;
 var redirect_path: [9216]u8 = undefined;
 var ctx_update_buf: [4096]u8 = undefined;
+
+// Preserve signed query fields while replacing only client request controls.
+fn numberedPath(path: []const u8, number: u16, out: []u8) ?usize {
+    var query: usize = 0;
+    while (query < path.len and path[query] != '?') : (query += 1) {}
+    if (query + 32 > out.len) return null;
+    @memcpy(out[0..query], path[0..query]);
+    var n = query;
+    var at = if (query < path.len) query + 1 else path.len;
+    var first = true;
+    while (at < path.len) {
+        const start = at;
+        while (at < path.len and path[at] != '&') : (at += 1) {}
+        const field = path[start..at];
+        const skip = (field.len >= 3 and field[0] == 'r' and field[1] == 'n' and field[2] == '=') or
+            (field.len >= 4 and field[0] == 'a' and field[1] == 'l' and field[2] == 'r' and field[3] == '=');
+        if (!skip and field.len > 0) {
+            if (n + 1 + field.len + 32 > out.len) return null;
+            out[n] = if (first) '?' else '&'; n += 1;
+            @memcpy(out[n..][0..field.len], field); n += field.len;
+            first = false;
+        }
+        if (at < path.len) at += 1;
+    }
+    const suffix = "alr=no&rn=";
+    out[n] = if (first) '?' else '&'; n += 1;
+    @memcpy(out[n..][0..suffix.len], suffix); n += suffix.len;
+    var digits: [5]u8 = undefined;
+    var d = digits.len;
+    var value = number;
+    while (true) {
+        d -= 1; digits[d] = @intCast(value % 10 + '0'); value /= 10;
+        if (value == 0) break;
+    }
+    @memcpy(out[n..][0..digits.len - d], digits[d..]);
+    return n + digits.len - d;
+}
 
 // Diagnostics: counts of each interesting part type seen across the whole loop.
 pub var dbg_n_media_header: u32 = 0;
@@ -391,13 +525,13 @@ fn applyPart(part: ump.Part, sink: Sink, progress: *FormatProgress, pass: *Proce
             }
         },
         ump.PartType.MEDIA_END => {
-            const id = ump.readUmpVarint(part.payload, 0) orelse return;
-            if (!progress.header_active or id.value != progress.header_id) return;
+            if (part.payload.len != 1 or !progress.header_active or part.payload[0] != progress.header_id) return;
             if (progress.segment_expected_bytes > 0 and progress.segment_bytes != @as(u64, @intCast(progress.segment_expected_bytes))) {
                 write_failed.* = true;
                 return;
             }
             progress.header_active = false;
+            if (progress.segment_init) progress.initialized = true;
             if (!progress.segment_init) {
                 progress.last_segment_num = progress.segment_num;
                 progress.buffered_end_ms = @max(progress.buffered_end_ms, progress.segment_end_ms);
@@ -705,4 +839,92 @@ test "sabr-loop: a truncated segment and unrelated track cannot complete" {
     try testing.expectEqual(@as(usize, 0), mem.len);
     var selected = FormatProgress{ .itag = 140 };
     try testing.expect(processUmpBuffer(buf[0..p], mem.sink(), &selected) == null);
+}
+
+test "sabr-loop: transient retry preserves request body and sequence" {
+    const Fake = struct {
+        calls: usize = 0,
+        body: [16384]u8 = undefined,
+        body_len: usize = 0,
+        same_request: bool = true,
+        response: [64]u8 = undefined,
+        response_len: usize = 0,
+        fn post(ctx: *anyopaque, host: []const u8, port: u16, path: []const u8, body: []const u8, out: []u8) PostResult {
+            _ = host; _ = port;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.same_request = self.same_request and std.mem.eql(u8, path, "/videoplayback?alr=no&rn=0");
+            self.calls += 1;
+            if (self.calls == 1) {
+                @memcpy(self.body[0..body.len], body);
+                self.body_len = body.len;
+                return .{};
+            }
+            self.same_request = self.same_request and std.mem.eql(u8, self.body[0..self.body_len], body);
+            @memcpy(out[0..self.response_len], self.response[0..self.response_len]);
+            return .{ .ok = true, .status = 200, .len = self.response_len };
+        }
+    };
+    var fake = Fake{};
+    var mh: [16]u8 = undefined;
+    var mw = @import("protobuf").Writer.init(&mh);
+    try mw.writeVarintField(1, 200);
+    try mw.writeVarintField(3, 251);
+    try mw.writeVarintField(14, 3);
+    var p = appendPart(&fake.response, 0, ump.PartType.MEDIA_HEADER, mw.bytes());
+    p = appendPart(&fake.response, p, ump.PartType.MEDIA, &.{ 200, 'A', 'B', 'C' });
+    // A high-bit header ID is one byte, not a protobuf/UMP varint.
+    fake.response_len = appendPart(&fake.response, p, ump.PartType.MEDIA_END, &.{200});
+    var mem = MemSink{};
+    const res = runLoopWithOptions(.{ .ctx = @ptrCast(&fake), .post = &Fake.post }, "cdn.test", 443, "/videoplayback", .{ .itag = 251, .last_modified = 0, .content_length = 3 }, true, "", "", 1, "2.test", mem.sink(), .{ .retry_delay_ms = 0 });
+    try testing.expect(res.success);
+    try testing.expectEqual(Failure.none, res.failure);
+    try testing.expectEqual(@as(u32, 2), res.requests);
+    try testing.expectEqual(@as(u32, 1), res.retries);
+    try testing.expect(fake.same_request);
+    try testing.expectEqualSlices(u8, "ABC", mem.buf[0..mem.len]);
+}
+
+test "sabr-loop: permanent rejection is not retried; network retries are bounded" {
+    const Fake = struct {
+        calls: usize = 0,
+        status: u32 = 403,
+        fn post(ctx: *anyopaque, host: []const u8, port: u16, path: []const u8, body: []const u8, out: []u8) PostResult {
+            _ = host; _ = port; _ = path; _ = body; _ = out;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return .{ .status = self.status };
+        }
+    };
+    var fake = Fake{};
+    var mem = MemSink{};
+    const transport = Transport{ .ctx = @ptrCast(&fake), .post = &Fake.post };
+    const rejected = runLoopWithOptions(transport, "cdn.test", 443, "/videoplayback", .{ .itag = 251, .last_modified = 0 }, true, "", "", 1, "2.test", mem.sink(), .{ .retry_delay_ms = 0 });
+    try testing.expectEqual(Failure.http_status, rejected.failure);
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    fake = .{ .status = 0 };
+    const failed = runLoopWithOptions(transport, "cdn.test", 443, "/videoplayback", .{ .itag = 251, .last_modified = 0 }, true, "", "", 1, "2.test", mem.sink(), .{ .max_transport_retries = 2, .retry_delay_ms = 0 });
+    try testing.expectEqual(Failure.transport, failed.failure);
+    try testing.expectEqual(@as(usize, 3), fake.calls);
+    try testing.expectEqual(@as(u32, 2), failed.retries);
+    try testing.expectEqual(@as(u64, 0), failed.bytes_written);
+}
+
+test "sabr-loop: cancellation during network retry stops before another POST" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn post(ctx: *anyopaque, host: []const u8, port: u16, path: []const u8, body: []const u8, out: []u8) PostResult {
+            _ = host; _ = port; _ = path; _ = body; _ = out;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return .{};
+        }
+        fn cancel(_: SabrResult) bool { return false; }
+    };
+    var fake = Fake{};
+    var mem = MemSink{};
+    const res = runLoopWithOptions(.{ .ctx = @ptrCast(&fake), .post = &Fake.post }, "cdn.test", 443, "/videoplayback", .{ .itag = 251, .last_modified = 0 }, true, "", "", 1, "2.test", mem.sink(), .{ .on_response = &Fake.cancel, .retry_delay_ms = 0 });
+    try testing.expectEqual(Failure.cancelled, res.failure);
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expectEqual(@as(u32, 0), res.retries);
+    try testing.expect(!res.success);
 }

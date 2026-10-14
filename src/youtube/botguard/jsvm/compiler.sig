@@ -115,10 +115,10 @@ pub const Op = enum(u8) {
     new_call, // u8: argc → new Constructor(args)
     this_val, // push this
     throw_op, // throw TOS
-    enter_try, // u32: catch_offset, u32: finally_offset
+    enter_try, // u32: catch_offset, finally_offset, protected_end
     leave_try, // exit try frame
     enter_catch, // push caught exception
-    enter_finally, // enter finally block
+    enter_finally, // u32: end of finally block
     leave_finally, // exit finally (re-throw if pending)
 
     // Iteration / for-in / for-of
@@ -141,6 +141,8 @@ pub const Op = enum(u8) {
     halt, // end of program
     dup2, // duplicate top TWO stack slots: [a,b] -> [a,b,a,b] (compound elem/prop assign)
     make_regexp, // [pattern, flags] -> fresh intrinsic RegExp literal object
+    close_scope, // u16: first frame-relative local leaving lexical scope
+    define_literal_property, // u8 kind: [object,key,value] -> [object], 0=data,1=get,2=set
 };
 
 // ── Constant pool ──
@@ -263,7 +265,26 @@ const Local = struct {
     name_idx: u32 = 0xFFFFFFFF,
     depth: u16 = 0, // scope depth
     is_captured: bool = false,
+    scope_binding: u32 = 0xFFFFFFFF,
 };
+
+const ScopeBinding = struct { name: u32, function: u16, slot: u16, start: u32, end: u32, previous: u32 };
+var scope_bindings: [65536]ScopeBinding = undefined;
+var scope_binding_count: u32 = 0;
+var scope_binding_heads: [MAX_FUNCTIONS]u32 = undefined;
+var func_context_id: [MAX_FUNC_NEST]u16 = undefined;
+var eval_caller_ip: u32 = 0;
+
+fn scopedCallerLocal(function: u16, ip: u32, name: u32) ?u16 {
+    if (function >= MAX_FUNCTIONS) return null;
+    var i = scope_binding_heads[function];
+    while (i != 0xFFFFFFFF) {
+        const binding = scope_bindings[i];
+        if (binding.function == function and binding.name == name and ip >= binding.start and ip < binding.end) return binding.slot;
+        i = binding.previous;
+    }
+    return null;
+}
 
 fn localName(local: Local) []const u8 {
     if (local.name_idx != 0xFFFFFFFF) return values.getString(local.name_idx);
@@ -360,6 +381,8 @@ var func_strict: [MAX_FUNC_NEST]bool = [_]bool{false} ** MAX_FUNC_NEST;
 // reserve up to the PEAK slot index, or a nested call's base pointer lands
 // inside this frame's local region and the two alias (stack corruption).
 var func_local_peak: [MAX_FUNC_NEST]u16 = undefined;
+var main_local_count: u16 = 0;
+pub fn mainLocalCount() u16 { return main_local_count; }
 fn bumpLocalPeak() void {
     if (cur_func < MAX_FUNC_NEST and local_count > func_local_peak[cur_func]) {
         func_local_peak[cur_func] = local_count;
@@ -386,7 +409,7 @@ var continue_labels: [MAX_CONTINUES]u16 = undefined;
 var continue_count: u16 = 0;
 var loop_start: u32 = 0; // bytecode offset of current loop start
 const NO_LABEL: u16 = 0xFFFF;
-const LabelScope = struct { name: u32, loop_node: NodeIdx, iter_depth: u16, operand_depth: u16 };
+const LabelScope = struct { name: u32, loop_node: NodeIdx, iter_depth: u16, operand_depth: u16, local_count: u16 };
 var label_scopes: [128]LabelScope = undefined;
 var label_count: u16 = 0;
 var label_base: u16 = 0;
@@ -397,6 +420,8 @@ var break_iter_depth: u16 = 0;
 var break_operand_depth: u16 = 0;
 var continue_iter_depth: u16 = 0;
 var continue_operand_depth: u16 = 0;
+var break_local_count: u16 = 0;
+var continue_local_count: u16 = 0;
 
 // When compiling an eval body, expression statements store their result into
 // the VM completion register (via set_completion) instead of discarding it, so
@@ -439,6 +464,9 @@ var had_error: bool = false;
 /// Call after parser.parse() has been invoked.
 /// Returns bytecode length (0 on failure).
 pub fn compile(root: NodeIdx) u32 {
+    scope_binding_count = 0;
+    @memset(&scope_binding_heads, 0xFFFFFFFF);
+    func_context_id[0] = 0xFFFF;
     bc_len = 0;
     srcmap_n = 0;
     cur_src_pos = 0;
@@ -470,6 +498,7 @@ pub fn compile(root: NodeIdx) u32 {
 
     compileNode(root);
     emitOp(.halt);
+    main_local_count = func_local_peak[0];
     return bc_len;
 }
 
@@ -480,6 +509,13 @@ pub fn compile(root: NodeIdx) u32 {
 /// Returns the bytecode offset where the eval code begins, or 0 on failure
 /// (0 is never a valid eval entry because the main program occupies offset 0).
 pub fn compileEval(root: NodeIdx, caller_func: u16) u32 {
+    return compileEvalAt(root, caller_func, 0);
+}
+
+pub fn compileEvalAt(root: NodeIdx, caller_func: u16, caller_ip: u32) u32 {
+    const saved_eval_caller_ip = eval_caller_ip;
+    const saved_context_id = func_context_id[0];
+    eval_caller_ip = caller_ip;
     // Preserve append position; reset only transient per-compilation state.
     const start = bc_len;
     const saved_locals = local_count;
@@ -530,6 +566,7 @@ pub fn compileEval(root: NodeIdx, caller_func: u16) u32 {
     } else {
         eval_body_func = 0xFFFF;
     }
+    func_context_id[0] = eval_body_func;
 
     // eval runs in a frame: reserve local slot 0 for `this` to match the VM's
     // frame convention (this_val / get_local 0).
@@ -596,6 +633,8 @@ pub fn compileEval(root: NodeIdx, caller_func: u16) u32 {
     eval_caller_active = saved_eval_caller_active;
     eval_caller_func = saved_eval_caller_func;
     eval_body_func = saved_eval_body_func;
+    eval_caller_ip = saved_eval_caller_ip;
+    func_context_id[0] = saved_context_id;
 
     if (had_error) return 0;
     return start;
@@ -919,6 +958,7 @@ fn compileIf(node: Node) void {
 fn compileFor(node: Node) void {
     clearStatementCompletion();
     beginScope();
+    const iteration_locals = local_count;
 
     // Init. A var-decl init manages its own stack (compileVarDecl pops each
     // initializer). A bare EXPRESSION init (e.g. `for(M=x, q=[]; ...)`) is an
@@ -956,6 +996,9 @@ fn compileFor(node: Node) void {
 
     // Continue target
     const continue_target = bc_len;
+    // A lexical for initializer gets a new environment before each update.
+    // Closing cells preserves old closures while the live slot keeps its value.
+    emitScopeCleanup(iteration_locals);
 
     // Update
     if (update_idx != NULL_NODE) {
@@ -980,6 +1023,14 @@ fn compileFor(node: Node) void {
 fn compileForIn(node: Node) void {
     clearStatementCompletion();
     beginScope();
+    const iteration_locals = local_count;
+    if (node.left != NULL_NODE) {
+        const lhs = parser.getNode(node.left);
+        if (lhs.tag == .var_decl and (lhs.flags.is_let or lhs.flags.is_const)) {
+            const bindings = parser.getList(lhs.left, @intCast(lhs.right));
+            if (bindings.len > 0) declareLocal(bindings[0]);
+        }
+    }
     compileNode(node.right); // the object to iterate
     emitOp(.iter_init);
 
@@ -987,6 +1038,7 @@ fn compileForIn(node: Node) void {
     const saved_breaks = break_count;
     const saved_continues = continue_count;
     loop_start = bc_len;
+    emitScopeCleanup(iteration_locals);
 
     const exit_jump = emitJump(.iter_next);
 
@@ -1176,16 +1228,19 @@ fn compileTry(node: Node) void {
     if (has_finally) {
         outer_try = emitJump(.enter_try); // catch offset (patched to 0 = finally-only)
         emitU32(0); // finally offset (patched below)
+        emitU32(0); // protected end (patched before finally)
         patchJumpTo(outer_try, 0);
     }
 
     // ── Inner try body + catch ──
     const inner_try = emitJump(.enter_try);
     emitU32(0); // no finally on the inner frame
+    emitU32(0); // protected end
     patchJumpTo(inner_try, 0); // default catch_ip=0 until patched
 
     compileNode(node.left); // try body
     emitOp(.leave_try);
+    patchJumpTo(inner_try + 8, bc_len);
     const skip_catch = emitJump(.jump); // normal flow skips the catch
 
     if (has_catch) {
@@ -1197,6 +1252,7 @@ fn compileTry(node: Node) void {
             declareLocal(catch_param_idx);
             emitOp(.set_local);
             emitU16(lastLocalSlot());
+            emitOp(.pop);
         } else {
             emitOp(.pop);
         }
@@ -1211,13 +1267,13 @@ fn compileTry(node: Node) void {
     if (has_finally) {
         // Close the inner frame is implicit (leave_try above / catch consumed).
         emitOp(.leave_try); // pop the OUTER finally frame before running finally
+        patchJumpTo(outer_try + 8, bc_len);
         patchJumpTo(outer_try + 4, bc_len); // outer finally offset
-        if (eval_mode) emitOp(.get_completion); // preserve the try/catch value
-        clearStatementCompletion(); // finally has its own statement value
-        emitOp(.enter_finally);
+        const finally_end = emitJump(.enter_finally);
+        clearStatementCompletion(); // entry saved the try/catch completion
         compileNode(finally_idx);
-        if (eval_mode) emitOp(.set_completion); // a normal finally preserves it
         emitOp(.leave_finally);
+        patchJump(finally_end);
     }
 }
 
@@ -1254,6 +1310,7 @@ fn compileBreak(node: Node) void {
     const label = jumpLabel(node, false);
     if (had_error) return;
     emitJumpCleanup(if (label == NO_LABEL) break_iter_depth else label_scopes[label].iter_depth, if (label == NO_LABEL) break_operand_depth else label_scopes[label].operand_depth);
+    emitScopeCleanup(if (label == NO_LABEL) break_local_count else label_scopes[label].local_count);
     if (break_count < MAX_BREAKS) {
         break_patches[break_count] = emitJump(.jump);
         break_labels[break_count] = label;
@@ -1271,6 +1328,7 @@ fn compileContinue(node: Node) void {
         keep_iter = scope.iter_depth + @as(u16, if (tag == .for_in_stmt or tag == .for_of_stmt) 1 else 0);
     }
     emitJumpCleanup(keep_iter, if (label == NO_LABEL) continue_operand_depth else label_scopes[label].operand_depth);
+    emitScopeCleanup(if (label == NO_LABEL) continue_local_count else label_scopes[label].local_count);
     if (continue_count < MAX_CONTINUES) {
         continue_patches[continue_count] = emitJump(.jump);
         continue_labels[continue_count] = label;
@@ -1298,7 +1356,7 @@ fn compileLabelStmt(node: Node) void {
     const body_tag = parser.getNode(body_idx).tag;
     const iteration = body_tag == .for_stmt or body_tag == .for_in_stmt or body_tag == .for_of_stmt or body_tag == .while_stmt or body_tag == .do_while_stmt;
     const scope = label_count;
-    label_scopes[scope] = .{ .name = values.internString(lexer.tokenText(lexer.getToken(node.token_idx))), .loop_node = if (iteration) body_idx else NULL_NODE, .iter_depth = control_iter_depth, .operand_depth = control_operand_depth };
+    label_scopes[scope] = .{ .name = values.internString(lexer.tokenText(lexer.getToken(node.token_idx))), .loop_node = if (iteration) body_idx else NULL_NODE, .iter_depth = control_iter_depth, .operand_depth = control_operand_depth, .local_count = local_count };
     label_count += 1;
     const saved_breaks = break_count;
     compileNode(node.left);
@@ -1312,6 +1370,8 @@ fn compileIteration(idx: NodeIdx, node: Node) void {
     const saved_break_operand = break_operand_depth;
     const saved_continue_iter = continue_iter_depth;
     const saved_continue_operand = continue_operand_depth;
+    const saved_break_locals = break_local_count;
+    const saved_continue_locals = continue_local_count;
     compiling_loop_node = idx;
     break_iter_depth = control_iter_depth;
     break_operand_depth = control_operand_depth;
@@ -1319,6 +1379,8 @@ fn compileIteration(idx: NodeIdx, node: Node) void {
     if (uses_iter) control_iter_depth += 1;
     continue_iter_depth = control_iter_depth;
     continue_operand_depth = control_operand_depth;
+    break_local_count = local_count;
+    continue_local_count = local_count;
     switch (node.tag) {
         .for_stmt => compileFor(node),
         .for_in_stmt => compileForIn(node),
@@ -1333,18 +1395,30 @@ fn compileIteration(idx: NodeIdx, node: Node) void {
     break_operand_depth = saved_break_operand;
     continue_iter_depth = saved_continue_iter;
     continue_operand_depth = saved_continue_operand;
+    break_local_count = saved_break_locals;
+    continue_local_count = saved_continue_locals;
 }
 
 fn compileSwitchScope(node: Node) void {
     const saved_break_iter = break_iter_depth;
     const saved_break_operand = break_operand_depth;
+    const saved_break_locals = break_local_count;
     break_iter_depth = control_iter_depth;
     break_operand_depth = control_operand_depth;
+    break_local_count = local_count;
     control_operand_depth += 1; // discriminant retained during case bodies
     compileSwitch(node);
     control_operand_depth -= 1;
     break_iter_depth = saved_break_iter;
     break_operand_depth = saved_break_operand;
+    break_local_count = saved_break_locals;
+}
+
+fn emitScopeCleanup(keep: u16) void {
+    if (keep >= local_count) return;
+    const base = func_ctx_local_base[cur_func];
+    emitOp(.close_scope);
+    emitU16(keep - base);
 }
 
 fn emitJumpCleanup(keep_iter: u16, keep_operand: u16) void {
@@ -1436,7 +1510,7 @@ fn unescapeString(s: []const u8) []const u8 {
                 if (i + 1 < s.len) {
                     const hi = hexVal(s[i]);
                     const lo = hexVal(s[i + 1]);
-                    unescape_buf[o] = (hi << 4) | lo; o += 1;
+                    o += values.encodeCodeUnit((@as(u16, hi) << 4) | lo, unescape_buf[o..]);
                     i += 2;
                 }
             },
@@ -1589,11 +1663,18 @@ fn compileArray(node: Node) void {
 
 fn compileObject(node: Node) void {
     const list = parser.getList(node.left, @intCast(node.right));
+    var has_accessors = false;
+    for (list) |prop_idx| {
+        const prop = parser.getNode(prop_idx);
+        if (prop.flags.is_getter or prop.flags.is_setter) has_accessors = true;
+    }
+    if (has_accessors) { emitOp(.make_object); emitByte(0); }
     var real_count: usize = 0;
     for (list) |prop_idx| {
         if (prop_idx == NULL_NODE) continue;
         const prop = parser.getNode(prop_idx);
         if (prop.tag == .spread_expr) {
+            if (has_accessors) { had_error = true; return; }
             compileNode(prop.left);
             emitOp(.spread);
             real_count += 1;
@@ -1625,10 +1706,13 @@ fn compileObject(node: Node) void {
         }
         // Value
         compileNode(prop.right);
+        if (has_accessors) {
+            emitOp(.define_literal_property);
+            emitByte(if (prop.flags.is_getter) 1 else if (prop.flags.is_setter) 2 else 0);
+        }
         real_count += 1;
     }
-    emitOp(.make_object);
-    emitByte(@intCast(@min(real_count, 255)));
+    if (!has_accessors) { emitOp(.make_object); emitByte(@intCast(@min(real_count, 255))); }
 }
 
 fn compileFuncExpr(node: Node) void {
@@ -2194,6 +2278,7 @@ fn compileFunctionBody(node: Node) u16 {
     if (cur_func + 1 >= MAX_FUNC_NEST) { had_error = true; return func_id; }
     cur_func += 1;
     func_ctx_local_base[cur_func] = local_base;
+    func_context_id[cur_func] = func_id;
     func_upval_count[cur_func] = 0;
     func_local_peak[cur_func] = local_base;
     func_has_eval[cur_func] = false;
@@ -2217,7 +2302,7 @@ fn compileFunctionBody(node: Node) u16 {
     const saved_loop_start = loop_start;
     const saved_label_base = label_base;
     const saved_loop_node = compiling_loop_node;
-    const saved_jump_depths = [6]u16{ control_iter_depth, control_operand_depth, break_iter_depth, break_operand_depth, continue_iter_depth, continue_operand_depth };
+    const saved_jump_depths = [8]u16{ control_iter_depth, control_operand_depth, break_iter_depth, break_operand_depth, continue_iter_depth, continue_operand_depth, break_local_count, continue_local_count };
     label_base = label_count;
     compiling_loop_node = NULL_NODE;
     control_iter_depth = 0; control_operand_depth = 0;
@@ -2384,6 +2469,7 @@ fn compileFunctionBody(node: Node) u16 {
     control_iter_depth = saved_jump_depths[0]; control_operand_depth = saved_jump_depths[1];
     break_iter_depth = saved_jump_depths[2]; break_operand_depth = saved_jump_depths[3];
     continue_iter_depth = saved_jump_depths[4]; continue_operand_depth = saved_jump_depths[5];
+    break_local_count = saved_jump_depths[6]; continue_local_count = saved_jump_depths[7];
     _ = saved_locals;
     _ = saved_bc;
 
@@ -2401,6 +2487,7 @@ fn compileArrowBody(node: Node) u16 {
     if (cur_func + 1 >= MAX_FUNC_NEST) { had_error = true; return func_id; }
     cur_func += 1;
     func_ctx_local_base[cur_func] = local_base;
+    func_context_id[cur_func] = func_id;
     func_upval_count[cur_func] = 0;
     func_local_peak[cur_func] = local_base;
     func_has_eval[cur_func] = false;
@@ -2417,7 +2504,7 @@ fn compileArrowBody(node: Node) u16 {
     const saved_loop_start = loop_start;
     const saved_label_base = label_base;
     const saved_loop_node = compiling_loop_node;
-    const saved_jump_depths = [6]u16{ control_iter_depth, control_operand_depth, break_iter_depth, break_operand_depth, continue_iter_depth, continue_operand_depth };
+    const saved_jump_depths = [8]u16{ control_iter_depth, control_operand_depth, break_iter_depth, break_operand_depth, continue_iter_depth, continue_operand_depth, break_local_count, continue_local_count };
     label_base = label_count;
     compiling_loop_node = NULL_NODE;
     control_iter_depth = 0; control_operand_depth = 0;
@@ -2547,6 +2634,7 @@ fn compileArrowBody(node: Node) u16 {
     control_iter_depth = saved_jump_depths[0]; control_operand_depth = saved_jump_depths[1];
     break_iter_depth = saved_jump_depths[2]; break_operand_depth = saved_jump_depths[3];
     continue_iter_depth = saved_jump_depths[4]; continue_operand_depth = saved_jump_depths[5];
+    break_local_count = saved_jump_depths[6]; continue_local_count = saved_jump_depths[7];
     _ = saved_locals;
     return func_id;
 }
@@ -2559,12 +2647,18 @@ fn beginScope() void {
 
 fn endScope() void {
     // Pop locals at the current block depth. Never pop below this function's
-    // local_base (those belong to enclosing functions). Upvalue capture is
-    // by-value (snapshot at make_func time), so there are no open upvalue cells
-    // to "close" here — the old set_upval-on-pop stub is intentionally gone.
+    // local_base. Captured bindings must close before later blocks reuse these
+    // slots, even when a closure was created through direct eval at runtime.
     const base = func_ctx_local_base[cur_func];
+    const previous = local_count;
     while (local_count > base and locals[local_count - 1].depth >= scope_depth) {
+        const binding = locals[local_count - 1].scope_binding;
+        if (binding != 0xFFFFFFFF) scope_bindings[binding].end = bc_len;
         local_count -= 1;
+    }
+    if (local_count < previous) {
+        emitOp(.close_scope);
+        emitU16(local_count - base);
     }
     scope_depth -|= 1;
 }
@@ -2583,6 +2677,14 @@ fn declareLocal(name_node_idx: NodeIdx) void {
         .depth = scope_depth,
         .is_captured = false,
     };
+    if (scope_depth > 0) {
+        if (scope_binding_count >= scope_bindings.len) { had_error = true; return; }
+        locals[local_count].scope_binding = scope_binding_count;
+        const function = func_context_id[cur_func];
+        scope_bindings[scope_binding_count] = .{ .name = values.internString(lexer.tokenText(tok)), .function = function, .slot = local_count - func_ctx_local_base[cur_func], .start = bc_len, .end = 0xFFFFFFFF, .previous = if (function < MAX_FUNCTIONS) scope_binding_heads[function] else 0xFFFFFFFF };
+        if (function < MAX_FUNCTIONS) scope_binding_heads[function] = scope_binding_count;
+        scope_binding_count += 1;
+    }
     local_count += 1;
     bumpLocalPeak();
 }
@@ -2804,6 +2906,9 @@ fn resolveEvalCaller(name: []const u8) ?u16 {
     dbg_evalcap_n += 1;
     const name_idx = values.internString(name);
     // 1) Caller's own locals (params + declared locals), by name.
+    if (scopedCallerLocal(eval_caller_func, eval_caller_ip, name_idx)) |slot| {
+        return addEvalUpvalue(slot, EVAL_UV_CALLER_LOCAL, name_idx);
+    }
     if (resolveLocalNameInFunc(eval_caller_func, name_idx)) |slot| {
         dbg_evalcap_local += 1;
         return addEvalUpvalue(slot, EVAL_UV_CALLER_LOCAL, name_idx);
@@ -2847,6 +2952,15 @@ fn captureAllEnclosingLocals() void {
     // Nested direct eval must retain those bindings too, even when its source
     // does not mention them until runtime.
     if (eval_caller_active and eval_caller_func < n_functions) {
+        // Dynamic source inside a returned closure can name an active block
+        // binding even when the enclosing eval source never reads it directly.
+        var binding_idx = scope_binding_heads[eval_caller_func];
+        while (binding_idx != 0xFFFFFFFF) {
+            const binding = scope_bindings[binding_idx];
+            if (eval_caller_ip >= binding.start and eval_caller_ip < binding.end)
+                _ = resolveUpvalue(values.getString(binding.name), cur_func);
+            binding_idx = binding.previous;
+        }
         const caller = functions[eval_caller_func];
         var li: u16 = 0;
         while (li < caller.name_tab_count) : (li += 1) {
@@ -3038,46 +3152,9 @@ fn parseFloat(text: []const u8) f64 {
         }
         return val;
     }
-    // Decimal
-    var val: f64 = 0;
-    var sign: f64 = 1;
-    var i: usize = 0;
-    if (i < text.len and text[i] == '-') { sign = -1; i += 1; }
-    while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {
-        val = val * 10 + @as(f64, @floatFromInt(text[i] - '0'));
-    }
-    if (i < text.len and text[i] == '.') {
-        i += 1;
-        var frac: f64 = 0.1;
-        while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {
-            val += @as(f64, @floatFromInt(text[i] - '0')) * frac;
-            frac *= 0.1;
-        }
-    }
-    if (i < text.len and (text[i] == 'e' or text[i] == 'E')) {
-        i += 1;
-        var exp_sign: f64 = 1;
-        if (i < text.len and text[i] == '-') { exp_sign = -1; i += 1; }
-        if (i < text.len and text[i] == '+') i += 1;
-        var exp: f64 = 0;
-        while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {
-            exp = exp * 10 + @as(f64, @floatFromInt(text[i] - '0'));
-        }
-        val *= pow10(exp_sign * exp);
-    }
-    return sign * val;
+    return values.parseDecimal(text);
 }
 
-fn pow10(exp: f64) f64 {
-    // Simple pow10 for exponents
-    if (exp == 0) return 1.0;
-    var result: f64 = 1.0;
-    var e = if (exp < 0) -exp else exp;
-    while (e >= 1.0) : (e -= 1.0) {
-        result *= 10.0;
-    }
-    return if (exp < 0) 1.0 / result else result;
-}
 
 fn eql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;

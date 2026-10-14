@@ -90,6 +90,10 @@ fn parseRepeated(depth: u16) u16 {
         '+' => { min = 1; max = NONE; cursor += 1; },
         '?' => { min = 0; max = 1; cursor += 1; },
         '{' => {
+            // In non-Unicode ECMAScript regexes, an incomplete quantifier is
+            // a literal brace (Annex B), e.g. /a{/ or /a{word}/. Only consume
+            // a complete {n}, {n,}, or {n,m} form as repetition syntax.
+            if (!quantifierEnd(cursor)) return atom;
             cursor += 1; min = parseInteger(); max = min;
             if (cursor < input.len and input[cursor] == ',') {
                 cursor += 1; max = if (cursor < input.len and input[cursor] == '}') NONE else parseInteger();
@@ -102,6 +106,17 @@ fn parseRepeated(depth: u16) u16 {
     var lazy = false;
     if (cursor < input.len and input[cursor] == '?') { lazy = true; cursor += 1; }
     return newNode(.{ .kind = .repeat, .left = atom, .min = min, .max = max, .lazy = lazy });
+}
+fn quantifierEnd(at: usize) bool {
+    var p = at + 1;
+    const first = p;
+    while (p < input.len and input[p] >= '0' and input[p] <= '9') p += 1;
+    if (p == first) return false;
+    if (p < input.len and input[p] == ',') {
+        p += 1;
+        while (p < input.len and input[p] >= '0' and input[p] <= '9') p += 1;
+    }
+    return p < input.len and input[p] == '}';
 }
 fn parseInteger() u16 {
     var n: u16 = 0; const before = cursor;
@@ -145,6 +160,10 @@ fn parseAtom(depth: u16) u16 {
             return newNode(.{ .kind = .literal, .value = escapedByte(e) });
         },
         '*', '+', '?', ')' => { failed = true; return newNode(.{ .kind = .empty }); },
+        '{' => {
+            if (quantifierEnd(cursor - 1)) failed = true;
+            return newNode(.{ .kind = .literal, .value = c });
+        },
         else => return newNode(.{ .kind = .literal, .value = c }),
     }
 }

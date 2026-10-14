@@ -24,7 +24,7 @@ fn print(msg: []const u8) void {
 /// `video_id`: 11-char YouTube video ID (content binding)
 /// `out`: buffer for base64-encoded PO token
 /// Returns token length, or 0 on failure.
-pub fn mintContentBound(integrity_token: []const u8, video_id: []const u8, out: *[256]u8) usize {
+pub fn mintContentBound(integrity_token: []const u8, video_id: []const u8, out: []u8) usize {
     return mintToken(integrity_token, video_id, out);
 }
 
@@ -32,7 +32,7 @@ pub fn mintContentBound(integrity_token: []const u8, video_id: []const u8, out: 
 /// `integrity_token`: base64 integrity token
 /// `visitor_data`: visitor data string (session binding)
 /// `out`: buffer for base64-encoded PO token
-pub fn mintSessionBound(integrity_token: []const u8, visitor_data: []const u8, out: *[256]u8) usize {
+pub fn mintSessionBound(integrity_token: []const u8, visitor_data: []const u8, out: []u8) usize {
     return mintToken(integrity_token, visitor_data, out);
 }
 
@@ -42,8 +42,8 @@ pub fn mintSessionBound(integrity_token: []const u8, visitor_data: []const u8, o
 ///   3. rawPoToken = mintCallback(contentBindingBytes)  (a byte array).
 ///   4. websafe-base64 encode the raw PO token bytes.
 var int_bytes_buf: [1024]u8 = undefined;
-var raw_pot_buf: [512]u8 = undefined;
-fn mintToken(integrity_token: []const u8, content_binding: []const u8, out: *[256]u8) usize {
+var raw_pot_buf: [1024]u8 = undefined;
+fn mintToken(integrity_token: []const u8, content_binding: []const u8, out: []u8) usize {
     // 1. base64-decode the integrity token.
     const int_len = base64Decode(integrity_token, int_bytes_buf[0..]);
     if (int_len == 0) return 0;
@@ -89,7 +89,7 @@ fn b64Val(c: u8) i16 {
 }
 
 /// URL-safe base64 encode (no padding): '+'->'-', '/'->'_'.
-fn base64UrlEncode(input: []const u8, out: *[256]u8) usize {
+fn base64UrlEncode(input: []const u8, out: []u8) usize {
     const n = base64Encode(input, out);
     for (0..n) |i| {
         if (out[i] == '+') out[i] = '-' else if (out[i] == '/') out[i] = '_';
@@ -163,12 +163,13 @@ pub fn mintColdStartTs(content_binding: []const u8, timestamp: u32, client_state
 
 const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-fn base64Encode(input: []const u8, out: *[256]u8) usize {
+fn base64Encode(input: []const u8, out: []u8) usize {
+    const required = (input.len / 3) * 4 + (if (input.len % 3 == 0) @as(usize, 0) else input.len % 3 + 1);
+    if (required > out.len) return 0;
     var oi: usize = 0;
     var i: usize = 0;
 
     while (i + 2 < input.len) {
-        if (oi + 4 > 256) break;
         const b0: u32 = input[i];
         const b1: u32 = input[i + 1];
         const b2: u32 = input[i + 2];
@@ -183,7 +184,6 @@ fn base64Encode(input: []const u8, out: *[256]u8) usize {
 
     // Handle remaining 1-2 bytes
     if (i < input.len) {
-        if (oi + 4 > 256) return oi;
         const b0: u32 = input[i];
         if (i + 1 < input.len) {
             const b1: u32 = input[i + 1];

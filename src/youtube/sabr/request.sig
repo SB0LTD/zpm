@@ -61,10 +61,13 @@ pub const AbrParams = struct {
     bandwidth_estimate: i64 = 0,
     last_manual_format_selection_ms: i64 = 0,
     enabled_track_types_bitfield: i32 = 0,
+    elapsed_wall_time_ms: i64 = 0,
 
     // Selected formats (audio and/or video). Empty slice => field omitted.
     audio_formats: []const SelectedFormat = &.{},
     video_formats: []const SelectedFormat = &.{},
+    // Acknowledge formats whose initialization has already been received.
+    initialized_formats: []const SelectedFormat = &.{},
 
     // Already-buffered ranges (empty on the first request).
     buffered: []const BufferedRange = &.{},
@@ -104,6 +107,12 @@ fn encodeClientAbrState(p: AbrParams, scratch: []u8) pb.Error![]const u8 {
     if (p.bandwidth_estimate != 0)
         try w.writeVarintField(23, @bitCast(p.bandwidth_estimate));
     try w.writeVarintField(28, @bitCast(p.player_time_ms));
+    try w.writeVarintField(29, @bitCast(p.elapsed_wall_time_ms));
+    try w.writeVarintField(34, 1);
+    try w.writeTag(35, .fixed32);
+    try w.writeFixed32(@bitCast(@as(f32, 1)));
+    try w.writeVarintField(36, @bitCast(p.elapsed_wall_time_ms));
+    try w.writeVarintField(39, @bitCast(p.elapsed_wall_time_ms));
     if (p.enabled_track_types_bitfield != 0)
         try w.writeVarintField(40, @as(u64, @bitCast(@as(i64, p.enabled_track_types_bitfield))));
     return w.bytes();
@@ -117,6 +126,12 @@ fn encodeBufferedRange(br: BufferedRange, scratch: []u8) pb.Error![]const u8 {
     try w.writeVarintField(3, @bitCast(br.duration_ms));
     try w.writeVarintField(4, @as(u64, @bitCast(@as(i64, br.start_segment_index))));
     try w.writeVarintField(5, @as(u64, @bitCast(@as(i64, br.end_segment_index))));
+    var time_scratch: [32]u8 = undefined;
+    var tw = pb.Writer.init(&time_scratch);
+    try tw.writeVarintField(1, @bitCast(br.start_time_ms));
+    try tw.writeVarintField(2, @bitCast(br.duration_ms));
+    try tw.writeVarintField(3, 1000);
+    try w.writeLenDelim(6, tw.bytes());
     return w.bytes();
 }
 
@@ -153,9 +168,8 @@ pub fn buildAbrRequest(p: AbrParams, out: []u8) pb.Error!usize {
     const abr = try encodeClientAbrState(p, &abr_scratch);
     try w.writeLenDelim(1, abr);
 
-    // Initialization format IDs identify which track headers the client needs.
-    for (p.audio_formats) |fmt| try writeFormatId(&w, 2, fmt);
-    for (p.video_formats) |fmt| try writeFormatId(&w, 2, fmt);
+    // Field 2 acknowledges initialization, rather than requesting it.
+    for (p.initialized_formats) |fmt| try writeFormatId(&w, 2, fmt);
 
     // field 3: buffered_ranges (repeated)
     for (p.buffered) |br| {
@@ -259,9 +273,10 @@ test "sabr-request: golden bytes for a minimal request" {
     //     body = 0A 03 80 01 01 (len 5)
     const golden = [_]u8{
         // field1 client_abr_state
-        0x0A, 0x03, 0xE0, 0x01, 0x00,
-        // field2 initialization audio format id
-        0x12, 0x05, 0x08, 0x8C, 0x01, 0x10, 0x05,
+        0x0A, 0x15, 0xE0, 0x01, 0x00,
+        0xE8, 0x01, 0x00, 0x90, 0x02, 0x01,
+        0x9D, 0x02, 0x00, 0x00, 0x80, 0x3F,
+        0xA0, 0x02, 0x00, 0xB8, 0x02, 0x00,
         // field16 selected_audio_format_ids
         0x82, 0x01, 0x05, 0x08, 0x8C, 0x01, 0x10, 0x05,
         // field19 streamer_context

@@ -135,11 +135,20 @@ pub fn selectBySabr(formats: []const StreamFormat, n_formats: usize, itag: u16) 
 /// Select metadata for SABR when the player supplies no direct stream URLs.
 /// A complete FormatId (itag + lastModified) is required by the POST protocol.
 pub fn selectBestSabr(formats: []const StreamFormat, n_formats: usize, audio: bool) ?*const StreamFormat {
+    return selectBestSabrWithCodec(formats, n_formats, audio, .any);
+}
+
+/// SABR selection honors the requested audio codec as strictly as direct
+/// selection. This prevents an AAC request producing Opus under an M4A path.
+pub fn selectBestSabrWithCodec(formats: []const StreamFormat, n_formats: usize, audio: bool, codec: AudioCodec) ?*const StreamFormat {
     var best: ?*const StreamFormat = null;
     for (formats[0..@min(n_formats, formats.len)]) |*fmt| {
         if (fmt.itag == 0 or fmt.last_modified == 0) continue;
         if (audio) {
             if (!fmt.is_audio or fmt.is_video) continue;
+            const mime = fmt.mime_type[0..fmt.mime_len];
+            if (codec == .aac and !containsStr(mime, "mp4a") and !containsStr(mime, "aac")) continue;
+            if (codec == .opus and !containsStr(mime, "opus")) continue;
         } else if (!fmt.is_video) continue;
         if (best == null or fmt.bitrate > best.?.bitrate) best = fmt;
     }

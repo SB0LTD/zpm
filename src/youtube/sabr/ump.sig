@@ -341,16 +341,16 @@ pub fn decodeSabrContextUpdate(payload: []const u8) SabrContextUpdate {
     return out;
 }
 
-/// Strip the single varint `header_id` prefix a MEDIA(21) payload carries,
-/// returning the raw media bytes that follow. The prefix is a UMP varint that
+/// Strip the single byte `header_id` prefix a MEDIA(21) payload carries,
+/// returning the raw media bytes that follow. The unsigned byte prefix
 /// ties this MEDIA part to a preceding MEDIA_HEADER's `header_id`.
 pub fn mediaBytes(payload: []const u8, header_id_out: *u32) []const u8 {
-    const v = readUmpVarint(payload, 0) orelse {
+    if (payload.len == 0) {
         header_id_out.* = 0;
         return payload;
-    };
-    header_id_out.* = @truncate(v.value);
-    return payload[v.size..];
+    }
+    header_id_out.* = payload[0];
+    return payload[1..];
 }
 
 // ── PartReader: iterate parts in a single UMP buffer ──

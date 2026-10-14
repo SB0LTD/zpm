@@ -18,14 +18,18 @@
 // Native functions use func_id >= 0xF000 to distinguish from user functions.
 
 const values = @import("values.sig");
+const std = @import("std");
 const objects = @import("objects.sig");
 const compiler = @import("compiler.sig");
 const regexp = @import("regexp.sig");
 const browser_metadata = @import("browser_metadata.sig");
+const events = @import("events.sig");
 const Value = values.Value;
 // The VM supplies synchronous JavaScript callback execution without a reverse
 // import from native builtins into the interpreter.
 pub var invoke_callback: ?*const fn (Value, Value, []const Value) Value = null;
+pub var callback_aborted: ?*const fn () bool = null;
+fn callbackAborted() bool { return if (callback_aborted) |aborted| aborted() else false; }
 
 // ── Debug print (console.log) ──
 extern "kernel32" fn GetStdHandle(u32) ?*anyopaque;
@@ -35,6 +39,13 @@ extern "kernel32" fn GetSystemTimeAsFileTime(*FileTime) void;
 const SystemTime = extern struct { year: u16, month: u16, weekday: u16, day: u16, hour: u16, minute: u16, second: u16, millis: u16 };
 extern "kernel32" fn FileTimeToSystemTime(*const FileTime, *SystemTime) c_int;
 extern "kernel32" fn SystemTimeToTzSpecificLocalTime(?*const anyopaque, *const SystemTime, *SystemTime) c_int;
+extern "bcrypt" fn BCryptGenRandom(?*anyopaque, [*]u8, u32, u32) callconv(.c) i32;
+extern "kernel32" fn QueryPerformanceCounter(*i64) c_int;
+extern "kernel32" fn QueryPerformanceFrequency(*i64) c_int;
+extern "kernel32" fn GetTickCount64() u64;
+extern "kernel32" fn Sleep(u32) void;
+const TimeZoneInformation = extern struct { bias: i32, standard_name: [32]u16, standard_date: SystemTime, standard_bias: i32, daylight_name: [32]u16, daylight_date: SystemTime, daylight_bias: i32 };
+extern "kernel32" fn GetTimeZoneInformation(*TimeZoneInformation) u32;
 fn dbgPrint(msg: []const u8) void {
     _ = WriteFile(GetStdHandle(@bitCast(@as(i32, -11))), msg.ptr, @intCast(msg.len), null, null);
 }
@@ -209,6 +220,7 @@ pub const N_DOM_LOOKUP_NAMESPACE: u16 = NATIVE_BASE + 147;
 pub const N_DOM_FALSE: u16 = NATIVE_BASE + 148;
 pub const N_DOM_IMAGE: u16 = NATIVE_BASE + 149;
 pub const N_DOM_EMPTY_STRING: u16 = NATIVE_BASE + 151;
+pub const N_DOM_MATCH_MEDIA: u16 = NATIVE_BASE + 152;
 pub const N_DOM_ORIENTATION_EVENT: u16 = NATIVE_BASE + 153;
 pub const N_ARR_TOSTRING: u16 = NATIVE_BASE + 155;
 pub const N_DOM_RECT: u16 = NATIVE_BASE + 156;
@@ -221,6 +233,31 @@ pub const N_REGEXP_CTOR: u16 = NATIVE_BASE + 246;
 pub const N_REGEXP_EXEC: u16 = NATIVE_BASE + 247;
 pub const N_REGEXP_TEST: u16 = NATIVE_BASE + 248;
 pub const N_REGEXP_TOSTRING: u16 = NATIVE_BASE + 249;
+pub const N_QUEUE_MICROTASK: u16 = NATIVE_BASE + 250;
+pub const N_DATE_TOSTRING: u16 = NATIVE_BASE + 251;
+pub const N_NUMBER_VALUE_OF: u16 = NATIVE_BASE + 252;
+pub const N_BOOLEAN_VALUE_OF: u16 = NATIVE_BASE + 253;
+pub const N_BOOLEAN_TOSTRING: u16 = NATIVE_BASE + 254;
+pub const N_BOOLEAN_CTOR: u16 = NATIVE_BASE + 255;
+pub const N_FUNCTION_PROTO: u16 = NATIVE_BASE + 256;
+pub const N_EVENT_ADD: u16 = NATIVE_BASE + 257;
+pub const N_EVENT_REMOVE: u16 = NATIVE_BASE + 258;
+pub const N_EVENT_DISPATCH: u16 = NATIVE_BASE + 259;
+pub const N_DOM_CLICK: u16 = NATIVE_BASE + 260;
+pub const N_EVENT_CTOR: u16 = NATIVE_BASE + 261;
+pub const N_EVENT_PREVENT: u16 = NATIVE_BASE + 262;
+pub const N_EVENT_STOP_IMMEDIATE: u16 = NATIVE_BASE + 263;
+pub const N_MEDIA_CAN_PLAY: u16 = NATIVE_BASE + 264;
+pub const N_IFRAME_WINDOW: u16 = NATIVE_BASE + 265;
+pub const N_IFRAME_DOCUMENT: u16 = NATIVE_BASE + 266;
+pub const N_IFRAME_SRCDOC: u16 = NATIVE_BASE + 267;
+pub const N_IFRAME_SET_SRCDOC: u16 = NATIVE_BASE + 268;
+pub const N_DOC_HAS_FOCUS: u16 = NATIVE_BASE + 269;
+pub const N_DOM_APPEND: u16 = NATIVE_BASE + 270;
+pub const N_DOM_REMOVE: u16 = NATIVE_BASE + 271;
+pub const N_DOM_FRAME_LOAD: u16 = NATIVE_BASE + 272;
+pub const N_DOM_EMPTY_OBJECT: u16 = NATIVE_BASE + 273;
+pub var dbg_iframe_reads: u32 = 0;
 var regexp_proto: u32 = objects.NULL_OBJ;
 
 // TextEncoder/TextDecoder
@@ -284,35 +321,93 @@ pub var bg_vm_setup_called: bool = false;
 /// realm (BotGuard reads `iframe.contentWindow` to obtain a pristine `String`/
 /// `eval` from a fresh realm — returning undefined breaks its register machine).
 pub var g_global_obj: u32 = 0;
+pub var dom_document_obj: u32 = objects.NULL_OBJ;
+pub var dom_window_template: u32 = objects.NULL_OBJ;
 pub var dbg_bg_telemetry_calls: u32 = 0;
 pub var dbg_bg_logger_calls: u32 = 0;
 pub var bg_snapshot_response: Value = Value.UNDEFINED; // captured botguardResponse string
 pub var bg_snapshot_result_called: bool = false;
 
-// Deferred task queue for setTimeout/setInterval. BotGuard schedules its VM
-// setup (and other work) via setTimeout(fn, 0); the host VM must drain these
-// after the synchronous call returns. Callbacks are enqueued here (with up to
-// two bound args) and executed by vm.drainTasks().
+// Caller-bounded event queue. Slots are reclaimed before one-shot callbacks
+// run, so recursive scheduling cannot exhaust an append-only queue. Timers
+// share cancellable IDs; microtasks have priority over ready timers.
 const MAX_TASKS: usize = 256;
-pub var task_fns: [MAX_TASKS]Value = undefined;
-pub var task_arg0: [MAX_TASKS]Value = undefined;
-pub var task_arg1: [MAX_TASKS]Value = undefined;
-pub var task_argc: [MAX_TASKS]u8 = undefined;
-pub var task_head: usize = 0; // next task to run
-pub var task_tail: usize = 0; // next free slot
-pub fn taskQueueReset() void { task_head = 0; task_tail = 0; }
-fn enqueueTask(args: []const Value) void {
-    // args[0] = callback fn, args[1] = delay (ignored), args[2..] = fn args.
-    if (args.len == 0 or args[0].tag != .function) return;
-    if (task_tail >= MAX_TASKS) return;
-    task_fns[task_tail] = args[0];
-    task_arg0[task_tail] = if (args.len > 2) args[2] else Value.UNDEFINED;
-    task_arg1[task_tail] = if (args.len > 3) args[3] else Value.UNDEFINED;
-    var extra: u8 = 0;
-    if (args.len > 2) extra += 1;
-    if (args.len > 3) extra += 1;
-    task_argc[task_tail] = extra;
-    task_tail += 1;
+pub const Task = struct {
+    callback: Value = Value.UNDEFINED,
+    args: [8]Value = [_]Value{Value.UNDEFINED} ** 8,
+    argc: u8 = 0,
+    id: u32 = 0,
+    due: u64 = 0,
+    interval: u32 = 0,
+    microtask: bool = false,
+    active: bool = false,
+};
+var tasks: [MAX_TASKS]Task = undefined;
+var task_next_id: u32 = 1;
+pub fn taskQueueReset() void {
+    events.reset();
+    for (&tasks) |*task| task.* = .{};
+    task_next_id = 1;
+}
+pub fn taskClock() u64 { return GetTickCount64(); }
+
+fn enqueueTask(args: []const Value, repeat: bool, microtask: bool) Value {
+    if (args.len == 0 or args[0].tag != .function) {
+        requestNativeThrow("Task callback must be a function");
+        return Value.UNDEFINED;
+    }
+    const extra: usize = if (!microtask and args.len > 2) args.len - 2 else 0;
+    if (extra > 8) { requestRangeError("Task argument capacity exceeded"); return Value.UNDEFINED; }
+    var free: ?usize = null;
+    for (tasks, 0..) |task, i| if (!task.active) { free = i; break; };
+    const slot = free orelse { requestRangeError("Task queue capacity exceeded"); return Value.UNDEFINED; };
+    const delay = if (!microtask and args.len > 1) args[1].toNumber() else 0;
+    const millis: u32 = if (delay > 0 and delay <= 2147483647) @intFromFloat(@trunc(delay)) else 0;
+    var id = task_next_id;
+    // IDs remain unique among outstanding timers even after integer wrap.
+    while (true) {
+        var occupied = false;
+        for (tasks) |task| if (task.active and task.id == id) { occupied = true; break; };
+        if (!occupied) break;
+        id +%= 1;
+        if (id == 0) id = 1;
+    }
+    task_next_id = id +% 1;
+    if (task_next_id == 0) task_next_id = 1;
+    tasks[slot] = .{ .callback = args[0], .id = id, .argc = @intCast(extra), .due = taskClock() + millis, .interval = if (repeat) @max(millis, 1) else 0, .microtask = microtask, .active = true };
+    for (0..extra) |i| tasks[slot].args[i] = args[i + 2];
+    return if (microtask) Value.UNDEFINED else Value.number(@floatFromInt(id));
+}
+
+fn cancelTask(args: []const Value) Value {
+    if (args.len == 0) return Value.UNDEFINED;
+    const number = args[0].toNumber();
+    if (number < 1 or number > 4294967295 or number != number) return Value.UNDEFINED;
+    const id: u32 = @intFromFloat(@trunc(number));
+    for (&tasks) |*task| if (task.active and task.id == id) { task.active = false; break; };
+    return Value.UNDEFINED;
+}
+
+/// Take one event, waiting only within the caller's absolute deadline. Copy
+/// arguments before invoking JS: its callback may reuse this queue slot.
+pub fn takeTask(deadline: u64) ?Task {
+    var chosen: ?usize = null;
+    for (tasks, 0..) |task, i| {
+        if (!task.active) continue;
+        if (chosen) |old| {
+            const previous = tasks[old];
+            if ((task.microtask and !previous.microtask) or (task.microtask == previous.microtask and (task.due < previous.due or (task.due == previous.due and task.id < previous.id)))) chosen = i;
+        } else chosen = i;
+    }
+    const index = chosen orelse return null;
+    const task = tasks[index];
+    if (!task.microtask) {
+        const now = taskClock();
+        if (task.due > deadline) return null;
+        if (task.due > now) Sleep(@intCast(@min(task.due - now, 4294967295)));
+    }
+    if (task.interval == 0) tasks[index].active = false else tasks[index].due = taskClock() + task.interval;
+    return task;
 }
 
 /// Reset captured BotGuard callback state before an invocation.
@@ -337,6 +432,7 @@ pub fn isVmIntrinsic(func_id: u16) bool {
 /// first real argument is the operand. (String/Number/Object/Boolean coercion,
 /// parseInt/parseFloat, isNaN/isFinite, encode/decodeURIComponent, atob/btoa.)
 pub fn nativeIgnoresReceiver(func_id: u16) bool {
+    if (func_id == N_EVENT_CTOR or func_id == N_DOM_FRAME_LOAD) return true;
     if (func_id == N_OBJ_FREEZE or func_id == N_OBJ_IS_FROZEN) return true;
     if (func_id >= N_MATH_FLOOR and func_id <= N_MATH_ATAN2) return true;
     if (func_id == N_JSON_PARSE or func_id == N_JSON_STRINGIFY or
@@ -351,14 +447,25 @@ pub fn nativeIgnoresReceiver(func_id: u16) bool {
         func_id == N_ARRAY_BUFFER or func_id == N_DATA_VIEW or
         func_id == N_SYMBOL or func_id == N_PROXY_CONSTRUCTOR or
         func_id == N_SET_TIMEOUT or func_id == N_SET_INTERVAL or
-        func_id == N_CLEAR_TIMEOUT or func_id == N_CONSOLE_LOG or
+        func_id == N_CLEAR_TIMEOUT or func_id == N_QUEUE_MICROTASK or func_id == N_CONSOLE_LOG or
         func_id == N_BG_VM_SETUP or func_id == N_BG_SNAPSHOT_RESULT or
         func_id == N_BG_TELEMETRY or func_id == N_BG_LOGGER) return true;
-    return func_id == N_STRING_CTOR or func_id == N_NUMBER_CTOR or func_id == N_REGEXP_CTOR or
+    return func_id == N_STRING_CTOR or func_id == N_NUMBER_CTOR or func_id == N_BOOLEAN_CTOR or func_id == N_REGEXP_CTOR or
         func_id == N_OBJECT_CTOR or func_id == N_PARSE_INT or func_id == N_PARSE_FLOAT or
         func_id == N_IS_NAN or func_id == N_IS_FINITE or
         func_id == N_ENCODE_URI or func_id == N_DECODE_URI or
         func_id == N_ATOB or func_id == N_BTOA;
+}
+/// Native methods are nonconstructible and have no automatic prototype.
+/// Host constructors install their own prototypes when their interface is built.
+pub fn nativeHasPrototype(id: u16) bool {
+    return switch (id) {
+        N_OBJECT_CTOR, N_ARRAY_CTOR, N_STRING_CTOR, N_NUMBER_CTOR, N_BOOLEAN_CTOR, N_EVENT_CTOR,
+        N_DATE_CTOR, N_REGEXP_CTOR, N_ERROR_CTOR, N_REFERROR_CTOR, N_TYPEERROR_CTOR,
+        N_UINT8_ARRAY, N_UINT16_ARRAY, N_UINT32_ARRAY, N_INT8_ARRAY,
+        N_ARRAY_BUFFER, N_DATA_VIEW, N_TEXT_ENCODE, N_TEXT_DECODE, N_FUNCTION, N_SYMBOL => true,
+        else => false,
+    };
 }
 
 /// True if a func_id is a Function.prototype method bound-invoker.
@@ -377,6 +484,7 @@ var rng_state: u64 = 0x1234567890ABCDEF;
 /// Install all built-in functions and objects on the global object.
 pub var dbg_disable_proto_wire: bool = false;
 pub fn installGlobals(global: u32) void {
+    resetPerfNow();
     // Math object
     const math_obj = objects.createObject();
     installNativeMethod(math_obj, "floor", N_MATH_FLOOR);
@@ -504,6 +612,12 @@ pub fn installGlobals(global: u32) void {
         objects.setEnumerable(objects.getNumberProto(), values.internString("constructor"), false);
     }
     objects.setProperty(global, values.internString("Number"), Value.function(num_ctor));
+    const bool_ctor = objects.createFunction(N_BOOLEAN_CTOR);
+    objects.setProperty(bool_ctor, values.internString("prototype"), Value.object(objects.getBooleanProto()));
+    objects.setEnumerable(bool_ctor, values.internString("prototype"), false);
+    objects.setProperty(objects.getBooleanProto(), values.internString("constructor"), Value.function(bool_ctor));
+    objects.setEnumerable(objects.getBooleanProto(), values.internString("constructor"), false);
+    objects.setProperty(global, values.internString("Boolean"), Value.function(bool_ctor));
 
     // Date — callable (Date() / new Date()) with static Date.now().
     const date_ctor = objects.createFunction(N_DATE_CTOR);
@@ -514,6 +628,7 @@ pub fn installGlobals(global: u32) void {
     installNativeMethod(date_proto, "getHours", N_DATE_HOURS);
     installNativeMethod(date_proto, "getMinutes", N_DATE_MINUTES);
     installNativeMethod(date_proto, "getTimezoneOffset", N_DATE_ZONE_OFFSET);
+    installNativeMethod(date_proto, "toString", N_DATE_TOSTRING);
     objects.setProperty(date_ctor, values.internString("prototype"), Value.object(date_proto));
     objects.setProperty(date_proto, values.internString("constructor"), Value.function(date_ctor));
     objects.setEnumerable(date_proto, values.internString("constructor"), false);
@@ -568,7 +683,7 @@ pub fn installGlobals(global: u32) void {
     if (!dbg_disable_proto_wire) {
         const func_ctor = objects.getProperty(global, values.internString("Function"));
         if (func_ctor.tag == .function) {
-            objects.setProperty(func_ctor.data.func_idx, values.internString("prototype"), Value.object(objects.getFunctionProto()));
+            objects.setProperty(func_ctor.data.func_idx, values.internString("prototype"), Value.function(objects.getFunctionProto()));
             objects.setEnumerable(func_ctor.data.func_idx, values.internString("prototype"), false);
             objects.setProperty(objects.getFunctionProto(), values.internString("constructor"), func_ctor);
             objects.setEnumerable(objects.getFunctionProto(), values.internString("constructor"), false);
@@ -581,6 +696,16 @@ pub fn installGlobals(global: u32) void {
     // method (receiver=args[0]) handled by callNative -> fnToStringNative. Object.
     // prototype.toString still returns "[object Function]" (type-detection intact).
     installNativeMethod(objects.getFunctionProto(), "toString", N_FN_TOSTRING);
+    installNativeMethod(objects.getFunctionProto(), "call", N_FN_CALL);
+    installNativeMethod(objects.getFunctionProto(), "apply", N_FN_APPLY);
+    installNativeMethod(objects.getFunctionProto(), "bind", N_FN_BIND);
+    objects.getObject(objects.getFunctionProto()).func_id = N_FUNCTION_PROTO;
+    for ([_][]const u8{"name", "length"}) |name| {
+        const key = values.internString(name);
+        objects.setProperty(objects.getFunctionProto(), key, if (eql(name,"name")) Value.string(values.internString("")) else Value.number(0));
+        objects.setEnumerable(objects.getFunctionProto(), key, false);
+        objects.setWritable(objects.getFunctionProto(), key, false);
+    }
 
 
 
@@ -590,6 +715,13 @@ pub fn installGlobals(global: u32) void {
     objects.setProperty(global, values.internString("undefined"), Value.UNDEFINED);
     objects.setProperty(global, values.internString("NaN"), Value.number(@as(f64, @bitCast(@as(u64, 0x7FF8000000000000)))));
     objects.setProperty(global, values.internString("Infinity"), Value.number(@as(f64, @bitCast(@as(u64, 0x7FF0000000000000)))));
+    for ([_][]const u8{"Object", "Array", "String", "Number", "Boolean", "RegExp", "Date", "Error", "ReferenceError", "TypeError"}) |name| {
+        const constructor = objects.getProperty(global, values.internString(name));
+        if (constructor.tag != .function) continue;
+        setNativeFunctionMetadata(constructor.data.func_idx, name, nativeArity(objects.closureFuncId(constructor.data.func_idx)));
+        objects.setEnumerable(constructor.data.func_idx, values.internString("prototype"), false);
+        objects.setWritable(constructor.data.func_idx, values.internString("prototype"), false);
+    }
 }
 
 /// Install Array.prototype / String.prototype methods on the shared prototype
@@ -605,10 +737,6 @@ fn installPrototypes() void {
     installNativeMethod(ap, "slice", N_ARR_SLICE);
     installNativeMethod(ap, "indexOf", N_ARR_INDEX_OF);
     installNativeMethod(ap, "join", N_ARR_JOIN);
-    // Array.prototype.toString === join with default "," separator (JS spec).
-    // Without this, `arr.toString()` fell through to Object.prototype.toString
-    // ("[object Array]") instead of "1,2,3" — BotGuard stringifies arrays.
-    installNativeMethod(ap, "toString", N_ARR_JOIN);
     installNativeMethod(ap, "reverse", N_ARR_REVERSE);
     installNativeMethod(ap, "sort", N_ARR_SORT);
     installNativeMethod(ap, "toString", N_ARR_TOSTRING);
@@ -675,13 +803,10 @@ fn installPrototypes() void {
         const np = objects.getNumberProto();
         if (np != objects.NULL_OBJ) {
             installNativeMethod(np, "toString", N_NUMBER_TO_STRING);
-            installNativeMethod(np, "valueOf", N_OBJ_VALUE_OF);
+            installNativeMethod(np, "valueOf", N_NUMBER_VALUE_OF);
         }
-        // String.prototype.toString/valueOf return the string itself.
-        const sp2b = objects.getStringProto();
-        if (sp2b != objects.NULL_OBJ) {
-            installNativeMethod(sp2b, "valueOf", N_OBJ_VALUE_OF);
-        }
+        installNativeMethod(objects.getBooleanProto(), "valueOf", N_BOOLEAN_VALUE_OF);
+        installNativeMethod(objects.getBooleanProto(), "toString", N_BOOLEAN_TOSTRING);
     }
 }
 
@@ -714,14 +839,23 @@ fn requestRangeError(msg: []const u8) void {
 /// string (or a String wrapper). Otherwise JS throws a TypeError.
 fn strToStringMethod(args: []const Value) Value {
     if (args.len > 0 and args[0].tag == .string) return args[0];
-    // (We don't model boxed String objects; a real string primitive is the
-    // only valid `this` here.) Anything else -> TypeError, matching V8.
+    if (args.len > 0 and args[0].tag == .object and objects.objTypeOf(args[0].data.obj_idx) == .boxed_string) return Value.string(objects.getObject(args[0].data.obj_idx).array_start);
     requestNativeThrow("String.prototype.toString requires that 'this' be a String");
     return Value.UNDEFINED;
 }
 
 pub fn callNative(func_id: u16, args: []const Value, argc: u8) Value {
-    _ = argc;
+    if (callbackAborted()) return Value.UNDEFINED;
+    // Generic string methods apply RequireObjectCoercible and ToString.
+    // toString/valueOf use their stricter String brand check below.
+    if (func_id >= N_STR_CHAR_AT and func_id <= N_STR_MATCH and func_id != N_STR_TOSTRING and args.len > 0 and args[0].tag != .string) {
+        if (args[0].tag == .null_val or args[0].tag == .undefined) { requestNativeThrow("String method called on null or undefined"); return Value.UNDEFINED; }
+        var normalized: [256]Value = undefined;
+        if (args.len > normalized.len) { requestRangeError("String argument capacity exceeded"); return Value.UNDEFINED; }
+        @memcpy(normalized[0..args.len], args);
+        normalized[0] = stringCtor(&.{args[0]});
+        return callNative(func_id, normalized[0..args.len], argc);
+    }
     return switch (func_id) {
         N_MATH_FLOOR => mathFloor(args),
         N_MATH_CEIL => mathCeil(args),
@@ -745,16 +879,17 @@ pub fn callNative(func_id: u16, args: []const Value, argc: u8) Value {
         N_IS_FINITE => nIsFinite(args),
         N_ATOB => nAtob(args),
         N_BTOA => nBtoa(args),
-        N_SET_TIMEOUT => blk: { enqueueTask(args); break :blk Value.number(0); },
-        N_SET_INTERVAL => Value.number(0), // intervals not run (would loop forever)
-        N_CLEAR_TIMEOUT => Value.UNDEFINED,
+        N_SET_TIMEOUT => enqueueTask(args, false, false),
+        N_SET_INTERVAL => enqueueTask(args, true, false),
+        N_CLEAR_TIMEOUT => cancelTask(args),
+        N_QUEUE_MICROTASK => enqueueTask(args, false, true),
         N_CONSOLE_LOG => nConsoleLog(args),
         N_STR_FROM_CHARCODE => strFromCharCode(args),
         N_STR_CHAR_AT => strCharAt(args),
         N_STR_CHAR_CODE_AT => strCharCodeAt(args),
         N_STR_INDEX_OF => strIndexOf(args),
         N_STR_SLICE => strSlice(args),
-        N_STR_SUBSTRING => strSlice(args), // similar semantics
+        N_STR_SUBSTRING => strSubstring(args),
         N_STR_SPLIT => strSplit(args),
         N_STR_REPLACE => strReplace(args),
         N_STR_MATCH => strMatch(args),
@@ -781,7 +916,7 @@ pub fn callNative(func_id: u16, args: []const Value, argc: u8) Value {
         N_ARR_FILL => arrFill(args),
         N_ARR_FLAT => arrFlat(args),
         N_ARR_SORT => arrSort(args),
-        N_ARR_TOSTRING => arrJoin(args[0..@min(args.len, 1)]),
+        N_ARR_TOSTRING => arrToString(args),
         N_ARR_REVERSE => arrReverse(args),
         // map/filter/reduce/forEach/find/some/every need callback execution and
         // are handled with VM re-entrancy in vm.sig (isArrayIterMethod). Reaching
@@ -810,10 +945,16 @@ pub fn callNative(func_id: u16, args: []const Value, argc: u8) Value {
         N_DATE_NOW => dateNow(),
         N_PERF_NOW => perfNow(),
         N_NUMBER_CTOR => if (args.len > 0) Value.number(args[0].toNumber()) else Value.number(0),
+        N_NUMBER_VALUE_OF => numberValue(args),
+        N_BOOLEAN_CTOR => boolVal(args.len > 0 and args[0].isTruthy()),
+        N_FUNCTION_PROTO => Value.UNDEFINED,
+        N_BOOLEAN_VALUE_OF => booleanValue(args),
+        N_BOOLEAN_TOSTRING => blk: { const v = booleanValue(args); if (native_throw) break :blk Value.UNDEFINED; break :blk Value.string(values.internString(if (v.data.boolean != 0) "true" else "false")); },
         N_STRING_CTOR => stringCtor(args),
         N_OBJECT_CTOR => objectCtor(args),
-        N_DATE_CTOR => dateNow(), // Date()/new Date() -> current epoch ms (numeric)
-        N_DATE_VALUE_OF => if (args.len > 0 and args[0].tag == .object and objects.objTypeOf(args[0].data.obj_idx) == .date) Value.number(objects.getObject(args[0].data.obj_idx).date_value) else Value.number(dateNaN()),
+        N_DATE_CTOR => dateStringFromTime(dateNow().toNumber()), // Calling Date ignores arguments; new Date uses constructDate.
+        N_DATE_TOSTRING => dateString(if (args.len > 0) args[0] else Value.UNDEFINED),
+        N_DATE_VALUE_OF => if (args.len > 0 and args[0].tag == .object and objects.objTypeOf(args[0].data.obj_idx) == .date) Value.number(objects.getObject(args[0].data.obj_idx).number_value) else Value.number(dateNaN()),
         N_DATE_HOURS, N_DATE_MINUTES, N_DATE_ZONE_OFFSET => dateLocalPart(args, func_id),
         N_ERROR_CTOR => makeErrorVal("Error", args),
         N_REFERROR_CTOR => makeErrorVal("ReferenceError", args),
@@ -821,11 +962,26 @@ pub fn callNative(func_id: u16, args: []const Value, argc: u8) Value {
         N_ERROR_TOSTRING => errorToString(args),
         N_DOM_CREATE_ELEMENT => makeDomElement(args),
         N_DOM_NOOP => Value.UNDEFINED,
+        N_DOM_EMPTY_OBJECT => Value.object(objects.createObject()),
+        N_EVENT_ADD => eventListen(args, false),
+        N_EVENT_REMOVE => eventListen(args, true),
+        N_EVENT_DISPATCH => eventDispatch(args),
+        N_DOM_CLICK => domClick(args),
+        N_EVENT_CTOR => makeEvent(args),
+        N_EVENT_PREVENT => eventPrevent(args),
+        N_EVENT_STOP_IMMEDIATE => eventStopImmediate(args),
         N_DOM_REPLACE_CHILD => if (args.len >= 3) args[2] else Value.UNDEFINED,
+        N_DOM_APPEND => domAppend(args),
+        N_DOM_REMOVE => domRemove(args),
+        N_DOM_FRAME_LOAD => domFrameLoad(args),
         N_DOM_LOOKUP_NAMESPACE => domLookupNamespace(args),
         N_DOM_FALSE => Value.FALSE,
         N_DOM_IMAGE => makeDomElement(&.{Value.string(values.internString("img"))}),
         N_DOM_EMPTY_STRING => Value.string(values.internString("")),
+        N_MEDIA_CAN_PLAY => mediaCanPlay(args),
+        N_IFRAME_WINDOW, N_IFRAME_DOCUMENT, N_IFRAME_SRCDOC, N_IFRAME_SET_SRCDOC => iframeProperty(func_id, args),
+        N_DOC_HAS_FOCUS => documentHasFocus(args),
+        N_DOM_MATCH_MEDIA => makeMediaQueryList(args),
         N_DOM_ORIENTATION_EVENT => makeOrientationEvent(args),
         N_DOM_RECT => makeDomRect(),
         N_DOM_GET_CONTEXT => Value.NULL,
@@ -846,7 +1002,11 @@ pub fn callNative(func_id: u16, args: []const Value, argc: u8) Value {
         N_UINT8_ARRAY => createTypedArrayN(args, 1),
         N_UINT16_ARRAY => createTypedArrayN(args, 2),
         N_UINT32_ARRAY => createTypedArrayN(args, 4),
-        N_INT8_ARRAY => createTypedArrayN(args, 1),
+        N_INT8_ARRAY => blk: {
+            const result = createTypedArrayN(args, 1);
+            if (result.tag == .object) objects.getObject(result.data.obj_idx).elem_signed = true;
+            break :blk result;
+        },
         N_ARRAY_BUFFER => createArrayBufferN(args),
         N_DATA_VIEW => createDataViewN(args),
         N_PROMISE_RESOLVE => if (args.len > 0) args[0] else Value.UNDEFINED,
@@ -879,8 +1039,9 @@ fn objProtoToString(args: []const Value) Value {
         .function => "[object Function]",
         .array => "[object Array]",
         .object => blk: {
+            if (objects.getObject(recv.data.obj_idx).dom_window) break :blk "[object Window]";
             const ot = objects.getObject(recv.data.obj_idx).obj_type;
-            break :blk if (objects.isArguments(recv.data.obj_idx)) "[object Arguments]" else if (ot == .array) "[object Array]" else if (ot == .function) "[object Function]" else if (ot == .regexp) "[object RegExp]" else if (ot == .date) "[object Date]" else "[object Object]";
+            break :blk if (objects.isArguments(recv.data.obj_idx)) "[object Arguments]" else if (ot == .array) "[object Array]" else if (ot == .function) "[object Function]" else if (ot == .regexp) "[object RegExp]" else if (ot == .date) "[object Date]" else if (ot == .boxed_string) "[object String]" else if (ot == .boxed_number) "[object Number]" else if (ot == .boxed_boolean) "[object Boolean]" else "[object Object]";
         },
         else => "[object Object]",
     };
@@ -922,40 +1083,47 @@ fn stringCtor(args: []const Value) Value {
 /// uses Object(x) mainly to ensure an object and to reach Object.* statics).
 fn objectCtor(args: []const Value) Value {
     if (args.len > 0 and (args[0].tag == .object or args[0].tag == .array or args[0].tag == .function)) return args[0];
+    if (args.len > 0 and args[0].tag == .string) return Value.object(objects.createStringWrapper(args[0].data.str_idx));
+    if (args.len > 0 and args[0].tag == .number) return Value.object(objects.createNumberWrapper(args[0].data.number));
+    if (args.len > 0 and args[0].tag == .boolean) return Value.object(objects.createBooleanWrapper(args[0].data.boolean != 0));
     return Value.object(objects.createObject());
+}
+
+pub fn constructString(args: []const Value) Value {
+    const text = stringCtor(args);
+    if (native_throw) return Value.UNDEFINED;
+    return Value.object(objects.createStringWrapper(text.data.str_idx));
+}
+pub fn constructNumber(args: []const Value) Value {
+    const n = if (args.len > 0) args[0].toNumber() else 0;
+    if (callbackAborted()) return Value.UNDEFINED;
+    return Value.object(objects.createNumberWrapper(n));
+}
+pub fn constructBoolean(args: []const Value) Value {
+    return Value.object(objects.createBooleanWrapper(args.len > 0 and args[0].isTruthy()));
+}
+fn numberValue(args: []const Value) Value {
+    if (args.len > 0) {
+        const v = args[0];
+        if (v.tag == .number) return v;
+        if (v.tag == .object and objects.objTypeOf(v.data.obj_idx) == .boxed_number) return Value.number(objects.getObject(v.data.obj_idx).number_value);
+    }
+    requestNativeThrow("Number method requires that 'this' be a Number");
+    return Value.UNDEFINED;
+}
+fn booleanValue(args: []const Value) Value {
+    if (args.len > 0) {
+        const v = args[0];
+        if (v.tag == .boolean) return v;
+        if (v.tag == .object and objects.objTypeOf(v.data.obj_idx) == .boxed_boolean) return boolVal(objects.getObject(v.data.obj_idx).array_start != 0);
+    }
+    requestNativeThrow("Boolean method requires that 'this' be a Boolean");
+    return Value.UNDEFINED;
 }
 
 /// Minimal number→decimal string (integers exact; fractional best-effort) for
 /// String(number). Returns bytes written.
-fn numberToDecimal(n: f64, buf: *[40]u8) usize {
-    if (n != n) { @memcpy(buf[0..3], "NaN"); return 3; }
-    const inf = @as(f64, @bitCast(@as(u64, 0x7FF0000000000000)));
-    if (n == inf) { @memcpy(buf[0..8], "Infinity"); return 8; }
-    if (n == -inf) { @memcpy(buf[0..9], "-Infinity"); return 9; }
-    var o: usize = 0;
-    var v = n;
-    if (v < 0) { buf[0] = '-'; o = 1; v = -v; }
-    const int_part: u64 = if (v < 1.8446744073709552e19) @intFromFloat(@floor(v)) else 0;
-    var digits: [20]u8 = undefined;
-    var d: usize = 0;
-    var t = int_part;
-    if (t == 0) { digits[0] = '0'; d = 1; } else while (t > 0) : (d += 1) { digits[d] = @intCast((t % 10) + '0'); t /= 10; }
-    var i: usize = 0;
-    while (i < d) : (i += 1) { buf[o] = digits[d - 1 - i]; o += 1; }
-    // Fractional part (up to 6 digits) — BotGuard rarely stringifies fractionals.
-    var frac = v - @floor(v);
-    if (frac > 0.0000001 and o + 8 < buf.len) {
-        buf[o] = '.'; o += 1;
-        var fd: usize = 0;
-        while (fd < 6 and frac > 0.0000001) : (fd += 1) {
-            frac *= 10;
-            const dig: u8 = @intFromFloat(@floor(frac));
-            buf[o] = dig + '0'; o += 1;
-            frac -= @floor(frac);
-        }
-    }
-    return o;
-}
+fn numberToDecimal(n: f64, buf: *[40]u8) usize { return values.numberToString(n, buf); }
 
 pub fn keyToNameIdx(key: Value) u32 { return keyNameIdx(key); }
 fn keyNameIdx(key: Value) u32 {
@@ -977,6 +1145,7 @@ fn keyNameIdx(key: Value) u32 {
                     const fn_val = objects.getProperty(key.data.obj_idx, values.internString(method));
                     if (fn_val.tag != .function) continue;
                     const result = invoke(fn_val, key, &.{});
+                    if (callbackAborted()) return values.internString("");
                     if (result.tag != .object and result.tag != .array and result.tag != .function) return keyNameIdx(result);
                 }
             }
@@ -996,7 +1165,7 @@ fn objHasOwn(args: []const Value) Value {
     if (recv.tag == .string) {
         const name = values.getString(name_idx);
         if (eql(name, "length")) return Value.TRUE;
-        if (objects.arrayIndexName(name)) |index| return boolVal(index < values.getStringLen(recv.data.str_idx));
+        if (objects.arrayIndexName(name)) |index| return boolVal(index < values.getStringUnitLength(recv.data.str_idx));
         return Value.FALSE;
     }
     if (recv.tag != .object and recv.tag != .array and recv.tag != .function) return Value.FALSE;
@@ -1034,7 +1203,7 @@ fn objPropertyIsEnumerable(args: []const Value) Value {
     const recv = args[0];
     const name_idx = keyNameIdx(if (args.len >= 2) args[1] else Value.UNDEFINED);
     if (recv.tag == .string) {
-        if (objects.arrayIndexName(values.getString(name_idx))) |index| return boolVal(index < values.getStringLen(recv.data.str_idx));
+        if (objects.arrayIndexName(values.getString(name_idx))) |index| return boolVal(index < values.getStringUnitLength(recv.data.str_idx));
         return Value.FALSE;
     }
     if (recv.tag != .object and recv.tag != .array and recv.tag != .function) return Value.FALSE;
@@ -1268,50 +1437,43 @@ fn objCreate(args: []const Value) Value {
         while (i < dbg_objcreate_proto_n) : (i += 1) { if (dbg_objcreate_proto[i] == pidx) { dbg_objcreate_proto_cnt[i] += 1; seen = true; break; } }
         if (!seen and dbg_objcreate_proto_n < dbg_objcreate_proto.len) { dbg_objcreate_proto[dbg_objcreate_proto_n] = pidx; dbg_objcreate_proto_cnt[dbg_objcreate_proto_n] = 1; dbg_objcreate_proto_n += 1; }
     } else dbg_objcreate_undef += 1;
-    const o = objects.createObject();
-    // Object.create(proto): set the new object's [[Prototype]].
-    if (args.len >= 2 and (args[1].tag == .object or args[1].tag == .array or args[1].tag == .function)) {
-        objects.setObjectPrototype(o, @intCast(args[1].data.obj_idx));
-    } else if (args.len >= 2 and args[1].tag == .null_val) {
-        // Object.create(null): no prototype.
-        objects.setObjectPrototype(o, objects.NULL_OBJ);
+    if (args.len < 2 or (!objectValue(args[1]) and args[1].tag != .null_val)) {
+        requestNativeThrow("Object prototype must be an object or null"); return Value.UNDEFINED;
     }
-    // Object.create(proto, propsObject): apply the property descriptors. Each
-    // own key of propsObject maps to a descriptor with `value` or `get`.
-    // BotGuard's TK does `Object.create(D.Oh, {value:{value:{}}})`; without
-    // honoring this second arg the created object is missing properties that
-    // are read (then `.prototype`-accessed) later, yielding undefined.
-    if (args.len >= 3 and (args[2].tag == .object or args[2].tag == .array)) {
-        const props: u32 = args[2].data.obj_idx;
-        applyPropertyDescriptors(o, props);
+    const o = objects.createObject();
+    objects.setObjectPrototype(o, if (args[1].tag == .null_val) objects.NULL_OBJ else args[1].data.obj_idx);
+    if (args.len >= 3 and args[2].tag != .undefined) {
+        if (args[2].tag == .null_val) { requestNativeThrow("Property descriptors cannot be null"); return Value.UNDEFINED; }
+        const props = objectCtor(&.{args[2]});
+        if (!applyPropertyDescriptors(o, props)) return Value.UNDEFINED;
     }
     return Value.object(o);
 }
 
-/// Apply a `{ key: descriptor, ... }` property-descriptor bag onto `target`.
-/// Used by Object.create(proto, props) and Object.defineProperties.
-fn applyPropertyDescriptors(target: u32, props: u32) void {
-    const pc = objects.ownPropCount(props);
-    var i: u16 = 0;
-    while (i < pc) : (i += 1) {
-        const key_idx = objects.ownPropNameAt(props, i);
-        const desc = objects.getProperty(props, key_idx);
-        if (desc.tag != .object and desc.tag != .array) continue;
-        const dobj: u32 = desc.data.obj_idx;
-        const val = objects.getProperty(dobj, values.internString("value"));
-        if (val.tag != .undefined) {
-            objects.setProperty(target, key_idx, val);
-        } else {
-            const getter = objects.getProperty(dobj, values.internString("get"));
-            if (getter.tag == .function) objects.setGetterProperty(target, key_idx, getter);
-        }
+/// Object.create uses the same descriptor conversion/definition rules as
+/// Object.defineProperty. Its fresh target is not exposed before all entries
+/// succeed; getter side effects and failures still follow property-key order.
+fn applyPropertyDescriptors(target: u32, props: Value) bool {
+    var keys: [objects.MAX_ENUM_KEYS]u32 = undefined;
+    const count = objects.enumerateOwnKeys(props.data.obj_idx, &keys, true);
+    if (count == keys.len) { requestRangeError("Property descriptor capacity exceeded"); return false; }
+    for (keys[0..count]) |key| {
+        // A previous descriptor getter can remove a later property or make it
+        // nonenumerable after the initial key snapshot.
+        var own: objects.Property = undefined;
+        if (!objects.ownPropertyDescriptor(props.data.obj_idx, key, &own) or !own.flags.enumerable) continue;
+        const desc = descriptorField(props, key);
+        if (native_throw or callbackAborted()) return false;
+        _ = objDefineProperty(&.{Value.UNDEFINED, Value.object(target), Value.string(key), desc});
+        if (native_throw or callbackAborted()) return false;
     }
+    return true;
 }
 
 fn objGetProto(args: []const Value) Value {
     if (args.len >= 2 and (args[1].tag == .object or args[1].tag == .array or args[1].tag == .function)) {
         const p = objects.getObjectPrototypeIdx(@intCast(args[1].data.obj_idx));
-        if (p != objects.NULL_OBJ) return Value.object(p);
+        if (p != objects.NULL_OBJ) return if (objects.objTypeOf(p) == .function) Value.function(p) else Value.object(p);
     }
     return Value.NULL;
 }
@@ -1335,7 +1497,7 @@ fn objGetOwnDescriptor(args: []const Value) Value {
     const desc = objects.createObject();
     if (prop.flags.is_getter or prop.flags.is_setter) {
         objects.setProperty(desc, values.internString("get"), if (prop.flags.is_getter) prop.value else Value.UNDEFINED);
-        objects.setProperty(desc, values.internString("set"), if (prop.flags.is_setter) prop.value else Value.UNDEFINED);
+        objects.setProperty(desc, values.internString("set"), if (prop.flags.is_setter) Value.function(prop.setter_fn) else Value.UNDEFINED);
     } else {
         objects.setProperty(desc, values.internString("value"), prop.value);
         objects.setProperty(desc, values.internString("writable"), if (prop.flags.writable) Value.TRUE else Value.FALSE);
@@ -1346,36 +1508,82 @@ fn objGetOwnDescriptor(args: []const Value) Value {
 }
 
 fn objDefineProperty(args: []const Value) Value {
-    if (args.len < 4) return if (args.len >= 2) args[1] else Value.UNDEFINED;
-    const target = args[1];
-    const key = args[2];
-    const desc = args[3];
-    if (target.tag != .object and target.tag != .array and target.tag != .function) return target;
-    if (desc.tag != .object) return target;
-    const tobj: u32 = target.data.obj_idx;
-    const dobj: u32 = desc.data.obj_idx;
-    // key -> string index
-    const key_idx: u32 = if (key.tag == .string) key.data.str_idx else valueToStrIdx(key);
-    const existed = objects.hasOwnProperty(tobj, key_idx);
-    const value_key = values.internString("value");
-    if (objects.hasOwnProperty(dobj, value_key)) {
-        objects.setProperty(tobj, key_idx, objects.getProperty(dobj, value_key));
-    } else {
-        const getter = objects.getProperty(dobj, values.internString("get"));
-        if (getter.tag == .function) {
-            // Accessor property: mark is_getter so reads invoke the getter.
-            objects.setGetterProperty(tobj, key_idx, getter);
-        } else if (!existed) {
-            objects.setProperty(tobj, key_idx, Value.UNDEFINED);
-        }
+    if (args.len < 4 or !objectValue(args[1]) or !objectValue(args[3])) { requestNativeThrow("Object.defineProperty requires object arguments"); return Value.UNDEFINED; }
+    const target = args[1]; const desc = args[3];
+    const key_idx = keyNameIdx(args[2]);
+    if (callbackAborted() or native_throw) return Value.UNDEFINED;
+    // ToPropertyDescriptor reads inherited fields and invokes accessors in the
+    // specified order. Complete the conversion before changing the target.
+    var present: [6]bool = undefined;
+    var fields: [6]Value = undefined;
+    for ([_][]const u8{"enumerable", "configurable", "value", "writable", "get", "set"}, 0..) |name, i| {
+        const field_key = values.internString(name);
+        present[i] = hasDescriptorField(desc.data.obj_idx, field_key);
+        fields[i] = if (present[i]) descriptorField(desc, field_key) else Value.UNDEFINED;
+        if (callbackAborted() or native_throw) return Value.UNDEFINED;
     }
-    const enumerable_key = values.internString("enumerable");
-    if (!existed or objects.hasOwnProperty(dobj, enumerable_key))
-        objects.setEnumerable(tobj, key_idx, objects.getProperty(dobj, enumerable_key).isTruthy());
-    const writable_key = values.internString("writable");
-    if (!existed or objects.hasOwnProperty(dobj, writable_key))
-        objects.setWritable(tobj, key_idx, objects.getProperty(dobj, writable_key).isTruthy());
+    const accessor = present[4] or present[5];
+    const data = present[2] or present[3];
+    if (accessor and data) { requestNativeThrow("Accessor descriptor cannot contain value or writable"); return Value.UNDEFINED; }
+    for (fields[4..6]) |function| if (function.tag != .undefined and function.tag != .function) { requestNativeThrow("Accessor getter and setter must be functions or undefined"); return Value.UNDEFINED; };
+    var previous: objects.Property = undefined;
+    const existed = objects.ownPropertyDescriptor(target.data.obj_idx, key_idx, &previous);
+    var property = if (existed) previous else objects.Property{ .name_idx = key_idx, .value = Value.UNDEFINED, .flags = .{ .writable = false, .enumerable = false, .configurable = false } };
+    if (present[0]) property.flags.enumerable = fields[0].isTruthy();
+    if (present[1]) property.flags.configurable = fields[1].isTruthy();
+    const conversion = existed and (accessor or data) and accessor != previous.flags.is_getter;
+    if (conversion) { property.value = Value.UNDEFINED; property.setter_fn = objects.NULL_OBJ; property.flags.writable = false; property.flags.is_getter = false; property.flags.is_setter = false; }
+    if (accessor) {
+        property.flags.is_getter = true; property.flags.writable = false;
+        if (present[4]) property.value = fields[4];
+        if (present[5]) { property.setter_fn = if (fields[5].tag == .function) fields[5].data.func_idx else objects.NULL_OBJ; property.flags.is_setter = fields[5].tag == .function; }
+    } else if (data) {
+        if (present[2]) property.value = fields[2];
+        if (present[3]) property.flags.writable = fields[3].isTruthy();
+    }
+    if (existed and !previous.flags.configurable) {
+        var invalid = property.flags.configurable or property.flags.enumerable != previous.flags.enumerable or conversion;
+        if (previous.flags.is_getter) {
+            invalid = invalid or !sameDescriptorValue(previous.value, property.value) or previous.setter_fn != property.setter_fn;
+        } else if (!previous.flags.writable) invalid = invalid or property.flags.writable or !sameDescriptorValue(previous.value, property.value);
+        if (invalid) { requestNativeThrow("Cannot redefine a non-configurable property"); return Value.UNDEFINED; }
+    }
+    if (objects.objTypeOf(target.data.obj_idx) == .array and eql(values.getString(key_idx), "length")) {
+        const length = property.value.toNumber();
+        if (callbackAborted()) return Value.UNDEFINED;
+        if (length != length or length < 0 or length > 4294967295 or @trunc(length) != length) { requestNativeThrow("Invalid array length"); native_throw_name = "RangeError"; return Value.UNDEFINED; }
+        property.value = Value.number(length);
+    }
+    if (!objects.defineOwnProperty(target.data.obj_idx, property)) { requestNativeThrow("Cannot define property"); return Value.UNDEFINED; }
     return target;
+}
+fn objectValue(value: Value) bool { return value.tag == .object or value.tag == .array or value.tag == .function; }
+fn hasDescriptorField(object: u32, key: u32) bool {
+    var current = object; var depth: usize = 0;
+    while (current != objects.NULL_OBJ and depth < 32) : (depth += 1) {
+        if (objects.hasOwnProperty(current, key)) return true;
+        current = objects.getObject(current).prototype;
+    }
+    return false;
+}
+fn descriptorField(receiver: Value, key: u32) Value {
+    var getter = Value.UNDEFINED;
+    if (objects.getPropertyGetter(receiver.data.obj_idx, key, &getter)) {
+        if (getter.tag == .function) { if (invoke_callback) |invoke| return invoke(getter, receiver, &.{}); }
+        return Value.UNDEFINED;
+    }
+    return objects.getProperty(receiver.data.obj_idx, key);
+}
+fn sameDescriptorValue(a: Value, b: Value) bool {
+    if (objectValue(a) and objectValue(b)) return a.data.obj_idx == b.data.obj_idx;
+    if (a.tag != b.tag) return false;
+    return switch (a.tag) {
+        .number => (a.data.number != a.data.number and b.data.number != b.data.number) or (a.data.number == b.data.number and (a.data.number != 0 or @as(u64, @bitCast(a.data.number)) == @as(u64, @bitCast(b.data.number)))),
+        .string, .symbol => a.data.str_idx == b.data.str_idx,
+        .boolean => a.data.boolean == b.data.boolean,
+        .undefined, .null_val => true,
+        else => false,
+    };
 }
 
 /// Minimal value->string-index for property keys (numbers/strings).
@@ -1389,19 +1597,7 @@ fn valueToStrIdx(v: Value) u32 {
     return values.internString("");
 }
 
-fn numToDecimal(n: f64, buf: []u8) usize {
-    const i = toI64(n);
-    if (i == 0) { buf[0] = '0'; return 1; }
-    var neg = false; var u: u64 = undefined;
-    if (i < 0) { neg = true; u = @intCast(-i); } else { u = @intCast(i); }
-    var d: [20]u8 = undefined; var dn: usize = 0;
-    while (u > 0) : (u /= 10) { d[dn] = @intCast((u % 10) + '0'); dn += 1; }
-    var o: usize = 0;
-    if (neg) { buf[0] = '-'; o = 1; }
-    var k: usize = 0;
-    while (k < dn) : (k += 1) buf[o + k] = d[dn - 1 - k];
-    return o + dn;
-}
+fn numToDecimal(n: f64, buf: []u8) usize { return values.numberToString(n, buf); }
 
 // ── DOM element stub ──
 
@@ -1419,8 +1615,21 @@ pub fn makeDomStyle() u32 {
     return style;
 }
 
+/// The fixed browser host has no active CSS media evaluator. Return the
+/// standard object with a conservative non-match instead of undefined.
+fn makeMediaQueryList(args: []const Value) Value {
+    const result = objects.createObject();
+    objects.setProperty(result, values.internString("matches"), Value.FALSE);
+    objects.setProperty(result, values.internString("media"), if (args.len > 0) Value.string(keyNameIdx(args[args.len - 1])) else Value.string(values.internString("undefined")));
+    objects.setProperty(result, values.internString("onchange"), Value.NULL);
+    for ([_][]const u8{ "addListener", "removeListener", "addEventListener", "removeEventListener" }) |name| installNativeMethod(result, name, N_DOM_NOOP);
+    installNativeMethod(result, "dispatchEvent", N_DOM_FALSE);
+    return Value.object(result);
+}
+
 fn makeDomElement(args: []const Value) Value {
     const el = objects.createObject();
+    registerDomNode(el, 1);
     if (dom_element_proto != objects.NULL_OBJ) objects.setObjectPrototype(el, dom_element_proto);
     const style = makeDomStyle();
     objects.setProperty(el, values.internString("style"), Value.object(style));
@@ -1432,19 +1641,31 @@ fn makeDomElement(args: []const Value) Value {
     installNativeMethod(el, "getAttribute", N_DOM_NOOP);
     installNativeMethod(el, "removeAttribute", N_DOM_NOOP);
     installNativeMethod(el, "hasAttribute", N_DOM_FALSE);
-    installNativeMethod(el, "click", N_DOM_NOOP);
+    installNativeMethod(el, "click", N_DOM_CLICK);
     installNativeMethod(el, "matches", N_DOM_FALSE);
-    installNativeMethod(el, "canPlayType", N_DOM_EMPTY_STRING);
+    if (args.len > 0 and args[args.len - 1].tag == .string) {
+        const tag = values.getString(args[args.len - 1].data.str_idx);
+        if (std.ascii.eqlIgnoreCase(tag, "audio") or std.ascii.eqlIgnoreCase(tag, "video")) {
+            objects.getObject(el).dom_media = true;
+            const ctor = objects.getProperty(g_global_obj, values.internString("HTMLMediaElement"));
+            if (ctor.tag == .function) {
+                const proto = objects.getProperty(ctor.data.func_idx, values.internString("prototype"));
+                if (proto.tag == .object) objects.setObjectPrototype(el, proto.data.obj_idx);
+            }
+            installNativeMethod(el, "canPlayType", N_MEDIA_CAN_PLAY);
+        }
+    }
     installNativeMethod(el, "getBoundingClientRect", N_DOM_RECT);
-    installNativeMethod(el, "appendChild", N_DOM_NOOP);
-    installNativeMethod(el, "removeChild", N_DOM_NOOP);
+    installNativeMethod(el, "appendChild", N_DOM_APPEND);
+    installNativeMethod(el, "removeChild", N_DOM_REMOVE);
     installNativeMethod(el, "replaceChild", N_DOM_REPLACE_CHILD);
     installNativeMethod(el, "lookupNamespaceURI", N_DOM_LOOKUP_NAMESPACE);
     objects.setProperty(el, values.internString("namespaceURI"), Value.string(values.internString("http://www.w3.org/1999/xhtml")));
     if (args.len > 0 and args[args.len - 1].tag == .string and eql(values.getString(args[args.len - 1].data.str_idx), "img"))
         objects.setProperty(el, values.internString("isMap"), Value.FALSE);
-    installNativeMethod(el, "addEventListener", N_DOM_NOOP);
-    installNativeMethod(el, "removeEventListener", N_DOM_NOOP);
+    installNativeMethod(el, "addEventListener", N_EVENT_ADD);
+    installNativeMethod(el, "removeEventListener", N_EVENT_REMOVE);
+    installNativeMethod(el, "dispatchEvent", N_EVENT_DISPATCH);
     // Fresh detached elements have callable focus/blur methods, but no active
     // document focus or layout box. Their scroll extents start at zero.
     installNativeMethod(el, "focus", N_DOM_NOOP);
@@ -1465,10 +1686,13 @@ fn makeDomElement(args: []const Value) Value {
     // `iframe.contentWindow` to get a fresh realm's pristine `String`/`eval`
     // (anti-tamper). jsdom returns a real Window; we return the global object
     // (which carries String/Object/eval/etc.). Also expose contentDocument.
-    if (g_global_obj != 0) {
-        objects.setProperty(el, values.internString("contentWindow"), Value.object(g_global_obj));
-        const doc = objects.getProperty(g_global_obj, values.internString("document"));
-        objects.setProperty(el, values.internString("contentDocument"), doc);
+    if (g_global_obj != 0 and args.len > 0 and args[args.len-1].tag == .string and std.ascii.eqlIgnoreCase(values.getString(args[args.len-1].data.str_idx), "iframe")) {
+        objects.getObject(el).dom_iframe = true;
+        const ctor = objects.getProperty(g_global_obj, values.internString("HTMLIFrameElement"));
+        if (ctor.tag == .function) {
+            const proto = objects.getProperty(ctor.data.func_idx, values.internString("prototype"));
+            if (proto.tag == .object) objects.setObjectPrototype(el, proto.data.obj_idx);
+        }
     }
     return Value.object(el);
 }
@@ -1479,6 +1703,195 @@ fn domLookupNamespace(args: []const Value) Value {
             return objects.getProperty(args[0].data.obj_idx, values.internString("namespaceURI"));
     }
     return Value.NULL;
+}
+
+fn eventListen(args: []const Value, remove: bool) Value {
+    if (args.len < 3 or args[0].tag != .object) { requestNativeThrow("EventTarget requires a receiver, type and listener"); return Value.UNDEFINED; }
+    const kind = stringCtor(args[1..2]);
+    if (callbackAborted()) return Value.UNDEFINED;
+    const callback = args[2];
+    if (callback.tag == .undefined or callback.tag == .null_val) return Value.UNDEFINED;
+    if (callback.tag != .function and callback.tag != .object and callback.tag != .array) { requestNativeThrow("Event listener must be an object or function"); return Value.UNDEFINED; }
+    const options = if (args.len > 3) args[3] else Value.FALSE;
+    if (remove) events.remove(args[0].data.obj_idx, kind.data.str_idx, callback, options)
+    else if (!events.add(args[0].data.obj_idx, kind.data.str_idx, callback, options)) requestRangeError("Event listener capacity exceeded");
+    return Value.UNDEFINED;
+}
+fn mediaCanPlay(args: []const Value) Value {
+    if (args.len == 0 or args[0].tag != .object or !objects.getObject(args[0].data.obj_idx).dom_media) {
+        requestNativeThrow("canPlayType requires an HTMLMediaElement receiver"); return Value.UNDEFINED;
+    }
+    if (args.len < 2) { requestNativeThrow("canPlayType requires a media type"); return Value.UNDEFINED; }
+    _ = stringCtor(args[1..2]);
+    if (callbackAborted()) return Value.UNDEFINED;
+    // No decoder is attached to this embedded host. Its codec capability
+    // response is the standard empty string, independently of the input type.
+    return Value.string(values.internString(""));
+}
+fn iframeProperty(id: u16, args: []const Value) Value {
+    if (args.len == 0 or args[0].tag != .object or !objects.getObject(args[0].data.obj_idx).dom_iframe) {
+        requestNativeThrow("Iframe property requires an HTMLIFrameElement receiver"); return Value.UNDEFINED;
+    }
+    const element = objects.getObject(args[0].data.obj_idx);
+    if (id == N_IFRAME_WINDOW) {
+        dbg_iframe_reads += 1;
+        if (element.dom_iframe_window != objects.NULL_OBJ) return Value.object(element.dom_iframe_window);
+        const window = objects.createObject();
+        if (window == objects.NULL_OBJ or !objects.copyOwnProperties(dom_window_template, window)) {
+            requestRangeError("Iframe window storage exceeded"); return Value.UNDEFINED;
+        }
+        objects.getObject(window).dom_window = true;
+        for ([_][]const u8{ "window", "self", "globalThis" }) |key|
+            objects.setProperty(window, values.internString(key), Value.object(window));
+        for ([_][]const u8{ "parent", "top" }) |key|
+            objects.setProperty(window, values.internString(key), Value.object(g_global_obj));
+        objects.setProperty(window, values.internString("frameElement"), args[0]);
+        element.dom_iframe_window = window;
+        return Value.object(window);
+    }
+    if (id == N_IFRAME_DOCUMENT) return objects.getProperty(g_global_obj, values.internString("document"));
+    if (id == N_IFRAME_SET_SRCDOC) {
+        const value = stringCtor(if (args.len > 1) args[1..2] else &.{Value.UNDEFINED});
+        if (!callbackAborted()) element.dom_srcdoc = value.data.str_idx;
+        return Value.UNDEFINED;
+    }
+    return Value.string(if (element.dom_srcdoc == objects.NULL_OBJ) values.internString("") else element.dom_srcdoc);
+}
+fn documentHasFocus(args: []const Value) Value {
+    if (args.len == 0 or args[0].tag != .object or args[0].data.obj_idx != dom_document_obj) {
+        requestNativeThrow("hasFocus requires a Document receiver"); return Value.UNDEFINED;
+    }
+    return Value.FALSE;
+}
+
+pub fn registerDomNode(node: u32, kind: u8) void {
+    const object = objects.getObject(node);
+    object.dom_node = true;
+    object.dom_children = objects.createArray(0);
+    objects.setProperty(node, values.internString("nodeType"), Value.number(@floatFromInt(kind)));
+    objects.setProperty(node, values.internString("parentNode"), Value.NULL);
+    objects.setProperty(node, values.internString("childNodes"), Value.object(object.dom_children));
+    objects.setProperty(node, values.internString("firstChild"), Value.NULL);
+    objects.setProperty(node, values.internString("lastChild"), Value.NULL);
+}
+fn syncDomChildren(parent: u32) void {
+    const array = objects.getObject(parent).dom_children;
+    const len = objects.arrayLength(array);
+    objects.setProperty(parent, values.internString("firstChild"), if (len == 0) Value.NULL else objects.getArrayElement(array, 0));
+    objects.setProperty(parent, values.internString("lastChild"), if (len == 0) Value.NULL else objects.getArrayElement(array, len-1));
+}
+fn detachDomChild(parent: u32, child: u32) bool {
+    const array = objects.getObject(parent).dom_children;
+    const len = objects.arrayLength(array);
+    for (0..len) |i| {
+        const value = objects.getArrayElement(array, @intCast(i));
+        if (value.tag != .object or value.data.obj_idx != child) continue;
+        var j: u32 = @intCast(i);
+        while (j+1 < len) : (j += 1) objects.setArrayElement(array, j, objects.getArrayElement(array, j+1));
+        objects.arraySetLength(array, len-1);
+        objects.getObject(child).dom_parent = objects.NULL_OBJ;
+        objects.setProperty(child, values.internString("parentNode"), Value.NULL);
+        syncDomChildren(parent);
+        return true;
+    }
+    return false;
+}
+fn validDomPair(args: []const Value) bool {
+    if (args.len >= 2 and args[0].tag == .object and args[1].tag == .object and objects.getObject(args[0].data.obj_idx).dom_node and objects.getObject(args[1].data.obj_idx).dom_node) return true;
+    requestNativeThrow("DOM operation requires Node receivers"); return false;
+}
+fn domAppend(args: []const Value) Value {
+    if (!validDomPair(args)) return Value.UNDEFINED;
+    const parent = args[0].data.obj_idx;
+    const child = args[1].data.obj_idx;
+    var ancestor = parent;
+    while (ancestor != objects.NULL_OBJ) {
+        if (ancestor == child) { requestNativeThrow("Node cannot contain itself"); native_throw_name = "HierarchyRequestError"; return Value.UNDEFINED; }
+        ancestor = objects.getObject(ancestor).dom_parent;
+    }
+    const previous = objects.getObject(child).dom_parent;
+    if (previous != objects.NULL_OBJ) _ = detachDomChild(previous, child);
+    objects.arrayPush(objects.getObject(parent).dom_children, args[1]);
+    objects.getObject(child).dom_parent = parent;
+    objects.setProperty(child, values.internString("parentNode"), args[0]);
+    syncDomChildren(parent);
+    if (objects.getObject(child).dom_iframe and domConnected(child)) {
+        const load = objects.createFunction(N_DOM_FRAME_LOAD);
+        _ = enqueueTask(&.{ Value.function(load), Value.number(0), args[1] }, false, false);
+    }
+    return args[1];
+}
+fn domConnected(node: u32) bool {
+    var current = node;
+    while (current != objects.NULL_OBJ) {
+        if (current == dom_document_obj) return true;
+        current = objects.getObject(current).dom_parent;
+    }
+    return false;
+}
+fn domFrameLoad(args: []const Value) Value {
+    if (args.len == 0 or args[0].tag != .object or !objects.getObject(args[0].data.obj_idx).dom_iframe or !domConnected(args[0].data.obj_idx)) return Value.UNDEFINED;
+    const event = makeEvent(&.{Value.string(values.internString("load"))});
+    _ = eventDispatch(&.{ args[0], event });
+    return Value.UNDEFINED;
+}
+fn domRemove(args: []const Value) Value {
+    if (!validDomPair(args)) return Value.UNDEFINED;
+    if (objects.getObject(args[1].data.obj_idx).dom_parent != args[0].data.obj_idx or !detachDomChild(args[0].data.obj_idx, args[1].data.obj_idx)) {
+        requestNativeThrow("Node is not a child of this parent"); native_throw_name = "NotFoundError"; return Value.UNDEFINED;
+    }
+    return args[1];
+}
+fn makeEvent(args: []const Value) Value {
+    const event = objects.createObject();
+    const kind = if (args.len > 0) stringCtor(args[0..1]) else Value.string(values.internString(""));
+    if (callbackAborted()) return Value.UNDEFINED;
+    objects.setProperty(event, values.internString("type"), kind);
+    const options = if (args.len > 1 and args[1].tag == .object) args[1] else Value.UNDEFINED;
+    for ([_][]const u8{ "bubbles", "cancelable", "composed" }) |key| {
+        const value = if (options.tag == .object) objects.getProperty(options.data.obj_idx, values.internString(key)).isTruthy() else false;
+        objects.setProperty(event, values.internString(key), boolVal(value));
+    }
+    objects.setProperty(event, values.internString("defaultPrevented"), Value.FALSE);
+    objects.setProperty(event, values.internString("isTrusted"), Value.FALSE);
+    objects.setProperty(event, values.internString("target"), Value.NULL);
+    objects.setProperty(event, values.internString("currentTarget"), Value.NULL);
+    objects.setProperty(event, values.internString("eventPhase"), Value.number(0));
+    installNativeMethod(event, "preventDefault", N_EVENT_PREVENT);
+    installNativeMethod(event, "stopImmediatePropagation", N_EVENT_STOP_IMMEDIATE);
+    installNativeMethod(event, "stopPropagation", N_DOM_NOOP);
+    return Value.object(event);
+}
+fn eventPrevent(args: []const Value) Value {
+    if (args.len > 0 and args[0].tag == .object and objects.getProperty(args[0].data.obj_idx, values.internString("cancelable")).isTruthy())
+        objects.setProperty(args[0].data.obj_idx, values.internString("defaultPrevented"), Value.TRUE);
+    return Value.UNDEFINED;
+}
+fn eventStopImmediate(args: []const Value) Value {
+    if (args.len > 0 and args[0].tag == .object) events.stopImmediate(args[0].data.obj_idx);
+    return Value.UNDEFINED;
+}
+fn eventDispatch(args: []const Value) Value {
+    if (args.len < 2 or args[0].tag != .object or args[1].tag != .object) { requestNativeThrow("dispatchEvent requires an EventTarget and event"); return Value.UNDEFINED; }
+    const event = args[1].data.obj_idx;
+    const kind = objects.getProperty(event, values.internString("type"));
+    if (kind.tag != .string or values.getString(kind.data.str_idx).len == 0 or events.isDispatching(event)) { requestNativeThrow("Event is uninitialized or already dispatching"); return Value.UNDEFINED; }
+    if (!events.hasCapacity()) { requestRangeError("Event dispatch depth exceeded"); return Value.UNDEFINED; }
+    const invoke = invoke_callback orelse return Value.TRUE;
+    const aborted = callback_aborted orelse return Value.TRUE;
+    return boolVal(events.dispatch(args[0].data.obj_idx, event, invoke, aborted));
+}
+fn domClick(args: []const Value) Value {
+    if (args.len == 0 or args[0].tag != .object) { requestNativeThrow("click requires an element"); return Value.UNDEFINED; }
+    const target = args[0].data.obj_idx;
+    if (objects.getProperty(target, values.internString("disabled")).isTruthy() or events.isClicking(target)) return Value.UNDEFINED;
+    if (!events.enterClick(target)) { requestRangeError("Click dispatch depth exceeded"); return Value.UNDEFINED; }
+    defer events.leaveClick();
+    const event = makeEvent(&.{Value.string(values.internString("click"))});
+    objects.setProperty(event.data.obj_idx, values.internString("bubbles"), Value.TRUE);
+    objects.setProperty(event.data.obj_idx, values.internString("cancelable"), Value.TRUE);
+    _ = eventDispatch(&.{ args[0], event });
+    return Value.UNDEFINED;
 }
 
 fn makeOrientationEvent(args: []const Value) Value {
@@ -1545,7 +1958,8 @@ fn fnToStringNative(args: []const Value) Value {
 }
 
 pub fn nativeFunctionSource(value: Value) u32 {
-    const name = objects.getProperty(value.data.func_idx, values.internString("name"));
+    const stored = objects.getObject(value.data.func_idx).native_name;
+    const name = if (stored != objects.NULL_OBJ) Value.string(stored) else objects.getProperty(value.data.func_idx, values.internString("name"));
     const text = if (name.tag == .string) values.getString(name.data.str_idx) else "";
     var buf: [256]u8 = undefined;
     const prefix = "function ";
@@ -1567,13 +1981,9 @@ fn ttIdentity(args: []const Value) Value {
             dbg_tt_argfunc = if (last.tag == .function) objects.closureFuncId(last.data.obj_idx) else 0xFFFF;
         }
     }
-    // Find the last string argument (skip the prepended receiver).
-    var i: usize = args.len;
-    while (i > 0) {
-        i -= 1;
-        if (args[i].tag == .string) return args[i];
-    }
-    return Value.string(values.internString(""));
+    // WebIDL converts the first input, including objects/functions, before
+    // invoking the policy. Extra callback arguments must not replace it.
+    return stringCtor(&.{if (args.len > 1) args[1] else Value.UNDEFINED});
 }
 
 // ── Error constructors ──
@@ -1651,71 +2061,81 @@ fn toI64(n: f64) i64 {
     return @intFromFloat(@trunc(n));
 }
 
-var fromcharcode_buf: [16384]u8 = undefined;
+var fromcharcode_buf: [65536]u8 = undefined;
 fn strFromCharCode(args: []const Value) Value {
-    const buf = &fromcharcode_buf;
     var len: usize = 0;
-    // When invoked via `.call`/`.apply` the receiver is prepended as args[0];
-    // for the common static call String.fromCharCode(a,b,...) every arg is a
-    // char code. We treat all numeric args as codes; a non-numeric leading
-    // receiver (String function/undefined) yields code 0 which we skip below
-    // only if it's the receiver — but since BotGuard calls it plainly, just
-    // encode each arg's ToUint16 as a byte (low 8 bits; BotGuard uses ASCII).
     for (args) |a| {
-        if (a.tag != .number) continue; // skip non-numeric (e.g. receiver)
         const code = toU16(a.toNumber());
-        if (len < buf.len) { buf[len] = @intCast(code & 0xFF); len += 1; }
+        if (callbackAborted()) return Value.UNDEFINED;
+        const written = values.encodeCodeUnit(code, fromcharcode_buf[len..]);
+        if (written == 0) { requestRangeError("String.fromCharCode exceeds fixed capacity"); return Value.UNDEFINED; }
+        len += written;
     }
-    return Value.string(values.internString(buf[0..len]));
+    return Value.string(values.internString(fromcharcode_buf[0..len]));
 }
 
 fn strCharAt(args: []const Value) Value {
-    if (args.len < 2) return Value.string(values.internString(""));
-    if (args[0].tag != .string) return Value.string(values.internString(""));
-    const str = values.getString(args[0].data.str_idx);
-    const idx: usize = safeIndex(args[1].toNumber());
-    if (idx >= str.len) return Value.string(values.internString(""));
-    return Value.string(values.internString(str[idx .. idx + 1]));
+    if (args.len == 0) return Value.string(values.internString(""));
+    const index = if (args.len > 1) args[1].toNumber() else 0;
+    if (callbackAborted()) return Value.UNDEFINED;
+    if (index < 0 or index >= @as(f64, @floatFromInt(values.getStringUnitLength(args[0].data.str_idx)))) return Value.string(values.internString(""));
+    return Value.string(values.getStringUnit(args[0].data.str_idx, safeIndex(index)));
 }
 
 pub var dbg_source_n: usize = 0;
 pub var dbg_source_strings: [256]u32 = undefined;
 fn strCharCodeAt(args: []const Value) Value {
-    if (args.len < 2) return Value.number(@as(f64, @bitCast(@as(u64, 0x7FF8000000000000))));
-    const str = values.getString(if (args[0].tag == .string) args[0].data.str_idx else 0);
-    const idx: usize = if (args.len > 1) safeIndex(args[1].toNumber()) else 0;
-    if (idx == 0 and str.len >= 8 and dbg_source_n < 256) {
-        dbg_source_strings[dbg_source_n] = args[0].data.str_idx;
-        dbg_source_n += 1;
-    }
-    if (idx >= str.len) return Value.number(@as(f64, @bitCast(@as(u64, 0x7FF8000000000000))));
-    return Value.number(@floatFromInt(str[idx]));
+    if (args.len == 0) return Value.number(dateNaN());
+    const idx = args[0].data.str_idx;
+    const index = if (args.len > 1) args[1].toNumber() else 0;
+    if (callbackAborted()) return Value.UNDEFINED;
+    if (index < 0 or index >= @as(f64, @floatFromInt(values.getStringUnitLength(idx)))) return Value.number(dateNaN());
+    if (safeIndex(index) == 0 and values.getStringLen(idx) >= 8 and dbg_source_n < 256) { dbg_source_strings[dbg_source_n] = idx; dbg_source_n += 1; }
+    return if (values.getStringCodeUnit(idx, safeIndex(index))) |unit| Value.number(@floatFromInt(unit)) else Value.number(dateNaN());
 }
 
 fn strIndexOf(args: []const Value) Value {
-    if (args.len < 2) return Value.number(-1);
-    const haystack = values.getString(if (args[0].tag == .string) args[0].data.str_idx else 0);
-    const needle = values.getString(if (args[1].tag == .string) args[1].data.str_idx else 0);
-    if (needle.len == 0) return Value.number(0);
-    if (needle.len > haystack.len) return Value.number(-1);
-    for (0..haystack.len - needle.len + 1) |i| {
-        if (eql(haystack[i .. i + needle.len], needle)) return Value.number(@floatFromInt(i));
+    if (args.len == 0) return Value.number(-1);
+    const idx = args[0].data.str_idx;
+    const haystack = values.getString(idx);
+    const needle_value = stringCtor(&.{if (args.len > 1) args[1] else Value.UNDEFINED});
+    if (callbackAborted()) return Value.UNDEFINED;
+    const needle = values.getString(needle_value.data.str_idx);
+    const count = values.getStringUnitLength(idx);
+    const position = if (args.len > 2) toI64(args[2].toNumber()) else 0;
+    if (callbackAborted()) return Value.UNDEFINED;
+    const start: usize = @intCast(@min(@max(position, 0), @as(i64, @intCast(count))));
+    if (needle.len == 0) return Value.number(@floatFromInt(start));
+    for (start..count) |unit| {
+        const byte = values.stringUnitByteOffset(idx, unit);
+        if (needle.len <= haystack.len-byte and eql(haystack[byte..][0..needle.len], needle)) return Value.number(@floatFromInt(unit));
     }
     return Value.number(-1);
+}
+fn strSubstring(args: []const Value) Value {
+    if (args.len == 0) return Value.string(values.internString(""));
+    const idx = args[0].data.str_idx;
+    const count: i64 = @intCast(values.getStringUnitLength(idx));
+    const from = if (args.len > 1) toI64(args[1].toNumber()) else 0;
+    if (callbackAborted()) return Value.UNDEFINED;
+    const to = if (args.len > 2 and args[2].tag != .undefined) toI64(args[2].toNumber()) else count;
+    if (callbackAborted()) return Value.UNDEFINED;
+    const start = @min(@max(from, 0), count);
+    const end = @min(@max(to, 0), count);
+    return Value.string(values.sliceStringUnits(idx, @intCast(@min(start, end)), @intCast(@max(start, end))));
 }
 
 fn strSlice(args: []const Value) Value {
     if (args.len == 0) return Value.string(values.internString(""));
-    const str = values.getString(if (args[0].tag == .string) args[0].data.str_idx else 0);
-    const len_i: i64 = @intCast(str.len);
+    const idx = args[0].data.str_idx;
+    const len: i64 = @intCast(values.getStringUnitLength(idx));
     var start: i64 = if (args.len > 1) toI64(args[1].toNumber()) else 0;
-    var end: i64 = if (args.len > 2) toI64(args[2].toNumber()) else len_i;
-    if (start < 0) start = @max(len_i + start, 0);
-    if (end < 0) end = @max(len_i + end, 0);
-    if (start >= len_i or start >= end) return Value.string(values.internString(""));
-    const s: usize = @intCast(@min(start, len_i));
-    const e: usize = @intCast(@min(end, len_i));
-    return Value.string(values.internString(str[s..e]));
+    if (callbackAborted()) return Value.UNDEFINED;
+    var end: i64 = if (args.len > 2 and args[2].tag != .undefined) toI64(args[2].toNumber()) else len;
+    if (callbackAborted()) return Value.UNDEFINED;
+    start = if (start < 0) @max(len + start, 0) else @min(start, len);
+    end = if (end < 0) @max(len + end, 0) else @min(end, len);
+    return Value.string(values.sliceStringUnits(idx, @intCast(start), @intCast(@max(start, end))));
 }
 
 fn strSplit(args: []const Value) Value {
@@ -1731,7 +2151,7 @@ fn strSplit(args: []const Value) Value {
     if (!isRegexp(separator)) {
         const needle = values.getString(stringCtor(&.{separator}).data.str_idx);
         if (needle.len == 0) {
-            for (0..@min(text.len, limit)) |i| objects.arrayPush(arr, Value.string(values.internString(text[i..][0..1])));
+            for (0..@min(values.getStringUnitLength(text_val.data.str_idx), limit)) |i| objects.arrayPush(arr, Value.string(values.getStringUnit(text_val.data.str_idx, i)));
             return Value.object(arr);
         }
         var from: usize = 0; var scan: usize = 0;
@@ -1831,7 +2251,9 @@ fn strReplace(args: []const Value) Value {
             callback_args[m.n_captures + 1] = Value.number(@floatFromInt(start));
             callback_args[m.n_captures + 2] = text_val;
             const result = callback(replace_value, Value.UNDEFINED, callback_args[0..m.n_captures + 3]);
+            if (callbackAborted()) return Value.UNDEFINED;
             const literal = values.getString(stringCtor(&.{result}).data.str_idx);
+            if (callbackAborted()) return Value.UNDEFINED;
             if (!replaceAppend(&buf, &used, literal)) return replaceOverflow();
         } else if (!replaceSubstitution(&buf, &used, text, replacement, m)) return replaceOverflow();
         copied = end;
@@ -2073,7 +2495,7 @@ fn strConcat(args: []const Value) Value {
     var total: usize = 0;
     for (args, 0..) |arg, i| {
         parts[i] = keyNameIdx(arg);
-        if (native_throw) return Value.UNDEFINED;
+        if (native_throw or callbackAborted()) return Value.UNDEFINED;
         total += values.getStringLen(parts[i]);
         if (total > str_concat_buf.len) { requestNativeThrow("String concatenation exceeds fixed string capacity"); return Value.UNDEFINED; }
     }
@@ -2223,6 +2645,7 @@ fn arrSort(args: []const Value) Value {
             const comparison: f64 = if (args.len > 1 and args[1].tag == .function and invoke_callback != null)
                 invoke_callback.?(args[1], Value.UNDEFINED, &.{prev, cur}).toNumber()
             else @floatFromInt(defaultCompare(prev, cur));
+            if (callbackAborted()) return Value.UNDEFINED;
             if (comparison != comparison or comparison <= 0) break;
             objects.setArrayElement(oi, @intCast(j + 1), prev);
         }
@@ -2329,8 +2752,9 @@ fn objAssign(args: []const Value) Value {
 
 /// Number.prototype.toString([radix]) — args[0]=receiver number, args[1]=radix.
 fn numberToString(args: []const Value) Value {
-    if (args.len == 0) return Value.string(values.internString("0"));
-    const n = args[0].toNumber();
+    const value = numberValue(args);
+    if (native_throw) return Value.UNDEFINED;
+    const n = value.data.number;
     var radix: u32 = 10;
     if (args.len >= 2 and args[1].tag != .undefined) {
         const r = args[1].toNumber();
@@ -2437,78 +2861,78 @@ fn arrSplice(args: []const Value) Value {
 
 // Scratch buffer for Array.prototype.join. BotGuard assembles its VM payload
 // via [...].join('\n'), which can be tens of KB.
+// Shared fixed arena with a separate reservation for each active join. Guest
+// getters and ToString methods may invoke join again without overwriting an
+// outer prefix. Results are interned before the reservation is released.
 var join_buf: [512 * 1024]u8 = undefined;
-
-fn arrJoin(args: []const Value) Value {
-    // args[0] = receiver array; args[1] = optional separator (default ",").
-    if (args.len == 0) return Value.string(values.internString(""));
-    if (args[0].tag != .object and args[0].tag != .array) return Value.string(values.internString(""));
-    const arr_idx: u32 = args[0].data.obj_idx;
-    const len = objects.arrayLength(arr_idx);
-
-    var sep: []const u8 = ",";
-    if (args.len >= 2 and args[1].tag == .string) {
-        sep = values.getString(args[1].data.str_idx);
+var join_used: usize = 0;
+var join_receivers: [64]u32 = undefined;
+var join_depth: usize = 0;
+fn arrToString(args: []const Value) Value {
+    if (args.len == 0 or args[0].tag == .null_val or args[0].tag == .undefined) {
+        requestNativeThrow("Array.toString requires a non-null receiver"); return Value.UNDEFINED;
     }
-
-    var o: usize = 0;
-    var i: u32 = 0;
-    while (i < len) : (i += 1) {
-        if (i > 0) {
-            if (o + sep.len > join_buf.len) break;
-            @memcpy(join_buf[o .. o + sep.len], sep);
-            o += sep.len;
-        }
-        const el = objects.getArrayElement(arr_idx, i);
-        o = appendValueText(el, o);
+    const receiver = objectCtor(&.{args[0]});
+    const join = descriptorField(receiver, values.internString("join"));
+    if (native_throw or callbackAborted()) return Value.UNDEFINED;
+    if (join.tag == .function) {
+        if (invoke_callback) |invoke| return invoke(join, receiver, &.{});
+        requestNativeThrow("Array.toString callback requires the interpreter"); return Value.UNDEFINED;
     }
-    return Value.string(values.internString(join_buf[0..o]));
+    return callNative(N_OBJ_TOSTRING, &.{receiver}, 1);
 }
-
-/// Append a value's string form to join_buf at offset o; returns new offset.
-/// null/undefined join as empty (per JS Array.prototype.join semantics).
-fn appendValueText(v: Value, o_in: usize) usize {
-    var o = o_in;
-    switch (v.tag) {
-        .string => {
-            const s = values.getString(v.data.str_idx);
-            if (o + s.len <= join_buf.len) { @memcpy(join_buf[o .. o + s.len], s); o += s.len; }
-        },
-        .number => {
-            var nb: [32]u8 = undefined;
-            const nl = numberToText(v.data.number, &nb);
-            if (o + nl <= join_buf.len) { @memcpy(join_buf[o .. o + nl], nb[0..nl]); o += nl; }
-        },
-        .boolean => {
-            const s = if (v.data.boolean != 0) "true" else "false";
-            if (o + s.len <= join_buf.len) { @memcpy(join_buf[o .. o + s.len], s); o += s.len; }
-        },
-        .undefined, .null_val => {}, // empty
-        else => {},
+fn arrJoin(args: []const Value) Value {
+    if (args.len == 0 or args[0].tag == .undefined or args[0].tag == .null_val) {
+        requestNativeThrow("Array.join requires a non-null receiver"); return Value.UNDEFINED;
     }
-    return o;
+    const receiver = args[0];
+    const object = objectValue(receiver);
+    const string = receiver.tag == .string;
+    const count: f64 = if (string) @floatFromInt(values.getStringUnitLength(receiver.data.str_idx))
+        else if (object and objects.objTypeOf(receiver.data.obj_idx) == .array) @floatFromInt(objects.arrayLength(receiver.data.obj_idx))
+        else if (object) descriptorField(receiver, values.internString("length")).toNumber() else 0;
+    if (native_throw or callbackAborted()) return Value.UNDEFINED;
+    const length: usize = if (count != count or count <= 0) 0 else blk: {
+        if (count > objects.MAX_ARRAY_ELEMENTS) { requestRangeError("Array.join length exceeds fixed capacity"); return Value.UNDEFINED; }
+        break :blk @intFromFloat(@floor(count));
+    };
+    const separator_value = if (args.len < 2 or args[1].tag == .undefined) Value.string(values.internString(",")) else stringCtor(&.{args[1]});
+    if (native_throw or callbackAborted()) return Value.UNDEFINED;
+    const separator = values.getString(separator_value.data.str_idx);
+    if (object) for (join_receivers[0..join_depth]) |active| {
+        if (active == receiver.data.obj_idx) return Value.string(values.internString(""));
+    };
+    if (join_depth == join_receivers.len) { requestRangeError("Array.join nesting exceeds fixed capacity"); return Value.UNDEFINED; }
+    const start = join_used;
+    join_receivers[join_depth] = if (object) receiver.data.obj_idx else objects.NULL_OBJ;
+    join_depth += 1;
+    defer { join_used = start; join_depth -= 1; }
+    for (0..length) |i| {
+        if (i > 0 and !joinAppend(separator)) return Value.UNDEFINED;
+        const element = if (string) Value.string(values.getStringUnit(receiver.data.str_idx, i))
+            else if (!objects.getObject(receiver.data.obj_idx).is_arguments and objects.hasArrayElement(receiver.data.obj_idx, @intCast(i))) objects.getArrayElement(receiver.data.obj_idx, @intCast(i))
+            else blk: {
+                var key_buf: [16]u8 = undefined;
+                const key = std.fmt.bufPrint(&key_buf, "{d}", .{i}) catch unreachable;
+                break :blk descriptorField(receiver, values.internString(key));
+            };
+        if (native_throw or callbackAborted()) return Value.UNDEFINED;
+        if (element.tag == .undefined or element.tag == .null_val) continue;
+        const text = stringCtor(&.{element});
+        if (native_throw or callbackAborted()) return Value.UNDEFINED;
+        if (!joinAppend(values.getString(text.data.str_idx))) return Value.UNDEFINED;
+    }
+    return Value.string(values.internString(join_buf[start..join_used]));
+}
+fn joinAppend(text: []const u8) bool {
+    if (text.len > join_buf.len - join_used) { requestRangeError("Array.join exceeds fixed string capacity"); return false; }
+    @memcpy(join_buf[join_used..][0..text.len], text);
+    join_used += text.len;
+    return true;
 }
 
 /// Minimal integer/float formatting for join (BotGuard values are integers).
-fn numberToText(n: f64, buf: *[32]u8) usize {
-    if (n != n) { @memcpy(buf[0..3], "NaN"); return 3; }
-    if (n == 0) { buf[0] = '0'; return 1; }
-    var len: usize = 0;
-    var val = n;
-    if (val < 0) { buf[0] = '-'; len = 1; val = -val; }
-    if (val >= 1.8e19) val = 0; // beyond u64 range — degrade gracefully
-    const int_part: u64 = @intFromFloat(@floor(val));
-    var digits: [20]u8 = undefined;
-    var d: usize = 0;
-    var tmp = int_part;
-    if (tmp == 0) { digits[0] = '0'; d = 1; } else {
-        while (tmp > 0) : (d += 1) { digits[d] = @intCast((tmp % 10) + '0'); tmp /= 10; }
-    }
-    var k: usize = 0;
-    while (k < d) : (k += 1) { buf[len + k] = digits[d - 1 - k]; }
-    len += d;
-    return len;
-}
+fn numberToText(n: f64, buf: *[32]u8) usize { return values.numberToString(n, buf); }
 
 fn arrIncludes(args: []const Value) Value {
     if (args.len < 2) return Value.FALSE;
@@ -2627,6 +3051,14 @@ fn safeLen(n: f64) u32 {
 pub var dbg_window_names_on: bool = false;
 pub var dbg_window_names_n: usize = 0;
 pub var dbg_window_names: [4096]u32 = undefined;
+pub var dbg_own_names_on: bool = false;
+pub var dbg_own_names_n: usize = 0;
+pub var dbg_own_names: [256]u32 = undefined;
+fn recordOwnNames(result: u32) void {
+    if (!dbg_own_names_on or dbg_own_names_n == dbg_own_names.len) return;
+    dbg_own_names[dbg_own_names_n] = result;
+    dbg_own_names_n += 1;
+}
 fn objOwnNames(args: []const Value) Value {
     if (args.len < 2 or args[1].tag == .null_val or args[1].tag == .undefined) {
         requestNativeThrow("Cannot convert undefined or null to object");
@@ -2635,7 +3067,7 @@ fn objOwnNames(args: []const Value) Value {
     var keys: [4096]u32 = undefined;
     const input = args[1];
     const count = if (input.tag == .object or input.tag == .array or input.tag == .function) objects.enumerateOwnKeys(input.data.obj_idx, &keys, false) else 0;
-    if (input.tag == .object and input.data.obj_idx == g_global_obj) {
+    if (input.tag == .object and objects.getObject(input.data.obj_idx).dom_window) {
         const result = objects.createArray(0);
         for (browser_metadata.window_names) |name| {
             const key = values.internString(name);
@@ -2650,10 +3082,12 @@ fn objOwnNames(args: []const Value) Value {
             dbg_window_names_n = @min(objects.arrayLength(result), dbg_window_names.len);
             for (0..dbg_window_names_n) |i| dbg_window_names[i] = objects.getArrayElement(result, @intCast(i)).data.str_idx;
         }
+        recordOwnNames(result);
         return Value.object(result);
     }
     const result = objects.createArray(@intCast(count));
     for (keys[0..count], 0..) |key, i| objects.setArrayElement(result, @intCast(i), Value.string(key));
+    recordOwnNames(result);
     return Value.object(result);
 }
 
@@ -2709,18 +3143,32 @@ fn nIsFinite(args: []const Value) Value {
 // was wrong (16368 instead of ~58704), making the interpreter break early on the
 // first computed jump past 16368. Size generously for the full program.
 var atob_buf: [65536]u8 = undefined;
+var atob_text: [131072]u8 = undefined;
 fn nAtob(args: []const Value) Value {
     if (args.len == 0) return Value.string(values.internString(""));
-    const str = values.getString(if (args[0].tag == .string) args[0].data.str_idx else 0);
-    const len = base64Decode(str, atob_buf[0..]);
-    return Value.string(values.internString(atob_buf[0..len]));
+    const str = values.getString(stringCtor(args[0..1]).data.str_idx);
+    if (callbackAborted()) return Value.UNDEFINED;
+    const len = base64Decode(str, &atob_buf);
+    if (native_throw) return Value.UNDEFINED;
+    var used: usize = 0;
+    for (atob_buf[0..len]) |byte| used += values.encodeCodeUnit(byte, atob_text[used..]);
+    return Value.string(values.internString(atob_text[0..used]));
 }
 
-var btoa_buf: [24576]u8 = undefined;
+var btoa_buf: [131072]u8 = undefined;
+var btoa_bytes: [65536]u8 = undefined;
 fn nBtoa(args: []const Value) Value {
     if (args.len == 0) return Value.string(values.internString(""));
-    const str = values.getString(if (args[0].tag == .string) args[0].data.str_idx else 0);
-    const len = base64Encode(str, &btoa_buf);
+    const idx = stringCtor(args[0..1]).data.str_idx;
+    if (callbackAborted()) return Value.UNDEFINED;
+    const count = values.getStringUnitLength(idx);
+    if (count > btoa_bytes.len) { requestRangeError("btoa exceeds fixed capacity"); return Value.UNDEFINED; }
+    for (0..count) |i| {
+        const unit = values.getStringCodeUnit(idx, i).?;
+        if (unit > 255) { requestNativeThrow("The string to be encoded contains characters outside of the Latin1 range"); native_throw_name = "InvalidCharacterError"; return Value.UNDEFINED; }
+        btoa_bytes[i] = @intCast(unit);
+    }
+    const len = base64Encode(btoa_bytes[0..count], &btoa_buf);
     return Value.string(values.internString(btoa_buf[0..len]));
 }
 
@@ -2733,22 +3181,81 @@ fn dateNow() Value {
 
 fn dateNaN() f64 { return @bitCast(@as(u64, 0x7FF8000000000000)); }
 
-fn dateLocalPart(args: []const Value, func_id: u16) Value {
-    if (args.len == 0 or args[0].tag != .object or objects.objTypeOf(args[0].data.obj_idx) != .date) return Value.number(dateNaN());
-    const ms = objects.getObject(args[0].data.obj_idx).date_value;
-    // FILETIME covers the Windows calendar range; reject invalid/outside dates
-    // before integer conversion instead of overflowing caller storage.
-    if (ms != ms or ms < -11644473600000 or ms > 9e14) return Value.number(dateNaN());
+fn dateParts(ms: f64, utc: *SystemTime, local: *SystemTime) bool {
+    if (ms != ms or ms < -11644473600000 or ms > 9e14) return false;
     const ticks: u64 = @intFromFloat((ms + 11644473600000) * 10000);
     const ft = FileTime{ .low = @truncate(ticks), .high = @truncate(ticks >> 32) };
+    return FileTimeToSystemTime(&ft, utc) != 0 and SystemTimeToTzSpecificLocalTime(null, utc, local) != 0;
+}
+
+fn dateOffset(utc: SystemTime, local: SystemTime) i64 {
+    const day_delta = dateDays(utc.year, utc.month, utc.day) - dateDays(local.year, local.month, local.day);
+    return day_delta * 1440 + @as(i64, utc.hour) * 60 + utc.minute - @as(i64, local.hour) * 60 - local.minute;
+}
+
+fn datePad(buf: []u8, cursor: *usize, value: u32, width: usize) void {
+    var n = value;
+    var i = width;
+    while (i > 0) { i -= 1; buf[cursor.* + i] = @intCast('0' + n % 10); n /= 10; }
+    cursor.* += width;
+}
+
+/// Local Date string from the OS calendar and zone, with no locale/runtime
+/// dependency. Date() and Date.prototype.toString share the same conversion.
+fn dateString(value: Value) Value {
+    if (value.tag != .object or objects.objTypeOf(value.data.obj_idx) != .date) {
+        requestNativeThrow("Method Date.prototype.toString called on incompatible receiver");
+        return Value.UNDEFINED;
+    }
+    return dateStringFromTime(objects.getObject(value.data.obj_idx).number_value);
+}
+
+fn dateStringFromTime(ms: f64) Value {
     var utc: SystemTime = undefined;
     var local: SystemTime = undefined;
-    if (FileTimeToSystemTime(&ft, &utc) == 0 or SystemTimeToTzSpecificLocalTime(null, &utc, &local) == 0) return Value.number(dateNaN());
+    if (!dateParts(ms, &utc, &local)) return Value.string(values.internString("Invalid Date"));
+    var buf: [192]u8 = undefined;
+    var n: usize = 0;
+    const weekdays = "SunMonTueWedThuFriSat";
+    const months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    @memcpy(buf[n..][0..3], weekdays[@as(usize, local.weekday) * 3..][0..3]); n += 3; buf[n] = ' '; n += 1;
+    @memcpy(buf[n..][0..3], months[@as(usize, local.month - 1) * 3..][0..3]); n += 3; buf[n] = ' '; n += 1;
+    datePad(&buf, &n, local.day, 2); buf[n] = ' '; n += 1;
+    datePad(&buf, &n, local.year, 4); buf[n] = ' '; n += 1;
+    datePad(&buf, &n, local.hour, 2); buf[n] = ':'; n += 1;
+    datePad(&buf, &n, local.minute, 2); buf[n] = ':'; n += 1;
+    datePad(&buf, &n, local.second, 2);
+    @memcpy(buf[n..][0..4], " GMT"); n += 4;
+    const offset = dateOffset(utc, local);
+    buf[n] = if (offset <= 0) '+' else '-'; n += 1;
+    const magnitude: u32 = @intCast(if (offset < 0) -offset else offset);
+    datePad(&buf, &n, magnitude / 60, 2); datePad(&buf, &n, magnitude % 60, 2);
+    var zone: TimeZoneInformation = undefined;
+    if (GetTimeZoneInformation(&zone) != 0xFFFFFFFF) {
+        const zone_name = if (offset == @as(i64, zone.bias) + zone.daylight_bias and zone.daylight_date.month != 0) zone.daylight_name else zone.standard_name;
+        if (zone_name[0] != 0) {
+            buf[n] = ' '; buf[n+1] = '('; n += 2;
+            for (zone_name) |c| {
+                if (c == 0) break;
+                if (c < 128) { buf[n] = @intCast(c); n += 1; }
+                else if (c < 2048) { buf[n] = @intCast(192 | (c >> 6)); buf[n+1] = @intCast(128 | (c & 63)); n += 2; }
+                else { buf[n] = @intCast(224 | (c >> 12)); buf[n+1] = @intCast(128 | ((c >> 6) & 63)); buf[n+2] = @intCast(128 | (c & 63)); n += 3; }
+            }
+            buf[n] = ')'; n += 1;
+        }
+    }
+    return Value.string(values.internString(buf[0..n]));
+}
+
+fn dateLocalPart(args: []const Value, func_id: u16) Value {
+    if (args.len == 0 or args[0].tag != .object or objects.objTypeOf(args[0].data.obj_idx) != .date) return Value.number(dateNaN());
+    const ms = objects.getObject(args[0].data.obj_idx).number_value;
+    var utc: SystemTime = undefined;
+    var local: SystemTime = undefined;
+    if (!dateParts(ms, &utc, &local)) return Value.number(dateNaN());
     if (func_id == N_DATE_HOURS) return Value.number(@floatFromInt(local.hour));
     if (func_id == N_DATE_MINUTES) return Value.number(@floatFromInt(local.minute));
-    const day_delta = dateDays(utc.year, utc.month, utc.day) - dateDays(local.year, local.month, local.day);
-    const offset = day_delta * 1440 + @as(i64, utc.hour) * 60 + utc.minute - @as(i64, local.hour) * 60 - local.minute;
-    return Value.number(@floatFromInt(offset));
+    return Value.number(@floatFromInt(dateOffset(utc, local)));
 }
 
 fn dateDigits(text: []const u8, start: usize, count: usize) ?i64 {
@@ -2820,23 +3327,33 @@ pub fn constructDate(args: []const Value) Value {
     return Value.object(objects.createDate(clipped, date_proto));
 }
 
-// performance.now(): a SMALL, monotonically-increasing millisecond value
-// relative to "page load" (starts near 0). BotGuard's interpreter clock is
-// `this.wM + performance.now()` and it debits a per-instruction time budget
-// (register fields fi/Ci). If this returned the Date epoch (~1.7e12) the budget
-// arithmetic exploded and the timing-gate `pM` took the wrong branch (skipping
-// opcode-handler installs), which broke live challenges. A small advancing
-// value keeps the budget in the same regime V8 sees (verified: V8 with
-// performance.now()=>~0 still mints a valid response). We advance by a tiny
-// fixed step per call so elapsed-time deltas are ~0 but strictly monotonic.
+// Milliseconds since environment initialization, measured by the monotonic
+// Windows performance counter. The deterministic clock is an explicit debug
+// option; the small increment is also a fallback when the counter is unavailable.
+pub var dbg_deterministic_clock: bool = false;
 var perf_now_ms: f64 = 0;
+var perf_counter_start: i64 = 0;
+var perf_counter_frequency: i64 = 0;
+pub var performance_time_origin: f64 = 0;
 fn perfNow() Value {
+    if (!dbg_deterministic_clock and perf_counter_frequency > 0) {
+        var now: i64 = 0;
+        if (QueryPerformanceCounter(&now) != 0) {
+            const elapsed = @as(f64, @floatFromInt(now - perf_counter_start)) * 1000 / @as(f64, @floatFromInt(perf_counter_frequency));
+            perf_now_ms = @max(perf_now_ms, elapsed);
+            return Value.number(perf_now_ms);
+        }
+    }
     const v = perf_now_ms;
     perf_now_ms += 0.005; // 5µs per call — monotonic, negligible elapsed
     return Value.number(v);
 }
 pub fn resetPerfNow() void {
     perf_now_ms = 0;
+    performance_time_origin = dateNow().toNumber();
+    perf_counter_frequency = 0;
+    _ = QueryPerformanceFrequency(&perf_counter_frequency);
+    _ = QueryPerformanceCounter(&perf_counter_start);
 }
 
 fn textEncode(args: []const Value) Value {
@@ -2865,18 +3382,22 @@ fn textDecode(args: []const Value) Value {
 }
 
 fn cryptoRandom(args: []const Value) Value {
-    // crypto.getRandomValues(arr)
-    if (args.len == 0) return Value.UNDEFINED;
-    if (args[0].tag != .object and args[0].tag != .array) return args[0];
-    const obj_idx: u32 = args[0].data.obj_idx;
-    const len = objects.arrayLength(obj_idx);
-    for (0..len) |i| {
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
-        objects.setArrayElement(obj_idx, @intCast(i), Value.number(@floatFromInt(rng_state & 0xFF)));
+    // Method calls prepend the Crypto receiver. Fill the actual integer view,
+    // preserving its identity, offset, aliasing and the full element width.
+    if (args.len == 0) { requestNativeThrow("getRandomValues requires an integer typed array"); return Value.UNDEFINED; }
+    const view = args[args.len - 1];
+    if (view.tag != .object or objects.objTypeOf(view.data.obj_idx) != .typed_array) {
+        requestNativeThrow("getRandomValues requires an integer typed array");
+        return Value.UNDEFINED;
     }
-    return args[0];
+    const object = objects.getObject(view.data.obj_idx);
+    if (object.byte_length > 65536) { requestNativeThrow("getRandomValues exceeds 65536 bytes"); native_throw_name = "QuotaExceededError"; return Value.UNDEFINED; }
+    const bytes = objects.getBufferBytes(object.buffer_id)[object.byte_offset..][0..object.byte_length];
+    if (bytes.len > 0 and BCryptGenRandom(null, bytes.ptr, @intCast(bytes.len), 2) < 0) {
+        requestNativeThrow("System random source failed");
+        return Value.UNDEFINED;
+    }
+    return view;
 }
 
 fn createTypedArrayN(args: []const Value, elem_size: u8) Value {
@@ -2886,6 +3407,21 @@ fn createTypedArrayN(args: []const Value, elem_size: u8) Value {
     } else if (args.len > 0 and (args[0].tag == .object or args[0].tag == .array)) {
         // new Uint8Array(existingArray) — copy its elements.
         const src: u32 = args[0].data.obj_idx;
+        if (objects.objTypeOf(src) == .array_buffer) {
+            const size = objects.getObject(src).byte_length;
+            const offset = if (args.len > 1) safeLen(args[1].toNumber()) else 0;
+            if (offset > size or offset % elem_size != 0 or (args.len < 3 and (size - offset) % elem_size != 0)) {
+                requestRangeError("Invalid typed array view");
+                return Value.UNDEFINED;
+            }
+            const count = if (args.len > 2) safeLen(args[2].toNumber()) else (size - offset) / elem_size;
+            const view = objects.createTypedArray(src, offset, count, elem_size);
+            if (view == objects.NULL_OBJ) {
+                requestRangeError("Typed array view exceeds buffer");
+                return Value.UNDEFINED;
+            }
+            return Value.object(view);
+        }
         const slen = @min(objects.arrayLength(src), 100000);
         const buf2 = objects.createArrayBuffer(slen * elem_size);
         const ta2 = objects.createTypedArray(buf2, 0, slen, elem_size);
@@ -3003,19 +3539,30 @@ fn base64Encode(data: []const u8, out: []u8) usize {
 }
 
 fn base64Decode(data: []const u8, out: []u8) usize {
-    const cap = out.len;
-    var o: usize = 0;
-    var i: usize = 0;
-    while (i + 3 < data.len and o + 3 <= cap) : (i += 4) {
-        const a = b64Val(data[i]);
-        const b = b64Val(data[i + 1]);
-        const c = b64Val(data[i + 2]);
-        const d = b64Val(data[i + 3]);
-        out[o] = (a << 2) | (b >> 4); o += 1;
-        if (data[i + 2] != '=') { out[o] = (b << 4) | (c >> 2); o += 1; }
-        if (data[i + 3] != '=') { out[o] = (c << 6) | d; o += 1; }
+    var symbols: usize = 0; var padding: usize = 0;
+    for (data) |ch| {
+        if (ch == 9 or ch == 10 or ch == 12 or ch == 13 or ch == 32) continue;
+        if (ch == '=') { padding += 1; continue; }
+        if (padding > 0 or !((ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '+' or ch == '/')) return invalidBase64();
+        symbols += 1;
     }
-    return o;
+    const remainder = symbols % 4;
+    if (remainder == 1 or padding > 2 or (padding > 0 and ((symbols + padding) % 4 != 0 or (padding == 1 and remainder != 3) or (padding == 2 and remainder != 2)))) return invalidBase64();
+    const needed = symbols / 4 * 3 + (if (remainder == 2) @as(usize, 1) else if (remainder == 3) @as(usize, 2) else @as(usize, 0));
+    if (needed > out.len) { requestRangeError("atob exceeds fixed binary capacity"); return 0; }
+    var carry: u32 = 0; var bits: u5 = 0; var used: usize = 0;
+    for (data) |ch| {
+        if (ch == '=' or ch == 9 or ch == 10 or ch == 12 or ch == 13 or ch == 32) continue;
+        carry = (carry << 6) | b64Val(ch); bits += 6;
+        if (bits >= 8) { bits -= 8; out[used] = @truncate(carry >> bits); used += 1; }
+        carry &= (@as(u32, 1) << bits) - 1;
+    }
+    return used;
+}
+fn invalidBase64() usize {
+    requestNativeThrow("The string to be decoded is not correctly encoded");
+    native_throw_name = "InvalidCharacterError";
+    return 0;
 }
 
 fn b64Val(c: u8) u8 {
@@ -3031,17 +3578,49 @@ fn b64Val(c: u8) u8 {
 
 pub fn installNativeMethod(obj: u32, name: []const u8, func_id: u16) void {
     const func_obj = objects.createFunction(func_id);
-    objects.setProperty(func_obj, values.internString("name"), Value.string(values.internString(name)));
-    objects.setEnumerable(func_obj, values.internString("name"), false);
+    setNativeFunctionMetadata(func_obj, name, nativeArity(func_id));
     objects.setProperty(obj, values.internString(name), Value.function(func_obj));
     objects.setEnumerable(obj, values.internString(name), false);
 }
 
 fn installNativeGlobal(global: u32, name: []const u8, func_id: u16) void {
     const func_obj = objects.createFunction(func_id);
-    objects.setProperty(func_obj, values.internString("name"), Value.string(values.internString(name)));
-    objects.setEnumerable(func_obj, values.internString("name"), false);
+    setNativeFunctionMetadata(func_obj, name, nativeArity(func_id));
     objects.setProperty(global, values.internString(name), Value.function(func_obj));
+}
+pub fn setNativeFunctionMetadata(function: u32, name: []const u8, arity: u8) void {
+    objects.getObject(function).native_name = values.internString(name);
+    for ([_][]const u8{"length", "name"}) |key_text| {
+        const key = values.internString(key_text);
+        objects.defineLiteralProperty(function, key, if (eql(key_text, "length")) Value.number(@floatFromInt(arity)) else Value.string(values.internString(name)), 0);
+        objects.setEnumerable(function, key, false);
+        objects.setWritable(function, key, false);
+    }
+}
+fn nativeArity(id: u16) u8 {
+    return switch (id) {
+        N_DATE_CTOR => 7,
+        N_OBJ_DEFINE_PROP, N_JSON_STRINGIFY, N_UINT8_ARRAY, N_UINT16_ARRAY, N_UINT32_ARRAY, N_INT8_ARRAY, N_DATA_VIEW => 3,
+        N_MATH_MIN, N_MATH_MAX, N_MATH_POW, N_MATH_IMUL, N_MATH_ATAN2, N_PARSE_INT,
+        N_STR_SLICE, N_STR_SUBSTRING, N_STR_SPLIT, N_STR_REPLACE, N_JSON_PARSE,
+        N_ARR_SPLICE, N_ARR_SLICE, N_OBJ_ASSIGN, N_OBJ_CREATE, N_OBJ_GET_OWN_DESC,
+        N_REGEXP_CTOR, N_PROXY_CONSTRUCTOR, N_FN_APPLY, N_EVENT_ADD, N_EVENT_REMOVE => 2,
+        N_MATH_FLOOR, N_MATH_CEIL, N_MATH_ROUND, N_MATH_ABS, N_MATH_LOG, N_MATH_SQRT,
+        N_MATH_SIGN, N_MATH_TRUNC, N_MATH_CLZ32, N_MATH_FROUND, N_PARSE_FLOAT, N_IS_NAN, N_IS_FINITE,
+        N_ENCODE_URI, N_DECODE_URI, N_ATOB, N_BTOA, N_SET_TIMEOUT, N_SET_INTERVAL, N_CLEAR_TIMEOUT,
+        N_STR_FROM_CHARCODE, N_STR_CHAR_AT, N_STR_CHAR_CODE_AT, N_STR_INDEX_OF, N_STR_INCLUDES,
+        N_STR_STARTS_WITH, N_STR_ENDS_WITH, N_STR_REPEAT, N_STR_CONCAT, N_STR_MATCH, N_STR_PAD_START, N_STR_PAD_END,
+        N_ARR_PUSH, N_ARR_UNSHIFT, N_ARR_INDEX_OF, N_ARR_JOIN, N_ARR_SORT, N_ARR_CONCAT,
+        N_ARR_INCLUDES, N_ARR_FIND, N_ARR_MAP, N_ARR_FILTER, N_ARR_REDUCE, N_ARR_FOR_EACH,
+        N_ARR_FILL, N_ARR_FLAT, N_ARR_FROM, N_ARR_IS_ARRAY, N_ARR_SOME, N_ARR_EVERY,
+        N_ARRAY_CTOR, N_OBJ_KEYS, N_OBJ_VALUES, N_OBJ_ENTRIES, N_OBJ_HAS_OWN, N_OBJ_FREEZE,
+        N_OBJ_GET_PROTO, N_OBJ_IS_PROTO_OF, N_OBJ_PROP_IS_ENUM, N_OBJ_OWN_NAMES, N_OBJ_IS_FROZEN,
+        N_NUMBER_IS_INTEGER, N_NUMBER_IS_FINITE, N_STRING_CTOR, N_OBJECT_CTOR, N_NUMBER_CTOR,
+        N_BOOLEAN_CTOR, N_ARRAY_BUFFER, N_ERROR_CTOR, N_REFERROR_CTOR, N_TYPEERROR_CTOR,
+        N_REGEXP_EXEC, N_REGEXP_TEST, N_NUMBER_TO_STRING, N_FN_CALL, N_FN_BIND,
+        N_SYMBOL, N_EVAL, N_FUNCTION, N_EVENT_DISPATCH, N_EVENT_CTOR => 1,
+        else => 0,
+    };
 }
 
 fn boolVal(b: bool) Value {

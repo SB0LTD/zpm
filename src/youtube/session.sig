@@ -1,9 +1,8 @@
 // @zpm/youtube/session — Browser-like YouTube Session (Layer 1)
 //
-// Establishes a genuine, cookied YouTube visitor session in pure Sig — the
-// missing piece that lets BotGuard's GenerateIT issue a NON-null integrity
-// token (a headless Create->GenerateIT replay, even in real Chrome, returns
-// [null,ttl,null,fallback]; the token is gated on a real visitor session).
+// Establishes a cookied visitor session and exchanges native BotGuard proofs.
+// A non-null Create integrity token alone does not guarantee playback access;
+// homepage proofs are preferred and SABR reports the server's protection verdict.
 //
 // Flow (mirrors what a browser does on first load of youtube.com):
 //   1. GET https://www.youtube.com/  with a Chrome UA and a fresh cookie jar.
@@ -52,6 +51,8 @@ pub const Session = struct {
     signature_timestamp: u32 = 0,
     player_url: [512]u8 = undefined,
     player_url_len: usize = 0,
+    event_id: [256]u8 = undefined,
+    event_id_len: usize = 0,
     bootstrapped: bool = false,
 
     pub fn init() Session {
@@ -112,6 +113,13 @@ pub fn bootstrap(sess: *Session, chal: *challenge.Challenge) bool {
     extractClientVersion(resp.body, sess);
     extractPlayerUrl(resp.body, sess);
     sess.signature_timestamp = findJsonUint(resp.body, "\"STS\"") orelse 0;
+    sess.event_id_len = 0;
+    if (findStrVal(resp.body, "\"EVENT_ID\"")) |event| {
+        if (event.len <= sess.event_id.len) {
+            @memcpy(sess.event_id[0..event.len], event);
+            sess.event_id_len = event.len;
+        }
+    }
     print("  [session] visitorData="); printNum(sess.visitor_data_len);
     print(" clientVersion='"); print(sess.clientVersion()); print("'\n");
 
@@ -524,26 +532,6 @@ pub fn generateITInSession(sess: *Session, bg_response: []const u8, out: *Integr
     const p2 = "\"]";
     @memcpy(git_body_buf[blen .. blen + p2.len], p2); blen += p2.len;
 
-    // Two GenerateIT endpoints exist and they are NOT interchangeable:
-    //   (A) jnn-pa.googleapis.com /$rpc/google.internal.waa.v1.Waa/GenerateIT
-    //       — the WAA gRPC-web endpoint. create-test uses this and gets a
-    //         NON-null integrity token.
-    //   (B) www.youtube.com/api/jnn/v1/GenerateIT — the first-party endpoint.
-    // Empirically (2026-10-11), with the live homepage challenge in a cookied
-    // visitor session, (A) returns the real token while (B) returns a null
-    // primary + fallback. So try (A) first (jar-threaded, WAA headers), then (B).
-    const waa_hdr = "Content-Type: application/json+protobuf\r\nX-Goog-Api-Key: " ++ WAA_API_KEY ++ "\r\nx-user-agent: grpc-web-javascript/0.1\r\n";
-    var waa_hdr_buf: [1024]u8 = undefined;
-    var wp: usize = 0;
-    wp = appendS(&waa_hdr_buf, wp, waa_hdr);
-    wp = appendS(&waa_hdr_buf, wp, visitorHeader(sess));
-    const resp_a = http.post("jnn-pa.googleapis.com", "/$rpc/google.internal.waa.v1.Waa/GenerateIT", waa_hdr_buf[0..wp], git_body_buf[0..blen], &sess.jar);
-    print("  [session] GenerateIT(waa) status="); printNum(resp_a.status);
-    print(" bytes="); printNum(resp_a.body.len); print("\n");
-    if (resp_a.body.len > 0) { print("  [session] GenerateIT(waa) raw: "); print(resp_a.body[0..@min(resp_a.body.len, 300)]); print("\n"); }
-    if (resp_a.ok and resp_a.body.len > 0 and storeGenerateIT(resp_a.body, out)) return true;
-
-    // Fallback to the first-party endpoint.
     var hdr_buf: [4096]u8 = undefined;
     var hp: usize = 0;
     hp = appendS(&hdr_buf, hp, "Content-Type: application/json+protobuf\r\nX-Goog-Api-Key: ");
@@ -560,8 +548,18 @@ pub fn generateITInSession(sess: *Session, bg_response: []const u8, out: *Integr
         print(resp.body[0..@min(resp.body.len, 400)]);
         print("\n");
     }
-    if (!resp.ok or resp.body.len == 0) return false;
-    return storeGenerateIT(resp.body, out);
+    if (resp.ok and resp.body.len > 0 and storeGenerateIT(resp.body, out)) return true;
+    // The first-party exchange is preferred for homepage challenges. Keep the
+    // WAA exchange as a bounded fallback for Create challenges.
+    const waa_hdr = "Content-Type: application/json+protobuf\r\nX-Goog-Api-Key: " ++ WAA_API_KEY ++ "\r\nx-user-agent: grpc-web-javascript/0.1\r\nOrigin: https://www.youtube.com\r\nReferer: https://www.youtube.com/\r\n";
+    var waa_hdr_buf: [1024]u8 = undefined;
+    var wp: usize = 0;
+    wp = appendS(&waa_hdr_buf, wp, waa_hdr);
+    wp = appendS(&waa_hdr_buf, wp, visitorHeader(sess));
+    const resp_a = http.post("jnn-pa.googleapis.com", "/$rpc/google.internal.waa.v1.Waa/GenerateIT", waa_hdr_buf[0..wp], git_body_buf[0..blen], &sess.jar);
+    print("  [session] GenerateIT(waa) status="); printNum(resp_a.status);
+    print(" bytes="); printNum(resp_a.body.len); print("\n");
+    return resp_a.ok and storeGenerateIT(resp_a.body, out);
 }
 
 /// Parse a GenerateIT response and store a valid primary token into `out`.
@@ -662,19 +660,24 @@ pub fn establishIntegrityToken(sess: *Session, chal: *challenge.Challenge, out: 
     if (!sess.bootstrapped) {
         if (!bootstrap(sess, chal)) return false;
     }
+    _ = jsvm.env.setYoutubeEventId(sess.event_id[0..sess.event_id_len]);
+    // Homepage challenges issue playback-capable proofs. A generic Create
+    // primary token alone does not prove that SABR will accept its attestation.
+    if (chal.program_len > 0 and executeChallenge(sess, chal, out)) return true;
+    out.* = .{};
 
-    // Use the WAA **Create** challenge — the only flow whose VM snapshot
-    // populates getMinter AND whose botguardResponse the server exchanges for a
-    // NON-null integrity token (proven by create-test on live, fresh challenges).
-    // The homepage `bgChallenge` and att/get challenges run the VM fine but their
-    // responses are refused by GenerateIT (null primary + fallback). Always fetch
-    // a fresh Create challenge here regardless of any homepage challenge captured
-    // during bootstrap.
+    // A fresh generic Create challenge can still provide a primary integrity
+    // token when the homepage challenge cannot be executed. Playback acceptance
+    // remains a separate SABR server verdict.
     chal.* = challenge.Challenge.init();
     if (!challenge.fetchCreate(chal)) {
         print("  [session] Create challenge fetch failed\n");
         return false;
     }
+    return executeChallenge(sess, chal, out);
+}
+
+fn executeChallenge(sess: *Session, chal: *challenge.Challenge, out: *IntegrityResult) bool {
     if (chal.script_len == 0 and chal.interpreter_url_len > 0) {
         print("  [session] fetching interpreter script ...\n");
         if (!challenge.fetchScript(chal)) {
@@ -682,7 +685,7 @@ pub fn establishIntegrityToken(sess: *Session, chal: *challenge.Challenge, out: 
             return false;
         }
     }
-    print("  [session] Create challenge program="); printNum(chal.program_len);
+    print("  [session] BotGuard challenge program="); printNum(chal.program_len);
     print(" script="); printNum(chal.script_len); print(" bytes\n");
 
     // Run the BotGuard VM to produce the botguardResponse (this also populates
@@ -703,20 +706,12 @@ pub fn establishIntegrityToken(sess: *Session, chal: *challenge.Challenge, out: 
     out.minter_ready = (signal.tag == .object or signal.tag == .array) and
         jsvm.objects.getArrayElement(signal.data.obj_idx, 0).tag == .function;
 
-    // Exchange the Create response for an integrity token via the WAA RPC
-    // (jnn-pa.googleapis.com GenerateIT) — the endpoint create-test uses to get
-    // a non-null token. This does not need the cookie jar (the proof is in the
-    // botguardResponse), matching the proven create-test path.
-    var itoken: [512]u8 = undefined;
-    var itoken_len: usize = 0;
-    if (!integrity.getToken(bg_response_buf[0..bg_len], &itoken, &itoken_len) or itoken_len == 0) {
+    // Exchange within the originating session, trying the first-party endpoint
+    // before the WAA fallback. Minter readiness and primary validity are distinct.
+    if (!generateITInSession(sess, bg_response_buf[0..bg_len], out)) {
         print("  [session] GenerateIT returned no primary token\n");
         return false;
     }
-    @memcpy(out.integrity_token[0..itoken_len], itoken[0..itoken_len]);
-    out.integrity_token_len = itoken_len;
-    out.valid = true;
-    out.ttl_secs = 43200;
     return true;
 }
 

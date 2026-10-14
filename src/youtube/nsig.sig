@@ -3,6 +3,9 @@ const cipher = @import("cipher.sig");
 const player_transform = @import("player_transform.sig");
 
 pub const MAX_NSIG_LEN: usize = 256;
+pub const Failure = player_transform.Failure;
+pub fn lastFailure() Failure { return player_transform.last_failure; }
+pub fn failureDetail() []const u8 { return player_transform.failure_detail; }
 
 /// Returns zero for unsupported source, VM failure, a player failure sentinel,
 /// or output overflow. The input is never silently truncated.

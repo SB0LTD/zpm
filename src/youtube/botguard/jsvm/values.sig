@@ -3,6 +3,68 @@
 // Defines the runtime value representation for the JS interpreter.
 // Uses a tagged union (NaN-boxing would be more efficient but less readable).
 // Fixed-size value pool — no heap allocator.
+const std = @import("std");
+
+/// ECMAScript Number::toString in base ten. Use shortest round-trip digits,
+/// then apply JS's decimal/exponent thresholds to a caller-provided buffer.
+/// Integer byte/index conversions stay on a small arithmetic fast path.
+pub fn numberToString(n: f64, buf: []u8) usize {
+    if (buf.len < 32) return 0;
+    if (n != n) { @memcpy(buf[0..3], "NaN"); return 3; }
+    if (n == 0) { buf[0] = '0'; return 1; }
+    const negative = n < 0;
+    const magnitude = if (negative) -n else n;
+    var used: usize = 0;
+    if (negative) { buf[0] = '-'; used = 1; }
+    if (magnitude == std.math.inf(f64)) { @memcpy(buf[used..][0..8], "Infinity"); return used + 8; }
+    if (magnitude <= 9007199254740991 and magnitude == @floor(magnitude)) {
+        var v: u64 = @intFromFloat(magnitude);
+        var digits: [16]u8 = undefined;
+        var count: usize = 0;
+        while (v > 0) : (v /= 10) { digits[count] = @intCast('0' + v % 10); count += 1; }
+        while (count > 0) { count -= 1; buf[used] = digits[count]; used += 1; }
+        return used;
+    }
+    var scratch: [32]u8 = undefined;
+    const scientific = std.fmt.bufPrint(&scratch, "{e}", .{magnitude}) catch return 0;
+    var digits: [24]u8 = undefined;
+    var count: usize = 0;
+    var at: usize = 0;
+    while (at < scientific.len and scientific[at] != 'e') : (at += 1) {
+        if (scientific[at] == '.') continue;
+        digits[count] = scientific[at]; count += 1;
+    }
+    at += 1;
+    var exponent_negative = false;
+    if (at < scientific.len and (scientific[at] == '-' or scientific[at] == '+')) { exponent_negative = scientific[at] == '-'; at += 1; }
+    var exponent: i32 = 0;
+    while (at < scientific.len) : (at += 1) exponent = exponent * 10 + scientific[at] - '0';
+    if (exponent_negative) exponent = -exponent;
+    if (exponent < -6 or exponent >= 21) {
+        buf[used] = digits[0]; used += 1;
+        if (count > 1) { buf[used] = '.'; used += 1; @memcpy(buf[used..][0..count-1], digits[1..count]); used += count-1; }
+        buf[used] = 'e'; used += 1;
+        buf[used] = if (exponent < 0) '-' else '+'; used += 1;
+        var e: u32 = @intCast(if (exponent < 0) -exponent else exponent);
+        var reversed: [3]u8 = undefined; var len: usize = 0;
+        while (e > 0) : (e /= 10) { reversed[len] = @intCast('0' + e % 10); len += 1; }
+        while (len > 0) { len -= 1; buf[used] = reversed[len]; used += 1; }
+        return used;
+    }
+    const point = exponent + 1;
+    if (point <= 0) {
+        buf[used] = '0'; buf[used+1] = '.'; used += 2;
+        var zeros = -point;
+        while (zeros > 0) : (zeros -= 1) { buf[used] = '0'; used += 1; }
+        @memcpy(buf[used..][0..count], digits[0..count]); return used + count;
+    }
+    var i: usize = 0;
+    while (i < @as(usize, @intCast(point)) or i < count) : (i += 1) {
+        if (i == point) { buf[used] = '.'; used += 1; }
+        buf[used] = if (i < count) digits[i] else '0'; used += 1;
+    }
+    return used;
+}
 
 /// Maximum number of live values in the VM at once.
 pub const MAX_VALUES: usize = 65536;
@@ -94,6 +156,12 @@ pub const Value = extern struct {
 var string_pool: [MAX_STRING_BYTES]u8 = undefined;
 var string_offsets: [MAX_STRINGS]u32 = undefined;
 var string_lengths: [MAX_STRINGS]u32 = undefined;
+var string_unit_lengths: [MAX_STRINGS]u32 = undefined;
+var string_checkpoint_starts: [MAX_STRINGS]u32 = undefined;
+// Non-ASCII strings index every 64 UTF-16 units. ASCII indexing stays O(1),
+// and arbitrary Unicode indexing scans at most 63 units, with no heap storage.
+var string_checkpoints: [MAX_STRING_BYTES / 64]u32 = undefined;
+var checkpoint_used: u32 = 0;
 // Zero means vacant, otherwise index + 1. At most 50% occupied.
 var string_hash_slots: [STRING_HASH_SLOTS]u32 = [_]u32{0} ** STRING_HASH_SLOTS;
 var n_strings: u32 = 0;
@@ -104,6 +172,34 @@ pub fn stringBytesUsed() u32 { return pool_used; }
 
 /// Intern a string, return its index.
 pub fn internString(text: []const u8) u32 {
+    // Canonical WTF-8 keeps each UTF-16 unit independently addressable,
+    // including lone surrogates. Astral UTF-8 input becomes two surrogate units.
+    // Normalize only when needed and stage into unused caller-owned arena space.
+    var scan: usize = 0;
+    while (scan < text.len) {
+        const before = scan;
+        const cp = readCodePoint(text, &scan);
+        if (cp > 0xFFFF or (cp >= 128 and scan == before + 1)) {
+            var used: usize = 0; var at: usize = 0;
+            while (at < text.len) {
+                const point = readCodePoint(text, &at);
+                if (point > 0xFFFF) {
+                    const shifted = point - 0x10000;
+                    const first = encodeCodeUnit(@intCast(0xD800 + (shifted >> 10)), string_pool[pool_used+used..]);
+                    if (first == 0) { exhausted = true; return 0; } used += first;
+                    const second = encodeCodeUnit(@intCast(0xDC00 + (shifted & 1023)), string_pool[pool_used+used..]);
+                    if (second == 0) { exhausted = true; return 0; } used += second;
+                } else {
+                    const len = encodeCodeUnit(@intCast(point), string_pool[pool_used+used..]);
+                    if (len == 0) { exhausted = true; return 0; } used += len;
+                }
+            }
+            return internCanonical(string_pool[pool_used..][0..used]);
+        }
+    }
+    return internCanonical(text);
+}
+fn internCanonical(text: []const u8) u32 {
     var hash: u32 = 2166136261;
     for (text) |c| hash = (hash ^ c) *% 16777619;
     var slot: usize = hash & (STRING_HASH_SLOTS - 1);
@@ -125,7 +221,21 @@ pub fn internString(text: []const u8) u32 {
     const idx = n_strings;
     string_offsets[idx] = pool_used;
     string_lengths[idx] = @intCast(text.len);
-    @memcpy(string_pool[pool_used .. pool_used + text.len], text);
+    if (string_pool[pool_used..].ptr != text.ptr) @memcpy(string_pool[pool_used .. pool_used + text.len], text);
+    var ascii = true;
+    for (text) |ch| if (ch >= 128) { ascii = false; break; };
+    string_checkpoint_starts[idx] = checkpoint_used;
+    if (ascii) string_unit_lengths[idx] = @intCast(text.len) else {
+        var at: usize = 0; var units: u32 = 0;
+        while (at < text.len) {
+            if (units > 0 and units % 64 == 0) {
+                if (checkpoint_used == string_checkpoints.len) { exhausted = true; return 0; }
+                string_checkpoints[checkpoint_used] = @intCast(at); checkpoint_used += 1;
+            }
+            _ = readCodePoint(text, &at); units += 1;
+        }
+        string_unit_lengths[idx] = units;
+    }
     pool_used += @intCast(text.len);
     n_strings += 1;
     string_hash_slots[slot] = idx + 1;
@@ -145,12 +255,67 @@ pub fn getStringLen(idx: u32) usize {
     if (idx >= n_strings) return 0;
     return string_lengths[idx];
 }
+pub fn getStringUnitLength(idx: u32) usize {
+    return if (idx < n_strings) string_unit_lengths[idx] else 0;
+}
+pub fn stringUnitByteOffset(idx: u32, unit: usize) usize {
+    if (idx >= n_strings) return 0;
+    const text = getString(idx);
+    const units = string_unit_lengths[idx];
+    if (unit >= units) return text.len;
+    if (units == text.len) return unit;
+    const group = unit / 64;
+    var at: usize = if (group == 0) 0 else string_checkpoints[string_checkpoint_starts[idx] + group - 1];
+    var i = group * 64;
+    while (i < unit) : (i += 1) _ = readCodePoint(text, &at);
+    return at;
+}
+pub fn getStringCodeUnit(idx: u32, unit: usize) ?u16 {
+    if (unit >= getStringUnitLength(idx)) return null;
+    var at = stringUnitByteOffset(idx, unit);
+    return @intCast(readCodePoint(getString(idx), &at));
+}
+pub fn getStringUnit(idx: u32, unit: usize) u32 {
+    if (unit >= getStringUnitLength(idx)) return internString("");
+    const text = getString(idx);
+    const start = stringUnitByteOffset(idx, unit);
+    var end = start; _ = readCodePoint(text, &end);
+    return internString(text[start..end]);
+}
+pub fn sliceStringUnits(idx: u32, start: usize, end: usize) u32 {
+    const text = getString(idx);
+    const from = stringUnitByteOffset(idx, start);
+    const to = stringUnitByteOffset(idx, @max(start, end));
+    return internString(text[from..to]);
+}
+pub fn encodeCodeUnit(unit: u16, out: []u8) usize {
+    const size: usize = if (unit < 128) 1 else if (unit < 2048) 2 else 3;
+    if (out.len < size) return 0;
+    if (size == 1) out[0] = @intCast(unit) else if (size == 2) {
+        out[0] = @intCast(0xC0 | (unit >> 6)); out[1] = @intCast(0x80 | (unit & 63));
+    } else {
+        out[0] = @intCast(0xE0 | (unit >> 12)); out[1] = @intCast(0x80 | ((unit >> 6) & 63)); out[2] = @intCast(0x80 | (unit & 63));
+    }
+    return size;
+}
+fn readCodePoint(text: []const u8, at: *usize) u32 {
+    const first = text[at.*]; at.* += 1;
+    if (first < 128) return first;
+    const size: usize = if (first >= 0xC2 and first <= 0xDF) 2 else if (first >= 0xE0 and first <= 0xEF) 3 else if (first >= 0xF0 and first <= 0xF4) 4 else return first;
+    if (size - 1 > text.len - at.*) return first;
+    var cp: u32 = first & @as(u8, if (size == 2) 31 else if (size == 3) 15 else 7);
+    for (text[at.*..][0..size-1]) |ch| { if (ch < 128 or ch >= 192) return first; cp = (cp << 6) | (ch & 63); }
+    if (cp < (if (size == 2) @as(u32, 128) else if (size == 3) @as(u32, 2048) else @as(u32, 65536)) or cp > 0x10FFFF) return first;
+    at.* += size - 1;
+    return cp;
+}
 
 
 /// Reset the value system (for new execution).
 pub fn reset() void {
     n_strings = 0;
     pool_used = 0;
+    checkpoint_used = 0;
     exhausted = false;
     @memset(&string_hash_slots, 0);
     // Pre-intern common strings
@@ -222,39 +387,29 @@ fn parseNumberFromString(idx: u32) f64 {
         }
     }
 
-    // Decimal: [digits][.digits][(e|E)[+/-]digits]
-    var val: f64 = 0;
+    // Validate the JS decimal grammar before the correctly-rounded converter;
+    // it also accepts inf/nan spellings which JS ToNumber must reject.
+    if (std.mem.eql(u8, t[i..], "Infinity")) return sign * std.math.inf(f64);
     var saw_digit = false;
-    while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) {
-        val = val * 10 + @as(f64, @floatFromInt(t[i] - '0'));
-        saw_digit = true;
-    }
+    while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) saw_digit = true;
     if (i < t.len and t[i] == '.') {
         i += 1;
-        var frac: f64 = 0.1;
-        while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) {
-            val += @as(f64, @floatFromInt(t[i] - '0')) * frac;
-            frac *= 0.1;
-            saw_digit = true;
-        }
+        while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) saw_digit = true;
     }
-    if (!saw_digit) return nan; // no mantissa digits -> NaN
+    if (!saw_digit) return nan;
     if (i < t.len and (t[i] == 'e' or t[i] == 'E')) {
         i += 1;
-        var esign: f64 = 1;
-        if (i < t.len and t[i] == '-') { esign = -1; i += 1; } else if (i < t.len and t[i] == '+') i += 1;
-        var exp: f64 = 0;
-        var saw_exp = false;
-        while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) {
-            exp = exp * 10 + @as(f64, @floatFromInt(t[i] - '0'));
-            saw_exp = true;
-        }
-        if (!saw_exp) return nan; // "1e" -> NaN
-        val *= pow10(esign * exp);
+        if (i < t.len and (t[i] == '-' or t[i] == '+')) i += 1;
+        const exponent_start = i;
+        while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) {}
+        if (i == exponent_start) return nan;
     }
-    // Any leftover (non-consumed) characters -> NaN.
     if (i != t.len) return nan;
-    return sign * val;
+    return parseDecimal(t);
+}
+
+pub fn parseDecimal(text: []const u8) f64 {
+    return std.fmt.parseFloat(f64, text) catch std.math.nan(f64);
 }
 
 fn isWs(c: u8) bool {
@@ -272,10 +427,4 @@ fn hexDigitVal(c: u8, radix: u8) ?u8 {
     return v;
 }
 
-fn pow10(p: f64) f64 {
-    // Simple integer-exponent power of 10 (p is an integer value here).
-    var result: f64 = 1;
-    var n: i64 = @intFromFloat(if (p < 0) -p else p);
-    while (n > 0) : (n -= 1) result *= 10;
-    return if (p < 0) 1.0 / result else result;
-}
+

@@ -10,26 +10,48 @@ const values = @import("values.sig");
 const objects = @import("objects.sig");
 const builtins = @import("builtins.sig");
 const browser_metadata = @import("browser_metadata.sig");
+const std = @import("std");
 const Value = values.Value;
 
 // ── Install all environment stubs ──
 
 /// Call after builtins.installGlobals().
 pub var dbg_no_document: bool = false;
+pub var dbg_no_webdriver: bool = false;
 var navigator_proto: u32 = objects.NULL_OBJ;
+var youtube_event_id: [256]u8 = undefined;
+var youtube_event_id_len: usize = 0;
+
+/// Session metadata is copied before the interpreter replaces its value arena.
+pub fn setYoutubeEventId(id: []const u8) bool {
+    youtube_event_id_len = 0;
+    if (id.len > youtube_event_id.len) return false;
+    @memcpy(youtube_event_id[0..id.len], id);
+    youtube_event_id_len = id.len;
+    return true;
+}
 
 pub fn installEnvironment(global: u32) void {
     // Record the global for builtins that need a realm reference (e.g. a created
     // iframe's contentWindow, which BotGuard reads to obtain a pristine String).
     builtins.g_global_obj = global;
+    objects.getObject(global).dom_window = true;
+    builtins.dom_window_template = objects.NULL_OBJ;
+    builtins.dbg_iframe_reads = 0;
     builtins.dom_element_proto = objects.NULL_OBJ;
     builtins.dom_style_proto = objects.NULL_OBJ;
+    builtins.dom_document_obj = objects.NULL_OBJ;
+    objects.setProperty(global, values.internString("Event"), Value.function(objects.createFunction(builtins.N_EVENT_CTOR)));
     objects.setProperty(global, values.internString("DeviceOrientationEvent"), Value.function(objects.createFunction(builtins.N_DOM_ORIENTATION_EVENT)));
     installNavigator(global);
     installWindow(global);
     const chrome = objects.createObject();
-    setNativeMethod(chrome, "loadTimes", builtins.N_OBJ_CREATE);
-    setNativeMethod(chrome, "csi", builtins.N_OBJ_CREATE);
+    setNativeMethod(chrome, "loadTimes", builtins.N_DOM_EMPTY_OBJECT);
+    setNativeMethod(chrome, "csi", builtins.N_DOM_EMPTY_OBJECT);
+    // chrome's legacy utility members are dictionary properties; hiding them
+    // like ECMAScript prototype methods truncates host-property iteration.
+    objects.setEnumerable(chrome, values.internString("loadTimes"), true);
+    objects.setEnumerable(chrome, values.internString("csi"), true);
     objects.setProperty(chrome, values.internString("app"), Value.object(objects.createObject()));
     objects.setProperty(global, values.internString("chrome"), Value.object(chrome));
     if (!dbg_no_document) installDocument(global);
@@ -39,6 +61,13 @@ pub fn installEnvironment(global: u32) void {
     installCrypto(global);
     installIntl(global);
     installMisc(global);
+    if (youtube_event_id_len > 0) {
+        const yt = objects.createObject();
+        const config = objects.createObject();
+        setPropStr(config, "EVENT_ID", youtube_event_id[0..youtube_event_id_len]);
+        objects.setProperty(yt, values.internString("config_"), Value.object(config));
+        objects.setProperty(global, values.internString("yt"), Value.object(yt));
+    }
     browser_metadata.installMissing(global, &browser_metadata.window_fields, builtins.N_DOM_NOOP);
     const navigator_ctor = objects.getProperty(global, values.internString("Navigator"));
     if (navigator_ctor.tag == .function and navigator_proto != objects.NULL_OBJ) {
@@ -54,7 +83,14 @@ pub fn installEnvironment(global: u32) void {
         const native_id = objects.closureFuncId(value.data.func_idx);
         if (native_id != builtins.N_DOM_NOOP and native_id != builtins.N_DOM_IMAGE and native_id != builtins.N_DOM_ORIENTATION_EVENT) continue;
         const proto = objects.createObject();
-        objects.setObjectPrototype(proto, builtins.dom_element_proto);
+        // Only DOM element interfaces inherit element behavior. SVGRect and
+        // other unrelated host classes must not inherit Node constants/APIs.
+        if (std.mem.startsWith(u8, field.name, "HTML") and std.mem.endsWith(u8, field.name, "Element")) {
+            const html_proto = hostPrototype(global, "HTMLElement");
+            objects.setObjectPrototype(proto, html_proto);
+        } else if (std.mem.startsWith(u8, field.name, "SVG") and std.mem.endsWith(u8, field.name, "Element")) {
+            objects.setObjectPrototype(proto, hostPrototype(global, "SVGElement"));
+        }
         objects.setProperty(proto, values.internString("constructor"), value);
         objects.setEnumerable(proto, values.internString("constructor"), false);
         if (values.internString(field.name) == values.internString("SVGRect")) {
@@ -69,6 +105,41 @@ pub fn installEnvironment(global: u32) void {
         objects.setProperty(value.data.func_idx, values.internString("prototype"), Value.object(proto));
         objects.setEnumerable(value.data.func_idx, values.internString("prototype"), false);
     }
+    const iframe_proto = hostPrototype(global, "HTMLIFrameElement");
+    installHostAccessor(iframe_proto, "contentWindow", builtins.N_IFRAME_WINDOW, null);
+    installHostAccessor(iframe_proto, "contentDocument", builtins.N_IFRAME_DOCUMENT, null);
+    installHostAccessor(iframe_proto, "srcdoc", builtins.N_IFRAME_SRCDOC, builtins.N_IFRAME_SET_SRCDOC);
+    // Capture browser bindings before guest code adds globals or replaces
+    // constructors. Each iframe receives its own window identity and bindings;
+    // standard intrinsic objects remain shared in this embedded host.
+    const template = objects.createObject();
+    if (objects.copyOwnProperties(global, template)) builtins.dom_window_template = template;
+}
+
+fn installHostAccessor(proto: u32, name: []const u8, get_id: u16, set_id: ?u16) void {
+    const getter = objects.createFunction(get_id);
+    var buffer: [128]u8 = undefined;
+    @memcpy(buffer[0..4], "get "); @memcpy(buffer[4..][0..name.len], name);
+    setPropStr(getter, "name", buffer[0..name.len+4]); setPropNum(getter, "length", 0);
+    objects.setEnumerable(getter, values.internString("name"), false);
+    objects.setEnumerable(getter, values.internString("length"), false);
+    var setter = Value.UNDEFINED;
+    if (set_id) |id| {
+        const function = objects.createFunction(id);
+        @memcpy(buffer[0..4], "set ");
+        setPropStr(function, "name", buffer[0..name.len+4]); setPropNum(function, "length", 1);
+        objects.setEnumerable(function, values.internString("name"), false);
+        objects.setEnumerable(function, values.internString("length"), false);
+        setter = Value.function(function);
+    }
+    objects.setAccessorProperty(proto, values.internString(name), Value.function(getter), setter);
+}
+
+fn hostPrototype(global: u32, name: []const u8) u32 {
+    const ctor = objects.getProperty(global, values.internString(name));
+    if (ctor.tag != .function) return objects.getObjectProto();
+    const proto = objects.getProperty(ctor.data.obj_idx, values.internString("prototype"));
+    return if (proto.tag == .object) proto.data.obj_idx else objects.getObjectProto();
 }
 
 fn installNavigator(global: u32) void {
@@ -88,7 +159,12 @@ fn installNavigator(global: u32) void {
     setPropBool(nav, "cookieEnabled", true);
     setPropBool(nav, "onLine", true);
     setPropBool(nav, "pdfViewerEnabled", true);
-    setPropBool(nav, "webdriver", false);
+    const webdriver_getter = objects.createFunction(builtins.N_DOM_FALSE);
+    setPropStr(webdriver_getter, "name", "get webdriver");
+    setPropNum(webdriver_getter, "length", 0);
+    objects.setEnumerable(webdriver_getter, values.internString("name"), false);
+    objects.setEnumerable(webdriver_getter, values.internString("length"), false);
+    if (!dbg_no_webdriver) objects.setGetterProperty(nav, values.internString("webdriver"), Value.function(webdriver_getter));
 
     // navigator.languages = ["en-US", "en"]
     const langs = objects.createArray(2);
@@ -146,15 +222,15 @@ fn installWindow(global: u32) void {
 
     // Event registration + idle/immediate scheduling. BotGuard probes for these
     // on window during fingerprinting; undefined there aborts feature collection.
-    setNativeMethod(global, "addEventListener", builtins.N_DOM_NOOP);
-    setNativeMethod(global, "removeEventListener", builtins.N_DOM_NOOP);
-    setNativeMethod(global, "dispatchEvent", builtins.N_DOM_NOOP);
+    setNativeMethod(global, "addEventListener", builtins.N_EVENT_ADD);
+    setNativeMethod(global, "removeEventListener", builtins.N_EVENT_REMOVE);
+    setNativeMethod(global, "dispatchEvent", builtins.N_EVENT_DISPATCH);
     setNativeMethod(global, "requestIdleCallback", builtins.N_SET_TIMEOUT);
     setNativeMethod(global, "cancelIdleCallback", builtins.N_CLEAR_TIMEOUT);
     setNativeMethod(global, "setImmediate", builtins.N_SET_TIMEOUT);
     setNativeMethod(global, "clearImmediate", builtins.N_CLEAR_TIMEOUT);
-    setNativeMethod(global, "queueMicrotask", builtins.N_SET_TIMEOUT);
-    setNativeMethod(global, "matchMedia", builtins.N_DOM_NOOP);
+    setNativeMethod(global, "queueMicrotask", builtins.N_QUEUE_MICROTASK);
+    setNativeMethod(global, "matchMedia", builtins.N_DOM_MATCH_MEDIA);
     setNativeMethod(global, "getComputedStyle", builtins.N_DOM_NOOP);
 
     // window.trustedTypes (Chrome Trusted Types API). BotGuard checks for its
@@ -200,6 +276,15 @@ fn installDocument(global: u32) void {
     const head = objects.createObject();
     makeNodeApi(head);
     objects.setProperty(doc, values.internString("head"), Value.object(head));
+    builtins.registerDomNode(doc, 9);
+    builtins.registerDomNode(html, 1);
+    builtins.registerDomNode(body, 1);
+    builtins.registerDomNode(head, 1);
+    setNativeMethod(doc, "appendChild", builtins.N_DOM_APPEND);
+    setNativeMethod(doc, "removeChild", builtins.N_DOM_REMOVE);
+    _ = builtins.callNative(builtins.N_DOM_APPEND, &.{ Value.object(doc), Value.object(html) }, 2);
+    _ = builtins.callNative(builtins.N_DOM_APPEND, &.{ Value.object(html), Value.object(head) }, 2);
+    _ = builtins.callNative(builtins.N_DOM_APPEND, &.{ Value.object(html), Value.object(body) }, 2);
 
     // document-level DOM APIs BotGuard may call.
     setNativeMethod(doc, "createElementNS", builtins.N_DOM_CREATE_ELEMENT);
@@ -213,6 +298,8 @@ fn installDocument(global: u32) void {
     // element object (which carries the common method surface) keeps those probes
     // on the happy path, same rationale as createElement/createTextNode.
     setNativeMethod(doc, "createEvent", builtins.N_DOM_CREATE_ELEMENT);
+    builtins.dom_document_obj = doc;
+    setNativeMethod(doc, "hasFocus", builtins.N_DOC_HAS_FOCUS);
     objects.setProperty(global, values.internString("Image"), Value.function(objects.createFunction(builtins.N_DOM_IMAGE)));
     const element_proto = objects.createObject();
     makeNodeApi(element_proto);
@@ -226,8 +313,14 @@ fn installDocument(global: u32) void {
     objects.setProperty(element_proto, values.internString("constructor"), Value.function(element_ctor));
     objects.setProperty(global, values.internString("Element"), Value.function(element_ctor));
     for ([_][]const u8{ "HTMLElement", "HTMLTableCaptionElement", "SVGElement", "SVGSVGElement" }) |name| {
+        const proto = objects.createObject();
+        const parent = if (std.mem.eql(u8, name, "HTMLTableCaptionElement")) hostPrototype(global, "HTMLElement") else if (std.mem.eql(u8, name, "SVGSVGElement")) hostPrototype(global, "SVGElement") else element_proto;
+        objects.setObjectPrototype(proto, parent);
         const ctor = objects.createFunction(builtins.N_DOM_CREATE_ELEMENT);
-        objects.setProperty(ctor, values.internString("prototype"), Value.object(element_proto));
+        objects.setProperty(ctor, values.internString("prototype"), Value.object(proto));
+        objects.setEnumerable(ctor, values.internString("prototype"), false);
+        objects.setProperty(proto, values.internString("constructor"), Value.function(ctor));
+        objects.setEnumerable(proto, values.internString("constructor"), false);
         objects.setProperty(global, values.internString(name), Value.function(ctor));
     }
     const navigator = objects.getProperty(global, values.internString("navigator"));
@@ -237,11 +330,13 @@ fn installDocument(global: u32) void {
         objects.setProperty(global, values.internString("Navigator"), Value.function(ctor));
     }
     const media_proto = objects.createObject();
-    setNativeMethod(media_proto, "canPlayType", builtins.N_DOM_EMPTY_STRING);
+    objects.setObjectPrototype(media_proto, hostPrototype(global, "HTMLElement"));
+    setNativeMethod(media_proto, "canPlayType", builtins.N_MEDIA_CAN_PLAY);
     const media_ctor = objects.createFunction(builtins.N_DOM_CREATE_ELEMENT);
     objects.setProperty(media_ctor, values.internString("prototype"), Value.object(media_proto));
     objects.setProperty(global, values.internString("HTMLMediaElement"), Value.function(media_ctor));
     const anchor_proto = objects.createObject();
+    objects.setObjectPrototype(anchor_proto, hostPrototype(global, "HTMLElement"));
     objects.setGetterProperty(anchor_proto, values.internString("href"), Value.function(objects.createFunction(builtins.N_DOM_EMPTY_STRING)));
     const anchor_ctor = objects.createFunction(builtins.N_DOM_CREATE_ELEMENT);
     objects.setProperty(anchor_ctor, values.internString("prototype"), Value.object(anchor_proto));
@@ -262,8 +357,9 @@ fn installDocument(global: u32) void {
     objects.setProperty(doc, values.internString("getElementsByTagName"), Value.function(empty_arr_func));
     objects.setProperty(doc, values.internString("getElementsByClassName"), Value.function(empty_arr_func));
     objects.setProperty(doc, values.internString("getElementsByName"), Value.function(empty_arr_func));
-    objects.setProperty(doc, values.internString("addEventListener"), Value.function(null_func));
-    objects.setProperty(doc, values.internString("removeEventListener"), Value.function(null_func));
+    setNativeMethod(doc, "addEventListener", builtins.N_EVENT_ADD);
+    setNativeMethod(doc, "removeEventListener", builtins.N_EVENT_REMOVE);
+    setNativeMethod(doc, "dispatchEvent", builtins.N_EVENT_DISPATCH);
 
     objects.dbgMarkEnvObject(doc);
     objects.dbgMarkEnvObject(html);
@@ -312,7 +408,7 @@ fn installPerformance(global: u32) void {
 
     // performance.timeOrigin — ms since epoch at navigation start. BotGuard
     // reads this as the base for its monotonic clock (timeOrigin + now()).
-    setPropNum(perf, "timeOrigin", 1703980800000);
+    setPropNum(perf, "timeOrigin", builtins.performance_time_origin);
 
     // Additional Performance API surface BotGuard may probe.
     setNativeMethod(perf, "mark", builtins.N_DOM_NOOP);
@@ -324,8 +420,8 @@ fn installPerformance(global: u32) void {
 
     // performance.timing (deprecated but BG might check)
     const timing = objects.createObject();
-    setPropNum(timing, "navigationStart", 1703980800000);
-    setPropNum(timing, "loadEventEnd", 1703980801500);
+    setPropNum(timing, "navigationStart", builtins.performance_time_origin);
+    setPropNum(timing, "loadEventEnd", builtins.performance_time_origin);
     objects.setProperty(perf, values.internString("timing"), Value.object(timing));
 
     objects.setProperty(global, values.internString("performance"), Value.object(perf));
@@ -415,8 +511,8 @@ fn setNativeMethod(obj: u32, name: []const u8, native_id: u16) void {
 fn makeNodeApi(el: u32) void {
     const style = builtins.makeDomStyle();
     objects.setProperty(el, values.internString("style"), Value.object(style));
-    setNativeMethod(el, "appendChild", builtins.N_DOM_NOOP);
-    setNativeMethod(el, "removeChild", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "appendChild", builtins.N_DOM_APPEND);
+    setNativeMethod(el, "removeChild", builtins.N_DOM_REMOVE);
     setNativeMethod(el, "replaceChild", builtins.N_DOM_REPLACE_CHILD);
     setNativeMethod(el, "lookupNamespaceURI", builtins.N_DOM_LOOKUP_NAMESPACE);
     objects.setProperty(el, values.internString("namespaceURI"), Value.string(values.internString("http://www.w3.org/1999/xhtml")));
@@ -426,10 +522,11 @@ fn makeNodeApi(el: u32) void {
     setNativeMethod(el, "removeAttribute", builtins.N_DOM_NOOP);
     setNativeMethod(el, "hasAttribute", builtins.N_DOM_FALSE);
     setNativeMethod(el, "matches", builtins.N_DOM_FALSE);
-    setNativeMethod(el, "click", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "click", builtins.N_DOM_CLICK);
     setNativeMethod(el, "getBoundingClientRect", builtins.N_DOM_RECT);
-    setNativeMethod(el, "addEventListener", builtins.N_DOM_NOOP);
-    setNativeMethod(el, "removeEventListener", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "addEventListener", builtins.N_EVENT_ADD);
+    setNativeMethod(el, "removeEventListener", builtins.N_EVENT_REMOVE);
+    setNativeMethod(el, "dispatchEvent", builtins.N_EVENT_DISPATCH);
     setNativeMethod(el, "contains", builtins.N_DOM_NOOP);
     setNativeMethod(el, "querySelector", builtins.N_DOM_NOOP);
     setNativeMethod(el, "getElementsByTagName", builtins.N_DOM_EMPTY_ARRAY);

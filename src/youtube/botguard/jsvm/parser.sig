@@ -146,7 +146,7 @@ pub fn parse(num_tokens: usize) NodeIdx {
     tok_pos = 0;
     n_nodes = 0;
     list_used = 0;
-    had_error = false;
+    had_error = lexer.hasError();
 
     // Allocate root program node
     const root = allocNode(.program);

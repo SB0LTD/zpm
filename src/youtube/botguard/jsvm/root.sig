@@ -13,8 +13,8 @@
 //   - try/catch/finally
 //   - Promises (basic)
 //
-// Memory: ~3MB total (fixed-size pools, no heap allocator)
-// Performance: Execute 500KB minified JS in < 3 seconds
+// Storage uses fixed-capacity pools and caller-owned output buffers, without a
+// heap allocator. Runtime and capacity depend on the challenge being executed.
 
 pub const lexer = @import("lexer.sig");
 pub const parser = @import("parser.sig");
@@ -43,6 +43,9 @@ pub fn execute(
     bg_response_len: *usize,
 ) bool {
     bg_response_len.* = 0;
+    bg_webpo_signal = values.Value.UNDEFINED;
+    mint_callback = values.Value.UNDEFINED;
+    mint_integrity_len = 0;
 
     // Phase 1: Initialize value system
     values.reset();
@@ -148,7 +151,7 @@ pub fn execute(
         dbg_aphase_referr_ip = rr[1];
     }
     if (vm.hasError()) { bg_fail_stage = 3; return false; }
-    vm.drainTasks();
+    vm.drainTasksUntil(.setup);
     if (vm.hasError()) { bg_fail_stage = 3; return false; }
 
     // a_ret is [snapshotFn, lifecycleFn] when present. But the async snapshot
@@ -170,6 +173,7 @@ pub fn execute(
     // so the VM can grow it after other allocations without corrupting the pool.
     const webpo_arr = objects.createArrayWithCapacity(16);
     bg_webpo_signal = values.Value.object(webpo_arr);
+    bg_signal_generation = vm.realmGeneration();
     objects.dbg_webpo_target = webpo_arr; // track any writes to webPoSignalOutput
 
     // Build E = [contentBinding, signedTimestamp, webPoSignalOutput, skipPrivacyBuffer].
@@ -205,7 +209,7 @@ pub fn execute(
         const async_ret = vm.callExportedN(async_snap, values.Value.UNDEFINED, async_args[0..]);
         vm.dbg_callrec_on = false;
         if (vm.hasError()) { bg_fail_stage = 6; return false; }
-        vm.drainTasks();
+        vm.drainTasksUntil(.snapshot);
         if (vm.hasError()) { bg_fail_stage = 6; return false; }
         dbg_async_ret_tag = @intFromEnum(async_ret.tag);
         if (builtins.bg_snapshot_result_called and builtins.bg_snapshot_response.tag == .string) {
@@ -231,7 +235,7 @@ pub fn execute(
         dbg_snap_calls = vm.dbgCalls()[0] -% calls_before;
         dbg_snap_ret_tag = @intFromEnum(snap_ret.tag);
         if (vm.hasError()) { bg_fail_stage = 6; return false; }
-        vm.drainTasks();
+        vm.drainTasksUntil(.snapshot);
         if (vm.hasError()) { bg_fail_stage = 6; return false; }
         resp = snap_ret;
         if (resp.tag != .string and builtins.bg_snapshot_result_called and builtins.bg_snapshot_response.tag == .string) {
@@ -273,6 +277,14 @@ pub var dbg_async_via: u8 = 0;
 // webPoSignalOutput[0] is the getMinter function. Set by execute()'s Phase 6.
 pub var bg_webpo_signal: values.Value = values.Value.UNDEFINED;
 
+// getMinter initializes a stateful minting closure once per integrity token.
+// Reuse that closure for video and visitor bindings in this VM realm.
+var mint_callback: values.Value = values.Value.UNDEFINED;
+var mint_integrity: [1024]u8 = undefined;
+var mint_integrity_len: usize = 0;
+var mint_generation: u32 = 0;
+var bg_signal_generation: u32 = 0;
+
 
 /// Mint a PO token from the VM's minter chain (WebPoMinter protocol):
 ///   getMinter = webPoSignalOutput[0]
@@ -284,6 +296,7 @@ pub var bg_webpo_signal: values.Value = values.Value.UNDEFINED;
 /// Must be called after execute() succeeded (bg_webpo_signal populated).
 pub fn mintPoToken(integrity_bytes: []const u8, content_binding: []const u8, out: []u8) usize {
     bg_mint_fail_stage = 0;
+    if (bg_signal_generation != vm.realmGeneration()) { bg_mint_fail_stage = 1; return 0; }
     if (bg_webpo_signal.tag != .object and bg_webpo_signal.tag != .array) { bg_mint_fail_stage = 1; return 0; }
     const webpo_idx: u32 = bg_webpo_signal.data.obj_idx;
 
@@ -291,25 +304,35 @@ pub fn mintPoToken(integrity_bytes: []const u8, content_binding: []const u8, out
     const get_minter = objects.getArrayElement(webpo_idx, 0);
     if (get_minter.tag != .function) { bg_mint_fail_stage = 2; return 0; }
 
-    // Build a JS array of the integrity token bytes.
-    const int_arr = objects.createArray(@intCast(integrity_bytes.len));
-    for (integrity_bytes, 0..) |b, i| {
-        objects.setArrayElement(int_arr, @intCast(i), values.Value.number(@floatFromInt(b)));
+    if (integrity_bytes.len == 0 or integrity_bytes.len > mint_integrity.len) { bg_mint_fail_stage = 3; return 0; }
+    var same = mint_generation == vm.realmGeneration() and mint_callback.tag == .function and mint_integrity_len == integrity_bytes.len;
+    if (same) for (integrity_bytes, 0..) |byte, i| { if (byte != mint_integrity[i]) { same = false; break; } };
+    if (!same) {
+        const int_buf = objects.createArrayBuffer(@intCast(integrity_bytes.len));
+        const int_arr = objects.createTypedArray(int_buf, 0, @intCast(integrity_bytes.len), 1);
+        if (int_arr == objects.NULL_OBJ) { bg_mint_fail_stage = 3; return 0; }
+        for (integrity_bytes, 0..) |b, i| objects.setArrayElement(int_arr, @intCast(i), values.Value.number(@floatFromInt(b)));
+        const int_args = [_]values.Value{values.Value.object(int_arr)};
+        mint_callback = vm.callExportedN(get_minter, values.Value.UNDEFINED, int_args[0..]);
+        // This callback returns synchronously. Awaiting an already available
+        // value does not run unrelated timers before the next minter call.
+        if (vm.hasError()) { bg_mint_fail_stage = 3; return 0; }
+        if (mint_callback.tag != .function) { bg_mint_fail_stage = 4; return 0; }
+        @memcpy(mint_integrity[0..integrity_bytes.len], integrity_bytes);
+        mint_integrity_len = integrity_bytes.len;
+        mint_generation = vm.realmGeneration();
     }
-    const int_args = [_]values.Value{values.Value.object(int_arr)};
-    const mint_cb = vm.callExportedN(get_minter, values.Value.UNDEFINED, int_args[0..]);
-    vm.drainTasks();
-    if (vm.hasError()) { bg_mint_fail_stage = 3; return 0; }
-    if (mint_cb.tag != .function) { bg_mint_fail_stage = 4; return 0; }
 
-    // Build a JS array of the content-binding bytes.
-    const cb_arr = objects.createArray(@intCast(content_binding.len));
+    // The WebPoMinter contract accepts Uint8Array inputs.
+    if (content_binding.len > 4096) { bg_mint_fail_stage = 5; return 0; }
+    const cb_buf = objects.createArrayBuffer(@intCast(content_binding.len));
+    const cb_arr = objects.createTypedArray(cb_buf, 0, @intCast(content_binding.len), 1);
+    if (cb_arr == objects.NULL_OBJ) { bg_mint_fail_stage = 5; return 0; }
     for (content_binding, 0..) |b, i| {
         objects.setArrayElement(cb_arr, @intCast(i), values.Value.number(@floatFromInt(b)));
     }
     const cb_args = [_]values.Value{values.Value.object(cb_arr)};
-    const result = vm.callExportedN(mint_cb, values.Value.UNDEFINED, cb_args[0..]);
-    vm.drainTasks();
+    const result = vm.callExportedN(mint_callback, values.Value.UNDEFINED, cb_args[0..]);
     if (vm.hasError()) { bg_mint_fail_stage = 5; return 0; }
     if (result.tag != .object and result.tag != .array) { bg_mint_fail_stage = 6; return 0; }
 
@@ -320,7 +343,8 @@ pub fn mintPoToken(integrity_bytes: []const u8, content_binding: []const u8, out
     var i: u32 = 0;
     while (i < n) : (i += 1) {
         const el = objects.getArrayElement(res_idx, i);
-        out[i] = if (el.tag == .number) @intFromFloat(@mod(el.data.number, 256)) else 0;
+        if (el.tag != .number or !@import("std").math.isFinite(el.data.number)) { bg_mint_fail_stage = 7; return 0; }
+        out[i] = @intFromFloat(@mod(@trunc(el.data.number), 256));
     }
     return n;
 }

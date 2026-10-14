@@ -130,7 +130,7 @@ fn attGetPost() usize {
 pub fn waaPost(path: []const u8, body: []const u8) usize {
     const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
     // WAA requires JSON+protobuf content type and the web WAA API key.
-    const headers = "Content-Type: application/json+protobuf\r\nx-goog-api-key: AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw\r\nx-user-agent: grpc-web-javascript/0.1\r\n";
+    const headers = "Content-Type: application/json+protobuf\r\nx-goog-api-key: AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw\r\nx-user-agent: grpc-web-javascript/0.1\r\nOrigin: https://www.youtube.com\r\nReferer: https://www.youtube.com/\r\n";
     const r = http.postInto("jnn-pa.googleapis.com", 443, path, headers, body, UA, &resp_buf);
     resp_buf_len = r.len;
     return r.len;

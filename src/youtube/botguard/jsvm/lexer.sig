@@ -136,11 +136,14 @@ pub const MAX_TOKENS: usize = 150_000;
 
 var tokens: [MAX_TOKENS]Token = undefined;
 var n_tokens: usize = 0;
+var lexical_error: bool = false;
+pub fn hasError() bool { return lexical_error; }
 var source: []const u8 = "";
 
 /// Tokenize a JavaScript source string.
 /// Returns the number of tokens produced.
 pub fn tokenize(src: []const u8) usize {
+    lexical_error = false;
     source = src;
     n_tokens = 0;
     var pos: usize = 0;
@@ -261,9 +264,13 @@ fn lexString(src: []const u8, pos: usize, start: usize) usize {
     const quote = src[pos];
     var p = pos + 1;
     while (p < src.len and src[p] != quote) : (p += 1) {
-        if (src[p] == '\\' and p + 1 < src.len) p += 1; // skip escaped char
+        if (src[p] == '\n' or src[p] == '\r') { lexical_error = true; break; }
+        if (src[p] == '\\' and p + 1 < src.len) {
+            p += 1;
+            if (src[p] == '\r' and p + 1 < src.len and src[p + 1] == '\n') p += 1;
+        }
     }
-    if (p < src.len) p += 1; // skip closing quote
+    if (p < src.len and src[p] == quote) p += 1 else lexical_error = true;
     emit(.string, start, p - start);
     return p;
 }
@@ -274,7 +281,7 @@ fn lexTemplate(src: []const u8, pos: usize, start: usize) usize {
         if (src[p] == '\\' and p + 1 < src.len) p += 1;
         // TODO: handle ${...} interpolation (nested brace counting)
     }
-    if (p < src.len) p += 1;
+    if (p < src.len) p += 1 else lexical_error = true;
     emit(.template, start, p - start);
     return p;
 }

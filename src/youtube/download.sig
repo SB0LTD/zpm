@@ -18,6 +18,7 @@
 const meta = @import("metadata.sig");
 const innertube = @import("innertube.sig");
 const cipher_mod = @import("cipher.sig");
+const nsig_mod = @import("nsig.sig");
 const manifest_mod = @import("manifest.sig");
 const stream_mod = @import("stream.sig");
 const mux_mod = @import("mux.sig");
@@ -33,7 +34,7 @@ const sabr_mod = @import("sabr/root.sig");
 // path uses the content-bound token.
 var g_pot_buf: [256]u8 = undefined;
 var g_pot_len: usize = 0;
-var g_stream_pot_buf: [256]u8 = undefined;
+var g_stream_pot_buf: [1536]u8 = undefined;
 var g_stream_pot_len: usize = 0;
 var g_session: session_mod.Session = session_mod.Session.init();
 var g_challenge: challenge_mod.Challenge = challenge_mod.Challenge.init();
@@ -53,8 +54,10 @@ pub const TokenSource = enum { none, cold_start, vm, external };
 var g_token_source: TokenSource = .none;
 const MediaKind = enum { audio, video };
 pub const DownloadOptions = struct {
+    web_client: session_mod.WebClient = .mweb,
     require_vm_token: bool = false,
     progress: stream_mod.ProgressFn = null,
+    sabr_response: ?*const fn (result: sabr_mod.stream.SabrResult) bool = null,
     // Externally-minted content-bound PO token (websafe-b64). When non-empty,
     // prepareTokens uses it directly and skips the live Create/VM/GenerateIT
     // establishment (relay a token minted via create-test --pinned <videoId>).
@@ -152,6 +155,9 @@ pub const DownloadStatus = struct {
     contains_video: bool = false,
     contains_audio: bool = false,
     token_source: TokenSource = .none,
+    selected_itag: u16 = 0,
+    sabr_result: ?sabr_mod.stream.SabrResult = null,
+    transform_failure: ?nsig_mod.Failure = null,
 };
 pub const VideoDownloadStatus = struct {
     video: DownloadStatus,
@@ -187,7 +193,7 @@ pub fn fetch(video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_p
     }
 
     const want_audio = req.track == .audio;
-    const ctx = acquirePlayer(video_id, req.options, want_audio);
+    const ctx = acquirePlayer(video_id, req.options, want_audio and req.delivery != .sabr and req.options.pot_override.len == 0);
     status.token_source = g_token_source;
     if (!ctx.ok) return status;
     const resp = ctx.resp;
@@ -207,9 +213,8 @@ pub fn fetch(video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_p
     } else switch (req.track) {
         .audio => {
             if (manifest_mod.selectBestAudio(&formats, n, req.codec)) |f| { cands[nc] = f; nc += 1; }
-            if (manifest_mod.selectBestAudio(&formats, n, .any)) |f| { if (nc == 0 or f != cands[0]) { cands[nc] = f; nc += 1; } }
-            if (ctx.sabr_available) { if (manifest_mod.selectBestSabr(&formats, n, true)) |f| { cands[nc] = f; nc += 1; } }
-            if (req.allow_muxed_fallback) { if (manifest_mod.selectByItag(&formats, n, 18) orelse manifest_mod.selectBestMuxed(&formats, n)) |f| { cands[nc] = f; nc += 1; } }
+            if (ctx.sabr_available) { if (manifest_mod.selectBestSabrWithCodec(&formats, n, true, req.codec)) |f| { if (nc == 0 or f != cands[0]) { cands[nc] = f; nc += 1; } } }
+            if (req.allow_muxed_fallback and req.delivery != .sabr and req.codec == .any) { if (manifest_mod.selectByItag(&formats, n, 18) orelse manifest_mod.selectBestMuxed(&formats, n)) |f| { cands[nc] = f; nc += 1; } }
         },
         .video => {
             if (manifest_mod.selectBestVideo(&formats, n)) |f| { cands[nc] = f; nc += 1; }
@@ -231,6 +236,13 @@ pub fn fetch(video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_p
 
     const media_kind: MediaKind = if (want_audio) .audio else .video;
     for (cands[0..nc]) |f| {
+        if (req.itag != 0) {
+            const valid_track = switch (req.track) { .audio => f.is_audio and !f.is_video, .video => f.is_video and !f.is_audio, .muxed => f.is_video and f.is_audio, .best_video => f.is_video };
+            if (!valid_track) return status;
+            const mime = f.mime_type[0..f.mime_len];
+            if (want_audio and req.codec == .aac and findStr(mime, "mp4a") == null and findStr(mime, "aac") == null) return status;
+            if (want_audio and req.codec == .opus and findStr(mime, "opus") == null) return status;
+        }
         print("  [download] Candidate itag=");
         printNum(f.itag);
         print(" direct=");
@@ -247,6 +259,7 @@ pub fn fetch(video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_p
             print(")\n");
             return status;
         }
+        if (status.sabr_result) |result| if (result.failure == .cancelled) return status;
     }
 
     // iOS one-shot fallback: a protected video's iOS URL serves only a ~1MB
@@ -334,14 +347,14 @@ fn acquirePlayer(video_id: *const [meta.VIDEO_ID_LEN]u8, options: DownloadOption
         }
     }
 
-    g_web_client = .mweb;
-    if (resp.len == 0) resp = session_mod.playerInSession(&g_session, video_id, .mweb, g_pot_buf[0..g_pot_len]);
+    g_web_client = options.web_client;
+    if (resp.len == 0) resp = session_mod.playerInSession(&g_session, video_id, g_web_client, g_pot_buf[0..g_pot_len]);
     if (!hasPlayerFormats(resp)) {
         print("  [download] session MWEB: no direct formats, trying session WEB...\n");
         g_web_client = .web;
         resp = session_mod.playerInSession(&g_session, video_id, .web, g_pot_buf[0..g_pot_len]);
     }
-    if (!hasPlayerFormats(resp) and options.require_vm_token) {
+    if (!hasPlayerFormats(resp) and (options.require_vm_token or options.pot_override.len > 0)) {
         print("  [download] ERROR: Web VM token has no downloadable WEB/MWEB formats\n");
         return ctx;
     }
@@ -399,6 +412,8 @@ fn acquirePlayer(video_id: *const [meta.VIDEO_ID_LEN]u8, options: DownloadOption
 /// signed/transformed URL (when present) and SABR (when offered) in a robust
 /// order; `.direct`/`.sabr` force one mechanism (fail-closed).
 fn deliverOne(resp: []const u8, fmt: *const manifest_mod.StreamFormat, kind: MediaKind, path: [*:0]const u8, delivery: Delivery, options: DownloadOptions, status: *DownloadStatus) bool {
+    status.selected_itag = fmt.itag;
+    status.sabr_result = null;
     status.bitrate = fmt.bitrate;
     status.contains_video = fmt.is_video;
     status.contains_audio = fmt.is_audio;
@@ -410,6 +425,7 @@ fn deliverOne(resp: []const u8, fmt: *const manifest_mod.StreamFormat, kind: Med
     // SABR. Otherwise try the direct URL first (it is cheaper when it works).
     if ((delivery == .sabr or fmt.url_len == 0) and want_sabr) {
         if (trySabr(resp, fmt, kind, path, options, status)) return true;
+        if (status.sabr_result) |result| if (result.failure == .cancelled) return false;
         if (delivery == .sabr) return false;
     }
 
@@ -425,7 +441,7 @@ fn deliverOne(resp: []const u8, fmt: *const manifest_mod.StreamFormat, kind: Med
             const dl = stream_mod.downloadToFile(url_buf[0..url_len], path, fmt.content_length, options.progress);
             status.bytes_downloaded = dl.bytes_written;
             status.success = dl.success;
-            if (dl.success) { setContainer(fmt, status); return true; }
+            if (dl.success) { status.transform_failure = null; setContainer(fmt, status); return true; }
             print("  [download] direct FAILED (HTTP status=");
             printNum(stream_mod.last_status);
             print(")\n");
@@ -485,6 +501,7 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
     var delivered = false;
     for (cands[0..nc]) |f| {
         if (deliverOne(resp, f, .video, output_path, .auto, options, &status)) { delivered = true; break; }
+        if (status.sabr_result) |sabr| if (sabr.failure == .cancelled) return status;
     }
     if (!delivered) { print("  [download] ERROR: video delivery failed on all candidates\n"); return status; }
 
@@ -615,10 +632,9 @@ fn prepareTokens(video_id: *const [meta.VIDEO_ID_LEN]u8, options: DownloadOption
             // content-bound proof.
             const visitor = g_session.visitorData();
             if (visitor.len > 0) g_stream_pot_len = minter.mintSessionBound(token, visitor, &g_stream_pot_buf);
-            if (g_stream_pot_len == 0 and g_pot_len > 0) { @memcpy(g_stream_pot_buf[0..g_pot_len], g_pot_buf[0..g_pot_len]); g_stream_pot_len = g_pot_len; }
-            if (g_pot_len > 0 and g_stream_pot_len > 0) {
+            if (g_pot_len > 0) {
                 g_token_source = .vm;
-                print("  [download] VM minted PO tokens (player=content-bound, GVS=session-bound) attempt "); printNum(attempt + 1); print("\n");
+                print("  [download] VM minted content proof; visitor proof="); print(if (g_stream_pot_len > 0) "YES" else "NO"); print(" attempt "); printNum(attempt + 1); print("\n");
                 return;
             }
         }
@@ -650,7 +666,6 @@ fn trySabr(
     options: DownloadOptions,
     status: *DownloadStatus,
 ) bool {
-    _ = options;
     print("  [download] SABR branch: serverAbrStreamingUrl present, no direct URL\n");
 
     // 1. serverAbrStreamingUrl (JSON-escaped) -> unescape to a real URL.
@@ -659,9 +674,13 @@ fn trySabr(
     if (raw_url_len == 0 or raw_url_len == g_sabr_url_buf.len) return false;
     const url_len = manifest_mod.transformStreamUrl(g_sabr_url_buf[0..raw_url_len], &g_sabr_url_buf);
     if (url_len == 0) {
-        print("  [download] SABR endpoint n transform unavailable\n");
+        status.transform_failure = nsig_mod.lastFailure();
+        print("  [download] SABR endpoint n transform unavailable: "); print(@tagName(nsig_mod.lastFailure()));
+        if (nsig_mod.failureDetail().len > 0) { print(" ("); print(nsig_mod.failureDetail()); print(")"); }
+        print("\n");
         return false;
     }
+    status.transform_failure = null;
     const sabr_url = g_sabr_url_buf[0..url_len];
 
     // 2. ustreamer config (base64 string) -> raw bytes for the request field.
@@ -672,11 +691,10 @@ fn trySabr(
         cfg_bytes = g_sabr_cfg_buf[0..n];
     }
 
-    // 3. GVS PO token for the SABR body. SABR is GVS delivery, so it wants the
-    // stream (session-bound) token when available, falling back to the
-    // content-bound token. g_stream_pot_buf holds base64url text -> raw bytes.
+    // 3. SABR playback attestation binds to the video, unlike direct GVS
+    // URLs whose token binds to visitorData. Decode the content-bound proof.
     var pot_bytes: []const u8 = "";
-    const sabr_pot_src = if (g_stream_pot_len > 0) g_stream_pot_buf[0..g_stream_pot_len] else g_pot_buf[0..g_pot_len];
+    const sabr_pot_src = g_pot_buf[0..g_pot_len];
     if (sabr_pot_src.len > 0) {
         const n = base64Decode(sabr_pot_src, &g_sabr_pot_buf);
         if (n == 0) return false;
@@ -692,7 +710,7 @@ fn trySabr(
     if (!sabr_mod.stream.parseUrl(sabr_url, &host, &hl, &path, &pl, &port)) return false;
 
     // 5. open the output sink + the live transport (session jar).
-    var fsink = sabr_mod.stream.FileSink.open(output_path) orelse return false;
+    var fsink = sabr_mod.stream.StagedFileSink.open(output_path) orelse return false;
     defer fsink.close();
     var transport_ctx = sabr_mod.stream.NetTransport{
         .jar = &g_session.jar,
@@ -724,7 +742,7 @@ fn trySabr(
     printNum(client_version.len);
     print("\n");
 
-    const res = sabr_mod.stream.runLoop(
+    const res = sabr_mod.stream.runLoopWithOptions(
         transport_ctx.transport(),
         host[0..hl],
         port,
@@ -736,12 +754,21 @@ fn trySabr(
         if (g_web_client == .mweb) 2 else 1,
         client_version,
         fsink.sink(),
+        .{ .progress = options.progress, .on_response = options.sabr_response },
     );
 
+    status.sabr_result = res;
     status.bytes_downloaded = res.bytes_written;
     status.success = res.success and res.bytes_written > 0;
+    if (status.success and !fsink.commit()) {
+        print("  [download] ERROR: complete SABR data could not be committed to the destination\n");
+        status.success = false;
+        status.sabr_result.?.success = false;
+        status.sabr_result.?.failure = .media_write;
+    }
 
     if (status.success) {
+        status.transform_failure = null;
         setContainer(fmt, status);
         print("  [download] SABR complete: ");
         printNum(res.bytes_written / 1024);

@@ -12,6 +12,7 @@
 
 const values = @import("values.sig");
 const Value = values.Value;
+const std = @import("std");
 
 // ── Configuration ──
 
@@ -44,6 +45,9 @@ pub const ObjType = enum(u8) {
     promise,
     proxy,
     date,
+    boxed_string,
+    boxed_number,
+    boxed_boolean,
 };
 
 pub const Object = struct {
@@ -58,6 +62,7 @@ pub const Object = struct {
     // Array-specific
     array_start: u32 = 0, // index into array_elements pool
     array_len: u32 = 0,
+    array_length_writable: bool = true,
     // Physical capacity reserved in the pool at array_start. array_len may be
     // less than array_cap. Growing past array_cap relocates the array to the
     // end of the pool. This makes arrays safely growable despite the flat,
@@ -66,6 +71,8 @@ pub const Object = struct {
     array_cap: u32 = 0,
     // Function-specific
     func_id: u16 = 0, // index into compiler's function descriptors
+    // Native source identity is independent of the configurable public name.
+    native_name: u32 = NULL_OBJ,
     closure_id: u32 = NULL_OBJ, // upvalue frame (object index)
     // Closure capture (by-value snapshot). Captured upvalue values live in the
     // shared closure_upvals pool at [upval_start .. upval_start + n_upvals).
@@ -76,10 +83,22 @@ pub const Object = struct {
     byte_offset: u32 = 0,
     byte_length: u32 = 0,
     elem_size: u8 = 1, // 1, 2, or 4
+    elem_signed: bool = false,
     is_frozen: bool = false,
     is_sealed: bool = false,
     is_arguments: bool = false,
-    date_value: f64 = 0,
+    // Internal scalar slot for Date timestamps and boxed Number values.
+    number_value: f64 = 0,
+    // Host receiver brand; prototype inheritance alone cannot forge a media
+    // element's WebIDL internal slots.
+    dom_media: bool = false,
+    dom_iframe: bool = false,
+    dom_srcdoc: u32 = NULL_OBJ,
+    dom_window: bool = false,
+    dom_iframe_window: u32 = NULL_OBJ,
+    dom_node: bool = false,
+    dom_parent: u32 = NULL_OBJ,
+    dom_children: u32 = NULL_OBJ,
     // Debug: tags environment objects (navigator/document/window/screen/
     // location/canvas/webgl contexts) so the VM can record which properties
     // BotGuard probes on them that our env doesn't implement (fingerprint leaks).
@@ -97,6 +116,7 @@ pub const Property = struct {
     flags: PropFlags = .{},
     // Non-strict arguments indexes can alias a parameter's shared cell.
     mapped_cell: u32 = NO_CELL,
+    setter_fn: u32 = NULL_OBJ,
 };
 
 pub const PropFlags = packed struct(u8) {
@@ -279,11 +299,11 @@ pub fn reset() void {
 
     // Create base prototypes
     object_proto = allocObject(.object);
-    array_proto = allocObject(.object);
-    function_proto = allocObject(.object);
-    string_proto = allocObject(.object);
-    number_proto = allocObject(.object);
-    boolean_proto = allocObject(.object);
+    array_proto = allocObject(.array);
+    function_proto = allocObject(.function);
+    string_proto = allocObject(.boxed_string);
+    number_proto = allocObject(.boxed_number);
+    boolean_proto = allocObject(.boxed_boolean);
     error_proto = allocObject(.object);
     // Built-in prototypes all inherit from Object.prototype in JS, so methods
     // like hasOwnProperty/toString/isPrototypeOf resolve on arrays, functions,
@@ -295,6 +315,14 @@ pub fn reset() void {
     if (number_proto != NULL_OBJ) objects[number_proto].prototype = object_proto;
     if (boolean_proto != NULL_OBJ) objects[boolean_proto].prototype = object_proto;
     if (error_proto != NULL_OBJ) objects[error_proto].prototype = object_proto;
+    if (string_proto != NULL_OBJ) {
+        objects[string_proto].array_start = values.internString("");
+        const length = values.internString("length");
+        setProperty(string_proto, length, Value.number(0));
+        setEnumerable(string_proto, length, false);
+        setWritable(string_proto, length, false);
+        setConfigurable(string_proto, length, false);
+    }
 }
 
 /// Get the Object.prototype index.
@@ -366,6 +394,26 @@ pub fn dbgOwnPropKind(obj_idx: u32, name_idx: u32) u8 {
 pub fn getObjectPrototypeIdx(obj_idx: u32) u32 {
     if (obj_idx >= n_objects) return NULL_OBJ;
     return objects[obj_idx].prototype;
+}
+
+/// Copy a host object's own descriptors into an empty object, preserving
+/// insertion order and flags. Values reference the existing fixed arenas.
+pub fn copyOwnProperties(source: u32, target: u32) bool {
+    if (source >= n_objects or target >= n_objects or objects[target].prop_count != 0 or objects[source].prop_count > MAX_PROPERTIES - n_properties) return false;
+    var cursor = objects[source].prop_head;
+    var tail = &objects[target].prop_head;
+    while (cursor != NULL_PROP) {
+        const idx = n_properties;
+        properties[idx] = properties[cursor];
+        properties[idx].mapped_cell = NO_CELL;
+        properties[idx].next = NULL_PROP;
+        n_properties += 1;
+        tail.* = idx;
+        tail = &properties[idx].next;
+        cursor = properties[cursor].next;
+    }
+    objects[target].prop_count = objects[source].prop_count;
+    return true;
 }
 
 /// Create a new array with given capacity.
@@ -568,25 +616,31 @@ pub fn dbgCellVal(ci: u32) Value {
 
 /// Create a typed array (Uint8Array, etc.).
 pub fn createTypedArray(buffer_id: u32, byte_offset: u32, length: u32, elem_size: u8) u32 {
+    if (elem_size != 1 and elem_size != 2 and elem_size != 4) return NULL_OBJ;
+    if (buffer_id >= n_objects or objects[buffer_id].obj_type != .array_buffer) return NULL_OBJ;
+    const byte_length = @as(u64, length) * elem_size;
+    if (byte_offset % elem_size != 0 or @as(u64, byte_offset) + byte_length > objects[buffer_id].byte_length) return NULL_OBJ;
     const idx = allocObject(.typed_array);
     if (idx == NULL_OBJ) return NULL_OBJ;
     objects[idx].buffer_id = buffer_id;
     objects[idx].byte_offset = byte_offset;
-    objects[idx].byte_length = length * elem_size;
+    objects[idx].byte_length = @intCast(byte_length);
     objects[idx].elem_size = elem_size;
+    objects[idx].array_len = length;
     return idx;
 }
 
 /// Create an ArrayBuffer.
 pub fn createArrayBuffer(byte_length: u32) u32 {
+    const slots_needed: u32 = @intCast((@as(u64, byte_length) + @sizeOf(Value) - 1) / @sizeOf(Value));
+    if (slots_needed > MAX_ARRAY_ELEMENTS - n_array_elems) return NULL_OBJ;
     const idx = allocObject(.array_buffer);
     if (idx == NULL_OBJ) return NULL_OBJ;
-    // Use array_elements pool for buffer storage (4 bytes per element slot)
+    // Reserve complete Value slots, and clear bytes even when the pool is reused.
     objects[idx].array_start = n_array_elems;
     objects[idx].byte_length = byte_length;
-    const slots_needed = (byte_length + 7) / 8; // Value is 16 bytes, but we pack
-    const space = @min(slots_needed, MAX_ARRAY_ELEMENTS - n_array_elems);
-    n_array_elems += space;
+    n_array_elems += slots_needed;
+    if (byte_length > 0) @memset(getBufferBytes(idx), 0);
     return idx;
 }
 
@@ -605,16 +659,51 @@ pub fn isArguments(obj_idx: u32) bool {
 }
 
 fn numericObjectValue(obj_idx: u32) f64 {
-    if (obj_idx < n_objects and objects[obj_idx].obj_type == .date) return objects[obj_idx].date_value;
+    if (obj_idx < n_objects and objects[obj_idx].obj_type == .date) return objects[obj_idx].number_value;
     return @bitCast(@as(u64, 0x7FF8000000000000));
 }
 
 pub fn createDate(timestamp_ms: f64, prototype: u32) u32 {
     const idx = allocObject(.date);
     if (idx != NULL_OBJ) {
-        objects[idx].date_value = timestamp_ms;
+        objects[idx].number_value = timestamp_ms;
         objects[idx].prototype = prototype;
     }
+    return idx;
+}
+
+pub fn createNumberWrapper(number: f64) u32 {
+    const idx = allocObject(.boxed_number);
+    if (idx != NULL_OBJ) { objects[idx].prototype = number_proto; objects[idx].number_value = number; }
+    return idx;
+}
+pub fn createBooleanWrapper(boolean: bool) u32 {
+    const idx = allocObject(.boxed_boolean);
+    if (idx != NULL_OBJ) { objects[idx].prototype = boolean_proto; objects[idx].array_start = @intFromBool(boolean); }
+    return idx;
+}
+/// String wrappers own immutable UTF-16 character indices in the fixed pool.
+pub fn createStringWrapper(string_index: u32) u32 {
+    const idx = allocObject(.boxed_string);
+    if (idx == NULL_OBJ) return idx;
+    objects[idx].prototype = string_proto;
+    objects[idx].array_start = string_index;
+    const unit_count = values.getStringUnitLength(string_index);
+    for (0..unit_count) |i| {
+        var buf: [20]u8 = undefined;
+        var n = i;
+        var start = buf.len;
+        while (true) { start -= 1; buf[start] = @intCast('0' + n % 10); n /= 10; if (n == 0) break; }
+        const key = values.internString(buf[start..]);
+        setProperty(idx, key, Value.string(values.getStringUnit(string_index, i)));
+        setWritable(idx, key, false);
+        setConfigurable(idx, key, false);
+    }
+    const length = values.internString("length");
+    setProperty(idx, length, Value.number(@floatFromInt(unit_count)));
+    setEnumerable(idx, length, false);
+    setWritable(idx, length, false);
+    setConfigurable(idx, length, false);
     return idx;
 }
 
@@ -826,6 +915,42 @@ pub fn setGetterProperty(obj_idx: u32, name_idx: u32, getter: Value) void {
     obj.prop_count += 1;
 }
 
+/// Accessors retain their independent getter and setter. A function pool index
+/// is enough for setters, avoiding a second tagged Value in every property.
+pub fn setAccessorProperty(obj_idx: u32, name_idx: u32, getter: Value, setter: Value) void {
+    setGetterProperty(obj_idx, name_idx, getter);
+    const node = dbgFindPropNode(obj_idx, name_idx);
+    if (node == NULL_PROP) return;
+    properties[node].setter_fn = if (setter.tag == .function) setter.data.func_idx else NULL_OBJ;
+    properties[node].flags.is_setter = setter.tag == .function;
+    properties[node].flags.writable = false;
+}
+/// Object literals define own properties and preserve the other accessor when
+/// a getter/setter pair uses the same key. A data definition replaces the pair.
+pub fn defineLiteralProperty(obj_idx: u32, name_idx: u32, value: Value, kind: u8) void {
+    if (kind == 0) {
+        const property = dbgFindPropNode(obj_idx, name_idx);
+        if (property != NULL_PROP) { properties[property].flags = .{}; properties[property].setter_fn = NULL_OBJ; }
+        setProperty(obj_idx, name_idx, value);
+        return;
+    }
+    var previous: Property = undefined;
+    var getter = Value.UNDEFINED;
+    var setter = Value.UNDEFINED;
+    if (ownPropertyDescriptor(obj_idx, name_idx, &previous) and previous.flags.is_getter) {
+        getter = previous.value;
+        if (previous.flags.is_setter) setter = Value.function(previous.setter_fn);
+    }
+    if (kind == 1) getter = value else setter = value;
+    setAccessorProperty(obj_idx, name_idx, getter, setter);
+    var flags = PropFlags{};
+    flags.is_getter = true;
+    flags.is_setter = setter.tag == .function;
+    flags.writable = false;
+    const property = dbgFindPropNode(obj_idx, name_idx);
+    if (property != NULL_PROP) properties[property].flags = flags;
+}
+
 /// Count how many OWN property nodes an object has with the given name (should
 /// be 0 or 1; >1 indicates a duplicate-node corruption).
 /// Return the properties-pool INDEX of an object's own property node for the
@@ -902,6 +1027,17 @@ pub fn dbgCountOwnProp(obj_idx: u32, name_idx: u32) u32 {
 
 /// Get a property from an object (with prototype chain).
 pub fn getProperty(obj_idx: u32, name_idx: u32) Value {
+    if (obj_idx < n_objects) {
+        const obj = objects[obj_idx];
+        const name = values.getString(name_idx);
+        if (obj.obj_type == .typed_array) {
+            if (std.mem.eql(u8, name, "length")) return Value.number(@floatFromInt(obj.array_len));
+            if (std.mem.eql(u8, name, "byteOffset")) return Value.number(@floatFromInt(obj.byte_offset));
+            if (std.mem.eql(u8, name, "buffer")) return Value.object(obj.buffer_id);
+            if (std.mem.eql(u8, name, "BYTES_PER_ELEMENT")) return Value.number(@floatFromInt(obj.elem_size));
+        }
+        if ((obj.obj_type == .typed_array or obj.obj_type == .array_buffer) and std.mem.eql(u8, name, "byteLength")) return Value.number(@floatFromInt(obj.byte_length));
+    }
     var current = obj_idx;
     var depth: u8 = 0;
     while (current != NULL_OBJ and depth < 32) : (depth += 1) {
@@ -910,6 +1046,11 @@ pub fn getProperty(obj_idx: u32, name_idx: u32) Value {
         while (p != NULL_PROP) {
             if (properties[p].name_idx == name_idx) return propertyValue(&properties[p]);
             p = properties[p].next;
+        }
+        if (objects[current].obj_type == .array or objects[current].obj_type == .typed_array) {
+            if (arrayIndexName(values.getString(name_idx))) |index| {
+                if (hasArrayElement(current, index)) return getArrayElement(current, index);
+            }
         }
         current = objects[current].prototype;
     }
@@ -931,7 +1072,7 @@ pub fn ownPropertyDescriptor(obj_idx: u32, name_idx: u32, out: *Property) bool {
     if (obj.obj_type == .array) {
         const name = values.getString(name_idx);
         if (name.len == 6 and name[0] == 'l' and name[1] == 'e' and name[2] == 'n' and name[3] == 'g' and name[4] == 't' and name[5] == 'h') {
-            out.* = .{ .name_idx = name_idx, .value = Value.number(@floatFromInt(obj.array_len)), .flags = .{ .enumerable = false, .configurable = false } };
+            out.* = .{ .name_idx = name_idx, .value = Value.number(@floatFromInt(obj.array_len)), .flags = .{ .writable = obj.array_length_writable, .enumerable = false, .configurable = false } };
             return true;
         }
         if (arrayIndexName(name)) |index| {
@@ -942,6 +1083,47 @@ pub fn ownPropertyDescriptor(obj_idx: u32, name_idx: u32, out: *Property) bool {
         }
     }
     return false;
+}
+/// Apply a validated own descriptor, bypassing assignment's writable check.
+/// DefineProperty can replace a configurable readonly property. Assignment
+/// cannot. Mapped data properties retain their parameter alias.
+pub fn defineOwnProperty(obj_idx: u32, descriptor: Property) bool {
+    if (obj_idx >= n_objects) return false;
+    const obj = &objects[obj_idx];
+    const name = values.getString(descriptor.name_idx);
+    if (obj.obj_type == .array and name.len == 6 and name[0] == 'l' and name[1] == 'e' and name[2] == 'n' and name[3] == 'g' and name[4] == 't' and name[5] == 'h') {
+        const length: u32 = @intFromFloat(descriptor.value.toNumber());
+        arraySetLength(obj_idx, length);
+        if (obj.array_len != length) return false;
+        obj.array_length_writable = descriptor.flags.writable;
+        return true;
+    }
+    const existing = dbgFindPropNode(obj_idx, descriptor.name_idx);
+    if (existing != NULL_PROP) {
+        if (descriptor.flags.is_getter) properties[existing].mapped_cell = NO_CELL;
+        writePropertyValue(&properties[existing], descriptor.value);
+        if (!descriptor.flags.writable) { properties[existing].value = descriptor.value; properties[existing].mapped_cell = NO_CELL; }
+        properties[existing].flags = descriptor.flags;
+        properties[existing].setter_fn = descriptor.setter_fn;
+        return true;
+    }
+    if ((!obj.extensible and !hasOwnProperty(obj_idx, descriptor.name_idx)) or n_properties == MAX_PROPERTIES) return false;
+    if (obj.obj_type == .array) {
+        if (arrayIndexName(name)) |index| {
+            if (index >= obj.array_len) {
+                arraySetLength(obj_idx, index + 1);
+                if (obj.array_len <= index) return false;
+            }
+            deleteArrayElement(obj_idx, index);
+        }
+    }
+    properties[n_properties] = descriptor;
+    properties[n_properties].next = obj.prop_head;
+    properties[n_properties].mapped_cell = NO_CELL;
+    obj.prop_head = n_properties;
+    obj.prop_count += 1;
+    n_properties += 1;
+    return true;
 }
 
 /// Look up a property node's is_getter flag (searching the prototype chain).
@@ -962,6 +1144,11 @@ pub fn getPropertyGetter(obj_idx: u32, name_idx: u32, out_getter: *Value) bool {
                 return false;
             }
             p = properties[p].next;
+        }
+        if (objects[current].obj_type == .array or objects[current].obj_type == .typed_array) {
+            if (arrayIndexName(values.getString(name_idx))) |index| {
+                if (hasArrayElement(current, index)) return false;
+            }
         }
         current = objects[current].prototype;
     }
@@ -998,7 +1185,7 @@ pub fn resolveSet(obj_idx: u32, name_idx: u32, out_setter: *Value) SetResolution
         while (p != NULL_PROP) {
             if (properties[p].name_idx == name_idx) {
                 if (properties[p].flags.is_getter or properties[p].flags.is_setter) {
-                    if (properties[p].flags.is_setter) { if (name_idx == dbg_resolveset_create_idx) dbg_resolveset_setter += 1; out_setter.* = properties[p].value; return .setter; }
+                    if (properties[p].flags.is_setter) { if (name_idx == dbg_resolveset_create_idx) dbg_resolveset_setter += 1; out_setter.* = Value.function(properties[p].setter_fn); return .setter; }
                     if (name_idx == dbg_resolveset_create_idx) dbg_resolveset_ignore += 1;
                     return .ignore; // getter-only own accessor
                 }
@@ -1017,7 +1204,7 @@ pub fn resolveSet(obj_idx: u32, name_idx: u32, out_setter: *Value) SetResolution
         while (pp != NULL_PROP) : (pp = properties[pp].next) {
             const p = pp;
             if (properties[p].name_idx == name_idx) {
-                if (properties[p].flags.is_setter) { if (name_idx == dbg_resolveset_create_idx) dbg_resolveset_setter += 1; out_setter.* = properties[p].value; return .setter; }
+                if (properties[p].flags.is_setter) { if (name_idx == dbg_resolveset_create_idx) dbg_resolveset_setter += 1; out_setter.* = Value.function(properties[p].setter_fn); return .setter; }
                 if (properties[p].flags.is_getter) { if (name_idx == dbg_resolveset_create_idx) dbg_resolveset_ignore += 1; return .ignore; } // inherited getter-only
                 if (name_idx == dbg_resolveset_create_idx) dbg_resolveset_data += 1;
                 return .data; // inherited data property -> shadow with own data prop
@@ -1029,6 +1216,12 @@ pub fn resolveSet(obj_idx: u32, name_idx: u32, out_setter: *Value) SetResolution
 }
 
 /// Delete an own property (unlink it from the object's property list).
+pub fn deleteOwnProperty(obj_idx: u32, name_idx: u32) bool {
+    var property: Property = undefined;
+    if (ownPropertyDescriptor(obj_idx, name_idx, &property) and !property.flags.configurable) return false;
+    deleteProperty(obj_idx, name_idx);
+    return true;
+}
 pub fn deleteProperty(obj_idx: u32, name_idx: u32) void {
     if (obj_idx >= n_objects) return;
     if (objects[obj_idx].obj_type == .array) {
@@ -1078,6 +1271,14 @@ pub fn setEnumerable(obj_idx: u32, name_idx: u32, enumerable: bool) void {
     var p = objects[obj_idx].prop_head;
     while (p != NULL_PROP) : (p = properties[p].next) {
         if (properties[p].name_idx == name_idx) { properties[p].flags.enumerable = enumerable; return; }
+    }
+}
+
+pub fn setConfigurable(obj_idx: u32, name_idx: u32, configurable: bool) void {
+    if (obj_idx >= n_objects) return;
+    var p = objects[obj_idx].prop_head;
+    while (p != NULL_PROP) : (p = properties[p].next) {
+        if (properties[p].name_idx == name_idx) { properties[p].flags.configurable = configurable; return; }
     }
 }
 
@@ -1258,7 +1459,9 @@ fn setElementPresent(abs_index: u32, present: bool) void {
 }
 
 pub fn hasArrayElement(obj_idx: u32, index: u32) bool {
-    if (obj_idx >= n_objects or objects[obj_idx].obj_type != .array) return false;
+    if (obj_idx >= n_objects) return false;
+    if (objects[obj_idx].obj_type == .typed_array) return index < objects[obj_idx].array_len;
+    if (objects[obj_idx].obj_type != .array) return false;
     const obj = objects[obj_idx];
     return index < obj.array_len and elementPresent(obj.array_start + index);
 }
@@ -1275,6 +1478,15 @@ pub fn deleteArrayElement(obj_idx: u32, index: u32) void {
 pub fn getArrayElement(obj_idx: u32, index: u32) Value {
     if (obj_idx >= n_objects) return Value.UNDEFINED;
     const obj = objects[obj_idx];
+    if (obj.obj_type == .typed_array) {
+        if (index >= obj.array_len) return Value.UNDEFINED;
+        const bytes = getBufferBytes(obj.buffer_id);
+        const start = obj.byte_offset + index * obj.elem_size;
+        var n: u32 = 0;
+        for (0..obj.elem_size) |i| n |= @as(u32, bytes[start + i]) << @as(u5, @intCast(i * 8));
+        if (obj.elem_signed) return Value.number(@floatFromInt(@as(i8, @bitCast(@as(u8, @truncate(n))))));
+        return Value.number(@floatFromInt(n));
+    }
     if (index >= obj.array_len) {
         if (index == dbg_r311_target) { dbg_r311_reads += 1; dbg_r311_last_read_tag = 254; dbg_r311_last_read_obj = obj_idx; recordR311Read(obj_idx); }
         return Value.UNDEFINED;
@@ -1366,6 +1578,17 @@ pub fn dbgWebpoLastTag() u8 { return dbg_webpo_last_tag; }
 pub fn dbgWebpoIdx0Tag() u8 { return dbg_webpo_idx0_tag; }
 
 pub fn setArrayElement(obj_idx: u32, index: u32, val: Value) void {
+    if (obj_idx < n_objects and objects[obj_idx].obj_type == .typed_array) {
+        const obj = objects[obj_idx];
+        if (index >= obj.array_len) return;
+        const numeric = val.toNumber();
+        const bits: u64 = @bitCast(numeric);
+        const n: u32 = if ((bits & 0x7ff0000000000000) == 0x7ff0000000000000) 0 else @intFromFloat(@mod(@trunc(numeric), 4294967296.0));
+        const bytes = getBufferBytes(obj.buffer_id);
+        const start = obj.byte_offset + index * obj.elem_size;
+        for (0..obj.elem_size) |i| bytes[start + i] = @truncate(n >> @as(u5, @intCast(i * 8)));
+        return;
+    }
     if (obj_idx == dbg_seed_target and dbg_seed_n < 128) {
         const j = dbg_seed_n;
         dbg_seed_index[j] = index;
@@ -1573,6 +1796,7 @@ pub fn arraySetLength(obj_idx: u32, new_len: u32) void {
     }
     if (obj_idx >= n_objects) return;
     const obj = &objects[obj_idx];
+    if (!obj.array_length_writable and new_len != obj.array_len) return;
     const old_len = obj.array_len;
     if (new_len > obj.array_cap and !relocateArray(obj_idx, new_len)) return;
     // Growing creates holes; it must not expose values left by a previous
@@ -1719,6 +1943,7 @@ pub fn getBufferBytes(obj_idx: u32) []u8 {
     if (obj.obj_type != .array_buffer) return &[_]u8{};
     const start = obj.array_start;
     const byte_len = obj.byte_length;
+    if (byte_len == 0) return &.{};
     // Reinterpret array_elements storage as bytes
     const ptr: [*]u8 = @ptrCast(&array_elements[start]);
     return ptr[0..byte_len];

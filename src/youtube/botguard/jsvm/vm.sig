@@ -62,6 +62,8 @@ const TryFrame = struct {
     finally_ip: u32 = 0,
     frame_depth: u16 = 0, // call frame depth when try was entered
     stack_depth: u16 = 0, // stack depth when try was entered
+    start_ip: u32 = 0,
+    end_ip: u32 = 0,
 };
 
 // ── VM State ──
@@ -98,9 +100,23 @@ var iter_count: u16 = 0;
 var global_obj: u32 = objects.NULL_OBJ; // global object index
 var had_error: bool = false;
 var error_value: Value = Value.UNDEFINED;
-// Exception pending across a finally-only block (unwinder → leave_finally).
-var pending_exception: bool = false;
-var pending_exception_val: Value = Value.UNDEFINED;
+const CompletionKind = enum { normal, exception, return_value, jump };
+const AbruptCompletion = struct {
+    kind: CompletionKind = .normal,
+    value: Value = Value.UNDEFINED,
+    target: u32 = 0,
+    stack_depth: u16 = 0,
+};
+const FinallyContext = struct {
+    frame_depth: u16,
+    start_ip: u32,
+    end_ip: u32,
+    action: AbruptCompletion,
+    statement_completion: Value,
+};
+var finally_contexts: [MAX_TRY_FRAMES]FinallyContext = undefined;
+var finally_count: u16 = 0;
+var staged_completion: ?AbruptCompletion = null;
 pub var dbg_finally_unwind: u32 = 0;
 pub fn dbgFinallyUnwind() u32 { return dbg_finally_unwind; }
 // Record user-call target names while enabled (for tracing the snapshot).
@@ -330,8 +346,9 @@ var lookup_ring_pos: usize = 0;
 // hold a large `.apply(this, bigArray)` (BotGuard base64-encodes via
 // `String.fromCharCode.apply(null, byteChunk)` with up to 8192-element chunks).
 // Module-level (not on the Zig call stack) to avoid a 128KB+ stack frame.
-var fnapply_args: [8192]Value = undefined;
-var fnapply_recv: [8193]Value = undefined;
+// Each active apply owns its argument span while getters/coercions reenter JS.
+var fnapply_storage: [32768]Value = undefined;
+var fnapply_used: usize = 0;
 fn setLookupName(name_idx: u32) void {
     prev_lookup_name = last_lookup_name;
     last_lookup_name = name_idx;
@@ -367,6 +384,21 @@ pub var dbg_lastuv_closure: u32 = 0xFFFFFFFF;
 pub var dbg_lastuv_upcount: u16 = 0;
 pub fn dbgLastUv() [6]u32 { return .{ dbg_lastuv_func, dbg_lastuv_idx, if (dbg_lastuv_closed) @as(u32,1) else 0, dbg_lastuv_addr, dbg_lastuv_closure, dbg_lastuv_upcount }; }
 pub var dbg_lastuv_readtag: u8 = 255;
+pub var dbg_binding_name: ?[]const u8 = null;
+pub var dbg_binding_count: usize = 0;
+pub var dbg_binding_closure: [256]u32 = undefined;
+pub var dbg_binding_index: [256]u16 = undefined;
+pub var dbg_binding_initial: [256]Value = undefined;
+pub var dbg_binding_write_count: usize = 0;
+pub var dbg_binding_write_func: [64]u16 = undefined;
+pub var dbg_binding_write_ip: [64]u32 = undefined;
+pub var dbg_binding_write_value: [64]Value = undefined;
+
+pub fn dbgBindingValue(closure: u32, index: u16) Value {
+    if (objects.isClosureUpvalClosed(closure, index)) return objects.getClosureUpvalClosedVal(closure, index);
+    const addr = objects.getClosureUpvalAddr(closure, index);
+    return if (addr < MAX_STACK) stack[addr] else Value.UNDEFINED;
+}
 pub fn dbgLastUvReadTag() u8 { return dbg_lastuv_readtag; }
 // Capture the first get_upval that reads a long (program) string.
 pub var dbg_badupval_done: bool = false;
@@ -1370,13 +1402,13 @@ fn operandWidth(op: Op) u32 {
         .load_const, .get_local, .set_local, .get_upval, .set_upval,
         .get_global, .get_global_safe, .set_global, .def_global,
         .get_prop, .set_prop, .get_optional, .get_elem_optional,
-        .make_array, .make_func, .del_prop => 2,
+        .make_array, .make_func, .del_prop, .close_scope => 2,
         // u8 operand (1 byte): argc / prop_count
-        .call, .call_direct_eval, .call_method, .make_object, .new_call => 1,
+        .call, .call_direct_eval, .call_method, .make_object, .new_call, .define_literal_property => 1,
         // u32 operand (4 bytes): jump targets / offsets
-        .jump, .jump_if_false, .jump_if_true, .jump_nullish, .loop_back, .iter_next => 4,
-        // two u32 operands (8 bytes)
-        .enter_try => 8,
+        .jump, .jump_if_false, .jump_if_true, .jump_nullish, .loop_back, .iter_next, .enter_finally => 4,
+        // catch, finally, protected-region end
+        .enter_try => 12,
         else => 0,
     };
 }
@@ -1474,9 +1506,10 @@ pub fn execute() Value {
     iter_count = 0;
     for (0..MAX_FRAMES) |i| ctor_is[i] = false;
     had_error = false;
+    operation_aborted = false;
     error_value = Value.UNDEFINED;
-    pending_exception = false;
-    pending_exception_val = Value.UNDEFINED;
+    finally_count = 0;
+    staged_completion = null;
     dbg_finally_unwind = 0;
     dbg_throwmsg_n = 0;
     dbg_firstpropthrow_captured = false;
@@ -1562,6 +1595,7 @@ pub fn execute() Value {
     objects.bindRuntimeStack(stack[0..]);
     global_obj = objects.createObject();
     builtins.invoke_callback = &invokeBuiltinCallback;
+    builtins.callback_aborted = &callbackAborted;
     values.object_number = &numericObjectPrimitive;
     builtins.string_conversion = &stringObjectPrimitive;
     builtins.installGlobals(global_obj);
@@ -1570,6 +1604,10 @@ pub fn execute() Value {
     // Push initial frame for top-level code
     frames[0] = .{ .func_id = 0xFFFF, .ip = 0, .bp = 0 };
     frame_count = 1;
+    // Catch and block bindings also need storage in the script frame. Keep
+    // operands above their peak slot so expressions cannot overwrite them.
+    sp = compiler.mainLocalCount();
+    @memset(stack[0..sp], Value.UNDEFINED);
 
     // Run
     return run();
@@ -1753,7 +1791,35 @@ fn run() Value {
 
 /// Execute a single opcode. Returns true if execution should halt.
 /// `frame` is a live pointer into the frames array (valid for this dispatch).
+// A synchronous host operation can invoke JS which transfers control to a
+// caller's catch/finally. Preserve that handler's stack and abandon the host
+// operation, even though a caught exception has already cleared had_error.
+var operation_aborted: bool = false;
+var operation_unwind_sp: u16 = 0;
+fn callbackAborted() bool { return operation_aborted or had_error; }
+const SyncCaller = struct {
+    depth: u16,
+    ip: u32,
+    fn capture() SyncCaller {
+        return .{ .depth = frame_count, .ip = if (frame_count > 0) frames[frame_count - 1].ip else 0 };
+    }
+    fn transferred(self: SyncCaller) bool {
+        if (operation_aborted) return true;
+        if (had_error or frame_count != self.depth or (self.depth > 0 and frames[self.depth - 1].ip != self.ip)) {
+            operation_aborted = true;
+            operation_unwind_sp = sp;
+            return true;
+        }
+        return false;
+    }
+};
 fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
+    operation_aborted = false;
+    const halted = execOneImpl(op, bc, frame);
+    if (operation_aborted) sp = operation_unwind_sp;
+    return halted;
+}
+fn execOneImpl(op: Op, bc: []const u8, frame: *CallFrame) bool {
     dbgHashEntry(frame);
         // Opcode-execution ring (for post-mortem of the failing instruction seq).
         op_ring[op_ring_pos % op_ring.len] = @intFromEnum(op);
@@ -1783,6 +1849,10 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                 }
             },
             .swap => { if (sp >= 2) { const tmp = stack[sp - 1]; stack[sp - 1] = stack[sp - 2]; stack[sp - 2] = tmp; } },
+            .close_scope => {
+                const first = readU16(bc, &frame.ip);
+                closeUpvalues(@as(u32, frame.bp) + first);
+            },
 
             // Constants
             .load_const => {
@@ -2066,6 +2136,15 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                 // snapshot after it returned. By-reference so all sharers see it.
                 const idx = readU16(bc, &frame.ip);
                 const v = peek();
+                if (dbg_binding_name) |name| {
+                    if (dbg_binding_write_count < dbg_binding_write_func.len and eql(values.getString(compiler.funcUpvalName(frame.func_id, idx)), name)) {
+                        const wi = dbg_binding_write_count;
+                        dbg_binding_write_func[wi] = frame.func_id;
+                        dbg_binding_write_ip[wi] = frame.ip;
+                        dbg_binding_write_value[wi] = v;
+                        dbg_binding_write_count += 1;
+                    }
+                }
                 if (frame.closure_obj != objects.NULL_OBJ) {
                     if (objects.isClosureUpvalClosed(frame.closure_obj, idx)) {
                         objects.setClosureUpvalClosedVal(frame.closure_obj, idx, v);
@@ -2391,6 +2470,7 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                     }
                 }
                 setPropOnValue(obj_val, name_str, val);
+                if (obj_val.tag == .undefined or obj_val.tag == .null_val or callbackAborted()) return false;
                 push(val);
             },
             .get_elem => {
@@ -2572,7 +2652,7 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                     return false;
                 }
                 const ge_res = getElemFromValue(obj_val, key);
-                if (dbg_gtrace_on and key.tag == .string and eql(values.getString(key.data.str_idx), "webdriver") and dbg_gtrace_n < 12605) {
+                if ((dbg_gtrace_on or debug_function_entry != null) and dbg_property_key.tag == .undefined and key.tag == .string and eql(values.getString(key.data.str_idx), "webdriver") and dbg_gtrace_n < 12605) {
                     dbg_property_receiver = obj_val;
                     dbg_property_key = key;
                     dbg_property_result = ge_res;
@@ -2683,6 +2763,7 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                     dbg_selem_n += 1;
                 }
                 setElemOnValue(obj_val, key, val);
+                if (obj_val.tag == .undefined or obj_val.tag == .null_val or callbackAborted()) return false;
                 push(val);
             },
             .get_optional => {
@@ -2730,7 +2811,7 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
 
             // Comparison
             .eq => { const b = pop(); const a = pop();
-                if (dbg_gtrace_on and stack[frame.bp + 2].toNumber() == 236 and startsWith(compiler.funcSourceText(frame.func_id), "function(w,F,A,J,v,c){h1(")) { dbg_branch_a = a; dbg_branch_b = b; }
+                if (dbg_gtrace_on and dbg_gtrace_n >= dbg_register_first and dbg_gtrace_n <= dbg_register_last and frame.bp + 2 < MAX_STACK and stack[frame.bp + 2].toNumber() == dbg_register_watch[0]) { dbg_branch_a = a; dbg_branch_b = b; for (0..16) |j| dbg_branch_slots[j] = if (frame.bp + j < MAX_STACK) stack[frame.bp + j] else Value.UNDEFINED; }
                 if (frame.func_id == 333 and dbg_guard_n < 64) {
                     const ev = stack[frame.bp+5];
                     if (ev.tag == .function and eql(compiler.funcSourceText(objects.closureFuncId(ev.data.func_idx)), "function(k){return x3.call(this,0,8,k)}")) {
@@ -2742,9 +2823,9 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                 push(boolVal(!abstractEq(a, b))); },
             .seq => { const b = pop(); const a = pop(); push(boolVal(strictEq(a, b))); },
             .sneq => { const b = pop(); const a = pop(); push(boolVal(!strictEq(a, b))); },
-            .lt => { const b = pop(); const a = pop(); push(boolVal(a.toNumber() < b.toNumber())); },
+            .lt => { const b = pop(); const a = pop(); push(boolVal(relationalOrder(a, b) == .less)); },
             .gt => { const b = pop(); const a = pop();
-                if (dbg_gtrace_on and dbg_branch_a.tag == .undefined and startsWith(compiler.funcSourceText(frame.func_id), "function(w,F,A,J,v,c){h1(") and stack[frame.bp + 2].toNumber() == 282) { dbg_branch_a = a; dbg_branch_b = b; }
+                if (dbg_gtrace_on and dbg_gtrace_n >= dbg_register_first and dbg_gtrace_n <= dbg_register_last and frame.bp + 2 < MAX_STACK and stack[frame.bp + 2].toNumber() == dbg_register_watch[0]) { dbg_branch_a = a; dbg_branch_b = b; for (0..16) |j| dbg_branch_slots[j] = if (frame.bp + j < MAX_STACK) stack[frame.bp + j] else Value.UNDEFINED; }
                 // ROOT capture: the `Lt.length>4` compare in func 286 (z==96). Record
                 // the LHS (Lt.length) whenever RHS==4 and we're in the state-machine func.
                 if (dbg_gt4_watch and frame.func_id == dbg_gt4_func and b.tag == .number and b.data.number == 4 and dbg_gt4_n < dbg_gt4_val.len) {
@@ -2752,9 +2833,9 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                     dbg_gt4_ip[dbg_gt4_n] = frame.ip;
                     dbg_gt4_n += 1;
                 }
-                push(boolVal(a.toNumber() > b.toNumber())); },
-            .lte => { const b = pop(); const a = pop(); push(boolVal(a.toNumber() <= b.toNumber())); },
-            .gte => { const b = pop(); const a = pop(); push(boolVal(a.toNumber() >= b.toNumber())); },
+                push(boolVal(relationalOrder(a, b) == .greater)); },
+            .lte => { const b = pop(); const a = pop(); const order = relationalOrder(a, b); push(boolVal(order == .less or order == .equal)); },
+            .gte => { const b = pop(); const a = pop(); const order = relationalOrder(a, b); push(boolVal(order == .greater or order == .equal)); },
             .instanceof => {
                 const b = pop();
                 const a = pop();
@@ -2801,7 +2882,7 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
             .not => { const a = pop(); push(boolVal(!a.isTruthy())); },
             .typeof_op => {
                 const a = pop();
-                if (dbg_gtrace_on and dbg_type_n < dbg_type_gn.len) {
+                if ((dbg_gtrace_on or debug_typeof_on) and dbg_type_n < dbg_type_gn.len) {
                     dbg_type_gn[dbg_type_n] = dbg_gtrace_n;
                     dbg_type_func[dbg_type_n] = frame.func_id;
                     dbg_type_name[dbg_type_n] = last_lookup_name;
@@ -2817,25 +2898,25 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
             .delete_op => { _ = pop(); push(Value.TRUE); },
 
             // Control flow (4-byte absolute targets / relative loop offset)
-            .jump => { const target = readU32(bc, &frame.ip); frame.ip = target; },
+            .jump => { const target = readU32(bc, &frame.ip); jumpTo(frame, target); },
             .jump_if_false => {
                 const target = readU32(bc, &frame.ip);
                 const v = pop();
-                if (!v.isTruthy()) frame.ip = target;
+                if (!v.isTruthy()) jumpTo(frame, target);
             },
             .jump_if_true => {
                 const target = readU32(bc, &frame.ip);
                 const v = pop();
-                if (v.isTruthy()) frame.ip = target;
+                if (v.isTruthy()) jumpTo(frame, target);
             },
             .jump_nullish => {
                 const target = readU32(bc, &frame.ip);
                 const v = peek();
-                if (v.tag == .null_val or v.tag == .undefined) frame.ip = target;
+                if (v.tag == .null_val or v.tag == .undefined) jumpTo(frame, target);
             },
             .loop_back => {
                 const offset = readU32(bc, &frame.ip);
-                frame.ip -= offset;
+                jumpTo(frame, frame.ip - offset);
             },
 
             // Functions and calls
@@ -3038,21 +3119,32 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                 if (checkNativeThrow()) return false;
                 push(result);
             },
+            .define_literal_property => {
+                const kind = bc[frame.ip]; frame.ip += 1;
+                const value = pop();
+                const key = pop();
+                const object = peek();
+                const name = builtins.keyToNameIdx(key);
+                if (callbackAborted()) return false;
+                if (object.tag == .object) objects.defineLiteralProperty(object.data.obj_idx, name, value, kind);
+            },
             .make_object => {
                 const count = bc[frame.ip];
                 frame.ip += 1;
                 const obj_idx = objects.createObject();
-                // Pop key/value pairs
-                var i: u8 = 0;
-                while (i < count) : (i += 1) {
-                    if (sp >= 2) {
-                        const val = pop();
-                        const key = pop();
+                // Define pairs in source order: the last duplicate wins and
+                // string keys retain their creation order for enumeration.
+                const pair_count: usize = @min(count, sp / 2);
+                const start = sp - pair_count * 2;
+                var i: usize = 0;
+                while (i < pair_count) : (i += 1) {
+                        const key = stack[start + i * 2];
+                        const val = stack[start + i * 2 + 1];
                         if (key.tag == .string) {
                             objects.setProperty(obj_idx, key.data.str_idx, val);
                         }
-                    }
                 }
+                sp = @intCast(start);
                 push(Value.object(obj_idx));
             },
             .make_array => {
@@ -3169,6 +3261,16 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                             objects.shareClosureUpvalCell(clo, ui, p, pidx);
                         }
                     }
+                    if (dbg_binding_name) |name| {
+                        var bi: u16 = 0;
+                        while (bi < n_uv and dbg_binding_count < dbg_binding_closure.len) : (bi += 1) {
+                            if (!eql(values.getString(compiler.funcUpvalName(func_id, bi)), name)) continue;
+                            dbg_binding_closure[dbg_binding_count] = clo;
+                            dbg_binding_index[dbg_binding_count] = bi;
+                            dbg_binding_initial[dbg_binding_count] = dbgBindingValue(clo, bi);
+                            dbg_binding_count += 1;
+                        }
+                    }
                     push(Value.function(clo));
                 }
             },
@@ -3249,6 +3351,7 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
             .enter_try => {
                 const catch_offset = readU32(bc, &frame.ip);
                 const finally_offset = readU32(bc, &frame.ip);
+                const protected_end = readU32(bc, &frame.ip);
                 dbg_enter_try += 1;
                 if (try_count < MAX_TRY_FRAMES) {
                     try_frames[try_count] = .{
@@ -3256,29 +3359,37 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
                         .finally_ip = finally_offset,
                         .frame_depth = frame_count,
                         .stack_depth = sp,
+                        .start_ip = frame.ip,
+                        .end_ip = protected_end,
                     };
                     try_count += 1;
-                }
+                } else fail("try frame capacity exceeded");
             },
             .leave_try => {
-                if (try_count > 0) try_count -= 1;
+                if (try_count > 0 and try_frames[try_count-1].frame_depth == frame_count) try_count -= 1;
             },
             .enter_catch => {
                 push(error_value);
                 had_error = false;
             },
-            .enter_finally => {},
+            .enter_finally => {
+                const end = readU32(bc, &frame.ip);
+                if (finally_count == finally_contexts.len) { fail("finally context capacity exceeded"); return false; }
+                finally_contexts[finally_count] = .{ .frame_depth = frame_count, .start_ip = frame.ip, .end_ip = end, .action = staged_completion orelse .{}, .statement_completion = frame.eval_completion };
+                finally_count += 1;
+                staged_completion = null;
+            },
             .leave_finally => {
-                // Re-raise a still-active error, or an exception that was pending
-                // across this finally block (set by the unwinder for finally-only
-                // try frames), so it propagates to the enclosing try/catch.
-                if (had_error) {
-                    throwException(error_value);
-                } else if (pending_exception) {
-                    pending_exception = false;
-                    had_error = true;
-                    error_value = pending_exception_val;
-                    throwException(pending_exception_val);
+                if (finally_count == 0 or finally_contexts[finally_count-1].frame_depth != frame_count) { fail("unbalanced finally context"); return false; }
+                finally_count -= 1;
+                const context = finally_contexts[finally_count];
+                frame.eval_completion = context.statement_completion;
+                completion = frame.eval_completion;
+                switch (context.action.kind) {
+                    .normal => {},
+                    .exception => throwException(context.action.value),
+                    .return_value => returnFromFrame(context.action.value),
+                    .jump => { sp = context.action.stack_depth; jumpTo(frame, context.action.target); },
                 }
             },
 
@@ -3299,10 +3410,10 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
             },
             .iter_next => {
                 const target = readU32(bc, &frame.ip);
-                if (iter_count == 0) { frame.ip = target; } else {
+                if (iter_count == 0) { jumpTo(frame, target); } else {
                     var it = &iters[iter_count - 1];
                     if (!it.valid or it.pos >= it.count) {
-                        frame.ip = target; // exhausted -> exit loop
+                        jumpTo(frame, target); // exhausted -> exit loop
                     } else {
                         // for-in yields keys (property names / array index strings).
                         const name_idx = it.keys[it.pos];
@@ -3325,23 +3436,27 @@ fn execOne(op: Op, bc: []const u8, frame: *CallFrame) bool {
             .del_prop => {
                 const name_idx = readU16(bc, &frame.ip);
                 const obj_val = pop();
+                var deleted = true;
                 if (obj_val.tag == .object or obj_val.tag == .array or obj_val.tag == .function) {
-                    objects.deleteProperty(@intCast(obj_val.data.obj_idx), constToStringIdx(name_idx));
+                    deleted = objects.deleteOwnProperty(@intCast(obj_val.data.obj_idx), constToStringIdx(name_idx));
                 }
-                push(Value.TRUE);
+                push(if (deleted) Value.TRUE else Value.FALSE);
             },
             .del_elem => {
                 const key = pop();
                 const obj_val = pop();
+                var deleted = true;
                 if (obj_val.tag == .object or obj_val.tag == .array or obj_val.tag == .function) {
                     const oi: u32 = @intCast(obj_val.data.obj_idx);
                     // `delete arr[i]` on a real array clears the element; on any
                     // object (incl. numeric key `delete o[5]`) delete the named
                     // property "5" (JS ToPropertyKey) — mirrors get/set which now
                     // treat numeric keys on plain objects as named props.
-                    objects.deleteProperty(oi, builtins.keyToNameIdx(key));
+                    const name = builtins.keyToNameIdx(key);
+                    if (operation_aborted) return false;
+                    deleted = objects.deleteOwnProperty(oi, name);
                 }
-                push(Value.TRUE);
+                push(if (deleted) Value.TRUE else Value.FALSE);
             },
         }
     return false;
@@ -3411,6 +3526,9 @@ fn prepareUserLocals(bp: u16, fobj: u32, actual_count: usize) void {
 }
 
 fn callValueSync(fn_val: Value, this_val: Value, a0: Value, a1: Value, a2: Value, argc: u8) Value {
+    if (callbackAborted()) return Value.UNDEFINED;
+    const caller = SyncCaller.capture();
+    defer { _ = caller.transferred(); }
     if (fn_val.tag != .function) return Value.UNDEFINED;
     const fobj: u32 = fn_val.data.func_idx;
     const obj = objects.getObject(fobj);
@@ -3418,6 +3536,13 @@ fn callValueSync(fn_val: Value, this_val: Value, a0: Value, a1: Value, a2: Value
 
     // Native callback: dispatch directly.
     if (obj.func_id >= 0xF000) {
+        if (isArrayIterMethod(obj.func_id)) {
+            return arrayIterMethod(obj.func_id, this_val, if (argc > 0) a0 else Value.UNDEFINED, if (argc > 1) a1 else Value.UNDEFINED);
+        }
+        if (builtins.isFnMethod(obj.func_id) or builtins.isVmIntrinsic(obj.func_id)) {
+            const args = [_]Value{ a0, a1, a2 };
+            return callExportedN(fn_val, this_val, args[0..argc]);
+        }
         // A materialized bound function (`f.bind(thisArg,...)`) invoked
         // synchronously (e.g. a register getter defined as
         // `Array.prototype.pop.bind(stack)`): dispatch the target with
@@ -3487,6 +3612,7 @@ fn callValueSync(fn_val: Value, this_val: Value, a0: Value, a1: Value, a2: Value
     // Run until this callee frame (and any it spawns) returns back to target_depth.
     runUntil(target_depth);
 
+    if (caller.transferred()) return Value.UNDEFINED;
     // Result is on TOS (returnFromFrame pushed it in the callee slot region).
     const result = if (sp > base) stack[sp - 1] else Value.UNDEFINED;
     sp = base;
@@ -3498,6 +3624,9 @@ fn callValueSync(fn_val: Value, this_val: Value, a0: Value, a1: Value, a2: Value
 /// VM-provided snapshot function, which take more args than callValueSync's 3.
 /// Returns the function's return value (TOS after it returns).
 pub fn callExportedN(fn_val: Value, this_val: Value, args: []const Value) Value {
+    if (callbackAborted()) return Value.UNDEFINED;
+    const caller = SyncCaller.capture();
+    defer { _ = caller.transferred(); }
     if (fn_val.tag != .function) return Value.UNDEFINED;
     const fobj: u32 = fn_val.data.func_idx;
     const obj = objects.getObject(fobj);
@@ -3505,7 +3634,28 @@ pub fn callExportedN(fn_val: Value, this_val: Value, args: []const Value) Value 
 
     // Native callback: dispatch directly (native funcs read args as a slice).
     if (obj.func_id >= 0xF000) {
-        if (builtins.isFnMethod(obj.func_id) or builtins.isVmIntrinsic(obj.func_id)) return Value.UNDEFINED;
+        if (isArrayIterMethod(obj.func_id)) {
+            return arrayIterMethod(obj.func_id, this_val, if (args.len > 0) args[0] else Value.UNDEFINED, if (args.len > 1) args[1] else Value.UNDEFINED);
+        }
+        if (builtins.isFnMethod(obj.func_id) or builtins.isVmIntrinsic(obj.func_id)) {
+            if (args.len > 255) { fail("intrinsic synchronous argument capacity exceeded"); return Value.UNDEFINED; }
+            const base = sp;
+            const depth = frame_count;
+            push(fn_val);
+            for (args) |arg| push(arg);
+            if (builtins.isFnMethod(obj.func_id)) fnMethodCall(obj.func_id, fobj, @intCast(args.len), this_val)
+            else {
+                const saved_direct = eval_is_direct;
+                eval_is_direct = false;
+                evalIntrinsic(obj.func_id, @intCast(args.len));
+                eval_is_direct = saved_direct;
+            }
+            runUntil(depth);
+            if (caller.transferred()) return Value.UNDEFINED;
+            const result = if (sp > base) stack[sp-1] else Value.UNDEFINED;
+            sp = base;
+            return result;
+        }
         if (builtins.nativeIgnoresReceiver(obj.func_id)) {
             const result = builtins.callNative(obj.func_id, args, @intCast(@min(args.len, 255)));
             _ = checkNativeThrow();
@@ -3542,6 +3692,7 @@ pub fn callExportedN(fn_val: Value, this_val: Value, args: []const Value) Value 
 
     runUntil(target_depth);
 
+    if (caller.transferred()) return Value.UNDEFINED;
     const result = if (sp > base) stack[sp - 1] else Value.UNDEFINED;
     sp = base;
     return result;
@@ -3552,16 +3703,23 @@ pub fn callExportedN(fn_val: Value, this_val: Value, args: []const Value) Value 
 /// after the synchronous entry point returns so those callbacks actually run.
 /// Bounded to avoid runaway task loops.
 pub fn drainTasks() void {
+    drainTasksUntil(.empty);
+}
+
+pub const TaskCompletion = enum { empty, setup, snapshot };
+
+/// Stop at the host's awaited callback so later timers cannot run ahead of the
+/// next synchronous invocation. This mirrors awaiting setup/snapshot in JS.
+pub fn drainTasksUntil(completion_target: TaskCompletion) void {
     var guard: u32 = 0;
-    while (builtins.task_head < builtins.task_tail and !had_error) {
+    const deadline = builtins.taskClock() + 5000;
+    while (!had_error) {
+        if (completion_target == .setup and builtins.bg_vm_setup_called) break;
+        if (completion_target == .snapshot and builtins.bg_snapshot_result_called) break;
         guard += 1;
-        if (guard > 100_000) break;
-        const i = builtins.task_head;
-        builtins.task_head += 1;
-        const fn_val = builtins.task_fns[i];
-        const argc = builtins.task_argc[i];
-        var args: [2]Value = .{ builtins.task_arg0[i], builtins.task_arg1[i] };
-        _ = callExportedN(fn_val, Value.UNDEFINED, args[0..argc]);
+        if (guard > 100_000 or builtins.taskClock() >= deadline) break;
+        const task = builtins.takeTask(deadline) orelse break;
+        _ = callExportedN(task.callback, Value.object(global_obj), task.args[0..task.argc]);
     }
 }
 
@@ -3569,6 +3727,16 @@ pub fn drainTasks() void {
 /// must be a host-callback id (>= NATIVE_BASE) handled by builtins.callNative.
 pub fn makeNativeFunction(native_id: u16) Value {
     const idx = objects.createFunction(native_id);
+    const arity: u8 = switch (native_id) {
+        builtins.N_BG_VM_SETUP => 4,
+        builtins.N_BG_SNAPSHOT_RESULT => 1,
+        builtins.N_BG_TELEMETRY => 3,
+        else => 0,
+    };
+    const key = values.internString("length");
+    objects.setProperty(idx, key, Value.number(@floatFromInt(arity)));
+    objects.setEnumerable(idx, key, false);
+    objects.setWritable(idx, key, false);
     return Value.function(idx);
 }
 
@@ -3580,6 +3748,44 @@ pub fn getPropertyValue(obj_idx: u32, name: []const u8) Value {
 /// Run the interpreter loop until frame_count drops to `until_depth` (the
 /// nested call returned) or an error/step-limit occurs.
 pub var dbg_hash_n: usize = 0;
+pub var dbg_serialized_n: usize = 0;
+pub var dbg_serialized_bytes: [65536]u8 = undefined;
+pub var dbg_register_fault_depth: usize = 0;
+pub var dbg_register_fault_frames: [16]u16 = undefined;
+pub var dbg_register_fault_locals: [16][16]Value = undefined;
+pub var dbg_factory_n: usize = 0;
+pub var dbg_factory_register: u32 = 448;
+pub var dbg_factory_rows: [64][9]Value = undefined;
+pub var dbg_watch_write_n: usize = 0;
+pub var dbg_watch_write_values: [32]Value = undefined;
+pub var dbg_watch_write_funcs: [32][3]u16 = undefined;
+pub var dbg_watch_write_slots: [32][3][16]Value = undefined;
+pub var dbg_ud_n: usize = 0;
+pub var dbg_ud_result: [8]Value = undefined;
+pub var dbg_ud_slots: [8][16]Value = undefined;
+pub var dbg_ud_fields: [8][16]Value = undefined;
+pub var dbg_snapshot_cells: [4]Value = undefined;
+fn debugUpvalue(frame: CallFrame, name: []const u8) Value {
+    for (0..compiler.upvalCount(frame.func_id)) |i| {
+        if (!eql(values.getString(compiler.funcUpvalName(frame.func_id, @intCast(i))), name)) continue;
+        if (objects.isClosureUpvalClosed(frame.closure_obj, @intCast(i))) return objects.getClosureUpvalClosedVal(frame.closure_obj, @intCast(i));
+        const addr = objects.getClosureUpvalAddr(frame.closure_obj, @intCast(i));
+        return if (addr < MAX_STACK) stack[addr] else Value.UNDEFINED;
+    }
+    return Value.UNDEFINED;
+}
+pub var dbg_hash_capture: usize = 0xFFFFFFFF;
+pub var dbg_hash_text_n: usize = 0;
+pub var dbg_hash_text: [256]Value = undefined;
+pub var dbg_hash_text_at: [256]usize = undefined;
+pub var dbg_protocol_n: usize = 0;
+pub var dbg_protocol_args: [256][3]Value = undefined;
+pub var dbg_protocol_g: [256]usize = undefined;
+pub var dbg_register_trace_on: bool = false;
+pub var dbg_register_trace_n: usize = 0;
+pub var dbg_register_trace_ids: [32768]u16 = undefined;
+pub var dbg_register_trace_hash: [32768]usize = undefined;
+pub var dbg_register_trace_values: [32768]Value = undefined;
 pub var dbg_hash_rows: [8192][6]f64 = undefined;
 pub var dbg_hash_stack: [16]u16 = [_]u16{0xFFFF} ** 16;
 pub var dbg_encode_n: usize = 0;
@@ -3600,10 +3806,77 @@ pub var dbg_encode_x: [128]Value = undefined;
 pub var dbg_encode_len: [128]u32 = undefined;
 pub var dbg_encode_g: [128]Value = undefined;
 pub var dbg_encode_caller: [128]u16 = undefined;
+pub var dbg_register_watch: [3]i32 = .{ -1, -1, -1 };
+// Optional development observer. Slots include `this` followed by parameters;
+// callbacks must not enter JavaScript or modify VM storage. No production sink.
+pub var debug_function_entry: ?*const fn (u16, []const Value) void = null;
+pub var debug_function_return: ?*const fn (u16, []const Value, Value) void = null;
+pub fn debugCallerFunction(depth: usize) u16 {
+    return if (depth + 1 < frame_count) frames[frame_count - 2 - depth].func_id else 0xFFFF;
+}
+pub fn debugCallerSlots(depth: usize) []const Value {
+    if (depth + 1 >= frame_count) return &.{};
+    const caller = frames[frame_count - 2 - depth];
+    const desc = compiler.getFunction(caller.func_id);
+    return stack[caller.bp..@min(sp, caller.bp + @as(u32, desc.param_count) + 1)];
+}
+pub var dbg_register_first: usize = 0;
+pub var dbg_register_last: usize = 0;
+pub fn dbgRegisterWatch(registers: [3]i32, first: usize, last: usize) void {
+    dbg_register_watch = registers;
+    dbg_register_first = first;
+    dbg_register_last = last;
+    dbg_417_n = 0;
+    dbg_branch_a = Value.UNDEFINED;
+    dbg_branch_b = Value.UNDEFINED;
+}
 fn dbgHashEntry(frame: *CallFrame) void {
+    if (debug_function_entry) |observe| {
+        const desc = compiler.getFunction(frame.func_id);
+        if (frame.ip == desc.code_start + 1) observe(frame.func_id, stack[frame.bp..@min(sp, frame.bp + @as(u32, desc.param_count) + 1)]);
+    }
+    if (dbg_gtrace_on and dbg_serialized_n == 0 and frame.ip == compiler.getFunction(frame.func_id).code_start + 1 and startsWith(compiler.funcSourceText(frame.func_id), "function(J,z,Z,b,k,c,l,D,T,H,P,G){{P=0;while(P!=85)") and stack[frame.bp+1].tag == .number and stack[frame.bp+1].data.number == 32) {
+        const array = stack[frame.bp+5];
+        if (array.tag == .object or array.tag == .array) {
+            dbg_serialized_n = @min(objects.arrayLength(array.data.obj_idx), dbg_serialized_bytes.len);
+            for (0..dbg_serialized_n) |i| {
+                const value = objects.getArrayElement(array.data.obj_idx, @intCast(i));
+                dbg_serialized_bytes[i] = if (value.tag == .number) @truncate(toU32(value)) else 0;
+            }
+        }
+    }
     if (!dbg_gtrace_on) return;
-    const register_write = if (startsWith(compiler.funcSourceText(frame.func_id), "function(f,Q,E){switch(!(f==94||f==401))")) stack[frame.bp + 1].toNumber() else if (startsWith(compiler.funcSourceText(frame.func_id), "function(f,Q,E){switch(!(Q==94||Q==401))")) stack[frame.bp + 2].toNumber() else -1;
-    if (dbg_417_n < 32 and frame.ip == compiler.getFunction(frame.func_id).code_start + 1 and register_write == 94 and dbg_gtrace_n >= 16120 and dbg_gtrace_n <= 16145) {
+    if (dbg_protocol_n < dbg_protocol_args.len and frame.ip == compiler.getFunction(frame.func_id).code_start + 1 and startsWith(compiler.funcSourceText(frame.func_id), "function(J,z,Z,b,k,c,l,D,T,H,P,G,v,q){while(!b.c9")) {
+        for (0..3) |i| dbg_protocol_args[dbg_protocol_n][i] = stack[frame.bp + 1 + i];
+        dbg_protocol_g[dbg_protocol_n] = dbg_gtrace_n;
+        dbg_protocol_n += 1;
+    }
+    if (dbg_hash_n >= 1300 and dbg_hash_n < 1400 and dbg_hash_text_n < dbg_hash_text.len and frame.ip == compiler.getFunction(frame.func_id).code_start + 1 and startsWith(compiler.funcSourceText(frame.func_id), "function(J,z,Z,b,k,c,l,D,T,H,P,G,v){for(k=(T=J.replace")) {
+        dbg_hash_text[dbg_hash_text_n] = stack[frame.bp + 1];
+        dbg_hash_text_at[dbg_hash_text_n] = dbg_hash_n;
+        dbg_hash_text_n += 1;
+    }
+    const register_write = if (startsWith(compiler.funcSourceText(frame.func_id), "function(J,z,Z){if(J==57||J==317)")) stack[frame.bp + 1].toNumber() else if (startsWith(compiler.funcSourceText(frame.func_id), "function(f,Q,E){switch(!(f==94||f==401))")) stack[frame.bp + 1].toNumber() else if (startsWith(compiler.funcSourceText(frame.func_id), "function(f,Q,E){switch(!(Q==94||Q==401))")) stack[frame.bp + 2].toNumber() else -1;
+    if (register_write == @as(f64, @floatFromInt(dbg_factory_register)) and dbg_gtrace_n >= dbg_register_first and dbg_gtrace_n <= dbg_register_last and frame.ip == compiler.getFunction(frame.func_id).code_start+1 and dbg_watch_write_n < dbg_watch_write_values.len) {
+        const row = dbg_watch_write_n;
+        dbg_watch_write_values[row] = stack[frame.bp+3];
+        for (0..3) |i| {
+            if (frame_count <= i+1) { dbg_watch_write_funcs[row][i] = 0xFFFF; continue; }
+            const caller = frames[frame_count-2-i]; dbg_watch_write_funcs[row][i] = caller.func_id;
+            for (0..16) |j| dbg_watch_write_slots[row][i][j] = if (caller.bp+j < MAX_STACK) stack[caller.bp+j] else Value.UNDEFINED;
+        }
+        dbg_watch_write_n += 1;
+    }
+    if (dbg_register_trace_on and dbg_hash_n >= 1313 and dbg_hash_n < 1400 and dbg_register_trace_n < dbg_register_trace_ids.len and frame.ip == compiler.getFunction(frame.func_id).code_start + 1 and register_write >= 0 and register_write <= 65535) {
+        const value = stack[frame.bp + 3];
+        if (value.tag != .object and value.tag != .array and value.tag != .function) {
+            dbg_register_trace_ids[dbg_register_trace_n] = @intFromFloat(register_write);
+            dbg_register_trace_hash[dbg_register_trace_n] = dbg_hash_n;
+            dbg_register_trace_values[dbg_register_trace_n] = value;
+            dbg_register_trace_n += 1;
+        }
+    }
+    if (dbg_417_n < 32 and frame.ip == compiler.getFunction(frame.func_id).code_start + 1 and register_write >= 0 and (register_write == dbg_register_watch[0] or register_write == dbg_register_watch[1] or register_write == dbg_register_watch[2]) and dbg_gtrace_n >= dbg_register_first and dbg_gtrace_n <= dbg_register_last) {
         dbg_417_values[dbg_417_n] = stack[frame.bp + 3];
         dbg_417_registers[dbg_417_n] = register_write;
         dbg_417_g[dbg_417_n] = dbg_gtrace_n;
@@ -3625,12 +3898,21 @@ fn dbgHashEntry(frame: *CallFrame) void {
         dbg_encode_len[dbg_encode_n] = objects.arrayLength(stack[frame.bp+2].data.obj_idx); dbg_encode_n += 1;
     }
     const hash_source = compiler.funcSourceText(frame.func_id);
-    if ((!startsWith(hash_source, "function(b,x,g,Y,L){if(b.length==3)") and !startsWith(hash_source, "function(f,Q,E,T,D){if(f.length==3)")) or frame.ip != compiler.getFunction(frame.func_id).code_start + 1 or dbg_hash_n >= 8192) return;
+    if ((!startsWith(hash_source, "function(J,z,Z,b,k){switch(!(J.length==3))") and !startsWith(hash_source, "function(b,x,g,Y,L){if(b.length==3)") and !startsWith(hash_source, "function(f,Q,E,T,D){if(f.length==3)")) or frame.ip != compiler.getFunction(frame.func_id).code_start + 1 or dbg_hash_n >= 8192) return;
     const b = stack[frame.bp + 1];
     const x = stack[frame.bp + 2];
     if ((b.tag != .object and b.tag != .array) or (x.tag != .object and x.tag != .array) or objects.arrayLength(b.data.obj_idx) != 3) return;
     if (dbg_hash_n == 0) {
         for (0..@min(frame_count, 16)) |i| dbg_hash_stack[i] = frames[frame_count - 1 - i].func_id;
+    }
+    if (dbg_hash_n == dbg_hash_capture) {
+        dbg_gtrace_cap_n = @min(frame_count, dbg_gtrace_cap_slots.len);
+        for (0..dbg_gtrace_cap_n) |i| {
+            const captured = frames[frame_count - 1 - i];
+            dbg_gtrace_cap_func[i] = captured.func_id;
+            dbg_gtrace_cap_ip[i] = captured.ip;
+            for (0..16) |j| dbg_gtrace_cap_slots[i][j] = if (captured.bp + j < MAX_STACK) stack[captured.bp + j] else Value.UNDEFINED;
+        }
     }
     for (0..3) |i| {
         dbg_hash_rows[dbg_hash_n][i] = objects.getArrayElement(b.data.obj_idx, @intCast(i)).toNumber();
@@ -3678,6 +3960,51 @@ fn runUntil(until_depth: u16) void {
 
 // ── Call / Return ──
 
+/// Drop a pending completion only when control actually leaves its finally.
+/// A callback or a catch nested inside the body preserves the outer action.
+fn discardFinallyOutside(depth: u16, target: u32) void {
+    while (finally_count > 0) {
+        const context = finally_contexts[finally_count-1];
+        if (context.frame_depth < depth) break;
+        if (context.frame_depth == depth and target >= context.start_ip and target < context.end_ip) break;
+        finally_count -= 1;
+    }
+}
+
+/// Every branch uses lexical protected-region bounds, so break/continue and
+/// labelled jumps cannot leave dead catch handlers on the exception stack.
+fn jumpTo(frame: *CallFrame, target: u32) void {
+    discardFinallyOutside(frame_count, target);
+    const destination_sp = sp;
+    while (try_count > 0 and try_frames[try_count-1].frame_depth == frame_count) {
+        const handler = try_frames[try_count-1];
+        if (target >= handler.start_ip and target < handler.end_ip) break;
+        try_count -= 1;
+        if (handler.finally_ip != 0) {
+            staged_completion = .{ .kind = .jump, .target = target, .stack_depth = destination_sp };
+            sp = handler.stack_depth;
+            frame.ip = handler.finally_ip;
+            return;
+        }
+    }
+    frame.ip = target;
+}
+
+fn returnThroughFinally(result: Value) bool {
+    discardFinallyOutside(frame_count, 0xFFFFFFFF);
+    while (try_count > 0 and try_frames[try_count-1].frame_depth == frame_count) {
+        try_count -= 1;
+        const handler = try_frames[try_count];
+        if (handler.finally_ip != 0) {
+            staged_completion = .{ .kind = .return_value, .value = result };
+            sp = handler.stack_depth;
+            frames[frame_count-1].ip = handler.finally_ip;
+            return true;
+        }
+    }
+    return false;
+}
+
 fn callFunction(argc: u8) void {
     if (sp < argc + 1) { fail("call: stack underflow"); return; }
 
@@ -3700,7 +4027,7 @@ fn callFunction(argc: u8) void {
 
             // Function.prototype.call/apply/bind bound-invokers.
             if (builtins.isFnMethod(obj.func_id)) {
-                fnMethodCall(obj.func_id, obj_idx, argc);
+                fnMethodCall(obj.func_id, obj_idx, argc, null);
                 return;
             }
 
@@ -3709,7 +4036,17 @@ fn callFunction(argc: u8) void {
                 // Native call
                 dbg_native_calls += 1;
                 if (dbg_callrec_on) dbgRecordNative(obj.func_id);
-                const result = builtins.callNative(obj.func_id, stack[sp - argc .. sp], argc);
+                // Plain calls have an undefined receiver. Receiver-aware native
+                // adapters still need that slot when a method is detached into
+                // a variable (e.g. `const create = Object.create; create(proto)`).
+                // Reuse the consumed callee slot so reentrant callbacks retain
+                // stable arguments without an additional temporary arena.
+                const native_args = if (builtins.nativeIgnoresReceiver(obj.func_id)) stack[sp - argc .. sp] else blk: {
+                    stack[sp - argc - 1] = Value.UNDEFINED;
+                    break :blk stack[sp - argc - 1 .. sp];
+                };
+                const result = builtins.callNative(obj.func_id, native_args, @intCast(@min(native_args.len, 255)));
+                if (operation_aborted) return;
                 sp -= (argc + 1);
                 if (checkNativeThrow()) return;
                 push(result);
@@ -4396,7 +4733,9 @@ fn evalIntrinsic(func_id: u16, argc: u8) void {
             throwException(serr);
             return;
         }
-        push(Value.UNDEFINED);
+        // Every syntax error aborts the entire eval before it can mutate any
+        // binding. In particular x=' is a lexical error, not an assignment.
+        throwException(makeErrorObject("SyntaxError", if (lexer.hasError()) "Invalid or unexpected token" else "Unexpected token"));
         return;
     }
 
@@ -4412,7 +4751,7 @@ fn evalIntrinsic(func_id: u16, argc: u8) void {
     const eval_receiver = if (direct_eval and frame_count > 0) stack[eval_caller_bp] else Value.object(global_obj);
     const eval_caller_closure: u32 = if (frame_count > 0) frames[frame_count - 1].closure_obj else objects.NULL_OBJ;
     const dbg_fn_before = compiler.dbgFunctionCount();
-    const code_start = compiler.compileEval(root, eval_caller_func);
+    const code_start = compiler.compileEvalAt(root, eval_caller_func, if (direct_eval and frame_count > 0) frames[frame_count - 1].ip else 0);
     dbg_eval_compile_err = compiler.hasError();
     if (code_start == 0 or compiler.hasError()) { push(Value.UNDEFINED); return; }
     dbg_eval_compiled += 1;
@@ -4869,13 +5208,14 @@ fn callMethod(argc: u8) void {
             // Intrinsics / fn-methods: fall back to plain-call semantics using
             // the region starting at the func slot (receiver is ignored by them).
             if (builtins.isVmIntrinsic(obj.func_id) or builtins.isFnMethod(obj.func_id)) {
+                const receiver = stack[recv_slot];
                 // Collapse [func][recv][args] -> [func][args] then dispatch.
                 // Shift args down over the receiver slot.
                 var k: u16 = recv_slot;
                 while (k + 1 < sp) : (k += 1) stack[k] = stack[k + 1];
                 sp -= 1;
                 if (builtins.isVmIntrinsic(obj.func_id)) evalIntrinsic(obj.func_id, argc)
-                else fnMethodCall(obj.func_id, obj_idx, argc);
+                else fnMethodCall(obj.func_id, obj_idx, argc, receiver);
                 return;
             }
 
@@ -4886,6 +5226,7 @@ fn callMethod(argc: u8) void {
                 const cb = if (argc >= 1) stack[recv_slot + 1] else Value.UNDEFINED;
                 const arg2 = if (argc >= 2) stack[recv_slot + 2] else Value.UNDEFINED;
                 const result = arrayIterMethod(obj.func_id, recv, cb, arg2);
+                if (operation_aborted) return;
                 sp = func_slot;
                 push(result);
                 return;
@@ -4907,6 +5248,7 @@ fn callMethod(argc: u8) void {
                     stack[recv_slot .. sp];
                 const nargc: u8 = @intCast(nargs.len);
                 const result = builtins.callNative(obj.func_id, nargs, nargc);
+                if (operation_aborted) return;
                 sp = func_slot;
                 if (checkNativeThrow()) return;
                 push(result);
@@ -5107,9 +5449,10 @@ fn arrayIterMethod(func_id: u16, recv: Value, cb: Value, arg2: Value) Value {
     if (func_id == builtins.N_ARR_MAP) {
         const out = objects.createArray(len);
         var i: u32 = 0;
-        while (i < len and !had_error) : (i += 1) {
+        while (i < len and !callbackAborted()) : (i += 1) {
             const el = objects.getArrayElement(arr, i);
             const r = callValueSync(cb, arg2, el, Value.number(@floatFromInt(i)), recv, 3);
+            if (callbackAborted()) return Value.UNDEFINED;
             objects.setArrayElement(out, i, r);
         }
         return Value.object(out);
@@ -5118,7 +5461,7 @@ fn arrayIterMethod(func_id: u16, recv: Value, cb: Value, arg2: Value) Value {
         const out = objects.createArray(0);
         var oi: u32 = 0;
         var i: u32 = 0;
-        while (i < len and !had_error) : (i += 1) {
+        while (i < len and !callbackAborted()) : (i += 1) {
             const el = objects.getArrayElement(arr, i);
             const r = callValueSync(cb, arg2, el, Value.number(@floatFromInt(i)), recv, 3);
             if (r.isTruthy()) { objects.setArrayElement(out, oi, el); oi += 1; }
@@ -5130,7 +5473,7 @@ fn arrayIterMethod(func_id: u16, recv: Value, cb: Value, arg2: Value) Value {
         var i: u32 = 0;
         // If no initial value was passed (arg2 undefined), seed with element 0.
         if (arg2.tag == .undefined and len > 0) { acc = objects.getArrayElement(arr, 0); i = 1; }
-        while (i < len and !had_error) : (i += 1) {
+        while (i < len and !callbackAborted()) : (i += 1) {
             const el = objects.getArrayElement(arr, i);
             acc = callValueSync(cb, Value.UNDEFINED, acc, el, Value.number(@floatFromInt(i)), 3);
         }
@@ -5138,7 +5481,7 @@ fn arrayIterMethod(func_id: u16, recv: Value, cb: Value, arg2: Value) Value {
     }
     if (func_id == builtins.N_ARR_FIND) {
         var i: u32 = 0;
-        while (i < len and !had_error) : (i += 1) {
+        while (i < len and !callbackAborted()) : (i += 1) {
             const el = objects.getArrayElement(arr, i);
             const r = callValueSync(cb, arg2, el, Value.number(@floatFromInt(i)), recv, 3);
             if (r.isTruthy()) return el;
@@ -5147,7 +5490,7 @@ fn arrayIterMethod(func_id: u16, recv: Value, cb: Value, arg2: Value) Value {
     }
     if (func_id == builtins.N_ARR_SOME) {
         var i: u32 = 0;
-        while (i < len and !had_error) : (i += 1) {
+        while (i < len and !callbackAborted()) : (i += 1) {
             const el = objects.getArrayElement(arr, i);
             const r = callValueSync(cb, arg2, el, Value.number(@floatFromInt(i)), recv, 3);
             if (r.isTruthy()) return Value.TRUE;
@@ -5156,7 +5499,7 @@ fn arrayIterMethod(func_id: u16, recv: Value, cb: Value, arg2: Value) Value {
     }
     if (func_id == builtins.N_ARR_EVERY) {
         var i: u32 = 0;
-        while (i < len and !had_error) : (i += 1) {
+        while (i < len and !callbackAborted()) : (i += 1) {
             const el = objects.getArrayElement(arr, i);
             const r = callValueSync(cb, arg2, el, Value.number(@floatFromInt(i)), recv, 3);
             if (!r.isTruthy()) return Value.FALSE;
@@ -5165,23 +5508,22 @@ fn arrayIterMethod(func_id: u16, recv: Value, cb: Value, arg2: Value) Value {
     }
     // forEach
     var i: u32 = 0;
-    while (i < len and !had_error) : (i += 1) {
+    while (i < len and !callbackAborted()) : (i += 1) {
         const el = objects.getArrayElement(arr, i);
         _ = callValueSync(cb, arg2, el, Value.number(@floatFromInt(i)), recv, 3);
     }
     return Value.UNDEFINED;
 }
 
-/// Handle Function.prototype.call/apply/bind bound-invokers.
+/// Handle generic Function.prototype.call/apply/bind and bound functions.
 /// Stack at entry: [invoker][arg0][arg1]... with sp past the args.
 ///   .call(thisArg, a, b)  -> target(a, b) with this=thisArg
 ///   .apply(thisArg, argsArray) -> target(...argsArray) with this=thisArg
-///   .bind(...) -> (simplified) returns the target unchanged
-fn fnMethodCall(kind: u16, invoker_idx: u32, argc: u8) void {
-    const target = objects.getProperty(invoker_idx, values.internString("__target__"));
+///   .bind(...) -> captures receiver and leading arguments
+fn fnMethodCall(kind: u16, invoker_idx: u32, argc: u8, receiver: ?Value) void {
+    const target = if (kind == builtins.N_FN_BOUND) objects.getProperty(invoker_idx, values.internString("__target__")) else receiver orelse Value.UNDEFINED;
     if (target.tag != .function) {
-        sp -= (argc + 1);
-        push(Value.UNDEFINED);
+        throwTypeErrorMsg("Function method requires a callable receiver");
         return;
     }
 
@@ -5217,6 +5559,7 @@ fn fnMethodCall(kind: u16, invoker_idx: u32, argc: u8) void {
         var cn: u8 = 0;
         if (bargs_v.tag == .array or bargs_v.tag == .object) {
             const balen = objects.arrayLength(@intCast(bargs_v.data.obj_idx));
+            if (balen + argc > combined.len) { throwRangeErrorMsg("bound argument capacity exceeded"); return; }
             var k: u32 = 0;
             while (k < balen and cn < 64) : (k += 1) {
                 combined[cn] = objects.getArrayElement(@intCast(bargs_v.data.obj_idx), k);
@@ -5231,6 +5574,12 @@ fn fnMethodCall(kind: u16, invoker_idx: u32, argc: u8) void {
         sp -= (argc + 1);
         const btobj = objects.getObject(target.data.func_idx);
         if (btobj.func_id >= 0xF000) {
+            if (builtins.isFnMethod(btobj.func_id) or builtins.isVmIntrinsic(btobj.func_id) or isArrayIterMethod(btobj.func_id)) {
+                const result = callExportedN(target, bthis, combined[0..cn]);
+                if (callbackAborted()) return;
+                push(result);
+                return;
+            }
             if (builtins.nativeIgnoresReceiver(btobj.func_id)) {
                 const result = builtins.callNative(btobj.func_id, combined[0..cn], cn);
                 if (checkNativeThrow()) return;
@@ -5278,31 +5627,42 @@ fn fnMethodCall(kind: u16, invoker_idx: u32, argc: u8) void {
     // scratch buffer (fnapply_args) so the full array is forwarded. The call
     // convention's u8 argc still bounds USER targets (255), but the base64 case
     // targets a NATIVE (fromCharCode) which we dispatch by slice length below.
-    var real_argc: u32 = 0;
+    var real_argc: u32 = if (kind == builtins.N_FN_APPLY) 0 else if (argc > 0) argc - 1 else 0;
+    var argument_list = Value.UNDEFINED;
     if (kind == builtins.N_FN_APPLY) {
         if (argc >= 2) {
             const arr = stack[sp - argc + 1];
-            if (arr.tag == .array or arr.tag == .object) {
+            argument_list = arr;
+            if (arr.tag == .array or arr.tag == .object or arr.tag == .function) {
                 // apply accepts any array-like object, including an ordinary
                 // arguments object. Its length/index properties need normal
                 // reads so mapped values and accessors remain observable.
                 const lv = getPropFromValue(arr, values.internString("length"));
+                if (callbackAborted()) return;
                 const ln = lv.toNumber();
-                const alen: u32 = if (ln > 0) @intFromFloat(@min(ln, @as(f64, @floatFromInt(fnapply_args.len)))) else 0;
-                var k: u32 = 0;
-                while (k < alen and real_argc < fnapply_args.len) : (k += 1) {
-                    fnapply_args[real_argc] = getElemFromValue(arr, Value.number(@floatFromInt(k)));
-                    real_argc += 1;
-                }
-            }
+                if (callbackAborted()) return;
+                const argument_length = if (ln > 0) @trunc(ln) else 0;
+                if (argument_length > 8192) { throwRangeErrorMsg("apply argument capacity exceeded"); return; }
+                real_argc = @intFromFloat(argument_length);
+            } else if (arr.tag != .undefined and arr.tag != .null_val) { throwTypeErrorMsg("apply requires an array-like object"); return; }
+        }
+    }
+    const saved_apply_used = fnapply_used;
+    if (real_argc + 1 > fnapply_storage.len - fnapply_used) { throwRangeErrorMsg("nested apply argument capacity exceeded"); return; }
+    fnapply_used += real_argc + 1;
+    defer fnapply_used = saved_apply_used;
+    const fnapply_recv = fnapply_storage[saved_apply_used..fnapply_used];
+    const fnapply_args = fnapply_recv[1..];
+    fnapply_recv[0] = this_arg;
+    if (kind == builtins.N_FN_APPLY) {
+        for (0..real_argc) |k| {
+            fnapply_args[k] = getElemFromValue(argument_list, Value.number(@floatFromInt(k)));
+            if (callbackAborted()) return;
         }
     } else {
         // .call — copy args after thisArg.
         var k: u8 = 1;
-        while (k < argc and real_argc < fnapply_args.len) : (k += 1) {
-            fnapply_args[real_argc] = stack[sp - argc + k];
-            real_argc += 1;
-        }
+        while (k < argc) : (k += 1) fnapply_args[k - 1] = stack[sp - argc + k];
     }
 
     // Native target: dispatch through callNative. Native methods use args[0]
@@ -5310,6 +5670,14 @@ fn fnMethodCall(kind: u16, invoker_idx: u32, argc: u8) void {
     // and `X.apply(thisArg,[...])` the native must see thisArg as its receiver
     // (e.g. Object.prototype.toString.call(arr) must inspect arr).
     if (tobj.func_id >= 0xF000) {
+        if (builtins.isFnMethod(tobj.func_id)) {
+            const base = sp - (argc + 1);
+            const result = callExportedN(target, this_arg, fnapply_args[0..real_argc]);
+            if (callbackAborted()) return;
+            sp = base;
+            push(result);
+            return;
+        }
         if (builtins.isVmIntrinsic(tobj.func_id)) {
             if (real_argc > 255) { fail("intrinsic apply argument capacity exceeded"); return; }
             sp -= (argc + 1);
@@ -5325,6 +5693,7 @@ fn fnMethodCall(kind: u16, invoker_idx: u32, argc: u8) void {
             const callback = if (real_argc > 0) fnapply_args[0] else Value.UNDEFINED;
             const arg2 = if (real_argc > 1) fnapply_args[1] else Value.UNDEFINED;
             const result = arrayIterMethod(tobj.func_id, this_arg, callback, arg2);
+            if (operation_aborted) return;
             sp -= (argc + 1);
             push(result);
             return;
@@ -5332,6 +5701,7 @@ fn fnMethodCall(kind: u16, invoker_idx: u32, argc: u8) void {
         if (dbg_disable_call_recv or builtins.nativeIgnoresReceiver(tobj.func_id)) {
             const na: u32 = @min(real_argc, @as(u32, 65535));
             const result = builtins.callNative(tobj.func_id, fnapply_args[0..na], @intCast(@min(na, 255)));
+            if (operation_aborted) return;
             sp -= (argc + 1);
             if (checkNativeThrow()) return;
             push(result);
@@ -5339,11 +5709,9 @@ fn fnMethodCall(kind: u16, invoker_idx: u32, argc: u8) void {
         }
         // Prepend this_arg as args[0]; forward the full spread (bounded by the
         // scratch buffer) so large `.apply` arrays reach the native intact.
-        fnapply_recv[0] = this_arg;
-        var ci: u32 = 0;
-        while (ci < real_argc and ci + 1 < fnapply_recv.len) : (ci += 1) fnapply_recv[ci + 1] = fnapply_args[ci];
-        const total: u32 = ci + 1;
+        const total: u32 = real_argc + 1;
         const result = builtins.callNative(tobj.func_id, fnapply_recv[0..total], @intCast(@min(total, 255)));
+        if (operation_aborted) return;
         sp -= (argc + 1);
         if (checkNativeThrow()) return;
         push(result);
@@ -5663,8 +6031,11 @@ pub fn dbgDlVal(i: usize) f64 { return if (i < 16) dbg_dl_vals[i] else -1; }
 pub var execution_limit: u64 = 200_000_000;
 pub var dbg_gtrace_on: bool = false;
 pub var dbg_type_n: usize = 0;
+// Independent development capture; avoids enabling expensive protocol tracing.
+pub var debug_typeof_on: bool = false;
 pub var dbg_branch_a: Value = Value.UNDEFINED;
 pub var dbg_branch_b: Value = Value.UNDEFINED;
+pub var dbg_branch_slots: [16]Value = undefined;
 pub var dbg_417_n: usize = 0;
 pub var dbg_417_values: [32]Value = undefined;
 pub var dbg_417_registers: [32]f64 = undefined;
@@ -5695,6 +6066,9 @@ pub var dbg_gtrace_cap_keynums: [5][32]Value = undefined;
 pub var dbg_gtrace_cap_keylens: [5]u32 = [_]u32{0} ** 5;
 pub var dbg_gtrace_sel: [200000]i32 = undefined;
 pub var dbg_gtrace_n: usize = 0;
+pub var dbg_gtrace_prefix: ?[]const u8 = null;
+pub var dbg_gtrace_pos_slot: u16 = 14;
+pub var dbg_gtrace_sel_slot: u16 = 2;
 pub fn dbgGTraceEnable(func: u16) void { dbg_gtrace_on = true; dbg_gtrace_func = func; dbg_gtrace_n = 0; }
 pub fn dbgGTraceN() usize { return dbg_gtrace_n; }
 pub fn dbgGTraceVal(i: usize) f64 { return if (i < dbg_gtrace_n) dbg_gtrace_val[i] else -1234567890123.0; }
@@ -5705,6 +6079,8 @@ pub var dbg_gtrace_cap_func: [32]u16 = [_]u16{0xFFFF} ** 32;
 pub var dbg_gtrace_cap_ip: [32]u32 = [_]u32{0} ** 32;
 pub var dbg_gtrace_cap_n: usize = 0;
 pub var dbg_gtrace_cap_slots: [32][16]Value = undefined;
+pub var dbg_gtrace_cap_upvals: [32][32]Value = undefined;
+
 pub fn dbgGTraceCapSet(idx: usize) void { dbg_gtrace_cap_idx = idx; }
 pub fn dbgGTraceCapN() usize { return dbg_gtrace_cap_n; }
 pub fn dbgGTraceCapFunc(i: usize) u16 { return if (i < 32) dbg_gtrace_cap_func[i] else 0xFFFF; }
@@ -5962,6 +6338,32 @@ fn callConstructor(argc: u8) void {
 
     const ctor_slot = sp - 1 - argc;
     const native_ctor = stack[ctor_slot];
+    if (native_ctor.tag == .function) {
+        const id = objects.closureFuncId(native_ctor.data.func_idx);
+        const native_without_constructor = id >= builtins.NATIVE_BASE and !builtins.nativeHasPrototype(id) and id != builtins.N_PROXY_CONSTRUCTOR and !objects.hasOwnProperty(native_ctor.data.func_idx, values.internString("prototype"));
+        if (id == builtins.N_FUNCTION_PROTO or id == builtins.N_SYMBOL or native_without_constructor or (id < builtins.NATIVE_BASE and (compiler.getFunction(id).is_arrow or compiler.getFunction(id).is_async or compiler.getFunction(id).is_generator))) { throwTypeErrorMsg("function is not a constructor"); return; }
+    }
+    if (native_ctor.tag == .function and objects.closureFuncId(native_ctor.data.func_idx) == builtins.N_NUMBER_CTOR) {
+        const result = builtins.constructNumber(stack[ctor_slot + 1 .. sp]);
+        if (operation_aborted) return;
+        sp = ctor_slot;
+        if (checkNativeThrow()) return;
+        push(result);
+        return;
+    }
+    if (native_ctor.tag == .function and objects.closureFuncId(native_ctor.data.func_idx) == builtins.N_BOOLEAN_CTOR) {
+        const result = builtins.constructBoolean(stack[ctor_slot + 1 .. sp]);
+        sp = ctor_slot;
+        push(result);
+        return;
+    }
+    if (native_ctor.tag == .function and objects.closureFuncId(native_ctor.data.func_idx) == builtins.N_STRING_CTOR) {
+        const result = builtins.constructString(stack[ctor_slot + 1 .. sp]);
+        sp = ctor_slot;
+        if (checkNativeThrow()) return;
+        push(result);
+        return;
+    }
     if (native_ctor.tag == .function and objects.closureFuncId(native_ctor.data.func_idx) == builtins.N_DATE_CTOR) {
         const result = builtins.constructDate(stack[ctor_slot + 1 .. sp]);
         sp = ctor_slot;
@@ -5986,14 +6388,16 @@ fn callConstructor(argc: u8) void {
     const callee_peek = if (sp >= argc + 1) stack[sp - 1 - argc] else Value.UNDEFINED;
     if (callee_peek.tag == .function) {
         const fproto = getPropFromValue(callee_peek, values.internString("prototype"));
-        if (fproto.tag == .object) {
+        if (fproto.tag == .object or fproto.tag == .array or fproto.tag == .function) {
             objects.setObjectPrototype(new_obj, @intCast(fproto.data.obj_idx));
         }
     }
 
     // Dispatch the call normally (the callee function must stay in place so
     // callFunction can find it). callFunction sets bp = the callee slot.
+    const caller = SyncCaller.capture();
     callFunction(argc);
+    if (frame_count <= depth_before and caller.transferred()) return;
 
     if (frame_count > depth_before) {
         // A user-function frame was pushed: overwrite its slot 0 (this) with
@@ -6005,7 +6409,7 @@ fn callConstructor(argc: u8) void {
         if (fi < MAX_FRAMES) { ctor_new_obj[fi] = new_obj; ctor_is[fi] = true; }
     } else {
         // Native/immediate: if it didn't return an object, use the new object.
-        if (sp > 0 and stack[sp - 1].tag != .object and stack[sp - 1].tag != .array) {
+        if (sp > 0 and stack[sp - 1].tag != .object and stack[sp - 1].tag != .array and stack[sp-1].tag != .function) {
             stack[sp - 1] = Value.object(new_obj);
         }
     }
@@ -6120,6 +6524,36 @@ pub fn dbgS137OpCount() usize { return dbg_s137_op_n; }
 pub fn dbgS137OpName(i: usize) []const u8 { if (i >= dbg_s137_op_n) return ""; return @tagName(@as(Op, @enumFromInt(dbg_s137_op[i]))); }
 
 fn returnFromFrame(result_in: Value) void {
+    if (frame_count > 0 and returnThroughFinally(result_in)) return;
+    if (debug_function_return) |observe| {
+        if (frame_count > 0) {
+            const current = frames[frame_count - 1];
+            const desc = compiler.getFunction(current.func_id);
+            observe(current.func_id, stack[current.bp..@min(sp, current.bp + @as(u32, desc.param_count) + 1)], result_in);
+        }
+    }
+    if (dbg_gtrace_on and dbg_gtrace_n == 16350 and frame_count > 0 and dbg_ud_n < dbg_ud_result.len) {
+        const frame = frames[frame_count-1];
+        if (startsWith(compiler.funcSourceText(frame.func_id), "function(J,z,Z,b,k,c,l,D,T,H,P,G,v,q,p,g){for(p=47;")) {
+            const state = stack[frame.bp+6];
+            dbg_ud_result[dbg_ud_n] = result_in;
+            for (0..16) |i| dbg_ud_slots[dbg_ud_n][i] = stack[frame.bp+i];
+            if (state.tag == .object) {
+                for ([_][]const u8{"G","Pv","eS","ED","nW","T","Tb","Vm","S0","l","O","N","W9","I","B9","K"},0..) |name,i| dbg_ud_fields[dbg_ud_n][i] = objects.getProperty(state.data.obj_idx, values.internString(name));
+            }
+            dbg_ud_n += 1;
+        }
+    }
+    if (dbg_gtrace_on and frame_count > 0 and dbg_factory_n < dbg_factory_rows.len) {
+        const frame = frames[frame_count-1];
+        if (startsWith(compiler.funcSourceText(frame.func_id), "function(G,v,q){if((H=(q=(v=")) {
+            const reg = debugUpvalue(frame, "J");
+            if (reg.tag == .number and reg.data.number == @as(f64, @floatFromInt(dbg_factory_register))) {
+                dbg_factory_rows[dbg_factory_n] = .{ result_in, stack[frame.bp+1], stack[frame.bp+2], stack[frame.bp+3], debugUpvalue(frame,"D"), debugUpvalue(frame,"H"), debugUpvalue(frame,"c"), debugUpvalue(frame,"z"), debugUpvalue(frame,"k") };
+                dbg_factory_n += 1;
+            }
+        }
+    }
     var result = result_in;
     if (dbg_gtrace_on and frame_count > 0) {
         const hf = frames[frame_count - 1];
@@ -6163,14 +6597,25 @@ fn returnFromFrame(result_in: Value) void {
     }
     // Trace the G reader (func dbg_gtrace_func) return values, so the decoded
     // operand array (dL = g[1][1]) element sequence can be diffed vs the oracle.
-    if (dbg_gtrace_on and frame_count > 0 and (frames[frame_count - 1].func_id == dbg_gtrace_func or startsWith(compiler.funcSourceText(frames[frame_count - 1].func_id), "function(b,x,g,Y,L){for(null==false;") or startsWith(compiler.funcSourceText(frames[frame_count - 1].func_id), "function(f,Q,E,T,D,e,H,q,P,O,I,Y,K,V,y,X){if((V=b(f,94),V)>=")) and dbg_gtrace_n < dbg_gtrace_val.len) {
+    if (dbg_gtrace_on and frame_count > 0 and (frames[frame_count - 1].func_id == dbg_gtrace_func or (if (dbg_gtrace_prefix) |prefix| startsWith(compiler.funcSourceText(frames[frame_count - 1].func_id), prefix) else false) or startsWith(compiler.funcSourceText(frames[frame_count - 1].func_id), "function(b,x,g,Y,L){for(null==false;") or startsWith(compiler.funcSourceText(frames[frame_count - 1].func_id), "function(f,Q,E,T,D,e,H,q,P,O,I,Y,K,V,y,X){if((V=b(f,94),V)>=")) and dbg_gtrace_n < dbg_gtrace_val.len) {
+        if (dbg_gtrace_n == 16349 and frame_count >= 3) {
+            const state = stack[frames[frame_count-1].bp+2];
+            const saved = stack[frames[frame_count-3].bp+4];
+            const current = objects.getProperty(state.data.obj_idx, values.internString("R"));
+            for ([_]Value{ saved, current },0..) |array,i| {
+                const cell = objects.getArrayElement(array.data.obj_idx,57);
+                dbg_snapshot_cells[i+2] = cell;
+                const getter = objects.getProperty(cell.data.obj_idx,values.internString("create"));
+                dbg_snapshot_cells[i] = if (getter.tag == .function) debugUpvalue(.{ .func_id=objects.closureFuncId(getter.data.func_idx),.closure_obj=getter.data.func_idx },"J") else Value.UNDEFINED;
+            }
+        }
         dbg_gtrace_val[dbg_gtrace_n] = if (result_in.tag == .number) result_in.data.number else -1234567890123.0;
         // Record G's selector arg x (local 2) so we can see if a divergent read
         // used a varint-triggering selector.
         const gf = frames[frame_count - 1];
         const gsrc = compiler.funcSourceText(gf.func_id);
-        dbg_gtrace_pos[dbg_gtrace_n] = if (startsWith(gsrc, "function(f,Q,E,T,D,e,H,q,P,O,I,Y,K,V,y,X){if((V=b(f,94),V)>=") and gf.bp + 14 < MAX_STACK and stack[gf.bp + 14].tag == .number) stack[gf.bp + 14].data.number else -1;
-        dbg_gtrace_sel[dbg_gtrace_n] = if (gf.bp + 2 < MAX_STACK and stack[gf.bp + 2].tag == .number) @intFromFloat(stack[gf.bp + 2].data.number) else -1;
+        dbg_gtrace_pos[dbg_gtrace_n] = if ((dbg_gtrace_prefix != null or startsWith(gsrc, "function(f,Q,E,T,D,e,H,q,P,O,I,Y,K,V,y,X){if((V=b(f,94),V)>=")) and gf.bp + dbg_gtrace_pos_slot < MAX_STACK and stack[gf.bp + dbg_gtrace_pos_slot].tag == .number) stack[gf.bp + dbg_gtrace_pos_slot].data.number else -1;
+        dbg_gtrace_sel[dbg_gtrace_n] = if (gf.bp + dbg_gtrace_sel_slot < MAX_STACK and stack[gf.bp + dbg_gtrace_sel_slot].tag == .number) @intFromFloat(stack[gf.bp + dbg_gtrace_sel_slot].data.number) else -1;
         // At the known-divergent G index, capture the full caller stack (func@ip)
         // so we can identify the dispatch that chose the wrong selector.
         if (dbg_gtrace_n == dbg_gtrace_cap_idx) {
@@ -6415,7 +6860,7 @@ fn returnFromFrame(result_in: Value) void {
     const idx = frame_count - 1;
     if (idx < MAX_FRAMES and ctor_is[idx]) {
         ctor_is[idx] = false;
-        if (result.tag != .object and result.tag != .array) {
+        if (result.tag != .object and result.tag != .array and result.tag != .function) {
             result = Value.object(ctor_new_obj[idx]);
         }
     }
@@ -6594,6 +7039,8 @@ pub var dbg_crp_prop_len: usize = 0;
 pub var dbg_crp_captured: bool = false;
 pub var dbg_crp_func: u16 = 0xFFFF;
 pub var dbg_crp_ip: u32 = 0;
+pub var dbg_crp_gn: usize = 0;
+pub var dbg_capture_on_throw: bool = false;
 pub fn dbgCrpFunc() u16 { return dbg_crp_func; }
 pub fn dbgCrpIp() u32 { return dbg_crp_ip; }
 pub fn dbgCrpOpCount() usize { return dbg_crp_op_n; }
@@ -6644,6 +7091,27 @@ fn throwCannotReadProp(is_null: bool, prop_name: []const u8) void {
     // Capture the opcode ring + IP at the FIRST cannot-read throw for analysis.
     if (dbg_mm_probe and !dbg_crp_captured) {
         dbg_crp_captured = true;
+        dbg_crp_gn = dbg_gtrace_n;
+        if (dbg_capture_on_throw) {
+            dbg_gtrace_cap_n = @min(frame_count, dbg_gtrace_cap_slots.len);
+            for (0..dbg_gtrace_cap_n) |i| {
+                const captured = frames[frame_count - 1 - i];
+                dbg_gtrace_cap_func[i] = captured.func_id;
+                dbg_gtrace_cap_ip[i] = captured.ip;
+                for (0..16) |j| dbg_gtrace_cap_slots[i][j] = if (captured.bp + j < MAX_STACK) stack[captured.bp + j] else Value.UNDEFINED;
+                for (0..32) |j| {
+                    var value = Value.UNDEFINED;
+                    if (captured.closure_obj != objects.NULL_OBJ and j < objects.closureUpvalCount(captured.closure_obj)) {
+                        if (objects.isClosureUpvalClosed(captured.closure_obj, @intCast(j))) value = objects.getClosureUpvalClosedVal(captured.closure_obj, @intCast(j))
+                        else {
+                            const address = objects.getClosureUpvalAddr(captured.closure_obj, @intCast(j));
+                            if (address != objects.NO_UPVAL_ADDR and address < MAX_STACK) value = stack[address];
+                        }
+                    }
+                    dbg_gtrace_cap_upvals[i][j] = value;
+                }
+            }
+        }
         if (frame_count > 0) { dbg_crp_func = frames[frame_count - 1].func_id; dbg_crp_ip = frames[frame_count - 1].ip; }
         const pl = @min(prop_name.len, dbg_crp_prop.len);
         @memcpy(dbg_crp_prop[0..pl], prop_name[0..pl]);
@@ -6681,15 +7149,38 @@ fn throwCannotReadProp(is_null: bool, prop_name: []const u8) void {
 /// Raise a TypeError with an arbitrary message. Used to surface a throw
 /// requested by a native builtin (builtins.native_throw), e.g.
 /// String.prototype.toString applied to a non-String `this`.
+fn throwCannotSetProp(is_null: bool, name: ?[]const u8) void {
+    var buffer: [256]u8 = undefined;
+    const base = if (is_null) "null" else "undefined";
+    const prefix = "Cannot set properties of ";
+    @memcpy(buffer[0..prefix.len], prefix);
+    @memcpy(buffer[prefix.len..][0..base.len], base);
+    var length = prefix.len + base.len;
+    if (name) |property| {
+        const setting = " (setting '";
+        @memcpy(buffer[length..][0..setting.len], setting); length += setting.len;
+        const take = @min(property.len, buffer.len - length - 2);
+        @memcpy(buffer[length..][0..take], property[0..take]); length += take;
+        @memcpy(buffer[length..][0..2], "')"); length += 2;
+    }
+    throwTypeErrorMsg(buffer[0..length]);
+}
 fn throwTypeErrorMsg(msg: []const u8) void {
+    if (operation_aborted) return;
     const err = makeErrorObject("TypeError", msg);
     had_error = true;
     throwException(err);
+}
+fn throwRangeErrorMsg(msg: []const u8) void {
+    if (operation_aborted) return;
+    had_error = true;
+    throwException(makeErrorObject("RangeError", msg));
 }
 
 /// If the most recent native call requested a throw, convert it into a real VM
 /// TypeError throw. Returns true if a throw was raised (caller must return).
 fn checkNativeThrow() bool {
+    if (operation_aborted) { builtins.native_throw = false; return true; }
     if (!builtins.native_throw) return false;
     builtins.native_throw = false;
     const err = makeErrorObject(builtins.native_throw_name, builtins.nativeThrowMsg());
@@ -6951,6 +7442,14 @@ fn throwException(val: Value) void {
             if (e2.tag == .number) {
                 const zf: f64 = e2.data.number;
                 const zi: i64 = @intFromFloat(zf);
+                if (dbg_gtrace_on and zi == 12 and dbg_register_fault_depth == 0) {
+                    dbg_register_fault_depth = @min(frame_count, dbg_register_fault_frames.len);
+                    for (0..dbg_register_fault_depth) |i| {
+                        const captured = frames[frame_count - 1 - i];
+                        dbg_register_fault_frames[i] = captured.func_id;
+                        for (0..16) |j| dbg_register_fault_locals[i][j] = if (captured.bp+j < MAX_STACK) stack[captured.bp+j] else Value.UNDEFINED;
+                    }
+                }
                 dbg_regfault_total += 1;
                 if (dbg_regfault_first_z < 0) {
                     dbg_regfault_first_z = zi;
@@ -7002,6 +7501,8 @@ fn throwException(val: Value) void {
     while (try_count > 0) {
         try_count -= 1;
         const tf = try_frames[try_count];
+        const destination = if (tf.catch_ip != 0) tf.catch_ip else tf.finally_ip;
+        if (destination != 0) discardFinallyOutside(tf.frame_depth, destination);
 
         // Unwind call frames
         if (frame_count > tf.frame_depth) closeUpvalues(frames[tf.frame_depth].bp);
@@ -7028,8 +7529,7 @@ fn throwException(val: Value) void {
             if (frame_count > 0) {
                 frames[frame_count - 1].ip = tf.finally_ip;
             }
-            pending_exception = true;
-            pending_exception_val = error_value;
+            staged_completion = .{ .kind = .exception, .value = error_value };
             had_error = false;
             dbg_finally_unwind += 1;
             return;
@@ -7037,18 +7537,22 @@ fn throwException(val: Value) void {
     }
 
     // Unhandled — set the error flag (execution will stop).
+    discardFinallyOutside(0, 0);
+    staged_completion = null;
     fail("uncaught exception");
 }
 
 // ── Stack Operations ──
 
 fn push(val: Value) void {
+    if (operation_aborted) return;
     if (sp >= MAX_STACK) { fail("stack overflow"); return; }
     stack[sp] = val;
     sp += 1;
 }
 
 fn pop() Value {
+    if (operation_aborted) return Value.UNDEFINED;
     if (sp == 0) return Value.UNDEFINED;
     sp -= 1;
     return stack[sp];
@@ -7270,34 +7774,7 @@ fn objectToStringIdx(v: Value) u32 {
     return values.internString("[object Object]");
 }
 
-fn formatNumber(n: f64, buf: *[32]u8) usize {
-    // Simple integer formatting (handles most BotGuard cases)
-    if (n == 0) { buf[0] = '0'; return 1; }
-    if (n != n) { @memcpy(buf[0..3], "NaN"); return 3; }
-
-    var len: usize = 0;
-    var val = n;
-    if (val < 0) { buf[0] = '-'; len = 1; val = -val; }
-
-    // Clamp huge/Infinity so @intFromFloat cannot overflow u64.
-    const inf = @as(f64, @bitCast(@as(u64, 0x7FF0000000000000)));
-    if (val == inf) { @memcpy(buf[len .. len + 8], "Infinity"); return len + 8; }
-    if (val >= 1.8e19) val = 0; // beyond u64 range — degrade gracefully
-
-    // Integer part
-    const int_part: u64 = @intFromFloat(@floor(val));
-    var digits: [20]u8 = undefined;
-    var d: usize = 0;
-    var tmp = int_part;
-    if (tmp == 0) { digits[0] = '0'; d = 1; } else {
-        while (tmp > 0) : (d += 1) { digits[d] = @intCast((tmp % 10) + '0'); tmp /= 10; }
-    }
-    // Reverse digits
-    var i: usize = 0;
-    while (i < d) : (i += 1) { buf[len + i] = digits[d - 1 - i]; }
-    len += d;
-    return len;
-}
+fn formatNumber(n: f64, buf: *[32]u8) usize { return values.numberToString(n, buf); }
 
 fn strictEq(a: Value, b: Value) bool {
     if (a.tag != b.tag) return false;
@@ -7331,14 +7808,46 @@ fn abstractEq(a: Value, b: Value) bool {
     return a.toNumber() == b.toNumber();
 }
 
+const RelationalOrder = enum { less, equal, greater, unordered };
+
+fn relationalOrder(left: Value, right: Value) RelationalOrder {
+    // ToPrimitive runs left-to-right for all four operators. Two strings use
+    // lexical ordering; mixed primitive types use numeric conversion. NaN
+    // is unordered, so <= and >= must not be implemented as negated < or >.
+    const a = if (left.tag == .object or left.tag == .array or left.tag == .function) objectPrimitiveWithHint(left, false) else left;
+    if (had_error) return .unordered;
+    const b = if (right.tag == .object or right.tag == .array or right.tag == .function) objectPrimitiveWithHint(right, false) else right;
+    if (had_error) return .unordered;
+    if (a.tag == .string and b.tag == .string) {
+        const x = values.getString(a.data.str_idx);
+        const y = values.getString(b.data.str_idx);
+        for (0..@min(x.len, y.len)) |i| {
+            if (x[i] < y[i]) return .less;
+            if (x[i] > y[i]) return .greater;
+        }
+        return if (x.len < y.len) .less else if (x.len > y.len) .greater else .equal;
+    }
+    const x = a.toNumber();
+    const y = b.toNumber();
+    if (x != x or y != y) return .unordered;
+    return if (x < y) .less else if (x > y) .greater else .equal;
+}
+
 fn objectPrimitive(value: Value) Value {
-    // OrdinaryToPrimitive with number/default hint: valueOf before toString.
+    // Date's default hint is string. Numeric operations still explicitly
+    // request number, while addition and loose equality use the default hint.
+    return objectPrimitiveWithHint(value, objects.objTypeOf(value.data.obj_idx) == .date);
+}
+
+fn objectPrimitiveWithHint(value: Value, prefer_string: bool) Value {
+    if (callbackAborted()) return Value.UNDEFINED;
     // Calling through the VM preserves receiver binding and user side effects.
-    for ([_][]const u8{ "valueOf", "toString" }) |name| {
+    const names = if (prefer_string) [_][]const u8{ "toString", "valueOf" } else [_][]const u8{ "valueOf", "toString" };
+    for (names) |name| {
         const method = getPropFromValue(value, values.internString(name));
         if (method.tag != .function) continue;
         const result = callValueSync(method, value, Value.UNDEFINED, Value.UNDEFINED, Value.UNDEFINED, 0);
-        if (had_error) return Value.UNDEFINED;
+        if (callbackAborted()) return Value.UNDEFINED;
         if (result.tag != .object and result.tag != .array and result.tag != .function) return result;
     }
     throwTypeErrorMsg("Cannot convert object to primitive value");
@@ -7346,11 +7855,12 @@ fn objectPrimitive(value: Value) Value {
 }
 
 fn stringObjectPrimitive(value: Value) u32 {
+    if (callbackAborted()) return values.internString("");
     for ([_][]const u8{ "toString", "valueOf" }) |name| {
         const method = getPropFromValue(value, values.internString(name));
         if (method.tag != .function) continue;
         const result = callValueSync(method, value, Value.UNDEFINED, Value.UNDEFINED, Value.UNDEFINED, 0);
-        if (had_error) return values.internString("");
+        if (callbackAborted()) return values.internString("");
         if (result.tag != .object and result.tag != .array and result.tag != .function) return valueToStringIdx(result);
     }
     throwTypeErrorMsg("Cannot convert object to primitive value");
@@ -7358,8 +7868,9 @@ fn stringObjectPrimitive(value: Value) u32 {
 }
 
 fn numericObjectPrimitive(index: u32) f64 {
+    if (callbackAborted()) return @bitCast(@as(u64, 0x7FF8000000000000));
     const value = if (objects.objTypeOf(index) == .function) Value.function(index) else Value.object(index);
-    return objectPrimitive(value).toNumber();
+    return objectPrimitiveWithHint(value, false).toNumber();
 }
 
 /// `a instanceof B`: true if B.prototype is in a's [[Prototype]] chain.
@@ -7369,7 +7880,7 @@ fn instanceOf(a: Value, b: Value) bool {
     // B.prototype (lazily created for user functions; for built-in Array/Object
     // constructors this is the corresponding shared proto object).
     const bproto = getPropFromValue(b, values.internString("prototype"));
-    if (bproto.tag != .object and bproto.tag != .array) {
+    if (bproto.tag != .object and bproto.tag != .array and bproto.tag != .function) {
         // Built-in constructors (Array, Object, ...) whose `.prototype` maps to
         // a shared proto: match by the constructor's well-known proto.
         return instanceOfBuiltin(a, b);
@@ -7429,6 +7940,7 @@ fn typeofValue(v: Value) Value {
 }
 
 fn getPropFromValue(obj_val: Value, name_idx: u32) Value {
+    if (callbackAborted()) return Value.UNDEFINED;
     // Diagnostic: reading `.prototype` (or any prop) off undefined/null is the
     // usual precursor to a not-callable. Capture the first such occurrence with
     // the receiver-producing lookup name so we can locate the divergence.
@@ -7442,23 +7954,12 @@ fn getPropFromValue(obj_val: Value, name_idx: u32) Value {
         if (frame_count > 0) { dbg_undef_prop_func = frames[frame_count - 1].func_id; dbg_undef_prop_ip = frames[frame_count - 1].ip; }
     }
     if (obj_val.tag == .function) {
-        // Function.prototype.call / .apply / .bind — return a bound invoker that
-        // remembers the target function (stored under "__target__").
         const name = values.getString(name_idx);
         // Trace: log the sequence of `.apply` reads on FUNCTIONS (E is a fn) so
         // we can compare our VM's apply-probe sequence to jsdom's.
         if (dbg_mm_probe and eql(name, "apply") and dbg_applyseq_n < 32) {
             dbg_applyseq_tag[dbg_applyseq_n] = 6; // function
             dbg_applyseq_n += 1;
-        }
-        var kind: u16 = 0;
-        if (eql(name, "call")) kind = builtins.N_FN_CALL
-        else if (eql(name, "apply")) kind = builtins.N_FN_APPLY
-        else if (eql(name, "bind")) kind = builtins.N_FN_BIND;
-        if (kind != 0) {
-            const inv = objects.createFunction(kind);
-            objects.setProperty(inv, values.internString("__target__"), obj_val);
-            return Value.function(inv);
         }
         const fobj: u32 = obj_val.data.obj_idx;
         const fid = objects.closureFuncId(fobj);
@@ -7472,9 +7973,12 @@ fn getPropFromValue(obj_val: Value, name_idx: u32) Value {
         // `f.prototype.method = ...` and `new f()`, so this must exist or the
         // whole setup collapses (dY.prototype would be undefined → tamper throw).
         if (eql(name, "prototype")) {
+            if (fid == builtins.N_FUNCTION_PROTO or (fid < builtins.NATIVE_BASE and compiler.getFunction(fid).is_arrow)) return Value.UNDEFINED;
             if (objects.hasOwnProperty(fobj, name_idx)) {
                 return objects.getProperty(fobj, name_idx);
             }
+            if (fid >= builtins.NATIVE_BASE and !builtins.nativeHasPrototype(fid)) return Value.UNDEFINED;
+            if (fid < builtins.NATIVE_BASE and compiler.getFunction(fid).is_async and !compiler.getFunction(fid).is_generator) return Value.UNDEFINED;
             const proto = objects.createObject();
             // proto.constructor = the function (standard JS)
             objects.setProperty(proto, values.internString("constructor"), obj_val);
@@ -7571,7 +8075,11 @@ fn getPropFromValue(obj_val: Value, name_idx: u32) Value {
         // String property access (length, prototype methods)
         const name = values.getString(name_idx);
         if (eql(name, "length")) {
-            return Value.number(@floatFromInt(values.getStringLen(obj_val.data.str_idx)));
+            return Value.number(@floatFromInt(values.getStringUnitLength(obj_val.data.str_idx)));
+        }
+        if (objects.arrayIndexName(name)) |index| {
+            if (index < values.getStringUnitLength(obj_val.data.str_idx)) return Value.string(values.getStringUnit(obj_val.data.str_idx, index));
+            return Value.UNDEFINED;
         }
         // Check string prototype
         return objects.getProperty(objects.getStringProto(), name_idx);
@@ -7590,6 +8098,11 @@ fn getPropFromValue(obj_val: Value, name_idx: u32) Value {
 }
 
 fn setPropOnValue(obj_val: Value, name_idx: u32, val: Value) void {
+    if (callbackAborted()) return;
+    if (obj_val.tag == .undefined or obj_val.tag == .null_val) {
+        throwCannotSetProp(obj_val.tag == .null_val, values.getString(name_idx));
+        return;
+    }
     if (obj_val.tag == .object or obj_val.tag == .array or obj_val.tag == .function) {
         const oi: u32 = obj_val.data.obj_idx;
         // Assigning `arr.length = N` on an array resizes it (JS: truncates when
@@ -7618,6 +8131,7 @@ fn setPropOnValue(obj_val: Value, name_idx: u32, val: Value) void {
 /// register read and stalls the interpreter. This path is shared by set_prop
 /// and computed string-key set_elem.
 fn setPropRespectingAccessors(oi: u32, name_idx: u32, val: Value, receiver: Value) void {
+    if (callbackAborted()) return;
     if (eql(values.getString(name_idx), "H") and val.tag == .number and dbg_hnum_func == 0xFFFF and frame_count > 0) { dbg_hnum_func = frames[frame_count-1].func_id; dbg_hnum_value = val.data.number; dbg_hnum_caller = if (frame_count > 1) frames[frame_count-2].func_id else 0xFFFF; }
     var setter: Value = Value.UNDEFINED;
     switch (objects.resolveSet(oi, name_idx, &setter)) {
@@ -7712,7 +8226,8 @@ fn getElemFromValue(obj_val: Value, key: Value) Value {
         // get/set asymmetry made EVERY numeric-keyed object read miss — which is
         // exactly how BotGuard's register banks are accessed (`x.Y[bankNum]`),
         // causing thousands of spurious register-void faults and a null token.
-        if (numIsArrayIndex(key.data.number) and objects.objTypeOf(@intCast(obj_val.data.obj_idx)) == .array) {
+        const indexed_type = objects.objTypeOf(obj_val.data.obj_idx);
+        if (numIsArrayIndex(key.data.number) and (indexed_type == .array or indexed_type == .typed_array)) {
             const idx: u32 = @intFromFloat(@floor(key.data.number));
             if (objects.hasArrayElement(obj_val.data.obj_idx, idx)) return objects.getArrayElement(obj_val.data.obj_idx, idx);
             return getPropFromValue(obj_val, builtins.keyToNameIdx(key));
@@ -7738,10 +8253,9 @@ fn getElemFromValue(obj_val: Value, key: Value) Value {
     // Numeric index into a string: single-char access (canonical index only).
     if (obj_val.tag == .string and key.tag == .number) {
         if (!numIsArrayIndex(key.data.number)) return Value.UNDEFINED;
-        const str = values.getString(obj_val.data.str_idx);
         const idx: usize = @intFromFloat(@floor(key.data.number));
-        if (idx < str.len) {
-            const ch_idx = values.internString(str[idx .. idx + 1]);
+        if (idx < values.getStringUnitLength(obj_val.data.str_idx)) {
+            const ch_idx = values.getStringUnit(obj_val.data.str_idx, idx);
             return Value.string(ch_idx);
         }
         return Value.UNDEFINED;
@@ -7758,7 +8272,7 @@ fn getElemFromValue(obj_val: Value, key: Value) Value {
         // with string keys; treating them as named props returned undefined and
         // derailed the whole interpreter loop.
         if ((obj_val.tag == .array or obj_val.tag == .object) and
-            objects.objTypeOf(@intCast(obj_val.data.obj_idx)) == .array)
+            (objects.objTypeOf(obj_val.data.obj_idx) == .array or objects.objTypeOf(obj_val.data.obj_idx) == .typed_array))
         {
             const ks = values.getString(key.data.str_idx);
             if (parseArrayIndex(ks)) |idx| {
@@ -7779,11 +8293,21 @@ fn getElemFromValue(obj_val: Value, key: Value) Value {
 }
 
 fn setElemOnValue(obj_val: Value, key: Value, val: Value) void {
+    if (callbackAborted()) return;
+    if (obj_val.tag == .undefined or obj_val.tag == .null_val) {
+        // PutValue fails before an object key's conversion. Key expression and
+        // RHS have already run; do not invoke a key's toString on this path.
+        const name = if (key.tag == .object or key.tag == .array or key.tag == .function) null else values.getString(builtins.keyToNameIdx(key));
+        throwCannotSetProp(obj_val.tag == .null_val, name);
+        return;
+    }
     if (obj_val.tag != .object and obj_val.tag != .array and obj_val.tag != .function) return;
     const oi: u32 = obj_val.data.obj_idx;
     if (key.tag == .number) {
-        if (objects.objTypeOf(oi) == .array and numIsArrayIndex(key.data.number)) {
+        if ((objects.objTypeOf(oi) == .array or objects.objTypeOf(oi) == .typed_array) and numIsArrayIndex(key.data.number)) {
             if (objects.isFrozen(oi)) return;
+            const name = builtins.keyToNameIdx(key);
+            if (objects.dbgFindPropNode(oi, name) != objects.NULL_PROP) { setPropRespectingAccessors(oi, name, val, obj_val); return; }
             objects.setArrayElement(oi, @intFromFloat(@floor(key.data.number)), val);
             return;
         }
@@ -7793,10 +8317,11 @@ fn setElemOnValue(obj_val: Value, key: Value, val: Value) void {
     }
     if (key.tag == .string) {
         // Numeric-string key on an array writes the element (mirror of getElem).
-        if (objects.objTypeOf(oi) == .array) {
+        if (objects.objTypeOf(oi) == .array or objects.objTypeOf(oi) == .typed_array) {
             const ks = values.getString(key.data.str_idx);
             if (parseArrayIndex(ks)) |idx| {
                 if (objects.isFrozen(oi)) return;
+                if (objects.dbgFindPropNode(oi, key.data.str_idx) != objects.NULL_PROP) { setPropRespectingAccessors(oi, key.data.str_idx, val, obj_val); return; }
                 objects.setArrayElement(oi, idx, val);
                 return;
             }
