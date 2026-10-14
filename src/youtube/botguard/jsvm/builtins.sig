@@ -257,6 +257,7 @@ pub const N_DOM_APPEND: u16 = NATIVE_BASE + 270;
 pub const N_DOM_REMOVE: u16 = NATIVE_BASE + 271;
 pub const N_DOM_FRAME_LOAD: u16 = NATIVE_BASE + 272;
 pub const N_DOM_EMPTY_OBJECT: u16 = NATIVE_BASE + 273;
+pub const N_NAV_WEBDRIVER: u16 = NATIVE_BASE + 274;
 pub var dbg_iframe_reads: u32 = 0;
 var regexp_proto: u32 = objects.NULL_OBJ;
 
@@ -976,6 +977,7 @@ pub fn callNative(func_id: u16, args: []const Value, argc: u8) Value {
         N_DOM_FRAME_LOAD => domFrameLoad(args),
         N_DOM_LOOKUP_NAMESPACE => domLookupNamespace(args),
         N_DOM_FALSE => Value.FALSE,
+        N_NAV_WEBDRIVER => navigatorWebdriver(args),
         N_DOM_IMAGE => makeDomElement(&.{Value.string(values.internString("img"))}),
         N_DOM_EMPTY_STRING => Value.string(values.internString("")),
         N_MEDIA_CAN_PLAY => mediaCanPlay(args),
@@ -1468,6 +1470,14 @@ fn applyPropertyDescriptors(target: u32, props: Value) bool {
         if (native_throw or callbackAborted()) return false;
     }
     return true;
+}
+
+// WebIDL attribute getters require an actual interface instance. A forged
+// prototype chain or a detached invocation cannot supply its internal slots.
+fn navigatorWebdriver(args: []const Value) Value {
+    if (args.len > 0 and args[0].tag == .object and objects.getObject(args[0].data.obj_idx).dom_navigator) return Value.FALSE;
+    requestNativeThrow("Illegal invocation");
+    return Value.UNDEFINED;
 }
 
 fn objGetProto(args: []const Value) Value {

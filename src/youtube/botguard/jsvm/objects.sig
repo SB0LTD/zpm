@@ -92,6 +92,7 @@ pub const Object = struct {
     // Host receiver brand; prototype inheritance alone cannot forge a media
     // element's WebIDL internal slots.
     dom_media: bool = false,
+    dom_navigator: bool = false,
     dom_iframe: bool = false,
     dom_srcdoc: u32 = NULL_OBJ,
     dom_window: bool = false,

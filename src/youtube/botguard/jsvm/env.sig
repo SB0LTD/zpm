@@ -159,7 +159,7 @@ fn installNavigator(global: u32) void {
     setPropBool(nav, "cookieEnabled", true);
     setPropBool(nav, "onLine", true);
     setPropBool(nav, "pdfViewerEnabled", true);
-    const webdriver_getter = objects.createFunction(builtins.N_DOM_FALSE);
+    const webdriver_getter = objects.createFunction(builtins.N_NAV_WEBDRIVER);
     setPropStr(webdriver_getter, "name", "get webdriver");
     setPropNum(webdriver_getter, "length", 0);
     objects.setEnumerable(webdriver_getter, values.internString("name"), false);
@@ -190,6 +190,7 @@ fn installNavigator(global: u32) void {
     objects.dbgMarkEnvObject(conn);
     const instance = objects.createObject();
     objects.setObjectPrototype(instance, nav);
+    objects.getObject(instance).dom_navigator = true;
     objects.setProperty(global, values.internString("navigator"), Value.object(instance));
 }
 
