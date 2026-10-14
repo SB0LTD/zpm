@@ -28,6 +28,20 @@ const session_mod = @import("session.sig");
 const challenge_mod = @import("botguard/challenge.sig");
 const http = @import("net.sig");
 const sabr_mod = @import("sabr/root.sig");
+const profiling = @import("download_profile.sig");
+pub const Profile = profiling.Profile;
+
+test "download profile resets stale samples before rejected external proof" {
+    const testing = @import("std").testing;
+    var profile = Profile{ .http_requests = 9, .sample_count = 1, .vm_ns = 42 };
+    const status = fetch("7Cbr_W7I2Vg", .{ .options = .{ .require_vm_token = true, .pot_override = "diagnostic", .profile = &profile } }, "unused.m4a");
+    try testing.expect(!status.success);
+    try testing.expectEqual(TokenSource.none, status.token_source);
+    try testing.expectEqual(@as(u32, 0), profile.http_requests);
+    try testing.expectEqual(@as(usize, 0), profile.sample_count);
+    try testing.expectEqual(@as(u64, 0), profile.vm_ns);
+    try testing.expect(profile.total_ns >= profile.tokens_ns);
+}
 
 // Video-bound web PO token for the current download (base64url). A cold-start
 // token is allowed only when the caller does not require the VM proof; the SABR
@@ -54,6 +68,8 @@ pub const TokenSource = enum { none, cold_start, vm, external };
 var g_token_source: TokenSource = .none;
 const MediaKind = enum { audio, video };
 pub const DownloadOptions = struct {
+    // Caller-owned; reset for each top-level operation. Null disables profiling.
+    profile: ?*Profile = null,
     web_client: session_mod.WebClient = .mweb,
     require_vm_token: bool = false,
     progress: stream_mod.ProgressFn = null,
@@ -182,6 +198,13 @@ pub fn audioWithOptions(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:
 /// delivery mechanisms per `req.delivery`. This is the primary internal API;
 /// the audio/video wrappers are expressed in terms of it.
 pub fn fetch(video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_path: [*:0]const u8) DownloadStatus {
+    if (req.options.profile) |p| { p.* = .{}; p.started_ns = profiling.clock(p); }
+    const started = profiling.clock(req.options.profile);
+    defer profiling.add(req.options.profile, "total_ns", started);
+    return fetchImpl(video_id, req, output_path);
+}
+
+fn fetchImpl(video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_path: [*:0]const u8) DownloadStatus {
     var status = DownloadStatus{ .success = false, .bytes_downloaded = 0, .container = .unknown, .codec = .unknown, .bitrate = 0, .duration_sec = 0 };
 
     print("  [download] Fetching player data...\n");
@@ -267,7 +290,7 @@ pub fn fetch(video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_p
     if (want_audio and ctx.used_ios and !g_skip_ios) {
         print("  [download] iOS stream rejected; retrying via WEB/MWEB + nsig path...\n");
         g_skip_ios = true;
-        const retry = fetch(video_id, req, output_path);
+        const retry = fetchImpl(video_id, req, output_path);
         g_skip_ios = false;
         if (retry.success) return retry;
     }
@@ -280,6 +303,9 @@ pub fn fetch(video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_p
 /// ProbeResult. Lets a caller see all forms (and whether SABR is offered)
 /// before choosing a MediaRequest. Uses one player acquisition.
 pub fn probe(video_id: *const [meta.VIDEO_ID_LEN]u8, options: DownloadOptions, out: []FormatInfo) ProbeResult {
+    if (options.profile) |p| { p.* = .{}; p.started_ns = profiling.clock(p); }
+    const started = profiling.clock(options.profile);
+    defer profiling.add(options.profile, "total_ns", started);
     var pr = ProbeResult{};
     prepareTokens(video_id, options);
     pr.token_source = g_token_source;
@@ -328,6 +354,8 @@ const PlayerCtx = struct {
 /// valid across subsequent innertube requests. Tokens must already be prepared
 /// (prepareTokens). `want_audio` enables the iOS-first probe (direct audio URLs).
 fn acquirePlayer(video_id: *const [meta.VIDEO_ID_LEN]u8, options: DownloadOptions, want_audio: bool) PlayerCtx {
+    const started = profiling.clock(options.profile);
+    defer profiling.add(options.profile, "player_ns", started);
     var ctx = PlayerCtx{};
 
     stream_mod.setUserAgent("");
@@ -438,7 +466,9 @@ fn deliverOne(resp: []const u8, fmt: *const manifest_mod.StreamFormat, kind: Med
             print(" size=");
             printNum(fmt.content_length);
             print("\n");
+            const direct_started = profiling.clock(options.profile);
             const dl = stream_mod.downloadToFile(url_buf[0..url_len], path, fmt.content_length, options.progress);
+            profiling.add(options.profile, "transfer_ns", direct_started);
             status.bytes_downloaded = dl.bytes_written;
             status.success = dl.success;
             if (dl.success) { status.transform_failure = null; setContainer(fmt, status); return true; }
@@ -464,6 +494,10 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
     // Audio delegates entirely to the caller-controlled resolver.
     if (kind == .audio)
         return fetch(video_id, .{ .track = .audio, .codec = codec_pref, .options = options }, output_path);
+
+    if (options.profile) |p| { p.* = .{}; p.started_ns = profiling.clock(p); }
+    const operation_started = profiling.clock(options.profile);
+    defer profiling.add(options.profile, "total_ns", operation_started);
 
     // Video path: acquire one player response, select the best video (muxed when
     // available), deliver it, and — for videoWithAudio — pull a matching adaptive
@@ -530,7 +564,9 @@ fn downloadMatchingAudio(resp: []const u8, formats: []const manifest_mod.StreamF
     var a_url: [9216]u8 = undefined;
     const a_len = appendStreamToken(audio_fmt.url[0..audio_fmt.url_len], &a_url);
     if (a_len == 0) return;
+    const audio_started = profiling.clock(options.profile);
     const result = stream_mod.downloadToFile(a_url[0..a_len], path, audio_fmt.content_length, options.progress);
+    profiling.add(options.profile, "transfer_ns", audio_started);
     out.bytes_downloaded = result.bytes_written;
     out.success = result.success;
     if (out.success) setContainer(audio_fmt, out);
@@ -589,6 +625,8 @@ fn setContainer(fmt: *const manifest_mod.StreamFormat, status: *DownloadStatus) 
 }
 
 fn prepareTokens(video_id: *const [meta.VIDEO_ID_LEN]u8, options: DownloadOptions) void {
+    const started = profiling.clock(options.profile);
+    defer profiling.add(options.profile, "tokens_ns", started);
     g_pot_len = 0;
     g_stream_pot_len = 0;
     g_token_source = .none;
@@ -620,7 +658,7 @@ fn prepareTokens(video_id: *const [meta.VIDEO_ID_LEN]u8, options: DownloadOption
         var integrity_result = session_mod.IntegrityResult{};
         if (attempt > 0) g_challenge = challenge_mod.Challenge.init();
         if (attempt > 0) { print("  [download] minter retry "); printNum(attempt); print("/"); printNum(MAX_VM_ATTEMPTS); print("\n"); }
-        if (session_mod.establishIntegrityToken(&g_session, &g_challenge, &integrity_result) and integrity_result.minter_ready) {
+        if (session_mod.establishIntegrityTokenProfiled(&g_session, &g_challenge, &integrity_result, options.profile) and integrity_result.minter_ready) {
             const token = integrity_result.integrity_token[0..integrity_result.integrity_token_len];
             // The /player request's serviceIntegrityDimensions.poToken is bound
             // to the video id (content binding).
@@ -742,6 +780,7 @@ fn trySabr(
     printNum(client_version.len);
     print("\n");
 
+    const transfer_started = profiling.clock(options.profile);
     const res = sabr_mod.stream.runLoopWithOptions(
         transport_ctx.transport(),
         host[0..hl],
@@ -754,13 +793,20 @@ fn trySabr(
         if (g_web_client == .mweb) 2 else 1,
         client_version,
         fsink.sink(),
-        .{ .progress = options.progress, .on_response = options.sabr_response },
+        .{ .progress = options.progress, .on_response = options.sabr_response, .profile = options.profile },
     );
+    profiling.add(options.profile, "transfer_ns", transfer_started);
 
     status.sabr_result = res;
     status.bytes_downloaded = res.bytes_written;
     status.success = res.success and res.bytes_written > 0;
-    if (status.success and !fsink.commit()) {
+    var committed = true;
+    if (status.success) {
+        const commit_started = profiling.clock(options.profile);
+        committed = fsink.commit();
+        profiling.add(options.profile, "commit_ns", commit_started);
+    }
+    if (!committed) {
         print("  [download] ERROR: complete SABR data could not be committed to the destination\n");
         status.success = false;
         status.sabr_result.?.success = false;

@@ -23,6 +23,7 @@
 const ump = @import("ump.sig");
 const request = @import("request.sig");
 const http = @import("youtube_net");
+const profiling = @import("../download_profile.sig");
 
 // ── Win32 file sink (append writer) ──
 extern "kernel32" fn CreateFileA([*:0]const u8, u32, u32, ?*anyopaque, u32, u32, ?*anyopaque) ?*anyopaque;
@@ -44,6 +45,22 @@ pub const Sink = struct {
     ctx: *anyopaque,
     write: *const fn (ctx: *anyopaque, bytes: []const u8) bool,
 };
+
+const ProfiledSink = struct {
+    inner: Sink,
+    profile: ?*profiling.Profile,
+    fn write(ctx: *anyopaque, bytes: []const u8) bool {
+        const self: *ProfiledSink = @ptrCast(@alignCast(ctx));
+        const started = profiling.clock(self.profile);
+        defer profiling.add(self.profile, "sink_ns", started);
+        return self.inner.write(self.inner.ctx, bytes);
+    }
+};
+fn sleepProfiled(ms: u32, profile: ?*profiling.Profile) void {
+    const started = profiling.clock(profile);
+    Sleep(ms);
+    profiling.add(profile, "sleep_ns", started);
+}
 
 /// A Win32 file-backed sink. Open once, append each MEDIA chunk, close at end.
 pub const FileSink = struct {
@@ -236,6 +253,7 @@ pub fn runLoop(
 }
 
 pub const LoopOptions = struct {
+    profile: ?*profiling.Profile = null,
     progress: ?*const fn (downloaded: u64, total: u64) void = null,
     // Return false to cancel between HTTP requests.
     on_response: ?*const fn (result: SabrResult) bool = null,
@@ -252,6 +270,8 @@ pub fn runLoopWithOptions(
     sink: Sink, options: LoopOptions,
 ) SabrResult {
     var result = SabrResult{};
+    var measured_sink = ProfiledSink{ .inner = sink, .profile = options.profile };
+    const actual_sink = if (options.profile != null) Sink{ .ctx = &measured_sink, .write = &ProfiledSink.write } else sink;
     var progress = FormatProgress{ .itag = selected.itag, .last_modified = selected.last_modified };
 
     // Reset diagnostic per-pass trace for this run.
@@ -308,20 +328,26 @@ pub fn runLoopWithOptions(
             .sabr_context = ctx_update_buf[0..ctx_update_len],
             .sabr_context_type = ctx_update_type,
         };
+        const build_started = profiling.clock(options.profile);
         const body_len = request.buildAbrRequest(params, &body_buf) catch {
+            profiling.add(options.profile, "request_build_ns", build_started);
             result.failure = .request_capacity;
             return result;
         };
 
         var request_path: [9408]u8 = undefined;
         const request_path_len = numberedPath(path, iter, &request_path) orelse {
+            profiling.add(options.profile, "request_build_ns", build_started);
             result.failure = .request_capacity;
             break;
         };
+        profiling.add(options.profile, "request_build_ns", build_started);
         var r: PostResult = .{};
         var attempts: u16 = 0;
         while (true) {
+            const http_started = profiling.clock(options.profile);
             r = transport.post(transport.ctx, host, port_cur, request_path[0..request_path_len], body_buf[0..body_len], &resp_buf);
+            if (options.profile) |p| p.recordHttp(profiling.clock(p) -| http_started, r.len, r.status);
             result.requests += 1;
             result.last_status = r.status;
             const transient = r.status == 0 or r.status == 408 or r.status == 429 or r.status == 500 or r.status == 502 or r.status == 503 or r.status == 504;
@@ -332,14 +358,15 @@ pub fn runLoopWithOptions(
             };
             attempts += 1;
             result.retries += 1;
-            if (options.retry_delay_ms > 0) Sleep(@min(options.retry_delay_ms, 30000));
+            if (options.retry_delay_ms > 0) sleepProfiled(@min(options.retry_delay_ms, 30000), options.profile);
         }
         if (!r.ok or r.len == 0) {
             result.failure = if (r.status == 0) .transport else if (!r.ok) .http_status else .empty_response;
             break;
         }
         if (r.len > resp_buf.len) { result.failure = .response_capacity; break; }
-        const combined = state.combine(resp_buf[0..r.len]) orelse { result.failure = .response_capacity; break; };
+        const ump_started = profiling.clock(options.profile);
+        const combined = state.combine(resp_buf[0..r.len]) orelse { profiling.add(options.profile, "ump_ns", ump_started); result.failure = .response_capacity; break; };
         // Walk parts via the shared `applyPart` dispatch (same path as
         // processUmpBuffer) while keeping the reader cursor so a part split
         // across this and the next POST survives via state.carry(leftover).
@@ -347,11 +374,19 @@ pub fn runLoopWithOptions(
         var pass = ProcessOutcome{};
         var write_failed = false;
         while (pr.next()) |part| {
-            applyPart(part, sink, &progress, &pass, &write_failed);
+            applyPart(part, actual_sink, &progress, &pass, &write_failed);
             if (write_failed) break;
         }
-        if (write_failed) { result.bytes_written = progress.bytes; result.failure = .media_write; break; }
+        if (write_failed) { profiling.add(options.profile, "ump_ns", ump_started); result.bytes_written = progress.bytes; result.failure = .media_write; break; }
         state.carry(pr.leftover());
+        profiling.add(options.profile, "ump_ns", ump_started);
+        if (options.profile) |p| {
+            if (progress.bytes > 0 and p.first_media_ns == 0) p.first_media_ns = profiling.clock(p) -| p.started_ns;
+            if (p.sample_count > 0 and p.dropped_samples == 0) {
+                p.samples[p.sample_count - 1].media_bytes = pass.media_bytes;
+                p.samples[p.sample_count - 1].protection = pass.protection_status;
+            }
+        }
 
         result.bytes_written = progress.bytes;
         if (pass.protection_status != 0) result.protection_status = pass.protection_status;
@@ -441,7 +476,7 @@ pub fn runLoopWithOptions(
         if (pass.protection_status == 2) {
             pending_passes += 1;
             if (pending_passes <= MAX_PENDING_PASSES) {
-                if (pass.backoff_time_ms > 0) Sleep(@intCast(@min(pass.backoff_time_ms, 30000)));
+                if (pass.backoff_time_ms > 0) sleepProfiled(@intCast(@min(pass.backoff_time_ms, 30000)), options.profile);
                 continue;
             }
             break;
@@ -451,7 +486,7 @@ pub fn runLoopWithOptions(
         if (pass.media_bytes == 0 and pass.backoff_time_ms == 0 and pass.redirect_url.len == 0) {
             break;
         }
-        if (pass.backoff_time_ms > 0) Sleep(@intCast(@min(pass.backoff_time_ms, 30000)));
+        if (pass.backoff_time_ms > 0) sleepProfiled(@intCast(@min(pass.backoff_time_ms, 30000)), options.profile);
     }
 
     if (!result.success and result.failure == .none) result.failure = if (iter == MAX_ITERATIONS) .iteration_limit else if (result.sabr_error_seen) .sabr_error else if (result.protection_status == 2 or result.protection_status == 3) .protection else .incomplete;
@@ -946,13 +981,24 @@ test "sabr-loop: transient retry preserves request body and sequence" {
     // A high-bit header ID is one byte, not a protobuf/UMP varint.
     fake.response_len = appendPart(&fake.response, p, ump.PartType.MEDIA_END, &.{200});
     var mem = MemSink{};
-    const res = runLoopWithOptions(.{ .ctx = @ptrCast(&fake), .post = &Fake.post }, "cdn.test", 443, "/videoplayback", .{ .itag = 251, .last_modified = 0, .content_length = 3 }, true, "", "", 1, "2.test", mem.sink(), .{ .retry_delay_ms = 0 });
+    var profile = profiling.Profile{};
+    profile.started_ns = profiling.clock(&profile);
+    const res = runLoopWithOptions(.{ .ctx = @ptrCast(&fake), .post = &Fake.post }, "cdn.test", 443, "/videoplayback", .{ .itag = 251, .last_modified = 0, .content_length = 3 }, true, "", "", 1, "2.test", mem.sink(), .{ .retry_delay_ms = 0, .profile = &profile });
     try testing.expect(res.success);
     try testing.expectEqual(Failure.none, res.failure);
     try testing.expectEqual(@as(u32, 2), res.requests);
     try testing.expectEqual(@as(u32, 1), res.retries);
     try testing.expect(fake.same_request);
     try testing.expectEqualSlices(u8, "ABC", mem.buf[0..mem.len]);
+    // Profiling includes the failed transport attempt without attributing
+    // media to it, and preserves successful delivery/retry semantics.
+    try testing.expectEqual(@as(u32, 2), profile.http_requests);
+    try testing.expectEqual(@as(usize, 2), profile.sample_count);
+    try testing.expectEqual(@as(u32, 0), profile.samples[0].status);
+    try testing.expectEqual(@as(u64, 0), profile.samples[0].media_bytes);
+    try testing.expectEqual(@as(u64, 3), profile.samples[1].media_bytes);
+    try testing.expectEqual(@as(u64, fake.response_len), profile.response_bytes);
+    try testing.expect(profile.ump_ns >= profile.sink_ns);
 }
 
 test "sabr-loop: permanent rejection is not retried; network retries are bounded" {

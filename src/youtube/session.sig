@@ -21,6 +21,7 @@
 const http = @import("net.sig");
 const challenge = @import("botguard/challenge.sig");
 const integrity = @import("botguard/integrity.sig");
+const profiling = @import("download_profile.sig");
 
 extern "kernel32" fn GetStdHandle(u32) ?*anyopaque;
 extern "kernel32" fn WriteFile(?*anyopaque, [*]const u8, u32, ?*u32, ?*anyopaque) c_int;
@@ -656,6 +657,9 @@ pub fn playerInSession(sess: *Session, video_id: []const u8, client: WebClient, 
 /// Returns an IntegrityResult; .valid && integrity_token_len>0 means a REAL
 /// (non-null) token was issued.
 pub fn establishIntegrityToken(sess: *Session, chal: *challenge.Challenge, out: *IntegrityResult) bool {
+    return establishIntegrityTokenProfiled(sess, chal, out, null);
+}
+pub fn establishIntegrityTokenProfiled(sess: *Session, chal: *challenge.Challenge, out: *IntegrityResult, profile: ?*profiling.Profile) bool {
     out.* = .{};
     if (!sess.bootstrapped) {
         if (!bootstrap(sess, chal)) return false;
@@ -663,7 +667,7 @@ pub fn establishIntegrityToken(sess: *Session, chal: *challenge.Challenge, out: 
     _ = jsvm.env.setYoutubeEventId(sess.event_id[0..sess.event_id_len]);
     // Homepage challenges issue playback-capable proofs. A generic Create
     // primary token alone does not prove that SABR will accept its attestation.
-    if (chal.program_len > 0 and executeChallenge(sess, chal, out)) return true;
+    if (chal.program_len > 0 and executeChallenge(sess, chal, out, profile)) return true;
     out.* = .{};
 
     // A fresh generic Create challenge can still provide a primary integrity
@@ -674,10 +678,10 @@ pub fn establishIntegrityToken(sess: *Session, chal: *challenge.Challenge, out: 
         print("  [session] Create challenge fetch failed\n");
         return false;
     }
-    return executeChallenge(sess, chal, out);
+    return executeChallenge(sess, chal, out, profile);
 }
 
-fn executeChallenge(sess: *Session, chal: *challenge.Challenge, out: *IntegrityResult) bool {
+fn executeChallenge(sess: *Session, chal: *challenge.Challenge, out: *IntegrityResult, profile: ?*profiling.Profile) bool {
     if (chal.script_len == 0 and chal.interpreter_url_len > 0) {
         print("  [session] fetching interpreter script ...\n");
         if (!challenge.fetchScript(chal)) {
@@ -691,6 +695,7 @@ fn executeChallenge(sess: *Session, chal: *challenge.Challenge, out: *IntegrityR
     // Run the BotGuard VM to produce the botguardResponse (this also populates
     // the minter chain in webPoSignalOutput[0]).
     var bg_len: usize = 0;
+    const vm_started = profiling.clock(profile);
     const ok = jsvm.execute(
         chal.script[0..chal.script_len],
         chal.program[0..chal.program_len],
@@ -698,6 +703,7 @@ fn executeChallenge(sess: *Session, chal: *challenge.Challenge, out: *IntegrityR
         &bg_response_buf,
         &bg_len,
     );
+    profiling.add(profile, "vm_ns", vm_started);
     print("  [session] VM response="); printNum(bg_len);
     print(" ok="); print(if (ok) "1" else "0"); print("\n");
     if (!ok or bg_len == 0) return false;
@@ -708,6 +714,8 @@ fn executeChallenge(sess: *Session, chal: *challenge.Challenge, out: *IntegrityR
 
     // Exchange within the originating session, trying the first-party endpoint
     // before the WAA fallback. Minter readiness and primary validity are distinct.
+    const exchange_started = profiling.clock(profile);
+    defer profiling.add(profile, "exchange_ns", exchange_started);
     if (!generateITInSession(sess, bg_response_buf[0..bg_len], out)) {
         print("  [session] GenerateIT returned no primary token\n");
         return false;
