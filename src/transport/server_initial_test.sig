@@ -40,7 +40,7 @@ var server_storage: conn.Connection = undefined;
 
 test "server idle: receiving QUIC Initial transitions to handshaking" {
     // 1. Create server in idle state
-    server_storage = conn.Connection.initServer(&server_stream_storage, 0);
+    conn.Connection.initServerInPlace(&server_storage, &server_stream_storage, 0);
     var server = &server_storage;
     defer server.deinit();
 
@@ -109,7 +109,7 @@ test "server idle: receiving QUIC Initial transitions to handshaking" {
 
 test "server sends response packet after receiving Initial" {
     // 1. Create server
-    server_storage = conn.Connection.initServer(&server_stream_storage, 0);
+    conn.Connection.initServerInPlace(&server_storage, &server_stream_storage, 0);
     var server = &server_storage;
     defer server.deinit();
 
@@ -262,7 +262,7 @@ test "deriveInitialKeys produces correct server keys for known DCID" {
 // ══════════════════════════════════════════════════════════════════════════════
 
 test "server idle tick with no packet stays idle" {
-    server_storage = conn.Connection.initServer(&server_stream_storage, 0);
+    conn.Connection.initServerInPlace(&server_storage, &server_stream_storage, 0);
     var server = &server_storage;
     defer server.deinit();
 
@@ -281,7 +281,7 @@ test "server idle tick with no packet stays idle" {
 // ══════════════════════════════════════════════════════════════════════════════
 
 test "server idle ignores non-Initial packets" {
-    server_storage = conn.Connection.initServer(&server_stream_storage, 0);
+    conn.Connection.initServerInPlace(&server_storage, &server_stream_storage, 0);
     var server = &server_storage;
     defer server.deinit();
 

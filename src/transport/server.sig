@@ -252,7 +252,8 @@ pub const Server = struct {
             self.total_connections += 1;
 
             // Initialize as server connection (port 0 — uses shared listen socket)
-            self.connections[idx] = conn.Connection.initServer(
+            conn.Connection.initServerInPlace(
+                &self.connections[idx],
                 &self.stream_arrays[idx],
                 0,
             );

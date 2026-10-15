@@ -47,7 +47,7 @@ fn installTestKeys(engine: *transport_crypto.TlsEngine, level: transport_crypto.
 
 test "1-RTT connection establishment" {
     // 1. Create server bound to localhost:0 (OS-assigned port)
-    server_storage = conn.Connection.initServer(&server_stream_storage, 0);
+    conn.Connection.initServerInPlace(&server_storage, &server_stream_storage, 0);
     var server = &server_storage;
 
     // Get the OS-assigned port
@@ -67,7 +67,7 @@ test "1-RTT connection establishment" {
         .sin_port = w32.htons(server_port),
         .sin_addr = 0x0100007F, // 127.0.0.1
     };
-    client_storage = conn.Connection.initClient(&client_stream_storage, server_addr, 0);
+    conn.Connection.initClientInPlace(&client_storage, &client_stream_storage, server_addr, 0);
     var client = &client_storage;
 
     defer {
@@ -604,7 +604,7 @@ var client_storage_37_5: conn.Connection = undefined;
 test "Connection close and draining" {
     // ── 1. Set up a connected client-server pair (same pattern as 37.1) ──
 
-    server_storage_37_5 = conn.Connection.initServer(&server_stream_storage_37_5, 0);
+    conn.Connection.initServerInPlace(&server_storage_37_5, &server_stream_storage_37_5, 0);
     var server = &server_storage_37_5;
 
     const local = server.socket.getLocalAddr();
@@ -622,7 +622,7 @@ test "Connection close and draining" {
         .sin_port = w32.htons(server_port),
         .sin_addr = 0x0100007F, // 127.0.0.1
     };
-    client_storage_37_5 = conn.Connection.initClient(&client_stream_storage_37_5, server_addr, 0);
+    conn.Connection.initClientInPlace(&client_storage_37_5, &client_stream_storage_37_5, server_addr, 0);
     var client = &client_storage_37_5;
 
     defer {
@@ -814,7 +814,7 @@ var server_storage_37_6: conn.Connection = undefined;
 test "Idle timeout" {
     // ── 1. Set up a connected server (same pattern as 37.1) ──
 
-    server_storage_37_6 = conn.Connection.initServer(&server_stream_storage_37_6, 0);
+    conn.Connection.initServerInPlace(&server_storage_37_6, &server_stream_storage_37_6, 0);
     var server = &server_storage_37_6;
 
     defer {
@@ -1191,7 +1191,8 @@ test "0-RTT resumption" {
     // ── 5. Verify the 0-RTT key derivation path exists ──
     // keys[zero_rtt].valid can be set, confirming the key slot is addressable.
 
-    var tls_engine = transport_crypto.TlsEngine.init(false);
+    var tls_engine: transport_crypto.TlsEngine = undefined;
+    tls_engine.initInPlace(false);
     const zero_rtt_idx = @intFromEnum(transport_crypto.EncryptionLevel.zero_rtt);
 
     // Initially, zero_rtt keys should not be valid
@@ -1212,7 +1213,7 @@ test "0-RTT resumption" {
     };
 
     // Create a client connection
-    client_storage_37_8 = conn.Connection.initClient(&client_stream_storage_37_8, resume_addr, 0);
+    conn.Connection.initClientInPlace(&client_storage_37_8, &client_stream_storage_37_8, resume_addr, 0);
     var client = &client_storage_37_8;
 
     defer {

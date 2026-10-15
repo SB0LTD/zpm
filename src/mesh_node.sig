@@ -87,11 +87,11 @@ pub fn main() void {
     };
     switch (role) {
         .server => {
-            node_conn = conn.Connection.initServer(&node_stream_storage, bind_port);
+            conn.Connection.initServerInPlace(&node_conn, &node_stream_storage, bind_port);
             writeOut("mesh-node: role=server\n");
         },
         .client => {
-            node_conn = conn.Connection.initClient(&node_stream_storage, peer, bind_port);
+            conn.Connection.initClientInPlace(&node_conn, &node_stream_storage, peer, bind_port);
             writeOut("mesh-node: role=client\n");
         },
     }

@@ -73,10 +73,6 @@ pub const HandshakeResult = struct {
 // ── TLS Engine ──
 
 pub const TlsEngine = struct {
-    // SChannel context handles (opaque Win32 handles stored as raw u64 pairs)
-    cred_handle: [2]u64 = [_]u64{ 0, 0 },
-    ctx_handle: [2]u64 = [_]u64{ 0, 0 },
-
     // Handshake state machine
     state: State = .idle,
 
@@ -88,9 +84,8 @@ pub const TlsEngine = struct {
     ticket_len: u16 = 0,
     has_ticket: bool = false,
 
-    // Handshake buffers
-    recv_buf: [8192]u8 = @as([8192]u8, @splat(0)),
-    recv_len: u16 = 0,
+    // Handshake-level CRYPTO output staging (EE+Cert+CV+Finished for the server,
+    // client Finished for the client). Filled by conn.sig from the tls13 engine.
     send_buf: [8192]u8 = @as([8192]u8, @splat(0)),
     send_len: u16 = 0,
 
@@ -104,10 +99,12 @@ pub const TlsEngine = struct {
     // Role
     is_server: bool = false,
 
-    // ── Embedded pure-Sig TLS 1.3 engine (Option B — mesh path) ──
-    // When use_tls13 is true, the whole mesh handshake is driven through this
-    // engine on BOTH platforms, independent of SChannel. conn.sig reads keys
-    // from tls13_engine directly (no win32-only getTls13Engine indirection).
+    // ── Embedded pure-Sig TLS 1.3 engine (Option B — the ONLY handshake path) ──
+    // The whole mesh handshake is driven through this engine on BOTH platforms.
+    // conn.sig installs QUIC keys by reading tls13_engine directly. The SChannel
+    // fields/methods below are dead (no caller sets use_tls13 = false) and are
+    // kept only to avoid a risky bulk deletion; AEAD/header-protection go
+    // through the win32 BCrypt seam (cross-platform via win32/linux_platform).
     tls13_engine: tls13.Tls13Engine = .{},
     use_tls13: bool = false,
 
@@ -118,257 +115,41 @@ pub const TlsEngine = struct {
         failed,
     };
 
-    /// Initialize a TLS engine for client or server role.
-    /// Acquires SChannel credentials configured for TLS 1.3 with ALPN "zpm".
-    pub fn init(is_server: bool) TlsEngine {
-        var engine = TlsEngine{};
-        engine.is_server = is_server;
+    /// Initialize a TLS engine for client or server role, IN PLACE into
+    /// caller-owned storage.
+    ///
+    /// The engine embeds a full pure-Sig TLS 1.3 engine (several KB). Returning
+    /// it by value would materialize that as a temporary on the caller's stack
+    /// frame — enough to overflow the stack in deep init chains (the embedding
+    /// Connection is ~130 KB, and the SChannel cred setup it used to do added
+    /// its own SecBuffer locals on top). Writing directly into caller storage
+    /// (always a module-level var) and skipping the dead SChannel acquisition
+    /// removes the overflow entirely.
+    ///
+    /// The whole mesh handshake runs through the embedded pure-Sig tls13 engine
+    /// on BOTH platforms. TlsEngine{}'s default does NOT generate an X25519
+    /// keypair; initServerInPlace/initClientInPlace do. Both peers advertise
+    /// ALPN "zpm" (the mesh protocol).
+    pub fn initInPlace(self: *TlsEngine, is_server: bool) void {
+        self.* = TlsEngine{};
+        self.is_server = is_server;
+        self.state = .idle;
+        self.use_tls13 = true;
 
-        // Set up SCH_CREDENTIALS for TLS 1.3
-        var creds = w32.SCH_CREDENTIALS{
-            .dwVersion = 5, // SCH_CREDENTIALS_VERSION
-            .dwFlags = if (is_server)
-                0
-            else
-                (w32.SCH_CRED_NO_DEFAULT_CREDS | w32.SCH_CRED_MANUAL_CRED_VALIDATION),
-        };
-
-        // Set up ALPN via SEC_APPLICATION_PROTOCOLS
-        // ALPN wire format: 1-byte length prefix + protocol string
-        var alpn_protos = w32.SEC_APPLICATION_PROTOCOLS{};
-        alpn_protos.ProtocolLists.ProtoNegoExt = w32.SecApplicationProtocolNegotiationExt_ALPN;
-        // Wire format: [length_byte, 'h', '3']
-        alpn_protos.ProtocolLists.ProtocolList[0] = @intCast(ZPM_ALPN.len); // 2
-        @memcpy(alpn_protos.ProtocolLists.ProtocolList[1 .. 1 + ZPM_ALPN.len], ZPM_ALPN);
-        alpn_protos.ProtocolLists.ProtocolListSize = @intCast(1 + ZPM_ALPN.len);
-        // ProtocolListsSize = size of the SEC_APPLICATION_PROTOCOL_LIST header (4 + 2) + wire data
-        alpn_protos.ProtocolListsSize = @intCast(@sizeOf(w32.SEC_APPLICATION_PROTOCOL_LIST));
-
-        const cred_use: w32.DWORD = if (is_server) w32.SECPKG_CRED_INBOUND else w32.SECPKG_CRED_OUTBOUND;
-
-        var cred_handle: w32.CredHandle = @splat(0);
-        const status = w32.AcquireCredentialsHandleW(
-            null, // principal
-            w32.UNISP_NAME_W, // package
-            cred_use,
-            null, // logon id
-            @ptrCast(&creds), // auth data (SCH_CREDENTIALS)
-            null, // get key fn
-            null, // get key arg
-            &cred_handle,
-            null, // expiry
-        );
-
-        if (status == w32.SEC_E_OK) {
-            // Store CredHandle as [2]u64 via bitcast
-            engine.cred_handle = @bitCast(cred_handle);
+        if (is_server) {
+            self.tls13_engine.initServerInPlace();
         } else {
-            engine.state = .failed;
+            self.tls13_engine.initClientInPlace();
         }
-
-        // Store ALPN protocols buffer for use in handshake calls
-        // We keep it in send_buf temporarily — startHandshake/feedCryptoData will set up
-        // the ALPN buffer from the comptime constant each time
-        _ = &alpn_protos;
-
-        // ── Mesh path (Option B): drive the handshake through the embedded
-        //    pure-Sig tls13 engine on BOTH platforms. SChannel fields above are
-        //    left intact for the non-mesh HTTP/3 client but are not used here.
-        //    TlsEngine{} default does NOT generate an X25519 keypair; initServer
-        //    /initClient do. Both peers advertise ALPN "zpm" (the mesh protocol).
-        engine.tls13_engine = if (is_server) tls13.Tls13Engine.initServer() else tls13.Tls13Engine.initClient();
-        engine.tls13_engine.setAlpn("zpm");
-        engine.use_tls13 = true;
-        // The mesh runs entirely through tls13; its state machine is authoritative,
-        // so clear any SChannel .failed set when creds didn't acquire (headless exe).
-        engine.state = .idle;
-
-        return engine;
+        self.tls13_engine.setAlpn("zpm");
     }
 
-    /// Feed received CRYPTO frame data into the handshake engine.
-    /// Appends data to recv_buf, then calls InitializeSecurityContextW (client)
-    /// or AcceptSecurityContext (server) with accumulated data.
+    /// Feed one reassembled CRYPTO handshake message into the engine. The mesh
+    /// runs entirely through the embedded pure-Sig TLS 1.3 engine on every
+    /// platform (there is no SChannel path), so this delegates straight to it.
     pub fn feedCryptoData(self: *TlsEngine, level: EncryptionLevel, data: []const u8) HandshakeResult {
-        // ── Mesh path (Option B): drive the embedded tls13 engine, map its
-        //    ProcessResult onto HandshakeResult. Branches at the TOP for BOTH
-        //    roles so the SChannel path below is reached only when use_tls13 is
-        //    false (the non-mesh HTTP/3 client).
-        if (self.use_tls13) {
-            return self.feedCryptoDataTls13(level, data);
-        }
-
-        var result = HandshakeResult{};
-
-        if (self.state == .failed) {
-            result.err = .handshake_failed;
-            return result;
-        }
-
-        // Append incoming data to recv_buf
-        const space = self.recv_buf.len - self.recv_len;
-        const copy_len: u16 = @intCast(if (data.len > space) space else data.len);
-        if (copy_len > 0) {
-            @memcpy(self.recv_buf[self.recv_len .. self.recv_len + copy_len], data[0..copy_len]);
-            self.recv_len += copy_len;
-        }
-
-        // Set up input SecBufferDesc: SECBUFFER_TOKEN (recv_buf data) + SECBUFFER_EMPTY
-        var in_bufs: [2]w32.SecBuffer = .{
-            .{
-                .cbBuffer = self.recv_len,
-                .BufferType = w32.SECBUFFER_TOKEN,
-                .pvBuffer = @ptrCast(&self.recv_buf),
-            },
-            .{
-                .cbBuffer = 0,
-                .BufferType = w32.SECBUFFER_EMPTY,
-                .pvBuffer = null,
-            },
-        };
-        var in_buf_desc = w32.SecBufferDesc{
-            .ulVersion = w32.SECBUFFER_VERSION,
-            .cBuffers = 2,
-            .pBuffers = @ptrCast(&in_bufs),
-        };
-
-        // Output: SECBUFFER_TOKEN
-        var out_token_buf: [4096]u8 = undefined;
-        var out_bufs: [1]w32.SecBuffer = .{
-            .{
-                .cbBuffer = out_token_buf.len,
-                .BufferType = w32.SECBUFFER_TOKEN,
-                .pvBuffer = @ptrCast(&out_token_buf),
-            },
-        };
-        var out_buf_desc = w32.SecBufferDesc{
-            .ulVersion = w32.SECBUFFER_VERSION,
-            .cBuffers = 1,
-            .pBuffers = @ptrCast(&out_bufs),
-        };
-
-        var cred_h: w32.CredHandle = @bitCast(self.cred_handle);
-        var ctx_h: w32.CtxtHandle = @bitCast(self.ctx_handle);
-        var out_flags: w32.DWORD = 0;
-        var status: i32 = undefined;
-
-        if (self.is_server) {
-            const asc_flags: w32.DWORD = w32.ASC_REQ_SEQUENCE_DETECT |
-                w32.ASC_REQ_REPLAY_DETECT |
-                w32.ASC_REQ_CONFIDENTIALITY |
-                w32.ASC_REQ_STREAM;
-
-            status = w32.AcceptSecurityContext(
-                &cred_h,
-                if (self.state == .in_progress) &ctx_h else null,
-                &in_buf_desc,
-                asc_flags,
-                0, // target data rep
-                &ctx_h,
-                &out_buf_desc,
-                &out_flags,
-                null, // expiry
-            );
-        } else {
-            const isc_flags: w32.DWORD = w32.ISC_REQ_SEQUENCE_DETECT |
-                w32.ISC_REQ_REPLAY_DETECT |
-                w32.ISC_REQ_CONFIDENTIALITY |
-                w32.ISC_REQ_STREAM |
-                w32.ISC_REQ_MANUAL_CRED_VALIDATION;
-
-            status = w32.InitializeSecurityContextW(
-                &cred_h,
-                &ctx_h,
-                null, // server name already set from first call
-                isc_flags,
-                0, // reserved
-                0, // target data rep
-                &in_buf_desc,
-                0, // reserved
-                &ctx_h,
-                &out_buf_desc,
-                &out_flags,
-                null, // expiry
-            );
-        }
-
-        // Store updated context handle
-        self.ctx_handle = @bitCast(ctx_h);
-
-        if (status == w32.SEC_I_CONTINUE_NEEDED or status == w32.SEC_I_COMPLETE_AND_CONTINUE) {
-            // Copy output token to TlsOutput
-            const out_len = out_bufs[0].cbBuffer;
-            if (out_len > 0 and out_len <= result.output.data.len) {
-                const src: [*]const u8 = @ptrCast(out_bufs[0].pvBuffer.?);
-                @memcpy(result.output.data[0..out_len], src[0..out_len]);
-                result.output.data_len = @intCast(out_len);
-                result.output.has_data = true;
-                result.output.level = .handshake;
-            }
-
-            if (status == w32.SEC_I_COMPLETE_AND_CONTINUE) {
-                _ = w32.CompleteAuthToken(&ctx_h, &out_buf_desc);
-            }
-
-            self.state = .in_progress;
-
-            // Handle SECBUFFER_EXTRA: leftover data that wasn't consumed
-            handleExtraBuffer(self, &in_bufs);
-        } else if (status == w32.SEC_E_OK) {
-            // Handshake complete
-            // Copy any final output token
-            const out_len = out_bufs[0].cbBuffer;
-            if (out_len > 0 and out_len <= result.output.data.len) {
-                const src: [*]const u8 = @ptrCast(out_bufs[0].pvBuffer.?);
-                @memcpy(result.output.data[0..out_len], src[0..out_len]);
-                result.output.data_len = @intCast(out_len);
-                result.output.has_data = true;
-                result.output.level = .handshake;
-            }
-
-            // Extract ALPN via QueryContextAttributesW
-            var alpn_info = w32.SecPkgContext_ApplicationProtocol{};
-            const query_status = w32.QueryContextAttributesW(
-                &ctx_h,
-                w32.SECPKG_ATTR_APPLICATION_PROTOCOL,
-                @ptrCast(&alpn_info),
-            );
-
-            if (query_status == w32.SEC_E_OK and
-                alpn_info.ProtoNegoStatus == w32.SecApplicationProtocolNegotiationStatus_Success)
-            {
-                // Verify ALPN matches ZPM_ALPN
-                const alpn_size = alpn_info.ProtocolIdSize;
-                if (alpn_size == ZPM_ALPN.len and
-                    eqlBytes(alpn_info.ProtocolId[0..ZPM_ALPN.len], ZPM_ALPN))
-                {
-                    // ALPN matches — handshake successful
-                    @memcpy(result.alpn[0..alpn_size], alpn_info.ProtocolId[0..alpn_size]);
-                    result.alpn_len = alpn_size;
-                } else {
-                    // ALPN mismatch
-                    self.state = .failed;
-                    result.err = .protocol_error;
-                    return result;
-                }
-            }
-
-            self.state = .complete;
-            result.complete = true;
-
-            // Handle SECBUFFER_EXTRA
-            handleExtraBuffer(self, &in_bufs);
-        } else if (status == w32.SEC_E_INCOMPLETE_MESSAGE) {
-            // Need more data — don't change state, return with has_data=false
-            result.output.has_data = false;
-        } else {
-            self.state = .failed;
-            result.err = .handshake_failed;
-        }
-
-        return result;
+        return self.feedCryptoDataTls13(level, data);
     }
-
     /// Mesh path: feed one reassembled CRYPTO message to the embedded tls13
     /// engine and map its ProcessResult onto HandshakeResult.
     ///
@@ -420,112 +201,6 @@ pub const TlsEngine = struct {
             result.complete = true;
         } else {
             self.state = .in_progress;
-        }
-
-        return result;
-    }
-
-    /// Initiate the TLS handshake (client side). Produces the ClientHello.
-    /// Calls InitializeSecurityContextW with the server name and ALPN buffer.
-    pub fn startHandshake(self: *TlsEngine, server_name: []const u8) HandshakeResult {
-        var result = HandshakeResult{};
-
-        if (self.state == .failed) {
-            result.err = .handshake_failed;
-            return result;
-        }
-
-        // Convert server_name to UTF-16 (simple ASCII→UTF-16 into stack buffer)
-        var name_w: [256:0]u16 = @as([256:0]u16, @splat(0));
-        const name_len = if (server_name.len > 255) 255 else server_name.len;
-        for (0..name_len) |i| {
-            name_w[i] = @intCast(server_name[i]);
-        }
-        name_w[name_len] = 0;
-
-        // Set up ALPN input buffer
-        var alpn_protos = buildAlpnProtocols();
-
-        // Input: SECBUFFER_APPLICATION_PROTOCOLS for ALPN
-        var in_bufs: [1]w32.SecBuffer = .{
-            .{
-                .cbBuffer = @intCast(@sizeOf(w32.SEC_APPLICATION_PROTOCOLS)),
-                .BufferType = w32.SECBUFFER_APPLICATION_PROTOCOLS,
-                .pvBuffer = @ptrCast(&alpn_protos),
-            },
-        };
-        var in_buf_desc = w32.SecBufferDesc{
-            .ulVersion = w32.SECBUFFER_VERSION,
-            .cBuffers = 1,
-            .pBuffers = @ptrCast(&in_bufs),
-        };
-
-        // Output: SECBUFFER_TOKEN for the ClientHello
-        var out_token_buf: [4096]u8 = undefined;
-        var out_bufs: [1]w32.SecBuffer = .{
-            .{
-                .cbBuffer = out_token_buf.len,
-                .BufferType = w32.SECBUFFER_TOKEN,
-                .pvBuffer = @ptrCast(&out_token_buf),
-            },
-        };
-        var out_buf_desc = w32.SecBufferDesc{
-            .ulVersion = w32.SECBUFFER_VERSION,
-            .cBuffers = 1,
-            .pBuffers = @ptrCast(&out_bufs),
-        };
-
-        const isc_flags: w32.DWORD = w32.ISC_REQ_SEQUENCE_DETECT |
-            w32.ISC_REQ_REPLAY_DETECT |
-            w32.ISC_REQ_CONFIDENTIALITY |
-            w32.ISC_REQ_STREAM |
-            w32.ISC_REQ_MANUAL_CRED_VALIDATION;
-
-        var cred_h: w32.CredHandle = @bitCast(self.cred_handle);
-        var ctx_h: w32.CtxtHandle = @splat(0);
-        var out_flags: w32.DWORD = 0;
-
-        const status = w32.InitializeSecurityContextW(
-            &cred_h,
-            null, // no existing context (first call)
-            @ptrCast(&name_w),
-            isc_flags,
-            0, // reserved
-            0, // target data rep
-            &in_buf_desc,
-            0, // reserved
-            &ctx_h,
-            &out_buf_desc,
-            &out_flags,
-            null, // expiry
-        );
-
-        if (status == w32.SEC_I_CONTINUE_NEEDED or status == w32.SEC_I_COMPLETE_AND_CONTINUE) {
-            // Copy output token to TlsOutput
-            const out_len = out_bufs[0].cbBuffer;
-            if (out_len > 0 and out_len <= result.output.data.len) {
-                const src: [*]const u8 = @ptrCast(out_bufs[0].pvBuffer.?);
-                @memcpy(result.output.data[0..out_len], src[0..out_len]);
-                result.output.data_len = @intCast(out_len);
-                result.output.has_data = true;
-                result.output.level = .initial;
-            }
-
-            // If COMPLETE_AND_CONTINUE, call CompleteAuthToken
-            if (status == w32.SEC_I_COMPLETE_AND_CONTINUE) {
-                _ = w32.CompleteAuthToken(&ctx_h, &out_buf_desc);
-            }
-
-            self.state = .in_progress;
-            self.ctx_handle = @bitCast(ctx_h);
-        } else if (status == w32.SEC_E_OK) {
-            // Handshake completed in one call (unlikely for TLS 1.3 but handle it)
-            self.state = .complete;
-            self.ctx_handle = @bitCast(ctx_h);
-            result.complete = true;
-        } else {
-            self.state = .failed;
-            result.err = .handshake_failed;
         }
 
         return result;
@@ -738,18 +413,9 @@ pub const TlsEngine = struct {
         self.app_secret = new_secret;
     }
 
-    /// Release SChannel handles and zero out key material.
+    /// Zero out key material and reset the engine. There are no OS handles to
+    /// release (the mesh path holds none; AEAD BCrypt handles are per-call).
     pub fn deinit(self: *TlsEngine) void {
-        // Delete security context if we ever started a handshake
-        if (self.state != .idle) {
-            var ctx_h: w32.CtxtHandle = @bitCast(self.ctx_handle);
-            _ = w32.DeleteSecurityContext(&ctx_h);
-        }
-
-        // Free credentials handle
-        var cred_h: w32.CredHandle = @bitCast(self.cred_handle);
-        _ = w32.FreeCredentialsHandle(&cred_h);
-
         // Zero out key material
         for (0..4) |i| {
             self.keys[i].key = @as([16]u8, @splat(0));
@@ -758,13 +424,7 @@ pub const TlsEngine = struct {
             self.keys[i].valid = false;
         }
 
-        // Zero out handles
-        self.cred_handle = [_]u64{ 0, 0 };
-        self.ctx_handle = [_]u64{ 0, 0 };
-
         // Zero out handshake buffers
-        @memset(&self.recv_buf, 0);
-        self.recv_len = 0;
         @memset(&self.send_buf, 0);
         self.send_len = 0;
 
@@ -780,38 +440,7 @@ pub const TlsEngine = struct {
     }
 };
 
-// ── SChannel Helpers ──
-
-/// Build the SEC_APPLICATION_PROTOCOLS struct with ALPN wire format for "zpm".
-fn buildAlpnProtocols() w32.SEC_APPLICATION_PROTOCOLS {
-    var protos = w32.SEC_APPLICATION_PROTOCOLS{};
-    protos.ProtocolLists.ProtoNegoExt = w32.SecApplicationProtocolNegotiationExt_ALPN;
-    // ALPN wire format: [length_byte, protocol_bytes...]
-    protos.ProtocolLists.ProtocolList[0] = @intCast(ZPM_ALPN.len);
-    @memcpy(protos.ProtocolLists.ProtocolList[1 .. 1 + ZPM_ALPN.len], ZPM_ALPN);
-    protos.ProtocolLists.ProtocolListSize = @intCast(1 + ZPM_ALPN.len);
-    protos.ProtocolListsSize = @intCast(@sizeOf(w32.SEC_APPLICATION_PROTOCOL_LIST));
-    return protos;
-}
-
-/// Handle SECBUFFER_EXTRA after an ISC/ASC call — move unconsumed data to the
-/// front of recv_buf so the next feedCryptoData call picks it up.
-fn handleExtraBuffer(engine: *TlsEngine, in_bufs: *[2]w32.SecBuffer) void {
-    // Check if the second buffer was marked as EXTRA by SChannel
-    if (in_bufs[1].BufferType == w32.SECBUFFER_EXTRA and in_bufs[1].cbBuffer > 0) {
-        const extra_len: u16 = @intCast(in_bufs[1].cbBuffer);
-        const consumed = engine.recv_len - extra_len;
-        // Move extra data to front of recv_buf
-        var i: u16 = 0;
-        while (i < extra_len) : (i += 1) {
-            engine.recv_buf[i] = engine.recv_buf[consumed + i];
-        }
-        engine.recv_len = extra_len;
-    } else {
-        // All data consumed
-        engine.recv_len = 0;
-    }
-}
+// ── Helpers ──
 
 /// Compare two byte slices for equality.
 fn eqlBytes(a: []const u8, b: []const u8) bool {

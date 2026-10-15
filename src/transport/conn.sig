@@ -515,80 +515,83 @@ pub const Connection = struct {
     zero_rtt_state: ZeroRttState,
     zero_rtt_rejected: bool,
 
-    /// Initialize a client connection.
-    pub fn initClient(
+    /// Initialize a client connection IN PLACE into caller-owned storage.
+    ///
+    /// `Connection` is very large (embeds the TLS engine, 1500B recv/send
+    /// buffers, the crypto reassembly streams, etc.). Returning it by value
+    /// would materialize a multi-KB temporary on the caller's stack frame,
+    /// which risks a stack overflow in deep call chains. Writing directly into
+    /// the caller's storage (always a module-level `var`) avoids that entirely.
+    pub fn initClientInPlace(
+        self: *Connection,
         stream_storage: *streams.StreamArray,
         server_addr: w32.sockaddr_in,
         local_port: u16,
-    ) Connection {
-        var conn: Connection = undefined;
-        conn.initCommon(stream_storage, false);
+    ) void {
+        self.initCommon(stream_storage, false);
 
-        conn.socket = udp.UdpSocket.init();
+        self.socket = udp.UdpSocket.init();
         const bind_addr = w32.sockaddr_in{
             .sin_port = w32.htons(local_port),
             .sin_addr = 0x0100007F,
         };
-        _ = conn.socket.bind(bind_addr);
-        conn.peer_addr = server_addr;
+        _ = self.socket.bind(bind_addr);
+        self.peer_addr = server_addr;
 
-        generateRandomCid(&conn.local_cids[0]);
-        conn.local_cid_count = 1;
+        generateRandomCid(&self.local_cids[0]);
+        self.local_cid_count = 1;
 
-        generateRandomCid(&conn.remote_cids[0]);
-        conn.remote_cid_count = 1;
+        generateRandomCid(&self.remote_cids[0]);
+        self.remote_cid_count = 1;
 
-        conn.version = @intFromEnum(packet.Version.quic_v1);
+        self.version = @intFromEnum(packet.Version.quic_v1);
 
         // Advertise both v1 and v2 in version_information (RFC 9368 §4)
-        conn.local_params.version_info_len = buildVersionInfo(
-            conn.version,
-            &conn.local_params.version_info,
+        self.local_params.version_info_len = buildVersionInfo(
+            self.version,
+            &self.local_params.version_info,
         );
 
         // RFC 9000 §18.2: initial_source_connection_id = our local CID
-        const clen: u8 = @intCast(@min(conn.local_cids[0].len, @as(u8, 20)));
-        @memcpy(conn.local_params.initial_source_connection_id[0..clen], conn.local_cids[0].buf[0..clen]);
-        conn.local_params.initial_source_connection_id_len = clen;
-
-        return conn;
+        const clen: u8 = @intCast(@min(self.local_cids[0].len, @as(u8, 20)));
+        @memcpy(self.local_params.initial_source_connection_id[0..clen], self.local_cids[0].buf[0..clen]);
+        self.local_params.initial_source_connection_id_len = clen;
     }
 
-    /// Initialize a server connection.
-    pub fn initServer(
+    /// Initialize a server connection IN PLACE into caller-owned storage.
+    /// See initClientInPlace for the rationale (avoids a large stack temporary).
+    pub fn initServerInPlace(
+        self: *Connection,
         stream_storage: *streams.StreamArray,
         local_port: u16,
-    ) Connection {
-        var conn: Connection = undefined;
-        conn.initCommon(stream_storage, true);
+    ) void {
+        self.initCommon(stream_storage, true);
 
-        conn.socket = udp.UdpSocket.init();
+        self.socket = udp.UdpSocket.init();
         const bind_addr = w32.sockaddr_in{
             .sin_port = w32.htons(local_port),
             .sin_addr = 0x00000000,
         };
-        _ = conn.socket.bind(bind_addr);
-        conn.peer_addr = w32.sockaddr_in{};
+        _ = self.socket.bind(bind_addr);
+        self.peer_addr = w32.sockaddr_in{};
 
-        generateRandomCid(&conn.local_cids[0]);
-        conn.local_cid_count = 1;
-        conn.remote_cid_count = 0;
+        generateRandomCid(&self.local_cids[0]);
+        self.local_cid_count = 1;
+        self.remote_cid_count = 0;
 
-        conn.version = @intFromEnum(packet.Version.quic_v1);
+        self.version = @intFromEnum(packet.Version.quic_v1);
 
         // Advertise both v1 and v2 in version_information (RFC 9368 §4)
-        conn.local_params.version_info_len = buildVersionInfo(
-            conn.version,
-            &conn.local_params.version_info,
+        self.local_params.version_info_len = buildVersionInfo(
+            self.version,
+            &self.local_params.version_info,
         );
 
         // RFC 9000 §18.2: initial_source_connection_id = our local CID
         // (original_destination_connection_id is set when the first Initial arrives)
-        const slen: u8 = @intCast(@min(conn.local_cids[0].len, @as(u8, 20)));
-        @memcpy(conn.local_params.initial_source_connection_id[0..slen], conn.local_cids[0].buf[0..slen]);
-        conn.local_params.initial_source_connection_id_len = slen;
-
-        return conn;
+        const slen: u8 = @intCast(@min(self.local_cids[0].len, @as(u8, 20)));
+        @memcpy(self.local_params.initial_source_connection_id[0..slen], self.local_cids[0].buf[0..slen]);
+        self.local_params.initial_source_connection_id_len = slen;
     }
 
     /// Common initialization shared by client and server.
@@ -618,7 +621,7 @@ pub const Connection = struct {
         self.peer_app_ks = .{};
         self.client_initiated = false;
 
-        self.tls = transport_crypto.TlsEngine.init(is_server);
+        self.tls.initInPlace(is_server);
 
         var freq: w32.LARGE_INTEGER = .{};
         _ = w32.QueryPerformanceFrequency(&freq);
@@ -1177,8 +1180,7 @@ pub const Connection = struct {
                             // embedded tls13 client is awaiting that flight, feed
                             // ALL reassembled bytes at once instead of one TLS
                             // message at a time.
-                            const feed_whole_flight = self.tls.use_tls13 and
-                                !self.tls.is_server and
+                            const feed_whole_flight = !self.tls.is_server and
                                 self.tls.tls13_engine.state == .wait_server_finished;
 
                             if (avail >= 4) {

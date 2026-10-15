@@ -216,9 +216,8 @@ pub const Tls13Engine = struct {
 
     // ── Peer certificate DER (client role: parsed from the server's Certificate
     //    message; dedicated so it never overloads the server's own cert_der).
-    //    Sized for the loopback-trust path (a P-256 SEC1 point / small cert);
-    //    kept modest to bound the embedded-engine footprint. ──
-    peer_cert_der: [2048]u8 = @as([2048]u8, @splat(0)),
+    //    Sized to match cert_der so a real X.509 server certificate fits. ──
+    peer_cert_der: [4096]u8 = @as([4096]u8, @splat(0)),
     peer_cert_der_len: u16 = 0,
 
     // ── Peer's QUIC transport params (client: from EncryptedExtensions 0x39). ──
@@ -226,10 +225,10 @@ pub const Tls13Engine = struct {
     peer_transport_params_len: u16 = 0,
 
     // ── Output buffer (handshake messages to send as CRYPTO frames) ──
-    // One handshake flight (ServerHello / EE+Cert+CV+Finished, or ClientHello /
-    // client Finished) fits comfortably; 4 KB bounds the embedded-engine
-    // footprint so the Connection struct stays off the stack-frame cliff.
-    output_buf: [4096]u8 = @as([4096]u8, @splat(0)),
+    // Holds one full handshake flight (ServerHello / EE+Cert+CV+Finished, or
+    // ClientHello / client Finished). 8 KB accommodates a real X.509 server
+    // certificate chain, not just the loopback-trust test point.
+    output_buf: [8192]u8 = @as([8192]u8, @splat(0)),
     output_len: u16 = 0,
     /// Bytes of ServerHello in output_buf (Initial-level). Remainder is Handshake-level.
     server_hello_len: u16 = 0,
@@ -245,24 +244,30 @@ pub const Tls13Engine = struct {
     // Public API
     // ══════════════════════════════════════════════════════════════════════
 
-    /// Initialize as a QUIC server.
+    /// Initialize as a QUIC server (by value — for standalone/test use).
     pub fn initServer() Tls13Engine {
         var e = Tls13Engine{};
-        e.state = .wait_client_hello;
-        e.is_server = true;
+        e.initServerInPlace();
+        return e;
+    }
+
+    /// Initialize as a QUIC server IN PLACE (avoids a multi-KB by-value
+    /// temporary when embedded in a larger struct).
+    pub fn initServerInPlace(self: *Tls13Engine) void {
+        self.* = Tls13Engine{};
+        self.state = .wait_client_hello;
+        self.is_server = true;
 
         // Default ALPN to "h3" for HTTP/3 / WebTransport compatibility
-        e.alpn_list[0] = 'h';
-        e.alpn_list[1] = '3';
-        e.alpn_list_len = 2;
+        self.alpn_list[0] = 'h';
+        self.alpn_list[1] = '3';
+        self.alpn_list_len = 2;
 
         // Generate server ephemeral X25519 keypair
         var seed: [32]u8 = undefined;
         fillRandom(&seed);
-        e.eph_private = seed;
-        e.eph_public = X25519.recoverPublicKey(seed) catch @as([32]u8, @splat(0));
-
-        return e;
+        self.eph_private = seed;
+        self.eph_public = X25519.recoverPublicKey(seed) catch @as([32]u8, @splat(0));
     }
 
     /// Initialize as a QUIC client. Mirrors initServer() in reverse: generates
@@ -271,28 +276,34 @@ pub const Tls13Engine = struct {
     /// The caller must setTransportParams() before buildClientHello().
     pub fn initClient() Tls13Engine {
         var e = Tls13Engine{};
-        e.state = .wait_server_hello;
-        e.is_server = false;
+        e.initClientInPlace();
+        return e;
+    }
+
+    /// Initialize as a QUIC client IN PLACE (avoids a multi-KB by-value
+    /// temporary when embedded in a larger struct).
+    pub fn initClientInPlace(self: *Tls13Engine) void {
+        self.* = Tls13Engine{};
+        self.state = .wait_server_hello;
+        self.is_server = false;
 
         // Default ALPN to "zpm" for the mesh (must match the server's ALPN).
-        e.alpn_list[0] = 'z';
-        e.alpn_list[1] = 'p';
-        e.alpn_list[2] = 'm';
-        e.alpn_list_len = 3;
+        self.alpn_list[0] = 'z';
+        self.alpn_list[1] = 'p';
+        self.alpn_list[2] = 'm';
+        self.alpn_list_len = 3;
 
         // Generate client ephemeral X25519 keypair
         var seed: [32]u8 = undefined;
         fillRandom(&seed);
-        e.eph_private = seed;
-        e.eph_public = X25519.recoverPublicKey(seed) catch @as([32]u8, @splat(0));
+        self.eph_private = seed;
+        self.eph_public = X25519.recoverPublicKey(seed) catch @as([32]u8, @splat(0));
 
         // Client random + legacy_session_id (32 random bytes, echoed back by the
         // server and validated in handleServerHello).
-        fillRandom(&e.client_random);
-        fillRandom(&e.client_session_id);
-        e.client_session_id_len = 32;
-
-        return e;
+        fillRandom(&self.client_random);
+        fillRandom(&self.client_session_id);
+        self.client_session_id_len = 32;
     }
 
     /// Load a DER-encoded certificate and ECDSA P-256 private key (32-byte scalar).

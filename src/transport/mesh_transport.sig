@@ -153,7 +153,7 @@ fn makeMeshTestCert(cert_out: *[65]u8) [32]u8 {
 /// Returns the number of iterations used, or null if the handshake stalled.
 fn driveHandshake() ?u32 {
     // MED-7: server binds 0.0.0.0:ephemeral. initServer uses sin_addr=0.
-    mesh_server_conn = conn.Connection.initServer(&mesh_server_storage, 0);
+    conn.Connection.initServerInPlace(&mesh_server_conn, &mesh_server_storage, 0);
 
     // Read the OS-assigned port via getLocalAddr; build the client's dest as
     // 127.0.0.1:port (do NOT use getLocalAddr().addr.sin_addr as the dest).
@@ -163,7 +163,7 @@ fn driveHandshake() ?u32 {
         .sin_port = local.addr.sin_port,
     };
 
-    mesh_client_conn = conn.Connection.initClient(&mesh_client_storage, server_addr, 0);
+    conn.Connection.initClientInPlace(&mesh_client_conn, &mesh_client_storage, server_addr, 0);
 
     // Load the server's test certificate + ECDSA P-256 key before its first tick.
     var cert: [65]u8 = undefined;
@@ -296,7 +296,7 @@ test "M3: 10016-byte checkpoint batch reassembles over the socket" {
 
 // broadcastGossip precondition: NotConnected before the handshake completes.
 test "broadcastGossip returns NotConnected when idle" {
-    mesh_client_conn = conn.Connection.initClient(&mesh_client_storage, loopback_zero, 0);
+    conn.Connection.initClientInPlace(&mesh_client_conn, &mesh_client_storage, loopback_zero, 0);
     defer mesh_client_conn.socket.deinit();
 
     var sender = Mesh.init(&mesh_client_conn, .{});
@@ -308,7 +308,7 @@ const loopback_zero = w32.sockaddr_in{ .sin_port = 0, .sin_addr = 0x0100007F };
 
 // Feature: distributed-mmorpg-infrastructure, Requirement 4.2-4.3
 test "onChallenge accepts a valid Ed25519 signature and rejects a wrong one" {
-    mesh_client_conn = conn.Connection.initClient(&mesh_client_storage, loopback_zero, 0);
+    conn.Connection.initClientInPlace(&mesh_client_conn, &mesh_client_storage, loopback_zero, 0);
     defer mesh_client_conn.socket.deinit();
 
     var m = Mesh.init(&mesh_client_conn, .{});
