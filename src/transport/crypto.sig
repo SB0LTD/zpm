@@ -7,6 +7,7 @@
 const w32 = @import("win32");
 const packet = @import("packet");
 const platform_crypto = @import("crypto");
+const tls13 = @import("tls13");
 
 // ── ALPN Protocol String ──
 
@@ -103,6 +104,13 @@ pub const TlsEngine = struct {
     // Role
     is_server: bool = false,
 
+    // ── Embedded pure-Sig TLS 1.3 engine (Option B — mesh path) ──
+    // When use_tls13 is true, the whole mesh handshake is driven through this
+    // engine on BOTH platforms, independent of SChannel. conn.sig reads keys
+    // from tls13_engine directly (no win32-only getTls13Engine indirection).
+    tls13_engine: tls13.Tls13Engine = .{},
+    use_tls13: bool = false,
+
     pub const State = enum(u8) {
         idle,
         in_progress,
@@ -163,6 +171,18 @@ pub const TlsEngine = struct {
         // the ALPN buffer from the comptime constant each time
         _ = &alpn_protos;
 
+        // ── Mesh path (Option B): drive the handshake through the embedded
+        //    pure-Sig tls13 engine on BOTH platforms. SChannel fields above are
+        //    left intact for the non-mesh HTTP/3 client but are not used here.
+        //    TlsEngine{} default does NOT generate an X25519 keypair; initServer
+        //    /initClient do. Both peers advertise ALPN "zpm" (the mesh protocol).
+        engine.tls13_engine = if (is_server) tls13.Tls13Engine.initServer() else tls13.Tls13Engine.initClient();
+        engine.tls13_engine.setAlpn("zpm");
+        engine.use_tls13 = true;
+        // The mesh runs entirely through tls13; its state machine is authoritative,
+        // so clear any SChannel .failed set when creds didn't acquire (headless exe).
+        engine.state = .idle;
+
         return engine;
     }
 
@@ -170,7 +190,14 @@ pub const TlsEngine = struct {
     /// Appends data to recv_buf, then calls InitializeSecurityContextW (client)
     /// or AcceptSecurityContext (server) with accumulated data.
     pub fn feedCryptoData(self: *TlsEngine, level: EncryptionLevel, data: []const u8) HandshakeResult {
-        _ = level;
+        // ── Mesh path (Option B): drive the embedded tls13 engine, map its
+        //    ProcessResult onto HandshakeResult. Branches at the TOP for BOTH
+        //    roles so the SChannel path below is reached only when use_tls13 is
+        //    false (the non-mesh HTTP/3 client).
+        if (self.use_tls13) {
+            return self.feedCryptoDataTls13(level, data);
+        }
+
         var result = HandshakeResult{};
 
         if (self.state == .failed) {
@@ -337,6 +364,62 @@ pub const TlsEngine = struct {
         } else {
             self.state = .failed;
             result.err = .handshake_failed;
+        }
+
+        return result;
+    }
+
+    /// Mesh path: feed one reassembled CRYPTO message to the embedded tls13
+    /// engine and map its ProcessResult onto HandshakeResult.
+    ///
+    /// Output level routing (RFC 9001 §4.1):
+    ///  - Server: ServerHello [0..server_hello_len] is Initial-level; the rest
+    ///    (EE+Cert+CV+Finished) is Handshake-level. The split is carried in
+    ///    output.level (.initial) + server_hello_len via the data_len fields;
+    ///    conn.sig re-splits using the tls13 engine's server_hello_len directly.
+    ///  - Client: the only output is the client Finished (Handshake-level).
+    /// Peer transport params are surfaced into HandshakeResult.transport_params.
+    fn feedCryptoDataTls13(self: *TlsEngine, level: EncryptionLevel, data: []const u8) HandshakeResult {
+        _ = level;
+        var result = HandshakeResult{};
+
+        const pr = self.tls13_engine.processMessage(data);
+        if (pr.err != .none) {
+            result.err = .handshake_failed;
+            return result;
+        }
+
+        // Output bytes (if any). conn.sig performs the Initial/Handshake split
+        // for the server using tls13_engine.server_hello_len; here we just hand
+        // the raw bytes up at the handshake level (client Finished / fallback).
+        if (pr.output_len > 0 and pr.output_len <= result.output.data.len) {
+            @memcpy(result.output.data[0..pr.output_len], self.tls13_engine.output_buf[0..pr.output_len]);
+            result.output.data_len = pr.output_len;
+            result.output.has_data = true;
+            // Server's first flight starts at Initial (ServerHello); the client's
+            // only output is Handshake (Finished). conn re-splits via server_hello_len.
+            result.output.level = if (self.is_server and pr.server_hello_len > 0) .initial else .handshake;
+        }
+
+        // Bounded ALPN copy: ProcessResult.alpn is [64], HandshakeResult.alpn is [32].
+        {
+            const n: u8 = @intCast(@min(pr.alpn_len, @as(u8, 32)));
+            @memcpy(result.alpn[0..n], pr.alpn[0..n]);
+            result.alpn_len = n;
+        }
+
+        // Peer transport params (client learns them from EncryptedExtensions).
+        if (pr.peer_transport_params_len > 0) {
+            const n = @min(pr.peer_transport_params_len, @as(u16, result.transport_params.len));
+            @memcpy(result.transport_params[0..n], pr.peer_transport_params[0..n]);
+            result.transport_params_len = n;
+        }
+
+        if (pr.complete) {
+            self.state = .complete;
+            result.complete = true;
+        } else {
+            self.state = .in_progress;
         }
 
         return result;

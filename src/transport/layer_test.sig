@@ -69,6 +69,7 @@ const allowed_imports = [_][]const u8{
     "telemetry",
     "appmap",
     "crypto_stream",
+    "tls13",
     "h3",
     "h3_server",
 };

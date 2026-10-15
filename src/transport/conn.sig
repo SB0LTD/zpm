@@ -460,6 +460,18 @@ pub const Connection = struct {
     // Client Initial keys (retained for decrypting subsequent Initial packets)
     client_initial_ks: transport_crypto.KeySet,
 
+    // Peer-direction Handshake/1-RTT keys (mesh/tls13 path). QUIC protects with
+    // the sender's secret and removes protection with the peer's; self.tls.keys
+    // hold our own-direction keys for sending, and these hold the peer's
+    // direction so the receive phase can swap them in around decrypt. The peer
+    // direction is the opposite of self.is_server (MED-8: net-new recv key-swap
+    // at handshake + 1-RTT, generalized from the Initial-only logic).
+    peer_handshake_ks: transport_crypto.KeySet,
+    peer_app_ks: transport_crypto.KeySet,
+    // True once the client has sent its first Initial (ClientHello) so the
+    // idle→handshaking initiation runs exactly once.
+    client_initiated: bool,
+
     // Timing
     idle_timeout_ticks: u64,
     last_recv_tick: u64,
@@ -602,6 +614,9 @@ pub const Connection = struct {
         self.peer_params = .{};
 
         self.client_initial_ks = .{};
+        self.peer_handshake_ks = .{};
+        self.peer_app_ks = .{};
+        self.client_initiated = false;
 
         self.tls = transport_crypto.TlsEngine.init(is_server);
 
@@ -779,6 +794,21 @@ pub const Connection = struct {
                 }
             }
             if (self.state == .idle) return .idle;
+        } else if (self.state == .idle and !self.is_server) {
+            // ── Client idle: initiate the handshake (inverse of the server
+            //    branch). First tick only: build ClientHello, derive client
+            //    Initial keys, transition to handshaking, then fall through to
+            //    the send phase which assembles + sends the padded Initial.
+            if (!self.client_initiated) {
+                self.initiateClientHandshake();
+                self.client_initiated = true;
+                self.state = .handshaking;
+                @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.handshaking), .monotonic);
+                self.last_recv_tick = now_tick;
+                // fall through to send phase below
+            } else {
+                return .idle;
+            }
         } else if (self.state == .idle) {
             return .idle;
         }
@@ -811,77 +841,14 @@ pub const Connection = struct {
             self.last_recv_tick = now_tick;
             self.telem.recordReceived(recv_len);
 
-            // Determine encryption level from packet header
-            const hdr_result = packet.parseHeader(self.recv_buf[0..recv_len]);
-            if (hdr_result.err == .none) {
-                const hdr = hdr_result.header;
-                const level = self.levelFromHeader(&hdr);
-
-                // Handle 0-RTT packets on server side
-                if (hdr.is_long and hdr.pkt_type == .zero_rtt and self.is_server) {
-                    _ = self.handleZeroRttPacket(self.recv_buf[0..recv_len], &hdr, now_tick);
-                } else {
-
-                    // For incoming Initial packets during handshaking, temporarily swap to
-                    // client Initial keys (server keys are installed for sending after first Initial).
-                    const need_key_swap = (level == .initial and self.client_initial_ks.valid);
-                    const lvl_idx_recv = @intFromEnum(transport_crypto.EncryptionLevel.initial);
-                    var saved_server_ks: transport_crypto.KeySet = .{};
-                    if (need_key_swap) {
-                        saved_server_ks = self.tls.keys[lvl_idx_recv];
-                        self.tls.keys[lvl_idx_recv] = self.client_initial_ks;
-                    }
-
-                    // Unprotect header and decrypt payload
-                    const pn_offset = hdr.payload_offset;
-                    self.tls.unprotectHeader(level, self.recv_buf[0..recv_len], pn_offset);
-
-                    // Re-read packet number after header unprotection
-                    const pn_len: u16 = (self.recv_buf[0] & 0x03) + 1;
-                    var pkt_number: u32 = 0;
-                    for (0..pn_len) |i| {
-                        pkt_number = (pkt_number << 8) | self.recv_buf[pn_offset + @as(u16, @intCast(i))];
-                    }
-
-                    const payload_start = pn_offset + pn_len;
-                    const payload_len: u16 = if (hdr.is_long)
-                        hdr.payload_len -| pn_len
-                    else if (recv_len > payload_start)
-                        recv_len - payload_start
-                    else
-                        0;
-
-                    if (payload_len > 0) {
-                        const decrypt_err = self.tls.decrypt(
-                            level,
-                            pkt_number,
-                            self.recv_buf[0..recv_len],
-                            payload_start,
-                            payload_len,
-                        );
-
-                        if (decrypt_err == .none) {
-                            // Update largest received packet number
-                            const space = self.spaceFromLevel(level);
-                            const s_idx = @intFromEnum(space);
-                            if (pkt_number > self.largest_recv_pkt[s_idx]) {
-                                self.largest_recv_pkt[s_idx] = pkt_number;
-                            }
-
-                            // Strip AEAD tag (16 bytes) from payload for frame parsing
-                            const frame_len: u16 = if (payload_len >= 16) payload_len - 16 else 0;
-
-                            // Parse and dispatch frames
-                            self.dispatchFrames(self.recv_buf[0..recv_len], payload_start, frame_len, space, now_tick);
-                        }
-                        // Decrypt failure: silently discard per RFC 9000 §12.1
-                    }
-
-                    // Restore server Initial keys for sending
-                    if (need_key_swap) {
-                        self.tls.keys[lvl_idx_recv] = saved_server_ks;
-                    }
-                } // end else (non-0-RTT path)
+            // A single UDP datagram may carry multiple coalesced QUIC packets
+            // (RFC 9000 §12.2) — e.g. the server coalesces ServerHello (Initial)
+            // + the EE/Cert/CV/Finished flight (Handshake). Process each in turn.
+            var pkt_start: u16 = 0;
+            while (pkt_start < recv_len) {
+                const consumed = self.processReceivedPacket(pkt_start, recv_len, now_tick);
+                if (consumed == 0) break;
+                pkt_start += consumed;
             }
         }
 
@@ -938,6 +905,170 @@ pub const Connection = struct {
         }
 
         return self.state;
+    }
+
+    /// Process one QUIC packet starting at `pkt_start` in recv_buf, returning
+    /// the number of bytes consumed (so the caller can advance to the next
+    /// coalesced packet). Returns 0 if the packet cannot be parsed. Header
+    /// protection and AEAD operate on the sub-slice recv_buf[pkt_start..end]
+    /// with offsets relative to that slice.
+    fn processReceivedPacket(self: *Connection, pkt_start: u16, end: u16, now_tick: u64) u16 {
+        const seg = self.recv_buf[pkt_start..end];
+        const hdr_result = packet.parseHeader(seg);
+        if (hdr_result.err != .none) return 0;
+        const hdr = hdr_result.header;
+        const level = self.levelFromHeader(&hdr);
+
+        // Total bytes this packet occupies in the datagram.
+        // Long header: payload_offset + payload_len (Length field covers PN+payload+tag).
+        // Short header (1-RTT): the rest of the datagram.
+        const seg_len: u16 = @intCast(seg.len);
+        const consumed: u16 = if (hdr.is_long)
+            @min(hdr.payload_offset + hdr.payload_len, seg_len)
+        else
+            seg_len;
+        if (consumed == 0) return 0;
+
+        // 0-RTT (server side) handled separately; it consumes the rest.
+        if (hdr.is_long and hdr.pkt_type == .zero_rtt and self.is_server) {
+            _ = self.handleZeroRttPacket(seg, &hdr, now_tick);
+            return consumed;
+        }
+
+        // QUIC removes packet protection with the PEER's traffic secret. Swap in
+        // the peer-direction keys around decrypt at every level (MED-8).
+        const peer_ks: transport_crypto.KeySet = switch (level) {
+            .initial => self.client_initial_ks,
+            .handshake => self.peer_handshake_ks,
+            .one_rtt => self.peer_app_ks,
+            .zero_rtt => .{},
+        };
+        const need_key_swap = peer_ks.valid;
+        const lvl_idx_recv = @intFromEnum(level);
+        var saved_own_ks: transport_crypto.KeySet = .{};
+        if (need_key_swap) {
+            saved_own_ks = self.tls.keys[lvl_idx_recv];
+            self.tls.keys[lvl_idx_recv] = peer_ks;
+        }
+
+        const pn_offset = hdr.payload_offset;
+        self.tls.unprotectHeader(level, self.recv_buf[pkt_start .. pkt_start + consumed], pn_offset);
+
+        const pn_len: u16 = (self.recv_buf[pkt_start] & 0x03) + 1;
+        var pkt_number: u32 = 0;
+        for (0..pn_len) |i| {
+            pkt_number = (pkt_number << 8) | self.recv_buf[pkt_start + pn_offset + @as(u16, @intCast(i))];
+        }
+
+        const payload_start = pn_offset + pn_len;
+        const payload_len: u16 = if (hdr.is_long)
+            hdr.payload_len -| pn_len
+        else if (consumed > payload_start)
+            consumed - payload_start
+        else
+            0;
+
+        if (payload_len > 0) {
+            const decrypt_err = self.tls.decrypt(
+                level,
+                pkt_number,
+                self.recv_buf[pkt_start .. pkt_start + consumed],
+                payload_start,
+                payload_len,
+            );
+            if (decrypt_err == .none) {
+                const space = self.spaceFromLevel(level);
+                const s_idx = @intFromEnum(space);
+                if (pkt_number > self.largest_recv_pkt[s_idx]) {
+                    self.largest_recv_pkt[s_idx] = pkt_number;
+                }
+                const frame_len: u16 = if (payload_len >= 16) payload_len - 16 else 0;
+                self.dispatchFrames(self.recv_buf[pkt_start .. pkt_start + consumed], payload_start, frame_len, space, now_tick);
+            }
+            // Decrypt failure: silently discard per RFC 9000 §12.1
+        }
+
+        if (need_key_swap) {
+            self.tls.keys[lvl_idx_recv] = saved_own_ks;
+        }
+
+        return consumed;
+    }
+
+    // ── Client handshake initiation (FR3) ──
+
+    /// Build the ClientHello, place it as Initial-level CRYPTO, and derive the
+    /// client's own Initial keys. Mirror of the server idle branch, inverted.
+    /// The DCID used for key derivation is EXACTLY the CID assembleSendPacket
+    /// writes as the Initial long-header DCID (MED-4):
+    /// self.remote_cids[self.active_remote_cid].
+    fn initiateClientHandshake(self: *Connection) void {
+        // Encode our local transport params into the tls13 engine so the
+        // ClientHello carries the 0x39 extension.
+        var tp_buf: [512]u8 = @as([512]u8, @splat(0));
+        const tp_len = encodeTransportParams(&self.local_params, &tp_buf);
+        if (tp_len > 0) {
+            self.setTlsTransportParams(tp_buf[0..tp_len]);
+        }
+
+        // Build the ClientHello into the embedded engine's output_buf.
+        const err = self.tls.tls13_engine.buildClientHello();
+        if (err != .none) {
+            writeStdout("CLIENT INIT: buildClientHello failed\n");
+            return;
+        }
+        const ch_len = self.tls.tls13_engine.output_len;
+        if (ch_len > 0 and ch_len <= self.tls.initial_send_buf.len) {
+            @memcpy(self.tls.initial_send_buf[0..ch_len], self.tls.tls13_engine.output_buf[0..ch_len]);
+            self.tls.initial_send_len = ch_len;
+        }
+
+        // Derive client Initial keys from the DCID we will put in the Initial
+        // long header (RFC 9001 §5.2). Install client_ks for sending; retain it
+        // so subsequent Initial recv/decrypt uses it, mirroring the server.
+        const dcid_slice = if (self.remote_cid_count > 0)
+            self.remote_cids[self.active_remote_cid].slice()
+        else
+            self.local_cids[self.active_local_cid].slice();
+
+        const client_ks = transport_crypto.deriveInitialKeys(dcid_slice, false, self.version);
+        const server_ks = transport_crypto.deriveInitialKeys(dcid_slice, true, self.version);
+        const lvl_idx = @intFromEnum(transport_crypto.EncryptionLevel.initial);
+        // Client encrypts its Initial with client_ks and decrypts the server's
+        // Initial with server_ks. Install client_ks for sending; the receive
+        // phase swaps in the peer (server) keys via peer_initial handling below.
+        self.tls.keys[lvl_idx] = client_ks;
+        // Retain the peer-direction Initial keys so the recv path can decrypt
+        // the server's Initial (ServerHello). We reuse client_initial_ks as the
+        // "peer Initial keys" slot, consistent with the existing swap logic:
+        // for a client, the peer (server) direction is server_ks.
+        self.client_initial_ks = server_ks;
+    }
+
+    /// Install QUIC Handshake/1-RTT keys from the embedded tls13 engine
+    /// (Option B — same on every platform). QUIC protects with the sender's
+    /// traffic secret and removes protection with the peer's. We put OUR
+    /// direction into self.tls.keys[level] (send) and retain the PEER direction
+    /// in peer_handshake_ks / peer_app_ks for the recv key-swap. Peer direction
+    /// is the opposite of self.is_server.
+    fn syncTls13Keys(self: *Connection) void {
+        const eng = &self.tls.tls13_engine;
+
+        if (eng.client_handshake_keys.valid and eng.server_handshake_keys.valid) {
+            const hs_lvl = @intFromEnum(transport_crypto.EncryptionLevel.handshake);
+            const own = if (self.is_server) eng.server_handshake_keys else eng.client_handshake_keys;
+            const peer = if (self.is_server) eng.client_handshake_keys else eng.server_handshake_keys;
+            self.tls.keys[hs_lvl] = toKeySet(own);
+            self.peer_handshake_ks = toKeySet(peer);
+        }
+
+        if (eng.client_app_keys.valid and eng.server_app_keys.valid) {
+            const app_lvl = @intFromEnum(transport_crypto.EncryptionLevel.one_rtt);
+            const own = if (self.is_server) eng.server_app_keys else eng.client_app_keys;
+            const peer = if (self.is_server) eng.client_app_keys else eng.server_app_keys;
+            self.tls.keys[app_lvl] = toKeySet(own);
+            self.peer_app_ks = toKeySet(peer);
+        }
     }
 
     // ── isTimedOut ──
@@ -1040,14 +1171,30 @@ pub const Connection = struct {
                             if (avail == 0) {
                                 writeStdout("CRYPTO: recv ok but avail=0\n");
                             }
+                            // The TLS 1.3 client expects the server's Handshake
+                            // flight (EE + Certificate + CertificateVerify +
+                            // server Finished) as ONE contiguous buffer. When the
+                            // embedded tls13 client is awaiting that flight, feed
+                            // ALL reassembled bytes at once instead of one TLS
+                            // message at a time.
+                            const feed_whole_flight = self.tls.use_tls13 and
+                                !self.tls.is_server and
+                                self.tls.tls13_engine.state == .wait_server_finished;
+
                             if (avail >= 4) {
                                 // Read TLS header to determine message length
                                 var hdr: [4]u8 = undefined;
                                 _ = cs.read(&hdr);
-                                const msg_len: u16 = @intCast(@min(
+                                const single_msg_len: u16 = @intCast(@min(
                                     (@as(u32, hdr[1]) << 16 | @as(u32, hdr[2]) << 8 | @as(u32, hdr[3])) + 4,
                                     crypto_stream.buf_size,
                                 ));
+                                // Feed the whole reassembled flight for the client,
+                                // otherwise exactly one TLS message.
+                                const msg_len: u16 = if (feed_whole_flight)
+                                    @intCast(@min(avail, @as(usize, crypto_stream.buf_size)))
+                                else
+                                    single_msg_len;
 
                                 if (avail >= msg_len) {
                                     var msg_buf: [8192]u8 = undefined;
@@ -1058,50 +1205,14 @@ pub const Connection = struct {
                                     const crypto_data = msg_buf[0..read_len];
                                     const hs_result = self.tls.feedCryptoData(level, crypto_data);
 
-                                    // Sync TLS 1.3 derived keys into the connection's key slots.
-                                    if (@hasDecl(w32, "getTls13Engine")) {
-                                        var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
-                                        if (w32.getTls13Engine(&cred_h)) |engine| {
-                                            if (engine.server_handshake_keys.valid) {
-                                                const hs_lvl = @intFromEnum(transport_crypto.EncryptionLevel.handshake);
-                                                self.tls.keys[hs_lvl] = .{
-                                                    .key = engine.server_handshake_keys.key,
-                                                    .iv = engine.server_handshake_keys.iv,
-                                                    .hp_key = engine.server_handshake_keys.hp_key,
-                                                    .valid = true,
-                                                };
-                                                writeStdout("KEY SYNC: handshake keys installed key=");
-                                                writeHexU8(engine.server_handshake_keys.key[0]);
-                                                writeHexU8(engine.server_handshake_keys.key[1]);
-                                                writeHexU8(engine.server_handshake_keys.key[2]);
-                                                writeHexU8(engine.server_handshake_keys.key[3]);
-                                                writeStdout(" iv=");
-                                                writeHexU8(engine.server_handshake_keys.iv[0]);
-                                                writeHexU8(engine.server_handshake_keys.iv[1]);
-                                                writeHexU8(engine.server_handshake_keys.iv[2]);
-                                                writeHexU8(engine.server_handshake_keys.iv[3]);
-                                                writeStdout("\n");
-                                            } else {
-                                                writeStdout("KEY SYNC: engine.server_handshake_keys NOT valid\n");
-                                            }
-                                            if (engine.server_app_keys.valid) {
-                                                const app_lvl = @intFromEnum(transport_crypto.EncryptionLevel.one_rtt);
-                                                self.tls.keys[app_lvl] = .{
-                                                    .key = engine.server_app_keys.key,
-                                                    .iv = engine.server_app_keys.iv,
-                                                    .hp_key = engine.server_app_keys.hp_key,
-                                                    .valid = true,
-                                                };
-                                                writeStdout("KEY SYNC: app keys installed\n");
-                                            }
-                                        } else {
-                                            writeStdout("KEY SYNC FAIL: getTls13Engine returned null, cred[0]=");
-                                            writeHexU64(self.tls.cred_handle[0]);
-                                            writeStdout("\n");
-                                        }
-                                    } else {
-                                        writeStdout("KEY SYNC FAIL: no getTls13Engine decl\n");
-                                    }
+                                    // Sync TLS 1.3 derived keys from the embedded
+                                    // tls13 engine into the connection's key slots
+                                    // (Option B — platform-independent, FR4). We
+                                    // install OUR-direction keys for sending into
+                                    // self.tls.keys[level] and retain the PEER
+                                    // direction for the recv key-swap. Peer
+                                    // direction = opposite of self.is_server.
+                                    self.syncTls13Keys();
 
                                     // Also log feedCryptoData result
                                     if (hs_result.output.has_data) {
@@ -1117,14 +1228,10 @@ pub const Connection = struct {
                                     // Route TLS output to send buffers (split Initial/Handshake per RFC 9001 §4.1)
                                     if (hs_result.output.has_data and hs_result.output.data_len > 0) {
                                         const out_len = hs_result.output.data_len;
-                                        // Check if we have a ServerHello split point from Tls13Engine
-                                        var sh_len: u16 = 0;
-                                        if (@hasDecl(w32, "getTls13Engine")) {
-                                            var cred_h2: w32.CredHandle = @bitCast(self.tls.cred_handle);
-                                            if (w32.getTls13Engine(&cred_h2)) |eng| {
-                                                sh_len = eng.server_hello_len;
-                                            }
-                                        }
+                                        // ServerHello split point from the embedded tls13 engine
+                                        // (server-only; the client's output is a single
+                                        // Finished at Handshake level).
+                                        const sh_len: u16 = if (self.is_server) self.tls.tls13_engine.server_hello_len else 0;
                                         if (sh_len > 0 and sh_len < out_len) {
                                             // ServerHello → Initial CRYPTO, rest → Handshake CRYPTO
                                             if (sh_len <= self.tls.initial_send_buf.len) {
@@ -1202,18 +1309,40 @@ pub const Connection = struct {
                     self.ack_needed[@intFromEnum(space)] = true;
                 },
 
-                .stream => {
-                    // STREAM → stream manager
-                    self.stream_mgr.onStreamFrame(fr.frame);
+                .stream => |sf| {
+                    // STREAM → stream manager. The actual payload must be COPIED
+                    // out of the packet buffer into the stream's recv ring (via
+                    // onStreamData, which also advances recv_offset / flow
+                    // control and handles FIN) so readFromStream can deliver it
+                    // — parallels the DATAGRAM inbound-copy. onStreamFrame alone
+                    // is metadata-only and would drop the bytes.
+                    const sdata_end = sf.data_offset + sf.data_len;
+                    if (sf.data_len > 0 and sdata_end <= buf.len) {
+                        self.stream_mgr.onStreamData(
+                            sf.stream_id,
+                            sf.offset,
+                            buf[sf.data_offset..sdata_end],
+                            sf.fin,
+                        );
+                    } else {
+                        // No payload (or out-of-bounds): fall back to the
+                        // metadata path for FIN/flow-control bookkeeping.
+                        self.stream_mgr.onStreamFrame(fr.frame);
+                    }
                     self.ack_needed[@intFromEnum(space)] = true;
                 },
 
                 .datagram => |dg| {
-                    // DATAGRAM → datagram handler
+                    // DATAGRAM → datagram handler. COPY the validated payload
+                    // out of recv_buf into the inbound ring (FR5.2) so it
+                    // survives the next socket recv; pollGossip drains it.
                     const dg_end = dg.data_offset + dg.data_len;
                     if (dg_end <= buf.len) {
-                        _ = self.datagrams.onReceive(buf[dg.data_offset..dg_end]);
+                        if (self.datagrams.onReceive(buf[dg.data_offset..dg_end])) |payload| {
+                            _ = self.datagrams.enqueueReceived(payload);
+                        }
                     }
+                    self.ack_needed[@intFromEnum(space)] = true;
                 },
 
                 .max_data => |md| {
@@ -1550,14 +1679,20 @@ pub const Connection = struct {
 
             const level = self.levelFromHeader(&hdr);
 
-            // For incoming Initial packets during handshaking, temporarily swap to client
-            // Initial keys (server keys are installed for sending after the first Initial).
-            const need_key_swap = (level == .initial and self.client_initial_ks.valid);
-            const lvl_idx_recv = @intFromEnum(transport_crypto.EncryptionLevel.initial);
-            var saved_server_ks: transport_crypto.KeySet = .{};
+            // Swap in the PEER-direction keys around decrypt at every level
+            // (MED-8), mirroring the tick() recv path.
+            const peer_ks: transport_crypto.KeySet = switch (level) {
+                .initial => self.client_initial_ks,
+                .handshake => self.peer_handshake_ks,
+                .one_rtt => self.peer_app_ks,
+                .zero_rtt => .{},
+            };
+            const need_key_swap = peer_ks.valid;
+            const lvl_idx_recv = @intFromEnum(level);
+            var saved_own_ks: transport_crypto.KeySet = .{};
             if (need_key_swap) {
-                saved_server_ks = self.tls.keys[lvl_idx_recv];
-                self.tls.keys[lvl_idx_recv] = self.client_initial_ks;
+                saved_own_ks = self.tls.keys[lvl_idx_recv];
+                self.tls.keys[lvl_idx_recv] = peer_ks;
             }
 
             const pn_offset = hdr.payload_offset;
@@ -1590,9 +1725,9 @@ pub const Connection = struct {
                 }
             }
 
-            // Restore server Initial keys for sending
+            // Restore our own-direction keys for sending at this level.
             if (need_key_swap) {
-                self.tls.keys[lvl_idx_recv] = saved_server_ks;
+                self.tls.keys[lvl_idx_recv] = saved_own_ks;
             }
         }
 
@@ -1628,13 +1763,9 @@ pub const Connection = struct {
     /// cert_der: DER-encoded certificate bytes.
     /// key_raw: 32-byte raw ECDSA P-256 private key scalar.
     pub fn loadTlsCertificate(self: *Connection, cert_der: []const u8, key_raw: []const u8) bool {
-        if (@hasDecl(w32, "getTls13Engine")) {
-            var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
-            if (w32.getTls13Engine(&cred_h)) |engine| {
-                return engine.loadCertificate(cert_der, key_raw) == .none;
-            }
-        }
-        return false;
+        // Option B: load into the embedded tls13 engine directly (same on
+        // every platform — no win32-only getTls13Engine).
+        return self.tls.tls13_engine.loadCertificate(cert_der, key_raw) == .none;
     }
 
     /// Load TLS certificate from PEM-encoded strings (Let's Encrypt ECDSA P-256).
@@ -1642,15 +1773,8 @@ pub const Connection = struct {
     /// cert_pem: Full PEM certificate (-----BEGIN CERTIFICATE-----\n...\n-----END...).
     /// key_pem: PKCS#8 PEM private key (-----BEGIN PRIVATE KEY-----\n...\n-----END...).
     pub fn loadTlsCertificatePem(self: *Connection, cert_pem: []const u8, key_pem: []const u8) bool {
-        if (!@hasDecl(w32, "getTls13Engine")) {
-            writeStdout("CERT: no getTls13Engine decl\n");
-            return false;
-        }
-        var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
-        const engine = w32.getTls13Engine(&cred_h) orelse {
-            writeStdout("CERT: getTls13Engine returned null\n");
-            return false;
-        };
+        // Option B: load into the embedded tls13 engine directly.
+        const engine = &self.tls.tls13_engine;
 
         // Decode cert PEM → DER
         var cert_der: [4096]u8 = undefined;
@@ -1696,20 +1820,14 @@ pub const Connection = struct {
         }
     }
 
-    /// Set ALPN protocol for this connection's TLS engine.
+    /// Set ALPN protocol for this connection's TLS engine (mesh = "zpm").
     pub fn setTlsAlpn(self: *Connection, alpn: []const u8) void {
-        if (@hasDecl(w32, "setTlsAlpn")) {
-            var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
-            _ = w32.setTlsAlpn(&cred_h, alpn);
-        }
+        self.tls.tls13_engine.setAlpn(alpn);
     }
 
-    /// Set QUIC transport parameters for TLS engine.
+    /// Set QUIC transport parameters for the embedded tls13 engine.
     pub fn setTlsTransportParams(self: *Connection, params: []const u8) void {
-        if (@hasDecl(w32, "setTlsTransportParams")) {
-            var cred_h: w32.CredHandle = @bitCast(self.tls.cred_handle);
-            _ = w32.setTlsTransportParams(&cred_h, params);
-        }
+        self.tls.tls13_engine.setTransportParams(params);
     }
     pub fn deinit(self: *Connection) void {
         // Close the UDP socket
@@ -1908,7 +2026,11 @@ pub const Connection = struct {
         // Determine which space/level to use
         // During handshaking, we may need to send in Initial space (ACK to client Initial)
         // OR handshake space (ServerHello). Check Initial first if ack_needed.
-        const space: PktNumSpace = if (self.state == .handshaking and self.ack_needed[@intFromEnum(PktNumSpace.initial)])
+        const space: PktNumSpace = if (self.state == .handshaking and
+            (self.ack_needed[@intFromEnum(PktNumSpace.initial)] or self.tls.initial_send_len > 0))
+            // Initial space when an Initial ACK is pending OR there is Initial-
+            // level CRYPTO to send (the client's ClientHello, or the server's
+            // ServerHello before the client Initial is acked).
             .initial
         else if (self.state == .handshaking)
             .handshake
@@ -2155,6 +2277,27 @@ pub const Connection = struct {
             }
         }
 
+        // Client Initial padding (RFC 9000 §14.1): a client Initial-bearing
+        // UDP datagram MUST be >= 1200 bytes. Append PADDING frames (0x00) so
+        // the whole packet (header + payload + AEAD tag) reaches 1200. The
+        // padding is inside the AEAD-protected payload and counted in
+        // payload_len so the header length fields and decryption agree.
+        if (space == .initial and !self.is_server) {
+            // Current whole-packet length once the 16-byte AEAD tag is added.
+            const projected_total: u16 = pos + 16;
+            if (projected_total < 1200) {
+                var pad: u16 = 1200 - projected_total;
+                // Clamp to the available room in send_buf (leaving the tag room).
+                const room: u16 = @intCast(self.send_buf.len - pos - 16);
+                if (pad > room) pad = room;
+                if (pad > 0) {
+                    @memset(self.send_buf[pos .. pos + pad], 0x00);
+                    pos += pad;
+                    is_ack_eliciting = true;
+                }
+            }
+        }
+
         // Nothing assembled beyond the header
         const payload_len = pos - payload_start;
         if (payload_len == 0) return 0;
@@ -2228,6 +2371,12 @@ pub const Connection = struct {
 };
 
 // ── Helpers ──
+
+/// Convert a tls13.QuicKeys-shaped value (key/iv/hp_key/valid) into the
+/// transport_crypto.KeySet used by the QUIC packet-protection slots.
+fn toKeySet(k: anytype) transport_crypto.KeySet {
+    return .{ .key = k.key, .iv = k.iv, .hp_key = k.hp_key, .valid = k.valid };
+}
 
 /// Decode PEM to DER (base64 decode between -----BEGIN...-----/-----END...-----).
 /// Returns the decoded length, or null on failure.

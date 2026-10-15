@@ -1222,6 +1222,8 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, transport_crypto, "packet", "src/transport/packet.sig");
     try wire(ctx, transport_crypto, "crypto", "src/platform/crypto.sig");
     _ = try ctx.addModule("tls13", "src/transport/tls13.sig");
+    // crypto.sig embeds a tls13.Tls13Engine (Option B — mesh handshake path).
+    try wire(ctx, transport_crypto, "tls13", "src/transport/tls13.sig");
     const recovery = try ctx.addModule("recovery", "src/transport/recovery.sig");
     try wire(ctx, recovery, "packet", "src/transport/packet.sig");
     const streams = try ctx.addModule("streams", "src/transport/streams.sig");
@@ -1297,6 +1299,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("win32", win32_path),
         importEntry("packet", "src/transport/packet.sig"),
         importEntry("crypto", "src/platform/crypto.sig"),
+        importEntry("tls13", "src/transport/tls13.sig"),
     });
     _ = try addTest(ctx, test_all, "test-recovery", "src/transport/recovery.sig", &.{importEntry("packet", "src/transport/packet.sig")});
     _ = try addTest(ctx, test_all, "test-streams", "src/transport/streams.sig", &.{importEntry("packet", "src/transport/packet.sig")});
@@ -1307,13 +1310,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("transport_crypto", "src/transport/crypto.sig"),     importEntry("recovery", "src/transport/recovery.sig"),
         importEntry("streams", "src/transport/streams.sig"),             importEntry("datagram", "src/transport/datagram.sig"),
         importEntry("telemetry", "src/transport/telemetry.sig"),         importEntry("udp", "src/transport/udp.sig"),
-        importEntry("crypto_stream", "src/transport/crypto_stream.sig"),
+        importEntry("crypto_stream", "src/transport/crypto_stream.sig"), importEntry("tls13", "src/transport/tls13.sig"),
     });
     _ = try addTest(ctx, test_all, "test-scheduler", "src/transport/scheduler.sig", &.{
         importEntry("win32", win32_path),                      importEntry("packet", "src/transport/packet.sig"),
         importEntry("streams", "src/transport/streams.sig"),   importEntry("datagram", "src/transport/datagram.sig"),
         importEntry("recovery", "src/transport/recovery.sig"), importEntry("transport_crypto", "src/transport/crypto.sig"),
         importEntry("udp", "src/transport/udp.sig"),           importEntry("telemetry", "src/transport/telemetry.sig"),
+        importEntry("tls13", "src/transport/tls13.sig"),
     });
     _ = try addTest(ctx, test_all, "test-appmap", "src/transport/appmap.sig", &.{
         importEntry("streams", "src/transport/streams.sig"),
@@ -1328,7 +1332,21 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("win32", win32_path),                                importEntry("transport_crypto", "src/transport/crypto.sig"),
         importEntry("recovery", "src/transport/recovery.sig"),           importEntry("telemetry", "src/transport/telemetry.sig"),
         importEntry("udp", "src/transport/udp.sig"),                     importEntry("crypto_stream", "src/transport/crypto_stream.sig"),
+        importEntry("tls13", "src/transport/tls13.sig"),
     });
+    // AC1 names `sig build test-quic-loopback` as the M1 gate: a dedicated step
+    // pointing at the SAME real-wire harness root (mesh_transport.sig) with the
+    // full conn-closure seam (identical to test-mesh-transport).
+    _ = try addTest(ctx, test_all, "test-quic-loopback", "src/transport/mesh_transport.sig", &.{
+        importEntry("conn", "src/transport/conn.sig"),                   importEntry("streams", "src/transport/streams.sig"),
+        importEntry("datagram", "src/transport/datagram.sig"),           importEntry("packet", "src/transport/packet.sig"),
+        importEntry("win32", win32_path),                                importEntry("transport_crypto", "src/transport/crypto.sig"),
+        importEntry("recovery", "src/transport/recovery.sig"),           importEntry("telemetry", "src/transport/telemetry.sig"),
+        importEntry("udp", "src/transport/udp.sig"),                     importEntry("crypto_stream", "src/transport/crypto_stream.sig"),
+        importEntry("tls13", "src/transport/tls13.sig"),
+    });
+    // Pure in-process TLS 1.3 client↔server handshake test (no sockets/QUIC).
+    _ = try addTest(ctx, test_all, "test-tls13", "src/transport/tls13.sig", &.{});
     _ = try addTest(ctx, test_all, "test-h3", "src/transport/h3.sig", &.{});
     _ = try addTest(ctx, test_all, "test-h3-server", "src/transport/server.sig", &.{
         importEntry("conn", "src/transport/conn.sig"),       importEntry("packet", "src/transport/packet.sig"),
@@ -1358,6 +1376,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("telemetry", "src/transport/telemetry.sig"),
         importEntry("udp", "src/transport/udp.sig"),
         importEntry("crypto_stream", "src/transport/crypto_stream.sig"),
+        importEntry("tls13", "src/transport/tls13.sig"),
     };
     // One compile step for the mesh node; the win32 seam above already follows
     // the requested target (-Dtarget=...), so the SAME step builds:
@@ -1396,6 +1415,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("packet", "src/transport/packet.sig"),     importEntry("recovery", "src/transport/recovery.sig"),
             importEntry("datagram", "src/transport/datagram.sig"), importEntry("udp", "src/transport/udp.sig"),
             importEntry("win32", win32_path),                      importEntry("appmap", "src/transport/appmap.sig"),
+            importEntry("tls13", "src/transport/tls13.sig"),
         },
     });
     _ = try ctx.addTestStep(.{
@@ -1406,6 +1426,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("streams", "src/transport/streams.sig"), importEntry("transport_crypto", "src/transport/crypto.sig"),
             importEntry("packet", "src/transport/packet.sig"),   importEntry("datagram", "src/transport/datagram.sig"),
             importEntry("udp", "src/transport/udp.sig"),         importEntry("win32", win32_path),
+            importEntry("tls13", "src/transport/tls13.sig"),
         },
     });
 }
