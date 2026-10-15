@@ -64,6 +64,9 @@ pub const DownloadOptions = struct {
     // Refresh a rejected native attestation once by default; 0 disables it.
     // At most 3 refreshes per track are permitted. External proofs are never refreshed.
     max_attestation_refreshes: u8 = 1,
+    // Reuse a pinned connection within one SABR attempt; false selects the
+    // one-shot comparison path. Never shared across fresh attestations.
+    reuse_sabr_connection: bool = true,
     web_client: session_mod.WebClient = .mweb,
     require_vm_token: bool = false,
     progress: stream_mod.ProgressFn = null,
@@ -796,9 +799,13 @@ fn trySabr(
     var fsink = sabr_mod.stream.StagedFileSink.open(output_path) orelse return false;
     defer fsink.close();
     var transport_ctx = sabr_mod.stream.NetTransport{
+        .reuse_connection = options.reuse_sabr_connection,
+        .profile = options.profile,
         .jar = &g_session.jar,
         .user_agent = if (g_web_client == .mweb) session_mod.MWEB_UA else http.CHROME_UA,
     };
+
+    defer transport_ctx.close();
 
     const client_version = if (g_web_client == .mweb)
         g_session.mweb_client_version[0..g_session.mweb_client_version_len]
@@ -841,6 +848,7 @@ fn trySabr(
         fsink.sink(),
         .{ .progress = options.progress, .on_response = options.sabr_response, .profile = options.profile },
     );
+    transport_ctx.close();
     profiling.add(options.profile, "transfer_ns", transfer_started);
 
     status.sabr_result = res;

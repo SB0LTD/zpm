@@ -1,8 +1,5 @@
 // HTTP client module root.
 //
-// This is a placeholder implementation for the HTTP client module. It will be
-// fully implemented in subsequent tasks.
-//
 // The module provides a pure-Sig HTTP/1.1 client that composes on the existing
 // tls_client stack, mirroring the proven wss.sig layering.
 
@@ -42,6 +39,55 @@ pub const Method = errors.Method;
 pub const Trace = errors.Trace;
 pub const TlsFailKind = errors.TlsFailKind;
 
+// Optional high-resolution timing. No clock calls when trace is null.
+extern "kernel32" fn QueryPerformanceCounter(*i64) c_int;
+extern "kernel32" fn QueryPerformanceFrequency(*i64) c_int;
+var trace_frequency: u64 = 0;
+fn traceClock(trace: ?*Trace) u64 {
+    if (trace == null) return 0;
+    if (trace_frequency == 0) {
+        var f: i64 = 0;
+        if (QueryPerformanceFrequency(&f) == 0 or f <= 0) return 0;
+        trace_frequency = @intCast(f);
+    }
+    var t: i64 = 0;
+    if (QueryPerformanceCounter(&t) == 0 or t < 0) return 0;
+    return @intCast(@as(u128, @intCast(t)) * 1_000_000_000 / trace_frequency);
+}
+fn traceAdd(trace: ?*Trace, comptime field: []const u8, started: u64) void {
+    if (trace) |t| @field(t, field) += traceClock(trace) -| started;
+}
+fn connectTraced(u: url_mod.Url, req: *const Request) Error!tlsc.Socket {
+    const started = traceClock(req.trace);
+    defer traceAdd(req.trace, "connect_ns", started);
+    const sock = socket_ext.connectDeadline(u.host, u.port, req.timeouts.connect_ms) catch |e| {
+        if (req.trace) |t| t.wsa_last_error = socket_ext.lastError();
+        return e;
+    };
+    if (req.trace) |t| t.connections_opened += 1;
+    return sock;
+}
+fn handshakeTraced(sock: *tlsc.Socket, u: url_mod.Url, req: *const Request, now: i64) Error!tlsc.Conn {
+    const started = traceClock(req.trace);
+    defer traceAdd(req.trace, "tls_ns", started);
+    return tlsc.handshake(sock.transport(), u.host, now) catch |e| return classifyTls(e, req.trace);
+}
+fn exchangeTraced(u: url_mod.Url, req: *const Request, tr: *transport.Transport, bufs: Buffers, keep_alive: bool) Error!Response {
+    {
+        const started = traceClock(req.trace);
+        defer traceAdd(req.trace, "send_ns", started);
+        try protocol.Http1.send(u, req, tr, bufs, keep_alive);
+    }
+    var resp = Response{};
+    {
+        const started = traceClock(req.trace);
+        defer traceAdd(req.trace, "read_ns", started);
+        try protocol.Http1.read(tr, bufs, req.method, &resp);
+    }
+    if (req.jar) |jar| resp.absorbCookies(jar);
+    return resp;
+}
+
 var g_entropy_seeded: bool = false;
 
 fn seedEntropyOnce() void {
@@ -62,14 +108,11 @@ fn classifyTls(e: tlsc.tls.Error, trace: ?*Trace) Error {
 
 /// Perform one request/response lifecycle against an already-parsed URL over a
 /// fresh connection. No redirect/retry logic here. Fills timing into `trace`.
-fn fetchOnce(u: url_mod.Url, req: *const Request, bufs: Buffers, now: i64, keep_alive: bool, trace: ?*Trace) Error!Response {
+fn fetchOnce(u: url_mod.Url, req: *const Request, bufs: Buffers, now: i64, keep_alive: bool) Error!Response {
     seedEntropyOnce();
 
     // 1. Connect with a deadline.
-    var sock = socket_ext.connectDeadline(u.host, u.port, req.timeouts.connect_ms) catch |e| {
-        if (trace) |t| t.wsa_last_error = socket_ext.lastError();
-        return e;
-    };
+    var sock = try connectTraced(u, req);
     errdefer sock.close();
 
     // 2. Apply socket-level recv/send timeouts.
@@ -81,9 +124,7 @@ fn fetchOnce(u: url_mod.Url, req: *const Request, bufs: Buffers, now: i64, keep_
     var plain: transport.PlainTransport = undefined;
     var tr: transport.Transport = undefined;
     if (u.scheme == .https) {
-        conn = tlsc.handshake(sock.transport(), u.host, now) catch |e| {
-            return classifyTls(e, trace);
-        };
+        conn = try handshakeTraced(&sock, u, req, now);
         tr = transport.connTransport(&conn);
     } else {
         plain = transport.PlainTransport.init(&sock);
@@ -91,12 +132,7 @@ fn fetchOnce(u: url_mod.Url, req: *const Request, bufs: Buffers, now: i64, keep_
     }
 
     // 4. Send + read over the HTTP/1.1 protocol.
-    try protocol.Http1.send(u, req, &tr, bufs, keep_alive);
-    var resp = Response{};
-    try protocol.Http1.read(&tr, bufs, req.method, &resp);
-
-    // 5. Absorb cookies into the jar if present.
-    if (req.jar) |jar| resp.absorbCookies(jar);
+    const resp = try exchangeTraced(u, req, &tr, bufs, keep_alive);
 
     // 6. One-shot: close the connection.
     tr.close();
@@ -117,6 +153,10 @@ fn copyUrl(raw: []const u8, out: []u8) Error!usize {
 /// Follows redirects up to req.max_redirects and retries transient failures
 /// per req.retry. `now` is Unix seconds for cert validity. Allocation-free.
 pub fn fetch(req: Request, bufs: Buffers, now: i64) Error!Response {
+    return fetchUsing(null, req, bufs, now);
+}
+
+fn fetchUsing(client: ?*Client, req: Request, bufs: Buffers, now: i64) Error!Response {
     if (req.trace) |t| t.* = .{};
 
     // Mutable current-request state across redirects.
@@ -134,7 +174,8 @@ pub fn fetch(req: Request, bufs: Buffers, now: i64) Error!Response {
         const u = url_mod.Url.parse(cur_raw, &host_buf) catch return Error.InvalidUrl;
         cur.url = cur_raw;
 
-        const result = fetchOnce(u, &cur, bufs, now, false, req.trace);
+        const reused_before = if (client) |c| c.matches(u) else false;
+        const result = if (client) |c| c.sendInner(cur, bufs, now, false) else fetchOnce(u, &cur, bufs, now, false);
 
         if (result) |resp| {
             // Success path: check for a redirect to follow.
@@ -174,7 +215,7 @@ pub fn fetch(req: Request, bufs: Buffers, now: i64) Error!Response {
             // Transport-level failure: retry if transient + method allows.
             if (retry.shouldRetryError(err) and retry.methodRetriable(cur.method, cur.retry_non_idempotent) and attempt < cur.retry.max) {
                 attempt += 1;
-                if (req.trace) |t| t.attempts = attempt;
+                if (req.trace) |t| { t.attempts = attempt; if (reused_before) t.stale_reconnects += 1; }
                 sleepBackoff(cur.retry, attempt, 0, null, cur.timeouts.total_ms);
                 continue;
             }
@@ -222,17 +263,12 @@ pub const Client = struct {
 
     fn openTo(self: *Client, u: url_mod.Url, req: *const Request, now: i64) Error!void {
         seedEntropyOnce();
-        self.sock = socket_ext.connectDeadline(u.host, u.port, req.timeouts.connect_ms) catch |e| {
-            if (req.trace) |t| t.wsa_last_error = socket_ext.lastError();
-            return e;
-        };
+        self.sock = try connectTraced(u, req);
         errdefer self.sock.close();
         socket_ext.setRecvTimeout(self.sock.fd, req.timeouts.recv_ms);
         socket_ext.setSendTimeout(self.sock.fd, req.timeouts.send_ms);
         if (u.scheme == .https) {
-            self.conn = tlsc.handshake(self.sock.transport(), u.host, now) catch |e| {
-                return classifyTls(e, req.trace);
-            };
+            self.conn = try handshakeTraced(&self.sock, u, req, now);
         } else {
             self.plain = transport.PlainTransport.init(&self.sock);
         }
@@ -250,21 +286,39 @@ pub const Client = struct {
         return self.plain.transport();
     }
 
-    /// Send a request, reusing the live connection when possible. On a stale
-    /// connection (server closed / EOF) it transparently reconnects once.
-    /// The URL host:port:scheme must be consistent across calls; a mismatch
-    /// transparently reconnects to the new target.
+    /// Follow redirects and retry policy identically to one-shot fetch, while
+    /// retaining fully consumed keep-alive connections. Client must stay pinned.
+    pub fn fetch(self: *Client, req: Request, bufs: Buffers, now: i64) Error!Response {
+        errdefer self.close();
+        return fetchUsing(self, req, bufs, now);
+    }
+
+    /// Single-hop send. A reused stale connection may reconnect once only
+    /// when retry policy permits the method. POST requires explicit opt-in.
+    /// Target changes open a fresh connection. Errors discard connection state.
     pub fn send(self: *Client, req: Request, bufs: Buffers, now: i64) Error!Response {
         if (req.trace) |t| t.* = .{};
+        return self.sendInner(req, bufs, now, true);
+    }
+
+    fn sendInner(self: *Client, req: Request, bufs: Buffers, now: i64, retry_stale: bool) Error!Response {
+        // Failed framing/IO must never leave a poisoned connection reusable.
+        errdefer self.close();
         var host_buf: [256]u8 = undefined;
         const u = url_mod.Url.parse(req.url, &host_buf) catch return Error.InvalidUrl;
 
         // Reconnect if we have no live conn or the target changed.
-        if (!self.matches(u)) {
+        const reused = self.matches(u);
+        if (reused) { if (req.trace) |t| t.reused_requests += 1; }
+        if (!reused) {
             self.close();
             try self.openTo(u, &req, now);
         }
 
+        if (reused) {
+            socket_ext.setRecvTimeout(self.sock.fd, req.timeouts.recv_ms);
+            socket_ext.setSendTimeout(self.sock.fd, req.timeouts.send_ms);
+        }
         // First attempt over the (possibly reused) connection.
         if (self.attempt(u, &req, bufs)) |resp| {
             self.afterResponse(&resp);
@@ -272,7 +326,9 @@ pub const Client = struct {
         } else |err| {
             // A reused connection may have been closed by the server between
             // requests; reconnect once and retry on a transient failure.
-            if (err == Error.PrematureClose or err == Error.RecvFailed or err == Error.SendFailed) {
+            if (retry_stale and reused and req.retry.max > 0 and retry.methodRetriable(req.method, req.retry_non_idempotent) and
+                (err == Error.PrematureClose or err == Error.RecvFailed or err == Error.SendFailed)) {
+                if (req.trace) |t| { t.stale_reconnects += 1; t.attempts = 1; }
                 self.close();
                 try self.openTo(u, &req, now);
                 const resp = try self.attempt(u, &req, bufs);
@@ -285,10 +341,7 @@ pub const Client = struct {
 
     fn attempt(self: *Client, u: url_mod.Url, req: *const Request, bufs: Buffers) Error!Response {
         var tr = self.transportFor(u);
-        try protocol.Http1.send(u, req, &tr, bufs, true); // keep-alive
-        var resp = Response{};
-        try protocol.Http1.read(&tr, bufs, req.method, &resp);
-        if (req.jar) |jar| resp.absorbCookies(jar);
+        const resp = try exchangeTraced(u, req, &tr, bufs, true);
         return resp;
     }
 

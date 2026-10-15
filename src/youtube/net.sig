@@ -19,6 +19,8 @@ const zhttp = @import("zpm_http");
 
 pub const CookieJar = zhttp.CookieJar;
 pub const CHROME_UA = zhttp.CHROME_UA;
+pub const Client = zhttp.Client;
+pub const Trace = zhttp.Trace;
 
 /// HTTP verb, matching the old http_session.Method surface.
 pub const Method = enum { get, post };
@@ -200,6 +202,12 @@ pub fn postInto(host: []const u8, port: u16, path: []const u8, extra_headers: []
 /// and must send the visitor session jar. `postInto` stays jar-less for its
 /// existing callers.
 pub fn postIntoJar(host: []const u8, port: u16, path: []const u8, extra_headers: []const u8, body: []const u8, user_agent: []const u8, jar: ?*CookieJar, out: []u8) IntoResult {
+    return postIntoJarUsing(host, port, path, extra_headers, body, user_agent, jar, out, null, null);
+}
+
+/// Optional pinned connection owner; null retains the one-shot lifecycle.
+/// Both paths share HTTP redirect/retry/framing policy. Slices remain borrowed.
+pub fn postIntoJarUsing(host: []const u8, port: u16, path: []const u8, extra_headers: []const u8, body: []const u8, user_agent: []const u8, jar: ?*CookieJar, out: []u8, client: ?*Client, trace: ?*Trace) IntoResult {
     const url = buildUrl(host, port, path) orelse return .{};
     const hdrs = normalizeHeaders(extra_headers) orelse return .{};
     const req = zhttp.Request{
@@ -209,13 +217,14 @@ pub fn postIntoJar(host: []const u8, port: u16, path: []const u8, extra_headers:
         .body = body,
         .user_agent = user_agent,
         .jar = jar,
+        .trace = trace,
     };
     const bufs = zhttp.Buffers{
         .body = out,
         .header_scratch = &header_scratch,
         .req_head = &req_head,
     };
-    const resp = zhttp.fetch(req, bufs, nowUnix()) catch return .{};
+    const resp = (if (client) |c| c.fetch(req, bufs, nowUnix()) else zhttp.fetch(req, bufs, nowUnix())) catch return .{};
     return .{ .status = resp.status, .len = resp.body.len, .ok = resp.status >= 200 and resp.status < 400 };
 }
 

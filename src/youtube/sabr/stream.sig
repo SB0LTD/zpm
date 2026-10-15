@@ -141,7 +141,8 @@ pub const StagedFileSink = struct {
 
 // ── Transport seam ──
 
-pub const PostResult = struct { status: u32 = 0, len: usize = 0, ok: bool = false };
+pub const PostResult = struct {
+    timings: profiling.HttpTimings = .{}, status: u32 = 0, len: usize = 0, ok: bool = false };
 
 /// Abstracts the SABR POST so the loop can be tested without a network. The
 /// production transport posts through net.postIntoJar.
@@ -347,7 +348,7 @@ pub fn runLoopWithOptions(
         while (true) {
             const http_started = profiling.clock(options.profile);
             r = transport.post(transport.ctx, host, port_cur, request_path[0..request_path_len], body_buf[0..body_len], &resp_buf);
-            if (options.profile) |p| p.recordHttp(profiling.clock(p) -| http_started, r.len, r.status);
+            if (options.profile) |p| { p.recordHttp(profiling.clock(p) -| http_started, r.len, r.status); p.recordTransport(r.timings); }
             result.requests += 1;
             result.last_status = r.status;
             const transient = r.status == 0 or r.status == 408 or r.status == 429 or r.status == 500 or r.status == 502 or r.status == 503 or r.status == 504;
@@ -726,16 +727,30 @@ pub fn parseUrl(url_str: []const u8, host: *[256]u8, host_len: *usize, path: *[9
 
 // ── Production transport (net.postIntoJar) ──
 
-/// Context the live transport carries: the session cookie jar + request headers.
+/// Owns an optional pinned connection plus the session jar and request headers.
 pub const NetTransport = struct {
+    // Pin this context after first POST. Closed by its operation owner on all
+    // success/failure/cancellation paths, never shared between attestations.
+    connection: http.Client = .{},
+    reuse_connection: bool = false,
+    profile: ?*profiling.Profile = null,
+
+
     jar: ?*http.CookieJar = null,
     user_agent: []const u8 = http.CHROME_UA,
     extra_headers: []const u8 = "Content-Type: application/x-protobuf\r\nOrigin: https://www.youtube.com\r\n",
 
+    pub fn close(self: *NetTransport) void { self.connection.close(); }
+
     fn postImpl(ctx: *anyopaque, host: []const u8, port: u16, path: []const u8, body: []const u8, out: []u8) PostResult {
         const self: *NetTransport = @ptrCast(@alignCast(ctx));
-        const r = http.postIntoJar(host, port, path, self.extra_headers, body, self.user_agent, self.jar, out);
-        return .{ .status = r.status, .len = r.len, .ok = r.ok };
+        var trace = http.Trace{};
+        const r = http.postIntoJarUsing(host, port, path, self.extra_headers, body, self.user_agent, self.jar, out,
+            if (self.reuse_connection) &self.connection else null, if (self.profile != null) &trace else null);
+        return .{ .status = r.status, .len = r.len, .ok = r.ok, .timings = .{
+            .connect_ns = trace.connect_ns, .tls_ns = trace.tls_ns, .send_ns = trace.send_ns, .read_ns = trace.read_ns,
+            .connections_opened = trace.connections_opened, .reused_requests = trace.reused_requests, .stale_reconnects = trace.stale_reconnects,
+        } };
     }
 
     pub fn transport(self: *NetTransport) Transport {

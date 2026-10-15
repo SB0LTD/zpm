@@ -5,7 +5,19 @@ extern "kernel32" fn QueryPerformanceCounter(*i64) c_int;
 extern "kernel32" fn QueryPerformanceFrequency(*i64) c_int;
 var frequency: u64 = 0;
 
+// Aggregate phase totals; send/read include TLS record IO/crypto. Connect
+// includes DNS resolution. Reuse counts attempts, not successful responses.
+pub const HttpTimings = struct {
+    connect_ns: u64 = 0,
+    tls_ns: u64 = 0,
+    send_ns: u64 = 0,
+    read_ns: u64 = 0,
+    connections_opened: u32 = 0,
+    reused_requests: u32 = 0,
+    stale_reconnects: u32 = 0,
+};
 pub const Sample = struct {
+    transport: HttpTimings = .{},
     http_ns: u64 = 0,
     response_bytes: u64 = 0,
     media_bytes: u64 = 0,
@@ -13,6 +25,7 @@ pub const Sample = struct {
     protection: i32 = 0, // per-response update; zero means no update
 };
 pub const Profile = struct {
+    transport: HttpTimings = .{},
     total_ns: u64 = 0,
     tokens_ns: u64 = 0,
     vm_ns: u64 = 0,
@@ -32,6 +45,15 @@ pub const Profile = struct {
     dropped_samples: u32 = 0,
     samples: [2048]Sample = undefined,
     started_ns: u64 = 0,
+
+    pub fn recordTransport(self: *Profile, detail: HttpTimings) void {
+        inline for (.{ "connect_ns", "tls_ns", "send_ns", "read_ns", "connections_opened", "reused_requests", "stale_reconnects" }) |field|
+            @field(self.transport, field) += @field(detail, field);
+        // Called after recordHttp; never overwrite the last retained sample
+        // when the fixed sample array has overflowed.
+        if (self.http_requests <= self.samples.len and self.sample_count > 0)
+            self.samples[self.sample_count - 1].transport = detail;
+    }
 
     pub fn recordHttp(self: *Profile, duration: u64, bytes: usize, status: u32) void {
         self.http_ns += duration;
@@ -62,7 +84,12 @@ pub fn add(profile: ?*Profile, comptime field: []const u8, started: u64) void {
 test "profile: bounded samples retain aggregate counts after overflow" {
     const testing = @import("std").testing;
     var p = Profile{};
-    for (0..p.samples.len + 3) |_| p.recordHttp(7, 11, 200);
+    for (0..p.samples.len + 3) |i| {
+        p.recordHttp(7, 11, 200);
+        p.recordTransport(.{ .connections_opened = 1, .tls_ns = @intCast(i) });
+    }
+    try testing.expectEqual(@as(u32, @intCast(p.samples.len + 3)), p.transport.connections_opened);
+    try testing.expectEqual(@as(u64, p.samples.len - 1), p.samples[p.samples.len - 1].transport.tls_ns);
     try testing.expectEqual(p.samples.len, p.sample_count);
     try testing.expectEqual(@as(u32, 3), p.dropped_samples);
     try testing.expectEqual(@as(u32, @intCast(p.samples.len + 3)), p.http_requests);

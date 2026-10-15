@@ -32,6 +32,14 @@ pub const TlsFailKind = enum(u8) { none, cert_invalid, protocol, transport };
 /// request; purely a diagnostic record, filled in as the request progresses.
 /// Allocation-free value type.
 pub const Trace = struct {
+    // Nanosecond phase totals across attempts/hops. Connect includes DNS.
+    connect_ns: u64 = 0,
+    tls_ns: u64 = 0,
+    send_ns: u64 = 0,
+    read_ns: u64 = 0,
+    connections_opened: u32 = 0,
+    reused_requests: u32 = 0,
+    stale_reconnects: u32 = 0,
     dns_ms: u32 = 0,
     connect_ms: u32 = 0,
     tls_ms: u32 = 0,

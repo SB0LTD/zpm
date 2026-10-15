@@ -712,7 +712,10 @@ fn executeChallenge(sess: *Session, chal: *challenge.Challenge, out: *IntegrityR
     profiling.add(profile, "vm_ns", vm_started);
     print("  [session] VM response="); printNum(bg_len);
     print(" ok="); print(if (ok) "1" else "0"); print("\n");
-    if (!ok or bg_len == 0) return false;
+    if (!ok or bg_len == 0) {
+        if (debug_integrity_capture) |capture| capture(sess, chal, "", "");
+        return false;
+    }
 
     const signal = jsvm.bg_webpo_signal;
     out.minter_ready = (signal.tag == .object or signal.tag == .array) and
@@ -722,12 +725,12 @@ fn executeChallenge(sess: *Session, chal: *challenge.Challenge, out: *IntegrityR
     // before the WAA fallback. Minter readiness and primary validity are distinct.
     const exchange_started = profiling.clock(profile);
     defer profiling.add(profile, "exchange_ns", exchange_started);
-    if (!generateITInSession(sess, bg_response_buf[0..bg_len], out)) {
-        print("  [session] GenerateIT returned no primary token\n");
-        return false;
-    }
-    if (debug_integrity_capture) |capture| capture(sess, chal, bg_response_buf[0..bg_len], out.integrity_token[0..out.integrity_token_len]);
-    return true;
+    const exchanged = generateITInSession(sess, bg_response_buf[0..bg_len], out);
+    // Capture failed exchanges too; otherwise the fallback hides the challenge
+    // that caused a fresh-session consistency failure. Empty token means failure.
+    if (debug_integrity_capture) |capture| capture(sess, chal, bg_response_buf[0..bg_len], if (exchanged) out.integrity_token[0..out.integrity_token_len] else "");
+    if (!exchanged) print("  [session] GenerateIT returned no primary token\n");
+    return exchanged;
 }
 
 fn appendS(buf: anytype, pos: usize, s: []const u8) usize {
