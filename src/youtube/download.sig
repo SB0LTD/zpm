@@ -31,18 +31,6 @@ const sabr_mod = @import("sabr/root.sig");
 const profiling = @import("download_profile.sig");
 pub const Profile = profiling.Profile;
 
-test "download profile resets stale samples before rejected external proof" {
-    const testing = @import("std").testing;
-    var profile = Profile{ .http_requests = 9, .sample_count = 1, .vm_ns = 42 };
-    const status = fetch("7Cbr_W7I2Vg", .{ .options = .{ .require_vm_token = true, .pot_override = "diagnostic", .profile = &profile } }, "unused.m4a");
-    try testing.expect(!status.success);
-    try testing.expectEqual(TokenSource.none, status.token_source);
-    try testing.expectEqual(@as(u32, 0), profile.http_requests);
-    try testing.expectEqual(@as(usize, 0), profile.sample_count);
-    try testing.expectEqual(@as(u64, 0), profile.vm_ns);
-    try testing.expect(profile.total_ns >= profile.tokens_ns);
-}
-
 // Video-bound web PO token for the current download (base64url). A cold-start
 // token is allowed only when the caller does not require the VM proof; the SABR
 // path uses the content-bound token.
@@ -54,6 +42,9 @@ var g_session: session_mod.Session = session_mod.Session.init();
 var g_challenge: challenge_mod.Challenge = challenge_mod.Challenge.init();
 var g_player_copy: [innertube.RESPONSE_BUF_SIZE]u8 = undefined;
 var g_web_client: session_mod.WebClient = .mweb;
+// Optional synchronous diagnostic observer. Slices are borrowed for this call;
+// the download API remains single-operation and callbacks must not reenter it.
+pub var debug_sabr_capture: ?*const fn ([]const u8, []const u8, []const u8, []const u8, []const u8) void = null;
 // When set, the audio path skips the iOS-first probe and resolves the stream
 // through the WEB/MWEB client (signatureCipher + nsig via player.js) using the
 // session's visitorData-bound GVS PO token. Used as a one-shot fallback after an
@@ -70,6 +61,9 @@ const MediaKind = enum { audio, video };
 pub const DownloadOptions = struct {
     // Caller-owned; reset for each top-level operation. Null disables profiling.
     profile: ?*Profile = null,
+    // Refresh a rejected native attestation once by default; 0 disables it.
+    // At most 3 refreshes per track are permitted. External proofs are never refreshed.
+    max_attestation_refreshes: u8 = 1,
     web_client: session_mod.WebClient = .mweb,
     require_vm_token: bool = false,
     progress: stream_mod.ProgressFn = null,
@@ -83,9 +77,9 @@ pub const DownloadOptions = struct {
 
 // ── Caller-controlled media request API ───────────────────────────────────
 //
-// The convenience entry points (audio/video/videoWithAudio) are thin wrappers
-// over `fetch(video_id, MediaRequest, path)`. A caller that needs a specific
-// form drives `fetch` directly: pick the track kind, codec, an exact itag, and
+// Audio entry points delegate to `fetch`; video helpers additionally coordinate
+// matching tracks from one session. For a specific representation, drive
+// `fetch` directly: pick the track kind, codec, an exact itag, and
 // the delivery mechanism. `probe` enumerates every available form first so a
 // caller can choose deterministically.
 
@@ -172,6 +166,7 @@ pub const DownloadStatus = struct {
     contains_audio: bool = false,
     token_source: TokenSource = .none,
     selected_itag: u16 = 0,
+    attestation_refreshes: u8 = 0,
     sabr_result: ?sabr_mod.stream.SabrResult = null,
     transform_failure: ?nsig_mod.Failure = null,
 };
@@ -195,13 +190,43 @@ pub fn audioWithOptions(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:
 
 /// Caller-controlled download. Resolves `req` against the video's player
 /// response and delivers the selected format to `output_path`, trying the
-/// delivery mechanisms per `req.delivery`. This is the primary internal API;
-/// the audio/video wrappers are expressed in terms of it.
+/// delivery mechanisms per `req.delivery`. Audio wrappers delegate here;
+/// videoWithAudio additionally coordinates a matching track when necessary.
 pub fn fetch(video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_path: [*:0]const u8) DownloadStatus {
     if (req.options.profile) |p| { p.* = .{}; p.started_ns = profiling.clock(p); }
     const started = profiling.clock(req.options.profile);
     defer profiling.add(req.options.profile, "total_ns", started);
-    return fetchImpl(video_id, req, output_path);
+    return fetchAttempts(fetchImpl, video_id, req, output_path);
+}
+
+fn fetchAttempts(comptime perform: anytype, video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_path: [*:0]const u8) DownloadStatus {
+    return fetchAttemptsFrom(perform, video_id, req, output_path, 0);
+}
+
+fn shouldRefresh(status: DownloadStatus, options: DownloadOptions, refreshes: u8) bool {
+    if (status.success or refreshes >= @min(options.max_attestation_refreshes, 3) or
+        status.token_source != .vm or options.pot_override.len > 0) return false;
+    const sabr = status.sabr_result orelse return false;
+    return sabr.failure == .protection;
+}
+
+fn announceRefresh(refreshes: u8) void {
+    print("  [download] SABR rejected the proof; establishing a fresh native session (refresh ");
+    printNum(refreshes); print(")\n");
+}
+
+fn fetchAttemptsFrom(comptime perform: anytype, video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_path: [*:0]const u8, initial_refreshes: u8) DownloadStatus {
+    var refreshes = initial_refreshes;
+    while (true) {
+        var status = perform(video_id, req, output_path);
+        status.attestation_refreshes = refreshes;
+        if (!shouldRefresh(status, req.options, refreshes)) return status;
+        refreshes += 1;
+        announceRefresh(refreshes);
+        // fetchImpl prepares a new session/challenge and reacquires formats.
+        // The previous staged sink has closed; never append its preview to
+        // a new representation or publish it as a complete destination.
+    }
 }
 
 fn fetchImpl(video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_path: [*:0]const u8) DownloadStatus {
@@ -499,6 +524,17 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
     const operation_started = profiling.clock(options.profile);
     defer profiling.add(options.profile, "total_ns", operation_started);
 
+    var refreshes: u8 = 0;
+    while (true) {
+        var status = downloadVideoOnce(video_id, output_path, options, audio_path, audio_status_out);
+        status.attestation_refreshes = refreshes;
+        if (!shouldRefresh(status, options, refreshes)) return status;
+        refreshes += 1;
+        announceRefresh(refreshes);
+    }
+}
+
+fn downloadVideoOnce(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const u8, options: DownloadOptions, audio_path: ?[*:0]const u8, audio_status_out: ?*DownloadStatus) DownloadStatus {
     // Video path: acquire one player response, select the best video (muxed when
     // available), deliver it, and — for videoWithAudio — pull a matching adaptive
     // audio track from the same response/session when the video has no audio.
@@ -546,19 +582,28 @@ fn downloadMedia(video_id: *const [meta.VIDEO_ID_LEN]u8, output_path: [*:0]const
 
     // videoWithAudio: fetch a matching adaptive audio track when the delivered
     // video carries no audio.
-    if (kind == .video and !status.contains_audio and audio_path != null and audio_status_out != null)
-        downloadMatchingAudio(resp, &formats, n_formats, audio_path.?, options, status.duration_sec, audio_status_out.?);
+    if (!status.contains_audio and audio_path != null and audio_status_out != null)
+        downloadMatchingAudio(video_id, resp, &formats, n_formats, audio_path.?, options, status.duration_sec, audio_status_out.?);
 
     return status;
 }
 
-fn downloadMatchingAudio(resp: []const u8, formats: []const manifest_mod.StreamFormat, n_formats: usize, path: [*:0]const u8, options: DownloadOptions, duration_sec: u32, out: *DownloadStatus) void {
+fn downloadMatchingAudio(video_id: *const [meta.VIDEO_ID_LEN]u8, resp: []const u8, formats: []const manifest_mod.StreamFormat, n_formats: usize, path: [*:0]const u8, options: DownloadOptions, duration_sec: u32, out: *DownloadStatus) void {
     const direct = manifest_mod.selectBestAudio(formats, n_formats, .aac) orelse manifest_mod.selectBestAudio(formats, n_formats, .any);
     const audio_fmt = direct orelse (if (sabr_mod.player_fields.serverAbrStreamingUrl(resp) != null) manifest_mod.selectBestSabr(formats, n_formats, true) else null) orelse return;
     print("  [download] Downloading matching adaptive audio from the same player/session...\n");
     out.* = .{ .success = false, .bytes_downloaded = 0, .container = .unknown, .codec = .unknown, .bitrate = audio_fmt.bitrate, .duration_sec = duration_sec, .contains_audio = true, .token_source = g_token_source };
     if (audio_fmt.url_len == 0) {
         _ = trySabr(resp, audio_fmt, .audio, path, options, out);
+        if (shouldRefresh(out.*, options, 0)) {
+            announceRefresh(1);
+            // Preserve the completed video and the outer operation's profile.
+            // Re-resolve only this audio representation in a fresh session.
+            out.* = fetchAttemptsFrom(fetchImpl, video_id, .{
+                .track = .audio, .itag = audio_fmt.itag, .delivery = .sabr,
+                .allow_muxed_fallback = false, .options = options,
+            }, path, 1);
+        }
         return;
     }
     var a_url: [9216]u8 = undefined;
@@ -759,6 +804,7 @@ fn trySabr(
         g_session.mweb_client_version[0..g_session.mweb_client_version_len]
     else g_session.clientVersion();
     if (client_version.len == 0) return false;
+    if (debug_sabr_capture) |capture| capture(sabr_url, resp, g_pot_buf[0..g_pot_len], pot_bytes, client_version);
     const selected = sabr_mod.request.SelectedFormat{
         .itag = @intCast(fmt.itag),
         .last_modified = fmt.last_modified,
@@ -973,4 +1019,62 @@ fn findStr(haystack: []const u8, needle: []const u8) ?usize {
         if (ok) return i;
     }
     return null;
+}
+
+test "download profile resets stale samples before rejected external proof" {
+    const testing = @import("std").testing;
+    var profile = Profile{ .http_requests = 9, .sample_count = 1, .vm_ns = 42 };
+    const status = fetch("7Cbr_W7I2Vg", .{ .options = .{ .require_vm_token = true, .pot_override = "diagnostic", .profile = &profile } }, "unused.m4a");
+    try testing.expect(!status.success);
+    try testing.expectEqual(TokenSource.none, status.token_source);
+    try testing.expectEqual(@as(u32, 0), profile.http_requests);
+    try testing.expectEqual(@as(usize, 0), profile.sample_count);
+    try testing.expectEqual(@as(u64, 0), profile.vm_ns);
+    try testing.expect(profile.total_ns >= profile.tokens_ns);
+}
+
+test "download attestation refresh is bounded and only applies to native protection failures" {
+    const testing = @import("std").testing;
+    const Fake = struct {
+        var calls: u8 = 0;
+        var succeeds_after: u8 = 2;
+        var failure: sabr_mod.stream.Failure = .protection;
+        var source: TokenSource = .vm;
+        fn run(_: *const [meta.VIDEO_ID_LEN]u8, _: MediaRequest, _: [*:0]const u8) DownloadStatus {
+            calls += 1;
+            return .{ .success = calls >= succeeds_after, .bytes_downloaded = 3, .container = .mp4, .codec = .aac, .bitrate = 1, .duration_sec = 1,
+                .token_source = source, .sabr_result = .{ .failure = if (calls >= succeeds_after) .none else failure } };
+        }
+    };
+    const recovered = fetchAttempts(Fake.run, "7Cbr_W7I2Vg", .{}, "unused.m4a");
+    try testing.expect(recovered.success);
+    try testing.expectEqual(@as(u8, 2), Fake.calls);
+    try testing.expectEqual(@as(u8, 1), recovered.attestation_refreshes);
+    Fake.succeeds_after = 255;
+    inline for (.{sabr_mod.stream.Failure.cancelled, .transport, .http_status, .media_write}) |failure| {
+        Fake.calls = 0; Fake.failure = failure;
+        _ = fetchAttempts(Fake.run, "7Cbr_W7I2Vg", .{}, "unused.m4a");
+        try testing.expectEqual(@as(u8, 1), Fake.calls);
+    }
+    Fake.failure = .protection;
+    Fake.source = .external; Fake.calls = 0;
+    _ = fetchAttempts(Fake.run, "7Cbr_W7I2Vg", .{}, "unused.m4a");
+    try testing.expectEqual(@as(u8, 1), Fake.calls);
+    Fake.source = .vm; Fake.calls = 0;
+    _ = fetchAttempts(Fake.run, "7Cbr_W7I2Vg", .{ .options = .{ .max_attestation_refreshes = 0 } }, "unused.m4a");
+    try testing.expectEqual(@as(u8, 1), Fake.calls);
+    Fake.calls = 0;
+    _ = fetchAttempts(Fake.run, "7Cbr_W7I2Vg", .{ .options = .{ .pot_override = "diagnostic" } }, "unused.m4a");
+    try testing.expectEqual(@as(u8, 1), Fake.calls);
+    Fake.calls = 0;
+    const exhausted = fetchAttempts(Fake.run, "7Cbr_W7I2Vg", .{ .options = .{ .max_attestation_refreshes = 255 } }, "unused.m4a");
+    try testing.expect(!exhausted.success);
+    try testing.expectEqual(@as(u8, 4), Fake.calls);
+    try testing.expectEqual(@as(u8, 3), exhausted.attestation_refreshes);
+    try testing.expectEqual(sabr_mod.stream.Failure.protection, exhausted.sabr_result.?.failure);
+    Fake.calls = 0;
+    const audio_exhausted = fetchAttemptsFrom(Fake.run, "7Cbr_W7I2Vg", .{}, "unused.m4a", 1);
+    try testing.expectEqual(@as(u8, 1), Fake.calls);
+    try testing.expectEqual(@as(u8, 1), audio_exhausted.attestation_refreshes);
+
 }

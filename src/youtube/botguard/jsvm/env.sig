@@ -289,8 +289,8 @@ fn installDocument(global: u32) void {
 
     // document-level DOM APIs BotGuard may call.
     setNativeMethod(doc, "createElementNS", builtins.N_DOM_CREATE_ELEMENT);
-    setNativeMethod(doc, "createTextNode", builtins.N_DOM_CREATE_ELEMENT);
-    setNativeMethod(doc, "createComment", builtins.N_DOM_CREATE_ELEMENT);
+    setNativeMethod(doc, "createTextNode", builtins.N_DOM_CREATE_TEXT);
+    setNativeMethod(doc, "createComment", builtins.N_DOM_CREATE_COMMENT);
     setNativeMethod(doc, "createDocumentFragment", builtins.N_DOM_CREATE_ELEMENT);
     // document.createEvent(type) -> a generic event-like object. BotGuard's live
     // interpreter probes `document.createEvent('...')` then reads/inits it; a
@@ -517,7 +517,7 @@ fn makeNodeApi(el: u32) void {
     setNativeMethod(el, "replaceChild", builtins.N_DOM_REPLACE_CHILD);
     setNativeMethod(el, "lookupNamespaceURI", builtins.N_DOM_LOOKUP_NAMESPACE);
     objects.setProperty(el, values.internString("namespaceURI"), Value.string(values.internString("http://www.w3.org/1999/xhtml")));
-    setNativeMethod(el, "insertBefore", builtins.N_DOM_NOOP);
+    setNativeMethod(el, "insertBefore", builtins.N_DOM_INSERT_BEFORE);
     setNativeMethod(el, "setAttribute", builtins.N_DOM_NOOP);
     setNativeMethod(el, "getAttribute", builtins.N_DOM_NOOP);
     setNativeMethod(el, "removeAttribute", builtins.N_DOM_NOOP);

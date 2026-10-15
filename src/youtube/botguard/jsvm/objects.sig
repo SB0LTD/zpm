@@ -98,8 +98,10 @@ pub const Object = struct {
     dom_window: bool = false,
     dom_iframe_window: u32 = NULL_OBJ,
     dom_node: bool = false,
+    dom_node_kind: u8 = 0,
     dom_parent: u32 = NULL_OBJ,
     dom_children: u32 = NULL_OBJ,
+    dom_element_children: u32 = NULL_OBJ,
     // Debug: tags environment objects (navigator/document/window/screen/
     // location/canvas/webgl contexts) so the VM can record which properties
     // BotGuard probes on them that our env doesn't implement (fingerprint leaks).
@@ -1740,6 +1742,16 @@ pub fn dbgG3wFunc(i: usize) u16 { return dbg_g3w_func[i]; }
 pub fn dbgG3wIp(i: usize) u32 { return dbg_g3w_ip[i]; }
 pub fn dbgG3wStr(i: usize) []const u8 { return dbg_g3w_str[i][0..dbg_g3w_slen[i]]; }
 pub fn dbgG3wStrIdx(i: usize) u32 { return dbg_g3w_stridx[i]; }
+
+/// Reserve caller-requested array storage without changing length or contents.
+pub fn arrayReserve(obj_idx: u32, capacity: u32) bool {
+    if (obj_idx >= n_objects or objects[obj_idx].obj_type != .array) return false;
+    const current = objects[obj_idx].array_cap;
+    if (capacity <= current) return true;
+    // Match normal array growth: repeated DOM appends must not copy/reserve
+    // every intermediate size in the fixed pool. Fall back near its limit.
+    return relocateArray(obj_idx, @max(capacity, @max(current * 2, 4))) or relocateArray(obj_idx, capacity);
+}
 
 /// Move an array's element storage to the end of the pool, reserving `new_cap`
 /// slots. Copies existing [0,array_len) elements, zero-inits the remainder.

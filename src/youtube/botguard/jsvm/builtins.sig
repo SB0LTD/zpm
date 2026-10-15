@@ -258,6 +258,9 @@ pub const N_DOM_REMOVE: u16 = NATIVE_BASE + 271;
 pub const N_DOM_FRAME_LOAD: u16 = NATIVE_BASE + 272;
 pub const N_DOM_EMPTY_OBJECT: u16 = NATIVE_BASE + 273;
 pub const N_NAV_WEBDRIVER: u16 = NATIVE_BASE + 274;
+pub const N_DOM_INSERT_BEFORE: u16 = NATIVE_BASE + 275;
+pub const N_DOM_CREATE_TEXT: u16 = NATIVE_BASE + 276;
+pub const N_DOM_CREATE_COMMENT: u16 = NATIVE_BASE + 277;
 pub var dbg_iframe_reads: u32 = 0;
 var regexp_proto: u32 = objects.NULL_OBJ;
 
@@ -962,6 +965,8 @@ pub fn callNative(func_id: u16, args: []const Value, argc: u8) Value {
         N_TYPEERROR_CTOR => makeErrorVal("TypeError", args),
         N_ERROR_TOSTRING => errorToString(args),
         N_DOM_CREATE_ELEMENT => makeDomElement(args),
+        N_DOM_CREATE_TEXT => makeDomCharacter(args, 3),
+        N_DOM_CREATE_COMMENT => makeDomCharacter(args, 8),
         N_DOM_NOOP => Value.UNDEFINED,
         N_DOM_EMPTY_OBJECT => Value.object(objects.createObject()),
         N_EVENT_ADD => eventListen(args, false),
@@ -971,7 +976,8 @@ pub fn callNative(func_id: u16, args: []const Value, argc: u8) Value {
         N_EVENT_CTOR => makeEvent(args),
         N_EVENT_PREVENT => eventPrevent(args),
         N_EVENT_STOP_IMMEDIATE => eventStopImmediate(args),
-        N_DOM_REPLACE_CHILD => if (args.len >= 3) args[2] else Value.UNDEFINED,
+        N_DOM_REPLACE_CHILD => domInsert(args, true),
+        N_DOM_INSERT_BEFORE => domInsert(args, false),
         N_DOM_APPEND => domAppend(args),
         N_DOM_REMOVE => domRemove(args),
         N_DOM_FRAME_LOAD => domFrameLoad(args),
@@ -1669,6 +1675,7 @@ fn makeDomElement(args: []const Value) Value {
     installNativeMethod(el, "appendChild", N_DOM_APPEND);
     installNativeMethod(el, "removeChild", N_DOM_REMOVE);
     installNativeMethod(el, "replaceChild", N_DOM_REPLACE_CHILD);
+    installNativeMethod(el, "insertBefore", N_DOM_INSERT_BEFORE);
     installNativeMethod(el, "lookupNamespaceURI", N_DOM_LOOKUP_NAMESPACE);
     objects.setProperty(el, values.internString("namespaceURI"), Value.string(values.internString("http://www.w3.org/1999/xhtml")));
     if (args.len > 0 and args[args.len - 1].tag == .string and eql(values.getString(args[args.len - 1].data.str_idx), "img"))
@@ -1774,21 +1781,82 @@ fn documentHasFocus(args: []const Value) Value {
     return Value.FALSE;
 }
 
+fn makeDomCharacter(args: []const Value, kind: u8) Value {
+    const data = stringCtor(if (args.len > 0) args[args.len-1..] else &.{Value.UNDEFINED});
+    if (callbackAborted()) return Value.UNDEFINED;
+    const node = objects.createObject();
+    registerDomNode(node, kind);
+    objects.setProperty(node, values.internString("data"), data);
+    objects.setProperty(node, values.internString("nodeValue"), data);
+    objects.setProperty(node, values.internString("textContent"), data);
+    objects.setProperty(node, values.internString("nodeName"), Value.string(values.internString(if (kind == 3) "#text" else "#comment")));
+    return Value.object(node);
+}
+
 pub fn registerDomNode(node: u32, kind: u8) void {
     const object = objects.getObject(node);
     object.dom_node = true;
+    object.dom_node_kind = kind;
     object.dom_children = objects.createArray(0);
     objects.setProperty(node, values.internString("nodeType"), Value.number(@floatFromInt(kind)));
+    objects.setWritable(node, values.internString("nodeType"), false);
     objects.setProperty(node, values.internString("parentNode"), Value.NULL);
     objects.setProperty(node, values.internString("childNodes"), Value.object(object.dom_children));
     objects.setProperty(node, values.internString("firstChild"), Value.NULL);
     objects.setProperty(node, values.internString("lastChild"), Value.NULL);
+    if (kind == 1 or kind == 9 or kind == 11) {
+        // A live element-only collection, distinct from childNodes and from
+        // JavaScript Array. Reuse its identity when nodes move or disappear.
+        const collection = objects.createObject();
+        object.dom_element_children = collection;
+        objects.setProperty(collection, values.internString("length"), Value.number(0));
+        objects.setEnumerable(collection, values.internString("length"), false);
+        objects.setWritable(collection, values.internString("length"), false);
+        objects.setProperty(node, values.internString("children"), Value.object(collection));
+        objects.setWritable(node, values.internString("children"), false);
+        objects.setProperty(node, values.internString("childElementCount"), Value.number(0));
+        objects.setProperty(node, values.internString("firstElementChild"), Value.NULL);
+        objects.setProperty(node, values.internString("lastElementChild"), Value.NULL);
+    }
 }
 fn syncDomChildren(parent: u32) void {
     const array = objects.getObject(parent).dom_children;
     const len = objects.arrayLength(array);
     objects.setProperty(parent, values.internString("firstChild"), if (len == 0) Value.NULL else objects.getArrayElement(array, 0));
     objects.setProperty(parent, values.internString("lastChild"), if (len == 0) Value.NULL else objects.getArrayElement(array, len-1));
+    const collection = objects.getObject(parent).dom_element_children;
+    if (collection == objects.NULL_OBJ) return;
+    const length_key = values.internString("length");
+    const old_length: u32 = @intFromFloat(objects.getProperty(collection, length_key).toNumber());
+    var count: u32 = 0;
+    var first = Value.NULL;
+    var last = Value.NULL;
+    for (0..len) |i| {
+        const child = objects.getArrayElement(array, @intCast(i));
+        if (child.tag != .object or objects.getObject(child.data.obj_idx).dom_node_kind != 1) continue;
+        var key_buf: [40]u8 = undefined;
+        const key_len = values.numberToString(@floatFromInt(count), &key_buf);
+        const key = values.internString(key_buf[0..key_len]);
+        objects.setWritable(collection, key, true);
+        objects.setProperty(collection, key, child);
+        objects.setWritable(collection, key, false);
+        if (count == 0) first = child;
+        last = child;
+        count += 1;
+    }
+    var i = count;
+    while (i < old_length) : (i += 1) {
+        var key_buf: [40]u8 = undefined;
+        const key_len = values.numberToString(@floatFromInt(i), &key_buf);
+        objects.deleteProperty(collection, values.internString(key_buf[0..key_len]));
+    }
+    objects.setWritable(collection, length_key, true);
+    objects.setProperty(collection, length_key, Value.number(@floatFromInt(count)));
+    objects.setWritable(collection, length_key, false);
+    objects.setProperty(parent, values.internString("childElementCount"), Value.number(@floatFromInt(count)));
+    objects.setProperty(parent, values.internString("firstElementChild"), first);
+    objects.setProperty(parent, values.internString("lastElementChild"), last);
+
 }
 fn detachDomChild(parent: u32, child: u32) bool {
     const array = objects.getObject(parent).dom_children;
@@ -1820,6 +1888,8 @@ fn domAppend(args: []const Value) Value {
         ancestor = objects.getObject(ancestor).dom_parent;
     }
     const previous = objects.getObject(child).dom_parent;
+    const array = objects.getObject(parent).dom_children;
+    if (!objects.arrayReserve(array, objects.arrayLength(array) + @as(u32, if (previous == parent) 0 else 1))) { requestRangeError("DOM child storage exceeded"); return Value.UNDEFINED; }
     if (previous != objects.NULL_OBJ) _ = detachDomChild(previous, child);
     objects.arrayPush(objects.getObject(parent).dom_children, args[1]);
     objects.getObject(child).dom_parent = parent;
@@ -1830,6 +1900,55 @@ fn domAppend(args: []const Value) Value {
         _ = enqueueTask(&.{ Value.function(load), Value.number(0), args[1] }, false, false);
     }
     return args[1];
+}
+// Shared ordered insertion for insertBefore and replaceChild. Validate before
+// detaching either node; resolve the reference again after same-parent moves.
+fn domInsert(args: []const Value, replace: bool) Value {
+    if (!validDomPair(args)) return Value.UNDEFINED;
+    if (args.len < 3) { requestNativeThrow("DOM insertion requires a reference node"); return Value.UNDEFINED; }
+    if (!replace and args[2].tag == .null_val) return domAppend(args[0..2]);
+    const parent = args[0].data.obj_idx;
+    const child = args[1].data.obj_idx;
+    if (args[2].tag != .object or !objects.getObject(args[2].data.obj_idx).dom_node) {
+        requestNativeThrow("DOM insertion requires a Node reference"); return Value.UNDEFINED;
+    }
+    const reference = args[2].data.obj_idx;
+    if (objects.getObject(reference).dom_parent != parent) {
+        requestNativeThrow("Node is not a child of this parent"); native_throw_name = "NotFoundError"; return Value.UNDEFINED;
+    }
+    if (child == reference) return args[1];
+    var ancestor = parent;
+    while (ancestor != objects.NULL_OBJ) {
+        if (ancestor == child) { requestNativeThrow("Node cannot contain itself"); native_throw_name = "HierarchyRequestError"; return Value.UNDEFINED; }
+        ancestor = objects.getObject(ancestor).dom_parent;
+    }
+    const array = objects.getObject(parent).dom_children;
+    const previous = objects.getObject(child).dom_parent;
+    const needed = objects.arrayLength(array) + @as(u32, if (!replace and previous != parent) 1 else 0);
+    if (!objects.arrayReserve(array, needed)) { requestRangeError("DOM child storage exceeded"); return Value.UNDEFINED; }
+    if (previous != objects.NULL_OBJ) _ = detachDomChild(previous, child);
+    const len = objects.arrayLength(array);
+    var at: u32 = 0;
+    while (at < len) : (at += 1) {
+        const value = objects.getArrayElement(array, at);
+        if (value.tag == .object and value.data.obj_idx == reference) break;
+    }
+    if (replace) {
+        objects.getObject(reference).dom_parent = objects.NULL_OBJ;
+        objects.setProperty(reference, values.internString("parentNode"), Value.NULL);
+    } else {
+        var i = len;
+        while (i > at) : (i -= 1) objects.setArrayElement(array, i, objects.getArrayElement(array, i-1));
+    }
+    objects.setArrayElement(array, at, args[1]);
+    objects.getObject(child).dom_parent = parent;
+    objects.setProperty(child, values.internString("parentNode"), args[0]);
+    syncDomChildren(parent);
+    if (objects.getObject(child).dom_iframe and domConnected(child)) {
+        const load = objects.createFunction(N_DOM_FRAME_LOAD);
+        _ = enqueueTask(&.{ Value.function(load), Value.number(0), args[1] }, false, false);
+    }
+    return if (replace) args[2] else args[1];
 }
 fn domConnected(node: u32) bool {
     var current = node;

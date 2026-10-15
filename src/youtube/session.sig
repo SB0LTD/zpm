@@ -392,6 +392,13 @@ const jsvm = @import("botguard/jsvm/root.sig");
 const WEB_API_KEY: []const u8 = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 const YT_REQUEST_KEY: []const u8 = "O43z0dpjhgX20SCx4KAo";
 const WAA_API_KEY: []const u8 = "AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw";
+// GenerateIT is a native RPC, independent of the browser client used for
+// homepage/player acquisition. Do not claim Chrome or send its client hints
+// for the Sig HTTP/TLS implementation.
+const INTEGRITY_USER_AGENT = "SB0-Sig-YouTube/1.0";
+// Optional synchronous diagnostic observer; slices are borrowed for the call.
+// Callbacks must not reenter the session/VM API.
+pub var debug_integrity_capture: ?*const fn (*const Session, *const challenge.Challenge, []const u8, []const u8) void = null;
 
 // Result of establishing a session-bound integrity token.
 pub const IntegrityResult = struct {
@@ -537,11 +544,10 @@ pub fn generateITInSession(sess: *Session, bg_response: []const u8, out: *Integr
     var hp: usize = 0;
     hp = appendS(&hdr_buf, hp, "Content-Type: application/json+protobuf\r\nX-Goog-Api-Key: ");
     hp = appendS(&hdr_buf, hp, WAA_API_KEY);
-    hp = appendS(&hdr_buf, hp, "\r\nOrigin: https://www.youtube.com\r\nReferer: https://www.youtube.com/\r\n");
-    hp = appendS(&hdr_buf, hp, "sec-ch-ua: \"Google Chrome\";v=\"131\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"131\"\r\nsec-ch-ua-mobile: ?0\r\nsec-ch-ua-platform: \"Windows\"\r\n");
+    hp = appendS(&hdr_buf, hp, "\r\nx-user-agent: grpc-web-javascript/0.1\r\nOrigin: https://www.youtube.com\r\nReferer: https://www.youtube.com/\r\n");
     hp = appendS(&hdr_buf, hp, visitorHeader(sess));
 
-    const resp = http.post("www.youtube.com", "/api/jnn/v1/GenerateIT", hdr_buf[0..hp], git_body_buf[0..blen], &sess.jar);
+    const resp = http.request(.post, "www.youtube.com", 443, "/api/jnn/v1/GenerateIT", hdr_buf[0..hp], git_body_buf[0..blen], &sess.jar, INTEGRITY_USER_AGENT);
     print("  [session] GenerateIT(yt) status="); printNum(resp.status);
     print(" bytes="); printNum(resp.body.len); print("\n");
     if (resp.body.len > 0) {
@@ -557,7 +563,7 @@ pub fn generateITInSession(sess: *Session, bg_response: []const u8, out: *Integr
     var wp: usize = 0;
     wp = appendS(&waa_hdr_buf, wp, waa_hdr);
     wp = appendS(&waa_hdr_buf, wp, visitorHeader(sess));
-    const resp_a = http.post("jnn-pa.googleapis.com", "/$rpc/google.internal.waa.v1.Waa/GenerateIT", waa_hdr_buf[0..wp], git_body_buf[0..blen], &sess.jar);
+    const resp_a = http.request(.post, "jnn-pa.googleapis.com", 443, "/$rpc/google.internal.waa.v1.Waa/GenerateIT", waa_hdr_buf[0..wp], git_body_buf[0..blen], &sess.jar, INTEGRITY_USER_AGENT);
     print("  [session] GenerateIT(waa) status="); printNum(resp_a.status);
     print(" bytes="); printNum(resp_a.body.len); print("\n");
     return resp_a.ok and storeGenerateIT(resp_a.body, out);
@@ -720,6 +726,7 @@ fn executeChallenge(sess: *Session, chal: *challenge.Challenge, out: *IntegrityR
         print("  [session] GenerateIT returned no primary token\n");
         return false;
     }
+    if (debug_integrity_capture) |capture| capture(sess, chal, bg_response_buf[0..bg_len], out.integrity_token[0..out.integrity_token_len]);
     return true;
 }
 
