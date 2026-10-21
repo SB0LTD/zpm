@@ -21,6 +21,17 @@ pub const OfficialPackage = struct {
 };
 
 pub const packages = [_]OfficialPackage{
+    .{
+        .scope = "zpm",
+        .name = "sql",
+        .version = "0.1.0",
+        .layer = 0,
+        .platform = .any,
+        .system_libraries = &.{},
+        .zpm_dependencies = &.{},
+        .description = "Bounded allocator-free in-memory SQL with caller-owned storage",
+        .source = "src/core/sql.sig",
+    },
     // ── Layer 0: Core ──
     .{
         .scope = "zpm",
@@ -470,7 +481,7 @@ fn eql(a: []const u8, b: []const u8) bool {
 const testing = @import("std").testing;
 
 test "official_packages: expected package count" {
-    try testing.expectEqual(@as(usize, 36), package_count);
+    try testing.expectEqual(@as(usize, 37), package_count);
 }
 
 test "official_packages: layer 0 packages have no platform dependencies" {
@@ -483,7 +494,7 @@ test "official_packages: layer 0 packages have no platform dependencies" {
 }
 
 test "official_packages: layer 0 includes portable AI foundations" {
-    try testing.expectEqual(@as(usize, 6), layer_0_count);
+    try testing.expectEqual(@as(usize, 7), layer_0_count);
     try testing.expect(findByName("ai-core") != null);
 }
 

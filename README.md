@@ -204,6 +204,7 @@ zpm module library. They are organized by the four-layer hierarchy above.
 | Package | Description |
 |---------|-------------|
 | `@zpm/core` | Core data types, storage, and logic |
+| `@zpm/sql` | Allocator-free in-memory SQL with bounded caller-owned storage; see [SQL contracts](docs/sql.md) |
 | `@zpm/math` | Sin/cos approximations, lerp, interpolation, pure math |
 | `@zpm/json` | Minimal JSON parser |
 | `@zpm/ai-core` | Caller-owned arenas, tensor bounds, deadline scheduling, device interfaces, and copy-on-write pages |
