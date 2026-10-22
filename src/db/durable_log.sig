@@ -63,9 +63,20 @@ pub fn appendKind(file: anytype, sequence: u64, payload: []const u8, kind: u16) 
     put(u32, trailer[0..4], checksum(payload));
     @memcpy(trailer[4..8], commit_magic);
     put(u64, trailer[8..16], sequence);
-    try file.appendAll(&header);
-    try file.appendAll(payload);
-    try file.appendAll(&trailer);
+    // Ordinary SQL records fit one small, bounded staging buffer. Coalescing
+    // their framing avoids three native write calls per synchronous commit.
+    // Large transactions retain the streaming path and constant stack bound.
+    var small_record: [4096]u8 = undefined;
+    if (payload.len <= small_record.len - overhead) {
+        @memcpy(small_record[0..header_size], &header);
+        @memcpy(small_record[header_size..][0..payload.len], payload);
+        @memcpy(small_record[header_size + payload.len ..][0..trailer_size], &trailer);
+        try file.appendAll(small_record[0 .. payload.len + overhead]);
+    } else {
+        try file.appendAll(&header);
+        try file.appendAll(payload);
+        try file.appendAll(&trailer);
+    }
     try file.sync();
 }
 
