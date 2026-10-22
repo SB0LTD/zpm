@@ -1,11 +1,17 @@
 //! OS cryptographic entropy into caller-owned buffers (Layer 1).
 //! Windows uses the system-preferred BCrypt RNG. Linux uses getrandom without
-//! GRND_RANDOM/GRND_NONBLOCK, waiting for initialized kernel entropy. There is
-//! no deterministic seed, clock fallback, userspace PRNG or heap allocation.
+//! GRND_RANDOM/GRND_NONBLOCK, waiting for initialized kernel entropy.
+//! macOS uses libSystem getentropy in at-most-256-byte calls. There is no
+//! deterministic seed, clock fallback, userspace PRNG or heap allocation.
 const std = @import("std");
 const builtin = @import("builtin");
 const Win = struct {
     extern "bcrypt" fn BCryptGenRandom(?*anyopaque, [*]u8, u32, u32) callconv(.c) i32;
+};
+const Darwin = struct {
+    // libSystem getentropy(2), introduced in macOS 10.12. Sig's std.c does
+    // not currently re-export this symbol for Darwin.
+    extern "c" fn getentropy([*]u8, usize) c_int;
 };
 pub const Error = error{ UnsupportedPlatform, EntropyUnavailable };
 
@@ -34,6 +40,13 @@ pub fn fill(output: []u8) Error!void {
                 .INTR => continue,
                 else => return error.EntropyUnavailable,
             }
+        } else if (builtin.os.tag == .macos) {
+            const count = @min(output.len - done, 256);
+            if (Darwin.getentropy(output[done..].ptr, count) != 0) {
+                if (std.c.errno(@as(c_int, -1)) == .INTR) continue;
+                return error.EntropyUnavailable;
+            }
+            done += count;
         } else return error.UnsupportedPlatform;
     }
 }

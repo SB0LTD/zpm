@@ -21,15 +21,17 @@ pub const OfficialPackage = struct {
 };
 
 pub const packages = [_]OfficialPackage{
+    .{ .scope = "zpm", .name = "db-stream", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Caller-owned protocol sessions over fragmented byte streams", .source = "src/db/stream_server.sig" },
+    .{ .scope = "zpm", .name = "sb0-stream", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Native consolidated SB0 delegated-channel and kernel UART I/O", .source = "src/platform/sb0_stream.sig" },
     .{ .scope = "zpm", .name = "durable-log", .version = "0.1.0", .layer = 0, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Checksummed committed write-ahead records and bounded recovery", .source = "src/db/durable_log.sig" },
     .{ .scope = "zpm", .name = "scram", .version = "0.1.0", .layer = 0, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Allocator-free SCRAM-SHA-256 server authentication", .source = "src/db/scram.sig" },
-    .{ .scope = "zpm", .name = "db-file", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Single-writer Windows/Linux durable files and atomic snapshot replacement", .source = "src/platform/db_file.sig" },
-    .{ .scope = "zpm", .name = "entropy", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Caller-buffer native cryptographic entropy on Windows and Linux", .source = "src/platform/entropy.sig" },
+    .{ .scope = "zpm", .name = "db-file", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Single-writer Windows/Linux/macOS durable files and atomic snapshot replacement", .source = "src/platform/db_file.sig" },
+    .{ .scope = "zpm", .name = "entropy", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Caller-buffer native cryptographic entropy on Windows, Linux and macOS", .source = "src/platform/entropy.sig" },
     .{ .scope = "zpm", .name = "db-store", .version = "0.1.0", .layer = 0, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{"sql"}, .description = "Caller-owned optimistic transaction snapshots and durable commit hooks", .source = "src/db/store.sig" },
     .{ .scope = "zpm", .name = "postgres", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{ "sql", "db-store", "scram" }, .description = "Bounded PostgreSQL v3 wire sessions and prepared portals", .source = "src/db/postgres.sig" },
     .{ .scope = "zpm", .name = "mysql", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{ "sql", "db-store" }, .description = "Bounded MySQL protocol 10 wire sessions", .source = "src/db/mysql.sig" },
     .{ .scope = "zpm", .name = "tds", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{ "sql", "db-store" }, .description = "Bounded SQL Server TDS 7.x wire sessions", .source = "src/db/tds.sig" },
-    .{ .scope = "zpm", .name = "tcp-server", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Nonblocking caller-buffer TCP server primitives for Windows and Linux", .source = "src/platform/tcp_server.sig" },
+    .{ .scope = "zpm", .name = "tcp-server", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Nonblocking caller-buffer TCP server primitives for Windows, Linux and macOS", .source = "src/platform/tcp_server.sig" },
     .{
         .scope = "zpm",
         .name = "sql",
@@ -490,7 +492,7 @@ fn eql(a: []const u8, b: []const u8) bool {
 const testing = @import("std").testing;
 
 test "official_packages: expected package count" {
-    try testing.expectEqual(@as(usize, 46), package_count);
+    try testing.expectEqual(@as(usize, 48), package_count);
 }
 
 test "official_packages: layer 0 packages have no platform dependencies" {

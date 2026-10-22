@@ -1,10 +1,12 @@
 //! Bounded nonblocking IPv4 TCP sockets for single-threaded servers (Layer 1).
 //! Caller-owned receive/send buffers; no allocator and no background threads.
-//! Windows uses Winsock select; Linux uses direct syscalls and poll (no libc).
+//! Windows uses Winsock select; Linux uses direct syscalls; macOS uses Darwin
+//! libSystem socket/poll calls. Every backend uses only caller-owned storage.
 const std = @import("std");
 const builtin = @import("builtin");
 const win = @import("win32.sig");
 const linux = std.os.linux;
+const darwin = std.c;
 const is_windows = builtin.os.tag == .windows;
 
 pub const Socket = if (is_windows) win.SOCKET else linux.fd_t;
@@ -31,7 +33,7 @@ pub fn init() Error!void {
     if (is_windows) {
         var data: win.WSADATA = .{};
         if (win.WSAStartup(0x0202, &data) != 0) return error.StartupFailed;
-    } else if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    } else if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedPlatform;
 }
 
 pub fn deinit() void {
@@ -62,6 +64,17 @@ pub fn listen(address: [4]u8, port: u16) Error!Socket {
         if (linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.BindFailed;
         if (linux.errno(linux.listen(fd, 128)) != .SUCCESS) return error.ListenFailed;
         return fd;
+    } else if (builtin.os.tag == .macos) {
+        const fd = darwin.socket(darwin.AF.INET, darwin.SOCK.STREAM, darwin.IPPROTO.TCP);
+        if (fd < 0) return error.SocketFailed;
+        errdefer close(fd);
+        try nonblocking(fd);
+        const enabled: c_int = 1;
+        if (darwin.setsockopt(fd, darwin.SOL.SOCKET, darwin.SO.REUSEADDR, &enabled, @sizeOf(c_int)) != 0) return error.ConfigureFailed;
+        const addr: darwin.sockaddr.in = .{ .port = networkPort(port), .addr = @bitCast(address) };
+        if (darwin.bind(fd, @ptrCast(&addr), @sizeOf(darwin.sockaddr.in)) != 0) return error.BindFailed;
+        if (darwin.listen(fd, 128) != 0) return error.ListenFailed;
+        return fd;
     } else return error.UnsupportedPlatform;
 }
 
@@ -75,6 +88,11 @@ pub fn localPort(fd: Socket) Error!u16 {
         var addr: linux.sockaddr.in = .{ .port = 0, .addr = 0 };
         var size: linux.socklen_t = @sizeOf(linux.sockaddr.in);
         if (linux.errno(linux.getsockname(fd, @ptrCast(&addr), &size)) != .SUCCESS) return error.AddressFailed;
+        return networkPort(addr.port);
+    } else if (builtin.os.tag == .macos) {
+        var addr: darwin.sockaddr.in = .{ .port = 0, .addr = 0 };
+        var size: darwin.socklen_t = @sizeOf(darwin.sockaddr.in);
+        if (darwin.getsockname(fd, @ptrCast(&addr), &size) != 0) return error.AddressFailed;
         return networkPort(addr.port);
     } else return error.UnsupportedPlatform;
 }
@@ -110,6 +128,20 @@ pub fn accept(listener: Socket) Error!?Socket {
             if (linux.errno(linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&enabled), @sizeOf(c_int))) != .SUCCESS)
                 return error.ConfigureFailed;
             return fd;
+        } else if (builtin.os.tag == .macos) {
+            const fd = darwin.accept(listener, null, null);
+            if (fd < 0) {
+                switch (darwin.errno(fd)) {
+                    .AGAIN => return null,
+                    .INTR, .CONNABORTED => continue,
+                    else => return error.AcceptFailed,
+                }
+            }
+            errdefer close(fd);
+            try nonblocking(fd);
+            const enabled: c_int = 1;
+            if (darwin.setsockopt(fd, darwin.IPPROTO.TCP, darwin.TCP.NODELAY, &enabled, @sizeOf(c_int)) != 0) return error.ConfigureFailed;
+            return fd;
         } else return error.UnsupportedPlatform;
     }
 }
@@ -134,12 +166,21 @@ pub fn recv(fd: Socket, buf: []u8) Error!?usize {
                 .INTR => continue,
                 else => return error.ReceiveFailed,
             }
+        } else if (builtin.os.tag == .macos) {
+            const rc = darwin.recv(fd, buf.ptr, buf.len, 0);
+            if (rc >= 0) return @intCast(rc);
+            switch (darwin.errno(rc)) {
+                .AGAIN => return null,
+                .INTR => continue,
+                else => return error.ReceiveFailed,
+            }
         } else return error.UnsupportedPlatform;
     }
 }
 
-/// May send fewer bytes than requested. null means would-block. Linux suppresses
-/// SIGPIPE so a disconnected peer cannot terminate the server process.
+/// May send fewer bytes than requested. null means would-block. Linux uses
+/// MSG_NOSIGNAL and Darwin sockets have SO_NOSIGPIPE, preventing termination
+/// when a disconnected peer is written to.
 pub fn send(fd: Socket, buf: []const u8) Error!?usize {
     if (buf.len == 0) return 0;
     while (true) {
@@ -158,6 +199,14 @@ pub fn send(fd: Socket, buf: []const u8) Error!?usize {
                 .INTR => continue,
                 else => return error.SendFailed,
             }
+        } else if (builtin.os.tag == .macos) {
+            const rc = darwin.send(fd, buf.ptr, buf.len, 0);
+            if (rc >= 0) return @intCast(rc);
+            switch (darwin.errno(rc)) {
+                .AGAIN => return null,
+                .INTR => continue,
+                else => return error.SendFailed,
+            }
         } else return error.UnsupportedPlatform;
     }
 }
@@ -169,6 +218,9 @@ pub fn close(fd: Socket) void {
     } else if (builtin.os.tag == .linux) {
         // Do not retry close on EINTR: Linux has already released the fd.
         _ = linux.close(fd);
+    } else if (builtin.os.tag == .macos) {
+        // A retry could close a descriptor reused by another operation.
+        _ = darwin.close(fd);
     }
 }
 
@@ -235,6 +287,25 @@ pub fn waitMasked(listener: Socket, clients: []const Socket, readable: []bool, w
             w.* = events & linux.POLL.OUT != 0;
         }
         return descriptors[0].revents & linux.POLL.IN != 0;
+    } else if (builtin.os.tag == .macos) {
+        var descriptors: [max_clients + 1]darwin.pollfd = undefined;
+        descriptors[0] = .{ .fd = listener, .events = darwin.POLL.IN, .revents = 0 };
+        for (clients, readable, writable, 0..) |fd, wants_read, wants_write, i| {
+            descriptors[i + 1] = .{ .fd = fd, .events = @as(i16, if (wants_read) darwin.POLL.IN else 0) | @as(i16, if (wants_write) darwin.POLL.OUT else 0), .revents = 0 };
+        }
+        @memset(readable, false);
+        @memset(writable, false);
+        const rc = darwin.poll(&descriptors, @intCast(clients.len + 1), @intCast(@min(timeout_ms, 0x7fffffff)));
+        if (rc < 0) {
+            if (darwin.errno(rc) == .INTR) return false;
+            return error.WaitFailed;
+        }
+        for (readable, writable, 0..) |*r, *w, i| {
+            const events = descriptors[i + 1].revents;
+            r.* = events & (darwin.POLL.IN | darwin.POLL.ERR | darwin.POLL.HUP | darwin.POLL.NVAL) != 0;
+            w.* = events & darwin.POLL.OUT != 0;
+        }
+        return descriptors[0].revents & darwin.POLL.IN != 0;
     } else return error.UnsupportedPlatform;
 }
 
@@ -242,6 +313,14 @@ fn nonblocking(fd: Socket) Error!void {
     if (is_windows) {
         var enabled: c_ulong = 1;
         if (win.ioctlsocket(fd, win.FIONBIO, &enabled) != 0) return error.ConfigureFailed;
+    } else if (builtin.os.tag == .macos) {
+        const flags = darwin.fcntl(fd, darwin.F.GETFL);
+        if (flags < 0) return error.ConfigureFailed;
+        const nonblock: c_int = @bitCast(@as(darwin.O, .{ .NONBLOCK = true }));
+        if (darwin.fcntl(fd, darwin.F.SETFL, flags | nonblock) < 0) return error.ConfigureFailed;
+        if (darwin.fcntl(fd, darwin.F.SETFD, @as(c_int, darwin.FD_CLOEXEC)) < 0) return error.ConfigureFailed;
+        const enabled: c_int = 1;
+        if (darwin.setsockopt(fd, darwin.SOL.SOCKET, darwin.SO.NOSIGPIPE, &enabled, @sizeOf(c_int)) != 0) return error.ConfigureFailed;
     }
 }
 

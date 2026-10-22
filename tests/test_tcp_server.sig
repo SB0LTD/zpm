@@ -27,6 +27,17 @@ fn connect(port: u16) !tcp.Socket {
         const addr: Win.Address = .{ .port = wire_port, .addr = address };
         if (Win.connect(fd, &addr, @sizeOf(Win.Address)) != 0) return error.ClientConnectFailed;
         return fd;
+    } else if (builtin.os.tag == .macos) {
+        const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, std.c.IPPROTO.TCP);
+        if (fd < 0) return error.ClientSocketFailed;
+        errdefer tcp.close(fd);
+        const addr: std.c.sockaddr.in = .{ .port = wire_port, .addr = address };
+        if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.ClientConnectFailed;
+        // send() must remain safe even after a peer's close, including clients
+        // used by the native backend contract rather than accepted sockets.
+        const enabled: c_int = 1;
+        if (std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.NOSIGPIPE, &enabled, @sizeOf(c_int)) != 0) return error.ClientSocketFailed;
+        return fd;
     } else {
         const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
         if (linux.errno(rc) != .SUCCESS) return error.ClientSocketFailed;
@@ -47,6 +58,16 @@ fn noDelay(fd: tcp.Socket) !void {
     if (windows) {
         var len: c_int = @sizeOf(c_int);
         try check(Win.getsockopt(fd, 6, 1, &value, &len) == 0);
+    } else if (builtin.os.tag == .macos) {
+        var len: std.c.socklen_t = @sizeOf(c_int);
+        try check(std.c.getsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, &value, &len) == 0);
+        var no_signal: c_int = 0;
+        len = @sizeOf(c_int);
+        try check(std.c.getsockopt(fd, std.c.SOL.SOCKET, std.c.SO.NOSIGPIPE, &no_signal, &len) == 0 and no_signal == 1);
+        const status = std.c.fcntl(fd, std.c.F.GETFL);
+        const nonblock: c_int = @bitCast(@as(std.c.O, .{ .NONBLOCK = true }));
+        try check(status >= 0 and status & nonblock != 0);
+        try check(std.c.fcntl(fd, std.c.F.GETFD) & std.c.FD_CLOEXEC != 0);
     } else {
         var len: linux.socklen_t = @sizeOf(c_int);
         try check(linux.errno(linux.getsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&value), &len)) == .SUCCESS);

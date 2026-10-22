@@ -1,10 +1,11 @@
-//! Single-writer durable database files for Windows and Linux, no libc or heap.
+//! Single-writer durable database files for Windows, Linux and macOS, no heap.
 //! All operations are synchronous; a handle belongs to one reactor/thread.
-//! Windows share modes and Linux flock exclude cooperating writer processes.
+//! Windows share modes and POSIX flock exclude cooperating writer processes.
 //! Every append/sync failure poisons this handle until it is closed and recovered.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
+const darwin = std.c;
 const windows = builtin.os.tag == .windows;
 const Handle = if (windows) ?*anyopaque else linux.fd_t;
 const invalid: Handle = if (windows) @ptrFromInt(~@as(usize, 0)) else -1;
@@ -77,6 +78,18 @@ pub const File = struct {
                 file.close();
                 return error.DataDirectoryBusy;
             }
+        } else if (builtin.os.tag == .macos) {
+            var path_buf: [path_capacity]u8 = undefined;
+            const z = try narrowPath(path, &path_buf);
+            const flags: darwin.O = .{ .ACCMODE = .RDWR, .CREAT = create, .CLOEXEC = true, .NOFOLLOW = true, .EXCL = exclusive };
+            const fd = darwin.open(z.ptr, flags, @as(c_uint, 0o600));
+            if (fd < 0) return error.FileOpenFailed;
+            file.handle = fd;
+            while (darwin.flock(file.handle, darwin.LOCK.EX | darwin.LOCK.NB) != 0) {
+                if (darwin.errno(@as(c_int, -1)) == .INTR) continue;
+                file.close();
+                return error.DataDirectoryBusy;
+            }
         } else return error.UnsupportedPlatform;
         errdefer file.close();
         // Sync directory entries before any durable transaction can be promised.
@@ -89,6 +102,8 @@ pub const File = struct {
             _ = Win.CloseHandle(self.handle);
         } else if (builtin.os.tag == .linux) {
             _ = linux.close(self.handle);
+        } else if (builtin.os.tag == .macos) {
+            _ = darwin.close(self.handle);
         }
         self.handle = invalid;
     }
@@ -102,6 +117,12 @@ pub const File = struct {
             const rc = linux.lseek(self.handle, @intCast(offset), whence);
             if (linux.errno(@intCast(rc)) != .SUCCESS) return error.FileSeekFailed;
             return rc;
+        } else if (builtin.os.tag == .macos) {
+            while (true) {
+                const rc = darwin.lseek(self.handle, @intCast(offset), @intCast(whence));
+                if (rc >= 0) return @intCast(rc);
+                if (darwin.errno(rc) != .INTR) return error.FileSeekFailed;
+            }
         } else return error.UnsupportedPlatform;
     }
     pub fn length(self: *File) Error!u64 {
@@ -124,6 +145,12 @@ pub const File = struct {
                     else => return error.FileReadFailed,
                 }
             }
+        } else if (builtin.os.tag == .macos) {
+            while (true) {
+                const rc = darwin.pread(self.handle, buffer.ptr, buffer.len, @intCast(offset));
+                if (rc >= 0) return @intCast(rc);
+                if (darwin.errno(rc) != .INTR) return error.FileReadFailed;
+            }
         } else return error.UnsupportedPlatform;
     }
     pub fn appendAll(self: *File, bytes: []const u8) Error!void {
@@ -144,6 +171,13 @@ pub const File = struct {
                     .INTR => continue,
                     else => return error.FileWriteFailed,
                 }
+            } else if (builtin.os.tag == .macos) {
+                const rc = darwin.write(self.handle, bytes[done..].ptr, bytes.len - done);
+                if (rc < 0) {
+                    if (darwin.errno(rc) == .INTR) continue;
+                    return error.FileWriteFailed;
+                }
+                count = @intCast(rc);
             } else return error.UnsupportedPlatform;
             if (count == 0 or count > bytes.len - done) return error.FileWriteFailed;
             done += count;
@@ -162,6 +196,13 @@ pub const File = struct {
                     else => return error.FileSyncFailed,
                 }
             }
+        } else if (builtin.os.tag == .macos) {
+            // Apple documents fsync as insufficient for ordered database
+            // commits: F_FULLFSYNC also flushes the device's write cache.
+            // Fail closed on unsupported storage instead of weakening durability.
+            while (darwin.fcntl(self.handle, darwin.F.FULLFSYNC, @as(c_int, 0)) != 0) {
+                if (darwin.errno(@as(c_int, -1)) != .INTR) return error.FileSyncFailed;
+            }
         } else return error.UnsupportedPlatform;
     }
     pub fn truncate(self: *File, size: u64) Error!void {
@@ -178,6 +219,10 @@ pub const File = struct {
                     .INTR => continue,
                     else => return error.FileTruncateFailed,
                 }
+            }
+        } else if (builtin.os.tag == .macos) {
+            while (darwin.ftruncate(self.handle, @intCast(size)) != 0) {
+                if (darwin.errno(@as(c_int, -1)) != .INTR) return error.FileTruncateFailed;
             }
         } else return error.UnsupportedPlatform;
     }
@@ -204,6 +249,15 @@ pub fn replaceAtomic(temporary: []const u8, target: []const u8) Error!void {
         try syncParent(target);
         // Also persist removal of the source name when directories differ.
         try syncParent(temporary);
+    } else if (builtin.os.tag == .macos) {
+        var a: [path_capacity]u8 = undefined;
+        var b: [path_capacity]u8 = undefined;
+        const az = try narrowPath(temporary, &a);
+        const bz = try narrowPath(target, &b);
+        if (darwin.renameat(darwin.AT.FDCWD, az.ptr, darwin.AT.FDCWD, bz.ptr) != 0) return error.FileRenameFailed;
+        try syncParent(target);
+        try syncParent(temporary);
+        try syncDarwinPublished(target);
     } else return error.UnsupportedPlatform;
 }
 
@@ -235,12 +289,46 @@ pub fn publishNew(temporary: []const u8, target: []const u8) Error!void {
         }
         try syncParent(target);
         try syncParent(temporary);
+    } else if (builtin.os.tag == .macos) {
+        var a: [path_capacity]u8 = undefined;
+        var b: [path_capacity]u8 = undefined;
+        const az = try narrowPath(temporary, &a);
+        const bz = try narrowPath(target, &b);
+        // Native RENAME_EXCL atomically refuses files, directories and symlinks.
+        const rc = darwin.renameatx_np(darwin.AT.FDCWD, az.ptr, darwin.AT.FDCWD, bz.ptr, .{ .EXCL = true });
+        if (rc != 0) {
+            const err = darwin.errno(rc);
+            if (err != .INVAL and err != .OPNOTSUPP and err != .NOSYS) return error.FileRenameFailed;
+            // Filesystems without RENAME_EXCL can atomically publish a hard
+            // link. Sync that name before retiring the source; never plain rename.
+            if (darwin.linkat(darwin.AT.FDCWD, az.ptr, darwin.AT.FDCWD, bz.ptr, 0) != 0) return error.FileRenameFailed;
+            try syncParent(target);
+            if (darwin.unlinkat(darwin.AT.FDCWD, az.ptr, 0) != 0) return error.FileRenameFailed;
+        }
+        try syncParent(target);
+        try syncParent(temporary);
+        try syncDarwinPublished(target);
     } else return error.UnsupportedPlatform;
+}
+
+/// A directory fsync pushes its metadata to the device; Darwin's subsequent
+/// full-sync of the published file also orders the device-cache flush. The
+/// existing inode is opened read-only, without following a substituted symlink.
+fn syncDarwinPublished(path: []const u8) Error!void {
+    if (builtin.os.tag != .macos) return;
+    var buf: [path_capacity]u8 = undefined;
+    const z = try narrowPath(path, &buf);
+    const fd = darwin.open(z.ptr, .{ .CLOEXEC = true, .NOFOLLOW = true });
+    if (fd < 0) return error.FileSyncFailed;
+    defer _ = darwin.close(fd);
+    while (darwin.fcntl(fd, darwin.F.FULLFSYNC, @as(c_int, 0)) != 0) {
+        if (darwin.errno(@as(c_int, -1)) != .INTR) return error.FileSyncFailed;
+    }
 }
 
 fn syncParent(path: []const u8) Error!void {
     if (windows) return; // MoveFileEx WRITE_THROUGH; file FlushFileBuffers on commits.
-    if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedPlatform;
     var end: usize = 0;
     for (path, 0..) |byte, i| if (byte == '/') {
         end = if (i == 0) 1 else i;
@@ -248,15 +336,24 @@ fn syncParent(path: []const u8) Error!void {
     const parent = if (end == 0) "." else path[0..end];
     var buf: [path_capacity]u8 = undefined;
     const z = try narrowPath(parent, &buf);
-    const rc = linux.openat(linux.AT.FDCWD, z.ptr, .{ .DIRECTORY = true, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) return error.FileSyncFailed;
-    const fd: linux.fd_t = @intCast(rc);
-    defer _ = linux.close(fd);
-    while (true) {
-        switch (linux.errno(linux.fsync(fd))) {
-            .SUCCESS => return,
-            .INTR => continue,
-            else => return error.FileSyncFailed,
+    if (builtin.os.tag == .macos) {
+        const fd = darwin.open(z.ptr, .{ .DIRECTORY = true, .CLOEXEC = true });
+        if (fd < 0) return error.FileSyncFailed;
+        defer _ = darwin.close(fd);
+        while (darwin.fsync(fd) != 0) {
+            if (darwin.errno(@as(c_int, -1)) != .INTR) return error.FileSyncFailed;
+        }
+    } else {
+        const rc = linux.openat(linux.AT.FDCWD, z.ptr, .{ .DIRECTORY = true, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.FileSyncFailed;
+        const fd: linux.fd_t = @intCast(rc);
+        defer _ = linux.close(fd);
+        while (true) {
+            switch (linux.errno(linux.fsync(fd))) {
+                .SUCCESS => return,
+                .INTR => continue,
+                else => return error.FileSyncFailed,
+            }
         }
     }
 }
@@ -271,6 +368,11 @@ pub fn remove(path: []const u8) Error!void {
         var buf: [path_capacity]u8 = undefined;
         const z = try narrowPath(path, &buf);
         if (linux.errno(linux.unlinkat(linux.AT.FDCWD, z.ptr, 0)) != .SUCCESS) return error.FileRemoveFailed;
+        try syncParent(path);
+    } else if (builtin.os.tag == .macos) {
+        var buf: [path_capacity]u8 = undefined;
+        const z = try narrowPath(path, &buf);
+        if (darwin.unlinkat(darwin.AT.FDCWD, z.ptr, 0) != 0) return error.FileRemoveFailed;
         try syncParent(path);
     } else return error.UnsupportedPlatform;
 }
