@@ -75,6 +75,10 @@ reports `DataType.integer32`; BIGINT/INT8 always reports `.integer` and retains
 the signed 64-bit range. Cells retain the shared i64 payload. The wire sessions
 report the correct width (PostgreSQL OIDs 23/20, MySQL LONG/LONGLONG, TDS INTN
 4/8), including binary encoding and prepared parameter inference.
+Applications persisting SQL must version this schema interpretation separately:
+`durable_log.appendKind` / `recoverKind` provide a checked payload kind, while
+the existing append/recover APIs retain kind 1. Never replay 64-bit INTEGER logs
+under a 32-bit INTEGER schema interpretation without an explicit migration.
 
 Keywords and unquoted ASCII identifiers are case insensitive. Strings use
 apostrophes, escaped by doubling them; integer literals are signed 64-bit.
