@@ -97,6 +97,28 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_all = try ctx.addStep("test", "Run all ZPM unit and compliance tests", &noopStep);
 
     // Core modules.
+    _ = try ctx.addModule("sql", "src/core/sql.sig");
+    const test_sql = try ctx.addStep("test-sql", "Execute bounded in-memory SQL contracts", &noopStep);
+    try ctx.addDependency(test_all, test_sql);
+    _ = try addContract(ctx, test_sql, "contract-sql", "tests/test_sql.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-index", "tests/test_sql_index.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try ctx.addModule("db_store", "src/db/store.sig");
+    const pg_module = try ctx.addModule("postgres", "src/db/postgres.sig");
+    try wire(ctx, pg_module, "scram", "src/db/scram.sig");
+    _ = try ctx.addModule("mysql", "src/db/mysql.sig");
+    _ = try ctx.addModule("tds", "src/db/tds.sig");
+    _ = try ctx.addModule("tcp_server", "src/platform/tcp_server.sig");
+    const test_db = try ctx.addStep("test-db", "Execute database wire, transaction and TCP contracts", &noopStep);
+    try ctx.addDependency(test_all, test_db);
+    inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy" }) |name| {
+        _ = try addContract(ctx, test_db, "contract-" ++ name, "tests/test_" ++ name ++ ".sig", &.{
+            importEntry("sql", "src/core/sql.sig"),             importEntry("db_store", "src/db/store.sig"),
+            importEntry("scram", "src/db/scram.sig"),           importEntry("durable_log", "src/db/durable_log.sig"),
+            importEntry("db_file", "src/platform/db_file.sig"), importEntry("entropy", "src/platform/entropy.sig"),
+            importEntry("postgres", "src/db/postgres.sig"),     importEntry("mysql", "src/db/mysql.sig"),
+            importEntry("tds", "src/db/tds.sig"),               importEntry("tcp_server", "src/platform/tcp_server.sig"),
+        });
+    }
     _ = try ctx.addModule("math", "src/core/math.sig");
     _ = try ctx.addModule("sig_math", "src/core/sig_math.sig");
     const synth_voice = try ctx.addModule("synth_voice", "src/core/synth_voice.sig");
@@ -359,6 +381,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, cognitive_receipt, "multimodal_now", "src/core/multimodal_now.sig");
     try wire(ctx, cognitive_receipt, "sig_testing", "src/core/sig_testing.sig");
     const core = try ctx.addModule("core", "src/core/root.sig");
+    try wire(ctx, core, "sql", "src/core/sql.sig");
     try wire(ctx, core, "sig_mem", "src/core/sig_mem.sig");
     inline for (.{ "sig_text", "safetensors", "ephemeral_scene", "now_voice_output", "device_control", "english_phonemes" }) |name|
         try wire(ctx, core, name, "src/core/" ++ name ++ ".sig");

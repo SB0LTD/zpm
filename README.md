@@ -156,6 +156,13 @@ delegate to `sig build` regardless of which naming a project uses.
 
 ---
 
+## Database server building blocks
+
+The allocator-free SQL engine, shared transaction store, PostgreSQL/MySQL/TDS
+sessions and native TCP reactor primitives are documented in
+[Database server building blocks](docs/database-server.md). Run
+`sig build test-db test-sql -Doptimize=ReleaseSafe` for executable contracts.
+
 ## QUIC Transport
 
 zpm includes a full QUIC implementation (RFC 9000, 9001, 9002, 9221) for high-performance registry access. Enable with `--transport quic`.
@@ -204,6 +211,7 @@ zpm module library. They are organized by the four-layer hierarchy above.
 | Package | Description |
 |---------|-------------|
 | `@zpm/core` | Core data types, storage, and logic |
+| `@zpm/sql` | Allocator-free in-memory SQL with bounded caller-owned storage; see [SQL contracts](docs/sql.md) |
 | `@zpm/math` | Sin/cos approximations, lerp, interpolation, pure math |
 | `@zpm/json` | Minimal JSON parser |
 | `@zpm/ai-core` | Caller-owned arenas, tensor bounds, deadline scheduling, device interfaces, and copy-on-write pages |

@@ -6,6 +6,7 @@
 // share the same source files.
 
 pub const math = @import("math");
+pub const sql = @import("sql");
 pub const text = @import("sig_text");
 pub const safetensors = @import("safetensors");
 pub const ephemeral_scene = @import("ephemeral_scene");
