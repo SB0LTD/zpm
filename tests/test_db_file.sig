@@ -18,7 +18,7 @@ const Replay = struct {
     }
 };
 pub fn main(init: std.process.Init) !void {
-    const pid: u32 = if (builtin.os.tag == .windows) Win.GetCurrentProcessId() else @intCast(std.os.linux.getpid());
+    const pid: u32 = if (builtin.os.tag == .windows) Win.GetCurrentProcessId() else if (builtin.os.tag == .macos) @intCast(std.c.getpid()) else @intCast(std.os.linux.getpid());
     var path_buffer: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, "sig-out/db-file-contract-{d}.wal", .{pid});
     var snapshot_buffer: [256]u8 = undefined;
@@ -31,6 +31,14 @@ pub fn main(init: std.process.Init) !void {
     var open = true;
     defer if (open) file.close();
     try check(try file.length() == 0);
+    if (builtin.os.tag == .macos) {
+        // Persistent handles must not leak across exec; creation must never
+        // grant group/other access (the process umask can restrict it further).
+        try check(std.c.fcntl(file.handle, std.c.F.GETFD) & std.c.FD_CLOEXEC != 0);
+        var metadata: std.c.Stat = undefined;
+        try check(std.c.fstat(file.handle, &metadata) == 0);
+        try check(metadata.mode & 0o077 == 0);
+    }
     if (disk.File.createExclusive(path)) |duplicate_value| {
         var duplicate = duplicate_value;
         duplicate.close();
@@ -90,6 +98,28 @@ pub fn main(init: std.process.Init) !void {
     try temporary.appendAll("new non-overwriting backup");
     try temporary.sync();
     temporary.close();
+    if (builtin.os.tag == .macos) {
+        var link_buffer: [256]u8 = undefined;
+        const link_bytes = try std.fmt.bufPrint(link_buffer[0 .. link_buffer.len - 1], "sig-out/db-file-contract-{d}.link", .{pid});
+        link_buffer[link_bytes.len] = 0;
+        const link_path = link_buffer[0..link_bytes.len :0];
+        // Relative target is interpreted from the symlink's own directory.
+        var target_buffer: [256]u8 = undefined;
+        const target_bytes = try std.fmt.bufPrint(target_buffer[0 .. target_buffer.len - 1], "db-file-contract-{d}.snapshot", .{pid});
+        target_buffer[target_bytes.len] = 0;
+        const target_name = target_buffer[0..target_bytes.len :0];
+        try check(std.c.symlinkat(target_name.ptr, std.c.AT.FDCWD, link_path.ptr) == 0);
+        defer disk.remove(link_path) catch {};
+        if (disk.File.open(link_path)) |unexpected_value| {
+            var unexpected = unexpected_value;
+            unexpected.close();
+            return error.SymlinkDatabaseOpened;
+        } else |err| try check(err == error.FileOpenFailed);
+        if (disk.publishNew(temporary_path, link_path)) |_| return error.SymlinkTargetOverwritten else |err| try check(err == error.FileRenameFailed);
+        var link_contents: [256]u8 = undefined;
+        const link_len = std.c.readlinkat(std.c.AT.FDCWD, link_path.ptr, &link_contents, link_contents.len);
+        try check(link_len == target_name.len and std.mem.eql(u8, link_contents[0..target_name.len], target_name));
+    }
     if (disk.publishNew(temporary_path, snapshot_path)) |_| return error.ExistingTargetOverwritten else |err| try check(err == error.FileRenameFailed);
     snapshot = try disk.File.open(snapshot_path);
     const preserved = try snapshot.readAt(0, &scratch);

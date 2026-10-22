@@ -110,13 +110,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("tcp_server", "src/platform/tcp_server.sig");
     const test_db = try ctx.addStep("test-db", "Execute database wire, transaction and TCP contracts", &noopStep);
     try ctx.addDependency(test_all, test_db);
-    inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy" }) |name| {
+    inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy", "db_stream", "pg_stream" }) |name| {
         _ = try addContract(ctx, test_db, "contract-" ++ name, "tests/test_" ++ name ++ ".sig", &.{
-            importEntry("sql", "src/core/sql.sig"),             importEntry("db_store", "src/db/store.sig"),
-            importEntry("scram", "src/db/scram.sig"),           importEntry("durable_log", "src/db/durable_log.sig"),
-            importEntry("db_file", "src/platform/db_file.sig"), importEntry("entropy", "src/platform/entropy.sig"),
-            importEntry("postgres", "src/db/postgres.sig"),     importEntry("mysql", "src/db/mysql.sig"),
-            importEntry("tds", "src/db/tds.sig"),               importEntry("tcp_server", "src/platform/tcp_server.sig"),
+            importEntry("sql", "src/core/sql.sig"),                   importEntry("db_store", "src/db/store.sig"),
+            importEntry("scram", "src/db/scram.sig"),                 importEntry("durable_log", "src/db/durable_log.sig"),
+            importEntry("db_file", "src/platform/db_file.sig"),       importEntry("entropy", "src/platform/entropy.sig"),
+            importEntry("stream_server", "src/db/stream_server.sig"), importEntry("postgres", "src/db/postgres.sig"),
+            importEntry("mysql", "src/db/mysql.sig"),                 importEntry("tds", "src/db/tds.sig"),
+            importEntry("tcp_server", "src/platform/tcp_server.sig"),
         });
     }
     _ = try ctx.addModule("math", "src/core/math.sig");

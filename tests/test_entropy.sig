@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
     var empty: [0]u8 = .{};
     try entropy.fill(&empty);
     try check(true);
-    if (builtin.os.tag == .windows or builtin.os.tag == .linux) {
+    if (builtin.os.tag == .windows or builtin.os.tag == .linux or builtin.os.tag == .macos) {
         var previous: [32]u8 = @splat(0);
         var current: [32]u8 = @splat(0);
         // Each accepted connection obtains a new 256-bit SCRAM nonce. A

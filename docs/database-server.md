@@ -70,7 +70,7 @@ Read-only statements do not copy the database; durable writes prepare a candidat
 trailer, then syncs. `recover` checks complete records, contiguous sequences and
 checksums before replay. Only an incomplete physical tail is truncated; complete
 corruption and semantic replay failures abort recovery. Callers must replay each
-batch atomically. `db_file.File` holds an exclusive writer lock on Windows/Linux,
+batch atomically. `db_file.File` holds an exclusive writer lock on Windows/Linux/macOS,
 provides complete append/fsync/truncate, and poisons failed writers. Atomic file
 publication helpers are for caller-validated backups/snapshots; never replace
 an active WAL inode or truncate it without a persisted sequence anchor.
@@ -87,7 +87,7 @@ listener. `localPort` reports ephemeral port assignments. `accept`, `recv` and
 Accepted sockets enable TCP_NODELAY. `waitMasked` uses caller read/write
 interest arrays and overwrites them with readiness; `wait` retains the simpler
 all-readable-sockets API. The bound is 63 client descriptors plus a listener.
-The Linux implementation uses direct syscalls; Windows uses native Winsock.
+The Linux implementation uses direct syscalls; Windows uses native Winsock. macOS uses libSystem sockets/poll, F_FULLFSYNC-backed file durability and getentropy.
 
 ## Contracts
 
@@ -103,3 +103,20 @@ on shared listeners. Performance reports separate native execution from TCP and
 client decoding. Compatibility references are the official PostgreSQL frontend/
 backend protocol documentation, MySQL Client/Server Protocol documentation and
 Microsoft's MS-TDS specification.
+
+## Native and delegated byte streams
+
+`db-stream` (`src/db/stream_server.sig`) runs an existing protocol session over a
+caller-owned `read`/`writeAll` transport. It retains fragmented frames, drains
+coalesced frames, validates consumed/written bounds and refuses truncated EOF.
+It owns no database or platform connection; the caller performs transaction
+rollback/disconnect when the session finishes. Contracts include fragmented
+PostgreSQL CRUD and rollback against the real SQL/store/session implementation.
+
+`sb0-stream` (`src/platform/sb0_stream.sig`) supplies consolidated SB0 delegated
+channels and privileged QEMU virt PL011 UART streams. Both native image kinds
+use `aarch64-sb0`; SB0X versus SB0K is an artifact choice. No x18 use or foreign
+image conversion is introduced. These transports do not implement native TCP,
+durable files or secure entropy, which require additional OS ABI capabilities.
+Native full-engine compilation also needs backend support for its aggregate and
+optional operations; loader/header checks alone are insufficient qualification.

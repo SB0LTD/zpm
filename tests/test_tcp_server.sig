@@ -11,10 +11,17 @@ const Win = struct {
     extern "ws2_32" fn getsockopt(usize, c_int, c_int, *c_int, *c_int) callconv(.c) c_int;
 };
 var assertions: usize = 0;
+var report_io: std.Io = undefined;
+var phase: []const u8 = "startup";
 
 fn check(value: bool) !void {
     assertions += 1;
-    if (!value) return error.TcpContractFailed;
+    if (!value) {
+        var buffer: [256]u8 = undefined;
+        const report = std.fmt.bufPrint(&buffer, "{{\"suite\":\"tcp_server\",\"pass\":false,\"assertion\":{d},\"phase\":\"{s}\"}}\n", .{ assertions, phase }) catch return error.TcpContractFailed;
+        std.Io.File.stderr().writeStreamingAll(report_io, report) catch {};
+        return error.TcpContractFailed;
+    }
 }
 
 fn connect(port: u16) !tcp.Socket {
@@ -26,6 +33,17 @@ fn connect(port: u16) !tcp.Socket {
         errdefer tcp.close(fd);
         const addr: Win.Address = .{ .port = wire_port, .addr = address };
         if (Win.connect(fd, &addr, @sizeOf(Win.Address)) != 0) return error.ClientConnectFailed;
+        return fd;
+    } else if (builtin.os.tag == .macos) {
+        const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, std.c.IPPROTO.TCP);
+        if (fd < 0) return error.ClientSocketFailed;
+        errdefer tcp.close(fd);
+        const addr: std.c.sockaddr.in = .{ .port = wire_port, .addr = address };
+        if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.ClientConnectFailed;
+        // send() must remain safe even after a peer's close, including clients
+        // used by the native backend contract rather than accepted sockets.
+        const enabled: c_int = 1;
+        if (std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.NOSIGPIPE, &enabled, @sizeOf(c_int)) != 0) return error.ClientSocketFailed;
         return fd;
     } else {
         const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
@@ -43,18 +61,48 @@ fn ready(listener: tcp.Socket, sockets: []const tcp.Socket, read: []bool, write:
 }
 
 fn noDelay(fd: tcp.Socket) !void {
+    phase = "accepted socket flags";
     var value: c_int = 0;
     if (windows) {
         var len: c_int = @sizeOf(c_int);
         try check(Win.getsockopt(fd, 6, 1, &value, &len) == 0);
+    } else if (builtin.os.tag == .macos) {
+        var len: std.c.socklen_t = @sizeOf(c_int);
+        try check(std.c.getsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, &value, &len) == 0);
+        var no_signal: c_int = 0;
+        len = @sizeOf(c_int);
+        try check(std.c.getsockopt(fd, std.c.SOL.SOCKET, std.c.SO.NOSIGPIPE, &no_signal, &len) == 0 and no_signal == 1);
+        const status = std.c.fcntl(fd, std.c.F.GETFL);
+        const nonblock: c_int = @bitCast(@as(std.c.O, .{ .NONBLOCK = true }));
+        try check(status >= 0 and status & nonblock != 0);
+        try check(std.c.fcntl(fd, std.c.F.GETFD) & std.c.FD_CLOEXEC != 0);
     } else {
         var len: linux.socklen_t = @sizeOf(c_int);
         try check(linux.errno(linux.getsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&value), &len)) == .SUCCESS);
     }
-    try check(value == 1);
+    // Darwin returns the nonzero TF_NODELAY flag (currently 0x4), whereas
+    // Winsock and Linux normalize this boolean socket option to 1. Verify the
+    // enabled state, then exercise both transitions on Darwin so accepting its
+    // native boolean representation cannot conceal a missing setsockopt call.
+    try check(if (builtin.os.tag == .macos) value != 0 else value == 1);
+    if (builtin.os.tag == .macos) {
+        phase = "TCP_NODELAY transitions";
+        const disabled: c_int = 0;
+        try check(std.c.setsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, &disabled, @sizeOf(c_int)) == 0);
+        var len: std.c.socklen_t = @sizeOf(c_int);
+        value = -1;
+        try check(std.c.getsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, &value, &len) == 0);
+        try check(value == 0);
+        const enabled: c_int = 1;
+        try check(std.c.setsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, &enabled, @sizeOf(c_int)) == 0);
+        len = @sizeOf(c_int);
+        try check(std.c.getsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, &value, &len) == 0);
+        try check(value != 0);
+    }
 }
 
 fn backpressure(listener: tcp.Socket, port: u16) !void {
+    phase = "backpressure connect";
     const client = try connect(port);
     defer tcp.close(client);
     var empty: [0]bool = .{};
@@ -65,6 +113,7 @@ fn backpressure(listener: tcp.Socket, port: u16) !void {
     var saw_backpressure = false;
     var total: usize = 0;
     for (0..2048) |_| {
+        phase = "backpressure fill";
         const sent = (try tcp.send(accepted, &data)) orelse {
             saw_backpressure = true;
             break;
@@ -79,6 +128,7 @@ fn backpressure(listener: tcp.Socket, port: u16) !void {
     defer tcp.close(other_client);
     var read: [1]bool = .{false};
     var write: [1]bool = .{true};
+    phase = "backpressure accept fairness";
     try check(try ready(listener, &.{accepted}, &read, &write));
     const other = (try tcp.accept(listener)) orelse return error.AcceptNotReady;
     defer tcp.close(other);
@@ -92,6 +142,7 @@ fn backpressure(listener: tcp.Socket, port: u16) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    report_io = init.io;
     try tcp.init();
     defer tcp.deinit();
     const listener = try tcp.listen(.{ 127, 0, 0, 1 }, 0);
@@ -113,6 +164,7 @@ pub fn main(init: std.process.Init) !void {
     const accepted = (try tcp.accept(listener)) orelse return error.AcceptNotReady;
     defer tcp.close(accepted);
     try noDelay(accepted);
+    phase = "initial readiness";
     try check(try tcp.accept(listener) == null);
     var buf: [64]u8 = undefined;
     try check(try tcp.recv(accepted, &buf) == null);
@@ -123,12 +175,14 @@ pub fn main(init: std.process.Init) !void {
     try check((try tcp.send(client, "hello")) == 5);
     var masked_read: [1]bool = .{false};
     var masked_write: [1]bool = .{false};
+    phase = "read interest masking";
     try check(!try tcp.waitMasked(listener, &.{accepted}, &masked_read, &masked_write, 0));
     try check(!masked_read[0] and !masked_write[0]);
     masked_read[0] = true;
     try check(!try tcp.waitMasked(listener, &.{accepted}, &masked_read, &masked_write, 1000));
     try check(masked_read[0] and !masked_write[0]);
     write = .{ false, false };
+    phase = "bidirectional bytes";
     try check(!try ready(listener, &.{ accepted, tcp.invalid_socket }, &read, &write));
     try check(read[0] and !read[1]);
     try check((try tcp.recv(accepted, &buf)) == 5);
@@ -139,6 +193,7 @@ pub fn main(init: std.process.Init) !void {
     try check((try tcp.send(accepted, "")) == 0);
     try check((try tcp.recv(accepted, buf[0..0])) == 0);
     // Both interfaces reject mismatched and over-capacity readiness sets.
+    phase = "invalid readiness sets";
     if (tcp.wait(listener, &.{accepted}, &no_read, &no_write, 0)) |_| {
         return error.InvalidSetAccepted;
     } else |err| try check(err == error.InvalidSet);
@@ -150,6 +205,7 @@ pub fn main(init: std.process.Init) !void {
     } else |err| try check(err == error.InvalidSet);
     tcp.close(client);
     client_closed = true;
+    phase = "peer EOF";
     write = .{ false, false };
     _ = try ready(listener, &.{ accepted, tcp.invalid_socket }, &read, &write);
     try check(read[0]);
