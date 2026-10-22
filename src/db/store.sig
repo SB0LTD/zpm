@@ -6,8 +6,10 @@
 //! conservative optimistic isolation, not PostgreSQL's default READ COMMITTED.
 //! Raw must accept exactly one statement, reject unsupported syntax, and leave
 //! database/result unchanged on error. Its SELECT implementation is read-only.
-//! Durable mode prepares a caller-owned candidate and invokes the synchronous
-//! commit hook BEFORE publishing it or acknowledging success. No database-sized
+//! Durable mode uses Raw.executeWithCommit to validate, synchronously persist,
+//! then apply a mutation without copying database state. Older Raw adapters use
+//! a caller-owned candidate. Both persist BEFORE publication/acknowledgement.
+//! No database-sized
 //! automatic/stack storage is used. Hooks must not reenter this store.
 
 pub const max_statement_bytes = 65536;
@@ -112,6 +114,16 @@ pub fn Store(comptime Raw: type) type {
                 };
             }
         }
+
+        const StatementCommit = struct {
+            store: *Self,
+            batch: []const u8,
+
+            fn commit(context: ?*anyopaque) anyerror!void {
+                const self: *const StatementCommit = @ptrCast(@alignCast(context orelse return error.InvalidCommitBatch));
+                try self.store.persist(self.batch);
+            }
+        };
 
         pub const Connection = struct {
             pub const Result = Raw.Result;
@@ -308,14 +320,22 @@ pub fn Store(comptime Raw: type) type {
                     self.store.generation += 1;
                     return;
                 }
-                const workspace = self.store.autocommit_workspace orelse return error.TransactionCapacity;
-                if (workspace == &self.store.database or workspace == self.transaction_workspace) return error.InvalidWorkspace;
+                if (self.store.autocommit_workspace) |workspace| {
+                    if (workspace == &self.store.database or workspace == self.transaction_workspace) return error.InvalidWorkspace;
+                }
                 if (result == &self.store.autocommit_result) return error.InvalidWorkspace;
-                snapshot(workspace, &self.store.database);
-                try workspace.execute(source, &self.store.autocommit_result);
                 var batch: [max_statement_bytes + 4]u8 = undefined;
                 writeLength(batch[0..4], source.len);
                 @memcpy(batch[4..][0..source.len], source);
+                if (@hasDecl(Raw, "executeWithCommit")) {
+                    var commit = StatementCommit{ .store = self.store, .batch = batch[0 .. source.len + 4] };
+                    try self.store.database.executeWithCommit(source, result, &commit, StatementCommit.commit);
+                    self.store.generation += 1;
+                    return;
+                }
+                const workspace = self.store.autocommit_workspace orelse return error.TransactionCapacity;
+                snapshot(workspace, &self.store.database);
+                try workspace.execute(source, &self.store.autocommit_result);
                 try self.store.persist(batch[0 .. source.len + 4]);
                 snapshot(&self.store.database, workspace);
                 self.store.generation += 1;

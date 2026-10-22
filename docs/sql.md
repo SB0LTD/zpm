@@ -50,8 +50,19 @@ moving or overwriting that owner.
 including live schemas, rows and primary-key indices. `Result.copyFrom` copies
 only active headers and cells. Both accept uninitialized destination storage;
 callers must never inspect inactive table/row/column ranges. Durable store
-candidate creation and publication use these operations, avoiding copies of
-empty reserved capacity. CREATE/DROP likewise leave inactive row payloads alone.
+transaction snapshots use these operations, avoiding copies of empty reserved
+capacity. CREATE/DROP/DELETE leave inactive row payloads alone.
+
+`executeWithCommit(source, &result, context, commit)` adds a synchronous commit
+boundary without introducing a storage dependency into Layer 0. Each mutation
+fully parses and validates syntax, types, constraints and capacity first, calls
+`commit(context)` exactly once, then applies the validated change without a
+further fallible operation. SELECT never calls the hook. Hook failure preserves
+the complete database and previous result. The caller serializes the entire
+call; the hook must not change the database, source or result, or reenter a write.
+Read-only observation is permitted. A hook can flush WAL before publication
+without a database-sized candidate or a second parse. Ordinary `execute` uses
+the same validation/application path with a compile-time no-op boundary.
 
 ## SQL subset
 

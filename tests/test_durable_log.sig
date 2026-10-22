@@ -14,6 +14,7 @@ const Mock = struct {
     fail_read: bool = false,
     read_chunk: usize = 8192,
     fail_truncate: bool = false,
+    append_calls: usize = 0,
     pub fn length(self: *Mock) !u64 {
         return self.len;
     }
@@ -25,6 +26,7 @@ const Mock = struct {
         return n;
     }
     pub fn appendAll(self: *Mock, bytes: []const u8) !void {
+        self.append_calls += 1;
         for (bytes) |byte| {
             if (self.len == self.fail_after or self.len == self.bytes.len) return error.InjectedDiskFull;
             self.bytes[self.len] = byte;
@@ -54,6 +56,20 @@ const Replay = struct {
 };
 pub fn main(init: std.process.Init) !void {
     try check(log.checksum("123456789") == 0xcbf43926);
+    // Exact staging boundary and streaming fallback retain identical framing,
+    // CRCs, replay payloads and stable-storage acknowledgement.
+    var staged_payload: [4096]u8 = @splat('a');
+    for ([_]usize{ 1, 4048, 4049, 4096 }) |length| {
+        var staged: Mock = .{};
+        try log.append(&staged, 1, staged_payload[0..length]);
+        try check(staged.append_calls == (if (length <= 4048) @as(usize, 1) else 3));
+        try check(staged.len == length + log.overhead and staged.stable == staged.len);
+        var staged_scratch: [4096]u8 = undefined;
+        var staged_replay: Replay = .{};
+        const result = try log.recover(&staged, &staged_scratch, &staged_replay, Replay.apply);
+        try check(result.sequence == 1 and staged_replay.bytes == length and !result.truncated_tail);
+        try check(std.mem.eql(u8, staged_scratch[0..length], staged_payload[0..length]));
+    }
     var original: Mock = .{};
     var boundaries: [4]usize = .{ 0, 0, 0, 0 };
     for ([_][]const u8{ "CREATE TABLE test (id INTEGER)", "INSERT INTO test VALUES (1)", "UPDATE test SET id = 2" }, 0..) |payload, i| {
