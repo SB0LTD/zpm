@@ -80,7 +80,25 @@ fn noDelay(fd: tcp.Socket) !void {
         var len: linux.socklen_t = @sizeOf(c_int);
         try check(linux.errno(linux.getsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&value), &len)) == .SUCCESS);
     }
-    try check(value == 1);
+    // Darwin returns the nonzero TF_NODELAY flag (currently 0x4), whereas
+    // Winsock and Linux normalize this boolean socket option to 1. Verify the
+    // enabled state, then exercise both transitions on Darwin so accepting its
+    // native boolean representation cannot conceal a missing setsockopt call.
+    try check(if (builtin.os.tag == .macos) value != 0 else value == 1);
+    if (builtin.os.tag == .macos) {
+        phase = "TCP_NODELAY transitions";
+        const disabled: c_int = 0;
+        try check(std.c.setsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, &disabled, @sizeOf(c_int)) == 0);
+        var len: std.c.socklen_t = @sizeOf(c_int);
+        value = -1;
+        try check(std.c.getsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, &value, &len) == 0);
+        try check(value == 0);
+        const enabled: c_int = 1;
+        try check(std.c.setsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, &enabled, @sizeOf(c_int)) == 0);
+        len = @sizeOf(c_int);
+        try check(std.c.getsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, &value, &len) == 0);
+        try check(value != 0);
+    }
 }
 
 fn backpressure(listener: tcp.Socket, port: u16) !void {
