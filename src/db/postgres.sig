@@ -1,7 +1,9 @@
 //! PostgreSQL v3 wire protocol over caller-owned input/output buffers (Layer 1).
-//! No socket, allocator, std, borrowed statement, or borrowed parameter storage.
-//! Trust authentication is intended for a caller that binds to a trusted interface.
+//! No socket, allocator, borrowed statement, or borrowed parameter storage.
+//! Configure SCRAM before startup for credential authentication. Trust mode is
+//! intended only for a caller that explicitly binds to a trusted interface.
 //! SQL semantics are those provided by DB; unsupported features return SQLSTATE.
+const scram = @import("scram");
 pub const max_packet: usize = 16384;
 pub const sql_capacity: usize = 4096;
 pub const statement_capacity: usize = 8;
@@ -180,11 +182,20 @@ pub fn Session(comptime DB: type) type {
         };
         startup: bool = false,
         failed: bool = false,
+        authentication: ?scram.Server = null,
         statements: [statement_capacity]Statement = @splat(.{}),
         portals: [portal_capacity]Portal = @splat(.{}),
         result: DB.Result = .{},
         active_portal: ?usize = null,
         commit_rolled_back: bool = false,
+
+        /// Copy a verifier and a fresh CSPRNG nonce before any startup bytes.
+        /// Every accepted connection needs its own unpredictable nonce; the
+        /// protocol layer intentionally owns no RNG or transport configuration.
+        pub fn configureAuthentication(self: *Self, verifier: *const scram.Verifier, server_nonce: []const u8) scram.Error!void {
+            if (self.startup or self.authentication != null) return error.AuthenticationState;
+            self.authentication = try scram.Server.init(verifier, server_nonce);
+        }
 
         /// An output of this size is sufficient before any SQL mutation occurs.
         pub fn responseCapacity() usize {
@@ -193,6 +204,7 @@ pub fn Session(comptime DB: type) type {
 
         pub fn handle(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
             if (output.len < responseCapacity()) return error.BufferTooSmall;
+            if (self.authentication) |*auth| if (auth.state == .failed) return .{ .close = true };
             const prefix: usize = if (self.startup) 1 else 0;
             if (input.len < prefix + 4) return .{};
             const size = read32(input[prefix..][0..4]);
@@ -212,6 +224,13 @@ pub fn Session(comptime DB: type) type {
                 self.handshake(input[4..total], &w) catch |err| {
                     w.at = 0;
                     try failure(&w, sqlstate(err), @errorName(err));
+                    close = true;
+                };
+            } else if (self.authentication != null and self.authentication.?.state != .complete) {
+                self.authenticate(input[0], input[5..total], &w) catch {
+                    self.authentication.?.state = .failed;
+                    w.at = 0;
+                    try authenticationFailure(&w);
                     close = true;
                 };
             } else {
@@ -236,16 +255,57 @@ pub fn Session(comptime DB: type) type {
                 return;
             }
             if (version != 196608) return error.UnsupportedProtocol;
-            var user = false;
+            var user: ?[]const u8 = null;
             while (true) {
                 const key = try r.string();
                 if (key.len == 0) break;
                 const value = try r.string();
-                if (equal(key, "user")) user = value.len != 0;
+                if (equal(key, "user")) {
+                    if (user != null) return error.ProtocolViolation;
+                    user = value;
+                }
                 if (equal(key, "client_encoding") and !equal(value, "UTF8") and !equal(value, "UTF-8")) return error.UnsupportedEncoding;
             }
             try r.done();
-            if (!user) return error.UserRequired;
+            if (user == null or user.?.len == 0) return error.UserRequired;
+            if (self.authentication) |*auth| {
+                auth.setUsername(user.?);
+                const p = try w.begin('R');
+                try w.u32be(10);
+                try w.string(scram.mechanism);
+                try w.byte(0);
+                w.end(p);
+                self.startup = true;
+                return;
+            }
+            try self.authenticationComplete(w);
+        }
+        fn authenticate(self: *Self, tag: u8, payload: []const u8, w: *Writer) !void {
+            if (tag != 'p' or payload.len > scram.max_message + 64) return error.AuthenticationFailed;
+            const auth = &self.authentication.?;
+            var message: [512]u8 = undefined;
+            if (auth.state == .initial) {
+                var r: Reader = .{ .bytes = payload };
+                if (!equal(try r.string(), scram.mechanism)) return error.AuthenticationFailed;
+                const length = try r.u32be();
+                if (length > scram.max_message) return error.AuthenticationFailed;
+                const first = try r.take(length);
+                try r.done();
+                const challenge = try auth.start(first, &message);
+                const p = try w.begin('R');
+                try w.u32be(11);
+                try w.append(challenge);
+                w.end(p);
+            } else if (auth.state == .challenge) {
+                const final = try auth.finish(payload, &message);
+                const p = try w.begin('R');
+                try w.u32be(12);
+                try w.append(final);
+                w.end(p);
+                try self.authenticationComplete(w);
+            } else return error.AuthenticationFailed;
+        }
+        fn authenticationComplete(self: *Self, w: *Writer) !void {
             const auth = try w.begin('R');
             try w.u32be(0);
             w.end(auth);
@@ -721,6 +781,19 @@ fn failure(w: *Writer, state: []const u8, message: []const u8) !void {
     try w.byte(0);
     w.end(p);
 }
+fn authenticationFailure(w: *Writer) !void {
+    const p = try w.begin('E');
+    try w.byte('S');
+    try w.string("FATAL");
+    try w.byte('V');
+    try w.string("FATAL");
+    try w.byte('C');
+    try w.string("28P01");
+    try w.byte('M');
+    try w.string("password authentication failed");
+    try w.byte(0);
+    w.end(p);
+}
 fn sqlstate(err: anyerror) []const u8 {
     const name = @errorName(err);
     if (equal(name, "TableNotFound")) return "42P01";
@@ -738,6 +811,9 @@ fn sqlstate(err: anyerror) []const u8 {
     if (equal(name, "DuplicatePortal")) return "42P03";
     if (equal(name, "TransactionFailed")) return "25P02";
     if (equal(name, "DatabaseBusy")) return "55P03";
+    if (equal(name, "SerializationFailure")) return "40001";
+    if (equal(name, "TransactionCapacity") or equal(name, "TransactionLogCapacity")) return "53200";
+    if (equal(name, "StorageUnavailable") or equal(name, "StorageFailure") or equal(name, "FileWriteFailed") or equal(name, "FileSyncFailed") or equal(name, "FileTruncateFailed") or equal(name, "WriterPoisoned")) return "58030";
     if (equal(name, "Syntax")) return "42601";
     if (equal(name, "UnsupportedStatement") or equal(name, "UnsupportedMessage") or equal(name, "UnsupportedProtocol") or equal(name, "UnsupportedEncoding") or equal(name, "UnsupportedBinaryType")) return "0A000";
     return "54000";

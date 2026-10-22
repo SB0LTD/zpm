@@ -6,11 +6,13 @@ owns the listeners, capacity profile and reactor policy.
 - `sql` (Layer 0): owned schemas/rows, fixed primary-key hash index, typed SQL.
 - `db_store` (Layer 0): a generic `Store(RawDatabase)` and per-connection adapter.
 - `postgres`, `mysql`, `tds` (Layer 1): pure, socket-independent wire sessions.
+- `scram`, `durable_log` (Layer 0): authentication state and portable committed WAL frames.
+- `db_file`, `entropy` (Layer 1): native durable files and cryptographic entropy.
 - `tcp_server` (Layer 1): nonblocking Winsock/Linux syscall socket primitives.
 
 All storage is fixed or caller-owned, and runtime code is Sig. Wire codecs
 have no allocator or socket dependencies. Native platform bindings belong only
-to the TCP primitive. Lower layers do not import RAMSQL.
+to platform primitives. Lower layers do not import RAMSQL.
 
 ## Session API and framing
 
@@ -41,20 +43,41 @@ quoted strings, identifiers and comments. Other RPC and unsupported data types
 return errors.
 
 These are bounded compatibility subsets, not complete SQL dialect or catalog
-implementations. The current trust/empty-password sessions have no TLS and are
-intended only for callers that enforce loopback/trusted-interface policy.
+implementations. PostgreSQL optionally enforces SCRAM-SHA-256: import `scram`,
+construct/import a Verifier, and call configureAuthentication with a fresh native
+CSPRNG nonce before startup. Default sessions retain trust for explicit test
+callers. MySQL/TDS still require an external trusted-interface policy. TLS and
+SCRAM channel binding are not implemented.
 
-## Shared transactions
+## Transactions and durability
 
-`Store(Raw)` owns one database, one fixed snapshot and a transaction owner.
-Every `Connection` must have a unique nonzero `id`. Ordinary statements do not
-copy the database. BEGIN copies once into the snapshot and owns the store;
-other connections receive DatabaseBusy until COMMIT/ROLLBACK. Rollback and
-disconnect restore the snapshot; failed PostgreSQL transactions cannot run
-further statements until rollback. This is serialized isolation, not MVCC.
+`Store(Raw)` owns committed state and a generation. Each connection needs a
+unique nonzero id and a distinct caller-owned `transaction_workspace`. BEGIN
+copies committed state into this workspace. Changes remain private; writing
+commits fail with SerializationFailure if another commit changed the generation.
+Read-only commits do not conflict. Disconnect discards private state. This
+conservative optimistic isolation differs from PostgreSQL READ COMMITTED.
 
-Store methods reject the reserved zero connection id. A default/invalid
-connection cannot commit or roll back another connection's committed state.
+Durable callers supply `autocommit_workspace`, `commit_ctx`, `commit_fn`, and
+set `durability_required`. Each connection also supplies a bounded
+`transaction_log`. Commit batches use repeated little-endian u32 length + SQL
+bytes; `BatchIterator` validates them without splitting literals or comments.
+The synchronous hook must persist a complete batch before returning. The store
+publishes only after hook success. Hook failure poisons subsequent writes.
+Read-only statements do not copy the database; durable writes prepare a candidate.
+
+`durable_log.append` writes a versioned checksummed header, payload and commit
+trailer, then syncs. `recover` checks complete records, contiguous sequences and
+checksums before replay. Only an incomplete physical tail is truncated; complete
+corruption and semantic replay failures abort recovery. Callers must replay each
+batch atomically. `db_file.File` holds an exclusive writer lock on Windows/Linux,
+provides complete append/fsync/truncate, and poisons failed writers. Atomic file
+publication helpers are for caller-validated backups/snapshots; never replace
+an active WAL inode or truncate it without a persisted sequence anchor.
+
+Runtime wiring and storage lifecycle remain product policy in RAMSQL. WAL v1
+replays SQL, so upgrades must preserve parser/type semantics or migrate formats.
+Capacity must cover every historical state, including rows later deleted.
 
 ## TCP API
 

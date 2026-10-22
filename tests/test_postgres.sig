@@ -1,6 +1,7 @@
 //! Executable PostgreSQL protocol contracts, including malformed framing.
 const std = @import("std");
 const pg = @import("postgres");
+const scram = @import("scram");
 const sql = @import("sql");
 const Raw = sql.Database(.{ .tables = 2, .columns = 4, .rows_per_table = 4, .text_bytes = 64 });
 const DB = struct {
@@ -8,8 +9,13 @@ const DB = struct {
     raw: Raw = .{},
     snapshot: Raw = .{},
     status: u8 = 'I',
+    forced_error: ?anyerror = null,
     pub fn execute(self: *@This(), source: []const u8, result: *Result) !void {
         if (self.status == 'E') return error.TransactionFailed;
+        if (self.forced_error) |err| {
+            self.failTransaction();
+            return err;
+        }
         self.raw.execute(source, result) catch |err| {
             self.failTransaction();
             return err;
@@ -412,6 +418,134 @@ fn malformed() !void {
     const missing_reply = try s2.handle(&db, missing, &output);
     try check(missing_reply.close and !s2.startup);
 }
+const scram_verifier = "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=";
+const scram_nonce = "%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+const scram_first = "n,,n=user,r=rOprNGfwEbeRWgbNEkqO";
+const scram_final = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=";
+fn authStartup(s: *Session, db: *DB, username: []const u8) !void {
+    var p = Packet.init(0);
+    p.len = 4;
+    p.number32(196608);
+    p.string("user");
+    p.string(username);
+    p.byte(0);
+    put32(p.bytes[0..4], @intCast(p.len));
+    const reply = try s.handle(db, p.bytes[0..p.len], &output);
+    try check(reply.consumed == p.len and s.startup and !reply.close);
+    var frames: Frames = .{ .bytes = output[0..reply.written] };
+    const request = (try frames.next()) orelse return error.MissingAuthenticationRequest;
+    try check(request.tag == 'R' and u32be(request.body[0..4]) == 10);
+    try check(equal(request.body[4..], "SCRAM-SHA-256\x00\x00"));
+    try check((try frames.next()) == null);
+    try check(s.authentication.?.state == .initial);
+}
+fn authFirst(s: *Session, db: *DB) !void {
+    var p = Packet.init('p');
+    p.string(scram.mechanism);
+    p.number32(scram_first.len);
+    p.append(scram_first);
+    const bytes = p.slice();
+    for (0..bytes.len) |i| {
+        const partial = try s.handle(db, bytes[0..i], &output);
+        try check(partial.consumed == 0 and partial.written == 0 and s.authentication.?.state == .initial);
+    }
+    const reply = try s.handle(db, bytes, &output);
+    try check(!reply.close and reply.consumed == bytes.len);
+    var frames: Frames = .{ .bytes = output[0..reply.written] };
+    const challenge = (try frames.next()) orelse return error.MissingChallenge;
+    try check(challenge.tag == 'R' and u32be(challenge.body[0..4]) == 11);
+    try check(equal(challenge.body[4..], "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"));
+    try check((try frames.next()) == null);
+}
+fn authenticationContracts() !void {
+    var db: DB = .{};
+    var v = try scram.Verifier.parse("user", scram_verifier);
+    var s: Session = .{};
+    try s.configureAuthentication(&v, scram_nonce);
+    // Configuration owns credential bytes, rather than borrowing caller state.
+    v.stored_key[0] ^= 1;
+    try authStartup(&s, &db, "user");
+    try authFirst(&s, &db);
+    var final = Packet.init('p');
+    final.append(scram_final);
+    const success = try send(&s, &db, &final);
+    try tags(success, "RRSSSSSSSKZ");
+    var frames: Frames = .{ .bytes = success };
+    const signature = (try frames.next()).?;
+    try check(u32be(signature.body[0..4]) == 12);
+    try check(equal(signature.body[4..], "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="));
+    const ok = (try frames.next()).?;
+    try check(u32be(ok.body[0..4]) == 0 and s.authentication.?.state == .complete);
+    try tags(try query(&s, &db, "CREATE TABLE authenticated (id INTEGER PRIMARY KEY)"), "CZ");
+    if (s.configureAuthentication(&v, scram_nonce)) |_| return error.AuthenticationReconfigured else |err| try check(err == error.AuthenticationState);
+    v = try scram.Verifier.parse("user", scram_verifier);
+    var wrong_user: Session = .{};
+    try wrong_user.configureAuthentication(&v, scram_nonce);
+    try authStartup(&wrong_user, &db, "unknown-user");
+    try authFirst(&wrong_user, &db);
+    const invalid = try wrong_user.handle(&db, final.slice(), &output);
+    try check(invalid.close and wrong_user.authentication.?.state == .failed);
+    try state(output[0..invalid.written], "28P01");
+    try tags(output[0..invalid.written], "E");
+    // No SQL, synchronization, prepared statement or replay can bypass auth.
+    for ([_]u8{ 'Q', 'P', 'S', 'X', '?' }) |tag| {
+        var pending: Session = .{};
+        try pending.configureAuthentication(&v, scram_nonce);
+        try authStartup(&pending, &db, "user");
+        var packet = Packet.init(tag);
+        if (tag == 'Q') packet.string("DROP TABLE authenticated");
+        const rejected = try pending.handle(&db, packet.slice(), &output);
+        try check(rejected.close and pending.authentication.?.state == .failed);
+        try state(output[0..rejected.written], "28P01");
+        const closed = try pending.handle(&db, final.slice(), &output);
+        try check(closed.close and closed.written == 0);
+    }
+    for (0..5) |case| {
+        var pending: Session = .{};
+        try pending.configureAuthentication(&v, scram_nonce);
+        try authStartup(&pending, &db, "user");
+        var packet = Packet.init('p');
+        packet.string(if (case == 0) "PLAIN" else scram.mechanism);
+        packet.number32(if (case == 1) 0xffffffff else if (case == 2) 10000 else if (case == 3) 0 else scram_first.len);
+        packet.append(if (case == 4) "bad-client-first" else scram_first);
+        const rejected = try pending.handle(&db, packet.slice(), &output);
+        try check(rejected.close);
+        try state(output[0..rejected.written], "28P01");
+    }
+    var bad_password: Session = .{};
+    try bad_password.configureAuthentication(&v, scram_nonce);
+    try authStartup(&bad_password, &db, "user");
+    try authFirst(&bad_password, &db);
+    final.bytes[final.len - 4] ^= 1;
+    const failed = try bad_password.handle(&db, final.slice(), &output);
+    try check(failed.close);
+    try state(output[0..failed.written], "28P01");
+    try tags(try query(&s, &db, "SELECT * FROM authenticated"), "TCZ");
+}
+fn backendErrorStates() !void {
+    var db: DB = .{};
+    var s: Session = .{};
+    try startup(&s, &db);
+    const Case = struct { err: anyerror, state: []const u8 };
+    const errors = [_]Case{
+        .{ .err = error.SerializationFailure, .state = "40001" },
+        .{ .err = error.TransactionCapacity, .state = "53200" },
+        .{ .err = error.TransactionLogCapacity, .state = "53200" },
+        .{ .err = error.StorageUnavailable, .state = "58030" },
+        .{ .err = error.StorageFailure, .state = "58030" },
+        .{ .err = error.FileWriteFailed, .state = "58030" },
+        .{ .err = error.FileSyncFailed, .state = "58030" },
+        .{ .err = error.FileTruncateFailed, .state = "58030" },
+        .{ .err = error.WriterPoisoned, .state = "58030" },
+    };
+    for (errors) |case| {
+        db.forced_error = case.err;
+        const response = try query(&s, &db, "CREATE TABLE rejected (id INTEGER)");
+        try state(response, case.state);
+        try tags(response, "EZ");
+        try check(db.raw.tableCount() == 0);
+    }
+}
 fn fuzz() !void {
     var db: DB = .{};
     var s: Session = .{};
@@ -441,6 +575,8 @@ pub fn main(init: std.process.Init) !void {
     try inference();
     try statementLifecycle();
     try malformed();
+    try authenticationContracts();
+    try backendErrorStates();
     try fuzz();
     var report: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&report, "{{\"suite\":\"postgres\",\"pass\":true,\"assertions\":{d},\"packets\":{d},\"fuzz_inputs\":{d},\"session_bytes\":{d}}}\n", .{ assertions, packets, fuzz_inputs, @sizeOf(Session) });

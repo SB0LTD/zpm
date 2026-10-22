@@ -84,7 +84,8 @@ const Reader = struct {
 
 fn handshakeAndFragmentation() !void {
     store = .{};
-    var db: DB = .{ .store = &store, .id = 1 };
+    var workspace: Raw = .{};
+    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
     var session: Session = .{};
     var tiny: [1]u8 = undefined;
     if (session.begin(&tiny)) |_| return error.ShortGreetingAccepted else |err| try check(err == error.BufferTooSmall);
@@ -108,7 +109,8 @@ fn handshakeAndFragmentation() !void {
 
 fn typedResultsAndErrors() !void {
     store = .{};
-    var db: DB = .{ .store = &store, .id = 1 };
+    var workspace: Raw = .{};
+    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
     var session: Session = .{};
     try connect(&session, &db);
     _ = try command(&session, &db, "CREATE TABLE data (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN, note TEXT)");
@@ -153,7 +155,8 @@ fn typedResultsAndErrors() !void {
 
 fn transactionsAndOutputPreflight() !void {
     store = .{};
-    var db: DB = .{ .store = &store, .id = 1 };
+    var workspace: Raw = .{};
+    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
     var session: Session = .{};
     try connect(&session, &db);
     _ = try command(&session, &db, "SET AUTOCOMMIT = 0");
@@ -175,7 +178,8 @@ fn transactionsAndOutputPreflight() !void {
 
 fn malformedAndFuzz() !void {
     store = .{};
-    var db: DB = .{ .store = &store, .id = 1 };
+    var workspace: Raw = .{};
+    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
     var scratch: [256]u8 = undefined;
     var session: Session = .{};
     _ = try session.begin(&output);
@@ -209,6 +213,40 @@ fn malformedAndFuzz() !void {
     }
 }
 
+fn concurrentCommittedVisibility() !void {
+    store = .{};
+    var first_workspace: Raw = .{};
+    var second_workspace: Raw = .{};
+    var first: DB = .{ .store = &store, .id = 1, .transaction_workspace = &first_workspace };
+    var second: DB = .{ .store = &store, .id = 2, .transaction_workspace = &second_workspace };
+    var a: Session = .{};
+    var b: Session = .{};
+    try connect(&a, &first);
+    try connect(&b, &second);
+    _ = try command(&a, &first, "CREATE TABLE views (id INTEGER PRIMARY KEY)");
+    _ = try command(&a, &first, "INSERT INTO views VALUES (1)");
+    _ = try command(&a, &first, "BEGIN");
+    try check(first.transactionStatus() == 'T');
+    _ = try command(&a, &first, "UPDATE views SET id = 2 WHERE id = 1");
+    _ = try command(&b, &second, "SELECT id FROM views");
+    try check(b.result.row_count == 1 and b.result.rows[0].cells[0].integer == 1);
+    _ = try command(&b, &second, "UPDATE views SET id = 3 WHERE id = 1");
+    try check(output[4] == 0 and second.transactionStatus() == 'I');
+    _ = try command(&a, &first, "SELECT id FROM views");
+    try check(a.result.rows[0].cells[0].integer == 2);
+    _ = try command(&a, &first, "COMMIT");
+    try check(output[4] == 0xff and first.transactionStatus() == 'E');
+    _ = try command(&a, &first, "ROLLBACK");
+    _ = try command(&a, &first, "SELECT id FROM views");
+    try check(first.transactionStatus() == 'I' and a.result.rows[0].cells[0].integer == 3);
+    _ = try command(&a, &first, "BEGIN");
+    _ = try command(&a, &first, "UPDATE views SET id = 4 WHERE id = 3");
+    _ = try command(&a, &first, "COMMIT");
+    try check(output[4] == 0 and first.transactionStatus() == 'I');
+    _ = try command(&b, &second, "SELECT id FROM views");
+    try check(b.result.rows[0].cells[0].integer == 4);
+}
+
 fn connectReady(session: *Session, db: *DB) !void {
     var scratch: [128]u8 = undefined;
     _ = try session.handle(db, packet(auth(&scratch, "", "ramsql"), 1), &output);
@@ -219,6 +257,7 @@ pub fn main(init: std.process.Init) !void {
     try handshakeAndFragmentation();
     try typedResultsAndErrors();
     try transactionsAndOutputPreflight();
+    try concurrentCommittedVisibility();
     try malformedAndFuzz();
     var buffer: [256]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"mysql\",\"pass\":true,\"assertions\":{d},\"fuzz_inputs\":{d}}}\n", .{ assertions, fuzz_inputs });
