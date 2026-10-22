@@ -58,13 +58,18 @@ commits fail with SerializationFailure if another commit changed the generation.
 Read-only commits do not conflict. Disconnect discards private state. This
 conservative optimistic isolation differs from PostgreSQL READ COMMITTED.
 
-Durable callers supply `autocommit_workspace`, `commit_ctx`, `commit_fn`, and
+Durable callers supply `commit_ctx`, `commit_fn`, and
 set `durability_required`. Each connection also supplies a bounded
 `transaction_log`. Commit batches use repeated little-endian u32 length + SQL
 bytes; `BatchIterator` validates them without splitting literals or comments.
 The synchronous hook must persist a complete batch before returning. The store
 publishes only after hook success. Hook failure poisons subsequent writes.
-Read-only statements do not copy the database; durable writes prepare a candidate.
+Read-only statements do not copy the database. For Raw adapters providing
+`executeWithCommit`, durable autocommit uses its validated mutation boundary:
+flush the framed statement, then apply it without copying any database state.
+It needs no `autocommit_workspace`. Older Raw adapters still require a distinct
+caller-owned `autocommit_workspace` and use candidate preparation/publication.
+Explicit transactions retain private snapshots and generation conflict checks.
 
 `durable_log.append` writes a versioned checksummed header, payload and commit
 trailer, then syncs. `recover` checks complete records, contiguous sequences and

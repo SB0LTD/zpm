@@ -368,11 +368,115 @@ fn framing() !void {
     if (invalid_tail.next()) |_| return error.MalformedTailAccepted else |err| try check(err == error.InvalidCommitBatch);
 }
 
+// This adapter counts the actual snapshot API calls. It prevents a regression
+// that silently reintroduces whole-database copies on durable point writes.
+const TrackedDB = struct {
+    pub const Result = DB.Result;
+    database: DB = .{},
+    pub var copies: usize = 0;
+
+    pub fn copyFrom(self: *@This(), source: *const @This()) void {
+        copies += 1;
+        self.database.copyFrom(&source.database);
+    }
+
+    pub fn execute(self: *@This(), source: []const u8, result: *Result) !void {
+        try self.database.execute(source, result);
+    }
+
+    pub fn executeWithCommit(self: *@This(), source: []const u8, result: *Result, context: ?*anyopaque, commit: *const fn (?*anyopaque) anyerror!void) anyerror!void {
+        try self.database.executeWithCommit(source, result, context, commit);
+    }
+};
+
+// Existing non-SQL adapters must retain the candidate path. This deliberately
+// does not provide executeWithCommit.
+const LegacyDB = struct {
+    pub const Result = DB.Result;
+    database: DB = .{},
+
+    pub fn copyFrom(self: *@This(), source: *const @This()) void {
+        self.database.copyFrom(&source.database);
+    }
+
+    pub fn execute(self: *@This(), source: []const u8, result: *Result) !void {
+        try self.database.execute(source, result);
+    }
+};
+
+const CountingSink = struct {
+    calls: usize = 0,
+    statements: usize = 0,
+    fail: bool = false,
+
+    fn commit(context: ?*anyopaque, batch: []const u8) anyerror!void {
+        const self: *CountingSink = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        if (self.fail) return error.InjectedStorageFailure;
+        var iterator = store_module.BatchIterator{ .bytes = batch };
+        while (try iterator.next()) |_| self.statements += 1;
+    }
+};
+
+fn mutationBoundaryStore() !void {
+    const TrackedStore = store_module.Store(TrackedDB);
+    var sink: CountingSink = .{};
+    var store: TrackedStore = .{ .durability_required = true, .commit_ctx = &sink, .commit_fn = CountingSink.commit };
+    var connection = TrackedStore.Connection{ .store = &store, .id = 1 };
+    var result: DB.Result = .{};
+    TrackedDB.copies = 0;
+    try connection.execute("CREATE TABLE t (id INT PRIMARY KEY, value TEXT)", &result);
+    try connection.execute("INSERT INTO t VALUES (1, 'one')", &result);
+    try connection.execute("UPDATE t SET value = 'two' WHERE id = 1", &result);
+    try connection.execute("SELECT * FROM t WHERE id = 1", &result);
+    try check(result.row_count == 1 and equal(result.rows[0].cells[1].text.slice(), "two"));
+    try check(TrackedDB.copies == 0 and store.autocommit_workspace == null);
+    try check(sink.calls == 3 and sink.statements == 3 and store.generation == 3);
+    if (connection.execute("INSERT INTO t VALUES (1, 'duplicate')", &result)) |_| return error.InvalidMutationPersisted else |err| try check(err == error.PrimaryKeyViolation);
+    if (connection.execute("DELETE FROM t trailing", &result)) |_| return error.InvalidMutationPersisted else |err| try check(err == error.Syntax);
+    try check(sink.calls == 3 and !store.storage_failed and TrackedDB.copies == 0);
+    sink.fail = true;
+    result.affected_rows = 91;
+    if (connection.execute("DELETE FROM t", &result)) |_| return error.CommitFailureIgnored else |err| try check(err == error.InjectedStorageFailure);
+    try check(store.storage_failed and store.generation == 3 and result.affected_rows == 91);
+    try connection.execute("SELECT * FROM t WHERE id = 1", &result);
+    try check(result.row_count == 1 and equal(result.rows[0].cells[1].text.slice(), "two"));
+    try check(TrackedDB.copies == 0 and sink.calls == 4);
+
+    store.storage_failed = false;
+    sink.fail = false;
+    var workspace: TrackedDB = .{};
+    var log: [1024]u8 = undefined;
+    connection.transaction_workspace = &workspace;
+    connection.transaction_log = &log;
+    try connection.beginTransaction();
+    try check(TrackedDB.copies == 1);
+    try connection.execute("INSERT INTO t VALUES (2, 'private')", &result);
+    try connection.commitTransaction();
+    try check(TrackedDB.copies == 2 and store.generation == 4 and sink.calls == 5);
+
+    const LegacyStore = store_module.Store(LegacyDB);
+    var legacy: LegacyStore = .{ .durability_required = true, .commit_ctx = &sink, .commit_fn = CountingSink.commit };
+    var legacy_connection = LegacyStore.Connection{ .store = &legacy, .id = 1 };
+    if (legacy_connection.execute("CREATE TABLE t (id INT)", &result)) |_| return error.MissingCandidateAccepted else |err| try check(err == error.TransactionCapacity);
+    var candidate: LegacyDB = .{};
+    legacy.autocommit_workspace = &candidate;
+    try legacy_connection.execute("CREATE TABLE t (id INT)", &result);
+    try legacy_connection.execute("INSERT INTO t VALUES (7)", &result);
+    try legacy_connection.execute("SELECT * FROM t", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 7);
+    sink.fail = true;
+    if (legacy_connection.execute("DELETE FROM t", &result)) |_| return error.LegacyFailureIgnored else |err| try check(err == error.InjectedStorageFailure);
+    try legacy_connection.execute("SELECT * FROM t", &result);
+    try check(result.row_count == 1 and legacy.storage_failed and legacy.generation == 2);
+}
+
 pub fn main() !void {
     try transactions();
     try durability();
     try interleavings();
     try framing();
+    try mutationBoundaryStore();
     try check(assertions >= 2000);
     std.debug.print("store: {d} assertions passed\n", .{assertions});
 }

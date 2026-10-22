@@ -226,13 +226,41 @@ pub fn Database(comptime config: Config) type {
         /// Result contains copied SELECT rows or a mutation's affected_rows.
         /// Any error preserves the previous result and the whole database.
         pub fn execute(self: *Self, source: []const u8, result: *Result) Error!void {
+            return self.executeInternal(source, result, NoCommit{});
+        }
+
+        const NoCommit = struct {
+            fn before(_: @This()) Error!void {}
+        };
+
+        const CommitBoundary = struct {
+            context: ?*anyopaque,
+            commit: *const fn (?*anyopaque) anyerror!void,
+
+            fn before(self: @This()) anyerror!void {
+                try self.commit(self.context);
+            }
+        };
+
+        /// Validate the entire statement before calling commit, then publish its
+        /// mutation without any further fallible operation. SELECT never calls
+        /// commit. Failed validation or commit preserves the database and result.
+        /// The caller serializes access through the complete call. The callback
+        /// must not mutate this database, source, or result, or reenter a write;
+        /// read-only observation is permitted. The callback normally
+        /// flushes a WAL record. No database snapshot or heap storage is needed.
+        pub fn executeWithCommit(self: *Self, source: []const u8, result: *Result, context: ?*anyopaque, commit: *const fn (?*anyopaque) anyerror!void) anyerror!void {
+            return self.executeInternal(source, result, CommitBoundary{ .context = context, .commit = commit });
+        }
+
+        fn executeInternal(self: *Self, source: []const u8, result: *Result, boundary: anytype) !void {
             var parser = Parser{ .source = source };
-            if (parser.takeWord("CREATE")) return self.create(&parser, result);
-            if (parser.takeWord("DROP")) return self.drop(&parser, result);
-            if (parser.takeWord("INSERT")) return self.insert(&parser, result);
+            if (parser.takeWord("CREATE")) return self.create(&parser, result, boundary);
+            if (parser.takeWord("DROP")) return self.drop(&parser, result, boundary);
+            if (parser.takeWord("INSERT")) return self.insert(&parser, result, boundary);
             if (parser.takeWord("SELECT")) return self.select(&parser, result);
-            if (parser.takeWord("UPDATE")) return self.update(&parser, result);
-            if (parser.takeWord("DELETE")) return self.delete(&parser, result);
+            if (parser.takeWord("UPDATE")) return self.update(&parser, result, boundary);
+            if (parser.takeWord("DELETE")) return self.delete(&parser, result, boundary);
             return error.UnsupportedStatement;
         }
 
@@ -304,7 +332,7 @@ pub fn Database(comptime config: Config) type {
             return null;
         }
 
-        fn create(self: *Self, parser: *Parser, result: *Result) Error!void {
+        fn create(self: *Self, parser: *Parser, result: *Result, boundary: anytype) !void {
             try parser.expectWord("TABLE");
             const name = try parser.name();
             for (&self.tables) |*table|
@@ -355,6 +383,7 @@ pub fn Database(comptime config: Config) type {
             };
             const index = destination orelse return error.TableCapacity;
             const table = &self.tables[index];
+            try boundary.before();
             table.live = true;
             table.name = name;
             table.column_count = count;
@@ -369,11 +398,12 @@ pub fn Database(comptime config: Config) type {
             result.clear(0);
         }
 
-        fn drop(self: *Self, parser: *Parser, result: *Result) Error!void {
+        fn drop(self: *Self, parser: *Parser, result: *Result, boundary: anytype) !void {
             try parser.expectWord("TABLE");
             const name = try parser.name();
             const index = try self.tableIndex(&name);
             try parser.finish();
+            try boundary.before();
             self.tables[index].live = false;
             result.clear(0);
         }
@@ -397,7 +427,7 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
-        fn insert(self: *Self, parser: *Parser, result: *Result) Error!void {
+        fn insert(self: *Self, parser: *Parser, result: *Result, boundary: anytype) !void {
             try parser.expectWord("INTO");
             const name = try parser.name();
             const table = &self.tables[try self.tableIndex(&name)];
@@ -436,6 +466,7 @@ pub fn Database(comptime config: Config) type {
                 }
             }
             if (table.row_count == config.rows_per_table) return error.RowCapacity;
+            try boundary.before();
             table.rows[table.row_count] = row;
             indexRow(table, table.row_count);
             table.row_count += 1;
@@ -611,7 +642,7 @@ pub fn Database(comptime config: Config) type {
             };
         }
 
-        fn update(self: *Self, parser: *Parser, result: *Result) Error!void {
+        fn update(self: *Self, parser: *Parser, result: *Result, boundary: anytype) !void {
             const name = try parser.name();
             const table = &self.tables[try self.tableIndex(&name)];
             try parser.expectWord("SET");
@@ -629,19 +660,22 @@ pub fn Database(comptime config: Config) type {
             }
             const where = try filter(parser, table);
             try parser.finish();
-            var selected: [config.rows_per_table]bool = @splat(false);
+            var selected: [config.rows_per_table]bool = undefined;
             var affected: usize = 0;
+            var last_selected: usize = 0;
             if (primaryPredicate(table, &where)) |key| {
                 if (primaryLookup(table, key)) |index| {
                     if (matches(&table.rows[index], &where)) {
-                        selected[index] = true;
                         affected = 1;
+                        last_selected = index;
                     }
                 }
             } else {
+                @memset(&selected, false);
                 for (table.rows[0..table.row_count], 0..) |*row, index| if (matches(row, &where)) {
                     selected[index] = true;
                     affected += 1;
+                    last_selected = index;
                 };
             }
             // All assignments are literals. Assigning one primary-key value to
@@ -650,15 +684,22 @@ pub fn Database(comptime config: Config) type {
                 for (table.columns[0..table.column_count], 0..) |*column, index| {
                     if (!column.primary_key or !assigned[index]) continue;
                     if (affected > 1) return error.PrimaryKeyViolation;
-                    for (table.rows[0..table.row_count], 0..) |*row, row_index|
-                        if (!selected[row_index] and compare(&row.cells[index], &assignments.cells[index]) == 0) return error.PrimaryKeyViolation;
+                    if (primaryLookup(table, &assignments.cells[index])) |row_index|
+                        if (row_index != last_selected) return error.PrimaryKeyViolation;
                 }
             }
-            for (0..table.row_count) |row_index| if (selected[row_index]) {
+            try boundary.before();
+            if (affected == 1) {
                 for (0..table.column_count) |column| if (assigned[column]) {
-                    table.rows[row_index].cells[column] = assignments.cells[column];
+                    table.rows[last_selected].cells[column] = assignments.cells[column];
                 };
-            };
+            } else if (affected > 1) {
+                for (0..table.row_count) |row_index| if (selected[row_index]) {
+                    for (0..table.column_count) |column| if (assigned[column]) {
+                        table.rows[row_index].cells[column] = assignments.cells[column];
+                    };
+                };
+            }
             if (affected != 0) {
                 if (table.primary_column) |column| if (assigned[column]) {
                     rebuildIndex(table);
@@ -667,12 +708,13 @@ pub fn Database(comptime config: Config) type {
             result.clear(affected);
         }
 
-        fn delete(self: *Self, parser: *Parser, result: *Result) Error!void {
+        fn delete(self: *Self, parser: *Parser, result: *Result, boundary: anytype) !void {
             try parser.expectWord("FROM");
             const name = try parser.name();
             const table = &self.tables[try self.tableIndex(&name)];
             const where = try filter(parser, table);
             try parser.finish();
+            try boundary.before();
             var kept: usize = 0;
             const old_count = table.row_count;
             for (0..old_count) |index| {
@@ -680,7 +722,8 @@ pub fn Database(comptime config: Config) type {
                 if (kept != index) table.rows[kept] = table.rows[index];
                 kept += 1;
             }
-            for (kept..old_count) |index| table.rows[index] = .{};
+            // Discarded payloads are outside row_count and never observable.
+            // New INSERTs initialize their complete row before publication.
             table.row_count = kept;
             if (kept != old_count) rebuildIndex(table);
             result.clear(old_count - kept);

@@ -492,6 +492,94 @@ fn postgresIntegers() !void {
     cases += 1;
 }
 
+const BoundaryProbe = struct {
+    db: *DB,
+    result: *DB.Result,
+    before: DB = .{},
+    before_result: DB.Result = .{},
+    calls: usize = 0,
+    fail: bool = false,
+
+    fn commit(context: ?*anyopaque) anyerror!void {
+        const self: *BoundaryProbe = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        try check(equalResult(self.result, &self.before_result));
+        try check(self.db.tableCount() == self.before.tableCount());
+        // An observer at the persistence boundary must see the complete old
+        // state, including affected rows and indices, before publication.
+        for ([_][]const u8{ "SELECT * FROM t ORDER BY id", "SELECT * FROM u ORDER BY id" }) |query| {
+            var expected: DB.Result = .{};
+            var observed: DB.Result = .{};
+            if (self.before.execute(query, &expected)) |_| {
+                try self.db.execute(query, &observed);
+                try check(equalResult(&expected, &observed));
+            } else |err| {
+                if (self.db.execute(query, &observed)) |_| return error.EarlyPublication else |other| try check(err == other);
+            }
+        }
+        if (self.fail) return error.InjectedCommitFailure;
+    }
+};
+
+fn commitBoundary() !void {
+    var db: DB = .{};
+    var result: DB.Result = .{};
+    try db.execute("CREATE TABLE t (id INT PRIMARY KEY, value TEXT NOT NULL)", &result);
+    try db.execute("INSERT INTO t VALUES (1, 'old')", &result);
+    try db.execute("INSERT INTO t VALUES (2, 'two')", &result);
+    var probe = BoundaryProbe{ .db = &db, .result = &result };
+    const writes = [_][]const u8{
+        "CREATE TABLE u (id INT PRIMARY KEY)",
+        "INSERT INTO t VALUES (3, 'three')",
+        "UPDATE t SET value = 'changed' WHERE id = 1",
+        "UPDATE t SET id = 4 WHERE id = 1",
+        "UPDATE t SET value = 'none' WHERE id = 99",
+        "DELETE FROM t WHERE id = 2",
+        "DELETE FROM t WHERE id = 99",
+        "DROP TABLE t",
+        "CREATE TABLE t (id INT PRIMARY KEY, value TEXT NOT NULL)",
+        "INSERT INTO t VALUES (4, 'reused')",
+        "DROP TABLE u",
+    };
+    for (writes) |source| {
+        probe.before.copyFrom(&db);
+        probe.before_result = result;
+        const calls = probe.calls;
+        probe.fail = true;
+        if (db.executeWithCommit(source, &result, &probe, BoundaryProbe.commit)) |_| return error.CommitFailureIgnored else |err| try check(err == error.InjectedCommitFailure);
+        try check(probe.calls == calls + 1 and equalResult(&result, &probe.before_result));
+        probe.fail = false;
+        try db.executeWithCommit(source, &result, &probe, BoundaryProbe.commit);
+        try check(probe.calls == calls + 2);
+        // The same validated statement must produce the same logical database
+        // and affected-row result through ordinary execution and the boundary.
+        var expected: DB.Result = .{};
+        try probe.before.execute(source, &expected);
+        try check(equalResult(&expected, &result) and expected.affected_rows == result.affected_rows);
+        probe.before_result = result;
+        try BoundaryProbe.commit(&probe);
+    }
+    const invalid = [_][]const u8{
+        "CREATE TABLE t (id INT)", "CREATE TABLE u (id WRONG)",
+        "CREATE TABLE u (id INT); DROP TABLE t", "DROP TABLE t trailing",
+        "DROP TABLE missing", "INSERT INTO t VALUES (4, 'duplicate')",
+        "INSERT INTO t VALUES (5, NULL)", "INSERT INTO t VALUES (5, 17)",
+        "INSERT INTO t VALUES (5, 'bad'); DELETE FROM t",
+        "UPDATE t SET value = NULL", "UPDATE t SET missing = 1",
+        "UPDATE t SET id = 5 trailing", "DELETE FROM t trailing",
+        "DELETE FROM missing", "SELECT * FROM t; DELETE FROM t", "VACUUM",
+    };
+    const calls = probe.calls;
+    for (invalid) |source| {
+        if (db.executeWithCommit(source, &result, &probe, BoundaryProbe.commit)) |_| return error.InvalidSqlCommitted else |_| {}
+        try check(probe.calls == calls and equalResult(&result, &probe.before_result));
+    }
+    try db.executeWithCommit("SELECT * FROM t WHERE id = 4", &result, &probe, BoundaryProbe.commit);
+    try check(probe.calls == calls and result.row_count == 1);
+    try same(result.rows[0].cells[1].text.slice(), "reused");
+    cases += 1;
+}
+
 pub fn main(init: std.process.Init) !void {
     if (comptime @import("builtin").os.tag == .windows) {
         if (std.mem.indexOf(u16, init.minimal.args.vector, std.unicode.utf8ToUtf16LeStringLiteral("--prove-failure")) != null)
@@ -516,6 +604,7 @@ pub fn main(init: std.process.Init) !void {
     try snapshots();
     try nullOrdering();
     try postgresIntegers();
+    try commitBoundary();
     var buffer: [256]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql\",\"pass\":true,\"cases\":{d},\"assertions\":{d},\"statements\":{d},\"fuzz_inputs\":{d},\"database_bytes\":{d}}}\n", .{ cases, assertions, statements, fuzz_inputs, @sizeOf(DB) });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
