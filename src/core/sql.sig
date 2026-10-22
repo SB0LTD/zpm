@@ -23,6 +23,11 @@ pub const Config = struct {
     predicates: usize = 8,
     /// MySQL/MSSQL BIT clients encode booleans as integer 0/1.
     boolean_integers: bool = false,
+    /// MySQL-style ordering by default; PostgreSQL uses false (ASC NULLS LAST).
+    nulls_first_ascending: bool = true,
+    /// Preserve the library's historical 64-bit INTEGER by default. PostgreSQL
+    /// servers select 32; BIGINT always provides the full signed 64-bit range.
+    integer_bits: u8 = 64,
 };
 
 pub const Error = error{
@@ -44,7 +49,7 @@ pub const Error = error{
     IntegerOverflow,
 };
 
-pub const DataType = enum { integer, boolean, text };
+pub const DataType = enum { integer, integer32, boolean, text };
 
 fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;
@@ -80,12 +85,14 @@ fn bytesOrder(a: []const u8, b: []const u8) i8 {
 }
 
 pub fn Database(comptime config: Config) type {
+    if (config.integer_bits != 32 and config.integer_bits != 64) @compileError("SQL INTEGER width must be 32 or 64");
     if (config.tables == 0 or config.columns == 0 or config.rows_per_table == 0 or
         config.name_bytes == 0 or config.text_bytes == 0 or config.predicates == 0)
         @compileError("SQL capacities must be non-zero");
 
     return struct {
         const Self = @This();
+        pub const integer_type: DataType = if (config.integer_bits == 32) .integer32 else .integer;
 
         pub const Name = struct {
             bytes: [config.name_bytes]u8 = @splat(0),
@@ -137,6 +144,20 @@ pub fn Database(comptime config: Config) type {
                 self.row_count = 0;
                 self.affected_rows = affected;
             }
+
+            /// Copy the observable result, without touching unused capacity.
+            /// Destination may be uninitialized; inactive ranges stay unreadable.
+            pub fn copyFrom(self: *Result, source: *const Result) void {
+                if (self == source) return;
+                self.column_count = source.column_count;
+                self.row_count = source.row_count;
+                self.affected_rows = source.affected_rows;
+                @memcpy(self.column_names[0..source.column_count], source.column_names[0..source.column_count]);
+                @memcpy(self.column_types[0..source.column_count], source.column_types[0..source.column_count]);
+                for (0..source.row_count) |row| {
+                    @memcpy(self.rows[row].cells[0..source.column_count], source.rows[row].cells[0..source.column_count]);
+                }
+            }
         };
 
         const index_capacity = blk: {
@@ -173,6 +194,25 @@ pub fn Database(comptime config: Config) type {
         /// Includes all caller-owned table, schema and text storage.
         pub fn storageBytes() usize {
             return @sizeOf(Self);
+        }
+
+        /// Copy a complete logical snapshot into distinct caller-owned storage.
+        /// Only live tables, schemas, rows and indices are observable. Inactive
+        /// table payloads and unused row capacity need neither copying nor zeroing.
+        /// All operations must continue to respect live/column_count/row_count.
+        pub fn copyFrom(self: *Self, source: *const Self) void {
+            if (self == source) return;
+            for (&self.tables, &source.tables) |*destination, *table| {
+                destination.live = table.live;
+                if (!table.live) continue;
+                destination.name = table.name;
+                destination.column_count = table.column_count;
+                destination.row_count = table.row_count;
+                destination.primary_column = table.primary_column;
+                @memcpy(destination.columns[0..table.column_count], table.columns[0..table.column_count]);
+                @memcpy(destination.rows[0..table.row_count], table.rows[0..table.row_count]);
+                if (table.primary_column != null) destination.primary_index = table.primary_index;
+            }
         }
 
         pub fn tableCount(self: *const Self) usize {
@@ -279,6 +319,8 @@ pub fn Database(comptime config: Config) type {
                 for (columns[0..count]) |*previous|
                     if (same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
                 if (parser.takeWord("INTEGER") or parser.takeWord("INT")) {
+                    column.data_type = integer_type;
+                } else if (parser.takeWord("BIGINT") or parser.takeWord("INT8")) {
                     column.data_type = .integer;
                 } else if (parser.takeWord("BOOLEAN") or parser.takeWord("BOOL")) {
                     column.data_type = .boolean;
@@ -312,7 +354,14 @@ pub fn Database(comptime config: Config) type {
                 break;
             };
             const index = destination orelse return error.TableCapacity;
-            self.tables[index] = .{ .live = true, .name = name, .column_count = count, .columns = columns };
+            const table = &self.tables[index];
+            table.live = true;
+            table.name = name;
+            table.column_count = count;
+            table.row_count = 0;
+            table.columns = columns;
+            table.primary_column = null;
+            @memset(&table.primary_index, 0);
             for (columns[0..count], 0..) |column, column_index|
                 if (column.primary_key) {
                     self.tables[index].primary_column = column_index;
@@ -325,7 +374,7 @@ pub fn Database(comptime config: Config) type {
             const name = try parser.name();
             const index = try self.tableIndex(&name);
             try parser.finish();
-            self.tables[index] = .{};
+            self.tables[index].live = false;
             result.clear(0);
         }
 
@@ -339,7 +388,10 @@ pub fn Database(comptime config: Config) type {
             }
             switch (value.*) {
                 .null_value => if (column.not_null) return error.NotNullViolation,
-                .integer => if (column.data_type != .integer) return error.TypeMismatch,
+                .integer => |integer| {
+                    if (column.data_type != .integer and column.data_type != .integer32) return error.TypeMismatch;
+                    if (column.data_type == .integer32 and (integer < -2147483648 or integer > 2147483647)) return error.IntegerOverflow;
+                },
                 .boolean => if (column.data_type != .boolean) return error.TypeMismatch,
                 .text => if (column.data_type != .text) return error.TypeMismatch,
             }
@@ -415,6 +467,9 @@ pub fn Database(comptime config: Config) type {
                     if (predicate.value != .null_value) {
                         var column = table.columns[predicate.column];
                         column.not_null = false;
+                        // PostgreSQL promotes out-of-range comparison constants;
+                        // range enforcement belongs to assignment, not WHERE.
+                        if (column.data_type == .integer32) column.data_type = .integer;
                         try validate(&column, &predicate.value);
                     }
                 }
@@ -490,11 +545,15 @@ pub fn Database(comptime config: Config) type {
             const where = try filter(parser, table);
             var order_column: ?usize = null;
             var descending = false;
+            var explicit_nulls_first: ?bool = null;
             if (parser.takeWord("ORDER")) {
                 try parser.expectWord("BY");
                 const column_name = try parser.name();
                 order_column = try columnIndex(table, &column_name);
                 if (parser.takeWord("DESC")) descending = true else _ = parser.takeWord("ASC");
+                if (parser.takeWord("NULLS")) {
+                    if (parser.takeWord("FIRST")) explicit_nulls_first = true else if (parser.takeWord("LAST")) explicit_nulls_first = false else return error.Syntax;
+                }
             }
             var limit: u64 = config.rows_per_table;
             if (parser.takeWord("LIMIT")) limit = try parser.unsigned(18446744073709551615);
@@ -516,6 +575,7 @@ pub fn Database(comptime config: Config) type {
                 };
             }
             if (order_column) |column| {
+                const nulls_first = explicit_nulls_first orelse (config.nulls_first_ascending != descending);
                 // Stable insertion sort over row indices avoids copying text
                 // cells during sorting and preserves insertion order for ties.
                 var index: usize = 1;
@@ -523,8 +583,16 @@ pub fn Database(comptime config: Config) type {
                     const selected = indices[index];
                     var position = index;
                     while (position != 0) {
-                        const order = compare(&table.rows[selected].cells[column], &table.rows[indices[position - 1]].cells[column]);
-                        if (if (descending) order <= 0 else order >= 0) break;
+                        const left = &table.rows[selected].cells[column];
+                        const right = &table.rows[indices[position - 1]].cells[column];
+                        const order = if (left.* == .null_value or right.* == .null_value) blk: {
+                            if (left.* == .null_value and right.* == .null_value) break :blk @as(i8, 0);
+                            break :blk if ((left.* == .null_value) == nulls_first) @as(i8, -1) else @as(i8, 1);
+                        } else blk: {
+                            const value = compare(left, right);
+                            break :blk if (descending) -value else value;
+                        };
+                        if (order >= 0) break;
                         indices[position] = indices[position - 1];
                         position -= 1;
                     }

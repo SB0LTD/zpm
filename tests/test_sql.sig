@@ -387,6 +387,111 @@ fn deterministicFuzz() !void {
     cases += 1;
 }
 
+fn snapshots() !void {
+    var source: DB = .{};
+    var target: DB = undefined;
+    @memset(std.mem.asBytes(&target), 0xaa);
+    var result: DB.Result = .{};
+    var copied: DB.Result = undefined;
+    @memset(std.mem.asBytes(&copied), 0xaa);
+    source.copyFrom(&source);
+    target.copyFrom(&source);
+    try check(target.tableCount() == 0);
+    // Empty slots must not touch or examine their poisoned row storage.
+    for (std.mem.asBytes(&target.tables[0].rows)) |byte| try check(byte == 0xaa);
+    try execute(&source, &result, "CREATE TABLE t (id INT PRIMARY KEY, value TEXT)");
+    try execute(&source, &result, "INSERT INTO t VALUES (1, 'first')");
+    try execute(&source, &result, "INSERT INTO t VALUES (2, NULL)");
+    try execute(&source, &result, "CREATE TABLE unindexed (flag BOOLEAN)");
+    try execute(&source, &result, "INSERT INTO unindexed VALUES (TRUE)");
+    target.copyFrom(&source);
+    target.copyFrom(&target);
+    try check(target.tableCount() == 2);
+    for (std.mem.asBytes(&target.tables[0].rows[2])) |byte| try check(byte == 0xaa);
+    const queries = [_][]const u8{ "SELECT * FROM t ORDER BY id", "SELECT * FROM t WHERE id = 2", "SELECT * FROM unindexed" };
+    var other: DB.Result = .{};
+    for (queries) |query| {
+        try execute(&source, &result, query);
+        try execute(&target, &other, query);
+        try check(equalResult(&result, &other));
+        copied.copyFrom(&result);
+        copied.copyFrom(&copied);
+        try check(equalResult(&result, &copied));
+    }
+    try execute(&target, &result, "UPDATE t SET value = 'private' WHERE id = 1");
+    try execute(&source, &result, "SELECT value FROM t WHERE id = 1");
+    try same(result.rows[0].cells[0].text.slice(), "first");
+    try rejects(&target, &result, "INSERT INTO t VALUES (1, 'duplicate')", error.PrimaryKeyViolation);
+    try execute(&source, &result, "DELETE FROM t WHERE id = 2");
+    target.copyFrom(&source);
+    try execute(&target, &result, "INSERT INTO t VALUES (2, 'reused')");
+    try execute(&target, &result, "SELECT value FROM t WHERE id = 2");
+    try same(result.rows[0].cells[0].text.slice(), "reused");
+    try execute(&source, &result, "DROP TABLE t");
+    try execute(&source, &result, "DROP TABLE unindexed");
+    target.copyFrom(&source);
+    try check(target.tableCount() == 0);
+    try execute(&target, &result, "CREATE TABLE t (name TEXT PRIMARY KEY)");
+    try execute(&target, &result, "INSERT INTO t VALUES ('fresh')");
+    try execute(&target, &result, "SELECT name FROM t WHERE name = 'fresh'");
+    try check(result.row_count == 1);
+    // A DDL result copies just the header, leaving old destination rows alone.
+    @memset(std.mem.asBytes(&copied), 0xaa);
+    result.clear(7);
+    copied.copyFrom(&result);
+    try check(copied.row_count == 0 and copied.column_count == 0 and copied.affected_rows == 7);
+    for (std.mem.asBytes(&copied.rows)) |byte| try check(byte == 0xaa);
+    cases += 1;
+}
+
+fn nullOrdering() !void {
+    const PostgresDB = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 4, .nulls_first_ascending = false });
+    var db: PostgresDB = .{};
+    var result: PostgresDB.Result = .{};
+    try db.execute("CREATE TABLE t (id INT PRIMARY KEY, rank INT)", &result);
+    try db.execute("INSERT INTO t VALUES (1, 5)", &result);
+    try db.execute("INSERT INTO t VALUES (2, NULL)", &result);
+    try db.execute("INSERT INTO t VALUES (3, 1)", &result);
+    try db.execute("INSERT INTO t VALUES (4, NULL)", &result);
+    const queries = [_][]const u8{
+        "SELECT id FROM t ORDER BY rank ASC", "SELECT id FROM t ORDER BY rank DESC",
+        "SELECT id FROM t ORDER BY rank ASC NULLS FIRST", "SELECT id FROM t ORDER BY rank ASC NULLS LAST",
+        "SELECT id FROM t ORDER BY rank DESC NULLS FIRST", "SELECT id FROM t ORDER BY rank DESC NULLS LAST",
+    };
+    const expected = [_][4]i64{ .{ 3, 1, 2, 4 }, .{ 2, 4, 1, 3 }, .{ 2, 4, 3, 1 }, .{ 3, 1, 2, 4 }, .{ 2, 4, 1, 3 }, .{ 1, 3, 2, 4 } };
+    for (queries, expected) |query, ids| {
+        try db.execute(query, &result);
+        try check(result.row_count == ids.len);
+        for (ids, 0..) |id, row| try check(result.rows[row].cells[0].integer == id);
+    }
+    const before = result;
+    if (db.execute("SELECT id FROM t ORDER BY rank NULLS invalid", &result)) |_| return error.InvalidNullOrder else |err| try check(err == error.Syntax);
+    try check(std.mem.eql(u8, std.mem.asBytes(&before), std.mem.asBytes(&result)));
+    cases += 1;
+}
+
+fn postgresIntegers() !void {
+    const IntDB = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 4, .integer_bits = 32 });
+    var db: IntDB = .{};
+    var result: IntDB.Result = .{};
+    try db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, wide BIGINT)", &result);
+    try db.execute("INSERT INTO t VALUES (-2147483648, -9223372036854775808)", &result);
+    try db.execute("INSERT INTO t VALUES (2147483647, 9223372036854775807)", &result);
+    try db.execute("SELECT * FROM t ORDER BY id", &result);
+    try check(result.column_types[0] == .integer32 and result.column_types[1] == .integer);
+    try check(result.rows[0].cells[0].integer == -2147483648 and result.rows[1].cells[0].integer == 2147483647);
+    try check(result.rows[0].cells[1].integer == std.math.minInt(i64) and result.rows[1].cells[1].integer == std.math.maxInt(i64));
+    const before = result;
+    const invalid = [_][]const u8{ "INSERT INTO t VALUES (2147483648, 0)", "INSERT INTO t VALUES (-2147483649, 0)", "UPDATE t SET id = 2147483648", "UPDATE t SET id = -2147483649" };
+    for (invalid) |query| {
+        if (db.execute(query, &result)) |_| return error.OverflowAccepted else |err| try check(err == error.IntegerOverflow);
+        try check(std.mem.eql(u8, std.mem.asBytes(&before), std.mem.asBytes(&result)));
+    }
+    try db.execute("SELECT id FROM t WHERE id < 2147483648 ORDER BY id", &result);
+    try check(result.row_count == 2);
+    cases += 1;
+}
+
 pub fn main(init: std.process.Init) !void {
     if (comptime @import("builtin").os.tag == .windows) {
         if (std.mem.indexOf(u16, init.minimal.args.vector, std.unicode.utf8ToUtf16LeStringLiteral("--prove-failure")) != null)
@@ -408,6 +513,9 @@ pub fn main(init: std.process.Init) !void {
     try integerBounds();
     try parserAndSortEdges();
     try deterministicFuzz();
+    try snapshots();
+    try nullOrdering();
+    try postgresIntegers();
     var buffer: [256]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql\",\"pass\":true,\"cases\":{d},\"assertions\":{d},\"statements\":{d},\"fuzz_inputs\":{d},\"database_bytes\":{d}}}\n", .{ cases, assertions, statements, fuzz_inputs, @sizeOf(DB) });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
