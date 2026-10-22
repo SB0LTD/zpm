@@ -294,11 +294,13 @@ pub fn Session(comptime DB: type) type {
                 const kind = self.result.column_types[column];
                 try writer.number(switch (kind) {
                     .integer => 20,
+                    .integer32 => 11,
                     .boolean => 1,
                     .text => 65535,
                 }, 4);
                 try writer.byte(switch (kind) {
                     .integer => 8,
+                    .integer32 => 3,
                     .boolean => 1,
                     .text => 253,
                 });

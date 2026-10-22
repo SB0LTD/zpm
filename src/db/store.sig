@@ -94,6 +94,10 @@ pub fn Store(comptime Raw: type) type {
         /// A failed durable write requires recovery before further writes.
         storage_failed: bool = false,
 
+        fn snapshot(destination: *Raw, source: *const Raw) void {
+            if (@hasDecl(Raw, "copyFrom")) destination.copyFrom(source) else destination.* = source.*;
+        }
+
         fn storageReady(self: *const Self) !void {
             if (self.storage_failed or (self.durability_required and self.commit_fn == null)) return error.StorageUnavailable;
             if (self.generation == 18446744073709551615) return error.GenerationExhausted;
@@ -130,7 +134,7 @@ pub fn Store(comptime Raw: type) type {
                 if (self.in_transaction) return;
                 const workspace = self.transaction_workspace orelse return error.TransactionCapacity;
                 if (workspace == &self.store.database or workspace == self.store.autocommit_workspace) return error.InvalidWorkspace;
-                workspace.* = self.store.database;
+                snapshot(workspace, &self.store.database);
                 self.base_generation = self.store.generation;
                 self.in_transaction = true;
                 self.dirty = false;
@@ -165,7 +169,7 @@ pub fn Store(comptime Raw: type) type {
                     if (self.store.commit_fn != null and (!self.logged or self.log_used == 0)) return error.InvalidCommitBatch;
                     if (self.log_used > self.transaction_log.len) return error.InvalidCommitBatch;
                     try self.store.persist(self.transaction_log[0..self.log_used]);
-                    self.store.database = workspace.*;
+                    snapshot(&self.store.database, workspace);
                     self.store.generation += 1;
                 }
                 self.resetTransaction();
@@ -273,7 +277,7 @@ pub fn Store(comptime Raw: type) type {
                     const name_length = @min(result.column_names[0].bytes.len, 8);
                     result.column_names[0] = .{ .len = name_length };
                     @memcpy(result.column_names[0].bytes[0..name_length], "?column?"[0..name_length]);
-                    result.column_types[0] = .integer;
+                    result.column_types[0] = if (@hasDecl(Raw, "integer_type")) Raw.integer_type else .integer;
                     result.rows[0].cells[0] = .{ .integer = 1 };
                     return;
                 }
@@ -307,15 +311,15 @@ pub fn Store(comptime Raw: type) type {
                 const workspace = self.store.autocommit_workspace orelse return error.TransactionCapacity;
                 if (workspace == &self.store.database or workspace == self.transaction_workspace) return error.InvalidWorkspace;
                 if (result == &self.store.autocommit_result) return error.InvalidWorkspace;
-                workspace.* = self.store.database;
+                snapshot(workspace, &self.store.database);
                 try workspace.execute(source, &self.store.autocommit_result);
                 var batch: [max_statement_bytes + 4]u8 = undefined;
                 writeLength(batch[0..4], source.len);
                 @memcpy(batch[4..][0..source.len], source);
                 try self.store.persist(batch[0 .. source.len + 4]);
-                self.store.database = workspace.*;
+                snapshot(&self.store.database, workspace);
                 self.store.generation += 1;
-                result.* = self.store.autocommit_result;
+                if (@hasDecl(Result, "copyFrom")) result.copyFrom(&self.store.autocommit_result) else result.* = self.store.autocommit_result;
             }
         };
     };

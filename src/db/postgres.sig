@@ -693,11 +693,13 @@ pub fn Session(comptime DB: type) type {
                 const data_type = self.result.column_types[i];
                 try w.u32be(switch (data_type) {
                     .integer => 20,
+                    .integer32 => 23,
                     .boolean => 16,
                     .text => 25,
                 });
                 try w.u16be(switch (data_type) {
                     .integer => 8,
+                    .integer32 => 4,
                     .boolean => 1,
                     .text => 0xffff,
                 });
@@ -727,7 +729,7 @@ pub fn Session(comptime DB: type) type {
                         .null_value => unreachable,
                         .integer => |n| if (binary) {
                             const bits: u64 = @bitCast(n);
-                            try w.u32be(@truncate(bits >> 32));
+                            if (self.result.column_types[i] != .integer32) try w.u32be(@truncate(bits >> 32));
                             try w.u32be(@truncate(bits));
                         } else try w.number(n),
                         .boolean => |b| try w.byte(if (binary) @intFromBool(b) else if (b) 't' else 'f'),
@@ -922,11 +924,13 @@ fn inferOid(s: anytype, token: []const u8, data_type: anytype) !void {
     if (n == 0 or n > s.count) return error.ProtocolViolation;
     const oid: u32 = switch (data_type) {
         .integer => 20,
+        .integer32 => 23,
         .boolean => 16,
         .text => 25,
     };
     const previous = s.oids[n - 1];
-    if (previous != 0 and previous != oid and !(oid == 20 and (previous == 21 or previous == 23))) return error.TypeMismatch;
+    const integer_conversion = (oid == 20 or oid == 23) and (previous == 20 or previous == 21 or previous == 23);
+    if (previous != 0 and previous != oid and !integer_conversion) return error.TypeMismatch;
     if (previous == 0) s.oids[n - 1] = oid;
 }
 fn integerText(bytes: []const u8) bool {

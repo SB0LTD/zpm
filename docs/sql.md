@@ -46,10 +46,17 @@ serializes access. There is no locking or transaction manager.
 `Text.slice()` borrow their owning value. Do not retain such a slice after
 moving or overwriting that owner.
 
+`DB.copyFrom(&source)` copies a complete logical snapshot into distinct storage,
+including live schemas, rows and primary-key indices. `Result.copyFrom` copies
+only active headers and cells. Both accept uninitialized destination storage;
+callers must never inspect inactive table/row/column ranges. Durable store
+candidate creation and publication use these operations, avoiding copies of
+empty reserved capacity. CREATE/DROP likewise leave inactive row payloads alone.
+
 ## SQL subset
 
 CREATE/DROP TABLE; single-row INSERT with optional column mapping; SELECT
-projection or `*`; UPDATE literal assignments; DELETE. Columns have INTEGER/INT,
+projection or `*`; UPDATE literal assignments; DELETE. Columns have INTEGER/INT, BIGINT/INT8,
 BOOLEAN/BOOL, or TEXT types, with NOT NULL and one single-column PRIMARY KEY.
 The primary key is also non-null. Omitted INSERT columns become NULL.
 
@@ -57,7 +64,17 @@ WHERE accepts `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`,
 and bounded AND conjunctions. No implicit type conversion occurs, including
 predicates on empty tables. Ordinary comparisons involving NULL do not match.
 One ORDER BY column with ASC/DESC is supported, followed by LIMIT. Ordering is
-stable, with NULL first ascending and last descending. Text compares bytewise.
+stable, with NULL first ascending and last descending by default. Set
+`Config.nulls_first_ascending = false` for PostgreSQL's inverse defaults.
+Explicit `NULLS FIRST` / `NULLS LAST` overrides the default in either direction.
+Text compares bytewise.
+
+`Config.integer_bits` defaults to 64 for existing library users. A PostgreSQL
+server selects 32: INTEGER/INT then enforces signed 32-bit assignment ranges and
+reports `DataType.integer32`; BIGINT/INT8 always reports `.integer` and retains
+the signed 64-bit range. Cells retain the shared i64 payload. The wire sessions
+report the correct width (PostgreSQL OIDs 23/20, MySQL LONG/LONGLONG, TDS INTN
+4/8), including binary encoding and prepared parameter inference.
 
 Keywords and unquoted ASCII identifiers are case insensitive. Strings use
 apostrophes, escaped by doubling them; integer literals are signed 64-bit.

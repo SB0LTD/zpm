@@ -431,6 +431,10 @@ pub fn Session(comptime DB: type) type {
                             try writer.byte(0x26);
                             try writer.byte(8);
                         }, // INTN/BIGINT
+                        .integer32 => {
+                            try writer.byte(0x26);
+                            try writer.byte(4);
+                        }, // INTN/INT
                         .boolean => {
                             try writer.byte(0x68);
                             try writer.byte(1);
@@ -453,8 +457,13 @@ pub fn Session(comptime DB: type) type {
                             else => try writer.byte(0),
                         },
                         .integer => |value| {
-                            try writer.byte(8);
-                            try writer.number(@bitCast(value), 8);
+                            if (self.result.column_types[column] == .integer32) {
+                                try writer.byte(4);
+                                try writer.number(@bitCast(value), 4);
+                            } else {
+                                try writer.byte(8);
+                                try writer.number(@bitCast(value), 8);
+                            }
                         },
                         .boolean => |value| {
                             try writer.byte(1);
