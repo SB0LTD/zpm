@@ -71,10 +71,18 @@ Errors include `Syntax`, `UnsupportedStatement`, `TableCapacity`,
 `DuplicateColumn`, `TypeMismatch`, `NotNullViolation`, `PrimaryKeyViolation`,
 and `IntegerOverflow`.
 
-This version intentionally has table scans and bounded insertion sorting,
-with no joins, expressions, aggregates, indexes, transactions, parameters,
-persistence, or full SQL-standard conformance. Those features belong in this
-package when implemented; network and file adapters belong in higher layers.
+Primary keys use a fixed open-addressing hash index with a maximum 50% load.
+Equality lookups and duplicate detection use that index. Delete compaction and
+key-changing updates rebuild references after validation. LIMIT without ordering
+stops scanning once enough rows match. Result clearing changes only active
+counts; callers must observe the active ranges. Column types are reported even
+when a SELECT returns zero rows. `Config.boolean_integers` optionally accepts
+integer 0/1 as boolean client values; the default remains strictly typed.
+
+Other predicates scan rows and ordering uses bounded insertion sorting. Joins,
+general expressions, aggregates, secondary indexes, persistence, and complete
+SQL-standard conformance remain unimplemented. The reusable shared transaction
+adapter and wire sessions are documented in [database-server.md](database-server.md).
 
 ## Validation
 

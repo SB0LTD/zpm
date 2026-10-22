@@ -101,6 +101,21 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_sql = try ctx.addStep("test-sql", "Execute bounded in-memory SQL contracts", &noopStep);
     try ctx.addDependency(test_all, test_sql);
     _ = try addContract(ctx, test_sql, "contract-sql", "tests/test_sql.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-index", "tests/test_sql_index.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try ctx.addModule("db_store", "src/db/store.sig");
+    _ = try ctx.addModule("postgres", "src/db/postgres.sig");
+    _ = try ctx.addModule("mysql", "src/db/mysql.sig");
+    _ = try ctx.addModule("tds", "src/db/tds.sig");
+    _ = try ctx.addModule("tcp_server", "src/platform/tcp_server.sig");
+    const test_db = try ctx.addStep("test-db", "Execute database wire, transaction and TCP contracts", &noopStep);
+    try ctx.addDependency(test_all, test_db);
+    inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server" }) |name| {
+        _ = try addContract(ctx, test_db, "contract-" ++ name, "tests/test_" ++ name ++ ".sig", &.{
+            importEntry("sql", "src/core/sql.sig"),         importEntry("db_store", "src/db/store.sig"),
+            importEntry("postgres", "src/db/postgres.sig"), importEntry("mysql", "src/db/mysql.sig"),
+            importEntry("tds", "src/db/tds.sig"),           importEntry("tcp_server", "src/platform/tcp_server.sig"),
+        });
+    }
     _ = try ctx.addModule("math", "src/core/math.sig");
     _ = try ctx.addModule("sig_math", "src/core/sig_math.sig");
     const synth_voice = try ctx.addModule("synth_voice", "src/core/synth_voice.sig");

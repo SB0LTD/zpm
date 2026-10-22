@@ -21,6 +21,11 @@ pub const OfficialPackage = struct {
 };
 
 pub const packages = [_]OfficialPackage{
+    .{ .scope = "zpm", .name = "db-store", .version = "0.1.0", .layer = 0, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{"sql"}, .description = "Bounded shared SQL store with serialized isolated transactions", .source = "src/db/store.sig" },
+    .{ .scope = "zpm", .name = "postgres", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{ "sql", "db-store" }, .description = "Bounded PostgreSQL v3 wire sessions and prepared portals", .source = "src/db/postgres.sig" },
+    .{ .scope = "zpm", .name = "mysql", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{ "sql", "db-store" }, .description = "Bounded MySQL protocol 10 wire sessions", .source = "src/db/mysql.sig" },
+    .{ .scope = "zpm", .name = "tds", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{ "sql", "db-store" }, .description = "Bounded SQL Server TDS 7.x wire sessions", .source = "src/db/tds.sig" },
+    .{ .scope = "zpm", .name = "tcp-server", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Nonblocking caller-buffer TCP server primitives for Windows and Linux", .source = "src/platform/tcp_server.sig" },
     .{
         .scope = "zpm",
         .name = "sql",
@@ -481,7 +486,7 @@ fn eql(a: []const u8, b: []const u8) bool {
 const testing = @import("std").testing;
 
 test "official_packages: expected package count" {
-    try testing.expectEqual(@as(usize, 37), package_count);
+    try testing.expectEqual(@as(usize, 42), package_count);
 }
 
 test "official_packages: layer 0 packages have no platform dependencies" {
@@ -494,7 +499,7 @@ test "official_packages: layer 0 packages have no platform dependencies" {
 }
 
 test "official_packages: layer 0 includes portable AI foundations" {
-    try testing.expectEqual(@as(usize, 7), layer_0_count);
+    try testing.expectEqual(@as(usize, 8), layer_0_count);
     try testing.expect(findByName("ai-core") != null);
 }
 

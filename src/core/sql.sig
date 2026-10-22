@@ -11,7 +11,7 @@
 //! NOT NULL and a single-column PRIMARY KEY. Identifiers are ASCII and case
 //! insensitive; text comparison is bytewise. NULL comparisons are unknown and
 //! therefore do not match WHERE, except explicit IS [NOT] NULL predicates.
-//! Transactions, joins, expressions, aggregates, indices and persistence are
+//! Transactions, joins, expressions, aggregates, secondary indices and persistence are
 //! outside this initial SQL subset. No allocator, platform, or std dependency.
 
 pub const Config = struct {
@@ -21,6 +21,8 @@ pub const Config = struct {
     name_bytes: usize = 32,
     text_bytes: usize = 128,
     predicates: usize = 8,
+    /// MySQL/MSSQL BIT clients encode booleans as integer 0/1.
+    boolean_integers: bool = false,
 };
 
 pub const Error = error{
@@ -126,7 +128,21 @@ pub fn Database(comptime config: Config) type {
             row_count: usize = 0,
             affected_rows: usize = 0,
             column_names: [config.columns]Name = @splat(.{}),
+            column_types: [config.columns]DataType = @splat(.integer),
             rows: [config.rows_per_table]Row = @splat(.{}),
+
+            /// Only active ranges are observable; avoid clearing unused row capacity.
+            pub fn clear(self: *Result, affected: usize) void {
+                self.column_count = 0;
+                self.row_count = 0;
+                self.affected_rows = affected;
+            }
+        };
+
+        const index_capacity = blk: {
+            var capacity: usize = 2;
+            while (capacity < config.rows_per_table * 2) capacity *= 2;
+            break :blk capacity;
         };
 
         const Table = struct {
@@ -136,6 +152,9 @@ pub fn Database(comptime config: Config) type {
             row_count: usize = 0,
             columns: [config.columns]Column = @splat(.{}),
             rows: [config.rows_per_table]Row = @splat(.{}),
+            primary_column: ?usize = null,
+            // Open addressing, <= 50% load; zero means vacant, other values row+1.
+            primary_index: [index_capacity]usize = @splat(0),
         };
 
         const Operator = enum { equal, not_equal, less, less_equal, greater, greater_equal, is_null, is_not_null };
@@ -189,6 +208,62 @@ pub fn Database(comptime config: Config) type {
             return error.ColumnNotFound;
         }
 
+        fn hash(value: *const Cell) usize {
+            var code: u64 = 14695981039346656037;
+            switch (value.*) {
+                .integer => |integer| {
+                    var bits: u64 = @bitCast(integer);
+                    for (0..8) |_| {
+                        code = (code ^ @as(u8, @truncate(bits))) *% 1099511628211;
+                        bits >>= 8;
+                    }
+                },
+                .text => |*text| for (text.slice()) |byte| {
+                    code = (code ^ byte) *% 1099511628211;
+                },
+                .boolean => |boolean| code = @intFromBool(boolean),
+                .null_value => unreachable,
+            }
+            // Mix low bits before the power-of-two table mask.
+            code ^= code >> 33;
+            code *%= 0xff51afd7ed558ccd;
+            code ^= code >> 33;
+            return @truncate(code);
+        }
+
+        fn primaryLookup(table: *const Table, value: *const Cell) ?usize {
+            const column = table.primary_column orelse return null;
+            if (value.* == .null_value) return null;
+            var slot = hash(value) & (index_capacity - 1);
+            for (0..index_capacity) |_| {
+                const item = table.primary_index[slot];
+                if (item == 0) return null;
+                if (compare(&table.rows[item - 1].cells[column], value) == 0) return item - 1;
+                slot = (slot + 1) & (index_capacity - 1);
+            }
+            return null;
+        }
+
+        fn indexRow(table: *Table, row: usize) void {
+            const column = table.primary_column orelse return;
+            var slot = hash(&table.rows[row].cells[column]) & (index_capacity - 1);
+            while (table.primary_index[slot] != 0) slot = (slot + 1) & (index_capacity - 1);
+            table.primary_index[slot] = row + 1;
+        }
+
+        fn rebuildIndex(table: *Table) void {
+            @memset(&table.primary_index, 0);
+            if (table.primary_column == null) return;
+            for (0..table.row_count) |row| indexRow(table, row);
+        }
+
+        fn primaryPredicate(table: *const Table, where: *const Filter) ?*const Cell {
+            const column = table.primary_column orelse return null;
+            for (where.items[0..where.len]) |*item|
+                if (item.column == column and item.op == .equal) return &item.value;
+            return null;
+        }
+
         fn create(self: *Self, parser: *Parser, result: *Result) Error!void {
             try parser.expectWord("TABLE");
             const name = try parser.name();
@@ -238,7 +313,11 @@ pub fn Database(comptime config: Config) type {
             };
             const index = destination orelse return error.TableCapacity;
             self.tables[index] = .{ .live = true, .name = name, .column_count = count, .columns = columns };
-            result.* = .{};
+            for (columns[0..count], 0..) |column, column_index|
+                if (column.primary_key) {
+                    self.tables[index].primary_column = column_index;
+                };
+            result.clear(0);
         }
 
         fn drop(self: *Self, parser: *Parser, result: *Result) Error!void {
@@ -247,10 +326,14 @@ pub fn Database(comptime config: Config) type {
             const index = try self.tableIndex(&name);
             try parser.finish();
             self.tables[index] = .{};
-            result.* = .{};
+            result.clear(0);
         }
 
-        fn validate(column: *const Column, value: *const Cell) Error!void {
+        fn validate(column: *const Column, value: *Cell) Error!void {
+            if (config.boolean_integers and column.data_type == .boolean and value.* == .integer) {
+                if (value.integer != 0 and value.integer != 1) return error.TypeMismatch;
+                value.* = .{ .boolean = value.integer == 1 };
+            }
             switch (value.*) {
                 .null_value => if (column.not_null) return error.NotNullViolation,
                 .integer => if (column.data_type != .integer) return error.TypeMismatch,
@@ -294,14 +377,14 @@ pub fn Database(comptime config: Config) type {
             for (table.columns[0..table.column_count], 0..) |*column, index| {
                 try validate(column, &row.cells[index]);
                 if (column.primary_key) {
-                    for (table.rows[0..table.row_count]) |*existing|
-                        if (compare(&row.cells[index], &existing.cells[index]) == 0) return error.PrimaryKeyViolation;
+                    if (primaryLookup(table, &row.cells[index]) != null) return error.PrimaryKeyViolation;
                 }
             }
             if (table.row_count == config.rows_per_table) return error.RowCapacity;
             table.rows[table.row_count] = row;
+            indexRow(table, table.row_count);
             table.row_count += 1;
-            result.* = .{ .affected_rows = 1 };
+            result.clear(1);
         }
 
         fn filter(parser: *Parser, table: *const Table) Error!Filter {
@@ -413,12 +496,22 @@ pub fn Database(comptime config: Config) type {
             var limit: u64 = config.rows_per_table;
             if (parser.takeWord("LIMIT")) limit = try parser.unsigned(18446744073709551615);
             try parser.finish();
-            var indices: [config.rows_per_table]usize = @splat(0);
+            var indices: [config.rows_per_table]usize = undefined;
             var found: usize = 0;
-            for (table.rows[0..table.row_count], 0..) |*row, index| if (matches(row, &where)) {
-                indices[found] = index;
-                found += 1;
-            };
+            if (primaryPredicate(table, &where)) |key| {
+                if (primaryLookup(table, key)) |index| {
+                    if (matches(&table.rows[index], &where)) {
+                        indices[0] = index;
+                        found = 1;
+                    }
+                }
+            } else if (limit != 0) {
+                for (table.rows[0..table.row_count], 0..) |*row, index| if (matches(row, &where)) {
+                    indices[found] = index;
+                    found += 1;
+                    if (order_column == null and found >= limit) break;
+                };
+            }
             if (order_column) |column| {
                 // Stable insertion sort over row indices avoids copying text
                 // cells during sorting and preserves insertion order for ties.
@@ -435,10 +528,13 @@ pub fn Database(comptime config: Config) type {
                     indices[position] = selected;
                 }
             }
-            result.* = .{};
+            result.clear(0);
             result.column_count = count;
             result.row_count = if (limit < found) @intCast(limit) else found;
-            for (0..count) |index| result.column_names[index] = table.columns[projection[index]].name;
+            for (0..count) |index| {
+                result.column_names[index] = table.columns[projection[index]].name;
+                result.column_types[index] = table.columns[projection[index]].data_type;
+            }
             for (0..result.row_count) |row_index| for (0..count) |column| {
                 result.rows[row_index].cells[column] = table.rows[indices[row_index]].cells[projection[column]];
             };
@@ -464,10 +560,19 @@ pub fn Database(comptime config: Config) type {
             try parser.finish();
             var selected: [config.rows_per_table]bool = @splat(false);
             var affected: usize = 0;
-            for (table.rows[0..table.row_count], 0..) |*row, index| if (matches(row, &where)) {
-                selected[index] = true;
-                affected += 1;
-            };
+            if (primaryPredicate(table, &where)) |key| {
+                if (primaryLookup(table, key)) |index| {
+                    if (matches(&table.rows[index], &where)) {
+                        selected[index] = true;
+                        affected = 1;
+                    }
+                }
+            } else {
+                for (table.rows[0..table.row_count], 0..) |*row, index| if (matches(row, &where)) {
+                    selected[index] = true;
+                    affected += 1;
+                };
+            }
             // All assignments are literals. Assigning one primary-key value to
             // multiple rows necessarily collides; compare untouched rows too.
             if (affected != 0) {
@@ -483,7 +588,12 @@ pub fn Database(comptime config: Config) type {
                     table.rows[row_index].cells[column] = assignments.cells[column];
                 };
             };
-            result.* = .{ .affected_rows = affected };
+            if (affected != 0) {
+                if (table.primary_column) |column| if (assigned[column]) {
+                    rebuildIndex(table);
+                };
+            }
+            result.clear(affected);
         }
 
         fn delete(self: *Self, parser: *Parser, result: *Result) Error!void {
@@ -501,7 +611,8 @@ pub fn Database(comptime config: Config) type {
             }
             for (kept..old_count) |index| table.rows[index] = .{};
             table.row_count = kept;
-            result.* = .{ .affected_rows = old_count - kept };
+            if (kept != old_count) rebuildIndex(table);
+            result.clear(old_count - kept);
         }
 
         const Parser = struct {

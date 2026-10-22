@@ -156,6 +156,13 @@ delegate to `sig build` regardless of which naming a project uses.
 
 ---
 
+## Database server building blocks
+
+The allocator-free SQL engine, shared transaction store, PostgreSQL/MySQL/TDS
+sessions and native TCP reactor primitives are documented in
+[Database server building blocks](docs/database-server.md). Run
+`sig build test-db test-sql -Doptimize=ReleaseSafe` for executable contracts.
+
 ## QUIC Transport
 
 zpm includes a full QUIC implementation (RFC 9000, 9001, 9002, 9221) for high-performance registry access. Enable with `--transport quic`.
