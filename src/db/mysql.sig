@@ -44,7 +44,12 @@ fn readLength(source: []const u8, position: *usize) Error!usize {
     const first = source[position.*];
     position.* += 1;
     if (first < 0xfb) return first;
-    const bytes: usize = switch (first) { 0xfc => 2, 0xfd => 3, 0xfe => 8, else => return error.MalformedPacket };
+    const bytes: usize = switch (first) {
+        0xfc => 2,
+        0xfd => 3,
+        0xfe => 8,
+        else => return error.MalformedPacket,
+    };
     if (bytes > source.len - position.*) return error.MalformedPacket;
     const value = readLe(source[position.*..][0..bytes]);
     position.* += bytes;
@@ -287,8 +292,16 @@ pub fn Session(comptime DB: type) type {
                 try writer.byte(0x0c);
                 try writer.number(45, 2);
                 const kind = self.result.column_types[column];
-                try writer.number(switch (kind) { .integer => 20, .boolean => 1, .text => 65535 }, 4);
-                try writer.byte(switch (kind) { .integer => 8, .boolean => 1, .text => 253 });
+                try writer.number(switch (kind) {
+                    .integer => 20,
+                    .boolean => 1,
+                    .text => 65535,
+                }, 4);
+                try writer.byte(switch (kind) {
+                    .integer => 8,
+                    .boolean => 1,
+                    .text => 253,
+                });
                 try writer.number(0, 2); // nullable, signed
                 try writer.byte(0); // decimals
                 try writer.number(0, 2);
@@ -329,8 +342,7 @@ pub fn Session(comptime DB: type) type {
                         reply.close = true;
                     },
                     2 => {
-                        if (equal(payload[1..], "ramsql")) try writer.ok(0, self.status(db)) else
-                            try writer.failure(1049, "42000", "Unknown database; use ramsql");
+                        if (equal(payload[1..], "ramsql")) try writer.ok(0, self.status(db)) else try writer.failure(1049, "42000", "Unknown database; use ramsql");
                     },
                     3 => {
                         if (db.execute(payload[1..], &self.result)) |_| {
