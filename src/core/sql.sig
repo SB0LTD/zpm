@@ -331,8 +331,11 @@ pub fn Database(comptime config: Config) type {
 
         fn validate(column: *const Column, value: *Cell) Error!void {
             if (config.boolean_integers and column.data_type == .boolean and value.* == .integer) {
-                if (value.integer != 0 and value.integer != 1) return error.TypeMismatch;
-                value.* = .{ .boolean = value.integer == 1 };
+                // Capture the payload before changing the active union tag.
+                const integer = value.integer;
+                if (integer != 0 and integer != 1) return error.TypeMismatch;
+                const boolean = integer == 1;
+                value.* = .{ .boolean = boolean };
             }
             switch (value.*) {
                 .null_value => if (column.not_null) return error.NotNullViolation,
