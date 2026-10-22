@@ -11,10 +11,17 @@ const Win = struct {
     extern "ws2_32" fn getsockopt(usize, c_int, c_int, *c_int, *c_int) callconv(.c) c_int;
 };
 var assertions: usize = 0;
+var report_io: std.Io = undefined;
+var phase: []const u8 = "startup";
 
 fn check(value: bool) !void {
     assertions += 1;
-    if (!value) return error.TcpContractFailed;
+    if (!value) {
+        var buffer: [256]u8 = undefined;
+        const report = std.fmt.bufPrint(&buffer, "{{\"suite\":\"tcp_server\",\"pass\":false,\"assertion\":{d},\"phase\":\"{s}\"}}\n", .{ assertions, phase }) catch return error.TcpContractFailed;
+        std.Io.File.stderr().writeStreamingAll(report_io, report) catch {};
+        return error.TcpContractFailed;
+    }
 }
 
 fn connect(port: u16) !tcp.Socket {
@@ -54,6 +61,7 @@ fn ready(listener: tcp.Socket, sockets: []const tcp.Socket, read: []bool, write:
 }
 
 fn noDelay(fd: tcp.Socket) !void {
+    phase = "accepted socket flags";
     var value: c_int = 0;
     if (windows) {
         var len: c_int = @sizeOf(c_int);
@@ -76,6 +84,7 @@ fn noDelay(fd: tcp.Socket) !void {
 }
 
 fn backpressure(listener: tcp.Socket, port: u16) !void {
+    phase = "backpressure connect";
     const client = try connect(port);
     defer tcp.close(client);
     var empty: [0]bool = .{};
@@ -86,6 +95,7 @@ fn backpressure(listener: tcp.Socket, port: u16) !void {
     var saw_backpressure = false;
     var total: usize = 0;
     for (0..2048) |_| {
+        phase = "backpressure fill";
         const sent = (try tcp.send(accepted, &data)) orelse {
             saw_backpressure = true;
             break;
@@ -100,6 +110,7 @@ fn backpressure(listener: tcp.Socket, port: u16) !void {
     defer tcp.close(other_client);
     var read: [1]bool = .{false};
     var write: [1]bool = .{true};
+    phase = "backpressure accept fairness";
     try check(try ready(listener, &.{accepted}, &read, &write));
     const other = (try tcp.accept(listener)) orelse return error.AcceptNotReady;
     defer tcp.close(other);
@@ -113,6 +124,7 @@ fn backpressure(listener: tcp.Socket, port: u16) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    report_io = init.io;
     try tcp.init();
     defer tcp.deinit();
     const listener = try tcp.listen(.{ 127, 0, 0, 1 }, 0);
@@ -134,6 +146,7 @@ pub fn main(init: std.process.Init) !void {
     const accepted = (try tcp.accept(listener)) orelse return error.AcceptNotReady;
     defer tcp.close(accepted);
     try noDelay(accepted);
+    phase = "initial readiness";
     try check(try tcp.accept(listener) == null);
     var buf: [64]u8 = undefined;
     try check(try tcp.recv(accepted, &buf) == null);
@@ -144,12 +157,14 @@ pub fn main(init: std.process.Init) !void {
     try check((try tcp.send(client, "hello")) == 5);
     var masked_read: [1]bool = .{false};
     var masked_write: [1]bool = .{false};
+    phase = "read interest masking";
     try check(!try tcp.waitMasked(listener, &.{accepted}, &masked_read, &masked_write, 0));
     try check(!masked_read[0] and !masked_write[0]);
     masked_read[0] = true;
     try check(!try tcp.waitMasked(listener, &.{accepted}, &masked_read, &masked_write, 1000));
     try check(masked_read[0] and !masked_write[0]);
     write = .{ false, false };
+    phase = "bidirectional bytes";
     try check(!try ready(listener, &.{ accepted, tcp.invalid_socket }, &read, &write));
     try check(read[0] and !read[1]);
     try check((try tcp.recv(accepted, &buf)) == 5);
@@ -160,6 +175,7 @@ pub fn main(init: std.process.Init) !void {
     try check((try tcp.send(accepted, "")) == 0);
     try check((try tcp.recv(accepted, buf[0..0])) == 0);
     // Both interfaces reject mismatched and over-capacity readiness sets.
+    phase = "invalid readiness sets";
     if (tcp.wait(listener, &.{accepted}, &no_read, &no_write, 0)) |_| {
         return error.InvalidSetAccepted;
     } else |err| try check(err == error.InvalidSet);
@@ -171,6 +187,7 @@ pub fn main(init: std.process.Init) !void {
     } else |err| try check(err == error.InvalidSet);
     tcp.close(client);
     client_closed = true;
+    phase = "peer EOF";
     write = .{ false, false };
     _ = try ready(listener, &.{ accepted, tcp.invalid_socket }, &read, &write);
     try check(read[0]);
