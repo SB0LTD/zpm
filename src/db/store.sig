@@ -11,6 +11,15 @@
 //! a caller-owned candidate. Both persist BEFORE publication/acknowledgement.
 //! No database-sized
 //! automatic/stack storage is used. Hooks must not reenter this store.
+//!
+//! Change records (Raw.executeChanges, kind 3): autocommit encodes the single
+//! statement's undo list into `encode_buffer` (or the connection's
+//! transaction_log when no store buffer is set) and persists it before
+//! publication. In an explicit transaction every COMPLETED statement appends
+//! its ops to transaction_log; a failing statement appends nothing and
+//! overflow is TransactionLogCapacity with no state change. COMMIT keeps the
+//! base_generation check first, then persists the accumulated record. Raw
+//! adapters without executeChanges keep the length-framed SQL-text batches.
 
 pub const max_statement_bytes = 65536;
 
@@ -92,6 +101,9 @@ pub fn Store(comptime Raw: type) type {
         autocommit_workspace: ?*Raw = null,
         commit_ctx: ?*anyopaque = null,
         commit_fn: ?CommitFn = null,
+        /// Autocommit change-record buffer (callers serialize; persistence
+        /// reuses its recovery buffer, so any record written is recoverable).
+        encode_buffer: []u8 = &.{},
         durability_required: bool = false,
         /// A failed durable write requires recovery before further writes.
         storage_failed: bool = false,
@@ -113,6 +125,11 @@ pub fn Store(comptime Raw: type) type {
                     return err;
                 };
             }
+        }
+
+        fn persistRecord(context: ?*anyopaque, record: []const u8) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidCommitBatch));
+            try self.persist(record);
         }
 
         const StatementCommit = struct {
@@ -297,6 +314,13 @@ pub fn Store(comptime Raw: type) type {
                 const reading = readonly(source);
                 if (self.in_transaction) {
                     const workspace = self.transaction_workspace orelse return error.InvalidWorkspace;
+                    if (!reading and self.logged and @hasDecl(Raw, "executeChanges")) {
+                        try self.store.storageReady();
+                        if (self.log_used > self.transaction_log.len) return error.TransactionLogCapacity;
+                        try workspace.executeChanges(source, result, self.transaction_log, &self.log_used, null, null);
+                        self.dirty = true;
+                        return;
+                    }
                     if (!reading) {
                         try self.store.storageReady();
                         if (self.logged and (self.log_used > self.transaction_log.len or
@@ -324,6 +348,13 @@ pub fn Store(comptime Raw: type) type {
                     if (workspace == &self.store.database or workspace == self.transaction_workspace) return error.InvalidWorkspace;
                 }
                 if (result == &self.store.autocommit_result) return error.InvalidWorkspace;
+                if (@hasDecl(Raw, "executeChanges")) {
+                    const buffer = if (self.store.encode_buffer.len != 0) self.store.encode_buffer else self.transaction_log;
+                    var used: usize = 0;
+                    try self.store.database.executeChanges(source, result, buffer, &used, self.store, persistRecord);
+                    self.store.generation += 1;
+                    return;
+                }
                 var batch: [max_statement_bytes + 4]u8 = undefined;
                 writeLength(batch[0..4], source.len);
                 @memcpy(batch[4..][0..source.len], source);

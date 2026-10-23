@@ -98,7 +98,20 @@ pub fn recover(file: anytype, scratch: []u8, context: anytype, comptime replay: 
 
 /// Refuses incompatible payload semantics without modifying the original WAL.
 pub fn recoverKind(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, kind: u16) !Recovery {
-    if (kind == 0) return error.UnsupportedLogVersion;
+    if (kind == 0 or kind > 31) return error.UnsupportedLogVersion;
+    return recoverImpl(file, scratch, context, replay, @as(u32, 1) << @intCast(kind), false);
+}
+
+/// Like recoverKind, but accepts every kind whose bit is set in accepted_mask
+/// (bit k accepts kind k; bit 0 is ignored) and calls
+/// replay(context, kind, sequence, payload). Any other kind fails closed with
+/// UnsupportedLogVersion before its payload is replayed.
+pub fn recoverKinds(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, accepted_mask: u32) !Recovery {
+    if (accepted_mask & ~@as(u32, 1) == 0) return error.UnsupportedLogVersion;
+    return recoverImpl(file, scratch, context, replay, accepted_mask & ~@as(u32, 1), true);
+}
+
+fn recoverImpl(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, accepted_mask: u32, comptime with_kind: bool) !Recovery {
     const length: u64 = try file.length();
     var result: Recovery = .{};
     while (result.valid_bytes < length) {
@@ -109,7 +122,8 @@ pub fn recoverKind(file: anytype, scratch: []u8, context: anytype, comptime repl
         const expected_crc = get(u32, header[24..28]);
         @memset(header[24..28], 0);
         if (!equal(header[0..8], magic) or checksum(&header) != expected_crc) return error.CorruptLogHeader;
-        if (get(u16, header[8..10]) != 1 or get(u16, header[10..12]) != kind) return error.UnsupportedLogVersion;
+        const kind = get(u16, header[10..12]);
+        if (get(u16, header[8..10]) != 1 or kind == 0 or kind > 31 or accepted_mask & (@as(u32, 1) << @intCast(kind)) == 0) return error.UnsupportedLogVersion;
         if (get(u32, header[28..32]) != 0) return error.CorruptLogHeader;
         const payload_len: usize = get(u32, header[12..16]);
         if (payload_len == 0) return error.InvalidPayloadLength;
@@ -124,7 +138,7 @@ pub fn recoverKind(file: anytype, scratch: []u8, context: anytype, comptime repl
         try readExact(file, result.valid_bytes + header_size + payload_len, &trailer);
         if (get(u32, trailer[0..4]) != checksum(payload) or !equal(trailer[4..8], commit_magic) or
             get(u64, trailer[8..16]) != sequence) return error.CorruptLogRecord;
-        try replay(context, sequence, payload);
+        if (with_kind) try replay(context, kind, sequence, payload) else try replay(context, sequence, payload);
         result.sequence = sequence;
         result.valid_bytes += record_length;
     }

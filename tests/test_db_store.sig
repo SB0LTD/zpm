@@ -4,6 +4,7 @@ const store_module = @import("db_store");
 const DB = sql.Database(.{ .tables = 2, .columns = 3, .rows_per_table = 8, .text_bytes = 32, .boolean_integers = true });
 const Store = store_module.Store(DB);
 var assertions: usize = 0;
+var replay_scratch: DB.ReplayScratch = .{};
 
 fn check(ok: bool) !void {
     assertions += 1;
@@ -171,16 +172,14 @@ const Probe = struct {
         self.last_length = bytes.len;
         if (bytes.len > self.last_batch.len) return error.TestBatchCapacity;
         @memcpy(self.last_batch[0..bytes.len], bytes);
+        // sql.Database stores persist kind-3 change records, one op per row
+        // or DDL change; replay applies the whole record atomically.
+        const ops = try DB.changeRecordOps(bytes);
+        if (self.fail_after) |limit| if (ops > limit) return error.InjectedStorageFailure;
+        if (ops == 0) return error.EmptyDurableCommit;
         self.scratch = self.durable;
-        var iterator = store_module.BatchIterator{ .bytes = bytes };
-        var completed: usize = 0;
-        while (try iterator.next()) |source| {
-            if (self.fail_after != null and completed == self.fail_after.?) return error.InjectedStorageFailure;
-            try self.scratch.execute(source, &self.result);
-            completed += 1;
-        }
-        if (completed == 0) return error.EmptyDurableCommit;
-        self.records += completed;
+        try self.scratch.applyChangeRecord(bytes, &replay_scratch);
+        self.records += ops;
         self.durable = self.scratch;
     }
 };
@@ -189,7 +188,8 @@ fn durability() !void {
     var candidate: DB = .{};
     var workspace: DB = .{};
     var log: [1024]u8 = undefined;
-    var store: Store = .{ .autocommit_workspace = &candidate, .durability_required = true };
+    var encode: [1024]u8 = undefined;
+    var store: Store = .{ .autocommit_workspace = &candidate, .durability_required = true, .encode_buffer = &encode };
     var connection: Store.Connection = .{
         .store = &store,
         .id = 1,
@@ -222,10 +222,10 @@ fn durability() !void {
     try count(&observer, 2);
     try probe.durable.execute("SELECT * FROM t WHERE id = 2", &out);
     try check(equal(out.rows[0].cells[1].text.slice(), "a;\nb"));
-    var iterator: store_module.BatchIterator = .{ .bytes = probe.last_batch[0..probe.last_length] };
-    try check(equal((try iterator.next()).?, "INSERT INTO t VALUES (2, 'a;\nb')"));
-    try check(equal((try iterator.next()).?, "UPDATE t SET value = 'changed' WHERE id = 1"));
-    try check((try iterator.next()) == null);
+    // The COMMIT record carries both completed statements' row ops.
+    try check(try DB.changeRecordOps(probe.last_batch[0..probe.last_length]) == 2);
+    try probe.durable.execute("SELECT * FROM t WHERE id = 1", &out);
+    try check(equal(out.rows[0].cells[1].text.slice(), "changed"));
     try check(connection.log_used == 0 and !connection.logged);
 
     const calls = probe.calls;

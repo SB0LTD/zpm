@@ -11,129 +11,77 @@
 //! NOT NULL and a single-column PRIMARY KEY. Identifiers are ASCII and case
 //! insensitive; text comparison is bytewise. NULL comparisons are unknown and
 //! therefore do not match WHERE, except explicit IS [NOT] NULL predicates.
-//! Transactions, joins, expressions, aggregates, secondary indices and persistence are
-//! outside this initial SQL subset. No allocator, platform, or std dependency.
+//! Transactions, joins, expressions, aggregates and secondary indices are
+//! outside this initial SQL subset.
+//!
+//! Pipeline (sql/*.sig, relative imports only; nothing outside this module
+//! imports them): lexer -> parser (statement-scoped node pool, bounded depth)
+//! -> binder (names and types, never executes; powers describe()) ->
+//! execution over versioned storage (stable rowids, row versions, PK
+//! multi-index, bounded reclamation) -> kind-3 change records
+//! (executeChanges / applyChangeRecord). `legacy_alpha` replays kind 1/2
+//! SQL-text WAL records with the alpha grammar only.
+//!
+//! No allocator, platform or runtime dependency. The only std symbols this
+//! module and sql/*.sig may ever use are std.fmt.parseFloat(T, s) and
+//! std.fmt.float.render(buf, value, options); today they use none.
+const types = @import("sql/types.sig");
+const ast = @import("sql/ast.sig");
+const parser_module = @import("sql/parser.sig");
+const binder_module = @import("sql/binder.sig");
+const storage = @import("sql/storage.sig");
+const change_log = @import("sql/change_log.sig");
 
-pub const Config = struct {
-    tables: usize = 4,
-    columns: usize = 8,
-    rows_per_table: usize = 128,
-    name_bytes: usize = 32,
-    text_bytes: usize = 128,
-    predicates: usize = 8,
-    /// MySQL/MSSQL BIT clients encode booleans as integer 0/1.
-    boolean_integers: bool = false,
-    /// MySQL-style ordering by default; PostgreSQL uses false (ASC NULLS LAST).
-    nulls_first_ascending: bool = true,
-    /// Preserve the library's historical 64-bit INTEGER by default. PostgreSQL
-    /// servers select 32; BIGINT always provides the full signed 64-bit range.
-    integer_bits: u8 = 64,
+pub const Config = types.Config;
+pub const Error = types.Error;
+pub const DataType = types.DataType;
+pub const CommandTag = types.CommandTag;
+pub const ParseMode = parser_module.Mode;
+pub const typeOid = types.typeOid;
+/// Kind-3 change-record format constants and header validation.
+pub const change_records = struct {
+    pub const format_version = change_log.format_version;
+    pub const header_size = change_log.header_size;
+    pub const first_oid = change_log.first_oid;
+    pub const opCount = change_log.opCount;
 };
-
-pub const Error = error{
-    Syntax,
-    UnsupportedStatement,
-    TableCapacity,
-    ColumnCapacity,
-    RowCapacity,
-    NameCapacity,
-    TextCapacity,
-    PredicateCapacity,
-    TableExists,
-    TableNotFound,
-    ColumnNotFound,
-    DuplicateColumn,
-    TypeMismatch,
-    NotNullViolation,
-    PrimaryKeyViolation,
-    IntegerOverflow,
-};
-
-pub const DataType = enum { integer, integer32, boolean, text };
-
-fn lower(byte: u8) u8 {
-    return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;
-}
-
-fn letter(byte: u8) bool {
-    return (byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z') or byte == '_';
-}
-
-fn digit(byte: u8) bool {
-    return byte >= '0' and byte <= '9';
-}
-
-fn same(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| if (left != right) return false;
-    return true;
-}
-
-fn keyword(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| if (lower(left) != lower(right)) return false;
-    return true;
-}
-
-fn bytesOrder(a: []const u8, b: []const u8) i8 {
-    const count = @min(a.len, b.len);
-    for (0..count) |index| {
-        if (a[index] < b[index]) return -1;
-        if (a[index] > b[index]) return 1;
-    }
-    return if (a.len < b.len) -1 else if (a.len > b.len) 1 else 0;
-}
 
 pub fn Database(comptime config: Config) type {
     if (config.integer_bits != 32 and config.integer_bits != 64) @compileError("SQL INTEGER width must be 32 or 64");
     if (config.tables == 0 or config.columns == 0 or config.rows_per_table == 0 or
-        config.name_bytes == 0 or config.text_bytes == 0 or config.predicates == 0)
+        config.name_bytes == 0 or config.text_bytes == 0 or config.predicates == 0 or
+        config.expr_nodes == 0 or config.expr_depth == 0)
         @compileError("SQL capacities must be non-zero");
+    if (config.tables > 255 or config.columns > 255 or config.name_bytes > 255) @compileError("SQL catalog capacities must fit change records");
+
+    const V = types.Values(config);
+    const S = storage.Storage(config);
+    const A = ast.Ast(config);
+    const P = parser_module.Parser(config);
+    const B = binder_module.Binder(config);
+    const C = change_log.ChangeLog(config);
 
     return struct {
         const Self = @This();
-        pub const integer_type: DataType = if (config.integer_bits == 32) .integer32 else .integer;
-
-        pub const Name = struct {
-            bytes: [config.name_bytes]u8 = @splat(0),
-            len: usize = 0,
-
-            pub fn slice(self: *const Name) []const u8 {
-                return self.bytes[0..self.len];
-            }
-        };
-
-        pub const Text = struct {
-            bytes: [config.text_bytes]u8 = @splat(0),
-            len: usize = 0,
-
-            pub fn slice(self: *const Text) []const u8 {
-                return self.bytes[0..self.len];
-            }
-        };
-
-        pub const Cell = union(enum) {
-            null_value: void,
-            integer: i64,
-            boolean: bool,
-            text: Text,
-        };
-
-        pub const Row = struct {
-            cells: [config.columns]Cell = @splat(.null_value),
-        };
-
-        pub const Column = struct {
-            name: Name = .{},
-            data_type: DataType = .integer,
-            not_null: bool = false,
-            primary_key: bool = false,
-        };
+        pub const integer_type: DataType = B.integer_type;
+        pub const Name = V.Name;
+        pub const Text = V.Text;
+        pub const Cell = V.Cell;
+        pub const Row = V.Row;
+        pub const Column = V.Column;
+        pub const RowRef = S.RowRef;
+        pub const StorageStats = S.Stats;
+        pub const ReplayScratch = C.Scratch;
+        pub const versions_per_table = S.versions_capacity;
+        pub const undo_capacity = S.undo_capacity;
+        /// Receives the complete change record before the statement publishes.
+        pub const RecordCommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
 
         pub const Result = struct {
             column_count: usize = 0,
             row_count: usize = 0,
             affected_rows: usize = 0,
+            command: CommandTag = .none,
             column_names: [config.columns]Name = @splat(.{}),
             column_types: [config.columns]DataType = @splat(.integer),
             rows: [config.rows_per_table]Row = @splat(.{}),
@@ -143,6 +91,7 @@ pub fn Database(comptime config: Config) type {
                 self.column_count = 0;
                 self.row_count = 0;
                 self.affected_rows = affected;
+                self.command = .none;
             }
 
             /// Copy the observable result, without touching unused capacity.
@@ -152,6 +101,7 @@ pub fn Database(comptime config: Config) type {
                 self.column_count = source.column_count;
                 self.row_count = source.row_count;
                 self.affected_rows = source.affected_rows;
+                self.command = source.command;
                 @memcpy(self.column_names[0..source.column_count], source.column_names[0..source.column_count]);
                 @memcpy(self.column_types[0..source.column_count], source.column_types[0..source.column_count]);
                 for (0..source.row_count) |row| {
@@ -160,58 +110,47 @@ pub fn Database(comptime config: Config) type {
             }
         };
 
-        const index_capacity = blk: {
-            var capacity: usize = 2;
-            while (capacity < config.rows_per_table * 2) capacity *= 2;
-            break :blk capacity;
+        /// Statement-scoped scratch inside caller-owned database storage:
+        /// the expression node pool and the statement-local undo list.
+        pub const Workspace = struct {
+            nodes: A.Pool = .{},
+            undo: [S.undo_capacity]S.Undo = undefined,
+            undo_len: usize = 0,
+            saved_oid_counter: u32 = 0,
+            saved_table: ?usize = null,
+            saved_next_rowid: u64 = 0,
         };
 
-        const Table = struct {
-            live: bool = false,
-            name: Name = .{},
-            column_count: usize = 0,
-            row_count: usize = 0,
-            columns: [config.columns]Column = @splat(.{}),
-            rows: [config.rows_per_table]Row = @splat(.{}),
-            primary_column: ?usize = null,
-            // Open addressing, <= 50% load; zero means vacant, other values row+1.
-            primary_index: [index_capacity]usize = @splat(0),
-        };
+        tables: [config.tables]S.Table = @splat(.{}),
+        /// Table OIDs are first_oid + counter; never reused.
+        oid_counter: u32 = 0,
+        /// Local commit sequence; every completed mutation stamps csn + 1.
+        csn: u64 = 0,
+        cid: u32 = 0,
+        epoch: u32 = 0,
+        workspace: Workspace = .{},
 
-        const Operator = enum { equal, not_equal, less, less_equal, greater, greater_equal, is_null, is_not_null };
-        const Predicate = struct {
-            column: usize = 0,
-            op: Operator = .equal,
-            value: Cell = .null_value,
-        };
-        const Filter = struct {
-            items: [config.predicates]Predicate = @splat(.{}),
-            len: usize = 0,
-        };
-
-        tables: [config.tables]Table = @splat(.{}),
-
-        /// Includes all caller-owned table, schema and text storage.
+        /// Includes all caller-owned table, version, index and statement storage.
         pub fn storageBytes() usize {
             return @sizeOf(Self);
         }
 
         /// Copy a complete logical snapshot into distinct caller-owned storage.
-        /// Only live tables, schemas, rows and indices are observable. Inactive
-        /// table payloads and unused row capacity need neither copying nor zeroing.
-        /// All operations must continue to respect live/column_count/row_count.
+        /// Only live tables, schemas, row slots, versions and indices are
+        /// observable. Inactive table payloads and unused row/version capacity
+        /// need neither copying nor zeroing; the statement workspace is scratch.
         pub fn copyFrom(self: *Self, source: *const Self) void {
             if (self == source) return;
+            self.oid_counter = source.oid_counter;
+            self.csn = source.csn;
+            self.cid = source.cid;
+            self.epoch = source.epoch;
             for (&self.tables, &source.tables) |*destination, *table| {
                 destination.live = table.live;
+                destination.pending_create = false;
+                destination.pending_drop = false;
                 if (!table.live) continue;
-                destination.name = table.name;
-                destination.column_count = table.column_count;
-                destination.row_count = table.row_count;
-                destination.primary_column = table.primary_column;
-                @memcpy(destination.columns[0..table.column_count], table.columns[0..table.column_count]);
-                @memcpy(destination.rows[0..table.row_count], table.rows[0..table.row_count]);
-                if (table.primary_column != null) destination.primary_index = table.primary_index;
+                S.copyTable(destination, table);
             }
         }
 
@@ -226,19 +165,41 @@ pub fn Database(comptime config: Config) type {
         /// Result contains copied SELECT rows or a mutation's affected_rows.
         /// Any error preserves the previous result and the whole database.
         pub fn execute(self: *Self, source: []const u8, result: *Result) Error!void {
-            return self.executeInternal(source, result, NoCommit{});
+            return self.run(source, result, .standard, NoCommit{});
+        }
+
+        /// Replays one alpha SQL-text statement (WAL kinds 1/2): alpha grammar,
+        /// MySQL/TDS-style boolean integers, the configured INTEGER width.
+        /// Anything outside the alpha grammar fails with UnsupportedLogVersion.
+        pub fn executeLegacy(self: *Self, source: []const u8, result: *Result) Error!void {
+            return self.run(source, result, .legacy_alpha, NoCommit{});
         }
 
         const NoCommit = struct {
-            fn before(_: @This()) Error!void {}
+            fn before(_: @This(), _: *Self) Error!void {}
         };
 
         const CommitBoundary = struct {
             context: ?*anyopaque,
             commit: *const fn (?*anyopaque) anyerror!void,
 
-            fn before(self: @This()) anyerror!void {
+            fn before(self: @This(), _: *Self) anyerror!void {
                 try self.commit(self.context);
+            }
+        };
+
+        const RecordSink = struct {
+            record: []u8,
+            used: *usize,
+            context: ?*anyopaque,
+            commit: ?RecordCommitFn,
+
+            fn before(self: @This(), db: *Self) anyerror!void {
+                var writer = try change_log.Writer.init(self.record, self.used.*);
+                try db.encodeStatement(&writer);
+                const length = try writer.finish();
+                if (self.commit) |commit| try commit(self.context, self.record[0..length]);
+                self.used.* = length;
             }
         };
 
@@ -250,283 +211,275 @@ pub fn Database(comptime config: Config) type {
         /// read-only observation is permitted. The callback normally
         /// flushes a WAL record. No database snapshot or heap storage is needed.
         pub fn executeWithCommit(self: *Self, source: []const u8, result: *Result, context: ?*anyopaque, commit: *const fn (?*anyopaque) anyerror!void) anyerror!void {
-            return self.executeInternal(source, result, CommitBoundary{ .context = context, .commit = commit });
+            return self.run(source, result, .standard, CommitBoundary{ .context = context, .commit = commit });
         }
 
-        fn executeInternal(self: *Self, source: []const u8, result: *Result, boundary: anytype) !void {
-            var parser = Parser{ .source = source };
-            if (parser.takeWord("CREATE")) return self.create(&parser, result, boundary);
-            if (parser.takeWord("DROP")) return self.drop(&parser, result, boundary);
-            if (parser.takeWord("INSERT")) return self.insert(&parser, result, boundary);
-            if (parser.takeWord("SELECT")) return self.select(&parser, result);
-            if (parser.takeWord("UPDATE")) return self.update(&parser, result, boundary);
-            if (parser.takeWord("DELETE")) return self.delete(&parser, result, boundary);
-            return error.UnsupportedStatement;
+        /// Like executeWithCommit, but encodes the completed statement's row and
+        /// DDL ops (from its undo list) as a kind-3 change record appended to
+        /// record[used..]; a header is written when used is 0. With `commit`,
+        /// the complete record is passed to it before publication; without it
+        /// the bytes are only appended (explicit transactions). `used` changes
+        /// only when the statement succeeds; overflow is TransactionLogCapacity
+        /// with no state change. SELECT encodes nothing and never commits.
+        pub fn executeChanges(self: *Self, source: []const u8, result: *Result, record: []u8, used: *usize, context: ?*anyopaque, commit: ?RecordCommitFn) anyerror!void {
+            return self.run(source, result, .standard, RecordSink{ .record = record, .used = used, .context = context, .commit = commit });
         }
 
-        fn tableIndex(self: *const Self, name: *const Name) Error!usize {
-            for (&self.tables, 0..) |*table, index|
-                if (table.live and same(table.name.slice(), name.slice())) return index;
-            return error.TableNotFound;
-        }
-
-        fn columnIndex(table: *const Table, name: *const Name) Error!usize {
-            for (table.columns[0..table.column_count], 0..) |*column, index|
-                if (same(column.name.slice(), name.slice())) return index;
-            return error.ColumnNotFound;
-        }
-
-        fn hash(value: *const Cell) usize {
-            var code: u64 = 14695981039346656037;
-            switch (value.*) {
-                .integer => |integer| {
-                    var bits: u64 = @bitCast(integer);
-                    for (0..8) |_| {
-                        code = (code ^ @as(u8, @truncate(bits))) *% 1099511628211;
-                        bits >>= 8;
-                    }
-                },
-                .text => |*text| for (text.slice()) |byte| {
-                    code = (code ^ byte) *% 1099511628211;
-                },
-                .boolean => |boolean| code = @intFromBool(boolean),
-                .null_value => unreachable,
+        /// Parse and bind without executing. SELECT reports its output columns.
+        pub fn describe(self: *Self, source: []const u8, result: *Result) Error!void {
+            const statement = try P.parse(source, &self.workspace.nodes, .standard);
+            const context = self.bindContext(source, .standard);
+            const bound = try B.bind(&context, &statement);
+            result.clear(0);
+            result.command = B.command(&bound);
+            if (bound == .select) {
+                const table = &self.tables[bound.select.table];
+                result.column_count = bound.select.count;
+                for (0..bound.select.count) |index| {
+                    result.column_names[index] = table.columns[bound.select.projection[index]].name;
+                    result.column_types[index] = table.columns[bound.select.projection[index]].data_type;
+                }
             }
-            // Mix low bits before the power-of-two table mask.
-            code ^= code >> 33;
-            code *%= 0xff51afd7ed558ccd;
-            code ^= code >> 33;
-            return @truncate(code);
         }
 
-        fn primaryLookup(table: *const Table, value: *const Cell) ?usize {
-            const column = table.primary_column orelse return null;
-            if (value.* == .null_value) return null;
-            var slot = hash(value) & (index_capacity - 1);
-            for (0..index_capacity) |_| {
-                const item = table.primary_index[slot];
-                if (item == 0) return null;
-                if (compare(&table.rows[item - 1].cells[column], value) == 0) return item - 1;
-                slot = (slot + 1) & (index_capacity - 1);
+        /// Applies a kind-3 change record atomically: the whole record is
+        /// decoded and validated against `scratch` before anything changes.
+        pub fn applyChangeRecord(self: *Self, record: []const u8, scratch: *ReplayScratch) Error!void {
+            return C.apply(self, record, scratch);
+        }
+
+        /// Header validation; returns the record's op count.
+        pub fn changeRecordOps(record: []const u8) Error!u32 {
+            return change_log.opCount(record);
+        }
+
+        /// Appends a catalog_counters op (next OID and every live table's next rowid).
+        pub fn encodeCatalogCounters(self: *const Self, record: []u8, used: *usize) Error!void {
+            var writer = try change_log.Writer.init(record, used.*);
+            try C.encodeCounters(&writer, change_log.first_oid + self.oid_counter, &self.tables);
+            used.* = try writer.finish();
+        }
+
+        pub fn storageStats(self: *const Self, table_name: []const u8) ?StorageStats {
+            const index = B.tableIndex(&self.tables, table_name) catch return null;
+            return S.stats(&self.tables[index]);
+        }
+
+        pub fn rowRef(self: *const Self, table_name: []const u8, rowid: u64) ?RowRef {
+            const index = B.tableIndex(&self.tables, table_name) catch return null;
+            const table = &self.tables[index];
+            const slot = S.findRow(table, rowid) orelse return null;
+            return .{ .slot = slot, .generation = table.rows[slot].generation };
+        }
+
+        /// Resolves a reference to its rowid; stale generations never resolve.
+        pub fn resolveRowRef(self: *const Self, table_name: []const u8, ref: RowRef) ?u64 {
+            const index = B.tableIndex(&self.tables, table_name) catch return null;
+            const table = &self.tables[index];
+            if (ref.slot >= table.row_high) return null;
+            const slot = &table.rows[ref.slot];
+            if (slot.newest == 0 or slot.generation != ref.generation) return null;
+            return slot.rowid;
+        }
+
+        /// Reclaims every dead version and empty row slot now.
+        pub fn vacuum(self: *Self) usize {
+            var freed: usize = 0;
+            for (&self.tables) |*table| if (table.live) {
+                freed += S.vacuum(table, self.csn);
+            };
+            return freed;
+        }
+
+        fn bindContext(self: *const Self, source: []const u8, mode: ParseMode) B.Context {
+            return .{ .source = source, .tables = &self.tables, .pool = &self.workspace.nodes, .boolean_integers = config.boolean_integers or mode == .legacy_alpha };
+        }
+
+        fn legacy(mode: ParseMode, err: Error) Error {
+            if (mode == .legacy_alpha and (err == error.Syntax or err == error.UnsupportedStatement)) return error.UnsupportedLogVersion;
+            return err;
+        }
+
+        fn run(self: *Self, source: []const u8, result: *Result, mode: ParseMode, sink: anytype) !void {
+            const statement = P.parse(source, &self.workspace.nodes, mode) catch |err| return legacy(mode, err);
+            const context = self.bindContext(source, mode);
+            const bound = B.bind(&context, &statement) catch |err| return legacy(mode, err);
+            switch (bound) {
+                .select => |*select| return self.runSelect(select, result),
+                // Transaction control belongs to the store, not a single Raw.
+                .begin, .commit, .rollback => return legacy(mode, error.UnsupportedStatement),
+                else => {},
             }
-            return null;
+            try self.mutate(&bound, result, sink);
         }
 
-        fn indexRow(table: *Table, row: usize) void {
-            const column = table.primary_column orelse return;
-            var slot = hash(&table.rows[row].cells[column]) & (index_capacity - 1);
-            while (table.primary_index[slot] != 0) slot = (slot + 1) & (index_capacity - 1);
-            table.primary_index[slot] = row + 1;
+        fn txRef(self: *const Self) S.TxRef {
+            return .{ .slot = 0, .epoch = self.epoch, .sub = 0 };
         }
 
-        fn rebuildIndex(table: *Table) void {
-            @memset(&table.primary_index, 0);
-            if (table.primary_column == null) return;
-            for (0..table.row_count) |row| indexRow(table, row);
+        fn push(self: *Self, entry: S.Undo) void {
+            // Bounded: one statement touches at most rows_per_table rows of one table.
+            self.workspace.undo[self.workspace.undo_len] = entry;
+            self.workspace.undo_len += 1;
         }
 
-        fn primaryPredicate(table: *const Table, where: *const Filter) ?*const Cell {
+        fn mutate(self: *Self, bound: *const B.Bound, result: *Result, sink: anytype) !void {
+            const workspace = &self.workspace;
+            workspace.undo_len = 0;
+            workspace.saved_oid_counter = self.oid_counter;
+            workspace.saved_table = null;
+            self.epoch +%= 1;
+            if (self.epoch == 0) self.epoch = 1;
+            self.cid +%= 1;
+            errdefer self.undoStatement();
+            const affected = switch (bound.*) {
+                .create_table => |*create| try self.createTable(create),
+                .drop_table => |index| blk: {
+                    self.tables[index].pending_drop = true;
+                    self.push(.{ .kind = .drop_table, .table = @intCast(index) });
+                    break :blk 0;
+                },
+                .insert => |*insert| try self.insertRow(insert),
+                .update => |*update| try self.updateRows(update),
+                .delete => |*delete| self.deleteRows(delete),
+                .select, .begin, .commit, .rollback => unreachable,
+            };
+            try sink.before(self);
+            self.stampStatement();
+            result.clear(affected);
+            result.command = B.command(bound);
+        }
+
+        /// A failing statement frees the versions it created and clears the
+        /// xmax marks it set (reclamation case 1) before the error returns.
+        fn undoStatement(self: *Self) void {
+            const workspace = &self.workspace;
+            var index = workspace.undo_len;
+            while (index != 0) {
+                index -= 1;
+                const entry = workspace.undo[index];
+                const table = &self.tables[entry.table];
+                switch (entry.kind) {
+                    .insert => S.reclaimVersion(table, entry.new),
+                    .update => {
+                        S.reclaimVersion(table, entry.new);
+                        clearMark(table, entry.old);
+                    },
+                    .delete => clearMark(table, entry.old),
+                    .create_table => table.pending_create = false,
+                    .drop_table => table.pending_drop = false,
+                }
+            }
+            workspace.undo_len = 0;
+            self.oid_counter = workspace.saved_oid_counter;
+            if (workspace.saved_table) |table| self.tables[table].next_rowid = workspace.saved_next_rowid;
+        }
+
+        fn clearMark(table: *S.Table, version: u32) void {
+            table.versions[version].xmax = .{};
+            table.versions[version].xmax_cid = 0;
+        }
+
+        /// Stamps the statement committed in this Raw, then reclaims up to
+        /// reclaim_budget superseded versions (horizon = current csn).
+        fn stampStatement(self: *Self) void {
+            const csn = self.csn + 1;
+            const workspace = &self.workspace;
+            for (workspace.undo[0..workspace.undo_len]) |entry| {
+                const table = &self.tables[entry.table];
+                switch (entry.kind) {
+                    .insert => table.versions[entry.new].xmin_csn = csn,
+                    .update => {
+                        table.versions[entry.new].xmin_csn = csn;
+                        table.versions[entry.old].xmax_csn = csn;
+                    },
+                    .delete => table.versions[entry.old].xmax_csn = csn,
+                    .create_table => {
+                        table.pending_create = false;
+                        table.live = true;
+                    },
+                    .drop_table => {
+                        table.pending_drop = false;
+                        table.live = false;
+                    },
+                }
+            }
+            self.csn = csn;
+            var budget: usize = S.reclaim_budget;
+            for (workspace.undo[0..workspace.undo_len]) |entry| {
+                if (budget == 0) break;
+                if (entry.kind != .update and entry.kind != .delete) continue;
+                const table = &self.tables[entry.table];
+                if (!table.live) continue;
+                S.reclaimVersion(table, entry.old);
+                budget -= 1;
+            }
+            workspace.undo_len = 0;
+        }
+
+        fn encodeStatement(self: *const Self, writer: *change_log.Writer) Error!void {
+            const workspace = &self.workspace;
+            for (workspace.undo[0..workspace.undo_len]) |entry| {
+                const table = &self.tables[entry.table];
+                switch (entry.kind) {
+                    .insert, .update => {
+                        const version = &table.versions[entry.new];
+                        const tag: change_log.Op = if (entry.kind == .insert) .insert else .update;
+                        try C.encodeRow(writer, tag, table.oid, table.rows[version.row - 1].rowid, version.cells[0..table.column_count]);
+                    },
+                    .delete => try C.encodeDelete(writer, table.oid, table.rows[table.versions[entry.old].row - 1].rowid),
+                    .create_table => try C.encodeCreate(writer, table),
+                    .drop_table => try C.encodeDrop(writer, table.oid),
+                }
+            }
+        }
+
+        fn createTable(self: *Self, create: *const B.Create) Error!usize {
+            var destination: ?usize = null;
+            for (&self.tables, 0..) |*table, index| if (!table.live and !table.pending_create) {
+                destination = index;
+                break;
+            };
+            const index = destination orelse return error.TableCapacity;
+            if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
+            const table = &self.tables[index];
+            S.reset(table, change_log.first_oid + self.oid_counter, create.name, create.columns[0..create.count]);
+            self.oid_counter += 1;
+            table.pending_create = true;
+            self.push(.{ .kind = .create_table, .table = @intCast(index) });
+            return 0;
+        }
+
+        fn insertRow(self: *Self, insert: *const B.Insert) Error!usize {
+            const table = &self.tables[insert.table];
+            if (table.primary_column) |column| {
+                if (S.lookupKey(table, &insert.row.cells[column]) != null) return error.PrimaryKeyViolation;
+            }
+            if (table.next_rowid == 0xffffffffffffffff) return error.RowCapacity;
+            try S.ensureVersions(table, 1, self.csn);
+            try S.ensureRowSlot(table, self.csn);
+            self.workspace.saved_table = insert.table;
+            self.workspace.saved_next_rowid = table.next_rowid;
+            const slot = S.allocRow(table, table.next_rowid);
+            table.next_rowid += 1;
+            const version = S.allocVersion(table);
+            table.versions[version] = .{ .row = slot + 1, .xmin = self.txRef(), .xmin_cid = self.cid, .cells = insert.row.cells };
+            table.rows[slot].newest = version + 1;
+            S.indexKey(table, version);
+            self.push(.{ .kind = .insert, .table = @intCast(insert.table), .new = version });
+            return 1;
+        }
+
+        fn primaryPredicate(table: *const S.Table, where: *const B.Filter) ?*const Cell {
             const column = table.primary_column orelse return null;
             for (where.items[0..where.len]) |*item|
                 if (item.column == column and item.op == .equal) return &item.value;
             return null;
         }
 
-        fn create(self: *Self, parser: *Parser, result: *Result, boundary: anytype) !void {
-            try parser.expectWord("TABLE");
-            const name = try parser.name();
-            for (&self.tables) |*table|
-                if (table.live and same(table.name.slice(), name.slice())) return error.TableExists;
-            try parser.expect('(');
-            var columns: [config.columns]Column = @splat(.{});
-            var count: usize = 0;
-            var has_primary = false;
-            while (true) {
-                if (count == config.columns) return error.ColumnCapacity;
-                var column: Column = .{ .name = try parser.name() };
-                for (columns[0..count]) |*previous|
-                    if (same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
-                if (parser.takeWord("INTEGER") or parser.takeWord("INT")) {
-                    column.data_type = integer_type;
-                } else if (parser.takeWord("BIGINT") or parser.takeWord("INT8")) {
-                    column.data_type = .integer;
-                } else if (parser.takeWord("BOOLEAN") or parser.takeWord("BOOL")) {
-                    column.data_type = .boolean;
-                } else if (parser.takeWord("TEXT")) {
-                    column.data_type = .text;
-                } else return error.Syntax;
-                var has_not_null = false;
-                while (true) {
-                    if (parser.takeWord("NOT")) {
-                        if (has_not_null) return error.Syntax;
-                        try parser.expectWord("NULL");
-                        has_not_null = true;
-                        column.not_null = true;
-                    } else if (parser.takeWord("PRIMARY")) {
-                        if (has_primary) return error.Syntax;
-                        try parser.expectWord("KEY");
-                        has_primary = true;
-                        column.primary_key = true;
-                        column.not_null = true;
-                    } else break;
-                }
-                columns[count] = column;
-                count += 1;
-                if (!parser.take(',')) break;
-            }
-            try parser.expect(')');
-            try parser.finish();
-            var destination: ?usize = null;
-            for (&self.tables, 0..) |*table, index| if (!table.live) {
-                destination = index;
-                break;
-            };
-            const index = destination orelse return error.TableCapacity;
-            const table = &self.tables[index];
-            try boundary.before();
-            table.live = true;
-            table.name = name;
-            table.column_count = count;
-            table.row_count = 0;
-            table.columns = columns;
-            table.primary_column = null;
-            @memset(&table.primary_index, 0);
-            for (columns[0..count], 0..) |column, column_index|
-                if (column.primary_key) {
-                    self.tables[index].primary_column = column_index;
-                };
-            result.clear(0);
-        }
-
-        fn drop(self: *Self, parser: *Parser, result: *Result, boundary: anytype) !void {
-            try parser.expectWord("TABLE");
-            const name = try parser.name();
-            const index = try self.tableIndex(&name);
-            try parser.finish();
-            try boundary.before();
-            self.tables[index].live = false;
-            result.clear(0);
-        }
-
-        fn validate(column: *const Column, value: *Cell) Error!void {
-            if (config.boolean_integers and column.data_type == .boolean and value.* == .integer) {
-                // Capture the payload before changing the active union tag.
-                const integer = value.integer;
-                if (integer != 0 and integer != 1) return error.TypeMismatch;
-                const boolean = integer == 1;
-                value.* = .{ .boolean = boolean };
-            }
-            switch (value.*) {
-                .null_value => if (column.not_null) return error.NotNullViolation,
-                .integer => |integer| {
-                    if (column.data_type != .integer and column.data_type != .integer32) return error.TypeMismatch;
-                    if (column.data_type == .integer32 and (integer < -2147483648 or integer > 2147483647)) return error.IntegerOverflow;
-                },
-                .boolean => if (column.data_type != .boolean) return error.TypeMismatch,
-                .text => if (column.data_type != .text) return error.TypeMismatch,
-            }
-        }
-
-        fn insert(self: *Self, parser: *Parser, result: *Result, boundary: anytype) !void {
-            try parser.expectWord("INTO");
-            const name = try parser.name();
-            const table = &self.tables[try self.tableIndex(&name)];
-            var mapping: [config.columns]usize = @splat(0);
-            var mapped: [config.columns]bool = @splat(false);
-            var count: usize = 0;
-            if (parser.take('(')) {
-                while (true) {
-                    if (count == config.columns) return error.ColumnCapacity;
-                    const column_name = try parser.name();
-                    const index = try columnIndex(table, &column_name);
-                    if (mapped[index]) return error.DuplicateColumn;
-                    mapping[count] = index;
-                    mapped[index] = true;
-                    count += 1;
-                    if (!parser.take(',')) break;
-                }
-                try parser.expect(')');
-            } else {
-                count = table.column_count;
-                for (0..count) |index| mapping[index] = index;
-            }
-            try parser.expectWord("VALUES");
-            try parser.expect('(');
-            var row: Row = .{};
-            for (0..count) |index| {
-                if (index != 0) try parser.expect(',');
-                row.cells[mapping[index]] = try parser.literal();
-            }
-            try parser.expect(')');
-            try parser.finish();
-            for (table.columns[0..table.column_count], 0..) |*column, index| {
-                try validate(column, &row.cells[index]);
-                if (column.primary_key) {
-                    if (primaryLookup(table, &row.cells[index]) != null) return error.PrimaryKeyViolation;
-                }
-            }
-            if (table.row_count == config.rows_per_table) return error.RowCapacity;
-            try boundary.before();
-            table.rows[table.row_count] = row;
-            indexRow(table, table.row_count);
-            table.row_count += 1;
-            result.clear(1);
-        }
-
-        fn filter(parser: *Parser, table: *const Table) Error!Filter {
-            var out: Filter = .{};
-            if (!parser.takeWord("WHERE")) return out;
-            while (true) {
-                if (out.len == config.predicates) return error.PredicateCapacity;
-                const name = try parser.name();
-                var predicate: Predicate = .{ .column = try columnIndex(table, &name) };
-                if (parser.takeWord("IS")) {
-                    predicate.op = if (parser.takeWord("NOT")) .is_not_null else .is_null;
-                    try parser.expectWord("NULL");
-                } else {
-                    if (parser.take('=')) {
-                        predicate.op = .equal;
-                    } else if (parser.take('!')) {
-                        try parser.expect('=');
-                        predicate.op = .not_equal;
-                    } else if (parser.take('<')) {
-                        predicate.op = if (parser.take('=')) .less_equal else if (parser.take('>')) .not_equal else .less;
-                    } else if (parser.take('>')) {
-                        predicate.op = if (parser.take('=')) .greater_equal else .greater;
-                    } else return error.Syntax;
-                    predicate.value = try parser.literal();
-                    if (predicate.value != .null_value) {
-                        var column = table.columns[predicate.column];
-                        column.not_null = false;
-                        // PostgreSQL promotes out-of-range comparison constants;
-                        // range enforcement belongs to assignment, not WHERE.
-                        if (column.data_type == .integer32) column.data_type = .integer;
-                        try validate(&column, &predicate.value);
-                    }
-                }
-                out.items[out.len] = predicate;
-                out.len += 1;
-                if (!parser.takeWord("AND")) break;
-            }
-            return out;
-        }
-
-        /// NULL sorts first for ASC, last for DESC. Other values have strict
-        /// schema types; no numeric/text or integer/boolean coercion occurs.
-        fn compare(left: *const Cell, right: *const Cell) i8 {
-            if (left.* == .null_value) return if (right.* == .null_value) 0 else -1;
-            if (right.* == .null_value) return 1;
-            return switch (left.*) {
-                .null_value => 0,
-                .integer => |value| if (value < right.integer) -1 else if (value > right.integer) 1 else 0,
-                .boolean => |value| if (value == right.boolean) 0 else if (value) 1 else -1,
-                .text => |*value| bytesOrder(value.slice(), right.text.slice()),
-            };
-        }
-
-        fn matches(row: *const Row, where: *const Filter) bool {
+        fn matches(cells: *const [config.columns]Cell, where: *const B.Filter) bool {
             for (where.items[0..where.len]) |*predicate| {
-                const value = &row.cells[predicate.column];
+                const value = &cells[predicate.column];
                 if (predicate.op == .is_null) {
                     if (value.* != .null_value) return false;
                     continue;
@@ -536,7 +489,7 @@ pub fn Database(comptime config: Config) type {
                     continue;
                 }
                 if (value.* == .null_value or predicate.value == .null_value) return false;
-                const order = compare(value, &predicate.value);
+                const order = V.compare(value, &predicate.value);
                 const matched = switch (predicate.op) {
                     .equal => order == 0,
                     .not_equal => order != 0,
@@ -551,289 +504,126 @@ pub fn Database(comptime config: Config) type {
             return true;
         }
 
-        fn select(self: *Self, parser: *Parser, result: *Result) Error!void {
-            const all = parser.take('*');
-            var names: [config.columns]Name = @splat(.{});
-            var count: usize = 0;
-            if (!all) {
-                while (true) {
-                    if (count == config.columns) return error.ColumnCapacity;
-                    names[count] = try parser.name();
-                    count += 1;
-                    if (!parser.take(',')) break;
-                }
+        /// Committed rows matching `where`, in rowid order (directory slots).
+        fn selectRows(table: *const S.Table, where: *const B.Filter, slots: *[config.rows_per_table]u32) usize {
+            if (primaryPredicate(table, where)) |key| {
+                const slot = S.lookupKey(table, key) orelse return 0;
+                const version = S.visible(table, slot).?;
+                if (!matches(&table.versions[version].cells, where)) return 0;
+                slots[0] = slot;
+                return 1;
             }
-            try parser.expectWord("FROM");
-            const name = try parser.name();
-            const table = &self.tables[try self.tableIndex(&name)];
-            var projection: [config.columns]usize = @splat(0);
-            if (all) {
-                count = table.column_count;
-                for (0..count) |index| projection[index] = index;
-            } else {
-                for (0..count) |index| projection[index] = try columnIndex(table, &names[index]);
-            }
-            const where = try filter(parser, table);
-            var order_column: ?usize = null;
-            var descending = false;
-            var explicit_nulls_first: ?bool = null;
-            if (parser.takeWord("ORDER")) {
-                try parser.expectWord("BY");
-                const column_name = try parser.name();
-                order_column = try columnIndex(table, &column_name);
-                if (parser.takeWord("DESC")) descending = true else _ = parser.takeWord("ASC");
-                if (parser.takeWord("NULLS")) {
-                    if (parser.takeWord("FIRST")) explicit_nulls_first = true else if (parser.takeWord("LAST")) explicit_nulls_first = false else return error.Syntax;
-                }
-            }
-            var limit: u64 = config.rows_per_table;
-            if (parser.takeWord("LIMIT")) limit = try parser.unsigned(18446744073709551615);
-            try parser.finish();
-            var indices: [config.rows_per_table]usize = undefined;
             var found: usize = 0;
-            if (primaryPredicate(table, &where)) |key| {
-                if (primaryLookup(table, key)) |index| {
-                    if (matches(&table.rows[index], &where)) {
-                        indices[0] = index;
+            for (0..table.row_high) |slot| {
+                const version = S.visible(table, slot) orelse continue;
+                if (!matches(&table.versions[version].cells, where)) continue;
+                slots[found] = @intCast(slot);
+                found += 1;
+            }
+            return found;
+        }
+
+        fn updateRows(self: *Self, update: *const B.Update) Error!usize {
+            const table = &self.tables[update.table];
+            var selected: [config.rows_per_table]u32 = undefined;
+            const affected = selectRows(table, &update.where, &selected);
+            // All assignments are literals. Assigning one primary-key value to
+            // multiple rows necessarily collides; compare untouched rows too.
+            if (affected != 0) {
+                for (table.columns[0..table.column_count], 0..) |*column, index| {
+                    if (!column.primary_key or !update.assigned[index]) continue;
+                    if (affected > 1) return error.PrimaryKeyViolation;
+                    if (S.lookupKey(table, &update.assignments.cells[index])) |slot|
+                        if (slot != selected[0]) return error.PrimaryKeyViolation;
+                }
+            }
+            try S.ensureVersions(table, affected, self.csn);
+            for (selected[0..affected]) |slot| {
+                const old = S.visible(table, slot).?;
+                const version = S.allocVersion(table);
+                table.versions[version] = .{ .row = slot + 1, .xmin = self.txRef(), .xmin_cid = self.cid, .older = old + 1, .cells = table.versions[old].cells };
+                for (0..table.column_count) |column| if (update.assigned[column]) {
+                    table.versions[version].cells[column] = update.assignments.cells[column];
+                };
+                table.rows[slot].newest = version + 1;
+                table.versions[old].xmax = self.txRef();
+                table.versions[old].xmax_cid = self.cid;
+                S.indexKey(table, version);
+                self.push(.{ .kind = .update, .table = @intCast(update.table), .old = old, .new = version });
+            }
+            return affected;
+        }
+
+        fn deleteRows(self: *Self, delete: *const B.Delete) usize {
+            const table = &self.tables[delete.table];
+            var selected: [config.rows_per_table]u32 = undefined;
+            const affected = selectRows(table, &delete.where, &selected);
+            for (selected[0..affected]) |slot| {
+                const old = S.visible(table, slot).?;
+                table.versions[old].xmax = self.txRef();
+                table.versions[old].xmax_cid = self.cid;
+                self.push(.{ .kind = .delete, .table = @intCast(delete.table), .old = old });
+            }
+            return affected;
+        }
+
+        fn runSelect(self: *const Self, query: *const B.Select, result: *Result) Error!void {
+            const table = &self.tables[query.table];
+            var indices: [config.rows_per_table]u32 = undefined;
+            var found: usize = 0;
+            if (primaryPredicate(table, &query.where)) |key| {
+                if (S.lookupKey(table, key)) |slot| {
+                    const version = S.visible(table, slot).?;
+                    if (matches(&table.versions[version].cells, &query.where)) {
+                        indices[0] = version;
                         found = 1;
                     }
                 }
-            } else if (limit != 0) {
-                for (table.rows[0..table.row_count], 0..) |*row, index| if (matches(row, &where)) {
-                    indices[found] = index;
+            } else if (query.limit != 0) {
+                for (0..table.row_high) |slot| {
+                    const version = S.visible(table, slot) orelse continue;
+                    if (!matches(&table.versions[version].cells, &query.where)) continue;
+                    indices[found] = version;
                     found += 1;
-                    if (order_column == null and found >= limit) break;
-                };
+                    if (query.order_column == null and found >= query.limit) break;
+                }
             }
-            if (order_column) |column| {
-                const nulls_first = explicit_nulls_first orelse (config.nulls_first_ascending != descending);
-                // Stable insertion sort over row indices avoids copying text
-                // cells during sorting and preserves insertion order for ties.
+            if (query.order_column) |column| {
+                const nulls_first = query.nulls_first orelse (config.nulls_first_ascending != query.descending);
+                // Stable insertion sort over version indices avoids copying text
+                // cells during sorting and preserves rowid order for ties.
                 var index: usize = 1;
                 while (index < found) : (index += 1) {
-                    const selected = indices[index];
+                    const chosen = indices[index];
                     var position = index;
                     while (position != 0) {
-                        const left = &table.rows[selected].cells[column];
-                        const right = &table.rows[indices[position - 1]].cells[column];
+                        const left = &table.versions[chosen].cells[column];
+                        const right = &table.versions[indices[position - 1]].cells[column];
                         const order = if (left.* == .null_value or right.* == .null_value) blk: {
                             if (left.* == .null_value and right.* == .null_value) break :blk @as(i8, 0);
                             break :blk if ((left.* == .null_value) == nulls_first) @as(i8, -1) else @as(i8, 1);
                         } else blk: {
-                            const value = compare(left, right);
-                            break :blk if (descending) -value else value;
+                            const value = V.compare(left, right);
+                            break :blk if (query.descending) -value else value;
                         };
                         if (order >= 0) break;
                         indices[position] = indices[position - 1];
                         position -= 1;
                     }
-                    indices[position] = selected;
+                    indices[position] = chosen;
                 }
             }
             result.clear(0);
-            result.column_count = count;
-            result.row_count = if (limit < found) @intCast(limit) else found;
-            for (0..count) |index| {
-                result.column_names[index] = table.columns[projection[index]].name;
-                result.column_types[index] = table.columns[projection[index]].data_type;
+            result.command = .select;
+            result.column_count = query.count;
+            result.row_count = if (query.limit < found) @intCast(query.limit) else found;
+            for (0..query.count) |index| {
+                result.column_names[index] = table.columns[query.projection[index]].name;
+                result.column_types[index] = table.columns[query.projection[index]].data_type;
             }
-            for (0..result.row_count) |row_index| for (0..count) |column| {
-                result.rows[row_index].cells[column] = table.rows[indices[row_index]].cells[projection[column]];
+            for (0..result.row_count) |row_index| for (0..query.count) |column| {
+                result.rows[row_index].cells[column] = table.versions[indices[row_index]].cells[query.projection[column]];
             };
         }
-
-        fn update(self: *Self, parser: *Parser, result: *Result, boundary: anytype) !void {
-            const name = try parser.name();
-            const table = &self.tables[try self.tableIndex(&name)];
-            try parser.expectWord("SET");
-            var assignments: Row = .{};
-            var assigned: [config.columns]bool = @splat(false);
-            while (true) {
-                const column_name = try parser.name();
-                const column = try columnIndex(table, &column_name);
-                if (assigned[column]) return error.DuplicateColumn;
-                try parser.expect('=');
-                assignments.cells[column] = try parser.literal();
-                try validate(&table.columns[column], &assignments.cells[column]);
-                assigned[column] = true;
-                if (!parser.take(',')) break;
-            }
-            const where = try filter(parser, table);
-            try parser.finish();
-            var selected: [config.rows_per_table]bool = undefined;
-            var affected: usize = 0;
-            var last_selected: usize = 0;
-            if (primaryPredicate(table, &where)) |key| {
-                if (primaryLookup(table, key)) |index| {
-                    if (matches(&table.rows[index], &where)) {
-                        affected = 1;
-                        last_selected = index;
-                    }
-                }
-            } else {
-                @memset(&selected, false);
-                for (table.rows[0..table.row_count], 0..) |*row, index| if (matches(row, &where)) {
-                    selected[index] = true;
-                    affected += 1;
-                    last_selected = index;
-                };
-            }
-            // All assignments are literals. Assigning one primary-key value to
-            // multiple rows necessarily collides; compare untouched rows too.
-            if (affected != 0) {
-                for (table.columns[0..table.column_count], 0..) |*column, index| {
-                    if (!column.primary_key or !assigned[index]) continue;
-                    if (affected > 1) return error.PrimaryKeyViolation;
-                    if (primaryLookup(table, &assignments.cells[index])) |row_index|
-                        if (row_index != last_selected) return error.PrimaryKeyViolation;
-                }
-            }
-            try boundary.before();
-            if (affected == 1) {
-                for (0..table.column_count) |column| if (assigned[column]) {
-                    table.rows[last_selected].cells[column] = assignments.cells[column];
-                };
-            } else if (affected > 1) {
-                for (0..table.row_count) |row_index| if (selected[row_index]) {
-                    for (0..table.column_count) |column| if (assigned[column]) {
-                        table.rows[row_index].cells[column] = assignments.cells[column];
-                    };
-                };
-            }
-            if (affected != 0) {
-                if (table.primary_column) |column| if (assigned[column]) {
-                    rebuildIndex(table);
-                };
-            }
-            result.clear(affected);
-        }
-
-        fn delete(self: *Self, parser: *Parser, result: *Result, boundary: anytype) !void {
-            try parser.expectWord("FROM");
-            const name = try parser.name();
-            const table = &self.tables[try self.tableIndex(&name)];
-            const where = try filter(parser, table);
-            try parser.finish();
-            try boundary.before();
-            var kept: usize = 0;
-            const old_count = table.row_count;
-            for (0..old_count) |index| {
-                if (matches(&table.rows[index], &where)) continue;
-                if (kept != index) table.rows[kept] = table.rows[index];
-                kept += 1;
-            }
-            // Discarded payloads are outside row_count and never observable.
-            // New INSERTs initialize their complete row before publication.
-            table.row_count = kept;
-            if (kept != old_count) rebuildIndex(table);
-            result.clear(old_count - kept);
-        }
-
-        const Parser = struct {
-            source: []const u8,
-            position: usize = 0,
-
-            fn space(self: *Parser) void {
-                while (self.position < self.source.len) {
-                    const byte = self.source[self.position];
-                    if (byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n') {
-                        self.position += 1;
-                    } else if (byte == '-' and self.position + 1 < self.source.len and self.source[self.position + 1] == '-') {
-                        self.position += 2;
-                        while (self.position < self.source.len and self.source[self.position] != '\n') self.position += 1;
-                    } else break;
-                }
-            }
-
-            fn take(self: *Parser, byte: u8) bool {
-                self.space();
-                if (self.position == self.source.len or self.source[self.position] != byte) return false;
-                self.position += 1;
-                return true;
-            }
-
-            fn expect(self: *Parser, byte: u8) Error!void {
-                if (!self.take(byte)) return error.Syntax;
-            }
-
-            fn word(self: *Parser) []const u8 {
-                self.space();
-                const start = self.position;
-                if (start == self.source.len or !letter(self.source[start])) return self.source[start..start];
-                self.position += 1;
-                while (self.position < self.source.len and (letter(self.source[self.position]) or digit(self.source[self.position]))) self.position += 1;
-                return self.source[start..self.position];
-            }
-
-            fn takeWord(self: *Parser, expected: []const u8) bool {
-                const saved = self.position;
-                if (keyword(self.word(), expected)) return true;
-                self.position = saved;
-                return false;
-            }
-
-            fn expectWord(self: *Parser, expected: []const u8) Error!void {
-                if (!self.takeWord(expected)) return error.Syntax;
-            }
-
-            fn name(self: *Parser) Error!Name {
-                const source = self.word();
-                if (source.len == 0) return error.Syntax;
-                for ([_][]const u8{ "CREATE", "DROP", "INSERT", "SELECT", "UPDATE", "DELETE", "TABLE", "INTO", "VALUES", "FROM", "WHERE", "AND", "OR", "SET", "ORDER", "BY", "ASC", "DESC", "LIMIT", "IS", "NOT", "NULL", "TRUE", "FALSE", "PRIMARY", "KEY" }) |reserved|
-                    if (keyword(source, reserved)) return error.Syntax;
-                if (source.len > config.name_bytes) return error.NameCapacity;
-                var out: Name = .{ .len = source.len };
-                for (source, 0..) |byte, index| out.bytes[index] = lower(byte);
-                return out;
-            }
-
-            fn unsigned(self: *Parser, maximum: u64) Error!u64 {
-                self.space();
-                const start = self.position;
-                var value: u64 = 0;
-                while (self.position < self.source.len and digit(self.source[self.position])) : (self.position += 1) {
-                    const next: u64 = self.source[self.position] - '0';
-                    if (value > (maximum - next) / 10) return error.IntegerOverflow;
-                    value = value * 10 + next;
-                }
-                if (start == self.position) return error.Syntax;
-                if (self.position < self.source.len and letter(self.source[self.position])) return error.Syntax;
-                return value;
-            }
-
-            fn literal(self: *Parser) Error!Cell {
-                if (self.takeWord("NULL")) return .null_value;
-                if (self.takeWord("TRUE")) return .{ .boolean = true };
-                if (self.takeWord("FALSE")) return .{ .boolean = false };
-                if (self.take('\'')) {
-                    var text: Text = .{};
-                    while (self.position < self.source.len) {
-                        const byte = self.source[self.position];
-                        self.position += 1;
-                        if (byte == '\'') {
-                            if (self.position == self.source.len or self.source[self.position] != '\'') return .{ .text = text };
-                            self.position += 1;
-                        }
-                        if (text.len == config.text_bytes) return error.TextCapacity;
-                        text.bytes[text.len] = byte;
-                        text.len += 1;
-                    }
-                    return error.Syntax;
-                }
-                const negative = self.take('-');
-                const magnitude = try self.unsigned(if (negative) 9223372036854775808 else 9223372036854775807);
-                const integer: i64 = if (negative)
-                    (if (magnitude == 9223372036854775808) -9223372036854775808 else -@as(i64, @intCast(magnitude)))
-                else
-                    @intCast(magnitude);
-                return .{ .integer = integer };
-            }
-
-            fn finish(self: *Parser) Error!void {
-                _ = self.take(';');
-                self.space();
-                if (self.position != self.source.len) return error.Syntax;
-            }
-        };
     };
 }

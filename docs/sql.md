@@ -1,7 +1,8 @@
 # Allocator-free in-memory SQL
 
-`src/core/sql.sig` is the reusable Layer 0 `@zpm/sql` package. It has no imports,
-system libraries, platform dependencies, or allocator parameters. The RAMSQL
+`src/core/sql.sig` is the reusable Layer 0 `@zpm/sql` package. It imports only its own
+`src/core/sql/*.sig` sub-files (relative imports; consumers import only `sql`) and
+has no system libraries, platform dependencies, or allocator parameters. The RAMSQL
 project consumes this engine rather than duplicating parsing and storage.
 
 ```zig
@@ -28,8 +29,10 @@ the planned hosted ZPM registry is not required.
 
 `Config` defines nonzero comptime bounds for tables, columns, rows per table,
 identifier bytes, text bytes per cell, and predicates per WHERE clause. Defaults
-are 4, 8, 128, 32, 128, and 8 respectively. All schema, rows, and text live inline
-in `DB`. `DB.storageBytes()` equals `@sizeOf(DB)`. Results have separate caller
+are 4, 8, 128, 32, 128, and 8 respectively. `versions_per_table` (default
+2 x rows), `tx_writes` (statement undo entries, default rows), `expr_nodes` (512)
+and `expr_depth` (64) bound row versions and statement parsing. All schema, row
+versions, indices, statement scratch and text live inline in `DB`. `DB.storageBytes()` equals `@sizeOf(DB)`. Results have separate caller
 storage, measured by `@sizeOf(DB.Result)`; choose stack or static storage for the
 profile's size. `tableCount()` returns the number of live tables.
 
@@ -37,7 +40,29 @@ profile's size. `tableCount()` returns the number of live tables.
 text. Successful SELECT copies headers/rows into result, without borrowing
 database memory. Mutation results expose `affected_rows`; CREATE/DROP report 0.
 Every error leaves the database and previous result unchanged. The caller
-serializes access. There is no locking or transaction manager.
+serializes access. There is no locking or transaction manager. `Result.command`
+reports the statement kind. `describe(source, &result)` parses and binds without
+executing (SELECT reports column names and types).
+
+Statements run through a lexer, a recursive-descent parser with a statement-scoped
+node pool, and a binder. Exhausting the pool or depth raises `StatementTooComplex`
+(SQLSTATE 54001). Each table stores a row directory (stable u64 rowids,
+generation-checked slots, rowid order for unordered scans), a version arena and a
+multi-entry primary-key index filtered by visibility. A statement's new versions and
+deletion marks stay invisible until it completes; a failing statement undoes them.
+Superseded versions are reclaimed after each statement (at most 64) and on demand.
+If none can be reclaimed the statement fails with `VersionCapacity` (53200), a
+documented capacity limit where PostgreSQL would succeed.
+
+`executeChanges(source, &result, record, &used, context, commit)` additionally
+encodes the completed statement's row and DDL ops as a versioned little-endian
+kind-3 change record; overflow is `TransactionLogCapacity` with no state change.
+`applyChangeRecord(record, &scratch)` decodes and validates the whole record
+against a caller-owned `ReplayScratch` before applying anything and fails closed
+on unknown versions/ops (`UnsupportedLogVersion`), malformed bytes
+(`InvalidChangeRecord`) or OID/rowid/key/capacity conflicts
+(`ChangeRecordConflict`). `executeLegacy` replays alpha SQL-text WAL records
+with the alpha grammar only; anything else is `UnsupportedLogVersion`.
 
 `Result` contains `column_count`, `row_count`, `affected_rows`,
 `column_names[config.columns]`, and `rows[config.rows_per_table]`. Each row has
@@ -101,11 +126,12 @@ Errors include `Syntax`, `UnsupportedStatement`, `TableCapacity`,
 `ColumnCapacity`, `RowCapacity`, `NameCapacity`, `TextCapacity`,
 `PredicateCapacity`, `TableExists`, `TableNotFound`, `ColumnNotFound`,
 `DuplicateColumn`, `TypeMismatch`, `NotNullViolation`, `PrimaryKeyViolation`,
-and `IntegerOverflow`.
+`IntegerOverflow`, `StatementTooComplex`, `VersionCapacity`,
+`TransactionLogCapacity`, `UnsupportedLogVersion`, `InvalidChangeRecord` and
+`ChangeRecordConflict`.
 
-Primary keys use a fixed open-addressing hash index with a maximum 50% load.
-Equality lookups and duplicate detection use that index. Delete compaction and
-key-changing updates rebuild references after validation. LIMIT without ordering
+Primary keys use a fixed multi-entry open-addressing hash index (key to version,
+maximum 50% load). Equality lookups and duplicate detection use that index. LIMIT without ordering
 stops scanning once enough rows match. Result clearing changes only active
 counts; callers must observe the active ranges. Column types are reported even
 when a SELECT returns zero rows. `Config.boolean_integers` optionally accepts
@@ -119,7 +145,8 @@ adapter and wire sessions are documented in [database-server.md](database-server
 ## Validation
 
 Run `sig build test-sql --summary all` with Sig 0.6.3. The target compiles and
-executes `tests/test_sql.sig`, emitting assertion, statement, and fuzz counts.
+executes `tests/test_sql.sig`, `test_sql_index.sig`, `test_sql_storage.sig` and
+`test_sql_change_log.sig`, emitting assertion, statement, and fuzz counts.
 It is also included in `sig build test`. The executable's `--prove-failure`
 option deliberately returns nonzero, including release modes. Contracts cover
 operations, ownership, fail-atomic constraints, capacity exhaustion/reuse,
