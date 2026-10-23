@@ -1,7 +1,7 @@
 const std = @import("std");
 const sql = @import("sql");
 const store_module = @import("db_store");
-const DB = sql.Database(.{ .tables = 2, .columns = 3, .rows_per_table = 8, .text_bytes = 32, .boolean_integers = true });
+const DB = sql.Database(.{ .tables = 2, .columns = 3, .rows_per_table = 8, .text_bytes = 32 });
 const Store = store_module.Store(DB);
 var assertions: usize = 0;
 var replay_scratch: DB.ReplayScratch = .{};
@@ -77,13 +77,19 @@ fn transactions() !void {
     if (b.execute("B E G I N", &out)) |_| return error.InvalidCommandAccepted else |_| {}
     if (b.execute("BEGIN; DELETE FROM t", &out)) |_| return error.BatchCommandAccepted else |_| {}
     try b.execute("CREATE TABLE bools (id INTEGER PRIMARY KEY, flag BOOLEAN)", &out);
+    // Integer 0/1 into BOOLEAN is a MySQL/TDS assignment rule only (N1).
+    if (b.execute("INSERT INTO bools VALUES (1, 0)", &out)) |_| return error.DialectLeaked else |err| try check(err == error.TypeMismatch);
+    b.dialect = .mysql;
     try b.execute("INSERT INTO bools VALUES (1, 0)", &out);
-    try b.execute("SELECT * FROM bools WHERE flag = 0", &out);
+    try b.execute("SELECT * FROM bools WHERE flag = FALSE", &out);
     try check(out.row_count == 1 and !out.rows[0].cells[1].boolean);
+    // Expression typing never coerces integers to booleans, in any dialect.
+    if (b.execute("SELECT * FROM bools WHERE flag = 0", &out)) |_| return error.DialectLeaked else |err| try check(err == error.UndefinedFunction);
     try b.execute("UPDATE bools SET flag = 1 WHERE id = 1", &out);
-    try b.execute("SELECT * FROM bools WHERE flag = 1", &out);
+    try b.execute("SELECT * FROM bools WHERE flag = TRUE", &out);
     try check(out.row_count == 1 and out.rows[0].cells[1].boolean);
     if (b.execute("UPDATE bools SET flag = 2", &out)) |_| return error.InvalidBooleanAccepted else |err| try check(err == error.TypeMismatch);
+    b.dialect = .postgres;
 
     // Independent repeatable snapshots remain readable during other commits.
     try a.setAutocommit(true);

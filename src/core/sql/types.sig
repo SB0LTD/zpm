@@ -8,13 +8,14 @@ pub const Config = struct {
     rows_per_table: usize = 128,
     name_bytes: usize = 32,
     text_bytes: usize = 128,
+    /// Maximum boolean leaf predicates (comparison, IS, IN, BETWEEN, LIKE)
+    /// in one WHERE clause; more raise PredicateCapacity (54000).
     predicates: usize = 8,
-    /// MySQL/MSSQL BIT clients encode booleans as integer 0/1.
-    boolean_integers: bool = false,
     /// MySQL-style ordering by default; PostgreSQL uses false (ASC NULLS LAST).
     nulls_first_ascending: bool = true,
-    /// Preserve the library's historical 64-bit INTEGER by default. PostgreSQL
-    /// servers select 32; BIGINT always provides the full signed 64-bit range.
+    /// What an unqualified INTEGER means outside the PostgreSQL dialect (MySQL
+    /// and TDS sessions) and in legacy_alpha replay. On the PostgreSQL path
+    /// INTEGER/INT/INT4 is always int4; BIGINT/INT8 is always int8.
     integer_bits: u8 = 64,
     /// Row-version arena slots per table. 0 selects 2 x rows_per_table; an
     /// explicit value must exceed rows_per_table.
@@ -57,7 +58,29 @@ pub const Error = error{
     InvalidChangeRecord,
     /// A change record names an unknown OID, a conflicting rowid or exceeds capacity.
     ChangeRecordConflict,
+    /// SQLSTATE 42883: no operator or function matches the argument types.
+    UndefinedFunction,
+    /// SQLSTATE 42725: an operator over untyped literals is ambiguous.
+    AmbiguousFunction,
+    /// SQLSTATE 42846: no cast exists between the two types.
+    CannotCoerce,
+    /// SQLSTATE 22P02: text is not valid input for the target type.
+    InvalidTextRepresentation,
+    /// SQLSTATE 22012.
+    DivisionByZero,
+    /// SQLSTATE 22025: a LIKE pattern ends with the escape character.
+    InvalidEscapeSequence,
+    /// SQLSTATE 42P02: a $n placeholder reached the engine unbound.
+    UndefinedParameter,
+    /// SQLSTATE 42P10: ORDER BY position out of range.
+    InvalidColumnReference,
 };
+
+/// Session dialect. It changes only assignment coercion (MySQL/TDS BIT
+/// clients send booleans as integer 0/1) and what an unqualified INTEGER
+/// means (Config.integer_bits outside PostgreSQL). Expression typing is the
+/// same in every dialect.
+pub const Dialect = enum { postgres, mysql, tds };
 
 pub const DataType = enum { integer, integer32, boolean, text };
 
@@ -193,15 +216,8 @@ pub fn Values(comptime config: Config) type {
             return @truncate(code);
         }
 
-        /// Assignment and comparison coercion for the supported type set.
-        pub fn validate(column: *const Column, value: *Cell, boolean_integers: bool) Error!void {
-            if (boolean_integers and column.data_type == .boolean and value.* == .integer) {
-                // Capture the payload before changing the active union tag.
-                const integer = value.integer;
-                if (integer != 0 and integer != 1) return error.TypeMismatch;
-                const boolean = integer == 1;
-                value.* = .{ .boolean = boolean };
-            }
+        /// Stored-value checks: NOT NULL, exact type tag and int4 range.
+        pub fn validate(column: *const Column, value: *const Cell) Error!void {
             switch (value.*) {
                 .null_value => if (column.not_null) return error.NotNullViolation,
                 .integer => |integer| {

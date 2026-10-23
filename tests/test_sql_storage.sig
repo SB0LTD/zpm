@@ -7,9 +7,9 @@ const sql = @import("sql");
 const Small = sql.Database(.{ .tables = 2, .columns = 3, .rows_per_table = 4, .name_bytes = 16, .text_bytes = 16 });
 const Tight = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 4, .versions_per_table = 5, .text_bytes = 16 });
 const Wide = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 128, .text_bytes = 16 });
-const Complex = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 4, .expr_nodes = 3, .expr_depth = 2, .predicates = 8 });
+const Complex = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 4, .expr_nodes = 10, .expr_depth = 4, .predicates = 8 });
 /// RAMSQL's default server profile (src/server.sig) for the memory report.
-const ServerProfile = sql.Database(.{ .tables = 8, .columns = 8, .rows_per_table = 512, .name_bytes = 63, .text_bytes = 128, .boolean_integers = true, .nulls_first_ascending = false, .integer_bits = 32 });
+const ServerProfile = sql.Database(.{ .tables = 8, .columns = 8, .rows_per_table = 512, .name_bytes = 63, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32 });
 
 var assertions: usize = 0;
 
@@ -242,7 +242,7 @@ fn describe() !void {
     const before = db.storageStats("t").?;
     try db.describe("SELECT label, id FROM t WHERE id = 1", &result);
     try check(result.command == .select and result.column_count == 2 and result.row_count == 0);
-    try check(std.mem.eql(u8, result.column_names[0].slice(), "label") and result.column_types[0] == .text and result.column_types[1] == .integer);
+    try check(std.mem.eql(u8, result.column_names[0].slice(), "label") and result.column_types[0] == .text and result.column_types[1] == .integer32);
     try db.describe("DELETE FROM t", &result);
     try check(result.command == .delete and result.column_count == 0);
     try db.describe("INSERT INTO t VALUES (2, 'b')", &result);

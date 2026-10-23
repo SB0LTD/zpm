@@ -23,6 +23,12 @@
 
 pub const max_statement_bytes = 65536;
 
+/// Per-session SQL dialect (design §4.2). MySQL and TDS sessions set it on
+/// their first message; PostgreSQL keeps the default. It only changes
+/// assignment coercion (integer 0/1 into BOOLEAN) and what an unqualified
+/// INTEGER means; expression typing is identical in every dialect.
+pub const Dialect = enum { postgres, mysql, tds };
+
 fn same(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (x != y) return false;
@@ -146,6 +152,7 @@ pub fn Store(comptime Raw: type) type {
             pub const Result = Raw.Result;
             store: *Self,
             id: u64,
+            dialect: Dialect = .postgres,
             failed: bool = false,
             autocommit: bool = true,
             /// Each connection needs distinct caller-owned transaction storage.
@@ -231,6 +238,16 @@ pub fn Store(comptime Raw: type) type {
                 self.rollbackTransaction() catch {};
             }
 
+            /// Hands this session's dialect to a Raw before it executes.
+            fn session(self: *const Connection, raw: *Raw) *Raw {
+                if (@hasField(Raw, "dialect")) raw.dialect = switch (self.dialect) {
+                    .postgres => .postgres,
+                    .mysql => .mysql,
+                    .tds => .tds,
+                };
+                return raw;
+            }
+
             pub fn execute(self: *Connection, source: []const u8, result: *Result) !void {
                 if (self.id == 0) return error.InvalidConnection;
                 errdefer self.failTransaction();
@@ -299,7 +316,9 @@ pub fn Store(comptime Raw: type) type {
                     return;
                 }
                 if (!self.autocommit and !self.in_transaction) try self.beginTransaction();
-                if (same(cmd, "SELECT 1")) {
+                // Raw adapters without the typed pipeline (no describe) get the
+                // historical liveness probe; the SQL engine evaluates it itself.
+                if (!@hasDecl(Raw, "describe") and same(cmd, "SELECT 1")) {
                     result.clear(0);
                     result.column_count = 1;
                     result.row_count = 1;
@@ -317,7 +336,7 @@ pub fn Store(comptime Raw: type) type {
                     if (!reading and self.logged and @hasDecl(Raw, "executeChanges")) {
                         try self.store.storageReady();
                         if (self.log_used > self.transaction_log.len) return error.TransactionLogCapacity;
-                        try workspace.executeChanges(source, result, self.transaction_log, &self.log_used, null, null);
+                        try self.session(workspace).executeChanges(source, result, self.transaction_log, &self.log_used, null, null);
                         self.dirty = true;
                         return;
                     }
@@ -326,7 +345,7 @@ pub fn Store(comptime Raw: type) type {
                         if (self.logged and (self.log_used > self.transaction_log.len or
                             source.len + 4 > self.transaction_log.len - self.log_used)) return error.TransactionLogCapacity;
                     }
-                    try workspace.execute(source, result);
+                    try self.session(workspace).execute(source, result);
                     if (!reading) {
                         if (self.logged) {
                             writeLength(self.transaction_log[self.log_used..][0..4], source.len);
@@ -337,10 +356,10 @@ pub fn Store(comptime Raw: type) type {
                     }
                     return;
                 }
-                if (reading) return self.store.database.execute(source, result);
+                if (reading) return self.session(&self.store.database).execute(source, result);
                 try self.store.storageReady();
                 if (self.store.commit_fn == null) {
-                    try self.store.database.execute(source, result);
+                    try self.session(&self.store.database).execute(source, result);
                     self.store.generation += 1;
                     return;
                 }
@@ -351,7 +370,7 @@ pub fn Store(comptime Raw: type) type {
                 if (@hasDecl(Raw, "executeChanges")) {
                     const buffer = if (self.store.encode_buffer.len != 0) self.store.encode_buffer else self.transaction_log;
                     var used: usize = 0;
-                    try self.store.database.executeChanges(source, result, buffer, &used, self.store, persistRecord);
+                    try self.session(&self.store.database).executeChanges(source, result, buffer, &used, self.store, persistRecord);
                     self.store.generation += 1;
                     return;
                 }
@@ -360,13 +379,13 @@ pub fn Store(comptime Raw: type) type {
                 @memcpy(batch[4..][0..source.len], source);
                 if (@hasDecl(Raw, "executeWithCommit")) {
                     var commit = StatementCommit{ .store = self.store, .batch = batch[0 .. source.len + 4] };
-                    try self.store.database.executeWithCommit(source, result, &commit, StatementCommit.commit);
+                    try self.session(&self.store.database).executeWithCommit(source, result, &commit, StatementCommit.commit);
                     self.store.generation += 1;
                     return;
                 }
                 const workspace = self.store.autocommit_workspace orelse return error.TransactionCapacity;
                 snapshot(workspace, &self.store.database);
-                try workspace.execute(source, &self.store.autocommit_result);
+                try self.session(workspace).execute(source, &self.store.autocommit_result);
                 try self.store.persist(batch[0 .. source.len + 4]);
                 snapshot(&self.store.database, workspace);
                 self.store.generation += 1;

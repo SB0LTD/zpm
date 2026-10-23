@@ -467,7 +467,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 const value = try decodeValue(reader);
                 row.cells[index] = value.cell;
                 // Stored values are already typed; integers must fit int4 columns.
-                V.validate(&table.columns[index], &row.cells[index], false) catch return error.ChangeRecordConflict;
+                V.validate(&table.columns[index], &row.cells[index]) catch return error.ChangeRecordConflict;
                 if (table.primary == index) key_offset.* = value.offset;
             }
         }

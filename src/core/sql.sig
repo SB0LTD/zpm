@@ -5,22 +5,34 @@
 //! storage. Each execute accepts exactly one statement and failing statements
 //! leave both the database and result unchanged. Callers serialize access.
 //!
-//! Supported: CREATE/DROP TABLE; single-row INSERT [column list] VALUES;
-//! SELECT */column list, AND predicates, one ORDER BY and LIMIT; UPDATE literal
-//! assignments; DELETE. Types are INTEGER, BOOLEAN, TEXT, NULL. Constraints are
-//! NOT NULL and a single-column PRIMARY KEY. Identifiers are ASCII and case
-//! insensitive; text comparison is bytewise. NULL comparisons are unknown and
-//! therefore do not match WHERE, except explicit IS [NOT] NULL predicates.
-//! Transactions, joins, expressions, aggregates and secondary indices are
-//! outside this initial SQL subset.
+//! Supported: CREATE/DROP TABLE; single-row INSERT [column list] VALUES
+//! (expressions); SELECT expressions [FROM one table [alias]] [WHERE]
+//! [ORDER BY expressions/positions/output names] [LIMIT]; UPDATE with
+//! expression SET; DELETE. Types are INTEGER (int4), BIGINT (int8), BOOLEAN,
+//! TEXT and NULL. Expressions (design §4.1): AND/OR/NOT with three-valued
+//! logic, comparisons, IS [NOT] NULL/TRUE/FALSE/UNKNOWN, [NOT] IN lists,
+//! [NOT] BETWEEN, [NOT] LIKE/ILIKE, `||`, checked integer `+ - * / %`, CASE,
+//! COALESCE, NULLIF, `::`/CAST, typed with PostgreSQL's implicit-cast rules.
+//! Constraints are NOT NULL and a single-column PRIMARY KEY. Unquoted
+//! identifiers are ASCII and case insensitive; quoted identifiers keep case;
+//! text comparison is bytewise. Transactions, joins, aggregates, other
+//! functions, NUMERIC and secondary indices are outside this SQL subset; this
+//! is not full SQL-standard or PostgreSQL compatibility.
+//!
+//! Dialect (per session, `Database.dialect`, set by the caller before each
+//! statement): on `.postgres` INTEGER is always int4; on `.mysql`/`.tds` it
+//! follows Config.integer_bits and integer 0/1 may be assigned to BOOLEAN.
+//! Expression typing never depends on the dialect.
 //!
 //! Pipeline (sql/*.sig, relative imports only; nothing outside this module
 //! imports them): lexer -> parser (statement-scoped node pool, bounded depth)
-//! -> binder (names and types, never executes; powers describe()) ->
-//! execution over versioned storage (stable rowids, row versions, PK
-//! multi-index, bounded reclamation) -> kind-3 change records
-//! (executeChanges / applyChangeRecord). `legacy_alpha` replays kind 1/2
-//! SQL-text WAL records with the alpha grammar only.
+//! -> binder (names and types, never executes; powers describe()) -> expr
+//! (evaluation) -> exec (scans, filters, projections, ORDER BY) / dml (row
+//! construction, assignment casts, per-row key checks) over versioned
+//! storage (stable rowids, row versions, PK multi-index, bounded
+//! reclamation) -> kind-3 change records (executeChanges /
+//! applyChangeRecord). `legacy_alpha` replays kind 1/2 SQL-text WAL records
+//! with the frozen alpha grammar (alpha.sig) only.
 //!
 //! No allocator, platform or runtime dependency. The only std symbols this
 //! module and sql/*.sig may ever use are std.fmt.parseFloat(T, s) and
@@ -31,9 +43,13 @@ const parser_module = @import("sql/parser.sig");
 const binder_module = @import("sql/binder.sig");
 const storage = @import("sql/storage.sig");
 const change_log = @import("sql/change_log.sig");
+const expr_module = @import("sql/expr.sig");
+const exec_module = @import("sql/exec.sig");
+const dml_module = @import("sql/dml.sig");
 
 pub const Config = types.Config;
 pub const Error = types.Error;
+pub const Dialect = types.Dialect;
 pub const DataType = types.DataType;
 pub const CommandTag = types.CommandTag;
 pub const ParseMode = parser_module.Mode;
@@ -60,6 +76,9 @@ pub fn Database(comptime config: Config) type {
     const P = parser_module.Parser(config);
     const B = binder_module.Binder(config);
     const C = change_log.ChangeLog(config);
+    const E = expr_module.Eval(config);
+    const X = exec_module.Exec(config);
+    const D = dml_module.Dml(config);
 
     return struct {
         const Self = @This();
@@ -128,6 +147,9 @@ pub fn Database(comptime config: Config) type {
         csn: u64 = 0,
         cid: u32 = 0,
         epoch: u32 = 0,
+        /// Session dialect of the next statement (callers serialize access
+        /// and set it per call; Store.Connection does). Not database state.
+        dialect: Dialect = .postgres,
         workspace: Workspace = .{},
 
         /// Includes all caller-owned table, version, index and statement storage.
@@ -169,7 +191,8 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// Replays one alpha SQL-text statement (WAL kinds 1/2): alpha grammar,
-        /// MySQL/TDS-style boolean integers, the configured INTEGER width.
+        /// alpha boolean integers (assignment and comparison), the configured
+        /// INTEGER width, whatever the dialect.
         /// Anything outside the alpha grammar fails with UnsupportedLogVersion.
         pub fn executeLegacy(self: *Self, source: []const u8, result: *Result) Error!void {
             return self.run(source, result, .legacy_alpha, NoCommit{});
@@ -233,11 +256,10 @@ pub fn Database(comptime config: Config) type {
             result.clear(0);
             result.command = B.command(&bound);
             if (bound == .select) {
-                const table = &self.tables[bound.select.table];
                 result.column_count = bound.select.count;
                 for (0..bound.select.count) |index| {
-                    result.column_names[index] = table.columns[bound.select.projection[index]].name;
-                    result.column_types[index] = table.columns[bound.select.projection[index]].data_type;
+                    result.column_names[index] = bound.select.names[index];
+                    result.column_types[index] = bound.select.types[index];
                 }
             }
         }
@@ -291,8 +313,12 @@ pub fn Database(comptime config: Config) type {
             return freed;
         }
 
-        fn bindContext(self: *const Self, source: []const u8, mode: ParseMode) B.Context {
-            return .{ .source = source, .tables = &self.tables, .pool = &self.workspace.nodes, .boolean_integers = config.boolean_integers or mode == .legacy_alpha };
+        fn bindContext(self: *Self, source: []const u8, mode: ParseMode) B.Context {
+            return .{ .source = source, .tables = &self.tables, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect };
+        }
+
+        fn evalContext(self: *const Self, source: []const u8) E.Context {
+            return .{ .source = source, .pool = &self.workspace.nodes };
         }
 
         fn legacy(mode: ParseMode, err: Error) Error {
@@ -305,12 +331,12 @@ pub fn Database(comptime config: Config) type {
             const context = self.bindContext(source, mode);
             const bound = B.bind(&context, &statement) catch |err| return legacy(mode, err);
             switch (bound) {
-                .select => |*select| return self.runSelect(select, result),
+                .select => |*select| return X.select(&self.tables, source, &self.workspace.nodes, select, result),
                 // Transaction control belongs to the store, not a single Raw.
                 .begin, .commit, .rollback => return legacy(mode, error.UnsupportedStatement),
                 else => {},
             }
-            try self.mutate(&bound, result, sink);
+            try self.mutate(source, &bound, result, sink);
         }
 
         fn txRef(self: *const Self) S.TxRef {
@@ -323,7 +349,7 @@ pub fn Database(comptime config: Config) type {
             self.workspace.undo_len += 1;
         }
 
-        fn mutate(self: *Self, bound: *const B.Bound, result: *Result, sink: anytype) !void {
+        fn mutate(self: *Self, source: []const u8, bound: *const B.Bound, result: *Result, sink: anytype) !void {
             const workspace = &self.workspace;
             workspace.undo_len = 0;
             workspace.saved_oid_counter = self.oid_counter;
@@ -339,9 +365,9 @@ pub fn Database(comptime config: Config) type {
                     self.push(.{ .kind = .drop_table, .table = @intCast(index) });
                     break :blk 0;
                 },
-                .insert => |*insert| try self.insertRow(insert),
-                .update => |*update| try self.updateRows(update),
-                .delete => |*delete| self.deleteRows(delete),
+                .insert => |*insert| try self.insertRow(source, insert),
+                .update => |*update| try self.updateRows(source, update),
+                .delete => |*delete| try self.deleteRows(source, delete),
                 .select, .begin, .commit, .rollback => unreachable,
             };
             try sink.before(self);
@@ -450,10 +476,12 @@ pub fn Database(comptime config: Config) type {
             return 0;
         }
 
-        fn insertRow(self: *Self, insert: *const B.Insert) Error!usize {
+        fn insertRow(self: *Self, source: []const u8, insert: *const B.Insert) Error!usize {
             const table = &self.tables[insert.table];
+            var ctx = self.evalContext(source);
+            const cells = try D.insertedRow(&ctx, table, &insert.values);
             if (table.primary_column) |column| {
-                if (S.lookupKey(table, &insert.row.cells[column]) != null) return error.PrimaryKeyViolation;
+                if (S.lookupKey(table, &cells[column]) != null) return error.PrimaryKeyViolation;
             }
             if (table.next_rowid == 0xffffffffffffffff) return error.RowCapacity;
             try S.ensureVersions(table, 1, self.csn);
@@ -463,167 +491,84 @@ pub fn Database(comptime config: Config) type {
             const slot = S.allocRow(table, table.next_rowid);
             table.next_rowid += 1;
             const version = S.allocVersion(table);
-            table.versions[version] = .{ .row = slot + 1, .xmin = self.txRef(), .xmin_cid = self.cid, .cells = insert.row.cells };
+            table.versions[version] = .{ .row = slot + 1, .xmin = self.txRef(), .xmin_cid = self.cid, .cells = cells };
             table.rows[slot].newest = version + 1;
             S.indexKey(table, version);
             self.push(.{ .kind = .insert, .table = @intCast(insert.table), .new = version });
             return 1;
         }
 
-        fn primaryPredicate(table: *const S.Table, where: *const B.Filter) ?*const Cell {
-            const column = table.primary_column orelse return null;
-            for (where.items[0..where.len]) |*item|
-                if (item.column == column and item.op == .equal) return &item.value;
-            return null;
-        }
-
-        fn matches(cells: *const [config.columns]Cell, where: *const B.Filter) bool {
-            for (where.items[0..where.len]) |*predicate| {
-                const value = &cells[predicate.column];
-                if (predicate.op == .is_null) {
-                    if (value.* != .null_value) return false;
-                    continue;
-                }
-                if (predicate.op == .is_not_null) {
-                    if (value.* == .null_value) return false;
-                    continue;
-                }
-                if (value.* == .null_value or predicate.value == .null_value) return false;
-                const order = V.compare(value, &predicate.value);
-                const matched = switch (predicate.op) {
-                    .equal => order == 0,
-                    .not_equal => order != 0,
-                    .less => order < 0,
-                    .less_equal => order <= 0,
-                    .greater => order > 0,
-                    .greater_equal => order >= 0,
-                    .is_null, .is_not_null => unreachable,
-                };
-                if (!matched) return false;
-            }
-            return true;
-        }
-
-        /// Committed rows matching `where`, in rowid order (directory slots).
-        fn selectRows(table: *const S.Table, where: *const B.Filter, slots: *[config.rows_per_table]u32) usize {
-            if (primaryPredicate(table, where)) |key| {
-                const slot = S.lookupKey(table, key) orelse return 0;
-                const version = S.visible(table, slot).?;
-                if (!matches(&table.versions[version].cells, where)) return 0;
-                slots[0] = slot;
-                return 1;
-            }
-            var found: usize = 0;
-            for (0..table.row_high) |slot| {
-                const version = S.visible(table, slot) orelse continue;
-                if (!matches(&table.versions[version].cells, where)) continue;
-                slots[found] = @intCast(slot);
-                found += 1;
-            }
-            return found;
-        }
-
-        fn updateRows(self: *Self, update: *const B.Update) Error!usize {
+        /// Rows are visited in rowid order and updated one at a time, as a
+        /// PostgreSQL heap scan does: WHERE, SET and key checks interleave,
+        /// and any error undoes every earlier row (undo list).
+        fn updateRows(self: *Self, source: []const u8, update: *const B.Update) Error!usize {
             const table = &self.tables[update.table];
-            var selected: [config.rows_per_table]u32 = undefined;
-            const affected = selectRows(table, &update.where, &selected);
-            // All assignments are literals. Assigning one primary-key value to
-            // multiple rows necessarily collides; compare untouched rows too.
-            if (affected != 0) {
-                for (table.columns[0..table.column_count], 0..) |*column, index| {
-                    if (!column.primary_key or !update.assigned[index]) continue;
-                    if (affected > 1) return error.PrimaryKeyViolation;
-                    if (S.lookupKey(table, &update.assignments.cells[index])) |slot|
-                        if (slot != selected[0]) return error.PrimaryKeyViolation;
-                }
-            }
-            try S.ensureVersions(table, affected, self.csn);
-            for (selected[0..affected]) |slot| {
-                const old = S.visible(table, slot).?;
-                const version = S.allocVersion(table);
-                table.versions[version] = .{ .row = slot + 1, .xmin = self.txRef(), .xmin_cid = self.cid, .older = old + 1, .cells = table.versions[old].cells };
-                for (0..table.column_count) |column| if (update.assigned[column]) {
-                    table.versions[version].cells[column] = update.assignments.cells[column];
-                };
-                table.rows[slot].newest = version + 1;
-                table.versions[old].xmax = self.txRef();
-                table.versions[old].xmax_cid = self.cid;
-                S.indexKey(table, version);
-                self.push(.{ .kind = .update, .table = @intCast(update.table), .old = old, .new = version });
-            }
-            return affected;
-        }
-
-        fn deleteRows(self: *Self, delete: *const B.Delete) usize {
-            const table = &self.tables[delete.table];
-            var selected: [config.rows_per_table]u32 = undefined;
-            const affected = selectRows(table, &delete.where, &selected);
-            for (selected[0..affected]) |slot| {
-                const old = S.visible(table, slot).?;
-                table.versions[old].xmax = self.txRef();
-                table.versions[old].xmax_cid = self.cid;
-                self.push(.{ .kind = .delete, .table = @intCast(delete.table), .old = old });
-            }
-            return affected;
-        }
-
-        fn runSelect(self: *const Self, query: *const B.Select, result: *Result) Error!void {
-            const table = &self.tables[query.table];
-            var indices: [config.rows_per_table]u32 = undefined;
-            var found: usize = 0;
-            if (primaryPredicate(table, &query.where)) |key| {
-                if (S.lookupKey(table, key)) |slot| {
+            var ctx = self.evalContext(source);
+            var affected: usize = 0;
+            switch (try X.candidates(&ctx, table, update.key)) {
+                .empty => {},
+                .slot => |slot| {
                     const version = S.visible(table, slot).?;
-                    if (matches(&table.versions[version].cells, &query.where)) {
-                        indices[0] = version;
-                        found = 1;
+                    if (try X.keep(&ctx, update.where, &table.versions[version].cells)) {
+                        try self.updateOne(&ctx, update, slot, version);
+                        affected = 1;
                     }
-                }
-            } else if (query.limit != 0) {
-                for (0..table.row_high) |slot| {
+                },
+                .scan => for (0..table.row_high) |slot| {
                     const version = S.visible(table, slot) orelse continue;
-                    if (!matches(&table.versions[version].cells, &query.where)) continue;
-                    indices[found] = version;
-                    found += 1;
-                    if (query.order_column == null and found >= query.limit) break;
-                }
+                    if (!try X.keep(&ctx, update.where, &table.versions[version].cells)) continue;
+                    try self.updateOne(&ctx, update, @intCast(slot), version);
+                    affected += 1;
+                },
             }
-            if (query.order_column) |column| {
-                const nulls_first = query.nulls_first orelse (config.nulls_first_ascending != query.descending);
-                // Stable insertion sort over version indices avoids copying text
-                // cells during sorting and preserves rowid order for ties.
-                var index: usize = 1;
-                while (index < found) : (index += 1) {
-                    const chosen = indices[index];
-                    var position = index;
-                    while (position != 0) {
-                        const left = &table.versions[chosen].cells[column];
-                        const right = &table.versions[indices[position - 1]].cells[column];
-                        const order = if (left.* == .null_value or right.* == .null_value) blk: {
-                            if (left.* == .null_value and right.* == .null_value) break :blk @as(i8, 0);
-                            break :blk if ((left.* == .null_value) == nulls_first) @as(i8, -1) else @as(i8, 1);
-                        } else blk: {
-                            const value = V.compare(left, right);
-                            break :blk if (query.descending) -value else value;
-                        };
-                        if (order >= 0) break;
-                        indices[position] = indices[position - 1];
-                        position -= 1;
+            return affected;
+        }
+
+        fn updateOne(self: *Self, ctx: *E.Context, update: *const B.Update, slot: u32, old: u32) Error!void {
+            const table = &self.tables[update.table];
+            const cells = try D.updatedRow(ctx, table, &update.values, &table.versions[old].cells);
+            if (table.primary_column) |column| {
+                if (update.values[column] != ast.none and D.keyTaken(table, &cells[column], slot)) return error.PrimaryKeyViolation;
+            }
+            // Statement-pending versions and marks are never reclaimed here.
+            try S.ensureVersions(table, 1, self.csn);
+            const version = S.allocVersion(table);
+            table.versions[version] = .{ .row = slot + 1, .xmin = self.txRef(), .xmin_cid = self.cid, .older = old + 1, .cells = cells };
+            table.rows[slot].newest = version + 1;
+            table.versions[old].xmax = self.txRef();
+            table.versions[old].xmax_cid = self.cid;
+            S.indexKey(table, version);
+            self.push(.{ .kind = .update, .table = @intCast(update.table), .old = old, .new = version });
+        }
+
+        fn deleteRows(self: *Self, source: []const u8, delete: *const B.Delete) Error!usize {
+            const table = &self.tables[delete.table];
+            var ctx = self.evalContext(source);
+            var affected: usize = 0;
+            switch (try X.candidates(&ctx, table, delete.key)) {
+                .empty => {},
+                .slot => |slot| {
+                    const version = S.visible(table, slot).?;
+                    if (try X.keep(&ctx, delete.where, &table.versions[version].cells)) {
+                        self.deleteOne(delete.table, version);
+                        affected = 1;
                     }
-                    indices[position] = chosen;
-                }
+                },
+                .scan => for (0..table.row_high) |slot| {
+                    const version = S.visible(table, slot) orelse continue;
+                    if (!try X.keep(&ctx, delete.where, &table.versions[version].cells)) continue;
+                    self.deleteOne(delete.table, version);
+                    affected += 1;
+                },
             }
-            result.clear(0);
-            result.command = .select;
-            result.column_count = query.count;
-            result.row_count = if (query.limit < found) @intCast(query.limit) else found;
-            for (0..query.count) |index| {
-                result.column_names[index] = table.columns[query.projection[index]].name;
-                result.column_types[index] = table.columns[query.projection[index]].data_type;
-            }
-            for (0..result.row_count) |row_index| for (0..query.count) |column| {
-                result.rows[row_index].cells[column] = table.versions[indices[row_index]].cells[query.projection[column]];
-            };
+            return affected;
+        }
+
+        fn deleteOne(self: *Self, table_index: usize, old: u32) void {
+            const table = &self.tables[table_index];
+            table.versions[old].xmax = self.txRef();
+            table.versions[old].xmax_cid = self.cid;
+            self.push(.{ .kind = .delete, .table = @intCast(table_index), .old = old });
         }
     };
 }

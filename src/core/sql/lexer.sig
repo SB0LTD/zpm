@@ -1,7 +1,15 @@
-//! Byte-level SQL lexer for the bounded grammar (Layer 0).
-//! Whitespace and `--` comments separate tokens; words are ASCII letters,
-//! digits and `_`; string literals use `''` escaping. Callers keep `source`
-//! alive for the statement; spans index into it.
+//! SQL lexers (Layer 0). Callers keep `source` alive for the statement; spans
+//! index into it.
+//!
+//! `Tokenizer` is the statement-pipeline lexer (design §4.1): words (ASCII
+//! case-folded on comparison), double-quoted identifiers that keep their case
+//! (`""` escapes), string literals with `''` escaping, integer, decimal and
+//! exponent literals, `$n` placeholders, the operators
+//! `= <> != < <= > >= + - * / % || :: -> ->> #> #>> @> <@ ?` and punctuation,
+//! with whitespace, `--` and (nested) `/* */` comments between tokens.
+//!
+//! `Lexer` is the frozen byte-level lexer of the alpha grammar. Only the
+//! `legacy_alpha` recognizer (alpha.sig) uses it; it must never grow.
 const types = @import("types.sig");
 const Error = types.Error;
 
@@ -10,10 +18,341 @@ pub const Quoted = struct {
     start: usize,
     /// Raw byte index of the closing quote.
     end: usize,
-    /// Decoded length after collapsing `''`.
+    /// Decoded length after collapsing the doubled quote.
     len: usize,
 };
 
+pub const Kind = enum { end, word, quoted_word, string, integer, decimal, parameter, symbol };
+
+/// Words the parser recognizes, classified once per token (quoted words are
+/// never keywords).
+pub const Keyword = enum {
+    none,
+    @"and",
+    as,
+    asc,
+    begin,
+    between,
+    bigint,
+    @"bool",
+    boolean,
+    by,
+    case,
+    cast,
+    coalesce,
+    commit,
+    create,
+    delete,
+    desc,
+    drop,
+    @"else",
+    end,
+    @"false",
+    first,
+    from,
+    ilike,
+    in,
+    insert,
+    int,
+    int4,
+    int8,
+    integer,
+    into,
+    is,
+    key,
+    last,
+    like,
+    limit,
+    not,
+    @"null",
+    nullif,
+    nulls,
+    @"or",
+    order,
+    primary,
+    rollback,
+    select,
+    set,
+    table,
+    text,
+    then,
+    transaction,
+    @"true",
+    unknown,
+    update,
+    values,
+    when,
+    where,
+};
+
+/// Words that cannot be unquoted identifiers.
+pub fn reserved(keyword: Keyword) bool {
+    return switch (keyword) {
+        .create, .drop, .insert, .select, .update, .delete, .table, .into, .values, .from, .where, .@"and", .@"or", .set, .order, .by, .asc, .desc, .limit, .is, .not, .@"null", .@"true", .@"false", .primary, .key, .case, .when, .then, .@"else", .end, .cast, .as, .in, .between, .like, .ilike => true,
+        else => false,
+    };
+}
+
+pub fn keywordOf(comptime text: []const u8) Keyword {
+    comptime {
+        var name: [text.len]u8 = undefined;
+        for (text, 0..) |byte, index| name[index] = types.lower(byte);
+        const final = name;
+        return @field(Keyword, &final);
+    }
+}
+
+pub fn classify(word: []const u8) Keyword {
+    if (word.len < 2 or word.len > 11) return .none;
+    var name: [11]u8 = undefined;
+    for (word, 0..) |byte, index| name[index] = types.lower(byte);
+    const wanted = name[0..word.len];
+    inline for (@typeInfo(Keyword).@"enum".field_names) |field| {
+        if (field.len == wanted.len and types.same(field, wanted)) return @field(Keyword, field);
+    }
+    return .none;
+}
+
+pub const Symbol = enum {
+    none,
+    comma,
+    lparen,
+    rparen,
+    semicolon,
+    dot,
+    star,
+    plus,
+    minus,
+    slash,
+    percent,
+    eq,
+    ne,
+    lt,
+    le,
+    gt,
+    ge,
+    concat,
+    cast,
+    arrow,
+    arrow_text,
+    path,
+    path_text,
+    contains,
+    contained,
+    question,
+};
+
+pub const Token = struct {
+    kind: Kind = .end,
+    symbol: Symbol = .none,
+    keyword: Keyword = .none,
+    /// Raw span; for quoted forms it excludes the quotes.
+    start: usize = 0,
+    end: usize = 0,
+    /// Decoded length (quoted forms) or raw length.
+    len: usize = 0,
+    /// Integer literal magnitude or parameter number.
+    integer: u64 = 0,
+
+    pub fn raw(self: Token, source: []const u8) []const u8 {
+        return source[self.start..self.end];
+    }
+
+    pub fn quoted(self: Token) Quoted {
+        return .{ .start = self.start, .end = self.end, .len = self.len };
+    }
+
+    pub fn isWord(self: Token, comptime expected: []const u8) bool {
+        return self.keyword == comptime keywordOf(expected);
+    }
+};
+
+fn space(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n' or byte == 0x0b or byte == 0x0c;
+}
+
+pub const Tokenizer = struct {
+    source: []const u8,
+    position: usize = 0,
+    /// Decoded string literals beyond this raise TextCapacity.
+    text_limit: usize,
+
+    fn skip(self: *Tokenizer) Error!void {
+        const source = self.source;
+        while (self.position < source.len) {
+            const byte = source[self.position];
+            if (space(byte)) {
+                self.position += 1;
+            } else if (byte == '-' and self.position + 1 < source.len and source[self.position + 1] == '-') {
+                self.position += 2;
+                while (self.position < source.len and source[self.position] != '\n') self.position += 1;
+            } else if (byte == '/' and self.position + 1 < source.len and source[self.position + 1] == '*') {
+                // PostgreSQL block comments nest.
+                self.position += 2;
+                var depth: usize = 1;
+                while (depth != 0) {
+                    if (self.position + 1 >= source.len) return error.Syntax;
+                    if (source[self.position] == '/' and source[self.position + 1] == '*') {
+                        depth += 1;
+                        self.position += 2;
+                    } else if (source[self.position] == '*' and source[self.position + 1] == '/') {
+                        depth -= 1;
+                        self.position += 2;
+                    } else self.position += 1;
+                }
+            } else break;
+        }
+    }
+
+    fn quotedForm(self: *Tokenizer, quote: u8, limit: usize, overflow: Error) Error!Token {
+        const start = self.position;
+        var len: usize = 0;
+        while (self.position < self.source.len) {
+            const byte = self.source[self.position];
+            self.position += 1;
+            if (byte == quote) {
+                if (self.position == self.source.len or self.source[self.position] != quote)
+                    return .{ .start = start, .end = self.position - 1, .len = len };
+                self.position += 1;
+            }
+            if (len == limit) return overflow;
+            len += 1;
+        }
+        return error.Syntax;
+    }
+
+    fn number(self: *Tokenizer) Error!Token {
+        const source = self.source;
+        const start = self.position;
+        var token: Token = .{ .kind = .integer, .start = start };
+        var magnitude: u64 = 0;
+        var overflow = false;
+        while (self.position < source.len and types.digit(source[self.position])) : (self.position += 1) {
+            const digit_value: u64 = source[self.position] - '0';
+            if (magnitude > (18446744073709551615 - digit_value) / 10) overflow = true else magnitude = magnitude * 10 + digit_value;
+        }
+        if (self.position < source.len and source[self.position] == '.') {
+            token.kind = .decimal;
+            self.position += 1;
+            while (self.position < source.len and types.digit(source[self.position])) self.position += 1;
+        }
+        if (self.position == start + 1 and token.kind == .decimal) return error.Syntax;
+        if (self.position < source.len and (source[self.position] == 'e' or source[self.position] == 'E')) {
+            const mark = self.position;
+            self.position += 1;
+            if (self.position < source.len and (source[self.position] == '+' or source[self.position] == '-')) self.position += 1;
+            if (self.position < source.len and types.digit(source[self.position])) {
+                token.kind = .decimal;
+                while (self.position < source.len and types.digit(source[self.position])) self.position += 1;
+            } else self.position = mark;
+        }
+        // Trailing junk after a numeric literal is a syntax error.
+        if (self.position < source.len and types.letter(source[self.position])) return error.Syntax;
+        if (token.kind == .integer and overflow) return error.IntegerOverflow;
+        token.integer = magnitude;
+        token.end = self.position;
+        token.len = token.end - start;
+        return token;
+    }
+
+    pub fn next(self: *Tokenizer) Error!Token {
+        try self.skip();
+        const source = self.source;
+        const start = self.position;
+        if (start == source.len) return .{ .kind = .end, .start = start, .end = start };
+        const byte = source[start];
+        if (types.letter(byte)) {
+            self.position += 1;
+            while (self.position < source.len and (types.letter(source[self.position]) or types.digit(source[self.position]) or source[self.position] == '$')) self.position += 1;
+            return .{ .kind = .word, .keyword = classify(source[start..self.position]), .start = start, .end = self.position, .len = self.position - start };
+        }
+        if (types.digit(byte) or (byte == '.' and start + 1 < source.len and types.digit(source[start + 1]))) return self.number();
+        if (byte == '\'') {
+            self.position += 1;
+            var token = try self.quotedForm('\'', self.text_limit, error.TextCapacity);
+            token.kind = .string;
+            return token;
+        }
+        if (byte == '"') {
+            self.position += 1;
+            var token = try self.quotedForm('"', 255, error.NameCapacity);
+            if (token.len == 0) return error.Syntax;
+            token.kind = .quoted_word;
+            return token;
+        }
+        if (byte == '$') {
+            self.position += 1;
+            var value: u64 = 0;
+            while (self.position < source.len and types.digit(source[self.position])) : (self.position += 1) {
+                value = value * 10 + (source[self.position] - '0');
+                if (value > 65535) return error.Syntax;
+            }
+            if (self.position == start + 1 or value == 0) return error.Syntax;
+            if (self.position < source.len and types.letter(source[self.position])) return error.Syntax;
+            return .{ .kind = .parameter, .start = start, .end = self.position, .len = self.position - start, .integer = value };
+        }
+        const following: u8 = if (start + 1 < source.len) source[start + 1] else 0;
+        const third: u8 = if (start + 2 < source.len) source[start + 2] else 0;
+        var width: usize = 1;
+        const symbol: Symbol = switch (byte) {
+            ',' => .comma,
+            '(' => .lparen,
+            ')' => .rparen,
+            ';' => .semicolon,
+            '.' => .dot,
+            '*' => .star,
+            '+' => .plus,
+            '/' => .slash,
+            '%' => .percent,
+            '=' => .eq,
+            '?' => .question,
+            '-' => if (following == '>') blk: {
+                width = if (third == '>') 3 else 2;
+                break :blk if (third == '>') Symbol.arrow_text else Symbol.arrow;
+            } else .minus,
+            '<' => if (following == '=') blk: {
+                width = 2;
+                break :blk Symbol.le;
+            } else if (following == '>') blk: {
+                width = 2;
+                break :blk Symbol.ne;
+            } else if (following == '@') blk: {
+                width = 2;
+                break :blk Symbol.contained;
+            } else .lt,
+            '>' => if (following == '=') blk: {
+                width = 2;
+                break :blk Symbol.ge;
+            } else .gt,
+            '!' => if (following == '=') blk: {
+                width = 2;
+                break :blk Symbol.ne;
+            } else return error.Syntax,
+            '|' => if (following == '|') blk: {
+                width = 2;
+                break :blk Symbol.concat;
+            } else return error.Syntax,
+            ':' => if (following == ':') blk: {
+                width = 2;
+                break :blk Symbol.cast;
+            } else return error.Syntax,
+            '#' => if (following == '>') blk: {
+                width = if (third == '>') 3 else 2;
+                break :blk if (third == '>') Symbol.path_text else Symbol.path;
+            } else return error.Syntax,
+            '@' => if (following == '>') blk: {
+                width = 2;
+                break :blk Symbol.contains;
+            } else return error.Syntax,
+            else => return error.Syntax,
+        };
+        self.position += width;
+        return .{ .kind = .symbol, .symbol = symbol, .start = start, .end = self.position, .len = width };
+    }
+};
+
+/// Frozen alpha-grammar byte lexer: whitespace and `--` comments separate
+/// tokens; words are ASCII letters, digits and `_`; `''` escapes quotes.
 pub const Lexer = struct {
     source: []const u8,
     position: usize = 0,
@@ -102,13 +441,18 @@ pub const Lexer = struct {
     }
 };
 
-/// Copies a quoted literal's decoded bytes into `out` (len bytes).
-pub fn decodeQuoted(source: []const u8, quoted: Quoted, out: []u8) void {
+/// Copies a quoted literal's decoded bytes into `out` (len bytes). `quote`
+/// is the doubled delimiter (`'` for strings, `"` for identifiers).
+pub fn decodeQuotedWith(source: []const u8, quoted: Quoted, quote: u8, out: []u8) void {
     var index = quoted.start;
     var written: usize = 0;
     while (index < quoted.end) {
         out[written] = source[index];
         written += 1;
-        index += if (source[index] == '\'') 2 else 1;
+        index += if (source[index] == quote) 2 else 1;
     }
+}
+
+pub fn decodeQuoted(source: []const u8, quoted: Quoted, out: []u8) void {
+    decodeQuotedWith(source, quoted, '\'', out);
 }

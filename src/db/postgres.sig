@@ -173,6 +173,7 @@ pub fn Session(comptime DB: type) type {
             result_rows: usize = 0,
             affected: usize = 0,
             rolled_back: bool = false,
+            command: []const u8 = "",
             fn source(self: *const Portal) []const u8 {
                 return self.sql[0..self.len];
             }
@@ -396,7 +397,7 @@ pub fn Session(comptime DB: type) type {
                         if (active != index) return error.PortalBusy;
                     }
                     if (p.complete) {
-                        try commandFor(w, p.source(), p.result_rows, p.affected, p.rolled_back);
+                        try commandFor(w, p.source(), p.command, p.result_rows, p.affected, p.rolled_back);
                         return false;
                     }
                     if (self.active_portal == null) {
@@ -406,6 +407,7 @@ pub fn Session(comptime DB: type) type {
                         p.result_rows = self.result.row_count;
                         p.affected = self.result.affected_rows;
                         p.rolled_back = self.commit_rolled_back;
+                        p.command = self.completed();
                     }
                     if (p.format_count > 1 and p.format_count != self.result.column_count) return error.ProtocolViolation;
                     const end = if (limit == 0) self.result.row_count else @min(self.result.row_count, p.row + limit);
@@ -457,6 +459,7 @@ pub fn Session(comptime DB: type) type {
             self.result.column_count = 0;
             self.result.row_count = 0;
             self.result.affected_rows = 0;
+            if (@hasField(DB.Result, "command")) self.result.command = .none;
             self.commit_rolled_back = false;
             const command_source = trim(source);
             if (keyword(command_source, "begin") or keyword(command_source, "begin work") or keyword(command_source, "begin transaction") or keyword(command_source, "start transaction")) {
@@ -741,23 +744,39 @@ pub fn Session(comptime DB: type) type {
             }
         }
         fn command(self: *Self, w: *Writer, source: []const u8) !void {
-            try commandFor(w, source, self.result.row_count, self.result.affected_rows, self.commit_rolled_back);
+            try commandFor(w, source, self.completed(), self.result.row_count, self.result.affected_rows, self.commit_rolled_back);
         }
-        fn commandFor(w: *Writer, source: []const u8, row_count: usize, affected: usize, rolled_back: bool) !void {
+        /// The engine's own command tag for the last statement, when it has one.
+        fn completed(self: *const Self) []const u8 {
+            if (!@hasField(DB.Result, "command")) return "";
+            return switch (self.result.command) {
+                .select => "select",
+                .insert => "insert",
+                .update => "update",
+                .delete => "delete",
+                .create_table => "create",
+                .drop_table => "drop",
+                else => "",
+            };
+        }
+        fn isCommand(completed_command: []const u8, source: []const u8, wanted: []const u8) bool {
+            return if (completed_command.len != 0) equal(completed_command, wanted) else word(source, wanted);
+        }
+        fn commandFor(w: *Writer, source: []const u8, completed_command: []const u8, row_count: usize, affected: usize, rolled_back: bool) !void {
             const p = try w.begin('C');
-            if (word(source, "select")) {
+            if (isCommand(completed_command, source, "select")) {
                 try w.append("SELECT ");
                 try w.number(@intCast(row_count));
-            } else if (word(source, "insert")) {
+            } else if (isCommand(completed_command, source, "insert")) {
                 try w.append("INSERT 0 ");
                 try w.number(@intCast(affected));
-            } else if (word(source, "update")) {
+            } else if (isCommand(completed_command, source, "update")) {
                 try w.append("UPDATE ");
                 try w.number(@intCast(affected));
-            } else if (word(source, "delete")) {
+            } else if (isCommand(completed_command, source, "delete")) {
                 try w.append("DELETE ");
                 try w.number(@intCast(affected));
-            } else if (word(source, "create")) try w.append("CREATE TABLE") else if (word(source, "drop")) try w.append("DROP TABLE") else if (word(source, "begin") or word(source, "start")) try w.append("BEGIN") else if (word(source, "commit") or word(source, "end")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (word(source, "rollback") or word(source, "abort")) try w.append("ROLLBACK") else if (word(source, "set")) try w.append("SET") else if (word(source, "deallocate")) try w.append("DEALLOCATE") else try w.append("OK");
+            } else if (isCommand(completed_command, source, "create")) try w.append("CREATE TABLE") else if (isCommand(completed_command, source, "drop")) try w.append("DROP TABLE") else if (word(source, "begin") or word(source, "start")) try w.append("BEGIN") else if (word(source, "commit") or word(source, "end")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (word(source, "rollback") or word(source, "abort")) try w.append("ROLLBACK") else if (word(source, "set")) try w.append("SET") else if (word(source, "deallocate")) try w.append("DEALLOCATE") else try w.append("OK");
             try w.byte(0);
             w.end(p);
         }
@@ -797,7 +816,26 @@ fn authenticationFailure(w: *Writer) !void {
     w.end(p);
 }
 fn sqlstate(err: anyerror) []const u8 {
+    return knownSqlstate(err) orelse "54000";
+}
+
+/// SQLSTATE for every engine, store and protocol error this codec knows;
+/// null means the error would fall back to 54000 (program_limit_exceeded).
+pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     const name = @errorName(err);
+    if (equal(name, "UndefinedFunction")) return "42883";
+    if (equal(name, "AmbiguousFunction")) return "42725";
+    if (equal(name, "CannotCoerce")) return "42846";
+    if (equal(name, "InvalidTextRepresentation")) return "22P02";
+    if (equal(name, "DivisionByZero")) return "22012";
+    if (equal(name, "InvalidEscapeSequence")) return "22025";
+    if (equal(name, "UndefinedParameter")) return "42P02";
+    if (equal(name, "InvalidColumnReference")) return "42P10";
+    if (equal(name, "StatementTooComplex")) return "54001";
+    if (equal(name, "VersionCapacity")) return "53200";
+    if (equal(name, "TableCapacity") or equal(name, "ColumnCapacity") or equal(name, "RowCapacity") or
+        equal(name, "NameCapacity") or equal(name, "TextCapacity") or equal(name, "PredicateCapacity")) return "54000";
+    if (equal(name, "UnsupportedLogVersion") or equal(name, "InvalidChangeRecord") or equal(name, "ChangeRecordConflict")) return "XX001";
     if (equal(name, "TableNotFound")) return "42P01";
     if (equal(name, "ColumnNotFound")) return "42703";
     if (equal(name, "TableExists")) return "42P07";
@@ -818,7 +856,7 @@ fn sqlstate(err: anyerror) []const u8 {
     if (equal(name, "StorageUnavailable") or equal(name, "StorageFailure") or equal(name, "FileWriteFailed") or equal(name, "FileSyncFailed") or equal(name, "FileTruncateFailed") or equal(name, "WriterPoisoned")) return "58030";
     if (equal(name, "Syntax")) return "42601";
     if (equal(name, "UnsupportedStatement") or equal(name, "UnsupportedMessage") or equal(name, "UnsupportedProtocol") or equal(name, "UnsupportedEncoding") or equal(name, "UnsupportedBinaryType")) return "0A000";
-    return "54000";
+    return null;
 }
 
 // One scanner serves counting and interpolation, so $ inside a quoted literal,

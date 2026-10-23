@@ -91,57 +91,99 @@ the same validation/application path with a compile-time no-op boundary.
 
 ## SQL subset
 
-CREATE/DROP TABLE; single-row INSERT with optional column mapping; SELECT
-projection or `*`; UPDATE literal assignments; DELETE. Columns have INTEGER/INT, BIGINT/INT8,
-BOOLEAN/BOOL, or TEXT types, with NOT NULL and one single-column PRIMARY KEY.
-The primary key is also non-null. Omitted INSERT columns become NULL.
+CREATE/DROP TABLE; single-row INSERT with optional column mapping and expression
+values; SELECT expressions or `*` with optional `FROM table [[AS] alias]` (one
+table; no FROM evaluates one row); UPDATE with expression SET; DELETE. Columns
+have INTEGER/INT/INT4, BIGINT/INT8, BOOLEAN/BOOL, or TEXT types, with NOT NULL
+and one single-column PRIMARY KEY. The primary key is also non-null. Omitted
+INSERT columns become NULL.
 
-WHERE accepts `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`,
-and bounded AND conjunctions. No implicit type conversion occurs, including
-predicates on empty tables. Ordinary comparisons involving NULL do not match.
-One ORDER BY column with ASC/DESC is supported, followed by LIMIT. Ordering is
-stable, with NULL first ascending and last descending by default. Set
-`Config.nulls_first_ascending = false` for PostgreSQL's inverse defaults.
-Explicit `NULLS FIRST` / `NULLS LAST` overrides the default in either direction.
-Text compares bytewise.
+Expressions (Q01) use PostgreSQL precedence, lowest first: OR, AND, NOT, IS,
+comparison (non-associative), BETWEEN/IN/LIKE/ILIKE, `||`, `+ -`, `* / %`,
+unary `+ -`, `::`. Supported forms: literals, (qualified) columns, parentheses,
+`=`, `<>`/`!=`, `<`, `<=`, `>`, `>=`, AND/OR/NOT with three-valued logic,
+`IS [NOT] NULL|TRUE|FALSE|UNKNOWN`, `[NOT] IN (list)`, `[NOT] BETWEEN`,
+`[NOT] LIKE|ILIKE` (`%`, `_`, default `\` escape), `||`, checked integer
+arithmetic, `CASE` (searched and simple), `COALESCE`, `NULLIF`, `x::type` and
+`CAST(x AS type)`. The binder types every expression with PostgreSQL's
+implicit-cast rules for this type set: untyped string/NULL literals take their
+type from context and are parsed at bind time (`'x'::integer` and `id = 'x'`
+are 22P02 even on empty tables); int4 and int8 mix to int8; there is no
+integer-to-boolean coercion (`WHERE id` is `TypeMismatch`/42804); an operator
+with no matching signature is `UndefinedFunction` (42883), `unknown + unknown`
+is `AmbiguousFunction` (42725), an impossible cast is `CannotCoerce` (42846).
+Evaluation checks int4/int8 overflow (`IntegerOverflow`, 22003) and division
+or modulo by zero (`DivisionByZero`, 22012); text input to integer and boolean
+casts follows int4in/int8in (signs, whitespace, `_`, 0x/0o/0b) and boolin.
+Assignments (INSERT values, UPDATE SET) use PostgreSQL assignment casts:
+int8 into int4 is range checked, integers and booleans convert into TEXT.
+Output columns are named like PostgreSQL (column, `coalesce`/`nullif`/`case`,
+cast type name such as `int4`, or `?column?`; `AS` aliases and quoted
+identifiers keep their case). `$n` reaching the engine is
+`UndefinedParameter`; decimal literals are `UnsupportedStatement` until NUMERIC.
+Other functions, JSON operators, aggregates, joins and subqueries are not
+supported.
 
-`Config.integer_bits` defaults to 64 for existing library users. A PostgreSQL
-server selects 32: INTEGER/INT then enforces signed 32-bit assignment ranges and
-reports `DataType.integer32`; BIGINT/INT8 always reports `.integer` and retains
-the signed 64-bit range. Cells retain the shared i64 payload. The wire sessions
-report the correct width (PostgreSQL OIDs 23/20, MySQL LONG/LONGLONG, TDS INTN
-4/8), including binary encoding and prepared parameter inference.
-Applications persisting SQL must version this schema interpretation separately:
-`durable_log.appendKind` / `recoverKind` provide a checked payload kind, while
-the existing append/recover APIs retain kind 1. Never replay 64-bit INTEGER logs
+WHERE keeps a row only when its predicate is TRUE. A top-level `pk = constant`
+conjunct (any constant expression) uses the primary-key index. At most
+`Config.predicates` leaf predicates may appear in one WHERE (`PredicateCapacity`).
+ORDER BY takes up to `columns` keys: expressions, output positions (out of
+range is `InvalidColumnReference`, 42P10) or output names, each with ASC/DESC and
+NULLS FIRST/LAST, then LIMIT. Sorting is a stable merge sort; with NULL first
+ascending and last descending by default (`Config.nulls_first_ascending = false`
+selects PostgreSQL's inverse defaults). Text compares bytewise.
+
+UPDATE and DELETE visit rows in rowid order; WHERE, SET evaluation and
+primary-key checks interleave per row like a PostgreSQL heap scan. A key is
+taken by any committed row this statement has not already replaced, or by a
+version this statement created (so `SET id = id + 1` over 1, 2, 3 is a
+violation, as in PostgreSQL for that physical order). Any error, including one
+after hundreds of rows, leaves zero rows changed. A failing SELECT never
+writes its result: fallible projections and sort keys are evaluated first.
+
+Dialect: `Database.dialect` (`.postgres` default, `.mysql`, `.tds`) is session
+state set by the caller before each statement; `db_store` connections set it,
+and the MySQL/TDS sessions set theirs on their first message. On `.postgres`
+an unqualified INTEGER is always int4 and BIGINT int8. On `.mysql`/`.tds`
+`Config.integer_bits` (default 64) selects INTEGER's width and integer 0/1 may
+be assigned to BOOLEAN; expression typing is identical in every dialect.
+Cells retain the shared i64 payload. The wire sessions report the correct width
+(PostgreSQL OIDs 23/20, MySQL LONG/LONGLONG, TDS INTN 4/8), including binary
+encoding and prepared parameter inference. Applications persisting SQL must
+version this schema interpretation separately: `durable_log.appendKind` /
+`recoverKind` provide a checked payload kind. Never replay 64-bit INTEGER logs
 under a 32-bit INTEGER schema interpretation without an explicit migration.
+`executeLegacy` keeps the alpha interpretation (integer_bits, boolean 0/1 in
+assignments and comparisons) and accepts only the frozen alpha grammar.
 
-Keywords and unquoted ASCII identifiers are case insensitive. Strings use
-apostrophes, escaped by doubling them; integer literals are signed 64-bit.
-Optional final semicolon, whitespace, and `--` comments are accepted.
-Identifiers and text have explicit byte capacities. SQL text is never executed
-as a batch, and unsupported trailing clauses are rejected before mutation.
+Keywords and unquoted ASCII identifiers are case insensitive; double-quoted
+identifiers keep their case. Strings use apostrophes, escaped by doubling them;
+integer literals are signed 64-bit. Optional final semicolon, whitespace, `--`
+and nested `/* */` comments are accepted. Identifiers and text have explicit
+byte capacities (text results of `||` included). SQL text is never executed as
+a batch, and unsupported trailing clauses are rejected before mutation.
 
 Errors include `Syntax`, `UnsupportedStatement`, `TableCapacity`,
 `ColumnCapacity`, `RowCapacity`, `NameCapacity`, `TextCapacity`,
 `PredicateCapacity`, `TableExists`, `TableNotFound`, `ColumnNotFound`,
 `DuplicateColumn`, `TypeMismatch`, `NotNullViolation`, `PrimaryKeyViolation`,
 `IntegerOverflow`, `StatementTooComplex`, `VersionCapacity`,
-`TransactionLogCapacity`, `UnsupportedLogVersion`, `InvalidChangeRecord` and
-`ChangeRecordConflict`.
+`TransactionLogCapacity`, `UnsupportedLogVersion`, `InvalidChangeRecord`,
+`ChangeRecordConflict`, `UndefinedFunction`, `AmbiguousFunction`,
+`CannotCoerce`, `InvalidTextRepresentation`, `DivisionByZero`,
+`InvalidEscapeSequence`, `UndefinedParameter` and `InvalidColumnReference`.
+`postgres.knownSqlstate` maps every one of them explicitly.
 
 Primary keys use a fixed multi-entry open-addressing hash index (key to version,
-maximum 50% load). Equality lookups and duplicate detection use that index. LIMIT without ordering
-stops scanning once enough rows match. Result clearing changes only active
-counts; callers must observe the active ranges. Column types are reported even
-when a SELECT returns zero rows. `Config.boolean_integers` optionally accepts
-integer 0/1 as boolean client values; the default remains strictly typed.
+maximum 50% load). Equality lookups and duplicate detection use that index. LIMIT
+without ordering stops scanning once enough rows match. Result clearing changes
+only active counts; callers must observe the active ranges. Column types are
+reported even when a SELECT returns zero rows.
 
-Other predicates scan rows and ordering uses bounded insertion sorting. Joins,
-general expressions, aggregates, secondary indexes, persistence, and complete
-SQL-standard conformance remain unimplemented. The reusable shared transaction
-adapter and wire sessions are documented in [database-server.md](database-server.md).
-
+Joins, aggregates, secondary indexes, NUMERIC and other types, functions beyond
+COALESCE/NULLIF, and complete SQL-standard or PostgreSQL conformance remain
+unimplemented. The reusable shared transaction adapter and wire sessions are
+documented in [database-server.md](database-server.md).
 ## Validation
 
 Run `sig build test-sql --summary all` with Sig 0.6.3. The target compiles and
@@ -150,4 +192,6 @@ executes `tests/test_sql.sig`, `test_sql_index.sig`, `test_sql_storage.sig` and
 It is also included in `sig build test`. The executable's `--prove-failure`
 option deliberately returns nonzero, including release modes. Contracts cover
 operations, ownership, fail-atomic constraints, capacity exhaustion/reuse,
-integer limits, malformed syntax, NULL semantics, and deterministic fuzz inputs.
+integer limits, malformed syntax, NULL semantics, deterministic fuzz inputs,
+expression precedence, truth tables, SQLSTATE classes and failure-after-many-rows
+atomicity.

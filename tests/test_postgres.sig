@@ -281,7 +281,8 @@ fn extended() !void {
     try tags(result, "DC");
     var frames: Frames = .{ .bytes = result };
     const row = (try frames.next()).?;
-    try check(u32be(row.body[2..6]) == 8 and equal(row.body[6..14], "\x00\x00\x00\x00\x00\x00\x00\x2a"));
+    // INTEGER is int4 on the PostgreSQL path whatever integer_bits says.
+    try check(u32be(row.body[2..6]) == 4 and equal(row.body[6..10], "\x00\x00\x00\x2a"));
     try check(equal(s.result.rows[0].cells[1].text.slice(), "a'b; -- $1"));
     try sync(&s, &db);
     try tags(try close(&s, &db, 'S', "insert"), "3");
@@ -320,7 +321,7 @@ fn inference() !void {
     _ = try query(&s, &db, "CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT, ok BOOLEAN)");
     try tags(try parse(&s, &db, "insert", "INSERT INTO t (body,id,ok) VALUES ($1,$2,$3)", &.{}), "1");
     try tags(try describe(&s, &db, 'S', "insert"), "tn");
-    try check(s.statements[0].oids[0] == 25 and s.statements[0].oids[1] == 20 and s.statements[0].oids[2] == 16);
+    try check(s.statements[0].oids[0] == 25 and s.statements[0].oids[1] == 23 and s.statements[0].oids[2] == 16);
     try tags(try bind(&s, &db, "", "insert", &.{ "123", "7", "true" }, 0, 0), "2");
     try tags(try execute(&s, &db, "", 0), "C");
     try sync(&s, &db);
@@ -569,10 +570,27 @@ fn fuzz() !void {
         fuzz_inputs += 1;
     }
 }
-pub fn main(init: std.process.Init) !void {
-    try normal();
+/// Every engine error has an explicit SQLSTATE; none falls back to 54000.
+fn errorStates() !void {
+    inline for (@typeInfo(sql.Error).error_set.error_names.?) |name| {
+        const err = @field(sql.Error, name);
+        try check(pg.knownSqlstate(err) != null);
+    }
+    const expected = .{
+        .{ error.UndefinedFunction, "42883" },         .{ error.TypeMismatch, "42804" },
+        .{ error.InvalidTextRepresentation, "22P02" }, .{ error.IntegerOverflow, "22003" },
+        .{ error.DivisionByZero, "22012" },            .{ error.AmbiguousFunction, "42725" },
+        .{ error.CannotCoerce, "42846" },              .{ error.StatementTooComplex, "54001" },
+        .{ error.VersionCapacity, "53200" },           .{ error.InvalidColumnReference, "42P10" },
+    };
+    inline for (expected) |pair| try check(equal(pg.knownSqlstate(pair[0]).?, pair[1]));
+    try check(pg.knownSqlstate(error.SomethingUnknown) == null);
+}
+
+pub fn main(init: std.process.Init) !void {    try normal();
     try extended();
     try inference();
+    try errorStates();
     try statementLifecycle();
     try malformed();
     try authenticationContracts();

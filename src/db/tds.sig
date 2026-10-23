@@ -857,6 +857,8 @@ pub fn Session(comptime DB: type) type {
         }
 
         pub fn handle(self: *Self, db: *DB, input: []const u8, out: []u8) Error!Reply {
+            // TDS BIT parameters arrive as integer 0/1 (design §4.2).
+            if (@hasField(DB, "dialect")) db.dialect = .tds;
             if (self.state == .closed) return error.InvalidState;
             if (input.len < 8) return .{};
             const packet_length = be16(input[2..4]);

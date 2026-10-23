@@ -324,6 +324,8 @@ pub fn Session(comptime DB: type) type {
         }
 
         pub fn handle(self: *Self, db: *DB, input: []const u8, out: []u8) Error!Reply {
+            // MySQL BIT clients assign booleans as integer 0/1 (design §4.2).
+            if (@hasField(DB, "dialect")) db.dialect = .mysql;
             if (!self.greeted or self.closed) return error.InvalidState;
             if (input.len < 4) return .{};
             const length: usize = @intCast(readLe(input[0..3]));
