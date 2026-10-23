@@ -9,7 +9,8 @@ const Tight = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 4, .v
 const Wide = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 128, .text_bytes = 16 });
 const Complex = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 4, .expr_nodes = 10, .expr_depth = 4, .predicates = 8 });
 /// RAMSQL's default server profile (src/server.sig) for the memory report.
-const ServerProfile = sql.Database(.{ .tables = 8, .columns = 8, .rows_per_table = 512, .name_bytes = 63, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32 });
+// RAMSQL's default server profile (16 clients -> 18 transaction slots, 4096 tx-writes).
+const ServerProfile = sql.Database(.{ .tables = 8, .columns = 8, .rows_per_table = 512, .name_bytes = 63, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 18, .tx_writes = 4096 });
 
 var assertions: usize = 0;
 

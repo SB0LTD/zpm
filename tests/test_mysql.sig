@@ -84,8 +84,7 @@ const Reader = struct {
 
 fn handshakeAndFragmentation() !void {
     store = .{};
-    var workspace: Raw = .{};
-    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
+    var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     var tiny: [1]u8 = undefined;
     if (session.begin(&tiny)) |_| return error.ShortGreetingAccepted else |err| try check(err == error.BufferTooSmall);
@@ -109,8 +108,7 @@ fn handshakeAndFragmentation() !void {
 
 fn typedResultsAndErrors() !void {
     store = .{};
-    var workspace: Raw = .{};
-    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
+    var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     try connect(&session, &db);
     _ = try command(&session, &db, "CREATE TABLE data (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN, note TEXT)");
@@ -155,8 +153,7 @@ fn typedResultsAndErrors() !void {
 
 fn transactionsAndOutputPreflight() !void {
     store = .{};
-    var workspace: Raw = .{};
-    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
+    var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     try connect(&session, &db);
     _ = try command(&session, &db, "SET AUTOCOMMIT = 0");
@@ -178,8 +175,7 @@ fn transactionsAndOutputPreflight() !void {
 
 fn malformedAndFuzz() !void {
     store = .{};
-    var workspace: Raw = .{};
-    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
+    var db: DB = .{ .store = &store, .id = 1 };
     var scratch: [256]u8 = undefined;
     var session: Session = .{};
     _ = try session.begin(&output);
@@ -215,10 +211,8 @@ fn malformedAndFuzz() !void {
 
 fn concurrentCommittedVisibility() !void {
     store = .{};
-    var first_workspace: Raw = .{};
-    var second_workspace: Raw = .{};
-    var first: DB = .{ .store = &store, .id = 1, .transaction_workspace = &first_workspace };
-    var second: DB = .{ .store = &store, .id = 2, .transaction_workspace = &second_workspace };
+    var first: DB = .{ .store = &store, .id = 1 };
+    var second: DB = .{ .store = &store, .id = 2 };
     var a: Session = .{};
     var b: Session = .{};
     try connect(&a, &first);
@@ -230,17 +224,20 @@ fn concurrentCommittedVisibility() !void {
     _ = try command(&a, &first, "UPDATE views SET id = 2 WHERE id = 1");
     _ = try command(&b, &second, "SELECT id FROM views");
     try check(b.result.row_count == 1 and b.result.rows[0].cells[0].integer == 1);
-    _ = try command(&b, &second, "UPDATE views SET id = 3 WHERE id = 1");
-    try check(output[4] == 0 and second.transactionStatus() == 'I');
+    // READ COMMITTED: the same-row writer waits (blocked, nothing consumed
+    // or written), then re-checks the committed row: id is now 2, UPDATE 0.
+    const parked = try command(&b, &second, "UPDATE views SET id = 3 WHERE id = 1");
+    try check(parked.blocked and parked.consumed == 0 and parked.written == 0 and second.blocked());
     _ = try command(&a, &first, "SELECT id FROM views");
     try check(a.result.rows[0].cells[0].integer == 2);
     _ = try command(&a, &first, "COMMIT");
-    try check(output[4] == 0xff and first.transactionStatus() == 'E');
-    _ = try command(&a, &first, "ROLLBACK");
+    try check(output[4] == 0 and first.transactionStatus() == 'I');
+    const resumed = try command(&b, &second, "UPDATE views SET id = 3 WHERE id = 1");
+    try check(!resumed.blocked and output[4] == 0 and output[5] == 0 and second.transactionStatus() == 'I');
     _ = try command(&a, &first, "SELECT id FROM views");
-    try check(first.transactionStatus() == 'I' and a.result.rows[0].cells[0].integer == 3);
+    try check(first.transactionStatus() == 'I' and a.result.rows[0].cells[0].integer == 2);
     _ = try command(&a, &first, "BEGIN");
-    _ = try command(&a, &first, "UPDATE views SET id = 4 WHERE id = 3");
+    _ = try command(&a, &first, "UPDATE views SET id = 4 WHERE id = 2");
     _ = try command(&a, &first, "COMMIT");
     try check(output[4] == 0 and first.transactionStatus() == 'I');
     _ = try command(&b, &second, "SELECT id FROM views");

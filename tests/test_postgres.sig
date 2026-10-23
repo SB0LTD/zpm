@@ -587,7 +587,143 @@ fn errorStates() !void {
     try check(pg.knownSqlstate(error.SomethingUnknown) == null);
 }
 
-pub fn main(init: std.process.Init) !void {    try normal();
+const stores = @import("db_store");
+const Store = stores.Store(Raw);
+const StoreSession = pg.Session(Store.Connection);
+var store_output: [StoreSession.responseCapacity()]u8 = undefined;
+
+fn storeSend(s: *StoreSession, db: *Store.Connection, p: *Packet) !pg.Reply {
+    const reply = try s.handle(db, p.slice(), &store_output);
+    packets += 1;
+    return reply;
+}
+
+fn storeQuery(s: *StoreSession, db: *Store.Connection, source: []const u8) ![]const u8 {
+    var p = Packet.init('Q');
+    p.string(source);
+    const reply = try storeSend(s, db, &p);
+    try check(!reply.blocked and reply.consumed == p.len);
+    return store_output[0..reply.written];
+}
+
+fn storeStartup(s: *StoreSession, db: *Store.Connection, options: []const u8) ![]const u8 {
+    var p = Packet.init(0);
+    p.len = 4;
+    p.number32(196608);
+    p.string("user");
+    p.string("ramsql");
+    p.string("options");
+    p.string(options);
+    p.byte(0);
+    put32(p.bytes[0..4], @intCast(p.len));
+    const reply = try s.handle(db, p.bytes[0..p.len], &store_output);
+    try check(reply.consumed == p.len and s.startup);
+    return store_output[0..reply.written];
+}
+
+fn commandTag(bytes: []const u8, wanted: []const u8) !void {
+    var frames: Frames = .{ .bytes = bytes };
+    while (try frames.next()) |f| if (f.tag == 'C') {
+        try check(equal(f.body[0 .. f.body.len - 1], wanted));
+        return;
+    };
+    return error.MissingCommandTag;
+}
+
+// READ COMMITTED wire behavior over the real store: BackendKeyData,
+// CancelRequest keys, startup options, control-command tags, SHOW rows, a
+// parked Execute reported as blocked, and ROLLBACK TO closing newer portals.
+fn storeContracts() !void {
+    var store: Store = .{};
+    var a: Store.Connection = .{ .store = &store, .id = 1 };
+    var b: Store.Connection = .{ .store = &store, .id = 2 };
+    var sa: StoreSession = .{};
+    var sb: StoreSession = .{};
+    sa.configureBackendKey(7, 0xdeadbeef);
+    const ready = try storeStartup(&sa, &a, "-c statement_timeout=1500");
+    var frames: Frames = .{ .bytes = ready };
+    var saw_key = false;
+    while (try frames.next()) |f| if (f.tag == 'K') {
+        try check(u32be(f.body[0..4]) == 7 and u32be(f.body[4..8]) == 0xdeadbeef);
+        saw_key = true;
+    };
+    try check(saw_key and a.settings.statement_timeout_ms == 1500);
+    _ = try storeStartup(&sb, &b, "");
+    // CancelRequest goes to the caller with its key; the codec looks nothing up.
+    var fresh: StoreSession = .{};
+    var cancel_bytes: [16]u8 = undefined;
+    put32(cancel_bytes[0..4], 16);
+    put32(cancel_bytes[4..8], 80877102);
+    put32(cancel_bytes[8..12], 7);
+    put32(cancel_bytes[12..16], 0xdeadbeef);
+    const cancel = try fresh.handle(&a, &cancel_bytes, &store_output);
+    try check(cancel.close and cancel.written == 0 and cancel.cancel.?.pid == 7 and cancel.cancel.?.secret == 0xdeadbeef);
+
+    _ = try storeQuery(&sa, &a, "CREATE TABLE w (id INTEGER PRIMARY KEY, v INTEGER)");
+    _ = try storeQuery(&sa, &a, "INSERT INTO w VALUES (1, 0)");
+    try commandTag(try storeQuery(&sa, &a, "SHOW statement_timeout"), "SHOW");
+    try check(equal(sa.result.rows[0].cells[0].text.slice(), "1500ms"));
+    try commandTag(try storeQuery(&sa, &a, "SET lock_timeout TO '2s'"), "SET");
+    try commandTag(try storeQuery(&sa, &a, "RESET lock_timeout"), "RESET");
+    try state(try storeQuery(&sa, &a, "SAVEPOINT outside"), "25P01");
+    try commandTag(try storeQuery(&sa, &a, "BEGIN"), "BEGIN");
+    try commandTag(try storeQuery(&sa, &a, "SAVEPOINT s"), "SAVEPOINT");
+    try commandTag(try storeQuery(&sa, &a, "UPDATE w SET v = 1 WHERE id = 1"), "UPDATE 1");
+
+    // b's extended-protocol Execute parks: nothing consumed or written.
+    var parse_packet = Packet.init('P');
+    parse_packet.string("");
+    parse_packet.string("UPDATE w SET v = 2 WHERE id = 1");
+    parse_packet.number16(0);
+    _ = try storeSend(&sb, &b, &parse_packet);
+    var bind_packet = Packet.init('B');
+    bind_packet.string("");
+    bind_packet.string("");
+    bind_packet.number16(0);
+    bind_packet.number16(0);
+    bind_packet.number16(0);
+    _ = try storeSend(&sb, &b, &bind_packet);
+    var execute_packet = Packet.init('E');
+    execute_packet.string("");
+    execute_packet.number32(0);
+    const parked = try storeSend(&sb, &b, &execute_packet);
+    try check(parked.blocked and parked.consumed == 0 and parked.written == 0 and b.blocked());
+
+    // A named portal bound after the savepoint is closed by ROLLBACK TO.
+    var portal_parse = Packet.init('P');
+    portal_parse.string("q");
+    portal_parse.string("SELECT v FROM w");
+    portal_parse.number16(0);
+    _ = try storeSend(&sa, &a, &portal_parse);
+    var portal_bind = Packet.init('B');
+    portal_bind.string("late");
+    portal_bind.string("q");
+    portal_bind.number16(0);
+    portal_bind.number16(0);
+    portal_bind.number16(0);
+    _ = try storeSend(&sa, &a, &portal_bind);
+    try check(sa.portals[0].live or sa.portals[1].live);
+    try commandTag(try storeQuery(&sa, &a, "ROLLBACK TO SAVEPOINT s"), "ROLLBACK");
+    for (&sa.portals) |*p| try check(!(p.live and equal(p.name.bytes[0..p.name.len], "late")));
+    // The row lock is gone: b's re-delivered Execute completes.
+    try check(b.wakeReady());
+    const resumed = try storeSend(&sb, &b, &execute_packet);
+    try check(!resumed.blocked and resumed.consumed == execute_packet.len);
+    try commandTag(store_output[0..resumed.written], "UPDATE 1");
+    try commandTag(try storeQuery(&sa, &a, "RELEASE SAVEPOINT s"), "RELEASE");
+    try commandTag(try storeQuery(&sa, &a, "COMMIT"), "COMMIT");
+    _ = try storeQuery(&sb, &b, "SELECT v FROM w");
+    try check(sb.result.rows[0].cells[0].integer == 2);
+    try state(try storeQuery(&sa, &a, "BEGIN ISOLATION LEVEL SERIALIZABLE"), "0A000");
+    _ = try storeQuery(&sa, &a, "SHOW transaction_isolation");
+    try check(equal(sa.result.rows[0].cells[0].text.slice(), "read committed") and equal(sa.result.column_names[0].slice(), "transaction_isolation"));
+    const usage = store.database.usage();
+    try check(usage.row_locks == 0 and usage.pending_versions == 0);
+}
+
+pub fn main(init: std.process.Init) !void {
+    try storeContracts();
+    try normal();
     try extended();
     try inference();
     try errorStates();

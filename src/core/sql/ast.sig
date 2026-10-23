@@ -174,6 +174,7 @@ pub fn Ast(comptime config: types.Config) type {
             order: [config.columns]OrderKey = undefined,
             order_count: usize = 0,
             limit: u64 = config.rows_per_table,
+            lock: Locking = .{},
         };
 
         pub const Assignment = struct {
@@ -200,9 +201,45 @@ pub fn Ast(comptime config: types.Config) type {
             select: Select,
             update: Update,
             delete: Delete,
-            begin: void,
-            commit: void,
-            rollback: void,
+            control: Control,
         };
     };
 }
+
+/// SELECT ... FOR UPDATE|SHARE [NOWAIT|SKIP LOCKED].
+pub const LockStrength = enum { none, update, share };
+pub const LockWait = enum { block, nowait, skip_locked };
+pub const Locking = struct { strength: LockStrength = .none, wait: LockWait = .block };
+
+pub const Isolation = enum { default, read_uncommitted, read_committed, repeatable_read, serializable };
+
+/// A configuration parameter name: an identifier, or the special SQL forms
+/// TIME ZONE and TRANSACTION ISOLATION LEVEL.
+pub const SettingName = struct {
+    ident: Ident = .{},
+    special: enum { none, time_zone, transaction_isolation } = .none,
+};
+
+/// SET value: DEFAULT, LOCAL (TIME ZONE LOCAL), a word, a string literal or
+/// a (signed) number. `span` is the raw word/number; `quoted` the string.
+pub const SettingValue = struct {
+    kind: enum { default, word, string, number } = .default,
+    span: Span = .{},
+    quoted: lexer.Quoted = .{ .start = 0, .end = 0, .len = 0 },
+};
+
+/// Transaction control and session commands; executed by the store, never
+/// by a single statement.
+pub const Control = union(enum) {
+    begin: Isolation,
+    commit: void,
+    rollback: void,
+    savepoint: Ident,
+    release: Ident,
+    rollback_to: Ident,
+    set: struct { local: bool, name: SettingName, value: SettingValue },
+    set_transaction: Isolation,
+    show: SettingName,
+    /// null = RESET ALL.
+    reset: ?SettingName,
+};

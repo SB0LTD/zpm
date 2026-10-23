@@ -28,6 +28,8 @@ pub const Kind = enum { end, word, quoted_word, string, integer, decimal, parame
 /// never keywords).
 pub const Keyword = enum {
     none,
+    abort,
+    all,
     @"and",
     as,
     asc,
@@ -41,7 +43,9 @@ pub const Keyword = enum {
     cast,
     coalesce,
     commit,
+    committed,
     create,
+    default,
     delete,
     desc,
     drop,
@@ -49,6 +53,7 @@ pub const Keyword = enum {
     end,
     @"false",
     first,
+    @"for",
     from,
     ilike,
     in,
@@ -59,36 +64,57 @@ pub const Keyword = enum {
     integer,
     into,
     is,
+    isolation,
     key,
     last,
+    level,
     like,
     limit,
+    local,
+    locked,
     not,
+    nowait,
     @"null",
     nullif,
     nulls,
     @"or",
     order,
     primary,
+    read,
+    release,
+    repeatable,
+    reset,
     rollback,
+    savepoint,
     select,
+    serializable,
+    session,
     set,
+    share,
+    show,
+    skip,
+    start,
     table,
     text,
     then,
+    time,
+    to,
     transaction,
     @"true",
+    uncommitted,
     unknown,
     update,
     values,
     when,
     where,
+    work,
+    zone,
 };
 
 /// Words that cannot be unquoted identifiers.
 pub fn reserved(keyword: Keyword) bool {
     return switch (keyword) {
-        .create, .drop, .insert, .select, .update, .delete, .table, .into, .values, .from, .where, .@"and", .@"or", .set, .order, .by, .asc, .desc, .limit, .is, .not, .@"null", .@"true", .@"false", .primary, .key, .case, .when, .then, .@"else", .end, .cast, .as, .in, .between, .like, .ilike => true,
+        .create, .drop, .insert, .select, .update, .delete, .table, .into, .values, .from, .where, .@"and", .@"or", .set, .order, .by, .asc, .desc, .limit, .is, .not, .@"null", .@"true", .@"false", .primary, .key, .case, .when, .then, .@"else", .end, .cast, .as, .in, .between, .like, .ilike, .@"for" => true,
         else => false,
     };
 }
@@ -103,8 +129,8 @@ pub fn keywordOf(comptime text: []const u8) Keyword {
 }
 
 pub fn classify(word: []const u8) Keyword {
-    if (word.len < 2 or word.len > 11) return .none;
-    var name: [11]u8 = undefined;
+    if (word.len < 2 or word.len > 12) return .none;
+    var name: [12]u8 = undefined;
     for (word, 0..) |byte, index| name[index] = types.lower(byte);
     const wanted = name[0..word.len];
     inline for (@typeInfo(Keyword).@"enum".field_names) |field| {

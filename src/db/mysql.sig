@@ -8,7 +8,9 @@
 //! Source: dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html.
 
 pub const max_request_bytes: usize = 65536;
-pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false };
+/// `blocked`: the statement is parked on a lock (consumed = written = 0);
+/// re-deliver the same bytes when the store reports progress.
+pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false, blocked: bool = false };
 pub const Error = error{ BufferTooSmall, MalformedPacket, RequestTooLarge, InvalidSequence, InvalidState };
 
 const protocol_41: u32 = 0x200;
@@ -351,7 +353,13 @@ pub fn Session(comptime DB: type) type {
                     3 => {
                         if (db.execute(payload[1..], &self.result)) |_| {
                             try self.results(&writer, self.status(db));
-                        } else |err| try sqlError(&writer, err);
+                        } else |err| {
+                            // A parked statement: nothing consumed or written;
+                            // the caller re-delivers the same packet later.
+                            const any: anyerror = err;
+                            if (any == error.WouldBlock) return .{ .blocked = true };
+                            try sqlError(&writer, err);
+                        }
                     },
                     14 => {
                         if (payload.len != 1) return error.MalformedPacket;

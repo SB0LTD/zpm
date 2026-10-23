@@ -38,13 +38,14 @@ pub fn Parser(comptime config: types.Config) type {
         has_peek: bool = false,
         pool: *Ast.Pool,
         source: []const u8,
+        mode: Mode = .standard,
         recursion: usize = 0,
 
         /// Parses exactly one statement. The pool is reset first.
         pub fn parse(source: []const u8, pool: *Ast.Pool, mode: Mode) Error!Ast.Statement {
             pool.reset();
             if (mode == .legacy_alpha) try alpha.Recognizer(config).check(source);
-            var self = Self{ .tokens = .{ .source = source, .text_limit = config.text_bytes }, .pool = pool, .source = source };
+            var self = Self{ .tokens = .{ .source = source, .text_limit = config.text_bytes }, .pool = pool, .source = source, .mode = mode };
             try self.advance();
             return self.statement();
         }
@@ -159,20 +160,165 @@ pub fn Parser(comptime config: types.Config) type {
             if (try self.takeWord("SELECT")) return .{ .select = try self.select() };
             if (try self.takeWord("UPDATE")) return .{ .update = try self.update() };
             if (try self.takeWord("DELETE")) return .{ .delete = try self.delete() };
-            if (try self.takeWord("BEGIN")) return self.control(.begin);
-            if (try self.takeWord("COMMIT")) return self.control(.commit);
-            if (try self.takeWord("ROLLBACK")) return self.control(.rollback);
+            if (self.mode == .legacy_alpha) {
+                if (try self.takeWord("BEGIN")) return self.legacyControl(.{ .begin = .default });
+                if (try self.takeWord("COMMIT")) return self.legacyControl(.commit);
+                if (try self.takeWord("ROLLBACK")) return self.legacyControl(.rollback);
+                return error.UnsupportedStatement;
+            }
+            return .{ .control = try self.controlStatement() };
+        }
+
+        fn legacyControl(self: *Self, control: ast.Control) Error!Ast.Statement {
+            _ = self.takeWord("TRANSACTION") catch return error.UnsupportedStatement;
+            self.finish() catch return error.UnsupportedStatement;
+            return .{ .control = control };
+        }
+
+        /// Transaction control and session commands (the store executes them).
+        fn controlStatement(self: *Self) Error!ast.Control {
+            // Trailing text after plain transaction control stays an
+            // unsupported statement (0A000), as before the pipeline split.
+            if (try self.takeWord("BEGIN")) {
+                _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
+                const level = try self.isolationClause();
+                self.finish() catch return error.UnsupportedStatement;
+                return .{ .begin = level };
+            }
+            if (try self.takeWord("START")) {
+                try self.expectWord("TRANSACTION");
+                const level = try self.isolationClause();
+                self.finish() catch return error.UnsupportedStatement;
+                return .{ .begin = level };
+            }
+            if ((try self.takeWord("COMMIT")) or (try self.takeWord("END"))) {
+                _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
+                self.finish() catch return error.UnsupportedStatement;
+                return .commit;
+            }
+            if (try self.takeWord("ABORT")) {
+                _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
+                try self.finish();
+                return .rollback;
+            }
+            if (try self.takeWord("ROLLBACK")) {
+                _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
+                if (try self.takeWord("TO")) {
+                    _ = try self.takeWord("SAVEPOINT");
+                    const name = try self.identifier();
+                    try self.finish();
+                    return .{ .rollback_to = name };
+                }
+                self.finish() catch return error.UnsupportedStatement;
+                return .rollback;
+            }
+            if (try self.takeWord("SAVEPOINT")) {
+                const name = try self.identifier();
+                try self.finish();
+                return .{ .savepoint = name };
+            }
+            if (try self.takeWord("RELEASE")) {
+                _ = try self.takeWord("SAVEPOINT");
+                const name = try self.identifier();
+                try self.finish();
+                return .{ .release = name };
+            }
+            if (try self.takeWord("SET")) {
+                var local = false;
+                if (try self.takeWord("LOCAL")) local = true else _ = try self.takeWord("SESSION");
+                if (try self.takeWord("TRANSACTION")) {
+                    const level = try self.isolationClause();
+                    if (level == .default) return error.Syntax;
+                    try self.finish();
+                    return .{ .set_transaction = level };
+                }
+                if (try self.takeWord("TIME")) {
+                    try self.expectWord("ZONE");
+                    var value: ast.SettingValue = .{};
+                    if (!try self.takeWord("LOCAL")) value = try self.settingValue();
+                    try self.finish();
+                    return .{ .set = .{ .local = local, .name = .{ .special = .time_zone }, .value = value } };
+                }
+                const name: ast.SettingName = .{ .ident = try self.label() };
+                if (!try self.takeWord("TO")) try self.expectSymbol(.eq);
+                const value = try self.settingValue();
+                try self.finish();
+                return .{ .set = .{ .local = local, .name = name, .value = value } };
+            }
+            if (try self.takeWord("SHOW")) {
+                const name = try self.settingName();
+                try self.finish();
+                return .{ .show = name };
+            }
+            if (try self.takeWord("RESET")) {
+                if (try self.takeWord("ALL")) {
+                    try self.finish();
+                    return .{ .reset = null };
+                }
+                const name = try self.settingName();
+                try self.finish();
+                return .{ .reset = name };
+            }
             return error.UnsupportedStatement;
         }
 
-        const ControlTag = enum { begin, commit, rollback };
+        fn settingName(self: *Self) Error!ast.SettingName {
+            if (try self.takeWord("TIME")) {
+                try self.expectWord("ZONE");
+                return .{ .special = .time_zone };
+            }
+            if (try self.takeWord("TRANSACTION")) {
+                try self.expectWord("ISOLATION");
+                try self.expectWord("LEVEL");
+                return .{ .special = .transaction_isolation };
+            }
+            return .{ .ident = try self.label() };
+        }
 
-        fn control(self: *Self, comptime tag: ControlTag) Error!Ast.Statement {
-            _ = self.takeWord("TRANSACTION") catch return error.UnsupportedStatement;
-            // Anything after transaction control stays an unsupported
-            // statement (0A000), as before the pipeline split.
-            self.finish() catch return error.UnsupportedStatement;
-            return @unionInit(Ast.Statement, @tagName(tag), {});
+        fn settingValue(self: *Self) Error!ast.SettingValue {
+            const token = self.current;
+            if (token.kind == .word and token.isWord("DEFAULT")) {
+                try self.advance();
+                return .{ .kind = .default };
+            }
+            switch (token.kind) {
+                .string => {
+                    try self.advance();
+                    return .{ .kind = .string, .quoted = token.quoted() };
+                },
+                .word => {
+                    try self.advance();
+                    return .{ .kind = .word, .span = .{ .start = token.start, .len = token.len } };
+                },
+                .integer, .decimal => {
+                    try self.advance();
+                    return .{ .kind = .number, .span = .{ .start = token.start, .len = token.end - token.start } };
+                },
+                .symbol => if (token.symbol == .minus) {
+                    try self.advance();
+                    const number = self.current;
+                    if (number.kind != .integer and number.kind != .decimal) return error.Syntax;
+                    try self.advance();
+                    return .{ .kind = .number, .span = .{ .start = token.start, .len = number.end - token.start } };
+                },
+                else => {},
+            }
+            return error.Syntax;
+        }
+
+        /// [ISOLATION LEVEL {READ COMMITTED|READ UNCOMMITTED|REPEATABLE READ|SERIALIZABLE}]
+        fn isolationClause(self: *Self) Error!ast.Isolation {
+            if (!try self.takeWord("ISOLATION")) return .default;
+            try self.expectWord("LEVEL");
+            if (try self.takeWord("SERIALIZABLE")) return .serializable;
+            if (try self.takeWord("REPEATABLE")) {
+                try self.expectWord("READ");
+                return .repeatable_read;
+            }
+            try self.expectWord("READ");
+            if (try self.takeWord("COMMITTED")) return .read_committed;
+            try self.expectWord("UNCOMMITTED");
+            return .read_uncommitted;
         }
 
         fn typeName(self: *Self) Error!ast.TypeName {
@@ -291,15 +437,32 @@ pub fn Parser(comptime config: types.Config) type {
                     if (!try self.takeSymbol(.comma)) break;
                 }
             }
+            var limited = false;
             if (try self.takeWord("LIMIT")) {
-                if (self.current.kind != .integer) return error.Syntax;
-                out.limit = self.current.integer;
-                try self.advance();
+                try self.limitValue(&out);
+                limited = true;
+            }
+            if (self.mode == .standard and try self.takeWord("FOR")) {
+                if (out.from == null) return error.Syntax;
+                if (try self.takeWord("UPDATE")) out.lock.strength = .update else {
+                    try self.expectWord("SHARE");
+                    out.lock.strength = .share;
+                }
+                if (try self.takeWord("NOWAIT")) out.lock.wait = .nowait else if (try self.takeWord("SKIP")) {
+                    try self.expectWord("LOCKED");
+                    out.lock.wait = .skip_locked;
+                }
+                if (!limited and try self.takeWord("LIMIT")) try self.limitValue(&out);
             }
             try self.finish();
             return out;
         }
 
+        fn limitValue(self: *Self, out: *Ast.Select) Error!void {
+            if (self.current.kind != .integer) return error.Syntax;
+            out.limit = self.current.integer;
+            try self.advance();
+        }
         fn update(self: *Self) Error!Ast.Update {
             var out: Ast.Update = .{ .table = try self.identifier() };
             try self.expectWord("SET");

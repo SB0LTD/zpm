@@ -20,13 +20,28 @@ pub const Config = struct {
     /// Row-version arena slots per table. 0 selects 2 x rows_per_table; an
     /// explicit value must exceed rows_per_table.
     versions_per_table: usize = 0,
-    /// Statement-local undo entries. 0 selects rows_per_table, the most rows a
-    /// single statement can touch; an explicit value must not be smaller.
+    /// Write-set entries per transaction (row versions, row marks and catalog
+    /// versions it created or marked). 0 selects 2 x rows_per_table (at least
+    /// 64); RAMSQL sets 4096. Exceeding it is WriteSetCapacity (53200) with
+    /// the statement rolled back.
     tx_writes: usize = 0,
     /// Statement-scoped expression node pool inside Database.workspace.
     expr_nodes: usize = 512,
     /// Maximum parser nesting depth.
     expr_depth: usize = 64,
+    /// Concurrent transaction slots (RAMSQL: clients + 2). Exhaustion is
+    /// TransactionCapacity (53200).
+    transactions: usize = 8,
+    /// User savepoints per transaction; one more slot is reserved for the
+    /// running statement's subtransaction.
+    savepoints: usize = 32,
+    /// FOR UPDATE / FOR SHARE row-lock entries shared by all transactions;
+    /// exhaustion is LockCapacity (53200).
+    row_locks: usize = 256,
+    /// FOR SHARE holders per locked row.
+    share_holders: usize = 8,
+    /// Sequence catalog capacity (cat_sequences; sequences arrive with FEAT-007).
+    sequences: usize = 16,
 };
 
 pub const Error = error{
@@ -74,6 +89,38 @@ pub const Error = error{
     UndefinedParameter,
     /// SQLSTATE 42P10: ORDER BY position out of range.
     InvalidColumnReference,
+    /// Not an error for subtransaction purposes: the statement met a lock held
+    /// by a live transaction and is parked (design §4.4/§4.5). Resume it by
+    /// re-delivering the same statement.
+    WouldBlock,
+    /// SQLSTATE 40001: interim same-row conflict (unused once locks wait).
+    SerializationFailure,
+    /// SQLSTATE 40P01.
+    DeadlockDetected,
+    /// SQLSTATE 55P03: NOWAIT or lock_timeout.
+    LockNotAvailable,
+    /// SQLSTATE 57014: cancel request or statement_timeout.
+    QueryCanceled,
+    /// SQLSTATE 53200: the transaction table is full.
+    TransactionCapacity,
+    /// SQLSTATE 53200: a transaction's write set (Config.tx_writes) is full.
+    WriteSetCapacity,
+    /// SQLSTATE 53200: the row-lock table or a lock's share holders are full.
+    LockCapacity,
+    /// SQLSTATE 53200: a catalog relation has no free version or row.
+    CatalogCapacity,
+    /// SQLSTATE 53200: too many savepoints in one transaction.
+    SavepointCapacity,
+    /// SQLSTATE 3B001.
+    SavepointNotFound,
+    /// SQLSTATE 25P01: SAVEPOINT/RELEASE/ROLLBACK TO outside a block.
+    NoActiveTransaction,
+    /// SQLSTATE 25006: the caller does not permit writes (storage unavailable).
+    ReadOnlyTransaction,
+    /// SQLSTATE 42704: unrecognized configuration parameter.
+    UndefinedSetting,
+    /// SQLSTATE 22023: invalid value for a configuration parameter.
+    InvalidSettingValue,
 };
 
 /// Session dialect. It changes only assignment coercion (MySQL/TDS BIT
@@ -105,7 +152,7 @@ pub fn typeFromOid(oid: u32) ?DataType {
 }
 
 /// Statement kind of a completed (or described) statement.
-pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback };
+pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset };
 
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;

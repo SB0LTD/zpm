@@ -9,7 +9,6 @@ const Store = stores.Store(Raw);
 const Protocol = pg.Session(Store.Connection);
 const Stream = streams.Server(Store.Connection, Protocol, 128);
 var store: Store = .{};
-var workspace: Raw = undefined;
 var stream: Stream = .{};
 var session: Protocol = .{};
 var input: [2048]u8 = undefined;
@@ -72,7 +71,7 @@ pub fn main() !void {
     for ([_]usize{ 1, 2, 3, 7, 31, 128, 2048 }) |chunk| {
         store = .{};
         session = .{};
-        var connection: Store.Connection = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
+        var connection: Store.Connection = .{ .store = &store, .id = 1 };
         var io: Io = .{ .chunk = chunk };
         try stream.run(&io, &connection, &session);
         try check(io.at == used);

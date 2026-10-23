@@ -1,25 +1,30 @@
-//! Caller-owned, allocator-free SQL store with independent transaction snapshots.
+//! Caller-owned, allocator-free SQL store over the READ COMMITTED engine.
 //!
-//! Callers serialize method calls (the network reactor already does this), but a
-//! transaction never blocks another connection. A transaction reads its private
-//! snapshot; a writing commit rejects any intervening committed write. This is
-//! conservative optimistic isolation, not PostgreSQL's default READ COMMITTED.
-//! Raw must accept exactly one statement, reject unsupported syntax, and leave
-//! database/result unchanged on error. Its SELECT implementation is read-only.
-//! Durable mode uses Raw.executeWithCommit to validate, synchronously persist,
-//! then apply a mutation without copying database state. Older Raw adapters use
-//! a caller-owned candidate. Both persist BEFORE publication/acknowledgement.
-//! No database-sized
-//! automatic/stack storage is used. Hooks must not reenter this store.
+//! Callers serialize method calls (the network reactor already does this);
+//! concurrency comes from interleaved transactions in one shared Raw
+//! (sql.Database). Every statement takes a new snapshot; there are no
+//! per-connection database copies. A statement that meets a lock held by a
+//! live transaction returns error.WouldBlock and is parked: the connection
+//! keeps it pending and the caller re-delivers the SAME statement bytes when
+//! `wakeReady()` reports progress (wake epoch, timer or cancel); the engine
+//! resumes it with the same snapshot (design §4.4-§4.5). lock_timeout (55P03),
+//! statement_timeout (57014), the one-time deadlock check (40P01, after
+//! deadlock_timeout) and cancel requests (57014) end a parked statement.
 //!
-//! Change records (Raw.executeChanges, kind 3): autocommit encodes the single
-//! statement's undo list into `encode_buffer` (or the connection's
-//! transaction_log when no store buffer is set) and persists it before
-//! publication. In an explicit transaction every COMPLETED statement appends
-//! its ops to transaction_log; a failing statement appends nothing and
-//! overflow is TransactionLogCapacity with no state change. COMMIT keeps the
-//! base_generation check first, then persists the accumulated record. Raw
-//! adapters without executeChanges keep the length-framed SQL-text batches.
+//! Commit path (design §4.6), identical for autocommit and COMMIT: a
+//! read-only transaction (empty write set) publishes without persistence;
+//! otherwise payload = prepareCommit(encode_buffer) -> commit_fn(payload)
+//! (flush) -> publishCommit (infallible). Nothing becomes visible to another
+//! snapshot before publishCommit (flush-before-publication). A persistence
+//! error aborts the transaction and marks storage failed (58030 for later
+//! writes) until the owner recovers. A terminal statement error inside a
+//! transaction block aborts the work since the innermost savepoint and marks
+//! the block failed (25P02 until ROLLBACK / ROLLBACK TO); in autocommit it
+//! aborts the implicit transaction.
+//!
+//! Session settings (SET/SHOW/RESET, SET LOCAL, startup `-c` options) are
+//! transactional like PostgreSQL's: reverted by ROLLBACK and ROLLBACK TO,
+//! SET LOCAL ends with the transaction. Hooks must not reenter this store.
 
 pub const max_statement_bytes = 65536;
 
@@ -39,41 +44,32 @@ fn upper(byte: u8) u8 {
     return if (byte >= 'a' and byte <= 'z') byte - 32 else byte;
 }
 
+fn lowerByte(byte: u8) u8 {
+    return if (byte >= 'A' and byte <= 'Z') byte + 32 else byte;
+}
+
+fn sameInsensitive(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (lowerByte(x) != lowerByte(y)) return false;
+    return true;
+}
+
 fn whitespace(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
 }
 
-// Match the strict SQL parser's whitespace and -- comments. Classification is
-// deliberately limited to SELECT: unknown/future statements take the write path.
-fn readonly(source: []const u8) bool {
-    var offset: usize = 0;
-    while (offset < source.len) {
-        if (whitespace(source[offset])) {
-            offset += 1;
-        } else if (source[offset] == '-' and offset + 1 < source.len and source[offset + 1] == '-') {
-            offset += 2;
-            while (offset < source.len and source[offset] != '\n') offset += 1;
-        } else break;
-    }
-    if (source.len - offset < 6) return false;
-    for (source[offset..][0..6], "SELECT") |a, b| if (upper(a) != b) return false;
-    offset += 6;
-    if (offset == source.len) return true;
-    const next = upper(source[offset]);
-    return !((next >= 'A' and next <= 'Z') or (next >= '0' and next <= '9') or next == '_');
+/// 64-bit FNV-1a over the statement bytes (parameters are interpolated by
+/// the codecs before the store sees them).
+pub fn fingerprint(source: []const u8) u64 {
+    var code: u64 = 14695981039346656037;
+    for (source) |byte| code = (code ^ byte) *% 1099511628211;
+    return code;
 }
 
-fn writeLength(bytes: []u8, length: usize) void {
-    bytes[0] = @truncate(length);
-    bytes[1] = @truncate(length >> 8);
-    bytes[2] = @truncate(length >> 16);
-    bytes[3] = @truncate(length >> 24);
-}
-
-/// A durable commit batch is [u32 little-endian length][SQL bytes], repeated.
-/// Length framing preserves semicolons, newlines and comments inside literals.
-/// The caller applies a complete batch to a scratch Raw and publishes only when
-/// every statement succeeds; malformed/rejected batches must never partly apply.
+/// A legacy durable commit batch is [u32 little-endian length][SQL bytes],
+/// repeated (WAL kinds 1/2). Length framing preserves semicolons, newlines and
+/// comments inside literals. Replay applies a complete batch in one
+/// transaction and publishes only when every statement succeeds.
 pub const BatchIterator = struct {
     bytes: []const u8,
     position: usize = 0,
@@ -92,61 +88,155 @@ pub const BatchIterator = struct {
     }
 };
 
+/// Session settings this store implements. Times are milliseconds.
+pub const Settings = struct {
+    lock_timeout_ms: u32 = 0,
+    statement_timeout_ms: u32 = 0,
+    application_name: [64]u8 = @splat(0),
+    application_name_len: u8 = 0,
+
+    pub fn applicationName(self: *const Settings) []const u8 {
+        return self.application_name[0..self.application_name_len];
+    }
+};
+
+/// One-time deadlock check delay (PostgreSQL's default deadlock_timeout).
+pub const deadlock_timeout_ms: u32 = 1000;
+
+const Parameter = enum { lock_timeout, statement_timeout, deadlock_timeout, transaction_isolation, default_transaction_isolation, timezone, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes, search_path };
+
+fn parameter(name: []const u8) ?Parameter {
+    inline for (@typeInfo(Parameter).@"enum".field_names) |field| {
+        if (sameInsensitive(name, field)) return @field(Parameter, field);
+    }
+    return null;
+}
+
+/// PostgreSQL's canonical spelling, used as the SHOW column name.
+fn canonical(which: Parameter) []const u8 {
+    return switch (which) {
+        .timezone => "TimeZone",
+        .datestyle => "DateStyle",
+        .intervalstyle => "IntervalStyle",
+        else => @tagName(which),
+    };
+}
+
+fn parseMilliseconds(text: []const u8) !u32 {
+    var index: usize = 0;
+    while (index < text.len and whitespace(text[index])) index += 1;
+    var value: u64 = 0;
+    const start = index;
+    while (index < text.len and text[index] >= '0' and text[index] <= '9') : (index += 1) {
+        value = value * 10 + (text[index] - '0');
+        if (value > 0x7fffffff) return error.InvalidSettingValue;
+    }
+    if (index == start) return error.InvalidSettingValue;
+    while (index < text.len and whitespace(text[index])) index += 1;
+    const unit = text[index..];
+    const scale: u64 = if (unit.len == 0 or sameInsensitive(unit, "ms")) 1 else if (sameInsensitive(unit, "s")) 1000 else if (sameInsensitive(unit, "min")) 60000 else if (sameInsensitive(unit, "h")) 3600000 else if (sameInsensitive(unit, "d")) 86400000 else return error.InvalidSettingValue;
+    const total = value * scale;
+    if (total > 0x7fffffff) return error.InvalidSettingValue;
+    return @intCast(total);
+}
+
+/// PostgreSQL's display: the largest unit that divides the value evenly.
+fn formatMilliseconds(value: u32, out: []u8) []const u8 {
+    if (value == 0) {
+        out[0] = '0';
+        return out[0..1];
+    }
+    const units = [_]struct { scale: u32, name: []const u8 }{
+        .{ .scale = 86400000, .name = "d" },  .{ .scale = 3600000, .name = "h" }, .{ .scale = 60000, .name = "min" },
+        .{ .scale = 1000, .name = "s" },      .{ .scale = 1, .name = "ms" },
+    };
+    for (units) |unit| {
+        if (value % unit.scale != 0) continue;
+        var digits: [16]u8 = undefined;
+        var count: usize = 0;
+        var number = value / unit.scale;
+        while (true) {
+            digits[count] = @intCast('0' + number % 10);
+            count += 1;
+            number /= 10;
+            if (number == 0) break;
+        }
+        for (0..count) |position| out[position] = digits[count - 1 - position];
+        @memcpy(out[count..][0..unit.name.len], unit.name);
+        return out[0 .. count + unit.name.len];
+    }
+    unreachable;
+}
+
 pub fn Store(comptime Raw: type) type {
     return struct {
         const Self = @This();
         pub const CommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
 
         database: Raw = .{},
-        /// Caller owns the Store, so this result stays off the execute stack even
-        /// when its configured row capacity is large. Only the durable candidate
-        /// path uses it; ordinary SELECTs write directly to the caller's result.
-        autocommit_result: Raw.Result = .{},
-        generation: u64 = 0,
-        /// Dedicated scratch space for durable autocommit, never a live tx view.
-        autocommit_workspace: ?*Raw = null,
         commit_ctx: ?*anyopaque = null,
         commit_fn: ?CommitFn = null,
-        /// Autocommit change-record buffer (callers serialize; persistence
-        /// reuses its recovery buffer, so any record written is recoverable).
+        /// Change-record encode buffer shared by every commit (callers
+        /// serialize; persistence reuses its recovery buffer, so any record
+        /// written is recoverable).
         encode_buffer: []u8 = &.{},
         durability_required: bool = false,
         /// A failed durable write requires recovery before further writes.
         storage_failed: bool = false,
-
-        fn snapshot(destination: *Raw, source: *const Raw) void {
-            if (@hasDecl(Raw, "copyFrom")) destination.copyFrom(source) else destination.* = source.*;
-        }
+        /// Monotonic time in nanoseconds, set by the caller before each call
+        /// (wait starts, timeouts and deadlock checks use it).
+        now_ns: i64 = 0,
 
         fn storageReady(self: *const Self) !void {
             if (self.storage_failed or (self.durability_required and self.commit_fn == null)) return error.StorageUnavailable;
-            if (self.generation == 18446744073709551615) return error.GenerationExhausted;
         }
 
-        fn persist(self: *Self, batch: []const u8) !void {
-            try self.storageReady();
-            if (self.commit_fn) |commit| {
-                commit(self.commit_ctx, batch) catch |err| {
+        /// Read-only transactions publish directly; others persist first.
+        fn commit(self: *Self, slot: u16) !void {
+            const db = &self.database;
+            if (db.readOnly(slot)) {
+                db.publishCommit(slot);
+                return;
+            }
+            self.storageReady() catch |err| {
+                db.abort(slot);
+                return err;
+            };
+            if (self.commit_fn) |persist| {
+                if (self.encode_buffer.len == 0) {
+                    db.abort(slot);
+                    return error.InvalidCommitBatch;
+                }
+                const payload = db.prepareCommit(slot, self.encode_buffer) catch |err| {
+                    db.abort(slot);
+                    return err;
+                };
+                persist(self.commit_ctx, payload) catch |err| {
+                    db.abort(slot);
                     self.storage_failed = true;
                     return err;
                 };
             }
+            db.publishCommit(slot);
         }
 
-        fn persistRecord(context: ?*anyopaque, record: []const u8) anyerror!void {
-            const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidCommitBatch));
-            try self.persist(record);
-        }
-
-        const StatementCommit = struct {
-            store: *Self,
-            batch: []const u8,
-
-            fn commit(context: ?*anyopaque) anyerror!void {
-                const self: *const StatementCommit = @ptrCast(@alignCast(context orelse return error.InvalidCommitBatch));
-                try self.store.persist(self.batch);
-            }
+        pub const Pending = struct {
+            active: bool = false,
+            fingerprint: u64 = 0,
+            /// The parked statement runs in an implicit (autocommit) transaction.
+            implicit: bool = false,
+            wake_epoch: u64 = 0,
+            wait_start_ns: i64 = 0,
+            deadlock_check_ns: i64 = 0,
+            deadlock_checked: bool = false,
+            lock_deadline_ns: ?i64 = null,
+            statement_deadline_ns: ?i64 = null,
+            /// Transactions waited for; a different set is a new lock wait
+            /// with its own deadlock check and lock_timeout, as in PostgreSQL.
+            waits: Raw.LockSet = .{},
         };
+
+        const SavedSettings = struct { current: Settings, base: Settings };
 
         pub const Connection = struct {
             pub const Result = Raw.Result;
@@ -155,69 +245,99 @@ pub fn Store(comptime Raw: type) type {
             dialect: Dialect = .postgres,
             failed: bool = false,
             autocommit: bool = true,
-            /// Each connection needs distinct caller-owned transaction storage.
-            transaction_workspace: ?*Raw = null,
-            transaction_log: []u8 = &.{},
+            /// Transaction slot (explicit block or a parked implicit statement).
+            tx: ?u16 = null,
             in_transaction: bool = false,
-            dirty: bool = false,
-            base_generation: u64 = 0,
-            log_used: usize = 0,
-            logged: bool = false,
+            /// Effective settings, the session value SET (non-LOCAL) writes,
+            /// the values at transaction start and the startup values.
+            settings: Settings = .{},
+            base: Settings = .{},
+            tx_start: Settings = .{},
+            startup: Settings = .{},
+            saved: [Raw.savepoint_capacity]SavedSettings = undefined,
+            saved_len: usize = 0,
+            pending: Pending = .{},
+            cancel_requested: bool = false,
+            /// Savepoint depth of the last ROLLBACK TO, for the codec's portals.
+            rolled_back_to: ?usize = null,
+
+            /// Number of established savepoints (portal bookkeeping).
+            pub fn savepointLevel(self: *const Connection) usize {
+                return self.saved_len;
+            }
+
+            /// Depth of a ROLLBACK TO executed by the last statement, once.
+            pub fn takeRollbackTo(self: *Connection) ?usize {
+                const depth = self.rolled_back_to;
+                self.rolled_back_to = null;
+                return depth;
+            }
+
+            fn db(self: *Connection) *Raw {
+                const raw = &self.store.database;
+                raw.dialect = switch (self.dialect) {
+                    .postgres => .postgres,
+                    .mysql => .mysql,
+                    .tds => .tds,
+                };
+                return raw;
+            }
 
             pub fn beginTransaction(self: *Connection) !void {
                 if (self.id == 0) return error.InvalidConnection;
                 if (self.failed) return error.TransactionFailed;
                 if (self.in_transaction) return;
-                const workspace = self.transaction_workspace orelse return error.TransactionCapacity;
-                if (workspace == &self.store.database or workspace == self.store.autocommit_workspace) return error.InvalidWorkspace;
-                snapshot(workspace, &self.store.database);
-                self.base_generation = self.store.generation;
+                if (self.pending.active) return error.TransactionFailed;
+                self.tx = try self.db().begin();
                 self.in_transaction = true;
-                self.dirty = false;
                 self.failed = false;
-                self.log_used = 0;
-                self.logged = self.store.commit_fn != null or self.store.durability_required;
+                self.tx_start = self.settings;
+                self.base = self.settings;
+                self.saved_len = 0;
             }
 
-            fn resetTransaction(self: *Connection) void {
-                // Stale workspace/log bytes are unreachable after this reset and
-                // are overwritten when this connection begins another transaction.
+            fn endTransaction(self: *Connection, committed: bool) void {
+                self.settings = if (committed) self.base else self.tx_start;
+                self.base = self.settings;
+                self.tx = null;
                 self.in_transaction = false;
-                self.dirty = false;
                 self.failed = false;
-                self.log_used = 0;
-                self.logged = false;
+                self.saved_len = 0;
+                self.pending = .{};
+                self.cancel_requested = false;
             }
 
             pub fn commitTransaction(self: *Connection) !void {
                 if (self.id == 0) return error.InvalidConnection;
                 if (!self.in_transaction) return;
+                const slot = self.tx.?;
                 if (self.failed) {
-                    self.resetTransaction();
+                    self.db().abort(slot);
+                    self.endTransaction(false);
                     return;
                 }
-                if (self.dirty) {
-                    errdefer self.failed = true;
-                    try self.store.storageReady();
-                    const workspace = self.transaction_workspace orelse return error.InvalidWorkspace;
-                    if (workspace == &self.store.database or workspace == self.store.autocommit_workspace) return error.InvalidWorkspace;
-                    if (self.base_generation != self.store.generation) return error.SerializationFailure;
-                    if (self.store.commit_fn != null and (!self.logged or self.log_used == 0)) return error.InvalidCommitBatch;
-                    if (self.log_used > self.transaction_log.len) return error.InvalidCommitBatch;
-                    try self.store.persist(self.transaction_log[0..self.log_used]);
-                    snapshot(&self.store.database, workspace);
-                    self.store.generation += 1;
-                }
-                self.resetTransaction();
+                self.store.commit(slot) catch |err| {
+                    // The transaction is gone either way, as in PostgreSQL.
+                    self.endTransaction(false);
+                    return err;
+                };
+                self.endTransaction(true);
             }
 
             pub fn rollbackTransaction(self: *Connection) !void {
                 if (self.id == 0) return error.InvalidConnection;
-                self.resetTransaction();
+                if (self.tx) |slot| self.db().abort(slot);
+                const was = self.in_transaction;
+                self.endTransaction(false);
+                if (!was) self.settings = self.base;
             }
 
+            /// A codec-level error inside a block fails it like a statement error.
             pub fn failTransaction(self: *Connection) void {
-                if (self.id != 0 and self.in_transaction) self.failed = true;
+                if (self.id == 0 or !self.in_transaction or self.failed) return;
+                if (self.tx) |slot| self.db().failScope(slot);
+                self.failed = true;
+                self.pending = .{};
             }
 
             pub fn transactionStatus(self: *const Connection) u8 {
@@ -234,25 +354,378 @@ pub fn Store(comptime Raw: type) type {
                 self.autocommit = enabled;
             }
 
+            /// Aborts any parked statement and open transaction, releasing locks.
             pub fn disconnect(self: *Connection) void {
+                if (self.id == 0) return;
                 self.rollbackTransaction() catch {};
+                self.pending = .{};
             }
 
-            /// Hands this session's dialect to a Raw before it executes.
-            fn session(self: *const Connection, raw: *Raw) *Raw {
-                if (@hasField(Raw, "dialect")) raw.dialect = switch (self.dialect) {
-                    .postgres => .postgres,
-                    .mysql => .mysql,
-                    .tds => .tds,
+            pub fn blocked(self: *const Connection) bool {
+                return self.pending.active;
+            }
+
+            /// A cancel request for this connection (key already verified by
+            /// the caller). Only a parked statement can be interrupted.
+            pub fn requestCancel(self: *Connection) void {
+                if (self.pending.active) self.cancel_requested = true;
+            }
+
+            /// Earliest timer of a parked statement (deadlock check, lock or
+            /// statement timeout).
+            pub fn nextDeadline(self: *const Connection) ?i64 {
+                if (!self.pending.active) return null;
+                var out: ?i64 = null;
+                if (!self.pending.deadlock_checked) out = self.pending.deadlock_check_ns;
+                for ([_]?i64{ self.pending.lock_deadline_ns, self.pending.statement_deadline_ns }) |candidate| {
+                    if (candidate) |at| out = if (out) |current| @min(current, at) else at;
+                }
+                return out;
+            }
+
+            /// True when the parked statement should be re-delivered now.
+            pub fn wakeReady(self: *const Connection) bool {
+                if (!self.pending.active) return false;
+                if (self.cancel_requested) return true;
+                if (self.store.database.wake_epoch != self.pending.wake_epoch) return true;
+                if (self.nextDeadline()) |at| return self.store.now_ns >= at;
+                return false;
+            }
+
+            pub fn waitStart(self: *const Connection) i64 {
+                return self.pending.wait_start_ns;
+            }
+
+            /// Applies one startup parameter (`options` with `-c name=value`
+            /// / `--name=value` items, or application_name).
+            pub fn startupParameter(self: *Connection, key: []const u8, value: []const u8) !void {
+                if (same(key, "application_name")) {
+                    try self.assign(&self.settings, .application_name, value, true);
+                } else if (same(key, "options")) {
+                    var index: usize = 0;
+                    while (index < value.len) {
+                        while (index < value.len and whitespace(value[index])) index += 1;
+                        if (index == value.len) break;
+                        var start = index;
+                        while (index < value.len and !whitespace(value[index])) index += 1;
+                        var item = value[start..index];
+                        if (same(item, "-c")) {
+                            while (index < value.len and whitespace(value[index])) index += 1;
+                            start = index;
+                            while (index < value.len and !whitespace(value[index])) index += 1;
+                            item = value[start..index];
+                        } else if (item.len > 2 and item[0] == '-' and item[1] == 'c') {
+                            item = item[2..];
+                        } else if (item.len > 2 and item[0] == '-' and item[1] == '-') {
+                            item = item[2..];
+                        } else return error.InvalidSettingValue;
+                        var equals: usize = 0;
+                        while (equals < item.len and item[equals] != '=') equals += 1;
+                        if (equals == 0 or equals == item.len) return error.InvalidSettingValue;
+                        const which = parameter(item[0..equals]) orelse return error.UndefinedSetting;
+                        try self.assign(&self.settings, which, item[equals + 1 ..], true);
+                    }
+                } else return;
+                self.base = self.settings;
+                self.startup = self.settings;
+            }
+
+            fn assign(self: *Connection, target: *Settings, which: Parameter, value: []const u8, is_default: bool) !void {
+                _ = self;
+                switch (which) {
+                    .lock_timeout => target.lock_timeout_ms = if (is_default and value.len == 0) 0 else try parseMilliseconds(value),
+                    .statement_timeout => target.statement_timeout_ms = if (is_default and value.len == 0) 0 else try parseMilliseconds(value),
+                    .application_name => {
+                        const length = @min(value.len, 63);
+                        @memcpy(target.application_name[0..length], value[0..length]);
+                        target.application_name_len = @intCast(length);
+                    },
+                    .transaction_isolation, .default_transaction_isolation => {
+                        if (!(value.len == 0 or sameInsensitive(value, "read committed") or sameInsensitive(value, "read uncommitted"))) return error.UnsupportedStatement;
+                    },
+                    .timezone => if (!(value.len == 0 or sameInsensitive(value, "UTC") or sameInsensitive(value, "Etc/UTC"))) return error.InvalidSettingValue,
+                    .client_encoding => if (!(value.len == 0 or sameInsensitive(value, "UTF8") or sameInsensitive(value, "UTF-8"))) return error.InvalidSettingValue,
+                    .standard_conforming_strings => if (!(value.len == 0 or sameInsensitive(value, "on") or sameInsensitive(value, "true"))) return error.InvalidSettingValue,
+                    .datestyle => if (!(value.len == 0 or sameInsensitive(value, "ISO, MDY") or sameInsensitive(value, "ISO"))) return error.InvalidSettingValue,
+                    .intervalstyle => if (!(value.len == 0 or sameInsensitive(value, "postgres"))) return error.InvalidSettingValue,
+                    .deadlock_timeout, .server_version, .server_encoding, .integer_datetimes, .search_path => return error.InvalidSettingValue,
+                }
+            }
+
+            fn showValue(self: *const Connection, which: Parameter, out: []u8) []const u8 {
+                const value: []const u8 = switch (which) {
+                    .lock_timeout => return formatMilliseconds(self.settings.lock_timeout_ms, out),
+                    .statement_timeout => return formatMilliseconds(self.settings.statement_timeout_ms, out),
+                    .deadlock_timeout => return formatMilliseconds(deadlock_timeout_ms, out),
+                    .application_name => self.settings.applicationName(),
+                    .transaction_isolation, .default_transaction_isolation => "read committed",
+                    .timezone => "UTC",
+                    .client_encoding, .server_encoding => "UTF8",
+                    .standard_conforming_strings, .integer_datetimes => "on",
+                    .datestyle => "ISO, MDY",
+                    .intervalstyle => "postgres",
+                    .server_version => "16.0",
+                    .search_path => "\"$user\", public",
                 };
-                return raw;
+                @memcpy(out[0..value.len], value);
+                return out[0..value.len];
+            }
+
+            fn showResult(self: *const Connection, which: Parameter, result: *Result, rows: bool) void {
+                result.clear(0);
+                result.command = .show;
+                result.column_count = 1;
+                const name = canonical(which);
+                const name_length = @min(name.len, result.column_names[0].bytes.len);
+                result.column_names[0] = .{ .len = name_length };
+                @memcpy(result.column_names[0].bytes[0..name_length], name[0..name_length]);
+                result.column_types[0] = .text;
+                if (!rows) return;
+                var buffer: [128]u8 = undefined;
+                const value = self.showValue(which, &buffer);
+                var text: Raw.Text = .{};
+                const length = @min(value.len, text.bytes.len);
+                text.len = length;
+                @memcpy(text.bytes[0..length], value[0..length]);
+                result.row_count = 1;
+                result.rows[0].cells[0] = .{ .text = text };
+            }
+
+            /// Parse and bind without executing (PostgreSQL Describe).
+            pub fn describe(self: *Connection, source: []const u8, result: *Result) !void {
+                if (self.id == 0) return error.InvalidConnection;
+                const raw = self.db();
+                const command = try raw.control(source);
+                switch (command) {
+                    .commit, .rollback, .rollback_to => {},
+                    else => if (self.failed) return error.TransactionFailed,
+                }
+                switch (command) {
+                    .none => return raw.describeIn(self.tx, source, result),
+                    .show => |name| {
+                        const which = parameter(name.slice()) orelse return error.UndefinedSetting;
+                        self.showResult(which, result, false);
+                    },
+                    else => result.clear(0),
+                }
+            }
+
+            fn control(self: *Connection, command: anytype, result: *Result) !void {
+                switch (command) {
+                    .none => unreachable,
+                    .begin => |level| {
+                        if (level == .repeatable_read or level == .serializable) return error.UnsupportedStatement;
+                        try self.beginTransaction();
+                        result.clear(0);
+                        result.command = .begin;
+                    },
+                    .commit => {
+                        try self.commitTransaction();
+                        result.clear(0);
+                        result.command = .commit;
+                    },
+                    .rollback => {
+                        try self.rollbackTransaction();
+                        result.clear(0);
+                        result.command = .rollback;
+                    },
+                    .savepoint => |name| {
+                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (self.failed) return error.TransactionFailed;
+                        try self.db().savepoint(self.tx.?, name.slice());
+                        self.saved[self.saved_len] = .{ .current = self.settings, .base = self.base };
+                        self.saved_len += 1;
+                        result.clear(0);
+                        result.command = .savepoint;
+                    },
+                    .release => |name| {
+                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (self.failed) return error.TransactionFailed;
+                        self.saved_len = try self.db().release(self.tx.?, name.slice());
+                        result.clear(0);
+                        result.command = .release;
+                    },
+                    .rollback_to => |name| {
+                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        const depth = try self.db().rollbackTo(self.tx.?, name.slice());
+                        self.rolled_back_to = depth;
+                        self.settings = self.saved[depth].current;
+                        self.base = self.saved[depth].base;
+                        self.saved_len = depth + 1;
+                        self.failed = false;
+                        result.clear(0);
+                        result.command = .rollback;
+                    },
+                    .set => |set| {
+                        if (self.failed) return error.TransactionFailed;
+                        const which = parameter(set.name.slice()) orelse return error.UndefinedSetting;
+                        const value = if (set.kind == .default) "" else set.value.slice();
+                        var next = self.settings;
+                        if (set.kind == .default) {
+                            try self.assign(&next, which, "", true);
+                            restore(&next, &self.startup, which);
+                        } else try self.assign(&next, which, value, false);
+                        if (set.local) {
+                            // Outside a block SET LOCAL has no effect (PostgreSQL warns).
+                            if (self.in_transaction) self.settings = next;
+                        } else {
+                            self.settings = next;
+                            restore(&self.base, &next, which);
+                        }
+                        result.clear(0);
+                        result.command = .set;
+                    },
+                    .set_transaction => |level| {
+                        if (self.failed) return error.TransactionFailed;
+                        if (level == .repeatable_read or level == .serializable) return error.UnsupportedStatement;
+                        result.clear(0);
+                        result.command = .set;
+                    },
+                    .show => |name| {
+                        if (self.failed) return error.TransactionFailed;
+                        const which = parameter(name.slice()) orelse return error.UndefinedSetting;
+                        self.showResult(which, result, true);
+                    },
+                    .reset => |name| {
+                        if (self.failed) return error.TransactionFailed;
+                        if (name) |text| {
+                            const which = parameter(text.slice()) orelse return error.UndefinedSetting;
+                            restore(&self.settings, &self.startup, which);
+                            restore(&self.base, &self.startup, which);
+                        } else {
+                            self.settings = self.startup;
+                            self.base = self.startup;
+                        }
+                        result.clear(0);
+                        result.command = .reset;
+                    },
+                }
+            }
+
+            fn restore(target: *Settings, source: *const Settings, which: Parameter) void {
+                switch (which) {
+                    .lock_timeout => target.lock_timeout_ms = source.lock_timeout_ms,
+                    .statement_timeout => target.statement_timeout_ms = source.statement_timeout_ms,
+                    .application_name => {
+                        target.application_name = source.application_name;
+                        target.application_name_len = source.application_name_len;
+                    },
+                    else => {},
+                }
+            }
+
+            /// Terminal statement error policy (§4.4).
+            fn terminal(self: *Connection, implicit: bool) void {
+                self.pending = .{};
+                self.cancel_requested = false;
+                const slot = self.tx orelse return;
+                if (implicit) {
+                    self.db().abort(slot);
+                    self.tx = null;
+                } else {
+                    self.db().failScope(slot);
+                    self.failed = true;
+                }
+            }
+
+            fn park(self: *Connection, source: []const u8, implicit: bool) void {
+                const now = self.store.now_ns;
+                self.pending = .{
+                    .active = true,
+                    .fingerprint = fingerprint(source),
+                    .implicit = implicit,
+                    .wake_epoch = self.store.database.wake_epoch,
+                    .wait_start_ns = now,
+                    .deadlock_check_ns = now + @as(i64, deadlock_timeout_ms) * 1000000,
+                    .lock_deadline_ns = if (self.settings.lock_timeout_ms != 0) now + @as(i64, self.settings.lock_timeout_ms) * 1000000 else null,
+                    .statement_deadline_ns = if (self.settings.statement_timeout_ms != 0) now + @as(i64, self.settings.statement_timeout_ms) * 1000000 else null,
+                    .waits = self.store.database.waitingFor(self.tx.?),
+                };
+                self.cancel_requested = false;
+            }
+
+            /// A re-parked statement waiting for different transactions starts
+            /// a new lock wait: fresh deadlock check and lock_timeout.
+            fn rewait(self: *Connection, slot: u16) void {
+                const waits = self.store.database.waitingFor(slot);
+                var changed = false;
+                for (waits.bits, self.pending.waits.bits) |a, b| changed = changed or a != b;
+                if (!changed) return;
+                const now = self.store.now_ns;
+                self.pending.waits = waits;
+                self.pending.wait_start_ns = now;
+                self.pending.deadlock_check_ns = now + @as(i64, deadlock_timeout_ms) * 1000000;
+                self.pending.deadlock_checked = false;
+                if (self.settings.lock_timeout_ms != 0) self.pending.lock_deadline_ns = now + @as(i64, self.settings.lock_timeout_ms) * 1000000;
+            }
+
+            fn finish(self: *Connection, slot: u16, implicit: bool, result: *Result) !void {
+                self.pending = .{};
+                self.cancel_requested = false;
+                if (!implicit) return;
+                self.tx = null;
+                try self.store.commit(slot);
+                self.store.database.lastOutcomeInto(result);
+            }
+
+            fn run(self: *Connection, source: []const u8, result: *Result, slot: u16, implicit: bool, resuming: bool) !void {
+                const writes = if (self.store.storageReady()) |_| true else |_| false;
+                self.db().statement(slot, source, result, .{ .@"resume" = resuming, .writes = writes, .hold_result = implicit }) catch |err| {
+                    if (err == error.WouldBlock) {
+                        if (!resuming) {
+                            self.park(source, implicit);
+                            return err;
+                        }
+                        return self.stillBlocked(slot, implicit);
+                    }
+                    self.terminal(implicit);
+                    return if (err == error.ReadOnlyTransaction) error.StorageUnavailable else err;
+                };
+                return self.finish(slot, implicit, result);
+            }
+
+            /// A re-delivered statement is still waiting: apply its timers.
+            fn stillBlocked(self: *Connection, slot: u16, implicit: bool) !void {
+                self.rewait(slot);
+                const now = self.store.now_ns;
+                var outcome: ?anyerror = null;
+                if (self.pending.statement_deadline_ns) |at| {
+                    if (now >= at) outcome = error.QueryCanceled;
+                }
+                if (outcome == null) if (self.pending.lock_deadline_ns) |at| {
+                    if (now >= at) outcome = error.LockNotAvailable;
+                };
+                if (outcome == null and !self.pending.deadlock_checked and now >= self.pending.deadlock_check_ns) {
+                    self.pending.deadlock_checked = true;
+                    if (self.store.database.deadlocked(slot)) outcome = error.DeadlockDetected;
+                }
+                if (outcome) |err| {
+                    self.db().abortStatement(slot);
+                    self.terminal(implicit);
+                    return err;
+                }
+                self.pending.wake_epoch = self.store.database.wake_epoch;
+                return error.WouldBlock;
+            }
+
+            fn resumeStatement(self: *Connection, source: []const u8, result: *Result) !void {
+                const slot = self.tx.?;
+                const implicit = self.pending.implicit;
+                if (fingerprint(source) != self.pending.fingerprint or self.cancel_requested) {
+                    // A different statement while one is parked is an
+                    // internal invariant failure; either way it is canceled.
+                    self.db().abortStatement(slot);
+                    self.terminal(implicit);
+                    return error.QueryCanceled;
+                }
+                return self.run(source, result, slot, implicit, true);
             }
 
             pub fn execute(self: *Connection, source: []const u8, result: *Result) !void {
                 if (self.id == 0) return error.InvalidConnection;
-                errdefer self.failTransaction();
                 if (source.len == 0 or source.len > max_statement_bytes) return error.Syntax;
-                // Normalize only bounded control commands. Long SQL still goes
+                if (self.pending.active) return self.resumeStatement(source, result);
+                // Bounded MySQL/TDS session commands. Long SQL still goes
                 // intact to the strict parser without a second SQL-sized copy.
                 var command: [256]u8 = undefined;
                 var count: usize = 0;
@@ -281,115 +754,38 @@ pub fn Store(comptime Raw: type) type {
                 }
                 if (count != 0 and command[count - 1] == ';') count -= 1;
                 const cmd = if (long_command) "" else command[0..count];
-                if (same(cmd, "BEGIN") or same(cmd, "BEGIN TRANSACTION") or same(cmd, "START TRANSACTION")) {
-                    try self.beginTransaction();
+                if (same(cmd, "SET AUTOCOMMIT = 0") or same(cmd, "SET AUTOCOMMIT=0") or same(cmd, "SET AUTOCOMMIT = 1") or same(cmd, "SET AUTOCOMMIT=1")) {
+                    if (self.failed) return error.TransactionFailed;
+                    try self.setAutocommit(cmd[cmd.len - 1] == '1');
                     result.clear(0);
                     return;
                 }
-                if (same(cmd, "COMMIT") or same(cmd, "COMMIT TRANSACTION")) {
-                    try self.commitTransaction();
+                if (same(cmd, "SET NAMES UTF8MB4") or same(cmd, "SET NAMES UTF8") or same(cmd, "SET TEXTSIZE 2147483647")) {
+                    if (self.failed) return error.TransactionFailed;
                     result.clear(0);
                     return;
                 }
-                if (same(cmd, "ROLLBACK") or same(cmd, "ROLLBACK TRANSACTION")) {
-                    try self.rollbackTransaction();
-                    result.clear(0);
+                const command_kind = self.db().control(source) catch |err| {
+                    self.failTransaction();
+                    return err;
+                };
+                if (command_kind != .none) {
+                    const was_block = self.in_transaction;
+                    self.control(command_kind, result) catch |err| {
+                        if (was_block and self.in_transaction) self.failTransaction();
+                        return err;
+                    };
                     return;
                 }
                 if (self.failed) return error.TransactionFailed;
-                if (same(cmd, "SET AUTOCOMMIT = 0") or same(cmd, "SET AUTOCOMMIT=0")) {
-                    try self.setAutocommit(false);
-                    result.clear(0);
-                    return;
-                }
-                if (same(cmd, "SET AUTOCOMMIT = 1") or same(cmd, "SET AUTOCOMMIT=1")) {
-                    try self.setAutocommit(true);
-                    result.clear(0);
-                    return;
-                }
-                if (same(cmd, "SET NAMES UTF8MB4") or same(cmd, "SET NAMES UTF8") or
-                    same(cmd, "SET CLIENT_ENCODING = 'UTF8'") or same(cmd, "SET CLIENT_ENCODING TO 'UTF8'") or
-                    same(cmd, "SET STANDARD_CONFORMING_STRINGS = ON") or same(cmd, "SET TIME ZONE 'UTC'") or
-                    same(cmd, "SET TEXTSIZE 2147483647"))
-                {
-                    result.clear(0);
-                    return;
-                }
                 if (!self.autocommit and !self.in_transaction) try self.beginTransaction();
-                // Raw adapters without the typed pipeline (no describe) get the
-                // historical liveness probe; the SQL engine evaluates it itself.
-                if (!@hasDecl(Raw, "describe") and same(cmd, "SELECT 1")) {
-                    result.clear(0);
-                    result.column_count = 1;
-                    result.row_count = 1;
-                    const name_length = @min(result.column_names[0].bytes.len, 8);
-                    result.column_names[0] = .{ .len = name_length };
-                    @memcpy(result.column_names[0].bytes[0..name_length], "?column?"[0..name_length]);
-                    result.column_types[0] = if (@hasDecl(Raw, "integer_type")) Raw.integer_type else .integer;
-                    result.rows[0].cells[0] = .{ .integer = 1 };
-                    return;
-                }
-
-                const reading = readonly(source);
-                if (self.in_transaction) {
-                    const workspace = self.transaction_workspace orelse return error.InvalidWorkspace;
-                    if (!reading and self.logged and @hasDecl(Raw, "executeChanges")) {
-                        try self.store.storageReady();
-                        if (self.log_used > self.transaction_log.len) return error.TransactionLogCapacity;
-                        try self.session(workspace).executeChanges(source, result, self.transaction_log, &self.log_used, null, null);
-                        self.dirty = true;
-                        return;
-                    }
-                    if (!reading) {
-                        try self.store.storageReady();
-                        if (self.logged and (self.log_used > self.transaction_log.len or
-                            source.len + 4 > self.transaction_log.len - self.log_used)) return error.TransactionLogCapacity;
-                    }
-                    try self.session(workspace).execute(source, result);
-                    if (!reading) {
-                        if (self.logged) {
-                            writeLength(self.transaction_log[self.log_used..][0..4], source.len);
-                            @memcpy(self.transaction_log[self.log_used + 4 ..][0..source.len], source);
-                            self.log_used += source.len + 4;
-                        }
-                        self.dirty = true;
-                    }
-                    return;
-                }
-                if (reading) return self.session(&self.store.database).execute(source, result);
-                try self.store.storageReady();
-                if (self.store.commit_fn == null) {
-                    try self.session(&self.store.database).execute(source, result);
-                    self.store.generation += 1;
-                    return;
-                }
-                if (self.store.autocommit_workspace) |workspace| {
-                    if (workspace == &self.store.database or workspace == self.transaction_workspace) return error.InvalidWorkspace;
-                }
-                if (result == &self.store.autocommit_result) return error.InvalidWorkspace;
-                if (@hasDecl(Raw, "executeChanges")) {
-                    const buffer = if (self.store.encode_buffer.len != 0) self.store.encode_buffer else self.transaction_log;
-                    var used: usize = 0;
-                    try self.session(&self.store.database).executeChanges(source, result, buffer, &used, self.store, persistRecord);
-                    self.store.generation += 1;
-                    return;
-                }
-                var batch: [max_statement_bytes + 4]u8 = undefined;
-                writeLength(batch[0..4], source.len);
-                @memcpy(batch[4..][0..source.len], source);
-                if (@hasDecl(Raw, "executeWithCommit")) {
-                    var commit = StatementCommit{ .store = self.store, .batch = batch[0 .. source.len + 4] };
-                    try self.session(&self.store.database).executeWithCommit(source, result, &commit, StatementCommit.commit);
-                    self.store.generation += 1;
-                    return;
-                }
-                const workspace = self.store.autocommit_workspace orelse return error.TransactionCapacity;
-                snapshot(workspace, &self.store.database);
-                try self.session(workspace).execute(source, &self.store.autocommit_result);
-                try self.store.persist(batch[0 .. source.len + 4]);
-                snapshot(&self.store.database, workspace);
-                self.store.generation += 1;
-                if (@hasDecl(Result, "copyFrom")) result.copyFrom(&self.store.autocommit_result) else result.* = self.store.autocommit_result;
+                const implicit = !self.in_transaction;
+                const slot = if (self.tx) |slot| slot else blk: {
+                    const slot = try self.db().begin();
+                    self.tx = slot;
+                    break :blk slot;
+                };
+                return self.run(source, result, slot, implicit, false);
             }
         };
     };

@@ -51,25 +51,24 @@ SCRAM channel binding are not implemented.
 
 ## Transactions and durability
 
-`Store(Raw)` owns committed state and a generation. Each connection needs a
-unique nonzero id and a distinct caller-owned `transaction_workspace`. BEGIN
-copies committed state into this workspace. Changes remain private; writing
-commits fail with SerializationFailure if another commit changed the generation.
-Read-only commits do not conflict. Disconnect discards private state. This
-conservative optimistic isolation differs from PostgreSQL READ COMMITTED.
+`Store(Raw)` owns one shared `sql.Database`; connections (unique nonzero id)
+hold no database copy. Isolation is READ COMMITTED: every statement takes a new
+snapshot, same-row writers wait (`error.WouldBlock`, `Reply.blocked` in the
+codecs) and resume with EvalPlanQual when the caller re-delivers the same
+statement after `wakeReady()`. Parked statements end with lock_timeout (55P03),
+statement_timeout or cancel (57014), or as deadlock victims (40P01, checked once
+per wait after 1 s). Callers set `store.now_ns` (monotonic) before each call.
+Errors in a block discard the work since the innermost savepoint and fail the
+block; disconnect aborts everything and releases locks.
 
-Durable callers supply `commit_ctx`, `commit_fn`, and
-set `durability_required`. Each connection also supplies a bounded
-`transaction_log`. Commit batches use repeated little-endian u32 length + SQL
-bytes; `BatchIterator` validates them without splitting literals or comments.
-The synchronous hook must persist a complete batch before returning. The store
-publishes only after hook success. Hook failure poisons subsequent writes.
-Read-only statements do not copy the database. For Raw adapters providing
-`executeWithCommit`, durable autocommit uses its validated mutation boundary:
-flush the framed statement, then apply it without copying any database state.
-It needs no `autocommit_workspace`. Older Raw adapters still require a distinct
-caller-owned `autocommit_workspace` and use candidate preparation/publication.
-Explicit transactions retain private snapshots and generation conflict checks.
+Durable callers supply `commit_ctx`, `commit_fn`, an `encode_buffer` and set
+`durability_required`. COMMIT and autocommit share one path: a transaction
+with an empty write set publishes without the hook; otherwise the store
+encodes the kind-3 change record into `encode_buffer`, the synchronous hook
+must persist it before returning, and only then does the store publish. Hook
+failure aborts the transaction and poisons subsequent writes. Legacy SQL-text
+batches (`BatchIterator`, repeated little-endian u32 length + SQL bytes) are
+only read during recovery.
 
 `durable_log.append` writes a versioned checksummed header, payload and commit
 trailer, then syncs. `recover` checks complete records, contiguous sequences and

@@ -9,7 +9,12 @@ pub const sql_capacity: usize = 4096;
 pub const statement_capacity: usize = 8;
 pub const portal_capacity: usize = 8;
 pub const parameter_capacity: usize = 32;
-pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false };
+/// A CancelRequest's key; the caller looks it up (the codec never does).
+pub const Cancel = struct { pid: u32, secret: u32 };
+/// `blocked`: the message's statement is parked on a lock (consumed =
+/// written = 0); re-deliver the same bytes when the store reports progress.
+/// `cancel`: the connection carried a CancelRequest (close it afterwards).
+pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false, blocked: bool = false, cancel: ?Cancel = null };
 
 fn equal(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
@@ -174,6 +179,8 @@ pub fn Session(comptime DB: type) type {
             affected: usize = 0,
             rolled_back: bool = false,
             command: []const u8 = "",
+            /// Savepoint depth when bound: ROLLBACK TO closes newer portals.
+            level: usize = 0,
             fn source(self: *const Portal) []const u8 {
                 return self.sql[0..self.len];
             }
@@ -189,6 +196,8 @@ pub fn Session(comptime DB: type) type {
         result: DB.Result = .{},
         active_portal: ?usize = null,
         commit_rolled_back: bool = false,
+        backend_pid: u32 = 1,
+        backend_secret: u32 = 0,
 
         /// Copy a verifier and a fresh CSPRNG nonce before any startup bytes.
         /// Every accepted connection needs its own unpredictable nonce; the
@@ -216,13 +225,13 @@ pub fn Session(comptime DB: type) type {
             }
             const total: usize = @as(usize, size) + prefix;
             if (input.len < total) return .{};
-            // Cancellation has no response in PostgreSQL. This synchronous
-            // adapter has no interruptible operation and safely ignores it.
+            // Cancellation has no response in PostgreSQL: the key goes to the
+            // caller, which owns the backend-key registry.
             if (!self.startup and total >= 8 and read32(input[4..8]) == 80877102 and total == 16)
-                return .{ .consumed = total, .close = true };
+                return .{ .consumed = total, .close = true, .cancel = .{ .pid = read32(input[8..12]), .secret = read32(input[12..16]) } };
             var close = false;
             if (!self.startup) {
-                self.handshake(input[4..total], &w) catch |err| {
+                self.handshake(db, input[4..total], &w) catch |err| {
                     w.at = 0;
                     try failure(&w, sqlstate(err), @errorName(err));
                     close = true;
@@ -238,6 +247,9 @@ pub fn Session(comptime DB: type) type {
                 const tag = input[0];
                 if (self.failed and tag != 'S' and tag != 'X') return .{ .consumed = total };
                 close = self.dispatch(db, tag, input[5..total], &w) catch |err| blk: {
+                    const any: anyerror = err;
+                    // Parked statement: nothing consumed or written.
+                    if (any == error.WouldBlock) return .{ .blocked = true };
                     w.at = 0;
                     try failure(&w, sqlstate(err), @errorName(err));
                     if (@hasDecl(DB, "failTransaction")) db.failTransaction();
@@ -247,7 +259,13 @@ pub fn Session(comptime DB: type) type {
             }
             return .{ .consumed = total, .written = w.at, .close = close };
         }
-        fn handshake(self: *Self, payload: []const u8, w: *Writer) !void {
+        /// RAMSQL-supplied BackendKeyData (pid, secret) sent after authentication.
+        pub fn configureBackendKey(self: *Self, pid: u32, secret: u32) void {
+            self.backend_pid = pid;
+            self.backend_secret = secret;
+        }
+
+        fn handshake(self: *Self, db: *DB, payload: []const u8, w: *Writer) !void {
             var r: Reader = .{ .bytes = payload };
             const version = try r.u32be();
             if (version == 80877103 or version == 80877104) {
@@ -266,6 +284,7 @@ pub fn Session(comptime DB: type) type {
                     user = value;
                 }
                 if (equal(key, "client_encoding") and !equal(value, "UTF8") and !equal(value, "UTF-8")) return error.UnsupportedEncoding;
+                if (@hasDecl(DB, "startupParameter")) try db.startupParameter(key, value);
             }
             try r.done();
             if (user == null or user.?.len == 0) return error.UserRequired;
@@ -318,8 +337,8 @@ pub fn Session(comptime DB: type) type {
             try parameter(w, "integer_datetimes", "on");
             try parameter(w, "standard_conforming_strings", "on");
             const key = try w.begin('K');
-            try w.u32be(1);
-            try w.u32be(0);
+            try w.u32be(self.backend_pid);
+            try w.u32be(self.backend_secret);
             w.end(key);
             const ready_at = try w.begin('Z');
             try w.byte('I');
@@ -357,7 +376,7 @@ pub fn Session(comptime DB: type) type {
                     try self.ready(db, w);
                 },
                 'P' => try self.parse(db, &r, w),
-                'B' => try self.bind(&r, w),
+                'B' => try self.bind(db, &r, w),
                 'D' => {
                     const kind = try r.byte();
                     const name = try r.string();
@@ -373,13 +392,20 @@ pub fn Session(comptime DB: type) type {
                         var q: Writer = .{ .bytes = &query };
                         var nulls: [parameter_capacity][]const u8 = @splat("NULL");
                         try interpolate(s.source(), nulls[0..s.count], &q);
-                        if (word(q.bytes[0..q.at], "select")) {
+                        if (@hasDecl(DB, "describe")) {
+                            // Parse and bind only: never executes or locks.
+                            try self.describeOnly(db, q.bytes[0..q.at]);
+                            if (self.result.column_count != 0) try self.description(w, null) else try w.empty('n');
+                        } else if (word(q.bytes[0..q.at], "select")) {
                             try self.execute(db, q.bytes[0..q.at]);
                             try self.description(w, null);
                         } else try w.empty('n');
                     } else if (kind == 'P') {
                         const p = try self.portal(name);
-                        if (word(p.source(), "select")) {
+                        if (@hasDecl(DB, "describe")) {
+                            try self.describeOnly(db, p.source());
+                            if (self.result.column_count != 0) try self.description(w, p) else try w.empty('n');
+                        } else if (word(p.source(), "select")) {
                             try self.execute(db, p.source());
                             try self.description(w, p);
                         } else try w.empty('n');
@@ -473,8 +499,28 @@ pub fn Session(comptime DB: type) type {
             } else if (word(source, "deallocate")) {
                 if (@hasDecl(DB, "transactionStatus") and db.transactionStatus() == 'E') return error.TransactionFailed;
                 try self.deallocate(source);
-            } else try db.execute(source, &self.result);
+            } else {
+                try db.execute(source, &self.result);
+                // ROLLBACK TO closes portals created after the savepoint.
+                if (@hasDecl(DB, "takeRollbackTo")) if (db.takeRollbackTo()) |depth| {
+                    for (&self.portals, 0..) |*p, index| {
+                        if (!p.live or p.level <= depth) continue;
+                        if (self.active_portal) |active| if (active == index) continue;
+                        p.live = false;
+                    }
+                };
+            }
         }
+        fn describeOnly(self: *Self, db: *DB, source: []const u8) !void {
+            self.result.column_count = 0;
+            self.result.row_count = 0;
+            const command_source = trim(source);
+            if (word(command_source, "begin") or word(command_source, "commit") or word(command_source, "rollback") or
+                word(command_source, "end") or word(command_source, "abort") or word(command_source, "deallocate") or
+                word(command_source, "start")) return;
+            try db.describe(source, &self.result);
+        }
+
         fn deallocate(self: *Self, source: []const u8) !void {
             var tokens: Tokens = .{ .source = source };
             if (!keyword(tokens.next(), "deallocate")) return error.Syntax;
@@ -574,7 +620,7 @@ pub fn Session(comptime DB: type) type {
             try q.append("SELECT * FROM ");
             try q.append(table);
             try q.append(" LIMIT 0");
-            try db.execute(q.bytes[0..q.at], &self.result);
+            if (@hasDecl(DB, "describe")) try db.describe(q.bytes[0..q.at], &self.result) else try db.execute(q.bytes[0..q.at], &self.result);
             if (self.result.column_count > 256) return error.ColumnCapacity;
             if (keyword(first, "insert")) {
                 var mapping: [256]usize = undefined;
@@ -627,7 +673,7 @@ pub fn Session(comptime DB: type) type {
             for (0..self.result.column_count) |i| if (keyword(name, self.result.column_names[i].slice())) return i;
             return null;
         }
-        fn bind(self: *Self, r: *Reader, w: *Writer) !void {
+        fn bind(self: *Self, db: *DB, r: *Reader, w: *Writer) !void {
             const name = try r.string();
             const statement_name = try r.string();
             const s = try self.statement(statement_name);
@@ -665,6 +711,7 @@ pub fn Session(comptime DB: type) type {
             var q: Writer = .{ .bytes = &next.sql };
             try interpolate(s.source(), values[0..count], &q);
             next.len = q.at;
+            if (@hasDecl(DB, "savepointLevel")) next.level = db.savepointLevel();
             var slot: ?*Portal = null;
             for (&self.portals) |*p| {
                 if (p.live and equal(p.name.slice(), name)) {
@@ -756,6 +803,14 @@ pub fn Session(comptime DB: type) type {
                 .delete => "delete",
                 .create_table => "create",
                 .drop_table => "drop",
+                .begin => "begin",
+                .commit => "commit",
+                .rollback => "rollback",
+                .savepoint => "savepoint",
+                .release => "release",
+                .set => "set",
+                .show => "show",
+                .reset => "reset",
                 else => "",
             };
         }
@@ -776,7 +831,7 @@ pub fn Session(comptime DB: type) type {
             } else if (isCommand(completed_command, source, "delete")) {
                 try w.append("DELETE ");
                 try w.number(@intCast(affected));
-            } else if (isCommand(completed_command, source, "create")) try w.append("CREATE TABLE") else if (isCommand(completed_command, source, "drop")) try w.append("DROP TABLE") else if (word(source, "begin") or word(source, "start")) try w.append("BEGIN") else if (word(source, "commit") or word(source, "end")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (word(source, "rollback") or word(source, "abort")) try w.append("ROLLBACK") else if (word(source, "set")) try w.append("SET") else if (word(source, "deallocate")) try w.append("DEALLOCATE") else try w.append("OK");
+            } else if (isCommand(completed_command, source, "create")) try w.append("CREATE TABLE") else if (isCommand(completed_command, source, "drop")) try w.append("DROP TABLE") else if (equal(completed_command, "savepoint")) try w.append("SAVEPOINT") else if (equal(completed_command, "release")) try w.append("RELEASE") else if (equal(completed_command, "show")) try w.append("SHOW") else if (equal(completed_command, "reset")) try w.append("RESET") else if (equal(completed_command, "set")) try w.append("SET") else if (equal(completed_command, "begin")) try w.append("BEGIN") else if (equal(completed_command, "commit")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (equal(completed_command, "rollback")) try w.append("ROLLBACK") else if (word(source, "begin") or word(source, "start")) try w.append("BEGIN") else if (word(source, "commit") or word(source, "end")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (word(source, "rollback") or word(source, "abort")) try w.append("ROLLBACK") else if (word(source, "set")) try w.append("SET") else if (word(source, "deallocate")) try w.append("DEALLOCATE") else try w.append("OK");
             try w.byte(0);
             w.end(p);
         }
@@ -852,6 +907,16 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "TransactionFailed")) return "25P02";
     if (equal(name, "DatabaseBusy")) return "55P03";
     if (equal(name, "SerializationFailure")) return "40001";
+    if (equal(name, "DeadlockDetected")) return "40P01";
+    // WouldBlock never reaches a client (it becomes Reply.blocked).
+    if (equal(name, "LockNotAvailable") or equal(name, "WouldBlock")) return "55P03";
+    if (equal(name, "QueryCanceled")) return "57014";
+    if (equal(name, "WriteSetCapacity") or equal(name, "LockCapacity") or equal(name, "CatalogCapacity") or equal(name, "SavepointCapacity")) return "53200";
+    if (equal(name, "SavepointNotFound")) return "3B001";
+    if (equal(name, "NoActiveTransaction")) return "25P01";
+    if (equal(name, "ReadOnlyTransaction")) return "25006";
+    if (equal(name, "UndefinedSetting")) return "42704";
+    if (equal(name, "InvalidSettingValue")) return "22023";
     if (equal(name, "TransactionCapacity") or equal(name, "TransactionLogCapacity")) return "53200";
     if (equal(name, "StorageUnavailable") or equal(name, "StorageFailure") or equal(name, "FileWriteFailed") or equal(name, "FileSyncFailed") or equal(name, "FileTruncateFailed") or equal(name, "WriterPoisoned")) return "58030";
     if (equal(name, "Syntax")) return "42601";

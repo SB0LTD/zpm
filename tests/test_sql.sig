@@ -28,6 +28,8 @@ fn same(actual: []const u8, expected: []const u8) !void {
 fn execute(db: *DB, result: *DB.Result, source: []const u8) !void {
     try db.execute(source, result);
     statements += 1;
+    // An autocommit statement publishes everything and holds nothing.
+    try check(quiet(db));
 }
 
 fn equalResult(left: *const DB.Result, right: *const DB.Result) bool {
@@ -76,7 +78,14 @@ fn rejects(db: *DB, result: *DB.Result, source: []const u8, expected: ?anyerror)
     } else |err| {
         if (expected) |wanted| try check(err == wanted) else try check(true);
         try check(equalResult(&before, result));
+        try check(quiet(db));
     }
+}
+
+/// No active transaction, held lock or uncommitted version remains.
+fn quiet(db: *const DB) bool {
+    const usage = db.usage();
+    return usage.transactions == 0 and usage.row_locks == 0 and usage.table_locks == 0 and usage.pending_versions == 0;
 }
 
 fn isNull(cell: DB.Cell) bool {
@@ -341,7 +350,11 @@ fn fuzzOne(baseline: *const DB, before: *const DB.Result, source: []const u8) !v
     fuzz_inputs += 1;
     if (db.execute(source, &result)) |_| {
         // A truncation can itself be a complete valid SQL statement.
+        try check(quiet(&db));
     } else |_| {
+        // Failure atomicity through the MVCC API: no transaction, lock or
+        // uncommitted version of the failed statement survives.
+        try check(quiet(&db));
         try check(equalResult(before, &result));
         try check(db.tableCount() == baseline.tableCount());
         try execute(&db, &result, "SELECT * FROM fuzz ORDER BY id");
@@ -512,8 +525,11 @@ const BoundaryProbe = struct {
             var expected: DB.Result = .{};
             var observed: DB.Result = .{};
             if (self.before.execute(query, &expected)) |_| {
-                try self.db.execute(query, &observed);
-                try check(equalResult(&expected, &observed));
+                // Under MVCC an unpublished DROP TABLE holds AccessExclusive:
+                // a reader waits (WouldBlock) instead of seeing a change.
+                if (self.db.execute(query, &observed)) |_| {
+                    try check(equalResult(&expected, &observed));
+                } else |err| try check(err == error.WouldBlock and self.db.usage().table_locks != 0);
             } else |err| {
                 if (self.db.execute(query, &observed)) |_| return error.EarlyPublication else |other| try check(err == other);
             }

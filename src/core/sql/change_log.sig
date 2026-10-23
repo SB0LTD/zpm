@@ -518,8 +518,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 scratch.epoch = 1;
             }
             for (&scratch.tables, &db.tables) |*vt, *table| {
-                vt.* = .{ .live = table.live, .base = table.live };
-                if (!table.live) continue;
+                const committed = S.committedTable(table);
+                vt.* = .{ .live = committed, .base = committed };
+                if (!committed) continue;
                 vt.oid = table.oid;
                 vt.name = table.name;
                 vt.column_count = table.column_count;
@@ -563,7 +564,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const index = try findVTable(scratch, try reader.int(u32));
                         const vt = &scratch.tables[index];
                         const rowid = try reader.int(u64);
-                        if (rowid == 0 or rowid < vt.next_rowid or rowid == 0xffffffffffffffff) return error.ChangeRecordConflict;
+                        // Concurrent transactions commit in any order, so rowids
+                        // need only be unused, not ascending.
+                        if (rowid == 0 or rowid == 0xffffffffffffffff or rowExists(db, scratch, index, rowid)) return error.ChangeRecordConflict;
+                        if (findRow(scratch, index, rowid) != null) return error.ChangeRecordConflict;
                         var key_offset: u32 = 0;
                         try decodeRow(&reader, vt, &row, &key_offset);
                         if (vt.live_rows == config.rows_per_table) return error.ChangeRecordConflict;
@@ -572,7 +576,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             try putKey(scratch, index, V.hash(&row.cells[column]), rowid);
                         }
                         try putRow(scratch, .{ .epoch = scratch.epoch, .table = index, .live = true, .has_key = vt.primary != null, .rowid = rowid, .key_offset = key_offset });
-                        vt.next_rowid = rowid + 1;
+                        if (rowid + 1 > vt.next_rowid) vt.next_rowid = rowid + 1;
                         vt.live_rows += 1;
                     },
                     @intFromEnum(Op.update) => {
@@ -632,7 +636,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
         // ----- application (infallible after validation) ----------------
 
         fn tableByOid(db: anytype, oid: u32) Error!*S.Table {
-            for (&db.tables) |*table| if (table.live and table.oid == oid) return table;
+            for (&db.tables) |*table| if (S.committedTable(table) and table.oid == oid) return table;
             return error.ChangeRecordConflict;
         }
 
@@ -669,14 +673,20 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 switch (tag) {
                     @intFromEnum(Op.create_table) => {
                         const definition = try decodeCreate(&reader);
-                        for (&db.tables) |*table| if (!table.live) {
+                        for (&db.tables, 0..) |*table, index| if (!table.live) {
                             S.reset(table, definition.oid, definition.name, definition.columns[0..definition.count]);
-                            table.live = true;
+                            try db.replayCreate(index, csn);
                             break;
                         };
                         db.oid_counter = definition.oid + 1 - first_oid;
                     },
-                    @intFromEnum(Op.drop_table) => (try tableByOid(db, try reader.int(u32))).live = false,
+                    @intFromEnum(Op.drop_table) => {
+                        const table = try tableByOid(db, try reader.int(u32));
+                        db.replayDrop((@intFromPtr(table) - @intFromPtr(&db.tables[0])) / @sizeOf(S.Table), csn);
+                        // Replay has no snapshot: the slot is free at once.
+                        table.live = false;
+                        table.dead_csn = 0;
+                    },
                     @intFromEnum(Op.insert), @intFromEnum(Op.update) => {
                         const table = try tableByOid(db, try reader.int(u32));
                         const rowid = try reader.int(u64);
@@ -688,7 +698,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             try S.ensureRowSlot(table, csn);
                             const slot = S.allocRow(table, rowid);
                             _ = try writeVersion(db, table, slot, 0, &row, csn);
-                            table.next_rowid = rowid + 1;
+                            if (rowid + 1 > table.next_rowid) table.next_rowid = rowid + 1;
                         } else {
                             const slot = S.findRow(table, rowid) orelse return error.ChangeRecordConflict;
                             const old = S.visible(table, slot) orelse return error.ChangeRecordConflict;

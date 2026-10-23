@@ -6,11 +6,16 @@
 //! multi-entry primary-key index from key to version, filtered by
 //! visibility. Every array is inline caller-owned storage; nothing allocates.
 //!
-//! Wave 1 visibility: a version is committed when xmin_csn != 0 and dead when
-//! xmax_csn != 0. A statement creates versions with xmin_csn = 0 and sets
-//! xmax marks with xmax_csn = 0; readers skip both until the statement stamps
-//! them with the Raw's next local csn. A failing statement frees its versions
-//! and clears its marks (undo list), so no reader ever observes them.
+//! Visibility (design §4.4): a statement reads under a Snapshot {csn, tx, cid}.
+//! A version's creation is visible when it committed at or before snap.csn,
+//! or when the snapshot's own transaction created it in an earlier statement
+//! (xmin_cid < cid); deletion uses the same rule on xmax. A statement
+//! therefore sees its transaction's earlier writes but never its own (no
+//! Halloween problem). Uncommitted versions carry csn 0 and are invisible to
+//! every other transaction; an aborted (sub)transaction frees its versions
+//! and clears its marks immediately, so no aborted version is ever observed.
+//! Superseded versions are reclaimed only once their xmax_csn is at or below
+//! the reclamation horizon (no pinned snapshot can still see them).
 //!
 //! Directory slots are allocated at a high-water mark so slot order equals
 //! rowid order (the historical insertion-ordered scan). When the mark reaches
@@ -33,26 +38,38 @@ pub fn mix(value: u64) usize {
     return @truncate(code);
 }
 
+/// {slot, epoch, sub}: transaction-table slot, the transaction's unique epoch
+/// (0 means "no transaction") and its subtransaction depth.
+pub const TxRef = struct { slot: u16 = 0, epoch: u32 = 0, sub: u16 = 0 };
+
+/// Statement snapshot. epoch 0 has no own transaction (committed view).
+pub const Snapshot = struct {
+    csn: u64,
+    slot: u16 = 0,
+    epoch: u32 = 0,
+    cid: u32 = 0,
+
+    pub fn own(self: Snapshot, ref: TxRef) bool {
+        return self.epoch != 0 and ref.epoch == self.epoch and ref.slot == self.slot;
+    }
+};
+
+/// Every committed version, nothing uncommitted.
+pub const committed_view: Snapshot = .{ .csn = 0xffffffffffffffff };
+
 pub fn Storage(comptime config: types.Config) type {
     const V = types.Values(config);
     return struct {
         pub const versions_capacity: usize = if (config.versions_per_table == 0) config.rows_per_table * 2 else config.versions_per_table;
-        /// One statement touches at most every row of one table, or one table.
-        pub const undo_capacity: usize = (if (config.tx_writes == 0) config.rows_per_table else config.tx_writes) + 1;
         pub const row_index_capacity: usize = pow2(config.rows_per_table * 2);
         pub const key_index_capacity: usize = pow2(versions_capacity * 2);
-        /// Opportunistic reclamation bound after a statement completes.
+        /// Opportunistic reclamation bound after a transaction publishes.
         pub const reclaim_budget: usize = 64;
 
         comptime {
             if (versions_capacity <= config.rows_per_table) @compileError("versions_per_table must exceed rows_per_table");
             if (versions_capacity > 0x7fffffff or config.rows_per_table > 0x7fffffff) @compileError("storage capacity exceeds u32 references");
-            if (config.tx_writes != 0 and config.tx_writes < config.rows_per_table) @compileError("tx_writes must cover rows_per_table");
         }
-
-        /// {slot, epoch, sub}; epoch 0 means "no transaction". In Wave 1 the
-        /// slot is 0 and the epoch is the Raw's statement epoch.
-        pub const TxRef = struct { slot: u16 = 0, epoch: u32 = 0, sub: u16 = 0 };
 
         pub const RowSlot = struct {
             rowid: u64 = 0,
@@ -88,10 +105,16 @@ pub fn Storage(comptime config: types.Config) type {
             next_rowid: u64 = 0,
         };
 
+        /// `live`: the slot is in use (from CREATE until reclamation). Name
+        /// visibility comes from the versioned catalog; these flags only
+        /// summarize it: `pending_create` until the creator publishes,
+        /// `pending_drop` while an uncommitted DROP holds it, `dead_csn` once
+        /// a DROP committed (storage is reclaimed when the horizon passes it).
         pub const Table = struct {
             live: bool = false,
             pending_create: bool = false,
             pending_drop: bool = false,
+            dead_csn: u64 = 0,
             oid: u32 = 0,
             name: V.Name = .{},
             column_count: usize = 0,
@@ -110,9 +133,10 @@ pub fn Storage(comptime config: types.Config) type {
             key_index: [key_index_capacity]u32 = @splat(0),
         };
 
-        pub const UndoKind = enum { insert, update, delete, create_table, drop_table };
-        /// `old`/`new` are version indices; `table` is the table slot.
-        pub const Undo = struct { kind: UndoKind, table: u32, old: u32 = 0, new: u32 = 0 };
+        /// A table every committed reader can see (created and not dropped).
+        pub fn committedTable(table: *const Table) bool {
+            return table.live and !table.pending_create and table.dead_csn == 0;
+        }
 
         /// Prepare a free table slot for a new definition. Unused capacity is
         /// neither cleared nor read; only both indices are reset.
@@ -126,6 +150,8 @@ pub fn Storage(comptime config: types.Config) type {
                 table.primary_column = index;
             };
             table.next_rowid = 1;
+            table.dead_csn = 0;
+            table.pending_drop = false;
             table.row_high = 0;
             table.row_used = 0;
             table.version_high = 0;
@@ -155,13 +181,40 @@ pub fn Storage(comptime config: types.Config) type {
             if (source.primary_column != null) destination.key_index = source.key_index;
         }
 
-        /// Committed view: the newest stamped version, unless it is dead.
-        pub fn visible(table: *const Table, slot: usize) ?u32 {
+        pub fn created(version: *const Version, snap: Snapshot) bool {
+            if (version.xmin_csn != 0) return version.xmin_csn <= snap.csn;
+            return snap.own(version.xmin) and version.xmin_cid < snap.cid;
+        }
+
+        pub fn deleted(version: *const Version, snap: Snapshot) bool {
+            if (version.xmax.epoch == 0) return false;
+            if (version.xmax_csn != 0) return version.xmax_csn <= snap.csn;
+            return snap.own(version.xmax) and version.xmax_cid < snap.cid;
+        }
+
+        /// The version of `slot` visible to `snap`, if any.
+        pub fn visibleAt(table: *const Table, slot: usize, snap: Snapshot) ?u32 {
             var ref = table.rows[slot].newest;
             while (ref != 0) {
                 const version = &table.versions[ref - 1];
-                if (version.xmin_csn != 0) return if (version.xmax_csn == 0) ref - 1 else null;
+                if (created(version, snap)) return if (deleted(version, snap)) null else ref - 1;
                 ref = version.older;
+            }
+            return null;
+        }
+
+        /// Committed view: the newest stamped version, unless it is dead.
+        pub fn visible(table: *const Table, slot: usize) ?u32 {
+            return visibleAt(table, slot, committed_view);
+        }
+
+        /// The version created right after `version` in its row's chain.
+        pub fn successor(table: *const Table, version: u32) ?u32 {
+            var ref = table.rows[table.versions[version].row - 1].newest;
+            while (ref != 0) {
+                const entry = &table.versions[ref - 1];
+                if (entry.older == version + 1) return ref - 1;
+                ref = entry.older;
             }
             return null;
         }
@@ -235,8 +288,8 @@ pub fn Storage(comptime config: types.Config) type {
             removeAt(table, &table.key_index, position, keyHome);
         }
 
-        /// Directory slot of the committed row whose key equals value.
-        pub fn lookupKey(table: *const Table, value: *const V.Cell) ?u32 {
+        /// Directory slot of the row visible to `snap` whose key equals value.
+        pub fn lookupKeyAt(table: *const Table, value: *const V.Cell, snap: Snapshot) ?u32 {
             const column = table.primary_column orelse return null;
             if (value.* == .null_value) return null;
             var position = V.hash(value) & (key_index_capacity - 1);
@@ -246,10 +299,15 @@ pub fn Storage(comptime config: types.Config) type {
                 const version = &table.versions[entry - 1];
                 if (V.compare(&version.cells[column], value) == 0) {
                     const slot = version.row - 1;
-                    if (visible(table, slot) == entry - 1) return slot;
+                    if (visibleAt(table, slot, snap) == entry - 1) return slot;
                 }
                 position = (position + 1) & (key_index_capacity - 1);
             }
+        }
+
+        /// Directory slot of the committed row whose key equals value.
+        pub fn lookupKey(table: *const Table, value: *const V.Cell) ?u32 {
+            return lookupKeyAt(table, value, committed_view);
         }
 
         pub fn freeVersions(table: *const Table) usize {

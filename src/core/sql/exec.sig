@@ -1,7 +1,8 @@
 //! Query execution (Layer 0, design §4.9): candidate scans with the
-//! primary-key probe, WHERE filters, projections and ORDER BY over typed
-//! expressions. A failing SELECT leaves the caller's result untouched: every
-//! fallible evaluation completes before the first result byte is written.
+//! primary-key probe, WHERE filters, projections, ORDER BY and LockRows over
+//! typed expressions, all under the statement snapshot. A failing SELECT
+//! leaves the caller's result untouched: every fallible evaluation (and every
+//! lock wait) completes before the first result byte is written.
 const types = @import("types.sig");
 const ast = @import("ast.sig");
 const storage = @import("storage.sig");
@@ -26,15 +27,24 @@ pub fn Exec(comptime config: types.Config) type {
             return (try E.truth(ctx, where)) == true;
         }
 
-        /// Evaluates a top-level `pk = constant` once and probes the index.
-        pub fn candidates(ctx: *E.Context, table: *const S.Table, key: u16) Error!Candidates {
+        /// Evaluates a top-level `pk = constant` once and probes the index
+        /// under the statement snapshot.
+        pub fn candidates(ctx: *E.Context, table: *const S.Table, key: u16, snap: storage.Snapshot) Error!Candidates {
             if (key == none) return .scan;
             ctx.row = null;
             const value = try E.eval(ctx, key);
             if (value == .null_value) return .empty;
-            const slot = S.lookupKey(table, &value) orelse return .empty;
+            const slot = S.lookupKeyAt(table, &value, snap) orelse return .empty;
             return .{ .slot = slot };
         }
+
+        /// Plain SELECT: candidates are emitted as read.
+        pub const NoLock = struct {
+            pub const active = false;
+            pub fn lock(_: @This(), _: usize, version: u32) Error!?u32 {
+                return version;
+            }
+        };
 
         fn simple(pool: *const Ast.Pool, id: u16) bool {
             return pool.nodes[id].kind == .column;
@@ -106,7 +116,11 @@ pub fn Exec(comptime config: types.Config) type {
             }
         };
 
-        pub fn select(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, query: *const B.Select, result: anytype) Error!void {
+        /// `locker` (FOR UPDATE/SHARE) runs after ORDER BY and before LIMIT, as
+        /// PostgreSQL's LockRows does: it returns the version to emit (the
+        /// newest committed one, whose WHERE is re-checked here when it
+        /// changed), null to skip the row, or WouldBlock to park.
+        pub fn select(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, query: *const B.Select, snap: storage.Snapshot, result: anytype, locker: anytype) Error!void {
             var ctx: E.Context = .{ .source = source, .pool = pool };
             var plain = true;
             for (query.targets[0..query.count]) |id| plain = plain and simple(pool, id);
@@ -124,24 +138,26 @@ pub fn Exec(comptime config: types.Config) type {
                 if (produced) @memcpy(result.rows[0].cells[0..query.count], row[0..query.count]);
                 return;
             }
-            const table = &tables[query.table.?];
+            const table_index = query.table.?;
+            const table = &tables[table_index];
+            const locking = @TypeOf(locker).active;
             var indices: [config.rows_per_table]u32 = undefined;
             var found: usize = 0;
-            if (query.limit != 0) switch (try candidates(&ctx, table, query.key)) {
+            if (query.limit != 0) switch (try candidates(&ctx, table, query.key, snap)) {
                 .empty => {},
                 .slot => |slot| {
-                    const version = S.visible(table, slot).?;
+                    const version = S.visibleAt(table, slot, snap).?;
                     if (try keep(&ctx, query.where, &table.versions[version].cells)) {
                         indices[0] = version;
                         found = 1;
                     }
                 },
                 .scan => for (0..table.row_high) |slot| {
-                    const version = S.visible(table, slot) orelse continue;
+                    const version = S.visibleAt(table, slot, snap) orelse continue;
                     if (!try keep(&ctx, query.where, &table.versions[version].cells)) continue;
                     indices[found] = version;
                     found += 1;
-                    if (query.order_count == 0 and found >= query.limit) break;
+                    if (!locking and query.order_count == 0 and found >= query.limit) break;
                 },
             };
             if (query.order_count != 0 and found != 0) {
@@ -155,6 +171,19 @@ pub fn Exec(comptime config: types.Config) type {
                 };
                 const sorter: Sorter = .{ .ctx = &ctx, .table = table, .query = query };
                 try sorter.sort(indices[0..found]);
+            }
+            if (locking) {
+                // LockRows: lock in output order; LIMIT counts locked rows.
+                var kept: usize = 0;
+                for (0..found) |position| {
+                    if (kept >= query.limit) break;
+                    const version = indices[position];
+                    const newest = (try locker.lock(table_index, version)) orelse continue;
+                    if (newest != version and !try keep(&ctx, query.where, &table.versions[newest].cells)) continue;
+                    indices[kept] = newest;
+                    kept += 1;
+                }
+                found = kept;
             }
             const rows: usize = if (query.limit < found) @intCast(query.limit) else found;
             if (!plain) {

@@ -1,5 +1,5 @@
 //! Name resolution and typing (Layer 0, design §4.1). Binds a parsed
-//! statement against the committed catalog without executing it, so
+//! statement against the catalog visible to the statement snapshot without executing it, so
 //! describe() never mutates data.
 //!
 //! Every expression is typed with PostgreSQL's implicit-cast rules for the
@@ -19,6 +19,7 @@ const lexer = @import("lexer.sig");
 const ast = @import("ast.sig");
 const storage = @import("storage.sig");
 const expr = @import("expr.sig");
+const catalog = @import("catalog.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -26,6 +27,7 @@ pub fn Binder(comptime config: types.Config) type {
     const V = types.Values(config);
     const Ast = ast.Ast(config);
     const S = storage.Storage(config);
+    const K = catalog.Catalog(config);
     return struct {
         /// INTEGER outside the PostgreSQL dialect and in legacy replay.
         pub const integer_type: types.DataType = if (config.integer_bits == 32) .integer32 else .integer;
@@ -53,6 +55,7 @@ pub fn Binder(comptime config: types.Config) type {
             order: [config.columns]Key,
             order_count: usize,
             limit: u64,
+            lock: ast.Locking = .{},
         };
 
         /// `values[c]` is the expression assigned to column c, or none.
@@ -67,14 +70,15 @@ pub fn Binder(comptime config: types.Config) type {
             select: Select,
             update: Update,
             delete: Delete,
-            begin: void,
-            commit: void,
-            rollback: void,
+            control: ast.Control,
         };
 
         pub const Context = struct {
             source: []const u8,
             tables: *const [config.tables]S.Table,
+            catalog: *const K,
+            /// Statement snapshot: every name lookup reads the catalog under it.
+            snapshot: storage.Snapshot,
             pool: *Ast.Pool,
             /// legacy_alpha replay: alpha INTEGER width and boolean integers.
             legacy: bool,
@@ -103,9 +107,16 @@ pub fn Binder(comptime config: types.Config) type {
                 .select => .select,
                 .update => .update,
                 .delete => .delete,
-                .begin => .begin,
-                .commit => .commit,
-                .rollback => .rollback,
+                .control => |control| switch (control) {
+                    .begin, .set_transaction => .begin,
+                    .commit => .commit,
+                    .rollback, .rollback_to => .rollback,
+                    .savepoint => .savepoint,
+                    .release => .release,
+                    .set => .set,
+                    .show => .show,
+                    .reset => .reset,
+                },
             };
         }
 
@@ -156,16 +167,14 @@ pub fn Binder(comptime config: types.Config) type {
             return out;
         }
 
-        /// Committed catalog lookup; a pending CREATE is not yet visible.
-        pub fn tableIndex(tables: *const [config.tables]S.Table, wanted: []const u8) Error!usize {
-            for (tables, 0..) |*table, index|
-                if (table.live and types.same(table.name.slice(), wanted)) return index;
-            return error.TableNotFound;
+        /// Catalog lookup under a snapshot (cat_relations, design M2).
+        pub fn tableIndex(cat: *const K, wanted: []const u8, snap: storage.Snapshot) Error!usize {
+            return cat.lookup(wanted, snap) orelse error.TableNotFound;
         }
 
         fn resolveTable(context: *const Context, ident: ast.Ident) Error!usize {
             const wanted = toName(context, ident);
-            return tableIndex(context.tables, wanted.slice());
+            return tableIndex(context.catalog, wanted.slice(), context.snapshot);
         }
 
         fn columnIndex(context: *const Context, entry: *const S.Table, ident: ast.Ident) Error!usize {
@@ -574,7 +583,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn bindSelect(context: *const Context, select: *const Ast.Select) Error!Select {
             const scope = try scopeFor(context, select.from);
-            var out: Select = .{ .table = scope.table, .targets = undefined, .names = undefined, .types = undefined, .count = 0, .where = none, .key = none, .order = undefined, .order_count = 0, .limit = select.limit };
+            var out: Select = .{ .table = scope.table, .targets = undefined, .names = undefined, .types = undefined, .count = 0, .where = none, .key = none, .order = undefined, .order_count = 0, .limit = select.limit, .lock = select.lock };
             for (select.targets[0..select.count]) |*target| {
                 if (target.star) {
                     const entry = &context.tables[scope.table.?];
@@ -625,8 +634,7 @@ pub fn Binder(comptime config: types.Config) type {
             switch (statement.*) {
                 .create_table => |*create| {
                     const table_name = toName(context, create.name);
-                    for (context.tables) |*entry|
-                        if (entry.live and types.same(entry.name.slice(), table_name.slice())) return error.TableExists;
+                    if (context.catalog.lookup(table_name.slice(), context.snapshot) != null) return error.TableExists;
                     var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count };
                     const plain_integer: types.DataType = if (context.legacy or context.dialect != .postgres) integer_type else .integer32;
                     for (create.columns[0..create.count], 0..) |*definition, index| {
@@ -697,9 +705,7 @@ pub fn Binder(comptime config: types.Config) type {
                     const where = try bindWhere(context, &scope, delete.where);
                     return .{ .delete = .{ .table = index, .where = where, .key = primaryKey(context, &context.tables[index], where) } };
                 },
-                .begin => return .begin,
-                .commit => return .commit,
-                .rollback => return .rollback,
+                .control => |control| return .{ .control = control },
             }
         }
     };

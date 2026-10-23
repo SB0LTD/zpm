@@ -57,23 +57,40 @@ pub fn Dml(comptime config: types.Config) type {
             return cells;
         }
 
-        pub fn keyTaken(table: *const S.Table, key: *const V.Cell, own_slot: u32) bool {
-            const column = table.primary_column orelse return false;
-            if (key.* == .null_value) return false;
+        pub const KeyState = union(enum) { free, taken, wait: u16 };
+
+        /// Unique-index check against the newest state, like PostgreSQL's
+        /// dirty snapshot: a key is taken by a committed live row, or by a
+        /// version the snapshot's own transaction created and still holds;
+        /// a version created or deleted by another live transaction means
+        /// the inserter must wait for that transaction (`wait`).
+        pub fn keyCheck(table: *const S.Table, key: *const V.Cell, own_slot: u32, snap: storage.Snapshot) KeyState {
+            const column = table.primary_column orelse return .free;
+            if (key.* == .null_value) return .free;
+            var waiting: ?u16 = null;
             var position = V.hash(key) & (S.key_index_capacity - 1);
             while (true) : (position = (position + 1) & (S.key_index_capacity - 1)) {
                 const entry = table.key_index[position];
-                if (entry == 0) return false;
+                if (entry == 0) break;
                 const version = &table.versions[entry - 1];
                 if (V.compare(&version.cells[column], key) != 0) continue;
-                // A version this statement created holds the key.
-                if (version.xmin_csn == 0) return true;
-                const slot = version.row - 1;
-                if (slot == own_slot or S.visible(table, slot) != entry - 1) continue;
-                // A committed row this statement already replaced released it.
-                if (version.xmax.epoch != 0 and version.xmax_csn == 0) continue;
-                return true;
+                if (version.row - 1 == own_slot) continue;
+                const marked = version.xmax.epoch != 0;
+                if (version.xmin_csn == 0) {
+                    if (snap.own(version.xmin)) {
+                        if (marked and snap.own(version.xmax)) continue;
+                        return .taken;
+                    }
+                    // Another live inserter; a version it replaced itself is
+                    // superseded by a newer indexed version.
+                    if (!marked and waiting == null) waiting = version.xmin.slot;
+                    continue;
+                }
+                if (!marked) return .taken;
+                if (version.xmax_csn != 0 or snap.own(version.xmax)) continue;
+                if (waiting == null) waiting = version.xmax.slot;
             }
+            return if (waiting) |slot| .{ .wait = slot } else .free;
         }
     };
 }

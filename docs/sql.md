@@ -40,17 +40,35 @@ profile's size. `tableCount()` returns the number of live tables.
 text. Successful SELECT copies headers/rows into result, without borrowing
 database memory. Mutation results expose `affected_rows`; CREATE/DROP report 0.
 Every error leaves the database and previous result unchanged. The caller
-serializes access. There is no locking or transaction manager. `Result.command`
-reports the statement kind. `describe(source, &result)` parses and binds without
-executing (SELECT reports column names and types).
+serializes calls. `Result.command` reports the statement kind.
+`describe(source, &result)` parses and binds without executing (SELECT reports
+column names and types).
+
+Transactions (READ COMMITTED only): `begin()` returns a transaction slot
+(`Config.transactions`, `TransactionCapacity` when full); `statement(slot,
+source, &result, .{})` runs one statement as a statement subtransaction under a
+new snapshot; `prepareCommit(slot, buffer)` encodes the kind-3 record without
+changing state, `publishCommit(slot)` stamps and releases everything
+infallibly, `abort(slot)` undoes the transaction. A statement that meets a lock
+held by a live transaction returns `WouldBlock` with its work kept;
+re-delivering it with `.resume = true` continues under the same snapshot
+(EvalPlanQual on every remaining target). `abortStatement`, `failScope`,
+`savepoint`/`release`/`rollbackTo`, `deadlocked` (bounded DFS over wait-for
+bitsets) and `control(source)` (decoded BEGIN/COMMIT/SAVEPOINT/SET/SHOW/RESET
+for the store) complete the API. Catalog relations (`cat_relations`,
+`cat_attributes`, `cat_attrdef`, `cat_sequences`) are versioned like rows, so
+DDL is transactional. `execute`, `executeWithCommit` and `executeChanges` are
+single-statement autocommit conveniences. `usage()` reports open
+transactions, held locks and uncommitted versions for leak checks.
 
 Statements run through a lexer, a recursive-descent parser with a statement-scoped
 node pool, and a binder. Exhausting the pool or depth raises `StatementTooComplex`
 (SQLSTATE 54001). Each table stores a row directory (stable u64 rowids,
 generation-checked slots, rowid order for unordered scans), a version arena and a
-multi-entry primary-key index filtered by visibility. A statement's new versions and
-deletion marks stay invisible until it completes; a failing statement undoes them.
-Superseded versions are reclaimed after each statement (at most 64) and on demand.
+multi-entry primary-key index filtered by visibility. A transaction's new versions and
+deletion marks stay invisible to others until it publishes; a failing statement undoes its own.
+Superseded versions are reclaimed after each publication (at most 64) and on
+demand, once no pinned snapshot of a parked statement can see them.
 If none can be reclaimed the statement fails with `VersionCapacity` (53200), a
 documented capacity limit where PostgreSQL would succeed.
 
@@ -74,9 +92,9 @@ moving or overwriting that owner.
 `DB.copyFrom(&source)` copies a complete logical snapshot into distinct storage,
 including live schemas, rows and primary-key indices. `Result.copyFrom` copies
 only active headers and cells. Both accept uninitialized destination storage;
-callers must never inspect inactive table/row/column ranges. Durable store
-transaction snapshots use these operations, avoiding copies of empty reserved
-capacity. CREATE/DROP/DELETE leave inactive row payloads alone.
+callers must never inspect inactive table/row/column ranges. `DB.copyFrom`
+requires a source without open transactions; the store never copies a
+database. CREATE/DROP/DELETE leave inactive row payloads alone.
 
 `executeWithCommit(source, &result, context, commit)` adds a synchronous commit
 boundary without introducing a storage dependency into Layer 0. Each mutation
@@ -171,7 +189,12 @@ Errors include `Syntax`, `UnsupportedStatement`, `TableCapacity`,
 `TransactionLogCapacity`, `UnsupportedLogVersion`, `InvalidChangeRecord`,
 `ChangeRecordConflict`, `UndefinedFunction`, `AmbiguousFunction`,
 `CannotCoerce`, `InvalidTextRepresentation`, `DivisionByZero`,
-`InvalidEscapeSequence`, `UndefinedParameter` and `InvalidColumnReference`.
+`InvalidEscapeSequence`, `UndefinedParameter`, `InvalidColumnReference` and the
+transaction errors `WouldBlock` (never sent to clients), `SerializationFailure`,
+`DeadlockDetected`, `LockNotAvailable`, `QueryCanceled`, `TransactionCapacity`,
+`WriteSetCapacity`, `LockCapacity`, `CatalogCapacity`, `SavepointCapacity`,
+`SavepointNotFound`, `NoActiveTransaction`, `ReadOnlyTransaction`,
+`UndefinedSetting` and `InvalidSettingValue`.
 `postgres.knownSqlstate` maps every one of them explicitly.
 
 Primary keys use a fixed multi-entry open-addressing hash index (key to version,
