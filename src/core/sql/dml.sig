@@ -89,6 +89,21 @@ pub fn Dml(comptime config: types.Config) type {
             return cells;
         }
 
+        /// COPY FROM: `provided[c]` holds column c's input-function value;
+        /// null takes the column default. Stored like an INSERT value
+        /// (typmod, NOT NULL, ranges), then generated columns are computed.
+        pub fn copiedRow(ctx: *E.Context, table: *const S.Table, provided: *const [config.columns]?V.Cell, derived: Derived) Error!E.Row {
+            var cells: E.Row = @splat(.null_value);
+            ctx.row = null;
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                if (column.default_kind == .generated) continue;
+                const evaluated: V.Cell = if (provided[index]) |cell| cell else try defaultCell(ctx, table, derived, index);
+                cells[index] = try store(column, evaluated, ctx.session);
+            }
+            try computeGenerated(ctx, table, derived, &cells);
+            return cells;
+        }
+
         /// Every SET expression sees the old row, never a partly updated one.
         pub fn updatedRow(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16, derived: Derived, old: *const E.Row) Error!E.Row {
             var cells = old.*;

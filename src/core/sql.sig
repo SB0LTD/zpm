@@ -18,7 +18,9 @@
 //! BOOL_AND/BOOL_OR, DISTINCT, FILTER), scalar/IN/EXISTS subqueries, WITH
 //! [RECURSIVE], UNION/INTERSECT/EXCEPT [ALL], [ORDER BY expressions/positions/
 //! output names] [LIMIT|OFFSET|FETCH FIRST] [FOR UPDATE|SHARE [NOWAIT|SKIP
-//! LOCKED]] (single table only); UPDATE with expression SET; DELETE. General
+//! LOCKED]] (single table only); UPDATE with expression SET; DELETE; COPY
+//! FROM STDIN / TO STDOUT through copyInfo/copyBegin/copyBuild/copyInsert/
+//! copyEnd (row formats belong to the caller's codec). General
 //! queries run in the bounded statement workspace (Config.work_rows;
 //! WorkspaceCapacity, 54000, when exhausted). Types are
 //! SMALLINT, INTEGER (int4), BIGINT (int8), NUMERIC[(p,s)] (at most
@@ -127,6 +129,9 @@ pub const CommandTag = types.CommandTag;
 pub const ParseMode = parser_module.Mode;
 pub const Isolation = ast.Isolation;
 pub const typeOid = types.typeOid;
+pub const CopyFormat = ast.CopyFormat;
+pub const CopyHeader = ast.CopyHeader;
+pub const CopyDirection = ast.CopyDirection;
 /// Kind-3 change-record format constants and header validation.
 pub const change_records = struct {
     pub const format_version = change_log.format_version;
@@ -513,6 +518,8 @@ pub fn Database(comptime config: Config) type {
                 tx.waiting_for = .{};
                 tx.table_wait = null;
                 tx.seq_dirty = .{};
+                tx.copy_table = null;
+                tx.copy_rows = 0;
                 return @intCast(slot);
             };
             return error.TransactionCapacity;
@@ -617,6 +624,8 @@ pub fn Database(comptime config: Config) type {
                 M.abortSlice(self, slot, sub.write_start, sub.lock_start);
                 tx.sub_len -= 1;
             }
+            tx.copy_table = null;
+            tx.copy_rows = 0;
             tx.pin = null;
             tx.fresh = false;
             tx.waiting_for = .{};
@@ -728,11 +737,7 @@ pub fn Database(comptime config: Config) type {
                 tx.sub_len += 1;
             }
             const start = tx.subs[tx.sub_len - 1].write_start;
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName };
-            self.session.sequences = &self.seq_hook;
-            self.seq_slot = slot;
-            self.seq_snap = snap;
-            self.workspace.query.views = .{ .ptr = self, .rows = &viewRows };
+            self.statementHooks(slot, snap);
             self.body(slot, source, &parsed, snap, result, options.mode) catch |err| {
                 if (err == error.WouldBlock) {
                     tx.pin = snap;
@@ -1466,7 +1471,6 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn insertOne(self: *Self, slot: u16, ctx: *E.Context, insert: *const B.Insert, values: *const [config.columns]u16, derived: D.Derived, snap: Snapshot) Error!usize {
-            const tx = &self.txs[slot];
             const table_index = insert.table;
             const table = &self.tables[table_index];
             const cells = try D.insertedRow(ctx, table, values, derived);
@@ -1483,6 +1487,15 @@ pub fn Database(comptime config: Config) type {
                     return self.park(slot, waits);
                 },
             };
+            try self.appendRow(slot, table_index, &cells, snap);
+            return 1;
+        }
+
+        /// Places a new row version (key already checked). Capacity errors
+        /// leave the table and write set unchanged.
+        fn appendRow(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            const table = &self.tables[table_index];
             if (table.next_rowid == 0xffffffffffffffff) return error.RowCapacity;
             try self.reserveWrites(slot, 1);
             const at = self.horizon();
@@ -1491,11 +1504,299 @@ pub fn Database(comptime config: Config) type {
             const row = S.allocRow(table, table.next_rowid);
             table.next_rowid += 1;
             const version = S.allocVersion(table);
-            table.versions[version] = .{ .row = row + 1, .xmin = tx.ref(slot), .xmin_cid = snap.cid, .cells = cells };
+            table.versions[version] = .{ .row = row + 1, .xmin = tx.ref(slot), .xmin_cid = snap.cid, .cells = cells.* };
             table.rows[row].newest = version + 1;
             S.indexKey(table, version);
             tx.push(.{ .kind = .insert, .table = @intCast(table_index), .new = version }) catch unreachable;
-            return 1;
+        }
+
+        // ---- COPY (design §4.7, §5.17) ----------------------------------
+
+        /// Validated COPY options with PostgreSQL's defaults filled in.
+        pub const CopyOptions = struct {
+            format: ast.CopyFormat = .text,
+            delimiter: u8 = '\t',
+            null_bytes: [64]u8 = @splat(0),
+            null_len: usize = 0,
+            quote: u8 = '"',
+            escape: u8 = '"',
+            header: ast.CopyHeader = .off,
+
+            pub fn nullString(self: *const CopyOptions) []const u8 {
+                return self.null_bytes[0..self.null_len];
+            }
+        };
+
+        /// What a codec needs to run a COPY. FROM: the target columns of
+        /// each data field, in field order. TO: the length of the SELECT
+        /// written into the caller's buffer (the codec runs it as a query).
+        pub const CopyInfo = struct {
+            direction: ast.CopyDirection = .from,
+            options: CopyOptions = .{},
+            count: usize = 0,
+            names: [config.columns]Name = @splat(.{}),
+            types: [config.columns]DataType = @splat(.integer),
+            typmods: [config.columns]i32 = @splat(-1),
+            select_len: usize = 0,
+        };
+
+        pub const copy_line_bytes = config.copy_line_bytes;
+
+        /// PostgreSQL ProcessCopyOptions (PostgreSQL 16 SQLSTATEs): binary
+        /// with DELIMITER/NULL 42601; non-single-byte DELIMITER/QUOTE/ESCAPE,
+        /// QUOTE/ESCAPE outside CSV, HEADER in binary and HEADER MATCH in
+        /// COPY TO 0A000; newline delimiters/NULL, a text delimiter from
+        /// `\.a-z0-9`, delimiter = quote and delimiter or quote inside NULL
+        /// 22023. NULL longer than 64 bytes is TextCapacity (54000).
+        fn copyOptions(given: *const ast.CopyOptions, direction: ast.CopyDirection) Error!CopyOptions {
+            const binary = given.format == .binary;
+            const csv = given.format == .csv;
+            if (binary and given.delimiter.set) return error.Syntax;
+            if (binary and given.null_string.set) return error.Syntax;
+            var out: CopyOptions = .{ .format = given.format, .header = given.header };
+            if (given.delimiter.set) {
+                if (given.delimiter.len != 1) return error.UnsupportedStatement;
+                out.delimiter = given.delimiter.bytes[0];
+            } else out.delimiter = if (csv) ',' else '\t';
+            if (given.null_string.set) {
+                if (given.null_string.len > out.null_bytes.len) return error.TextCapacity;
+                out.null_len = given.null_string.len;
+                @memcpy(out.null_bytes[0..out.null_len], given.null_string.bytes[0..out.null_len]);
+            } else if (!csv) {
+                out.null_len = 2;
+                @memcpy(out.null_bytes[0..2], "\\N");
+            }
+            const null_text = out.nullString();
+            if (out.delimiter == '\r' or out.delimiter == '\n') return error.InvalidParameterValue;
+            for (null_text) |byte| if (byte == '\r' or byte == '\n') return error.InvalidParameterValue;
+            if (!csv) {
+                for ("\\.abcdefghijklmnopqrstuvwxyz0123456789") |byte| if (out.delimiter == byte) return error.InvalidParameterValue;
+            }
+            if (binary and given.header != .off) return error.UnsupportedStatement;
+            if (given.header == .match and direction == .to) return error.UnsupportedStatement;
+            if (!csv and given.quote.set) return error.UnsupportedStatement;
+            if (csv) {
+                if (given.quote.set) {
+                    if (given.quote.len != 1) return error.UnsupportedStatement;
+                    out.quote = given.quote.bytes[0];
+                }
+                if (out.delimiter == out.quote) return error.InvalidParameterValue;
+            }
+            if (!csv and given.escape.set) return error.UnsupportedStatement;
+            if (csv) {
+                out.escape = out.quote;
+                if (given.escape.set) {
+                    if (given.escape.len != 1) return error.UnsupportedStatement;
+                    out.escape = given.escape.bytes[0];
+                }
+            }
+            for (null_text) |byte| if (byte == out.delimiter) return error.InvalidParameterValue;
+            if (csv) for (null_text) |byte| if (byte == out.quote) return error.InvalidParameterValue;
+            return out;
+        }
+
+        fn parseCopy(self: *Self, source: []const u8) Error!A.Copy {
+            const parsed = try P.parse(source, &self.workspace.nodes, .standard);
+            return switch (parsed) {
+                .copy => |copy| copy,
+                else => error.UnsupportedStatement,
+            };
+        }
+
+        fn appendText(out: []u8, used: *usize, bytes: []const u8) Error!void {
+            if (bytes.len > out.len - used.*) return error.TextCapacity;
+            @memcpy(out[used.*..][0..bytes.len], bytes);
+            used.* += bytes.len;
+        }
+
+        fn appendQuoted(out: []u8, used: *usize, name: []const u8) Error!void {
+            try appendText(out, used, "\"");
+            for (name) |byte| {
+                if (byte == '"') try appendText(out, used, "\"\"") else try appendText(out, used, &[_]u8{byte});
+            }
+            try appendText(out, used, "\"");
+        }
+
+        /// Parses and validates a COPY statement and binds its target under
+        /// the snapshot of `slot` (or the committed state). Never executes,
+        /// locks or writes. COPY TO writes the equivalent SELECT into
+        /// `select` (`(query)` verbatim; a table lists its non-generated
+        /// columns or the given ones).
+        pub fn copyInfo(self: *Self, slot: ?u16, source: []const u8, select: []u8) Error!CopyInfo {
+            const copy = try self.parseCopy(source);
+            var info: CopyInfo = .{ .direction = copy.direction, .options = try copyOptions(&copy.options, copy.direction) };
+            var snap: Snapshot = .{ .csn = self.csn };
+            if (slot) |owner| if (self.active(owner)) {
+                snap = .{ .csn = self.csn, .slot = owner, .epoch = self.txs[owner].epoch, .cid = self.txs[owner].cid +% 1 };
+            };
+            if (copy.query) |span| {
+                var used: usize = 0;
+                try appendText(select, &used, span.slice(source));
+                info.select_len = used;
+                return info;
+            }
+            const context = self.bindContext(source, .standard, snap);
+            const bound = try B.bindCopy(&context, &copy, false);
+            const table = &self.tables[bound.table];
+            info.count = bound.count;
+            for (bound.mapping[0..bound.count], 0..) |column, field| {
+                info.names[field] = table.columns[column].name;
+                info.types[field] = table.columns[column].data_type;
+                info.typmods[field] = table.columns[column].typmod;
+            }
+            if (copy.direction == .to) {
+                var used: usize = 0;
+                try appendText(select, &used, "SELECT ");
+                for (bound.mapping[0..bound.count], 0..) |column, field| {
+                    if (field != 0) try appendText(select, &used, ", ");
+                    try appendQuoted(select, &used, table.columns[column].name.slice());
+                }
+                try appendText(select, &used, " FROM ");
+                try appendQuoted(select, &used, table.name.slice());
+                info.select_len = used;
+            }
+            return info;
+        }
+
+        /// Opens a COPY FROM in transaction `slot`: a statement
+        /// subtransaction that stays open until copyEnd (rows) or a terminal
+        /// error (abort/failScope/abortStatement roll the whole COPY back).
+        /// A table-lock wait returns WouldBlock; re-deliver with `resuming`.
+        pub fn copyBegin(self: *Self, slot: u16, source: []const u8, resuming: bool) Error!CopyInfo {
+            if (!self.active(slot)) return error.NoActiveTransaction;
+            const tx = &self.txs[slot];
+            var snap: Snapshot = undefined;
+            if (resuming) {
+                const pinned = tx.pin orelse return error.QueryCanceled;
+                snap = pinned;
+                if (tx.fresh) snap.csn = self.csn;
+                tx.pin = null;
+                tx.fresh = false;
+            } else {
+                if (tx.pin != null or tx.copy_table != null) return error.QueryCanceled;
+                const copy = try self.parseCopy(source);
+                if (copy.direction != .from) return error.UnsupportedStatement;
+                _ = try copyOptions(&copy.options, copy.direction);
+                if (tx.sub_len >= M.sub_capacity) return error.SavepointCapacity;
+                tx.cid +%= 1;
+                snap = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
+                tx.subs[tx.sub_len] = .{ .statement = true, .write_start = @intCast(tx.write_len), .lock_start = @intCast(tx.lock_len) };
+                tx.sub_len += 1;
+            }
+            const info = self.openCopy(slot, source, snap) catch |err| {
+                if (err == error.WouldBlock) {
+                    tx.pin = snap;
+                    return err;
+                }
+                self.dropStatement(slot);
+                self.wake_epoch +%= 1;
+                return err;
+            };
+            return info;
+        }
+
+        fn openCopy(self: *Self, slot: u16, source: []const u8, snap: Snapshot) Error!CopyInfo {
+            const tx = &self.txs[slot];
+            const copy = try self.parseCopy(source);
+            const context = self.bindContext(source, .standard, snap);
+            const bound = try B.bindCopy(&context, &copy, false);
+            try self.lockTable(slot, bound.table, .row_exclusive);
+            var info: CopyInfo = .{ .direction = .from, .options = try copyOptions(&copy.options, .from), .count = bound.count };
+            const table = &self.tables[bound.table];
+            for (bound.mapping[0..bound.count], 0..) |column, field| {
+                info.names[field] = table.columns[column].name;
+                info.types[field] = table.columns[column].data_type;
+                info.typmods[field] = table.columns[column].typmod;
+            }
+            tx.waiting_for = .{};
+            tx.table_wait = null;
+            tx.copy_table = @intCast(bound.table);
+            tx.copy_snap = snap;
+            tx.copy_rows = 0;
+            return info;
+        }
+
+        fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName };
+            self.session.sequences = &self.seq_hook;
+            self.seq_slot = slot;
+            self.seq_snap = snap;
+            self.workspace.query.views = .{ .ptr = self, .rows = &viewRows };
+        }
+
+        /// One COPY FROM data row: `fields[p]` is field p's text (null =
+        /// NULL) for the column copyBegin reported at p. Applies the input
+        /// functions, then defaults (identity nextval, DEFAULT) for the other
+        /// columns and generated columns, and validates like INSERT. Writes
+        /// nothing; a sequence value drawn by a default is consumed as in
+        /// PostgreSQL. Errors are terminal for the COPY.
+        pub fn copyBuild(self: *Self, slot: u16, source: []const u8, fields: []const ?[]const u8, out: *Row) Error!void {
+            if (!self.active(slot)) return error.NoActiveTransaction;
+            const tx = &self.txs[slot];
+            const table_index = tx.copy_table orelse return error.NoActiveTransaction;
+            const copy = try self.parseCopy(source);
+            const snap = tx.copy_snap;
+            const context = self.bindContext(source, .standard, snap);
+            const bound = try B.bindCopy(&context, &copy, true);
+            if (bound.table != table_index) return error.TableNotFound;
+            if (fields.len != bound.count) return error.BadCopyFormat;
+            const table = &self.tables[table_index];
+            self.statementHooks(slot, snap);
+            var provided: [config.columns]?Cell = @splat(null);
+            for (fields, 0..) |field, position| {
+                const column = &table.columns[bound.mapping[position]];
+                provided[bound.mapping[position]] = if (field) |text| try Io.parse(types.typeOfData(column.data_type), column.typmod, text, &self.session) else .null_value;
+            }
+            var ctx = self.evalContext(source);
+            out.cells = try D.copiedRow(&ctx, table, &provided, .{ .defaults = &bound.defaults, .generated = &bound.generated });
+        }
+
+        /// Inserts a built row under the open COPY. A key held by a live
+        /// inserter or deleter parks the COPY (WouldBlock, row kept by the
+        /// caller); calling again with the same row re-checks it (inserted,
+        /// or 23505 once the other inserter committed).
+        pub fn copyInsert(self: *Self, slot: u16, row: *const Row) Error!void {
+            if (!self.active(slot)) return error.NoActiveTransaction;
+            const tx = &self.txs[slot];
+            const table_index = tx.copy_table orelse return error.NoActiveTransaction;
+            tx.pin = null;
+            tx.waiting_for = .{};
+            const snap = tx.copy_snap;
+            const table = &self.tables[table_index];
+            if (table.primary_column) |column| switch (D.keyCheck(table, &row.cells[column], 0xffffffff, snap)) {
+                .free => {},
+                .taken => return error.PrimaryKeyViolation,
+                .wait => |owner| {
+                    var waits: L.Set = .{};
+                    waits.add(owner);
+                    tx.pin = snap;
+                    return self.park(slot, waits);
+                },
+            };
+            try self.appendRow(slot, table_index, &row.cells, snap);
+            tx.copy_rows += 1;
+        }
+
+        /// Completes the open COPY FROM: merges its subtransaction into the
+        /// transaction and records the outcome (COPY n). Returns n.
+        pub fn copyEnd(self: *Self, slot: u16) Error!usize {
+            if (!self.active(slot)) return error.NoActiveTransaction;
+            const tx = &self.txs[slot];
+            if (tx.copy_table == null) return error.NoActiveTransaction;
+            const rows = tx.copy_rows;
+            tx.copy_table = null;
+            tx.copy_rows = 0;
+            tx.pin = null;
+            tx.sub_len -= 1;
+            tx.waiting_for = .{};
+            tx.table_wait = null;
+            self.outcome = .{ .affected = rows, .command = .copy };
+            return rows;
+        }
+
+        /// True while `slot` has an open COPY FROM.
+        pub fn copyActive(self: *const Self, slot: u16) bool {
+            return self.active(slot) and self.txs[slot].copy_table != null;
         }
 
         /// Rows are visited in rowid order and updated one at a time, as a

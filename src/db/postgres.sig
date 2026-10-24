@@ -5,6 +5,9 @@
 //! SQL semantics are those provided by DB; unsupported features return SQLSTATE.
 const scram = @import("scram");
 const pg_types = @import("pg_types.sig");
+const pg_copy = @import("pg_copy.sig");
+/// COPY data formats (text, csv, binary framing and escaping).
+pub const copy_format = pg_copy;
 pub const max_packet: usize = 16384;
 pub const sql_capacity: usize = 4096;
 pub const statement_capacity: usize = 8;
@@ -14,6 +17,10 @@ pub const parameter_capacity: usize = 32;
 pub const Cancel = struct { pid: u32, secret: u32 };
 /// `blocked`: the message's statement is parked on a lock (consumed =
 /// written = 0); re-deliver the same bytes when the store reports progress.
+/// During COPY FROM a row parked on a key wait is already owned by the
+/// store: `consumed` then covers the input through that row (written = 0);
+/// keep the rest buffered and call handle() again on wake (with or without
+/// new input) - the parked row is re-checked before anything is read.
 /// `cancel`: the connection carried a CancelRequest (close it afterwards).
 pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false, blocked: bool = false, cancel: ?Cancel = null };
 
@@ -143,9 +150,37 @@ const Writer = struct {
 
 pub fn Session(comptime DB: type) type {
     const T = pg_types.Types(DB.Result);
+    const has_copy = @hasDecl(DB, "copyBegin");
+    const CopyInfo = if (has_copy) DB.CopyInfo else struct {};
+    const line_bytes: usize = if (has_copy) DB.copy_line_bytes else 1;
+    const field_capacity: usize = if (has_copy) (CopyInfo{}).types.len else 1;
     return struct {
         const Self = @This();
         const utc_session: T.Session = .{};
+
+        /// COPY FROM STDIN state (design §4.7). `remaining` counts the
+        /// bytes of the current CopyData body not yet consumed (bodies are
+        /// streamed, so their size is not bounded by the caller's input
+        /// buffer); `carry` holds an incomplete row across messages
+        /// (Config.copy_line_bytes); `discard` drops CopyData/CopyDone/
+        /// CopyFail after an error, as PostgreSQL does.
+        const CopyState = struct {
+            mode: enum { none, in, discard } = .none,
+            remaining: usize = 0,
+            info: CopyInfo = .{},
+            sql: [sql_capacity]u8 = undefined,
+            sql_len: usize = 0,
+            carry: [line_bytes]u8 = undefined,
+            carry_len: usize = 0,
+            /// The carry may hold complete rows (left by a parked row).
+            carry_rows: bool = false,
+            scratch: [2 * line_bytes]u8 = undefined,
+            header_pending: bool = false,
+            binary_header: bool = false,
+            ended: bool = false,
+            eol: pg_copy.Eol = .unknown,
+        };
+        const Fed = struct { used: usize = 0, blocked: bool = false };
 
         fn valueSession(db: *DB) *const T.Session {
             if (@hasDecl(DB, "valueSession")) return db.valueSession();
@@ -206,6 +241,7 @@ pub fn Session(comptime DB: type) type {
         commit_rolled_back: bool = false,
         backend_pid: u32 = 1,
         backend_secret: u32 = 0,
+        copy: CopyState = .{},
 
         /// Copy a verifier and a fresh CSPRNG nonce before any startup bytes.
         /// Every accepted connection needs its own unpredictable nonce; the
@@ -223,6 +259,7 @@ pub fn Session(comptime DB: type) type {
         pub fn handle(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
             if (output.len < responseCapacity()) return error.BufferTooSmall;
             if (self.authentication) |*auth| if (auth.state == .failed) return .{ .close = true };
+            if (has_copy and self.copy.mode != .none) return self.copyHandle(db, input, output);
             const prefix: usize = if (self.startup) 1 else 0;
             if (input.len < prefix + 4) return .{};
             const size = read32(input[prefix..][0..4]);
@@ -390,7 +427,11 @@ pub fn Session(comptime DB: type) type {
                     for (&self.portals) |*p| if (p.name.len == 0) {
                         p.live = false;
                     };
-                    if (trim(source).len == 0) try w.empty('I') else {
+                    if (trim(source).len == 0) try w.empty('I') else if (has_copy and word(source, "copy")) {
+                        try self.startCopy(db, source, w);
+                        // COPY FROM: ReadyForQuery follows CopyDone/CopyFail.
+                        if (self.copy.mode == .in) return false;
+                    } else {
                         try self.execute(db, source);
                         if (self.result.column_count != 0) {
                             try self.description(w, null);
@@ -536,6 +577,392 @@ pub fn Session(comptime DB: type) type {
                 };
             }
         }
+        // ---- COPY ---------------------------------------------------------
+
+        fn copyOptions(self: *const Self) pg_copy.Options {
+            return optionsOf(&self.copy.info.options);
+        }
+
+        fn optionsOf(options: anytype) pg_copy.Options {
+            return .{
+                .format = switch (options.format) {
+                    .text => .text,
+                    .csv => .csv,
+                    .binary => .binary,
+                },
+                .delimiter = options.delimiter,
+                .null_string = options.nullString(),
+                .quote = options.quote,
+                .escape = options.escape,
+            };
+        }
+
+        /// COPY TO STDOUT runs its SELECT and streams CopyData; COPY FROM
+        /// STDIN opens the store's COPY and sends CopyInResponse.
+        fn startCopy(self: *Self, db: *DB, source: []const u8, w: *Writer) !void {
+            var select: [sql_capacity + 1024]u8 = undefined;
+            const info = try db.copyDescribe(source, &select);
+            if (info.direction == .to) {
+                try self.execute(db, select[0..info.select_len]);
+                return self.copyOut(db, &info, w);
+            }
+            if (source.len > sql_capacity) return error.StatementCapacity;
+            const begun = try db.copyBegin(source);
+            self.copy.mode = .in;
+            self.copy.remaining = 0;
+            self.copy.info = begun;
+            @memcpy(self.copy.sql[0..source.len], source);
+            self.copy.sql_len = source.len;
+            self.copy.carry_len = 0;
+            self.copy.carry_rows = false;
+            self.copy.ended = false;
+            self.copy.eol = .unknown;
+            self.copy.binary_header = begun.options.format == .binary;
+            self.copy.header_pending = begun.options.format != .binary and begun.options.header != .off;
+            const binary: u16 = @intFromBool(begun.options.format == .binary);
+            const p = try w.begin('G');
+            try w.byte(@intCast(binary));
+            try w.u16be(@intCast(begun.count));
+            for (0..begun.count) |_| try w.u16be(binary);
+            w.end(p);
+        }
+
+        fn copyOut(self: *Self, db: *DB, info: *const CopyInfo, w: *Writer) !void {
+            const options = optionsOf(&info.options);
+            const binary = options.format == .binary;
+            const count = self.result.column_count;
+            const session = valueSession(db);
+            const h = try w.begin('H');
+            try w.byte(@intFromBool(binary));
+            try w.u16be(@intCast(count));
+            for (0..count) |_| try w.u16be(@intFromBool(binary));
+            w.end(h);
+            if (binary) {
+                const p = try w.begin('d');
+                try w.append(pg_copy.signature);
+                try w.u32be(0);
+                try w.u32be(0);
+                w.end(p);
+            } else if (info.options.header != .off) {
+                const p = try w.begin('d');
+                var sink: pg_copy.Sink = .{ .bytes = w.bytes[w.at..] };
+                for (0..count) |field| {
+                    if (field != 0) try sink.byte(options.delimiter);
+                    const name = self.result.column_names[field].slice();
+                    if (options.format == .csv) try pg_copy.appendCsv(&options, name, count == 1, &sink) else try pg_copy.appendText(&options, name, &sink);
+                }
+                try sink.byte('\n');
+                w.at += sink.at;
+                w.end(p);
+            }
+            var text: [DB.Result.ValueIo.format_bytes]u8 = undefined;
+            for (self.result.rows[0..self.result.row_count]) |*row| {
+                const p = try w.begin('d');
+                if (binary) {
+                    try w.u16be(@intCast(count));
+                    for (0..count) |field| {
+                        const cell = &row.cells[field];
+                        if (cell.* == .null_value) {
+                            try w.u32be(0xffffffff);
+                            continue;
+                        }
+                        const length = w.at;
+                        try w.u32be(0);
+                        const start = w.at;
+                        w.at += T.sendBinary(cell, self.result.column_types[field], session, w.bytes[w.at..]) catch return error.BufferTooSmall;
+                        write32(w.bytes[length..][0..4], @intCast(w.at - start));
+                    }
+                } else {
+                    var sink: pg_copy.Sink = .{ .bytes = w.bytes[w.at..] };
+                    for (0..count) |field| {
+                        if (field != 0) try sink.byte(options.delimiter);
+                        const cell = &row.cells[field];
+                        if (cell.* == .null_value) {
+                            try sink.append(options.null_string);
+                            continue;
+                        }
+                        const length = T.sendText(cell, session, &text) catch return error.BufferTooSmall;
+                        if (options.format == .csv) try pg_copy.appendCsv(&options, text[0..length], count == 1, &sink) else try pg_copy.appendText(&options, text[0..length], &sink);
+                    }
+                    try sink.byte('\n');
+                    w.at += sink.at;
+                }
+                w.end(p);
+            }
+            if (binary) {
+                const p = try w.begin('d');
+                try w.u16be(0xffff);
+                w.end(p);
+            }
+            try w.empty('c');
+            const c = try w.begin('C');
+            try w.append("COPY ");
+            try w.number(@intCast(self.result.row_count));
+            try w.byte(0);
+            w.end(c);
+        }
+
+        fn copyHandle(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
+            var w: Writer = .{ .bytes = output };
+            if (self.copy.mode == .in) {
+                // The parked row first, then rows the session still carries.
+                if (db.copyBlocked()) {
+                    db.copyResume() catch |err| {
+                        if (err == error.WouldBlock) return .{ .blocked = true };
+                        try self.copyError(db, &w, err);
+                        return .{ .written = w.at };
+                    };
+                }
+                if (self.copy.carry_rows) {
+                    const fed = self.copyRows(db, self.copy.carry[0..self.copy.carry_len]) catch |err| {
+                        try self.copyError(db, &w, err);
+                        return .{ .written = w.at };
+                    };
+                    self.shiftCarry(fed.used);
+                    if (fed.blocked) return .{ .blocked = true };
+                    self.copy.carry_rows = false;
+                }
+            }
+            if (self.copy.remaining != 0) return self.copyBody(db, input, 0, &w);
+            if (input.len < 5) return .{};
+            const tag = input[0];
+            const size = read32(input[1..5]);
+            if (size < 4) {
+                if (self.copy.mode == .in) db.copyFail();
+                self.copy.mode = .none;
+                try failure(&w, "08P01", "invalid packet length");
+                return .{ .consumed = input.len, .written = w.at, .close = true };
+            }
+            if (tag == 'd') {
+                self.copy.remaining = size - 4;
+                if (self.copy.remaining == 0) return .{ .consumed = 5 };
+                return self.copyBody(db, input, 5, &w);
+            }
+            if (size > max_packet) {
+                if (self.copy.mode == .in) db.copyFail();
+                self.copy.mode = .none;
+                try failure(&w, "08P01", "invalid packet length");
+                return .{ .consumed = input.len, .written = w.at, .close = true };
+            }
+            const total: usize = @as(usize, size) + 1;
+            if (input.len < total) return .{};
+            const discarding = self.copy.mode == .discard;
+            switch (tag) {
+                'c' => {
+                    if (discarding) {
+                        self.copy.mode = .none;
+                        return .{ .consumed = total };
+                    }
+                    self.copyFinish(db, &w) catch |err| {
+                        if (err == error.WouldBlock) return .{ .blocked = true };
+                        w.at = 0;
+                        try self.copyError(db, &w, err);
+                        self.copy.mode = .none;
+                    };
+                    self.copy.mode = .none;
+                    return .{ .consumed = total, .written = w.at };
+                },
+                'f' => {
+                    self.copy.mode = .none;
+                    if (discarding) return .{ .consumed = total };
+                    db.copyFail();
+                    try failure(&w, "57014", "COPY from stdin failed");
+                    try self.ready(db, &w);
+                    return .{ .consumed = total, .written = w.at };
+                },
+                // Flush and Sync are ignored in copy-in mode.
+                'H', 'S' => return .{ .consumed = total },
+                else => {
+                    if (discarding) {
+                        self.copy.mode = .none;
+                        return self.handle(db, input, output);
+                    }
+                    self.copy.mode = .none;
+                    db.copyFail();
+                    try failure(&w, "08P01", "unexpected message type during COPY from stdin");
+                    try self.ready(db, &w);
+                    return .{ .consumed = total, .written = w.at };
+                },
+            }
+        }
+
+        /// Consumes CopyData body bytes at input[offset..] (the header,
+        /// if any, is input[0..offset]).
+        fn copyBody(self: *Self, db: *DB, input: []const u8, offset: usize, w: *Writer) error{BufferTooSmall}!Reply {
+            const n = @min(self.copy.remaining, input.len - offset);
+            if (n == 0) return .{ .consumed = offset };
+            if (self.copy.mode == .discard) {
+                self.copy.remaining -= n;
+                return .{ .consumed = offset + n };
+            }
+            const fed = self.copyFeed(db, input[offset..][0..n]) catch |err| {
+                self.copy.remaining -= n;
+                try self.copyError(db, w, err);
+                return .{ .consumed = offset + n, .written = w.at };
+            };
+            self.copy.remaining -= fed.used;
+            return .{ .consumed = offset + fed.used, .blocked = fed.blocked };
+        }
+
+        /// A terminal COPY error: roll back, report, then discard the rest
+        /// of the copy stream.
+        fn copyError(self: *Self, db: *DB, w: *Writer, err: anyerror) error{BufferTooSmall}!void {
+            db.copyFail();
+            try failure(w, sqlstate(err), @errorName(err));
+            try self.ready(db, w);
+            self.copy.mode = .discard;
+            self.copy.carry_len = 0;
+            self.copy.carry_rows = false;
+        }
+
+        fn shiftCarry(self: *Self, used: usize) void {
+            const rest = self.copy.carry_len - used;
+            for (0..rest) |index| self.copy.carry[index] = self.copy.carry[used + index];
+            self.copy.carry_len = rest;
+        }
+
+        fn copyFeed(self: *Self, db: *DB, chunk: []const u8) !Fed {
+            var rest = chunk;
+            var used: usize = 0;
+            while (rest.len != 0) {
+                if (self.copy.ended) {
+                    used += rest.len;
+                    break;
+                }
+                if (self.copy.carry_len == 0) {
+                    const fed = try self.copyRows(db, rest);
+                    used += fed.used;
+                    rest = rest[fed.used..];
+                    if (fed.blocked) return .{ .used = used, .blocked = true };
+                    if (rest.len == 0 or self.copy.ended) continue;
+                    if (rest.len > self.copy.carry.len) return error.TextCapacity;
+                    @memcpy(self.copy.carry[0..rest.len], rest);
+                    self.copy.carry_len = rest.len;
+                    used += rest.len;
+                    break;
+                }
+                const n = @min(rest.len, self.copy.carry.len - self.copy.carry_len);
+                @memcpy(self.copy.carry[self.copy.carry_len..][0..n], rest[0..n]);
+                self.copy.carry_len += n;
+                used += n;
+                rest = rest[n..];
+                const fed = try self.copyRows(db, self.copy.carry[0..self.copy.carry_len]);
+                self.shiftCarry(fed.used);
+                if (fed.blocked) {
+                    self.copy.carry_rows = self.copy.carry_len != 0;
+                    return .{ .used = used, .blocked = true };
+                }
+                if (fed.used == 0 and self.copy.carry_len == self.copy.carry.len) return error.TextCapacity;
+            }
+            return .{ .used = used };
+        }
+
+        fn rowLength(self: *const Self, bytes: []const u8) !?usize {
+            const options = self.copyOptions();
+            if (options.format == .binary) {
+                if (self.copy.binary_header) return pg_copy.binaryHeader(bytes);
+                return pg_copy.tupleEnd(bytes, self.copy.info.count);
+            }
+            return pg_copy.lineEnd(&options, bytes);
+        }
+
+        /// Complete rows at the start of `bytes`; stops at an incomplete
+        /// one, the end marker or a parked row (included in `used`).
+        fn copyRows(self: *Self, db: *DB, bytes: []const u8) !Fed {
+            var at: usize = 0;
+            while (at < bytes.len and !self.copy.ended) {
+                const length = (try self.rowLength(bytes[at..])) orelse break;
+                if (length > line_bytes) return error.TextCapacity;
+                const blocked = try self.copyLine(db, bytes[at..][0..length], true);
+                at += length;
+                if (blocked) return .{ .used = at, .blocked = true };
+            }
+            return .{ .used = at };
+        }
+
+        /// One row (or the binary header / a header line). Returns true when
+        /// the row is parked on a key wait.
+        fn copyLine(self: *Self, db: *DB, row: []const u8, terminated: bool) !bool {
+            const options = self.copyOptions();
+            const info = &self.copy.info;
+            var fields: [field_capacity]?[]const u8 = undefined;
+            if (options.format == .binary) {
+                if (self.copy.binary_header) {
+                    self.copy.binary_header = false;
+                    return false;
+                }
+                if (row.len == 2 and row[0] == 0xff and row[1] == 0xff) {
+                    self.copy.ended = true;
+                    return false;
+                }
+                const count = pg_copy.tupleFields(row, &fields);
+                var used: usize = 0;
+                for (fields[0..count], 0..) |*field, index| if (field.*) |bytes| {
+                    const out = self.copy.scratch[used..];
+                    const text = T.receiveText(bytes, info.types[index], out) catch |err| return if (err == error.BufferTooSmall) error.TextCapacity else error.InvalidBinaryRepresentation;
+                    if (text.len != 0 and @intFromPtr(text.ptr) == @intFromPtr(out.ptr)) used += text.len;
+                    field.* = text;
+                };
+                return self.copyInsert(db, fields[0..count]);
+            }
+            const line = try pg_copy.stripLine(row, &self.copy.eol, terminated);
+            if (options.format == .text and equal(line, "\\.")) {
+                self.copy.ended = true;
+                return false;
+            }
+            // HEADER skips the first line; HEADER MATCH checks its names.
+            if (self.copy.header_pending and info.options.header == .on) {
+                self.copy.header_pending = false;
+                return false;
+            }
+            const capacity = @max(info.count, 1);
+            const count = if (options.format == .csv)
+                try pg_copy.csvFields(&options, line, &self.copy.scratch, fields[0..capacity])
+            else
+                try pg_copy.textFields(&options, line, &self.copy.scratch, fields[0..capacity]);
+            if (count != info.count) return error.BadCopyFormat;
+            if (self.copy.header_pending) {
+                self.copy.header_pending = false;
+                for (fields[0..count], 0..) |field, index| {
+                    const value = field orelse return error.BadCopyFormat;
+                    if (!equal(value, info.names[index].slice())) return error.BadCopyFormat;
+                }
+                return false;
+            }
+            return self.copyInsert(db, fields[0..count]);
+        }
+
+        fn copyInsert(self: *Self, db: *DB, fields: []const ?[]const u8) !bool {
+            db.copyRow(self.copy.sql[0..self.copy.sql_len], fields) catch |err| {
+                if (err == error.WouldBlock) return true;
+                return err;
+            };
+            return false;
+        }
+
+        /// CopyDone: the final unterminated row, then COPY n and ReadyForQuery.
+        fn copyFinish(self: *Self, db: *DB, w: *Writer) !void {
+            if (!self.copy.ended and self.copy.carry_len != 0) {
+                const options = self.copyOptions();
+                const length = self.copy.carry_len;
+                // Owned by this call either way (a parked row is the store's).
+                self.copy.carry_len = 0;
+                self.copy.carry_rows = false;
+                // A partial binary tuple; an open CSV quote fails in csvFields.
+                if (options.format == .binary) return error.BadCopyFormat;
+                if (try self.copyLine(db, self.copy.carry[0..length], false)) return error.WouldBlock;
+            }
+            if (self.copy.binary_header) return error.BadCopyFormat;
+            const copied = try db.copyEnd();
+            const c = try w.begin('C');
+            try w.append("COPY ");
+            try w.number(@intCast(copied));
+            try w.byte(0);
+            w.end(c);
+            try self.ready(db, w);
+        }
+
+
         fn describeOnly(self: *Self, db: *DB, source: []const u8) !void {
             self.result.column_count = 0;
             self.result.row_count = 0;
@@ -938,6 +1365,8 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "WrongObjectType")) return "42809";
     if (equal(name, "DependentObjects")) return "2BP01";
     if (equal(name, "UndefinedObject")) return "42704";
+    if (equal(name, "BadCopyFormat")) return "22P04";
+    if (equal(name, "InvalidBinaryRepresentation")) return "22P03";
     if (equal(name, "NumericValueOutOfRange")) return "22003";
     if (equal(name, "NumericCapacity")) return "54000";
     if (equal(name, "InvalidParameterValue")) return "22023";

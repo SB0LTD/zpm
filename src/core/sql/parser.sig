@@ -188,6 +188,10 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.isWord("SELECT") or (self.mode == .standard and self.isWord("WITH"))) return self.topQuery();
             if (try self.takeWord("UPDATE")) return .{ .update = try self.update() };
             if (try self.takeWord("DELETE")) return .{ .delete = try self.delete() };
+            if (self.mode == .standard and self.rawWord("copy")) {
+                try self.advance();
+                return .{ .copy = try self.copyStatement() };
+            }
             if (self.mode == .legacy_alpha) {
                 if (try self.takeWord("BEGIN")) return self.legacyControl(.{ .begin = .default });
                 if (try self.takeWord("COMMIT")) return self.legacyControl(.commit);
@@ -195,6 +199,202 @@ pub fn Parser(comptime config: types.Config) type {
                 return error.UnsupportedStatement;
             }
             return .{ .control = try self.controlStatement() };
+        }
+
+        /// The current token is the unquoted word `wanted` (any keyword
+        /// class; COPY's words are not keywords of the tokenizer).
+        fn rawWord(self: *const Self, comptime wanted: []const u8) bool {
+            return wordIs(self.source, self.current, wanted);
+        }
+
+        fn takeRaw(self: *Self, comptime wanted: []const u8) Error!bool {
+            if (!self.rawWord(wanted)) return false;
+            try self.advance();
+            return true;
+        }
+
+        /// COPY [BINARY] t [(columns)] FROM STDIN | COPY {t [(columns)] |
+        /// (query)} TO STDOUT, then [WITH] (option [arg], ...) or the
+        /// pre-9.0 option list (BINARY, DELIMITER [AS] 'c', NULL [AS] 's',
+        /// CSV, HEADER, QUOTE [AS] 'q', ESCAPE [AS] 'e'). Files, PROGRAM,
+        /// WHERE and FORCE_* options are outside the subset (0A000).
+        fn copyStatement(self: *Self) Error!Ast.Copy {
+            var out: Ast.Copy = .{};
+            if (self.rawWord("binary")) {
+                const next = try self.peek();
+                if (next.kind == .word or next.kind == .quoted_word) {
+                    try self.advance();
+                    out.options.format = .binary;
+                    out.options.format_set = true;
+                }
+            }
+            if (try self.takeSymbol(.lparen)) {
+                const start = self.tokenStart();
+                var depth: usize = 1;
+                while (true) {
+                    if (self.current.kind == .end) return error.Syntax;
+                    if (self.isSymbol(.lparen)) depth += 1;
+                    if (self.isSymbol(.rparen)) {
+                        depth -= 1;
+                        if (depth == 0) break;
+                    }
+                    try self.advance();
+                }
+                out.query = self.spanTo(start);
+                try self.advance();
+                if (out.query.?.len == 0) return error.Syntax;
+            } else {
+                const first = try self.identifier();
+                if (try self.takeSymbol(.dot)) {
+                    out.table = .{ .schema = first, .name = try self.identifier() };
+                } else out.table = .{ .name = first };
+                if (try self.takeSymbol(.lparen)) {
+                    out.explicit_columns = true;
+                    while (true) {
+                        if (out.column_count == config.columns) return error.ColumnCapacity;
+                        out.columns[out.column_count] = try self.identifier();
+                        out.column_count += 1;
+                        if (!try self.takeSymbol(.comma)) break;
+                    }
+                    try self.expectSymbol(.rparen);
+                }
+            }
+            if (try self.takeWord("FROM")) {
+                if (out.query != null) return error.Syntax;
+                out.direction = .from;
+                if (!try self.takeRaw("stdin")) return if (self.current.kind == .string or self.rawWord("program")) error.UnsupportedStatement else error.Syntax;
+            } else if (try self.takeRaw("to")) {
+                out.direction = .to;
+                if (!try self.takeRaw("stdout")) return if (self.current.kind == .string or self.rawWord("program")) error.UnsupportedStatement else error.Syntax;
+            } else return error.Syntax;
+            _ = try self.takeWord("WITH");
+            if (try self.takeSymbol(.lparen)) {
+                while (true) {
+                    try self.copyGenericOption(&out.options);
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                try self.expectSymbol(.rparen);
+            } else try self.copyLegacyOptions(&out.options);
+            if (self.isWord("WHERE")) return error.UnsupportedStatement;
+            try self.finish();
+            return out;
+        }
+
+        fn copyString(self: *Self, out: *ast.CopyText) Error!void {
+            if (out.set) return error.Syntax;
+            const token = self.current;
+            out.set = true;
+            switch (token.kind) {
+                .string => {
+                    out.len = token.len;
+                    if (token.len <= out.bytes.len) lexer.decodeQuoted(self.source, token.quoted(), out.bytes[0..token.len]);
+                },
+                .word, .integer, .decimal => {
+                    const raw = token.raw(self.source);
+                    out.len = raw.len;
+                    if (raw.len <= out.bytes.len) {
+                        for (raw, 0..) |byte, index| out.bytes[index] = if (token.kind == .word) types.lower(byte) else byte;
+                    }
+                },
+                else => return error.Syntax,
+            }
+            try self.advance();
+        }
+
+        /// One `name [argument]` item of the parenthesized option list.
+        fn copyGenericOption(self: *Self, options: *ast.CopyOptions) Error!void {
+            if (self.current.kind != .word) return error.Syntax;
+            const name = self.current.raw(self.source);
+            try self.advance();
+            const has_argument = !(self.isSymbol(.comma) or self.isSymbol(.rparen));
+            if (types.keyword(name, "format")) {
+                if (options.format_set or !has_argument) return error.Syntax;
+                var text: ast.CopyText = .{};
+                try self.copyString(&text);
+                const value = text.slice();
+                options.format_set = true;
+                options.format = if (types.keyword(value, "text")) .text else if (types.keyword(value, "csv")) .csv else if (types.keyword(value, "binary")) .binary else return error.InvalidParameterValue;
+            } else if (types.keyword(name, "delimiter")) {
+                if (!has_argument) return error.Syntax;
+                try self.copyString(&options.delimiter);
+            } else if (types.keyword(name, "null")) {
+                if (!has_argument) return error.Syntax;
+                try self.copyString(&options.null_string);
+            } else if (types.keyword(name, "quote")) {
+                if (!has_argument) return error.Syntax;
+                try self.copyString(&options.quote);
+            } else if (types.keyword(name, "escape")) {
+                if (!has_argument) return error.Syntax;
+                try self.copyString(&options.escape);
+            } else if (types.keyword(name, "header")) {
+                if (options.header_set) return error.Syntax;
+                options.header_set = true;
+                options.header = .on;
+                if (!has_argument) return;
+                var text: ast.CopyText = .{};
+                try self.copyString(&text);
+                const value = text.slice();
+                if (types.keyword(value, "match")) {
+                    options.header = .match;
+                } else options.header = if (copyBoolean(value)) |on| (if (on) .on else .off) else return error.InvalidParameterValue;
+            } else if (types.keyword(name, "freeze")) {
+                if (options.freeze_set) return error.Syntax;
+                options.freeze_set = true;
+                if (has_argument) {
+                    var text: ast.CopyText = .{};
+                    try self.copyString(&text);
+                    if (copyBoolean(text.slice()) == null) return error.InvalidParameterValue;
+                }
+            } else if (types.keyword(name, "encoding")) {
+                if (options.encoding_set or !has_argument) return error.Syntax;
+                options.encoding_set = true;
+                var text: ast.CopyText = .{};
+                try self.copyString(&text);
+                if (!(types.keyword(text.slice(), "utf8") or types.keyword(text.slice(), "utf-8"))) return error.UnsupportedStatement;
+            } else if (types.keyword(name, "force_quote") or types.keyword(name, "force_not_null") or types.keyword(name, "force_null") or
+                types.keyword(name, "default") or types.keyword(name, "on_error") or types.keyword(name, "log_verbosity") or types.keyword(name, "reject_limit"))
+            {
+                return error.UnsupportedStatement;
+            } else return error.Syntax;
+        }
+
+        /// parse_bool's spellings (and 0/1) for HEADER/FREEZE.
+        fn copyBoolean(value: []const u8) ?bool {
+            if (types.keyword(value, "true") or types.keyword(value, "on") or types.keyword(value, "1") or types.keyword(value, "t") or types.keyword(value, "yes")) return true;
+            if (types.keyword(value, "false") or types.keyword(value, "off") or types.keyword(value, "0") or types.keyword(value, "f") or types.keyword(value, "no")) return false;
+            return null;
+        }
+
+        fn copyLegacyOptions(self: *Self, options: *ast.CopyOptions) Error!void {
+            while (self.current.kind == .word) {
+                if (try self.takeRaw("binary")) {
+                    if (options.format_set) return error.Syntax;
+                    options.format = .binary;
+                    options.format_set = true;
+                } else if (try self.takeRaw("csv")) {
+                    if (options.format_set) return error.Syntax;
+                    options.format = .csv;
+                    options.format_set = true;
+                } else if (try self.takeRaw("header")) {
+                    if (options.header_set) return error.Syntax;
+                    options.header_set = true;
+                    options.header = .on;
+                } else if (try self.takeRaw("delimiter")) {
+                    _ = try self.takeWord("AS");
+                    try self.copyString(&options.delimiter);
+                } else if (try self.takeWord("NULL")) {
+                    _ = try self.takeWord("AS");
+                    try self.copyString(&options.null_string);
+                } else if (try self.takeRaw("quote")) {
+                    _ = try self.takeWord("AS");
+                    try self.copyString(&options.quote);
+                } else if (try self.takeRaw("escape")) {
+                    _ = try self.takeWord("AS");
+                    try self.copyString(&options.escape);
+                } else if (self.rawWord("force") or self.rawWord("freeze") or self.rawWord("encoding")) {
+                    return error.UnsupportedStatement;
+                } else return;
+            }
         }
 
         fn legacyControl(self: *Self, control: ast.Control) Error!Ast.Statement {

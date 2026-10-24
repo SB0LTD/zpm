@@ -155,6 +155,34 @@ sequences. currval/lastval state is per session (`SequenceSession`, set by
 the caller; Store.Connection owns one). The value hook
 (`value.Session.sequences`) also serves regclass lookups.
 
+### COPY (P03, design §4.7, §5.17)
+
+`COPY t [(columns)] FROM STDIN` and `COPY {t [(columns)] | (query)} TO
+STDOUT` parse into `Statement.copy` (options `FORMAT text|csv|binary`,
+`DELIMITER`, `NULL` (<= 64 bytes), `HEADER [boolean|match]`, `QUOTE`,
+`ESCAPE`, `FREEZE`, `ENCODING 'UTF8'`, and the pre-9.0 spelling). They never
+run through `statement()`: `Database.copyInfo` validates the options with
+PostgreSQL 16's ProcessCopyOptions SQLSTATEs and binds the target (COPY TO
+writes the equivalent SELECT for the caller to run, bounded by result rows).
+COPY FROM is `copyBegin` (a statement subtransaction left open on the stack,
+RowExclusive lock, the statement snapshot kept in `Tx.copy_*`), then per row
+`copyBuild` (input functions, then defaults/identity/generated columns via
+`dml.copiedRow`, validation as INSERT; re-binds the statement each call
+because the workspace is shared) and `copyInsert` (unique check, then the row
+version), then `copyEnd` (merge, outcome `COPY n`). A key held by a live
+inserter parks the COPY (WouldBlock, row kept by the caller, snapshot pinned)
+and the same row is re-checked on the next `copyInsert`. Any terminal error
+is handled like a statement error (abort / failScope / abortStatement roll
+the whole COPY back). Every row counts against `tx_writes` (53200) and the
+table's row capacity (`RowCapacity`, 54000). New errors: `BadCopyFormat`
+(22P04), `InvalidBinaryRepresentation` (22P03). `Config.copy_line_bytes`
+(8192) bounds the row a codec carries across CopyData messages.
+
+The wire side lives in `src/db`: `pg_copy.sig` (text/CSV/binary framing,
+field splitting and escaping), `pg_types.receiveText` (binary fields to input
+text) and the PostgreSQL session's copy-in mode (streamed CopyData bodies,
+CopyDone/CopyFail, discard after errors), over `Store.Connection.copy*`.
+
 ### System views (P01, design §4.10)
 
 `catalog.sig` defines the views (`pg_type`, `pg_namespace`, `pg_class`,

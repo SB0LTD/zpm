@@ -64,6 +64,9 @@ pub const Config = struct {
     subqueries: usize = 16,
     /// Common table expressions per statement (StatementTooComplex beyond).
     ctes: usize = 4,
+    /// COPY FROM: longest data row (text/CSV line or binary tuple) a codec
+    /// carries across CopyData messages; longer rows are TextCapacity (54000).
+    copy_line_bytes: usize = 8192,
 };
 
 pub fn workRows(comptime config: Config) usize {
@@ -190,6 +193,11 @@ pub const Error = error{
     DependentObjects,
     /// SQLSTATE 42704: a named constraint (ON CONFLICT ON CONSTRAINT) does not exist.
     UndefinedObject,
+    /// SQLSTATE 22P04: malformed COPY data (field count, quoting, header,
+    /// binary signature).
+    BadCopyFormat,
+    /// SQLSTATE 22P03: a binary COPY field has the wrong length or layout.
+    InvalidBinaryRepresentation,
 };
 
 /// Session dialect. It changes only assignment coercion (MySQL/TDS BIT
@@ -371,7 +379,7 @@ pub fn typeFromOid(oid: u32) ?DataType {
 pub const DefaultKind = enum(u8) { none = 0, default = 1, identity_always = 2, identity_by_default = 3, generated = 4 };
 
 /// Statement kind of a completed (or described) statement.
-pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence };
+pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy };
 
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;

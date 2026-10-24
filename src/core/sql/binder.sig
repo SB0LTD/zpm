@@ -2426,7 +2426,49 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .delete = .{ .table = index, .where = where, .key = primaryKey(context, &context.tables[index], where), .returning = returning } };
                 },
                 .control => |control| return .{ .control = control },
+                // COPY runs through Database.copyInfo/copyBegin, never as a statement.
+                .copy => return error.UnsupportedStatement,
             }
+        }
+
+        /// COPY's target: field p fills column mapping[p]; every other
+        /// column takes its default (identity, DEFAULT, NULL) and generated
+        /// columns are computed. COPY TO lists the columns it emits.
+        pub const Copy = struct {
+            table: usize,
+            mapping: [config.columns]u8 = undefined,
+            count: usize = 0,
+            defaults: [config.columns]u16 = @splat(none),
+            generated: [config.columns]u16 = @splat(none),
+        };
+
+        /// PostgreSQL CopyGetAttnums: without a column list every
+        /// non-generated column in order; listed generated columns are
+        /// 42P10, repeated ones 42701. Identity columns accept the supplied
+        /// value (COPY ignores GENERATED ALWAYS, as PostgreSQL does).
+        pub fn bindCopy(context: *const Context, copy: *const Ast.Copy, with_defaults: bool) Error!Copy {
+            const index = try resolveQualified(context, copy.table.schema, copy.table.name);
+            const entry = &context.tables[index];
+            var out: Copy = .{ .table = index };
+            if (copy.explicit_columns) {
+                var mapped: [config.columns]bool = @splat(false);
+                for (copy.columns[0..copy.column_count]) |ident| {
+                    const column = try columnIndex(context, entry, ident);
+                    if (mapped[column]) return error.DuplicateColumn;
+                    if (entry.columns[column].default_kind == .generated) return error.InvalidColumnReference;
+                    mapped[column] = true;
+                    out.mapping[out.count] = @intCast(column);
+                    out.count += 1;
+                }
+            } else {
+                for (entry.columns[0..entry.column_count], 0..) |*column, position| {
+                    if (column.default_kind == .generated) continue;
+                    out.mapping[out.count] = @intCast(position);
+                    out.count += 1;
+                }
+            }
+            if (with_defaults) try bindDefaults(context, index, entry, &out.defaults, &out.generated);
+            return out;
         }
     };
 }

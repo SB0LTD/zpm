@@ -345,6 +345,18 @@ pub fn Ast(comptime config: types.Config) type {
             returning: Returning = .{},
         };
 
+        /// COPY t [(columns)] FROM STDIN | COPY t [(columns)] | (query) TO
+        /// STDOUT, with options. `query` is the raw text of `(query)`.
+        pub const Copy = struct {
+            table: TableRef = .{},
+            explicit_columns: bool = false,
+            columns: [config.columns]Ident = undefined,
+            column_count: usize = 0,
+            query: ?Span = null,
+            direction: CopyDirection = .from,
+            options: CopyOptions = .{},
+        };
+
         pub const Statement = union(enum) {
             create_table: CreateTable,
             drop_table: Ident,
@@ -358,9 +370,41 @@ pub fn Ast(comptime config: types.Config) type {
             update: Update,
             delete: Delete,
             control: Control,
+            copy: Copy,
         };
     };
 }
+
+pub const CopyDirection = enum { from, to };
+pub const CopyFormat = enum { text, csv, binary };
+pub const CopyHeader = enum { off, on, match };
+
+/// A decoded COPY option string (DELIMITER, NULL, QUOTE, ESCAPE). `len` is
+/// the decoded length even when it exceeds `bytes` (validation rejects it).
+pub const CopyText = struct {
+    set: bool = false,
+    bytes: [64]u8 = @splat(0),
+    len: usize = 0,
+
+    pub fn slice(self: *const CopyText) []const u8 {
+        return self.bytes[0..@min(self.len, self.bytes.len)];
+    }
+};
+
+/// COPY options as written; Database.copyInfo validates them and fills the
+/// PostgreSQL defaults (text: tab and \N; csv: comma, empty NULL, `"`).
+pub const CopyOptions = struct {
+    format: CopyFormat = .text,
+    format_set: bool = false,
+    delimiter: CopyText = .{},
+    null_string: CopyText = .{},
+    quote: CopyText = .{},
+    escape: CopyText = .{},
+    header: CopyHeader = .off,
+    header_set: bool = false,
+    freeze_set: bool = false,
+    encoding_set: bool = false,
+};
 
 pub const Overriding = enum { none, system, user };
 

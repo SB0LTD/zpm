@@ -74,6 +74,12 @@ pub fn Mvcc(comptime config: types.Config) type {
             /// resumed statement continues after them.
             progress: usize = 0,
             progress_affected: usize = 0,
+            /// The open COPY FROM statement (its statement subtransaction
+            /// stays on the stack between data messages): target table,
+            /// statement snapshot and rows inserted so far.
+            copy_table: ?u8 = null,
+            copy_snap: storage.Snapshot = .{ .csn = 0 },
+            copy_rows: usize = 0,
 
             pub fn ref(self: *const Tx, slot: usize) storage.TxRef {
                 return .{ .slot = @intCast(slot), .epoch = self.epoch, .sub = @intCast(self.sub_len) };

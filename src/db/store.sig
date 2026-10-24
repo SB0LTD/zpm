@@ -396,6 +396,11 @@ pub fn Store(comptime Raw: type) type {
             /// Transactions waited for; a different set is a new lock wait
             /// with its own deadlock check and lock_timeout, as in PostgreSQL.
             waits: Raw.LockSet = .{},
+            /// A COPY FROM row is parked on a key wait: the built row is
+            /// Connection.copy_row (inflight); copyResume re-checks it.
+            copy: bool = false,
+            /// Rows the parked COPY had inserted before the blocked one.
+            rows_done: usize = 0,
         };
 
         const SavedSettings = struct { current: Settings, base: Settings };
@@ -434,6 +439,14 @@ pub fn Store(comptime Raw: type) type {
             /// Startup `database` (current_database(); information_schema catalogs).
             database_name: [64]u8 = @splat(0),
             database_len: u8 = 0,
+            /// The open COPY FROM runs in an implicit transaction.
+            copy_implicit: bool = false,
+            copy_rows: usize = 0,
+            /// The COPY FROM row being inserted (kept while it is parked).
+            copy_row: Raw.Row = .{},
+
+            pub const CopyInfo = Raw.CopyInfo;
+            pub const copy_line_bytes = Raw.copy_line_bytes;
 
             pub fn reportedParameters() []const []const u8 {
                 return &reported_parameters;
@@ -1026,6 +1039,148 @@ pub fn Store(comptime Raw: type) type {
                     return error.QueryCanceled;
                 }
                 return self.run(source, result, slot, implicit, true);
+            }
+
+            // ---- COPY (design §4.7, §5.17) ----------------------------------
+
+            /// Parses and validates a COPY statement and binds its target
+            /// (never executes). COPY TO writes its SELECT into `select`.
+            pub fn copyDescribe(self: *Connection, source: []const u8, select: []u8) !Raw.CopyInfo {
+                if (self.id == 0) return error.InvalidConnection;
+                if (self.failed) return error.TransactionFailed;
+                if (self.pending.active and self.pending.copy) return error.QueryCanceled;
+                return self.db().copyInfo(self.tx, source, select);
+            }
+
+            /// Opens COPY FROM STDIN as one statement of the open block (or
+            /// an implicit transaction). Its rows stay in the statement
+            /// subtransaction until copyEnd; copyFail, an error or a
+            /// disconnect rolls the whole COPY back. A table-lock wait
+            /// parks it (WouldBlock): re-deliver the same statement.
+            pub fn copyBegin(self: *Connection, source: []const u8) !Raw.CopyInfo {
+                if (self.id == 0) return error.InvalidConnection;
+                if (self.pending.active) {
+                    const slot = self.tx.?;
+                    const implicit = self.pending.implicit;
+                    if (self.pending.copy or fingerprint(source) != self.pending.fingerprint or self.cancel_requested) {
+                        self.db().abortStatement(slot);
+                        self.terminal(implicit);
+                        return error.QueryCanceled;
+                    }
+                    const info = self.db().copyBegin(slot, source, true) catch |err| {
+                        if (err == error.WouldBlock) {
+                            try self.stillBlocked(slot, implicit);
+                            unreachable;
+                        }
+                        self.terminal(implicit);
+                        return err;
+                    };
+                    self.pending = .{};
+                    self.cancel_requested = false;
+                    self.copy_implicit = implicit;
+                    self.copy_rows = 0;
+                    return info;
+                }
+                if (self.failed) return error.TransactionFailed;
+                if (!self.autocommit and !self.in_transaction) try self.beginTransaction();
+                self.statement_us = self.store.wallNow();
+                const implicit = !self.in_transaction;
+                const slot = if (self.tx) |slot| slot else blk: {
+                    const slot = try self.db().begin();
+                    self.tx = slot;
+                    break :blk slot;
+                };
+                self.store.storageReady() catch |err| {
+                    self.terminal(implicit);
+                    return err;
+                };
+                const info = self.db().copyBegin(slot, source, false) catch |err| {
+                    if (err == error.WouldBlock) {
+                        self.park(source, implicit);
+                        return err;
+                    }
+                    self.terminal(implicit);
+                    return err;
+                };
+                self.copy_implicit = implicit;
+                self.copy_rows = 0;
+                return info;
+            }
+
+            /// One data row (fields in COPY column order, null = NULL).
+            /// WouldBlock: the row is parked on a key wait and owned by the
+            /// store; call copyResume when wakeReady() reports progress.
+            /// Any other error has rolled the COPY back.
+            pub fn copyRow(self: *Connection, source: []const u8, fields: []const ?[]const u8) !void {
+                const slot = self.tx orelse return error.NoActiveTransaction;
+                if (self.pending.active) return error.QueryCanceled;
+                self.db().copyBuild(slot, source, fields, &self.copy_row) catch |err| {
+                    self.terminal(self.copy_implicit);
+                    return err;
+                };
+                return self.insertCopyRow(slot);
+            }
+
+            fn insertCopyRow(self: *Connection, slot: u16) !void {
+                self.db().copyInsert(slot, &self.copy_row) catch |err| {
+                    if (err == error.WouldBlock) {
+                        self.park("", self.copy_implicit);
+                        self.pending.copy = true;
+                        self.pending.rows_done = self.copy_rows;
+                        return err;
+                    }
+                    self.terminal(self.copy_implicit);
+                    return err;
+                };
+                self.copy_rows += 1;
+            }
+
+            /// A COPY row is parked on a key wait.
+            pub fn copyBlocked(self: *const Connection) bool {
+                return self.pending.active and self.pending.copy;
+            }
+
+            /// Re-checks the parked COPY row: inserted (pending cleared),
+            /// still waiting (WouldBlock, timers applied) or a terminal
+            /// error (23505 after the other inserter committed, 55P03,
+            /// 57014, 40P01) with the COPY rolled back.
+            pub fn copyResume(self: *Connection) !void {
+                if (!self.copyBlocked()) return;
+                const slot = self.tx.?;
+                const implicit = self.pending.implicit;
+                if (self.cancel_requested) {
+                    self.db().abortStatement(slot);
+                    self.terminal(implicit);
+                    return error.QueryCanceled;
+                }
+                self.db().copyInsert(slot, &self.copy_row) catch |err| {
+                    if (err == error.WouldBlock) return self.stillBlocked(slot, implicit);
+                    self.terminal(implicit);
+                    return err;
+                };
+                self.pending = .{};
+                self.cancel_requested = false;
+                self.copy_rows += 1;
+            }
+
+            /// Completes COPY FROM (CopyDone): commits an implicit
+            /// transaction (53200 / storage errors abort it). Returns rows.
+            pub fn copyEnd(self: *Connection) !usize {
+                const slot = self.tx orelse return error.NoActiveTransaction;
+                if (self.pending.active) return error.QueryCanceled;
+                const rows = try self.db().copyEnd(slot);
+                if (self.copy_implicit) {
+                    self.tx = null;
+                    try self.store.commit(slot);
+                }
+                return rows;
+            }
+
+            /// CopyFail, malformed data or a protocol error: rolls the COPY
+            /// back (and the implicit transaction, or fails the block).
+            pub fn copyFail(self: *Connection) void {
+                if (self.id == 0) return;
+                self.terminal(self.copy_implicit);
             }
 
             pub fn execute(self: *Connection, source: []const u8, result: *Result) !void {

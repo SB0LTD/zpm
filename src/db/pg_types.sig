@@ -156,6 +156,42 @@ pub fn Types(comptime Result: type) type {
             return at;
         }
 
+        /// A binary COPY field as the text its input function accepts
+        /// (PostgreSQL *recv lengths are exact: anything else is
+        /// ProtocolViolation, which COPY reports as 22P03). Text-like values
+        /// are returned in place; others are rendered into `out`.
+        pub fn receiveText(bytes: []const u8, data_type: DataType, out: []u8) Error![]const u8 {
+            switch (data_type) {
+                .text, .name, .json => return bytes,
+                .jsonb => {
+                    if (bytes.len == 0 or bytes[0] != 1) return error.ProtocolViolation;
+                    return bytes[1..];
+                },
+                .boolean => {
+                    if (bytes.len != 1) return error.ProtocolViolation;
+                    return if (bytes[0] != 0) "t" else "f";
+                },
+                else => {},
+            }
+            const cell: Cell = switch (data_type) {
+                .integer32 => blk: {
+                    if (bytes.len != 4) return error.ProtocolViolation;
+                    break :blk .{ .integer = getInt(i32, bytes) };
+                },
+                .integer => blk: {
+                    if (bytes.len != 8) return error.ProtocolViolation;
+                    break :blk .{ .integer = getInt(i64, bytes) };
+                },
+                else => try decodeBinary(bytes, data_type),
+            };
+            var text: [Io.format_bytes]u8 = undefined;
+            const utc: Session = .{};
+            const rendered = Io.format(&cell, true, &utc, &text) catch return error.ProtocolViolation;
+            if (rendered.len > out.len) return error.BufferTooSmall;
+            @memcpy(out[0..rendered.len], rendered);
+            return out[0..rendered.len];
+        }
+
         fn decodeBinary(bytes: []const u8, data_type: DataType) Error!Cell {
             const need: usize = switch (data_type) {
                 .smallint => 2,

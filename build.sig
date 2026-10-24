@@ -119,7 +119,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_db = try ctx.addStep("test-db", "Execute database wire, transaction and TCP contracts", &noopStep);
     try ctx.addDependency(test_all, test_db);
     _ = try ctx.addModule("wall_clock", "src/platform/wall_clock.sig");
-    inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy", "db_stream", "pg_stream", "wall_clock" }) |name| {
+    inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy", "db_stream", "pg_stream", "wall_clock", "pg_copy" }) |name| {
         _ = try addContract(ctx, test_db, "contract-" ++ name, "tests/test_" ++ name ++ ".sig", &.{
             importEntry("sql", "src/core/sql.sig"),                   importEntry("db_store", "src/db/store.sig"),
             importEntry("scram", "src/db/scram.sig"),                 importEntry("durable_log", "src/db/durable_log.sig"),
