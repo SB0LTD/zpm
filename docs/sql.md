@@ -361,7 +361,8 @@ assignments and comparisons) and accepts only the frozen alpha grammar.
 
 Keywords and unquoted ASCII identifiers are case insensitive; double-quoted
 identifiers keep their case. Strings use apostrophes, escaped by doubling them;
-integer literals are signed 64-bit. Optional final semicolon, whitespace, `--`
+integer literals beyond the u64 range are decimal (NUMERIC) tokens. Optional
+final semicolon, whitespace, `--`
 and nested `/* */` comments are accepted. Identifiers and text have explicit
 byte capacities (text results of `||` included). SQL text is never executed as
 a batch, and unsupported trailing clauses are rejected before mutation.
@@ -380,8 +381,8 @@ Errors include `Syntax`, `UnsupportedStatement`, `TableCapacity`,
 `ClockUnavailable`, `WorkspaceCapacity`, `GroupingError`, `AmbiguousColumn`,
 `CardinalityViolation`, `InvalidRowCountInLimit`,
 `InvalidRowCountInResultOffset`, `GeneratedAlways`, `SequenceLimit`,
-`SequenceNotReady`, `WrongObjectType`, `DependentObjects`, `UndefinedObject`
-and the
+`SequenceNotReady`, `WrongObjectType`, `DependentObjects`, `UndefinedObject`,
+`BadCopyFormat`, `InvalidBinaryRepresentation` and the
 transaction errors `WouldBlock` (never sent to clients), `SerializationFailure`,
 `DeadlockDetected`, `LockNotAvailable`, `QueryCanceled`, `TransactionCapacity`,
 `WriteSetCapacity`, `LockCapacity`, `CatalogCapacity`, `SavepointCapacity`,
@@ -397,9 +398,14 @@ reported even when a SELECT returns zero rows.
 
 Window functions, LATERAL and NATURAL joins, data-modifying CTEs, secondary
 indexes, arrays, zone abbreviations, non-ISO
-DateStyle and other IntervalStyles, functions beyond those listed above, and
-complete SQL-standard or PostgreSQL conformance remain unimplemented. The reusable shared transaction adapter and wire sessions are
-documented in [database-server.md](database-server.md).
+DateStyle and other IntervalStyles, REPEATABLE READ/SERIALIZABLE, SERIAL,
+sequence CACHE > 1, FOR UPDATE/SHARE over joins, ON CONFLICT arbiters other
+than the primary key, COPY files/PROGRAM/WHERE/FORCE_*/ON_ERROR, functions
+beyond those listed above, and complete SQL-standard or PostgreSQL conformance
+remain unimplemented. Every bound above is a comptime `Config` capacity: a
+statement or transaction that exceeds one fails with the listed capacity error
+where PostgreSQL would succeed. The reusable shared transaction adapter and
+wire sessions are documented in [database-server.md](database-server.md).
 ## Validation
 
 Run `sig build test-sql --summary all` with Sig 0.6.3. The target compiles and

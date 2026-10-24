@@ -46,6 +46,12 @@ TimeZone through the caller's `zone_provider` (TZif bytes it owns), built-in
 UTC or POSIX TZ strings, and supplies statement/transaction timestamps from
 `wall_clock`. MySQL and TDS sessions return the step 3.2 types as text columns
 (`Result.textify`).
+COPY FROM STDIN / TO STDOUT (text, csv, binary) runs over the simple query
+protocol only (extended-protocol COPY is 0A000): `pg_copy.sig` frames rows,
+CopyData bodies are streamed (not bounded by the packet limit), a row is at
+most `copy_line_bytes`, and a row whose key is held by a live inserter parks
+the COPY like a blocked statement (`Reply.blocked` with the bytes consumed
+through that row). Errors discard the remaining CopyData as PostgreSQL does.
 MySQL supports protocol 10, COM_QUERY, PING, INIT_DB and text results; COM_STMT
 binary preparation is not implemented. TDS 7.2–7.4 supports PRELOGIN/LOGIN7,
 SQL_BATCH, typed nullable values, packet fragmentation, transaction-manager
@@ -91,8 +97,10 @@ provides complete append/fsync/truncate, and poisons failed writers. Atomic file
 publication helpers are for caller-validated backups/snapshots; never replace
 an active WAL inode or truncate it without a persisted sequence anchor.
 
-Runtime wiring and storage lifecycle remain product policy in RAMSQL. WAL v1
-replays SQL, so upgrades must preserve parser/type semantics or migrate formats.
+Runtime wiring and storage lifecycle remain product policy in RAMSQL. New
+records are kind-3 typed change records (`sql.change_records`); legacy kind 1/2
+SQL-text records replay only through the frozen alpha grammar, so upgrades must
+preserve both interpretations or migrate formats.
 Capacity must cover every historical state, including rows later deleted.
 
 ## TCP API
