@@ -6,9 +6,15 @@
 //! from interleaving transactions, never from threads.
 //!
 //! Supported: CREATE/DROP TABLE; single-row INSERT [column list] VALUES
-//! (expressions); SELECT expressions [FROM one table [alias]] [WHERE]
-//! [ORDER BY expressions/positions/output names] [LIMIT] [FOR UPDATE|SHARE
-//! [NOWAIT|SKIP LOCKED]]; UPDATE with expression SET; DELETE. Types are
+//! (expressions); SELECT [DISTINCT [ON (...)]] expressions [FROM tables,
+//! derived tables and CTEs joined INNER/LEFT/RIGHT/FULL/CROSS ON|USING]
+//! [WHERE] [GROUP BY] [HAVING] with aggregates (COUNT/SUM/AVG/MIN/MAX/
+//! BOOL_AND/BOOL_OR, DISTINCT, FILTER), scalar/IN/EXISTS subqueries, WITH
+//! [RECURSIVE], UNION/INTERSECT/EXCEPT [ALL], [ORDER BY expressions/positions/
+//! output names] [LIMIT|OFFSET|FETCH FIRST] [FOR UPDATE|SHARE [NOWAIT|SKIP
+//! LOCKED]] (single table only); UPDATE with expression SET; DELETE. General
+//! queries run in the bounded statement workspace (Config.work_rows;
+//! WorkspaceCapacity, 54000, when exhausted). Types are
 //! SMALLINT, INTEGER (int4), BIGINT (int8), NUMERIC[(p,s)] (at most
 //! Config.numeric_digits significant digits), REAL, DOUBLE PRECISION,
 //! BOOLEAN, TEXT, NAME, OID, DATE, TIMESTAMP[(p)], TIMESTAMPTZ[(p)], INTERVAL,
@@ -24,7 +30,7 @@
 //! typed with PostgreSQL's implicit-cast rules. Constraints are NOT NULL and
 //! a single-column PRIMARY KEY. Unquoted identifiers are ASCII and case
 //! insensitive; quoted identifiers keep case; text comparison is bytewise.
-//! Joins, aggregates, other functions, arrays and secondary indices are
+//! Window functions, other functions, arrays and secondary indices are
 //! outside this SQL subset; this is not full SQL-standard or PostgreSQL
 //! compatibility.
 //!
@@ -51,9 +57,11 @@
 //!
 //! Pipeline (sql/*.sig, relative imports only; nothing outside this module
 //! imports them): lexer -> parser (statement-scoped node pool, bounded depth)
-//! -> binder (names under the statement snapshot, types; never executes;
-//! powers describe()) -> expr (evaluation) -> exec (scans, filters,
-//! projections, ORDER BY, LockRows) / dml (row construction, assignment
+//! -> binder (names under the statement snapshot, types, query plans; never
+//! executes; powers describe()) -> expr (evaluation) -> exec (scans, filters,
+//! projections, ORDER BY, LockRows; joins, grouping, DISTINCT, subqueries,
+//! CTEs and set operations over the workspace; sort.sig merge sort) / dml
+//! (row construction, assignment
 //! casts, unique checks) over versioned storage (stable rowids, row versions,
 //! PK multi-index, horizon-bounded reclamation), mvcc (transaction table,
 //! write sets, subtransactions), locks (row/table locks, wait-for sets,
@@ -83,6 +91,7 @@ const numeric_module = @import("sql/numeric.sig");
 const temporal_module = @import("sql/temporal.sig");
 const tzif_module = @import("sql/tzif.sig");
 const float_module = @import("sql/float_text.sig");
+const sort_module = @import("sql/sort.sig");
 
 pub const Config = types.Config;
 /// Per-statement session values (TimeZone, zone resolver, clocks).
@@ -100,6 +109,9 @@ pub const temporal = temporal_module;
 pub const tzif = tzif_module;
 /// REAL/DOUBLE text I/O.
 pub const float_text = float_module;
+/// The executor's stable merge sort over caller-owned index arrays
+/// (returns the number of comparisons; contract tests count them).
+pub const mergeSort = sort_module.mergeSort;
 pub const Error = types.Error;
 pub const Dialect = types.Dialect;
 pub const DataType = types.DataType;
@@ -220,7 +232,7 @@ pub fn Database(comptime config: Config) type {
             column_types: [config.columns]DataType = @splat(.integer),
             /// PostgreSQL atttypmod of each column (-1 when none).
             column_typmods: [config.columns]i32 = @splat(-1),
-            rows: [config.rows_per_table]Row = @splat(.{}),
+            rows: [types.resultRows(config)]Row = @splat(.{}),
 
             pub const default_session: *const value_module.Session = &value_module.default_session;
 
@@ -276,7 +288,11 @@ pub fn Database(comptime config: Config) type {
         /// Statement-scoped scratch inside caller-owned database storage.
         pub const Workspace = struct {
             nodes: A.Pool = .{},
+            plans: B.Plans = .{},
+            query: X.Work = .{},
         };
+        /// Query workspace capacity: rows (each up to 2 x columns cells).
+        pub const work_rows = X.work_rows;
 
         tables: [config.tables]S.Table = @splat(.{}),
         catalog: K = .{},
@@ -688,7 +704,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn bindContext(self: *Self, source: []const u8, mode: ParseMode, snap: Snapshot) B.Context {
-            return .{ .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session };
+            return .{ .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans };
         }
 
         fn evalContext(self: *const Self, source: []const u8) E.Context {
@@ -708,6 +724,14 @@ pub fn Database(comptime config: Config) type {
                     const locker: RowLocker = .{ .db = self, .slot = slot, .snap = snap, .mode = if (select.lock.strength == .update) .update else .share, .wait = select.lock.wait };
                     return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, locker, &self.session);
                 },
+                .query => |root| {
+                    self.outcome = .{ .affected = 0, .command = .select };
+                    const plans = &self.workspace.plans;
+                    for (plans.items[0..plans.len]) |*plan| {
+                        for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| try self.lockTable(slot, table, .access_share);
+                    }
+                    return X.runQuery(&self.tables, source, &self.workspace.nodes, plans, root, snap, result, &self.session, &self.workspace.query);
+                },
                 else => {},
             }
             const affected: usize = switch (bound) {
@@ -725,7 +749,7 @@ pub fn Database(comptime config: Config) type {
                     try self.lockTable(slot, delete.table, .row_exclusive);
                     break :blk try self.deleteRows(slot, source, delete, snap);
                 },
-                .select, .control => unreachable,
+                .select, .query, .control => unreachable,
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound) };
         }
@@ -1167,6 +1191,15 @@ pub fn Database(comptime config: Config) type {
                 for (0..bound.select.count) |index| {
                     result.column_names[index] = bound.select.names[index];
                     result.column_types[index] = bound.select.types[index];
+                }
+            }
+            if (bound == .query) {
+                const plan = &self.workspace.plans.items[bound.query];
+                result.column_count = plan.count;
+                for (0..plan.count) |index| {
+                    result.column_names[index] = plan.names[index];
+                    result.column_types[index] = types.dataTypeOf(plan.tys[index]);
+                    result.column_typmods[index] = plan.typmods[index];
                 }
             }
         }

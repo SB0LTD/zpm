@@ -199,8 +199,54 @@ cast type name such as `int4`, or `?column?`; `AS` aliases and quoted
 identifiers keep their case). `$n` reaching the engine is
 `UndefinedParameter`. Integer literals beyond int8 and decimal/exponent
 literals are NUMERIC (a decimal literal cast to a float type is parsed as a
-float). Other functions (`pg_typeof` included), JSON (non-B) operators,
-aggregates, joins and subqueries are not supported.
+float). Other functions (`pg_typeof` included), JSON (non-B) operators and
+window functions are not supported.
+
+### Queries (Q06/Q07/Q08, design §4.9)
+
+Single-table SELECTs without grouping, DISTINCT, OFFSET, subqueries, CTEs or
+set operations keep the direct scan path (and FOR UPDATE/SHARE). Everything
+else is bound into statement-scoped plans (`Config.subqueries` query blocks,
+`Config.relations` FROM items per block, `Config.ctes` CTEs per statement;
+`StatementTooComplex` beyond) and executed in `Database.workspace`:
+
+- FROM: tables, CTE names and derived tables `(SELECT ...) alias`, joined
+  left-deep with INNER/LEFT/RIGHT/FULL [OUTER]/CROSS JOIN ... ON | USING
+  (merged columns; FULL is COALESCE) and commas. Nested loops; an ON conjunct
+  `inner.pk = expression over earlier items` of an INNER/LEFT join probes the
+  primary-key index; RIGHT/FULL track matched inner rows in the workspace.
+  Unqualified names must be unique across a block's items
+  (`AmbiguousColumn`, 42702); an unknown qualifier is `TableNotFound` (42P01).
+- Subqueries: scalar (`CardinalityViolation`, 21000, for more than one row),
+  [NOT] IN (SQL NULL semantics) and [NOT] EXISTS, correlated (re-run per
+  outer row, scratch released afterwards) or not (run once per statement).
+- Grouping: GROUP BY keys (expressions, positions, output aliases when no
+  input column has the name) are evaluated once per row, merge-sorted and
+  grouped by runs of equal keys (NULLs equal). COUNT(*), COUNT, SUM, AVG, MIN,
+  MAX, BOOL_AND/EVERY, BOOL_OR with DISTINCT (sort-based) and FILTER (WHERE);
+  HAVING. Result types: COUNT int8, SUM(int2/int4) int8, SUM(int8)/SUM(numeric)
+  and AVG of integers/numeric NUMERIC (numeric_div scale), SUM(float4) float4,
+  AVG(float) float8 with float8_accum's overflow check (22003). Empty input
+  gives COUNT 0 and NULL otherwise; no GROUP BY means exactly one group.
+  Ungrouped columns and misplaced or nested aggregates are `GroupingError`
+  (42803). AVG(interval) is not provided.
+- DISTINCT / DISTINCT ON are sort-based (NULLs equal); ORDER BY items outside
+  the select list of a SELECT DISTINCT, or DISTINCT ON items that are not the
+  leading ORDER BY items, are `InvalidColumnReference` (42P10). OFFSET,
+  LIMIT ALL/NULL and FETCH FIRST|NEXT [n] ROW|ROWS ONLY; negative counts are
+  `InvalidRowCountInLimit` (2201W) / `InvalidRowCountInResultOffset` (2201X).
+- WITH [RECURSIVE] CTEs are materialized once per statement; a recursive CTE
+  (`non-recursive UNION [ALL] recursive`) iterates over the previous step's
+  rows until a step adds none (UNION drops rows already produced). UNION,
+  INTERSECT and EXCEPT [ALL] use stable sorting and run multiplicities; their
+  ORDER BY names result columns only (expressions are `UnsupportedStatement`).
+- Workspace: `Config.work_rows` (0 = rows_per_table) x 2 x columns cells and
+  proportional index arrays. Scratch grows from the bottom; materialized CTEs
+  and uncorrelated subquery results are copied to the top for the statement.
+  Exhaustion (for example a non-terminating WITH RECURSIVE or a large cross
+  join) is `WorkspaceCapacity` (54000) before the result is written.
+  `Result.rows` holds `Config.result_rows` (0 = rows_per_table) rows
+  (`RowCapacity` beyond).
 
 WHERE keeps a row only when its predicate is TRUE. A top-level `pk = constant`
 conjunct (any constant expression) uses the primary-key index. At most
@@ -252,7 +298,9 @@ Errors include `Syntax`, `UnsupportedStatement`, `TableCapacity`,
 `InvalidEscapeSequence`, `UndefinedParameter`, `InvalidColumnReference`,
 `NumericValueOutOfRange`, `NumericCapacity`, `InvalidParameterValue`,
 `InvalidDatetimeFormat`, `DatetimeFieldOverflow`, `UntranslatableCharacter`,
-`ClockUnavailable` and the
+`ClockUnavailable`, `WorkspaceCapacity`, `GroupingError`, `AmbiguousColumn`,
+`CardinalityViolation`, `InvalidRowCountInLimit`,
+`InvalidRowCountInResultOffset` and the
 transaction errors `WouldBlock` (never sent to clients), `SerializationFailure`,
 `DeadlockDetected`, `LockNotAvailable`, `QueryCanceled`, `TransactionCapacity`,
 `WriteSetCapacity`, `LockCapacity`, `CatalogCapacity`, `SavepointCapacity`,
@@ -266,7 +314,8 @@ without ordering stops scanning once enough rows match. Result clearing changes
 only active counts; callers must observe the active ranges. Column types are
 reported even when a SELECT returns zero rows.
 
-Joins, aggregates, secondary indexes, arrays, zone abbreviations, non-ISO
+Window functions, LATERAL and NATURAL joins, data-modifying CTEs, secondary
+indexes, arrays, zone abbreviations, non-ISO
 DateStyle and other IntervalStyles, functions beyond those listed above, and
 complete SQL-standard or PostgreSQL conformance remain unimplemented. The reusable shared transaction adapter and wire sessions are
 documented in [database-server.md](database-server.md).

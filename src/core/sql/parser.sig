@@ -1,9 +1,15 @@
 //! Recursive-descent parser (Layer 0, design §4.1).
 //!
 //! Statements: CREATE/DROP TABLE; single-row INSERT [column list] VALUES
-//! (expressions); SELECT targets [FROM t [[AS] alias]] [WHERE e] [ORDER BY
-//! key [ASC|DESC] [NULLS FIRST|LAST], ...] [LIMIT n]; UPDATE t SET c = e, ...
-//! [WHERE e]; DELETE FROM t [WHERE e]; BEGIN/COMMIT/ROLLBACK [TRANSACTION].
+//! (expressions); [WITH [RECURSIVE] ...] SELECT [DISTINCT [ON (e, ...)]]
+//! targets [FROM items joined by commas or [INNER|LEFT|RIGHT|FULL [OUTER]|
+//! CROSS] JOIN ... ON e | USING (c, ...)] [WHERE e] [GROUP BY e, ...] [HAVING
+//! e] {UNION|INTERSECT|EXCEPT [ALL] ...} [ORDER BY key [ASC|DESC] [NULLS
+//! FIRST|LAST], ...] [LIMIT n|ALL] [OFFSET n] [FETCH FIRST n ROWS ONLY];
+//! UPDATE t SET c = e, ... [WHERE e]; DELETE FROM t [WHERE e];
+//! BEGIN/COMMIT/ROLLBACK [TRANSACTION]. Query blocks (subqueries, CTE bodies,
+//! set-operation branches) live in Pool.queries; `Pool.complex` routes a
+//! statement to the general engine.
 //!
 //! Expressions use PostgreSQL precedence, lowest first: OR, AND, NOT, IS,
 //! comparison (non-associative), BETWEEN/IN/LIKE/ILIKE, `||` and the JSON
@@ -163,7 +169,7 @@ pub fn Parser(comptime config: types.Config) type {
                 return .{ .drop_table = name };
             }
             if (try self.takeWord("INSERT")) return .{ .insert = try self.insert() };
-            if (try self.takeWord("SELECT")) return .{ .select = try self.select() };
+            if (self.isWord("SELECT") or (self.mode == .standard and self.isWord("WITH"))) return self.topQuery();
             if (try self.takeWord("UPDATE")) return .{ .update = try self.update() };
             if (try self.takeWord("DELETE")) return .{ .delete = try self.delete() };
             if (self.mode == .legacy_alpha) {
@@ -476,8 +482,180 @@ pub fn Parser(comptime config: types.Config) type {
             return self.expression();
         }
 
-        fn select(self: *Self) Error!Ast.Select {
-            var out: Ast.Select = .{};
+        /// A complete SELECT/WITH statement. Single-table queries without
+        /// grouping, DISTINCT, OFFSET, subqueries, CTEs or set operations
+        /// stay on the simple path (`.select`); the rest use the general
+        /// query engine (`.query`).
+        fn topQuery(self: *Self) Error!Ast.Statement {
+            const top = try self.query();
+            try self.finish();
+            const block = &self.pool.queries[top];
+            if (!self.pool.complex and block.set_op == .none) return .{ .select = top };
+            if (block.lock.strength != .none) return error.UnsupportedStatement;
+            return .{ .query = top };
+        }
+
+        /// [WITH [RECURSIVE] name [(columns)] AS (query), ...] set-expression
+        /// [ORDER BY ...] [LIMIT n|ALL] [OFFSET n [ROW|ROWS]]
+        /// [FETCH FIRST|NEXT [n] ROW|ROWS ONLY] [FOR UPDATE|SHARE ...].
+        fn query(self: *Self) Error!u16 {
+            try self.enter();
+            defer self.leave();
+            var ctes: [config.ctes]Ast.Cte = undefined;
+            var cte_count: usize = 0;
+            var recursive = false;
+            if (self.mode == .standard and try self.takeWord("WITH")) {
+                self.pool.complex = true;
+                recursive = try self.takeWord("RECURSIVE");
+                while (true) {
+                    if (cte_count == config.ctes) return error.StatementTooComplex;
+                    var cte: Ast.Cte = .{ .name = try self.identifier() };
+                    if (try self.takeSymbol(.lparen)) {
+                        while (true) {
+                            if (cte.column_count == config.columns) return error.ColumnCapacity;
+                            cte.columns[cte.column_count] = try self.identifier();
+                            cte.column_count += 1;
+                            if (!try self.takeSymbol(.comma)) break;
+                        }
+                        try self.expectSymbol(.rparen);
+                    }
+                    try self.expectWord("AS");
+                    try self.expectSymbol(.lparen);
+                    cte.query = try self.query();
+                    try self.expectSymbol(.rparen);
+                    ctes[cte_count] = cte;
+                    cte_count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+            }
+            const top = try self.setExpression();
+            const block = &self.pool.queries[top];
+            if (cte_count != 0) {
+                if (block.cte_count != 0) return error.Syntax;
+                block.ctes = ctes;
+                block.cte_count = cte_count;
+                block.recursive = recursive;
+            }
+            if (try self.takeWord("ORDER")) {
+                if (block.order_count != 0) return error.Syntax;
+                try self.expectWord("BY");
+                while (true) {
+                    if (block.order_count == config.columns) return error.ColumnCapacity;
+                    var key: Ast.OrderKey = .{ .expr = try self.expression() };
+                    if (try self.takeWord("DESC")) key.descending = true else _ = try self.takeWord("ASC");
+                    if (try self.takeWord("NULLS")) {
+                        if (try self.takeWord("FIRST")) key.nulls_first = true else if (try self.takeWord("LAST")) key.nulls_first = false else return error.Syntax;
+                    }
+                    block.order[block.order_count] = key;
+                    block.order_count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+            }
+            var limited = false;
+            var offset_seen = false;
+            while (true) {
+                if (!limited and try self.takeWord("LIMIT")) {
+                    limited = true;
+                    if (!(try self.takeWord("ALL")) and !(try self.takeWord("NULL"))) try self.countValue(&block.limit, &block.negative_limit);
+                } else if (!offset_seen and self.mode == .standard and try self.takeWord("OFFSET")) {
+                    offset_seen = true;
+                    self.pool.complex = true;
+                    try self.countValue(&block.offset, &block.negative_offset);
+                    _ = (try self.takeWord("ROW")) or (try self.takeWord("ROWS"));
+                } else if (!limited and self.mode == .standard and try self.takeWord("FETCH")) {
+                    limited = true;
+                    if (!(try self.takeWord("FIRST"))) try self.expectWord("NEXT");
+                    block.limit = 1;
+                    if (self.current.kind == .integer or self.isSymbol(.minus) or self.current.kind == .decimal) try self.countValue(&block.limit, &block.negative_limit);
+                    if (!(try self.takeWord("ROW"))) try self.expectWord("ROWS");
+                    try self.expectWord("ONLY");
+                } else break;
+            }
+            if (self.mode == .standard and try self.takeWord("FOR")) {
+                if (block.set_op != .none or block.item_count == 0) return error.Syntax;
+                if (try self.takeWord("UPDATE")) block.lock.strength = .update else {
+                    try self.expectWord("SHARE");
+                    block.lock.strength = .share;
+                }
+                if (try self.takeWord("NOWAIT")) block.lock.wait = .nowait else if (try self.takeWord("SKIP")) {
+                    try self.expectWord("LOCKED");
+                    block.lock.wait = .skip_locked;
+                }
+                if (!limited and try self.takeWord("LIMIT")) try self.countValue(&block.limit, &block.negative_limit);
+            }
+            return top;
+        }
+
+        /// UNION/EXCEPT (left-associative) over INTERSECT terms.
+        fn setExpression(self: *Self) Error!u16 {
+            var left = try self.setTerm();
+            while (self.mode == .standard and (self.isWord("UNION") or self.isWord("EXCEPT"))) {
+                const op: ast.SetOp = if (self.isWord("UNION")) .@"union" else .except;
+                try self.advance();
+                const all = try self.setQuantifier();
+                const right = try self.setTerm();
+                left = try self.setNode(op, all, left, right);
+            }
+            return left;
+        }
+
+        fn setTerm(self: *Self) Error!u16 {
+            var left = try self.setPrimary();
+            while (self.mode == .standard and try self.takeWord("INTERSECT")) {
+                const all = try self.setQuantifier();
+                const right = try self.setPrimary();
+                left = try self.setNode(.intersect, all, left, right);
+            }
+            return left;
+        }
+
+        fn setQuantifier(self: *Self) Error!bool {
+            if (try self.takeWord("ALL")) return true;
+            _ = try self.takeWord("DISTINCT");
+            return false;
+        }
+
+        fn setNode(self: *Self, op: ast.SetOp, all: bool, left: u16, right: u16) Error!u16 {
+            self.pool.complex = true;
+            const index = try self.pool.newQuery();
+            const block = &self.pool.queries[index];
+            block.set_op = op;
+            block.set_all = all;
+            block.left = left;
+            block.right = right;
+            return index;
+        }
+
+        fn setPrimary(self: *Self) Error!u16 {
+            if (self.mode == .standard and try self.takeSymbol(.lparen)) {
+                const inner = try self.query();
+                try self.expectSymbol(.rparen);
+                self.pool.complex = true;
+                return inner;
+            }
+            try self.expectWord("SELECT");
+            return self.core();
+        }
+
+        /// SELECT [DISTINCT [ON (exprs)] | ALL] targets [FROM items] [WHERE]
+        /// [GROUP BY exprs] [HAVING expr].
+        fn core(self: *Self) Error!u16 {
+            const index = try self.pool.newQuery();
+            const out = &self.pool.queries[index];
+            if (self.mode == .standard and try self.takeWord("DISTINCT")) {
+                self.pool.complex = true;
+                out.distinct = true;
+                if (try self.takeWord("ON")) {
+                    try self.expectSymbol(.lparen);
+                    while (true) {
+                        if (out.distinct_on_count == config.columns) return error.ColumnCapacity;
+                        out.distinct_on[out.distinct_on_count] = try self.expression();
+                        out.distinct_on_count += 1;
+                        if (!try self.takeSymbol(.comma)) break;
+                    }
+                    try self.expectSymbol(.rparen);
+                }
+            } else if (self.mode == .standard) _ = try self.takeWord("ALL");
             var star = false;
             while (true) {
                 if (out.count == config.columns) return error.ColumnCapacity;
@@ -487,63 +665,111 @@ pub fn Parser(comptime config: types.Config) type {
                     star = true;
                 } else {
                     target.expr = try self.expression();
-                    target.alias = try self.bareAlias();
+                    const n = &self.pool.nodes[target.expr];
+                    if (n.kind == .column and n.star) {
+                        // t.*
+                        target.star = true;
+                        star = true;
+                        self.pool.complex = true;
+                    } else target.alias = try self.bareAlias();
                 }
                 out.targets[out.count] = target;
                 out.count += 1;
                 if (!try self.takeSymbol(.comma)) break;
             }
             if (try self.takeWord("FROM")) {
-                var from: Ast.TableRef = .{ .name = try self.identifier() };
-                from.alias = try self.bareAlias();
-                out.from = from;
+                try self.fromList(out);
             } else if (star) return error.Syntax;
             out.where = try self.where();
-            if (try self.takeWord("ORDER")) {
+            if (self.mode == .standard and try self.takeWord("GROUP")) {
                 try self.expectWord("BY");
+                self.pool.complex = true;
                 while (true) {
-                    if (out.order_count == config.columns) return error.ColumnCapacity;
-                    var key: Ast.OrderKey = .{ .expr = try self.expression() };
-                    if (try self.takeWord("DESC")) key.descending = true else _ = try self.takeWord("ASC");
-                    if (try self.takeWord("NULLS")) {
-                        if (try self.takeWord("FIRST")) key.nulls_first = true else if (try self.takeWord("LAST")) key.nulls_first = false else return error.Syntax;
-                    }
-                    out.order[out.order_count] = key;
-                    out.order_count += 1;
+                    if (out.group_count == config.columns) return error.ColumnCapacity;
+                    out.group[out.group_count] = try self.expression();
+                    out.group_count += 1;
                     if (!try self.takeSymbol(.comma)) break;
                 }
             }
-            var limited = false;
-            if (try self.takeWord("LIMIT")) {
-                try self.limitValue(&out);
-                limited = true;
+            if (self.mode == .standard and try self.takeWord("HAVING")) {
+                self.pool.complex = true;
+                out.having = try self.expression();
             }
-            if (self.mode == .standard and try self.takeWord("FOR")) {
-                if (out.from == null) return error.Syntax;
-                if (try self.takeWord("UPDATE")) out.lock.strength = .update else {
-                    try self.expectWord("SHARE");
-                    out.lock.strength = .share;
-                }
-                if (try self.takeWord("NOWAIT")) out.lock.wait = .nowait else if (try self.takeWord("SKIP")) {
-                    try self.expectWord("LOCKED");
-                    out.lock.wait = .skip_locked;
-                }
-                if (!limited and try self.takeWord("LIMIT")) try self.limitValue(&out);
-            }
-            try self.finish();
-            return out;
+            return index;
         }
 
-        fn limitValue(self: *Self, out: *Ast.Select) Error!void {
+        fn fromList(self: *Self, out: *Ast.Select) Error!void {
+            try self.fromItem(out, .first);
+            while (self.mode == .standard) {
+                if (try self.takeSymbol(.comma)) {
+                    try self.fromItem(out, .cross);
+                    continue;
+                }
+                var kind: ast.JoinKind = .inner;
+                if (try self.takeWord("JOIN")) {
+                    kind = .inner;
+                } else if (try self.takeWord("INNER")) {
+                    try self.expectWord("JOIN");
+                } else if (try self.takeWord("CROSS")) {
+                    try self.expectWord("JOIN");
+                    kind = .cross;
+                } else if (self.isWord("LEFT") or self.isWord("RIGHT") or self.isWord("FULL")) {
+                    kind = if (self.isWord("LEFT")) .left else if (self.isWord("RIGHT")) .right else .full;
+                    try self.advance();
+                    _ = try self.takeWord("OUTER");
+                    try self.expectWord("JOIN");
+                } else break;
+                try self.fromItem(out, kind);
+                if (kind == .cross) continue;
+                const item = &out.items[out.item_count - 1];
+                if (try self.takeWord("ON")) {
+                    item.on = try self.expression();
+                } else if (try self.takeWord("USING")) {
+                    try self.expectSymbol(.lparen);
+                    while (true) {
+                        if (item.using_count == config.columns) return error.ColumnCapacity;
+                        item.using[item.using_count] = try self.identifier();
+                        item.using_count += 1;
+                        if (!try self.takeSymbol(.comma)) break;
+                    }
+                    try self.expectSymbol(.rparen);
+                } else return error.Syntax;
+            }
+            if (out.item_count == 1 and out.items[0].query == none) {
+                out.from = .{ .name = out.items[0].name, .alias = out.items[0].alias };
+            } else self.pool.complex = true;
+        }
+
+        fn fromItem(self: *Self, out: *Ast.Select, kind: ast.JoinKind) Error!void {
+            if (out.item_count == config.relations) return error.StatementTooComplex;
+            var item: Ast.FromItem = .{ .join = kind };
+            if (self.mode == .standard and try self.takeSymbol(.lparen)) {
+                if (!self.isWord("SELECT") and !self.isWord("WITH")) return error.UnsupportedStatement;
+                item.query = try self.query();
+                try self.expectSymbol(.rparen);
+                self.pool.complex = true;
+            } else item.name = try self.identifier();
+            item.alias = try self.bareAlias();
+            out.items[out.item_count] = item;
+            out.item_count += 1;
+        }
+
+        /// A LIMIT/OFFSET/FETCH count; negative counts are reported by the
+        /// binder (2201W / 2201X) after name resolution, as PostgreSQL
+        /// reports them at execution.
+        fn countValue(self: *Self, value: *u64, negative: *bool) Error!void {
+            const minus = try self.takeSymbol(.minus);
             if (self.current.kind == .decimal) {
                 // An integer beyond u64 (bigint out of range, as PostgreSQL).
                 for (self.current.raw(self.source)) |byte| if (!types.digit(byte)) return error.Syntax;
                 return error.IntegerOverflow;
             }
             if (self.current.kind != .integer) return error.Syntax;
-            out.limit = self.current.integer;
+            value.* = self.current.integer;
             try self.advance();
+            if (minus and value.* != 0) negative.* = true;
         }
+
         fn update(self: *Self) Error!Ast.Update {
             var out: Ast.Update = .{ .table = try self.identifier() };
             try self.expectWord("SET");
@@ -578,6 +804,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .quoted_word => true,
                 .word => switch (token.keyword) {
                     .from, .as, .where, .order, .limit, .asc, .desc, .nulls => true,
+                    .group, .having, .@"union", .intersect, .except, .offset, .fetch, .join, .inner, .left, .right, .full, .cross, .on, .using, .natural, .window => true,
                     // AT TIME ZONE continues the expression.
                     .at => false,
                     else => !lexer.reserved(token.keyword),
@@ -689,6 +916,12 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (try self.takeWord("IN")) {
                 try self.expectSymbol(.lparen);
+                if (self.mode == .standard and (self.isWord("SELECT") or self.isWord("WITH"))) {
+                    const inner = try self.query();
+                    try self.expectSymbol(.rparen);
+                    self.pool.complex = true;
+                    return self.pool.add(.{ .kind = .in_subquery, .negated = negated, .a = left, .integer = inner });
+                }
                 const first = try self.expression();
                 const node = try self.pool.add(.{ .kind = .in_list, .negated = negated, .a = left, .b = first });
                 var last = first;
@@ -819,6 +1052,54 @@ pub fn Parser(comptime config: types.Config) type {
             return node;
         }
 
+        fn aggregateName(self: *const Self, name: ast.Ident) bool {
+            const raw = name.span.slice(self.source);
+            for ([_][]const u8{ "count", "sum", "avg", "min", "max", "bool_and", "bool_or", "every" }) |word| {
+                if (types.keyword(raw, word)) return true;
+            }
+            return false;
+        }
+
+        /// name(args) with `*`, DISTINCT/ALL and FILTER (WHERE ...) for aggregates.
+        fn functionCall(self: *Self, name: ast.Ident) Error!u16 {
+            try self.expectSymbol(.lparen);
+            var call: ast.Node = .{ .kind = .function, .name = name };
+            var first: u16 = none;
+            if (try self.takeSymbol(.star)) {
+                call.star = true;
+                try self.expectSymbol(.rparen);
+            } else if (!try self.takeSymbol(.rparen)) {
+                if (self.mode == .standard and try self.takeWord("DISTINCT")) {
+                    call.distinct = true;
+                } else if (self.mode == .standard) _ = try self.takeWord("ALL");
+                first = try self.expression();
+                call.b = first;
+            }
+            const node = try self.pool.add(call);
+            if (first != none) {
+                var last = first;
+                while (try self.takeSymbol(.comma)) {
+                    const item = try self.expression();
+                    self.pool.nodes[last].next = item;
+                    try self.pool.raise(node, item);
+                    last = item;
+                }
+                try self.expectSymbol(.rparen);
+            }
+            if (self.mode == .standard and self.isWord("FILTER") and lparenNext(try self.peek())) {
+                try self.advance();
+                try self.advance();
+                try self.expectWord("WHERE");
+                const filter = try self.expression();
+                try self.expectSymbol(.rparen);
+                self.pool.nodes[node].c = filter;
+                try self.pool.raise(node, filter);
+            }
+            const n = &self.pool.nodes[node];
+            if (n.distinct or n.c != none or self.aggregateName(name)) self.pool.complex = true;
+            return node;
+        }
+
         fn caseExpr(self: *Self) Error!u16 {
             const operand = if (self.isWord("WHEN")) none else try self.expression();
             var first: u16 = none;
@@ -868,6 +1149,12 @@ pub fn Parser(comptime config: types.Config) type {
                 .symbol => {
                     if (token.symbol != .lparen) return error.Syntax;
                     try self.advance();
+                    if (self.mode == .standard and (self.isWord("SELECT") or self.isWord("WITH"))) {
+                        const query_index = try self.query();
+                        try self.expectSymbol(.rparen);
+                        self.pool.complex = true;
+                        return self.pool.add(.{ .kind = .scalar_subquery, .integer = query_index });
+                    }
                     const inner = try self.expression();
                     try self.expectSymbol(.rparen);
                     return inner;
@@ -924,13 +1211,19 @@ pub fn Parser(comptime config: types.Config) type {
                     return node;
                 }
             }
-            const name = try self.identifier();
-            if (self.isSymbol(.lparen)) {
-                const node = try self.arguments(.function, true);
-                self.pool.nodes[node].name = name;
-                return node;
+            if (self.mode == .standard and token.kind == .word and self.isWord("EXISTS") and lparenNext(try self.peek())) {
+                try self.advance();
+                try self.advance();
+                if (!self.isWord("SELECT") and !self.isWord("WITH")) return error.Syntax;
+                const query_index = try self.query();
+                try self.expectSymbol(.rparen);
+                self.pool.complex = true;
+                return self.pool.add(.{ .kind = .exists_subquery, .integer = query_index });
             }
+            const name = try self.identifier();
+            if (self.isSymbol(.lparen)) return self.functionCall(name);
             if (try self.takeSymbol(.dot)) {
+                if (self.mode == .standard and try self.takeSymbol(.star)) return self.pool.add(.{ .kind = .column, .star = true, .qualifier = name });
                 const column = try self.identifier();
                 return self.pool.add(.{ .kind = .column, .name = column, .qualifier = name });
             }

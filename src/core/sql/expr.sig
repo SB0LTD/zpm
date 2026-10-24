@@ -204,12 +204,37 @@ pub fn Eval(comptime config: types.Config) type {
         pub const Row = [config.columns]V.Cell;
         pub const Session = value_module.Session;
 
+        /// Evaluates a subquery node (scalar value, or a boolean/NULL for
+        /// EXISTS and IN) for the general query engine.
+        pub const Hook = struct {
+            ptr: *anyopaque,
+            run: *const fn (ptr: *anyopaque, ctx: *const Context, id: u16) Error!V.Cell,
+        };
+
         pub const Context = struct {
             source: []const u8,
             pool: *const Ast.Pool,
+            /// Single-table row (simple SELECT and DML): relation 0.
             row: ?*const Row = null,
             session: *const Session = &value_module.default_session,
+            /// General engine: one row per FROM item plus the grouped row
+            /// (ast.groupRelation); null is a NULL-extended row.
+            tuple: [config.relations + 1]?[*]const V.Cell = @splat(null),
+            /// Enclosing block's context (correlated columns, `level` > 0).
+            outer: ?*const Context = null,
+            hook: ?*const Hook = null,
         };
+
+        const null_cell: V.Cell = .null_value;
+
+        pub fn columnRef(ctx: *const Context, n: *const ast.Node) *const V.Cell {
+            var owner = ctx;
+            var level = n.level;
+            while (level != 0) : (level -= 1) owner = owner.outer.?;
+            if (owner.row) |row| if (n.relation == 0) return &row[n.column];
+            const base = owner.tuple[n.relation] orelse return &null_cell;
+            return &base[n.column];
+        }
 
         pub fn literalText(source: []const u8, quoted: lexer.Quoted) V.Text {
             var text: V.Text = .{ .len = quoted.len };
@@ -250,7 +275,7 @@ pub fn Eval(comptime config: types.Config) type {
 
         fn operandRef(ctx: *const Context, id: u16, scratch: *V.Cell) Error!*const V.Cell {
             const n = node(ctx, id);
-            if (n.kind == .column) return &ctx.row.?[n.column];
+            if (n.kind == .column) return columnRef(ctx, n);
             scratch.* = try eval(ctx, id);
             return scratch;
         }
@@ -410,7 +435,12 @@ pub fn Eval(comptime config: types.Config) type {
                     const number = try Io.parse(.numeric, -1, n.name.span.slice(ctx.source), ctx.session);
                     return if (n.ty == .numeric or n.ty == .unknown) number else Io.cast(number, .numeric, n.ty, -1, ctx.session);
                 },
-                .column => return ctx.row.?[n.column],
+                .column => return columnRef(ctx, n).*,
+                .scalar_subquery, .exists_subquery, .in_subquery => {
+                    const hook = ctx.hook orelse return error.UnsupportedStatement;
+                    return hook.run(hook.ptr, ctx, id);
+                },
+                .aggregate => unreachable,
                 .and_op, .or_op, .not_op, .test_op, .between, .in_list, .like => return boolCell(try truth(ctx, id)),
                 .unary => {
                     const value = try eval(ctx, n.a);

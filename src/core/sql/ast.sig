@@ -43,6 +43,14 @@ pub const Func = enum { none, now, transaction_timestamp, statement_timestamp, c
 
 pub const Test = enum { is_null, is_not_null, is_true, is_not_true, is_false, is_not_false, is_unknown, is_not_unknown };
 
+/// Aggregate functions (design §4.9). `count_star` is COUNT(*).
+pub const Agg = enum { none, count, count_star, sum, avg, min, max, bool_and, bool_or };
+
+/// Relation slot of the grouped row (keys then aggregates) after grouping.
+pub fn groupRelation(comptime config: types.Config) u8 {
+    return @intCast(config.relations);
+}
+
 pub const NodeKind = enum {
     null_literal,
     bool_literal,
@@ -68,6 +76,15 @@ pub const NodeKind = enum {
     function,
     /// `a` AT TIME ZONE `b`.
     at_zone,
+    /// Aggregate call: argument `a` (none for COUNT(*)), FILTER `c`.
+    /// Replaced by a grouped-row column during binding.
+    aggregate,
+    /// `(SELECT ...)`; `integer` is the query (parser) / plan (binder) index.
+    scalar_subquery,
+    /// EXISTS (SELECT ...).
+    exists_subquery,
+    /// `a` [NOT] IN (SELECT ...).
+    in_subquery,
 };
 
 /// Children by kind: unary/not/test/cast `a`; binary/and/or/nullif `a`,`b`;
@@ -100,6 +117,15 @@ pub const Node = struct {
     boolean: bool = false,
     /// Bound column index (column nodes).
     column: u16 = 0,
+    /// Bound FROM item of a column (groupRelation for grouped-row columns).
+    relation: u8 = 0,
+    /// Enclosing query levels up to the column's scope (correlation).
+    level: u8 = 0,
+    /// DISTINCT inside an aggregate call.
+    distinct: bool = false,
+    /// `f(*)`, or `t.*` / `*` in a target list.
+    star: bool = false,
+    agg: Agg = .none,
 };
 
 pub fn Ast(comptime config: types.Config) type {
@@ -107,9 +133,27 @@ pub fn Ast(comptime config: types.Config) type {
         pub const Pool = struct {
             nodes: [config.expr_nodes]Node = undefined,
             len: usize = 0,
+            /// Query blocks of the statement (top query, subqueries, CTE
+            /// bodies, set-operation branches).
+            queries: [config.subqueries]Select = undefined,
+            query_len: usize = 0,
+            /// The statement needs the general query engine (joins,
+            /// grouping, DISTINCT, OFFSET, subqueries, CTEs, set operations).
+            complex: bool = false,
 
             pub fn reset(self: *Pool) void {
                 self.len = 0;
+                self.query_len = 0;
+                self.complex = false;
+            }
+
+            /// A new default query block, initialized in place (blocks are
+            /// large; they are never copied while parsing).
+            pub fn newQuery(self: *Pool) Error!u16 {
+                if (self.query_len == config.subqueries) return error.StatementTooComplex;
+                self.queries[self.query_len] = .{};
+                self.query_len += 1;
+                return @intCast(self.query_len - 1);
             }
 
             /// Adds a node whose depth is one more than its deepest child.
@@ -175,15 +219,57 @@ pub fn Ast(comptime config: types.Config) type {
             alias: ?Ident = null,
         };
 
+        /// One FROM item: a table or CTE name, or a derived table
+        /// (`query` != none), joined to the items before it.
+        pub const FromItem = struct {
+            name: Ident = .{},
+            alias: ?Ident = null,
+            query: u16 = none,
+            join: JoinKind = .first,
+            on: u16 = none,
+            using: [config.columns]Ident = undefined,
+            using_count: usize = 0,
+        };
+
+        pub const Cte = struct {
+            name: Ident = .{},
+            columns: [config.columns]Ident = undefined,
+            column_count: usize = 0,
+            query: u16 = none,
+        };
+
+        /// A query block: a SELECT core, or a set operation over the
+        /// blocks `left` and `right` (set_op != none). ORDER BY, LIMIT and
+        /// OFFSET apply to the block's result.
         pub const Select = struct {
             targets: [config.columns]Target = undefined,
             count: usize = 0,
+            /// The single FROM table of a simple statement.
             from: ?TableRef = null,
+            items: [config.relations]FromItem = undefined,
+            item_count: usize = 0,
             where: u16 = none,
+            distinct: bool = false,
+            distinct_on: [config.columns]u16 = undefined,
+            distinct_on_count: usize = 0,
+            group: [config.columns]u16 = undefined,
+            group_count: usize = 0,
+            having: u16 = none,
             order: [config.columns]OrderKey = undefined,
             order_count: usize = 0,
-            limit: u64 = config.rows_per_table,
+            /// No LIMIT (or LIMIT ALL) is maxInt(u64).
+            limit: u64 = 0xffffffffffffffff,
+            offset: u64 = 0,
+            negative_limit: bool = false,
+            negative_offset: bool = false,
             lock: Locking = .{},
+            set_op: SetOp = .none,
+            set_all: bool = false,
+            left: u16 = none,
+            right: u16 = none,
+            ctes: [config.ctes]Cte = undefined,
+            cte_count: usize = 0,
+            recursive: bool = false,
         };
 
         pub const Assignment = struct {
@@ -207,13 +293,19 @@ pub fn Ast(comptime config: types.Config) type {
             create_table: CreateTable,
             drop_table: Ident,
             insert: Insert,
-            select: Select,
+            /// A simple single-table SELECT: index into Pool.queries.
+            select: u16,
+            /// A query for the general engine: index into Pool.queries.
+            query: u16,
             update: Update,
             delete: Delete,
             control: Control,
         };
     };
 }
+
+pub const JoinKind = enum { first, cross, inner, left, right, full };
+pub const SetOp = enum { none, @"union", intersect, except };
 
 /// SELECT ... FOR UPDATE|SHARE [NOWAIT|SKIP LOCKED].
 pub const LockStrength = enum { none, update, share };

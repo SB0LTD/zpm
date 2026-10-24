@@ -130,12 +130,42 @@ pub const Keyword = enum {
     without,
     work,
     zone,
+    // Query clauses (design §4.9).
+    group,
+    having,
+    distinct,
+    on,
+    join,
+    inner,
+    left,
+    right,
+    full,
+    outer,
+    cross,
+    using,
+    natural,
+    recursive,
+    @"union",
+    intersect,
+    except,
+    offset,
+    fetch,
+    next,
+    row,
+    rows,
+    only,
+    exists,
+    filter,
+    window,
+    lateral,
 };
 
 /// Words that cannot be unquoted identifiers.
 pub fn reserved(keyword: Keyword) bool {
     return switch (keyword) {
         .create, .drop, .insert, .select, .update, .delete, .table, .into, .values, .from, .where, .@"and", .@"or", .set, .order, .by, .asc, .desc, .limit, .is, .not, .@"null", .@"true", .@"false", .primary, .key, .case, .when, .then, .@"else", .end, .cast, .as, .in, .between, .like, .ilike, .@"for" => true,
+        // PostgreSQL reserved and type_func_name keywords used by queries.
+        .group, .having, .distinct, .on, .join, .inner, .left, .right, .full, .outer, .cross, .using, .natural, .@"union", .intersect, .except, .offset, .fetch, .only, .with, .all, .window, .lateral => true,
         else => false,
     };
 }
@@ -153,9 +183,18 @@ pub fn classify(word: []const u8) Keyword {
     if (word.len < 2 or word.len > 12) return .none;
     var name: [12]u8 = undefined;
     for (word, 0..) |byte, index| name[index] = types.lower(byte);
-    const wanted = name[0..word.len];
-    inline for (@typeInfo(Keyword).@"enum".field_names) |field| {
-        if (field.len == wanted.len and types.same(field, wanted)) return @field(Keyword, field);
+    // Only keywords of the word's length are compared (bucketed at comptime).
+    switch (word.len) {
+        inline 2...12 => |length| {
+            @setEvalBranchQuota(20000);
+            const wanted = name[0..length];
+            inline for (@typeInfo(Keyword).@"enum".field_names) |field| {
+                if (comptime field.len == length) {
+                    if (types.same(field, wanted)) return @field(Keyword, field);
+                }
+            }
+        },
+        else => {},
     }
     return .none;
 }

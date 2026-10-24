@@ -50,7 +50,29 @@ pub const Config = struct {
     numeric_digits: usize = 64,
     /// JSONB nesting depth; deeper documents raise StatementTooComplex (54001).
     json_depth: usize = 64,
+    /// Query workspace row slots (design §4.9): sorts, groups, joins, CTEs,
+    /// derived tables and set operations of one statement share
+    /// work_rows x 2 x columns cells. 0 selects rows_per_table. Exhaustion is
+    /// WorkspaceCapacity (54000) before anything is published.
+    work_rows: usize = 0,
+    /// Rows one statement can return (Result.rows). 0 selects rows_per_table.
+    result_rows: usize = 0,
+    /// FROM items (tables, derived tables, CTE references) per query block.
+    relations: usize = 4,
+    /// Query blocks per statement (subqueries, CTE bodies, set-operation
+    /// branches); more raise StatementTooComplex (54001).
+    subqueries: usize = 16,
+    /// Common table expressions per statement (StatementTooComplex beyond).
+    ctes: usize = 4,
 };
+
+pub fn workRows(comptime config: Config) usize {
+    return if (config.work_rows == 0) config.rows_per_table else config.work_rows;
+}
+
+pub fn resultRows(comptime config: Config) usize {
+    return if (config.result_rows == 0) config.rows_per_table else config.result_rows;
+}
 
 pub const Error = error{
     Syntax,
@@ -144,6 +166,18 @@ pub const Error = error{
     UntranslatableCharacter,
     /// SQLSTATE 0A000: the statement needs a wall clock and none is available.
     ClockUnavailable,
+    /// SQLSTATE 54000: the statement's query workspace (Config.work_rows) is full.
+    WorkspaceCapacity,
+    /// SQLSTATE 42803: an ungrouped column or misplaced aggregate.
+    GroupingError,
+    /// SQLSTATE 42702: an unqualified column name matches several relations.
+    AmbiguousColumn,
+    /// SQLSTATE 21000: a scalar subquery returned more than one row.
+    CardinalityViolation,
+    /// SQLSTATE 2201W: LIMIT is negative.
+    InvalidRowCountInLimit,
+    /// SQLSTATE 2201X: OFFSET is negative.
+    InvalidRowCountInResultOffset,
 };
 
 /// Session dialect. It changes only assignment coercion (MySQL/TDS BIT

@@ -910,6 +910,12 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "InvalidEscapeSequence")) return "22025";
     if (equal(name, "UndefinedParameter")) return "42P02";
     if (equal(name, "InvalidColumnReference")) return "42P10";
+    if (equal(name, "WorkspaceCapacity")) return "54000";
+    if (equal(name, "GroupingError")) return "42803";
+    if (equal(name, "AmbiguousColumn")) return "42702";
+    if (equal(name, "CardinalityViolation")) return "21000";
+    if (equal(name, "InvalidRowCountInLimit")) return "2201W";
+    if (equal(name, "InvalidRowCountInResultOffset")) return "2201X";
     if (equal(name, "NumericValueOutOfRange")) return "22003";
     if (equal(name, "NumericCapacity")) return "54000";
     if (equal(name, "InvalidParameterValue")) return "22023";

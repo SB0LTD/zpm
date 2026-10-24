@@ -337,7 +337,9 @@ fn parserAndSortEdges() !void {
     try rejects(&db, &result, "SELECT id FROM edges LIMIT 18446744073709551616", error.IntegerOverflow);
     try execute(&db, &result, "SELECT id FROM edges WHERE id = 1 OR id = 2 ORDER BY id");
     try check(result.row_count == 2 and result.rows[0].cells[0].integer == 1 and result.rows[1].cells[0].integer == 2);
-    try rejects(&db, &result, "SELECT COUNT(*) FROM edges", null);
+    // Aggregates are supported since step 3.4 (design §5.5).
+    try execute(&db, &result, "SELECT COUNT(*) FROM edges");
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 4);
     try rejects(&db, &result, "CREATE TABLE two_keys (a INT PRIMARY KEY, b INT PRIMARY KEY)", error.Syntax);
     try execute(&db, &result, "CREATE TABLE abcdefghijklmnopqrstuvwxyzabcdef (value TEXT)");
     try execute(&db, &result, "INSERT INTO abcdefghijklmnopqrstuvwxyzabcdef VALUES ('1234567890123456789012345678901234567890123456789012345678901234')");
