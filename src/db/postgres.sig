@@ -927,6 +927,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "SequenceNotReady")) return "55000";
     if (equal(name, "WrongObjectType")) return "42809";
     if (equal(name, "DependentObjects")) return "2BP01";
+    if (equal(name, "UndefinedObject")) return "42704";
     if (equal(name, "NumericValueOutOfRange")) return "22003";
     if (equal(name, "NumericCapacity")) return "54000";
     if (equal(name, "InvalidParameterValue")) return "22023";

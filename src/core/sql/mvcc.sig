@@ -69,6 +69,11 @@ pub fn Mvcc(comptime config: types.Config) type {
             /// Sequences whose log-ahead value this transaction recorded
             /// (non-transactional: carried into the next append on abort).
             seq_dirty: Q.Set = .{},
+            /// Source rows of the running INSERT already handled (inserted,
+            /// updated or skipped by ON CONFLICT) and its affected count; a
+            /// resumed statement continues after them.
+            progress: usize = 0,
+            progress_affected: usize = 0,
 
             pub fn ref(self: *const Tx, slot: usize) storage.TxRef {
                 return .{ .slot = @intCast(slot), .epoch = self.epoch, .sub = @intCast(self.sub_len) };

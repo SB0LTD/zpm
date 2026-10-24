@@ -188,6 +188,8 @@ pub const Error = error{
     WrongObjectType,
     /// SQLSTATE 2BP01: an identity column owns the sequence.
     DependentObjects,
+    /// SQLSTATE 42704: a named constraint (ON CONFLICT ON CONSTRAINT) does not exist.
+    UndefinedObject,
 };
 
 /// Session dialect. It changes only assignment coercion (MySQL/TDS BIT

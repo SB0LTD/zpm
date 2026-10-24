@@ -322,6 +322,76 @@ fn generated() !void {
     try autocommit("DROP TABLE g");
 }
 
+/// ON CONFLICT (design §5.11): DO NOTHING, DO UPDATE with EXCLUDED and
+/// WHERE, ON CONSTRAINT, 21000 for a row hit twice, 42P10/42704/42601,
+/// conflicts with the newest committed or own version, waits for an
+/// in-progress inserter or deleter and re-checks on resume.
+fn upsert() !void {
+    try autocommit("CREATE TABLE u (id INTEGER PRIMARY KEY, label TEXT, n INTEGER)");
+    try autocommit("INSERT INTO u VALUES (1, 'one', 1), (2, 'two', 2)");
+    try expect("INSERT INTO u VALUES (1, 'upsert', 9) ON CONFLICT (id) DO UPDATE SET label = EXCLUDED.label RETURNING label", "upsert");
+    var result: DB.Result = .{};
+    try db.execute("INSERT INTO u VALUES (2, 'x', 0), (3, 'three', 3) ON CONFLICT DO NOTHING RETURNING id", &result);
+    try check(result.affected_rows == 1 and result.command == .insert);
+    try same(try render(&result), "3");
+    try expect("INSERT INTO u AS t VALUES (2, 'b', 5) ON CONFLICT ON CONSTRAINT u_pkey DO UPDATE SET n = t.n + EXCLUDED.n, label = t.label || EXCLUDED.label RETURNING *", "2|twob|7");
+    try db.execute("INSERT INTO u VALUES (3, 'z', 0) ON CONFLICT (id) DO UPDATE SET label = 'never' WHERE u.n > 100 RETURNING id", &result);
+    try check(result.affected_rows == 0 and result.row_count == 0);
+    try expect("INSERT INTO u VALUES (4, 'a', 1), (4, 'b', 2) ON CONFLICT DO NOTHING RETURNING label", "a");
+    try rejectsOnly("INSERT INTO u VALUES (5, 'a', 1), (5, 'b', 2) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n", error.CardinalityViolation);
+    try rejectsOnly("INSERT INTO u VALUES (1, 'a', 1) ON CONFLICT (label) DO NOTHING", error.InvalidColumnReference);
+    try rejectsOnly("INSERT INTO u VALUES (1, 'a', 1) ON CONFLICT ON CONSTRAINT nope DO NOTHING", error.UndefinedObject);
+    try rejectsOnly("INSERT INTO u VALUES (1, 'a', 1) ON CONFLICT DO UPDATE SET n = 1", error.Syntax);
+    try rejectsOnly("INSERT INTO u VALUES (1, 'a', 1) ON CONFLICT (id) DO UPDATE SET n = excluded.nope", error.ColumnNotFound);
+    try rejectsOnly("INSERT INTO u VALUES (1, 'a', 1) ON CONFLICT (id) DO UPDATE SET label = label", error.AmbiguousColumn);
+    try expect("INSERT INTO u SELECT id, 'copy', n * 10 FROM u WHERE id <= 2 ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n RETURNING id, n", "1|10;2|70");
+    try expect("SELECT id, label, n FROM u ORDER BY id", "1|upsert|10;2|twob|70;3|three|3;4|a|1");
+    // Own uncommitted rows conflict; a later statement may update them.
+    const a = try db.begin();
+    _ = try run(a, "INSERT INTO u VALUES (6, 'mine', 0)");
+    const own = try run(a, "INSERT INTO u VALUES (6, 'again', 1) ON CONFLICT (id) DO UPDATE SET n = u.n + 1 RETURNING n");
+    try check(own.row_count == 1 and own.rows[0].cells[0].integer == 1);
+    // A second transaction waits for the in-progress inserter, then updates.
+    const b = try db.begin();
+    const wait_insert = "INSERT INTO u VALUES (6, 'b', 10) ON CONFLICT (id) DO UPDATE SET n = u.n + EXCLUDED.n RETURNING n";
+    try parks(b, wait_insert);
+    db.publishCommit(a);
+    try db.statement(b, wait_insert, &result, .{ .@"resume" = true });
+    try check(result.affected_rows == 1);
+    try same(try render(&result), "11");
+    db.publishCommit(b);
+    // Inserter rolls back: the waiter inserts.
+    const c = try db.begin();
+    const d = try db.begin();
+    _ = try run(c, "INSERT INTO u VALUES (7, 'c', 1)");
+    const rolled = "INSERT INTO u VALUES (7, 'd', 2) ON CONFLICT (id) DO UPDATE SET n = 99 RETURNING label, n";
+    try parks(d, rolled);
+    db.abort(c);
+    try db.statement(d, rolled, &result, .{ .@"resume" = true });
+    try same(try render(&result), "d|2");
+    db.publishCommit(d);
+    // A deleter commits: the waiter inserts a new row.
+    const e = try db.begin();
+    const f = try db.begin();
+    _ = try run(e, "DELETE FROM u WHERE id = 1");
+    const deleted = "INSERT INTO u VALUES (1, 'new', 5) ON CONFLICT (id) DO UPDATE SET n = 99 RETURNING label, n";
+    try parks(f, deleted);
+    db.publishCommit(e);
+    try db.statement(f, deleted, &result, .{ .@"resume" = true });
+    try same(try render(&result), "new|5");
+    db.publishCommit(f);
+    // Different keys never wait.
+    const g = try db.begin();
+    const h = try db.begin();
+    _ = try run(g, "INSERT INTO u VALUES (20, 'g', 1) ON CONFLICT (id) DO UPDATE SET n = 0");
+    _ = try run(h, "INSERT INTO u VALUES (21, 'h', 1) ON CONFLICT (id) DO UPDATE SET n = 0");
+    db.publishCommit(g);
+    db.publishCommit(h);
+    try expect("SELECT id, n FROM u WHERE id IN (1, 6, 7, 20, 21) ORDER BY id", "1|5;6|11;7|2;20|1;21|1");
+    try empty();
+    try autocommit("DROP TABLE u");
+}
+
 var primary: DB = .{};
 var replica: DB = .{};
 var scratch: DB.ReplayScratch = .{};
@@ -386,6 +456,7 @@ pub fn main(init: std.process.Init) !void {
     try defaults();
     try identity();
     try generated();
+    try upsert();
     try durability();
     var buffer: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-dml\",\"pass\":true,\"assertions\":{d},\"database_bytes\":{d}}}\n", .{ assertions, DB.storageBytes() });

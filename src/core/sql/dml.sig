@@ -103,7 +103,8 @@ pub fn Dml(comptime config: types.Config) type {
             return cells;
         }
 
-        pub const KeyState = union(enum) { free, taken, wait: u16 };
+        /// `taken` is the conflicting (newest committed or own) version.
+        pub const KeyState = union(enum) { free, taken: u32, wait: u16 };
 
         /// Unique-index check against the newest state, like PostgreSQL's
         /// dirty snapshot: a key is taken by a committed live row, or by a
@@ -125,14 +126,14 @@ pub fn Dml(comptime config: types.Config) type {
                 if (version.xmin_csn == 0) {
                     if (snap.own(version.xmin)) {
                         if (marked and snap.own(version.xmax)) continue;
-                        return .taken;
+                        return .{ .taken = entry - 1 };
                     }
                     // Another live inserter; a version it replaced itself is
                     // superseded by a newer indexed version.
                     if (!marked and waiting == null) waiting = version.xmin.slot;
                     continue;
                 }
-                if (!marked) return .taken;
+                if (!marked) return .{ .taken = entry - 1 };
                 if (version.xmax_csn != 0 or snap.own(version.xmax)) continue;
                 if (waiting == null) waiting = version.xmax.slot;
             }

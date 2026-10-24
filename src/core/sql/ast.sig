@@ -222,8 +222,21 @@ pub fn Ast(comptime config: types.Config) type {
 
         pub const InsertSource = enum { values, query, default_values };
 
+        /// ON CONFLICT [(columns) | ON CONSTRAINT name] DO NOTHING |
+        /// DO UPDATE SET ... [WHERE ...].
+        pub const OnConflict = struct {
+            columns: [config.columns]Ident = undefined,
+            column_count: usize = 0,
+            constraint: ?Ident = null,
+            action: ConflictAction = .nothing,
+            assignments: [config.columns]Assignment = undefined,
+            count: usize = 0,
+            where: u16 = none,
+        };
+
         pub const Insert = struct {
             table: Ident = .{},
+            alias: ?Ident = null,
             explicit_columns: bool = false,
             columns: [config.columns]Ident = undefined,
             column_count: usize = 0,
@@ -234,6 +247,7 @@ pub fn Ast(comptime config: types.Config) type {
             /// INSERT ... SELECT: index into Pool.queries.
             query: u16 = none,
             overriding: Overriding = .none,
+            conflict: ?OnConflict = null,
             returning: Returning = .{},
         };
 
@@ -338,6 +352,8 @@ pub fn Ast(comptime config: types.Config) type {
 }
 
 pub const Overriding = enum { none, system, user };
+
+pub const ConflictAction = enum { none, nothing, update };
 
 pub const JoinKind = enum { first, cross, inner, left, right, full };
 pub const SetOp = enum { none, @"union", intersect, except };

@@ -713,6 +713,8 @@ pub fn Database(comptime config: Config) type {
                 if (tx.pin != null) return error.QueryCanceled;
                 if (tx.sub_len >= M.sub_capacity) return error.SavepointCapacity;
                 tx.cid +%= 1;
+                tx.progress = 0;
+                tx.progress_affected = 0;
                 snap = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
                 tx.subs[tx.sub_len] = .{ .statement = true, .write_start = @intCast(tx.write_len), .lock_start = @intCast(tx.lock_len) };
                 tx.sub_len += 1;
@@ -1160,15 +1162,11 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// Inserts every VALUES row, SELECT row or the DEFAULT VALUES row in
-        /// order. A resumed statement skips the rows it already inserted
-        /// (its write slice holds them).
+        /// order. A resumed statement continues after the rows it already
+        /// handled (Tx.progress); their writes are in its write slice.
         fn insertRows(self: *Self, slot: u16, source: []const u8, insert: *const B.Insert, snap: Snapshot) Error!usize {
             const tx = &self.txs[slot];
-            const start = tx.subs[tx.sub_len - 1].write_start;
-            var done: usize = 0;
-            for (tx.writes[start..tx.write_len]) |entry| if (entry.kind == .insert) {
-                done += 1;
-            };
+            const done = tx.progress;
             var ctx = self.evalContext(source);
             const derived: D.Derived = .{ .defaults = &insert.defaults, .generated = &insert.generated };
             var position: usize = 0;
@@ -1178,13 +1176,12 @@ pub fn Database(comptime config: Config) type {
                 for (0..rows.count) |index| {
                     if (position >= done) {
                         ctx.tuple[1] = X.rowAt(work, rows, index);
-                        try self.insertOne(slot, &ctx, insert.table, &insert.values, derived, snap);
+                        try self.insertProgress(slot, &ctx, insert, &insert.values, derived, snap, position);
                     }
                     position += 1;
                 }
             } else if (insert.rows == ast.none) {
-                if (done == 0) try self.insertOne(slot, &ctx, insert.table, &insert.values, derived, snap);
-                position = 1;
+                if (done == 0) try self.insertProgress(slot, &ctx, insert, &insert.values, derived, snap, 0);
             } else {
                 const nodes = &self.workspace.nodes.nodes;
                 var row = insert.rows;
@@ -1197,21 +1194,60 @@ pub fn Database(comptime config: Config) type {
                             values[insert.mapping[item_index]] = item;
                             item_index += 1;
                         }
-                        try self.insertOne(slot, &ctx, insert.table, &values, derived, snap);
+                        try self.insertProgress(slot, &ctx, insert, &values, derived, snap, position);
                     }
                     position += 1;
                 }
             }
-            return position;
+            return tx.progress_affected;
         }
 
-        fn insertOne(self: *Self, slot: u16, ctx: *E.Context, table_index: usize, values: *const [config.columns]u16, derived: D.Derived, snap: Snapshot) Error!void {
+        fn insertProgress(self: *Self, slot: u16, ctx: *E.Context, insert: *const B.Insert, values: *const [config.columns]u16, derived: D.Derived, snap: Snapshot, position: usize) Error!void {
+            const affected = try self.insertOne(slot, ctx, insert, values, derived, snap);
             const tx = &self.txs[slot];
+            tx.progress = position + 1;
+            tx.progress_affected += affected;
+        }
+
+        /// ON CONFLICT DO UPDATE on the conflicting row (the newest committed
+        /// or own version, not the statement snapshot's): wait for a live
+        /// writer or locker (the whole row is retried on resume), 21000 when
+        /// this statement already wrote the row, WHERE false locks the row
+        /// and skips it. Returns rows affected (0 or 1).
+        fn conflictUpdate(self: *Self, slot: u16, ctx: *E.Context, table_index: usize, update: *const B.Update, version: u32, proposed: *const E.Row, snap: Snapshot) Error!usize {
+            const table = &self.tables[table_index];
+            const entry = &table.versions[version];
+            if (entry.xmin_csn == 0 and snap.own(entry.xmin) and entry.xmin_cid == snap.cid) return error.CardinalityViolation;
+            var waits: L.Set = .{};
+            const goal = switch (self.target(slot, table_index, version, snap, .write, &waits)) {
+                .wait => return self.park(slot, waits),
+                .ready => |newest| newest,
+                .skip, .authored => return error.CardinalityViolation,
+            };
+            const row = table.versions[goal].row - 1;
+            ctx.tuple[1] = proposed;
+            if (!try X.keep(ctx, update.where, &table.versions[goal].cells)) {
+                if (try self.locks.grantRow(table_index, table.rows[row].rowid, slot, .update)) |index| {
+                    self.txs[slot].pushLock(.{ .kind = .row, .table = @intCast(table_index), .mode = @intFromEnum(locks_module.RowMode.update), .index = index });
+                }
+                return 0;
+            }
+            try self.updateOne(slot, ctx, update, row, goal, snap);
+            return 1;
+        }
+
+        fn insertOne(self: *Self, slot: u16, ctx: *E.Context, insert: *const B.Insert, values: *const [config.columns]u16, derived: D.Derived, snap: Snapshot) Error!usize {
+            const tx = &self.txs[slot];
+            const table_index = insert.table;
             const table = &self.tables[table_index];
             const cells = try D.insertedRow(ctx, table, values, derived);
             if (table.primary_column) |column| switch (D.keyCheck(table, &cells[column], 0xffffffff, snap)) {
                 .free => {},
-                .taken => return error.PrimaryKeyViolation,
+                .taken => |version| switch (insert.conflict.action) {
+                    .none => return error.PrimaryKeyViolation,
+                    .nothing => return 0,
+                    .update => return self.conflictUpdate(slot, ctx, table_index, &insert.conflict.update, version, &cells, snap),
+                },
                 .wait => |owner| {
                     var waits: L.Set = .{};
                     waits.add(owner);
@@ -1230,6 +1266,7 @@ pub fn Database(comptime config: Config) type {
             table.rows[row].newest = version + 1;
             S.indexKey(table, version);
             tx.push(.{ .kind = .insert, .table = @intCast(table_index), .new = version }) catch unreachable;
+            return 1;
         }
 
         /// Rows are visited in rowid order and updated one at a time, as a

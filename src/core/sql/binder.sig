@@ -77,6 +77,7 @@ pub fn Binder(comptime config: types.Config) type {
             /// column's expression text as source.
             defaults: [config.columns]u16 = @splat(none),
             generated: [config.columns]u16 = @splat(none),
+            conflict: Conflict = .{},
             returning: Returning = .{},
         };
 
@@ -103,6 +104,14 @@ pub fn Binder(comptime config: types.Config) type {
         pub const Update = struct { table: usize, values: [config.columns]u16, where: u16, key: u16, returning: Returning = .{}, defaults: [config.columns]u16 = @splat(none), generated: [config.columns]u16 = @splat(none) };
 
         pub const Delete = struct { table: usize, where: u16, key: u16, returning: Returning = .{} };
+
+        /// ON CONFLICT on the primary key (the only unique index). DO UPDATE
+        /// evaluates `update` with the existing row as relation 0 and the
+        /// proposed row (EXCLUDED) as relation 1.
+        pub const Conflict = struct {
+            action: ast.ConflictAction = .none,
+            update: Update = .{ .table = 0, .values = @splat(none), .where = none, .key = none },
+        };
 
         pub const Bound = union(enum) {
             create_table: Create,
@@ -739,6 +748,63 @@ pub fn Binder(comptime config: types.Config) type {
             return true;
         }
 
+        /// PostgreSQL's primary-key constraint name `<table>_pkey`.
+        fn primaryKeyName(entry: *const S.Table) Error!V.Name {
+            var out: V.Name = .{};
+            for ([_][]const u8{ entry.name.slice(), "_pkey" }) |part| {
+                if (part.len > config.name_bytes - out.len) return error.NameCapacity;
+                @memcpy(out.bytes[out.len..][0..part.len], part);
+                out.len += part.len;
+            }
+            return out;
+        }
+
+        fn bindAssignments(context: *const Context, scope: *const Scope, entry: *const S.Table, assignments: []const Ast.Assignment, values: *[config.columns]u16) Error!void {
+            for (assignments) |*item| {
+                const column = try columnIndex(context, entry, item.column);
+                if (values[column] != none) return error.DuplicateColumn;
+                if (context.node(item.value).kind == .default_value) {
+                    values[column] = item.value;
+                    continue;
+                }
+                switch (entry.columns[column].default_kind) {
+                    .generated, .identity_always => return error.GeneratedAlways,
+                    else => {},
+                }
+                try typeExpr(context, scope, item.value);
+                values[column] = try assignment(context, item.value, &entry.columns[column]);
+            }
+        }
+
+        /// The conflict arbiter must be the primary key (42P10 otherwise; a
+        /// missing named constraint is 42704; DO UPDATE needs a target).
+        fn bindConflict(context: *const Context, index: usize, entry: *const S.Table, table_alias: ?ast.Ident, conflict: *const Ast.OnConflict, out: *Conflict) Error!void {
+            if (conflict.constraint) |ident| {
+                const wanted = toName(context, ident);
+                if (entry.primary_column == null) return error.UndefinedObject;
+                const name = try primaryKeyName(entry);
+                if (!types.same(wanted.slice(), name.slice())) return error.UndefinedObject;
+            } else if (conflict.column_count != 0) {
+                var used: [config.columns]bool = @splat(false);
+                for (conflict.columns[0..conflict.column_count]) |ident| used[try columnIndex(context, entry, ident)] = true;
+                const primary = entry.primary_column orelse return error.InvalidColumnReference;
+                for (used, 0..) |flag, column| if (flag != (column == primary)) return error.InvalidColumnReference;
+            } else if (conflict.action == .update) return error.Syntax;
+            out.action = conflict.action;
+            if (conflict.action != .update) return;
+            var scope = tableScope(context, index);
+            if (table_alias) |name| scope.rels[0].name = toName(context, name);
+            // EXCLUDED is an ordinary relation name: an unqualified column
+            // present in both is ambiguous (42702), as in PostgreSQL.
+            scope.rels[1] = .{ .table = index, .name = literalName("excluded") };
+            scope.rel_count = 2;
+            var update: Update = .{ .table = index, .values = @splat(none), .where = none, .key = none };
+            try bindAssignments(context, &scope, entry, conflict.assignments[0..conflict.count], &update.values);
+            update.where = try bindWhere(context, &scope, conflict.where);
+            try bindDefaults(context, index, entry, &update.defaults, &update.generated);
+            out.update = update;
+        }
+
         fn integerColumn(data_type: types.DataType) bool {
             return data_type == .smallint or data_type == .integer32 or data_type == .integer;
         }
@@ -1145,17 +1211,19 @@ pub fn Binder(comptime config: types.Config) type {
             };
         }
 
-        /// RETURNING over the target table's row (`*`, `t.*`, expressions).
-        fn bindReturning(context: *const Context, index: usize, list: *const Ast.Returning) Error!Returning {
+        /// RETURNING over the target table's row (`*`, `t.*`, expressions);
+        /// `alias` (INSERT ... AS alias) replaces the table name.
+        fn bindReturning(context: *const Context, index: usize, list: *const Ast.Returning, table_alias: ?ast.Ident) Error!Returning {
             var out: Returning = .{};
             if (list.count == 0) return out;
-            const scope = tableScope(context, index);
+            var scope = tableScope(context, index);
+            if (table_alias) |name| scope.rels[0].name = toName(context, name);
             const entry = &context.tables[index];
             for (list.targets[0..list.count]) |*target| {
                 if (target.star) {
                     if (target.expr != none) {
                         const qualifier = toName(context, context.node(target.expr).qualifier);
-                        if (!types.same(qualifier.slice(), entry.name.slice())) return error.TableNotFound;
+                        if (!types.same(qualifier.slice(), scope.rels[0].name.slice())) return error.TableNotFound;
                     }
                     for (entry.columns[0..entry.column_count], 0..) |*column, position| {
                         if (out.count == config.columns) return error.ColumnCapacity;
@@ -2168,7 +2236,8 @@ pub fn Binder(comptime config: types.Config) type {
                         .default_values => if (insert.explicit_columns) return error.Syntax,
                     }
                     try bindDefaults(context, index, entry, &out.defaults, &out.generated);
-                    out.returning = try bindReturning(context, index, &insert.returning);
+                    if (insert.conflict) |*conflict| try bindConflict(context, index, entry, insert.alias, conflict, &out.conflict);
+                    out.returning = try bindReturning(context, index, &insert.returning, insert.alias);
                     return .{ .insert = out };
                 },
                 .select => |index| return .{ .select = try bindSelect(context, &context.pool.queries[index]) },
@@ -2201,14 +2270,14 @@ pub fn Binder(comptime config: types.Config) type {
                     out.where = try bindWhere(context, &scope, update.where);
                     out.key = primaryKey(context, entry, out.where);
                     try bindDefaults(context, index, entry, &out.defaults, &out.generated);
-                    out.returning = try bindReturning(context, index, &update.returning);
+                    out.returning = try bindReturning(context, index, &update.returning, null);
                     return .{ .update = out };
                 },
                 .delete => |*delete| {
                     const index = try resolveTable(context, delete.table);
                     const scope = tableScope(context, index);
                     const where = try bindWhere(context, &scope, delete.where);
-                    const returning = try bindReturning(context, index, &delete.returning);
+                    const returning = try bindReturning(context, index, &delete.returning, null);
                     return .{ .delete = .{ .table = index, .where = where, .key = primaryKey(context, &context.tables[index], where), .returning = returning } };
                 },
                 .control => |control| return .{ .control = control },

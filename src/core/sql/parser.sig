@@ -578,6 +578,7 @@ pub fn Parser(comptime config: types.Config) type {
         fn insert(self: *Self) Error!Ast.Insert {
             try self.expectWord("INTO");
             var out: Ast.Insert = .{ .table = try self.identifier() };
+            if (self.mode == .standard and try self.takeWord("AS")) out.alias = try self.identifier();
             if (try self.takeSymbol(.lparen)) {
                 out.explicit_columns = true;
                 while (true) {
@@ -624,6 +625,38 @@ pub fn Parser(comptime config: types.Config) type {
                     out.row_count += 1;
                     if (self.mode != .standard or !try self.takeSymbol(.comma)) break;
                 }
+            }
+            if (self.mode == .standard and try self.takeWord("ON")) {
+                try self.expectWord("CONFLICT");
+                var conflict: Ast.OnConflict = .{};
+                if (try self.takeSymbol(.lparen)) {
+                    while (true) {
+                        if (conflict.column_count == config.columns) return error.ColumnCapacity;
+                        conflict.columns[conflict.column_count] = try self.identifier();
+                        conflict.column_count += 1;
+                        if (!try self.takeSymbol(.comma)) break;
+                    }
+                    try self.expectSymbol(.rparen);
+                } else if (try self.takeWord("ON")) {
+                    try self.expectWord("CONSTRAINT");
+                    conflict.constraint = try self.identifier();
+                }
+                try self.expectWord("DO");
+                if (!try self.takeWord("NOTHING")) {
+                    try self.expectWord("UPDATE");
+                    try self.expectWord("SET");
+                    while (true) {
+                        if (conflict.count == config.columns) return error.DuplicateColumn;
+                        const column = try self.identifier();
+                        try self.expectSymbol(.eq);
+                        conflict.assignments[conflict.count] = .{ .column = column, .value = try self.valueItem() };
+                        conflict.count += 1;
+                        if (!try self.takeSymbol(.comma)) break;
+                    }
+                    conflict.where = try self.where();
+                    conflict.action = .update;
+                }
+                out.conflict = conflict;
             }
             try self.returningClause(&out.returning);
             try self.finish();
