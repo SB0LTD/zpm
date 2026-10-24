@@ -413,6 +413,15 @@ pub fn Session(comptime DB: type) type {
             return true;
         }
 
+
+        /// New types (NUMERIC, REAL/DOUBLE, temporal, JSON) travel as TEXT
+        /// columns here: native metadata is not implemented (flag F-M).
+        fn textify(db: *DB, result: *DB.Result) anyerror!void {
+            if (!@hasDecl(DB.Result, "textify")) return;
+            const session = if (@hasDecl(DB, "valueSession")) db.valueSession() else DB.Result.default_session;
+            try result.textify(session);
+        }
+
         fn results(self: *Self, writer: *Writer, completion: u8) Error!void {
             // Validate all text before writing COLMETADATA, so encoding errors
             // produce a complete ERROR/DONE response instead of partial rows.
@@ -442,7 +451,7 @@ pub fn Session(comptime DB: type) type {
                             try writer.byte(0x68);
                             try writer.byte(1);
                         }, // BITN
-                        .text => {
+                        else => {
                             try writer.byte(0xe7); // NVARCHAR
                             try writer.number(65534, 2);
                             try writer.bytes(&.{ 9, 4, 0xd0, 0, 0x34 }); // SQL_Latin1_General_CP1_CI_AS
@@ -456,8 +465,8 @@ pub fn Session(comptime DB: type) type {
                     try writer.byte(0xd1);
                     for (row.cells[0..self.result.column_count], 0..) |*cell, column| switch (cell.*) {
                         .null_value => switch (self.result.column_types[column]) {
-                            .text => try writer.number(0xffff, 2),
-                            else => try writer.byte(0),
+                            .integer, .integer32, .boolean => try writer.byte(0),
+                            else => try writer.number(0xffff, 2),
                         },
                         .integer => |value| {
                             if (self.result.column_types[column] == .integer32) {
@@ -476,6 +485,8 @@ pub fn Session(comptime DB: type) type {
                             try writer.number((try utf16Length(value.slice())) * 2, 2);
                             try writer.unicode(value.slice());
                         },
+                        // textify() rendered every other type as text.
+                        else => unreachable,
                     };
                 }
             }
@@ -491,6 +502,7 @@ pub fn Session(comptime DB: type) type {
             const before = txStatus(db);
             if (db.execute(query, &self.result)) |_| {
                 try notifyTransaction(writer, before, txStatus(db), isRollback(query));
+                textify(db, &self.result) catch |err| return writer.failure(245, @errorName(err));
                 self.results(writer, 0xfd) catch |err| {
                     if (err == error.BufferTooSmall) return err;
                     try writer.failure(245, @errorName(err));
@@ -812,6 +824,7 @@ pub fn Session(comptime DB: type) type {
             const before = txStatus(db);
             if (db.execute(query, &self.result)) |_| {
                 try notifyTransaction(writer, before, txStatus(db), isRollback(query));
+                textify(db, &self.result) catch |err| return writer.failureToken(245, @errorName(err), 0xfe);
                 self.results(writer, 0xff) catch |err| return writer.failureToken(245, @errorName(err), 0xfe);
                 try writer.byte(0x79); // RETURNSTATUS
                 try writer.number(0, 4);

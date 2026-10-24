@@ -621,6 +621,19 @@ fn storeStartup(s: *StoreSession, db: *Store.Connection, options: []const u8) ![
     return store_output[0..reply.written];
 }
 
+/// Whether `bytes` holds a ParameterStatus for `name` (with `value` when given).
+fn parameterStatus(bytes: []const u8, name: []const u8, value: ?[]const u8) bool {
+    var frames: Frames = .{ .bytes = bytes };
+    while (frames.next() catch return false) |f| if (f.tag == 'S') {
+        const key_end = std.mem.indexOfScalar(u8, f.body, 0) orelse return false;
+        if (!equal(f.body[0..key_end], name)) continue;
+        const rest = f.body[key_end + 1 ..];
+        const value_end = std.mem.indexOfScalar(u8, rest, 0) orelse return false;
+        return if (value) |wanted| equal(rest[0..value_end], wanted) else true;
+    };
+    return false;
+}
+
 fn commandTag(bytes: []const u8, wanted: []const u8) !void {
     var frames: Frames = .{ .bytes = bytes };
     while (try frames.next()) |f| if (f.tag == 'C') {
@@ -641,6 +654,7 @@ fn storeContracts() !void {
     var sb: StoreSession = .{};
     sa.configureBackendKey(7, 0xdeadbeef);
     const ready = try storeStartup(&sa, &a, "-c statement_timeout=1500");
+    const startup_parameters = parameterStatus(ready, "TimeZone", "UTC") and parameterStatus(ready, "DateStyle", "ISO, MDY") and parameterStatus(ready, "IntervalStyle", "postgres") and parameterStatus(ready, "server_version", "16.0");
     var frames: Frames = .{ .bytes = ready };
     var saw_key = false;
     while (try frames.next()) |f| if (f.tag == 'K') {
@@ -665,6 +679,24 @@ fn storeContracts() !void {
     try check(equal(sa.result.rows[0].cells[0].text.slice(), "1500ms"));
     try commandTag(try storeQuery(&sa, &a, "SET lock_timeout TO '2s'"), "SET");
     try commandTag(try storeQuery(&sa, &a, "RESET lock_timeout"), "RESET");
+    // ParameterStatus: every reported setting at startup, then each changed
+    // one before ReadyForQuery (SET, RESET, failed-block revert); unchanged
+    // settings are not re-sent.
+    try check(startup_parameters);
+    const zoned = try storeQuery(&sa, &a, "SET TIME ZONE 'UTC+3'");
+    try check(parameterStatus(zoned, "TimeZone", "UTC+3") and !parameterStatus(zoned, "DateStyle", null));
+    try check(!parameterStatus(try storeQuery(&sa, &a, "SELECT 1"), "TimeZone", null));
+    try check(parameterStatus(try storeQuery(&sa, &a, "SET TIME ZONE 5"), "TimeZone", "<+05>-05"));
+    _ = try storeQuery(&sa, &a, "BEGIN");
+    try check(parameterStatus(try storeQuery(&sa, &a, "SET TIME ZONE -3.5"), "TimeZone", "<-03:30>+03:30"));
+    try check(parameterStatus(try storeQuery(&sa, &a, "SELECT missing FROM w"), "TimeZone", "<+05>-05"));
+    _ = try storeQuery(&sa, &a, "ROLLBACK");
+    try check(parameterStatus(try storeQuery(&sa, &a, "RESET TimeZone"), "TimeZone", "UTC"));
+    try check(parameterStatus(try storeQuery(&sa, &a, "SET DateStyle = 'ISO, DMY'"), "DateStyle", "ISO, DMY"));
+    try state(try storeQuery(&sa, &a, "SET TIME ZONE 'Mars/Base'"), "22023");
+    try state(try storeQuery(&sa, &a, "SET DateStyle = 'SQL'"), "22023");
+    _ = try storeQuery(&sa, &a, "RESET ALL");
+    try check(a.settings.statement_timeout_ms == 1500);
     try state(try storeQuery(&sa, &a, "SAVEPOINT outside"), "25P01");
     try commandTag(try storeQuery(&sa, &a, "BEGIN"), "BEGIN");
     try commandTag(try storeQuery(&sa, &a, "SAVEPOINT s"), "SAVEPOINT");

@@ -5,7 +5,8 @@
 //!   ops, each: tag u8 then its fields
 //!     1 create_table  oid u32, name, expr_format_version u16 (= 1),
 //!                     column_count u8, columns: name, type_oid u32,
-//!                     typmod i32 (= -1), flags u8 (1 not null, 2 primary key),
+//!                     typmod i32 (-1, NUMERIC(p,s) or TIMESTAMP[TZ](p)),
+//!                     flags u8 (1 not null, 2 primary key),
 //!                     default_len u16 (= 0; defaults arrive with FEAT-007)
 //!     2 drop_table    oid u32
 //!     3 insert        oid u32, rowid u64, count u8, values
@@ -13,7 +14,12 @@
 //!     5 delete        oid u32, rowid u64
 //!     6 catalog_counters next_oid u32, count u8, (oid u32, next_rowid u64)*
 //!     7..9            reserved for sequence ops (FEAT-007); rejected today
-//!   name: len u8 + bytes. value: 0 null | 1 i64 | 2 bool u8 | 3 len u32 + bytes.
+//!   name: len u8 + bytes. value: 0 null | 1 i64 | 2 bool u8 | 3 len u32 + bytes
+//!   | 4 f32 bits u32 | 5 f64 bits u64 | 6 numeric {special u8, negative u8,
+//!   dscale u16, coefficient 4 x u64} | 7 date i32 | 8 timestamp i64
+//!   | 9 timestamptz i64 | 10 interval {months i32, days i32, us i64}
+//!   | 11 jsonb len u32 + canonical bytes. Every value is checked against the
+//!   column's type OID (create_table) before anything applies.
 //! Ops may repeat a (table, rowid) and apply in record order.
 //!
 //! apply() decodes and validates the WHOLE record against a bounded,
@@ -24,6 +30,9 @@
 //! ChangeRecordConflict.
 const types = @import("types.sig");
 const storage = @import("storage.sig");
+const numeric = @import("numeric.sig");
+const temporal = @import("temporal.sig");
+const jsonb = @import("jsonb.sig");
 const Error = types.Error;
 
 pub const format_version: u16 = 1;
@@ -165,6 +174,44 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u32, @intCast(text.len));
                     try writer.bytes(text.slice());
                 },
+                .float4 => |value| {
+                    try writer.int(u8, 4);
+                    try writer.int(u32, @bitCast(value));
+                },
+                .float8 => |value| {
+                    try writer.int(u8, 5);
+                    try writer.int(u64, @bitCast(value));
+                },
+                .numeric => |*value| {
+                    try writer.int(u8, 6);
+                    try writer.int(u8, @intFromEnum(value.special));
+                    try writer.int(u8, @intFromBool(value.negative));
+                    try writer.int(u16, value.dscale);
+                    for (value.limbs) |limb| try writer.int(u64, limb);
+                },
+                .date => |value| {
+                    try writer.int(u8, 7);
+                    try writer.int(i32, value);
+                },
+                .timestamp => |value| {
+                    try writer.int(u8, 8);
+                    try writer.int(i64, value);
+                },
+                .timestamptz => |value| {
+                    try writer.int(u8, 9);
+                    try writer.int(i64, value);
+                },
+                .interval => |value| {
+                    try writer.int(u8, 10);
+                    try writer.int(i32, value.months);
+                    try writer.int(i32, value.days);
+                    try writer.int(i64, value.us);
+                },
+                .jsonb => |*document| {
+                    try writer.int(u8, 11);
+                    try writer.int(u32, @intCast(document.len));
+                    try writer.bytes(document.slice());
+                },
             }
         }
 
@@ -177,7 +224,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             for (table.columns[0..table.column_count]) |*column| {
                 try writer.name(column.name.slice());
                 try writer.int(u32, types.typeOid(column.data_type));
-                try writer.int(i32, -1);
+                try writer.int(i32, column.typmod);
                 try writer.int(u8, @as(u8, @intFromBool(column.not_null)) | (@as(u8, @intFromBool(column.primary_key)) << 1));
                 try writer.int(u16, 0);
             }
@@ -385,13 +432,39 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     if (value > 1) return error.InvalidChangeRecord;
                     break :blk .{ .boolean = value == 1 };
                 },
-                3 => blk: {
+                3, 11 => blk: {
                     const len = try reader.int(u32);
                     if (len > config.text_bytes) return error.ChangeRecordConflict;
                     var text: V.Text = .{ .len = len };
                     @memcpy(text.bytes[0..len], try reader.take(len));
-                    break :blk .{ .text = text };
+                    if (tag == 3) break :blk .{ .text = text };
+                    if (!jsonb.validBinary(text.slice(), config.json_depth, config.numeric_digits)) return error.InvalidChangeRecord;
+                    break :blk .{ .jsonb = text };
                 },
+                4 => .{ .float4 = @bitCast(try reader.int(u32)) },
+                5 => .{ .float8 = @bitCast(try reader.int(u64)) },
+                6 => blk: {
+                    const special = try reader.int(u8);
+                    const negative = try reader.int(u8);
+                    if (special > 3 or negative > 1) return error.InvalidChangeRecord;
+                    var out: numeric.Numeric = .{ .special = @enumFromInt(special), .negative = negative == 1, .dscale = try reader.int(u16) };
+                    for (&out.limbs) |*limb| limb.* = try reader.int(u64);
+                    if (out.dscale > numeric.max_scale or numeric.digitCount(out.coef()) > config.numeric_digits) return error.InvalidChangeRecord;
+                    if (out.special != .finite and (out.coef() != 0 or out.dscale != 0 or out.negative)) return error.InvalidChangeRecord;
+                    if (out.negative and out.coef() == 0) return error.InvalidChangeRecord;
+                    break :blk .{ .numeric = out };
+                },
+                7 => blk: {
+                    const days = try reader.int(i32);
+                    if (temporal.finiteDate(days) and !temporal.validDate(days)) return error.InvalidChangeRecord;
+                    break :blk .{ .date = days };
+                },
+                8, 9 => blk: {
+                    const us = try reader.int(i64);
+                    if (temporal.finiteTimestamp(us) and !temporal.validTimestamp(us)) return error.InvalidChangeRecord;
+                    break :blk if (tag == 8) V.Cell{ .timestamp = us } else V.Cell{ .timestamptz = us };
+                },
+                10 => .{ .interval = .{ .months = try reader.int(i32), .days = try reader.int(i32), .us = try reader.int(i64) } },
                 else => return error.InvalidChangeRecord,
             };
             return .{ .cell = cell, .offset = offset };
@@ -439,7 +512,16 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 for (out.columns[0..index]) |*previous|
                     if (types.same(previous.name.slice(), column.name.slice())) return error.InvalidChangeRecord;
                 column.data_type = types.typeFromOid(try reader.int(u32)) orelse return error.UnsupportedLogVersion;
-                if (try reader.int(i32) != -1) return error.UnsupportedLogVersion;
+                column.typmod = try reader.int(i32);
+                const typmod_ok = switch (column.data_type) {
+                    .numeric => column.typmod == -1 or blk: {
+                        const decoded = numeric.Ops(config.numeric_digits).decodeTypmod(column.typmod) orelse break :blk false;
+                        break :blk decoded.precision >= 1 and decoded.precision <= config.numeric_digits and decoded.scale >= -1000 and decoded.scale <= 1000;
+                    },
+                    .timestamp, .timestamptz => column.typmod >= -1 and column.typmod <= 6,
+                    else => column.typmod == -1,
+                };
+                if (!typmod_ok) return error.InvalidChangeRecord;
                 const flags = try reader.int(u8);
                 if (flags > 3) return error.InvalidChangeRecord;
                 column.not_null = flags & 1 != 0;

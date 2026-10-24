@@ -4,6 +4,7 @@
 //! intended only for a caller that explicitly binds to a trusted interface.
 //! SQL semantics are those provided by DB; unsupported features return SQLSTATE.
 const scram = @import("scram");
+const pg_types = @import("pg_types.sig");
 pub const max_packet: usize = 16384;
 pub const sql_capacity: usize = 4096;
 pub const statement_capacity: usize = 8;
@@ -141,8 +142,15 @@ const Writer = struct {
 };
 
 pub fn Session(comptime DB: type) type {
+    const T = pg_types.Types(DB.Result);
     return struct {
         const Self = @This();
+        const utc_session: T.Session = .{};
+
+        fn valueSession(db: *DB) *const T.Session {
+            if (@hasDecl(DB, "valueSession")) return db.valueSession();
+            return &utc_session;
+        }
         const Name = struct {
             bytes: [64]u8 = @splat(0),
             len: usize = 0,
@@ -237,7 +245,7 @@ pub fn Session(comptime DB: type) type {
                     close = true;
                 };
             } else if (self.authentication != null and self.authentication.?.state != .complete) {
-                self.authenticate(input[0], input[5..total], &w) catch {
+                self.authenticate(db, input[0], input[5..total], &w) catch {
                     self.authentication.?.state = .failed;
                     w.at = 0;
                     try authenticationFailure(&w);
@@ -298,9 +306,9 @@ pub fn Session(comptime DB: type) type {
                 self.startup = true;
                 return;
             }
-            try self.authenticationComplete(w);
+            try self.authenticationComplete(db, w);
         }
-        fn authenticate(self: *Self, tag: u8, payload: []const u8, w: *Writer) !void {
+        fn authenticate(self: *Self, db: *DB, tag: u8, payload: []const u8, w: *Writer) !void {
             if (tag != 'p' or payload.len > scram.max_message + 64) return error.AuthenticationFailed;
             const auth = &self.authentication.?;
             var message: [512]u8 = undefined;
@@ -322,20 +330,25 @@ pub fn Session(comptime DB: type) type {
                 try w.u32be(12);
                 try w.append(final);
                 w.end(p);
-                try self.authenticationComplete(w);
+                try self.authenticationComplete(db, w);
             } else return error.AuthenticationFailed;
         }
-        fn authenticationComplete(self: *Self, w: *Writer) !void {
+        fn authenticationComplete(self: *Self, db: *DB, w: *Writer) !void {
             const auth = try w.begin('R');
             try w.u32be(0);
             w.end(auth);
-            try parameter(w, "server_version", "16.0");
-            try parameter(w, "server_encoding", "UTF8");
-            try parameter(w, "client_encoding", "UTF8");
-            try parameter(w, "DateStyle", "ISO, MDY");
-            try parameter(w, "TimeZone", "UTC");
-            try parameter(w, "integer_datetimes", "on");
-            try parameter(w, "standard_conforming_strings", "on");
+            if (@hasDecl(DB, "takeParameterChanges")) {
+                // Every reported setting at startup (design §4.7).
+                try reportParameters(db, w, db.takeParameterChanges());
+            } else {
+                try parameter(w, "server_version", "16.0");
+                try parameter(w, "server_encoding", "UTF8");
+                try parameter(w, "client_encoding", "UTF8");
+                try parameter(w, "DateStyle", "ISO, MDY");
+                try parameter(w, "TimeZone", "UTC");
+                try parameter(w, "integer_datetimes", "on");
+                try parameter(w, "standard_conforming_strings", "on");
+            }
             const key = try w.begin('K');
             try w.u32be(self.backend_pid);
             try w.u32be(self.backend_secret);
@@ -345,8 +358,20 @@ pub fn Session(comptime DB: type) type {
             w.end(ready_at);
             self.startup = true;
         }
+        fn reportParameters(db: *DB, w: *Writer, mask: u16) !void {
+            if (!@hasDecl(DB, "takeParameterChanges")) return;
+            const names = DB.reportedParameters();
+            for (names, 0..) |name, index| {
+                if (mask & (@as(u16, 1) << @intCast(index)) == 0) continue;
+                var buffer: [64]u8 = undefined;
+                try parameter(w, name, db.parameterValue(index, &buffer));
+            }
+        }
         fn ready(self: *Self, db: *DB, w: *Writer) !void {
             _ = self;
+            // Changed reported settings precede ReadyForQuery, as PostgreSQL's
+            // ReportChangedGUCOptions.
+            if (@hasDecl(DB, "takeParameterChanges")) try reportParameters(db, w, db.takeParameterChanges());
             const p = try w.begin('Z');
             try w.byte(if (@hasDecl(DB, "transactionStatus")) db.transactionStatus() else 'I');
             w.end(p);
@@ -369,7 +394,7 @@ pub fn Session(comptime DB: type) type {
                         try self.execute(db, source);
                         if (self.result.column_count != 0) {
                             try self.description(w, null);
-                            try self.rows(w, null, 0, self.result.row_count);
+                            try self.rows(db, w, null, 0, self.result.row_count);
                         }
                         try self.command(w, source);
                     }
@@ -437,7 +462,7 @@ pub fn Session(comptime DB: type) type {
                     }
                     if (p.format_count > 1 and p.format_count != self.result.column_count) return error.ProtocolViolation;
                     const end = if (limit == 0) self.result.row_count else @min(self.result.row_count, p.row + limit);
-                    try self.rows(w, p, p.row, end);
+                    try self.rows(db, w, p, p.row, end);
                     p.row = end;
                     if (end < self.result.row_count) try w.empty('s') else {
                         try self.command(w, p.source());
@@ -651,7 +676,7 @@ pub fn Session(comptime DB: type) type {
                     }
                     if (token[0] == '$') {
                         if (column_index >= count_columns) return error.ColumnCapacity;
-                        try inferOid(s, token, self.result.column_types[mapping[column_index]]);
+                        try inferOid(s, token, T.oid(self.result.column_types[mapping[column_index]]));
                     }
                 }
             } else {
@@ -661,8 +686,14 @@ pub fn Session(comptime DB: type) type {
                     const token = tokens.next();
                     if (token.len == 0) break;
                     if (token[0] == '$') {
-                        if (column_index) |i| try inferOid(s, token, self.result.column_types[i]);
-                    } else if (identifier(token)) column_index = self.column(token);
+                        if (column_index) |i| try inferOid(s, token, T.oid(self.result.column_types[i]));
+                    } else if (identifier(token)) {
+                        column_index = self.column(token);
+                    } else if (token[0] != '=' and token[0] != '<' and token[0] != '>' and token[0] != '!' and token[0] != ' ') {
+                        // `col ->> $1`, `col + $1`: the operator decides the
+                        // parameter type, not the column; leave it unknown.
+                        column_index = null;
+                    }
                 }
             }
             for (s.oids[0..s.count]) |*oid| if (oid.* == 0) {
@@ -695,7 +726,9 @@ pub fn Session(comptime DB: type) type {
                 if (size == 0xffffffff) try l.append("NULL") else {
                     const bytes = try r.take(size);
                     const fmt = if (nf == 0) 0 else formats[if (nf == 1) 0 else i];
-                    try literal(&l, bytes, s.oids[i], fmt);
+                    if (T.handles(s.oids[i])) {
+                        l.at += T.literal(bytes, s.oids[i], fmt, l.bytes[l.at..]) catch |err| return if (err == error.BufferTooSmall) error.StatementCapacity else err;
+                    } else try literal(&l, bytes, s.oids[i], fmt);
                 }
                 values[i] = l.bytes[begin..l.at];
             }
@@ -741,19 +774,10 @@ pub fn Session(comptime DB: type) type {
                 try w.u32be(0);
                 try w.u16be(0);
                 const data_type = self.result.column_types[i];
-                try w.u32be(switch (data_type) {
-                    .integer => 20,
-                    .integer32 => 23,
-                    .boolean => 16,
-                    .text => 25,
-                });
-                try w.u16be(switch (data_type) {
-                    .integer => 8,
-                    .integer32 => 4,
-                    .boolean => 1,
-                    .text => 0xffff,
-                });
-                try w.u32be(0xffffffff);
+                try w.u32be(T.oid(data_type));
+                try w.u16be(@bitCast(T.length(data_type)));
+                const typmod: i32 = if (@hasField(DB.Result, "column_typmods")) self.result.column_typmods[i] else -1;
+                try w.u32be(@bitCast(typmod));
                 if (portal_value) |v| {
                     if (v.format_count > 1 and v.format_count != self.result.column_count) return error.ProtocolViolation;
                     try w.u16be(v.format(i));
@@ -761,7 +785,8 @@ pub fn Session(comptime DB: type) type {
             }
             w.end(p);
         }
-        fn rows(self: *Self, w: *Writer, portal_value: ?*const Portal, first: usize, end: usize) !void {
+        fn rows(self: *Self, db: *DB, w: *Writer, portal_value: ?*const Portal, first: usize, end: usize) !void {
+            const session = valueSession(db);
             for (first..end) |row| {
                 const p = try w.begin('D');
                 try w.u16be(@intCast(self.result.column_count));
@@ -778,12 +803,11 @@ pub fn Session(comptime DB: type) type {
                     switch (cell) {
                         .null_value => unreachable,
                         .integer => |n| if (binary) {
-                            const bits: u64 = @bitCast(n);
-                            if (self.result.column_types[i] != .integer32) try w.u32be(@truncate(bits >> 32));
-                            try w.u32be(@truncate(bits));
+                            w.at += T.sendBinary(&cell, self.result.column_types[i], session, w.bytes[w.at..]) catch return error.BufferTooSmall;
                         } else try w.number(n),
                         .boolean => |b| try w.byte(if (binary) @intFromBool(b) else if (b) 't' else 'f'),
                         .text => |t| try w.append(t.slice()),
+                        else => w.at += (if (binary) T.sendBinary(&cell, self.result.column_types[i], session, w.bytes[w.at..]) else T.sendText(&cell, session, w.bytes[w.at..])) catch return error.BufferTooSmall,
                     }
                     write32(w.bytes[length..][0..4], @intCast(w.at - start));
                 }
@@ -886,6 +910,14 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "InvalidEscapeSequence")) return "22025";
     if (equal(name, "UndefinedParameter")) return "42P02";
     if (equal(name, "InvalidColumnReference")) return "42P10";
+    if (equal(name, "NumericValueOutOfRange")) return "22003";
+    if (equal(name, "NumericCapacity")) return "54000";
+    if (equal(name, "InvalidParameterValue")) return "22023";
+    if (equal(name, "InvalidDatetimeFormat")) return "22007";
+    if (equal(name, "DatetimeFieldOverflow")) return "22008";
+    if (equal(name, "UntranslatableCharacter")) return "22P05";
+    if (equal(name, "ClockUnavailable")) return "0A000";
+    if (equal(name, "TimeZoneCapacity")) return "53200";
     if (equal(name, "StatementTooComplex")) return "54001";
     if (equal(name, "VersionCapacity")) return "53200";
     if (equal(name, "TableCapacity") or equal(name, "ColumnCapacity") or equal(name, "RowCapacity") or
@@ -1017,7 +1049,7 @@ const Tokens = struct {
         return self.source[begin..self.at];
     }
 };
-fn inferOid(s: anytype, token: []const u8, data_type: anytype) !void {
+fn inferOid(s: anytype, token: []const u8, oid: u32) !void {
     var n: usize = 0;
     for (token[1..]) |c| {
         if (c < '0' or c > '9') return error.Syntax;
@@ -1025,12 +1057,6 @@ fn inferOid(s: anytype, token: []const u8, data_type: anytype) !void {
         if (n > parameter_capacity) return error.ParameterCapacity;
     }
     if (n == 0 or n > s.count) return error.ProtocolViolation;
-    const oid: u32 = switch (data_type) {
-        .integer => 20,
-        .integer32 => 23,
-        .boolean => 16,
-        .text => 25,
-    };
     const previous = s.oids[n - 1];
     const integer_conversion = (oid == 20 or oid == 23) and (previous == 20 or previous == 21 or previous == 23);
     if (previous != 0 and previous != oid and !integer_conversion) return error.TypeMismatch;

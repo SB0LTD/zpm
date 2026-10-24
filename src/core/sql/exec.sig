@@ -8,6 +8,7 @@ const ast = @import("ast.sig");
 const storage = @import("storage.sig");
 const expr = @import("expr.sig");
 const binder = @import("binder.sig");
+const value_module = @import("value.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -120,8 +121,8 @@ pub fn Exec(comptime config: types.Config) type {
         /// PostgreSQL's LockRows does: it returns the version to emit (the
         /// newest committed one, whose WHERE is re-checked here when it
         /// changed), null to skip the row, or WouldBlock to park.
-        pub fn select(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, query: *const B.Select, snap: storage.Snapshot, result: anytype, locker: anytype) Error!void {
-            var ctx: E.Context = .{ .source = source, .pool = pool };
+        pub fn select(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, query: *const B.Select, snap: storage.Snapshot, result: anytype, locker: anytype, session: *const value_module.Session) Error!void {
+            var ctx: E.Context = .{ .source = source, .pool = pool, .session = session };
             var plain = true;
             for (query.targets[0..query.count]) |id| plain = plain and simple(pool, id);
             if (query.table == null) {
@@ -212,6 +213,7 @@ pub fn Exec(comptime config: types.Config) type {
             for (0..query.count) |index| {
                 result.column_names[index] = query.names[index];
                 result.column_types[index] = query.types[index];
+                result.column_typmods[index] = query.typmods[index];
             }
         }
     };

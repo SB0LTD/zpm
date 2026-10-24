@@ -34,6 +34,18 @@ rejected rather than overwriting it.
 
 PostgreSQL supports simple and extended queries, named statement lifecycle,
 typed text/binary parameters and rows, SQLSTATE errors and synchronization.
+`pg_types.sig` implements binary send/receive for every SQL type (NUMERIC
+base-10000 digits, int64 microsecond timestamps, interval, JSONB version 1,
+float4/8, int2, oid, name) and renders parameters as `'...'::type` literals;
+RowDescription carries type OIDs, lengths and typmods. ParameterStatus reports
+application_name, client_encoding, DateStyle, integer_datetimes,
+IntervalStyle, server_encoding, server_version (16.0),
+standard_conforming_strings and TimeZone at startup, and every changed value
+before ReadyForQuery (`Connection.takeParameterChanges`). The store resolves
+TimeZone through the caller's `zone_provider` (TZif bytes it owns), built-in
+UTC or POSIX TZ strings, and supplies statement/transaction timestamps from
+`wall_clock`. MySQL and TDS sessions return the step 3.2 types as text columns
+(`Result.textify`).
 MySQL supports protocol 10, COM_QUERY, PING, INIT_DB and text results; COM_STMT
 binary preparation is not implemented. TDS 7.2–7.4 supports PRELOGIN/LOGIN7,
 SQL_BATCH, typed nullable values, packet fragmentation, transaction-manager

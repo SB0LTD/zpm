@@ -1,0 +1,43 @@
+//! Real-time (wall) clock in microseconds since the Unix epoch (Layer 1).
+//! Per-OS structure follows entropy.sig: Windows uses
+//! GetSystemTimePreciseAsFileTime, Linux the clock_gettime(CLOCK_REALTIME)
+//! system call and macOS libSystem clock_gettime. Any other target (native
+//! SB0 today) reports ClockUnavailable; callers fail statements that need the
+//! clock (SQL now(), current_timestamp) instead of inventing a time.
+const std = @import("std");
+const builtin = @import("builtin");
+
+const Win = struct {
+    extern "kernel32" fn GetSystemTimePreciseAsFileTime(*u64) callconv(.c) void;
+};
+const Darwin = struct {
+    const Timespec = extern struct { sec: isize, nsec: isize };
+    extern "c" fn clock_gettime(c_int, *Timespec) c_int;
+};
+
+pub const Error = error{ClockUnavailable};
+
+/// Whether this target has a wall clock at all.
+pub const available = builtin.os.tag == .windows or builtin.os.tag == .linux or builtin.os.tag == .macos;
+
+/// 100 ns FILETIME ticks between 1601-01-01 and 1970-01-01.
+const filetime_unix_offset: u64 = 116444736000000000;
+
+/// Microseconds since 1970-01-01 00:00:00 UTC.
+pub fn nowUs() Error!i64 {
+    if (builtin.os.tag == .windows) {
+        var ticks: u64 = 0;
+        Win.GetSystemTimePreciseAsFileTime(&ticks);
+        if (ticks < filetime_unix_offset) return error.ClockUnavailable;
+        return @intCast((ticks - filetime_unix_offset) / 10);
+    } else if (builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.ClockUnavailable;
+        return @as(i64, @intCast(ts.sec)) * 1000000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1000);
+    } else if (builtin.os.tag == .macos) {
+        var ts: Darwin.Timespec = undefined;
+        if (Darwin.clock_gettime(0, &ts) != 0) return error.ClockUnavailable; // CLOCK_REALTIME
+        return @as(i64, @intCast(ts.sec)) * 1000000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1000);
+    } else return error.ClockUnavailable;
+}

@@ -25,6 +25,16 @@
 //! Session settings (SET/SHOW/RESET, SET LOCAL, startup `-c` options) are
 //! transactional like PostgreSQL's: reverted by ROLLBACK and ROLLBACK TO,
 //! SET LOCAL ends with the transaction. Hooks must not reenter this store.
+//!
+//! TimeZone (design §4.2/§4.8): UTC, a number of hours (ISO sign, shown as
+//! `<+05>-05`), a zone name resolved through the caller's zone provider
+//! (canonical spelling reported), or a POSIX TZ string (`UTC+3`, `+05:30`,
+//! west-positive like PostgreSQL). DateStyle accepts ISO with MDY/DMY/YMD
+//! order; IntervalStyle accepts postgres. Each statement runs with a session
+//! (zone, transaction/statement timestamps from `wall_clock`); without a
+//! clock now() and friends fail with 0A000. Changes to reported settings are
+//! exposed to the PostgreSQL codec through takeParameterChanges() so it can
+//! send ParameterStatus before ReadyForQuery.
 
 pub const max_statement_bytes = 65536;
 
@@ -88,17 +98,117 @@ pub const BatchIterator = struct {
     }
 };
 
-/// Session settings this store implements. Times are milliseconds.
-pub const Settings = struct {
-    lock_timeout_ms: u32 = 0,
-    statement_timeout_ms: u32 = 0,
-    application_name: [64]u8 = @splat(0),
-    application_name_len: u8 = 0,
+pub const DateOrder = enum { mdy, dmy, ymd };
 
-    pub fn applicationName(self: *const Settings) []const u8 {
-        return self.application_name[0..self.application_name_len];
+/// Session settings this store implements. Times are milliseconds.
+pub fn SettingsOf(comptime Zone: type) type {
+    return struct {
+        const Self = @This();
+        lock_timeout_ms: u32 = 0,
+        statement_timeout_ms: u32 = 0,
+        application_name: [64]u8 = @splat(0),
+        application_name_len: u8 = 0,
+        /// TimeZone as SHOW reports it, and the resolved zone.
+        timezone: [64]u8 = [_]u8{ 'U', 'T', 'C' } ++ @as([61]u8, @splat(0)),
+        timezone_len: u8 = 3,
+        zone: Zone = .{},
+        date_order: DateOrder = .mdy,
+
+        pub fn applicationName(self: *const Self) []const u8 {
+            return self.application_name[0..self.application_name_len];
+        }
+
+        pub fn timeZone(self: *const Self) []const u8 {
+            return self.timezone[0..self.timezone_len];
+        }
+
+        pub fn dateStyle(self: *const Self) []const u8 {
+            return switch (self.date_order) {
+                .mdy => "ISO, MDY",
+                .dmy => "ISO, DMY",
+                .ymd => "ISO, YMD",
+            };
+        }
+    };
+}
+
+/// ParameterStatus names, in the order the codec reports them.
+pub const reported_parameters = [_][]const u8{ "application_name", "client_encoding", "DateStyle", "integer_datetimes", "IntervalStyle", "server_encoding", "server_version", "standard_conforming_strings", "TimeZone" };
+
+fn digitByte(byte: u8) bool {
+    return byte >= '0' and byte <= '9';
+}
+
+/// A plain (possibly signed, fractional) number of hours.
+fn hoursValue(text: []const u8) ?i64 {
+    var index: usize = 0;
+    var negative = false;
+    if (index < text.len and (text[index] == '+' or text[index] == '-')) {
+        negative = text[index] == '-';
+        index += 1;
     }
-};
+    var whole: i64 = 0;
+    var digits: usize = 0;
+    while (index < text.len and digitByte(text[index])) : (index += 1) {
+        whole = whole * 10 + (text[index] - '0');
+        digits += 1;
+        if (whole > 1000) return null;
+    }
+    var micro_hours: i64 = 0;
+    if (index < text.len and text[index] == '.') {
+        index += 1;
+        var scale: i64 = 100000;
+        while (index < text.len and digitByte(text[index])) : (index += 1) {
+            micro_hours += (text[index] - '0') * scale;
+            scale = @divTrunc(scale, 10);
+            digits += 1;
+        }
+    }
+    if (digits == 0 or index != text.len) return null;
+    // Seconds east (SQL sign), rounded to whole seconds.
+    const seconds = whole * 3600 + @divTrunc(micro_hours * 3600 + 500000, 1000000);
+    return if (negative) -seconds else seconds;
+}
+
+/// pg_tzset_offset display: `<+05>-05`, `<-03:30>+03:30` (east positive).
+fn offsetName(east: i64, out: *[64]u8) u8 {
+    var parts: [16]u8 = undefined;
+    var used: usize = 0;
+    var magnitude: u64 = @abs(east);
+    const push2 = struct {
+        fn call(buffer: []u8, at: *usize, value: u64) void {
+            buffer[at.*] = @intCast('0' + (value / 10) % 10);
+            buffer[at.* + 1] = @intCast('0' + value % 10);
+            at.* += 2;
+        }
+    }.call;
+    const hours = magnitude / 3600;
+    if (hours >= 100) {
+        parts[used] = @intCast('0' + hours / 100);
+        used += 1;
+    }
+    push2(&parts, &used, hours);
+    magnitude %= 3600;
+    if (magnitude != 0) {
+        parts[used] = ':';
+        used += 1;
+        push2(&parts, &used, magnitude / 60);
+        magnitude %= 60;
+        if (magnitude != 0) {
+            parts[used] = ':';
+            used += 1;
+            push2(&parts, &used, magnitude);
+        }
+    }
+    const inner = if (east >= 0) "+" else "-";
+    const outer = if (east >= 0) "-" else "+";
+    var at: usize = 0;
+    for ([_][]const u8{ "<", inner, parts[0..used], ">", outer, parts[0..used] }) |piece| {
+        @memcpy(out[at..][0..piece.len], piece);
+        at += piece.len;
+    }
+    return @intCast(at);
+}
 
 /// One-time deadlock check delay (PostgreSQL's default deadlock_timeout).
 pub const deadlock_timeout_ms: u32 = 1000;
@@ -169,9 +279,19 @@ fn formatMilliseconds(value: u32, out: []u8) []const u8 {
 }
 
 pub fn Store(comptime Raw: type) type {
+    // Raw adapters without session values (test doubles) get a unit zone.
+    const has_session = @hasDecl(Raw, "Zone");
+    const Zone = if (has_session) Raw.Zone else struct {};
+    const Settings = SettingsOf(Zone);
     return struct {
         const Self = @This();
         pub const CommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
+        pub const ZoneProvider = struct {
+            context: ?*anyopaque = null,
+            /// Resolves a zone name; writes the canonical spelling and
+            /// returns its length. Unknown names fail (22023).
+            lookup: *const fn (?*anyopaque, []const u8, *Zone, *[64]u8) anyerror!usize,
+        };
 
         database: Raw = .{},
         commit_ctx: ?*anyopaque = null,
@@ -186,6 +306,46 @@ pub fn Store(comptime Raw: type) type {
         /// Monotonic time in nanoseconds, set by the caller before each call
         /// (wait starts, timeouts and deadlock checks use it).
         now_ns: i64 = 0,
+        /// Wall clock in PostgreSQL-epoch microseconds; null without one
+        /// (now() and friends then fail with 0A000).
+        wall_clock: ?*const fn () ?i64 = null,
+        /// Named time zones (RAMSQL's zone directory); null = UTC and
+        /// POSIX/offset zones only.
+        zone_provider: ?ZoneProvider = null,
+
+        /// Zone name -> zone: the provider (exact, then case-insensitive),
+        /// built-in UTC, then a POSIX TZ string, as PostgreSQL's pg_tzset.
+        fn resolveZone(self: *const Self, name: []const u8, zone: *Zone, spelled: *[64]u8) !usize {
+            if (name.len == 0 or name.len > 64) return error.InvalidSettingValue;
+            if (self.zone_provider) |provider| {
+                if (provider.lookup(provider.context, name, zone, spelled)) |length| return length else |err| {
+                    // A full zone cache is a capacity error (53200), not an unknown name.
+                    if (err == error.TimeZoneCapacity) return err;
+                }
+            }
+            if (!has_session) return error.InvalidSettingValue;
+            if (sameInsensitive(name, "UTC") or sameInsensitive(name, "GMT") or sameInsensitive(name, "Etc/UTC") or sameInsensitive(name, "Zulu")) {
+                zone.* = .{};
+                const label: []const u8 = if (sameInsensitive(name, "Etc/UTC")) "Etc/UTC" else if (sameInsensitive(name, "GMT")) "GMT" else if (sameInsensitive(name, "Zulu")) "Zulu" else "UTC";
+                @memcpy(spelled[0..label.len], label);
+                return label.len;
+            }
+            const rule = Raw.tzif.parsePosix(name) catch return error.InvalidSettingValue;
+            zone.* = if (rule.has_dst) .{ .kind = .posix, .posix = rule } else .{ .kind = .fixed, .offset = rule.std_offset };
+            for (name, 0..) |byte, index| spelled[index] = upper(byte);
+            return name.len;
+        }
+
+        fn resolverLookup(context: ?*anyopaque, name: []const u8, zone: *Zone) Raw.SqlError!void {
+            const self: *const Self = @ptrCast(@alignCast(context.?));
+            var spelled: [64]u8 = undefined;
+            _ = self.resolveZone(name, zone, &spelled) catch return error.InvalidParameterValue;
+        }
+
+        fn wallNow(self: *const Self) ?i64 {
+            const clock = self.wall_clock orelse return null;
+            return clock();
+        }
 
         fn storageReady(self: *const Self) !void {
             if (self.storage_failed or (self.durability_required and self.commit_fn == null)) return error.StorageUnavailable;
@@ -237,6 +397,7 @@ pub fn Store(comptime Raw: type) type {
         };
 
         const SavedSettings = struct { current: Settings, base: Settings };
+        const ReportedValue = struct { bytes: [64]u8 = @splat(0), len: u8 = 0, valid: bool = false };
 
         pub const Connection = struct {
             pub const Result = Raw.Result;
@@ -260,6 +421,54 @@ pub fn Store(comptime Raw: type) type {
             cancel_requested: bool = false,
             /// Savepoint depth of the last ROLLBACK TO, for the codec's portals.
             rolled_back_to: ?usize = null,
+            /// Wall-clock start of the open (or implicit) transaction and of
+            /// the current statement, PostgreSQL-epoch microseconds.
+            transaction_us: ?i64 = null,
+            statement_us: ?i64 = null,
+            /// Values last reported through ParameterStatus.
+            reported: [reported_parameters.len]ReportedValue = @splat(.{}),
+
+            pub fn reportedParameters() []const []const u8 {
+                return &reported_parameters;
+            }
+
+            /// Current value of reported_parameters[index].
+            pub fn parameterValue(self: *const Connection, index: usize, out: *[64]u8) []const u8 {
+                const value: []const u8 = switch (index) {
+                    0 => self.settings.applicationName(),
+                    1, 5 => "UTF8",
+                    2 => self.settings.dateStyle(),
+                    3, 7 => "on",
+                    4 => "postgres",
+                    6 => "16.0",
+                    8 => self.settings.timeZone(),
+                    else => unreachable,
+                };
+                @memcpy(out[0..value.len], value);
+                return out[0..value.len];
+            }
+
+            /// Bit i set: reported_parameters[i] changed since the last call
+            /// (all bits on the first call). Marks them reported.
+            pub fn takeParameterChanges(self: *Connection) u16 {
+                var mask: u16 = 0;
+                for (&self.reported, 0..) |*entry, index| {
+                    var buffer: [64]u8 = undefined;
+                    const current = self.parameterValue(index, &buffer);
+                    if (!entry.valid or !same(entry.bytes[0..entry.len], current)) {
+                        mask |= @as(u16, 1) << @intCast(index);
+                        @memcpy(entry.bytes[0..current.len], current);
+                        entry.len = @intCast(current.len);
+                        entry.valid = true;
+                    }
+                }
+                return mask;
+            }
+
+            /// Session values (zone, clocks) for output formatting.
+            pub fn valueSession(self: *Connection) *const Raw.SessionValues {
+                return &self.db().session;
+            }
 
             /// Number of established savepoints (portal bookkeeping).
             pub fn savepointLevel(self: *const Connection) usize {
@@ -280,6 +489,13 @@ pub fn Store(comptime Raw: type) type {
                     .mysql => .mysql,
                     .tds => .tds,
                 };
+                if (comptime has_session) raw.session = .{
+                    .zone = self.settings.zone,
+                    .resolver = .{ .context = @ptrCast(self.store), .lookup = &resolverLookup },
+                    .transaction_us = self.transaction_us orelse self.statement_us,
+                    .statement_us = self.statement_us,
+                    .clock = self.store.wall_clock,
+                };
                 return raw;
             }
 
@@ -291,12 +507,14 @@ pub fn Store(comptime Raw: type) type {
                 self.tx = try self.db().begin();
                 self.in_transaction = true;
                 self.failed = false;
+                self.transaction_us = self.store.wallNow();
                 self.tx_start = self.settings;
                 self.base = self.settings;
                 self.saved_len = 0;
             }
 
             fn endTransaction(self: *Connection, committed: bool) void {
+                self.transaction_us = null;
                 self.settings = if (committed) self.base else self.tx_start;
                 self.base = self.settings;
                 self.tx = null;
@@ -338,6 +556,20 @@ pub fn Store(comptime Raw: type) type {
                 if (self.tx) |slot| self.db().failScope(slot);
                 self.failed = true;
                 self.pending = .{};
+                self.revertSettings();
+            }
+
+            /// An error inside a block reverts settings made since the
+            /// innermost savepoint (or BEGIN) at once, as PostgreSQL's
+            /// AbortTransaction / AbortSubTransaction (AtEOXact_GUC) do.
+            fn revertSettings(self: *Connection) void {
+                if (self.saved_len > 0) {
+                    self.settings = self.saved[self.saved_len - 1].current;
+                    self.base = self.saved[self.saved_len - 1].base;
+                } else {
+                    self.settings = self.tx_start;
+                    self.base = self.tx_start;
+                }
             }
 
             pub fn transactionStatus(self: *const Connection) u8 {
@@ -431,7 +663,6 @@ pub fn Store(comptime Raw: type) type {
             }
 
             fn assign(self: *Connection, target: *Settings, which: Parameter, value: []const u8, is_default: bool) !void {
-                _ = self;
                 switch (which) {
                     .lock_timeout => target.lock_timeout_ms = if (is_default and value.len == 0) 0 else try parseMilliseconds(value),
                     .statement_timeout => target.statement_timeout_ms = if (is_default and value.len == 0) 0 else try parseMilliseconds(value),
@@ -443,13 +674,67 @@ pub fn Store(comptime Raw: type) type {
                     .transaction_isolation, .default_transaction_isolation => {
                         if (!(value.len == 0 or sameInsensitive(value, "read committed") or sameInsensitive(value, "read uncommitted"))) return error.UnsupportedStatement;
                     },
-                    .timezone => if (!(value.len == 0 or sameInsensitive(value, "UTC") or sameInsensitive(value, "Etc/UTC"))) return error.InvalidSettingValue,
+                    .timezone => try self.assignZone(target, value),
                     .client_encoding => if (!(value.len == 0 or sameInsensitive(value, "UTF8") or sameInsensitive(value, "UTF-8"))) return error.InvalidSettingValue,
                     .standard_conforming_strings => if (!(value.len == 0 or sameInsensitive(value, "on") or sameInsensitive(value, "true"))) return error.InvalidSettingValue,
-                    .datestyle => if (!(value.len == 0 or sameInsensitive(value, "ISO, MDY") or sameInsensitive(value, "ISO"))) return error.InvalidSettingValue,
+                    .datestyle => target.date_order = try dateOrder(value, target.date_order),
                     .intervalstyle => if (!(value.len == 0 or sameInsensitive(value, "postgres"))) return error.InvalidSettingValue,
                     .deadlock_timeout, .server_version, .server_encoding, .integer_datetimes, .search_path => return error.InvalidSettingValue,
                 }
+            }
+
+            fn assignZone(self: *Connection, target: *Settings, raw_value: []const u8) !void {
+                var value = raw_value;
+                while (value.len != 0 and whitespace(value[0])) value = value[1..];
+                while (value.len != 0 and whitespace(value[value.len - 1])) value = value[0 .. value.len - 1];
+                if (value.len == 0 or sameInsensitive(value, "local") or sameInsensitive(value, "default")) {
+                    target.zone = .{};
+                    target.timezone_len = 3;
+                    @memcpy(target.timezone[0..3], "UTC");
+                    return;
+                }
+                if (hoursValue(value)) |east| {
+                    if (!has_session) return error.InvalidSettingValue;
+                    // PostgreSQL limits numeric zones to +-15:59:59... via
+                    // pg_tzset_offset's range; reject beyond 168 hours.
+                    if (east > 168 * 3600 or east < -168 * 3600) return error.InvalidSettingValue;
+                    target.zone = .{ .kind = .fixed, .offset = @intCast(east) };
+                    target.timezone_len = offsetName(east, &target.timezone);
+                    return;
+                }
+                var zone: Zone = .{};
+                var spelled: [64]u8 = undefined;
+                const length = try self.store.resolveZone(value, &zone, &spelled);
+                target.zone = zone;
+                @memcpy(target.timezone[0..length], spelled[0..length]);
+                target.timezone_len = @intCast(length);
+            }
+
+            /// DateStyle: a comma list of ISO and at most one order keyword.
+            fn dateOrder(value: []const u8, current: DateOrder) !DateOrder {
+                if (value.len == 0) return .mdy;
+                var order = current;
+                var index: usize = 0;
+                while (index <= value.len) {
+                    var end = index;
+                    while (end < value.len and value[end] != ',') end += 1;
+                    var item = value[index..end];
+                    while (item.len != 0 and whitespace(item[0])) item = item[1..];
+                    while (item.len != 0 and whitespace(item[item.len - 1])) item = item[0 .. item.len - 1];
+                    if (sameInsensitive(item, "ISO")) {
+                        // The only output style implemented (non-ISO styles: F3).
+                    } else if (sameInsensitive(item, "MDY") or sameInsensitive(item, "US") or sameInsensitive(item, "NONEURO") or sameInsensitive(item, "NONEUROPEAN")) {
+                        order = .mdy;
+                    } else if (sameInsensitive(item, "DMY") or sameInsensitive(item, "EURO") or sameInsensitive(item, "EUROPEAN")) {
+                        order = .dmy;
+                    } else if (sameInsensitive(item, "YMD")) {
+                        order = .ymd;
+                    } else if (sameInsensitive(item, "DEFAULT")) {
+                        order = .mdy;
+                    } else return error.InvalidSettingValue;
+                    index = end + 1;
+                }
+                return order;
             }
 
             fn showValue(self: *const Connection, which: Parameter, out: []u8) []const u8 {
@@ -459,10 +744,10 @@ pub fn Store(comptime Raw: type) type {
                     .deadlock_timeout => return formatMilliseconds(deadlock_timeout_ms, out),
                     .application_name => self.settings.applicationName(),
                     .transaction_isolation, .default_transaction_isolation => "read committed",
-                    .timezone => "UTC",
+                    .timezone => self.settings.timeZone(),
                     .client_encoding, .server_encoding => "UTF8",
                     .standard_conforming_strings, .integer_datetimes => "on",
-                    .datestyle => "ISO, MDY",
+                    .datestyle => self.settings.dateStyle(),
                     .intervalstyle => "postgres",
                     .server_version => "16.0",
                     .search_path => "\"$user\", public",
@@ -610,6 +895,12 @@ pub fn Store(comptime Raw: type) type {
                         target.application_name = source.application_name;
                         target.application_name_len = source.application_name_len;
                     },
+                    .timezone => {
+                        target.timezone = source.timezone;
+                        target.timezone_len = source.timezone_len;
+                        target.zone = source.zone;
+                    },
+                    .datestyle => target.date_order = source.date_order,
                     else => {},
                 }
             }
@@ -625,6 +916,7 @@ pub fn Store(comptime Raw: type) type {
                 } else {
                     self.db().failScope(slot);
                     self.failed = true;
+                    self.revertSettings();
                 }
             }
 
@@ -779,6 +1071,7 @@ pub fn Store(comptime Raw: type) type {
                 }
                 if (self.failed) return error.TransactionFailed;
                 if (!self.autocommit and !self.in_transaction) try self.beginTransaction();
+                self.statement_us = self.store.wallNow();
                 const implicit = !self.in_transaction;
                 const slot = if (self.tx) |slot| slot else blk: {
                     const slot = try self.db().begin();

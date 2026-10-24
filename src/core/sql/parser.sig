@@ -6,10 +6,11 @@
 //! [WHERE e]; DELETE FROM t [WHERE e]; BEGIN/COMMIT/ROLLBACK [TRANSACTION].
 //!
 //! Expressions use PostgreSQL precedence, lowest first: OR, AND, NOT, IS,
-//! comparison (non-associative), BETWEEN/IN/LIKE/ILIKE, `||` (and JSON
-//! operators, tokenized only), `+ -`, `* / %`, unary `+ -`, `::`. Primaries
-//! are literals, (qualified) columns, parentheses, CASE, CAST, COALESCE,
-//! NULLIF, function calls and `$n`. Recursion and tree depth are bounded by
+//! comparison (non-associative), BETWEEN/IN/LIKE/ILIKE, `||` and the JSON
+//! operators, `+ -`, `* / %`, AT TIME ZONE, unary `+ -`, `::`. Primaries
+//! are literals (including typed literals such as DATE '...'), (qualified)
+//! columns, parentheses, CASE, CAST, COALESCE, NULLIF, function calls,
+//! CURRENT_TIMESTAMP / CURRENT_DATE and `$n`. Recursion and tree depth are bounded by
 //! Config.expr_depth and nodes by Config.expr_nodes (StatementTooComplex).
 //!
 //! `legacy_alpha` first runs the frozen alpha recognizer (alpha.sig) so kind
@@ -18,6 +19,7 @@ const types = @import("types.sig");
 const lexer = @import("lexer.sig");
 const ast = @import("ast.sig");
 const alpha = @import("alpha.sig");
+const numeric = @import("numeric.sig");
 const Error = types.Error;
 const Token = lexer.Token;
 const Symbol = lexer.Symbol;
@@ -97,6 +99,10 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn expectSymbol(self: *Self, symbol: Symbol) Error!void {
             if (!try self.takeSymbol(symbol)) return error.Syntax;
+        }
+
+        fn wordIs(source: []const u8, token: Token, comptime wanted: []const u8) bool {
+            return token.kind == .word and types.keyword(token.raw(source), wanted);
         }
 
         fn finish(self: *Self) Error!void {
@@ -321,19 +327,87 @@ pub fn Parser(comptime config: types.Config) type {
             return .read_uncommitted;
         }
 
-        fn typeName(self: *Self) Error!ast.TypeName {
-            const out: ast.TypeName = if (self.isWord("INTEGER") or self.isWord("INT") or self.isWord("INT4"))
-                .integer
-            else if (self.isWord("BIGINT") or self.isWord("INT8"))
-                .bigint
-            else if (self.isWord("BOOLEAN") or self.isWord("BOOL"))
-                .boolean
-            else if (self.isWord("TEXT"))
-                .text
-            else
-                return error.Syntax;
+        pub const TypeSpec = struct { ty: ast.TypeName, typmod: i32 = -1 };
+
+        fn typeWord(token: Token) bool {
+            return switch (token.keyword) {
+                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb => true,
+                else => false,
+            };
+        }
+
+        fn typmodNumber(self: *Self) Error!i32 {
+            var negative = false;
+            if (try self.takeSymbol(.minus)) negative = true;
+            if (self.current.kind != .integer or self.current.integer > 100000) return error.Syntax;
+            const value: i32 = @intCast(self.current.integer);
             try self.advance();
-            return out;
+            return if (negative) -value else value;
+        }
+
+        /// `(p)` timestamp precision: 0..6, larger values clamp to 6 as
+        /// PostgreSQL does (it also warns).
+        fn precision(self: *Self) Error!i32 {
+            if (!try self.takeSymbol(.lparen)) return -1;
+            const value = try self.typmodNumber();
+            try self.expectSymbol(.rparen);
+            if (value < 0) return error.InvalidParameterValue;
+            return @min(value, 6);
+        }
+
+        fn typeName(self: *Self) Error!TypeSpec {
+            const word = self.current;
+            if (word.kind != .word or !typeWord(word)) return error.Syntax;
+            try self.advance();
+            return switch (word.keyword) {
+                .integer, .int, .int4 => .{ .ty = .int4 },
+                .bigint, .int8 => .{ .ty = .int8 },
+                .smallint, .int2 => .{ .ty = .int2 },
+                .boolean, .@"bool" => .{ .ty = .boolean },
+                .text => .{ .ty = .text },
+                .name => .{ .ty = .name },
+                .oid => .{ .ty = .oid },
+                .real, .float4 => .{ .ty = .float4 },
+                .float8 => .{ .ty = .float8 },
+                .double => blk: {
+                    try self.expectWord("PRECISION");
+                    break :blk .{ .ty = .float8 };
+                },
+                .float => blk: {
+                    if (!try self.takeSymbol(.lparen)) break :blk .{ .ty = .float8 };
+                    const bits = try self.typmodNumber();
+                    try self.expectSymbol(.rparen);
+                    if (bits < 1 or bits > 53) return error.InvalidParameterValue;
+                    break :blk .{ .ty = if (bits <= 24) .float4 else .float8 };
+                },
+                .numeric, .decimal => blk: {
+                    if (!try self.takeSymbol(.lparen)) break :blk .{ .ty = .numeric };
+                    const p = try self.typmodNumber();
+                    var s: i32 = 0;
+                    if (try self.takeSymbol(.comma)) s = try self.typmodNumber();
+                    try self.expectSymbol(.rparen);
+                    break :blk .{ .ty = .numeric, .typmod = try numeric.Ops(config.numeric_digits).encodeTypmod(p, s) };
+                },
+                .date => .{ .ty = .date },
+                .timestamp => blk: {
+                    const p = try self.precision();
+                    var zoned = false;
+                    if (try self.takeWord("WITH")) {
+                        try self.expectWord("TIME");
+                        try self.expectWord("ZONE");
+                        zoned = true;
+                    } else if (try self.takeWord("WITHOUT")) {
+                        try self.expectWord("TIME");
+                        try self.expectWord("ZONE");
+                    }
+                    break :blk .{ .ty = if (zoned) .timestamptz else .timestamp, .typmod = p };
+                },
+                .timestamptz => .{ .ty = .timestamptz, .typmod = try self.precision() },
+                .interval => .{ .ty = .interval },
+                .json => .{ .ty = .json },
+                .jsonb => .{ .ty = .jsonb },
+                else => unreachable,
+            };
         }
 
         fn create(self: *Self) Error!Ast.CreateTable {
@@ -344,7 +418,9 @@ pub fn Parser(comptime config: types.Config) type {
             while (true) {
                 if (out.count == config.columns) return error.ColumnCapacity;
                 var column: Ast.ColumnDef = .{ .name = try self.identifier() };
-                column.type_name = try self.typeName();
+                const spec = try self.typeName();
+                column.type_name = spec.ty;
+                column.typmod = spec.typmod;
                 var has_not_null = false;
                 while (true) {
                     if (try self.takeWord("NOT")) {
@@ -459,6 +535,11 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn limitValue(self: *Self, out: *Ast.Select) Error!void {
+            if (self.current.kind == .decimal) {
+                // An integer beyond u64 (bigint out of range, as PostgreSQL).
+                for (self.current.raw(self.source)) |byte| if (!types.digit(byte)) return error.Syntax;
+                return error.IntegerOverflow;
+            }
             if (self.current.kind != .integer) return error.Syntax;
             out.limit = self.current.integer;
             try self.advance();
@@ -497,6 +578,8 @@ pub fn Parser(comptime config: types.Config) type {
                 .quoted_word => true,
                 .word => switch (token.keyword) {
                     .from, .as, .where, .order, .limit, .asc, .desc, .nulls => true,
+                    // AT TIME ZONE continues the expression.
+                    .at => false,
                     else => !lexer.reserved(token.keyword),
                 },
                 else => false,
@@ -507,7 +590,8 @@ pub fn Parser(comptime config: types.Config) type {
             try self.enter();
             defer self.leave();
             // Fast path for the common bare column (projection lists).
-            if ((self.current.kind == .word and !lexer.reserved(self.current.keyword)) or self.current.kind == .quoted_word) {
+            const niladic = wordIs(self.source, self.current, "current_timestamp") or wordIs(self.source, self.current, "current_date");
+            if ((self.current.kind == .word and !lexer.reserved(self.current.keyword) and !niladic) or self.current.kind == .quoted_word) {
                 if (ends(try self.peek())) {
                     const name = try self.identifier();
                     return self.pool.add(.{ .kind = .column, .name = name });
@@ -631,7 +715,13 @@ pub fn Parser(comptime config: types.Config) type {
             while (self.current.kind == .symbol) {
                 const op: ast.Op = switch (self.current.symbol) {
                     .concat => .concat,
-                    .arrow, .arrow_text, .path, .path_text, .contains, .contained, .question => .json,
+                    .arrow => .arrow,
+                    .arrow_text => .arrow_text,
+                    .path => .path,
+                    .path_text => .path_text,
+                    .contains => .contains,
+                    .contained => .contained,
+                    .question => .exists,
                     else => break,
                 };
                 try self.advance();
@@ -653,12 +743,27 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn multiplicative(self: *Self) Error!u16 {
-            var left = try self.unary();
+            var left = try self.atZone();
             while (self.isSymbol(.star) or self.isSymbol(.slash) or self.isSymbol(.percent)) {
                 const op: ast.Op = if (self.isSymbol(.star)) .mul else if (self.isSymbol(.slash)) .div else .mod;
                 try self.advance();
-                const right = try self.unary();
+                const right = try self.atZone();
                 left = try self.pool.add(.{ .kind = .binary, .op = op, .a = left, .b = right });
+            }
+            return left;
+        }
+
+        /// `x AT TIME ZONE z` binds tighter than `*` and looser than unary minus.
+        fn atZone(self: *Self) Error!u16 {
+            var left = try self.unary();
+            while (self.isWord("AT")) {
+                const after = try self.peek();
+                if (!after.isWord("TIME")) break;
+                try self.advance();
+                try self.advance();
+                try self.expectWord("ZONE");
+                const zone = try self.unary();
+                left = try self.pool.add(.{ .kind = .at_zone, .a = left, .b = zone });
             }
             return left;
         }
@@ -673,9 +778,8 @@ pub fn Parser(comptime config: types.Config) type {
                 // PostgreSQL negates a numeric constant in the grammar, unless
                 // `::` binds to the constant first.
                 const after = try self.peek();
-                if (!(after.kind == .symbol and after.symbol == .cast)) {
+                if (!(after.kind == .symbol and after.symbol == .cast) and self.current.integer <= 9223372036854775808) {
                     const magnitude = self.current.integer;
-                    if (magnitude > 9223372036854775808) return error.IntegerOverflow;
                     const value: i64 = if (magnitude == 9223372036854775808) -9223372036854775808 else -@as(i64, @intCast(magnitude));
                     try self.advance();
                     return self.pool.add(.{ .kind = .int_literal, .integer = value });
@@ -689,7 +793,7 @@ pub fn Parser(comptime config: types.Config) type {
             var node = try self.primary();
             while (try self.takeSymbol(.cast)) {
                 const target = try self.typeName();
-                node = try self.pool.add(.{ .kind = .cast, .cast_type = target, .a = node });
+                node = try self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = node });
             }
             return node;
         }
@@ -744,8 +848,9 @@ pub fn Parser(comptime config: types.Config) type {
             const token = self.current;
             switch (token.kind) {
                 .integer => {
-                    if (token.integer > 9223372036854775807) return error.IntegerOverflow;
                     try self.advance();
+                    // Integer literals beyond int8 are NUMERIC, as in PostgreSQL.
+                    if (token.integer > 9223372036854775807) return self.pool.add(.{ .kind = .decimal_literal, .name = .{ .span = .{ .start = token.start, .len = token.len } } });
                     return self.pool.add(.{ .kind = .int_literal, .integer = @intCast(token.integer) });
                 },
                 .decimal => {
@@ -781,7 +886,27 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectWord("AS");
                     const target = try self.typeName();
                     try self.expectSymbol(.rparen);
-                    return self.pool.add(.{ .kind = .cast, .cast_type = target, .a = inner });
+                    return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
+                }
+                // Typed literal: DATE '...', TIMESTAMP [WITH TIME ZONE] '...', ...
+                if (typeWord(token)) {
+                    const after = try self.peek();
+                    const multiword = (token.isWord("DOUBLE") and after.isWord("PRECISION")) or
+                        (token.isWord("TIMESTAMP") and (after.isWord("WITH") or after.isWord("WITHOUT"))) or
+                        ((token.isWord("NUMERIC") or token.isWord("DECIMAL") or token.isWord("TIMESTAMP") or token.isWord("TIMESTAMPTZ")) and after.kind == .symbol and after.symbol == .lparen);
+                    if (after.kind == .string or multiword) {
+                        const target = try self.typeName();
+                        if (self.current.kind != .string) return error.Syntax;
+                        const literal = self.current;
+                        try self.advance();
+                        const inner = try self.pool.add(.{ .kind = .text_literal, .text = literal.quoted() });
+                        return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
+                    }
+                }
+                // SQL-standard niladic functions.
+                if (wordIs(self.source, token, "current_timestamp") or wordIs(self.source, token, "current_date")) {
+                    const name = try self.identifier();
+                    return self.pool.add(.{ .kind = .function, .name = name });
                 }
                 if ((self.isWord("COALESCE") or self.isWord("NULLIF")) and lparenNext(try self.peek())) {
                     const is_coalesce = self.isWord("COALESCE");

@@ -29,14 +29,17 @@ pub const Ident = struct {
     len: usize = 0,
 };
 
-/// Declared column / cast target type.
-pub const TypeName = enum { integer, bigint, boolean, text };
+/// Bound expression type (types.Type). Declared column and cast targets use
+/// the same enum (never `unknown`) plus a typmod.
+pub const Type = types.Type;
+pub const TypeName = types.Type;
 
-/// Bound expression type. `unknown` is an untyped string or NULL literal
-/// that has not been resolved by context yet.
-pub const Type = enum { unknown, int4, int8, boolean, text };
+/// `arrow` ->, `arrow_text` ->>, `path` #>, `path_text` #>>, `contains` @>,
+/// `contained` <@, `exists` ?.
+pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists };
 
-pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, json };
+/// Built-in functions bound by name.
+pub const Func = enum { none, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length };
 
 pub const Test = enum { is_null, is_not_null, is_true, is_not_true, is_false, is_not_false, is_unknown, is_not_unknown };
 
@@ -63,6 +66,8 @@ pub const NodeKind = enum {
     nullif,
     cast,
     function,
+    /// `a` AT TIME ZONE `b`.
+    at_zone,
 };
 
 /// Children by kind: unary/not/test/cast `a`; binary/and/or/nullif `a`,`b`;
@@ -79,7 +84,10 @@ pub const Node = struct {
     /// Constant subtree (no column reference); set by the binder.
     constant: bool = false,
     ty: Type = .unknown,
-    cast_type: TypeName = .integer,
+    cast_type: TypeName = .int4,
+    /// Cast target typmod (-1 none).
+    typmod: i32 = -1,
+    func: Func = .none,
     depth: u16 = 1,
     a: u16 = none,
     b: u16 = none,
@@ -129,7 +137,8 @@ pub fn Ast(comptime config: types.Config) type {
 
         pub const ColumnDef = struct {
             name: Ident = .{},
-            type_name: TypeName = .integer,
+            type_name: TypeName = .int4,
+            typmod: i32 = -1,
             not_null: bool = false,
             primary_key: bool = false,
         };

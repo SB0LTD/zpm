@@ -106,6 +106,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-change-log", "tests/test_sql_change_log.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-expr", "tests/test_sql_expr.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-mvcc", "tests/test_sql_mvcc.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-types", "tests/test_sql_types.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try ctx.addModule("db_store", "src/db/store.sig");
     const pg_module = try ctx.addModule("postgres", "src/db/postgres.sig");
     try wire(ctx, pg_module, "scram", "src/db/scram.sig");
@@ -114,14 +115,15 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("tcp_server", "src/platform/tcp_server.sig");
     const test_db = try ctx.addStep("test-db", "Execute database wire, transaction and TCP contracts", &noopStep);
     try ctx.addDependency(test_all, test_db);
-    inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy", "db_stream", "pg_stream" }) |name| {
+    _ = try ctx.addModule("wall_clock", "src/platform/wall_clock.sig");
+    inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy", "db_stream", "pg_stream", "wall_clock" }) |name| {
         _ = try addContract(ctx, test_db, "contract-" ++ name, "tests/test_" ++ name ++ ".sig", &.{
             importEntry("sql", "src/core/sql.sig"),                   importEntry("db_store", "src/db/store.sig"),
             importEntry("scram", "src/db/scram.sig"),                 importEntry("durable_log", "src/db/durable_log.sig"),
             importEntry("db_file", "src/platform/db_file.sig"),       importEntry("entropy", "src/platform/entropy.sig"),
             importEntry("stream_server", "src/db/stream_server.sig"), importEntry("postgres", "src/db/postgres.sig"),
             importEntry("mysql", "src/db/mysql.sig"),                 importEntry("tds", "src/db/tds.sig"),
-            importEntry("tcp_server", "src/platform/tcp_server.sig"),
+            importEntry("tcp_server", "src/platform/tcp_server.sig"), importEntry("wall_clock", "src/platform/wall_clock.sig"),
         });
     }
     _ = try ctx.addModule("math", "src/core/math.sig");

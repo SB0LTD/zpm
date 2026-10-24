@@ -20,6 +20,7 @@ const ast = @import("ast.sig");
 const storage = @import("storage.sig");
 const expr = @import("expr.sig");
 const catalog = @import("catalog.sig");
+const value = @import("value.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -28,6 +29,8 @@ pub fn Binder(comptime config: types.Config) type {
     const Ast = ast.Ast(config);
     const S = storage.Storage(config);
     const K = catalog.Catalog(config);
+    const E = expr.Eval(config);
+    const Io = value.Io(config);
     return struct {
         /// INTEGER outside the PostgreSQL dialect and in legacy replay.
         pub const integer_type: types.DataType = if (config.integer_bits == 32) .integer32 else .integer;
@@ -48,6 +51,7 @@ pub fn Binder(comptime config: types.Config) type {
             targets: [config.columns]u16,
             names: [config.columns]V.Name,
             types: [config.columns]types.DataType,
+            typmods: [config.columns]i32 = @splat(-1),
             count: usize,
             where: u16,
             /// Constant expression equal to the primary key (index probe), or none.
@@ -83,6 +87,8 @@ pub fn Binder(comptime config: types.Config) type {
             /// legacy_alpha replay: alpha INTEGER width and boolean integers.
             legacy: bool,
             dialect: types.Dialect,
+            /// Time zone and resolver for datetime literals parsed at bind time.
+            session: *const value.Session = &value.default_session,
 
             fn node(self: *const Context, id: u16) *ast.Node {
                 return &self.pool.nodes[id];
@@ -121,34 +127,7 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         pub fn dataType(ty: ast.Type) types.DataType {
-            return switch (ty) {
-                .int4 => .integer32,
-                .int8 => .integer,
-                .boolean => .boolean,
-                .text, .unknown => .text,
-            };
-        }
-
-        fn fromData(data_type: types.DataType) ast.Type {
-            return switch (data_type) {
-                .integer32 => .int4,
-                .integer => .int8,
-                .boolean => .boolean,
-                .text => .text,
-            };
-        }
-
-        fn fromTypeName(name: ast.TypeName) ast.Type {
-            return switch (name) {
-                .integer => .int4,
-                .bigint => .int8,
-                .boolean => .boolean,
-                .text => .text,
-            };
-        }
-
-        fn integral(ty: ast.Type) bool {
-            return ty == .int4 or ty == .int8;
+            return types.dataTypeOf(ty);
         }
 
         fn toName(context: *const Context, ident: ast.Ident) V.Name {
@@ -186,15 +165,17 @@ pub fn Binder(comptime config: types.Config) type {
 
         // ---- literal coercion ----------------------------------------------
 
-        /// Resolves an untyped literal to `target`, parsing string input now.
+        /// Resolves an untyped literal to `target`, parsing string input now
+        /// (so `'x'::integer` and `id = 'x'` fail even over empty tables).
         fn coerce(context: *const Context, id: u16, target: ast.Type) Error!void {
             const n = context.node(id);
             if (n.ty != .unknown) return;
             if (n.kind == .text_literal) {
-                const text = expr.Eval(config).literalText(context.source, n.text);
+                const text = E.literalText(context.source, n.text);
                 switch (target) {
-                    .int4, .int8 => {
-                        n.integer = try expr.parseInteger(text.slice(), target);
+                    .int2, .int4, .int8 => {
+                        n.integer = try expr.parseInteger(text.slice(), if (target == .int2) .int4 else target);
+                        if (target == .int2 and (n.integer < -32768 or n.integer > 32767)) return error.NumericValueOutOfRange;
                         n.kind = .int_literal;
                     },
                     .boolean => {
@@ -202,29 +183,53 @@ pub fn Binder(comptime config: types.Config) type {
                         n.kind = .bool_literal;
                     },
                     .text, .unknown => {},
+                    // Validated now, converted again at evaluation.
+                    else => _ = try Io.parse(target, -1, text.slice(), context.session),
                 }
             }
             n.ty = if (target == .unknown) .text else target;
         }
 
-        /// Operands of a comparison: unknown takes the other side's type;
-        /// int4/int8 compare directly; anything else has no operator.
-        fn comparable(context: *const Context, a: u16, b: u16) Error!void {
-            const left = context.node(a).ty;
-            const right = context.node(b).ty;
-            if (left == .unknown and right == .unknown) {
-                try coerce(context, a, .text);
-                return coerce(context, b, .text);
+        /// Wraps `id` in an implicit/assignment cast to `target` when needed.
+        fn convert(context: *const Context, id: u16, target: ast.Type, typmod: i32, mode: value.Context) Error!u16 {
+            const n = context.node(id);
+            if (n.ty == .unknown) {
+                try coerce(context, id, target);
+                return id;
             }
-            if (left == .unknown) return coerce(context, a, right);
-            if (right == .unknown) return coerce(context, b, left);
-            if (left == right or (integral(left) and integral(right))) return;
+            if (n.ty == target and typmod < 0) return id;
+            // Integer cells need no conversion between int2/int4/int8 except
+            // the range check, which assignment performs at store time.
+            if (n.ty == target) return id;
+            if (!value.castable(n.ty, target, mode)) return if (mode == .assignment) error.TypeMismatch else error.UndefinedFunction;
+            const constant = n.constant;
+            const cast_id = try context.pool.add(.{ .kind = .cast, .cast_type = target, .typmod = typmod, .a = id, .ty = target });
+            context.node(cast_id).constant = constant;
+            return cast_id;
+        }
+
+        /// Operands of a comparison: unknown takes the other side's type;
+        /// numeric and datetime operands promote to their common type.
+        fn comparable(context: *const Context, a: *u16, b: *u16) Error!void {
+            const left = context.node(a.*).ty;
+            const right = context.node(b.*).ty;
+            if (left == .unknown and right == .unknown) {
+                try coerce(context, a.*, .text);
+                return coerce(context, b.*, .text);
+            }
+            if (left == .unknown) return coerce(context, a.*, right);
+            if (right == .unknown) return coerce(context, b.*, left);
+            if (left == .json or right == .json) return error.UndefinedFunction;
+            if (left == right) return;
+            if (value.integral(left) and value.integral(right)) return;
             if (context.legacy) {
                 // Alpha replay compared boolean columns with integer 0/1.
-                if (left == .boolean and context.node(b).kind == .int_literal) return legacyBoolean(context, b);
-                if (right == .boolean and context.node(a).kind == .int_literal) return legacyBoolean(context, a);
+                if (left == .boolean and context.node(b.*).kind == .int_literal) return legacyBoolean(context, b.*);
+                if (right == .boolean and context.node(a.*).kind == .int_literal) return legacyBoolean(context, a.*);
             }
-            return error.UndefinedFunction;
+            const target = value.common(left, right) orelse return error.UndefinedFunction;
+            a.* = try convert(context, a.*, target, -1, .implicit);
+            b.* = try convert(context, b.*, target, -1, .implicit);
         }
 
         fn legacyBoolean(context: *const Context, id: u16) Error!void {
@@ -241,14 +246,35 @@ pub fn Binder(comptime config: types.Config) type {
             if (ty != .boolean) return error.TypeMismatch;
         }
 
-        /// Common type of CASE results / COALESCE arguments (select_common_type).
+        /// Common type of CASE results / COALESCE arguments / IN lists
+        /// (select_common_type).
         fn unifyInto(result: *ast.Type, ty: ast.Type) Error!void {
             if (ty == .unknown) return;
             if (result.* == .unknown) {
                 result.* = ty;
-            } else if (integral(result.*) and integral(ty)) {
-                if (ty == .int8) result.* = .int8;
-            } else if (result.* != ty) return error.TypeMismatch;
+                return;
+            }
+            result.* = value.common(result.*, ty) orelse return error.TypeMismatch;
+        }
+
+        /// Converts every member of a `next`-linked list to `target`,
+        /// relinking cast nodes in place; returns the new head.
+        fn convertList(context: *const Context, head: u16, target: ast.Type) Error!u16 {
+            var first = head;
+            var previous: u16 = none;
+            var item = head;
+            while (item != none) {
+                const next = context.node(item).next;
+                const converted = try convert(context, item, target, -1, .implicit);
+                if (converted != item) {
+                    context.node(converted).next = next;
+                    context.node(item).next = none;
+                    if (previous == none) first = converted else context.node(previous).next = converted;
+                }
+                previous = converted;
+                item = next;
+            }
+            return first;
         }
 
         // ---- expression typing ----------------------------------------------
@@ -263,6 +289,148 @@ pub fn Binder(comptime config: types.Config) type {
             return true;
         }
 
+        fn arithmeticType(context: *const Context, n: *ast.Node) Error!void {
+            if (context.node(n.a).ty == .unknown and context.node(n.b).ty == .unknown) return error.AmbiguousFunction;
+            var left = context.node(n.a).ty;
+            var right = context.node(n.b).ty;
+            // An untyped literal takes the other operand's type, except
+            // that datetime arithmetic takes an interval.
+            if (left == .unknown) {
+                try coerce(context, n.a, if (value.datetime(right) and right != .date) .interval else right);
+                left = context.node(n.a).ty;
+            }
+            if (right == .unknown) {
+                const target: ast.Type = if (left == .date) (if (n.op == .sub) .date else return error.AmbiguousFunction) else if (value.datetime(left)) .interval else left;
+                try coerce(context, n.b, target);
+                right = context.node(n.b).ty;
+            }
+            if (value.numericCategory(left) and value.numericCategory(right)) {
+                const result = value.arithmeticType(left, right);
+                if (n.op == .mod and (result == .float4 or result == .float8)) return error.UndefinedFunction;
+                if (!value.integral(result)) {
+                    n.a = try convert(context, n.a, result, -1, .implicit);
+                    n.b = try convert(context, n.b, result, -1, .implicit);
+                }
+                n.ty = result;
+                return;
+            }
+            const add = n.op == .add;
+            const sub = n.op == .sub;
+            if (!add and !sub) return error.UndefinedFunction;
+            // date +- integer, integer + date
+            if (left == .date and value.integral(right)) {
+                n.ty = .date;
+                return;
+            }
+            if (add and value.integral(left) and right == .date) {
+                n.ty = .date;
+                return;
+            }
+            if (sub and value.datetime(left) and value.datetime(right)) {
+                if (left == .date and right == .date) {
+                    n.ty = .int4;
+                    return;
+                }
+                const target = value.common(left, right).?;
+                n.a = try convert(context, n.a, target, -1, .implicit);
+                n.b = try convert(context, n.b, target, -1, .implicit);
+                n.ty = .interval;
+                return;
+            }
+            if (value.datetime(left) and right == .interval) {
+                if (left == .date) n.a = try convert(context, n.a, .timestamp, -1, .implicit);
+                n.ty = if (left == .timestamptz) .timestamptz else .timestamp;
+                return;
+            }
+            if (add and left == .interval and value.datetime(right)) {
+                if (right == .date) n.b = try convert(context, n.b, .timestamp, -1, .implicit);
+                n.ty = if (right == .timestamptz) .timestamptz else .timestamp;
+                return;
+            }
+            if (left == .interval and right == .interval) {
+                n.ty = .interval;
+                return;
+            }
+            return error.UndefinedFunction;
+        }
+
+        fn jsonOperator(context: *const Context, n: *ast.Node) Error!void {
+            const left = context.node(n.a).ty;
+            if (left == .unknown) return error.AmbiguousFunction;
+            if (left != .jsonb) return error.UndefinedFunction;
+            const right_node = context.node(n.b);
+            switch (n.op) {
+                .arrow, .arrow_text => {
+                    if (right_node.ty == .unknown) try coerce(context, n.b, .text);
+                    const right = context.node(n.b).ty;
+                    if (right != .text and !value.integral(right)) return error.UndefinedFunction;
+                    n.ty = if (n.op == .arrow) .jsonb else .text;
+                },
+                .path, .path_text => {
+                    // The right operand is a text[] literal only.
+                    if (right_node.ty != .unknown or right_node.kind != .text_literal) return error.UndefinedFunction;
+                    const text = E.literalText(context.source, right_node.text);
+                    var items: [32][]const u8 = undefined;
+                    _ = try Io.Documents.parsePath(text.slice(), &items);
+                    right_node.ty = .text;
+                    n.ty = if (n.op == .path) .jsonb else .text;
+                },
+                .contains, .contained => {
+                    n.b = try convert(context, n.b, .jsonb, -1, .implicit);
+                    if (context.node(n.b).ty != .jsonb) return error.UndefinedFunction;
+                    n.ty = .boolean;
+                },
+                .exists => {
+                    if (right_node.ty == .unknown) try coerce(context, n.b, .text);
+                    if (context.node(n.b).ty != .text) return error.UndefinedFunction;
+                    n.ty = .boolean;
+                },
+                else => unreachable,
+            }
+        }
+
+        fn functionName(context: *const Context, n: *const ast.Node) ast.Func {
+            const name = toName(context, n.name);
+            const table = [_]struct { name: []const u8, func: ast.Func }{
+                .{ .name = "now", .func = .now },
+                .{ .name = "transaction_timestamp", .func = .transaction_timestamp },
+                .{ .name = "statement_timestamp", .func = .statement_timestamp },
+                .{ .name = "clock_timestamp", .func = .clock_timestamp },
+                .{ .name = "current_timestamp", .func = .current_timestamp },
+                .{ .name = "current_date", .func = .current_date },
+                .{ .name = "jsonb_typeof", .func = .jsonb_typeof },
+                .{ .name = "jsonb_array_length", .func = .jsonb_array_length },
+            };
+            for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
+            return .none;
+        }
+
+        fn typeFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            n.func = functionName(context, n);
+            var count: usize = 0;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                try typeExpr(context, scope, item);
+                count += 1;
+            }
+            switch (n.func) {
+                .none => return error.UndefinedFunction,
+                .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp, .current_timestamp, .current_date => {
+                    if (count != 0) return error.UndefinedFunction;
+                    n.ty = if (n.func == .current_date) .date else .timestamptz;
+                    // Volatile clocks are still row-independent.
+                    n.constant = true;
+                },
+                .jsonb_typeof, .jsonb_array_length => {
+                    if (count != 1) return error.UndefinedFunction;
+                    n.b = try convert(context, n.b, .jsonb, -1, .implicit);
+                    if (context.node(n.b).ty != .jsonb) return error.UndefinedFunction;
+                    n.ty = if (n.func == .jsonb_typeof) .text else .int4;
+                    n.constant = isConstant(context, n.b);
+                },
+            }
+        }
+
         fn typeExpr(context: *const Context, scope: *const Scope, id: u16) Error!void {
             const n = context.node(id);
             n.constant = true;
@@ -271,10 +439,13 @@ pub fn Binder(comptime config: types.Config) type {
                 .bool_literal => n.ty = .boolean,
                 .int_literal => n.ty = if (n.integer >= -2147483648 and n.integer <= 2147483647) .int4 else .int8,
                 .text_literal => n.ty = .unknown,
-                // NUMERIC arrives with Q02 (step 3.2).
-                .decimal_literal => return error.UnsupportedStatement,
+                .decimal_literal => {
+                    // Validated now (54000 beyond numeric_digits).
+                    _ = try Io.parse(.numeric, -1, n.name.span.slice(context.source), context.session);
+                    n.ty = .numeric;
+                },
                 .param => return error.UndefinedParameter,
-                .function => return error.UndefinedFunction,
+                .function => try typeFunction(context, scope, n),
                 .when_arm => unreachable,
                 .column => {
                     const table_index = scope.table orelse return error.ColumnNotFound;
@@ -286,14 +457,15 @@ pub fn Binder(comptime config: types.Config) type {
                     const entry = &context.tables[table_index];
                     const column = try columnIndex(context, entry, n.name);
                     n.column = @intCast(column);
-                    n.ty = fromData(entry.columns[column].data_type);
+                    n.ty = types.typeOfData(entry.columns[column].data_type);
+                    n.typmod = entry.columns[column].typmod;
                     n.constant = false;
                 },
                 .unary => {
                     try typeExpr(context, scope, n.a);
                     const ty = context.node(n.a).ty;
                     if (ty == .unknown) return error.AmbiguousFunction;
-                    if (!integral(ty)) return error.UndefinedFunction;
+                    if (!value.numericCategory(ty) and ty != .interval) return error.UndefinedFunction;
                     n.ty = ty;
                     n.constant = isConstant(context, n.a);
                 },
@@ -301,31 +473,21 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeExpr(context, scope, n.a);
                     try typeExpr(context, scope, n.b);
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b);
-                    const left = context.node(n.a).ty;
-                    const right = context.node(n.b).ty;
                     switch (n.op) {
                         .eq, .ne, .lt, .le, .gt, .ge => {
-                            try comparable(context, n.a, n.b);
+                            try comparable(context, &n.a, &n.b);
                             n.ty = .boolean;
                         },
-                        .add, .sub, .mul, .div, .mod => {
-                            if (left == .unknown and right == .unknown) return error.AmbiguousFunction;
-                            if (left == .unknown and integral(right)) try coerce(context, n.a, right);
-                            if (right == .unknown and integral(left)) try coerce(context, n.b, left);
-                            const l = context.node(n.a).ty;
-                            const r = context.node(n.b).ty;
-                            if (!integral(l) or !integral(r)) return error.UndefinedFunction;
-                            n.ty = if (l == .int8 or r == .int8) .int8 else .int4;
-                        },
+                        .add, .sub, .mul, .div, .mod => try arithmeticType(context, n),
                         .concat => {
                             // text || text, text || anynonarray, anynonarray || text.
-                            if (left == .unknown) try coerce(context, n.a, .text);
-                            if (right == .unknown) try coerce(context, n.b, .text);
-                            if (context.node(n.a).ty != .text and context.node(n.b).ty != .text) return error.UndefinedFunction;
+                            if (context.node(n.a).ty == .unknown) try coerce(context, n.a, .text);
+                            if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .text);
+                            if (!value.stringType(context.node(n.a).ty) and !value.stringType(context.node(n.b).ty)) return error.UndefinedFunction;
                             n.ty = .text;
                         },
-                        // JSON operators arrive with Q04 (step 3.2).
-                        else => return error.UndefinedFunction,
+                        .arrow, .arrow_text, .path, .path_text, .contains, .contained, .exists => try jsonOperator(context, n),
+                        .neg, .pos => unreachable,
                     }
                 },
                 .and_op, .or_op => {
@@ -354,17 +516,39 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeExpr(context, scope, n.a);
                     try typeExpr(context, scope, n.b);
                     try typeExpr(context, scope, n.c);
-                    try comparable(context, n.a, n.b);
-                    try comparable(context, n.a, n.c);
+                    var result: ast.Type = .unknown;
+                    for ([_]u16{ n.a, n.b, n.c }) |part| try unifyInto(&result, context.node(part).ty);
+                    if (result == .unknown) result = .text;
+                    if (result == .json) return error.UndefinedFunction;
+                    if (!(value.integral(result) and value.integral(context.node(n.a).ty) and value.integral(context.node(n.b).ty) and value.integral(context.node(n.c).ty))) {
+                        n.a = try convert(context, n.a, result, -1, .implicit);
+                        n.b = try convert(context, n.b, result, -1, .implicit);
+                        n.c = try convert(context, n.c, result, -1, .implicit);
+                    }
                     n.ty = .boolean;
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b) and isConstant(context, n.c);
                 },
                 .in_list => {
                     try typeExpr(context, scope, n.a);
+                    var result: ast.Type = context.node(n.a).ty;
                     var item = n.b;
                     while (item != none) : (item = context.node(item).next) {
                         try typeExpr(context, scope, item);
-                        try comparable(context, n.a, item);
+                        try unifyInto(&result, context.node(item).ty);
+                    }
+                    if (result == .unknown) result = .text;
+                    if (result == .json) return error.UndefinedFunction;
+                    if (value.integral(result)) {
+                        // int2/int4/int8 cells compare directly.
+                        if (context.node(n.a).ty == .unknown) try coerce(context, n.a, result);
+                        item = n.b;
+                        while (item != none) : (item = context.node(item).next) {
+                            const ty = context.node(item).ty;
+                            if (ty == .unknown) try coerce(context, item, result) else if (!value.integral(ty)) return error.UndefinedFunction;
+                        }
+                    } else {
+                        n.a = try convert(context, n.a, result, -1, .implicit);
+                        n.b = try convertList(context, n.b, result);
                     }
                     n.ty = .boolean;
                     n.constant = isConstant(context, n.a) and listConstant(context, n.b);
@@ -389,7 +573,7 @@ pub fn Binder(comptime config: types.Config) type {
                     while (arm != none) : (arm = context.node(arm).next) {
                         const entry = context.node(arm);
                         try typeExpr(context, scope, entry.a);
-                        if (n.a != none) try comparable(context, n.a, entry.a) else try booleanArgument(context, entry.a);
+                        if (n.a != none) try comparable(context, &n.a, &entry.a) else try booleanArgument(context, entry.a);
                         try typeExpr(context, scope, entry.b);
                         try unifyInto(&result, context.node(entry.b).ty);
                         entry.constant = isConstant(context, entry.a) and isConstant(context, entry.b);
@@ -401,9 +585,15 @@ pub fn Binder(comptime config: types.Config) type {
                         constant = constant and isConstant(context, n.c);
                     }
                     if (result == .unknown) result = .text;
+                    const widen = !value.integral(result);
                     arm = n.b;
-                    while (arm != none) : (arm = context.node(arm).next) try coerce(context, context.node(arm).b, result);
-                    if (n.c != none) try coerce(context, n.c, result);
+                    while (arm != none) : (arm = context.node(arm).next) {
+                        const entry = context.node(arm);
+                        if (widen) entry.b = try convert(context, entry.b, result, -1, .implicit) else try coerce(context, entry.b, result);
+                    }
+                    if (n.c != none) {
+                        if (widen) n.c = try convert(context, n.c, result, -1, .implicit) else try coerce(context, n.c, result);
+                    }
                     n.ty = result;
                     n.constant = constant;
                 },
@@ -415,41 +605,67 @@ pub fn Binder(comptime config: types.Config) type {
                         try unifyInto(&result, context.node(item).ty);
                     }
                     if (result == .unknown) result = .text;
-                    item = n.b;
-                    while (item != none) : (item = context.node(item).next) try coerce(context, item, result);
+                    if (value.integral(result)) {
+                        item = n.b;
+                        while (item != none) : (item = context.node(item).next) try coerce(context, item, result);
+                    } else n.b = try convertList(context, n.b, result);
                     n.ty = result;
                     n.constant = listConstant(context, n.b);
                 },
                 .nullif => {
                     try typeExpr(context, scope, n.a);
                     try typeExpr(context, scope, n.b);
-                    try comparable(context, n.a, n.b);
-                    n.ty = context.node(n.a).ty;
+                    const original = context.node(n.a).ty;
+                    try comparable(context, &n.a, &n.b);
+                    n.ty = if (original == .unknown) context.node(n.a).ty else original;
+                    if (context.node(n.a).ty != n.ty) {
+                        // NULLIF returns the first argument's type.
+                        n.ty = context.node(n.a).ty;
+                    }
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b);
                 },
                 .cast => {
-                    try typeExpr(context, scope, n.a);
-                    const target = fromTypeName(n.cast_type);
+                    const target = n.cast_type;
+                    const inner = context.node(n.a);
+                    if (inner.kind == .decimal_literal and (target == .float4 or target == .float8)) {
+                        // numeric -> float8 is float8in of the numeric's text,
+                        // so a float-cast literal is parsed as a float directly
+                        // (no NUMERIC capacity limit for 1e100::float8).
+                        _ = try Io.parse(target, -1, inner.name.span.slice(context.source), context.session);
+                        inner.ty = target;
+                        inner.constant = true;
+                    } else try typeExpr(context, scope, n.a);
                     const from = context.node(n.a).ty;
                     if (from == .unknown) {
                         try coerce(context, n.a, target);
-                    } else {
-                        const allowed = switch (target) {
-                            .int4, .text => true,
-                            .int8 => from != .boolean,
-                            .boolean => from != .int8,
-                            .unknown => unreachable,
-                        };
-                        if (!allowed) return error.CannotCoerce;
+                    } else if (!value.castable(from, target, .explicit)) return error.CannotCoerce;
+                    // Typmods are validated at bind time (eval applies them).
+                    if (n.typmod >= 0 and context.node(n.a).kind == .text_literal) {
+                        const text = E.literalText(context.source, context.node(n.a).text);
+                        _ = try Io.parse(target, n.typmod, text.slice(), context.session);
                     }
                     n.ty = target;
                     n.constant = isConstant(context, n.a);
+                },
+                .at_zone => {
+                    try typeExpr(context, scope, n.a);
+                    try typeExpr(context, scope, n.b);
+                    var ty = context.node(n.a).ty;
+                    if (ty == .unknown or ty == .date) {
+                        n.a = try convert(context, n.a, .timestamptz, -1, .implicit);
+                        ty = .timestamptz;
+                    }
+                    if (ty != .timestamp and ty != .timestamptz) return error.UndefinedFunction;
+                    try coerce(context, n.b, .text);
+                    if (context.node(n.b).ty != .text) return error.UndefinedFunction;
+                    n.ty = if (ty == .timestamptz) .timestamp else .timestamptz;
+                    n.constant = isConstant(context, n.a) and isConstant(context, n.b);
                 },
             }
         }
 
         /// Types an expression whose untyped result defaults to text.
-        fn value(context: *const Context, scope: *const Scope, id: u16) Error!void {
+        fn valueExpr(context: *const Context, scope: *const Scope, id: u16) Error!void {
             try typeExpr(context, scope, id);
             if (context.node(id).ty == .unknown) try coerce(context, id, .text);
         }
@@ -512,25 +728,31 @@ pub fn Binder(comptime config: types.Config) type {
                 if (n.kind != .binary or n.op != .eq) continue;
                 const left = context.node(n.a);
                 const right = context.node(n.b);
-                if (left.kind == .column and left.column == primary and right.constant) return n.b;
-                if (right.kind == .column and right.column == primary and left.constant) return n.a;
+                if (left.kind == .column and left.column == primary and right.constant and storedTag(entry, primary, right.ty)) return n.b;
+                if (right.kind == .column and right.column == primary and left.constant and storedTag(entry, primary, left.ty)) return n.a;
             }
             return none;
         }
 
+        /// Whether a probe value of type `ty` has the key column's cell tag.
+        fn storedTag(entry: *const S.Table, column: usize, ty: ast.Type) bool {
+            return V.cellTag(entry.columns[column].data_type) == V.cellTag(types.dataTypeOf(ty));
+        }
+
         /// Assignment (INSERT values, UPDATE SET) typing: PostgreSQL
         /// assignment casts, plus integer 0/1 into boolean for MySQL/TDS.
-        fn assignment(context: *const Context, id: u16, column: *const V.Column) Error!void {
-            const target = fromData(column.data_type);
+        /// Returns the (possibly cast-wrapped) expression id.
+        fn assignment(context: *const Context, id: u16, column: *const V.Column) Error!u16 {
+            const target = types.typeOfData(column.data_type);
             const ty = context.node(id).ty;
-            if (ty == .unknown) return coerce(context, id, target);
-            const ok = switch (target) {
-                .int4, .int8 => integral(ty),
-                .boolean => ty == .boolean or (integral(ty) and context.booleanIntegers()),
-                .text => true,
-                .unknown => unreachable,
-            };
-            if (!ok) return error.TypeMismatch;
+            if (ty == .unknown) {
+                try coerce(context, id, target);
+                return id;
+            }
+            if (target == .boolean and value.integral(ty) and context.booleanIntegers()) return id;
+            if (value.integral(target) and value.integral(ty)) return id;
+            if (ty == target) return id;
+            return convert(context, id, target, -1, .assignment);
         }
 
         const Strength = struct { name: []const u8, strength: u8 };
@@ -548,16 +770,12 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .coalesce => .{ .name = "coalesce", .strength = 2 },
                 .nullif => .{ .name = "nullif", .strength = 2 },
+                .at_zone => .{ .name = "timezone", .strength = 2 },
                 .case_expr => .{ .name = "case", .strength = 1 },
                 .cast => blk: {
                     const inner = figure(context, n.a, buffer);
                     if (inner.strength > 1) break :blk inner;
-                    break :blk .{ .name = switch (n.cast_type) {
-                        .integer => "int4",
-                        .bigint => "int8",
-                        .boolean => "bool",
-                        .text => "text",
-                    }, .strength = 1 };
+                    break :blk .{ .name = types.typeInfo(types.dataTypeOf(n.cast_type)).name, .strength = 1 };
                 },
                 else => .{ .name = "?column?", .strength = 0 },
             };
@@ -581,6 +799,14 @@ pub fn Binder(comptime config: types.Config) type {
             return .{ .table = index, .name = context.tables[index].name };
         }
 
+        fn outputTypmod(context: *const Context, id: u16) i32 {
+            const n = context.node(id);
+            return switch (n.kind) {
+                .column, .cast => n.typmod,
+                else => -1,
+            };
+        }
+
         fn bindSelect(context: *const Context, select: *const Ast.Select) Error!Select {
             const scope = try scopeFor(context, select.from);
             var out: Select = .{ .table = scope.table, .targets = undefined, .names = undefined, .types = undefined, .count = 0, .where = none, .key = none, .order = undefined, .order_count = 0, .limit = select.limit, .lock = select.lock };
@@ -589,19 +815,21 @@ pub fn Binder(comptime config: types.Config) type {
                     const entry = &context.tables[scope.table.?];
                     for (entry.columns[0..entry.column_count], 0..) |*column, index| {
                         if (out.count == config.columns) return error.ColumnCapacity;
-                        const id = try context.pool.add(.{ .kind = .column, .column = @intCast(index), .ty = fromData(column.data_type) });
+                        const id = try context.pool.add(.{ .kind = .column, .column = @intCast(index), .ty = types.typeOfData(column.data_type), .typmod = column.typmod });
                         out.targets[out.count] = id;
                         out.names[out.count] = column.name;
                         out.types[out.count] = column.data_type;
+                        out.typmods[out.count] = column.typmod;
                         out.count += 1;
                     }
                     continue;
                 }
                 if (out.count == config.columns) return error.ColumnCapacity;
-                try value(context, &scope, target.expr);
+                try valueExpr(context, &scope, target.expr);
                 out.targets[out.count] = target.expr;
                 out.names[out.count] = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
-                out.types[out.count] = dataType(context.node(target.expr).ty);
+                out.types[out.count] = types.dataTypeOf(context.node(target.expr).ty);
+                out.typmods[out.count] = outputTypmod(context, target.expr);
                 out.count += 1;
             }
             out.where = try bindWhere(context, &scope, select.where);
@@ -622,12 +850,21 @@ pub fn Binder(comptime config: types.Config) type {
                             break :blk;
                         };
                     }
-                    try value(context, &scope, id);
+                    try valueExpr(context, &scope, id);
                 }
+                if (context.node(id).ty == .json) return error.UndefinedFunction;
                 out.order[out.order_count] = .{ .expr = id, .descending = key.descending, .nulls_first = key.nulls_first };
                 out.order_count += 1;
             }
             return out;
+        }
+
+        fn columnType(context: *const Context, definition: *const Ast.ColumnDef) types.DataType {
+            const plain_integer: types.DataType = if (context.legacy or context.dialect != .postgres) integer_type else .integer32;
+            return switch (definition.type_name) {
+                .int4 => plain_integer,
+                else => types.dataTypeOf(definition.type_name),
+            };
         }
 
         pub fn bind(context: *const Context, statement: *const Ast.Statement) Error!Bound {
@@ -636,17 +873,12 @@ pub fn Binder(comptime config: types.Config) type {
                     const table_name = toName(context, create.name);
                     if (context.catalog.lookup(table_name.slice(), context.snapshot) != null) return error.TableExists;
                     var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count };
-                    const plain_integer: types.DataType = if (context.legacy or context.dialect != .postgres) integer_type else .integer32;
                     for (create.columns[0..create.count], 0..) |*definition, index| {
-                        var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key };
+                        var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod };
                         for (out.columns[0..index]) |*previous|
                             if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
-                        column.data_type = switch (definition.type_name) {
-                            .integer => plain_integer,
-                            .bigint => .integer,
-                            .boolean => .boolean,
-                            .text => .text,
-                        };
+                        column.data_type = columnType(context, definition);
+                        if (definition.primary_key and column.data_type == .json) return error.UndefinedFunction;
                         out.columns[index] = column;
                     }
                     return .{ .create_table = out };
@@ -677,8 +909,7 @@ pub fn Binder(comptime config: types.Config) type {
                         const id = insert.values[position];
                         const column = mapping[position];
                         try typeExpr(context, &empty, id);
-                        try assignment(context, id, &entry.columns[column]);
-                        out.values[column] = id;
+                        out.values[column] = try assignment(context, id, &entry.columns[column]);
                     }
                     return .{ .insert = out };
                 },
@@ -692,8 +923,7 @@ pub fn Binder(comptime config: types.Config) type {
                         const column = try columnIndex(context, entry, item.column);
                         if (out.values[column] != none) return error.DuplicateColumn;
                         try typeExpr(context, &scope, item.value);
-                        try assignment(context, item.value, &entry.columns[column]);
-                        out.values[column] = item.value;
+                        out.values[column] = try assignment(context, item.value, &entry.columns[column]);
                     }
                     out.where = try bindWhere(context, &scope, update.where);
                     out.key = primaryKey(context, entry, out.where);

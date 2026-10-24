@@ -37,6 +37,8 @@ fn resultEqual(a: *const DB.Result, b: *const DB.Result) bool {
             .text => |t| {
                 if (y != .text or !equal(t.slice(), y.text.slice())) return false;
             },
+            // This contract stores INTEGER/BOOLEAN/TEXT only.
+            else => return false,
         }
     };
     return true;

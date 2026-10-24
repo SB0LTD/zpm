@@ -65,6 +65,8 @@ fn equalResult(left: *const DB.Result, right: *const DB.Result) bool {
                     },
                     else => return false,
                 },
+                // This contract's tables use INTEGER/BOOLEAN/TEXT only.
+                else => return false,
             }
         }
     }

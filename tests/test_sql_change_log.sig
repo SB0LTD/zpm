@@ -30,6 +30,8 @@ fn sameResult(a: *const DB.Result, b: *const DB.Result) bool {
             .integer => |value| if (y != .integer or y.integer != value) return false,
             .boolean => |value| if (y != .boolean or y.boolean != value) return false,
             .text => |value| if (y != .text or !std.mem.eql(u8, value.slice(), y.text.slice())) return false,
+            // Other types: tag and btree equality.
+            else => if (std.meta.activeTag(x) != std.meta.activeTag(y) or DB.compareCells(&x, &y) != 0) return false,
         }
     };
     return true;

@@ -10,6 +10,8 @@
 const types = @import("types.sig");
 const lexer = @import("lexer.sig");
 const ast = @import("ast.sig");
+const value_module = @import("value.sig");
+const temporal = @import("temporal.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -103,6 +105,7 @@ pub fn parseBoolean(input: []const u8) Error!bool {
 
 pub fn checkRange(value: i64, ty: ast.Type) Error!i64 {
     if (ty == .int4 and (value < -2147483648 or value > 2147483647)) return error.IntegerOverflow;
+    if (ty == .int2 and (value < -32768 or value > 32767)) return error.NumericValueOutOfRange;
     return value;
 }
 
@@ -195,13 +198,17 @@ pub fn like(text: []const u8, pattern: []const u8, insensitive: bool) Error!bool
 pub fn Eval(comptime config: types.Config) type {
     const V = types.Values(config);
     const Ast = ast.Ast(config);
+    const Io = value_module.Io(config);
+    const J = Io.Documents;
     return struct {
         pub const Row = [config.columns]V.Cell;
+        pub const Session = value_module.Session;
 
         pub const Context = struct {
             source: []const u8,
             pool: *const Ast.Pool,
             row: ?*const Row = null,
+            session: *const Session = &value_module.default_session,
         };
 
         pub fn literalText(source: []const u8, quoted: lexer.Quoted) V.Text {
@@ -210,68 +217,17 @@ pub fn Eval(comptime config: types.Config) type {
             return text;
         }
 
-        fn appendBytes(text: *V.Text, bytes: []const u8) Error!void {
-            if (bytes.len > config.text_bytes - text.len) return error.TextCapacity;
-            @memcpy(text.bytes[text.len..][0..bytes.len], bytes);
-            text.len += bytes.len;
+        pub fn appendCell(text: *V.Text, cell: *const V.Cell, verbose: bool, session: *const Session) Error!void {
+            return Io.appendCell(text, cell, verbose, session);
         }
 
-        fn appendInteger(text: *V.Text, value: i64) Error!void {
-            var digits: [20]u8 = undefined;
-            var index: usize = digits.len;
-            var magnitude: u64 = if (value < 0) @as(u64, @bitCast(-%value)) else @intCast(value);
-            while (true) {
-                index -= 1;
-                digits[index] = @intCast('0' + magnitude % 10);
-                magnitude /= 10;
-                if (magnitude == 0) break;
-            }
-            if (value < 0) try appendBytes(text, "-");
-            try appendBytes(text, digits[index..]);
-        }
-
-        /// Text form of a non-NULL cell. `verbose` booleans are true/false
-        /// (casts, assignment); otherwise t/f (the output function).
-        pub fn appendCell(text: *V.Text, cell: *const V.Cell, verbose: bool) Error!void {
-            switch (cell.*) {
-                .null_value => {},
-                .integer => |value| try appendInteger(text, value),
-                .boolean => |value| try appendBytes(text, if (verbose) (if (value) "true" else "false") else (if (value) "t" else "f")),
-                .text => |*value| try appendBytes(text, value.slice()),
-            }
-        }
-
-        pub fn toText(cell: *const V.Cell, verbose: bool) Error!V.Cell {
-            if (cell.* == .null_value) return .null_value;
-            var text: V.Text = .{};
-            try appendCell(&text, cell, verbose);
-            return .{ .text = text };
+        pub fn toText(cell: *const V.Cell, verbose: bool, session: *const Session) Error!V.Cell {
+            return Io.toText(cell, verbose, session);
         }
 
         /// Explicit or assignment cast of a value of type `from`.
-        pub fn cast(cell: V.Cell, from: ast.Type, to: ast.TypeName) Error!V.Cell {
-            if (cell == .null_value) return .null_value;
-            switch (to) {
-                .integer, .bigint => {
-                    const target: ast.Type = if (to == .integer) .int4 else .int8;
-                    return switch (cell) {
-                        .integer => |value| .{ .integer = try checkRange(value, target) },
-                        .boolean => |value| .{ .integer = @intFromBool(value) },
-                        .text => |*value| .{ .integer = try parseInteger(value.slice(), target) },
-                        .null_value => unreachable,
-                    };
-                },
-                .boolean => return switch (cell) {
-                    .integer => |value| .{ .boolean = value != 0 },
-                    .boolean => cell,
-                    .text => |*value| .{ .boolean = try parseBoolean(value.slice()) },
-                    .null_value => unreachable,
-                },
-                .text => {
-                    _ = from;
-                    return toText(&cell, true);
-                },
-            }
+        pub fn cast(cell: V.Cell, from: ast.Type, to: ast.Type, typmod: i32, session: *const Session) Error!V.Cell {
+            return Io.cast(cell, from, to, typmod, session);
         }
 
         fn node(ctx: *const Context, id: u16) *const ast.Node {
@@ -352,6 +308,16 @@ pub fn Eval(comptime config: types.Config) type {
                         const right = try operandRef(ctx, n.b, &right_value);
                         return compareOp(n.op, left, right);
                     }
+                    if (n.op == .contains or n.op == .contained or n.op == .exists) {
+                        const left = try eval(ctx, n.a);
+                        const right = try eval(ctx, n.b);
+                        if (left == .null_value or right == .null_value) return null;
+                        return switch (n.op) {
+                            .contains => J.contains(left.jsonb.slice(), right.jsonb.slice()),
+                            .contained => J.contains(right.jsonb.slice(), left.jsonb.slice()),
+                            else => J.exists(left.jsonb.slice(), right.text.slice()),
+                        };
+                    }
                 },
                 .between => {
                     // a BETWEEN b AND c is a >= b AND a <= c (PostgreSQL
@@ -399,39 +365,93 @@ pub fn Eval(comptime config: types.Config) type {
             };
         }
 
+        fn clockValue(ctx: *const Context, func: ast.Func) Error!V.Cell {
+            const session = ctx.session;
+            const value: ?i64 = switch (func) {
+                .now, .transaction_timestamp, .current_timestamp, .current_date => session.transaction_us,
+                .statement_timestamp => session.statement_us,
+                .clock_timestamp => if (session.clock) |clock| clock() else null,
+                else => unreachable,
+            };
+            const us = value orelse return error.ClockUnavailable;
+            if (func == .current_date) return .{ .date = temporal.timestampToDate(temporal.toLocal(&session.zone, us)) };
+            return .{ .timestamptz = us };
+        }
+
+        fn jsonResult(bytes: []const u8, at: ?usize, as_text: bool) Error!V.Cell {
+            const position = at orelse return .null_value;
+            if (as_text) {
+                var text: V.Text = .{};
+                var out: J.Text = .{ .bytes = &text.bytes };
+                if (!try J.renderText(bytes, position, &out)) return .null_value;
+                text.len = out.len;
+                return .{ .text = text };
+            }
+            var text: V.Text = .{};
+            text.len = J.copyValue(bytes, position, &text.bytes).len;
+            return .{ .jsonb = text };
+        }
+
         pub fn eval(ctx: *const Context, id: u16) Error!V.Cell {
             const n = node(ctx, id);
             switch (n.kind) {
                 .null_literal => return .null_value,
                 .bool_literal => return .{ .boolean = n.boolean },
                 .int_literal => return .{ .integer = n.integer },
-                .text_literal => return .{ .text = literalText(ctx.source, n.text) },
+                .text_literal => {
+                    const text = literalText(ctx.source, n.text);
+                    return switch (n.ty) {
+                        .unknown, .text => .{ .text = text },
+                        else => Io.parse(n.ty, n.typmod, text.slice(), ctx.session),
+                    };
+                },
+                .decimal_literal => {
+                    if (n.ty == .float4 or n.ty == .float8) return Io.parse(n.ty, -1, n.name.span.slice(ctx.source), ctx.session);
+                    const number = try Io.parse(.numeric, -1, n.name.span.slice(ctx.source), ctx.session);
+                    return if (n.ty == .numeric or n.ty == .unknown) number else Io.cast(number, .numeric, n.ty, -1, ctx.session);
+                },
                 .column => return ctx.row.?[n.column],
                 .and_op, .or_op, .not_op, .test_op, .between, .in_list, .like => return boolCell(try truth(ctx, id)),
                 .unary => {
                     const value = try eval(ctx, n.a);
                     if (value == .null_value) return .null_value;
                     if (n.op == .pos) return value;
-                    if (value.integer == -9223372036854775808) return error.IntegerOverflow;
-                    return .{ .integer = try checkRange(-value.integer, n.ty) };
+                    return Io.negate(&value, n.ty);
                 },
                 .binary => switch (n.op) {
-                    .eq, .ne, .lt, .le, .gt, .ge => return boolCell(try truth(ctx, id)),
+                    .eq, .ne, .lt, .le, .gt, .ge, .contains, .contained, .exists => return boolCell(try truth(ctx, id)),
                     .concat => {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return .null_value;
                         var text: V.Text = .{};
                         // anytextcat/textanycat cast booleans to 'true'/'false' (measured on PG18).
-                        try appendCell(&text, &left, true);
-                        try appendCell(&text, &right, true);
+                        try appendCell(&text, &left, true, ctx.session);
+                        try appendCell(&text, &right, true, ctx.session);
                         return .{ .text = text };
                     },
                     .add, .sub, .mul, .div, .mod => {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return .null_value;
-                        return .{ .integer = try arithmetic(n.op, n.ty, left.integer, right.integer) };
+                        if (left == .integer and right == .integer and value_module.integral(n.ty))
+                            return .{ .integer = try arithmetic(n.op, n.ty, left.integer, right.integer) };
+                        return Io.arithmetic(n.op, &left, &right, n.ty, ctx.session);
+                    },
+                    .arrow, .arrow_text => {
+                        const left = try eval(ctx, n.a);
+                        const right = try eval(ctx, n.b);
+                        if (left == .null_value or right == .null_value) return .null_value;
+                        const bytes = left.jsonb.slice();
+                        const at = if (right == .integer) J.element(bytes, right.integer) else J.field(bytes, right.text.slice());
+                        return jsonResult(bytes, at, n.op == .arrow_text);
+                    },
+                    .path, .path_text => {
+                        const left = try eval(ctx, n.a);
+                        const right = try eval(ctx, n.b);
+                        if (left == .null_value or right == .null_value) return .null_value;
+                        const bytes = left.jsonb.slice();
+                        return jsonResult(bytes, try J.path(bytes, right.text.slice()), n.op == .path_text);
                     },
                     else => unreachable,
                 },
@@ -465,9 +485,30 @@ pub fn Eval(comptime config: types.Config) type {
                 },
                 .cast => {
                     const value = try eval(ctx, n.a);
-                    return cast(value, node(ctx, n.a).ty, n.cast_type);
+                    return cast(value, node(ctx, n.a).ty, n.cast_type, n.typmod, ctx.session);
                 },
-                .decimal_literal, .param, .function, .when_arm => unreachable,
+                .at_zone => {
+                    const value = try eval(ctx, n.a);
+                    const zone = try eval(ctx, n.b);
+                    if (value == .null_value or zone == .null_value) return .null_value;
+                    return Io.atZone(&value, zone.text.slice(), ctx.session);
+                },
+                .function => switch (n.func) {
+                    .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp, .current_timestamp, .current_date => return clockValue(ctx, n.func),
+                    .jsonb_typeof, .jsonb_array_length => {
+                        const argument = try eval(ctx, n.b);
+                        if (argument == .null_value) return .null_value;
+                        const bytes = argument.jsonb.slice();
+                        if (n.func == .jsonb_array_length) return .{ .integer = try J.arrayLength(bytes) };
+                        var text: V.Text = .{};
+                        const name = J.typeName(bytes);
+                        @memcpy(text.bytes[0..name.len], name);
+                        text.len = name.len;
+                        return .{ .text = text };
+                    },
+                    .none => unreachable,
+                },
+                .param, .when_arm => unreachable,
             }
         }
     };

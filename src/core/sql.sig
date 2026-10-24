@@ -9,16 +9,28 @@
 //! (expressions); SELECT expressions [FROM one table [alias]] [WHERE]
 //! [ORDER BY expressions/positions/output names] [LIMIT] [FOR UPDATE|SHARE
 //! [NOWAIT|SKIP LOCKED]]; UPDATE with expression SET; DELETE. Types are
-//! INTEGER (int4), BIGINT (int8), BOOLEAN, TEXT and NULL. Expressions (design
+//! SMALLINT, INTEGER (int4), BIGINT (int8), NUMERIC[(p,s)] (at most
+//! Config.numeric_digits significant digits), REAL, DOUBLE PRECISION,
+//! BOOLEAN, TEXT, NAME, OID, DATE, TIMESTAMP[(p)], TIMESTAMPTZ[(p)], INTERVAL,
+//! JSON and JSONB (encoded size at most Config.text_bytes) and NULL; see
+//! value.sig, numeric.sig, float_text.sig, temporal.sig, tzif.sig and
+//! jsonb.sig for their exact input/output rules. Expressions (design
 //! §4.1): AND/OR/NOT with three-valued logic, comparisons, IS [NOT]
 //! NULL/TRUE/FALSE/UNKNOWN, [NOT] IN lists, [NOT] BETWEEN, [NOT] LIKE/ILIKE,
-//! `||`, checked integer `+ - * / %`, CASE, COALESCE, NULLIF, `::`/CAST,
+//! `||`, checked arithmetic over the numeric and datetime types, AT TIME
+//! ZONE, the JSONB operators `-> ->> #> #>> @> <@ ?`, CASE, COALESCE, NULLIF,
+//! `::`/CAST, now() / CURRENT_TIMESTAMP / statement_timestamp() /
+//! clock_timestamp() / CURRENT_DATE, jsonb_typeof and jsonb_array_length,
 //! typed with PostgreSQL's implicit-cast rules. Constraints are NOT NULL and
 //! a single-column PRIMARY KEY. Unquoted identifiers are ASCII and case
 //! insensitive; quoted identifiers keep case; text comparison is bytewise.
-//! Joins, aggregates, other functions, NUMERIC and secondary indices are
+//! Joins, aggregates, other functions, arrays and secondary indices are
 //! outside this SQL subset; this is not full SQL-standard or PostgreSQL
 //! compatibility.
+//!
+//! Session values (per statement, `Database.session`, set by the caller like
+//! the dialect): TimeZone, a zone-name resolver, transaction/statement start
+//! times and the wall clock (value.Session).
 //!
 //! Transactions (design §4.4-§4.5): READ COMMITTED only, over row versions.
 //! Every statement takes a new snapshot and runs as a statement
@@ -51,7 +63,8 @@
 //!
 //! No allocator, platform or runtime dependency. The only std symbols this
 //! module and sql/*.sig may ever use are std.fmt.parseFloat(T, s) and
-//! std.fmt.float.render(buf, value, options); today they use none.
+//! std.fmt.float.render(buf, value, options); float_text.sig uses exactly
+//! those two (REAL/DOUBLE input and shortest round-trip output).
 const types = @import("sql/types.sig");
 const ast = @import("sql/ast.sig");
 const lexer = @import("sql/lexer.sig");
@@ -65,8 +78,28 @@ const dml_module = @import("sql/dml.sig");
 const mvcc_module = @import("sql/mvcc.sig");
 const locks_module = @import("sql/locks.sig");
 const catalog_module = @import("sql/catalog.sig");
+const value_module = @import("sql/value.sig");
+const numeric_module = @import("sql/numeric.sig");
+const temporal_module = @import("sql/temporal.sig");
+const tzif_module = @import("sql/tzif.sig");
+const float_module = @import("sql/float_text.sig");
 
 pub const Config = types.Config;
+/// Per-statement session values (TimeZone, zone resolver, clocks).
+pub const Session = value_module.Session;
+pub const Zone = temporal_module.Zone;
+pub const ZoneResolver = temporal_module.Resolver;
+pub const Interval = temporal_module.Interval;
+pub const Numeric = numeric_module.Numeric;
+pub const Type = types.Type;
+pub const typeInfo = types.typeInfo;
+pub const typeFromOid = types.typeFromOid;
+/// Datetime helpers for codecs and callers (PostgreSQL epoch, zones).
+pub const temporal = temporal_module;
+/// TZif validation and POSIX TZ strings for zone providers.
+pub const tzif = tzif_module;
+/// REAL/DOUBLE text I/O.
+pub const float_text = float_module;
 pub const Error = types.Error;
 pub const Dialect = types.Dialect;
 pub const DataType = types.DataType;
@@ -151,6 +184,13 @@ pub fn Database(comptime config: Config) type {
         pub const Name = V.Name;
         pub const Text = V.Text;
         pub const Cell = V.Cell;
+        pub const CellTag = V.CellTag;
+        pub const SqlError = types.Error;
+        pub const Zone = temporal_module.Zone;
+        pub const SessionValues = value_module.Session;
+        pub const tzif = tzif_module;
+        /// btree comparison of two non-NULL cells of the same type.
+        pub const compareCells = V.compare;
         pub const Row = V.Row;
         pub const Column = V.Column;
         pub const RowRef = S.RowRef;
@@ -165,14 +205,46 @@ pub fn Database(comptime config: Config) type {
         /// Receives the complete change record before the statement publishes.
         pub const RecordCommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
 
+        /// Text I/O, casts and JSONB/NUMERIC helpers for this configuration.
+        pub const Io = value_module.Io(config);
+
         pub const Result = struct {
+            /// Value I/O for codecs that only see the result type.
+            pub const ValueIo = value_module.Io(config);
+
             column_count: usize = 0,
             row_count: usize = 0,
             affected_rows: usize = 0,
             command: CommandTag = .none,
             column_names: [config.columns]Name = @splat(.{}),
             column_types: [config.columns]DataType = @splat(.integer),
+            /// PostgreSQL atttypmod of each column (-1 when none).
+            column_typmods: [config.columns]i32 = @splat(-1),
             rows: [config.rows_per_table]Row = @splat(.{}),
+
+            pub const default_session: *const value_module.Session = &value_module.default_session;
+
+            /// Renders every column that is not BIGINT/INTEGER/BOOLEAN/TEXT
+            /// as TEXT (output function, `session` TimeZone), for codecs
+            /// without native metadata for the other types (MySQL/TDS, flag
+            /// F-M). A value longer than Config.text_bytes is TextCapacity.
+            pub fn textify(self: *Result, session: *const value_module.Session) Error!void {
+                for (0..self.column_count) |column| {
+                    switch (self.column_types[column]) {
+                        .integer, .integer32, .boolean, .text => continue,
+                        .smallint, .oid => {
+                            self.column_types[column] = .integer;
+                            continue;
+                        },
+                        else => {},
+                    }
+                    for (self.rows[0..self.row_count]) |*row| {
+                        row.cells[column] = try ValueIo.toText(&row.cells[column], false, session);
+                    }
+                    self.column_types[column] = .text;
+                    self.column_typmods[column] = -1;
+                }
+            }
 
             /// Only active ranges are observable; avoid clearing unused row capacity.
             pub fn clear(self: *Result, affected: usize) void {
@@ -192,6 +264,7 @@ pub fn Database(comptime config: Config) type {
                 self.command = source.command;
                 @memcpy(self.column_names[0..source.column_count], source.column_names[0..source.column_count]);
                 @memcpy(self.column_types[0..source.column_count], source.column_types[0..source.column_count]);
+                @memcpy(self.column_typmods[0..source.column_count], source.column_typmods[0..source.column_count]);
                 for (0..source.row_count) |row| {
                     @memcpy(self.rows[row].cells[0..source.column_count], source.rows[row].cells[0..source.column_count]);
                 }
@@ -228,6 +301,9 @@ pub fn Database(comptime config: Config) type {
         /// Session dialect of the next statement (callers serialize access
         /// and set it per call; Store.Connection does). Not database state.
         dialect: Dialect = .postgres,
+        /// Session values of the next statement (TimeZone, clocks); set per
+        /// call like `dialect`. Not database state.
+        session: value_module.Session = .{},
         workspace: Workspace = .{},
 
         /// Includes all caller-owned table, version, index, catalog,
@@ -612,11 +688,11 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn bindContext(self: *Self, source: []const u8, mode: ParseMode, snap: Snapshot) B.Context {
-            return .{ .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect };
+            return .{ .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session };
         }
 
         fn evalContext(self: *const Self, source: []const u8) E.Context {
-            return .{ .source = source, .pool = &self.workspace.nodes };
+            return .{ .source = source, .pool = &self.workspace.nodes, .session = &self.session };
         }
 
         fn body(self: *Self, slot: u16, source: []const u8, parsed: *const A.Statement, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
@@ -628,9 +704,9 @@ pub fn Database(comptime config: Config) type {
                     self.outcome = .{ .affected = 0, .command = .select };
                     if (select.table) |table| try self.lockTable(slot, table, .access_share);
                     if (select.lock.strength == .none)
-                        return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, X.NoLock{});
+                        return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, X.NoLock{}, &self.session);
                     const locker: RowLocker = .{ .db = self, .slot = slot, .snap = snap, .mode = if (select.lock.strength == .update) .update else .share, .wait = select.lock.wait };
-                    return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, locker);
+                    return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, locker, &self.session);
                 },
                 else => {},
             }

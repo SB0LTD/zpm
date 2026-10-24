@@ -278,6 +278,15 @@ pub fn Session(comptime DB: type) type {
             try writer.failure(details[0], details[1], @errorName(err));
         }
 
+
+        /// New types (NUMERIC, REAL/DOUBLE, temporal, JSON) travel as TEXT
+        /// columns here: native metadata is not implemented (flag F-M).
+        fn textify(db: *DB, result: *DB.Result) anyerror!void {
+            if (!@hasDecl(DB.Result, "textify")) return;
+            const session = if (@hasDecl(DB, "valueSession")) db.valueSession() else DB.Result.default_session;
+            try result.textify(session);
+        }
+
         fn results(self: *Self, writer: *Writer, flags: u16) Error!void {
             if (self.result.column_count == 0) return writer.ok(self.result.affected_rows, flags);
             var start = try writer.packet();
@@ -298,13 +307,13 @@ pub fn Session(comptime DB: type) type {
                     .integer => 20,
                     .integer32 => 11,
                     .boolean => 1,
-                    .text => 65535,
+                    else => 65535,
                 }, 4);
                 try writer.byte(switch (kind) {
                     .integer => 8,
                     .integer32 => 3,
                     .boolean => 1,
-                    .text => 253,
+                    else => 253,
                 });
                 try writer.number(0, 2); // nullable, signed
                 try writer.byte(0); // decimals
@@ -319,6 +328,8 @@ pub fn Session(comptime DB: type) type {
                     .integer => |value| try writer.decimal(value),
                     .boolean => |value| try writer.string(if (value) "1" else "0"),
                     .text => |*value| try writer.string(value.slice()),
+                    // textify() rendered every other type as text.
+                    else => unreachable,
                 };
                 try writer.finish(start);
             }
@@ -352,7 +363,9 @@ pub fn Session(comptime DB: type) type {
                     },
                     3 => {
                         if (db.execute(payload[1..], &self.result)) |_| {
-                            try self.results(&writer, self.status(db));
+                            if (textify(db, &self.result)) |_| {
+                                try self.results(&writer, self.status(db));
+                            } else |err| try sqlError(&writer, err);
                         } else |err| {
                             // A parked statement: nothing consumed or written;
                             // the caller re-delivers the same packet later.

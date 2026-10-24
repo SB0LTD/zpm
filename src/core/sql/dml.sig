@@ -1,7 +1,9 @@
 //! Row construction for INSERT values and expression SET (Layer 0, design
 //! §4.9). Expressions are evaluated against the old row (UPDATE) or no row
-//! (INSERT), converted with assignment casts (int/boolean into text, MySQL/TDS
-//! integer 0/1 into boolean) and checked (NOT NULL, int4 range). Primary-key
+//! (INSERT), converted with assignment casts (inserted by the binder; MySQL/TDS
+//! integer 0/1 into boolean here), coerced to the column typmod (NUMERIC(p,s)
+//! rounding and 22003, TIMESTAMP(p) rounding) and checked (NOT NULL, int2/int4
+//! range). Primary-key
 //! uniqueness is checked per row as PostgreSQL's immediate unique index
 //! does: a key is taken by any committed row this statement has not already
 //! replaced, or by a version this statement created.
@@ -9,6 +11,7 @@ const types = @import("types.sig");
 const ast = @import("ast.sig");
 const storage = @import("storage.sig");
 const expr = @import("expr.sig");
+const value = @import("value.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -16,13 +19,14 @@ pub fn Dml(comptime config: types.Config) type {
     const V = types.Values(config);
     const S = storage.Storage(config);
     const E = expr.Eval(config);
+    const Io = value.Io(config);
     return struct {
         /// Converts an evaluated value into the column's stored form.
-        pub fn store(column: *const V.Column, value: V.Cell) Error!V.Cell {
-            var cell = value;
+        pub fn store(column: *const V.Column, evaluated: V.Cell, session: *const value.Session) Error!V.Cell {
+            var cell = evaluated;
             switch (column.data_type) {
-                .text => if (cell != .null_value and cell != .text) {
-                    cell = try E.toText(&value, true);
+                .text, .name => if (cell != .null_value and cell != .text) {
+                    cell = try E.toText(&evaluated, true, session);
                 },
                 .boolean => if (cell == .integer) {
                     // The binder admits integers here only for MySQL/TDS.
@@ -30,8 +34,9 @@ pub fn Dml(comptime config: types.Config) type {
                     if (integer != 0 and integer != 1) return error.TypeMismatch;
                     cell = .{ .boolean = integer == 1 };
                 },
-                .integer, .integer32 => {},
+                else => {},
             }
+            cell = try Io.applyTypmod(cell, types.typeOfData(column.data_type), column.typmod);
             try V.validate(column, &cell);
             return cell;
         }
@@ -40,8 +45,8 @@ pub fn Dml(comptime config: types.Config) type {
             var cells: E.Row = @splat(.null_value);
             ctx.row = null;
             for (table.columns[0..table.column_count], 0..) |*column, index| {
-                const value: V.Cell = if (values[index] == none) .null_value else try E.eval(ctx, values[index]);
-                cells[index] = try store(column, value);
+                const evaluated: V.Cell = if (values[index] == none) .null_value else try E.eval(ctx, values[index]);
+                cells[index] = try store(column, evaluated, ctx.session);
             }
             return cells;
         }
@@ -52,7 +57,7 @@ pub fn Dml(comptime config: types.Config) type {
             ctx.row = old;
             for (table.columns[0..table.column_count], 0..) |*column, index| {
                 if (values[index] == none) continue;
-                cells[index] = try store(column, try E.eval(ctx, values[index]));
+                cells[index] = try store(column, try E.eval(ctx, values[index]), ctx.session);
             }
             return cells;
         }

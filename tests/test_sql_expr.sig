@@ -28,6 +28,7 @@ fn sameCell(a: anytype, b: @TypeOf(a)) bool {
         .integer => |value| b == .integer and b.integer == value,
         .boolean => |value| b == .boolean and b.boolean == value,
         .text => |*value| b == .text and same(value.slice(), b.text.slice()),
+        else => std.meta.eql(a, b),
     };
 }
 
@@ -255,7 +256,9 @@ fn errors() !void {
     try rejects(&db, &r, "SELECT 'a' LIKE 'a\\'", error.InvalidEscapeSequence);
     try rejects(&db, &r, "SELECT $1", error.UndefinedParameter);
     try rejects(&db, &r, "SELECT id FROM t ORDER BY 2", error.InvalidColumnReference);
-    try rejects(&db, &r, "SELECT 1.5", error.UnsupportedStatement);
+    // Decimal literals are NUMERIC since step 3.2 (test_sql_types covers them).
+    try db.execute("SELECT 1.5", &r);
+    try check(r.column_types[0] == .numeric and r.rows[0].cells[0] == .numeric);
     try rejects(&db, &r, "SELECT id FROM t AS x WHERE t.id = 1", error.TableNotFound);
     try rejects(&db, &r, "SELECT *", error.Syntax);
     try rejects(&db, &r, "SELECT id", error.ColumnNotFound);

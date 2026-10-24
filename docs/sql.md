@@ -112,9 +112,68 @@ the same validation/application path with a compile-time no-op boundary.
 CREATE/DROP TABLE; single-row INSERT with optional column mapping and expression
 values; SELECT expressions or `*` with optional `FROM table [[AS] alias]` (one
 table; no FROM evaluates one row); UPDATE with expression SET; DELETE. Columns
-have INTEGER/INT/INT4, BIGINT/INT8, BOOLEAN/BOOL, or TEXT types, with NOT NULL
-and one single-column PRIMARY KEY. The primary key is also non-null. Omitted
-INSERT columns become NULL.
+have SMALLINT/INT2, INTEGER/INT/INT4, BIGINT/INT8, NUMERIC/DECIMAL[(p[,s])],
+REAL/FLOAT4, DOUBLE PRECISION/FLOAT8/FLOAT[(p)], BOOLEAN/BOOL, TEXT, NAME, OID,
+DATE, TIMESTAMP[(p)] [WITH|WITHOUT TIME ZONE], TIMESTAMPTZ[(p)], INTERVAL, JSON
+or JSONB types, with NOT NULL and one single-column PRIMARY KEY. The primary
+key is also non-null. Omitted INSERT columns become NULL.
+
+### Value types (Q02/Q03/Q04)
+
+Cells are a tagged union (`types.sig`) with inline storage bounded by
+`Config.text_bytes`: integers (int2/int4/int8/oid), booleans, text
+(text/name/json), float4, float8, NUMERIC (`numeric.sig`: coefficient below
+10^`Config.numeric_digits` (default 64, at most 76) and display scale at most
+120; more is `NumericCapacity`, 54000), DATE (i32 days), TIMESTAMP/TIMESTAMPTZ
+(i64 microseconds since 2000-01-01, TIMESTAMPTZ in UTC), INTERVAL (months,
+days, microseconds) and JSONB (canonical binary, `jsonb.sig`). Typmods are
+stored per column (`Column.typmod`, `Result.column_typmods`, PostgreSQL's
+encoding) and carried by kind-3 create_table records; every new value type has
+a change-record encoding that replay validates against the column type OID
+(JSONB bytes are structurally checked). `value.sig` holds text I/O, casts in
+the implicit/assignment/explicit contexts and the operators:
+
+- NUMERIC: numeric_in forms (`_` separators, exponents, NaN, [+-]Infinity),
+  half-away-from-zero rounding, PostgreSQL 15+ typmods (precision 1..1000,
+  scale -1000..1000, precision above `numeric_digits` is 54000 at DDL),
+  `select_div_scale` for `/`, mod scale max(dscales), NaN sorting last and no
+  negative zero; numeric-to-int casts round half away (22003 out of range,
+  0A000 for NaN/Infinity).
+- REAL/DOUBLE (`float_text.sig`): the float8in grammar measured on musl is
+  checked before `std.fmt.parseFloat` (decimal, `0x..p` hex, Infinity/inf/NaN,
+  trimmed whitespace; 22P02 otherwise, 22003 out of range); output is the
+  shortest round-trip digits (`std.fmt.float.render`) laid out like float8out
+  with extra_float_digits = 1; overflow/underflow 22003, `/ 0` 22012;
+  float-to-int casts use rint; float-to-numeric uses 15 (float4: 6)
+  significant digits as float8_numeric does.
+- Promotion: int2 < int4 < int8 < numeric < float4 < float8, with float4 and a
+  non-float operand promoting to float8; date < timestamp < timestamptz. The
+  binder inserts implicit cast nodes so operators always see one type.
+- Temporal (`temporal.sig`, `tzif.sig`): ISO 8601 input only (`T`/space,
+  fractions rounded to microseconds, `Z`/`+-HH[[:]MM[[:]SS]]`, a zone name, BC),
+  infinity/-infinity/epoch, PostgreSQL range limits (22008) and 22007 for bad
+  text; DateStyle ISO and IntervalStyle postgres output; `+ -` for date/int,
+  date/date, timestamp(tz)/interval (months and days in session local time for
+  timestamptz), timestamp - timestamp with justify_hours, AT TIME ZONE,
+  now()/CURRENT_TIMESTAMP/transaction_timestamp() (transaction start),
+  statement_timestamp(), clock_timestamp(), CURRENT_DATE. Zones are UTC,
+  fixed offsets, POSIX TZ strings or TZif v2+ bytes owned by the caller and
+  decoded in place (footer rules after the last transition); local times in
+  DST gaps take the offset before the transition and overlaps the offset
+  after it (DetermineTimeZoneOffset). The session (`Database.session`,
+  `value.Session`) supplies the zone, a zone-name resolver and the clocks;
+  without a clock the time functions fail with `ClockUnavailable` (0A000).
+- JSON keeps validated input verbatim; JSONB orders keys by (length, bytes),
+  keeps the last duplicate, stores numbers as NUMERIC, nests at most
+  `Config.json_depth` (64; deeper is 54001), validates `\u` escapes and
+  surrogate pairs (`\u0000` is `UntranslatableCharacter`, 22P05) and prints
+  with PostgreSQL spacing. Operators: `-> ->> #> #>> @> <@ ?` (a top-level
+  scalar is a one-element pseudo array; `#>` takes a `'{a,b}'` literal), `=`
+  and PostgreSQL's btree ordering, `jsonb_typeof`, `jsonb_array_length`, casts
+  text/json/jsonb. Strings compare bytewise (the reference uses its collation).
+
+The only std symbols `sql.sig` and `sql/*.sig` use are `std.fmt.parseFloat`
+and `std.fmt.float.render` (both in `float_text.sig`).
 
 Expressions (Q01) use PostgreSQL precedence, lowest first: OR, AND, NOT, IS,
 comparison (non-associative), BETWEEN/IN/LIKE/ILIKE, `||`, `+ -`, `* / %`,
@@ -138,9 +197,10 @@ int8 into int4 is range checked, integers and booleans convert into TEXT.
 Output columns are named like PostgreSQL (column, `coalesce`/`nullif`/`case`,
 cast type name such as `int4`, or `?column?`; `AS` aliases and quoted
 identifiers keep their case). `$n` reaching the engine is
-`UndefinedParameter`; decimal literals are `UnsupportedStatement` until NUMERIC.
-Other functions, JSON operators, aggregates, joins and subqueries are not
-supported.
+`UndefinedParameter`. Integer literals beyond int8 and decimal/exponent
+literals are NUMERIC (a decimal literal cast to a float type is parsed as a
+float). Other functions (`pg_typeof` included), JSON (non-B) operators,
+aggregates, joins and subqueries are not supported.
 
 WHERE keeps a row only when its predicate is TRUE. A top-level `pk = constant`
 conjunct (any constant expression) uses the primary-key index. At most
@@ -189,7 +249,10 @@ Errors include `Syntax`, `UnsupportedStatement`, `TableCapacity`,
 `TransactionLogCapacity`, `UnsupportedLogVersion`, `InvalidChangeRecord`,
 `ChangeRecordConflict`, `UndefinedFunction`, `AmbiguousFunction`,
 `CannotCoerce`, `InvalidTextRepresentation`, `DivisionByZero`,
-`InvalidEscapeSequence`, `UndefinedParameter`, `InvalidColumnReference` and the
+`InvalidEscapeSequence`, `UndefinedParameter`, `InvalidColumnReference`,
+`NumericValueOutOfRange`, `NumericCapacity`, `InvalidParameterValue`,
+`InvalidDatetimeFormat`, `DatetimeFieldOverflow`, `UntranslatableCharacter`,
+`ClockUnavailable` and the
 transaction errors `WouldBlock` (never sent to clients), `SerializationFailure`,
 `DeadlockDetected`, `LockNotAvailable`, `QueryCanceled`, `TransactionCapacity`,
 `WriteSetCapacity`, `LockCapacity`, `CatalogCapacity`, `SavepointCapacity`,
@@ -203,15 +266,17 @@ without ordering stops scanning once enough rows match. Result clearing changes
 only active counts; callers must observe the active ranges. Column types are
 reported even when a SELECT returns zero rows.
 
-Joins, aggregates, secondary indexes, NUMERIC and other types, functions beyond
-COALESCE/NULLIF, and complete SQL-standard or PostgreSQL conformance remain
-unimplemented. The reusable shared transaction adapter and wire sessions are
+Joins, aggregates, secondary indexes, arrays, zone abbreviations, non-ISO
+DateStyle and other IntervalStyles, functions beyond those listed above, and
+complete SQL-standard or PostgreSQL conformance remain unimplemented. The reusable shared transaction adapter and wire sessions are
 documented in [database-server.md](database-server.md).
 ## Validation
 
 Run `sig build test-sql --summary all` with Sig 0.6.3. The target compiles and
-executes `tests/test_sql.sig`, `test_sql_index.sig`, `test_sql_storage.sig` and
-`test_sql_change_log.sig`, emitting assertion, statement, and fuzz counts.
+executes `tests/test_sql.sig`, `test_sql_index.sig`, `test_sql_storage.sig`,
+`test_sql_change_log.sig`, `test_sql_expr.sig`, `test_sql_mvcc.sig` and
+`test_sql_types.sig` (value types, zones, JSONB and typed change-record round
+trips), emitting assertion, statement, and fuzz counts.
 It is also included in `sig build test`. The executable's `--prove-failure`
 option deliberately returns nonzero, including release modes. Contracts cover
 operations, ownership, fail-atomic constraints, capacity exhaustion/reuse,
