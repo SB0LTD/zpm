@@ -37,6 +37,8 @@ fn resultEqual(a: *const DB.Result, b: *const DB.Result) bool {
             .text => |t| {
                 if (y != .text or !equal(t.slice(), y.text.slice())) return false;
             },
+            // This contract stores INTEGER/BOOLEAN/TEXT only.
+            else => return false,
         }
     };
     return true;
@@ -96,8 +98,8 @@ const Model = struct {
 fn verifyAll(comptime kind: Kind, keys: *const [64]u64, model: *const Model, db: *DB, r: *DB.Result) !void {
     try execute(db, r, "SELECT * FROM t ORDER BY id");
     try check(r.column_count == 3 and r.row_count == model.count);
-    try check(r.column_types[0] == (if (kind == .integer) sql.DataType.integer else sql.DataType.text));
-    try check(r.column_types[1] == .integer and r.column_types[2] == .boolean);
+    try check(r.column_types[0] == (if (kind == .integer) sql.DataType.integer32 else sql.DataType.text));
+    try check(r.column_types[1] == .integer32 and r.column_types[2] == .boolean);
     var row: usize = 0;
     for (model.live, 0..) |live, i| if (live) {
         try expectKey(kind, r.rows[row].cells[0], keys[i]);
@@ -234,7 +236,7 @@ fn booleanAndMetadata() !void {
     var r: DB.Result = .{};
     try execute(&db, &r, "CREATE TABLE t (id BOOLEAN PRIMARY KEY,val INTEGER,flag TEXT)");
     try execute(&db, &r, "SELECT flag,id,val FROM t LIMIT 0");
-    try check(r.row_count == 0 and r.column_count == 3 and r.column_types[0] == .text and r.column_types[1] == .boolean and r.column_types[2] == .integer);
+    try check(r.row_count == 0 and r.column_count == 3 and r.column_types[0] == .text and r.column_types[1] == .boolean and r.column_types[2] == .integer32);
     try check(equal(r.column_names[0].slice(), "flag") and equal(r.column_names[1].slice(), "id"));
     try execute(&db, &r, "INSERT INTO t VALUES (FALSE,10,'a')");
     try execute(&db, &r, "INSERT INTO t VALUES (TRUE,20,'b')");
@@ -265,7 +267,7 @@ fn booleanAndMetadata() !void {
 fn boundaryKeys() !void {
     var db: DB = .{};
     var r: DB.Result = .{};
-    try execute(&db, &r, "CREATE TABLE t (id INTEGER PRIMARY KEY,val INTEGER)");
+    try execute(&db, &r, "CREATE TABLE t (id BIGINT PRIMARY KEY,val INTEGER)");
     try execute(&db, &r, "INSERT INTO t VALUES (-9223372036854775808,1)");
     try execute(&db, &r, "INSERT INTO t VALUES (9223372036854775807,2)");
     try execute(&db, &r, "INSERT INTO t VALUES (-1,3)");

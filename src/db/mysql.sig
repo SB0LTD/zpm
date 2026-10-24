@@ -8,7 +8,9 @@
 //! Source: dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html.
 
 pub const max_request_bytes: usize = 65536;
-pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false };
+/// `blocked`: the statement is parked on a lock (consumed = written = 0);
+/// re-deliver the same bytes when the store reports progress.
+pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false, blocked: bool = false };
 pub const Error = error{ BufferTooSmall, MalformedPacket, RequestTooLarge, InvalidSequence, InvalidState };
 
 const protocol_41: u32 = 0x200;
@@ -276,6 +278,15 @@ pub fn Session(comptime DB: type) type {
             try writer.failure(details[0], details[1], @errorName(err));
         }
 
+
+        /// New types (NUMERIC, REAL/DOUBLE, temporal, JSON) travel as TEXT
+        /// columns here: native metadata is not implemented (flag F-M).
+        fn textify(db: *DB, result: *DB.Result) anyerror!void {
+            if (!@hasDecl(DB.Result, "textify")) return;
+            const session = if (@hasDecl(DB, "valueSession")) db.valueSession() else DB.Result.default_session;
+            try result.textify(session);
+        }
+
         fn results(self: *Self, writer: *Writer, flags: u16) Error!void {
             if (self.result.column_count == 0) return writer.ok(self.result.affected_rows, flags);
             var start = try writer.packet();
@@ -296,13 +307,13 @@ pub fn Session(comptime DB: type) type {
                     .integer => 20,
                     .integer32 => 11,
                     .boolean => 1,
-                    .text => 65535,
+                    else => 65535,
                 }, 4);
                 try writer.byte(switch (kind) {
                     .integer => 8,
                     .integer32 => 3,
                     .boolean => 1,
-                    .text => 253,
+                    else => 253,
                 });
                 try writer.number(0, 2); // nullable, signed
                 try writer.byte(0); // decimals
@@ -317,6 +328,8 @@ pub fn Session(comptime DB: type) type {
                     .integer => |value| try writer.decimal(value),
                     .boolean => |value| try writer.string(if (value) "1" else "0"),
                     .text => |*value| try writer.string(value.slice()),
+                    // textify() rendered every other type as text.
+                    else => unreachable,
                 };
                 try writer.finish(start);
             }
@@ -324,6 +337,8 @@ pub fn Session(comptime DB: type) type {
         }
 
         pub fn handle(self: *Self, db: *DB, input: []const u8, out: []u8) Error!Reply {
+            // MySQL BIT clients assign booleans as integer 0/1 (design §4.2).
+            if (@hasField(DB, "dialect")) db.dialect = .mysql;
             if (!self.greeted or self.closed) return error.InvalidState;
             if (input.len < 4) return .{};
             const length: usize = @intCast(readLe(input[0..3]));
@@ -348,8 +363,16 @@ pub fn Session(comptime DB: type) type {
                     },
                     3 => {
                         if (db.execute(payload[1..], &self.result)) |_| {
-                            try self.results(&writer, self.status(db));
-                        } else |err| try sqlError(&writer, err);
+                            if (textify(db, &self.result)) |_| {
+                                try self.results(&writer, self.status(db));
+                            } else |err| try sqlError(&writer, err);
+                        } else |err| {
+                            // A parked statement: nothing consumed or written;
+                            // the caller re-delivers the same packet later.
+                            const any: anyerror = err;
+                            if (any == error.WouldBlock) return .{ .blocked = true };
+                            try sqlError(&writer, err);
+                        }
                     },
                     14 => {
                         if (payload.len != 1) return error.MalformedPacket;

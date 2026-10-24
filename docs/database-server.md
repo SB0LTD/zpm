@@ -34,6 +34,24 @@ rejected rather than overwriting it.
 
 PostgreSQL supports simple and extended queries, named statement lifecycle,
 typed text/binary parameters and rows, SQLSTATE errors and synchronization.
+`pg_types.sig` implements binary send/receive for every SQL type (NUMERIC
+base-10000 digits, int64 microsecond timestamps, interval, JSONB version 1,
+float4/8, int2, oid, name) and renders parameters as `'...'::type` literals;
+RowDescription carries type OIDs, lengths and typmods. ParameterStatus reports
+application_name, client_encoding, DateStyle, integer_datetimes,
+IntervalStyle, server_encoding, server_version (16.0),
+standard_conforming_strings and TimeZone at startup, and every changed value
+before ReadyForQuery (`Connection.takeParameterChanges`). The store resolves
+TimeZone through the caller's `zone_provider` (TZif bytes it owns), built-in
+UTC or POSIX TZ strings, and supplies statement/transaction timestamps from
+`wall_clock`. MySQL and TDS sessions return the step 3.2 types as text columns
+(`Result.textify`).
+COPY FROM STDIN / TO STDOUT (text, csv, binary) runs over the simple query
+protocol only (extended-protocol COPY is 0A000): `pg_copy.sig` frames rows,
+CopyData bodies are streamed (not bounded by the packet limit), a row is at
+most `copy_line_bytes`, and a row whose key is held by a live inserter parks
+the COPY like a blocked statement (`Reply.blocked` with the bytes consumed
+through that row). Errors discard the remaining CopyData as PostgreSQL does.
 MySQL supports protocol 10, COM_QUERY, PING, INIT_DB and text results; COM_STMT
 binary preparation is not implemented. TDS 7.2–7.4 supports PRELOGIN/LOGIN7,
 SQL_BATCH, typed nullable values, packet fragmentation, transaction-manager
@@ -51,25 +69,24 @@ SCRAM channel binding are not implemented.
 
 ## Transactions and durability
 
-`Store(Raw)` owns committed state and a generation. Each connection needs a
-unique nonzero id and a distinct caller-owned `transaction_workspace`. BEGIN
-copies committed state into this workspace. Changes remain private; writing
-commits fail with SerializationFailure if another commit changed the generation.
-Read-only commits do not conflict. Disconnect discards private state. This
-conservative optimistic isolation differs from PostgreSQL READ COMMITTED.
+`Store(Raw)` owns one shared `sql.Database`; connections (unique nonzero id)
+hold no database copy. Isolation is READ COMMITTED: every statement takes a new
+snapshot, same-row writers wait (`error.WouldBlock`, `Reply.blocked` in the
+codecs) and resume with EvalPlanQual when the caller re-delivers the same
+statement after `wakeReady()`. Parked statements end with lock_timeout (55P03),
+statement_timeout or cancel (57014), or as deadlock victims (40P01, checked once
+per wait after 1 s). Callers set `store.now_ns` (monotonic) before each call.
+Errors in a block discard the work since the innermost savepoint and fail the
+block; disconnect aborts everything and releases locks.
 
-Durable callers supply `commit_ctx`, `commit_fn`, and
-set `durability_required`. Each connection also supplies a bounded
-`transaction_log`. Commit batches use repeated little-endian u32 length + SQL
-bytes; `BatchIterator` validates them without splitting literals or comments.
-The synchronous hook must persist a complete batch before returning. The store
-publishes only after hook success. Hook failure poisons subsequent writes.
-Read-only statements do not copy the database. For Raw adapters providing
-`executeWithCommit`, durable autocommit uses its validated mutation boundary:
-flush the framed statement, then apply it without copying any database state.
-It needs no `autocommit_workspace`. Older Raw adapters still require a distinct
-caller-owned `autocommit_workspace` and use candidate preparation/publication.
-Explicit transactions retain private snapshots and generation conflict checks.
+Durable callers supply `commit_ctx`, `commit_fn`, an `encode_buffer` and set
+`durability_required`. COMMIT and autocommit share one path: a transaction
+with an empty write set publishes without the hook; otherwise the store
+encodes the kind-3 change record into `encode_buffer`, the synchronous hook
+must persist it before returning, and only then does the store publish. Hook
+failure aborts the transaction and poisons subsequent writes. Legacy SQL-text
+batches (`BatchIterator`, repeated little-endian u32 length + SQL bytes) are
+only read during recovery.
 
 `durable_log.append` writes a versioned checksummed header, payload and commit
 trailer, then syncs. `recover` checks complete records, contiguous sequences and
@@ -80,8 +97,10 @@ provides complete append/fsync/truncate, and poisons failed writers. Atomic file
 publication helpers are for caller-validated backups/snapshots; never replace
 an active WAL inode or truncate it without a persisted sequence anchor.
 
-Runtime wiring and storage lifecycle remain product policy in RAMSQL. WAL v1
-replays SQL, so upgrades must preserve parser/type semantics or migrate formats.
+Runtime wiring and storage lifecycle remain product policy in RAMSQL. New
+records are kind-3 typed change records (`sql.change_records`); legacy kind 1/2
+SQL-text records replay only through the frozen alpha grammar, so upgrades must
+preserve both interpretations or migrate formats.
 Capacity must cover every historical state, including rows later deleted.
 
 ## TCP API

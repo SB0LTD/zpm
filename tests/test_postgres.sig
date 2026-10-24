@@ -221,6 +221,107 @@ fn close(s: *Session, db: *DB, kind: u8, name: []const u8) ![]const u8 {
     return send(s, db, &p);
 }
 
+/// A Raw adapter with describe() that counts executions (design §5.10(d)).
+const Counting = struct {
+    pub const Result = Raw.Result;
+    raw: Raw = .{},
+    executions: usize = 0,
+    pub fn execute(self: *@This(), source: []const u8, result: *Result) !void {
+        self.executions += 1;
+        return self.raw.execute(source, result);
+    }
+    pub fn describe(self: *@This(), source: []const u8, result: *Result) !void {
+        return self.raw.describe(source, result);
+    }
+};
+const CountingSession = pg.Session(Counting);
+var counting_output: [CountingSession.responseCapacity()]u8 = undefined;
+fn countingSend(s: *CountingSession, db: *Counting, p: *Packet) ![]const u8 {
+    const bytes = p.slice();
+    const reply = try s.handle(db, bytes, &counting_output);
+    try check(reply.consumed == bytes.len and !reply.close);
+    packets += 1;
+    return counting_output[0..reply.written];
+}
+fn commandText(bytes: []const u8, wanted: []const u8) !void {
+    var frames: Frames = .{ .bytes = bytes };
+    while (try frames.next()) |f| if (f.tag == 'C') {
+        try check(equal(f.body[0 .. f.body.len - 1], wanted));
+        return;
+    };
+    return error.MissingCommandComplete;
+}
+/// Prepared INSERT ... RETURNING: Parse (with inference), Describe
+/// statement and portal, Bind, then Execute twice: the engine executes it
+/// exactly once and reports RowDescription, the row and INSERT 0 1.
+fn returningOnce() !void {
+    var db: Counting = .{};
+    var s: CountingSession = .{};
+    var p = Packet.init(0);
+    p.len = 4;
+    p.number32(196608);
+    p.string("user");
+    p.string("ramsql");
+    p.byte(0);
+    put32(p.bytes[0..4], @intCast(p.len));
+    const ready = try s.handle(&db, p.bytes[0..p.len], &counting_output);
+    try check(ready.consumed == p.len and s.startup);
+    var q = Packet.init('Q');
+    q.string("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)");
+    try tags(try countingSend(&s, &db, &q), "CZ");
+    db.executions = 0;
+    var parse_packet = Packet.init('P');
+    parse_packet.string("ins");
+    parse_packet.string("INSERT INTO notes VALUES ($1, $2) RETURNING id, body || '!' AS shout");
+    parse_packet.number16(2);
+    parse_packet.number32(0);
+    parse_packet.number32(0);
+    try tags(try countingSend(&s, &db, &parse_packet), "1");
+    var describe_statement = Packet.init('D');
+    describe_statement.byte('S');
+    describe_statement.string("ins");
+    try tags(try countingSend(&s, &db, &describe_statement), "tT");
+    try check(s.result.column_count == 2 and equal(s.result.column_names[1].slice(), "shout"));
+    var bind_packet = Packet.init('B');
+    bind_packet.string("");
+    bind_packet.string("ins");
+    bind_packet.number16(0);
+    bind_packet.number16(2);
+    bind_packet.number32(1);
+    bind_packet.append("7");
+    bind_packet.number32(5);
+    bind_packet.append("hello");
+    bind_packet.number16(0);
+    try tags(try countingSend(&s, &db, &bind_packet), "2");
+    var describe_portal = Packet.init('D');
+    describe_portal.byte('P');
+    describe_portal.string("");
+    try tags(try countingSend(&s, &db, &describe_portal), "T");
+    try check(db.executions == 0);
+    var execute_packet = Packet.init('E');
+    execute_packet.string("");
+    execute_packet.number32(0);
+    const executed = try countingSend(&s, &db, &execute_packet);
+    try tags(executed, "DC");
+    try commandText(executed, "INSERT 0 1");
+    var frames: Frames = .{ .bytes = executed };
+    const row = (try frames.next()).?;
+    try check(equal(row.body, "\x00\x02\x00\x00\x00\x017\x00\x00\x00\x06hello!"));
+    try check(db.executions == 1);
+    // A completed portal replays its tag without executing again.
+    var again = Packet.init('E');
+    again.string("");
+    again.number32(0);
+    try tags(try countingSend(&s, &db, &again), "C");
+    try check(db.executions == 1);
+    var sync_packet = Packet.init('S');
+    try tags(try countingSend(&s, &db, &sync_packet), "Z");
+    var count = Packet.init('Q');
+    count.string("SELECT COUNT(*) FROM notes");
+    const counted = try countingSend(&s, &db, &count);
+    try tags(counted, "TDCZ");
+    try check(s.result.rows[0].cells[0].integer == 1);
+}
 fn normal() !void {
     var db: DB = .{};
     var s: Session = .{};
@@ -281,7 +382,8 @@ fn extended() !void {
     try tags(result, "DC");
     var frames: Frames = .{ .bytes = result };
     const row = (try frames.next()).?;
-    try check(u32be(row.body[2..6]) == 8 and equal(row.body[6..14], "\x00\x00\x00\x00\x00\x00\x00\x2a"));
+    // INTEGER is int4 on the PostgreSQL path whatever integer_bits says.
+    try check(u32be(row.body[2..6]) == 4 and equal(row.body[6..10], "\x00\x00\x00\x2a"));
     try check(equal(s.result.rows[0].cells[1].text.slice(), "a'b; -- $1"));
     try sync(&s, &db);
     try tags(try close(&s, &db, 'S', "insert"), "3");
@@ -320,7 +422,7 @@ fn inference() !void {
     _ = try query(&s, &db, "CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT, ok BOOLEAN)");
     try tags(try parse(&s, &db, "insert", "INSERT INTO t (body,id,ok) VALUES ($1,$2,$3)", &.{}), "1");
     try tags(try describe(&s, &db, 'S', "insert"), "tn");
-    try check(s.statements[0].oids[0] == 25 and s.statements[0].oids[1] == 20 and s.statements[0].oids[2] == 16);
+    try check(s.statements[0].oids[0] == 25 and s.statements[0].oids[1] == 23 and s.statements[0].oids[2] == 16);
     try tags(try bind(&s, &db, "", "insert", &.{ "123", "7", "true" }, 0, 0), "2");
     try tags(try execute(&s, &db, "", 0), "C");
     try sync(&s, &db);
@@ -569,10 +671,196 @@ fn fuzz() !void {
         fuzz_inputs += 1;
     }
 }
+/// Every engine error has an explicit SQLSTATE; none falls back to 54000.
+fn errorStates() !void {
+    inline for (@typeInfo(sql.Error).error_set.error_names.?) |name| {
+        const err = @field(sql.Error, name);
+        try check(pg.knownSqlstate(err) != null);
+    }
+    const expected = .{
+        .{ error.UndefinedFunction, "42883" },         .{ error.TypeMismatch, "42804" },
+        .{ error.InvalidTextRepresentation, "22P02" }, .{ error.IntegerOverflow, "22003" },
+        .{ error.DivisionByZero, "22012" },            .{ error.AmbiguousFunction, "42725" },
+        .{ error.CannotCoerce, "42846" },              .{ error.StatementTooComplex, "54001" },
+        .{ error.VersionCapacity, "53200" },           .{ error.InvalidColumnReference, "42P10" },
+    };
+    inline for (expected) |pair| try check(equal(pg.knownSqlstate(pair[0]).?, pair[1]));
+    try check(pg.knownSqlstate(error.SomethingUnknown) == null);
+}
+
+const stores = @import("db_store");
+const Store = stores.Store(Raw);
+const StoreSession = pg.Session(Store.Connection);
+var store_output: [StoreSession.responseCapacity()]u8 = undefined;
+
+fn storeSend(s: *StoreSession, db: *Store.Connection, p: *Packet) !pg.Reply {
+    const reply = try s.handle(db, p.slice(), &store_output);
+    packets += 1;
+    return reply;
+}
+
+fn storeQuery(s: *StoreSession, db: *Store.Connection, source: []const u8) ![]const u8 {
+    var p = Packet.init('Q');
+    p.string(source);
+    const reply = try storeSend(s, db, &p);
+    try check(!reply.blocked and reply.consumed == p.len);
+    return store_output[0..reply.written];
+}
+
+fn storeStartup(s: *StoreSession, db: *Store.Connection, options: []const u8) ![]const u8 {
+    var p = Packet.init(0);
+    p.len = 4;
+    p.number32(196608);
+    p.string("user");
+    p.string("ramsql");
+    p.string("options");
+    p.string(options);
+    p.byte(0);
+    put32(p.bytes[0..4], @intCast(p.len));
+    const reply = try s.handle(db, p.bytes[0..p.len], &store_output);
+    try check(reply.consumed == p.len and s.startup);
+    return store_output[0..reply.written];
+}
+
+/// Whether `bytes` holds a ParameterStatus for `name` (with `value` when given).
+fn parameterStatus(bytes: []const u8, name: []const u8, value: ?[]const u8) bool {
+    var frames: Frames = .{ .bytes = bytes };
+    while (frames.next() catch return false) |f| if (f.tag == 'S') {
+        const key_end = std.mem.indexOfScalar(u8, f.body, 0) orelse return false;
+        if (!equal(f.body[0..key_end], name)) continue;
+        const rest = f.body[key_end + 1 ..];
+        const value_end = std.mem.indexOfScalar(u8, rest, 0) orelse return false;
+        return if (value) |wanted| equal(rest[0..value_end], wanted) else true;
+    };
+    return false;
+}
+
+fn commandTag(bytes: []const u8, wanted: []const u8) !void {
+    var frames: Frames = .{ .bytes = bytes };
+    while (try frames.next()) |f| if (f.tag == 'C') {
+        try check(equal(f.body[0 .. f.body.len - 1], wanted));
+        return;
+    };
+    return error.MissingCommandTag;
+}
+
+// READ COMMITTED wire behavior over the real store: BackendKeyData,
+// CancelRequest keys, startup options, control-command tags, SHOW rows, a
+// parked Execute reported as blocked, and ROLLBACK TO closing newer portals.
+fn storeContracts() !void {
+    var store: Store = .{};
+    var a: Store.Connection = .{ .store = &store, .id = 1 };
+    var b: Store.Connection = .{ .store = &store, .id = 2 };
+    var sa: StoreSession = .{};
+    var sb: StoreSession = .{};
+    sa.configureBackendKey(7, 0xdeadbeef);
+    const ready = try storeStartup(&sa, &a, "-c statement_timeout=1500");
+    const startup_parameters = parameterStatus(ready, "TimeZone", "UTC") and parameterStatus(ready, "DateStyle", "ISO, MDY") and parameterStatus(ready, "IntervalStyle", "postgres") and parameterStatus(ready, "server_version", "16.0");
+    var frames: Frames = .{ .bytes = ready };
+    var saw_key = false;
+    while (try frames.next()) |f| if (f.tag == 'K') {
+        try check(u32be(f.body[0..4]) == 7 and u32be(f.body[4..8]) == 0xdeadbeef);
+        saw_key = true;
+    };
+    try check(saw_key and a.settings.statement_timeout_ms == 1500);
+    _ = try storeStartup(&sb, &b, "");
+    // CancelRequest goes to the caller with its key; the codec looks nothing up.
+    var fresh: StoreSession = .{};
+    var cancel_bytes: [16]u8 = undefined;
+    put32(cancel_bytes[0..4], 16);
+    put32(cancel_bytes[4..8], 80877102);
+    put32(cancel_bytes[8..12], 7);
+    put32(cancel_bytes[12..16], 0xdeadbeef);
+    const cancel = try fresh.handle(&a, &cancel_bytes, &store_output);
+    try check(cancel.close and cancel.written == 0 and cancel.cancel.?.pid == 7 and cancel.cancel.?.secret == 0xdeadbeef);
+
+    _ = try storeQuery(&sa, &a, "CREATE TABLE w (id INTEGER PRIMARY KEY, v INTEGER)");
+    _ = try storeQuery(&sa, &a, "INSERT INTO w VALUES (1, 0)");
+    try commandTag(try storeQuery(&sa, &a, "SHOW statement_timeout"), "SHOW");
+    try check(equal(sa.result.rows[0].cells[0].text.slice(), "1500ms"));
+    try commandTag(try storeQuery(&sa, &a, "SET lock_timeout TO '2s'"), "SET");
+    try commandTag(try storeQuery(&sa, &a, "RESET lock_timeout"), "RESET");
+    // ParameterStatus: every reported setting at startup, then each changed
+    // one before ReadyForQuery (SET, RESET, failed-block revert); unchanged
+    // settings are not re-sent.
+    try check(startup_parameters);
+    const zoned = try storeQuery(&sa, &a, "SET TIME ZONE 'UTC+3'");
+    try check(parameterStatus(zoned, "TimeZone", "UTC+3") and !parameterStatus(zoned, "DateStyle", null));
+    try check(!parameterStatus(try storeQuery(&sa, &a, "SELECT 1"), "TimeZone", null));
+    try check(parameterStatus(try storeQuery(&sa, &a, "SET TIME ZONE 5"), "TimeZone", "<+05>-05"));
+    _ = try storeQuery(&sa, &a, "BEGIN");
+    try check(parameterStatus(try storeQuery(&sa, &a, "SET TIME ZONE -3.5"), "TimeZone", "<-03:30>+03:30"));
+    try check(parameterStatus(try storeQuery(&sa, &a, "SELECT missing FROM w"), "TimeZone", "<+05>-05"));
+    _ = try storeQuery(&sa, &a, "ROLLBACK");
+    try check(parameterStatus(try storeQuery(&sa, &a, "RESET TimeZone"), "TimeZone", "UTC"));
+    try check(parameterStatus(try storeQuery(&sa, &a, "SET DateStyle = 'ISO, DMY'"), "DateStyle", "ISO, DMY"));
+    try state(try storeQuery(&sa, &a, "SET TIME ZONE 'Mars/Base'"), "22023");
+    try state(try storeQuery(&sa, &a, "SET DateStyle = 'SQL'"), "22023");
+    _ = try storeQuery(&sa, &a, "RESET ALL");
+    try check(a.settings.statement_timeout_ms == 1500);
+    try state(try storeQuery(&sa, &a, "SAVEPOINT outside"), "25P01");
+    try commandTag(try storeQuery(&sa, &a, "BEGIN"), "BEGIN");
+    try commandTag(try storeQuery(&sa, &a, "SAVEPOINT s"), "SAVEPOINT");
+    try commandTag(try storeQuery(&sa, &a, "UPDATE w SET v = 1 WHERE id = 1"), "UPDATE 1");
+
+    // b's extended-protocol Execute parks: nothing consumed or written.
+    var parse_packet = Packet.init('P');
+    parse_packet.string("");
+    parse_packet.string("UPDATE w SET v = 2 WHERE id = 1");
+    parse_packet.number16(0);
+    _ = try storeSend(&sb, &b, &parse_packet);
+    var bind_packet = Packet.init('B');
+    bind_packet.string("");
+    bind_packet.string("");
+    bind_packet.number16(0);
+    bind_packet.number16(0);
+    bind_packet.number16(0);
+    _ = try storeSend(&sb, &b, &bind_packet);
+    var execute_packet = Packet.init('E');
+    execute_packet.string("");
+    execute_packet.number32(0);
+    const parked = try storeSend(&sb, &b, &execute_packet);
+    try check(parked.blocked and parked.consumed == 0 and parked.written == 0 and b.blocked());
+
+    // A named portal bound after the savepoint is closed by ROLLBACK TO.
+    var portal_parse = Packet.init('P');
+    portal_parse.string("q");
+    portal_parse.string("SELECT v FROM w");
+    portal_parse.number16(0);
+    _ = try storeSend(&sa, &a, &portal_parse);
+    var portal_bind = Packet.init('B');
+    portal_bind.string("late");
+    portal_bind.string("q");
+    portal_bind.number16(0);
+    portal_bind.number16(0);
+    portal_bind.number16(0);
+    _ = try storeSend(&sa, &a, &portal_bind);
+    try check(sa.portals[0].live or sa.portals[1].live);
+    try commandTag(try storeQuery(&sa, &a, "ROLLBACK TO SAVEPOINT s"), "ROLLBACK");
+    for (&sa.portals) |*p| try check(!(p.live and equal(p.name.bytes[0..p.name.len], "late")));
+    // The row lock is gone: b's re-delivered Execute completes.
+    try check(b.wakeReady());
+    const resumed = try storeSend(&sb, &b, &execute_packet);
+    try check(!resumed.blocked and resumed.consumed == execute_packet.len);
+    try commandTag(store_output[0..resumed.written], "UPDATE 1");
+    try commandTag(try storeQuery(&sa, &a, "RELEASE SAVEPOINT s"), "RELEASE");
+    try commandTag(try storeQuery(&sa, &a, "COMMIT"), "COMMIT");
+    _ = try storeQuery(&sb, &b, "SELECT v FROM w");
+    try check(sb.result.rows[0].cells[0].integer == 2);
+    try state(try storeQuery(&sa, &a, "BEGIN ISOLATION LEVEL SERIALIZABLE"), "0A000");
+    _ = try storeQuery(&sa, &a, "SHOW transaction_isolation");
+    try check(equal(sa.result.rows[0].cells[0].text.slice(), "read committed") and equal(sa.result.column_names[0].slice(), "transaction_isolation"));
+    const usage = store.database.usage();
+    try check(usage.row_locks == 0 and usage.pending_versions == 0);
+}
+
 pub fn main(init: std.process.Init) !void {
+    try storeContracts();
+    try returningOnce();
     try normal();
     try extended();
     try inference();
+    try errorStates();
     try statementLifecycle();
     try malformed();
     try authenticationContracts();
