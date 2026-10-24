@@ -203,10 +203,190 @@ fn acrossParks() !void {
     try empty();
 }
 
+fn rejectsOnly(source: []const u8, wanted: anyerror) !void {
+    var result: DB.Result = .{};
+    if (db.execute(source, &result)) |_| {
+        std.debug.print("accepted: {s}\n", .{source});
+        return error.InvalidStatementAccepted;
+    } else |err| {
+        if (err != wanted) std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
+        try check(err == wanted);
+    }
+    try empty();
+}
+
+/// CREATE SEQUENCE, nextval/currval/setval/lastval, bounds, CYCLE, option
+/// errors and non-transactional values (design §5.12/§5.13).
+fn sequences() !void {
+    try rejectsOnly("SELECT currval('s')", error.TableNotFound);
+    try autocommit("CREATE SEQUENCE s");
+    try rejectsOnly("SELECT currval('s')", error.SequenceNotReady);
+    try rejectsOnly("SELECT lastval()", error.SequenceNotReady);
+    try expect("SELECT nextval('s')", "1");
+    try expect("SELECT nextval('s'), nextval('s')", "2|3");
+    try expect("SELECT currval('s'), lastval()", "3|3");
+    try expect("SELECT setval('s', 10)", "10");
+    try expect("SELECT nextval('S'), nextval('public.s')", "11|12");
+    try expect("SELECT setval('s', 20, false), nextval('s')", "20|20");
+    try rejectsOnly("SELECT setval('s', 0)", error.NumericValueOutOfRange);
+    try autocommit("CREATE SEQUENCE m MAXVALUE 2");
+    try expect("SELECT nextval('m'), nextval('m')", "1|2");
+    try rejectsOnly("SELECT nextval('m')", error.SequenceLimit);
+    try autocommit("CREATE SEQUENCE c MINVALUE 1 MAXVALUE 2 CYCLE");
+    try expect("SELECT nextval('c'), nextval('c'), nextval('c')", "1|2|1");
+    try autocommit("CREATE SEQUENCE d INCREMENT BY -2 START WITH -1");
+    try expect("SELECT nextval('d'), nextval('d')", "-1|-3");
+    try rejectsOnly("CREATE SEQUENCE z CACHE 5", error.UnsupportedStatement);
+    try rejectsOnly("CREATE SEQUENCE z INCREMENT 0", error.InvalidParameterValue);
+    try rejectsOnly("CREATE SEQUENCE z MINVALUE 5 MAXVALUE 5", error.InvalidParameterValue);
+    try rejectsOnly("CREATE SEQUENCE z START 100 MAXVALUE 10", error.InvalidParameterValue);
+    try rejectsOnly("CREATE SEQUENCE s", error.TableExists);
+    try rejectsOnly("CREATE TABLE s (id INTEGER)", error.TableExists);
+    try rejectsOnly("SELECT nextval('compat')", error.WrongObjectType);
+    try rejectsOnly("DROP TABLE s", error.WrongObjectType);
+    try rejectsOnly("DROP SEQUENCE compat", error.WrongObjectType);
+    // Values are never rolled back.
+    const slot = try db.begin();
+    _ = try run(slot, "SELECT nextval('s')");
+    _ = try run(slot, "CREATE SEQUENCE inner_seq");
+    try check((try run(slot, "SELECT nextval('inner_seq')")).rows[0].cells[0].integer == 1);
+    db.abort(slot);
+    try expect("SELECT nextval('s')", "22");
+    try rejectsOnly("SELECT nextval('inner_seq')", error.TableNotFound);
+    var result: DB.Result = .{};
+    try db.execute("DROP SEQUENCE m", &result);
+    try check(result.command == .drop_sequence);
+    try rejectsOnly("SELECT nextval('m')", error.TableNotFound);
+    try autocommit("DROP SEQUENCE c");
+    try autocommit("DROP SEQUENCE d");
+}
+
+fn defaults() !void {
+    try autocommit("CREATE TABLE d (id INTEGER PRIMARY KEY, label TEXT DEFAULT 'default', n INTEGER DEFAULT 2 + 3 NOT NULL, flag BOOLEAN DEFAULT TRUE)");
+    try expect("INSERT INTO d (id) VALUES (1) RETURNING *", "1|default|5|t");
+    try expect("INSERT INTO d VALUES (2, DEFAULT, 7, DEFAULT), (3, 'x', DEFAULT, NULL) RETURNING *", "2|default|7|t;3|x|5|NULL");
+    try expect("UPDATE d SET label = DEFAULT, n = n * 2 WHERE id = 3 RETURNING label, n", "default|10");
+    try rejectsOnly("UPDATE d SET n = NULL", error.NotNullViolation);
+    try autocommit("CREATE TABLE nn (id INTEGER PRIMARY KEY, v TEXT NOT NULL DEFAULT NULL, w INTEGER DEFAULT nextval('s'))");
+    try rejectsOnly("INSERT INTO nn (id) VALUES (1)", error.NotNullViolation);
+    try expect("INSERT INTO nn (id, v) VALUES (1, 'a') RETURNING w", "23");
+    try rejectsOnly("CREATE TABLE bad (id INTEGER DEFAULT 'abc')", error.InvalidTextRepresentation);
+
+    try autocommit("DROP TABLE nn");
+    try autocommit("DROP TABLE d");
+}
+
+fn identity() !void {
+    try autocommit("CREATE TABLE ident (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, label TEXT)");
+    var result: DB.Result = .{};
+    try db.execute("INSERT INTO ident (label) VALUES ('generated') RETURNING id", &result);
+    try names(&result, &.{"id"});
+    try same(try render(&result), "1");
+    try expect("INSERT INTO ident (label) VALUES ('b'), ('c') RETURNING id", "2;3");
+    try rejectsOnly("INSERT INTO ident VALUES (10, 'x')", error.GeneratedAlways);
+    try rejectsOnly("INSERT INTO ident (id, label) SELECT 10, 'x'", error.GeneratedAlways);
+    try expect("INSERT INTO ident OVERRIDING SYSTEM VALUE VALUES (10, 'x') RETURNING id", "10");
+    try expect("INSERT INTO ident OVERRIDING USER VALUE VALUES (99, 'y') RETURNING id", "4");
+    try expect("INSERT INTO ident DEFAULT VALUES RETURNING id, label", "5|NULL");
+    try rejectsOnly("UPDATE ident SET id = 50", error.GeneratedAlways);
+    try expect("UPDATE ident SET id = DEFAULT WHERE id = 10 RETURNING id", "6");
+    // A rolled-back insert leaves a gap.
+    const slot = try db.begin();
+    _ = try run(slot, "INSERT INTO ident (label) VALUES ('gone')");
+    db.abort(slot);
+    try expect("INSERT INTO ident (label) VALUES ('kept') RETURNING id", "8");
+    try expect("SELECT currval('ident_id_seq'), lastval()", "8|8");
+    try rejectsOnly("DROP SEQUENCE ident_id_seq", error.DependentObjects);
+    try autocommit("CREATE TABLE byd (id BIGINT GENERATED BY DEFAULT AS IDENTITY (START WITH 100 INCREMENT BY 10), v INTEGER)");
+    try expect("INSERT INTO byd (v) VALUES (1) RETURNING id", "100");
+    try expect("INSERT INTO byd VALUES (5, 2) RETURNING id", "5");
+    try expect("INSERT INTO byd OVERRIDING USER VALUE VALUES (5, 3) RETURNING id", "110");
+    try rejectsOnly("CREATE TABLE badid (id TEXT GENERATED ALWAYS AS IDENTITY)", error.TypeMismatch);
+    try autocommit("DROP TABLE byd");
+    try rejectsOnly("SELECT nextval('byd_id_seq')", error.TableNotFound);
+    try autocommit("DROP TABLE ident");
+    try rejectsOnly("SELECT nextval('ident_id_seq')", error.TableNotFound);
+    try autocommit("CREATE TABLE ident (id INTEGER GENERATED ALWAYS AS IDENTITY, label TEXT)");
+    try expect("INSERT INTO ident (label) VALUES ('again') RETURNING id", "1");
+    try autocommit("DROP TABLE ident");
+}
+
+fn generated() !void {
+    try autocommit("CREATE TABLE g (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED)");
+    try expect("INSERT INTO g (id, a) VALUES (1, 5) RETURNING b", "10");
+    try rejectsOnly("INSERT INTO g VALUES (2, 1, 3)", error.GeneratedAlways);
+    try expect("INSERT INTO g VALUES (2, 1, DEFAULT) RETURNING *", "2|1|2");
+    try expect("UPDATE g SET a = 7 WHERE id = 1 RETURNING b", "14");
+    try rejectsOnly("UPDATE g SET b = 1", error.GeneratedAlways);
+    try expect("SELECT id, a, b FROM g ORDER BY id", "1|7|14;2|1|2");
+    try autocommit("DROP TABLE g");
+}
+
+var primary: DB = .{};
+var replica: DB = .{};
+var scratch: DB.ReplayScratch = .{};
+var record: [8192]u8 = undefined;
+
+/// Executes on `primary` and replays its change record (if any) on `replica`.
+fn replicated(source: []const u8) !usize {
+    var result: DB.Result = .{};
+    var used: usize = 0;
+    try primary.executeChanges(source, &result, &record, &used, null, null);
+    if (used != 0) try replica.applyChangeRecord(record[0..used], &scratch);
+    return used;
+}
+
+fn value(target: *DB, source: []const u8) !i64 {
+    var result: DB.Result = .{};
+    try target.execute(source, &result);
+    return result.rows[0].cells[0].integer;
+}
+
+/// Change records carry identity/sequence definitions and log-ahead values
+/// (SEQ_LOG_VALS = 32), a read-only SELECT writes no record, a SELECT that
+/// advances a sequence does, and an aborted transaction's log-ahead value
+/// is carried into the next record.
+fn durability() !void {
+    _ = try replicated("CREATE TABLE ident (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, label TEXT DEFAULT 'd', twice INTEGER GENERATED ALWAYS AS (id * 2) STORED)");
+    for (0..3) |_| _ = try replicated("INSERT INTO ident (label) VALUES ('x')");
+    try check(try value(&replica, "SELECT COUNT(*) FROM ident") == 3);
+    try check(try value(&replica, "INSERT INTO ident DEFAULT VALUES RETURNING id") == 34);
+    try check(try value(&replica, "SELECT twice FROM ident WHERE id = 34") == 68);
+    try check(try value(&primary, "INSERT INTO ident DEFAULT VALUES RETURNING id") == 4);
+    try check(try replicated("SELECT 1") == 0);
+    _ = try replicated("CREATE SEQUENCE s");
+    try check(try replicated("SELECT nextval('s')") != 0);
+    try check(try value(&replica, "SELECT nextval('s')") == 34);
+    // Carried: the aborted transaction's log-ahead value rides on the next
+    // record written by anyone, here a plain SELECT.
+    _ = try replicated("CREATE SEQUENCE t");
+    const slot = try primary.begin();
+    var result: DB.Result = .{};
+    try primary.statement(slot, "SELECT nextval('t')", &result, .{});
+    primary.abort(slot);
+    const probe = try primary.begin();
+    try check(!primary.readOnly(probe));
+    primary.abort(probe);
+    try check(try replicated("SELECT 2") != 0);
+    try check(try replicated("SELECT 3") == 0);
+    try check(try value(&replica, "SELECT nextval('t')") == 34);
+    _ = try replicated("SELECT setval('s', 500)");
+    try check(try value(&replica, "SELECT nextval('s')") == 501);
+    _ = try replicated("DROP SEQUENCE s");
+    _ = try replicated("DROP TABLE ident");
+    try check(replica.catalog.find("ident_id_seq", .{ .csn = replica.csn }) == null);
+    try check(replica.tableCount() == 0);
+}
+
 pub fn main(init: std.process.Init) !void {
     try returning();
     try atomicity();
     try acrossParks();
+    try sequences();
+    try defaults();
+    try identity();
+    try generated();
+    try durability();
     var buffer: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-dml\",\"pass\":true,\"assertions\":{d},\"database_bytes\":{d}}}\n", .{ assertions, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

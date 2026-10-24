@@ -8,7 +8,8 @@
 //!   cat_relations  (oid, relname, relkind, relnamespace, slot)   tables + sequences rows
 //!   cat_attributes (attrelid, attnum, attname, atttypid, attnotnull, attpk)  tables x columns
 //!   cat_attrdef    (adrelid, adnum, adbin)                       tables x columns (empty until defaults)
-//!   cat_sequences  (seqrelid, last_value, is_called, increment)  sequences (empty until FEAT-007)
+//!   cat_sequences  (seqrelid, start, increment, max, min, cycle)  sequences
+//!                  (values are non-transactional and live in the sequence slots)
 //!   cat_namespaces pg_catalog (11), public (2200), information_schema: static
 //!
 //! Every relation is sized by the user-object limits (Config.tables,
@@ -77,6 +78,57 @@ pub fn Catalog(comptime config: types.Config) type {
 
         /// Room for one relation's catalog rows.
         pub const max_changes = 1 + config.columns;
+
+        /// A visible relation row: kind 'r' (table) or 'S' (sequence) and
+        /// its table or sequence slot.
+        pub const Found = struct { kind: u8, slot: usize };
+
+        fn sequenceRow(slot: usize) u64 {
+            return config.tables + slot + 1;
+        }
+
+        /// cat_relations (relkind S) and cat_sequences rows for a sequence slot.
+        pub fn createSequence(self: *Self, slot: usize, seq: anytype, xmin: storage.TxRef, cid: u32, csn: u64, horizon: u64, out: *[max_changes]Change) Error!usize {
+            var count: usize = 0;
+            errdefer for (out[0..count]) |change| SC.reclaimVersion(self.relation(change.relation), change.version);
+            const oid: i64 = seq.oid;
+            const relation_cells = [_]CV.Cell{ int(oid), text(seq.name.slice()), text("S"), int(public_namespace), int(@intCast(slot)) };
+            out[count] = .{ .relation = .relations, .version = try self.addVersion(.relations, sequenceRow(slot), &relation_cells, xmin, cid, csn, horizon) };
+            count += 1;
+            const spec = seq.spec;
+            const cells = [_]CV.Cell{ int(oid), int(spec.start), int(spec.increment), int(spec.max), int(spec.min), .{ .boolean = spec.cycle } };
+            out[count] = .{ .relation = .sequences, .version = try self.addVersion(.sequences, slot + 1, &cells, xmin, cid, csn, horizon) };
+            count += 1;
+            return count;
+        }
+
+        pub fn dropSequence(self: *Self, slot: usize, snap: storage.Snapshot, xmax: storage.TxRef, cid: u32, csn: u64, out: *[max_changes]Change) usize {
+            var count: usize = 0;
+            const relations = self.relation(.relations);
+            if (visibleRow(relations, sequenceRow(slot), snap)) |version| {
+                mark(relations, version, xmax, cid, csn);
+                out[count] = .{ .relation = .relations, .version = version };
+                count += 1;
+            }
+            const sequences = self.relation(.sequences);
+            if (visibleRow(sequences, slot + 1, snap)) |version| {
+                mark(sequences, version, xmax, cid, csn);
+                out[count] = .{ .relation = .sequences, .version = version };
+                count += 1;
+            }
+            return count;
+        }
+
+        /// Any relation (table or sequence) named `name` visible to `snap`.
+        pub fn find(self: *const Self, name: []const u8, snap: storage.Snapshot) ?Found {
+            const relations = self.relationConst(.relations);
+            for (0..relations.row_high) |row| {
+                const version = SC.visibleAt(relations, row, snap) orelse continue;
+                const cells = &relations.versions[version].cells;
+                if (sameName(&cells[1], name)) return .{ .kind = cells[2].text.bytes[0], .slot = @intCast(cells[4].integer) };
+            }
+            return null;
+        }
 
         fn addVersion(self: *Self, which: Relation, rowid: u64, cells: []const CV.Cell, xmin: storage.TxRef, cid: u32, csn: u64, horizon: u64) Error!u32 {
             const table = self.relation(which);
@@ -147,13 +199,8 @@ pub fn Catalog(comptime config: types.Config) type {
 
         /// Table slot whose relation row named `name` is visible to `snap`.
         pub fn lookup(self: *const Self, name: []const u8, snap: storage.Snapshot) ?usize {
-            const relations = self.relationConst(.relations);
-            for (0..relations.row_high) |row| {
-                const version = SC.visibleAt(relations, row, snap) orelse continue;
-                const cells = &relations.versions[version].cells;
-                if (sameName(&cells[1], name)) return @intCast(cells[4].integer);
-            }
-            return null;
+            const found = self.find(name, snap) orelse return null;
+            return if (found.kind == 'r') found.slot else null;
         }
 
         /// A live transaction other than the snapshot's own that has an

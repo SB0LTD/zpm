@@ -6,6 +6,7 @@
 //! annotates nodes in place (types, column indices, coerced literals).
 const types = @import("types.sig");
 const lexer = @import("lexer.sig");
+const sequence = @import("sequence.sig");
 const Error = types.Error;
 
 /// Absent child / end of a sibling list.
@@ -39,7 +40,7 @@ pub const TypeName = types.Type;
 pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists };
 
 /// Built-in functions bound by name.
-pub const Func = enum { none, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length };
+pub const Func = enum { none, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next };
 
 pub const Test = enum { is_null, is_not_null, is_true, is_not_true, is_false, is_not_false, is_unknown, is_not_unknown };
 
@@ -189,12 +190,22 @@ pub fn Ast(comptime config: types.Config) type {
             typmod: i32 = -1,
             not_null: bool = false,
             primary_key: bool = false,
+            default_kind: types.DefaultKind = .none,
+            /// DEFAULT / GENERATED ... AS (expr) source text.
+            expression: Span = .{},
+            /// Identity sequence options.
+            sequence: sequence.Options = .{},
         };
 
         pub const CreateTable = struct {
             name: Ident = .{},
             columns: [config.columns]ColumnDef = undefined,
             count: usize = 0,
+        };
+
+        pub const CreateSequence = struct {
+            name: Ident = .{},
+            options: sequence.Options = .{},
         };
 
         pub const Target = struct {
@@ -222,6 +233,7 @@ pub fn Ast(comptime config: types.Config) type {
             row_count: usize = 0,
             /// INSERT ... SELECT: index into Pool.queries.
             query: u16 = none,
+            overriding: Overriding = .none,
             returning: Returning = .{},
         };
 
@@ -311,6 +323,8 @@ pub fn Ast(comptime config: types.Config) type {
         pub const Statement = union(enum) {
             create_table: CreateTable,
             drop_table: Ident,
+            create_sequence: CreateSequence,
+            drop_sequence: Ident,
             insert: Insert,
             /// A simple single-table SELECT: index into Pool.queries.
             select: u16,
@@ -322,6 +336,8 @@ pub fn Ast(comptime config: types.Config) type {
         };
     };
 }
+
+pub const Overriding = enum { none, system, user };
 
 pub const JoinKind = enum { first, cross, inner, left, right, full };
 pub const SetOp = enum { none, @"union", intersect, except };

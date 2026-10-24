@@ -20,20 +20,22 @@
 const types = @import("types.sig");
 const storage = @import("storage.sig");
 const locks = @import("locks.sig");
+const sequence = @import("sequence.sig");
 const Error = types.Error;
 
 pub fn Mvcc(comptime config: types.Config) type {
     const V = types.Values(config);
     const S = storage.Storage(config);
     const L = locks.Locks(config);
+    const Q = sequence.Sequences(config);
     return struct {
         pub const write_capacity: usize = if (config.tx_writes == 0) @max(config.rows_per_table * 2, 64) else config.tx_writes;
         pub const sub_capacity: usize = config.savepoints + 1;
 
-        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete };
+        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence };
 
-        /// `table` is the table slot (or catalog relation); `old`/`new` are
-        /// version indices.
+        /// `table` is the table slot (catalog relation, sequence slot);
+        /// `old`/`new` are version indices.
         pub const Write = struct { kind: WriteKind, table: u8, old: u32 = 0, new: u32 = 0 };
 
         pub const Sub = struct {
@@ -64,6 +66,9 @@ pub fn Mvcc(comptime config: types.Config) type {
             waiting_for: L.Set = .{},
             /// Pending table-lock request of a parked statement (FIFO queue).
             table_wait: ?TableWait = null,
+            /// Sequences whose log-ahead value this transaction recorded
+            /// (non-transactional: carried into the next append on abort).
+            seq_dirty: Q.Set = .{},
 
             pub fn ref(self: *const Tx, slot: usize) storage.TxRef {
                 return .{ .slot = @intCast(slot), .epoch = self.epoch, .sub = @intCast(self.sub_len) };
@@ -126,6 +131,14 @@ pub fn Mvcc(comptime config: types.Config) type {
                     .drop_table => db.tables[entry.table].pending_drop = false,
                     .catalog_insert => db.catalog.undo(.{ .relation = @enumFromInt(entry.table), .version = entry.new }, true),
                     .catalog_delete => db.catalog.undo(.{ .relation = @enumFromInt(entry.table), .version = entry.old }, false),
+                    .create_sequence => {
+                        const seq = &db.seqs[entry.table];
+                        seq.live = false;
+                        seq.pending_create = false;
+                        if (db.oid_counter + types_first_oid == seq.oid + 1) db.oid_counter -= 1;
+                        tx.seq_dirty.remove(entry.table);
+                    },
+                    .drop_sequence => db.seqs[entry.table].pending_drop = false,
                 }
             }
             tx.write_len = start;
@@ -165,6 +178,12 @@ pub fn Mvcc(comptime config: types.Config) type {
                     },
                     .catalog_insert => db.catalog.stamp(.{ .relation = @enumFromInt(entry.table), .version = entry.new }, csn, true),
                     .catalog_delete => db.catalog.stamp(.{ .relation = @enumFromInt(entry.table), .version = entry.old }, csn, false),
+                    .create_sequence => db.seqs[entry.table].pending_create = false,
+                    .drop_sequence => {
+                        const seq = &db.seqs[entry.table];
+                        seq.pending_drop = false;
+                        seq.dead_csn = csn;
+                    },
                 }
             }
         }

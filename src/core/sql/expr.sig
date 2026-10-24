@@ -236,6 +236,33 @@ pub fn Eval(comptime config: types.Config) type {
             return &base[n.column];
         }
 
+        /// nextval/currval/setval/lastval and identity defaults through the
+        /// session's sequence hook (strict: a NULL argument gives NULL).
+        fn sequenceValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+            switch (n.func) {
+                .lastval => return .{ .integer = try hook.call(hook.ptr, .lastval, "", 0, 0, false) },
+                .identity_next => return .{ .integer = try hook.call(hook.ptr, .identity, "", @intCast(n.integer), n.column, false) },
+                else => {},
+            }
+            const name = try eval(ctx, n.b);
+            if (name == .null_value) return .null_value;
+            if (n.func == .setval) {
+                const second = ctx.pool.nodes[n.b].next;
+                const amount = try eval(ctx, second);
+                if (amount == .null_value) return .null_value;
+                var called = true;
+                const third = ctx.pool.nodes[second].next;
+                if (third != ast.none) {
+                    const flag = try eval(ctx, third);
+                    if (flag == .null_value) return .null_value;
+                    called = flag.boolean;
+                }
+                return .{ .integer = try hook.call(hook.ptr, .setval, name.text.slice(), 0, amount.integer, called) };
+            }
+            return .{ .integer = try hook.call(hook.ptr, if (n.func == .nextval) .nextval else .currval, name.text.slice(), 0, 0, false) };
+        }
+
         pub fn literalText(source: []const u8, quoted: lexer.Quoted) V.Text {
             var text: V.Text = .{ .len = quoted.len };
             lexer.decodeQuoted(source, quoted, &text.bytes);
@@ -537,6 +564,7 @@ pub fn Eval(comptime config: types.Config) type {
                         text.len = name.len;
                         return .{ .text = text };
                     },
+                    .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .none => unreachable,
                 },
                 .param, .when_arm => unreachable,

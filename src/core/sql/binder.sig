@@ -21,6 +21,8 @@ const storage = @import("storage.sig");
 const expr = @import("expr.sig");
 const catalog = @import("catalog.sig");
 const value = @import("value.sig");
+const sequence = @import("sequence.sig");
+const parser = @import("parser.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -31,15 +33,22 @@ pub fn Binder(comptime config: types.Config) type {
     const K = catalog.Catalog(config);
     const E = expr.Eval(config);
     const Io = value.Io(config);
+    const P = parser.Parser(config);
     return struct {
         /// INTEGER outside the PostgreSQL dialect and in legacy replay.
         pub const integer_type: types.DataType = if (config.integer_bits == 32) .integer32 else .integer;
+
+        /// An identity column's owned sequence `<table>_<column>_seq`.
+        pub const Identity = struct { column: u8, name: V.Name, spec: sequence.Spec };
 
         pub const Create = struct {
             name: V.Name,
             columns: [config.columns]V.Column,
             count: usize,
+            identity: ?Identity = null,
         };
+
+        pub const CreateSequence = struct { name: V.Name, spec: sequence.Spec };
 
         /// RETURNING output columns, evaluated over one table row (relation 0).
         pub const Returning = struct {
@@ -63,6 +72,11 @@ pub fn Binder(comptime config: types.Config) type {
             count: usize = 0,
             plan: u16 = none,
             values: [config.columns]u16 = @splat(none),
+            /// Column defaults (DEFAULT expression or identity nextval) and
+            /// stored generation expressions; both evaluate with the
+            /// column's expression text as source.
+            defaults: [config.columns]u16 = @splat(none),
+            generated: [config.columns]u16 = @splat(none),
             returning: Returning = .{},
         };
 
@@ -86,13 +100,16 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// `values[c]` is the expression assigned to column c (a
         /// default_value node for SET c = DEFAULT), or none.
-        pub const Update = struct { table: usize, values: [config.columns]u16, where: u16, key: u16, returning: Returning = .{} };
+        pub const Update = struct { table: usize, values: [config.columns]u16, where: u16, key: u16, returning: Returning = .{}, defaults: [config.columns]u16 = @splat(none), generated: [config.columns]u16 = @splat(none) };
 
         pub const Delete = struct { table: usize, where: u16, key: u16, returning: Returning = .{} };
 
         pub const Bound = union(enum) {
             create_table: Create,
             drop_table: usize,
+            create_sequence: CreateSequence,
+            /// Sequence slot.
+            drop_sequence: usize,
             insert: Insert,
             select: Select,
             /// Root plan of a general query (Context.plans).
@@ -249,6 +266,8 @@ pub fn Binder(comptime config: types.Config) type {
             return switch (bound.*) {
                 .create_table => .create_table,
                 .drop_table => .drop_table,
+                .create_sequence => .create_sequence,
+                .drop_sequence => .drop_sequence,
                 .insert => .insert,
                 .select, .query => .select,
                 .update => .update,
@@ -540,6 +559,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "current_date", .func = .current_date },
                 .{ .name = "jsonb_typeof", .func = .jsonb_typeof },
                 .{ .name = "jsonb_array_length", .func = .jsonb_array_length },
+                .{ .name = "nextval", .func = .nextval },
+                .{ .name = "currval", .func = .currval },
+                .{ .name = "setval", .func = .setval },
+                .{ .name = "lastval", .func = .lastval },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -651,7 +674,84 @@ pub fn Binder(comptime config: types.Config) type {
                     n.ty = if (n.func == .jsonb_typeof) .text else .int4;
                     n.constant = isConstant(context, n.b);
                 },
+                // Sequence functions (regclass arguments as text; volatile).
+                .nextval, .currval, .setval, .lastval => {
+                    const wanted: []const ast.Type = switch (n.func) {
+                        .lastval => &.{},
+                        .setval => if (count == 3) &.{ .text, .int8, .boolean } else &.{ .text, .int8 },
+                        else => &.{.text},
+                    };
+                    if (count != wanted.len) return error.UndefinedFunction;
+                    var args: [3]u16 = undefined;
+                    var arg_item = n.b;
+                    for (0..count) |index| {
+                        args[index] = arg_item;
+                        arg_item = context.node(arg_item).next;
+                    }
+                    for (wanted, 0..) |target, index| {
+                        const ty = context.node(args[index]).ty;
+                        if (ty != .unknown and ty != target and !(value.integral(ty) and value.integral(target))) return error.UndefinedFunction;
+                        args[index] = try convert(context, args[index], target, -1, .implicit);
+                    }
+                    for (0..count) |index| context.node(args[index]).next = if (index + 1 < count) args[index + 1] else none;
+                    if (count != 0) n.b = args[0];
+                    n.ty = .int8;
+                    n.constant = false;
+                },
+                .identity_next => unreachable,
             }
+        }
+
+        /// Binds a column's DEFAULT or generation text (its own source) into
+        /// the statement pool; generation expressions see the row (relation 0).
+        fn bindExpressionText(context: *const Context, column: *const V.Column, row_table: ?usize) Error!u16 {
+            var sub = context.*;
+            sub.source = column.expression.slice();
+            const id = try P.parseExpression(sub.source, context.pool);
+            const scope: Scope = if (row_table) |table| tableScope(&sub, table) else .{};
+            try typeExpr(&sub, &scope, id);
+            return assignment(&sub, id, column);
+        }
+
+        fn bindDefaults(context: *const Context, index: usize, entry: *const S.Table, defaults: *[config.columns]u16, generated: *[config.columns]u16) Error!void {
+            for (entry.columns[0..entry.column_count], 0..) |*column, position| switch (column.default_kind) {
+                .none => {},
+                .identity_always, .identity_by_default => defaults[position] = try context.pool.add(.{ .kind = .function, .func = .identity_next, .integer = @intCast(index), .column = @intCast(position), .ty = types.typeOfData(column.data_type) }),
+                .default => defaults[position] = try bindExpressionText(context, column, null),
+                .generated => generated[position] = try bindExpressionText(context, column, index),
+            };
+        }
+
+        /// An explicit (non-DEFAULT) value for a column: GENERATED columns
+        /// and ALWAYS identities reject it (428C9) unless OVERRIDING SYSTEM
+        /// VALUE; OVERRIDING USER VALUE replaces identity values with the
+        /// default. Returns whether the value is used.
+        fn explicitValue(column: *const V.Column, overriding: ast.Overriding) Error!bool {
+            switch (column.default_kind) {
+                .generated => return error.GeneratedAlways,
+                .identity_always => {
+                    if (overriding == .user) return false;
+                    if (overriding != .system) return error.GeneratedAlways;
+                },
+                .identity_by_default => if (overriding == .user) return false,
+                else => {},
+            }
+            return true;
+        }
+
+        fn integerColumn(data_type: types.DataType) bool {
+            return data_type == .smallint or data_type == .integer32 or data_type == .integer;
+        }
+
+        fn identityName(table: V.Name, column: V.Name) Error!V.Name {
+            const parts = [_][]const u8{ table.slice(), "_", column.slice(), "_seq" };
+            var out: V.Name = .{};
+            for (parts) |part| {
+                if (part.len > config.name_bytes - out.len) return error.NameCapacity;
+                @memcpy(out.bytes[out.len..][0..part.len], part);
+                out.len += part.len;
+            }
+            return out;
         }
 
         fn typeExpr(context: *const Context, scope: *const Scope, id: u16) Error!void {
@@ -1078,7 +1178,7 @@ pub fn Binder(comptime config: types.Config) type {
             return out;
         }
 
-        fn bindValues(context: *const Context, entry: *const S.Table, out: *Insert) Error!void {
+        fn bindValues(context: *const Context, entry: *const S.Table, out: *Insert, overriding: ast.Overriding) Error!void {
             const empty: Scope = .{};
             var row = out.rows;
             while (row != none) : (row = context.node(row).next) {
@@ -1089,6 +1189,9 @@ pub fn Binder(comptime config: types.Config) type {
                 while (item != none) : (position += 1) {
                     const next = context.node(item).next;
                     var converted = item;
+                    if (context.node(item).kind != .default_value and !try explicitValue(&entry.columns[out.mapping[position]], overriding)) {
+                        context.node(item).kind = .default_value;
+                    }
                     if (context.node(item).kind != .default_value) {
                         try typeExpr(context, &empty, item);
                         converted = try assignment(context, item, &entry.columns[out.mapping[position]]);
@@ -1106,7 +1209,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// INSERT ... SELECT: untyped output literals take the target column
         /// type (PostgreSQL does not resolve unknowns in an INSERT's SELECT).
-        fn bindInsertQuery(context: *const Context, entry: *const S.Table, query_index: u16, out: *Insert) Error!void {
+        fn bindInsertQuery(context: *const Context, entry: *const S.Table, query_index: u16, out: *Insert, overriding: ast.Overriding) Error!void {
             const plans = context.plans orelse return error.UnsupportedStatement;
             plans.reset();
             const root = try bindPlan(context, query_index, null, null, true);
@@ -1118,6 +1221,7 @@ pub fn Binder(comptime config: types.Config) type {
             try resolveUnknown(context, root);
             for (0..p.count) |position| {
                 const column = out.mapping[position];
+                if (!try explicitValue(&entry.columns[column], overriding)) continue;
                 const id = try context.pool.add(.{ .kind = .column, .relation = 1, .column = @intCast(position), .ty = p.tys[position], .typmod = p.typmods[position] });
                 out.values[column] = try assignment(context, id, &entry.columns[column]);
             }
@@ -1990,19 +2094,54 @@ pub fn Binder(comptime config: types.Config) type {
             switch (statement.*) {
                 .create_table => |*create| {
                     const table_name = toName(context, create.name);
-                    if (context.catalog.lookup(table_name.slice(), context.snapshot) != null) return error.TableExists;
+                    if (context.catalog.find(table_name.slice(), context.snapshot) != null) return error.TableExists;
                     var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count };
                     for (create.columns[0..create.count], 0..) |*definition, index| {
-                        var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod };
+                        var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod, .default_kind = definition.default_kind };
                         for (out.columns[0..index]) |*previous|
                             if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
                         column.data_type = columnType(context, definition);
                         if (definition.primary_key and column.data_type == .json) return error.UndefinedFunction;
+                        const text = definition.expression.slice(context.source);
+                        if (text.len > config.text_bytes) return error.TextCapacity;
+                        column.expression.len = text.len;
+                        @memcpy(column.expression.bytes[0..text.len], text);
+                        switch (definition.default_kind) {
+                            .identity_always, .identity_by_default => {
+                                if (!integerColumn(column.data_type)) return error.TypeMismatch;
+                                if (out.identity != null) return error.UnsupportedStatement;
+                                column.not_null = true;
+                                var options = definition.sequence;
+                                if (options.type_oid == 0) options.type_oid = types.typeOid(column.data_type);
+                                const seq_name = try identityName(table_name, column.name);
+                                if (context.catalog.find(seq_name.slice(), context.snapshot) != null) return error.TableExists;
+                                out.identity = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(options) };
+                            },
+                            // Type-checked now; evaluated per row.
+                            .default => _ = try bindExpressionText(context, &column, null),
+                            else => {},
+                        }
                         out.columns[index] = column;
                     }
                     return .{ .create_table = out };
                 },
-                .drop_table => |ident| return .{ .drop_table = try resolveTable(context, ident) },
+                .drop_table => |ident| {
+                    const wanted = toName(context, ident);
+                    const found = context.catalog.find(wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+                    if (found.kind != 'r') return error.WrongObjectType;
+                    return .{ .drop_table = found.slot };
+                },
+                .create_sequence => |*create| {
+                    const name = toName(context, create.name);
+                    if (context.catalog.find(name.slice(), context.snapshot) != null) return error.TableExists;
+                    return .{ .create_sequence = .{ .name = name, .spec = try sequence.resolve(create.options) } };
+                },
+                .drop_sequence => |ident| {
+                    const wanted = toName(context, ident);
+                    const found = context.catalog.find(wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+                    if (found.kind != 'S') return error.WrongObjectType;
+                    return .{ .drop_sequence = found.slot };
+                },
                 .insert => |*insert| {
                     const index = try resolveTable(context, insert.table);
                     const entry = &context.tables[index];
@@ -2024,10 +2163,11 @@ pub fn Binder(comptime config: types.Config) type {
                     var out: Insert = .{ .table = index, .count = count, .rows = insert.rows, .row_count = insert.row_count };
                     for (0..count) |position| out.mapping[position] = @intCast(mapping[position]);
                     switch (insert.source) {
-                        .values => try bindValues(context, entry, &out),
-                        .query => try bindInsertQuery(context, entry, insert.query, &out),
+                        .values => try bindValues(context, entry, &out, insert.overriding),
+                        .query => try bindInsertQuery(context, entry, insert.query, &out, insert.overriding),
                         .default_values => if (insert.explicit_columns) return error.Syntax,
                     }
+                    try bindDefaults(context, index, entry, &out.defaults, &out.generated);
                     out.returning = try bindReturning(context, index, &insert.returning);
                     return .{ .insert = out };
                 },
@@ -2051,11 +2191,16 @@ pub fn Binder(comptime config: types.Config) type {
                             out.values[column] = item.value;
                             continue;
                         }
+                        switch (entry.columns[column].default_kind) {
+                            .generated, .identity_always => return error.GeneratedAlways,
+                            else => {},
+                        }
                         try typeExpr(context, &scope, item.value);
                         out.values[column] = try assignment(context, item.value, &entry.columns[column]);
                     }
                     out.where = try bindWhere(context, &scope, update.where);
                     out.key = primaryKey(context, entry, out.where);
+                    try bindDefaults(context, index, entry, &out.defaults, &out.generated);
                     out.returning = try bindReturning(context, index, &update.returning);
                     return .{ .update = out };
                 },

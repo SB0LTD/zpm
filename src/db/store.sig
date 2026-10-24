@@ -283,6 +283,8 @@ pub fn Store(comptime Raw: type) type {
     const has_session = @hasDecl(Raw, "Zone");
     const Zone = if (has_session) Raw.Zone else struct {};
     const Settings = SettingsOf(Zone);
+    const has_sequences = @hasDecl(Raw, "SequenceSession");
+    const SequenceSession = if (has_sequences) Raw.SequenceSession else struct {};
     return struct {
         const Self = @This();
         pub const CommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
@@ -427,6 +429,8 @@ pub fn Store(comptime Raw: type) type {
             statement_us: ?i64 = null,
             /// Values last reported through ParameterStatus.
             reported: [reported_parameters.len]ReportedValue = @splat(.{}),
+            /// currval/lastval state of this session.
+            sequences: SequenceSession = .{},
 
             pub fn reportedParameters() []const []const u8 {
                 return &reported_parameters;
@@ -484,6 +488,7 @@ pub fn Store(comptime Raw: type) type {
 
             fn db(self: *Connection) *Raw {
                 const raw = &self.store.database;
+                if (comptime has_sequences) raw.sequence_session = &self.sequences;
                 raw.dialect = switch (self.dialect) {
                     .postgres => .postgres,
                     .mysql => .mysql,

@@ -26,6 +26,7 @@ const lexer = @import("lexer.sig");
 const ast = @import("ast.sig");
 const alpha = @import("alpha.sig");
 const numeric = @import("numeric.sig");
+const sequence = @import("sequence.sig");
 const Error = types.Error;
 const Token = lexer.Token;
 const Symbol = lexer.Symbol;
@@ -160,13 +161,28 @@ pub fn Parser(comptime config: types.Config) type {
             return null;
         }
 
+        /// A standalone expression (column DEFAULT / generation text) parsed
+        /// into the statement's pool without resetting it; its spans refer to
+        /// `source`, which must be evaluated with that source.
+        pub fn parseExpression(source: []const u8, pool: *Ast.Pool) Error!u16 {
+            var self = Self{ .tokens = .{ .source = source, .text_limit = config.text_bytes }, .pool = pool, .source = source, .mode = .standard };
+            try self.advance();
+            const id = try self.expression();
+            if (self.current.kind != .end) return error.Syntax;
+            return id;
+        }
+
         fn statement(self: *Self) Error!Ast.Statement {
-            if (try self.takeWord("CREATE")) return .{ .create_table = try self.create() };
+            if (try self.takeWord("CREATE")) {
+                if (self.mode == .standard and try self.takeWord("SEQUENCE")) return .{ .create_sequence = try self.createSequence() };
+                return .{ .create_table = try self.create() };
+            }
             if (try self.takeWord("DROP")) {
-                try self.expectWord("TABLE");
+                const sequence_kind = self.mode == .standard and try self.takeWord("SEQUENCE");
+                if (!sequence_kind) try self.expectWord("TABLE");
                 const name = try self.identifier();
                 try self.finish();
-                return .{ .drop_table = name };
+                return if (sequence_kind) .{ .drop_sequence = name } else .{ .drop_table = name };
             }
             if (try self.takeWord("INSERT")) return .{ .insert = try self.insert() };
             if (self.isWord("SELECT") or (self.mode == .standard and self.isWord("WITH"))) return self.topQuery();
@@ -416,6 +432,82 @@ pub fn Parser(comptime config: types.Config) type {
             };
         }
 
+        /// A signed integer option value.
+        fn signedInteger(self: *Self) Error!i64 {
+            const negative = try self.takeSymbol(.minus);
+            if (!negative) _ = try self.takeSymbol(.plus);
+            if (self.current.kind == .decimal) return error.NumericValueOutOfRange;
+            if (self.current.kind != .integer) return error.Syntax;
+            const magnitude = self.current.integer;
+            try self.advance();
+            if (negative) {
+                if (magnitude > 9223372036854775808) return error.NumericValueOutOfRange;
+                return if (magnitude == 9223372036854775808) -0x7fffffffffffffff - 1 else -@as(i64, @intCast(magnitude));
+            }
+            if (magnitude > 9223372036854775807) return error.NumericValueOutOfRange;
+            return @intCast(magnitude);
+        }
+
+        /// Sequence options (CREATE SEQUENCE and identity specifications).
+        fn sequenceOptions(self: *Self, out: *sequence.Options) Error!void {
+            while (true) {
+                if (try self.takeWord("INCREMENT")) {
+                    _ = try self.takeWord("BY");
+                    out.increment = try self.signedInteger();
+                } else if (try self.takeWord("MINVALUE")) {
+                    out.min = try self.signedInteger();
+                } else if (try self.takeWord("MAXVALUE")) {
+                    out.max = try self.signedInteger();
+                } else if (try self.takeWord("START")) {
+                    _ = try self.takeWord("WITH");
+                    out.start = try self.signedInteger();
+                } else if (try self.takeWord("CACHE")) {
+                    out.cache = try self.signedInteger();
+                } else if (try self.takeWord("CYCLE")) {
+                    out.cycle = true;
+                } else if (try self.takeWord("NO")) {
+                    if (try self.takeWord("MINVALUE")) {
+                        out.min = null;
+                        out.no_min = true;
+                    } else if (try self.takeWord("MAXVALUE")) {
+                        out.max = null;
+                        out.no_max = true;
+                    } else {
+                        try self.expectWord("CYCLE");
+                        out.cycle = false;
+                    }
+                } else if (try self.takeWord("AS")) {
+                    const spec = try self.typeName();
+                    out.type_oid = switch (spec.ty) {
+                        .int2 => 21,
+                        .int4 => 23,
+                        .int8 => 20,
+                        else => return error.InvalidParameterValue,
+                    };
+                } else return;
+            }
+        }
+
+        fn createSequence(self: *Self) Error!Ast.CreateSequence {
+            var out: Ast.CreateSequence = .{ .name = try self.identifier() };
+            try self.sequenceOptions(&out.options);
+            try self.finish();
+            return out;
+        }
+
+        /// Source text from `start` to the current token (exclusive), trimmed.
+        fn spanTo(self: *const Self, start: usize) ast.Span {
+            var end = self.current.start;
+            if (self.current.kind == .end) end = self.source.len;
+            if (self.current.kind == .string or self.current.kind == .quoted_word) end -= 1;
+            while (end > start and (self.source[end - 1] == ' ' or self.source[end - 1] == '\t' or self.source[end - 1] == '\r' or self.source[end - 1] == '\n')) end -= 1;
+            return .{ .start = start, .len = end - start };
+        }
+
+        fn tokenStart(self: *const Self) usize {
+            return if (self.current.kind == .string or self.current.kind == .quoted_word) self.current.start - 1 else self.current.start;
+        }
+
         fn create(self: *Self) Error!Ast.CreateTable {
             try self.expectWord("TABLE");
             var out: Ast.CreateTable = .{ .name = try self.identifier() };
@@ -429,7 +521,39 @@ pub fn Parser(comptime config: types.Config) type {
                 column.typmod = spec.typmod;
                 var has_not_null = false;
                 while (true) {
-                    if (try self.takeWord("NOT")) {
+                    if (self.mode == .standard and try self.takeWord("DEFAULT")) {
+                        if (column.default_kind != .none) return error.Syntax;
+                        column.default_kind = .default;
+                        const start = self.tokenStart();
+                        _ = try self.other();
+                        column.expression = self.spanTo(start);
+                    } else if (self.mode == .standard and try self.takeWord("GENERATED")) {
+                        if (column.default_kind != .none) return error.Syntax;
+                        var always = true;
+                        if (try self.takeWord("BY")) {
+                            try self.expectWord("DEFAULT");
+                            always = false;
+                        } else try self.expectWord("ALWAYS");
+                        try self.expectWord("AS");
+                        if (try self.takeWord("IDENTITY")) {
+                            column.default_kind = if (always) .identity_always else .identity_by_default;
+                            if (try self.takeSymbol(.lparen)) {
+                                try self.sequenceOptions(&column.sequence);
+                                try self.expectSymbol(.rparen);
+                            }
+                        } else {
+                            if (!always) return error.Syntax;
+                            try self.expectSymbol(.lparen);
+                            const start = self.tokenStart();
+                            _ = try self.expression();
+                            column.expression = self.spanTo(start);
+                            try self.expectSymbol(.rparen);
+                            try self.expectWord("STORED");
+                            column.default_kind = .generated;
+                        }
+                    } else if (self.mode == .standard and self.isWord("NULL")) {
+                        try self.advance();
+                    } else if (try self.takeWord("NOT")) {
                         if (has_not_null) return error.Syntax;
                         try self.expectWord("NULL");
                         has_not_null = true;
@@ -463,6 +587,13 @@ pub fn Parser(comptime config: types.Config) type {
                     if (!try self.takeSymbol(.comma)) break;
                 }
                 try self.expectSymbol(.rparen);
+            }
+            if (self.mode == .standard and try self.takeWord("OVERRIDING")) {
+                if (try self.takeWord("SYSTEM")) out.overriding = .system else {
+                    try self.expectWord("USER");
+                    out.overriding = .user;
+                }
+                try self.expectWord("VALUE");
             }
             if (self.mode == .standard and try self.takeWord("DEFAULT")) {
                 try self.expectWord("VALUES");
@@ -1112,6 +1243,10 @@ pub fn Parser(comptime config: types.Config) type {
         /// name(args) with `*`, DISTINCT/ALL and FILTER (WHERE ...) for aggregates.
         fn functionCall(self: *Self, name: ast.Ident) Error!u16 {
             try self.expectSymbol(.lparen);
+            // Volatile sequence functions run on the general engine, which
+            // evaluates every projection exactly once per row.
+            const raw_name = name.span.slice(self.source);
+            if (!name.quoted and (types.keyword(raw_name, "nextval") or types.keyword(raw_name, "setval"))) self.pool.complex = true;
             var call: ast.Node = .{ .kind = .function, .name = name };
             var first: u16 = none;
             if (try self.takeSymbol(.star)) {

@@ -827,6 +827,8 @@ pub fn Session(comptime DB: type) type {
                 .delete => "delete",
                 .create_table => "create",
                 .drop_table => "drop",
+                .create_sequence => "create_sequence",
+                .drop_sequence => "drop_sequence",
                 .begin => "begin",
                 .commit => "commit",
                 .rollback => "rollback",
@@ -843,7 +845,11 @@ pub fn Session(comptime DB: type) type {
         }
         fn commandFor(w: *Writer, source: []const u8, completed_command: []const u8, row_count: usize, affected: usize, rolled_back: bool) !void {
             const p = try w.begin('C');
-            if (isCommand(completed_command, source, "select")) {
+            if (equal(completed_command, "create_sequence")) {
+                try w.append("CREATE SEQUENCE");
+            } else if (equal(completed_command, "drop_sequence")) {
+                try w.append("DROP SEQUENCE");
+            } else if (isCommand(completed_command, source, "select")) {
                 try w.append("SELECT ");
                 try w.number(@intCast(row_count));
             } else if (isCommand(completed_command, source, "insert")) {
@@ -916,6 +922,11 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "CardinalityViolation")) return "21000";
     if (equal(name, "InvalidRowCountInLimit")) return "2201W";
     if (equal(name, "InvalidRowCountInResultOffset")) return "2201X";
+    if (equal(name, "GeneratedAlways")) return "428C9";
+    if (equal(name, "SequenceLimit")) return "2200H";
+    if (equal(name, "SequenceNotReady")) return "55000";
+    if (equal(name, "WrongObjectType")) return "42809";
+    if (equal(name, "DependentObjects")) return "2BP01";
     if (equal(name, "NumericValueOutOfRange")) return "22003";
     if (equal(name, "NumericCapacity")) return "54000";
     if (equal(name, "InvalidParameterValue")) return "22023";

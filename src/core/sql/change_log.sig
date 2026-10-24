@@ -6,14 +6,21 @@
 //!     1 create_table  oid u32, name, expr_format_version u16 (= 1),
 //!                     column_count u8, columns: name, type_oid u32,
 //!                     typmod i32 (-1, NUMERIC(p,s) or TIMESTAMP[TZ](p)),
-//!                     flags u8 (1 not null, 2 primary key),
-//!                     default_len u16 (= 0; defaults arrive with FEAT-007)
+//!                     flags u8 (1 not null, 2 primary key, bits 2..4 the
+//!                     default kind: 1 DEFAULT, 2 identity ALWAYS, 3 identity
+//!                     BY DEFAULT, 4 GENERATED ... STORED),
+//!                     expression_len u16 + canonical expression source text
+//!                     (DEFAULT / generation; 0 otherwise)
 //!     2 drop_table    oid u32
 //!     3 insert        oid u32, rowid u64, count u8, values
 //!     4 update        oid u32, rowid u64, count u8, values (complete row)
 //!     5 delete        oid u32, rowid u64
 //!     6 catalog_counters next_oid u32, count u8, (oid u32, next_rowid u64)*
-//!     7..9            reserved for sequence ops (FEAT-007); rejected today
+//!     7 create_sequence oid u32, name, type_oid u32, increment i64, min i64,
+//!                     max i64, start i64, cycle u8, owner table oid u32 (0
+//!                     none), owner column u8
+//!     8 drop_sequence oid u32
+//!     9 sequence      oid u32, last_value i64, is_called u8 (log-ahead value)
 //!   name: len u8 + bytes. value: 0 null | 1 i64 | 2 bool u8 | 3 len u32 + bytes
 //!   | 4 f32 bits u32 | 5 f64 bits u64 | 6 numeric {special u8, negative u8,
 //!   dscale u16, coefficient 4 x u64} | 7 date i32 | 8 timestamp i64
@@ -33,6 +40,7 @@ const storage = @import("storage.sig");
 const numeric = @import("numeric.sig");
 const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
+const sequence = @import("sequence.sig");
 const Error = types.Error;
 
 pub const format_version: u16 = 1;
@@ -40,7 +48,7 @@ pub const header_size: usize = 8;
 pub const first_oid: u32 = 16384;
 pub const expr_format_version: u16 = 1;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6 };
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9 };
 
 fn Unsigned(comptime T: type) type {
     return switch (T) {
@@ -225,9 +233,37 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 try writer.name(column.name.slice());
                 try writer.int(u32, types.typeOid(column.data_type));
                 try writer.int(i32, column.typmod);
-                try writer.int(u8, @as(u8, @intFromBool(column.not_null)) | (@as(u8, @intFromBool(column.primary_key)) << 1));
-                try writer.int(u16, 0);
+                try writer.int(u8, @as(u8, @intFromBool(column.not_null)) | (@as(u8, @intFromBool(column.primary_key)) << 1) | (@as(u8, @intFromEnum(column.default_kind)) << 2));
+                const text = column.expression.slice();
+                try writer.int(u16, @intCast(text.len));
+                try writer.bytes(text);
             }
+        }
+
+        pub fn encodeCreateSequence(writer: *Writer, seq: anytype) Error!void {
+            try writer.op(.create_sequence);
+            try writer.int(u32, seq.oid);
+            try writer.name(seq.name.slice());
+            try writer.int(u32, seq.spec.type_oid);
+            try writer.int(i64, seq.spec.increment);
+            try writer.int(i64, seq.spec.min);
+            try writer.int(i64, seq.spec.max);
+            try writer.int(i64, seq.spec.start);
+            try writer.int(u8, @intFromBool(seq.spec.cycle));
+            try writer.int(u32, seq.owner);
+            try writer.int(u8, seq.owner_column);
+        }
+
+        pub fn encodeDropSequence(writer: *Writer, oid: u32) Error!void {
+            try writer.op(.drop_sequence);
+            try writer.int(u32, oid);
+        }
+
+        pub fn encodeSequenceValue(writer: *Writer, oid: u32, last_value: i64, called: bool) Error!void {
+            try writer.op(.sequence);
+            try writer.int(u32, oid);
+            try writer.int(i64, last_value);
+            try writer.int(u8, @intFromBool(called));
         }
 
         pub fn encodeDrop(writer: *Writer, oid: u32) Error!void {
@@ -296,6 +332,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
             live_rows: usize = 0,
         };
 
+        const VSeq = struct { live: bool = false, oid: u32 = 0, name: V.Name = .{} };
+
         /// Caller-owned replay overlay. Bounded by 2 x rows x tables live
         /// entries (rows touched from the database plus rows created by the
         /// record that are still alive) at <= 50% load. Reset is O(1).
@@ -304,7 +342,43 @@ pub fn ChangeLog(comptime config: types.Config) type {
             rows: [overlay_capacity]RowEntry = @splat(.{}),
             keys: [overlay_capacity]KeyEntry = @splat(.{}),
             tables: [config.tables]VTable = undefined,
+            seqs: [config.sequences]VSeq = undefined,
         };
+
+        const SequenceDefinition = struct { oid: u32, name: V.Name, spec: sequence.Spec, owner: u32, owner_column: u8 };
+
+        fn decodeCreateSequence(reader: *Reader) Error!SequenceDefinition {
+            var out: SequenceDefinition = .{ .oid = try reader.int(u32), .name = .{}, .spec = .{}, .owner = 0, .owner_column = 0 };
+            const seq_name = try reader.name();
+            if (!validName(seq_name)) return error.InvalidChangeRecord;
+            out.name.len = seq_name.len;
+            @memcpy(out.name.bytes[0..seq_name.len], seq_name);
+            out.spec.type_oid = try reader.int(u32);
+            out.spec.increment = try reader.int(i64);
+            out.spec.min = try reader.int(i64);
+            out.spec.max = try reader.int(i64);
+            out.spec.start = try reader.int(i64);
+            const cycle = try reader.int(u8);
+            if (cycle > 1) return error.InvalidChangeRecord;
+            out.spec.cycle = cycle == 1;
+            out.owner = try reader.int(u32);
+            out.owner_column = try reader.int(u8);
+            const spec = out.spec;
+            if ((spec.type_oid != 20 and spec.type_oid != 21 and spec.type_oid != 23) or spec.increment == 0 or spec.min >= spec.max or spec.start < spec.min or spec.start > spec.max)
+                return error.InvalidChangeRecord;
+            return out;
+        }
+
+        fn findVSeq(scratch: *Scratch, oid: u32) Error!usize {
+            for (&scratch.seqs, 0..) |*seq, index| if (seq.live and seq.oid == oid) return index;
+            return error.ChangeRecordConflict;
+        }
+
+        fn nameTaken(scratch: *const Scratch, name: []const u8) bool {
+            for (&scratch.tables) |*vt| if (vt.live and types.same(vt.name.slice(), name)) return true;
+            for (&scratch.seqs) |*seq| if (seq.live and types.same(seq.name.slice(), name)) return true;
+            return false;
+        }
 
         const mask = overlay_capacity - 1;
 
@@ -523,14 +597,24 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 };
                 if (!typmod_ok) return error.InvalidChangeRecord;
                 const flags = try reader.int(u8);
-                if (flags > 3) return error.InvalidChangeRecord;
+                if (flags >> 2 > 4) return error.InvalidChangeRecord;
                 column.not_null = flags & 1 != 0;
                 column.primary_key = flags & 2 != 0;
+                column.default_kind = @enumFromInt(flags >> 2);
                 if (column.primary_key) {
                     if (has_primary or !column.not_null) return error.InvalidChangeRecord;
                     has_primary = true;
                 }
-                if (try reader.int(u16) != 0) return error.UnsupportedLogVersion;
+                const text_len = try reader.int(u16);
+                const needs_text = column.default_kind == .default or column.default_kind == .generated;
+                if (needs_text != (text_len != 0)) return error.InvalidChangeRecord;
+                if (text_len > config.text_bytes) return error.ChangeRecordConflict;
+                const text = try reader.take(text_len);
+                column.expression.len = text_len;
+                @memcpy(column.expression.bytes[0..text_len], text);
+                if ((column.default_kind == .identity_always or column.default_kind == .identity_by_default) and
+                    (!column.not_null or (column.data_type != .smallint and column.data_type != .integer32 and column.data_type != .integer)))
+                    return error.InvalidChangeRecord;
                 out.columns[index] = column;
             }
             return out;
@@ -612,6 +696,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 vt.next_rowid = table.next_rowid;
                 vt.live_rows = S.liveRows(table);
             }
+            for (&scratch.seqs, &db.seqs) |*vs, *seq| {
+                vs.* = .{ .live = seq.live and !seq.pending_create and seq.dead_csn == 0, .oid = seq.oid, .name = seq.name };
+            }
             var next_oid: u32 = first_oid + db.oid_counter;
             var reader = Reader{ .bytes = record };
             var row: V.Row = .{};
@@ -621,9 +708,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.create_table) => {
                         const definition = try decodeCreate(&reader);
                         if (definition.oid < next_oid) return error.ChangeRecordConflict;
+                        if (nameTaken(scratch, definition.name.slice())) return error.ChangeRecordConflict;
                         var free: ?usize = null;
                         for (&scratch.tables, 0..) |*vt, index| {
-                            if (vt.live and types.same(vt.name.slice(), definition.name.slice())) return error.ChangeRecordConflict;
                             if (!vt.live and free == null) free = index;
                         }
                         const index = free orelse return error.ChangeRecordConflict;
@@ -709,10 +796,40 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             scratch.tables[index].next_rowid = next;
                         }
                     },
+                    @intFromEnum(Op.create_sequence) => {
+                        const definition = try decodeCreateSequence(&reader);
+                        if (definition.oid < next_oid or definition.oid == 0xffffffff) return error.ChangeRecordConflict;
+                        if (nameTaken(scratch, definition.name.slice())) return error.ChangeRecordConflict;
+                        if (definition.owner != 0) {
+                            const owner = try findVTable(scratch, definition.owner);
+                            if (definition.owner_column >= scratch.tables[owner].column_count) return error.ChangeRecordConflict;
+                        }
+                        var free: ?usize = null;
+                        for (&scratch.seqs, 0..) |*vs, index| if (!vs.live and free == null) {
+                            free = index;
+                        };
+                        const index = free orelse return error.ChangeRecordConflict;
+                        scratch.seqs[index] = .{ .live = true, .oid = definition.oid, .name = definition.name };
+                        next_oid = definition.oid + 1;
+                    },
+                    @intFromEnum(Op.drop_sequence) => {
+                        const index = try findVSeq(scratch, try reader.int(u32));
+                        scratch.seqs[index].live = false;
+                    },
+                    @intFromEnum(Op.sequence) => {
+                        _ = try findVSeq(scratch, try reader.int(u32));
+                        _ = try reader.int(i64);
+                        if (try reader.int(u8) > 1) return error.InvalidChangeRecord;
+                    },
                     else => return error.UnsupportedLogVersion,
                 }
             }
             if (reader.position != record.len) return error.InvalidChangeRecord;
+        }
+
+        fn seqByOid(db: anytype, oid: u32) Error!usize {
+            for (&db.seqs, 0..) |*seq, index| if (seq.live and seq.oid == oid) return index;
+            return error.ChangeRecordConflict;
         }
 
         // ----- application (infallible after validation) ----------------
@@ -801,6 +918,26 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             const table = try tableByOid(db, try reader.int(u32));
                             table.next_rowid = try reader.int(u64);
                         }
+                    },
+                    @intFromEnum(Op.create_sequence) => {
+                        const definition = try decodeCreateSequence(&reader);
+                        for (&db.seqs, 0..) |*seq, index| if (!seq.live) {
+                            sequence.Sequences(config).init(seq, definition.oid, definition.name, definition.spec, definition.owner, definition.owner_column);
+                            try db.replayCreateSequence(index, csn);
+                            break;
+                        };
+                        db.oid_counter = definition.oid + 1 - first_oid;
+                    },
+                    @intFromEnum(Op.drop_sequence) => {
+                        const index = try seqByOid(db, try reader.int(u32));
+                        db.replayDropSequence(index, csn);
+                        db.seqs[index].live = false;
+                    },
+                    @intFromEnum(Op.sequence) => {
+                        const index = try seqByOid(db, try reader.int(u32));
+                        const last_value = try reader.int(i64);
+                        const called = try reader.int(u8) == 1;
+                        sequence.Sequences(config).restore(&db.seqs[index], last_value, called);
                     },
                     else => return error.UnsupportedLogVersion,
                 }

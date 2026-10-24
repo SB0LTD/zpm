@@ -41,39 +41,65 @@ pub fn Dml(comptime config: types.Config) type {
             return cell;
         }
 
-        /// The column default for an unlisted column or a DEFAULT item.
-        fn defaultCell(ctx: *E.Context, table: *const S.Table, column: usize) Error!V.Cell {
-            _ = ctx;
-            _ = table;
-            _ = column;
-            return .null_value;
+        /// Bound column defaults and generation expressions (binder).
+        pub const Derived = struct {
+            defaults: *const [config.columns]u16,
+            generated: *const [config.columns]u16,
+        };
+
+        /// The column default (DEFAULT expression, identity nextval) for an
+        /// unlisted column or a DEFAULT item; NULL without one.
+        fn defaultCell(ctx: *const E.Context, table: *const S.Table, derived: Derived, column: usize) Error!V.Cell {
+            const id = derived.defaults[column];
+            if (id == none) return .null_value;
+            var sub = ctx.*;
+            sub.source = table.columns[column].expression.slice();
+            sub.row = null;
+            return E.eval(&sub, id);
         }
 
         fn isDefault(ctx: *const E.Context, id: u16) bool {
             return id == none or ctx.pool.nodes[id].kind == .default_value;
         }
 
+        /// Stored generated columns, computed from the new row after every
+        /// other column (PostgreSQL ExecComputeStoredGenerated).
+        fn computeGenerated(ctx: *const E.Context, table: *const S.Table, derived: Derived, cells: *E.Row) Error!void {
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                const id = derived.generated[index];
+                if (id == none) continue;
+                var sub = ctx.*;
+                sub.source = column.expression.slice();
+                sub.row = cells;
+                const evaluated = try E.eval(&sub, id);
+                cells[index] = try store(column, evaluated, ctx.session);
+            }
+        }
+
         /// `values[c]` none or a default_value node takes the column default.
-        pub fn insertedRow(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16) Error!E.Row {
+        pub fn insertedRow(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16, derived: Derived) Error!E.Row {
             var cells: E.Row = @splat(.null_value);
             ctx.row = null;
             for (table.columns[0..table.column_count], 0..) |*column, index| {
-                const evaluated: V.Cell = if (isDefault(ctx, values[index])) try defaultCell(ctx, table, index) else try E.eval(ctx, values[index]);
+                if (column.default_kind == .generated) continue;
+                const evaluated: V.Cell = if (isDefault(ctx, values[index])) try defaultCell(ctx, table, derived, index) else try E.eval(ctx, values[index]);
                 cells[index] = try store(column, evaluated, ctx.session);
             }
+            try computeGenerated(ctx, table, derived, &cells);
             return cells;
         }
 
         /// Every SET expression sees the old row, never a partly updated one.
-        pub fn updatedRow(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16, old: *const E.Row) Error!E.Row {
+        pub fn updatedRow(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16, derived: Derived, old: *const E.Row) Error!E.Row {
             var cells = old.*;
             ctx.row = old;
             for (table.columns[0..table.column_count], 0..) |*column, index| {
-                if (values[index] == none) continue;
-                const evaluated: V.Cell = if (isDefault(ctx, values[index])) try defaultCell(ctx, table, index) else try E.eval(ctx, values[index]);
-                ctx.row = old;
+                if (values[index] == none or column.default_kind == .generated) continue;
+                const evaluated: V.Cell = if (isDefault(ctx, values[index])) try defaultCell(ctx, table, derived, index) else try E.eval(ctx, values[index]);
                 cells[index] = try store(column, evaluated, ctx.session);
             }
+            try computeGenerated(ctx, table, derived, &cells);
+            ctx.row = old;
             return cells;
         }
 

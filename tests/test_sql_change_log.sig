@@ -162,11 +162,20 @@ fn corruption() !void {
     @memcpy(copy[0..used], record[0..used]);
     copy[2] = 1;
     if (target.applyChangeRecord(copy[0..used], &scratch)) |_| return error.UnknownFlagsAccepted else |err| try check(err == error.UnsupportedLogVersion);
-    for ([_]u8{ 0, 7, 8, 9, 200 }) |tag| {
+    for ([_]u8{ 0, 10, 200 }) |tag| {
         @memcpy(copy[0..used], record[0..used]);
         copy[8] = tag;
         target.copyFrom(&base);
         if (target.applyChangeRecord(copy[0..used], &scratch)) |_| return error.UnknownOpAccepted else |err| try check(err == error.UnsupportedLogVersion);
+        try check(target.tableCount() == 0);
+    }
+    // Sequence ops (7..9, FEAT-007) over create_table bytes are malformed
+    // or name no live sequence: rejected, nothing applied.
+    for ([_]u8{ 7, 8, 9 }) |tag| {
+        @memcpy(copy[0..used], record[0..used]);
+        copy[8] = tag;
+        target.copyFrom(&base);
+        if (target.applyChangeRecord(copy[0..used], &scratch)) |_| return error.MisreadSequenceOpAccepted else |err| try check(err == error.InvalidChangeRecord or err == error.ChangeRecordConflict);
         try check(target.tableCount() == 0);
     }
     // Trailing bytes after the declared ops are corruption.
@@ -294,11 +303,29 @@ fn atomicity() !void {
                 b.int(u8, 0);
             }
         }.f, .wanted = error.ChangeRecordConflict },
-        // Sequence ops are reserved and fail closed until FEAT-007.
+        // A truncated sequence definition, a value for no live sequence and
+        // an unknown op after a valid row all fail closed atomically.
         .{ .build = struct {
             fn f(b: *Builder) void {
                 b.row(3, oid, 3, 3, "three");
                 b.int(u8, 7);
+                b.ops += 1;
+            }
+        }.f, .wanted = error.InvalidChangeRecord },
+        .{ .build = struct {
+            fn f(b: *Builder) void {
+                b.row(3, oid, 3, 3, "three");
+                b.int(u8, 9);
+                b.int(u32, 99999);
+                b.int(i64, 5);
+                b.int(u8, 1);
+                b.ops += 1;
+            }
+        }.f, .wanted = error.ChangeRecordConflict },
+        .{ .build = struct {
+            fn f(b: *Builder) void {
+                b.row(3, oid, 3, 3, "three");
+                b.int(u8, 10);
                 b.ops += 1;
             }
         }.f, .wanted = error.UnsupportedLogVersion },

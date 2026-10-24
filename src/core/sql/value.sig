@@ -26,6 +26,18 @@ pub const Session = struct {
     statement_us: ?i64 = null,
     /// Current wall clock in PostgreSQL-epoch microseconds.
     clock: ?*const fn () ?i64 = null,
+    /// Sequence functions and identity defaults (set by the Database for
+    /// each statement); null rejects them (0A000).
+    sequences: ?*const SequenceHook = null,
+};
+
+pub const SequenceCall = enum { nextval, currval, setval, lastval, identity };
+
+/// `name` is the regclass text (nextval/currval/setval); identity passes
+/// the table slot in `oid` and the column in `value`.
+pub const SequenceHook = struct {
+    ptr: *anyopaque,
+    call: *const fn (ptr: *anyopaque, kind: SequenceCall, name: []const u8, oid: u32, value: i64, called: bool) Error!i64,
 };
 
 pub const default_session: Session = .{};

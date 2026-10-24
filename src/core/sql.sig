@@ -92,6 +92,7 @@ const temporal_module = @import("sql/temporal.sig");
 const tzif_module = @import("sql/tzif.sig");
 const float_module = @import("sql/float_text.sig");
 const sort_module = @import("sql/sort.sig");
+const sequence_module = @import("sql/sequence.sig");
 
 pub const Config = types.Config;
 /// Per-statement session values (TimeZone, zone resolver, clocks).
@@ -189,6 +190,7 @@ pub fn Database(comptime config: Config) type {
     const M = mvcc_module.Mvcc(config);
     const L = locks_module.Locks(config);
     const K = catalog_module.Catalog(config);
+    const Q = sequence_module.Sequences(config);
 
     return struct {
         const Self = @This();
@@ -214,6 +216,10 @@ pub fn Database(comptime config: Config) type {
         pub const transaction_capacity = config.transactions;
         pub const savepoint_capacity = config.savepoints;
         pub const write_capacity = M.write_capacity;
+        /// Per-session currval/lastval state; callers that own sessions set
+        /// `sequence_session` before each statement (Store.Connection does).
+        pub const SequenceSession = Q.Session;
+        pub const sequence_capacity = config.sequences;
         /// Receives the complete change record before the statement publishes.
         pub const RecordCommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
 
@@ -307,6 +313,17 @@ pub fn Database(comptime config: Config) type {
 
         tables: [config.tables]S.Table = @splat(.{}),
         catalog: K = .{},
+        /// Sequence slots (Config.sequences); values are non-transactional.
+        seqs: [config.sequences]Q.Seq = @splat(.{}),
+        /// Log-ahead values of aborted transactions, carried into the next
+        /// change record any transaction writes (design §4.6).
+        seq_carried: Q.Set = .{},
+        /// currval/lastval of callers without their own session state.
+        default_sequences: Q.Session = .{},
+        sequence_session: ?*Q.Session = null,
+        seq_hook: value_module.SequenceHook = undefined,
+        seq_slot: u16 = 0,
+        seq_snap: Snapshot = .{ .csn = 0 },
         txs: [config.transactions]M.Tx = @splat(.{}),
         locks: L = .{},
         /// Table OIDs are first_oid + counter; never reused while committed.
@@ -348,6 +365,8 @@ pub fn Database(comptime config: Config) type {
             self.cid = source.cid;
             self.epoch = source.epoch;
             self.catalog = source.catalog;
+            self.seqs = source.seqs;
+            self.seq_carried = source.seq_carried;
             self.locks = .{};
             for (&self.txs) |*tx| tx.active = false;
             for (&self.tables, &source.tables) |*destination, *table| {
@@ -443,7 +462,7 @@ pub fn Database(comptime config: Config) type {
             // The hook may observe the database (read-only), which reuses
             // `outcome`; keep this statement's own.
             const outcome = self.outcome;
-            sink.before(self, slot, outcome.command == .select) catch |err| {
+            sink.before(self, slot, outcome.command == .select and self.readOnly(slot)) catch |err| {
                 self.abort(slot);
                 return err;
             };
@@ -485,6 +504,7 @@ pub fn Database(comptime config: Config) type {
                 tx.fresh = false;
                 tx.waiting_for = .{};
                 tx.table_wait = null;
+                tx.seq_dirty = .{};
                 return @intCast(slot);
             };
             return error.TransactionCapacity;
@@ -494,9 +514,11 @@ pub fn Database(comptime config: Config) type {
             return slot < config.transactions and self.txs[slot].active;
         }
 
-        /// A transaction with no write is read-only: commit needs no record.
+        /// Read-only (commit needs no record): no write, no sequence
+        /// log-ahead value of its own and none carried (design §4.6).
         pub fn readOnly(self: *const Self, slot: u16) bool {
-            return self.txs[slot].write_len == 0;
+            const tx = &self.txs[slot];
+            return tx.write_len == 0 and !tx.seq_dirty.any() and !self.seq_carried.any();
         }
 
         /// Encodes the transaction's change record into `buffer`. Fallible,
@@ -525,12 +547,19 @@ pub fn Database(comptime config: Config) type {
                 self.reclaimTables(at);
             }
             tx.write_len = 0;
+            // The record (if any) carried every pending log-ahead value.
+            tx.seq_dirty = .{};
+            self.seq_carried = .{};
         }
 
         /// Undoes every write and releases every lock of the transaction.
+        /// Sequence log-ahead values are not rolled back: they are carried.
         pub fn abort(self: *Self, slot: u16) void {
             if (!self.active(slot)) return;
+            const tx = &self.txs[slot];
             M.abortSlice(self, slot, 0, 0);
+            self.seq_carried.merge(&tx.seq_dirty);
+            tx.seq_dirty = .{};
             self.free(slot);
         }
 
@@ -689,6 +718,10 @@ pub fn Database(comptime config: Config) type {
                 tx.sub_len += 1;
             }
             const start = tx.subs[tx.sub_len - 1].write_start;
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall };
+            self.session.sequences = &self.seq_hook;
+            self.seq_slot = slot;
+            self.seq_snap = snap;
             self.body(slot, source, &parsed, snap, result, options.mode) catch |err| {
                 if (err == error.WouldBlock) {
                     tx.pin = snap;
@@ -758,6 +791,15 @@ pub fn Database(comptime config: Config) type {
             const affected: usize = switch (bound) {
                 .create_table => |*create| try self.createTable(slot, create, snap),
                 .drop_table => |index| try self.dropTable(slot, index, snap),
+                .create_sequence => |*create| blk: {
+                    try self.createSequence(slot, create.name, create.spec, 0, 0, snap);
+                    break :blk 0;
+                },
+                .drop_sequence => |index| blk: {
+                    if (self.seqs[index].owner != 0) return error.DependentObjects;
+                    try self.dropSequence(slot, index, snap);
+                    break :blk 0;
+                },
                 .insert => |*insert| blk: {
                     try self.lockTable(slot, insert.table, .row_exclusive);
                     break :blk try self.insertRows(slot, source, insert, snap);
@@ -836,7 +878,139 @@ pub fn Database(comptime config: Config) type {
                 table.dead_csn = 0;
                 freed = true;
             };
+            for (&self.seqs) |*seq| if (seq.live and seq.dead_csn != 0 and seq.dead_csn <= at) {
+                seq.live = false;
+                seq.dead_csn = 0;
+                freed = true;
+            };
             if (freed) _ = self.catalog.vacuum(at);
+        }
+
+        // ---- sequences (design §4.11) ---------------------------------------
+
+        /// CREATE SEQUENCE, or an identity column's owned sequence.
+        fn createSequence(self: *Self, slot: u16, name: Name, spec: sequence_module.Spec, owner: u32, owner_column: u8, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            if (self.catalog.creator(name.slice(), snap)) |other| {
+                var waits: L.Set = .{};
+                waits.add(other);
+                tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                return self.park(slot, waits);
+            }
+            if (self.catalog.find(name.slice(), snap) != null) return error.TableExists;
+            try self.reserveWrites(slot, 3);
+            var destination: ?usize = null;
+            for (0..2) |attempt| {
+                for (&self.seqs, 0..) |*seq, index| if (!seq.live) {
+                    destination = index;
+                    break;
+                };
+                if (destination != null or attempt == 1) break;
+                self.reclaimTables(self.horizon());
+            }
+            const index = destination orelse return error.TableCapacity;
+            if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
+            const seq = &self.seqs[index];
+            Q.init(seq, change_log.first_oid + self.oid_counter, name, spec, owner, owner_column);
+            seq.pending_create = true;
+            seq.creator = slot;
+            self.oid_counter += 1;
+            tx.push(.{ .kind = .create_sequence, .table = @intCast(index) }) catch unreachable;
+            var changes: [K.max_changes]K.Change = undefined;
+            const count = try self.catalog.createSequence(index, seq, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
+            for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
+        }
+
+        fn dropSequence(self: *Self, slot: u16, index: usize, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            const seq = &self.seqs[index];
+            if (seq.pending_drop and seq.creator != slot) {
+                // Another transaction's uncommitted DROP: wait for it.
+                var waits: L.Set = .{};
+                waits.add(seq.creator);
+                return self.park(slot, waits);
+            }
+            try self.reserveWrites(slot, 3);
+            seq.pending_drop = true;
+            seq.creator = slot;
+            tx.push(.{ .kind = .drop_sequence, .table = @intCast(index) }) catch unreachable;
+            var changes: [K.max_changes]K.Change = undefined;
+            const count = self.catalog.dropSequence(index, snap, tx.ref(slot), snap.cid, 0, &changes);
+            for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
+        }
+
+        /// The identity sequence of a table column visible to the statement.
+        fn identitySequence(self: *const Self, table_index: usize, column: usize) Error!usize {
+            const oid = self.tables[table_index].oid;
+            for (&self.seqs, 0..) |*seq, index| {
+                if (!seq.live or seq.owner != oid or seq.owner_column != column or seq.dead_csn != 0) continue;
+                if (seq.pending_create and seq.creator != self.seq_slot) continue;
+                return index;
+            }
+            return error.TableNotFound;
+        }
+
+        /// regclass text input: optional `public.` qualifier, quoted names
+        /// keep case, unquoted names fold to lower case.
+        fn sequenceByName(self: *const Self, text: []const u8) Error!usize {
+            var raw = text;
+            while (raw.len != 0 and (raw[0] == ' ' or raw[0] == '\t')) raw = raw[1..];
+            while (raw.len != 0 and (raw[raw.len - 1] == ' ' or raw[raw.len - 1] == '\t')) raw = raw[0 .. raw.len - 1];
+            if (raw.len > 7 and types.keyword(raw[0..7], "public.")) raw = raw[7..];
+            var name: Name = .{};
+            if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') {
+                raw = raw[1 .. raw.len - 1];
+                if (raw.len > config.name_bytes) return error.TableNotFound;
+                @memcpy(name.bytes[0..raw.len], raw);
+            } else {
+                if (raw.len > config.name_bytes) return error.TableNotFound;
+                for (raw, 0..) |byte, position| name.bytes[position] = types.lower(byte);
+            }
+            name.len = raw.len;
+            const found = self.catalog.find(name.slice(), self.seq_snap) orelse return error.TableNotFound;
+            if (found.kind != 'S') return error.WrongObjectType;
+            return found.slot;
+        }
+
+        const LiveOids = struct {
+            db: *const Self,
+            pub fn has(self: LiveOids, oid: u32) bool {
+                for (&self.db.seqs) |*seq| if (seq.live and seq.oid == oid) return true;
+                return false;
+            }
+        };
+
+        fn sequenceCall(ptr: *anyopaque, kind: value_module.SequenceCall, name: []const u8, oid: u32, amount: i64, called: bool) Error!i64 {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const session = self.sequence_session orelse &self.default_sequences;
+            if (kind == .lastval) {
+                if (session.last == 0 or !(LiveOids{ .db = self }).has(session.last)) return error.SequenceNotReady;
+                return session.currval(session.last) orelse error.SequenceNotReady;
+            }
+            const index = if (kind == .identity) try self.identitySequence(oid, @intCast(amount)) else try self.sequenceByName(name);
+            const seq = &self.seqs[index];
+            const tx = &self.txs[self.seq_slot];
+            switch (kind) {
+                .nextval, .identity => {
+                    const out = try Q.next(seq);
+                    if (out.logged) tx.seq_dirty.add(index);
+                    session.record(seq.oid, out.value, LiveOids{ .db = self });
+                    return out.value;
+                },
+                .currval => return session.currval(seq.oid) orelse error.SequenceNotReady,
+                .setval => {
+                    try Q.set(seq, amount, called);
+                    tx.seq_dirty.add(index);
+                    if (called) {
+                        // setval sets currval but not lastval's sequence.
+                        const last = session.last;
+                        session.record(seq.oid, amount, LiveOids{ .db = self });
+                        session.last = last;
+                    }
+                    return amount;
+                },
+                .lastval => unreachable,
+            }
         }
 
         fn park(self: *Self, slot: u16, waits: L.Set) Error {
@@ -962,6 +1136,7 @@ pub fn Database(comptime config: Config) type {
             var changes: [K.max_changes]K.Change = undefined;
             const count = try self.catalog.create(index, table, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
+            if (create.identity) |identity| try self.createSequence(slot, identity.name, identity.spec, table.oid, identity.column, snap);
             return 0;
         }
 
@@ -969,6 +1144,12 @@ pub fn Database(comptime config: Config) type {
             try self.lockTable(slot, index, .access_exclusive);
             const tx = &self.txs[slot];
             const table = &self.tables[index];
+            // Owned identity sequences go with the table (DROP ... CASCADE of
+            // the dependency), encoded before the table.
+            for (&self.seqs, 0..) |*seq, seq_index| {
+                if (!seq.live or seq.owner != table.oid or seq.dead_csn != 0 or seq.pending_drop) continue;
+                try self.dropSequence(slot, seq_index, snap);
+            }
             try self.reserveWrites(slot, 2 + table.column_count);
             table.pending_drop = true;
             tx.push(.{ .kind = .drop_table, .table = @intCast(index) }) catch unreachable;
@@ -989,6 +1170,7 @@ pub fn Database(comptime config: Config) type {
                 done += 1;
             };
             var ctx = self.evalContext(source);
+            const derived: D.Derived = .{ .defaults = &insert.defaults, .generated = &insert.generated };
             var position: usize = 0;
             if (insert.plan != ast.none) {
                 const work = &self.workspace.query;
@@ -996,12 +1178,12 @@ pub fn Database(comptime config: Config) type {
                 for (0..rows.count) |index| {
                     if (position >= done) {
                         ctx.tuple[1] = X.rowAt(work, rows, index);
-                        try self.insertOne(slot, &ctx, insert.table, &insert.values, snap);
+                        try self.insertOne(slot, &ctx, insert.table, &insert.values, derived, snap);
                     }
                     position += 1;
                 }
             } else if (insert.rows == ast.none) {
-                if (done == 0) try self.insertOne(slot, &ctx, insert.table, &insert.values, snap);
+                if (done == 0) try self.insertOne(slot, &ctx, insert.table, &insert.values, derived, snap);
                 position = 1;
             } else {
                 const nodes = &self.workspace.nodes.nodes;
@@ -1015,7 +1197,7 @@ pub fn Database(comptime config: Config) type {
                             values[insert.mapping[item_index]] = item;
                             item_index += 1;
                         }
-                        try self.insertOne(slot, &ctx, insert.table, &values, snap);
+                        try self.insertOne(slot, &ctx, insert.table, &values, derived, snap);
                     }
                     position += 1;
                 }
@@ -1023,10 +1205,10 @@ pub fn Database(comptime config: Config) type {
             return position;
         }
 
-        fn insertOne(self: *Self, slot: u16, ctx: *E.Context, table_index: usize, values: *const [config.columns]u16, snap: Snapshot) Error!void {
+        fn insertOne(self: *Self, slot: u16, ctx: *E.Context, table_index: usize, values: *const [config.columns]u16, derived: D.Derived, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const table = &self.tables[table_index];
-            const cells = try D.insertedRow(ctx, table, values);
+            const cells = try D.insertedRow(ctx, table, values, derived);
             if (table.primary_column) |column| switch (D.keyCheck(table, &cells[column], 0xffffffff, snap)) {
                 .free => {},
                 .taken => return error.PrimaryKeyViolation,
@@ -1090,7 +1272,7 @@ pub fn Database(comptime config: Config) type {
         fn updateOne(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, row: u32, old: u32, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const table = &self.tables[update.table];
-            const cells = try D.updatedRow(ctx, table, &update.values, &table.versions[old].cells);
+            const cells = try D.updatedRow(ctx, table, &update.values, .{ .defaults = &update.defaults, .generated = &update.generated }, &table.versions[old].cells);
             if (table.primary_column) |column| {
                 if (update.values[column] != ast.none) switch (D.keyCheck(table, &cells[column], row, snap)) {
                     .free => {},
@@ -1168,8 +1350,20 @@ pub fn Database(comptime config: Config) type {
                     },
                     .create_table => try C.encodeCreate(writer, &self.tables[entry.table]),
                     .drop_table => try C.encodeDrop(writer, self.tables[entry.table].oid),
+                    .create_sequence => try C.encodeCreateSequence(writer, &self.seqs[entry.table]),
+                    .drop_sequence => try C.encodeDropSequence(writer, self.seqs[entry.table].oid),
                     .catalog_insert, .catalog_delete => {},
                 }
+            }
+            // At most one log-ahead value per sequence: this transaction's
+            // and every carried one (newest value wins).
+            var pending = tx.seq_dirty;
+            pending.merge(&self.seq_carried);
+            for (&self.seqs, 0..) |*seq, index| {
+                if (!pending.has(index) or !seq.live or seq.dead_csn != 0) continue;
+                if (seq.pending_create and seq.creator != slot) continue;
+                if (seq.pending_drop and seq.creator == slot) continue;
+                try C.encodeSequenceValue(writer, seq.oid, seq.logged_value, seq.logged_called);
             }
         }
 
@@ -1342,6 +1536,18 @@ pub fn Database(comptime config: Config) type {
             table.live = true;
             table.pending_create = false;
             _ = try self.catalog.create(index, table, .{ .epoch = self.epoch }, self.cid, csn, csn, &changes);
+        }
+
+        /// Replay hook: committed catalog rows for a sequence slot.
+        pub fn replayCreateSequence(self: *Self, index: usize, csn: u64) Error!void {
+            var changes: [K.max_changes]K.Change = undefined;
+            _ = try self.catalog.createSequence(index, &self.seqs[index], .{ .epoch = self.epoch }, self.cid, csn, csn, &changes);
+        }
+
+        /// Replay hook: a committed DROP SEQUENCE.
+        pub fn replayDropSequence(self: *Self, index: usize, csn: u64) void {
+            var changes: [K.max_changes]K.Change = undefined;
+            _ = self.catalog.dropSequence(index, storage.committed_view, .{ .epoch = self.epoch }, self.cid, csn, &changes);
         }
 
         /// Replay hook: a committed DROP TABLE.

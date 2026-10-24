@@ -178,6 +178,16 @@ pub const Error = error{
     InvalidRowCountInLimit,
     /// SQLSTATE 2201X: OFFSET is negative.
     InvalidRowCountInResultOffset,
+    /// SQLSTATE 428C9: a value assigned to a GENERATED ALWAYS column.
+    GeneratedAlways,
+    /// SQLSTATE 2200H: nextval reached the sequence bound without CYCLE.
+    SequenceLimit,
+    /// SQLSTATE 55000: currval/lastval before nextval in this session.
+    SequenceNotReady,
+    /// SQLSTATE 42809: the relation is not of the expected kind.
+    WrongObjectType,
+    /// SQLSTATE 2BP01: an identity column owns the sequence.
+    DependentObjects,
 };
 
 /// Session dialect. It changes only assignment coercion (MySQL/TDS BIT
@@ -273,8 +283,11 @@ pub fn typeFromOid(oid: u32) ?DataType {
     return null;
 }
 
+/// How a column gets a value it is not assigned (design §4.11).
+pub const DefaultKind = enum(u8) { none = 0, default = 1, identity_always = 2, identity_by_default = 3, generated = 4 };
+
 /// Statement kind of a completed (or described) statement.
-pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset };
+pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence };
 
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;
@@ -360,6 +373,10 @@ pub fn Values(comptime config: Config) type {
             typmod: i32 = -1,
             not_null: bool = false,
             primary_key: bool = false,
+            /// DEFAULT, identity (owned sequence) or GENERATED ... STORED.
+            default_kind: DefaultKind = .none,
+            /// Source text of the DEFAULT or generation expression.
+            expression: Text = .{},
         };
 
         pub fn cellTag(data_type: DataType) CellTag {
