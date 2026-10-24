@@ -278,6 +278,88 @@ pub fn typeOid(data_type: DataType) u32 {
     return typeInfo(data_type).oid;
 }
 
+/// SQL spelling of a type (format_type with no typmod, regtype output,
+/// information_schema.columns.data_type).
+pub fn sqlTypeName(data_type: DataType) []const u8 {
+    return switch (data_type) {
+        .integer => "bigint",
+        .integer32 => "integer",
+        .smallint => "smallint",
+        .boolean => "boolean",
+        .text => "text",
+        .numeric => "numeric",
+        .real => "real",
+        .double => "double precision",
+        .name => "name",
+        .oid => "oid",
+        .date => "date",
+        .timestamp => "timestamp without time zone",
+        .timestamptz => "timestamp with time zone",
+        .interval => "interval",
+        .json => "json",
+        .jsonb => "jsonb",
+    };
+}
+
+/// pg_type.typinput (input function name).
+pub fn typeInputName(data_type: DataType) []const u8 {
+    return switch (data_type) {
+        .integer => "int8in",
+        .integer32 => "int4in",
+        .smallint => "int2in",
+        .boolean => "boolin",
+        .text => "textin",
+        .numeric => "numeric_in",
+        .real => "float4in",
+        .double => "float8in",
+        .name => "namein",
+        .oid => "oidin",
+        .date => "date_in",
+        .timestamp => "timestamp_in",
+        .timestamptz => "timestamptz_in",
+        .interval => "interval_in",
+        .json => "json_in",
+        .jsonb => "jsonb_in",
+    };
+}
+
+/// regtype input: type names and aliases, optionally pg_catalog-qualified
+/// or quoted, any typmod suffix ignored. null when unknown.
+pub fn typeByName(input: []const u8) ?DataType {
+    var text = input;
+    while (text.len != 0 and (text[0] == ' ' or text[0] == '\t')) text = text[1..];
+    while (text.len != 0 and (text[text.len - 1] == ' ' or text[text.len - 1] == '\t')) text = text[0 .. text.len - 1];
+    if (text.len > 11 and keyword(text[0..11], "pg_catalog.")) text = text[11..];
+    var buffer: [40]u8 = undefined;
+    var length: usize = 0;
+    var quoted = false;
+    if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') {
+        quoted = true;
+        text = text[1 .. text.len - 1];
+    }
+    for (text) |byte| {
+        if (byte == '(' and !quoted) break;
+        if (length == buffer.len) return null;
+        buffer[length] = if (quoted) byte else lower(byte);
+        length += 1;
+    }
+    while (length != 0 and buffer[length - 1] == ' ') length -= 1;
+    const name = buffer[0..length];
+    const aliases = [_]struct { name: []const u8, data_type: DataType }{
+        .{ .name = "integer", .data_type = .integer32 },     .{ .name = "int", .data_type = .integer32 },
+        .{ .name = "bigint", .data_type = .integer },        .{ .name = "smallint", .data_type = .smallint },
+        .{ .name = "boolean", .data_type = .boolean },       .{ .name = "real", .data_type = .real },
+        .{ .name = "double precision", .data_type = .double }, .{ .name = "decimal", .data_type = .numeric },
+        .{ .name = "timestamp without time zone", .data_type = .timestamp }, .{ .name = "timestamp with time zone", .data_type = .timestamptz },
+    };
+    for (aliases) |alias| if (same(name, alias.name)) return alias.data_type;
+    inline for (@typeInfo(DataType).@"enum".field_names) |field| {
+        const data_type = @field(DataType, field);
+        if (same(name, typeInfo(data_type).name)) return data_type;
+    }
+    return null;
+}
+
 pub fn typeFromOid(oid: u32) ?DataType {
     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
         if (typeInfo(@field(DataType, field)).oid == oid) return @field(DataType, field);

@@ -236,6 +236,121 @@ pub fn Eval(comptime config: types.Config) type {
             return &base[n.column];
         }
 
+        fn textCell(bytes: []const u8) Error!V.Cell {
+            if (bytes.len > config.text_bytes) return error.TextCapacity;
+            var text: V.Text = .{ .len = bytes.len };
+            @memcpy(text.bytes[0..bytes.len], bytes);
+            return .{ .text = text };
+        }
+
+        fn digitsCell(value: i64) Error!V.Cell {
+            var buffer: [24]u8 = undefined;
+            var index: usize = buffer.len;
+            var magnitude: u64 = if (value < 0) @as(u64, @bitCast(-%value)) else @intCast(value);
+            while (true) {
+                index -= 1;
+                buffer[index] = @intCast('0' + magnitude % 10);
+                magnitude /= 10;
+                if (magnitude == 0) break;
+            }
+            if (value < 0) {
+                index -= 1;
+                buffer[index] = '-';
+            }
+            return textCell(buffer[index..]);
+        }
+
+        /// format_type(oid, typmod): the SQL spelling with NUMERIC(p,s) and
+        /// TIMESTAMP[TZ](p) modifiers; `???` for an unknown OID.
+        fn formatType(oid: i64, typmod: i64) Error!V.Cell {
+            const data_type = if (oid >= 0 and oid <= 0xffffffff) types.typeFromOid(@intCast(oid)) else null;
+            const known = data_type orelse return textCell("???");
+            var buffer: [64]u8 = undefined;
+            var at: usize = 0;
+            const append = struct {
+                fn f(out: *[64]u8, position: *usize, bytes: []const u8) void {
+                    @memcpy(out[position.*..][0..bytes.len], bytes);
+                    position.* += bytes.len;
+                }
+            }.f;
+            const number = struct {
+                fn f(out: *[64]u8, position: *usize, value: i64) void {
+                    var digits: [24]u8 = undefined;
+                    var index: usize = digits.len;
+                    var magnitude: u64 = @intCast(@max(value, 0));
+                    while (true) {
+                        index -= 1;
+                        digits[index] = @intCast('0' + magnitude % 10);
+                        magnitude /= 10;
+                        if (magnitude == 0) break;
+                    }
+                    append(out, position, digits[index..]);
+                }
+            }.f;
+            switch (known) {
+                .numeric => if (typmod >= 4) {
+                    const packed_value = typmod - 4;
+                    append(&buffer, &at, "numeric(");
+                    number(&buffer, &at, packed_value >> 16);
+                    append(&buffer, &at, ",");
+                    number(&buffer, &at, packed_value & 0xffff);
+                    append(&buffer, &at, ")");
+                    return textCell(buffer[0..at]);
+                },
+                .timestamp, .timestamptz => if (typmod >= 0) {
+                    append(&buffer, &at, "timestamp(");
+                    number(&buffer, &at, typmod);
+                    append(&buffer, &at, if (known == .timestamp) ") without time zone" else ") with time zone");
+                    return textCell(buffer[0..at]);
+                },
+                else => {},
+            }
+            return textCell(types.sqlTypeName(known));
+        }
+
+        /// Discovery functions and regclass/regtype conversions (design §4.10).
+        fn catalogValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            switch (n.func) {
+                .current_database => return textCell(ctx.session.database),
+                .current_schema => return textCell("public"),
+                else => {},
+            }
+            const first = try eval(ctx, n.b);
+            if (first == .null_value) return .null_value;
+            switch (n.func) {
+                .to_regtype, .regtype_in => {
+                    if (types.typeByName(first.text.slice())) |data_type| return .{ .integer = types.typeOid(data_type) };
+                    if (n.func == .to_regtype) return .null_value;
+                    return error.UndefinedObject;
+                },
+                .to_regclass, .regclass_in => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const oid = try hook.call(hook.ptr, .regclass, first.text.slice(), 0, 0, n.func == .regclass_in);
+                    if (oid < 0) return .null_value;
+                    return .{ .integer = oid };
+                },
+                .regtype_out => {
+                    const data_type = if (first.integer >= 0 and first.integer <= 0xffffffff) types.typeFromOid(@intCast(first.integer)) else null;
+                    if (data_type) |known| return textCell(types.sqlTypeName(known));
+                    return digitsCell(first.integer);
+                },
+                .regclass_out => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    var buffer: [64]u8 = undefined;
+                    if (first.integer >= 0 and first.integer <= 0xffffffff) {
+                        if (hook.relation_name(hook.ptr, @intCast(first.integer), &buffer)) |length| return textCell(buffer[0..length]);
+                    }
+                    return digitsCell(first.integer);
+                },
+                .format_type => {
+                    const second = try eval(ctx, ctx.pool.nodes[n.b].next);
+                    return formatType(first.integer, if (second == .null_value) -1 else second.integer);
+                },
+                .pg_get_expr => return first,
+                else => unreachable,
+            }
+        }
+
         /// nextval/currval/setval/lastval and identity defaults through the
         /// session's sequence hook (strict: a NULL argument gives NULL).
         fn sequenceValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
@@ -245,8 +360,15 @@ pub fn Eval(comptime config: types.Config) type {
                 .identity_next => return .{ .integer = try hook.call(hook.ptr, .identity, "", @intCast(n.integer), n.column, false) },
                 else => {},
             }
-            const name = try eval(ctx, n.b);
-            if (name == .null_value) return .null_value;
+            const name_cell = try eval(ctx, n.b);
+            if (name_cell == .null_value) return .null_value;
+            // A regclass argument (OID) names the sequence directly.
+            var oid: u32 = 0;
+            var name: []const u8 = "";
+            if (name_cell == .integer) {
+                if (name_cell.integer <= 0 or name_cell.integer > 0xffffffff) return error.TableNotFound;
+                oid = @intCast(name_cell.integer);
+            } else name = name_cell.text.slice();
             if (n.func == .setval) {
                 const second = ctx.pool.nodes[n.b].next;
                 const amount = try eval(ctx, second);
@@ -258,9 +380,9 @@ pub fn Eval(comptime config: types.Config) type {
                     if (flag == .null_value) return .null_value;
                     called = flag.boolean;
                 }
-                return .{ .integer = try hook.call(hook.ptr, .setval, name.text.slice(), 0, amount.integer, called) };
+                return .{ .integer = try hook.call(hook.ptr, .setval, name, oid, amount.integer, called) };
             }
-            return .{ .integer = try hook.call(hook.ptr, if (n.func == .nextval) .nextval else .currval, name.text.slice(), 0, 0, false) };
+            return .{ .integer = try hook.call(hook.ptr, if (n.func == .nextval) .nextval else .currval, name, oid, 0, false) };
         }
 
         pub fn literalText(source: []const u8, quoted: lexer.Quoted) V.Text {
@@ -565,6 +687,7 @@ pub fn Eval(comptime config: types.Config) type {
                         return .{ .text = text };
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
+                    .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out => return catalogValue(ctx, n),
                     .none => unreachable,
                 },
                 .param, .when_arm => unreachable,

@@ -353,7 +353,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn typeWord(token: Token) bool {
             return switch (token.keyword) {
-                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb => true,
+                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
                 else => false,
             };
         }
@@ -428,6 +428,8 @@ pub fn Parser(comptime config: types.Config) type {
                 .interval => .{ .ty = .interval },
                 .json => .{ .ty = .json },
                 .jsonb => .{ .ty = .jsonb },
+                .regclass => .{ .ty = .oid, .typmod = ast.regclass_typmod },
+                .regtype => .{ .ty = .oid, .typmod = ast.regtype_typmod },
                 else => unreachable,
             };
         }
@@ -517,6 +519,8 @@ pub fn Parser(comptime config: types.Config) type {
                 if (out.count == config.columns) return error.ColumnCapacity;
                 var column: Ast.ColumnDef = .{ .name = try self.identifier() };
                 const spec = try self.typeName();
+                // regclass/regtype columns are outside the subset.
+                if (spec.typmod < -1) return error.UnsupportedStatement;
                 column.type_name = spec.ty;
                 column.typmod = spec.typmod;
                 var has_not_null = false;
@@ -947,7 +951,7 @@ pub fn Parser(comptime config: types.Config) type {
                 } else return error.Syntax;
             }
             if (out.item_count == 1 and out.items[0].query == none) {
-                out.from = .{ .name = out.items[0].name, .alias = out.items[0].alias };
+                out.from = .{ .schema = out.items[0].schema, .name = out.items[0].name, .alias = out.items[0].alias };
             } else self.pool.complex = true;
         }
 
@@ -959,7 +963,13 @@ pub fn Parser(comptime config: types.Config) type {
                 item.query = try self.query();
                 try self.expectSymbol(.rparen);
                 self.pool.complex = true;
-            } else item.name = try self.identifier();
+            } else {
+                item.name = try self.identifier();
+                if (self.mode == .standard and try self.takeSymbol(.dot)) {
+                    item.schema = item.name;
+                    item.name = try self.identifier();
+                }
+            }
             item.alias = try self.bareAlias();
             out.items[out.item_count] = item;
             out.item_count += 1;

@@ -109,14 +109,65 @@ the same validation/application path with a compile-time no-op boundary.
 
 ## SQL subset
 
-CREATE/DROP TABLE; single-row INSERT with optional column mapping and expression
-values; SELECT expressions or `*` with optional `FROM table [[AS] alias]` (one
-table; no FROM evaluates one row); UPDATE with expression SET; DELETE. Columns
+CREATE/DROP TABLE; CREATE/DROP SEQUENCE; INSERT [AS alias] with optional column
+mapping and multi-row VALUES (DEFAULT items), INSERT ... SELECT or DEFAULT
+VALUES, OVERRIDING SYSTEM|USER VALUE and ON CONFLICT on the primary key (DO
+NOTHING / DO UPDATE SET ... [WHERE], EXCLUDED); SELECT; UPDATE with expression
+SET (`SET col = DEFAULT`); DELETE; RETURNING on INSERT/UPDATE/DELETE. Columns
 have SMALLINT/INT2, INTEGER/INT/INT4, BIGINT/INT8, NUMERIC/DECIMAL[(p[,s])],
 REAL/FLOAT4, DOUBLE PRECISION/FLOAT8/FLOAT[(p)], BOOLEAN/BOOL, TEXT, NAME, OID,
 DATE, TIMESTAMP[(p)] [WITH|WITHOUT TIME ZONE], TIMESTAMPTZ[(p)], INTERVAL, JSON
 or JSONB types, with NOT NULL and one single-column PRIMARY KEY. The primary
-key is also non-null. Omitted INSERT columns become NULL.
+key is also non-null. Omitted INSERT columns take their DEFAULT (NULL without
+one).
+
+### DML, defaults, identity and sequences (Q09/Q10, design §4.11, §5.10-§5.13)
+
+RETURNING rows are the statement's write slice in order (new versions for
+INSERT/UPDATE, deleted versions for DELETE), evaluated into the statement
+workspace after the statement succeeds, so a statement parked on a lock and
+resumed emits every row exactly once and a failure returns none. A resumed
+multi-row INSERT continues after the source rows it already handled
+(`Tx.progress`). Column DEFAULT expressions are stored as source text
+(change-record `create_table` carries the default kind and text) and bound per
+statement against that text; identity columns own a sequence (`<t>_<c>_seq`,
+relkind S, dropped with the table); stored generated columns are recomputed
+after every other column on insert and update. Errors: `GeneratedAlways`
+(428C9), `SequenceLimit` (2200H), `SequenceNotReady` (55000),
+`WrongObjectType` (42809), `DependentObjects` (2BP01), `UndefinedObject`
+(42704).
+
+ON CONFLICT checks the proposed key against the newest committed or own
+version (`dml.keyCheck`, not the statement snapshot): an in-progress inserter
+or deleter parks the statement and the row is retried on resume; a row this
+statement already wrote is `CardinalityViolation` (21000) for DO UPDATE; DO
+UPDATE locks the row (EvalPlanQual `target`) and evaluates SET/WHERE with the
+existing row as relation 0 and EXCLUDED as relation 1.
+
+Sequences (`sql/sequence.sig`, `Config.sequences` slots) are
+non-transactional and follow PostgreSQL's nextval with CACHE 1 and
+SEQ_LOG_VALS = 32: a nextval that exhausts its log count records a log-ahead
+value that rides on the transaction's change record (op 9); an aborted
+transaction's value is carried (`Database.seq_carried`) into the next record
+any transaction writes, and `readOnly()` is false while a transaction has its
+own or the database has carried sequence values. Ops 7/8 create and drop
+sequences. currval/lastval state is per session (`SequenceSession`, set by
+the caller; Store.Connection owns one). The value hook
+(`value.Session.sequences`) also serves regclass lookups.
+
+### System views (P01, design §4.10)
+
+`catalog.sig` defines the views (`pg_type`, `pg_namespace`, `pg_class`,
+`pg_attribute`, `pg_index`, `pg_attrdef`, `pg_sequence`, and
+`information_schema.schemata/tables/columns/table_constraints/key_column_usage`)
+as virtual FROM items: the executor asks the Database for their rows at scan
+time (`Exec.Work.views`), computed from cat_relations visible to the
+statement snapshot, the table definitions, the sequence slots and the static
+type table, so they change after every committed or own DDL. A primary key's
+index takes the OID after its table's (`<table>_pkey`). DEFAULT and generation
+expressions are shown through `deparse.sig`. regclass/regtype casts are OID
+values tagged for `::text` output. "char", regproc, int2vector, character_data
+and yes_or_no columns are TEXT.
 
 ### Value types (Q02/Q03/Q04)
 
@@ -300,7 +351,9 @@ Errors include `Syntax`, `UnsupportedStatement`, `TableCapacity`,
 `InvalidDatetimeFormat`, `DatetimeFieldOverflow`, `UntranslatableCharacter`,
 `ClockUnavailable`, `WorkspaceCapacity`, `GroupingError`, `AmbiguousColumn`,
 `CardinalityViolation`, `InvalidRowCountInLimit`,
-`InvalidRowCountInResultOffset` and the
+`InvalidRowCountInResultOffset`, `GeneratedAlways`, `SequenceLimit`,
+`SequenceNotReady`, `WrongObjectType`, `DependentObjects`, `UndefinedObject`
+and the
 transaction errors `WouldBlock` (never sent to clients), `SerializationFailure`,
 `DeadlockDetected`, `LockNotAvailable`, `QueryCanceled`, `TransactionCapacity`,
 `WriteSetCapacity`, `LockCapacity`, `CatalogCapacity`, `SavepointCapacity`,
@@ -323,9 +376,12 @@ documented in [database-server.md](database-server.md).
 
 Run `sig build test-sql --summary all` with Sig 0.6.3. The target compiles and
 executes `tests/test_sql.sig`, `test_sql_index.sig`, `test_sql_storage.sig`,
-`test_sql_change_log.sig`, `test_sql_expr.sig`, `test_sql_mvcc.sig` and
+`test_sql_change_log.sig`, `test_sql_expr.sig`, `test_sql_mvcc.sig`,
 `test_sql_types.sig` (value types, zones, JSONB and typed change-record round
-trips), emitting assertion, statement, and fuzz counts.
+trips), `test_sql_query.sig`, `test_sql_dml.sig` (RETURNING, defaults,
+identity, sequences, upsert, durability of sequence values) and
+`test_sql_catalog.sig` (system views), emitting assertion, statement, and fuzz
+counts.
 It is also included in `sig build test`. The executable's `--prove-failure`
 option deliberately returns nonzero, including release modes. Contracts cover
 operations, ownership, fail-atomic constraints, capacity exhaustion/reuse,

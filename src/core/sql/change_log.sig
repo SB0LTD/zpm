@@ -720,8 +720,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         for (definition.columns[0..definition.count], 0..) |column, position| if (column.primary_key) {
                             vt.primary = position;
                         };
-                        if (definition.oid == 0xffffffff) return error.ChangeRecordConflict;
-                        next_oid = definition.oid + 1;
+                        if (definition.oid >= 0xfffffffe) return error.ChangeRecordConflict;
+                        // A primary key's index owns the next OID.
+                        next_oid = definition.oid + 1 + @as(u32, @intFromBool(vt.primary != null));
                     },
                     @intFromEnum(Op.drop_table) => {
                         const index = try findVTable(scratch, try reader.int(u32));
@@ -875,9 +876,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         for (&db.tables, 0..) |*table, index| if (!table.live) {
                             S.reset(table, definition.oid, definition.name, definition.columns[0..definition.count]);
                             try db.replayCreate(index, csn);
+                            db.oid_counter = definition.oid + 1 + @as(u32, @intFromBool(table.primary_column != null)) - first_oid;
                             break;
                         };
-                        db.oid_counter = definition.oid + 1 - first_oid;
                     },
                     @intFromEnum(Op.drop_table) => {
                         const table = try tableByOid(db, try reader.int(u32));

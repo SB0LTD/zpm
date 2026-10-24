@@ -645,7 +645,17 @@ pub fn Session(comptime DB: type) type {
             try q.append("SELECT * FROM ");
             try q.append(table);
             try q.append(" LIMIT 0");
-            if (@hasDecl(DB, "describe")) try db.describe(q.bytes[0..q.at], &self.result) else try db.execute(q.bytes[0..q.at], &self.result);
+            if (@hasDecl(DB, "describe")) {
+                db.describe(q.bytes[0..q.at], &self.result) catch |err| {
+                    // A relation wider than the result (a system view) gives no
+                    // column types: unknown parameters stay text.
+                    if (err != error.ColumnCapacity) return err;
+                    for (s.oids[0..s.count]) |*oid| if (oid.* == 0) {
+                        oid.* = 25;
+                    };
+                    return;
+                };
+            } else try db.execute(q.bytes[0..q.at], &self.result);
             if (self.result.column_count > 256) return error.ColumnCapacity;
             if (keyword(first, "insert")) {
                 var mapping: [256]usize = undefined;

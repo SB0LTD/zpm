@@ -131,7 +131,8 @@ pub fn Mvcc(comptime config: types.Config) type {
                         const table = &db.tables[entry.table];
                         table.pending_create = false;
                         table.live = false;
-                        if (db.oid_counter + types_first_oid == table.oid + 1) db.oid_counter -= 1;
+                        const width: u32 = 1 + @as(u32, @intFromBool(table.primary_column != null));
+                        if (db.oid_counter + types_first_oid == table.oid + width) db.oid_counter -= width;
                     },
                     .drop_table => db.tables[entry.table].pending_drop = false,
                     .catalog_insert => db.catalog.undo(.{ .relation = @enumFromInt(entry.table), .version = entry.new }, true),

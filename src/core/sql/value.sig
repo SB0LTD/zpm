@@ -26,18 +26,24 @@ pub const Session = struct {
     statement_us: ?i64 = null,
     /// Current wall clock in PostgreSQL-epoch microseconds.
     clock: ?*const fn () ?i64 = null,
-    /// Sequence functions and identity defaults (set by the Database for
-    /// each statement); null rejects them (0A000).
+    /// Sequence functions, identity defaults and regclass lookups (set by
+    /// the Database for each statement); null rejects them (0A000).
     sequences: ?*const SequenceHook = null,
+    /// current_database(): the session's startup database.
+    database: []const u8 = "postgres",
 };
 
-pub const SequenceCall = enum { nextval, currval, setval, lastval, identity };
+pub const SequenceCall = enum { nextval, currval, setval, lastval, identity, regclass };
 
-/// `name` is the regclass text (nextval/currval/setval); identity passes
-/// the table slot in `oid` and the column in `value`.
+/// `name` is the regclass text (nextval/currval/setval; or `oid` when the
+/// argument is a regclass); identity passes the table slot in `oid` and the
+/// column in `value`; regclass resolves a relation name to its OID (-1 when
+/// missing unless `called`, which raises 42P01).
 pub const SequenceHook = struct {
     ptr: *anyopaque,
     call: *const fn (ptr: *anyopaque, kind: SequenceCall, name: []const u8, oid: u32, value: i64, called: bool) Error!i64,
+    /// regclass output: the relation named by `oid`, if any.
+    relation_name: *const fn (ptr: *anyopaque, oid: u32, out: *[64]u8) ?usize,
 };
 
 pub const default_session: Session = .{};
@@ -119,6 +125,8 @@ pub fn common(a: Type, b: Type) ?Type {
     }
     if (datetime(a) and datetime(b)) return if (datetimeRank(a) > datetimeRank(b)) a else b;
     if (stringType(a) and stringType(b)) return .text;
+    // int2/int4/int8 -> oid is implicit (catalog OID comparisons).
+    if ((a == .oid and (b == .int2 or b == .int4 or b == .int8)) or (b == .oid and (a == .int2 or a == .int4 or a == .int8))) return .oid;
     return null;
 }
 

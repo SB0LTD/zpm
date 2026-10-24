@@ -10,6 +10,7 @@ const expr = @import("expr.sig");
 const binder = @import("binder.sig");
 const value_module = @import("value.sig");
 const sort_module = @import("sort.sig");
+const catalog = @import("catalog.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -57,6 +58,9 @@ pub fn Exec(comptime config: types.Config) type {
             ref_high: usize = work_refs,
             ctes: [config.ctes]CteRun = undefined,
             cache: [config.subqueries]Cache = undefined,
+            /// System-view rows (catalog.sig View) for this statement; set by
+            /// the Database before it runs a query (kept across resets).
+            views: ?ViewHook = null,
 
             fn reset(self: *Work) void {
                 self.cell_low = 0;
@@ -65,6 +69,26 @@ pub fn Exec(comptime config: types.Config) type {
                 self.ref_high = work_refs;
                 for (&self.ctes) |*cte| cte.* = .{};
                 for (&self.cache) |*entry| entry.* = .{};
+            }
+        };
+
+        /// Produces a system view's rows into the workspace at scan time.
+        pub const ViewHook = struct {
+            ptr: *anyopaque,
+            rows: *const fn (ptr: *anyopaque, view: catalog.View, sink: *RowSink) Error!void,
+        };
+
+        /// Appends rows of `width` cells to a workspace row list.
+        pub const RowSink = struct {
+            query: *Query,
+            list: List,
+            width: usize,
+
+            pub fn add(self: *RowSink, cells: []const V.Cell) Error!void {
+                std_assert(cells.len == self.width);
+                const at = try self.query.cells(self.width);
+                for (cells, 0..) |cell, index| self.query.work.cells[at + index] = cell;
+                try self.query.push(&self.list, at);
             }
         };
 
@@ -172,6 +196,12 @@ pub fn Exec(comptime config: types.Config) type {
                     return list;
                 }
                 if (source.cte != B.no_cte) return self.materializeCte(source.cte, outer);
+                if (source.view) |view| {
+                    const hook = self.work.views orelse return error.UnsupportedStatement;
+                    var sink: RowSink = .{ .query = self, .list = .{ .start = @intCast(self.work.ref_low) }, .width = catalog.viewColumns(view).len };
+                    try hook.rows(hook.ptr, view, &sink);
+                    return sink.list;
+                }
                 return self.run(source.plan, outer);
             }
 

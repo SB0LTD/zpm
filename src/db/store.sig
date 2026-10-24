@@ -431,6 +431,9 @@ pub fn Store(comptime Raw: type) type {
             reported: [reported_parameters.len]ReportedValue = @splat(.{}),
             /// currval/lastval state of this session.
             sequences: SequenceSession = .{},
+            /// Startup `database` (current_database(); information_schema catalogs).
+            database_name: [64]u8 = @splat(0),
+            database_len: u8 = 0,
 
             pub fn reportedParameters() []const []const u8 {
                 return &reported_parameters;
@@ -500,6 +503,7 @@ pub fn Store(comptime Raw: type) type {
                     .transaction_us = self.transaction_us orelse self.statement_us,
                     .statement_us = self.statement_us,
                     .clock = self.store.wall_clock,
+                    .database = if (self.database_len == 0) "postgres" else self.database_name[0..self.database_len],
                 };
                 return raw;
             }
@@ -636,6 +640,12 @@ pub fn Store(comptime Raw: type) type {
             /// Applies one startup parameter (`options` with `-c name=value`
             /// / `--name=value` items, or application_name).
             pub fn startupParameter(self: *Connection, key: []const u8, value: []const u8) !void {
+                if (same(key, "database")) {
+                    if (value.len > self.database_name.len) return error.InvalidSettingValue;
+                    @memcpy(self.database_name[0..value.len], value);
+                    self.database_len = @intCast(value.len);
+                    return;
+                }
                 if (same(key, "application_name")) {
                     try self.assign(&self.settings, .application_name, value, true);
                 } else if (same(key, "options")) {

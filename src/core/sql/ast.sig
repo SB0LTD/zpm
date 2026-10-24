@@ -40,7 +40,14 @@ pub const TypeName = types.Type;
 pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists };
 
 /// Built-in functions bound by name.
-pub const Func = enum { none, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next };
+pub const Func = enum { none, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out };
+
+/// Cast typmods marking `::regclass` / `::regtype` (OID-valued casts).
+pub const regclass_typmod: i32 = -2;
+pub const regtype_typmod: i32 = -3;
+
+/// Node.reg: an OID-valued expression known to be a regclass / regtype.
+pub const Reg = enum(u8) { none, regclass, regtype };
 
 pub const Test = enum { is_null, is_not_null, is_true, is_not_true, is_false, is_not_false, is_unknown, is_not_unknown };
 
@@ -131,6 +138,7 @@ pub const Node = struct {
     /// `f(*)`, or `t.*` / `*` in a target list.
     star: bool = false,
     agg: Agg = .none,
+    reg: Reg = .none,
 };
 
 pub fn Ast(comptime config: types.Config) type {
@@ -258,6 +266,7 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const TableRef = struct {
+            schema: ?Ident = null,
             name: Ident = .{},
             alias: ?Ident = null,
         };
@@ -265,6 +274,8 @@ pub fn Ast(comptime config: types.Config) type {
         /// One FROM item: a table or CTE name, or a derived table
         /// (`query` != none), joined to the items before it.
         pub const FromItem = struct {
+            /// pg_catalog / information_schema / public qualifier.
+            schema: ?Ident = null,
             name: Ident = .{},
             alias: ?Ident = null,
             query: u16 = none,

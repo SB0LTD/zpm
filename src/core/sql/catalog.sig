@@ -34,6 +34,68 @@ pub const namespaces = [_]Namespace{
 };
 
 pub const public_namespace: u32 = 2200;
+pub const catalog_namespace: u32 = 11;
+pub const information_namespace: u32 = 13000;
+
+/// System views (design §4.10): virtual relations computed at scan time from
+/// the catalog base relations, the table definitions and the static type
+/// table under the statement snapshot. Columns PostgreSQL declares as
+/// "char", regproc, int2vector, character_data or yes_or_no are text here;
+/// sql_identifier columns are name (OID 19), cardinal_number int4.
+pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_index, pg_attrdef, pg_sequence, schemata, tables, columns, table_constraints, key_column_usage };
+
+pub const ViewColumn = struct { name: []const u8, ty: types.Type };
+
+fn col(name: []const u8, ty: types.Type) ViewColumn {
+    return .{ .name = name, .ty = ty };
+}
+
+const pg_type_columns = [_]ViewColumn{ col("oid", .oid), col("typname", .name), col("typnamespace", .oid), col("typlen", .int2), col("typtype", .text), col("typcategory", .text), col("typarray", .oid), col("typdelim", .text), col("typinput", .text) };
+const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name) };
+const pg_class_columns = [_]ViewColumn{ col("oid", .oid), col("relname", .name), col("relnamespace", .oid), col("relkind", .text), col("relnatts", .int2) };
+const pg_attribute_columns = [_]ViewColumn{ col("attrelid", .oid), col("attname", .name), col("atttypid", .oid), col("atttypmod", .int4), col("attnum", .int2), col("attnotnull", .boolean), col("attisdropped", .boolean), col("attidentity", .text), col("attgenerated", .text), col("atthasdef", .boolean) };
+const pg_index_columns = [_]ViewColumn{ col("indexrelid", .oid), col("indrelid", .oid), col("indisprimary", .boolean), col("indisunique", .boolean), col("indkey", .text) };
+const pg_attrdef_columns = [_]ViewColumn{ col("adrelid", .oid), col("adnum", .int2), col("adbin", .text) };
+const pg_sequence_columns = [_]ViewColumn{ col("seqrelid", .oid), col("seqtypid", .oid), col("seqstart", .int8), col("seqincrement", .int8), col("seqmax", .int8), col("seqmin", .int8), col("seqcache", .int8), col("seqcycle", .boolean) };
+const schemata_columns = [_]ViewColumn{ col("catalog_name", .name), col("schema_name", .name) };
+const tables_columns = [_]ViewColumn{ col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("table_type", .text) };
+const columns_columns = [_]ViewColumn{ col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4), col("column_default", .text), col("is_nullable", .text), col("data_type", .text), col("character_maximum_length", .int4), col("numeric_precision", .int4), col("numeric_precision_radix", .int4), col("numeric_scale", .int4), col("datetime_precision", .int4), col("is_identity", .text), col("identity_generation", .text), col("is_generated", .text), col("generation_expression", .text) };
+const table_constraints_columns = [_]ViewColumn{ col("constraint_catalog", .name), col("constraint_schema", .name), col("constraint_name", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("constraint_type", .text) };
+const key_column_usage_columns = [_]ViewColumn{ col("constraint_catalog", .name), col("constraint_schema", .name), col("constraint_name", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4) };
+
+pub fn viewColumns(view: View) []const ViewColumn {
+    return switch (view) {
+        .pg_type => &pg_type_columns,
+        .pg_namespace => &pg_namespace_columns,
+        .pg_class => &pg_class_columns,
+        .pg_attribute => &pg_attribute_columns,
+        .pg_index => &pg_index_columns,
+        .pg_attrdef => &pg_attrdef_columns,
+        .pg_sequence => &pg_sequence_columns,
+        .schemata => &schemata_columns,
+        .tables => &tables_columns,
+        .columns => &columns_columns,
+        .table_constraints => &table_constraints_columns,
+        .key_column_usage => &key_column_usage_columns,
+    };
+}
+
+/// pg_catalog views resolve unqualified (pg_catalog is searched first);
+/// information_schema views only when qualified.
+pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
+    const catalog_views = [_]View{ .pg_type, .pg_namespace, .pg_class, .pg_attribute, .pg_index, .pg_attrdef, .pg_sequence };
+    const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage };
+    const qualified = schema orelse {
+        for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
+        return null;
+    };
+    if (types.same(qualified, "pg_catalog")) {
+        for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
+    } else if (types.same(qualified, "information_schema")) {
+        for (information_views) |view| if (types.same(@tagName(view), name)) return view;
+    }
+    return null;
+}
 
 pub fn Catalog(comptime config: types.Config) type {
     const rows = @max(config.tables * config.columns, config.tables + config.sequences);
@@ -114,6 +176,22 @@ pub fn Catalog(comptime config: types.Config) type {
             if (visibleRow(sequences, slot + 1, snap)) |version| {
                 mark(sequences, version, xmax, cid, csn);
                 out[count] = .{ .relation = .sequences, .version = version };
+                count += 1;
+            }
+            return count;
+        }
+
+        pub const relation_rows = rows;
+
+        /// Every relation (table or sequence) visible to `snap`, in
+        /// catalog row order.
+        pub fn visibleRelations(self: *const Self, snap: storage.Snapshot, out: *[rows]Found) usize {
+            const relations = self.relationConst(.relations);
+            var count: usize = 0;
+            for (0..relations.row_high) |row| {
+                const version = SC.visibleAt(relations, row, snap) orelse continue;
+                const cells = &relations.versions[version].cells;
+                out[count] = .{ .kind = cells[2].text.bytes[0], .slot = @intCast(cells[4].integer) };
                 count += 1;
             }
             return count;

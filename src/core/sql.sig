@@ -5,8 +5,14 @@
 //! storage. Callers serialize access (one call at a time); concurrency comes
 //! from interleaving transactions, never from threads.
 //!
-//! Supported: CREATE/DROP TABLE; single-row INSERT [column list] VALUES
-//! (expressions); SELECT [DISTINCT [ON (...)]] expressions [FROM tables,
+//! Supported: CREATE/DROP TABLE (DEFAULT, GENERATED {ALWAYS|BY DEFAULT} AS
+//! IDENTITY, GENERATED ALWAYS AS (expr) STORED); CREATE/DROP SEQUENCE and
+//! nextval/currval/setval/lastval (sequence.sig); INSERT [AS alias] [column
+//! list] VALUES rows | SELECT | DEFAULT VALUES [OVERRIDING ...] [ON CONFLICT
+//! ... DO NOTHING | DO UPDATE] [RETURNING]; UPDATE/DELETE ... RETURNING; the
+//! system views of catalog.sig with current_database, to_regtype,
+//! to_regclass, format_type and ::regclass/::regtype;
+//! SELECT [DISTINCT [ON (...)]] expressions [FROM tables,
 //! derived tables and CTEs joined INNER/LEFT/RIGHT/FULL/CROSS ON|USING]
 //! [WHERE] [GROUP BY] [HAVING] with aggregates (COUNT/SUM/AVG/MIN/MAX/
 //! BOOL_AND/BOOL_OR, DISTINCT, FILTER), scalar/IN/EXISTS subqueries, WITH
@@ -93,6 +99,7 @@ const tzif_module = @import("sql/tzif.sig");
 const float_module = @import("sql/float_text.sig");
 const sort_module = @import("sql/sort.sig");
 const sequence_module = @import("sql/sequence.sig");
+const deparse_module = @import("sql/deparse.sig");
 
 pub const Config = types.Config;
 /// Per-statement session values (TimeZone, zone resolver, clocks).
@@ -191,6 +198,7 @@ pub fn Database(comptime config: Config) type {
     const L = locks_module.Locks(config);
     const K = catalog_module.Catalog(config);
     const Q = sequence_module.Sequences(config);
+    const G = deparse_module.Deparse(config);
 
     return struct {
         const Self = @This();
@@ -720,10 +728,11 @@ pub fn Database(comptime config: Config) type {
                 tx.sub_len += 1;
             }
             const start = tx.subs[tx.sub_len - 1].write_start;
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
+            self.workspace.query.views = .{ .ptr = self, .rows = &viewRows };
             self.body(slot, source, &parsed, snap, result, options.mode) catch |err| {
                 if (err == error.WouldBlock) {
                     tx.pin = snap;
@@ -955,6 +964,23 @@ pub fn Database(comptime config: Config) type {
         /// regclass text input: optional `public.` qualifier, quoted names
         /// keep case, unquoted names fold to lower case.
         fn sequenceByName(self: *const Self, text: []const u8) Error!usize {
+            const name = regclassName(text) orelse return error.TableNotFound;
+            const found = self.catalog.find(name.slice(), self.seq_snap) orelse return error.TableNotFound;
+            if (found.kind != 'S') return error.WrongObjectType;
+            return found.slot;
+        }
+
+        fn sequenceByOid(self: *const Self, oid: u32) Error!usize {
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(self.seq_snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S' and self.seqs[found.slot].oid == oid) return found.slot;
+                if (found.kind == 'r' and self.tables[found.slot].oid == oid) return error.WrongObjectType;
+            }
+            return error.TableNotFound;
+        }
+
+        fn regclassName(text: []const u8) ?Name {
             var raw = text;
             while (raw.len != 0 and (raw[0] == ' ' or raw[0] == '\t')) raw = raw[1..];
             while (raw.len != 0 and (raw[raw.len - 1] == ' ' or raw[raw.len - 1] == '\t')) raw = raw[0 .. raw.len - 1];
@@ -962,16 +988,68 @@ pub fn Database(comptime config: Config) type {
             var name: Name = .{};
             if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') {
                 raw = raw[1 .. raw.len - 1];
-                if (raw.len > config.name_bytes) return error.TableNotFound;
+                if (raw.len > config.name_bytes) return null;
                 @memcpy(name.bytes[0..raw.len], raw);
             } else {
-                if (raw.len > config.name_bytes) return error.TableNotFound;
+                if (raw.len > config.name_bytes) return null;
                 for (raw, 0..) |byte, position| name.bytes[position] = types.lower(byte);
             }
             name.len = raw.len;
-            const found = self.catalog.find(name.slice(), self.seq_snap) orelse return error.TableNotFound;
-            if (found.kind != 'S') return error.WrongObjectType;
-            return found.slot;
+            return name;
+        }
+
+        /// regclass input: a visible table, its primary-key index
+        /// (`<table>_pkey`) or a sequence; -1 (or 42P01) when missing.
+        fn regclassOid(self: *const Self, text: []const u8, strict: bool) Error!i64 {
+            const missing: Error!i64 = if (strict) error.TableNotFound else -1;
+            const name = regclassName(text) orelse return missing;
+            if (self.catalog.find(name.slice(), self.seq_snap)) |found| {
+                return if (found.kind == 'S') self.seqs[found.slot].oid else self.tables[found.slot].oid;
+            }
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(self.seq_snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind != 'r') continue;
+                const table = &self.tables[found.slot];
+                if (table.primary_column == null) continue;
+                const index_name = indexName(table) catch continue;
+                if (types.same(index_name.slice(), name.slice())) return table.oid + 1;
+            }
+            return missing;
+        }
+
+        fn indexName(table: *const S.Table) Error!Name {
+            var out: Name = .{};
+            for ([_][]const u8{ table.name.slice(), "_pkey" }) |part| {
+                if (part.len > config.name_bytes - out.len) return error.NameCapacity;
+                @memcpy(out.bytes[out.len..][0..part.len], part);
+                out.len += part.len;
+            }
+            return out;
+        }
+
+        fn relationName(ptr: *anyopaque, oid: u32, out: *[64]u8) ?usize {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(self.seq_snap, &relations);
+            for (relations[0..count]) |found| {
+                var name: Name = undefined;
+                if (found.kind == 'S') {
+                    if (self.seqs[found.slot].oid != oid) continue;
+                    name = self.seqs[found.slot].name;
+                } else {
+                    const table = &self.tables[found.slot];
+                    if (table.oid == oid) {
+                        name = table.name;
+                    } else if (table.primary_column != null and table.oid + 1 == oid) {
+                        name = indexName(table) catch return null;
+                    } else continue;
+                }
+                if (name.len > out.len) return null;
+                @memcpy(out[0..name.len], name.slice());
+                return name.len;
+            }
+            return null;
         }
 
         const LiveOids = struct {
@@ -989,7 +1067,8 @@ pub fn Database(comptime config: Config) type {
                 if (session.last == 0 or !(LiveOids{ .db = self }).has(session.last)) return error.SequenceNotReady;
                 return session.currval(session.last) orelse error.SequenceNotReady;
             }
-            const index = if (kind == .identity) try self.identitySequence(oid, @intCast(amount)) else try self.sequenceByName(name);
+            if (kind == .regclass) return self.regclassOid(name, called);
+            const index = if (kind == .identity) try self.identitySequence(oid, @intCast(amount)) else if (oid != 0) try self.sequenceByOid(oid) else try self.sequenceByName(name);
             const seq = &self.seqs[index];
             const tx = &self.txs[self.seq_slot];
             switch (kind) {
@@ -1011,8 +1090,157 @@ pub fn Database(comptime config: Config) type {
                     }
                     return amount;
                 },
-                .lastval => unreachable,
+                .lastval, .regclass => unreachable,
             }
+        }
+
+        // ---- system views (design §4.10) ---------------------------------
+
+        fn nameCell(bytes: []const u8) V.Cell {
+            var text: V.Text = .{ .len = @min(bytes.len, config.text_bytes) };
+            @memcpy(text.bytes[0..text.len], bytes[0..text.len]);
+            return .{ .text = text };
+        }
+
+        fn intCell(value: i64) V.Cell {
+            return .{ .integer = value };
+        }
+
+        fn boolCell(value: bool) V.Cell {
+            return .{ .boolean = value };
+        }
+
+        fn optionalInt(value: ?i64) V.Cell {
+            return if (value) |number| .{ .integer = number } else .null_value;
+        }
+
+        /// Canonical text of a column's DEFAULT / generation expression,
+        /// re-parsed from its stored source into scratch pool nodes.
+        fn expressionText(self: *Self, column: *const V.Column) V.Cell {
+            const pool = &self.workspace.nodes;
+            const saved = pool.len;
+            defer pool.len = saved;
+            var text: V.Text = .{};
+            const source = column.expression.slice();
+            const id = P.parseExpression(source, pool) catch return nameCell(source);
+            G.column(pool, source, id, column.data_type, &text) catch return nameCell(source);
+            return .{ .text = text };
+        }
+
+        fn numericPrecision(column: *const V.Column) [3]?i64 {
+            return switch (column.data_type) {
+                .smallint => .{ 16, 2, 0 },
+                .integer32 => .{ 32, 2, 0 },
+                .integer => .{ 64, 2, 0 },
+                .real => .{ 24, 2, null },
+                .double => .{ 53, 2, null },
+                .numeric => if (column.typmod >= 4) .{ (column.typmod - 4) >> 16, 10, (column.typmod - 4) & 0xffff } else .{ null, 10, null },
+                else => .{ null, null, null },
+            };
+        }
+
+        fn datetimePrecision(column: *const V.Column) ?i64 {
+            return switch (column.data_type) {
+                .date => 0,
+                .timestamp, .timestamptz => if (column.typmod >= 0) column.typmod else 6,
+                .interval => 6,
+                else => null,
+            };
+        }
+
+        fn viewRows(ptr: *anyopaque, view: catalog_module.View, sink: *X.RowSink) Error!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const database = self.session.database;
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(self.seq_snap, &relations);
+            const public: i64 = catalog_module.public_namespace;
+            switch (view) {
+                .pg_type => inline for (@typeInfo(DataType).@"enum".field_names) |field| {
+                    const data_type = @field(DataType, field);
+                    const info = types.typeInfo(data_type);
+                    var category: [1]u8 = .{info.category};
+                    try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), nameCell("b"), nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)) });
+                },
+                .pg_namespace => for (catalog_module.namespaces) |namespace| {
+                    try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name) });
+                },
+                .schemata => for (catalog_module.namespaces) |namespace| {
+                    try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
+                },
+                else => for (relations[0..count]) |found| {
+                    if (found.kind == 'S') {
+                        const seq = &self.seqs[found.slot];
+                        switch (view) {
+                            .pg_class => try sink.add(&.{ intCell(seq.oid), nameCell(seq.name.slice()), intCell(public), nameCell("S"), intCell(3) }),
+                            .pg_sequence => try sink.add(&.{ intCell(seq.oid), intCell(seq.spec.type_oid), intCell(seq.spec.start), intCell(seq.spec.increment), intCell(seq.spec.max), intCell(seq.spec.min), intCell(1), boolCell(seq.spec.cycle) }),
+                            else => {},
+                        }
+                        continue;
+                    }
+                    const table = &self.tables[found.slot];
+                    const name = table.name.slice();
+                    const oid: i64 = table.oid;
+                    const pkey = indexName(table) catch Name{};
+                    switch (view) {
+                        .pg_class => {
+                            try sink.add(&.{ intCell(oid), nameCell(name), intCell(public), nameCell("r"), intCell(@intCast(table.column_count)) });
+                            if (table.primary_column != null) try sink.add(&.{ intCell(oid + 1), nameCell(pkey.slice()), intCell(public), nameCell("i"), intCell(1) });
+                        },
+                        .tables => try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(name), nameCell("BASE TABLE") }),
+                        .pg_index => if (table.primary_column) |column| {
+                            var key: [4]u8 = undefined;
+                            const digits = formatSmall(column + 1, &key);
+                            try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(digits) });
+                        },
+                        .table_constraints => if (table.primary_column != null) {
+                            try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(pkey.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell("PRIMARY KEY") });
+                        },
+                        .key_column_usage => if (table.primary_column) |column| {
+                            try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(pkey.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(1) });
+                        },
+                        .pg_attribute, .pg_attrdef, .columns => for (table.columns[0..table.column_count], 0..) |*column, index| {
+                            const attnum: i64 = @intCast(index + 1);
+                            const kind = column.default_kind;
+                            const identity: []const u8 = switch (kind) {
+                                .identity_always => "a",
+                                .identity_by_default => "d",
+                                else => "",
+                            };
+                            const has_expression = kind == .default or kind == .generated;
+                            switch (view) {
+                                .pg_attribute => try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(types.typeOid(column.data_type)), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), nameCell(identity), nameCell(if (kind == .generated) "s" else ""), boolCell(has_expression) }),
+                                .pg_attrdef => if (has_expression) {
+                                    try sink.add(&.{ intCell(oid), intCell(attnum), self.expressionText(column) });
+                                },
+                                .columns => {
+                                    const numeric = numericPrecision(column);
+                                    try sink.add(&.{
+                                        nameCell(database),                                       nameCell("public"),                          nameCell(name),            nameCell(column.name.slice()),
+                                        intCell(attnum),                                          if (kind == .default) self.expressionText(column) else .null_value, nameCell(if (column.not_null) "NO" else "YES"), nameCell(types.sqlTypeName(column.data_type)),
+                                        .null_value,                                              optionalInt(numeric[0]),                     optionalInt(numeric[1]),   optionalInt(numeric[2]),
+                                        optionalInt(datetimePrecision(column)),                   nameCell(if (identity.len != 0) "YES" else "NO"), if (identity.len == 0) .null_value else nameCell(if (kind == .identity_always) "ALWAYS" else "BY DEFAULT"), nameCell(if (kind == .generated) "ALWAYS" else "NEVER"),
+                                        if (kind == .generated) self.expressionText(column) else .null_value,
+                                    });
+                                },
+                                else => unreachable,
+                            }
+                        },
+                        else => {},
+                    }
+                },
+            }
+        }
+
+        fn formatSmall(value: usize, out: *[4]u8) []const u8 {
+            var index: usize = out.len;
+            var rest = value;
+            while (true) {
+                index -= 1;
+                out[index] = @intCast('0' + rest % 10);
+                rest /= 10;
+                if (rest == 0) break;
+            }
+            return out[index..];
         }
 
         fn park(self: *Self, slot: u16, waits: L.Set) Error {
@@ -1133,7 +1361,8 @@ pub fn Database(comptime config: Config) type {
             S.reset(table, change_log.first_oid + self.oid_counter, create.name, create.columns[0..create.count]);
             table.live = true;
             table.pending_create = true;
-            self.oid_counter += 1;
+            // A primary key's index owns the next OID (pg_class relkind i).
+            self.oid_counter += 1 + @as(u32, @intFromBool(table.primary_column != null));
             tx.push(.{ .kind = .create_table, .table = @intCast(index) }) catch unreachable;
             var changes: [K.max_changes]K.Change = undefined;
             const count = try self.catalog.create(index, table, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
