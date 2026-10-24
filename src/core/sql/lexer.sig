@@ -158,6 +158,27 @@ pub const Keyword = enum {
     filter,
     window,
     lateral,
+    // DML, defaults, identity and sequences (design §5.10-§5.13).
+    returning,
+    conflict,
+    do,
+    nothing,
+    constraint,
+    sequence,
+    increment,
+    minvalue,
+    maxvalue,
+    cycle,
+    cache,
+    generated,
+    always,
+    identity,
+    overriding,
+    system,
+    stored,
+    no,
+    user,
+    value,
 };
 
 /// Words that cannot be unquoted identifiers.
@@ -166,6 +187,7 @@ pub fn reserved(keyword: Keyword) bool {
         .create, .drop, .insert, .select, .update, .delete, .table, .into, .values, .from, .where, .@"and", .@"or", .set, .order, .by, .asc, .desc, .limit, .is, .not, .@"null", .@"true", .@"false", .primary, .key, .case, .when, .then, .@"else", .end, .cast, .as, .in, .between, .like, .ilike, .@"for" => true,
         // PostgreSQL reserved and type_func_name keywords used by queries.
         .group, .having, .distinct, .on, .join, .inner, .left, .right, .full, .outer, .cross, .using, .natural, .@"union", .intersect, .except, .offset, .fetch, .only, .with, .all, .window, .lateral => true,
+        .returning, .do, .constraint, .default => true,
         else => false,
     };
 }

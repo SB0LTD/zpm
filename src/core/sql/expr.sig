@@ -441,6 +441,7 @@ pub fn Eval(comptime config: types.Config) type {
                     return hook.run(hook.ptr, ctx, id);
                 },
                 .aggregate => unreachable,
+                .values_row, .default_value => return error.Syntax,
                 .and_op, .or_op, .not_op, .test_op, .between, .in_list, .like => return boolCell(try truth(ctx, id)),
                 .unary => {
                     const value = try eval(ctx, n.a);

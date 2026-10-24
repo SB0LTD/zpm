@@ -788,6 +788,31 @@ pub fn Exec(comptime config: types.Config) type {
                 @memcpy(result.rows[index].cells[0..p.count], work.cells[offset..][0..p.count]);
             }
         }
+        /// Runs a bound general query and leaves its output rows in `work`
+        /// (INSERT ... SELECT); read them with rowAt until the next reset.
+        pub fn queryRows(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, plans: *const B.Plans, root: u16, snap: storage.Snapshot, session: *const value_module.Session, work: *Work) Error!List {
+            work.reset();
+            var runner: Query = .{ .tables = tables, .source = source, .pool = pool, .plans = plans, .snap = snap, .session = session, .work = work };
+            runner.hook = .{ .ptr = &runner, .run = Query.subquery };
+            return runner.run(root, null);
+        }
+
+        pub fn rowAt(work: *const Work, list: List, index: usize) [*]const V.Cell {
+            return work.cells[work.refs[list.start + index]..].ptr;
+        }
+
+        pub fn resetWork(work: *Work) void {
+            work.reset();
+        }
+
+        /// Reserves `count` statement-lifetime cells (RETURNING staging).
+        pub fn stageCells(work: *Work, count: usize) Error!usize {
+            if (work.cell_high - work.cell_low < count) return error.WorkspaceCapacity;
+            const at = work.cell_low;
+            work.cell_low += count;
+            return at;
+        }
+
         pub const Candidates = union(enum) { scan, empty, slot: u32 };
 
         /// WHERE keeps a row only when the predicate is TRUE.

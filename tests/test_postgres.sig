@@ -221,6 +221,107 @@ fn close(s: *Session, db: *DB, kind: u8, name: []const u8) ![]const u8 {
     return send(s, db, &p);
 }
 
+/// A Raw adapter with describe() that counts executions (design §5.10(d)).
+const Counting = struct {
+    pub const Result = Raw.Result;
+    raw: Raw = .{},
+    executions: usize = 0,
+    pub fn execute(self: *@This(), source: []const u8, result: *Result) !void {
+        self.executions += 1;
+        return self.raw.execute(source, result);
+    }
+    pub fn describe(self: *@This(), source: []const u8, result: *Result) !void {
+        return self.raw.describe(source, result);
+    }
+};
+const CountingSession = pg.Session(Counting);
+var counting_output: [CountingSession.responseCapacity()]u8 = undefined;
+fn countingSend(s: *CountingSession, db: *Counting, p: *Packet) ![]const u8 {
+    const bytes = p.slice();
+    const reply = try s.handle(db, bytes, &counting_output);
+    try check(reply.consumed == bytes.len and !reply.close);
+    packets += 1;
+    return counting_output[0..reply.written];
+}
+fn commandText(bytes: []const u8, wanted: []const u8) !void {
+    var frames: Frames = .{ .bytes = bytes };
+    while (try frames.next()) |f| if (f.tag == 'C') {
+        try check(equal(f.body[0 .. f.body.len - 1], wanted));
+        return;
+    };
+    return error.MissingCommandComplete;
+}
+/// Prepared INSERT ... RETURNING: Parse (with inference), Describe
+/// statement and portal, Bind, then Execute twice: the engine executes it
+/// exactly once and reports RowDescription, the row and INSERT 0 1.
+fn returningOnce() !void {
+    var db: Counting = .{};
+    var s: CountingSession = .{};
+    var p = Packet.init(0);
+    p.len = 4;
+    p.number32(196608);
+    p.string("user");
+    p.string("ramsql");
+    p.byte(0);
+    put32(p.bytes[0..4], @intCast(p.len));
+    const ready = try s.handle(&db, p.bytes[0..p.len], &counting_output);
+    try check(ready.consumed == p.len and s.startup);
+    var q = Packet.init('Q');
+    q.string("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)");
+    try tags(try countingSend(&s, &db, &q), "CZ");
+    db.executions = 0;
+    var parse_packet = Packet.init('P');
+    parse_packet.string("ins");
+    parse_packet.string("INSERT INTO notes VALUES ($1, $2) RETURNING id, body || '!' AS shout");
+    parse_packet.number16(2);
+    parse_packet.number32(0);
+    parse_packet.number32(0);
+    try tags(try countingSend(&s, &db, &parse_packet), "1");
+    var describe_statement = Packet.init('D');
+    describe_statement.byte('S');
+    describe_statement.string("ins");
+    try tags(try countingSend(&s, &db, &describe_statement), "tT");
+    try check(s.result.column_count == 2 and equal(s.result.column_names[1].slice(), "shout"));
+    var bind_packet = Packet.init('B');
+    bind_packet.string("");
+    bind_packet.string("ins");
+    bind_packet.number16(0);
+    bind_packet.number16(2);
+    bind_packet.number32(1);
+    bind_packet.append("7");
+    bind_packet.number32(5);
+    bind_packet.append("hello");
+    bind_packet.number16(0);
+    try tags(try countingSend(&s, &db, &bind_packet), "2");
+    var describe_portal = Packet.init('D');
+    describe_portal.byte('P');
+    describe_portal.string("");
+    try tags(try countingSend(&s, &db, &describe_portal), "T");
+    try check(db.executions == 0);
+    var execute_packet = Packet.init('E');
+    execute_packet.string("");
+    execute_packet.number32(0);
+    const executed = try countingSend(&s, &db, &execute_packet);
+    try tags(executed, "DC");
+    try commandText(executed, "INSERT 0 1");
+    var frames: Frames = .{ .bytes = executed };
+    const row = (try frames.next()).?;
+    try check(equal(row.body, "\x00\x02\x00\x00\x00\x017\x00\x00\x00\x06hello!"));
+    try check(db.executions == 1);
+    // A completed portal replays its tag without executing again.
+    var again = Packet.init('E');
+    again.string("");
+    again.number32(0);
+    try tags(try countingSend(&s, &db, &again), "C");
+    try check(db.executions == 1);
+    var sync_packet = Packet.init('S');
+    try tags(try countingSend(&s, &db, &sync_packet), "Z");
+    var count = Packet.init('Q');
+    count.string("SELECT COUNT(*) FROM notes");
+    const counted = try countingSend(&s, &db, &count);
+    try tags(counted, "TDCZ");
+    try check(s.result.rows[0].cells[0].integer == 1);
+}
 fn normal() !void {
     var db: DB = .{};
     var s: Session = .{};
@@ -755,6 +856,7 @@ fn storeContracts() !void {
 
 pub fn main(init: std.process.Init) !void {
     try storeContracts();
+    try returningOnce();
     try normal();
     try extended();
     try inference();

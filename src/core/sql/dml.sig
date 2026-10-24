@@ -41,11 +41,24 @@ pub fn Dml(comptime config: types.Config) type {
             return cell;
         }
 
+        /// The column default for an unlisted column or a DEFAULT item.
+        fn defaultCell(ctx: *E.Context, table: *const S.Table, column: usize) Error!V.Cell {
+            _ = ctx;
+            _ = table;
+            _ = column;
+            return .null_value;
+        }
+
+        fn isDefault(ctx: *const E.Context, id: u16) bool {
+            return id == none or ctx.pool.nodes[id].kind == .default_value;
+        }
+
+        /// `values[c]` none or a default_value node takes the column default.
         pub fn insertedRow(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16) Error!E.Row {
             var cells: E.Row = @splat(.null_value);
             ctx.row = null;
             for (table.columns[0..table.column_count], 0..) |*column, index| {
-                const evaluated: V.Cell = if (values[index] == none) .null_value else try E.eval(ctx, values[index]);
+                const evaluated: V.Cell = if (isDefault(ctx, values[index])) try defaultCell(ctx, table, index) else try E.eval(ctx, values[index]);
                 cells[index] = try store(column, evaluated, ctx.session);
             }
             return cells;
@@ -57,7 +70,9 @@ pub fn Dml(comptime config: types.Config) type {
             ctx.row = old;
             for (table.columns[0..table.column_count], 0..) |*column, index| {
                 if (values[index] == none) continue;
-                cells[index] = try store(column, try E.eval(ctx, values[index]), ctx.session);
+                const evaluated: V.Cell = if (isDefault(ctx, values[index])) try defaultCell(ctx, table, index) else try E.eval(ctx, values[index]);
+                ctx.row = old;
+                cells[index] = try store(column, evaluated, ctx.session);
             }
             return cells;
         }

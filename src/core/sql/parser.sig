@@ -464,17 +464,64 @@ pub fn Parser(comptime config: types.Config) type {
                 }
                 try self.expectSymbol(.rparen);
             }
-            try self.expectWord("VALUES");
-            try self.expectSymbol(.lparen);
-            while (true) {
-                if (out.value_count == config.columns) return error.Syntax;
-                out.values[out.value_count] = try self.expression();
-                out.value_count += 1;
-                if (!try self.takeSymbol(.comma)) break;
+            if (self.mode == .standard and try self.takeWord("DEFAULT")) {
+                try self.expectWord("VALUES");
+                out.source = .default_values;
+            } else if (self.mode == .standard and (self.isWord("SELECT") or self.isWord("WITH"))) {
+                out.source = .query;
+                out.query = try self.query();
+            } else {
+                try self.expectWord("VALUES");
+                var previous: u16 = none;
+                while (true) {
+                    try self.expectSymbol(.lparen);
+                    const row = try self.pool.add(.{ .kind = .values_row });
+                    var last: u16 = none;
+                    var items: usize = 0;
+                    while (true) {
+                        if (items == config.columns) return error.Syntax;
+                        const item = try self.valueItem();
+                        if (last == none) self.pool.nodes[row].b = item else self.pool.nodes[last].next = item;
+                        last = item;
+                        items += 1;
+                        if (!try self.takeSymbol(.comma)) break;
+                    }
+                    try self.expectSymbol(.rparen);
+                    self.pool.nodes[row].integer = @intCast(items);
+                    if (previous == none) out.rows = row else self.pool.nodes[previous].next = row;
+                    previous = row;
+                    out.row_count += 1;
+                    if (self.mode != .standard or !try self.takeSymbol(.comma)) break;
+                }
             }
-            try self.expectSymbol(.rparen);
+            try self.returningClause(&out.returning);
             try self.finish();
             return out;
+        }
+
+        /// An INSERT VALUES item or SET value: an expression or DEFAULT.
+        fn valueItem(self: *Self) Error!u16 {
+            if (self.mode == .standard and try self.takeWord("DEFAULT")) return self.pool.add(.{ .kind = .default_value });
+            return self.expression();
+        }
+
+        /// RETURNING targets: `*`, `t.*` or expressions with aliases.
+        fn returningClause(self: *Self, out: *Ast.Returning) Error!void {
+            if (self.mode != .standard or !try self.takeWord("RETURNING")) return;
+            while (true) {
+                if (out.count == config.columns) return error.ColumnCapacity;
+                var target: Ast.Target = .{};
+                if (try self.takeSymbol(.star)) {
+                    target.star = true;
+                } else {
+                    target.expr = try self.expression();
+                    const n = &self.pool.nodes[target.expr];
+                    if (n.kind == .column and n.star) target.star = true else target.alias = try self.bareAlias();
+                }
+                out.targets[out.count] = target;
+                out.count += 1;
+                if (!try self.takeSymbol(.comma)) break;
+            }
         }
 
         fn where(self: *Self) Error!u16 {
@@ -777,11 +824,12 @@ pub fn Parser(comptime config: types.Config) type {
                 if (out.count == config.columns) return error.DuplicateColumn;
                 const column = try self.identifier();
                 try self.expectSymbol(.eq);
-                out.assignments[out.count] = .{ .column = column, .value = try self.expression() };
+                out.assignments[out.count] = .{ .column = column, .value = try self.valueItem() };
                 out.count += 1;
                 if (!try self.takeSymbol(.comma)) break;
             }
             out.where = try self.where();
+            try self.returningClause(&out.returning);
             try self.finish();
             return out;
         }
@@ -790,6 +838,7 @@ pub fn Parser(comptime config: types.Config) type {
             try self.expectWord("FROM");
             var out: Ast.Delete = .{ .table = try self.identifier() };
             out.where = try self.where();
+            try self.returningClause(&out.returning);
             try self.finish();
             return out;
         }

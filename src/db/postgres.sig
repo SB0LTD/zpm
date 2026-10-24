@@ -442,7 +442,7 @@ pub fn Session(comptime DB: type) type {
                     try r.done();
                     if (limit > 0x7fffffff) return error.ProtocolViolation;
                     const p = try self.portal(name);
-                    if (!word(p.source(), "select") and p.format_count > 1) return error.ProtocolViolation;
+
                     const index = (@intFromPtr(p) - @intFromPtr(&self.portals[0])) / @sizeOf(Portal);
                     if (self.active_portal) |active| {
                         if (active != index) return error.PortalBusy;

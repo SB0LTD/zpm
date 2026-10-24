@@ -283,7 +283,18 @@ pub fn Database(comptime config: Config) type {
             }
         };
 
-        pub const Outcome = struct { affected: usize = 0, command: CommandTag = .none };
+        /// RETURNING rows of a completed mutation, staged in the statement
+        /// workspace (`rows` x `count` cells at `base`) until written.
+        pub const Returned = struct {
+            count: usize = 0,
+            rows: usize = 0,
+            base: usize = 0,
+            names: [config.columns]Name = @splat(.{}),
+            types: [config.columns]DataType = @splat(.integer),
+            typmods: [config.columns]i32 = @splat(-1),
+        };
+
+        pub const Outcome = struct { affected: usize = 0, command: CommandTag = .none, returning: Returned = .{} };
 
         /// Statement-scoped scratch inside caller-owned database storage.
         pub const Workspace = struct {
@@ -445,6 +456,16 @@ pub fn Database(comptime config: Config) type {
             if (self.outcome.command == .select) return;
             result.clear(self.outcome.affected);
             result.command = self.outcome.command;
+            const returned = &self.outcome.returning;
+            if (returned.count == 0) return;
+            result.column_count = returned.count;
+            @memcpy(result.column_names[0..returned.count], returned.names[0..returned.count]);
+            @memcpy(result.column_types[0..returned.count], returned.types[0..returned.count]);
+            @memcpy(result.column_typmods[0..returned.count], returned.typmods[0..returned.count]);
+            result.row_count = returned.rows;
+            for (0..returned.rows) |row| {
+                @memcpy(result.rows[row].cells[0..returned.count], self.workspace.query.cells[returned.base + row * returned.count ..][0..returned.count]);
+            }
         }
 
         // ---- transactions -------------------------------------------------
@@ -739,7 +760,7 @@ pub fn Database(comptime config: Config) type {
                 .drop_table => |index| try self.dropTable(slot, index, snap),
                 .insert => |*insert| blk: {
                     try self.lockTable(slot, insert.table, .row_exclusive);
-                    break :blk try self.insertRow(slot, source, insert, snap);
+                    break :blk try self.insertRows(slot, source, insert, snap);
                 },
                 .update => |*update| blk: {
                     try self.lockTable(slot, update.table, .row_exclusive);
@@ -752,6 +773,50 @@ pub fn Database(comptime config: Config) type {
                 .select, .query, .control => unreachable,
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound) };
+            switch (bound) {
+                .insert => |*insert| if (insert.returning.count != 0) try self.returnRows(slot, source, &insert.returning, insert.table, insert.plan == ast.none),
+                .update => |*update| if (update.returning.count != 0) try self.returnRows(slot, source, &update.returning, update.table, true),
+                .delete => |*delete| if (delete.returning.count != 0) try self.returnRows(slot, source, &delete.returning, delete.table, true),
+                else => {},
+            }
+        }
+
+        /// RETURNING: one row per row this statement wrote, in write order
+        /// (new versions for INSERT/UPDATE, the deleted version for DELETE).
+        /// The statement's write slice survives a park, so a resumed
+        /// statement emits every row exactly once. Every value is computed
+        /// into the workspace first; a failure leaves the result untouched.
+        fn returnRows(self: *Self, slot: u16, source: []const u8, list: *const B.Returning, table_index: usize, fresh: bool) Error!void {
+            const tx = &self.txs[slot];
+            const start = tx.subs[tx.sub_len - 1].write_start;
+            const writes = tx.writes[start..tx.write_len];
+            var count: usize = 0;
+            for (writes) |entry| if (rowWrite(entry.kind) and entry.table == table_index) {
+                count += 1;
+            };
+            if (count > types.resultRows(config)) return error.RowCapacity;
+            const work = &self.workspace.query;
+            if (fresh) X.resetWork(work);
+            const width = list.count;
+            const base = try X.stageCells(work, count * width);
+            var ctx = self.evalContext(source);
+            const table = &self.tables[table_index];
+            var row: usize = 0;
+            for (writes) |entry| {
+                if (!rowWrite(entry.kind) or entry.table != table_index) continue;
+                ctx.row = &table.versions[if (entry.kind == .delete) entry.old else entry.new].cells;
+                for (list.targets[0..width], 0..) |id, column| work.cells[base + row * width + column] = try E.eval(&ctx, id);
+                row += 1;
+            }
+            var returned: Returned = .{ .count = width, .rows = count, .base = base };
+            @memcpy(returned.names[0..width], list.names[0..width]);
+            @memcpy(returned.types[0..width], list.types[0..width]);
+            @memcpy(returned.typmods[0..width], list.typmods[0..width]);
+            self.outcome.returning = returned;
+        }
+
+        fn rowWrite(kind: anytype) bool {
+            return kind == .insert or kind == .update or kind == .delete;
         }
 
         /// Reclamation horizon: no pinned snapshot can see a version whose
@@ -913,11 +978,55 @@ pub fn Database(comptime config: Config) type {
             return 0;
         }
 
-        fn insertRow(self: *Self, slot: u16, source: []const u8, insert: *const B.Insert, snap: Snapshot) Error!usize {
+        /// Inserts every VALUES row, SELECT row or the DEFAULT VALUES row in
+        /// order. A resumed statement skips the rows it already inserted
+        /// (its write slice holds them).
+        fn insertRows(self: *Self, slot: u16, source: []const u8, insert: *const B.Insert, snap: Snapshot) Error!usize {
             const tx = &self.txs[slot];
-            const table = &self.tables[insert.table];
+            const start = tx.subs[tx.sub_len - 1].write_start;
+            var done: usize = 0;
+            for (tx.writes[start..tx.write_len]) |entry| if (entry.kind == .insert) {
+                done += 1;
+            };
             var ctx = self.evalContext(source);
-            const cells = try D.insertedRow(&ctx, table, &insert.values);
+            var position: usize = 0;
+            if (insert.plan != ast.none) {
+                const work = &self.workspace.query;
+                const rows = try X.queryRows(&self.tables, source, &self.workspace.nodes, &self.workspace.plans, insert.plan, snap, &self.session, work);
+                for (0..rows.count) |index| {
+                    if (position >= done) {
+                        ctx.tuple[1] = X.rowAt(work, rows, index);
+                        try self.insertOne(slot, &ctx, insert.table, &insert.values, snap);
+                    }
+                    position += 1;
+                }
+            } else if (insert.rows == ast.none) {
+                if (done == 0) try self.insertOne(slot, &ctx, insert.table, &insert.values, snap);
+                position = 1;
+            } else {
+                const nodes = &self.workspace.nodes.nodes;
+                var row = insert.rows;
+                while (row != ast.none) : (row = nodes[row].next) {
+                    if (position >= done) {
+                        var values: [config.columns]u16 = @splat(ast.none);
+                        var item = nodes[row].b;
+                        var item_index: usize = 0;
+                        while (item != ast.none) : (item = nodes[item].next) {
+                            values[insert.mapping[item_index]] = item;
+                            item_index += 1;
+                        }
+                        try self.insertOne(slot, &ctx, insert.table, &values, snap);
+                    }
+                    position += 1;
+                }
+            }
+            return position;
+        }
+
+        fn insertOne(self: *Self, slot: u16, ctx: *E.Context, table_index: usize, values: *const [config.columns]u16, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            const table = &self.tables[table_index];
+            const cells = try D.insertedRow(ctx, table, values);
             if (table.primary_column) |column| switch (D.keyCheck(table, &cells[column], 0xffffffff, snap)) {
                 .free => {},
                 .taken => return error.PrimaryKeyViolation,
@@ -938,8 +1047,7 @@ pub fn Database(comptime config: Config) type {
             table.versions[version] = .{ .row = row + 1, .xmin = tx.ref(slot), .xmin_cid = snap.cid, .cells = cells };
             table.rows[row].newest = version + 1;
             S.indexKey(table, version);
-            tx.push(.{ .kind = .insert, .table = @intCast(insert.table), .new = version }) catch unreachable;
-            return 1;
+            tx.push(.{ .kind = .insert, .table = @intCast(table_index), .new = version }) catch unreachable;
         }
 
         /// Rows are visited in rowid order and updated one at a time, as a
@@ -1186,6 +1294,18 @@ pub fn Database(comptime config: Config) type {
             const bound = try B.bind(&context, &parsed);
             result.clear(0);
             result.command = B.command(&bound);
+            const returning: ?*const B.Returning = switch (bound) {
+                .insert => |*insert| &insert.returning,
+                .update => |*update| &update.returning,
+                .delete => |*delete| &delete.returning,
+                else => null,
+            };
+            if (returning) |list| {
+                result.column_count = list.count;
+                @memcpy(result.column_names[0..list.count], list.names[0..list.count]);
+                @memcpy(result.column_types[0..list.count], list.types[0..list.count]);
+                @memcpy(result.column_typmods[0..list.count], list.typmods[0..list.count]);
+            }
             if (bound == .select) {
                 result.column_count = bound.select.count;
                 for (0..bound.select.count) |index| {

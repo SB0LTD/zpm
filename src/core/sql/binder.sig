@@ -41,8 +41,30 @@ pub fn Binder(comptime config: types.Config) type {
             count: usize,
         };
 
-        /// `values[c]` is the expression assigned to column c, or none (NULL).
-        pub const Insert = struct { table: usize, values: [config.columns]u16 };
+        /// RETURNING output columns, evaluated over one table row (relation 0).
+        pub const Returning = struct {
+            targets: [config.columns]u16 = undefined,
+            names: [config.columns]V.Name = undefined,
+            types: [config.columns]types.DataType = undefined,
+            typmods: [config.columns]i32 = undefined,
+            count: usize = 0,
+        };
+
+        /// VALUES: `rows` is the first values_row node; item p of every row
+        /// is assigned to column mapping[p] (a default_value item, or an
+        /// unlisted column, takes the column default). INSERT ... SELECT:
+        /// `plan` is the root plan and `values[c]` reads its output row as
+        /// relation 1. DEFAULT VALUES: neither (one row of defaults).
+        pub const Insert = struct {
+            table: usize,
+            rows: u16 = none,
+            row_count: usize = 0,
+            mapping: [config.columns]u8 = undefined,
+            count: usize = 0,
+            plan: u16 = none,
+            values: [config.columns]u16 = @splat(none),
+            returning: Returning = .{},
+        };
 
         pub const Key = struct { expr: u16, descending: bool, nulls_first: ?bool };
 
@@ -62,10 +84,11 @@ pub fn Binder(comptime config: types.Config) type {
             lock: ast.Locking = .{},
         };
 
-        /// `values[c]` is the expression assigned to column c, or none.
-        pub const Update = struct { table: usize, values: [config.columns]u16, where: u16, key: u16 };
+        /// `values[c]` is the expression assigned to column c (a
+        /// default_value node for SET c = DEFAULT), or none.
+        pub const Update = struct { table: usize, values: [config.columns]u16, where: u16, key: u16, returning: Returning = .{} };
 
-        pub const Delete = struct { table: usize, where: u16, key: u16 };
+        pub const Delete = struct { table: usize, where: u16, key: u16, returning: Returning = .{} };
 
         pub const Bound = union(enum) {
             create_table: Create,
@@ -645,6 +668,8 @@ pub fn Binder(comptime config: types.Config) type {
                     n.ty = .numeric;
                 },
                 .param => return error.UndefinedParameter,
+                // DEFAULT outside an INSERT VALUES item or SET value (42601).
+                .values_row, .default_value => return error.Syntax,
                 .function => try typeFunction(context, scope, n),
                 .when_arm => unreachable,
                 .column => {
@@ -1018,6 +1043,85 @@ pub fn Binder(comptime config: types.Config) type {
                 .column, .cast => n.typmod,
                 else => -1,
             };
+        }
+
+        /// RETURNING over the target table's row (`*`, `t.*`, expressions).
+        fn bindReturning(context: *const Context, index: usize, list: *const Ast.Returning) Error!Returning {
+            var out: Returning = .{};
+            if (list.count == 0) return out;
+            const scope = tableScope(context, index);
+            const entry = &context.tables[index];
+            for (list.targets[0..list.count]) |*target| {
+                if (target.star) {
+                    if (target.expr != none) {
+                        const qualifier = toName(context, context.node(target.expr).qualifier);
+                        if (!types.same(qualifier.slice(), entry.name.slice())) return error.TableNotFound;
+                    }
+                    for (entry.columns[0..entry.column_count], 0..) |*column, position| {
+                        if (out.count == config.columns) return error.ColumnCapacity;
+                        out.targets[out.count] = try context.pool.add(.{ .kind = .column, .column = @intCast(position), .ty = types.typeOfData(column.data_type), .typmod = column.typmod });
+                        out.names[out.count] = column.name;
+                        out.types[out.count] = column.data_type;
+                        out.typmods[out.count] = column.typmod;
+                        out.count += 1;
+                    }
+                    continue;
+                }
+                if (out.count == config.columns) return error.ColumnCapacity;
+                try valueExpr(context, &scope, target.expr);
+                out.targets[out.count] = target.expr;
+                out.names[out.count] = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
+                out.types[out.count] = types.dataTypeOf(context.node(target.expr).ty);
+                out.typmods[out.count] = outputTypmod(context, target.expr);
+                out.count += 1;
+            }
+            return out;
+        }
+
+        fn bindValues(context: *const Context, entry: *const S.Table, out: *Insert) Error!void {
+            const empty: Scope = .{};
+            var row = out.rows;
+            while (row != none) : (row = context.node(row).next) {
+                if (context.node(row).integer != out.count) return error.Syntax;
+                var previous: u16 = none;
+                var item = context.node(row).b;
+                var position: usize = 0;
+                while (item != none) : (position += 1) {
+                    const next = context.node(item).next;
+                    var converted = item;
+                    if (context.node(item).kind != .default_value) {
+                        try typeExpr(context, &empty, item);
+                        converted = try assignment(context, item, &entry.columns[out.mapping[position]]);
+                    }
+                    if (converted != item) {
+                        context.node(converted).next = next;
+                        context.node(item).next = none;
+                        if (previous == none) context.node(row).b = converted else context.node(previous).next = converted;
+                    }
+                    previous = converted;
+                    item = next;
+                }
+            }
+        }
+
+        /// INSERT ... SELECT: untyped output literals take the target column
+        /// type (PostgreSQL does not resolve unknowns in an INSERT's SELECT).
+        fn bindInsertQuery(context: *const Context, entry: *const S.Table, query_index: u16, out: *Insert) Error!void {
+            const plans = context.plans orelse return error.UnsupportedStatement;
+            plans.reset();
+            const root = try bindPlan(context, query_index, null, null, true);
+            const p = &plans.items[root];
+            if (p.count != out.count) return error.Syntax;
+            for (0..p.count) |position| if (p.tys[position] == .unknown) {
+                try castColumn(context, root, position, types.typeOfData(entry.columns[out.mapping[position]].data_type));
+            };
+            try resolveUnknown(context, root);
+            for (0..p.count) |position| {
+                const column = out.mapping[position];
+                const id = try context.pool.add(.{ .kind = .column, .relation = 1, .column = @intCast(position), .ty = p.tys[position], .typmod = p.typmods[position] });
+                out.values[column] = try assignment(context, id, &entry.columns[column]);
+            }
+            out.plan = root;
         }
 
         fn bindSelect(context: *const Context, select: *const Ast.Select) Error!Select {
@@ -1882,6 +1986,7 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         pub fn bind(context: *const Context, statement: *const Ast.Statement) Error!Bound {
+            if (context.plans) |plans| plans.reset();
             switch (statement.*) {
                 .create_table => |*create| {
                     const table_name = toName(context, create.name);
@@ -1916,15 +2021,14 @@ pub fn Binder(comptime config: types.Config) type {
                         count = entry.column_count;
                         for (0..count) |column| mapping[column] = column;
                     }
-                    if (insert.value_count != count) return error.Syntax;
-                    var out: Insert = .{ .table = index, .values = @splat(none) };
-                    const empty: Scope = .{};
-                    for (0..count) |position| {
-                        const id = insert.values[position];
-                        const column = mapping[position];
-                        try typeExpr(context, &empty, id);
-                        out.values[column] = try assignment(context, id, &entry.columns[column]);
+                    var out: Insert = .{ .table = index, .count = count, .rows = insert.rows, .row_count = insert.row_count };
+                    for (0..count) |position| out.mapping[position] = @intCast(mapping[position]);
+                    switch (insert.source) {
+                        .values => try bindValues(context, entry, &out),
+                        .query => try bindInsertQuery(context, entry, insert.query, &out),
+                        .default_values => if (insert.explicit_columns) return error.Syntax,
                     }
+                    out.returning = try bindReturning(context, index, &insert.returning);
                     return .{ .insert = out };
                 },
                 .select => |index| return .{ .select = try bindSelect(context, &context.pool.queries[index]) },
@@ -1943,18 +2047,24 @@ pub fn Binder(comptime config: types.Config) type {
                     for (update.assignments[0..update.count]) |*item| {
                         const column = try columnIndex(context, entry, item.column);
                         if (out.values[column] != none) return error.DuplicateColumn;
+                        if (context.node(item.value).kind == .default_value) {
+                            out.values[column] = item.value;
+                            continue;
+                        }
                         try typeExpr(context, &scope, item.value);
                         out.values[column] = try assignment(context, item.value, &entry.columns[column]);
                     }
                     out.where = try bindWhere(context, &scope, update.where);
                     out.key = primaryKey(context, entry, out.where);
+                    out.returning = try bindReturning(context, index, &update.returning);
                     return .{ .update = out };
                 },
                 .delete => |*delete| {
                     const index = try resolveTable(context, delete.table);
                     const scope = tableScope(context, index);
                     const where = try bindWhere(context, &scope, delete.where);
-                    return .{ .delete = .{ .table = index, .where = where, .key = primaryKey(context, &context.tables[index], where) } };
+                    const returning = try bindReturning(context, index, &delete.returning);
+                    return .{ .delete = .{ .table = index, .where = where, .key = primaryKey(context, &context.tables[index], where), .returning = returning } };
                 },
                 .control => |control| return .{ .control = control },
             }

@@ -85,6 +85,10 @@ pub const NodeKind = enum {
     exists_subquery,
     /// `a` [NOT] IN (SELECT ...).
     in_subquery,
+    /// One INSERT VALUES row: items `b` -> next; rows are linked by `next`.
+    values_row,
+    /// The DEFAULT keyword as an INSERT VALUES item or SET value.
+    default_value,
 };
 
 /// Children by kind: unary/not/test/cast `a`; binary/and/or/nullif `a`,`b`;
@@ -193,19 +197,32 @@ pub fn Ast(comptime config: types.Config) type {
             count: usize = 0,
         };
 
+        pub const Target = struct {
+            expr: u16 = none,
+            star: bool = false,
+            alias: ?Ident = null,
+        };
+
+        /// RETURNING target list (count 0: none).
+        pub const Returning = struct {
+            targets: [config.columns]Target = undefined,
+            count: usize = 0,
+        };
+
+        pub const InsertSource = enum { values, query, default_values };
+
         pub const Insert = struct {
             table: Ident = .{},
             explicit_columns: bool = false,
             columns: [config.columns]Ident = undefined,
             column_count: usize = 0,
-            values: [config.columns]u16 = undefined,
-            value_count: usize = 0,
-        };
-
-        pub const Target = struct {
-            expr: u16 = none,
-            star: bool = false,
-            alias: ?Ident = null,
+            source: InsertSource = .values,
+            /// First values_row node (VALUES rows linked by `next`).
+            rows: u16 = none,
+            row_count: usize = 0,
+            /// INSERT ... SELECT: index into Pool.queries.
+            query: u16 = none,
+            returning: Returning = .{},
         };
 
         pub const OrderKey = struct {
@@ -282,11 +299,13 @@ pub fn Ast(comptime config: types.Config) type {
             assignments: [config.columns]Assignment = undefined,
             count: usize = 0,
             where: u16 = none,
+            returning: Returning = .{},
         };
 
         pub const Delete = struct {
             table: Ident = .{},
             where: u16 = none,
+            returning: Returning = .{},
         };
 
         pub const Statement = union(enum) {
