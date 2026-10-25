@@ -801,11 +801,7 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn repeatable(self: *const Query) bool {
-                for (self.pool.nodes[0..self.pool.len]) |node| switch (node.kind) {
-                    .function, .scalar_subquery, .exists_subquery, .in_subquery => return false,
-                    else => {},
-                };
-                return true;
+                return repeatablePool(self.pool);
             }
 
             // ---- set operations and CTEs -------------------------------
@@ -1090,6 +1086,30 @@ pub fn Exec(comptime config: types.Config) type {
             return pool.nodes[id].kind == .column;
         }
 
+        fn repeatablePool(pool: *const Ast.Pool) bool {
+            for (pool.nodes[0..pool.len]) |node| switch (node.kind) {
+                .function, .scalar_subquery, .exists_subquery, .in_subquery => return false,
+                else => {},
+            };
+            return true;
+        }
+
+        /// A strict leading column makes later column sort keys irrelevant.
+        /// A visible subset of this physical order remains ordered at every
+        /// snapshot. NULLs/ties/key updates invalidate the stored proof.
+        fn layoutOrder(table: *const S.Table, pool: *const Ast.Pool, query: *const B.Select) ?bool {
+            const node = &pool.nodes[query.order[0].expr];
+            const reverse = switch (table.column_order[node.column].state) {
+                .increasing => query.order[0].descending,
+                .decreasing => !query.order[0].descending,
+                .one => if (table.row_high <= 1) false else return null,
+                .empty => if (table.row_high == 0) false else return null,
+                .unordered => return null,
+            };
+            if (!repeatablePool(pool)) return null;
+            return reverse;
+        }
+
         const Sorter = struct {
             ctx: *E.Context,
             table: *const S.Table,
@@ -1142,6 +1162,92 @@ pub fn Exec(comptime config: types.Config) type {
             }
         };
 
+        const IntegerKey = struct { rank: u64, null_rank: bool };
+        const IntegerEntry = struct {
+            keys: [config.columns]IntegerKey = undefined,
+            version: u32,
+            ordinal: u32,
+        };
+        const IntegerOrder = struct { column: u16, descending: bool, nulls_first: bool };
+        const IntegerSorter = struct {
+            entries: []const IntegerEntry,
+            count: usize,
+            session: *const value_module.Session,
+            pub fn order(self: *const IntegerSorter, left: u32, right: u32) Error!i8 {
+                try self.session.checkpoint();
+                const a = &self.entries[left];
+                const b = &self.entries[right];
+                for (0..self.count) |column| {
+                    const x = a.keys[column];
+                    const y = b.keys[column];
+                    if (x.null_rank != y.null_rank) return if (x.null_rank) 1 else -1;
+                    if (x.rank != y.rank) return if (x.rank < y.rank) -1 else 1;
+                }
+                return if (a.ordinal < b.ordinal) -1 else if (a.ordinal > b.ordinal) 1 else 0;
+            }
+        };
+
+        fn integerOrder(pool: *const Ast.Pool, query: *const B.Select) bool {
+            for (query.order[0..query.order_count]) |key| {
+                const node = &pool.nodes[key.expr];
+                if (node.kind != .column or !value_module.integral(node.ty)) return false;
+            }
+            return query.order_count != 0;
+        }
+
+        /// Evaluate column keys once per qualifying row, then compare compact
+        /// cached ranks. The heap moves only slot IDs; one spare key slot is
+        /// recycled on rejection/replacement. NULL placement and stable row-slot
+        /// order match Sorter/StableSorter. Keep this stack frame off point reads.
+        noinline fn integerTopK(ctx: *E.Context, table: *const S.Table, query: *const B.Select, snap: storage.Snapshot, indices: []u32) Error!usize {
+            var entries: [types.workRows(config) + 1]IntegerEntry = undefined;
+            var keys: [config.columns]IntegerOrder = undefined;
+            for (query.order[0..query.order_count], 0..) |key, column| keys[column] = .{
+                .column = ctx.pool.nodes[key.expr].column,
+                .descending = key.descending,
+                .nulls_first = key.nulls_first orelse (config.nulls_first_ascending != key.descending),
+            };
+            const count: usize = @intCast(query.limit);
+            if (count == 0) return 0;
+            var used: usize = 0;
+            var spare: u32 = @intCast(count);
+            const sorter: IntegerSorter = .{ .entries = &entries, .count = query.order_count, .session = ctx.session };
+            rows: for (0..table.row_high) |slot| {
+                try ctx.session.checkpoint();
+                const version = S.visibleAt(table, slot, snap) orelse continue;
+                if (!try keep(ctx, query.where, &table.versions[version].cells)) continue;
+                const candidate: u32 = if (used < count) @intCast(used) else spare;
+                const entry = &entries[candidate];
+                entry.version = version;
+                entry.ordinal = table.versions[version].row;
+                const full = used == count;
+                var relation: i8 = 0;
+                for (keys[0..query.order_count], 0..) |key, column| {
+                    const value = &table.versions[version].cells[key.column];
+                    const is_null = value.* == .null_value;
+                    var rank: u64 = if (is_null) 0 else @as(u64, @bitCast(value.integer)) ^ 0x8000000000000000;
+                    if (!is_null and key.descending) rank = ~rank;
+                    const normalized: IntegerKey = .{ .rank = rank, .null_rank = if (is_null) !key.nulls_first else key.nulls_first };
+                    // The cached heap root is the worst retained row. Reject
+                    // at its first decisive column before reading later keys
+                    // or writing a spare entry for a losing candidate.
+                    if (full and relation == 0) {
+                        const worst = entries[indices[0]].keys[column];
+                        relation = if (normalized.null_rank != worst.null_rank)
+                            (if (normalized.null_rank) @as(i8, 1) else -1)
+                        else if (normalized.rank < worst.rank) -1 else if (normalized.rank > worst.rank) 1 else 0;
+                        if (relation > 0) continue :rows;
+                    }
+                    entry.keys[column] = normalized;
+                }
+                if (full and relation == 0 and entry.ordinal >= entries[indices[0]].ordinal) continue;
+                const removed = try sort_module.offerTopKSlot(indices[0..count], &used, candidate, &sorter);
+                if (full) spare = removed;
+            }
+            for (indices[0..used]) |*id| id.* = entries[id.*].version;
+            return used;
+        }
+
         /// `locker` (FOR UPDATE/SHARE) runs after ORDER BY and before LIMIT, as
         /// PostgreSQL's LockRows does: it returns the version to emit (the
         /// newest committed one, whose WHERE is re-checked here when it
@@ -1172,6 +1278,7 @@ pub fn Exec(comptime config: types.Config) type {
             var found: usize = 0;
             var column_order = true;
             for (query.order[0..query.order_count]) |key| column_order = column_order and simple(pool, key.expr);
+            const layout_reverse: ?bool = if (!locking and column_order and query.order_count != 0 and query.limit <= indices.len) layoutOrder(table, pool, query) else null;
             const top_k = !locking and column_order and query.order_count != 0 and query.limit <= indices.len and (query.limit < table.row_high / 2 or table.row_high > indices.len);
             const sorter: Sorter = .{ .ctx = &ctx, .table = table, .query = query };
             const stable: StableSorter = .{ .base = &sorter };
@@ -1184,7 +1291,21 @@ pub fn Exec(comptime config: types.Config) type {
                         found = 1;
                     }
                 },
-                .scan => for (0..table.row_high) |slot| {
+                .scan => if (layout_reverse) |reverse| {
+                    var offset: usize = 0;
+                    while (offset < table.row_high) : (offset += 1) {
+                        try session.checkpoint();
+                        const slot = if (reverse) table.row_high - 1 - offset else offset;
+                        const version = S.visibleAt(table, slot, snap) orelse continue;
+                        if (!try keep(&ctx, query.where, &table.versions[version].cells)) continue;
+                        if (found == indices.len) return error.WorkspaceCapacity;
+                        indices[found] = version;
+                        found += 1;
+                        if (found >= query.limit) break;
+                    }
+                } else if (top_k and integerOrder(pool, query)) {
+                    found = try integerTopK(&ctx, table, query, snap, &indices);
+                } else for (0..table.row_high) |slot| {
                     try session.checkpoint();
                     const version = S.visibleAt(table, slot, snap) orelse continue;
                     if (!try keep(&ctx, query.where, &table.versions[version].cells)) continue;
@@ -1198,7 +1319,7 @@ pub fn Exec(comptime config: types.Config) type {
                     if (!locking and query.order_count == 0 and found >= query.limit) break;
                 },
             };
-            if (query.order_count != 0 and found != 0) {
+            if (query.order_count != 0 and found != 0 and layout_reverse == null) {
                 // Sort keys are evaluated for every candidate row, so an
                 // erroring key fails even when one row (or none) is compared.
                 for (query.order[0..query.order_count]) |*key| if (!simple(pool, key.expr)) {

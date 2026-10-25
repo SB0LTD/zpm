@@ -9,7 +9,14 @@ const types = @import("types.sig");
 /// includes a stable ordinal when equal keys must retain scan order. Empty
 /// storage accepts nothing; comparison errors leave only private scratch dirty.
 pub fn offerTopK(items: []u32, used: *usize, candidate: u32, context: anytype) types.Error!void {
-    if (items.len == 0) return;
+    _ = try offerTopKSlot(items, used, candidate, context);
+}
+
+/// Same heap operation, returning the old root when replaced, or candidate
+/// when rejected/filling. Once full, that returned handle can be reused for
+/// caller-owned cached key storage. No key records move with heap handles.
+pub fn offerTopKSlot(items: []u32, used: *usize, candidate: u32, context: anytype) types.Error!u32 {
+    if (items.len == 0) return candidate;
     if (used.* < items.len) {
         var child = used.*;
         used.* += 1;
@@ -22,9 +29,10 @@ pub fn offerTopK(items: []u32, used: *usize, candidate: u32, context: anytype) t
             items[child] = swap;
             child = parent;
         }
-        return;
+        return candidate;
     }
-    if (try context.order(candidate, items[0]) >= 0) return;
+    if (try context.order(candidate, items[0]) >= 0) return candidate;
+    const removed = items[0];
     items[0] = candidate;
     var parent: usize = 0;
     while (parent * 2 + 1 < items.len) {
@@ -36,6 +44,7 @@ pub fn offerTopK(items: []u32, used: *usize, candidate: u32, context: anytype) t
         items[child] = swap;
         parent = child;
     }
+    return removed;
 }
 
 /// Sorts `items`; returns the number of comparisons made.

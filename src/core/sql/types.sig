@@ -570,26 +570,49 @@ pub fn Values(comptime config: Config) type {
         }
 
         /// Consistent with compare: equal values hash equally.
+        fn wordHash(bits: u64, tag: u64) usize {
+            var code = bits ^ (tag *% 0x9e3779b97f4a7c15);
+            // Full 64-bit avalanche; unlike bytewise FNV this has no serial
+            // dependency chain proportional to the fixed key's byte width.
+            code ^= code >> 33;
+            code *%= 0xff51afd7ed558ccd;
+            code ^= code >> 33;
+            code *%= 0xc4ceb9fe1a85ec53;
+            code ^= code >> 33;
+            return @truncate(code);
+        }
+
         pub fn hash(value: *const Cell) usize {
             var code: u64 = 14695981039346656037;
-            mix(&code, @intFromEnum(@as(CellTag, value.*)));
+            const tag: u64 = @intFromEnum(@as(CellTag, value.*));
+            // Fixed-width keys do not need a serial byte-at-a-time FNV chain.
+            // Include the type domain, then avalanche the normalized word below.
+            // Variable/composite representations retain their canonical hashing.
             switch (value.*) {
-                .integer => |integer| mix(&code, @bitCast(integer)),
-                .text => |*text| for (text.slice()) |byte| {
-                    code = (code ^ byte) *% 1099511628211;
+                .integer => |integer| return wordHash(@bitCast(integer), tag),
+                .text => |*text| {
+                    mix(&code, tag);
+                    for (text.slice()) |byte| code = (code ^ byte) *% 1099511628211;
                 },
-                .boolean => |boolean| code = @intFromBool(boolean),
-                .float4 => |float| mix(&code, @bitCast(normalFloat(@floatCast(float)))),
-                .float8 => |float| mix(&code, @bitCast(normalFloat(float))),
-                .numeric => |*number| for (numeric.numeric_hash(number)) |limb| mix(&code, limb),
-                .date => |days| mix(&code, @bitCast(@as(i64, days))),
-                .timestamp, .timestamptz => |us| mix(&code, @bitCast(us)),
+                .boolean => |boolean| return wordHash(@intFromBool(boolean), tag),
+                .float4 => |float| return wordHash(@bitCast(normalFloat(@floatCast(float))), tag),
+                .float8 => |float| return wordHash(@bitCast(normalFloat(float)), tag),
+                .numeric => |*number| {
+                    mix(&code, tag);
+                    for (numeric.numeric_hash(number)) |limb| mix(&code, limb);
+                },
+                .date => |days| return wordHash(@bitCast(@as(i64, days)), tag),
+                .timestamp, .timestamptz => |us| return wordHash(@bitCast(us), tag),
                 .interval => |span| {
+                    mix(&code, tag);
                     const total = temporal.intervalSpan(span);
                     mix(&code, @truncate(@as(u128, @bitCast(total))));
                     mix(&code, @truncate(@as(u128, @bitCast(total)) >> 64));
                 },
-                .jsonb => |*document| J.hash(document.slice(), 0, &code),
+                .jsonb => |*document| {
+                    mix(&code, tag);
+                    J.hash(document.slice(), 0, &code);
+                },
                 .null_value => unreachable,
             }
             // Mix low bits before the power-of-two table mask.
