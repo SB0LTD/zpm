@@ -53,9 +53,9 @@ pub fn Exec(comptime config: types.Config) type {
             cells: [work_cells]V.Cell = undefined,
             cell_low: usize = 0,
             cell_high: usize = work_cells,
-            refs: [work_refs]u32 = undefined,
+            refs: if (config.external_storage) []u32 else [work_refs]u32 = if (config.external_storage) &.{} else undefined,
             ref_low: usize = 0,
-            ref_high: usize = work_refs,
+            ref_high: usize = if (config.external_storage) 0 else work_refs,
             ctes: [config.ctes]CteRun = undefined,
             cache: [config.subqueries]Cache = undefined,
             /// System-view rows (catalog.sig View) for this statement; set by
@@ -66,7 +66,7 @@ pub fn Exec(comptime config: types.Config) type {
                 self.cell_low = 0;
                 self.cell_high = work_cells;
                 self.ref_low = 0;
-                self.ref_high = work_refs;
+                self.ref_high = self.refs.len;
                 for (&self.ctes) |*cte| cte.* = .{};
                 for (&self.cache) |*entry| entry.* = .{};
             }
@@ -892,16 +892,25 @@ pub fn Exec(comptime config: types.Config) type {
             pub fn order(self: *const Sorter, left: u32, right: u32) Error!i8 {
                 try self.ctx.session.checkpoint();
                 for (self.query.order[0..self.query.order_count]) |*key| {
-                    self.ctx.row = &self.table.versions[left].cells;
-                    const a = try E.eval(self.ctx, key.expr);
-                    self.ctx.row = &self.table.versions[right].cells;
-                    const b = try E.eval(self.ctx, key.expr);
+                    const node = &self.ctx.pool.nodes[key.expr];
+                    var av: V.Cell = undefined;
+                    var bv: V.Cell = undefined;
+                    const a: *const V.Cell = if (node.kind == .column) &self.table.versions[left].cells[node.column] else blk: {
+                        self.ctx.row = &self.table.versions[left].cells;
+                        av = try E.eval(self.ctx, key.expr);
+                        break :blk &av;
+                    };
+                    const b: *const V.Cell = if (node.kind == .column) &self.table.versions[right].cells[node.column] else blk: {
+                        self.ctx.row = &self.table.versions[right].cells;
+                        bv = try E.eval(self.ctx, key.expr);
+                        break :blk &bv;
+                    };
                     const nulls_first = key.nulls_first orelse (config.nulls_first_ascending != key.descending);
-                    const result: i8 = if (a == .null_value or b == .null_value) blk: {
-                        if (a == .null_value and b == .null_value) break :blk 0;
-                        break :blk if ((a == .null_value) == nulls_first) -1 else 1;
+                    const result: i8 = if (a.* == .null_value or b.* == .null_value) blk: {
+                        if (a.* == .null_value and b.* == .null_value) break :blk 0;
+                        break :blk if ((a.* == .null_value) == nulls_first) -1 else 1;
                     } else blk: {
-                        const value = V.compare(&a, &b);
+                        const value = V.compare(a, b);
                         break :blk if (key.descending) -value else value;
                     };
                     if (result != 0) return result;
@@ -911,8 +920,19 @@ pub fn Exec(comptime config: types.Config) type {
 
             /// Stable bottom-up merge sort over version indices.
             fn sort(self: *const Sorter, items: []u32) Error!void {
-                var scratch: [config.rows_per_table]u32 = undefined;
+                var scratch: [types.workRows(config)]u32 = undefined;
                 _ = try sort_module.mergeSort(items, scratch[0..items.len], self);
+            }
+        };
+
+        const StableSorter = struct {
+            base: *const Sorter,
+            pub fn order(self: *const StableSorter, left: u32, right: u32) Error!i8 {
+                const result = try self.base.order(left, right);
+                if (result != 0) return result;
+                const a = self.base.table.versions[left].row;
+                const b = self.base.table.versions[right].row;
+                return if (a < b) -1 else if (a > b) 1 else 0;
             }
         };
 
@@ -942,8 +962,13 @@ pub fn Exec(comptime config: types.Config) type {
             const table_index = query.table.?;
             const table = &tables[table_index];
             const locking = @TypeOf(locker).active;
-            var indices: [config.rows_per_table]u32 = undefined;
+            var indices: [types.workRows(config)]u32 = undefined;
             var found: usize = 0;
+            var column_order = true;
+            for (query.order[0..query.order_count]) |key| column_order = column_order and simple(pool, key.expr);
+            const top_k = !locking and column_order and query.order_count != 0 and query.limit <= indices.len and (query.limit < table.row_high / 2 or table.row_high > indices.len);
+            const sorter: Sorter = .{ .ctx = &ctx, .table = table, .query = query };
+            const stable: StableSorter = .{ .base = &sorter };
             if (query.limit != 0) switch (try candidates(&ctx, table, query.key, snap)) {
                 .empty => {},
                 .slot => |slot| {
@@ -957,8 +982,13 @@ pub fn Exec(comptime config: types.Config) type {
                     try session.checkpoint();
                     const version = S.visibleAt(table, slot, snap) orelse continue;
                     if (!try keep(&ctx, query.where, &table.versions[version].cells)) continue;
-                    indices[found] = version;
-                    found += 1;
+                    if (top_k) {
+                        try sort_module.offerTopK(indices[0..@intCast(query.limit)], &found, version, &stable);
+                    } else {
+                        if (found == indices.len) return error.WorkspaceCapacity;
+                        indices[found] = version;
+                        found += 1;
+                    }
                     if (!locking and query.order_count == 0 and found >= query.limit) break;
                 },
             };
@@ -971,8 +1001,10 @@ pub fn Exec(comptime config: types.Config) type {
                         _ = try E.eval(&ctx, key.expr);
                     }
                 };
-                const sorter: Sorter = .{ .ctx = &ctx, .table = table, .query = query };
-                try sorter.sort(indices[0..found]);
+                if (top_k) {
+                    var scratch: [types.workRows(config)]u32 = undefined;
+                    _ = try sort_module.mergeSort(indices[0..found], scratch[0..found], &stable);
+                } else try sorter.sort(indices[0..found]);
             }
             if (locking) {
                 // LockRows: lock in output order; LIMIT counts locked rows.
@@ -988,6 +1020,7 @@ pub fn Exec(comptime config: types.Config) type {
                 found = kept;
             }
             const rows: usize = if (query.limit < found) @intCast(query.limit) else found;
+            if (rows > result.rows.len) return error.WorkspaceCapacity;
             if (!plain) {
                 // Validation pass: projections may fail; the result is untouched.
                 for (indices[0..rows]) |version| {

@@ -6,6 +6,10 @@ const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
 
 pub const Config = struct {
+    /// Caller supplies row/version/index buffers and query reference workspace.
+    /// Stored-row capacity then comes from those buffers, not rows_per_table.
+    /// Cells/results/schema/transaction capacities remain separately budgeted.
+    external_storage: bool = false,
     tables: usize = 4,
     columns: usize = 8,
     rows_per_table: usize = 128,

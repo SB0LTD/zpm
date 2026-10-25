@@ -122,6 +122,7 @@ pub const float_text = float_module;
 /// The executor's stable merge sort over caller-owned index arrays
 /// (returns the number of comparisons; contract tests count them).
 pub const mergeSort = sort_module.mergeSort;
+pub const offerTopK = sort_module.offerTopK;
 pub const Error = types.Error;
 pub const ExecutionControl = types.ExecutionControl;
 pub const Dialect = types.Dialect;
@@ -224,6 +225,9 @@ pub fn Database(comptime config: Config) type {
         pub const Column = V.Column;
         pub const RowRef = S.RowRef;
         pub const StorageStats = S.Stats;
+        pub const StorageBacking = S.Backing;
+        pub const StorageRowSlot = S.RowSlot;
+        pub const StorageVersion = S.Version;
         pub const ReplayScratch = C.Scratch;
         pub const Snapshot = storage.Snapshot;
         pub const LockSet = L.Set;
@@ -365,8 +369,118 @@ pub fn Database(comptime config: Config) type {
         session: value_module.Session = .{},
         workspace: Workspace = .{},
 
-        /// Includes all caller-owned table, version, index, catalog,
-        /// transaction, lock and statement storage.
+        const BackingLayout = struct {
+            offsets: [config.tables][4]usize,
+            refs: usize,
+            bytes: usize,
+            row_index: usize,
+            key_index: usize,
+        };
+
+        fn appendLayout(cursor: *usize, comptime T: type, count: usize) Error!usize {
+            const aligned = @addWithOverflow(cursor.*, @alignOf(T) - 1);
+            if (aligned[1] != 0) return error.InvalidParameterValue;
+            const offset = aligned[0] & ~(@as(usize, @alignOf(T)) - 1);
+            const size = @mulWithOverflow(count, @sizeOf(T));
+            const end = @addWithOverflow(offset, size[0]);
+            if (size[1] != 0 or end[1] != 0) return error.InvalidParameterValue;
+            cursor.* = end[0];
+            return offset;
+        }
+
+        fn backingLayout(rows: usize, versions: usize, refs: usize) Error!BackingLayout {
+            if (rows == 0 or rows > 0x7fffffff or versions <= rows or versions > 0x7fffffff or refs == 0 or refs > 0x7fffffff or versions > ~@as(usize, 0) / 4) return error.InvalidParameterValue;
+            var layout: BackingLayout = undefined;
+            var ri: usize = 2;
+            while (ri < rows * 2) ri *= 2;
+            var ki: usize = 2;
+            while (ki < versions * 2) ki *= 2;
+            layout.row_index = ri;
+            layout.key_index = ki;
+            var cursor: usize = 0;
+            for (&layout.offsets) |*offsets| {
+                offsets[0] = try appendLayout(&cursor, S.RowSlot, rows);
+                offsets[1] = try appendLayout(&cursor, S.Version, versions);
+                offsets[2] = try appendLayout(&cursor, u32, ri);
+                offsets[3] = try appendLayout(&cursor, u32, ki);
+            }
+            layout.refs = try appendLayout(&cursor, u32, refs);
+            layout.bytes = cursor;
+            return layout;
+        }
+
+        /// Exact byte budget for runtime-sized external row/version/index buffers.
+        pub fn backingBytes(rows: usize, versions: usize, refs: usize) Error!usize {
+            return (try backingLayout(rows, versions, refs)).bytes;
+        }
+
+        fn storageView(comptime T: type, bytes: []u8, offset: usize, count: usize) Error![]T {
+            const ptr = bytes.ptr + offset;
+            if (@intFromPtr(ptr) % @alignOf(T) != 0) return error.InvalidParameterValue;
+            return @as([*]T, @ptrCast(@alignCast(ptr)))[0..count];
+        }
+
+        /// Carve only the declared typed buffers from one caller-owned region.
+        /// No allocator interface, hidden growth, or platform imports.
+        pub fn bindMemory(self: *Self, bytes: []u8, rows: usize, versions: usize, refs: usize) Error!void {
+            if (comptime !config.external_storage) @compileError("bindMemory requires external_storage");
+            const layout = try backingLayout(rows, versions, refs);
+            if (bytes.len < layout.bytes) return error.WorkspaceCapacity;
+            var backings: [config.tables]StorageBacking = undefined;
+            for (&backings, layout.offsets) |*backing, offsets| backing.* = .{
+                .rows = try storageView(S.RowSlot, bytes, offsets[0], rows),
+                .versions = try storageView(S.Version, bytes, offsets[1], versions),
+                .row_index = try storageView(u32, bytes, offsets[2], layout.row_index),
+                .key_index = try storageView(u32, bytes, offsets[3], layout.key_index),
+            };
+            try self.bindStorage(backings, try storageView(u32, bytes, layout.refs, refs));
+        }
+
+        const StorageSpan = struct {
+            start: usize,
+            end: usize,
+
+            fn of(values: anytype) StorageSpan {
+                const start = @intFromPtr(values.ptr);
+                return .{ .start = start, .end = start + values.len * @sizeOf(@TypeOf(values[0])) };
+            }
+        };
+
+        /// Bind distinct caller-owned storage to a fresh external-storage DB.
+        /// Buffers must outlive the DB and must not be moved during a statement
+        /// or transaction. No initialization reads unused row/version storage.
+        /// Validation completes before any binding is changed.
+        pub fn bindStorage(self: *Self, backings: [config.tables]StorageBacking, refs: []u32) Error!void {
+            if (comptime !config.external_storage) @compileError("bindStorage requires external_storage");
+            if (self.csn != 0 or refs.len == 0 or refs.len > 0x7fffffff) return error.InvalidParameterValue;
+            for (&self.tables) |*table| if (table.live) return error.InvalidParameterValue;
+            for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
+            var spans: [config.tables * 4 + 2]StorageSpan = undefined;
+            spans[0] = .{ .start = @intFromPtr(self), .end = @intFromPtr(self) + @sizeOf(Self) };
+            spans[1] = StorageSpan.of(refs);
+            for (backings, 0..) |backing, i| {
+                if (!backing.valid()) return error.InvalidParameterValue;
+                spans[2 + i * 4] = StorageSpan.of(backing.rows);
+                spans[3 + i * 4] = StorageSpan.of(backing.versions);
+                spans[4 + i * 4] = StorageSpan.of(backing.row_index);
+                spans[5 + i * 4] = StorageSpan.of(backing.key_index);
+            }
+            for (spans, 0..) |a, i| for (spans[i + 1 ..]) |b| {
+                if (a.start < b.end and b.start < a.end) return error.InvalidParameterValue;
+            };
+            for (&self.tables, backings) |*table, backing| {
+                table.rows = backing.rows;
+                table.versions = backing.versions;
+                table.row_index = backing.row_index;
+                table.key_index = backing.key_index;
+            }
+            self.workspace.query.refs = refs;
+            self.workspace.query.ref_high = refs.len;
+        }
+
+        /// Inline object bytes. With external_storage this excludes the bound
+        /// row/version/index/reference buffers; backingBytes reports their
+        /// separate capacity budget. It is not total resident memory.
         pub fn storageBytes() usize {
             return @sizeOf(Self);
         }
@@ -374,6 +488,23 @@ pub fn Database(comptime config: Config) type {
         /// Copy a complete committed logical state into distinct storage. The
         /// source must have no active transaction; the copy has none.
         pub fn copyFrom(self: *Self, source: *const Self) void {
+            if (comptime config.external_storage) @compileError("use checked copyFromInto with external storage");
+            self.copyState(source);
+        }
+
+        /// Copies into independently bound external buffers, rejecting a small
+        /// destination before modifying it. Indices are rebuilt for its masks.
+        pub fn copyFromInto(self: *Self, source: *const Self) Error!void {
+            if (self == source) return;
+            for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
+            for (&source.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
+            for (&self.tables, &source.tables) |*dst, *src| if (src.live) {
+                if (dst.rows.len < src.row_high or dst.versions.len < src.version_high or dst.row_index.len == 0 or dst.key_index.len == 0) return error.WorkspaceCapacity;
+            };
+            self.copyState(source);
+        }
+
+        fn copyState(self: *Self, source: *const Self) void {
             if (self == source) return;
             self.oid_counter = source.oid_counter;
             self.csn = source.csn;
@@ -394,7 +525,12 @@ pub fn Database(comptime config: Config) type {
             self.outcome = .{};
             self.dialect = .postgres;
             self.session = .{};
-            self.workspace = .{};
+            if (comptime config.external_storage) {
+                const refs = self.workspace.query.refs;
+                self.workspace = .{};
+                self.workspace.query.refs = refs;
+                self.workspace.query.ref_high = refs.len;
+            } else self.workspace = .{};
             self.locks = .{};
             for (&self.txs) |*tx| tx.active = false;
             for (&self.tables, &source.tables) |*destination, *table| {
@@ -726,6 +862,7 @@ pub fn Database(comptime config: Config) type {
         /// (atomicity) and leaves `result` untouched; WouldBlock keeps it
         /// open with its versions and locks (re-deliver with .resume).
         pub fn statement(self: *Self, slot: u16, source: []const u8, result: *Result, options: StatementOptions) Error!void {
+            if (comptime config.external_storage) if (self.workspace.query.refs.len == 0) return error.InvalidParameterValue;
             if (!self.active(slot)) return error.NoActiveTransaction;
             const tx = &self.txs[slot];
             const parsed = P.parse(source, &self.workspace.nodes, options.mode) catch |err| {
@@ -2110,6 +2247,7 @@ pub fn Database(comptime config: Config) type {
         /// decoded and validated against `scratch` before anything changes.
         /// Replay runs before any transaction starts.
         pub fn applyChangeRecord(self: *Self, record: []const u8, scratch: *ReplayScratch) Error!void {
+            if (comptime config.external_storage) if (self.workspace.query.refs.len == 0) return error.InvalidParameterValue;
             try C.apply(self, record, scratch);
             self.reclaimTables(self.csn);
             self.wake_epoch +%= 1;

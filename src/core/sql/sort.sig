@@ -5,6 +5,39 @@
 //! but complete). At most n * ceil(log2 n) comparisons are made.
 const types = @import("types.sig");
 
+/// Keep the best items.len handles in a max-heap. The caller's comparator
+/// includes a stable ordinal when equal keys must retain scan order. Empty
+/// storage accepts nothing; comparison errors leave only private scratch dirty.
+pub fn offerTopK(items: []u32, used: *usize, candidate: u32, context: anytype) types.Error!void {
+    if (items.len == 0) return;
+    if (used.* < items.len) {
+        var child = used.*;
+        used.* += 1;
+        items[child] = candidate;
+        while (child != 0) {
+            const parent = (child - 1) / 2;
+            if (try context.order(items[child], items[parent]) <= 0) break;
+            const swap = items[parent];
+            items[parent] = items[child];
+            items[child] = swap;
+            child = parent;
+        }
+        return;
+    }
+    if (try context.order(candidate, items[0]) >= 0) return;
+    items[0] = candidate;
+    var parent: usize = 0;
+    while (parent * 2 + 1 < items.len) {
+        var child = parent * 2 + 1;
+        if (child + 1 < items.len and try context.order(items[child + 1], items[child]) > 0) child += 1;
+        if (try context.order(items[parent], items[child]) >= 0) break;
+        const swap = items[parent];
+        items[parent] = items[child];
+        items[child] = swap;
+        parent = child;
+    }
+}
+
 /// Sorts `items`; returns the number of comparisons made.
 pub fn mergeSort(items: []u32, scratch: []u32, context: anytype) types.Error!u64 {
     if (scratch.len < items.len) return error.WorkspaceCapacity;
