@@ -160,7 +160,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
     const S = storage.Storage(config);
     const overlay_capacity = blk: {
         var capacity: usize = 2;
-        const entries = if (config.external_storage)
+        const entries: usize = if (config.external_storage)
             (if (config.tx_writes == 0) @max(config.rows_per_table * 2, 64) else config.tx_writes)
         else config.rows_per_table * config.tables;
         while (capacity < entries * 4) capacity *= 2;

@@ -36,6 +36,45 @@ versions, indices, statement scratch and text live inline in `DB`. `DB.storageBy
 storage, measured by `@sizeOf(DB.Result)`; choose stack or static storage for the
 profile's size. `tableCount()` returns the number of live tables.
 
+With `external_storage=true`, row/version/index arrays and query-reference
+scratch instead use disjoint caller-supplied buffers (`bindStorage`) or a checked
+caller-owned byte layout (`backingBytes` / `bindMemory`). Their actual lengths
+set row capacity; no heap allocation is introduced. `storageBytes()` reports
+only the inline database object and excludes that external backing. Schema,
+Cells, result rows and transaction state retain their separately configured bounds.
+
+### Streaming single-table aggregates
+
+Eligible base-table aggregates consume visible versions directly, without an
+input-sized source-row, tuple, key or ordinal array. Scalar aggregate state is
+bounded by the number of aggregate expressions. Grouping uses canonical typed
+hashing plus full equality, one key/state record per distinct group, and sorts
+only group handles. NULL grouping, FILTER, HAVING, projections and ordered
+LIMIT/OFFSET retain the existing evaluator and aggregate type/overflow rules.
+The internal Result is published only after the complete query succeeds.
+
+The group budget is derived from remaining workspace Cells and reference slots,
+including room for projection, hash buckets and ordering. Exhaustion remains
+`WorkspaceCapacity`; all-unique input can still require input-sized group/output
+state. Caller-owned scratch does not imply unlimited physical memory. State
+borrows properly aligned whole Cell slots and is initialized before use; it is
+never hashed as raw memory or exposed as tagged Cells.
+
+`Database.workspace.query.stream_stats` exposes statement diagnostics: visible
+rows examined, groups accumulated, hash probe steps and per-plan peak group-state
+Cell/reference counts. Nested eligible plans contribute counts; the peaks are
+not total process memory. Scalar accumulators also use a bounded local array.
+Stats reset with query workspace; a simple non-query execution path need not
+reset them. Inspect them only for the general query just executed.
+
+DISTINCT aggregates, non-base/derived/join sources and finite unordered lazy
+LIMIT plans retain the materializing implementation. This patch does not make
+execution resumable, multicore or result-streaming and does not change the
+public schema/value/session bounds. `test_sql_stream_group.sig` verifies 100K
+stored rows using only 1024 query references, fixed scratch for 64 groups,
+typed key equivalence, collisions, pending-version visibility, cancellation,
+overflow and capacity failure atomicity.
+
 `execute(source, &result)` accepts one statement and copies input names and
 text. Successful SELECT copies headers/rows into result, without borrowing
 database memory. Mutation results expose `affected_rows`; CREATE/DROP report 0.

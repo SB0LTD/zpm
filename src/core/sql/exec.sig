@@ -44,6 +44,16 @@ pub fn Exec(comptime config: types.Config) type {
 
         const Mark = struct { cells: usize, refs: usize };
 
+        /// Per-statement evidence for the single-source streaming path. Counts
+        /// include nested eligible plans; scratch figures are per-plan peaks.
+        pub const StreamStats = struct {
+            rows: usize = 0,
+            groups: usize = 0,
+            probes: usize = 0,
+            scratch_cells: usize = 0,
+            scratch_refs: usize = 0,
+        };
+
         /// The statement's query workspace (design §4.9): caller-owned,
         /// uninitialized until a statement writes it. Scratch grows from the
         /// bottom and is released per correlated subquery evaluation;
@@ -58,6 +68,7 @@ pub fn Exec(comptime config: types.Config) type {
             ref_high: usize = if (config.external_storage) 0 else work_refs,
             ctes: [config.ctes]CteRun = undefined,
             cache: [config.subqueries]Cache = undefined,
+            stream_stats: StreamStats = .{},
             /// System-view rows (catalog.sig View) for this statement; set by
             /// the Database before it runs a query (kept across resets).
             views: ?ViewHook = null,
@@ -67,6 +78,7 @@ pub fn Exec(comptime config: types.Config) type {
                 self.cell_high = work_cells;
                 self.ref_low = 0;
                 self.ref_high = self.refs.len;
+                self.stream_stats = .{};
                 for (&self.ctes) |*cte| cte.* = .{};
                 for (&self.cache) |*entry| entry.* = .{};
             }
@@ -395,13 +407,165 @@ pub fn Exec(comptime config: types.Config) type {
             const Accumulator = struct {
                 count: i64 = 0,
                 integer: i64 = 0,
-                wide: i128 = 0,
+                // Workspace Cell slots need not have the native i128 alignment.
+                // Declare the actual alignment instead of promising an aligned
+                // pointer to borrowed bytes that may only be 8-byte aligned.
+                wide: i128 align(@alignOf(V.Cell)) = 0,
                 value: V.Cell = .null_value,
                 flag: ?bool = null,
                 /// AVG(float): PostgreSQL float8_accum's Sx and Sxx.
                 sx: f64 = 0,
                 sxx: f64 = 0,
             };
+
+            /// Accumulators borrow whole Cell slots from the existing workspace.
+            /// No second arena, heap, input-sized handle list or per-row Cell
+            /// is needed. These reserved bytes are never read as tagged Cells.
+            fn accumulatorCells(count: usize) usize {
+                return (count * @sizeOf(Accumulator) + @sizeOf(V.Cell) - 1) / @sizeOf(V.Cell);
+            }
+
+            fn accumulators(self: *Query, at: u32, count: usize) []Accumulator {
+                comptime {
+                    if (@alignOf(Accumulator) > @alignOf(V.Cell)) @compileError("SQL workspace must align aggregate states");
+                }
+                const ptr: [*]Accumulator = @ptrCast(@alignCast(&self.work.cells[at]));
+                return ptr[0..count];
+            }
+
+            fn streamEligible(p: *const B.Plan) bool {
+                if (!p.grouped or p.source_count != 1 or p.sources[0].table == null) return false;
+                // DISTINCT requires separate per-aggregate distinct-value state.
+                for (p.aggs[0..p.agg_count]) |agg| if (agg.distinct) return false;
+                // Keep the existing lazy evaluation contract for finite LIMITs.
+                if (p.limit != 0xffffffffffffffff and p.order_count == 0 and p.distinct == .none) return false;
+                return true;
+            }
+
+            fn addAggregates(self: *Query, p: *const B.Plan, ctx: *E.Context, states: []Accumulator) Error!void {
+                for (p.aggs[0..p.agg_count], states) |*agg, *acc| {
+                    if (agg.filter != none and (try E.truth(ctx, agg.filter)) != true) continue;
+                    if (agg.kind == .count_star) {
+                        acc.count += 1;
+                    } else {
+                        const input = try E.eval(ctx, agg.arg);
+                        if (input != .null_value) try self.accumulate(agg, acc, &input);
+                    }
+                }
+            }
+
+            fn projectGroup(self: *Query, p: *const B.Plan, at: u32, states: []const Accumulator, outer: ?*const E.Context, out: *List) Error!void {
+                for (p.aggs[0..p.agg_count], states, 0..) |*agg, *acc, index| {
+                    self.work.cells[at + p.key_count + index] = try self.finishAggregate(agg, acc);
+                }
+                var ctx = self.context(outer);
+                ctx.tuple[group_relation] = self.row(at);
+                if (try keep(&ctx, p.having, null)) try self.projectRow(p, &ctx, out);
+            }
+
+            const GroupSorter = struct {
+                query: *const Query,
+                width: usize,
+                pub fn order(self: *const GroupSorter, a: u32, b: u32) Error!i8 {
+                    try self.query.session.checkpoint();
+                    for (0..self.width) |column| {
+                        const compared = V.compare(&self.query.work.cells[a + column], &self.query.work.cells[b + column]);
+                        if (compared != 0) return compared;
+                    }
+                    return 0;
+                }
+            };
+
+            /// Consume visible base-table versions directly. State grows with
+            /// groups, not scanned rows. All output remains private until the
+            /// ordinary query publication step succeeds.
+            fn streamGroup(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                const table = &self.tables[p.sources[0].table.?];
+                var ctx = self.context(outer);
+                var out: List = .{};
+                if (p.key_count == 0) {
+                    var states: [config.columns]Accumulator = undefined;
+                    for (states[0..p.agg_count]) |*state| state.* = .{};
+                    for (0..table.row_high) |slot| {
+                        try self.session.checkpoint();
+                        const version = S.visibleAt(table, slot, self.snap) orelse continue;
+                        self.work.stream_stats.rows += 1;
+                        ctx.tuple[0] = &table.versions[version].cells;
+                        if (try keep(&ctx, p.where, null)) try self.addAggregates(p, &ctx, states[0..p.agg_count]);
+                    }
+                    const at = try self.cells(p.agg_count);
+                    try self.projectGroup(p, at, states[0..p.agg_count], outer, &out);
+                    self.work.stream_stats.groups += 1;
+                    self.work.stream_stats.scratch_cells = @max(self.work.stream_stats.scratch_cells, p.agg_count);
+                    return self.finish(p, out);
+                }
+
+                const state_cells = accumulatorCells(p.agg_count);
+                const record_cells = p.key_count + p.agg_count + state_cells;
+                // Leave room for projection as well as group state. Ref budget
+                // covers rounded buckets, tickets, group sorting and final sort.
+                const cell_budget = self.work.cell_high - self.work.cell_low;
+                const ref_budget = self.work.ref_high - self.work.ref_low;
+                const capacity = @min(cell_budget / (record_cells + p.width), ref_budget / 8);
+                if (capacity == 0) return error.WorkspaceCapacity;
+                var slots: usize = 2;
+                while (slots < capacity * 2) slots *= 2;
+                const buckets = try self.refs(slots);
+                @memset(self.work.refs[buckets..][0..slots], absent);
+                const tickets = try self.refs(capacity);
+                var groups: usize = 0;
+                var keys: [config.columns]V.Cell = undefined;
+                for (0..table.row_high) |slot| {
+                    try self.session.checkpoint();
+                    const version = S.visibleAt(table, slot, self.snap) orelse continue;
+                    self.work.stream_stats.rows += 1;
+                    ctx.tuple[0] = &table.versions[version].cells;
+                    if (!try keep(&ctx, p.where, null)) continue;
+                    var code: usize = 2166136261;
+                    for (p.keys[0..p.key_count], 0..) |key, column| {
+                        keys[column] = try E.eval(&ctx, key);
+                        // V.hash deliberately rejects NULL (PK users exclude it).
+                        const hash: usize = if (keys[column] == .null_value) 0x9e3779b9 else V.hash(&keys[column]);
+                        code = (code ^ hash) *% 16777619;
+                    }
+                    var bucket = code & (slots - 1);
+                    var at: u32 = undefined;
+                    while (true) {
+                        try self.session.checkpoint();
+                        self.work.stream_stats.probes += 1;
+                        const found = self.work.refs[buckets + bucket];
+                        if (found == absent) {
+                            if (groups == capacity) return error.WorkspaceCapacity;
+                            at = try self.cells(record_cells);
+                            for (keys[0..p.key_count], 0..) |key, column| self.work.cells[at + column] = key;
+                            for (self.accumulators(at + @as(u32, @intCast(p.key_count + p.agg_count)), p.agg_count)) |*state| state.* = .{};
+                            self.work.refs[tickets + groups] = at;
+                            self.work.refs[buckets + bucket] = at;
+                            groups += 1;
+                            break;
+                        }
+                        var equal = true;
+                        for (keys[0..p.key_count], 0..) |*key, column| {
+                            if (V.compare(key, &self.work.cells[found + column]) != 0) { equal = false; break; }
+                        }
+                        if (equal) { at = found; break; }
+                        bucket = (bucket + 1) & (slots - 1);
+                    }
+                    try self.addAggregates(p, &ctx, self.accumulators(at + @as(u32, @intCast(p.key_count + p.agg_count)), p.agg_count));
+                }
+                // Preserve the previous key-sorted group order, including NULLs;
+                // sorting touches G handles, never N input ordinals or Cells.
+                const scratch = try self.refs(groups);
+                const sorter: GroupSorter = .{ .query = self, .width = p.key_count };
+                _ = try sort_module.mergeSort(self.work.refs[tickets..][0..groups], self.work.refs[scratch..][0..groups], &sorter);
+                for (self.work.refs[tickets..][0..groups]) |at| {
+                    try self.projectGroup(p, at, self.accumulators(at + @as(u32, @intCast(p.key_count + p.agg_count)), p.agg_count), outer, &out);
+                }
+                self.work.stream_stats.groups += groups;
+                self.work.stream_stats.scratch_cells = @max(self.work.stream_stats.scratch_cells, groups * record_cells);
+                self.work.stream_stats.scratch_refs = @max(self.work.stream_stats.scratch_refs, slots + capacity + groups);
+                return self.finish(p, out);
+            }
 
             fn infinite(x: f64) bool {
                 return x == x and x - x != 0;
@@ -597,6 +761,7 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn core(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                if (streamEligible(p)) return self.streamGroup(p, outer);
                 const tuples = try self.join(p, outer);
                 const rows = if (p.grouped) try self.group(p, tuples, outer) else try self.project(p, tuples, outer);
                 return self.finish(p, rows);
