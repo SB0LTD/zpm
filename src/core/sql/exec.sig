@@ -1142,6 +1142,78 @@ pub fn Exec(comptime config: types.Config) type {
             }
         };
 
+        const IntegerKey = struct { rank: u64, null_rank: bool };
+        const IntegerEntry = struct {
+            keys: [config.columns]IntegerKey = undefined,
+            version: u32,
+            ordinal: u32,
+        };
+        const IntegerOrder = struct { column: u16, descending: bool, nulls_first: bool };
+        const IntegerSorter = struct {
+            entries: []const IntegerEntry,
+            count: usize,
+            session: *const value_module.Session,
+            pub fn order(self: *const IntegerSorter, left: u32, right: u32) Error!i8 {
+                try self.session.checkpoint();
+                const a = &self.entries[left];
+                const b = &self.entries[right];
+                for (0..self.count) |column| {
+                    const x = a.keys[column];
+                    const y = b.keys[column];
+                    if (x.null_rank != y.null_rank) return if (x.null_rank) 1 else -1;
+                    if (x.rank != y.rank) return if (x.rank < y.rank) -1 else 1;
+                }
+                return if (a.ordinal < b.ordinal) -1 else if (a.ordinal > b.ordinal) 1 else 0;
+            }
+        };
+
+        fn integerOrder(pool: *const Ast.Pool, query: *const B.Select) bool {
+            for (query.order[0..query.order_count]) |key| {
+                const node = &pool.nodes[key.expr];
+                if (node.kind != .column or !value_module.integral(node.ty)) return false;
+            }
+            return query.order_count != 0;
+        }
+
+        /// Evaluate column keys once per qualifying row, then compare compact
+        /// cached ranks. The heap moves only slot IDs; one spare key slot is
+        /// recycled on rejection/replacement. NULL placement and stable row-slot
+        /// order match Sorter/StableSorter. Keep this stack frame off point reads.
+        noinline fn integerTopK(ctx: *E.Context, table: *const S.Table, query: *const B.Select, snap: storage.Snapshot, indices: []u32) Error!usize {
+            var entries: [types.workRows(config) + 1]IntegerEntry = undefined;
+            var keys: [config.columns]IntegerOrder = undefined;
+            for (query.order[0..query.order_count], 0..) |key, column| keys[column] = .{
+                .column = ctx.pool.nodes[key.expr].column,
+                .descending = key.descending,
+                .nulls_first = key.nulls_first orelse (config.nulls_first_ascending != key.descending),
+            };
+            const count: usize = @intCast(query.limit);
+            var used: usize = 0;
+            var spare: u32 = @intCast(count);
+            const sorter: IntegerSorter = .{ .entries = &entries, .count = query.order_count, .session = ctx.session };
+            for (0..table.row_high) |slot| {
+                try ctx.session.checkpoint();
+                const version = S.visibleAt(table, slot, snap) orelse continue;
+                if (!try keep(ctx, query.where, &table.versions[version].cells)) continue;
+                const candidate: u32 = if (used < count) @intCast(used) else spare;
+                const entry = &entries[candidate];
+                entry.version = version;
+                entry.ordinal = table.versions[version].row;
+                for (keys[0..query.order_count], 0..) |key, column| {
+                    const value = &table.versions[version].cells[key.column];
+                    const is_null = value.* == .null_value;
+                    var rank: u64 = if (is_null) 0 else @as(u64, @bitCast(value.integer)) ^ 0x8000000000000000;
+                    if (!is_null and key.descending) rank = ~rank;
+                    entry.keys[column] = .{ .rank = rank, .null_rank = if (is_null) !key.nulls_first else key.nulls_first };
+                }
+                const full = used == count;
+                const removed = try sort_module.offerTopKSlot(indices[0..count], &used, candidate, &sorter);
+                if (full) spare = removed;
+            }
+            for (indices[0..used]) |*id| id.* = entries[id.*].version;
+            return used;
+        }
+
         /// `locker` (FOR UPDATE/SHARE) runs after ORDER BY and before LIMIT, as
         /// PostgreSQL's LockRows does: it returns the version to emit (the
         /// newest committed one, whose WHERE is re-checked here when it
@@ -1184,7 +1256,9 @@ pub fn Exec(comptime config: types.Config) type {
                         found = 1;
                     }
                 },
-                .scan => for (0..table.row_high) |slot| {
+                .scan => if (top_k and integerOrder(pool, query)) {
+                    found = try integerTopK(&ctx, table, query, snap, &indices);
+                } else for (0..table.row_high) |slot| {
                     try session.checkpoint();
                     const version = S.visibleAt(table, slot, snap) orelse continue;
                     if (!try keep(&ctx, query.where, &table.versions[version].cells)) continue;
