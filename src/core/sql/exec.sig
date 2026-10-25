@@ -780,10 +780,32 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn core(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
-                if (streamEligible(p)) return self.streamGroup(p, outer);
+                if (streamEligible(p) and self.repeatable()) {
+                    const at = self.mark();
+                    const stats = self.work.stream_stats;
+                    if (self.streamGroup(p, outer)) |rows| return rows else |err| {
+                        // Hash state can cost more than sorted runs at high
+                        // cardinality. Preserve queries that fit the existing
+                        // workspace by retrying that operator only when replay
+                        // cannot repeat volatile functions or subquery effects.
+                        if (err != error.WorkspaceCapacity or !self.repeatable()) return err;
+                        self.release(at);
+                        self.work.stream_stats = stats;
+                        // ExecutionControl remains charged for the attempted
+                        // hash work; retry must not bypass cancellation/budgets.
+                    }
+                }
                 const tuples = try self.join(p, outer);
                 const rows = if (p.grouped) try self.group(p, tuples, outer) else try self.project(p, tuples, outer);
                 return self.finish(p, rows);
+            }
+
+            fn repeatable(self: *const Query) bool {
+                for (self.pool.nodes[0..self.pool.len]) |node| switch (node.kind) {
+                    .function, .scalar_subquery, .exists_subquery, .in_subquery => return false,
+                    else => {},
+                };
+                return true;
             }
 
             // ---- set operations and CTEs -------------------------------

@@ -151,8 +151,33 @@ fn equality() !void {
     try check(sr.row_count == 0 and small.workspace.query.stream_stats.rows == 2);
 }
 
+// Many aggregate states can need more memory than sorted one-row runs. The
+// optimized path must not reject a pure query that the old operator can fit.
+const Dense = sql.Database(.{ .tables = 1, .columns = 8, .rows_per_table = 512,
+    .work_rows = 512, .result_rows = 512, .integer_bits = 32 });
+var dense: Dense = .{};
+var dr: Dense.Result = .{};
+fn highCardinalityFallback() !void {
+    try dense.execute("CREATE TABLE t (id INT PRIMARY KEY, g INT, n INT)", &dr);
+    var text: [128]u8 = undefined;
+    for (0..350) |i| try dense.execute(try std.fmt.bufPrint(&text, "INSERT INTO t VALUES ({d},{d},{d})", .{i,i,350-i}), &dr);
+    try dense.execute("SELECT g, COUNT(id), SUM(n), MIN(n), MAX(n), AVG(n), COUNT(n), SUM(g) FROM t GROUP BY g ORDER BY g", &dr);
+    try check(dr.row_count == 350 and dense.workspace.query.stream_stats.rows == 0);
+    for (0..350) |i| {
+        try check(dr.rows[i].cells[0].integer == i and dr.rows[i].cells[1].integer == 1 and dr.rows[i].cells[2].integer == 350-i and dr.rows[i].cells[3].integer == 350-i and dr.rows[i].cells[4].integer == 350-i and dr.rows[i].cells[6].integer == 1 and dr.rows[i].cells[7].integer == i);
+    }
+    // Volatile evaluation must neither repeat on retry nor lose old capacity.
+    // Conservative eligibility routes functions directly to the existing path.
+    try dense.execute("CREATE SEQUENCE s", &dr);
+    try dense.execute("SELECT g, COUNT(id), SUM(n), MIN(n), MAX(n), AVG(n), COUNT(n), SUM(g) FROM t WHERE nextval('s') > 0 GROUP BY g ORDER BY g", &dr);
+    try check(dr.row_count == 350 and dense.workspace.query.stream_stats.rows == 0);
+    try dense.execute("SELECT lastval()", &dr);
+    try check(dr.rows[0].cells[0].integer == 350);
+}
+
 pub fn main() !void {
     try large();
     try equality();
+    try highCardinalityFallback();
     std.debug.print("{{\"suite\":\"sql-stream-group\",\"pass\":true,\"assertions\":{d},\"rows\":{d},\"query_refs\":{d}}}\n", .{assertions,count,refs.len});
 }
