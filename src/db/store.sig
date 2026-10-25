@@ -285,6 +285,9 @@ pub fn Store(comptime Raw: type) type {
     const Settings = SettingsOf(Zone);
     const has_sequences = @hasDecl(Raw, "SequenceSession");
     const SequenceSession = if (has_sequences) Raw.SequenceSession else struct {};
+    const has_control = @hasDecl(Raw, "ExecutionControl");
+    const ExecutionControl = if (has_control) Raw.ExecutionControl else struct {};
+    const ExecutionError = if (@hasDecl(Raw, "SqlError")) Raw.SqlError else anyerror;
     return struct {
         const Self = @This();
         pub const CommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
@@ -308,6 +311,16 @@ pub fn Store(comptime Raw: type) type {
         /// Monotonic time in nanoseconds, set by the caller before each call
         /// (wait starts, timeouts and deadlock checks use it).
         now_ns: i64 = 0,
+        /// Live monotonic clock for running-statement deadlines. Without one,
+        /// now_ns remains the deterministic caller-driven clock used by tests.
+        monotonic_clock: ?*const fn () i64 = null,
+        /// Zero means no work limit. Units count expression/operator/row steps,
+        /// not elapsed time. Each connection owns its execution control.
+        max_query_work: u64 = 0,
+        interrupt_context: ?*anyopaque = null,
+        /// May service cancellation I/O, but must not execute SQL/reenter a
+        /// database operation. requestCancel is safe from this callback.
+        interrupt_poll: ?*const fn (?*anyopaque, u64) void = null,
         /// Wall clock in PostgreSQL-epoch microseconds; null without one
         /// (now() and friends then fail with 0A000).
         wall_clock: ?*const fn () ?i64 = null,
@@ -426,6 +439,9 @@ pub fn Store(comptime Raw: type) type {
             saved_len: usize = 0,
             pending: Pending = .{},
             cancel_requested: bool = false,
+            running_statement: bool = false,
+            execution: ExecutionControl = .{},
+            execution_deadline_ns: ?i64 = null,
             /// Savepoint depth of the last ROLLBACK TO, for the codec's portals.
             rolled_back_to: ?usize = null,
             /// Wall-clock start of the open (or implicit) transaction and of
@@ -518,6 +534,7 @@ pub fn Store(comptime Raw: type) type {
                     .clock = self.store.wall_clock,
                     .database = if (self.database_len == 0) "postgres" else self.database_name[0..self.database_len],
                 };
+                if (comptime has_control) raw.session.control = if (self.running_statement) &self.execution else null;
                 return raw;
             }
 
@@ -620,9 +637,9 @@ pub fn Store(comptime Raw: type) type {
             }
 
             /// A cancel request for this connection (key already verified by
-            /// the caller). Only a parked statement can be interrupted.
+            /// the caller). Running work observes it at an execution checkpoint.
             pub fn requestCancel(self: *Connection) void {
-                if (self.pending.active) self.cancel_requested = true;
+                if (self.pending.active or self.running_statement) self.cancel_requested = true;
             }
 
             /// Earliest timer of a parked statement (deadlock check, lock or
@@ -958,7 +975,7 @@ pub fn Store(comptime Raw: type) type {
                     .wait_start_ns = now,
                     .deadlock_check_ns = now + @as(i64, deadlock_timeout_ms) * 1000000,
                     .lock_deadline_ns = if (self.settings.lock_timeout_ms != 0) now + @as(i64, self.settings.lock_timeout_ms) * 1000000 else null,
-                    .statement_deadline_ns = if (self.settings.statement_timeout_ms != 0) now + @as(i64, self.settings.statement_timeout_ms) * 1000000 else null,
+                    .statement_deadline_ns = if (comptime has_control) self.execution_deadline_ns else if (self.settings.statement_timeout_ms != 0) now + @as(i64, self.settings.statement_timeout_ms) * 1000000 else null,
                     .waits = self.store.database.waitingFor(self.tx.?),
                 };
                 self.cancel_requested = false;
@@ -989,6 +1006,21 @@ pub fn Store(comptime Raw: type) type {
             }
 
             fn run(self: *Connection, source: []const u8, result: *Result, slot: u16, implicit: bool, resuming: bool) !void {
+                if (comptime has_control) {
+                    if (!resuming) {
+                        self.execution.reset(self.store.max_query_work);
+                        self.execution.context = self;
+                        self.execution.poll = &pollExecution;
+                        const now = if (self.store.monotonic_clock) |clock| clock() else self.store.now_ns;
+                        self.execution_deadline_ns = if (self.settings.statement_timeout_ms != 0) now + @as(i64, self.settings.statement_timeout_ms) * 1000000 else null;
+                        self.cancel_requested = false;
+                    }
+                }
+                self.running_statement = true;
+                defer {
+                    self.running_statement = false;
+                    if (comptime has_control) self.store.database.session.control = null;
+                }
                 const writes = if (self.store.storageReady()) |_| true else |_| false;
                 self.db().statement(slot, source, result, .{ .@"resume" = resuming, .writes = writes, .hold_result = implicit }) catch |err| {
                     if (err == error.WouldBlock) {
@@ -1002,6 +1034,16 @@ pub fn Store(comptime Raw: type) type {
                     return if (err == error.ReadOnlyTransaction) error.StorageUnavailable else err;
                 };
                 return self.finish(slot, implicit, result);
+            }
+
+            fn pollExecution(context: ?*anyopaque) ExecutionError!void {
+                const self: *Connection = @ptrCast(@alignCast(context.?));
+                if (self.store.interrupt_poll) |poll| poll(self.store.interrupt_context, self.id);
+                if (self.cancel_requested) return error.QueryCanceled;
+                if (self.execution_deadline_ns) |deadline| {
+                    const now = if (self.store.monotonic_clock) |clock| clock() else self.store.now_ns;
+                    if (now >= deadline) return error.QueryCanceled;
+                }
             }
 
             /// A re-delivered statement is still waiting: apply its timers.

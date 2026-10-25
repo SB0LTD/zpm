@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SIG_RELEASE_TAG: sig-0.6.3-zig0.17.0.ac9b716
+  SIG_RELEASE_TAG: sig-0.6.4-zig0.17.0.90a898d
 
 jobs:
   native:
@@ -27,14 +27,14 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            asset: sig-0.6.3-zig0.17.0.ac9b716-x86_64-linux.tar.xz
-            sha256: e1c1560fc7be0d6b1a0b04ffbdbc899023d64ded0bf65a654f61ffbbc9200277
+            asset: sig-0.6.4-zig0.17.0.90a898d-x86_64-linux.tar.xz
+            sha256: 8dd32622531b5f81dbb12502c78e187141dd42ea3553f4d9e2c09c3e82d64a89
           - os: macos-latest
-            asset: sig-0.6.3-zig0.17.0.ac9b716-aarch64-macos.tar.xz
-            sha256: 995b3d7c0c83cf5a7f8722a6401c8f6709e7d23516f74b0c6b75b44ffc3e4d92
+            asset: sig-0.6.4-zig0.17.0.90a898d-aarch64-macos.tar.xz
+            sha256: 75ae868e63b6a90ffd3e282f410b18e5098ea87d02cbdc0fd95224f5e922491f
           - os: windows-latest
-            asset: sig-0.6.3-zig0.17.0.ac9b716-x86_64-windows.zip
-            sha256: 5d0e883b64129715eb86baec43005c72050b93bef5fe7172fdc4f20e4efad8a2
+            asset: sig-0.6.4-zig0.17.0.90a898d-x86_64-windows.zip
+            sha256: 49fc99ac20af7841a5b686c68a8720515deda9c28dcad0cb9191fa0de30e33a0
     defaults:
       run:
         shell: pwsh

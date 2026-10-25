@@ -567,6 +567,7 @@ pub fn Eval(comptime config: types.Config) type {
         }
 
         pub fn eval(ctx: *const Context, id: u16) Error!V.Cell {
+            try ctx.session.checkpoint();
             const n = node(ctx, id);
             switch (n.kind) {
                 .null_literal => return .null_value,

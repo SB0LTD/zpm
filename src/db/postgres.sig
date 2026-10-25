@@ -15,6 +15,16 @@ pub const portal_capacity: usize = 8;
 pub const parameter_capacity: usize = 32;
 /// A CancelRequest's key; the caller looks it up (the codec never does).
 pub const Cancel = struct { pid: u32, secret: u32 };
+
+/// Inspect only the untyped startup header; never executes a session or SQL.
+pub fn isCancelHeader(input: []const u8) bool {
+    return input.len >= 8 and read32(input[0..4]) == 16 and read32(input[4..8]) == 80877102;
+}
+
+pub fn parseCancel(input: []const u8) ?Cancel {
+    if (input.len < 16 or !isCancelHeader(input)) return null;
+    return .{ .pid = read32(input[8..12]), .secret = read32(input[12..16]) };
+}
 /// `blocked`: the message's statement is parked on a lock (consumed =
 /// written = 0); re-deliver the same bytes when the store reports progress.
 /// During COPY FROM a row parked on a key wait is already owned by the
@@ -272,8 +282,8 @@ pub fn Session(comptime DB: type) type {
             if (input.len < total) return .{};
             // Cancellation has no response in PostgreSQL: the key goes to the
             // caller, which owns the backend-key registry.
-            if (!self.startup and total >= 8 and read32(input[4..8]) == 80877102 and total == 16)
-                return .{ .consumed = total, .close = true, .cancel = .{ .pid = read32(input[8..12]), .secret = read32(input[12..16]) } };
+            if (!self.startup) if (parseCancel(input[0..total])) |key|
+                return .{ .consumed = total, .close = true, .cancel = key };
             var close = false;
             if (!self.startup) {
                 self.handshake(db, input[4..total], &w) catch |err| {
@@ -1354,6 +1364,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "UndefinedParameter")) return "42P02";
     if (equal(name, "InvalidColumnReference")) return "42P10";
     if (equal(name, "WorkspaceCapacity")) return "54000";
+    if (equal(name, "QueryWorkLimit")) return "54000";
     if (equal(name, "GroupingError")) return "42803";
     if (equal(name, "AmbiguousColumn")) return "42702";
     if (equal(name, "CardinalityViolation")) return "21000";

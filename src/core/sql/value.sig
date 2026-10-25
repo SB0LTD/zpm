@@ -31,6 +31,11 @@ pub const Session = struct {
     sequences: ?*const SequenceHook = null,
     /// current_database(): the session's startup database.
     database: []const u8 = "postgres",
+    control: ?*types.ExecutionControl = null,
+
+    pub fn checkpoint(self: *const Session) Error!void {
+        if (self.control) |control| try control.checkpoint();
+    }
 };
 
 pub const SequenceCall = enum { nextval, currval, setval, lastval, identity, regclass };

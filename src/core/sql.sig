@@ -123,6 +123,7 @@ pub const float_text = float_module;
 /// (returns the number of comparisons; contract tests count them).
 pub const mergeSort = sort_module.mergeSort;
 pub const Error = types.Error;
+pub const ExecutionControl = types.ExecutionControl;
 pub const Dialect = types.Dialect;
 pub const DataType = types.DataType;
 pub const CommandTag = types.CommandTag;
@@ -215,6 +216,7 @@ pub fn Database(comptime config: Config) type {
         pub const SqlError = types.Error;
         pub const Zone = temporal_module.Zone;
         pub const SessionValues = value_module.Session;
+        pub const ExecutionControl = types.ExecutionControl;
         pub const tzif = tzif_module;
         /// btree comparison of two non-NULL cells of the same type.
         pub const compareCells = V.compare;
@@ -380,6 +382,19 @@ pub fn Database(comptime config: Config) type {
             self.catalog = source.catalog;
             self.seqs = source.seqs;
             self.seq_carried = source.seq_carried;
+            // A logical copy has fresh session/execution state. In particular,
+            // never copy caller-owned interrupt or sequence-hook pointers.
+            self.sequence_session = null;
+            self.default_sequences = .{};
+            self.seq_hook = undefined; // installed before a sequence expression
+            self.seq_slot = 0;
+            self.seq_snap = .{ .csn = 0 };
+            self.wake_epoch = 0;
+            self.wait_counter = 0;
+            self.outcome = .{};
+            self.dialect = .postgres;
+            self.session = .{};
+            self.workspace = .{};
             self.locks = .{};
             for (&self.txs) |*tx| tx.active = false;
             for (&self.tables, &source.tables) |*destination, *table| {
@@ -782,6 +797,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn body(self: *Self, slot: u16, source: []const u8, parsed: *const A.Statement, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
+            try self.session.checkpoint();
             const context = self.bindContext(source, mode, snap);
             const bound = try B.bind(&context, parsed);
             switch (bound) {
@@ -1437,6 +1453,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn insertProgress(self: *Self, slot: u16, ctx: *E.Context, insert: *const B.Insert, values: *const [config.columns]u16, derived: D.Derived, snap: Snapshot, position: usize) Error!void {
+            try self.session.checkpoint();
             const affected = try self.insertOne(slot, ctx, insert, values, derived, snap);
             const tx = &self.txs[slot];
             tx.progress = position + 1;
@@ -1819,6 +1836,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn updateSlot(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, row: u32, snap: Snapshot) Error!usize {
+            try self.session.checkpoint();
             const table = &self.tables[update.table];
             if (table.rows[row].newest == 0) return 0;
             const version = S.visibleAt(table, row, snap) orelse return 0;
@@ -1878,6 +1896,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn deleteSlot(self: *Self, slot: u16, ctx: *E.Context, delete: *const B.Delete, row: u32, snap: Snapshot) Error!usize {
+            try self.session.checkpoint();
             const tx = &self.txs[slot];
             const table = &self.tables[delete.table];
             if (table.rows[row].newest == 0) return 0;

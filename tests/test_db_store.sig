@@ -736,6 +736,85 @@ fn savepoints() !void {
     try quiescent(&store);
 }
 
+var query_clock_ns: i64 = 0;
+fn queryClock() i64 {
+    query_clock_ns += 100000;
+    return query_clock_ns;
+}
+
+const RunningCancel = struct {
+    connection: *Store.Connection,
+    calls: usize = 0,
+    saw_private_changes: bool = false,
+
+    fn poll(context: ?*anyopaque, id: u64) void {
+        const self: *RunningCancel = @ptrCast(@alignCast(context.?));
+        if (id != self.connection.id) return;
+        self.calls += 1;
+        if (self.calls == 16) {
+            self.saw_private_changes = self.connection.store.database.usage().pending_versions != 0;
+            self.connection.requestCancel();
+        }
+    }
+};
+
+fn runningControl() !void {
+    var store: Store = .{};
+    var connection = Store.Connection{ .store = &store, .id = 1 };
+    var result: DB.Result = .{};
+    try connection.execute("CREATE TABLE t (id INT PRIMARY KEY, value INT)", &result);
+    try connection.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70), (8, 80)", &result);
+    const queries = [_][]const u8{
+        "SELECT * FROM t WHERE id > 0", "SELECT id FROM t ORDER BY id DESC",
+        "SELECT COUNT(*) FROM t", "SELECT a.id FROM t a CROSS JOIN t b WHERE a.id = 99",
+        "UPDATE t SET value = value + 1", "DELETE FROM t",
+    };
+    for (queries) |source| {
+        try connection.execute("SELECT * FROM t ORDER BY id", &result);
+        result.affected_rows = 97;
+        store.max_query_work = 5;
+        if (connection.execute(source, &result)) |_| return error.WorkLimitIgnored else |err| try check(err == error.QueryWorkLimit);
+        try check(result.row_count == 8 and result.affected_rows == 97 and result.rows[0].cells[1].integer == 10);
+        try check(!connection.running_statement and store.database.session.control == null);
+        try quiescent(&store);
+        store.max_query_work = 0;
+        try connection.execute("SELECT * FROM t ORDER BY id", &result);
+        try check(result.row_count == 8);
+        for (0..8) |row| try check(result.rows[row].cells[1].integer == @as(i64, @intCast((row + 1) * 10)));
+    }
+    // A live clock expires during evaluation, without a lock wait. Changes
+    // made before the interrupt are undone by the statement subtransaction.
+    try connection.execute("SET statement_timeout = 1", &result);
+    connection.execution.poll_interval = 1;
+    store.monotonic_clock = queryClock;
+    query_clock_ns = 0;
+    if (connection.execute("UPDATE t SET value = value + 1", &result)) |_| return error.RunningDeadlineIgnored else |err| try check(err == error.QueryCanceled);
+    try check(connection.execution.used > 1);
+    try quiescent(&store);
+    store.monotonic_clock = null;
+    try connection.execute("SET statement_timeout = 0", &result);
+
+    var cancel = RunningCancel{ .connection = &connection };
+    store.interrupt_context = &cancel;
+    store.interrupt_poll = RunningCancel.poll;
+    if (connection.execute("UPDATE t SET value = value + 1", &result)) |_| return error.RunningCancelIgnored else |err| try check(err == error.QueryCanceled);
+    try check(cancel.calls == 16 and cancel.saw_private_changes and !connection.running_statement);
+    try quiescent(&store);
+    store.interrupt_poll = null;
+    try connection.execute("SELECT * FROM t ORDER BY id", &result);
+    for (0..8) |row| try check(result.rows[row].cells[1].integer == @as(i64, @intCast((row + 1) * 10)));
+
+    // Cancellation during an explicit transaction keeps its failed-block rules.
+    try connection.beginTransaction();
+    store.max_query_work = 5;
+    if (connection.execute("DELETE FROM t", &result)) |_| return error.BudgetedTransactionPublished else |err| try check(err == error.QueryWorkLimit);
+    try check(connection.transactionStatus() == 'E');
+    try connection.rollbackTransaction();
+    store.max_query_work = 0;
+    try count(&connection, 8);
+    try quiescent(&store);
+}
+
 pub fn main() !void {
     try transactions();
     try durability();
@@ -745,6 +824,7 @@ pub fn main() !void {
     try parking();
     try timers();
     try savepoints();
+    try runningControl();
     try check(assertions >= 2177);
     std.debug.print("store: {d} assertions passed\n", .{assertions});
 }

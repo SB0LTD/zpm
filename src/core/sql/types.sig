@@ -198,6 +198,38 @@ pub const Error = error{
     BadCopyFormat,
     /// SQLSTATE 22P03: a binary COPY field has the wrong length or layout.
     InvalidBinaryRepresentation,
+    /// SQLSTATE 54000: the configured statement work budget was exhausted.
+    QueryWorkLimit,
+};
+
+/// Caller-owned execution accounting and interrupt polling. This is independent
+/// of clocks/platforms: the caller's poll hook can enforce deadlines or cancel.
+/// A hook must not execute SQL or mutate database storage. It may only inspect
+/// time/interrupt state and return a terminal error. Checks never run during
+/// rollback or durable publication, so cleanup/publication stay infallible.
+pub const ExecutionControl = struct {
+    context: ?*anyopaque = null,
+    poll: ?*const fn (?*anyopaque) Error!void = null,
+    max_work: u64 = 0,
+    used: u64 = 0,
+    poll_interval: u32 = 256,
+    until_poll: u32 = 0,
+
+    pub fn reset(self: *ExecutionControl, limit: u64) void {
+        self.max_work = limit;
+        self.used = 0;
+        self.until_poll = 0;
+    }
+
+    pub fn checkpoint(self: *ExecutionControl) Error!void {
+        if (self.max_work != 0 and self.used >= self.max_work) return error.QueryWorkLimit;
+        if (self.used != 0xffffffffffffffff) self.used += 1;
+        if (self.until_poll == 0) {
+            if (self.poll) |poll| try poll(self.context);
+            self.until_poll = @max(self.poll_interval, 1);
+        }
+        self.until_poll -= 1;
+    }
 };
 
 /// Session dialect. It changes only assignment coercion (MySQL/TDS BIT
