@@ -131,6 +131,9 @@ pub fn Storage(comptime config: types.Config) type {
             return n != 0 and (n & (n - 1)) == 0;
         }
 
+        pub const OrderState = enum { empty, one, increasing, decreasing, unordered };
+        pub const OrderProof = struct { state: OrderState = .empty, last: V.Cell = .null_value };
+
         pub const Table = struct {
             live: bool = false,
             pending_create: bool = false,
@@ -141,6 +144,9 @@ pub fn Storage(comptime config: types.Config) type {
             column_count: usize = 0,
             columns: [config.columns]V.Column = @splat(.{}),
             primary_column: ?usize = null,
+            /// Conservative strict non-NULL order over physical row slots.
+            /// Updates/aborts may discard a proof, never invent one. Not persisted.
+            column_order: [config.columns]OrderProof = @splat(.{}),
             next_rowid: u64 = 0,
             row_generation: u32 = 0,
             row_high: usize = 0,
@@ -178,6 +184,7 @@ pub fn Storage(comptime config: types.Config) type {
             table.version_high = 0;
             table.version_used = 0;
             table.version_free = 0;
+            table.column_order = @splat(.{});
             @memset(table.row_index[0..], 0);
             if (table.primary_column != null) @memset(table.key_index[0..], 0);
         }
@@ -189,6 +196,7 @@ pub fn Storage(comptime config: types.Config) type {
             destination.column_count = source.column_count;
             @memcpy(destination.columns[0..source.column_count], source.columns[0..source.column_count]);
             destination.primary_column = source.primary_column;
+            destination.column_order = source.column_order;
             destination.next_rowid = source.next_rowid;
             destination.row_generation = source.row_generation;
             destination.row_high = source.row_high;
@@ -203,7 +211,7 @@ pub fn Storage(comptime config: types.Config) type {
                 @memset(destination.key_index, 0);
                 for (0..destination.row_high) |slot| if (destination.rows[slot].newest != 0) indexRow(destination, @intCast(slot));
                 if (destination.primary_column != null) for (0..destination.version_high) |version| {
-                    if (destination.versions[version].row != 0) indexKey(destination, @intCast(version));
+                    if (destination.versions[version].row != 0) indexKeyOnly(destination, @intCast(version));
                 };
             } else {
                 destination.row_index = source.row_index;
@@ -302,6 +310,40 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         pub fn indexKey(table: *Table, version: u32) void {
+            noteOrder(table, version);
+            indexKeyOnly(table, version);
+        }
+
+        fn noteOrder(table: *Table, version: u32) void {
+            const entry = &table.versions[version];
+            for (table.column_order[0..table.column_count], 0..) |*proof, column| {
+                const value = &entry.cells[column];
+                if (entry.older != 0) {
+                    if (entry.older == version + 1 or table.versions[entry.older - 1].row == 0) {
+                        proof.state = .unordered;
+                    } else if (proof.state != .unordered and V.compare(value, &table.versions[entry.older - 1].cells[column]) != 0) proof.state = .unordered;
+                    continue;
+                }
+                // The first row after reset/full reclamation can start a new
+                // proof. Other inserts must be appended to the directory.
+                if (entry.row == 1 and table.row_high == 1) {
+                    proof.* = .{ .state = if (value.* == .null_value) .unordered else .one, .last = value.* };
+                    continue;
+                }
+                if (proof.state == .unordered) continue;
+                if (entry.row != table.row_high or value.* == .null_value) { proof.state = .unordered; continue; }
+                const compared = V.compare(value, &proof.last);
+                proof.state = switch (proof.state) {
+                    .one => if (compared > 0) .increasing else if (compared < 0) .decreasing else .unordered,
+                    .increasing => if (compared > 0) .increasing else .unordered,
+                    .decreasing => if (compared < 0) .decreasing else .unordered,
+                    .empty, .unordered => .unordered,
+                };
+                if (proof.state != .unordered) proof.last = value.*;
+            }
+        }
+
+        fn indexKeyOnly(table: *Table, version: u32) void {
             if (table.primary_column == null) return;
             var position = keyHome(table, version + 1);
             while (table.key_index[position] != 0) position = (position + 1) & (table.key_index.len - 1);
