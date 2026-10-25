@@ -40,7 +40,7 @@ fn runs() !void {
     var source: [256]u8=undefined;var expected: [n]u32=undefined;
     for (0..16) |mask| {
         const d1=mask&1!=0;const d2=mask&2!=0;const nf1=mask&4!=0;const nf2=mask&8!=0;
-        for ([_]usize{1,16,32}) |k| for ([_]usize{3,n}) |only| {
+        for ([_]usize{0,1,16,32}) |k| for ([_]usize{3,n}) |only| {
             const count=model(d1,d2,nf1,nf2,only,&expected);
             const text=try std.fmt.bufPrint(&source,"SELECT id FROM t WHERE id < {d} ORDER BY a {s} NULLS {s}, b {s} NULLS {s} LIMIT {d}",.{only,if(d1) "DESC" else "ASC",if(nf1) "FIRST" else "LAST",if(d2) "DESC" else "ASC",if(nf2) "FIRST" else "LAST",k});
             try db.execute(text,&result);try check(result.row_count==@min(k,count));

@@ -1208,10 +1208,11 @@ pub fn Exec(comptime config: types.Config) type {
                 .nulls_first = key.nulls_first orelse (config.nulls_first_ascending != key.descending),
             };
             const count: usize = @intCast(query.limit);
+            if (count == 0) return 0;
             var used: usize = 0;
             var spare: u32 = @intCast(count);
             const sorter: IntegerSorter = .{ .entries = &entries, .count = query.order_count, .session = ctx.session };
-            for (0..table.row_high) |slot| {
+            rows: for (0..table.row_high) |slot| {
                 try ctx.session.checkpoint();
                 const version = S.visibleAt(table, slot, snap) orelse continue;
                 if (!try keep(ctx, query.where, &table.versions[version].cells)) continue;
@@ -1219,14 +1220,27 @@ pub fn Exec(comptime config: types.Config) type {
                 const entry = &entries[candidate];
                 entry.version = version;
                 entry.ordinal = table.versions[version].row;
+                const full = used == count;
+                var relation: i8 = 0;
                 for (keys[0..query.order_count], 0..) |key, column| {
                     const value = &table.versions[version].cells[key.column];
                     const is_null = value.* == .null_value;
                     var rank: u64 = if (is_null) 0 else @as(u64, @bitCast(value.integer)) ^ 0x8000000000000000;
                     if (!is_null and key.descending) rank = ~rank;
-                    entry.keys[column] = .{ .rank = rank, .null_rank = if (is_null) !key.nulls_first else key.nulls_first };
+                    const normalized: IntegerKey = .{ .rank = rank, .null_rank = if (is_null) !key.nulls_first else key.nulls_first };
+                    // The cached heap root is the worst retained row. Reject
+                    // at its first decisive column before reading later keys
+                    // or writing a spare entry for a losing candidate.
+                    if (full and relation == 0) {
+                        const worst = entries[indices[0]].keys[column];
+                        relation = if (normalized.null_rank != worst.null_rank)
+                            (if (normalized.null_rank) @as(i8, 1) else -1)
+                        else if (normalized.rank < worst.rank) -1 else if (normalized.rank > worst.rank) 1 else 0;
+                        if (relation > 0) continue :rows;
+                    }
+                    entry.keys[column] = normalized;
                 }
-                const full = used == count;
+                if (full and relation == 0 and entry.ordinal >= entries[indices[0]].ordinal) continue;
                 const removed = try sort_module.offerTopKSlot(indices[0..count], &used, candidate, &sorter);
                 if (full) spare = removed;
             }
