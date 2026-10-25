@@ -68,7 +68,8 @@ Stats reset with query workspace; a simple non-query execution path need not
 reset them. Inspect them only for the general query just executed.
 
 DISTINCT aggregates, non-base/derived/join sources and finite unordered lazy
-LIMIT plans retain the materializing implementation. This patch does not make
+grouped LIMIT plans retain the materializing implementation. Scalar positive
+LIMIT plans use the streaming path as well. This patch does not make
 execution resumable, multicore or result-streaming and does not change the
 public schema/value/session bounds. `test_sql_stream_group.sig` verifies 100K
 stored rows using only 1024 query references, fixed scratch for 64 groups,

@@ -438,8 +438,20 @@ pub fn Exec(comptime config: types.Config) type {
                 // DISTINCT requires separate per-aggregate distinct-value state.
                 for (p.aggs[0..p.agg_count]) |agg| if (agg.distinct) return false;
                 // Keep the existing lazy evaluation contract for finite LIMITs.
-                if (p.limit != 0xffffffffffffffff and p.order_count == 0 and p.distinct == .none) return false;
+                if (p.limit != 0xffffffffffffffff and p.order_count == 0 and p.distinct == .none) {
+                    if (p.key_count != 0 or (p.limit == 0 and p.offset == 0)) return false;
+                }
                 return true;
+            }
+
+            /// A base-column input can be borrowed for this synchronous step;
+            /// no whole tagged union copy is needed to read an integer or key.
+            /// Computed/correlated expressions retain the ordinary evaluator.
+            fn streamInput(self: *Query, ctx: *E.Context, id: u16, temporary: *V.Cell) Error!*const V.Cell {
+                const node = &self.pool.nodes[id];
+                if (node.kind == .column and node.level == 0 and node.relation == 0) return &ctx.tuple[0].?[node.column];
+                temporary.* = try E.eval(ctx, id);
+                return temporary;
             }
 
             fn addAggregates(self: *Query, p: *const B.Plan, ctx: *E.Context, states: []Accumulator) Error!void {
@@ -448,8 +460,9 @@ pub fn Exec(comptime config: types.Config) type {
                     if (agg.kind == .count_star) {
                         acc.count += 1;
                     } else {
-                        const input = try E.eval(ctx, agg.arg);
-                        if (input != .null_value) try self.accumulate(agg, acc, &input);
+                        var temporary: V.Cell = undefined;
+                        const input = try self.streamInput(ctx, agg.arg, &temporary);
+                        if (input.* != .null_value) try self.accumulate(agg, acc, input);
                     }
                 }
             }
@@ -507,25 +520,30 @@ pub fn Exec(comptime config: types.Config) type {
                 const cell_budget = self.work.cell_high - self.work.cell_low;
                 const ref_budget = self.work.ref_high - self.work.ref_low;
                 const capacity = @min(cell_budget / (record_cells + p.width), ref_budget / 8);
-                if (capacity == 0) return error.WorkspaceCapacity;
                 var slots: usize = 2;
                 while (slots < capacity * 2) slots *= 2;
-                const buckets = try self.refs(slots);
-                @memset(self.work.refs[buckets..][0..slots], absent);
-                const tickets = try self.refs(capacity);
+                var buckets: u32 = undefined;
+                var tickets: u32 = undefined;
                 var groups: usize = 0;
-                var keys: [config.columns]V.Cell = undefined;
+                var computed_keys: [config.columns]V.Cell = undefined;
+                var keys: [config.columns]*const V.Cell = undefined;
                 for (0..table.row_high) |slot| {
                     try self.session.checkpoint();
                     const version = S.visibleAt(table, slot, self.snap) orelse continue;
                     self.work.stream_stats.rows += 1;
                     ctx.tuple[0] = &table.versions[version].cells;
                     if (!try keep(&ctx, p.where, null)) continue;
+                    if (groups == 0) {
+                        if (capacity == 0) return error.WorkspaceCapacity;
+                        buckets = try self.refs(slots);
+                        @memset(self.work.refs[buckets..][0..slots], absent);
+                        tickets = try self.refs(capacity);
+                    }
                     var code: usize = 2166136261;
                     for (p.keys[0..p.key_count], 0..) |key, column| {
-                        keys[column] = try E.eval(&ctx, key);
+                        keys[column] = try self.streamInput(&ctx, key, &computed_keys[column]);
                         // V.hash deliberately rejects NULL (PK users exclude it).
-                        const hash: usize = if (keys[column] == .null_value) 0x9e3779b9 else V.hash(&keys[column]);
+                        const hash: usize = if (keys[column].* == .null_value) 0x9e3779b9 else V.hash(keys[column]);
                         code = (code ^ hash) *% 16777619;
                     }
                     var bucket = code & (slots - 1);
@@ -537,7 +555,7 @@ pub fn Exec(comptime config: types.Config) type {
                         if (found == absent) {
                             if (groups == capacity) return error.WorkspaceCapacity;
                             at = try self.cells(record_cells);
-                            for (keys[0..p.key_count], 0..) |key, column| self.work.cells[at + column] = key;
+                            for (keys[0..p.key_count], 0..) |key, column| self.work.cells[at + column] = key.*;
                             for (self.accumulators(at + @as(u32, @intCast(p.key_count + p.agg_count)), p.agg_count)) |*state| state.* = .{};
                             self.work.refs[tickets + groups] = at;
                             self.work.refs[buckets + bucket] = at;
@@ -545,7 +563,7 @@ pub fn Exec(comptime config: types.Config) type {
                             break;
                         }
                         var equal = true;
-                        for (keys[0..p.key_count], 0..) |*key, column| {
+                        for (keys[0..p.key_count], 0..) |key, column| {
                             if (V.compare(key, &self.work.cells[found + column]) != 0) { equal = false; break; }
                         }
                         if (equal) { at = found; break; }
@@ -553,6 +571,7 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                     try self.addAggregates(p, &ctx, self.accumulators(at + @as(u32, @intCast(p.key_count + p.agg_count)), p.agg_count));
                 }
+                if (groups == 0) return self.finish(p, out);
                 // Preserve the previous key-sorted group order, including NULLs;
                 // sorting touches G handles, never N input ordinals or Cells.
                 const scratch = try self.refs(groups);
