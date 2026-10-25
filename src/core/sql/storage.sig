@@ -4,7 +4,10 @@
 //! rowid -> slot open-addressing index (load <= 50%), a version arena of
 //! Config.versions_per_table slots (default 2 x rows_per_table) and a
 //! multi-entry primary-key index from key to version, filtered by
-//! visibility. Every array is inline caller-owned storage; nothing allocates.
+//! visibility. The default arrays are inline caller-owned storage. With
+//! external_storage they are distinct caller-provided slices: their lengths,
+//! not the inline Config profile, set row/version/index capacities. Nothing
+//! allocates; values inside a version still use the configured inline cells.
 //!
 //! Visibility (design §4.4): a statement reads under a Snapshot {csn, tx, cid}.
 //! A version's creation is visible when it committed at or before snap.csn,
@@ -110,6 +113,24 @@ pub fn Storage(comptime config: types.Config) type {
         /// summarize it: `pending_create` until the creator publishes,
         /// `pending_drop` while an uncommitted DROP holds it, `dead_csn` once
         /// a DROP committed (storage is reclaimed when the horizon passes it).
+        pub const Backing = struct {
+            rows: []RowSlot,
+            versions: []Version,
+            row_index: []u32,
+            key_index: []u32,
+
+            pub fn valid(self: Backing) bool {
+                return self.rows.len != 0 and self.rows.len <= 0x7fffffff and
+                    self.versions.len > self.rows.len and self.versions.len <= 0x7fffffff and
+                    self.row_index.len >= self.rows.len * 2 and powerOfTwo(self.row_index.len) and
+                    self.key_index.len >= self.versions.len * 2 and powerOfTwo(self.key_index.len);
+            }
+        };
+
+        fn powerOfTwo(n: usize) bool {
+            return n != 0 and (n & (n - 1)) == 0;
+        }
+
         pub const Table = struct {
             live: bool = false,
             pending_create: bool = false,
@@ -127,10 +148,10 @@ pub fn Storage(comptime config: types.Config) type {
             version_high: usize = 0,
             version_used: usize = 0,
             version_free: u32 = 0,
-            rows: [config.rows_per_table]RowSlot = @splat(.{}),
-            versions: [versions_capacity]Version = @splat(.{}),
-            row_index: [row_index_capacity]u32 = @splat(0),
-            key_index: [key_index_capacity]u32 = @splat(0),
+            rows: if (config.external_storage) []RowSlot else [config.rows_per_table]RowSlot = if (config.external_storage) &.{} else @splat(.{}),
+            versions: if (config.external_storage) []Version else [versions_capacity]Version = if (config.external_storage) &.{} else @splat(.{}),
+            row_index: if (config.external_storage) []u32 else [row_index_capacity]u32 = if (config.external_storage) &.{} else @splat(0),
+            key_index: if (config.external_storage) []u32 else [key_index_capacity]u32 = if (config.external_storage) &.{} else @splat(0),
         };
 
         /// A table every committed reader can see (created and not dropped).
@@ -157,8 +178,8 @@ pub fn Storage(comptime config: types.Config) type {
             table.version_high = 0;
             table.version_used = 0;
             table.version_free = 0;
-            @memset(&table.row_index, 0);
-            if (table.primary_column != null) @memset(&table.key_index, 0);
+            @memset(table.row_index[0..], 0);
+            if (table.primary_column != null) @memset(table.key_index[0..], 0);
         }
 
         /// Copy a live table's observable state into distinct storage.
@@ -177,8 +198,17 @@ pub fn Storage(comptime config: types.Config) type {
             destination.version_free = source.version_free;
             @memcpy(destination.rows[0..source.row_high], source.rows[0..source.row_high]);
             @memcpy(destination.versions[0..source.version_high], source.versions[0..source.version_high]);
-            destination.row_index = source.row_index;
-            if (source.primary_column != null) destination.key_index = source.key_index;
+            if (comptime config.external_storage) {
+                @memset(destination.row_index, 0);
+                @memset(destination.key_index, 0);
+                for (0..destination.row_high) |slot| if (destination.rows[slot].newest != 0) indexRow(destination, @intCast(slot));
+                if (destination.primary_column != null) for (0..destination.version_high) |version| {
+                    if (destination.versions[version].row != 0) indexKey(destination, @intCast(version));
+                };
+            } else {
+                destination.row_index = source.row_index;
+                if (source.primary_column != null) destination.key_index = source.key_index;
+            }
         }
 
         pub fn created(version: *const Version, snap: Snapshot) bool {
@@ -220,11 +250,11 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         fn rowHome(table: *const Table, entry: u32) usize {
-            return mix(table.rows[entry - 1].rowid) & (row_index_capacity - 1);
+            return mix(table.rows[entry - 1].rowid) & (table.row_index.len - 1);
         }
 
         fn keyHome(table: *const Table, entry: u32) usize {
-            return V.hash(&table.versions[entry - 1].cells[table.primary_column.?]) & (key_index_capacity - 1);
+            return V.hash(&table.versions[entry - 1].cells[table.primary_column.?]) & (table.key_index.len - 1);
         }
 
         /// Backward-shift deletion keeps linear probing tombstone-free.
@@ -247,18 +277,18 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         pub fn findRow(table: *const Table, rowid: u64) ?u32 {
-            var position = mix(rowid) & (row_index_capacity - 1);
+            var position = mix(rowid) & (table.row_index.len - 1);
             while (true) {
                 const entry = table.row_index[position];
                 if (entry == 0) return null;
                 if (table.rows[entry - 1].rowid == rowid) return entry - 1;
-                position = (position + 1) & (row_index_capacity - 1);
+                position = (position + 1) & (table.row_index.len - 1);
             }
         }
 
         fn indexRow(table: *Table, slot: u32) void {
             var position = rowHome(table, slot + 1);
-            while (table.row_index[position] != 0) position = (position + 1) & (row_index_capacity - 1);
+            while (table.row_index[position] != 0) position = (position + 1) & (table.row_index.len - 1);
             table.row_index[position] = slot + 1;
         }
 
@@ -266,15 +296,15 @@ pub fn Storage(comptime config: types.Config) type {
             var position = rowHome(table, slot + 1);
             while (table.row_index[position] != slot + 1) {
                 if (table.row_index[position] == 0) return;
-                position = (position + 1) & (row_index_capacity - 1);
+                position = (position + 1) & (table.row_index.len - 1);
             }
-            removeAt(table, &table.row_index, position, rowHome);
+            removeAt(table, table.row_index[0..], position, rowHome);
         }
 
         pub fn indexKey(table: *Table, version: u32) void {
             if (table.primary_column == null) return;
             var position = keyHome(table, version + 1);
-            while (table.key_index[position] != 0) position = (position + 1) & (key_index_capacity - 1);
+            while (table.key_index[position] != 0) position = (position + 1) & (table.key_index.len - 1);
             table.key_index[position] = version + 1;
         }
 
@@ -283,16 +313,16 @@ pub fn Storage(comptime config: types.Config) type {
             var position = keyHome(table, version + 1);
             while (table.key_index[position] != version + 1) {
                 if (table.key_index[position] == 0) return;
-                position = (position + 1) & (key_index_capacity - 1);
+                position = (position + 1) & (table.key_index.len - 1);
             }
-            removeAt(table, &table.key_index, position, keyHome);
+            removeAt(table, table.key_index[0..], position, keyHome);
         }
 
         /// Directory slot of the row visible to `snap` whose key equals value.
         pub fn lookupKeyAt(table: *const Table, value: *const V.Cell, snap: Snapshot) ?u32 {
             const column = table.primary_column orelse return null;
             if (value.* == .null_value) return null;
-            var position = V.hash(value) & (key_index_capacity - 1);
+            var position = V.hash(value) & (table.key_index.len - 1);
             while (true) {
                 const entry = table.key_index[position];
                 if (entry == 0) return null;
@@ -301,7 +331,7 @@ pub fn Storage(comptime config: types.Config) type {
                     const slot = version.row - 1;
                     if (visibleAt(table, slot, snap) == entry - 1) return slot;
                 }
-                position = (position + 1) & (key_index_capacity - 1);
+                position = (position + 1) & (table.key_index.len - 1);
             }
         }
 
@@ -311,7 +341,7 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         pub fn freeVersions(table: *const Table) usize {
-            return versions_capacity - table.version_used;
+            return table.versions.len - table.version_used;
         }
 
         /// Caller initializes every field of the returned version.
@@ -394,7 +424,7 @@ pub fn Storage(comptime config: types.Config) type {
                 write += 1;
             }
             table.row_high = write;
-            @memset(&table.row_index, 0);
+            @memset(table.row_index[0..], 0);
             for (0..write) |slot| indexRow(table, @intCast(slot));
         }
 
@@ -407,9 +437,9 @@ pub fn Storage(comptime config: types.Config) type {
 
         /// On-demand reclamation and compaction so one new row slot fits.
         pub fn ensureRowSlot(table: *Table, horizon: u64) Error!void {
-            if (table.row_high < config.rows_per_table) return;
-            if (table.row_used == config.rows_per_table) _ = vacuum(table, horizon);
-            if (table.row_used == config.rows_per_table) return error.RowCapacity;
+            if (table.row_high < table.rows.len) return;
+            if (table.row_used == table.rows.len) _ = vacuum(table, horizon);
+            if (table.row_used == table.rows.len) return error.RowCapacity;
             compact(table);
         }
 

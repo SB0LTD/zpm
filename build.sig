@@ -110,16 +110,18 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-query", "tests/test_sql_query.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-dml", "tests/test_sql_dml.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-catalog", "tests/test_sql_catalog.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-external", "tests/test_sql_external.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try ctx.addModule("db_store", "src/db/store.sig");
     const pg_module = try ctx.addModule("postgres", "src/db/postgres.sig");
     try wire(ctx, pg_module, "scram", "src/db/scram.sig");
     _ = try ctx.addModule("mysql", "src/db/mysql.sig");
     _ = try ctx.addModule("tds", "src/db/tds.sig");
     _ = try ctx.addModule("tcp_server", "src/platform/tcp_server.sig");
+    _ = try ctx.addModule("page_region", "src/platform/page_region.sig");
     const test_db = try ctx.addStep("test-db", "Execute database wire, transaction and TCP contracts", &noopStep);
     try ctx.addDependency(test_all, test_db);
     _ = try ctx.addModule("wall_clock", "src/platform/wall_clock.sig");
-    inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy", "db_stream", "pg_stream", "wall_clock", "pg_copy" }) |name| {
+    inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy", "db_stream", "pg_stream", "wall_clock", "pg_copy", "page_region" }) |name| {
         _ = try addContract(ctx, test_db, "contract-" ++ name, "tests/test_" ++ name ++ ".sig", &.{
             importEntry("sql", "src/core/sql.sig"),                   importEntry("db_store", "src/db/store.sig"),
             importEntry("scram", "src/db/scram.sig"),                 importEntry("durable_log", "src/db/durable_log.sig"),
@@ -127,6 +129,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("stream_server", "src/db/stream_server.sig"), importEntry("postgres", "src/db/postgres.sig"),
             importEntry("mysql", "src/db/mysql.sig"),                 importEntry("tds", "src/db/tds.sig"),
             importEntry("tcp_server", "src/platform/tcp_server.sig"), importEntry("wall_clock", "src/platform/wall_clock.sig"),
+            importEntry("page_region", "src/platform/page_region.sig"),
         });
     }
     _ = try ctx.addModule("math", "src/core/math.sig");

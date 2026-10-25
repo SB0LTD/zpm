@@ -80,6 +80,48 @@ fn sortContract() !void {
     for (seen) |flag| try check(flag);
 }
 
+const StableCounting = struct {
+    keys: []const u32,
+    calls: u64 = 0,
+    fail_at: u64 = 0,
+    pub fn order(self: *StableCounting, a: u32, b: u32) sql.Error!i8 {
+        self.calls += 1;
+        if (self.fail_at != 0 and self.calls == self.fail_at) return error.QueryCanceled;
+        if (self.keys[a] < self.keys[b]) return -1;
+        if (self.keys[a] > self.keys[b]) return 1;
+        return if (a < b) -1 else if (a > b) 1 else 0;
+    }
+};
+fn topKContract() !void {
+    var keys: [4096]u32 = undefined;
+    var all: [4096]u32 = undefined;
+    var scratch: [4096]u32 = undefined;
+    var heap: [4096]u32 = undefined;
+    for (0..4) |pattern| {
+        for (0..keys.len) |i| {
+            keys[i] = switch (pattern) { 0 => @intCast((i * 17) % 37), 1 => @intCast(keys.len-i), 2 => @intCast(i), else => 7 };
+            all[i] = @intCast(i);
+        }
+        var reference = StableCounting{ .keys = &keys };
+        _ = try sql.mergeSort(&all, &scratch, &reference);
+        for ([_]usize{0,1,2,16,63,512,4096}) |k| {
+            var comparator = StableCounting{ .keys = &keys };
+            var used: usize = 0;
+            for (0..keys.len) |i| try sql.offerTopK(heap[0..k], &used, @intCast(i), &comparator);
+            try check(used == k);
+            // The bound excludes final ordering, which costs O(k log k).
+            try check(comparator.calls <= keys.len * (2 * ceilLog2(@max(k,1)) + 3));
+            _ = try sql.mergeSort(heap[0..used], scratch[0..used], &comparator);
+            for (heap[0..used], all[0..used]) |actual,wanted| try check(actual == wanted);
+        }
+    }
+    var failing = StableCounting{ .keys = &keys, .fail_at = 2 };
+    var used: usize = 0;
+    try sql.offerTopK(heap[0..2], &used, 0, &failing);
+    try sql.offerTopK(heap[0..2], &used, 1, &failing);
+    if (sql.offerTopK(heap[0..2], &used, 2, &failing)) |_| return error.CancelIgnored else |err| try check(err == error.QueryCanceled);
+}
+
 // ---- result rendering ---------------------------------------------------
 
 var text_buffer: [8192]u8 = undefined;
@@ -345,6 +387,7 @@ fn capacity() !void {
 
 pub fn main(init: std.process.Init) !void {
     try sortContract();
+    try topKContract();
     try ordering();
     try aggregates();
     try bigGroups();

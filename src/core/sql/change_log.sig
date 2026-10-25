@@ -160,7 +160,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
     const S = storage.Storage(config);
     const overlay_capacity = blk: {
         var capacity: usize = 2;
-        while (capacity < config.rows_per_table * config.tables * 4) capacity *= 2;
+        const entries = if (config.external_storage)
+            (if (config.tx_writes == 0) @max(config.rows_per_table * 2, 64) else config.tx_writes)
+        else config.rows_per_table * config.tables;
+        while (capacity < entries * 4) capacity *= 2;
         break :blk capacity;
     };
     return struct {
@@ -740,7 +743,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (findRow(scratch, index, rowid) != null) return error.ChangeRecordConflict;
                         var key_offset: u32 = 0;
                         try decodeRow(&reader, vt, &row, &key_offset);
-                        if (vt.live_rows == config.rows_per_table) return error.ChangeRecordConflict;
+                        if (vt.live_rows >= db.tables[index].rows.len) return error.ChangeRecordConflict;
                         if (vt.primary) |column| {
                             if (try keyTaken(db, scratch, record, index, &row.cells[column], 0)) return error.ChangeRecordConflict;
                             try putKey(scratch, index, V.hash(&row.cells[column]), rowid);
