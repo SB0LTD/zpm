@@ -76,6 +76,15 @@ stored rows using only 1024 query references, fixed scratch for 64 groups,
 typed key equivalence, collisions, pending-version visibility, cancellation,
 overflow and capacity failure atomicity.
 
+At high group cardinality, hash states can cost more than sorted runs. Pure
+eligible queries retry the existing operator on WorkspaceCapacity after releasing
+private scratch. Execution work already spent remains charged. Plans containing
+function or subquery nodes conservatively use the existing path immediately;
+retry never repeats nextval/clock or nested evaluation. A 350-group/seven-aggregate
+regression verifies old workspace capacity, including a volatile WHERE sequence
+whose lastval proves exactly one evaluation per source row. This safety policy
+is conservative; bounded paths for those additional shapes remain open.
+
 `execute(source, &result)` accepts one statement and copies input names and
 text. Successful SELECT copies headers/rows into result, without borrowing
 database memory. Mutation results expose `affected_rows`; CREATE/DROP report 0.
