@@ -85,6 +85,7 @@ pub fn Exec(comptime config: types.Config) type {
             width: usize,
 
             pub fn add(self: *RowSink, cells: []const V.Cell) Error!void {
+                try self.query.session.checkpoint();
                 std_assert(cells.len == self.width);
                 const at = try self.query.cells(self.width);
                 for (cells, 0..) |cell, index| self.query.work.cells[at + index] = cell;
@@ -115,6 +116,7 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn cells(self: *Query, count: usize) Error!u32 {
+                try self.session.checkpoint();
                 const work = self.work;
                 if (work.cell_high - work.cell_low < count) return error.WorkspaceCapacity;
                 const at = work.cell_low;
@@ -131,6 +133,7 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn push(self: *Query, list: *List, handle: u32) Error!void {
+                try self.session.checkpoint();
                 const at = try self.refs(1);
                 if (list.count == 0) list.start = at;
                 std_assert(list.start + list.count == at);
@@ -190,6 +193,7 @@ pub fn Exec(comptime config: types.Config) type {
                     const table = &self.tables[index];
                     var list: List = .{ .start = @intCast(self.work.ref_low) };
                     for (0..table.row_high) |slot| {
+                        try self.session.checkpoint();
                         const version = S.visibleAt(table, slot, self.snap) orelse continue;
                         try self.push(&list, version);
                     }
@@ -219,6 +223,7 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn emit(self: *Query, out: *Tuples, previous: Tuples, index: ?usize, handle: u32) Error!void {
+                try self.session.checkpoint();
                 const at = try self.refs(out.width);
                 if (out.count == 0) out.start = at;
                 std_assert(out.start + out.count * out.width == at);
@@ -266,6 +271,7 @@ pub fn Exec(comptime config: types.Config) type {
                                 };
                             }
                         } else for (self.handles(rows), 0..) |handle, position| {
+                            try self.session.checkpoint();
                             ctx.tuple[stage] = self.rowOf(source, handle);
                             if (stage != 0 and source.on != none and (try E.truth(&ctx, source.on)) != true) continue;
                             any = true;
@@ -322,6 +328,7 @@ pub fn Exec(comptime config: types.Config) type {
                 count: u32,
 
                 pub fn order(self: *const KeySorter, a: u32, b: u32) Error!i8 {
+                    try self.query.session.checkpoint();
                     const work = self.query.work;
                     for (0..self.count) |column| {
                         const result = V.compare(&work.cells[self.base + a * self.width + column], &work.cells[self.base + b * self.width + column]);
@@ -529,6 +536,7 @@ pub fn Exec(comptime config: types.Config) type {
                 key_count: usize,
 
                 pub fn order(self: *const RowSorter, a: u32, b: u32) Error!i8 {
+                    try self.query.session.checkpoint();
                     const work = self.query.work;
                     for (self.keys[0..self.key_count]) |key| {
                         const x = &work.cells[a + key.column];
@@ -724,6 +732,7 @@ pub fn Exec(comptime config: types.Config) type {
                 var working = result;
                 while (true) {
                     state.state = .iterating;
+                    try self.session.checkpoint();
                     state.working = working;
                     at = self.mark();
                     var step = try self.run(p.right, outer);
@@ -881,6 +890,7 @@ pub fn Exec(comptime config: types.Config) type {
             query: *const B.Select,
 
             pub fn order(self: *const Sorter, left: u32, right: u32) Error!i8 {
+                try self.ctx.session.checkpoint();
                 for (self.query.order[0..self.query.order_count]) |*key| {
                     self.ctx.row = &self.table.versions[left].cells;
                     const a = try E.eval(self.ctx, key.expr);
@@ -911,6 +921,7 @@ pub fn Exec(comptime config: types.Config) type {
         /// newest committed one, whose WHERE is re-checked here when it
         /// changed), null to skip the row, or WouldBlock to park.
         pub fn select(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, query: *const B.Select, snap: storage.Snapshot, result: anytype, locker: anytype, session: *const value_module.Session) Error!void {
+            try session.checkpoint();
             var ctx: E.Context = .{ .source = source, .pool = pool, .session = session };
             var plain = true;
             for (query.targets[0..query.count]) |id| plain = plain and simple(pool, id);
@@ -943,6 +954,7 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 },
                 .scan => for (0..table.row_high) |slot| {
+                    try session.checkpoint();
                     const version = S.visibleAt(table, slot, snap) orelse continue;
                     if (!try keep(&ctx, query.where, &table.versions[version].cells)) continue;
                     indices[found] = version;
@@ -983,6 +995,11 @@ pub fn Exec(comptime config: types.Config) type {
                     for (query.targets[0..query.count]) |id| _ = try E.eval(&ctx, id);
                 }
             }
+            // Validation accounted for every expression and may fail/cancel.
+            // Publishing the validated result must remain infallible.
+            var publishing = session.*;
+            publishing.control = null;
+            ctx.session = &publishing;
             writeHeader(query, result);
             result.row_count = rows;
             for (0..rows) |row_index| {

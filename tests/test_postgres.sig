@@ -630,6 +630,8 @@ fn backendErrorStates() !void {
     try startup(&s, &db);
     const Case = struct { err: anyerror, state: []const u8 };
     const errors = [_]Case{
+        .{ .err = error.QueryWorkLimit, .state = "54000" },
+        .{ .err = error.QueryCanceled, .state = "57014" },
         .{ .err = error.SerializationFailure, .state = "40001" },
         .{ .err = error.TransactionCapacity, .state = "53200" },
         .{ .err = error.TransactionLogCapacity, .state = "53200" },
@@ -771,6 +773,12 @@ fn storeContracts() !void {
     put32(cancel_bytes[4..8], 80877102);
     put32(cancel_bytes[8..12], 7);
     put32(cancel_bytes[12..16], 0xdeadbeef);
+    for (0..16) |len| try check(pg.parseCancel(cancel_bytes[0..len]) == null);
+    try check(pg.isCancelHeader(cancel_bytes[0..8]));
+    try check(pg.parseCancel(&cancel_bytes).?.secret == 0xdeadbeef);
+    cancel_bytes[7] ^= 1;
+    try check(!pg.isCancelHeader(&cancel_bytes) and pg.parseCancel(&cancel_bytes) == null);
+    cancel_bytes[7] ^= 1;
     const cancel = try fresh.handle(&a, &cancel_bytes, &store_output);
     try check(cancel.close and cancel.written == 0 and cancel.cancel.?.pid == 7 and cancel.cancel.?.secret == 0xdeadbeef);
 
