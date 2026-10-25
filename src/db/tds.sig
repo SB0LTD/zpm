@@ -9,8 +9,11 @@
 
 pub const max_request_bytes: usize = 65536;
 pub const max_parameters: usize = 32;
-pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false };
-pub const Error = error{ BufferTooSmall, MalformedPacket, RequestTooLarge, InvalidSequence, InvalidState, InvalidUnicode, UnsupportedValue, UnsupportedRpc };
+/// `blocked`: the statement is parked on a lock (consumed = written = 0);
+/// re-deliver the same packet when the store reports progress.
+pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false, blocked: bool = false };
+/// WouldBlock never leaves handle(); it becomes Reply.blocked.
+pub const Error = error{ BufferTooSmall, MalformedPacket, RequestTooLarge, InvalidSequence, InvalidState, InvalidUnicode, UnsupportedValue, UnsupportedRpc, WouldBlock };
 
 fn le(source: []const u8) u64 {
     var value: u64 = 0;
@@ -410,6 +413,15 @@ pub fn Session(comptime DB: type) type {
             return true;
         }
 
+
+        /// New types (NUMERIC, REAL/DOUBLE, temporal, JSON) travel as TEXT
+        /// columns here: native metadata is not implemented (flag F-M).
+        fn textify(db: *DB, result: *DB.Result) anyerror!void {
+            if (!@hasDecl(DB.Result, "textify")) return;
+            const session = if (@hasDecl(DB, "valueSession")) db.valueSession() else DB.Result.default_session;
+            try result.textify(session);
+        }
+
         fn results(self: *Self, writer: *Writer, completion: u8) Error!void {
             // Validate all text before writing COLMETADATA, so encoding errors
             // produce a complete ERROR/DONE response instead of partial rows.
@@ -439,7 +451,7 @@ pub fn Session(comptime DB: type) type {
                             try writer.byte(0x68);
                             try writer.byte(1);
                         }, // BITN
-                        .text => {
+                        else => {
                             try writer.byte(0xe7); // NVARCHAR
                             try writer.number(65534, 2);
                             try writer.bytes(&.{ 9, 4, 0xd0, 0, 0x34 }); // SQL_Latin1_General_CP1_CI_AS
@@ -453,8 +465,8 @@ pub fn Session(comptime DB: type) type {
                     try writer.byte(0xd1);
                     for (row.cells[0..self.result.column_count], 0..) |*cell, column| switch (cell.*) {
                         .null_value => switch (self.result.column_types[column]) {
-                            .text => try writer.number(0xffff, 2),
-                            else => try writer.byte(0),
+                            .integer, .integer32, .boolean => try writer.byte(0),
+                            else => try writer.number(0xffff, 2),
                         },
                         .integer => |value| {
                             if (self.result.column_types[column] == .integer32) {
@@ -473,6 +485,8 @@ pub fn Session(comptime DB: type) type {
                             try writer.number((try utf16Length(value.slice())) * 2, 2);
                             try writer.unicode(value.slice());
                         },
+                        // textify() rendered every other type as text.
+                        else => unreachable,
                     };
                 }
             }
@@ -488,11 +502,12 @@ pub fn Session(comptime DB: type) type {
             const before = txStatus(db);
             if (db.execute(query, &self.result)) |_| {
                 try notifyTransaction(writer, before, txStatus(db), isRollback(query));
+                textify(db, &self.result) catch |err| return writer.failure(245, @errorName(err));
                 self.results(writer, 0xfd) catch |err| {
                     if (err == error.BufferTooSmall) return err;
                     try writer.failure(245, @errorName(err));
                 };
-            } else |err| try writer.failure(switch (err) {
+            } else |err| if (blockedError(err)) return error.WouldBlock else try writer.failure(switch (err) {
                 error.TableNotFound => 208,
                 error.ColumnNotFound => 207,
                 error.PrimaryKeyViolation => 2627,
@@ -809,11 +824,12 @@ pub fn Session(comptime DB: type) type {
             const before = txStatus(db);
             if (db.execute(query, &self.result)) |_| {
                 try notifyTransaction(writer, before, txStatus(db), isRollback(query));
+                textify(db, &self.result) catch |err| return writer.failureToken(245, @errorName(err), 0xfe);
                 self.results(writer, 0xff) catch |err| return writer.failureToken(245, @errorName(err), 0xfe);
                 try writer.byte(0x79); // RETURNSTATUS
                 try writer.number(0, 4);
                 try writer.doneToken(0xfe, 0, 0); // DONEPROC
-            } else |err| try writer.failureToken(switch (err) {
+            } else |err| if (blockedError(err)) return error.WouldBlock else try writer.failureToken(switch (err) {
                 error.TableNotFound => 208,
                 error.ColumnNotFound => 207,
                 error.PrimaryKeyViolation => 2627,
@@ -821,6 +837,11 @@ pub fn Session(comptime DB: type) type {
                 error.DatabaseBusy => 1222,
                 else => 102,
             }, @errorName(err), 0xfe);
+        }
+
+        fn blockedError(err: anytype) bool {
+            const any: anyerror = err;
+            return any == error.WouldBlock;
         }
 
         fn transactionRequest(db: *DB, source: []const u8, writer: *Writer) Error!void {
@@ -857,6 +878,8 @@ pub fn Session(comptime DB: type) type {
         }
 
         pub fn handle(self: *Self, db: *DB, input: []const u8, out: []u8) Error!Reply {
+            // TDS BIT parameters arrive as integer 0/1 (design §4.2).
+            if (@hasField(DB, "dialect")) db.dialect = .tds;
             if (self.state == .closed) return error.InvalidState;
             if (input.len < 8) return .{};
             const packet_length = be16(input[2..4]);
@@ -868,6 +891,8 @@ pub fn Session(comptime DB: type) type {
             if (self.message_len != 0 and (input[0] != self.message_type or input[6] != self.next_packet_id)) return error.InvalidSequence;
             const final = input[1] & 1 != 0;
             if (!final and payload.len == 0) return error.MalformedPacket;
+            const saved_len = self.message_len;
+            const saved_id = self.next_packet_id;
             if (!final or self.message_len != 0) {
                 if (self.message_len == 0) self.message_type = input[0];
                 @memcpy(self.message[self.message_len..][0..payload.len], payload);
@@ -876,28 +901,42 @@ pub fn Session(comptime DB: type) type {
                 if (!final) return .{ .consumed = packet_length };
             }
             const source = if (self.message_len == 0) payload else self.message[0..self.message_len];
-            defer self.message_len = 0;
+            var keep_message = false;
+            defer {
+                if (!keep_message) self.message_len = 0;
+            }
             var writer: Writer = .{ .out = out, .packet_size = self.packet_size };
             try writer.open();
             var reply: Reply = .{ .consumed = packet_length };
-            switch (self.state) {
-                .prelogin => {
+            const outcome: Error!void = switch (self.state) {
+                .prelogin => blk: {
                     if (input[0] != 0x12) return error.InvalidState;
                     reply.close = try self.prelogin(source, &writer);
+                    break :blk {};
                 },
-                .login => {
+                .login => blk: {
                     if (input[0] != 0x10) return error.InvalidState;
                     reply.close = try self.login(source, &writer);
+                    break :blk {};
                 },
                 .ready => switch (input[0]) {
-                    1 => try self.batch(db, source, &writer),
-                    3 => try self.rpc(db, source, &writer),
-                    6 => try writer.done(0x20, 0), // ATTENTION acknowledgement
-                    0x0e => try transactionRequest(db, source, &writer),
-                    else => try writer.failure(40510, "Unsupported TDS packet type"),
+                    1 => self.batch(db, source, &writer),
+                    3 => self.rpc(db, source, &writer),
+                    6 => writer.done(0x20, 0), // ATTENTION acknowledgement
+                    0x0e => transactionRequest(db, source, &writer),
+                    else => writer.failure(40510, "Unsupported TDS packet type"),
                 },
                 .closed => return error.InvalidState,
-            }
+            };
+            outcome catch |err| {
+                if (err != error.WouldBlock) return err;
+                // Parked: the final packet is re-delivered, so drop it from
+                // the reassembly buffer and keep the earlier packets.
+                keep_message = saved_len != 0;
+                self.message_len = saved_len;
+                self.next_packet_id = saved_id;
+                return .{ .blocked = true };
+            };
             writer.seal(true);
             reply.written = writer.pos;
             if (reply.close) self.state = .closed;

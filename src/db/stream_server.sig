@@ -19,6 +19,9 @@ pub fn Server(comptime Database: type, comptime Protocol: type, comptime input_c
                 if (self.used != 0) {
                     const reply = try session.handle(database, self.input[0..self.used], &self.output);
                     if (reply.consumed > self.used or reply.written > self.output.len) return error.InvalidProtocolReply;
+                    // One stream is one session: nothing else could release a
+                    // lock it waits for, so a parked statement ends the session.
+                    if (@hasField(@TypeOf(reply), "blocked") and reply.blocked) return error.StatementBlocked;
                     if (reply.consumed == 0 and reply.written != 0) return error.InvalidProtocolReply;
                     if (reply.written != 0) try io.writeAll(self.output[0..reply.written]);
                     if (reply.close) return;

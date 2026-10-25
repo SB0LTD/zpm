@@ -28,6 +28,8 @@ fn same(actual: []const u8, expected: []const u8) !void {
 fn execute(db: *DB, result: *DB.Result, source: []const u8) !void {
     try db.execute(source, result);
     statements += 1;
+    // An autocommit statement publishes everything and holds nothing.
+    try check(quiet(db));
 }
 
 fn equalResult(left: *const DB.Result, right: *const DB.Result) bool {
@@ -63,6 +65,8 @@ fn equalResult(left: *const DB.Result, right: *const DB.Result) bool {
                     },
                     else => return false,
                 },
+                // This contract's tables use INTEGER/BOOLEAN/TEXT only.
+                else => return false,
             }
         }
     }
@@ -76,7 +80,14 @@ fn rejects(db: *DB, result: *DB.Result, source: []const u8, expected: ?anyerror)
     } else |err| {
         if (expected) |wanted| try check(err == wanted) else try check(true);
         try check(equalResult(&before, result));
+        try check(quiet(db));
     }
+}
+
+/// No active transaction, held lock or uncommitted version remains.
+fn quiet(db: *const DB) bool {
+    const usage = db.usage();
+    return usage.transactions == 0 and usage.row_locks == 0 and usage.table_locks == 0 and usage.pending_versions == 0;
 }
 
 fn isNull(cell: DB.Cell) bool {
@@ -150,7 +161,7 @@ fn constraintsAndAtomicity() !void {
     try rejects(&db, &result, "INSERT INTO accounts VALUES (1, 'duplicate', 30, true)", error.PrimaryKeyViolation);
     try rejects(&db, &result, "INSERT INTO accounts VALUES (NULL, 'missing', 30, true)", error.NotNullViolation);
     try rejects(&db, &result, "INSERT INTO accounts (id, balance) VALUES (3, 30)", error.NotNullViolation);
-    try rejects(&db, &result, "INSERT INTO accounts VALUES (3, 'wrong', 'thirty', true)", error.TypeMismatch);
+    try rejects(&db, &result, "INSERT INTO accounts VALUES (3, 'wrong', 'thirty', true)", error.InvalidTextRepresentation);
     try rejects(&db, &result, "UPDATE accounts SET id = 7", error.PrimaryKeyViolation);
     try rejects(&db, &result, "UPDATE accounts SET balance = 999, id = 7", error.PrimaryKeyViolation);
     try rejects(&db, &result, "UPDATE accounts SET name = NULL WHERE id = 1", error.NotNullViolation);
@@ -209,10 +220,10 @@ fn namesAndTypeErrors() !void {
     try rejects(&db, &result, "SELECT missing FROM records", error.ColumnNotFound);
     try rejects(&db, &result, "SELECT * FROM missing", error.TableNotFound);
     try rejects(&db, &result, "SELECT * FROM records WHERE absent = 1", error.ColumnNotFound);
-    try rejects(&db, &result, "SELECT * FROM records WHERE id = 'wrong'", error.TypeMismatch);
+    try rejects(&db, &result, "SELECT * FROM records WHERE id = 'wrong'", error.InvalidTextRepresentation);
     try rejects(&db, &result, "UPDATE records SET absent = 1", error.ColumnNotFound);
-    try rejects(&db, &result, "UPDATE records SET id = 'wrong'", error.TypeMismatch);
-    try rejects(&db, &result, "DELETE FROM records WHERE id = TRUE", error.TypeMismatch);
+    try rejects(&db, &result, "UPDATE records SET id = 'wrong'", error.InvalidTextRepresentation);
+    try rejects(&db, &result, "DELETE FROM records WHERE id = TRUE", error.UndefinedFunction);
     try rejects(&db, &result, "INSERT INTO records (id, ID) VALUES (1, 2)", error.DuplicateColumn);
     try rejects(&db, &result, "SELECT * FROM records ORDER BY absent", error.ColumnNotFound);
     try rejects(&db, &result, "DROP TABLE absent", error.TableNotFound);
@@ -289,7 +300,7 @@ fn lexerAndOwnership() !void {
 fn integerBounds() !void {
     var db: DB = .{};
     var result: DB.Result = .{};
-    try execute(&db, &result, "CREATE TABLE numbers (value INTEGER)");
+    try execute(&db, &result, "CREATE TABLE numbers (value BIGINT)");
     try execute(&db, &result, "INSERT INTO numbers VALUES (-9223372036854775808)");
     try execute(&db, &result, "INSERT INTO numbers VALUES (9223372036854775807)");
     try execute(&db, &result, "INSERT INTO numbers VALUES (0)");
@@ -324,8 +335,11 @@ fn parserAndSortEdges() !void {
     try check(result.rows[0].cells[0].integer == 1 and result.rows[1].cells[0].integer == 3);
     try check(result.rows[2].cells[0].integer == 4 and result.rows[3].cells[0].integer == 2);
     try rejects(&db, &result, "SELECT id FROM edges LIMIT 18446744073709551616", error.IntegerOverflow);
-    try rejects(&db, &result, "SELECT id FROM edges WHERE id = 1 OR id = 2", error.Syntax);
-    try rejects(&db, &result, "SELECT COUNT(*) FROM edges", null);
+    try execute(&db, &result, "SELECT id FROM edges WHERE id = 1 OR id = 2 ORDER BY id");
+    try check(result.row_count == 2 and result.rows[0].cells[0].integer == 1 and result.rows[1].cells[0].integer == 2);
+    // Aggregates are supported since step 3.4 (design §5.5).
+    try execute(&db, &result, "SELECT COUNT(*) FROM edges");
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 4);
     try rejects(&db, &result, "CREATE TABLE two_keys (a INT PRIMARY KEY, b INT PRIMARY KEY)", error.Syntax);
     try execute(&db, &result, "CREATE TABLE abcdefghijklmnopqrstuvwxyzabcdef (value TEXT)");
     try execute(&db, &result, "INSERT INTO abcdefghijklmnopqrstuvwxyzabcdef VALUES ('1234567890123456789012345678901234567890123456789012345678901234')");
@@ -340,7 +354,11 @@ fn fuzzOne(baseline: *const DB, before: *const DB.Result, source: []const u8) !v
     fuzz_inputs += 1;
     if (db.execute(source, &result)) |_| {
         // A truncation can itself be a complete valid SQL statement.
+        try check(quiet(&db));
     } else |_| {
+        // Failure atomicity through the MVCC API: no transaction, lock or
+        // uncommitted version of the failed statement survives.
+        try check(quiet(&db));
         try check(equalResult(before, &result));
         try check(db.tableCount() == baseline.tableCount());
         try execute(&db, &result, "SELECT * FROM fuzz ORDER BY id");
@@ -511,8 +529,11 @@ const BoundaryProbe = struct {
             var expected: DB.Result = .{};
             var observed: DB.Result = .{};
             if (self.before.execute(query, &expected)) |_| {
-                try self.db.execute(query, &observed);
-                try check(equalResult(&expected, &observed));
+                // Under MVCC an unpublished DROP TABLE holds AccessExclusive:
+                // a reader waits (WouldBlock) instead of seeing a change.
+                if (self.db.execute(query, &observed)) |_| {
+                    try check(equalResult(&expected, &observed));
+                } else |err| try check(err == error.WouldBlock and self.db.usage().table_locks != 0);
             } else |err| {
                 if (self.db.execute(query, &observed)) |_| return error.EarlyPublication else |other| try check(err == other);
             }
@@ -563,7 +584,7 @@ fn commitBoundary() !void {
         "CREATE TABLE t (id INT)", "CREATE TABLE u (id WRONG)",
         "CREATE TABLE u (id INT); DROP TABLE t", "DROP TABLE t trailing",
         "DROP TABLE missing", "INSERT INTO t VALUES (4, 'duplicate')",
-        "INSERT INTO t VALUES (5, NULL)", "INSERT INTO t VALUES (5, 17)",
+        "INSERT INTO t VALUES (5, NULL)", "INSERT INTO t VALUES (5, 1 / 0)",
         "INSERT INTO t VALUES (5, 'bad'); DELETE FROM t",
         "UPDATE t SET value = NULL", "UPDATE t SET missing = 1",
         "UPDATE t SET id = 5 trailing", "DELETE FROM t trailing",

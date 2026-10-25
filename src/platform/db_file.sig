@@ -57,6 +57,34 @@ pub const File = struct {
     pub fn createExclusive(path: []const u8) Error!File {
         return openImpl(path, true, true);
     }
+    /// Read-only, shared and unlocked (resource files such as TZif zone
+    /// data); follows symbolic links, never creates. Only readAt/length/close
+    /// are meaningful on the handle.
+    pub fn openReadOnly(path: []const u8) Error!File {
+        var file: File = .{};
+        if (windows) {
+            var path_buf: [path_capacity]u16 = undefined;
+            const z = try widePath(path, &path_buf);
+            // GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING.
+            file.handle = Win.CreateFileW(z.ptr, 0x80000000, 3, null, 3, 0x80, null);
+            if (file.handle == invalid) return error.FileOpenFailed;
+        } else if (builtin.os.tag == .linux) {
+            var path_buf: [path_capacity]u8 = undefined;
+            const z = try narrowPath(path, &path_buf);
+            const flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true };
+            const rc = linux.openat(linux.AT.FDCWD, z.ptr, flags, 0);
+            if (linux.errno(rc) != .SUCCESS) return error.FileOpenFailed;
+            file.handle = @intCast(rc);
+        } else if (builtin.os.tag == .macos) {
+            var path_buf: [path_capacity]u8 = undefined;
+            const z = try narrowPath(path, &path_buf);
+            const flags: darwin.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true };
+            const fd = darwin.open(z.ptr, flags, @as(c_uint, 0));
+            if (fd < 0) return error.FileOpenFailed;
+            file.handle = fd;
+        } else return error.UnsupportedPlatform;
+        return file;
+    }
     fn openImpl(path: []const u8, exclusive: bool, create: bool) Error!File {
         var file: File = .{};
         if (windows) {

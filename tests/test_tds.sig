@@ -108,6 +108,10 @@ fn execute(session: *Session, db: *DB, query: []const u8) ![]const u8 {
     return flatten(try session.handle(db, packet(1, 1, 2, try batch(&buffer, query)), &output));
 }
 
+fn session_handle_batch(session: *Session, db: *DB, buffer: *[2048]u8, query: []const u8) !tds.Reply {
+    return session.handle(db, packet(1, 1, 2, try batch(buffer, query)), &output);
+}
+
 const Reader = struct {
     source: []const u8,
     pos: usize = 0,
@@ -127,8 +131,7 @@ const Reader = struct {
 
 fn loginAndFragmentation() !void {
     store = .{};
-    var workspace: Raw = .{};
-    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
+    var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     const pre = packet(0x12, 1, 1, &prelogin);
     for (0..pre.len) |cut| {
@@ -152,8 +155,7 @@ fn loginAndFragmentation() !void {
 
 fn typedRowsAndErrors() !void {
     store = .{};
-    var workspace: Raw = .{};
-    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
+    var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     try connect(&session, &db);
     const created = try execute(&session, &db, "CREATE TABLE data (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN, note TEXT)");
@@ -193,8 +195,7 @@ fn typedRowsAndErrors() !void {
 
 fn outputFragmentation() !void {
     store = .{};
-    var workspace: Raw = .{};
-    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
+    var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     try connect(&session, &db);
     _ = try execute(&session, &db, "CREATE TABLE many (a TEXT, b TEXT, c TEXT, d TEXT)");
@@ -218,8 +219,7 @@ fn outputFragmentation() !void {
 
 fn transactionManagerAndPreflight() !void {
     store = .{};
-    var workspace: Raw = .{};
-    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
+    var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     try connect(&session, &db);
     var buffer: [256]u8 = undefined;
@@ -253,10 +253,8 @@ fn transactionManagerAndPreflight() !void {
 
 fn concurrentCommittedVisibility() !void {
     store = .{};
-    var first_workspace: Raw = .{};
-    var second_workspace: Raw = .{};
-    var first: DB = .{ .store = &store, .id = 1, .transaction_workspace = &first_workspace };
-    var second: DB = .{ .store = &store, .id = 2, .transaction_workspace = &second_workspace };
+    var first: DB = .{ .store = &store, .id = 1 };
+    var second: DB = .{ .store = &store, .id = 2 };
     var a: Session = .{};
     var b: Session = .{};
     try connect(&a, &first);
@@ -268,17 +266,25 @@ fn concurrentCommittedVisibility() !void {
     _ = try execute(&a, &first, "UPDATE views SET id = 2 WHERE id = 1");
     _ = try execute(&b, &second, "SELECT id FROM views");
     try check(b.result.row_count == 1 and b.result.rows[0].cells[0].integer == 1);
-    _ = try execute(&b, &second, "UPDATE views SET id = 3 WHERE id = 1");
-    try check(second.transactionStatus() == 'I');
+    // READ COMMITTED: the same-row writer waits (blocked, nothing consumed
+    // or written), then re-checks the committed row: id is now 2, 0 rows.
+    var parked_buffer: [2048]u8 = undefined;
+    const parked = try session_handle_batch(&b, &second, &parked_buffer, "UPDATE views SET id = 3 WHERE id = 1");
+    try check(parked.blocked and parked.consumed == 0 and parked.written == 0 and second.blocked());
     _ = try execute(&a, &first, "SELECT id FROM views");
     try check(a.result.rows[0].cells[0].integer == 2);
-    const conflict = try execute(&a, &first, "COMMIT");
-    try check(conflict[0] == 0xaa and first.transactionStatus() == 'E');
-    _ = try execute(&a, &first, "ROLLBACK");
+    const committed = try execute(&a, &first, "COMMIT");
+    try check(committed[0] != 0xaa and first.transactionStatus() == 'I');
+    const resumed = try execute(&b, &second, "UPDATE views SET id = 3 WHERE id = 1");
+    try check(!second.blocked() and second.transactionStatus() == 'I' and b.result.affected_rows == 0);
+    try check(resumed[0] != 0xaa);
+    const usage = store.database.usage();
+    try check(usage.transactions == 0 and usage.row_locks == 0 and usage.table_locks == 0);
+    try check(usage.pending_versions == 0);
     _ = try execute(&a, &first, "SELECT id FROM views");
-    try check(first.transactionStatus() == 'I' and a.result.rows[0].cells[0].integer == 3);
+    try check(first.transactionStatus() == 'I' and a.result.rows[0].cells[0].integer == 2);
     _ = try execute(&a, &first, "BEGIN");
-    _ = try execute(&a, &first, "UPDATE views SET id = 4 WHERE id = 3");
+    _ = try execute(&a, &first, "UPDATE views SET id = 4 WHERE id = 2");
     _ = try execute(&a, &first, "COMMIT");
     try check(first.transactionStatus() == 'I');
     _ = try execute(&b, &second, "SELECT id FROM views");
@@ -351,8 +357,7 @@ const RpcBuilder = struct {
 
 fn rpcParameters() !void {
     store = .{};
-    var workspace: Raw = .{};
-    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
+    var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     try connect(&session, &db);
     _ = try execute(&session, &db, "CREATE TABLE binds (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN, note TEXT)");
@@ -427,8 +432,7 @@ fn rpcParameters() !void {
 
 fn malformedAndFuzz() !void {
     store = .{};
-    var workspace: Raw = .{};
-    var db: DB = .{ .store = &store, .id = 1, .transaction_workspace = &workspace };
+    var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     var pre = prelogin;
     pre[17] = 1;

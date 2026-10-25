@@ -52,6 +52,21 @@ pub fn main(init: std.process.Init) !void {
     try log.append(&file, 1, "durable transaction");
     const committed_length = try file.length();
     try check(committed_length == log.overhead + "durable transaction".len);
+    // Read-only resource handles (zone data) share with the locked writer,
+    // read the same bytes and never create files.
+    var reader = try disk.File.openReadOnly(path);
+    var shared: [64]u8 = undefined;
+    try check(try reader.length() == committed_length);
+    const shared_count = try reader.readAt(0, &shared);
+    try check(shared_count == @min(shared.len, committed_length));
+    reader.close();
+    var missing_buffer: [256]u8 = undefined;
+    const missing_path = try std.fmt.bufPrint(&missing_buffer, "sig-out/db-file-contract-{d}.missing", .{pid});
+    if (disk.File.openReadOnly(missing_path)) |unexpected_value| {
+        var unexpected = unexpected_value;
+        unexpected.close();
+        return error.ReadOnlyOpenCreatedFile;
+    } else |err| try check(err == error.FileOpenFailed);
     try file.appendAll("RAMS");
     try file.sync();
     file.close();

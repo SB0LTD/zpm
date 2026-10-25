@@ -4,12 +4,25 @@
 //! intended only for a caller that explicitly binds to a trusted interface.
 //! SQL semantics are those provided by DB; unsupported features return SQLSTATE.
 const scram = @import("scram");
+const pg_types = @import("pg_types.sig");
+const pg_copy = @import("pg_copy.sig");
+/// COPY data formats (text, csv, binary framing and escaping).
+pub const copy_format = pg_copy;
 pub const max_packet: usize = 16384;
 pub const sql_capacity: usize = 4096;
 pub const statement_capacity: usize = 8;
 pub const portal_capacity: usize = 8;
 pub const parameter_capacity: usize = 32;
-pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false };
+/// A CancelRequest's key; the caller looks it up (the codec never does).
+pub const Cancel = struct { pid: u32, secret: u32 };
+/// `blocked`: the message's statement is parked on a lock (consumed =
+/// written = 0); re-deliver the same bytes when the store reports progress.
+/// During COPY FROM a row parked on a key wait is already owned by the
+/// store: `consumed` then covers the input through that row (written = 0);
+/// keep the rest buffered and call handle() again on wake (with or without
+/// new input) - the parked row is re-checked before anything is read.
+/// `cancel`: the connection carried a CancelRequest (close it afterwards).
+pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false, blocked: bool = false, cancel: ?Cancel = null };
 
 fn equal(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
@@ -136,8 +149,43 @@ const Writer = struct {
 };
 
 pub fn Session(comptime DB: type) type {
+    const T = pg_types.Types(DB.Result);
+    const has_copy = @hasDecl(DB, "copyBegin");
+    const CopyInfo = if (has_copy) DB.CopyInfo else struct {};
+    const line_bytes: usize = if (has_copy) DB.copy_line_bytes else 1;
+    const field_capacity: usize = if (has_copy) (CopyInfo{}).types.len else 1;
     return struct {
         const Self = @This();
+        const utc_session: T.Session = .{};
+
+        /// COPY FROM STDIN state (design §4.7). `remaining` counts the
+        /// bytes of the current CopyData body not yet consumed (bodies are
+        /// streamed, so their size is not bounded by the caller's input
+        /// buffer); `carry` holds an incomplete row across messages
+        /// (Config.copy_line_bytes); `discard` drops CopyData/CopyDone/
+        /// CopyFail after an error, as PostgreSQL does.
+        const CopyState = struct {
+            mode: enum { none, in, discard } = .none,
+            remaining: usize = 0,
+            info: CopyInfo = .{},
+            sql: [sql_capacity]u8 = undefined,
+            sql_len: usize = 0,
+            carry: [line_bytes]u8 = undefined,
+            carry_len: usize = 0,
+            /// The carry may hold complete rows (left by a parked row).
+            carry_rows: bool = false,
+            scratch: [2 * line_bytes]u8 = undefined,
+            header_pending: bool = false,
+            binary_header: bool = false,
+            ended: bool = false,
+            eol: pg_copy.Eol = .unknown,
+        };
+        const Fed = struct { used: usize = 0, blocked: bool = false };
+
+        fn valueSession(db: *DB) *const T.Session {
+            if (@hasDecl(DB, "valueSession")) return db.valueSession();
+            return &utc_session;
+        }
         const Name = struct {
             bytes: [64]u8 = @splat(0),
             len: usize = 0,
@@ -173,6 +221,9 @@ pub fn Session(comptime DB: type) type {
             result_rows: usize = 0,
             affected: usize = 0,
             rolled_back: bool = false,
+            command: []const u8 = "",
+            /// Savepoint depth when bound: ROLLBACK TO closes newer portals.
+            level: usize = 0,
             fn source(self: *const Portal) []const u8 {
                 return self.sql[0..self.len];
             }
@@ -188,6 +239,9 @@ pub fn Session(comptime DB: type) type {
         result: DB.Result = .{},
         active_portal: ?usize = null,
         commit_rolled_back: bool = false,
+        backend_pid: u32 = 1,
+        backend_secret: u32 = 0,
+        copy: CopyState = .{},
 
         /// Copy a verifier and a fresh CSPRNG nonce before any startup bytes.
         /// Every accepted connection needs its own unpredictable nonce; the
@@ -205,6 +259,7 @@ pub fn Session(comptime DB: type) type {
         pub fn handle(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
             if (output.len < responseCapacity()) return error.BufferTooSmall;
             if (self.authentication) |*auth| if (auth.state == .failed) return .{ .close = true };
+            if (has_copy and self.copy.mode != .none) return self.copyHandle(db, input, output);
             const prefix: usize = if (self.startup) 1 else 0;
             if (input.len < prefix + 4) return .{};
             const size = read32(input[prefix..][0..4]);
@@ -215,19 +270,19 @@ pub fn Session(comptime DB: type) type {
             }
             const total: usize = @as(usize, size) + prefix;
             if (input.len < total) return .{};
-            // Cancellation has no response in PostgreSQL. This synchronous
-            // adapter has no interruptible operation and safely ignores it.
+            // Cancellation has no response in PostgreSQL: the key goes to the
+            // caller, which owns the backend-key registry.
             if (!self.startup and total >= 8 and read32(input[4..8]) == 80877102 and total == 16)
-                return .{ .consumed = total, .close = true };
+                return .{ .consumed = total, .close = true, .cancel = .{ .pid = read32(input[8..12]), .secret = read32(input[12..16]) } };
             var close = false;
             if (!self.startup) {
-                self.handshake(input[4..total], &w) catch |err| {
+                self.handshake(db, input[4..total], &w) catch |err| {
                     w.at = 0;
                     try failure(&w, sqlstate(err), @errorName(err));
                     close = true;
                 };
             } else if (self.authentication != null and self.authentication.?.state != .complete) {
-                self.authenticate(input[0], input[5..total], &w) catch {
+                self.authenticate(db, input[0], input[5..total], &w) catch {
                     self.authentication.?.state = .failed;
                     w.at = 0;
                     try authenticationFailure(&w);
@@ -237,6 +292,9 @@ pub fn Session(comptime DB: type) type {
                 const tag = input[0];
                 if (self.failed and tag != 'S' and tag != 'X') return .{ .consumed = total };
                 close = self.dispatch(db, tag, input[5..total], &w) catch |err| blk: {
+                    const any: anyerror = err;
+                    // Parked statement: nothing consumed or written.
+                    if (any == error.WouldBlock) return .{ .blocked = true };
                     w.at = 0;
                     try failure(&w, sqlstate(err), @errorName(err));
                     if (@hasDecl(DB, "failTransaction")) db.failTransaction();
@@ -246,7 +304,13 @@ pub fn Session(comptime DB: type) type {
             }
             return .{ .consumed = total, .written = w.at, .close = close };
         }
-        fn handshake(self: *Self, payload: []const u8, w: *Writer) !void {
+        /// RAMSQL-supplied BackendKeyData (pid, secret) sent after authentication.
+        pub fn configureBackendKey(self: *Self, pid: u32, secret: u32) void {
+            self.backend_pid = pid;
+            self.backend_secret = secret;
+        }
+
+        fn handshake(self: *Self, db: *DB, payload: []const u8, w: *Writer) !void {
             var r: Reader = .{ .bytes = payload };
             const version = try r.u32be();
             if (version == 80877103 or version == 80877104) {
@@ -265,6 +329,7 @@ pub fn Session(comptime DB: type) type {
                     user = value;
                 }
                 if (equal(key, "client_encoding") and !equal(value, "UTF8") and !equal(value, "UTF-8")) return error.UnsupportedEncoding;
+                if (@hasDecl(DB, "startupParameter")) try db.startupParameter(key, value);
             }
             try r.done();
             if (user == null or user.?.len == 0) return error.UserRequired;
@@ -278,9 +343,9 @@ pub fn Session(comptime DB: type) type {
                 self.startup = true;
                 return;
             }
-            try self.authenticationComplete(w);
+            try self.authenticationComplete(db, w);
         }
-        fn authenticate(self: *Self, tag: u8, payload: []const u8, w: *Writer) !void {
+        fn authenticate(self: *Self, db: *DB, tag: u8, payload: []const u8, w: *Writer) !void {
             if (tag != 'p' or payload.len > scram.max_message + 64) return error.AuthenticationFailed;
             const auth = &self.authentication.?;
             var message: [512]u8 = undefined;
@@ -302,31 +367,48 @@ pub fn Session(comptime DB: type) type {
                 try w.u32be(12);
                 try w.append(final);
                 w.end(p);
-                try self.authenticationComplete(w);
+                try self.authenticationComplete(db, w);
             } else return error.AuthenticationFailed;
         }
-        fn authenticationComplete(self: *Self, w: *Writer) !void {
+        fn authenticationComplete(self: *Self, db: *DB, w: *Writer) !void {
             const auth = try w.begin('R');
             try w.u32be(0);
             w.end(auth);
-            try parameter(w, "server_version", "16.0");
-            try parameter(w, "server_encoding", "UTF8");
-            try parameter(w, "client_encoding", "UTF8");
-            try parameter(w, "DateStyle", "ISO, MDY");
-            try parameter(w, "TimeZone", "UTC");
-            try parameter(w, "integer_datetimes", "on");
-            try parameter(w, "standard_conforming_strings", "on");
+            if (@hasDecl(DB, "takeParameterChanges")) {
+                // Every reported setting at startup (design §4.7).
+                try reportParameters(db, w, db.takeParameterChanges());
+            } else {
+                try parameter(w, "server_version", "16.0");
+                try parameter(w, "server_encoding", "UTF8");
+                try parameter(w, "client_encoding", "UTF8");
+                try parameter(w, "DateStyle", "ISO, MDY");
+                try parameter(w, "TimeZone", "UTC");
+                try parameter(w, "integer_datetimes", "on");
+                try parameter(w, "standard_conforming_strings", "on");
+            }
             const key = try w.begin('K');
-            try w.u32be(1);
-            try w.u32be(0);
+            try w.u32be(self.backend_pid);
+            try w.u32be(self.backend_secret);
             w.end(key);
             const ready_at = try w.begin('Z');
             try w.byte('I');
             w.end(ready_at);
             self.startup = true;
         }
+        fn reportParameters(db: *DB, w: *Writer, mask: u16) !void {
+            if (!@hasDecl(DB, "takeParameterChanges")) return;
+            const names = DB.reportedParameters();
+            for (names, 0..) |name, index| {
+                if (mask & (@as(u16, 1) << @intCast(index)) == 0) continue;
+                var buffer: [64]u8 = undefined;
+                try parameter(w, name, db.parameterValue(index, &buffer));
+            }
+        }
         fn ready(self: *Self, db: *DB, w: *Writer) !void {
             _ = self;
+            // Changed reported settings precede ReadyForQuery, as PostgreSQL's
+            // ReportChangedGUCOptions.
+            if (@hasDecl(DB, "takeParameterChanges")) try reportParameters(db, w, db.takeParameterChanges());
             const p = try w.begin('Z');
             try w.byte(if (@hasDecl(DB, "transactionStatus")) db.transactionStatus() else 'I');
             w.end(p);
@@ -345,18 +427,22 @@ pub fn Session(comptime DB: type) type {
                     for (&self.portals) |*p| if (p.name.len == 0) {
                         p.live = false;
                     };
-                    if (trim(source).len == 0) try w.empty('I') else {
+                    if (trim(source).len == 0) try w.empty('I') else if (has_copy and word(source, "copy")) {
+                        try self.startCopy(db, source, w);
+                        // COPY FROM: ReadyForQuery follows CopyDone/CopyFail.
+                        if (self.copy.mode == .in) return false;
+                    } else {
                         try self.execute(db, source);
                         if (self.result.column_count != 0) {
                             try self.description(w, null);
-                            try self.rows(w, null, 0, self.result.row_count);
+                            try self.rows(db, w, null, 0, self.result.row_count);
                         }
                         try self.command(w, source);
                     }
                     try self.ready(db, w);
                 },
                 'P' => try self.parse(db, &r, w),
-                'B' => try self.bind(&r, w),
+                'B' => try self.bind(db, &r, w),
                 'D' => {
                     const kind = try r.byte();
                     const name = try r.string();
@@ -372,13 +458,20 @@ pub fn Session(comptime DB: type) type {
                         var q: Writer = .{ .bytes = &query };
                         var nulls: [parameter_capacity][]const u8 = @splat("NULL");
                         try interpolate(s.source(), nulls[0..s.count], &q);
-                        if (word(q.bytes[0..q.at], "select")) {
+                        if (@hasDecl(DB, "describe")) {
+                            // Parse and bind only: never executes or locks.
+                            try self.describeOnly(db, q.bytes[0..q.at]);
+                            if (self.result.column_count != 0) try self.description(w, null) else try w.empty('n');
+                        } else if (word(q.bytes[0..q.at], "select")) {
                             try self.execute(db, q.bytes[0..q.at]);
                             try self.description(w, null);
                         } else try w.empty('n');
                     } else if (kind == 'P') {
                         const p = try self.portal(name);
-                        if (word(p.source(), "select")) {
+                        if (@hasDecl(DB, "describe")) {
+                            try self.describeOnly(db, p.source());
+                            if (self.result.column_count != 0) try self.description(w, p) else try w.empty('n');
+                        } else if (word(p.source(), "select")) {
                             try self.execute(db, p.source());
                             try self.description(w, p);
                         } else try w.empty('n');
@@ -390,13 +483,13 @@ pub fn Session(comptime DB: type) type {
                     try r.done();
                     if (limit > 0x7fffffff) return error.ProtocolViolation;
                     const p = try self.portal(name);
-                    if (!word(p.source(), "select") and p.format_count > 1) return error.ProtocolViolation;
+
                     const index = (@intFromPtr(p) - @intFromPtr(&self.portals[0])) / @sizeOf(Portal);
                     if (self.active_portal) |active| {
                         if (active != index) return error.PortalBusy;
                     }
                     if (p.complete) {
-                        try commandFor(w, p.source(), p.result_rows, p.affected, p.rolled_back);
+                        try commandFor(w, p.source(), p.command, p.result_rows, p.affected, p.rolled_back);
                         return false;
                     }
                     if (self.active_portal == null) {
@@ -406,10 +499,11 @@ pub fn Session(comptime DB: type) type {
                         p.result_rows = self.result.row_count;
                         p.affected = self.result.affected_rows;
                         p.rolled_back = self.commit_rolled_back;
+                        p.command = self.completed();
                     }
                     if (p.format_count > 1 and p.format_count != self.result.column_count) return error.ProtocolViolation;
                     const end = if (limit == 0) self.result.row_count else @min(self.result.row_count, p.row + limit);
-                    try self.rows(w, p, p.row, end);
+                    try self.rows(db, w, p, p.row, end);
                     p.row = end;
                     if (end < self.result.row_count) try w.empty('s') else {
                         try self.command(w, p.source());
@@ -457,6 +551,7 @@ pub fn Session(comptime DB: type) type {
             self.result.column_count = 0;
             self.result.row_count = 0;
             self.result.affected_rows = 0;
+            if (@hasField(DB.Result, "command")) self.result.command = .none;
             self.commit_rolled_back = false;
             const command_source = trim(source);
             if (keyword(command_source, "begin") or keyword(command_source, "begin work") or keyword(command_source, "begin transaction") or keyword(command_source, "start transaction")) {
@@ -470,8 +565,414 @@ pub fn Session(comptime DB: type) type {
             } else if (word(source, "deallocate")) {
                 if (@hasDecl(DB, "transactionStatus") and db.transactionStatus() == 'E') return error.TransactionFailed;
                 try self.deallocate(source);
-            } else try db.execute(source, &self.result);
+            } else {
+                try db.execute(source, &self.result);
+                // ROLLBACK TO closes portals created after the savepoint.
+                if (@hasDecl(DB, "takeRollbackTo")) if (db.takeRollbackTo()) |depth| {
+                    for (&self.portals, 0..) |*p, index| {
+                        if (!p.live or p.level <= depth) continue;
+                        if (self.active_portal) |active| if (active == index) continue;
+                        p.live = false;
+                    }
+                };
+            }
         }
+        // ---- COPY ---------------------------------------------------------
+
+        fn copyOptions(self: *const Self) pg_copy.Options {
+            return optionsOf(&self.copy.info.options);
+        }
+
+        fn optionsOf(options: anytype) pg_copy.Options {
+            return .{
+                .format = switch (options.format) {
+                    .text => .text,
+                    .csv => .csv,
+                    .binary => .binary,
+                },
+                .delimiter = options.delimiter,
+                .null_string = options.nullString(),
+                .quote = options.quote,
+                .escape = options.escape,
+            };
+        }
+
+        /// COPY TO STDOUT runs its SELECT and streams CopyData; COPY FROM
+        /// STDIN opens the store's COPY and sends CopyInResponse.
+        fn startCopy(self: *Self, db: *DB, source: []const u8, w: *Writer) !void {
+            var select: [sql_capacity + 1024]u8 = undefined;
+            const info = try db.copyDescribe(source, &select);
+            if (info.direction == .to) {
+                try self.execute(db, select[0..info.select_len]);
+                return self.copyOut(db, &info, w);
+            }
+            if (source.len > sql_capacity) return error.StatementCapacity;
+            const begun = try db.copyBegin(source);
+            self.copy.mode = .in;
+            self.copy.remaining = 0;
+            self.copy.info = begun;
+            @memcpy(self.copy.sql[0..source.len], source);
+            self.copy.sql_len = source.len;
+            self.copy.carry_len = 0;
+            self.copy.carry_rows = false;
+            self.copy.ended = false;
+            self.copy.eol = .unknown;
+            self.copy.binary_header = begun.options.format == .binary;
+            self.copy.header_pending = begun.options.format != .binary and begun.options.header != .off;
+            const binary: u16 = @intFromBool(begun.options.format == .binary);
+            const p = try w.begin('G');
+            try w.byte(@intCast(binary));
+            try w.u16be(@intCast(begun.count));
+            for (0..begun.count) |_| try w.u16be(binary);
+            w.end(p);
+        }
+
+        fn copyOut(self: *Self, db: *DB, info: *const CopyInfo, w: *Writer) !void {
+            const options = optionsOf(&info.options);
+            const binary = options.format == .binary;
+            const count = self.result.column_count;
+            const session = valueSession(db);
+            const h = try w.begin('H');
+            try w.byte(@intFromBool(binary));
+            try w.u16be(@intCast(count));
+            for (0..count) |_| try w.u16be(@intFromBool(binary));
+            w.end(h);
+            if (binary) {
+                const p = try w.begin('d');
+                try w.append(pg_copy.signature);
+                try w.u32be(0);
+                try w.u32be(0);
+                w.end(p);
+            } else if (info.options.header != .off) {
+                const p = try w.begin('d');
+                var sink: pg_copy.Sink = .{ .bytes = w.bytes[w.at..] };
+                for (0..count) |field| {
+                    if (field != 0) try sink.byte(options.delimiter);
+                    const name = self.result.column_names[field].slice();
+                    if (options.format == .csv) try pg_copy.appendCsv(&options, name, count == 1, &sink) else try pg_copy.appendText(&options, name, &sink);
+                }
+                try sink.byte('\n');
+                w.at += sink.at;
+                w.end(p);
+            }
+            var text: [DB.Result.ValueIo.format_bytes]u8 = undefined;
+            for (self.result.rows[0..self.result.row_count]) |*row| {
+                const p = try w.begin('d');
+                if (binary) {
+                    try w.u16be(@intCast(count));
+                    for (0..count) |field| {
+                        const cell = &row.cells[field];
+                        if (cell.* == .null_value) {
+                            try w.u32be(0xffffffff);
+                            continue;
+                        }
+                        const length = w.at;
+                        try w.u32be(0);
+                        const start = w.at;
+                        w.at += T.sendBinary(cell, self.result.column_types[field], session, w.bytes[w.at..]) catch return error.BufferTooSmall;
+                        write32(w.bytes[length..][0..4], @intCast(w.at - start));
+                    }
+                } else {
+                    var sink: pg_copy.Sink = .{ .bytes = w.bytes[w.at..] };
+                    for (0..count) |field| {
+                        if (field != 0) try sink.byte(options.delimiter);
+                        const cell = &row.cells[field];
+                        if (cell.* == .null_value) {
+                            try sink.append(options.null_string);
+                            continue;
+                        }
+                        const length = T.sendText(cell, session, &text) catch return error.BufferTooSmall;
+                        if (options.format == .csv) try pg_copy.appendCsv(&options, text[0..length], count == 1, &sink) else try pg_copy.appendText(&options, text[0..length], &sink);
+                    }
+                    try sink.byte('\n');
+                    w.at += sink.at;
+                }
+                w.end(p);
+            }
+            if (binary) {
+                const p = try w.begin('d');
+                try w.u16be(0xffff);
+                w.end(p);
+            }
+            try w.empty('c');
+            const c = try w.begin('C');
+            try w.append("COPY ");
+            try w.number(@intCast(self.result.row_count));
+            try w.byte(0);
+            w.end(c);
+        }
+
+        fn copyHandle(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
+            var w: Writer = .{ .bytes = output };
+            if (self.copy.mode == .in) {
+                // The parked row first, then rows the session still carries.
+                if (db.copyBlocked()) {
+                    db.copyResume() catch |err| {
+                        if (err == error.WouldBlock) return .{ .blocked = true };
+                        try self.copyError(db, &w, err);
+                        return .{ .written = w.at };
+                    };
+                }
+                if (self.copy.carry_rows) {
+                    const fed = self.copyRows(db, self.copy.carry[0..self.copy.carry_len]) catch |err| {
+                        try self.copyError(db, &w, err);
+                        return .{ .written = w.at };
+                    };
+                    self.shiftCarry(fed.used);
+                    if (fed.blocked) return .{ .blocked = true };
+                    self.copy.carry_rows = false;
+                }
+            }
+            if (self.copy.remaining != 0) return self.copyBody(db, input, 0, &w);
+            if (input.len < 5) return .{};
+            const tag = input[0];
+            const size = read32(input[1..5]);
+            if (size < 4) {
+                if (self.copy.mode == .in) db.copyFail();
+                self.copy.mode = .none;
+                try failure(&w, "08P01", "invalid packet length");
+                return .{ .consumed = input.len, .written = w.at, .close = true };
+            }
+            if (tag == 'd') {
+                self.copy.remaining = size - 4;
+                if (self.copy.remaining == 0) return .{ .consumed = 5 };
+                return self.copyBody(db, input, 5, &w);
+            }
+            if (size > max_packet) {
+                if (self.copy.mode == .in) db.copyFail();
+                self.copy.mode = .none;
+                try failure(&w, "08P01", "invalid packet length");
+                return .{ .consumed = input.len, .written = w.at, .close = true };
+            }
+            const total: usize = @as(usize, size) + 1;
+            if (input.len < total) return .{};
+            const discarding = self.copy.mode == .discard;
+            switch (tag) {
+                'c' => {
+                    if (discarding) {
+                        self.copy.mode = .none;
+                        return .{ .consumed = total };
+                    }
+                    self.copyFinish(db, &w) catch |err| {
+                        if (err == error.WouldBlock) return .{ .blocked = true };
+                        w.at = 0;
+                        try self.copyError(db, &w, err);
+                        self.copy.mode = .none;
+                    };
+                    self.copy.mode = .none;
+                    return .{ .consumed = total, .written = w.at };
+                },
+                'f' => {
+                    self.copy.mode = .none;
+                    if (discarding) return .{ .consumed = total };
+                    db.copyFail();
+                    try failure(&w, "57014", "COPY from stdin failed");
+                    try self.ready(db, &w);
+                    return .{ .consumed = total, .written = w.at };
+                },
+                // Flush and Sync are ignored in copy-in mode.
+                'H', 'S' => return .{ .consumed = total },
+                else => {
+                    if (discarding) {
+                        self.copy.mode = .none;
+                        return self.handle(db, input, output);
+                    }
+                    self.copy.mode = .none;
+                    db.copyFail();
+                    try failure(&w, "08P01", "unexpected message type during COPY from stdin");
+                    try self.ready(db, &w);
+                    return .{ .consumed = total, .written = w.at };
+                },
+            }
+        }
+
+        /// Consumes CopyData body bytes at input[offset..] (the header,
+        /// if any, is input[0..offset]).
+        fn copyBody(self: *Self, db: *DB, input: []const u8, offset: usize, w: *Writer) error{BufferTooSmall}!Reply {
+            const n = @min(self.copy.remaining, input.len - offset);
+            if (n == 0) return .{ .consumed = offset };
+            if (self.copy.mode == .discard) {
+                self.copy.remaining -= n;
+                return .{ .consumed = offset + n };
+            }
+            const fed = self.copyFeed(db, input[offset..][0..n]) catch |err| {
+                self.copy.remaining -= n;
+                try self.copyError(db, w, err);
+                return .{ .consumed = offset + n, .written = w.at };
+            };
+            self.copy.remaining -= fed.used;
+            return .{ .consumed = offset + fed.used, .blocked = fed.blocked };
+        }
+
+        /// A terminal COPY error: roll back, report, then discard the rest
+        /// of the copy stream.
+        fn copyError(self: *Self, db: *DB, w: *Writer, err: anyerror) error{BufferTooSmall}!void {
+            db.copyFail();
+            try failure(w, sqlstate(err), @errorName(err));
+            try self.ready(db, w);
+            self.copy.mode = .discard;
+            self.copy.carry_len = 0;
+            self.copy.carry_rows = false;
+        }
+
+        fn shiftCarry(self: *Self, used: usize) void {
+            const rest = self.copy.carry_len - used;
+            for (0..rest) |index| self.copy.carry[index] = self.copy.carry[used + index];
+            self.copy.carry_len = rest;
+        }
+
+        fn copyFeed(self: *Self, db: *DB, chunk: []const u8) !Fed {
+            var rest = chunk;
+            var used: usize = 0;
+            while (rest.len != 0) {
+                if (self.copy.ended) {
+                    used += rest.len;
+                    break;
+                }
+                if (self.copy.carry_len == 0) {
+                    const fed = try self.copyRows(db, rest);
+                    used += fed.used;
+                    rest = rest[fed.used..];
+                    if (fed.blocked) return .{ .used = used, .blocked = true };
+                    if (rest.len == 0 or self.copy.ended) continue;
+                    if (rest.len > self.copy.carry.len) return error.TextCapacity;
+                    @memcpy(self.copy.carry[0..rest.len], rest);
+                    self.copy.carry_len = rest.len;
+                    used += rest.len;
+                    break;
+                }
+                const n = @min(rest.len, self.copy.carry.len - self.copy.carry_len);
+                @memcpy(self.copy.carry[self.copy.carry_len..][0..n], rest[0..n]);
+                self.copy.carry_len += n;
+                used += n;
+                rest = rest[n..];
+                const fed = try self.copyRows(db, self.copy.carry[0..self.copy.carry_len]);
+                self.shiftCarry(fed.used);
+                if (fed.blocked) {
+                    self.copy.carry_rows = self.copy.carry_len != 0;
+                    return .{ .used = used, .blocked = true };
+                }
+                if (fed.used == 0 and self.copy.carry_len == self.copy.carry.len) return error.TextCapacity;
+            }
+            return .{ .used = used };
+        }
+
+        fn rowLength(self: *const Self, bytes: []const u8) !?usize {
+            const options = self.copyOptions();
+            if (options.format == .binary) {
+                if (self.copy.binary_header) return pg_copy.binaryHeader(bytes);
+                return pg_copy.tupleEnd(bytes, self.copy.info.count);
+            }
+            return pg_copy.lineEnd(&options, bytes);
+        }
+
+        /// Complete rows at the start of `bytes`; stops at an incomplete
+        /// one, the end marker or a parked row (included in `used`).
+        fn copyRows(self: *Self, db: *DB, bytes: []const u8) !Fed {
+            var at: usize = 0;
+            while (at < bytes.len and !self.copy.ended) {
+                const length = (try self.rowLength(bytes[at..])) orelse break;
+                if (length > line_bytes) return error.TextCapacity;
+                const blocked = try self.copyLine(db, bytes[at..][0..length], true);
+                at += length;
+                if (blocked) return .{ .used = at, .blocked = true };
+            }
+            return .{ .used = at };
+        }
+
+        /// One row (or the binary header / a header line). Returns true when
+        /// the row is parked on a key wait.
+        fn copyLine(self: *Self, db: *DB, row: []const u8, terminated: bool) !bool {
+            const options = self.copyOptions();
+            const info = &self.copy.info;
+            var fields: [field_capacity]?[]const u8 = undefined;
+            if (options.format == .binary) {
+                if (self.copy.binary_header) {
+                    self.copy.binary_header = false;
+                    return false;
+                }
+                if (row.len == 2 and row[0] == 0xff and row[1] == 0xff) {
+                    self.copy.ended = true;
+                    return false;
+                }
+                const count = pg_copy.tupleFields(row, &fields);
+                var used: usize = 0;
+                for (fields[0..count], 0..) |*field, index| if (field.*) |bytes| {
+                    const out = self.copy.scratch[used..];
+                    const text = T.receiveText(bytes, info.types[index], out) catch |err| return if (err == error.BufferTooSmall) error.TextCapacity else error.InvalidBinaryRepresentation;
+                    if (text.len != 0 and @intFromPtr(text.ptr) == @intFromPtr(out.ptr)) used += text.len;
+                    field.* = text;
+                };
+                return self.copyInsert(db, fields[0..count]);
+            }
+            const line = try pg_copy.stripLine(row, &self.copy.eol, terminated);
+            if (options.format == .text and equal(line, "\\.")) {
+                self.copy.ended = true;
+                return false;
+            }
+            // HEADER skips the first line; HEADER MATCH checks its names.
+            if (self.copy.header_pending and info.options.header == .on) {
+                self.copy.header_pending = false;
+                return false;
+            }
+            const capacity = @max(info.count, 1);
+            const count = if (options.format == .csv)
+                try pg_copy.csvFields(&options, line, &self.copy.scratch, fields[0..capacity])
+            else
+                try pg_copy.textFields(&options, line, &self.copy.scratch, fields[0..capacity]);
+            if (count != info.count) return error.BadCopyFormat;
+            if (self.copy.header_pending) {
+                self.copy.header_pending = false;
+                for (fields[0..count], 0..) |field, index| {
+                    const value = field orelse return error.BadCopyFormat;
+                    if (!equal(value, info.names[index].slice())) return error.BadCopyFormat;
+                }
+                return false;
+            }
+            return self.copyInsert(db, fields[0..count]);
+        }
+
+        fn copyInsert(self: *Self, db: *DB, fields: []const ?[]const u8) !bool {
+            db.copyRow(self.copy.sql[0..self.copy.sql_len], fields) catch |err| {
+                if (err == error.WouldBlock) return true;
+                return err;
+            };
+            return false;
+        }
+
+        /// CopyDone: the final unterminated row, then COPY n and ReadyForQuery.
+        fn copyFinish(self: *Self, db: *DB, w: *Writer) !void {
+            if (!self.copy.ended and self.copy.carry_len != 0) {
+                const options = self.copyOptions();
+                const length = self.copy.carry_len;
+                // Owned by this call either way (a parked row is the store's).
+                self.copy.carry_len = 0;
+                self.copy.carry_rows = false;
+                // A partial binary tuple; an open CSV quote fails in csvFields.
+                if (options.format == .binary) return error.BadCopyFormat;
+                if (try self.copyLine(db, self.copy.carry[0..length], false)) return error.WouldBlock;
+            }
+            if (self.copy.binary_header) return error.BadCopyFormat;
+            const copied = try db.copyEnd();
+            const c = try w.begin('C');
+            try w.append("COPY ");
+            try w.number(@intCast(copied));
+            try w.byte(0);
+            w.end(c);
+            try self.ready(db, w);
+        }
+
+
+        fn describeOnly(self: *Self, db: *DB, source: []const u8) !void {
+            self.result.column_count = 0;
+            self.result.row_count = 0;
+            const command_source = trim(source);
+            if (word(command_source, "begin") or word(command_source, "commit") or word(command_source, "rollback") or
+                word(command_source, "end") or word(command_source, "abort") or word(command_source, "deallocate") or
+                word(command_source, "start")) return;
+            try db.describe(source, &self.result);
+        }
+
         fn deallocate(self: *Self, source: []const u8) !void {
             var tokens: Tokens = .{ .source = source };
             if (!keyword(tokens.next(), "deallocate")) return error.Syntax;
@@ -571,7 +1072,17 @@ pub fn Session(comptime DB: type) type {
             try q.append("SELECT * FROM ");
             try q.append(table);
             try q.append(" LIMIT 0");
-            try db.execute(q.bytes[0..q.at], &self.result);
+            if (@hasDecl(DB, "describe")) {
+                db.describe(q.bytes[0..q.at], &self.result) catch |err| {
+                    // A relation wider than the result (a system view) gives no
+                    // column types: unknown parameters stay text.
+                    if (err != error.ColumnCapacity) return err;
+                    for (s.oids[0..s.count]) |*oid| if (oid.* == 0) {
+                        oid.* = 25;
+                    };
+                    return;
+                };
+            } else try db.execute(q.bytes[0..q.at], &self.result);
             if (self.result.column_count > 256) return error.ColumnCapacity;
             if (keyword(first, "insert")) {
                 var mapping: [256]usize = undefined;
@@ -602,7 +1113,7 @@ pub fn Session(comptime DB: type) type {
                     }
                     if (token[0] == '$') {
                         if (column_index >= count_columns) return error.ColumnCapacity;
-                        try inferOid(s, token, self.result.column_types[mapping[column_index]]);
+                        try inferOid(s, token, T.oid(self.result.column_types[mapping[column_index]]));
                     }
                 }
             } else {
@@ -612,8 +1123,14 @@ pub fn Session(comptime DB: type) type {
                     const token = tokens.next();
                     if (token.len == 0) break;
                     if (token[0] == '$') {
-                        if (column_index) |i| try inferOid(s, token, self.result.column_types[i]);
-                    } else if (identifier(token)) column_index = self.column(token);
+                        if (column_index) |i| try inferOid(s, token, T.oid(self.result.column_types[i]));
+                    } else if (identifier(token)) {
+                        column_index = self.column(token);
+                    } else if (token[0] != '=' and token[0] != '<' and token[0] != '>' and token[0] != '!' and token[0] != ' ') {
+                        // `col ->> $1`, `col + $1`: the operator decides the
+                        // parameter type, not the column; leave it unknown.
+                        column_index = null;
+                    }
                 }
             }
             for (s.oids[0..s.count]) |*oid| if (oid.* == 0) {
@@ -624,7 +1141,7 @@ pub fn Session(comptime DB: type) type {
             for (0..self.result.column_count) |i| if (keyword(name, self.result.column_names[i].slice())) return i;
             return null;
         }
-        fn bind(self: *Self, r: *Reader, w: *Writer) !void {
+        fn bind(self: *Self, db: *DB, r: *Reader, w: *Writer) !void {
             const name = try r.string();
             const statement_name = try r.string();
             const s = try self.statement(statement_name);
@@ -646,7 +1163,9 @@ pub fn Session(comptime DB: type) type {
                 if (size == 0xffffffff) try l.append("NULL") else {
                     const bytes = try r.take(size);
                     const fmt = if (nf == 0) 0 else formats[if (nf == 1) 0 else i];
-                    try literal(&l, bytes, s.oids[i], fmt);
+                    if (T.handles(s.oids[i])) {
+                        l.at += T.literal(bytes, s.oids[i], fmt, l.bytes[l.at..]) catch |err| return if (err == error.BufferTooSmall) error.StatementCapacity else err;
+                    } else try literal(&l, bytes, s.oids[i], fmt);
                 }
                 values[i] = l.bytes[begin..l.at];
             }
@@ -662,6 +1181,7 @@ pub fn Session(comptime DB: type) type {
             var q: Writer = .{ .bytes = &next.sql };
             try interpolate(s.source(), values[0..count], &q);
             next.len = q.at;
+            if (@hasDecl(DB, "savepointLevel")) next.level = db.savepointLevel();
             var slot: ?*Portal = null;
             for (&self.portals) |*p| {
                 if (p.live and equal(p.name.slice(), name)) {
@@ -691,19 +1211,10 @@ pub fn Session(comptime DB: type) type {
                 try w.u32be(0);
                 try w.u16be(0);
                 const data_type = self.result.column_types[i];
-                try w.u32be(switch (data_type) {
-                    .integer => 20,
-                    .integer32 => 23,
-                    .boolean => 16,
-                    .text => 25,
-                });
-                try w.u16be(switch (data_type) {
-                    .integer => 8,
-                    .integer32 => 4,
-                    .boolean => 1,
-                    .text => 0xffff,
-                });
-                try w.u32be(0xffffffff);
+                try w.u32be(T.oid(data_type));
+                try w.u16be(@bitCast(T.length(data_type)));
+                const typmod: i32 = if (@hasField(DB.Result, "column_typmods")) self.result.column_typmods[i] else -1;
+                try w.u32be(@bitCast(typmod));
                 if (portal_value) |v| {
                     if (v.format_count > 1 and v.format_count != self.result.column_count) return error.ProtocolViolation;
                     try w.u16be(v.format(i));
@@ -711,7 +1222,8 @@ pub fn Session(comptime DB: type) type {
             }
             w.end(p);
         }
-        fn rows(self: *Self, w: *Writer, portal_value: ?*const Portal, first: usize, end: usize) !void {
+        fn rows(self: *Self, db: *DB, w: *Writer, portal_value: ?*const Portal, first: usize, end: usize) !void {
+            const session = valueSession(db);
             for (first..end) |row| {
                 const p = try w.begin('D');
                 try w.u16be(@intCast(self.result.column_count));
@@ -728,12 +1240,11 @@ pub fn Session(comptime DB: type) type {
                     switch (cell) {
                         .null_value => unreachable,
                         .integer => |n| if (binary) {
-                            const bits: u64 = @bitCast(n);
-                            if (self.result.column_types[i] != .integer32) try w.u32be(@truncate(bits >> 32));
-                            try w.u32be(@truncate(bits));
+                            w.at += T.sendBinary(&cell, self.result.column_types[i], session, w.bytes[w.at..]) catch return error.BufferTooSmall;
                         } else try w.number(n),
                         .boolean => |b| try w.byte(if (binary) @intFromBool(b) else if (b) 't' else 'f'),
                         .text => |t| try w.append(t.slice()),
+                        else => w.at += (if (binary) T.sendBinary(&cell, self.result.column_types[i], session, w.bytes[w.at..]) else T.sendText(&cell, session, w.bytes[w.at..])) catch return error.BufferTooSmall,
                     }
                     write32(w.bytes[length..][0..4], @intCast(w.at - start));
                 }
@@ -741,23 +1252,53 @@ pub fn Session(comptime DB: type) type {
             }
         }
         fn command(self: *Self, w: *Writer, source: []const u8) !void {
-            try commandFor(w, source, self.result.row_count, self.result.affected_rows, self.commit_rolled_back);
+            try commandFor(w, source, self.completed(), self.result.row_count, self.result.affected_rows, self.commit_rolled_back);
         }
-        fn commandFor(w: *Writer, source: []const u8, row_count: usize, affected: usize, rolled_back: bool) !void {
+        /// The engine's own command tag for the last statement, when it has one.
+        fn completed(self: *const Self) []const u8 {
+            if (!@hasField(DB.Result, "command")) return "";
+            return switch (self.result.command) {
+                .select => "select",
+                .insert => "insert",
+                .update => "update",
+                .delete => "delete",
+                .create_table => "create",
+                .drop_table => "drop",
+                .create_sequence => "create_sequence",
+                .drop_sequence => "drop_sequence",
+                .begin => "begin",
+                .commit => "commit",
+                .rollback => "rollback",
+                .savepoint => "savepoint",
+                .release => "release",
+                .set => "set",
+                .show => "show",
+                .reset => "reset",
+                else => "",
+            };
+        }
+        fn isCommand(completed_command: []const u8, source: []const u8, wanted: []const u8) bool {
+            return if (completed_command.len != 0) equal(completed_command, wanted) else word(source, wanted);
+        }
+        fn commandFor(w: *Writer, source: []const u8, completed_command: []const u8, row_count: usize, affected: usize, rolled_back: bool) !void {
             const p = try w.begin('C');
-            if (word(source, "select")) {
+            if (equal(completed_command, "create_sequence")) {
+                try w.append("CREATE SEQUENCE");
+            } else if (equal(completed_command, "drop_sequence")) {
+                try w.append("DROP SEQUENCE");
+            } else if (isCommand(completed_command, source, "select")) {
                 try w.append("SELECT ");
                 try w.number(@intCast(row_count));
-            } else if (word(source, "insert")) {
+            } else if (isCommand(completed_command, source, "insert")) {
                 try w.append("INSERT 0 ");
                 try w.number(@intCast(affected));
-            } else if (word(source, "update")) {
+            } else if (isCommand(completed_command, source, "update")) {
                 try w.append("UPDATE ");
                 try w.number(@intCast(affected));
-            } else if (word(source, "delete")) {
+            } else if (isCommand(completed_command, source, "delete")) {
                 try w.append("DELETE ");
                 try w.number(@intCast(affected));
-            } else if (word(source, "create")) try w.append("CREATE TABLE") else if (word(source, "drop")) try w.append("DROP TABLE") else if (word(source, "begin") or word(source, "start")) try w.append("BEGIN") else if (word(source, "commit") or word(source, "end")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (word(source, "rollback") or word(source, "abort")) try w.append("ROLLBACK") else if (word(source, "set")) try w.append("SET") else if (word(source, "deallocate")) try w.append("DEALLOCATE") else try w.append("OK");
+            } else if (isCommand(completed_command, source, "create")) try w.append("CREATE TABLE") else if (isCommand(completed_command, source, "drop")) try w.append("DROP TABLE") else if (equal(completed_command, "savepoint")) try w.append("SAVEPOINT") else if (equal(completed_command, "release")) try w.append("RELEASE") else if (equal(completed_command, "show")) try w.append("SHOW") else if (equal(completed_command, "reset")) try w.append("RESET") else if (equal(completed_command, "set")) try w.append("SET") else if (equal(completed_command, "begin")) try w.append("BEGIN") else if (equal(completed_command, "commit")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (equal(completed_command, "rollback")) try w.append("ROLLBACK") else if (word(source, "begin") or word(source, "start")) try w.append("BEGIN") else if (word(source, "commit") or word(source, "end")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (word(source, "rollback") or word(source, "abort")) try w.append("ROLLBACK") else if (word(source, "set")) try w.append("SET") else if (word(source, "deallocate")) try w.append("DEALLOCATE") else try w.append("OK");
             try w.byte(0);
             w.end(p);
         }
@@ -797,7 +1338,48 @@ fn authenticationFailure(w: *Writer) !void {
     w.end(p);
 }
 fn sqlstate(err: anyerror) []const u8 {
+    return knownSqlstate(err) orelse "54000";
+}
+
+/// SQLSTATE for every engine, store and protocol error this codec knows;
+/// null means the error would fall back to 54000 (program_limit_exceeded).
+pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     const name = @errorName(err);
+    if (equal(name, "UndefinedFunction")) return "42883";
+    if (equal(name, "AmbiguousFunction")) return "42725";
+    if (equal(name, "CannotCoerce")) return "42846";
+    if (equal(name, "InvalidTextRepresentation")) return "22P02";
+    if (equal(name, "DivisionByZero")) return "22012";
+    if (equal(name, "InvalidEscapeSequence")) return "22025";
+    if (equal(name, "UndefinedParameter")) return "42P02";
+    if (equal(name, "InvalidColumnReference")) return "42P10";
+    if (equal(name, "WorkspaceCapacity")) return "54000";
+    if (equal(name, "GroupingError")) return "42803";
+    if (equal(name, "AmbiguousColumn")) return "42702";
+    if (equal(name, "CardinalityViolation")) return "21000";
+    if (equal(name, "InvalidRowCountInLimit")) return "2201W";
+    if (equal(name, "InvalidRowCountInResultOffset")) return "2201X";
+    if (equal(name, "GeneratedAlways")) return "428C9";
+    if (equal(name, "SequenceLimit")) return "2200H";
+    if (equal(name, "SequenceNotReady")) return "55000";
+    if (equal(name, "WrongObjectType")) return "42809";
+    if (equal(name, "DependentObjects")) return "2BP01";
+    if (equal(name, "UndefinedObject")) return "42704";
+    if (equal(name, "BadCopyFormat")) return "22P04";
+    if (equal(name, "InvalidBinaryRepresentation")) return "22P03";
+    if (equal(name, "NumericValueOutOfRange")) return "22003";
+    if (equal(name, "NumericCapacity")) return "54000";
+    if (equal(name, "InvalidParameterValue")) return "22023";
+    if (equal(name, "InvalidDatetimeFormat")) return "22007";
+    if (equal(name, "DatetimeFieldOverflow")) return "22008";
+    if (equal(name, "UntranslatableCharacter")) return "22P05";
+    if (equal(name, "ClockUnavailable")) return "0A000";
+    if (equal(name, "TimeZoneCapacity")) return "53200";
+    if (equal(name, "StatementTooComplex")) return "54001";
+    if (equal(name, "VersionCapacity")) return "53200";
+    if (equal(name, "TableCapacity") or equal(name, "ColumnCapacity") or equal(name, "RowCapacity") or
+        equal(name, "NameCapacity") or equal(name, "TextCapacity") or equal(name, "PredicateCapacity")) return "54000";
+    if (equal(name, "UnsupportedLogVersion") or equal(name, "InvalidChangeRecord") or equal(name, "ChangeRecordConflict")) return "XX001";
     if (equal(name, "TableNotFound")) return "42P01";
     if (equal(name, "ColumnNotFound")) return "42703";
     if (equal(name, "TableExists")) return "42P07";
@@ -814,11 +1396,21 @@ fn sqlstate(err: anyerror) []const u8 {
     if (equal(name, "TransactionFailed")) return "25P02";
     if (equal(name, "DatabaseBusy")) return "55P03";
     if (equal(name, "SerializationFailure")) return "40001";
+    if (equal(name, "DeadlockDetected")) return "40P01";
+    // WouldBlock never reaches a client (it becomes Reply.blocked).
+    if (equal(name, "LockNotAvailable") or equal(name, "WouldBlock")) return "55P03";
+    if (equal(name, "QueryCanceled")) return "57014";
+    if (equal(name, "WriteSetCapacity") or equal(name, "LockCapacity") or equal(name, "CatalogCapacity") or equal(name, "SavepointCapacity")) return "53200";
+    if (equal(name, "SavepointNotFound")) return "3B001";
+    if (equal(name, "NoActiveTransaction")) return "25P01";
+    if (equal(name, "ReadOnlyTransaction")) return "25006";
+    if (equal(name, "UndefinedSetting")) return "42704";
+    if (equal(name, "InvalidSettingValue")) return "22023";
     if (equal(name, "TransactionCapacity") or equal(name, "TransactionLogCapacity")) return "53200";
     if (equal(name, "StorageUnavailable") or equal(name, "StorageFailure") or equal(name, "FileWriteFailed") or equal(name, "FileSyncFailed") or equal(name, "FileTruncateFailed") or equal(name, "WriterPoisoned")) return "58030";
     if (equal(name, "Syntax")) return "42601";
     if (equal(name, "UnsupportedStatement") or equal(name, "UnsupportedMessage") or equal(name, "UnsupportedProtocol") or equal(name, "UnsupportedEncoding") or equal(name, "UnsupportedBinaryType")) return "0A000";
-    return "54000";
+    return null;
 }
 
 // One scanner serves counting and interpolation, so $ inside a quoted literal,
@@ -914,7 +1506,7 @@ const Tokens = struct {
         return self.source[begin..self.at];
     }
 };
-fn inferOid(s: anytype, token: []const u8, data_type: anytype) !void {
+fn inferOid(s: anytype, token: []const u8, oid: u32) !void {
     var n: usize = 0;
     for (token[1..]) |c| {
         if (c < '0' or c > '9') return error.Syntax;
@@ -922,12 +1514,6 @@ fn inferOid(s: anytype, token: []const u8, data_type: anytype) !void {
         if (n > parameter_capacity) return error.ParameterCapacity;
     }
     if (n == 0 or n > s.count) return error.ProtocolViolation;
-    const oid: u32 = switch (data_type) {
-        .integer => 20,
-        .integer32 => 23,
-        .boolean => 16,
-        .text => 25,
-    };
     const previous = s.oids[n - 1];
     const integer_conversion = (oid == 20 or oid == 23) and (previous == 20 or previous == 21 or previous == 23);
     if (previous != 0 and previous != oid and !integer_conversion) return error.TypeMismatch;
