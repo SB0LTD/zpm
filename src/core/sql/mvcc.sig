@@ -175,14 +175,26 @@ pub fn Mvcc(comptime config: types.Config) type {
             const tx = &db.txs[slot];
             for (tx.writes[0..tx.write_len]) |entry| {
                 switch (entry.kind) {
-                    .insert => db.tables[entry.table].versions[entry.new].xmin_csn = csn,
+                    .insert => {
+                        const table = &db.tables[entry.table];
+                        S.summarize(table, &table.versions[entry.new].cells, true, csn);
+                        table.versions[entry.new].xmin_csn = csn;
+                    },
                     .update => {
                         const table = &db.tables[entry.table];
+                        S.summarizeUpdate(table, &table.versions[entry.old].cells, &table.versions[entry.new].cells, csn);
                         table.versions[entry.new].xmin_csn = csn;
                         table.versions[entry.old].xmax_csn = csn;
                     },
-                    .delete => db.tables[entry.table].versions[entry.old].xmax_csn = csn,
-                    .create_table => db.tables[entry.table].pending_create = false,
+                    .delete => {
+                        const table = &db.tables[entry.table];
+                        S.summarize(table, &table.versions[entry.old].cells, false, csn);
+                        table.versions[entry.old].xmax_csn = csn;
+                    },
+                    .create_table => {
+                        db.tables[entry.table].pending_create = false;
+                        S.initSummary(&db.tables[entry.table], csn);
+                    },
                     .drop_table => {
                         const table = &db.tables[entry.table];
                         table.pending_drop = false;

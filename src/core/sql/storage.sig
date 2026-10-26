@@ -134,6 +134,32 @@ pub fn Storage(comptime config: types.Config) type {
         pub const OrderState = enum { empty, one, increasing, decreasing, unordered };
         pub const OrderProof = struct { state: OrderState = .empty, last: V.Cell = .null_value };
 
+        /// Exact committed state, derived from published row transitions (not
+        /// persisted). Old snapshots and transactions with own writes scan.
+        /// At most 2^31-1 rows of i64 values fit comfortably in an i128 total.
+        pub const ColumnSummary = struct { nonnull: i64 = 0, total: i128 = 0 };
+        /// Conservative bounds over every inserted version, including pending
+        /// and aborted writes. Never narrowed by deletion or reclamation.
+        pub const IntegerBounds = struct { known: bool = false, low: i64 = 0, high: i64 = 0 };
+        pub const Summary = struct {
+            valid: bool = false,
+            csn: u64 = 0,
+            rows: i64 = 0,
+            primary_bounds: IntegerBounds = .{},
+            columns: [config.columns]ColumnSummary = @splat(.{}),
+        };
+        pub const SummaryGroup = struct {
+            key: V.Cell = .null_value,
+            rows: i64 = 0,
+            columns: [config.columns]ColumnSummary = @splat(.{}),
+        };
+        pub const Rollup = struct {
+            valid: bool = false,
+            used: usize = 0,
+            groups: [config.summary_groups]SummaryGroup = @splat(.{}),
+            buckets: [pow2(config.summary_groups * 2)]u32 = @splat(0),
+        };
+
         pub const Table = struct {
             live: bool = false,
             pending_create: bool = false,
@@ -147,6 +173,9 @@ pub fn Storage(comptime config: types.Config) type {
             /// Conservative strict non-NULL order over physical row slots.
             /// Updates/aborts may discard a proof, never invent one. Not persisted.
             column_order: [config.columns]OrderProof = @splat(.{}),
+            summary: Summary = .{},
+            integer_bounds: [config.columns]IntegerBounds = @splat(.{}),
+            rollups: [config.columns]Rollup = @splat(.{}),
             next_rowid: u64 = 0,
             row_generation: u32 = 0,
             row_high: usize = 0,
@@ -185,6 +214,9 @@ pub fn Storage(comptime config: types.Config) type {
             table.version_used = 0;
             table.version_free = 0;
             table.column_order = @splat(.{});
+            table.summary = .{};
+            table.integer_bounds = @splat(.{});
+            resetRollups(table);
             @memset(table.row_index[0..], 0);
             if (table.primary_column != null) @memset(table.key_index[0..], 0);
         }
@@ -197,6 +229,9 @@ pub fn Storage(comptime config: types.Config) type {
             @memcpy(destination.columns[0..source.column_count], source.columns[0..source.column_count]);
             destination.primary_column = source.primary_column;
             destination.column_order = source.column_order;
+            destination.summary = source.summary;
+            destination.integer_bounds = source.integer_bounds;
+            destination.rollups = source.rollups;
             destination.next_rowid = source.next_rowid;
             destination.row_generation = source.row_generation;
             destination.row_high = source.row_high;
@@ -309,7 +344,106 @@ pub fn Storage(comptime config: types.Config) type {
             removeAt(table, table.row_index[0..], position, rowHome);
         }
 
+        /// Called only at durable publication or validated change-record replay.
+        pub fn summarize(table: *Table, cells: *const [config.columns]V.Cell, add: bool, csn: u64) void {
+            changeSummary(table, cells, add, csn);
+            if (table.summary.valid and table.summary.rows == 0) {
+                resetRollups(table);
+                table.summary.primary_bounds = .{};
+            }
+        }
+
+        pub fn summarizeUpdate(table: *Table, old: *const [config.columns]V.Cell, new: *const [config.columns]V.Cell, csn: u64) void {
+            // An update does not empty/reinitialize the table's summaries.
+            changeSummary(table, old, false, csn);
+            changeSummary(table, new, true, csn);
+        }
+
+        fn changeSummary(table: *Table, cells: *const [config.columns]V.Cell, add: bool, csn: u64) void {
+            if (!table.summary.valid) return;
+            const sign: i64 = if (add) 1 else -1;
+            table.summary.rows += sign;
+            table.summary.csn = csn;
+            if (add) if (table.primary_column) |primary| {
+                const value = &cells[primary];
+                if (value.* == .integer) {
+                    const bounds = &table.summary.primary_bounds;
+                    if (!bounds.known) bounds.* = .{ .known = true, .low = value.integer, .high = value.integer }
+                    else { bounds.low = @min(bounds.low, value.integer); bounds.high = @max(bounds.high, value.integer); }
+                }
+            };
+            for (cells[0..table.column_count], table.summary.columns[0..table.column_count]) |*cell, *column| {
+                if (cell.* == .null_value) continue;
+                column.nonnull += sign;
+                if (cell.* == .integer) column.total += @as(i128, cell.integer) * sign;
+            }
+            summarizeGroups(table, cells, add);
+        }
+
+        pub fn initSummary(table: *Table, csn: u64) void {
+            table.summary = .{ .valid = true, .csn = csn };
+            resetRollups(table);
+        }
+
+        fn resetRollups(table: *Table) void {
+            if (comptime config.summary_groups != 0) for (&table.rollups) |*rollup| {
+                rollup.valid = true;
+                rollup.used = 0;
+                @memset(&rollup.buckets, 0);
+            };
+        }
+
+        /// Equality must also preserve the displayed representative. NUMERIC
+        /// scale, float signed zero and equivalent interval forms need more
+        /// representative tracking, so retain ordinary grouping for those.
+        pub fn summaryKeyType(data_type: types.DataType) bool {
+            return switch (data_type) {
+                .integer, .integer32, .smallint, .oid, .text, .name, .boolean,
+                .date, .timestamp, .timestamptz => true,
+                else => false,
+            };
+        }
+
+        fn summarizeGroups(table: *Table, cells: *const [config.columns]V.Cell, add: bool) void {
+            if (comptime config.summary_groups != 0) {
+                const sign: i64 = if (add) 1 else -1;
+                for (table.columns[0..table.column_count], table.rollups[0..table.column_count], 0..) |definition, *rollup, key_column| {
+                    if (!rollup.valid) continue;
+                    if (!summaryKeyType(definition.data_type)) continue;
+                    const key = &cells[key_column];
+                    const hash: usize = if (key.* == .null_value) 0x9e3779b9 else V.hash(key);
+                    const mask = rollup.buckets.len - 1;
+                    var bucket = hash & mask;
+                    while (rollup.buckets[bucket] != 0 and V.compare(&rollup.groups[rollup.buckets[bucket] - 1].key, key) != 0) bucket = (bucket + 1) & mask;
+                    const at: usize = if (rollup.buckets[bucket] == 0) rollup.used else rollup.buckets[bucket] - 1;
+                    if (rollup.buckets[bucket] == 0) {
+                        if (!add or at == rollup.groups.len) { rollup.valid = false; continue; }
+                        rollup.groups[at] = .{ .key = key.* };
+                        rollup.buckets[bucket] = @intCast(at + 1);
+                        rollup.used += 1;
+                    }
+                    const group = &rollup.groups[at];
+                    if (!add and group.rows == 0) { rollup.valid = false; continue; }
+                    group.rows += sign;
+                    for (cells[0..table.column_count], group.columns[0..table.column_count]) |*cell, *column| {
+                        if (cell.* == .null_value) continue;
+                        column.nonnull += sign;
+                        if (cell.* == .integer) column.total += @as(i128, cell.integer) * sign;
+                    }
+                }
+            }
+        }
+
         pub fn indexKey(table: *Table, version: u32) void {
+            for (table.versions[version].cells[0..table.column_count], table.integer_bounds[0..table.column_count]) |*cell, *bounds| {
+                if (cell.* != .integer) continue;
+                if (!bounds.known) {
+                    bounds.* = .{ .known = true, .low = cell.integer, .high = cell.integer };
+                } else {
+                    bounds.low = @min(bounds.low, cell.integer);
+                    bounds.high = @max(bounds.high, cell.integer);
+                }
+            }
             noteOrder(table, version);
             indexKeyOnly(table, version);
         }
@@ -360,8 +494,9 @@ pub fn Storage(comptime config: types.Config) type {
             removeAt(table, table.key_index[0..], position, keyHome);
         }
 
-        /// Directory slot of the row visible to `snap` whose key equals value.
-        pub fn lookupKeyAt(table: *const Table, value: *const V.Cell, snap: Snapshot) ?u32 {
+        /// Visible version whose primary key equals value. Returning the hit
+        /// avoids walking its MVCC chain twice in read execution.
+        pub fn lookupVersionAt(table: *const Table, value: *const V.Cell, snap: Snapshot) ?u32 {
             const column = table.primary_column orelse return null;
             if (value.* == .null_value) return null;
             var position = V.hash(value) & (table.key_index.len - 1);
@@ -371,10 +506,16 @@ pub fn Storage(comptime config: types.Config) type {
                 const version = &table.versions[entry - 1];
                 if (V.compare(&version.cells[column], value) == 0) {
                     const slot = version.row - 1;
-                    if (visibleAt(table, slot, snap) == entry - 1) return slot;
+                    if (visibleAt(table, slot, snap) == entry - 1) return entry - 1;
                 }
                 position = (position + 1) & (table.key_index.len - 1);
             }
+        }
+
+        /// Directory slot of the row visible to `snap` whose key equals value.
+        pub fn lookupKeyAt(table: *const Table, value: *const V.Cell, snap: Snapshot) ?u32 {
+            const version = lookupVersionAt(table, value, snap) orelse return null;
+            return table.versions[version].row - 1;
         }
 
         /// Directory slot of the committed row whose key equals value.

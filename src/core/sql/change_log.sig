@@ -849,6 +849,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             table.versions[version] = .{ .row = slot + 1, .xmin = .{ .epoch = db.epoch }, .xmin_cid = db.cid, .xmin_csn = csn, .older = older, .cells = row.cells };
             table.rows[slot].newest = version + 1;
             S.indexKey(table, version);
+            if (older == 0) S.summarize(table, &table.versions[version].cells, true, csn);
             return version;
         }
 
@@ -878,6 +879,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const definition = try decodeCreate(&reader);
                         for (&db.tables, 0..) |*table, index| if (!table.live) {
                             S.reset(table, definition.oid, definition.name, definition.columns[0..definition.count]);
+                            S.initSummary(table, csn);
                             try db.replayCreate(index, csn);
                             db.oid_counter = definition.oid + 1 + @as(u32, @intFromBool(table.primary_column != null)) - first_oid;
                             break;
@@ -905,7 +907,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         } else {
                             const slot = S.findRow(table, rowid) orelse return error.ChangeRecordConflict;
                             const old = S.visible(table, slot) orelse return error.ChangeRecordConflict;
-                            _ = try writeVersion(db, table, slot, old + 1, &row, csn);
+                            const new = try writeVersion(db, table, slot, old + 1, &row, csn);
+                            S.summarizeUpdate(table, &table.versions[old].cells, &table.versions[new].cells, csn);
                             retire(db, table, old, csn);
                         }
                     },
@@ -913,6 +916,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const table = try tableByOid(db, try reader.int(u32));
                         const slot = S.findRow(table, try reader.int(u64)) orelse return error.ChangeRecordConflict;
                         const old = S.visible(table, slot) orelse return error.ChangeRecordConflict;
+                        S.summarize(table, &table.versions[old].cells, false, csn);
                         retire(db, table, old, csn);
                     },
                     @intFromEnum(Op.catalog_counters) => {

@@ -934,6 +934,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn body(self: *Self, slot: u16, source: []const u8, parsed: *const A.Statement, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
+            self.workspace.query.read_stats = .{};
             try self.session.checkpoint();
             const context = self.bindContext(source, mode, snap);
             const bound = try B.bind(&context, parsed);
@@ -943,9 +944,9 @@ pub fn Database(comptime config: Config) type {
                     self.outcome = .{ .affected = 0, .command = .select };
                     if (select.table) |table| try self.lockTable(slot, table, .access_share);
                     if (select.lock.strength == .none)
-                        return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, X.NoLock{}, &self.session);
+                        return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, X.NoLock{}, &self.session, self.txs[slot].write_len == 0, &self.workspace.query.read_stats);
                     const locker: RowLocker = .{ .db = self, .slot = slot, .snap = snap, .mode = if (select.lock.strength == .update) .update else .share, .wait = select.lock.wait };
-                    return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, locker, &self.session);
+                    return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, locker, &self.session, self.txs[slot].write_len == 0, &self.workspace.query.read_stats);
                 },
                 .query => |root| {
                     self.outcome = .{ .affected = 0, .command = .select };
@@ -953,7 +954,7 @@ pub fn Database(comptime config: Config) type {
                     for (plans.items[0..plans.len]) |*plan| {
                         for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| try self.lockTable(slot, table, .access_share);
                     }
-                    return X.runQuery(&self.tables, source, &self.workspace.nodes, plans, root, snap, result, &self.session, &self.workspace.query);
+                    return X.runQuery(&self.tables, source, &self.workspace.nodes, plans, root, snap, result, &self.session, &self.workspace.query, self.txs[slot].write_len == 0);
                 },
                 else => {},
             }
@@ -1963,7 +1964,7 @@ pub fn Database(comptime config: Config) type {
             var affected: usize = 0;
             switch (try X.candidates(&ctx, table, update.key, snap)) {
                 .empty => {},
-                .slot => |row| affected += try self.updateSlot(slot, &ctx, update, row, snap),
+                .slot => |hit| affected += try self.updateSlot(slot, &ctx, update, hit.row, snap),
                 .scan => {
                     const high = table.row_high;
                     for (0..high) |row| affected += try self.updateSlot(slot, &ctx, update, @intCast(row), snap);
@@ -2023,7 +2024,7 @@ pub fn Database(comptime config: Config) type {
             var affected: usize = 0;
             switch (try X.candidates(&ctx, table, delete.key, snap)) {
                 .empty => {},
-                .slot => |row| affected += try self.deleteSlot(slot, &ctx, delete, row, snap),
+                .slot => |hit| affected += try self.deleteSlot(slot, &ctx, delete, hit.row, snap),
                 .scan => {
                     const high = table.row_high;
                     for (0..high) |row| affected += try self.deleteSlot(slot, &ctx, delete, @intCast(row), snap);

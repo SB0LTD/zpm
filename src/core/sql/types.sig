@@ -10,6 +10,12 @@ pub const Config = struct {
     /// Stored-row capacity then comes from those buffers, not rows_per_table.
     /// Cells/results/schema/transaction capacities remain separately budgeted.
     external_storage: bool = false,
+    /// Optional exact committed GROUP BY synopses per supported column. This
+    /// budgets metadata groups, not SQL results: overflow retains scan paths.
+    summary_groups: usize = 0,
+    /// Speculative ordered hash probes on a proven dense integer primary-key
+    /// domain. Budget exhaustion restarts the ordinary scan; 0 disables it.
+    ordered_probe_rows: usize = 8192,
     tables: usize = 4,
     columns: usize = 8,
     rows_per_table: usize = 128,
