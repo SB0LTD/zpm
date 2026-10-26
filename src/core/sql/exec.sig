@@ -1473,11 +1473,13 @@ pub fn Exec(comptime config: types.Config) type {
             if (value != .integer) { interval.exact = false; return; }
             const key: i128 = value.integer;
             switch (op) {
-                .eq => { interval.low = @max(interval.low, key); interval.high = @min(interval.high, key); },
-                .lt => interval.high = @min(interval.high, key - 1),
-                .le => interval.high = @min(interval.high, key),
-                .gt => interval.low = @max(interval.low, key + 1),
-                .ge => interval.low = @max(interval.low, key),
+                // Explicit comparisons also lower on the native AArch64
+                // backend, whose min/max intrinsic currently stops at 64 bits.
+                .eq => { if (interval.low < key) interval.low = key; if (interval.high > key) interval.high = key; },
+                .lt => { if (interval.high > key - 1) interval.high = key - 1; },
+                .le => { if (interval.high > key) interval.high = key; },
+                .gt => { if (interval.low < key + 1) interval.low = key + 1; },
+                .ge => { if (interval.low < key) interval.low = key; },
                 else => unreachable,
             }
         }
