@@ -127,6 +127,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("tds", "src/db/tds.sig");
     _ = try ctx.addModule("tcp_server", "src/platform/tcp_server.sig");
     _ = try ctx.addModule("page_region", "src/platform/page_region.sig");
+    _ = try ctx.addModule("worker_thread", "src/platform/worker_thread.sig");
+    const test_workers = try ctx.addStep("test-workers", "Execute native joined worker and synchronization contracts", &noopStep);
+    try ctx.addDependency(test_all, test_workers);
+    _ = try addContract(ctx, test_workers, "contract-worker-thread", "tests/test_worker_thread.sig", &.{importEntry("worker_thread", "src/platform/worker_thread.sig")});
     const test_db = try ctx.addStep("test-db", "Execute database wire, transaction and TCP contracts", &noopStep);
     try ctx.addDependency(test_all, test_db);
     _ = try ctx.addModule("wall_clock", "src/platform/wall_clock.sig");
