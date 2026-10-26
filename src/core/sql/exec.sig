@@ -26,6 +26,7 @@ pub fn Exec(comptime config: types.Config) type {
         pub const work_rows = types.workRows(config);
         pub const work_cells = work_rows * 2 * config.columns;
         pub const work_refs = work_rows * 4 * (config.relations + 4);
+        const integer_topk_capacity = if (config.external_workspace) 256 else types.workRows(config);
         const absent: u32 = 0xffffffff;
         const group_relation = B.group_relation;
 
@@ -73,9 +74,9 @@ pub fn Exec(comptime config: types.Config) type {
         /// materialized CTEs and uncorrelated subquery results are copied
         /// to the top and live for the statement.
         pub const Work = struct {
-            cells: [work_cells]V.Cell = undefined,
+            cells: if (config.external_workspace) []V.Cell else [work_cells]V.Cell = if (config.external_workspace) &.{} else undefined,
             cell_low: usize = 0,
-            cell_high: usize = work_cells,
+            cell_high: usize = if (config.external_workspace) 0 else work_cells,
             refs: if (config.external_storage) []u32 else [work_refs]u32 = if (config.external_storage) &.{} else undefined,
             ref_low: usize = 0,
             ref_high: usize = if (config.external_storage) 0 else work_refs,
@@ -89,7 +90,7 @@ pub fn Exec(comptime config: types.Config) type {
 
             fn reset(self: *Work) void {
                 self.cell_low = 0;
-                self.cell_high = work_cells;
+                self.cell_high = self.cells.len;
                 self.ref_low = 0;
                 self.ref_high = self.refs.len;
                 self.stream_stats = .{};
@@ -262,7 +263,39 @@ pub fn Exec(comptime config: types.Config) type {
                 out.count += 1;
             }
 
-            /// Left-deep nested loops; the WHERE clause filters the last stage.
+            /// Only pure, non-throwing comparisons may move across inner joins.
+            /// Outer joins and volatile/computed/subquery predicates retain the
+            /// original path. An OR moves only when all its inputs are present.
+            fn earlyAvailable(self: *const Query, id: u16, stage: usize) bool {
+                if (id == none) return true;
+                const n = self.pool.nodes[id];
+                return switch (n.kind) {
+                    .column => n.level == 0 and n.relation <= stage,
+                    .null_literal, .bool_literal, .int_literal, .text_literal, .decimal_literal => true,
+                    .binary => switch (n.op) {
+                        .eq, .ne, .lt, .le, .gt, .ge => self.earlyAvailable(n.a, stage) and self.earlyAvailable(n.b, stage),
+                        else => false,
+                    },
+                    .and_op, .or_op => self.earlyAvailable(n.a, stage) and self.earlyAvailable(n.b, stage),
+                    .not_op, .test_op => self.earlyAvailable(n.a, stage),
+                    else => false,
+                };
+            }
+
+            fn earlyKeep(self: *const Query, ctx: *E.Context, id: u16, stage: usize) Error!bool {
+                if (id == none) return true;
+                const n = self.pool.nodes[id];
+                if (n.kind == .and_op) return try self.earlyKeep(ctx, n.a, stage) and try self.earlyKeep(ctx, n.b, stage);
+                return !self.earlyAvailable(id, stage) or (try E.truth(ctx, id)) == true;
+            }
+
+            fn joinKeep(self: *const Query, ctx: *E.Context, id: u16, stage: usize, last: bool, early: bool) Error!bool {
+                if (last) return keep(ctx, id, null);
+                return !early or try self.earlyKeep(ctx, id, stage);
+            }
+
+            /// Left-deep joins prune eligible WHERE conjuncts at their first
+            /// complete tuple, before allocating the next intermediate stage.
             fn join(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!Tuples {
                 var ctx = self.context(outer);
                 if (p.source_count == 0) {
@@ -270,6 +303,8 @@ pub fn Exec(comptime config: types.Config) type {
                     return .{ .start = @intCast(self.work.ref_low), .count = @intFromBool(kept), .width = 0 };
                 }
                 var current: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 1, .width = 0 };
+                var early = self.earlyAvailable(p.where, p.source_count - 1);
+                for (p.sources[0..p.source_count]) |source| if (source.join == .left or source.join == .right or source.join == .full) { early = false; break; };
                 for (p.sources[0..p.source_count], 0..) |*source, stage| {
                     const last = stage + 1 == p.source_count;
                     const probing = source.probe != none and stage != 0;
@@ -294,7 +329,7 @@ pub fn Exec(comptime config: types.Config) type {
                                     ctx.tuple[stage] = &table.versions[version].cells;
                                     if (source.on == none or (try E.truth(&ctx, source.on)) == true) {
                                         any = true;
-                                        if (!last or try keep(&ctx, p.where, null)) try self.emit(&next, current, index, version);
+                                        if (try self.joinKeep(&ctx, p.where, stage, last, early)) try self.emit(&next, current, index, version);
                                     }
                                 };
                             }
@@ -304,11 +339,11 @@ pub fn Exec(comptime config: types.Config) type {
                             if (stage != 0 and source.on != none and (try E.truth(&ctx, source.on)) != true) continue;
                             any = true;
                             if (tracks) self.work.refs[matched + position] = 1;
-                            if (!last or try keep(&ctx, p.where, null)) try self.emit(&next, current, index, handle);
+                            if (try self.joinKeep(&ctx, p.where, stage, last, early)) try self.emit(&next, current, index, handle);
                         }
                         if (!any and outer_join) {
                             ctx.tuple[stage] = null;
-                            if (!last or try keep(&ctx, p.where, null)) try self.emit(&next, current, index, absent);
+                            if (try self.joinKeep(&ctx, p.where, stage, last, early)) try self.emit(&next, current, index, absent);
                         }
                     }
                     if (tracks) {
@@ -316,7 +351,7 @@ pub fn Exec(comptime config: types.Config) type {
                             if (self.work.refs[matched + position] != 0) continue;
                             for (0..stage) |slot| ctx.tuple[slot] = null;
                             ctx.tuple[stage] = self.rowOf(source, handle);
-                            if (!last or try keep(&ctx, p.where, null)) try self.emit(&next, current, null, handle);
+                            if (try self.joinKeep(&ctx, p.where, stage, last, early)) try self.emit(&next, current, null, handle);
                         }
                     }
                     current = next;
@@ -1632,7 +1667,7 @@ pub fn Exec(comptime config: types.Config) type {
         /// recycled on rejection/replacement. NULL placement and stable row-slot
         /// order match Sorter/StableSorter. Keep this stack frame off point reads.
         noinline fn integerTopK(ctx: *E.Context, table: *const S.Table, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats) Error!usize {
-            var entries: [types.workRows(config) + 1]IntegerEntry = undefined;
+            var entries: [integer_topk_capacity + 1]IntegerEntry = undefined;
             var keys: [config.columns]IntegerOrder = undefined;
             const current = committed_only and table.summary.valid and table.summary.csn <= snap.csn;
             for (query.order[0..query.order_count], 0..) |key, column| {
@@ -1758,7 +1793,7 @@ pub fn Exec(comptime config: types.Config) type {
         /// PostgreSQL's LockRows does: it returns the version to emit (the
         /// newest committed one, whose WHERE is re-checked here when it
         /// changed), null to skip the row, or WouldBlock to park.
-        pub fn select(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, query: *const B.Select, snap: storage.Snapshot, result: anytype, locker: anytype, session: *const value_module.Session, committed_only: bool, stats: *ReadStats) Error!void {
+        pub fn select(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, query: *const B.Select, snap: storage.Snapshot, result: anytype, locker: anytype, session: *const value_module.Session, committed_only: bool, stats: *ReadStats, work: *Work) Error!void {
             try session.checkpoint();
             var ctx: E.Context = .{ .source = source, .pool = pool, .session = session };
             var plain = true;
@@ -1780,7 +1815,10 @@ pub fn Exec(comptime config: types.Config) type {
             const table_index = query.table.?;
             const table = &tables[table_index];
             const locking = @TypeOf(locker).active;
-            var indices: [types.workRows(config)]u32 = undefined;
+            var inline_indices: [if (config.external_workspace) 0 else types.workRows(config)]u32 = undefined;
+            const index_capacity = if (config.external_workspace) @min(work.refs.len / 2, work.cells.len / (2 * config.columns)) else inline_indices.len;
+            if (index_capacity == 0) return error.WorkspaceCapacity;
+            const indices = if (config.external_workspace) work.refs[0..index_capacity] else inline_indices[0..];
             var found: usize = 0;
             var column_order = true;
             for (query.order[0..query.order_count]) |key| column_order = column_order and simple(pool, key.expr);
@@ -1814,12 +1852,12 @@ pub fn Exec(comptime config: types.Config) type {
                     break :scan;
                   }
                   if (!locking and column_order and query.order_count != 0 and query.limit <= indices.len) {
-                    if (try densePrimaryScan(&ctx, table, query, snap, &indices, committed_only, stats)) |count| {
+                    if (try densePrimaryScan(&ctx, table, query, snap, indices, committed_only, stats)) |count| {
                         found = count;ordered = true;break :scan;
                     }
                   }
-                  if (top_k and integerOrder(pool, query)) {
-                    found = try integerTopK(&ctx, table, query, snap, &indices, committed_only, stats);
+                  if (top_k and query.limit <= integer_topk_capacity and integerOrder(pool, query)) {
+                    found = try integerTopK(&ctx, table, query, snap, indices, committed_only, stats);
                   } else for (0..table.row_high) |slot| {
                     try session.checkpoint();
                     const version = S.visibleAt(table, slot, snap) orelse continue;
@@ -1845,8 +1883,11 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 };
                 if (top_k) {
-                    var scratch: [types.workRows(config)]u32 = undefined;
+                    var inline_scratch: [if (config.external_workspace) 0 else types.workRows(config)]u32 = undefined;
+                    const scratch = if (config.external_workspace) work.refs[index_capacity..][0..index_capacity] else inline_scratch[0..];
                     _ = try sort_module.mergeSort(indices[0..found], scratch[0..found], &stable);
+                } else if (comptime config.external_workspace) {
+                    _ = try sort_module.mergeSort(indices[0..found], work.refs[index_capacity..][0..found], &sorter);
                 } else try sorter.sort(indices[0..found]);
             }
             if (locking) {

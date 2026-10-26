@@ -8,8 +8,8 @@ const pg_types = @import("pg_types.sig");
 const pg_copy = @import("pg_copy.sig");
 /// COPY data formats (text, csv, binary framing and escaping).
 pub const copy_format = pg_copy;
-pub const max_packet: usize = 16384;
-pub const sql_capacity: usize = 4096;
+pub const max_packet: usize = 65535;
+pub const sql_capacity: usize = 65536;
 pub const statement_capacity: usize = 8;
 pub const portal_capacity: usize = 8;
 pub const parameter_capacity: usize = 32;
@@ -243,6 +243,8 @@ pub fn Session(comptime DB: type) type {
         };
         startup: bool = false,
         failed: bool = false,
+        oversize_remaining: usize = 0,
+        oversize_tag: u8 = 0,
         authentication: ?scram.Server = null,
         statements: [statement_capacity]Statement = @splat(.{}),
         portals: [portal_capacity]Portal = @splat(.{}),
@@ -263,11 +265,36 @@ pub fn Session(comptime DB: type) type {
 
         /// An output of this size is sufficient before any SQL mutation occurs.
         pub fn responseCapacity() usize {
+            if (@hasDecl(DB.Result, "storageBytesFor")) return responseCapacityFor(DB.Result.default_row_capacity) catch unreachable;
             return @sizeOf(DB.Result) * 2 + 4096;
         }
 
+        pub fn responseCapacityFor(row_capacity: usize) error{BufferTooSmall}!usize {
+            const bytes = if (@hasDecl(DB.Result, "storageBytesFor")) DB.Result.storageBytesFor(row_capacity) catch return error.BufferTooSmall else @sizeOf(DB.Result);
+            const multiplied = @mulWithOverflow(bytes, 2);
+            const total = @addWithOverflow(multiplied[0], 4096);
+            if (multiplied[1] != 0 or total[1] != 0) return error.BufferTooSmall;
+            return total[0];
+        }
+
+        pub fn requiredCapacity(self: *const Self) error{BufferTooSmall}!usize {
+            return responseCapacityFor(self.result.rows.len);
+        }
+
+        fn discardOversize(self: *Self, db: *DB, input: []const u8, output: []u8, prefix: usize) error{BufferTooSmall}!Reply {
+            const consumed = @min(input.len, self.oversize_remaining);
+            self.oversize_remaining -= consumed;
+            if (self.oversize_remaining != 0 or self.failed) return .{ .consumed = prefix + consumed };
+            var writer: Writer = .{ .bytes = output };
+            try failure(&writer, "54000", "SQL message exceeds the configured packet capacity");
+            if (@hasDecl(DB, "failTransaction")) db.failTransaction();
+            if (self.oversize_tag == 'Q') try self.ready(db, &writer) else self.failed = true;
+            return .{ .consumed = prefix + consumed, .written = writer.at };
+        }
+
         pub fn handle(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
-            if (output.len < responseCapacity()) return error.BufferTooSmall;
+            if (output.len < try self.requiredCapacity()) return error.BufferTooSmall;
+            if (self.oversize_remaining != 0) return self.discardOversize(db, input, output, 0);
             if (self.authentication) |*auth| if (auth.state == .failed) return .{ .close = true };
             if (has_copy and self.copy.mode != .none) return self.copyHandle(db, input, output);
             const prefix: usize = if (self.startup) 1 else 0;
@@ -275,6 +302,15 @@ pub fn Session(comptime DB: type) type {
             const size = read32(input[prefix..][0..4]);
             var w: Writer = .{ .bytes = output };
             if (size < 4 or size > max_packet) {
+                // Drain a bounded oversized SQL frame without retaining it.
+                // A valid query that exceeds our budget gets a SQL error and
+                // remains synchronized, rather than an unread-body TCP reset.
+                if (self.startup and (self.authentication == null or self.authentication.?.state == .complete) and size > max_packet and size <= 16 * 1024 * 1024 and
+                    (input[0] == 'Q' or input[0] == 'P' or input[0] == 'B')) {
+                    self.oversize_remaining = size - 4;
+                    self.oversize_tag = input[0];
+                    return self.discardOversize(db, input[5..], output, 5);
+                }
                 try failure(&w, "08P01", "invalid packet length");
                 return .{ .consumed = @min(input.len, prefix + 4), .written = w.at, .close = true };
             }
@@ -1335,15 +1371,25 @@ fn failure(w: *Writer, state: []const u8, message: []const u8) !void {
     w.end(p);
 }
 fn authenticationFailure(w: *Writer) !void {
+    return fatal(w, "28P01", "password authentication failed");
+}
+
+pub fn connectionLimitError(output: []u8) error{BufferTooSmall}!usize {
+    var writer: Writer = .{ .bytes = output };
+    try fatal(&writer, "53300", "too many connections");
+    return writer.at;
+}
+
+fn fatal(w: *Writer, state: []const u8, message: []const u8) !void {
     const p = try w.begin('E');
     try w.byte('S');
     try w.string("FATAL");
     try w.byte('V');
     try w.string("FATAL");
     try w.byte('C');
-    try w.string("28P01");
+    try w.string(state);
     try w.byte('M');
-    try w.string("password authentication failed");
+    try w.string(message);
     try w.byte(0);
     w.end(p);
 }

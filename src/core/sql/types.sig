@@ -10,6 +10,10 @@ pub const Config = struct {
     /// Stored-row capacity then comes from those buffers, not rows_per_table.
     /// Cells/results/schema/transaction capacities remain separately budgeted.
     external_storage: bool = false,
+    /// Query cells are a separately bound caller-owned runtime budget.
+    external_workspace: bool = false,
+    /// Result rows are bound independently by each serialized caller/session.
+    external_results: bool = false,
     /// Optional caller-backed committed integral scan projection. Old snapshots
     /// and own writes retain MVCC row scans. Currently external storage only.
     compact_integral_scans: bool = false,

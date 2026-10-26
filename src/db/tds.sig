@@ -269,7 +269,20 @@ pub fn Session(comptime DB: type) type {
         pub fn responseCapacity() usize {
             // Includes UTF-16 expansion plus every packet/metadata header. The
             // minimum negotiated packet size is 512, so headers add < 1.6%.
+            if (@hasDecl(DB.Result, "storageBytesFor")) return responseCapacityFor(DB.Result.default_row_capacity) catch unreachable;
             return @sizeOf(DB.Result) * 3 + 4096;
+        }
+
+        pub fn responseCapacityFor(row_capacity: usize) Error!usize {
+            const bytes = if (@hasDecl(DB.Result, "storageBytesFor")) DB.Result.storageBytesFor(row_capacity) catch return error.BufferTooSmall else @sizeOf(DB.Result);
+            const multiplied = @mulWithOverflow(bytes, 3);
+            const total = @addWithOverflow(multiplied[0], 4096);
+            if (multiplied[1] != 0 or total[1] != 0) return error.BufferTooSmall;
+            return total[0];
+        }
+
+        pub fn requiredCapacity(self: *const Self) Error!usize {
+            return responseCapacityFor(self.result.rows.len);
         }
 
         pub fn begin(_: *Self, _: []u8) Error!usize {
@@ -885,7 +898,7 @@ pub fn Session(comptime DB: type) type {
             const packet_length = be16(input[2..4]);
             if (packet_length < 8 or input[7] != 0 or input[1] & 0xfe != 0) return error.MalformedPacket;
             if (input.len < packet_length) return .{};
-            if (out.len < responseCapacity()) return error.BufferTooSmall;
+            if (out.len < try self.requiredCapacity()) return error.BufferTooSmall;
             const payload = input[8..packet_length];
             if (payload.len > self.message.len - self.message_len) return error.RequestTooLarge;
             if (self.message_len != 0 and (input[0] != self.message_type or input[6] != self.next_packet_id)) return error.InvalidSequence;

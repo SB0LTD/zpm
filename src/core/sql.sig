@@ -185,6 +185,7 @@ pub const StatementOptions = struct {
 };
 
 pub fn Database(comptime config: Config) type {
+    if (config.external_workspace and !config.external_storage) @compileError("external_workspace requires external_storage");
     if (config.integer_bits != 32 and config.integer_bits != 64) @compileError("SQL INTEGER width must be 32 or 64");
     if (config.tables == 0 or config.columns == 0 or config.rows_per_table == 0 or
         config.name_bytes == 0 or config.text_bytes == 0 or config.predicates == 0 or
@@ -257,7 +258,34 @@ pub fn Database(comptime config: Config) type {
             column_types: [config.columns]DataType = @splat(.integer),
             /// PostgreSQL atttypmod of each column (-1 when none).
             column_typmods: [config.columns]i32 = @splat(-1),
-            rows: [types.resultRows(config)]Row = @splat(.{}),
+            rows: if (config.external_results) []Row else [types.resultRows(config)]Row = if (config.external_results) &.{} else @splat(.{}),
+            pub const default_row_capacity = types.resultRows(config);
+            pub const external_rows = config.external_results;
+
+            pub fn storageBytesFor(rows: usize) Error!usize {
+                if (rows == 0 or rows > 0x7fffffff) return error.InvalidParameterValue;
+                const amount = @mulWithOverflow(rows, @sizeOf(Row));
+                const header = @sizeOf(Result) - (if (config.external_results) 0 else @sizeOf([types.resultRows(config)]Row));
+                const total = @addWithOverflow(header, amount[0]);
+                if (amount[1] != 0 or total[1] != 0) return error.InvalidParameterValue;
+                return total[0];
+            }
+
+            pub fn rowBytes(rows: usize) Error!usize {
+                _ = try storageBytesFor(rows);
+                return rows * @sizeOf(Row);
+            }
+
+            pub fn bindMemory(self: *Result, bytes: []u8, rows: usize) Error!void {
+                if (comptime !config.external_results) @compileError("result binding requires external_results");
+                if (bytes.len < try rowBytes(rows)) return error.WorkspaceCapacity;
+                const values = try storageView(Row, bytes, 0, rows);
+                const start = @intFromPtr(values.ptr);
+                const own = @intFromPtr(self);
+                if (start < own + @sizeOf(Result) and own < start + rows * @sizeOf(Row)) return error.InvalidParameterValue;
+                self.rows = values;
+                self.clear(0);
+            }
 
             pub const default_session: *const value_module.Session = &value_module.default_session;
 
@@ -294,7 +322,13 @@ pub fn Database(comptime config: Config) type {
             /// Copy the observable result, without touching unused capacity.
             /// Destination may be uninitialized; inactive ranges stay unreadable.
             pub fn copyFrom(self: *Result, source: *const Result) void {
+                if (comptime config.external_results) @compileError("use copyFromChecked for runtime-sized results");
+                self.copyFromChecked(source) catch unreachable;
+            }
+
+            pub fn copyFromChecked(self: *Result, source: *const Result) Error!void {
                 if (self == source) return;
+                if (source.row_count > self.rows.len) return error.RowCapacity;
                 self.column_count = source.column_count;
                 self.row_count = source.row_count;
                 self.affected_rows = source.affected_rows;
@@ -420,6 +454,46 @@ pub fn Database(comptime config: Config) type {
             return (try backingLayout(rows, versions, refs)).bytes;
         }
 
+        pub fn queryWorkspaceBytes(rows: usize) Error!usize {
+            if (rows == 0 or rows > 0xffffffff / (2 * config.columns)) return error.InvalidParameterValue;
+            var cursor: usize = 0;
+            _ = try appendLayout(&cursor, Cell, rows * 2 * config.columns);
+            return cursor;
+        }
+
+        pub fn queryReferenceCount(rows: usize) Error!usize {
+            const factor = 4 * (config.relations + 4);
+            if (rows == 0 or rows > 0x7fffffff / factor) return error.InvalidParameterValue;
+            return rows * factor;
+        }
+
+        /// Bind scratch only to fresh state; validate ownership before mutation.
+        /// This region never becomes part of the database's inline object/image.
+        pub fn bindWorkspace(self: *Self, cells: []Cell) Error!void {
+            if (comptime !config.external_workspace) @compileError("bindWorkspace requires external_workspace");
+            if (self.csn != 0 or cells.len < 2 * config.columns or cells.len > 0xffffffff) return error.InvalidParameterValue;
+            for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
+            const region = StorageSpan.of(cells);
+            const own: StorageSpan = .{ .start = @intFromPtr(self), .end = @intFromPtr(self) + @sizeOf(Self) };
+            if (region.start < own.end and own.start < region.end) return error.InvalidParameterValue;
+            if (comptime config.external_storage) {
+                const refs = StorageSpan.of(self.workspace.query.refs);
+                if (refs.start < refs.end and region.start < refs.end and refs.start < region.end) return error.InvalidParameterValue;
+                for (&self.tables) |*table| inline for (.{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live" }) |field| {
+                    const part = StorageSpan.of(@field(table, field));
+                    if (part.start < part.end and region.start < part.end and part.start < region.end) return error.InvalidParameterValue;
+                };
+            }
+            self.workspace.query.cells = cells;
+            self.workspace.query.cell_high = cells.len;
+        }
+
+        pub fn bindWorkspaceMemory(self: *Self, bytes: []u8, rows: usize) Error!void {
+            const required = try queryWorkspaceBytes(rows);
+            if (bytes.len < required) return error.WorkspaceCapacity;
+            try self.bindWorkspace(try storageView(Cell, bytes, 0, rows * 2 * config.columns));
+        }
+
         fn storageView(comptime T: type, bytes: []u8, offset: usize, count: usize) Error![]T {
             const ptr = bytes.ptr + offset;
             if (@intFromPtr(ptr) % @alignOf(T) != 0) return error.InvalidParameterValue;
@@ -464,9 +538,10 @@ pub fn Database(comptime config: Config) type {
             if (self.csn != 0 or refs.len == 0 or refs.len > 0x7fffffff) return error.InvalidParameterValue;
             for (&self.tables) |*table| if (table.live) return error.InvalidParameterValue;
             for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
-            var spans: [config.tables * 7 + 2]StorageSpan = undefined;
+            var spans: [config.tables * 7 + 3]StorageSpan = undefined;
             spans[0] = .{ .start = @intFromPtr(self), .end = @intFromPtr(self) + @sizeOf(Self) };
             spans[1] = StorageSpan.of(refs);
+            spans[spans.len - 1] = if (comptime config.external_workspace) StorageSpan.of(self.workspace.query.cells) else .{ .start = 0, .end = 0 };
             for (backings, 0..) |backing, i| {
                 if (!backing.valid()) return error.InvalidParameterValue;
                 spans[2 + i * 7] = StorageSpan.of(backing.rows);
@@ -543,9 +618,14 @@ pub fn Database(comptime config: Config) type {
             self.session = .{};
             if (comptime config.external_storage) {
                 const refs = self.workspace.query.refs;
+                const cells = if (comptime config.external_workspace) self.workspace.query.cells else {};
                 self.workspace = .{};
                 self.workspace.query.refs = refs;
                 self.workspace.query.ref_high = refs.len;
+                if (comptime config.external_workspace) {
+                    self.workspace.query.cells = cells;
+                    self.workspace.query.cell_high = cells.len;
+                }
             } else self.workspace = .{};
             self.locks = .{};
             for (&self.txs) |*tx| tx.active = false;
@@ -878,6 +958,8 @@ pub fn Database(comptime config: Config) type {
         /// (atomicity) and leaves `result` untouched; WouldBlock keeps it
         /// open with its versions and locks (re-deliver with .resume).
         pub fn statement(self: *Self, slot: u16, source: []const u8, result: *Result, options: StatementOptions) Error!void {
+            if (comptime config.external_results) if (result.rows.len == 0) return error.InvalidParameterValue;
+            if (comptime config.external_workspace) if (self.workspace.query.cells.len == 0) return error.InvalidParameterValue;
             if (comptime config.external_storage) if (self.workspace.query.refs.len == 0) return error.InvalidParameterValue;
             if (!self.active(slot)) return error.NoActiveTransaction;
             const tx = &self.txs[slot];
@@ -960,9 +1042,9 @@ pub fn Database(comptime config: Config) type {
                     self.outcome = .{ .affected = 0, .command = .select };
                     if (select.table) |table| try self.lockTable(slot, table, .access_share);
                     if (select.lock.strength == .none)
-                        return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, X.NoLock{}, &self.session, self.txs[slot].write_len == 0, &self.workspace.query.read_stats);
+                        return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, X.NoLock{}, &self.session, self.txs[slot].write_len == 0, &self.workspace.query.read_stats, &self.workspace.query);
                     const locker: RowLocker = .{ .db = self, .slot = slot, .snap = snap, .mode = if (select.lock.strength == .update) .update else .share, .wait = select.lock.wait };
-                    return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, locker, &self.session, self.txs[slot].write_len == 0, &self.workspace.query.read_stats);
+                    return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, locker, &self.session, self.txs[slot].write_len == 0, &self.workspace.query.read_stats, &self.workspace.query);
                 },
                 .query => |root| {
                     self.outcome = .{ .affected = 0, .command = .select };
@@ -1002,9 +1084,9 @@ pub fn Database(comptime config: Config) type {
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound) };
             switch (bound) {
-                .insert => |*insert| if (insert.returning.count != 0) try self.returnRows(slot, source, &insert.returning, insert.table, insert.plan == ast.none),
-                .update => |*update| if (update.returning.count != 0) try self.returnRows(slot, source, &update.returning, update.table, true),
-                .delete => |*delete| if (delete.returning.count != 0) try self.returnRows(slot, source, &delete.returning, delete.table, true),
+                .insert => |*insert| if (insert.returning.count != 0) try self.returnRows(slot, source, &insert.returning, insert.table, insert.plan == ast.none, result.rows.len),
+                .update => |*update| if (update.returning.count != 0) try self.returnRows(slot, source, &update.returning, update.table, true, result.rows.len),
+                .delete => |*delete| if (delete.returning.count != 0) try self.returnRows(slot, source, &delete.returning, delete.table, true, result.rows.len),
                 else => {},
             }
         }
@@ -1014,7 +1096,7 @@ pub fn Database(comptime config: Config) type {
         /// The statement's write slice survives a park, so a resumed
         /// statement emits every row exactly once. Every value is computed
         /// into the workspace first; a failure leaves the result untouched.
-        fn returnRows(self: *Self, slot: u16, source: []const u8, list: *const B.Returning, table_index: usize, fresh: bool) Error!void {
+        fn returnRows(self: *Self, slot: u16, source: []const u8, list: *const B.Returning, table_index: usize, fresh: bool, result_capacity: usize) Error!void {
             const tx = &self.txs[slot];
             const start = tx.subs[tx.sub_len - 1].write_start;
             const writes = tx.writes[start..tx.write_len];
@@ -1022,7 +1104,7 @@ pub fn Database(comptime config: Config) type {
             for (writes) |entry| if (rowWrite(entry.kind) and entry.table == table_index) {
                 count += 1;
             };
-            if (count > types.resultRows(config)) return error.RowCapacity;
+            if (count > result_capacity) return error.RowCapacity;
             const work = &self.workspace.query;
             if (fresh) X.resetWork(work);
             const width = list.count;
@@ -2264,6 +2346,7 @@ pub fn Database(comptime config: Config) type {
         /// decoded and validated against `scratch` before anything changes.
         /// Replay runs before any transaction starts.
         pub fn applyChangeRecord(self: *Self, record: []const u8, scratch: *ReplayScratch) Error!void {
+            if (comptime config.external_workspace) if (self.workspace.query.cells.len == 0) return error.InvalidParameterValue;
             if (comptime config.external_storage) if (self.workspace.query.refs.len == 0) return error.InvalidParameterValue;
             try C.apply(self, record, scratch);
             self.reclaimTables(self.csn);
