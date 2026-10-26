@@ -77,9 +77,9 @@ fn large() !void {
     try check(result.rows[0].cells[0].integer == count and result.rows[0].cells[1].integer == @as(i64, count)*(count-1)/2 and result.rows[0].cells[2].integer == 0 and result.rows[0].cells[3].integer == count-1);
     try check(db.workspace.query.stream_stats.scratch_refs == 0);
     try db.execute("SELECT COUNT(*) FROM data LIMIT 1", &result);
-    try check(result.row_count == 1 and result.rows[0].cells[0].integer == count and db.workspace.query.stream_stats.rows == count);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == count and db.workspace.query.stream_stats.rows == 0 and db.workspace.query.stream_stats.summary_rows == count);
     try db.execute("SELECT COUNT(*) FROM data LIMIT 1 OFFSET 1", &result);
-    try check(result.row_count == 0 and db.workspace.query.stream_stats.rows == count);
+    try check(result.row_count == 0 and db.workspace.query.stream_stats.rows == 0 and db.workspace.query.stream_stats.summary_rows == count);
     try db.execute("SELECT g, label, COUNT(*) FROM data GROUP BY g, label ORDER BY g", &result);
     try check(result.row_count == 64 and result.rows[7].cells[1] == .text and result.rows[7].cells[2].integer == (count-1-7)/64+1);
     try db.execute("SELECT g FROM data WHERE id < 256 GROUP BY g HAVING SUM(n) >= 0 ORDER BY g DESC LIMIT 4", &result);
@@ -102,7 +102,7 @@ fn large() !void {
     try check(cancel.calls == 25);
     control = .{ .max_work = 100 };
     db.session.control = &control;
-    try rejected("SELECT COUNT(*), SUM(n) FROM data", error.QueryWorkLimit);
+    try rejected("SELECT COUNT(*), SUM(n) FROM data WHERE id >= 0", error.QueryWorkLimit);
     db.session.control = null;
     @memset(&db.workspace.query.cells, .{ .integer = 0x55555555 });
     @memset(&refs, 0xaaaaaaaa);

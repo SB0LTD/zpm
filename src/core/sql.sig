@@ -953,7 +953,7 @@ pub fn Database(comptime config: Config) type {
                     for (plans.items[0..plans.len]) |*plan| {
                         for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| try self.lockTable(slot, table, .access_share);
                     }
-                    return X.runQuery(&self.tables, source, &self.workspace.nodes, plans, root, snap, result, &self.session, &self.workspace.query);
+                    return X.runQuery(&self.tables, source, &self.workspace.nodes, plans, root, snap, result, &self.session, &self.workspace.query, self.txs[slot].write_len == 0);
                 },
                 else => {},
             }

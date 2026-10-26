@@ -134,6 +134,17 @@ pub fn Storage(comptime config: types.Config) type {
         pub const OrderState = enum { empty, one, increasing, decreasing, unordered };
         pub const OrderProof = struct { state: OrderState = .empty, last: V.Cell = .null_value };
 
+        /// Exact committed state, derived from published row transitions (not
+        /// persisted). Old snapshots and transactions with own writes scan.
+        /// At most 2^31-1 rows of i64 values fit comfortably in an i128 total.
+        pub const ColumnSummary = struct { nonnull: i64 = 0, total: i128 = 0 };
+        pub const Summary = struct {
+            valid: bool = false,
+            csn: u64 = 0,
+            rows: i64 = 0,
+            columns: [config.columns]ColumnSummary = @splat(.{}),
+        };
+
         pub const Table = struct {
             live: bool = false,
             pending_create: bool = false,
@@ -147,6 +158,7 @@ pub fn Storage(comptime config: types.Config) type {
             /// Conservative strict non-NULL order over physical row slots.
             /// Updates/aborts may discard a proof, never invent one. Not persisted.
             column_order: [config.columns]OrderProof = @splat(.{}),
+            summary: Summary = .{},
             next_rowid: u64 = 0,
             row_generation: u32 = 0,
             row_high: usize = 0,
@@ -185,6 +197,7 @@ pub fn Storage(comptime config: types.Config) type {
             table.version_used = 0;
             table.version_free = 0;
             table.column_order = @splat(.{});
+            table.summary = .{};
             @memset(table.row_index[0..], 0);
             if (table.primary_column != null) @memset(table.key_index[0..], 0);
         }
@@ -197,6 +210,7 @@ pub fn Storage(comptime config: types.Config) type {
             @memcpy(destination.columns[0..source.column_count], source.columns[0..source.column_count]);
             destination.primary_column = source.primary_column;
             destination.column_order = source.column_order;
+            destination.summary = source.summary;
             destination.next_rowid = source.next_rowid;
             destination.row_generation = source.row_generation;
             destination.row_high = source.row_high;
@@ -307,6 +321,23 @@ pub fn Storage(comptime config: types.Config) type {
                 position = (position + 1) & (table.row_index.len - 1);
             }
             removeAt(table, table.row_index[0..], position, rowHome);
+        }
+
+        /// Called only at durable publication or validated change-record replay.
+        pub fn summarize(table: *Table, cells: *const [config.columns]V.Cell, add: bool, csn: u64) void {
+            if (!table.summary.valid) return;
+            const sign: i64 = if (add) 1 else -1;
+            table.summary.rows += sign;
+            table.summary.csn = csn;
+            for (cells[0..table.column_count], table.summary.columns[0..table.column_count]) |*cell, *column| {
+                if (cell.* == .null_value) continue;
+                column.nonnull += sign;
+                if (cell.* == .integer) column.total += @as(i128, cell.integer) * sign;
+            }
+        }
+
+        pub fn initSummary(table: *Table, csn: u64) void {
+            table.summary = .{ .valid = true, .csn = csn };
         }
 
         pub fn indexKey(table: *Table, version: u32) void {

@@ -48,6 +48,8 @@ pub fn Exec(comptime config: types.Config) type {
         /// include nested eligible plans; scratch figures are per-plan peaks.
         pub const StreamStats = struct {
             rows: usize = 0,
+            summary_rows: usize = 0,
+            summary_plans: usize = 0,
             groups: usize = 0,
             probes: usize = 0,
             scratch_cells: usize = 0,
@@ -116,6 +118,7 @@ pub fn Exec(comptime config: types.Config) type {
             snap: storage.Snapshot,
             session: *const value_module.Session,
             work: *Work,
+            committed_only: bool = false,
             hook: E.Hook = undefined,
 
             fn mark(self: *const Query) Mark {
@@ -489,6 +492,21 @@ pub fn Exec(comptime config: types.Config) type {
                 }
             };
 
+            /// Every eligible aggregate can use exact published metadata.
+            /// No computed/filter/distinct input is skipped. The caller proves
+            /// this transaction has no writes; CSN protects pinned snapshots.
+            fn summaryEligible(self: *const Query, p: *const B.Plan, table: *const S.Table) bool {
+                if (!self.committed_only or !table.summary.valid or table.summary.csn > self.snap.csn or p.where != none) return false;
+                for (p.aggs[0..p.agg_count]) |agg| {
+                    if (agg.distinct or agg.filter != none) return false;
+                    if (agg.kind == .count_star) continue;
+                    if (agg.kind != .count and !(agg.kind == .sum and value_module.integral(agg.arg_ty))) return false;
+                    const node = &self.pool.nodes[agg.arg];
+                    if (node.kind != .column or node.level != 0 or node.relation != 0) return false;
+                }
+                return true;
+            }
+
             /// Consume visible base-table versions directly. State grows with
             /// groups, not scanned rows. All output remains private until the
             /// ordinary query publication step succeeds.
@@ -499,7 +517,21 @@ pub fn Exec(comptime config: types.Config) type {
                 if (p.key_count == 0) {
                     var states: [config.columns]Accumulator = undefined;
                     for (states[0..p.agg_count]) |*state| state.* = .{};
-                    for (0..table.row_high) |slot| {
+                    if (self.summaryEligible(p, table)) {
+                        for (p.aggs[0..p.agg_count], states[0..p.agg_count]) |agg, *state| {
+                            try self.session.checkpoint();
+                            if (agg.kind == .count_star) {
+                                state.count = table.summary.rows;
+                            } else {
+                                const column = &table.summary.columns[self.pool.nodes[agg.arg].column];
+                                state.count = column.nonnull;
+                                state.wide = column.total;
+                                if (agg.kind == .sum and agg.ty == .int8) state.integer = @intCast(column.total);
+                            }
+                        }
+                        self.work.stream_stats.summary_rows += @intCast(table.summary.rows);
+                        self.work.stream_stats.summary_plans += 1;
+                    } else for (0..table.row_high) |slot| {
                         try self.session.checkpoint();
                         const version = S.visibleAt(table, slot, self.snap) orelse continue;
                         self.work.stream_stats.rows += 1;
@@ -1009,9 +1041,9 @@ pub fn Exec(comptime config: types.Config) type {
         }
 
         /// Runs the plan `root` and writes its rows into `result`.
-        pub fn runQuery(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, plans: *const B.Plans, root: u16, snap: storage.Snapshot, result: anytype, session: *const value_module.Session, work: *Work) Error!void {
+        pub fn runQuery(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, plans: *const B.Plans, root: u16, snap: storage.Snapshot, result: anytype, session: *const value_module.Session, work: *Work, committed_only: bool) Error!void {
             work.reset();
-            var runner: Query = .{ .tables = tables, .source = source, .pool = pool, .plans = plans, .snap = snap, .session = session, .work = work };
+            var runner: Query = .{ .tables = tables, .source = source, .pool = pool, .plans = plans, .snap = snap, .session = session, .work = work, .committed_only = committed_only };
             runner.hook = .{ .ptr = &runner, .run = Query.subquery };
             const list = try runner.run(root, null);
             const p = &plans.items[root];

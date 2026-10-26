@@ -849,11 +849,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
             table.versions[version] = .{ .row = slot + 1, .xmin = .{ .epoch = db.epoch }, .xmin_cid = db.cid, .xmin_csn = csn, .older = older, .cells = row.cells };
             table.rows[slot].newest = version + 1;
             S.indexKey(table, version);
+            S.summarize(table, &table.versions[version].cells, true, csn);
             return version;
         }
 
         fn retire(db: anytype, table: *S.Table, version: u32, csn: u64) void {
             const entry = &table.versions[version];
+            S.summarize(table, &entry.cells, false, csn);
             entry.xmax = .{ .epoch = db.epoch };
             entry.xmax_cid = db.cid;
             entry.xmax_csn = csn;
@@ -878,6 +880,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const definition = try decodeCreate(&reader);
                         for (&db.tables, 0..) |*table, index| if (!table.live) {
                             S.reset(table, definition.oid, definition.name, definition.columns[0..definition.count]);
+                            S.initSummary(table, csn);
                             try db.replayCreate(index, csn);
                             db.oid_counter = definition.oid + 1 + @as(u32, @intFromBool(table.primary_column != null)) - first_oid;
                             break;
