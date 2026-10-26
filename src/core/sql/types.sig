@@ -10,6 +10,9 @@ pub const Config = struct {
     /// Stored-row capacity then comes from those buffers, not rows_per_table.
     /// Cells/results/schema/transaction capacities remain separately budgeted.
     external_storage: bool = false,
+    /// Optional caller-backed committed integral scan projection. Old snapshots
+    /// and own writes retain MVCC row scans. Currently external storage only.
+    compact_integral_scans: bool = false,
     /// Optional exact committed GROUP BY synopses per supported column. This
     /// budgets metadata groups, not SQL results: overflow retains scan paths.
     summary_groups: usize = 0,

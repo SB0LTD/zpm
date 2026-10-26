@@ -370,7 +370,7 @@ pub fn Database(comptime config: Config) type {
         workspace: Workspace = .{},
 
         const BackingLayout = struct {
-            offsets: [config.tables][4]usize,
+            offsets: [config.tables][7]usize,
             refs: usize,
             bytes: usize,
             row_index: usize,
@@ -403,6 +403,12 @@ pub fn Database(comptime config: Config) type {
                 offsets[1] = try appendLayout(&cursor, S.Version, versions);
                 offsets[2] = try appendLayout(&cursor, u32, ri);
                 offsets[3] = try appendLayout(&cursor, u32, ki);
+                const scan_rows = if (S.compact_enabled) rows else 0;
+                const scan_cells = @mulWithOverflow(scan_rows, config.columns);
+                if (scan_cells[1] != 0) return error.InvalidParameterValue;
+                offsets[4] = try appendLayout(&cursor, i64, scan_cells[0]);
+                offsets[5] = try appendLayout(&cursor, u64, scan_rows);
+                offsets[6] = try appendLayout(&cursor, u8, scan_rows);
             }
             layout.refs = try appendLayout(&cursor, u32, refs);
             layout.bytes = cursor;
@@ -432,6 +438,9 @@ pub fn Database(comptime config: Config) type {
                 .versions = try storageView(S.Version, bytes, offsets[1], versions),
                 .row_index = try storageView(u32, bytes, offsets[2], layout.row_index),
                 .key_index = try storageView(u32, bytes, offsets[3], layout.key_index),
+                .scan_values = try storageView(i64, bytes, offsets[4], if (S.compact_enabled) rows * config.columns else 0),
+                .scan_nonnull = try storageView(u64, bytes, offsets[5], if (S.compact_enabled) rows else 0),
+                .scan_live = try storageView(u8, bytes, offsets[6], if (S.compact_enabled) rows else 0),
             };
             try self.bindStorage(backings, try storageView(u32, bytes, layout.refs, refs));
         }
@@ -455,17 +464,21 @@ pub fn Database(comptime config: Config) type {
             if (self.csn != 0 or refs.len == 0 or refs.len > 0x7fffffff) return error.InvalidParameterValue;
             for (&self.tables) |*table| if (table.live) return error.InvalidParameterValue;
             for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
-            var spans: [config.tables * 4 + 2]StorageSpan = undefined;
+            var spans: [config.tables * 7 + 2]StorageSpan = undefined;
             spans[0] = .{ .start = @intFromPtr(self), .end = @intFromPtr(self) + @sizeOf(Self) };
             spans[1] = StorageSpan.of(refs);
             for (backings, 0..) |backing, i| {
                 if (!backing.valid()) return error.InvalidParameterValue;
-                spans[2 + i * 4] = StorageSpan.of(backing.rows);
-                spans[3 + i * 4] = StorageSpan.of(backing.versions);
-                spans[4 + i * 4] = StorageSpan.of(backing.row_index);
-                spans[5 + i * 4] = StorageSpan.of(backing.key_index);
+                spans[2 + i * 7] = StorageSpan.of(backing.rows);
+                spans[3 + i * 7] = StorageSpan.of(backing.versions);
+                spans[4 + i * 7] = StorageSpan.of(backing.row_index);
+                spans[5 + i * 7] = StorageSpan.of(backing.key_index);
+                spans[6 + i * 7] = StorageSpan.of(backing.scan_values);
+                spans[7 + i * 7] = StorageSpan.of(backing.scan_nonnull);
+                spans[8 + i * 7] = StorageSpan.of(backing.scan_live);
             }
             for (spans, 0..) |a, i| for (spans[i + 1 ..]) |b| {
+                if (a.start == a.end or b.start == b.end) continue;
                 if (a.start < b.end and b.start < a.end) return error.InvalidParameterValue;
             };
             for (&self.tables, backings) |*table, backing| {
@@ -473,6 +486,9 @@ pub fn Database(comptime config: Config) type {
                 table.versions = backing.versions;
                 table.row_index = backing.row_index;
                 table.key_index = backing.key_index;
+                table.scan_values = backing.scan_values;
+                table.scan_nonnull = backing.scan_nonnull;
+                table.scan_live = backing.scan_live;
             }
             self.workspace.query.refs = refs;
             self.workspace.query.ref_high = refs.len;

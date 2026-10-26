@@ -68,6 +68,7 @@ pub fn Storage(comptime config: types.Config) type {
         pub const key_index_capacity: usize = pow2(versions_capacity * 2);
         /// Opportunistic reclamation bound after a transaction publishes.
         pub const reclaim_budget: usize = 64;
+        pub const compact_enabled = config.compact_integral_scans and config.external_storage and config.columns <= 64;
 
         comptime {
             if (versions_capacity <= config.rows_per_table) @compileError("versions_per_table must exceed rows_per_table");
@@ -118,12 +119,16 @@ pub fn Storage(comptime config: types.Config) type {
             versions: []Version,
             row_index: []u32,
             key_index: []u32,
+            scan_values: []i64 = &.{},
+            scan_nonnull: []u64 = &.{},
+            scan_live: []u8 = &.{},
 
             pub fn valid(self: Backing) bool {
                 return self.rows.len != 0 and self.rows.len <= 0x7fffffff and
                     self.versions.len > self.rows.len and self.versions.len <= 0x7fffffff and
                     self.row_index.len >= self.rows.len * 2 and powerOfTwo(self.row_index.len) and
-                    self.key_index.len >= self.versions.len * 2 and powerOfTwo(self.key_index.len);
+                    self.key_index.len >= self.versions.len * 2 and powerOfTwo(self.key_index.len) and
+                    (!compact_enabled or (self.scan_values.len >= self.rows.len * config.columns and self.scan_nonnull.len >= self.rows.len and self.scan_live.len >= self.rows.len));
             }
         };
 
@@ -183,6 +188,12 @@ pub fn Storage(comptime config: types.Config) type {
             version_high: usize = 0,
             version_used: usize = 0,
             version_free: u32 = 0,
+            /// Column-major committed values. Every element below scan_high is
+            /// initialized, including directory holes and non-integral columns.
+            scan_high: usize = 0,
+            scan_values: []i64 = &.{},
+            scan_nonnull: []u64 = &.{},
+            scan_live: []u8 = &.{},
             rows: if (config.external_storage) []RowSlot else [config.rows_per_table]RowSlot = if (config.external_storage) &.{} else @splat(.{}),
             versions: if (config.external_storage) []Version else [versions_capacity]Version = if (config.external_storage) &.{} else @splat(.{}),
             row_index: if (config.external_storage) []u32 else [row_index_capacity]u32 = if (config.external_storage) &.{} else @splat(0),
@@ -213,6 +224,7 @@ pub fn Storage(comptime config: types.Config) type {
             table.version_high = 0;
             table.version_used = 0;
             table.version_free = 0;
+            table.scan_high = 0;
             table.column_order = @splat(.{});
             table.summary = .{};
             table.integer_bounds = @splat(.{});
@@ -239,6 +251,12 @@ pub fn Storage(comptime config: types.Config) type {
             destination.version_high = source.version_high;
             destination.version_used = source.version_used;
             destination.version_free = source.version_free;
+            if (comptime compact_enabled) {
+                destination.scan_high = source.scan_high;
+                @memcpy(destination.scan_live[0..source.scan_high], source.scan_live[0..source.scan_high]);
+                @memcpy(destination.scan_nonnull[0..source.scan_high], source.scan_nonnull[0..source.scan_high]);
+                for (0..config.columns) |column| @memcpy(destination.scan_values[column * destination.rows.len..][0..source.scan_high], source.scan_values[column * source.rows.len..][0..source.scan_high]);
+            }
             @memcpy(destination.rows[0..source.row_high], source.rows[0..source.row_high]);
             @memcpy(destination.versions[0..source.version_high], source.versions[0..source.version_high]);
             if (comptime config.external_storage) {
@@ -251,6 +269,31 @@ pub fn Storage(comptime config: types.Config) type {
             } else {
                 destination.row_index = source.row_index;
                 if (source.primary_column != null) destination.key_index = source.key_index;
+            }
+        }
+
+        fn scanEnsure(table: *Table, high: usize) void {
+            if (high <= table.scan_high) return;
+            @memset(table.scan_live[table.scan_high..high], 0);
+            @memset(table.scan_nonnull[table.scan_high..high], 0);
+            for (0..config.columns) |column| @memset(table.scan_values[column * table.rows.len + table.scan_high..column * table.rows.len + high], 0);
+            table.scan_high = high;
+        }
+
+        /// Publication/replay only, after durable success. Private versions and
+        /// aborts never alter this projection. No allocation or fallible work.
+        pub fn scanPublish(table: *Table, version: u32, live: bool) void {
+            if (comptime compact_enabled) {
+                const entry = &table.versions[version];
+                const slot = entry.row - 1;
+                scanEnsure(table, @as(usize, slot) + 1);
+                table.scan_live[slot] = @intFromBool(live);
+                var mask: u64 = 0;
+                for (entry.cells[0..table.column_count], 0..) |*cell, column| {
+                    if (cell.* != .null_value) mask |= @as(u64, 1) << @intCast(column);
+                    table.scan_values[column * table.rows.len + slot] = if (cell.* == .integer) cell.integer else 0;
+                }
+                table.scan_nonnull[slot] = mask;
             }
         }
 
@@ -597,7 +640,26 @@ pub fn Storage(comptime config: types.Config) type {
             var write: usize = 0;
             for (0..table.row_high) |read| {
                 if (table.rows[read].newest == 0) continue;
+                if (comptime compact_enabled) {
+                    if (read == write and read >= table.scan_high) {
+                        table.scan_live[write] = 0;
+                        table.scan_nonnull[write] = 0;
+                        for (0..config.columns) |column| table.scan_values[column * table.rows.len + write] = 0;
+                    }
+                }
                 if (read != write) {
+                    if (comptime compact_enabled) {
+                        if (read < table.scan_high) {
+                            table.scan_live[write] = table.scan_live[read];
+                            table.scan_nonnull[write] = table.scan_nonnull[read];
+                            for (0..config.columns) |column| table.scan_values[column * table.rows.len + write] = table.scan_values[column * table.rows.len + read];
+                        } else {
+                            // An unpublished appended row has no committed data.
+                            table.scan_live[write] = 0;
+                            table.scan_nonnull[write] = 0;
+                            for (0..config.columns) |column| table.scan_values[column * table.rows.len + write] = 0;
+                        }
+                    }
                     table.rows[write] = table.rows[read];
                     table.row_generation +%= 1;
                     table.rows[write].generation = table.row_generation;
@@ -607,6 +669,7 @@ pub fn Storage(comptime config: types.Config) type {
                 write += 1;
             }
             table.row_high = write;
+            if (comptime compact_enabled) table.scan_high = write;
             @memset(table.row_index[0..], 0);
             for (0..write) |slot| indexRow(table, @intCast(slot));
         }

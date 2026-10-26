@@ -11,6 +11,7 @@ const binder = @import("binder.sig");
 const value_module = @import("value.sig");
 const sort_module = @import("sort.sig");
 const catalog = @import("catalog.sig");
+const builtin = @import("builtin");
 const Error = types.Error;
 const none = ast.none;
 
@@ -51,6 +52,8 @@ pub fn Exec(comptime config: types.Config) type {
             summary_rows: usize = 0,
             summary_plans: usize = 0,
             dense_plans: usize = 0,
+            compact_plans: usize = 0,
+            compact_rows: usize = 0,
             groups: usize = 0,
             probes: usize = 0,
             scratch_cells: usize = 0,
@@ -673,6 +676,232 @@ pub fn Exec(comptime config: types.Config) type {
                 return self.finish(p, out);
             }
 
+            const CompactPredicate = struct { column: u16, op: ast.Op, value: i64, nonnull: bool };
+            fn compactPredicates(self: *const Query, id: u16, table: *const S.Table, out: []CompactPredicate, used: *usize) bool {
+                if (id == none) return true;
+                const node = &self.pool.nodes[id];
+                if (node.kind == .and_op) return self.compactPredicates(node.a, table, out, used) and self.compactPredicates(node.b, table, out, used);
+                if (node.kind != .binary or used.* == out.len) return false;
+                switch (node.op) { .eq, .ne, .lt, .le, .gt, .ge => {}, else => return false }
+                var a = &self.pool.nodes[node.a];
+                var b = &self.pool.nodes[node.b];
+                var op = node.op;
+                if (b.kind == .column and a.kind == .int_literal) {
+                    const temp = a; a = b; b = temp;
+                    op = switch (op) { .lt => .gt, .le => .ge, .gt => .lt, .ge => .le, else => op };
+                }
+                // Computed, volatile, nullable literal and correlated inputs
+                // retain expression evaluation and its normal error behavior.
+                if (a.kind != .column or a.level != 0 or a.relation != 0 or !value_module.integral(a.ty) or b.kind != .int_literal) return false;
+                out[used.*] = .{ .column = a.column, .op = op, .value = b.integer,
+                    .nonnull = table.summary.columns[a.column].nonnull == table.summary.rows };
+                used.* += 1;
+                return true;
+            }
+
+            inline fn compactKeep(table: *const S.Table, slot: usize, predicates: []const CompactPredicate) bool {
+                for (predicates) |predicate| {
+                    if (!predicate.nonnull and table.scan_nonnull[slot] & (@as(u64, 1) << @intCast(predicate.column)) == 0) return false;
+                    const value = table.scan_values[@as(usize, predicate.column) * table.rows.len + slot];
+                    const keep_row = switch (predicate.op) {
+                        .eq => value == predicate.value, .ne => value != predicate.value,
+                        .lt => value < predicate.value, .le => value <= predicate.value,
+                        .gt => value > predicate.value, .ge => value >= predicate.value,
+                        else => unreachable,
+                    };
+                    if (!keep_row) return false;
+                }
+                return true;
+            }
+
+            fn comparisonMask(comptime op: ast.Op, table: *const S.Table, start: usize, count: usize, predicate: CompactPredicate) u64 {
+                const base = @as(usize,predicate.column) * table.rows.len + start;
+                var mask: u64 = 0;
+                var i: usize = 0;
+                // Preserve a scalar implementation for native/codegen backends
+                // that do not lower packed vector comparisons yet.
+                if (comptime builtin.zig_backend == .stage2_llvm) {
+                  const rhs: @Vector(8,i64) = @splat(predicate.value);
+                  while (i + 8 <= count) : (i += 8) {
+                    const values: @Vector(8,i64) = table.scan_values[base+i..][0..8].*;
+                    const matched = switch(op) {
+                        .eq => values == rhs, .ne => values != rhs,
+                        .lt => values < rhs, .le => values <= rhs,
+                        .gt => values > rhs, .ge => values >= rhs,
+                        else => unreachable,
+                    };
+                    var bits: u8 = @bitCast(matched);
+                    if (!predicate.nonnull) {
+                        const flags: @Vector(8,u64) = table.scan_nonnull[start+i..][0..8].*;
+                        const bit: @Vector(8,u64) = @splat(@as(u64,1) << @intCast(predicate.column));
+                        const zero: @Vector(8,u64) = @splat(0);
+                        bits &= @as(u8,@bitCast((flags & bit) != zero));
+                    }
+                    if (comptime builtin.cpu.arch.endian() == .big) bits = @bitReverse(bits);
+                    mask |= @as(u64,bits) << @intCast(i);
+                  }
+                }
+                while (i < count) : (i += 1) {
+                    const value = table.scan_values[base+i];
+                    const matched = switch(op) {
+                        .eq => value == predicate.value, .ne => value != predicate.value,
+                        .lt => value < predicate.value, .le => value <= predicate.value,
+                        .gt => value > predicate.value, .ge => value >= predicate.value,
+                        else => unreachable,
+                    };
+                    const valid = predicate.nonnull or table.scan_nonnull[start+i] & (@as(u64,1) << @intCast(predicate.column)) != 0;
+                    mask |= @as(u64,@intFromBool(matched and valid)) << @intCast(i);
+                }
+                return mask;
+            }
+
+            const CompactFold = struct {
+                table: *const S.Table, domain: DenseDomain, grouped: bool, key_nonnull: bool,
+                transitions: []const Transition, nonnull: []const bool,
+                present: *[4097]bool, counts: *[4][4097]i64, totals: *[4][4097]i64,
+                fused: bool, count_index: usize, sum_index: usize,
+                presence_count: ?usize,
+                inline fn add(self: *const CompactFold, slot: usize) void {
+                    const table = self.table;
+                    const bucket: usize = if (!self.grouped) 0 else if (!self.key_nonnull and table.scan_nonnull[slot] & (@as(u64,1) << @intCast(self.domain.column)) == 0) self.domain.span
+                        else @intCast(@as(i128,table.scan_values[@as(usize,self.domain.column)*table.rows.len+slot])-self.domain.base);
+                    if (self.presence_count == null) self.present[bucket] = true;
+                    if (self.fused) {
+                        self.counts[self.count_index][bucket] += 1;
+                        self.totals[self.sum_index][bucket] += table.scan_values[@as(usize,self.transitions[self.sum_index].column)*table.rows.len+slot];
+                    } else for (self.transitions,0..) |item,i| {
+                        if (item.kind != .count_star and !self.nonnull[i] and table.scan_nonnull[slot] & (@as(u64,1) << @intCast(item.column)) == 0) continue;
+                        self.counts[i][bucket] += 1;
+                        if (item.kind == .sum_integer or item.kind == .sum_wide) self.totals[i][bucket] += table.scan_values[@as(usize,item.column)*table.rows.len+slot];
+                    }
+                }
+            };
+
+            inline fn countSumDense(keys: []const i64, values: []const i64, noalias counts: *[4097]i64, noalias sums: *[4097]i64, base: i64) void {
+                for (keys,values) |key,value| {
+                    // The validated domain is <=4096 wide. Modular subtraction
+                    // is exact even when that signed interval crosses zero.
+                    const bucket:usize=@intCast(@as(u64,@bitCast(key)) -% @as(u64,@bitCast(base)));
+                    counts[bucket]+=1;sums[bucket]+=value;
+                }
+            }
+
+            inline fn countSumMasked(keys: []const i64, values: []const i64, noalias counts: *[4097]i64, noalias sums: *[4097]i64, base: i64, selected: u64) void {
+                var mask=selected;
+                while(mask!=0) {
+                    const i=@ctz(mask);mask&=mask-1;
+                    const bucket:usize=@intCast(@as(u64,@bitCast(keys[i])) -% @as(u64,@bitCast(base)));
+                    counts[bucket]+=1;sums[bucket]+=values[i];
+                }
+            }
+
+            /// Integral committed scans use caller-backed column-major data
+            /// and compact per-group arithmetic, not padded Cell unions.
+            /// The shared publication/replay path maintains this projection;
+            /// it is never a cached SQL result or a speculative row snapshot.
+            noinline fn compactGroup(self: *Query, p: *const B.Plan, outer: ?*const E.Context, table: *const S.Table) Error!?List {
+                if (!self.committed_only or !table.summary.valid or table.summary.csn > self.snap.csn or p.key_count > 1 or p.agg_count > 4) return null;
+                var transitions: [4]Transition = undefined;
+                if (!self.prepareTransitions(p, transitions[0..p.agg_count])) return null;
+                var nonnull: [4]bool = undefined;
+                for (p.aggs[0..p.agg_count], 0..) |agg, i| {
+                    // At most 2^31-1 values of these types fit exactly in i64.
+                    // int8 inputs retain prefix-overflow/wide numeric handling.
+                    if (agg.kind != .count and agg.kind != .count_star and agg.arg_ty != .int2 and agg.arg_ty != .int4 and agg.arg_ty != .oid) return null;
+                    nonnull[i] = agg.kind == .count_star or table.summary.columns[transitions[i].column].nonnull == table.summary.rows;
+                }
+                const domain: DenseDomain = if (p.key_count == 0) .{ .column = 0, .base = 0, .span = 0 } else self.denseDomain(p, table, 4097) orelse return null;
+                var predicates: [config.predicates]CompactPredicate = undefined;
+                var predicate_count: usize = 0;
+                if (!self.compactPredicates(p.where, table, &predicates, &predicate_count)) return null;
+                const size = domain.span + 1;
+                var present: [4097]bool = undefined;
+                var counts: [4][4097]i64 = undefined;
+                var totals: [4][4097]i64 = undefined;
+                @memset(present[0..size], false);
+                for (0..p.agg_count) |i| { @memset(counts[i][0..size], 0); @memset(totals[i][0..size], 0); }
+                if (p.key_count == 0) present[0] = true;
+                const dense = table.summary.rows == @as(i64, @intCast(table.scan_high));
+                const key_nonnull = p.key_count == 0 or table.summary.columns[domain.column].nonnull == table.summary.rows;
+                var count_index:usize=0;var sum_index:usize=1;var fused=false;
+                var presence_count:?usize=null;
+                for(transitions[0..p.agg_count],0..) |item,i| if(item.kind==.count_star) {presence_count=i;break;};
+                if (p.agg_count == 2) {
+                    if (transitions[1].kind == .count_star) { count_index=1;sum_index=0; }
+                    fused=transitions[count_index].kind==.count_star and transitions[sum_index].kind==.sum_integer and nonnull[sum_index];
+                }
+                const fold:CompactFold=.{.table=table,.domain=domain,.grouped=p.key_count!=0,.key_nonnull=key_nonnull,
+                    .transitions=transitions[0..p.agg_count],.nonnull=nonnull[0..p.agg_count],.present=&present,.counts=&counts,.totals=&totals,
+                    .fused=fused,.count_index=count_index,.sum_index=sum_index,.presence_count=presence_count};
+                var visited:usize=0;
+                defer { self.work.stream_stats.rows+=visited;self.work.stream_stats.compact_rows+=visited; }
+                var start:usize=0;
+                while (start < table.scan_high) : (start += 64) {
+                    const count=@min(@as(usize,64),table.scan_high-start);
+                    // Reserve/check every input step before reading this bounded
+                    // block. A work/cancel failure still leaves results private.
+                    if (self.session.control != null) for (0..count) |_| try self.session.checkpoint();
+                    var mask:u64=if(count==64) ~@as(u64,0) else (@as(u64,1)<<@intCast(count))-1;
+                    if (!dense) {
+                        mask=0;for(0..count) |i| mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
+                    }
+                    visited+=@popCount(mask);
+                    for (predicates[0..predicate_count]) |predicate| mask &= switch(predicate.op) {
+                        .eq=>comparisonMask(.eq,table,start,count,predicate),.ne=>comparisonMask(.ne,table,start,count,predicate),
+                        .lt=>comparisonMask(.lt,table,start,count,predicate),.le=>comparisonMask(.le,table,start,count,predicate),
+                        .gt=>comparisonMask(.gt,table,start,count,predicate),.ge=>comparisonMask(.ge,table,start,count,predicate),
+                        else=>unreachable,
+                    };
+                    if (fused and p.key_count!=0 and key_nonnull) {
+                        const keys=table.scan_values[@as(usize,domain.column)*table.rows.len+start..][0..count];
+                        const values=table.scan_values[@as(usize,transitions[sum_index].column)*table.rows.len+start..][0..count];
+                        const full:u64=if(count==64) ~@as(u64,0) else (@as(u64,1)<<@intCast(count))-1;
+                        if(mask==full) countSumDense(keys,values,&counts[count_index],&totals[sum_index],domain.base)
+                        else countSumMasked(keys,values,&counts[count_index],&totals[sum_index],domain.base,mask);
+                    } else if (predicate_count==0 and dense) {
+                        for (0..count) |i| fold.add(start+i);
+                    } else while (mask!=0) {
+                        const i=@ctz(mask);mask&=mask-1;fold.add(start+i);
+                    }
+                }
+                if(p.key_count!=0) if(presence_count) |index| for(present[0..size],0..) |*exists,bucket| {exists.*=counts[index][bucket]!=0;};
+                var groups: usize = 0;
+                for (present[0..size]) |used| groups += @intFromBool(used);
+                var out: List = .{};
+                self.work.stream_stats.compact_plans += 1;
+                if (groups == 0) return try self.finish(p, out);
+                const tickets = try self.refs(groups);
+                var used: usize = 0;
+                var states: [config.columns]Accumulator = undefined;
+                // Retain the ordinary key sort/projection, HAVING and output
+                // validation. No result bytes are published by this scan.
+                for (present[0..size], 0..) |exists, bucket| {
+                    if (!exists) continue;
+                    try self.session.checkpoint();
+                    const at = try self.cells(p.key_count + p.agg_count);
+                    if (p.key_count != 0) self.work.cells[at] = if (bucket == domain.span) .null_value else .{ .integer = domain.base + @as(i64, @intCast(bucket)) };
+                    // Store the bucket ID after the keys/aggregate output.
+                    const bucket_cell = try self.cells(1);
+                    self.work.cells[bucket_cell] = .{ .integer = @intCast(bucket) };
+                    self.work.refs[tickets + used] = at;
+                    used += 1;
+                }
+                if (p.key_count != 0) {
+                    const scratch = try self.refs(groups);
+                    const sorter: GroupSorter = .{ .query = self, .width = 1 };
+                    _ = try sort_module.mergeSort(self.work.refs[tickets..][0..groups], self.work.refs[scratch..][0..groups], &sorter);
+                }
+                for (self.work.refs[tickets..][0..groups]) |at| {
+                    const bucket: usize = @intCast(self.work.cells[at + p.key_count + p.agg_count].integer);
+                    for (states[0..p.agg_count], 0..) |*state, i| state.* = .{ .count = counts[if(fused and i==sum_index) count_index else i][bucket], .integer = totals[i][bucket], .wide = totals[i][bucket] };
+                    try self.projectGroup(p, at, states[0..p.agg_count], outer, &out);
+                }
+                self.work.stream_stats.groups += groups;
+                self.work.stream_stats.scratch_cells = @max(self.work.stream_stats.scratch_cells, groups * (p.key_count + p.agg_count + 1));
+                self.work.stream_stats.scratch_refs = @max(self.work.stream_stats.scratch_refs, groups * 2);
+                return try self.finish(p, out);
+            }
+
             /// Consume visible base-table versions directly. State grows with
             /// groups, not scanned rows. All output remains private until the
             /// ordinary query publication step succeeds.
@@ -687,6 +916,11 @@ pub fn Exec(comptime config: types.Config) type {
                             const rollup = &table.rollups[key.column];
                             if (rollup.valid) return self.rollupGroup(p, outer, table, rollup);
                         }
+                    }
+                }
+                if (comptime S.compact_enabled) {
+                    if (p.key_count != 0 or !self.summaryEligible(p, table)) {
+                        if (try self.compactGroup(p, outer, table)) |rows| return rows;
                     }
                 }
                 if (p.key_count == 0) {

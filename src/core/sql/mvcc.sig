@@ -178,17 +178,20 @@ pub fn Mvcc(comptime config: types.Config) type {
                     .insert => {
                         const table = &db.tables[entry.table];
                         S.summarize(table, &table.versions[entry.new].cells, true, csn);
+                        S.scanPublish(table, entry.new, true);
                         table.versions[entry.new].xmin_csn = csn;
                     },
                     .update => {
                         const table = &db.tables[entry.table];
                         S.summarizeUpdate(table, &table.versions[entry.old].cells, &table.versions[entry.new].cells, csn);
+                        S.scanPublish(table, entry.new, true);
                         table.versions[entry.new].xmin_csn = csn;
                         table.versions[entry.old].xmax_csn = csn;
                     },
                     .delete => {
                         const table = &db.tables[entry.table];
                         S.summarize(table, &table.versions[entry.old].cells, false, csn);
+                        S.scanPublish(table, entry.old, false);
                         table.versions[entry.old].xmax_csn = csn;
                     },
                     .create_table => {
