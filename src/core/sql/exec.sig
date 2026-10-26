@@ -715,11 +715,14 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn comparisonMask(comptime op: ast.Op, table: *const S.Table, start: usize, count: usize, predicate: CompactPredicate) u64 {
-                const rhs: @Vector(8,i64) = @splat(predicate.value);
                 const base = @as(usize,predicate.column) * table.rows.len + start;
                 var mask: u64 = 0;
                 var i: usize = 0;
-                while (i + 8 <= count) : (i += 8) {
+                // Preserve a scalar implementation for native/codegen backends
+                // that do not lower packed vector comparisons yet.
+                if (comptime builtin.zig_backend == .stage2_llvm) {
+                  const rhs: @Vector(8,i64) = @splat(predicate.value);
+                  while (i + 8 <= count) : (i += 8) {
                     const values: @Vector(8,i64) = table.scan_values[base+i..][0..8].*;
                     const matched = switch(op) {
                         .eq => values == rhs, .ne => values != rhs,
@@ -736,6 +739,7 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                     if (comptime builtin.cpu.arch.endian() == .big) bits = @bitReverse(bits);
                     mask |= @as(u64,bits) << @intCast(i);
+                  }
                 }
                 while (i < count) : (i += 1) {
                     const value = table.scan_values[base+i];
