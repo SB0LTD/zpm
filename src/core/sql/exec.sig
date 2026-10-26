@@ -56,6 +56,13 @@ pub fn Exec(comptime config: types.Config) type {
             scratch_cells: usize = 0,
             scratch_refs: usize = 0,
         };
+        pub const ReadStats = struct {
+            key_probes: usize = 0,
+            key_walks: usize = 0,
+            key_fallbacks: usize = 0,
+            key_successes: usize = 0,
+            nonnull_sort_keys: usize = 0,
+        };
 
         /// The statement's query workspace (design §4.9): caller-owned,
         /// uninitialized until a statement writes it. Scratch grows from the
@@ -72,6 +79,7 @@ pub fn Exec(comptime config: types.Config) type {
             ctes: [config.ctes]CteRun = undefined,
             cache: [config.subqueries]Cache = undefined,
             stream_stats: StreamStats = .{},
+            read_stats: ReadStats = .{},
             /// System-view rows (catalog.sig View) for this statement; set by
             /// the Database before it runs a query (kept across resets).
             views: ?ViewHook = null,
@@ -82,6 +90,7 @@ pub fn Exec(comptime config: types.Config) type {
                 self.ref_low = 0;
                 self.ref_high = self.refs.len;
                 self.stream_stats = .{};
+                self.read_stats = .{};
                 for (&self.ctes) |*cte| cte.* = .{};
                 for (&self.cache) |*entry| entry.* = .{};
             }
@@ -1243,7 +1252,7 @@ pub fn Exec(comptime config: types.Config) type {
             return at;
         }
 
-        pub const Candidates = union(enum) { scan, empty, slot: u32 };
+        pub const Candidates = union(enum) { scan, empty, slot: struct { row: u32, version: u32 } };
 
         /// WHERE keeps a row only when the predicate is TRUE.
         pub fn keep(ctx: *E.Context, where: u16, row: ?*const E.Row) Error!bool {
@@ -1259,8 +1268,8 @@ pub fn Exec(comptime config: types.Config) type {
             ctx.row = null;
             const value = try E.eval(ctx, key);
             if (value == .null_value) return .empty;
-            const slot = S.lookupKeyAt(table, &value, snap) orelse return .empty;
-            return .{ .slot = slot };
+            const version = S.lookupVersionAt(table, &value, snap) orelse return .empty;
+            return .{ .slot = .{ .row = table.versions[version].row - 1, .version = version } };
         }
 
         /// Plain SELECT: candidates are emitted as read.
@@ -1357,7 +1366,7 @@ pub fn Exec(comptime config: types.Config) type {
             version: u32,
             ordinal: u32,
         };
-        const IntegerOrder = struct { column: u16, descending: bool, nulls_first: bool };
+        const IntegerOrder = struct { column: u16, descending: bool, nulls_first: bool, nonnull: bool };
         const IntegerSorter = struct {
             entries: []const IntegerEntry,
             count: usize,
@@ -1388,14 +1397,17 @@ pub fn Exec(comptime config: types.Config) type {
         /// cached ranks. The heap moves only slot IDs; one spare key slot is
         /// recycled on rejection/replacement. NULL placement and stable row-slot
         /// order match Sorter/StableSorter. Keep this stack frame off point reads.
-        noinline fn integerTopK(ctx: *E.Context, table: *const S.Table, query: *const B.Select, snap: storage.Snapshot, indices: []u32) Error!usize {
+        noinline fn integerTopK(ctx: *E.Context, table: *const S.Table, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats) Error!usize {
             var entries: [types.workRows(config) + 1]IntegerEntry = undefined;
             var keys: [config.columns]IntegerOrder = undefined;
-            for (query.order[0..query.order_count], 0..) |key, column| keys[column] = .{
-                .column = ctx.pool.nodes[key.expr].column,
-                .descending = key.descending,
-                .nulls_first = key.nulls_first orelse (config.nulls_first_ascending != key.descending),
-            };
+            const current = committed_only and table.summary.valid and table.summary.csn <= snap.csn;
+            for (query.order[0..query.order_count], 0..) |key, column| {
+                const index = ctx.pool.nodes[key.expr].column;
+                const nonnull = table.columns[index].not_null or (current and table.summary.columns[index].nonnull == table.summary.rows);
+                keys[column] = .{ .column = index, .descending = key.descending,
+                    .nulls_first = key.nulls_first orelse (config.nulls_first_ascending != key.descending), .nonnull = nonnull };
+                stats.nonnull_sort_keys += @intFromBool(nonnull);
+            }
             const count: usize = @intCast(query.limit);
             if (count == 0) return 0;
             var used: usize = 0;
@@ -1413,7 +1425,7 @@ pub fn Exec(comptime config: types.Config) type {
                 var relation: i8 = 0;
                 for (keys[0..query.order_count], 0..) |key, column| {
                     const value = &table.versions[version].cells[key.column];
-                    const is_null = value.* == .null_value;
+                    const is_null = !key.nonnull and value.* == .null_value;
                     var rank: u64 = if (is_null) 0 else @as(u64, @bitCast(value.integer)) ^ 0x8000000000000000;
                     if (!is_null and key.descending) rank = ~rank;
                     const normalized: IntegerKey = .{ .rank = rank, .null_rank = if (is_null) !key.nulls_first else key.nulls_first };
@@ -1437,11 +1449,80 @@ pub fn Exec(comptime config: types.Config) type {
             return used;
         }
 
+        const KeyInterval = struct { low: i128, high: i128, exact: bool = true };
+        fn restrictKeys(ctx: *E.Context, id: u16, column: usize, interval: *KeyInterval) Error!void {
+            if (id == none) return;
+            const node = &ctx.pool.nodes[id];
+            if (node.kind == .and_op) {
+                try restrictKeys(ctx, node.a, column, interval);
+                try restrictKeys(ctx, node.b, column, interval);
+                return;
+            }
+            if (node.kind != .binary) { interval.exact = false; return; }
+            switch (node.op) { .eq, .lt, .le, .gt, .ge => {}, else => { interval.exact = false; return; } }
+            const a = &ctx.pool.nodes[node.a];
+            const b = &ctx.pool.nodes[node.b];
+            var expression: u16 = undefined;
+            var op = node.op;
+            if (a.kind == .column and a.level == 0 and a.relation == 0 and a.column == column and b.constant) expression = node.b
+            else if (b.kind == .column and b.level == 0 and b.relation == 0 and b.column == column and a.constant) {
+                expression = node.a;
+                op = switch (op) { .lt => .gt, .le => .ge, .gt => .lt, .ge => .le, else => op };
+            } else { interval.exact = false; return; }
+            const value = try E.eval(ctx, expression);
+            if (value != .integer) { interval.exact = false; return; }
+            const key: i128 = value.integer;
+            switch (op) {
+                .eq => { interval.low = @max(interval.low, key); interval.high = @min(interval.high, key); },
+                .lt => interval.high = @min(interval.high, key - 1),
+                .le => interval.high = @min(interval.high, key),
+                .gt => interval.low = @max(interval.low, key + 1),
+                .ge => interval.low = @max(interval.low, key),
+                else => unreachable,
+            }
+        }
+
+        /// Uniqueness + N keys inside an N-wide integral interval proves
+        /// density, regardless of physical layout. Probe in ORDER BY direction.
+        /// A bounded failed speculation retries the ordinary scan, charging all
+        /// work already done. Only repeatable plans may take this path.
+        noinline fn densePrimaryScan(ctx: *E.Context, table: *const S.Table, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats) Error!?usize {
+            if (config.ordered_probe_rows == 0 or !committed_only or !table.summary.valid or table.summary.csn > snap.csn) return null;
+            const column = table.primary_column orelse return null;
+            const key = &ctx.pool.nodes[query.order[0].expr];
+            if (key.column != column or !value_module.integral(key.ty) or !repeatablePool(ctx.pool)) return null;
+            const bounds = table.summary.primary_bounds;
+            if (!bounds.known or @as(i128, bounds.high) - bounds.low + 1 != table.summary.rows) return null;
+            var interval: KeyInterval = .{ .low = bounds.low, .high = bounds.high };
+            try restrictKeys(ctx, query.where, column, &interval);
+            const reverse = query.order[0].descending;
+            var current = if (reverse) interval.high else interval.low;
+            const budget = @min(config.ordered_probe_rows, @max(@as(usize, 256), @as(usize, @intCast(query.limit)) * 128));
+            // Do not replace a small broad sequential scan with random probes
+            // when a residual predicate may require the entire key interval.
+            if (!interval.exact and @as(i128, table.summary.rows) <= budget and interval.high - interval.low + 1 > @divTrunc(@as(i128, table.summary.rows), 4)) return null;
+            stats.key_walks += 1;
+            var probes: usize = 0;
+            var found: usize = 0;
+            while (current >= interval.low and current <= interval.high) : (current += if (reverse) @as(i128, -1) else 1) {
+                if (probes == budget) { stats.key_fallbacks += 1; return null; }
+                try ctx.session.checkpoint();
+                probes += 1;stats.key_probes += 1;
+                const value: V.Cell = .{ .integer = @intCast(current) };
+                const version = S.lookupVersionAt(table, &value, snap) orelse { stats.key_fallbacks += 1; return null; };
+                if (!try keep(ctx, query.where, &table.versions[version].cells)) continue;
+                indices[found] = version;found += 1;
+                if (found >= query.limit) break;
+            }
+            stats.key_successes += 1;
+            return found;
+        }
+
         /// `locker` (FOR UPDATE/SHARE) runs after ORDER BY and before LIMIT, as
         /// PostgreSQL's LockRows does: it returns the version to emit (the
         /// newest committed one, whose WHERE is re-checked here when it
         /// changed), null to skip the row, or WouldBlock to park.
-        pub fn select(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, query: *const B.Select, snap: storage.Snapshot, result: anytype, locker: anytype, session: *const value_module.Session) Error!void {
+        pub fn select(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, query: *const B.Select, snap: storage.Snapshot, result: anytype, locker: anytype, session: *const value_module.Session, committed_only: bool, stats: *ReadStats) Error!void {
             try session.checkpoint();
             var ctx: E.Context = .{ .source = source, .pool = pool, .session = session };
             var plain = true;
@@ -1468,19 +1549,21 @@ pub fn Exec(comptime config: types.Config) type {
             var column_order = true;
             for (query.order[0..query.order_count]) |key| column_order = column_order and simple(pool, key.expr);
             const layout_reverse: ?bool = if (!locking and column_order and query.order_count != 0 and query.limit <= indices.len) layoutOrder(table, pool, query) else null;
+            var ordered = layout_reverse != null;
             const top_k = !locking and column_order and query.order_count != 0 and query.limit <= indices.len and (query.limit < table.row_high / 2 or table.row_high > indices.len);
             const sorter: Sorter = .{ .ctx = &ctx, .table = table, .query = query };
             const stable: StableSorter = .{ .base = &sorter };
             if (query.limit != 0) switch (try candidates(&ctx, table, query.key, snap)) {
                 .empty => {},
-                .slot => |slot| {
-                    const version = S.visibleAt(table, slot, snap).?;
+                .slot => |hit| {
+                    const version = hit.version;
                     if (try keep(&ctx, query.where, &table.versions[version].cells)) {
                         indices[0] = version;
                         found = 1;
                     }
                 },
-                .scan => if (layout_reverse) |reverse| {
+                .scan => scan: {
+                  if (layout_reverse) |reverse| {
                     var offset: usize = 0;
                     while (offset < table.row_high) : (offset += 1) {
                         try session.checkpoint();
@@ -1492,9 +1575,16 @@ pub fn Exec(comptime config: types.Config) type {
                         found += 1;
                         if (found >= query.limit) break;
                     }
-                } else if (top_k and integerOrder(pool, query)) {
-                    found = try integerTopK(&ctx, table, query, snap, &indices);
-                } else for (0..table.row_high) |slot| {
+                    break :scan;
+                  }
+                  if (!locking and column_order and query.order_count != 0 and query.limit <= indices.len) {
+                    if (try densePrimaryScan(&ctx, table, query, snap, &indices, committed_only, stats)) |count| {
+                        found = count;ordered = true;break :scan;
+                    }
+                  }
+                  if (top_k and integerOrder(pool, query)) {
+                    found = try integerTopK(&ctx, table, query, snap, &indices, committed_only, stats);
+                  } else for (0..table.row_high) |slot| {
                     try session.checkpoint();
                     const version = S.visibleAt(table, slot, snap) orelse continue;
                     if (!try keep(&ctx, query.where, &table.versions[version].cells)) continue;
@@ -1506,9 +1596,10 @@ pub fn Exec(comptime config: types.Config) type {
                         found += 1;
                     }
                     if (!locking and query.order_count == 0 and found >= query.limit) break;
+                  }
                 },
             };
-            if (query.order_count != 0 and found != 0 and layout_reverse == null) {
+            if (query.order_count != 0 and found != 0 and !ordered) {
                 // Sort keys are evaluated for every candidate row, so an
                 // erroring key fails even when one row (or none) is compared.
                 for (query.order[0..query.order_count]) |*key| if (!simple(pool, key.expr)) {

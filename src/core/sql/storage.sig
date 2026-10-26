@@ -145,6 +145,7 @@ pub fn Storage(comptime config: types.Config) type {
             valid: bool = false,
             csn: u64 = 0,
             rows: i64 = 0,
+            primary_bounds: IntegerBounds = .{},
             columns: [config.columns]ColumnSummary = @splat(.{}),
         };
         pub const SummaryGroup = struct {
@@ -346,7 +347,10 @@ pub fn Storage(comptime config: types.Config) type {
         /// Called only at durable publication or validated change-record replay.
         pub fn summarize(table: *Table, cells: *const [config.columns]V.Cell, add: bool, csn: u64) void {
             changeSummary(table, cells, add, csn);
-            if (table.summary.valid and table.summary.rows == 0) resetRollups(table);
+            if (table.summary.valid and table.summary.rows == 0) {
+                resetRollups(table);
+                table.summary.primary_bounds = .{};
+            }
         }
 
         pub fn summarizeUpdate(table: *Table, old: *const [config.columns]V.Cell, new: *const [config.columns]V.Cell, csn: u64) void {
@@ -360,6 +364,14 @@ pub fn Storage(comptime config: types.Config) type {
             const sign: i64 = if (add) 1 else -1;
             table.summary.rows += sign;
             table.summary.csn = csn;
+            if (add) if (table.primary_column) |primary| {
+                const value = &cells[primary];
+                if (value.* == .integer) {
+                    const bounds = &table.summary.primary_bounds;
+                    if (!bounds.known) bounds.* = .{ .known = true, .low = value.integer, .high = value.integer }
+                    else { bounds.low = @min(bounds.low, value.integer); bounds.high = @max(bounds.high, value.integer); }
+                }
+            };
             for (cells[0..table.column_count], table.summary.columns[0..table.column_count]) |*cell, *column| {
                 if (cell.* == .null_value) continue;
                 column.nonnull += sign;
@@ -482,8 +494,9 @@ pub fn Storage(comptime config: types.Config) type {
             removeAt(table, table.key_index[0..], position, keyHome);
         }
 
-        /// Directory slot of the row visible to `snap` whose key equals value.
-        pub fn lookupKeyAt(table: *const Table, value: *const V.Cell, snap: Snapshot) ?u32 {
+        /// Visible version whose primary key equals value. Returning the hit
+        /// avoids walking its MVCC chain twice in read execution.
+        pub fn lookupVersionAt(table: *const Table, value: *const V.Cell, snap: Snapshot) ?u32 {
             const column = table.primary_column orelse return null;
             if (value.* == .null_value) return null;
             var position = V.hash(value) & (table.key_index.len - 1);
@@ -493,10 +506,16 @@ pub fn Storage(comptime config: types.Config) type {
                 const version = &table.versions[entry - 1];
                 if (V.compare(&version.cells[column], value) == 0) {
                     const slot = version.row - 1;
-                    if (visibleAt(table, slot, snap) == entry - 1) return slot;
+                    if (visibleAt(table, slot, snap) == entry - 1) return entry - 1;
                 }
                 position = (position + 1) & (table.key_index.len - 1);
             }
+        }
+
+        /// Directory slot of the row visible to `snap` whose key equals value.
+        pub fn lookupKeyAt(table: *const Table, value: *const V.Cell, snap: Snapshot) ?u32 {
+            const version = lookupVersionAt(table, value, snap) orelse return null;
+            return table.versions[version].row - 1;
         }
 
         /// Directory slot of the committed row whose key equals value.
