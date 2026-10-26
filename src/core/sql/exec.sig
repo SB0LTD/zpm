@@ -50,6 +50,7 @@ pub fn Exec(comptime config: types.Config) type {
             rows: usize = 0,
             summary_rows: usize = 0,
             summary_plans: usize = 0,
+            dense_plans: usize = 0,
             groups: usize = 0,
             probes: usize = 0,
             scratch_cells: usize = 0,
@@ -501,10 +502,113 @@ pub fn Exec(comptime config: types.Config) type {
                     if (agg.distinct or agg.filter != none) return false;
                     if (agg.kind == .count_star) continue;
                     if (agg.kind != .count and !(agg.kind == .sum and value_module.integral(agg.arg_ty))) return false;
+                    // A legacy int8 -> int8 SUM must preserve prefix-overflow
+                    // errors, even if cancellation makes the final total fit.
+                    if (agg.kind == .sum and agg.ty == .int8 and agg.arg_ty == .int8) return false;
                     const node = &self.pool.nodes[agg.arg];
                     if (node.kind != .column or node.level != 0 or node.relation != 0) return false;
                 }
                 return true;
+            }
+
+            const Transition = struct {
+                kind: enum { count_star, count, sum_integer, sum_wide },
+                column: u16 = 0,
+            };
+
+            fn prepareTransitions(self: *const Query, p: *const B.Plan, output: []Transition) bool {
+                for (p.aggs[0..p.agg_count], output) |agg, *item| {
+                    if (agg.distinct or agg.filter != none) return false;
+                    if (agg.kind == .count_star) { item.* = .{ .kind = .count_star }; continue; }
+                    if (agg.kind != .count and !(agg.kind == .sum and value_module.integral(agg.arg_ty))) return false;
+                    const node = &self.pool.nodes[agg.arg];
+                    if (node.kind != .column or node.level != 0 or node.relation != 0) return false;
+                    item.* = .{ .column = node.column, .kind = if (agg.kind == .count) .count else if (agg.ty == .int8) .sum_integer else .sum_wide };
+                }
+                return true;
+            }
+
+            inline fn addTransitions(transitions: []const Transition, states: []Accumulator, source_cells: *const [config.columns]V.Cell) Error!void {
+                for (transitions, states) |item, *state| {
+                    if (item.kind == .count_star) { state.count += 1; continue; }
+                    const value = &source_cells[item.column];
+                    if (value.* == .null_value) continue;
+                    state.count += 1;
+                    switch (item.kind) {
+                        .count => {},
+                        .sum_integer => {
+                            const sum = @addWithOverflow(state.integer, value.integer);
+                            if (sum[1] != 0) return error.IntegerOverflow;
+                            state.integer = sum[0];
+                        },
+                        .sum_wide => state.wide += value.integer,
+                        .count_star => unreachable,
+                    }
+                }
+            }
+
+            const DenseDomain = struct { column: u16, base: i64, span: usize };
+            fn denseDomain(self: *const Query, p: *const B.Plan, table: *const S.Table, bucket_budget: usize) ?DenseDomain {
+                if (p.key_count != 1) return null;
+                const key = &self.pool.nodes[p.keys[0]];
+                if (key.kind != .column or key.level != 0 or key.relation != 0 or !value_module.integral(key.ty)) return null;
+                const bounds = table.integer_bounds[key.column];
+                if (!bounds.known) return null;
+                const span = @as(i128, bounds.high) - bounds.low + 1;
+                // This is an optimization budget, not a SQL cardinality limit.
+                // Wider domains keep the collision-safe hash/sort paths.
+                if (span > 4096 or span + 1 > bucket_budget) return null;
+                return .{ .column = key.column, .base = bounds.low, .span = @intCast(span) };
+            }
+
+            noinline fn denseGroup(self: *Query, p: *const B.Plan, outer: ?*const E.Context, table: *const S.Table, domain: DenseDomain, capacity: usize, record_cells: usize) Error!List {
+                var ctx = self.context(outer);
+                var out: List = .{};
+                var groups: usize = 0;
+                var buckets: u32 = undefined;
+                var tickets: u32 = undefined;
+                var transitions: [config.columns]Transition = undefined;
+                const prepared = self.prepareTransitions(p, transitions[0..p.agg_count]);
+                for (0..table.row_high) |slot| {
+                    try self.session.checkpoint();
+                    const version = S.visibleAt(table, slot, self.snap) orelse continue;
+                    self.work.stream_stats.rows += 1;
+                    const source_cells = &table.versions[version].cells;
+                    ctx.tuple[0] = source_cells;
+                    if (!try keep(&ctx, p.where, null)) continue;
+                    if (groups == 0) {
+                        if (capacity == 0) return error.WorkspaceCapacity;
+                        buckets = try self.refs(domain.span + 1);
+                        @memset(self.work.refs[buckets..][0..domain.span + 1], absent);
+                        tickets = try self.refs(capacity);
+                    }
+                    const key = &source_cells[domain.column];
+                    const bucket: usize = if (key.* == .null_value) domain.span else @intCast(@as(i128, key.integer) - domain.base);
+                    self.work.stream_stats.probes += 1;
+                    var at = self.work.refs[buckets + bucket];
+                    if (at == absent) {
+                        if (groups == capacity) return error.WorkspaceCapacity;
+                        at = try self.cells(record_cells);
+                        self.work.cells[at] = key.*;
+                        for (self.accumulators(at + @as(u32, @intCast(1 + p.agg_count)), p.agg_count)) |*state| state.* = .{};
+                        self.work.refs[tickets + groups] = at;
+                        self.work.refs[buckets + bucket] = at;
+                        groups += 1;
+                    }
+                    const states = self.accumulators(at + @as(u32, @intCast(1 + p.agg_count)), p.agg_count);
+                    if (prepared) try addTransitions(transitions[0..p.agg_count], states, source_cells) else try self.addAggregates(p, &ctx, states);
+                }
+                self.work.stream_stats.dense_plans += 1;
+                if (groups == 0) return self.finish(p, out);
+                const scratch = try self.refs(groups);
+                const sorter: GroupSorter = .{ .query = self, .width = 1 };
+                _ = try sort_module.mergeSort(self.work.refs[tickets..][0..groups], self.work.refs[scratch..][0..groups], &sorter);
+                for (self.work.refs[tickets..][0..groups]) |at|
+                    try self.projectGroup(p, at, self.accumulators(at + @as(u32, @intCast(1 + p.agg_count)), p.agg_count), outer, &out);
+                self.work.stream_stats.groups += groups;
+                self.work.stream_stats.scratch_cells = @max(self.work.stream_stats.scratch_cells, groups * record_cells);
+                self.work.stream_stats.scratch_refs = @max(self.work.stream_stats.scratch_refs, domain.span + 1 + capacity + groups);
+                return self.finish(p, out);
             }
 
             /// Consume visible base-table versions directly. State grows with
@@ -554,6 +658,7 @@ pub fn Exec(comptime config: types.Config) type {
                 const capacity = @min(cell_budget / (record_cells + p.width), ref_budget / 8);
                 var slots: usize = 2;
                 while (slots < capacity * 2) slots *= 2;
+                if (self.denseDomain(p, table, slots)) |domain| return self.denseGroup(p, outer, table, domain, capacity, record_cells);
                 var buckets: u32 = undefined;
                 var tickets: u32 = undefined;
                 var groups: usize = 0;

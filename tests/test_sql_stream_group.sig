@@ -33,7 +33,7 @@ fn grouped(n: usize) !void {
     }
     try check(db.workspace.query.stream_stats.rows == n);
     try check(db.workspace.query.stream_stats.groups == 64);
-    try check(db.workspace.query.stream_stats.probes > n); // real bucket collisions
+    try check(db.workspace.query.stream_stats.probes == n and db.workspace.query.stream_stats.dense_plans == 1);
 }
 
 fn rejected(source: []const u8, expected: sql.Error) !void {

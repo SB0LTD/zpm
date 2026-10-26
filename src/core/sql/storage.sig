@@ -138,6 +138,9 @@ pub fn Storage(comptime config: types.Config) type {
         /// persisted). Old snapshots and transactions with own writes scan.
         /// At most 2^31-1 rows of i64 values fit comfortably in an i128 total.
         pub const ColumnSummary = struct { nonnull: i64 = 0, total: i128 = 0 };
+        /// Conservative bounds over every inserted version, including pending
+        /// and aborted writes. Never narrowed by deletion or reclamation.
+        pub const IntegerBounds = struct { known: bool = false, low: i64 = 0, high: i64 = 0 };
         pub const Summary = struct {
             valid: bool = false,
             csn: u64 = 0,
@@ -159,6 +162,7 @@ pub fn Storage(comptime config: types.Config) type {
             /// Updates/aborts may discard a proof, never invent one. Not persisted.
             column_order: [config.columns]OrderProof = @splat(.{}),
             summary: Summary = .{},
+            integer_bounds: [config.columns]IntegerBounds = @splat(.{}),
             next_rowid: u64 = 0,
             row_generation: u32 = 0,
             row_high: usize = 0,
@@ -198,6 +202,7 @@ pub fn Storage(comptime config: types.Config) type {
             table.version_free = 0;
             table.column_order = @splat(.{});
             table.summary = .{};
+            table.integer_bounds = @splat(.{});
             @memset(table.row_index[0..], 0);
             if (table.primary_column != null) @memset(table.key_index[0..], 0);
         }
@@ -211,6 +216,7 @@ pub fn Storage(comptime config: types.Config) type {
             destination.primary_column = source.primary_column;
             destination.column_order = source.column_order;
             destination.summary = source.summary;
+            destination.integer_bounds = source.integer_bounds;
             destination.next_rowid = source.next_rowid;
             destination.row_generation = source.row_generation;
             destination.row_high = source.row_high;
@@ -341,6 +347,15 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         pub fn indexKey(table: *Table, version: u32) void {
+            for (table.versions[version].cells[0..table.column_count], table.integer_bounds[0..table.column_count]) |*cell, *bounds| {
+                if (cell.* != .integer) continue;
+                if (!bounds.known) {
+                    bounds.* = .{ .known = true, .low = cell.integer, .high = cell.integer };
+                } else {
+                    bounds.low = @min(bounds.low, cell.integer);
+                    bounds.high = @max(bounds.high, cell.integer);
+                }
+            }
             noteOrder(table, version);
             indexKeyOnly(table, version);
         }
