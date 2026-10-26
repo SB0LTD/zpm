@@ -501,7 +501,7 @@ pub fn Exec(comptime config: types.Config) type {
                 for (p.aggs[0..p.agg_count]) |agg| {
                     if (agg.distinct or agg.filter != none) return false;
                     if (agg.kind == .count_star) continue;
-                    if (agg.kind != .count and !(agg.kind == .sum and value_module.integral(agg.arg_ty))) return false;
+                    if (agg.kind != .count and !((agg.kind == .sum or agg.kind == .avg) and value_module.integral(agg.arg_ty))) return false;
                     // A legacy int8 -> int8 SUM must preserve prefix-overflow
                     // errors, even if cancellation makes the final total fit.
                     if (agg.kind == .sum and agg.ty == .int8 and agg.arg_ty == .int8) return false;
@@ -509,6 +509,59 @@ pub fn Exec(comptime config: types.Config) type {
                     if (node.kind != .column or node.level != 0 or node.relation != 0) return false;
                 }
                 return true;
+            }
+
+            fn summaryStates(self: *Query, p: *const B.Plan, columns: *const [config.columns]S.ColumnSummary, rows: i64, states: []Accumulator) Error!void {
+                for (p.aggs[0..p.agg_count], states) |agg, *state| {
+                    try self.session.checkpoint();
+                    state.* = .{};
+                    if (agg.kind == .count_star) { state.count = rows; continue; }
+                    const column = &columns[self.pool.nodes[agg.arg].column];
+                    state.count = column.nonnull;
+                    state.wide = column.total;
+                    if (agg.kind == .sum and agg.ty == .int8) state.integer = @intCast(column.total);
+                }
+            }
+
+            const RollupSorter = struct {
+                rollup: *const S.Rollup,
+                session: *const value_module.Session,
+                pub fn order(self: *const RollupSorter, a: u32, b: u32) Error!i8 {
+                    try self.session.checkpoint();
+                    const left = &self.rollup.groups[a];
+                    const right = &self.rollup.groups[b];
+                    return V.compare(&left.key, &right.key);
+                }
+            };
+
+            fn rollupGroup(self: *Query, p: *const B.Plan, outer: ?*const E.Context, table: *const S.Table, rollup: *const S.Rollup) Error!List {
+                var out: List = .{};
+                var groups: usize = 0;
+                for (rollup.groups[0..rollup.used]) |*entry| if (entry.rows != 0) { groups += 1; };
+                self.work.stream_stats.summary_plans += 1;
+                self.work.stream_stats.summary_rows += @intCast(table.summary.rows);
+                if (groups == 0) return self.finish(p, out);
+                const order = try self.refs(groups);
+                const scratch = try self.refs(groups);
+                var used: usize = 0;
+                for (rollup.groups[0..rollup.used], 0..) |*entry, i| if (entry.rows != 0) {
+                    self.work.refs[order + used] = @intCast(i);
+                    used += 1;
+                };
+                const sorter: RollupSorter = .{ .rollup = rollup, .session = self.session };
+                _ = try sort_module.mergeSort(self.work.refs[order..][0..groups], self.work.refs[scratch..][0..groups], &sorter);
+                var states: [config.columns]Accumulator = undefined;
+                for (self.work.refs[order..][0..groups]) |index| {
+                    const entry = &rollup.groups[index];
+                    const at = try self.cells(1 + p.agg_count);
+                    self.work.cells[at] = entry.key;
+                    try self.summaryStates(p, &entry.columns, entry.rows, states[0..p.agg_count]);
+                    try self.projectGroup(p, at, states[0..p.agg_count], outer, &out);
+                }
+                self.work.stream_stats.groups += groups;
+                self.work.stream_stats.scratch_cells = @max(self.work.stream_stats.scratch_cells, groups * (1 + p.agg_count));
+                self.work.stream_stats.scratch_refs = @max(self.work.stream_stats.scratch_refs, groups * 2);
+                return self.finish(p, out);
             }
 
             const Transition = struct {
@@ -520,10 +573,10 @@ pub fn Exec(comptime config: types.Config) type {
                 for (p.aggs[0..p.agg_count], output) |agg, *item| {
                     if (agg.distinct or agg.filter != none) return false;
                     if (agg.kind == .count_star) { item.* = .{ .kind = .count_star }; continue; }
-                    if (agg.kind != .count and !(agg.kind == .sum and value_module.integral(agg.arg_ty))) return false;
+                    if (agg.kind != .count and !((agg.kind == .sum or agg.kind == .avg) and value_module.integral(agg.arg_ty))) return false;
                     const node = &self.pool.nodes[agg.arg];
                     if (node.kind != .column or node.level != 0 or node.relation != 0) return false;
-                    item.* = .{ .column = node.column, .kind = if (agg.kind == .count) .count else if (agg.ty == .int8) .sum_integer else .sum_wide };
+                    item.* = .{ .column = node.column, .kind = if (agg.kind == .count) .count else if (agg.kind == .sum and agg.ty == .int8) .sum_integer else .sum_wide };
                 }
                 return true;
             }
@@ -618,21 +671,20 @@ pub fn Exec(comptime config: types.Config) type {
                 const table = &self.tables[p.sources[0].table.?];
                 var ctx = self.context(outer);
                 var out: List = .{};
+                if (comptime config.summary_groups != 0) {
+                    if (p.key_count == 1 and self.summaryEligible(p, table)) {
+                        const key = &self.pool.nodes[p.keys[0]];
+                        if (key.kind == .column and key.level == 0 and key.relation == 0 and S.summaryKeyType(table.columns[key.column].data_type)) {
+                            const rollup = &table.rollups[key.column];
+                            if (rollup.valid) return self.rollupGroup(p, outer, table, rollup);
+                        }
+                    }
+                }
                 if (p.key_count == 0) {
                     var states: [config.columns]Accumulator = undefined;
                     for (states[0..p.agg_count]) |*state| state.* = .{};
                     if (self.summaryEligible(p, table)) {
-                        for (p.aggs[0..p.agg_count], states[0..p.agg_count]) |agg, *state| {
-                            try self.session.checkpoint();
-                            if (agg.kind == .count_star) {
-                                state.count = table.summary.rows;
-                            } else {
-                                const column = &table.summary.columns[self.pool.nodes[agg.arg].column];
-                                state.count = column.nonnull;
-                                state.wide = column.total;
-                                if (agg.kind == .sum and agg.ty == .int8) state.integer = @intCast(column.total);
-                            }
-                        }
+                        try self.summaryStates(p, &table.summary.columns, table.summary.rows, states[0..p.agg_count]);
                         self.work.stream_stats.summary_rows += @intCast(table.summary.rows);
                         self.work.stream_stats.summary_plans += 1;
                     } else for (0..table.row_high) |slot| {

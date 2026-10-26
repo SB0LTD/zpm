@@ -182,8 +182,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                     },
                     .update => {
                         const table = &db.tables[entry.table];
-                        S.summarize(table, &table.versions[entry.old].cells, false, csn);
-                        S.summarize(table, &table.versions[entry.new].cells, true, csn);
+                        S.summarizeUpdate(table, &table.versions[entry.old].cells, &table.versions[entry.new].cells, csn);
                         table.versions[entry.new].xmin_csn = csn;
                         table.versions[entry.old].xmax_csn = csn;
                     },
