@@ -760,11 +760,12 @@ pub fn Exec(comptime config: types.Config) type {
                 transitions: []const Transition, nonnull: []const bool,
                 present: *[4097]bool, counts: *[4][4097]i64, totals: *[4][4097]i64,
                 fused: bool, count_index: usize, sum_index: usize,
+                presence_count: ?usize,
                 inline fn add(self: *const CompactFold, slot: usize) void {
                     const table = self.table;
                     const bucket: usize = if (!self.grouped) 0 else if (!self.key_nonnull and table.scan_nonnull[slot] & (@as(u64,1) << @intCast(self.domain.column)) == 0) self.domain.span
                         else @intCast(@as(i128,table.scan_values[@as(usize,self.domain.column)*table.rows.len+slot])-self.domain.base);
-                    self.present[bucket] = true;
+                    if (self.presence_count == null) self.present[bucket] = true;
                     if (self.fused) {
                         self.counts[self.count_index][bucket] += 1;
                         self.totals[self.sum_index][bucket] += table.scan_values[@as(usize,self.transitions[self.sum_index].column)*table.rows.len+slot];
@@ -775,6 +776,24 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
             };
+
+            inline fn countSumDense(keys: []const i64, values: []const i64, noalias counts: *[4097]i64, noalias sums: *[4097]i64, base: i64) void {
+                for (keys,values) |key,value| {
+                    // The validated domain is <=4096 wide. Modular subtraction
+                    // is exact even when that signed interval crosses zero.
+                    const bucket:usize=@intCast(@as(u64,@bitCast(key)) -% @as(u64,@bitCast(base)));
+                    counts[bucket]+=1;sums[bucket]+=value;
+                }
+            }
+
+            inline fn countSumMasked(keys: []const i64, values: []const i64, noalias counts: *[4097]i64, noalias sums: *[4097]i64, base: i64, selected: u64) void {
+                var mask=selected;
+                while(mask!=0) {
+                    const i=@ctz(mask);mask&=mask-1;
+                    const bucket:usize=@intCast(@as(u64,@bitCast(keys[i])) -% @as(u64,@bitCast(base)));
+                    counts[bucket]+=1;sums[bucket]+=values[i];
+                }
+            }
 
             /// Integral committed scans use caller-backed column-major data
             /// and compact per-group arithmetic, not padded Cell unions.
@@ -805,13 +824,15 @@ pub fn Exec(comptime config: types.Config) type {
                 const dense = table.summary.rows == @as(i64, @intCast(table.scan_high));
                 const key_nonnull = p.key_count == 0 or table.summary.columns[domain.column].nonnull == table.summary.rows;
                 var count_index:usize=0;var sum_index:usize=1;var fused=false;
+                var presence_count:?usize=null;
+                for(transitions[0..p.agg_count],0..) |item,i| if(item.kind==.count_star) {presence_count=i;break;};
                 if (p.agg_count == 2) {
                     if (transitions[1].kind == .count_star) { count_index=1;sum_index=0; }
                     fused=transitions[count_index].kind==.count_star and transitions[sum_index].kind==.sum_integer and nonnull[sum_index];
                 }
                 const fold:CompactFold=.{.table=table,.domain=domain,.grouped=p.key_count!=0,.key_nonnull=key_nonnull,
                     .transitions=transitions[0..p.agg_count],.nonnull=nonnull[0..p.agg_count],.present=&present,.counts=&counts,.totals=&totals,
-                    .fused=fused,.count_index=count_index,.sum_index=sum_index};
+                    .fused=fused,.count_index=count_index,.sum_index=sum_index,.presence_count=presence_count};
                 var visited:usize=0;
                 defer { self.work.stream_stats.rows+=visited;self.work.stream_stats.compact_rows+=visited; }
                 var start:usize=0;
@@ -831,12 +852,19 @@ pub fn Exec(comptime config: types.Config) type {
                         .gt=>comparisonMask(.gt,table,start,count,predicate),.ge=>comparisonMask(.ge,table,start,count,predicate),
                         else=>unreachable,
                     };
-                    if (predicate_count==0 and dense) {
+                    if (fused and p.key_count!=0 and key_nonnull) {
+                        const keys=table.scan_values[@as(usize,domain.column)*table.rows.len+start..][0..count];
+                        const values=table.scan_values[@as(usize,transitions[sum_index].column)*table.rows.len+start..][0..count];
+                        const full:u64=if(count==64) ~@as(u64,0) else (@as(u64,1)<<@intCast(count))-1;
+                        if(mask==full) countSumDense(keys,values,&counts[count_index],&totals[sum_index],domain.base)
+                        else countSumMasked(keys,values,&counts[count_index],&totals[sum_index],domain.base,mask);
+                    } else if (predicate_count==0 and dense) {
                         for (0..count) |i| fold.add(start+i);
                     } else while (mask!=0) {
                         const i=@ctz(mask);mask&=mask-1;fold.add(start+i);
                     }
                 }
+                if(p.key_count!=0) if(presence_count) |index| for(present[0..size],0..) |*exists,bucket| {exists.*=counts[index][bucket]!=0;};
                 var groups: usize = 0;
                 for (present[0..size]) |used| groups += @intFromBool(used);
                 var out: List = .{};

@@ -70,6 +70,7 @@ fn cacheHash() u64 {
     return h;
 }
 fn rejected(_: ?*anyopaque,_:[]const u8) anyerror!void {try check(cacheHash()==before_hash);return error.InjectedFlushFailure;}
+fn canceled(_: ?*anyopaque) sql.Error!void {return error.QueryCanceled;}
 pub fn main() !void {
     try bind(&db,0);try bind(&copy,1);try bind(&producer,2);try bind(&replay,3);
     try db.execute("CREATE TABLE t(id INT PRIMARY KEY,g INT,v INT,label TEXT)",&result);
@@ -123,6 +124,9 @@ pub fn main() !void {
     try paired(&larger,"SELECT SUM(v),COUNT(*) FROM t WHERE id>=0",true);
     try check(result.rows[0].cells[0].integer==17*result.rows[0].cells[1].integer);
     try paired(&larger,"SELECT g,SUM(v),COUNT(*) FROM t WHERE id>=0 GROUP BY g ORDER BY g",true);
+    try larger.execute("UPDATE t SET g=1",&result);
+    try paired(&larger,"SELECT g,SUM(g),COUNT(*) FROM t GROUP BY g ORDER BY g",true);
+    try check(result.row_count==1 and result.rows[0].cells[1].integer==result.rows[0].cells[2].integer);
     // Compact a directory whose last slot has never been published. The
     // projection must initialize that slot rather than copy uninitialized data.
     try copy.execute("DELETE FROM t WHERE id<32",&result);
@@ -160,6 +164,16 @@ pub fn main() !void {
         try replay.applyChangeRecord(record[0..used],&scratch);
     }
     try paired(&replay,"SELECT g,COUNT(*),SUM(v) FROM t WHERE id>=0 GROUP BY g ORDER BY g",true);
+    const ranges=[_][3]i64{.{-9223372036854775808,-9223372036854775807,-9223372036854775806},.{-1,0,1},.{9223372036854775805,9223372036854775806,9223372036854775807}};
+    for(ranges) |keys| {
+        try replay.execute("DROP TABLE t",&result);
+        try replay.execute("CREATE TABLE t(id INT PRIMARY KEY,g BIGINT,v INT)",&result);
+        var text:[512]u8=undefined;
+        try replay.execute(try std.fmt.bufPrint(&text,"INSERT INTO t VALUES(1,{d},11),(2,{d},22),(3,{d},33)",.{keys[0],keys[1],keys[2]}),&result);
+        try paired(&replay,"SELECT g,COUNT(*),SUM(v) FROM t GROUP BY g ORDER BY g",true);
+        try check(result.row_count==3);
+        for(result.rows[0..3],0..) |row,i| try check(row.cells[0].integer==keys[i] and row.cells[1].integer==1 and row.cells[2].integer==11*@as(i64,@intCast(i+1)));
+    }
     var invalid:DB=.{};const t=&db.tables[0];
     const aliased:DB.StorageBacking=.{.rows=t.rows,.versions=t.versions,.row_index=t.row_index,.key_index=t.key_index,
         .scan_values=@as([*]i64,@ptrCast(@alignCast(t.rows.ptr)))[0..t.rows.len*4],.scan_nonnull=t.scan_nonnull,.scan_live=t.scan_live};
@@ -170,6 +184,10 @@ pub fn main() !void {
     result.row_count=37;
     if(db.execute("SELECT COUNT(*),SUM(v) FROM t WHERE id>=0",&result)) |_| return error.ExpectedLimit
         else |err| try check(err==error.QueryWorkLimit);
+    try check(result.row_count==37);db.session.control=null;
+    var interrupt:sql.ExecutionControl=.{.poll=&canceled,.poll_interval=1};db.session.control=&interrupt;
+    if(db.execute("SELECT COUNT(*),SUM(v) FROM t WHERE id>=0",&result)) |_| return error.ExpectedCancel
+        else |err| try check(err==error.QueryCanceled);
     try check(result.row_count==37);db.session.control=null;
     std.debug.print("{{\"suite\":\"sql-compact-scan\",\"pass\":true,\"assertions\":{d}}}\n",.{assertions});
 }
