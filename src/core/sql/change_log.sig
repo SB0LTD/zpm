@@ -849,7 +849,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
             table.versions[version] = .{ .row = slot + 1, .xmin = .{ .epoch = db.epoch }, .xmin_cid = db.cid, .xmin_csn = csn, .older = older, .cells = row.cells };
             table.rows[slot].newest = version + 1;
             S.indexKey(table, version);
-            if (older == 0) S.summarize(table, &table.versions[version].cells, true, csn);
+            if (older == 0) {
+                S.summarize(table, &table.versions[version].cells, true, csn);
+                S.scanPublish(table, version, true);
+            }
             return version;
         }
 
@@ -909,6 +912,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             const old = S.visible(table, slot) orelse return error.ChangeRecordConflict;
                             const new = try writeVersion(db, table, slot, old + 1, &row, csn);
                             S.summarizeUpdate(table, &table.versions[old].cells, &table.versions[new].cells, csn);
+                            S.scanPublish(table, new, true);
                             retire(db, table, old, csn);
                         }
                     },
@@ -917,6 +921,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const slot = S.findRow(table, try reader.int(u64)) orelse return error.ChangeRecordConflict;
                         const old = S.visible(table, slot) orelse return error.ChangeRecordConflict;
                         S.summarize(table, &table.versions[old].cells, false, csn);
+                        S.scanPublish(table, old, false);
                         retire(db, table, old, csn);
                     },
                     @intFromEnum(Op.catalog_counters) => {

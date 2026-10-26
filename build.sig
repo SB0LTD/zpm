@@ -118,6 +118,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-dense-group", "tests/test_sql_dense_group.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-rollup", "tests/test_sql_rollup.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-ordered-probes", "tests/test_sql_ordered_probes.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-compact-scan", "tests/test_sql_compact_scan.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try ctx.addModule("db_store", "src/db/store.sig");
     const pg_module = try ctx.addModule("postgres", "src/db/postgres.sig");
     try wire(ctx, pg_module, "scram", "src/db/scram.sig");

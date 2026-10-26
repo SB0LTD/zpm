@@ -51,6 +51,8 @@ pub fn Exec(comptime config: types.Config) type {
             summary_rows: usize = 0,
             summary_plans: usize = 0,
             dense_plans: usize = 0,
+            compact_plans: usize = 0,
+            compact_rows: usize = 0,
             groups: usize = 0,
             probes: usize = 0,
             scratch_cells: usize = 0,
@@ -673,6 +675,124 @@ pub fn Exec(comptime config: types.Config) type {
                 return self.finish(p, out);
             }
 
+            const CompactPredicate = struct { column: u16, op: ast.Op, value: i64, nonnull: bool };
+            fn compactPredicates(self: *const Query, id: u16, table: *const S.Table, out: []CompactPredicate, used: *usize) bool {
+                if (id == none) return true;
+                const node = &self.pool.nodes[id];
+                if (node.kind == .and_op) return self.compactPredicates(node.a, table, out, used) and self.compactPredicates(node.b, table, out, used);
+                if (node.kind != .binary or used.* == out.len) return false;
+                switch (node.op) { .eq, .ne, .lt, .le, .gt, .ge => {}, else => return false }
+                var a = &self.pool.nodes[node.a];
+                var b = &self.pool.nodes[node.b];
+                var op = node.op;
+                if (b.kind == .column and a.kind == .int_literal) {
+                    const temp = a; a = b; b = temp;
+                    op = switch (op) { .lt => .gt, .le => .ge, .gt => .lt, .ge => .le, else => op };
+                }
+                // Computed, volatile, nullable literal and correlated inputs
+                // retain expression evaluation and its normal error behavior.
+                if (a.kind != .column or a.level != 0 or a.relation != 0 or !value_module.integral(a.ty) or b.kind != .int_literal) return false;
+                out[used.*] = .{ .column = a.column, .op = op, .value = b.integer,
+                    .nonnull = table.summary.columns[a.column].nonnull == table.summary.rows };
+                used.* += 1;
+                return true;
+            }
+
+            inline fn compactKeep(table: *const S.Table, slot: usize, predicates: []const CompactPredicate) bool {
+                for (predicates) |predicate| {
+                    if (!predicate.nonnull and table.scan_nonnull[slot] & (@as(u64, 1) << @intCast(predicate.column)) == 0) return false;
+                    const value = table.scan_values[@as(usize, predicate.column) * table.rows.len + slot];
+                    const keep_row = switch (predicate.op) {
+                        .eq => value == predicate.value, .ne => value != predicate.value,
+                        .lt => value < predicate.value, .le => value <= predicate.value,
+                        .gt => value > predicate.value, .ge => value >= predicate.value,
+                        else => unreachable,
+                    };
+                    if (!keep_row) return false;
+                }
+                return true;
+            }
+
+            /// Integral committed scans use caller-backed column-major data
+            /// and compact per-group arithmetic, not padded Cell unions.
+            /// The shared publication/replay path maintains this projection;
+            /// it is never a cached SQL result or a speculative row snapshot.
+            noinline fn compactGroup(self: *Query, p: *const B.Plan, outer: ?*const E.Context, table: *const S.Table) Error!?List {
+                if (!self.committed_only or !table.summary.valid or table.summary.csn > self.snap.csn or p.key_count > 1 or p.agg_count > 4) return null;
+                var transitions: [4]Transition = undefined;
+                if (!self.prepareTransitions(p, transitions[0..p.agg_count])) return null;
+                var nonnull: [4]bool = undefined;
+                for (p.aggs[0..p.agg_count], 0..) |agg, i| {
+                    // At most 2^31-1 values of these types fit exactly in i64.
+                    // int8 inputs retain prefix-overflow/wide numeric handling.
+                    if (agg.kind != .count and agg.kind != .count_star and agg.arg_ty != .int2 and agg.arg_ty != .int4 and agg.arg_ty != .oid) return null;
+                    nonnull[i] = agg.kind == .count_star or table.summary.columns[transitions[i].column].nonnull == table.summary.rows;
+                }
+                const domain: DenseDomain = if (p.key_count == 0) .{ .column = 0, .base = 0, .span = 0 } else self.denseDomain(p, table, 4097) orelse return null;
+                var predicates: [config.predicates]CompactPredicate = undefined;
+                var predicate_count: usize = 0;
+                if (!self.compactPredicates(p.where, table, &predicates, &predicate_count)) return null;
+                const size = domain.span + 1;
+                var present: [4097]bool = undefined;
+                var counts: [4][4097]i64 = undefined;
+                var totals: [4][4097]i64 = undefined;
+                @memset(present[0..size], false);
+                for (0..p.agg_count) |i| { @memset(counts[i][0..size], 0); @memset(totals[i][0..size], 0); }
+                if (p.key_count == 0) present[0] = true;
+                const dense = table.summary.rows == @as(i64, @intCast(table.scan_high));
+                const key_nonnull = p.key_count == 0 or table.summary.columns[domain.column].nonnull == table.summary.rows;
+                for (0..table.scan_high) |slot| {
+                    try self.session.checkpoint();
+                    if (!dense and table.scan_live[slot] == 0) continue;
+                    self.work.stream_stats.rows += 1;
+                    self.work.stream_stats.compact_rows += 1;
+                    if (!compactKeep(table, slot, predicates[0..predicate_count])) continue;
+                    const bucket: usize = if (p.key_count == 0) 0 else if (!key_nonnull and table.scan_nonnull[slot] & (@as(u64, 1) << @intCast(domain.column)) == 0) domain.span
+                        else @intCast(@as(i128, table.scan_values[@as(usize, domain.column) * table.rows.len + slot]) - domain.base);
+                    present[bucket] = true;
+                    for (transitions[0..p.agg_count], 0..) |item, i| {
+                        if (item.kind != .count_star and !nonnull[i] and table.scan_nonnull[slot] & (@as(u64, 1) << @intCast(item.column)) == 0) continue;
+                        counts[i][bucket] += 1;
+                        if (item.kind == .sum_integer or item.kind == .sum_wide) totals[i][bucket] += table.scan_values[@as(usize, item.column) * table.rows.len + slot];
+                    }
+                }
+                var groups: usize = 0;
+                for (present[0..size]) |used| groups += @intFromBool(used);
+                var out: List = .{};
+                self.work.stream_stats.compact_plans += 1;
+                if (groups == 0) return try self.finish(p, out);
+                const tickets = try self.refs(groups);
+                var used: usize = 0;
+                var states: [config.columns]Accumulator = undefined;
+                // Retain the ordinary key sort/projection, HAVING and output
+                // validation. No result bytes are published by this scan.
+                for (present[0..size], 0..) |exists, bucket| {
+                    if (!exists) continue;
+                    try self.session.checkpoint();
+                    const at = try self.cells(p.key_count + p.agg_count);
+                    if (p.key_count != 0) self.work.cells[at] = if (bucket == domain.span) .null_value else .{ .integer = domain.base + @as(i64, @intCast(bucket)) };
+                    // Store the bucket ID after the keys/aggregate output.
+                    const bucket_cell = try self.cells(1);
+                    self.work.cells[bucket_cell] = .{ .integer = @intCast(bucket) };
+                    self.work.refs[tickets + used] = at;
+                    used += 1;
+                }
+                if (p.key_count != 0) {
+                    const scratch = try self.refs(groups);
+                    const sorter: GroupSorter = .{ .query = self, .width = 1 };
+                    _ = try sort_module.mergeSort(self.work.refs[tickets..][0..groups], self.work.refs[scratch..][0..groups], &sorter);
+                }
+                for (self.work.refs[tickets..][0..groups]) |at| {
+                    const bucket: usize = @intCast(self.work.cells[at + p.key_count + p.agg_count].integer);
+                    for (states[0..p.agg_count], 0..) |*state, i| state.* = .{ .count = counts[i][bucket], .integer = totals[i][bucket], .wide = totals[i][bucket] };
+                    try self.projectGroup(p, at, states[0..p.agg_count], outer, &out);
+                }
+                self.work.stream_stats.groups += groups;
+                self.work.stream_stats.scratch_cells = @max(self.work.stream_stats.scratch_cells, groups * (p.key_count + p.agg_count + 1));
+                self.work.stream_stats.scratch_refs = @max(self.work.stream_stats.scratch_refs, groups * 2);
+                return try self.finish(p, out);
+            }
+
             /// Consume visible base-table versions directly. State grows with
             /// groups, not scanned rows. All output remains private until the
             /// ordinary query publication step succeeds.
@@ -687,6 +807,11 @@ pub fn Exec(comptime config: types.Config) type {
                             const rollup = &table.rollups[key.column];
                             if (rollup.valid) return self.rollupGroup(p, outer, table, rollup);
                         }
+                    }
+                }
+                if (comptime S.compact_enabled) {
+                    if (p.key_count != 0 or !self.summaryEligible(p, table)) {
+                        if (try self.compactGroup(p, outer, table)) |rows| return rows;
                     }
                 }
                 if (p.key_count == 0) {
