@@ -11,6 +11,7 @@ const binder = @import("binder.sig");
 const value_module = @import("value.sig");
 const sort_module = @import("sort.sig");
 const catalog = @import("catalog.sig");
+const builtin = @import("builtin");
 const Error = types.Error;
 const none = ast.none;
 
@@ -713,6 +714,64 @@ pub fn Exec(comptime config: types.Config) type {
                 return true;
             }
 
+            fn comparisonMask(comptime op: ast.Op, table: *const S.Table, start: usize, count: usize, predicate: CompactPredicate) u64 {
+                const rhs: @Vector(8,i64) = @splat(predicate.value);
+                const base = @as(usize,predicate.column) * table.rows.len + start;
+                var mask: u64 = 0;
+                var i: usize = 0;
+                while (i + 8 <= count) : (i += 8) {
+                    const values: @Vector(8,i64) = table.scan_values[base+i..][0..8].*;
+                    const matched = switch(op) {
+                        .eq => values == rhs, .ne => values != rhs,
+                        .lt => values < rhs, .le => values <= rhs,
+                        .gt => values > rhs, .ge => values >= rhs,
+                        else => unreachable,
+                    };
+                    var bits: u8 = @bitCast(matched);
+                    if (!predicate.nonnull) {
+                        const flags: @Vector(8,u64) = table.scan_nonnull[start+i..][0..8].*;
+                        const bit: @Vector(8,u64) = @splat(@as(u64,1) << @intCast(predicate.column));
+                        const zero: @Vector(8,u64) = @splat(0);
+                        bits &= @as(u8,@bitCast((flags & bit) != zero));
+                    }
+                    if (comptime builtin.cpu.arch.endian() == .big) bits = @bitReverse(bits);
+                    mask |= @as(u64,bits) << @intCast(i);
+                }
+                while (i < count) : (i += 1) {
+                    const value = table.scan_values[base+i];
+                    const matched = switch(op) {
+                        .eq => value == predicate.value, .ne => value != predicate.value,
+                        .lt => value < predicate.value, .le => value <= predicate.value,
+                        .gt => value > predicate.value, .ge => value >= predicate.value,
+                        else => unreachable,
+                    };
+                    const valid = predicate.nonnull or table.scan_nonnull[start+i] & (@as(u64,1) << @intCast(predicate.column)) != 0;
+                    mask |= @as(u64,@intFromBool(matched and valid)) << @intCast(i);
+                }
+                return mask;
+            }
+
+            const CompactFold = struct {
+                table: *const S.Table, domain: DenseDomain, grouped: bool, key_nonnull: bool,
+                transitions: []const Transition, nonnull: []const bool,
+                present: *[4097]bool, counts: *[4][4097]i64, totals: *[4][4097]i64,
+                fused: bool, count_index: usize, sum_index: usize,
+                inline fn add(self: *const CompactFold, slot: usize) void {
+                    const table = self.table;
+                    const bucket: usize = if (!self.grouped) 0 else if (!self.key_nonnull and table.scan_nonnull[slot] & (@as(u64,1) << @intCast(self.domain.column)) == 0) self.domain.span
+                        else @intCast(@as(i128,table.scan_values[@as(usize,self.domain.column)*table.rows.len+slot])-self.domain.base);
+                    self.present[bucket] = true;
+                    if (self.fused) {
+                        self.counts[self.count_index][bucket] += 1;
+                        self.totals[self.sum_index][bucket] += table.scan_values[@as(usize,self.transitions[self.sum_index].column)*table.rows.len+slot];
+                    } else for (self.transitions,0..) |item,i| {
+                        if (item.kind != .count_star and !self.nonnull[i] and table.scan_nonnull[slot] & (@as(u64,1) << @intCast(item.column)) == 0) continue;
+                        self.counts[i][bucket] += 1;
+                        if (item.kind == .sum_integer or item.kind == .sum_wide) self.totals[i][bucket] += table.scan_values[@as(usize,item.column)*table.rows.len+slot];
+                    }
+                }
+            };
+
             /// Integral committed scans use caller-backed column-major data
             /// and compact per-group arithmetic, not padded Cell unions.
             /// The shared publication/replay path maintains this projection;
@@ -741,19 +800,37 @@ pub fn Exec(comptime config: types.Config) type {
                 if (p.key_count == 0) present[0] = true;
                 const dense = table.summary.rows == @as(i64, @intCast(table.scan_high));
                 const key_nonnull = p.key_count == 0 or table.summary.columns[domain.column].nonnull == table.summary.rows;
-                for (0..table.scan_high) |slot| {
-                    try self.session.checkpoint();
-                    if (!dense and table.scan_live[slot] == 0) continue;
-                    self.work.stream_stats.rows += 1;
-                    self.work.stream_stats.compact_rows += 1;
-                    if (!compactKeep(table, slot, predicates[0..predicate_count])) continue;
-                    const bucket: usize = if (p.key_count == 0) 0 else if (!key_nonnull and table.scan_nonnull[slot] & (@as(u64, 1) << @intCast(domain.column)) == 0) domain.span
-                        else @intCast(@as(i128, table.scan_values[@as(usize, domain.column) * table.rows.len + slot]) - domain.base);
-                    present[bucket] = true;
-                    for (transitions[0..p.agg_count], 0..) |item, i| {
-                        if (item.kind != .count_star and !nonnull[i] and table.scan_nonnull[slot] & (@as(u64, 1) << @intCast(item.column)) == 0) continue;
-                        counts[i][bucket] += 1;
-                        if (item.kind == .sum_integer or item.kind == .sum_wide) totals[i][bucket] += table.scan_values[@as(usize, item.column) * table.rows.len + slot];
+                var count_index:usize=0;var sum_index:usize=1;var fused=false;
+                if (p.agg_count == 2) {
+                    if (transitions[1].kind == .count_star) { count_index=1;sum_index=0; }
+                    fused=transitions[count_index].kind==.count_star and transitions[sum_index].kind==.sum_integer and nonnull[sum_index];
+                }
+                const fold:CompactFold=.{.table=table,.domain=domain,.grouped=p.key_count!=0,.key_nonnull=key_nonnull,
+                    .transitions=transitions[0..p.agg_count],.nonnull=nonnull[0..p.agg_count],.present=&present,.counts=&counts,.totals=&totals,
+                    .fused=fused,.count_index=count_index,.sum_index=sum_index};
+                var visited:usize=0;
+                defer { self.work.stream_stats.rows+=visited;self.work.stream_stats.compact_rows+=visited; }
+                var start:usize=0;
+                while (start < table.scan_high) : (start += 64) {
+                    const count=@min(@as(usize,64),table.scan_high-start);
+                    // Reserve/check every input step before reading this bounded
+                    // block. A work/cancel failure still leaves results private.
+                    if (self.session.control != null) for (0..count) |_| try self.session.checkpoint();
+                    var mask:u64=if(count==64) ~@as(u64,0) else (@as(u64,1)<<@intCast(count))-1;
+                    if (!dense) {
+                        mask=0;for(0..count) |i| mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
+                    }
+                    visited+=@popCount(mask);
+                    for (predicates[0..predicate_count]) |predicate| mask &= switch(predicate.op) {
+                        .eq=>comparisonMask(.eq,table,start,count,predicate),.ne=>comparisonMask(.ne,table,start,count,predicate),
+                        .lt=>comparisonMask(.lt,table,start,count,predicate),.le=>comparisonMask(.le,table,start,count,predicate),
+                        .gt=>comparisonMask(.gt,table,start,count,predicate),.ge=>comparisonMask(.ge,table,start,count,predicate),
+                        else=>unreachable,
+                    };
+                    if (predicate_count==0 and dense) {
+                        for (0..count) |i| fold.add(start+i);
+                    } else while (mask!=0) {
+                        const i=@ctz(mask);mask&=mask-1;fold.add(start+i);
                     }
                 }
                 var groups: usize = 0;
@@ -784,7 +861,7 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 for (self.work.refs[tickets..][0..groups]) |at| {
                     const bucket: usize = @intCast(self.work.cells[at + p.key_count + p.agg_count].integer);
-                    for (states[0..p.agg_count], 0..) |*state, i| state.* = .{ .count = counts[i][bucket], .integer = totals[i][bucket], .wide = totals[i][bucket] };
+                    for (states[0..p.agg_count], 0..) |*state, i| state.* = .{ .count = counts[if(fused and i==sum_index) count_index else i][bucket], .integer = totals[i][bucket], .wide = totals[i][bucket] };
                     try self.projectGroup(p, at, states[0..p.agg_count], outer, &out);
                 }
                 self.work.stream_stats.groups += groups;

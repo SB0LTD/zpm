@@ -47,6 +47,10 @@ fn model() !void {
     try check(result.row_count==expected_groups);
     try paired(&db,"SELECT COUNT(*),SUM(v) FROM t WHERE g>=7 AND g<14",true);
     try paired(&db,"SELECT COUNT(*),SUM(v) FROM t WHERE 7<=g AND 14>g",true);
+    try paired(&db,"SELECT COUNT(*),SUM(v) FROM t WHERE g=7",true);
+    try paired(&db,"SELECT COUNT(*),SUM(v) FROM t WHERE g<>7",true);
+    try paired(&db,"SELECT COUNT(*),SUM(v) FROM t WHERE g<=7",true);
+    try paired(&db,"SELECT COUNT(*),SUM(v) FROM t WHERE g>7",true);
     try paired(&db,"SELECT COUNT(*),SUM(v) FROM t WHERE g=7 OR g=8",false);
     try paired(&db,"SELECT COUNT(*),SUM(v) FROM t WHERE id+0>=0",false);
 }
@@ -113,6 +117,12 @@ pub fn main() !void {
     @memset(&buffers[4],0xa5);try larger.bindMemory(&buffers[4],256,512,8192);
     try larger.copyFromInto(&db);
     try paired(&larger,"SELECT g,COUNT(*),SUM(v) FROM t WHERE id>=0 GROUP BY g ORDER BY g",true);
+    try larger.execute("UPDATE t SET v=17",&result);
+    try paired(&larger,"SELECT COUNT(*),SUM(v) FROM t WHERE id>=0",true);
+    try check(result.rows[0].cells[1].integer==17*result.rows[0].cells[0].integer);
+    try paired(&larger,"SELECT SUM(v),COUNT(*) FROM t WHERE id>=0",true);
+    try check(result.rows[0].cells[0].integer==17*result.rows[0].cells[1].integer);
+    try paired(&larger,"SELECT g,SUM(v),COUNT(*) FROM t WHERE id>=0 GROUP BY g ORDER BY g",true);
     // Compact a directory whose last slot has never been published. The
     // projection must initialize that slot rather than copy uninitialized data.
     try copy.execute("DELETE FROM t WHERE id<32",&result);
