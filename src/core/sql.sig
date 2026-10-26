@@ -407,9 +407,11 @@ pub fn Database(comptime config: Config) type {
             offsets: [config.tables][7]usize,
             refs: usize,
             bytes: usize,
-            row_index: usize,
-            key_index: usize,
+            row_index: [config.tables]usize,
+            key_index: [config.tables]usize,
         };
+
+        pub const TableBudget = struct { rows: usize, versions: usize };
 
         fn appendLayout(cursor: *usize, comptime T: type, count: usize) Error!usize {
             const aligned = @addWithOverflow(cursor.*, @alignOf(T) - 1);
@@ -423,16 +425,19 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn backingLayout(rows: usize, versions: usize, refs: usize) Error!BackingLayout {
-            if (rows == 0 or rows > 0x7fffffff or versions <= rows or versions > 0x7fffffff or refs == 0 or refs > 0x7fffffff or versions > ~@as(usize, 0) / 4) return error.InvalidParameterValue;
+            return backingLayoutFor(@splat(.{ .rows=rows, .versions=versions }),refs);
+        }
+
+        fn backingLayoutFor(budgets: [config.tables]TableBudget, refs: usize) Error!BackingLayout {
+            if (refs == 0 or refs > 0x7fffffff) return error.InvalidParameterValue;
             var layout: BackingLayout = undefined;
-            var ri: usize = 2;
-            while (ri < rows * 2) ri *= 2;
-            var ki: usize = 2;
-            while (ki < versions * 2) ki *= 2;
-            layout.row_index = ri;
-            layout.key_index = ki;
             var cursor: usize = 0;
-            for (&layout.offsets) |*offsets| {
+            for (&layout.offsets, &layout.row_index, &layout.key_index, budgets) |*offsets,*row_index,*key_index,budget| {
+                const rows=budget.rows; const versions=budget.versions;
+                if (rows == 0 or rows > 0x7fffffff or versions <= rows or versions > 0x7fffffff or versions > ~@as(usize,0)/4) return error.InvalidParameterValue;
+                var ri:usize=2; while(ri<rows*2) ri*=2;
+                var ki:usize=2; while(ki<versions*2) ki*=2;
+                row_index.*=ri; key_index.*=ki;
                 offsets[0] = try appendLayout(&cursor, S.RowSlot, rows);
                 offsets[1] = try appendLayout(&cursor, S.Version, versions);
                 offsets[2] = try appendLayout(&cursor, u32, ri);
@@ -452,6 +457,10 @@ pub fn Database(comptime config: Config) type {
         /// Exact byte budget for runtime-sized external row/version/index buffers.
         pub fn backingBytes(rows: usize, versions: usize, refs: usize) Error!usize {
             return (try backingLayout(rows, versions, refs)).bytes;
+        }
+
+        pub fn backingBytesFor(budgets: [config.tables]TableBudget, refs: usize) Error!usize {
+            return (try backingLayoutFor(budgets,refs)).bytes;
         }
 
         pub fn queryWorkspaceBytes(rows: usize) Error!usize {
@@ -503,18 +512,22 @@ pub fn Database(comptime config: Config) type {
         /// Carve only the declared typed buffers from one caller-owned region.
         /// No allocator interface, hidden growth, or platform imports.
         pub fn bindMemory(self: *Self, bytes: []u8, rows: usize, versions: usize, refs: usize) Error!void {
+            return self.bindMemoryFor(bytes,@splat(.{.rows=rows,.versions=versions}),refs);
+        }
+
+        pub fn bindMemoryFor(self: *Self, bytes: []u8, budgets: [config.tables]TableBudget, refs: usize) Error!void {
             if (comptime !config.external_storage) @compileError("bindMemory requires external_storage");
-            const layout = try backingLayout(rows, versions, refs);
+            const layout = try backingLayoutFor(budgets, refs);
             if (bytes.len < layout.bytes) return error.WorkspaceCapacity;
             var backings: [config.tables]StorageBacking = undefined;
-            for (&backings, layout.offsets) |*backing, offsets| backing.* = .{
-                .rows = try storageView(S.RowSlot, bytes, offsets[0], rows),
-                .versions = try storageView(S.Version, bytes, offsets[1], versions),
-                .row_index = try storageView(u32, bytes, offsets[2], layout.row_index),
-                .key_index = try storageView(u32, bytes, offsets[3], layout.key_index),
-                .scan_values = try storageView(i64, bytes, offsets[4], if (S.compact_enabled) rows * config.columns else 0),
-                .scan_nonnull = try storageView(u64, bytes, offsets[5], if (S.compact_enabled) rows else 0),
-                .scan_live = try storageView(u8, bytes, offsets[6], if (S.compact_enabled) rows else 0),
+            for (&backings, layout.offsets, layout.row_index, layout.key_index, budgets) |*backing, offsets, ri, ki, budget| backing.* = .{
+                .rows = try storageView(S.RowSlot, bytes, offsets[0], budget.rows),
+                .versions = try storageView(S.Version, bytes, offsets[1], budget.versions),
+                .row_index = try storageView(u32, bytes, offsets[2], ri),
+                .key_index = try storageView(u32, bytes, offsets[3], ki),
+                .scan_values = try storageView(i64, bytes, offsets[4], if (S.compact_enabled) budget.rows * config.columns else 0),
+                .scan_nonnull = try storageView(u64, bytes, offsets[5], if (S.compact_enabled) budget.rows else 0),
+                .scan_live = try storageView(u8, bytes, offsets[6], if (S.compact_enabled) budget.rows else 0),
             };
             try self.bindStorage(backings, try storageView(u32, bytes, layout.refs, refs));
         }

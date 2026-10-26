@@ -3,12 +3,14 @@ const std = @import("std");
 const sql = @import("sql");
 const cfg: sql.Config = .{ .external_storage=true, .external_workspace=true, .external_results=true, .tables=3,
     .columns=4, .rows_per_table=32, .result_rows=32, .work_rows=16, .text_bytes=16,
-    .integer_bits=32, .nulls_first_ascending=false, .tx_writes=256 };
+    .integer_bits=32, .nulls_first_ascending=false, .tx_writes=256, .compact_integral_scans=true };
 const DB = sql.Database(cfg);
 const Large = sql.Database(largeConfig());
 fn largeConfig() sql.Config { var c=cfg; c.work_rows=1000000; return c; }
 const bytes = DB.backingBytes(256,512,512) catch unreachable;
-var memory:[bytes]u8 align(16)=undefined;
+const budgets:[3]DB.TableBudget=.{ .{.rows=256,.versions=512}, .{.rows=16,.versions=32}, .{.rows=64,.versions=128} };
+const asymmetric_bytes = DB.backingBytesFor(budgets,512) catch unreachable;
+var memory:[asymmetric_bytes]u8 align(16)=undefined;
 var other_memory:[bytes]u8 align(16)=undefined;
 var scratch:[1024]DB.Cell=undefined;
 var other_scratch:[1024]DB.Cell=undefined;
@@ -25,7 +27,9 @@ pub fn main(init:std.process.Init) !void {
     try check(@sizeOf(DB)<1024*1024);
     try check(try DB.queryWorkspaceBytes(1000000)==1000000*2*cfg.columns*@sizeOf(DB.Cell));
     if(DB.queryWorkspaceBytes(0)) |_| return error.ZeroAccepted else |err| try check(err==error.InvalidParameterValue);
-    try db.bindMemory(&memory,256,512,512);
+    try check(asymmetric_bytes<bytes);
+    try db.bindMemoryFor(&memory,budgets,512);
+    try check(db.tables[0].rows.len==256 and db.tables[1].rows.len==16 and db.tables[2].rows.len==64);
     if(db.execute("CREATE TABLE impossible(id INT)",&result)) |_| return error.UnboundAccepted else |err| try check(err==error.InvalidParameterValue);
     try db.bindWorkspace(&scratch);
     const original=db.workspace.query.cells.ptr;
@@ -38,6 +42,12 @@ pub fn main(init:std.process.Init) !void {
     for(0..128) |i| try db.execute(try std.fmt.bufPrint(&text,"INSERT INTO facts VALUES({d},{d},{d})",.{i,i%8,i%32}),&result);
     for(0..8) |i| try db.execute(try std.fmt.bufPrint(&text,"INSERT INTO products VALUES({d},{d})",.{i,10+i}),&result);
     for(0..32) |i| try db.execute(try std.fmt.bufPrint(&text,"INSERT INTO shops VALUES({d})",.{i}),&result);
+    for(0..128) |i| {
+        if(db.execute(try std.fmt.bufPrint(&text,"INSERT INTO facts VALUES({d},0,0)",.{i}),&result)) |_| return error.DuplicateAccepted
+            else |err| try check(err==error.PrimaryKeyViolation);
+    }
+    if(db.execute("INSERT INTO products VALUES(7,99)",&result)) |_| return error.DuplicateAccepted
+        else |err| try check(err==error.PrimaryKeyViolation);
     try db.execute("SELECT s.id,COUNT(*),SUM(f.id) FROM facts f JOIN products p ON p.id=f.p JOIN shops s ON s.id=f.shop WHERE f.shop=3 AND p.unit=13 GROUP BY s.id",&result);
     try check(result.row_count==1 and result.rows[0].cells[0].integer==3 and result.rows[0].cells[1].integer==4 and result.rows[0].cells[2].integer==204);
     try db.execute("SELECT COUNT(*),SUM(f.id) FROM facts f JOIN products p ON p.id=f.p JOIN shops s ON s.id=f.shop WHERE f.shop=3 OR f.shop=4",&result);
@@ -58,6 +68,9 @@ pub fn main(init:std.process.Init) !void {
     try check(copy.workspace.query.cells.ptr==copied_cells);
     try copy.execute("SELECT COUNT(*) FROM facts",&result);
     try check(result.rows[0].cells[0].integer==3);
+    try copy.execute("SELECT COUNT(*),SUM(unit) FROM products WHERE unit>=0",&result);
+    try check(result.rows[0].cells[0].integer==8 and result.rows[0].cells[1].integer==108);
+    try check(copy.workspace.query.stream_stats.compact_plans==1);
     var small:DB.Result=.{};
     try small.bindMemory(&small_bytes,1);
     if(copy.execute("UPDATE facts SET shop=0 RETURNING id",&small)) |_| return error.SmallResultAccepted

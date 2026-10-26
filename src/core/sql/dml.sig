@@ -130,8 +130,9 @@ pub fn Dml(comptime config: types.Config) type {
             const column = table.primary_column orelse return .free;
             if (key.* == .null_value) return .free;
             var waiting: ?u16 = null;
-            var position = V.hash(key) & (S.key_index_capacity - 1);
-            while (true) : (position = (position + 1) & (S.key_index_capacity - 1)) {
+            const mask = table.key_index.len - 1;
+            var position = V.hash(key) & mask;
+            while (true) : (position = (position + 1) & mask) {
                 const entry = table.key_index[position];
                 if (entry == 0) break;
                 const version = &table.versions[entry - 1];
