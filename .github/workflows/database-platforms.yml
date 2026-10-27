@@ -84,7 +84,7 @@ jobs:
 
       - name: Execute allocator-free SQL, wire, transaction and OS contracts
         run: |
-          $arguments = @('build', 'test-db', 'test-sql', 'test-workers', 'test-resource-budget', 'test-packed-integer', '-Doptimize=ReleaseSafe', '-j2', '--Sig-lib-dir', $env:SIG_LIB_DIR)
+          $arguments = @('build', 'test-db', 'test-sql', 'test-workers', 'test-resource-budget', 'test-packed-integer', 'test-machine-resources', '-Doptimize=ReleaseSafe', '-j2', '--Sig-lib-dir', $env:SIG_LIB_DIR)
           if ($env:RUNNER_OS -eq 'macOS') { $arguments += '-Dlink-libc=true' }
           & $env:SIG @arguments
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -92,7 +92,7 @@ jobs:
       - name: Execute Linux native worker and memory-grant concurrency contracts
         if: runner.os == 'Linux'
         run: |
-          & $env:SIG build test-workers test-resource-budget -Doptimize=ReleaseSafe -Dlink-libc=false -j2 --Sig-lib-dir $env:SIG_LIB_DIR *> linux-native-concurrency.log
+          & $env:SIG build test-workers test-resource-budget test-machine-resources -Doptimize=ReleaseSafe -Dlink-libc=false -j2 --Sig-lib-dir $env:SIG_LIB_DIR *> linux-native-concurrency.log
           $result = $LASTEXITCODE
           Get-Content linux-native-concurrency.log
           if ($result -ne 0) { exit $result }

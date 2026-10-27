@@ -1379,6 +1379,11 @@ pub fn connectionLimitError(output: []u8) error{BufferTooSmall}!usize {
     try fatal(&writer, "53300", "too many connections");
     return writer.at;
 }
+pub fn memoryLimitError(output: []u8) error{BufferTooSmall}!usize {
+    var writer: Writer = .{ .bytes = output };
+    try fatal(&writer, "53200", "database memory budget exhausted");
+    return writer.at;
+}
 
 fn fatal(w: *Writer, state: []const u8, message: []const u8) !void {
     const p = try w.begin('E');

@@ -885,6 +885,9 @@ fn oversizedFrames() !void {
     const used=try pg.connectionLimitError(&rejected);
     try state(rejected[0..used],"53300");
     try check(std.mem.indexOf(u8,rejected[0..used],"FATAL")!=null);
+    const memory_used=try pg.memoryLimitError(&rejected);
+    try state(rejected[0..memory_used],"53200");
+    try check(std.mem.indexOf(u8,rejected[0..memory_used],"FATAL")!=null);
 }
 
 pub fn main(init: std.process.Init) !void {

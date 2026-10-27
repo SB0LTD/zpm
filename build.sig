@@ -158,6 +158,21 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("page_region", "src/platform/page_region.sig"),
         });
     }
+    _ = try ctx.addModule("resource_observation", "src/core/resource_observation.sig");
+    const machine_resources=try ctx.addModule("machine_resources", "src/platform/machine_resources.sig");
+    try wire(ctx,machine_resources,"resource_observation","src/core/resource_observation.sig");
+    try wire(ctx,machine_resources,"resource_budget","src/core/resource_budget.sig");
+    const budgeted_region=try ctx.addModule("budgeted_region","src/platform/budgeted_region.sig");
+    try wire(ctx,budgeted_region,"page_region","src/platform/page_region.sig");
+    try wire(ctx,budgeted_region,"resource_budget","src/core/resource_budget.sig");
+    const test_machine=try ctx.addStep("test-machine-resources","Execute native resource observation and constrained-scope contracts",&noopStep);
+    try ctx.addDependency(test_all,test_machine);
+    _=try addContract(ctx,test_machine,"contract-machine-resources","tests/test_machine_resources.sig",&.{
+        importEntry("resource_observation","src/core/resource_observation.sig"),importEntry("resource_budget","src/core/resource_budget.sig"),
+        importEntry("machine_resources","src/platform/machine_resources.sig")});
+    _=try addContract(ctx,test_machine,"contract-budgeted-region","tests/test_budgeted_region.sig",&.{
+        importEntry("resource_budget","src/core/resource_budget.sig"),importEntry("page_region","src/platform/page_region.sig"),
+        importEntry("budgeted_region","src/platform/budgeted_region.sig")});
     _ = try ctx.addModule("math", "src/core/math.sig");
     _ = try ctx.addModule("sig_math", "src/core/sig_math.sig");
     const synth_voice = try ctx.addModule("synth_voice", "src/core/synth_voice.sig");
