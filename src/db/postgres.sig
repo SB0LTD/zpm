@@ -281,6 +281,53 @@ pub fn Session(comptime DB: type) type {
             return responseCapacityFor(self.result.rows.len);
         }
 
+        pub const DetachedCandidate=union(enum) {metadata,describe:[]const u8,execute:[]const u8};
+        /// A scheduling proposal, never authorization to execute arbitrary SQL
+        /// under a read lock. The caller must bind execute/describe sources in
+        /// an independent read-only context and reject unsupported plans first.
+        /// Session ownership, database immutability, private Describe support,
+        /// idle autocommit state and output capacity remain caller obligations.
+        pub fn detachedCandidate(self:*Self,input:[]const u8) ?DetachedCandidate {
+            if(!self.startup or self.failed or self.copy.mode!=.none or self.active_portal!=null or self.oversize_remaining!=0 or
+                (self.authentication!=null and self.authentication.?.state!=.complete)) return null;
+            return self.detachedFrame(input) catch null;
+        }
+        fn detachedFrame(self:*Self,input:[]const u8) !?DetachedCandidate {
+            if(input.len<5) return null;
+            const size=read32(input[1..5]);
+            if(size<4 or size>max_packet or @as(usize,size)+1>input.len) return null;
+            var r:Reader=.{.bytes=input[5..@as(usize,size)+1]};
+            switch(input[0]) {
+                'Q'=>{const source=try r.string();try r.done();return .{.execute=source};},
+                // These mutate only per-session protocol state. Parse's type
+                // inference calls Describe, which must use the private context.
+                'P'=>return if(@hasDecl(DB,"describe")) .metadata else null,
+                'B','C'=>return .metadata,
+                'H','S'=>{try r.done();return .metadata;},
+                'D'=>{
+                    const kind=try r.byte();const name=try r.string();try r.done();
+                    if(kind=='P') return .{.describe=(try self.portal(name)).source()};
+                    if(kind=='S') {
+                        const statement_value=try self.statement(name);
+                        // Parameterized statement Describe interpolates NULLs;
+                        // retain its serialized path instead of a SQL-sized
+                        // speculative buffer on every query's stack.
+                        if(statement_value.count!=0) return null;
+                        return .{.describe=statement_value.source()};
+                    }
+                    return null;
+                },
+                'E'=>{
+                    const name=try r.string();const limit=try r.u32be();try r.done();
+                    if(limit!=0) return null; // suspended portals retain their owner
+                    const portal_value=try self.portal(name);
+                    if(portal_value.complete) return .metadata;
+                    return .{.execute=portal_value.source()};
+                },
+                else=>return null,
+            }
+        }
+
         fn discardOversize(self: *Self, db: *DB, input: []const u8, output: []u8, prefix: usize) error{BufferTooSmall}!Reply {
             const consumed = @min(input.len, self.oversize_remaining);
             self.oversize_remaining -= consumed;

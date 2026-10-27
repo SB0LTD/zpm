@@ -115,6 +115,16 @@ pub fn main(init:std.process.Init) !void {
     var connection:Store.Connection=.{.store=&store,.id=7,.read_context=context};
     try connection.execute("SELECT COUNT(*) FROM points",result);
     try check(result.rows[0].cells[0].integer==128 and connection.valueSession()==&context.session);
+    const shared_nodes=db.workspace.nodes.len;
+    try connection.describe("SELECT id AS identity, amount FROM points",result);
+    try check(result.row_count==0 and result.column_count==2 and std.mem.eql(u8,result.column_names[0].slice(),"identity"));
+    try check(db.workspace.nodes.len==shared_nodes);
+    try connection.describe("SELECT 1/0 AS unevaluated",result);
+    try check(result.row_count==0 and result.column_count==1);
+    try rejected(error.DivisionByZero,connection.execute("SELECT 1/0 AS unevaluated",result));
+    try connection.describe("WITH p AS(SELECT id,amount FROM points) SELECT id,amount FROM p",result);
+    try check(result.row_count==0 and result.column_count==2);
+    try rejected(error.UnsupportedStatement,connection.describe("DELETE FROM points",result));
     connection.in_transaction=true;
     try rejected(error.InvalidParameterValue,connection.execute("SELECT COUNT(*) FROM points",result));
     connection.in_transaction=false;connection.read_context=null;
@@ -125,6 +135,7 @@ pub fn main(init:std.process.Init) !void {
     try rejected(error.QueryCanceled,context.prepare(db,"SELECT COUNT(*) FROM points",snapshot));
     connection.read_context=context;
     try rejected(error.QueryCanceled,connection.execute("SELECT COUNT(*) FROM points",result));
+    try rejected(error.QueryCanceled,connection.describe("SELECT COUNT(*) FROM points",result));
     connection.read_context=null;
     context.session.control=null;
     const slot=try db.begin();

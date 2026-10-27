@@ -890,7 +890,47 @@ fn oversizedFrames() !void {
     try check(std.mem.indexOf(u8,rejected[0..memory_used],"FATAL")!=null);
 }
 
+fn detachedCandidates() !void {
+    var local:Store=.{};var connection:Store.Connection=.{.store=&local,.id=1};defer connection.disconnect();
+    var session:StoreSession=.{};
+    var message=Packet.init('Q');message.string("SELECT 1");
+    try check(session.detachedCandidate(message.slice())==null);
+    _=try storeStartup(&session,&connection,"");
+    const candidate=session.detachedCandidate(message.slice()) orelse return error.MissingReadCandidate;
+    try check(candidate==.execute and equal(candidate.execute,"SELECT 1"));
+    const full=message.slice();
+    for(0..full.len) |length| try check(session.detachedCandidate(full[0..length])==null);
+    var parse_message=Packet.init('P');parse_message.string("lookup");parse_message.string("SELECT $1::int");parse_message.number16(1);parse_message.number32(23);
+    try check(session.detachedCandidate(parse_message.slice()).?==.metadata);
+    _=try storeSend(&session,&connection,&parse_message);
+    var bind_message=Packet.init('B');bind_message.string("bound");bind_message.string("lookup");bind_message.number16(0);bind_message.number16(1);bind_message.number32(1);bind_message.append("7");bind_message.number16(0);
+    try check(session.detachedCandidate(bind_message.slice()).?==.metadata);
+    _=try storeSend(&session,&connection,&bind_message);
+    var description=Packet.init('D');description.byte('P');description.string("bound");
+    const described=session.detachedCandidate(description.slice()).?;
+    try check(described==.describe and equal(described.describe,"SELECT 7::int"));
+    description=Packet.init('D');description.byte('S');description.string("lookup");
+    try check(session.detachedCandidate(description.slice())==null);
+    var execution=Packet.init('E');execution.string("bound");execution.number32(0);
+    const executed=session.detachedCandidate(execution.slice()).?;
+    try check(executed==.execute and equal(executed.execute,"SELECT 7::int"));
+    execution.bytes[execution.len-1]=1;
+    try check(session.detachedCandidate(execution.slice())==null);
+    var synchronization=Packet.init('S');
+    try check(session.detachedCandidate(synchronization.slice()).?==.metadata);
+    session.failed=true;try check(session.detachedCandidate(synchronization.slice())==null);session.failed=false;
+    session.active_portal=0;try check(session.detachedCandidate(message.slice())==null);session.active_portal=null;
+    session.oversize_remaining=5;try check(session.detachedCandidate(message.slice())==null);session.oversize_remaining=0;
+    var transaction=Packet.init('Q');transaction.string("BEGIN");
+    // SQL text alone is never classified as a safe read: the caller must bind
+    // this candidate and reject its non-query plan before taking the fast route.
+    try check(session.detachedCandidate(transaction.slice()).?==.execute);
+    var bad=Packet.init('D');bad.byte('P');bad.append("unterminated");
+    try check(session.detachedCandidate(bad.slice())==null);
+}
+
 pub fn main(init: std.process.Init) !void {
+    try detachedCandidates();
     try oversizedFrames();
     try storeContracts();
     try returningOnce();

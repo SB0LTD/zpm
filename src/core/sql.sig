@@ -477,6 +477,31 @@ pub fn Database(comptime config: Config) type {
                         &self.session,&self.workspace.query,self.snapshot.epoch==0),
                 }
             }
+            /// Describe an already bound read without running expressions,
+            /// acquiring row locks or touching the database's shared workspace.
+            pub fn describeResult(self:*Context,result:*Result) Error!void {
+                const db=self.database orelse return error.InvalidParameterValue;
+                try self.validate(db,self.source,result);
+                if(self.preparation_error) |err| return err;
+                const plan=self.prepared orelse return error.InvalidParameterValue;
+                result.clear(0);result.command=.select;
+                switch(plan) {
+                    .simple=>|select| {
+                        result.column_count=select.count;
+                        @memcpy(result.column_names[0..select.count],select.names[0..select.count]);
+                        @memcpy(result.column_types[0..select.count],select.types[0..select.count]);
+                        @memcpy(result.column_typmods[0..select.count],select.typmods[0..select.count]);
+                    },
+                    .general=>|root| {
+                        const query=&self.workspace.plans.items[root];
+                        result.column_count=query.count;
+                        for(0..query.count) |i| {
+                            result.column_names[i]=query.names[i];result.column_types[i]=types.dataTypeOf(query.tys[i]);
+                            result.column_typmods[i]=query.typmods[i];
+                        }
+                    },
+                }
+            }
             fn readViewRows(pointer:*anyopaque,view:catalog_module.View,sink:*X.RowSink) Error!void {
                 const context:*Context=@ptrCast(@alignCast(pointer));
                 const db=context.database orelse return error.InvalidParameterValue;
