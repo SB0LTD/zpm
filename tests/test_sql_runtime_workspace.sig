@@ -53,8 +53,12 @@ pub fn main(init:std.process.Init) !void {
     try db.execute("SELECT COUNT(*),SUM(f.id) FROM facts f JOIN products p ON p.id=f.p JOIN shops s ON s.id=f.shop WHERE f.shop=3 OR f.shop=4",&result);
     try check(result.row_count==1 and result.rows[0].cells[0].integer==8 and result.rows[0].cells[1].integer==412);
     // An OR depending on a later source must never discard earlier tuples.
+    // Unique-key grouped joins now stream without the old intermediate bank.
+    try db.execute("SELECT COUNT(*) FROM facts f JOIN products p ON p.id=f.p JOIN shops s ON s.id=f.shop WHERE f.shop=3 OR s.id=2",&result);
+    try check(result.row_count==1 and result.rows[0].cells[0].integer==8);
+    // The non-aggregate path retains its bounded materialization contract.
     result.row_count=27;
-    if(db.execute("SELECT COUNT(*) FROM facts f JOIN products p ON p.id=f.p JOIN shops s ON s.id=f.shop WHERE f.shop=3 OR s.id=2",&result)) |_| return error.ExpectedCapacity
+    if(db.execute("SELECT f.id FROM facts f JOIN products p ON p.id=f.p JOIN shops s ON s.id=f.shop WHERE f.shop=3 OR s.id=2",&result)) |_| return error.ExpectedCapacity
         else |err| try check(err==error.WorkspaceCapacity);
     try check(result.row_count==27);
     try db.execute("DELETE FROM facts WHERE id>=2",&result);

@@ -485,7 +485,13 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn streamEligible(p: *const B.Plan) bool {
-                if (!p.grouped or p.source_count != 1 or p.sources[0].table == null) return false;
+                if (!p.grouped or p.source_count == 0 or p.sources[0].table == null) return false;
+                // Each later input contributes at most one visible row through
+                // its unique primary key. Other join shapes retain the general
+                // operator; no fanout-sized state is hidden in this path.
+                for(p.sources[1..p.source_count]) |source| {
+                    if(source.join!=.inner or source.table==null or source.probe==none) return false;
+                }
                 // DISTINCT requires separate per-aggregate distinct-value state.
                 for (p.aggs[0..p.agg_count]) |agg| if (agg.distinct) return false;
                 // Keep the existing lazy evaluation contract for finite LIMITs.
@@ -544,6 +550,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// No computed/filter/distinct input is skipped. The caller proves
             /// this transaction has no writes; CSN protects pinned snapshots.
             fn summaryEligible(self: *const Query, p: *const B.Plan, table: *const S.Table) bool {
+                if(p.source_count!=1) return false;
                 if (!self.committed_only or !table.summary.valid or table.summary.csn > self.snap.csn or p.where != none) return false;
                 for (p.aggs[0..p.agg_count]) |agg| {
                     if (agg.distinct or agg.filter != none) return false;
@@ -939,6 +946,35 @@ pub fn Exec(comptime config: types.Config) type {
 
             /// Consume visible base-table versions directly. State grows with
             /// groups, not scanned rows. All output remains private until the
+            /// Scan one fact row and resolve unique-key inner dimensions using
+            /// borrowed version cells. Scratch depends on group cardinality,
+            /// not on fact cardinality or left-deep intermediate tuple counts.
+            fn nextStreamTuple(self:*Query,p:*const B.Plan,ctx:*E.Context,slot:*usize,early:bool) Error!bool {
+                const table=&self.tables[p.sources[0].table.?];
+                scan: while(slot.*<table.row_high) {
+                    try self.session.checkpoint();
+                    const current=slot.*;slot.*+=1;
+                    const version=S.visibleAt(table,current,self.snap) orelse continue;
+                    self.work.stream_stats.rows+=1;
+                    ctx.row=null;ctx.tuple[0]=&table.versions[version].cells;
+                    if(p.source_count>1 and early and !try self.earlyKeep(ctx,p.where,0)) continue;
+                    for(p.sources[1..p.source_count],1..) |*source,stage| {
+                        try self.session.checkpoint();
+                        const key=try E.eval(ctx,source.probe);
+                        if(key==.null_value) continue :scan;
+                        const dimension=&self.tables[source.table.?];
+                        const found=S.lookupKeyAt(dimension,&key,self.snap) orelse continue :scan;
+                        const visible=S.visibleAt(dimension,found,self.snap) orelse continue :scan;
+                        ctx.tuple[stage]=&dimension.versions[visible].cells;
+                        if(source.on!=none and (try E.truth(ctx,source.on))!=true) continue :scan;
+                        if(stage+1<p.source_count and early and !try self.earlyKeep(ctx,p.where,stage)) continue :scan;
+                    }
+                    if(try keep(ctx,p.where,null)) return true;
+                }
+                return false;
+            }
+
+            /// Aggregate states and projections remain private until the
             /// ordinary query publication step succeeds.
             fn streamGroup(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
                 const table = &self.tables[p.sources[0].table.?];
@@ -954,10 +990,11 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
                 if (comptime S.compact_enabled) {
-                    if (p.key_count != 0 or !self.summaryEligible(p, table)) {
+                    if (p.source_count==1 and (p.key_count != 0 or !self.summaryEligible(p, table))) {
                         if (try self.compactGroup(p, outer, table)) |rows| return rows;
                     }
                 }
+                const early=p.source_count>1 and self.earlyAvailable(p.where,p.source_count-1);
                 if (p.key_count == 0) {
                     var states: [config.columns]Accumulator = undefined;
                     for (states[0..p.agg_count]) |*state| state.* = .{};
@@ -965,12 +1002,9 @@ pub fn Exec(comptime config: types.Config) type {
                         try self.summaryStates(p, &table.summary.columns, table.summary.rows, states[0..p.agg_count]);
                         self.work.stream_stats.summary_rows += @intCast(table.summary.rows);
                         self.work.stream_stats.summary_plans += 1;
-                    } else for (0..table.row_high) |slot| {
-                        try self.session.checkpoint();
-                        const version = S.visibleAt(table, slot, self.snap) orelse continue;
-                        self.work.stream_stats.rows += 1;
-                        ctx.tuple[0] = &table.versions[version].cells;
-                        if (try keep(&ctx, p.where, null)) try self.addAggregates(p, &ctx, states[0..p.agg_count]);
+                    } else {
+                        var slot:usize=0;
+                        while(try self.nextStreamTuple(p,&ctx,&slot,early)) try self.addAggregates(p,&ctx,states[0..p.agg_count]);
                     }
                     const at = try self.cells(p.agg_count);
                     try self.projectGroup(p, at, states[0..p.agg_count], outer, &out);
@@ -988,18 +1022,14 @@ pub fn Exec(comptime config: types.Config) type {
                 const capacity = @min(cell_budget / (record_cells + p.width), ref_budget / 8);
                 var slots: usize = 2;
                 while (slots < capacity * 2) slots *= 2;
-                if (self.denseDomain(p, table, slots)) |domain| return self.denseGroup(p, outer, table, domain, capacity, record_cells);
+                if(p.source_count==1) if (self.denseDomain(p, table, slots)) |domain| return self.denseGroup(p, outer, table, domain, capacity, record_cells);
                 var buckets: u32 = undefined;
                 var tickets: u32 = undefined;
                 var groups: usize = 0;
                 var computed_keys: [config.columns]V.Cell = undefined;
                 var keys: [config.columns]*const V.Cell = undefined;
-                for (0..table.row_high) |slot| {
-                    try self.session.checkpoint();
-                    const version = S.visibleAt(table, slot, self.snap) orelse continue;
-                    self.work.stream_stats.rows += 1;
-                    ctx.tuple[0] = &table.versions[version].cells;
-                    if (!try keep(&ctx, p.where, null)) continue;
+                var slot:usize=0;
+                while(try self.nextStreamTuple(p,&ctx,&slot,early)) {
                     if (groups == 0) {
                         if (capacity == 0) return error.WorkspaceCapacity;
                         buckets = try self.refs(slots);
