@@ -56,6 +56,7 @@ pub fn Exec(comptime config: types.Config) type {
             compact_plans: usize = 0,
             compact_rows: usize = 0,
             gathered_rows: usize = 0,
+            distinct_bitmap_bytes: usize = 0,
             groups: usize = 0,
             probes: usize = 0,
             scratch_cells: usize = 0,
@@ -495,8 +496,10 @@ pub fn Exec(comptime config: types.Config) type {
                 for(p.sources[1..p.source_count]) |source| {
                     if(source.join!=.inner or source.table==null or source.probe==none) return false;
                 }
-                // DISTINCT requires separate per-aggregate distinct-value state.
-                for (p.aggs[0..p.agg_count]) |agg| if (agg.distinct) return false;
+                // Integral COUNT(DISTINCT) may use exact caller-backed bitmap
+                // states. Other types/aggregates keep the general operator.
+                for (p.aggs[0..p.agg_count]) |agg| if (agg.distinct and
+                    (agg.kind!=.count or !value_module.integral(agg.arg_ty))) return false;
                 // Keep the existing lazy evaluation contract for finite LIMITs.
                 if (p.limit != 0xffffffffffffffff and p.order_count == 0 and p.distinct == .none) {
                     if (p.key_count != 0 or (p.limit == 0 and p.offset == 0)) return false;
@@ -523,6 +526,62 @@ pub fn Exec(comptime config: types.Config) type {
                         const input = try self.streamInput(ctx, agg.arg, &temporary);
                         if (input.* != .null_value) try self.accumulate(agg, acc, input);
                     }
+                }
+            }
+
+            const DistinctDomain=struct {base:i64=0,span:usize=0,offset:usize=0,words:usize=0};
+            const DistinctLayout=struct {
+                domains:[config.columns]DistinctDomain=@splat(.{}),words:usize=0,cells:usize=0,active:bool=false,
+            };
+            fn distinctLayout(self:*const Query,p:*const B.Plan) ?DistinctLayout {
+                var layout:DistinctLayout=.{};
+                const available=self.work.cell_high-self.work.cell_low;
+                for(p.aggs[0..p.agg_count],0..) |agg,i| {
+                    if(!agg.distinct) continue;
+                    layout.active=true;
+                    const node=&self.pool.nodes[agg.arg];
+                    if(agg.kind!=.count or node.kind!=.column or node.level!=0 or node.relation>=p.source_count or
+                        !value_module.integral(node.ty)) return null;
+                    const source=p.sources[node.relation].table orelse return null;
+                    const table=&self.tables[source];
+                    const bounds=table.integer_bounds[node.column];
+                    // Bounds include every inserted version, including aborted
+                    // and pending writes, and are never narrowed by reclamation.
+                    // They safely enclose old snapshots and own-write values.
+                    const span:u128=if(bounds.known) @intCast(@as(i128,bounds.high)-bounds.low+1) else 0;
+                    const words=(span+63)/64;
+                    const total=@as(u128,layout.words)+words;
+                    if(span>@as(u128,~@as(usize,0)) or total*8>@as(u128,available)*@sizeOf(V.Cell)) return null;
+                    layout.domains[i]=.{.base=bounds.low,.span=@intCast(span),.offset=layout.words,.words=@intCast(words)};
+                    layout.words=@intCast(total);
+                }
+                layout.cells=@intCast((@as(u128,layout.words)*8+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell));
+                return layout;
+            }
+            fn distinctWords(self:*Query,at:u32,words:usize) []align(@alignOf(V.Cell)) u64 {
+                if(words==0) return &.{};
+                const data:[*]align(@alignOf(V.Cell)) u64=@ptrCast(&self.work.cells[at]);
+                return data[0..words];
+            }
+            fn addDistinctAggregates(self:*Query,p:*const B.Plan,ctx:*E.Context,states:[]Accumulator,
+                layout:*const DistinctLayout,seen:[]align(@alignOf(V.Cell)) u64) Error!void {
+                for(p.aggs[0..p.agg_count],states,0..) |*agg,*acc,i| {
+                    if(agg.filter!=none and (try E.truth(ctx,agg.filter))!=true) continue;
+                    if(agg.kind==.count_star) {acc.count+=1;continue;}
+                    var temporary:V.Cell=undefined;
+                    const input=try self.streamInput(ctx,agg.arg,&temporary);
+                    if(input.*==.null_value) continue;
+                    if(agg.distinct) {
+                        try self.session.checkpoint();
+                        const domain=layout.domains[i];
+                        const relative=@as(i128,input.integer)-domain.base;
+                        if(relative<0 or relative>=domain.span) return error.WorkspaceCapacity;
+                        const bit:usize=@intCast(relative);const mask=@as(u64,1)<<@as(u6,@intCast(bit%64));
+                        const word=&seen[domain.offset+bit/64];
+                        if(word.*&mask!=0) continue;
+                        word.*|=mask;
+                    }
+                    try self.accumulate(agg,acc,input);
                 }
             }
 
@@ -1028,6 +1087,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// ordinary query publication step succeeds.
             fn streamGroup(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
                 const table = &self.tables[p.sources[0].table.?];
+                const distinct=self.distinctLayout(p) orelse return error.WorkspaceCapacity;
                 var ctx = self.context(outer);
                 var out: List = .{};
                 if (comptime config.summary_groups != 0) {
@@ -1050,22 +1110,33 @@ pub fn Exec(comptime config: types.Config) type {
                 if (p.key_count == 0) {
                     var states: [config.columns]Accumulator = undefined;
                     for (states[0..p.agg_count]) |*state| state.* = .{};
+                    var bitmap_at:u32=0;
+                    if(distinct.active) {
+                        bitmap_at=try self.cells(distinct.cells);
+                        @memset(self.distinctWords(bitmap_at,distinct.words),0);
+                        self.work.stream_stats.distinct_bitmap_bytes+=distinct.words*8;
+                    }
                     if (self.summaryEligible(p, table)) {
                         try self.summaryStates(p, &table.summary.columns, table.summary.rows, states[0..p.agg_count]);
                         self.work.stream_stats.summary_rows += @intCast(table.summary.rows);
                         self.work.stream_stats.summary_plans += 1;
                     } else {
-                        while(try self.nextStreamTuple(p,&ctx,&cursor,early)) try self.addAggregates(p,&ctx,states[0..p.agg_count]);
+                        while(try self.nextStreamTuple(p,&ctx,&cursor,early)) {
+                            if(distinct.active) try self.addDistinctAggregates(p,&ctx,states[0..p.agg_count],&distinct,self.distinctWords(bitmap_at,distinct.words))
+                            else try self.addAggregates(p,&ctx,states[0..p.agg_count]);
+                        }
                     }
                     const at = try self.cells(p.agg_count);
                     try self.projectGroup(p, at, states[0..p.agg_count], outer, &out);
                     self.work.stream_stats.groups += 1;
-                    self.work.stream_stats.scratch_cells = @max(self.work.stream_stats.scratch_cells, p.agg_count);
+                    self.work.stream_stats.scratch_cells = @max(self.work.stream_stats.scratch_cells, p.agg_count+distinct.cells);
                     return self.finish(p, out);
                 }
 
                 const state_cells = accumulatorCells(p.agg_count);
-                const record_cells = p.key_count + p.agg_count + state_cells;
+                const ordinary_cells=p.key_count+p.agg_count+state_cells;
+                if(distinct.cells>self.work.cell_high-self.work.cell_low or ordinary_cells>self.work.cell_high-self.work.cell_low-distinct.cells) return error.WorkspaceCapacity;
+                const record_cells = ordinary_cells+distinct.cells;
                 // Leave room for projection as well as group state. Ref budget
                 // covers rounded buckets, tickets, group sorting and final sort.
                 const cell_budget = self.work.cell_high - self.work.cell_low;
@@ -1073,7 +1144,7 @@ pub fn Exec(comptime config: types.Config) type {
                 const capacity = @min(cell_budget / (record_cells + p.width), ref_budget / 8);
                 var slots: usize = 2;
                 while (slots < capacity * 2) slots *= 2;
-                if(p.source_count==1) if (self.denseDomain(p, table, slots)) |domain| return self.denseGroup(p, outer, table, domain, capacity, record_cells);
+                if(!distinct.active and p.source_count==1) if (self.denseDomain(p, table, slots)) |domain| return self.denseGroup(p, outer, table, domain, capacity, record_cells);
                 var buckets: u32 = undefined;
                 var tickets: u32 = undefined;
                 var groups: usize = 0;
@@ -1104,6 +1175,10 @@ pub fn Exec(comptime config: types.Config) type {
                             at = try self.cells(record_cells);
                             for (keys[0..p.key_count], 0..) |key, column| self.work.cells[at + column] = key.*;
                             for (self.accumulators(at + @as(u32, @intCast(p.key_count + p.agg_count)), p.agg_count)) |*state| state.* = .{};
+                            if(distinct.active) {
+                                @memset(self.distinctWords(at+@as(u32,@intCast(ordinary_cells)),distinct.words),0);
+                                self.work.stream_stats.distinct_bitmap_bytes+=distinct.words*8;
+                            }
                             self.work.refs[tickets + groups] = at;
                             self.work.refs[buckets + bucket] = at;
                             groups += 1;
@@ -1116,7 +1191,9 @@ pub fn Exec(comptime config: types.Config) type {
                         if (equal) { at = found; break; }
                         bucket = (bucket + 1) & (slots - 1);
                     }
-                    try self.addAggregates(p, &ctx, self.accumulators(at + @as(u32, @intCast(p.key_count + p.agg_count)), p.agg_count));
+                    const states=self.accumulators(at+@as(u32,@intCast(p.key_count+p.agg_count)),p.agg_count);
+                    if(distinct.active) try self.addDistinctAggregates(p,&ctx,states,&distinct,self.distinctWords(at+@as(u32,@intCast(ordinary_cells)),distinct.words))
+                    else try self.addAggregates(p,&ctx,states);
                 }
                 if (groups == 0) return self.finish(p, out);
                 // Preserve the previous key-sorted group order, including NULLs;

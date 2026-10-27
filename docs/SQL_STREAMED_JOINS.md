@@ -29,7 +29,7 @@ and failed residual ON conditions exclude the tuple. Every probe uses the same
 snapshot as the fact scan, including an owning transaction's pending versions.
 
 The route requires grouped output, a physical base table, and a primary-key
-probe for every later inner source. DISTINCT aggregates, outer joins, non-key
+probe for every later inner source. Non-count/non-integral DISTINCT aggregates, outer joins, non-key
 joins and expressions with functions/subqueries retain the existing general
 path. Existing finite-LIMIT eligibility and repeatability checks remain in
 force. Whole-table summaries, compact scalar/group scans and dense domains are
