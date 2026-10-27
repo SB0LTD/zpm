@@ -128,6 +128,11 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("tcp_server", "src/platform/tcp_server.sig");
     _ = try ctx.addModule("page_region", "src/platform/page_region.sig");
     _ = try ctx.addModule("worker_thread", "src/platform/worker_thread.sig");
+    _ = try ctx.addModule("resource_budget", "src/core/resource_budget.sig");
+    const test_resources = try ctx.addStep("test-resource-budget", "Execute machine-budget arithmetic and owned grant contracts", &noopStep);
+    try ctx.addDependency(test_all, test_resources);
+    _ = try addContract(ctx, test_resources, "contract-resource-budget", "tests/test_resource_budget.sig", &.{
+        importEntry("resource_budget", "src/core/resource_budget.sig"), importEntry("worker_thread", "src/platform/worker_thread.sig") });
     const test_workers = try ctx.addStep("test-workers", "Execute native joined worker and synchronization contracts", &noopStep);
     try ctx.addDependency(test_all, test_workers);
     _ = try addContract(ctx, test_workers, "contract-worker-thread", "tests/test_worker_thread.sig", &.{importEntry("worker_thread", "src/platform/worker_thread.sig")});
