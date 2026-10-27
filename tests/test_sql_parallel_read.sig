@@ -30,6 +30,7 @@ fn insideExecution(raw:?*anyopaque) DB.SqlError!void {
     _=arrivals.fetchOr(@as(u32,1)<<index,.acq_rel);
     while(arrivals.load(.acquire)!=255) std.atomic.spinLoopHint();
 }
+fn canceled(_: ?*anyopaque) DB.SqlError!void {return error.QueryCanceled;}
 fn check(ok:bool) !void {assertions+=1;if(!ok) return error.ParallelReadContract;}
 fn rejected(comptime expected:anyerror,actual:anytype) !void {
     if(actual) |_| return error.ExpectedFailure else |err| try check(err==expected);
@@ -111,6 +112,11 @@ pub fn main(init:std.process.Init) !void {
     try check(connection.detachedReadEligible());
     var limited:DB.ExecutionControl=.{};limited.reset(1);context.session.control=&limited;
     try rejected(error.QueryWorkLimit,context.execute(db,"SELECT SUM(amount+1) FROM points",snapshot,result));
+    var cancel:DB.ExecutionControl=.{.poll=canceled};context.session.control=&cancel;
+    try rejected(error.QueryCanceled,context.prepare(db,"SELECT COUNT(*) FROM points",snapshot));
+    connection.read_context=context;
+    try rejected(error.QueryCanceled,connection.execute("SELECT COUNT(*) FROM points",result));
+    connection.read_context=null;
     context.session.control=null;
     const slot=try db.begin();
     try db.statement(slot,"INSERT INTO points VALUES(200,0,42)",&main_result,.{});

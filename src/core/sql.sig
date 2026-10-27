@@ -442,10 +442,13 @@ pub fn Database(comptime config: Config) type {
                 try self.validate(db,source,null);
                 self.prepared=null;
                 self.preparation_error=null;self.database=db;self.source=source;self.snapshot=snapshot;
-                errdefer |err| self.preparation_error=err;
+                self.prepareBody(db,source,snapshot) catch |err| {self.preparation_error=err;return err;};
+            }
+            fn prepareBody(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot) Error!void {
                 self.session.sequences=null;
                 const parsed=try P.parse(source,&self.workspace.nodes,.standard);
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
+                try self.session.checkpoint();
                 for(self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |query| {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
                 }
@@ -465,7 +468,6 @@ pub fn Database(comptime config: Config) type {
                 if(self.preparation_error) |err| return err;
                 const plan=self.prepared orelse return error.InvalidParameterValue;
                 if(config.external_results and result.rows.len==0) return error.InvalidParameterValue;
-                try self.session.checkpoint();
                 self.workspace.query.views=.{.ptr=self,.rows=readViewRows};
                 self.workspace.query.read_stats=.{};
                 switch(plan) {
@@ -479,6 +481,19 @@ pub fn Database(comptime config: Config) type {
                 const context:*Context=@ptrCast(@alignCast(pointer));
                 const db=context.database orelse return error.InvalidParameterValue;
                 return db.fillViewRows(&context.session,context.snapshot,&context.workspace.nodes,view,sink);
+            }
+            /// Conservative routing hint for callers with a mutable named-zone
+            /// cache. Typed temporal values use the immutable session zone;
+            /// dynamic zone names/text timestamp input may require a resolver.
+            pub fn needsZoneResolver(self:*const Context) bool {
+                for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| {
+                    if(node.kind==.at_zone) return true;
+                    if(node.kind==.cast and (node.ty==.timestamp or node.ty==.timestamptz)) {
+                        if(node.a==ast.none) return true;
+                        switch(self.workspace.nodes.nodes[node.a].ty){.unknown,.text,.name=>return true,else=>{}}
+                    }
+                }
+                return false;
             }
             pub fn execute(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,result:*Result) Error!void {
                 try self.validate(db,source,result);
