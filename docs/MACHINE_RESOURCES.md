@@ -73,6 +73,15 @@ Native SB0 resource ABI probing is not implemented; unsupported targets return
 `UnsupportedPlatform`. None of these observations means RAMSQL has adopted
 elastic storage or parallel SQL automatically.
 
+`budgeted_region.Region` couples one unique OS mapping to the shared ledger.
+Initialize it at its final caller-owned address; live handles cannot be copied
+or moved. Reserve charges native page-rounded bytes, and a failed OS reservation
+returns the grant. Close releases the OS mapping before returning the grant;
+failed OS releases keep ownership/accounting intact. Pressure blocks new grants
+without revoking live mappings. `page_region.tryClose` reports release failures;
+the legacy infallible `close` stops on such a failure rather than forgetting a
+live mapping. The wrapper is page ownership, not a table allocator or GC.
+
 ## Executable qualification
 
 `sig build test-machine-resources test-resource-budget -Doptimize=ReleaseSafe`
