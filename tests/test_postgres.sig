@@ -929,7 +929,37 @@ fn detachedCandidates() !void {
     try check(session.detachedCandidate(bad.slice())==null);
 }
 
+fn initializedProtocolPrefixes() !void {
+    var db:DB=.{};var session:Session=.{};try startup(&session,&db);
+    for(&session.statements) |*statement| @memset(&statement.sql,0xa5);
+    for(&session.portals) |*portal_value| {@memset(&portal_value.sql,0x5a);@memset(&portal_value.formats,0xffff);}
+    try tags(try parse(&session,&db,"p","SELECT $1::int AS answer",&.{23}),"1");
+    for(0..32) |i| {
+        var number:[24]u8=undefined;const value=try std.fmt.bufPrint(&number,"{d}",.{i});
+        const format:u16=@intCast(i%2);
+        try tags(try bind(&session,&db,"","p",&.{value},0,format),"2");
+        try check(!session.portals[0].complete and session.portals[0].row==0 and session.portals[0].affected==0);
+        try tags(try execute(&session,&db,"",0),"DC");
+        try check(session.result.row_count==1 and session.result.rows[0].cells[0].integer==i);
+    }
+    // Replacing a long unnamed statement with a short one cannot expose tails.
+    try tags(try parse(&session,&db,"","SELECT 10                                 AS answer",&.{}),"1");
+    try tags(try bind(&session,&db,"","",&.{},0,1),"2");
+    try tags(try execute(&session,&db,"",0),"DC");
+    try tags(try parse(&session,&db,"","SELECT 2",&.{}),"1");
+    try tags(try bind(&session,&db,"","",&.{},0,0),"2");
+    try tags(try execute(&session,&db,"",0),"DC");
+    try check(session.result.rows[0].cells[0].integer==2);
+    const length=session.portals[0].len;var saved:[128]u8=undefined;
+    @memcpy(saved[0..length],session.portals[0].sql[0..length]);
+    var invalid=Packet.init('B');invalid.string("");invalid.string("p");invalid.number16(1);invalid.number16(2);
+    try state(try send(&session,&db,&invalid),"08P01");
+    try check(session.portals[0].len==length and equal(session.portals[0].sql[0..length],saved[0..length]));
+    try sync(&session,&db);
+}
+
 pub fn main(init: std.process.Init) !void {
+    try initializedProtocolPrefixes();
     try detachedCandidates();
     try oversizedFrames();
     try storeContracts();

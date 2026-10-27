@@ -884,7 +884,7 @@ pub fn Exec(comptime config: types.Config) type {
                     const count=@min(@as(usize,64),table.scan_high-start);
                     // Reserve/check every input step before reading this bounded
                     // block. A work/cancel failure still leaves results private.
-                    if (self.session.control != null) for (0..count) |_| try self.session.checkpoint();
+                    try self.session.checkpoints(count);
                     var mask:u64=if(count==64) ~@as(u64,0) else (@as(u64,1)<<@intCast(count))-1;
                     if (!dense) {
                         mask=0;for(0..count) |i| mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
@@ -1887,14 +1887,14 @@ pub fn Exec(comptime config: types.Config) type {
             while(start<table.scan_high):(start+=64) {
                 const count=@min(@as(usize,64),table.scan_high-start);
                 // Charge dead slots too, exactly as the canonical scan does.
-                if(ctx.session.control!=null) for(0..count) |_| try ctx.session.checkpoint();
+                try ctx.session.checkpoints(count);
                 var mask:u64=0;
                 for(0..count) |i| mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
                 stats.projected_filter_rows+=@popCount(mask);
                 for(predicates[0..used]) |predicate| {
                     // Comparisons borrow their column and evaluate one literal;
                     // subsequent AND terms run only for preceding TRUE rows.
-                    if(ctx.session.control!=null) for(0..@popCount(mask)) |_| try ctx.session.checkpoint();
+                    try ctx.session.checkpoints(@popCount(mask));
                     mask &= switch(predicate.op) {
                         .eq=>Query.comparisonMask(.eq,table,start,count,predicate),
                         .ne=>Query.comparisonMask(.ne,table,start,count,predicate),
