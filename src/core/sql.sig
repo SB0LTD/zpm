@@ -2,8 +2,9 @@
 //!
 //! Database and result storage belong entirely to the caller. Identifiers and
 //! text cells are copied inline; neither statements nor results borrow database
-//! storage. Callers serialize access (one call at a time); concurrency comes
-//! from interleaving transactions, never from threads.
+//! storage. Callers serialize the default database methods. Independent
+//! ReadContext instances may execute on threads while the caller holds shared
+//! immutable ownership and excludes all database/schema mutations.
 //!
 //! Supported: CREATE/DROP TABLE (DEFAULT, GENERATED {ALWAYS|BY DEFAULT} AS
 //! IDENTITY, GENERATED ALWAYS AS (expr) STORED); CREATE/DROP SEQUENCE and
@@ -360,6 +361,144 @@ pub fn Database(comptime config: Config) type {
             nodes: A.Pool = .{},
             plans: B.Plans = .{},
             query: X.Work = .{},
+        };
+        /// Independent parser/binder/executor state over shared immutable table
+        /// storage. The caller excludes ALL database/schema mutations until the
+        /// call returns (or between prepare/run), and owns every scratch/result
+        /// buffer. No row/database snapshots are copied into this context.
+        pub const ReadContext = struct {
+            const Context=@This();
+            const Plan=union(enum){simple:B.Select,general:u16};
+            workspace:Workspace=.{},
+            session:value_module.Session=.{},
+            dialect:Dialect=.postgres,
+            prepared:?Plan=null,
+            preparation_error:?Error=null,
+            database:?*const Self=null,
+            source:[]const u8=&.{},
+            snapshot:Snapshot=.{.csn=0},
+
+            pub fn backingBytes(rows:usize) Error!usize {
+                return Context.backingBytesFor(rows,try Self.queryReferenceCount(rows));
+            }
+            pub fn backingBytesFor(rows:usize,refs:usize) Error!usize {
+                const cells=try Self.queryWorkspaceBytes(rows);
+                if(refs==0 or refs>0x7fffffff) return error.InvalidParameterValue;
+                const reference_bytes=@mulWithOverflow(refs,@sizeOf(u32));
+                const total=@addWithOverflow(cells,reference_bytes[0]);
+                if(reference_bytes[1]!=0 or total[1]!=0) return error.InvalidParameterValue;
+                return total[0];
+            }
+            pub fn bindMemory(self:*Context,bytes:[]u8,rows:usize) Error!void {
+                return self.bindMemoryFor(bytes,rows,try Self.queryReferenceCount(rows));
+            }
+            pub fn bindMemoryFor(self:*Context,bytes:[]u8,rows:usize,reference_count:usize) Error!void {
+                if(comptime !config.external_workspace or !config.external_storage) @compileError("ReadContext.bindMemory requires external workspace/storage");
+                const required=try Context.backingBytesFor(rows,reference_count);
+                if(bytes.len<required) return error.WorkspaceCapacity;
+                const own=try objectSpan(self);
+                if(overlaps(own,try span(bytes))) return error.InvalidParameterValue;
+                const cells=try Self.storageView(Cell,bytes,0,rows*2*config.columns);
+                const refs=try Self.storageView(u32,bytes,try Self.queryWorkspaceBytes(rows),reference_count);
+                self.workspace.query.cells=cells;self.workspace.query.refs=refs;
+                self.workspace.query.cell_high=cells.len;self.workspace.query.ref_high=refs.len;
+                self.prepared=null;
+            }
+            fn objectSpan(pointer:anytype) Error!StorageSpan {
+                const first=@intFromPtr(pointer);const last=@addWithOverflow(first,@sizeOf(@TypeOf(pointer.*)));
+                if(last[1]!=0) return error.InvalidParameterValue;
+                return .{.start=first,.end=last[0]};
+            }
+            fn span(values:anytype) Error!StorageSpan {
+                const bytes=@mulWithOverflow(values.len,@sizeOf(@TypeOf(values[0])));
+                const last=@addWithOverflow(@intFromPtr(values.ptr),bytes[0]);
+                if(bytes[1]!=0 or last[1]!=0) return error.InvalidParameterValue;
+                return .{.start=@intFromPtr(values.ptr),.end=last[0]};
+            }
+            fn overlaps(a:StorageSpan,b:StorageSpan) bool {
+                return a.start<a.end and b.start<b.end and a.start<b.end and b.start<a.end;
+            }
+            fn validate(self:*Context,db:*const Self,source:[]const u8,result:?*Result) Error!void {
+                const cells=self.workspace.query.cells[0..];const refs=self.workspace.query.refs[0..];
+                if(cells.len<2*config.columns or refs.len==0) return error.WorkspaceCapacity;
+                const empty:StorageSpan=.{.start=0,.end=0};
+                const mutable=[_]StorageSpan{try objectSpan(self),
+                    if(config.external_workspace) try span(cells) else empty,
+                    if(config.external_storage) try span(refs) else empty,
+                    if(result) |out| try objectSpan(out) else empty,
+                    if(config.external_results and result!=null) try span(result.?.rows) else empty};
+                const db_span=try objectSpan(db);const source_span=try span(source);
+                for(mutable,0..) |part,index| {
+                    if(overlaps(part,db_span) or overlaps(part,source_span)) return error.InvalidParameterValue;
+                    for(mutable[0..index]) |earlier| if(overlaps(part,earlier)) return error.InvalidParameterValue;
+                    for(&db.tables) |*table| inline for(.{"rows","versions","row_index","key_index","scan_values","scan_nonnull","scan_live"}) |name| {
+                        if(overlaps(part,try span(@field(table,name)[0..]))) return error.InvalidParameterValue;
+                    };
+                }
+            }
+            /// Callbacks in session (clock/zone resolver/control) must themselves
+            /// be safe for concurrent reads. Sequence hooks are always disabled.
+            pub fn prepare(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot) Error!void {
+                try self.validate(db,source,null);
+                self.prepared=null;
+                self.preparation_error=null;self.database=db;self.source=source;self.snapshot=snapshot;
+                self.prepareBody(db,source,snapshot) catch |err| {self.preparation_error=err;return err;};
+            }
+            fn prepareBody(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot) Error!void {
+                self.session.sequences=null;
+                const parsed=try P.parse(source,&self.workspace.nodes,.standard);
+                switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
+                try self.session.checkpoint();
+                for(self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |query| {
+                    if(query.lock.strength!=.none) return error.UnsupportedStatement;
+                }
+                const context:B.Context=.{.source=source,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
+                    .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans};
+                const bound=try B.bind(&context,&parsed);
+                for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
+                    .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
+                    else=>{},
+                };
+                self.prepared=switch(bound){.select=>|select| .{.simple=select},.query=>|root| .{.general=root},else=>return error.UnsupportedStatement};
+                self.database=db;self.source=source;self.snapshot=snapshot;
+            }
+            pub fn run(self:*Context,result:*Result) Error!void {
+                const db=self.database orelse return error.InvalidParameterValue;
+                try self.validate(db,self.source,result);
+                if(self.preparation_error) |err| return err;
+                const plan=self.prepared orelse return error.InvalidParameterValue;
+                if(config.external_results and result.rows.len==0) return error.InvalidParameterValue;
+                self.workspace.query.views=.{.ptr=self,.rows=readViewRows};
+                self.workspace.query.read_stats=.{};
+                switch(plan) {
+                    .simple=>|*select| try X.select(&db.tables,self.source,&self.workspace.nodes,select,self.snapshot,result,X.NoLock{},
+                        &self.session,self.snapshot.epoch==0,&self.workspace.query.read_stats,&self.workspace.query),
+                    .general=>|root| try X.runQuery(&db.tables,self.source,&self.workspace.nodes,&self.workspace.plans,root,self.snapshot,result,
+                        &self.session,&self.workspace.query,self.snapshot.epoch==0),
+                }
+            }
+            fn readViewRows(pointer:*anyopaque,view:catalog_module.View,sink:*X.RowSink) Error!void {
+                const context:*Context=@ptrCast(@alignCast(pointer));
+                const db=context.database orelse return error.InvalidParameterValue;
+                return db.fillViewRows(&context.session,context.snapshot,&context.workspace.nodes,view,sink);
+            }
+            /// Conservative routing hint for callers with a mutable named-zone
+            /// cache. Typed temporal values use the immutable session zone;
+            /// dynamic zone names/text timestamp input may require a resolver.
+            pub fn needsZoneResolver(self:*const Context) bool {
+                for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| {
+                    if(node.kind==.at_zone) return true;
+                    if(node.kind==.cast and (node.ty==.timestamp or node.ty==.timestamptz)) {
+                        if(node.a==ast.none) return true;
+                        switch(self.workspace.nodes.nodes[node.a].ty){.unknown,.text,.name=>return true,else=>{}}
+                    }
+                }
+                return false;
+            }
+            pub fn execute(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,result:*Result) Error!void {
+                try self.validate(db,source,result);
+                try self.prepare(db,source,snapshot);try self.run(result);
+            }
         };
         /// Query workspace capacity: rows (each up to 2 x columns cells).
         pub const work_rows = X.work_rows;
@@ -1386,8 +1525,7 @@ pub fn Database(comptime config: Config) type {
 
         /// Canonical text of a column's DEFAULT / generation expression,
         /// re-parsed from its stored source into scratch pool nodes.
-        fn expressionText(self: *Self, column: *const V.Column) V.Cell {
-            const pool = &self.workspace.nodes;
+        fn expressionTextWithPool(pool:*A.Pool,column:*const V.Column) V.Cell {
             const saved = pool.len;
             defer pool.len = saved;
             var text: V.Text = .{};
@@ -1420,9 +1558,12 @@ pub fn Database(comptime config: Config) type {
 
         fn viewRows(ptr: *anyopaque, view: catalog_module.View, sink: *X.RowSink) Error!void {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            const database = self.session.database;
+            return self.fillViewRows(&self.session,self.seq_snap,&self.workspace.nodes,view,sink);
+        }
+        fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
+            const database = session_values.database;
             var relations: [K.relation_rows]K.Found = undefined;
-            const count = self.catalog.visibleRelations(self.seq_snap, &relations);
+            const count = self.catalog.visibleRelations(snapshot, &relations);
             const public: i64 = catalog_module.public_namespace;
             switch (view) {
                 .pg_type => inline for (@typeInfo(DataType).@"enum".field_names) |field| {
@@ -1480,16 +1621,16 @@ pub fn Database(comptime config: Config) type {
                             switch (view) {
                                 .pg_attribute => try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(types.typeOid(column.data_type)), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), nameCell(identity), nameCell(if (kind == .generated) "s" else ""), boolCell(has_expression) }),
                                 .pg_attrdef => if (has_expression) {
-                                    try sink.add(&.{ intCell(oid), intCell(attnum), self.expressionText(column) });
+                                    try sink.add(&.{ intCell(oid), intCell(attnum), expressionTextWithPool(pool,column) });
                                 },
                                 .columns => {
                                     const numeric = numericPrecision(column);
                                     try sink.add(&.{
                                         nameCell(database),                                       nameCell("public"),                          nameCell(name),            nameCell(column.name.slice()),
-                                        intCell(attnum),                                          if (kind == .default) self.expressionText(column) else .null_value, nameCell(if (column.not_null) "NO" else "YES"), nameCell(types.sqlTypeName(column.data_type)),
+                                        intCell(attnum),                                          if (kind == .default) expressionTextWithPool(pool,column) else .null_value, nameCell(if (column.not_null) "NO" else "YES"), nameCell(types.sqlTypeName(column.data_type)),
                                         .null_value,                                              optionalInt(numeric[0]),                     optionalInt(numeric[1]),   optionalInt(numeric[2]),
                                         optionalInt(datetimePrecision(column)),                   nameCell(if (identity.len != 0) "YES" else "NO"), if (identity.len == 0) .null_value else nameCell(if (kind == .identity_always) "ALWAYS" else "BY DEFAULT"), nameCell(if (kind == .generated) "ALWAYS" else "NEVER"),
-                                        if (kind == .generated) self.expressionText(column) else .null_value,
+                                        if (kind == .generated) expressionTextWithPool(pool,column) else .null_value,
                                     });
                                 },
                                 else => unreachable,

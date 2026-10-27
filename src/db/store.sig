@@ -1,7 +1,8 @@
 //! Caller-owned, allocator-free SQL store over the READ COMMITTED engine.
 //!
-//! Callers serialize method calls (the network reactor already does this);
-//! concurrency comes from interleaved transactions in one shared Raw
+//! Callers serialize default method calls; opt-in detached read contexts use
+//! caller-held shared immutable ownership for the complete codec call.
+//! Transaction concurrency comes from interleaved transactions in one shared Raw
 //! (sql.Database). Every statement takes a new snapshot; there are no
 //! per-connection database copies. A statement that meets a lock held by a
 //! live transaction returns error.WouldBlock and is parked: the connection
@@ -429,6 +430,11 @@ pub fn Store(comptime Raw: type) type {
             /// Transaction slot (explicit block or a parked implicit statement).
             tx: ?u16 = null,
             in_transaction: bool = false,
+            /// Opt-in immutable autocommit SELECT route. The caller owns the
+            /// context and excludes ALL storage mutations for the entire codec
+            /// call, including result formatting. Never set for transaction,
+            /// prepared-portal, COPY or session-control execution.
+            read_context: if(@hasDecl(Raw,"ReadContext")) ?*Raw.ReadContext else ?*void = null,
             /// Effective settings, the session value SET (non-LOCAL) writes,
             /// the values at transaction start and the startup values.
             settings: Settings = .{},
@@ -503,7 +509,19 @@ pub fn Store(comptime Raw: type) type {
 
             /// Session values (zone, clocks) for output formatting.
             pub fn valueSession(self: *Connection) *const Raw.SessionValues {
+                if(comptime @hasDecl(Raw,"ReadContext")) if(self.read_context) |context| return &context.session;
                 return &self.db().session;
+            }
+            pub fn detachedReadEligible(self:*const Connection) bool {
+                return self.id!=0 and !self.failed and self.autocommit and !self.in_transaction and self.tx==null and
+                    !self.pending.active and !self.running_statement and self.read_context==null;
+            }
+            /// No global Raw.session installation or mutable zone lookup hook.
+            /// A caller using named-zone operations must provide a read-safe
+            /// resolver or keep those operations on the serialized path.
+            pub fn detachedReadSession(self:*const Connection,execution_control:*ExecutionControl,statement_us:?i64) Raw.SessionValues {
+                return .{.zone=self.settings.zone,.transaction_us=statement_us,.statement_us=statement_us,
+                    .clock=self.store.wall_clock,.database=if(self.database_len==0) "postgres" else self.database_name[0..self.database_len],.control=execution_control};
             }
 
             /// Number of established savepoints (portal bookkeeping).
@@ -1228,6 +1246,11 @@ pub fn Store(comptime Raw: type) type {
             pub fn execute(self: *Connection, source: []const u8, result: *Result) !void {
                 if (self.id == 0) return error.InvalidConnection;
                 if (source.len == 0 or source.len > max_statement_bytes) return error.Syntax;
+                if(comptime @hasDecl(Raw,"ReadContext")) if(self.read_context) |context| {
+                    if(self.failed or self.in_transaction or self.tx!=null or !self.autocommit or self.pending.active or
+                        context.database==null or context.database.?!=&self.store.database or !same(source,context.source)) return error.InvalidParameterValue;
+                    return context.run(result);
+                };
                 if (self.pending.active) return self.resumeStatement(source, result);
                 // Bounded MySQL/TDS session commands. Long SQL still goes
                 // intact to the strict parser without a second SQL-sized copy.

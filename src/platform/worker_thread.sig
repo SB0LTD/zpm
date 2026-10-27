@@ -12,6 +12,9 @@ const Win = struct {
     extern "ntdll" fn RtlAcquireSRWLockExclusive(*usize) callconv(.winapi) void;
     extern "ntdll" fn RtlTryAcquireSRWLockExclusive(*usize) callconv(.winapi) u8;
     extern "ntdll" fn RtlReleaseSRWLockExclusive(*usize) callconv(.winapi) void;
+    extern "ntdll" fn RtlAcquireSRWLockShared(*usize) callconv(.winapi) void;
+    extern "ntdll" fn RtlTryAcquireSRWLockShared(*usize) callconv(.winapi) u8;
+    extern "ntdll" fn RtlReleaseSRWLockShared(*usize) callconv(.winapi) void;
     extern "ntdll" fn RtlWaitOnAddress(*const anyopaque, *const anyopaque, usize, *const i64) callconv(.winapi) i32;
     extern "ntdll" fn RtlWakeAddressAll(*const anyopaque) callconv(.winapi) void;
 };
@@ -102,5 +105,59 @@ pub const Mutex = struct {
     pub fn unlock(self: *Mutex) void {
         if (builtin.os.tag == .windows) { Win.RtlReleaseSRWLockExclusive(&self.native); return; }
         if (self.native.swap(0, .release) == 2) wakeAll(&self.native);
+    }
+};
+
+/// Caller-owned reader/writer gate. Linux writer intent prevents a stream of
+/// new readers from indefinitely bypassing a queued writer. Windows uses SRW.
+/// No recursive acquisition, upgrades, movable live state or heap allocation.
+pub const RwLock=struct {
+    native:usize=0,
+    state:std.atomic.Value(u32)=.init(0),
+    writers:std.atomic.Value(u32)=.init(0),
+    signal:Signal=.{},
+    const exclusive:u32=0x80000000;
+    pub fn tryLockRead(self:*RwLock) bool {
+        if(builtin.os.tag==.windows) return Win.RtlTryAcquireSRWLockShared(&self.native)!=0;
+        if(self.writers.load(.acquire)!=0) return false;
+        const current=self.state.load(.monotonic);
+        if(current>=exclusive-1) return false;
+        return self.state.cmpxchgStrong(current,current+1,.acquire,.monotonic)==null;
+    }
+    pub fn lockRead(self:*RwLock) void {
+        if(builtin.os.tag==.windows) {Win.RtlAcquireSRWLockShared(&self.native);return;}
+        while(true) {
+            const epoch=self.signal.epoch.load(.acquire);
+            if(self.tryLockRead()) return;
+            if(self.writers.load(.acquire)==0 and self.state.load(.acquire)<exclusive-1) continue;
+            self.signal.wait(epoch,100);
+        }
+    }
+    pub fn unlockRead(self:*RwLock) void {
+        if(builtin.os.tag==.windows) {Win.RtlReleaseSRWLockShared(&self.native);return;}
+        const previous=self.state.fetchSub(1,.release);
+        if(previous==0 or previous>=exclusive) @panic("invalid shared lock ownership");
+        if(previous==1) self.signal.notify();
+    }
+    pub fn tryLockWrite(self:*RwLock) bool {
+        if(builtin.os.tag==.windows) return Win.RtlTryAcquireSRWLockExclusive(&self.native)!=0;
+        if(self.writers.load(.acquire)!=0) return false;
+        return self.state.cmpxchgStrong(0,exclusive,.acquire,.monotonic)==null;
+    }
+    pub fn lockWrite(self:*RwLock) void {
+        if(builtin.os.tag==.windows) {Win.RtlAcquireSRWLockExclusive(&self.native);return;}
+        if(self.writers.fetchAdd(1,.acq_rel)==std.math.maxInt(u32)) @panic("writer count overflow");
+        while(true) {
+            const epoch=self.signal.epoch.load(.acquire);
+            if(self.state.cmpxchgStrong(0,exclusive,.acquire,.monotonic)==null) {
+                _=self.writers.fetchSub(1,.release);return;
+            }
+            self.signal.wait(epoch,100);
+        }
+    }
+    pub fn unlockWrite(self:*RwLock) void {
+        if(builtin.os.tag==.windows) {Win.RtlReleaseSRWLockExclusive(&self.native);return;}
+        if(self.state.swap(0,.release)!=exclusive) @panic("invalid exclusive lock ownership");
+        self.signal.notify();
     }
 };
