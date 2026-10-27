@@ -59,10 +59,14 @@ this adapter does not claim complete observation of those configurations.
 
 Read active logical/physical CPU counts, physical memory and page size through
 native sysctl. Read Mach host/task counters, releasing the acquired host port
-after each sample. Available physical memory is conservatively free plus
-purgeable pages; speculative pages are already included in free pages. It is
-reported as `free_and_purgeable`, not Linux `MemAvailable` equivalence. Inactive
-anonymous pages and swap are not counted as readily available RAM.
+after each sample. Available physical memory includes free pages and an estimate
+of reclaimable file cache/purgeable pages. Speculative pages are already included
+in free pages and are excluded from the additional cache estimate; the process's
+own external footprint is excluded there too. Cache and purgeable counters are
+not blindly summed. It is reported as `free_and_file_cache`, not Linux
+`MemAvailable` equivalence. Inactive anonymous pages and swap are not counted as
+readily available RAM. The estimate derives from native Mach counters, not a
+hardcoded fraction of total RAM.
 
 Apply a nonzero `os_proc_available_memory` app allowance. Zero is ambiguous
 (not an app, or exhausted), so it is not advertised as a discovered process

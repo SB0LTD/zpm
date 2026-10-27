@@ -52,6 +52,11 @@ fn buffers() resources.Buffers {
     return .{.file=&scratch[0],.mounts=&scratch[1],.member=&scratch[2],.root=&scratch[3],.mount=&scratch[4],.path=&scratch[5]};
 }
 fn parsers() !void {
+    try check(try facts.macAvailableBytes(10,3,100,2,4096,4096)==107*4096);
+    try check(try facts.macAvailableBytes(10,3,0,2,4096,0)==13*4096);
+    try check(try facts.macAvailableBytes(10,3,100,200,4096,0)==13*4096);
+    try rejected(error.InvalidObservation,facts.macAvailableBytes(1,1,1,0,0,0));
+    try rejected(error.ArithmeticOverflow,facts.macAvailableBytes(std.math.maxInt(u64),0,0,0,4096,0));
     try check(try facts.cpuCount("0-127,256-383\n")==256);
     try check(try facts.cpuCount("0-1000000")==1000001);
     for([_] []const u8{"","-1","0-","2-1","0,0","0-2,1-3","1,,3","4294967296","1-2-3"}) |bad| try rejected(error.InvalidObservation,facts.cpuCount(bad));
