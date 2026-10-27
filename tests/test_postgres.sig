@@ -862,7 +862,33 @@ fn storeContracts() !void {
     try check(usage.row_locks == 0 and usage.pending_versions == 0);
 }
 
+var oversized_session: Session = .{};
+var oversized_db: DB = .{};
+fn oversizedFrames() !void {
+    try startup(&oversized_session, &oversized_db);
+    var header:[5]u8=.{ 'Q',0,0,0,0 };
+    put32(header[1..],80004);
+    const beginning=try oversized_session.handle(&oversized_db,&header,&output);
+    try check(beginning.consumed==5 and beginning.written==0 and !beginning.close);
+    var remaining:usize=80000;
+    var chunk:[8192]u8=@splat('x');
+    while(remaining!=0) {
+        const amount=@min(remaining,chunk.len);
+        const reply=try oversized_session.handle(&oversized_db,chunk[0..amount],&output);
+        try check(reply.consumed==amount and !reply.close);
+        remaining-=amount;
+        if(remaining==0) try state(output[0..reply.written],"54000") else try check(reply.written==0);
+    }
+    _=try query(&oversized_session,&oversized_db,"SELECT 1");
+    try check(oversized_session.result.row_count==1 and oversized_session.result.rows[0].cells[0].integer==1);
+    var rejected:[256]u8=undefined;
+    const used=try pg.connectionLimitError(&rejected);
+    try state(rejected[0..used],"53300");
+    try check(std.mem.indexOf(u8,rejected[0..used],"FATAL")!=null);
+}
+
 pub fn main(init: std.process.Init) !void {
+    try oversizedFrames();
     try storeContracts();
     try returningOnce();
     try normal();

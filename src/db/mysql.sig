@@ -171,7 +171,20 @@ pub fn Session(comptime DB: type) type {
         /// Provision before processing requests so successful mutations cannot
         /// subsequently fail while encoding their response.
         pub fn responseCapacity() usize {
+            if (@hasDecl(DB.Result, "storageBytesFor")) return responseCapacityFor(DB.Result.default_row_capacity) catch unreachable;
             return @sizeOf(DB.Result) * 2 + 4096;
+        }
+
+        pub fn responseCapacityFor(row_capacity: usize) Error!usize {
+            const bytes = if (@hasDecl(DB.Result, "storageBytesFor")) DB.Result.storageBytesFor(row_capacity) catch return error.BufferTooSmall else @sizeOf(DB.Result);
+            const multiplied = @mulWithOverflow(bytes, 2);
+            const total = @addWithOverflow(multiplied[0], 4096);
+            if (multiplied[1] != 0 or total[1] != 0) return error.BufferTooSmall;
+            return total[0];
+        }
+
+        pub fn requiredCapacity(self: *const Self) Error!usize {
+            return responseCapacityFor(self.result.rows.len);
         }
 
         pub fn begin(self: *Self, out: []u8) Error!usize {
@@ -345,7 +358,7 @@ pub fn Session(comptime DB: type) type {
             if (length > max_request_bytes - 4) return error.RequestTooLarge;
             if (length > input.len - 4) return .{};
             if (input[3] != (if (self.authenticated) @as(u8, 0) else @as(u8, 1))) return error.InvalidSequence;
-            if (out.len < responseCapacity()) return error.BufferTooSmall;
+            if (out.len < try self.requiredCapacity()) return error.BufferTooSmall;
             var writer: Writer = .{ .output = out, .sequence = if (self.authenticated) 1 else 2 };
             const payload = input[4..][0..length];
             var reply: Reply = .{ .consumed = length + 4 };
