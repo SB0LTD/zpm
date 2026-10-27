@@ -247,6 +247,24 @@ pub const ExecutionControl = struct {
         }
         self.until_poll -= 1;
     }
+
+    /// Equivalent to count checkpoint calls, including exact work-limit and
+    /// callback positions. Jump only over the interval with no observable poll.
+    pub fn advance(self:*ExecutionControl,count:usize) Error!void {
+        var remaining=count;
+        while(remaining!=0) {
+            if(self.until_poll==0) {
+                try self.checkpoint();remaining-=1;continue;
+            }
+            var steps=@min(remaining,@as(usize,self.until_poll));
+            if(self.max_work!=0) {
+                if(self.used>=self.max_work) return error.QueryWorkLimit;
+                steps=@intCast(@min(@as(u64,@intCast(steps)),self.max_work-self.used));
+            }
+            self.used+|=@intCast(steps);
+            self.until_poll-=@intCast(steps);remaining-=steps;
+        }
+    }
 };
 
 /// Session dialect. It changes only assignment coercion (MySQL/TDS BIT

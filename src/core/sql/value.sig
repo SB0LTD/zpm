@@ -36,6 +36,9 @@ pub const Session = struct {
     pub fn checkpoint(self: *const Session) Error!void {
         if (self.control) |control| try control.checkpoint();
     }
+    pub fn checkpoints(self:*const Session,count:usize) Error!void {
+        if(self.control) |control| try control.advance(count);
+    }
 };
 
 pub const SequenceCall = enum { nextval, currval, setval, lastval, identity, regclass };

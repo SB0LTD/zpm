@@ -1110,7 +1110,8 @@ pub fn Session(comptime DB: type) type {
             const name = try r.string();
             const source = try r.string();
             if (source.len > sql_capacity) return error.StatementCapacity;
-            var next: Statement = .{};
+            var next: Statement = undefined;
+            next.name=.{};next.oids=@splat(0);
             try next.name.set(name);
             next.len = source.len;
             @memcpy(next.sql[0..source.len], source);
@@ -1131,8 +1132,10 @@ pub fn Session(comptime DB: type) type {
                 if (!s.live and slot == null) slot = s;
             }
             const s = slot orelse return error.StatementCapacity;
-            next.live = true;
-            s.* = next;
+            // SQL tails are never part of a live statement. Publish only the
+            // initialized source and bounded metadata, not sql_capacity bytes.
+            s.name=next.name;s.len=next.len;s.count=next.count;s.oids=next.oids;
+            @memcpy(s.sql[0..next.len],next.sql[0..next.len]);s.live=true;
             try w.empty('1');
         }
         fn infer(self: *Self, db: *DB, s: *Statement) !void {
@@ -1262,7 +1265,8 @@ pub fn Session(comptime DB: type) type {
                 }
                 values[i] = l.bytes[begin..l.at];
             }
-            var next: Portal = .{};
+            var next: Portal = undefined;
+            next.name=.{};next.level=0;
             try next.name.set(name);
             next.format_count = try r.u16be();
             if (next.format_count > next.formats.len) return error.ColumnCapacity;
@@ -1288,8 +1292,13 @@ pub fn Session(comptime DB: type) type {
             if (self.active_portal) |active| {
                 if (p == &self.portals[active]) return error.PortalBusy;
             }
-            next.live = true;
-            p.* = next;
+            // Validate completely before replacing even the unnamed portal.
+            // The prior SQL/format tails may contain old bytes; every accessor
+            // is bounded by len/format_count and cannot observe those tails.
+            p.name=next.name;p.len=next.len;p.format_count=next.format_count;p.level=next.level;
+            @memcpy(p.sql[0..next.len],next.sql[0..next.len]);
+            @memcpy(p.formats[0..next.format_count],next.formats[0..next.format_count]);
+            p.row=0;p.complete=false;p.result_rows=0;p.affected=0;p.rolled_back=false;p.command="";p.live=true;
             try w.empty('2');
         }
         fn description(self: *Self, w: *Writer, portal_value: ?*const Portal) !void {
