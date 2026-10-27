@@ -131,6 +131,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("tds", "src/db/tds.sig");
     _ = try ctx.addModule("tcp_server", "src/platform/tcp_server.sig");
     _ = try ctx.addModule("page_region", "src/platform/page_region.sig");
+    // Explicit opt-in: this fixture touches about 1.2 GB and checks 100M values
+    // twice. Do not silently add its resource cost to the ordinary test graph.
+    const test_packed_large = try ctx.addStep("test-packed-integer-100m", "Qualify 100M real packed values, with and without NULLs", &noopStep);
+    _ = try addContract(ctx, test_packed_large, "contract-packed-integer-100m", "tests/test_packed_integer_100m.sig", &.{importEntry("packed_integer", "src/core/packed_integer.sig"), importEntry("page_region", "src/platform/page_region.sig")});
     _ = try ctx.addModule("worker_thread", "src/platform/worker_thread.sig");
     _ = try ctx.addModule("resource_budget", "src/core/resource_budget.sig");
     const test_resources = try ctx.addStep("test-resource-budget", "Execute machine-budget arithmetic and owned grant contracts", &noopStep);

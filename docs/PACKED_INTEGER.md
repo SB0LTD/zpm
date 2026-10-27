@@ -61,6 +61,14 @@ every bit width, signed extrema, NULLs, random round trips, unaligned decoding,
 error atomicity, alias rejection, corruption and checked format arithmetic.
 It is included in the Windows/Linux/macOS database platform workflow.
 
+The separate opt-in `sig build test-packed-integer-100m -Doptimize=ReleaseSafe`
+reserves about 1.2 GB of OS-backed caller storage. It generates and checks every
+one of 100M actual signed values, first without NULLs, then with every seventeenth
+value NULL. Both cases encode, parse, verify the exact summary and decode every
+row, printing machine-readable results. The source, bitmap and output have
+separate owners and remain live throughout validation. This is physical-column
+qualification, not SQL, durability or comparative throughput evidence.
+
 This primitive does not implement SQL execution, MVCC, page publication,
 reclamation, WAL, snapshots or automatic machine-resource discovery. RAMSQL must
 integrate it behind storage accessors and preserve those contracts before a

@@ -1,0 +1,39 @@
+{
+  "scope": "physical_column_only",
+  "sql_integration": false,
+  "comparative_benchmark": false,
+  "durability_test": false,
+  "date": "2026-10-27",
+  "platform": "Windows-10-10.0.26300-SP0",
+  "build_mode": "ReleaseSafe",
+  "compiler": "sig-0.6.4-zig0.17.0.90a898d",
+  "sdk_revision": "0df3506cbf958a5dabbeb8a250a045085e49f0b6",
+  "caller_owned_os_region_bytes": 1162500080,
+  "sha256": {
+    "src/core/packed_integer.sig": "0bb67c560cd49dc53ebf09ce071efb959bfc4b1bc3615080f63bf146ddd01744",
+    "tests/test_packed_integer_100m.sig": "844236b327acac96e917b3bbf6f9a03716241f7de93b08e4df4b95b6591e01e4",
+    ".sig-cache/packed-100m-out/bin/contract-packed-integer-100m.exe": "47a143586ad1ad0476f4658d29e5b5bc0b8babdbe12e9e8acefe195b0582f3ef"
+  },
+  "cases": [
+    {
+      "scope": "physical_column_only",
+      "rows": 100000000,
+      "nullable": false,
+      "frame_bytes": 337500080,
+      "nonnull": 100000000,
+      "sum": -50000000,
+      "checked_values": 100000000,
+      "passed": true
+    },
+    {
+      "scope": "physical_column_only",
+      "rows": 100000000,
+      "nullable": true,
+      "frame_bytes": 350000080,
+      "nonnull": 94117647,
+      "sum": -2941176,
+      "checked_values": 100000000,
+      "passed": true
+    }
+  ]
+}
