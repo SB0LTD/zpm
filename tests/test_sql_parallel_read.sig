@@ -50,9 +50,18 @@ fn queries(index:usize) !void {
         try context.execute(db,try std.fmt.bufPrint(&text,"SELECT id FROM points WHERE cat={d} ORDER BY amount DESC,id LIMIT 3",.{category}),snapshot,result);
         if(result.row_count!=3) return error.ParallelReadContract;
         for(0..3) |row| if(result.rows[row].cells[0].integer!=category+(15-row)*8) return error.ParallelReadContract;
+        try context.execute(db,try std.fmt.bufPrint(&text,"SELECT id,amount FROM points WHERE cat={d} AND amount>0",.{category}),snapshot,result);
+        var expected_rows:usize=0;
+        for(0..128) |candidate| {
+            const amount=@as(i64,@intCast(candidate))*7-23;
+            if(candidate%8!=category or amount<=0) continue;
+            if(result.rows[expected_rows].cells[0].integer!=candidate or result.rows[expected_rows].cells[1].integer!=amount) return error.ParallelReadContract;
+            expected_rows+=1;
+        }
+        if(result.row_count!=expected_rows or context.workspace.query.read_stats.projected_filter_scans!=1) return error.ParallelReadContract;
         try context.execute(db,"SELECT COUNT(*) FROM points p WHERE p.id IN(SELECT q.id FROM products q)",snapshot,result);
         if(result.row_count!=1 or result.rows[0].cells[0].integer!=8) return error.ParallelReadContract;
-        _=completed.fetchAdd(5,.monotonic);
+        _=completed.fetchAdd(6,.monotonic);
     }
 }
 fn entry(raw:?*anyopaque) void {
@@ -62,7 +71,7 @@ fn entry(raw:?*anyopaque) void {
 pub fn main(init:std.process.Init) !void {
     try db.bindMemory(&backing,512,1024,8192);try db.bindWorkspace(&main_scratch);
     try main_result.bindMemory(&main_output,32);
-    try db.execute("CREATE TABLE points(id INT PRIMARY KEY,cat INT,amount INT)",&main_result);
+    try db.execute("CREATE TABLE points(id INT PRIMARY KEY,cat INT NOT NULL,amount INT NOT NULL)",&main_result);
     try db.execute("CREATE TABLE products(id INT PRIMARY KEY,unit INT)",&main_result);
     var text:[256]u8=undefined;
     for(0..128) |id| try db.execute(try std.fmt.bufPrint(&text,"INSERT INTO points VALUES({d},{d},{d})",.{id,id%8,@as(i64,@intCast(id))*7-23}),&main_result);
@@ -80,7 +89,7 @@ pub fn main(init:std.process.Init) !void {
         for(&threads,0..) |*thread,index| {try thread.start(entry,@ptrFromInt(index+1));started+=1;}
         for(&threads) |*thread| try thread.join();started=0;
     } else {arrivals.store(255,.release);for(0..8) |index| try queries(index);}
-    try check(!failed.load(.acquire) and completed.load(.acquire)==2000);
+    try check(!failed.load(.acquire) and completed.load(.acquire)==2400);
     try check(db.csn==original_csn and db.epoch==original_epoch and db.workspace.nodes.len==original_nodes);
     const context=&contexts[0];const result=&results[0];
     for([_] []const u8{"INSERT INTO points VALUES(200,0,1)","DELETE FROM points","SELECT id FROM points FOR UPDATE","SELECT nextval('unowned')"}) |statement| {
