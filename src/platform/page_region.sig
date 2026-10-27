@@ -10,7 +10,7 @@ const Darwin = struct {
     extern "c" fn mmap(?*anyopaque, usize, c_int, c_int, c_int, i64) ?*anyopaque;
     extern "c" fn munmap(*anyopaque, usize) c_int;
 };
-pub const Error = error{ InvalidCapacity, UnsupportedPlatform, MemoryReservationFailed };
+pub const Error = error{ InvalidCapacity, UnsupportedPlatform, MemoryReservationFailed, MemoryReleaseFailed };
 pub const Region = struct {
     bytes: []u8 = &.{},
 
@@ -21,18 +21,22 @@ pub const Region = struct {
         const typed: [*]T = @ptrCast(@alignCast(ptr));
         return typed[0..count];
     }
-    pub fn close(self: *Region) void {
+    pub fn tryClose(self: *Region) Error!void {
         if (self.bytes.len == 0) return;
         if (builtin.os.tag == .windows) {
-            _ = Win.VirtualFree(self.bytes.ptr, 0, 0x8000);
+            if(Win.VirtualFree(self.bytes.ptr, 0, 0x8000)==0) return error.MemoryReleaseFailed;
         } else if (builtin.os.tag == .linux) {
-            _ = std.os.linux.munmap(self.bytes.ptr, self.bytes.len);
+            if(std.os.linux.errno(std.os.linux.munmap(self.bytes.ptr, self.bytes.len))!=.SUCCESS) return error.MemoryReleaseFailed;
         } else if (builtin.os.tag == .macos) {
-            _ = Darwin.munmap(self.bytes.ptr, self.bytes.len);
-        }
+            if(Darwin.munmap(self.bytes.ptr, self.bytes.len)!=0) return error.MemoryReleaseFailed;
+        } else return error.UnsupportedPlatform;
         self.bytes = &.{};
     }
+    pub fn close(self:*Region) void { self.tryClose() catch @panic("cannot discard live OS page ownership"); }
 };
+
+/// Reads the native page size; this standard-library query does not allocate.
+pub fn pageSize() usize { return std.heap.pageSize(); }
 
 pub fn reserve(bytes: usize) Error!Region {
     if (bytes == 0) return error.InvalidCapacity;

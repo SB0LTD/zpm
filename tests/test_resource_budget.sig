@@ -36,6 +36,14 @@ fn plans() !void {
     m=base;
     const operator_cap=try budget.plan(m,.{.hard_process_bytes=2*GiB});
     try check(operator_cap.headroom_bytes==GiB/4 and operator_cap.process_bytes==2*GiB);
+    m=base;m.available_address_space=GiB;m.process_committed=GiB/4;
+    const virtual_cap=try budget.plan(m,.{});
+    try check(virtual_cap.process_bytes==GiB and virtual_cap.headroom_bytes==GiB/4);
+    m.available_address_space=0;
+    try check((try budget.plan(m,.{})).new_commit_bytes==0);
+    m.available_address_space=std.math.maxInt(u64);
+    try rejected(error.ArithmeticOverflow,budget.plan(m,.{}));
+    m=base;
     m.scope_limit=16*GiB;m.scope_used=12*GiB;
     m.scope_limit=0;
     const pressure=try budget.plan(m,.{});
