@@ -46,7 +46,7 @@ pub fn Exec(comptime config: types.Config) type {
 
         const Mark = struct { cells: usize, refs: usize };
 
-        /// Per-statement evidence for the single-source streaming path. Counts
+        /// Per-statement evidence for streaming read paths. Counts
         /// include nested eligible plans; scratch figures are per-plan peaks.
         pub const StreamStats = struct {
             rows: usize = 0,
@@ -55,6 +55,7 @@ pub fn Exec(comptime config: types.Config) type {
             dense_plans: usize = 0,
             compact_plans: usize = 0,
             compact_rows: usize = 0,
+            gathered_rows: usize = 0,
             groups: usize = 0,
             probes: usize = 0,
             scratch_cells: usize = 0,
@@ -501,14 +502,13 @@ pub fn Exec(comptime config: types.Config) type {
                 return true;
             }
 
-            /// A base-column input can be borrowed for this synchronous step;
+            /// A bound column input can be borrowed for this synchronous step;
             /// no whole tagged union copy is needed to read an integer or key.
             /// Computed/correlated expressions retain the ordinary evaluator.
             fn streamInput(self: *Query, ctx: *E.Context, id: u16, temporary: *V.Cell) Error!*const V.Cell {
                 const node = &self.pool.nodes[id];
-                if (node.kind == .column and node.level == 0 and node.relation == 0) return &ctx.tuple[0].?[node.column];
-                temporary.* = try E.eval(ctx, id);
-                return temporary;
+                if (node.kind == .column and node.level==0 and node.relation==0) return E.columnRef(ctx,node);
+                return E.evalRef(ctx,id,temporary);
             }
 
             fn addAggregates(self: *Query, p: *const B.Plan, ctx: *E.Context, states: []Accumulator) Error!void {
@@ -946,25 +946,73 @@ pub fn Exec(comptime config: types.Config) type {
 
             /// Consume visible base-table versions directly. State grows with
             /// groups, not scanned rows. All output remains private until the
+            const StreamCursor=struct {
+                next:usize=0,
+                high:usize=0,
+                columns:?u64=null,
+                row:if(S.compact_enabled) [config.columns]V.Cell else [0]V.Cell=undefined,
+            };
+
+            fn prepareStreamCursor(self:*const Query,p:*const B.Plan,cursor:*StreamCursor) void {
+                const table=&self.tables[p.sources[0].table.?];
+                cursor.high=table.row_high;
+                if(comptime S.compact_enabled) {
+                    // Exactly the committed projection guard used by compact
+                    // aggregates: old snapshots and own writes retain MVCC.
+                    if(!self.committed_only or !table.summary.valid or table.summary.csn>self.snap.csn) return;
+                    var columns:u64=0;
+                    for(self.pool.nodes[0..self.pool.len]) |node| {
+                        if(node.kind!=.column or node.level!=0 or node.relation!=0) continue;
+                        if(node.column>=table.column_count or !value_module.integral(node.ty)) return;
+                        switch(table.columns[node.column].data_type) {
+                            .smallint,.integer32,.integer,.oid=>{},
+                            else=>return,
+                        }
+                        columns|=@as(u64,1)<<@intCast(node.column);
+                    }
+                    cursor.columns=columns;cursor.high=table.scan_high;
+                }
+            }
+
+            fn streamFactRow(self:*Query,table:*const S.Table,cursor:*StreamCursor,slot:usize) ?[*]const V.Cell {
+                if(comptime S.compact_enabled) if(cursor.columns) |mask| {
+                    if(table.scan_live[slot]==0) return null;
+                    const nonnull=table.scan_nonnull[slot];
+                    var columns=mask;
+                    while(columns!=0) {
+                        const column=@ctz(columns);
+                        const bit=@as(u64,1)<<@intCast(column);
+                        if(nonnull&bit!=0) {
+                            cursor.row[column]=.{.integer=table.scan_values[@as(usize,column)*table.rows.len+slot]};
+                        } else cursor.row[column]=.null_value;
+                        columns&=columns-1;
+                    }
+                    self.work.stream_stats.gathered_rows+=1;
+                    return &cursor.row;
+                };
+                const version=S.visibleAt(table,slot,self.snap) orelse return null;
+                return &table.versions[version].cells;
+            }
+
             /// Scan one fact row and resolve unique-key inner dimensions using
             /// borrowed version cells. Scratch depends on group cardinality,
             /// not on fact cardinality or left-deep intermediate tuple counts.
-            fn nextStreamTuple(self:*Query,p:*const B.Plan,ctx:*E.Context,slot:*usize,early:bool) Error!bool {
+            fn nextStreamTuple(self:*Query,p:*const B.Plan,ctx:*E.Context,cursor:*StreamCursor,early:bool) Error!bool {
                 const table=&self.tables[p.sources[0].table.?];
-                scan: while(slot.*<table.row_high) {
+                scan: while(cursor.next<cursor.high) {
                     try self.session.checkpoint();
-                    const current=slot.*;slot.*+=1;
-                    const version=S.visibleAt(table,current,self.snap) orelse continue;
+                    const current=cursor.next;cursor.next+=1;
+                    const fact_cells=self.streamFactRow(table,cursor,current) orelse continue;
                     self.work.stream_stats.rows+=1;
-                    ctx.row=null;ctx.tuple[0]=&table.versions[version].cells;
+                    ctx.row=null;ctx.tuple[0]=fact_cells;
                     if(p.source_count>1 and early and !try self.earlyKeep(ctx,p.where,0)) continue;
                     for(p.sources[1..p.source_count],1..) |*source,stage| {
                         try self.session.checkpoint();
-                        const key=try E.eval(ctx,source.probe);
-                        if(key==.null_value) continue :scan;
+                        var key_value:V.Cell=undefined;
+                        const key=try E.evalRef(ctx,source.probe,&key_value);
+                        if(key.*==.null_value) continue :scan;
                         const dimension=&self.tables[source.table.?];
-                        const found=S.lookupKeyAt(dimension,&key,self.snap) orelse continue :scan;
-                        const visible=S.visibleAt(dimension,found,self.snap) orelse continue :scan;
+                        const visible=S.lookupVersionAt(dimension,key,self.snap) orelse continue :scan;
                         ctx.tuple[stage]=&dimension.versions[visible].cells;
                         if(source.on!=none and (try E.truth(ctx,source.on))!=true) continue :scan;
                         if(stage+1<p.source_count and early and !try self.earlyKeep(ctx,p.where,stage)) continue :scan;
@@ -995,6 +1043,8 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
                 const early=p.source_count>1 and self.earlyAvailable(p.where,p.source_count-1);
+                var cursor:StreamCursor=.{};
+                self.prepareStreamCursor(p,&cursor);
                 if (p.key_count == 0) {
                     var states: [config.columns]Accumulator = undefined;
                     for (states[0..p.agg_count]) |*state| state.* = .{};
@@ -1003,8 +1053,7 @@ pub fn Exec(comptime config: types.Config) type {
                         self.work.stream_stats.summary_rows += @intCast(table.summary.rows);
                         self.work.stream_stats.summary_plans += 1;
                     } else {
-                        var slot:usize=0;
-                        while(try self.nextStreamTuple(p,&ctx,&slot,early)) try self.addAggregates(p,&ctx,states[0..p.agg_count]);
+                        while(try self.nextStreamTuple(p,&ctx,&cursor,early)) try self.addAggregates(p,&ctx,states[0..p.agg_count]);
                     }
                     const at = try self.cells(p.agg_count);
                     try self.projectGroup(p, at, states[0..p.agg_count], outer, &out);
@@ -1028,8 +1077,7 @@ pub fn Exec(comptime config: types.Config) type {
                 var groups: usize = 0;
                 var computed_keys: [config.columns]V.Cell = undefined;
                 var keys: [config.columns]*const V.Cell = undefined;
-                var slot:usize=0;
-                while(try self.nextStreamTuple(p,&ctx,&slot,early)) {
+                while(try self.nextStreamTuple(p,&ctx,&cursor,early)) {
                     if (groups == 0) {
                         if (capacity == 0) return error.WorkspaceCapacity;
                         buckets = try self.refs(slots);

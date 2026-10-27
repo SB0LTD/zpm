@@ -386,6 +386,32 @@ fn atomicity() !void {
     try check(db.storageStats("w").?.live_rows == 400);
 }
 
+fn borrowedOperands() !void {
+    var db:DB=.{};var r:DB.Result=.{};
+    try db.execute("CREATE TABLE opvals(id INT PRIMARY KEY,a INT,b INT,n NUMERIC,f DOUBLE PRECISION)",&r);
+    try db.execute("INSERT INTO opvals VALUES(1,7,2,1.25,1.5),(2,NULL,3,NULL,NULL),(3,-7,2,-2.50,'-0')",&r);
+    try db.execute("SELECT id,a+b,a-b,a*b,a/b,a%b FROM opvals ORDER BY id",&r);
+    try check(r.row_count==3 and r.column_count==6);
+    const expected=[2][6]i64{.{1,9,5,14,3,1},.{3,-5,-9,-14,-3,-1}};
+    for(expected,0..) |row,index| for(row,0..) |value,column| {
+        try check(r.rows[index*2].cells[column]==.integer and r.rows[index*2].cells[column].integer==value);
+    };
+    for(1..6) |column| try check(r.rows[1].cells[column]==.null_value);
+    try db.execute("SELECT n+b=3.25,n*b=2.50,f+b=3.5,f*b=3.0 FROM opvals WHERE id=1",&r);
+    for(0..4) |column| try check(r.rows[0].cells[column]==.boolean and r.rows[0].cells[column].boolean);
+    try integer(&db,&r,"SELECT (a+3)*(b+4) FROM opvals WHERE id=3",-24);
+    try integer(&db,&r,"SELECT a+(SELECT SUM(b) FROM opvals) FROM opvals WHERE id=1",14);
+    try truth(&db,&r,"SELECT (n+1.5)*(n-0.5)=2.0625 FROM opvals WHERE id=1",true);
+    try db.execute("CREATE SEQUENCE operand_order",&r);
+    const missing=try cellOf(&db,&r,"SELECT a+nextval('operand_order') FROM opvals WHERE id=2");
+    try check(missing==.null_value);
+    try integer(&db,&r,"SELECT nextval('operand_order')",2);
+    try integer(&db,&r,"SELECT nextval('operand_order')*10+nextval('operand_order')",34);
+    try rejects(&db,&r,"SELECT a/0 FROM opvals WHERE id=1",error.DivisionByZero);
+    // NULL propagation must not change the existing right-operand evaluation.
+    try rejects(&db,&r,"SELECT a+(b/0) FROM opvals WHERE id=2",error.DivisionByZero);
+}
+
 pub fn main(init: std.process.Init) !void {
     try precedence();
     try truthTables();
@@ -395,6 +421,7 @@ pub fn main(init: std.process.Init) !void {
     try assignmentAndDialects();
     try keyChecks();
     try atomicity();
+    try borrowedOperands();
     var buffer: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-expr\",\"pass\":true,\"assertions\":{d},\"database_bytes\":{d},\"wide_bytes\":{d}}}\n", .{ assertions, DB.storageBytes(), Wide.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

@@ -129,6 +129,14 @@ pub fn main(init:std.process.Init) !void {
     if(context.execute(db,"SELECT nextval('read_sequence')",.{.csn=db.csn},result)) |_| return error.SequenceMutationAccepted else |_| {}
     try db.execute("SELECT nextval('read_sequence')",&main_result);
     try check(main_result.rows[0].cells[0].integer==1);
+    const before_insert=db.csn;
+    try context.execute(db,"SELECT SUM(amount*2) FROM points",.{.csn=before_insert},result);
+    try check(result.rows[0].cells[0].integer==107904 and context.workspace.query.stream_stats.gathered_rows==128);
+    try db.execute("INSERT INTO points VALUES(200,0,42)",&main_result);
+    try context.execute(db,"SELECT SUM(amount*2) FROM points",.{.csn=before_insert},result);
+    try check(result.rows[0].cells[0].integer==107904 and context.workspace.query.stream_stats.gathered_rows==0);
+    try context.execute(db,"SELECT SUM(amount*2) FROM points",.{.csn=db.csn},result);
+    try check(result.rows[0].cells[0].integer==107988 and context.workspace.query.stream_stats.gathered_rows==129);
     const message=try std.fmt.bufPrint(&text,"PASS isolated SQL read contexts: {d} assertions, {d} real queries, native_threads={s}; server integration not claimed\n",
         .{assertions,completed.load(.acquire),if(workers.available) "8" else "0"});
     try std.Io.File.stdout().writeStreamingAll(init.io,message);
