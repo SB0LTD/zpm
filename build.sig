@@ -144,6 +144,11 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_workers = try ctx.addStep("test-workers", "Execute native joined worker and synchronization contracts", &noopStep);
     try ctx.addDependency(test_all, test_workers);
     _ = try addContract(ctx, test_workers, "contract-worker-thread", "tests/test_worker_thread.sig", &.{importEntry("worker_thread", "src/platform/worker_thread.sig")});
+    _ = try addContract(ctx, test_workers, "contract-rwlock", "tests/test_rwlock.sig", &.{importEntry("worker_thread", "src/platform/worker_thread.sig")});
+    const test_parallel=try ctx.addStep("test-parallel-read","Execute independent SQL read contexts over shared storage",&noopStep);
+    try ctx.addDependency(test_all,test_parallel);
+    _=try addContract(ctx,test_parallel,"contract-parallel-read","tests/test_sql_parallel_read.sig",&.{
+        importEntry("sql","src/core/sql.sig"),importEntry("worker_thread","src/platform/worker_thread.sig"),importEntry("db_store","src/db/store.sig")});
     const test_db = try ctx.addStep("test-db", "Execute database wire, transaction and TCP contracts", &noopStep);
     try ctx.addDependency(test_all, test_db);
     _ = try ctx.addModule("wall_clock", "src/platform/wall_clock.sig");
