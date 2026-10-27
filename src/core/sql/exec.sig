@@ -501,12 +501,12 @@ pub fn Exec(comptime config: types.Config) type {
                 return true;
             }
 
-            /// A base-column input can be borrowed for this synchronous step;
+            /// A bound column input can be borrowed for this synchronous step;
             /// no whole tagged union copy is needed to read an integer or key.
             /// Computed/correlated expressions retain the ordinary evaluator.
             fn streamInput(self: *Query, ctx: *E.Context, id: u16, temporary: *V.Cell) Error!*const V.Cell {
                 const node = &self.pool.nodes[id];
-                if (node.kind == .column and node.level == 0 and node.relation == 0) return &ctx.tuple[0].?[node.column];
+                if (node.kind == .column) return E.columnRef(ctx,node);
                 temporary.* = try E.eval(ctx, id);
                 return temporary;
             }
@@ -960,11 +960,11 @@ pub fn Exec(comptime config: types.Config) type {
                     if(p.source_count>1 and early and !try self.earlyKeep(ctx,p.where,0)) continue;
                     for(p.sources[1..p.source_count],1..) |*source,stage| {
                         try self.session.checkpoint();
-                        const key=try E.eval(ctx,source.probe);
-                        if(key==.null_value) continue :scan;
+                        var key_value:V.Cell=undefined;
+                        const key=try self.streamInput(ctx,source.probe,&key_value);
+                        if(key.*==.null_value) continue :scan;
                         const dimension=&self.tables[source.table.?];
-                        const found=S.lookupKeyAt(dimension,&key,self.snap) orelse continue :scan;
-                        const visible=S.visibleAt(dimension,found,self.snap) orelse continue :scan;
+                        const visible=S.lookupVersionAt(dimension,key,self.snap) orelse continue :scan;
                         ctx.tuple[stage]=&dimension.versions[visible].cells;
                         if(source.on!=none and (try E.truth(ctx,source.on))!=true) continue :scan;
                         if(stage+1<p.source_count and early and !try self.earlyKeep(ctx,p.where,stage)) continue :scan;
