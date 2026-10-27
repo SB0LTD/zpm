@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main, master]
   workflow_dispatch:
+    inputs:
+      large_columns:
+        description: 'Also validate 100M actual packed values (about 1.2 GB memory)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -79,10 +84,39 @@ jobs:
 
       - name: Execute allocator-free SQL, wire, transaction and OS contracts
         run: |
-          $arguments = @('build', 'test-db', 'test-sql', 'test-workers', 'test-resource-budget', '-Doptimize=ReleaseSafe', '-j2', '--Sig-lib-dir', $env:SIG_LIB_DIR)
+          $arguments = @('build', 'test-db', 'test-sql', 'test-workers', 'test-resource-budget', 'test-packed-integer', '-Doptimize=ReleaseSafe', '-j2', '--Sig-lib-dir', $env:SIG_LIB_DIR)
           if ($env:RUNNER_OS -eq 'macOS') { $arguments += '-Dlink-libc=true' }
           & $env:SIG @arguments
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Execute Linux native worker and memory-grant concurrency contracts
+        if: runner.os == 'Linux'
+        run: |
+          & $env:SIG build test-workers test-resource-budget -Doptimize=ReleaseSafe -Dlink-libc=false -j2 --Sig-lib-dir $env:SIG_LIB_DIR *> linux-native-concurrency.log
+          $result = $LASTEXITCODE
+          Get-Content linux-native-concurrency.log
+          if ($result -ne 0) { exit $result }
+          if (-not (Select-String -LiteralPath linux-native-concurrency.log -SimpleMatch 'native concurrent grants=80000' -Quiet)) {
+            throw 'Linux native grant concurrency must execute, not skip'
+          }
+
+      - name: Qualify 100M physical column values
+        if: github.event_name == 'workflow_dispatch' && inputs.large_columns
+        run: |
+          $arguments = @('build', 'test-packed-integer-100m', '-Doptimize=ReleaseSafe', '-j2', '--Sig-lib-dir', $env:SIG_LIB_DIR)
+          if ($env:RUNNER_OS -eq 'macOS') { $arguments += '-Dlink-libc=true' }
+          & $env:SIG @arguments *> packed-integer-100m.log
+          $result = $LASTEXITCODE
+          Get-Content packed-integer-100m.log
+          exit $result
+
+      - name: Preserve large-column qualification log
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.large_columns
+        uses: actions/upload-artifact@v4
+        with:
+          name: packed-integer-100m-${{ matrix.os }}
+          path: packed-integer-100m.log
+          if-no-files-found: error
 
       - name: Validate official package catalog and layer contracts
         working-directory: cli
