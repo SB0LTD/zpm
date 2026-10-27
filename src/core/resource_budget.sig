@@ -49,7 +49,12 @@ pub fn plan(machine: Machine, policy: Policy) Error!Plan {
     if(policy.execution_percent>100 or policy.minimum_task_bytes==0 or
         (policy.max_workers!=null and policy.max_workers.?==0) or
         (policy.hard_process_bytes!=null and policy.hard_process_bytes.?==0)) return error.InvalidPolicy;
-    const headroom=policy.headroom_bytes orelse @max(256*1024*1024,machine.physical_total/16);
+    // A small container on a large host must not inherit host-sized headroom.
+    // Scope/operator limits constrain the capacity from which defaults derive.
+    var capacity=machine.physical_total;
+    if(machine.scope_limit) |limit| capacity=@min(capacity,limit);
+    if(policy.hard_process_bytes) |limit| capacity=@min(capacity,limit);
+    const headroom=policy.headroom_bytes orelse @min(capacity/4,@max(256*1024*1024,capacity/16));
     var budget=@min(machine.physical_total,try add(machine.process_resident,machine.available_physical -| headroom));
     if(machine.available_commit) |available| budget=@min(budget,try add(machine.process_committed,available -| headroom));
     if(machine.scope_limit) |limit| {

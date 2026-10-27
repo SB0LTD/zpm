@@ -22,7 +22,21 @@ fn plans() !void {
     try check((try budget.plan(m,.{.max_workers=1})).cpu_workers==1);
     m=base;m.scope_limit=16*GiB;m.scope_used=12*GiB;
     const scoped=try budget.plan(m,.{.fixed_bytes=GiB,.recovery_bytes=GiB});
-    try check(scoped.process_bytes==8*GiB and scoped.new_commit_bytes==0);
+    try check(scoped.headroom_bytes==GiB and scoped.process_bytes==11*GiB and scoped.new_commit_bytes==3*GiB);
+    // Container headroom derives from the effective scope, not the host size.
+    m=.{.usable_cpus=128,.physical_total=1024*GiB,.available_physical=512*GiB,
+        .process_resident=GiB,.process_committed=GiB,.scope_limit=8*GiB,.scope_used=2*GiB};
+    const small_scope=try budget.plan(m,.{});
+    try check(small_scope.headroom_bytes==GiB/2 and small_scope.process_bytes==13*GiB/2);
+    const explicit_headroom=try budget.plan(m,.{.headroom_bytes=2*GiB});
+    try check(explicit_headroom.headroom_bytes==2*GiB and explicit_headroom.process_bytes==5*GiB);
+    m.scope_limit=GiB/2;m.scope_used=0;m.process_resident=0;m.process_committed=0;
+    const tiny_scope=try budget.plan(m,.{});
+    try check(tiny_scope.headroom_bytes==GiB/8 and tiny_scope.process_bytes==3*GiB/8);
+    m=base;
+    const operator_cap=try budget.plan(m,.{.hard_process_bytes=2*GiB});
+    try check(operator_cap.headroom_bytes==GiB/4 and operator_cap.process_bytes==2*GiB);
+    m.scope_limit=16*GiB;m.scope_used=12*GiB;
     m.scope_limit=0;
     const pressure=try budget.plan(m,.{});
     try check(pressure.process_bytes==0 and pressure.pressure and pressure.admitted_tasks==0);
