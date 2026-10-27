@@ -89,6 +89,17 @@ jobs:
           & $env:SIG @arguments
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Execute Linux native worker and memory-grant concurrency contracts
+        if: runner.os == 'Linux'
+        run: |
+          & $env:SIG build test-workers test-resource-budget -Doptimize=ReleaseSafe -Dlink-libc=false -j2 --Sig-lib-dir $env:SIG_LIB_DIR *> linux-native-concurrency.log
+          $result = $LASTEXITCODE
+          Get-Content linux-native-concurrency.log
+          if ($result -ne 0) { exit $result }
+          if (-not (Select-String -LiteralPath linux-native-concurrency.log -SimpleMatch 'native concurrent grants=80000' -Quiet)) {
+            throw 'Linux native grant concurrency must execute, not skip'
+          }
+
       - name: Qualify 100M physical column values
         if: github.event_name == 'workflow_dispatch' && inputs.large_columns
         run: |
