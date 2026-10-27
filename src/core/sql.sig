@@ -378,21 +378,27 @@ pub fn Database(comptime config: Config) type {
             snapshot:Snapshot=.{.csn=0},
 
             pub fn backingBytes(rows:usize) Error!usize {
+                return backingBytesFor(rows,try Self.queryReferenceCount(rows));
+            }
+            pub fn backingBytesFor(rows:usize,refs:usize) Error!usize {
                 const cells=try Self.queryWorkspaceBytes(rows);
-                const refs=try Self.queryReferenceCount(rows);
+                if(refs==0 or refs>0x7fffffff) return error.InvalidParameterValue;
                 const reference_bytes=@mulWithOverflow(refs,@sizeOf(u32));
                 const total=@addWithOverflow(cells,reference_bytes[0]);
                 if(reference_bytes[1]!=0 or total[1]!=0) return error.InvalidParameterValue;
                 return total[0];
             }
             pub fn bindMemory(self:*Context,bytes:[]u8,rows:usize) Error!void {
+                return self.bindMemoryFor(bytes,rows,try Self.queryReferenceCount(rows));
+            }
+            pub fn bindMemoryFor(self:*Context,bytes:[]u8,rows:usize,reference_count:usize) Error!void {
                 if(comptime !config.external_workspace or !config.external_storage) @compileError("ReadContext.bindMemory requires external workspace/storage");
-                const required=try Context.backingBytes(rows);
+                const required=try Context.backingBytesFor(rows,reference_count);
                 if(bytes.len<required) return error.WorkspaceCapacity;
                 const own=try objectSpan(self);
                 if(overlaps(own,try span(bytes))) return error.InvalidParameterValue;
                 const cells=try Self.storageView(Cell,bytes,0,rows*2*config.columns);
-                const refs=try Self.storageView(u32,bytes,try Self.queryWorkspaceBytes(rows),try Self.queryReferenceCount(rows));
+                const refs=try Self.storageView(u32,bytes,try Self.queryWorkspaceBytes(rows),reference_count);
                 self.workspace.query.cells=cells;self.workspace.query.refs=refs;
                 self.workspace.query.cell_high=cells.len;self.workspace.query.ref_high=refs.len;
                 self.prepared=null;
