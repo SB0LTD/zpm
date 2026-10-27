@@ -79,7 +79,7 @@ jobs:
 
       - name: Execute allocator-free SQL, wire, transaction and OS contracts
         run: |
-          $arguments = @('build', 'test-db', 'test-sql', 'test-workers', 'test-packed-integer', '-Doptimize=ReleaseSafe', '-j2', '--Sig-lib-dir', $env:SIG_LIB_DIR)
+          $arguments = @('build', 'test-db', 'test-sql', 'test-workers', 'test-resource-budget', 'test-packed-integer', '-Doptimize=ReleaseSafe', '-j2', '--Sig-lib-dir', $env:SIG_LIB_DIR)
           if ($env:RUNNER_OS -eq 'macOS') { $arguments += '-Dlink-libc=true' }
           & $env:SIG @arguments
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
