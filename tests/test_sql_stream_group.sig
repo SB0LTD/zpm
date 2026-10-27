@@ -177,17 +177,23 @@ fn highCardinalityFallback() !void {
 
 // A fact scan and two unique-key dimensions must not materialize N handles.
 const Star=sql.Database(.{.external_storage=true,.tables=3,.columns=4,
-    .rows_per_table=4,.text_bytes=16,.work_rows=128,.result_rows=128,.integer_bits=32});
+    .rows_per_table=4,.text_bytes=16,.work_rows=128,.result_rows=128,.integer_bits=32,.compact_integral_scans=true});
 var star:Star=.{};
 var star_result:Star.Result=.{};
 var fact_rows:[count]Star.StorageRowSlot=undefined;
 var fact_versions:[count*2]Star.StorageVersion=undefined;
 var fact_row_index:[262144]u32=undefined;
 var fact_key_index:[524288]u32=undefined;
+var fact_scan_values:[count*4]i64=undefined;
+var fact_scan_nonnull:[count]u64=undefined;
+var fact_scan_live:[count]u8=undefined;
 var dim_rows:[2][32]Star.StorageRowSlot=undefined;
 var dim_versions:[2][64]Star.StorageVersion=undefined;
 var dim_row_index:[2][128]u32=undefined;
 var dim_key_index:[2][256]u32=undefined;
+var dim_scan_values:[2][32*4]i64=undefined;
+var dim_scan_nonnull:[2][32]u64=undefined;
+var dim_scan_live:[2][32]u8=undefined;
 var star_refs:[512]u32=undefined;
 const star_query="SELECT s.region,COUNT(*),SUM(f.amt*p.unit) FROM facts f JOIN shops s ON s.id=f.shop JOIN products p ON p.id=f.product GROUP BY s.region ORDER BY s.region NULLS LAST";
 fn starRejected(source:[]const u8,expected:sql.Error) !void {
@@ -218,13 +224,17 @@ fn starModel(n:usize) !void {
     }
     try check(star.workspace.query.stream_stats.rows==n);
     try check(star.workspace.query.stream_stats.groups==5);
+    try check(star.workspace.query.stream_stats.gathered_rows==n);
     try check(star.workspace.query.stream_stats.scratch_refs<=star_refs.len);
 }
 fn joinedGroups() !void {
     try star.bindStorage(.{
-        .{.rows=&fact_rows,.versions=&fact_versions,.row_index=&fact_row_index,.key_index=&fact_key_index},
-        .{.rows=&dim_rows[0],.versions=&dim_versions[0],.row_index=&dim_row_index[0],.key_index=&dim_key_index[0]},
-        .{.rows=&dim_rows[1],.versions=&dim_versions[1],.row_index=&dim_row_index[1],.key_index=&dim_key_index[1]},
+        .{.rows=&fact_rows,.versions=&fact_versions,.row_index=&fact_row_index,.key_index=&fact_key_index,
+          .scan_values=&fact_scan_values,.scan_nonnull=&fact_scan_nonnull,.scan_live=&fact_scan_live},
+        .{.rows=&dim_rows[0],.versions=&dim_versions[0],.row_index=&dim_row_index[0],.key_index=&dim_key_index[0],
+          .scan_values=&dim_scan_values[0],.scan_nonnull=&dim_scan_nonnull[0],.scan_live=&dim_scan_live[0]},
+        .{.rows=&dim_rows[1],.versions=&dim_versions[1],.row_index=&dim_row_index[1],.key_index=&dim_key_index[1],
+          .scan_values=&dim_scan_values[1],.scan_nonnull=&dim_scan_nonnull[1],.scan_live=&dim_scan_live[1]},
     },&star_refs);
     try star.execute("CREATE TABLE facts(id INT PRIMARY KEY,shop INT,product INT,amt INT)",&star_result);
     try star.execute("CREATE TABLE shops(id INT PRIMARY KEY,region INT)",&star_result);
@@ -295,6 +305,7 @@ fn joinedGroups() !void {
     try star.statement(writer,"UPDATE products SET unit=100 WHERE id=0",&star_result,.{});
     try starModel(count);
     try star.statement(writer,star_query,&star_result,.{});
+    try check(star.workspace.query.stream_stats.gathered_rows==0);
     var own_sum:i64=0;
     for(0..count) |id| {
         if(id%23==0 or id%17==0 or id%19==0 or id%4!=0) continue;
@@ -304,6 +315,45 @@ fn joinedGroups() !void {
     try check(star_result.rows[0].cells[2].integer==own_sum);
     star.abort(writer);
     try starModel(count);
+    const pending=try star.begin();
+    try star.statement(pending,"UPDATE facts SET shop=0,product=0,amt=5 WHERE id=0",&star_result,.{});
+    try starModel(count);
+    try star.statement(pending,"SELECT COUNT(*),SUM(f.amt*p.unit) FROM facts f JOIN shops s ON s.id=f.shop JOIN products p ON p.id=f.product WHERE f.id=0",&star_result,.{});
+    try check(star_result.rows[0].cells[0].integer==1 and star_result.rows[0].cells[1].integer==5);
+    try check(star.workspace.query.stream_stats.gathered_rows==0);
+    star.abort(pending);
+    try starModel(count);
+}
+
+const Mixed=sql.Database(.{.external_storage=true,.compact_integral_scans=true,.tables=2,
+    .columns=4,.rows_per_table=4,.text_bytes=32,.work_rows=32,.result_rows=16,.integer_bits=32});
+const mixed_bytes=Mixed.backingBytes(16,32,512) catch unreachable;
+var mixed_memory:[mixed_bytes]u8 align(16)=undefined;
+var mixed:Mixed=.{};
+var mixed_result:Mixed.Result=.{};
+fn mixedInputs() !void {
+    try mixed.bindMemory(&mixed_memory,16,32,512);
+    try mixed.execute("CREATE TABLE f(id INT PRIMARY KEY,p INT,label TEXT,n NUMERIC)",&mixed_result);
+    try mixed.execute("CREATE TABLE d(id INT PRIMARY KEY,m INT)",&mixed_result);
+    try mixed.execute("INSERT INTO f VALUES(1,1,'a',1.5),(2,1,'bb',2.25),(3,2,NULL,NULL)",&mixed_result);
+    try mixed.execute("INSERT INTO d VALUES(1,10),(2,20)",&mixed_result);
+    const integral="SELECT d.m,COUNT(*),SUM(f.id) FROM f JOIN d ON d.id=f.p GROUP BY d.m ORDER BY d.m";
+    try mixed.execute(integral,&mixed_result);
+    try check(mixed_result.row_count==2 and mixed_result.rows[0].cells[1].integer==2 and mixed_result.rows[0].cells[2].integer==3);
+    try check(mixed.workspace.query.stream_stats.gathered_rows==3);
+    try mixed.execute("SELECT f.label,COUNT(*) FROM f JOIN d ON d.id=f.p GROUP BY f.label ORDER BY f.label NULLS LAST",&mixed_result);
+    try check(mixed_result.row_count==3 and std.mem.eql(u8,mixed_result.rows[0].cells[0].text.slice(),"a") and
+        std.mem.eql(u8,mixed_result.rows[1].cells[0].text.slice(),"bb") and mixed_result.rows[2].cells[0]==.null_value);
+    try check(mixed.workspace.query.stream_stats.gathered_rows==0);
+    try mixed.execute("SELECT COUNT(f.n),SUM(f.n*d.m)=37.5 FROM f JOIN d ON d.id=f.p",&mixed_result);
+    try check(mixed_result.rows[0].cells[0].integer==2 and mixed_result.rows[0].cells[1].boolean);
+    try check(mixed.workspace.query.stream_stats.gathered_rows==0);
+    try mixed.execute("SELECT COUNT(*) FROM f JOIN d ON d.id=f.p WHERE f.label IS NULL",&mixed_result);
+    try check(mixed_result.rows[0].cells[0].integer==1 and mixed.workspace.query.stream_stats.gathered_rows==0);
+    try mixed.execute("DELETE FROM f WHERE id=1",&mixed_result);
+    try mixed.execute(integral,&mixed_result);
+    try check(mixed_result.row_count==2 and mixed_result.rows[0].cells[1].integer==1 and mixed_result.rows[0].cells[2].integer==2);
+    try check(mixed.workspace.query.stream_stats.gathered_rows==2);
 }
 
 pub fn main() !void {
@@ -311,5 +361,6 @@ pub fn main() !void {
     try equality();
     try highCardinalityFallback();
     try joinedGroups();
+    try mixedInputs();
     std.debug.print("{{\"suite\":\"sql-stream-group\",\"pass\":true,\"assertions\":{d},\"rows\":{d},\"query_refs\":{d},\"joined_rows\":{d},\"joined_query_refs\":{d}}}\n", .{assertions,count,refs.len,count,star_refs.len});
 }
