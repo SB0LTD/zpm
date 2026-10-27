@@ -842,6 +842,17 @@ pub fn Store(comptime Raw: type) type {
             /// Parse and bind without executing (PostgreSQL Describe).
             pub fn describe(self: *Connection, source: []const u8, result: *Result) !void {
                 if (self.id == 0) return error.InvalidConnection;
+                if(comptime @hasDecl(Raw,"ReadContext")) if(self.read_context) |context| {
+                    if(self.failed or self.in_transaction or self.tx!=null or !self.autocommit or self.pending.active) return error.InvalidParameterValue;
+                    if(context.preparation_error) |err| switch(err) {
+                        error.QueryCanceled,error.QueryWorkLimit=>return err,
+                        else=>{},
+                    };
+                    // Describe may receive a transient interpolation buffer;
+                    // never inspect a source retained from an earlier call.
+                    try context.prepare(&self.store.database,source,.{.csn=self.store.database.csn});
+                    return context.describeResult(result);
+                };
                 const raw = self.db();
                 const command = try raw.control(source);
                 switch (command) {
