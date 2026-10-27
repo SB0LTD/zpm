@@ -62,6 +62,8 @@ pub fn Exec(comptime config: types.Config) type {
             scratch_refs: usize = 0,
         };
         pub const ReadStats = struct {
+            projected_filter_scans: usize = 0,
+            projected_filter_rows: usize = 0,
             key_probes: usize = 0,
             key_walks: usize = 0,
             key_fallbacks: usize = 0,
@@ -719,14 +721,14 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             const CompactPredicate = struct { column: u16, op: ast.Op, value: i64, nonnull: bool };
-            fn compactPredicates(self: *const Query, id: u16, table: *const S.Table, out: []CompactPredicate, used: *usize) bool {
+            fn compactPredicates(pool: *const Ast.Pool, id: u16, table: *const S.Table, out: []CompactPredicate, used: *usize) bool {
                 if (id == none) return true;
-                const node = &self.pool.nodes[id];
-                if (node.kind == .and_op) return self.compactPredicates(node.a, table, out, used) and self.compactPredicates(node.b, table, out, used);
+                const node = &pool.nodes[id];
+                if (node.kind == .and_op) return compactPredicates(pool, node.a, table, out, used) and compactPredicates(pool, node.b, table, out, used);
                 if (node.kind != .binary or used.* == out.len) return false;
                 switch (node.op) { .eq, .ne, .lt, .le, .gt, .ge => {}, else => return false }
-                var a = &self.pool.nodes[node.a];
-                var b = &self.pool.nodes[node.b];
+                var a = &pool.nodes[node.a];
+                var b = &pool.nodes[node.b];
                 var op = node.op;
                 if (b.kind == .column and a.kind == .int_literal) {
                     const temp = a; a = b; b = temp;
@@ -855,7 +857,7 @@ pub fn Exec(comptime config: types.Config) type {
                 const domain: DenseDomain = if (p.key_count == 0) .{ .column = 0, .base = 0, .span = 0 } else self.denseDomain(p, table, 4097) orelse return null;
                 var predicates: [config.predicates]CompactPredicate = undefined;
                 var predicate_count: usize = 0;
-                if (!self.compactPredicates(p.where, table, &predicates, &predicate_count)) return null;
+                if (!compactPredicates(self.pool, p.where, table, &predicates, &predicate_count)) return null;
                 const size = domain.span + 1;
                 var present: [4097]bool = undefined;
                 var counts: [4][4097]i64 = undefined;
@@ -1867,6 +1869,53 @@ pub fn Exec(comptime config: types.Config) type {
             return found;
         }
 
+        /// Filter narrow committed integer columns first; resolve full MVCC
+        /// versions only for survivors. Non-null proofs preserve AND's exact
+        /// left-to-right short-circuit checkpoint count. Nullable/computed
+        /// predicates and old/own-write snapshots keep the canonical path.
+        noinline fn projectedFilterScan(ctx:*E.Context,table:*const S.Table,query:*const B.Select,snap:storage.Snapshot,
+            indices:[]u32,committed_only:bool,stats:*ReadStats) Error!?usize {
+            if(comptime !S.compact_enabled) return null;
+            if(!committed_only or !table.summary.valid or table.summary.csn>snap.csn or table.scan_high!=table.row_high or
+                query.where==none or query.order_count!=0 or query.limit!=0xffffffffffffffff) return null;
+            var predicates:[config.predicates]Query.CompactPredicate=undefined;
+            var used:usize=0;
+            if(!Query.compactPredicates(ctx.pool,query.where,table,&predicates,&used) or used==0) return null;
+            for(predicates[0..used]) |predicate| if(!predicate.nonnull) return null;
+            stats.projected_filter_scans+=1;
+            var found:usize=0;var start:usize=0;
+            while(start<table.scan_high):(start+=64) {
+                const count=@min(@as(usize,64),table.scan_high-start);
+                // Charge dead slots too, exactly as the canonical scan does.
+                if(ctx.session.control!=null) for(0..count) |_| try ctx.session.checkpoint();
+                var mask:u64=0;
+                for(0..count) |i| mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
+                stats.projected_filter_rows+=@popCount(mask);
+                for(predicates[0..used]) |predicate| {
+                    // Comparisons borrow their column and evaluate one literal;
+                    // subsequent AND terms run only for preceding TRUE rows.
+                    if(ctx.session.control!=null) for(0..@popCount(mask)) |_| try ctx.session.checkpoint();
+                    mask &= switch(predicate.op) {
+                        .eq=>Query.comparisonMask(.eq,table,start,count,predicate),
+                        .ne=>Query.comparisonMask(.ne,table,start,count,predicate),
+                        .lt=>Query.comparisonMask(.lt,table,start,count,predicate),
+                        .le=>Query.comparisonMask(.le,table,start,count,predicate),
+                        .gt=>Query.comparisonMask(.gt,table,start,count,predicate),
+                        .ge=>Query.comparisonMask(.ge,table,start,count,predicate),
+                        else=>unreachable,
+                    };
+                    if(mask==0) break;
+                }
+                while(mask!=0) {
+                    const slot=start+@ctz(mask);mask&=mask-1;
+                    const version=S.visibleAt(table,slot,snap) orelse continue;
+                    if(found==indices.len) return error.WorkspaceCapacity;
+                    indices[found]=version;found+=1;
+                }
+            }
+            return found;
+        }
+
         /// `locker` (FOR UPDATE/SHARE) runs after ORDER BY and before LIMIT, as
         /// PostgreSQL's LockRows does: it returns the version to emit (the
         /// newest committed one, whose WHERE is re-checked here when it
@@ -1934,6 +1983,9 @@ pub fn Exec(comptime config: types.Config) type {
                         found = count;ordered = true;break :scan;
                     }
                   }
+                  if(!locking and !top_k) if(try projectedFilterScan(&ctx,table,query,snap,indices,committed_only,stats)) |count| {
+                    found=count;break :scan;
+                  };
                   if (top_k and query.limit <= integer_topk_capacity and integerOrder(pool, query)) {
                     found = try integerTopK(&ctx, table, query, snap, indices, committed_only, stats);
                   } else for (0..table.row_high) |slot| {
