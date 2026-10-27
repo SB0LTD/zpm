@@ -373,12 +373,13 @@ pub fn Database(comptime config: Config) type {
             session:value_module.Session=.{},
             dialect:Dialect=.postgres,
             prepared:?Plan=null,
+            preparation_error:?Error=null,
             database:?*const Self=null,
             source:[]const u8=&.{},
             snapshot:Snapshot=.{.csn=0},
 
             pub fn backingBytes(rows:usize) Error!usize {
-                return backingBytesFor(rows,try Self.queryReferenceCount(rows));
+                return Context.backingBytesFor(rows,try Self.queryReferenceCount(rows));
             }
             pub fn backingBytesFor(rows:usize,refs:usize) Error!usize {
                 const cells=try Self.queryWorkspaceBytes(rows);
@@ -440,6 +441,8 @@ pub fn Database(comptime config: Config) type {
             pub fn prepare(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot) Error!void {
                 try self.validate(db,source,null);
                 self.prepared=null;
+                self.preparation_error=null;self.database=db;self.source=source;self.snapshot=snapshot;
+                errdefer |err| self.preparation_error=err;
                 self.session.sequences=null;
                 const parsed=try P.parse(source,&self.workspace.nodes,.standard);
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
@@ -457,9 +460,10 @@ pub fn Database(comptime config: Config) type {
                 self.database=db;self.source=source;self.snapshot=snapshot;
             }
             pub fn run(self:*Context,result:*Result) Error!void {
-                const plan=self.prepared orelse return error.InvalidParameterValue;
                 const db=self.database orelse return error.InvalidParameterValue;
                 try self.validate(db,self.source,result);
+                if(self.preparation_error) |err| return err;
+                const plan=self.prepared orelse return error.InvalidParameterValue;
                 if(config.external_results and result.rows.len==0) return error.InvalidParameterValue;
                 try self.session.checkpoint();
                 self.workspace.query.views=.{.ptr=self,.rows=readViewRows};
