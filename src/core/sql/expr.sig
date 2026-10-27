@@ -429,6 +429,18 @@ pub fn Eval(comptime config: types.Config) type {
             return scratch;
         }
 
+        /// Same evaluation/checkpoint contract as eval, borrowing a stable row
+        /// column or placing a computed value in caller-owned scratch.
+        pub fn evalRef(ctx:*const Context,id:u16,scratch:*V.Cell) Error!*const V.Cell {
+            const n=node(ctx,id);
+            if(n.kind==.column) {
+                try ctx.session.checkpoint();
+                return columnRef(ctx,n);
+            }
+            scratch.*=try eval(ctx,id);
+            return scratch;
+        }
+
         fn boolCell(value: ?bool) V.Cell {
             return if (value) |b| .{ .boolean = b } else .null_value;
         }
@@ -617,8 +629,8 @@ pub fn Eval(comptime config: types.Config) type {
                         // columns instead of copying the full tagged payload.
                         var left_value: V.Cell = undefined;
                         var right_value: V.Cell = undefined;
-                        const left = try operandRef(ctx, n.a, &left_value);
-                        const right = try operandRef(ctx, n.b, &right_value);
+                        const left = try evalRef(ctx, n.a, &left_value);
+                        const right = try evalRef(ctx, n.b, &right_value);
                         if (left.* == .null_value or right.* == .null_value) return .null_value;
                         if (left.* == .integer and right.* == .integer and value_module.integral(n.ty))
                             return .{ .integer = try arithmetic(n.op, n.ty, left.integer, right.integer) };

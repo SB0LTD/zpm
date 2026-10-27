@@ -507,9 +507,8 @@ pub fn Exec(comptime config: types.Config) type {
             /// Computed/correlated expressions retain the ordinary evaluator.
             fn streamInput(self: *Query, ctx: *E.Context, id: u16, temporary: *V.Cell) Error!*const V.Cell {
                 const node = &self.pool.nodes[id];
-                if (node.kind == .column) return E.columnRef(ctx,node);
-                temporary.* = try E.eval(ctx, id);
-                return temporary;
+                if (node.kind == .column and node.level==0 and node.relation==0) return E.columnRef(ctx,node);
+                return E.evalRef(ctx,id,temporary);
             }
 
             fn addAggregates(self: *Query, p: *const B.Plan, ctx: *E.Context, states: []Accumulator) Error!void {
@@ -1010,7 +1009,7 @@ pub fn Exec(comptime config: types.Config) type {
                     for(p.sources[1..p.source_count],1..) |*source,stage| {
                         try self.session.checkpoint();
                         var key_value:V.Cell=undefined;
-                        const key=try self.streamInput(ctx,source.probe,&key_value);
+                        const key=try E.evalRef(ctx,source.probe,&key_value);
                         if(key.*==.null_value) continue :scan;
                         const dimension=&self.tables[source.table.?];
                         const visible=S.lookupVersionAt(dimension,key,self.snap) orelse continue :scan;
