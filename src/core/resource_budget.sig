@@ -10,6 +10,8 @@ pub const Machine = struct {
     process_resident: u64 = 0,
     process_committed: u64 = 0,
     available_commit: ?u64 = null,
+    /// Remaining process virtual-address allowance (e.g. Linux RLIMIT_AS).
+    available_address_space: ?u64 = null,
     scope_limit: ?u64 = null,
     scope_used: ?u64 = null,
 };
@@ -54,9 +56,11 @@ pub fn plan(machine: Machine, policy: Policy) Error!Plan {
     var capacity=machine.physical_total;
     if(machine.scope_limit) |limit| capacity=@min(capacity,limit);
     if(policy.hard_process_bytes) |limit| capacity=@min(capacity,limit);
+    if(machine.available_address_space) |available| capacity=@min(capacity,try add(machine.process_committed,available));
     const headroom=policy.headroom_bytes orelse @min(capacity/4,@max(256*1024*1024,capacity/16));
     var budget=@min(machine.physical_total,try add(machine.process_resident,machine.available_physical -| headroom));
     if(machine.available_commit) |available| budget=@min(budget,try add(machine.process_committed,available -| headroom));
+    if(machine.available_address_space) |available| budget=@min(budget,try add(machine.process_committed,available -| headroom));
     if(machine.scope_limit) |limit| {
         const available=limit -| machine.scope_used.?;
         budget=@min(budget,@min(limit,try add(machine.process_resident,available -| headroom)));
