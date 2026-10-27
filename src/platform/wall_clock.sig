@@ -31,6 +31,12 @@ pub fn nowUs() Error!i64 {
         Win.GetSystemTimePreciseAsFileTime(&ticks);
         if (ticks < filetime_unix_offset) return error.ClockUnavailable;
         return @intCast((ticks - filetime_unix_offset) / 10);
+    } else if (builtin.os.tag == .linux and !builtin.link_libc) {
+        // Standard Linux vDSO lookup and syscall fallback require no libc/TLS
+        // allocation. This keeps caller-owned native workers usable.
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.errno(std.os.linux.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return error.ClockUnavailable;
+        return @as(i64, @intCast(ts.sec)) * 1000000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1000);
     } else if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
         var ts: Posix.Timespec = undefined;
         if (Posix.clock_gettime(0, &ts) != 0) return error.ClockUnavailable; // CLOCK_REALTIME
