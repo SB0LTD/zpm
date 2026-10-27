@@ -175,9 +175,141 @@ fn highCardinalityFallback() !void {
     try check(dr.rows[0].cells[0].integer == 350);
 }
 
+// A fact scan and two unique-key dimensions must not materialize N handles.
+const Star=sql.Database(.{.external_storage=true,.tables=3,.columns=4,
+    .rows_per_table=4,.text_bytes=16,.work_rows=128,.result_rows=128,.integer_bits=32});
+var star:Star=.{};
+var star_result:Star.Result=.{};
+var fact_rows:[count]Star.StorageRowSlot=undefined;
+var fact_versions:[count*2]Star.StorageVersion=undefined;
+var fact_row_index:[262144]u32=undefined;
+var fact_key_index:[524288]u32=undefined;
+var dim_rows:[2][32]Star.StorageRowSlot=undefined;
+var dim_versions:[2][64]Star.StorageVersion=undefined;
+var dim_row_index:[2][128]u32=undefined;
+var dim_key_index:[2][256]u32=undefined;
+var star_refs:[512]u32=undefined;
+const star_query="SELECT s.region,COUNT(*),SUM(f.amt*p.unit) FROM facts f JOIN shops s ON s.id=f.shop JOIN products p ON p.id=f.product GROUP BY s.region ORDER BY s.region NULLS LAST";
+fn starRejected(source:[]const u8,expected:sql.Error) !void {
+    const before=star_result;
+    if(star.execute(source,&star_result)) |_| return error.FailureExpected else |err| try check(err==expected);
+    try check(star_result.row_count==before.row_count and star_result.column_count==before.column_count);
+    for(0..before.row_count) |row| for(0..before.column_count) |column| {
+        try check(Star.compareCells(&star_result.rows[row].cells[column],&before.rows[row].cells[column])==0);
+    };
+    const usage=star.usage();
+    try check(usage.transactions==0 and usage.row_locks==0 and usage.pending_versions==0);
+}
+fn starModel(n:usize) !void {
+    try star.execute(star_query,&star_result);
+    try check(star_result.row_count==5);
+    var sizes:[5]i64=@splat(0);var sums:[5]i64=@splat(0);
+    for(0..n) |id| {
+        if(id%23==0 or id%17==0) continue;
+        const group=if(id%16==7) 4 else id%4;
+        sizes[group]+=1;
+        if(id%19!=0) sums[group]+=(@as(i64,@intCast(id%97))-48)*@as(i64,@intCast(id%8+1));
+    }
+    for(0..5) |group| {
+        if(group==4) try check(star_result.rows[group].cells[0]==.null_value)
+        else try check(star_result.rows[group].cells[0].integer==group);
+        try check(star_result.rows[group].cells[1].integer==sizes[group]);
+        try check(star_result.rows[group].cells[2].integer==sums[group]);
+    }
+    try check(star.workspace.query.stream_stats.rows==n);
+    try check(star.workspace.query.stream_stats.groups==5);
+    try check(star.workspace.query.stream_stats.scratch_refs<=star_refs.len);
+}
+fn joinedGroups() !void {
+    try star.bindStorage(.{
+        .{.rows=&fact_rows,.versions=&fact_versions,.row_index=&fact_row_index,.key_index=&fact_key_index},
+        .{.rows=&dim_rows[0],.versions=&dim_versions[0],.row_index=&dim_row_index[0],.key_index=&dim_key_index[0]},
+        .{.rows=&dim_rows[1],.versions=&dim_versions[1],.row_index=&dim_row_index[1],.key_index=&dim_key_index[1]},
+    },&star_refs);
+    try star.execute("CREATE TABLE facts(id INT PRIMARY KEY,shop INT,product INT,amt INT)",&star_result);
+    try star.execute("CREATE TABLE shops(id INT PRIMARY KEY,region INT)",&star_result);
+    try star.execute("CREATE TABLE products(id INT PRIMARY KEY,unit INT)",&star_result);
+    var text:[192]u8=undefined;
+    for(0..16) |id| try star.execute(try std.fmt.bufPrint(&text,"INSERT INTO shops VALUES({d},{s})",.{id,if(id==7) "NULL" else try std.fmt.bufPrint(text[128..],"{d}",.{id%4})}),&star_result);
+    for(0..8) |id| try star.execute(try std.fmt.bufPrint(&text,"INSERT INTO products VALUES({d},{d})",.{id,id+1}),&star_result);
+    var small_refs:usize=0;var small_cells:usize=0;
+    for(0..count) |id| {
+        var shop:[24]u8=undefined;var product:[24]u8=undefined;var amount:[24]u8=undefined;
+        try star.execute(try std.fmt.bufPrint(&text,"INSERT INTO facts VALUES({d},{s},{s},{s})",.{id,
+            try std.fmt.bufPrint(&shop,"{d}",.{if(id%23==0) @as(usize,999) else id%16}),
+            if(id%17==0) "NULL" else try std.fmt.bufPrint(&product,"{d}",.{id%8}),
+            if(id%19==0) "NULL" else try std.fmt.bufPrint(&amount,"{d}",.{@as(i64,@intCast(id%97))-48})}),&star_result);
+        if(id==511) {
+            try starModel(512);
+            small_refs=star.workspace.query.stream_stats.scratch_refs;
+            small_cells=star.workspace.query.stream_stats.scratch_cells;
+        }
+    }
+    try starModel(count);
+    try check(star.workspace.query.stream_stats.scratch_refs==small_refs);
+    try check(star.workspace.query.stream_stats.scratch_cells==small_cells);
+    var total:i64=0;var sum:i64=0;
+    for(13..count) |id| {
+        if(id%23==0 or id%17==0 or id%8+1<=4) continue;
+        total+=1;
+        if(id%19!=0) sum+=(@as(i64,@intCast(id%97))-48)*@as(i64,@intCast(id%8+1));
+    }
+    try star.execute("SELECT COUNT(*),SUM(f.amt*p.unit) FROM facts f JOIN shops s ON s.id=f.shop JOIN products p ON p.id=f.product WHERE f.id>=13 AND p.unit>4",&star_result);
+    try check(star_result.rows[0].cells[0].integer==total and star_result.rows[0].cells[1].integer==sum);
+    try check(star.workspace.query.stream_stats.scratch_refs==0 and star.workspace.query.stream_stats.summary_plans==0);
+    // A later probe can depend on a preceding dimension, rather than the fact.
+    var chained:[4]i64=@splat(0);
+    for(0..count) |id| if(id%23!=0 and id%16!=7) {chained[id%4]+=1;};
+    try star.execute("SELECT s.region,COUNT(*) FROM facts f JOIN shops s ON s.id=f.shop JOIN products p ON p.id=s.region GROUP BY s.region ORDER BY s.region",&star_result);
+    try check(star_result.row_count==4);
+    for(0..4) |region| try check(star_result.rows[region].cells[0].integer==region and star_result.rows[region].cells[1].integer==chained[region]);
+    total=0;sum=0;
+    for(0..count) |id| {
+        const amount=@as(i64,@intCast(id%97))-48;
+        if(id%23==0 or id%17==0 or id%19==0 or amount<=0) continue;
+        total+=1;sum+=amount*@as(i64,@intCast(id%8+1));
+    }
+    try star.execute("SELECT COUNT(*),SUM(f.amt*p.unit) FROM facts f JOIN shops s ON s.id=f.shop JOIN products p ON p.id=f.product AND f.amt>0",&star_result);
+    try check(star_result.rows[0].cells[0].integer==total and star_result.rows[0].cells[1].integer==sum);
+    try star.execute("SELECT COUNT(*),SUM(f.amt*p.unit) FROM facts f JOIN shops s ON s.id=f.shop JOIN products p ON p.id=f.product WHERE f.id<0",&star_result);
+    try check(star_result.rows[0].cells[0].integer==0 and star_result.rows[0].cells[1]==.null_value);
+    // DISTINCT, outer joins, non-key joins and excessive groups retain bounded
+    // failure/previous-result behavior rather than silently changing semantics.
+    try starRejected("SELECT COUNT(DISTINCT f.amt) FROM facts f JOIN shops s ON s.id=f.shop",error.WorkspaceCapacity);
+    try starRejected("SELECT COUNT(*) FROM facts f LEFT JOIN shops s ON s.id=f.shop",error.WorkspaceCapacity);
+    try starRejected("SELECT COUNT(*) FROM facts f JOIN shops s ON s.region=f.shop",error.WorkspaceCapacity);
+    try starRejected("SELECT f.id,COUNT(*) FROM facts f JOIN shops s ON s.id=f.shop GROUP BY f.id ORDER BY f.id",error.WorkspaceCapacity);
+    var cancel:Cancel=.{};
+    var control:sql.ExecutionControl=.{.context=&cancel,.poll=&Cancel.poll,.poll_interval=1};
+    star.session.control=&control;
+    try starRejected(star_query,error.QueryCanceled);
+    star.session.control=null;
+    try check(cancel.calls==25);
+    control=.{.max_work=100};star.session.control=&control;
+    try starRejected(star_query,error.QueryWorkLimit);star.session.control=null;
+    @memset(&star_refs,0xaaaaaaaa);
+    @memset(&star.workspace.query.cells,.{.integer=0x55555555});
+    try starModel(count);
+    // Pending dimension versions are visible only to the owning transaction.
+    const writer=try star.begin();
+    try star.statement(writer,"UPDATE products SET unit=100 WHERE id=0",&star_result,.{});
+    try starModel(count);
+    try star.statement(writer,star_query,&star_result,.{});
+    var own_sum:i64=0;
+    for(0..count) |id| {
+        if(id%23==0 or id%17==0 or id%19==0 or id%4!=0) continue;
+        const unit:i64=if(id%8==0) 100 else @intCast(id%8+1);
+        own_sum+=(@as(i64,@intCast(id%97))-48)*unit;
+    }
+    try check(star_result.rows[0].cells[2].integer==own_sum);
+    star.abort(writer);
+    try starModel(count);
+}
+
 pub fn main() !void {
     try large();
     try equality();
     try highCardinalityFallback();
-    std.debug.print("{{\"suite\":\"sql-stream-group\",\"pass\":true,\"assertions\":{d},\"rows\":{d},\"query_refs\":{d}}}\n", .{assertions,count,refs.len});
+    try joinedGroups();
+    std.debug.print("{{\"suite\":\"sql-stream-group\",\"pass\":true,\"assertions\":{d},\"rows\":{d},\"query_refs\":{d},\"joined_rows\":{d},\"joined_query_refs\":{d}}}\n", .{assertions,count,refs.len,count,star_refs.len});
 }

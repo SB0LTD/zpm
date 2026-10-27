@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "scope": "bounded SQL unique-key joined aggregation correctness",
+  "compiler": "Sig 0.6.4; matched runtime library 0df3506",
+  "sources": {
+    "src/core/sql/exec.sig": "b8c4344f02fe9cf774a909435d642e1176c09932f3cd0ac22a962f0aef77b1f0",
+    "tests/test_sql_stream_group.sig": "0c58c4fe56874bb498bdd8e6bacf4b6d3dec9924876c044551f177e6d637736b"
+  },
+  "runs": [
+    {
+      "environment": "Windows x86_64",
+      "binary_sha256": "bf78a9fdac6957a46b1fa8be3f4de80244dfd7b63223673bd6f3b5bb0721d04c",
+      "result": {
+        "suite": "sql-stream-group",
+        "pass": true,
+        "assertions": 1335,
+        "rows": 100000,
+        "query_refs": 1024,
+        "joined_rows": 100000,
+        "joined_query_refs": 512
+      }
+    },
+    {
+      "environment": "no-libc Linux x86_64 under WSL Ubuntu",
+      "binary_sha256": "9bc7078682ed9de3203a62242fc15a05222fa353dcf9f84c3c360d37770a1c80",
+      "result": {
+        "suite": "sql-stream-group",
+        "pass": true,
+        "assertions": 1335,
+        "rows": 100000,
+        "query_refs": 1024,
+        "joined_rows": 100000,
+        "joined_query_refs": 512
+      }
+    }
+  ],
+  "joined_dimensions": [
+    16,
+    8
+  ],
+  "joined_workspace_cells": 1024,
+  "joined_query_handles": 512,
+  "baseline": {
+    "library_revision": "82d9a691b79e284cb3b7434e5d87681b1f2c3930",
+    "result": "WorkspaceCapacity at first 512-row joined fixture",
+    "binary_sha256": "1202faca6da41aa3baabf583f6438bac678ba3ac6215f2d0dabc2074a7a9535f"
+  }
+}
