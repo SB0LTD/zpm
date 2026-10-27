@@ -45,7 +45,7 @@ pub const Observation=struct {
     numa_localities:?u32=null,
     /// Windows exposes the immediate job, not a list of ancestor job handles.
     immediate_job:bool=false,
-    available_kind:enum{os_estimate,free_and_purgeable}=.os_estimate,
+    available_kind:enum{os_estimate,free_and_file_cache}=.os_estimate,
     process_virtual_bytes:u64=0,
 };
 fn copy(input:[]const u8,output:[]u8) Error![]const u8 {
@@ -205,20 +205,22 @@ fn observeMac(b:Buffers,owned_commit_bytes:u64) Error!Observation {
     if(task==0 or total==0 or cpus==0 or page_size==0) return error.InvalidObservation;
     const host=Mac.mach_host_self();if(host==0) return error.ProbeFailed;
     defer _=Mac.mach_port_deallocate(task,host);
-    // Stable HOST_VM_INFO64 revision-0 prefix, expressed in 32-bit natural_t
-    // units as required by Mach. Speculative pages are ALREADY in free_count.
-    var vm:extern struct {free:u32=0,active:u32=0,inactive:u32=0,wired:u32=0,counters:[9]u64=@splat(0),purgeable:u32=0,speculative:u32=0}=.{};
+    // HOST_VM_INFO64 revision 1, expressed in 32-bit natural_t units. Request
+    // the file-backed counters: free/purgeable alone excludes reclaimable cache
+    // and can incorrectly starve a database on an otherwise idle machine.
+    var vm:extern struct {free:u32=0,active:u32=0,inactive:u32=0,wired:u32=0,counters:[9]u64=@splat(0),purgeable:u32=0,speculative:u32=0,
+        decompressions:u64=0,compressions:u64=0,swapins:u64=0,swapouts:u64=0,compressor:u32=0,throttled:u32=0,external:u32=0,internal:u32=0,uncompressed:u64=0}=.{};
     var vm_count:u32=@sizeOf(@TypeOf(vm))/4;
     if(Mac.host_statistics64(host,4,&vm,&vm_count)!=0 or vm_count<@sizeOf(@TypeOf(vm))/4) return error.ProbeFailed;
     var process:std.c.task_vm_info_data_t=std.mem.zeroes(std.c.task_vm_info_data_t);
     var process_count=std.c.TASK.VM.INFO_COUNT;
     if(std.c.task_info(task,std.c.TASK.VM.INFO,@ptrCast(&process),&process_count)!=0 or
         process_count*4<@offsetOf(std.c.task_vm_info_data_t,"resident_size")+8) return error.ProbeFailed;
-    const available_pages=@as(u64,vm.free)+vm.purgeable;
-    const available_bytes=@mulWithOverflow(available_pages,page_size);if(available_bytes[1]!=0) return error.ArithmeticOverflow;
-    var result:Observation=.{.machine=.{.usable_cpus=cpus,.physical_total=total,.available_physical=@min(total,available_bytes[0]),
+    const own_external=if(process_count*4>=@offsetOf(std.c.task_vm_info_data_t,"external")+8) process.external else 0;
+    const available_bytes=try facts.macAvailableBytes(vm.free,vm.purgeable,vm.external,vm.speculative,page_size,own_external);
+    var result:Observation=.{.machine=.{.usable_cpus=cpus,.physical_total=total,.available_physical=@min(total,available_bytes),
         .process_resident=process.resident_size,.process_committed=owned_commit_bytes},
-        .physical_cores=cores,.available_kind=.free_and_purgeable,.process_virtual_bytes=process.virtual_size};
+        .physical_cores=cores,.available_kind=.free_and_file_cache,.process_virtual_bytes=process.virtual_size};
     const app_available=Mac.os_proc_available_memory();
     if(app_available!=0) {
         const owned=if(process_count*4>=@offsetOf(std.c.task_vm_info_data_t,"phys_footprint")+8) process.phys_footprint else process.resident_size;

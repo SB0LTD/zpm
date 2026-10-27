@@ -113,6 +113,19 @@ pub fn within(path:[]const u8,root:[]const u8) bool {
     return std.mem.eql(u8,root,"/") or (std.mem.startsWith(u8,path,root) and
         (path.len==root.len or path[root.len]=='/'));
 }
+/// Mach free pages already include speculative pages. File-backed cache can be
+/// reclaimed without counting anonymous RAM or compressed/swap contents. Use
+/// the larger cache/purgeable estimate, not their potentially overlapping sum,
+/// and exclude the process's own external footprint from the added allowance.
+pub fn macAvailableBytes(free:u64,purgeable:u64,external:u64,speculative:u64,page:u64,owned_external:u64) Error!u64 {
+    if(page==0 or !std.math.isPowerOfTwo(page)) return error.InvalidObservation;
+    const free_bytes=@mulWithOverflow(free,page);
+    const reclaimable=@mulWithOverflow(@max(purgeable,external -| speculative),page);
+    if(free_bytes[1]!=0 or reclaimable[1]!=0) return error.ArithmeticOverflow;
+    const result=@addWithOverflow(free_bytes[0],reclaimable[0] -| owned_external);
+    if(result[1]!=0) return error.ArithmeticOverflow;
+    return result[0];
+}
 pub const GroupMask=extern struct {mask:u64,group:u16,reserved:[3]u16=@splat(0)};
 pub const CpuFilter=struct {
     groups:[]const u16,
