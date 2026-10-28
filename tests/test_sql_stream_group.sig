@@ -227,6 +227,25 @@ fn starModel(n:usize) !void {
     try check(star.workspace.query.stream_stats.gathered_rows==n);
     try check(star.workspace.query.stream_stats.scratch_refs<=star_refs.len);
 }
+const star_distinct="SELECT s.region,COUNT(DISTINCT f.amt),COUNT(DISTINCT p.unit),SUM(f.id) FROM facts f JOIN shops s ON s.id=f.shop JOIN products p ON p.id=f.product GROUP BY s.region ORDER BY s.region NULLS LAST";
+fn starDistinctModel(expected_bitmap_bytes:usize) !void {
+    var amounts:[5][97]bool=@splat(@splat(false));var units:[5][8]bool=@splat(@splat(false));var totals:[5]i64=@splat(0);
+    for(0..count) |id| {
+        if(id%23==0 or id%17==0) continue;
+        const group=if(id%16==7) 4 else id%4;
+        if(id%19!=0) amounts[group][id%97]=true;
+        units[group][id%8]=true;totals[group]+=@intCast(id);
+    }
+    try star.execute(star_distinct,&star_result);try check(star_result.row_count==5);
+    for(0..5) |group| {
+        var a:i64=0;var u:i64=0;
+        for(amounts[group]) |present| a+=@intFromBool(present);
+        for(units[group]) |present| u+=@intFromBool(present);
+        try check(star_result.rows[group].cells[1].integer==a and star_result.rows[group].cells[2].integer==u and star_result.rows[group].cells[3].integer==totals[group]);
+    }
+    try check(star.workspace.query.stream_stats.rows==count and star.workspace.query.stream_stats.distinct_bitmap_bytes==expected_bitmap_bytes);
+    try check(star.workspace.query.stream_stats.scratch_refs<=star_refs.len);
+}
 fn joinedGroups() !void {
     try star.bindStorage(.{
         .{.rows=&fact_rows,.versions=&fact_versions,.row_index=&fact_row_index,.key_index=&fact_key_index,
@@ -283,9 +302,16 @@ fn joinedGroups() !void {
     try check(star_result.rows[0].cells[0].integer==total and star_result.rows[0].cells[1].integer==sum);
     try star.execute("SELECT COUNT(*),SUM(f.amt*p.unit) FROM facts f JOIN shops s ON s.id=f.shop JOIN products p ON p.id=f.product WHERE f.id<0",&star_result);
     try check(star_result.rows[0].cells[0].integer==0 and star_result.rows[0].cells[1]==.null_value);
-    // DISTINCT, outer joins, non-key joins and excessive groups retain bounded
+    try starDistinctModel(120);
+    try star.execute("SELECT COUNT(DISTINCT f.amt) FROM facts f JOIN shops s ON s.id=f.shop",&star_result);
+    try check(star_result.rows[0].cells[0].integer==97);
+    try star.execute("SELECT COUNT(DISTINCT amt) FILTER(WHERE id%2=0) FROM facts",&star_result);
+    try check(star_result.rows[0].cells[0].integer==97);
+    try star.execute("SELECT COUNT(DISTINCT amt) FROM facts WHERE id<0",&star_result);
+    try check(star_result.rows[0].cells[0].integer==0);
+    // Non-count DISTINCT, outer joins, non-key joins and excessive groups retain bounded
     // failure/previous-result behavior rather than silently changing semantics.
-    try starRejected("SELECT COUNT(DISTINCT f.amt) FROM facts f JOIN shops s ON s.id=f.shop",error.WorkspaceCapacity);
+    try starRejected("SELECT SUM(DISTINCT f.amt) FROM facts f JOIN shops s ON s.id=f.shop",error.WorkspaceCapacity);
     try starRejected("SELECT COUNT(*) FROM facts f LEFT JOIN shops s ON s.id=f.shop",error.WorkspaceCapacity);
     try starRejected("SELECT COUNT(*) FROM facts f JOIN shops s ON s.region=f.shop",error.WorkspaceCapacity);
     try starRejected("SELECT f.id,COUNT(*) FROM facts f JOIN shops s ON s.id=f.shop GROUP BY f.id ORDER BY f.id",error.WorkspaceCapacity);
@@ -295,6 +321,8 @@ fn joinedGroups() !void {
     try starRejected(star_query,error.QueryCanceled);
     star.session.control=null;
     try check(cancel.calls==25);
+    cancel=.{};control=.{.context=&cancel,.poll=&Cancel.poll,.poll_interval=1};star.session.control=&control;
+    try starRejected(star_distinct,error.QueryCanceled);star.session.control=null;
     control=.{.max_work=100};star.session.control=&control;
     try starRejected(star_query,error.QueryWorkLimit);star.session.control=null;
     @memset(&star_refs,0xaaaaaaaa);
@@ -321,8 +349,16 @@ fn joinedGroups() !void {
     try star.statement(pending,"SELECT COUNT(*),SUM(f.amt*p.unit) FROM facts f JOIN shops s ON s.id=f.shop JOIN products p ON p.id=f.product WHERE f.id=0",&star_result,.{});
     try check(star_result.rows[0].cells[0].integer==1 and star_result.rows[0].cells[1].integer==5);
     try check(star.workspace.query.stream_stats.gathered_rows==0);
+    try star.statement(pending,"UPDATE facts SET amt=-1000 WHERE id=0",&star_result,.{});
+    try star.statement(pending,"SELECT COUNT(DISTINCT amt) FROM facts WHERE id=0",&star_result,.{});
+    try check(star_result.rows[0].cells[0].integer==1);
+    try star.execute("SELECT COUNT(DISTINCT amt) FROM facts WHERE id=0",&star_result);
+    try check(star_result.rows[0].cells[0].integer==0);
     star.abort(pending);
     try starModel(count);
+    @memset(&star_refs,0xaaaaaaaa);@memset(&star.workspace.query.cells,.{.integer=0x55555555});
+    // Aborted outliers still widen conservative fact/dimension bounds.
+    try starDistinctModel(760);
 }
 
 const Mixed=sql.Database(.{.external_storage=true,.compact_integral_scans=true,.tables=2,
@@ -356,7 +392,51 @@ fn mixedInputs() !void {
     try check(mixed.workspace.query.stream_stats.gathered_rows==2);
 }
 
+fn distinctFallbackCases() !void {
+    const D=sql.Database(.{.tables=1,.columns=4,.rows_per_table=8,.work_rows=64});
+    var database:D=.{};var output:D.Result=.{};
+    try database.execute("CREATE TABLE d(id INT PRIMARY KEY,g INT,n BIGINT,label TEXT)",&output);
+    try database.execute("INSERT INTO d VALUES(1,0,-9223372036854775808,'a'),(2,0,0,'a'),(3,0,9223372036854775807,'b'),(4,1,0,NULL),(5,1,NULL,NULL)",&output);
+    try database.execute("SELECT COUNT(DISTINCT n) FROM d",&output);
+    try check(output.rows[0].cells[0].integer==3 and database.workspace.query.stream_stats.distinct_bitmap_bytes==0);
+    try database.execute("SELECT g,COUNT(DISTINCT n) FROM d GROUP BY g ORDER BY g",&output);
+    try check(output.row_count==2 and output.rows[0].cells[1].integer==3 and output.rows[1].cells[1].integer==1);
+    try database.execute("SELECT COUNT(DISTINCT label) FROM d",&output);
+    try check(output.rows[0].cells[0].integer==2);
+    try database.execute("DROP TABLE d",&output);
+    try database.execute("CREATE TABLE d(id INT PRIMARY KEY,n INT)",&output);
+    try database.execute("INSERT INTO d VALUES(1,NULL),(2,NULL)",&output);
+    try database.execute("SELECT COUNT(DISTINCT n) FROM d",&output);
+    try check(output.rows[0].cells[0].integer==0 and database.workspace.query.stream_stats.distinct_bitmap_bytes==0);
+}
+
+const DistinctLarge=sql.Database(.{.external_storage=true,.tables=1,.columns=3,.rows_per_table=4,
+    .work_rows=8192,.result_rows=32,.text_bytes=16,.integer_bits=32});
+var distinct_backing:[DistinctLarge.backingBytes(count,count*2,512) catch unreachable]u8 align(16)=undefined;
+var distinct_db:DistinctLarge=.{};var distinct_result:DistinctLarge.Result=.{};
+var expected_distinct:[20][50000]bool=undefined;
+fn realisticDistinctDomain() !void {
+    @memset(std.mem.asBytes(&expected_distinct),0);
+    try distinct_db.bindMemory(&distinct_backing,count,count*2,512);
+    try distinct_db.execute("CREATE TABLE d(id INT PRIMARY KEY,g INT,n INT)",&distinct_result);
+    var text:[128]u8=undefined;
+    for(0..count) |id| {
+        const value=(id*48271)%50000;expected_distinct[id%20][value]=true;
+        try distinct_db.execute(try std.fmt.bufPrint(&text,"INSERT INTO d VALUES({d},{d},{d})",.{id,id%20,@as(i64,@intCast(value))-20000}),&distinct_result);
+    }
+    try distinct_db.execute("SELECT g,COUNT(DISTINCT n),COUNT(*) FROM d GROUP BY g ORDER BY g",&distinct_result);
+    try check(distinct_result.row_count==20);
+    for(0..20) |group| {
+        var wanted:i64=0;for(expected_distinct[group]) |present| wanted+=@intFromBool(present);
+        try check(distinct_result.rows[group].cells[0].integer==group and distinct_result.rows[group].cells[1].integer==wanted and distinct_result.rows[group].cells[2].integer==5000);
+    }
+    try check(distinct_db.workspace.query.stream_stats.distinct_bitmap_bytes==125120);
+    try check(distinct_db.workspace.query.stream_stats.scratch_refs<=512);
+}
+
 pub fn main() !void {
+    try realisticDistinctDomain();
+    try distinctFallbackCases();
     try large();
     try equality();
     try highCardinalityFallback();

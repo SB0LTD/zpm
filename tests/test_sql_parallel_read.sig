@@ -43,7 +43,7 @@ fn queries(index:usize) !void {
         if(result.row_count!=1 or result.rows[0].cells[0].integer!=@as(i64,@intCast(id))*7-23) return error.ParallelReadContract;
         const category=(index+trial)%8;
         var total:i64=0;for(0..16) |row| total+=@as(i64,@intCast(category+row*8))*7-23;
-        try context.execute(db,try std.fmt.bufPrint(&text,"SELECT COUNT(*),SUM(amount) FROM points WHERE cat={d}",.{category}),snapshot,result);
+        try context.execute(db,try std.fmt.bufPrint(&text,"SELECT COUNT(DISTINCT amount),SUM(amount) FROM points WHERE cat={d}",.{category}),snapshot,result);
         if(result.row_count!=1 or result.rows[0].cells[0].integer!=16 or result.rows[0].cells[1].integer!=total) return error.ParallelReadContract;
         try context.execute(db,try std.fmt.bufPrint(&text,"SELECT p.cat,COUNT(*),SUM(p.amount*q.unit) FROM points p JOIN products q ON q.id=p.cat WHERE p.cat={d} GROUP BY p.cat",.{category}),snapshot,result);
         if(result.row_count!=1 or result.rows[0].cells[1].integer!=16 or result.rows[0].cells[2].integer!=total*@as(i64,@intCast(10+category))) return error.ParallelReadContract;

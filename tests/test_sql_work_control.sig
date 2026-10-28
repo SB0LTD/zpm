@@ -13,6 +13,11 @@ const Probe=struct {
 };
 var assertions:usize=0;
 fn check(ok:bool) !void {assertions+=1;if(!ok) return error.WorkControlContract;}
+fn sameError(a:?anyerror,b:?anyerror) bool {
+    if(a) |left| {if(b) |right| return left==right;return false;}
+    if(b) |_| return false;
+    return true;
+}
 pub fn main() !void {
     const maximum=std.math.maxInt(u64);
     for([_]u64{0,1,5,63,64,65,255,256,257,maximum}) |limit|
@@ -29,7 +34,13 @@ pub fn main() !void {
         var scalar_error:?anyerror=null;
         for(0..count) |_| scalar.checkpoint() catch |err| {scalar_error=err;break;};
         var batch_error:?anyerror=null;batched.advance(count) catch |err| {batch_error=err;};
-        try check(scalar_error==batch_error and scalar.used==batched.used and scalar.until_poll==batched.until_poll and
+        if(!sameError(scalar_error,batch_error) or scalar.used!=batched.used or scalar.until_poll!=batched.until_poll or
+            scalar.max_work!=batched.max_work or scalar.poll_interval!=batched.poll_interval) {
+            std.debug.print("work mismatch limit={d} interval={d} count={d} initial={d} until={d} fail={d} mutate={} scalar={d}/{d}/{d} batch={d}/{d}/{d} errors={s}/{s}\n",
+                .{limit,interval,count,initial,until,fail_at,mutate,scalar.used,scalar.until_poll,a.calls,batched.used,batched.until_poll,b.calls,
+                if(scalar_error) |err| @errorName(err) else "none",if(batch_error) |err| @errorName(err) else "none"});
+        }
+        try check(sameError(scalar_error,batch_error) and scalar.used==batched.used and scalar.until_poll==batched.until_poll and
             scalar.max_work==batched.max_work and scalar.poll_interval==batched.poll_interval);
         try check(a.calls==b.calls and std.mem.eql(u64,a.trace[0..a.calls],b.trace[0..b.calls]));
     };
