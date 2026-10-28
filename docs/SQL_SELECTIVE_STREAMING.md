@@ -137,6 +137,17 @@ choice, not a new SQL range/cardinality limit.
 
 ### Sparse predicate cascades before dimension probes
 
+The follow-up instruction-address profile of the accepted five-million-row
+candidate identifies runtime comparison dispatch inside the sparse survivor
+loop. The refinement now dispatches once per predicate/block to a comptime
+operator-specialized loop. It still gathers only selected slots, validates
+nullable slots before loading their value payload, and leaves work charges,
+rejection counters, final residual evaluation and all admission guards intact.
+This removes per-survivor SQL operator dispatch without allocating a selection
+list or scanning an entire second column. Existing independent scalar models,
+all comparisons, work limits and error-ordering contracts remain authoritative;
+the instruction-count change alone does not establish a throughput gain.
+
 After a selective leading predicate produces a mask, additional safe leading
 AND conjuncts can refine only its surviving positions. Integral comparisons
 and fact DATE comparisons/BETWEEN with binder-validated literal bounds use

@@ -879,6 +879,29 @@ pub fn Exec(comptime config: types.Config) type {
                 return mask;
             }
 
+            /// Sparse survivors need gathers, not a second complete column
+            /// scan. Specialize the operator outside that gather loop so each
+            /// survivor executes one exact comparison rather than SQL dispatch.
+            fn refineComparisonMask(comptime op:ast.Op,table:*const S.Table,start:usize,predicate:CompactPredicate,initial:u64) u64 {
+                const base=@as(usize,predicate.column)*table.rows.len+start;
+                var selected=initial;var mask=initial;
+                while(selected!=0) {
+                    const i=@ctz(selected);selected&=selected-1;
+                    if(!predicate.nonnull and table.scan_nonnull[start+i]&(@as(u64,1)<<@intCast(predicate.column))==0) {
+                        mask&=~(@as(u64,1)<<@intCast(i));continue;
+                    }
+                    const value=table.scan_values[base+i];
+                    const matched=switch(op) {
+                        .eq=>value==predicate.value,.ne=>value!=predicate.value,
+                        .lt=>value<predicate.value,.le=>value<=predicate.value,
+                        .gt=>value>predicate.value,.ge=>value>=predicate.value,
+                        else=>unreachable,
+                    };
+                    if(!matched) mask&=~(@as(u64,1)<<@intCast(i));
+                }
+                return mask;
+            }
+
             const CompactFold = struct {
                 table: *const S.Table, domain: DenseDomain, grouped: bool, key_nonnull: bool,
                 transitions: []const Transition, nonnull: []const bool,
@@ -1253,11 +1276,15 @@ pub fn Exec(comptime config: types.Config) type {
                             for(cursor.cascade[0..cursor.cascade_count]) |extra| {
                                 if(mask==0) break;
                                 const before=@popCount(mask);try self.session.checkpoints(before);
-                                const single=[_]CompactPredicate{extra};var selected=mask;
-                                while(selected!=0) {
-                                    const i=@ctz(selected);selected&=selected-1;
-                                    if(!compactKeep(table,start+i,&single)) mask&=~(@as(u64,1)<<@intCast(i));
-                                }
+                                mask=switch(extra.op) {
+                                    .eq=>refineComparisonMask(.eq,table,start,extra,mask),
+                                    .ne=>refineComparisonMask(.ne,table,start,extra,mask),
+                                    .lt=>refineComparisonMask(.lt,table,start,extra,mask),
+                                    .le=>refineComparisonMask(.le,table,start,extra,mask),
+                                    .gt=>refineComparisonMask(.gt,table,start,extra,mask),
+                                    .ge=>refineComparisonMask(.ge,table,start,extra,mask),
+                                    else=>unreachable,
+                                };
                                 self.work.stream_stats.cascade_rejected+=before-@popCount(mask);
                             }
                             cursor.prefix_start=start;cursor.prefix_mask=mask;cursor.next+=count;
