@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "server_version": "18.3",
+  "psql_sha256": "832f7fdf02c1c592f2df5f8bf48b6cfbc1e2bfd713f0822d1ac6724a312b5895",
+  "test_source_sha256": "e332bdc29700666be45daf891bb29a3b74b2cd6c9da775d2d594473f2f5eeff0",
+  "platform": "native Windows",
+  "method": "Real PostgreSQL fixtures; temporary table inside rolled-back transaction; independent of Sig implementation",
+  "fixtures": [
+    {
+      "sql": "SELECT ROUND(2.5),ROUND(-2.5),ROUND(2.55,1),ROUND(-2.55,1),ROUND(1234.56,-1),ROUND(150.0,-2),ROUND(-150.0,-2)",
+      "expected": "3|-3|2.6|-2.6|1230|200|-200",
+      "actual": "3|-3|2.6|-2.6|1230|200|-200"
+    },
+    {
+      "sql": "SELECT ROUND(2.5::float8),ROUND(3.5::float8),ROUND(-2.5::float8),ROUND(-3.5::float8),ROUND(-0.5::float8),ROUND(0.5::float8)",
+      "expected": "2|4|-2|-4|-0|0",
+      "actual": "2|4|-2|-4|-0|0"
+    },
+    {
+      "sql": "SELECT ROUND(2),ROUND(2::numeric),ROUND('2.5'),ROUND(NULL),ROUND(NULL,2),ROUND(2,2)",
+      "expected": "2|2|2|NULL|NULL|2.00",
+      "actual": "2|2|2|NULL|NULL|2.00"
+    },
+    {
+      "sql": "SELECT ROUND('NaN'::numeric,2),ROUND('Infinity'::numeric,-2),ROUND('-Infinity'::numeric,2),ROUND('NaN'::float8),ROUND('Infinity'::float8),ROUND('-Infinity'::float8)",
+      "expected": "NaN|Infinity|-Infinity|NaN|Infinity|-Infinity",
+      "actual": "NaN|Infinity|-Infinity|NaN|Infinity|-Infinity"
+    },
+    {
+      "sql": "SELECT ROUND(-0.5::float8),ROUND('-0'::float8),ROUND(-0.1::float8)",
+      "expected": "-0|-0|-0",
+      "actual": "-0|-0|-0"
+    },
+    {
+      "sql": "SELECT ROUND(123.45,-2147483648),ROUND(0.0,-2147483648),ROUND(NULL::numeric,2147483647),ROUND(1.5,NULL)",
+      "expected": "0|0|NULL|NULL",
+      "actual": "0|0|NULL|NULL"
+    },
+    {
+      "sql": "SELECT ROUND(AVG(v),2) FROM rounding_data WHERE g=1",
+      "expected": "1.79",
+      "actual": "1.79"
+    },
+    {
+      "sql": "SELECT g,ROUND(AVG(v),2) FROM rounding_data GROUP BY g HAVING ROUND(AVG(v),2)>0 ORDER BY g",
+      "expected": "1|1.79",
+      "actual": "1|1.79"
+    },
+    {
+      "sql": "SELECT ROUND(v,g-1) FROM rounding_data WHERE id=4",
+      "expected": "-1.3",
+      "actual": "-1.3"
+    },
+    {
+      "sql": "SELECT SUM(ROUND(v,1)) FROM rounding_data",
+      "expected": "2.2",
+      "actual": "2.2"
+    }
+  ]
+}

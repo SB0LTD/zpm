@@ -59,6 +59,59 @@ fn rejects(source: []const u8, wanted: anyerror) !void {
     }
 }
 
+fn rounding() !void {
+    // Fixtures and overload types checked against native PostgreSQL 18.3.
+    try row("SELECT ROUND(2.5),ROUND(-2.5),ROUND(2.55,1),ROUND(-2.55,1),ROUND(1234.56,-1),ROUND(150.0,-2),ROUND(-150.0,-2)","3|-3|2.6|-2.6|1230|200|-200");
+    try row("SELECT ROUND(2.5::float8),ROUND(3.5::float8),ROUND(-2.5::float8),ROUND(-3.5::float8),ROUND(-0.5::float8),ROUND(0.5::float8)","2|4|-2|-4|-0|0");
+    for(result.column_types[0..result.column_count]) |ty| try check(ty==.double);
+    try row("SELECT ROUND(2),ROUND(2::numeric),ROUND('2.5'),ROUND(NULL),ROUND(NULL,2),ROUND(2,2)","2|2|2|NULL|NULL|2.00");
+    for([_]@TypeOf(result.column_types[0]){.double,.numeric,.double,.double,.numeric,.numeric},0..) |ty,i| try check(result.column_types[i]==ty);
+    try row("SELECT ROUND('NaN'::numeric,2),ROUND('Infinity'::numeric,-2),ROUND('-Infinity'::numeric,2),ROUND('NaN'::float8),ROUND('Infinity'::float8),ROUND('-Infinity'::float8)","NaN|Infinity|-Infinity|NaN|Infinity|-Infinity");
+    try row("SELECT ROUND(-0.5::float8),ROUND('-0'::float8),ROUND(-0.1::float8)","-0|-0|-0");
+    for(result.rows[0].cells[0..3]) |cell| try check(@as(u64,@bitCast(cell.float8))==0x8000000000000000);
+    try row("SELECT ROUND(123.45,-2147483648),ROUND(0.0,-2147483648),ROUND(NULL::numeric,2147483647),ROUND(1.5,NULL)","0|0|NULL|NULL");
+    try rejects("SELECT ROUND()",error.UndefinedFunction);
+    try rejects("SELECT ROUND(1,2,3)",error.UndefinedFunction);
+    try rejects("SELECT ROUND(TRUE)",error.UndefinedFunction);
+    try rejects("SELECT ROUND(1.5::float8,2)",error.UndefinedFunction);
+    try rejects("SELECT ROUND(1.5,2::bigint)",error.UndefinedFunction);
+    try rejects("SELECT ROUND(1.5,2.0)",error.UndefinedFunction);
+    try rejects("SELECT ROUND('bad')",error.InvalidTextRepresentation);
+    try rejects("SELECT ROUND('bad',2)",error.InvalidTextRepresentation);
+    try rejects("SELECT ROUND(1.0,2147483647)",error.NumericCapacity);
+    try rejects("SELECT ROUND(9999999999999999999999999999999999999999999999999999999999999999::numeric,120)",error.NumericCapacity);
+    var source:[160]u8=undefined;var expected:[80]u8=undefined;
+    // An integer quantization model, independent of Numeric.round.
+    for(0..2001) |i| {
+        const coefficient=@as(i64,@intCast(i))-1000;
+        const magnitude=@abs(coefficient);
+        const rounded=(magnitude+5)/10;
+        const sql_text=try std.fmt.bufPrint(&source,"SELECT ROUND({s}{d}.{d:0>3},2)",.{if(coefficient<0) "-" else "",magnitude/1000,magnitude%1000});
+        const wanted=try std.fmt.bufPrint(&expected,"{s}{d}.{d:0>2}",.{if(coefficient<0 and rounded!=0) "-" else "",rounded/100,rounded%100});
+        try row(sql_text,wanted);
+    }
+    // Both signs and every odd/even half-step around zero.
+    for(0..129) |i| {
+        const lower=@as(i64,@intCast(i))-64;
+        try db.execute(try std.fmt.bufPrint(&source,"SELECT ROUND({d}::float8+0.5::float8)",.{lower}),&result);
+        const wanted=if(lower&1==0) lower else lower+1;
+        try check(result.rows[0].cells[0].float8==@as(f64,@floatFromInt(wanted)));
+    }
+    try db.execute("SELECT ROUND('4503599627370495.5'::float8),ROUND('-4503599627370495.5'::float8),ROUND('1e308'::float8)",&result);
+    try check(result.rows[0].cells[0].float8==4503599627370496.0 and result.rows[0].cells[1].float8 == -4503599627370496.0 and result.rows[0].cells[2].float8==1e308);
+    try db.execute("CREATE TABLE rounding_data(id INT PRIMARY KEY,g INT,v NUMERIC)",&result);
+    try db.execute("INSERT INTO rounding_data VALUES(1,1,1.235),(2,1,2.345),(3,2,NULL),(4,2,-1.255)",&result);
+    try row("SELECT ROUND(AVG(v),2) FROM rounding_data WHERE g=1","1.79");
+    try row("SELECT g,ROUND(AVG(v),2) FROM rounding_data GROUP BY g HAVING ROUND(AVG(v),2)>0 ORDER BY g","1|1.79");
+    try row("SELECT ROUND(v,g-1) FROM rounding_data WHERE id=4","-1.3");
+    try row("SELECT SUM(ROUND(v,1)) FROM rounding_data","2.2");
+    const previous=result;
+    try rejects("SELECT ROUND(v,2147483647) FROM rounding_data",error.NumericCapacity);
+    try check(result.row_count==previous.row_count and result.column_count==previous.column_count and DB.compareCells(&result.rows[0].cells[0],&previous.rows[0].cells[0])==0);
+    try check(db.usage().pending_versions==0 and db.usage().transactions==0);
+    try db.execute("DROP TABLE rounding_data",&result);
+}
+
 fn numeric() !void {
     try row("SELECT 12.34565::numeric(18,4), 1/3::numeric, 10/4::numeric, 1.5*2.25, 2/3.0, 100.0/3", "12.3457|0.33333333333333333333|2.5000000000000000|3.375|0.66666666666666666667|33.3333333333333333");
     try row("SELECT 0.001/7, 123456789/0.001, 1.0 * 1.00, 0.0001 * 0.0001, -1.5 * 0, 1e-10/3", "0.00014285714285714286|123456789000.00000000|1.000|0.00000001|0.0|0.0000000000333333333333333333");
@@ -337,6 +390,7 @@ fn changeLog() !void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    try rounding();
     try numeric();
     try floats();
     try temporals();

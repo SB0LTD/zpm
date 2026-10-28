@@ -407,10 +407,15 @@ pub fn Ops(comptime digits: usize) type {
             const current: i32 = value.dscale;
             if (scale >= current) {
                 if (target > max_scale) return error.NumericCapacity;
-                return make(raw * pow10[@intCast(target - value.dscale)], target, value.negative);
+                const shift = target - value.dscale;
+                // Reject before widening arithmetic: a bounded coefficient
+                // times 10^120 can overflow even the u512 intermediate.
+                if (raw != 0 and digitCount(raw) + shift > digits) return error.NumericCapacity;
+                return make(raw * pow10[shift], target, value.negative);
             }
-            const drop: usize = @intCast(current - scale);
-            if (drop >= 150) return make(0, target, false);
+            const drop_wide: i64 = @as(i64, current) - scale;
+            if (drop_wide >= 150) return make(0, target, false);
+            const drop: usize = @intCast(drop_wide);
             const unit = pow10[drop];
             const remainder = raw % unit;
             raw /= unit;
