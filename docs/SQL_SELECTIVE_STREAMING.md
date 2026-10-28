@@ -112,6 +112,27 @@ before claiming a performance advantage.
 
 ## Current research and applicable next experiments
 
+### Reuse binder-validated DATE literals
+
+The post-projection selective-join profile still includes repeated temporal
+parsing, field decoding and typmod work. The binder already validates an
+untyped DATE literal once; execution previously discarded that proof and
+repeated the conversion for each surviving fact. Binding now retains the exact
+day count in the node's existing integer payload plus a validation flag. A
+DATE cast over that validated literal reuses the same value. This adds no
+query cache, input-dependent storage or mutable shared expression state.
+
+Invalid literal errors still occur at their existing binding phase, including
+behind FALSE. Computed text/date casts retain canonical lazy evaluation and
+runtime errors. Only successfully prevalidated pure DATE literals are folded;
+clock functions and timezone-dependent computed conversions are untouched.
+Evaluation retains the literal child's checkpoint when bypassing its cast,
+so cancellation/work charging stays equivalent. The independent fixture
+compares both implicit DATE coercion and eight original-style joins against
+the prior immutable source: all nine instrumented work totals match exactly.
+Multiple distinct literals, reused node IDs, infinities, BC dates, private
+writes and pinned snapshots remain covered by the surrounding contracts.
+
 - [Robust Predicate Transfer with Dynamic Execution, PVLDB 2026](https://www.vldb.org/pvldb/vol19/p1278-qiao.pdf)
   combines asymmetric transfer plans, coarse/fine filters and runtime decisions
   about filter construction. The applicable lesson is to account for filter

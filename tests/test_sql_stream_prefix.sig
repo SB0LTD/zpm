@@ -88,7 +88,7 @@ pub fn main() !void {
     try database.execute("CREATE TABLE facts(id INT PRIMARY KEY,store INT,product INT,day DATE,amount INT)",&result);
     try database.execute("CREATE TABLE products(id INT PRIMARY KEY,category INT)",&result);
     try database.execute("CREATE TABLE categories(id INT PRIMARY KEY,label TEXT)",&result);
-    var buffer:[512]u8=undefined;
+    var buffer:[4096]u8=undefined;
     for(0..4) |i| try database.execute(try std.fmt.bufPrint(&buffer,"INSERT INTO categories VALUES({d},'c{d}')",.{i,i}),&result);
     for(0..16) |i| try database.execute(try std.fmt.bufPrint(&buffer,"INSERT INTO products VALUES({d},{d})",.{i,i/4}),&result);
     for(0..n) |i| {
@@ -97,8 +97,39 @@ pub fn main() !void {
         try database.execute(try std.fmt.bufPrint(&buffer,"INSERT INTO facts VALUES({d},{d},{s},DATE '2025-{d:0>2}-15',{d})",.{i,i%8,product,i%12+1,@as(i64,@intCast(i))-128}),&result);
     }
     try dateProjection(n);const initial_dates=result;
+    // Distinct literal values and reused node IDs in later statements must not
+    // substitute a prior value. Every DATE remains independently bound.
+    var literal_at:usize=0;
+    const header="SELECT COUNT(*) FROM facts WHERE day IN (";
+    @memcpy(buffer[0..header.len],header);literal_at=header.len;
+    for(0..32) |i| {
+        const month=if(i<28) @as(usize,1) else i-26;const day=if(i<28) i+1 else 15;
+        const part=try std.fmt.bufPrint(buffer[literal_at..],"{s}DATE '2025-{d:0>2}-{d:0>2}'",.{if(i==0) "" else ",",month,day});literal_at+=part.len;
+    }
+    buffer[literal_at]=')';literal_at+=1;try database.execute(buffer[0..literal_at],&result);
+    var literal_expected:i64=0;for(0..n) |i| if(i%12<5) {literal_expected+=1;};
+    try check(result.row_count==1 and result.rows[0].cells[0].integer==literal_expected);
+    // Literal input validation already happens at binding, even behind FALSE.
+    try rejected("SELECT COUNT(*) FROM facts WHERE store=999 AND day>DATE 'invalid'",error.InvalidDatetimeFormat);
+    try rejected("SELECT COUNT(*) FROM facts WHERE store=0 AND day>DATE 'invalid'",error.InvalidDatetimeFormat);
+    // A computed text-to-date cast is not prevalidated and must stay lazy.
+    try database.execute("SELECT COUNT(*) FROM facts WHERE store=999 AND day>CAST(CAST('invalid' AS TEXT) AS DATE)",&result);
+    try check(result.rows[0].cells[0].integer==0);
+    try rejected("SELECT COUNT(*) FROM facts WHERE store=0 AND day>CAST(CAST('invalid' AS TEXT) AS DATE)",error.InvalidDatetimeFormat);
+    var implicit_control:sql.ExecutionControl=.{};database.session.control=&implicit_control;
+    try database.execute("SELECT COUNT(*) FROM facts WHERE day>='2025-03-01' AND day<='2025-08-31'",&result);database.session.control=null;
+    std.debug.print("literal-work implicit used={d}\n",.{implicit_control.used});
+    var implicit_expected:i64=0;for(0..n) |i| if(i%12>=2 and i%12<=7) {implicit_expected+=1;};
+    try check(result.rows[0].cells[0].integer==implicit_expected);
     for(0..8) |store| {
+        var literal_control:sql.ExecutionControl=.{};database.session.control=&literal_control;
         try database.execute(try std.fmt.bufPrint(&buffer,query,.{store}),&result);
+        database.session.control=null;
+        std.debug.print("literal-work store={d} used={d}\n",.{store,literal_control.used});
+        if(comptime @hasField(@TypeOf(database.workspace.nodes.nodes[0]),"date_bound")) {
+            var bound:usize=0;for(database.workspace.nodes.nodes[0..database.workspace.nodes.len]) |node| {bound+=@intFromBool(node.date_bound);}
+            try check(bound>=2);
+        }
         try model(@intCast(store),false,false,.eq);
         const stats=database.workspace.query.stream_stats;
         try check(stats.rows==n);
