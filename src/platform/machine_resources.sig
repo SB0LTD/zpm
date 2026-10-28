@@ -284,16 +284,19 @@ fn observeWindows(b:Buffers) Error!Observation {
         .single_group_mask=if(group_count==1) process_mask else null,.group_masks=job_affinity});
     const commit_ceiling=@addWithOverflow(app.total,app.available);if(commit_ceiling[1]!=0) return error.ArithmeticOverflow;
     var observation:Observation=.{.machine=.{.usable_cpus=topology.logical,.physical_total=memory.total,.available_physical=memory.available,
-        .process_resident=counters.ws,.process_committed=app.total,.available_commit=app.available,
+        // APP_MEMORY_INFORMATION includes app/shared commitment. Keep that
+        // charge in the app scope; only this process's private commitment is
+        // ownership that may be added back when granting private OS pages.
+        .process_resident=counters.ws,.process_committed=counters.private,.available_commit=app.available,
         .available_address_space=memory.available_virtual,
-        .scope_limit=commit_ceiling[0],.scope_used=app.total},.commit_source=.os,.physical_cores=topology.cores,.numa_localities=topology.numa_localities};
+        .scope_limit=commit_ceiling[0],.scope_used=app.total,.scope_charge=.committed},.commit_source=.os,.physical_cores=topology.cores,.numa_localities=topology.numa_localities};
     if(in_job!=0) {
         observation.immediate_job=true;
         var job:Win.Job=.{};
         if(Win.QueryInformationJobObject(null,9,&job,@sizeOf(Win.Job),null)==0) return error.ProbeFailed;
         var scopes:facts.Scopes=.{};
         scopes.memory(commit_ceiling[0],app.total);
-        if(job.basic.flags&0x100!=0) scopes.memory(job.process_memory,app.private);
+        if(job.basic.flags&0x100!=0) scopes.memory(job.process_memory,counters.private);
         if(job.basic.flags&0x200!=0) {
             // Same current-usage query as Microsoft's HCS container shim.
             // Notification/violation snapshots and peaks are not current usage.

@@ -23,6 +23,20 @@ fn plans() !void {
     m=base;m.scope_limit=16*GiB;m.scope_used=12*GiB;
     const scoped=try budget.plan(m,.{.fixed_bytes=GiB,.recovery_bytes=GiB});
     try check(scoped.headroom_bytes==GiB and scoped.process_bytes==11*GiB and scoped.new_commit_bytes==3*GiB);
+    // Reserved/committed execution arenas need not be resident yet. A commit
+    // scope must include those owned bytes once, even before first touch.
+    m=base;m.process_resident=2*GiB;m.process_committed=8*GiB;
+    m.scope_limit=16*GiB;m.scope_used=10*GiB;
+    const resident_scope=try budget.plan(m,.{.recovery_bytes=0});
+    try check(resident_scope.process_bytes==7*GiB and resident_scope.pressure);
+    m.scope_charge=.committed;
+    const committed_scope=try budget.plan(m,.{.recovery_bytes=0});
+    try check(committed_scope.process_bytes==13*GiB and committed_scope.new_commit_bytes==5*GiB and !committed_scope.pressure);
+    try check((try budget.plan(m,.{.hard_process_bytes=12*GiB})).process_bytes==12*GiB);
+    m.available_physical=GiB;
+    try check((try budget.plan(m,.{})).process_bytes==2*GiB);
+    m.available_physical=32*GiB;m.scope_used=16*GiB;
+    try check((try budget.plan(m,.{})).new_commit_bytes==0);
     // Container headroom derives from the effective scope, not the host size.
     m=.{.usable_cpus=128,.physical_total=1024*GiB,.available_physical=512*GiB,
         .process_resident=GiB,.process_committed=GiB,.scope_limit=8*GiB,.scope_used=2*GiB};
