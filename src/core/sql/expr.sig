@@ -410,6 +410,12 @@ pub fn Eval(comptime config: types.Config) type {
         }
 
         fn compareOp(op: ast.Op, left: *const V.Cell, right: *const V.Cell) ?bool {
+            if (op == .is_distinct or op == .is_not_distinct) {
+                const left_null = left.* == .null_value;
+                const right_null = right.* == .null_value;
+                const equal = if (left_null or right_null) left_null and right_null else V.compare(left, right) == 0;
+                return if (op == .is_not_distinct) equal else !equal;
+            }
             if (left.* == .null_value or right.* == .null_value) return null;
             const order = V.compare(left, right);
             return switch (op) {
@@ -487,7 +493,7 @@ pub fn Eval(comptime config: types.Config) type {
                     };
                 },
                 .binary => {
-                    if (n.op == .eq or n.op == .ne or n.op == .lt or n.op == .le or n.op == .gt or n.op == .ge) {
+                    if (n.op == .eq or n.op == .ne or n.op == .lt or n.op == .le or n.op == .gt or n.op == .ge or n.op == .is_distinct or n.op == .is_not_distinct) {
                         // Column operands compare in place, without a cell copy.
                         var left_value: V.Cell = undefined;
                         var right_value: V.Cell = undefined;
@@ -613,7 +619,7 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.negate(&value, n.ty);
                 },
                 .binary => switch (n.op) {
-                    .eq, .ne, .lt, .le, .gt, .ge, .contains, .contained, .exists => return boolCell(try truth(ctx, id)),
+                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists => return boolCell(try truth(ctx, id)),
                     .concat => {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
@@ -693,6 +699,18 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.atZone(&value, zone.text.slice(), ctx.session);
                 },
                 .function => switch (n.func) {
+                    .greatest, .least => {
+                        var best: V.Cell = .null_value;
+                        var item = n.b;
+                        while (item != none) : (item = node(ctx, item).next) {
+                            const candidate = try eval(ctx, item);
+                            if (candidate == .null_value) continue;
+                            if (best == .null_value) { best = candidate; continue; }
+                            const order = V.compare(&candidate, &best);
+                            if ((n.func == .greatest and order > 0) or (n.func == .least and order < 0)) best = candidate;
+                        }
+                        return best;
+                    },
                     .round => {
                         const argument = try eval(ctx, n.b);
                         const scale_id = node(ctx, n.b).next;

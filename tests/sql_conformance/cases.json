@@ -1,0 +1,1666 @@
+{
+  "schema": 1,
+  "target": "PostgreSQL 18.3; native MySQL/T-SQL lanes remain separately versioned and unqualified",
+  "source_baseline": "53655a9a89a3ddff6f2f5829388b09a10c3d9c93",
+  "qualification": "incomplete",
+  "note": "Every fixture is an executable smoke specification, not proof of complete feature/overload behavior. Scope/lane not runnable must fail qualification, never become a passing skip.",
+  "fixtures": {
+    "base": [
+      "CREATE TABLE tdd_a(id INT PRIMARY KEY,g INT,v INT)",
+      "INSERT INTO tdd_a VALUES(1,1,10),(2,1,20),(3,2,30),(4,2,NULL)",
+      "CREATE TABLE tdd_b(id INT PRIMARY KEY,v INT)",
+      "INSERT INTO tdd_b VALUES(1,11),(3,33),(5,55)"
+    ],
+    "none": []
+  },
+  "closure_dimensions": [
+    "results_and_types",
+    "null_and_empty",
+    "errors_and_atomicity",
+    "parameterized_execution",
+    "rollback_and_replay",
+    "resource_and_cancellation",
+    "concurrency_if_applicable",
+    "cross_platform"
+  ],
+  "cases": [
+    {
+      "id": "PG.PRED.DISTINCT",
+      "dialect": "postgresql18",
+      "family": "predicates",
+      "title": "NULL-safe equality",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT NULL IS DISTINCT FROM NULL,NULL IS DISTINCT FROM 1,1 IS NOT DISTINCT FROM 1"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.PRED.QUANTIFIED",
+      "dialect": "postgresql18",
+      "family": "predicates",
+      "title": "ANY/SOME/ALL",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT 1=ANY(SELECT id FROM tdd_a),5>ALL(SELECT id FROM tdd_a)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.PRED.SYMMETRIC",
+      "dialect": "postgresql18",
+      "family": "predicates",
+      "title": "Symmetric BETWEEN",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT 2 BETWEEN SYMMETRIC 3 AND 1"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.PRED.OVERLAPS",
+      "dialect": "postgresql18",
+      "family": "predicates",
+      "title": "Temporal overlaps",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT (DATE '2025-01-01',DATE '2025-02-01') OVERLAPS (DATE '2025-01-15',DATE '2025-03-01')"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.PRED.REGEX",
+      "dialect": "postgresql18",
+      "family": "predicates",
+      "title": "Regular expressions",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT 'abc' ~ '^a','ABC' ~* '^a','abc' SIMILAR TO 'a%'"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.PRED.ESCAPE",
+      "dialect": "postgresql18",
+      "family": "predicates",
+      "title": "LIKE escape clause",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT 'a_b' LIKE 'a!_b' ESCAPE '!'"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.QUERY.WINDOW",
+      "dialect": "postgresql18",
+      "family": "windows",
+      "title": "Ranking/offset windows",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT id,ROW_NUMBER() OVER (ORDER BY id),RANK() OVER (ORDER BY g),DENSE_RANK() OVER (ORDER BY g),LAG(v) OVER (ORDER BY id),LEAD(v) OVER (ORDER BY id) FROM tdd_a ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.QUERY.WINDOW_AGG",
+      "dialect": "postgresql18",
+      "family": "windows",
+      "title": "Window aggregates",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT id,SUM(v) OVER (),SUM(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM tdd_a ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.QUERY.WINDOW_FRAMES",
+      "dialect": "postgresql18",
+      "family": "windows",
+      "title": "Named windows and frame exclusions",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT id,SUM(v) OVER w FROM tdd_a WINDOW w AS (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.GROUP.ROLLUP",
+      "dialect": "postgresql18",
+      "family": "grouping",
+      "title": "ROLLUP/GROUPING",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT g,COUNT(*),SUM(v),GROUPING(g) FROM tdd_a GROUP BY ROLLUP(g) ORDER BY GROUPING(g),g"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.GROUP.CUBE",
+      "dialect": "postgresql18",
+      "family": "grouping",
+      "title": "CUBE",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT g,v,COUNT(*) FROM tdd_a GROUP BY CUBE(g,v) ORDER BY GROUPING(g,v),g NULLS LAST,v NULLS LAST"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.GROUP.SETS",
+      "dialect": "postgresql18",
+      "family": "grouping",
+      "title": "GROUPING SETS",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT g,COUNT(*) FROM tdd_a GROUP BY GROUPING SETS ((g),()) ORDER BY GROUPING(g),g"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.AGG.COLLECTION",
+      "dialect": "postgresql18",
+      "family": "aggregates",
+      "title": "String/array aggregates",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT g,STRING_AGG(id::text,',' ORDER BY id),ARRAY_AGG(v ORDER BY id) FROM tdd_a GROUP BY g ORDER BY g"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.AGG.STATISTICAL",
+      "dialect": "postgresql18",
+      "family": "aggregates",
+      "title": "Statistical aggregates",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT STDDEV_POP(v),VAR_POP(v),CORR(id,v),COVAR_POP(id,v),REGR_COUNT(id,v) FROM tdd_a"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.AGG.ORDERED_SET",
+      "dialect": "postgresql18",
+      "family": "aggregates",
+      "title": "Ordered-set aggregates",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v),PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v),MODE() WITHIN GROUP (ORDER BY g) FROM tdd_a"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.AGG.BITWISE",
+      "dialect": "postgresql18",
+      "family": "aggregates",
+      "title": "Bitwise aggregates",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT BIT_AND(id),BIT_OR(id),BIT_XOR(id) FROM tdd_a"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.AGG.INTERVAL",
+      "dialect": "postgresql18",
+      "family": "aggregates",
+      "title": "AVG(interval)",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT AVG(id*INTERVAL '1 day') FROM tdd_a"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.JOIN.LATERAL",
+      "dialect": "postgresql18",
+      "family": "joins",
+      "title": "LATERAL",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT a.id,x.v FROM tdd_a a CROSS JOIN LATERAL (SELECT a.id+1 AS v) x ORDER BY a.id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.JOIN.NATURAL",
+      "dialect": "postgresql18",
+      "family": "joins",
+      "title": "NATURAL JOIN",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT id FROM tdd_a NATURAL JOIN tdd_b ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.JOIN.TREE",
+      "dialect": "postgresql18",
+      "family": "joins",
+      "title": "Parenthesized join tree",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT a.id FROM (tdd_a a JOIN tdd_b b ON a.id=b.id) LEFT JOIN tdd_b c ON c.id=a.id ORDER BY a.id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.QUERY.TABLE_FUNCTION",
+      "dialect": "postgresql18",
+      "family": "queries",
+      "title": "Set-returning/table functions",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT x,n FROM GENERATE_SERIES(1,3) WITH ORDINALITY AS t(x,n) ORDER BY n"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.QUERY.MODIFYING_CTE",
+      "dialect": "postgresql18",
+      "family": "queries",
+      "title": "Data-modifying CTE",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "WITH changed AS (UPDATE tdd_a SET v=v+1 WHERE id=1 RETURNING id,v) SELECT * FROM changed"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.QUERY.CTE_MATERIALIZATION",
+      "dialect": "postgresql18",
+      "family": "queries",
+      "title": "CTE materialization syntax",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "WITH x AS NOT MATERIALIZED (SELECT id FROM tdd_a) SELECT * FROM x ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.QUERY.RECURSIVE_SEARCH",
+      "dialect": "postgresql18",
+      "family": "queries",
+      "title": "Recursive SEARCH/CYCLE",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SEARCH DEPTH FIRST BY n SET ord CYCLE n SET cyc USING path SELECT n,cyc FROM t ORDER BY n"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.QUERY.ROW",
+      "dialect": "postgresql18",
+      "family": "queries",
+      "title": "Row expressions/comparison",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT ROW(1,NULL) IS NOT DISTINCT FROM ROW(1,NULL),ROW(1,2)<ROW(1,3)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.QUERY.VALUES_TABLE",
+      "dialect": "postgresql18",
+      "family": "queries",
+      "title": "Standalone VALUES/TABLE",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "VALUES (1),(2)",
+        "TABLE tdd_a ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.QUERY.SAMPLE",
+      "dialect": "postgresql18",
+      "family": "queries",
+      "title": "TABLESAMPLE",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT COUNT(*) FROM tdd_a TABLESAMPLE SYSTEM(100) REPEATABLE(1)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.QUERY.FETCH_TIES",
+      "dialect": "postgresql18",
+      "family": "queries",
+      "title": "FETCH WITH TIES",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT g FROM tdd_a ORDER BY g FETCH FIRST 1 ROW WITH TIES"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.QUERY.LIMIT_EXPR",
+      "dialect": "postgresql18",
+      "family": "queries",
+      "title": "Expression LIMIT/OFFSET",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT id FROM tdd_a ORDER BY id LIMIT (1+1) OFFSET (1+0)"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.DDL.SCHEMA",
+      "dialect": "postgresql18",
+      "family": "schema",
+      "title": "Schema lifecycle",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE SCHEMA tdd_schema",
+        "CREATE TABLE tdd_schema.t(id INT)",
+        "INSERT INTO tdd_schema.t VALUES(1)",
+        "SELECT * FROM tdd_schema.t"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.DDL.ALTER",
+      "dialect": "postgresql18",
+      "family": "schema",
+      "title": "ALTER TABLE",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "ALTER TABLE tdd_a ADD COLUMN extra INT DEFAULT 7",
+        "ALTER TABLE tdd_a RENAME COLUMN extra TO renamed",
+        "SELECT renamed FROM tdd_a ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.DDL.CREATE_VARIANTS",
+      "dialect": "postgresql18",
+      "family": "schema",
+      "title": "Temporary/CTAS/LIKE",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TEMP TABLE tdd_tmp AS SELECT id FROM tdd_a",
+        "CREATE TABLE tdd_like (LIKE tdd_a INCLUDING ALL)",
+        "SELECT * FROM tdd_tmp ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.DDL.INHERITANCE",
+      "dialect": "postgresql18",
+      "family": "schema",
+      "title": "Table inheritance",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_child(extra INT) INHERITS(tdd_a)",
+        "INSERT INTO tdd_child(id,g,v,extra) VALUES(9,1,2,3)",
+        "SELECT id FROM tdd_a ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.DDL.PARTITION",
+      "dialect": "postgresql18",
+      "family": "schema",
+      "title": "Partition lifecycle",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_part(id INT) PARTITION BY RANGE(id)",
+        "CREATE TABLE tdd_part0 PARTITION OF tdd_part FOR VALUES FROM (0) TO (10)",
+        "INSERT INTO tdd_part VALUES(1)",
+        "SELECT * FROM tdd_part"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.DDL.IF_EXISTS",
+      "dialect": "postgresql18",
+      "family": "schema",
+      "title": "Conditional DDL",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE IF NOT EXISTS tdd_new(id INT)",
+        "CREATE TABLE IF NOT EXISTS tdd_new(id INT)",
+        "DROP TABLE IF EXISTS tdd_new",
+        "DROP TABLE IF EXISTS tdd_new"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.DDL.TRUNCATE",
+      "dialect": "postgresql18",
+      "family": "schema",
+      "title": "TRUNCATE",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "TRUNCATE tdd_a",
+        "SELECT COUNT(*) FROM tdd_a"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.DDL.DATABASE",
+      "dialect": "postgresql18",
+      "family": "schema",
+      "title": "Database lifecycle",
+      "coverage": "smoke",
+      "scope": "cluster",
+      "setup": "none",
+      "statements": [
+        "CREATE DATABASE ramsql_tdd_child",
+        "SELECT datname FROM pg_database WHERE datname='ramsql_tdd_child'",
+        "DROP DATABASE ramsql_tdd_child"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.CONSTRAINT.COMPOSITE",
+      "dialect": "postgresql18",
+      "family": "constraints",
+      "title": "Composite/table-level primary key",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_pk(a INT,b INT,CONSTRAINT tdd_pk_pk PRIMARY KEY(a,b))",
+        "INSERT INTO tdd_pk VALUES(1,1),(1,2)",
+        "SELECT * FROM tdd_pk ORDER BY a,b"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.CONSTRAINT.UNIQUE",
+      "dialect": "postgresql18",
+      "family": "constraints",
+      "title": "UNIQUE/NULL rules",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_u(a INT UNIQUE NULLS NOT DISTINCT)",
+        "INSERT INTO tdd_u VALUES(NULL),(1)",
+        "SELECT * FROM tdd_u ORDER BY a NULLS FIRST"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.CONSTRAINT.CHECK",
+      "dialect": "postgresql18",
+      "family": "constraints",
+      "title": "CHECK",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_check(v INT CHECK(v>0))",
+        "INSERT INTO tdd_check VALUES(1)",
+        "SELECT * FROM tdd_check"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.CONSTRAINT.FK",
+      "dialect": "postgresql18",
+      "family": "constraints",
+      "title": "Foreign-key actions",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_fk(id INT REFERENCES tdd_a(id) ON DELETE CASCADE)",
+        "INSERT INTO tdd_fk VALUES(1)",
+        "DELETE FROM tdd_a WHERE id=1",
+        "SELECT COUNT(*) FROM tdd_fk"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.CONSTRAINT.DEFERRED",
+      "dialect": "postgresql18",
+      "family": "constraints",
+      "title": "Deferred constraints",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_du(v INT UNIQUE DEFERRABLE INITIALLY DEFERRED)",
+        "INSERT INTO tdd_du VALUES(1),(1)",
+        "DELETE FROM tdd_du",
+        "SET CONSTRAINTS ALL IMMEDIATE"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.CONSTRAINT.EXCLUSION",
+      "dialect": "postgresql18",
+      "family": "constraints",
+      "title": "Exclusion constraints",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_ex(v INT4RANGE,EXCLUDE USING gist(v WITH &&))",
+        "INSERT INTO tdd_ex VALUES('[1,3)')",
+        "SELECT v FROM tdd_ex"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.INDEX.SECONDARY",
+      "dialect": "postgresql18",
+      "family": "indexes",
+      "title": "Secondary/index catalog",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE INDEX tdd_ix ON tdd_a(v)",
+        "SELECT indexname FROM pg_indexes WHERE indexname='tdd_ix'"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.INDEX.ADVANCED",
+      "dialect": "postgresql18",
+      "family": "indexes",
+      "title": "Composite/expression/partial/covering index",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE INDEX tdd_adv ON tdd_a(g,(v+1)) INCLUDE(id) WHERE v IS NOT NULL",
+        "SELECT indexname FROM pg_indexes WHERE indexname='tdd_adv'"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.DML.UPDATE_FROM",
+      "dialect": "postgresql18",
+      "family": "dml",
+      "title": "UPDATE FROM",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "UPDATE tdd_a a SET v=b.v FROM tdd_b b WHERE a.id=b.id",
+        "SELECT id,v FROM tdd_a ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.DML.DELETE_USING",
+      "dialect": "postgresql18",
+      "family": "dml",
+      "title": "DELETE USING",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "DELETE FROM tdd_a a USING tdd_b b WHERE a.id=b.id",
+        "SELECT id FROM tdd_a ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.DML.TUPLE_ASSIGN",
+      "dialect": "postgresql18",
+      "family": "dml",
+      "title": "Tuple assignment",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "UPDATE tdd_a SET (g,v)=(3,4) WHERE id=1",
+        "SELECT g,v FROM tdd_a WHERE id=1"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.DML.MERGE",
+      "dialect": "postgresql18",
+      "family": "dml",
+      "title": "MERGE",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "MERGE INTO tdd_a a USING tdd_b b ON a.id=b.id WHEN MATCHED THEN UPDATE SET v=b.v WHEN NOT MATCHED THEN INSERT(id,g,v) VALUES(b.id,0,b.v)",
+        "SELECT id,v FROM tdd_a ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.DML.UPSERT_UNIQUE",
+      "dialect": "postgresql18",
+      "family": "dml",
+      "title": "Non-PK upsert",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_up(id INT PRIMARY KEY,v INT UNIQUE)",
+        "INSERT INTO tdd_up VALUES(1,2)",
+        "INSERT INTO tdd_up VALUES(3,2) ON CONFLICT(v) DO UPDATE SET id=EXCLUDED.id RETURNING id,v"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.SEQUENCE.EXTENDED",
+      "dialect": "postgresql18",
+      "family": "sequences",
+      "title": "Sequence lifecycle/cache/SERIAL",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_serial(id SERIAL PRIMARY KEY)",
+        "CREATE SEQUENCE tdd_seq CACHE 4",
+        "ALTER SEQUENCE tdd_seq RESTART WITH 9",
+        "SELECT nextval('tdd_seq')"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.DDL.VIRTUAL",
+      "dialect": "postgresql18",
+      "family": "schema",
+      "title": "Virtual generated columns",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_vg(v INT,doubled INT GENERATED ALWAYS AS(v*2) VIRTUAL)",
+        "INSERT INTO tdd_vg(v) VALUES(3)",
+        "SELECT * FROM tdd_vg"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.VIEW.ORDINARY",
+      "dialect": "postgresql18",
+      "family": "views",
+      "title": "Views",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE VIEW tdd_view AS SELECT id,v FROM tdd_a",
+        "SELECT * FROM tdd_view ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.VIEW.MATERIALIZED",
+      "dialect": "postgresql18",
+      "family": "views",
+      "title": "Materialized views",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE MATERIALIZED VIEW tdd_mv AS SELECT g,SUM(v) AS total FROM tdd_a GROUP BY g",
+        "REFRESH MATERIALIZED VIEW tdd_mv",
+        "SELECT * FROM tdd_mv ORDER BY g"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.TYPE.CHARACTER",
+      "dialect": "postgresql18",
+      "family": "types",
+      "title": "VARCHAR/CHAR",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_type(v VARCHAR(8))",
+        "INSERT INTO tdd_type VALUES('abc'),(NULL)",
+        "SELECT v FROM tdd_type ORDER BY v NULLS LAST"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.TYPE.BINARY",
+      "dialect": "postgresql18",
+      "family": "types",
+      "title": "BYTEA",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_type(v BYTEA)",
+        "INSERT INTO tdd_type VALUES('\\x00ff'::bytea),(NULL)",
+        "SELECT v FROM tdd_type ORDER BY v NULLS LAST"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.TYPE.UUID",
+      "dialect": "postgresql18",
+      "family": "types",
+      "title": "UUID",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_type(v UUID)",
+        "INSERT INTO tdd_type VALUES('12345678-1234-1234-1234-123456789abc'),(NULL)",
+        "SELECT v FROM tdd_type ORDER BY v NULLS LAST"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.TYPE.TIME",
+      "dialect": "postgresql18",
+      "family": "types",
+      "title": "TIME/TIMETZ",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_type(v TIME)",
+        "INSERT INTO tdd_type VALUES(TIME '12:34:56'),(NULL)",
+        "SELECT v FROM tdd_type ORDER BY v NULLS LAST"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.TYPE.MONEY",
+      "dialect": "postgresql18",
+      "family": "types",
+      "title": "MONEY",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_type(v MONEY)",
+        "INSERT INTO tdd_type VALUES(1),(NULL)",
+        "SELECT v FROM tdd_type ORDER BY v NULLS LAST"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.TYPE.BIT",
+      "dialect": "postgresql18",
+      "family": "types",
+      "title": "BIT/VARBIT",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_type(v BIT(3))",
+        "INSERT INTO tdd_type VALUES(B'101'),(NULL)",
+        "SELECT v FROM tdd_type ORDER BY v NULLS LAST"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.TYPE.NETWORK",
+      "dialect": "postgresql18",
+      "family": "types",
+      "title": "Network/MAC",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_type(v INET)",
+        "INSERT INTO tdd_type VALUES('192.0.2.1'),(NULL)",
+        "SELECT v FROM tdd_type ORDER BY v NULLS LAST"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.TYPE.GEOMETRIC",
+      "dialect": "postgresql18",
+      "family": "types",
+      "title": "Geometric types",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT POINT(1,2),BOX(POINT(1,2),POINT(3,4))"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.TYPE.XML",
+      "dialect": "postgresql18",
+      "family": "types",
+      "title": "XML",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_type(v XML)",
+        "INSERT INTO tdd_type VALUES(XMLPARSE(DOCUMENT '<x/>')),(NULL)",
+        "SELECT v FROM tdd_type"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.TYPE.ARRAY",
+      "dialect": "postgresql18",
+      "family": "types",
+      "title": "Arrays",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_type(v INT[])",
+        "INSERT INTO tdd_type VALUES(ARRAY[1,2]),(NULL)",
+        "SELECT v FROM tdd_type ORDER BY v NULLS LAST"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.TYPE.RANGE",
+      "dialect": "postgresql18",
+      "family": "types",
+      "title": "Range/multirange",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_type(v INT4RANGE)",
+        "INSERT INTO tdd_type VALUES('[1,3)'),(NULL)",
+        "SELECT v FROM tdd_type ORDER BY v NULLS LAST"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.TYPE.ENUM_DOMAIN_COMPOSITE",
+      "dialect": "postgresql18",
+      "family": "types",
+      "title": "User-defined types",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE TYPE tdd_enum AS ENUM ('a','b')",
+        "CREATE DOMAIN tdd_positive AS INT CHECK(VALUE>0)",
+        "CREATE TYPE tdd_composite AS (a INT,b TEXT)",
+        "SELECT 'a'::tdd_enum,1::tdd_positive,ROW(1,'x')::tdd_composite"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.TYPE.CATALOG_IDS",
+      "dialect": "postgresql18",
+      "family": "types",
+      "title": "Additional catalog identifiers",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT '0/16B6C50'::pg_lsn,'1'::xid8"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.JSON.OPS",
+      "dialect": "postgresql18",
+      "family": "json",
+      "title": "JSON operators",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT '{\"a\":1}'::json->>'a'"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.JSONB.MODIFY",
+      "dialect": "postgresql18",
+      "family": "json",
+      "title": "Remaining JSONB operations",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT jsonb_set('{\"a\":1}'::jsonb,'{a}','2'::jsonb),'{\"a\":1}'::jsonb||'{\"b\":2}'::jsonb"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.JSON.PATH",
+      "dialect": "postgresql18",
+      "family": "json",
+      "title": "JSONPATH/SQL-JSON",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT jsonb_path_exists('{\"a\":1}'::jsonb,'$.a')"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.JSON.TABLE",
+      "dialect": "postgresql18",
+      "family": "json",
+      "title": "JSON_TABLE",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT * FROM JSON_TABLE('[{\"a\":1}]','$[*]' COLUMNS(a INT PATH '$.a')) AS j"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.JSON.AGG",
+      "dialect": "postgresql18",
+      "family": "json",
+      "title": "JSON aggregates",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT JSON_AGG(id ORDER BY id),JSONB_OBJECT_AGG(id::text,v) FROM tdd_a"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.FUNC.STRING",
+      "dialect": "postgresql18",
+      "family": "functions",
+      "title": "String functions",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT lower('ABC'),upper('abc'),length('abcd'),substring('abcd' FROM 2 FOR 2),trim(' x '),position('b' IN 'abc'),replace('abc','b','x')"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.FUNC.NUMERIC",
+      "dialect": "postgresql18",
+      "family": "functions",
+      "title": "Numeric functions",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT abs(-2),ceil(1.2),floor(1.8),trunc(1.8),sqrt(4.0),power(2,3),ln(1.0)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.FUNC.TEMPORAL",
+      "dialect": "postgresql18",
+      "family": "functions",
+      "title": "Temporal functions",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT extract(year FROM DATE '2025-03-01'),date_trunc('month',TIMESTAMP '2025-03-15 12:00:00'),age(DATE '2025-03-01',DATE '2024-03-01')"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.FUNC.FORMAT",
+      "dialect": "postgresql18",
+      "family": "functions",
+      "title": "Formatting functions",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT to_char(DATE '2025-03-15','YYYY-MM'),to_date('2025-03-15','YYYY-MM-DD'),to_number('12.3','99.9')"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.FUNC.MINMAX",
+      "dialect": "postgresql18",
+      "family": "functions",
+      "title": "GREATEST/LEAST",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT greatest(1,NULL,3),least(1,NULL,3)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.FUNC.DISCOVERY",
+      "dialect": "postgresql18",
+      "family": "functions",
+      "title": "Discovery functions",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT pg_typeof(1),pg_get_serial_sequence('tdd_a','id')"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.TEXT.COLLATION",
+      "dialect": "postgresql18",
+      "family": "text",
+      "title": "Collation selection",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT 'a' COLLATE \"C\" < 'b' COLLATE \"C\""
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.TEXT.ENCODING",
+      "dialect": "postgresql18",
+      "family": "text",
+      "title": "Unicode/codepoint functions",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT char_length('\u05e9\u05dc\u05d5\u05dd'),octet_length('\u05e9\u05dc\u05d5\u05dd'),normalize('a',NFC)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.TEXT.LITERALS",
+      "dialect": "postgresql18",
+      "family": "text",
+      "title": "Escape/dollar/Unicode literals",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT E'a\\nb',$q$abc$q$,U&'d\\0061t'"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.TEXT.SEARCH",
+      "dialect": "postgresql18",
+      "family": "text",
+      "title": "Full text search",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT to_tsvector('simple','one two') @@ to_tsquery('simple','one')"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.OP.BITWISE",
+      "dialect": "postgresql18",
+      "family": "operators",
+      "title": "Bitwise operators",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT 3&1,3|4,3#1,1<<2,8>>1"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.TX.ISOLATION",
+      "dialect": "postgresql18",
+      "family": "transactions",
+      "title": "Repeatable Read/Serializable",
+      "coverage": "smoke_only_not_anomaly_proof",
+      "scope": "transaction",
+      "setup": "none",
+      "statements": [
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "SHOW transaction_isolation"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.TX.CHARACTERISTICS",
+      "dialect": "postgresql18",
+      "family": "transactions",
+      "title": "Transaction characteristics",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "none",
+      "statements": [
+        "SET TRANSACTION READ ONLY",
+        "SHOW transaction_read_only"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.TX.LOCK_MODES",
+      "dialect": "postgresql18",
+      "family": "transactions",
+      "title": "Additional row lock modes",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT id FROM tdd_a FOR NO KEY UPDATE OF tdd_a"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.TX.TABLE_LOCK",
+      "dialect": "postgresql18",
+      "family": "transactions",
+      "title": "Explicit table/advisory locking",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "LOCK TABLE tdd_a IN SHARE MODE",
+        "SELECT pg_try_advisory_xact_lock(123)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.TX.TWO_PHASE",
+      "dialect": "postgresql18",
+      "family": "transactions",
+      "title": "Two-phase commit",
+      "coverage": "smoke",
+      "scope": "cluster",
+      "setup": "none",
+      "statements": [
+        "BEGIN",
+        "SELECT 1",
+        "PREPARE TRANSACTION 'ramsql_tdd_tx'",
+        "COMMIT PREPARED 'ramsql_tdd_tx'"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.CURSOR",
+      "dialect": "postgresql18",
+      "family": "session",
+      "title": "Cursor lifecycle",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "DECLARE tdd_c SCROLL CURSOR FOR SELECT id FROM tdd_a ORDER BY id",
+        "FETCH NEXT FROM tdd_c",
+        "MOVE BACKWARD 1 FROM tdd_c",
+        "CLOSE tdd_c"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.SQL_PREPARE",
+      "dialect": "postgresql18",
+      "family": "session",
+      "title": "SQL prepared statements",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "PREPARE tdd_stmt(INT) AS SELECT $1+1",
+        "EXECUTE tdd_stmt(2)",
+        "DEALLOCATE tdd_stmt"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.SESSION.SETTINGS",
+      "dialect": "postgresql18",
+      "family": "session",
+      "title": "General settings/search_path",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SET LOCAL search_path TO public",
+        "SHOW search_path"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.SESSION.NOTIFY",
+      "dialect": "postgresql18",
+      "family": "session",
+      "title": "Notifications",
+      "coverage": "smoke_only_not_delivery_proof",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "LISTEN tdd_channel",
+        "NOTIFY tdd_channel,'x'",
+        "UNLISTEN tdd_channel"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.SECURITY.ROLE",
+      "dialect": "postgresql18",
+      "family": "security",
+      "title": "Roles/privileges",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE ROLE ramsql_tdd_role",
+        "GRANT SELECT ON tdd_a TO ramsql_tdd_role",
+        "REVOKE SELECT ON tdd_a FROM ramsql_tdd_role",
+        "DROP ROLE ramsql_tdd_role"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.SECURITY.RLS",
+      "dialect": "postgresql18",
+      "family": "security",
+      "title": "Row-level security",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "ALTER TABLE tdd_a ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY tdd_policy ON tdd_a USING(id>1)",
+        "SELECT policyname FROM pg_policies WHERE policyname='tdd_policy'"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.ROUTINE.FUNCTION",
+      "dialect": "postgresql18",
+      "family": "routines",
+      "title": "SQL functions",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE FUNCTION tdd_fn(x INT) RETURNS INT LANGUAGE SQL IMMUTABLE AS 'SELECT x+1'",
+        "SELECT tdd_fn(2)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.ROUTINE.PROCEDURE",
+      "dialect": "postgresql18",
+      "family": "routines",
+      "title": "Procedures/DO",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE PROCEDURE tdd_proc() LANGUAGE SQL AS 'SELECT 1'",
+        "CALL tdd_proc()",
+        "DO $$BEGIN NULL; END$$"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.ROUTINE.TRIGGER",
+      "dialect": "postgresql18",
+      "family": "routines",
+      "title": "Triggers",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE FUNCTION tdd_trigger_fn() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.v:=42; RETURN NEW; END$$",
+        "CREATE TRIGGER tdd_trigger BEFORE INSERT ON tdd_a FOR EACH ROW EXECUTE FUNCTION tdd_trigger_fn()",
+        "INSERT INTO tdd_a VALUES(5,1,1)",
+        "SELECT v FROM tdd_a WHERE id=5"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.ROUTINE.RULE",
+      "dialect": "postgresql18",
+      "family": "routines",
+      "title": "Rewrite rules",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE RULE tdd_rule AS ON DELETE TO tdd_a DO INSTEAD NOTHING",
+        "DELETE FROM tdd_a WHERE id=1",
+        "SELECT id FROM tdd_a ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.CATALOG",
+      "dialect": "postgresql18",
+      "family": "catalog",
+      "title": "Catalog expansion",
+      "coverage": "namespace_catalog_only_not_feature_closure",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT nspname FROM pg_namespace ORDER BY nspname"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.UTILITY.EXPLAIN",
+      "dialect": "postgresql18",
+      "family": "utility",
+      "title": "Explain/analyze plans",
+      "coverage": "unqualified_requires_plan_structure_validator",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "EXPLAIN (FORMAT JSON,ANALYZE) SELECT * FROM tdd_a WHERE id=1"
+      ],
+      "ordered": false,
+      "comparator": "explain_structure"
+    },
+    {
+      "id": "PG.UTILITY.MAINTENANCE",
+      "dialect": "postgresql18",
+      "family": "utility",
+      "title": "Maintenance commands",
+      "coverage": "smoke",
+      "scope": "session",
+      "setup": "base",
+      "statements": [
+        "VACUUM tdd_a",
+        "ANALYZE tdd_a"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.UTILITY.COMMENT",
+      "dialect": "postgresql18",
+      "family": "utility",
+      "title": "Object comments",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "COMMENT ON TABLE tdd_a IS 'tdd'",
+        "SELECT obj_description('tdd_a'::regclass)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.INTEGRATION.EXTENSION",
+      "dialect": "postgresql18",
+      "family": "integration",
+      "title": "Extension catalog visibility only; lifecycle remains untested",
+      "coverage": "catalog_only_not_feature_closure",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT extname FROM pg_extension ORDER BY extname"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.INTEGRATION.FOREIGN",
+      "dialect": "postgresql18",
+      "family": "integration",
+      "title": "Foreign server objects",
+      "coverage": "smoke",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "CREATE FOREIGN DATA WRAPPER tdd_fdw",
+        "CREATE SERVER tdd_server FOREIGN DATA WRAPPER tdd_fdw",
+        "SELECT srvname FROM pg_foreign_server WHERE srvname='tdd_server'"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "PG.INTEGRATION.REPLICATION",
+      "dialect": "postgresql18",
+      "family": "integration",
+      "title": "Publication catalog visibility only; replication remains untested",
+      "coverage": "catalog_only_not_feature_closure",
+      "scope": "transaction",
+      "setup": "base",
+      "statements": [
+        "SELECT pubname FROM pg_publication ORDER BY pubname"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "PG.COPY.OPTIONS",
+      "dialect": "postgresql18",
+      "family": "copy",
+      "title": "COPY WHERE/options",
+      "coverage": "smoke",
+      "scope": "copy_protocol",
+      "setup": "base",
+      "statements": [
+        "COPY tdd_a TO STDOUT WITH (FORMAT CSV,FORCE_QUOTE *)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "MYSQL.IDENTIFIERS",
+      "dialect": "mysql",
+      "family": "dialects",
+      "title": "Backtick identifiers",
+      "coverage": "smoke",
+      "scope": "native_dialect",
+      "setup": "base",
+      "statements": [
+        "SELECT 1 AS `value`"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "MYSQL.TYPES",
+      "dialect": "mysql",
+      "family": "dialects",
+      "title": "Native unsigned types",
+      "coverage": "smoke",
+      "scope": "native_dialect",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_mysql(v BIGINT UNSIGNED)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "MYSQL.AUTO_INCREMENT",
+      "dialect": "mysql",
+      "family": "dialects",
+      "title": "AUTO_INCREMENT",
+      "coverage": "smoke",
+      "scope": "native_dialect",
+      "setup": "base",
+      "statements": [
+        "CREATE TABLE tdd_mysql(id INT AUTO_INCREMENT PRIMARY KEY)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "MYSQL.REPLACE_UPSERT",
+      "dialect": "mysql",
+      "family": "dialects",
+      "title": "REPLACE/upsert",
+      "coverage": "smoke",
+      "scope": "native_dialect",
+      "setup": "base",
+      "statements": [
+        "REPLACE INTO tdd_a(id,g,v) VALUES(1,1,2)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "MYSQL.LIMIT",
+      "dialect": "mysql",
+      "family": "dialects",
+      "title": "MySQL LIMIT forms",
+      "coverage": "smoke",
+      "scope": "native_dialect",
+      "setup": "base",
+      "statements": [
+        "SELECT id FROM tdd_a ORDER BY id LIMIT 1,2"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "MYSQL.FUNCTIONS",
+      "dialect": "mysql",
+      "family": "dialects",
+      "title": "Native scalar functions",
+      "coverage": "smoke",
+      "scope": "native_dialect",
+      "setup": "base",
+      "statements": [
+        "SELECT IFNULL(NULL,2),DATE_ADD('2025-01-01',INTERVAL 1 DAY)"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "TSQL.IDENTIFIERS",
+      "dialect": "tsql",
+      "family": "dialects",
+      "title": "Bracket identifiers",
+      "coverage": "smoke",
+      "scope": "native_dialect",
+      "setup": "base",
+      "statements": [
+        "SELECT 1 AS [value]"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "TSQL.TOP",
+      "dialect": "tsql",
+      "family": "dialects",
+      "title": "TOP",
+      "coverage": "smoke",
+      "scope": "native_dialect",
+      "setup": "base",
+      "statements": [
+        "SELECT TOP(2) id FROM tdd_a ORDER BY id"
+      ],
+      "ordered": true
+    },
+    {
+      "id": "TSQL.OUTPUT",
+      "dialect": "tsql",
+      "family": "dialects",
+      "title": "OUTPUT",
+      "coverage": "smoke",
+      "scope": "native_dialect",
+      "setup": "base",
+      "statements": [
+        "UPDATE tdd_a SET v=2 OUTPUT inserted.id WHERE id=1"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "TSQL.APPLY",
+      "dialect": "tsql",
+      "family": "dialects",
+      "title": "APPLY",
+      "coverage": "smoke",
+      "scope": "native_dialect",
+      "setup": "base",
+      "statements": [
+        "SELECT a.id,x.v FROM tdd_a a CROSS APPLY(SELECT a.id+1 AS v)x"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "TSQL.FUNCTIONS",
+      "dialect": "tsql",
+      "family": "dialects",
+      "title": "Native scalar functions",
+      "coverage": "smoke",
+      "scope": "native_dialect",
+      "setup": "base",
+      "statements": [
+        "SELECT ISNULL(NULL,2),DATEADD(day,1,CAST('2025-01-01' AS date))"
+      ],
+      "ordered": false
+    },
+    {
+      "id": "TSQL.PROCEDURAL",
+      "dialect": "tsql",
+      "family": "dialects",
+      "title": "Variables/errors/transactions",
+      "coverage": "smoke",
+      "scope": "native_dialect",
+      "setup": "base",
+      "statements": [
+        "DECLARE @x INT=1; SELECT @x"
+      ],
+      "ordered": false
+    }
+  ]
+}

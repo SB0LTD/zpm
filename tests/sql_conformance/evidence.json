@@ -1,0 +1,106 @@
+{
+  "baseline_commit": "53655a9a89a3ddff6f2f5829388b09a10c3d9c93",
+  "toolchain": "Sig 0.6.4",
+  "platform": "Windows x86_64",
+  "optimization": "ReleaseSafe",
+  "qualification": "incomplete",
+  "source_sha256": {
+    "src/core/sql.sig": "2e5d68a90dab64f1b10f871e3257e05e8e0cf968e94393c4dd986eefbc285fa8",
+    "src/core/sql/ast.sig": "62e24860cf7eed1cf59375df6386eb919ea99a9c53f94e85839484adb0181682",
+    "src/core/sql/binder.sig": "700934650db4737b5bdf6d45b44f7e1e513fdb34e6fe4961674de37e66b8bb87",
+    "src/core/sql/deparse.sig": "51d196a249962d2a4fbb542febe70de0c282cd767922c1c82e39a64fbe713174",
+    "src/core/sql/expr.sig": "cbdc54769d34a5228565efc411f10c0cd6fad89a5301f7c9b2c72e14bd78874f",
+    "src/core/sql/lexer.sig": "72c9fa0b1f311e25b2f37c54ebc2dae71cded066ba249f81a92f3760ae5ef7dd",
+    "src/core/sql/parser.sig": "b73f407cc97739a8b217547198e1118e1e8ab250e4145cfe8d50167c5d6fca7a",
+    "tests/test_sql_distinct.sig": "f307c76ece7e8c9fe4966238da775d01cd1602b85216028d4270e4a7fc5fbf1e",
+    "tests/test_sql_minmax.sig": "963699f1489dab32e371c71d006ca0d3e1cbb7447d2fb717cac98f88d367c7b4"
+  },
+  "core_result": "core_smoke_results.ndjson",
+  "oracle_result": "postgres18_oracle.json",
+  "scope_limitations": [
+    "smoke programs, not complete feature contracts",
+    "no native MySQL or SQL Server oracle yet",
+    "cluster/COPY/session and EXPLAIN comparator unimplemented",
+    "in-process core runner does not qualify wire/server utility support",
+    "cross-platform and concurrency/recovery closure still pending"
+  ],
+  "regressions": [
+    {
+      "suite": "minmax",
+      "exit": 0,
+      "stdout": "{\"suite\":\"sql-minmax\",\"pass\":true,\"assertions\":49}\n",
+      "stderr": ""
+    },
+    {
+      "suite": "distinct",
+      "exit": 0,
+      "stdout": "{\"suite\":\"sql-distinct\",\"pass\":true,\"assertions\":917}\n",
+      "stderr": ""
+    },
+    {
+      "suite": "expr",
+      "exit": 0,
+      "stdout": "{\"suite\":\"sql-expr\",\"pass\":true,\"assertions\":397,\"database_bytes\":315168,\"wide_bytes\":621136}\n",
+      "stderr": ""
+    },
+    {
+      "suite": "types",
+      "exit": 0,
+      "stdout": "{\"suite\":\"sql-types\",\"pass\":true,\"assertions\":4491,\"database_bytes\":563280}\n",
+      "stderr": ""
+    },
+    {
+      "suite": "query",
+      "exit": 0,
+      "stdout": "{\"suite\":\"sql-query\",\"pass\":true,\"assertions\":63417,\"database_bytes\":479584,\"big_bytes\":1253904,\"work_rows\":512}\n",
+      "stderr": ""
+    },
+    {
+      "suite": "catalog",
+      "exit": 0,
+      "stdout": "{\"suite\":\"sql-catalog\",\"pass\":true,\"assertions\":36,\"database_bytes\":269280}\n",
+      "stderr": ""
+    },
+    {
+      "suite": "change_log",
+      "exit": 0,
+      "stdout": "{\"suite\":\"sql-change-log\",\"pass\":true,\"assertions\":876,\"rejected_flips\":202,\"accepted_flips\":52}\n",
+      "stderr": ""
+    },
+    {
+      "suite": "compact_scan",
+      "exit": 0,
+      "stdout": "",
+      "stderr": "{\"suite\":\"sql-compact-scan\",\"pass\":true,\"assertions\":23371}\n"
+    },
+    {
+      "suite": "dml",
+      "exit": 0,
+      "stdout": "{\"suite\":\"sql-dml\",\"pass\":true,\"assertions\":220,\"database_bytes\":289040}\n",
+      "stderr": ""
+    }
+  ],
+  "additional_modes": [
+    {
+      "mode": "ReleaseSafe",
+      "exit": 0,
+      "stdout": "{\"suite\":\"sql-distinct\",\"pass\":true,\"assertions\":917}\n",
+      "stderr": ""
+    },
+    {
+      "mode": "Debug",
+      "exit": 0,
+      "stdout": "{\"suite\":\"sql-distinct\",\"pass\":true,\"assertions\":917}\n",
+      "stderr": ""
+    }
+  ],
+  "tdd_red": {
+    "distinct": "baseline=53655a9a89a3ddff6f2f5829388b09a10c3d9c93\nexit=1\n\nSELECT NULL IS DISTINCT FROM NULL: Syntax\nerror: Syntax\n",
+    "minmax": "exit=1\n\nSELECT GREATEST(1,NULL,3): UndefinedFunction\nerror: UndefinedFunction\n"
+  },
+  "harness_tests": {
+    "passed": 7,
+    "command": "python -m unittest discover -s tests/sql_conformance -p test_audit.py"
+  },
+  "source_hash_encoding": "UTF-8 with LF newlines"
+}

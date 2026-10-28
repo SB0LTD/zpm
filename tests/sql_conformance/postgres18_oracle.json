@@ -1,0 +1,7707 @@
+{
+  "qualification": "incomplete",
+  "scope": "smoke_only",
+  "manifest_sha256": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c",
+  "oracle_version": [
+    [
+      "PostgreSQL 18.3 on x86_64-windows, compiled by msvc-19.44.35222, 64-bit"
+    ]
+  ],
+  "cases": [
+    {
+      "id": "PG.PRED.DISTINCT",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ],
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ],
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "f",
+              "t",
+              "t"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.PRED.QUANTIFIED",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ],
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "t",
+              "t"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.PRED.SYMMETRIC",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "t"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.PRED.OVERLAPS",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "overlaps",
+              16,
+              1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "t"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.PRED.REGEX",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ],
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ],
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "t",
+              "t",
+              "t"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.PRED.ESCAPE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "t"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.QUERY.WINDOW",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "row_number",
+              20,
+              8,
+              -1,
+              0
+            ],
+            [
+              "rank",
+              20,
+              8,
+              -1,
+              0
+            ],
+            [
+              "dense_rank",
+              20,
+              8,
+              -1,
+              0
+            ],
+            [
+              "lag",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "lead",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "1",
+              "1",
+              "1",
+              null,
+              "20"
+            ],
+            [
+              "2",
+              "2",
+              "1",
+              "1",
+              "10",
+              "30"
+            ],
+            [
+              "3",
+              "3",
+              "3",
+              "2",
+              "20",
+              null
+            ],
+            [
+              "4",
+              "4",
+              "3",
+              "2",
+              "30",
+              null
+            ]
+          ],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.QUERY.WINDOW_AGG",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "sum",
+              20,
+              8,
+              -1,
+              0
+            ],
+            [
+              "sum",
+              20,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "60",
+              "10"
+            ],
+            [
+              "2",
+              "60",
+              "30"
+            ],
+            [
+              "3",
+              "60",
+              "30"
+            ],
+            [
+              "4",
+              "60",
+              "30"
+            ]
+          ],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.QUERY.WINDOW_FRAMES",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "sum",
+              20,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "20"
+            ],
+            [
+              "2",
+              "40"
+            ],
+            [
+              "3",
+              "20"
+            ],
+            [
+              "4",
+              "30"
+            ]
+          ],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.GROUP.ROLLUP",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "g",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "count",
+              20,
+              8,
+              -1,
+              0
+            ],
+            [
+              "sum",
+              20,
+              8,
+              -1,
+              0
+            ],
+            [
+              "grouping",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "2",
+              "30",
+              "0"
+            ],
+            [
+              "2",
+              "2",
+              "30",
+              "0"
+            ],
+            [
+              null,
+              "4",
+              "60",
+              "1"
+            ]
+          ],
+          "command": "SELECT 3",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.GROUP.CUBE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "g",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "v",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "count",
+              20,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "10",
+              "1"
+            ],
+            [
+              "1",
+              "20",
+              "1"
+            ],
+            [
+              "2",
+              "30",
+              "1"
+            ],
+            [
+              "2",
+              null,
+              "1"
+            ],
+            [
+              "1",
+              null,
+              "2"
+            ],
+            [
+              "2",
+              null,
+              "2"
+            ],
+            [
+              null,
+              "10",
+              "1"
+            ],
+            [
+              null,
+              "20",
+              "1"
+            ],
+            [
+              null,
+              "30",
+              "1"
+            ],
+            [
+              null,
+              null,
+              "1"
+            ],
+            [
+              null,
+              null,
+              "4"
+            ]
+          ],
+          "command": "SELECT 11",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.GROUP.SETS",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "g",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "count",
+              20,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "2"
+            ],
+            [
+              "2",
+              "2"
+            ],
+            [
+              null,
+              "4"
+            ]
+          ],
+          "command": "SELECT 3",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.AGG.COLLECTION",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "g",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "string_agg",
+              25,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "array_agg",
+              1007,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "1,2",
+              "{10,20}"
+            ],
+            [
+              "2",
+              "3,4",
+              "{30,NULL}"
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.AGG.STATISTICAL",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "stddev_pop",
+              1700,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "var_pop",
+              1700,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "corr",
+              701,
+              8,
+              -1,
+              0
+            ],
+            [
+              "covar_pop",
+              701,
+              8,
+              -1,
+              0
+            ],
+            [
+              "regr_count",
+              20,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "8.1649658092772603",
+              "66.6666666666666667",
+              "1",
+              "6.666666666666667",
+              "3"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.AGG.ORDERED_SET",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "percentile_cont",
+              701,
+              8,
+              -1,
+              0
+            ],
+            [
+              "percentile_disc",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "mode",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "20",
+              "20",
+              "1"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.AGG.BITWISE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "bit_and",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "bit_or",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "bit_xor",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "0",
+              "7",
+              "4"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.AGG.INTERVAL",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "avg",
+              1186,
+              16,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "2 days 12:00:00"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.JOIN.LATERAL",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "v",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "2"
+            ],
+            [
+              "2",
+              "3"
+            ],
+            [
+              "3",
+              "4"
+            ],
+            [
+              "4",
+              "5"
+            ]
+          ],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.JOIN.NATURAL",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [],
+          "command": "SELECT 0",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.JOIN.TREE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ],
+            [
+              "3"
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.QUERY.TABLE_FUNCTION",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "x",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "n",
+              20,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "1"
+            ],
+            [
+              "2",
+              "2"
+            ],
+            [
+              "3",
+              "3"
+            ]
+          ],
+          "command": "SELECT 3",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.QUERY.MODIFYING_CTE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "v",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "11"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.QUERY.CTE_MATERIALIZATION",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ],
+            [
+              "2"
+            ],
+            [
+              "3"
+            ],
+            [
+              "4"
+            ]
+          ],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.QUERY.RECURSIVE_SEARCH",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "n",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "cyc",
+              16,
+              1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "f"
+            ],
+            [
+              "2",
+              "f"
+            ],
+            [
+              "3",
+              "f"
+            ]
+          ],
+          "command": "SELECT 3",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.QUERY.ROW",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ],
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "t",
+              "t"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.QUERY.VALUES_TABLE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "column1",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ],
+            [
+              "2"
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "g",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "v",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "1",
+              "10"
+            ],
+            [
+              "2",
+              "1",
+              "20"
+            ],
+            [
+              "3",
+              "2",
+              "30"
+            ],
+            [
+              "4",
+              "2",
+              null
+            ]
+          ],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.QUERY.SAMPLE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "count",
+              20,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "4"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.QUERY.FETCH_TIES",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "g",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ],
+            [
+              "1"
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.QUERY.LIMIT_EXPR",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "2"
+            ],
+            [
+              "3"
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DDL.SCHEMA",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE SCHEMA",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 1",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DDL.ALTER",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "ALTER TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "ALTER TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "renamed",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "7"
+            ],
+            [
+              "7"
+            ],
+            [
+              "7"
+            ],
+            [
+              "7"
+            ]
+          ],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DDL.CREATE_VARIANTS",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ],
+            [
+              "2"
+            ],
+            [
+              "3"
+            ],
+            [
+              "4"
+            ]
+          ],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DDL.INHERITANCE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 1",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ],
+            [
+              "2"
+            ],
+            [
+              "3"
+            ],
+            [
+              "4"
+            ],
+            [
+              "9"
+            ]
+          ],
+          "command": "SELECT 5",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DDL.PARTITION",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 1",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DDL.IF_EXISTS",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "DROP TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "DROP TABLE",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DDL.TRUNCATE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "TRUNCATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "count",
+              20,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "0"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DDL.DATABASE",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "PG.CONSTRAINT.COMPOSITE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "a",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "b",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "1"
+            ],
+            [
+              "1",
+              "2"
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.CONSTRAINT.UNIQUE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "a",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              null
+            ],
+            [
+              "1"
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.CONSTRAINT.CHECK",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 1",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.CONSTRAINT.FK",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 1",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "DELETE 1",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "count",
+              20,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "0"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.CONSTRAINT.DEFERRED",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "DELETE 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "SET CONSTRAINTS",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.CONSTRAINT.EXCLUSION",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 1",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              3904,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "[1,3)"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.INDEX.SECONDARY",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE INDEX",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "indexname",
+              19,
+              64,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "tdd_ix"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.INDEX.ADVANCED",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE INDEX",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "indexname",
+              19,
+              64,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "tdd_adv"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DML.UPDATE_FROM",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "UPDATE 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "v",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "11"
+            ],
+            [
+              "2",
+              "20"
+            ],
+            [
+              "3",
+              "33"
+            ],
+            [
+              "4",
+              null
+            ]
+          ],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DML.DELETE_USING",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "DELETE 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "2"
+            ],
+            [
+              "4"
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DML.TUPLE_ASSIGN",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "UPDATE 1",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "g",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "v",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "3",
+              "4"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DML.MERGE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "MERGE 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "v",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "11"
+            ],
+            [
+              "2",
+              "20"
+            ],
+            [
+              "3",
+              "33"
+            ],
+            [
+              "4",
+              null
+            ],
+            [
+              "5",
+              "55"
+            ]
+          ],
+          "command": "SELECT 5",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DML.UPSERT_UNIQUE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 1",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "v",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "3",
+              "2"
+            ]
+          ],
+          "command": "INSERT 0 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.SEQUENCE.EXTENDED",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE SEQUENCE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "ALTER SEQUENCE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "nextval",
+              20,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "9"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.DDL.VIRTUAL",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 1",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "doubled",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "3",
+              "6"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.VIEW.ORDINARY",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE VIEW",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "v",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "10"
+            ],
+            [
+              "2",
+              "20"
+            ],
+            [
+              "3",
+              "30"
+            ],
+            [
+              "4",
+              null
+            ]
+          ],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.VIEW.MATERIALIZED",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "REFRESH MATERIALIZED VIEW",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "g",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "total",
+              20,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "30"
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TYPE.CHARACTER",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              1043,
+              -1,
+              12,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "abc"
+            ],
+            [
+              null
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TYPE.BINARY",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              17,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "\\x00ff"
+            ],
+            [
+              null
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TYPE.UUID",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              2950,
+              16,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "12345678-1234-1234-1234-123456789abc"
+            ],
+            [
+              null
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TYPE.TIME",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              1083,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "12:34:56"
+            ],
+            [
+              null
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TYPE.MONEY",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              790,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "$1.00"
+            ],
+            [
+              null
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TYPE.BIT",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              1560,
+              -1,
+              3,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "101"
+            ],
+            [
+              null
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TYPE.NETWORK",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              869,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "192.0.2.1"
+            ],
+            [
+              null
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TYPE.GEOMETRIC",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "point",
+              600,
+              16,
+              -1,
+              0
+            ],
+            [
+              "box",
+              603,
+              32,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "(1,2)",
+              "(3,4),(1,2)"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TYPE.XML",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              142,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "<x/>"
+            ],
+            [
+              null
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TYPE.ARRAY",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              1007,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "{1,2}"
+            ],
+            [
+              null
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TYPE.RANGE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 2",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              3904,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "[1,3)"
+            ],
+            [
+              null
+            ]
+          ],
+          "command": "SELECT 2",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TYPE.ENUM_DOMAIN_COMPOSITE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TYPE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE DOMAIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TYPE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "tdd_enum",
+              18673,
+              4,
+              -1,
+              0
+            ],
+            [
+              "tdd_positive",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "row",
+              18682,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "a",
+              "1",
+              "(1,x)"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TYPE.CATALOG_IDS",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "pg_lsn",
+              3220,
+              8,
+              -1,
+              0
+            ],
+            [
+              "xid8",
+              5069,
+              8,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "0/16B6C50",
+              "1"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.JSON.OPS",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "?column?",
+              25,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.JSONB.MODIFY",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "jsonb_set",
+              3802,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "?column?",
+              3802,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "{\"a\": 2}",
+              "{\"a\": 1, \"b\": 2}"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.JSON.PATH",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "jsonb_path_exists",
+              16,
+              1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "t"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.JSON.TABLE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "a",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.JSON.AGG",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "json_agg",
+              114,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "jsonb_object_agg",
+              3802,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "[1, 2, 3, 4]",
+              "{\"1\": 10, \"2\": 20, \"3\": 30, \"4\": null}"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.FUNC.STRING",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "lower",
+              25,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "upper",
+              25,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "length",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "substring",
+              25,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "btrim",
+              25,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "position",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "replace",
+              25,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "abc",
+              "ABC",
+              "4",
+              "bc",
+              "x",
+              "2",
+              "axc"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.FUNC.NUMERIC",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "abs",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "ceil",
+              1700,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "floor",
+              1700,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "trunc",
+              1700,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "sqrt",
+              1700,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "power",
+              701,
+              8,
+              -1,
+              0
+            ],
+            [
+              "ln",
+              1700,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "2",
+              "2",
+              "1",
+              "1",
+              "2.000000000000000",
+              "8",
+              "0.0000000000000000"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.FUNC.TEMPORAL",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "extract",
+              1700,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "date_trunc",
+              1114,
+              8,
+              -1,
+              0
+            ],
+            [
+              "age",
+              1186,
+              16,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "2025",
+              "2025-03-01 00:00:00",
+              "1 year"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.FUNC.FORMAT",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "to_char",
+              25,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "to_date",
+              1082,
+              4,
+              -1,
+              0
+            ],
+            [
+              "to_number",
+              1700,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "2025-03",
+              "2025-03-15",
+              "12.3"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.FUNC.MINMAX",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "greatest",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "least",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "3",
+              "1"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.FUNC.DISCOVERY",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "pg_typeof",
+              2206,
+              4,
+              -1,
+              0
+            ],
+            [
+              "pg_get_serial_sequence",
+              25,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "integer",
+              null
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TEXT.COLLATION",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "t"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TEXT.ENCODING",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "char_length",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "octet_length",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "normalize",
+              25,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "4",
+              "8",
+              "a"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TEXT.LITERALS",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "?column?",
+              25,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "?column?",
+              25,
+              -1,
+              -1,
+              0
+            ],
+            [
+              "?column?",
+              25,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "a\nb",
+              "abc",
+              "dat"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TEXT.SEARCH",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "?column?",
+              16,
+              1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "t"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.OP.BITWISE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "?column?",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "?column?",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "?column?",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "?column?",
+              23,
+              4,
+              -1,
+              0
+            ],
+            [
+              "?column?",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1",
+              "7",
+              "2",
+              "4",
+              "4"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TX.ISOLATION",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "SET",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "transaction_isolation",
+              25,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "serializable"
+            ]
+          ],
+          "command": "SHOW",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TX.CHARACTERISTICS",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "SET",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "transaction_read_only",
+              25,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "on"
+            ]
+          ],
+          "command": "SHOW",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TX.LOCK_MODES",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ],
+            [
+              "2"
+            ],
+            [
+              "3"
+            ],
+            [
+              "4"
+            ]
+          ],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TX.TABLE_LOCK",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "LOCK TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "pg_try_advisory_xact_lock",
+              16,
+              1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "t"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.TX.TWO_PHASE",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "PG.CURSOR",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "DECLARE CURSOR",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ]
+          ],
+          "command": "FETCH 1",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "MOVE 0",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CLOSE CURSOR",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.SQL_PREPARE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "PREPARE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "?column?",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "3"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "DEALLOCATE",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.SESSION.SETTINGS",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "SET",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "search_path",
+              25,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "public"
+            ]
+          ],
+          "command": "SHOW",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.SESSION.NOTIFY",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "LISTEN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "NOTIFY",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "UNLISTEN",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.SECURITY.ROLE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE ROLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "GRANT",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "REVOKE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "DROP ROLE",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.SECURITY.RLS",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "ALTER TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE POLICY",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "policyname",
+              19,
+              64,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "tdd_policy"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.ROUTINE.FUNCTION",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE FUNCTION",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "tdd_fn",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "3"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.ROUTINE.PROCEDURE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE PROCEDURE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CALL",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "DO",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.ROUTINE.TRIGGER",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE FUNCTION",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TRIGGER",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 1",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "v",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "42"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.ROUTINE.RULE",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE RULE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "DELETE 0",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "id",
+              23,
+              4,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "1"
+            ],
+            [
+              "2"
+            ],
+            [
+              "3"
+            ],
+            [
+              "4"
+            ]
+          ],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.CATALOG",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "nspname",
+              19,
+              64,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "information_schema"
+            ],
+            [
+              "pg_catalog"
+            ],
+            [
+              "pg_toast"
+            ],
+            [
+              "public"
+            ]
+          ],
+          "command": "SELECT 4",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.UTILITY.EXPLAIN",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "QUERY PLAN",
+              114,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "[\n  {\n    \"Plan\": {\n      \"Node Type\": \"Index Scan\",\n      \"Parallel Aware\": false,\n      \"Async Capable\": false,\n      \"Scan Direction\": \"Forward\",\n      \"Index Name\": \"tdd_a_pkey\",\n      \"Relation Name\": \"tdd_a\",\n      \"Alias\": \"tdd_a\",\n      \"Startup Cost\": 0.15,\n      \"Total Cost\": 8.17,\n      \"Plan Rows\": 1,\n      \"Plan Width\": 12,\n      \"Actual Startup Time\": 0.003,\n      \"Actual Total Time\": 0.003,\n      \"Actual Rows\": 1.00,\n      \"Actual Loops\": 1,\n      \"Disabled\": false,\n      \"Index Cond\": \"(id = 1)\",\n      \"Rows Removed by Index Recheck\": 0,\n      \"Index Searches\": 1,\n      \"Shared Hit Blocks\": 2,\n      \"Shared Read Blocks\": 0,\n      \"Shared Dirtied Blocks\": 0,\n      \"Shared Written Blocks\": 0,\n      \"Local Hit Blocks\": 0,\n      \"Local Read Blocks\": 0,\n      \"Local Dirtied Blocks\": 0,\n      \"Local Written Blocks\": 0,\n      \"Temp Read Blocks\": 0,\n      \"Temp Written Blocks\": 0\n    },\n    \"Planning\": {\n      \"Shared Hit Blocks\": 8,\n      \"Shared Read Blocks\": 0,\n      \"Shared Dirtied Blocks\": 0,\n      \"Shared Written Blocks\": 0,\n      \"Local Hit Blocks\": 0,\n      \"Local Read Blocks\": 0,\n      \"Local Dirtied Blocks\": 0,\n      \"Local Written Blocks\": 0,\n      \"Temp Read Blocks\": 0,\n      \"Temp Written Blocks\": 0\n    },\n    \"Planning Time\": 0.072,\n    \"Triggers\": [\n    ],\n    \"Execution Time\": 0.010\n  }\n]"
+            ]
+          ],
+          "command": "EXPLAIN",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.UTILITY.MAINTENANCE",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "PG.UTILITY.COMMENT",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "COMMENT",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "obj_description",
+              25,
+              -1,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "tdd"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.INTEGRATION.EXTENSION",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "extname",
+              19,
+              64,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "plpgsql"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.INTEGRATION.FOREIGN",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE FOREIGN DATA WRAPPER",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE SERVER",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "srvname",
+              19,
+              64,
+              -1,
+              0
+            ]
+          ],
+          "rows": [
+            [
+              "tdd_server"
+            ]
+          ],
+          "command": "SELECT 1",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.INTEGRATION.REPLICATION",
+      "status": "oracle_valid",
+      "oracle": [
+        {
+          "columns": [],
+          "rows": [],
+          "command": "BEGIN",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 4",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "CREATE TABLE",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [],
+          "rows": [],
+          "command": "INSERT 0 3",
+          "error": null,
+          "transaction": "T"
+        },
+        {
+          "columns": [
+            [
+              "pubname",
+              19,
+              64,
+              -1,
+              0
+            ]
+          ],
+          "rows": [],
+          "command": "SELECT 0",
+          "error": null,
+          "transaction": "T"
+        }
+      ]
+    },
+    {
+      "id": "PG.COPY.OPTIONS",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "MYSQL.IDENTIFIERS",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "MYSQL.TYPES",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "MYSQL.AUTO_INCREMENT",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "MYSQL.REPLACE_UPSERT",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "MYSQL.LIMIT",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "MYSQL.FUNCTIONS",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "TSQL.IDENTIFIERS",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "TSQL.TOP",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "TSQL.OUTPUT",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "TSQL.APPLY",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "TSQL.FUNCTIONS",
+      "status": "unexecuted_scope"
+    },
+    {
+      "id": "TSQL.PROCEDURAL",
+      "status": "unexecuted_scope"
+    }
+  ],
+  "counts": {
+    "oracle_valid": 102,
+    "unexecuted_scope": 16
+  },
+  "manifest_hash_encoding": "UTF-8 with LF newlines"
+}

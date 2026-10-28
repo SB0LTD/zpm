@@ -679,7 +679,8 @@ pub fn Binder(comptime config: types.Config) type {
             const agg = aggregateKind(context, n);
             if (agg != .none) return typeAggregate(context, scope, n, agg);
             if (n.distinct or n.c != none or n.star) return error.UndefinedFunction;
-            n.func = functionName(context, n);
+            // GREATEST/LEAST are grammar forms, not ordinary named functions.
+            if (n.func != .greatest and n.func != .least) n.func = functionName(context, n);
             var count: usize = 0;
             var item = n.b;
             while (item != none) : (item = context.node(item).next) {
@@ -688,6 +689,17 @@ pub fn Binder(comptime config: types.Config) type {
             }
             switch (n.func) {
                 .none => return error.UndefinedFunction,
+                .greatest, .least => {
+                    if (count == 0) return error.Syntax;
+                    var target: ast.Type = .unknown;
+                    item = n.b;
+                    while (item != none) : (item = context.node(item).next) try unifyInto(&target, context.node(item).ty);
+                    if (target == .unknown) target = .text;
+                    if (target == .json) return error.UndefinedFunction;
+                    n.b = try convertList(context, n.b, target);
+                    n.ty = target;
+                    n.constant = listConstant(context, n.b);
+                },
                 .round => {
                     if (count != 1 and count != 2) return error.UndefinedFunction;
                     const first = n.b;
@@ -952,7 +964,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeExpr(context, scope, n.b);
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b);
                     switch (n.op) {
-                        .eq, .ne, .lt, .le, .gt, .ge => {
+                        .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct => {
                             try comparable(context, &n.a, &n.b);
                             n.ty = .boolean;
                         },

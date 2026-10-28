@@ -181,6 +181,8 @@ pub const Keyword = enum {
     value,
     regclass,
     regtype,
+    greatest,
+    least,
 };
 
 /// Words that cannot be unquoted identifiers.

@@ -108,6 +108,8 @@ pub fn Deparse(comptime config: types.Config) type {
                 .div => " / ",
                 .mod => " % ",
                 .concat => " || ",
+                .is_distinct => " IS DISTINCT FROM ",
+                .is_not_distinct => " IS NOT DISTINCT FROM ",
                 else => null,
             };
         }

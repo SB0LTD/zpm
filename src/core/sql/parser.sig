@@ -1278,6 +1278,12 @@ pub fn Parser(comptime config: types.Config) type {
             var left = try self.comparison();
             while (try self.takeWord("IS")) {
                 const negated = try self.takeWord("NOT");
+                if (try self.takeWord("DISTINCT")) {
+                    try self.expectWord("FROM");
+                    const right = try self.comparison();
+                    left = try self.pool.add(.{ .kind = .binary, .op = if (negated) .is_not_distinct else .is_distinct, .a = left, .b = right });
+                    continue;
+                }
                 const kind: ast.Test = if (try self.takeWord("NULL"))
                     (if (negated) .is_not_null else .is_null)
                 else if (try self.takeWord("TRUE"))
@@ -1621,6 +1627,14 @@ pub fn Parser(comptime config: types.Config) type {
                 if (wordIs(self.source, token, "current_timestamp") or wordIs(self.source, token, "current_date")) {
                     const name = try self.identifier();
                     return self.pool.add(.{ .kind = .function, .name = name });
+                }
+                if ((self.isWord("GREATEST") or self.isWord("LEAST")) and lparenNext(try self.peek())) {
+                    const func: ast.Func = if (self.isWord("GREATEST")) .greatest else .least;
+                    const name = try self.identifier();
+                    const id = try self.arguments(.function, false);
+                    self.pool.nodes[id].func = func;
+                    self.pool.nodes[id].name = name;
+                    return id;
                 }
                 if ((self.isWord("COALESCE") or self.isWord("NULLIF")) and lparenNext(try self.peek())) {
                     const is_coalesce = self.isWord("COALESCE");

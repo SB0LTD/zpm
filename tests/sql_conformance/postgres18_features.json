@@ -1,0 +1,5292 @@
+{
+  "source": "https://github.com/postgres/postgres/blob/REL_18_3/src/backend/catalog/sql_features.txt",
+  "blob": "ebe85337c2877ba927b1dee97bc54a9a80470f04",
+  "applicability": "unreviewed; upstream inventory includes language bindings, not just SQL statements",
+  "features": [
+    {
+      "id": "B011",
+      "name": "Embedded Ada",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B012",
+      "name": "Embedded C",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "B013",
+      "name": "Embedded COBOL",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B014",
+      "name": "Embedded Fortran",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B015",
+      "name": "Embedded MUMPS",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B016",
+      "name": "Embedded Pascal",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B017",
+      "name": "Embedded PL/I",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B021",
+      "name": "Direct SQL",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "B030",
+      "name": "Enhanced dynamic SQL",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B031",
+      "name": "Basic dynamic SQL",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B032",
+      "name": "Extended dynamic SQL",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B033",
+      "name": "Untyped SQL-invoked function arguments",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B034",
+      "name": "Dynamic specification of cursor attributes",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B035",
+      "name": "Non-extended descriptor names",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B036",
+      "name": "Describe input statement",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B041",
+      "name": "Extensions to embedded SQL exception declarations",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B051",
+      "name": "Enhanced execution rights",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B111",
+      "name": "Module language Ada",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B112",
+      "name": "Module language C",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B113",
+      "name": "Module language COBOL",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B114",
+      "name": "Module language Fortran",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B115",
+      "name": "Module language MUMPS",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B116",
+      "name": "Module language Pascal",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B117",
+      "name": "Module language PL/I",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B121",
+      "name": "Routine language Ada",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B122",
+      "name": "Routine language C",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B123",
+      "name": "Routine language COBOL",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B124",
+      "name": "Routine language Fortran",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B125",
+      "name": "Routine language MUMPS",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B126",
+      "name": "Routine language Pascal",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B127",
+      "name": "Routine language PL/I",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B128",
+      "name": "Routine language SQL",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "B200",
+      "name": "Polymorphic table functions",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B201",
+      "name": "More than one PTF generic table parameter",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B202",
+      "name": "PTF copartitioning",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B203",
+      "name": "More than one copartition specification",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B204",
+      "name": "PRUNE WHEN EMPTY",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B205",
+      "name": "Pass-through columns",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B206",
+      "name": "PTF descriptor parameters",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B207",
+      "name": "Cross products of partitionings",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B208",
+      "name": "PTF component procedure interface",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B209",
+      "name": "PTF extended names",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B211",
+      "name": "Module language Ada: VARCHAR and NUMERIC support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "B221",
+      "name": "Routine language Ada: VARCHAR and NUMERIC support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "E011",
+      "name": "Numeric data types",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E011-01",
+      "name": "Numeric data types",
+      "subfeature": "INTEGER and SMALLINT data types",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E011-02",
+      "name": "Numeric data types",
+      "subfeature": "REAL, DOUBLE PRECISION, and FLOAT data types",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E011-03",
+      "name": "Numeric data types",
+      "subfeature": "DECIMAL and NUMERIC data types",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E011-04",
+      "name": "Numeric data types",
+      "subfeature": "Arithmetic operators",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E011-05",
+      "name": "Numeric data types",
+      "subfeature": "Numeric comparison",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E011-06",
+      "name": "Numeric data types",
+      "subfeature": "Implicit casting among the numeric data types",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E021",
+      "name": "Character data types",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E021-01",
+      "name": "Character string types",
+      "subfeature": "CHARACTER data type",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E021-02",
+      "name": "Character string types",
+      "subfeature": "CHARACTER VARYING data type",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E021-03",
+      "name": "Character string types",
+      "subfeature": "Character literals",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E021-04",
+      "name": "Character string types",
+      "subfeature": "CHARACTER_LENGTH function",
+      "postgres_supported": true,
+      "note": "trims trailing spaces from CHARACTER values before counting"
+    },
+    {
+      "id": "E021-05",
+      "name": "Character string types",
+      "subfeature": "OCTET_LENGTH function",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E021-06",
+      "name": "Character string types",
+      "subfeature": "SUBSTRING function",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E021-07",
+      "name": "Character string types",
+      "subfeature": "Character concatenation",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E021-08",
+      "name": "Character string types",
+      "subfeature": "UPPER and LOWER functions",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E021-09",
+      "name": "Character string types",
+      "subfeature": "TRIM function",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E021-10",
+      "name": "Character string types",
+      "subfeature": "Implicit casting among the character string types",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E021-11",
+      "name": "Character string types",
+      "subfeature": "POSITION function",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E021-12",
+      "name": "Character string types",
+      "subfeature": "Character comparison",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E031",
+      "name": "Identifiers",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E031-01",
+      "name": "Identifiers",
+      "subfeature": "Delimited identifiers",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E031-02",
+      "name": "Identifiers",
+      "subfeature": "Lower case identifiers",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E031-03",
+      "name": "Identifiers",
+      "subfeature": "Trailing underscore",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E051",
+      "name": "Basic query specification",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E051-01",
+      "name": "Basic query specification",
+      "subfeature": "SELECT DISTINCT",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E051-02",
+      "name": "Basic query specification",
+      "subfeature": "GROUP BY clause",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E051-04",
+      "name": "Basic query specification",
+      "subfeature": "GROUP BY can contain columns not in <select list>",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E051-05",
+      "name": "Basic query specification",
+      "subfeature": "Select list items can be renamed",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E051-06",
+      "name": "Basic query specification",
+      "subfeature": "HAVING clause",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E051-07",
+      "name": "Basic query specification",
+      "subfeature": "Qualified * in select list",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E051-08",
+      "name": "Basic query specification",
+      "subfeature": "Correlation names in the FROM clause",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E051-09",
+      "name": "Basic query specification",
+      "subfeature": "Rename columns in the FROM clause",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061",
+      "name": "Basic predicates and search conditions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061-01",
+      "name": "Basic predicates and search conditions",
+      "subfeature": "Comparison predicate",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061-02",
+      "name": "Basic predicates and search conditions",
+      "subfeature": "BETWEEN predicate",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061-03",
+      "name": "Basic predicates and search conditions",
+      "subfeature": "IN predicate with list of values",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061-04",
+      "name": "Basic predicates and search conditions",
+      "subfeature": "LIKE predicate",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061-05",
+      "name": "Basic predicates and search conditions",
+      "subfeature": "LIKE predicate ESCAPE clause",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061-06",
+      "name": "Basic predicates and search conditions",
+      "subfeature": "NULL predicate",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061-07",
+      "name": "Basic predicates and search conditions",
+      "subfeature": "Quantified comparison predicate",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061-08",
+      "name": "Basic predicates and search conditions",
+      "subfeature": "EXISTS predicate",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061-09",
+      "name": "Basic predicates and search conditions",
+      "subfeature": "Subqueries in comparison predicate",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061-11",
+      "name": "Basic predicates and search conditions",
+      "subfeature": "Subqueries in IN predicate",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061-12",
+      "name": "Basic predicates and search conditions",
+      "subfeature": "Subqueries in quantified comparison predicate",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061-13",
+      "name": "Basic predicates and search conditions",
+      "subfeature": "Correlated subqueries",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E061-14",
+      "name": "Basic predicates and search conditions",
+      "subfeature": "Search condition",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E071",
+      "name": "Basic query expressions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E071-01",
+      "name": "Basic query expressions",
+      "subfeature": "UNION DISTINCT table operator",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E071-02",
+      "name": "Basic query expressions",
+      "subfeature": "UNION ALL table operator",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E071-03",
+      "name": "Basic query expressions",
+      "subfeature": "EXCEPT DISTINCT table operator",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E071-05",
+      "name": "Basic query expressions",
+      "subfeature": "Columns combined via table operators need not have exactly the same data type",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E071-06",
+      "name": "Basic query expressions",
+      "subfeature": "Table operators in subqueries",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E081",
+      "name": "Basic Privileges",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E081-01",
+      "name": "Basic Privileges",
+      "subfeature": "SELECT privilege",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E081-02",
+      "name": "Basic Privileges",
+      "subfeature": "DELETE privilege",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E081-03",
+      "name": "Basic Privileges",
+      "subfeature": "INSERT privilege at the table level",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E081-04",
+      "name": "Basic Privileges",
+      "subfeature": "UPDATE privilege at the table level",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E081-05",
+      "name": "Basic Privileges",
+      "subfeature": "UPDATE privilege at the column level",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E081-06",
+      "name": "Basic Privileges",
+      "subfeature": "REFERENCES privilege at the table level",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E081-07",
+      "name": "Basic Privileges",
+      "subfeature": "REFERENCES privilege at the column level",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E081-08",
+      "name": "Basic Privileges",
+      "subfeature": "WITH GRANT OPTION",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E081-09",
+      "name": "Basic Privileges",
+      "subfeature": "USAGE privilege",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E081-10",
+      "name": "Basic Privileges",
+      "subfeature": "EXECUTE privilege",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E091",
+      "name": "Set functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E091-01",
+      "name": "Set functions",
+      "subfeature": "AVG",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E091-02",
+      "name": "Set functions",
+      "subfeature": "COUNT",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E091-03",
+      "name": "Set functions",
+      "subfeature": "MAX",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E091-04",
+      "name": "Set functions",
+      "subfeature": "MIN",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E091-05",
+      "name": "Set functions",
+      "subfeature": "SUM",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E091-06",
+      "name": "Set functions",
+      "subfeature": "ALL quantifier",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E091-07",
+      "name": "Set functions",
+      "subfeature": "DISTINCT quantifier",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E101",
+      "name": "Basic data manipulation",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E101-01",
+      "name": "Basic data manipulation",
+      "subfeature": "INSERT statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E101-03",
+      "name": "Basic data manipulation",
+      "subfeature": "Searched UPDATE statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E101-04",
+      "name": "Basic data manipulation",
+      "subfeature": "Searched DELETE statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E111",
+      "name": "Single row SELECT statement",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E121",
+      "name": "Basic cursor support",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E121-01",
+      "name": "Basic cursor support",
+      "subfeature": "DECLARE CURSOR",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E121-02",
+      "name": "Basic cursor support",
+      "subfeature": "ORDER BY columns need not be in select list",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E121-03",
+      "name": "Basic cursor support",
+      "subfeature": "Value expressions in ORDER BY clause",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E121-04",
+      "name": "Basic cursor support",
+      "subfeature": "OPEN statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E121-06",
+      "name": "Basic cursor support",
+      "subfeature": "Positioned UPDATE statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E121-07",
+      "name": "Basic cursor support",
+      "subfeature": "Positioned DELETE statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E121-08",
+      "name": "Basic cursor support",
+      "subfeature": "CLOSE statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E121-10",
+      "name": "Basic cursor support",
+      "subfeature": "FETCH statement implicit NEXT",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E121-17",
+      "name": "Basic cursor support",
+      "subfeature": "WITH HOLD cursors",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E131",
+      "name": "Null value support (nulls in lieu of values)",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E141",
+      "name": "Basic integrity constraints",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E141-01",
+      "name": "Basic integrity constraints",
+      "subfeature": "NOT NULL constraints",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E141-02",
+      "name": "Basic integrity constraints",
+      "subfeature": "UNIQUE constraints of NOT NULL columns",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E141-03",
+      "name": "Basic integrity constraints",
+      "subfeature": "PRIMARY KEY constraints",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E141-04",
+      "name": "Basic integrity constraints",
+      "subfeature": "Basic FOREIGN KEY constraint with the NO ACTION default for both referential delete action and referential update action",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E141-06",
+      "name": "Basic integrity constraints",
+      "subfeature": "CHECK constraints",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E141-07",
+      "name": "Basic integrity constraints",
+      "subfeature": "Column defaults",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E141-08",
+      "name": "Basic integrity constraints",
+      "subfeature": "NOT NULL inferred on PRIMARY KEY",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E141-10",
+      "name": "Basic integrity constraints",
+      "subfeature": "Names in a foreign key can be specified in any order",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E151",
+      "name": "Transaction support",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E151-01",
+      "name": "Transaction support",
+      "subfeature": "COMMIT statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E151-02",
+      "name": "Transaction support",
+      "subfeature": "ROLLBACK statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E152",
+      "name": "Basic SET TRANSACTION statement",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E152-01",
+      "name": "Basic SET TRANSACTION statement",
+      "subfeature": "SET TRANSACTION statement: ISOLATION LEVEL SERIALIZABLE clause",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E152-02",
+      "name": "Basic SET TRANSACTION statement",
+      "subfeature": "SET TRANSACTION statement: READ ONLY and READ WRITE clauses",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E153",
+      "name": "Updatable queries with subqueries",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E161",
+      "name": "SQL comments using leading double minus",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E171",
+      "name": "SQLSTATE support",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "E182",
+      "name": "Host language binding",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F021",
+      "name": "Basic information schema",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F021-01",
+      "name": "Basic information schema",
+      "subfeature": "COLUMNS view",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F021-02",
+      "name": "Basic information schema",
+      "subfeature": "TABLES view",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F021-03",
+      "name": "Basic information schema",
+      "subfeature": "VIEWS view",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F021-04",
+      "name": "Basic information schema",
+      "subfeature": "TABLE_CONSTRAINTS view",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F021-05",
+      "name": "Basic information schema",
+      "subfeature": "REFERENTIAL_CONSTRAINTS view",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F021-06",
+      "name": "Basic information schema",
+      "subfeature": "CHECK_CONSTRAINTS view",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F031",
+      "name": "Basic schema manipulation",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F031-01",
+      "name": "Basic schema manipulation",
+      "subfeature": "CREATE TABLE statement to create persistent base tables",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F031-02",
+      "name": "Basic schema manipulation",
+      "subfeature": "CREATE VIEW statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F031-03",
+      "name": "Basic schema manipulation",
+      "subfeature": "GRANT statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F031-04",
+      "name": "Basic schema manipulation",
+      "subfeature": "ALTER TABLE statement: ADD COLUMN clause",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F031-13",
+      "name": "Basic schema manipulation",
+      "subfeature": "DROP TABLE statement: RESTRICT clause",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F031-16",
+      "name": "Basic schema manipulation",
+      "subfeature": "DROP VIEW statement: RESTRICT clause",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F031-19",
+      "name": "Basic schema manipulation",
+      "subfeature": "REVOKE statement: RESTRICT clause",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F032",
+      "name": "CASCADE drop behavior",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F033",
+      "name": "ALTER TABLE statement: DROP COLUMN clause",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F034",
+      "name": "Extended REVOKE statement",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F035",
+      "name": "REVOKE with CASCADE",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F036",
+      "name": "REVOKE statement performed by non-owner",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F037",
+      "name": "REVOKE statement: GRANT OPTION FOR clause",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F038",
+      "name": "REVOKE of a WITH GRANT OPTION privilege",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F041",
+      "name": "Basic joined table",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F041-01",
+      "name": "Basic joined table",
+      "subfeature": "Inner join (but not necessarily the INNER keyword)",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F041-02",
+      "name": "Basic joined table",
+      "subfeature": "INNER keyword",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F041-03",
+      "name": "Basic joined table",
+      "subfeature": "LEFT OUTER JOIN",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F041-04",
+      "name": "Basic joined table",
+      "subfeature": "RIGHT OUTER JOIN",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F041-05",
+      "name": "Basic joined table",
+      "subfeature": "Outer joins can be nested",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F041-07",
+      "name": "Basic joined table",
+      "subfeature": "The inner table in a left or right outer join can also be used in an inner join",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F041-08",
+      "name": "Basic joined table",
+      "subfeature": "All comparison operators are supported (rather than just =)",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F051",
+      "name": "Basic date and time",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F051-01",
+      "name": "Basic date and time",
+      "subfeature": "DATE data type (including support of DATE literal)",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F051-02",
+      "name": "Basic date and time",
+      "subfeature": "TIME data type (including support of TIME literal) with fractional seconds precision of at least 0",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F051-03",
+      "name": "Basic date and time",
+      "subfeature": "TIMESTAMP data type (including support of TIMESTAMP literal) with fractional seconds precision of at least 0 and 6",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F051-04",
+      "name": "Basic date and time",
+      "subfeature": "Comparison predicate on DATE, TIME, and TIMESTAMP data types",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F051-05",
+      "name": "Basic date and time",
+      "subfeature": "Explicit CAST between datetime types and character string types",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F051-06",
+      "name": "Basic date and time",
+      "subfeature": "CURRENT_DATE",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F051-07",
+      "name": "Basic date and time",
+      "subfeature": "LOCALTIME",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F051-08",
+      "name": "Basic date and time",
+      "subfeature": "LOCALTIMESTAMP",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F052",
+      "name": "Intervals and datetime arithmetic",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F053",
+      "name": "OVERLAPS predicate",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F054",
+      "name": "TIMESTAMP in DATE type precedence list",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F081",
+      "name": "UNION and EXCEPT in views",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F111",
+      "name": "Isolation levels other than SERIALIZABLE",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F112",
+      "name": "Isolation level READ UNCOMMITTED",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F113",
+      "name": "Isolation level READ COMMITTED",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F114",
+      "name": "Isolation level REPEATABLE READ",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F120",
+      "name": "Get diagnostics statement",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F121",
+      "name": "Basic diagnostics management",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F122",
+      "name": "Enhanced diagnostics management",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F123",
+      "name": "All diagnostics",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F124",
+      "name": "SET TRANSACTION statement: DIAGNOSTICS SIZE clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F131",
+      "name": "Grouped operations",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F131-01",
+      "name": "Grouped operations",
+      "subfeature": "WHERE, GROUP BY, and HAVING clauses supported in queries with grouped views",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F131-02",
+      "name": "Grouped operations",
+      "subfeature": "Multiple tables supported in queries with grouped views",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F131-03",
+      "name": "Grouped operations",
+      "subfeature": "Set functions supported in queries with grouped views",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F131-04",
+      "name": "Grouped operations",
+      "subfeature": "Subqueries with GROUP BY and HAVING clauses and grouped views",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F131-05",
+      "name": "Grouped operations",
+      "subfeature": "Single row SELECT with GROUP BY and HAVING clauses and grouped views",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F171",
+      "name": "Multiple schemas per user",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F181",
+      "name": "Multiple module support",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F191",
+      "name": "Referential delete actions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F200",
+      "name": "TRUNCATE TABLE statement",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F201",
+      "name": "CAST function",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F202",
+      "name": "TRUNCATE TABLE: identity column restart option",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F221",
+      "name": "Explicit defaults",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F222",
+      "name": "INSERT statement: DEFAULT VALUES clause",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F231",
+      "name": "Privilege tables",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F251",
+      "name": "Domain support",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F261",
+      "name": "CASE expression",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F261-01",
+      "name": "CASE expression",
+      "subfeature": "Simple CASE",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F261-02",
+      "name": "CASE expression",
+      "subfeature": "Searched CASE",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F261-03",
+      "name": "CASE expression",
+      "subfeature": "NULLIF",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F261-04",
+      "name": "CASE expression",
+      "subfeature": "COALESCE",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F262",
+      "name": "Extended CASE expression",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F263",
+      "name": "Comma-separated predicates in simple CASE expression",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F271",
+      "name": "Compound character literals",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F281",
+      "name": "LIKE enhancements",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F291",
+      "name": "UNIQUE predicate",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F292",
+      "name": "UNIQUE null treatment",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F301",
+      "name": "CORRESPONDING in query expressions",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F302",
+      "name": "INTERSECT table operator",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F303",
+      "name": "INTERSECT DISTINCT table operator",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F304",
+      "name": "EXCEPT ALL table operator",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F305",
+      "name": "INTERSECT ALL table operator",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F311",
+      "name": "Schema definition statement",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F311-01",
+      "name": "Schema definition statement",
+      "subfeature": "CREATE SCHEMA",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F311-02",
+      "name": "Schema definition statement",
+      "subfeature": "CREATE TABLE for persistent base tables",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F311-03",
+      "name": "Schema definition statement",
+      "subfeature": "CREATE VIEW",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F311-04",
+      "name": "Schema definition statement",
+      "subfeature": "CREATE VIEW: WITH CHECK OPTION",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F311-05",
+      "name": "Schema definition statement",
+      "subfeature": "GRANT statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F312",
+      "name": "MERGE statement",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F313",
+      "name": "Enhanced MERGE statement",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F314",
+      "name": "MERGE statement with DELETE branch",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F321",
+      "name": "User authorization",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F341",
+      "name": "Usage tables",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F361",
+      "name": "Subprogram support",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F381",
+      "name": "Extended schema manipulation",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F382",
+      "name": "Alter column data type",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F383",
+      "name": "Set column not null clause",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F384",
+      "name": "Drop identity property clause",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F385",
+      "name": "Drop column generation expression clause",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F386",
+      "name": "Set identity column generation clause",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F387",
+      "name": "ALTER TABLE statement: ALTER COLUMN clause",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F388",
+      "name": "ALTER TABLE statement: ADD/DROP CONSTRAINT clause",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F391",
+      "name": "Long identifiers",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F392",
+      "name": "Unicode escapes in identifiers",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F393",
+      "name": "Unicode escapes in literals",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F394",
+      "name": "Optional normal form specification",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F401",
+      "name": "Extended joined table",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F402",
+      "name": "Named column joins for LOBs, arrays, and multisets",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F403",
+      "name": "Partitioned join tables",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F404",
+      "name": "Range variable for common column names",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F405",
+      "name": "NATURAL JOIN",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F406",
+      "name": "FULL OUTER JOIN",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F407",
+      "name": "CROSS JOIN",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F411",
+      "name": "Time zone specification",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": "differences regarding literal interpretation"
+    },
+    {
+      "id": "F421",
+      "name": "National character",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F431",
+      "name": "Read-only scrollable cursors",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F432",
+      "name": "FETCH with explicit NEXT",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F433",
+      "name": "FETCH FIRST",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F434",
+      "name": "FETCH LAST",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F435",
+      "name": "FETCH PRIOR",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F436",
+      "name": "FETCH ABSOLUTE",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F437",
+      "name": "FETCH RELATIVE",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F438",
+      "name": "Scrollable cursors",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F441",
+      "name": "Extended set function support",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F442",
+      "name": "Mixed column references in set functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F451",
+      "name": "Character set definition",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F461",
+      "name": "Named character sets",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F471",
+      "name": "Scalar subquery values",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F481",
+      "name": "Expanded NULL predicate",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F491",
+      "name": "Constraint management",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F492",
+      "name": "Optional table constraint enforcement",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": "except not-null constraints"
+    },
+    {
+      "id": "F501",
+      "name": "Features and conformance views",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F501-01",
+      "name": "Features and conformance views",
+      "subfeature": "SQL_FEATURES view",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F501-02",
+      "name": "Features and conformance views",
+      "subfeature": "SQL_SIZING view",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F502",
+      "name": "Enhanced documentation tables",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F521",
+      "name": "Assertions",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F531",
+      "name": "Temporary tables",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F555",
+      "name": "Enhanced seconds precision",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F561",
+      "name": "Full value expressions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F571",
+      "name": "Truth value tests",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F591",
+      "name": "Derived tables",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F611",
+      "name": "Indicator data types",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F641",
+      "name": "Row and table constructors",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F651",
+      "name": "Catalog name qualifiers",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F661",
+      "name": "Simple tables",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F671",
+      "name": "Subqueries in CHECK constraints",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "intentionally omitted"
+    },
+    {
+      "id": "F672",
+      "name": "Retrospective CHECK constraints",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F673",
+      "name": "Reads SQL-data routine invocations in CHECK constraints",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F690",
+      "name": "Collation support",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F692",
+      "name": "Extended collation support",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F693",
+      "name": "SQL-session and client module collations",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F695",
+      "name": "Translation support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F696",
+      "name": "Additional translation documentation",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F701",
+      "name": "Referential update actions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F711",
+      "name": "ALTER domain",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F721",
+      "name": "Deferrable constraints",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "foreign and unique keys only"
+    },
+    {
+      "id": "F731",
+      "name": "INSERT column privileges",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F741",
+      "name": "Referential MATCH types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "no partial match yet"
+    },
+    {
+      "id": "F751",
+      "name": "View CHECK enhancements",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F761",
+      "name": "Session management",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F762",
+      "name": "CURRENT_CATALOG",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F763",
+      "name": "CURRENT_SCHEMA",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F771",
+      "name": "Connection management",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F781",
+      "name": "Self-referencing operations",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F791",
+      "name": "Insensitive cursors",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F801",
+      "name": "Full set function",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F812",
+      "name": "Basic flagging",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F813",
+      "name": "Extended flagging",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F821",
+      "name": "Local table references",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F831",
+      "name": "Full cursor update",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F832",
+      "name": "Updatable scrollable cursors",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F833",
+      "name": "Updatable ordered cursors",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F841",
+      "name": "LIKE_REGEX predicate",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "consider regexp_like()"
+    },
+    {
+      "id": "F842",
+      "name": "OCCURRENCES_REGEX function",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "consider regexp_matches()"
+    },
+    {
+      "id": "F843",
+      "name": "POSITION_REGEX function",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "consider regexp_instr()"
+    },
+    {
+      "id": "F844",
+      "name": "SUBSTRING_REGEX function",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "consider regexp_substr()"
+    },
+    {
+      "id": "F845",
+      "name": "TRANSLATE_REGEX function",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "consider regexp_replace()"
+    },
+    {
+      "id": "F846",
+      "name": "Octet support in regular expression operators",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F847",
+      "name": "Non-constant regular expressions",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F850",
+      "name": "Top-level ORDER BY in query expression",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F851",
+      "name": "ORDER BY in subqueries",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F852",
+      "name": "Top-level ORDER BY in views",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F855",
+      "name": "Nested ORDER BY in query expression",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F856",
+      "name": "Nested FETCH FIRST in query expression",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F857",
+      "name": "Top-level FETCH FIRST in query expression",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F858",
+      "name": "FETCH FIRST in subqueries",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F859",
+      "name": "Top-level FETCH FIRST in views",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F860",
+      "name": "Dynamic FETCH FIRST row count",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F861",
+      "name": "Top-level OFFSET in query expression",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F862",
+      "name": "OFFSET in subqueries",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F863",
+      "name": "Nested OFFSET in query expression",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F864",
+      "name": "Top-level OFFSET in views",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F865",
+      "name": "Dynamic offset row count in OFFSET",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F866",
+      "name": "FETCH FIRST clause: PERCENT option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "F867",
+      "name": "FETCH FIRST clause: WITH TIES option",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F868",
+      "name": "ORDER BY in grouped table",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "F869",
+      "name": "SQL implementation info population",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "R010",
+      "name": "Row pattern recognition: FROM clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "R020",
+      "name": "Row pattern recognition: WINDOW clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "R030",
+      "name": "Row pattern recognition: full aggregate support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S011",
+      "name": "Distinct data types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S011-01",
+      "name": "Distinct data types",
+      "subfeature": "USER_DEFINED_TYPES view",
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S023",
+      "name": "Basic structured types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S024",
+      "name": "Enhanced structured types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S025",
+      "name": "Final structured types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S026",
+      "name": "Self-referencing structured types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S027",
+      "name": "Create method by specific method name",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S028",
+      "name": "Permutable UDT options list",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S041",
+      "name": "Basic reference types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S043",
+      "name": "Enhanced reference types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S051",
+      "name": "Create table of type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "partially supported"
+    },
+    {
+      "id": "S071",
+      "name": "SQL paths in function and type name resolution",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "S081",
+      "name": "Subtables",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S090",
+      "name": "Minimal array support",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "S091",
+      "name": "Basic array support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "partially supported"
+    },
+    {
+      "id": "S092",
+      "name": "Arrays of user-defined types",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "S093",
+      "name": "Arrays of distinct types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S094",
+      "name": "Arrays of reference types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S095",
+      "name": "Array constructors by query",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "S096",
+      "name": "Optional array bounds",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "S097",
+      "name": "Array element assignment",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S098",
+      "name": "ARRAY_AGG",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "S099",
+      "name": "Array expressions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "S111",
+      "name": "ONLY in query expressions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "S151",
+      "name": "Type predicate",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "see pg_typeof()"
+    },
+    {
+      "id": "S161",
+      "name": "Subtype treatment",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S162",
+      "name": "Subtype treatment for references",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S201",
+      "name": "SQL-invoked routines on arrays",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "S202",
+      "name": "SQL-invoked routines on multisets",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S203",
+      "name": "Array parameters",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "S204",
+      "name": "Array as result type of functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "S211",
+      "name": "User-defined cast functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "S231",
+      "name": "Structured type locators",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S232",
+      "name": "Array locators",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S233",
+      "name": "Multiset locators",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S241",
+      "name": "Transform functions",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S242",
+      "name": "Alter transform statement",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S251",
+      "name": "User-defined orderings",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S261",
+      "name": "Specific type method",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S271",
+      "name": "Basic multiset support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S272",
+      "name": "Multisets of user-defined types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S274",
+      "name": "Multisets of reference types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S275",
+      "name": "Advanced multiset support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S281",
+      "name": "Nested collection types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S291",
+      "name": "Unique constraint on entire row",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S301",
+      "name": "Enhanced UNNEST",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "S401",
+      "name": "Distinct types based on array types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S402",
+      "name": "Distinct types based on multiset types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S403",
+      "name": "ARRAY_MAX_CARDINALITY",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "S404",
+      "name": "TRIM_ARRAY",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T011",
+      "name": "Timestamp in Information Schema",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T021",
+      "name": "BINARY and VARBINARY data types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T022",
+      "name": "Advanced support for BINARY and VARBINARY data types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T023",
+      "name": "Compound binary literals",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T024",
+      "name": "Spaces in binary literals",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T031",
+      "name": "BOOLEAN data type",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T039",
+      "name": "CLOB locator: non-holdable",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T040",
+      "name": "Concatenation of CLOBs",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T041",
+      "name": "Basic LOB data type support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T042",
+      "name": "Extended LOB data type support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T043",
+      "name": "Multiplier T",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T044",
+      "name": "Multiplier P",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T045",
+      "name": "BLOB data type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T046",
+      "name": "CLOB data type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T047",
+      "name": "POSITION, OCTET_LENGTH, TRIM, and SUBSTRING for BLOBs",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T048",
+      "name": "Concatenation of BLOBs",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T049",
+      "name": "BLOB locator: non-holdable",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T050",
+      "name": "POSITION, CHAR_LENGTH, OCTET_LENGTH, LOWER, TRIM, UPPER, and SUBSTRING for CLOBs",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T051",
+      "name": "Row types",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T053",
+      "name": "Explicit aliases for all-fields reference",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T054",
+      "name": "GREATEST and LEAST",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": "different null handling"
+    },
+    {
+      "id": "T055",
+      "name": "String padding functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T056",
+      "name": "Multi-character TRIM functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T061",
+      "name": "UCS support",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T062",
+      "name": "Character length units",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T071",
+      "name": "BIGINT data type",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T076",
+      "name": "DECFLOAT data type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T081",
+      "name": "Optional string types maximum length",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T101",
+      "name": "Enhanced nullability determination",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T111",
+      "name": "Updatable joins, unions, and columns",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T121",
+      "name": "WITH (excluding RECURSIVE) in query expression",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T122",
+      "name": "WITH (excluding RECURSIVE) in subquery",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T131",
+      "name": "Recursive query",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T132",
+      "name": "Recursive query in subquery",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T133",
+      "name": "Enhanced cycle mark values",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T141",
+      "name": "SIMILAR predicate",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T151",
+      "name": "DISTINCT predicate",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T152",
+      "name": "DISTINCT predicate with negation",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T171",
+      "name": "LIKE clause in table definition",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T172",
+      "name": "AS subquery clause in table definition",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T173",
+      "name": "Extended LIKE clause in table definition",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T174",
+      "name": "Identity columns",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T175",
+      "name": "Generated columns",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "mostly supported"
+    },
+    {
+      "id": "T176",
+      "name": "Sequence generator support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "supported except for NEXT VALUE FOR"
+    },
+    {
+      "id": "T177",
+      "name": "Sequence generator support: simple restart option",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T178",
+      "name": "Identity columns: simple restart option",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T180",
+      "name": "System-versioned tables",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T181",
+      "name": "Application-time period tables",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T191",
+      "name": "Referential action RESTRICT",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T200",
+      "name": "Trigger DDL",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "similar but not fully compatible"
+    },
+    {
+      "id": "T201",
+      "name": "Comparable data types for referential constraints",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T211",
+      "name": "Basic trigger capability",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T212",
+      "name": "Enhanced trigger capability",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T213",
+      "name": "INSTEAD OF triggers",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T214",
+      "name": "BEFORE triggers",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T215",
+      "name": "AFTER triggers",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T216",
+      "name": "Ability to require true search condition before trigger is invoked",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T217",
+      "name": "TRIGGER privilege",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T218",
+      "name": "Multiple triggers for the same event executed in the order created",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "intentionally omitted"
+    },
+    {
+      "id": "T231",
+      "name": "Sensitive cursors",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T241",
+      "name": "START TRANSACTION statement",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T251",
+      "name": "SET TRANSACTION statement: LOCAL option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T261",
+      "name": "Chained transactions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T262",
+      "name": "Multiple server transactions",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T271",
+      "name": "Savepoints",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T272",
+      "name": "Enhanced savepoint management",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T281",
+      "name": "SELECT privilege with column granularity",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T285",
+      "name": "Enhanced derived column names",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T301",
+      "name": "Functional dependencies",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "partially supported"
+    },
+    {
+      "id": "T312",
+      "name": "OVERLAY function",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T321",
+      "name": "Basic SQL-invoked routines",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "partially supported"
+    },
+    {
+      "id": "T321-01",
+      "name": "Basic SQL-invoked routines",
+      "subfeature": "User-defined functions with no overloading",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T321-02",
+      "name": "Basic SQL-invoked routines",
+      "subfeature": "User-defined stored procedures with no overloading",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T321-03",
+      "name": "Basic SQL-invoked routines",
+      "subfeature": "Function invocation",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T321-04",
+      "name": "Basic SQL-invoked routines",
+      "subfeature": "CALL statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T321-05",
+      "name": "Basic SQL-invoked routines",
+      "subfeature": "RETURN statement",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T321-06",
+      "name": "Basic SQL-invoked routines",
+      "subfeature": "ROUTINES view",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T321-07",
+      "name": "Basic SQL-invoked routines",
+      "subfeature": "PARAMETERS view",
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T322",
+      "name": "Declared data type attributes",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T323",
+      "name": "Explicit security for external routines",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T324",
+      "name": "Explicit security for SQL routines",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T325",
+      "name": "Qualified SQL parameter references",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T326",
+      "name": "Table functions",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T331",
+      "name": "Basic roles",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T332",
+      "name": "Extended roles",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T341",
+      "name": "Overloading of SQL-invoked functions and SQL-invoked procedures",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T351",
+      "name": "Bracketed comments",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T431",
+      "name": "Extended grouping capabilities",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T432",
+      "name": "Nested and concatenated GROUPING SETS",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T433",
+      "name": "Multi-argument GROUPING function",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T434",
+      "name": "GROUP BY DISTINCT",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T441",
+      "name": "ABS and MOD functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T461",
+      "name": "Symmetric BETWEEN predicate",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T471",
+      "name": "Result sets return value",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T472",
+      "name": "DESCRIBE CURSOR",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T491",
+      "name": "LATERAL derived table",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T495",
+      "name": "Combined data change and retrieval",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "different syntax"
+    },
+    {
+      "id": "T501",
+      "name": "Enhanced EXISTS predicate",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T502",
+      "name": "Period predicates",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T511",
+      "name": "Transaction counts",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T521",
+      "name": "Named arguments in CALL statement",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T522",
+      "name": "Default values for IN parameters of SQL-invoked procedures",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "supported except DEFAULT key word in invocation"
+    },
+    {
+      "id": "T523",
+      "name": "Default values for INOUT parameters of SQL-invoked procedures",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T524",
+      "name": "Named arguments in routine invocations other than a CALL statement",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T525",
+      "name": "Default values for parameters of SQL-invoked functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T551",
+      "name": "Optional key words for default syntax",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T561",
+      "name": "Holdable locators",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T571",
+      "name": "Array-returning external SQL-invoked functions",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T572",
+      "name": "Multiset-returning external SQL-invoked functions",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T581",
+      "name": "Regular expression substring function",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T591",
+      "name": "UNIQUE constraints of possibly null columns",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T601",
+      "name": "Local cursor references",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T611",
+      "name": "Elementary OLAP operations",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T612",
+      "name": "Advanced OLAP operations",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T613",
+      "name": "Sampling",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T614",
+      "name": "NTILE function",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T615",
+      "name": "LEAD and LAG functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T616",
+      "name": "Null treatment option for LEAD and LAG functions",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T617",
+      "name": "FIRST_VALUE and LAST_VALUE functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T618",
+      "name": "NTH_VALUE function",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "function exists, but some options missing"
+    },
+    {
+      "id": "T619",
+      "name": "Nested window functions",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T620",
+      "name": "WINDOW clause: GROUPS option",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T621",
+      "name": "Enhanced numeric functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T622",
+      "name": "Trigonometric functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T623",
+      "name": "General logarithm functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T624",
+      "name": "Common logarithm functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T625",
+      "name": "LISTAGG",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T626",
+      "name": "ANY_VALUE",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T627",
+      "name": "Window framed COUNT DISTINCT",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T631",
+      "name": "IN predicate with one list element",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T641",
+      "name": "Multiple column assignment",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "only some syntax variants supported"
+    },
+    {
+      "id": "T651",
+      "name": "SQL-schema statements in SQL routines",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T652",
+      "name": "SQL-dynamic statements in SQL routines",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T653",
+      "name": "SQL-schema statements in external routines",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T654",
+      "name": "SQL-dynamic statements in external routines",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T655",
+      "name": "Cyclically dependent routines",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T661",
+      "name": "Non-decimal integer literals",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T662",
+      "name": "Underscores in numeric literals",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T670",
+      "name": "Schema and data statement mixing",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T801",
+      "name": "JSON data type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T802",
+      "name": "Enhanced JSON data type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T803",
+      "name": "String-based JSON",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T811",
+      "name": "Basic SQL/JSON constructor functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T812",
+      "name": "SQL/JSON: JSON_OBJECTAGG",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T813",
+      "name": "SQL/JSON: JSON_ARRAYAGG with ORDER BY",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T814",
+      "name": "Colon in JSON_OBJECT or JSON_OBJECTAGG",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T821",
+      "name": "Basic SQL/JSON query operators",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T822",
+      "name": "SQL/JSON: IS JSON WITH UNIQUE KEYS predicate",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T823",
+      "name": "SQL/JSON: PASSING clause",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T824",
+      "name": "JSON_TABLE: specific PLAN clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T825",
+      "name": "SQL/JSON: ON EMPTY and ON ERROR clauses",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T826",
+      "name": "General value expression in ON ERROR or ON EMPTY clauses",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T827",
+      "name": "JSON_TABLE: sibling NESTED COLUMNS clauses",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T828",
+      "name": "JSON_QUERY",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T829",
+      "name": "JSON_QUERY: array wrapper options",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T830",
+      "name": "Enforcing unique keys in SQL/JSON constructor functions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T831",
+      "name": "SQL/JSON path language: strict mode",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T832",
+      "name": "SQL/JSON path language: item method",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T833",
+      "name": "SQL/JSON path language: multiple subscripts",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T834",
+      "name": "SQL/JSON path language: wildcard member accessor",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T835",
+      "name": "SQL/JSON path language: filter expressions",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T836",
+      "name": "SQL/JSON path language: starts with predicate",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T837",
+      "name": "SQL/JSON path language: regex_like predicate",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T838",
+      "name": "JSON_TABLE: PLAN DEFAULT clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T839",
+      "name": "Formatted cast of datetimes to/from character strings",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T840",
+      "name": "Hex integer literals in SQL/JSON path language",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T851",
+      "name": "SQL/JSON: optional keywords for default syntax",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T860",
+      "name": "SQL/JSON simplified accessor: column reference only",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T861",
+      "name": "SQL/JSON simplified accessor: case-sensitive JSON member accessor",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T862",
+      "name": "SQL/JSON simplified accessor: wildcard member accessor",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T863",
+      "name": "SQL/JSON simplified accessor: single-quoted string literal as member accessor",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T864",
+      "name": "SQL/JSON simplified accessor",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "T865",
+      "name": "SQL/JSON item method: bigint()",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T866",
+      "name": "SQL/JSON item method: boolean()",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T867",
+      "name": "SQL/JSON item method: date()",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T868",
+      "name": "SQL/JSON item method: decimal()",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T869",
+      "name": "SQL/JSON item method: decimal() with precision and scale",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T870",
+      "name": "SQL/JSON item method: integer()",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T871",
+      "name": "SQL/JSON item method: number()",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T872",
+      "name": "SQL/JSON item method: string()",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T873",
+      "name": "SQL/JSON item method: time()",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T874",
+      "name": "SQL/JSON item method: time_tz()",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T875",
+      "name": "SQL/JSON item method: time precision",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T876",
+      "name": "SQL/JSON item method: timestamp()",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T877",
+      "name": "SQL/JSON item method: timestamp_tz()",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T878",
+      "name": "SQL/JSON item method: timestamp precision",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "T879",
+      "name": "JSON in equality operations",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": "with jsonb"
+    },
+    {
+      "id": "T880",
+      "name": "JSON in grouping operations",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": "with jsonb"
+    },
+    {
+      "id": "T881",
+      "name": "JSON in ordering operations",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "with jsonb, partially supported"
+    },
+    {
+      "id": "T882",
+      "name": "JSON in multiset element grouping operations",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M001",
+      "name": "Datalinks",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M002",
+      "name": "Datalinks via SQL/CLI",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M003",
+      "name": "Datalinks via Embedded SQL",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M004",
+      "name": "Foreign data support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "partially supported"
+    },
+    {
+      "id": "M005",
+      "name": "Foreign schema support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M006",
+      "name": "GetSQLString routine",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M007",
+      "name": "TransmitRequest",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M009",
+      "name": "GetOpts and GetStatistics routines",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M010",
+      "name": "Foreign-data wrapper support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "different API"
+    },
+    {
+      "id": "M011",
+      "name": "Datalinks via Ada",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M012",
+      "name": "Datalinks via C",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M013",
+      "name": "Datalinks via COBOL",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M014",
+      "name": "Datalinks via Fortran",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M015",
+      "name": "Datalinks via M",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M016",
+      "name": "Datalinks via Pascal",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M017",
+      "name": "Datalinks via PL/I",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M018",
+      "name": "Foreign-data wrapper interface routines in Ada",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M019",
+      "name": "Foreign-data wrapper interface routines in C",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "different API"
+    },
+    {
+      "id": "M020",
+      "name": "Foreign-data wrapper interface routines in COBOL",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M021",
+      "name": "Foreign-data wrapper interface routines in Fortran",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M022",
+      "name": "Foreign-data wrapper interface routines in MUMPS",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M023",
+      "name": "Foreign-data wrapper interface routines in Pascal",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M024",
+      "name": "Foreign-data wrapper interface routines in PL/I",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M030",
+      "name": "SQL-server foreign data support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "M031",
+      "name": "Foreign-data wrapper general routines",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X010",
+      "name": "XML type",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X011",
+      "name": "Arrays of XML type",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X012",
+      "name": "Multisets of XML type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X013",
+      "name": "Distinct types of XML type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X014",
+      "name": "Attributes of XML type",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X015",
+      "name": "Fields of XML type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X016",
+      "name": "Persistent XML values",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X020",
+      "name": "XMLConcat",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X025",
+      "name": "XMLCast",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X030",
+      "name": "XMLDocument",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X031",
+      "name": "XMLElement",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X032",
+      "name": "XMLForest",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X034",
+      "name": "XMLAgg",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X035",
+      "name": "XMLAgg: ORDER BY option",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X036",
+      "name": "XMLComment",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X037",
+      "name": "XMLPI",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X038",
+      "name": "XMLText",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": "supported except for RETURNING"
+    },
+    {
+      "id": "X040",
+      "name": "Basic table mapping",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X041",
+      "name": "Basic table mapping: null absent",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X042",
+      "name": "Basic table mapping: null as nil",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X043",
+      "name": "Basic table mapping: table as forest",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X044",
+      "name": "Basic table mapping: table as element",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X045",
+      "name": "Basic table mapping: with target namespace",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X046",
+      "name": "Basic table mapping: data mapping",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X047",
+      "name": "Basic table mapping: metadata mapping",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X048",
+      "name": "Basic table mapping: base64 encoding of binary strings",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X049",
+      "name": "Basic table mapping: hex encoding of binary strings",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X050",
+      "name": "Advanced table mapping",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X051",
+      "name": "Advanced table mapping: null absent",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X052",
+      "name": "Advanced table mapping: null as nil",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X053",
+      "name": "Advanced table mapping: table as forest",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X054",
+      "name": "Advanced table mapping: table as element",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X055",
+      "name": "Advanced table mapping: with target namespace",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X056",
+      "name": "Advanced table mapping: data mapping",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X057",
+      "name": "Advanced table mapping: metadata mapping",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X058",
+      "name": "Advanced table mapping: base64 encoding of binary strings",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X059",
+      "name": "Advanced table mapping: hex encoding of binary strings",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X060",
+      "name": "XMLParse: character string input and CONTENT option",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X061",
+      "name": "XMLParse: character string input and DOCUMENT option",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X065",
+      "name": "XMLParse: binary string input and CONTENT option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X066",
+      "name": "XMLParse: binary string input and DOCUMENT option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X068",
+      "name": "XMLSerialize: BOM",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X069",
+      "name": "XMLSerialize: INDENT",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X070",
+      "name": "XMLSerialize: character string serialization and CONTENT option",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X071",
+      "name": "XMLSerialize: character string serialization and DOCUMENT option",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X072",
+      "name": "XMLSerialize: character string serialization",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X073",
+      "name": "XMLSerialize: binary string serialization and CONTENT option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X074",
+      "name": "XMLSerialize: binary string serialization and DOCUMENT option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X075",
+      "name": "XMLSerialize: binary string serialization",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X076",
+      "name": "XMLSerialize: VERSION",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X077",
+      "name": "XMLSerialize: explicit ENCODING option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X078",
+      "name": "XMLSerialize: explicit XML declaration",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X080",
+      "name": "Namespaces in XML publishing",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X081",
+      "name": "Query-level XML namespace declarations",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X082",
+      "name": "XML namespace declarations in DML",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X083",
+      "name": "XML namespace declarations in DDL",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X084",
+      "name": "XML namespace declarations in compound statements",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X085",
+      "name": "Predefined namespace prefixes",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X086",
+      "name": "XML namespace declarations in XMLTable",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X090",
+      "name": "XML document predicate",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X091",
+      "name": "XML content predicate",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X096",
+      "name": "XMLExists",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "XPath 1.0 only"
+    },
+    {
+      "id": "X100",
+      "name": "Host language support for XML: CONTENT option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X101",
+      "name": "Host language support for XML: DOCUMENT option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X110",
+      "name": "Host language support for XML: VARCHAR mapping",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X111",
+      "name": "Host language support for XML: CLOB mapping",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X112",
+      "name": "Host language support for XML: BLOB mapping",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X113",
+      "name": "Host language support for XML: STRIP WHITESPACE option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X114",
+      "name": "Host language support for XML: PRESERVE WHITESPACE option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X120",
+      "name": "XML parameters in SQL routines",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X121",
+      "name": "XML parameters in external routines",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X131",
+      "name": "Query-level XMLBINARY clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X132",
+      "name": "XMLBINARY clause in DML",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X133",
+      "name": "XMLBINARY clause in DDL",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X134",
+      "name": "XMLBINARY clause in compound statements",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X135",
+      "name": "XMLBINARY clause in subqueries",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X141",
+      "name": "IS VALID predicate: data-driven case",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X142",
+      "name": "IS VALID predicate: ACCORDING TO clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X143",
+      "name": "IS VALID predicate: ELEMENT clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X144",
+      "name": "IS VALID predicate: schema location",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X145",
+      "name": "IS VALID predicate outside check constraints",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X151",
+      "name": "IS VALID predicate: with DOCUMENT option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X152",
+      "name": "IS VALID predicate: with CONTENT option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X153",
+      "name": "IS VALID predicate: with SEQUENCE option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X155",
+      "name": "IS VALID predicate: NAMESPACE without ELEMENT clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X157",
+      "name": "IS VALID predicate: NO NAMESPACE with ELEMENT clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X160",
+      "name": "Basic Information Schema for registered XML schemas",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X161",
+      "name": "Advanced Information Schema for registered XML schemas",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X170",
+      "name": "XML null handling options",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X171",
+      "name": "NIL ON NO CONTENT option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X181",
+      "name": "XML(DOCUMENT(UNTYPED)) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X182",
+      "name": "XML(DOCUMENT(ANY)) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X190",
+      "name": "XML(SEQUENCE) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X191",
+      "name": "XML(DOCUMENT(XMLSCHEMA)) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X192",
+      "name": "XML(CONTENT(XMLSCHEMA)) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X200",
+      "name": "XMLQuery",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X201",
+      "name": "XMLQuery: RETURNING CONTENT",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X202",
+      "name": "XMLQuery: RETURNING SEQUENCE",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X203",
+      "name": "XMLQuery: passing a context item",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X204",
+      "name": "XMLQuery: initializing an XQuery variable",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X205",
+      "name": "XMLQuery: EMPTY ON EMPTY option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X206",
+      "name": "XMLQuery: NULL ON EMPTY option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X211",
+      "name": "XML 1.1 support",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X221",
+      "name": "XML passing mechanism BY VALUE",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X222",
+      "name": "XML passing mechanism BY REF",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "parser accepts BY REF but ignores it; passing is always BY VALUE"
+    },
+    {
+      "id": "X231",
+      "name": "XML(CONTENT(UNTYPED)) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X232",
+      "name": "XML(CONTENT(ANY)) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X241",
+      "name": "RETURNING CONTENT in XML publishing",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X242",
+      "name": "RETURNING SEQUENCE in XML publishing",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X251",
+      "name": "Persistent XML values of XML(DOCUMENT(UNTYPED)) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X252",
+      "name": "Persistent XML values of XML(DOCUMENT(ANY)) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X253",
+      "name": "Persistent XML values of XML(CONTENT(UNTYPED)) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X254",
+      "name": "Persistent XML values of XML(CONTENT(ANY)) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X255",
+      "name": "Persistent XML values of XML(SEQUENCE) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X256",
+      "name": "Persistent XML values of XML(DOCUMENT(XMLSCHEMA)) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X257",
+      "name": "Persistent XML values of XML(CONTENT(XMLSCHEMA)) type",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X260",
+      "name": "XML type: ELEMENT clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X261",
+      "name": "XML type: NAMESPACE without ELEMENT clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X263",
+      "name": "XML type: NO NAMESPACE with ELEMENT clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X264",
+      "name": "XML type: schema location",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X271",
+      "name": "XMLValidate: data-driven case",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X272",
+      "name": "XMLValidate: ACCORDING TO clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X273",
+      "name": "XMLValidate: ELEMENT clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X274",
+      "name": "XMLValidate: schema location",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X281",
+      "name": "XMLValidate with DOCUMENT option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X282",
+      "name": "XMLValidate with CONTENT option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X283",
+      "name": "XMLValidate with SEQUENCE option",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X284",
+      "name": "XMLValidate: NAMESPACE without ELEMENT clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X286",
+      "name": "XMLValidate: NO NAMESPACE with ELEMENT clause",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X300",
+      "name": "XMLTable",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": "XPath 1.0 only"
+    },
+    {
+      "id": "X301",
+      "name": "XMLTable: derived column list option",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X302",
+      "name": "XMLTable: ordinality column option",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X303",
+      "name": "XMLTable: column default option",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X304",
+      "name": "XMLTable: passing a context item",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": "must be XML DOCUMENT"
+    },
+    {
+      "id": "X305",
+      "name": "XMLTable: initializing an XQuery variable",
+      "subfeature": null,
+      "postgres_supported": false,
+      "note": null
+    },
+    {
+      "id": "X400",
+      "name": "Name and identifier mapping",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    },
+    {
+      "id": "X410",
+      "name": "Alter column data type: XML type",
+      "subfeature": null,
+      "postgres_supported": true,
+      "note": null
+    }
+  ]
+}

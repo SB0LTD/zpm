@@ -37,17 +37,17 @@ pub const TypeName = types.Type;
 
 /// `arrow` ->, `arrow_text` ->>, `path` #>, `path_text` #>>, `contains` @>,
 /// `contained` <@, `exists` ?.
-pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists };
+pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists, is_distinct, is_not_distinct };
 
 /// Built-in functions bound by name.
-pub const Func = enum { none, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round };
+pub const Func = enum { none, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, greatest, least };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
 /// clock or subquery in a pure function never makes its effects repeatable.
 pub fn canRepeatFunction(func: Func) bool {
     return switch (func) {
-        .round => true,
+        .round, .greatest, .least => true,
         else => false,
     };
 }
