@@ -385,6 +385,31 @@ fn capacity() !void {
     try check(r.row_count == 3);
 }
 
+fn projectionOwnership() !void {
+    var db:DB=.{};var r:DB.Result=.{};
+    const text="abcdefghijklmnopqrstuvwxyz012345";
+    try db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, tag TEXT, amount NUMERIC)",&r);
+    try db.execute("INSERT INTO p VALUES (1,'abcdefghijklmnopqrstuvwxyz012345',1.25),(2,NULL,NULL)",&r);
+    // Both materialized inputs and outputs share the caller's arena. Repeated
+    // borrowed columns must copy before the next expression can reuse scratch.
+    @memset(&db.workspace.query.cells,.{.integer=0x55555555});
+    try db.execute("WITH src AS (SELECT id,tag,amount FROM p) SELECT tag,tag,amount,amount+1,id+10,NULL FROM src ORDER BY 5",&r);
+    try check(r.row_count==2 and r.column_count==6);
+    for(0..2) |column| try check(std.mem.eql(u8,r.rows[0].cells[column].text.slice(),text));
+    try check(r.rows[0].cells[2].numeric.coef()==125 and r.rows[0].cells[2].numeric.dscale==2);
+    try check(r.rows[0].cells[3].numeric.coef()==225 and r.rows[0].cells[3].numeric.dscale==2);
+    try check(r.rows[0].cells[4].integer==11 and r.rows[0].cells[5]==.null_value);
+    for(0..4) |column| try check(r.rows[1].cells[column]==.null_value);
+    try check(r.rows[1].cells[4].integer==12 and r.rows[1].cells[5]==.null_value);
+    // Result ownership survives poisoning/reuse of every temporary input.
+    @memset(&db.workspace.query.cells,.{.integer=0x66666666});
+    try check(std.mem.eql(u8,r.rows[0].cells[0].text.slice(),text));
+    try check(r.rows[0].cells[3].numeric.coef()==225);
+    try rejects(&db,&r,"SELECT tag,amount,1/(id-id) FROM p",error.DivisionByZero);
+    try check(std.mem.eql(u8,r.rows[0].cells[1].text.slice(),text));
+    try expect(&db,&r,"SELECT id+10,id,id+20,id,id+30,id FROM p ORDER BY 1","11|1|21|1|31|1;12|2|22|2|32|2");
+}
+
 pub fn main(init: std.process.Init) !void {
     try sortContract();
     try topKContract();
@@ -394,6 +419,7 @@ pub fn main(init: std.process.Init) !void {
     try joins();
     try transactions();
     try capacity();
+    try projectionOwnership();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-query\",\"pass\":true,\"assertions\":{d},\"database_bytes\":{d},\"big_bytes\":{d},\"work_rows\":{d}}}\n", .{ assertions, DB.storageBytes(), Big.storageBytes(), Big.work_rows });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

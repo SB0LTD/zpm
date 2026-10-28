@@ -373,8 +373,12 @@ pub fn Exec(comptime config: types.Config) type {
             fn projectRow(self: *Query, p: *const B.Plan, ctx: *E.Context, out: *List) Error!void {
                 const at = try self.cells(p.width);
                 for (p.targets[0..p.width], 0..) |id, column| {
-                    const value = try E.eval(ctx, id);
-                    self.work.cells[at + column] = value;
+                    // The newly reserved output cannot alias an input tuple.
+                    // Columns borrow only until this copy; computed values use
+                    // the private destination as scratch, avoiding another Cell.
+                    const destination=&self.work.cells[at+column];
+                    const value=try E.evalRef(ctx,id,destination);
+                    if(value!=destination) destination.*=value.*;
                 }
                 try self.push(out, at);
             }
