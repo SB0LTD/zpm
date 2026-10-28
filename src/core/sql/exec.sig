@@ -60,6 +60,8 @@ pub fn Exec(comptime config: types.Config) type {
             factor_plans: usize = 0,
             factor_keys: usize = 0,
             factor_selected_rows: usize = 0,
+            nested_factor_plans: usize = 0,
+            nested_factor_keys: usize = 0,
             gathered_rows: usize = 0,
             distinct_bitmap_bytes: usize = 0,
             groups: usize = 0,
@@ -1458,6 +1460,204 @@ pub fn Exec(comptime config: types.Config) type {
                 return result;
             }
 
+            const NestedInput=enum {none,key,rows,total};
+            const NestedPredicate=struct {input:NestedInput,op:ast.Op,value:i64};
+            const NestedAggregate=struct {total:i128 align(@alignOf(V.Cell))=0,extreme:i128 align(@alignOf(V.Cell))=0,count:i64=0};
+            fn nestedStates(bytes:[*]u8,count:usize) []NestedAggregate {
+                const pointer:[*]NestedAggregate=@ptrCast(@alignCast(bytes+factor_header));return pointer[0..count];
+            }
+            fn nestedInput(self:*const Query,first:u16,outputs:[]const NestedInput) NestedInput {
+                var id=first;
+                for(0..config.expr_depth) |_| {
+                    const node=self.pool.nodes[id];
+                    if(node.kind==.cast and node.ty==.numeric and node.typmod<0) {id=node.a;continue;}
+                    if(node.kind==.column and node.level==0 and node.relation==0 and node.column<outputs.len) return outputs[node.column];
+                    return .none;
+                }
+                return .none;
+            }
+            fn nestedLiteral(self:*const Query,first:u16) ?i64 {
+                var id=first;
+                for(0..config.expr_depth) |_| {
+                    const node=self.pool.nodes[id];
+                    if(node.kind==.cast and node.ty==.numeric and node.typmod<0) {id=node.a;continue;}
+                    return if(node.kind==.int_literal) node.integer else null;
+                }
+                return null;
+            }
+            fn nestedPredicates(self:*const Query,id:u16,outputs:[]const NestedInput,out:[]NestedPredicate,used:*usize) bool {
+                if(id==none) return true;
+                const node=self.pool.nodes[id];
+                if(node.kind==.and_op) return self.nestedPredicates(node.a,outputs,out,used) and self.nestedPredicates(node.b,outputs,out,used);
+                if(node.kind!=.binary or used.*==out.len) return false;
+                var op=node.op;switch(op){.eq,.ne,.lt,.le,.gt,.ge=>{},else=>return false}
+                var input=self.nestedInput(node.a,outputs);var literal=self.nestedLiteral(node.b);
+                if(input==.none or literal==null) {
+                    input=self.nestedInput(node.b,outputs);literal=self.nestedLiteral(node.a);
+                    op=switch(op){.lt=>.gt,.le=>.ge,.gt=>.lt,.ge=>.le,else=>op};
+                }
+                if(input==.none or literal==null) return false;
+                out[used.*]=.{.input=input,.op=op,.value=literal.?};used.*+=1;return true;
+            }
+            fn nestedValue(input:NestedInput,key:i64,bucket:*const NarrowBucket) i128 {
+                return switch(input){.key=>key,.rows=>bucket.rows,.total=>bucket.total,.none=>unreachable};
+            }
+
+            /// Carry a non-null COUNT/SUM producer directly into a grouped
+            /// unique-key consumer. No producer Cell table or NUMERIC per key.
+            noinline fn nestedFactorGroup(self:*Query,p:*const B.Plan,outer:?*const E.Context) Error!?List {
+                if(outer!=null or p.set_op!=.none or p.correlated or !p.grouped or p.source_count!=2 or p.key_count==0 or p.agg_count==0 or !self.committed_only) return null;
+                if(comptime config.numeric_digits<39) return null;
+                const source=p.sources[0];var producer_id=source.plan;
+                if(source.table!=null or source.view!=null or p.sources[1].table==null or p.sources[1].join!=.inner or p.sources[1].probe==none) return null;
+                if(source.cte!=B.no_cte) {
+                    // A shared/recursive producer owns a materialization lifetime.
+                    // Fuse only a single consumer, leaving that lifetime untouched.
+                    for(self.plans.ctes[0..self.plans.cte_len]) |definition| if(definition.recursive) {return null;};
+                    if(self.work.ctes[source.cte].state!=.idle) return null;
+                    var references:usize=0;for(self.plans.items[0..self.plans.len]) |plan| for(plan.sources[0..plan.source_count]) |item| {references+=@intFromBool(item.cte==source.cte);};
+                    if(references!=1) return null;
+                    producer_id=self.plans.ctes[source.cte].plan;
+                }
+                if(producer_id==none) return null;
+                const producer=&self.plans.items[producer_id];
+                if(producer.set_op!=.none or producer.correlated or !producer.grouped or producer.source_count!=1 or producer.sources[0].table==null or
+                    producer.where!=none or producer.having!=none or producer.key_count!=1 or producer.agg_count!=2 or producer.order_count!=0 or
+                    producer.distinct!=.none or producer.limit!=0xffffffffffffffff or producer.offset!=0) return null;
+                const table=&self.tables[producer.sources[0].table.?];
+                if(!table.summary.valid or table.summary.rows<0 or table.summary.csn>self.snap.csn or table.scan_high!=table.row_high) return null;
+                const key=self.pool.nodes[producer.keys[0]];
+                if(key.kind!=.column or key.level!=0 or key.relation!=0 or !value_module.integral(key.ty)) return null;
+                var transitions:[2]Transition=undefined;if(!self.prepareTransitions(producer,&transitions)) return null;
+                const count_index:usize=if(transitions[0].kind==.count_star) 0 else 1;const sum_index=1-count_index;
+                if(transitions[count_index].kind!=.count_star or (transitions[sum_index].kind!=.sum_integer and transitions[sum_index].kind!=.sum_wide)) return null;
+                const sum_column=transitions[sum_index].column;
+                // The narrow producer state represents every prefix exactly.
+                // Nullable measures need a separate non-null count; defer those
+                // to the canonical executor rather than treating NULL as zero.
+                if(table.summary.columns[sum_column].nonnull!=table.summary.rows) return null;
+                const amounts=table.integer_bounds[sum_column];const bounds=table.integer_bounds[key.column];if(!amounts.known or !bounds.known) return null;
+                const n=@as(i128,table.summary.rows);const low=n*@as(i128,@min(amounts.low,0));const high=n*@as(i128,@max(amounts.high,0));
+                if(low < -9223372036854775808 or high>9223372036854775807) return null;
+                var outputs:[config.columns]NestedInput=undefined;
+                for(producer.targets[0..producer.count],0..) |id,column| {
+                    const target=self.pool.nodes[id];
+                    if(target.kind!=.column or target.level!=0 or target.relation!=group_relation) return null;
+                    outputs[column]=if(target.column==0) .key else if(target.column==1+count_index) .rows else if(target.column==1+sum_index) .total else return null;
+                }
+                const probe=self.pool.nodes[p.sources[1].probe];
+                if(probe.kind!=.column or probe.level!=0 or probe.relation!=0 or probe.column>=producer.count or outputs[probe.column]!=.key or !self.factorOn(p.sources[1].on,probe.column)) return null;
+                const dimension=&self.tables[p.sources[1].table.?];
+                for(p.keys[0..p.key_count]) |id| {
+                    const group_key=self.pool.nodes[id];
+                    if(group_key.kind!=.column or group_key.level!=0 or group_key.relation!=1 or !S.summaryKeyType(dimension.columns[group_key.column].data_type)) return null;
+                }
+                var inputs:[config.columns]NestedInput=undefined;
+                for(p.aggs[0..p.agg_count],0..) |agg,index| {
+                    if(agg.distinct or agg.filter!=none) return null;
+                    if(agg.kind==.count_star) {inputs[index]=.none;continue;}
+                    if(agg.kind!=.count and agg.kind!=.sum and agg.kind!=.avg and agg.kind!=.min and agg.kind!=.max) return null;
+                    const input=self.pool.nodes[agg.arg];
+                    if(input.kind!=.column or input.level!=0 or input.relation!=0 or input.column>=producer.count) return null;
+                    inputs[index]=outputs[input.column];
+                    if(agg.kind==.sum and agg.ty==.int8) {
+                        const lower:i128=switch(inputs[index]){.key=>@min(bounds.low,0),.rows=>0,.total=>low,.none=>unreachable};
+                        const upper:i128=switch(inputs[index]){.key=>@max(bounds.high,0),.rows=>n,.total=>high,.none=>unreachable};
+                        if(n*lower < -9223372036854775808 or n*upper>9223372036854775807) return null;
+                    }
+                }
+                var predicates:[config.predicates]NestedPredicate=undefined;var predicate_count:usize=0;
+                if(!self.nestedPredicates(p.where,outputs[0..producer.count],&predicates,&predicate_count)) return null;
+                const stride=factor_header+p.agg_count*@sizeOf(NestedAggregate);const state_cells=(stride+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell);
+                const per_key=1+p.key_count+p.agg_count+state_cells+p.width+1;
+                const domain_budget=@min((self.work.cell_high-self.work.cell_low)/per_key,(self.work.ref_high-self.work.ref_low)/16);
+                // Admission is in caller-owned bytes and handles, never a new
+                // compile-time SQL row ceiling. Conservative extrema can decline.
+                const span128=@as(i128,bounds.high)-bounds.low+1;if(span128<=0 or span128>domain_budget) return null;
+                const span:usize=@intCast(span128);const cell_start=self.work.cell_low;const ref_start=self.work.ref_low;
+                const partial_at=try self.cells((span*@sizeOf(NarrowBucket)+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell));
+                const partial_ptr:[*]NarrowBucket=@ptrCast(@alignCast(&self.work.cells[partial_at]));const partial=partial_ptr[0..span];for(partial) |*bucket| bucket.*=.{};
+                var slots:usize=2;while(slots<span*2) slots*=2;
+                const buckets=try self.refs(slots);@memset(self.work.refs[buckets..][0..slots],absent);const tickets=try self.refs(span);var groups:usize=0;
+                const dense=table.summary.rows==@as(i64,@intCast(table.scan_high));const key_nonnull=table.summary.columns[key.column].nonnull==table.summary.rows;
+                var start:usize=0;
+                while(start<table.scan_high):(start+=64) {
+                    const count=@min(@as(usize,64),table.scan_high-start);try self.session.checkpoints(count);
+                    const keys=table.scan_values[@as(usize,key.column)*table.rows.len+start..][0..count];
+                    const values=table.scan_values[@as(usize,sum_column)*table.rows.len+start..][0..count];
+                    if(dense and key_nonnull) {
+                        self.work.stream_stats.rows+=count;
+                        for(keys,values) |key_value,value| {const bucket=&partial[@intCast(@as(i128,key_value)-bounds.low)];bucket.rows+=1;bucket.total+=value;}
+                    } else {
+                        var mask=liveMask(table,start,count,dense);self.work.stream_stats.rows+=@popCount(mask);
+                        while(mask!=0) {
+                            const i=@ctz(mask);mask&=mask-1;
+                            // A NULL producer key cannot pass this integral PK
+                            // equality join. Its SUM is proven non-throwing above.
+                            if(!key_nonnull and table.scan_nonnull[start+i]&(@as(u64,1)<<@intCast(key.column))==0) continue;
+                            const bucket=&partial[@intCast(@as(i128,keys[i])-bounds.low)];bucket.rows+=1;bucket.total+=values[i];
+                        }
+                    }
+                }
+                var ctx=self.context(outer);var producer_cells:[config.columns]V.Cell=undefined;var key_cells:[config.columns]*const V.Cell=undefined;
+                for(partial,0..) |*value,index| {
+                    if(value.rows==0) continue;try self.session.checkpoint();self.work.stream_stats.nested_factor_keys+=1;
+                    const key_value:i64=@intCast(@as(i128,bounds.low)+index);var keep_key=true;
+                    for(predicates[0..predicate_count]) |predicate| {
+                        const input=nestedValue(predicate.input,key_value,value);
+                        const passes=switch(predicate.op){.eq=>input==predicate.value,.ne=>input!=predicate.value,.lt=>input<predicate.value,.le=>input<=predicate.value,.gt=>input>predicate.value,.ge=>input>=predicate.value,else=>unreachable};
+                        if(!passes) {keep_key=false;break;}
+                    }
+                    if(!keep_key) continue;
+                    producer_cells[probe.column]=.{.integer=key_value};ctx.row=null;ctx.tuple[0]=&producer_cells;
+                    self.work.stream_stats.dimension_probes+=1;
+                    const visible=S.lookupVersionAt(dimension,&producer_cells[probe.column],self.snap) orelse continue;
+                    ctx.tuple[1]=&dimension.versions[visible].cells;
+                    if(p.sources[1].on!=none and (try E.truth(&ctx,p.sources[1].on))!=true) continue;
+                    var hash:usize=2166136261;
+                    for(p.keys[0..p.key_count],0..) |id,column| {key_cells[column]=E.columnRef(&ctx,&self.pool.nodes[id]);hash=(hash^(if(key_cells[column].*==.null_value) @as(usize,0x9e3779b9) else V.hash(key_cells[column])))*%16777619;}
+                    var bucket=hash&(slots-1);var group_at:u32=undefined;
+                    while(true) {
+                        try self.session.checkpoint();self.work.stream_stats.probes+=1;const found=self.work.refs[buckets+bucket];
+                        if(found==absent) {
+                            group_at=try self.cells(p.key_count+p.agg_count+state_cells);
+                            for(key_cells[0..p.key_count],0..) |group_key,column| self.work.cells[group_at+column]=group_key.*;
+                            const bytes:[*]u8=@ptrCast(&self.work.cells[group_at+p.key_count+p.agg_count]);@memset(bytes[0..stride],0);
+                            self.work.refs[buckets+bucket]=group_at;self.work.refs[tickets+groups]=group_at;groups+=1;break;
+                        }
+                        var equal=true;for(key_cells[0..p.key_count],0..) |group_key,column| if(V.compare(group_key,&self.work.cells[found+column])!=0) {equal=false;break;};
+                        if(equal) {group_at=found;break;}bucket=(bucket+1)&(slots-1);
+                    }
+                    const bytes:[*]u8=@ptrCast(&self.work.cells[group_at+p.key_count+p.agg_count]);factorRows(bytes).*+=1;
+                    for(p.aggs[0..p.agg_count],inputs[0..p.agg_count],nestedStates(bytes,p.agg_count)) |agg,input,*state| {
+                        if(agg.kind==.count_star or agg.kind==.count) {state.count+=1;continue;}
+                        const scalar=nestedValue(input,key_value,value);
+                        if(agg.kind==.min or agg.kind==.max) state.extreme=if(state.count==0) scalar else if(agg.kind==.min) @min(state.extreme,scalar) else @max(state.extreme,scalar)
+                        else state.total+=scalar;
+                        state.count+=1;
+                    }
+                }
+                if(groups!=0) {const scratch=try self.refs(groups);const sorter:GroupSorter=.{.query=self,.width=p.key_count};_=try sort_module.mergeSort(self.work.refs[tickets..][0..groups],self.work.refs[scratch..][0..groups],&sorter);}
+                var out:List=.{};
+                for(self.work.refs[tickets..][0..groups]) |at| {
+                    const bytes:[*]u8=@ptrCast(&self.work.cells[at+p.key_count+p.agg_count]);var states:[config.columns]Accumulator=undefined;
+                    for(p.aggs[0..p.agg_count],nestedStates(bytes,p.agg_count),states[0..p.agg_count]) |agg,value,*state| {
+                        state.*=.{.count=value.count,.wide=value.total};
+                        if(value.count!=0) {
+                            if(agg.kind==.min or agg.kind==.max) state.value=if(value_module.integral(agg.arg_ty)) .{.integer=@intCast(value.extreme)} else try self.numericOf(value.extreme)
+                            else if(agg.kind==.sum or agg.kind==.avg) {
+                                if(!value_module.integral(agg.arg_ty)) state.value=try self.numericOf(value.total)
+                                else if(agg.kind==.sum and agg.ty==.int8) state.integer=@intCast(value.total);
+                            }
+                        }
+                    }
+                    try self.projectGroup(p,at,states[0..p.agg_count],outer,&out);
+                }
+                const result=try self.finish(p,out);self.work.stream_stats.nested_factor_plans+=1;self.work.stream_stats.groups+=groups;
+                self.work.stream_stats.scratch_cells=@max(self.work.stream_stats.scratch_cells,self.work.cell_low-cell_start);self.work.stream_stats.scratch_refs=@max(self.work.stream_stats.scratch_refs,self.work.ref_low-ref_start);
+                return result;
+            }
+
             const WideBucket=struct {
                 // Storage references admit at most 2^31-1 rows; even i64 input
                 // extremes therefore fit exactly in this signed i128 total.
@@ -1886,6 +2086,13 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn core(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(self.repeatable()) {
+                    const at=self.mark();const stats=self.work.stream_stats;
+                    if(self.nestedFactorGroup(p,outer)) |result| {if(result) |rows| return rows;} else |err| {
+                        if(err!=error.WorkspaceCapacity) return err;
+                        self.release(at);self.work.stream_stats=stats;
+                    }
+                };
                 if (streamEligible(p) and self.repeatable()) {
                     const at = self.mark();
                     const stats = self.work.stream_stats;
