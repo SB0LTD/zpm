@@ -112,6 +112,29 @@ before claiming a performance advantage.
 
 ## Current research and applicable next experiments
 
+### Proven narrower aggregate state
+
+Wide grouped arithmetic now chooses a 16-byte `{i64 total, i64 rows}` state
+when committed metadata proves the input non-null and its conservative bounds
+prove every possible accumulation prefix fits i64. For live row count N and
+input bounds [L,H], require `N*min(L,0) >= i64_min` and
+`N*max(H,0) <= i64_max`, computing the proof in i128. Every group and every
+partial sum contains at most N values, so this bounds partial sums even with
+mixed signs; a small final total alone would not establish the proof.
+
+The existing 32-byte exact i128 state handles nullable inputs, wider/unproven
+bounds and old snapshots/private writes as before. Input bounds include
+uncommitted and aborted versions, so an aborted extreme safely removes the
+narrowing opportunity rather than making the proof optimistic. No hint hash,
+write-time index, allocation or extra storage backing is introduced. Existing
+NUMERIC SUM/AVG finalization and SQL result types remain unchanged.
+
+The independent 5003-key model covers both nullable/non-null keys, dense and
+retained-hole loops, old snapshots, exact averages, aborted bound widening,
+extreme keys and sums that genuinely exceed i64. Metadata-disabled execution
+remains the canonical differential reference. Smaller state is an execution
+choice, not a new SQL range/cardinality limit.
+
 ### Sparse predicate cascades before dimension probes
 
 After a selective leading predicate produces a mask, additional safe leading
@@ -152,6 +175,8 @@ Evaluation retains the literal child's checkpoint when bypassing its cast,
 so cancellation/work charging stays equivalent. The independent fixture
 compares both implicit DATE coercion and eight original-style joins against
 the prior immutable source: all nine instrumented work totals match exactly.
+That proof compares fold-only source `129a89db` with `c3b0c93f`; later cascades
+charge their additional performed filter work separately.
 Multiple distinct literals, reused node IDs, infinities, BC dates, private
 writes and pinned snapshots remain covered by the surrounding contracts.
 

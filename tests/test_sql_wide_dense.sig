@@ -82,12 +82,41 @@ pub fn main() !void {
     // Conservative bounds widened by an aborted write force safe fallback.
     const widened=try db.begin();try db.statement(widened,"UPDATE t SET g=9223372036854775807 WHERE id=3",&result,.{});db.abort(widened);
     try paired(false);
+    // Fresh bounded non-null values admit exact 16-byte states. NULL keys
+    // exercise the sparse loop without weakening the sum's non-null proof.
+    try db.execute("DROP TABLE t",&result);try db.execute("CREATE TABLE t(id INT PRIMARY KEY,g BIGINT,v BIGINT)",&result);
+    for(0..n) |i| {
+        items[i]=.{.key=if(i%17==0) null else @as(i64,@intCast(i%domain))+base,.value=@as(i64,@intCast(i))-6000};
+        const key=if(items[i].key) |v| try std.fmt.bufPrint(&key_buffer,"{d}",.{v}) else "NULL";
+        try db.execute(try std.fmt.bufPrint(&text,"INSERT INTO t VALUES({d},{s},{d})",.{i,key,items[i].value.?}),&result);
+    }
+    try paired(true);try db.execute(query,&result);try model(false);
+    try check(db.workspace.query.stream_stats.narrow_dense_plans==1);
+    try db.execute(average,&result);saved=result;try check(db.workspace.query.stream_stats.narrow_dense_plans==1);
+    db.tables[0].summary.valid=false;try db.execute(average,&result);db.tables[0].summary.valid=true;try equal();
+    // Make the key non-null in bounded write batches, exercising the dense
+    // narrow loop as well as the nullable-key loop above.
+    var start:usize=0;while(start<n):(start+=500) {
+        try db.execute(try std.fmt.bufPrint(&text,"UPDATE t SET g=0 WHERE g IS NULL AND id>={d} AND id<{d}",.{start,start+500}),&result);
+    }
+    for(&items) |*item| if(item.key==null) {item.key=0;};
+    try paired(true);try db.execute(query,&result);try check(db.workspace.query.stream_stats.narrow_dense_plans==1);
+    const retained=try db.begin();const retained_snapshot:DB.Snapshot=.{.csn=db.csn};db.txs[retained].pin=retained_snapshot;
+    saved=result;try db.execute("DELETE FROM t WHERE id=2",&result);items[2].alive=false;
+    try old_read.execute(&db,query,retained_snapshot,&result);try equal();
+    try paired(true);try db.execute(query,&result);try check(db.workspace.query.stream_stats.narrow_dense_plans==1);
+    db.abort(retained);
+    // Even an aborted extreme extends conservative bounds and removes the
+    // narrowing proof; exact wide arithmetic must remain available.
+    const widened_sum=try db.begin();try db.statement(widened_sum,"UPDATE t SET v=9223372036854775807 WHERE id=3",&result,.{});db.abort(widened_sum);
+    try paired(true);try db.execute(query,&result);try check(db.workspace.query.stream_stats.narrow_dense_plans==0);
     for([_][]const u8{"9223372036854775807","-9223372036854775808"}) |key| {
         try db.execute("DROP TABLE t",&result);try db.execute("CREATE TABLE t(id INT PRIMARY KEY,g BIGINT,v BIGINT)",&result);
         try db.execute(try std.fmt.bufPrint(&text,"INSERT INTO t VALUES(1,{s},9223372036854775807),(2,{s},9223372036854775807)",.{key,key}),&result);
         try db.execute(query,&result);try check(db.workspace.query.stream_stats.wide_dense_plans==1);
         try check(result.row_count==1 and result.rows[0].cells[1].integer==2);
         try check(result.rows[0].cells[2].numeric.coef()==@as(i128,9223372036854775807)*2);
+        try check(db.workspace.query.stream_stats.narrow_dense_plans==0);
         try db.execute("DELETE FROM t",&result);try db.execute(query,&result);try check(result.row_count==0);
     }
     std.debug.print("PASS wide dense: {d} assertions, 5003-key domain, exact wide sums/averages, NULLs, snapshots, aborts, cancellation and extreme keys\n",.{assertions});
