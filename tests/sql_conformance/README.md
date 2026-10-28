@@ -184,4 +184,3 @@ audit are separate, visible facts; never rewrite the audit to return success for
 unsupported SQL.
 
 SQLancer-style TLP, NoREC and constant-folding metamorphic tests are additional oracles, not substitutes for native differential and crash tests. See [SQLancer papers](https://github.com/sqlancer/sqlancer/blob/main/docs/PAPERS.md) and [CODDTest](https://doi.org/10.1145/3709674). Bounded equivalence can strengthen optimizer checks but remains bounded: [VeriEQL](https://arxiv.org/abs/2403.03193).
-
