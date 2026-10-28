@@ -38,6 +38,12 @@ pub fn main() !void {
     for(0..n) |i| try both(try std.fmt.bufPrint(&text,"INSERT INTO data VALUES({d},{d},{d},'row-{d}')",.{i,i%16,i,i}));
     try same("SELECT id,n,label FROM data WHERE g=3 AND n>511",32);
     try check(db.workspace.query.read_stats.projected_filter_scans==1);
+    // Low-byte collisions must be rejected by exact value comparison.
+    try same("SELECT id FROM data WHERE n=257",1);
+    try same("SELECT id FROM data WHERE n=513",1);
+    try same("SELECT id FROM data WHERE n=-255",0);
+    try same("SELECT id FROM data WHERE n=0",1);
+    try same("SELECT id FROM data WHERE n=1023",1);
     try same("SELECT id FROM data WHERE 3=g AND 900<n AND n<1000",6);
     try same("SELECT id FROM data WHERE g=99 AND n>0",0);
     for(0..16) |group| {

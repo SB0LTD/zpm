@@ -122,13 +122,16 @@ pub fn Storage(comptime config: types.Config) type {
             scan_values: []i64 = &.{},
             scan_nonnull: []u64 = &.{},
             scan_live: []u8 = &.{},
+            /// Optional rejection-only byte lanes; exact values stay authoritative.
+            scan_fingerprints: []u8 = &.{},
 
             pub fn valid(self: Backing) bool {
                 return self.rows.len != 0 and self.rows.len <= 0x7fffffff and
                     self.versions.len > self.rows.len and self.versions.len <= 0x7fffffff and
                     self.row_index.len >= self.rows.len * 2 and powerOfTwo(self.row_index.len) and
                     self.key_index.len >= self.versions.len * 2 and powerOfTwo(self.key_index.len) and
-                    (!compact_enabled or (self.scan_values.len >= self.rows.len * config.columns and self.scan_nonnull.len >= self.rows.len and self.scan_live.len >= self.rows.len));
+                    (!compact_enabled or (self.scan_values.len >= self.rows.len * config.columns and self.scan_nonnull.len >= self.rows.len and self.scan_live.len >= self.rows.len and
+                    (self.scan_fingerprints.len==0 or self.scan_fingerprints.len>=self.rows.len*config.columns)));
             }
         };
 
@@ -201,6 +204,7 @@ pub fn Storage(comptime config: types.Config) type {
             scan_values: []i64 = &.{},
             scan_nonnull: []u64 = &.{},
             scan_live: []u8 = &.{},
+            scan_fingerprints: []u8 = &.{},
             rows: if (config.external_storage) []RowSlot else [config.rows_per_table]RowSlot = if (config.external_storage) &.{} else @splat(.{}),
             versions: if (config.external_storage) []Version else [versions_capacity]Version = if (config.external_storage) &.{} else @splat(.{}),
             row_index: if (config.external_storage) []u32 else [row_index_capacity]u32 = if (config.external_storage) &.{} else @splat(0),
@@ -265,6 +269,13 @@ pub fn Storage(comptime config: types.Config) type {
                 @memcpy(destination.scan_live[0..source.scan_high], source.scan_live[0..source.scan_high]);
                 @memcpy(destination.scan_nonnull[0..source.scan_high], source.scan_nonnull[0..source.scan_high]);
                 for (0..config.columns) |column| @memcpy(destination.scan_values[column * destination.rows.len..][0..source.scan_high], source.scan_values[column * source.rows.len..][0..source.scan_high]);
+                if(destination.scan_fingerprints.len!=0) for(0..config.columns) |column| {
+                    const out=destination.scan_fingerprints[column*destination.rows.len..][0..source.scan_high];
+                    if(source.scan_fingerprints.len!=0) @memcpy(out,source.scan_fingerprints[column*source.rows.len..][0..source.scan_high])
+                    else {
+                        for(out,source.scan_values[column*source.rows.len..][0..source.scan_high]) |*byte,value| byte.*=@truncate(@as(u64,@bitCast(value)));
+                    }
+                };
             }
             @memcpy(destination.rows[0..source.row_high], source.rows[0..source.row_high]);
             @memcpy(destination.versions[0..source.version_high], source.versions[0..source.version_high]);
@@ -286,6 +297,7 @@ pub fn Storage(comptime config: types.Config) type {
             @memset(table.scan_live[table.scan_high..high], 0);
             @memset(table.scan_nonnull[table.scan_high..high], 0);
             for (0..config.columns) |column| @memset(table.scan_values[column * table.rows.len + table.scan_high..column * table.rows.len + high], 0);
+            if(table.scan_fingerprints.len!=0) for(0..config.columns) |column| @memset(table.scan_fingerprints[column*table.rows.len+table.scan_high..column*table.rows.len+high],0);
             table.scan_high = high;
         }
 
@@ -303,6 +315,7 @@ pub fn Storage(comptime config: types.Config) type {
                     table.scan_values[column * table.rows.len + slot] = switch(cell.*) {
                         .integer=>cell.integer,.date=>cell.date,else=>0,
                     };
+                    if(table.scan_fingerprints.len!=0) table.scan_fingerprints[column*table.rows.len+slot]=@truncate(@as(u64,@bitCast(table.scan_values[column*table.rows.len+slot])));
                 }
                 table.scan_nonnull[slot] = mask;
             }
@@ -687,6 +700,7 @@ pub fn Storage(comptime config: types.Config) type {
                         table.scan_live[write] = 0;
                         table.scan_nonnull[write] = 0;
                         for (0..config.columns) |column| table.scan_values[column * table.rows.len + write] = 0;
+                        if(table.scan_fingerprints.len!=0) for(0..config.columns) |column| {table.scan_fingerprints[column*table.rows.len+write]=0;};
                     }
                 }
                 if (read != write) {
@@ -696,11 +710,13 @@ pub fn Storage(comptime config: types.Config) type {
                             table.scan_live[write] = table.scan_live[read];
                             table.scan_nonnull[write] = table.scan_nonnull[read];
                             for (0..config.columns) |column| table.scan_values[column * table.rows.len + write] = table.scan_values[column * table.rows.len + read];
+                            if(table.scan_fingerprints.len!=0) for(0..config.columns) |column| {table.scan_fingerprints[column*table.rows.len+write]=table.scan_fingerprints[column*table.rows.len+read];};
                         } else {
                             // An unpublished appended row has no committed data.
                             table.scan_live[write] = 0;
                             table.scan_nonnull[write] = 0;
                             for (0..config.columns) |column| table.scan_values[column * table.rows.len + write] = 0;
+                            if(table.scan_fingerprints.len!=0) for(0..config.columns) |column| {table.scan_fingerprints[column*table.rows.len+write]=0;};
                         }
                     }
                     table.rows[write] = table.rows[read];

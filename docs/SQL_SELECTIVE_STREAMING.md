@@ -180,6 +180,31 @@ charge their additional performed filter work separately.
 Multiple distinct literals, reused node IDs, infinities, BC dates, private
 writes and pinned snapshots remain covered by the surrounding contracts.
 
+### Optional equality fingerprints
+
+Selective equality still reads a full-width fact column on each execution.
+Caller-backed tables can now provide optional byte fingerprints alongside
+the exact committed lanes. The standard checked memory layout accounts for
+one byte per column/row in addition to the existing i64 projection. Explicit
+backings may omit these bytes and retain the previous exact scan path.
+
+The fingerprint is the integer payload's low byte. Equality implies equal
+fingerprints; the reverse is never assumed. SIMD scans 16 byte lanes at a time,
+and every survivor is checked against its exact full-width value and null flag.
+Blocks with too many fingerprint matches retain the existing vector exact
+comparison rather than performing many scalar gathers. Range and inequality
+operators are unchanged. No false-positive row is returned, no probabilistic
+answer is substituted, and no query-result cache is introduced.
+
+Publication/replay, initialization of holes, directory compaction and independent
+copying maintain these derived bytes with the existing committed projection.
+Copying from a backing without fingerprints reconstructs them from exact lanes.
+Checked binding includes short-buffer and alias rejection before mutation.
+Tests cover low-byte collisions such as 1/257/513/-255, sparse slots, partial
+blocks, nulls, old snapshots/private writes, failed flush, replay and copies.
+The cost is explicit extra caller-owned memory and publication work; full-data
+read/write timing is required before deciding whether to integrate this path.
+
 - [Robust Predicate Transfer with Dynamic Execution, PVLDB 2026](https://www.vldb.org/pvldb/vol19/p1278-qiao.pdf)
   combines asymmetric transfer plans, coarse/fine filters and runtime decisions
   about filter construction. The applicable lesson is to account for filter
