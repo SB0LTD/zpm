@@ -189,8 +189,15 @@ one byte per column/row in addition to the existing i64 projection. Explicit
 backings may omit these bytes and retain the previous exact scan path.
 
 The fingerprint is the integer payload's low byte. Equality implies equal
-fingerprints; the reverse is never assumed. SIMD scans 16 byte lanes at a time,
-and every survivor is checked against its exact full-width value and null flag.
+fingerprints. For a conservative known integer interval [L,H] with H-L<=255,
+the encoding is injective: distinct members differ by less than 256 and cannot
+have the same residue modulo 256. An equality literal outside [L,H] rejects
+everything; a literal inside this interval may therefore use byte matches as
+exact equality, with separate NULL validation. Bounds include pending/aborted
+extrema, which may disable the proof but never falsely narrow it. All other
+domains retain full-width equality verification. SIMD scans 16 byte lanes at a
+time. The proof does not assume unsigned values, exclude signed wrap boundaries,
+or treat nullable slots as zero-valued rows.
 Blocks with too many fingerprint matches retain the existing vector exact
 comparison rather than performing many scalar gathers. Range and inequality
 operators are unchanged. No false-positive row is returned, no probabilistic

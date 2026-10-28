@@ -858,7 +858,23 @@ pub fn Exec(comptime config: types.Config) type {
             fn comparisonMask(comptime op: ast.Op, table: *const S.Table, start: usize, count: usize, predicate: CompactPredicate) u64 {
                 const base = @as(usize,predicate.column) * table.rows.len + start;
                 if(comptime op==.eq) if(table.scan_fingerprints.len!=0) {
+                    const bounds=table.integer_bounds[predicate.column];
+                    if(bounds.known and (predicate.value<bounds.low or predicate.value>bounds.high)) return 0;
                     var selected=fingerprintCandidates(table,start,count,predicate);
+                    // Low-byte encoding is injective on any integer interval
+                    // of width <=255, including intervals crossing zero. Bounds
+                    // include pending/aborted values, so they are conservative.
+                    // The literal must also belong to that interval: an outside
+                    // value can share a byte despite not occurring in the table.
+                    if(bounds.known and @as(i128,bounds.high)-bounds.low<=255) {
+                        if(predicate.nonnull) return selected;
+                        var exact=selected;
+                        while(selected!=0) {
+                            const i=@ctz(selected);selected&=selected-1;
+                            if(table.scan_nonnull[start+i]&(@as(u64,1)<<@intCast(predicate.column))==0) exact&=~(@as(u64,1)<<@intCast(i));
+                        }
+                        return exact;
+                    }
                     // A byte match is only necessary, never sufficient. Dense
                     // candidate blocks retain the vector exact-value path.
                     if(@popCount(selected)<=count/8) {
