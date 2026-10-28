@@ -47,6 +47,36 @@ fn rejected(source: []const u8, expected: sql.Error) !void {
     try check(usage.transactions == 0 and usage.row_locks == 0 and usage.pending_versions == 0);
 }
 
+fn roundedGroups() !void {
+    try db.execute("SELECT g,ROUND(SUM(n),0),ROUND(AVG(n),2) FROM data GROUP BY g ORDER BY g",&result);
+    try check(result.row_count==64 and db.workspace.query.stream_stats.dense_plans==1);
+    for(0..64) |g| {
+        const size=(count-1-g)/64+1;
+        const sum=size*g+64*size*(size-1)/2;
+        const cents=(2*sum*100+size)/(2*size);
+        try check(result.rows[g].cells[0].integer==g);
+        try check(result.rows[g].cells[1].numeric.dscale==0 and result.rows[g].cells[1].numeric.coef()==sum);
+        try check(result.rows[g].cells[2].numeric.dscale==2 and result.rows[g].cells[2].numeric.coef()==cents);
+    }
+    // An immutable function in the OUTER plan must not disable streaming of
+    // the large CTE input merely because both plans share one expression pool.
+    try db.execute("WITH totals AS(SELECT g,SUM(n) AS total FROM data GROUP BY g) SELECT g,ROUND(total,0) FROM totals ORDER BY g",&result);
+    try check(result.row_count==64 and db.workspace.query.stream_stats.rows==count and db.workspace.query.stream_stats.dense_plans==1);
+    for(0..64) |g| {
+        const size=(count-1-g)/64+1;
+        const sum=size*g+64*size*(size-1)/2;
+        try check(result.rows[g].cells[0].integer==g and result.rows[g].cells[1].numeric.coef()==sum);
+    }
+    try check(db.workspace.query.stream_stats.scratch_refs<=refs.len);
+    // A pure wrapper must not hide the side effects of its argument from the
+    // pool-wide replay guard. Failure occurs before any sequence advancement.
+    try db.execute("CREATE SEQUENCE counted_round",&result);
+    try db.execute("SELECT 123",&result);
+    try rejected("SELECT g,ROUND(SUM(n),0),ROUND(nextval('counted_round')) FROM data GROUP BY g ORDER BY g",error.WorkspaceCapacity);
+    try db.execute("SELECT nextval('counted_round')",&result);
+    try check(result.rows[0].cells[0].integer==1);
+}
+
 const Cancel = struct {
     calls: usize = 0,
     fn poll(context: ?*anyopaque) sql.Error!void {
@@ -73,6 +103,7 @@ fn large() !void {
     try check(db.workspace.query.stream_stats.scratch_cells == small_stats.scratch_cells);
     try check(db.workspace.query.stream_stats.scratch_refs == small_stats.scratch_refs);
     try check(db.workspace.query.stream_stats.scratch_refs <= refs.len);
+    try roundedGroups();
     try db.execute("SELECT COUNT(*), SUM(n), MIN(n), MAX(n) FROM data", &result);
     try check(result.rows[0].cells[0].integer == count and result.rows[0].cells[1].integer == @as(i64, count)*(count-1)/2 and result.rows[0].cells[2].integer == 0 and result.rows[0].cells[3].integer == count-1);
     try check(db.workspace.query.stream_stats.scratch_refs == 0);

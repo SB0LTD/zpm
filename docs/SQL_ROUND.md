@@ -24,6 +24,13 @@ within the existing capacity contract. Special numeric values retain their value
 There is no allocator or libc dependency. The shared float rounding helper also
 serves float-to-integer casts. The SQL function works over columns and aggregate
 expressions; failed evaluation preserves the caller's previous result.
+The executor recognizes ROUND as deterministic when selecting streaming
+aggregation or safely retrying an operator. Its arguments are still inspected:
+wrapping a sequence, clock or subquery cannot bypass the existing restrictions.
+This also permits a streaming CTE when ROUND appears in its outer query.
+The 100k-row streamed-aggregate contract uses only 1,024 query references and
+checks grouped rounded SUM/AVG, an outer rounded CTE projection, and a wrapped
+sequence call that must remain excluded from repeatable execution.
 
 `test_sql_types.sig` exercises 2,001 signed decimal inputs against an independent
 integer quantization model, 129 even/odd float half-steps, metadata/overload
