@@ -69,6 +69,8 @@ fn entry(raw:?*anyopaque) void {
     queries(index) catch {failed.store(true,.release);};
 }
 pub fn main(init:std.process.Init) !void {
+    inline for(.{"SELECT 1","\t\x0bselect 1","-- reviewer\r\n SELECT 1","/* outer /* nested */ tail */ WITH q AS(SELECT 1) SELECT * FROM q"}) |source| try check(DB.queryCandidate(source));
+    inline for(.{"","-- only comment","/* unfinished","/* x */ UPDATE points SET amount=0","\"select\"","SELECTOR","BEGIN","'SELECT 1'"}) |source| try check(!DB.queryCandidate(source));
     try db.bindMemory(&backing,512,1024,8192);try db.bindWorkspace(&main_scratch);
     try main_result.bindMemory(&main_output,32);
     try db.execute("CREATE TABLE points(id INT PRIMARY KEY,cat INT NOT NULL,amount INT NOT NULL)",&main_result);
