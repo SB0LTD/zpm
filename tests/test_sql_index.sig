@@ -293,7 +293,46 @@ fn boundaryKeys() !void {
     try execute(&db, &r, "SELECT val FROM t WHERE id = 'x'");
     try check(r.row_count == 1 and r.rows[0].cells[0].integer == 3);
 }
+fn orderedIntegralCandidates() !void {
+    var db: DB = .{};
+    var r: DB.Result = .{};
+    try execute(&db,&r,"CREATE TABLE t(id BIGINT PRIMARY KEY,val INTEGER)");
+    // Dense signed keys exercise validated offset candidates. A gap, deleted
+    // row, aborted low outlier and slot reuse must retain exact lookup results.
+    var text:[128]u8=undefined;
+    try execute(&db,&r,"INSERT INTO t VALUES(-4,0),(-3,17),(-2,34),(-1,51),(0,68),(1,85),(2,102),(3,119)");
+    try check(db.tables[0].primary_directory.state==.candidate and db.tables[0].primary_directory.base == -4);
+    for(0..8) |i| {
+        try execute(&db,&r,try std.fmt.bufPrint(&text,"SELECT val FROM t WHERE id={d}",.{@as(i64,@intCast(i))-4}));
+        try check(r.row_count==1 and r.rows[0].cells[0].integer==i*17);
+    }
+    try execute(&db,&r,"DELETE FROM t WHERE id=-2");
+    try execute(&db,&r,"SELECT val FROM t WHERE id=-2");try check(r.row_count==0);
+    try execute(&db,&r,"SELECT val FROM t WHERE id=3");try check(r.row_count==1 and r.rows[0].cells[0].integer==119);
+    // Core transaction lifetime is explicit; wire control SQL is handled above
+    // this layer. Each statement uses the slot returned by begin().
+    const slot=try db.begin();
+    try db.statement(slot,"INSERT INTO t VALUES(-9223372036854775808,999)",&r,.{});
+    try db.statement(slot,"UPDATE t SET id=100 WHERE id=-1",&r,.{});
+    try db.statement(slot,"SELECT val FROM t WHERE id=100",&r,.{});try check(r.row_count==1 and r.rows[0].cells[0].integer==51);
+    try db.statement(slot,"SELECT val FROM t WHERE id=-1",&r,.{});try check(r.row_count==0);
+    db.abort(slot);
+    statements+=4;
+    try check(db.tables[0].primary_directory.state==.disabled);
+    try execute(&db,&r,"SELECT val FROM t WHERE id=-1");try check(r.row_count==1 and r.rows[0].cells[0].integer==51);
+    try execute(&db,&r,"SELECT val FROM t WHERE id=100");try check(r.row_count==0);
+    try execute(&db,&r,"INSERT INTO t VALUES(-2,222)");
+    try execute(&db,&r,"SELECT val FROM t WHERE id=-2");try check(r.row_count==1 and r.rows[0].cells[0].integer==222);
+    try execute(&db,&r,"SELECT val FROM t WHERE id=9223372036854775807");try check(r.row_count==0);
+    try execute(&db,&r,"DROP TABLE t");
+    try execute(&db,&r,"CREATE TABLE t(id BIGINT PRIMARY KEY,val INTEGER)");
+    try execute(&db,&r,"INSERT INTO t VALUES(-9223372036854775808,10),(-9223372036854775807,20)");
+    try check(db.tables[0].primary_directory.state==.candidate);
+    try execute(&db,&r,"SELECT val FROM t WHERE id=-9223372036854775807");try check(r.row_count==1 and r.rows[0].cells[0].integer==20);
+    try execute(&db,&r,"SELECT val FROM t WHERE id=9223372036854775807");try check(r.row_count==0);
+}
 pub fn main(init: std.process.Init) !void {
+    try orderedIntegralCandidates();
     try randomModel(.integer);
     try randomModel(.text);
     try booleanAndMetadata();
