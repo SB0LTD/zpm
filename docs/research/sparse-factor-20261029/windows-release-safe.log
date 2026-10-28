@@ -1,0 +1,1 @@
+PASS SQL sparse factor predicates: 1537 assertions, scalar/vector equivalence, nullable DATE/measure masks, all comparisons and identical work totals
