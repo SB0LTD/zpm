@@ -59,6 +59,8 @@ pub fn Exec(comptime config: types.Config) type {
             distinct_bitmap_bytes: usize = 0,
             groups: usize = 0,
             probes: usize = 0,
+            dimension_probes: usize = 0,
+            prefix_rejected: usize = 0,
             scratch_cells: usize = 0,
             scratch_refs: usize = 0,
         };
@@ -307,7 +309,7 @@ pub fn Exec(comptime config: types.Config) type {
                     return .{ .start = @intCast(self.work.ref_low), .count = @intFromBool(kept), .width = 0 };
                 }
                 var current: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 1, .width = 0 };
-                var early = self.earlyAvailable(p.where, p.source_count - 1);
+                var early = self.earlyAvailable(p.where, p.source_count - 1) and self.prefixJoinsSafe(p);
                 for (p.sources[0..p.source_count]) |source| if (source.join == .left or source.join == .right or source.join == .full) { early = false; break; };
                 for (p.sources[0..p.source_count], 0..) |*source, stage| {
                     const last = stage + 1 == p.source_count;
@@ -1011,16 +1013,68 @@ pub fn Exec(comptime config: types.Config) type {
                 next:usize=0,
                 high:usize=0,
                 columns:?u64=null,
+                prefix:?CompactPredicate=null,
+                prefix_mask:u64=0,
+                prefix_start:usize=0,
                 row:if(S.compact_enabled) [config.columns]V.Cell else [0]V.Cell=undefined,
             };
 
-            fn prepareStreamCursor(self:*const Query,p:*const B.Plan,cursor:*StreamCursor) void {
+            fn prefixOperandSafe(self:*const Query,id:u16) bool {
+                const node=self.pool.nodes[id];
+                return node.kind==.int_literal or (node.kind==.column and node.level==0 and value_module.integral(node.ty));
+            }
+            fn prefixOnSafe(self:*const Query,id:u16) bool {
+                if(id==none) return true;
+                const node=self.pool.nodes[id];
+                if(node.kind==.and_op or node.kind==.or_op) return self.prefixOnSafe(node.a) and self.prefixOnSafe(node.b);
+                if(node.kind!=.binary) return false;
+                return switch(node.op) {
+                    .eq,.ne,.lt,.le,.gt,.ge=>self.prefixOperandSafe(node.a) and self.prefixOperandSafe(node.b),
+                    else=>false,
+                };
+            }
+            fn prefixJoinsSafe(self:*const Query,p:*const B.Plan) bool {
+                for(p.sources[1..p.source_count]) |source| {
+                    if(source.probe!=none and !self.prefixOperandSafe(source.probe)) return false;
+                    if(!self.prefixOnSafe(source.on)) return false;
+                }
+                return true;
+            }
+            fn prefixCanReject(table:*const S.Table,predicate:CompactPredicate) bool {
+                const bounds=table.integer_bounds[predicate.column];
+                if(!bounds.known) return true;
+                // Bounds include pending/aborted inserts too. Proving that
+                // even this conservative domain always passes safely avoids
+                // an extra pass for an unselective leading conjunct.
+                return switch(predicate.op) {
+                    .eq=>bounds.low!=predicate.value or bounds.high!=predicate.value,
+                    .ne=>predicate.value>=bounds.low and predicate.value<=bounds.high,
+                    .lt=>bounds.high>=predicate.value,
+                    .le=>bounds.high>predicate.value,
+                    .gt=>bounds.low<=predicate.value,
+                    .ge=>bounds.low<predicate.value,
+                    else=>false,
+                };
+            }
+
+            fn prepareStreamCursor(self:*const Query,p:*const B.Plan,cursor:*StreamCursor,early:bool) void {
                 const table=&self.tables[p.sources[0].table.?];
                 cursor.high=table.row_high;
                 if(comptime S.compact_enabled) {
                     // Exactly the committed projection guard used by compact
                     // aggregates: old snapshots and own writes retain MVCC.
                     if(!self.committed_only or !table.summary.valid or table.summary.csn>self.snap.csn) return;
+                    // A typed/computed residual need not prevent a safe first
+                    // conjunct from rejecting fact rows before inner probes.
+                    // Keep SQL's left-to-right error ordering: only the first
+                    // non-null integral/literal comparison may move here.
+                    if(!early and p.source_count>1 and p.where!=none and table.scan_high==table.row_high) {
+                        var first=p.where;
+                        while(self.pool.nodes[first].kind==.and_op) first=self.pool.nodes[first].a;
+                        var predicate:[1]CompactPredicate=undefined;var used:usize=0;
+                        if(self.prefixJoinsSafe(p) and compactPredicates(self.pool,first,table,&predicate,&used) and used==1 and predicate[0].nonnull and prefixCanReject(table,predicate[0]))
+                            cursor.prefix=predicate[0];
+                    }
                     var columns:u64=0;
                     for(self.pool.nodes[0..self.pool.len]) |node| {
                         if(node.kind!=.column or node.level!=0 or node.relation!=0) continue;
@@ -1060,11 +1114,41 @@ pub fn Exec(comptime config: types.Config) type {
             /// not on fact cardinality or left-deep intermediate tuple counts.
             fn nextStreamTuple(self:*Query,p:*const B.Plan,ctx:*E.Context,cursor:*StreamCursor,early:bool) Error!bool {
                 const table=&self.tables[p.sources[0].table.?];
-                scan: while(cursor.next<cursor.high) {
-                    try self.session.checkpoint();
-                    const current=cursor.next;cursor.next+=1;
+                scan: while(cursor.next<cursor.high or cursor.prefix_mask!=0) {
+                    var current:usize=undefined;
+                    if(comptime S.compact_enabled) {
+                      if(cursor.prefix) |predicate| {
+                        while(cursor.prefix_mask==0 and cursor.next<cursor.high) {
+                            const start=cursor.next;const count=@min(@as(usize,64),cursor.high-start);
+                            try self.session.checkpoints(count);
+                            var mask:u64=0;
+                            for(0..count) |i| mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
+                            const visible=@popCount(mask);
+                            self.work.stream_stats.rows+=visible;
+                            try self.session.checkpoints(visible);
+                            mask &= switch(predicate.op) {
+                                .eq=>comparisonMask(.eq,table,start,count,predicate),
+                                .ne=>comparisonMask(.ne,table,start,count,predicate),
+                                .lt=>comparisonMask(.lt,table,start,count,predicate),
+                                .le=>comparisonMask(.le,table,start,count,predicate),
+                                .gt=>comparisonMask(.gt,table,start,count,predicate),
+                                .ge=>comparisonMask(.ge,table,start,count,predicate),
+                                else=>unreachable,
+                            };
+                            self.work.stream_stats.prefix_rejected+=visible-@popCount(mask);
+                            cursor.prefix_start=start;cursor.prefix_mask=mask;cursor.next+=count;
+                        }
+                        if(cursor.prefix_mask==0) return false;
+                        current=cursor.prefix_start+@ctz(cursor.prefix_mask);
+                        cursor.prefix_mask&=cursor.prefix_mask-1;
+                      } else {
+                        try self.session.checkpoint();current=cursor.next;cursor.next+=1;
+                      }
+                    } else {
+                        try self.session.checkpoint();current=cursor.next;cursor.next+=1;
+                    }
                     const fact_cells=self.streamFactRow(table,cursor,current) orelse continue;
-                    self.work.stream_stats.rows+=1;
+                    if(cursor.prefix==null) self.work.stream_stats.rows+=1;
                     ctx.row=null;ctx.tuple[0]=fact_cells;
                     if(p.source_count>1 and early and !try self.earlyKeep(ctx,p.where,0)) continue;
                     for(p.sources[1..p.source_count],1..) |*source,stage| {
@@ -1073,6 +1157,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const key=try E.evalRef(ctx,source.probe,&key_value);
                         if(key.*==.null_value) continue :scan;
                         const dimension=&self.tables[source.table.?];
+                        self.work.stream_stats.dimension_probes+=1;
                         const visible=S.lookupVersionAt(dimension,key,self.snap) orelse continue :scan;
                         ctx.tuple[stage]=&dimension.versions[visible].cells;
                         if(source.on!=none and (try E.truth(ctx,source.on))!=true) continue :scan;
@@ -1104,9 +1189,9 @@ pub fn Exec(comptime config: types.Config) type {
                         if (try self.compactGroup(p, outer, table)) |rows| return rows;
                     }
                 }
-                const early=p.source_count>1 and self.earlyAvailable(p.where,p.source_count-1);
+                const early=p.source_count>1 and self.earlyAvailable(p.where,p.source_count-1) and self.prefixJoinsSafe(p);
                 var cursor:StreamCursor=.{};
-                self.prepareStreamCursor(p,&cursor);
+                self.prepareStreamCursor(p,&cursor,early);
                 if (p.key_count == 0) {
                     var states: [config.columns]Accumulator = undefined;
                     for (states[0..p.agg_count]) |*state| state.* = .{};
