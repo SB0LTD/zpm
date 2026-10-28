@@ -112,6 +112,10 @@ pub fn main() !void {
     // transactions deliberately do not retain their begin-time snapshot.
     database.txs[reader].pin=old_snapshot;
     try database.execute("UPDATE facts SET store=99 WHERE id=3",&result);
+    try database.execute("DELETE FROM facts WHERE id=16",&result);removed=16;
+    const dense_hole=try std.fmt.bufPrint(&buffer,query,.{0});
+    try database.execute(dense_hole,&result);try model(0,true,false,.eq);
+    try check(database.workspace.query.stream_stats.rows==n-1 and database.workspace.query.stream_stats.prefix_rejected>0);
     const q3=try std.fmt.bufPrint(&buffer,query,.{3});
     var old_read:DB.ReadContext=.{};old_read.workspace.query.refs=&old_refs;
     try old_read.execute(&database,q3,old_snapshot,&result);try model(3,false,false,.eq);
@@ -135,7 +139,6 @@ pub fn main() !void {
     try rejected(q99,error.QueryWorkLimit);database.session.control=null;
     @memset(&refs,0xaaaaaaaa);@memset(&database.workspace.query.cells,.{.integer=0x55555555});
     try database.execute(q99,&result);try model(99,true,false,.eq);
-    try database.execute("DELETE FROM facts WHERE id=16",&result);removed=16;
     const q0=try std.fmt.bufPrint(&buffer,query,.{0});
     try database.execute(q0,&result);try model(0,true,false,.eq);
     try check(database.workspace.query.stream_stats.rows==n-1);
@@ -144,5 +147,41 @@ pub fn main() !void {
     try rejected(protected,error.DivisionByZero);
     try check(database.workspace.query.stream_stats.prefix_rejected==0);
     const usage=database.usage();try check(usage.transactions==0 and usage.row_locks==0 and usage.pending_versions==0);
+    // An outer table's TEXT column must not disable an integral fact scan in
+    // a different CTE plan sharing the expression pool. The computed key keeps
+    // this on the general streaming path rather than a small dense rollup.
+    try database.execute("WITH totals AS (SELECT store+0 AS k,COUNT(*) AS n,SUM(amount) AS total FROM facts GROUP BY store+0) SELECT c.label,SUM(t.n),SUM(t.total) FROM categories c JOIN totals t ON t.k%4=c.id GROUP BY c.label ORDER BY c.label",&result);
+    var expected_counts:[4]i64=@splat(0);var expected_sums:[4]i64=@splat(0);
+    for(0..n) |i| {
+        if(i==1 or i==16) continue;
+        expected_counts[i%4]+=1;expected_sums[i%4]+=@as(i64,@intCast(i))-128;
+    }
+    try check(result.row_count==4);
+    for(0..4) |i| {
+        try check(result.rows[i].cells[1]==.numeric and result.rows[i].cells[2]==.numeric);
+        try check(result.rows[i].cells[1].numeric.coef()==expected_counts[i]);
+        try check(result.rows[i].cells[2].numeric.coef()==expected_sums[i]);
+    }
+    std.debug.print("plan-local gathered={d} expected={d}\n",.{database.workspace.query.stream_stats.gathered_rows,n-1});
+    try check(database.workspace.query.stream_stats.gathered_rows==n-1);
+    // Walk every branch of nested expressions and aggregate FILTER roots.
+    // Poisoned projection scratch must never substitute an uncollected column.
+    @memset(&database.workspace.query.cells,.{.integer=0x44444444});
+    try database.execute("WITH totals AS (SELECT id-id AS k,SUM(CASE WHEN store IN(0,1,99) THEN COALESCE(amount,0) ELSE -amount END) AS total,SUM(amount) FILTER(WHERE product IS NULL OR product BETWEEN 0 AND 3) AS chosen FROM facts GROUP BY id-id) SELECT c.label,t.total,t.chosen FROM categories c JOIN totals t ON c.id=t.k",&result);
+    var signed_sum:i64=0;var filtered_sum:i64=0;
+    for(0..n) |i| {
+        if(i==16) continue;
+        const amount=@as(i64,@intCast(i))-128;
+        const positive=i!=1 and (i==3 or i%8==0 or i%8==1);
+        signed_sum+=if(positive) amount else -amount;
+        if(i%17==0 or (i%31!=0 and i%16<=3)) filtered_sum+=amount;
+    }
+    try check(result.row_count==1 and std.mem.eql(u8,result.rows[0].cells[0].text.slice(),"c0"));
+    try check(result.rows[0].cells[1].integer==signed_sum and result.rows[0].cells[2].integer==filtered_sum);
+    try check(database.workspace.query.stream_stats.gathered_rows==n-1);
+    // A DATE dependency still requires canonical typed rows, even when other
+    // expressions could use the committed integral projection.
+    try database.execute(q0,&result);try model(0,true,false,.eq);
+    try check(database.workspace.query.stream_stats.gathered_rows==0);
     std.debug.print("PASS stream prefix: {d} assertions, typed dates, exact independent row model, partial blocks, snapshots, NULL/error ordering and cancellation\n",.{assertions});
 }
