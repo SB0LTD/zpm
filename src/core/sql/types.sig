@@ -17,6 +17,9 @@ pub const Config = struct {
     /// Optional caller-backed committed integral scan projection. Old snapshots
     /// and own writes retain MVCC row scans. Currently external storage only.
     compact_integral_scans: bool = false,
+    /// Opt-in exact aggregate-before-unique-key-join execution. Unsupported
+    /// expressions, visibility or caller-workspace budgets retain ordinary SQL.
+    factorized_aggregates: bool = false,
     /// Optional exact committed GROUP BY synopses per supported column. This
     /// budgets metadata groups, not SQL results: overflow retains scan paths.
     summary_groups: usize = 0,

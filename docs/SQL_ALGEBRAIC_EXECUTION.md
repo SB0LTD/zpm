@@ -4,6 +4,9 @@ Status: researched design plus an allocator-free algebra proof. The SQL server
 does not execute this design yet. No database speedup, new SQL capability or
 100M-row qualification is claimed by this document.
 
+An [opt-in first join kernel](SQL_FACTORIZED_JOINS.md) is now implemented in
+the SQL executor. The broader design and RAMSQL adoption remain unfinished.
+
 ## Recommendation
 
 Build typed, factorized query pipelines over a compact columnar base with an

@@ -114,6 +114,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-stream-group", "tests/test_sql_stream_group.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-stream-prefix", "tests/test_sql_stream_prefix.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-factor-algebra", "tests/test_sql_factor_algebra.sig", &.{});
+    _ = try addContract(ctx, test_sql, "contract-sql-factor-join", "tests/test_sql_factor_join.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-wide-dense", "tests/test_sql_wide_dense.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-projected-filter", "tests/test_sql_projected_filter.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-work-control", "tests/test_sql_work_control.sig", &.{importEntry("sql", "src/core/sql.sig")});
