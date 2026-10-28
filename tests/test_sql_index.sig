@@ -293,7 +293,35 @@ fn boundaryKeys() !void {
     try execute(&db, &r, "SELECT val FROM t WHERE id = 'x'");
     try check(r.row_count == 1 and r.rows[0].cells[0].integer == 3);
 }
+fn orderedIntegralCandidates() !void {
+    var db: DB = .{};
+    var r: DB.Result = .{};
+    try execute(&db,&r,"CREATE TABLE t(id BIGINT PRIMARY KEY,val INTEGER)");
+    // Dense signed keys exercise validated offset candidates. A gap, deleted
+    // row, aborted low outlier and slot reuse must retain exact lookup results.
+    var text:[128]u8=undefined;
+    for(0..8) |i| try execute(&db,&r,try std.fmt.bufPrint(&text,"INSERT INTO t VALUES({d},{d})",.{@as(i64,@intCast(i))-4,i*17}));
+    for(0..8) |i| {
+        try execute(&db,&r,try std.fmt.bufPrint(&text,"SELECT val FROM t WHERE id={d}",.{@as(i64,@intCast(i))-4}));
+        try check(r.row_count==1 and r.rows[0].cells[0].integer==i*17);
+    }
+    try execute(&db,&r,"DELETE FROM t WHERE id=-2");
+    try execute(&db,&r,"SELECT val FROM t WHERE id=-2");try check(r.row_count==0);
+    try execute(&db,&r,"SELECT val FROM t WHERE id=3");try check(r.row_count==1 and r.rows[0].cells[0].integer==119);
+    try execute(&db,&r,"BEGIN");
+    try execute(&db,&r,"INSERT INTO t VALUES(-9223372036854775808,999)");
+    try execute(&db,&r,"UPDATE t SET id=100 WHERE id=-1");
+    try execute(&db,&r,"SELECT val FROM t WHERE id=100");try check(r.row_count==1 and r.rows[0].cells[0].integer==51);
+    try execute(&db,&r,"SELECT val FROM t WHERE id=-1");try check(r.row_count==0);
+    try execute(&db,&r,"ROLLBACK");
+    try execute(&db,&r,"SELECT val FROM t WHERE id=-1");try check(r.row_count==1 and r.rows[0].cells[0].integer==51);
+    try execute(&db,&r,"SELECT val FROM t WHERE id=100");try check(r.row_count==0);
+    try execute(&db,&r,"INSERT INTO t VALUES(-2,222)");
+    try execute(&db,&r,"SELECT val FROM t WHERE id=-2");try check(r.row_count==1 and r.rows[0].cells[0].integer==222);
+    try execute(&db,&r,"SELECT val FROM t WHERE id=9223372036854775807");try check(r.row_count==0);
+}
 pub fn main(init: std.process.Init) !void {
+    try orderedIntegralCandidates();
     try randomModel(.integer);
     try randomModel(.text);
     try booleanAndMetadata();

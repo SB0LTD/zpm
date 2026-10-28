@@ -542,6 +542,20 @@ pub fn Storage(comptime config: types.Config) type {
         pub fn lookupVersionAt(table: *const Table, value: *const V.Cell, snap: Snapshot) ?u32 {
             const column = table.primary_column orelse return null;
             if (value.* == .null_value) return null;
+            // Ordered integral keys often share an offset with directory slots.
+            // This is only a candidate: validate the canonical visible version
+            // and its exact key before accepting it. Holes, compaction, changed
+            // bounds and older/own snapshots retain the normal hash probe.
+            if (value.* == .integer and table.integer_bounds[column].known and
+                (table.column_order[column].state == .increasing or table.column_order[column].state == .one)) {
+                const offset = @as(i128, value.integer) - table.integer_bounds[column].low;
+                if (offset >= 0 and offset < table.row_high) {
+                    if (visibleAt(table, @intCast(offset), snap)) |candidate| {
+                        const key = &table.versions[candidate].cells[column];
+                        if (key.* == .integer and key.integer == value.integer) return candidate;
+                    }
+                }
+            }
             var position = V.hash(value) & (table.key_index.len - 1);
             while (true) {
                 const entry = table.key_index[position];
