@@ -308,15 +308,15 @@ fn orderedIntegralCandidates() !void {
     try execute(&db,&r,"DELETE FROM t WHERE id=-2");
     try execute(&db,&r,"SELECT val FROM t WHERE id=-2");try check(r.row_count==0);
     try execute(&db,&r,"SELECT val FROM t WHERE id=3");try check(r.row_count==1 and r.rows[0].cells[0].integer==119);
-    // Explicit control statements use the session API, not execute's one-shot
-    // autocommit wrapper. All statements inside the transaction share slot 0.
-    try db.statement(0,"BEGIN",&r,.{});
-    try db.statement(0,"INSERT INTO t VALUES(-9223372036854775808,999)",&r,.{});
-    try db.statement(0,"UPDATE t SET id=100 WHERE id=-1",&r,.{});
-    try db.statement(0,"SELECT val FROM t WHERE id=100",&r,.{});try check(r.row_count==1 and r.rows[0].cells[0].integer==51);
-    try db.statement(0,"SELECT val FROM t WHERE id=-1",&r,.{});try check(r.row_count==0);
-    try db.statement(0,"ROLLBACK",&r,.{});
-    statements+=6;
+    // Core transaction lifetime is explicit; wire control SQL is handled above
+    // this layer. Each statement uses the slot returned by begin().
+    const slot=try db.begin();
+    try db.statement(slot,"INSERT INTO t VALUES(-9223372036854775808,999)",&r,.{});
+    try db.statement(slot,"UPDATE t SET id=100 WHERE id=-1",&r,.{});
+    try db.statement(slot,"SELECT val FROM t WHERE id=100",&r,.{});try check(r.row_count==1 and r.rows[0].cells[0].integer==51);
+    try db.statement(slot,"SELECT val FROM t WHERE id=-1",&r,.{});try check(r.row_count==0);
+    db.abort(slot);
+    statements+=4;
     try execute(&db,&r,"SELECT val FROM t WHERE id=-1");try check(r.row_count==1 and r.rows[0].cells[0].integer==51);
     try execute(&db,&r,"SELECT val FROM t WHERE id=100");try check(r.row_count==0);
     try execute(&db,&r,"INSERT INTO t VALUES(-2,222)");
