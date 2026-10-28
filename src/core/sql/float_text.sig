@@ -244,14 +244,18 @@ pub fn ArithmeticOf(comptime T: type) type {
     };
 }
 
-/// rint(): round half to even.
+/// Portable rint(): nearest-even without libc or ambient rounding-mode state.
+/// At/above 2^52 every finite float8 is integral; the same bit guard retains
+/// NaNs and infinities. Smaller conversions are safely bounded inside i64.
 pub fn rint(value: f64) f64 {
-    const rounded = @round(value);
-    if (@abs(value - @trunc(value)) == 0.5) {
-        const half = rounded / 2;
-        if (half != @trunc(half)) return rounded - (if (value < 0) @as(f64, -1) else @as(f64, 1));
-    }
-    return rounded;
+    const bits: u64 = @bitCast(value);
+    if (bits & 0x7fff_ffff_ffff_ffff >= 0x4330_0000_0000_0000) return value;
+    var whole: i64 = @intFromFloat(value);
+    const fraction = value - @as(f64, @floatFromInt(whole));
+    const distance = @abs(fraction);
+    if (distance > 0.5 or (distance == 0.5 and whole & 1 != 0)) whole += if (fraction < 0) @as(i64, -1) else 1;
+    // An integer cast loses the sign of zero, which ROUND(float8) retains.
+    return if (whole == 0) @bitCast(bits & 0x8000_0000_0000_0000) else @floatFromInt(whole);
 }
 
 /// float -> integer cast (rint, range check 22003; NaN 22003).

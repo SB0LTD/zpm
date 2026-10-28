@@ -564,6 +564,7 @@ pub fn Binder(comptime config: types.Config) type {
             const name = toName(context, n.name);
             const table = [_]struct { name: []const u8, func: ast.Func }{
                 .{ .name = "now", .func = .now },
+                .{ .name = "round", .func = .round },
                 .{ .name = "transaction_timestamp", .func = .transaction_timestamp },
                 .{ .name = "statement_timestamp", .func = .statement_timestamp },
                 .{ .name = "clock_timestamp", .func = .clock_timestamp },
@@ -687,6 +688,21 @@ pub fn Binder(comptime config: types.Config) type {
             }
             switch (n.func) {
                 .none => return error.UndefinedFunction,
+                .round => {
+                    if (count != 1 and count != 2) return error.UndefinedFunction;
+                    const first = n.b;
+                    const second = context.node(first).next;
+                    // PostgreSQL prefers float8 for one unknown/integral/real
+                    // argument; two arguments have only the numeric,int4 form.
+                    const target: ast.Type = if (count == 2 or context.node(first).ty == .numeric) .numeric else .float8;
+                    const argument = try convert(context, first, target, -1, .implicit);
+                    const scale = if (count == 2) try convert(context, second, .int4, -1, .implicit) else none;
+                    context.node(argument).next = scale;
+                    if (scale != none) context.node(scale).next = none;
+                    n.b = argument;
+                    n.ty = target;
+                    n.constant = isConstant(context, argument) and (scale == none or isConstant(context, scale));
+                },
                 .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp, .current_timestamp, .current_date => {
                     if (count != 0) return error.UndefinedFunction;
                     n.ty = if (n.func == .current_date) .date else .timestamptz;

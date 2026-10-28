@@ -12,6 +12,7 @@ const lexer = @import("lexer.sig");
 const ast = @import("ast.sig");
 const value_module = @import("value.sig");
 const temporal = @import("temporal.sig");
+const float_text = @import("float_text.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -692,6 +693,14 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.atZone(&value, zone.text.slice(), ctx.session);
                 },
                 .function => switch (n.func) {
+                    .round => {
+                        const argument = try eval(ctx, n.b);
+                        const scale_id = node(ctx, n.b).next;
+                        const scale: V.Cell = if (scale_id == none) .{ .integer = 0 } else try eval(ctx, scale_id);
+                        if (argument == .null_value or scale == .null_value) return .null_value;
+                        if (n.ty == .float8) return .{ .float8 = float_text.rint(argument.float8) };
+                        return .{ .numeric = try Io.Numerics.round(&argument.numeric, @intCast(scale.integer)) };
+                    },
                     .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp, .current_timestamp, .current_date => return clockValue(ctx, n.func),
                     .jsonb_typeof, .jsonb_array_length => {
                         const argument = try eval(ctx, n.b);
