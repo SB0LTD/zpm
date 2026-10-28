@@ -212,6 +212,11 @@ papers' allocator-based engines or foreign runtimes into the Sig server.
 
 ## Acceptance before any performance claim
 
+The broader [algebraic execution design](SQL_ALGEBRAIC_EXECUTION.md) examines
+aggregate-before-join, typed intermediate state and compact MVCC storage. Its
+proof prototype is separate from the integrated executor; operation counts
+must not be presented as measured database speedups.
+
 Pass independent correctness and rollback/snapshot contracts, then run the
 unchanged original JDBC checks on the actual dataset. Keep other engine services,
 builds and profilers stopped during throughput measurement. Record binary/input
