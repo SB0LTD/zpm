@@ -66,6 +66,7 @@ fn cacheHash() u64 {
     for(0..t.scan_high) |slot| {
         h=h*%1099511628211 ^ t.scan_live[slot];h=h*%1099511628211 ^ t.scan_nonnull[slot];
         for(0..4) |column| h=h*%1099511628211 ^ @as(u64,@bitCast(t.scan_values[column*t.rows.len+slot]));
+        if(t.scan_fingerprints.len!=0) for(0..4) |column| {h=h*%1099511628211 ^ t.scan_fingerprints[column*t.rows.len+slot];};
     }
     return h;
 }

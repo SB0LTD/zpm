@@ -836,8 +836,40 @@ pub fn Exec(comptime config: types.Config) type {
                 return mask;
             }
 
+            fn fingerprintCandidates(table:*const S.Table,start:usize,count:usize,predicate:CompactPredicate) u64 {
+                const base=@as(usize,predicate.column)*table.rows.len+start;
+                const wanted:u8=@truncate(@as(u64,@bitCast(predicate.value)));
+                var mask:u64=0;var i:usize=0;
+                if(comptime builtin.zig_backend==.stage2_llvm) {
+                    const target:@Vector(16,u8)=@splat(wanted);
+                    while(i+16<=count):(i+=16) {
+                        const values:@Vector(16,u8)=table.scan_fingerprints[base+i..][0..16].*;
+                        var bits:u16=@bitCast(values==target);
+                        if(comptime builtin.cpu.arch.endian()==.big) bits=@bitReverse(bits);
+                        mask|=@as(u64,bits)<<@intCast(i);
+                    }
+                }
+                while(i<count):(i+=1) mask|=@as(u64,@intFromBool(table.scan_fingerprints[base+i]==wanted))<<@intCast(i);
+                return mask;
+            }
+
             fn comparisonMask(comptime op: ast.Op, table: *const S.Table, start: usize, count: usize, predicate: CompactPredicate) u64 {
                 const base = @as(usize,predicate.column) * table.rows.len + start;
+                if(comptime op==.eq) if(table.scan_fingerprints.len!=0) {
+                    var selected=fingerprintCandidates(table,start,count,predicate);
+                    // A byte match is only necessary, never sufficient. Dense
+                    // candidate blocks retain the vector exact-value path.
+                    if(@popCount(selected)<=count/8) {
+                        var exact:u64=0;
+                        while(selected!=0) {
+                            const i=@ctz(selected);selected&=selected-1;
+                            if(table.scan_values[base+i]!=predicate.value) continue;
+                            if(!predicate.nonnull and table.scan_nonnull[start+i]&(@as(u64,1)<<@intCast(predicate.column))==0) continue;
+                            exact|=@as(u64,1)<<@intCast(i);
+                        }
+                        return exact;
+                    }
+                };
                 var mask: u64 = 0;
                 var i: usize = 0;
                 // Preserve a scalar implementation for native/codegen backends

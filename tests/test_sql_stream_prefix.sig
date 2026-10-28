@@ -14,6 +14,7 @@ var key_indices:[3][2048]u32=undefined;
 var values:[3][(n+1)*5]i64=undefined;
 var nonnull:[3][n+1]u64=undefined;
 var live:[3][n+1]u8=undefined;
+var fingerprints:[3][(n+1)*5]u8=undefined;
 var refs:[1024]u32=undefined;
 var old_refs:[512]u32=undefined;
 var assertions:usize=0;
@@ -25,6 +26,14 @@ var date_before_flush:i64=0;
 fn rejectDateFlush(_: ?*anyopaque,_:[]const u8) anyerror!void {
     try check(database.tables[0].scan_values[3*database.tables[0].rows.len+4]==date_before_flush);
     return error.InjectedDateFlushFailure;
+}
+fn fingerprintProjection(db:*const DB) !void {
+    for(&db.tables) |*table| if(table.scan_fingerprints.len!=0) {
+        for(0..5) |column| for(0..table.scan_high) |slot| {
+            const at=column*table.rows.len+slot;
+            try check(table.scan_fingerprints[at]==@as(u8,@truncate(@as(u64,@bitCast(table.scan_values[at])))));
+        };
+    };
 }
 fn check(ok:bool) !void {assertions+=1;if(!ok) {std.debug.print("prefix assertion {d} failed\n",.{assertions});return error.StreamPrefixContract;}}
 const query="SELECT c.label,COUNT(*),SUM(f.amount) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE f.store={d} AND f.day BETWEEN DATE '2025-03-01' AND DATE '2025-08-31' GROUP BY c.label ORDER BY c.label";
@@ -83,7 +92,12 @@ fn dateProjection(expected_gathered:usize) !void {
 }
 pub fn main() !void {
     var banks:[3]DB.StorageBacking=undefined;
-    for(&banks,0..) |*bank,i| bank.*=.{.rows=&rows[i],.versions=&versions[i],.row_index=&row_indices[i],.key_index=&key_indices[i],.scan_values=&values[i],.scan_nonnull=&nonnull[i],.scan_live=&live[i]};
+    for(&banks,0..) |*bank,i| bank.*=.{.rows=&rows[i],.versions=&versions[i],.row_index=&row_indices[i],.key_index=&key_indices[i],.scan_values=&values[i],.scan_nonnull=&nonnull[i],.scan_live=&live[i],.scan_fingerprints=&fingerprints[i]};
+    var invalid=banks;invalid[0].scan_fingerprints=fingerprints[0][0..1];
+    if(database.bindStorage(invalid,&refs)) |_| return error.ShortFingerprintAccepted else |err| try check(err==error.InvalidParameterValue);
+    invalid=banks;invalid[0].scan_fingerprints=std.mem.sliceAsBytes(&values[0])[0..(n+1)*5];
+    if(database.bindStorage(invalid,&refs)) |_| return error.AliasedFingerprintAccepted else |err| try check(err==error.InvalidParameterValue);
+    try check(database.tables[0].rows.len==0 and database.workspace.query.refs.len==0);
     try database.bindStorage(banks,&refs);
     try database.execute("CREATE TABLE facts(id INT PRIMARY KEY,store INT,product INT,day DATE,amount INT)",&result);
     try database.execute("CREATE TABLE products(id INT PRIMARY KEY,category INT)",&result);
@@ -96,7 +110,7 @@ pub fn main() !void {
         const product=if(i%17==0) "NULL" else try std.fmt.bufPrint(&key,"{d}",.{if(i%31==0) @as(usize,99) else i%16});
         try database.execute(try std.fmt.bufPrint(&buffer,"INSERT INTO facts VALUES({d},{d},{s},DATE '2025-{d:0>2}-15',{d})",.{i,i%8,product,i%12+1,@as(i64,@intCast(i))-128}),&result);
     }
-    try dateProjection(n);const initial_dates=result;
+    try dateProjection(n);const initial_dates=result;try fingerprintProjection(&database);
     for(0..8) |store| {
         try database.execute(try std.fmt.bufPrint(&buffer,query,.{store}),&result);
         try model(@intCast(store),false,false,.eq);
@@ -226,13 +240,19 @@ pub fn main() !void {
     if(database.executeChanges("UPDATE facts SET day=DATE '2200-12-31' WHERE id=4",&result,&change_record,&used,null,rejectDateFlush)) |_| return error.ExpectedFlushFailure
         else |err| try check(err==error.InjectedDateFlushFailure);
     try check(used==0);try dateProjection(n-1);try equalResult(&committed_dates);
+    try fingerprintProjection(&database);
     @memset(&copy_memory,0xa5);try copied.bindMemory(&copy_memory,n+1,(n+1)*2,2048);
-    try copied.copyFromInto(&database);try copied.execute(date_query,&result);
+    // A caller may omit the optional bytes. Copying into byte-backed storage
+    // then reconstructs fingerprints from exact initialized projection lanes.
+    const optional=database.tables[0].scan_fingerprints;database.tables[0].scan_fingerprints=&.{};
+    try copied.copyFromInto(&database);database.tables[0].scan_fingerprints=optional;
+    try fingerprintProjection(&copied);try copied.execute(date_query,&result);
     try equalResult(&committed_dates);try check(copied.workspace.query.stream_stats.gathered_rows==n-1);
     var replay_scratch:DB.ReplayScratch=.{};
     for([_][]const u8{"UPDATE facts SET day=DATE '-infinity' WHERE id=0","UPDATE facts SET day=DATE 'infinity' WHERE id=4","UPDATE facts SET day=DATE '0001-01-01 BC' WHERE id=3","DELETE FROM facts WHERE id=5"}) |statement| {
         used=0;try database.executeChanges(statement,&result,&change_record,&used,null,null);
         try copied.applyChangeRecord(change_record[0..used],&replay_scratch);
+        try fingerprintProjection(&database);try fingerprintProjection(&copied);
         const remaining:usize=if(std.mem.startsWith(u8,statement,"DELETE")) n-2 else n-1;
         try dateProjection(remaining);const expected=result;
         try copied.execute(date_query,&result);try equalResult(&expected);
