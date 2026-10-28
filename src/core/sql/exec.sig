@@ -1087,8 +1087,12 @@ pub fn Exec(comptime config: types.Config) type {
                 switch(node.kind) {
                     .column=>{
                         if(node.level!=0 or node.relation!=0) return true;
-                        if(node.column>=table.column_count or !value_module.integral(node.ty)) return false;
-                        switch(table.columns[node.column].data_type) {.smallint,.integer32,.integer,.oid=>{},else=>return false}
+                        if(node.column>=table.column_count) return false;
+                        switch(table.columns[node.column].data_type) {
+                            .smallint,.integer32,.integer,.oid=>if(!value_module.integral(node.ty)) return false,
+                            .date=>if(node.ty!=.date) return false,
+                            else=>return false,
+                        }
                         columns.*|=@as(u64,1)<<@intCast(node.column);return true;
                     },
                     .null_literal,.bool_literal,.int_literal,.text_literal,.decimal_literal=>return true,
@@ -1156,7 +1160,8 @@ pub fn Exec(comptime config: types.Config) type {
                         const column=@ctz(columns);
                         const bit=@as(u64,1)<<@intCast(column);
                         if(nonnull&bit!=0) {
-                            cursor.row[column]=.{.integer=table.scan_values[@as(usize,column)*table.rows.len+slot]};
+                            const value=table.scan_values[@as(usize,column)*table.rows.len+slot];
+                            cursor.row[column]=if(table.columns[column].data_type==.date) .{.date=@intCast(value)} else .{.integer=value};
                         } else cursor.row[column]=.null_value;
                         columns&=columns-1;
                     }

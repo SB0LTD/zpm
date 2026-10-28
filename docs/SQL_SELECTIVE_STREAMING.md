@@ -61,8 +61,26 @@ fallback. A valid current committed summary proving every scanned slot is live
 allows a full mask without reading flags. Required-column non-null counts can
 similarly avoid per-row null-mask loads. These proofs never apply to old
 snapshots or a transaction's private writes. A pinned snapshot retaining a
-deleted slot exercises the sparse path; DATE residuals still borrow canonical
-typed rows rather than reinterpret integral projection data.
+deleted slot exercises the sparse path.
+
+### Typed DATE projection
+
+The next profile identified canonical fact-row borrowing as the largest sampled
+active-code cost. DATE dependencies previously forced that path even though a
+date is exactly an i32 day count. Durable publication and validated change-record
+replay now write this payload into the existing i64 column-major backing.
+Streaming projection reconstructs a DATE-tagged Cell, including NULL, negative
+day counts and both infinity sentinels. This changes no backing size, persistent
+record encoding or SQL comparison semantics. Other unsupported types still use
+canonical versions. The final WHERE and aggregation evaluators remain unchanged.
+
+Differential tests explicitly disable committed metadata and compare results
+against canonical MVCC execution. They cover DATE MIN/MAX/COUNT, negative and BC
+dates, infinities, nulls, private writes/abort, a pinned old snapshot, deletion,
+copying into independent poisoned backing, failed durable flush, and applying
+validated update/delete change records. Only durable publication/replay changes
+the projection; a flush failure leaves both visible answers and projected values
+unchanged.
 
 ## Current research and applicable next experiments
 

@@ -194,7 +194,9 @@ pub fn Storage(comptime config: types.Config) type {
             version_used: usize = 0,
             version_free: u32 = 0,
             /// Column-major committed values. Every element below scan_high is
-            /// initialized, including directory holes and non-integral columns.
+            /// initialized, including directory holes and unsupported columns.
+            /// Integer values and exact DATE day counts occupy i64 lanes; a
+            /// reader reconstructs the declared Cell tag before evaluation.
             scan_high: usize = 0,
             scan_values: []i64 = &.{},
             scan_nonnull: []u64 = &.{},
@@ -298,7 +300,9 @@ pub fn Storage(comptime config: types.Config) type {
                 var mask: u64 = 0;
                 for (entry.cells[0..table.column_count], 0..) |*cell, column| {
                     if (cell.* != .null_value) mask |= @as(u64, 1) << @intCast(column);
-                    table.scan_values[column * table.rows.len + slot] = if (cell.* == .integer) cell.integer else 0;
+                    table.scan_values[column * table.rows.len + slot] = switch(cell.*) {
+                        .integer=>cell.integer,.date=>cell.date,else=>0,
+                    };
                 }
                 table.scan_nonnull[slot] = mask;
             }
