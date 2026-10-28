@@ -62,6 +62,7 @@ pub fn Exec(comptime config: types.Config) type {
             factor_selected_rows: usize = 0,
             nested_factor_plans: usize = 0,
             nested_factor_keys: usize = 0,
+            presence_rejected_blocks:usize=0,
             gathered_rows: usize = 0,
             distinct_bitmap_bytes: usize = 0,
             groups: usize = 0,
@@ -843,7 +844,11 @@ pub fn Exec(comptime config: types.Config) type {
                 return mask;
             }
 
-            fn comparisonMask(comptime op: ast.Op, table: *const S.Table, start: usize, count: usize, predicate: CompactPredicate) u64 {
+            fn comparisonMask(comptime op: ast.Op, table: *const S.Table, start: usize, count: usize, predicate: CompactPredicate, stats:?*StreamStats) u64 {
+                if(comptime S.presence_enabled and op==.eq) if(!S.blockMayContain(table,predicate.column,start,count,predicate.value)) {
+                    if(stats) |value| value.presence_rejected_blocks+=1;
+                    return 0;
+                };
                 const base = @as(usize,predicate.column) * table.rows.len + start;
                 var mask: u64 = 0;
                 var i: usize = 0;
@@ -973,9 +978,9 @@ pub fn Exec(comptime config: types.Config) type {
                     var mask=liveMask(table,start,count,dense);
                     visited+=@popCount(mask);
                     for (predicates[0..predicate_count]) |predicate| mask &= switch(predicate.op) {
-                        .eq=>comparisonMask(.eq,table,start,count,predicate),.ne=>comparisonMask(.ne,table,start,count,predicate),
-                        .lt=>comparisonMask(.lt,table,start,count,predicate),.le=>comparisonMask(.le,table,start,count,predicate),
-                        .gt=>comparisonMask(.gt,table,start,count,predicate),.ge=>comparisonMask(.ge,table,start,count,predicate),
+                        .eq=>comparisonMask(.eq,table,start,count,predicate,&self.work.stream_stats),.ne=>comparisonMask(.ne,table,start,count,predicate,&self.work.stream_stats),
+                        .lt=>comparisonMask(.lt,table,start,count,predicate,&self.work.stream_stats),.le=>comparisonMask(.le,table,start,count,predicate,&self.work.stream_stats),
+                        .gt=>comparisonMask(.gt,table,start,count,predicate,&self.work.stream_stats),.ge=>comparisonMask(.ge,table,start,count,predicate,&self.work.stream_stats),
                         else=>unreachable,
                     };
                     if (fused and p.key_count!=0 and key_nonnull) {
@@ -1246,12 +1251,12 @@ pub fn Exec(comptime config: types.Config) type {
                             self.work.stream_stats.rows+=visible;
                             try self.session.checkpoints(visible);
                             mask &= switch(predicate.op) {
-                                .eq=>comparisonMask(.eq,table,start,count,predicate),
-                                .ne=>comparisonMask(.ne,table,start,count,predicate),
-                                .lt=>comparisonMask(.lt,table,start,count,predicate),
-                                .le=>comparisonMask(.le,table,start,count,predicate),
-                                .gt=>comparisonMask(.gt,table,start,count,predicate),
-                                .ge=>comparisonMask(.ge,table,start,count,predicate),
+                                .eq=>comparisonMask(.eq,table,start,count,predicate,&self.work.stream_stats),
+                                .ne=>comparisonMask(.ne,table,start,count,predicate,&self.work.stream_stats),
+                                .lt=>comparisonMask(.lt,table,start,count,predicate,&self.work.stream_stats),
+                                .le=>comparisonMask(.le,table,start,count,predicate,&self.work.stream_stats),
+                                .gt=>comparisonMask(.gt,table,start,count,predicate,&self.work.stream_stats),
+                                .ge=>comparisonMask(.ge,table,start,count,predicate,&self.work.stream_stats),
                                 else=>unreachable,
                             };
                             self.work.stream_stats.prefix_rejected+=visible-@popCount(mask);
@@ -1382,9 +1387,9 @@ pub fn Exec(comptime config: types.Config) type {
                     for(predicates[0..predicate_count]) |predicate| {
                         if(mask==0) break;
                         mask&=switch(predicate.op) {
-                            .eq=>comparisonMask(.eq,table,start,count,predicate),.ne=>comparisonMask(.ne,table,start,count,predicate),
-                            .lt=>comparisonMask(.lt,table,start,count,predicate),.le=>comparisonMask(.le,table,start,count,predicate),
-                            .gt=>comparisonMask(.gt,table,start,count,predicate),.ge=>comparisonMask(.ge,table,start,count,predicate),else=>unreachable,
+                            .eq=>comparisonMask(.eq,table,start,count,predicate,&self.work.stream_stats),.ne=>comparisonMask(.ne,table,start,count,predicate,&self.work.stream_stats),
+                            .lt=>comparisonMask(.lt,table,start,count,predicate,&self.work.stream_stats),.le=>comparisonMask(.le,table,start,count,predicate,&self.work.stream_stats),
+                            .gt=>comparisonMask(.gt,table,start,count,predicate,&self.work.stream_stats),.ge=>comparisonMask(.ge,table,start,count,predicate,&self.work.stream_stats),else=>unreachable,
                         };
                     }
                     while(mask!=0) {
@@ -2663,12 +2668,12 @@ pub fn Exec(comptime config: types.Config) type {
                     // subsequent AND terms run only for preceding TRUE rows.
                     try ctx.session.checkpoints(@popCount(mask));
                     mask &= switch(predicate.op) {
-                        .eq=>Query.comparisonMask(.eq,table,start,count,predicate),
-                        .ne=>Query.comparisonMask(.ne,table,start,count,predicate),
-                        .lt=>Query.comparisonMask(.lt,table,start,count,predicate),
-                        .le=>Query.comparisonMask(.le,table,start,count,predicate),
-                        .gt=>Query.comparisonMask(.gt,table,start,count,predicate),
-                        .ge=>Query.comparisonMask(.ge,table,start,count,predicate),
+                        .eq=>Query.comparisonMask(.eq,table,start,count,predicate,null),
+                        .ne=>Query.comparisonMask(.ne,table,start,count,predicate,null),
+                        .lt=>Query.comparisonMask(.lt,table,start,count,predicate,null),
+                        .le=>Query.comparisonMask(.le,table,start,count,predicate,null),
+                        .gt=>Query.comparisonMask(.gt,table,start,count,predicate,null),
+                        .ge=>Query.comparisonMask(.ge,table,start,count,predicate,null),
                         else=>unreachable,
                     };
                     if(mask==0) break;
