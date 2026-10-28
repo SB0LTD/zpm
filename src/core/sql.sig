@@ -2414,6 +2414,14 @@ pub fn Database(comptime config: Config) type {
             };
         }
 
+        /// Lexer-based scheduling hint, including nested comments/whitespace.
+        /// Never authorizes execution: callers must still bind a read-only plan.
+        pub fn queryCandidate(source:[]const u8) bool {
+            var tokens:lexer.Tokenizer=.{.source=source,.text_limit=config.text_bytes};
+            const first=tokens.next() catch return false;
+            return first.isWord("select") or first.isWord("with");
+        }
+
         fn controlWord(source: []const u8) bool {
             var tokens: lexer.Tokenizer = .{ .source = source, .text_limit = config.text_bytes };
             const first = tokens.next() catch return false;
