@@ -42,6 +42,16 @@ pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, n
 /// Built-in functions bound by name.
 pub const Func = enum { none, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round };
 
+/// Conservative proof for repeated evaluation during an operator retry. Every
+/// argument is checked separately by the pool walk, so wrapping a sequence,
+/// clock or subquery in a pure function never makes its effects repeatable.
+pub fn canRepeatFunction(func: Func) bool {
+    return switch (func) {
+        .round => true,
+        else => false,
+    };
+}
+
 /// Cast typmods marking `::regclass` / `::regtype` (OID-valued casts).
 pub const regclass_typmod: i32 = -2;
 pub const regtype_typmod: i32 = -3;

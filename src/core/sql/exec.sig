@@ -1712,7 +1712,8 @@ pub fn Exec(comptime config: types.Config) type {
 
         fn repeatablePool(pool: *const Ast.Pool) bool {
             for (pool.nodes[0..pool.len]) |node| switch (node.kind) {
-                .function, .scalar_subquery, .exists_subquery, .in_subquery => return false,
+                .function => if (!ast.canRepeatFunction(node.func)) return false,
+                .scalar_subquery, .exists_subquery, .in_subquery => return false,
                 else => {},
             };
             return true;
