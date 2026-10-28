@@ -122,6 +122,8 @@ pub const Node = struct {
     insensitive: bool = false,
     /// Constant subtree (no column reference); set by the binder.
     constant: bool = false,
+    /// Binder-validated DATE literal: integer stores its exact day count.
+    date_bound: bool = false,
     ty: Type = .unknown,
     cast_type: TypeName = .int4,
     /// Cast target typmod (-1 none).
