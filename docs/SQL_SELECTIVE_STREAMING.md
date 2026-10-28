@@ -43,6 +43,27 @@ performs 472 dimension probes before the optimization and 59 for its selective
 store case after it; these are operation counts, not throughput measurements.
 The existing 100k streaming and full SQL contracts remain separate requirements.
 
+### Plan-local projection and visibility masks
+
+Fact-column discovery now walks the current bound plan's expression roots,
+including aggregate arguments/FILTER, grouping, WHERE/HAVING, targets and hidden
+sort targets, DISTINCT ON and join predicates/probe keys. Relation indices are
+local to each query block: scanning the entire statement pool previously let an
+unrelated outer TEXT column disable a CTE's integral projection. Unsupported
+expressions, excessive traversal or nonintegral fact dependencies retain the
+canonical typed/MVCC path. The walk uses a depth and visit budget without heap
+storage. CASE arms, argument lists and aggregate FILTER dependencies are covered
+by independent scalar-answer regressions with poisoned scratch.
+
+Live masks are shared by compact aggregates, projected filters and streaming
+prefixes. LLVM batches sparse visibility bytes; other backends use a scalar
+fallback. A valid current committed summary proving every scanned slot is live
+allows a full mask without reading flags. Required-column non-null counts can
+similarly avoid per-row null-mask loads. These proofs never apply to old
+snapshots or a transaction's private writes. A pinned snapshot retaining a
+deleted slot exercises the sparse path; DATE residuals still borrow canonical
+typed rows rather than reinterpret integral projection data.
+
 ## Current research and applicable next experiments
 
 - [Robust Predicate Transfer with Dynamic Execution, PVLDB 2026](https://www.vldb.org/pvldb/vol19/p1278-qiao.pdf)

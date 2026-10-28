@@ -819,6 +819,21 @@ pub fn Exec(comptime config: types.Config) type {
                 return true;
             }
 
+            fn liveMask(table:*const S.Table,start:usize,count:usize,dense:bool) u64 {
+                if(dense) return if(count==64) ~@as(u64,0) else (@as(u64,1)<<@intCast(count))-1;
+                var mask:u64=0;var i:usize=0;
+                if(comptime builtin.zig_backend==.stage2_llvm) {
+                    const zero:@Vector(8,u8)=@splat(0);
+                    while(i+8<=count):(i+=8) {
+                        const flags:@Vector(8,u8)=table.scan_live[start+i..][0..8].*;
+                        const bits:u8=@bitCast(flags!=zero);
+                        mask|=@as(u64,bits)<<@intCast(i);
+                    }
+                }
+                while(i<count):(i+=1) mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
+                return mask;
+            }
+
             fn comparisonMask(comptime op: ast.Op, table: *const S.Table, start: usize, count: usize, predicate: CompactPredicate) u64 {
                 const base = @as(usize,predicate.column) * table.rows.len + start;
                 var mask: u64 = 0;
@@ -946,10 +961,7 @@ pub fn Exec(comptime config: types.Config) type {
                     // Reserve/check every input step before reading this bounded
                     // block. A work/cancel failure still leaves results private.
                     try self.session.checkpoints(count);
-                    var mask:u64=if(count==64) ~@as(u64,0) else (@as(u64,1)<<@intCast(count))-1;
-                    if (!dense) {
-                        mask=0;for(0..count) |i| mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
-                    }
+                    var mask=liveMask(table,start,count,dense);
                     visited+=@popCount(mask);
                     for (predicates[0..predicate_count]) |predicate| mask &= switch(predicate.op) {
                         .eq=>comparisonMask(.eq,table,start,count,predicate),.ne=>comparisonMask(.ne,table,start,count,predicate),
@@ -1016,6 +1028,8 @@ pub fn Exec(comptime config: types.Config) type {
                 prefix:?CompactPredicate=null,
                 prefix_mask:u64=0,
                 prefix_start:usize=0,
+                all_live:bool=false,
+                all_nonnull:bool=false,
                 row:if(S.compact_enabled) [config.columns]V.Cell else [0]V.Cell=undefined,
             };
 
@@ -1057,6 +1071,51 @@ pub fn Exec(comptime config: types.Config) type {
                 };
             }
 
+            fn projectionList(self:*const Query,table:*const S.Table,first:u16,columns:*u64,depth:usize,budget:*usize) bool {
+                var id=first;
+                while(id!=none) {
+                    if(!self.projectionNode(table,id,columns,depth,budget)) return false;
+                    id=self.pool.nodes[id].next;
+                }
+                return true;
+            }
+            fn projectionNode(self:*const Query,table:*const S.Table,id:u16,columns:*u64,depth:usize,budget:*usize) bool {
+                if(id==none) return true;
+                if(depth>=config.expr_depth or budget.*==0) return false;
+                budget.*-=1;
+                const node=self.pool.nodes[id];
+                switch(node.kind) {
+                    .column=>{
+                        if(node.level!=0 or node.relation!=0) return true;
+                        if(node.column>=table.column_count or !value_module.integral(node.ty)) return false;
+                        switch(table.columns[node.column].data_type) {.smallint,.integer32,.integer,.oid=>{},else=>return false}
+                        columns.*|=@as(u64,1)<<@intCast(node.column);return true;
+                    },
+                    .null_literal,.bool_literal,.int_literal,.text_literal,.decimal_literal=>return true,
+                    .unary,.not_op,.test_op,.cast=>return self.projectionNode(table,node.a,columns,depth+1,budget),
+                    .binary,.and_op,.or_op,.nullif,.like,.when_arm,.at_zone=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionNode(table,node.b,columns,depth+1,budget),
+                    .between=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionNode(table,node.b,columns,depth+1,budget) and self.projectionNode(table,node.c,columns,depth+1,budget),
+                    .in_list=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionList(table,node.b,columns,depth+1,budget),
+                    .coalesce,.function=>return self.projectionList(table,node.b,columns,depth+1,budget),
+                    .case_expr=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionList(table,node.b,columns,depth+1,budget) and self.projectionNode(table,node.c,columns,depth+1,budget),
+                    .aggregate=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionNode(table,node.c,columns,depth+1,budget),
+                    else=>return false,
+                }
+            }
+            fn projectionColumns(self:*const Query,p:*const B.Plan,table:*const S.Table,columns:*u64) bool {
+                // Relation numbers are local to a query block. Walking the
+                // whole shared pool confuses unrelated CTE/outer columns with
+                // this fact table and can disable (or over-gather) projection.
+                var budget:usize=config.expr_nodes*4;
+                if(!self.projectionNode(table,p.where,columns,0,&budget) or !self.projectionNode(table,p.having,columns,0,&budget)) return false;
+                for(p.keys[0..p.key_count]) |id| if(!self.projectionNode(table,id,columns,0,&budget)) return false;
+                for(p.aggs[0..p.agg_count]) |agg| if(!self.projectionNode(table,agg.arg,columns,0,&budget) or !self.projectionNode(table,agg.filter,columns,0,&budget)) return false;
+                for(p.targets[0..p.width]) |id| if(!self.projectionNode(table,id,columns,0,&budget)) return false;
+                for(p.distinct_on[0..p.distinct_on_count]) |id| if(!self.projectionNode(table,id,columns,0,&budget)) return false;
+                for(p.sources[0..p.source_count]) |source| if(!self.projectionNode(table,source.on,columns,0,&budget) or !self.projectionNode(table,source.probe,columns,0,&budget)) return false;
+                return true;
+            }
+
             fn prepareStreamCursor(self:*const Query,p:*const B.Plan,cursor:*StreamCursor,early:bool) void {
                 const table=&self.tables[p.sources[0].table.?];
                 cursor.high=table.row_high;
@@ -1064,6 +1123,7 @@ pub fn Exec(comptime config: types.Config) type {
                     // Exactly the committed projection guard used by compact
                     // aggregates: old snapshots and own writes retain MVCC.
                     if(!self.committed_only or !table.summary.valid or table.summary.csn>self.snap.csn) return;
+                    cursor.all_live=table.summary.rows>=0 and @as(u64,@intCast(table.summary.rows))==table.scan_high and table.scan_high==table.row_high;
                     // A typed/computed residual need not prevent a safe first
                     // conjunct from rejecting fact rows before inner probes.
                     // Keep SQL's left-to-right error ordering: only the first
@@ -1076,14 +1136,12 @@ pub fn Exec(comptime config: types.Config) type {
                             cursor.prefix=predicate[0];
                     }
                     var columns:u64=0;
-                    for(self.pool.nodes[0..self.pool.len]) |node| {
-                        if(node.kind!=.column or node.level!=0 or node.relation!=0) continue;
-                        if(node.column>=table.column_count or !value_module.integral(node.ty)) return;
-                        switch(table.columns[node.column].data_type) {
-                            .smallint,.integer32,.integer,.oid=>{},
-                            else=>return,
-                        }
-                        columns|=@as(u64,1)<<@intCast(node.column);
+                    if(!self.projectionColumns(p,table,&columns)) return;
+                    cursor.all_nonnull=true;
+                    var required=columns;
+                    while(required!=0) {
+                        const column=@ctz(required);required&=required-1;
+                        if(table.summary.columns[column].nonnull!=table.summary.rows) {cursor.all_nonnull=false;break;}
                     }
                     cursor.columns=columns;cursor.high=table.scan_high;
                 }
@@ -1091,8 +1149,8 @@ pub fn Exec(comptime config: types.Config) type {
 
             fn streamFactRow(self:*Query,table:*const S.Table,cursor:*StreamCursor,slot:usize) ?[*]const V.Cell {
                 if(comptime S.compact_enabled) if(cursor.columns) |mask| {
-                    if(table.scan_live[slot]==0) return null;
-                    const nonnull=table.scan_nonnull[slot];
+                    if(!cursor.all_live and table.scan_live[slot]==0) return null;
+                    const nonnull=if(cursor.all_nonnull) ~@as(u64,0) else table.scan_nonnull[slot];
                     var columns=mask;
                     while(columns!=0) {
                         const column=@ctz(columns);
@@ -1121,8 +1179,7 @@ pub fn Exec(comptime config: types.Config) type {
                         while(cursor.prefix_mask==0 and cursor.next<cursor.high) {
                             const start=cursor.next;const count=@min(@as(usize,64),cursor.high-start);
                             try self.session.checkpoints(count);
-                            var mask:u64=0;
-                            for(0..count) |i| mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
+                            var mask=liveMask(table,start,count,cursor.all_live);
                             const visible=@popCount(mask);
                             self.work.stream_stats.rows+=visible;
                             try self.session.checkpoints(visible);
@@ -2046,13 +2103,13 @@ pub fn Exec(comptime config: types.Config) type {
             if(!Query.compactPredicates(ctx.pool,query.where,table,&predicates,&used) or used==0) return null;
             for(predicates[0..used]) |predicate| if(!predicate.nonnull) return null;
             stats.projected_filter_scans+=1;
+            const dense=table.summary.rows>=0 and @as(u64,@intCast(table.summary.rows))==table.scan_high;
             var found:usize=0;var start:usize=0;
             while(start<table.scan_high):(start+=64) {
                 const count=@min(@as(usize,64),table.scan_high-start);
                 // Charge dead slots too, exactly as the canonical scan does.
                 try ctx.session.checkpoints(count);
-                var mask:u64=0;
-                for(0..count) |i| mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
+                var mask=Query.liveMask(table,start,count,dense);
                 stats.projected_filter_rows+=@popCount(mask);
                 for(predicates[0..used]) |predicate| {
                     // Comparisons borrow their column and evaluate one literal;
