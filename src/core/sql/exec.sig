@@ -62,6 +62,7 @@ pub fn Exec(comptime config: types.Config) type {
             probes: usize = 0,
             dimension_probes: usize = 0,
             prefix_rejected: usize = 0,
+            cascade_rejected: usize = 0,
             scratch_cells: usize = 0,
             scratch_refs: usize = 0,
         };
@@ -1030,6 +1031,8 @@ pub fn Exec(comptime config: types.Config) type {
                 prefix:?CompactPredicate=null,
                 prefix_mask:u64=0,
                 prefix_start:usize=0,
+                cascade:[config.predicates]CompactPredicate=undefined,
+                cascade_count:usize=0,
                 all_live:bool=false,
                 all_nonnull:bool=false,
                 row:if(S.compact_enabled) [config.columns]V.Cell else [0]V.Cell=undefined,
@@ -1122,6 +1125,50 @@ pub fn Exec(comptime config: types.Config) type {
                 return true;
             }
 
+            fn boundDate(node:*const ast.Node) ?i64 {
+                if(node.ty!=.date or !node.date_bound or (node.kind!=.text_literal and node.kind!=.cast)) return null;
+                return node.integer;
+            }
+            fn dateColumn(table:*const S.Table,node:*const ast.Node) bool {
+                return node.kind==.column and node.level==0 and node.relation==0 and node.ty==.date and
+                    node.column<table.column_count and table.columns[node.column].data_type==.date;
+            }
+            fn datePredicates(self:*const Query,id:u16,table:*const S.Table,out:*[2]CompactPredicate,used:*usize) bool {
+                const node=&self.pool.nodes[id];
+                if(node.kind==.between and !node.negated) {
+                    const column=&self.pool.nodes[node.a];if(!dateColumn(table,column)) return false;
+                    const low=boundDate(&self.pool.nodes[node.b]) orelse return false;
+                    const high=boundDate(&self.pool.nodes[node.c]) orelse return false;
+                    const nonnull=table.summary.columns[column.column].nonnull==table.summary.rows;
+                    out[0]=.{.column=column.column,.op=.ge,.value=low,.nonnull=nonnull};
+                    out[1]=.{.column=column.column,.op=.le,.value=high,.nonnull=nonnull};used.*=2;return true;
+                }
+                if(node.kind!=.binary) return false;
+                var op=node.op;switch(op){.eq,.ne,.lt,.le,.gt,.ge=>{},else=>return false}
+                var column=&self.pool.nodes[node.a];var literal=&self.pool.nodes[node.b];
+                if(dateColumn(table,literal)) {
+                    const swap=column;column=literal;literal=swap;
+                    op=switch(op){.lt=>.gt,.le=>.ge,.gt=>.lt,.ge=>.le,else=>op};
+                }
+                if(!dateColumn(table,column)) return false;
+                const value=boundDate(literal) orelse return false;
+                out[0]=.{.column=column.column,.op=op,.value=value,.nonnull=table.summary.columns[column.column].nonnull==table.summary.rows};used.*=1;return true;
+            }
+            fn collectCascade(self:*const Query,id:u16,first:u16,table:*const S.Table,cursor:*StreamCursor) bool {
+                if(id==first) return true;
+                const node=&self.pool.nodes[id];
+                if(node.kind==.and_op) return self.collectCascade(node.a,first,table,cursor) and self.collectCascade(node.b,first,table,cursor);
+                var predicates:[2]CompactPredicate=undefined;var used:usize=0;
+                if(!compactPredicates(self.pool,id,table,&predicates,&used)) {
+                    used=0;if(!self.datePredicates(id,table,&predicates,&used)) return false;
+                }
+                if(used>cursor.cascade.len-cursor.cascade_count) return false;
+                for(predicates[0..used]) |predicate| if(!predicate.nonnull) return false;
+                for(predicates[0..used]) |predicate| if(prefixCanReject(table,predicate)) {
+                    cursor.cascade[cursor.cascade_count]=predicate;cursor.cascade_count+=1;
+                };
+                return true;
+            }
             fn prepareStreamCursor(self:*const Query,p:*const B.Plan,cursor:*StreamCursor,early:bool) void {
                 const table=&self.tables[p.sources[0].table.?];
                 cursor.high=table.row_high;
@@ -1138,8 +1185,10 @@ pub fn Exec(comptime config: types.Config) type {
                         var first=p.where;
                         while(self.pool.nodes[first].kind==.and_op) first=self.pool.nodes[first].a;
                         var predicate:[1]CompactPredicate=undefined;var used:usize=0;
-                        if(self.prefixJoinsSafe(p) and compactPredicates(self.pool,first,table,&predicate,&used) and used==1 and predicate[0].nonnull and prefixCanReject(table,predicate[0]))
+                        if(self.prefixJoinsSafe(p) and compactPredicates(self.pool,first,table,&predicate,&used) and used==1 and predicate[0].nonnull and prefixCanReject(table,predicate[0])) {
                             cursor.prefix=predicate[0];
+                            _=self.collectCascade(p.where,first,table,cursor);
+                        }
                     }
                     var columns:u64=0;
                     if(!self.projectionColumns(p,table,&columns)) return;
@@ -1200,6 +1249,16 @@ pub fn Exec(comptime config: types.Config) type {
                                 else=>unreachable,
                             };
                             self.work.stream_stats.prefix_rejected+=visible-@popCount(mask);
+                            for(cursor.cascade[0..cursor.cascade_count]) |extra| {
+                                if(mask==0) break;
+                                const before=@popCount(mask);try self.session.checkpoints(before);
+                                const single=[_]CompactPredicate{extra};var selected=mask;
+                                while(selected!=0) {
+                                    const i=@ctz(selected);selected&=selected-1;
+                                    if(!compactKeep(table,start+i,&single)) mask&=~(@as(u64,1)<<@intCast(i));
+                                }
+                                self.work.stream_stats.cascade_rejected+=before-@popCount(mask);
+                            }
                             cursor.prefix_start=start;cursor.prefix_mask=mask;cursor.next+=count;
                         }
                         if(cursor.prefix_mask==0) return false;

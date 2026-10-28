@@ -112,6 +112,28 @@ before claiming a performance advantage.
 
 ## Current research and applicable next experiments
 
+### Sparse predicate cascades before dimension probes
+
+After a selective leading predicate produces a mask, additional safe leading
+AND conjuncts can refine only its surviving positions. Integral comparisons
+and fact DATE comparisons/BETWEEN with binder-validated literal bounds use
+exact committed lanes, avoiding a second full-column scan or full-row fetch.
+The complete WHERE evaluator still checks every surviving joined tuple.
+
+Collection stops at the first computed, unsupported or nullable conjunct;
+it cannot move a later false predicate across a throwing expression. Existing
+nonthrowing ON/probe and committed-snapshot guards remain required. NULL date
+inputs therefore retain the original UNKNOWN/error behavior. A fixed descriptor
+budget limits this optimization, not SQL result cardinality: excess conjuncts
+remain in canonical evaluation. Cancellation/work checks precede every bounded
+refinement, and separate counters retain leading/cascade rejection evidence.
+
+The independent model adds all six DATE comparisons, reversed operands,
+exact probe/rejection bounds, a false DATE guard before division-by-zero, an
+earlier throwing guard before that DATE predicate, and a nullable DATE that must
+not hide a later error. This is a bounded fact-predicate cascade, not the full
+RPT+ join-order/Bloom-transfer algorithm from the research below.
+
 ### Reuse binder-validated DATE literals
 
 The post-projection selective-join profile still includes repeated temporal
