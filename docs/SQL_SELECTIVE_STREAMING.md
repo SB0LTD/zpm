@@ -110,6 +110,28 @@ empty results and extreme key intervals. Metadata-disabled execution supplies
 an additional canonical differential check. Full workload timing is required
 before claiming a performance advantage.
 
+### Follow-up typed-value costs
+
+The next full-data profile moves the bottleneck to typed bucket arithmetic,
+general expression projection, numeric comparisons and aggregate finalization.
+Equal-scale finite NUMERIC values now compare their signed coefficients directly
+instead of multiplying both into 1024-bit decimal-aligned temporaries. Different
+scales and special values retain their established semantics. Checked i128 to
+NUMERIC construction uses the coefficient directly, preserving the configured
+precision error and handling the full signed i128 range without a string/parse
+round trip. Projection borrows column operands through the existing evalRef
+checkpoint contract before copying once into its owned output row.
+
+When committed metadata proves the sum input non-null, wide grouping derives
+the final non-null count from its row count instead of updating two identical
+counters per fact. Bounded modular key subtraction is exact even for domains
+crossing zero or adjacent to signed i64 extremes. The large-domain contract now
+also converts its nullable columns to non-null to exercise both proof-based
+loops. Numeric kernel tests compare conversion against decimal parsing and
+ordering against signed i128 arithmetic, with precision boundaries, mixed scales
+and special values checked separately. These changes need fresh full-data
+timing; the profile alone does not prove a throughput gain.
+
 ## Current research and applicable next experiments
 
 - [Robust Predicate Transfer with Dynamic Execution, PVLDB 2026](https://www.vldb.org/pvldb/vol19/p1278-qiao.pdf)

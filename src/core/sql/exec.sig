@@ -11,6 +11,7 @@ const binder = @import("binder.sig");
 const value_module = @import("value.sig");
 const sort_module = @import("sort.sig");
 const catalog = @import("catalog.sig");
+const numeric = @import("numeric.sig");
 const builtin = @import("builtin");
 const Error = types.Error;
 const none = ast.none;
@@ -371,8 +372,8 @@ pub fn Exec(comptime config: types.Config) type {
             fn projectRow(self: *Query, p: *const B.Plan, ctx: *E.Context, out: *List) Error!void {
                 const at = try self.cells(p.width);
                 for (p.targets[0..p.width], 0..) |id, column| {
-                    const value = try E.eval(ctx, id);
-                    self.work.cells[at + column] = value;
+                    var scratch:V.Cell=undefined;
+                    self.work.cells[at + column] = (try E.evalRef(ctx,id,&scratch)).*;
                 }
                 try self.push(out, at);
             }
@@ -1282,8 +1283,9 @@ pub fn Exec(comptime config: types.Config) type {
                     if(dense and key_nonnull and sum_nonnull) {
                         visited+=count;
                         for(keys,values) |key_value,value| {
-                            const bucket=&buckets[@intCast(@as(i128,key_value)-bounds.low)];
-                            bucket.rows+=1;bucket.nonnull+=1;bucket.total+=value;
+                            const delta=@as(u64,@bitCast(key_value)) -% @as(u64,@bitCast(bounds.low));
+                            const bucket=&buckets[@intCast(delta)];
+                            bucket.rows+=1;bucket.total+=value;
                         }
                     } else {
                         var mask=liveMask(table,start,count,dense);visited+=@popCount(mask);
@@ -1292,7 +1294,8 @@ pub fn Exec(comptime config: types.Config) type {
                             const nonnull=table.scan_nonnull[start+i];
                             const slot:usize=if(!key_nonnull and nonnull&(@as(u64,1)<<@intCast(key.column))==0) span else @intCast(@as(i128,keys[i])-bounds.low);
                             const bucket=&buckets[slot];bucket.rows+=1;
-                            if(sum_nonnull or nonnull&(@as(u64,1)<<@intCast(sum_column))!=0) {bucket.nonnull+=1;bucket.total+=values[i];}
+                            if(sum_nonnull) bucket.total+=values[i]
+                            else if(nonnull&(@as(u64,1)<<@intCast(sum_column))!=0) {bucket.nonnull+=1;bucket.total+=values[i];}
                         }
                     }
                 }
@@ -1306,7 +1309,7 @@ pub fn Exec(comptime config: types.Config) type {
                     self.work.cells[at]=if(bucket_index==span) .null_value else .{.integer=@intCast(@as(i128,bounds.low)+bucket_index)};
                     var states:[2]Accumulator=.{.{},.{}};
                     states[count_index].count=bucket.rows;
-                    states[sum_index].count=bucket.nonnull;states[sum_index].wide=bucket.total;
+                    states[sum_index].count=if(sum_nonnull) bucket.rows else bucket.nonnull;states[sum_index].wide=bucket.total;
                     try self.projectGroup(p,at,&states,outer,&out);groups+=1;
                 }
                 self.work.stream_stats.wide_dense_plans+=1;
@@ -1494,21 +1497,8 @@ pub fn Exec(comptime config: types.Config) type {
                 }
             }
 
-            fn numericOf(self: *Query, value: i128) Error!V.Cell {
-                var digits: [48]u8 = undefined;
-                var index: usize = digits.len;
-                var magnitude: u128 = if (value < 0) @intCast(-value) else @intCast(value);
-                while (true) {
-                    index -= 1;
-                    digits[index] = @intCast('0' + magnitude % 10);
-                    magnitude /= 10;
-                    if (magnitude == 0) break;
-                }
-                if (value < 0) {
-                    index -= 1;
-                    digits[index] = '-';
-                }
-                return Io.parse(.numeric, -1, digits[index..], self.session);
+            fn numericOf(_: *Query, value: i128) Error!V.Cell {
+                return .{.numeric=try numeric.Ops(config.numeric_digits).fromWide(value)};
             }
 
             fn finishAggregate(self: *Query, agg: *const B.Agg, acc: *const Accumulator) Error!V.Cell {

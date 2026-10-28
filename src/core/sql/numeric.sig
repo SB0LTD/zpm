@@ -100,6 +100,15 @@ pub fn compareValues(a: *const Numeric, b: *const Numeric) i8 {
     const rb = rankOf(b);
     if (ra != rb) return if (ra < rb) -1 else 1;
     if (a.special != .finite) return 0;
+    // Equal scales need no decimal alignment or 1024-bit multiplication.
+    if(a.dscale==b.dscale) {
+        const left=a.coef();const right=b.coef();
+        const sa:i8=if(left==0) 0 else if(a.negative) -1 else 1;
+        const sb:i8=if(right==0) 0 else if(b.negative) -1 else 1;
+        if(sa!=sb) return if(sa<sb) -1 else 1;
+        if(left==right) return 0;
+        return if((left>right)==(sa>0)) 1 else -1;
+    }
     const scale = @max(a.dscale, b.dscale);
     const left: u1024 = @as(u1024, a.coef()) * pow10_wide[scale - a.dscale];
     const right: u1024 = @as(u1024, b.coef()) * pow10_wide[scale - b.dscale];
@@ -144,6 +153,14 @@ pub fn Ops(comptime digits: usize) type {
             const magnitude: u64 = if (value < 0) @as(u64, @bitCast(-%value)) else @intCast(value);
             out.setCoef(magnitude);
             return out;
+        }
+
+        /// Exact checked aggregate conversion, including the i128 minimum.
+        /// Preserve the configured NUMERIC capacity without a decimal string
+        /// round trip; unlike fromInt this can exceed the configured precision.
+        pub fn fromWide(value:i128) Error!Numeric {
+            const magnitude:u128=if(value<0) @bitCast(-%value) else @intCast(value);
+            return make(magnitude,0,value<0);
         }
 
         /// numeric_in: surrounding whitespace, sign, digits with an optional

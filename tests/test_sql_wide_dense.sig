@@ -1,7 +1,7 @@
 //! Caller-backed wide grouping versus an independent i128 model and MVCC.
 const std=@import("std");const sql=@import("sql");
 const DB=sql.Database(.{.external_storage=true,.compact_integral_scans=true,.tables=1,.columns=3,
-    .rows_per_table=4,.work_rows=16384,.result_rows=8192,.text_bytes=16});
+    .rows_per_table=4,.work_rows=16384,.result_rows=8192,.text_bytes=16,.tx_writes=2048});
 const n=12011;const domain=5003;const base=-2501;
 var db:DB=.{};var result:DB.Result=.{};var saved:DB.Result=.{};
 var backing:[8388608]u8 align(64)=undefined;
@@ -79,6 +79,13 @@ pub fn main() !void {
     saved=result;var control:sql.ExecutionControl=.{.max_work=10};db.session.control=&control;
     if(db.execute(query,&result)) |_| return error.ExpectedWorkLimit else |err| try check(err==error.QueryWorkLimit);
     db.session.control=null;try equal();try paired(true);
+    // Exercise both metadata-proven non-null loops on the large domain too.
+    try db.execute("UPDATE t SET v=0 WHERE v IS NULL",&result);
+    for(&items) |*item| if(item.alive and item.value==null) {item.value=0;};
+    try paired(true);
+    try db.execute("UPDATE t SET g=0 WHERE g IS NULL",&result);
+    for(&items) |*item| if(item.alive and item.key==null) {item.key=0;};
+    try paired(true);
     // Conservative bounds widened by an aborted write force safe fallback.
     const widened=try db.begin();try db.statement(widened,"UPDATE t SET g=9223372036854775807 WHERE id=3",&result,.{});db.abort(widened);
     try paired(false);
