@@ -36,7 +36,14 @@ The reads form a checked sample, not an atomic kernel resource snapshot.
 
 ## Windows
 
-Read system physical memory, process residency and app commitment. Enumerate
+Read system physical memory, process residency/private commitment and app
+commit availability. `PROCESS_MEMORY_COUNTERS_EX.PrivateUsage` supplies this
+process's owned private commitment. `APP_MEMORY_INFORMATION.TotalCommitUsage`
+includes shared commitment and remains an app-scope charge rather than being
+added back as process-private ownership. See Microsoft's
+[process memory counters](https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters_ex)
+and [app memory information](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/ns-processthreadsapi-app_memory_information).
+Enumerate
 variable-size CPU-set records across process groups, honor default CPU sets,
 single-group hard affinity, immediate job group masks and reservations belonging
 to other processes. Preserve physical-core and group-local NUMA counts without
@@ -49,6 +56,14 @@ CPU rate cap. Current job usage uses information class 28, as in
 [Microsoft's HCS shim](https://github.com/microsoft/hcsshim/blob/main/internal/winapi/jobobject.go);
 do not use historical notification snapshots or peak usage as current usage.
 Failed current-usage queries return an error rather than assuming free capacity.
+
+The machine budget explicitly distinguishes resident and committed scope
+charges. Windows app/job limits use committed bytes; Linux cgroups retain the
+resident default. A Windows private page mapping can be committed before it is
+resident, so adding residency to remaining commit allowance and then subtracting
+the full owned commitment would charge its untouched pages twice. Physical
+availability, operator limits and headroom remain separate constraints; the
+commit correction cannot authorize memory beyond any of them.
 
 `immediate_job` explicitly reports this scope: Win32 does not enumerate parent
 job handles through `QueryInformationJobObject(NULL)`. Parent job constraints,
@@ -94,6 +109,9 @@ include 256 Windows CPU-set records across four groups, reservation/default/hard
 affinity, parent memory pressure with a larger parent limit, quotas, mount-path
 escapes, migration, missing/denied files, small/aliased buffers and 10,000 checked
 random profiles. Windows additionally creates real process/job memory limits and
-sets one-CPU affinity in the isolated contract process. Linux exercises real
+sets one-CPU affinity in the isolated contract process.
+Windows also reserves an untouched 64 MB private mapping, compares observed
+ownership with an independent native process counter and checks its commitment
+increase before the constrained-job checks. Linux exercises real
 procfs/cgroup reads and native address limits. macOS runs in the hosted OS matrix;
 cross-compilation alone is not recorded as a native macOS pass.

@@ -14,6 +14,10 @@ pub const Machine = struct {
     available_address_space: ?u64 = null,
     scope_limit: ?u64 = null,
     scope_used: ?u64 = null,
+    /// Match the scope's charge units: cgroup residency and Windows commit
+    /// limits are different constraints. Never add resident bytes to commit
+    /// availability and then subtract the process's entire commit again.
+    scope_charge: enum { resident, committed } = .resident,
 };
 pub const Policy = struct {
     hard_process_bytes: ?u64 = null,
@@ -63,7 +67,11 @@ pub fn plan(machine: Machine, policy: Policy) Error!Plan {
     if(machine.available_address_space) |available| budget=@min(budget,try add(machine.process_committed,available -| headroom));
     if(machine.scope_limit) |limit| {
         const available=limit -| machine.scope_used.?;
-        budget=@min(budget,@min(limit,try add(machine.process_resident,available -| headroom)));
+        const owned=switch(machine.scope_charge) {
+            .resident=>machine.process_resident,
+            .committed=>machine.process_committed,
+        };
+        budget=@min(budget,@min(limit,try add(owned,available -| headroom)));
     }
     if(policy.hard_process_bytes) |hard| budget=@min(budget,hard);
     const overhead=try add(policy.fixed_bytes,policy.recovery_bytes);

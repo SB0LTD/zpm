@@ -146,6 +146,7 @@ fn cpuSets() !void {
     try rejected(error.InvalidObservation,facts.windowsCpuSets(&records,.{.groups=&.{0,1,2,3}}));
 }
 const WindowsTest=struct {
+    const Process=extern struct {size:u32=@sizeOf(Process),faults:u32=0,peak_ws:usize=0,ws:usize=0,peak_paged:usize=0,paged:usize=0,peak_nonpaged:usize=0,nonpaged:usize=0,pagefile:usize=0,peak_pagefile:usize=0,private:usize=0};
     const Basic=extern struct {process_time:i64=0,job_time:i64=0,flags:u32=0,min_ws:usize=0,max_ws:usize=0,active:u32=0,affinity:usize=0,priority:u32=0,scheduling:u32=0};
     const Job=extern struct {basic:Basic=.{},io:[6]u64=@splat(0),process_memory:usize=0,job_memory:usize=0,peak_process:usize=0,peak_job:usize=0};
     extern "kernel32" fn CreateJobObjectW(?*anyopaque,?[*:0]const u16) callconv(.winapi) ?*anyopaque;
@@ -155,8 +156,25 @@ const WindowsTest=struct {
     extern "kernel32" fn GetProcessAffinityMask(*anyopaque,*usize,*usize) callconv(.winapi) c_int;
     extern "kernel32" fn SetProcessAffinityMask(*anyopaque,usize) callconv(.winapi) c_int;
     extern "kernel32" fn CloseHandle(*anyopaque) callconv(.winapi) c_int;
+    extern "kernel32" fn K32GetProcessMemoryInfo(*anyopaque,*Process,u32) callconv(.winapi) c_int;
+    extern "kernel32" fn VirtualAlloc(?*anyopaque,usize,u32,u32) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn VirtualFree(?*anyopaque,usize,u32) callconv(.winapi) c_int;
     fn constrained() !void {
         const process=GetCurrentProcess();var affinity:usize=0;var system:usize=0;
+        const before=try resources.observe(buffers(),0);
+        const bytes=64*1024*1024;
+        const untouched=VirtualAlloc(null,bytes,0x3000,4) orelse return error.CommitTestUnavailable;
+        defer _=VirtualFree(untouched,0,0x8000);
+        const after=try resources.observe(buffers(),0);
+        var counters:Process=.{};
+        try check(K32GetProcessMemoryInfo(process,&counters,@sizeOf(Process))!=0);
+        // Query the process directly, independently of app/job totals. The
+        // committed mapping remains untouched; residency is not ownership.
+        const difference=if(after.machine.process_committed>counters.private) after.machine.process_committed-counters.private else counters.private-after.machine.process_committed;
+        if(difference>64*1024) std.debug.print("process commit observation={d}, independent private commit={d}, resident={d}\n",.{after.machine.process_committed,counters.private,counters.ws});
+        try check(difference<=64*1024);
+        try check(after.machine.process_committed>=before.machine.process_committed+bytes);
+        try check(after.machine.scope_charge==.committed);
         if(GetProcessAffinityMask(process,&affinity,&system)==0 or affinity==0) return error.AffinityTestUnavailable;
         const first=affinity & (~affinity+%1);
         try check(SetProcessAffinityMask(process,first)!=0);
