@@ -55,6 +55,7 @@ pub fn Exec(comptime config: types.Config) type {
             dense_plans: usize = 0,
             compact_plans: usize = 0,
             compact_rows: usize = 0,
+            wide_dense_plans: usize = 0,
             gathered_rows: usize = 0,
             distinct_bitmap_bytes: usize = 0,
             groups: usize = 0,
@@ -826,7 +827,8 @@ pub fn Exec(comptime config: types.Config) type {
                     const zero:@Vector(8,u8)=@splat(0);
                     while(i+8<=count):(i+=8) {
                         const flags:@Vector(8,u8)=table.scan_live[start+i..][0..8].*;
-                        const bits:u8=@bitCast(flags!=zero);
+                        var bits:u8=@bitCast(flags!=zero);
+                        if(comptime builtin.cpu.arch.endian()==.big) bits=@bitReverse(bits);
                         mask|=@as(u64,bits)<<@intCast(i);
                     }
                 }
@@ -1230,6 +1232,89 @@ pub fn Exec(comptime config: types.Config) type {
                 return false;
             }
 
+            const WideBucket=struct {
+                // Storage references admit at most 2^31-1 rows; even i64 input
+                // extremes therefore fit exactly in this signed i128 total.
+                total:i128 align(@alignOf(V.Cell))=0,
+                rows:i64=0,
+                nonnull:i64=0,
+            };
+
+            /// Exact wide arithmetic over bounded integral grouping domains.
+            /// The state is borrowed from the query arena, never a comptime
+            /// cardinality-sized array or an input-sized handle list.
+            noinline fn wideDenseGroup(self:*Query,p:*const B.Plan,outer:?*const E.Context,table:*const S.Table) Error!?List {
+                if(!self.committed_only or !table.summary.valid or table.summary.csn>self.snap.csn or p.where!=none or p.key_count!=1 or p.agg_count!=2) return null;
+                const key=self.pool.nodes[p.keys[0]];
+                if(key.kind!=.column or key.level!=0 or key.relation!=0 or !value_module.integral(key.ty)) return null;
+                var transitions:[2]Transition=undefined;
+                if(!self.prepareTransitions(p,&transitions)) return null;
+                const count_index:usize=if(transitions[0].kind==.count_star) 0 else 1;
+                const sum_index=1-count_index;
+                if(transitions[count_index].kind!=.count_star or transitions[sum_index].kind!=.sum_wide) return null;
+                const bounds=table.integer_bounds[key.column];
+                if(!bounds.known) return null;
+                const span128=@as(i128,bounds.high)-bounds.low+1;
+                const cell_budget=self.work.cell_high-self.work.cell_low;
+                const ref_budget=self.work.ref_high-self.work.ref_low;
+                const output_cells=1+p.agg_count+p.width;
+                // Round state cost upward per domain entry and leave room for
+                // all output groups and finish/sort handles before reserving.
+                const state_per_bucket=(@sizeOf(WideBucket)+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell);
+                const bucket_budget=@min(cell_budget/(state_per_bucket+output_cells),ref_budget/4);
+                if(span128+1>bucket_budget) return null;
+                const span:usize=@intCast(span128);const size=span+1;
+                const state_cells=(size*@sizeOf(WideBucket)+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell);
+                const state_at=try self.cells(state_cells);
+                const ptr:[*]WideBucket=@ptrCast(@alignCast(&self.work.cells[state_at]));
+                const buckets=ptr[0..size];for(buckets) |*bucket| bucket.*=.{};
+                const sum_column=transitions[sum_index].column;
+                const key_nonnull=table.summary.columns[key.column].nonnull==table.summary.rows;
+                const sum_nonnull=table.summary.columns[sum_column].nonnull==table.summary.rows;
+                const dense=table.summary.rows==@as(i64,@intCast(table.scan_high));
+                var visited:usize=0;defer {self.work.stream_stats.rows+=visited;self.work.stream_stats.compact_rows+=visited;}
+                var start:usize=0;
+                while(start<table.scan_high):(start+=64) {
+                    const count=@min(@as(usize,64),table.scan_high-start);
+                    try self.session.checkpoints(count);
+                    const keys=table.scan_values[@as(usize,key.column)*table.rows.len+start..][0..count];
+                    const values=table.scan_values[@as(usize,sum_column)*table.rows.len+start..][0..count];
+                    if(dense and key_nonnull and sum_nonnull) {
+                        visited+=count;
+                        for(keys,values) |key_value,value| {
+                            const bucket=&buckets[@intCast(@as(i128,key_value)-bounds.low)];
+                            bucket.rows+=1;bucket.nonnull+=1;bucket.total+=value;
+                        }
+                    } else {
+                        var mask=liveMask(table,start,count,dense);visited+=@popCount(mask);
+                        while(mask!=0) {
+                            const i=@ctz(mask);mask&=mask-1;
+                            const nonnull=table.scan_nonnull[start+i];
+                            const slot:usize=if(!key_nonnull and nonnull&(@as(u64,1)<<@intCast(key.column))==0) span else @intCast(@as(i128,keys[i])-bounds.low);
+                            const bucket=&buckets[slot];bucket.rows+=1;
+                            if(sum_nonnull or nonnull&(@as(u64,1)<<@intCast(sum_column))!=0) {bucket.nonnull+=1;bucket.total+=values[i];}
+                        }
+                    }
+                }
+                var out:List=.{};var groups:usize=0;
+                // Canonical grouping order uses NULL first, then integral keys.
+                // Final SQL ORDER BY/HAVING/projection still run normally.
+                for(0..size) |index| {
+                    const bucket_index=if(index==0) span else index-1;
+                    const bucket=&buckets[bucket_index];if(bucket.rows==0) continue;
+                    const at=try self.cells(1+p.agg_count);
+                    self.work.cells[at]=if(bucket_index==span) .null_value else .{.integer=@intCast(@as(i128,bounds.low)+bucket_index)};
+                    var states:[2]Accumulator=.{.{},.{}};
+                    states[count_index].count=bucket.rows;
+                    states[sum_index].count=bucket.nonnull;states[sum_index].wide=bucket.total;
+                    try self.projectGroup(p,at,&states,outer,&out);groups+=1;
+                }
+                self.work.stream_stats.wide_dense_plans+=1;
+                self.work.stream_stats.groups+=groups;
+                self.work.stream_stats.scratch_cells=@max(self.work.stream_stats.scratch_cells,state_cells+groups*(1+p.agg_count));
+                return try self.finish(p,out);
+            }
+
             /// Aggregate states and projections remain private until the
             /// ordinary query publication step succeeds.
             fn streamGroup(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
@@ -1247,6 +1332,7 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
                 if (comptime S.compact_enabled) {
+                    if(p.source_count==1) if(try self.wideDenseGroup(p,outer,table)) |rows| return rows;
                     if (p.source_count==1 and (p.key_count != 0 or !self.summaryEligible(p, table))) {
                         if (try self.compactGroup(p, outer, table)) |rows| return rows;
                     }

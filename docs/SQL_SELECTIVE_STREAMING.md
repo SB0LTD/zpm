@@ -82,6 +82,34 @@ validated update/delete change records. Only durable publication/replay changes
 the projection; a flush failure leaves both visible answers and projected values
 unchanged.
 
+### Caller-backed wide grouping
+
+The five-million-row customer aggregation's follow-up profile is dominated by
+group-key comparisons and per-row aggregate dispatch. A current committed,
+single-source grouping with a bounded integral key, COUNT(*) and an integral
+wide SUM/AVG can now use direct arithmetic buckets. Each bucket stores row
+count, non-null count and an exact signed i128 total in bytes borrowed from the
+existing query arena. It admits the entire conservative key domain only when
+the caller's remaining scratch can hold state, output and finish handles;
+otherwise the original collision-safe engine remains available. There is no
+fixed 4096-key optimization cutoff, input-sized list or query-answer cache.
+
+Storage references allow at most 2^31-1 rows. Even an i64 extreme per row has
+total magnitude below 2^94, so i128 arithmetic is exact for every admitted
+input, including cancellation between positive and negative values. NULL group
+keys have a distinct bucket, and all-NULL sums remain NULL. The existing numeric
+SUM/AVG finalizer, HAVING, projection and ORDER BY remain authoritative. The
+general path handles filters, unsupported aggregates, sparse/widened domains,
+old snapshots and private writes. This is an execution specialization, not a
+larger compile-time array or a storage-format change.
+
+A 12,011-row, 5003-key independent model exercises signed i64 extremes and
+totals beyond i64, null keys/values, swapped aggregate order, exact AVG
+comparison, pinned snapshots, retained tombstones, aborts, work cancellation,
+empty results and extreme key intervals. Metadata-disabled execution supplies
+an additional canonical differential check. Full workload timing is required
+before claiming a performance advantage.
+
 ## Current research and applicable next experiments
 
 - [Robust Predicate Transfer with Dynamic Execution, PVLDB 2026](https://www.vldb.org/pvldb/vol19/p1278-qiao.pdf)
