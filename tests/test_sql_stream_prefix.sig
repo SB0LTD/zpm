@@ -137,6 +137,11 @@ pub fn main() !void {
         const selected:usize=n/8+@as(usize,@intFromBool(store<n%8));
         try check(stats.prefix_rejected==n-selected);
         try check(stats.dimension_probes<=2*selected);
+        if(comptime @hasField(@TypeOf(stats),"cascade_rejected")) {
+            var dated:usize=0;for(0..n) |i| if(i%8==store and i%12>=2 and i%12<=7) {dated+=1;};
+            try check(stats.cascade_rejected==selected-dated);
+            try check(stats.dimension_probes<=2*dated);
+        }
     }
     const symbols=[_] []const u8{"=","<>","<","<=",">",">="};
     for([_]Op{.eq,.ne,.lt,.le,.gt,.ge},0..) |op,index| {
@@ -147,6 +152,14 @@ pub fn main() !void {
     }
     try database.execute("SELECT c.label,COUNT(*),SUM(f.amount) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE 3<f.store AND f.day BETWEEN DATE '2025-03-01' AND DATE '2025-08-31' GROUP BY c.label ORDER BY c.label",&result);
     try model(3,false,false,.gt);try check(database.workspace.query.stream_stats.prefix_rejected>0);
+    try database.execute("SELECT c.label,COUNT(*),SUM(f.amount) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE f.store=3 AND DATE '2025-03-01'<=f.day AND DATE '2025-08-31'>=f.day GROUP BY c.label ORDER BY c.label",&result);
+    try model(3,false,false,.eq);
+    for([_]Op{.eq,.ne,.lt,.le,.gt,.ge},0..) |op,index| {
+        const source=try std.fmt.bufPrint(&buffer,"SELECT COUNT(*) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE f.store=3 AND f.day{s}DATE '2025-06-15'",.{symbols[index]});
+        try database.execute(source,&result);var expected:i64=0;
+        for(0..n) |i| if(i%8==3 and i%17!=0 and i%31!=0 and matches(@intCast(i%12+1),6,op)) {expected+=1;};
+        try check(result.row_count==1 and result.rows[0].cells[0].integer==expected);
+    }
     try database.execute("SELECT c.label,COUNT(*),SUM(f.amount) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE f.store>=0 AND f.day BETWEEN DATE '2025-03-01' AND DATE '2025-08-31' GROUP BY c.label ORDER BY c.label",&result);
     try model(0,false,false,.ge);try check(database.workspace.query.stream_stats.prefix_rejected==0);
     // A rejected leading conjunct must retain SQL's error short-circuit. A
@@ -154,6 +167,13 @@ pub fn main() !void {
     const protected="SELECT COUNT(*) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE f.store=99 AND 10/(f.amount-f.amount)>0";
     try database.execute(protected,&result);try check(result.rows[0].cells[0].integer==0);
     try check(database.workspace.query.stream_stats.dimension_probes==0);
+    const cascade_protected="SELECT COUNT(*) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE f.store=0 AND f.day<DATE '1900-01-01' AND 10/(f.amount-f.amount)>0";
+    try database.execute(cascade_protected,&result);try check(result.rows[0].cells[0].integer==0);
+    try rejected("SELECT COUNT(*) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE f.store=0 AND 10/(f.amount-f.amount)>0 AND f.day<DATE '1900-01-01'",error.DivisionByZero);
+    try database.execute("UPDATE facts SET day=NULL WHERE id=8",&result);
+    try rejected(cascade_protected,error.DivisionByZero);
+    if(comptime @hasField(@TypeOf(database.workspace.query.stream_stats),"cascade_rejected")) try check(database.workspace.query.stream_stats.cascade_rejected==0);
+    try database.execute("UPDATE facts SET day=DATE '2025-09-15' WHERE id=8",&result);
     try rejected("SELECT COUNT(*) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE 10/(f.amount-f.amount)>0 AND f.store=99",error.DivisionByZero);
     try rejected("SELECT COUNT(*) FROM facts f JOIN products p ON p.id=f.product AND 10/(f.amount-f.amount)>0 JOIN categories c ON c.id=p.category WHERE f.store=88 AND f.day>DATE '2025-03-01'",error.DivisionByZero);
     try check(database.workspace.query.stream_stats.prefix_rejected==0);
