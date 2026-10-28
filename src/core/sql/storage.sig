@@ -138,6 +138,10 @@ pub fn Storage(comptime config: types.Config) type {
 
         pub const OrderState = enum { empty, one, increasing, decreasing, unordered };
         pub const OrderProof = struct { state: OrderState = .empty, last: V.Cell = .null_value };
+        pub const PrimaryDirectory = struct {
+            state: enum { empty, candidate, disabled } = .empty,
+            base: i64 = 0,
+        };
 
         /// Exact committed state, derived from published row transitions (not
         /// persisted). Old snapshots and transactions with own writes scan.
@@ -175,6 +179,7 @@ pub fn Storage(comptime config: types.Config) type {
             column_count: usize = 0,
             columns: [config.columns]V.Column = @splat(.{}),
             primary_column: ?usize = null,
+            primary_directory: PrimaryDirectory = .{},
             /// Conservative strict non-NULL order over physical row slots.
             /// Updates/aborts may discard a proof, never invent one. Not persisted.
             column_order: [config.columns]OrderProof = @splat(.{}),
@@ -226,6 +231,7 @@ pub fn Storage(comptime config: types.Config) type {
             table.version_free = 0;
             table.scan_high = 0;
             table.column_order = @splat(.{});
+            table.primary_directory = .{};
             table.summary = .{};
             table.integer_bounds = @splat(.{});
             resetRollups(table);
@@ -240,6 +246,7 @@ pub fn Storage(comptime config: types.Config) type {
             destination.column_count = source.column_count;
             @memcpy(destination.columns[0..source.column_count], source.columns[0..source.column_count]);
             destination.primary_column = source.primary_column;
+            destination.primary_directory = source.primary_directory;
             destination.column_order = source.column_order;
             destination.summary = source.summary;
             destination.integer_bounds = source.integer_bounds;
@@ -488,7 +495,25 @@ pub fn Storage(comptime config: types.Config) type {
                 }
             }
             noteOrder(table, version);
+            notePrimaryDirectory(table, version);
             indexKeyOnly(table, version);
+        }
+
+        fn notePrimaryDirectory(table: *Table, version: u32) void {
+            const column = table.primary_column orelse return;
+            const hint = &table.primary_directory;
+            if (hint.state == .disabled) return;
+            const entry = &table.versions[version];
+            const key = &entry.cells[column];
+            if (key.* != .integer) { hint.state = .disabled; return; }
+            if (hint.state == .empty) {
+                if (entry.row != 1 or entry.older != 0) { hint.state = .disabled; return; }
+                hint.* = .{ .state = .candidate, .base = key.integer };
+            }
+            // Dense key-to-slot mappings are stronger eligibility evidence
+            // than monotonic order: sparse ordered keys disable speculation.
+            if (@as(i128, key.integer) != @as(i128, hint.base) + entry.row - 1)
+                hint.state = .disabled;
         }
 
         fn noteOrder(table: *Table, version: u32) void {
@@ -544,11 +569,10 @@ pub fn Storage(comptime config: types.Config) type {
             if (value.* == .null_value) return null;
             // Ordered integral keys often share an offset with directory slots.
             // This is only a candidate: validate the canonical visible version
-            // and its exact key before accepting it. Holes, compaction, changed
-            // bounds and older/own snapshots retain the normal hash probe.
-            if (value.* == .integer and table.integer_bounds[column].known and
-                (table.column_order[column].state == .increasing or table.column_order[column].state == .one)) {
-                const offset = @as(i128, value.integer) - table.integer_bounds[column].low;
+            // and its exact key before accepting it. Holes, compaction, key
+            // changes and unmatched older/own versions retain the hash probe.
+            if (value.* == .integer and table.primary_directory.state == .candidate) {
+                const offset = @as(i128, value.integer) - table.primary_directory.base;
                 if (offset >= 0 and offset < table.row_high) {
                     if (visibleAt(table, @intCast(offset), snap)) |candidate| {
                         const key = &table.versions[candidate].cells[column];
@@ -662,6 +686,7 @@ pub fn Storage(comptime config: types.Config) type {
                     }
                 }
                 if (read != write) {
+                    table.primary_directory.state = .disabled;
                     if (comptime compact_enabled) {
                         if (read < table.scan_high) {
                             table.scan_live[write] = table.scan_live[read];
