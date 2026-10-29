@@ -231,3 +231,20 @@ workflow runs all ten Python harness/evidence tests on each native OS. Earlier
 contract totals above describe their historical checkpoints.
 
 SQLancer-style TLP, NoREC and constant-folding metamorphic tests are additional oracles, not substitutes for native differential and crash tests. See [SQLancer papers](https://github.com/sqlancer/sqlancer/blob/main/docs/PAPERS.md) and [CODDTest](https://doi.org/10.1145/3709674). Bounded equivalence can strengthen optimizer checks but remains bounded: [VeriEQL](https://arxiv.org/abs/2403.03193).
+
+Flat row-constructor IN/NOT IN lists are covered by
+`contract-sql-row-membership`: 5,928 assertions, a 2,916-case three-valued
+matrix, and 40 additional native PostgreSQL 18.3 probes. Reproduce the oracle:
+
+```powershell
+python tests/sql_conformance/verify_membership_oracle.py --port 55491 --report .sig-cache/membership-oracle.json
+```
+
+`membership_oracle.json` pins its contract/script hashes and matrix digest.
+The eleven Python tests include identity checks for this evidence. The Sig
+contract separately covers schema replay, work/cancellation and caller-storage
+exhaustion. A 64-candidate list is tested with depth five and 1,024 AST nodes;
+binding storage grows with candidate count and width. This is constructor-list
+support, not general records or row IN subqueries/ANY/ALL. Bare NULL record
+candidates and nested records remain explicitly unsupported. Historical
+unqualified-scope lists in earlier oracle records describe those earlier batches.

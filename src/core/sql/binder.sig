@@ -982,6 +982,35 @@ pub fn Binder(comptime config: types.Config) type {
             while (item != none) : (item = context.node(item).next) try context.pool.raise(id, item);
         }
 
+        fn bindRowIn(context: *const Context, scope: *const Scope, id: u16) Error!void {
+            const n = context.node(id);
+            const original = n.a;
+            try bindRowFields(context, scope, original);
+            var item = n.b;
+            var head: u16 = none;
+            var tail: u16 = none;
+            while (item != none) {
+                const next = context.node(item).next;
+                if (context.node(item).kind != .row_constructor) {
+                    // A NULL record payload is distinct from a constructor
+                    // with NULL fields; general record values are unqualified.
+                    if (context.node(item).kind == .null_literal) return error.UnsupportedStatement;
+                    return error.UndefinedFunction;
+                }
+                // Keep the original unresolved literal types until the last
+                // candidate: each equality operator resolves independently.
+                const left = if (next == none) original else try cloneTree(context, original);
+                const comparison = try context.pool.add(.{ .kind = .binary, .op = .eq, .a = left, .b = item });
+                try bindRowCompare(context, scope, comparison);
+                if (head == none) head = comparison else context.node(tail).next = comparison;
+                tail = comparison;
+                item = next;
+            }
+            n.* = .{ .kind = .row_in, .b = head, .negated = n.negated, .ty = .boolean, .constant = listConstant(context, head), .next = n.next, .name = n.name };
+            item = head;
+            while (item != none) : (item = context.node(item).next) try context.pool.raise(id, item);
+        }
+
         fn typeExpr(context: *const Context, scope: *const Scope, id: u16) Error!void {
             const n = context.node(id);
             n.constant = true;
@@ -1000,7 +1029,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .values_row, .default_value => return error.Syntax,
                 .row_constructor => return error.UnsupportedStatement,
                 // Internal comparison lists have already bound every field.
-                .row_compare => { n.ty = .boolean; n.constant = listConstant(context, n.b); },
+                .row_compare, .row_in => { n.ty = .boolean; n.constant = listConstant(context, n.b); },
                 .function => try typeFunction(context, scope, n),
                 .when_arm => unreachable,
                 .column => {
@@ -1090,6 +1119,7 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b) and isConstant(context, n.c);
                 },
                 .in_list => {
+                    if (context.node(n.a).kind == .row_constructor) return bindRowIn(context, scope, id);
                     try typeExpr(context, scope, n.a);
                     var result: ast.Type = context.node(n.a).ty;
                     var item = n.b;
@@ -1257,7 +1287,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn isPredicate(n: *const ast.Node) bool {
             return switch (n.kind) {
-                .test_op, .between, .in_list, .like, .row_compare => true,
+                .test_op, .between, .in_list, .like, .row_compare, .row_in => true,
                 .binary => n.op == .eq or n.op == .ne or n.op == .lt or n.op == .le or n.op == .gt or n.op == .ge,
                 else => false,
             };
@@ -1985,7 +2015,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn listOwner(kind: ast.NodeKind) bool {
             return switch (kind) {
-                .in_list, .case_expr, .coalesce, .function, .row_constructor, .row_compare => true,
+                .in_list, .case_expr, .coalesce, .function, .row_constructor, .row_compare, .row_in => true,
                 else => false,
             };
         }

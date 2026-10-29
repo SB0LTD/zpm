@@ -139,6 +139,17 @@ pub fn Deparse(comptime config: types.Config) type {
                     try rowText(context, n.b, true, w);
                     try w.bytes(")");
                 },
+                .row_in => {
+                    try w.bytes(if (n.negated) "NOT (" else "(");
+                    var item = n.b;
+                    var first = true;
+                    while (item != none) : (item = context.node(item).next) {
+                        if (!first) try w.bytes(" OR ");
+                        try expression(context, item, w);
+                        first = false;
+                    }
+                    try w.bytes(")");
+                },
                 .test_op => {
                     try w.bytes("(");
                     try expression(context, n.a, w);

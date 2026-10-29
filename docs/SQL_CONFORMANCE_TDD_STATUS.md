@@ -19,6 +19,39 @@ device deployment.
 
 ## Implemented in this batch
 
+### Follow-up: flat row-constructor membership
+
+`ROW(a,b) IN (ROW(x,y),...)` and tuple shorthand now bind independent
+field-pair equality operators per candidate. A flat predicate list folds their
+three-valued results and short-circuits on a match; NOT IN negates that result.
+Each candidate owns its left expression, matching PostgreSQL's repeated
+evaluation of volatile operands. Strict equality against a literal NULL omits
+the other operand's evaluation, while runtime NULLs retain normal evaluation.
+
+The implementation reuses the statement AST pool and existing row comparator;
+it adds no record payload or heap allocation. Binding consumes O(candidates ×
+fields) AST storage, with ordinary StatementTooComplex errors on exhaustion.
+The flat list avoids an execution-depth increase per candidate: 64 candidates
+pass with an expression-depth budget of five and sufficient AST storage.
+Schema deparsing uses equivalent OR comparisons, subject to the existing
+schema-expression size and depth budgets.
+
+The contract first failed with UnsupportedStatement. The completed suite passes
+5,928 assertions in Windows ReleaseSafe and Debug. The independent PostgreSQL
+18.3 oracle passes 2,916 finite matrix cases plus 40 targeted probes covering
+types, volatile calls, NULLs, grouping, joins, correlation, mutations and errors.
+Schema replay, cancellation, work limits and AST exhaustion are checked in Sig.
+See [membership oracle](../tests/sql_conformance/membership_oracle.json) and
+[the contract](../tests/test_sql_row_membership.sig). Eleven Python tests check
+the oracle/harness identity and semantic comparison machinery.
+
+This qualifies flat constructor lists. General record values (including bare
+NULL record candidates), nested records, row subquery membership and row
+ANY/ALL remain unqualified and are not counted as passing compatibility cases.
+PostgreSQL's [IN lowering](https://doxygen.postgresql.org/parse__expr_8c.html)
+informs the repeated-left-expression design; performance superiority is not
+claimed by these correctness tests.
+
 ### Follow-up: NULLIF cross-type results
 
 `NULLIF(real, double precision)`, mixed date/timestamp comparisons, and

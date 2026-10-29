@@ -113,13 +113,16 @@ pub const NodeKind = enum {
     row_constructor,
     /// Bound field-pair comparisons in `b` -> next, with the row operator `op`.
     row_compare,
+    /// Bound flat IN candidates: row_compare nodes in `b` -> next.
+    /// Each owns a separate left expression, as PostgreSQL's OR expansion does.
+    row_in,
 };
 
 /// Children by kind: unary/not/test/cast `a`; binary/and/or/nullif `a`,`b`;
 /// between `a` BETWEEN `b` AND `c`; in_list `a` IN (`b` -> next ...);
 /// like `a` LIKE `b`; case_expr operand `a` (or none), arms `b` -> next,
 /// ELSE `c`; when_arm condition `a`, result `b`; coalesce/function args `b`
-/// -> next. row_constructor/row_compare own a `b` -> next list.
+/// -> next. row_constructor/row_compare/row_in own a `b` -> next list.
 pub const Node = struct {
     kind: NodeKind = .null_literal,
     op: Op = .add,

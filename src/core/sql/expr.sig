@@ -454,12 +454,23 @@ pub fn Eval(comptime config: types.Config) type {
             return if (value) |b| .{ .boolean = b } else .null_value;
         }
 
+        fn nullConstant(ctx: *const Context, id: u16) bool {
+            const n = node(ctx, id);
+            return n.kind == .null_literal or (n.kind == .cast and nullConstant(ctx, n.a));
+        }
+
         fn rowTruth(ctx: *const Context, n: *const ast.Node) Error!?bool {
             var unknown = false;
             var item = n.b;
             while (item != none) : (item = node(ctx, item).next) {
                 try ctx.session.checkpoint();
                 const pair = node(ctx, item);
+                // PostgreSQL folds a strict equality against a literal NULL
+                // without evaluating the other operand, even when volatile.
+                if ((n.op == .eq or n.op == .ne) and (nullConstant(ctx, pair.a) or nullConstant(ctx, pair.b))) {
+                    unknown = true;
+                    continue;
+                }
                 var left_value: V.Cell = undefined; var right_value: V.Cell = undefined;
                 const left = try operandRef(ctx, pair.a, &left_value);
                 const right = try operandRef(ctx, pair.b, &right_value);
@@ -489,6 +500,17 @@ pub fn Eval(comptime config: types.Config) type {
             const n = node(ctx, id);
             switch (n.kind) {
                 .row_compare => return rowTruth(ctx, n),
+                .row_in => {
+                    var unknown = false;
+                    var item = n.b;
+                    while (item != none) : (item = node(ctx, item).next) {
+                        try ctx.session.checkpoint();
+                        if (try truth(ctx, item)) |matched| {
+                            if (matched) return !n.negated;
+                        } else unknown = true;
+                    }
+                    return if (unknown) null else n.negated;
+                },
                 .and_op => {
                     const left = try truth(ctx, n.a);
                     if (left == false) return false;
@@ -656,7 +678,7 @@ pub fn Eval(comptime config: types.Config) type {
                 .aggregate => unreachable,
                 .values_row, .default_value => return error.Syntax,
                 .row_constructor => return error.UnsupportedStatement,
-                .row_compare => return boolCell(try truth(ctx, id)),
+                .row_compare, .row_in => return boolCell(try truth(ctx, id)),
                 .and_op, .or_op, .not_op, .test_op, .between, .in_list, .like => return boolCell(try truth(ctx, id)),
                 .unary => {
                     const value = try eval(ctx, n.a);
