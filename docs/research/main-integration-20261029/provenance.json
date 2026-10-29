@@ -1,0 +1,28 @@
+{
+  "implementation_commit": "56925f429ef5b3fc0a3f948ddfc766dc7e1957d3",
+  "upstream_main": "41d8dacb9198b31f0387f72490131d9a0a1ffa1f",
+  "legacy_master": "42deef76292d04ffb975720fcafd4e1c716fcb23",
+  "command": "sig build test-sql test-solana test-game -Doptimize=ReleaseSafe -j2 --Sig-lib-dir <matched-library>",
+  "compiler": "Sig 0.6.4",
+  "platform": "Windows x86_64",
+  "contracts": {
+    "sql": 32,
+    "solana": 5,
+    "game": 1
+  },
+  "exit_code": 0,
+  "native_build_summary": "294 total, 79 succeeded, 0 cached, 0 failed, 215 unrelated steps skipped",
+  "python_harness_tests": 9,
+  "code_sha256": {
+    "build.sig": "25edb0cf002ba27a2c3ec7e742641db0d2d8faffcbb8f9700634e4118550c669",
+    "src/core/sql.sig": "4d480ae9430c1234d4e10d896e4abc2b98de7b8c64ce950bdcb68b1cd55a1d4b",
+    "src/core/sql/ast.sig": "595f986fa8a5f12543c4994a16bb374b2d2ebd65f8fa4190ff58227427ea17c1",
+    "src/core/sql/binder.sig": "995ee379ab9ea6aac6b3a967fb2c3d54750e1ff357433edf1fe49dbf0789c9bd",
+    "src/core/sql/parser.sig": "04f82af4dd9cd19b28a223aec000908b488c479bd60a8c087a0ae407b8a5e22e",
+    "src/core/sql/expr.sig": "19c8688000ffdb08b56fcfa405c02e9c4a7df668468c8f9a85a2eb799f781e5e",
+    "src/core/sql/exec.sig": "5367b3f7d587182809fa3d0693e3ad7ba25187e45178c7f2fc08e8713776506e",
+    "src/core/sql/deparse.sig": "7c2be987be996d1e5d93b8d2b3510ac73398bdd375d1c19ef05ad563248043e9",
+    "src/core/sql/value.sig": "268296fd3207cdb693938bd19b258c6e369c8d863ca03110769e2e53ed3d69d6"
+  },
+  "scope": "Host contract validation only. No on-chain deployment, Android device execution or full SQL compatibility claim."
+}

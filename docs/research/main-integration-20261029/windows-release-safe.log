@@ -1,0 +1,152 @@
+compile: tests/test_sql.sig -> <WORKSPACE>\sig-out\bin\contract-sql.exe (200 modules)
+compile: tests/test_sql_index.sig -> <WORKSPACE>\sig-out\bin\contract-sql-index.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql.exe
+compile: tests/test_sql_storage.sig -> <WORKSPACE>\sig-out\bin\contract-sql-storage.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-index.exe
+compile: tests/test_sql_change_log.sig -> <WORKSPACE>\sig-out\bin\contract-sql-change-log.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-change-log.exe
+compile: tests/test_sql_expr.sig -> <WORKSPACE>\sig-out\bin\contract-sql-expr.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-storage.exe
+compile: tests/test_sql_distinct.sig -> <WORKSPACE>\sig-out\bin\contract-sql-distinct.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-expr.exe
+compile: tests/test_sql_minmax.sig -> <WORKSPACE>\sig-out\bin\contract-sql-minmax.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-distinct.exe
+compile: tests/test_sql_quantified.sig -> <WORKSPACE>\sig-out\bin\contract-sql-quantified.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-minmax.exe
+compile: tests/test_sql_row_predicates.sig -> <WORKSPACE>\sig-out\bin\contract-sql-row-predicates.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-quantified.exe
+compile: tests/test_sql_mvcc.sig -> <WORKSPACE>\sig-out\bin\contract-sql-mvcc.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-row-predicates.exe
+compile: tests/test_sql_types.sig -> <WORKSPACE>\sig-out\bin\contract-sql-types.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-mvcc.exe
+compile: tests/test_sql_query.sig -> <WORKSPACE>\sig-out\bin\contract-sql-query.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-types.exe
+compile: tests/test_sql_dml.sig -> <WORKSPACE>\sig-out\bin\contract-sql-dml.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-dml.exe
+compile: tests/test_sql_catalog.sig -> <WORKSPACE>\sig-out\bin\contract-sql-catalog.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-query.exe
+compile: tests/test_sql_external.sig -> <WORKSPACE>\sig-out\bin\contract-sql-external.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-catalog.exe
+compile: tests/test_sql_stream_group.sig -> <WORKSPACE>\sig-out\bin\contract-sql-stream-group.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-external.exe
+compile: tests/test_sql_stream_prefix.sig -> <WORKSPACE>\sig-out\bin\contract-sql-stream-prefix.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-stream-prefix.exe
+compile: tests/test_sql_factor_algebra.sig -> <WORKSPACE>\sig-out\bin\contract-sql-factor-algebra.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-factor-algebra.exe
+compile: tests/test_sql_factor_join.sig -> <WORKSPACE>\sig-out\bin\contract-sql-factor-join.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-stream-group.exe
+compile: tests/test_sql_factor_cte.sig -> <WORKSPACE>\sig-out\bin\contract-sql-factor-cte.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-factor-join.exe
+compile: tests/test_sql_block_presence.sig -> <WORKSPACE>\sig-out\bin\contract-sql-block-presence.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-factor-cte.exe
+compile: tests/test_sql_wide_dense.sig -> <WORKSPACE>\sig-out\bin\contract-sql-wide-dense.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-block-presence.exe
+compile: tests/test_sql_projected_filter.sig -> <WORKSPACE>\sig-out\bin\contract-sql-projected-filter.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-wide-dense.exe
+compile: tests/test_sql_work_control.sig -> <WORKSPACE>\sig-out\bin\contract-sql-work-control.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-work-control.exe
+compile: tests/test_sql_integer_topk.sig -> <WORKSPACE>\sig-out\bin\contract-sql-integer-topk.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-projected-filter.exe
+compile: tests/test_sql_layout_order.sig -> <WORKSPACE>\sig-out\bin\contract-sql-layout-order.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-integer-topk.exe
+compile: tests/test_sql_summary.sig -> <WORKSPACE>\sig-out\bin\contract-sql-summary.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-layout-order.exe
+compile: tests/test_sql_dense_group.sig -> <WORKSPACE>\sig-out\bin\contract-sql-dense-group.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-summary.exe
+compile: tests/test_sql_rollup.sig -> <WORKSPACE>\sig-out\bin\contract-sql-rollup.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-dense-group.exe
+compile: tests/test_sql_ordered_probes.sig -> <WORKSPACE>\sig-out\bin\contract-sql-ordered-probes.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-rollup.exe
+compile: tests/test_sql_compact_scan.sig -> <WORKSPACE>\sig-out\bin\contract-sql-compact-scan.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-ordered-probes.exe
+compile: tests/test_sql_runtime_workspace.sig -> <WORKSPACE>\sig-out\bin\contract-sql-runtime-workspace.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-compact-scan.exe
+compile: tests/test_solana_client.sig -> <WORKSPACE>\sig-out\bin\contract-solana-client.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-sql-runtime-workspace.exe
+compile: tests/test_solana_cpi.sig -> <WORKSPACE>\sig-out\bin\contract-solana-cpi.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-solana-cpi.exe
+compile: tests/test_solana_runtime.sig -> <WORKSPACE>\sig-out\bin\contract-solana-runtime.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-solana-client.exe
+compile: tests/test_ledger_game.sig -> <WORKSPACE>\sig-out\bin\contract-ledger-game.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-solana-runtime.exe
+compile: tests/test_solana_input.sig -> <WORKSPACE>\sig-out\bin\contract-solana-input.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-ledger-game.exe
+compile: tests/test_solana_core.sig -> <WORKSPACE>\sig-out\bin\contract-solana-core.exe (200 modules)
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-solana-input.exe
+compile: executable verified at <WORKSPACE>\sig-out\bin\contract-solana-core.exe
+{"suite":"sql","pass":true,"cases":14,"assertions":8431,"statements":1426,"fuzz_inputs":1313,"database_bytes":234176}
+{"suite":"sql-index","pass":true,"assertions":239627,"statements":50245,"model_steps":8192,"rejected":1928}
+{"suite":"sql-change-log","pass":true,"assertions":876,"rejected_flips":202,"accepted_flips":52}
+{"suite":"sql-storage","pass":true,"assertions":619,"small_bytes":216352,"server_profile_bytes":12688544,"server_versions_per_table":1024}
+{"suite":"sql-distinct","pass":true,"assertions":917}
+{"suite":"sql-expr","pass":true,"assertions":397,"database_bytes":319440,"wide_bytes":625392}
+{"suite":"sql-quantified","pass":true,"assertions":3582,"matrix_queries":1152,"matrix_fnv64":"7886b30b421deb63"}
+{"suite":"sql-minmax","pass":true,"assertions":49}
+{"suite":"sql-row-predicates","pass":true,"assertions":8430,"matrix_queries":4160,"matrix_fnv64":"c35321a7fe106b6f"}
+{"suite":"sql-mvcc","pass":true,"assertions":122,"database_bytes":209312}
+
+{"suite":"sql-types","pass":true,"assertions":4491,"database_bytes":567552}
+{"suite":"sql-query","pass":true,"assertions":63417,"database_bytes":483872,"big_bytes":1258176,"work_rows":512}
+{"suite":"sql-dml","pass":true,"assertions":220,"database_bytes":293344}
+{"suite":"sql-catalog","pass":true,"assertions":36,"database_bytes":273552}
+external-storage: 100000 rows, 21 assertions, database metadata 232368 bytes
+
+literal-work implicit used=732
+literal-work store=0 used=706
+prefix store=0 dimension_probes=20 rejected=224
+literal-work store=1 used=692
+prefix store=1 dimension_probes=18 rejected=225
+literal-work store=2 used=825
+prefix store=2 dimension_probes=39 rejected=225
+literal-work store=3 used=825
+prefix store=3 dimension_probes=38 rejected=225
+literal-work store=4 used=704
+prefix store=4 dimension_probes=21 rejected=225
+literal-work store=5 used=704
+prefix store=5 dimension_probes=20 rejected=225
+literal-work store=6 used=837
+prefix store=6 dimension_probes=41 rejected=225
+literal-work store=7 used=837
+prefix store=7 dimension_probes=41 rejected=225
+plan-local gathered=256 expected=256
+PASS stream prefix: 513 assertions, typed dates, exact independent row model, partial blocks, snapshots, NULL/error ordering and cancellation
+
+PASS factor algebra: 1712 assertions; flat joined rows=182609, factor products=2968; excludes scan/link-build costs; research prototype, SQL integration=false
+
+PASS SQL factor join: 1824 assertions, actual executor, scalar model, canonical equivalence, visibility and failure atomicity
+
+PASS SQL nested factor: 1141 assertions, canonical and scalar equivalence, fallback and failure atomicity
+
+PASS SQL block presence: 24441 assertions, exact scalar/canonical results, no false negatives, ownership/publication/compaction and identical work totals
+
+{"suite":"sql-stream-group","pass":true,"assertions":1702,"rows":100000,"query_refs":1024,"joined_rows":100000,"joined_query_refs":512}
+
+PASS projected filter: 959 assertions, independent scalar executor and row models
+
+PASS wide dense: 485432 assertions, 5003-key domain, exact wide sums/averages, NULLs, snapshots, aborts, cancellation and extreme keys
+
+PASS exact batched work control: 76801 assertions
+
+{"suite":"sql-integer-topk","pass":true,"assertions":3140}
+
+{"suite":"sql-layout-order","pass":true,"assertions":108}
+
+{"suite":"sql-summary","pass":true,"assertions":4136}
+
+{"suite":"sql-dense-group","pass":true,"assertions":610}
+
+{"suite":"sql-ordered-probes","pass":true,"assertions":188}
+
+{"suite":"sql-rollup","pass":true,"assertions":6409}
+
+{"suite":"runtime-workspace","passed":true,"assertions":153,"inline_bytes":246992}
+{"suite":"sql-compact-scan","pass":true,"assertions":23371}
+
+Solana client PASS: 29 assertions
+Solana CPI/Rent PASS: 27 assertions
+Solana runtime PASS: 26 assertions
+ZPM ledger-game contracts PASS: 53 assertions
+Solana input/PDA PASS: 10422 assertions
+Solana core PASS: 1082 assertions
+
+Build summary: 294 total, 79 succeeded, 0 cached, 0 failed, 215 skipped in 440849 ms

@@ -3,6 +3,20 @@
 2026-10-29. Branch `feat/sql-conformance-tdd`, isolated from concurrent RAMSQL
 performance work. Baseline: ZPM `53655a9a89a3ddff6f2f5829388b09a10c3d9c93`.
 
+## Main integration
+
+The SQL work was integrated with upstream main `41d8dac` and the useful changes
+from legacy master `42deef7`, preserving both histories. The only master merge
+conflict was build registration; SQL/performance and Solana/game registrations
+are all retained. The resulting native build passes 32 SQL, five Solana and one
+game contract executables, plus nine Python harness tests. Source hashes and
+the full Windows ReleaseSafe build log are recorded in
+[main integration provenance](research/main-integration-20261029/provenance.json).
+Historical milestone evidence below describes its original commits; it must not
+be mistaken for the current merged source fingerprint. The broad conformance
+audit remains incomplete, and host tests do not qualify on-chain or Android
+device deployment.
+
 ## Implemented in this batch
 
 - Scalar `IS DISTINCT FROM` and `IS NOT DISTINCT FROM`: grammar, common comparison
