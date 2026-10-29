@@ -233,7 +233,7 @@
     "stderr": ""
   },
   "native_oracle": "quantified_oracle.json",
-  "core_result": "core_smoke_results.ndjson",
+  "core_result": "core_smoke_results.stage2.ndjson",
   "core_result_sha256": "9d0c76d7efcb1ad44d2894a323c107e2fcb873273f3f9a8bca4be3cbe6bcfc90",
   "tdd_red": {
     "sql-quantified-red.log": "exit=1\n\nSELECT NULL = ANY(SELECT v FROM t WHERE (id=0 AND false) OR (id=1 AND false) OR (id=2 AND false) OR (id=3 AND false)): Syntax\nerror: Syntax\n",
@@ -251,5 +251,7 @@
     "streamed subquery reducers: current subqueries materialize in caller workspace",
     "Linux/macOS/SB0 execution",
     "complete SQL compatibility"
-  ]
+  ],
+  "record_type": "historical_second_batch_checkpoint",
+  "implementation_commit": "b2d8474fd3a51ea3dade97cee8efdf0112928640"
 }

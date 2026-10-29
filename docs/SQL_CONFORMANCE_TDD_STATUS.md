@@ -85,6 +85,44 @@ The semantic reference is PostgreSQL 18's
 [row and array comparisons](https://www.postgresql.org/docs/18/functions-comparisons.html)
 are separately specified and must not be inferred from these scalar-subquery tests.
 
+## Third batch: flat row-constructor predicates
+
+Explicit `ROW(a,b)` and implicit `(a,b)` constructors now support `= <> != < <= >
+>= IS DISTINCT FROM IS NOT DISTINCT FROM` against another flat constructor.
+Constructor `IS NULL` and `IS NOT NULL` tests follow their separate all-fields
+rules; neither is implemented as the complement of the other. Ordering stops at
+the first unequal or NULL pair, while equality can continue past NULLs to find a
+later mismatch. Empty constructors follow the native distinction: ordinary
+comparison is unsupported, distinctness and NULL tests have defined Boolean results.
+
+Binding builds a list of typed field pairs in caller-owned statement storage.
+Execution borrows stable column operands and uses fixed Cell scratch rather than
+constructing a heap record or copying every field into a temporary tuple. AST
+cloning, grouping rewrites, dependency walks, safe early filters and expression
+deparsing visit every field. Defaults/generated expressions survive kind-3 schema
+record replay without changing the log format.
+
+All 27 default SQL contract executables pass: 449,096 assertions. The focused row
+suite passes 8,430 assertions in ReleaseSafe and Debug. Native PostgreSQL 18.3
+passes the independent 4,160-case matrix plus 49 additional SQL probes, covering
+NULLs, order, types, sequence effects, correlation, grouping, DML and errors.
+Both implementations identify the matrix as `c35321a7fe106b6f`. Additional Sig
+contracts check schema replay, cancellation, exhausted AST grants and untouched
+results after failures. A 16-field predicate works with an eight-column result
+configuration; the explicit AST-budget test rejects excess work without truncation.
+
+Current proof is [row_evidence.json](../tests/sql_conformance/row_evidence.json),
+with [row_oracle.json](../tests/sql_conformance/row_oracle.json). The previous
+quantified record is historical at `b2d8474` and retains its archived smoke run.
+These are Windows correctness results, not database throughput measurements.
+
+This does not provide general record values. Projection/storage of records,
+nested records, field selection, whole-row/table-star expansion, row membership,
+quantified row comparisons and row BETWEEN remain open. Those scopes must not
+be inferred from a passing constructor-predicate test. Prepared-wire and other
+platform qualification also remain incomplete. Native semantics are specified in
+[PostgreSQL row comparisons](https://www.postgresql.org/docs/18/functions-comparisons.html).
+
 ## The broad audit remains red
 
 The [inventory](../tests/sql_conformance/README.md) contains 118 stable smoke
@@ -93,7 +131,7 @@ programs. Native PostgreSQL 18.3 accepted all 102 transaction-harness programs;
 `postgres18_oracle.json` with a manifest SHA-256, and generate an allocator-free
 Sig core test executable.
 
-Current core results: **3 smoke passes, 98 failures, 17 unexecuted scopes or
+Current core results: **4 smoke passes, 97 failures, 17 unexecuted scopes or
 comparators**. A smoke pass does not close a full feature family. A core utility
 rejection also does not establish what the server integration implements. The
 suite intentionally exits with an error until the declared scope is qualified.
@@ -105,9 +143,11 @@ administrative features and dialect-specific behaviors need additional contracts
 
 ## Next batches
 
-1. Row predicates, remaining quantified forms and predicate syntax: extend native
-   negative/type/NULL tests before implementation. Add streamed subquery reducers
-   behind independent result/state tests and explicit workspace accounting.
+1. Remaining row membership/quantified forms and general record values need
+   native type, NULL and volatile-operand tests first. Record payload ownership
+   and shape must be defined before exposing record results. Add streamed
+   subquery reducers behind independent result/state tests and explicit workspace
+   accounting; then continue the remaining predicate syntax.
 2. Expand semantic typing/function contracts, then relational composition,
    windows and grouping; retain independent reference execution and explicit
    optimizer legality checks.

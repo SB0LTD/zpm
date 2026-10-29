@@ -32,7 +32,7 @@
 //! jsonb.sig for their exact input/output rules. Expressions (design
 //! §4.1): AND/OR/NOT with three-valued logic, comparisons, IS [NOT]
 //! NULL/TRUE/FALSE/UNKNOWN and DISTINCT FROM, [NOT] IN lists, [NOT] BETWEEN, [NOT] LIKE/ILIKE,
-//! GREATEST/LEAST, `||`, checked arithmetic over the numeric and datetime types, AT TIME
+//! Flat ROW constructor comparisons and NULL tests, GREATEST/LEAST, `||`, checked arithmetic over the numeric and datetime types, AT TIME
 //! ZONE, the JSONB operators `-> ->> #> #>> @> <@ ?`, CASE, COALESCE, NULLIF,
 //! `::`/CAST, now() / CURRENT_TIMESTAMP / statement_timestamp() /
 //! clock_timestamp() / CURRENT_DATE, jsonb_typeof and jsonb_array_length,

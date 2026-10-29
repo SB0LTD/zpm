@@ -276,6 +276,19 @@ pub fn Exec(comptime config: types.Config) type {
                 if (id == none) return true;
                 const n = self.pool.nodes[id];
                 return switch (n.kind) {
+                    .row_compare => blk: {
+                        var item = n.b;
+                        while (item != none) : (item = self.pool.nodes[item].next) {
+                            const pair = self.pool.nodes[item];
+                            if (!self.earlyAvailable(pair.a, stage) or !self.earlyAvailable(pair.b, stage)) break :blk false;
+                        }
+                        break :blk true;
+                    },
+                    .row_constructor => blk: {
+                        var item = n.b;
+                        while (item != none) : (item = self.pool.nodes[item].next) if (!self.earlyAvailable(item, stage)) break :blk false;
+                        break :blk true;
+                    },
                     .column => n.level == 0 and n.relation <= stage,
                     .null_literal, .bool_literal, .int_literal, .text_literal, .decimal_literal => true,
                     .binary => switch (n.op) {

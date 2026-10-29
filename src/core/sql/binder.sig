@@ -926,6 +926,58 @@ pub fn Binder(comptime config: types.Config) type {
             return out;
         }
 
+        fn bindRowFields(context: *const Context, scope: *const Scope, id: u16) Error!void {
+            const row = context.node(id);
+            var item = row.b;
+            while (item != none) : (item = context.node(item).next) {
+                const field_node = context.node(item);
+                if (field_node.kind == .row_constructor) return error.UnsupportedStatement;
+                // A clone of a bound field retains its scope and plan IDs.
+                // Only unresolved fields need binding again (literals are
+                // idempotent; a bound subquery must not be rebound as syntax).
+                if (field_node.ty == .unknown) try typeExpr(context, scope, item);
+            }
+            row.constant = listConstant(context, row.b);
+        }
+
+        fn bindRowCompare(context: *const Context, scope: *const Scope, id: u16) Error!void {
+            const n = context.node(id);
+            if (context.node(n.a).kind != .row_constructor or context.node(n.b).kind != .row_constructor) return error.UndefinedFunction;
+            switch (n.op) { .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct => {}, else => return error.UndefinedFunction }
+            try bindRowFields(context, scope, n.a);
+            try bindRowFields(context, scope, n.b);
+            var left = context.node(n.a).b;
+            var right = context.node(n.b).b;
+            var l = left; var r = right;
+            while (l != none and r != none) { l = context.node(l).next; r = context.node(r).next; }
+            if (l != none or r != none) return error.Syntax;
+            if (left == none) {
+                if (n.op != .is_distinct and n.op != .is_not_distinct) return error.UnsupportedStatement;
+                n.* = .{ .kind = .bool_literal, .boolean = n.op == .is_not_distinct, .ty = .boolean, .constant = true, .next = n.next, .name = n.name };
+                return;
+            }
+            var head: u16 = none; var tail: u16 = none;
+            while (left != none) {
+                const left_next = context.node(left).next;
+                const right_next = context.node(right).next;
+                // Row fields require an operator even when one literal is
+                // NULL: unlike a scalar IS DISTINCT FROM NULL shortcut.
+                if (context.node(left).ty == .json or context.node(right).ty == .json) return error.UndefinedFunction;
+                const pair = try context.pool.add(.{ .kind = .binary, .op = n.op, .a = left, .b = right, .ty = .boolean });
+                const key = context.node(pair);
+                try comparable(context, &key.a, &key.b);
+                key.constant = isConstant(context, key.a) and isConstant(context, key.b);
+                try context.pool.raise(pair, key.a);
+                try context.pool.raise(pair, key.b);
+                if (head == none) head = pair else context.node(tail).next = pair;
+                tail = pair;
+                left = left_next; right = right_next;
+            }
+            n.* = .{ .kind = .row_compare, .op = n.op, .b = head, .ty = .boolean, .constant = listConstant(context, head), .next = n.next, .name = n.name, .depth = 1 };
+            var item = head;
+            while (item != none) : (item = context.node(item).next) try context.pool.raise(id, item);
+        }
+
         fn typeExpr(context: *const Context, scope: *const Scope, id: u16) Error!void {
             const n = context.node(id);
             n.constant = true;
@@ -942,6 +994,9 @@ pub fn Binder(comptime config: types.Config) type {
                 .param => return error.UndefinedParameter,
                 // DEFAULT outside an INSERT VALUES item or SET value (42601).
                 .values_row, .default_value => return error.Syntax,
+                .row_constructor => return error.UnsupportedStatement,
+                // Internal comparison lists have already bound every field.
+                .row_compare => { n.ty = .boolean; n.constant = listConstant(context, n.b); },
                 .function => try typeFunction(context, scope, n),
                 .when_arm => unreachable,
                 .column => {
@@ -960,6 +1015,7 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = isConstant(context, n.a);
                 },
                 .binary => {
+                    if (context.node(n.a).kind == .row_constructor or context.node(n.b).kind == .row_constructor) return bindRowCompare(context, scope, id);
                     try typeExpr(context, scope, n.a);
                     try typeExpr(context, scope, n.b);
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b);
@@ -995,6 +1051,17 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = isConstant(context, n.a);
                 },
                 .test_op => {
+                    if (context.node(n.a).kind == .row_constructor) {
+                        if (n.test_kind != .is_null and n.test_kind != .is_not_null) return error.TypeMismatch;
+                        try bindRowFields(context, scope, n.a);
+                        var item = context.node(n.a).b;
+                        while (item != none) : (item = context.node(item).next) {
+                            if (context.node(item).ty == .unknown) try coerce(context, item, .text);
+                        }
+                        n.ty = .boolean;
+                        n.constant = listConstant(context, context.node(n.a).b);
+                        return;
+                    }
                     try typeExpr(context, scope, n.a);
                     if (n.test_kind == .is_null or n.test_kind == .is_not_null) {
                         if (context.node(n.a).ty == .unknown) try coerce(context, n.a, .text);
@@ -1177,7 +1244,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn isPredicate(n: *const ast.Node) bool {
             return switch (n.kind) {
-                .test_op, .between, .in_list, .like => true,
+                .test_op, .between, .in_list, .like, .row_compare => true,
                 .binary => n.op == .eq or n.op == .ne or n.op == .lt or n.op == .le or n.op == .gt or n.op == .ge,
                 else => false,
             };
@@ -1905,7 +1972,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn listOwner(kind: ast.NodeKind) bool {
             return switch (kind) {
-                .in_list, .case_expr, .coalesce, .function => true,
+                .in_list, .case_expr, .coalesce, .function, .row_constructor, .row_compare => true,
                 else => false,
             };
         }

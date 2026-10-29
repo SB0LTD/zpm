@@ -1,0 +1,265 @@
+{
+  "baseline_commit": "b2d8474",
+  "qualification": "flat row-constructor predicates only; overall SQL conformance incomplete",
+  "platform": "Windows x86_64",
+  "compiler": "Sig 0.6.4",
+  "sdk": "portable-toolchain-0df/lib",
+  "hash_encoding": "UTF-8 with LF newlines",
+  "source_sha256": {
+    "build.sig": "322ce877db611d7085fbcb6462a406816c5d68859c01f36f90520df3de3972b4",
+    "src/core/sql.sig": "9fc0a65f2be8579a79d945c3b93f8ac8c12a419a3d22f9784d6fb8a536d8a3d0",
+    "tests/test_sql_row_predicates.sig": "bb7f0c9255eeab409796a338d67c497a7f43641cfb0129bbac4c0ebaaa3f7365",
+    "src/core/sql/alpha.sig": "ab1dea07858b623e116c29cd6e87d350d2b3719ee07f47c72492136a1e28005e",
+    "src/core/sql/ast.sig": "c2d09f64527460a23072dbed8c53e1ed603ab1abe749c06ee0f489c1c9347d48",
+    "src/core/sql/binder.sig": "39bdf53bce19ca12fe0c7038525895e6efbdea59665362bab93db529c88ddb78",
+    "src/core/sql/catalog.sig": "34f4fcaa5b6be43669af025eaf7ff4d400e694288556b351f8bd5d17f54fac79",
+    "src/core/sql/change_log.sig": "20c3c7338aa64ecdd15e9f3dfff31117088c7e941448fa4be77e3ac1c372f680",
+    "src/core/sql/deparse.sig": "7c2be987be996d1e5d93b8d2b3510ac73398bdd375d1c19ef05ad563248043e9",
+    "src/core/sql/dml.sig": "d9ba8ad47e9d9fbd6ef30b9836997b78ce602b7603b613c6dd7ea44b96fad311",
+    "src/core/sql/exec.sig": "40355890fe97320e5d9bb54efb5346a07c0db64b91fff400f1041f57c21536eb",
+    "src/core/sql/expr.sig": "15261251ef2274ec3e926d441eaeebbc66c84073300d49487e1f1ddf83c24d54",
+    "src/core/sql/float_text.sig": "b1134d049c22591520dbd6b841c7c428ab6ce2d8387fdeb46fe44d1e1bbb7402",
+    "src/core/sql/jsonb.sig": "33a0a8493dae230c1463f34177c6f2d6fb972c192b40b516b4c7c9d1b36bdbbd",
+    "src/core/sql/lexer.sig": "062b1cca75ae53b6cd616e1bf436df28d1c3868363113fc423c7aafc02fa8fc4",
+    "src/core/sql/locks.sig": "f91d6bb68611d4d22fe1d52afd3d5ebb304053c3a904bbdc35fb83a13351c657",
+    "src/core/sql/mvcc.sig": "ff1c9d6d1ea6343180359dff45b4955a296982d83d95a66cd20d49af5d71fcc4",
+    "src/core/sql/numeric.sig": "875cd7c813fa05922439de3e7f22c2a0512944a1547c5cdf06987ee7e6cdc434",
+    "src/core/sql/parser.sig": "04f82af4dd9cd19b28a223aec000908b488c479bd60a8c087a0ae407b8a5e22e",
+    "src/core/sql/sequence.sig": "884e8c5fc0502681affdf996508870a86b8e6a914ed113f29c37a9168c21b031",
+    "src/core/sql/sort.sig": "c3ed8c8f76ee6ac5d3c5151c82392bc611c075a2edda8d6e5b72bcf74eac9668",
+    "src/core/sql/storage.sig": "89a005dda8b3a0c330c09e515cad518894dd9fb522eb24bd936b1db575f8fe9a",
+    "src/core/sql/temporal.sig": "8e0f384dc6b2f6642d5b58f6e7848e280f91f9c69a9e47d9a1f760fd3c44348c",
+    "src/core/sql/types.sig": "d60f2680c3dfc0946e1f36b6f5da5bf6f100f25eeafabfb55e14cc0e16204209",
+    "src/core/sql/tzif.sig": "f34b74fd4446cfb4b381235beb2ecfe349c02345209b65feb06f4afcc736b0fd",
+    "src/core/sql/value.sig": "268296fd3207cdb693938bd19b258c6e369c8d863ca03110769e2e53ed3d69d6"
+  },
+  "default_sql_contract_count": 27,
+  "default_sql_assertions": 449096,
+  "regressions": {
+    "mode": "ReleaseSafe",
+    "results": [
+      {
+        "suite": "test_sql_index",
+        "source": "tests/test_sql_index.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"sql-index\",\"pass\":true,\"assertions\":239627,\"statements\":50245,\"model_steps\":8192,\"rejected\":1928}\n",
+        "stderr": ""
+      },
+      {
+        "suite": "test_sql",
+        "source": "tests/test_sql.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"sql\",\"pass\":true,\"cases\":14,\"assertions\":8431,\"statements\":1426,\"fuzz_inputs\":1313,\"database_bytes\":229904}\n",
+        "stderr": ""
+      },
+      {
+        "suite": "test_sql_change_log",
+        "source": "tests/test_sql_change_log.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"sql-change-log\",\"pass\":true,\"assertions\":876,\"rejected_flips\":202,\"accepted_flips\":52}\n",
+        "stderr": ""
+      },
+      {
+        "suite": "test_sql_storage",
+        "source": "tests/test_sql_storage.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"sql-storage\",\"pass\":true,\"assertions\":619,\"small_bytes\":212080,\"server_profile_bytes\":12684176,\"server_versions_per_table\":1024}\n",
+        "stderr": ""
+      },
+      {
+        "suite": "test_sql_distinct",
+        "source": "tests/test_sql_distinct.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"sql-distinct\",\"pass\":true,\"assertions\":917}\n",
+        "stderr": ""
+      },
+      {
+        "suite": "test_sql_expr",
+        "source": "tests/test_sql_expr.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"sql-expr\",\"pass\":true,\"assertions\":397,\"database_bytes\":315168,\"wide_bytes\":621136}\n",
+        "stderr": ""
+      },
+      {
+        "suite": "test_sql_minmax",
+        "source": "tests/test_sql_minmax.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"sql-minmax\",\"pass\":true,\"assertions\":49}\n",
+        "stderr": ""
+      },
+      {
+        "suite": "test_sql_quantified",
+        "source": "tests/test_sql_quantified.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"sql-quantified\",\"pass\":true,\"assertions\":3582,\"matrix_queries\":1152,\"matrix_fnv64\":\"7886b30b421deb63\"}\n",
+        "stderr": ""
+      },
+      {
+        "suite": "test_sql_mvcc",
+        "source": "tests/test_sql_mvcc.sig",
+        "exit": 0,
+        "stdout": "",
+        "stderr": "{\"suite\":\"sql-mvcc\",\"pass\":true,\"assertions\":122,\"database_bytes\":205040}\n"
+      },
+      {
+        "suite": "test_sql_row_predicates",
+        "source": "tests/test_sql_row_predicates.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"sql-row-predicates\",\"pass\":true,\"assertions\":8430,\"matrix_queries\":4160,\"matrix_fnv64\":\"c35321a7fe106b6f\"}\n",
+        "stderr": ""
+      },
+      {
+        "suite": "test_sql_types",
+        "source": "tests/test_sql_types.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"sql-types\",\"pass\":true,\"assertions\":4491,\"database_bytes\":563280}\n",
+        "stderr": ""
+      },
+      {
+        "suite": "test_sql_query",
+        "source": "tests/test_sql_query.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"sql-query\",\"pass\":true,\"assertions\":63417,\"database_bytes\":479584,\"big_bytes\":1253904,\"work_rows\":512}\n",
+        "stderr": ""
+      },
+      {
+        "suite": "test_sql_dml",
+        "source": "tests/test_sql_dml.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"sql-dml\",\"pass\":true,\"assertions\":220,\"database_bytes\":289040}\n",
+        "stderr": ""
+      },
+      {
+        "suite": "test_sql_catalog",
+        "source": "tests/test_sql_catalog.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"sql-catalog\",\"pass\":true,\"assertions\":36,\"database_bytes\":269280}\n",
+        "stderr": ""
+      },
+      {
+        "suite": "test_sql_external",
+        "source": "tests/test_sql_external.sig",
+        "exit": 0,
+        "stdout": "",
+        "stderr": "external-storage: 100000 rows, 21 assertions, database metadata 228128 bytes\n"
+      },
+      {
+        "suite": "test_sql_stream_prefix",
+        "source": "tests/test_sql_stream_prefix.sig",
+        "exit": 0,
+        "stdout": "",
+        "stderr": "prefix store=0 dimension_probes=61 rejected=224\nprefix store=1 dimension_probes=59 rejected=225\nprefix store=2 dimension_probes=59 rejected=225\nprefix store=3 dimension_probes=59 rejected=225\nprefix store=4 dimension_probes=59 rejected=225\nprefix store=5 dimension_probes=59 rejected=225\nprefix store=6 dimension_probes=59 rejected=225\nprefix store=7 dimension_probes=59 rejected=225\nPASS stream prefix: 284 assertions, typed dates, exact independent row model, partial blocks, snapshots, NULL/error ordering and cancellation\n"
+      },
+      {
+        "suite": "test_sql_projected_filter",
+        "source": "tests/test_sql_projected_filter.sig",
+        "exit": 0,
+        "stdout": "",
+        "stderr": "PASS projected filter: 959 assertions, independent scalar executor and row models\n"
+      },
+      {
+        "suite": "test_sql_work_control",
+        "source": "tests/test_sql_work_control.sig",
+        "exit": 0,
+        "stdout": "",
+        "stderr": "PASS exact batched work control: 76801 assertions\n"
+      },
+      {
+        "suite": "test_sql_stream_group",
+        "source": "tests/test_sql_stream_group.sig",
+        "exit": 0,
+        "stdout": "",
+        "stderr": "{\"suite\":\"sql-stream-group\",\"pass\":true,\"assertions\":1702,\"rows\":100000,\"query_refs\":1024,\"joined_rows\":100000,\"joined_query_refs\":512}\n"
+      },
+      {
+        "suite": "test_sql_integer_topk",
+        "source": "tests/test_sql_integer_topk.sig",
+        "exit": 0,
+        "stdout": "",
+        "stderr": "{\"suite\":\"sql-integer-topk\",\"pass\":true,\"assertions\":3140}\n"
+      },
+      {
+        "suite": "test_sql_layout_order",
+        "source": "tests/test_sql_layout_order.sig",
+        "exit": 0,
+        "stdout": "",
+        "stderr": "{\"suite\":\"sql-layout-order\",\"pass\":true,\"assertions\":108}\n"
+      },
+      {
+        "suite": "test_sql_summary",
+        "source": "tests/test_sql_summary.sig",
+        "exit": 0,
+        "stdout": "",
+        "stderr": "{\"suite\":\"sql-summary\",\"pass\":true,\"assertions\":4136}\n"
+      },
+      {
+        "suite": "test_sql_dense_group",
+        "source": "tests/test_sql_dense_group.sig",
+        "exit": 0,
+        "stdout": "",
+        "stderr": "{\"suite\":\"sql-dense-group\",\"pass\":true,\"assertions\":610}\n"
+      },
+      {
+        "suite": "test_sql_rollup",
+        "source": "tests/test_sql_rollup.sig",
+        "exit": 0,
+        "stdout": "",
+        "stderr": "{\"suite\":\"sql-rollup\",\"pass\":true,\"assertions\":6409}\n"
+      },
+      {
+        "suite": "test_sql_ordered_probes",
+        "source": "tests/test_sql_ordered_probes.sig",
+        "exit": 0,
+        "stdout": "",
+        "stderr": "{\"suite\":\"sql-ordered-probes\",\"pass\":true,\"assertions\":188}\n"
+      },
+      {
+        "suite": "test_sql_compact_scan",
+        "source": "tests/test_sql_compact_scan.sig",
+        "exit": 0,
+        "stdout": "",
+        "stderr": "{\"suite\":\"sql-compact-scan\",\"pass\":true,\"assertions\":23371}\n"
+      },
+      {
+        "suite": "test_sql_runtime_workspace",
+        "source": "tests/test_sql_runtime_workspace.sig",
+        "exit": 0,
+        "stdout": "{\"suite\":\"runtime-workspace\",\"passed\":true,\"assertions\":153,\"inline_bytes\":242720}\n",
+        "stderr": ""
+      }
+    ],
+    "pending": [],
+    "all_passed": true
+  },
+  "focused_modes": [
+    {
+      "mode": "ReleaseSafe",
+      "exit": 0,
+      "stdout": "{\"suite\":\"sql-row-predicates\",\"pass\":true,\"assertions\":8430,\"matrix_queries\":4160,\"matrix_fnv64\":\"c35321a7fe106b6f\"}\n",
+      "stderr": ""
+    },
+    {
+      "mode": "Debug",
+      "exit": 0,
+      "stdout": "{\"suite\":\"sql-row-predicates\",\"pass\":true,\"assertions\":8430,\"matrix_queries\":4160,\"matrix_fnv64\":\"c35321a7fe106b6f\"}\n",
+      "stderr": ""
+    }
+  ],
+  "native_oracle": "row_oracle.json",
+  "core_result": "core_smoke_results.ndjson",
+  "core_result_sha256": "f18845c2c2dfb5bd8d7f5d7355c5ce3790906d6589430317feaea876b2d4c3d2",
+  "tdd_red": "exit=1\n\nSELECT ROW(NULL,NULL) = ROW(NULL,NULL): UndefinedFunction\nerror: UndefinedFunction\n",
+  "harness_tests": {
+    "passed": 9,
+    "command": "python -m unittest discover -s tests/sql_conformance -p test_audit.py"
+  },
+  "validation_note": "All 27 contracts passed. Two additional correlation/grouping probes were then added and the row suite alone was rerun in ReleaseSafe and Debug, with a fresh native-oracle run; SQL implementation files remained unchanged.",
+  "open_scopes": [
+    "standalone/stored record payloads and field selection",
+    "nested record values",
+    "row IN/ANY/ALL and BETWEEN",
+    "whole-row references and ROW(table.*) expansion",
+    "prepared-wire, cross-platform and concurrency qualification",
+    "full SQL compatibility"
+  ]
+}

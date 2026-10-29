@@ -108,13 +108,18 @@ pub const NodeKind = enum {
     values_row,
     /// The DEFAULT keyword as an INSERT VALUES item or SET value.
     default_value,
+    /// Structural ROW(...) / (x,y), only in qualified predicate contexts.
+    /// Members are `b` -> next; this is not a scalar record value type.
+    row_constructor,
+    /// Bound field-pair comparisons in `b` -> next, with the row operator `op`.
+    row_compare,
 };
 
 /// Children by kind: unary/not/test/cast `a`; binary/and/or/nullif `a`,`b`;
 /// between `a` BETWEEN `b` AND `c`; in_list `a` IN (`b` -> next ...);
 /// like `a` LIKE `b`; case_expr operand `a` (or none), arms `b` -> next,
 /// ELSE `c`; when_arm condition `a`, result `b`; coalesce/function args `b`
-/// -> next.
+/// -> next. row_constructor/row_compare own a `b` -> next list.
 pub const Node = struct {
     kind: NodeKind = .null_literal,
     op: Op = .add,

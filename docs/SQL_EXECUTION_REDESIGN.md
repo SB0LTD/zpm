@@ -124,6 +124,23 @@ must cover the exact predicate and visible snapshot, with correct update/delete
 invalidation. None of these future physical reducers is implemented by the
 normalization change.
 
+## Row-predicate implementation and record-value boundary
+
+Flat constructor predicates now bind scalar field pairs once in the statement
+pool and evaluate them directly. Lexicographic ordering needs at most the first
+decisive pair; equality must preserve an unknown result until a later unequal
+pair can override it. Constructor NULL tests are conjunctions of per-field NULL
+or non-NULL tests. Borrowed operands and two Cell scratch slots avoid a temporary
+tuple allocation or a width-sized array of copied Cells during comparison.
+This is constant additional scratch with respect to constructor width, not a
+claim of constant memory for the whole query.
+
+The structural constructor is not mislabeled as a scalar record type: record
+projection/storage is rejected until typed payload ownership exists. General
+records require caller-budgeted shape descriptors and owned/borrowed value
+regions, result-lifetime rules, schema-dependent codecs and recovery contracts.
+They must not be implemented by returning a text cell under a fake record type.
+
 ## Layer ownership
 
 ZPM owns reusable AST/binding/type rules, relational operators, storage and

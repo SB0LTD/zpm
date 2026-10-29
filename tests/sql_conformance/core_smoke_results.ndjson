@@ -22,7 +22,7 @@
 {"id":"PG.QUERY.MODIFYING_CTE","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.QUERY.CTE_MATERIALIZATION","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.QUERY.RECURSIVE_SEARCH","status":"incomplete","statement":4,"detail":"Syntax"}
-{"id":"PG.QUERY.ROW","status":"incomplete","statement":4,"detail":"UndefinedFunction"}
+{"id":"PG.QUERY.ROW","status":"core_smoke_pass","statement":4,"detail":""}
 {"id":"PG.QUERY.VALUES_TABLE","status":"incomplete","statement":4,"detail":"UnsupportedStatement"}
 {"id":"PG.QUERY.SAMPLE","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.QUERY.FETCH_TIES","status":"incomplete","statement":4,"detail":"Syntax"}

@@ -23,7 +23,7 @@ No calendar promise or universal speedup is implied. A release claiming complete
 
 ## Concrete smoke specifications
 
-Current core run: **3 smoke passes, 98 failures, 17 unexecuted scopes/comparators**. These are probes selected to expose gaps, not a percentage of PostgreSQL compatibility. Core-only rejection of a server utility does not prove absence in the server integration layer.
+Current core run: **4 smoke passes, 97 failures, 17 unexecuted scopes/comparators**. These are probes selected to expose gaps, not a percentage of PostgreSQL compatibility. Core-only rejection of a server utility does not prove absence in the server integration layer.
 
 | ID | Feature | Core smoke status |
 |---|---|---|
@@ -51,7 +51,7 @@ Current core run: **3 smoke passes, 98 failures, 17 unexecuted scopes/comparator
 | PG.QUERY.MODIFYING_CTE | Data-modifying CTE | Syntax |
 | PG.QUERY.CTE_MATERIALIZATION | CTE materialization syntax | Syntax |
 | PG.QUERY.RECURSIVE_SEARCH | Recursive SEARCH/CYCLE | Syntax |
-| PG.QUERY.ROW | Row expressions/comparison | UndefinedFunction |
+| PG.QUERY.ROW | Flat constructor comparison predicates | pass; record values and remaining row forms unqualified |
 | PG.QUERY.VALUES_TABLE | Standalone VALUES/TABLE | UnsupportedStatement |
 | PG.QUERY.SAMPLE | TABLESAMPLE | Syntax |
 | PG.QUERY.FETCH_TIES | FETCH WITH TIES | Syntax |
@@ -198,7 +198,23 @@ multi-session schedules are covered separately in Sig, not by this single-sessio
 native run. Quantified support currently covers SELECT-context scalar subqueries and ordinary
 `= <> != < <= > >=`; arrays, rows, LIKE/ILIKE/custom operators remain unqualified.
 DML contexts remain unqualified. All 26 default SQL contracts pass; the complete
-current source/evidence record is `quantified_evidence.json`. The original
+second-batch source/evidence record is `quantified_evidence.json`. The original
 `evidence.json` is historical and refers to the archived first-batch smoke run.
+
+The current record is `row_evidence.json`: 27 passing default SQL contracts and
+449,096 assertions. Its constructor-predicate suite has 8,430 assertions in both
+ReleaseSafe and Debug. `row_oracle.json` records 4,160 independent matrix cases
+and 49 additional PostgreSQL 18.3 probes. Reproduce the native part with:
+
+```powershell
+python tests/sql_conformance/verify_row_oracle.py --port 55491 --report .sig-cache/row-oracle.json
+```
+
+`contract-sql-row-predicates` covers flat constructor-to-constructor comparisons
+and constructor NULL tests, including DML, grouping and scalar-subquery fields.
+Record payloads, nested records, whole-row expansion, field selection and remaining
+row membership/quantified forms are unqualified. Standalone/nested record examples
+are explicitly rejected in the Sig suite and are excluded from native passing
+scope; they are not counted as compatibility successes.
 
 SQLancer-style TLP, NoREC and constant-folding metamorphic tests are additional oracles, not substitutes for native differential and crash tests. See [SQLancer papers](https://github.com/sqlancer/sqlancer/blob/main/docs/PAPERS.md) and [CODDTest](https://doi.org/10.1145/3709674). Bounded equivalence can strengthen optimizer checks but remains bounded: [VeriEQL](https://arxiv.org/abs/2403.03193).

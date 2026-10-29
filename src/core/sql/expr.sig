@@ -453,10 +453,41 @@ pub fn Eval(comptime config: types.Config) type {
             return if (value) |b| .{ .boolean = b } else .null_value;
         }
 
+        fn rowTruth(ctx: *const Context, n: *const ast.Node) Error!?bool {
+            var unknown = false;
+            var item = n.b;
+            while (item != none) : (item = node(ctx, item).next) {
+                try ctx.session.checkpoint();
+                const pair = node(ctx, item);
+                var left_value: V.Cell = undefined; var right_value: V.Cell = undefined;
+                const left = try operandRef(ctx, pair.a, &left_value);
+                const right = try operandRef(ctx, pair.b, &right_value);
+                switch (n.op) {
+                    .is_distinct, .is_not_distinct => {
+                        if (compareOp(.is_distinct, left, right).?) return n.op == .is_distinct;
+                    },
+                    .eq, .ne => {
+                        if (compareOp(.eq, left, right)) |equal| {
+                            if (!equal) return n.op == .ne;
+                        } else unknown = true;
+                    },
+                    .lt, .le, .gt, .ge => {
+                        if (left.* == .null_value or right.* == .null_value) return null;
+                        const order = V.compare(left, right);
+                        if (order != 0) return if (n.op == .lt or n.op == .le) order < 0 else order > 0;
+                    },
+                    else => unreachable,
+                }
+            }
+            if (unknown) return null;
+            return switch (n.op) { .eq, .le, .ge, .is_not_distinct => true, .ne, .lt, .gt, .is_distinct => false, else => unreachable };
+        }
+
         /// Evaluates a boolean-typed expression to TRUE, FALSE or NULL.
         pub fn truth(ctx: *const Context, id: u16) Error!?bool {
             const n = node(ctx, id);
             switch (n.kind) {
+                .row_compare => return rowTruth(ctx, n),
                 .and_op => {
                     const left = try truth(ctx, n.a);
                     if (left == false) return false;
@@ -479,6 +510,16 @@ pub fn Eval(comptime config: types.Config) type {
                 },
                 .test_op => {
                     if (n.test_kind == .is_null or n.test_kind == .is_not_null) {
+                        const arg = node(ctx, n.a);
+                        if (arg.kind == .row_constructor) {
+                            var item = arg.b;
+                            while (item != none) : (item = node(ctx, item).next) {
+                                var scratch: V.Cell = undefined;
+                                const field = try evalRef(ctx, item, &scratch);
+                                if ((field.* == .null_value) != (n.test_kind == .is_null)) return false;
+                            }
+                            return true;
+                        }
                         const value = try eval(ctx, n.a);
                         return (value == .null_value) == (n.test_kind == .is_null);
                     }
@@ -612,6 +653,8 @@ pub fn Eval(comptime config: types.Config) type {
                 },
                 .aggregate => unreachable,
                 .values_row, .default_value => return error.Syntax,
+                .row_constructor => return error.UnsupportedStatement,
+                .row_compare => return boolCell(try truth(ctx, id)),
                 .and_op, .or_op, .not_op, .test_op, .between, .in_list, .like => return boolCell(try truth(ctx, id)),
                 .unary => {
                     const value = try eval(ctx, n.a);

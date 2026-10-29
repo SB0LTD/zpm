@@ -1646,6 +1646,19 @@ pub fn Parser(comptime config: types.Config) type {
                         return self.pool.add(.{ .kind = .scalar_subquery, .integer = query_index });
                     }
                     const inner = try self.expression();
+                    if (self.mode == .standard and try self.takeSymbol(.comma)) {
+                        const row = try self.pool.add(.{ .kind = .row_constructor, .b = inner });
+                        var last = inner;
+                        while (true) {
+                            const item = try self.expression();
+                            self.pool.nodes[last].next = item;
+                            try self.pool.raise(row, item);
+                            last = item;
+                            if (!try self.takeSymbol(.comma)) break;
+                        }
+                        try self.expectSymbol(.rparen);
+                        return row;
+                    }
                     try self.expectSymbol(.rparen);
                     return inner;
                 },
@@ -1657,6 +1670,16 @@ pub fn Parser(comptime config: types.Config) type {
                 if (try self.takeWord("TRUE")) return self.pool.add(.{ .kind = .bool_literal, .boolean = true });
                 if (try self.takeWord("FALSE")) return self.pool.add(.{ .kind = .bool_literal, .boolean = false });
                 if (try self.takeWord("CASE")) return self.caseExpr();
+                if (self.mode == .standard and self.isWord("ROW") and lparenNext(try self.peek())) {
+                    try self.advance();
+                    const after = try self.peek();
+                    if (after.kind == .symbol and after.symbol == .rparen) {
+                        try self.advance();
+                        try self.advance();
+                        return self.pool.add(.{ .kind = .row_constructor });
+                    }
+                    return self.arguments(.row_constructor, false);
+                }
                 if (try self.takeWord("CAST")) {
                     try self.expectSymbol(.lparen);
                     const inner = try self.expression();

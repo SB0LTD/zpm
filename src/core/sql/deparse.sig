@@ -108,15 +108,42 @@ pub fn Deparse(comptime config: types.Config) type {
                 .div => " / ",
                 .mod => " % ",
                 .concat => " || ",
+                .eq => " = ", .ne => " <> ", .lt => " < ",
+                .le => " <= ", .gt => " > ", .ge => " >= ",
                 .is_distinct => " IS DISTINCT FROM ",
                 .is_not_distinct => " IS NOT DISTINCT FROM ",
                 else => null,
             };
         }
 
+        fn rowText(context: *const Context, head: u16, pair_side: ?bool, w: *Writer) Error!void {
+            try w.bytes("ROW(");
+            var item = head; var first = true;
+            while (item != none) : (item = context.node(item).next) {
+                if (!first) try w.bytes(", ");
+                const field = if (pair_side) |right| (if (right) context.node(item).b else context.node(item).a) else item;
+                try expression(context, field, w);
+                first = false;
+            }
+            try w.bytes(")");
+        }
+
         fn expression(context: *const Context, id: u16, w: *Writer) Error!void {
             const n = context.node(id);
             switch (n.kind) {
+                .row_constructor => try rowText(context, n.b, null, w),
+                .row_compare => {
+                    try w.bytes("(");
+                    try rowText(context, n.b, false, w);
+                    try w.bytes(opText(n.op) orelse return error.UnsupportedStatement);
+                    try rowText(context, n.b, true, w);
+                    try w.bytes(")");
+                },
+                .test_op => {
+                    try w.bytes("(");
+                    try expression(context, n.a, w);
+                    try w.bytes(switch (n.test_kind) { .is_null => " IS NULL)", .is_not_null => " IS NOT NULL)", else => return error.UnsupportedStatement });
+                },
                 .int_literal => try integer(n.integer, w),
                 .decimal_literal => try w.bytes(n.name.span.slice(context.source)),
                 .bool_literal => try w.bytes(if (n.boolean) "true" else "false"),
