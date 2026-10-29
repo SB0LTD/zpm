@@ -1808,6 +1808,8 @@ pub fn Database(comptime config: Config) type {
             const count = try self.catalog.create(index, table, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
             if (create.identity) |identity| try self.createSequence(slot, identity.name, identity.spec, table.oid, identity.column, snap);
+            const generated_context = self.bindContext("", .standard, snap);
+            try B.validateGenerated(&generated_context, index);
             return 0;
         }
 

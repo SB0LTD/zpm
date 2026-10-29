@@ -19,6 +19,36 @@ device deployment.
 
 ## Implemented in this batch
 
+### Follow-up: stored expression source ownership
+
+Deferred validation now resolves literal spans against the owning stored
+column expression, instead of the surrounding CREATE/INSERT/UPDATE/COPY SQL.
+Strict NULL comparison nodes reuse their existing integer metadata slot for
+an owner index; no source pointer is retained and the AST node size is unchanged.
+DDL defaults are type-checked without prematurely evaluating discarded
+constants. Needed defaults are validated when binding the consuming statement;
+defaults overridden by supplied values or unchanged UPDATE columns are not bound.
+The masks cover VALUES rows, INSERT SELECT, conflict updates and COPY mapping.
+
+Generated expressions are bound against caller-owned candidate table metadata
+before CREATE publishes. Detected binding and discarded-constant errors abort it;
+the table is absent afterward and the name can be reused. This does not qualify
+every generated-column restriction, such as volatility or generated dependencies.
+
+The new test first failed with InvalidTextRepresentation on a valid numeric
+default. It now passes 75 assertions in Windows ReleaseSafe and Debug; 30 native
+PostgreSQL 18.3 probes confirm default/generated error phases, source independence,
+unused defaults, updates, conflict handling and rollback. Sig additionally checks
+COPY components, cancellation/work exhaustion and schema replay after overwriting
+the original record buffer. Fifteen Python tests verify harness/evidence identity.
+See [source oracle](../tests/sql_conformance/sources_oracle.json) and
+[contract](../tests/test_sql_expression_sources.sig).
+
+This closes the stored-source audit item identified in the ESCAPE batch.
+General planner error-order equivalence and complete generated-column constraints
+remain unqualified. Storage remains caller-owned and existing AST budgets apply.
+Performance remains to be measured independently of these correctness tests.
+
 ### Follow-up: LIKE / ILIKE ESCAPE
 
 LIKE/ILIKE and their negated forms now accept ESCAPE expressions: empty disables

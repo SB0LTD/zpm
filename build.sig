@@ -113,6 +113,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-row-null-candidates", "tests/test_sql_row_null_candidates.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-between", "tests/test_sql_between.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-like-escape", "tests/test_sql_like_escape.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-expression-sources", "tests/test_sql_expression_sources.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-nullif-types", "tests/test_sql_nullif_types.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-mvcc", "tests/test_sql_mvcc.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-types", "tests/test_sql_types.sig", &.{importEntry("sql", "src/core/sql.sig")});
