@@ -206,6 +206,8 @@ pub const Error = error{
     InvalidRowCountInResultOffset,
     /// SQLSTATE 428C9: a value assigned to a GENERATED ALWAYS column.
     GeneratedAlways,
+    /// SQLSTATE 42P17: invalid generated-column definition.
+    InvalidObjectDefinition,
     /// SQLSTATE 2200H: nextval reached the sequence bound without CYCLE.
     SequenceLimit,
     /// SQLSTATE 55000: currval/lastval before nextval in this session.

@@ -19,6 +19,37 @@ device deployment.
 
 ## Implemented in this batch
 
+### Follow-up: stored generated-column restrictions (2026-10-30)
+
+Stored generation now rejects active mutable functions and context-sensitive
+casts/operators with InvalidObjectDefinition (SQLSTATE 42P17). Self-references
+and references to other generated columns are rejected even inside discarded
+branches. Subqueries are rejected with 0A000; aggregate binding retains 42803.
+Built-in immutability/strictness metadata is separate from physical retry safety.
+Ordinary defaults retain their permitted volatile behavior.
+
+A scoped planning pass reduces supported CASE, COALESCE, NULLIF, strict NULL
+and Boolean-annihilator forms before checking immutability. Functions removed by
+these reductions are never executed. Replacements preserve coercion boundaries,
+including int4 overflow before widening to int8. Unreachable pool nodes are
+excluded from deferred validation; reachable stored operands keep their source
+owner. Constants use existing AST slots, with no heap allocation or node-size
+increase. No claim of complete PostgreSQL expression-planner equivalence follows.
+
+The first contract failed because an active nextval-generated column was
+accepted. The completed suite passes 132 assertions in Windows ReleaseSafe and
+Debug, including no sequence/clock effects during planning, hidden mutable calls,
+generated dependencies, casts, arithmetic, rollback, replay and interruption
+after candidate CREATE metadata exists. Native PostgreSQL 18.3 passes 52 probes.
+Sixteen Python tests validate harness/evidence identity. The protocol mapping
+contract explicitly checks 42P17. See
+[generated oracle](../tests/sql_conformance/generated_oracle.json) and
+[contract](../tests/test_sql_generated_restrictions.sig).
+
+Virtual generation, inheritance/partitioning, system-column rules, additional
+planner reductions and complete coercion/overload coverage remain unqualified.
+These finite results do not close the entire generated-column feature family.
+
 ### Follow-up: stored expression source ownership
 
 Deferred validation now resolves literal spans against the owning stored

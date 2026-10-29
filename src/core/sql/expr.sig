@@ -157,7 +157,7 @@ pub fn like(text: []const u8, pattern: []const u8, insensitive: bool) Error!bool
     return likeEscape(text, pattern, "\\", insensitive);
 }
 
-fn validateEscape(escape: []const u8) Error!void {
+pub fn validateLikeEscape(escape: []const u8) Error!void {
     if (escape.len == 0) return;
     if (escape.len > 4 or !@import("std").unicode.utf8ValidateSlice(escape) or utf8Length(escape[0]) != escape.len) return error.InvalidEscapeSequence;
 }
@@ -169,7 +169,7 @@ fn escapeAt(pattern: []const u8, at: usize, escape: []const u8) bool {
 /// Empty disables escaping; otherwise escape is exactly one UTF-8 character.
 /// Matching uses constant scratch and scans the original pattern directly.
 pub fn likeEscape(text: []const u8, pattern: []const u8, escape: []const u8, insensitive: bool) Error!bool {
-    try validateEscape(escape);
+    try validateLikeEscape(escape);
     return likeMatch(text, pattern, escape, insensitive, null);
 }
 
@@ -653,7 +653,7 @@ pub fn Eval(comptime config: types.Config) type {
                     // the outer LIKE operator, after evaluating both arguments.
                     if (pattern == .null_value or (n.c != none and escape == .null_value)) return null;
                     const escape_text: []const u8 = if (n.c == none) "\\" else escape.text.slice();
-                    try validateEscape(escape_text);
+                    try validateLikeEscape(escape_text);
                     if (value == .null_value) return null;
                     const matched = try likeMatch(value.text.slice(), pattern.text.slice(), escape_text, n.insensitive, ctx.session.control);
                     return matched != n.negated;

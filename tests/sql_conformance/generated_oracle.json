@@ -1,0 +1,25 @@
+{
+  "target": "PostgreSQL 18.3",
+  "qualification": "stored_generated_restrictions",
+  "matrix_queries": 0,
+  "extra_probes": 52,
+  "failures": [],
+  "unsupported_examples": [],
+  "excluded_dimensions": [
+    "virtual generated columns",
+    "inheritance and partitioning",
+    "system columns",
+    "complete planner reductions and coercion overloads",
+    "schema replay",
+    "work/cancellation budgets"
+  ],
+  "oracle_version": [
+    [
+      "PostgreSQL 18.3 on x86_64-windows, compiled by msvc-19.44.35222, 64-bit"
+    ]
+  ],
+  "matrix_fnv64": "cbf29ce484222325",
+  "hash_encoding": "UTF-8 with LF newlines",
+  "contract_sha256": "f0d0a1c6217b996703171976bdacf5d3738931e325cfe917dfbf1dec6c6ad962",
+  "oracle_script_sha256": "8a4697d0230dc5ef7e400d99df5b668df336441b3bddcba89963df72dc9f3d2f"
+}

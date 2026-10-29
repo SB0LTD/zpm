@@ -832,14 +832,225 @@ pub fn Binder(comptime config: types.Config) type {
             sub.source = column.expression.slice();
             const start = context.pool.len;
             const id = try P.parseExpression(sub.source, context.pool);
+            if (row_table != null) try generatedSubqueries(&sub, id);
             const scope: Scope = if (row_table) |table| tableScope(&sub, table) else .{};
             try typeExpr(&sub, &scope, id);
             const assigned = try assignment(&sub, id, column);
+            if (row_table) |table| {
+                try generatedReferences(&sub, assigned, table);
+                try simplifyGenerated(&sub, assigned);
+                if (!immutableGenerated(&sub, assigned)) return error.InvalidObjectDefinition;
+            }
             // Store an index, never a pointer into temporary CREATE metadata.
             for (context.pool.nodes[start..context.pool.len]) |*n| {
-                if (n.kind == .row_compare and n.a != none) n.integer = source_owner;
+                if (n.kind == .row_compare and n.a != none) n.integer = -1;
             }
+            markStoredSources(&sub, assigned, source_owner);
             return assigned;
+        }
+
+        fn markStoredSources(context: *const Context, id: u16, owner: i64) void {
+            if (id == none) return;
+            const n = context.node(id);
+            if (n.kind == .row_compare and n.a != none) n.integer = owner;
+            markStoredSources(context, n.a, owner);
+            markStoredSources(context, n.c, owner);
+            if (listOwner(n.kind)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) markStoredSources(context, item, owner);
+            } else markStoredSources(context, n.b, owner);
+        }
+
+        fn generatedSubqueries(context: *const Context, id: u16) Error!void {
+            if (id == none) return;
+            const n = context.node(id);
+            switch (n.kind) { .scalar_subquery, .exists_subquery, .in_subquery => return error.UnsupportedStatement, else => {} }
+            try generatedSubqueries(context, n.a);
+            try generatedSubqueries(context, n.c);
+            if (listOwner(n.kind)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) try generatedSubqueries(context, item);
+            } else try generatedSubqueries(context, n.b);
+        }
+
+        fn generatedReferences(context: *const Context, id: u16, table: usize) Error!void {
+            if (id == none) return;
+            const n = context.node(id);
+            if (n.kind == .column and n.level == 0 and n.relation == 0 and context.tables[table].columns[n.column].default_kind == .generated) return error.InvalidObjectDefinition;
+            try generatedReferences(context, n.a, table);
+            try generatedReferences(context, n.c, table);
+            if (listOwner(n.kind)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) try generatedReferences(context, item, table);
+            } else try generatedReferences(context, n.b, table);
+        }
+
+        fn knownNull(context: *const Context, id: u16) bool {
+            if (id == none) return false;
+            const n = context.node(id);
+            return n.kind == .null_literal or (n.kind == .cast and knownNull(context, n.a));
+        }
+
+        fn immutableGenerated(context: *const Context, id: u16) bool {
+            if (id == none) return true;
+            const n = context.node(id);
+            switch (n.kind) {
+                .function => if (!ast.immutableFunction(n.func)) return false,
+                .cast => {
+                    const from = context.node(n.a).ty; const to = n.cast_type;
+                    if (from != to) {
+                        if (value.stringType(from) and (value.datetime(to) or to == .interval)) return false;
+                        if (value.stringType(to) and (value.datetime(from) or from == .interval)) return false;
+                        if ((from == .timestamptz and value.datetime(to)) or (to == .timestamptz and value.datetime(from))) return false;
+                    }
+                },
+                .binary => if ((n.op == .add or n.op == .sub) and n.ty == .timestamptz and
+                    (context.node(n.a).ty == .interval or context.node(n.b).ty == .interval)) return false,
+                .scalar_subquery, .exists_subquery, .in_subquery, .aggregate => return false,
+                .row_compare => {
+                    if (n.a != none) return true;
+                    var item = n.b;
+                    while (item != none) : (item = context.node(item).next) {
+                        const pair = context.node(item);
+                        if ((n.op == .eq or n.op == .ne) and (knownNull(context, pair.a) or knownNull(context, pair.b))) continue;
+                        if (!immutableGenerated(context, pair.a) or !immutableGenerated(context, pair.b)) return false;
+                    }
+                    return true;
+                },
+                else => {},
+            }
+            if (!immutableGenerated(context, n.a) or !immutableGenerated(context, n.c)) return false;
+            if (!listOwner(n.kind)) return immutableGenerated(context, n.b);
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) if (!immutableGenerated(context, item)) return false;
+            return true;
+        }
+
+        fn generatedConstant(context: *const Context, id: u16) bool {
+            return id != none and context.node(id).ty != .unknown and isConstant(context, id) and immutableGenerated(context, id);
+        }
+
+        fn generatedValue(context: *const Context, id: u16) Error!V.Cell {
+            const eval_context: E.Context = .{ .source = context.source, .pool = context.pool, .session = context.session };
+            return E.eval(&eval_context, id);
+        }
+
+        fn generatedLiteral(context: *const Context, id: u16, boolean: ?bool) void {
+            const n = context.node(id);
+            n.* = .{ .kind = if (boolean == null) .null_literal else .bool_literal, .ty = n.ty, .boolean = boolean orelse false, .constant = true, .next = n.next, .name = n.name };
+        }
+
+        fn generatedReplace(context: *const Context, id: u16, replacement: u16) Error!void {
+            const n = context.node(id);
+            var source = replacement;
+            if (context.node(source).ty != n.ty) source = try context.pool.add(.{ .kind = .cast, .a = source, .cast_type = n.ty, .ty = n.ty, .typmod = n.typmod, .constant = isConstant(context, source) });
+            const next = n.next; const name = n.name;
+            n.* = context.node(source).*; n.next = next; n.name = name;
+        }
+
+        /// Plan only the supported expression subset, without executing mutable
+        /// calls. Pruned AST nodes remain in the pool but cannot be evaluated.
+        fn simplifyGenerated(context: *const Context, id: u16) Error!void {
+            if (id == none) return;
+            const n = context.node(id);
+            if (n.kind == .column) return;
+            if (n.kind == .case_expr) {
+                try simplifyGenerated(context, n.a);
+                const known = n.a == none or generatedConstant(context, n.a);
+                const operand = if (n.a != none and known) try generatedValue(context, n.a) else V.Cell.null_value;
+                var head: u16 = none; var tail: u16 = none; var arm = n.b;
+                while (arm != none) {
+                    const entry = context.node(arm); const next = entry.next;
+                    try simplifyGenerated(context, entry.a);
+                    if (known and generatedConstant(context, entry.a)) {
+                        const candidate = try generatedValue(context, entry.a);
+                        const hit = if (n.a == none) candidate == .boolean and candidate.boolean else E.compareOp(.eq, &operand, &candidate) == true;
+                        if (!hit) { arm = next; continue; }
+                        try simplifyGenerated(context, entry.b);
+                        if (head == none) return generatedReplace(context, id, entry.b);
+                        n.c = entry.b; break;
+                    }
+                    try simplifyGenerated(context, entry.b);
+                    entry.constant = isConstant(context, entry.a) and isConstant(context, entry.b);
+                    if (head == none) head = arm else context.node(tail).next = arm;
+                    tail = arm; entry.next = none; arm = next;
+                }
+                n.b = head;
+                try simplifyGenerated(context, n.c);
+                if (head == none) {
+                    if (n.c != none) return generatedReplace(context, id, n.c);
+                    generatedLiteral(context, id, null); return;
+                }
+                n.constant = isConstant(context, n.a) and listConstant(context, n.b) and isConstant(context, n.c);
+                return;
+            }
+            if (n.kind == .coalesce) {
+                var head: u16 = none; var tail: u16 = none; var item = n.b;
+                while (item != none) {
+                    const next = context.node(item).next;
+                    try simplifyGenerated(context, item);
+                    if (generatedConstant(context, item)) {
+                        if ((try generatedValue(context, item)) == .null_value) { item = next; continue; }
+                        if (head == none) return generatedReplace(context, id, item);
+                        context.node(tail).next = item; context.node(item).next = none; n.b = head;
+                        n.constant = listConstant(context, head); return;
+                    }
+                    if (head == none) head = item else context.node(tail).next = item;
+                    tail = item; context.node(item).next = none; item = next;
+                }
+                n.b = head; n.constant = listConstant(context, head);
+                if (head == none) generatedLiteral(context, id, null);
+                return;
+            }
+            if (n.kind == .row_compare and n.a == none) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) {
+                    const pair = context.node(item);
+                    try simplifyGenerated(context, pair.a); try simplifyGenerated(context, pair.b);
+                    pair.constant = isConstant(context, pair.a) and isConstant(context, pair.b);
+                }
+                n.constant = listConstant(context, n.b); return;
+            }
+            if (n.kind == .and_op or n.kind == .or_op) {
+                const annihilator = n.kind == .or_op;
+                try simplifyGenerated(context, n.a);
+                if (generatedConstant(context, n.a)) {
+                    const folded = try generatedValue(context, n.a);
+                    if (folded == .boolean and folded.boolean == annihilator) { generatedLiteral(context, id, annihilator); return; }
+                }
+                try simplifyGenerated(context, n.b);
+                if (generatedConstant(context, n.b)) {
+                    const folded = try generatedValue(context, n.b);
+                    if (folded == .boolean and folded.boolean == annihilator) { generatedLiteral(context, id, annihilator); return; }
+                }
+                n.constant = isConstant(context, n.a) and isConstant(context, n.b); return;
+            }
+            try simplifyGenerated(context, n.a); try simplifyGenerated(context, n.c);
+            if (listOwner(n.kind)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) try simplifyGenerated(context, item);
+                n.constant = isConstant(context, n.a) and isConstant(context, n.c) and listConstant(context, n.b);
+            } else {
+                try simplifyGenerated(context, n.b);
+                n.constant = isConstant(context, n.a) and isConstant(context, n.b) and isConstant(context, n.c);
+            }
+            if (n.kind == .row_compare and n.a != none) { generatedLiteral(context, id, null); return; }
+            if (n.kind == .cast and knownNull(context, n.a)) { generatedLiteral(context, id, null); return; }
+            if (n.kind == .nullif and knownNull(context, n.a)) { generatedLiteral(context, id, null); return; }
+            if (n.kind == .binary and n.op != .is_distinct and n.op != .is_not_distinct and (knownNull(context, n.a) or knownNull(context, n.b))) { generatedLiteral(context, id, null); return; }
+            if (n.kind == .function and ast.strictFunction(n.func)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) if (knownNull(context, item)) { generatedLiteral(context, id, null); return; };
+            }
+            if (n.kind == .like and n.c != none and generatedConstant(context, n.b) and generatedConstant(context, n.c)) {
+                const pattern = try generatedValue(context, n.b); const escape = try generatedValue(context, n.c);
+                if (pattern != .null_value and escape != .null_value) try expr.validateLikeEscape(escape.text.slice());
+            }
+            if (generatedConstant(context, id)) {
+                const evaluated = try generatedValue(context, id);
+                if (evaluated == .null_value) generatedLiteral(context, id, null) else if (evaluated == .boolean) generatedLiteral(context, id, evaluated.boolean);
+                if (evaluated == .integer) n.* = .{ .kind = .int_literal, .integer = evaluated.integer, .ty = n.ty, .constant = true, .next = n.next, .name = n.name };
+            }
         }
 
         fn assignedDefaults(context: *const Context, values: *const [config.columns]u16) [config.columns]bool {

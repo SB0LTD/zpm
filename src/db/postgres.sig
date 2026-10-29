@@ -1478,6 +1478,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "InvalidRowCountInLimit")) return "2201W";
     if (equal(name, "InvalidRowCountInResultOffset")) return "2201X";
     if (equal(name, "GeneratedAlways")) return "428C9";
+    if (equal(name, "InvalidObjectDefinition")) return "42P17";
     if (equal(name, "SequenceLimit")) return "2200H";
     if (equal(name, "SequenceNotReady")) return "55000";
     if (equal(name, "WrongObjectType")) return "42809";
