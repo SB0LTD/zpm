@@ -159,7 +159,15 @@ pub fn like(text: []const u8, pattern: []const u8, insensitive: bool) Error!bool
 
 pub fn validateLikeEscape(escape: []const u8) Error!void {
     if (escape.len == 0) return;
-    if (escape.len > 4 or !@import("std").unicode.utf8ValidateSlice(escape) or utf8Length(escape[0]) != escape.len) return error.InvalidEscapeSequence;
+    if (escape.len > 4) return error.InvalidEscapeSequence;
+    // This input is exactly one scalar, not an arbitrary UTF-8 buffer.
+    // Validate its lead/length before decoding so malformed input cannot reach
+    // a decoder assertion. Scalar decoding also works on native SB0 backends
+    // without the whole-buffer validator's vector reduction.
+    const unicode = @import("std").unicode;
+    const width = unicode.utf8ByteSequenceLength(escape[0]) catch return error.InvalidEscapeSequence;
+    if (width != escape.len) return error.InvalidEscapeSequence;
+    _ = unicode.utf8Decode(escape) catch return error.InvalidEscapeSequence;
 }
 
 fn escapeAt(pattern: []const u8, at: usize, escape: []const u8) bool {
