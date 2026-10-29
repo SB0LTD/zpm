@@ -19,6 +19,34 @@ device deployment.
 
 ## Implemented in this batch
 
+### Follow-up: bare NULL candidates in row lists
+
+`ROW(a,b) IN (NULL,...)` and NOT IN now treat a bare NULL candidate as
+unknown without constructing a record payload or evaluating that candidate's
+left operand. Other candidates retain their normal comparison/evaluation rules.
+This also covers empty constructors compared only with NULL.
+
+The retained AST records name/grouping dependencies. Grouping validation checks
+them without registering eliminated aggregates, so discarded aggregates do not
+run or overflow. A flagged post-binding pass validates immutable constant
+subexpressions, respecting CASE/COALESCE selection and avoiding sequence/clock
+evaluation. Statements without NULL row candidates skip that pass. Binding and
+grouping errors take precedence over constant-evaluation errors.
+
+The new test first failed with UnsupportedStatement. The independent PostgreSQL
+18.3 oracle passes 43 probes; the Sig contract passes 98 assertions in Windows
+ReleaseSafe and Debug, including replay, cancellation, errors, grouping,
+volatile calls and eliminated aggregates. Twelve Python tests verify the
+harness/evidence. The earlier constructor-list contract now accepts its former
+bare-NULL rejection case; its refreshed native evidence has 2,916 matrix queries
+and 41 additional probes. Earlier assertion counts below are historical.
+
+See [row NULL oracle](../tests/sql_conformance/row_null_oracle.json) and
+[contract](../tests/test_sql_row_null_candidates.sig). This closes bare NULL
+candidates; general record payloads, nested records and row subquery/ANY/ALL
+forms remain unqualified. The constant pass is scoped to discarded row operands,
+not a claim of complete PostgreSQL optimizer equivalence.
+
 ### Follow-up: flat row-constructor membership
 
 `ROW(a,b) IN (ROW(x,y),...)` and tuple shorthand now bind independent

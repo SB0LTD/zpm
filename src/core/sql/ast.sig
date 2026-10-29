@@ -112,6 +112,8 @@ pub const NodeKind = enum {
     /// Members are `b` -> next; this is not a scalar record value type.
     row_constructor,
     /// Bound field-pair comparisons in `b` -> next, with the row operator `op`.
+    /// With `a` present and `b` absent, strict equality to a bare NULL record:
+    /// `a` retains binding dependencies but is never evaluated at runtime.
     row_compare,
     /// Bound flat IN candidates: row_compare nodes in `b` -> next.
     /// Each owns a separate left expression, as PostgreSQL's OR expansion does.
@@ -174,11 +176,14 @@ pub fn Ast(comptime config: types.Config) type {
             /// The statement needs the general query engine (joins,
             /// grouping, DISTINCT, OFFSET, subqueries, CTEs, set operations).
             complex: bool = false,
+            /// Strict NULL record comparisons need a post-binding constant pass.
+            discarded_row_constants: bool = false,
 
             pub fn reset(self: *Pool) void {
                 self.len = 0;
                 self.query_len = 0;
                 self.complex = false;
+                self.discarded_row_constants = false;
             }
 
             /// A new default query block, initialized in place (blocks are

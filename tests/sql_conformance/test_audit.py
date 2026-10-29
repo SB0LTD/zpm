@@ -36,12 +36,21 @@ def message(kind, body):
 
 
 class AuditTests(unittest.TestCase):
+    def test_row_null_oracle_identity(self):
+        root = Path(__file__).parent
+        report = json.loads((root / 'row_null_oracle.json').read_text(encoding='utf8'))
+        self.assertEqual(report['failures'], [])
+        self.assertEqual(report['extra_probes'], 43)
+        for key, path in [('contract_sha256', root.parent / 'test_sql_row_null_candidates.sig'),
+                          ('oracle_script_sha256', root / 'verify_row_null_oracle.py')]:
+            self.assertEqual(report[key], hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest())
+
     def test_membership_oracle_identity(self):
         root = Path(__file__).parent
         report = json.loads((root / 'membership_oracle.json').read_text(encoding='utf8'))
         self.assertEqual(report['failures'], [])
         self.assertEqual(report['matrix_queries'], 2916)
-        self.assertEqual(report['extra_probes'], 40)
+        self.assertEqual(report['extra_probes'], 41)
         for key, path in [('contract_sha256', root.parent / 'test_sql_row_membership.sig'),
                           ('oracle_script_sha256', root / 'verify_membership_oracle.py')]:
             self.assertEqual(report[key], hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest())

@@ -982,6 +982,65 @@ pub fn Binder(comptime config: types.Config) type {
             while (item != none) : (item = context.node(item).next) try context.pool.raise(id, item);
         }
 
+        fn foldableScalar(context: *const Context, id: u16) bool {
+            if (id == none) return true;
+            const n = context.node(id);
+            if (!n.constant) return false;
+            switch (n.kind) {
+                .function => if (!ast.canRepeatFunction(n.func) and n.func != .jsonb_typeof and n.func != .jsonb_array_length) return false,
+                .row_constructor, .row_compare, .row_in => return false,
+                else => {},
+            }
+            if (!foldableScalar(context, n.a) or !foldableScalar(context, n.c)) return false;
+            if (!listOwner(n.kind)) return foldableScalar(context, n.b);
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) if (!foldableScalar(context, item)) return false;
+            return true;
+        }
+
+        // A strict NULL record comparison discards runtime evaluation, but
+        // PostgreSQL still simplifies immutable constant expressions first.
+        // Never evaluate clocks, sequences, aggregates or subqueries here.
+        fn validateDiscardedConstants(context: *const Context, id: u16) Error!void {
+            if (id == none) return;
+            const n = context.node(id);
+            const eval_context: E.Context = .{ .source = context.source, .pool = context.pool, .session = context.session };
+            if (foldableScalar(context, id)) { _ = try E.eval(&eval_context, id); return; }
+            if (n.kind == .case_expr) {
+                try validateDiscardedConstants(context, n.a);
+                const known_operand = n.a == none or foldableScalar(context, n.a);
+                const operand = if (n.a != none and known_operand) try E.eval(&eval_context, n.a) else V.Cell.null_value;
+                var arm = n.b;
+                while (arm != none) : (arm = context.node(arm).next) {
+                    const entry = context.node(arm);
+                    try validateDiscardedConstants(context, entry.a);
+                    if (known_operand and foldableScalar(context, entry.a)) {
+                        const candidate = try E.eval(&eval_context, entry.a);
+                        const matches = if (n.a == none) candidate == .boolean and candidate.boolean else E.compareOp(.eq, &operand, &candidate) == true;
+                        if (!matches) continue;
+                        try validateDiscardedConstants(context, entry.b);
+                        return;
+                    }
+                    try validateDiscardedConstants(context, entry.b);
+                }
+                return validateDiscardedConstants(context, n.c);
+            }
+            if (n.kind == .coalesce) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) {
+                    try validateDiscardedConstants(context, item);
+                    if (foldableScalar(context, item) and (try E.eval(&eval_context, item)) != .null_value) return;
+                }
+                return;
+            }
+            try validateDiscardedConstants(context, n.a);
+            try validateDiscardedConstants(context, n.c);
+            if (listOwner(n.kind)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) try validateDiscardedConstants(context, item);
+            } else try validateDiscardedConstants(context, n.b);
+        }
+
         fn bindRowIn(context: *const Context, scope: *const Scope, id: u16) Error!void {
             const n = context.node(id);
             const original = n.a;
@@ -991,17 +1050,20 @@ pub fn Binder(comptime config: types.Config) type {
             var tail: u16 = none;
             while (item != none) {
                 const next = context.node(item).next;
-                if (context.node(item).kind != .row_constructor) {
-                    // A NULL record payload is distinct from a constructor
-                    // with NULL fields; general record values are unqualified.
-                    if (context.node(item).kind == .null_literal) return error.UnsupportedStatement;
-                    return error.UndefinedFunction;
-                }
                 // Keep the original unresolved literal types until the last
                 // candidate: each equality operator resolves independently.
                 const left = if (next == none) original else try cloneTree(context, original);
-                const comparison = try context.pool.add(.{ .kind = .binary, .op = .eq, .a = left, .b = item });
-                try bindRowCompare(context, scope, comparison);
+                var comparison: u16 = undefined;
+                if (context.node(item).kind == .null_literal) {
+                    context.pool.discarded_row_constants = true;
+                    // Keep dependencies for grouping/name validation, without
+                    // creating a record payload or evaluating the operand.
+                    comparison = try context.pool.add(.{ .kind = .row_compare, .op = .eq, .a = left, .ty = .boolean, .constant = isConstant(context, left) });
+                } else {
+                    if (context.node(item).kind != .row_constructor) return error.UndefinedFunction;
+                    comparison = try context.pool.add(.{ .kind = .binary, .op = .eq, .a = left, .b = item });
+                    try bindRowCompare(context, scope, comparison);
+                }
                 if (head == none) head = comparison else context.node(tail).next = comparison;
                 tail = comparison;
                 item = next;
@@ -1029,7 +1091,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .values_row, .default_value => return error.Syntax,
                 .row_constructor => return error.UnsupportedStatement,
                 // Internal comparison lists have already bound every field.
-                .row_compare, .row_in => { n.ty = .boolean; n.constant = listConstant(context, n.b); },
+                .row_compare, .row_in => { n.ty = .boolean; n.constant = isConstant(context, n.a) and listConstant(context, n.b); },
                 .function => try typeFunction(context, scope, n),
                 .when_arm => unreachable,
                 .column => {
@@ -2129,6 +2191,25 @@ pub fn Binder(comptime config: types.Config) type {
         /// Rewrites a post-grouping expression: GROUP BY keys and aggregate
         /// calls become grouped-row columns; any other column of this block
         /// is a GroupingError (42803).
+        fn validateDiscardedGroup(context: *const Context, p: *const Plan, id: u16) Error!void {
+            if (id == none) return;
+            for (p.keys[0..p.key_count]) |key| if (sameExpr(context, id, key)) return;
+            const n = context.node(id);
+            switch (n.kind) {
+                // Binding already validated aggregate arguments and nesting.
+                // An aggregate eliminated by strict NULL must not execute.
+                .aggregate, .scalar_subquery, .exists_subquery => return,
+                .column => if (n.level == 0) return error.GroupingError else return,
+                else => {},
+            }
+            try validateDiscardedGroup(context, p, n.a);
+            try validateDiscardedGroup(context, p, n.c);
+            if (listOwner(n.kind)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) try validateDiscardedGroup(context, p, item);
+            } else try validateDiscardedGroup(context, p, n.b);
+        }
+
         fn groupify(context: *const Context, p: *Plan, id: u16) Error!void {
             if (id == none) return;
             const n = context.node(id);
@@ -2136,6 +2217,7 @@ pub fn Binder(comptime config: types.Config) type {
                 if (sameExpr(context, id, key)) return groupColumn(n, index, context.node(key).typmod);
             }
             switch (n.kind) {
+                .row_compare => if (n.a != none) return validateDiscardedGroup(context, p, n.a),
                 .aggregate => {
                     const index = try registerAgg(context, p, id);
                     return groupColumn(n, p.key_count + index, -1);
@@ -2431,6 +2513,19 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         pub fn bind(context: *const Context, statement: *const Ast.Statement) Error!Bound {
+            const bound = try bindStatement(context, statement);
+            try validateDiscardedRows(context);
+            return bound;
+        }
+
+        fn validateDiscardedRows(context: *const Context) Error!void {
+            if (!context.pool.discarded_row_constants) return;
+            for (context.pool.nodes[0..context.pool.len]) |*n| {
+                if (n.kind == .row_compare and n.a != none) try validateDiscardedConstants(context, n.a);
+            }
+        }
+
+        fn bindStatement(context: *const Context, statement: *const Ast.Statement) Error!Bound {
             if (context.plans) |plans| plans.reset();
             switch (statement.*) {
                 .create_table => |*create| {
@@ -2606,6 +2701,7 @@ pub fn Binder(comptime config: types.Config) type {
                 }
             }
             if (with_defaults) try bindDefaults(context, index, entry, &out.defaults, &out.generated);
+            try validateDiscardedRows(context);
             return out;
         }
     };

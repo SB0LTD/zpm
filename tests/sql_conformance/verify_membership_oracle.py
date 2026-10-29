@@ -50,7 +50,7 @@ def main():
     pg = Pg(args.port, args.user, args.database)
     report = {'target': 'PostgreSQL 18.3', 'qualification': 'flat_constructor_in_lists_only',
               'matrix_queries': 0, 'extra_probes': 0, 'failures': [], 'unsupported_examples': [],
-              'excluded_dimensions': ['record projection/storage', 'nested record values', 'bare NULL record candidates', 'row IN subqueries/ANY/ALL', 'schema replay', 'work/cancellation budgets']}
+              'excluded_dimensions': ['record projection/storage', 'nested record values', 'row IN subqueries/ANY/ALL', 'schema replay', 'work/cancellation budgets']}
     digest = 14695981039346656037
     def text(value):
         return None if value is None else 't' if value else 'f'
@@ -112,7 +112,7 @@ def main():
             elif mutation:
                 probe(json.loads(mutation[1]), affected=mutation[2])
                 report['extra_probes'] += 1
-            elif negative and ('IN (NULL)' in json.loads(negative[1]) or 'ROW(ROW(' in json.loads(negative[1])):
+            elif negative and 'ROW(ROW(' in json.loads(negative[1]):
                 report['unsupported_examples'].append(json.loads(negative[1]))
             elif negative:
                 states = {'Syntax': '42601', 'UndefinedFunction': '42883', 'InvalidTextRepresentation': '22P02', 'UnsupportedStatement': '0A000', 'TypeMismatch': '42804', 'DivisionByZero': '22012'}
