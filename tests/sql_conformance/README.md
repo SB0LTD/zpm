@@ -307,3 +307,18 @@ evidence. Sig separately checks COPY component calls, work/cancellation and repl
 after overwriting the caller's record buffer. The source owner uses existing AST
 metadata with no retained pointers or node-size growth. Complete generated-column
 restrictions and general planner error timing remain unqualified.
+
+`contract-sql-generated-restrictions` covers stored generated-column immutability,
+dependencies and supported branch reduction: 132 assertions and 52 PostgreSQL
+18.3 probes. Reproduce its native oracle with:
+
+```powershell
+python tests/sql_conformance/verify_generated_oracle.py --port 55491 --report .sig-cache/generated-oracle.json
+```
+
+`generated_oracle.json` pins both sources. Sixteen Python tests validate current
+evidence. Sig separately checks replay, sequence non-effects and interruption
+during candidate CREATE validation; the wire error map checks 42P17. Virtual
+generation, inheritance/partitioning, system-column rules, additional planner
+reductions and complete coercion coverage remain unqualified. These results
+cover explicit STORED generation within the documented expression subset.

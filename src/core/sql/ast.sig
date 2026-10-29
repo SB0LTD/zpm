@@ -52,6 +52,27 @@ pub fn canRepeatFunction(func: Func) bool {
     };
 }
 
+/// PostgreSQL immutability is stronger than retry safety. Catalogue lookups
+/// and clocks depend on session/database state even with constant arguments.
+pub fn immutableFunction(func: Func) bool {
+    return switch (func) {
+        .round, .greatest, .least, .jsonb_typeof, .jsonb_array_length => true,
+        else => false,
+    };
+}
+
+pub fn strictFunction(func: Func) bool {
+    return switch (func) {
+        .round, .jsonb_typeof, .jsonb_array_length,
+        .nextval, .currval, .setval, .lastval, .identity_next,
+        .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp,
+        .current_timestamp, .current_date, .current_database, .current_schema,
+        .to_regtype, .to_regclass, .pg_get_expr,
+        .regclass_in, .regtype_in, .regclass_out, .regtype_out => true,
+        else => false,
+    };
+}
+
 /// Cast typmods marking `::regclass` / `::regtype` (OID-valued casts).
 pub const regclass_typmod: i32 = -2;
 pub const regtype_typmod: i32 = -3;
@@ -115,7 +136,8 @@ pub const NodeKind = enum {
     /// With `a` present and `b` absent, strict comparison to a bare NULL record:
     /// `a` retains binding dependencies but is never evaluated at runtime.
     /// Its `integer` is the deferred-validation source owner: 0 = statement,
-    /// -1 = type-check-only DDL default, positive = 1 + table*columns + column.
+    /// -1 = excluded (DDL default or unreachable subtree), positive =
+    /// 1 + table*columns + column.
     row_compare,
     /// Bound flat IN candidates: row_compare nodes in `b` -> next.
     /// Each owns a separate left expression, as PostgreSQL's OR expansion does.
