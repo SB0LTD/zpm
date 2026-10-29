@@ -253,7 +253,7 @@ fn errors() !void {
     // The failing projection is on the last row: nothing reaches the result.
     try rejects(&db, &r, "SELECT 10 / (id - 3) FROM t ORDER BY id", error.DivisionByZero);
     try rejects(&db, &r, "SELECT id FROM t ORDER BY 1 / (id - 1)", error.DivisionByZero);
-    try rejects(&db, &r, "SELECT 'a' LIKE 'a\\'", error.InvalidEscapeSequence);
+    try truth(&db, &r, "SELECT 'a' LIKE 'a\\'", false);
     try rejects(&db, &r, "SELECT $1", error.UndefinedParameter);
     try rejects(&db, &r, "SELECT id FROM t ORDER BY 2", error.InvalidColumnReference);
     // Decimal literals are NUMERIC since step 3.2 (test_sql_types covers them).

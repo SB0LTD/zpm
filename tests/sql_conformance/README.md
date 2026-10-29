@@ -23,16 +23,16 @@ No calendar promise or universal speedup is implied. A release claiming complete
 
 ## Concrete smoke specifications
 
-Current core run: **4 smoke passes, 97 failures, 17 unexecuted scopes/comparators**. These are probes selected to expose gaps, not a percentage of PostgreSQL compatibility. Core-only rejection of a server utility does not prove absence in the server integration layer.
+Current core run: **6 smoke passes, 95 failures, 17 unexecuted scopes/comparators**. These are probes selected to expose gaps, not a percentage of PostgreSQL compatibility. Core-only rejection of a server utility does not prove absence in the server integration layer.
 
 | ID | Feature | Core smoke status |
 |---|---|---|
 | PG.PRED.DISTINCT | NULL-safe equality | pass; closure incomplete |
 | PG.PRED.QUANTIFIED | ANY/SOME/ALL, scalar subqueries with six ordinary comparison operators | pass; array/row/custom-operator forms and closure remain incomplete |
-| PG.PRED.SYMMETRIC | Symmetric BETWEEN | Syntax |
+| PG.PRED.SYMMETRIC | Symmetric BETWEEN | pass; scalar/flat-row range contracts, broader closure incomplete |
 | PG.PRED.OVERLAPS | Temporal overlaps | Syntax |
 | PG.PRED.REGEX | Regular expressions | Syntax |
-| PG.PRED.ESCAPE | LIKE escape clause | Syntax |
+| PG.PRED.ESCAPE | LIKE escape clause | pass; UTF-8 LIKE/ASCII ILIKE contracts, collations and planner closure incomplete |
 | PG.QUERY.WINDOW | Ranking/offset windows | Syntax |
 | PG.QUERY.WINDOW_AGG | Window aggregates | Syntax |
 | PG.QUERY.WINDOW_FRAMES | Named windows and frame exclusions | Syntax |
@@ -201,7 +201,7 @@ DML contexts remain unqualified. All 26 default SQL contracts pass; the complete
 second-batch source/evidence record is `quantified_evidence.json`. The original
 `evidence.json` is historical and refers to the archived first-batch smoke run.
 
-The current record is `row_evidence.json`: 27 passing default SQL contracts and
+The row-comparison checkpoint record is `row_evidence.json`: 27 passing default SQL contracts and
 449,096 assertions. Its constructor-predicate suite has 8,430 assertions in both
 ReleaseSafe and Debug. `row_oracle.json` records 4,160 independent matrix cases
 and 49 additional PostgreSQL 18.3 probes. Reproduce the native part with:
@@ -278,3 +278,19 @@ controls and caller AST exhaustion. Ordinary lowering uses two comparisons and
 symmetric lowering uses four; simple typed scalar ranges retain their compact
 shape. Nested/general record payloads remain unqualified. This is correctness
 evidence, not a benchmark result or full SQL compatibility claim.
+
+`contract-sql-like-escape` covers explicit ESCAPE for LIKE/ILIKE and negated
+forms: 16,348 assertions, 8,120 matrix cases and 44 additional PostgreSQL 18.3
+probes. Reproduce its independent code-point DP/native oracle:
+
+```powershell
+python tests/sql_conformance/verify_like_oracle.py --port 55491 --report .sig-cache/like-oracle.json
+```
+
+`like_oracle.json` pins the contract/script and matrix digest. Fourteen Python
+tests validate current evidence. Sig checks replay, an at-capacity pattern,
+exact work exhaustion and cancellation inside matching. The matcher uses
+constant scratch without a normalized-pattern buffer; worst-case rescanning is
+still possible. Unicode case folding, collations, planner error timing and
+filter placement remain unqualified. The concrete JOIN/filter error mismatch is
+recorded in [the status document](../../docs/SQL_CONFORMANCE_TDD_STATUS.md).

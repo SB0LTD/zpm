@@ -152,47 +152,84 @@ fn utf8Length(byte: u8) usize {
     return 4;
 }
 
-/// LIKE/ILIKE with `%`, `_` (one UTF-8 character) and the default `\` escape.
+/// LIKE/ILIKE with PostgreSQL's default backslash escape.
 pub fn like(text: []const u8, pattern: []const u8, insensitive: bool) Error!bool {
+    return likeEscape(text, pattern, "\\", insensitive);
+}
+
+fn validateEscape(escape: []const u8) Error!void {
+    if (escape.len == 0) return;
+    if (escape.len > 4 or !@import("std").unicode.utf8ValidateSlice(escape) or utf8Length(escape[0]) != escape.len) return error.InvalidEscapeSequence;
+}
+
+fn escapeAt(pattern: []const u8, at: usize, escape: []const u8) bool {
+    return escape.len != 0 and escape.len <= pattern.len - at and @import("std").mem.eql(u8, pattern[at..][0..escape.len], escape);
+}
+
+/// Empty disables escaping; otherwise escape is exactly one UTF-8 character.
+/// Matching uses constant scratch and scans the original pattern directly.
+pub fn likeEscape(text: []const u8, pattern: []const u8, escape: []const u8, insensitive: bool) Error!bool {
+    try validateEscape(escape);
+    return likeMatch(text, pattern, escape, insensitive, null);
+}
+
+fn likeMatch(text: []const u8, pattern: []const u8, escape: []const u8, insensitive: bool, control: ?*types.ExecutionControl) Error!bool {
     var t: usize = 0;
     var p: usize = 0;
     var star_p: ?usize = null;
     var star_t: usize = 0;
     while (t < text.len) {
+        if (control) |active| try active.checkpoint();
         if (p < pattern.len) {
+            const escaped = escapeAt(pattern, p, escape);
             const byte = pattern[p];
-            if (byte == '%') {
+            if (!escaped and byte == '%') {
                 p += 1;
+                // Collapse wildcard runs. A following trailing escape is an
+                // error even when these underscores consumed the remaining text.
+                while (p < pattern.len and !escapeAt(pattern, p, escape)) {
+                    if (control) |active| try active.checkpoint();
+                    if (pattern[p] == '%') { p += 1; continue; }
+                    if (pattern[p] != '_') break;
+                    if (t == text.len) return false;
+                    t += @min(utf8Length(text[t]), text.len - t);
+                    p += 1;
+                }
+                if (p == pattern.len) return true;
+                if (escapeAt(pattern, p, escape) and p + escape.len == pattern.len) return error.InvalidEscapeSequence;
                 star_p = p;
                 star_t = t;
                 continue;
             }
-            if (byte == '_') {
+            if (!escaped and byte == '_') {
                 t += @min(utf8Length(text[t]), text.len - t);
                 p += 1;
                 continue;
             }
-            var literal = byte;
-            var width: usize = 1;
-            if (byte == '\\') {
-                if (p + 1 == pattern.len) return error.InvalidEscapeSequence;
-                literal = pattern[p + 1];
-                width = 2;
-            }
-            const matched = if (insensitive) types.lower(literal) == types.lower(text[t]) else literal == text[t];
+            const literal_at = p + (if (escaped) escape.len else 0);
+            if (literal_at == pattern.len) return error.InvalidEscapeSequence;
+            const literal_width = @min(utf8Length(pattern[literal_at]), pattern.len - literal_at);
+            const text_width = @min(utf8Length(text[t]), text.len - t);
+            const matched = if (insensitive and literal_width == 1 and text_width == 1)
+                types.lower(pattern[literal_at]) == types.lower(text[t])
+            else text_width == literal_width and @import("std").mem.eql(u8, pattern[literal_at..][0..literal_width], text[t..][0..text_width]);
             if (matched) {
-                p += width;
-                t += 1;
+                p = literal_at + literal_width;
+                t += text_width;
                 continue;
             }
         }
         const resume_at = star_p orelse return false;
+        if (star_t == text.len) return false;
         star_t += @min(utf8Length(text[star_t]), text.len - star_t);
         t = star_t;
         p = resume_at;
     }
-    while (p < pattern.len and pattern[p] == '%') p += 1;
-    if (p < pattern.len and pattern[p] == '\\' and p + 1 == pattern.len) return error.InvalidEscapeSequence;
+    // Reaching the end of text does not examine a later trailing escape.
+    while (p < pattern.len and pattern[p] == '%' and !escapeAt(pattern, p, escape)) {
+        if (control) |active| try active.checkpoint();
+        p += 1;
+    }
     return p == pattern.len;
 }
 
@@ -610,8 +647,15 @@ pub fn Eval(comptime config: types.Config) type {
                 .like => {
                     const value = try eval(ctx, n.a);
                     const pattern = try eval(ctx, n.b);
-                    if (value == .null_value or pattern == .null_value) return null;
-                    const matched = try like(value.text.slice(), pattern.text.slice(), n.insensitive);
+                    var escape: V.Cell = .null_value;
+                    if (n.c != none) escape = try eval(ctx, n.c);
+                    // like_escape(pattern, escape) is strict independently of
+                    // the outer LIKE operator, after evaluating both arguments.
+                    if (pattern == .null_value or (n.c != none and escape == .null_value)) return null;
+                    const escape_text: []const u8 = if (n.c == none) "\\" else escape.text.slice();
+                    try validateEscape(escape_text);
+                    if (value == .null_value) return null;
+                    const matched = try likeMatch(value.text.slice(), pattern.text.slice(), escape_text, n.insensitive, ctx.session.control);
                     return matched != n.negated;
                 },
                 else => {},

@@ -122,7 +122,7 @@ pub const NodeKind = enum {
 
 /// Children by kind: unary/not/test/cast `a`; binary/and/or/nullif `a`,`b`;
 /// between `a` BETWEEN `b` AND `c`; in_list `a` IN (`b` -> next ...);
-/// like `a` LIKE `b`; case_expr operand `a` (or none), arms `b` -> next,
+/// like `a` LIKE `b` [ESCAPE `c`]; case_expr operand `a` (or none), arms `b` -> next,
 /// ELSE `c`; when_arm condition `a`, result `b`; coalesce/function args `b`
 /// -> next. row_constructor/row_compare/row_in own a `b` -> next list.
 pub const Node = struct {
