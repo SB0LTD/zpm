@@ -431,7 +431,7 @@ pub fn Database(comptime config: Config) type {
                 for(mutable,0..) |part,index| {
                     if(overlaps(part,db_span) or overlaps(part,source_span)) return error.InvalidParameterValue;
                     for(mutable[0..index]) |earlier| if(overlaps(part,earlier)) return error.InvalidParameterValue;
-                    for(&db.tables) |*table| inline for(.{"rows","versions","row_index","key_index","scan_values","scan_nonnull","scan_live"}) |name| {
+                    for(&db.tables) |*table| inline for(.{"rows","versions","row_index","key_index","scan_values","scan_nonnull","scan_live","scan_presence"}) |name| {
                         if(overlaps(part,try span(@field(table,name)[0..]))) return error.InvalidParameterValue;
                     };
                 }
@@ -568,7 +568,7 @@ pub fn Database(comptime config: Config) type {
         workspace: Workspace = .{},
 
         const BackingLayout = struct {
-            offsets: [config.tables][7]usize,
+            offsets: [config.tables][8]usize,
             refs: usize,
             bytes: usize,
             row_index: [config.tables]usize,
@@ -612,6 +612,7 @@ pub fn Database(comptime config: Config) type {
                 offsets[4] = try appendLayout(&cursor, i64, scan_cells[0]);
                 offsets[5] = try appendLayout(&cursor, u64, scan_rows);
                 offsets[6] = try appendLayout(&cursor, u8, scan_rows);
+                offsets[7] = if(S.presence_enabled) try appendLayout(&cursor,u64,try S.presenceWords(rows)) else cursor;
             }
             layout.refs = try appendLayout(&cursor, u32, refs);
             layout.bytes = cursor;
@@ -652,7 +653,7 @@ pub fn Database(comptime config: Config) type {
             if (comptime config.external_storage) {
                 const refs = StorageSpan.of(self.workspace.query.refs);
                 if (refs.start < refs.end and region.start < refs.end and refs.start < region.end) return error.InvalidParameterValue;
-                for (&self.tables) |*table| inline for (.{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live" }) |field| {
+                for (&self.tables) |*table| inline for (.{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence" }) |field| {
                     const part = StorageSpan.of(@field(table, field));
                     if (part.start < part.end and region.start < part.end and part.start < region.end) return error.InvalidParameterValue;
                 };
@@ -692,6 +693,7 @@ pub fn Database(comptime config: Config) type {
                 .scan_values = try storageView(i64, bytes, offsets[4], if (S.compact_enabled) budget.rows * config.columns else 0),
                 .scan_nonnull = try storageView(u64, bytes, offsets[5], if (S.compact_enabled) budget.rows else 0),
                 .scan_live = try storageView(u8, bytes, offsets[6], if (S.compact_enabled) budget.rows else 0),
+                .scan_presence = if(S.presence_enabled) try storageView(u64,bytes,offsets[7],try S.presenceWords(budget.rows)) else &.{},
             };
             try self.bindStorage(backings, try storageView(u32, bytes, layout.refs, refs));
         }
@@ -715,19 +717,20 @@ pub fn Database(comptime config: Config) type {
             if (self.csn != 0 or refs.len == 0 or refs.len > 0x7fffffff) return error.InvalidParameterValue;
             for (&self.tables) |*table| if (table.live) return error.InvalidParameterValue;
             for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
-            var spans: [config.tables * 7 + 3]StorageSpan = undefined;
+            var spans: [config.tables * 8 + 3]StorageSpan = undefined;
             spans[0] = .{ .start = @intFromPtr(self), .end = @intFromPtr(self) + @sizeOf(Self) };
             spans[1] = StorageSpan.of(refs);
             spans[spans.len - 1] = if (comptime config.external_workspace) StorageSpan.of(self.workspace.query.cells) else .{ .start = 0, .end = 0 };
             for (backings, 0..) |backing, i| {
                 if (!backing.valid()) return error.InvalidParameterValue;
-                spans[2 + i * 7] = StorageSpan.of(backing.rows);
-                spans[3 + i * 7] = StorageSpan.of(backing.versions);
-                spans[4 + i * 7] = StorageSpan.of(backing.row_index);
-                spans[5 + i * 7] = StorageSpan.of(backing.key_index);
-                spans[6 + i * 7] = StorageSpan.of(backing.scan_values);
-                spans[7 + i * 7] = StorageSpan.of(backing.scan_nonnull);
-                spans[8 + i * 7] = StorageSpan.of(backing.scan_live);
+                spans[2 + i * 8] = StorageSpan.of(backing.rows);
+                spans[3 + i * 8] = StorageSpan.of(backing.versions);
+                spans[4 + i * 8] = StorageSpan.of(backing.row_index);
+                spans[5 + i * 8] = StorageSpan.of(backing.key_index);
+                spans[6 + i * 8] = StorageSpan.of(backing.scan_values);
+                spans[7 + i * 8] = StorageSpan.of(backing.scan_nonnull);
+                spans[8 + i * 8] = StorageSpan.of(backing.scan_live);
+                spans[9 + i * 8] = StorageSpan.of(backing.scan_presence);
             }
             for (spans, 0..) |a, i| for (spans[i + 1 ..]) |b| {
                 if (a.start == a.end or b.start == b.end) continue;
@@ -741,6 +744,7 @@ pub fn Database(comptime config: Config) type {
                 table.scan_values = backing.scan_values;
                 table.scan_nonnull = backing.scan_nonnull;
                 table.scan_live = backing.scan_live;
+                table.scan_presence = backing.scan_presence;
             }
             self.workspace.query.refs = refs;
             self.workspace.query.ref_high = refs.len;

@@ -205,6 +205,7 @@ pub fn Eval(comptime config: types.Config) type {
         pub const Row = [config.columns]V.Cell;
         pub const Session = value_module.Session;
 
+
         /// Evaluates a subquery node (scalar value, or a boolean/NULL for
         /// EXISTS and IN) for the general query engine.
         pub const Hook = struct {
@@ -635,6 +636,7 @@ pub fn Eval(comptime config: types.Config) type {
                 .bool_literal => return .{ .boolean = n.boolean },
                 .int_literal => return .{ .integer = n.integer },
                 .text_literal => {
+                    if(n.ty==.date and n.date_bound) return .{.date=@intCast(n.integer)};
                     const text = literalText(ctx.source, n.text);
                     return switch (n.ty) {
                         .unknown, .text => .{ .text = text },
@@ -733,6 +735,12 @@ pub fn Eval(comptime config: types.Config) type {
                     return left;
                 },
                 .cast => {
+                    if(n.cast_type==.date and n.date_bound) {
+                        // The binder already parsed this literal child. Keep
+                        // its observable evaluation checkpoint, then borrow
+                        // the exact day count without repeating conversion.
+                        try ctx.session.checkpoint();return .{.date=@intCast(n.integer)};
+                    }
                     const value = try eval(ctx, n.a);
                     return cast(value, node(ctx, n.a).ty, n.cast_type, n.typmod, ctx.session);
                 },

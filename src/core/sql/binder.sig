@@ -354,6 +354,10 @@ pub fn Binder(comptime config: types.Config) type {
                         n.kind = .bool_literal;
                     },
                     .text, .unknown => {},
+                    .date=>{
+                        const date=try Io.parse(target,-1,text.slice(),context.session);
+                        n.integer=date.date;n.date_bound=true;
+                    },
                     // Validated now, converted again at evaluation.
                     else => _ = try Io.parse(target, -1, text.slice(), context.session),
                 }
@@ -1185,6 +1189,7 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b);
                 },
                 .cast => {
+                    n.date_bound=false;
                     if (n.typmod == ast.regclass_typmod or n.typmod == ast.regtype_typmod) return regCast(context, scope, n);
                     const target = n.cast_type;
                     const inner = context.node(n.a);
@@ -1218,6 +1223,10 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     n.ty = target;
                     n.constant = isConstant(context, n.a);
+                    const bound=context.node(n.a);
+                    if(target==.date and bound.kind==.text_literal and bound.ty==.date and bound.date_bound) {
+                        n.date_bound=true;n.integer=bound.integer;
+                    }
                 },
                 .at_zone => {
                     try typeExpr(context, scope, n.a);

@@ -69,6 +69,13 @@ pub fn Storage(comptime config: types.Config) type {
         /// Opportunistic reclamation bound after a transaction publishes.
         pub const reclaim_budget: usize = 64;
         pub const compact_enabled = config.compact_integral_scans and config.external_storage and config.columns <= 64;
+        pub const presence_enabled = compact_enabled and config.block_presence_filters;
+
+        pub fn presenceWords(rows:usize) Error!usize {
+            const rounded=@addWithOverflow(rows,63);if(rounded[1]!=0) return error.InvalidParameterValue;
+            const words=@mulWithOverflow(rounded[0]/64,config.columns*4);if(words[1]!=0) return error.InvalidParameterValue;
+            return words[0];
+        }
 
         comptime {
             if (versions_capacity <= config.rows_per_table) @compileError("versions_per_table must exceed rows_per_table");
@@ -122,13 +129,17 @@ pub fn Storage(comptime config: types.Config) type {
             scan_values: []i64 = &.{},
             scan_nonnull: []u64 = &.{},
             scan_live: []u8 = &.{},
+            scan_presence: []u64 = &.{},
 
             pub fn valid(self: Backing) bool {
+                const scan_cells=@mulWithOverflow(self.rows.len,config.columns);
+                if(compact_enabled and scan_cells[1]!=0) return false;
                 return self.rows.len != 0 and self.rows.len <= 0x7fffffff and
                     self.versions.len > self.rows.len and self.versions.len <= 0x7fffffff and
                     self.row_index.len >= self.rows.len * 2 and powerOfTwo(self.row_index.len) and
                     self.key_index.len >= self.versions.len * 2 and powerOfTwo(self.key_index.len) and
-                    (!compact_enabled or (self.scan_values.len >= self.rows.len * config.columns and self.scan_nonnull.len >= self.rows.len and self.scan_live.len >= self.rows.len));
+                    (!compact_enabled or (self.scan_values.len >= scan_cells[0] and self.scan_nonnull.len >= self.rows.len and self.scan_live.len >= self.rows.len)) and
+                    (!presence_enabled or self.scan_presence.len >= (presenceWords(self.rows.len) catch return false));
             }
         };
 
@@ -194,11 +205,14 @@ pub fn Storage(comptime config: types.Config) type {
             version_used: usize = 0,
             version_free: u32 = 0,
             /// Column-major committed values. Every element below scan_high is
-            /// initialized, including directory holes and non-integral columns.
+            /// initialized, including directory holes and unsupported columns.
+            /// Integer values and exact DATE day counts occupy i64 lanes; a
+            /// reader reconstructs the declared Cell tag before evaluation.
             scan_high: usize = 0,
             scan_values: []i64 = &.{},
             scan_nonnull: []u64 = &.{},
             scan_live: []u8 = &.{},
+            scan_presence: []u64 = &.{},
             rows: if (config.external_storage) []RowSlot else [config.rows_per_table]RowSlot = if (config.external_storage) &.{} else @splat(.{}),
             versions: if (config.external_storage) []Version else [versions_capacity]Version = if (config.external_storage) &.{} else @splat(.{}),
             row_index: if (config.external_storage) []u32 else [row_index_capacity]u32 = if (config.external_storage) &.{} else @splat(0),
@@ -263,6 +277,10 @@ pub fn Storage(comptime config: types.Config) type {
                 @memcpy(destination.scan_live[0..source.scan_high], source.scan_live[0..source.scan_high]);
                 @memcpy(destination.scan_nonnull[0..source.scan_high], source.scan_nonnull[0..source.scan_high]);
                 for (0..config.columns) |column| @memcpy(destination.scan_values[column * destination.rows.len..][0..source.scan_high], source.scan_values[column * source.rows.len..][0..source.scan_high]);
+                if(comptime presence_enabled) {
+                    const blocks=(source.scan_high+63)/64;
+                    for(0..config.columns) |column| @memcpy(destination.scan_presence[presenceAt(destination,column,0)..][0..blocks*4],source.scan_presence[presenceAt(source,column,0)..][0..blocks*4]);
+                }
             }
             @memcpy(destination.rows[0..source.row_high], source.rows[0..source.row_high]);
             @memcpy(destination.versions[0..source.version_high], source.versions[0..source.version_high]);
@@ -281,10 +299,44 @@ pub fn Storage(comptime config: types.Config) type {
 
         fn scanEnsure(table: *Table, high: usize) void {
             if (high <= table.scan_high) return;
+            if(comptime presence_enabled) {
+                const first=(table.scan_high+63)/64;const end=(high+63)/64;
+                for(0..config.columns) |column| @memset(table.scan_presence[presenceAt(table,column,first)..][0..(end-first)*4],0);
+            }
             @memset(table.scan_live[table.scan_high..high], 0);
             @memset(table.scan_nonnull[table.scan_high..high], 0);
             for (0..config.columns) |column| @memset(table.scan_values[column * table.rows.len + table.scan_high..column * table.rows.len + high], 0);
             table.scan_high = high;
+        }
+
+        fn presenceAt(table:*const Table,column:usize,block:usize) usize {
+            return (column*((table.rows.len+63)/64)+block)*4;
+        }
+        fn presenceAdd(table:*Table,slot:usize,column:usize,value:i64) void {
+            const residue:u8=@truncate(@as(u64,@bitCast(value)));
+            table.scan_presence[presenceAt(table,column,slot/64)+residue/64]|=@as(u64,1)<<@as(u6,@truncate(residue));
+        }
+        /// Absence is definitive; presence can be a residue collision or a
+        /// retained old/deleted value. Call only on a snapshot-safe projection.
+        pub fn blockMayContain(table:*const Table,column:usize,start:usize,count:usize,value:i64) bool {
+            if(comptime !presence_enabled) return true;
+            if(start%64!=0 or count>64 or start>=table.scan_high or count>table.scan_high-start) return true;
+            const residue:u8=@truncate(@as(u64,@bitCast(value)));
+            return table.scan_presence[presenceAt(table,column,start/64)+residue/64]&(@as(u64,1)<<@as(u6,@truncate(residue)))!=0;
+        }
+        fn rebuildPresence(table:*Table) void {
+            if(comptime presence_enabled) {
+                const blocks=(table.scan_high+63)/64;
+                for(0..config.columns) |column| @memset(table.scan_presence[presenceAt(table,column,0)..][0..blocks*4],0);
+                for(0..table.scan_high) |slot| {
+                    if(table.scan_live[slot]==0) continue;
+                    for(0..table.column_count) |column| {
+                        const ty=table.columns[column].data_type;
+                        if(ty!=.integer and ty!=.integer32 and ty!=.smallint and ty!=.oid and ty!=.date) continue;
+                        if(table.scan_nonnull[slot]&(@as(u64,1)<<@intCast(column))!=0) presenceAdd(table,slot,column,table.scan_values[column*table.rows.len+slot]);
+                    }
+                }
+            }
         }
 
         /// Publication/replay only, after durable success. Private versions and
@@ -298,7 +350,10 @@ pub fn Storage(comptime config: types.Config) type {
                 var mask: u64 = 0;
                 for (entry.cells[0..table.column_count], 0..) |*cell, column| {
                     if (cell.* != .null_value) mask |= @as(u64, 1) << @intCast(column);
-                    table.scan_values[column * table.rows.len + slot] = if (cell.* == .integer) cell.integer else 0;
+                    table.scan_values[column * table.rows.len + slot] = switch(cell.*) {
+                        .integer=>cell.integer,.date=>cell.date,else=>0,
+                    };
+                    if(comptime presence_enabled) if(live and (cell.*==.integer or cell.*==.date)) presenceAdd(table,slot,column,table.scan_values[column*table.rows.len+slot]);
                 }
                 table.scan_nonnull[slot] = mask;
             }
@@ -708,7 +763,7 @@ pub fn Storage(comptime config: types.Config) type {
                 write += 1;
             }
             table.row_high = write;
-            if (comptime compact_enabled) table.scan_high = write;
+            if (comptime compact_enabled) {table.scan_high = write;rebuildPresence(table);}
             @memset(table.row_index[0..], 0);
             for (0..write) |slot| indexRow(table, @intCast(slot));
         }

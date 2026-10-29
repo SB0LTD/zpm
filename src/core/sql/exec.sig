@@ -55,12 +55,21 @@ pub fn Exec(comptime config: types.Config) type {
             dense_plans: usize = 0,
             compact_plans: usize = 0,
             compact_rows: usize = 0,
+            wide_dense_plans: usize = 0,
+            narrow_dense_plans: usize = 0,
+            factor_plans: usize = 0,
+            factor_keys: usize = 0,
+            factor_selected_rows: usize = 0,
+            nested_factor_plans: usize = 0,
+            nested_factor_keys: usize = 0,
+            presence_rejected_blocks:usize=0,
             gathered_rows: usize = 0,
             distinct_bitmap_bytes: usize = 0,
             groups: usize = 0,
             probes: usize = 0,
             dimension_probes: usize = 0,
             prefix_rejected: usize = 0,
+            cascade_rejected: usize = 0,
             scratch_cells: usize = 0,
             scratch_refs: usize = 0,
         };
@@ -832,7 +841,27 @@ pub fn Exec(comptime config: types.Config) type {
                 return true;
             }
 
-            fn comparisonMask(comptime op: ast.Op, table: *const S.Table, start: usize, count: usize, predicate: CompactPredicate) u64 {
+            fn liveMask(table:*const S.Table,start:usize,count:usize,dense:bool) u64 {
+                if(dense) return if(count==64) ~@as(u64,0) else (@as(u64,1)<<@intCast(count))-1;
+                var mask:u64=0;var i:usize=0;
+                if(comptime builtin.zig_backend==.stage2_llvm) {
+                    const zero:@Vector(8,u8)=@splat(0);
+                    while(i+8<=count):(i+=8) {
+                        const flags:@Vector(8,u8)=table.scan_live[start+i..][0..8].*;
+                        var bits:u8=@bitCast(flags!=zero);
+                        if(comptime builtin.cpu.arch.endian()==.big) bits=@bitReverse(bits);
+                        mask|=@as(u64,bits)<<@intCast(i);
+                    }
+                }
+                while(i<count):(i+=1) mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
+                return mask;
+            }
+
+            fn comparisonMask(comptime op: ast.Op, table: *const S.Table, start: usize, count: usize, predicate: CompactPredicate, stats:?*StreamStats) u64 {
+                if(comptime S.presence_enabled and op==.eq) if(!S.blockMayContain(table,predicate.column,start,count,predicate.value)) {
+                    if(stats) |value| value.presence_rejected_blocks+=1;
+                    return 0;
+                };
                 const base = @as(usize,predicate.column) * table.rows.len + start;
                 var mask: u64 = 0;
                 var i: usize = 0;
@@ -959,15 +988,12 @@ pub fn Exec(comptime config: types.Config) type {
                     // Reserve/check every input step before reading this bounded
                     // block. A work/cancel failure still leaves results private.
                     try self.session.checkpoints(count);
-                    var mask:u64=if(count==64) ~@as(u64,0) else (@as(u64,1)<<@intCast(count))-1;
-                    if (!dense) {
-                        mask=0;for(0..count) |i| mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
-                    }
+                    var mask=liveMask(table,start,count,dense);
                     visited+=@popCount(mask);
                     for (predicates[0..predicate_count]) |predicate| mask &= switch(predicate.op) {
-                        .eq=>comparisonMask(.eq,table,start,count,predicate),.ne=>comparisonMask(.ne,table,start,count,predicate),
-                        .lt=>comparisonMask(.lt,table,start,count,predicate),.le=>comparisonMask(.le,table,start,count,predicate),
-                        .gt=>comparisonMask(.gt,table,start,count,predicate),.ge=>comparisonMask(.ge,table,start,count,predicate),
+                        .eq=>comparisonMask(.eq,table,start,count,predicate,&self.work.stream_stats),.ne=>comparisonMask(.ne,table,start,count,predicate,&self.work.stream_stats),
+                        .lt=>comparisonMask(.lt,table,start,count,predicate,&self.work.stream_stats),.le=>comparisonMask(.le,table,start,count,predicate,&self.work.stream_stats),
+                        .gt=>comparisonMask(.gt,table,start,count,predicate,&self.work.stream_stats),.ge=>comparisonMask(.ge,table,start,count,predicate,&self.work.stream_stats),
                         else=>unreachable,
                     };
                     if (fused and p.key_count!=0 and key_nonnull) {
@@ -1029,6 +1055,10 @@ pub fn Exec(comptime config: types.Config) type {
                 prefix:?CompactPredicate=null,
                 prefix_mask:u64=0,
                 prefix_start:usize=0,
+                cascade:[config.predicates]CompactPredicate=undefined,
+                cascade_count:usize=0,
+                all_live:bool=false,
+                all_nonnull:bool=false,
                 row:if(S.compact_enabled) [config.columns]V.Cell else [0]V.Cell=undefined,
             };
 
@@ -1070,6 +1100,99 @@ pub fn Exec(comptime config: types.Config) type {
                 };
             }
 
+            fn projectionList(self:*const Query,table:*const S.Table,first:u16,columns:*u64,depth:usize,budget:*usize) bool {
+                var id=first;
+                while(id!=none) {
+                    if(!self.projectionNode(table,id,columns,depth,budget)) return false;
+                    id=self.pool.nodes[id].next;
+                }
+                return true;
+            }
+            fn projectionNode(self:*const Query,table:*const S.Table,id:u16,columns:*u64,depth:usize,budget:*usize) bool {
+                if(id==none) return true;
+                if(depth>=config.expr_depth or budget.*==0) return false;
+                budget.*-=1;
+                const node=self.pool.nodes[id];
+                switch(node.kind) {
+                    .column=>{
+                        if(node.level!=0 or node.relation!=0) return true;
+                        if(node.column>=table.column_count) return false;
+                        switch(table.columns[node.column].data_type) {
+                            .smallint,.integer32,.integer,.oid=>if(!value_module.integral(node.ty)) return false,
+                            .date=>if(node.ty!=.date) return false,
+                            else=>return false,
+                        }
+                        columns.*|=@as(u64,1)<<@intCast(node.column);return true;
+                    },
+                    .null_literal,.bool_literal,.int_literal,.text_literal,.decimal_literal=>return true,
+                    .unary,.not_op,.test_op,.cast=>return self.projectionNode(table,node.a,columns,depth+1,budget),
+                    .binary,.and_op,.or_op,.nullif,.like,.when_arm,.at_zone=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionNode(table,node.b,columns,depth+1,budget),
+                    .between=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionNode(table,node.b,columns,depth+1,budget) and self.projectionNode(table,node.c,columns,depth+1,budget),
+                    .in_list=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionList(table,node.b,columns,depth+1,budget),
+                    .coalesce,.function=>return self.projectionList(table,node.b,columns,depth+1,budget),
+                    .case_expr=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionList(table,node.b,columns,depth+1,budget) and self.projectionNode(table,node.c,columns,depth+1,budget),
+                    .aggregate=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionNode(table,node.c,columns,depth+1,budget),
+                    else=>return false,
+                }
+            }
+            fn projectionColumns(self:*const Query,p:*const B.Plan,table:*const S.Table,columns:*u64) bool {
+                // Relation numbers are local to a query block. Walking the
+                // whole shared pool confuses unrelated CTE/outer columns with
+                // this fact table and can disable (or over-gather) projection.
+                var budget:usize=config.expr_nodes*4;
+                if(!self.projectionNode(table,p.where,columns,0,&budget) or !self.projectionNode(table,p.having,columns,0,&budget)) return false;
+                for(p.keys[0..p.key_count]) |id| if(!self.projectionNode(table,id,columns,0,&budget)) return false;
+                for(p.aggs[0..p.agg_count]) |agg| if(!self.projectionNode(table,agg.arg,columns,0,&budget) or !self.projectionNode(table,agg.filter,columns,0,&budget)) return false;
+                for(p.targets[0..p.width]) |id| if(!self.projectionNode(table,id,columns,0,&budget)) return false;
+                for(p.distinct_on[0..p.distinct_on_count]) |id| if(!self.projectionNode(table,id,columns,0,&budget)) return false;
+                for(p.sources[0..p.source_count]) |source| if(!self.projectionNode(table,source.on,columns,0,&budget) or !self.projectionNode(table,source.probe,columns,0,&budget)) return false;
+                return true;
+            }
+
+            fn boundDate(node:*const ast.Node) ?i64 {
+                if(node.ty!=.date or !node.date_bound or (node.kind!=.text_literal and node.kind!=.cast)) return null;
+                return node.integer;
+            }
+            fn dateColumn(table:*const S.Table,node:*const ast.Node) bool {
+                return node.kind==.column and node.level==0 and node.relation==0 and node.ty==.date and
+                    node.column<table.column_count and table.columns[node.column].data_type==.date;
+            }
+            fn datePredicates(self:*const Query,id:u16,table:*const S.Table,out:*[2]CompactPredicate,used:*usize) bool {
+                const node=&self.pool.nodes[id];
+                if(node.kind==.between and !node.negated) {
+                    const column=&self.pool.nodes[node.a];if(!dateColumn(table,column)) return false;
+                    const low=boundDate(&self.pool.nodes[node.b]) orelse return false;
+                    const high=boundDate(&self.pool.nodes[node.c]) orelse return false;
+                    const nonnull=table.summary.columns[column.column].nonnull==table.summary.rows;
+                    out[0]=.{.column=column.column,.op=.ge,.value=low,.nonnull=nonnull};
+                    out[1]=.{.column=column.column,.op=.le,.value=high,.nonnull=nonnull};used.*=2;return true;
+                }
+                if(node.kind!=.binary) return false;
+                var op=node.op;switch(op){.eq,.ne,.lt,.le,.gt,.ge=>{},else=>return false}
+                var column=&self.pool.nodes[node.a];var literal=&self.pool.nodes[node.b];
+                if(dateColumn(table,literal)) {
+                    const swap=column;column=literal;literal=swap;
+                    op=switch(op){.lt=>.gt,.le=>.ge,.gt=>.lt,.ge=>.le,else=>op};
+                }
+                if(!dateColumn(table,column)) return false;
+                const value=boundDate(literal) orelse return false;
+                out[0]=.{.column=column.column,.op=op,.value=value,.nonnull=table.summary.columns[column.column].nonnull==table.summary.rows};used.*=1;return true;
+            }
+            fn collectCascade(self:*const Query,id:u16,first:u16,table:*const S.Table,cursor:*StreamCursor) bool {
+                if(id==first) return true;
+                const node=&self.pool.nodes[id];
+                if(node.kind==.and_op) return self.collectCascade(node.a,first,table,cursor) and self.collectCascade(node.b,first,table,cursor);
+                var predicates:[2]CompactPredicate=undefined;var used:usize=0;
+                if(!compactPredicates(self.pool,id,table,&predicates,&used)) {
+                    used=0;if(!self.datePredicates(id,table,&predicates,&used)) return false;
+                }
+                if(used>cursor.cascade.len-cursor.cascade_count) return false;
+                for(predicates[0..used]) |predicate| if(!predicate.nonnull) return false;
+                for(predicates[0..used]) |predicate| if(prefixCanReject(table,predicate)) {
+                    cursor.cascade[cursor.cascade_count]=predicate;cursor.cascade_count+=1;
+                };
+                return true;
+            }
             fn prepareStreamCursor(self:*const Query,p:*const B.Plan,cursor:*StreamCursor,early:bool) void {
                 const table=&self.tables[p.sources[0].table.?];
                 cursor.high=table.row_high;
@@ -1077,6 +1200,7 @@ pub fn Exec(comptime config: types.Config) type {
                     // Exactly the committed projection guard used by compact
                     // aggregates: old snapshots and own writes retain MVCC.
                     if(!self.committed_only or !table.summary.valid or table.summary.csn>self.snap.csn) return;
+                    cursor.all_live=table.summary.rows>=0 and @as(u64,@intCast(table.summary.rows))==table.scan_high and table.scan_high==table.row_high;
                     // A typed/computed residual need not prevent a safe first
                     // conjunct from rejecting fact rows before inner probes.
                     // Keep SQL's left-to-right error ordering: only the first
@@ -1085,18 +1209,18 @@ pub fn Exec(comptime config: types.Config) type {
                         var first=p.where;
                         while(self.pool.nodes[first].kind==.and_op) first=self.pool.nodes[first].a;
                         var predicate:[1]CompactPredicate=undefined;var used:usize=0;
-                        if(self.prefixJoinsSafe(p) and compactPredicates(self.pool,first,table,&predicate,&used) and used==1 and predicate[0].nonnull and prefixCanReject(table,predicate[0]))
+                        if(self.prefixJoinsSafe(p) and compactPredicates(self.pool,first,table,&predicate,&used) and used==1 and predicate[0].nonnull and prefixCanReject(table,predicate[0])) {
                             cursor.prefix=predicate[0];
+                            _=self.collectCascade(p.where,first,table,cursor);
+                        }
                     }
                     var columns:u64=0;
-                    for(self.pool.nodes[0..self.pool.len]) |node| {
-                        if(node.kind!=.column or node.level!=0 or node.relation!=0) continue;
-                        if(node.column>=table.column_count or !value_module.integral(node.ty)) return;
-                        switch(table.columns[node.column].data_type) {
-                            .smallint,.integer32,.integer,.oid=>{},
-                            else=>return,
-                        }
-                        columns|=@as(u64,1)<<@intCast(node.column);
+                    if(!self.projectionColumns(p,table,&columns)) return;
+                    cursor.all_nonnull=true;
+                    var required=columns;
+                    while(required!=0) {
+                        const column=@ctz(required);required&=required-1;
+                        if(table.summary.columns[column].nonnull!=table.summary.rows) {cursor.all_nonnull=false;break;}
                     }
                     cursor.columns=columns;cursor.high=table.scan_high;
                 }
@@ -1104,14 +1228,15 @@ pub fn Exec(comptime config: types.Config) type {
 
             fn streamFactRow(self:*Query,table:*const S.Table,cursor:*StreamCursor,slot:usize) ?[*]const V.Cell {
                 if(comptime S.compact_enabled) if(cursor.columns) |mask| {
-                    if(table.scan_live[slot]==0) return null;
-                    const nonnull=table.scan_nonnull[slot];
+                    if(!cursor.all_live and table.scan_live[slot]==0) return null;
+                    const nonnull=if(cursor.all_nonnull) ~@as(u64,0) else table.scan_nonnull[slot];
                     var columns=mask;
                     while(columns!=0) {
                         const column=@ctz(columns);
                         const bit=@as(u64,1)<<@intCast(column);
                         if(nonnull&bit!=0) {
-                            cursor.row[column]=.{.integer=table.scan_values[@as(usize,column)*table.rows.len+slot]};
+                            const value=table.scan_values[@as(usize,column)*table.rows.len+slot];
+                            cursor.row[column]=if(table.columns[column].data_type==.date) .{.date=@intCast(value)} else .{.integer=value};
                         } else cursor.row[column]=.null_value;
                         columns&=columns-1;
                     }
@@ -1134,21 +1259,30 @@ pub fn Exec(comptime config: types.Config) type {
                         while(cursor.prefix_mask==0 and cursor.next<cursor.high) {
                             const start=cursor.next;const count=@min(@as(usize,64),cursor.high-start);
                             try self.session.checkpoints(count);
-                            var mask:u64=0;
-                            for(0..count) |i| mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
+                            var mask=liveMask(table,start,count,cursor.all_live);
                             const visible=@popCount(mask);
                             self.work.stream_stats.rows+=visible;
                             try self.session.checkpoints(visible);
                             mask &= switch(predicate.op) {
-                                .eq=>comparisonMask(.eq,table,start,count,predicate),
-                                .ne=>comparisonMask(.ne,table,start,count,predicate),
-                                .lt=>comparisonMask(.lt,table,start,count,predicate),
-                                .le=>comparisonMask(.le,table,start,count,predicate),
-                                .gt=>comparisonMask(.gt,table,start,count,predicate),
-                                .ge=>comparisonMask(.ge,table,start,count,predicate),
+                                .eq=>comparisonMask(.eq,table,start,count,predicate,&self.work.stream_stats),
+                                .ne=>comparisonMask(.ne,table,start,count,predicate,&self.work.stream_stats),
+                                .lt=>comparisonMask(.lt,table,start,count,predicate,&self.work.stream_stats),
+                                .le=>comparisonMask(.le,table,start,count,predicate,&self.work.stream_stats),
+                                .gt=>comparisonMask(.gt,table,start,count,predicate,&self.work.stream_stats),
+                                .ge=>comparisonMask(.ge,table,start,count,predicate,&self.work.stream_stats),
                                 else=>unreachable,
                             };
                             self.work.stream_stats.prefix_rejected+=visible-@popCount(mask);
+                            for(cursor.cascade[0..cursor.cascade_count]) |extra| {
+                                if(mask==0) break;
+                                const before=@popCount(mask);try self.session.checkpoints(before);
+                                const single=[_]CompactPredicate{extra};var selected=mask;
+                                while(selected!=0) {
+                                    const i=@ctz(selected);selected&=selected-1;
+                                    if(!compactKeep(table,start+i,&single)) mask&=~(@as(u64,1)<<@intCast(i));
+                                }
+                                self.work.stream_stats.cascade_rejected+=before-@popCount(mask);
+                            }
                             cursor.prefix_start=start;cursor.prefix_mask=mask;cursor.next+=count;
                         }
                         if(cursor.prefix_mask==0) return false;
@@ -1181,10 +1315,477 @@ pub fn Exec(comptime config: types.Config) type {
                 return false;
             }
 
+            const FactorAggregate=struct {total:i128 align(@alignOf(V.Cell))=0,count:i64=0};
+            const factor_header=(@sizeOf(i64)+@alignOf(FactorAggregate)-1)/@alignOf(FactorAggregate)*@alignOf(FactorAggregate);
+            fn factorRows(bytes:[*]u8) *i64 {return @ptrCast(@alignCast(bytes));}
+            fn factorStates(bytes:[*]u8,count:usize) []FactorAggregate {
+                const pointer:[*]FactorAggregate=@ptrCast(@alignCast(bytes+factor_header));return pointer[0..count];
+            }
+            fn factorOperand(self:*const Query,id:u16,key_column:u16) bool {
+                const node=self.pool.nodes[id];
+                return node.kind==.int_literal or (node.kind==.column and node.level==0 and value_module.integral(node.ty) and (node.relation!=0 or node.column==key_column));
+            }
+            fn factorOn(self:*const Query,id:u16,key_column:u16) bool {
+                if(id==none) return true;
+                const node=self.pool.nodes[id];
+                if(node.kind==.and_op or node.kind==.or_op) return self.factorOn(node.a,key_column) and self.factorOn(node.b,key_column);
+                if(node.kind!=.binary) return false;
+                return switch(node.op) {
+                    .eq,.ne,.lt,.le,.gt,.ge=>self.factorOperand(node.a,key_column) and self.factorOperand(node.b,key_column),
+                    else=>false,
+                };
+            }
+            fn factorPredicates(self:*const Query,id:u16,table:*const S.Table,out:[]CompactPredicate,used:*usize) bool {
+                if(id==none) return true;
+                const node=self.pool.nodes[id];
+                if(node.kind==.and_op) return self.factorPredicates(node.a,table,out,used) and self.factorPredicates(node.b,table,out,used);
+                var leaf:[2]CompactPredicate=undefined;var count:usize=0;
+                if(!compactPredicates(self.pool,id,table,&leaf,&count)) {
+                    count=0;if(!self.datePredicates(id,table,&leaf,&count)) return false;
+                }
+                if(count>out.len-used.*) return false;
+                @memcpy(out[used.*..][0..count],leaf[0..count]);used.*+=count;return true;
+            }
+
+            /// Distribute direct fact aggregates over non-throwing unique-key
+            /// inner joins. All admission/proof failures retain ordinary SQL.
+            /// Scratch scales with the admitted join-key domain, never fact rows.
+            noinline fn factorGroup(self:*Query,p:*const B.Plan,outer:?*const E.Context,table:*const S.Table) Error!?List {
+                if(p.source_count<2 or p.key_count==0 or p.agg_count==0 or !self.committed_only or !table.summary.valid or
+                    table.summary.rows<0 or table.summary.csn>self.snap.csn or table.scan_high!=table.row_high) return null;
+                // Every wide integer sum of at most 2^31-1 i64 inputs fits i128.
+                // Small configured NUMERIC capacities need their canonical path.
+                if(comptime config.numeric_digits<39) return null;
+                const join_key=self.pool.nodes[p.sources[1].probe];
+                if(join_key.kind!=.column or join_key.level!=0 or join_key.relation!=0 or !value_module.integral(join_key.ty)) return null;
+                for(p.sources[1..p.source_count]) |source| {
+                    if(!self.factorOperand(source.probe,join_key.column) or !self.factorOn(source.on,join_key.column)) return null;
+                }
+                for(p.keys[0..p.key_count]) |id| {
+                    const key=self.pool.nodes[id];
+                    if(key.kind!=.column or key.level!=0 or key.relation==0) return null;
+                    const dimension=&self.tables[p.sources[key.relation].table.?];
+                    if(!S.summaryKeyType(dimension.columns[key.column].data_type)) return null;
+                }
+                var transitions:[config.columns]Transition=undefined;
+                if(!self.prepareTransitions(p,transitions[0..p.agg_count])) return null;
+                for(transitions[0..p.agg_count]) |transition| if(transition.kind==.sum_integer and table.summary.columns[transition.column].nonnull!=0) {
+                    const amounts=table.integer_bounds[transition.column];if(!amounts.known) return null;
+                    const n=@as(i128,table.summary.rows);
+                    if(n*@as(i128,@min(amounts.low,0)) < -9223372036854775808 or n*@as(i128,@max(amounts.high,0))>9223372036854775807) return null;
+                };
+                var predicates:[config.predicates*2]CompactPredicate=undefined;var predicate_count:usize=0;
+                if(!self.factorPredicates(p.where,table,&predicates,&predicate_count)) return null;
+                const bounds=table.integer_bounds[join_key.column];if(!bounds.known) return null;
+                const span128=@as(i128,bounds.high)-bounds.low+1;
+                const stride=factor_header+p.agg_count*@sizeOf(FactorAggregate);
+                const state_cells=(stride+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell);
+                const cells_per_key=(stride+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell)+p.key_count+p.agg_count+state_cells+p.width+1;
+                const domain_budget=@min((self.work.cell_high-self.work.cell_low)/cells_per_key,(self.work.ref_high-self.work.ref_low)/16);
+                if(span128<=0 or span128>domain_budget) return null;
+                const span:usize=@intCast(span128);
+                const bytes=span*stride;
+                const cell_start=self.work.cell_low;const ref_start=self.work.ref_low;
+                const partial_at=try self.cells((bytes+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell));
+                const partial:[*]u8=@ptrCast(&self.work.cells[partial_at]);@memset(partial[0..bytes],0);
+                var slots:usize=2;while(slots<span*2) slots*=2;
+                const buckets=try self.refs(slots);@memset(self.work.refs[buckets..][0..slots],absent);
+                const tickets=try self.refs(span);var groups:usize=0;
+                const key_nonnull=table.summary.columns[join_key.column].nonnull==table.summary.rows;
+                const dense=table.summary.rows==@as(i64,@intCast(table.scan_high));
+                var start:usize=0;
+                while(start<table.scan_high):(start+=64) {
+                    const count=@min(@as(usize,64),table.scan_high-start);try self.session.checkpoints(count);
+                    var mask=liveMask(table,start,count,dense);self.work.stream_stats.rows+=@popCount(mask);
+                    for(predicates[0..predicate_count]) |predicate| {
+                        if(mask==0) break;
+                        mask&=switch(predicate.op) {
+                            .eq=>comparisonMask(.eq,table,start,count,predicate,&self.work.stream_stats),.ne=>comparisonMask(.ne,table,start,count,predicate,&self.work.stream_stats),
+                            .lt=>comparisonMask(.lt,table,start,count,predicate,&self.work.stream_stats),.le=>comparisonMask(.le,table,start,count,predicate,&self.work.stream_stats),
+                            .gt=>comparisonMask(.gt,table,start,count,predicate,&self.work.stream_stats),.ge=>comparisonMask(.ge,table,start,count,predicate,&self.work.stream_stats),else=>unreachable,
+                        };
+                    }
+                    while(mask!=0) {
+                        const i=@ctz(mask);mask&=mask-1;const slot=start+i;const flags=table.scan_nonnull[slot];
+                        if(!key_nonnull and flags&(@as(u64,1)<<@intCast(join_key.column))==0) continue;
+                        const key=table.scan_values[@as(usize,join_key.column)*table.rows.len+slot];
+                        const at=partial+@as(usize,@intCast(@as(i128,key)-bounds.low))*stride;
+                        factorRows(at).*+=1;self.work.stream_stats.factor_selected_rows+=1;
+                        for(transitions[0..p.agg_count],factorStates(at,p.agg_count)) |transition,*state| {
+                            if(transition.kind==.count_star) {state.count+=1;continue;}
+                            if(flags&(@as(u64,1)<<@intCast(transition.column))==0) continue;
+                            state.count+=1;
+                            if(transition.kind==.sum_integer or transition.kind==.sum_wide) state.total+=table.scan_values[@as(usize,transition.column)*table.rows.len+slot];
+                        }
+                    }
+                }
+                var ctx=self.context(outer);var fact:[config.columns]V.Cell=undefined;
+                var key_cells:[config.columns]*const V.Cell=undefined;
+                for(0..span) |key_index| {
+                    const input=partial+key_index*stride;if(factorRows(input).*==0) continue;
+                    self.work.stream_stats.factor_keys+=1;
+                    fact[join_key.column]=.{.integer=@intCast(@as(i128,bounds.low)+key_index)};ctx.row=null;ctx.tuple[0]=&fact;
+                    var matched=true;
+                    for(p.sources[1..p.source_count],1..) |source,stage| {
+                        try self.session.checkpoint();var temporary:V.Cell=undefined;
+                        const key=try E.evalRef(&ctx,source.probe,&temporary);
+                        if(key.*==.null_value) {matched=false;break;}
+                        self.work.stream_stats.dimension_probes+=1;
+                        const dimension=&self.tables[source.table.?];
+                        const visible=S.lookupVersionAt(dimension,key,self.snap) orelse {matched=false;break;};
+                        ctx.tuple[stage]=&dimension.versions[visible].cells;
+                        if(source.on!=none and (try E.truth(&ctx,source.on))!=true) {matched=false;break;}
+                    }
+                    if(!matched) continue;
+                    var hash:usize=2166136261;
+                    for(p.keys[0..p.key_count],0..) |id,column| {
+                        key_cells[column]=E.columnRef(&ctx,&self.pool.nodes[id]);
+                        hash=(hash^(if(key_cells[column].*==.null_value) @as(usize,0x9e3779b9) else V.hash(key_cells[column])))*%16777619;
+                    }
+                    var bucket=hash&(slots-1);var group_at:u32=undefined;
+                    while(true) {
+                        try self.session.checkpoint();self.work.stream_stats.probes+=1;
+                        const found=self.work.refs[buckets+bucket];
+                        if(found==absent) {
+                            group_at=try self.cells(p.key_count+p.agg_count+state_cells);
+                            for(key_cells[0..p.key_count],0..) |key,column| self.work.cells[group_at+column]=key.*;
+                            const state_bytes:[*]u8=@ptrCast(&self.work.cells[group_at+p.key_count+p.agg_count]);@memset(state_bytes[0..stride],0);
+                            self.work.refs[buckets+bucket]=group_at;self.work.refs[tickets+groups]=group_at;groups+=1;break;
+                        }
+                        var equal=true;for(key_cells[0..p.key_count],0..) |key,column| if(V.compare(key,&self.work.cells[found+column])!=0) {equal=false;break;};
+                        if(equal) {group_at=found;break;}bucket=(bucket+1)&(slots-1);
+                    }
+                    const output:[*]u8=@ptrCast(&self.work.cells[group_at+p.key_count+p.agg_count]);
+                    factorRows(output).*+=factorRows(input).*;
+                    for(factorStates(input,p.agg_count),factorStates(output,p.agg_count)) |value,*state| {state.count+=value.count;state.total+=value.total;}
+                }
+                if(groups!=0) {
+                    const scratch=try self.refs(groups);const sorter:GroupSorter=.{.query=self,.width=p.key_count};
+                    _=try sort_module.mergeSort(self.work.refs[tickets..][0..groups],self.work.refs[scratch..][0..groups],&sorter);
+                }
+                var out:List=.{};
+                for(self.work.refs[tickets..][0..groups]) |at| {
+                    const bytes_at:[*]u8=@ptrCast(&self.work.cells[at+p.key_count+p.agg_count]);var states:[config.columns]Accumulator=undefined;
+                    for(factorStates(bytes_at,p.agg_count),transitions[0..p.agg_count],states[0..p.agg_count]) |value,transition,*state| {
+                        state.*=.{.count=value.count,.wide=value.total,.integer=if(transition.kind==.sum_integer) @intCast(value.total) else 0};
+                    }
+                    try self.projectGroup(p,at,states[0..p.agg_count],outer,&out);
+                }
+                const result=try self.finish(p,out);
+                self.work.stream_stats.factor_plans+=1;self.work.stream_stats.groups+=groups;
+                self.work.stream_stats.scratch_cells=@max(self.work.stream_stats.scratch_cells,self.work.cell_low-cell_start);
+                self.work.stream_stats.scratch_refs=@max(self.work.stream_stats.scratch_refs,self.work.ref_low-ref_start);
+                return result;
+            }
+
+            const NestedInput=enum {none,key,rows,total};
+            const NestedPredicate=struct {input:NestedInput,op:ast.Op,value:i64};
+            const NestedAggregate=struct {total:i128 align(@alignOf(V.Cell))=0,extreme:i128 align(@alignOf(V.Cell))=0,count:i64=0};
+            fn nestedStates(bytes:[*]u8,count:usize) []NestedAggregate {
+                const pointer:[*]NestedAggregate=@ptrCast(@alignCast(bytes+factor_header));return pointer[0..count];
+            }
+            fn nestedInput(self:*const Query,first:u16,outputs:[]const NestedInput) NestedInput {
+                var id=first;
+                for(0..config.expr_depth) |_| {
+                    const node=self.pool.nodes[id];
+                    if(node.kind==.cast and node.ty==.numeric and node.typmod<0) {id=node.a;continue;}
+                    if(node.kind==.column and node.level==0 and node.relation==0 and node.column<outputs.len) return outputs[node.column];
+                    return .none;
+                }
+                return .none;
+            }
+            fn nestedLiteral(self:*const Query,first:u16) ?i64 {
+                var id=first;
+                for(0..config.expr_depth) |_| {
+                    const node=self.pool.nodes[id];
+                    if(node.kind==.cast and node.ty==.numeric and node.typmod<0) {id=node.a;continue;}
+                    return if(node.kind==.int_literal) node.integer else null;
+                }
+                return null;
+            }
+            fn nestedPredicates(self:*const Query,id:u16,outputs:[]const NestedInput,out:[]NestedPredicate,used:*usize) bool {
+                if(id==none) return true;
+                const node=self.pool.nodes[id];
+                if(node.kind==.and_op) return self.nestedPredicates(node.a,outputs,out,used) and self.nestedPredicates(node.b,outputs,out,used);
+                if(node.kind!=.binary or used.*==out.len) return false;
+                var op=node.op;switch(op){.eq,.ne,.lt,.le,.gt,.ge=>{},else=>return false}
+                var input=self.nestedInput(node.a,outputs);var literal=self.nestedLiteral(node.b);
+                if(input==.none or literal==null) {
+                    input=self.nestedInput(node.b,outputs);literal=self.nestedLiteral(node.a);
+                    op=switch(op){.lt=>.gt,.le=>.ge,.gt=>.lt,.ge=>.le,else=>op};
+                }
+                if(input==.none or literal==null) return false;
+                out[used.*]=.{.input=input,.op=op,.value=literal.?};used.*+=1;return true;
+            }
+            fn nestedValue(input:NestedInput,key:i64,bucket:*const NarrowBucket) i128 {
+                return switch(input){.key=>key,.rows=>bucket.rows,.total=>bucket.total,.none=>unreachable};
+            }
+
+            /// Carry a non-null COUNT/SUM producer directly into a grouped
+            /// unique-key consumer. No producer Cell table or NUMERIC per key.
+            noinline fn nestedFactorGroup(self:*Query,p:*const B.Plan,outer:?*const E.Context) Error!?List {
+                if(outer!=null or p.set_op!=.none or p.correlated or !p.grouped or p.source_count!=2 or p.key_count==0 or p.agg_count==0 or !self.committed_only) return null;
+                if(comptime config.numeric_digits<39) return null;
+                const source=p.sources[0];var producer_id=source.plan;
+                if(source.table!=null or source.view!=null or p.sources[1].table==null or p.sources[1].join!=.inner or p.sources[1].probe==none) return null;
+                if(source.cte!=B.no_cte) {
+                    // A shared/recursive producer owns a materialization lifetime.
+                    // Fuse only a single consumer, leaving that lifetime untouched.
+                    for(self.plans.ctes[0..self.plans.cte_len]) |definition| if(definition.recursive) {return null;};
+                    if(self.work.ctes[source.cte].state!=.idle) return null;
+                    var references:usize=0;for(self.plans.items[0..self.plans.len]) |plan| for(plan.sources[0..plan.source_count]) |item| {references+=@intFromBool(item.cte==source.cte);};
+                    if(references!=1) return null;
+                    producer_id=self.plans.ctes[source.cte].plan;
+                }
+                if(producer_id==none) return null;
+                const producer=&self.plans.items[producer_id];
+                if(producer.set_op!=.none or producer.correlated or !producer.grouped or producer.source_count!=1 or producer.sources[0].table==null or
+                    producer.where!=none or producer.having!=none or producer.key_count!=1 or producer.agg_count!=2 or producer.order_count!=0 or
+                    producer.distinct!=.none or producer.limit!=0xffffffffffffffff or producer.offset!=0) return null;
+                const table=&self.tables[producer.sources[0].table.?];
+                if(!table.summary.valid or table.summary.rows<0 or table.summary.csn>self.snap.csn or table.scan_high!=table.row_high) return null;
+                const key=self.pool.nodes[producer.keys[0]];
+                if(key.kind!=.column or key.level!=0 or key.relation!=0 or !value_module.integral(key.ty)) return null;
+                var transitions:[2]Transition=undefined;if(!self.prepareTransitions(producer,&transitions)) return null;
+                const count_index:usize=if(transitions[0].kind==.count_star) 0 else 1;const sum_index=1-count_index;
+                if(transitions[count_index].kind!=.count_star or (transitions[sum_index].kind!=.sum_integer and transitions[sum_index].kind!=.sum_wide)) return null;
+                const sum_column=transitions[sum_index].column;
+                // The narrow producer state represents every prefix exactly.
+                // Nullable measures need a separate non-null count; defer those
+                // to the canonical executor rather than treating NULL as zero.
+                if(table.summary.columns[sum_column].nonnull!=table.summary.rows) return null;
+                const amounts=table.integer_bounds[sum_column];const bounds=table.integer_bounds[key.column];if(!amounts.known or !bounds.known) return null;
+                const n=@as(i128,table.summary.rows);const low=n*@as(i128,@min(amounts.low,0));const high=n*@as(i128,@max(amounts.high,0));
+                if(low < -9223372036854775808 or high>9223372036854775807) return null;
+                var outputs:[config.columns]NestedInput=undefined;
+                for(producer.targets[0..producer.count],0..) |id,column| {
+                    const target=self.pool.nodes[id];
+                    if(target.kind!=.column or target.level!=0 or target.relation!=group_relation) return null;
+                    outputs[column]=if(target.column==0) .key else if(target.column==1+count_index) .rows else if(target.column==1+sum_index) .total else return null;
+                }
+                const probe=self.pool.nodes[p.sources[1].probe];
+                if(probe.kind!=.column or probe.level!=0 or probe.relation!=0 or probe.column>=producer.count or outputs[probe.column]!=.key or !self.factorOn(p.sources[1].on,probe.column)) return null;
+                const dimension=&self.tables[p.sources[1].table.?];
+                for(p.keys[0..p.key_count]) |id| {
+                    const group_key=self.pool.nodes[id];
+                    if(group_key.kind!=.column or group_key.level!=0 or group_key.relation!=1 or !S.summaryKeyType(dimension.columns[group_key.column].data_type)) return null;
+                }
+                var inputs:[config.columns]NestedInput=undefined;
+                for(p.aggs[0..p.agg_count],0..) |agg,index| {
+                    if(agg.distinct or agg.filter!=none) return null;
+                    if(agg.kind==.count_star) {inputs[index]=.none;continue;}
+                    if(agg.kind!=.count and agg.kind!=.sum and agg.kind!=.avg and agg.kind!=.min and agg.kind!=.max) return null;
+                    const input=self.pool.nodes[agg.arg];
+                    if(input.kind!=.column or input.level!=0 or input.relation!=0 or input.column>=producer.count) return null;
+                    inputs[index]=outputs[input.column];
+                    if(agg.kind==.sum and agg.ty==.int8) {
+                        const lower:i128=switch(inputs[index]){.key=>@min(bounds.low,0),.rows=>0,.total=>low,.none=>unreachable};
+                        const upper:i128=switch(inputs[index]){.key=>@max(bounds.high,0),.rows=>n,.total=>high,.none=>unreachable};
+                        if(n*lower < -9223372036854775808 or n*upper>9223372036854775807) return null;
+                    }
+                }
+                var predicates:[config.predicates]NestedPredicate=undefined;var predicate_count:usize=0;
+                if(!self.nestedPredicates(p.where,outputs[0..producer.count],&predicates,&predicate_count)) return null;
+                const stride=factor_header+p.agg_count*@sizeOf(NestedAggregate);const state_cells=(stride+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell);
+                const per_key=1+p.key_count+p.agg_count+state_cells+p.width+1;
+                const domain_budget=@min((self.work.cell_high-self.work.cell_low)/per_key,(self.work.ref_high-self.work.ref_low)/16);
+                // Admission is in caller-owned bytes and handles, never a new
+                // compile-time SQL row ceiling. Conservative extrema can decline.
+                const span128=@as(i128,bounds.high)-bounds.low+1;if(span128<=0 or span128>domain_budget) return null;
+                const span:usize=@intCast(span128);const cell_start=self.work.cell_low;const ref_start=self.work.ref_low;
+                const partial_at=try self.cells((span*@sizeOf(NarrowBucket)+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell));
+                const partial_ptr:[*]NarrowBucket=@ptrCast(@alignCast(&self.work.cells[partial_at]));const partial=partial_ptr[0..span];for(partial) |*bucket| bucket.*=.{};
+                var slots:usize=2;while(slots<span*2) slots*=2;
+                const buckets=try self.refs(slots);@memset(self.work.refs[buckets..][0..slots],absent);const tickets=try self.refs(span);var groups:usize=0;
+                const dense=table.summary.rows==@as(i64,@intCast(table.scan_high));const key_nonnull=table.summary.columns[key.column].nonnull==table.summary.rows;
+                var start:usize=0;
+                while(start<table.scan_high):(start+=64) {
+                    const count=@min(@as(usize,64),table.scan_high-start);try self.session.checkpoints(count);
+                    const keys=table.scan_values[@as(usize,key.column)*table.rows.len+start..][0..count];
+                    const values=table.scan_values[@as(usize,sum_column)*table.rows.len+start..][0..count];
+                    if(dense and key_nonnull) {
+                        self.work.stream_stats.rows+=count;
+                        for(keys,values) |key_value,value| {const bucket=&partial[@intCast(@as(i128,key_value)-bounds.low)];bucket.rows+=1;bucket.total+=value;}
+                    } else {
+                        var mask=liveMask(table,start,count,dense);self.work.stream_stats.rows+=@popCount(mask);
+                        while(mask!=0) {
+                            const i=@ctz(mask);mask&=mask-1;
+                            // A NULL producer key cannot pass this integral PK
+                            // equality join. Its SUM is proven non-throwing above.
+                            if(!key_nonnull and table.scan_nonnull[start+i]&(@as(u64,1)<<@intCast(key.column))==0) continue;
+                            const bucket=&partial[@intCast(@as(i128,keys[i])-bounds.low)];bucket.rows+=1;bucket.total+=values[i];
+                        }
+                    }
+                }
+                var ctx=self.context(outer);var producer_cells:[config.columns]V.Cell=undefined;var key_cells:[config.columns]*const V.Cell=undefined;
+                for(partial,0..) |*value,index| {
+                    if(value.rows==0) continue;try self.session.checkpoint();self.work.stream_stats.nested_factor_keys+=1;
+                    const key_value:i64=@intCast(@as(i128,bounds.low)+index);var keep_key=true;
+                    for(predicates[0..predicate_count]) |predicate| {
+                        const input=nestedValue(predicate.input,key_value,value);
+                        const passes=switch(predicate.op){.eq=>input==predicate.value,.ne=>input!=predicate.value,.lt=>input<predicate.value,.le=>input<=predicate.value,.gt=>input>predicate.value,.ge=>input>=predicate.value,else=>unreachable};
+                        if(!passes) {keep_key=false;break;}
+                    }
+                    if(!keep_key) continue;
+                    producer_cells[probe.column]=.{.integer=key_value};ctx.row=null;ctx.tuple[0]=&producer_cells;
+                    self.work.stream_stats.dimension_probes+=1;
+                    const visible=S.lookupVersionAt(dimension,&producer_cells[probe.column],self.snap) orelse continue;
+                    ctx.tuple[1]=&dimension.versions[visible].cells;
+                    if(p.sources[1].on!=none and (try E.truth(&ctx,p.sources[1].on))!=true) continue;
+                    var hash:usize=2166136261;
+                    for(p.keys[0..p.key_count],0..) |id,column| {key_cells[column]=E.columnRef(&ctx,&self.pool.nodes[id]);hash=(hash^(if(key_cells[column].*==.null_value) @as(usize,0x9e3779b9) else V.hash(key_cells[column])))*%16777619;}
+                    var bucket=hash&(slots-1);var group_at:u32=undefined;
+                    while(true) {
+                        try self.session.checkpoint();self.work.stream_stats.probes+=1;const found=self.work.refs[buckets+bucket];
+                        if(found==absent) {
+                            group_at=try self.cells(p.key_count+p.agg_count+state_cells);
+                            for(key_cells[0..p.key_count],0..) |group_key,column| self.work.cells[group_at+column]=group_key.*;
+                            const bytes:[*]u8=@ptrCast(&self.work.cells[group_at+p.key_count+p.agg_count]);@memset(bytes[0..stride],0);
+                            self.work.refs[buckets+bucket]=group_at;self.work.refs[tickets+groups]=group_at;groups+=1;break;
+                        }
+                        var equal=true;for(key_cells[0..p.key_count],0..) |group_key,column| if(V.compare(group_key,&self.work.cells[found+column])!=0) {equal=false;break;};
+                        if(equal) {group_at=found;break;}bucket=(bucket+1)&(slots-1);
+                    }
+                    const bytes:[*]u8=@ptrCast(&self.work.cells[group_at+p.key_count+p.agg_count]);factorRows(bytes).*+=1;
+                    for(p.aggs[0..p.agg_count],inputs[0..p.agg_count],nestedStates(bytes,p.agg_count)) |agg,input,*state| {
+                        if(agg.kind==.count_star or agg.kind==.count) {state.count+=1;continue;}
+                        const scalar=nestedValue(input,key_value,value);
+                        if(agg.kind==.min or agg.kind==.max) state.extreme=if(state.count==0) scalar else if(agg.kind==.min) @min(state.extreme,scalar) else @max(state.extreme,scalar)
+                        else state.total+=scalar;
+                        state.count+=1;
+                    }
+                }
+                if(groups!=0) {const scratch=try self.refs(groups);const sorter:GroupSorter=.{.query=self,.width=p.key_count};_=try sort_module.mergeSort(self.work.refs[tickets..][0..groups],self.work.refs[scratch..][0..groups],&sorter);}
+                var out:List=.{};
+                for(self.work.refs[tickets..][0..groups]) |at| {
+                    const bytes:[*]u8=@ptrCast(&self.work.cells[at+p.key_count+p.agg_count]);var states:[config.columns]Accumulator=undefined;
+                    for(p.aggs[0..p.agg_count],nestedStates(bytes,p.agg_count),states[0..p.agg_count]) |agg,value,*state| {
+                        state.*=.{.count=value.count,.wide=value.total};
+                        if(value.count!=0) {
+                            if(agg.kind==.min or agg.kind==.max) state.value=if(value_module.integral(agg.arg_ty)) .{.integer=@intCast(value.extreme)} else try self.numericOf(value.extreme)
+                            else if(agg.kind==.sum or agg.kind==.avg) {
+                                if(!value_module.integral(agg.arg_ty)) state.value=try self.numericOf(value.total)
+                                else if(agg.kind==.sum and agg.ty==.int8) state.integer=@intCast(value.total);
+                            }
+                        }
+                    }
+                    try self.projectGroup(p,at,states[0..p.agg_count],outer,&out);
+                }
+                const result=try self.finish(p,out);self.work.stream_stats.nested_factor_plans+=1;self.work.stream_stats.groups+=groups;
+                self.work.stream_stats.scratch_cells=@max(self.work.stream_stats.scratch_cells,self.work.cell_low-cell_start);self.work.stream_stats.scratch_refs=@max(self.work.stream_stats.scratch_refs,self.work.ref_low-ref_start);
+                return result;
+            }
+
+            const WideBucket=struct {
+                // Storage references admit at most 2^31-1 rows; even i64 input
+                // extremes therefore fit exactly in this signed i128 total.
+                total:i128 align(@alignOf(V.Cell))=0,
+                rows:i64=0,
+                nonnull:i64=0,
+            };
+            const NarrowBucket=struct {total:i64=0,rows:i64=0};
+
+            /// Exact wide arithmetic over bounded integral grouping domains.
+            /// The state is borrowed from the query arena, never a comptime
+            /// cardinality-sized array or an input-sized handle list.
+            noinline fn wideDenseGroup(self:*Query,p:*const B.Plan,outer:?*const E.Context,table:*const S.Table) Error!?List {
+                if(!self.committed_only or !table.summary.valid or table.summary.csn>self.snap.csn or p.where!=none or p.key_count!=1 or p.agg_count!=2) return null;
+                const key=self.pool.nodes[p.keys[0]];
+                if(key.kind!=.column or key.level!=0 or key.relation!=0 or !value_module.integral(key.ty)) return null;
+                var transitions:[2]Transition=undefined;
+                if(!self.prepareTransitions(p,&transitions)) return null;
+                const count_index:usize=if(transitions[0].kind==.count_star) 0 else 1;
+                const sum_index=1-count_index;
+                if(transitions[count_index].kind!=.count_star or transitions[sum_index].kind!=.sum_wide) return null;
+                const bounds=table.integer_bounds[key.column];
+                if(!bounds.known) return null;
+                const sum_column=transitions[sum_index].column;
+                const amounts=table.integer_bounds[sum_column];
+                if(amounts.known and table.summary.rows>=0 and table.summary.columns[sum_column].nonnull==table.summary.rows) {
+                    const rows=@as(i128,table.summary.rows);
+                    const low=rows*@as(i128,@min(amounts.low,0));
+                    const high=rows*@as(i128,@max(amounts.high,0));
+                    // This bounds every group AND every accumulation prefix,
+                    // including mixed signs, not just the final table total.
+                    if(low>=-9223372036854775808 and high<=9223372036854775807)
+                        return self.typedDenseGroup(p,outer,table,key.column,bounds,sum_column,count_index,sum_index,true);
+                }
+                return self.typedDenseGroup(p,outer,table,key.column,bounds,sum_column,count_index,sum_index,false);
+            }
+
+            noinline fn typedDenseGroup(self:*Query,p:*const B.Plan,outer:?*const E.Context,table:*const S.Table,key_column:u16,bounds:S.IntegerBounds,sum_column:u16,count_index:usize,sum_index:usize,comptime narrow:bool) Error!?List {
+                const Bucket=if(narrow) NarrowBucket else WideBucket;
+                const span128=@as(i128,bounds.high)-bounds.low+1;
+                const cell_budget=self.work.cell_high-self.work.cell_low;
+                const ref_budget=self.work.ref_high-self.work.ref_low;
+                const output_cells=1+p.agg_count+p.width;
+                // Round state cost upward per domain entry and leave room for
+                // all output groups and finish/sort handles before reserving.
+                const state_per_bucket=(@sizeOf(Bucket)+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell);
+                const bucket_budget=@min(cell_budget/(state_per_bucket+output_cells),ref_budget/4);
+                if(span128+1>bucket_budget) return null;
+                const span:usize=@intCast(span128);const size=span+1;
+                const state_cells=(size*@sizeOf(Bucket)+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell);
+                const state_at=try self.cells(state_cells);
+                const ptr:[*]Bucket=@ptrCast(@alignCast(&self.work.cells[state_at]));
+                const buckets=ptr[0..size];for(buckets) |*bucket| bucket.*=.{};
+                const key_nonnull=table.summary.columns[key_column].nonnull==table.summary.rows;
+                const sum_nonnull=if(narrow) true else table.summary.columns[sum_column].nonnull==table.summary.rows;
+                const dense=table.summary.rows==@as(i64,@intCast(table.scan_high));
+                var visited:usize=0;defer {self.work.stream_stats.rows+=visited;self.work.stream_stats.compact_rows+=visited;}
+                var start:usize=0;
+                while(start<table.scan_high):(start+=64) {
+                    const count=@min(@as(usize,64),table.scan_high-start);
+                    try self.session.checkpoints(count);
+                    const keys=table.scan_values[@as(usize,key_column)*table.rows.len+start..][0..count];
+                    const values=table.scan_values[@as(usize,sum_column)*table.rows.len+start..][0..count];
+                    if(dense and key_nonnull and sum_nonnull) {
+                        visited+=count;
+                        for(keys,values) |key_value,value| {
+                            const bucket=&buckets[@intCast(@as(i128,key_value)-bounds.low)];
+                            bucket.rows+=1;
+                            if(comptime !narrow) bucket.nonnull+=1;
+                            bucket.total+=value;
+                        }
+                    } else {
+                        var mask=liveMask(table,start,count,dense);visited+=@popCount(mask);
+                        while(mask!=0) {
+                            const i=@ctz(mask);mask&=mask-1;
+                            const nonnull=table.scan_nonnull[start+i];
+                            const slot:usize=if(!key_nonnull and nonnull&(@as(u64,1)<<@intCast(key_column))==0) span else @intCast(@as(i128,keys[i])-bounds.low);
+                            const bucket=&buckets[slot];bucket.rows+=1;
+                            if(sum_nonnull or nonnull&(@as(u64,1)<<@intCast(sum_column))!=0) {
+                                if(comptime !narrow) bucket.nonnull+=1;
+                                bucket.total+=values[i];
+                            }
+                        }
+                    }
+                }
+                var out:List=.{};var groups:usize=0;
+                // Canonical grouping order uses NULL first, then integral keys.
+                // Final SQL ORDER BY/HAVING/projection still run normally.
+                for(0..size) |index| {
+                    const bucket_index=if(index==0) span else index-1;
+                    const bucket=&buckets[bucket_index];if(bucket.rows==0) continue;
+                    const at=try self.cells(1+p.agg_count);
+                    self.work.cells[at]=if(bucket_index==span) .null_value else .{.integer=@intCast(@as(i128,bounds.low)+bucket_index)};
+                    var states:[2]Accumulator=.{.{},.{}};
+                    states[count_index].count=bucket.rows;
+                    states[sum_index].count=if(narrow) bucket.rows else bucket.nonnull;states[sum_index].wide=bucket.total;
+                    try self.projectGroup(p,at,&states,outer,&out);groups+=1;
+                }
+                self.work.stream_stats.wide_dense_plans+=1;
+                self.work.stream_stats.narrow_dense_plans+=@intFromBool(narrow);
+                self.work.stream_stats.groups+=groups;
+                self.work.stream_stats.scratch_cells=@max(self.work.stream_stats.scratch_cells,state_cells+groups*(1+p.agg_count));
+                return try self.finish(p,out);
+            }
+
             /// Aggregate states and projections remain private until the
             /// ordinary query publication step succeeds.
             fn streamGroup(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
                 const table = &self.tables[p.sources[0].table.?];
+                if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(try self.factorGroup(p,outer,table)) |rows| return rows;
                 const distinct=self.distinctLayout(p) orelse return error.WorkspaceCapacity;
                 var ctx = self.context(outer);
                 var out: List = .{};
@@ -1198,6 +1799,7 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
                 if (comptime S.compact_enabled) {
+                    if(p.source_count==1) if(try self.wideDenseGroup(p,outer,table)) |rows| return rows;
                     if (p.source_count==1 and (p.key_count != 0 or !self.summaryEligible(p, table))) {
                         if (try self.compactGroup(p, outer, table)) |rows| return rows;
                     }
@@ -1502,6 +2104,13 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn core(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(self.repeatable()) {
+                    const at=self.mark();const stats=self.work.stream_stats;
+                    if(self.nestedFactorGroup(p,outer)) |result| {if(result) |rows| return rows;} else |err| {
+                        if(err!=error.WorkspaceCapacity) return err;
+                        self.release(at);self.work.stream_stats=stats;
+                    }
+                };
                 if (streamEligible(p) and self.repeatable()) {
                     const at = self.mark();
                     const stats = self.work.stream_stats;
@@ -2060,25 +2669,25 @@ pub fn Exec(comptime config: types.Config) type {
             if(!Query.compactPredicates(ctx.pool,query.where,table,&predicates,&used) or used==0) return null;
             for(predicates[0..used]) |predicate| if(!predicate.nonnull) return null;
             stats.projected_filter_scans+=1;
+            const dense=table.summary.rows>=0 and @as(u64,@intCast(table.summary.rows))==table.scan_high;
             var found:usize=0;var start:usize=0;
             while(start<table.scan_high):(start+=64) {
                 const count=@min(@as(usize,64),table.scan_high-start);
                 // Charge dead slots too, exactly as the canonical scan does.
                 try ctx.session.checkpoints(count);
-                var mask:u64=0;
-                for(0..count) |i| mask|=@as(u64,@intFromBool(table.scan_live[start+i]!=0))<<@intCast(i);
+                var mask=Query.liveMask(table,start,count,dense);
                 stats.projected_filter_rows+=@popCount(mask);
                 for(predicates[0..used]) |predicate| {
                     // Comparisons borrow their column and evaluate one literal;
                     // subsequent AND terms run only for preceding TRUE rows.
                     try ctx.session.checkpoints(@popCount(mask));
                     mask &= switch(predicate.op) {
-                        .eq=>Query.comparisonMask(.eq,table,start,count,predicate),
-                        .ne=>Query.comparisonMask(.ne,table,start,count,predicate),
-                        .lt=>Query.comparisonMask(.lt,table,start,count,predicate),
-                        .le=>Query.comparisonMask(.le,table,start,count,predicate),
-                        .gt=>Query.comparisonMask(.gt,table,start,count,predicate),
-                        .ge=>Query.comparisonMask(.ge,table,start,count,predicate),
+                        .eq=>Query.comparisonMask(.eq,table,start,count,predicate,null),
+                        .ne=>Query.comparisonMask(.ne,table,start,count,predicate,null),
+                        .lt=>Query.comparisonMask(.lt,table,start,count,predicate,null),
+                        .le=>Query.comparisonMask(.le,table,start,count,predicate,null),
+                        .gt=>Query.comparisonMask(.gt,table,start,count,predicate,null),
+                        .ge=>Query.comparisonMask(.ge,table,start,count,predicate,null),
                         else=>unreachable,
                     };
                     if(mask==0) break;
