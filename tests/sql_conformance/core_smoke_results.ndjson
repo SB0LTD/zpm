@@ -1,9 +1,9 @@
 {"id":"PG.PRED.DISTINCT","status":"core_smoke_pass","statement":4,"detail":""}
 {"id":"PG.PRED.QUANTIFIED","status":"core_smoke_pass","statement":4,"detail":""}
-{"id":"PG.PRED.SYMMETRIC","status":"incomplete","statement":4,"detail":"Syntax"}
+{"id":"PG.PRED.SYMMETRIC","status":"core_smoke_pass","statement":4,"detail":""}
 {"id":"PG.PRED.OVERLAPS","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.PRED.REGEX","status":"incomplete","statement":4,"detail":"Syntax"}
-{"id":"PG.PRED.ESCAPE","status":"incomplete","statement":4,"detail":"Syntax"}
+{"id":"PG.PRED.ESCAPE","status":"core_smoke_pass","statement":4,"detail":""}
 {"id":"PG.QUERY.WINDOW","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.QUERY.WINDOW_AGG","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.QUERY.WINDOW_FRAMES","status":"incomplete","statement":4,"detail":"Syntax"}

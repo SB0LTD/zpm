@@ -139,7 +139,7 @@ pub const Error = error{
     InvalidTextRepresentation,
     /// SQLSTATE 22012.
     DivisionByZero,
-    /// SQLSTATE 22025: a LIKE pattern ends with the escape character.
+    /// SQLSTATE 22025: invalid LIKE escape string or reached trailing escape.
     InvalidEscapeSequence,
     /// SQLSTATE 42P02: a $n placeholder reached the engine unbound.
     UndefinedParameter,

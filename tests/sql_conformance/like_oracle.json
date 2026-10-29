@@ -1,0 +1,25 @@
+{
+  "target": "PostgreSQL 18.3",
+  "qualification": "utf8_like_ascii_ilike_explicit_escape",
+  "matrix_queries": 8120,
+  "extra_probes": 44,
+  "failures": [],
+  "unsupported_examples": [],
+  "excluded_dimensions": [
+    "Unicode case folding",
+    "locale/nondeterministic collations",
+    "optimizer-dependent filter/error ordering",
+    "planner constant-fold error timing",
+    "schema replay",
+    "work/cancellation budgets"
+  ],
+  "oracle_version": [
+    [
+      "PostgreSQL 18.3 on x86_64-windows, compiled by msvc-19.44.35222, 64-bit"
+    ]
+  ],
+  "matrix_fnv64": "8faec4b036c8ff3d",
+  "hash_encoding": "UTF-8 with LF newlines",
+  "contract_sha256": "91d50b3d52963ec0a6500dedc3c786a87b0638993dc1a4a50e588203141c1196",
+  "oracle_script_sha256": "06762c3c4e2c6b95e67b10b2d9ea7cdc4e11b3fe9b3d36072375046feb744ccf"
+}

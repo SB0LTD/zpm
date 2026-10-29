@@ -152,6 +152,18 @@ pub fn Deparse(comptime config: types.Config) type {
                     try expression(context, n.c, w);
                     try w.bytes(")");
                 },
+                .like => {
+                    try w.bytes("(");
+                    try expression(context, n.a, w);
+                    try w.bytes(if (n.negated) " NOT " else " ");
+                    try w.bytes(if (n.insensitive) "ILIKE " else "LIKE ");
+                    try expression(context, n.b, w);
+                    if (n.c != none) {
+                        try w.bytes(" ESCAPE ");
+                        try expression(context, n.c, w);
+                    }
+                    try w.bytes(")");
+                },
                 .row_constructor => try rowText(context, n.b, null, w),
                 .row_compare => {
                     if (n.a != none) {

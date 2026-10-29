@@ -1406,7 +1406,8 @@ pub fn Parser(comptime config: types.Config) type {
             if (insensitive or self.isWord("LIKE")) {
                 try self.advance();
                 const pattern_node = try self.other();
-                return self.pool.add(.{ .kind = .like, .negated = negated, .insensitive = insensitive, .a = left, .b = pattern_node });
+                const escape_node = if (try self.takeRaw("escape")) try self.other() else none;
+                return self.pool.add(.{ .kind = .like, .negated = negated, .insensitive = insensitive, .a = left, .b = pattern_node, .c = escape_node });
             }
             return left;
         }

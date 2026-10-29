@@ -1269,8 +1269,14 @@ pub fn Binder(comptime config: types.Config) type {
                     const left_ty = context.node(n.a).ty;
                     const right_ty = context.node(n.b).ty;
                     if ((left_ty != .text and left_ty != .name) or (right_ty != .text and right_ty != .name)) return error.UndefinedFunction;
+                    if (n.c != none) {
+                        try typeExpr(context, scope, n.c);
+                        try coerce(context, n.c, .text);
+                        const escape_ty = context.node(n.c).ty;
+                        if (escape_ty != .text and escape_ty != .name) return error.UndefinedFunction;
+                    }
                     n.ty = .boolean;
-                    n.constant = isConstant(context, n.a) and isConstant(context, n.b);
+                    n.constant = isConstant(context, n.a) and isConstant(context, n.b) and isConstant(context, n.c);
                 },
                 .case_expr => {
                     var constant = true;

@@ -19,6 +19,47 @@ device deployment.
 
 ## Implemented in this batch
 
+### Follow-up: LIKE / ILIKE ESCAPE
+
+LIKE/ILIKE and their negated forms now accept ESCAPE expressions: empty disables
+escaping, otherwise one UTF-8 character is required. Custom escapes include
+multibyte characters and wildcard characters themselves. Input, pattern and
+escape are evaluated in order; NULL pattern/escape propagation follows the
+strict pattern-conversion operation independently of the outer match. Invalid
+escape strings use the existing SQLSTATE 22025. Trailing pattern escapes are
+reported only when the matching path reaches them, correcting the old test
+that expected an error after the input had already ended.
+
+The matcher scans the original pattern with constant scratch, avoiding a
+rewritten-pattern buffer and its expansion/capacity costs. UTF-8 underscores
+consume one character. ASCII ILIKE folding retains the existing scope; Unicode
+case folding and locale/nondeterministic collations remain unqualified. Worst
+case rescanning is O(text length × pattern length); matcher and wildcard-run
+loops now honor work/cancellation controls. An eight-byte pattern at an
+eight-byte text budget succeeds without a larger temporary pattern buffer.
+
+The new contract first failed with Syntax. The completed suite passes 16,348
+assertions in Windows ReleaseSafe and Debug. PostgreSQL 18.3 passes 8,120 matrix
+cases plus 44 targeted probes, with an independent code-point dynamic-program
+reference. Sig additionally checks schema replay, exact work limits and
+mid-match cancellation. Fourteen Python tests check harness/evidence identity.
+See [oracle](../tests/sql_conformance/like_oracle.json) and
+[contract](../tests/test_sql_like_escape.sig).
+
+The refreshed broad audit has six smoke passes, 95 failures and 17 unexecuted
+scopes/comparators. The former four-pass output is preserved as
+`core_smoke_results.stage3.ndjson`. These are smoke counts, not a compatibility
+percentage or a claim that whole feature families are closed.
+
+**Open planner gap:** with the test fixture's invalid escape on row 8,
+`SELECT COUNT(*) FROM lt x JOIN lt y ON x.v LIKE y.p ESCAPE y.e WHERE y.id=1`
+returns 1 in PostgreSQL but raises InvalidEscapeSequence in the core because ON
+is evaluated before the filtering WHERE clause. The passing JOIN contract uses
+a prefiltered relation and does not count that query as compatible. General
+filter/error ordering and planner constant-fold error timing remain unqualified.
+Stored-expression source ownership in deferred constant validation also needs
+dedicated default/generated-expression audit cases in a subsequent batch.
+
 ### Follow-up: scalar and row BETWEEN variants
 
 Flat row constructors now support BETWEEN / NOT BETWEEN, with optional
@@ -238,7 +279,7 @@ contracts check schema replay, cancellation, exhausted AST grants and untouched
 results after failures. A 16-field predicate works with an eight-column result
 configuration; the explicit AST-budget test rejects excess work without truncation.
 
-Current proof is [row_evidence.json](../tests/sql_conformance/row_evidence.json),
+The row-comparison checkpoint proof is [row_evidence.json](../tests/sql_conformance/row_evidence.json),
 with [row_oracle.json](../tests/sql_conformance/row_oracle.json). The previous
 quantified record is historical at `b2d8474` and retains its archived smoke run.
 These are Windows correctness results, not database throughput measurements.
@@ -258,7 +299,7 @@ programs. Native PostgreSQL 18.3 accepted all 102 transaction-harness programs;
 `postgres18_oracle.json` with a manifest SHA-256, and generate an allocator-free
 Sig core test executable.
 
-Current core results: **4 smoke passes, 97 failures, 17 unexecuted scopes or
+Current core results: **6 smoke passes, 95 failures, 17 unexecuted scopes or
 comparators**. A smoke pass does not close a full feature family. A core utility
 rejection also does not establish what the server integration implements. The
 suite intentionally exits with an error until the declared scope is qualified.
