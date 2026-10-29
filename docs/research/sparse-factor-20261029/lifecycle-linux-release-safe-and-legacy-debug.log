@@ -1,0 +1,2 @@
+PASS SQL factor join: 1838 assertions, actual executor, scalar model, canonical equivalence, visibility and failure atomicity
+PASS SQL factor join: 1838 assertions, actual executor, scalar model, canonical equivalence, visibility and failure atomicity

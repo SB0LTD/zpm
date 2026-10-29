@@ -65,6 +65,8 @@ pub fn Exec(comptime config: types.Config) type {
             nested_factor_plans: usize = 0,
             nested_factor_keys: usize = 0,
             presence_rejected_blocks:usize=0,
+            sparse_factor_masks:usize=0,
+            sparse_factor_rows:usize=0,
             gathered_rows: usize = 0,
             distinct_bitmap_bytes: usize = 0,
             groups: usize = 0,
@@ -1401,8 +1403,21 @@ pub fn Exec(comptime config: types.Config) type {
                 while(start<table.scan_high):(start+=64) {
                     const count=@min(@as(usize,64),table.scan_high-start);try self.session.checkpoints(count);
                     var mask=liveMask(table,start,count,dense);self.work.stream_stats.rows+=@popCount(mask);
-                    for(predicates[0..predicate_count]) |predicate| {
+                    for(predicates[0..predicate_count],0..) |predicate,predicate_index| {
                         if(mask==0) break;
+                        if(comptime config.sparse_factor_predicates) if(predicate_index!=0 and @popCount(mask)<=8) {
+                            // All accepted predicates are non-throwing direct
+                            // comparisons. NULL still fails WHERE exactly as in
+                            // the vector mask; logical checkpoints are unchanged.
+                            const single=[_]CompactPredicate{predicate};var selected=mask;
+                            self.work.stream_stats.sparse_factor_masks+=1;
+                            self.work.stream_stats.sparse_factor_rows+=@popCount(mask);
+                            while(selected!=0) {
+                                const i=@ctz(selected);selected&=selected-1;
+                                if(!compactKeep(table,start+i,&single)) mask&=~(@as(u64,1)<<@intCast(i));
+                            }
+                            continue;
+                        };
                         mask&=switch(predicate.op) {
                             .eq=>comparisonMask(.eq,table,start,count,predicate,&self.work.stream_stats),.ne=>comparisonMask(.ne,table,start,count,predicate,&self.work.stream_stats),
                             .lt=>comparisonMask(.lt,table,start,count,predicate,&self.work.stream_stats),.le=>comparisonMask(.le,table,start,count,predicate,&self.work.stream_stats),

@@ -20,6 +20,9 @@ pub const Config = struct {
     /// Optional conservative 256-bit presence summary per 64-row scan block
     /// and column. Borrowed external backing; exact comparisons remain required.
     block_presence_filters: bool = false,
+    /// Later safe factorized predicates can inspect sparse survivor masks
+    /// instead of reconstructing a full vector mask. Dense masks stay vectorized.
+    sparse_factor_predicates: bool = false,
     /// Opt-in exact aggregate-before-unique-key-join execution. Unsupported
     /// expressions, visibility or caller-workspace budgets retain ordinary SQL.
     factorized_aggregates: bool = false,

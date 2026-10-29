@@ -2,8 +2,9 @@
 //! executor, plus an independent scalar model and visibility/error boundaries.
 const std=@import("std");
 const sql=@import("sql");
+pub const sparse_test=if(@hasDecl(@import("root"),"test_sparse_factor")) @import("root").test_sparse_factor else false;
 fn config(comptime factor:bool) sql.Config {return .{.external_storage=true,.tables=3,.columns=6,.rows_per_table=2,.text_bytes=16,.name_bytes=16,
-    .integer_bits=32,.work_rows=128,.result_rows=16,.tx_writes=1024,.compact_integral_scans=true,.factorized_aggregates=factor,.nulls_first_ascending=false};}
+    .integer_bits=32,.work_rows=128,.result_rows=16,.tx_writes=1024,.compact_integral_scans=true,.factorized_aggregates=factor,.block_presence_filters=factor and sparse_test,.sparse_factor_predicates=factor and sparse_test,.nulls_first_ascending=false};}
 const Fast=sql.Database(config(true));const Slow=sql.Database(config(false));
 const Small=sql.Database(blk:{var c=config(true);c.numeric_digits=8;break :blk c;});
 const n=513;
@@ -117,6 +118,10 @@ pub fn main() !void {
     }
     try execute("SELECT c.label,COUNT(*),SUM(f.amount) FROM facts f JOIN products p ON p.id=f.product AND p.flag=1 JOIN categories c ON c.id=p.category GROUP BY c.label HAVING COUNT(*)>1 ORDER BY c.label");
     try check(fast.workspace.query.stream_stats.factor_plans==1);
+    if(sparse_test) {
+        try execute("SELECT c.label,COUNT(*),SUM(f.amount) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE f.store=0 AND f.quantity=1 AND f.day BETWEEN DATE '2025-03-01' AND DATE '2025-08-31' GROUP BY c.label ORDER BY c.label");
+        try check(fast.workspace.query.stream_stats.sparse_factor_masks>0);
+    }
     for([_][]const u8{"=","<>","<","<=",">",">="}) |op| {
         const source=try std.fmt.bufPrint(&text,"SELECT c.label,COUNT(*),SUM(f.amount) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE f.store<>2 AND DATE '2025-06-15'{s}f.day GROUP BY c.label ORDER BY c.label",.{op});
         try execute(source);try check(fast.workspace.query.stream_stats.factor_plans==1);
