@@ -19,6 +19,25 @@ device deployment.
 
 ## Implemented in this batch
 
+### Follow-up: NULLIF cross-type results
+
+`NULLIF(real, double precision)`, mixed date/timestamp comparisons, and
+name/text comparisons now retain the selected equality operator's original
+first-operand type and value. Numeric combinations that require promotion keep
+their promoted result type. The comparison-only cast uses caller storage and
+evaluates each operand once, including volatile sequence calls and aggregate
+inputs. No AST child is duplicated, and evaluation checkpoints are preserved.
+
+The new contract first failed with OID 701 instead of PostgreSQL's 700. After
+the fix, 24 PostgreSQL 18.3 oracle cases and 93 assertions pass in both Windows
+ReleaseSafe and ReleaseFast. Coverage includes payload tags, NULL metadata,
+sequences, column and aggregate inputs, and error/result preservation. See
+[the oracle](../tests/sql_conformance/nullif_oracle.json) and
+[the executable contract](../tests/test_sql_nullif_types.sig).
+This closes a result-type bug; it does not qualify all SQL functionality.
+
+### Original conformance batch
+
 - Scalar `IS DISTINCT FROM` and `IS NOT DISTINCT FROM`: grammar, common comparison
   binding, non-null Boolean evaluation and expression deparsing. The evaluator
   borrows stable column operands and evaluates computed operands once. Existing

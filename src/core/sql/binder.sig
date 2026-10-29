@@ -1180,12 +1180,16 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeExpr(context, scope, n.a);
                     try typeExpr(context, scope, n.b);
                     const original = context.node(n.a).ty;
+                    const right = context.node(n.b).ty;
+                    // PostgreSQL has direct cross-type equality operators for
+                    // these families. Our comparison casts must not change the
+                    // returned first operand's type or representation.
+                    const preserve = ((original == .float4 or original == .float8) and
+                        (right == .float4 or right == .float8)) or
+                        (value.datetime(original) and value.datetime(right)) or
+                        (value.stringType(original) and value.stringType(right));
                     try comparable(context, &n.a, &n.b);
-                    n.ty = if (original == .unknown) context.node(n.a).ty else original;
-                    if (context.node(n.a).ty != n.ty) {
-                        // NULLIF returns the first argument's type.
-                        n.ty = context.node(n.a).ty;
-                    }
+                    n.ty = if (preserve) original else context.node(n.a).ty;
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b);
                 },
                 .cast => {
