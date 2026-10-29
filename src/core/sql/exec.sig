@@ -60,6 +60,8 @@ pub fn Exec(comptime config: types.Config) type {
             factor_plans: usize = 0,
             factor_keys: usize = 0,
             factor_selected_rows: usize = 0,
+            typed_group_plans: usize = 0,
+            typed_group_channels: usize = 0,
             nested_factor_plans: usize = 0,
             nested_factor_keys: usize = 0,
             presence_rejected_blocks:usize=0,
@@ -1783,6 +1785,79 @@ pub fn Exec(comptime config: types.Config) type {
                 return try self.finish(p,out);
             }
 
+            /// A general typed state vector per admitted integral key. Multiple
+            /// SUM/AVG channels stay on committed columns through aggregation;
+            /// Cells are constructed only for final groups. No input-sized rows.
+            noinline fn typedMultiGroup(self:*Query,p:*const B.Plan,outer:?*const E.Context,table:*const S.Table) Error!?List {
+                if(!self.committed_only or !table.summary.valid or table.summary.rows<0 or table.summary.csn>self.snap.csn or
+                    table.scan_high!=table.row_high or p.where!=none or p.key_count!=1 or p.agg_count==0) return null;
+                if(comptime config.numeric_digits<39) return null;
+                const key=self.pool.nodes[p.keys[0]];
+                if(key.kind!=.column or key.level!=0 or key.relation!=0 or !value_module.integral(key.ty)) return null;
+                var transitions:[config.columns]Transition=undefined;
+                if(!self.prepareTransitions(p,transitions[0..p.agg_count])) return null;
+                // Preserve canonical checked-i64 SUM semantics: every possible
+                // accumulation prefix must fit, not merely the final total.
+                for(transitions[0..p.agg_count]) |item| if(item.kind==.sum_integer and table.summary.columns[item.column].nonnull!=0) {
+                    const amounts=table.integer_bounds[item.column];if(!amounts.known) return null;
+                    const rows=@as(i128,table.summary.rows);
+                    if(rows*@as(i128,@min(amounts.low,0)) < -9223372036854775808 or rows*@as(i128,@max(amounts.high,0))>9223372036854775807) return null;
+                };
+                const bounds=table.integer_bounds[key.column];if(!bounds.known) return null;
+                const span128=@as(i128,bounds.high)-bounds.low+1;
+                const stride=factor_header+p.agg_count*@sizeOf(FactorAggregate);
+                const per_bucket=(stride+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell)+1+p.agg_count+p.width;
+                const budget=@min((self.work.cell_high-self.work.cell_low)/per_bucket,(self.work.ref_high-self.work.ref_low)/2);
+                if(span128<=0 or span128>=budget) return null;
+                const span:usize=@intCast(span128);const size=span+1; // independent NULL-key state
+                const bytes=size*stride;
+                const state_cells=(bytes+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell);
+                const at=try self.cells(state_cells);
+                const partial:[*]u8=@ptrCast(&self.work.cells[at]);@memset(partial[0..bytes],0);
+                const key_nonnull=table.summary.columns[key.column].nonnull==table.summary.rows;
+                const dense=table.summary.rows==@as(i64,@intCast(table.scan_high));
+                var nonnull:[config.columns]bool=undefined;
+                for(transitions[0..p.agg_count],0..) |item,index| nonnull[index]=item.kind==.count_star or table.summary.columns[item.column].nonnull==table.summary.rows;
+                var start:usize=0;
+                while(start<table.scan_high):(start+=64) {
+                    const count=@min(@as(usize,64),table.scan_high-start);try self.session.checkpoints(count);
+                    var selected=liveMask(table,start,count,dense);self.work.stream_stats.rows+=@popCount(selected);
+                    while(selected!=0) {
+                        const bit=@ctz(selected);selected&=selected-1;const slot=start+bit;
+                        const flags=table.scan_nonnull[slot];
+                        const bucket:usize=if(!key_nonnull and flags&(@as(u64,1)<<@intCast(key.column))==0) span
+                            else @intCast(@as(i128,table.scan_values[@as(usize,key.column)*table.rows.len+slot])-bounds.low);
+                        const state=partial+bucket*stride;factorRows(state).*+=1;
+                        for(transitions[0..p.agg_count],factorStates(state,p.agg_count),0..) |item,*channel,index| {
+                            if(item.kind!=.count_star and !nonnull[index] and flags&(@as(u64,1)<<@intCast(item.column))==0) continue;
+                            channel.count+=1;
+                            if(item.kind==.sum_integer or item.kind==.sum_wide) channel.total+=table.scan_values[@as(usize,item.column)*table.rows.len+slot];
+                        }
+                    }
+                }
+                var out:List=.{};var groups:usize=0;
+                // Canonical group order is NULL, then increasing integral keys.
+                // HAVING, arithmetic/projection errors and final sort/limit
+                // retain their existing implementation and private publication.
+                for(0..size) |index| {
+                    const bucket=if(index==0) span else index-1;const state=partial+bucket*stride;
+                    if(factorRows(state).*==0) continue;
+                    try self.session.checkpoint();const group_at=try self.cells(1+p.agg_count);
+                    self.work.cells[group_at]=if(bucket==span) .null_value else .{.integer=@intCast(@as(i128,bounds.low)+bucket)};
+                    var values:[config.columns]Accumulator=undefined;
+                    for(transitions[0..p.agg_count],factorStates(state,p.agg_count),values[0..p.agg_count]) |item,channel,*value| {
+                        value.*=.{.count=channel.count,.wide=channel.total};
+                        if(item.kind==.sum_integer) value.integer=@intCast(channel.total);
+                    }
+                    try self.projectGroup(p,group_at,values[0..p.agg_count],outer,&out);groups+=1;
+                }
+                self.work.stream_stats.typed_group_plans+=1;self.work.stream_stats.typed_group_channels+=p.agg_count;
+                self.work.stream_stats.groups+=groups;
+                self.work.stream_stats.scratch_cells=@max(self.work.stream_stats.scratch_cells,state_cells+groups*(1+p.agg_count+p.width));
+                self.work.stream_stats.scratch_refs=@max(self.work.stream_stats.scratch_refs,groups*2);
+                return try self.finish(p,out);
+            }
+
             /// Aggregate states and projections remain private until the
             /// ordinary query publication step succeeds.
             fn streamGroup(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
@@ -1805,6 +1880,7 @@ pub fn Exec(comptime config: types.Config) type {
                     if (p.source_count==1 and (p.key_count != 0 or !self.summaryEligible(p, table))) {
                         if (try self.compactGroup(p, outer, table)) |rows| return rows;
                     }
+                    if(comptime config.typed_grouped_aggregates) if(p.source_count==1) if(try self.typedMultiGroup(p,outer,table)) |rows| return rows;
                 }
                 const early=p.source_count>1 and self.earlyAvailable(p.where,p.source_count-1) and self.prefixJoinsSafe(p);
                 var cursor:StreamCursor=.{};

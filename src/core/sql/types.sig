@@ -23,6 +23,9 @@ pub const Config = struct {
     /// Opt-in exact aggregate-before-unique-key-join execution. Unsupported
     /// expressions, visibility or caller-workspace budgets retain ordinary SQL.
     factorized_aggregates: bool = false,
+    /// Caller-arena typed COUNT/SUM/AVG channels for committed integral GROUP
+    /// BY. Unsupported expressions, visibility and budgets retain ordinary SQL.
+    typed_grouped_aggregates: bool = false,
     /// Optional exact committed GROUP BY synopses per supported column. This
     /// budgets metadata groups, not SQL results: overflow retains scan paths.
     summary_groups: usize = 0,
