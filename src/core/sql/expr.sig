@@ -409,7 +409,8 @@ pub fn Eval(comptime config: types.Config) type {
             return &ctx.pool.nodes[id];
         }
 
-        fn compareOp(op: ast.Op, left: *const V.Cell, right: *const V.Cell) ?bool {
+        /// Comparison of binder-compatible operands, also used by sublink folds.
+        pub fn compareOp(op: ast.Op, left: *const V.Cell, right: *const V.Cell) ?bool {
             if (op == .is_distinct or op == .is_not_distinct) {
                 const left_null = left.* == .null_value;
                 const right_null = right.* == .null_value;

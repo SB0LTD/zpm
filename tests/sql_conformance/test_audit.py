@@ -7,6 +7,7 @@ import struct
 import unittest
 from audit import Pg, equivalent
 from generate_contracts import literal
+from verify_quantified_oracle import matrix
 
 
 def result(rows):
@@ -33,6 +34,23 @@ def message(kind, body):
 
 
 class AuditTests(unittest.TestCase):
+    def test_quantified_oracle_identity(self):
+        root = Path(__file__).parent
+        report = json.loads((root / 'quantified_oracle.json').read_text(encoding='utf8'))
+        self.assertEqual(report['failures'], [])
+        self.assertEqual(report['matrix_queries'], 1152)
+        paths = [('contract_sha256', root.parent / 'test_sql_quantified.sig'),
+                 ('oracle_script_sha256', root / 'verify_quantified_oracle.py')]
+        for key, path in paths:
+            self.assertEqual(report[key], hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest())
+        digest, count = 14695981039346656037, 0
+        for query, wanted in matrix():
+            for byte in query.encode() + bytes([2 if wanted is None else int(wanted)]):
+                digest = ((digest ^ byte) * 1099511628211) & ((1 << 64) - 1)
+            count += 1
+        self.assertEqual(count, report['matrix_queries'])
+        self.assertEqual(f'{digest:x}', report['matrix_fnv64'])
+
     def test_inventory_and_oracle_are_consistent(self):
         root = Path(__file__).parent
         content = (root / 'cases.json').read_bytes().replace(b'\r\n', b'\n')

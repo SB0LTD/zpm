@@ -16,7 +16,7 @@
 //! SELECT [DISTINCT [ON (...)]] expressions [FROM tables,
 //! derived tables and CTEs joined INNER/LEFT/RIGHT/FULL/CROSS ON|USING]
 //! [WHERE] [GROUP BY] [HAVING] with aggregates (COUNT/SUM/AVG/MIN/MAX/
-//! BOOL_AND/BOOL_OR, DISTINCT, FILTER), scalar/IN/EXISTS subqueries, WITH
+//! BOOL_AND/BOOL_OR, DISTINCT, FILTER), scalar/IN/EXISTS and ANY/SOME/ALL subqueries, WITH
 //! [RECURSIVE], UNION/INTERSECT/EXCEPT [ALL], [ORDER BY expressions/positions/
 //! output names] [LIMIT|OFFSET|FETCH FIRST] [FOR UPDATE|SHARE [NOWAIT|SKIP
 //! LOCKED]] (single table only); UPDATE with expression SET; DELETE; COPY

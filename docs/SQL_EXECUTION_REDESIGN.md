@@ -98,6 +98,32 @@ code-page ownership/recovery remain compatible with allocator-free constraints.
 7. Publish source SHA, flags, raw measurements and regressions. Claim superiority
    only over named versions/workloads demonstrated by reproducible runs.
 
+## Quantified comparisons: implemented normalization and next physical step
+
+The scalar-subquery implementation normalizes `x op ALL(Q)` to
+`NOT (x opposite(op) ANY(Q))`. SQL's three-valued De Morgan duality preserves
+empty sets and NULLs. This reuses the IN/ANY sublink and its existing negation bit
+without enlarging expression nodes. Six ordinary comparison operators are covered;
+array, row, LIKE/ILIKE and custom-operator forms still need their own contracts.
+
+The current executor materializes the subquery in caller-bounded workspace. That
+is a known physical limitation, not a claim of constant-memory execution. A future
+streamed reducer can use `(row_count, nonnull_count, min, max)` for inequalities:
+`x < ANY(Q)` depends on the maximum non-null value, while `x > ANY(Q)` depends on
+the minimum. Universal inequalities follow through the same De Morgan rule.
+`x <> ANY(Q)` and `x = ALL(Q)` also admit exact extrema summaries. NULL/empty
+state remains explicit. Summarize in the resolved comparison type domain; the
+mixed REAL/exact-number precision bug demonstrates why raw-type conversion rules
+cannot be guessed from common-result typing.
+
+Extrema and counts cannot answer arbitrary equality membership: `{1,1,3}` and
+`{1,2,3}` have identical counts/min/max but differ for `2 = ANY(Q)`. That path
+needs an exact set, suitable index or streamed comparisons. A Bloom filter can
+reject impossible matches; it cannot certify SQL equality. Maintained summaries
+must cover the exact predicate and visible snapshot, with correct update/delete
+invalidation. None of these future physical reducers is implemented by the
+normalization change.
+
 ## Layer ownership
 
 ZPM owns reusable AST/binding/type rules, relational operators, storage and

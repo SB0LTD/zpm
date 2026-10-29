@@ -125,6 +125,14 @@ pub fn castable(from: Type, to: Type, context: Context) bool {
 
 /// select_common_type / operator promotion for two typed operands; null
 /// when they do not unify.
+/// Mixed REAL comparisons resolve a float8 operator, unlike CASE/GREATEST
+/// common-type selection. Rounding an exact int/numeric to float4 first can
+/// turn distinct values into equal ones (e.g. 16777217 and 16777216::real).
+pub fn comparisonType(a: Type, b: Type) ?Type {
+    if (a != b and numericCategory(a) and numericCategory(b) and (a == .float4 or b == .float4)) return .float8;
+    return common(a, b);
+}
+
 pub fn common(a: Type, b: Type) ?Type {
     if (a == b) return a;
     if (numericCategory(a) and numericCategory(b)) {

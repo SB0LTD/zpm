@@ -15,7 +15,7 @@
     "tests/test_sql_distinct.sig": "f307c76ece7e8c9fe4966238da775d01cd1602b85216028d4270e4a7fc5fbf1e",
     "tests/test_sql_minmax.sig": "963699f1489dab32e371c71d006ca0d3e1cbb7447d2fb717cac98f88d367c7b4"
   },
-  "core_result": "core_smoke_results.ndjson",
+  "core_result": "core_smoke_results.stage1.ndjson",
   "oracle_result": "postgres18_oracle.json",
   "scope_limitations": [
     "smoke programs, not complete feature contracts",
@@ -102,5 +102,7 @@
     "passed": 7,
     "command": "python -m unittest discover -s tests/sql_conformance -p test_audit.py"
   },
-  "source_hash_encoding": "UTF-8 with LF newlines"
+  "source_hash_encoding": "UTF-8 with LF newlines",
+  "record_type": "historical_first_batch_checkpoint",
+  "implementation_commit": "a7c4695d91299b60362eddec6da3a690b92cdc59"
 }

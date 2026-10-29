@@ -1693,18 +1693,19 @@ pub fn Exec(comptime config: types.Config) type {
                     .in_subquery => {
                         const value = try E.eval(ctx, n.a);
                         if (list.count == 0) return .{ .boolean = n.negated };
-                        var found = false;
-                        var unknown = value == .null_value;
-                        if (!unknown) for (self.handles(list)) |offset| {
+                        // All currently admitted comparison operators are
+                        // strict. A NULL left operand cannot be decisive.
+                        if (value == .null_value) return .null_value;
+                        var unknown = false;
+                        for (self.handles(list)) |offset| {
+                            try ctx.session.checkpoint();
                             const candidate = &self.work.cells[offset];
-                            if (candidate.* == .null_value) {
+                            if (E.compareOp(n.op, &value, candidate)) |matched| {
+                                if (matched) return .{ .boolean = !n.negated };
+                            } else {
                                 unknown = true;
-                            } else if (V.compare(&value, candidate) == 0) {
-                                found = true;
-                                break;
                             }
-                        };
-                        if (found) return .{ .boolean = !n.negated };
+                        }
                         if (unknown) return .null_value;
                         return .{ .boolean = n.negated };
                     },

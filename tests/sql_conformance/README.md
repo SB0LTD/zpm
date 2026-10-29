@@ -23,12 +23,12 @@ No calendar promise or universal speedup is implied. A release claiming complete
 
 ## Concrete smoke specifications
 
-Current core run: **2 smoke passes, 99 failures, 17 unexecuted scopes/comparators**. These are probes selected to expose gaps, not a percentage of PostgreSQL compatibility. Core-only rejection of a server utility does not prove absence in the server integration layer.
+Current core run: **3 smoke passes, 98 failures, 17 unexecuted scopes/comparators**. These are probes selected to expose gaps, not a percentage of PostgreSQL compatibility. Core-only rejection of a server utility does not prove absence in the server integration layer.
 
 | ID | Feature | Core smoke status |
 |---|---|---|
 | PG.PRED.DISTINCT | NULL-safe equality | pass; closure incomplete |
-| PG.PRED.QUANTIFIED | ANY/SOME/ALL | Syntax |
+| PG.PRED.QUANTIFIED | ANY/SOME/ALL, scalar subqueries with six ordinary comparison operators | pass; array/row/custom-operator forms and closure remain incomplete |
 | PG.PRED.SYMMETRIC | Symmetric BETWEEN | Syntax |
 | PG.PRED.OVERLAPS | Temporal overlaps | Syntax |
 | PG.PRED.REGEX | Regular expressions | Syntax |
@@ -182,5 +182,23 @@ The broad generated suite deliberately returns an error while any feature or
 closure dimension is incomplete. Passing first-slice regressions and a red broad
 audit are separate, visible facts; never rewrite the audit to return success for
 unsupported SQL.
+
+The quantified-comparison regression is `contract-sql-quantified`. To reproduce
+its independent PostgreSQL oracle validation on an owned loopback test instance:
+
+```powershell
+python tests/sql_conformance/verify_quantified_oracle.py --port 55491 --report .sig-cache/quantified-oracle.json
+```
+
+The checked-in `quantified_oracle.json` pins the Sig contract and generator source
+hashes. Harness tests reject stale source or matrix identity. The finite matrix
+has 1,152 cases; 42 additional SQL examples cover types, precision boundaries,
+nesting, correlation, operators and errors. Legacy replay, resource controls and
+multi-session schedules are covered separately in Sig, not by this single-session
+native run. Quantified support currently covers SELECT-context scalar subqueries and ordinary
+`= <> != < <= > >=`; arrays, rows, LIKE/ILIKE/custom operators remain unqualified.
+DML contexts remain unqualified. All 26 default SQL contracts pass; the complete
+current source/evidence record is `quantified_evidence.json`. The original
+`evidence.json` is historical and refers to the archived first-batch smoke run.
 
 SQLancer-style TLP, NoREC and constant-folding metamorphic tests are additional oracles, not substitutes for native differential and crash tests. See [SQLancer papers](https://github.com/sqlancer/sqlancer/blob/main/docs/PAPERS.md) and [CODDTest](https://doi.org/10.1145/3709674). Bounded equivalence can strengthen optimizer checks but remains bounded: [VeriEQL](https://arxiv.org/abs/2403.03193).

@@ -398,7 +398,7 @@ pub fn Binder(comptime config: types.Config) type {
                 if (left == .boolean and context.node(b.*).kind == .int_literal) return legacyBoolean(context, b.*);
                 if (right == .boolean and context.node(a.*).kind == .int_literal) return legacyBoolean(context, a.*);
             }
-            const target = value.common(left, right) orelse return error.UndefinedFunction;
+            const target = value.comparisonType(left, right) orelse return error.UndefinedFunction;
             a.* = try convert(context, a.*, target, -1, .implicit);
             b.* = try convert(context, b.*, target, -1, .implicit);
         }
@@ -1647,11 +1647,11 @@ pub fn Binder(comptime config: types.Config) type {
                 .in_subquery => {
                     const left = context.node(n.a).ty;
                     const right = plan.tys[0];
+                    if (left == .json or right == .json) return error.UndefinedFunction;
                     if (left == .unknown) {
                         try coerce(context, n.a, right);
                     } else if (left != right and !(value.integral(left) and value.integral(right))) {
-                        if (left == .json or right == .json) return error.UndefinedFunction;
-                        const target = value.common(left, right) orelse return error.UndefinedFunction;
+                        const target = value.comparisonType(left, right) orelse return error.UndefinedFunction;
                         n.a = try convert(context, n.a, target, -1, .implicit);
                         try castColumn(context, plan_id, 0, target);
                     }

@@ -132,7 +132,8 @@ pub fn Parser(comptime config: types.Config) type {
                 if (token.len > config.name_bytes) return error.NameCapacity;
                 return .{ .span = .{ .start = token.start, .len = token.end - token.start }, .quoted = true, .len = token.len };
             }
-            if (token.kind != .word or lexer.reserved(token.keyword)) return error.Syntax;
+            const legacy_quantifier_name = self.mode == .legacy_alpha and (token.keyword == .any or token.keyword == .some);
+            if (token.kind != .word or (lexer.reserved(token.keyword) and !legacy_quantifier_name)) return error.Syntax;
             if (token.len > config.name_bytes) return error.NameCapacity;
             return .{ .span = .{ .start = token.start, .len = token.len }, .len = token.len };
         }
@@ -1313,13 +1314,45 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn comparison(self: *Self) Error!u16 {
-            const left = try self.pattern();
-            const op = self.comparisonOp() orelse return left;
-            try self.advance();
-            const right = try self.pattern();
-            // Comparison operators are non-associative in PostgreSQL.
-            if (self.comparisonOp() != null) return error.Syntax;
-            return self.pool.add(.{ .kind = .binary, .op = op, .a = left, .b = right });
+            var left = try self.pattern();
+            while (self.comparisonOp()) |op| {
+                try self.advance();
+                if (self.mode == .standard and (self.isWord("ANY") or self.isWord("SOME") or self.isWord("ALL"))) {
+                    const all = self.isWord("ALL");
+                    try self.advance();
+                    try self.expectSymbol(.lparen);
+                    // Array-valued ANY/ALL is a separate PostgreSQL extension.
+                    if (!self.isWord("SELECT") and !self.isWord("WITH") and !self.isSymbol(.lparen)) return error.UnsupportedStatement;
+                    const inner = try self.query();
+                    try self.expectSymbol(.rparen);
+                    self.pool.complex = true;
+                    // SQL three-valued De Morgan duality preserves NULL and
+                    // empty-set semantics without a new AST storage field.
+                    left = try self.pool.add(.{ .kind = .in_subquery, .op = if (all) oppositeComparison(op) else op, .negated = all, .a = left, .integer = inner });
+                    // A completed sublink can itself be a higher-precedence
+                    // operand: x=ANY(...)::text || 'suffix', or ... = TRUE.
+                    left = try self.castTail(left);
+                    left = try self.atZoneTail(left);
+                    left = try self.multiplicativeTail(left);
+                    left = try self.additiveTail(left);
+                    left = try self.otherTail(left);
+                    left = try self.patternTail(left);
+                    continue;
+                }
+                const right = try self.pattern();
+                // Ordinary comparisons are non-associative in PostgreSQL.
+                if (self.comparisonOp() != null) return error.Syntax;
+                return self.pool.add(.{ .kind = .binary, .op = op, .a = left, .b = right });
+            }
+            return left;
+        }
+
+        fn oppositeComparison(op: ast.Op) ast.Op {
+            return switch (op) {
+                .eq => .ne, .ne => .eq, .lt => .ge,
+                .le => .gt, .gt => .le, .ge => .lt,
+                else => unreachable,
+            };
         }
 
         fn lparenNext(token: Token) bool {
@@ -1332,6 +1365,10 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn pattern(self: *Self) Error!u16 {
             const left = try self.other();
+            return self.patternTail(left);
+        }
+
+        fn patternTail(self: *Self, left: u16) Error!u16 {
             var negated = false;
             if (self.isWord("NOT") and patternKeyword(try self.peek())) {
                 try self.advance();
@@ -1349,7 +1386,7 @@ pub fn Parser(comptime config: types.Config) type {
                     const inner = try self.query();
                     try self.expectSymbol(.rparen);
                     self.pool.complex = true;
-                    return self.pool.add(.{ .kind = .in_subquery, .negated = negated, .a = left, .integer = inner });
+                    return self.pool.add(.{ .kind = .in_subquery, .op = .eq, .negated = negated, .a = left, .integer = inner });
                 }
                 const first = try self.expression();
                 const node = try self.pool.add(.{ .kind = .in_list, .negated = negated, .a = left, .b = first });
@@ -1373,7 +1410,11 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn other(self: *Self) Error!u16 {
-            var left = try self.additive();
+            return self.otherTail(try self.additive());
+        }
+
+        fn otherTail(self: *Self, initial: u16) Error!u16 {
+            var left = initial;
             while (self.current.kind == .symbol) {
                 const op: ast.Op = switch (self.current.symbol) {
                     .concat => .concat,
@@ -1394,7 +1435,11 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn additive(self: *Self) Error!u16 {
-            var left = try self.multiplicative();
+            return self.additiveTail(try self.multiplicative());
+        }
+
+        fn additiveTail(self: *Self, initial: u16) Error!u16 {
+            var left = initial;
             while (self.isSymbol(.plus) or self.isSymbol(.minus)) {
                 const op: ast.Op = if (self.isSymbol(.plus)) .add else .sub;
                 try self.advance();
@@ -1405,7 +1450,11 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn multiplicative(self: *Self) Error!u16 {
-            var left = try self.atZone();
+            return self.multiplicativeTail(try self.atZone());
+        }
+
+        fn multiplicativeTail(self: *Self, initial: u16) Error!u16 {
+            var left = initial;
             while (self.isSymbol(.star) or self.isSymbol(.slash) or self.isSymbol(.percent)) {
                 const op: ast.Op = if (self.isSymbol(.star)) .mul else if (self.isSymbol(.slash)) .div else .mod;
                 try self.advance();
@@ -1417,7 +1466,11 @@ pub fn Parser(comptime config: types.Config) type {
 
         /// `x AT TIME ZONE z` binds tighter than `*` and looser than unary minus.
         fn atZone(self: *Self) Error!u16 {
-            var left = try self.unary();
+            return self.atZoneTail(try self.unary());
+        }
+
+        fn atZoneTail(self: *Self, initial: u16) Error!u16 {
+            var left = initial;
             while (self.isWord("AT")) {
                 const after = try self.peek();
                 if (!after.isWord("TIME")) break;
@@ -1452,7 +1505,11 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn castExpr(self: *Self) Error!u16 {
-            var node = try self.primary();
+            return self.castTail(try self.primary());
+        }
+
+        fn castTail(self: *Self, initial: u16) Error!u16 {
+            var node = initial;
             while (try self.takeSymbol(.cast)) {
                 const target = try self.typeName();
                 node = try self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = node });

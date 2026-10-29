@@ -1,5 +1,5 @@
 {"id":"PG.PRED.DISTINCT","status":"core_smoke_pass","statement":4,"detail":""}
-{"id":"PG.PRED.QUANTIFIED","status":"incomplete","statement":4,"detail":"Syntax"}
+{"id":"PG.PRED.QUANTIFIED","status":"core_smoke_pass","statement":4,"detail":""}
 {"id":"PG.PRED.SYMMETRIC","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.PRED.OVERLAPS","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.PRED.REGEX","status":"incomplete","statement":4,"detail":"Syntax"}

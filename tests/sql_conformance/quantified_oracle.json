@@ -1,0 +1,21 @@
+{
+  "target": "PostgreSQL 18.3",
+  "qualification": "quantified_contract_only",
+  "excluded_dimensions": [
+    "legacy replay",
+    "resource/cancellation controls",
+    "multi-session MVCC schedules"
+  ],
+  "matrix_queries": 1152,
+  "extra_probes": 42,
+  "failures": [],
+  "oracle_version": [
+    [
+      "PostgreSQL 18.3 on x86_64-windows, compiled by msvc-19.44.35222, 64-bit"
+    ]
+  ],
+  "matrix_fnv64": "7886b30b421deb63",
+  "contract_sha256": "51dc3c71f320d75471219d54630f16ad41ea3fa49d94b193a6ab10a34debdf8e",
+  "oracle_script_sha256": "87dd47976ac6226c214f2774b986f3563d308f15bc2f284f0dd5f7d9a08fe59a",
+  "hash_encoding": "UTF-8 with LF newlines"
+}

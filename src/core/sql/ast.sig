@@ -101,7 +101,8 @@ pub const NodeKind = enum {
     scalar_subquery,
     /// EXISTS (SELECT ...).
     exists_subquery,
-    /// `a` [NOT] IN (SELECT ...).
+    /// `a` [NOT] IN (SELECT ...), or `a op ANY/SOME/ALL (SELECT ...)`.
+    /// IN is equality ANY. ALL is NOT ANY with the opposite comparison.
     in_subquery,
     /// One INSERT VALUES row: items `b` -> next; rows are linked by `next`.
     values_row,

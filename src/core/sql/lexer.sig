@@ -183,6 +183,8 @@ pub const Keyword = enum {
     regtype,
     greatest,
     least,
+    any,
+    some,
 };
 
 /// Words that cannot be unquoted identifiers.
@@ -191,7 +193,7 @@ pub fn reserved(keyword: Keyword) bool {
         .create, .drop, .insert, .select, .update, .delete, .table, .into, .values, .from, .where, .@"and", .@"or", .set, .order, .by, .asc, .desc, .limit, .is, .not, .@"null", .@"true", .@"false", .primary, .key, .case, .when, .then, .@"else", .end, .cast, .as, .in, .between, .like, .ilike, .@"for" => true,
         // PostgreSQL reserved and type_func_name keywords used by queries.
         .group, .having, .distinct, .on, .join, .inner, .left, .right, .full, .outer, .cross, .using, .natural, .@"union", .intersect, .except, .offset, .fetch, .only, .with, .all, .window, .lateral => true,
-        .returning, .do, .constraint, .default => true,
+        .returning, .do, .constraint, .default, .any, .some => true,
         else => false,
     };
 }
