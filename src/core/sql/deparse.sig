@@ -131,6 +131,27 @@ pub fn Deparse(comptime config: types.Config) type {
         fn expression(context: *const Context, id: u16, w: *Writer) Error!void {
             const n = context.node(id);
             switch (n.kind) {
+                .and_op, .or_op => {
+                    try w.bytes("(");
+                    try expression(context, n.a, w);
+                    try w.bytes(if (n.kind == .and_op) " AND " else " OR ");
+                    try expression(context, n.b, w);
+                    try w.bytes(")");
+                },
+                .not_op => {
+                    try w.bytes("NOT (");
+                    try expression(context, n.a, w);
+                    try w.bytes(")");
+                },
+                .between => {
+                    try w.bytes("(");
+                    try expression(context, n.a, w);
+                    try w.bytes(if (n.negated) " NOT BETWEEN " else " BETWEEN ");
+                    try expression(context, n.b, w);
+                    try w.bytes(" AND ");
+                    try expression(context, n.c, w);
+                    try w.bytes(")");
+                },
                 .row_constructor => try rowText(context, n.b, null, w),
                 .row_compare => {
                     if (n.a != none) {

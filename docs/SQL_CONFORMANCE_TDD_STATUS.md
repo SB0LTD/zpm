@@ -19,6 +19,39 @@ device deployment.
 
 ## Implemented in this batch
 
+### Follow-up: scalar and row BETWEEN variants
+
+Flat row constructors now support BETWEEN / NOT BETWEEN, with optional
+ASYMMETRIC or SYMMETRIC. Complex or mixed-domain scalar ranges use the same
+lowering. Each comparison resolves its own operand types and owns the required
+expression copies, matching PostgreSQL's repeated volatile evaluation. This
+also fixes scalar mixed-REAL precision loss from coercing all three operands
+into one result type. Simple typed scalar ranges retain their compact scan
+shape, including the existing DATE column/literal path.
+
+The lowering uses existing comparison and AND/OR nodes: ordinary ranges need
+two comparisons; symmetric ranges need four. All AST storage comes from the
+statement pool. Row field comparisons retain lexicographic NULL and
+short-circuit behavior. Bare NULL record bounds reuse strict NULL comparison
+metadata, including dependency validation and discarded-constant checks. No
+record payload or heap allocation is introduced. Deparsing handles the lowered
+Boolean forms and compact ranges for default/generated-expression replay.
+
+The new contract first failed with UnsupportedStatement. It passes 17,939
+assertions in Windows ReleaseSafe and Debug. The PostgreSQL 18.3 oracle passes
+8,910 finite matrix cases plus 62 targeted probes for types, precision,
+volatile evaluation, NULL bounds, correlation, grouping, joins, DML and errors.
+Sig additionally checks replay, execution controls and AST exhaustion. Thirteen
+Python tests verify harness and oracle identity. See
+[range oracle](../tests/sql_conformance/between_oracle.json) and
+[contract](../tests/test_sql_between.sig).
+
+This qualifies scalar and flat constructor range predicates. General record
+payloads and nested records remain unqualified. AST expansion consumes caller
+capacity and reports StatementTooComplex on exhaustion; these correctness
+checks do not establish performance superiority. The lowering follows
+[PostgreSQL comparison semantics](https://www.postgresql.org/docs/18/functions-comparison.html).
+
 ### Follow-up: bare NULL candidates in row lists
 
 `ROW(a,b) IN (NULL,...)` and NOT IN now treat a bare NULL candidate as

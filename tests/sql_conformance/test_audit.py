@@ -10,6 +10,7 @@ from generate_contracts import literal
 from verify_quantified_oracle import matrix
 from verify_row_oracle import matrix as row_matrix
 from verify_membership_oracle import matrix as membership_matrix
+from verify_between_oracle import matrix as between_matrix
 
 
 def result(rows):
@@ -36,6 +37,23 @@ def message(kind, body):
 
 
 class AuditTests(unittest.TestCase):
+    def test_between_oracle_identity(self):
+        root = Path(__file__).parent
+        report = json.loads((root / 'between_oracle.json').read_text(encoding='utf8'))
+        self.assertEqual(report['failures'], [])
+        self.assertEqual(report['matrix_queries'], 8910)
+        self.assertEqual(report['extra_probes'], 62)
+        for key, path in [('contract_sha256', root.parent / 'test_sql_between.sig'),
+                          ('oracle_script_sha256', root / 'verify_between_oracle.py')]:
+            self.assertEqual(report[key], hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest())
+        digest, count = 14695981039346656037, 0
+        for query, wanted in between_matrix():
+            for byte in query.encode() + bytes([2 if wanted is None else int(wanted)]):
+                digest = ((digest ^ byte) * 1099511628211) & ((1 << 64) - 1)
+            count += 1
+        self.assertEqual(count, 8910)
+        self.assertEqual(f'{digest:x}', report['matrix_fnv64'])
+
     def test_row_null_oracle_identity(self):
         root = Path(__file__).parent
         report = json.loads((root / 'row_null_oracle.json').read_text(encoding='utf8'))
