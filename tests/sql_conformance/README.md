@@ -217,4 +217,17 @@ row membership/quantified forms are unqualified. Standalone/nested record exampl
 are explicitly rejected in the Sig suite and are excluded from native passing
 scope; they are not counted as compatibility successes.
 
+The NULLIF follow-up adds `contract-sql-nullif-types`: 24 native PostgreSQL
+18.3 cases and 93 executable assertions covering cross-type result metadata,
+payload representation, volatile evaluation, aggregates and error preservation.
+Reproduce its oracle with:
+
+```powershell
+python tests/sql_conformance/verify_nullif_oracle.py --port 55491 --report .sig-cache/nullif-oracle.json
+```
+
+`nullif_oracle.json` pins the contract and oracle script hashes. The database
+workflow runs all ten Python harness/evidence tests on each native OS. Earlier
+contract totals above describe their historical checkpoints.
+
 SQLancer-style TLP, NoREC and constant-folding metamorphic tests are additional oracles, not substitutes for native differential and crash tests. See [SQLancer papers](https://github.com/sqlancer/sqlancer/blob/main/docs/PAPERS.md) and [CODDTest](https://doi.org/10.1145/3709674). Bounded equivalence can strengthen optimizer checks but remains bounded: [VeriEQL](https://arxiv.org/abs/2403.03193).

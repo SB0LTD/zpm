@@ -729,6 +729,18 @@ pub fn Eval(comptime config: types.Config) type {
                     return .null_value;
                 },
                 .nullif => {
+                    if (n.ty != node(ctx, n.a).ty) {
+                        // The binder inserted a comparison-only cast. Retain
+                        // its original operand, evaluating volatile values once.
+                        const conversion = node(ctx, n.a);
+                        @import("std").debug.assert(conversion.kind == .cast);
+                        try ctx.session.checkpoint();
+                        const original = try eval(ctx, conversion.a);
+                        const left = try cast(original, n.ty, conversion.cast_type, conversion.typmod, ctx.session);
+                        const right = try eval(ctx, n.b);
+                        if (compareOp(.eq, &left, &right) == true) return .null_value;
+                        return original;
+                    }
                     const left = try eval(ctx, n.a);
                     const right = try eval(ctx, n.b);
                     if (compareOp(.eq, &left, &right) == true) return .null_value;

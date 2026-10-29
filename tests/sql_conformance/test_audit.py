@@ -35,6 +35,16 @@ def message(kind, body):
 
 
 class AuditTests(unittest.TestCase):
+    def test_nullif_oracle_identity(self):
+        root = Path(__file__).parent
+        report = json.loads((root / 'nullif_oracle.json').read_text(encoding='utf8'))
+        self.assertEqual(report['failures'], [])
+        self.assertEqual(len(report['cases']), 24)
+        self.assertTrue(all(case['pass'] for case in report['cases']))
+        for key, path in [('contract_sha256', root.parent / 'test_sql_nullif_types.sig'),
+                          ('oracle_script_sha256', root / 'verify_nullif_oracle.py')]:
+            self.assertEqual(report[key], hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest())
+
     def test_row_oracle_identity(self):
         root = Path(__file__).parent
         report = json.loads((root / 'row_oracle.json').read_text(encoding='utf8'))

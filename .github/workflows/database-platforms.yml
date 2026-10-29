@@ -82,6 +82,11 @@ jobs:
           & $compiler.FullName version
           if ($LASTEXITCODE -ne 0) { throw 'Sig compiler did not start' }
 
+      - name: Validate SQL oracle evidence and differential harness
+        run: |
+          python -m unittest discover -s tests/sql_conformance -p 'test_*.py'
+          if ($LASTEXITCODE -ne 0) { throw 'SQL oracle evidence failed' }
+
       - name: Execute allocator-free SQL, wire, transaction and OS contracts
         run: |
           $arguments = @('build', 'test-db', 'test-sql', 'test-workers', 'test-resource-budget', 'test-packed-integer', 'test-machine-resources', 'test-parallel-read', '-Doptimize=ReleaseSafe', '-j2', '--Sig-lib-dir', $env:SIG_LIB_DIR)
