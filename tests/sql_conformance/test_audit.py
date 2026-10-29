@@ -38,6 +38,15 @@ def message(kind, body):
 
 
 class AuditTests(unittest.TestCase):
+    def test_sources_oracle_identity(self):
+        root = Path(__file__).parent
+        report = json.loads((root / 'sources_oracle.json').read_text(encoding='utf8'))
+        self.assertEqual(report['failures'], [])
+        self.assertEqual(report['extra_probes'], 30)
+        for key, path in [('contract_sha256', root.parent / 'test_sql_expression_sources.sig'),
+                          ('oracle_script_sha256', root / 'verify_sources_oracle.py')]:
+            self.assertEqual(report[key], hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest())
+
     def test_like_oracle_identity(self):
         root = Path(__file__).parent
         report = json.loads((root / 'like_oracle.json').read_text(encoding='utf8'))

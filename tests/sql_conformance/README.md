@@ -294,3 +294,16 @@ constant scratch without a normalized-pattern buffer; worst-case rescanning is
 still possible. Unicode case folding, collations, planner error timing and
 filter placement remain unqualified. The concrete JOIN/filter error mismatch is
 recorded in [the status document](../../docs/SQL_CONFORMANCE_TDD_STATUS.md).
+
+`contract-sql-expression-sources` covers ownership and validation phases of
+stored expressions: 75 assertions and 30 PostgreSQL 18.3 probes. Reproduce with:
+
+```powershell
+python tests/sql_conformance/verify_sources_oracle.py --port 55491 --report .sig-cache/sources-oracle.json
+```
+
+`sources_oracle.json` pins both sources; fifteen Python tests check current
+evidence. Sig separately checks COPY component calls, work/cancellation and replay
+after overwriting the caller's record buffer. The source owner uses existing AST
+metadata with no retained pointers or node-size growth. Complete generated-column
+restrictions and general planner error timing remain unqualified.

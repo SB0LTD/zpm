@@ -823,21 +823,58 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// Binds a column's DEFAULT or generation text (its own source) into
         /// the statement pool; generation expressions see the row (relation 0).
-        fn bindExpressionText(context: *const Context, column: *const V.Column, row_table: ?usize) Error!u16 {
+        fn storedSource(table: usize, column: usize) i64 {
+            return 1 + @as(i64, @intCast(table * config.columns + column));
+        }
+
+        fn bindExpressionText(context: *const Context, column: *const V.Column, row_table: ?usize, source_owner: i64) Error!u16 {
             var sub = context.*;
             sub.source = column.expression.slice();
+            const start = context.pool.len;
             const id = try P.parseExpression(sub.source, context.pool);
             const scope: Scope = if (row_table) |table| tableScope(&sub, table) else .{};
             try typeExpr(&sub, &scope, id);
-            return assignment(&sub, id, column);
+            const assigned = try assignment(&sub, id, column);
+            // Store an index, never a pointer into temporary CREATE metadata.
+            for (context.pool.nodes[start..context.pool.len]) |*n| {
+                if (n.kind == .row_compare and n.a != none) n.integer = source_owner;
+            }
+            return assigned;
         }
 
-        fn bindDefaults(context: *const Context, index: usize, entry: *const S.Table, defaults: *[config.columns]u16, generated: *[config.columns]u16) Error!void {
+        fn assignedDefaults(context: *const Context, values: *const [config.columns]u16) [config.columns]bool {
+            var needed: [config.columns]bool = @splat(false);
+            for (values, 0..) |id, column| needed[column] = id != none and context.node(id).kind == .default_value;
+            return needed;
+        }
+
+        fn insertedDefaults(context: *const Context, insert: *const Insert) [config.columns]bool {
+            if (insert.plan != none) {
+                var needed: [config.columns]bool = undefined;
+                for (insert.values, 0..) |id, column| needed[column] = id == none;
+                return needed;
+            }
+            var needed: [config.columns]bool = @splat(true);
+            if (insert.rows == none) return needed;
+            for (insert.mapping[0..insert.count]) |column| needed[column] = false;
+            var row = insert.rows;
+            while (row != none) : (row = context.node(row).next) {
+                var item = context.node(row).b;
+                var position: usize = 0;
+                while (item != none) : (item = context.node(item).next) {
+                    if (context.node(item).kind == .default_value) needed[insert.mapping[position]] = true;
+                    position += 1;
+                }
+            }
+            return needed;
+        }
+
+        fn bindDefaults(context: *const Context, index: usize, entry: *const S.Table, needed: *const [config.columns]bool, defaults: *[config.columns]u16, generated: *[config.columns]u16) Error!void {
             for (entry.columns[0..entry.column_count], 0..) |*column, position| switch (column.default_kind) {
                 .none => {},
                 .identity_always, .identity_by_default => defaults[position] = try context.pool.add(.{ .kind = .function, .func = .identity_next, .integer = @intCast(index), .column = @intCast(position), .ty = types.typeOfData(column.data_type) }),
-                .default => defaults[position] = try bindExpressionText(context, column, null),
-                .generated => generated[position] = try bindExpressionText(context, column, index),
+                .default => if (needed[position]) { defaults[position] = try bindExpressionText(context, column, null, storedSource(index, position)); },
+                .generated => generated[position] = try bindExpressionText(context, column, index, storedSource(index, position)),
             };
         }
 
@@ -911,7 +948,8 @@ pub fn Binder(comptime config: types.Config) type {
             var update: Update = .{ .table = index, .values = @splat(none), .where = none, .key = none };
             try bindAssignments(context, &scope, entry, conflict.assignments[0..conflict.count], &update.values);
             update.where = try bindWhere(context, &scope, conflict.where);
-            try bindDefaults(context, index, entry, &update.defaults, &update.generated);
+            const needed = assignedDefaults(context, &update.values);
+            try bindDefaults(context, index, entry, &needed, &update.defaults, &update.generated);
             out.update = update;
         }
 
@@ -2581,8 +2619,24 @@ pub fn Binder(comptime config: types.Config) type {
         fn validateDiscardedRows(context: *const Context) Error!void {
             if (!context.pool.discarded_row_constants) return;
             for (context.pool.nodes[0..context.pool.len]) |*n| {
-                if (n.kind == .row_compare and n.a != none) try validateDiscardedConstants(context, n.a);
+                if (n.kind != .row_compare or n.a == none or n.integer < 0) continue;
+                var sub = context.*;
+                if (n.integer > 0) {
+                    const owner: usize = @intCast(n.integer - 1);
+                    sub.source = context.tables[owner / config.columns].columns[owner % config.columns].expression.slice();
+                }
+                try validateDiscardedConstants(&sub, n.a);
             }
+        }
+
+        /// Validate generated expressions after the candidate schema exists in
+        /// caller-owned table storage, before the CREATE transaction publishes.
+        pub fn validateGenerated(context: *const Context, index: usize) Error!void {
+            const entry = &context.tables[index];
+            for (entry.columns[0..entry.column_count], 0..) |*column, position| {
+                if (column.default_kind == .generated) _ = try bindExpressionText(context, column, index, storedSource(index, position));
+            }
+            try validateDiscardedRows(context);
         }
 
         fn bindStatement(context: *const Context, statement: *const Ast.Statement) Error!Bound {
@@ -2614,7 +2668,7 @@ pub fn Binder(comptime config: types.Config) type {
                                 out.identity = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(options) };
                             },
                             // Type-checked now; evaluated per row.
-                            .default => _ = try bindExpressionText(context, &column, null),
+                            .default => _ = try bindExpressionText(context, &column, null, -1),
                             else => {},
                         }
                         out.columns[index] = column;
@@ -2663,7 +2717,8 @@ pub fn Binder(comptime config: types.Config) type {
                         .query => try bindInsertQuery(context, entry, insert.query, &out, insert.overriding),
                         .default_values => if (insert.explicit_columns) return error.Syntax,
                     }
-                    try bindDefaults(context, index, entry, &out.defaults, &out.generated);
+                    const needed = insertedDefaults(context, &out);
+                    try bindDefaults(context, index, entry, &needed, &out.defaults, &out.generated);
                     if (insert.conflict) |*conflict| try bindConflict(context, index, entry, insert.alias, conflict, &out.conflict);
                     out.returning = try bindReturning(context, index, &insert.returning, insert.alias);
                     return .{ .insert = out };
@@ -2707,7 +2762,8 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     out.where = try bindWhere(context, &scope, update.where);
                     out.key = primaryKey(context, entry, out.where);
-                    try bindDefaults(context, index, entry, &out.defaults, &out.generated);
+                    const needed = assignedDefaults(context, &out.values);
+                    try bindDefaults(context, index, entry, &needed, &out.defaults, &out.generated);
                     out.returning = try bindReturning(context, index, &update.returning, null);
                     return .{ .update = out };
                 },
@@ -2760,7 +2816,11 @@ pub fn Binder(comptime config: types.Config) type {
                     out.count += 1;
                 }
             }
-            if (with_defaults) try bindDefaults(context, index, entry, &out.defaults, &out.generated);
+            if (with_defaults) {
+                var needed: [config.columns]bool = @splat(true);
+                for (out.mapping[0..out.count]) |column| needed[column] = false;
+                try bindDefaults(context, index, entry, &needed, &out.defaults, &out.generated);
+            }
             try validateDiscardedRows(context);
             return out;
         }

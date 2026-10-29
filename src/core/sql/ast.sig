@@ -114,6 +114,8 @@ pub const NodeKind = enum {
     /// Bound field-pair comparisons in `b` -> next, with the row operator `op`.
     /// With `a` present and `b` absent, strict comparison to a bare NULL record:
     /// `a` retains binding dependencies but is never evaluated at runtime.
+    /// Its `integer` is the deferred-validation source owner: 0 = statement,
+    /// -1 = type-check-only DDL default, positive = 1 + table*columns + column.
     row_compare,
     /// Bound flat IN candidates: row_compare nodes in `b` -> next.
     /// Each owns a separate left expression, as PostgreSQL's OR expansion does.
