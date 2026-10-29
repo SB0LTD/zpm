@@ -460,7 +460,7 @@ pub fn Eval(comptime config: types.Config) type {
         }
 
         fn rowTruth(ctx: *const Context, n: *const ast.Node) Error!?bool {
-            if (n.a != none) return null; // Strict equality to a NULL record.
+            if (n.a != none) return null; // Strict comparison to a NULL record.
             var unknown = false;
             var item = n.b;
             while (item != none) : (item = node(ctx, item).next) {

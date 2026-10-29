@@ -1,0 +1,24 @@
+{
+  "target": "PostgreSQL 18.3",
+  "qualification": "scalar_and_flat_row_between",
+  "matrix_queries": 8910,
+  "extra_probes": 62,
+  "failures": [],
+  "unsupported_examples": [],
+  "excluded_dimensions": [
+    "record projection/storage",
+    "nested record values",
+    "row IN subqueries/ANY/ALL",
+    "schema replay",
+    "work/cancellation budgets"
+  ],
+  "oracle_version": [
+    [
+      "PostgreSQL 18.3 on x86_64-windows, compiled by msvc-19.44.35222, 64-bit"
+    ]
+  ],
+  "matrix_fnv64": "74cc0c15174c4d8",
+  "hash_encoding": "UTF-8 with LF newlines",
+  "contract_sha256": "15ebc62655136a79f087ee799c9bdd3fce23bd66ca8f5f6c493f51952a2655ad",
+  "oracle_script_sha256": "6da74c7e769de330d32a9cca9a132648878e73847ed84216b020445862647144"
+}

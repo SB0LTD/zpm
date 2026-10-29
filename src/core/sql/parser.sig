@@ -1375,10 +1375,12 @@ pub fn Parser(comptime config: types.Config) type {
                 negated = true;
             }
             if (try self.takeWord("BETWEEN")) {
+                const symmetric = try self.takeWord("SYMMETRIC");
+                if (!symmetric) _ = try self.takeWord("ASYMMETRIC");
                 const low = try self.other();
                 try self.expectWord("AND");
                 const high = try self.other();
-                return self.pool.add(.{ .kind = .between, .negated = negated, .a = left, .b = low, .c = high });
+                return self.pool.add(.{ .kind = .between, .negated = negated, .symmetric = symmetric, .a = left, .b = low, .c = high });
             }
             if (try self.takeWord("IN")) {
                 try self.expectSymbol(.lparen);

@@ -112,7 +112,7 @@ pub const NodeKind = enum {
     /// Members are `b` -> next; this is not a scalar record value type.
     row_constructor,
     /// Bound field-pair comparisons in `b` -> next, with the row operator `op`.
-    /// With `a` present and `b` absent, strict equality to a bare NULL record:
+    /// With `a` present and `b` absent, strict comparison to a bare NULL record:
     /// `a` retains binding dependencies but is never evaluated at runtime.
     row_compare,
     /// Bound flat IN candidates: row_compare nodes in `b` -> next.
@@ -130,6 +130,8 @@ pub const Node = struct {
     op: Op = .add,
     test_kind: Test = .is_null,
     negated: bool = false,
+    /// BETWEEN SYMMETRIC; consumed by binding into ordinary comparisons.
+    symmetric: bool = false,
     insensitive: bool = false,
     /// Constant subtree (no column reference); set by the binder.
     constant: bool = false,

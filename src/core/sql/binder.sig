@@ -1073,6 +1073,73 @@ pub fn Binder(comptime config: types.Config) type {
             while (item != none) : (item = context.node(item).next) try context.pool.raise(id, item);
         }
 
+        fn simpleRangeOperand(n: *const ast.Node) bool {
+            return switch (n.kind) {
+                .column, .null_literal, .bool_literal, .int_literal, .text_literal, .decimal_literal => true,
+                .cast => n.date_bound,
+                else => false,
+            };
+        }
+
+        fn rangeComparison(context: *const Context, scope: *const Scope, left: u16, right: u16, op: ast.Op) Error!u16 {
+            const a = try cloneTree(context, left);
+            const b = try cloneTree(context, right);
+            const id = try context.pool.add(.{ .kind = .binary, .op = op, .a = a, .b = b, .ty = .boolean });
+            const n = context.node(id);
+            const left_row = context.node(a).kind == .row_constructor;
+            const right_row = context.node(b).kind == .row_constructor;
+            if (left_row or right_row) {
+                if ((left_row and context.node(b).kind == .null_literal) or (right_row and context.node(a).kind == .null_literal)) {
+                    context.pool.discarded_row_constants = true;
+                    const row = if (left_row) a else b;
+                    n.* = .{ .kind = .row_compare, .op = op, .a = row, .ty = .boolean, .constant = isConstant(context, row), .depth = n.depth };
+                } else try bindRowCompare(context, scope, id);
+            } else {
+                if (context.node(a).ty == .json or context.node(b).ty == .json) return error.UndefinedFunction;
+                try comparable(context, &n.a, &n.b);
+                n.constant = isConstant(context, n.a) and isConstant(context, n.b);
+                try context.pool.raise(id, n.a);
+                try context.pool.raise(id, n.b);
+            }
+            return id;
+        }
+
+        fn rangeBoolean(context: *const Context, kind: ast.NodeKind, a: u16, b: u16) Error!u16 {
+            return context.pool.add(.{ .kind = kind, .a = a, .b = b, .ty = .boolean, .constant = isConstant(context, a) and isConstant(context, b) });
+        }
+
+        fn bindBetween(context: *const Context, scope: *const Scope, id: u16) Error!void {
+            const n = context.node(id);
+            for ([_]u16{n.a, n.b, n.c}) |part| {
+                if (context.node(part).kind == .row_constructor) try bindRowFields(context, scope, part) else try typeExpr(context, scope, part);
+            }
+            const a = context.node(n.a); const b = context.node(n.b); const c = context.node(n.c);
+            // Keep the existing compact date/integral scan shape where operands
+            // are repeatable simple values in the same comparison domain.
+            if (!n.symmetric and a.ty != .unknown and a.ty != .json and
+                a.kind != .row_constructor and b.kind != .row_constructor and c.kind != .row_constructor and
+                simpleRangeOperand(a) and simpleRangeOperand(b) and simpleRangeOperand(c) and
+                ((a.ty == b.ty and a.ty == c.ty) or (value.integral(a.ty) and value.integral(b.ty) and value.integral(c.ty)))) {
+                n.ty = .boolean;
+                n.constant = isConstant(context, n.a) and isConstant(context, n.b) and isConstant(context, n.c);
+                return;
+            }
+            const first = try rangeComparison(context, scope, n.a, n.b, if (n.negated) .lt else .ge);
+            const second = try rangeComparison(context, scope, n.a, n.c, if (n.negated) .gt else .le);
+            const inner: ast.NodeKind = if (n.negated) .or_op else .and_op;
+            var left = first; var right = second; var kind = inner;
+            if (n.symmetric) {
+                left = try rangeBoolean(context, inner, first, second);
+                const third = try rangeComparison(context, scope, n.a, n.c, if (n.negated) .lt else .ge);
+                const fourth = try rangeComparison(context, scope, n.a, n.b, if (n.negated) .gt else .le);
+                right = try rangeBoolean(context, inner, third, fourth);
+                kind = if (n.negated) .and_op else .or_op;
+            }
+            n.* = .{ .kind = kind, .a = left, .b = right, .ty = .boolean, .constant = isConstant(context, left) and isConstant(context, right), .next = n.next, .name = n.name };
+            try context.pool.raise(id, left);
+            try context.pool.raise(id, right);
+        }
+
         fn typeExpr(context: *const Context, scope: *const Scope, id: u16) Error!void {
             const n = context.node(id);
             n.constant = true;
@@ -1165,20 +1232,7 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = isConstant(context, n.a);
                 },
                 .between => {
-                    try typeExpr(context, scope, n.a);
-                    try typeExpr(context, scope, n.b);
-                    try typeExpr(context, scope, n.c);
-                    var result: ast.Type = .unknown;
-                    for ([_]u16{ n.a, n.b, n.c }) |part| try unifyInto(&result, context.node(part).ty);
-                    if (result == .unknown) result = .text;
-                    if (result == .json) return error.UndefinedFunction;
-                    if (!(value.integral(result) and value.integral(context.node(n.a).ty) and value.integral(context.node(n.b).ty) and value.integral(context.node(n.c).ty))) {
-                        n.a = try convert(context, n.a, result, -1, .implicit);
-                        n.b = try convert(context, n.b, result, -1, .implicit);
-                        n.c = try convert(context, n.c, result, -1, .implicit);
-                    }
-                    n.ty = .boolean;
-                    n.constant = isConstant(context, n.a) and isConstant(context, n.b) and isConstant(context, n.c);
+                    try bindBetween(context, scope, id);
                 },
                 .in_list => {
                     if (context.node(n.a).kind == .row_constructor) return bindRowIn(context, scope, id);

@@ -263,3 +263,18 @@ python tests/sql_conformance/verify_row_null_oracle.py --port 55491 --report .si
 current harness and evidence. General record/nested values and row subquery
 membership remain unqualified; constant validation is scoped to discarded row
 operands and does not qualify the entire optimizer.
+
+`contract-sql-between` covers scalar and flat row BETWEEN / NOT BETWEEN,
+including ASYMMETRIC and SYMMETRIC: 17,939 assertions, 8,910 finite reference
+cases and 62 additional PostgreSQL 18.3 probes. Reproduce its native oracle:
+
+```powershell
+python tests/sql_conformance/verify_between_oracle.py --port 55491 --report .sig-cache/between-oracle.json
+```
+
+`between_oracle.json` pins both sources and the matrix digest. Thirteen Python
+tests validate current evidence. The Sig contract also checks replay, resource
+controls and caller AST exhaustion. Ordinary lowering uses two comparisons and
+symmetric lowering uses four; simple typed scalar ranges retain their compact
+shape. Nested/general record payloads remain unqualified. This is correctness
+evidence, not a benchmark result or full SQL compatibility claim.
