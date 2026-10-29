@@ -190,6 +190,82 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _=try addContract(ctx,test_machine,"contract-budgeted-region","tests/test_budgeted_region.sig",&.{
         importEntry("resource_budget","src/core/resource_budget.sig"),importEntry("page_region","src/platform/page_region.sig"),
         importEntry("budgeted_region","src/platform/budgeted_region.sig")});
+    _ = try ctx.addModule("solana_le", "src/solana/le.sig");
+    _ = try ctx.addModule("solana_base58", "src/solana/base58.sig");
+    _ = try ctx.addModule("solana_client","src/solana/client.sig");
+    _ = try ctx.addModule("solana_rpc_json","src/solana/rpc_json.sig");
+    const solana_rpc = try ctx.addModule("solana_rpc","src/solana/rpc.sig");
+    try wire(ctx,solana_rpc,"solana_rpc_json","src/solana/rpc_json.sig");
+    try wire(ctx,solana_rpc,"solana_base58","src/solana/base58.sig");
+    _ = try ctx.addModule("solana_program_error", "src/solana/program_error.sig");
+    const solana_input = try ctx.addModule("solana_entrypoint_input","src/solana/entrypoint_input.sig");
+    try wire(ctx,solana_input,"solana_le","src/solana/le.sig");
+    _ = try ctx.addModule("solana_syscalls","src/platform/solana/syscalls.sig");
+    const solana_clock = try ctx.addModule("solana_clock","src/platform/solana/clock.sig");
+    try wire(ctx,solana_clock,"solana_syscalls","src/platform/solana/syscalls.sig");
+    try wire(ctx,solana_clock,"solana_base58","src/solana/base58.sig");
+    const solana_cpi = try ctx.addModule("solana_cpi","src/platform/solana/cpi.sig");
+    try wire(ctx,solana_cpi,"solana_syscalls","src/platform/solana/syscalls.sig");
+    try wire(ctx,solana_cpi,"solana_entrypoint_input","src/solana/entrypoint_input.sig");
+    const solana_rent = try ctx.addModule("solana_rent","src/platform/solana/rent.sig");
+    try wire(ctx,solana_rent,"solana_syscalls","src/platform/solana/syscalls.sig");
+    try wire(ctx,solana_rent,"solana_base58","src/solana/base58.sig");
+    try wire(ctx,solana_rent,"solana_le","src/solana/le.sig");
+    const solana_system = try ctx.addModule("solana_system_account","src/platform/solana/system_account.sig");
+    try wire(ctx,solana_system,"solana_cpi","src/platform/solana/cpi.sig");
+    try wire(ctx,solana_system,"solana_le","src/solana/le.sig");
+    try wire(ctx,solana_system,"solana_entrypoint_input","src/solana/entrypoint_input.sig");
+    try wire(ctx,solana_system,"solana_program_error","src/solana/program_error.sig");
+    const solana_entrypoint = try ctx.addModule("solana_entrypoint","src/platform/solana/entrypoint.sig");
+    try wire(ctx,solana_entrypoint,"solana_entrypoint_input","src/solana/entrypoint_input.sig");
+    try wire(ctx,solana_entrypoint,"solana_le","src/solana/le.sig");
+    try wire(ctx,solana_entrypoint,"solana_program_error","src/solana/program_error.sig");
+    try wire(ctx,solana_entrypoint,"solana_clock","src/platform/solana/clock.sig");
+    const test_solana = try ctx.addStep("test-solana", "Execute allocator-free Solana ABI contracts", &noopStep);
+    try ctx.addDependency(test_all,test_solana);
+    _ = try addContract(ctx,test_solana,"contract-solana-client","tests/test_solana_client.sig",&.{
+        importEntry("solana_client","src/solana/client.sig"),
+        importEntry("solana_rpc_json","src/solana/rpc_json.sig"),
+        importEntry("solana_rpc","src/solana/rpc.sig"),
+        importEntry("solana_base58","src/solana/base58.sig"),
+    });
+    _ = try addContract(ctx,test_solana,"contract-solana-cpi","tests/test_solana_cpi.sig",&.{
+        importEntry("solana_cpi","src/platform/solana/cpi.sig"),
+        importEntry("solana_rent","src/platform/solana/rent.sig"),
+        importEntry("solana_system_account","src/platform/solana/system_account.sig"),
+        importEntry("solana_syscalls","src/platform/solana/syscalls.sig"),
+        importEntry("solana_entrypoint_input","src/solana/entrypoint_input.sig"),
+        importEntry("solana_le","src/solana/le.sig"),
+        importEntry("solana_program_error","src/solana/program_error.sig"),
+    });
+    _ = try addContract(ctx,test_solana,"contract-solana-runtime","tests/test_solana_runtime.sig",&.{
+        importEntry("solana_syscalls","src/platform/solana/syscalls.sig"),
+        importEntry("solana_clock","src/platform/solana/clock.sig"),
+        importEntry("solana_entrypoint","src/platform/solana/entrypoint.sig"),
+        importEntry("solana_entrypoint_input","src/solana/entrypoint_input.sig"),
+        importEntry("solana_le","src/solana/le.sig"),
+        importEntry("solana_base58","src/solana/base58.sig"),
+        importEntry("solana_program_error","src/solana/program_error.sig"),
+    });
+    _ = try ctx.addModule("ledger_world", "src/game/ledger_world.sig");
+    const action_wire = try ctx.addModule("action_wire", "src/game/action_wire.sig");
+    try wire(ctx, action_wire, "ledger_world", "src/game/ledger_world.sig");
+    const state_wire = try ctx.addModule("state_wire", "src/game/state_wire.sig");
+    try wire(ctx, state_wire, "ledger_world", "src/game/ledger_world.sig");
+    _ = try ctx.addModule("action_funding", "src/game/action_funding.sig");
+    _ = try ctx.addModule("scene3d", "src/game/scene3d.sig");
+    _ = try ctx.addModule("bitmap_font", "src/core/bitmap_font.sig");
+    _ = try ctx.addModule("android_native", "src/platform/android/native_activity.sig");
+    _ = try ctx.addModule("gles1", "src/platform/gles1.sig");
+    const test_game = try ctx.addStep("test-game", "Execute deterministic ledger RPG and funding contracts", &noopStep);
+    try ctx.addDependency(test_all, test_game);
+    _ = try addContract(ctx, test_game, "contract-ledger-game", "tests/test_ledger_game.sig", &.{
+        importEntry("ledger_world", "src/game/ledger_world.sig"),
+        importEntry("action_wire", "src/game/action_wire.sig"),
+        importEntry("action_funding", "src/game/action_funding.sig"),
+        importEntry("scene3d", "src/game/scene3d.sig"),
+        importEntry("state_wire", "src/game/state_wire.sig"),
+    });
     _ = try ctx.addModule("math", "src/core/math.sig");
     _ = try ctx.addModule("sig_math", "src/core/sig_math.sig");
     const synth_voice = try ctx.addModule("synth_voice", "src/core/synth_voice.sig");
@@ -235,6 +311,16 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const sha256 = try ctx.addModule("sha256", "src/core/sha256.sig");
     try wire(ctx, sha256, "sig_mem", "src/core/sig_mem.sig");
     try wire(ctx, sha256, "sig_testing", "src/core/sig_testing.sig");
+    const solana_pda = try ctx.addModule("solana_pda","src/solana/pda.sig");
+    try wire(ctx,solana_pda,"sha256","src/core/sha256.sig");
+    _ = try addContract(ctx,test_solana,"contract-solana-input","tests/test_solana_input.sig",&.{
+        importEntry("solana_le","src/solana/le.sig"),
+        importEntry("solana_entrypoint_input","src/solana/entrypoint_input.sig"),
+        importEntry("solana_pda","src/solana/pda.sig"),
+        importEntry("sha256","src/core/sha256.sig"),
+        importEntry("sig_mem","src/core/sig_mem.sig"),
+        importEntry("sig_testing","src/core/sig_testing.sig"),
+    });
     var process_path: [sig_build.PATH_BUF_SIZE]u8 = undefined;
     const lib = ctx.sig_lib_dir[0..ctx.sig_lib_dir_len];
     const process_suffix = "/sig/process.sig";
@@ -546,6 +632,13 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const c3_wallet_auth = try ctx.addModule("c3-wallet-auth", "src/c3/wallet_auth.sig");
     _ = try ctx.addModule("c3-wallet", "src/c3/wallet.sig");
     try wire(ctx, c3_wallet_auth, "sig_testing", "src/core/sig_testing.sig");
+    _ = try addContract(ctx,test_solana,"contract-solana-core","tests/test_solana_core.sig",&.{
+        importEntry("solana_le","src/solana/le.sig"),
+        importEntry("solana_base58","src/solana/base58.sig"),
+        importEntry("solana_program_error","src/solana/program_error.sig"),
+        importEntry("c3-wallet-auth","src/c3/wallet_auth.sig"),
+        importEntry("sig_testing","src/core/sig_testing.sig"),
+    });
     const c3_protocol = try ctx.addModule("c3", "src/c3/root.sig");
     try wire(ctx, c3_protocol, "capital", "src/c3.sig");
     try wire(ctx, c3_protocol, "audit", "src/c3/audit.sig");
