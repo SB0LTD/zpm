@@ -133,6 +133,12 @@ pub fn Deparse(comptime config: types.Config) type {
             switch (n.kind) {
                 .row_constructor => try rowText(context, n.b, null, w),
                 .row_compare => {
+                    if (n.a != none) {
+                        try w.bytes("(");
+                        try expression(context, n.a, w);
+                        try w.bytes(" IN (NULL))");
+                        return;
+                    }
                     try w.bytes("(");
                     try rowText(context, n.b, false, w);
                     try w.bytes(opText(n.op) orelse return error.UnsupportedStatement);

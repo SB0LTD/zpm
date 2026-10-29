@@ -248,3 +248,18 @@ binding storage grows with candidate count and width. This is constructor-list
 support, not general records or row IN subqueries/ANY/ALL. Bare NULL record
 candidates and nested records remain explicitly unsupported. Historical
 unqualified-scope lists in earlier oracle records describe those earlier batches.
+
+Bare NULL record candidates are covered by `contract-sql-row-null-candidates`:
+98 assertions and 43 PostgreSQL 18.3 probes. This closes the bare-NULL exclusion
+above; refreshed constructor-list evidence includes 41 additional probes.
+Grouping/name validation, constant errors, CASE/COALESCE, volatile suppression,
+eliminated aggregates, replay and execution controls are covered. Reproduce with:
+
+```powershell
+python tests/sql_conformance/verify_row_null_oracle.py --port 55491 --report .sig-cache/row-null-oracle.json
+```
+
+`row_null_oracle.json` pins both source hashes. Twelve Python tests validate the
+current harness and evidence. General record/nested values and row subquery
+membership remain unqualified; constant validation is scoped to discarded row
+operands and does not qualify the entire optimizer.

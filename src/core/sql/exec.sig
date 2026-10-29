@@ -286,6 +286,7 @@ pub fn Exec(comptime config: types.Config) type {
                 const n = self.pool.nodes[id];
                 return switch (n.kind) {
                     .row_compare => blk: {
+                        if (n.a != none) break :blk self.earlyAvailable(n.a, stage);
                         var item = n.b;
                         while (item != none) : (item = self.pool.nodes[item].next) {
                             const pair = self.pool.nodes[item];

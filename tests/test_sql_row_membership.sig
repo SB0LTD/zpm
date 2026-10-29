@@ -93,7 +93,7 @@ pub fn main(init:std.process.Init) !void {
     try rejects("SELECT ROW(1,'x') IN (ROW(2,1))",error.InvalidTextRepresentation);
     try rejects("SELECT ROW() IN (ROW())",error.UnsupportedStatement);
     // Unqualified record payloads are rejected rather than misrepresented.
-    try rejects("SELECT ROW(1,2) IN (NULL)",error.UnsupportedStatement);
+    try truth("SELECT ROW(1,2) IN (NULL)",null);
     try rejects("SELECT ROW(ROW(1,2),3) IN (ROW(ROW(1,2),3))",error.UnsupportedStatement);
     var primary:DB=.{};var replayed:DB=.{};var scratch:DB.ReplayScratch=.{};
     var bytes:[32768]u8=undefined;var used:usize=0;
