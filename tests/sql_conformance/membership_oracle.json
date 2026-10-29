@@ -1,0 +1,28 @@
+{
+  "target": "PostgreSQL 18.3",
+  "qualification": "flat_constructor_in_lists_only",
+  "matrix_queries": 2916,
+  "extra_probes": 40,
+  "failures": [],
+  "unsupported_examples": [
+    "SELECT ROW(1,2) IN (NULL)",
+    "SELECT ROW(ROW(1,2),3) IN (ROW(ROW(1,2),3))"
+  ],
+  "excluded_dimensions": [
+    "record projection/storage",
+    "nested record values",
+    "bare NULL record candidates",
+    "row IN subqueries/ANY/ALL",
+    "schema replay",
+    "work/cancellation budgets"
+  ],
+  "oracle_version": [
+    [
+      "PostgreSQL 18.3 on x86_64-windows, compiled by msvc-19.44.35222, 64-bit"
+    ]
+  ],
+  "matrix_fnv64": "34f61bb6e004f407",
+  "hash_encoding": "UTF-8 with LF newlines",
+  "contract_sha256": "42660af730a3306098f5f05e3f184a5e21398b80dabcf87ede791d82ddba30d9",
+  "oracle_script_sha256": "28cc3ef5493fa949ca9233dbab5dc6c5406956a64502fdb4e3d826090518a71f"
+}

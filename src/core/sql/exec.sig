@@ -293,7 +293,7 @@ pub fn Exec(comptime config: types.Config) type {
                         }
                         break :blk true;
                     },
-                    .row_constructor => blk: {
+                    .row_constructor, .row_in => blk: {
                         var item = n.b;
                         while (item != none) : (item = self.pool.nodes[item].next) if (!self.earlyAvailable(item, stage)) break :blk false;
                         break :blk true;
@@ -1129,6 +1129,7 @@ pub fn Exec(comptime config: types.Config) type {
                     .binary,.and_op,.or_op,.nullif,.like,.when_arm,.at_zone=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionNode(table,node.b,columns,depth+1,budget),
                     .between=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionNode(table,node.b,columns,depth+1,budget) and self.projectionNode(table,node.c,columns,depth+1,budget),
                     .in_list=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionList(table,node.b,columns,depth+1,budget),
+                    .row_in=>return self.projectionList(table,node.b,columns,depth+1,budget),
                     .coalesce,.function=>return self.projectionList(table,node.b,columns,depth+1,budget),
                     .case_expr=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionList(table,node.b,columns,depth+1,budget) and self.projectionNode(table,node.c,columns,depth+1,budget),
                     .aggregate=>return self.projectionNode(table,node.a,columns,depth+1,budget) and self.projectionNode(table,node.c,columns,depth+1,budget),
