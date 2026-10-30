@@ -216,9 +216,12 @@ pub fn Binder(comptime config: types.Config) type {
             kind:Ast.WindowKind=.aggregate,
             aggregate:Agg=.{.kind=.none,.arg=none,.filter=none,.distinct=false,.arg_ty=.unknown,.ty=.unknown},
             argument:u16=none,result:u16=0,output_node:u16=none,
+            deferred_arg:u16=none,deferred_filter:u16=none,filter_column:u16=none,
             partition:[config.columns]u16=undefined,partition_count:usize=0,
             order:[config.columns]SortKey=undefined,order_count:usize=0,
             frame:Ast.Frame=.default,
+            start:Ast.FrameBound=.{.kind=.unbounded_preceding},end:Ast.FrameBound=.{},
+            exclude:Ast.Exclusion=.no_others,
         };
 
         pub const Distinct = enum { none, all, on };
@@ -694,14 +697,50 @@ pub fn Binder(comptime config: types.Config) type {
             };
         }
 
+        fn repeatableWindowInput(context:*const Context,id:u16) bool {
+            if(id==none) return true;const n=context.node(id);
+            switch(n.kind){
+                .function=>if(!ast.canRepeatFunction(n.func) and n.func!=.jsonb_typeof and n.func!=.jsonb_array_length) return false,
+                .scalar_subquery,.exists_subquery,.in_subquery=>return false,
+                else=>{},
+            }
+            if(!repeatableWindowInput(context,n.a) or !repeatableWindowInput(context,n.c)) return false;
+            if(listOwner(n.kind)){var item=n.b;while(item!=none):(item=context.node(item).next) if(!repeatableWindowInput(context,item)) return false;}
+            else if(!repeatableWindowInput(context,n.b)) return false;
+            return true;
+        }
+
+        fn frameVariable(context:*const Context,id:u16) bool {
+            if(id==none) return false;const node=context.node(id);
+            if(node.kind==.column) return true;
+            if(node.kind==.scalar_subquery or node.kind==.exists_subquery or node.kind==.in_subquery) {
+                if(plansOf(context).items[@intCast(node.integer)].correlated) return true;
+                if(node.kind!=.in_subquery) return false;
+            }
+            if(frameVariable(context,node.a) or frameVariable(context,node.c)) return true;
+            if(listOwner(node.kind)){var item=node.b;while(item!=none):(item=context.node(item).next) if(frameVariable(context,item)) return true;}
+            else if(frameVariable(context,node.b)) return true;
+            return false;
+        }
+        fn typeFrameOffset(context:*const Context,scope:*const Scope,bound:*Ast.FrameBound) Error!void {
+            if(bound.offset==none) return;
+            var inner=scope.*;inner.aggregates=false;inner.windows=false;
+            try typeExpr(context,&inner,bound.offset);
+            if(frameVariable(context,bound.offset)) return error.InvalidColumnReference;
+            const ty=context.node(bound.offset).ty;
+            if(ty!=.unknown and !value.castable(ty,.int8,.assignment)) return error.TypeMismatch;
+            bound.offset=try convert(context,bound.offset,.int8,-1,.assignment);
+        }
+
         fn typeWindow(context:*const Context,scope:*const Scope,n:*ast.Node) Error!void {
             if(!scope.windows) return scope.window_error;
-            if(n.distinct or n.c!=none) return error.UnsupportedStatement;
+            if(n.distinct) return error.UnsupportedStatement;
             const spec=&context.pool.windows[n.window];
             var inner=scope.*;inner.windows=false;inner.inside_window=true;
             const name=toName(context,n.name);
             const ranking=types.same(name.slice(),"rank") or types.same(name.slice(),"dense_rank") or types.same(name.slice(),"row_number");
             if(ranking) {
+                if(n.c!=none) return error.UnsupportedStatement;
                 if(n.b!=none or n.star) return error.UndefinedFunction;
                 n.ty=.int8;
             } else {
@@ -717,8 +756,23 @@ pub fn Binder(comptime config: types.Config) type {
                 }
                 n.ty=try aggregateType(context,n,kind,n.b,ty);n.agg=kind;
             }
+            if(n.c!=none) {
+                var filter_scope=inner;filter_scope.aggregates=false;
+                try typeExpr(context,&filter_scope,n.c);try booleanArgument(context,n.c);
+            }
             for(spec.partition[0..spec.partition_count]) |id| {try valueExpr(context,&inner,id);try sortableType(context.node(id).ty);}
             for(spec.order[0..spec.order_count]) |key| {try valueExpr(context,&inner,key.expr);try sortableType(context.node(key.expr).ty);}
+            if(spec.frame==.groups and spec.order_count==0) return error.WindowingError;
+            if(spec.frame==.range and (spec.start.offset!=none or spec.end.offset!=none)) {
+                if(spec.order_count!=1) return error.WindowingError;
+                if(!value.integral(context.node(spec.order[0].expr).ty)) return error.UnsupportedStatement;
+            }
+            try typeFrameOffset(context,scope,&spec.start);try typeFrameOffset(context,scope,&spec.end);
+            if(spec.exclude==.no_others and spec.start.kind==.unbounded_preceding) {
+                if(spec.end.kind==.unbounded_following) spec.frame=.full
+                else if(spec.end.kind==.current_row and spec.frame!=.default) spec.frame=if(spec.frame==.rows) .rows_prefix else .default;
+            }
+            if((spec.frame==.rows or spec.frame==.groups or spec.frame==.range) and !ranking and (!repeatableWindowInput(context,n.b) or !repeatableWindowInput(context,n.c))) return error.UnsupportedStatement;
             n.func=.window_call;n.constant=false;
         }
 
@@ -2895,8 +2949,24 @@ pub fn Binder(comptime config: types.Config) type {
             else if(containsWindow(context,n.b)) return true;
             return false;
         }
+        fn safeWindowOperand(context:*const Context,id:u16) bool {
+            if(id==none) return false;
+            return switch(context.node(id).kind){.column,.null_literal,.bool_literal,.int_literal,.text_literal,.decimal_literal=>true,else=>false};
+        }
+        fn safeWindowFilter(context:*const Context,id:u16) bool {
+            const n=context.node(id);
+            return switch(n.kind){
+                .column,.null_literal,.bool_literal=>true,
+                .test_op=>safeWindowOperand(context,n.a),
+                .not_op=>safeWindowFilter(context,n.a),
+                .and_op,.or_op=>safeWindowFilter(context,n.a) and safeWindowFilter(context,n.b),
+                .binary=>switch(n.op){.eq,.ne,.lt,.le,.gt,.ge,.is_distinct,.is_not_distinct=>safeWindowOperand(context,n.a) and safeWindowOperand(context,n.b),else=>false},
+                else=>false,
+            };
+        }
+
         fn windowInput(context:*const Context,input:*Plan,id:u16) Error!u16 {
-            for(input.targets[0..input.count],0..) |old,i| if(sameExpr(context,old,id)) return @intCast(i);
+            if(repeatableWindowInput(context,id)) for(input.targets[0..input.count],0..) |old,i| if(sameExpr(context,old,id)) return @intCast(i);
             if(input.count==config.columns) return error.StatementTooComplex;
             const index=input.count;input.count+=1;input.targets[index]=try cloneTree(context,id);
             input.tys[index]=context.node(id).ty;input.typmods[index]=outputTypmod(context,id);
@@ -2911,12 +2981,28 @@ pub fn Binder(comptime config: types.Config) type {
             if(n.window!=none) {
                 if(p.window_count==config.columns) return error.StatementTooComplex;
                 const spec=&context.pool.windows[n.window];
-                var win:Window=.{.frame=spec.frame,.output_node=id};
+                var win:Window=.{.frame=spec.frame,.start=spec.start,.end=spec.end,.exclude=spec.exclude,.output_node=id};
                 const name=toName(context,n.name);
                 win.kind=if(types.same(name.slice(),"rank")) .rank else if(types.same(name.slice(),"dense_rank")) .dense_rank else if(types.same(name.slice(),"row_number")) .row_number else .aggregate;
                 if(win.kind==.aggregate) {
-                    win.argument=if(n.agg==.count_star) none else try windowInput(context,input,n.b);
+                    // PostgreSQL folds immutable constant inputs before a
+                    // FILTER/frame can discard them; never execute volatile
+                    // or session-dependent expressions during binding.
+                    if(generatedConstant(context,n.b)) _=try generatedValue(context,n.b);
+                    if(generatedConstant(context,n.c)) _=try generatedValue(context,n.c);
+                    if(n.agg!=.count_star) {
+                        const arg=context.node(n.b);
+                        const bounded=spec.frame==.rows or spec.frame==.groups or spec.frame==.range;
+                        const simple=arg.kind==.column or arg.kind==.null_literal or arg.kind==.int_literal or arg.kind==.bool_literal or arg.kind==.text_literal or arg.kind==.decimal_literal;
+                        if((bounded or n.c!=none) and !simple) {
+                            win.deferred_arg=try cloneTree(context,n.b);try lowerWindowTree(context,p,input,win.deferred_arg);
+                        } else win.argument=try windowInput(context,input,n.b);
+                    }
                     win.aggregate=.{.kind=n.agg,.arg=none,.filter=none,.distinct=false,.arg_ty=if(n.b==none) .unknown else context.node(n.b).ty,.ty=n.ty};
+                    if(n.c!=none) {
+                        if(safeWindowFilter(context,n.c)) win.filter_column=try windowInput(context,input,n.c)
+                        else {win.deferred_filter=try cloneTree(context,n.c);try lowerWindowTree(context,p,input,win.deferred_filter);}
+                    }
                 }
                 for(spec.partition[0..spec.partition_count]) |item| {win.partition[win.partition_count]=try windowInput(context,input,item);win.partition_count+=1;}
                 for(spec.order[0..spec.order_count]) |key| {
@@ -2941,6 +3027,7 @@ pub fn Binder(comptime config: types.Config) type {
             const plans=plansOf(context);const p=&plans.items[id];var active=false;
             for(p.targets[0..p.width]) |target| active=active or containsWindow(context,target);
             if(!active) return;
+            for(p.targets[0..p.width]) |target| {if(generatedConstant(context,target)) _=try generatedValue(context,target);}
             const child=try plans.add();const input=&plans.items[child];input.*=p.*;
             input.count=0;input.width=0;input.window_count=0;input.order_count=0;input.distinct=.none;
             input.limit=0xffffffffffffffff;input.offset=0;

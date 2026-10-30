@@ -323,11 +323,16 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const WindowKind=enum {aggregate,rank,dense_rank,row_number};
-        pub const Frame=enum {default,rows_prefix,full};
+        pub const Frame=enum {default,rows_prefix,full,rows,groups,range};
+        pub const BoundKind=enum {unbounded_preceding,preceding,current_row,following,unbounded_following};
+        pub const FrameBound=struct {kind:BoundKind=.current_row,offset:u16=none};
+        pub const Exclusion=enum {no_others,current_row,group,ties};
         pub const Window=struct {
             partition:[config.columns]u16=undefined,partition_count:usize=0,
             order:[config.columns]OrderKey=undefined,order_count:usize=0,
             frame:Frame=.default,
+            start:FrameBound=.{.kind=.unbounded_preceding},end:FrameBound=.{},
+            exclude:Exclusion=.no_others,
         };
 
         pub const TableRef = struct {

@@ -73,6 +73,12 @@ pub fn Exec(comptime config: types.Config) type {
             distinct_bitmap_bytes: usize = 0,
             groups: usize = 0,
             probes: usize = 0,
+            window_frame_rows:usize=0,
+            window_prefix_rows:usize=0,
+            window_scalar_visits:usize=0,
+            window_tree_builds:usize=0,
+            window_tree_visits:usize=0,
+            window_range_probes:usize=0,
             dimension_probes: usize = 0,
             prefix_rejected: usize = 0,
             cascade_rejected: usize = 0,
@@ -2425,9 +2431,22 @@ pub fn Exec(comptime config: types.Config) type {
                 return self.finish(p,out);
             }
 
-            fn windowAccumulate(self:*Query,win:*const B.Window,acc:*Accumulator,at:u32) Error!void {
+            fn windowIncluded(self:*const Query,win:*const B.Window,at:u32) bool {
+                if(win.filter_column==none) return true;
+                const flag=&self.work.cells[at+win.filter_column];return flag.*==.boolean and flag.boolean;
+            }
+            fn windowAccumulate(self:*Query,win:*const B.Window,acc:*Accumulator,at:u32,outer:?*const E.Context) Error!void {
                 try self.session.checkpoint();
+                if(!self.windowIncluded(win,at)) return;
+                if(win.deferred_filter!=none) {
+                    var ctx=self.context(outer);ctx.tuple[0]=self.row(at);
+                    if(try E.truth(&ctx,win.deferred_filter)!=true) return;
+                }
                 if(win.aggregate.kind==.count_star) {acc.count+=1;return;}
+                if(win.deferred_arg!=none) {
+                    var ctx=self.context(outer);ctx.tuple[0]=self.row(at);const item=try E.eval(&ctx,win.deferred_arg);
+                    if(item!=.null_value) try self.accumulate(&win.aggregate,acc,&item);return;
+                }
                 const item=&self.work.cells[at+win.argument];
                 if(item.*!=.null_value) try self.accumulate(&win.aggregate,acc,item);
             }
@@ -2436,13 +2455,212 @@ pub fn Exec(comptime config: types.Config) type {
                 for(win.order[0..win.order_count]) |key| if(V.compare(&self.work.cells[a+key.column],&self.work.cells[b+key.column])!=0) return false;
                 return true;
             }
+            fn frameOffset(self:*Query,bound:Ast.FrameBound,outer:?*const E.Context) Error!u64 {
+                if(bound.offset==none) return 0;
+                var ctx=self.context(outer);const value=try E.eval(&ctx,bound.offset);
+                if(value==.null_value) return error.NullWindowFrameOffset;
+                if(value.integer<0) return error.InvalidWindowFrameOffset;
+                return @intCast(value.integer);
+            }
+            fn framePosition(kind:Ast.BoundKind,offset:u64,position:usize,first:usize,end:usize,ending:bool) usize {
+                var raw:i128=switch(kind){
+                    .unbounded_preceding=>first,.unbounded_following=>end,
+                    .current_row=>position,.preceding=>@as(i128,position)-offset,.following=>@as(i128,position)+offset,
+                };
+                if(ending and kind!=.unbounded_preceding and kind!=.unbounded_following) raw+=1;
+                return @intCast(@max(@as(i128,first),@min(@as(i128,end),raw)));
+            }
+            fn frameSelected(index:usize,current:usize,peer_first:usize,peer_end:usize,exclude:Ast.Exclusion) bool {
+                return switch(exclude){.no_others=>true,.current_row=>index!=current,.group=>index<peer_first or index>=peer_end,.ties=>index==current or index<peer_first or index>=peer_end};
+            }
+            fn rangePosition(self:*Query,win:*const B.Window,row_handles:[]const u32,bound:Ast.FrameBound,offset:u64,current:usize,
+                first:usize,end:usize,nonnull_first:usize,nonnull_end:usize,peer_first:usize,peer_end:usize,ending:bool) Error!usize {
+                switch(bound.kind){.unbounded_preceding=>return first,.unbounded_following=>return end,.current_row=>return if(ending) peer_end else peer_first,else=>{}}
+                const key=&self.work.cells[row_handles[current]+win.order[0].column];
+                if(key.*==.null_value) return if(ending) peer_end else peer_first;
+                const subtract=(bound.kind==.preceding)!=win.order[0].descending;
+                const target=@as(i128,key.integer)+(if(subtract) -@as(i128,offset) else @as(i128,offset));
+                var left=nonnull_first;var right=nonnull_end;
+                while(left<right) {
+                    try self.session.checkpoint();self.work.stream_stats.window_range_probes+=1;
+                    const middle=left+(right-left)/2;const candidate=@as(i128,self.work.cells[row_handles[middle]+win.order[0].column].integer);
+                    const advance=if(win.order[0].descending) (if(ending) candidate>=target else candidate>target) else (if(ending) candidate<=target else candidate<target);
+                    if(advance) left=middle+1 else right=middle;
+                }
+                return left;
+            }
+            fn prefixRange(prefix:[]const FactorAggregate,first:usize,end:usize) FactorAggregate {
+                if(first>=end) return .{};
+                return .{.total=prefix[end].total-prefix[first].total,.count=prefix[end].count-prefix[first].count};
+            }
+            fn frameBest(self:*Query,win:*const B.Window,row_handles:[]const u32,a:u32,b:u32) Error!u32 {
+                try self.session.checkpoint();
+                if(a==absent) return b;if(b==absent) return a;
+                const order=V.compare(&self.work.cells[row_handles[a]+win.argument],&self.work.cells[row_handles[b]+win.argument]);
+                if(order==0) return @min(a,b);
+                return if((win.aggregate.kind==.min and order<0) or (win.aggregate.kind==.max and order>0)) a else b;
+            }
+            fn frameTreeRange(self:*Query,win:*const B.Window,row_handles:[]const u32,tree:u32,leaves:usize,first:usize,end:usize) Error!u32 {
+                if(first>=end) return absent;
+                var left=first+leaves;var right=end+leaves;var best:u32=absent;
+                while(left<right) {
+                    try self.session.checkpoint();
+                    if(left&1!=0){self.work.stream_stats.window_tree_visits+=1;best=try self.frameBest(win,row_handles,best,self.work.refs[tree+left]);left+=1;}
+                    if(right&1!=0){right-=1;self.work.stream_stats.window_tree_visits+=1;best=try self.frameBest(win,row_handles,best,self.work.refs[tree+right]);}
+                    left/=2;right/=2;
+                }
+                return best;
+            }
+            fn boundedWindow(self:*Query,rows:List,win:*const B.Window,start_offset:u64,end_offset:u64,outer:?*const E.Context) Error!void {
+                if(rows.count==0) return;
+                const row_handles=self.handles(rows);
+                const peer_needed=win.frame!=.rows or win.exclude==.group or win.exclude==.ties;
+                const peers=if(peer_needed) try self.refs(@as(usize,rows.count)+1) else 0;
+                const eligible=win.deferred_arg==none and win.deferred_filter==none and (win.aggregate.kind==.count or win.aggregate.kind==.count_star or win.aggregate.kind==.bool_and or win.aggregate.kind==.bool_or or
+                    ((win.aggregate.kind==.sum or win.aggregate.kind==.avg) and value_module.integral(win.aggregate.arg_ty)));
+                var fast=false;
+                var prefix:[]FactorAggregate=&.{};
+                if(eligible) {
+                    const bytes=@mulWithOverflow(@as(usize,rows.count)+1,@sizeOf(FactorAggregate));if(bytes[1]!=0) return error.WorkspaceCapacity;
+                    const rounded=@addWithOverflow(bytes[0],@sizeOf(V.Cell)-1);if(rounded[1]!=0) return error.WorkspaceCapacity;
+                    if(rounded[0]/@sizeOf(V.Cell)<=self.work.cell_high-self.work.cell_low) {
+                        const at=try self.cells(rounded[0]/@sizeOf(V.Cell));
+                        const pointer:[*]FactorAggregate=@ptrCast(@alignCast(&self.work.cells[at]));prefix=pointer[0..@as(usize,rows.count)+1];fast=true;
+                    }
+                }
+                var tree:?u32=null;
+                if(win.deferred_arg==none and win.deferred_filter==none and (win.aggregate.kind==.min or win.aggregate.kind==.max)) {
+                    var leaves:usize=1;while(leaves<rows.count) {const next=@mulWithOverflow(leaves,@as(usize,2));if(next[1]!=0) return error.WorkspaceCapacity;leaves=next[0];}
+                    const amount=@mulWithOverflow(leaves,@as(usize,2));if(amount[1]!=0) return error.WorkspaceCapacity;
+                    if(amount[0]<=self.work.ref_high-self.work.ref_low) tree=try self.refs(amount[0]);
+                }
+                var first:usize=0;
+                while(first<row_handles.len) {
+                    var end=first+1;
+                    while(end<row_handles.len){try self.session.checkpoint();if(!self.equalColumns(row_handles[first],row_handles[end],win.partition[0..win.partition_count])) break;end+=1;}
+                    var group_count:usize=1;
+                    if(peer_needed) {
+                        self.work.refs[peers]=@intCast(first);
+                        for(first+1..end) |index| if(!try self.windowPeers(row_handles[index-1],row_handles[index],win)) {
+                            self.work.refs[peers+group_count]=@intCast(index);group_count+=1;
+                        };
+                        self.work.refs[peers+group_count]=@intCast(end);
+                    }
+                    const range_offsets=win.frame==.range and (win.start.offset!=none or win.end.offset!=none);
+                    var nonnull_first=first;var nonnull_end=end;
+                    if(range_offsets) {
+                        if(self.work.cells[row_handles[first]+win.order[0].column]==.null_value) nonnull_first=self.work.refs[peers+1];
+                        if(self.work.cells[row_handles[end-1]+win.order[0].column]==.null_value) nonnull_end=self.work.refs[peers+group_count-1];
+                    }
+                    if(fast) {
+                        prefix[0]=.{};
+                        for(first..end) |index| {
+                            try self.session.checkpoint();const relative=index-first;prefix[relative+1]=prefix[relative];
+                            self.work.stream_stats.window_prefix_rows+=1;
+                            if(!self.windowIncluded(win,row_handles[index])) continue;
+                            if(win.aggregate.kind==.count_star) prefix[relative+1].count+=1
+                            else {
+                                const item=&self.work.cells[row_handles[index]+win.argument];
+                                if(item.*!=.null_value) {
+                                    prefix[relative+1].count+=1;
+                                    if(win.aggregate.kind==.sum or win.aggregate.kind==.avg) prefix[relative+1].total+=item.integer;
+                                    if(win.aggregate.kind==.bool_and or win.aggregate.kind==.bool_or) prefix[relative+1].total+=@intFromBool(item.boolean);
+                                }
+                            }
+                        }
+                    }
+                    var leaves:usize=1;
+                    if(tree) |root| {
+                        while(leaves<end-first) leaves*=2;
+                        for(0..leaves) |index| {
+                            try self.session.checkpoint();
+                            self.work.refs[root+leaves+index]=if(index<end-first and self.windowIncluded(win,row_handles[first+index]) and self.work.cells[row_handles[first+index]+win.argument]!=.null_value) @intCast(first+index) else absent;
+                        }
+                        var node=leaves;
+                        while(node>1) {node-=1;self.work.stream_stats.window_tree_builds+=1;self.work.refs[root+node]=try self.frameBest(win,row_handles,self.work.refs[root+node*2],self.work.refs[root+node*2+1]);}
+                    }
+                    var peer_index:usize=0;
+                    for(first..end) |current| {
+                        try self.session.checkpoint();
+                        self.work.stream_stats.window_frame_rows+=1;
+                        if(peer_needed) while(current>=self.work.refs[peers+peer_index+1]) {peer_index+=1;};
+                        const peer_first:usize=if(peer_needed) self.work.refs[peers+peer_index] else current;
+                        const peer_end:usize=if(peer_needed) self.work.refs[peers+peer_index+1] else current+1;
+                        const a=if(win.frame==.rows) framePosition(win.start.kind,start_offset,current,first,end,false) else if(range_offsets)
+                            try self.rangePosition(win,row_handles,win.start,start_offset,current,first,end,nonnull_first,nonnull_end,peer_first,peer_end,false) else
+                            self.work.refs[peers+framePosition(win.start.kind,start_offset,peer_index,0,group_count,false)];
+                        const b=if(win.frame==.rows) framePosition(win.end.kind,end_offset,current,first,end,true) else if(range_offsets)
+                            try self.rangePosition(win,row_handles,win.end,end_offset,current,first,end,nonnull_first,nonnull_end,peer_first,peer_end,true) else
+                            self.work.refs[peers+framePosition(win.end.kind,end_offset,peer_index,0,group_count,true)];
+                        var state:Accumulator=.{};
+                        if(fast) {
+                            var total=prefixRange(prefix,a-first,b-first);
+                            if(a<b and win.exclude!=.no_others) {
+                                const drop_first=if(win.exclude==.current_row) @max(a,current) else @max(a,peer_first);
+                                const drop_end=if(win.exclude==.current_row) @min(b,current+1) else @min(b,peer_end);
+                                const drop=prefixRange(prefix,drop_first-first,drop_end-first);
+                                total.total-=drop.total;total.count-=drop.count;
+                                if(win.exclude==.ties and current>=a and current<b) {
+                                    const own=prefixRange(prefix,current-first,current-first+1);total.total+=own.total;total.count+=own.count;
+                                }
+                            }
+                            state.count=total.count;state.wide=total.total;
+                            if(win.aggregate.kind==.sum and win.aggregate.ty==.int8) state.integer=@intCast(total.total);
+                            if(total.count!=0 and (win.aggregate.kind==.bool_and or win.aggregate.kind==.bool_or)) state.flag=if(win.aggregate.kind==.bool_and) total.total==total.count else total.total!=0;
+                        } else if(tree) |root| {
+                            var best:u32=absent;
+                            if(win.exclude==.no_others) best=try self.frameTreeRange(win,row_handles,root,leaves,a-first,b-first)
+                            else if(a<b) {
+                                const cut_first=if(win.exclude==.current_row) current else peer_first;
+                                const cut_end=if(win.exclude==.current_row) current+1 else peer_end;
+                                best=try self.frameTreeRange(win,row_handles,root,leaves,a-first,@min(b,cut_first)-first);
+                                best=try self.frameBest(win,row_handles,best,try self.frameTreeRange(win,row_handles,root,leaves,@max(a,cut_end)-first,b-first));
+                                if(win.exclude==.ties and current>=a and current<b and self.windowIncluded(win,row_handles[current]) and self.work.cells[row_handles[current]+win.argument]!=.null_value) best=try self.frameBest(win,row_handles,best,@intCast(current));
+                            }
+                            if(best!=absent){state.count=1;state.value=self.work.cells[row_handles[best]+win.argument];}
+                        } else if(a<b) for(row_handles[a..b],a..) |at,index| {
+                            try self.session.checkpoint();self.work.stream_stats.window_scalar_visits+=1;
+                            if(frameSelected(index,current,peer_first,peer_end,win.exclude)) try self.windowAccumulate(win,&state,at,outer);
+                        };
+                        self.work.cells[row_handles[current]+win.result]=try self.finishAggregate(&win.aggregate,&state);
+                    }
+                    first=end;
+                }
+            }
+            fn windowOutput(self:*Query,p:*const B.Plan,rows:List,outer:?*const E.Context) Error!List {
+                if(p.distinct!=.none) {
+                    const tuples:Tuples=.{.start=rows.start,.count=rows.count,.width=1};
+                    return self.finish(p,try self.project(p,tuples,outer));
+                }
+                var sort_plan=p.*;var mapped=true;
+                for(p.order[0..p.order_count],0..) |key,index| {
+                    const target=self.pool.nodes[p.targets[key.column]];
+                    if(target.kind!=.column or target.relation!=0 or target.level!=0){mapped=false;break;}
+                    sort_plan.order[index].column=target.column;
+                }
+                if(mapped) {
+                    const selected=try self.finish(&sort_plan,rows);
+                    var projection=p.*;projection.order_count=0;projection.offset=0;projection.limit=0xffffffffffffffff;
+                    return self.project(&projection,.{.start=selected.start,.count=selected.count,.width=1},outer);
+                }
+                const tuples:Tuples=.{.start=rows.start,.count=rows.count,.width=1};
+                return self.finish(p,try self.project(p,tuples,outer));
+            }
+
             fn windowCore(self:*Query,p:*const B.Plan,outer:?*const E.Context) Error!List {
+                if(p.limit==0) return .{};
                 const rows=try self.run(p.sources[0].plan,outer);
                 for(p.windows[0..p.window_count]) |*win| {
+                    const scratch_mark=self.mark();defer self.release(scratch_mark);
+                    const start_offset=if(win.kind==.aggregate) try self.frameOffset(win.start,outer) else 0;
+                    const end_offset=if(win.kind==.aggregate) try self.frameOffset(win.end,outer) else 0;
                     var order:[2*config.columns]B.SortKey=undefined;var count:usize=0;
                     for(win.partition[0..win.partition_count]) |column| {order[count]=.{.column=column,.descending=false,.nulls_first=true};count+=1;}
                     for(win.order[0..win.order_count]) |key| {order[count]=key;count+=1;}
                     try self.sortRows(rows,order[0..count]);
+                    if(win.kind==.aggregate and (win.frame==.rows or win.frame==.groups or win.frame==.range)) {
+                        try self.boundedWindow(rows,win,start_offset,end_offset,outer);continue;
+                    }
                     const row_handles=self.handles(rows);var first:usize=0;
                     while(first<row_handles.len) {
                         var end=first+1;
@@ -2460,7 +2678,7 @@ pub fn Exec(comptime config: types.Config) type {
                             var state:Accumulator=.{};
                             const full=win.frame==.full or (win.frame==.default and win.order_count==0);
                             if(full) {
-                                for(row_handles[first..end]) |at| try self.windowAccumulate(win,&state,at);
+                                for(row_handles[first..end]) |at| try self.windowAccumulate(win,&state,at,outer);
                                 const value=try self.finishAggregate(&win.aggregate,&state);
                                 for(row_handles[first..end]) |at| {try self.session.checkpoint();self.work.cells[at+win.result]=value;}
                             } else {
@@ -2468,7 +2686,7 @@ pub fn Exec(comptime config: types.Config) type {
                                 while(begin<end) {
                                     var peer_end=begin+1;
                                     if(win.frame==.default) while(peer_end<end and try self.windowPeers(row_handles[begin],row_handles[peer_end],win)):(peer_end+=1) {};
-                                    for(row_handles[begin..peer_end]) |at| try self.windowAccumulate(win,&state,at);
+                                    for(row_handles[begin..peer_end]) |at| try self.windowAccumulate(win,&state,at,outer);
                                     const value=try self.finishAggregate(&win.aggregate,&state);
                                     for(row_handles[begin..peer_end]) |at| {try self.session.checkpoint();self.work.cells[at+win.result]=value;}
                                     begin=peer_end;
@@ -2478,8 +2696,7 @@ pub fn Exec(comptime config: types.Config) type {
                         first=end;
                     }
                 }
-                const tuples:Tuples=.{.start=rows.start,.count=rows.count,.width=1};
-                const output=try self.project(p,tuples,outer);return self.finish(p,output);
+                return self.windowOutput(p,rows,outer);
             }
 
             fn core(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {

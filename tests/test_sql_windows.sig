@@ -64,8 +64,8 @@ pub fn main() !void {
     try reject("SELECT SUM(RANK() OVER ()) OVER () FROM fact",error.WindowingError);
     try reject("SELECT RANK() OVER (ORDER BY ROW_NUMBER() OVER ()) FROM fact",error.WindowingError);
     try reject("SELECT SUM(DISTINCT v) OVER () FROM fact",error.UnsupportedStatement);
-    try reject("SELECT SUM(v) FILTER (WHERE id>1) OVER () FROM fact",error.UnsupportedStatement);
-    try reject("SELECT SUM(v) OVER (ORDER BY v RANGE UNBOUNDED PRECEDING) FROM fact",error.UnsupportedStatement);
+    try run("SELECT SUM(v) FILTER (WHERE id>1) OVER () FROM fact");try check(result.row_count==6 and result.rows[0].cells[0].integer==52);
+    try reject("SELECT SUM(v) OVER (ORDER BY CAST(v AS NUMERIC) RANGE 1 PRECEDING) FROM fact",error.UnsupportedStatement);
     try reject("SELECT id,SUM(v) OVER ()/(id-3) FROM fact ORDER BY id",error.DivisionByZero);
     const q="SELECT id,SUM(v) OVER (PARTITION BY k ORDER BY v),RANK() OVER (ORDER BY v DESC) FROM fact ORDER BY id";
     var control:sql.ExecutionControl=.{};db.session.control=&control;try run(q);const used=control.used;

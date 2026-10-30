@@ -3,4 +3,5 @@
 *.sig text eol=lf
 tests/evidence/to-char-pg16.tsv -text
 tests/evidence/windows-pg16.tsv -text
+tests/evidence/window-frames-pg16.tsv -text
 tests/evidence/rollup-pg16.tsv -text

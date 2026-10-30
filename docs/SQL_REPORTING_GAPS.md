@@ -1,8 +1,13 @@
 # Reporting SQL: Q03/Q06 implementation record
 
-The RAMSQL gap-closing plan owns the compatibility scope. This record covers
-reusable ZPM code; it does not close the broad Q03/Q06 feature families or the
-dbMeter correctness/performance gate.
+The RAMSQL gap-closing plan owns the compatibility scope. The initial reporting
+implementation merged in ZPM PR 80 and RAMSQL PR 35. The final pinned server
+passed PG16/PG18 memory/durable+SCRAM and all 32 active hosted/native/release
+checks (RAMSQL runs 41024653323 and 41024653363). Original full 5M and subset
+dbMeter correctness now pass 7/7 for all three engines in run 41024725859.
+This does not close the broad Q03/Q06 families or the performance gate; the same
+full-data run retains a substantial IRDB throughput advantage and an invalid
+PostgreSQL trial. Preserve those results.
 
 ## Temporal to_char (Q03)
 
@@ -33,10 +38,10 @@ The SQL contract replays 252 captured PostgreSQL 16.15 fixtures plus NULL,
 signature, session-zone, grouping and error-atomicity checks. The fixture manifest
 records the native reference, UTC session and byte hash. A separate primitive
 contract verifies preflight capacity, unsupported-token, range and alias errors.
-Native PostgreSQL 16/18 server differential qualification and the original 5M
-dbMeter query remain required before declaring this concrete gate closed.
+The initial formatter's concrete server and original 5M query gates passed on
+the final reporting pin; unsupported formatter families remain open.
 
-## Window functions (Q06 candidate)
+## Window functions (Q06 partial)
 
 The parser/binder now admit `OVER (...)` with partition expressions, independent
 ordering and NULL placement. RANK, DENSE_RANK, ROW_NUMBER and the existing
@@ -61,17 +66,19 @@ cancellation are checked through sorting, partition/peer scans, accumulation and
 publication; no failed statement publishes partial results. Misplaced/nested
 windows report PostgreSQL SQLSTATE 42P20.
 
-The candidate replays 66 captured PostgreSQL queries and has 8,882 native
-assertions including a work-limit and cancellation sweep across every execution
-checkpoint. Full three-OS/native/server and original dbMeter qualification remain
-pending. Ordinary aggregates containing window calls report 42803; misplaced
+The initial implementation replays 66 captured PostgreSQL queries and passed
+three-OS/native/server and original dbMeter qualification. Ordinary aggregates containing window calls report 42803; misplaced
 windows and windows nested inside window clauses report 42P20. This distinction
 was caught by the PG16/18 server gate and has focused regression tests.
-FILTER/DISTINCT window aggregates, bounded/moving frames, explicit
-RANGE/GROUPS, named windows and correlated subqueries in the same window target
-projection remain unsupported. This is not complete PostgreSQL window coverage.
+The follow-up [budgeted frame/FILTER candidate](SQL_WINDOW_FRAMES.md) adds ROWS,
+GROUPS, integral-key RANGE offsets, exclusions and aggregate FILTER, with 397
+additional native fixtures. Its independent final server qualification remains
+required. DISTINCT windows remain explicitly unsupported, matching PostgreSQL.
+Named windows, remaining built-in window functions, numeric/float/temporal RANGE
+offsets, volatile moving inputs and correlated subqueries in the same window
+target projection remain gaps. This is not complete PostgreSQL window coverage.
 
-## ROLLUP and GROUPING (Q06 candidate)
+## ROLLUP and GROUPING (Q06 partial)
 
 A flat `GROUP BY ROLLUP(k1, ..., kn)` creates each prefix and the grand total.
 `GROUP BY ()` provides an empty grouping set; `ROLLUP()` remains a syntax error,
@@ -100,8 +107,8 @@ Grouped windows can consume GROUPING masks and subtotal states after HAVING.
 
 Multiple/composite ROLLUP elements, CUBE/general GROUPING SETS, and nonintegral
 or computed DISTINCT membership remain unimplemented. Wide integral domains may
-exceed the admitted bitmap/query budget. Native/platform/server differential
-qualification and the unchanged original 5M dbMeter checks are still required.
+exceed the admitted bitmap/query budget. The initial implementation's
+native/platform/server and original 5M dbMeter checks passed on the final pin.
 
 ## Remaining Q06 work
 
