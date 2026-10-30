@@ -512,10 +512,12 @@ pub fn Binder(comptime config: types.Config) type {
             if (!add and !sub) return error.UndefinedFunction;
             // date +- integer, integer + date
             if (left == .date and value.integral(right)) {
+                if (right == .int8) return error.UndefinedFunction;
                 n.ty = .date;
                 return;
             }
             if (add and value.integral(left) and right == .date) {
+                if (left == .int8) return error.UndefinedFunction;
                 n.ty = .date;
                 return;
             }

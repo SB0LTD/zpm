@@ -460,9 +460,9 @@ pub fn Io(comptime config: types.Config) type {
                 .timestamptz => switch (cell) {
                     .date => |value| blk: {
                         const local = try temporal.dateToTimestamp(value);
-                        break :blk V.Cell{ .timestamptz = if (temporal.finiteTimestamp(local)) temporal.toUtc(&session.zone, local) else local };
+                        break :blk V.Cell{ .timestamptz = if (temporal.finiteTimestamp(local)) try temporal.toUtc(&session.zone, local) else local };
                     },
-                    .timestamp => |value| V.Cell{ .timestamptz = if (temporal.finiteTimestamp(value)) temporal.toUtc(&session.zone, value) else value },
+                    .timestamp => |value| V.Cell{ .timestamptz = if (temporal.finiteTimestamp(value)) try temporal.toUtc(&session.zone, value) else value },
                     .timestamptz => cell,
                     .text => |*value| try parse(.timestamptz, -1, value.slice(), session),
                     else => return error.CannotCoerce,
@@ -527,7 +527,10 @@ pub fn Io(comptime config: types.Config) type {
                 },
                 .date => |a| switch (right.*) {
                     .integer => |b| return .{ .date = try temporal.datePlusDays(a, if (op == .sub) -b else b) },
-                    .date => |b| return .{ .integer = @as(i64, a) - b },
+                    .date => |b| {
+                        if (!temporal.finiteDate(a) or !temporal.finiteDate(b)) return error.DatetimeFieldOverflow;
+                        return .{ .integer = @as(i64, a) - b };
+                    },
                     else => {},
                 },
                 .timestamp => |a| switch (right.*) {
@@ -572,7 +575,7 @@ pub fn Io(comptime config: types.Config) type {
             try resolveZone(zone_name, session, &zone);
             return switch (cell.*) {
                 .timestamptz => |value| .{ .timestamp = if (temporal.finiteTimestamp(value)) temporal.toLocal(&zone, value) else value },
-                .timestamp => |value| .{ .timestamptz = if (temporal.finiteTimestamp(value)) temporal.toUtc(&zone, value) else value },
+                .timestamp => |value| .{ .timestamptz = if (temporal.finiteTimestamp(value)) try temporal.toUtc(&zone, value) else value },
                 else => error.UndefinedFunction,
             };
         }

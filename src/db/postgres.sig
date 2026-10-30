@@ -1494,6 +1494,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "InvalidParameterValue")) return "22023";
     if (equal(name, "InvalidDatetimeFormat")) return "22007";
     if (equal(name, "DatetimeFieldOverflow")) return "22008";
+    if (equal(name, "IntervalFieldOverflow")) return "22015";
     if (equal(name, "UntranslatableCharacter")) return "22P05";
     if (equal(name, "ClockUnavailable")) return "0A000";
     if (equal(name, "TimeZoneCapacity")) return "53200";
