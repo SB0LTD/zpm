@@ -34,7 +34,9 @@
 //! further failure. Unknown versions or ops fail closed with
 //! UnsupportedLogVersion, malformed bytes with InvalidChangeRecord, and
 //! unknown OIDs, rowid or key conflicts and capacity overflow with
-//! ChangeRecordConflict.
+//! ChangeRecordConflict. A create needs an unused OID at or above first_oid,
+//! not an ascending one: OIDs are taken when CREATE runs, so concurrent DDL
+//! commits out of OID order. The OID counter keeps the maximum seen.
 const types = @import("types.sig");
 const storage = @import("storage.sig");
 const numeric = @import("numeric.sig");
@@ -383,6 +385,21 @@ pub fn ChangeLog(comptime config: types.Config) type {
             return false;
         }
 
+        fn overlaps(start: u32, width: u32, oid: u32, oid_width: u32) bool {
+            return @as(u64, oid) < @as(u64, start) + width and @as(u64, start) < @as(u64, oid) + oid_width;
+        }
+
+        /// Whether [oid, oid + width) meets an OID the record or the database
+        /// still holds: a table and its primary-key index (oid + 1), or a
+        /// sequence. Database slots count until reclaimed, even uncommitted.
+        fn oidTaken(db: anytype, scratch: *const Scratch, oid: u32, width: u32) bool {
+            for (&scratch.tables) |*vt| if (vt.live and overlaps(vt.oid, 1 + @as(u32, @intFromBool(vt.primary != null)), oid, width)) return true;
+            for (&scratch.seqs) |*vs| if (vs.live and overlaps(vs.oid, 1, oid, width)) return true;
+            for (&db.tables) |*table| if (table.live and overlaps(table.oid, 1 + @as(u32, @intFromBool(table.primary_column != null)), oid, width)) return true;
+            for (&db.seqs) |*seq| if (seq.live and overlaps(seq.oid, 1, oid, width)) return true;
+            return false;
+        }
+
         const mask = overlay_capacity - 1;
 
         fn rowHome(table: u8, rowid: u64) usize {
@@ -710,7 +727,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 switch (tag) {
                     @intFromEnum(Op.create_table) => {
                         const definition = try decodeCreate(&reader);
-                        if (definition.oid < next_oid) return error.ChangeRecordConflict;
+                        // OIDs are taken when CREATE runs, so concurrent DDL
+                        // commits in any OID order (STO-01): an OID need only
+                        // be unused, not ascending. A primary key's index owns
+                        // the next OID.
+                        var width: u32 = 1;
+                        for (definition.columns[0..definition.count]) |column| if (column.primary_key) {
+                            width = 2;
+                        };
+                        if (definition.oid < first_oid or definition.oid >= 0xfffffffe or oidTaken(db, scratch, definition.oid, width)) return error.ChangeRecordConflict;
                         if (nameTaken(scratch, definition.name.slice())) return error.ChangeRecordConflict;
                         var free: ?usize = null;
                         for (&scratch.tables, 0..) |*vt, index| {
@@ -723,9 +748,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         for (definition.columns[0..definition.count], 0..) |column, position| if (column.primary_key) {
                             vt.primary = position;
                         };
-                        if (definition.oid >= 0xfffffffe) return error.ChangeRecordConflict;
-                        // A primary key's index owns the next OID.
-                        next_oid = definition.oid + 1 + @as(u32, @intFromBool(vt.primary != null));
+                        next_oid = @max(next_oid, definition.oid + width);
                     },
                     @intFromEnum(Op.drop_table) => {
                         const index = try findVTable(scratch, try reader.int(u32));
@@ -789,6 +812,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     },
                     @intFromEnum(Op.catalog_counters) => {
                         const counter = try reader.int(u32);
+                        // next_oid is the maximum so far; a counter never lowers it.
                         if (counter < next_oid) return error.ChangeRecordConflict;
                         next_oid = counter;
                         const tables = try reader.int(u8);
@@ -802,7 +826,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     },
                     @intFromEnum(Op.create_sequence) => {
                         const definition = try decodeCreateSequence(&reader);
-                        if (definition.oid < next_oid or definition.oid == 0xffffffff) return error.ChangeRecordConflict;
+                        if (definition.oid < first_oid or definition.oid == 0xffffffff or oidTaken(db, scratch, definition.oid, 1)) return error.ChangeRecordConflict;
                         if (nameTaken(scratch, definition.name.slice())) return error.ChangeRecordConflict;
                         if (definition.owner != 0) {
                             const owner = try findVTable(scratch, definition.owner);
@@ -814,7 +838,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         };
                         const index = free orelse return error.ChangeRecordConflict;
                         scratch.seqs[index] = .{ .live = true, .oid = definition.oid, .name = definition.name };
-                        next_oid = definition.oid + 1;
+                        next_oid = @max(next_oid, definition.oid + 1);
                     },
                     @intFromEnum(Op.drop_sequence) => {
                         const index = try findVSeq(scratch, try reader.int(u32));
@@ -884,7 +908,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             S.reset(table, definition.oid, definition.name, definition.columns[0..definition.count]);
                             S.initSummary(table, csn);
                             try db.replayCreate(index, csn);
-                            db.oid_counter = definition.oid + 1 + @as(u32, @intFromBool(table.primary_column != null)) - first_oid;
+                            // Creates arrive in any OID order: keep the maximum.
+                            db.oid_counter = @max(db.oid_counter, definition.oid + 1 + @as(u32, @intFromBool(table.primary_column != null)) - first_oid);
                             break;
                         };
                     },
@@ -939,7 +964,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             try db.replayCreateSequence(index, csn);
                             break;
                         };
-                        db.oid_counter = definition.oid + 1 - first_oid;
+                        db.oid_counter = @max(db.oid_counter, definition.oid + 1 - first_oid);
                     },
                     @intFromEnum(Op.drop_sequence) => {
                         const index = try seqByOid(db, try reader.int(u32));
