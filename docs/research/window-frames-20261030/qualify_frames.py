@@ -1,6 +1,6 @@
 import pathlib, subprocess, sys
 
-ROOT=pathlib.Path(__file__).resolve().parents[1]
+ROOT=next(p for p in pathlib.Path(__file__).resolve().parents if (p/'src/core/sql.sig').is_file())
 NAMES=['window_frames','windows','grouping_rollup','rollup','to_char','types','query','stream_group']
 mode=sys.argv[1]
 if len(sys.argv)>2: NAMES=sys.argv[2:]

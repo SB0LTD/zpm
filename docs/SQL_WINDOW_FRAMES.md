@@ -34,10 +34,23 @@ categories report 42P20; arithmetic uses widened values before clamping, includi
 int64 extrema and offsets. Empty frames retain each aggregate's empty semantics.
 
 Windows consume WHERE/grouping/HAVING output. Final DISTINCT, ordering, OFFSET
-and LIMIT follow window evaluation. For final ordering on bound columns without
-DISTINCT, input handles are ordered/trimmed before final projection: expressions
-unused by sorting execute only for returned rows. Complex sorting retains the
-existing projected-row path. No base-row predicates or reviewer SQL are rewritten.
+and LIMIT follow window evaluation. When deterministic targets are trivial
+columns/literals and final ordering uses bound columns without DISTINCT, input
+handles are ordered/trimmed before projection. Complex deterministic targets
+retain eager projection. Unsorted volatile/nonrepeatable targets are deferred
+until their rows are returned, even when another target requires eager output.
+That path preserves original input ordinals through sorting using contiguous
+output cells, without a per-row mapping allocation. Targets used for sorting or
+DISTINCT must execute before those operations. No reviewer SQL is rewritten.
+
+Independent CI exposed a native-version disagreement for `SELECT id,10/(id-1),
+SUM(v) OVER () FROM compat ORDER BY id DESC LIMIT 1` with ids 1..3: PG16
+returns a row, while PG18 raises 22012. The initial candidate matched PG16; the
+revised complex deterministic path follows eager PG18 behavior. The contradictory
+native results are retained in RAMSQL's progress evidence; this error-timing
+difference remains documented rather than claiming both plans agree. Portable
+differential projection checks filter out the invalid denominator or select the
+invalid row. Original dbMeter SQL and expected results are untouched.
 
 ## Algorithms and caller memory
 

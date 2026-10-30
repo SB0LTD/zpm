@@ -231,6 +231,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// columns, then resjunk sort keys.
         pub const Plan = struct {
             windows:[config.columns]Window=undefined,window_count:usize=0,
+            window_late:[2*config.columns]bool=.{false}**(2*config.columns),
             set_op: ast.SetOp = .none,
             set_all: bool = false,
             left: u16 = none,
@@ -3039,6 +3040,7 @@ pub fn Binder(comptime config: types.Config) type {
                 win.result=@intCast(input.count+index);context.node(win.output_node).column=win.result;
                 input.targets[win.result]=try context.pool.add(.{.kind=.null_literal,.ty=.unknown,.constant=true});
             }
+            for(p.targets[0..p.width],0..) |target,index| p.window_late[index]=!repeatableWindowInput(context,target);
             p.source_count=1;p.sources[0]=.{.plan=child};p.where=none;p.grouped=false;p.rollup=false;p.key_count=0;p.agg_count=0;p.having=none;
         }
 

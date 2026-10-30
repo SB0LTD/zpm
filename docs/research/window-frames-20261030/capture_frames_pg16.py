@@ -49,7 +49,7 @@ for frame in ['ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING','GROUPS 1 PRECEDING EXC
   spec='PARTITION BY k ORDER BY '+('v,id ' if frame.startswith('ROWS') else 'v ')+frame
   queries.append('SELECT id,'+','.join(f+' FILTER (WHERE '+predicate+') OVER ('+spec+')' for f in filter_functions)+' FROM fact ORDER BY id')
 queries += [
- 'SELECT id,10/(id-1),SUM(v) OVER () FROM fact ORDER BY id DESC LIMIT 1',
+ 'SELECT id,10/(id-1),SUM(v) OVER () FROM fact WHERE id>1 ORDER BY id DESC LIMIT 1',
  'SELECT id,SUM(v) OVER () FROM fact ORDER BY (id+0) DESC LIMIT 2 OFFSET 2',
  'SELECT id,SUM(v) OVER ()+id AS marker FROM fact ORDER BY marker DESC LIMIT 2',
  'SELECT id,SUM(10/(id-3)) FILTER (WHERE id<>3) OVER () FROM fact ORDER BY id',

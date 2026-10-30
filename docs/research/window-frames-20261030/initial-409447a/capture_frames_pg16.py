@@ -1,0 +1,92 @@
+import subprocess,json,pathlib,hashlib
+setup="CREATE TEMP TABLE fact(id INTEGER PRIMARY KEY,k INTEGER,v INTEGER); INSERT INTO fact VALUES(1,1,10),(2,1,10),(3,1,30),(4,2,5),(5,2,NULL),(6,NULL,7),(7,3,NULL),(8,3,NULL);"
+frames=[
+ 'ROWS 0 PRECEDING','ROWS 1 PRECEDING','ROWS 2.5 PRECEDING',
+ "ROWS CAST('2' AS BIGINT) PRECEDING",'ROWS COALESCE(NULL,1) PRECEDING',
+ 'ROWS (SELECT 1) PRECEDING',
+ 'ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING',
+ 'ROWS BETWEEN 1 FOLLOWING AND 3 FOLLOWING',
+ 'ROWS BETWEEN 3 FOLLOWING AND 1 FOLLOWING',
+ 'ROWS BETWEEN 1 PRECEDING AND 3 PRECEDING',
+ 'ROWS BETWEEN CURRENT ROW AND CURRENT ROW',
+ 'ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING',
+ 'ROWS BETWEEN 9223372036854775807 PRECEDING AND 9223372036854775807 FOLLOWING',
+ 'ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING',
+ 'ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING',
+ 'GROUPS 0 PRECEDING','GROUPS 1 PRECEDING',
+ 'GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING',
+ 'GROUPS BETWEEN 2 FOLLOWING AND 1 FOLLOWING',
+ 'GROUPS BETWEEN 1 PRECEDING AND 2 PRECEDING',
+ 'GROUPS BETWEEN CURRENT ROW AND CURRENT ROW',
+ 'GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING',
+ 'GROUPS BETWEEN 9223372036854775807 PRECEDING AND 9223372036854775807 FOLLOWING',
+ 'RANGE 0 PRECEDING','RANGE 5 PRECEDING',
+ 'RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING',
+ 'RANGE BETWEEN 10 FOLLOWING AND 5 FOLLOWING',
+ 'RANGE BETWEEN 5 PRECEDING AND 10 PRECEDING',
+ 'RANGE BETWEEN 9223372036854775807 PRECEDING AND 9223372036854775807 FOLLOWING',
+ 'RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW',
+ 'RANGE BETWEEN CURRENT ROW AND CURRENT ROW',
+ 'RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING',
+ 'RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING',
+]
+queries=[]
+functions=['COUNT(*)','SUM(v)','MIN(v)','MAX(v)','AVG(v)','BOOL_AND(v>7)','BOOL_OR(v>7)']
+for frame in frames:
+ for partition in ['', 'PARTITION BY k ']:
+  for exclude in ['',' EXCLUDE CURRENT ROW',' EXCLUDE GROUP',' EXCLUDE TIES',' EXCLUDE NO OTHERS']:
+   order='v,id' if frame.startswith('ROWS') else 'v'
+   spec=partition+'ORDER BY '+order+' '+frame+exclude
+   queries.append('SELECT id,'+','.join(f+' OVER ('+spec+')' for f in functions)+' FROM fact ORDER BY id')
+for descending in [False,True]:
+ for nulls in ['FIRST','LAST']:
+  for frame in ['RANGE 5 PRECEDING','RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING','RANGE BETWEEN 5 FOLLOWING AND UNBOUNDED FOLLOWING','RANGE BETWEEN UNBOUNDED PRECEDING AND 5 PRECEDING']:
+   spec='ORDER BY v '+('DESC ' if descending else 'ASC ')+'NULLS '+nulls+' '+frame
+   queries.append('SELECT id,'+','.join(f+' OVER ('+spec+')' for f in functions)+' FROM fact ORDER BY id')
+filter_functions=['COUNT(*)','COUNT(v)','SUM(v)','AVG(v)','MIN(v)','MAX(v)','BOOL_AND(v>7)']
+for frame in ['ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING','GROUPS 1 PRECEDING EXCLUDE TIES','RANGE 5 PRECEDING','ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING','RANGE UNBOUNDED PRECEDING']:
+ for predicate in ['v>7','id<>3','NULL','FALSE','id<>3 AND 10/(id-3)>0']:
+  spec='PARTITION BY k ORDER BY '+('v,id ' if frame.startswith('ROWS') else 'v ')+frame
+  queries.append('SELECT id,'+','.join(f+' FILTER (WHERE '+predicate+') OVER ('+spec+')' for f in filter_functions)+' FROM fact ORDER BY id')
+queries += [
+ 'SELECT id,10/(id-1),SUM(v) OVER () FROM fact ORDER BY id DESC LIMIT 1',
+ 'SELECT id,SUM(v) OVER () FROM fact ORDER BY (id+0) DESC LIMIT 2 OFFSET 2',
+ 'SELECT id,SUM(v) OVER ()+id AS marker FROM fact ORDER BY marker DESC LIMIT 2',
+ 'SELECT id,SUM(10/(id-3)) FILTER (WHERE id<>3) OVER () FROM fact ORDER BY id',
+ 'SELECT id,SUM(10/(id-id)) FILTER (WHERE NULL) OVER () FROM fact ORDER BY id',
+ 'SELECT id,COUNT(*) FILTER (WHERE 10/(id-id)>0) OVER (ORDER BY id ROWS BETWEEN 3 FOLLOWING AND 1 FOLLOWING) FROM fact ORDER BY id',
+ 'SELECT id,COUNT(*) FILTER (WHERE 10/(id-1)>0) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING) FROM fact ORDER BY id',
+ 'WITH g AS (SELECT k,SUM(v) AS amount,COUNT(*) AS sales FROM fact GROUP BY k) SELECT k,amount,SUM(amount) FILTER (WHERE sales>1) OVER () FROM g ORDER BY k NULLS LAST',
+ 'WITH g AS (SELECT k,SUM(v) AS amount,COUNT(*) AS sales FROM fact GROUP BY k) SELECT k,amount,SUM(amount) FILTER (WHERE sales>1) OVER (ORDER BY k NULLS LAST ROWS 1 PRECEDING) FROM g ORDER BY k NULLS LAST',
+ 'SELECT id,BOOL_AND(flag) OVER (ORDER BY id ROWS 2 PRECEDING),BOOL_OR(flag) OVER (ORDER BY id ROWS 2 PRECEDING) FROM (SELECT id,v>7 AS flag FROM fact) s ORDER BY id',
+ 'SELECT id,COUNT(label) OVER (ORDER BY id ROWS 2 PRECEDING) FROM (SELECT id,CASE WHEN v IS NULL THEN NULL ELSE CAST(v AS TEXT) END AS label FROM fact) s ORDER BY id',
+ "SELECT id,COUNT(*) OVER (ORDER BY range_key RANGE BETWEEN 9223372036854775807 PRECEDING AND 9223372036854775807 FOLLOWING),SUM(CAST(v AS BIGINT)) OVER (ORDER BY range_key RANGE BETWEEN 9223372036854775807 PRECEDING AND 9223372036854775807 FOLLOWING) FROM (SELECT id,CASE WHEN id=1 THEN CAST('-9223372036854775808' AS BIGINT) WHEN id=2 THEN CAST('9223372036854775807' AS BIGINT) ELSE CAST(v AS BIGINT) END AS range_key,v FROM fact) s ORDER BY id",
+ "SELECT id,SUM(huge) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING),AVG(huge) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM (SELECT id,CASE WHEN id<3 THEN CAST('9223372036854775807' AS BIGINT) ELSE CAST(v AS BIGINT) END AS huge FROM fact) s ORDER BY id",
+ 'SELECT id,SUM(10/(id-1)) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING) FROM fact ORDER BY id',
+ 'SELECT id,SUM(10/(id-id)) OVER (ORDER BY id ROWS BETWEEN 3 FOLLOWING AND 1 FOLLOWING) FROM fact ORDER BY id',
+ 'SELECT id,SUM(10/(id-id)) OVER (RANGE CURRENT ROW EXCLUDE GROUP) FROM fact ORDER BY id',
+ 'SELECT id,SUM(CAST(v AS BIGINT)) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) FROM fact ORDER BY id',
+ 'SELECT id,SUM(CAST(v AS NUMERIC)/3) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM fact ORDER BY id',
+ 'SELECT id,SUM(CAST(v AS DOUBLE PRECISION)) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) FROM fact ORDER BY id',
+ 'SELECT id,SUM(v) OVER (RANGE CURRENT ROW EXCLUDE CURRENT ROW) FROM fact ORDER BY id',
+ 'SELECT id,SUM(v) OVER (RANGE CURRENT ROW EXCLUDE GROUP) FROM fact ORDER BY id',
+ 'SELECT id,SUM(v) OVER (RANGE CURRENT ROW EXCLUDE TIES) FROM fact ORDER BY id',
+ 'SELECT k,SUM(v),SUM(SUM(v)) OVER (ORDER BY k NULLS FIRST ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM fact GROUP BY k ORDER BY k NULLS FIRST',
+ 'SELECT id,RANK() OVER (ORDER BY v ROWS -1 PRECEDING) FROM fact ORDER BY id',
+ 'SELECT SUM(v) OVER (ROWS -1 PRECEDING) FROM fact LIMIT 0',
+ 'SELECT id,SUM(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) FROM fact ORDER BY id LIMIT 2 OFFSET 2',
+]
+sql="\\pset null '<NULL>'\n\\pset fieldsep '\x1f'\n"+setup+'\n'+'\n'.join("SELECT 'CASE:"+str(i)+"';\n"+q+";\nSELECT 'END';" for i,q in enumerate(queries))
+p=subprocess.run(['wsl.exe','-d','Ubuntu','-u','postgres','--','psql','-X','-qAt','-v','ON_ERROR_STOP=1'],input=sql.encode(),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+if p.returncode: print(p.stderr.decode());raise SystemExit(p.returncode)
+values=[];current=[];index=None
+for line in p.stdout.decode().split('\n'):
+ if line.startswith('CASE:'): index=int(line[5:]);current=[]
+ elif line=='END': values.append((index,'\x1e'.join(current)));index=None
+ elif index is not None: current.append(line)
+assert len(values)==len(queries)
+target=pathlib.Path('tests/evidence/window-frames-pg16.tsv')
+target.write_bytes(('\n'.join(queries[i]+'\t'+value for i,value in values)+'\n').encode())
+version=subprocess.check_output(['wsl.exe','-d','Ubuntu','-u','postgres','--','psql','-X','-qAt','-c','SELECT version()']).decode().strip()
+meta={'reference':version,'setup':setup,'cases':len(values),'sha256':hashlib.sha256(target.read_bytes()).hexdigest(),'purpose':'correctness fixture; no timings'}
+target.with_suffix('.json').write_text(json.dumps(meta,indent=2)+'\n');print(meta)

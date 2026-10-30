@@ -1,0 +1,16 @@
+legacy: window_frames
+PASS SQL window frames: 106873 assertions
+legacy: windows
+PASS SQL windows: 8840 assertions
+legacy: grouping_rollup
+PASS SQL rollup: 19443 assertions
+legacy: rollup
+{"suite":"sql-rollup","pass":true,"assertions":6409}
+legacy: to_char
+PASS temporal to_char: 553 assertions
+legacy: types
+{"suite":"sql-types","pass":true,"assertions":4491,"database_bytes":592752}
+legacy: query
+{"suite":"sql-query","pass":true,"assertions":63417,"database_bytes":500368,"big_bytes":1270816,"work_rows":512}
+legacy: stream_group
+{"suite":"sql-stream-group","pass":true,"assertions":1702,"rows":100000,"query_refs":1024,"joined_rows":100000,"joined_query_refs":512}

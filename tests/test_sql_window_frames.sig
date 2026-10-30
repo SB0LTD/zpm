@@ -87,6 +87,12 @@ pub fn main() !void {
     try run("SELECT id,nextval('sort_calls') AS marker,SUM(v) OVER () FROM fact ORDER BY marker DESC LIMIT 2");
     try check(result.row_count==2 and result.rows[0].cells[0].integer==8 and result.rows[0].cells[1].integer==8 and result.rows[1].cells[1].integer==7);
     try run("SELECT currval('sort_calls')");try check(result.rows[0].cells[0].integer==8);
+    try run("CREATE SEQUENCE mixed_calls START 1");
+    try run("SELECT id,id+SUM(v) OVER () AS amount,nextval('mixed_calls') FROM fact ORDER BY id DESC LIMIT 2");
+    try check(result.row_count==2 and result.rows[0].cells[0].integer==8 and result.rows[0].cells[1].integer==70 and result.rows[0].cells[2].integer==1 and result.rows[1].cells[2].integer==2);
+    try run("SELECT currval('mixed_calls')");try check(result.rows[0].cells[0].integer==2);
+    try run("SELECT id,10/(id-1),SUM(v) OVER () FROM fact LIMIT 1 OFFSET 1");
+    try check(result.row_count==1 and result.rows[0].cells[0].integer==2 and result.rows[0].cells[1].integer==10);
     const rolling="SELECT id,SUM(v) OVER (ORDER BY id ROWS 1 PRECEDING) FROM fact ORDER BY id";
     const tx=try db.begin();try db.statement(tx,"UPDATE fact SET v=100 WHERE id=1",&result,.{});
     try db.statement(tx,rolling,&result,.{});try check(result.rows[0].cells[1].integer==100);db.abort(tx);

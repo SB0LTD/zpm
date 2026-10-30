@@ -3,11 +3,13 @@
 All eight contracts pass on Windows Sig 0.6.4 ReleaseSafe, Linux Sig 0.6.4
 ReleaseSafe and Linux Sig 0.5.9 Debug. Commands and matched library paths are in
 `qualify_frames.py`; those absolute paths identify this workspace and must be
-adapted for another machine. The grouping contract ran separately in each mode.
+adapted for another machine. Initial grouping checks ran separately; revised
+logs include all eight. The final frame-only rerun also checks the native SB0
+min/max intrinsic workaround against the complete frame contract on each host.
 
 | Contract | Assertions per mode |
 | --- | ---: |
-| New bounded frames/FILTER | 106,870 |
+| New bounded frames/FILTER | 106,873 |
 | Existing windows | 8,840 |
 | Grouping ROLLUP | 19,443 |
 | Existing committed group synopsis | 6,409 |

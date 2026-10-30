@@ -2468,7 +2468,11 @@ pub fn Exec(comptime config: types.Config) type {
                     .current_row=>position,.preceding=>@as(i128,position)-offset,.following=>@as(i128,position)+offset,
                 };
                 if(ending and kind!=.unbounded_preceding and kind!=.unbounded_following) raw+=1;
-                return @intCast(@max(@as(i128,first),@min(@as(i128,end),raw)));
+                // The native SB0 backend supports wide comparisons, while
+                // its min/max intrinsics are limited to machine integers.
+                if(raw<@as(i128,first)) return first;
+                if(raw>@as(i128,end)) return end;
+                return @intCast(raw);
             }
             fn frameSelected(index:usize,current:usize,peer_first:usize,peer_end:usize,exclude:Ast.Exclusion) bool {
                 return switch(exclude){.no_others=>true,.current_row=>index!=current,.group=>index<peer_first or index>=peer_end,.ties=>index==current or index<peer_first or index>=peer_end};
@@ -2638,10 +2642,40 @@ pub fn Exec(comptime config: types.Config) type {
                     if(target.kind!=.column or target.relation!=0 or target.level!=0){mapped=false;break;}
                     sort_plan.order[index].column=target.column;
                 }
+                // Only trivial projections can move across a sort without
+                // changing error timing. PG16 and PG18 themselves differ for
+                // unselected throwing expressions; retain the eager path.
+                for(p.targets[0..p.width],0..) |id,index| {
+                    const kind=self.pool.nodes[id].kind;
+                    if(p.order_count!=0 and !p.window_late[index] and kind!=.column and kind!=.null_literal and kind!=.bool_literal and kind!=.int_literal and kind!=.text_literal and kind!=.decimal_literal) mapped=false;
+                }
                 if(mapped) {
                     const selected=try self.finish(&sort_plan,rows);
                     var projection=p.*;projection.order_count=0;projection.offset=0;projection.limit=0xffffffffffffffff;
                     return self.project(&projection,.{.start=selected.start,.count=selected.count,.width=1},outer);
+                }
+                var late=p.window_late;
+                for(p.order[0..p.order_count]) |key| late[key.column]=false;
+                var deferred=false;for(late[0..p.width]) |flag| deferred=deferred or flag;
+                if(deferred) {
+                    // Preserve input handles while sorting projected output.
+                    // Contiguous output cells recover each selected input's
+                    // ordinal without an extra Cell or per-row mapping array.
+                    const amount=@mulWithOverflow(@as(usize,rows.count),p.width);if(amount[1]!=0) return error.WorkspaceCapacity;
+                    const base=try self.cells(amount[0]);const inputs=self.handles(rows);
+                    var out:List=.{.start=@intCast(self.work.ref_low)};var ctx=self.context(outer);
+                    for(inputs,0..) |at,index| {
+                        try self.session.checkpoint();ctx.tuple[0]=self.row(at);
+                        const target=base+index*p.width;
+                        for(p.targets[0..p.width],0..) |id,column| self.work.cells[target+column]=if(late[column]) .{.null_value={}} else try E.eval(&ctx,id);
+                        try self.push(&out,@intCast(target));
+                    }
+                    const selected=try self.finish(p,out);
+                    for(self.handles(selected)) |at| {
+                        try self.session.checkpoint();const index=(at-base)/p.width;ctx.tuple[0]=self.row(inputs[index]);
+                        for(p.targets[0..p.width],0..) |id,column| if(late[column]) {self.work.cells[at+column]=try E.eval(&ctx,id);};
+                    }
+                    return selected;
                 }
                 const tuples:Tuples=.{.start=rows.start,.count=rows.count,.width=1};
                 return self.finish(p,try self.project(p,tuples,outer));
