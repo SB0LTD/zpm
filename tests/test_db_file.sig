@@ -71,6 +71,34 @@ pub fn main(init: std.process.Init) !void {
     try file.sync();
     file.close();
     open = false;
+    // openExisting reports absence as FileNotFound (missing file or missing
+    // directory component), still opens an existing file and never creates.
+    var existing = try disk.File.openExisting(path);
+    try check(try existing.length() == committed_length + 4);
+    existing.close();
+    if (disk.File.openExisting(missing_path)) |unexpected_value| {
+        var unexpected = unexpected_value;
+        unexpected.close();
+        return error.MissingFileOpened;
+    } else |err| try check(err == error.FileNotFound);
+    var absent_buffer: [256]u8 = undefined;
+    const absent_path = try std.fmt.bufPrint(&absent_buffer, "sig-out/db-file-contract-{d}.absent/child.wal", .{pid});
+    if (disk.File.openExisting(absent_path)) |unexpected_value| {
+        var unexpected = unexpected_value;
+        unexpected.close();
+        return error.MissingDirectoryOpened;
+    } else |err| try check(err == error.FileNotFound);
+    // Creating opens never report FileNotFound; nothing above created a file
+    // or directory (exclusive creation proves the file was still absent).
+    if (disk.File.open(absent_path)) |unexpected_value| {
+        var unexpected = unexpected_value;
+        unexpected.close();
+        return error.MissingDirectoryCreated;
+    } else |err| try check(err == error.FileOpenFailed);
+    var fresh = try disk.File.createExclusive(missing_path);
+    try check(try fresh.length() == 0);
+    fresh.close();
+    try disk.remove(missing_path);
     file = try disk.File.open(path);
     open = true;
     var scratch: [128]u8 = undefined;
