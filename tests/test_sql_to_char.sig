@@ -39,6 +39,7 @@ pub fn main() !void {
     try reject("SELECT to_char(1,'YYYY')",error.UndefinedFunction);
     try reject("SELECT to_char('2024-01-01','YYYY')",error.AmbiguousFunction);
     try reject("SELECT to_char(TIMESTAMP '2024-01-01','IYYY-IW')",error.UnsupportedStatement);
+    try reject("SELECT to_char(TIMESTAMP '2024-01-01','iyyy-iw')",error.UnsupportedStatement);
     try reject("SELECT to_char(DATE '2024-01-01')",error.UndefinedFunction);
     try reject("SELECT to_char(DATE '2024-01-01','YYYY',1)",error.UndefinedFunction);
     db.session.zone=.{.kind=.fixed,.offset=7200};

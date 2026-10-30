@@ -41,7 +41,7 @@ const tokens=[_] []const u8{"HH24","hh24","HH12","hh12","MONTH","Month","month",
     "YYY","yyy","DDD","ddd","DAY","Day","day","MON","Mon","mon","HH","hh","MI","mi","SS","ss","MS","ms","US","us",
     "YY","yy","MM","mm","DD","dd","DY","Dy","dy","WW","ww","CC","cc","AM","am","PM","pm","BC","bc","AD","ad",
     "Y","y","D","d","W","w","Q","q","J","j"};
-const unsupported=[_] []const u8{"IYYY","IYY","IY","IDDD","ID","IW","I","TZH","TZM","TZ","tz","OF","RM","rm","TM","tm","FX","fx","SP","sp"};
+const unsupported=[_] []const u8{"IYYY","iyyy","IYY","iyy","IY","iy","IDDD","iddd","ID","id","IW","iw","I","i","TZH","TZM","TZ","tz","OF","RM","rm","TM","tm","FX","fx","SP","sp"};
 
 fn render(us:i64,pattern:[]const u8,out:*Writer) Error!void {
     const date=@divFloor(us,temporal.usecs_per_day);const time=@mod(us,temporal.usecs_per_day);
