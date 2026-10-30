@@ -338,6 +338,14 @@ const RpcBuilder = struct {
         self.numeric(8, 1);
         self.numeric(@bitCast(value), 8);
     }
+    /// INTN of `size` bytes: SMALLINT (2), INT (4) or BIGINT (8).
+    fn sized(self: *RpcBuilder, parameter: []const u8, value: i64, size: usize) !void {
+        try self.name(parameter);
+        self.numeric(0x26, 1);
+        self.numeric(size, 1);
+        self.numeric(size, 1);
+        self.numeric(@bitCast(value), size);
+    }
     fn boolean(self: *RpcBuilder, parameter: []const u8, value: bool) !void {
         try self.name(parameter);
         self.numeric(0x68, 1);
@@ -430,6 +438,87 @@ fn rpcParameters() !void {
     try check(session.result.row_count == 2);
 }
 
+/// NET-01: `bal-@d` with a negative SMALLINT, INT or BIGINT must not form a
+/// `--` comment that drops the WHERE clause, so exactly one row changes.
+fn rpcNegativeIntegers() !void {
+    store = .{};
+    var db: DB = .{ .store = &store, .id = 1 };
+    var session: Session = .{};
+    try connect(&session, &db);
+    _ = try execute(&session, &db, "CREATE TABLE accounts (id INTEGER PRIMARY KEY, bal INTEGER)");
+    _ = try execute(&session, &db, "INSERT INTO accounts VALUES (1, 100)");
+    _ = try execute(&session, &db, "INSERT INTO accounts VALUES (2, 100)");
+    _ = try execute(&session, &db, "INSERT INTO accounts VALUES (3, 100)");
+    var buffer: [4096]u8 = undefined;
+    const declarations = [_][]const u8{ "@d SMALLINT,@id INT", "@d INT,@id INT", "@d BIGINT,@id INT" };
+    const widths = [_]usize{ 2, 4, 8 };
+    for (declarations, widths, 0..) |declaration, width, index| {
+        var builder: RpcBuilder = .{ .target = &buffer };
+        try builder.begin("UPDATE accounts SET bal = bal-@d WHERE id = @id", declaration);
+        try builder.sized("@d", -5, width);
+        try builder.sized("@id", @intCast(index + 1), 4);
+        const updated = try flatten(try session.handle(&db, packet(3, 1, 2, buffer[0..builder.pos]), &output));
+        try check(updated[0] == 0xff and session.result.affected_rows == 1);
+        var text: [64]u8 = undefined;
+        const expanded = try std.fmt.bufPrint(&text, "UPDATE accounts SET bal = bal-(-5) WHERE id = {d}", .{index + 1});
+        try same(session.rpc_expanded[0..expanded.len], expanded);
+    }
+    _ = try execute(&session, &db, "SELECT bal FROM accounts ORDER BY id");
+    try check(session.result.row_count == 3);
+    for (0..3) |row| try check(session.result.rows[row].cells[0].integer == 105);
+    // A negative second operand: 10-(-3), not the comment 10--3.
+    var builder: RpcBuilder = .{ .target = &buffer };
+    try builder.begin("SELECT @a-@b", "@a INT,@b INT");
+    try builder.sized("@a", 10, 4);
+    try builder.sized("@b", -3, 4);
+    const difference = try flatten(try session.handle(&db, packet(3, 1, 3, buffer[0..builder.pos]), &output));
+    try check(difference[0] == 0x81 and session.result.rows[0].cells[0].integer == 13);
+    // A value is spaced from a neighbor it would otherwise merge with.
+    builder = .{ .target = &buffer };
+    try builder.begin("SELECT 'a'@s,@n.5", "@s NVARCHAR(MAX),@n INT");
+    try builder.text("@s", "b", false);
+    try builder.sized("@n", 7, 4);
+    _ = try flatten(try session.handle(&db, packet(3, 1, 4, buffer[0..builder.pos]), &output));
+    const spaced = "SELECT 'a' 'b',7 .5";
+    try same(session.rpc_expanded[0..spaced.len], spaced);
+    // An exponent sign on the left: `1e-@n` is not the decimal token 1e-5.
+    builder = .{ .target = &buffer };
+    try builder.begin("SELECT 1e-@n", "@n INT");
+    try builder.sized("@n", 5, 4);
+    _ = try flatten(try session.handle(&db, packet(3, 1, 5, buffer[0..builder.pos]), &output));
+    const exponent = "SELECT 1e- 5";
+    try same(session.rpc_expanded[0..exponent.len], exponent);
+    // The BIGINT minimum, unary minus, negatives of mixed widths and `*-`.
+    builder = .{ .target = &buffer };
+    try builder.begin("SELECT @a, -@b, @b-@c, @c*-@b", "@a BIGINT,@b INT,@c SMALLINT");
+    try builder.sized("@a", std.math.minInt(i64), 8);
+    try builder.sized("@b", -5, 4);
+    try builder.sized("@c", -3, 2);
+    const selected = try flatten(try session.handle(&db, packet(3, 1, 6, buffer[0..builder.pos]), &output));
+    try check(selected[0] == 0x81);
+    const mixed = "SELECT (-9223372036854775808), -(-5), (-5)-(-3), (-3)*-(-5)";
+    try same(session.rpc_expanded[0..mixed.len], mixed);
+    const row = session.result.rows[0];
+    try check(row.cells[0].integer == std.math.minInt(i64));
+    try check(row.cells[1].integer == 5 and row.cells[2].integer == -2 and row.cells[3].integer == -15);
+    // NULL (INTN with length 0) after `-`.
+    builder = .{ .target = &buffer };
+    try builder.begin("SELECT 1-@n", "@n INT");
+    try builder.name("@n");
+    builder.numeric(0x26, 1);
+    builder.numeric(4, 1);
+    builder.numeric(0, 1);
+    const nulled = try flatten(try session.handle(&db, packet(3, 1, 7, buffer[0..builder.pos]), &output));
+    try check(nulled[0] == 0x81 and session.result.rows[0].cells[0] == .null_value);
+    try same(session.rpc_expanded[0.."SELECT 1-NULL".len], "SELECT 1-NULL");
+    // Text carrying comment and quote metacharacters stays one literal.
+    builder = .{ .target = &buffer };
+    try builder.begin("SELECT 'a'@s", "@s NVARCHAR(MAX)");
+    try builder.text("@s", "'--/*", false);
+    _ = try flatten(try session.handle(&db, packet(3, 1, 8, buffer[0..builder.pos]), &output));
+    try same(session.rpc_expanded[0.."SELECT 'a' '''--/*'".len], "SELECT 'a' '''--/*'");
+}
+
 fn malformedAndFuzz() !void {
     store = .{};
     var db: DB = .{ .store = &store, .id = 1 };
@@ -482,6 +571,7 @@ pub fn main(init: std.process.Init) !void {
     try transactionManagerAndPreflight();
     try concurrentCommittedVisibility();
     try rpcParameters();
+    try rpcNegativeIntegers();
     try malformedAndFuzz();
     var buffer: [256]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"tds\",\"pass\":true,\"assertions\":{d},\"fuzz_inputs\":{d}}}\n", .{ assertions, fuzz_inputs });

@@ -9,7 +9,9 @@ const darwin = std.c;
 const windows = builtin.os.tag == .windows;
 const Handle = if (windows) ?*anyopaque else linux.fd_t;
 const invalid: Handle = if (windows) @ptrFromInt(~@as(usize, 0)) else -1;
-pub const Error = error{ UnsupportedPlatform, InvalidPath, PathTooLong, FileOpenFailed, DataDirectoryBusy, FileReadFailed, FileWriteFailed, FileSyncFailed, FileSeekFailed, FileTruncateFailed, FileRenameFailed, FileRemoveFailed, WriterPoisoned };
+/// FileNotFound is returned only by openExisting, and only when the path or a
+/// directory component does not exist; every other open failure is FileOpenFailed.
+pub const Error = error{ UnsupportedPlatform, InvalidPath, PathTooLong, FileNotFound, FileOpenFailed, DataDirectoryBusy, FileReadFailed, FileWriteFailed, FileSyncFailed, FileSeekFailed, FileTruncateFailed, FileRenameFailed, FileRemoveFailed, WriterPoisoned };
 const Win = struct {
     extern "kernel32" fn CreateFileW([*:0]const u16, u32, u32, ?*anyopaque, u32, u32, ?*anyopaque) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn CloseHandle(?*anyopaque) callconv(.winapi) c_int;
@@ -50,6 +52,8 @@ pub const File = struct {
         return openImpl(path, false, true);
     }
     /// Open and lock a required source; never create a missing database.
+    /// A missing file or directory component is FileNotFound, so callers can
+    /// tell "absent" from "present but unusable" (FileOpenFailed).
     pub fn openExisting(path: []const u8) Error!File {
         return openImpl(path, false, false);
     }
@@ -92,7 +96,10 @@ pub const File = struct {
             const z = try widePath(path, &path_buf);
             file.handle = Win.CreateFileW(z.ptr, 0xc0000000, 1, null, if (exclusive) 1 else if (create) 4 else 3, 0x80, null);
             if (file.handle == invalid) {
-                if (Win.GetLastError() == 32) return error.DataDirectoryBusy;
+                const code = Win.GetLastError();
+                if (code == 32) return error.DataDirectoryBusy;
+                // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND.
+                if (!create and (code == 2 or code == 3)) return error.FileNotFound;
                 return error.FileOpenFailed;
             }
         } else if (builtin.os.tag == .linux) {
@@ -100,7 +107,11 @@ pub const File = struct {
             const z = try narrowPath(path, &path_buf);
             const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = create, .CLOEXEC = true, .NOFOLLOW = true, .EXCL = exclusive };
             const rc = linux.openat(linux.AT.FDCWD, z.ptr, flags, 0o600);
-            if (linux.errno(rc) != .SUCCESS) return error.FileOpenFailed;
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .NOENT, .NOTDIR => return if (create) error.FileOpenFailed else error.FileNotFound,
+                else => return error.FileOpenFailed,
+            }
             file.handle = @intCast(rc);
             if (linux.errno(linux.flock(file.handle, 2 | 4)) != .SUCCESS) { // LOCK_EX | LOCK_NB
                 file.close();
@@ -111,7 +122,10 @@ pub const File = struct {
             const z = try narrowPath(path, &path_buf);
             const flags: darwin.O = .{ .ACCMODE = .RDWR, .CREAT = create, .CLOEXEC = true, .NOFOLLOW = true, .EXCL = exclusive };
             const fd = darwin.open(z.ptr, flags, @as(c_uint, 0o600));
-            if (fd < 0) return error.FileOpenFailed;
+            if (fd < 0) return switch (darwin.errno(fd)) {
+                .NOENT, .NOTDIR => if (create) error.FileOpenFailed else error.FileNotFound,
+                else => error.FileOpenFailed,
+            };
             file.handle = fd;
             while (darwin.flock(file.handle, darwin.LOCK.EX | darwin.LOCK.NB) != 0) {
                 if (darwin.errno(@as(c_int, -1)) == .INTR) continue;

@@ -29,6 +29,9 @@ pub const Config = struct {
     /// Precontract a unique-key dimension to group IDs before combining one
     /// dimension label with one integral fact key in caller-owned group state.
     dimension_group_ids: bool = false,
+    /// Typed grouped COUNT(DISTINCT fact integer) over unique dimension chains.
+    /// Exact membership bitmaps borrow the query arena and remain per snapshot.
+    dimension_distinct_groups: bool = false,
     /// Optional exact committed GROUP BY synopses per supported column. This
     /// budgets metadata groups, not SQL results: overflow retains scan paths.
     summary_groups: usize = 0,
@@ -149,7 +152,7 @@ pub const Error = error{
     InvalidEscapeSequence,
     /// SQLSTATE 42P02: a $n placeholder reached the engine unbound.
     UndefinedParameter,
-    /// SQLSTATE 42P10: ORDER BY position out of range.
+    /// SQLSTATE 42P10: invalid ORDER BY reference or window-frame variable.
     InvalidColumnReference,
     /// Not an error for subtransaction purposes: the statement met a lock held
     /// by a live transaction and is parked (design §4.4/§4.5). Resume it by
@@ -204,6 +207,10 @@ pub const Error = error{
     GroupingError,
     /// SQLSTATE 42P20: misplaced or nested window function.
     WindowingError,
+    /// SQLSTATE 22013: negative window frame offset.
+    InvalidWindowFrameOffset,
+    /// SQLSTATE 22004: NULL window frame offset.
+    NullWindowFrameOffset,
     /// SQLSTATE 42702: an unqualified column name matches several relations.
     AmbiguousColumn,
     /// SQLSTATE 21000: a scalar subquery returned more than one row.

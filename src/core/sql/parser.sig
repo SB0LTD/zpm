@@ -982,7 +982,7 @@ pub fn Parser(comptime config: types.Config) type {
                     limited = true;
                     if (!(try self.takeWord("FIRST"))) try self.expectWord("NEXT");
                     block.limit = 1;
-                    if (self.current.kind == .integer or self.isSymbol(.minus) or self.current.kind == .decimal) try self.countValue(&block.limit, &block.negative_limit);
+                    if (self.current.kind == .integer or self.isSymbol(.minus) or self.isSymbol(.lparen) or self.current.kind == .decimal) try self.countValue(&block.limit, &block.negative_limit);
                     if (!(try self.takeWord("ROW"))) try self.expectWord("ROWS");
                     try self.expectWord("ONLY");
                 } else break;
@@ -1188,8 +1188,10 @@ pub fn Parser(comptime config: types.Config) type {
 
         /// A LIMIT/OFFSET/FETCH count; negative counts are reported by the
         /// binder (2201W / 2201X) after name resolution, as PostgreSQL
-        /// reports them at execution.
+        /// reports them at execution. One pair of parentheses is accepted,
+        /// since the wire codecs splice a negative bound parameter as `(-n)`.
         fn countValue(self: *Self, value: *u64, negative: *bool) Error!void {
+            const parenthesized = try self.takeSymbol(.lparen);
             const minus = try self.takeSymbol(.minus);
             if (self.current.kind == .decimal) {
                 // An integer beyond u64 (bigint out of range, as PostgreSQL).
@@ -1199,6 +1201,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.current.kind != .integer) return error.Syntax;
             value.* = self.current.integer;
             try self.advance();
+            if (parenthesized) try self.expectSymbol(.rparen);
             if (minus and value.* != 0) negative.* = true;
         }
 
@@ -1628,22 +1631,35 @@ pub fn Parser(comptime config: types.Config) type {
                         if(!try self.takeSymbol(.comma)) break;
                     }
                 }
-                if(try self.takeWord("ROWS")) {
-                    const between=try self.takeWord("BETWEEN");
-                    if(!self.isWord("UNBOUNDED")) return error.UnsupportedStatement;
-                    try self.expectWord("UNBOUNDED");try self.expectWord("PRECEDING");
-                    spec.frame=.rows_prefix;
-                    if(between) {
-                        try self.expectWord("AND");
-                        if(try self.takeWord("UNBOUNDED")) {try self.expectWord("FOLLOWING");spec.frame=.full;}
-                        else {try self.expectWord("CURRENT");try self.expectWord("ROW");}
+                if(self.isWord("ROWS") or self.isWord("GROUPS") or self.isWord("RANGE")) {
+                    spec.frame=if(self.isWord("ROWS")) .rows else if(self.isWord("GROUPS")) .groups else .range;
+                    try self.advance();const between=try self.takeWord("BETWEEN");
+                    spec.start=try self.frameBound(node);
+                    if(between) {try self.expectWord("AND");spec.end=try self.frameBound(node);}
+                    if(spec.start.kind==.unbounded_following or spec.end.kind==.unbounded_preceding or @intFromEnum(spec.end.kind)<@intFromEnum(spec.start.kind)) return error.WindowingError;
+                    if(try self.takeWord("EXCLUDE")) {
+                        if(try self.takeWord("CURRENT")){try self.expectWord("ROW");spec.exclude=.current_row;}
+                        else if(try self.takeWord("GROUP")) spec.exclude=.group
+                        else if(try self.takeWord("TIES")) spec.exclude=.ties
+                        else {try self.expectWord("NO");try self.expectWord("OTHERS");}
                     }
-                } else if(self.isWord("RANGE") or self.isWord("GROUPS")) return error.UnsupportedStatement;
+                }
                 try self.expectSymbol(.rparen);
             }
             const n = &self.pool.nodes[node];
             if (n.distinct or n.c != none or self.aggregateName(name)) self.pool.complex = true;
             return node;
+        }
+
+        fn frameBound(self:*Self,owner:u16) Error!Ast.FrameBound {
+            if(try self.takeWord("UNBOUNDED")) {
+                if(try self.takeWord("PRECEDING")) return .{.kind=.unbounded_preceding};
+                try self.expectWord("FOLLOWING");return .{.kind=.unbounded_following};
+            }
+            if(try self.takeWord("CURRENT")){try self.expectWord("ROW");return .{.kind=.current_row};}
+            const offset=try self.expression();try self.pool.raise(owner,offset);
+            if(try self.takeWord("PRECEDING")) return .{.kind=.preceding,.offset=offset};
+            try self.expectWord("FOLLOWING");return .{.kind=.following,.offset=offset};
         }
 
         fn caseExpr(self: *Self) Error!u16 {

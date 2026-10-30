@@ -91,8 +91,10 @@ pub fn Mvcc(comptime config: types.Config) type {
                 self.write_len += 1;
             }
 
-            pub fn pushLock(self: *Tx, entry: L.Entry) void {
-                // Bounded: each table mode and each row lock appears once.
+            /// Bounded by L.list_capacity (each table mode once, each held
+            /// row's grant and upgrade once); checked all the same.
+            pub fn pushLock(self: *Tx, entry: L.Entry) Error!void {
+                if (self.lock_len == L.list_capacity) return error.LockCapacity;
                 self.lock_list[self.lock_len] = entry;
                 self.lock_len += 1;
             }
@@ -158,6 +160,16 @@ pub fn Mvcc(comptime config: types.Config) type {
         }
 
         const types_first_oid: u32 = 16384;
+
+        /// Lists a lock just granted to `slot`. When the list is full the
+        /// grant is released again, so the failing statement leaves the
+        /// lock table as it found it.
+        pub fn recordLock(db: anytype, slot: usize, entry: L.Entry) Error!void {
+            db.txs[slot].pushLock(entry) catch |err| {
+                db.locks.release(slot, entry);
+                return err;
+            };
+        }
 
         pub fn releaseLocks(db: anytype, slot: usize, lock_start: usize) void {
             const tx = &db.txs[slot];

@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "scope": "revised projection and frame bounds; local correctness/counter contracts, no throughput evidence",
+  "source_hash_encoding": "UTF-8 with LF, except TSV exact raw bytes",
+  "files": {
+    "src/core/sql/ast.sig": "d1dff777d188bb7541991321c28e6e1ae789b18234d2d9157de556c001cb445a",
+    "src/core/sql/binder.sig": "001a97a5f683bf6fa2e19a776fbbc7e26e7967c7f96257e0eeb2f95e988a1d82",
+    "src/core/sql/exec.sig": "dec105ae1c362e9a0744adbfcaf57594e28d2ff00c18d7ed338587a87fcfcd1c",
+    "src/core/sql/lexer.sig": "1f665520d52e49c44050823de214cbd9857cd0e48b382c701e4229fd558e08d0",
+    "src/core/sql/parser.sig": "428d440d88c7bf930095455336059278c3467c5acd57403e92999ba1ca7b0d7e",
+    "src/core/sql/types.sig": "c735f8220f003d3a68500ba8ef757f1d19f0a3420304a44fc9ada11e0fcc4910",
+    "src/db/postgres.sig": "0aaea16a7ef213a0dbbc532b36ebdac6533ca45a431fa66e4dee0457c0c0031b",
+    "tests/test_sql_windows.sig": "f9ae032e8ba0c742d327e55ff398db7a80965c25dc0b6d8186d68d69b55f620d",
+    "tests/test_sql_window_frames.sig": "e8276c24006b08c668624020fc0edbaf7c7acd8724d5a2c85c31c7200b6d7de1",
+    "build.sig": "341636ccc8bf53f21c452abbcfb3cc13133d0580a521d30d78ad758c533c7b8e",
+    ".gitattributes": "b92e40ec091f52e9af5f1ac74909f756e3ac0fbf58a3c620980d4a53ce23acfb",
+    "tests/evidence/window-frames-pg16.tsv": "80c840dbdaf34a535b5b316c9a64758ec8b336379e36eaf3f923ec69b9c9d218",
+    "tests/evidence/window-frames-pg16.json": "39b28430991aa1b3623606569078d7d32a73d91d60ecd9c2bf416f40f4da9ca8"
+  }
+}

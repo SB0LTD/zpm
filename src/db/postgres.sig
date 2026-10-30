@@ -1474,6 +1474,8 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "QueryWorkLimit")) return "54000";
     if (equal(name, "GroupingError")) return "42803";
     if (equal(name, "WindowingError")) return "42P20";
+    if (equal(name, "InvalidWindowFrameOffset")) return "22013";
+    if (equal(name, "NullWindowFrameOffset")) return "22004";
     if (equal(name, "AmbiguousColumn")) return "42702";
     if (equal(name, "CardinalityViolation")) return "21000";
     if (equal(name, "InvalidRowCountInLimit")) return "2201W";
@@ -1564,7 +1566,7 @@ fn scan(source: []const u8, values: ?[]const []const u8, w: ?*Writer) !usize {
             highest = @max(highest, n);
             if (values) |v| {
                 if (n > v.len) return error.ProtocolViolation;
-                if (w) |out| try out.append(v[n - 1]);
+                if (w) |out| try splice(out, v[n - 1], source[j..]);
             }
             i = j;
             continue;
@@ -1573,6 +1575,26 @@ fn scan(source: []const u8, values: ?[]const []const u8, w: ?*Writer) !usize {
         i += 1;
     }
     return highest;
+}
+/// A byte that can continue a word, number, string or quoted identifier.
+fn tokenByte(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '$' or c == '.' or c == '\'' or c == '"' or c >= 0x80;
+}
+/// Whether `a` directly followed by `b` could lex as one token (a word, a
+/// number, `''` or `""`) or open a comment (`--`, `/*`).
+fn joins(a: u8, b: u8) bool {
+    return (tokenByte(a) and tokenByte(b)) or (a == '-' and b == '-') or (a == '/' and b == '*');
+}
+/// Appends a rendered parameter as a self-contained token sequence (NET-01):
+/// a space separates it from the preceding output or the following `rest`
+/// only where they would otherwise merge, so other spliced text is unchanged.
+fn splice(w: *Writer, value: []const u8, rest: []const u8) !void {
+    if (value.len == 0) return;
+    // An exponent sign on the left: `1e-$1` must not lex as the number 1e-5.
+    const sign = w.at >= 2 and (w.bytes[w.at - 1] == '-' or w.bytes[w.at - 1] == '+') and (w.bytes[w.at - 2] | 0x20) == 'e';
+    if (w.at != 0 and (sign or joins(w.bytes[w.at - 1], value[0]))) try w.byte(' ');
+    try w.append(value);
+    if (rest.len != 0 and joins(value[value.len - 1], rest[0])) try w.byte(' ');
 }
 fn parameterCount(source: []const u8) !usize {
     return scan(source, null, null);
@@ -1665,11 +1687,21 @@ fn literal(w: *Writer, bytes: []const u8, oid: u32, format: u16) !void {
             if (bytes.len != count) return error.ProtocolViolation;
             var bits: u64 = if (bytes[0] & 128 != 0) 0xffffffffffffffff else 0;
             for (bytes) |b| bits = (bits << 8) | b;
-            try w.number(@bitCast(bits));
+            const value: i64 = @bitCast(bits);
+            // NET-01: a negative is `(-5)`, so `x-$1` never becomes `x--5`
+            // (a comment) and `$1::text` casts the whole value.
+            if (value < 0) try w.byte('(');
+            try w.number(value);
+            if (value < 0) try w.byte(')');
         } else if (oid == 25 or oid == 1043 or oid == 1042) try quoted(w, bytes) else return error.UnsupportedBinaryType;
     } else if (oid == 20 or oid == 21 or oid == 23 or (oid == 0 and integerText(bytes))) {
         if (!integerText(bytes)) return error.TypeMismatch;
-        try w.append(if (bytes[0] == '+') bytes[1..] else bytes);
+        const digits = if (bytes[0] == '+') bytes[1..] else bytes;
+        // NET-01: parenthesize negatives as above. Non-negative values stay
+        // bare, since LIMIT and OFFSET accept only an integer token.
+        if (digits[0] == '-') try w.byte('(');
+        try w.append(digits);
+        if (digits[0] == '-') try w.byte(')');
     } else if (oid == 16) {
         if (keyword(bytes, "t") or keyword(bytes, "true") or keyword(bytes, "yes") or keyword(bytes, "on") or equal(bytes, "1")) try w.append("TRUE") else if (keyword(bytes, "f") or keyword(bytes, "false") or keyword(bytes, "no") or keyword(bytes, "off") or equal(bytes, "0")) try w.append("FALSE") else return error.TypeMismatch;
     } else try quoted(w, bytes);

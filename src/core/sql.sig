@@ -1715,7 +1715,7 @@ pub fn Database(comptime config: Config) type {
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
             }
-            if (self.locks.grantTable(table, slot, mode)) tx.pushLock(.{ .kind = .table, .table = @intCast(table), .mode = @intFromEnum(mode) });
+            if (self.locks.grantTable(table, slot, mode)) try M.recordLock(self, slot, .{ .kind = .table, .table = @intCast(table), .mode = @intFromEnum(mode) });
             tx.table_wait = null;
         }
 
@@ -1764,9 +1764,7 @@ pub fn Database(comptime config: Config) type {
                     .ready => |newest| {
                         const table = &db.tables[table_index];
                         const rowid = table.rows[table.versions[newest].row - 1].rowid;
-                        if (try db.locks.grantRow(table_index, rowid, self.slot, self.mode)) |index| {
-                            db.txs[self.slot].pushLock(.{ .kind = .row, .table = @intCast(table_index), .mode = @intFromEnum(self.mode), .index = index });
-                        }
+                        if (try db.locks.grantRow(table_index, rowid, self.slot, self.mode)) |granted| try M.recordLock(db, self.slot, granted);
                         return newest;
                     },
                 }
@@ -1899,9 +1897,7 @@ pub fn Database(comptime config: Config) type {
             const row = table.versions[goal].row - 1;
             ctx.tuple[1] = proposed;
             if (!try X.keep(ctx, update.where, &table.versions[goal].cells)) {
-                if (try self.locks.grantRow(table_index, table.rows[row].rowid, slot, .update)) |index| {
-                    self.txs[slot].pushLock(.{ .kind = .row, .table = @intCast(table_index), .mode = @intFromEnum(locks_module.RowMode.update), .index = index });
-                }
+                if (try self.locks.grantRow(table_index, table.rows[row].rowid, slot, .update)) |granted| try M.recordLock(self, slot, granted);
                 return 0;
             }
             try self.updateOne(slot, ctx, update, row, goal, snap);

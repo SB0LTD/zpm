@@ -114,6 +114,17 @@ fn nameByte(value: u8) bool {
     return (value >= 'a' and value <= 'z') or (value >= 'A' and value <= 'Z') or (value >= '0' and value <= '9') or value == '_';
 }
 
+/// A byte that can continue a word, number, string or quoted identifier.
+fn tokenByte(value: u8) bool {
+    return nameByte(value) or value == '$' or value == '.' or value == '\'' or value == '"' or value >= 0x80;
+}
+
+/// Whether `a` directly followed by `b` could lex as one token (a word, a
+/// number, `''` or `""`) or open a comment (`--`, `/*`).
+fn joins(a: u8, b: u8) bool {
+    return (tokenByte(a) and tokenByte(b)) or (a == '-' and b == '-') or (a == '/' and b == '*');
+}
+
 fn whitespace(value: u8) bool {
     return value == ' ' or value == '\t' or value == '\r' or value == '\n';
 }
@@ -662,6 +673,18 @@ pub fn Session(comptime DB: type) type {
             position.* += text.len;
         }
 
+        /// Appends a parameter literal as a self-contained token sequence
+        /// (NET-01): a space separates it from the preceding output or the
+        /// following `rest` only where they would otherwise merge.
+        fn splice(target: []u8, position: *usize, value: []const u8, rest: []const u8) Error!void {
+            if (value.len == 0) return;
+            // An exponent sign on the left: `1e-@p` must not lex as the number 1e-5.
+            const sign = position.* >= 2 and (target[position.* - 1] == '-' or target[position.* - 1] == '+') and (target[position.* - 2] | 0x20) == 'e';
+            if (position.* != 0 and (sign or joins(target[position.* - 1], value[0]))) try append(target, position, " ");
+            try append(target, position, value);
+            if (rest.len != 0 and joins(value[value.len - 1], rest[0])) try append(target, position, " ");
+        }
+
         fn literal(self: *Self, value: RpcValue, parameter: *Parameter, position: *usize) Error!void {
             parameter.literal_offset = position.*;
             switch (value) {
@@ -685,7 +708,11 @@ pub fn Session(comptime DB: type) type {
                         start -= 1;
                         scratch[start] = '-';
                     }
+                    // NET-01: a negative is `(-5)`, so `x-@p` never becomes
+                    // `x--5` (a comment). Non-negative values stay bare.
+                    if (integer < 0) try append(&self.rpc_values, position, "(");
                     try append(&self.rpc_values, position, scratch[start..]);
+                    if (integer < 0) try append(&self.rpc_values, position, ")");
                 },
                 .text => |utf16| {
                     if (parameter.family != .text or position.* == self.rpc_values.len) return error.UnsupportedRpc;
@@ -765,7 +792,7 @@ pub fn Session(comptime DB: type) type {
                     var found = false;
                     for (self.rpc_parameters[0..count]) |*parameter| {
                         if (equal(name, parameter.name[0..parameter.name_len])) {
-                            try append(&self.rpc_expanded, &written, self.rpc_values[parameter.literal_offset..][0..parameter.literal_len]);
+                            try splice(&self.rpc_expanded, &written, self.rpc_values[parameter.literal_offset..][0..parameter.literal_len], source[position..]);
                             found = true;
                             break;
                         }
