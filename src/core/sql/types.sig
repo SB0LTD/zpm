@@ -29,6 +29,9 @@ pub const Config = struct {
     /// Precontract a unique-key dimension to group IDs before combining one
     /// dimension label with one integral fact key in caller-owned group state.
     dimension_group_ids: bool = false,
+    /// Typed grouped COUNT(DISTINCT fact integer) over unique dimension chains.
+    /// Exact membership bitmaps borrow the query arena and remain per snapshot.
+    dimension_distinct_groups: bool = false,
     /// Optional exact committed GROUP BY synopses per supported column. This
     /// budgets metadata groups, not SQL results: overflow retains scan paths.
     summary_groups: usize = 0,
