@@ -4,10 +4,10 @@
 {"id":"PG.PRED.OVERLAPS","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.PRED.REGEX","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.PRED.ESCAPE","status":"core_smoke_pass","statement":4,"detail":""}
-{"id":"PG.QUERY.WINDOW","status":"incomplete","statement":4,"detail":"Syntax"}
-{"id":"PG.QUERY.WINDOW_AGG","status":"incomplete","statement":4,"detail":"Syntax"}
+{"id":"PG.QUERY.WINDOW","status":"incomplete","statement":4,"detail":"UndefinedFunction"}
+{"id":"PG.QUERY.WINDOW_AGG","status":"core_smoke_pass","statement":4,"detail":""}
 {"id":"PG.QUERY.WINDOW_FRAMES","status":"incomplete","statement":4,"detail":"Syntax"}
-{"id":"PG.GROUP.ROLLUP","status":"incomplete","statement":4,"detail":"UndefinedFunction"}
+{"id":"PG.GROUP.ROLLUP","status":"core_smoke_pass","statement":4,"detail":""}
 {"id":"PG.GROUP.CUBE","status":"incomplete","statement":4,"detail":"UndefinedFunction"}
 {"id":"PG.GROUP.SETS","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.AGG.COLLECTION","status":"incomplete","statement":4,"detail":"Syntax"}

@@ -1,5 +1,100 @@
 # SQL conformance TDD checkpoint
 
+## Current checkpoint — 30 October 2026, after PR consolidation
+
+The original feature map is
+[tests/sql_conformance/README.md](../tests/sql_conformance/README.md), backed by
+118 stable programs in `cases.json` and the 755-record upstream feature list.
+It has now been rerun on consolidated main
+`2c0ac40afa11177158b1eac5f8e7cb9bce1c72c7`, whose complete source tree matches
+the qualified integration source `0f5af8d`. The original SQL/expected oracle
+programs were unchanged.
+
+**Current result: 8 smoke passes, 93 failures, 17 unexecuted scopes/comparators.**
+The executable intentionally returns SqlConformanceIncomplete. Preserve the
+former 6/95/17 output as `core_smoke_results.stage4.ndjson`; the new output,
+source hashes, tree identity and expected nonzero exit are recorded in
+[consolidation_evidence.json](../tests/sql_conformance/consolidation_evidence.json).
+These are targeted gap probes, not a PostgreSQL compatibility percentage.
+
+| Inventory item | Reconciled state |
+| --- | --- |
+| Aggregate windows | The original smoke program now passes; default/prefix totals are implemented |
+| ROLLUP/GROUPING | The original smoke program now passes; flat prefixes/empty grouping set are implemented |
+| Ranking/offset windows | Probe advances from Syntax to UndefinedFunction: ranking works, LAG/LEAD do not |
+| Named windows/frames | Combined named-window probe still fails; bounded ROWS/GROUPS, integral RANGE, exclusions and aggregate FILTER are independently implemented/tested |
+| Formatting | Temporal to_char works; the combined probe still fails because to_date/to_number are missing |
+| Earlier predicate slices | NULL-safe equality, scalar-subquery ANY/SOME/ALL, flat row predicates/list membership/BETWEEN, LIKE ESCAPE and GREATEST/LEAST retain their stated finite coverage |
+| System/native dialect cases | 17 are unexecuted in this driver; separate server tests do not imply full SQL or native MySQL/T-SQL qualification |
+
+The frame/FILTER contract replays 397 PostgreSQL 16.15 fixtures and executes
+106,873 assertions, with caller-owned prefix/tree state, scalar fallback,
+snapshot/private-write, poisoning, limits, cancellation and side-effect checks.
+Scope and algorithm limitations are in [SQL_WINDOW_FRAMES.md](SQL_WINDOW_FRAMES.md).
+DISTINCT windows are unsupported in PostgreSQL itself and are not an additional
+PostgreSQL-parity feature to implement.
+
+The consolidation merged ZPM PRs 77, 81 and 82–85 and RAMSQL PRs 30, 34 and 36.
+It includes the newer parameter-boundary, DDL-replay, lock-upgrade and explicit
+durable-create fixes plus the committed hardening audit. Seven inconclusive
+performance experiments and the failed-advantage dbMeter workflow PR were closed
+with branches/evidence preserved. All 17 original PRs are accounted for; see the
+[consolidation decisions](PR_CONSOLIDATION_20261030.md).
+
+Fresh qualification: ZPM's Linux/macOS/Windows database matrix
+[41114412805](https://github.com/SB0LTD/zpm/actions/runs/41114412805) passes;
+RAMSQL [CI 41114733707](https://github.com/SB0LTD/ramsql/actions/runs/41114733707)
+and [release matrix 41114733789](https://github.com/SB0LTD/ramsql/actions/runs/41114733789)
+pass all 32 active checks, including PG16/PG18 memory/durable+SCRAM, hosted exact
+artifacts and native SB0X/SB0K. The broad legacy graph retains four unrelated
+SABR/TLS/TTS failures, with 300 successes and 22 skips; it is not reported green.
+
+### What is still missing
+
+1. **Correctness before expansion.** General filter/error placement and planner
+   constant folding remain unqualified. Retain the LIKE JOIN/WHERE mismatch and
+   native PG16/PG18 projection-timing disagreement. The newer hardening audit's
+   SQLF temporal overflow/interval parsing, JSONB concatenation, infinite-date
+   subtraction and ambiguous-binding cases remain open; the affected temporal,
+   value, numeric and JSON source files were unchanged by this consolidation.
+2. **Common schema and types.** VARCHAR/CHAR, UUID/BYTEA, TIME/TIMETZ, arrays and
+   general records; SERIAL, IF [NOT] EXISTS, ALTER/TRUNCATE, views/schemas,
+   secondary indexes and table/composite/UNIQUE/CHECK/FK/deferred constraints
+   still block ordinary application schemas. Virtual generation, inheritance
+   and partitioning remain beyond the qualified stored-generation slice.
+3. **Ordinary functions/operators.** String/math/date/regex/discovery families,
+   to_date/to_number, numeric/interval/localized/ISO/timezone formatting,
+   remaining JSON/JSONB/SQL-JSON operations and additional aggregates/overloads.
+4. **Query composition.** Named and remaining built-in windows; nonintegral or
+   temporal RANGE offsets; volatile moving inputs; CUBE/general GROUPING SETS
+   and composite ROLLUP; LATERAL/NATURAL/parenthesized joins, table functions,
+   modifying/materialized CTE forms, SEARCH/CYCLE, VALUES/TABLE, TABLESAMPLE,
+   expression LIMIT/OFFSET and FETCH WITH TIES. Row subquery/ANY/ALL, nested
+   records, array predicates and OVERLAPS also remain open.
+5. **Mutation and systems.** UPDATE FROM, DELETE USING, tuple assignment, MERGE,
+   non-PK arbiters, broader sequence lifecycle; remaining isolation/transaction
+   characteristics/locks, cursors, SQL PREPARE, settings/notifications, roles/RLS,
+   routines/triggers/rules, catalogs, COPY options, administrative/integration SQL
+   and independently qualified native MySQL/T-SQL behavior. READ COMMITTED,
+   savepoint, wire-prepare and COPY subsets already have separate passing tests;
+   they must not be relabeled wholly absent by a core-only utility failure.
+6. **Scale and coverage.** Elastic schema/value storage, compact typed base/MVCC
+   data and intra-query scheduling are still needed for the requested 100M-row
+   workloads. Original dbMeter full/subset correctness is separately 7/7, but
+   run 41024725859 fails its overall advantage gate, including stock 200-byte
+   text, nine-column and 20-additional-table probes. No universal performance or
+   production-readiness claim follows. The 755 upstream records still need
+   reviewed applicability and mappings; these 118 programs do not cover every
+   PostgreSQL feature or overload.
+
+The per-ID table in the inventory retains every failure/unexecuted entry.
+The newer [RAMSQL feature/divergence audit](https://github.com/SB0LTD/ramsql/blob/main/docs/compatibility/FEATURE_GAPS.md)
+and [hardening plan](https://github.com/SB0LTD/ramsql/blob/main/PLAN.md) add
+application priorities, safety findings and layer ownership. System findings
+such as NET-02 and STO-02/04/05 remain open after the four wave-zero fixes.
+
+## Historical implementation checkpoints
+
 2026-10-29. Branch `feat/sql-conformance-tdd`, isolated from concurrent RAMSQL
 performance work. Baseline: ZPM `53655a9a89a3ddff6f2f5829388b09a10c3d9c93`.
 
@@ -107,7 +202,7 @@ mid-match cancellation. Fourteen Python tests check harness/evidence identity.
 See [oracle](../tests/sql_conformance/like_oracle.json) and
 [contract](../tests/test_sql_like_escape.sig).
 
-The refreshed broad audit has six smoke passes, 95 failures and 17 unexecuted
+The ESCAPE-era broad audit had six smoke passes, 95 failures and 17 unexecuted
 scopes/comparators. The former four-pass output is preserved as
 `core_smoke_results.stage3.ndjson`. These are smoke counts, not a compatibility
 percentage or a claim that whole feature families are closed.
@@ -118,8 +213,9 @@ returns 1 in PostgreSQL but raises InvalidEscapeSequence in the core because ON
 is evaluated before the filtering WHERE clause. The passing JOIN contract uses
 a prefiltered relation and does not count that query as compatible. General
 filter/error ordering and planner constant-fold error timing remain unqualified.
-Stored-expression source ownership in deferred constant validation also needs
-dedicated default/generated-expression audit cases in a subsequent batch.
+Stored-expression source ownership then needed dedicated default/generated
+audits; the later source-ownership and generation-restriction follow-ups above
+address those concrete cases. General planner timing remains open.
 
 ### Follow-up: scalar and row BETWEEN variants
 
@@ -360,7 +456,7 @@ programs. Native PostgreSQL 18.3 accepted all 102 transaction-harness programs;
 `postgres18_oracle.json` with a manifest SHA-256, and generate an allocator-free
 Sig core test executable.
 
-Current core results: **6 smoke passes, 95 failures, 17 unexecuted scopes or
+Current core results: **8 smoke passes, 93 failures, 17 unexecuted scopes or
 comparators**. A smoke pass does not close a full feature family. A core utility
 rejection also does not establish what the server integration implements. The
 suite intentionally exits with an error until the declared scope is qualified.
@@ -372,15 +468,15 @@ administrative features and dialect-specific behaviors need additional contracts
 
 ## Next batches
 
-1. Remaining row membership/quantified forms and general record values need
-   native type, NULL and volatile-operand tests first. Record payload ownership
-   and shape must be defined before exposing record results. Add streamed
-   subquery reducers behind independent result/state tests and explicit workspace
-   accounting; then continue the remaining predicate syntax.
-2. Expand semantic typing/function contracts, then relational composition,
-   windows and grouping; retain independent reference execution and explicit
-   optimizer legality checks.
-3. Schema/dependency/constraint and DML features, including WAL failures and replay.
+1. Close known wrong-result/crash and planner-order cases with failing native
+   differential regressions first; preserve the scoped successes already proved.
+2. Prioritize schema/type/constraint and ordinary-function blockers from the
+   application audit, then complete the remaining relational/window/grouping and
+   row/array predicate forms listed in the current checkpoint. Record payload
+   ownership must be defined before exposing general record results. Streamed
+   subquery reducers need independent state/result and workspace contracts.
+3. Complete schema dependencies and DML, including WAL failure/replay and all
+   newly exposed constraint/concurrency interactions.
 4. Multi-session transaction, locking, security, routine, COPY, catalog and native
    dialect harnesses. Adjudicate every applicable upstream feature before a full
    compatibility claim.

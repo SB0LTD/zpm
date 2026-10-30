@@ -1,6 +1,13 @@
 # SQL conformance inventory and closing plan
 
-Status: incomplete. Baseline `53655a9a89a3ddff6f2f5829388b09a10c3d9c93`; isolated branch `feat/sql-conformance-tdd`. PostgreSQL 18.3 is the first explicit language target; PostgreSQL wire compatibility is a separate contract. MySQL and T-SQL targets require their own versioned native oracles.
+Status: incomplete; refreshed 30 October 2026 after PR consolidation on main
+`2c0ac40afa11177158b1eac5f8e7cb9bce1c72c7` (engine source `0f5af8d`).
+The original TDD baseline was `53655a9a89a3ddff6f2f5829388b09a10c3d9c93`.
+PostgreSQL 18.3 is the frozen positive language oracle for this inventory;
+PostgreSQL wire compatibility is a separate contract. MySQL and T-SQL targets
+require their own versioned native oracles. See the
+[current TDD checkpoint](../../docs/SQL_CONFORMANCE_TDD_STATUS.md) and
+[refresh evidence](consolidation_evidence.json).
 
 ## What this inventory proves
 
@@ -23,7 +30,13 @@ No calendar promise or universal speedup is implied. A release claiming complete
 
 ## Concrete smoke specifications
 
-Current core run: **6 smoke passes, 95 failures, 17 unexecuted scopes/comparators**. These are probes selected to expose gaps, not a percentage of PostgreSQL compatibility. Core-only rejection of a server utility does not prove absence in the server integration layer.
+Current core run: **8 smoke passes, 93 failures, 17 unexecuted scopes/comparators**.
+The broad executable still deliberately exits with SqlConformanceIncomplete.
+The former 6/95/17 result is retained at `core_smoke_results.stage4.ndjson`.
+These probes are not a percentage of PostgreSQL compatibility. Core-only
+rejection of a server utility does not prove absence in the server layer.
+Some probes combine several features: their first failure does not mean every
+component is missing. The annotations below separate those cases.
 
 | ID | Feature | Core smoke status |
 |---|---|---|
@@ -33,10 +46,10 @@ Current core run: **6 smoke passes, 95 failures, 17 unexecuted scopes/comparator
 | PG.PRED.OVERLAPS | Temporal overlaps | Syntax |
 | PG.PRED.REGEX | Regular expressions | Syntax |
 | PG.PRED.ESCAPE | LIKE escape clause | pass; UTF-8 LIKE/ASCII ILIKE contracts, collations and planner closure incomplete |
-| PG.QUERY.WINDOW | Ranking/offset windows | Syntax |
-| PG.QUERY.WINDOW_AGG | Window aggregates | Syntax |
-| PG.QUERY.WINDOW_FRAMES | Named windows and frame exclusions | Syntax |
-| PG.GROUP.ROLLUP | ROLLUP/GROUPING | UndefinedFunction |
+| PG.QUERY.WINDOW | Ranking/offset windows | UndefinedFunction; LAG/LEAD missing, ranking functions implemented |
+| PG.QUERY.WINDOW_AGG | Window aggregates | pass; complete window family remains partial |
+| PG.QUERY.WINDOW_FRAMES | Named windows and frame exclusions | Syntax at named-window form; bounded/excluded frames implemented separately |
+| PG.GROUP.ROLLUP | ROLLUP/GROUPING | pass; flat ROLLUP/GROUPING only, broader grouping remains partial |
 | PG.GROUP.CUBE | CUBE | UndefinedFunction |
 | PG.GROUP.SETS | GROUPING SETS | Syntax |
 | PG.AGG.COLLECTION | String/array aggregates | Syntax |
@@ -102,7 +115,7 @@ Current core run: **6 smoke passes, 95 failures, 17 unexecuted scopes/comparator
 | PG.FUNC.STRING | String functions | Syntax |
 | PG.FUNC.NUMERIC | Numeric functions | UndefinedFunction |
 | PG.FUNC.TEMPORAL | Temporal functions | Syntax |
-| PG.FUNC.FORMAT | Formatting functions | UndefinedFunction |
+| PG.FUNC.FORMAT | Formatting functions | UndefinedFunction for to_date/to_number; temporal to_char implemented separately |
 | PG.FUNC.MINMAX | GREATEST/LEAST | pass; closure incomplete |
 | PG.FUNC.DISCOVERY | Discovery functions | UndefinedFunction |
 | PG.TEXT.COLLATION | Collation selection | Syntax |
@@ -145,6 +158,44 @@ Current core run: **6 smoke passes, 95 failures, 17 unexecuted scopes/comparator
 | TSQL.APPLY | APPLY | UnexecutedScopeOrComparator |
 | TSQL.FUNCTIONS | Native scalar functions | UnexecutedScopeOrComparator |
 | TSQL.PROCEDURAL | Variables/errors/transactions | UnexecutedScopeOrComparator |
+
+## Remaining work after consolidation
+
+| Area | Available slice | Still missing or unqualified |
+| --- | --- | --- |
+| Windows | RANK/DENSE_RANK/ROW_NUMBER, aggregate FILTER, bounded ROWS/GROUPS, integral-key RANGE, exclusions | Named windows; LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE/NTILE/PERCENT_RANK/CUME_DIST; numeric/float/temporal RANGE offsets; volatile moving inputs; correlated window-target subqueries |
+| Grouping | Ordinary aggregates, flat ROLLUP/GROUPING and GROUP BY () | CUBE/general GROUPING SETS, composite/multiple ROLLUP, remaining aggregate families and DISTINCT domains |
+| Formatting/functions | Temporal to_char; GREATEST/LEAST; existing numeric/JSON/sequence/catalog subset | to_date/to_number, numeric/interval/localized/ISO/timezone formatting, ordinary string/math/date/regex/discovery function families and overloads |
+| Schema/types | Existing typed tables, identity/default/stored-generation slices | VARCHAR/CHAR, UUID/BYTEA, TIME/TIMETZ, arrays/general records/user types; SERIAL; conditional DDL; ALTER/TRUNCATE/views/schemas; secondary indexes; table/composite/UNIQUE/CHECK/FK/deferred constraints |
+| Relational queries | Existing joins, scalar subqueries, recursive CTE subset, set operations | LATERAL/NATURAL/parenthesized joins, table functions, modifying/materialized CTE forms, SEARCH/CYCLE, standalone VALUES/TABLE, TABLESAMPLE, expression LIMIT/OFFSET and FETCH WITH TIES |
+| Predicates/DML | Flat row comparison/list membership/BETWEEN, scalar-subquery quantified comparisons, RETURNING and PK upsert | General/nested record values, row subquery/ANY/ALL and array forms, OVERLAPS/regex, UPDATE FROM, DELETE USING, tuple assignment, MERGE and non-PK arbiters |
+| System/dialect scope | Independently tested READ COMMITTED, savepoint, lock, prepared-wire and COPY subsets | Remaining isolation/transaction characteristics/locks, cursors, SQL PREPARE, settings/notifications, roles/RLS, routines/triggers/rules, expanded catalogs, COPY options, replication/extensions/foreign objects and native MySQL/T-SQL semantics |
+
+DISTINCT window aggregates are unsupported by PostgreSQL too; they are not an
+extra PostgreSQL-parity requirement. See [frame scope](../../docs/SQL_WINDOW_FRAMES.md)
+for exact fast paths, scalar fallback and finite caller-workspace budgets.
+
+Known wrong-result/error cases also need TDD closure. The earlier LIKE JOIN/WHERE
+error-order mismatch and general planner constant/error timing remain open.
+PG16 and PG18 themselves disagree on the retained discarded-row projection-error
+probe. The newer RAMSQL hardening audit adds temporal overflow/interval parsing,
+JSONB concatenation, infinite-date subtraction and name-binding divergences;
+the consolidation does not fix those SQLF findings. See the
+[application feature/divergence audit](https://github.com/SB0LTD/ramsql/blob/main/docs/compatibility/FEATURE_GAPS.md)
+and [system gap plan](https://github.com/SB0LTD/ramsql/blob/main/compatibility/GAP_CLOSING_PLAN.md).
+
+The 17 unexecuted cases require scope/comparator work, not a claim of 17 proven
+engine absences. Prepared wire operations and selected session/transaction
+commands already have separate server tests. The 755 upstream standard records
+still need reviewed applicability and mappings, including overloads beyond these
+118 probes. No full language or dialect closure follows from this inventory.
+
+Original dbMeter full/subset correctness is separately 7/7 for all three engines
+in run 41024725859. Its overall advantage gate failed, including stock 200-byte
+text, nine-column and 20-additional-table probes. Those finite profile limits,
+elastic schema/value storage, compact 100M-row base/MVCC storage and intra-query
+parallelism remain system/infrastructure work; this driver's small test buffers
+do not define production capacities. No local throughput was measured here.
 
 ## Running
 

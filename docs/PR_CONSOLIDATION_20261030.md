@@ -5,6 +5,20 @@ Existing worktrees, uncommitted changes, experiment branches and raw evidence
 are preserved. The consolidated source retains original commits and authors.
 Qualification applies to the combined source, not just its individual parents.
 
+Final outcome: all 17 original PRs are accounted for, with nine merged and eight
+closed without merging. ZPM main adopted this integration through PR 81 at
+`2c0ac40afa11177158b1eac5f8e7cb9bce1c72c7`; RAMSQL through PR 36 at
+`ed3f21e0b79b7cbb73003e2fae426262e019067d`. All source/integration PR heads below
+are ancestors of their respective main branches. No open PR remained in the
+three repositories at completion of this consolidation.
+
+Combined qualification: database matrix 41114412805 passes all three hosted OS
+jobs; RAMSQL CI 41114733707 / release 41114733789 pass all 32 active checks,
+including exact artifacts, all four PostgreSQL cells and native SB0X/SB0K.
+The broad legacy graph 41114412832 retains its four unchanged unrelated failures
+(300 successful / 22 skipped steps). The refreshed broad SQL audit remains red:
+8 smoke passes, 93 failures and 17 unexecuted scopes/comparators.
+
 ## ZPM changes selected for main
 
 | PR | Change | Consolidation |
@@ -20,8 +34,8 @@ Only the build registration conflicted when combining DISTINCT with reporting;
 both sets of contracts are retained. RAMSQL integrates the verified immutable
 combined archive, enables the already isolated DISTINCT candidate, adopts its
 SRV-01 explicit-create branch and preserves PR 30's complete benchmark evidence.
-Fresh source/platform, server PG16/PG18 and native SB0 qualification remain the
-adoption gates for this consolidation.
+The combined source/platform, server PG16/PG18 and native SB0 adoption gates
+passed as recorded above.
 
 The earlier DISTINCT comparison used unchanged dbMeter scenarios, a same-library
 control and candidate, and AB/BA/AB order in CI run 40994795421. Its subset mixed
@@ -58,7 +72,9 @@ exactly regenerates all three live summaries and the final failed gate.
 
 The original SQL TDD inventory is `docs/SQL_CONFORMANCE_TDD_STATUS.md` with
 `tests/sql_conformance/README.md`, `cases.json` and the upstream feature list.
-Refresh its broad audit after this consolidation; do not infer complete language,
+Its broad audit is refreshed in
+[consolidation_evidence.json](../tests/sql_conformance/consolidation_evidence.json);
+do not infer complete language,
 allocator-free 100M-row storage, native durability or production qualification
 from these finite improvements. RAMSQL's wider gap plan remains authoritative
 for system/operational gaps.

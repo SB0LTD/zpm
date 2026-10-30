@@ -1,0 +1,87 @@
+{
+  "schema": 1,
+  "date": "2026-10-30",
+  "source_revision": "2c0ac40afa11177158b1eac5f8e7cb9bce1c72c7",
+  "source_tree": "1765a55941c22606bcbad98acd3bb7648aaac5c9",
+  "compiled_source_revision": "0f5af8da5f4ca6f25576c1615ff2ef28bf96ca41",
+  "tree_identity_verified": true,
+  "compiler": "Sig 0.6.4 (zig 0.17.0)",
+  "optimization": "ReleaseSafe",
+  "host": "Windows x86_64",
+  "scope": "118 core smoke programs against unchanged frozen PostgreSQL 18.3 positive oracle; not full family/system/dialect closure",
+  "counts": {
+    "pass": 8,
+    "fail": 93,
+    "unexecuted": 17
+  },
+  "expected_exit_code": 1,
+  "error": "SqlConformanceIncomplete",
+  "result_sha256": "5aa8164166bd998a70b162f4631a37242a10124279931ef6e972889dc1fea19b",
+  "source_hash_encoding": "UTF-8 with LF",
+  "source_sha256": {
+    "src/core/sql.sig": "feb64fdf9e7084c2eeaeac47de2152240526e13ac486803b3ec2ecf2a71ccd61",
+    "src/core/sql/alpha.sig": "ab1dea07858b623e116c29cd6e87d350d2b3719ee07f47c72492136a1e28005e",
+    "src/core/sql/ast.sig": "d1dff777d188bb7541991321c28e6e1ae789b18234d2d9157de556c001cb445a",
+    "src/core/sql/binder.sig": "001a97a5f683bf6fa2e19a776fbbc7e26e7967c7f96257e0eeb2f95e988a1d82",
+    "src/core/sql/catalog.sig": "34f4fcaa5b6be43669af025eaf7ff4d400e694288556b351f8bd5d17f54fac79",
+    "src/core/sql/change_log.sig": "bf78302e4fbeb4c283656d5e5adf3a562a311bcee272bd3f2631d44408b4af8b",
+    "src/core/sql/datetime_format.sig": "d4aee0da7313b861b73e382373b88c5b9ba8281a78a8ddeab04d890791316ee0",
+    "src/core/sql/deparse.sig": "6f90b6fd628bb2f86960d14d3e8cc812b82aca2ca1687278384aef1fb2e08b46",
+    "src/core/sql/dml.sig": "d9ba8ad47e9d9fbd6ef30b9836997b78ce602b7603b613c6dd7ea44b96fad311",
+    "src/core/sql/exec.sig": "50ad5959c540cf1add2a8b1f1863de258edf8d627a43a78b2c72845674dc20c3",
+    "src/core/sql/expr.sig": "5a519f1c1e011ee3689f3db76202f642418f964afe7c2e835d91627c2d2c288d",
+    "src/core/sql/float_text.sig": "b1134d049c22591520dbd6b841c7c428ab6ce2d8387fdeb46fe44d1e1bbb7402",
+    "src/core/sql/jsonb.sig": "33a0a8493dae230c1463f34177c6f2d6fb972c192b40b516b4c7c9d1b36bdbbd",
+    "src/core/sql/lexer.sig": "1f665520d52e49c44050823de214cbd9857cd0e48b382c701e4229fd558e08d0",
+    "src/core/sql/locks.sig": "a99ae2abc99c6d8271ffcfc634cc0600d89b8df0fa7bd481d2f36457037dae2a",
+    "src/core/sql/mvcc.sig": "5e453025fa44d0ab22729a614d05998b5da8abad4b72b71c1a21da31e493aff1",
+    "src/core/sql/numeric.sig": "875cd7c813fa05922439de3e7f22c2a0512944a1547c5cdf06987ee7e6cdc434",
+    "src/core/sql/parser.sig": "d759f62ada4aa938e75e4e189c52420f599042011afae742be65fcf76d7bd2a8",
+    "src/core/sql/sequence.sig": "884e8c5fc0502681affdf996508870a86b8e6a914ed113f29c37a9168c21b031",
+    "src/core/sql/sort.sig": "c3ed8c8f76ee6ac5d3c5151c82392bc611c075a2edda8d6e5b72bcf74eac9668",
+    "src/core/sql/storage.sig": "f37f77bd0bfc96b240e34ea6c6e06df3b4ccc21f87e1d8772e60b77e55154c61",
+    "src/core/sql/temporal.sig": "8e0f384dc6b2f6642d5b58f6e7848e280f91f9c69a9e47d9a1f760fd3c44348c",
+    "src/core/sql/types.sig": "393077d890f25fd21e291b6190684ec283b48030d1f6af3cc189c6a93eb6d915",
+    "src/core/sql/tzif.sig": "f34b74fd4446cfb4b381235beb2ecfe349c02345209b65feb06f4afcc736b0fd",
+    "src/core/sql/value.sig": "268296fd3207cdb693938bd19b258c6e369c8d863ca03110769e2e53ed3d69d6",
+    "tests/sql_conformance/cases.json": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c",
+    "tests/sql_conformance/postgres18_oracle.json": "dcf2ef99e025d694cffc06c3e07f3b164d20e58f5103becef279335afb246120",
+    "tests/sql_conformance/generate_contracts.py": "0952c368240d51046b899717ff1ca45476758ede29c160a6ab80bc62771c7cf5"
+  },
+  "consolidated_zpm_prs": [
+    77,
+    81,
+    82,
+    83,
+    84,
+    85
+  ],
+  "qualification": {
+    "zpm_database_matrix": 41114412805,
+    "zpm_legacy_graph": 41114412832,
+    "legacy_graph_counts": {
+      "succeeded": 300,
+      "failed_unrelated": 4,
+      "skipped": 22
+    },
+    "ramsql_ci": 41114733707,
+    "ramsql_release": 41114733789
+  },
+  "changes": [
+    {
+      "id": "PG.QUERY.WINDOW",
+      "before": "Syntax",
+      "after": "UndefinedFunction: LAG/LEAD remain missing"
+    },
+    {
+      "id": "PG.QUERY.WINDOW_AGG",
+      "before": "Syntax",
+      "after": "core_smoke_pass"
+    },
+    {
+      "id": "PG.GROUP.ROLLUP",
+      "before": "UndefinedFunction",
+      "after": "core_smoke_pass"
+    }
+  ]
+}
