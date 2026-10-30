@@ -1,0 +1,2 @@
+PASS dimension DISTINCT: 1454 assertions, scalar/canonical, shared-label membership, snapshots and failure atomicity
+PASS dimension group IDs: 9429 assertions, scalar/canonical, visibility, replay and failure atomicity
