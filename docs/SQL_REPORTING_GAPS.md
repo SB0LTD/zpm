@@ -68,9 +68,41 @@ pending. FILTER/DISTINCT window aggregates, bounded/moving frames, explicit
 RANGE/GROUPS, named windows and correlated subqueries in the same window target
 projection remain unsupported. This is not complete PostgreSQL window coverage.
 
+## ROLLUP and GROUPING (Q06 candidate)
+
+A flat `GROUP BY ROLLUP(k1, ..., kn)` creates each prefix and the grand total.
+`GROUP BY ()` provides an empty grouping set; `ROLLUP()` remains a syntax error,
+as in PostgreSQL. GROUPING arguments must match bound grouping expressions; the
+rightmost argument supplies the low mask bit. Real NULL key groups remain
+separate from rolled NULLs through an internal level tag. Empty input produces
+only the grand-total row; HAVING is evaluated separately at every level.
+
+Evaluate keys, aggregate filters and arguments once per admitted input, then
+update independent prefix states. COUNT/SUM/AVG reuse the existing checked and
+exact numeric transitions; averages never average already-finalized averages.
+Direct integral COUNT(DISTINCT) uses independent exact membership per prefix,
+so counts are not incorrectly added across subgroups. No base-table summary or
+query-answer shortcut substitutes for the rows. Unique-key inner chains stream;
+other joins use the existing bounded tuple operator. All group/hash/sort and
+membership state borrows the caller's arena, with explicit capacity errors and
+work/cancellation accounting. Final errors leave the published result untouched.
+
+The candidate matches 31 PostgreSQL fixtures plus visibility, volatile-input,
+poisoned-scratch, capacity, invalid-grouping and checkpoint sweeps: 19,426
+assertions (19,443 with the explicit computed-DISTINCT rejection). It also preserves the prior 6,409-assertion committed group-synopsis
+contract; that pre-existing synopsis is a separate mechanism, not SQL ROLLUP.
+Snapshot/private-write tests observe the appropriate versions, and volatile
+aggregate arguments execute once per input rather than once per rollup level.
+Grouped windows can consume GROUPING masks and subtotal states after HAVING.
+
+Multiple/composite ROLLUP elements, CUBE/general GROUPING SETS, and nonintegral
+or computed DISTINCT membership remain unimplemented. Wide integral domains may
+exceed the admitted bitmap/query budget. Native/platform/server differential
+qualification and the unchanged original 5M dbMeter checks are still required.
+
 ## Remaining Q06 work
 
-ROLLUP and the unsupported window forms still require implementation and
+The unsupported window/grouping forms still require implementation and
 qualification. Do not rewrite the reviewer's SQL or expected results to avoid
 these operators. Preserve peer ties, NULL ordering, empty input, exact numeric
 types, HAVING-before-window and LIMIT-after-window semantics. Rollup levels must

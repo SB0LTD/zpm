@@ -264,6 +264,7 @@ pub fn Eval(comptime config: types.Config) type {
             pool: *const Ast.Pool,
             /// Single-table row (simple SELECT and DML): relation 0.
             row: ?*const Row = null,
+            grouping_mask:u64=0,
             session: *const Session = &value_module.default_session,
             /// General engine: one row per FROM item plus the grouped row
             /// (ast.groupRelation); null is a NULL-extended row.
@@ -839,6 +840,14 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.atZone(&value, zone.text.slice(), ctx.session);
                 },
                 .function => switch (n.func) {
+                    .grouping => {
+                        var value:i64=0;var item=n.b;
+                        while(item!=none):(item=node(ctx,item).next) {
+                            const shift:u6=@intCast(n.integer-1-node(ctx,item).integer);
+                            value=value*2+@as(i64,@intCast((ctx.grouping_mask>>shift)&1));
+                        }
+                        return .{.integer=value};
+                    },
                     .window_call => unreachable,
                     .greatest, .least => {
                         var best: V.Cell = .null_value;

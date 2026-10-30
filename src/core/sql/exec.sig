@@ -617,11 +617,14 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn projectGroup(self: *Query, p: *const B.Plan, at: u32, states: []const Accumulator, outer: ?*const E.Context, out: *List) Error!void {
+                return self.projectGroupMask(p,at,states,outer,out,0);
+            }
+            fn projectGroupMask(self:*Query,p:*const B.Plan,at:u32,states:[]const Accumulator,outer:?*const E.Context,out:*List,mask:u64) Error!void {
                 for (p.aggs[0..p.agg_count], states, 0..) |*agg, *acc, index| {
                     self.work.cells[at + p.key_count + index] = try self.finishAggregate(agg, acc);
                 }
                 var ctx = self.context(outer);
-                ctx.tuple[group_relation] = self.row(at);
+                ctx.tuple[group_relation] = self.row(at);ctx.grouping_mask=mask;
                 if (try keep(&ctx, p.having, null)) try self.projectRow(p, &ctx, out);
             }
 
@@ -2323,6 +2326,105 @@ pub fn Exec(comptime config: types.Config) type {
                 return list;
             }
 
+            fn rollupRecord(self:*Query,p:*const B.Plan,keys:[]const V.Cell,prefix:usize,buckets:u32,slots:usize,
+                tickets:u32,groups:*usize,capacity:usize,record_cells:usize,ordinary_cells:usize,distinct:*const DistinctLayout) Error!u32 {
+                var code:usize=2166136261^prefix;const null_value:V.Cell=.null_value;
+                for(keys,0..) |*key,column| {
+                    const value=if(column<prefix) key else &null_value;
+                    const hash:usize=if(value.*==.null_value) 0x9e3779b9 else V.hash(value);
+                    code=(code^hash)*%16777619;
+                }
+                var bucket=code&(slots-1);
+                while(true) {
+                    try self.session.checkpoint();self.work.stream_stats.probes+=1;
+                    const found=self.work.refs[buckets+bucket];
+                    if(found==absent) {
+                        if(groups.*==capacity) return error.WorkspaceCapacity;
+                        const at=try self.cells(record_cells);
+                        for(keys,0..) |key,column| self.work.cells[at+column]=if(column<prefix) key else .null_value;
+                        self.work.cells[at+p.key_count+p.agg_count]=.{.integer=@intCast(prefix)};
+                        for(self.accumulators(at+@as(u32,@intCast(p.key_count+p.agg_count+1)),p.agg_count)) |*state| state.*=.{};
+                        if(distinct.active) {
+                            @memset(self.distinctWords(at+@as(u32,@intCast(ordinary_cells)),distinct.words),0);
+                            self.work.stream_stats.distinct_bitmap_bytes+=distinct.words*8;
+                        }
+                        self.work.refs[buckets+bucket]=at;self.work.refs[tickets+groups.*]=at;groups.*+=1;return at;
+                    }
+                    var equal=self.work.cells[found+p.key_count+p.agg_count].integer==@as(i64,@intCast(prefix));
+                    if(equal) for(keys[0..prefix],0..) |*key,column| if(V.compare(key,&self.work.cells[found+column])!=0) {equal=false;break;};
+                    if(equal) return found;bucket=(bucket+1)&(slots-1);
+                }
+            }
+
+            /// One input evaluation, independent exact aggregate state at every
+            /// prefix. The level tag separates real NULL keys from rolled NULLs.
+            fn groupingRollup(self:*Query,p:*const B.Plan,outer:?*const E.Context) Error!List {
+                var scan_plan=p.*;scan_plan.limit=0xffffffffffffffff;scan_plan.offset=0;
+                const streamed=streamEligible(&scan_plan);
+                var tuples:Tuples=undefined;if(!streamed) tuples=try self.join(p,outer);
+                for(p.aggs[0..p.agg_count]) |agg| if(agg.distinct) {
+                    if(agg.kind!=.count or !value_module.integral(agg.arg_ty)) return error.UnsupportedStatement;
+                    const argument=self.pool.nodes[agg.arg];
+                    if(argument.kind!=.column or argument.level!=0 or argument.relation>=p.source_count or p.sources[argument.relation].table==null) return error.UnsupportedStatement;
+                };
+                const distinct=self.distinctLayout(p) orelse return error.WorkspaceCapacity;
+                const ordinary_cells=p.key_count+p.agg_count+1+accumulatorCells(p.agg_count);
+                const record_sum=@addWithOverflow(ordinary_cells,distinct.cells);if(record_sum[1]!=0) return error.WorkspaceCapacity;
+                const record_cells=record_sum[0];
+                const capacity=@min((self.work.cell_high-self.work.cell_low)/(record_cells+p.width),(self.work.ref_high-self.work.ref_low)/8);
+                if(capacity==0) return error.WorkspaceCapacity;
+                var slots:usize=2;while(slots<capacity*2) slots*=2;
+                const buckets=try self.refs(slots);@memset(self.work.refs[buckets..][0..slots],absent);
+                const tickets=try self.refs(capacity);var groups:usize=0;
+                var keys:[config.columns]V.Cell=@splat(.null_value);
+                _=try self.rollupRecord(p,keys[0..p.key_count],0,buckets,slots,tickets,&groups,capacity,record_cells,ordinary_cells,&distinct);
+                var ctx=self.context(outer);var cursor:StreamCursor=.{};var row_index:usize=0;
+                const early=streamed and p.source_count>1 and self.earlyAvailable(p.where,p.source_count-1) and self.prefixJoinsSafe(p);
+                if(streamed) self.prepareStreamCursor(p,&cursor,early);
+                while(true) {
+                    if(streamed) {if(!try self.nextStreamTuple(p,&ctx,&cursor,early)) break;}
+                    else {if(row_index==tuples.count) break;try self.session.checkpoint();self.setTuple(p,&ctx,tuples,row_index);row_index+=1;}
+                    for(p.keys[0..p.key_count],0..) |id,index| keys[index]=try E.eval(&ctx,id);
+                    var values:[config.columns]V.Cell=undefined;var allowed:[config.columns]bool=@splat(false);
+                    for(p.aggs[0..p.agg_count],0..) |agg,index| {
+                        if(agg.filter!=none and try E.truth(&ctx,agg.filter)!=true) continue;
+                        if(agg.kind==.count_star){allowed[index]=true;continue;}
+                        values[index]=try E.eval(&ctx,agg.arg);allowed[index]=values[index]!=.null_value;
+                    }
+                    for(0..p.key_count+1) |prefix| {
+                        const at=try self.rollupRecord(p,keys[0..p.key_count],prefix,buckets,slots,tickets,&groups,capacity,record_cells,ordinary_cells,&distinct);
+                        const states=self.accumulators(at+@as(u32,@intCast(p.key_count+p.agg_count+1)),p.agg_count);
+                        const seen=self.distinctWords(at+@as(u32,@intCast(ordinary_cells)),distinct.words);
+                        for(p.aggs[0..p.agg_count],states,0..) |agg,*state,index| {
+                            try self.session.checkpoint();if(!allowed[index]) continue;
+                            if(agg.kind==.count_star){state.count+=1;continue;}
+                            if(agg.distinct) {
+                                const domain=distinct.domains[index];const relative=@as(i128,values[index].integer)-domain.base;
+                                if(relative<0 or relative>=domain.span) return error.WorkspaceCapacity;
+                                const position:usize=@intCast(relative);const bit=@as(u64,1)<<@as(u6,@intCast(position%64));
+                                const word=&seen[domain.offset+position/64];if(word.*&bit!=0) continue;word.*|=bit;
+                            }
+                            try self.accumulate(&agg,state,&values[index]);
+                        }
+                    }
+                }
+                if(groups>1) {
+                    const scratch=try self.refs(groups);const sorter:GroupSorter=.{.query=self,.width=p.key_count};
+                    _=try sort_module.mergeSort(self.work.refs[tickets..][0..groups],self.work.refs[scratch..][0..groups],&sorter);
+                }
+                var out:List=.{};
+                for(self.work.refs[tickets..][0..groups]) |at| {
+                    const prefix:usize=@intCast(self.work.cells[at+p.key_count+p.agg_count].integer);
+                    const omitted=p.key_count-prefix;
+                    const mask:u64=if(omitted==64) ~@as(u64,0) else (@as(u64,1)<<@as(u6,@intCast(omitted)))-1;
+                    try self.projectGroupMask(p,at,self.accumulators(at+@as(u32,@intCast(p.key_count+p.agg_count+1)),p.agg_count),outer,&out,mask);
+                }
+                self.work.stream_stats.groups+=groups;
+                self.work.stream_stats.scratch_cells=@max(self.work.stream_stats.scratch_cells,groups*record_cells);
+                self.work.stream_stats.scratch_refs=@max(self.work.stream_stats.scratch_refs,slots+capacity+groups);
+                return self.finish(p,out);
+            }
+
             fn windowAccumulate(self:*Query,win:*const B.Window,acc:*Accumulator,at:u32) Error!void {
                 try self.session.checkpoint();
                 if(win.aggregate.kind==.count_star) {acc.count+=1;return;}
@@ -2382,6 +2484,7 @@ pub fn Exec(comptime config: types.Config) type {
 
             fn core(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
                 if(p.window_count!=0) return self.windowCore(p,outer);
+                if(p.rollup) return self.groupingRollup(p,outer);
                 if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(self.repeatable()) {
                     const at=self.mark();const stats=self.work.stream_stats;
                     if(self.nestedFactorGroup(p,outer)) |result| {if(result) |rows| return rows;} else |err| {

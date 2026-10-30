@@ -234,6 +234,7 @@ pub fn Binder(comptime config: types.Config) type {
             source_count: usize = 0,
             where: u16 = none,
             grouped: bool = false,
+            rollup:bool=false,
             keys: [config.columns]u16 = undefined,
             key_count: usize = 0,
             aggs: [config.columns]Agg = undefined,
@@ -580,6 +581,7 @@ pub fn Binder(comptime config: types.Config) type {
             const table = [_]struct { name: []const u8, func: ast.Func }{
                 .{ .name = "now", .func = .now },
                 .{ .name = "to_char", .func = .to_char },
+                .{ .name = "grouping", .func = .grouping },
                 .{ .name = "round", .func = .round },
                 .{ .name = "transaction_timestamp", .func = .transaction_timestamp },
                 .{ .name = "statement_timestamp", .func = .statement_timestamp },
@@ -738,6 +740,12 @@ pub fn Binder(comptime config: types.Config) type {
                 count += 1;
             }
             switch (n.func) {
+                .grouping => {
+                    if(!scope.aggregates) return error.GroupingError;
+                    if(count==0 or count>31) return error.InvalidParameterValue;
+                    n.ty=.int4;n.constant=false;
+                    if(scope.saw_aggregate) |flag| flag.*=true;
+                },
                 .window_call => unreachable,
                 .none => return error.UndefinedFunction,
                 .greatest, .least => {
@@ -2580,6 +2588,17 @@ pub fn Binder(comptime config: types.Config) type {
         fn groupify(context: *const Context, p: *Plan, id: u16) Error!void {
             if (id == none) return;
             const n = context.node(id);
+            if(n.kind==.function and n.func==.grouping) {
+                var item=n.b;
+                while(item!=none):(item=context.node(item).next) {
+                    var found:?usize=null;
+                    for(p.keys[0..p.key_count],0..) |key,index| if(sameExpr(context,item,key)){found=index;break;};
+                    const index=found orelse return error.GroupingError;
+                    const arg=context.node(item);const next=arg.next;
+                    arg.*=.{.kind=.int_literal,.integer=@intCast(index),.ty=.int4,.constant=true,.next=next};
+                }
+                n.integer=@intCast(p.key_count);return;
+            }
             if(n.window!=none) {
                 const spec=&context.pool.windows[n.window];
                 for(spec.partition[0..spec.partition_count]) |item| try groupify(context,p,item);
@@ -2803,7 +2822,8 @@ pub fn Binder(comptime config: types.Config) type {
             for (q.order[0..q.order_count], 0..) |*key, index| order_refs[index] = try orderRef(context, &scope, p, key.expr);
             var on_refs: [config.columns]OrderRef = undefined;
             for (q.distinct_on[0..q.distinct_on_count], 0..) |expr_id, index| on_refs[index] = try orderRef(context, &scope, p, expr_id);
-            p.grouped = p.key_count != 0 or saw or p.having != none;
+            p.rollup=q.rollup;
+            p.grouped = q.rollup or p.key_count != 0 or saw or p.having != none;
             if (p.grouped) {
                 for (p.targets[0..p.count]) |target| try groupify(context, p, target);
                 try groupify(context, p, p.having);
@@ -2880,6 +2900,10 @@ pub fn Binder(comptime config: types.Config) type {
         }
         fn lowerWindowTree(context:*const Context,p:*Plan,input:*Plan,id:u16) Error!void {
             if(id==none) return;const n=context.node(id);
+            if(n.kind==.function and n.func==.grouping) {
+                const column=try windowInput(context,input,id);const ty=n.ty;const next=n.next;
+                n.*=.{.kind=.column,.relation=0,.column=column,.ty=ty,.next=next};return;
+            }
             if(n.window!=none) {
                 if(p.window_count==config.columns) return error.StatementTooComplex;
                 const spec=&context.pool.windows[n.window];
@@ -2924,7 +2948,7 @@ pub fn Binder(comptime config: types.Config) type {
                 win.result=@intCast(input.count+index);context.node(win.output_node).column=win.result;
                 input.targets[win.result]=try context.pool.add(.{.kind=.null_literal,.ty=.unknown,.constant=true});
             }
-            p.source_count=1;p.sources[0]=.{.plan=child};p.where=none;p.grouped=false;p.key_count=0;p.agg_count=0;p.having=none;
+            p.source_count=1;p.sources[0]=.{.plan=child};p.where=none;p.grouped=false;p.rollup=false;p.key_count=0;p.agg_count=0;p.having=none;
         }
 
         fn member(list: []const u16, column: u16) bool {

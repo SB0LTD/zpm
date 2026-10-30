@@ -40,14 +40,14 @@ pub const TypeName = types.Type;
 pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists, is_distinct, is_not_distinct };
 
 /// Built-in functions bound by name.
-pub const Func = enum { none, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, greatest, least };
+pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, greatest, least };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
 /// clock or subquery in a pure function never makes its effects repeatable.
 pub fn canRepeatFunction(func: Func) bool {
     return switch (func) {
-        .window_call, .to_char, .round, .greatest, .least => true,
+        .grouping, .window_call, .to_char, .round, .greatest, .least => true,
         else => false,
     };
 }
@@ -373,6 +373,7 @@ pub fn Ast(comptime config: types.Config) type {
             distinct_on_count: usize = 0,
             group: [config.columns]u16 = undefined,
             group_count: usize = 0,
+            rollup:bool=false,
             having: u16 = none,
             order: [config.columns]OrderKey = undefined,
             order_count: usize = 0,

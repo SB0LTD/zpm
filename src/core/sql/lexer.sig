@@ -28,7 +28,7 @@ pub const Kind = enum { end, word, quoted_word, string, integer, decimal, parame
 /// never keywords).
 pub const Keyword = enum {
     none,
-    over, partition, current, preceding, following, unbounded, range, groups,
+    rollup, over, partition, current, preceding, following, unbounded, range, groups,
     abort,
     all,
     @"and",

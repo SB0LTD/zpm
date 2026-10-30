@@ -1100,11 +1100,21 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and try self.takeWord("GROUP")) {
                 try self.expectWord("BY");
                 self.pool.complex = true;
-                while (true) {
-                    if (out.group_count == config.columns) return error.ColumnCapacity;
-                    out.group[out.group_count] = try self.expression();
-                    out.group_count += 1;
-                    if (!try self.takeSymbol(.comma)) break;
+                var empty=false;
+                if(self.isSymbol(.lparen)) {
+                    const next=try self.peek();
+                    if(next.kind==.symbol and next.symbol==.rparen) {try self.advance();try self.advance();empty=true;out.rollup=true;}
+                }
+                if(!empty) {
+                    out.rollup=try self.takeWord("ROLLUP");
+                    if(out.rollup){try self.expectSymbol(.lparen);if(self.isSymbol(.rparen)) return error.Syntax;}
+                    while (true) {
+                        if (out.group_count == config.columns) return error.ColumnCapacity;
+                        out.group[out.group_count] = try self.expression();
+                        out.group_count += 1;
+                        if (!try self.takeSymbol(.comma)) break;
+                    }
+                    if(out.rollup) try self.expectSymbol(.rparen);
                 }
             }
             if (self.mode == .standard and try self.takeWord("HAVING")) {
