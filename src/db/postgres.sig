@@ -1473,6 +1473,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "WorkspaceCapacity")) return "54000";
     if (equal(name, "QueryWorkLimit")) return "54000";
     if (equal(name, "GroupingError")) return "42803";
+    if (equal(name, "WindowingError")) return "42P20";
     if (equal(name, "AmbiguousColumn")) return "42702";
     if (equal(name, "CardinalityViolation")) return "21000";
     if (equal(name, "InvalidRowCountInLimit")) return "2201W";

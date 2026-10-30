@@ -1,0 +1,7 @@
+{
+  "reference": "PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+  "session_timezone": "UTC",
+  "cases": 252,
+  "sha256": "9f84f8228536c0744556d9b17b0af960e14818d026f0ac9eec3658cd5a735ece",
+  "purpose": "correctness fixture; no timings"
+}

@@ -40,14 +40,14 @@ pub const TypeName = types.Type;
 pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists, is_distinct, is_not_distinct };
 
 /// Built-in functions bound by name.
-pub const Func = enum { none, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, greatest, least };
+pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, greatest, least };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
 /// clock or subquery in a pure function never makes its effects repeatable.
 pub fn canRepeatFunction(func: Func) bool {
     return switch (func) {
-        .round, .greatest, .least => true,
+        .grouping, .window_call, .to_char, .round, .greatest, .least => true,
         else => false,
     };
 }
@@ -63,7 +63,7 @@ pub fn immutableFunction(func: Func) bool {
 
 pub fn strictFunction(func: Func) bool {
     return switch (func) {
-        .round, .jsonb_typeof, .jsonb_array_length,
+        .to_char, .round, .jsonb_typeof, .jsonb_array_length,
         .nextval, .currval, .setval, .lastval, .identity_next,
         .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp,
         .current_timestamp, .current_date, .current_database, .current_schema,
@@ -150,6 +150,8 @@ pub const NodeKind = enum {
 /// ELSE `c`; when_arm condition `a`, result `b`; coalesce/function args `b`
 /// -> next. row_constructor/row_compare/row_in own a `b` -> next list.
 pub const Node = struct {
+    /// OVER specification in the statement's caller-owned window pool.
+    window: u16 = none,
     kind: NodeKind = .null_literal,
     op: Op = .add,
     test_kind: Test = .is_null,
@@ -193,6 +195,8 @@ pub const Node = struct {
 pub fn Ast(comptime config: types.Config) type {
     return struct {
         pub const Pool = struct {
+            windows:[config.columns*config.subqueries]Window=undefined,
+            window_len:usize=0,
             nodes: [config.expr_nodes]Node = undefined,
             len: usize = 0,
             /// Query blocks of the statement (top query, subqueries, CTE
@@ -206,6 +210,7 @@ pub fn Ast(comptime config: types.Config) type {
             discarded_row_constants: bool = false,
 
             pub fn reset(self: *Pool) void {
+                self.window_len=0;
                 self.len = 0;
                 self.query_len = 0;
                 self.complex = false;
@@ -317,6 +322,14 @@ pub fn Ast(comptime config: types.Config) type {
             nulls_first: ?bool = null,
         };
 
+        pub const WindowKind=enum {aggregate,rank,dense_rank,row_number};
+        pub const Frame=enum {default,rows_prefix,full};
+        pub const Window=struct {
+            partition:[config.columns]u16=undefined,partition_count:usize=0,
+            order:[config.columns]OrderKey=undefined,order_count:usize=0,
+            frame:Frame=.default,
+        };
+
         pub const TableRef = struct {
             schema: ?Ident = null,
             name: Ident = .{},
@@ -360,6 +373,7 @@ pub fn Ast(comptime config: types.Config) type {
             distinct_on_count: usize = 0,
             group: [config.columns]u16 = undefined,
             group_count: usize = 0,
+            rollup:bool=false,
             having: u16 = none,
             order: [config.columns]OrderKey = undefined,
             order_count: usize = 0,

@@ -12,6 +12,7 @@ const lexer = @import("lexer.sig");
 const ast = @import("ast.sig");
 const value_module = @import("value.sig");
 const temporal = @import("temporal.sig");
+const datetime_format = @import("datetime_format.sig");
 const float_text = @import("float_text.sig");
 const Error = types.Error;
 const none = ast.none;
@@ -263,6 +264,7 @@ pub fn Eval(comptime config: types.Config) type {
             pool: *const Ast.Pool,
             /// Single-table row (simple SELECT and DML): relation 0.
             row: ?*const Row = null,
+            grouping_mask:u64=0,
             session: *const Session = &value_module.default_session,
             /// General engine: one row per FROM item plus the grouped row
             /// (ast.groupRelation); null is a NULL-extended row.
@@ -838,6 +840,15 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.atZone(&value, zone.text.slice(), ctx.session);
                 },
                 .function => switch (n.func) {
+                    .grouping => {
+                        var value:i64=0;var item=n.b;
+                        while(item!=none):(item=node(ctx,item).next) {
+                            const shift:u6=@intCast(n.integer-1-node(ctx,item).integer);
+                            value=value*2+@as(i64,@intCast((ctx.grouping_mask>>shift)&1));
+                        }
+                        return .{.integer=value};
+                    },
+                    .window_call => unreachable,
                     .greatest, .least => {
                         var best: V.Cell = .null_value;
                         var item = n.b;
@@ -849,6 +860,16 @@ pub fn Eval(comptime config: types.Config) type {
                             if ((n.func == .greatest and order > 0) or (n.func == .least and order < 0)) best = candidate;
                         }
                         return best;
+                    },
+                    .to_char => {
+                        const argument=try eval(ctx,n.b);const format=try eval(ctx,node(ctx,n.b).next);
+                        if(argument==.null_value or format==.null_value or format.text.len==0) return .null_value;
+                        const us=if(argument==.timestamp) argument.timestamp else argument.timestamptz;
+                        if(!temporal.finiteTimestamp(us)) return .null_value;
+                        const local=if(argument==.timestamptz) temporal.toLocal(&ctx.session.zone,us) else us;
+                        var text:V.Text=.{};
+                        text.len=try datetime_format.format(local,format.text.slice(),&text.bytes);
+                        return .{.text=text};
                     },
                     .round => {
                         const argument = try eval(ctx, n.b);

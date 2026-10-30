@@ -1100,11 +1100,21 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and try self.takeWord("GROUP")) {
                 try self.expectWord("BY");
                 self.pool.complex = true;
-                while (true) {
-                    if (out.group_count == config.columns) return error.ColumnCapacity;
-                    out.group[out.group_count] = try self.expression();
-                    out.group_count += 1;
-                    if (!try self.takeSymbol(.comma)) break;
+                var empty=false;
+                if(self.isSymbol(.lparen)) {
+                    const next=try self.peek();
+                    if(next.kind==.symbol and next.symbol==.rparen) {try self.advance();try self.advance();empty=true;out.rollup=true;}
+                }
+                if(!empty) {
+                    out.rollup=try self.takeWord("ROLLUP");
+                    if(out.rollup){try self.expectSymbol(.lparen);if(self.isSymbol(.rparen)) return error.Syntax;}
+                    while (true) {
+                        if (out.group_count == config.columns) return error.ColumnCapacity;
+                        out.group[out.group_count] = try self.expression();
+                        out.group_count += 1;
+                        if (!try self.takeSymbol(.comma)) break;
+                    }
+                    if(out.rollup) try self.expectSymbol(.rparen);
                 }
             }
             if (self.mode == .standard and try self.takeWord("HAVING")) {
@@ -1587,6 +1597,49 @@ pub fn Parser(comptime config: types.Config) type {
                 try self.expectSymbol(.rparen);
                 self.pool.nodes[node].c = filter;
                 try self.pool.raise(node, filter);
+            }
+            if(self.mode==.standard and try self.takeWord("OVER")) {
+                self.pool.complex=true;
+                if(self.pool.window_len==self.pool.windows.len) return error.StatementTooComplex;
+                const index=self.pool.window_len;self.pool.window_len+=1;
+                self.pool.windows[index]=.{};self.pool.nodes[node].window=@intCast(index);
+                try self.expectSymbol(.lparen);
+                const spec=&self.pool.windows[index];
+                if(try self.takeWord("PARTITION")) {
+                    try self.expectWord("BY");
+                    while(true) {
+                        if(spec.partition_count==config.columns) return error.ColumnCapacity;
+                        const item=try self.expression();try self.pool.raise(node,item);
+                        spec.partition[spec.partition_count]=item;spec.partition_count+=1;
+                        if(!try self.takeSymbol(.comma)) break;
+                    }
+                }
+                if(try self.takeWord("ORDER")) {
+                    try self.expectWord("BY");
+                    while(true) {
+                        if(spec.order_count==config.columns) return error.ColumnCapacity;
+                        const item=try self.expression();try self.pool.raise(node,item);
+                        var key:Ast.OrderKey=.{.expr=item};
+                        if(try self.takeWord("DESC")) key.descending=true else _=try self.takeWord("ASC");
+                        if(try self.takeWord("NULLS")) {
+                            if(try self.takeWord("FIRST")) key.nulls_first=true else {try self.expectWord("LAST");key.nulls_first=false;}
+                        }
+                        spec.order[spec.order_count]=key;spec.order_count+=1;
+                        if(!try self.takeSymbol(.comma)) break;
+                    }
+                }
+                if(try self.takeWord("ROWS")) {
+                    const between=try self.takeWord("BETWEEN");
+                    if(!self.isWord("UNBOUNDED")) return error.UnsupportedStatement;
+                    try self.expectWord("UNBOUNDED");try self.expectWord("PRECEDING");
+                    spec.frame=.rows_prefix;
+                    if(between) {
+                        try self.expectWord("AND");
+                        if(try self.takeWord("UNBOUNDED")) {try self.expectWord("FOLLOWING");spec.frame=.full;}
+                        else {try self.expectWord("CURRENT");try self.expectWord("ROW");}
+                    }
+                } else if(self.isWord("RANGE") or self.isWord("GROUPS")) return error.UnsupportedStatement;
+                try self.expectSymbol(.rparen);
             }
             const n = &self.pool.nodes[node];
             if (n.distinct or n.c != none or self.aggregateName(name)) self.pool.complex = true;
