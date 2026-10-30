@@ -442,6 +442,240 @@ fn inference() !void {
     try tags(try query(&s, &db, "SELECT body FROM t ORDER BY id"), "TDDCZ");
     try check(equal(s.result.rows[0].cells[0].text.slice(), "456") and equal(s.result.rows[1].cells[0].text.slice(), "999"));
 }
+/// The unnamed portal's SQL after Bind: the statement with parameters spliced.
+fn portalText(s: *Session) ![]const u8 {
+    for (&s.portals) |*p| if (p.live and p.name.len == 0) return p.sql[0..p.len];
+    return error.MissingPortal;
+}
+/// Parse, Bind and Execute `source` as the unnamed statement; check its tag.
+fn boundCommand(s: *Session, db: *DB, source: []const u8, oids: []const u32, values: []const ?[]const u8, format: u16, tag: []const u8) !void {
+    try tags(try parse(s, db, "", source, oids), "1");
+    try tags(try bind(s, db, "", "", values, format, 0), "2");
+    const executed = try execute(s, db, "", 0);
+    try tags(executed, "C");
+    try commandText(executed, tag);
+    try sync(s, db);
+}
+fn columnValues(s: *Session, db: *DB, source: []const u8, wanted: [3]i64) !void {
+    try tags(try query(s, db, source), "TDDDCZ");
+    for (wanted, 0..) |value, i| try check(s.result.rows[i].cells[0].integer == value);
+}
+/// NET-01: a bound integer is spliced as a self-contained token sequence. A
+/// negative value after `-` must not open a `--` comment that drops the rest
+/// of the statement, so `v-$1 ... WHERE id = $2` changes exactly one row.
+fn negativeParameters() !void {
+    var db: DB = .{};
+    var s: Session = .{};
+    try startup(&s, &db);
+    _ = try query(&s, &db, "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)");
+    _ = try query(&s, &db, "INSERT INTO a VALUES (1, 100, 0)");
+    _ = try query(&s, &db, "INSERT INTO a VALUES (2, 100, 0)");
+    _ = try query(&s, &db, "INSERT INTO a VALUES (3, 100, 0)");
+    const update = "UPDATE a SET v = v-$1 WHERE id = $2";
+    // int4, text then binary.
+    try boundCommand(&s, &db, update, &.{ 23, 23 }, &.{ "-5", "1" }, 0, "UPDATE 1");
+    try boundCommand(&s, &db, update, &.{ 23, 23 }, &.{ "\xff\xff\xff\xfb", "\x00\x00\x00\x01" }, 1, "UPDATE 1");
+    try columnValues(&s, &db, "SELECT v FROM a ORDER BY id", .{ 110, 100, 100 });
+    // int8, text then binary.
+    try boundCommand(&s, &db, update, &.{ 20, 20 }, &.{ "-5", "2" }, 0, "UPDATE 1");
+    try boundCommand(&s, &db, update, &.{ 20, 20 }, &.{ "\xff\xff\xff\xff\xff\xff\xff\xfb", "\x00\x00\x00\x00\x00\x00\x00\x02" }, 1, "UPDATE 1");
+    try columnValues(&s, &db, "SELECT v FROM a ORDER BY id", .{ 110, 110, 100 });
+    // int2 control: pg_types renders it as the quoted literal '-5'::smallint.
+    try boundCommand(&s, &db, update, &.{ 21, 23 }, &.{ "-5", "3" }, 0, "UPDATE 1");
+    try boundCommand(&s, &db, update, &.{ 21, 23 }, &.{ "\xff\xfb", "\x00\x00\x00\x03" }, 1, "UPDATE 1");
+    try columnValues(&s, &db, "SELECT v FROM a ORDER BY id", .{ 110, 110, 110 });
+    // OID 0: `v = $1` infers int4 for $1, which `w-$1` reuses.
+    try tags(try parse(&s, &db, "", "UPDATE a SET v = $1, w = w-$1 WHERE id = $2", &.{}), "1");
+    const described = try describe(&s, &db, 'S', "");
+    try tags(described, "tn");
+    var frames: Frames = .{ .bytes = described };
+    try check(equal((try frames.next()).?.body, "\x00\x02\x00\x00\x00\x17\x00\x00\x00\x17"));
+    try tags(try bind(&s, &db, "", "", &.{ "-5", "2" }, 0, 0), "2");
+    try commandText(try execute(&s, &db, "", 0), "UPDATE 1");
+    try sync(&s, &db);
+    try columnValues(&s, &db, "SELECT v FROM a ORDER BY id", .{ 110, -5, 110 });
+    try columnValues(&s, &db, "SELECT w FROM a ORDER BY id", .{ 0, 5, 0 });
+    // A negative second operand: 10-(-3), not the comment 10--3.
+    try tags(try parse(&s, &db, "", "SELECT $1-$2", &.{ 23, 23 }), "1");
+    try tags(try bind(&s, &db, "", "", &.{ "10", "-3" }, 0, 0), "2");
+    try tags(try execute(&s, &db, "", 0), "DC");
+    try check(s.result.rows[0].cells[0].integer == 13);
+    try sync(&s, &db);
+    try tags(try parse(&s, &db, "", "SELECT $1-$2", &.{ 20, 20 }), "1");
+    try tags(try bind(&s, &db, "", "", &.{ "\x00\x00\x00\x00\x00\x00\x00\x0a", "\xff\xff\xff\xff\xff\xff\xff\xfd" }, 1, 0), "2");
+    try tags(try execute(&s, &db, "", 0), "DC");
+    try check(s.result.rows[0].cells[0].integer == 13);
+    try sync(&s, &db);
+    // A cast applies to the whole value: (-5)::text is '-5'.
+    try tags(try parse(&s, &db, "", "SELECT $1::text", &.{23}), "1");
+    try tags(try bind(&s, &db, "", "", &.{"-5"}, 0, 0), "2");
+    try tags(try execute(&s, &db, "", 0), "DC");
+    try check(equal(s.result.rows[0].cells[0].text.slice(), "-5"));
+    try sync(&s, &db);
+    // LIMIT/OFFSET accept only an integer token: non-negative values stay bare.
+    try tags(try parse(&s, &db, "", "SELECT id FROM a ORDER BY id LIMIT $1 OFFSET $2", &.{ 23, 20 }), "1");
+    try tags(try bind(&s, &db, "", "", &.{ "2", "1" }, 0, 0), "2");
+    try tags(try execute(&s, &db, "", 0), "DDC");
+    try check(s.result.rows[0].cells[0].integer == 2 and s.result.rows[1].cells[0].integer == 3);
+    try sync(&s, &db);
+    try tags(try bind(&s, &db, "", "", &.{ "\x00\x00\x00\x01", "\x00\x00\x00\x00\x00\x00\x00\x00" }, 1, 0), "2");
+    try tags(try execute(&s, &db, "", 0), "DC");
+    try check(s.result.rows[0].cells[0].integer == 1);
+    try sync(&s, &db);
+    // The spliced text: a negative is parenthesized, and a value is spaced
+    // from any neighbor it would otherwise merge with into one token.
+    try tags(try parse(&s, &db, "", update, &.{ 23, 20 }), "1");
+    try tags(try bind(&s, &db, "", "", &.{ "-5", "2" }, 0, 0), "2");
+    try check(equal(try portalText(&s), "UPDATE a SET v = v-(-5) WHERE id = 2"));
+    try sync(&s, &db);
+    try tags(try parse(&s, &db, "", "SELECT 'a'$1,$2e1,x$3,$4.5", &.{ 25, 23, 16, 20 }), "1");
+    try tags(try bind(&s, &db, "", "", &.{ "b", "5", "t", "1" }, 0, 0), "2");
+    try check(equal(try portalText(&s), "SELECT 'a' 'b',5 e1,x TRUE,1 .5"));
+    try sync(&s, &db);
+    // An exponent sign on the left: `1e-$1` is not the decimal token 1e-5.
+    try tags(try parse(&s, &db, "", "SELECT 1e-$1", &.{23}), "1");
+    try tags(try bind(&s, &db, "", "", &.{"5"}, 0, 0), "2");
+    try check(equal(try portalText(&s), "SELECT 1e- 5"));
+    try sync(&s, &db);
+}
+var capacity_template: [65000]u8 = undefined;
+/// NET-01 review probes: the int8 minimum, negatives around operators, text
+/// carrying quote and comment metacharacters, inferred int8 parameters, IN
+/// and BETWEEN, NULL after `-`, and the capacity limit after splicing.
+fn splicedParameterValues() !void {
+    var db: DB = .{};
+    var s: Session = .{};
+    try startup(&s, &db);
+    _ = try query(&s, &db, "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER, t TEXT)");
+    _ = try query(&s, &db, "CREATE TABLE b (id INTEGER PRIMARY KEY, big BIGINT, w BIGINT)");
+    _ = try query(&s, &db, "INSERT INTO a VALUES (1, 100, 'x')");
+    _ = try query(&s, &db, "INSERT INTO a VALUES (2, 100, 'y')");
+    _ = try query(&s, &db, "INSERT INTO a VALUES (3, 100, 'z')");
+    _ = try query(&s, &db, "INSERT INTO b VALUES (1, 0, 0)");
+    _ = try query(&s, &db, "INSERT INTO b VALUES (2, 0, 0)");
+    // R1: the int8 minimum, binary and text, bare and cast.
+    try tags(try parse(&s, &db, "", "SELECT $1, $1::text", &.{20}), "1");
+    const minimums = [_][]const u8{ "\x80\x00\x00\x00\x00\x00\x00\x00", "-9223372036854775808" };
+    const minimum_formats = [_]u16{ 1, 0 };
+    for (minimums, minimum_formats) |value, format| {
+        const values = [_]?[]const u8{value};
+        try tags(try bind(&s, &db, "", "", &values, format, 0), "2");
+        try tags(try execute(&s, &db, "", 0), "DC");
+        const cell = s.result.rows[0].cells[0];
+        try check(cell == .integer and cell.integer == std.math.minInt(i64));
+        try check(equal(s.result.rows[0].cells[1].text.slice(), "-9223372036854775808"));
+        try check(equal(try portalText(&s), "SELECT (-9223372036854775808), (-9223372036854775808)::text"));
+        try sync(&s, &db);
+    }
+    // R2: two negatives, unary minus, modulo and `*-`.
+    try tags(try parse(&s, &db, "", "SELECT $1-$2, -$1, $1 % 3, $2*-$1", &.{ 23, 23 }), "1");
+    try tags(try bind(&s, &db, "", "", &.{ "-5", "-3" }, 0, 0), "2");
+    try tags(try execute(&s, &db, "", 0), "DC");
+    try check(equal(try portalText(&s), "SELECT (-5)-(-3), -(-5), (-5) % 3, (-3)*-(-5)"));
+    try check(s.result.rows[0].cells[0].integer == -2);
+    try check(s.result.rows[0].cells[1].integer == 5);
+    try check(s.result.rows[0].cells[2].integer == -2);
+    try check(s.result.rows[0].cells[3].integer == -15);
+    try sync(&s, &db);
+    // R3: text carrying quote and comment metacharacters changes exactly one
+    // row and round-trips byte for byte.
+    const nasty = [_][]const u8{ "'--", "x'; DELETE FROM a; --", "/*", "*/", "\\'", "$1", "''", "a\nb--c", "' OR 1=1 --" };
+    for (nasty) |text| {
+        try tags(try parse(&s, &db, "", "UPDATE a SET t = $1 WHERE id = $2", &.{ 25, 23 }), "1");
+        const values = [_]?[]const u8{ text, "2" };
+        try tags(try bind(&s, &db, "", "", &values, 0, 0), "2");
+        try commandText(try execute(&s, &db, "", 0), "UPDATE 1");
+        try sync(&s, &db);
+        try tags(try query(&s, &db, "SELECT t FROM a ORDER BY id"), "TDDDCZ");
+        try check(equal(s.result.rows[0].cells[0].text.slice(), "x"));
+        try check(equal(s.result.rows[1].cells[0].text.slice(), text));
+        try check(equal(s.result.rows[2].cells[0].text.slice(), "z"));
+    }
+    // R4: OID 0 inferred as int8 from `big = $1`, text then binary, `w-$1`.
+    try tags(try parse(&s, &db, "", "UPDATE b SET big = $1, w = w-$1 WHERE id = $2", &.{}), "1");
+    const described = try describe(&s, &db, 'S', "");
+    var frames: Frames = .{ .bytes = described };
+    try check(equal((try frames.next()).?.body, "\x00\x02\x00\x00\x00\x14\x00\x00\x00\x17"));
+    try tags(try bind(&s, &db, "", "", &.{ "-5", "2" }, 0, 0), "2");
+    try commandText(try execute(&s, &db, "", 0), "UPDATE 1");
+    try sync(&s, &db);
+    try tags(try bind(&s, &db, "", "", &.{ "\xff\xff\xff\xff\xff\xff\xff\xfb", "\x00\x00\x00\x02" }, 1, 0), "2");
+    try commandText(try execute(&s, &db, "", 0), "UPDATE 1");
+    try sync(&s, &db);
+    try tags(try query(&s, &db, "SELECT big, w FROM b ORDER BY id"), "TDDCZ");
+    try check(s.result.rows[0].cells[0].integer == 0 and s.result.rows[0].cells[1].integer == 0);
+    try check(s.result.rows[1].cells[0].integer == -5 and s.result.rows[1].cells[1].integer == 10);
+    // R5: parenthesized negatives inside IN lists and BETWEEN.
+    _ = try query(&s, &db, "UPDATE a SET v = -7 WHERE id = 3");
+    try tags(try parse(&s, &db, "", "SELECT id FROM a WHERE v IN ($1, $2) AND v BETWEEN $3 AND $4", &.{ 23, 23, 23, 23 }), "1");
+    try tags(try bind(&s, &db, "", "", &.{ "-7", "-8", "-10", "-5" }, 0, 0), "2");
+    try tags(try execute(&s, &db, "", 0), "DC");
+    try check(s.result.rows[0].cells[0].integer == 3);
+    try sync(&s, &db);
+    // R6: NULL after `-` stays a NULL operand.
+    try tags(try parse(&s, &db, "", "SELECT 1-$1", &.{23}), "1");
+    try tags(try bind(&s, &db, "", "", &.{null}, 0, 0), "2");
+    try tags(try execute(&s, &db, "", 0), "DC");
+    try check(s.result.rows[0].cells[0] == .null_value);
+    try sync(&s, &db);
+    // R7: parentheses push a near-limit template past sql_capacity. Bind
+    // fails cleanly with 54000.
+    const head = "SELECT $1";
+    @memcpy(capacity_template[0..head.len], head);
+    var at: usize = head.len;
+    for (2..33) |n| {
+        const part = try std.fmt.bufPrint(capacity_template[at..], "-${d}", .{n});
+        at += part.len;
+    }
+    const tail = " --";
+    @memcpy(capacity_template[at..][0..tail.len], tail);
+    at += tail.len;
+    @memset(capacity_template[at..], 'x');
+    const oids: [32]u32 = @splat(20);
+    try tags(try parse(&s, &db, "", &capacity_template, &oids), "1");
+    const minimum_values: [32]?[]const u8 = @splat("\x80\x00\x00\x00\x00\x00\x00\x00");
+    try state(try bind(&s, &db, "", "", &minimum_values, 1, 0), "54000");
+    try sync(&s, &db);
+}
+/// A negative bound LIMIT or OFFSET is spliced as `(-1)` (NET-01) and still
+/// reports 2201W / 2201X, as PostgreSQL does. Non-negative counts stay bare.
+fn negativeCounts() !void {
+    var db: DB = .{};
+    var s: Session = .{};
+    try startup(&s, &db);
+    _ = try query(&s, &db, "CREATE TABLE a (id INTEGER PRIMARY KEY)");
+    _ = try query(&s, &db, "INSERT INTO a VALUES (1)");
+    _ = try query(&s, &db, "INSERT INTO a VALUES (2)");
+    const Case = struct { source: []const u8, spliced: []const u8, state: []const u8 };
+    const cases = [_]Case{
+        .{ .source = "SELECT id FROM a ORDER BY id LIMIT $1", .spliced = "SELECT id FROM a ORDER BY id LIMIT (-1)", .state = "2201W" },
+        .{ .source = "SELECT id FROM a ORDER BY id OFFSET $1", .spliced = "SELECT id FROM a ORDER BY id OFFSET (-1)", .state = "2201X" },
+        // FETCH FIRST is a row-count limit, reported as LIMIT is.
+        .{ .source = "SELECT id FROM a ORDER BY id FETCH FIRST $1 ROWS ONLY", .spliced = "SELECT id FROM a ORDER BY id FETCH FIRST (-1) ROWS ONLY", .state = "2201W" },
+    };
+    const negatives = [_][]const u8{ "-1", "\xff\xff\xff\xff" };
+    const formats = [_]u16{ 0, 1 };
+    for (cases) |case| {
+        try tags(try parse(&s, &db, "", case.source, &.{23}), "1");
+        for (negatives, formats) |value, format| {
+            const values = [_]?[]const u8{value};
+            try tags(try bind(&s, &db, "", "", &values, format, 0), "2");
+            try check(equal(try portalText(&s), case.spliced));
+            try state(try execute(&s, &db, "", 0), case.state);
+            try sync(&s, &db);
+        }
+    }
+    // FETCH FIRST shares the count path; a non-negative count stays bare.
+    try tags(try parse(&s, &db, "", "SELECT id FROM a ORDER BY id FETCH FIRST $1 ROWS ONLY", &.{23}), "1");
+    const ones = [_][]const u8{ "1", "\x00\x00\x00\x01" };
+    for (ones, formats) |value, format| {
+        const values = [_]?[]const u8{value};
+        try tags(try bind(&s, &db, "", "", &values, format, 0), "2");
+        try tags(try execute(&s, &db, "", 0), "DC");
+        try check(s.result.row_count == 1 and s.result.rows[0].cells[0].integer == 1);
+        try sync(&s, &db);
+    }
+}
 fn statementLifecycle() !void {
     var db: DB = .{};
     var s: Session = .{};
@@ -968,6 +1202,9 @@ pub fn main(init: std.process.Init) !void {
     try normal();
     try extended();
     try inference();
+    try negativeParameters();
+    try splicedParameterValues();
+    try negativeCounts();
     try errorStates();
     try statementLifecycle();
     try malformed();
