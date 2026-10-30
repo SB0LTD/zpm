@@ -61,10 +61,13 @@ cancellation are checked through sorting, partition/peer scans, accumulation and
 publication; no failed statement publishes partial results. Misplaced/nested
 windows report PostgreSQL SQLSTATE 42P20.
 
-The candidate replays 66 captured PostgreSQL queries and has 8,844 native
+The candidate replays 66 captured PostgreSQL queries and has 8,882 native
 assertions including a work-limit and cancellation sweep across every execution
 checkpoint. Full three-OS/native/server and original dbMeter qualification remain
-pending. FILTER/DISTINCT window aggregates, bounded/moving frames, explicit
+pending. Ordinary aggregates containing window calls report 42803; misplaced
+windows and windows nested inside window clauses report 42P20. This distinction
+was caught by the PG16/18 server gate and has focused regression tests.
+FILTER/DISTINCT window aggregates, bounded/moving frames, explicit
 RANGE/GROUPS, named windows and correlated subqueries in the same window target
 projection remain unsupported. This is not complete PostgreSQL window coverage.
 

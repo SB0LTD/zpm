@@ -58,7 +58,9 @@ pub fn main() !void {
     try reject("SELECT id FROM fact WHERE RANK() OVER ()>1",error.WindowingError);
     try reject("SELECT RANK() OVER () FROM fact GROUP BY RANK() OVER ()",error.WindowingError);
     try reject("SELECT RANK() OVER () FROM fact HAVING RANK() OVER ()>1",error.WindowingError);
-    try reject("SELECT SUM(RANK() OVER ()) FROM fact",error.WindowingError);
+    try reject("SELECT SUM(RANK() OVER ()) FROM fact",error.GroupingError);
+    try reject("SELECT COUNT(*) FILTER (WHERE RANK() OVER ()>0) FROM fact",error.WindowingError);
+    try reject("SELECT RANK() OVER (ORDER BY SUM(RANK() OVER ())) FROM fact",error.WindowingError);
     try reject("SELECT SUM(RANK() OVER ()) OVER () FROM fact",error.WindowingError);
     try reject("SELECT RANK() OVER (ORDER BY ROW_NUMBER() OVER ()) FROM fact",error.WindowingError);
     try reject("SELECT SUM(DISTINCT v) OVER () FROM fact",error.UnsupportedStatement);

@@ -189,6 +189,8 @@ pub fn Binder(comptime config: types.Config) type {
             /// Aggregate calls are allowed (targets, HAVING, ORDER BY).
             aggregates: bool = false,
             windows: bool = false,
+            window_error:Error=error.WindowingError,
+            inside_window:bool=false,
             saw_aggregate: ?*bool = null,
             ctes: ?*const CteEnv = null,
         };
@@ -630,6 +632,7 @@ pub fn Binder(comptime config: types.Config) type {
             var inner = scope.*;
             inner.aggregates = false;
             inner.windows = false;
+            inner.window_error=if(scope.inside_window) error.WindowingError else error.GroupingError;
             var kind = kind_in;
             if (n.star) {
                 if (kind != .count or n.distinct) return error.Syntax;
@@ -648,6 +651,7 @@ pub fn Binder(comptime config: types.Config) type {
                 arg_ty = context.node(arg).ty;
             }
             if (n.c != none) {
+                inner.window_error=error.WindowingError;
                 try typeExpr(context, &inner, n.c);
                 try booleanArgument(context, n.c);
             }
@@ -691,10 +695,10 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn typeWindow(context:*const Context,scope:*const Scope,n:*ast.Node) Error!void {
-            if(!scope.windows) return error.WindowingError;
+            if(!scope.windows) return scope.window_error;
             if(n.distinct or n.c!=none) return error.UnsupportedStatement;
             const spec=&context.pool.windows[n.window];
-            var inner=scope.*;inner.windows=false;
+            var inner=scope.*;inner.windows=false;inner.inside_window=true;
             const name=toName(context,n.name);
             const ranking=types.same(name.slice(),"rank") or types.same(name.slice(),"dense_rank") or types.same(name.slice(),"row_number");
             if(ranking) {
