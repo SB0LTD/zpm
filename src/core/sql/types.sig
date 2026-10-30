@@ -26,6 +26,9 @@ pub const Config = struct {
     /// Caller-arena typed COUNT/SUM/AVG channels for committed integral GROUP
     /// BY. Unsupported expressions, visibility and budgets retain ordinary SQL.
     typed_grouped_aggregates: bool = false,
+    /// Precontract a unique-key dimension to group IDs before combining one
+    /// dimension label with one integral fact key in caller-owned group state.
+    dimension_group_ids: bool = false,
     /// Optional exact committed GROUP BY synopses per supported column. This
     /// budgets metadata groups, not SQL results: overflow retains scan paths.
     summary_groups: usize = 0,
