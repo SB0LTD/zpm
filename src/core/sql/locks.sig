@@ -9,6 +9,9 @@
 //! PostgreSQL's conflict matrix for those three modes. Every lock a
 //! transaction acquires is appended to its lock list, so aborting a
 //! subtransaction releases exactly the locks acquired after its watermark.
+//! A transaction holds a row at most once: FOR UPDATE after its own FOR
+//! SHARE upgrades that holder in place and lists an upgrade entry, whose
+//! release downgrades it to share again.
 //!
 //! A waiter records the set of transactions it waits for (a bitset over the
 //! transaction table). Deadlock detection is an iterative DFS over those sets
@@ -29,7 +32,9 @@ pub fn Locks(comptime config: types.Config) type {
     const words = (config.transactions + 63) / 64;
     return struct {
         const Self = @This();
-        pub const list_capacity: usize = config.tables * 3 + config.row_locks;
+        /// Per-transaction lock-list bound: each table mode once, and per
+        /// held row its grant plus at most one share -> update upgrade.
+        pub const list_capacity: usize = config.tables * 3 + config.row_locks * 2;
 
         /// Bitset over transaction slots.
         pub const Set = struct {
@@ -68,7 +73,8 @@ pub fn Locks(comptime config: types.Config) type {
             holders: [config.share_holders]Holder = undefined,
         };
 
-        pub const EntryKind = enum(u8) { table, row };
+        /// `upgrade` records an in-place share -> update upgrade of a row.
+        pub const EntryKind = enum(u8) { table, row, upgrade };
 
         /// One acquisition in a transaction's lock list.
         pub const Entry = struct { kind: EntryKind, table: u8, mode: u8, index: u16 = 0 };
@@ -149,9 +155,11 @@ pub fn Locks(comptime config: types.Config) type {
             return false;
         }
 
-        /// Adds a holder (conflicts were checked by the caller). Returns the
-        /// lock index, or null when this transaction already held the mode.
-        pub fn grantRow(self: *Self, table: usize, rowid: u64, slot: usize, mode: RowMode) Error!?u16 {
+        /// Adds a holder, or upgrades this transaction's share holder to
+        /// update in place (conflicts were checked by the caller). Returns
+        /// the lock-list entry to record, or null when this transaction
+        /// already held the mode.
+        pub fn grantRow(self: *Self, table: usize, rowid: u64, slot: usize, mode: RowMode) Error!?Entry {
             if (self.holdsRow(table, rowid, slot, mode)) return null;
             const index = self.findRow(table, rowid) orelse blk: {
                 for (&self.rows, 0..) |*entry, candidate| if (!entry.used) {
@@ -161,13 +169,23 @@ pub fn Locks(comptime config: types.Config) type {
                 return error.LockCapacity;
             };
             const entry = &self.rows[index];
-            if (entry.count == config.share_holders) {
-                if (entry.count == 0) entry.used = false;
-                return error.LockCapacity;
-            }
+            for (entry.holders[0..entry.count]) |*holder| if (holder.slot == slot) {
+                holder.mode = mode;
+                return .{ .kind = .upgrade, .table = @intCast(table), .mode = @intFromEnum(mode), .index = @intCast(index) };
+            };
+            if (entry.count == config.share_holders) return error.LockCapacity;
             entry.holders[entry.count] = .{ .slot = @intCast(slot), .mode = mode };
             entry.count += 1;
-            return @intCast(index);
+            return .{ .kind = .row, .table = @intCast(table), .mode = @intFromEnum(mode), .index = @intCast(index) };
+        }
+
+        /// Undoes an in-place upgrade: the holder is share again.
+        pub fn downgradeRow(self: *Self, index: usize, slot: usize) void {
+            const entry = &self.rows[index];
+            for (entry.holders[0..entry.count]) |*holder| if (holder.slot == slot) {
+                holder.mode = .share;
+                return;
+            };
         }
 
         pub fn releaseRow(self: *Self, index: usize, slot: usize, mode: RowMode) void {
@@ -190,6 +208,7 @@ pub fn Locks(comptime config: types.Config) type {
             switch (entry.kind) {
                 .table => self.releaseTable(entry.table, slot, entry.mode),
                 .row => self.releaseRow(entry.index, slot, @enumFromInt(entry.mode)),
+                .upgrade => self.downgradeRow(entry.index, slot),
             }
         }
 

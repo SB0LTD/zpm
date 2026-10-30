@@ -49,6 +49,18 @@ fn empty() !void {
     try check(usage.transactions == 0 and usage.row_locks == 0 and usage.table_locks == 0 and usage.pending_versions == 0);
 }
 
+/// Row-lock holders of `slot` in `mode` (`.share` or `.update`) across the
+/// lock table: one per held row, so an appended second holder shows.
+fn holding(slot: u16, comptime mode: anytype) usize {
+    var count: usize = 0;
+    for (&db.locks.rows) |*entry| if (entry.used) {
+        for (entry.holders[0..entry.count]) |holder| if (holder.slot == slot and holder.mode == mode) {
+            count += 1;
+        };
+    };
+    return count;
+}
+
 fn commit(slot: u16) void {
     db.publishCommit(slot);
 }
@@ -310,6 +322,187 @@ fn errorPaths() !void {
     try empty();
 }
 
+/// STO-03: FOR SHARE then FOR UPDATE of the same rows upgrades each holder
+/// in place and the lock list stays in bounds. Every row-lock entry
+/// (row_locks = 8 rows, ids 10..17) is share-locked, then upgraded, with
+/// table locks on t and p also in the lock list.
+fn lockUpgradeInPlace() !void {
+    const a = try db.begin();
+    try check(try rows(a, "SELECT * FROM t") == 1);
+    try check(try rows(a, "SELECT id FROM p WHERE id < 18 FOR SHARE") == 8);
+    try check(db.usage().row_locks == 8);
+    try check(try rows(a, "SELECT id FROM p WHERE id < 18 FOR UPDATE") == 8);
+    try check(db.usage().row_locks == 8);
+    try check(holding(a, .update) == 8 and holding(a, .share) == 0);
+    // Held in update mode: another FOR SHARE conflicts and an UPDATE parks.
+    const b = try db.begin();
+    if (run(b, "SELECT id FROM p WHERE id = 17 FOR SHARE NOWAIT")) |_| return error.UpgradeIgnored else |err| try check(err == error.LockNotAvailable);
+    try parks(b, "UPDATE p SET v = 1 WHERE id = 17");
+    try check(db.waitingFor(b).has(a));
+    db.abort(b);
+    commit(a);
+    try empty();
+}
+
+/// Upgrading 8 share locks (ids 10..17 in ORDER BY order), then needing a
+/// 9th row lock: LockCapacity. The failing statement undoes its upgrades
+/// (share again, list length restored), the transaction stays usable, and
+/// ROLLBACK leaves nothing behind.
+fn lockUpgradeCapacity() !void {
+    const c = try db.begin();
+    try check(try rows(c, "SELECT * FROM t") == 1);
+    try check(try rows(c, "SELECT id FROM p WHERE id < 18 FOR SHARE") == 8);
+    const base = db.txs[c].lock_len;
+    if (run(c, "SELECT id FROM p ORDER BY id FOR UPDATE")) |_| return error.LockCapacityIgnored else |err| try check(err == error.LockCapacity);
+    try check(db.active(c) and !db.parked(c) and db.usage().row_locks == 8);
+    try check(db.txs[c].lock_len == base and holding(c, .update) == 0 and holding(c, .share) == 8);
+    const d = try db.begin();
+    try check(try rows(d, "SELECT id FROM p WHERE id = 10 FOR SHARE NOWAIT") == 1);
+    try parks(d, "UPDATE p SET v = 1 WHERE id = 11");
+    try check(db.waitingFor(d).has(c));
+    db.abort(d);
+    try check(try rows(c, "SELECT id FROM p WHERE id < 18 FOR UPDATE") == 8);
+    db.abort(c);
+    try empty();
+    try autocommit("UPDATE p SET v = v + 1 WHERE id = 10");
+    try check(try fresh("SELECT v FROM p WHERE id = 10") == 1);
+}
+
+/// An upgrade waits for the other share holders exactly like a fresh FOR
+/// UPDATE: NOWAIT fails, a blocking request parks on the other holder, and
+/// two upgraders deadlock.
+fn lockUpgradeWaits() !void {
+    const e = try db.begin();
+    const f = try db.begin();
+    try check(try rows(e, "SELECT id FROM p WHERE id = 10 FOR SHARE") == 1);
+    try check(try rows(f, "SELECT id FROM p WHERE id = 10 FOR SHARE") == 1);
+    if (run(e, "SELECT id FROM p WHERE id = 10 FOR UPDATE NOWAIT")) |_| return error.UpgradeDidNotWait else |err| try check(err == error.LockNotAvailable);
+    try parks(e, "SELECT id FROM p WHERE id = 10 FOR UPDATE");
+    try check(db.waitingFor(e).has(f) and !db.deadlocked(e));
+    try parks(f, "SELECT id FROM p WHERE id = 10 FOR UPDATE");
+    try check(db.waitingFor(f).has(e) and db.deadlocked(e) and db.deadlocked(f));
+    db.abort(f);
+    try check((try resumeRun(e, "SELECT id FROM p WHERE id = 10 FOR UPDATE")).row_count == 1);
+    const g = try db.begin();
+    if (run(g, "SELECT id FROM p WHERE id = 10 FOR SHARE NOWAIT")) |_| return error.UpgradeIgnored else |err| try check(err == error.LockNotAvailable);
+    db.abort(g);
+    commit(e);
+    try empty();
+}
+
+/// ROLLBACK TO a savepoint taken between FOR SHARE and FOR UPDATE undoes
+/// only the upgrade; the share lock stays (PostgreSQL subtransactions).
+fn lockUpgradeSavepoint() !void {
+    const h = try db.begin();
+    try check(try rows(h, "SELECT id FROM p WHERE id = 10 FOR SHARE") == 1);
+    try db.savepoint(h, "s");
+    try check(try rows(h, "SELECT id FROM p WHERE id = 10 FOR UPDATE") == 1);
+    const k = try db.begin();
+    if (run(k, "SELECT id FROM p WHERE id = 10 FOR SHARE NOWAIT")) |_| return error.UpgradeIgnored else |err| try check(err == error.LockNotAvailable);
+    try check(try db.rollbackTo(h, "s") == 0);
+    try check(try rows(k, "SELECT id FROM p WHERE id = 10 FOR SHARE NOWAIT") == 1);
+    try check(db.usage().row_locks == 1);
+    db.abort(k);
+    const m = try db.begin();
+    try parks(m, "UPDATE p SET v = 1 WHERE id = 10");
+    try check(db.waitingFor(m).has(h));
+    db.abort(m);
+    db.abort(h);
+    try empty();
+}
+
+/// A FOR UPDATE that upgraded share locks and then parked gives back exactly
+/// those upgrades on abortStatement; resumed, it adds one upgrade per row
+/// and never a second holder.
+fn lockUpgradeParked() !void {
+    const c = try db.begin();
+    try check(try rows(c, "SELECT id FROM p WHERE id < 18 FOR SHARE") == 8);
+    const y = try db.begin();
+    try check(try rows(y, "SELECT id FROM p WHERE id = 17 FOR SHARE") == 1);
+    const base = db.txs[c].lock_len;
+    try check(base == 9);
+    try parks(c, "SELECT id FROM p WHERE id < 18 ORDER BY id FOR UPDATE");
+    try check(db.waitingFor(c).has(y));
+    try check(db.txs[c].lock_len == base + 7);
+    try check(holding(c, .update) == 7 and holding(c, .share) == 1);
+    db.abortStatement(c);
+    try check(db.txs[c].lock_len == base);
+    try check(holding(c, .update) == 0 and holding(c, .share) == 8);
+    // Park again, then resume after y commits: exactly 8 upgrades in all.
+    try parks(c, "SELECT id FROM p WHERE id < 18 ORDER BY id FOR UPDATE");
+    try check(db.txs[c].lock_len == base + 7);
+    commit(y);
+    try check((try resumeRun(c, "SELECT id FROM p WHERE id < 18 ORDER BY id FOR UPDATE")).row_count == 8);
+    try check(db.txs[c].lock_len == base + 8);
+    try check(holding(c, .update) == 8 and holding(c, .share) == 0);
+    db.abort(c);
+    try empty();
+}
+
+/// Repeated upgrade / ROLLBACK TO cycles and redundant requests never grow
+/// the lock list past one grant and one upgrade per row.
+fn lockUpgradeSavepointCycles() !void {
+    const h = try db.begin();
+    try check(try rows(h, "SELECT id FROM p WHERE id < 18 FOR SHARE") == 8);
+    const base = db.txs[h].lock_len;
+    try db.savepoint(h, "s");
+    for (0..20) |_| {
+        try check(try rows(h, "SELECT id FROM p WHERE id < 18 FOR UPDATE") == 8);
+        try check(try rows(h, "SELECT id FROM p WHERE id < 18 FOR SHARE") == 8);
+        try check(try rows(h, "SELECT id FROM p WHERE id < 18 FOR UPDATE") == 8);
+        try check(db.txs[h].lock_len == base + 8);
+        try check(try db.rollbackTo(h, "s") == 0);
+        try check(db.txs[h].lock_len == base and holding(h, .share) == 8 and holding(h, .update) == 0);
+    }
+    try check(try rows(h, "SELECT id FROM p WHERE id < 18 FOR UPDATE") == 8);
+    try check(try db.release(h, "s") == 0);
+    try check(holding(h, .update) == 8 and db.txs[h].lock_len == base + 8);
+    db.abort(h);
+    try empty();
+}
+
+/// ON CONFLICT DO UPDATE ... WHERE false (conflictUpdate) upgrades a share
+/// lock in place, and only after the other share holder is gone.
+fn lockUpgradeConflict() !void {
+    const e = try db.begin();
+    const f = try db.begin();
+    try check(try rows(e, "SELECT id FROM p WHERE id = 10 FOR SHARE") == 1);
+    try check(try rows(f, "SELECT id FROM p WHERE id = 10 FOR SHARE") == 1);
+    const upsert = "INSERT INTO p VALUES (10, 5) ON CONFLICT (id) DO UPDATE SET v = 7 WHERE p.v < -100";
+    try parks(e, upsert);
+    try check(db.waitingFor(e).has(f));
+    db.abort(f);
+    try check((try resumeRun(e, upsert)).affected_rows == 0);
+    try check(holding(e, .update) == 1 and holding(e, .share) == 0);
+    const g = try db.begin();
+    if (run(g, "SELECT id FROM p WHERE id = 10 FOR SHARE NOWAIT")) |_| return error.UpgradeIgnored else |err| try check(err == error.LockNotAvailable);
+    db.abort(g);
+    commit(e);
+    try empty();
+}
+
+/// The lock-list bound is reached exactly, without LockCapacity: every
+/// table mode on all 3 table slots plus one grant and one upgrade for each
+/// of the 8 row-lock entries.
+fn lockUpgradeFullList() !void {
+    const x = try db.begin();
+    _ = try run(x, "CREATE TABLE r (id INTEGER)");
+    _ = try run(x, "SELECT * FROM r");
+    _ = try run(x, "INSERT INTO r VALUES (1)");
+    _ = try run(x, "DROP TABLE r");
+    _ = try run(x, "SELECT * FROM t");
+    _ = try run(x, "UPDATE t SET v = v WHERE id = 2");
+    _ = try run(x, "DROP TABLE t");
+    try check(try rows(x, "SELECT id FROM p WHERE id < 18 FOR SHARE") == 8);
+    try check(try rows(x, "SELECT id FROM p WHERE id < 18 FOR UPDATE") == 8);
+    _ = try run(x, "UPDATE p SET v = v WHERE id = 10");
+    _ = try run(x, "DROP TABLE p");
+    try check(db.txs[x].lock_len == 3 * 3 + 8 * 2);
+    db.abort(x);
+    try empty();
+    try check(try fresh("SELECT v FROM p WHERE id = 10") == 1);
+}
+
 pub fn main() !void {
     try visibility();
     try statementSubtransactions();
@@ -317,6 +510,14 @@ pub fn main() !void {
     try ddl();
     try deadlocks();
     try errorPaths();
+    try lockUpgradeInPlace();
+    try lockUpgradeCapacity();
+    try lockUpgradeWaits();
+    try lockUpgradeSavepoint();
+    try lockUpgradeParked();
+    try lockUpgradeSavepointCycles();
+    try lockUpgradeConflict();
+    try lockUpgradeFullList();
     try check(assertions > 0);
     var buffer: [256]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-mvcc\",\"pass\":true,\"assertions\":{d},\"database_bytes\":{d}}}\n", .{ assertions, DB.storageBytes() });
