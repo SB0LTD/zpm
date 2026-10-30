@@ -982,7 +982,7 @@ pub fn Parser(comptime config: types.Config) type {
                     limited = true;
                     if (!(try self.takeWord("FIRST"))) try self.expectWord("NEXT");
                     block.limit = 1;
-                    if (self.current.kind == .integer or self.isSymbol(.minus) or self.current.kind == .decimal) try self.countValue(&block.limit, &block.negative_limit);
+                    if (self.current.kind == .integer or self.isSymbol(.minus) or self.isSymbol(.lparen) or self.current.kind == .decimal) try self.countValue(&block.limit, &block.negative_limit);
                     if (!(try self.takeWord("ROW"))) try self.expectWord("ROWS");
                     try self.expectWord("ONLY");
                 } else break;
@@ -1188,8 +1188,10 @@ pub fn Parser(comptime config: types.Config) type {
 
         /// A LIMIT/OFFSET/FETCH count; negative counts are reported by the
         /// binder (2201W / 2201X) after name resolution, as PostgreSQL
-        /// reports them at execution.
+        /// reports them at execution. One pair of parentheses is accepted,
+        /// since the wire codecs splice a negative bound parameter as `(-n)`.
         fn countValue(self: *Self, value: *u64, negative: *bool) Error!void {
+            const parenthesized = try self.takeSymbol(.lparen);
             const minus = try self.takeSymbol(.minus);
             if (self.current.kind == .decimal) {
                 // An integer beyond u64 (bigint out of range, as PostgreSQL).
@@ -1199,6 +1201,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.current.kind != .integer) return error.Syntax;
             value.* = self.current.integer;
             try self.advance();
+            if (parenthesized) try self.expectSymbol(.rparen);
             if (minus and value.* != 0) negative.* = true;
         }
 
