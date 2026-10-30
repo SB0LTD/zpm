@@ -2,3 +2,4 @@
 # bytes canonical so Windows and Unix hosts verify the same content locks.
 *.sig text eol=lf
 tests/evidence/to-char-pg16.tsv -text
+tests/evidence/windows-pg16.tsv -text

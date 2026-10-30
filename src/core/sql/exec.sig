@@ -2323,7 +2323,65 @@ pub fn Exec(comptime config: types.Config) type {
                 return list;
             }
 
+            fn windowAccumulate(self:*Query,win:*const B.Window,acc:*Accumulator,at:u32) Error!void {
+                try self.session.checkpoint();
+                if(win.aggregate.kind==.count_star) {acc.count+=1;return;}
+                const item=&self.work.cells[at+win.argument];
+                if(item.*!=.null_value) try self.accumulate(&win.aggregate,acc,item);
+            }
+            fn windowPeers(self:*const Query,a:u32,b:u32,win:*const B.Window) Error!bool {
+                try self.session.checkpoint();
+                for(win.order[0..win.order_count]) |key| if(V.compare(&self.work.cells[a+key.column],&self.work.cells[b+key.column])!=0) return false;
+                return true;
+            }
+            fn windowCore(self:*Query,p:*const B.Plan,outer:?*const E.Context) Error!List {
+                const rows=try self.run(p.sources[0].plan,outer);
+                for(p.windows[0..p.window_count]) |*win| {
+                    var order:[2*config.columns]B.SortKey=undefined;var count:usize=0;
+                    for(win.partition[0..win.partition_count]) |column| {order[count]=.{.column=column,.descending=false,.nulls_first=true};count+=1;}
+                    for(win.order[0..win.order_count]) |key| {order[count]=key;count+=1;}
+                    try self.sortRows(rows,order[0..count]);
+                    const row_handles=self.handles(rows);var first:usize=0;
+                    while(first<row_handles.len) {
+                        var end=first+1;
+                        while(end<row_handles.len) {
+                            try self.session.checkpoint();if(!self.equalColumns(row_handles[first],row_handles[end],win.partition[0..win.partition_count])) break;end+=1;
+                        }
+                        if(win.kind!=.aggregate) {
+                            var rank:usize=1;var dense:usize=1;
+                            for(first..end) |i| {
+                                try self.session.checkpoint();
+                                if(i!=first and !try self.windowPeers(row_handles[i-1],row_handles[i],win)){rank=i-first+1;dense+=1;}
+                                self.work.cells[row_handles[i]+win.result]=.{.integer=@intCast(switch(win.kind){.rank=>rank,.dense_rank=>dense,.row_number=>i-first+1,.aggregate=>unreachable})};
+                            }
+                        } else {
+                            var state:Accumulator=.{};
+                            const full=win.frame==.full or (win.frame==.default and win.order_count==0);
+                            if(full) {
+                                for(row_handles[first..end]) |at| try self.windowAccumulate(win,&state,at);
+                                const value=try self.finishAggregate(&win.aggregate,&state);
+                                for(row_handles[first..end]) |at| {try self.session.checkpoint();self.work.cells[at+win.result]=value;}
+                            } else {
+                                var begin=first;
+                                while(begin<end) {
+                                    var peer_end=begin+1;
+                                    if(win.frame==.default) while(peer_end<end and try self.windowPeers(row_handles[begin],row_handles[peer_end],win)):(peer_end+=1) {};
+                                    for(row_handles[begin..peer_end]) |at| try self.windowAccumulate(win,&state,at);
+                                    const value=try self.finishAggregate(&win.aggregate,&state);
+                                    for(row_handles[begin..peer_end]) |at| {try self.session.checkpoint();self.work.cells[at+win.result]=value;}
+                                    begin=peer_end;
+                                }
+                            }
+                        }
+                        first=end;
+                    }
+                }
+                const tuples:Tuples=.{.start=rows.start,.count=rows.count,.width=1};
+                const output=try self.project(p,tuples,outer);return self.finish(p,output);
+            }
+
             fn core(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                if(p.window_count!=0) return self.windowCore(p,outer);
                 if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(self.repeatable()) {
                     const at=self.mark();const stats=self.work.stream_stats;
                     if(self.nestedFactorGroup(p,outer)) |result| {if(result) |rows| return rows;} else |err| {

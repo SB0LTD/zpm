@@ -839,6 +839,7 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.atZone(&value, zone.text.slice(), ctx.session);
                 },
                 .function => switch (n.func) {
+                    .window_call => unreachable,
                     .greatest, .least => {
                         var best: V.Cell = .null_value;
                         var item = n.b;

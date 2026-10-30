@@ -202,6 +202,8 @@ pub const Error = error{
     WorkspaceCapacity,
     /// SQLSTATE 42803: an ungrouped column or misplaced aggregate.
     GroupingError,
+    /// SQLSTATE 42P20: misplaced or nested window function.
+    WindowingError,
     /// SQLSTATE 42702: an unqualified column name matches several relations.
     AmbiguousColumn,
     /// SQLSTATE 21000: a scalar subquery returned more than one row.

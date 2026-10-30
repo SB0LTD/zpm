@@ -36,11 +36,42 @@ contract verifies preflight capacity, unsupported-token, range and alias errors.
 Native PostgreSQL 16/18 server differential qualification and the original 5M
 dbMeter query remain required before declaring this concrete gate closed.
 
-## Q06 remains open
+## Window functions (Q06 candidate)
 
-RANK OVER, aggregate windows, partition/order/frame processing, and ROLLUP must
-be implemented in parser/binder/execution with caller-owned storage and
-cancellation. Do not rewrite the reviewer's SQL or expected results to avoid
+The parser/binder now admit `OVER (...)` with partition expressions, independent
+ordering and NULL placement. RANK, DENSE_RANK, ROW_NUMBER and the existing
+ordinary aggregate families run over caller-owned materialized window inputs.
+Window inputs are produced after WHERE/grouping/HAVING, with final ordering,
+DISTINCT, OFFSET and LIMIT applied after windows. A grouped CTE's numeric total
+can feed `SUM(revenue) OVER ()` before a top-N limit.
+
+Default ordered aggregate frames include the complete current peer group;
+unordered defaults cover the full partition. ROWS UNBOUNDED PRECEDING,
+ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, and the full unbounded ROWS
+frame are provided. Ranking retains peer gaps. Each window keeps its own sort
+keys; preceding window results are not reused as aggregate inputs. NULL/empty
+input and aggregate result types use the existing typed SQL implementation.
+
+The bound plan separates input materialization from window evaluation and final
+projection, without a heap or persistent cache. Dependencies and window outputs
+use the caller's existing expression, plan, column and query-workspace budgets;
+the dependency count is bounded by Config.columns, windows by Config.columns,
+and each query block containing windows adds one private plan. Exhaustion is a statement error. Work and
+cancellation are checked through sorting, partition/peer scans, accumulation and
+publication; no failed statement publishes partial results. Misplaced/nested
+windows report PostgreSQL SQLSTATE 42P20.
+
+The candidate replays 66 captured PostgreSQL queries and has 8,844 native
+assertions including a work-limit and cancellation sweep across every execution
+checkpoint. Full three-OS/native/server and original dbMeter qualification remain
+pending. FILTER/DISTINCT window aggregates, bounded/moving frames, explicit
+RANGE/GROUPS, named windows and correlated subqueries in the same window target
+projection remain unsupported. This is not complete PostgreSQL window coverage.
+
+## Remaining Q06 work
+
+ROLLUP and the unsupported window forms still require implementation and
+qualification. Do not rewrite the reviewer's SQL or expected results to avoid
 these operators. Preserve peer ties, NULL ordering, empty input, exact numeric
 types, HAVING-before-window and LIMIT-after-window semantics. Rollup levels must
 remain distinct from real NULL groups; subtotals cannot average group averages

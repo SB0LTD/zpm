@@ -188,6 +188,7 @@ pub fn Binder(comptime config: types.Config) type {
             plan: u16 = none,
             /// Aggregate calls are allowed (targets, HAVING, ORDER BY).
             aggregates: bool = false,
+            windows: bool = false,
             saw_aggregate: ?*bool = null,
             ctes: ?*const CteEnv = null,
         };
@@ -209,12 +210,22 @@ pub fn Binder(comptime config: types.Config) type {
             probe: u16 = none,
         };
 
+        pub const Window=struct {
+            kind:Ast.WindowKind=.aggregate,
+            aggregate:Agg=.{.kind=.none,.arg=none,.filter=none,.distinct=false,.arg_ty=.unknown,.ty=.unknown},
+            argument:u16=none,result:u16=0,output_node:u16=none,
+            partition:[config.columns]u16=undefined,partition_count:usize=0,
+            order:[config.columns]SortKey=undefined,order_count:usize=0,
+            frame:Ast.Frame=.default,
+        };
+
         pub const Distinct = enum { none, all, on };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
         /// columns, then resjunk sort keys.
         pub const Plan = struct {
+            windows:[config.columns]Window=undefined,window_count:usize=0,
             set_op: ast.SetOp = .none,
             set_all: bool = false,
             left: u16 = none,
@@ -616,6 +627,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (!scope.aggregates) return error.GroupingError;
             var inner = scope.*;
             inner.aggregates = false;
+            inner.windows = false;
             var kind = kind_in;
             if (n.star) {
                 if (kind != .count or n.distinct) return error.Syntax;
@@ -637,7 +649,19 @@ pub fn Binder(comptime config: types.Config) type {
                 try typeExpr(context, &inner, n.c);
                 try booleanArgument(context, n.c);
             }
-            const result: ast.Type = switch (kind) {
+            const result=try aggregateType(context,n,kind,arg,arg_ty);
+            n.kind = .aggregate;
+            n.agg = kind;
+            n.a = n.b;
+            n.b = none;
+            n.ty = result;
+            n.typmod = -1;
+            n.constant = false;
+            if (scope.saw_aggregate) |flag| flag.* = true;
+        }
+
+        fn aggregateType(context:*const Context,n:*ast.Node,kind:ast.Agg,arg:u16,arg_ty:ast.Type) Error!ast.Type {
+            return switch (kind) {
                 .count, .count_star => .int8,
                 .sum => switch (arg_ty) {
                     .int2, .int4 => .int8,
@@ -662,17 +686,38 @@ pub fn Binder(comptime config: types.Config) type {
                 .bool_and, .bool_or => if (arg_ty == .boolean) .boolean else return error.UndefinedFunction,
                 .none => unreachable,
             };
-            n.kind = .aggregate;
-            n.agg = kind;
-            n.a = n.b;
-            n.b = none;
-            n.ty = result;
-            n.typmod = -1;
-            n.constant = false;
-            if (scope.saw_aggregate) |flag| flag.* = true;
+        }
+
+        fn typeWindow(context:*const Context,scope:*const Scope,n:*ast.Node) Error!void {
+            if(!scope.windows) return error.WindowingError;
+            if(n.distinct or n.c!=none) return error.UnsupportedStatement;
+            const spec=&context.pool.windows[n.window];
+            var inner=scope.*;inner.windows=false;
+            const name=toName(context,n.name);
+            const ranking=types.same(name.slice(),"rank") or types.same(name.slice(),"dense_rank") or types.same(name.slice(),"row_number");
+            if(ranking) {
+                if(n.b!=none or n.star) return error.UndefinedFunction;
+                n.ty=.int8;
+            } else {
+                var kind=aggregateKind(context,n);
+                if(kind==.none) return error.UndefinedFunction;
+                if(n.star) {if(kind!=.count) return error.Syntax;kind=.count_star;}
+                else if(n.b==none or context.node(n.b).next!=none) return error.UndefinedFunction;
+                if(n.b!=none) try typeExpr(context,&inner,n.b);
+                var ty:ast.Type=if(n.b==none) .unknown else context.node(n.b).ty;
+                if(n.b!=none and ty==.unknown) {
+                    switch(kind){.count,.min,.max=>try coerce(context,n.b,.text),.bool_and,.bool_or=>try coerce(context,n.b,.boolean),else=>return error.AmbiguousFunction}
+                    ty=context.node(n.b).ty;
+                }
+                n.ty=try aggregateType(context,n,kind,n.b,ty);n.agg=kind;
+            }
+            for(spec.partition[0..spec.partition_count]) |id| {try valueExpr(context,&inner,id);try sortableType(context.node(id).ty);}
+            for(spec.order[0..spec.order_count]) |key| {try valueExpr(context,&inner,key.expr);try sortableType(context.node(key.expr).ty);}
+            n.func=.window_call;n.constant=false;
         }
 
         fn typeFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            if(n.window!=none) return typeWindow(context,scope,n);
             switch (n.func) {
                 // Bound internally (identity defaults, reg casts): already typed.
                 .identity_next, .regclass_in, .regtype_in, .regclass_out, .regtype_out => {
@@ -693,6 +738,7 @@ pub fn Binder(comptime config: types.Config) type {
                 count += 1;
             }
             switch (n.func) {
+                .window_call => unreachable,
                 .none => return error.UndefinedFunction,
                 .greatest, .least => {
                     if (count == 0) return error.Syntax;
@@ -2461,7 +2507,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (a == none or b == none) return false;
             const x = context.node(a);
             const y = context.node(b);
-            if (x.kind != y.kind or x.ty != y.ty) return false;
+            if (x.kind != y.kind or x.ty != y.ty or x.window!=none or y.window!=none) return false;
             switch (x.kind) {
                 .column => return x.relation == y.relation and x.column == y.column and x.level == y.level,
                 .int_literal => return x.integer == y.integer,
@@ -2534,6 +2580,11 @@ pub fn Binder(comptime config: types.Config) type {
         fn groupify(context: *const Context, p: *Plan, id: u16) Error!void {
             if (id == none) return;
             const n = context.node(id);
+            if(n.window!=none) {
+                const spec=&context.pool.windows[n.window];
+                for(spec.partition[0..spec.partition_count]) |item| try groupify(context,p,item);
+                for(spec.order[0..spec.order_count]) |key| try groupify(context,p,key.expr);
+            }
             for (p.keys[0..p.key_count], 0..) |key, index| {
                 if (sameExpr(context, id, key)) return groupColumn(n, index, context.node(key).typmod);
             }
@@ -2729,6 +2780,7 @@ pub fn Binder(comptime config: types.Config) type {
             }
             var saw = false;
             scope.aggregates = true;
+            scope.windows = true;
             scope.saw_aggregate = &saw;
             for (q.targets[0..q.count]) |*target| {
                 if (target.star) {
@@ -2741,10 +2793,12 @@ pub fn Binder(comptime config: types.Config) type {
             }
             p.width = p.count;
             if (q.having != none) {
+                scope.windows=false;
                 try typeExpr(context, &scope, q.having);
                 try booleanArgument(context, q.having);
                 p.having = q.having;
             }
+            scope.windows=true;
             var order_refs: [config.columns]OrderRef = undefined;
             for (q.order[0..q.order_count], 0..) |*key, index| order_refs[index] = try orderRef(context, &scope, p, key.expr);
             var on_refs: [config.columns]OrderRef = undefined;
@@ -2805,7 +2859,72 @@ pub fn Binder(comptime config: types.Config) type {
                 for (order[0..order_count]) |key| appendKey(p, key);
             }
             try checkCounts(q, p);
+            try lowerWindows(context,id);
             return id;
+        }
+
+        fn containsWindow(context:*const Context,id:u16) bool {
+            if(id==none) return false;const n=context.node(id);if(n.window!=none) return true;
+            if(n.kind==.scalar_subquery or n.kind==.exists_subquery) return false;
+            if(containsWindow(context,n.a) or containsWindow(context,n.c)) return true;
+            if(listOwner(n.kind)) {var item=n.b;while(item!=none):(item=context.node(item).next) if(containsWindow(context,item)) return true;}
+            else if(containsWindow(context,n.b)) return true;
+            return false;
+        }
+        fn windowInput(context:*const Context,input:*Plan,id:u16) Error!u16 {
+            for(input.targets[0..input.count],0..) |old,i| if(sameExpr(context,old,id)) return @intCast(i);
+            if(input.count==config.columns) return error.StatementTooComplex;
+            const index=input.count;input.count+=1;input.targets[index]=try cloneTree(context,id);
+            input.tys[index]=context.node(id).ty;input.typmods[index]=outputTypmod(context,id);
+            input.names[index]=literalName("window_input");return @intCast(index);
+        }
+        fn lowerWindowTree(context:*const Context,p:*Plan,input:*Plan,id:u16) Error!void {
+            if(id==none) return;const n=context.node(id);
+            if(n.window!=none) {
+                if(p.window_count==config.columns) return error.StatementTooComplex;
+                const spec=&context.pool.windows[n.window];
+                var win:Window=.{.frame=spec.frame,.output_node=id};
+                const name=toName(context,n.name);
+                win.kind=if(types.same(name.slice(),"rank")) .rank else if(types.same(name.slice(),"dense_rank")) .dense_rank else if(types.same(name.slice(),"row_number")) .row_number else .aggregate;
+                if(win.kind==.aggregate) {
+                    win.argument=if(n.agg==.count_star) none else try windowInput(context,input,n.b);
+                    win.aggregate=.{.kind=n.agg,.arg=none,.filter=none,.distinct=false,.arg_ty=if(n.b==none) .unknown else context.node(n.b).ty,.ty=n.ty};
+                }
+                for(spec.partition[0..spec.partition_count]) |item| {win.partition[win.partition_count]=try windowInput(context,input,item);win.partition_count+=1;}
+                for(spec.order[0..spec.order_count]) |key| {
+                    win.order[win.order_count]=.{.column=try windowInput(context,input,key.expr),.descending=key.descending,.nulls_first=nullsFirst(&key)};win.order_count+=1;
+                }
+                const next=n.next;const ty=n.ty;
+                n.*=.{.kind=.column,.relation=0,.ty=ty,.next=next};
+                p.windows[p.window_count]=win;p.window_count+=1;return;
+            }
+            if(n.kind==.column and n.level==0) {
+                const column=try windowInput(context,input,id);n.relation=0;n.column=column;return;
+            }
+            if(n.kind==.scalar_subquery or n.kind==.exists_subquery or n.kind==.in_subquery) {
+                if(plansOf(context).items[@intCast(n.integer)].correlated) return error.UnsupportedStatement;
+                if(n.kind!=.in_subquery) return;
+            }
+            try lowerWindowTree(context,p,input,n.a);try lowerWindowTree(context,p,input,n.c);
+            if(listOwner(n.kind)) {var item=n.b;while(item!=none):(item=context.node(item).next) try lowerWindowTree(context,p,input,item);}
+            else try lowerWindowTree(context,p,input,n.b);
+        }
+        fn lowerWindows(context:*const Context,id:u16) Error!void {
+            const plans=plansOf(context);const p=&plans.items[id];var active=false;
+            for(p.targets[0..p.width]) |target| active=active or containsWindow(context,target);
+            if(!active) return;
+            const child=try plans.add();const input=&plans.items[child];input.*=p.*;
+            input.count=0;input.width=0;input.window_count=0;input.order_count=0;input.distinct=.none;
+            input.limit=0xffffffffffffffff;input.offset=0;
+            for(p.targets[0..p.width]) |*target| {
+                target.*=try cloneTree(context,target.*);try lowerWindowTree(context,p,input,target.*);
+            }
+            input.width=input.count+p.window_count;
+            for(p.windows[0..p.window_count],0..) |*win,index| {
+                win.result=@intCast(input.count+index);context.node(win.output_node).column=win.result;
+                input.targets[win.result]=try context.pool.add(.{.kind=.null_literal,.ty=.unknown,.constant=true});
+            }
+            p.source_count=1;p.sources[0]=.{.plan=child};p.where=none;p.grouped=false;p.key_count=0;p.agg_count=0;p.having=none;
         }
 
         fn member(list: []const u16, column: u16) bool {
