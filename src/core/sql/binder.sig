@@ -568,6 +568,7 @@ pub fn Binder(comptime config: types.Config) type {
             const name = toName(context, n.name);
             const table = [_]struct { name: []const u8, func: ast.Func }{
                 .{ .name = "now", .func = .now },
+                .{ .name = "to_char", .func = .to_char },
                 .{ .name = "round", .func = .round },
                 .{ .name = "transaction_timestamp", .func = .transaction_timestamp },
                 .{ .name = "statement_timestamp", .func = .statement_timestamp },
@@ -703,6 +704,17 @@ pub fn Binder(comptime config: types.Config) type {
                     n.b = try convertList(context, n.b, target);
                     n.ty = target;
                     n.constant = listConstant(context, n.b);
+                },
+                .to_char => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const first=n.b;const second=context.node(first).next;
+                    const ty=context.node(first).ty;
+                    if(ty==.unknown) return error.AmbiguousFunction;
+                    const target:ast.Type=switch(ty){.date=>.timestamptz,.timestamp,.timestamptz=>ty,else=>return error.UndefinedFunction};
+                    const argument=try convert(context,first,target,-1,.implicit);
+                    const format=try convert(context,second,.text,-1,.implicit);
+                    context.node(argument).next=format;context.node(format).next=none;
+                    n.b=argument;n.ty=.text;n.constant=isConstant(context,argument) and isConstant(context,format);
                 },
                 .round => {
                     if (count != 1 and count != 2) return error.UndefinedFunction;

@@ -40,14 +40,14 @@ pub const TypeName = types.Type;
 pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists, is_distinct, is_not_distinct };
 
 /// Built-in functions bound by name.
-pub const Func = enum { none, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, greatest, least };
+pub const Func = enum { none, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, greatest, least };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
 /// clock or subquery in a pure function never makes its effects repeatable.
 pub fn canRepeatFunction(func: Func) bool {
     return switch (func) {
-        .round, .greatest, .least => true,
+        .to_char, .round, .greatest, .least => true,
         else => false,
     };
 }
@@ -63,7 +63,7 @@ pub fn immutableFunction(func: Func) bool {
 
 pub fn strictFunction(func: Func) bool {
     return switch (func) {
-        .round, .jsonb_typeof, .jsonb_array_length,
+        .to_char, .round, .jsonb_typeof, .jsonb_array_length,
         .nextval, .currval, .setval, .lastval, .identity_next,
         .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp,
         .current_timestamp, .current_date, .current_database, .current_schema,

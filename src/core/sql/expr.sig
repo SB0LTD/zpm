@@ -12,6 +12,7 @@ const lexer = @import("lexer.sig");
 const ast = @import("ast.sig");
 const value_module = @import("value.sig");
 const temporal = @import("temporal.sig");
+const datetime_format = @import("datetime_format.sig");
 const float_text = @import("float_text.sig");
 const Error = types.Error;
 const none = ast.none;
@@ -849,6 +850,16 @@ pub fn Eval(comptime config: types.Config) type {
                             if ((n.func == .greatest and order > 0) or (n.func == .least and order < 0)) best = candidate;
                         }
                         return best;
+                    },
+                    .to_char => {
+                        const argument=try eval(ctx,n.b);const format=try eval(ctx,node(ctx,n.b).next);
+                        if(argument==.null_value or format==.null_value or format.text.len==0) return .null_value;
+                        const us=if(argument==.timestamp) argument.timestamp else argument.timestamptz;
+                        if(!temporal.finiteTimestamp(us)) return .null_value;
+                        const local=if(argument==.timestamptz) temporal.toLocal(&ctx.session.zone,us) else us;
+                        var text:V.Text=.{};
+                        text.len=try datetime_format.format(local,format.text.slice(),&text.bytes);
+                        return .{.text=text};
                     },
                     .round => {
                         const argument = try eval(ctx, n.b);
