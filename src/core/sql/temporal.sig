@@ -115,9 +115,9 @@ pub fn offsetAt(zone: *const Zone, utc_us: i64) i32 {
 }
 
 /// UTC microseconds of a local time in `zone` (DetermineTimeZoneOffset).
-pub fn toUtc(zone: *const Zone, local_us: i64) i64 {
+pub fn toUtc(zone: *const Zone, local_us: i64) Error!i64 {
     const seconds = @divFloor(local_us, usecs_per_second);
-    const sub_second = local_us - seconds * usecs_per_second;
+    const sub_second = @mod(local_us, usecs_per_second);
     const local = seconds + unix_epoch_seconds;
     const utc: i64 = switch (zone.kind) {
         .utc => local,
@@ -128,7 +128,7 @@ pub fn toUtc(zone: *const Zone, local_us: i64) i64 {
             break :blk tzif.resolveLocal(local, tzif.nextBoundary(&v, local - 86400), tzif.infoAt(&v, local - 86400));
         },
     };
-    return (utc - unix_epoch_seconds) * usecs_per_second + sub_second;
+    return checkedAdd(try checkedMul(utc - unix_epoch_seconds, usecs_per_second), sub_second);
 }
 
 pub fn toLocal(zone: *const Zone, utc_us: i64) i64 {
@@ -352,17 +352,17 @@ pub fn parseTimestamp(input: []const u8, kind: Kind, session_zone: *const Zone, 
     if (fields.year < -4713 or fields.year > 294277) return error.DatetimeFieldOverflow;
     const days = dateOf(fields.year, fields.month, fields.day);
     if (days < min_date or days > end_date) return error.DatetimeFieldOverflow;
-    const local = days * usecs_per_day + fields.time;
+    const local = try checkedAdd(try checkedMul(days, usecs_per_day), fields.time);
     var value = local;
     if (kind == .timestamptz) {
         if (fields.zone_seconds) |offset| {
-            value = local - offset * usecs_per_second;
+            value = try checkedAdd(local, -offset * usecs_per_second);
         } else if (fields.named) |name| {
             var zone: Zone = .{};
             const lookup = resolver.lookup orelse return error.InvalidSettingValue;
             try lookup(resolver.context, name, &zone);
-            value = toUtc(&zone, local);
-        } else value = toUtc(session_zone, local);
+            value = try toUtc(&zone, local);
+        } else value = try toUtc(session_zone, local);
     } else if (fields.named) |name| {
         // A zone name on TIMESTAMP input must still be a valid zone.
         var zone: Zone = .{};
@@ -598,16 +598,21 @@ const Accumulator = struct {
         self.us = try checkedAdd(self.us, sign * micros);
     }
 
+    // Sign each part before addition so INT64_MIN remains representable.
+    fn signedMicros(sign: i64, whole: i64, scale: i64, fraction_us: i64) Error!i64 {
+        return checkedAdd(try checkedMul(sign * whole, scale), sign * fraction_us);
+    }
+
     fn add(self: *Accumulator, amount: Number, unit: Unit) Error!void {
         const sign: i64 = if (amount.negative) -1 else 1;
         const whole = amount.whole;
         const nanos = amount.nanos;
         switch (unit) {
-            .microsecond => self.us = try checkedAdd(self.us, sign * (whole + @divTrunc(nanos + 500000000, 1000000000))),
-            .millisecond => self.us = try checkedAdd(self.us, sign * (try checkedMul(whole, 1000) + @divTrunc(nanos + 500000, 1000000))),
-            .second => self.us = try checkedAdd(self.us, sign * (try checkedMul(whole, usecs_per_second) + @divTrunc(nanos + 500, 1000))),
-            .minute => self.us = try checkedAdd(self.us, sign * (try checkedMul(whole, usecs_per_minute) + @divTrunc(nanos * 60 + 500, 1000))),
-            .hour => self.us = try checkedAdd(self.us, sign * (try checkedMul(whole, usecs_per_hour) + @divTrunc(nanos * 3600 + 500, 1000))),
+            .microsecond => self.us = try checkedAdd(self.us, try signedMicros(sign, whole, 1, @divTrunc(nanos + 500000000, 1000000000))),
+            .millisecond => self.us = try checkedAdd(self.us, try signedMicros(sign, whole, 1000, @divTrunc(nanos + 500000, 1000000))),
+            .second => self.us = try checkedAdd(self.us, try signedMicros(sign, whole, usecs_per_second, @divTrunc(nanos + 500, 1000))),
+            .minute => self.us = try checkedAdd(self.us, try signedMicros(sign, whole, usecs_per_minute, @divTrunc(nanos * 60 + 500, 1000))),
+            .hour => self.us = try checkedAdd(self.us, try signedMicros(sign, whole, usecs_per_hour, @divTrunc(nanos * 3600 + 500, 1000))),
             .day => {
                 self.days = try checkedAdd(self.days, sign * whole);
                 try self.fractionalDays(sign, nanos, 1);
@@ -662,6 +667,13 @@ fn number(s: *Scanner) Error!?Number {
 
 /// IntervalStyle postgres input: `[@] {number unit | [+-]hh:mm[:ss[.f]]}... [ago]`.
 pub fn parseInterval(input: []const u8) Error!Interval {
+    return parseIntervalFields(input) catch |err| switch (err) {
+        error.DatetimeFieldOverflow => error.IntervalFieldOverflow,
+        else => err,
+    };
+}
+
+fn parseIntervalFields(input: []const u8) Error!Interval {
     const text = trim(input);
     var s: Scanner = .{ .text = text };
     var acc: Accumulator = .{};
@@ -731,9 +743,9 @@ pub fn parseInterval(input: []const u8) Error!Interval {
     }
     if (!any) return error.InvalidDatetimeFormat;
     if (ago) {
-        acc.months = -acc.months;
-        acc.days = -acc.days;
-        acc.us = -acc.us;
+        acc.months = try checkedMul(acc.months, -1);
+        acc.days = try checkedMul(acc.days, -1);
+        acc.us = try checkedMul(acc.us, -1);
     }
     if (acc.months < -2147483648 or acc.months > 2147483647 or acc.days < -2147483648 or acc.days > 2147483647) return error.DatetimeFieldOverflow;
     return .{ .months = @intCast(acc.months), .days = @intCast(acc.days), .us = acc.us };
@@ -776,7 +788,7 @@ fn addCalendar(local: i64, months: i32, days: i32) Error!i64 {
         const month = total - year * 12 + 1;
         if (year < -4713 or year > 294277) return error.DatetimeFieldOverflow;
         const day = @min(civil.day, monthLength(year, month));
-        value = dateOf(year, month, day) * usecs_per_day + time;
+        value = try checkedAdd(try checkedMul(dateOf(year, month, day), usecs_per_day), time);
     }
     if (days != 0) value = try checkedAdd(value, try checkedMul(days, usecs_per_day));
     return value;
@@ -796,7 +808,7 @@ pub fn timestamptzPlus(us: i64, span: Interval, zone: *const Zone) Error!i64 {
     var value = us;
     if (span.months != 0 or span.days != 0) {
         const local = try addCalendar(toLocal(zone, us), span.months, span.days);
-        value = toUtc(zone, local);
+        value = try toUtc(zone, local);
     }
     value = try checkedAdd(value, span.us);
     if (!validTimestamp(value)) return error.DatetimeFieldOverflow;
@@ -823,7 +835,7 @@ pub fn timestampDifference(a: i64, b: i64) Error!Interval {
 
 pub fn datePlusDays(days: i32, delta: i64) Error!i32 {
     if (!finiteDate(days)) return days;
-    const value = @as(i64, days) + delta;
+    const value = try checkedAdd(days, delta);
     if (!validDate(value)) return error.DatetimeFieldOverflow;
     return @intCast(value);
 }
@@ -831,7 +843,7 @@ pub fn datePlusDays(days: i32, delta: i64) Error!i32 {
 pub fn dateToTimestamp(days: i32) Error!i64 {
     if (days == date_no_begin) return timestamp_no_begin;
     if (days == date_no_end) return timestamp_no_end;
-    const value = @as(i64, days) * usecs_per_day;
+    const value = try checkedMul(days, usecs_per_day);
     if (!validTimestamp(value)) return error.DatetimeFieldOverflow;
     return value;
 }

@@ -49,14 +49,22 @@ pass all 32 active checks, including PG16/PG18 memory/durable+SCRAM, hosted exac
 artifacts and native SB0X/SB0K. The broad legacy graph retains four unrelated
 SABR/TLS/TTS failures, with 300 successes and 22 skips; it is not reported green.
 
+### Temporal correctness follow-up
+
+The SQLF-01 overflow paths and SQLF-05 infinite-date subtraction are now covered
+by checked arithmetic/operator fixes and PostgreSQL boundary regressions; see
+[SQL_TEMPORAL_BOUNDARIES.md](SQL_TEMPORAL_BOUNDARIES.md). This does not change the
+118-program feature inventory or close interval syntax, JSONB or wider temporal
+feature gaps. The FV-12 formal proof remains open.
+
 ### What is still missing
 
 1. **Correctness before expansion.** General filter/error placement and planner
    constant folding remain unqualified. Retain the LIKE JOIN/WHERE mismatch and
    native PG16/PG18 projection-timing disagreement. The newer hardening audit's
-   SQLF temporal overflow/interval parsing, JSONB concatenation, infinite-date
-   subtraction and ambiguous-binding cases remain open; the affected temporal,
-   value, numeric and JSON source files were unchanged by this consolidation.
+   SQLF interval parsing, JSONB concatenation and ambiguous-binding cases remain
+   open. The temporal follow-up above changes temporal/value/binder source after
+   the consolidation baseline; it does not close the remaining feature probes.
 2. **Common schema and types.** VARCHAR/CHAR, UUID/BYTEA, TIME/TIMETZ, arrays and
    general records; SERIAL, IF [NOT] EXISTS, ALTER/TRUNCATE, views/schemas,
    secondary indexes and table/composite/UNIQUE/CHECK/FK/deferred constraints

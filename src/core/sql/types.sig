@@ -197,6 +197,8 @@ pub const Error = error{
     InvalidDatetimeFormat,
     /// SQLSTATE 22008: a date/time field or value is out of range.
     DatetimeFieldOverflow,
+    /// SQLSTATE 22015: an input interval field is out of range.
+    IntervalFieldOverflow,
     /// SQLSTATE 22P05: \u0000 in JSONB.
     UntranslatableCharacter,
     /// SQLSTATE 0A000: the statement needs a wall clock and none is available.

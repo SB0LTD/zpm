@@ -194,6 +194,36 @@ fn temporals() !void {
     try rejects("SELECT 'garbage'::date", error.InvalidDatetimeFormat);
     try rejects("SELECT 'garbage'::interval", error.InvalidDatetimeFormat);
     try rejects("SELECT '2026-01-01 12:00 Mars/Base'::timestamptz", error.InvalidSettingValue);
+    // Exact text/error oracle captured from native PostgreSQL 16.15 (UTC).
+    try rejects("SELECT '294277-06-01'::timestamp", error.DatetimeFieldOverflow);
+    try rejects("SELECT '300000-01-01'::date::timestamp", error.DatetimeFieldOverflow);
+    try rejects("SELECT '300000-01-01'::date::timestamptz", error.DatetimeFieldOverflow);
+    try rejects("SELECT timestamp '294276-12-31' + interval '1 month'", error.DatetimeFieldOverflow);
+    try rejects("SELECT timestamptz '294276-12-31 00:00:00+00' + interval '1 month'", error.DatetimeFieldOverflow);
+    try rejects("SELECT date 'infinity' - date 'infinity'", error.DatetimeFieldOverflow);
+    try rejects("SELECT date '-infinity' - date '2000-01-01'", error.DatetimeFieldOverflow);
+    try rejects("SELECT date '2000-01-01' - date 'infinity'", error.DatetimeFieldOverflow);
+    try rejects("SELECT date '2000-01-01' + 1::bigint", error.UndefinedFunction);
+    try rejects("SELECT 1::bigint + date '2000-01-01'", error.UndefinedFunction);
+    try rejects("SELECT date '2000-01-01' - 1::bigint", error.UndefinedFunction);
+    try rejects("SELECT date '2000-01-01' - (-2147483648)::integer", error.DatetimeFieldOverflow);
+    try row("SELECT (date '5874897-12-31' - date '4714-11-24 BC')::text, (date '4714-11-24 BC' - date '5874897-12-31')::text", "2147483493|-2147483493");
+    try row("SELECT ('294276-12-31 23:59:59.999999'::timestamp(0))::text, ('4714-11-24 00:00:00.000001 BC'::timestamp(0))::text", "294277-01-01 00:00:00|4714-11-24 00:00:00 BC");
+    try row("SELECT ('294277-01-01 00:00:00+01'::timestamptz)::text, (date 'infinity' + 1)::text, (date '-infinity' - 1)::text", "294276-12-31 23:00:00+00|infinity|-infinity");
+    try row("SELECT 1", "1");
+    try rejects("SELECT '9223372036854.9999999 seconds'::interval", error.IntervalFieldOverflow);
+    try rejects("SELECT '9223372036854775807.9 microseconds'::interval", error.IntervalFieldOverflow);
+    try rejects("SELECT '-9223372036854775807.9 microseconds ago'::interval", error.IntervalFieldOverflow);
+    try rejects("SELECT '9223372036854776 milliseconds'::interval", error.IntervalFieldOverflow);
+    try rejects("SELECT '153722867281 minutes'::interval", error.IntervalFieldOverflow);
+    try rejects("SELECT '2562047789 hours'::interval", error.IntervalFieldOverflow);
+    try rejects("SELECT '2147483648 days'::interval", error.IntervalFieldOverflow);
+    try rejects("SELECT '2147483648 months'::interval", error.IntervalFieldOverflow);
+    try rejects("SELECT -interval '-2147483648 months'", error.DatetimeFieldOverflow);
+    try rejects("SELECT interval '2147483647 months' + interval '1 month'", error.DatetimeFieldOverflow);
+    try row("SELECT '-9223372036854775807.9 microseconds'::interval::text, '9223372036854775807 microseconds'::interval::text", "-2562047788:00:54.775808|2562047788:00:54.775807");
+    try row("SELECT 1", "1");
+    try rejects("SELECT '294277-01-09 04:00:54.775807-15:59'::timestamptz", error.DatetimeFieldOverflow);
     // Zones: fixed offset (east) and a POSIX DST rule.
     db.session.zone = .{ .kind = .fixed, .offset = 5 * 3600 + 1800 };
     try row("SELECT '2026-10-22T12:00:00Z'::timestamptz, '2026-10-22 12:00'::timestamptz", "2026-10-22 17:30:00+05:30|2026-10-22 12:00:00+05:30");
@@ -221,6 +251,45 @@ fn temporals() !void {
     try db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, at TIMESTAMPTZ(3), day DATE, span INTERVAL)", &result);
     try db.execute("INSERT INTO events VALUES (1, '2026-10-22 12:00:00.12345Z', '2026-10-22', '1 day 2 hours')", &result);
     try row("SELECT at, day, span FROM events", "2026-10-22 12:00:00.123+00|2026-10-22|1 day 02:00:00");
+}
+
+/// Exercise every candidate timestamp year against wide-integer range math.
+/// This is independent of the checked-i64 implementation under test.
+fn temporalRangeProperties() !void {
+    const t = sql.temporal;
+    var text_buffer: [96]u8 = undefined;
+    const zone: t.Zone = .{};
+    var year: i64 = -4713;
+    while (year <= 294277) : (year += 1) {
+        const day = t.dateOf(year, 12, 31);
+        const wide = @as(i128, day) * t.usecs_per_day;
+        const valid = wide >= t.min_timestamp and wide < t.end_timestamp;
+        const source = try std.fmt.bufPrint(&text_buffer, "{d:0>4}-12-31{s}", .{ @as(u64, @intCast(if (year <= 0) 1 - year else year)), if (year <= 0) " BC" else "" });
+        const parsed = t.parseTimestamp(source, .timestamp, &zone, .{});
+        const cast = t.dateToTimestamp(@intCast(day));
+        if (valid) {
+            const expected: i64 = @intCast(wide);
+            const actual = parsed catch |err| {
+                std.debug.print("range property {s}: {s}\n", .{ source, @errorName(err) });
+                return err;
+            };
+            try check(actual == expected);
+            try check(try cast == expected);
+            const next = @as(i128, t.dateOf(year + 1, 1, 31)) * t.usecs_per_day;
+            const added = t.timestampPlus(expected, .{ .months = 1 });
+            if (next >= t.min_timestamp and next < t.end_timestamp) {
+                try check(try added == @as(i64, @intCast(next)));
+            } else if (added) |_| return error.InvalidSqlAccepted else |err| try check(err == error.DatetimeFieldOverflow);
+        } else {
+            if (parsed) |_| return error.InvalidSqlAccepted else |err| try check(err == error.DatetimeFieldOverflow);
+            if (cast) |_| return error.InvalidSqlAccepted else |err| try check(err == error.DatetimeFieldOverflow);
+        }
+    }
+    const west: t.Zone = .{ .kind = .fixed, .offset = -12 * 3600 };
+    if (t.toUtc(&west, 9223372036854775807)) |_| return error.InvalidSqlAccepted else |err| try check(err == error.DatetimeFieldOverflow);
+    for ([_]i64{ -9223372036854775808, 9223372036854775807 }) |delta| {
+        if (t.datePlusDays(1, delta)) |_| return error.InvalidSqlAccepted else |err| try check(err == error.DatetimeFieldOverflow);
+    }
 }
 
 /// A minimal TZif v2 file: two types (EST/EDT), two transitions in 2026,
@@ -394,6 +463,7 @@ pub fn main(init: std.process.Init) !void {
     try numeric();
     try floats();
     try temporals();
+    try temporalRangeProperties();
     try tzif();
     try json();
     try changeLog();
