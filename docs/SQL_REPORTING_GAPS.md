@@ -88,8 +88,8 @@ membership state borrows the caller's arena, with explicit capacity errors and
 work/cancellation accounting. Final errors leave the published result untouched.
 
 The candidate matches 31 PostgreSQL fixtures plus visibility, volatile-input,
-poisoned-scratch, capacity, invalid-grouping and checkpoint sweeps: 19,426
-assertions (19,443 with the explicit computed-DISTINCT rejection). It also preserves the prior 6,409-assertion committed group-synopsis
+poisoned-scratch, capacity, invalid-grouping and checkpoint sweeps: 19,443
+assertions. It also preserves the prior 6,409-assertion committed group-synopsis
 contract; that pre-existing synopsis is a separate mechanism, not SQL ROLLUP.
 Snapshot/private-write tests observe the appropriate versions, and volatile
 aggregate arguments execute once per input rather than once per rollup level.
