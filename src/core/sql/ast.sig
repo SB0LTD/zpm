@@ -322,7 +322,7 @@ pub fn Ast(comptime config: types.Config) type {
             nulls_first: ?bool = null,
         };
 
-        pub const WindowKind=enum {aggregate,rank,dense_rank,row_number,lag,lead,percent_rank,cume_dist,ntile};
+        pub const WindowKind=enum {aggregate,rank,dense_rank,row_number,lag,lead,percent_rank,cume_dist,ntile,first_value,last_value,nth_value};
         pub const Frame=enum {default,rows_prefix,full,rows,groups,range};
         pub const BoundKind=enum {unbounded_preceding,preceding,current_row,following,unbounded_following};
         pub const FrameBound=struct {kind:BoundKind=.current_row,offset:u16=none};
