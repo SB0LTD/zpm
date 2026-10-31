@@ -211,6 +211,8 @@ pub const Error = error{
     WindowingError,
     /// SQLSTATE 22013: negative window frame offset.
     InvalidWindowFrameOffset,
+    /// SQLSTATE 22014: NTILE bucket count must be positive.
+    InvalidArgumentForNtile,
     /// SQLSTATE 22004: NULL window frame offset.
     NullWindowFrameOffset,
     /// SQLSTATE 42702: an unqualified column name matches several relations.

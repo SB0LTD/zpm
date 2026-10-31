@@ -736,6 +736,9 @@ pub fn Binder(comptime config: types.Config) type {
             const ty=context.node(bound.offset).ty;
             if(ty!=.unknown and !value.castable(ty,.int8,.assignment)) return error.TypeMismatch;
             bound.offset=try convert(context,bound.offset,.int8,-1,.assignment);
+            // Native planning folds immutable errors even when an optimized
+            // ranking frame or LIMIT0 will avoid runtime offset evaluation.
+            if(generatedConstant(context,bound.offset)) _=try generatedValue(context,bound.offset);
         }
 
         fn offsetWindowName(context:*const Context,n:*const ast.Node) bool {
@@ -766,20 +769,45 @@ pub fn Binder(comptime config: types.Config) type {
                 n.b=arguments[0];n.ty=target;
         }
 
+        fn rankWindowName(context:*const Context,n:*const ast.Node) bool {
+            const name=toName(context,n.name);
+            return types.same(name.slice(),"rank") or types.same(name.slice(),"dense_rank") or types.same(name.slice(),"row_number") or types.same(name.slice(),"percent_rank") or types.same(name.slice(),"cume_dist");
+        }
+        fn typeRankArguments(context:*const Context,scope:*const Scope,n:*ast.Node) Error!void {
+            var inner=scope.*;inner.windows=false;inner.inside_window=true;
+            var item=n.b;
+            while(item!=none) : (item=context.node(item).next) try typeExpr(context,&inner,item);
+            const name=toName(context,n.name);
+            if(n.b!=none) return if(types.same(name.slice(),"row_number")) error.UndefinedFunction else error.WrongObjectType;
+            // Native PostgreSQL also accepts zero-argument window calls as fn(*).
+            n.ty=if(types.same(name.slice(),"percent_rank") or types.same(name.slice(),"cume_dist")) .float8 else .int8;
+        }
+        fn typeNtileArgument(context:*const Context,scope:*const Scope,n:*ast.Node) Error!void {
+            if(n.b==none or n.star or context.node(n.b).next!=none) return error.UndefinedFunction;
+            var inner=scope.*;inner.windows=false;inner.inside_window=true;
+            try typeExpr(context,&inner,n.b);
+            const ty=context.node(n.b).ty;
+            if(ty!=.unknown and ty!=.int2 and ty!=.int4) return error.UndefinedFunction;
+            n.b=try convert(context,n.b,.int4,-1,.implicit);n.ty=.int4;
+        }
+
         fn typeWindow(context:*const Context,scope:*const Scope,n:*ast.Node) Error!void {
             if(!scope.windows) return scope.window_error;
             if(n.distinct) return error.UnsupportedStatement;
             const spec=&context.pool.windows[n.window];
             var inner=scope.*;inner.windows=false;inner.inside_window=true;
             const name=toName(context,n.name);
-            const ranking=types.same(name.slice(),"rank") or types.same(name.slice(),"dense_rank") or types.same(name.slice(),"row_number");
+            const tile=types.same(name.slice(),"ntile");
+            const ranking=rankWindowName(context,n) or tile;
             const offset_window=offsetWindowName(context,n);
             if(offset_window) {
                 try typeOffsetArguments(context,&inner,n);
-            } else if(ranking) {
+            } else if(tile) {
+                try typeNtileArgument(context,&inner,n);
                 if(n.c!=none) return error.UnsupportedStatement;
-                if(n.b!=none or n.star) return error.UndefinedFunction;
-                n.ty=.int8;
+            } else if(ranking) {
+                try typeRankArguments(context,&inner,n);
+                if(n.c!=none) return error.UnsupportedStatement;
             } else {
                 var kind=aggregateKind(context,n);
                 if(kind==.none) return error.UndefinedFunction;
@@ -819,6 +847,9 @@ pub fn Binder(comptime config: types.Config) type {
                 try typeOffsetArguments(context,scope,n);
                 return error.WrongObjectType;
             }
+            if(rankWindowName(context,n)) {try typeRankArguments(context,scope,n);return error.WrongObjectType;}
+            const window_name=toName(context,n.name);
+            if(types.same(window_name.slice(),"ntile")) {try typeNtileArgument(context,scope,n);return error.WrongObjectType;}
             switch (n.func) {
                 // Bound internally (identity defaults, reg casts): already typed.
                 .identity_next, .regclass_in, .regtype_in, .regclass_out, .regtype_out => {
@@ -3033,7 +3064,7 @@ pub fn Binder(comptime config: types.Config) type {
                 const spec=&context.pool.windows[n.window];
                 var win:Window=.{.frame=spec.frame,.start=spec.start,.end=spec.end,.exclude=spec.exclude,.output_node=id};
                 const name=toName(context,n.name);
-                win.kind=if(types.same(name.slice(),"rank")) .rank else if(types.same(name.slice(),"dense_rank")) .dense_rank else if(types.same(name.slice(),"row_number")) .row_number else if(types.same(name.slice(),"lag")) .lag else if(types.same(name.slice(),"lead")) .lead else .aggregate;
+                win.kind=if(types.same(name.slice(),"rank")) .rank else if(types.same(name.slice(),"dense_rank")) .dense_rank else if(types.same(name.slice(),"row_number")) .row_number else if(types.same(name.slice(),"lag")) .lag else if(types.same(name.slice(),"lead")) .lead else if(types.same(name.slice(),"percent_rank")) .percent_rank else if(types.same(name.slice(),"cume_dist")) .cume_dist else if(types.same(name.slice(),"ntile")) .ntile else .aggregate;
                 if(win.kind==.lag or win.kind==.lead) {
                     win.offset_repeatable=repeatableWindowInput(context,spec.start.offset) and repeatableWindowInput(context,spec.end.offset);
                     // Value is evaluated at the selected row; offset/default
@@ -3049,6 +3080,15 @@ pub fn Binder(comptime config: types.Config) type {
                         switch(index){0=>win.deferred_arg=cloned,1=>win.offset_arg=cloned,2=>win.default_arg=cloned,else=>unreachable}
                         index+=1;
                     }
+                } else if(win.kind==.ntile) {
+                    win.offset_repeatable=repeatableWindowInput(context,n.b);
+                    win.offset_total=false;
+                    if(generatedConstant(context,n.b)) {
+                        const bucket=try generatedValue(context,n.b);
+                        win.offset_total=bucket==.null_value or bucket.integer>0;
+                    }
+                    win.deferred_arg=try cloneTree(context,n.b);
+                    try lowerWindowTree(context,p,input,win.deferred_arg);
                 } else if(win.kind==.aggregate) {
                     // PostgreSQL folds immutable constant inputs before a
                     // FILTER/frame can discard them; never execute volatile
@@ -3126,7 +3166,7 @@ pub fn Binder(comptime config: types.Config) type {
             }
             for(p.targets[0..p.width],0..) |target,index| p.window_late[index]=!repeatableWindowInput(context,target);
             for(p.windows[0..p.window_count]) |*win| {
-                if(win.kind!=.lag and win.kind!=.lead) continue;
+                if(win.kind!=.lag and win.kind!=.lead and win.kind!=.ntile) continue;
                 win.offset_prefix=p.window_count==1 and offsetPrefixOrder(context,p,win);
                 if(p.limit==0 or (win.offset_repeatable and win.offset_total)) continue;
                 if(p.window_count!=1 or (p.limit!=0xffffffffffffffff and !win.offset_prefix)) return error.UnsupportedStatement;

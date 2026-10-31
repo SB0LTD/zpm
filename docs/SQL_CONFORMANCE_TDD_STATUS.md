@@ -526,3 +526,11 @@ locally and retains SqlConformanceIncomplete. PG.QUERY.WINDOW advances; named
 windows and the wider family remain incomplete. Non-total/nonrepeatable nested
 or uncertain demand combinations reject explicitly; no complete SQL claim.
 Hosted qualification is pending.
+
+### Distribution/ranking candidate —31 October2026
+
+percent_rank/cume_dist/ntile add native-backed coverage within the existing
+window family. The118-program smoke counts remain10/91/17: do not count each
+new function as a closed feature family or a compatibility percentage. See
+[SQL_WINDOW_RANKING.md](SQL_WINDOW_RANKING.md) for scope, native quirks, remaining
+demand restrictions and independent tests. Hosted/wire qualification pending.

@@ -2812,12 +2812,46 @@ pub fn Exec(comptime config: types.Config) type {
                     const row_handles=self.handles(rows);var first:usize=0;
                     const demand_end:usize=if(win.offset_prefix) @intCast(@min(@as(u64,row_handles.len),p.offset+|p.limit)) else row_handles.len;
                     while(first<row_handles.len) {
-                        if((win.kind==.lag or win.kind==.lead) and first>=demand_end) break;
+                        if((win.kind==.lag or win.kind==.lead or win.kind==.ntile) and first>=demand_end) break;
                         var end=first+1;
                         while(end<row_handles.len) {
                             try self.session.checkpoint();if(!self.equalColumns(row_handles[first],row_handles[end],win.partition[0..win.partition_count])) break;end+=1;
                         }
-                        if(win.kind==.lag or win.kind==.lead) {
+                        if(win.kind==.cume_dist) {
+                            var begin=first;
+                            while(begin<end) {
+                                var peer_end=begin+1;
+                                while(peer_end<end and try self.windowPeers(row_handles[begin],row_handles[peer_end],win)) : (peer_end+=1) {}
+                                const value:f64=@as(f64,@floatFromInt(peer_end-first))/@as(f64,@floatFromInt(end-first));
+                                for(row_handles[begin..peer_end]) |at| {try self.session.checkpoint();self.work.cells[at+win.result]=.{.float8=value};}
+                                begin=peer_end;
+                            }
+                        } else if(win.kind==.ntile) {
+                            var bucket:usize=0;var within:usize=0;var boundary:usize=0;var remainder:usize=0;
+                            var ctx=self.context(outer);
+                            for(first..@min(end,demand_end)) |i| {
+                                try self.session.checkpoint();
+                                if(bucket==0) {
+                                    ctx.tuple[0]=self.row(row_handles[i]);
+                                    const bucket_count=try E.eval(&ctx,win.deferred_arg);
+                                    if(bucket_count==.null_value) {self.work.cells[row_handles[i]+win.result]=.{.null_value={}};continue;}
+                                    if(bucket_count.integer<=0) return error.InvalidArgumentForNtile;
+                                    const buckets:usize=@intCast(bucket_count.integer);
+                                    boundary=(end-first)/buckets;
+                                    if(boundary==0) boundary=1 else {
+                                        remainder=(end-first)%buckets;
+                                        if(remainder!=0) boundary+=1;
+                                    }
+                                    bucket=1;
+                                }
+                                within+=1;
+                                if(within>boundary) {
+                                    if(remainder!=0 and bucket==remainder) {remainder=0;boundary-=1;}
+                                    bucket+=1;within=1;
+                                }
+                                self.work.cells[row_handles[i]+win.result]=.{.integer=@intCast(bucket)};
+                            }
+                        } else if(win.kind==.lag or win.kind==.lead) {
                             var ctx=self.context(outer);
                             for(first..@min(end,demand_end)) |i| {
                                 try self.session.checkpoint();ctx.tuple[0]=self.row(row_handles[i]);
@@ -2838,7 +2872,9 @@ pub fn Exec(comptime config: types.Config) type {
                             for(first..end) |i| {
                                 try self.session.checkpoint();
                                 if(i!=first and !try self.windowPeers(row_handles[i-1],row_handles[i],win)){rank=i-first+1;dense+=1;}
-                                self.work.cells[row_handles[i]+win.result]=.{.integer=@intCast(switch(win.kind){.rank=>rank,.dense_rank=>dense,.row_number=>i-first+1,.aggregate,.lag,.lead=>unreachable})};
+                                self.work.cells[row_handles[i]+win.result]=if(win.kind==.percent_rank)
+                                    .{.float8=if(end-first<=1) 0 else @as(f64,@floatFromInt(rank-1))/@as(f64,@floatFromInt(end-first-1))}
+                                    else .{.integer=@intCast(switch(win.kind){.rank=>rank,.dense_rank=>dense,.row_number=>i-first+1,else=>unreachable})};
                             }
                         } else {
                             var state:Accumulator=.{};
