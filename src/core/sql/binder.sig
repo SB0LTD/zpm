@@ -552,14 +552,14 @@ pub fn Binder(comptime config: types.Config) type {
         fn jsonOperator(context: *const Context, n: *ast.Node) Error!void {
             const left = context.node(n.a).ty;
             if (left == .unknown) return error.AmbiguousFunction;
-            if (left != .jsonb) return error.UndefinedFunction;
+            if (left != .jsonb and left != .json) return error.UndefinedFunction;
             const right_node = context.node(n.b);
             switch (n.op) {
                 .arrow, .arrow_text => {
                     if (right_node.ty == .unknown) try coerce(context, n.b, .text);
                     const right = context.node(n.b).ty;
-                    if (right != .text and !value.integral(right)) return error.UndefinedFunction;
-                    n.ty = if (n.op == .arrow) .jsonb else .text;
+                    if (right != .text and right != .int2 and right != .int4) return error.UndefinedFunction;
+                    n.ty = if (n.op == .arrow) left else .text;
                 },
                 .path, .path_text => {
                     // The right operand is a text[] literal only.
@@ -568,14 +568,16 @@ pub fn Binder(comptime config: types.Config) type {
                     var items: [32][]const u8 = undefined;
                     _ = try Io.Documents.parsePath(text.slice(), &items);
                     right_node.ty = .text;
-                    n.ty = if (n.op == .path) .jsonb else .text;
+                    n.ty = if (n.op == .path) left else .text;
                 },
                 .contains, .contained => {
+                    if (left != .jsonb) return error.UndefinedFunction;
                     n.b = try convert(context, n.b, .jsonb, -1, .implicit);
                     if (context.node(n.b).ty != .jsonb) return error.UndefinedFunction;
                     n.ty = .boolean;
                 },
                 .exists => {
+                    if (left != .jsonb) return error.UndefinedFunction;
                     if (right_node.ty == .unknown) try coerce(context, n.b, .text);
                     if (context.node(n.b).ty != .text) return error.UndefinedFunction;
                     n.ty = .boolean;
@@ -1564,6 +1566,15 @@ pub fn Binder(comptime config: types.Config) type {
                         },
                         .add, .sub, .mul, .div, .mod => try arithmeticType(context, n),
                         .concat => {
+                            const left_ty = context.node(n.a).ty;
+                            const right_ty = context.node(n.b).ty;
+                            if ((left_ty == .jsonb and (right_ty == .jsonb or right_ty == .unknown)) or
+                                (right_ty == .jsonb and left_ty == .unknown)) {
+                                try coerce(context, n.a, .jsonb);
+                                try coerce(context, n.b, .jsonb);
+                                n.ty = .jsonb;
+                                return;
+                            }
                             // text || text, text || anynonarray, anynonarray || text.
                             if (context.node(n.a).ty == .unknown) try coerce(context, n.a, .text);
                             if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .text);

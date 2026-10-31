@@ -747,6 +747,14 @@ pub fn Eval(comptime config: types.Config) type {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return .null_value;
+                        if (n.ty == .jsonb) {
+                            var out: J.Buffer = .{};
+                            try J.concatControlled(left.jsonb.slice(), right.jsonb.slice(), &out, ctx.session.control);
+                            var value: V.Text = .{};
+                            @memcpy(value.bytes[0..out.len], out.bytes[0..out.len]);
+                            value.len = out.len;
+                            return .{ .jsonb = value };
+                        }
                         var text: V.Text = .{};
                         // anytextcat/textanycat cast booleans to 'true'/'false' (measured on PG18).
                         try appendCell(&text, &left, true, ctx.session);
@@ -770,6 +778,15 @@ pub fn Eval(comptime config: types.Config) type {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return .null_value;
+                        if (node(ctx, n.a).ty == .json) {
+                            var out: J.Buffer = .{};
+                            const selector: J.JsonSelector = if (right == .integer) .{ .index = right.integer } else .{ .field = right.text.slice() };
+                            if (!try J.extractJsonControlled(left.text.slice(), selector, n.op == .arrow_text, &out, ctx.session.control)) return .null_value;
+                            var value: V.Text = .{};
+                            @memcpy(value.bytes[0..out.len], out.bytes[0..out.len]);
+                            value.len = out.len;
+                            return .{ .text = value };
+                        }
                         const bytes = left.jsonb.slice();
                         const at = if (right == .integer) J.element(bytes, right.integer) else J.field(bytes, right.text.slice());
                         return jsonResult(bytes, at, n.op == .arrow_text);
@@ -778,6 +795,14 @@ pub fn Eval(comptime config: types.Config) type {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return .null_value;
+                        if (node(ctx, n.a).ty == .json) {
+                            var out: J.Buffer = .{};
+                            if (!try J.extractJsonControlled(left.text.slice(), .{ .path = right.text.slice() }, n.op == .path_text, &out, ctx.session.control)) return .null_value;
+                            var value: V.Text = .{};
+                            @memcpy(value.bytes[0..out.len], out.bytes[0..out.len]);
+                            value.len = out.len;
+                            return .{ .text = value };
+                        }
                         const bytes = left.jsonb.slice();
                         return jsonResult(bytes, try J.path(bytes, right.text.slice()), n.op == .path_text);
                     },

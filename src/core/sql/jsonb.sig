@@ -185,6 +185,7 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
             /// null: validate only (JSON); otherwise unsorted JSONB output.
             out: ?*Buffer,
             depth: usize = 0,
+            control: ?*types.ExecutionControl = null,
 
             fn skip(self: *Parser) void {
                 while (self.at < self.text.len) : (self.at += 1) {
@@ -237,7 +238,12 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
                     header = out.len;
                     _ = try out.reserve(2);
                 }
+                var poll_at = self.at;
                 while (true) {
+                    if (self.at >= poll_at) {
+                        if (self.control) |control| try control.checkpoint();
+                        poll_at = self.at + 256;
+                    }
                     if (self.at >= self.text.len) return error.InvalidTextRepresentation;
                     const c = self.text[self.at];
                     self.at += 1;
@@ -261,6 +267,7 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
                         't' => '\t',
                         'u' => {
                             var code = try self.hex();
+                            if (!jsonb and self.out == null) continue;
                             if (code >= 0xd800 and code <= 0xdbff) {
                                 if (self.text.len - self.at < 2 or self.text[self.at] != '\\' or self.text[self.at + 1] != 'u') return error.InvalidTextRepresentation;
                                 self.at += 2;
@@ -301,6 +308,7 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
                     if (!types.digit(self.peek())) return error.InvalidTextRepresentation;
                     while (types.digit(self.peek())) self.at += 1;
                 }
+                if (self.control) |control| try control.advance((self.at - start) / 256);
                 const out = self.out orelse return;
                 const value = N.parse(self.text[start..self.at]) catch |err| switch (err) {
                     error.NumericValueOutOfRange => return error.NumericValueOutOfRange,
@@ -311,6 +319,7 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
             }
 
             fn parseValue(self: *Parser, jsonb: bool) Error!void {
+                if (self.control) |control| try control.checkpoint();
                 self.skip();
                 switch (self.peek()) {
                     '{', '[' => {
@@ -401,7 +410,11 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
 
         /// Validates JSON text (the JSON type keeps it verbatim).
         pub fn validateJson(text: []const u8) Error!void {
-            var parser: Parser = .{ .text = text, .out = null };
+            return validateJsonControlled(text, null);
+        }
+
+        pub fn validateJsonControlled(text: []const u8, control: ?*types.ExecutionControl) Error!void {
+            var parser: Parser = .{ .text = text, .out = null, .control = control };
             try parser.parseValue(false);
             parser.skip();
             if (parser.at != text.len) return error.InvalidTextRepresentation;
@@ -409,56 +422,119 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
 
         /// Text to canonical JSONB.
         pub fn parse(text: []const u8, out: *Buffer) Error!void {
+            return parseControlled(text, out, null);
+        }
+
+        pub fn parseControlled(text: []const u8, out: *Buffer, control: ?*types.ExecutionControl) Error!void {
             var raw: Buffer = .{};
-            var parser: Parser = .{ .text = text, .out = &raw };
+            var parser: Parser = .{ .text = text, .out = &raw, .control = control };
             try parser.parseValue(true);
             parser.skip();
             if (parser.at != text.len) return error.InvalidTextRepresentation;
             out.len = 0;
-            try canonical(raw.bytes[0..raw.len], 0, out);
+            try canonical(raw.bytes[0..raw.len], out, control);
         }
 
-        /// Copies a value, sorting object keys and keeping the last duplicate.
-        fn canonical(bytes: []const u8, at: usize, out: *Buffer) Error!void {
-            const tag: Tag = @enumFromInt(bytes[at]);
-            if (tag != .object and tag != .array) return out.append(bytes[at..][0..sizeAt(bytes, at)]);
-            const header = out.len;
-            _ = try out.reserve(5);
-            out.bytes[header] = bytes[at];
-            var count: usize = 0;
-            if (tag == .array) {
-                var members = Members.init(bytes, at);
-                while (members.next()) |member| {
-                    try canonical(bytes, member.value, out);
-                    count += 1;
-                }
-            } else {
-                var keys: [capacity / 3 + 1]u16 = undefined;
-                var total: usize = 0;
-                var members = Members.init(bytes, at);
-                while (members.next()) |member| {
-                    // Key offset: start of the key length field.
-                    const offset: u16 = @intCast(member.value - member.key.len - 2);
-                    // Stable insertion by (length, bytes).
-                    var position = total;
-                    while (position > 0 and keyOrder(keyAt(bytes, keys[position - 1]), member.key) > 0) : (position -= 1) keys[position] = keys[position - 1];
-                    keys[position] = offset;
-                    total += 1;
-                }
-                var index: usize = 0;
-                while (index < total) : (index += 1) {
-                    // Last-wins: skip a key equal to the following one.
-                    if (index + 1 < total and types.same(keyAt(bytes, keys[index]), keyAt(bytes, keys[index + 1]))) continue;
-                    const key = keyAt(bytes, keys[index]);
-                    const key_header = try out.reserve(2);
-                    put16(key_header, key.len);
-                    try out.append(key);
-                    try canonical(bytes, keys[index] + 2 + key.len, out);
-                    count += 1;
-                }
+        fn offsetLess(bytes: []const u8, a: u16, b: u16, control: ?*types.ExecutionControl) Error!bool {
+            if (control) |c| try c.checkpoint();
+            const order = keyOrder(keyAt(bytes, a), keyAt(bytes, b));
+            // The input offset breaks duplicate-key ties: the last input wins.
+            return order < 0 or (order == 0 and a < b);
+        }
+
+        fn siftKeys(bytes: []const u8, keys: []u16, start: usize, control: ?*types.ExecutionControl) Error!void {
+            var root = start;
+            while (root < keys.len / 2) {
+                var child = root * 2 + 1;
+                if (child + 1 < keys.len and try offsetLess(bytes, keys[child], keys[child + 1], control)) child += 1;
+                if (!try offsetLess(bytes, keys[root], keys[child], control)) break;
+                const saved = keys[root]; keys[root] = keys[child]; keys[child] = saved;
+                root = child;
             }
-            put16(out.bytes[header + 1 ..], count);
-            put16(out.bytes[header + 3 ..], out.len - header - 5);
+        }
+
+        fn sortKeys(bytes: []const u8, keys: []u16, control: ?*types.ExecutionControl) Error!void {
+            var root = keys.len / 2;
+            while (root != 0) { root -= 1; try siftKeys(bytes, keys, root, control); }
+            var end = keys.len;
+            while (end > 1) {
+                end -= 1;
+                const saved = keys[0]; keys[0] = keys[end]; keys[end] = saved;
+                try siftKeys(bytes, keys[0..end], 0, control);
+            }
+        }
+
+        /// Iterative DFS uses one key pool for the whole document, rather than
+        /// capacity-sized arrays in every recursive frame. Heapsort bounds the
+        /// sorting work even for reverse-ordered or duplicate-heavy objects.
+        fn canonical(bytes: []const u8, out: *Buffer, control: ?*types.ExecutionControl) Error!void {
+            const Frame = struct {
+                members: Members,
+                header: usize,
+                base: usize,
+                total: usize = 0,
+                index: usize = 0,
+                count: usize = 0,
+            };
+            var frames: [depth_limit + 1]Frame = undefined;
+            var keys: [capacity / 3 + 1]u16 = undefined;
+            var key_top: usize = 0;
+            var depth: usize = 0;
+            var pending: ?usize = 0;
+            while (true) {
+                if (control) |c| try c.checkpoint();
+                if (pending) |at| {
+                    pending = null;
+                    const tag: Tag = @enumFromInt(bytes[at]);
+                    if (tag != .object and tag != .array) {
+                        try out.append(bytes[at..][0..sizeAt(bytes, at)]);
+                    } else {
+                        if (depth >= depth_limit) return error.StatementTooComplex;
+                        const header = out.len;
+                        _ = try out.reserve(5);
+                        out.bytes[header] = bytes[at];
+                        var frame: Frame = .{ .members = Members.init(bytes, at), .header = header, .base = key_top };
+                        if (tag == .object) {
+                            var members = frame.members;
+                            while (members.next()) |member| {
+                                if (control) |c| try c.checkpoint();
+                                if (key_top == keys.len) return error.TextCapacity;
+                                keys[key_top] = @intCast(member.value - member.key.len - 2);
+                                key_top += 1;
+                            }
+                            frame.total = key_top - frame.base;
+                            try sortKeys(bytes, keys[frame.base..key_top], control);
+                        }
+                        frames[depth] = frame;
+                        depth += 1;
+                    }
+                }
+                while (depth != 0) {
+                    const frame = &frames[depth - 1];
+                    if (frame.members.object) {
+                        while (frame.index < frame.total) {
+                            const index = frame.index;
+                            frame.index += 1;
+                            const offset = keys[frame.base + index];
+                            if (index + 1 < frame.total and types.same(keyAt(bytes, offset), keyAt(bytes, keys[frame.base + index + 1]))) continue;
+                            const key = keyAt(bytes, offset);
+                            try out.append(bytes[offset..][0..2 + key.len]);
+                            pending = offset + 2 + key.len;
+                            frame.count += 1;
+                            break;
+                        }
+                    } else if (frame.members.next()) |member| {
+                        pending = member.value;
+                        frame.count += 1;
+                    }
+                    if (pending != null) break;
+                    put16(out.bytes[frame.header + 1 ..], frame.count);
+                    put16(out.bytes[frame.header + 3 ..], out.len - frame.header - 5);
+                    key_top = frame.base;
+                    depth -= 1;
+                }
+                if (pending == null and depth == 0) break;
+            }
         }
 
         fn keyAt(bytes: []const u8, offset: usize) []const u8 {
@@ -571,20 +647,9 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
 
         fn subElement(bytes: []const u8, at: usize, step: []const u8) ?usize {
             if (bytes[at] != @intFromEnum(Tag.array)) return null;
-            var negative = false;
-            var index: usize = 0;
-            if (step.len != 0 and step[0] == '-') {
-                negative = true;
-                index = 1;
-            }
-            if (index == step.len) return null;
-            var value: i64 = 0;
-            while (index < step.len) : (index += 1) {
-                if (!types.digit(step[index]) or value > 100000000) return null;
-                value = value * 10 + (step[index] - '0');
-            }
+            const index = pathIndex(step) orelse return null;
             const count: i64 = @intCast(countAt(bytes, at));
-            const wanted = if (negative) count - value else value;
+            const wanted = if (index < 0) count + index else index;
             if (wanted < 0 or wanted >= count) return null;
             var members = Members.init(bytes, at);
             var position: i64 = 0;
@@ -601,8 +666,7 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
                 at = switch (@as(Tag, @enumFromInt(bytes[at]))) {
                     .object => subField(bytes, at, step) orelse return null,
                     .array => subElement(bytes, at, step) orelse return null,
-                    // Only the top-level scalar is a pseudo array.
-                    else => if (at == 0 and (types.same(step, "0") or types.same(step, "-1"))) 0 else return null,
+                    else => return null,
                 };
             }
             return at;
@@ -649,6 +713,208 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
                 at += 1;
             }
             return count;
+        }
+
+        fn startContainer(out: *Buffer, tag: Tag) Error!void {
+            out.len = 0;
+            const header = try out.reserve(5);
+            header[0] = @intFromEnum(tag);
+        }
+
+        fn finishContainer(out: *Buffer, count: usize) void {
+            put16(out.bytes[1..], count);
+            put16(out.bytes[3..], out.len - 5);
+        }
+
+        fn copyMember(out: *Buffer, bytes: []const u8, member: Members.Member, object: bool) Error!void {
+            if (object) {
+                put16(try out.reserve(2), member.key.len);
+                try out.append(member.key);
+            }
+            try out.append(bytes[member.value..][0..sizeAt(bytes, member.value)]);
+        }
+
+        fn depthFits(bytes: []const u8, at: usize, depth: usize, control: ?*types.ExecutionControl) Error!bool {
+            if (control) |c| try c.checkpoint();
+            if (bytes[at] != @intFromEnum(Tag.object) and bytes[at] != @intFromEnum(Tag.array)) return true;
+            if (depth == 0) return false;
+            var members = Members.init(bytes, at);
+            while (members.next()) |member| if (!try depthFits(bytes, member.value, depth - 1, control)) return false;
+            return true;
+        }
+
+        /// Shallow JSONB concatenation. Inputs are canonical and do not alias
+        /// the caller-owned output. Object merge is linear, with right wins.
+        pub fn concat(a: []const u8, b: []const u8, out: *Buffer) Error!void {
+            return concatControlled(a, b, out, null);
+        }
+
+        pub fn concatControlled(a: []const u8, b: []const u8, out: *Buffer, control: ?*types.ExecutionControl) Error!void {
+            const objects = tagOf(a) == .object and tagOf(b) == .object;
+            try startContainer(out, if (objects) .object else .array);
+            var count: usize = 0;
+            if (objects) {
+                var ai = Members.init(a, 0);
+                var bi = Members.init(b, 0);
+                var av = ai.next();
+                var bv = bi.next();
+                while (av != null or bv != null) {
+                    if (control) |c| try c.checkpoint();
+                    const order: i8 = if (av == null) 1 else if (bv == null) -1 else keyOrder(av.?.key, bv.?.key);
+                    if (order < 0) {
+                        try copyMember(out, a, av.?, true);
+                        av = ai.next();
+                    } else {
+                        try copyMember(out, b, bv.?, true);
+                        bv = bi.next();
+                        if (order == 0) av = ai.next();
+                    }
+                    count += 1;
+                }
+            } else {
+                for ([_][]const u8{ a, b }) |bytes| {
+                    if (tagOf(bytes) == .array) {
+                        try out.append(bytes[5..]);
+                        count += countAt(bytes, 0);
+                    } else {
+                        try out.append(bytes);
+                        count += 1;
+                    }
+                }
+            }
+            finishContainer(out, count);
+            if (!try depthFits(out.bytes[0..out.len], 0, depth_limit, control)) return error.StatementTooComplex;
+        }
+
+        pub const JsonSelector = union(enum) { field: []const u8, index: i64, path: []const u8 };
+        const RawSpan = struct { start: usize, end: usize };
+
+        /// Extraction decodes escapes throughout the document like PostgreSQL,
+        /// but returns the original lexical substring (JSON is not JSONB).
+        fn rawDocument(text: []const u8, control: ?*types.ExecutionControl) Error!RawSpan {
+            var parser: Parser = .{ .text = text, .out = null, .control = control };
+            parser.skip();
+            const start = parser.at;
+            try parser.parseValue(true);
+            const end = parser.at;
+            parser.skip();
+            if (parser.at != text.len) return error.InvalidTextRepresentation;
+            return .{ .start = start, .end = end };
+        }
+
+        fn rawField(text: []const u8, span: RawSpan, key: []const u8, control: ?*types.ExecutionControl) Error!?RawSpan {
+            if (text[span.start] != '{') return null;
+            var parser: Parser = .{ .text = text, .at = span.start + 1, .out = null, .control = control };
+            var found: ?RawSpan = null;
+            parser.skip();
+            while (parser.peek() != '}') {
+                if (parser.peek() != '"') return error.InvalidTextRepresentation;
+                parser.at += 1;
+                var decoded: Buffer = .{};
+                parser.out = &decoded;
+                try parser.string(true);
+                parser.out = null;
+                const matches = types.same(decoded.bytes[2..decoded.len], key);
+                parser.skip();
+                if (parser.peek() != ':') return error.InvalidTextRepresentation;
+                parser.at += 1;
+                parser.skip();
+                const start = parser.at;
+                try parser.parseValue(true);
+                if (matches) found = .{ .start = start, .end = parser.at };
+                parser.skip();
+                if (parser.peek() == '}') break;
+                if (parser.peek() != ',') return error.InvalidTextRepresentation;
+                parser.at += 1;
+                parser.skip();
+            }
+            return found;
+        }
+
+        fn rawElement(text: []const u8, span: RawSpan, index: i64, control: ?*types.ExecutionControl) Error!?RawSpan {
+            if (text[span.start] != '[') return null;
+            var wanted = index;
+            if (wanted < 0) {
+                var scan: Parser = .{ .text = text, .at = span.start + 1, .out = null, .control = control };
+                var count: i64 = 0;
+                scan.skip();
+                while (scan.peek() != ']') {
+                    try scan.parseValue(true);
+                    count += 1;
+                    scan.skip();
+                    if (scan.peek() == ']') break;
+                    scan.at += 1;
+                    scan.skip();
+                }
+                wanted += count;
+            }
+            if (wanted < 0) return null;
+            var parser: Parser = .{ .text = text, .at = span.start + 1, .out = null, .control = control };
+            var position: i64 = 0;
+            parser.skip();
+            while (parser.peek() != ']') : (position += 1) {
+                const start = parser.at;
+                try parser.parseValue(true);
+                if (position == wanted) return .{ .start = start, .end = parser.at };
+                parser.skip();
+                if (parser.peek() == ']') break;
+                parser.at += 1;
+                parser.skip();
+            }
+            return null;
+        }
+
+        fn pathIndex(step: []const u8) ?i64 {
+            var at: usize = 0;
+            while (at < step.len and (step[at] == ' ' or (step[at] >= 9 and step[at] <= 13))) at += 1;
+            var negative = false;
+            if (at < step.len and (step[at] == '-' or step[at] == '+')) {
+                negative = step[at] == '-';
+                at += 1;
+            }
+            if (at == step.len) return null;
+            var number: i64 = 0;
+            const limit: i64 = if (negative) 2147483648 else 2147483647;
+            while (at < step.len) : (at += 1) {
+                if (!types.digit(step[at])) return null;
+                const digit: i64 = step[at] - '0';
+                if (number > @divTrunc(limit - digit, 10)) return null;
+                number = number * 10 + digit;
+            }
+            return if (negative) -number else number;
+        }
+
+        /// Returns false for SQL NULL (missing member, wrong structure, or
+        /// JSON null requested as text). An empty path selects the root.
+        pub fn extractJson(text: []const u8, selector: JsonSelector, as_text: bool, out: *Buffer) Error!bool {
+            return extractJsonControlled(text, selector, as_text, out, null);
+        }
+
+        pub fn extractJsonControlled(text: []const u8, selector: JsonSelector, as_text: bool, out: *Buffer, control: ?*types.ExecutionControl) Error!bool {
+            var span = try rawDocument(text, control);
+            switch (selector) {
+                .field => |key| span = (try rawField(text, span, key, control)) orelse return false,
+                .index => |index| span = (try rawElement(text, span, index, control)) orelse return false,
+                .path => |literal| {
+                    var items: [32][]const u8 = undefined;
+                    const count = try parsePath(literal, &items);
+                    for (items[0..count]) |step| {
+                        span = if (text[span.start] == '{') (try rawField(text, span, step, control)) orelse return false
+                            else if (text[span.start] == '[') (try rawElement(text, span, pathIndex(step) orelse return false, control)) orelse return false
+                            else return false;
+                    }
+                },
+            }
+            out.len = 0;
+            if (as_text and text[span.start] == 'n') return false;
+            if (as_text and text[span.start] == '"') {
+                var parser: Parser = .{ .text = text, .at = span.start + 1, .out = out, .control = control };
+                try parser.string(true);
+                const length = out.len - 2;
+                for (0..length) |i| out.bytes[i] = out.bytes[i + 2];
+                out.len = length;
+            } else try out.append(text[span.start..span.end]);
+            return true;
         }
 
         /// The `?` operator.
