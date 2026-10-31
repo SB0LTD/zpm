@@ -1,0 +1,18 @@
+{
+  "baseline_commit": "ae93633bfe3a2b225f8efe7fb1f4a2f7136e189e",
+  "scope": "local offset-window candidate, unchanged118 manifest, no full closure claim",
+  "exit_code": 1,
+  "terminal_error": "SqlConformanceIncomplete",
+  "core_smoke_pass": 10,
+  "failures": 91,
+  "unexecuted": 17,
+  "output_sha256_lf": "d709627a8e1ad1a9a50261696e020c91060be41bcf395de3e83dc09f34fcd9c3",
+  "inputs_sha256_lf": {
+    "tests/sql_conformance/cases.json": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c",
+    "tests/sql_conformance/postgres18_oracle.json": "dcf2ef99e025d694cffc06c3e07f3b164d20e58f5103becef279335afb246120",
+    "tests/sql_conformance/generate_contracts.py": "0952c368240d51046b899717ff1ca45476758ede29c160a6ab80bc62771c7cf5",
+    "src/core/sql/ast.sig": "3cf5e017ad075c8c4292ae1f8f2161fb1c7ac886b7c821fa6700e74e1b0128a0",
+    "src/core/sql/binder.sig": "5a014f98d6e3cf59930f3358c581e7ba1feca93e0a2a218b1f515460e05f0084",
+    "src/core/sql/exec.sig": "1fe9cd37de67ba26dcc14956f22297185c269af0462d60d54cf3675c53fa4f91"
+  }
+}

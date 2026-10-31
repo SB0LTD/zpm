@@ -2800,27 +2800,45 @@ pub fn Exec(comptime config: types.Config) type {
                 const rows=try self.run(p.sources[0].plan,outer);
                 for(p.windows[0..p.window_count]) |*win| {
                     const scratch_mark=self.mark();defer self.release(scratch_mark);
-                    const start_offset=if(win.kind==.aggregate) try self.frameOffset(win.start,outer) else 0;
-                    const end_offset=if(win.kind==.aggregate) try self.frameOffset(win.end,outer) else 0;
+                    const start_offset=if(win.kind==.aggregate or win.kind==.lag or win.kind==.lead) try self.frameOffset(win.start,outer) else 0;
+                    const end_offset=if(win.kind==.aggregate or win.kind==.lag or win.kind==.lead) try self.frameOffset(win.end,outer) else 0;
                     var order:[2*config.columns]B.SortKey=undefined;var count:usize=0;
-                    for(win.partition[0..win.partition_count]) |column| {order[count]=.{.column=column,.descending=false,.nulls_first=true};count+=1;}
+                    for(win.partition[0..win.partition_count]) |column| {order[count]=.{.column=column,.descending=false,.nulls_first=false};count+=1;}
                     for(win.order[0..win.order_count]) |key| {order[count]=key;count+=1;}
                     try self.sortRows(rows,order[0..count]);
                     if(win.kind==.aggregate and (win.frame==.rows or win.frame==.groups or win.frame==.range)) {
                         try self.boundedWindow(rows,win,start_offset,end_offset,outer);continue;
                     }
                     const row_handles=self.handles(rows);var first:usize=0;
+                    const demand_end:usize=if(win.offset_prefix) @intCast(@min(@as(u64,row_handles.len),p.offset+|p.limit)) else row_handles.len;
                     while(first<row_handles.len) {
+                        if((win.kind==.lag or win.kind==.lead) and first>=demand_end) break;
                         var end=first+1;
                         while(end<row_handles.len) {
                             try self.session.checkpoint();if(!self.equalColumns(row_handles[first],row_handles[end],win.partition[0..win.partition_count])) break;end+=1;
                         }
-                        if(win.kind!=.aggregate) {
+                        if(win.kind==.lag or win.kind==.lead) {
+                            var ctx=self.context(outer);
+                            for(first..@min(end,demand_end)) |i| {
+                                try self.session.checkpoint();ctx.tuple[0]=self.row(row_handles[i]);
+                                const step=if(win.offset_arg==none) V.Cell{.integer=1} else try E.eval(&ctx,win.offset_arg);
+                                if(step==.null_value) {self.work.cells[row_handles[i]+win.result]=.{.null_value={}};continue;}
+                                // int4 offset and u32 workspace handles fit i64,
+                                // including INT_MIN and negative-offset reversal.
+                                const target=@as(i64,@intCast(i))+(if(win.kind==.lead) step.integer else -step.integer);
+                                var value:V.Cell=.{.null_value={}};
+                                if(target>=@as(i64,@intCast(first)) and target<@as(i64,@intCast(end))) {
+                                    ctx.tuple[0]=self.row(row_handles[@intCast(target)]);
+                                    value=try E.eval(&ctx,win.deferred_arg);
+                                } else if(win.default_arg!=none) value=try E.eval(&ctx,win.default_arg);
+                                self.work.cells[row_handles[i]+win.result]=value;
+                            }
+                        } else if(win.kind!=.aggregate) {
                             var rank:usize=1;var dense:usize=1;
                             for(first..end) |i| {
                                 try self.session.checkpoint();
                                 if(i!=first and !try self.windowPeers(row_handles[i-1],row_handles[i],win)){rank=i-first+1;dense+=1;}
-                                self.work.cells[row_handles[i]+win.result]=.{.integer=@intCast(switch(win.kind){.rank=>rank,.dense_rank=>dense,.row_number=>i-first+1,.aggregate=>unreachable})};
+                                self.work.cells[row_handles[i]+win.result]=.{.integer=@intCast(switch(win.kind){.rank=>rank,.dense_rank=>dense,.row_number=>i-first+1,.aggregate,.lag,.lead=>unreachable})};
                             }
                         } else {
                             var state:Accumulator=.{};

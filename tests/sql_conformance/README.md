@@ -46,7 +46,7 @@ component is missing. The annotations below separate those cases.
 | PG.PRED.OVERLAPS | Temporal overlaps | Syntax |
 | PG.PRED.REGEX | Regular expressions | Syntax |
 | PG.PRED.ESCAPE | LIKE escape clause | pass; UTF-8 LIKE/ASCII ILIKE contracts, collations and planner closure incomplete |
-| PG.QUERY.WINDOW | Ranking/offset windows | UndefinedFunction; LAG/LEAD missing, ranking functions implemented |
+| PG.QUERY.WINDOW | Ranking/offset windows | candidate smoke pass; LAG/LEAD finite coverage, demand/other window closure incomplete |
 | PG.QUERY.WINDOW_AGG | Window aggregates | pass; complete window family remains partial |
 | PG.QUERY.WINDOW_FRAMES | Named windows and frame exclusions | Syntax at named-window form; bounded/excluded frames implemented separately |
 | PG.GROUP.ROLLUP | ROLLUP/GROUPING | pass; flat ROLLUP/GROUPING only, broader grouping remains partial |
@@ -107,7 +107,7 @@ component is missing. The annotations below separate those cases.
 | PG.TYPE.RANGE | Range/multirange | Syntax |
 | PG.TYPE.ENUM_DOMAIN_COMPOSITE | User-defined types | Syntax |
 | PG.TYPE.CATALOG_IDS | Additional catalog identifiers | Syntax |
-| PG.JSON.OPS | JSON operators | UndefinedFunction |
+| PG.JSON.OPS | JSON operators | candidate smoke pass; lexical extraction, broader JSON closure incomplete |
 | PG.JSONB.MODIFY | Remaining JSONB operations | UndefinedFunction |
 | PG.JSON.PATH | JSONPATH/SQL-JSON | UndefinedFunction |
 | PG.JSON.TABLE | JSON_TABLE | Syntax |
@@ -373,3 +373,13 @@ during candidate CREATE validation; the wire error map checks 42P17. Virtual
 generation, inheritance/partitioning, system-column rules, additional planner
 reductions and complete coercion coverage remain unqualified. These results
 cover explicit STORED generation within the documented expression subset.
+
+## Latest inventory candidates —31 October2026
+
+The unchanged118 programs now yield10 smoke passes,91 failures and17 unexecuted
+scopes/comparators locally. The driver still exits1 SqlConformanceIncomplete.
+The earlier8/93/17 consolidated evidence is retained as historical qualification;
+JSON and offset-window candidates have separate hashed evidence manifests.
+See [offset scope](../../docs/SQL_WINDOW_OFFSETS.md) and
+[JSON scope](../../docs/SQL_JSON_OPERATORS.md). Candidate smoke success does not
+close a feature family, and hosted qualification remains separate evidence.
