@@ -504,3 +504,14 @@ administrative features and dialect-specific behaviors need additional contracts
 No release or performance-superiority claim follows from this checkpoint. The
 next release decision needs the declared SQL scope, integration/system evidence,
 and reproducible workload results in addition to these core regressions.
+
+### JSON inventory candidate — 31 October 2026
+
+The next slice implements plain JSON extraction and JSONB concatenation and
+changes the canonicalizer/work-control paths. Local re-execution of the unchanged
+118 programs gives **9 smoke passes / 92 failures / 17 unexecuted**, with the
+required SqlConformanceIncomplete failure. The consolidated 8/93/17 baseline above
+remains historical qualification evidence. PG.JSONB.MODIFY still fails because
+jsonb_set is missing; JSON constructors, aggregates, paths and table functions
+remain open. See [SQL_JSON_OPERATORS.md](SQL_JSON_OPERATORS.md) for exact scope,
+regressions and capacity limits. Cross-platform/wire qualification is pending.

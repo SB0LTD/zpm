@@ -1162,6 +1162,13 @@ pub fn Session(comptime DB: type) type {
                     }
                 }
             }
+            if (table.len == 0 and keyword(first, "select")) {
+                // A constant SELECT has no relation. Apply the same unknown
+                // text fallback used below; explicit SQL casts still bind in
+                // the engine. This is not general expression type inference.
+                for (s.oids[0..s.count]) |*oid| if (oid.* == 0) { oid.* = 25; };
+                return;
+            }
             if (table.len == 0 or !identifier(table)) return error.UnsupportedStatement;
             var text: [sql_capacity]u8 = undefined;
             var q: Writer = .{ .bytes = &text };

@@ -415,6 +415,20 @@ fn extended() !void {
     try state(try execute(&s, &db, "absent", 0), "34000");
     try sync(&s, &db);
 }
+fn parameterConstantSelect() !void {
+    var db: DB = .{};
+    var s: Session = .{};
+    try startup(&s, &db);
+    // A parameterized constant SELECT has no relation from which to infer.
+    // Unknown inputs use the existing text fallback; SQL casts determine
+    // expression types without requiring a fictitious FROM relation.
+    try tags(try parse(&s, &db, "", "SELECT $1::json -> $2, $3::jsonb || $4::jsonb", &.{}), "1");
+    try tags(try bind(&s, &db, "", "", &.{ "{\"x\":2.50}", "x", "{\"a\":1}", "{\"b\":2}" }, 0, 0), "2");
+    try tags(try execute(&s, &db, "", 0), "DC");
+    try check(equal(s.result.rows[0].cells[0].text.slice(), "2.50"));
+    try check(s.result.column_types[0]==.json and s.result.column_types[1]==.jsonb);
+    try sync(&s, &db);
+}
 fn inference() !void {
     var db: DB = .{};
     var s: Session = .{};
@@ -1201,6 +1215,7 @@ pub fn main(init: std.process.Init) !void {
     try returningOnce();
     try normal();
     try extended();
+    try parameterConstantSelect();
     try inference();
     try negativeParameters();
     try splicedParameterValues();

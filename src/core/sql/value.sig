@@ -261,8 +261,12 @@ pub fn Io(comptime config: types.Config) type {
         }
 
         pub fn jsonbCell(source: []const u8) Error!V.Cell {
+            return jsonbCellControlled(source, null);
+        }
+
+        pub fn jsonbCellControlled(source: []const u8, control: ?*types.ExecutionControl) Error!V.Cell {
             var buffer: J.Buffer = .{};
-            try J.parse(source, &buffer);
+            try J.parseControlled(source, &buffer, control);
             var text: V.Text = .{};
             try appendBytes(&text, buffer.bytes[0..buffer.len]);
             return .{ .jsonb = text };
@@ -284,7 +288,7 @@ pub fn Io(comptime config: types.Config) type {
                 } },
                 .boolean => .{ .boolean = try expr.parseBoolean(input) },
                 .text, .unknown, .json => blk: {
-                    if (ty == .json) try J.validateJson(input);
+                    if (ty == .json) try J.validateJsonControlled(input, session.control);
                     break :blk try textCell(input);
                 },
                 .name => try textCell(input[0..@min(input.len, 63)]),
@@ -295,7 +299,7 @@ pub fn Io(comptime config: types.Config) type {
                 .timestamp => .{ .timestamp = try temporal.parseTimestamp(input, .timestamp, &session.zone, session.resolver) },
                 .timestamptz => .{ .timestamptz = try temporal.parseTimestamp(input, .timestamptz, &session.zone, session.resolver) },
                 .interval => .{ .interval = try temporal.parseInterval(input) },
-                .jsonb => try jsonbCell(input),
+                .jsonb => try jsonbCellControlled(input, session.control),
             };
             return applyTypmod(cell, ty, typmod);
         }
@@ -429,7 +433,7 @@ pub fn Io(comptime config: types.Config) type {
                 },
                 .json => switch (cell) {
                     .text => |*value| blk: {
-                        if (from != .json) try J.validateJson(value.slice());
+                        if (from != .json) try J.validateJsonControlled(value.slice(), session.control);
                         break :blk cell;
                     },
                     .jsonb => blk: {
@@ -439,7 +443,7 @@ pub fn Io(comptime config: types.Config) type {
                     else => return error.CannotCoerce,
                 },
                 .jsonb => switch (cell) {
-                    .text => |*value| try jsonbCell(value.slice()),
+                    .text => |*value| try jsonbCellControlled(value.slice(), session.control),
                     .jsonb => cell,
                     else => return error.CannotCoerce,
                 },
