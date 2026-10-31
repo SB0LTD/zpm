@@ -129,15 +129,38 @@ fn backpressure(listener: tcp.Socket, port: u16) !void {
     var read: [1]bool = .{false};
     var write: [1]bool = .{true};
     phase = "backpressure accept fairness";
-    try check(try ready(listener, &.{accepted}, &read, &write));
+    // Readiness is for any requested descriptor: the pressured writer can
+    // become writable before Darwin reports the newly connected listener.
+    // Retain write interest and the original total 1s deadline, rather than
+    // requiring both events to occur in a single poll wakeup.
+    const accept_deadline = std.Io.Timestamp.now(report_io, .awake).toMilliseconds() + 1000;
+    var accept_ready = false;
+    while (true) {
+        const remaining = accept_deadline - std.Io.Timestamp.now(report_io, .awake).toMilliseconds();
+        if (remaining <= 0) break;
+        write[0] = true;
+        if (try tcp.wait(listener, &.{accepted}, &read, &write, @intCast(remaining))) {
+            accept_ready = true;
+            break;
+        }
+    }
+    try check(accept_ready);
     const other = (try tcp.accept(listener)) orelse return error.AcceptNotReady;
     defer tcp.close(other);
     try check((try tcp.send(other_client, "x")) == 1);
     var buf: [1]u8 = undefined;
     var other_read: [1]bool = .{false};
     var other_write: [1]bool = .{false};
-    _ = try ready(listener, &.{other}, &other_read, &other_write);
+    phase = "backpressure peer readability";
+    const read_deadline = std.Io.Timestamp.now(report_io, .awake).toMilliseconds() + 1000;
+    while (true) {
+        const remaining = read_deadline - std.Io.Timestamp.now(report_io, .awake).toMilliseconds();
+        if (remaining <= 0) break;
+        _ = try tcp.wait(listener, &.{other}, &other_read, &other_write, @intCast(remaining));
+        if (other_read[0]) break;
+    }
     try check(other_read[0]);
+    phase = "backpressure peer payload";
     try check((try tcp.recv(other, &buf)) == 1 and buf[0] == 'x');
 }
 
