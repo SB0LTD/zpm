@@ -40,9 +40,9 @@
 //! a single-column PRIMARY KEY. Unquoted identifiers are ASCII and case
 //! insensitive; quoted identifiers keep case; text comparison is bytewise.
 //! Window support includes ROW_NUMBER/RANK/DENSE_RANK/PERCENT_RANK/CUME_DIST,
-//! NTILE, LAG/LEAD and bounded aggregate frames/exclusions (see the SQL_WINDOW_*
+//! NTILE, LAG/LEAD, FIRST_VALUE/LAST_VALUE/NTH_VALUE and bounded aggregate frames/exclusions (see the SQL_WINDOW_*
 //! module docs for demand and frame restrictions). Named WINDOW definitions
-//! support scoped inheritance. Value-window functions, general arrays/records and secondary indices remain outside this
+//! support scoped inheritance. General arrays/records and secondary indices remain outside this
 //! SQL subset; this is not full SQL-standard or PostgreSQL compatibility.
 //!
 //! Session values (per statement, `Database.session`, set by the caller like

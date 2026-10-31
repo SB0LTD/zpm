@@ -1,6 +1,18 @@
 # SQL conformance TDD checkpoint
 
-## Current checkpoint — 30 October 2026, after PR consolidation
+## Latest candidate checkpoint - 31 October 2026
+
+The unchanged 118-program driver has **11 smoke passes, 90 failures and 17
+unexecuted scopes/comparators**, and still exits1 SqlConformanceIncomplete.
+JSON extraction/concatenation, LAG/LEAD, distribution ranking and named windows
+have finite implementations and evidence described below. Frame value windows
+are the next candidate: see [scope and known native differences](SQL_WINDOW_VALUES.md).
+These results do not close the SQL inventory. Named/value window hosted gates
+and PostgreSQL boundary-difference characterization remain pending.
+
+The dated checkpoints below preserve historical qualification evidence.
+
+## Historical checkpoint â€” 30 October 2026, after PR consolidation
 
 The original feature map is
 [tests/sql_conformance/README.md](../tests/sql_conformance/README.md), backed by
@@ -10,7 +22,7 @@ It has now been rerun on consolidated main
 the qualified integration source `0f5af8d`. The original SQL/expected oracle
 programs were unchanged.
 
-**Current result: 8 smoke passes, 93 failures, 17 unexecuted scopes/comparators.**
+**Historical result: 8 smoke passes, 93 failures, 17 unexecuted scopes/comparators.**
 The executable intentionally returns SqlConformanceIncomplete. Preserve the
 former 6/95/17 output as `core_smoke_results.stage4.ndjson`; the new output,
 source hashes, tree identity and expected nonzero exit are recorded in
@@ -34,7 +46,7 @@ Scope and algorithm limitations are in [SQL_WINDOW_FRAMES.md](SQL_WINDOW_FRAMES.
 DISTINCT windows are unsupported in PostgreSQL itself and are not an additional
 PostgreSQL-parity feature to implement.
 
-The consolidation merged ZPM PRs 77, 81 and 82–85 and RAMSQL PRs 30, 34 and 36.
+The consolidation merged ZPM PRs 77, 81 and 82â€“85 and RAMSQL PRs 30, 34 and 36.
 It includes the newer parameter-boundary, DDL-replay, lock-upgrade and explicit
 durable-create fixes plus the committed hardening audit. Seven inconclusive
 performance experiments and the failed-advantage dbMeter workflow PR were closed
@@ -57,7 +69,7 @@ by checked arithmetic/operator fixes and PostgreSQL boundary regressions; see
 118-program feature inventory or close interval syntax, JSONB or wider temporal
 feature gaps. The FV-12 formal proof remains open.
 
-### Snapshot and sequence safety follow-up — 31 October 2026
+### Snapshot and sequence safety follow-up â€” 31 October 2026
 
 STO-02 and STO-04 now have reproduced regressions and implementation fixes:
 running/COPY snapshots participate in reclamation, and a consumer commit
@@ -207,7 +219,7 @@ The matcher scans the original pattern with constant scratch, avoiding a
 rewritten-pattern buffer and its expansion/capacity costs. UTF-8 underscores
 consume one character. ASCII ILIKE folding retains the existing scope; Unicode
 case folding and locale/nondeterministic collations remain unqualified. Worst
-case rescanning is O(text length × pattern length); matcher and wildcard-run
+case rescanning is O(text length Ã— pattern length); matcher and wildcard-run
 loops now honor work/cancellation controls. An eight-byte pattern at an
 eight-byte text budget succeeds without a larger temporary pattern buffer.
 
@@ -305,7 +317,7 @@ evaluation of volatile operands. Strict equality against a literal NULL omits
 the other operand's evaluation, while runtime NULLs retain normal evaluation.
 
 The implementation reuses the statement AST pool and existing row comparator;
-it adds no record payload or heap allocation. Binding consumes O(candidates ×
+it adds no record payload or heap allocation. Binding consumes O(candidates Ã—
 fields) AST storage, with ordinary StatementTooComplex errors on exhaustion.
 The flat list avoids an execution-depth increase per candidate: 64 candidates
 pass with an expression-depth budget of five and sufficient AST storage.
@@ -505,7 +517,7 @@ No release or performance-superiority claim follows from this checkpoint. The
 next release decision needs the declared SQL scope, integration/system evidence,
 and reproducible workload results in addition to these core regressions.
 
-### JSON inventory candidate � 31 October 2026
+### JSON inventory candidate — 31 October 2026
 
 The next slice implements plain JSON extraction and JSONB concatenation and
 changes the canonicalizer/work-control paths. Local re-execution of the unchanged
@@ -516,7 +528,7 @@ jsonb_set is missing; JSON constructors, aggregates, paths and table functions
 remain open. See [SQL_JSON_OPERATORS.md](SQL_JSON_OPERATORS.md) for exact scope,
 regressions and capacity limits. Cross-platform/wire qualification is pending.
 
-### Offset-window inventory candidate �31 October2026
+### Offset-window inventory candidate —31 October2026
 
 LAG/LEAD implement typed offsets/defaults, lazy selected-row evaluation and
 bounded root-query prefix demand. Native-reference and independent adversarial
@@ -527,7 +539,7 @@ windows and the wider family remain incomplete. Non-total/nonrepeatable nested
 or uncertain demand combinations reject explicitly; no complete SQL claim.
 Hosted qualification is pending.
 
-### Distribution/ranking candidate �31 October2026
+### Distribution/ranking candidate —31 October2026
 
 percent_rank/cume_dist/ntile add native-backed coverage within the existing
 window family. The118-program smoke counts remain10/91/17: do not count each
@@ -547,3 +559,20 @@ ranking3053 and windows9035. Independent review reproduced all five,27 native
 fixtures and extra scalar-key/sequence-interleaving probes. Cross-platform,
 wire and PG18 qualification remain separate pending gates. Complete SQL,
 window-family and performance-superiority claims remain unsupported.
+
+### Frame value-window candidate - 31 October 2026
+
+first_value/last_value/nth_value now have scoped implementation and78 native
+reference programs,600 independent interval-membership property queries,
+work/cancel/error/reuse and lazy side-effect checks. Linux ReleaseSafe passes:
+value6179, named1832, frames108118, offsets2023, ranking3053, windows9035;
+PostgreSQL protocol17325. The unchanged118 inventory remains11/90/17 and
+intentionally exits1 SqlConformanceIncomplete. The separate evidence manifest
+pins current source/output hashes; historical manifests describe older slices.
+
+Native parity remains incomplete:12 extra EXCLUDE TIES boundary programs retain
+four PostgreSQL16 value differences against independently observed array_agg
+frame membership. A separate native executor XX000/mark-state discrepancy is
+also documented. These differences are not passing compatibility evidence;
+PG18 version characterization, hosted/wire qualification and broader SQL closure
+remain pending. See the value-window scope document and boundary fixture.

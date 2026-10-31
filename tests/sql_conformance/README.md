@@ -159,11 +159,11 @@ component is missing. The annotations below separate those cases.
 | TSQL.FUNCTIONS | Native scalar functions | UnexecutedScopeOrComparator |
 | TSQL.PROCEDURAL | Variables/errors/transactions | UnexecutedScopeOrComparator |
 
-## Remaining work after consolidation
+## Remaining work after 31 October candidates
 
 | Area | Available slice | Still missing or unqualified |
 | --- | --- | --- |
-| Windows | RANK/DENSE_RANK/ROW_NUMBER, aggregate FILTER, bounded ROWS/GROUPS, integral-key RANGE, exclusions | Named windows; LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE/NTILE/PERCENT_RANK/CUME_DIST; numeric/float/temporal RANGE offsets; volatile moving inputs; correlated window-target subqueries |
+| Windows | Ranking/distribution, LAG/LEAD, scoped named definitions, aggregate FILTER, bounded ROWS/GROUPS, integral RANGE and exclusions; frame value functions in candidate qualification | Native EXCLUDE TIES boundary differences and internal-error behavior; numeric/float/temporal RANGE offsets; shared volatile execution, uncertain nested demand, moving volatile inputs, collations and wider type/coercion coverage |
 | Grouping | Ordinary aggregates, flat ROLLUP/GROUPING and GROUP BY () | CUBE/general GROUPING SETS, composite/multiple ROLLUP, remaining aggregate families and DISTINCT domains |
 | Formatting/functions | Temporal to_char; GREATEST/LEAST; existing numeric/JSON/sequence/catalog subset | to_date/to_number, numeric/interval/localized/ISO/timezone formatting, ordinary string/math/date/regex/discovery function families and overloads |
 | Schema/types | Existing typed tables, identity/default/stored-generation slices | VARCHAR/CHAR, UUID/BYTEA, TIME/TIMETZ, arrays/general records/user types; SERIAL; conditional DDL; ALTER/TRUNCATE/views/schemas; secondary indexes; table/composite/UNIQUE/CHECK/FK/deferred constraints |
@@ -374,7 +374,7 @@ generation, inheritance/partitioning, system-column rules, additional planner
 reductions and complete coercion coverage remain unqualified. These results
 cover explicit STORED generation within the documented expression subset.
 
-## Latest inventory candidates —31 October2026
+## Latest inventory candidates â€”31 October2026
 
 The unchanged118 programs now yield10 smoke passes,91 failures and17 unexecuted
 scopes/comparators locally. The driver still exits1 SqlConformanceIncomplete.
@@ -391,3 +391,20 @@ The unchanged118-program inventory now gives **11 smoke passes /90 failures /
 PG.QUERY.WINDOW_FRAMES smoke success, not complete window-family qualification.
 `named_windows_evidence.json` pins the exact local inputs/output; older manifests
 describe their historical slices. See [named scope](../../docs/SQL_NAMED_WINDOWS.md).
+
+### Frame value-window candidate - 31 October 2026
+
+first_value/last_value/nth_value now have scoped implementation and78 native
+reference programs,600 independent interval-membership property queries,
+work/cancel/error/reuse and lazy side-effect checks. Linux ReleaseSafe passes:
+value6179, named1832, frames108118, offsets2023, ranking3053, windows9035;
+PostgreSQL protocol17325. The unchanged118 inventory remains11/90/17 and
+intentionally exits1 SqlConformanceIncomplete. The separate evidence manifest
+pins current source/output hashes; historical manifests describe older slices.
+
+Native parity remains incomplete:12 extra EXCLUDE TIES boundary programs retain
+four PostgreSQL16 value differences against independently observed array_agg
+frame membership. A separate native executor XX000/mark-state discrepancy is
+also documented. These differences are not passing compatibility evidence;
+PG18 version characterization, hosted/wire qualification and broader SQL closure
+remain pending. See the value-window scope document and boundary fixture.

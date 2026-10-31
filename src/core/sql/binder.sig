@@ -776,6 +776,30 @@ pub fn Binder(comptime config: types.Config) type {
             if(generatedConstant(context,bound.offset)) _=try generatedValue(context,bound.offset);
         }
 
+        fn valueWindowName(context:*const Context,n:*const ast.Node) bool {
+            const name=toName(context,n.name);
+            return types.same(name.slice(),"first_value") or types.same(name.slice(),"last_value") or types.same(name.slice(),"nth_value");
+        }
+        fn typeValueArguments(context:*const Context,scope:*const Scope,n:*ast.Node) Error!void {
+            var inner=scope.*;inner.windows=false;inner.inside_window=true;
+            if(n.c!=none) return error.UnsupportedStatement;
+            if(n.star or n.b==none) return error.UndefinedFunction;
+            const first=n.b;const second=context.node(first).next;
+            const name=toName(context,n.name);const nth=types.same(name.slice(),"nth_value");
+            if(nth) {if(second==none or context.node(second).next!=none) return error.UndefinedFunction;}
+            else if(second!=none) return error.UndefinedFunction;
+            try typeExpr(context,&inner,first);
+            if(nth) {
+                try typeExpr(context,&inner,second);
+                const ty=context.node(second).ty;
+                if(ty!=.unknown and ty!=.int2 and ty!=.int4) return error.UndefinedFunction;
+                context.node(first).next=none;context.node(second).next=none;
+                context.node(first).next=try convert(context,second,.int4,-1,.implicit);
+            }
+            n.ty=context.node(first).ty;
+            if(n.ty==.unknown) return error.TypeMismatch;
+        }
+
         fn offsetWindowName(context:*const Context,n:*const ast.Node) bool {
             const name=toName(context,n.name);
             return types.same(name.slice(),"lag") or types.same(name.slice(),"lead");
@@ -887,7 +911,10 @@ pub fn Binder(comptime config: types.Config) type {
             const tile=types.same(name.slice(),"ntile");
             const ranking=rankWindowName(context,n) or tile;
             const offset_window=offsetWindowName(context,n);
-            if(offset_window) {
+            const value_window=valueWindowName(context,n);
+            if(value_window) {
+                try typeValueArguments(context,&inner,n);
+            } else if(offset_window) {
                 try typeOffsetArguments(context,&inner,n);
             } else if(tile) {
                 try typeNtileArgument(context,&inner,n);
@@ -913,12 +940,13 @@ pub fn Binder(comptime config: types.Config) type {
                 try typeExpr(context,&filter_scope,n.c);try booleanArgument(context,n.c);
             }
             try typeWindowSpec(context,scope,spec);
-            if((spec.frame==.rows or spec.frame==.groups or spec.frame==.range) and !ranking and !offset_window and (!repeatableWindowInput(context,n.b) or !repeatableWindowInput(context,n.c))) return error.UnsupportedStatement;
+            if((spec.frame==.rows or spec.frame==.groups or spec.frame==.range) and !ranking and !offset_window and !value_window and (!repeatableWindowInput(context,n.b) or !repeatableWindowInput(context,n.c))) return error.UnsupportedStatement;
             n.func=.window_call;n.constant=false;
         }
 
         fn typeFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
             if(n.window!=none) return typeWindow(context,scope,n);
+            if(valueWindowName(context,n)) {try typeValueArguments(context,scope,n);return error.WrongObjectType;}
             if(offsetWindowName(context,n)) {
                 try typeOffsetArguments(context,scope,n);
                 return error.WrongObjectType;
@@ -3160,8 +3188,36 @@ pub fn Binder(comptime config: types.Config) type {
                 const spec=&context.pool.windows[n.window];
                 var win:Window=.{.frame=spec.frame,.start=spec.start,.end=spec.end,.exclude=spec.exclude,.output_node=id};
                 const name=toName(context,n.name);
-                win.kind=if(types.same(name.slice(),"rank")) .rank else if(types.same(name.slice(),"dense_rank")) .dense_rank else if(types.same(name.slice(),"row_number")) .row_number else if(types.same(name.slice(),"lag")) .lag else if(types.same(name.slice(),"lead")) .lead else if(types.same(name.slice(),"percent_rank")) .percent_rank else if(types.same(name.slice(),"cume_dist")) .cume_dist else if(types.same(name.slice(),"ntile")) .ntile else .aggregate;
-                if(win.kind==.lag or win.kind==.lead) {
+                win.kind=if(types.same(name.slice(),"rank")) .rank else if(types.same(name.slice(),"dense_rank")) .dense_rank else if(types.same(name.slice(),"row_number")) .row_number else if(types.same(name.slice(),"lag")) .lag else if(types.same(name.slice(),"lead")) .lead else if(types.same(name.slice(),"percent_rank")) .percent_rank else if(types.same(name.slice(),"cume_dist")) .cume_dist else if(types.same(name.slice(),"ntile")) .ntile else if(types.same(name.slice(),"first_value")) .first_value else if(types.same(name.slice(),"last_value")) .last_value else if(types.same(name.slice(),"nth_value")) .nth_value else .aggregate;
+                if(win.kind==.first_value or win.kind==.last_value or win.kind==.nth_value) {
+                    win.offset_repeatable=repeatableFrameInput(context,spec.start.offset) and repeatableFrameInput(context,spec.end.offset);
+                    // Value arguments stay lazy at the selected frame row.
+                    var item=n.b;var index:usize=0;
+                    while(item!=none) : (item=context.node(item).next) {
+                        win.offset_repeatable=win.offset_repeatable and repeatableWindowInput(context,item);
+                        win.offset_total=win.offset_total and (safeWindowOperand(context,item) or generatedConstant(context,item));
+                        if(generatedConstant(context,item)) {
+                            const constant=try generatedValue(context,item);
+                            if(index==1 and constant!=.null_value and constant.integer<=0) win.offset_total=false;
+                        } else if(index==1) win.offset_total=false;
+                        const cloned=try cloneTree(context,item);try lowerWindowTree(context,p,input,cloned);
+                        if(index==0) win.deferred_arg=cloned else win.offset_arg=cloned;
+                        index+=1;
+                    }
+                    for([_]u16{spec.start.offset,spec.end.offset}) |bound| if(bound!=none) {
+                        if(generatedConstant(context,bound)) {
+                            const v=try generatedValue(context,bound);
+                            if(v==.null_value or v.integer<0) win.offset_total=false;
+                        } else win.offset_total=false;
+                    };
+                    // Reuse the bounded frame resolver without aggregate state.
+                    switch(win.frame) {
+                        .full=>{win.frame=.rows;win.start=.{.kind=.unbounded_preceding};win.end=.{.kind=.unbounded_following};},
+                        .rows_prefix=>{win.frame=.rows;win.start=.{.kind=.unbounded_preceding};win.end=.{.kind=.current_row};},
+                        .default=>{if(spec.order_count==0){win.frame=.rows;win.end=.{.kind=.unbounded_following};}else win.frame=.range;},
+                        else=>{},
+                    }
+                } else if(win.kind==.lag or win.kind==.lead) {
                     win.offset_repeatable=repeatableFrameInput(context,spec.start.offset) and repeatableFrameInput(context,spec.end.offset);
                     // Value is evaluated at the selected row; offset/default
                     // at the current row, with default only outside partition.
@@ -3283,7 +3339,7 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     continue;
                 }
-                if(win.kind!=.lag and win.kind!=.lead and win.kind!=.ntile) continue;
+                if(win.kind!=.lag and win.kind!=.lead and win.kind!=.ntile and win.kind!=.first_value and win.kind!=.last_value and win.kind!=.nth_value) continue;
                 win.offset_prefix=p.window_count==1 and offsetPrefixOrder(context,p,win);
                 if(p.limit==0 or (win.offset_repeatable and win.offset_total)) continue;
                 if(p.window_count!=1 or (p.limit!=0xffffffffffffffff and !win.offset_prefix)) return error.UnsupportedStatement;

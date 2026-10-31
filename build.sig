@@ -139,6 +139,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-window-frames", "tests/test_sql_window_frames.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-window-offsets", "tests/test_sql_window_offsets.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-window-ranking", "tests/test_sql_window_ranking.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-window-values", "tests/test_sql_window_values.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-named-windows", "tests/test_sql_named_windows.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-datetime-format", "tests/test_datetime_format.sig", &.{importEntry("datetime_format", "src/core/sql/datetime_format.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-dimension-distinct", "tests/test_sql_dimension_distinct.sig", &.{importEntry("sql", "src/core/sql.sig")});
