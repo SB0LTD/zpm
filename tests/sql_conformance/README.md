@@ -48,7 +48,7 @@ component is missing. The annotations below separate those cases.
 | PG.PRED.ESCAPE | LIKE escape clause | pass; UTF-8 LIKE/ASCII ILIKE contracts, collations and planner closure incomplete |
 | PG.QUERY.WINDOW | Ranking/offset windows | candidate smoke pass; LAG/LEAD finite coverage, demand/other window closure incomplete |
 | PG.QUERY.WINDOW_AGG | Window aggregates | pass; complete window family remains partial |
-| PG.QUERY.WINDOW_FRAMES | Named windows and frame exclusions | Syntax at named-window form; bounded/excluded frames implemented separately |
+| PG.QUERY.WINDOW_FRAMES | Named windows and frame exclusions | candidate smoke pass; scoped named inheritance and bounded/excluded frames; wider family incomplete |
 | PG.GROUP.ROLLUP | ROLLUP/GROUPING | pass; flat ROLLUP/GROUPING only, broader grouping remains partial |
 | PG.GROUP.CUBE | CUBE | UndefinedFunction |
 | PG.GROUP.SETS | GROUPING SETS | Syntax |
@@ -383,3 +383,11 @@ JSON and offset-window candidates have separate hashed evidence manifests.
 See [offset scope](../../docs/SQL_WINDOW_OFFSETS.md) and
 [JSON scope](../../docs/SQL_JSON_OPERATORS.md). Candidate smoke success does not
 close a feature family, and hosted qualification remains separate evidence.
+
+### Named-window candidate, 31 October 2026
+
+The unchanged118-program inventory now gives **11 smoke passes /90 failures /
+17 unexecuted**. The driver still exits1 SqlConformanceIncomplete. This adds
+PG.QUERY.WINDOW_FRAMES smoke success, not complete window-family qualification.
+`named_windows_evidence.json` pins the exact local inputs/output; older manifests
+describe their historical slices. See [named scope](../../docs/SQL_NAMED_WINDOWS.md).
