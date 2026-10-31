@@ -53,3 +53,19 @@ UTF8 input validation. Encoded cells still have Config.text_bytes and the u16
 65535-byte ceiling. Rendered expansion (SQLF-09) remains open. General large-cell
 evaluator/formatting stack use (SQLF-06) remains open beyond the canonicalizer.
 There is no measured throughput claim or full JSON/SQL compatibility claim.
+
+### Live qualification follow-up
+
+The new no-FROM parameter case exposed a pre-existing wire rejection. The codec
+now uses its existing unknown-to-TEXT fallback for constant SELECTs, permitting
+explicit JSON/JSONB SQL casts. This does not implement context-wide parameter
+inference or claim PostgreSQL-exact ParameterDescription OIDs for inferred
+casts; typed/ambiguous expression inference remains inventory work. The failed
+live fixture is retained. The report writer escapes lone surrogate code points
+so legal plain JSON results cannot truncate qualification evidence.
+
+First Linux libc CI failed in Sig0.6.4 std.Thread.join (pthread_join unreachable),
+while Windows/macOS passed. The identical canonical workload now executes on the
+main stack on Linux libc, with all 8,051 assertions retained. The worker remains
+on Windows/macOS and no-libc Linux. This is a harness portability workaround,
+not a measured stack claim or a change to engine execution.
