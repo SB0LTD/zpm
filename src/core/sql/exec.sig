@@ -2629,9 +2629,45 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 return best;
             }
-            fn boundedWindow(self:*Query,rows:List,win:*const B.Window,start_offset:u64,end_offset:u64,outer:?*const E.Context) Error!void {
+            /// Select from at most three surviving intervals; exclusions never
+            /// require scanning a frame. NULL values occupy positions normally.
+            fn frameValue(self:*Query,win:*const B.Window,row_handles:[]const u32,current:usize,a:usize,b:usize,
+                peer_first:usize,peer_end:usize,outer:?*const E.Context) Error!V.Cell {
+                var ctx=self.context(outer);ctx.tuple[0]=self.row(row_handles[current]);
+                var nth:usize=1;
+                if(win.kind==.nth_value) {
+                    const n=try E.eval(&ctx,win.offset_arg);
+                    if(n==.null_value) return .{.null_value={}};
+                    if(n.integer<=0) return error.InvalidArgumentForNthValue;
+                    nth=@intCast(n.integer);
+                }
+                if(a>=b) return .{.null_value={}};
+                var starts:[3]usize=undefined;var ends:[3]usize=undefined;var count:usize=0;
+                if(win.exclude==.no_others) {starts[0]=a;ends[0]=b;count=1;}
+                else {
+                    const cut_first=if(win.exclude==.current_row) current else peer_first;
+                    const cut_end=if(win.exclude==.current_row) current+1 else peer_end;
+                    const left_end=@min(b,cut_first);
+                    if(a<left_end){starts[count]=a;ends[count]=left_end;count+=1;}
+                    if(win.exclude==.ties and current>=a and current<b){starts[count]=current;ends[count]=current+1;count+=1;}
+                    const right_start=@max(a,cut_end);
+                    if(right_start<b){starts[count]=right_start;ends[count]=b;count+=1;}
+                }
+                var target:?usize=null;
+                if(win.kind==.last_value) {if(count!=0) target=ends[count-1]-1;}
+                else for(0..count) |i| {
+                    const len=ends[i]-starts[i];
+                    if(nth<=len){target=starts[i]+nth-1;break;}
+                    nth-=len;
+                }
+                if(target) |i| {ctx.tuple[0]=self.row(row_handles[i]);return E.eval(&ctx,win.deferred_arg);}
+                return .{.null_value={}};
+            }
+
+            fn boundedWindow(self:*Query,rows:List,win:*const B.Window,start_offset:u64,end_offset:u64,outer:?*const E.Context,demand:u64) Error!void {
                 if(rows.count==0) return;
                 const row_handles=self.handles(rows);
+                const demand_end:usize=if(win.offset_prefix) @intCast(@min(@as(u64,row_handles.len),demand)) else row_handles.len;
                 const peer_needed=win.frame!=.rows or win.exclude==.group or win.exclude==.ties;
                 const peers=if(peer_needed) try self.refs(@as(usize,rows.count)+1) else 0;
                 const eligible=win.deferred_arg==none and win.deferred_filter==none and (win.aggregate.kind==.count or win.aggregate.kind==.count_star or win.aggregate.kind==.bool_and or win.aggregate.kind==.bool_or or
@@ -2654,6 +2690,7 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 var first:usize=0;
                 while(first<row_handles.len) {
+                    if(first>=demand_end) break;
                     var end=first+1;
                     while(end<row_handles.len){try self.session.checkpoint();if(!self.equalColumns(row_handles[first],row_handles[end],win.partition[0..win.partition_count])) break;end+=1;}
                     var group_count:usize=1;
@@ -2698,7 +2735,7 @@ pub fn Exec(comptime config: types.Config) type {
                         while(node>1) {node-=1;self.work.stream_stats.window_tree_builds+=1;self.work.refs[root+node]=try self.frameBest(win,row_handles,self.work.refs[root+node*2],self.work.refs[root+node*2+1]);}
                     }
                     var peer_index:usize=0;
-                    for(first..end) |current| {
+                    for(first..@min(end,demand_end)) |current| {
                         try self.session.checkpoint();
                         self.work.stream_stats.window_frame_rows+=1;
                         if(peer_needed) while(current>=self.work.refs[peers+peer_index+1]) {peer_index+=1;};
@@ -2710,6 +2747,10 @@ pub fn Exec(comptime config: types.Config) type {
                         const b=if(win.frame==.rows) framePosition(win.end.kind,end_offset,current,first,end,true) else if(range_offsets)
                             try self.rangePosition(win,row_handles,win.end,end_offset,current,first,end,nonnull_first,nonnull_end,peer_first,peer_end,true) else
                             self.work.refs[peers+framePosition(win.end.kind,end_offset,peer_index,0,group_count,true)];
+                        if(win.kind==.first_value or win.kind==.last_value or win.kind==.nth_value) {
+                            self.work.cells[row_handles[current]+win.result]=try self.frameValue(win,row_handles,current,a,b,peer_first,peer_end,outer);
+                            continue;
+                        }
                         var state:Accumulator=.{};
                         if(fast) {
                             var total=prefixRange(prefix,a-first,b-first);
@@ -2800,14 +2841,14 @@ pub fn Exec(comptime config: types.Config) type {
                 const rows=try self.run(p.sources[0].plan,outer);
                 for(p.windows[0..p.window_count]) |*win| {
                     const scratch_mark=self.mark();defer self.release(scratch_mark);
-                    const start_offset=if(win.kind==.aggregate or win.kind==.lag or win.kind==.lead) try self.frameOffset(win.start,outer) else 0;
-                    const end_offset=if(win.kind==.aggregate or win.kind==.lag or win.kind==.lead) try self.frameOffset(win.end,outer) else 0;
+                    const start_offset=if(win.kind==.aggregate or win.kind==.lag or win.kind==.lead or win.kind==.first_value or win.kind==.last_value or win.kind==.nth_value) try self.frameOffset(win.start,outer) else 0;
+                    const end_offset=if(win.kind==.aggregate or win.kind==.lag or win.kind==.lead or win.kind==.first_value or win.kind==.last_value or win.kind==.nth_value) try self.frameOffset(win.end,outer) else 0;
                     var order:[2*config.columns]B.SortKey=undefined;var count:usize=0;
                     for(win.partition[0..win.partition_count]) |column| {order[count]=.{.column=column,.descending=false,.nulls_first=false};count+=1;}
                     for(win.order[0..win.order_count]) |key| {order[count]=key;count+=1;}
                     try self.sortRows(rows,order[0..count]);
-                    if(win.kind==.aggregate and (win.frame==.rows or win.frame==.groups or win.frame==.range)) {
-                        try self.boundedWindow(rows,win,start_offset,end_offset,outer);continue;
+                    if((win.kind==.aggregate or win.kind==.first_value or win.kind==.last_value or win.kind==.nth_value) and (win.frame==.rows or win.frame==.groups or win.frame==.range)) {
+                        try self.boundedWindow(rows,win,start_offset,end_offset,outer,p.offset+|p.limit);continue;
                     }
                     const row_handles=self.handles(rows);var first:usize=0;
                     const demand_end:usize=if(win.offset_prefix) @intCast(@min(@as(u64,row_handles.len),p.offset+|p.limit)) else row_handles.len;

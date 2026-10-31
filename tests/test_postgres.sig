@@ -931,6 +931,7 @@ fn errorStates() !void {
         .{ error.UndefinedFunction, "42883" },         .{ error.TypeMismatch, "42804" },
         .{ error.InvalidTextRepresentation, "22P02" }, .{ error.IntegerOverflow, "22003" },
         .{ error.DivisionByZero, "22012" },            .{ error.AmbiguousFunction, "42725" },
+        .{ error.InvalidArgumentForNthValue, "22016" },
         .{ error.CannotCoerce, "42846" },              .{ error.StatementTooComplex, "54001" },
         .{ error.VersionCapacity, "53200" },           .{ error.InvalidColumnReference, "42P10" },
         .{ error.InvalidObjectDefinition, "42P17" },
