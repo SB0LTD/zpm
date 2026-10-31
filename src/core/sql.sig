@@ -532,8 +532,9 @@ pub fn Database(comptime config: Config) type {
         catalog: K = .{},
         /// Sequence slots (Config.sequences); values are non-transactional.
         seqs: [config.sequences]Q.Seq = @splat(.{}),
-        /// Log-ahead values of aborted transactions, carried into the next
-        /// change record any transaction writes (design §4.6).
+        /// Globally pending log-ahead values, including live owners. Any
+        /// acknowledged consumer must persist them before publication; later
+        /// cache hits need no record once that watermark has been published.
         seq_carried: Q.Set = .{},
         /// currval/lastval of callers without their own session state.
         default_sequences: Q.Session = .{},
@@ -942,6 +943,7 @@ pub fn Database(comptime config: Config) type {
                 tx.sub_len = 0;
                 tx.lock_len = 0;
                 tx.pin = null;
+                tx.running_snap = null;
                 tx.fresh = false;
                 tx.waiting_for = .{};
                 tx.table_wait = null;
@@ -1009,6 +1011,7 @@ pub fn Database(comptime config: Config) type {
         fn free(self: *Self, slot: u16) void {
             const tx = &self.txs[slot];
             tx.active = false;
+            tx.running_snap = null;
             tx.sub_len = 0;
             tx.pin = null;
             tx.fresh = false;
@@ -1054,6 +1057,7 @@ pub fn Database(comptime config: Config) type {
             }
             tx.copy_table = null;
             tx.copy_rows = 0;
+            tx.running_snap = null;
             tx.pin = null;
             tx.fresh = false;
             tx.waiting_for = .{};
@@ -1167,6 +1171,8 @@ pub fn Database(comptime config: Config) type {
                 tx.subs[tx.sub_len] = .{ .statement = true, .write_start = @intCast(tx.write_len), .lock_start = @intCast(tx.lock_len) };
                 tx.sub_len += 1;
             }
+            tx.running_snap = snap;
+            defer tx.running_snap = null;
             const start = tx.subs[tx.sub_len - 1].write_start;
             self.statementHooks(slot, snap);
             self.body(slot, source, &parsed, snap, result, options.mode) catch |err| {
@@ -1310,12 +1316,14 @@ pub fn Database(comptime config: Config) type {
             return kind == .insert or kind == .update or kind == .delete;
         }
 
-        /// Reclamation horizon: no pinned snapshot can see a version whose
-        /// xmax_csn is at or below it.
+        /// Reclamation horizon covers running bodies, parked statements and
+        /// COPY between messages. A pre-data lock wait may re-snapshot.
         fn horizon(self: *const Self) u64 {
             var out = self.csn;
-            for (&self.txs) |*tx| if (tx.active and !tx.fresh) {
-                if (tx.pin) |pin| out = @min(out, pin.csn);
+            for (&self.txs) |*tx| if (tx.active) {
+                if (tx.running_snap) |snap| out = @min(out, snap.csn);
+                if (tx.copy_table != null) out = @min(out, tx.copy_snap.csn);
+                if (!tx.fresh) if (tx.pin) |pin| { out = @min(out, pin.csn); };
             };
             return out;
         }
@@ -1512,7 +1520,10 @@ pub fn Database(comptime config: Config) type {
             switch (kind) {
                 .nextval, .identity => {
                     const out = try Q.next(seq);
-                    if (out.logged) tx.seq_dirty.add(index);
+                    if (out.logged) {
+                        tx.seq_dirty.add(index);
+                        self.seq_carried.add(index);
+                    }
                     session.record(seq.oid, out.value, LiveOids{ .db = self });
                     return out.value;
                 },
@@ -1520,6 +1531,7 @@ pub fn Database(comptime config: Config) type {
                 .setval => {
                     try Q.set(seq, amount, called);
                     tx.seq_dirty.add(index);
+                    self.seq_carried.add(index);
                     if (called) {
                         // setval sets currval but not lastval's sequence.
                         const last = session.last;
@@ -2117,6 +2129,8 @@ pub fn Database(comptime config: Config) type {
                 tx.subs[tx.sub_len] = .{ .statement = true, .write_start = @intCast(tx.write_len), .lock_start = @intCast(tx.lock_len) };
                 tx.sub_len += 1;
             }
+            tx.running_snap = snap;
+            defer tx.running_snap = null;
             const info = self.openCopy(slot, source, snap) catch |err| {
                 if (err == error.WouldBlock) {
                     tx.pin = snap;
