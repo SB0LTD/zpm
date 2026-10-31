@@ -1121,6 +1121,17 @@ pub fn Parser(comptime config: types.Config) type {
                 self.pool.complex = true;
                 out.having = try self.expression();
             }
+            if(self.mode==.standard and try self.takeWord("WINDOW")) {
+                self.pool.complex=true;var previous:u16=none;
+                while(true) {
+                    const name=try self.identifier();try self.expectWord("AS");
+                    const owner=try self.pool.add(.{.kind=.null_literal});
+                    const window=try self.windowSpec(owner,false);
+                    self.pool.windows[window].definition=name;
+                    if(previous==none) out.window_defs=window else self.pool.windows[previous].next=window;
+                    previous=window;if(!try self.takeSymbol(.comma)) break;
+                }
+            }
             return index;
         }
 
@@ -1603,17 +1614,28 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if(self.mode==.standard and try self.takeWord("OVER")) {
                 self.pool.complex=true;
-                if(self.pool.window_len==self.pool.windows.len) return error.StatementTooComplex;
-                const index=self.pool.window_len;self.pool.window_len+=1;
-                self.pool.windows[index]=.{};self.pool.nodes[node].window=@intCast(index);
-                try self.expectSymbol(.lparen);
-                const spec=&self.pool.windows[index];
+                self.pool.nodes[node].window=try self.windowSpec(node,true);
+            }
+            const n = &self.pool.nodes[node];
+            if (n.distinct or n.c != none or self.aggregateName(name)) self.pool.complex = true;
+            return node;
+        }
+
+        fn windowSpec(self:*Self,owner:u16,allow_bare:bool) Error!u16 {
+            if(self.pool.window_len==self.pool.windows.len) return error.StatementTooComplex;
+            const index=self.pool.window_len;self.pool.window_len+=1;
+            self.pool.windows[index]=.{};const spec=&self.pool.windows[index];
+            if(allow_bare and !self.isSymbol(.lparen)) {
+                spec.base=try self.identifier();spec.direct=true;return @intCast(index);
+            }
+            try self.expectSymbol(.lparen);
+            if((self.current.kind==.word or self.current.kind==.quoted_word) and !self.isWord("PARTITION") and !self.isWord("ORDER") and !self.isWord("ROWS") and !self.isWord("RANGE") and !self.isWord("GROUPS")) spec.base=try self.identifier();
                 if(try self.takeWord("PARTITION")) {
                     try self.expectWord("BY");
                     while(true) {
                         if(spec.partition_count==config.columns) return error.ColumnCapacity;
-                        const item=try self.expression();try self.pool.raise(node,item);
-                        spec.partition[spec.partition_count]=item;spec.partition_count+=1;
+                        const item=try self.expression();try self.pool.raise(owner,item);
+                        spec.partition[spec.partition_count]=item;spec.partition_origin[spec.partition_count]=item;spec.partition_count+=1;
                         if(!try self.takeSymbol(.comma)) break;
                     }
                 }
@@ -1621,21 +1643,21 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectWord("BY");
                     while(true) {
                         if(spec.order_count==config.columns) return error.ColumnCapacity;
-                        const item=try self.expression();try self.pool.raise(node,item);
+                        const item=try self.expression();try self.pool.raise(owner,item);
                         var key:Ast.OrderKey=.{.expr=item};
                         if(try self.takeWord("DESC")) key.descending=true else _=try self.takeWord("ASC");
                         if(try self.takeWord("NULLS")) {
                             if(try self.takeWord("FIRST")) key.nulls_first=true else {try self.expectWord("LAST");key.nulls_first=false;}
                         }
-                        spec.order[spec.order_count]=key;spec.order_count+=1;
+                        spec.order[spec.order_count]=key;spec.order_origin[spec.order_count]=item;spec.order_count+=1;
                         if(!try self.takeSymbol(.comma)) break;
                     }
                 }
                 if(self.isWord("ROWS") or self.isWord("GROUPS") or self.isWord("RANGE")) {
-                    spec.frame=if(self.isWord("ROWS")) .rows else if(self.isWord("GROUPS")) .groups else .range;
+                    spec.framed=true;spec.frame=if(self.isWord("ROWS")) .rows else if(self.isWord("GROUPS")) .groups else .range;
                     try self.advance();const between=try self.takeWord("BETWEEN");
-                    spec.start=try self.frameBound(node);
-                    if(between) {try self.expectWord("AND");spec.end=try self.frameBound(node);}
+                    spec.start=try self.frameBound(owner);
+                    if(between) {try self.expectWord("AND");spec.end=try self.frameBound(owner);}
                     if(spec.start.kind==.unbounded_following or spec.end.kind==.unbounded_preceding or @intFromEnum(spec.end.kind)<@intFromEnum(spec.start.kind)) return error.WindowingError;
                     if(try self.takeWord("EXCLUDE")) {
                         if(try self.takeWord("CURRENT")){try self.expectWord("ROW");spec.exclude=.current_row;}
@@ -1644,11 +1666,7 @@ pub fn Parser(comptime config: types.Config) type {
                         else {try self.expectWord("NO");try self.expectWord("OTHERS");}
                     }
                 }
-                try self.expectSymbol(.rparen);
-            }
-            const n = &self.pool.nodes[node];
-            if (n.distinct or n.c != none or self.aggregateName(name)) self.pool.complex = true;
-            return node;
+            try self.expectSymbol(.rparen);return @intCast(index);
         }
 
         fn frameBound(self:*Self,owner:u16) Error!Ast.FrameBound {
