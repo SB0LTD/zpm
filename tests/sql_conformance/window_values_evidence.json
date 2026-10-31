@@ -1,0 +1,41 @@
+{
+  "baseline_commit": "4bbb5dea5abc74f4fcbbae179da465ce51ce379c",
+  "scope": "local value-window candidate, unchanged118 manifest; no full SQL/window/native parity closure",
+  "exit_code": 1,
+  "terminal_error": "SqlConformanceIncomplete",
+  "core_smoke_pass": 11,
+  "failures": 90,
+  "unexecuted": 17,
+  "output_sha256_lf": "d1ca525d6bfb4f77919e7353979b163368a99e963f15a8d5b583b10d72afb56c",
+  "inputs_sha256_lf": {
+    "tests/sql_conformance/cases.json": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c",
+    "tests/sql_conformance/postgres18_oracle.json": "dcf2ef99e025d694cffc06c3e07f3b164d20e58f5103becef279335afb246120",
+    "tests/sql_conformance/generate_contracts.py": "0952c368240d51046b899717ff1ca45476758ede29c160a6ab80bc62771c7cf5",
+    "src/core/sql.sig": "8a53292eb7e6c2e9e24f3372d838d751a644a1bf3c3a1e1c1a2e0133b9f56e04",
+    "src/core/sql/types.sig": "bc954a4f1226d43210d6637ae8b0bc8764426edea8ad40a9dc5f6c347643b7e7",
+    "src/core/sql/ast.sig": "6f2441eabb8b99cfe7d94eb6307388b83d136ec5ecdaa3938ca0495a76cf0157",
+    "src/core/sql/binder.sig": "cb8da08632ea4ce627cec489b053a4166980f57f9cff8ac1d7922314895a20a1",
+    "src/core/sql/exec.sig": "b13c29894c5ff9bbe8b0a07f6a6cc886866b668d6764e14ee080f3ef6dc60889",
+    "src/db/postgres.sig": "431f4adaf0ec770a1128eb2464fa7f5c47e9ebfc56ace537f71acbd52ec32bd0",
+    "src/core/sql/parser.sig": "187c68faa53aa8e0f05402aab35a8d469e913eb7f885050f8a3c5cd11d9b1bfe",
+    "tests/test_sql_named_windows.sig": "ecd478805dcba80bfce1a7f2f0a3528eee999a5c91217064ae956b50c0dab2f3",
+    "tests/fixtures/named_windows_pg16.json": "3d5a30fabbde206ae89f94c62fabe54e3587b80b5465a3dd880929cb86a8ede7",
+    "tools/capture_sql_named_windows_oracle.py": "a3963d989f2ee354f154efdbbbe784eccc01d4780757df8d85f8b3a49371df7d",
+    "tests/test_sql_window_values.sig": "fd8f5d3d2f232218028507efd90f0b2c947a31e4c84fe5571cfbebf9f4412386",
+    "tests/fixtures/window_values_pg16.json": "23e6e507644275acf1da24135f8d755d7cad9c111f741b1e8c33774f195fd411",
+    "tests/fixtures/window_values_boundary_deviations_pg16.json": "35a944f964b57340daab47b6e14db94dfc222edd12dfc6c81e874e551e6bc6f1",
+    "tools/capture_sql_window_values_oracle.py": "d60603d0fb8d1a24df7f8a68237db9dbc73169de0288a7f8f2d3777833af9da7",
+    "tests/test_postgres.sig": "e20d4783e98ce7ffefcacc4b3d2ac34f353f2439ee6c95b885e9ed53bf5f7a5c"
+  },
+  "known_native_boundary_programs": 12,
+  "known_native_value_deviations_pg16": 4,
+  "verification": {
+    "value_assertions": 6179,
+    "named_assertions": 1832,
+    "frames_assertions": 108118,
+    "offset_assertions": 2023,
+    "ranking_assertions": 3053,
+    "windows_assertions": 9035,
+    "postgres_protocol_assertions": 17325
+  }
+}
