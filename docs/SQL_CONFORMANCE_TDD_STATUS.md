@@ -515,3 +515,14 @@ remains historical qualification evidence. PG.JSONB.MODIFY still fails because
 jsonb_set is missing; JSON constructors, aggregates, paths and table functions
 remain open. See [SQL_JSON_OPERATORS.md](SQL_JSON_OPERATORS.md) for exact scope,
 regressions and capacity limits. Cross-platform/wire qualification is pending.
+
+### Offset-window inventory candidate —31 October2026
+
+LAG/LEAD implement typed offsets/defaults, lazy selected-row evaluation and
+bounded root-query prefix demand. Native-reference and independent adversarial
+checks are documented in [SQL_WINDOW_OFFSETS.md](SQL_WINDOW_OFFSETS.md). The
+unchanged inventory now gives **10 smoke passes /91 failures /17 unexecuted**
+locally and retains SqlConformanceIncomplete. PG.QUERY.WINDOW advances; named
+windows and the wider family remain incomplete. Non-total/nonrepeatable nested
+or uncertain demand combinations reject explicitly; no complete SQL claim.
+Hosted qualification is pending.
