@@ -534,3 +534,16 @@ window family. The118-program smoke counts remain10/91/17: do not count each
 new function as a closed feature family or a compatibility percentage. See
 [SQL_WINDOW_RANKING.md](SQL_WINDOW_RANKING.md) for scope, native quirks, remaining
 demand restrictions and independent tests. Hosted/wire qualification pending.
+
+### Named-window candidate, 31 October 2026
+
+WINDOW definitions and scoped inheritance advance PG.QUERY.WINDOW_FRAMES. The
+unchanged118-program inventory now gives **11 smoke passes /90 failures /
+17 unexecuted**, with mandatory SqlConformanceIncomplete. See
+[SQL_NAMED_WINDOWS.md](SQL_NAMED_WINDOWS.md) for native-backed scope, volatile
+evaluation fixes, explicit unsupported combinations and capacity/control checks.
+Five Linux ReleaseSafe suites pass: named1832, frames108118, offsets2023,
+ranking3053 and windows9035. Independent review reproduced all five,27 native
+fixtures and extra scalar-key/sequence-interleaving probes. Cross-platform,
+wire and PG18 qualification remain separate pending gates. Complete SQL,
+window-family and performance-superiority claims remain unsupported.

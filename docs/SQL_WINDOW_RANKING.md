@@ -37,7 +37,7 @@ Native reference: PostgreSQL18 functions-window documentation and
 The initial frozen PG16.15 oracle has62 programs, checked for value/type/error.
 Additional tests exercise constant bucket-count distributions over varying row
 counts, singleton/empty input, LIMIT0, frame-folding errors and work cancellation.
-Hosted/native/PG18 qualification remains pending. Named windows and first/last/
+Hosted/native/PG18 qualification remains pending. Named-window work is described separately in SQL_NAMED_WINDOWS.md. First/last/
 nth_value, wider frames and complete SQL inventory closure remain open.
 
 Observed ReleaseSafe ranking:3047assertions on Windows and independently Linux.
