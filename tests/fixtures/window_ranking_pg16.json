@@ -1,0 +1,2310 @@
+{
+  "reference": "PostgreSQL16.15",
+  "setup": "CREATE TEMP TABLE r(id INTEGER PRIMARY KEY,g INTEGER,v INTEGER,b INTEGER); INSERT INTO r VALUES(1,1,10,NULL),(2,1,10,2),(3,1,30,3),(4,2,40,2),(5,2,40,0),(6,2,NULL,-1),(7,NULL,60,3),(8,NULL,60,1),(9,3,70,NULL);",
+  "cases": [
+    {
+      "sql": "SELECT id,percent_rank() OVER () AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "double precision"
+        ],
+        [
+          "2",
+          "0",
+          "double precision"
+        ],
+        [
+          "3",
+          "0",
+          "double precision"
+        ],
+        [
+          "4",
+          "0",
+          "double precision"
+        ],
+        [
+          "5",
+          "0",
+          "double precision"
+        ],
+        [
+          "6",
+          "0",
+          "double precision"
+        ],
+        [
+          "7",
+          "0",
+          "double precision"
+        ],
+        [
+          "8",
+          "0",
+          "double precision"
+        ],
+        [
+          "9",
+          "0",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,percent_rank() OVER (ORDER BY v) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "double precision"
+        ],
+        [
+          "2",
+          "0",
+          "double precision"
+        ],
+        [
+          "3",
+          "0.25",
+          "double precision"
+        ],
+        [
+          "4",
+          "0.375",
+          "double precision"
+        ],
+        [
+          "5",
+          "0.375",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ],
+        [
+          "7",
+          "0.625",
+          "double precision"
+        ],
+        [
+          "8",
+          "0.625",
+          "double precision"
+        ],
+        [
+          "9",
+          "0.875",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,percent_rank() OVER (ORDER BY v DESC NULLS LAST) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0.75",
+          "double precision"
+        ],
+        [
+          "2",
+          "0.75",
+          "double precision"
+        ],
+        [
+          "3",
+          "0.625",
+          "double precision"
+        ],
+        [
+          "4",
+          "0.375",
+          "double precision"
+        ],
+        [
+          "5",
+          "0.375",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ],
+        [
+          "7",
+          "0.125",
+          "double precision"
+        ],
+        [
+          "8",
+          "0.125",
+          "double precision"
+        ],
+        [
+          "9",
+          "0",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,percent_rank() OVER (PARTITION BY g ORDER BY v) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "double precision"
+        ],
+        [
+          "2",
+          "0",
+          "double precision"
+        ],
+        [
+          "3",
+          "1",
+          "double precision"
+        ],
+        [
+          "4",
+          "0",
+          "double precision"
+        ],
+        [
+          "5",
+          "0",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ],
+        [
+          "7",
+          "0",
+          "double precision"
+        ],
+        [
+          "8",
+          "0",
+          "double precision"
+        ],
+        [
+          "9",
+          "0",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,percent_rank() OVER (PARTITION BY g) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "double precision"
+        ],
+        [
+          "2",
+          "0",
+          "double precision"
+        ],
+        [
+          "3",
+          "0",
+          "double precision"
+        ],
+        [
+          "4",
+          "0",
+          "double precision"
+        ],
+        [
+          "5",
+          "0",
+          "double precision"
+        ],
+        [
+          "6",
+          "0",
+          "double precision"
+        ],
+        [
+          "7",
+          "0",
+          "double precision"
+        ],
+        [
+          "8",
+          "0",
+          "double precision"
+        ],
+        [
+          "9",
+          "0",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,percent_rank() OVER (ORDER BY v,id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "double precision"
+        ],
+        [
+          "2",
+          "0.125",
+          "double precision"
+        ],
+        [
+          "3",
+          "0.25",
+          "double precision"
+        ],
+        [
+          "4",
+          "0.375",
+          "double precision"
+        ],
+        [
+          "5",
+          "0.5",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ],
+        [
+          "7",
+          "0.625",
+          "double precision"
+        ],
+        [
+          "8",
+          "0.75",
+          "double precision"
+        ],
+        [
+          "9",
+          "0.875",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,percent_rank() OVER (ORDER BY v,id ROWS BETWEEN NULL PRECEDING AND CURRENT ROW) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "double precision"
+        ],
+        [
+          "2",
+          "0.125",
+          "double precision"
+        ],
+        [
+          "3",
+          "0.25",
+          "double precision"
+        ],
+        [
+          "4",
+          "0.375",
+          "double precision"
+        ],
+        [
+          "5",
+          "0.5",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ],
+        [
+          "7",
+          "0.625",
+          "double precision"
+        ],
+        [
+          "8",
+          "0.75",
+          "double precision"
+        ],
+        [
+          "9",
+          "0.875",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,percent_rank(1) OVER () AS value FROM r ORDER BY id",
+      "sqlstate": "42809",
+      "rows": null,
+      "diagnostic": "ERROR:  42809: WITHIN GROUP is required for ordered-set aggregate percent_rank\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,percent_ra...\n                                                             ^\nLOCATION:  ParseFuncOrColumn, parse_func.c:382"
+    },
+    {
+      "sql": "SELECT id,percent_rank(NULL) OVER () AS value FROM r ORDER BY id",
+      "sqlstate": "42809",
+      "rows": null,
+      "diagnostic": "ERROR:  42809: WITHIN GROUP is required for ordered-set aggregate percent_rank\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,percent_ra...\n                                                             ^\nLOCATION:  ParseFuncOrColumn, parse_func.c:382"
+    },
+    {
+      "sql": "SELECT id,percent_rank(*) OVER () AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "double precision"
+        ],
+        [
+          "2",
+          "0",
+          "double precision"
+        ],
+        [
+          "3",
+          "0",
+          "double precision"
+        ],
+        [
+          "4",
+          "0",
+          "double precision"
+        ],
+        [
+          "5",
+          "0",
+          "double precision"
+        ],
+        [
+          "6",
+          "0",
+          "double precision"
+        ],
+        [
+          "7",
+          "0",
+          "double precision"
+        ],
+        [
+          "8",
+          "0",
+          "double precision"
+        ],
+        [
+          "9",
+          "0",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,cume_dist() OVER () AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "double precision"
+        ],
+        [
+          "2",
+          "1",
+          "double precision"
+        ],
+        [
+          "3",
+          "1",
+          "double precision"
+        ],
+        [
+          "4",
+          "1",
+          "double precision"
+        ],
+        [
+          "5",
+          "1",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ],
+        [
+          "7",
+          "1",
+          "double precision"
+        ],
+        [
+          "8",
+          "1",
+          "double precision"
+        ],
+        [
+          "9",
+          "1",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,cume_dist() OVER (ORDER BY v) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0.2222222222222222",
+          "double precision"
+        ],
+        [
+          "2",
+          "0.2222222222222222",
+          "double precision"
+        ],
+        [
+          "3",
+          "0.3333333333333333",
+          "double precision"
+        ],
+        [
+          "4",
+          "0.5555555555555556",
+          "double precision"
+        ],
+        [
+          "5",
+          "0.5555555555555556",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ],
+        [
+          "7",
+          "0.7777777777777778",
+          "double precision"
+        ],
+        [
+          "8",
+          "0.7777777777777778",
+          "double precision"
+        ],
+        [
+          "9",
+          "0.8888888888888888",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,cume_dist() OVER (ORDER BY v DESC NULLS LAST) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0.8888888888888888",
+          "double precision"
+        ],
+        [
+          "2",
+          "0.8888888888888888",
+          "double precision"
+        ],
+        [
+          "3",
+          "0.6666666666666666",
+          "double precision"
+        ],
+        [
+          "4",
+          "0.5555555555555556",
+          "double precision"
+        ],
+        [
+          "5",
+          "0.5555555555555556",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ],
+        [
+          "7",
+          "0.3333333333333333",
+          "double precision"
+        ],
+        [
+          "8",
+          "0.3333333333333333",
+          "double precision"
+        ],
+        [
+          "9",
+          "0.1111111111111111",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,cume_dist() OVER (PARTITION BY g ORDER BY v) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0.6666666666666666",
+          "double precision"
+        ],
+        [
+          "2",
+          "0.6666666666666666",
+          "double precision"
+        ],
+        [
+          "3",
+          "1",
+          "double precision"
+        ],
+        [
+          "4",
+          "0.6666666666666666",
+          "double precision"
+        ],
+        [
+          "5",
+          "0.6666666666666666",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ],
+        [
+          "7",
+          "1",
+          "double precision"
+        ],
+        [
+          "8",
+          "1",
+          "double precision"
+        ],
+        [
+          "9",
+          "1",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,cume_dist() OVER (PARTITION BY g) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "double precision"
+        ],
+        [
+          "2",
+          "1",
+          "double precision"
+        ],
+        [
+          "3",
+          "1",
+          "double precision"
+        ],
+        [
+          "4",
+          "1",
+          "double precision"
+        ],
+        [
+          "5",
+          "1",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ],
+        [
+          "7",
+          "1",
+          "double precision"
+        ],
+        [
+          "8",
+          "1",
+          "double precision"
+        ],
+        [
+          "9",
+          "1",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,cume_dist() OVER (ORDER BY v,id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0.1111111111111111",
+          "double precision"
+        ],
+        [
+          "2",
+          "0.2222222222222222",
+          "double precision"
+        ],
+        [
+          "3",
+          "0.3333333333333333",
+          "double precision"
+        ],
+        [
+          "4",
+          "0.4444444444444444",
+          "double precision"
+        ],
+        [
+          "5",
+          "0.5555555555555556",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ],
+        [
+          "7",
+          "0.6666666666666666",
+          "double precision"
+        ],
+        [
+          "8",
+          "0.7777777777777778",
+          "double precision"
+        ],
+        [
+          "9",
+          "0.8888888888888888",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,cume_dist() OVER (ORDER BY v,id ROWS BETWEEN NULL PRECEDING AND CURRENT ROW) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0.1111111111111111",
+          "double precision"
+        ],
+        [
+          "2",
+          "0.2222222222222222",
+          "double precision"
+        ],
+        [
+          "3",
+          "0.3333333333333333",
+          "double precision"
+        ],
+        [
+          "4",
+          "0.4444444444444444",
+          "double precision"
+        ],
+        [
+          "5",
+          "0.5555555555555556",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ],
+        [
+          "7",
+          "0.6666666666666666",
+          "double precision"
+        ],
+        [
+          "8",
+          "0.7777777777777778",
+          "double precision"
+        ],
+        [
+          "9",
+          "0.8888888888888888",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,cume_dist(1) OVER () AS value FROM r ORDER BY id",
+      "sqlstate": "42809",
+      "rows": null,
+      "diagnostic": "ERROR:  42809: WITHIN GROUP is required for ordered-set aggregate cume_dist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,cume_dist(...\n                                                             ^\nLOCATION:  ParseFuncOrColumn, parse_func.c:382"
+    },
+    {
+      "sql": "SELECT id,cume_dist(NULL) OVER () AS value FROM r ORDER BY id",
+      "sqlstate": "42809",
+      "rows": null,
+      "diagnostic": "ERROR:  42809: WITHIN GROUP is required for ordered-set aggregate cume_dist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,cume_dist(...\n                                                             ^\nLOCATION:  ParseFuncOrColumn, parse_func.c:382"
+    },
+    {
+      "sql": "SELECT id,cume_dist(*) OVER () AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "double precision"
+        ],
+        [
+          "2",
+          "1",
+          "double precision"
+        ],
+        [
+          "3",
+          "1",
+          "double precision"
+        ],
+        [
+          "4",
+          "1",
+          "double precision"
+        ],
+        [
+          "5",
+          "1",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ],
+        [
+          "7",
+          "1",
+          "double precision"
+        ],
+        [
+          "8",
+          "1",
+          "double precision"
+        ],
+        [
+          "9",
+          "1",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(1) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "1",
+          "integer"
+        ],
+        [
+          "3",
+          "1",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "1",
+          "integer"
+        ],
+        [
+          "6",
+          "1",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "1",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(1) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "1",
+          "integer"
+        ],
+        [
+          "3",
+          "1",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "1",
+          "integer"
+        ],
+        [
+          "6",
+          "1",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "1",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(2) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "1",
+          "integer"
+        ],
+        [
+          "3",
+          "2",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "1",
+          "integer"
+        ],
+        [
+          "6",
+          "2",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "2",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(2) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "2",
+          "integer"
+        ],
+        [
+          "2",
+          "2",
+          "integer"
+        ],
+        [
+          "3",
+          "2",
+          "integer"
+        ],
+        [
+          "4",
+          "2",
+          "integer"
+        ],
+        [
+          "5",
+          "1",
+          "integer"
+        ],
+        [
+          "6",
+          "1",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "1",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(3) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "2",
+          "integer"
+        ],
+        [
+          "3",
+          "3",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "2",
+          "integer"
+        ],
+        [
+          "6",
+          "3",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "2",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(3) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "3",
+          "integer"
+        ],
+        [
+          "2",
+          "3",
+          "integer"
+        ],
+        [
+          "3",
+          "3",
+          "integer"
+        ],
+        [
+          "4",
+          "2",
+          "integer"
+        ],
+        [
+          "5",
+          "2",
+          "integer"
+        ],
+        [
+          "6",
+          "2",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "1",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(4) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "2",
+          "integer"
+        ],
+        [
+          "3",
+          "3",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "2",
+          "integer"
+        ],
+        [
+          "6",
+          "3",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "2",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(4) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "4",
+          "integer"
+        ],
+        [
+          "2",
+          "4",
+          "integer"
+        ],
+        [
+          "3",
+          "3",
+          "integer"
+        ],
+        [
+          "4",
+          "3",
+          "integer"
+        ],
+        [
+          "5",
+          "2",
+          "integer"
+        ],
+        [
+          "6",
+          "2",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "1",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(8) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "2",
+          "integer"
+        ],
+        [
+          "3",
+          "3",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "2",
+          "integer"
+        ],
+        [
+          "6",
+          "3",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "2",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(8) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "8",
+          "integer"
+        ],
+        [
+          "2",
+          "7",
+          "integer"
+        ],
+        [
+          "3",
+          "6",
+          "integer"
+        ],
+        [
+          "4",
+          "5",
+          "integer"
+        ],
+        [
+          "5",
+          "4",
+          "integer"
+        ],
+        [
+          "6",
+          "3",
+          "integer"
+        ],
+        [
+          "7",
+          "2",
+          "integer"
+        ],
+        [
+          "8",
+          "1",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(9) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "2",
+          "integer"
+        ],
+        [
+          "3",
+          "3",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "2",
+          "integer"
+        ],
+        [
+          "6",
+          "3",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "2",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(9) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "9",
+          "integer"
+        ],
+        [
+          "2",
+          "8",
+          "integer"
+        ],
+        [
+          "3",
+          "7",
+          "integer"
+        ],
+        [
+          "4",
+          "6",
+          "integer"
+        ],
+        [
+          "5",
+          "5",
+          "integer"
+        ],
+        [
+          "6",
+          "4",
+          "integer"
+        ],
+        [
+          "7",
+          "3",
+          "integer"
+        ],
+        [
+          "8",
+          "2",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(10) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "2",
+          "integer"
+        ],
+        [
+          "3",
+          "3",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "2",
+          "integer"
+        ],
+        [
+          "6",
+          "3",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "2",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(10) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "9",
+          "integer"
+        ],
+        [
+          "2",
+          "8",
+          "integer"
+        ],
+        [
+          "3",
+          "7",
+          "integer"
+        ],
+        [
+          "4",
+          "6",
+          "integer"
+        ],
+        [
+          "5",
+          "5",
+          "integer"
+        ],
+        [
+          "6",
+          "4",
+          "integer"
+        ],
+        [
+          "7",
+          "3",
+          "integer"
+        ],
+        [
+          "8",
+          "2",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(2147483647) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "2",
+          "integer"
+        ],
+        [
+          "3",
+          "3",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "2",
+          "integer"
+        ],
+        [
+          "6",
+          "3",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "2",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(2147483647) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "9",
+          "integer"
+        ],
+        [
+          "2",
+          "8",
+          "integer"
+        ],
+        [
+          "3",
+          "7",
+          "integer"
+        ],
+        [
+          "4",
+          "6",
+          "integer"
+        ],
+        [
+          "5",
+          "5",
+          "integer"
+        ],
+        [
+          "6",
+          "4",
+          "integer"
+        ],
+        [
+          "7",
+          "3",
+          "integer"
+        ],
+        [
+          "8",
+          "2",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(NULL) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ],
+        [
+          "7",
+          null,
+          "integer"
+        ],
+        [
+          "8",
+          null,
+          "integer"
+        ],
+        [
+          "9",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(NULL) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ],
+        [
+          "7",
+          null,
+          "integer"
+        ],
+        [
+          "8",
+          null,
+          "integer"
+        ],
+        [
+          "9",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(b) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "1",
+          "integer"
+        ],
+        [
+          "3",
+          "1",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "1",
+          "integer"
+        ],
+        [
+          "6",
+          "2",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "2",
+          "integer"
+        ],
+        [
+          "9",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(b) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "1",
+          "integer"
+        ],
+        [
+          "3",
+          "1",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "1",
+          "integer"
+        ],
+        [
+          "6",
+          "1",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "1",
+          "integer"
+        ],
+        [
+          "9",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile('2') OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "1",
+          "integer"
+        ],
+        [
+          "3",
+          "2",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "1",
+          "integer"
+        ],
+        [
+          "6",
+          "2",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "2",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile('2') OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "2",
+          "integer"
+        ],
+        [
+          "2",
+          "2",
+          "integer"
+        ],
+        [
+          "3",
+          "2",
+          "integer"
+        ],
+        [
+          "4",
+          "2",
+          "integer"
+        ],
+        [
+          "5",
+          "1",
+          "integer"
+        ],
+        [
+          "6",
+          "1",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "1",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(2::smallint) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "1",
+          "integer"
+        ],
+        [
+          "3",
+          "2",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "1",
+          "integer"
+        ],
+        [
+          "6",
+          "2",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "2",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(2::smallint) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "2",
+          "integer"
+        ],
+        [
+          "2",
+          "2",
+          "integer"
+        ],
+        [
+          "3",
+          "2",
+          "integer"
+        ],
+        [
+          "4",
+          "2",
+          "integer"
+        ],
+        [
+          "5",
+          "1",
+          "integer"
+        ],
+        [
+          "6",
+          "1",
+          "integer"
+        ],
+        [
+          "7",
+          "1",
+          "integer"
+        ],
+        [
+          "8",
+          "1",
+          "integer"
+        ],
+        [
+          "9",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(0) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "22014",
+      "rows": null,
+      "diagnostic": "ERROR:  22014: argument of ntile must be greater than zero\nLOCATION:  window_ntile, windowfuncs.c:441"
+    },
+    {
+      "sql": "SELECT id,ntile(0) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "22014",
+      "rows": null,
+      "diagnostic": "ERROR:  22014: argument of ntile must be greater than zero\nLOCATION:  window_ntile, windowfuncs.c:441"
+    },
+    {
+      "sql": "SELECT id,ntile(-1) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "22014",
+      "rows": null,
+      "diagnostic": "ERROR:  22014: argument of ntile must be greater than zero\nLOCATION:  window_ntile, windowfuncs.c:441"
+    },
+    {
+      "sql": "SELECT id,ntile(-1) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "22014",
+      "rows": null,
+      "diagnostic": "ERROR:  22014: argument of ntile must be greater than zero\nLOCATION:  window_ntile, windowfuncs.c:441"
+    },
+    {
+      "sql": "SELECT id,ntile(-2147483648) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "22014",
+      "rows": null,
+      "diagnostic": "ERROR:  22014: argument of ntile must be greater than zero\nLOCATION:  window_ntile, windowfuncs.c:441"
+    },
+    {
+      "sql": "SELECT id,ntile(-2147483648) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "22014",
+      "rows": null,
+      "diagnostic": "ERROR:  22014: argument of ntile must be greater than zero\nLOCATION:  window_ntile, windowfuncs.c:441"
+    },
+    {
+      "sql": "SELECT id,ntile(2::bigint) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function ntile(bigint) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,ntile(2::b...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,ntile(2::bigint) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function ntile(bigint) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,ntile(2::b...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,ntile(1.5) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function ntile(numeric) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,ntile(1.5)...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,ntile(1.5) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function ntile(numeric) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,ntile(1.5)...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,ntile(true) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function ntile(boolean) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,ntile(true...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,ntile(true) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function ntile(boolean) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,ntile(true...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,ntile(1/0) OVER (PARTITION BY g ORDER BY v,id) AS value FROM r ORDER BY id",
+      "sqlstate": "22012",
+      "rows": null,
+      "diagnostic": "ERROR:  22012: division by zero\nLOCATION:  int4div, int.c:870"
+    },
+    {
+      "sql": "SELECT id,ntile(1/0) OVER (ORDER BY id DESC) AS value FROM r ORDER BY id",
+      "sqlstate": "22012",
+      "rows": null,
+      "diagnostic": "ERROR:  22012: division by zero\nLOCATION:  int4div, int.c:870"
+    },
+    {
+      "sql": "SELECT id,ntile(3) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "1",
+          "integer"
+        ],
+        [
+          "3",
+          "1",
+          "integer"
+        ],
+        [
+          "4",
+          "2",
+          "integer"
+        ],
+        [
+          "5",
+          "2",
+          "integer"
+        ],
+        [
+          "6",
+          "2",
+          "integer"
+        ],
+        [
+          "7",
+          "3",
+          "integer"
+        ],
+        [
+          "8",
+          "3",
+          "integer"
+        ],
+        [
+          "9",
+          "3",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(3) OVER (ORDER BY id ROWS BETWEEN NULL PRECEDING AND CURRENT ROW) AS value FROM r ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "1",
+          "integer"
+        ],
+        [
+          "3",
+          "1",
+          "integer"
+        ],
+        [
+          "4",
+          "2",
+          "integer"
+        ],
+        [
+          "5",
+          "2",
+          "integer"
+        ],
+        [
+          "6",
+          "2",
+          "integer"
+        ],
+        [
+          "7",
+          "3",
+          "integer"
+        ],
+        [
+          "8",
+          "3",
+          "integer"
+        ],
+        [
+          "9",
+          "3",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile() OVER () AS value FROM r ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function ntile() does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,ntile() OV...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,ntile(2,3) OVER () AS value FROM r ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function ntile(integer, integer) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,ntile(2,3)...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    }
+  ]
+}

@@ -33,15 +33,17 @@
 //! §4.1): AND/OR/NOT with three-valued logic, comparisons, IS [NOT]
 //! NULL/TRUE/FALSE/UNKNOWN and DISTINCT FROM, [NOT] IN lists, [NOT] BETWEEN, [NOT] LIKE/ILIKE,
 //! Flat ROW constructor comparisons and NULL tests, GREATEST/LEAST, `||`, checked arithmetic over the numeric and datetime types, AT TIME
-//! ZONE, the JSONB operators `-> ->> #> #>> @> <@ ?`, CASE, COALESCE, NULLIF,
+//! ZONE, JSON/JSONB extraction `-> ->> #> #>>`, JSONB `@> <@ ? ||`, CASE, COALESCE, NULLIF,
 //! `::`/CAST, now() / CURRENT_TIMESTAMP / statement_timestamp() /
 //! clock_timestamp() / CURRENT_DATE, jsonb_typeof and jsonb_array_length,
 //! typed with PostgreSQL's implicit-cast rules. Constraints are NOT NULL and
 //! a single-column PRIMARY KEY. Unquoted identifiers are ASCII and case
 //! insensitive; quoted identifiers keep case; text comparison is bytewise.
-//! Window functions, other functions, arrays and secondary indices are
-//! outside this SQL subset; this is not full SQL-standard or PostgreSQL
-//! compatibility.
+//! Window support includes ROW_NUMBER/RANK/DENSE_RANK/PERCENT_RANK/CUME_DIST,
+//! NTILE, LAG/LEAD and bounded aggregate frames/exclusions (see the SQL_WINDOW_*
+//! module docs for demand and frame restrictions). Named windows, value-window
+//! functions, general arrays/records and secondary indices remain outside this
+//! SQL subset; this is not full SQL-standard or PostgreSQL compatibility.
 //!
 //! Session values (per statement, `Database.session`, set by the caller like
 //! the dialect): TimeZone, a zone-name resolver, transaction/statement start
