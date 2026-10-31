@@ -328,6 +328,9 @@ pub fn Ast(comptime config: types.Config) type {
         pub const FrameBound=struct {kind:BoundKind=.current_row,offset:u16=none};
         pub const Exclusion=enum {no_others,current_row,group,ties};
         pub const Window=struct {
+            definition:?Ident=null,base:?Ident=null,direct:bool=false,framed:bool=false,next:u16=none,
+            partition_typed:bool=false,order_typed:bool=false,bounds_typed:bool=false,
+            partition_origin:[config.columns]u16=undefined,order_origin:[config.columns]u16=undefined,
             partition:[config.columns]u16=undefined,partition_count:usize=0,
             order:[config.columns]OrderKey=undefined,order_count:usize=0,
             frame:Frame=.default,
@@ -380,6 +383,7 @@ pub fn Ast(comptime config: types.Config) type {
             group_count: usize = 0,
             rollup:bool=false,
             having: u16 = none,
+            window_defs:u16=none,
             order: [config.columns]OrderKey = undefined,
             order_count: usize = 0,
             /// No LIMIT (or LIMIT ALL) is maxInt(u64).
