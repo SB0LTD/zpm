@@ -74,7 +74,7 @@ component is missing. The annotations below separate those cases.
 | PG.DDL.CREATE_VARIANTS | Temporary/CTAS/LIKE | Syntax |
 | PG.DDL.INHERITANCE | Table inheritance | Syntax |
 | PG.DDL.PARTITION | Partition lifecycle | Syntax |
-| PG.DDL.IF_EXISTS | Conditional DDL | Syntax |
+| PG.DDL.IF_EXISTS | Conditional DDL | candidate smoke pass; table/sequence clauses, wider DDL/notice parity incomplete |
 | PG.DDL.TRUNCATE | TRUNCATE | UnsupportedStatement |
 | PG.DDL.DATABASE | Database lifecycle | UnexecutedScopeOrComparator |
 | PG.CONSTRAINT.COMPOSITE | Composite/table-level primary key | Syntax |
@@ -159,11 +159,11 @@ component is missing. The annotations below separate those cases.
 | TSQL.FUNCTIONS | Native scalar functions | UnexecutedScopeOrComparator |
 | TSQL.PROCEDURAL | Variables/errors/transactions | UnexecutedScopeOrComparator |
 
-## Remaining work after 31 October candidates
+## Remaining work after 1 November candidates
 
 | Area | Available slice | Still missing or unqualified |
 | --- | --- | --- |
-| Windows | Ranking/distribution, LAG/LEAD, scoped named definitions, aggregate FILTER, bounded ROWS/GROUPS, integral RANGE and exclusions; frame value functions in candidate qualification | Native EXCLUDE TIES boundary differences and internal-error behavior; numeric/float/temporal RANGE offsets; shared volatile execution, uncertain nested demand, moving volatile inputs, collations and wider type/coercion coverage |
+| Windows | Ranking/distribution, LAG/LEAD, scoped named definitions, aggregate FILTER, bounded ROWS/GROUPS, integral RANGE and exclusions; frame value functions with documented native differences | Native EXCLUDE TIES boundary differences and internal-error behavior; numeric/float/temporal RANGE offsets; shared volatile execution, uncertain nested demand, moving volatile inputs, collations and wider type/coercion coverage |
 | Grouping | Ordinary aggregates, flat ROLLUP/GROUPING and GROUP BY () | CUBE/general GROUPING SETS, composite/multiple ROLLUP, remaining aggregate families and DISTINCT domains |
 | Formatting/functions | Temporal to_char; GREATEST/LEAST; existing numeric/JSON/sequence/catalog subset | to_date/to_number, numeric/interval/localized/ISO/timezone formatting, ordinary string/math/date/regex/discovery function families and overloads |
 | Schema/types | Existing typed tables, identity/default/stored-generation slices | VARCHAR/CHAR, UUID/BYTEA, TIME/TIMETZ, arrays/general records/user types; SERIAL; conditional DDL; ALTER/TRUNCATE/views/schemas; secondary indexes; table/composite/UNIQUE/CHECK/FK/deferred constraints |
@@ -408,3 +408,12 @@ frame membership. A separate native executor XX000/mark-state discrepancy is
 also documented. These differences are not passing compatibility evidence;
 PG18 version characterization, hosted/wire qualification and broader SQL closure
 remain pending. See the value-window scope document and boundary fixture.
+
+### Conditional DDL candidate - 1 November 2026
+
+The unchanged118-program driver now gives12 smoke passes,89 failures and17
+unexecuted; exit1 SqlConformanceIncomplete is required.49 native-reference
+programs and the207-assertion conditional contract cover the declared slice.
+Existing MVCC/catalog/change-log/expression/DML/generated contracts also pass.
+See [scope](../../docs/SQL_CONDITIONAL_DDL.md) and
+`conditional_ddl_evidence.json`. Wider schema/DDL closure remains incomplete.

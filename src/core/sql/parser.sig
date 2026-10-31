@@ -181,9 +181,12 @@ pub fn Parser(comptime config: types.Config) type {
             if (try self.takeWord("DROP")) {
                 const sequence_kind = self.mode == .standard and try self.takeWord("SEQUENCE");
                 if (!sequence_kind) try self.expectWord("TABLE");
-                const name = try self.identifier();
+                const conditional = self.mode == .standard and self.rawWord("if") and (try self.peek()).isWord("EXISTS");
+                if (conditional) try self.advance();
+                if (conditional) try self.expectWord("EXISTS");
+                const drop: Ast.Drop = .{ .name = try self.identifier(), .if_exists = conditional };
                 try self.finish();
-                return if (sequence_kind) .{ .drop_sequence = name } else .{ .drop_table = name };
+                return if (sequence_kind) .{ .drop_sequence = drop } else .{ .drop_table = drop };
             }
             if (try self.takeWord("INSERT")) return .{ .insert = try self.insert() };
             if (self.isWord("SELECT") or (self.mode == .standard and self.isWord("WITH"))) return self.topQuery();
@@ -653,46 +656,69 @@ pub fn Parser(comptime config: types.Config) type {
 
         /// Sequence options (CREATE SEQUENCE and identity specifications).
         fn sequenceOptions(self: *Self, out: *sequence.Options) Error!void {
+            var seen:u16=0;
             while (true) {
+                var option:u16=0;
                 if (try self.takeWord("INCREMENT")) {
+                    option=1;
                     _ = try self.takeWord("BY");
                     out.increment = try self.signedInteger();
                 } else if (try self.takeWord("MINVALUE")) {
+                    option=2;
                     out.min = try self.signedInteger();
                 } else if (try self.takeWord("MAXVALUE")) {
+                    option=4;
                     out.max = try self.signedInteger();
                 } else if (try self.takeWord("START")) {
+                    option=8;
                     _ = try self.takeWord("WITH");
                     out.start = try self.signedInteger();
                 } else if (try self.takeWord("CACHE")) {
+                    option=16;
                     out.cache = try self.signedInteger();
                 } else if (try self.takeWord("CYCLE")) {
+                    option=32;
                     out.cycle = true;
                 } else if (try self.takeWord("NO")) {
                     if (try self.takeWord("MINVALUE")) {
+                        option=2;
                         out.min = null;
                         out.no_min = true;
                     } else if (try self.takeWord("MAXVALUE")) {
+                        option=4;
                         out.max = null;
                         out.no_max = true;
                     } else {
                         try self.expectWord("CYCLE");
+                        option=32;
                         out.cycle = false;
                     }
                 } else if (try self.takeWord("AS")) {
+                    option=64;
                     const spec = try self.typeName();
                     out.type_oid = switch (spec.ty) {
                         .int2 => 21,
                         .int4 => 23,
                         .int8 => 20,
-                        else => return error.InvalidParameterValue,
+                        // Type validity is semantic: an existing conditional
+                        // creation skips option validation before resolve().
+                        else => 0xffffffff,
                     };
                 } else return;
+                if(seen&option!=0) out.duplicate_options=true;
+                seen|=option;
             }
         }
 
+        fn ifNotExists(self: *Self) Error!bool {
+            if (self.mode != .standard or !self.rawWord("if") or !(try self.peek()).isWord("NOT")) return false;
+            try self.advance();
+            try self.expectWord("NOT");try self.expectWord("EXISTS");return true;
+        }
+
         fn createSequence(self: *Self) Error!Ast.CreateSequence {
-            var out: Ast.CreateSequence = .{ .name = try self.identifier() };
+            const conditional = try self.ifNotExists();
+            var out: Ast.CreateSequence = .{ .name = try self.identifier(), .if_not_exists = conditional };
             try self.sequenceOptions(&out.options);
             try self.finish();
             return out;
@@ -713,7 +739,8 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn create(self: *Self) Error!Ast.CreateTable {
             try self.expectWord("TABLE");
-            var out: Ast.CreateTable = .{ .name = try self.identifier() };
+            const conditional = try self.ifNotExists();
+            var out: Ast.CreateTable = .{ .name = try self.identifier(), .if_not_exists = conditional };
             try self.expectSymbol(.lparen);
             var has_primary = false;
             while (true) {
@@ -727,13 +754,13 @@ pub fn Parser(comptime config: types.Config) type {
                 var has_not_null = false;
                 while (true) {
                     if (self.mode == .standard and try self.takeWord("DEFAULT")) {
-                        if (column.default_kind != .none) return error.Syntax;
+                        if (column.default_kind != .none) {if(out.if_not_exists) out.invalid_definition=true else return error.Syntax;}
                         column.default_kind = .default;
                         const start = self.tokenStart();
                         _ = try self.other();
                         column.expression = self.spanTo(start);
                     } else if (self.mode == .standard and try self.takeWord("GENERATED")) {
-                        if (column.default_kind != .none) return error.Syntax;
+                        if (column.default_kind != .none) {if(out.if_not_exists) out.invalid_definition=true else return error.Syntax;}
                         var always = true;
                         if (try self.takeWord("BY")) {
                             try self.expectWord("DEFAULT");
@@ -759,12 +786,12 @@ pub fn Parser(comptime config: types.Config) type {
                     } else if (self.mode == .standard and self.isWord("NULL")) {
                         try self.advance();
                     } else if (try self.takeWord("NOT")) {
-                        if (has_not_null) return error.Syntax;
+                        if (has_not_null) {if(out.if_not_exists) out.invalid_definition=true else return error.Syntax;}
                         try self.expectWord("NULL");
                         has_not_null = true;
                         column.not_null = true;
                     } else if (try self.takeWord("PRIMARY")) {
-                        if (has_primary) return error.Syntax;
+                        if (has_primary) {if(out.if_not_exists) out.invalid_definition=true else return error.Syntax;}
                         try self.expectWord("KEY");
                         has_primary = true;
                         column.primary_key = true;

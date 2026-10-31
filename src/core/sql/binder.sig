@@ -114,6 +114,7 @@ pub fn Binder(comptime config: types.Config) type {
         };
 
         pub const Bound = union(enum) {
+            noop: types.CommandTag,
             create_table: Create,
             drop_table: usize,
             create_sequence: CreateSequence,
@@ -297,6 +298,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         pub fn command(bound: *const Bound) types.CommandTag {
             return switch (bound.*) {
+                .noop => |tag| tag,
                 .create_table => .create_table,
                 .drop_table => .drop_table,
                 .create_sequence => .create_sequence,
@@ -3415,7 +3417,11 @@ pub fn Binder(comptime config: types.Config) type {
             switch (statement.*) {
                 .create_table => |*create| {
                     const table_name = toName(context, create.name);
-                    if (context.catalog.find(table_name.slice(), context.snapshot) != null) return error.TableExists;
+                    if (context.catalog.find(table_name.slice(), context.snapshot) != null) {
+                        if (create.if_not_exists) return .{ .noop = .create_table };
+                        return error.TableExists;
+                    }
+                    if (create.invalid_definition) return error.Syntax;
                     var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count };
                     for (create.columns[0..create.count], 0..) |*definition, index| {
                         var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod, .default_kind = definition.default_kind };
@@ -3446,20 +3452,29 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     return .{ .create_table = out };
                 },
-                .drop_table => |ident| {
-                    const wanted = toName(context, ident);
-                    const found = context.catalog.find(wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+                .drop_table => |drop| {
+                    const wanted = toName(context, drop.name);
+                    const found = context.catalog.find(wanted.slice(), context.snapshot) orelse {
+                        if (drop.if_exists) return .{ .noop = .drop_table };
+                        return error.TableNotFound;
+                    };
                     if (found.kind != 'r') return error.WrongObjectType;
                     return .{ .drop_table = found.slot };
                 },
                 .create_sequence => |*create| {
                     const name = toName(context, create.name);
-                    if (context.catalog.find(name.slice(), context.snapshot) != null) return error.TableExists;
+                    if (context.catalog.find(name.slice(), context.snapshot) != null) {
+                        if (create.if_not_exists) return .{ .noop = .create_sequence };
+                        return error.TableExists;
+                    }
                     return .{ .create_sequence = .{ .name = name, .spec = try sequence.resolve(create.options) } };
                 },
-                .drop_sequence => |ident| {
-                    const wanted = toName(context, ident);
-                    const found = context.catalog.find(wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+                .drop_sequence => |drop| {
+                    const wanted = toName(context, drop.name);
+                    const found = context.catalog.find(wanted.slice(), context.snapshot) orelse {
+                        if (drop.if_exists) return .{ .noop = .drop_sequence };
+                        return error.TableNotFound;
+                    };
                     if (found.kind != 'S') return error.WrongObjectType;
                     return .{ .drop_sequence = found.slot };
                 },

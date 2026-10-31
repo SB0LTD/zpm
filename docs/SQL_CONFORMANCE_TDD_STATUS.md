@@ -1,14 +1,15 @@
 # SQL conformance TDD checkpoint
 
-## Latest candidate checkpoint - 31 October 2026
+## Latest candidate checkpoint - 1 November 2026
 
-The unchanged 118-program driver has **11 smoke passes, 90 failures and 17
+The unchanged 118-program driver has **12 smoke passes, 89 failures and 17
 unexecuted scopes/comparators**, and still exits1 SqlConformanceIncomplete.
 JSON extraction/concatenation, LAG/LEAD, distribution ranking and named windows
-have finite implementations and evidence described below. Frame value windows
-are the next candidate: see [scope and known native differences](SQL_WINDOW_VALUES.md).
-These results do not close the SQL inventory. Named/value window hosted gates
-and PostgreSQL boundary-difference characterization remain pending.
+have finite implementations and qualified main integrations. Frame value windows
+also qualified their declared finite scope; their native boundary differences
+remain open (see SQL_WINDOW_VALUES.md). Conditional DDL is the next candidate,
+with local/reviewed core evidence below and hosted/wire qualification pending.
+These results do not close the SQL inventory.
 
 The dated checkpoints below preserve historical qualification evidence.
 
@@ -576,3 +577,16 @@ frame membership. A separate native executor XX000/mark-state discrepancy is
 also documented. These differences are not passing compatibility evidence;
 PG18 version characterization, hosted/wire qualification and broader SQL closure
 remain pending. See the value-window scope document and boundary fixture.
+
+### Conditional DDL candidate - 1 November 2026
+
+PG.DDL.IF_EXISTS now passes the unchanged smoke program: **12 passes /89 failures /
+17 unexecuted**, with mandatory SqlConformanceIncomplete. CREATE/DROP TABLE and
+SEQUENCE conditional clauses preserve existing state and skip empty durability
+work while retaining carried sequence persistence. Adversarial tests corrected
+IF identifiers, skipped semantic validation, repeated sequence options and stale
+DROP SEQUENCE retry snapshots. Core207 assertions and seven existing suites pass
+in Linux ReleaseSafe and were independently rerun.49 frozen native programs match.
+See SQL_CONDITIONAL_DDL.md and conditional_ddl_evidence.json for scope/provenance.
+NoticeResponse, full READ ONLY semantics, wider DDL variants, hosted/wire/PG18
+qualification and the full SQL inventory remain open. No throughput claim follows.
