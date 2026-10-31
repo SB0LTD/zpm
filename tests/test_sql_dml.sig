@@ -448,6 +448,48 @@ fn durability() !void {
     try check(replica.tableCount() == 0);
 }
 
+/// A transaction may consume another live transaction's log-ahead cache.
+/// Its acknowledged commit must carry that watermark before the owner ends.
+fn concurrentSequenceWatermarks() !void {
+    for ([_]bool{ false, true }) |descending| {
+        primary = .{};
+        replica = .{};
+        _ = try replicated(if (descending) "CREATE SEQUENCE shared INCREMENT BY -1" else "CREATE SEQUENCE shared");
+        const owner = try primary.begin();
+        var result: DB.Result = .{};
+        try primary.statement(owner, "SELECT nextval('shared')", &result, .{});
+        try check(result.rows[0].cells[0].integer == (if (descending) @as(i64, -1) else 1));
+        // owner stays live; this consumer commits a value from its cache.
+        const bytes = try replicated("SELECT nextval('shared')");
+        const recovered = try value(&replica, "SELECT nextval('shared')");
+        const committed: i64 = if (descending) -2 else 2;
+        if (!(if (descending) recovered < committed else recovered > committed)) {
+            std.debug.print("sequence replay can reissue an acknowledged value: consumer={d}, replay starts={d}, WAL bytes={d}\n", .{ committed, recovered, bytes });
+            return error.LostConcurrentSequenceWatermark;
+        }
+        try check(bytes != 0);
+        // Once the shared watermark is durable, later cache hits keep the
+        // no-record path even while the original owner is still active.
+        try check(try replicated("SELECT nextval('shared')") == 0);
+        primary.abort(owner);
+        _ = try replicated("SELECT 1");
+        try check(try replicated("SELECT 2") == 0);
+    }
+    // An unrelated commit cannot persist a pending CREATE's definition,
+    // but must not erase the creator's own obligation to persist it later.
+    primary = .{};
+    replica = .{};
+    const creator = try primary.begin();
+    var result: DB.Result = .{};
+    try primary.statement(creator, "CREATE SEQUENCE private_seq", &result, .{});
+    try primary.statement(creator, "SELECT nextval('private_seq')", &result, .{});
+    _ = try replicated("SELECT 1");
+    const payload = try primary.prepareCommit(creator, &record);
+    try replica.applyChangeRecord(payload, &scratch);
+    primary.publishCommit(creator);
+    try check(try value(&replica, "SELECT nextval('private_seq')") == 34);
+}
+
 pub fn main(init: std.process.Init) !void {
     try returning();
     try atomicity();
@@ -458,6 +500,7 @@ pub fn main(init: std.process.Init) !void {
     try generated();
     try upsert();
     try durability();
+    try concurrentSequenceWatermarks();
     var buffer: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-dml\",\"pass\":true,\"assertions\":{d},\"database_bytes\":{d}}}\n", .{ assertions, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

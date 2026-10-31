@@ -57,6 +57,15 @@ by checked arithmetic/operator fixes and PostgreSQL boundary regressions; see
 118-program feature inventory or close interval syntax, JSONB or wider temporal
 feature gaps. The FV-12 formal proof remains open.
 
+### Snapshot and sequence safety follow-up — 31 October 2026
+
+STO-02 and STO-04 now have reproduced regressions and implementation fixes:
+running/COPY snapshots participate in reclamation, and a consumer commit
+persists a live owner's pending sequence watermark. See
+[SQL_SNAPSHOT_SEQUENCE_SAFETY.md](SQL_SNAPSHOT_SEQUENCE_SAFETY.md) for exact scope.
+This is safety work and does not close additional SQL feature-map programs.
+STO-05, NET-02 and the listed SQL feature gaps remain open.
+
 ### What is still missing
 
 1. **Correctness before expansion.** General filter/error placement and planner

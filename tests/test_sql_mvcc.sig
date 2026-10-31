@@ -1,4 +1,4 @@
-//! READ COMMITTED engine contracts (design §4.4-§4.5): snapshot visibility
+//! READ COMMITTED engine contracts (design Â§4.4-Â§4.5): snapshot visibility
 //! matrix, statement subtransactions across parks, EvalPlanQual, savepoints,
 //! transactional DDL, bitset deadlock detection, and empty lock/transaction
 //! tables after commit, abort and every error path.
@@ -503,6 +503,76 @@ fn lockUpgradeFullList() !void {
     try check(try fresh("SELECT v FROM p WHERE id = 10") == 1);
 }
 
+/// A resumed UPDATE must not vacuum versions needed by its remaining scan.
+/// The correct bounded outcome is 53200 and statement rollback, not success
+/// with a skipped row. A larger arena is covered by existing EPQ contracts.
+fn resumedReclamationPressure() !void {
+    db = .{};
+    try autocommit("CREATE TABLE pressure (id INTEGER PRIMARY KEY, v BIGINT)");
+    try autocommit("INSERT INTO pressure VALUES (1,0),(2,0),(3,0)");
+    const holder = try db.begin();
+    const waiter = try db.begin();
+    _ = try run(holder, "UPDATE pressure SET v = 10 WHERE id > 1");
+    try parks(waiter, "UPDATE pressure SET v = v + 1");
+    // Keep every old version behind the waiter's parked snapshot.
+    while (db.tables[0].version_used < db.tables[0].versions.len) {
+        _ = try run(holder, "UPDATE pressure SET v = v + 1 WHERE id = 2");
+    }
+    const expected = try value(holder, "SELECT v FROM pressure WHERE id = 2");
+    commit(holder);
+    try check(db.tables[0].version_used == db.tables[0].versions.len);
+    if (resumeRun(waiter, "UPDATE pressure SET v = v + 1")) |out| {
+        std.debug.print("unsafe resume succeeded: affected={d}; remaining snapshot rows were reclaimed\n", .{out.affected_rows});
+        return error.ReclaimedRunningSnapshot;
+    } else |err| try check(err == error.VersionCapacity);
+    try check(!db.parked(waiter) and db.active(waiter));
+    try check(db.txs[waiter].sub_len == 0 and db.txs[waiter].running_snap == null);
+    db.abort(waiter);
+    try check(try fresh("SELECT v FROM pressure WHERE id = 1") == 0);
+    try check(try fresh("SELECT v FROM pressure WHERE id = 2") == expected);
+    try check(try fresh("SELECT v FROM pressure WHERE id = 3") == 10);
+    _ = db.vacuum();
+    try empty();
+}
+
+/// COPY owns its statement snapshot between data messages, even without a
+/// lock wait. Writer publication and explicit vacuum must both respect it.
+fn copySnapshotHorizon() !void {
+    db = .{};
+    try autocommit("CREATE TABLE pressure (id INTEGER PRIMARY KEY, v BIGINT)");
+    try autocommit("INSERT INTO pressure VALUES (1,0),(2,0),(3,0)");
+    const copier = try db.begin();
+    _ = try db.copyBegin(copier, "COPY pressure FROM STDIN", false);
+    try check(!db.parked(copier) and db.copyActive(copier) and db.txs[copier].running_snap == null);
+    const writer = try db.begin();
+    _ = try run(writer, "UPDATE pressure SET v = 10");
+    commit(writer);
+    try check(db.tables[0].version_used == 6);
+    _ = db.vacuum();
+    try check(db.tables[0].version_used == 6);
+    var row: DB.Row = undefined;
+    try db.copyBuild(copier, "COPY pressure FROM STDIN", &.{"4", "40"}, &row);
+    try db.copyInsert(copier, &row);
+    try check(try db.copyEnd(copier) == 1);
+    commit(copier);
+    _ = db.vacuum();
+    try check(db.tables[0].version_used == 4);
+    try check(try fresh("SELECT v FROM pressure WHERE id = 4") == 40);
+    try empty();
+    const canceled = try db.begin();
+    _ = try db.copyBegin(canceled, "COPY pressure FROM STDIN", false);
+    const other = try db.begin();
+    _ = try run(other, "UPDATE pressure SET v = v + 1");
+    commit(other);
+    try check(db.tables[0].version_used == 8);
+    db.abortStatement(canceled);
+    try check(!db.copyActive(canceled));
+    _ = db.vacuum();
+    try check(db.tables[0].version_used == 4);
+    db.abort(canceled);
+    try empty();
+}
+
 pub fn main() !void {
     try visibility();
     try statementSubtransactions();
@@ -518,6 +588,8 @@ pub fn main() !void {
     try lockUpgradeSavepointCycles();
     try lockUpgradeConflict();
     try lockUpgradeFullList();
+    try resumedReclamationPressure();
+    try copySnapshotHorizon();
     try check(assertions > 0);
     var buffer: [256]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-mvcc\",\"pass\":true,\"assertions\":{d},\"database_bytes\":{d}}}\n", .{ assertions, DB.storageBytes() });

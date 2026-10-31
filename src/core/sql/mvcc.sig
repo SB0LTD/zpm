@@ -61,6 +61,9 @@ pub fn Mvcc(comptime config: types.Config) type {
             lock_len: usize = 0,
             /// Snapshot of a parked statement (resumed with the same snapshot).
             pin: ?storage.Snapshot = null,
+            /// Statement body currently executing, including a resumed body.
+            /// Reclamation must retain its snapshot until the call returns.
+            running_snap: ?storage.Snapshot = null,
             /// The parked statement touched no data yet: resume re-snapshots.
             fresh: bool = false,
             waiting_for: L.Set = .{},
