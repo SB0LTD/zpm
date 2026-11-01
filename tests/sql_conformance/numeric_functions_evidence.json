@@ -1,0 +1,38 @@
+{
+  "date": "2026-11-01",
+  "base_commit": "f73c3fe9ee7774dba14e7ba4dbe0253316bfa556",
+  "runtime": "allocator-free Sig Layer 0",
+  "inputs_lf_sha256": {
+    "src/core/sql/ast.sig": "9c20f6ba1a55bd3634febfc91f445cc0bc32398db307279666ff6b2d3e239f93",
+    "src/core/sql/binder.sig": "18618029efd47e858241044a11e27b7a7d404bbbe23bf11803afb04e44e91442",
+    "src/core/sql/expr.sig": "358e66c7d4504af09df81cf940d8f4d5f8546dd64ab5ed5ab5c67135e82b785f",
+    "src/core/sql/numeric.sig": "964fb86cd937e53f4193ce097fdee4e23ef54cf6257fe3593ba72dc9dcd44e69",
+    "tests/test_sql_numeric_functions.sig": "bbcaa2751e88226a6da4d749c66f829570bd70f39ff9aace5be6793d22a88fbe",
+    "tests/sql_conformance/verify_numeric_functions_oracle.py": "e700e7539b1e0854948db9854c4c22f384f0719c3c4cfe29e2a2ed14acc5333c",
+    "tests/sql_conformance/numeric_functions_oracle.json": "cce5c52c55504a0dafa4d3ece798de3b273ee55f93e73cca1a7849bcb69e5315",
+    "tests/sql_conformance/numeric_planner_gaps.json": "206fcf7935476f904fa001f3f24fd23bfceef3f58213480c919672a91fd8c41b",
+    "tests/sql_conformance/cases.json": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c"
+  },
+  "native_oracle": {
+    "engine": "PostgreSQL16.15",
+    "matrix": 204,
+    "extras": 116,
+    "failures": 0
+  },
+  "core": {
+    "windows_release_safe": 1266,
+    "linux_release_safe": 1266,
+    "exit": 0
+  },
+  "inventory": {
+    "unchanged_cases": 118,
+    "smoke_pass": 12,
+    "failure": 89,
+    "unexecuted": 17,
+    "exit": 1,
+    "error": "SqlConformanceIncomplete",
+    "log_lf_sha256": "f277c0fa1eb121e0f02ac5424ad9b093febd59639f5288e5242a37fdb4a9594b"
+  },
+  "qualification": "Independent core review approved; RAMSQL wire and hosted gates pending",
+  "open_family": "PG.FUNC.NUMERIC still UndefinedFunction at sqrt; mathematical family not closed"
+}

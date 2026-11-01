@@ -1,0 +1,21 @@
+{
+  "scope": "Open planner follow-ups; excluded from the implemented numeric slice, not passing gates",
+  "cases": [
+    {
+      "id": "PG.PLANNER.UNUSED_DERIVED_NUMERIC",
+      "sql": "SELECT 7 FROM (SELECT trunc(NULL::numeric,(1/0)::int4) AS x) q",
+      "native_postgresql_16_15": {
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "sqlstate": "00000"
+      },
+      "candidate": {
+        "sqlstate": "22012"
+      },
+      "needed": "Propagate required output columns into derived plans and prune unused immutable projections before constant validation; preserve volatile semantics and grouping/window dependencies."
+    }
+  ]
+}

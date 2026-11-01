@@ -40,14 +40,14 @@ pub const TypeName = types.Type;
 pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists, is_distinct, is_not_distinct };
 
 /// Built-in functions bound by name.
-pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, greatest, least };
+pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, greatest, least };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
 /// clock or subquery in a pure function never makes its effects repeatable.
 pub fn canRepeatFunction(func: Func) bool {
     return switch (func) {
-        .grouping, .window_call, .to_char, .round, .greatest, .least => true,
+        .grouping, .window_call, .to_char, .round, .abs, .ceil, .floor, .trunc, .sign, .greatest, .least => true,
         else => false,
     };
 }
@@ -56,14 +56,14 @@ pub fn canRepeatFunction(func: Func) bool {
 /// and clocks depend on session/database state even with constant arguments.
 pub fn immutableFunction(func: Func) bool {
     return switch (func) {
-        .round, .greatest, .least, .jsonb_typeof, .jsonb_array_length => true,
+        .round, .abs, .ceil, .floor, .trunc, .sign, .greatest, .least, .jsonb_typeof, .jsonb_array_length => true,
         else => false,
     };
 }
 
 pub fn strictFunction(func: Func) bool {
     return switch (func) {
-        .to_char, .round, .jsonb_typeof, .jsonb_array_length,
+        .to_char, .round, .abs, .ceil, .floor, .trunc, .sign, .jsonb_typeof, .jsonb_array_length,
         .nextval, .currval, .setval, .lastval, .identity_next,
         .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp,
         .current_timestamp, .current_date, .current_database, .current_schema,
@@ -161,6 +161,9 @@ pub const Node = struct {
     insensitive: bool = false,
     /// Constant subtree (no column reference); set by the binder.
     constant: bool = false,
+    /// Numeric strict call with a syntactic NULL argument. Keep its children
+    /// for semantic/constant validation; do not execute or lower them.
+    planned_null: bool = false,
     /// Binder-validated DATE literal: integer stores its exact day count.
     date_bound: bool = false,
     ty: Type = .unknown,
@@ -208,6 +211,7 @@ pub fn Ast(comptime config: types.Config) type {
             complex: bool = false,
             /// Strict NULL record comparisons need a post-binding constant pass.
             discarded_row_constants: bool = false,
+            planned_nulls: bool = false,
 
             pub fn reset(self: *Pool) void {
                 self.window_len=0;
@@ -215,6 +219,7 @@ pub fn Ast(comptime config: types.Config) type {
                 self.query_len = 0;
                 self.complex = false;
                 self.discarded_row_constants = false;
+                self.planned_nulls = false;
             }
 
             /// A new default query block, initialized in place (blocks are
