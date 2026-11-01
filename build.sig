@@ -991,6 +991,52 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("sig_process", process_source),
         },
     });
+
+    // ── LFM3 (LFM3-Audio-2B text backbone): short-conv + GQA hybrid on CPU ──
+    _ = try ctx.addModule("unicode_class", "src/core/unicode_class.sig");
+    const lfm3_plan = try ctx.addModule("lfm3_plan", "src/core/lfm3_plan.sig");
+    try wire(ctx, lfm3_plan, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_plan, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, lfm3_plan, "sig_mem", "src/core/sig_mem.sig");
+    const lfm3_executor = try ctx.addModule("lfm3_executor", "src/core/lfm3_executor.sig");
+    try wire(ctx, lfm3_executor, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, lfm3_executor, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_executor, "lfm3_plan", "src/core/lfm3_plan.sig");
+    try wire(ctx, lfm3_executor, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, lfm3_executor, "transformer_ops", "src/core/transformer_ops.sig");
+    const lfm3_tokenizer = try ctx.addModule("lfm3_tokenizer", "src/core/lfm3_tokenizer.sig");
+    try wire(ctx, lfm3_tokenizer, "sig_mem", "src/core/sig_mem.sig");
+    try wire(ctx, lfm3_tokenizer, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_tokenizer, "tokenizer", "src/core/tokenizer.sig");
+    try wire(ctx, lfm3_tokenizer, "unicode_class", "src/core/unicode_class.sig");
+    const test_lfm3 = try ctx.addStep("test-lfm3", "Execute LFM3 schedule, conv-state, tokenizer and executor contracts", &noopStep);
+    try ctx.addDependency(test_all, test_lfm3);
+    _ = try addTest(ctx, test_lfm3, "test-unicode-class", "src/core/unicode_class.sig", &.{});
+    _ = try addContract(ctx, test_lfm3, "contract-lfm3", "tests/test_lfm3.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+        importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+        importEntry("lfm3_tokenizer", "src/core/lfm3_tokenizer.sig"),
+        importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+    });
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/lfm3_run.sig",
+        .output_name = "lfm3-run",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{
+            importEntry("gguf", "src/core/gguf.sig"),
+            importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+            importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+            importEntry("lfm3_tokenizer", "src/core/lfm3_tokenizer.sig"),
+            importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
+            importEntry("worker_thread", "src/platform/worker_thread.sig"),
+            importEntry("sig_process", process_source),
+        },
+    });
     const tts_gpu = try ctx.addModule("tts_gpu", "src/tts/gpu.sig");
     try wire(ctx, tts_gpu, "tts_model_container", "src/tts/model_container.sig");
     try wire(ctx, tts_gpu, "quantized_linear", "src/core/quantized_linear.sig");

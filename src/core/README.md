@@ -39,9 +39,24 @@ var buf: [4096]u8 = undefined;
 const len = try session.generateComplete(&s, "Hello", .{}, &buf);
 ```
 
+### LFM3 (short-convolution + GQA hybrid)
+
+```
+lfm3_plan.sig        ← schedule from GGUF metadata (per-layer KV heads, SWA pattern)
+lfm3_executor.sig    ← batched CPU forward: rolling conv state, f16 KV, sliding windows
+    └── quantized_linear.sig ← Q8_K activations x Q4_K/Q6_K integer tiles (GGML numerics)
+lfm3_tokenizer.sig   ← special-token partition, LLAMA3 pre-split, ignore_merges, chat template
+    └── unicode_class.sig    ← generated \p{L}/\p{N}/\s table (tools/gen_unicode_class.py)
+```
+
+The executor owns no threads: hosts pass a `Parallel` dispatcher that runs
+independent row/channel/head ranges on their workers. `tools/lfm3_run.sig` is
+the Windows host runner used for llama.cpp parity and speed checks.
+
 ### Supported Models
 - Qwen3-0.6B (Q4_K, Q6_K) — tested, ~2s/token on ARM64
 - Qwen3-1.7B, Qwen3-4B — supported via configurable limits
+- LFM3-Audio-2B text backbone (`lfm3`, Q4_K_M) — greedy output matches llama.cpp
 
 ### Quantization Formats
 - **Q4_K** (GGML type 12): 256-element blocks, 8-wide SIMD

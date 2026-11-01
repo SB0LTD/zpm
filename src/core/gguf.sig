@@ -105,6 +105,14 @@ pub const Summary = struct {
     ssm_group_count: u64 = 0, // GDN head count
     ssm_time_step_rank: u64 = 0,
     ssm_inner_size: u64 = 0,
+    // Short-convolution hybrid (lfm2 / lfm3) fields. Per-layer arrays stay in
+    // model storage: a zero KV head count marks a convolution layer, and the
+    // boolean pattern marks sliding-window attention layers.
+    shortconv_l_cache: u64 = 0,
+    sliding_window: u64 = 0,
+    rope_frequency_base_swa: f32 = 0,
+    head_count_kv_layers: ArrayRef = .{},
+    sliding_window_pattern: ArrayRef = .{},
     tokenizer_tokens: ArrayRef = .{},
     tokenizer_merges: ArrayRef = .{},
     tokenizer_scores: ArrayRef = .{},
@@ -399,6 +407,10 @@ fn recordArray(
         summary.tokenizer_scores = value;
     } else if (try keyEquals(source, key, "tokenizer.ggml.token_type")) {
         summary.tokenizer_token_types = value;
+    } else if (try keyEndsWith(source, key, ".attention.head_count_kv")) {
+        summary.head_count_kv_layers = value;
+    } else if (try keyEndsWith(source, key, ".attention.sliding_window_pattern")) {
+        summary.sliding_window_pattern = value;
     }
 }
 
@@ -437,12 +449,18 @@ fn recordInteger(source: Source, key: KeyRef, value: u64, summary: *Summary) voi
         summary.ssm_time_step_rank = value;
     } else if (keyEndsWith(source, key, ".ssm.inner_size") catch false) {
         summary.ssm_inner_size = value;
+    } else if (keyEndsWith(source, key, ".shortconv.l_cache") catch false) {
+        summary.shortconv_l_cache = value;
+    } else if (keyEndsWith(source, key, ".attention.sliding_window") catch false) {
+        summary.sliding_window = value;
     }
 }
 
 fn recordFloat(source: Source, key: KeyRef, value: f32, summary: *Summary) void {
     if (keyEndsWith(source, key, ".rope.freq_base") catch false) {
         summary.rope_frequency_base = value;
+    } else if (keyEndsWith(source, key, ".rope.freq_base_swa") catch false) {
+        summary.rope_frequency_base_swa = value;
     } else if (keyEndsWith(source, key, ".attention.layer_norm_rms_epsilon") catch false) {
         summary.rms_norm_epsilon = value;
     }
