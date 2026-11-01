@@ -1,0 +1,18 @@
+{
+  "scope": "Observed open planner gaps; not passing SQRT parity gates",
+  "cases": [
+    {
+      "id": "PG.PLANNER.CONSTANT_MATH_EMPTY_INPUT",
+      "sql": "SELECT sqrt(-1::numeric) WHERE FALSE",
+      "native_postgresql_16_15": {
+        "sqlstate": "2201F"
+      },
+      "candidate": {
+        "sqlstate": "00000",
+        "row_count": 0
+      },
+      "status": "open",
+      "needed": "Complete semantic diagnostics before reachability-aware constant simplification; validate live constant math before row demand, preserve CASE/COALESCE and window-clause semantics. Add all-math empty-input differential cases."
+    }
+  ]
+}

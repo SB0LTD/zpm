@@ -608,6 +608,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "floor", .func = .floor },
                 .{ .name = "trunc", .func = .trunc },
                 .{ .name = "sign", .func = .sign },
+                .{ .name = "sqrt", .func = .sqrt },
                 .{ .name = "transaction_timestamp", .func = .transaction_timestamp },
                 .{ .name = "statement_timestamp", .func = .statement_timestamp },
                 .{ .name = "clock_timestamp", .func = .clock_timestamp },
@@ -1017,7 +1018,7 @@ pub fn Binder(comptime config: types.Config) type {
                     context.node(argument).next=format;context.node(format).next=none;
                     n.b=argument;n.ty=.text;n.constant=isConstant(context,argument) and isConstant(context,format);
                 },
-                .abs, .ceil, .floor, .trunc, .sign => {
+                .abs, .ceil, .floor, .trunc, .sign, .sqrt => {
                     const scaled=n.func==.trunc and count==2;
                     if(count!=1 and !scaled) return error.UndefinedFunction;
                     const first=n.b;const second=context.node(first).next;

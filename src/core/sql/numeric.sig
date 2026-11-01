@@ -13,6 +13,7 @@
 //! PostgreSQL's base-10000 representation (weight, first digit, ndigits) is
 //! derived on demand for select_div_scale and the binary wire format.
 const types = @import("types.sig");
+const std = @import("std");
 const Error = types.Error;
 
 pub const Special = enum(u8) { finite, nan, pinf, ninf };
@@ -396,6 +397,39 @@ pub fn Ops(comptime digits: usize) type {
             const left = try scaled(a, scale);
             const right = try scaled(b, scale);
             return make(left % right, scale, a.negative);
+        }
+
+        /// Exact decimal root, with the native base10000 display-scale rule.
+        /// The scaled radicand is integer; nearest rounding needs no floating
+        /// approximation: sqrt(N) rounds up iff N-q*q > q, q=floor(sqrt(N)).
+        pub fn sqrt(value: *const Numeric) Error!Numeric {
+            if(value.special==.ninf or (value.special==.finite and value.negative and !value.isZero()))
+                return error.InvalidArgumentForPowerFunction;
+            if(value.special!=.finite) return value.*;
+            if(value.dscale>max_scale) return error.NumericCapacity;
+            const weight=baseWeight(value).weight;
+            const scale:usize=@intCast(@max(min_sig_digits-(2*weight+1),@as(i32,value.dscale),0));
+            if(scale>max_scale) return error.NumericCapacity;
+            const exponent=2*scale-@as(usize,value.dscale);
+            if(exponent>=pow10_wide.len) return error.NumericCapacity;
+            // For supported inputs exponent<=120, so the u1024 product is
+            // bounded by 196 decimal digits (76 coefficient +120 expansion).
+            const radicand=@as(u1024,value.coef())*pow10_wide[exponent];
+            // Rounded coefficient reaches L=10^digits exactly at integer
+            // N >= L*L-L+1. Reject before root computation and narrowing.
+            if(radicand>=pow10_wide[2*digits]-pow10_wide[digits]+1) return error.NumericCapacity;
+            if(radicand==0) return make(0,scale,false);
+            // Supported coefficients have at most76 digits: after the guard
+            // N<10^152<2^512. Reuse Sig's standard fixed-integer primitive,
+            // choosing smaller widths for ordinary values. No module alias
+            // or relative import of another published ZPM package is needed.
+            const radicand512:u512=@intCast(radicand);
+            const root:u512=if(radicand512<=~@as(u128,0)) std.math.sqrt(@as(u128,@intCast(radicand512)))
+                else if(radicand512<=~@as(u256,0)) std.math.sqrt(@as(u256,@intCast(radicand512)))
+                else std.math.sqrt(radicand512);
+            const remainder=radicand512-root*root;
+            const coefficient=root+@as(u512,if(remainder>root) 1 else 0);
+            return make(@intCast(coefficient),scale,false);
         }
 
         pub fn absolute(value: *const Numeric) Numeric {

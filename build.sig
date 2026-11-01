@@ -98,6 +98,8 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
 
     // Core modules.
     _ = try ctx.addModule("sql", "src/core/sql.sig");
+    // Contracts may import this public module; register it before those steps.
+    _ = try ctx.addModule("math", "src/core/math.sig");
     const test_sql = try ctx.addStep("test-sql", "Execute bounded in-memory SQL contracts", &noopStep);
     try ctx.addDependency(test_all, test_sql);
     _ = try addContract(ctx, test_sql, "contract-sql", "tests/test_sql.sig", &.{importEntry("sql", "src/core/sql.sig")});
@@ -142,6 +144,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-window-values", "tests/test_sql_window_values.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-conditional-ddl", "tests/test_sql_conditional_ddl.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-numeric-functions", "tests/test_sql_numeric_functions.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-integer-square-root", "tests/test_integer_square_root.sig", &.{});
+    _ = try addContract(ctx, test_sql, "contract-sql-square-root", "tests/test_sql_square_root.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-math-composition", "tests/test_sql_math_composition.sig", &.{importEntry("sql", "src/core/sql.sig"),importEntry("math", "src/core/math.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-named-windows", "tests/test_sql_named_windows.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-datetime-format", "tests/test_datetime_format.sig", &.{importEntry("datetime_format", "src/core/sql/datetime_format.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-dimension-distinct", "tests/test_sql_dimension_distinct.sig", &.{importEntry("sql", "src/core/sql.sig")});
@@ -290,7 +295,6 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("scene3d", "src/game/scene3d.sig"),
         importEntry("state_wire", "src/game/state_wire.sig"),
     });
-    _ = try ctx.addModule("math", "src/core/math.sig");
     _ = try ctx.addModule("sig_math", "src/core/sig_math.sig");
     const synth_voice = try ctx.addModule("synth_voice", "src/core/synth_voice.sig");
     try wire(ctx, synth_voice, "math", "src/core/math.sig");

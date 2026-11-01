@@ -148,6 +148,8 @@ pub const Error = error{
     InvalidTextRepresentation,
     /// SQLSTATE 22012.
     DivisionByZero,
+    /// SQLSTATE2201F: square root/power domain error.
+    InvalidArgumentForPowerFunction,
     /// SQLSTATE 22025: invalid LIKE escape string or reached trailing escape.
     InvalidEscapeSequence,
     /// SQLSTATE 42P02: a $n placeholder reached the engine unbound.
