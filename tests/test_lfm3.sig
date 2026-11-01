@@ -198,7 +198,10 @@ var kv_a: [KV_ELEMENTS]u16 = @splat(0);
 var kv_b: [KV_ELEMENTS]u16 = @splat(0);
 var conv_a: [CONV_ELEMENTS]f32 = @splat(0);
 var conv_b: [CONV_ELEMENTS]f32 = @splat(0);
+const unpacked: executor.PackedWeights(CAPACITY) = .{};
 var logits_a: [VOCAB]f32 = undefined;
+var packed_storage: [1536 * 1024]u8 align(64) = undefined;
+var packed_weights: executor.PackedWeights(CAPACITY) = .{};
 
 fn layerSchedule() !void {
     try fixture.initialize(.{});
@@ -370,7 +373,7 @@ fn batchInvariance() !void {
     const source = fixture.source();
     const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 0, 3, 3, 5, 1 };
     var cache_a = newCache(&kv_a, &conv_a);
-    const selected = try executor.prefill(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &work, &cache_a, &prompt, .{});
+    const selected = try executor.prefill(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &unpacked, &work, &cache_a, &prompt, .{});
     logits_a = work.logits;
     for (logits_a) |value| try check(std.math.isFinite(value));
 
@@ -378,7 +381,7 @@ fn batchInvariance() !void {
     var cache_b = newCache(&kv_b, &conv_b);
     var stepped: ?u32 = null;
     for (prompt, 0..) |token, position| {
-        stepped = try executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &work, &cache_b, &.{token}, position + 1 == prompt.len, pool.parallel());
+        stepped = try executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &unpacked, &work, &cache_b, &.{token}, position + 1 == prompt.len, pool.parallel());
     }
     try check(pool.calls > 0 and stepped != null and stepped.? == selected);
     try check(std.mem.eql(f32, &logits_a, &work.logits));
@@ -388,8 +391,55 @@ fn batchInvariance() !void {
 
     // Reset discards the history: replaying the prompt reproduces it.
     cache_a.reset();
-    try check(try executor.prefill(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &work, &cache_a, &prompt, .{}) == selected);
+    try check(try executor.prefill(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &unpacked, &work, &cache_a, &prompt, .{}) == selected);
     try check(std.mem.eql(f32, &logits_a, &work.logits));
+    executed_cases += 1;
+}
+
+/// Eight-row packed weights: one prefill and stepping through a reordering
+/// dispatcher stay bit-identical, and both stay within float summation error
+/// of the canonical row kernels. Matrices whose rows do not split into
+/// eight-row groups (attn_gate, two rows) keep the canonical path.
+fn packedExecution() !void {
+    try fixture.initialize(.{});
+    try fixture.build();
+    const source = fixture.source();
+    const required = try executor.requiredPackedBytes(CAPACITY, &fixture.index, &fixture.plan);
+    try check(required > 0 and required <= packed_storage.len);
+    try rejected(executor.packWeights(CAPACITY, source, &fixture.index, &fixture.plan, packed_storage[0 .. required - 1], &packed_weights, .{}), error.PackedCapacity);
+    var pool = ReversedPool{};
+    try executor.packWeights(CAPACITY, source, &fixture.index, &fixture.plan, &packed_storage, &packed_weights, pool.parallel());
+    try check(packed_weights.bytes.len == required);
+    for (fixture.plan.layers[0..LAYERS]) |layer| {
+        try check(packed_weights.offsets[layer.ffn_down.index] != executor.NOT_PACKED);
+        if (layer.attn_gate.present()) try check(packed_weights.offsets[layer.attn_gate.index] == executor.NOT_PACKED);
+    }
+
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 0, 3, 3, 5, 1 };
+    var cache_a = newCache(&kv_a, &conv_a);
+    const canonical = try executor.prefill(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &unpacked, &work, &cache_a, &prompt, .{});
+    logits_a = work.logits;
+    cache_a.reset();
+    const selected = try executor.prefill(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &packed_weights, &work, &cache_a, &prompt, .{});
+    try check(selected == canonical);
+    for (logits_a, work.logits) |expected, actual| try check(@abs(actual - expected) <= 1e-5 * @max(1.0, @abs(expected)));
+    logits_a = work.logits;
+
+    var cache_b = newCache(&kv_b, &conv_b);
+    var stepped: ?u32 = null;
+    for (prompt, 0..) |token, position| {
+        stepped = try executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &packed_weights, &work, &cache_b, &.{token}, position + 1 == prompt.len, pool.parallel());
+    }
+    try check(stepped != null and stepped.? == selected);
+    try check(std.mem.eql(f32, &logits_a, &work.logits));
+    try check(std.mem.eql(f32, &conv_a, &conv_b));
+    try check(std.mem.eql(u16, kv_a[0..], kv_b[0..]));
+
+    // An offset past the packed bytes is rejected before any worker runs.
+    var truncated = packed_weights;
+    truncated.bytes = truncated.bytes[0 .. truncated.bytes.len - 1];
+    cache_b.reset();
+    try rejected(executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &truncated, &work, &cache_b, &.{1}, true, .{}), error.InvalidPlan);
     executed_cases += 1;
 }
 
@@ -398,17 +448,17 @@ fn runtimeBounds() !void {
     try fixture.build();
     const source = fixture.source();
     var cache = newCache(&kv_a, &conv_a);
-    try rejected(executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &work, &cache, &.{VOCAB}, true, .{}), error.InvalidToken);
-    try rejected(executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &work, &cache, &.{}, true, .{}), error.BatchCapacity);
+    try rejected(executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &unpacked, &work, &cache, &.{VOCAB}, true, .{}), error.InvalidToken);
+    try rejected(executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &unpacked, &work, &cache, &.{}, true, .{}), error.BatchCapacity);
     const nine: [9]u32 = @splat(1);
-    try rejected(executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &work, &cache, &nine, true, .{}), error.BatchCapacity);
+    try rejected(executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &unpacked, &work, &cache, &nine, true, .{}), error.BatchCapacity);
     var short = executor.Cache{ .kv = kv_a[0 .. KV_ELEMENTS - 1], .conv = &conv_a, .context = CONTEXT };
-    try rejected(executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &work, &short, &.{1}, true, .{}), error.KvCapacity);
+    try rejected(executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &unpacked, &work, &short, &.{1}, true, .{}), error.KvCapacity);
     var shallow = executor.Cache{ .kv = &kv_a, .conv = conv_a[0 .. CONV_ELEMENTS - 1], .context = CONTEXT };
-    try rejected(executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &work, &shallow, &.{1}, true, .{}), error.ConvCapacity);
+    try rejected(executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &unpacked, &work, &shallow, &.{1}, true, .{}), error.ConvCapacity);
     cache.position = CONTEXT - 1;
-    try rejected(executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &work, &cache, &.{ 1, 2 }, true, .{}), error.ContextCapacity);
-    try check(try executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &work, &cache, &.{1}, false, .{}) == null);
+    try rejected(executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &unpacked, &work, &cache, &.{ 1, 2 }, true, .{}), error.ContextCapacity);
+    try check(try executor.forward(CAPACITY, LIMITS, source, &fixture.index, &fixture.plan, &unpacked, &work, &cache, &.{1}, false, .{}) == null);
     try check(cache.position == CONTEXT);
     executed_cases += 1;
 }
@@ -499,6 +549,7 @@ pub fn main(init: std.process.Init) !void {
     try ropeFactors();
     try convolutionState();
     try batchInvariance();
+    try packedExecution();
     try runtimeBounds();
     try preTokenizer();
     try specialTokens();

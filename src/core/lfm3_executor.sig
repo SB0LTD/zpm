@@ -9,7 +9,8 @@
 //!
 //! Numerics follow llama.cpp's CPU backend with flash attention off, so greedy
 //! output can be compared token for token: matrix inputs are quantized once to
-//! Q8_K and multiplied with integer Q4_K/Q6_K kernels, the KV cache is f16,
+//! Q8_K and multiplied with integer Q4_K/Q6_K kernels (on caller-owned
+//! eight-row packed copies when the host provides them), the KV cache is f16,
 //! queries and attention weights are rounded to f16 before their products, and
 //! RoPE angles advance by repeated multiplication as in ggml's rope cache.
 
@@ -30,6 +31,7 @@ pub const Error = quantized.Error || transformer.Error || error{
     BatchCapacity,
     StorageNotMapped,
     ArithmeticOverflow,
+    PackedCapacity,
 };
 
 /// Comptime capacity of one workspace. `batch` bounds the tokens of one call;
@@ -95,6 +97,118 @@ pub const Cache = struct {
     }
 };
 
+/// Caller-owned eight-row interleaved copies of the matrices (see
+/// quantized.packQ4KX8 and packQ6KX8), filled once by `packWeights`. `offsets[tensor]`
+/// locates a tensor's copy in `bytes`; matrices without one, and every matrix
+/// of an empty value, run on the canonical row kernels.
+pub fn PackedWeights(comptime tensor_capacity: usize) type {
+    return struct {
+        bytes: []const u8 = &.{},
+        offsets: [tensor_capacity]usize = @splat(NOT_PACKED),
+    };
+}
+
+pub const NOT_PACKED = ~@as(usize, 0);
+
+/// Bytes of storage `packWeights` fills: packed copies keep canonical sizes.
+pub fn requiredPackedBytes(comptime tensor_capacity: usize, index: *const gguf.Index(tensor_capacity), plan: *const lfm3.Plan) Error!usize {
+    var total: usize = 0;
+    var matrices = Matrices.init(plan);
+    while (matrices.next()) |reference| {
+        if (packable(index, reference)) total = try add(total, @intCast(index.tensors[reference.index].byte_size));
+    }
+    return total;
+}
+
+/// Pack every matrix the forward pass multiplies whose rows split into
+/// PACKED_ROWS-row groups into `storage` and record them in `out`. Prefill
+/// then reads each activation once per eight rows instead of once per row.
+pub fn packWeights(
+    comptime tensor_capacity: usize,
+    source: gguf.Source,
+    index: *const gguf.Index(tensor_capacity),
+    plan: *const lfm3.Plan,
+    storage: []u8,
+    out: *PackedWeights(tensor_capacity),
+    parallel: Parallel,
+) Error!void {
+    out.* = .{};
+    if (storage.len < try requiredPackedBytes(tensor_capacity, index, plan)) return error.PackedCapacity;
+    var used: usize = 0;
+    var matrices = Matrices.init(plan);
+    while (matrices.next()) |reference| {
+        if (!packable(index, reference)) continue;
+        const view = try matrixView(source, index, reference);
+        const task = PackTask{
+            .source = view.bytes,
+            .output = storage[used..][0..view.bytes.len],
+            .blocks = view.columns / quantized.QK_K,
+            .q4 = view.ggml_type == 12,
+        };
+        forRange(parallel, view.rows / quantized.PACKED_ROWS, &task);
+        out.offsets[reference.index] = used;
+        used += view.bytes.len;
+    }
+    out.bytes = storage[0..used];
+}
+
+/// Every matrix `forward` multiplies, each once.
+const Matrices = struct {
+    plan: *const lfm3.Plan,
+    layer: usize = 0,
+    slot: usize = 0,
+
+    fn init(plan: *const lfm3.Plan) Matrices {
+        return .{ .plan = plan };
+    }
+
+    fn next(self: *Matrices) ?lfm3.TensorRef {
+        while (self.layer < self.plan.layer_count) {
+            const layer = &self.plan.layers[self.layer];
+            const references = [_]lfm3.TensorRef{
+                layer.in_proj,   layer.out_proj,    layer.attn_q,   layer.attn_k, layer.attn_v,
+                layer.attn_gate, layer.attn_output, layer.ffn_gate, layer.ffn_up, layer.ffn_down,
+            };
+            while (self.slot < references.len) {
+                const reference = references[self.slot];
+                self.slot += 1;
+                if (reference.present()) return reference;
+            }
+            self.layer += 1;
+            self.slot = 0;
+        }
+        if (self.layer == self.plan.layer_count) {
+            self.layer += 1;
+            if (self.plan.output.present()) return self.plan.output;
+        }
+        return null;
+    }
+};
+
+fn packable(index: anytype, reference: lfm3.TensorRef) bool {
+    const tensor = &index.tensors[reference.index];
+    return tensor.dimension_count == 2 and (tensor.ggml_type == 12 or tensor.ggml_type == 14) and
+        tensor.dimensions[1] % quantized.PACKED_ROWS == 0 and tensor.dimensions[0] % quantized.QK_K == 0;
+}
+
+const PackTask = struct {
+    source: []const u8,
+    output: []u8,
+    blocks: usize,
+    q4: bool,
+
+    fn run(self: *const PackTask, first: usize, end: usize) void {
+        const block_bytes: usize = if (self.q4) quantized.Q4_K_BLOCK_BYTES else quantized.Q6_K_BLOCK_BYTES;
+        const group_bytes = quantized.PACKED_ROWS * self.blocks * block_bytes;
+        for (first..end) |group| {
+            const output = self.output[group * group_bytes ..][0..group_bytes];
+            const rows = self.source[group * group_bytes ..][0..group_bytes];
+            const packed_group = if (self.q4) quantized.packQ4KX8(output, rows, self.blocks) else quantized.packQ6KX8(output, rows, self.blocks);
+            packed_group catch unreachable;
+        }
+    }
+};
+
 pub fn requiredKvElements(plan: *const lfm3.Plan, context: usize) Error!usize {
     if (context == 0 or plan.max_kv_head_count == 0 or plan.head_size == 0) return error.InvalidPlan;
     var elements = try multiply(plan.attention_layer_count, 2);
@@ -142,6 +256,7 @@ pub fn forward(
     source: gguf.Source,
     index: *const gguf.Index(tensor_capacity),
     plan: *const lfm3.Plan,
+    weights: *const PackedWeights(tensor_capacity),
     work: *Workspace(limits),
     cache: *Cache,
     tokens: []const u32,
@@ -173,7 +288,7 @@ pub fn forward(
         forRange(parallel, count, &operator_norm);
         switch (layer.kind) {
             .short_conv => {
-                try linear(source, index, layer.in_proj, &work.activations, count, work.mixed[0 .. count * 3 * hidden], parallel);
+                try linear(source, index, weights, layer.in_proj, &work.activations, count, work.mixed[0 .. count * 3 * hidden], parallel);
                 const state = cache.conv[@as(usize, layer.slot) * (plan.conv_kernel - 1) * hidden ..][0 .. (plan.conv_kernel - 1) * hidden];
                 const conv = ConvTask{
                     .kernel = plan.conv_kernel,
@@ -186,9 +301,9 @@ pub fn forward(
                 };
                 forRange(parallel, hidden, &conv);
                 quantizeBlocks(parallel, work.mixer[0 .. count * hidden], &work.activations);
-                try linear(source, index, layer.out_proj, &work.activations, count, work.projected[0 .. count * hidden], parallel);
+                try linear(source, index, weights, layer.out_proj, &work.activations, count, work.projected[0 .. count * hidden], parallel);
             },
-            .attention => try attentionBlock(tensor_capacity, limits, source, index, plan, layer, work, cache, count, parallel),
+            .attention => try attentionBlock(tensor_capacity, limits, source, index, plan, weights, layer, work, cache, count, parallel),
         }
         try addResidual(source, index, plan, layer.post_attention_norm, work.hidden[0 .. count * hidden], work.projected[0 .. count * hidden], parallel);
 
@@ -200,15 +315,15 @@ pub fn forward(
             .activations = &work.activations,
         };
         forRange(parallel, count, &ffn_norm);
-        try linear(source, index, layer.ffn_gate, &work.activations, count, work.ffn_gate[0 .. count * feed_forward], parallel);
-        try linear(source, index, layer.ffn_up, &work.activations, count, work.ffn_up[0 .. count * feed_forward], parallel);
+        try linear(source, index, weights, layer.ffn_gate, &work.activations, count, work.ffn_gate[0 .. count * feed_forward], parallel);
+        try linear(source, index, weights, layer.ffn_up, &work.activations, count, work.ffn_up[0 .. count * feed_forward], parallel);
         const swiglu = SwiGluQuantizeTask{
             .gate = work.ffn_gate[0 .. count * feed_forward],
             .up = work.ffn_up[0 .. count * feed_forward],
             .activations = &work.activations,
         };
         forRange(parallel, count * feed_forward / quantized.QK_K, &swiglu);
-        try linear(source, index, layer.ffn_down, &work.activations, count, work.projected[0 .. count * hidden], parallel);
+        try linear(source, index, weights, layer.ffn_down, &work.activations, count, work.projected[0 .. count * hidden], parallel);
         try addResidual(source, index, plan, layer.post_ffw_norm, work.hidden[0 .. count * hidden], work.projected[0 .. count * hidden], parallel);
     }
     cache.position += count;
@@ -222,7 +337,7 @@ pub fn forward(
         .activations = &work.activations,
     };
     output_norm.run(0, 1);
-    try linear(source, index, plan.output, &work.activations, 1, work.logits[0..plan.vocabulary_size], parallel);
+    try linear(source, index, weights, plan.output, &work.activations, 1, work.logits[0..plan.vocabulary_size], parallel);
     return @intCast(try transformer.argmax(work.logits[0..plan.vocabulary_size]));
 }
 
@@ -234,6 +349,7 @@ pub fn prefill(
     source: gguf.Source,
     index: *const gguf.Index(tensor_capacity),
     plan: *const lfm3.Plan,
+    weights: *const PackedWeights(tensor_capacity),
     work: *Workspace(limits),
     cache: *Cache,
     tokens: []const u32,
@@ -243,7 +359,7 @@ pub fn prefill(
     var start: usize = 0;
     while (true) {
         const end = @min(tokens.len, start + limits.batch);
-        const selected = try forward(tensor_capacity, limits, source, index, plan, work, cache, tokens[start..end], end == tokens.len, parallel);
+        const selected = try forward(tensor_capacity, limits, source, index, plan, weights, work, cache, tokens[start..end], end == tokens.len, parallel);
         if (end == tokens.len) return selected.?;
         start = end;
     }
@@ -255,6 +371,7 @@ fn attentionBlock(
     source: gguf.Source,
     index: *const gguf.Index(tensor_capacity),
     plan: *const lfm3.Plan,
+    weights: *const PackedWeights(tensor_capacity),
     layer: *const lfm3.Layer,
     work: *Workspace(limits),
     cache: *Cache,
@@ -267,10 +384,10 @@ fn attentionBlock(
     const kv_heads: usize = layer.kv_head_count;
     const query_width = heads * head_size;
     const key_value_width = kv_heads * head_size;
-    try linear(source, index, layer.attn_q, &work.activations, count, work.query[0 .. count * query_width], parallel);
-    try linear(source, index, layer.attn_k, &work.activations, count, work.key[0 .. count * key_value_width], parallel);
-    try linear(source, index, layer.attn_v, &work.activations, count, work.value[0 .. count * key_value_width], parallel);
-    try linear(source, index, layer.attn_gate, &work.activations, count, work.gate[0 .. count * heads], parallel);
+    try linear(source, index, weights, layer.attn_q, &work.activations, count, work.query[0 .. count * query_width], parallel);
+    try linear(source, index, weights, layer.attn_k, &work.activations, count, work.key[0 .. count * key_value_width], parallel);
+    try linear(source, index, weights, layer.attn_v, &work.activations, count, work.value[0 .. count * key_value_width], parallel);
+    try linear(source, index, weights, layer.attn_gate, &work.activations, count, work.gate[0 .. count * heads], parallel);
     // Every slot this batch writes is checked once, before workers index it.
     _ = try kvOffset(plan, cache.context, layer.slot, true, kv_heads - 1, cache.position + count - 1);
 
@@ -311,7 +428,7 @@ fn attentionBlock(
     };
     forRange(parallel, count * heads, &attention);
     quantizeBlocks(parallel, work.mixer[0 .. count * query_width], &work.activations);
-    try linear(source, index, layer.attn_output, &work.activations, count, work.projected[0 .. count * hidden], parallel);
+    try linear(source, index, weights, layer.attn_output, &work.activations, count, work.projected[0 .. count * hidden], parallel);
 }
 
 /// Run `context.run(first, end)` over [0, count) through the host dispatcher.
@@ -397,7 +514,7 @@ fn addResidual(source: gguf.Source, index: anytype, plan: *const lfm3.Plan, norm
         .epsilon = plan.rms_norm_epsilon,
     };
     forRange(parallel, hidden.len / plan.hidden_size, &task);
-    for (hidden) |value| if (!math.isFinite(value)) return error.NonFinite;
+    if (!allFinite(hidden)) return error.NonFinite;
 }
 
 const ResidualTask = struct {
@@ -473,24 +590,25 @@ const PrepareTask = struct {
 
 // NeoX rotary embedding over `heads` contiguous heads, mirroring ggml's rope
 /// cache: theta starts at the position and is multiplied by base^(-2/d) per
-/// lane pair; optional frequency factors divide each pair's angle.
+/// lane pair; optional frequency factors divide each pair's angle. Every head
+/// shares one cosine and sine per lane pair.
 pub fn ropeNeox(values: []f32, heads: usize, head_size: usize, position: usize, base: f32, factors: ?[]const f32) void {
     const half = head_size / 2;
     const exponent = -2.0 / @as(f64, @floatFromInt(head_size));
     const theta_scale: f32 = @floatCast(@exp(exponent * @log(@as(f64, base))));
-    for (0..heads) |head| {
-        const row = values[head * head_size ..][0..head_size];
-        var theta: f32 = @floatFromInt(position);
-        for (0..half) |lane| {
-            const angle = if (factors) |divisors| theta / divisors[lane] else theta;
-            const cosine = @cos(angle);
-            const sine = @sin(angle);
+    var theta: f32 = @floatFromInt(position);
+    for (0..half) |lane| {
+        const angle = if (factors) |divisors| theta / divisors[lane] else theta;
+        const cosine = @cos(angle);
+        const sine = @sin(angle);
+        for (0..heads) |head| {
+            const row = values[head * head_size ..][0..head_size];
             const low = row[lane];
             const high = row[lane + half];
             row[lane] = low * cosine - high * sine;
             row[lane + half] = low * sine + high * cosine;
-            theta *= theta_scale;
         }
+        theta *= theta_scale;
     }
 }
 
@@ -653,6 +771,7 @@ fn vectorView(source: gguf.Source, index: anytype, reference: lfm3.TensorRef, el
 fn linear(
     source: gguf.Source,
     index: anytype,
+    weights: anytype,
     reference: lfm3.TensorRef,
     activations: []const quantized.Q8KBlock,
     tokens: usize,
@@ -662,8 +781,13 @@ fn linear(
     const view = try matrixView(source, index, reference);
     const blocks = view.columns / quantized.QK_K;
     if (tokens == 0 or output.len != tokens * view.rows or activations.len < tokens * blocks) return error.InvalidPlan;
+    const offset = weights.offsets[reference.index];
+    const is_packed = offset != NOT_PACKED;
+    if (is_packed and (!packable(index, reference) or offset > weights.bytes.len or view.bytes.len > weights.bytes.len - offset))
+        return error.InvalidPlan;
     const task = MatmulTask{
-        .weights = view.bytes,
+        .weights = if (is_packed) weights.bytes[offset..][0..view.bytes.len] else view.bytes,
+        .unit_rows = if (is_packed) quantized.PACKED_ROWS else 1,
         .row_bytes = view.row_bytes,
         .q4 = view.ggml_type == 12,
         .activations = activations[0 .. tokens * blocks],
@@ -672,12 +796,15 @@ fn linear(
         .output = output,
         .width = view.rows,
     };
-    forRange(parallel, view.rows, &task);
-    for (output) |value| if (!math.isFinite(value)) return error.NonFinite;
+    forRange(parallel, view.rows / task.unit_rows, &task);
+    if (!allFinite(output)) return error.NonFinite;
 }
 
+/// One unit is one canonical row, or one PACKED_ROWS-row group of a packed
+/// matrix.
 const MatmulTask = struct {
     weights: []const u8,
+    unit_rows: usize,
     row_bytes: usize,
     q4: bool,
     activations: []const quantized.Q8KBlock,
@@ -690,17 +817,20 @@ const MatmulTask = struct {
     /// token tile sweeps them, and each tile's activations stay in L1 across
     /// the block: prefill streams each weight row and activation row once.
     fn run(self: *const MatmulTask, first: usize, end: usize) void {
-        const row_block = 32;
+        const unit_block = 32 / self.unit_rows;
+        const unit_bytes = self.unit_rows * self.row_bytes;
         var block_start = first;
-        while (block_start < end) : (block_start += row_block) {
-            const block_end = @min(end, block_start + row_block);
+        while (block_start < end) : (block_start += unit_block) {
+            const block_end = @min(end, block_start + unit_block);
             var slot: usize = 0;
             while (slot < self.tokens) {
                 const count = @min(self.tokens - slot, quantized.MAX_TILE);
-                for (block_start..block_end) |row| {
-                    const bytes = self.weights[row * self.row_bytes ..][0..self.row_bytes];
+                for (block_start..block_end) |unit| {
+                    const bytes = self.weights[unit * unit_bytes ..][0..unit_bytes];
                     inline for (1..quantized.MAX_TILE + 1) |width| {
-                        if (count == width) self.tile(width, bytes, row, slot);
+                        if (count == width) {
+                            if (self.unit_rows == 1) self.tile(width, bytes, unit, slot) else self.packedTile(width, bytes, unit, slot);
+                        }
                     }
                 }
                 slot += count;
@@ -710,13 +840,29 @@ const MatmulTask = struct {
 
     /// Shapes were validated by `linear`, so every row holds `blocks` blocks.
     inline fn tile(self: *const MatmulTask, comptime count: usize, bytes: []const u8, row: usize, first_slot: usize) void {
-        var rows: [count][*]const quantized.Q8KBlock = undefined;
-        inline for (0..count) |offset| rows[offset] = self.activations[(first_slot + offset) * self.blocks ..].ptr;
+        const rows = self.tokenRows(count, first_slot);
         const results = if (self.q4)
             quantized.dotQ4KQ8KTile(count, bytes, rows, self.blocks)
         else
             quantized.dotQ6KQ8KTile(count, bytes, rows, self.blocks);
         inline for (0..count) |offset| self.output[(first_slot + offset) * self.width + row] = results[offset];
+    }
+
+    inline fn packedTile(self: *const MatmulTask, comptime count: usize, bytes: []const u8, group: usize, first_slot: usize) void {
+        const rows = self.tokenRows(count, first_slot);
+        const results = if (self.q4)
+            quantized.dotQ4KX8Q8KTile(count, bytes, rows, self.blocks)
+        else
+            quantized.dotQ6KX8Q8KTile(count, bytes, rows, self.blocks);
+        inline for (0..count) |offset| {
+            self.output[(first_slot + offset) * self.width + group * quantized.PACKED_ROWS ..][0..quantized.PACKED_ROWS].* = results[offset];
+        }
+    }
+
+    inline fn tokenRows(self: *const MatmulTask, comptime count: usize, first_slot: usize) [count][*]const quantized.Q8KBlock {
+        var rows: [count][*]const quantized.Q8KBlock = undefined;
+        inline for (0..count) |offset| rows[offset] = self.activations[(first_slot + offset) * self.blocks ..].ptr;
+        return rows;
     }
 };
 
@@ -746,6 +892,28 @@ fn kvOffset(plan: *const lfm3.Plan, context: usize, slot: u8, values: bool, head
     offset = try multiply(offset, context);
     offset += position;
     return multiply(offset, plan.head_size);
+}
+
+/// math.isFinite over a slice, sixteen exponents per step: the check runs
+/// serially after every parallel matmul and residual.
+fn allFinite(values: []const f32) bool {
+    const Lanes = @Vector(16, u32);
+    const exponent: Lanes = @splat(0x7f800000);
+    var largest: Lanes = @splat(0);
+    var index: usize = 0;
+    while (index + 16 <= values.len) : (index += 16) {
+        const bits: Lanes = @bitCast(@as(@Vector(16, f32), values[index..][0..16].*));
+        largest = @max(largest, bits & exponent);
+    }
+    if (@reduce(.Max, largest) == 0x7f800000) return false;
+    for (values[index..]) |value| if (!math.isFinite(value)) return false;
+    return true;
+}
+
+fn add(left: usize, right: usize) Error!usize {
+    const result = @addWithOverflow(left, right);
+    if (result[1] != 0) return error.ArithmeticOverflow;
+    return result[0];
 }
 
 fn multiply(left: anytype, right: anytype) Error!usize {

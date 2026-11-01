@@ -26,6 +26,8 @@ var plan: plan_mod.Plan = .{};
 var work: executor.Workspace(limits) = .{};
 var kv_storage: [MAX_ATTENTION_LAYERS * 2 * 4 * limits.context * 128]u16 = @splat(0);
 var conv_storage: [MAX_CONV_ROWS * limits.hidden]f32 = @splat(0);
+var packed_storage: [1200 << 20]u8 align(64) = undefined;
+var weights: executor.PackedWeights(capacity) = .{};
 var vocabulary: indexes.VocabularyIndex(160_000, 262_144) = .{};
 var merges: indexes.MergeIndex(524_288, 512) = .{};
 var specials: codec.SpecialTokens = .{};
@@ -231,15 +233,18 @@ pub fn main(init: std.process.Init) !void {
     try pool.start(threads - 1);
     defer pool.stop();
     const parallel = pool.parallel();
+    const pack_start = now(init.io);
+    try executor.packWeights(capacity, source, &index, &plan, &packed_storage, &weights, parallel);
+    const pack_ns = now(init.io) - pack_start;
     var cache = executor.Cache{
         .kv = kv_storage[0..try executor.requiredKvElements(&plan, limits.context)],
         .conv = conv_storage[0..try executor.requiredConvElements(&plan)],
         .context = limits.context,
     };
     cache.reset();
-    try out.print("profile layers={d} conv={d} attention={d} threads={d} work_bytes={d} kv_bytes={d}\n", .{
+    try out.print("profile layers={d} conv={d} attention={d} threads={d} work_bytes={d} kv_bytes={d} packed_bytes={d} pack_ms={d:.1}\n", .{
         plan.layer_count, plan.conv_layer_count, plan.attention_layer_count, threads,
-        @sizeOf(@TypeOf(work)), cache.kv.len * 2,
+        @sizeOf(@TypeOf(work)), cache.kv.len * 2, weights.bytes.len, milliseconds(pack_ns),
     });
 
     if (std.mem.eql(u8, mode, "bench")) {
@@ -248,14 +253,14 @@ pub fn main(init: std.process.Init) !void {
         if (prompt_count == 0 or prompt_count + generate_count > limits.context) return error.ContextCapacity;
         for (tokens[0..prompt_count], 0..) |*token, position| token.* = @intCast(1000 + (position * 7919) % 100_000);
         // Warm the page cache and branch predictors once, as llama-bench does.
-        _ = try executor.prefill(capacity, limits, source, &index, &plan, &work, &cache, tokens[0..@min(prompt_count, 16)], parallel);
+        _ = try executor.prefill(capacity, limits, source, &index, &plan, &weights, &work, &cache, tokens[0..@min(prompt_count, 16)], parallel);
         cache.reset();
         const prompt_start = now(init.io);
-        var selected = try executor.prefill(capacity, limits, source, &index, &plan, &work, &cache, tokens[0..prompt_count], parallel);
+        var selected = try executor.prefill(capacity, limits, source, &index, &plan, &weights, &work, &cache, tokens[0..prompt_count], parallel);
         const prompt_ns = now(init.io) - prompt_start;
         const generate_start = now(init.io);
         for (0..generate_count) |_| {
-            selected = (try executor.forward(capacity, limits, source, &index, &plan, &work, &cache, &.{selected}, true, parallel)).?;
+            selected = (try executor.forward(capacity, limits, source, &index, &plan, &weights, &work, &cache, &.{selected}, true, parallel)).?;
         }
         const generate_ns = now(init.io) - generate_start;
         try out.print("bench threads={d} pp={d} pp_ms={d:.1} pp_tps={d:.2} tg={d} tg_ms={d:.1} tg_tps={d:.2}\n", .{
@@ -278,7 +283,7 @@ pub fn main(init: std.process.Init) !void {
     const end_text = vocabulary.lookup(source, "<|endoftext|>") orelse return error.MissingStopToken;
 
     const prompt_start = now(init.io);
-    var selected = try executor.prefill(capacity, limits, source, &index, &plan, &work, &cache, tokens[0..prompt_count], parallel);
+    var selected = try executor.prefill(capacity, limits, source, &index, &plan, &weights, &work, &cache, tokens[0..prompt_count], parallel);
     const prompt_ns = now(init.io) - prompt_start;
     try printTop(out, 0, selected);
     var generated: usize = 0;
@@ -288,7 +293,7 @@ pub fn main(init: std.process.Init) !void {
         generated += 1;
         if (selected == end_turn or selected == end_text or generated == maximum) break;
         const step_start = now(init.io);
-        selected = (try executor.forward(capacity, limits, source, &index, &plan, &work, &cache, &.{selected}, true, parallel)).?;
+        selected = (try executor.forward(capacity, limits, source, &index, &plan, &weights, &work, &cache, &.{selected}, true, parallel)).?;
         generate_ns += now(init.io) - step_start;
         try printTop(out, generated, selected);
     }

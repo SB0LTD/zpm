@@ -44,14 +44,19 @@ const len = try session.generateComplete(&s, "Hello", .{}, &buf);
 ```
 lfm3_plan.sig        ← schedule from GGUF metadata (per-layer KV heads, SWA pattern)
 lfm3_executor.sig    ← batched CPU forward: rolling conv state, f16 KV, sliding windows
-    └── quantized_linear.sig ← Q8_K activations x Q4_K/Q6_K integer tiles (GGML numerics)
+    └── quantized_linear.sig ← Q8_K activations x Q4_K/Q6_K integer tiles (GGML numerics),
+                                eight-row packed layouts, optional AVX-VNNI
 lfm3_tokenizer.sig   ← special-token partition, LLAMA3 pre-split, ignore_merges, chat template
     └── unicode_class.sig    ← generated \p{L}/\p{N}/\s table (tools/gen_unicode_class.py)
 ```
 
 The executor owns no threads: hosts pass a `Parallel` dispatcher that runs
-independent row/channel/head ranges on their workers. `tools/lfm3_run.sig` is
-the Windows host runner used for llama.cpp parity and speed checks.
+independent row/channel/head ranges on their workers. Hosts that can spare the
+memory (`requiredPackedBytes`, the matrices' own size) also hand caller-owned
+storage to `packWeights`: eight-row interleaved Q4_K/Q6_K copies let one
+activation load and scale unpack serve eight rows in prefill and decode.
+`tools/lfm3_run.sig` is the Windows host runner used for llama.cpp parity and
+speed checks.
 
 ### Supported Models
 - Qwen3-0.6B (Q4_K, Q6_K) — tested, ~2s/token on ARM64
