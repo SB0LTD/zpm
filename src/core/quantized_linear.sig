@@ -345,8 +345,8 @@ pub fn dotQ4KQ8KTile(comptime count: usize, weight_bytes: []const u8, activation
         }
         // Each minimum covers two 16-lane bsums.
         const min_pairs: Words16 = @shuffle(i16, mins, undefined, [16]i32{ 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7 });
-        const d = f16ToF32(readU16(block, 0));
-        const dmin = f16ToF32(readU16(block, 2));
+        const d = halfAt(block, 0);
+        const dmin = halfAt(block, 2);
         inline for (0..count) |row| {
             const activation = &activations[row][block_index];
             const bsums: Words16 = activation.bsums;
@@ -413,7 +413,7 @@ pub fn dotQ6KQ8KTile(comptime count: usize, weight_bytes: []const u8, activation
                 }
             }
         }
-        const d = f16ToF32(readU16(block, 208));
+        const d = halfAt(block, 208);
         inline for (0..count) |row| {
             const activation = &activations[row][block_index];
             const bsums: Words16 = activation.bsums;
@@ -425,6 +425,12 @@ pub fn dotQ6KQ8KTile(comptime count: usize, weight_bytes: []const u8, activation
     var result: [count]f32 = undefined;
     inline for (0..count) |row| result[row] = @reduce(.Add, sums[row]);
     return result;
+}
+
+/// Little-endian f16 at `offset` through the target's conversion (F16C on
+/// x86, a compiler-rt routine elsewhere): exact, including subnormals.
+inline fn halfAt(bytes: []const u8, offset: usize) f32 {
+    return @floatCast(@as(f16, @bitCast(readU16(bytes, offset))));
 }
 
 /// Round to nearest with ties to even through the f32 mantissa, bit-exact with

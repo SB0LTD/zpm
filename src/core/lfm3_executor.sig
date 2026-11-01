@@ -699,11 +699,8 @@ const MatmulTask = struct {
                 const count = @min(self.tokens - slot, quantized.MAX_TILE);
                 for (block_start..block_end) |row| {
                     const bytes = self.weights[row * self.row_bytes ..][0..self.row_bytes];
-                    switch (count) {
-                        1 => self.tile(1, bytes, row, slot),
-                        2 => self.tile(2, bytes, row, slot),
-                        3 => self.tile(3, bytes, row, slot),
-                        else => self.tile(quantized.MAX_TILE, bytes, row, slot),
+                    inline for (1..quantized.MAX_TILE + 1) |width| {
+                        if (count == width) self.tile(width, bytes, row, slot);
                     }
                 }
                 slot += count;

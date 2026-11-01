@@ -58,13 +58,15 @@ const Memory = struct {
 const Pool = struct {
     threads: [MAX_WORKERS]worker.Thread = @splat(.{}),
     count: usize = 0,
-    generation: std.atomic.Value(u32) = .init(0),
-    pending: std.atomic.Value(u32) = .init(0),
-    sleepers: std.atomic.Value(u32) = .init(0),
-    next: std.atomic.Value(usize) = .init(0),
     task: ?*const executor.Task = null,
     chunk: usize = 1,
     stopping: bool = false,
+    // Spinning workers read `generation` while claims hit `next` and
+    // completions hit `pending`: one cache line each, or they ping-pong.
+    generation: std.atomic.Value(u32) align(64) = .init(0),
+    pending: std.atomic.Value(u32) align(64) = .init(0),
+    next: std.atomic.Value(usize) align(64) = .init(0),
+    sleepers: std.atomic.Value(u32) align(64) = .init(0),
 
     fn start(self: *Pool, workers: usize) !void {
         self.count = workers;
