@@ -1474,6 +1474,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "CannotCoerce")) return "42846";
     if (equal(name, "InvalidTextRepresentation")) return "22P02";
     if (equal(name, "DivisionByZero")) return "22012";
+    if (equal(name, "InvalidArgumentForPowerFunction")) return "2201F";
     if (equal(name, "InvalidEscapeSequence")) return "22025";
     if (equal(name, "UndefinedParameter")) return "42P02";
     if (equal(name, "InvalidColumnReference")) return "42P10";

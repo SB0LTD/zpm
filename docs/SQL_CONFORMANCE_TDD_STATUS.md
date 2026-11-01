@@ -12,8 +12,16 @@ RAMSQL PR46. ZPM database matrix41259206264, RAMSQL CI41259423089 and release
 qualification41259423088 passed. The broad legacy ZPM graph retains four
 unrelated SABR/TLS/TTS failures (314 successes,22 skips).
 
-Basic numeric functions are the next candidate; scope, pending qualification
-and exact remaining mathematical gaps are in [SQL_NUMERIC_FUNCTIONS.md](SQL_NUMERIC_FUNCTIONS.md).
+Basic ABS/CEIL/FLOOR/TRUNC/SIGN functions qualified and merged in ZPM PR94
+(main f4e3c61) and RAMSQL PR47 (main79d0fc0). ZPM database matrix41262543271,
+RAMSQL CI41300988243 and release qualification41300988055 passed; the latter
+has24 active successes and2 policy skips. The initial release Windows job timed
+out at20 minutes; reviewed job budget30 preserves all checks. The broad legacy
+ZPM graph retains4 unrelated failures,316 successes and22 skips.
+
+SQRT is the next candidate; [SQL_SQUARE_ROOT.md](SQL_SQUARE_ROOT.md) records
+its current evidence and pending gates. The mathematical family remains open,
+including POWER/LN and the explicit planner/precision gaps.
 These results do not close the SQL inventory.
 
 The dated checkpoints below preserve historical qualification evidence.

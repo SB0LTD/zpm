@@ -1,0 +1,76 @@
+{
+  "date": "2026-11-01",
+  "base_commit": "29bd16cd17c960822b4ab57157d19ed93f6f559e",
+  "runtime": "allocator-free Sig; integer primitive reused from matched SDK",
+  "sdk_std_math_sqrt_lf_sha256": "15e5f7d3ff984bc4ab0452477796dea38a5cf1b6f298dbae607d4d0f9144796b",
+  "inputs_lf_sha256": {
+    "build.sig": "56e34415c013900ce24e98065f07224705a23d759b1b00ca16ee0c7606592366",
+    "src/core/math.sig": "6e25ed9974278c554155d27813b5c419b9179494181b79ae1b358002c8e9d242",
+    "src/core/sql/ast.sig": "1ffbb2331cc0551d3e32aec35fa8af6af5e8ba331cb841e926ede219016fc5f5",
+    "src/core/sql/binder.sig": "a90c9c34bba7d0abcfe57860c55964a3f40ecade7d1640135a8d8614a9d3a81e",
+    "src/core/sql/expr.sig": "e1fffdabae8f3bea0e4e3bb3ce3518f6f36c021d094c5f06e073b166d5acee9d",
+    "src/core/sql/numeric.sig": "3923502dc9e539e0a2666890f625677cc4b20c7d24c8ab432bf68010237d5444",
+    "src/core/sql/types.sig": "e817e2f10cd1f359b565bb9dc2cb8c7ebd40700c8360fe8875e61d909d6c1925",
+    "src/db/postgres.sig": "29a2dd6e197e5f57fb1c0ad366996c64da9d06fe94b0095a0bae2d99d1d8ef20",
+    "tests/test_postgres.sig": "ae3331199a68246ddee7148edc54cb5fb7158fbc1202c5f8ce20752fb48b3fad",
+    "tests/test_integer_square_root.sig": "dd80ec8c5bbf1d5fddb3a137f0789c70fc5f564b680da860c0d3b9c7bd49f585",
+    "tests/test_sql_math_composition.sig": "097d7ab4253717b4941e7976822071893fa602b6d08cf80f84faddeb3c693296",
+    "tests/test_sql_square_root.sig": "834a7a65a032fdfc02efb879bc9dda3f734c6280e870cc1b92e4aa75e2686f2e",
+    "tools/capture_sql_square_root_oracle.py": "21a704e2416f9ffcb0023098871af6a60772fd74627b75b45f7fe14844ee53de",
+    "tests/fixtures/square_root_pg16.json": "9523c3db17f17973f2667e29c8bb8a2a360be2510bd45b8b433b0b7081c68b5b",
+    "tests/sql_conformance/square_root_planner_gaps.json": "6bce09dfd007ca451d6314b0de4c4e1f72a2a2eb8c7dfa16978104a34430c09e",
+    "tests/sql_conformance/cases.json": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c"
+  },
+  "baseline": {
+    "sql": "SELECT sqrt(1::numeric)",
+    "exit": 1,
+    "error": "UndefinedFunction"
+  },
+  "native_oracle": {
+    "version": "PostgreSQL16.15",
+    "frozen_cases": 109,
+    "independent_decimal_models": 88,
+    "extended_probes": 14,
+    "extended_statements": 21,
+    "failures": 0,
+    "exit": 0
+  },
+  "windows": {
+    "sdk_integer_assertions": 133905,
+    "sql_assertions": 375,
+    "composition_assertions": 3,
+    "exit": 0
+  },
+  "linux": {
+    "sdk_integer_assertions": 133905,
+    "sql_assertions": 375,
+    "composition_assertions": 3,
+    "postgres_assertions": 17327,
+    "exit": 0
+  },
+  "linux_regressions": {
+    "expressions": 397,
+    "dml": 229,
+    "expression_sources": 75,
+    "generated": 132,
+    "basic_numeric": 1266,
+    "change_log": 940,
+    "exit": 0
+  },
+  "inventory": {
+    "programs": 118,
+    "smoke_pass": 12,
+    "failed": 89,
+    "unexecuted": 17,
+    "exit": 1,
+    "error": "SqlConformanceIncomplete",
+    "log_lf_sha256": "f277c0fa1eb121e0f02ac5424ad9b093febd59639f5288e5242a37fdb4a9594b"
+  },
+  "qualification": "Scoped independent review approved; RAMSQL wire/hosted gates pending",
+  "scope_gaps": [
+    "Configured numeric coefficient/display capacity",
+    "Generic constant-fold timing: sqrt negative under WHERE FALSE",
+    "Unused derived-output pruning",
+    "Remaining math functions including POWER/LN"
+  ]
+}
