@@ -1,0 +1,21 @@
+{
+  "target": "PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)",
+  "matrix_queries": 204,
+  "extra_probes": 116,
+  "failures": [],
+  "excluded_dimensions": [
+    "numeric results outside configured coefficient/display capacity",
+    "other mathematical functions and overloads",
+    "extended-wire parameter lifecycle",
+    "WAL replay and execution budgets (Sig-only tests)"
+  ],
+  "oracle_version": [
+    [
+      "PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit"
+    ]
+  ],
+  "matrix_sha256": "0286a767fe3ff07f21d3bae14c54f5c1310f8d3758c9df4b3e2445e851d576b7",
+  "hash_encoding": "UTF-8 with LF newlines",
+  "contract_sha256": "bbcaa2751e88226a6da4d749c66f829570bd70f39ff9aace5be6793d22a88fbe",
+  "oracle_script_sha256": "e700e7539b1e0854948db9854c4c22f384f0719c3c4cfe29e2a2ed14acc5333c"
+}

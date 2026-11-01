@@ -896,6 +896,23 @@ pub fn Eval(comptime config: types.Config) type {
                         text.len=try datetime_format.format(local,format.text.slice(),&text.bytes);
                         return .{.text=text};
                     },
+                    .abs, .ceil, .floor, .trunc, .sign => {
+                        if(n.planned_null) return .null_value;
+                        const argument=try eval(ctx,n.b);
+                        const scale_id=node(ctx,n.b).next;
+                        const scale:V.Cell=if(scale_id==none) .{.integer=0} else try eval(ctx,scale_id);
+                        if(argument==.null_value or scale==.null_value) return .null_value;
+                        if(n.ty==.numeric) return .{.numeric=switch(n.func){
+                            .abs=>Io.Numerics.absolute(&argument.numeric),.sign=>Io.Numerics.signum(&argument.numeric),
+                            .ceil,.floor=>try Io.Numerics.directedInteger(&argument.numeric,n.func==.ceil),
+                            .trunc=>try Io.Numerics.trunc(&argument.numeric,@intCast(scale.integer)),else=>unreachable}};
+                        if(n.ty==.float4) return .{.float4=@abs(argument.float4)};
+                        if(n.ty==.float8) return .{.float8=switch(n.func){
+                            .abs=>@abs(argument.float8),.ceil=>@ceil(argument.float8),.floor=>@floor(argument.float8),.trunc=>@trunc(argument.float8),
+                            .sign=>if(argument.float8>0) @as(f64,1) else if(argument.float8<0) -1 else 0,else=>unreachable}};
+                        if(argument.integer==(-0x7fffffffffffffff-1)) return error.IntegerOverflow;
+                        return .{.integer=try checkRange(if(argument.integer<0) -argument.integer else argument.integer,n.ty)};
+                    },
                     .round => {
                         const argument = try eval(ctx, n.b);
                         const scale_id = node(ctx, n.b).next;

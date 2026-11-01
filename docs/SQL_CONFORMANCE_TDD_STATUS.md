@@ -7,8 +7,13 @@ unexecuted scopes/comparators**, and still exits1 SqlConformanceIncomplete.
 JSON extraction/concatenation, LAG/LEAD, distribution ranking and named windows
 have finite implementations and qualified main integrations. Frame value windows
 also qualified their declared finite scope; their native boundary differences
-remain open (see SQL_WINDOW_VALUES.md). Conditional DDL is the next candidate,
-with local/reviewed core evidence below and hosted/wire qualification pending.
+remain open (see SQL_WINDOW_VALUES.md). Conditional DDL and quoted-name recovery qualified and merged in ZPM PR93 and
+RAMSQL PR46. ZPM database matrix41259206264, RAMSQL CI41259423089 and release
+qualification41259423088 passed. The broad legacy ZPM graph retains four
+unrelated SABR/TLS/TTS failures (314 successes,22 skips).
+
+Basic numeric functions are the next candidate; scope, pending qualification
+and exact remaining mathematical gaps are in [SQL_NUMERIC_FUNCTIONS.md](SQL_NUMERIC_FUNCTIONS.md).
 These results do not close the SQL inventory.
 
 The dated checkpoints below preserve historical qualification evidence.

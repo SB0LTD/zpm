@@ -398,6 +398,44 @@ pub fn Ops(comptime digits: usize) type {
             return make(left % right, scale, a.negative);
         }
 
+        pub fn absolute(value: *const Numeric) Numeric {
+            var out=value.*;out.negative=false;
+            if(out.special==.ninf) out.special=.pinf;
+            return out;
+        }
+
+        pub fn signum(value: *const Numeric) Numeric {
+            if(value.special==.nan) return value.*;
+            if(value.isZero()) return fromInt(0);
+            return fromInt(if(value.negative or value.special==.ninf) -1 else 1);
+        }
+
+        /// Truncate toward zero, retaining max(scale,0) display decimals.
+        pub fn trunc(value: *const Numeric, scale: i32) Error!Numeric {
+            if(value.special!=.finite) return value.*;
+            const target:usize=@intCast(@max(scale,0));
+            if(target>max_scale or value.dscale>max_scale) return error.NumericCapacity;
+            var raw:u512=value.coef();const current:i32=value.dscale;
+            if(scale>=current) {
+                const shift=target-value.dscale;
+                if(raw!=0 and digitCount(raw)+shift>digits) return error.NumericCapacity;
+                return make(raw*pow10[shift],target,value.negative);
+            }
+            const drop_wide:i64=@as(i64,current)-scale;
+            if(drop_wide>=150) return make(0,target,false);
+            raw/=pow10[@intCast(drop_wide)];
+            if(scale<0) raw*=pow10[@intCast(-scale)];
+            return make(raw,target,value.negative);
+        }
+
+        pub fn directedInteger(value: *const Numeric, ceiling: bool) Error!Numeric {
+            const truncated=try trunc(value,0);
+            if(value.special!=.finite) return truncated;
+            const fractional=@as(u512,value.coef())%pow10[value.dscale]!=0;
+            if(fractional and (ceiling!=value.negative)) return make(@as(u512,truncated.coef())+1,0,value.negative);
+            return truncated;
+        }
+
         /// Round half away from zero to `scale` decimals (scale may be
         /// negative: round to 10^-scale); the result's dscale is max(scale, 0).
         pub fn round(value: *const Numeric, scale: i32) Error!Numeric {
