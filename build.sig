@@ -98,6 +98,8 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
 
     // Core modules.
     _ = try ctx.addModule("sql", "src/core/sql.sig");
+    // Contracts may import this public module; register it before those steps.
+    _ = try ctx.addModule("math", "src/core/math.sig");
     const test_sql = try ctx.addStep("test-sql", "Execute bounded in-memory SQL contracts", &noopStep);
     try ctx.addDependency(test_all, test_sql);
     _ = try addContract(ctx, test_sql, "contract-sql", "tests/test_sql.sig", &.{importEntry("sql", "src/core/sql.sig")});
@@ -293,7 +295,6 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("scene3d", "src/game/scene3d.sig"),
         importEntry("state_wire", "src/game/state_wire.sig"),
     });
-    _ = try ctx.addModule("math", "src/core/math.sig");
     _ = try ctx.addModule("sig_math", "src/core/sig_math.sig");
     const synth_voice = try ctx.addModule("synth_voice", "src/core/synth_voice.sig");
     try wire(ctx, synth_voice, "math", "src/core/math.sig");

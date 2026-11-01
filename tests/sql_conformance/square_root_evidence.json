@@ -4,7 +4,7 @@
   "runtime": "allocator-free Sig; integer primitive reused from matched SDK",
   "sdk_std_math_sqrt_lf_sha256": "15e5f7d3ff984bc4ab0452477796dea38a5cf1b6f298dbae607d4d0f9144796b",
   "inputs_lf_sha256": {
-    "build.sig": "56e34415c013900ce24e98065f07224705a23d759b1b00ca16ee0c7606592366",
+    "build.sig": "215b4ba1991072da47047f595b6cf8c000902f9a1f0e8afca76a59589f20f9ee",
     "src/core/math.sig": "6e25ed9974278c554155d27813b5c419b9179494181b79ae1b358002c8e9d242",
     "src/core/sql/ast.sig": "1ffbb2331cc0551d3e32aec35fa8af6af5e8ba331cb841e926ede219016fc5f5",
     "src/core/sql/binder.sig": "a90c9c34bba7d0abcfe57860c55964a3f40ecade7d1640135a8d8614a9d3a81e",
@@ -72,5 +72,29 @@
     "Generic constant-fold timing: sqrt negative under WHERE FALSE",
     "Unused derived-output pruning",
     "Remaining math functions including POWER/LN"
-  ]
+  ],
+  "build_graph": {
+    "first_hosted_run": 41304100454,
+    "first_conclusion": "failure before contracts",
+    "cause": "Duplicate math module registration; CapacityExceeded also denotes duplicate names",
+    "fix": "Register existing math before contracts; all3 contracts remain",
+    "help_exit": 0,
+    "canonical_contracts_exit": 0,
+    "canonical_command": [
+      "sig",
+      "build",
+      "run-contract-integer-square-root",
+      "run-contract-sql-square-root",
+      "run-contract-sql-math-composition",
+      "-Doptimize=ReleaseSafe",
+      "-j1"
+    ],
+    "canonical_summary": {
+      "total": 348,
+      "succeeded": 6,
+      "failed": 0,
+      "unselected": 342
+    },
+    "canonical_log_lf_sha256": "71f5c8e1d4aca67e4ddea50e90ae8390f29ba7bb25837d2c6f32accf5e5a9d2d"
+  }
 }
