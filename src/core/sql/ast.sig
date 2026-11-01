@@ -263,15 +263,20 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const CreateTable = struct {
+            if_not_exists: bool = false,
+            invalid_definition: bool = false,
             name: Ident = .{},
             columns: [config.columns]ColumnDef = undefined,
             count: usize = 0,
         };
 
         pub const CreateSequence = struct {
+            if_not_exists: bool = false,
             name: Ident = .{},
             options: sequence.Options = .{},
         };
+
+        pub const Drop = struct { name: Ident, if_exists: bool = false };
 
         pub const Target = struct {
             expr: u16 = none,
@@ -434,9 +439,9 @@ pub fn Ast(comptime config: types.Config) type {
 
         pub const Statement = union(enum) {
             create_table: CreateTable,
-            drop_table: Ident,
+            drop_table: Drop,
             create_sequence: CreateSequence,
-            drop_sequence: Ident,
+            drop_sequence: Drop,
             insert: Insert,
             /// A simple single-table SELECT: index into Pool.queries.
             select: u16,

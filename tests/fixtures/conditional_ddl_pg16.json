@@ -1,0 +1,672 @@
+{
+  "reference": "PostgreSQL16.15",
+  "scope": "Temporary relations, one rolled-back native transaction per program; notices retained separately",
+  "cases": [
+    {
+      "name": "create_absent",
+      "setup": [],
+      "statement": "CREATE TABLE IF NOT EXISTS t(id INTEGER)",
+      "probe": "SELECT COUNT(*) AS value FROM t",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 0
+        }
+      ],
+      "diagnostic": ""
+    },
+    {
+      "name": "existing_table_different",
+      "setup": [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER DEFAULT 7)",
+        "INSERT INTO t VALUES(1,10)"
+      ],
+      "statement": "CREATE TABLE IF NOT EXISTS t(other TEXT)",
+      "probe": "SELECT id,v FROM t ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "id": 1,
+          "v": 10
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"t\" already exists, skipping\nLOCATION:  transformCreateStmt, parse_utilcmd.c:207"
+    },
+    {
+      "name": "existing_table_default",
+      "setup": [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER DEFAULT 7)",
+        "INSERT INTO t VALUES(1,10)"
+      ],
+      "statement": "CREATE TABLE IF NOT EXISTS t(other INTEGER DEFAULT undefined_function())",
+      "probe": "SELECT id,v FROM t ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "id": 1,
+          "v": 10
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"t\" already exists, skipping\nLOCATION:  transformCreateStmt, parse_utilcmd.c:207"
+    },
+    {
+      "name": "existing_table_divide",
+      "setup": [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER DEFAULT 7)",
+        "INSERT INTO t VALUES(1,10)"
+      ],
+      "statement": "CREATE TABLE IF NOT EXISTS t(other INTEGER DEFAULT 1/0)",
+      "probe": "SELECT id,v FROM t ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "id": 1,
+          "v": 10
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"t\" already exists, skipping\nLOCATION:  transformCreateStmt, parse_utilcmd.c:207"
+    },
+    {
+      "name": "existing_table_identity",
+      "setup": [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER DEFAULT 7)",
+        "INSERT INTO t VALUES(1,10)"
+      ],
+      "statement": "CREATE TABLE IF NOT EXISTS t(id INTEGER GENERATED ALWAYS AS IDENTITY(INCREMENT BY 0))",
+      "probe": "SELECT id,v FROM t ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "id": 1,
+          "v": 10
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"t\" already exists, skipping\nLOCATION:  transformCreateStmt, parse_utilcmd.c:207"
+    },
+    {
+      "name": "existing_table_generated",
+      "setup": [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER DEFAULT 7)",
+        "INSERT INTO t VALUES(1,10)"
+      ],
+      "statement": "CREATE TABLE IF NOT EXISTS t(id INTEGER GENERATED ALWAYS AS(nonexistent) STORED)",
+      "probe": "SELECT id,v FROM t ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "id": 1,
+          "v": 10
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"t\" already exists, skipping\nLOCATION:  transformCreateStmt, parse_utilcmd.c:207"
+    },
+    {
+      "name": "existing_table_duplicates",
+      "setup": [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER DEFAULT 7)",
+        "INSERT INTO t VALUES(1,10)"
+      ],
+      "statement": "CREATE TABLE IF NOT EXISTS t(id INTEGER,id INTEGER)",
+      "probe": "SELECT id,v FROM t ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "id": 1,
+          "v": 10
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"t\" already exists, skipping\nLOCATION:  transformCreateStmt, parse_utilcmd.c:207"
+    },
+    {
+      "name": "existing_table_primary",
+      "setup": [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER DEFAULT 7)",
+        "INSERT INTO t VALUES(1,10)"
+      ],
+      "statement": "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY,v INTEGER PRIMARY KEY)",
+      "probe": "SELECT id,v FROM t ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "id": 1,
+          "v": 10
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"t\" already exists, skipping\nLOCATION:  transformCreateStmt, parse_utilcmd.c:207"
+    },
+    {
+      "name": "existing_table_not_null",
+      "setup": [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER DEFAULT 7)",
+        "INSERT INTO t VALUES(1,10)"
+      ],
+      "statement": "CREATE TABLE IF NOT EXISTS t(id INTEGER NOT NULL NOT NULL)",
+      "probe": "SELECT id,v FROM t ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "id": 1,
+          "v": 10
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"t\" already exists, skipping\nLOCATION:  transformCreateStmt, parse_utilcmd.c:207"
+    },
+    {
+      "name": "existing_table_defaults",
+      "setup": [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER DEFAULT 7)",
+        "INSERT INTO t VALUES(1,10)"
+      ],
+      "statement": "CREATE TABLE IF NOT EXISTS t(id INTEGER DEFAULT 1 DEFAULT 2)",
+      "probe": "SELECT id,v FROM t ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "id": 1,
+          "v": 10
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"t\" already exists, skipping\nLOCATION:  transformCreateStmt, parse_utilcmd.c:207"
+    },
+    {
+      "name": "table_collision_sequence",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE TABLE IF NOT EXISTS s(id INTEGER)",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 19
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"s\" already exists, skipping\nLOCATION:  transformCreateStmt, parse_utilcmd.c:207"
+    },
+    {
+      "name": "sequence_collision_table",
+      "setup": [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER DEFAULT 7)",
+        "INSERT INTO t VALUES(1,10)"
+      ],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS t INCREMENT BY 0",
+      "probe": "SELECT id,v FROM t ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "id": 1,
+          "v": 10
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"t\" already exists, skipping\nLOCATION:  DefineSequence, sequence.c:156"
+    },
+    {
+      "name": "existing_sequence_zero",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s INCREMENT BY 0",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 19
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"s\" already exists, skipping\nLOCATION:  DefineSequence, sequence.c:156"
+    },
+    {
+      "name": "existing_sequence_type",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s AS TEXT",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 19
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"s\" already exists, skipping\nLOCATION:  DefineSequence, sequence.c:156"
+    },
+    {
+      "name": "existing_sequence_bounds",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s MINVALUE 10 MAXVALUE 1",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 19
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"s\" already exists, skipping\nLOCATION:  DefineSequence, sequence.c:156"
+    },
+    {
+      "name": "existing_sequence_cache",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s CACHE 0",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 19
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"s\" already exists, skipping\nLOCATION:  DefineSequence, sequence.c:156"
+    },
+    {
+      "name": "existing_sequence_changed",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s START WITH 100 INCREMENT BY -1",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 19
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"s\" already exists, skipping\nLOCATION:  DefineSequence, sequence.c:156"
+    },
+    {
+      "name": "existing_sequence_redundant_0",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s AS TEXT AS BIGINT",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 19
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"s\" already exists, skipping\nLOCATION:  DefineSequence, sequence.c:156"
+    },
+    {
+      "name": "existing_sequence_redundant_1",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s INCREMENT BY 1 INCREMENT BY 2",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 19
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"s\" already exists, skipping\nLOCATION:  DefineSequence, sequence.c:156"
+    },
+    {
+      "name": "existing_sequence_redundant_2",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s MINVALUE 1 NO MINVALUE",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 19
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"s\" already exists, skipping\nLOCATION:  DefineSequence, sequence.c:156"
+    },
+    {
+      "name": "existing_sequence_redundant_3",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s NO MAXVALUE MAXVALUE 20",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 19
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"s\" already exists, skipping\nLOCATION:  DefineSequence, sequence.c:156"
+    },
+    {
+      "name": "existing_sequence_redundant_4",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s START 1 START 2",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 19
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"s\" already exists, skipping\nLOCATION:  DefineSequence, sequence.c:156"
+    },
+    {
+      "name": "existing_sequence_redundant_5",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s CACHE 1 CACHE 1",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 19
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"s\" already exists, skipping\nLOCATION:  DefineSequence, sequence.c:156"
+    },
+    {
+      "name": "existing_sequence_redundant_6",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s CYCLE NO CYCLE",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 19
+        }
+      ],
+      "diagnostic": "NOTICE:  42P07: relation \"s\" already exists, skipping\nLOCATION:  DefineSequence, sequence.c:156"
+    },
+    {
+      "name": "absent_redundant_0",
+      "setup": [],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s AS TEXT AS BIGINT",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "42601",
+      "rows": null,
+      "diagnostic": "ERROR:  42601: conflicting or redundant options\nLINE 1: CREATE TEMP SEQUENCE IF NOT EXISTS s AS TEXT AS BIGINT;\n                                                     ^\nLOCATION:  errorConflictingDefElem, define.c:387\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "absent_redundant_1",
+      "setup": [],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s INCREMENT BY 1 INCREMENT BY 2",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "42601",
+      "rows": null,
+      "diagnostic": "ERROR:  42601: conflicting or redundant options\nLINE 1: ...EATE TEMP SEQUENCE IF NOT EXISTS s INCREMENT BY 1 INCREMENT ...\n                                                             ^\nLOCATION:  errorConflictingDefElem, define.c:387\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "absent_redundant_2",
+      "setup": [],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s MINVALUE 1 NO MINVALUE",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "42601",
+      "rows": null,
+      "diagnostic": "ERROR:  42601: conflicting or redundant options\nLINE 1: CREATE TEMP SEQUENCE IF NOT EXISTS s MINVALUE 1 NO MINVALUE;\n                                                        ^\nLOCATION:  errorConflictingDefElem, define.c:387\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "absent_redundant_3",
+      "setup": [],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s NO MAXVALUE MAXVALUE 20",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "42601",
+      "rows": null,
+      "diagnostic": "ERROR:  42601: conflicting or redundant options\nLINE 1: CREATE TEMP SEQUENCE IF NOT EXISTS s NO MAXVALUE MAXVALUE 20...\n                                                         ^\nLOCATION:  errorConflictingDefElem, define.c:387\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "absent_redundant_4",
+      "setup": [],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s START 1 START 2",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "42601",
+      "rows": null,
+      "diagnostic": "ERROR:  42601: conflicting or redundant options\nLINE 1: CREATE TEMP SEQUENCE IF NOT EXISTS s START 1 START 2;\n                                                     ^\nLOCATION:  errorConflictingDefElem, define.c:387\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "absent_redundant_5",
+      "setup": [],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s CACHE 1 CACHE 1",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "42601",
+      "rows": null,
+      "diagnostic": "ERROR:  42601: conflicting or redundant options\nLINE 1: CREATE TEMP SEQUENCE IF NOT EXISTS s CACHE 1 CACHE 1;\n                                                     ^\nLOCATION:  errorConflictingDefElem, define.c:387\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "absent_redundant_6",
+      "setup": [],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s CYCLE NO CYCLE",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "42601",
+      "rows": null,
+      "diagnostic": "ERROR:  42601: conflicting or redundant options\nLINE 1: CREATE TEMP SEQUENCE IF NOT EXISTS s CYCLE NO CYCLE;\n                                                   ^\nLOCATION:  errorConflictingDefElem, define.c:387\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "absent_invalid_type",
+      "setup": [],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s AS TEXT",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "22023",
+      "rows": null,
+      "diagnostic": "ERROR:  22023: sequence type must be smallint, integer, or bigint\nLOCATION:  init_params, sequence.c:1398\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "sequence_absent",
+      "setup": [],
+      "statement": "CREATE SEQUENCE IF NOT EXISTS s START WITH 9",
+      "probe": "SELECT nextval('s') AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 9
+        }
+      ],
+      "diagnostic": ""
+    },
+    {
+      "name": "drop_missing_table",
+      "setup": [],
+      "statement": "DROP TABLE IF EXISTS missing",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 1
+        }
+      ],
+      "diagnostic": "NOTICE:  00000: table \"missing\" does not exist, skipping\nLOCATION:  DropErrorMsgNonExistent, tablecmds.c:1326"
+    },
+    {
+      "name": "drop_existing_table",
+      "setup": [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER DEFAULT 7)",
+        "INSERT INTO t VALUES(1,10)"
+      ],
+      "statement": "DROP TABLE IF EXISTS t",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 1
+        }
+      ],
+      "diagnostic": ""
+    },
+    {
+      "name": "wrong_kind_table",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "DROP TABLE IF EXISTS s",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "42809",
+      "rows": null,
+      "diagnostic": "ERROR:  42809: \"s\" is not a table\nHINT:  Use DROP SEQUENCE to remove a sequence.\nLOCATION:  DropErrorMsgWrongType, tablecmds.c:1355\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "ordinary_if_table",
+      "setup": [],
+      "statement": "CREATE TABLE if(id INTEGER)",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 1
+        }
+      ],
+      "diagnostic": ""
+    },
+    {
+      "name": "drop_if_table",
+      "setup": [
+        "CREATE TABLE if(id INTEGER)"
+      ],
+      "statement": "DROP TABLE if",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 1
+        }
+      ],
+      "diagnostic": ""
+    },
+    {
+      "name": "drop_missing_sequence",
+      "setup": [],
+      "statement": "DROP SEQUENCE IF EXISTS missing",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 1
+        }
+      ],
+      "diagnostic": "NOTICE:  00000: sequence \"missing\" does not exist, skipping\nLOCATION:  DropErrorMsgNonExistent, tablecmds.c:1326"
+    },
+    {
+      "name": "drop_existing_sequence",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "DROP SEQUENCE IF EXISTS s",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 1
+        }
+      ],
+      "diagnostic": ""
+    },
+    {
+      "name": "wrong_kind_sequence",
+      "setup": [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER DEFAULT 7)",
+        "INSERT INTO t VALUES(1,10)"
+      ],
+      "statement": "DROP SEQUENCE IF EXISTS t",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "42809",
+      "rows": null,
+      "diagnostic": "ERROR:  42809: \"t\" is not a sequence\nHINT:  Use DROP TABLE to remove a table.\nLOCATION:  DropErrorMsgWrongType, tablecmds.c:1355\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "ordinary_if_sequence",
+      "setup": [],
+      "statement": "CREATE SEQUENCE if",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 1
+        }
+      ],
+      "diagnostic": ""
+    },
+    {
+      "name": "drop_if_sequence",
+      "setup": [
+        "CREATE SEQUENCE if"
+      ],
+      "statement": "DROP SEQUENCE if",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 1
+        }
+      ],
+      "diagnostic": ""
+    },
+    {
+      "name": "ordinary_duplicate_table",
+      "setup": [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER DEFAULT 7)",
+        "INSERT INTO t VALUES(1,10)"
+      ],
+      "statement": "CREATE TABLE t(id INTEGER)",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "42P07",
+      "rows": null,
+      "diagnostic": "ERROR:  42P07: relation \"t\" already exists\nLOCATION:  heap_create_with_catalog, heap.c:1167\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "ordinary_duplicate_sequence",
+      "setup": [
+        "CREATE SEQUENCE s START WITH 19 INCREMENT BY 3"
+      ],
+      "statement": "CREATE SEQUENCE s",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "42P07",
+      "rows": null,
+      "diagnostic": "ERROR:  42P07: relation \"s\" already exists\nLOCATION:  heap_create_with_catalog, heap.c:1167\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "bad_create_clause",
+      "setup": [],
+      "statement": "CREATE TABLE IF EXISTS t(id INTEGER)",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "42601",
+      "rows": null,
+      "diagnostic": "ERROR:  42601: syntax error at or near \"EXISTS\"\nLINE 1: CREATE TEMP TABLE IF EXISTS t(id INTEGER);\n                             ^\nLOCATION:  scanner_yyerror, scan.l:1244\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "bad_drop_clause",
+      "setup": [],
+      "statement": "DROP TABLE IF NOT EXISTS t",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "42601",
+      "rows": null,
+      "diagnostic": "ERROR:  42601: syntax error at or near \"NOT\"\nLINE 1: DROP TABLE IF NOT EXISTS t;\n                      ^\nLOCATION:  scanner_yyerror, scan.l:1244\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "identity_owned",
+      "setup": [
+        "CREATE TABLE t(id INTEGER GENERATED ALWAYS AS IDENTITY)"
+      ],
+      "statement": "DROP SEQUENCE IF EXISTS t_id_seq",
+      "probe": "SELECT 1 AS value",
+      "sqlstate": "2BP01",
+      "rows": null,
+      "diagnostic": "ERROR:  2BP01: cannot drop sequence t_id_seq because column id of table t requires it\nHINT:  You can drop column id of table t instead.\nLOCATION:  findDependentObjects, dependency.c:843\nERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block\nLOCATION:  exec_simple_query, postgres.c:1138"
+    },
+    {
+      "name": "quoted_case",
+      "setup": [
+        "CREATE TABLE \"T\"(id INTEGER)"
+      ],
+      "statement": "CREATE TABLE IF NOT EXISTS t(id INTEGER)",
+      "probe": "SELECT COUNT(*) AS value FROM t",
+      "sqlstate": "00000",
+      "rows": [
+        {
+          "value": 0
+        }
+      ],
+      "diagnostic": ""
+    }
+  ]
+}

@@ -582,8 +582,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
         };
 
         fn validName(value: []const u8) bool {
-            if (value.len == 0 or value.len > config.name_bytes or !types.letter(value[0])) return false;
-            for (value) |byte| if (!(types.letter(byte) or types.digit(byte)) or (byte >= 'A' and byte <= 'Z')) return false;
+            // These are decoded identifier bytes, not unquoted SQL tokens.
+            // Quoted names preserve case, punctuation and non-ASCII bytes.
+            if (value.len == 0 or value.len > config.name_bytes) return false;
+            for (value) |byte| if (byte == 0) return false;
             return true;
         }
 

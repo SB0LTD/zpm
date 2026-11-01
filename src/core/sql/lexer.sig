@@ -328,6 +328,7 @@ pub const Tokenizer = struct {
         while (self.position < self.source.len) {
             const byte = self.source[self.position];
             self.position += 1;
+            if (byte == 0 and quote == '"') return error.Syntax;
             if (byte == quote) {
                 if (self.position == self.source.len or self.source[self.position] != quote)
                     return .{ .start = start, .end = self.position - 1, .len = len };

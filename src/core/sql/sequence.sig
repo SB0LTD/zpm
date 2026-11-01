@@ -16,6 +16,9 @@ pub const log_values: i64 = 32;
 
 /// Parsed CREATE SEQUENCE / identity options (null: not given).
 pub const Options = struct {
+    /// Parser-observed conflicting/redundant options; defer semantic failure
+    /// until resolution so an existing conditional target can be skipped.
+    duplicate_options: bool = false,
     increment: ?i64 = null,
     min: ?i64 = null,
     max: ?i64 = null,
@@ -51,6 +54,7 @@ fn typeBounds(oid: u32) Error![2]i64 {
 /// (22023 for a zero increment, MINVALUE >= MAXVALUE, START out of range or
 /// a bound outside the type; 0A000 for CACHE other than 1).
 pub fn resolve(options: Options) Error!Spec {
+    if (options.duplicate_options) return error.Syntax;
     const oid: u32 = if (options.type_oid == 0) 20 else options.type_oid;
     const bounds = try typeBounds(oid);
     var out: Spec = .{ .type_oid = oid, .cycle = options.cycle };
