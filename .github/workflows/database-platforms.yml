@@ -23,6 +23,45 @@ env:
   SIG_RELEASE_TAG: sig-0.6.4-zig0.17.0.90a898d
 
 jobs:
+  parameter-oracle:
+    name: Native parameter grammar (PostgreSQL ${{ matrix.major }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - major: 16
+            image: postgres@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36
+          - major: 18
+            image: postgres@sha256:4da1a4828be12604092fa55311276f08f9224a74a62dcb4708bd7439e2a03911
+    services:
+      postgres:
+        image: ${{ matrix.image }}
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify PREPARE grammar and native result/type expectations
+        run: >-
+          python tools/verify_pg_parameter_lexing.py
+          --port ${{ job.services.postgres.ports[5432] }}
+          --expected-major ${{ matrix.major }} --report parameter-oracle.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: parameter-oracle-pg${{ matrix.major }}
+          path: parameter-oracle.json
+          if-no-files-found: error
+
   native:
     name: Database contracts (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

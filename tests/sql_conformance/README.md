@@ -1,13 +1,13 @@
 # SQL conformance inventory and closing plan
 
-Status: incomplete; refreshed 30 October 2026 after PR consolidation on main
-`2c0ac40afa11177158b1eac5f8e7cb9bce1c72c7` (engine source `0f5af8d`).
+Status: incomplete; reconciled 1 November 2026 against qualified ZPM main
+`69f75554b4e33d2421d20d389c13918d3ab3538f` (SQRT source `8d8e5c9`).
 The original TDD baseline was `53655a9a89a3ddff6f2f5829388b09a10c3d9c93`.
 PostgreSQL 18.3 is the frozen positive language oracle for this inventory;
 PostgreSQL wire compatibility is a separate contract. MySQL and T-SQL targets
 require their own versioned native oracles. See the
 [current TDD checkpoint](../../docs/SQL_CONFORMANCE_TDD_STATUS.md) and
-[refresh evidence](consolidation_evidence.json).
+[latest recorded checkpoint](checkpoint_20261101.json).
 
 ## What this inventory proves
 
@@ -30,9 +30,10 @@ No calendar promise or universal speedup is implied. A release claiming complete
 
 ## Concrete smoke specifications
 
-Current core run: **8 smoke passes, 93 failures, 17 unexecuted scopes/comparators**.
+Current core run: **12 smoke passes, 89 failures, 17 unexecuted scopes/comparators**.
 The broad executable still deliberately exits with SqlConformanceIncomplete.
-The former 6/95/17 result is retained at `core_smoke_results.stage4.ndjson`.
+The former8/93/17 result is retained at `core_smoke_results.consolidation.ndjson`;
+the earlier6/95/17 result remains at `core_smoke_results.stage4.ndjson`.
 These probes are not a percentage of PostgreSQL compatibility. Core-only
 rejection of a server utility does not prove absence in the server layer.
 Some probes combine several features: their first failure does not mean every
@@ -46,9 +47,9 @@ component is missing. The annotations below separate those cases.
 | PG.PRED.OVERLAPS | Temporal overlaps | Syntax |
 | PG.PRED.REGEX | Regular expressions | Syntax |
 | PG.PRED.ESCAPE | LIKE escape clause | pass; UTF-8 LIKE/ASCII ILIKE contracts, collations and planner closure incomplete |
-| PG.QUERY.WINDOW | Ranking/offset windows | candidate smoke pass; LAG/LEAD finite coverage, demand/other window closure incomplete |
+| PG.QUERY.WINDOW | Ranking/offset windows | qualified smoke pass; LAG/LEAD finite coverage, demand/other window closure incomplete |
 | PG.QUERY.WINDOW_AGG | Window aggregates | pass; complete window family remains partial |
-| PG.QUERY.WINDOW_FRAMES | Named windows and frame exclusions | candidate smoke pass; scoped named inheritance and bounded/excluded frames; wider family incomplete |
+| PG.QUERY.WINDOW_FRAMES | Named windows and frame exclusions | qualified smoke pass; scoped named inheritance and bounded/excluded frames; wider family incomplete |
 | PG.GROUP.ROLLUP | ROLLUP/GROUPING | pass; flat ROLLUP/GROUPING only, broader grouping remains partial |
 | PG.GROUP.CUBE | CUBE | UndefinedFunction |
 | PG.GROUP.SETS | GROUPING SETS | Syntax |
@@ -74,7 +75,7 @@ component is missing. The annotations below separate those cases.
 | PG.DDL.CREATE_VARIANTS | Temporary/CTAS/LIKE | Syntax |
 | PG.DDL.INHERITANCE | Table inheritance | Syntax |
 | PG.DDL.PARTITION | Partition lifecycle | Syntax |
-| PG.DDL.IF_EXISTS | Conditional DDL | candidate smoke pass; table/sequence clauses, wider DDL/notice parity incomplete |
+| PG.DDL.IF_EXISTS | Conditional DDL | qualified smoke pass; table/sequence clauses, wider DDL/notice parity incomplete |
 | PG.DDL.TRUNCATE | TRUNCATE | UnsupportedStatement |
 | PG.DDL.DATABASE | Database lifecycle | UnexecutedScopeOrComparator |
 | PG.CONSTRAINT.COMPOSITE | Composite/table-level primary key | Syntax |
@@ -107,7 +108,7 @@ component is missing. The annotations below separate those cases.
 | PG.TYPE.RANGE | Range/multirange | Syntax |
 | PG.TYPE.ENUM_DOMAIN_COMPOSITE | User-defined types | Syntax |
 | PG.TYPE.CATALOG_IDS | Additional catalog identifiers | Syntax |
-| PG.JSON.OPS | JSON operators | candidate smoke pass; lexical extraction, broader JSON closure incomplete |
+| PG.JSON.OPS | JSON operators | qualified smoke pass; lexical extraction, broader JSON closure incomplete |
 | PG.JSONB.MODIFY | Remaining JSONB operations | UndefinedFunction |
 | PG.JSON.PATH | JSONPATH/SQL-JSON | UndefinedFunction |
 | PG.JSON.TABLE | JSON_TABLE | Syntax |

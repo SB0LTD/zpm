@@ -415,6 +415,80 @@ fn extended() !void {
     try state(try execute(&s, &db, "absent", 0), "34000");
     try sync(&s, &db);
 }
+/// NET-02: comment text must never participate in counting, interpolation or inference.
+fn parameterLexicalRegions() !void {
+    var db: DB = .{};
+    var s: Session = .{};
+    try startup(&s, &db);
+    const sources = [_][]const u8{
+        "SELECT /* $32 */ $1::int",
+        "SELECT /* outer /* $32 */ $0 */ $1::int",
+        "SELECT /* ' -- \" $999999999999999999999 */ $1::int",
+        "SELECT $1::int /* ' */ + $1::int",
+        "SELECT /* $2 /* ' */ $3 */ $1::int",
+        "SELECT $1::int -- ' $32\n + $1::int",
+    };
+    for (sources) |source| {
+        try tags(try parse(&s, &db, "", source, &.{23}), "1");
+        try check(s.statements[0].count == 1);
+        try tags(try bind(&s, &db, "", "", &.{"7"}, 0, 0), "2");
+        const bound=try portalText(&s);
+        try check(std.mem.indexOf(u8,bound,"/*")!=null or std.mem.indexOf(u8,bound,"--")!=null);
+        try tags(try execute(&s, &db, "", 0), "DC");
+        try check(s.result.rows[0].cells[0].integer == (if(std.mem.indexOf(u8,source," + ")!=null) @as(i64,14) else @as(i64,7)));
+        try sync(&s, &db);
+    }
+    // Nested depth is bounded by input length, without a separate nesting grant.
+    var template: [2048]u8 = undefined;
+    for (0..65) |depth| {
+        @memcpy(template[0..7],"SELECT ");
+        var at:usize=7;
+        for(0..depth) |_| { const part="/* ' $32 ";@memcpy(template[at..][0..part.len],part);at+=part.len; }
+        for(0..depth) |_| { const part=" */";@memcpy(template[at..][0..part.len],part);at+=part.len; }
+        const tail="$1::int";@memcpy(template[at..][0..tail.len],tail);
+        try tags(try parse(&s,&db,"",template[0..at+tail.len],&.{23}),"1");
+        for(0..2) |format| {
+            const value=if(format==0) "7" else "\x00\x00\x00\x07";
+            try tags(try bind(&s,&db,"","",&.{value},@intCast(format),@intCast(format)),"2");
+            const bound=try portalText(&s);
+            try check(equal(bound[0..at],template[0..at]));
+            try check(equal(bound[at..],"7::int"));
+            try tags(try execute(&s,&db,"",0),"DC");
+            try check(s.result.rows[0].cells[0].integer==7);
+            try sync(&s,&db);
+        }
+    }
+    try tags(try parse(&s,&db,"","SELECT 'it''s $32', $1::int AS \"out$31\"",&.{23}),"1");
+    try tags(try bind(&s,&db,"","",&.{"7"},0,0),"2");
+    try tags(try execute(&s,&db,"",0),"DC");
+    try check(equal(s.result.rows[0].cells[0].text.slice(),"it's $32"));
+    try check(s.result.rows[0].cells[1].integer==7);
+    try sync(&s,&db);
+    // Identifier dollars and quoted regions are not parameter references.
+    try tags(try query(&s,&db,"CREATE TABLE lex (a$2 INT, v INT)"),"CZ");
+    try tags(try query(&s,&db,"INSERT INTO lex VALUES(7,100)"),"CZ");
+    try tags(try parse(&s,&db,"","SELECT a$2 FROM lex WHERE a$2=$1 /* v=$32 */",&.{23}),"1");
+    try tags(try bind(&s,&db,"","",&.{"7"},0,0),"2");
+    try tags(try execute(&s,&db,"",0),"DC");
+    try check(s.result.rows[0].cells[0].integer==7);
+    try sync(&s,&db);
+    // OID-0 inference must skip an entire nested comment, including FROM and values.
+    try tags(try parse(&s,&db,"","/* FROM missing $32 */ UPDATE lex SET v=$1 WHERE a$2=$2",&.{}),"1");
+    try check(s.statements[0].oids[0]==23 and s.statements[0].oids[1]==23);
+    try tags(try bind(&s,&db,"","",&.{"-5","7"},0,0),"2");
+    try commandText(try execute(&s,&db,"",0),"UPDATE 1");
+    try sync(&s,&db);
+    try tags(try query(&s,&db,"SELECT v FROM lex"),"TDCZ");
+    try check(s.result.rows[0].cells[0].integer == -5);
+    // Lexical failure cannot replace the previous valid unnamed statement.
+    try tags(try parse(&s,&db,"","SELECT $1::int",&.{23}),"1");
+    try state(try parse(&s,&db,"","SELECT /* unterminated $1",&.{}),"42601");
+    try sync(&s,&db);
+    try tags(try bind(&s,&db,"","",&.{"9"},0,0),"2");
+    try tags(try execute(&s,&db,"",0),"DC");
+    try check(s.result.rows[0].cells[0].integer==9);
+    try sync(&s,&db);
+}
 fn parameterConstantSelect() !void {
     var db: DB = .{};
     var s: Session = .{};
@@ -542,14 +616,19 @@ fn negativeParameters() !void {
     try tags(try bind(&s, &db, "", "", &.{ "-5", "2" }, 0, 0), "2");
     try check(equal(try portalText(&s), "UPDATE a SET v = v-(-5) WHERE id = 2"));
     try sync(&s, &db);
-    try tags(try parse(&s, &db, "", "SELECT 'a'$1,$2e1,x$3,$4.5", &.{ 25, 23, 16, 20 }), "1");
-    try tags(try bind(&s, &db, "", "", &.{ "b", "5", "t", "1" }, 0, 0), "2");
-    try check(equal(try portalText(&s), "SELECT 'a' 'b',5 e1,x TRUE,1 .5"));
+    // This former interpolation-only probe is not a valid SQL template:
+    // PostgreSQL rejects $2e1 as trailing junk; x$3 is one identifier.
+    try state(try parse(&s, &db, "", "SELECT 'a'$1,$2e1,x$3,$4.5", &.{ 25, 23, 16, 20 }), "42601");
     try sync(&s, &db);
+    try tags(try parse(&s,&db,"","SELECT $1/*$32*/,$2--$32\n,$3,$4",&.{25,23,16,20}),"1");
+    try tags(try bind(&s,&db,"","",&.{"b","5","t","1"},0,0),"2");
+    try check(equal(try portalText(&s),"SELECT 'b'/*$32*/,5--$32\n,TRUE,1"));
+    try sync(&s,&db);
     // An exponent sign on the left: `1e-$1` is not the decimal token 1e-5.
-    try tags(try parse(&s, &db, "", "SELECT 1e-$1", &.{23}), "1");
-    try tags(try bind(&s, &db, "", "", &.{"5"}, 0, 0), "2");
-    try check(equal(try portalText(&s), "SELECT 1e- 5"));
+    // Native PostgreSQL rejects this malformed template at Parse (42601).
+    // The shared tokenizer now catches it before Bind, rather than constructing
+    // a different invalid SQL string. NET-01 valid-boundary coverage stays above.
+    try state(try parse(&s, &db, "", "SELECT 1e-$1", &.{23}), "42601");
     try sync(&s, &db);
 }
 var capacity_template: [65000]u8 = undefined;
@@ -1217,6 +1296,7 @@ pub fn main(init: std.process.Init) !void {
     try returningOnce();
     try normal();
     try extended();
+    try parameterLexicalRegions();
     try parameterConstantSelect();
     try inference();
     try negativeParameters();
