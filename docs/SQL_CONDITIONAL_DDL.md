@@ -34,7 +34,7 @@ this slice; success tags/data effects are a separate scope from notice parity.
 
 Initial tests fail Syntax against the preceding main. Independent adversarial
 review reproduced the IF-name regression and empty-record/callback bug before
-their fixes. The conditional contract passes207 assertions, including49 frozen
+their fixes. The conditional contract passes220 assertions, including49 frozen
 PostgreSQL16.15 programs, API concurrency retries, WAL/replay, capacity/control
 and cleanup. Independent review reran it and the existing MVCC351, catalog36,
 change-log940, expressions397, DML229, expression-source75 and generated132
@@ -46,6 +46,27 @@ A smoke pass does not close the DDL family. Reproduce native fixtures with:
 ```powershell
 python tools/capture_sql_conditional_ddl_oracle.py --psql wsl -d Ubuntu -u postgres psql
 ```
+
+## Durability follow-up
+
+The first hosted durable run passed the49 new programs but failed its final
+restart with InvalidChangeRecord. Quoted names were accepted by SQL and written
+verbatim, while the decoder incorrectly required lowercase simple identifiers.
+Dropping an object later did not remove its unreplayable historical record.
+
+Replay now validates decoded names as nonempty, within name capacity and without
+NUL, preserving exact case/punctuation/bytes. The lexer rejects NUL in quoted
+identifiers; string-literal handling and the existing empty-name rejection are
+unchanged. Tests round-trip uppercase, spaces, leading digits, doubled quotes,
+dollar signs and UTF8 table/column names plus a quoted sequence. Corrupt empty/
+NUL names still reject atomically. Outer WAL lengths, CRCs, commit trailers and
+typed-record versions are unchanged. This does not establish complete encoding
+or Unicode identifier parity.
+
+The preserved155-record,13985-byte failing history has SHA256
+`c40bfaa1a0e80cda3b399536ff0d2963ffbce786cd73e89d0985ec0fe41108de`.
+Its quoted creation is record146. End-to-end recovery of that history and fresh
+hosted qualification of the correction remain required gates.
 
 References: [PostgreSQL18 CREATE TABLE](https://www.postgresql.org/docs/18/sql-createtable.html)
 and [DROP TABLE](https://www.postgresql.org/docs/18/sql-droptable.html).

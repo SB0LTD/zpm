@@ -417,3 +417,15 @@ programs and the207-assertion conditional contract cover the declared slice.
 Existing MVCC/catalog/change-log/expression/DML/generated contracts also pass.
 See [scope](../../docs/SQL_CONDITIONAL_DDL.md) and
 `conditional_ddl_evidence.json`. Wider schema/DDL closure remains incomplete.
+
+
+### Conditional DDL durability correction - 1 November 2026
+
+The first candidate's hosted durable run exposed unreplayable quoted schema
+names. The corrected decoder preserves bounded non-NUL identifier bytes; quoted
+identifier NULs are rejected before publication. Core220 assertions and the
+seven existing regression suites pass in Linux ReleaseSafe. The broad118 driver
+still gives12/89/17 and exits1. Updated evidence includes lexer/change-log hashes.
+The preserved failing WAL and recovery gate are documented in SQL_CONDITIONAL_DDL.md.
+Fresh hosted and full durable-wire recovery remain pending; no compatibility or
+production-completeness claim follows from the earlier49 live case successes.

@@ -47,7 +47,7 @@ pub fn main() !void {
  try run("DROP TABLE IF EXISTS a");try run("DROP TABLE IF EXISTS b");
  try run("CREATE TABLE if(id INTEGER)");try run("DROP TABLE if");
  try run("CREATE SEQUENCE if");try run("DROP SEQUENCE if");
- try callbacks();try nativeFixtures();try concurrentDdl();try carriedSequence();try resources();
+ try callbacks();try nativeFixtures();try concurrentDdl();try carriedSequence();try resources();try quotedReplay();
  try check(db.usage().transactions==0 and db.usage().pending_versions==0);
  std.debug.print("conditional-ddl assertions {d}\n",.{assertions});
 }
@@ -109,6 +109,39 @@ fn carriedSequence() !void {
  try restored.execute("SELECT nextval('s')",&fixture_result);try check(fixture_result.rows[0].cells[0].integer==34);
 }
 fn cancel(_: ?*anyopaque) sql.Error!void {return error.QueryCanceled;}
+fn quotedReplay() !void {
+ phase="quoted identifier WAL replay";
+ const cases=[_][2][]const u8{
+  .{"\"UPPER\"","\"Column\""},.{"\"space name\"","\"space col\""},
+  .{"\"1numeric\"","\"1col\""},.{"\"q\"\"x\"","\"c\"\"x\""},
+  .{"cost$","col$"},.{"\"\xc3\xa9\"","\"\xce\xa9\""},
+ };
+ var source:[512]u8=undefined;var buffer:[4096]u8=undefined;
+ for(cases) |names| {
+  fixture_db=.{};restored=.{};var used:usize=0;
+  const create=try std.fmt.bufPrint(&source,"CREATE TABLE {s}({s} INTEGER PRIMARY KEY)",.{names[0],names[1]});
+  try fixture_db.executeChanges(create,&fixture_result,&buffer,&used,null,null);
+  const insert=try std.fmt.bufPrint(&source,"INSERT INTO {s} VALUES(17)",.{names[0]});
+  try fixture_db.executeChanges(insert,&fixture_result,&buffer,&used,null,null);
+  try restored.applyChangeRecord(buffer[0..used],&replay_scratch);
+  const select=try std.fmt.bufPrint(&source,"SELECT {s} FROM {s}",.{names[1],names[0]});
+  try restored.execute(select,&fixture_result);try check(fixture_result.rows[0].cells[0].integer==17);
+ }
+ // A valid quoted sequence name is also part of the typed schema journal.
+ fixture_db=.{};restored=.{};var used:usize=0;
+ try fixture_db.executeChanges("CREATE SEQUENCE \"Seq Space\"",&fixture_result,&buffer,&used,null,null);
+ try restored.applyChangeRecord(buffer[0..used],&replay_scratch);
+ try check(std.mem.eql(u8,restored.seqs[0].name.slice(),"Seq Space"));
+ // Empty and NUL names must be rejected before any replay publication.
+ for([_]usize{13,14}) |bad| {
+  var damaged:[4096]u8=undefined;@memcpy(damaged[0..used],buffer[0..used]);damaged[bad]=0;
+  restored=.{};
+  if(restored.applyChangeRecord(damaged[0..used],&replay_scratch)) |_| return error.InvalidNameAccepted else |err| try check(err==error.InvalidChangeRecord);
+  try check(restored.tableCount()==0 and !restored.seqs[0].live);
+ }
+ try rejects("CREATE TABLE \"\"(id INTEGER)",error.Syntax);
+ try rejects("CREATE TABLE \"bad\x00name\"(id INTEGER)",error.Syntax);
+}
 fn resources() !void {
  phase="resources";
  try run("CREATE TABLE a(id INTEGER)");

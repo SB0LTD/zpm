@@ -14,7 +14,9 @@
     "src/core/sql/parser.sig": "1a85417a11fa587a315237674f17e52eb205c274d05a9d9c632ba4a1235c4128",
     "src/core/sql/binder.sig": "abe258cbe762b1914cdbcc8e33b902d03744349c48d280cad62cb3d1bd308732",
     "src/core/sql/sequence.sig": "f355b7f9745dcb2fb2a5b11d0c5591f97d5e3a7050d4c613759fdf6c897e3758",
-    "tests/test_sql_conditional_ddl.sig": "3ce5f89216827143a7f12881e54fb1a46a7120fbef4459be8b4109f877a4833b",
+    "src/core/sql/lexer.sig": "bfcbf97b2aef757ed88cd848393cab492da6d3a4a3782638e34ab6f4698a4a8c",
+    "src/core/sql/change_log.sig": "9de1f82a8a09c280b7dc07590d5a9619e3eb400b859082829e7fbf2b97d05940",
+    "tests/test_sql_conditional_ddl.sig": "e9467a474c18a0840a39e4edac456ad4015a68b25e0264a2c73bd14f650c1cad",
     "tests/fixtures/conditional_ddl_pg16.json": "a1fd3863e948d153c055788696af342bd67a184f70f44fd0a5c7cb36b7deaf3f",
     "tools/capture_sql_conditional_ddl_oracle.py": "0884e1b8ee95cc68474191ba15dfe723a1ed2eb7f274b93482cf04802081086e",
     "tests/sql_conformance/cases.json": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c",
@@ -22,7 +24,7 @@
     "tests/sql_conformance/generate_contracts.py": "0952c368240d51046b899717ff1ca45476758ede29c160a6ab80bc62771c7cf5"
   },
   "linux_release_safe_assertions": {
-    "conditional": 207,
+    "conditional": 220,
     "mvcc": 351,
     "catalog": 36,
     "change_log": 940,
