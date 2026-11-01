@@ -4,6 +4,7 @@
 //! intended only for a caller that explicitly binds to a trusted interface.
 //! SQL semantics are those provided by DB; unsupported features return SQLSTATE.
 const scram = @import("scram");
+const sql = @import("sql");
 const pg_types = @import("pg_types.sig");
 const pg_copy = @import("pg_copy.sig");
 /// COPY data formats (text, csv, binary framing and escaping).
@@ -1068,12 +1069,12 @@ pub fn Session(comptime DB: type) type {
 
         fn deallocate(self: *Self, source: []const u8) !void {
             var tokens: Tokens = .{ .source = source };
-            if (!keyword(tokens.next(), "deallocate")) return error.Syntax;
-            var name = tokens.next();
-            if (keyword(name, "prepare")) name = tokens.next();
+            if (!keyword(try tokens.next(), "deallocate")) return error.Syntax;
+            var name = try tokens.next();
+            if (keyword(name, "prepare")) name = try tokens.next();
             if (name.len == 0) return error.Syntax;
-            var next = tokens.next();
-            if (equal(next, ";")) next = tokens.next();
+            var next = try tokens.next();
+            if (equal(next, ";")) next = try tokens.next();
             if (next.len != 0) return error.Syntax;
             if (keyword(name, "all")) {
                 for (&self.statements) |*s| s.live = false;
@@ -1147,17 +1148,17 @@ pub fn Session(comptime DB: type) type {
             if (!unknown) return;
             if (self.active_portal != null) return error.PortalBusy;
             var tokens: Tokens = .{ .source = s.source() };
-            const first = tokens.next();
+            const first = try tokens.next();
             var table: []const u8 = "";
             if (keyword(first, "insert")) {
-                if (!keyword(tokens.next(), "into")) return error.Syntax;
-                table = tokens.next();
-            } else if (keyword(first, "update")) table = tokens.next() else if (keyword(first, "select") or keyword(first, "delete")) {
+                if (!keyword(try tokens.next(), "into")) return error.Syntax;
+                table = try tokens.next();
+            } else if (keyword(first, "update")) table = try tokens.next() else if (keyword(first, "select") or keyword(first, "delete")) {
                 while (true) {
-                    const token = tokens.next();
+                    const token = try tokens.next();
                     if (token.len == 0) break;
                     if (keyword(token, "from")) {
-                        table = tokens.next();
+                        table = try tokens.next();
                         break;
                     }
                 }
@@ -1191,23 +1192,23 @@ pub fn Session(comptime DB: type) type {
                 var mapping: [256]usize = undefined;
                 var count_columns = self.result.column_count;
                 for (0..count_columns) |i| mapping[i] = i;
-                var token = tokens.next();
+                var token = try tokens.next();
                 if (equal(token, "(")) {
                     count_columns = 0;
                     while (true) {
-                        token = tokens.next();
+                        token = try tokens.next();
                         if (equal(token, ")")) break;
                         if (equal(token, ",")) continue;
                         if (count_columns == mapping.len) return error.ColumnCapacity;
                         mapping[count_columns] = self.column(token) orelse return error.ColumnNotFound;
                         count_columns += 1;
                     }
-                    token = tokens.next();
+                    token = try tokens.next();
                 }
-                if (!keyword(token, "values") or !equal(tokens.next(), "(")) return error.Syntax;
+                if (!keyword(token, "values") or !equal(try tokens.next(), "(")) return error.Syntax;
                 var column_index: usize = 0;
                 while (true) {
-                    token = tokens.next();
+                    token = try tokens.next();
                     if (token.len == 0) return error.Syntax;
                     if (equal(token, ")")) break;
                     if (equal(token, ",")) {
@@ -1223,7 +1224,7 @@ pub fn Session(comptime DB: type) type {
                 tokens = .{ .source = s.source() };
                 var column_index: ?usize = null;
                 while (true) {
-                    const token = tokens.next();
+                    const token = try tokens.next();
                     if (token.len == 0) break;
                     if (token[0] == '$') {
                         if (column_index) |i| try inferOid(s, token, T.oid(self.result.column_types[i]));
@@ -1546,45 +1547,30 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     return null;
 }
 
-// One scanner serves counting and interpolation, so $ inside a quoted literal,
-// quoted identifier, or line comment can never become a parameter substitution.
+// The engine tokenizer owns quote/comment/identifier boundaries. Counting and
+// interpolation visit precisely its parameter tokens; every untouched byte is
+// copied verbatim, including whitespace and nested comments.
 fn scan(source: []const u8, values: ?[]const []const u8, w: ?*Writer) !usize {
-    var i: usize = 0;
+    var tokenizer: sql.Tokenizer = .{ .source = source, .text_limit = source.len };
+    var copied: usize = 0;
     var highest: usize = 0;
-    var quote: u8 = 0;
-    var comment = false;
-    while (i < source.len) {
-        const c = source[i];
-        if (comment) {
-            if (c == '\n') comment = false;
-        } else if (quote != 0) {
-            if (c == quote) {
-                if (i + 1 < source.len and source[i + 1] == quote) {
-                    if (w) |out| try out.append(source[i..][0..2]);
-                    i += 2;
-                    continue;
-                }
-                quote = 0;
+    while (true) {
+        const token = try tokenizer.next();
+        if (token.kind == .end) break;
+        if (token.kind != .parameter) continue;
+        if (token.integer > parameter_capacity) return error.ParameterCapacity;
+        const n: usize = @intCast(token.integer);
+        highest = @max(highest, n);
+        if (values) |v| {
+            if (n > v.len) return error.ProtocolViolation;
+            if (w) |out| {
+                try out.append(source[copied..token.start]);
+                try splice(out, v[n - 1], source[token.end..]);
             }
-        } else if (c == '\'' or c == '"') quote = c else if (c == '-' and i + 1 < source.len and source[i + 1] == '-') comment = true else if (c == '$') {
-            var j = i + 1;
-            var n: usize = 0;
-            while (j < source.len and source[j] >= '0' and source[j] <= '9') : (j += 1) {
-                n = n * 10 + source[j] - '0';
-                if (n > parameter_capacity) return error.ParameterCapacity;
-            }
-            if (j == i + 1 or n == 0) return error.Syntax;
-            highest = @max(highest, n);
-            if (values) |v| {
-                if (n > v.len) return error.ProtocolViolation;
-                if (w) |out| try splice(out, v[n - 1], source[j..]);
-            }
-            i = j;
-            continue;
         }
-        if (w) |out| try out.byte(c);
-        i += 1;
+        copied = token.end;
     }
+    if (w) |out| try out.append(source[copied..]);
     return highest;
 }
 /// A byte that can continue a word, number, string or quoted identifier.
@@ -1618,45 +1604,19 @@ fn identifier(token: []const u8) bool {
     const first = lower(token[0]);
     return (first >= 'a' and first <= 'z') or first == '_';
 }
+// Inference and DEALLOCATE use the same tokenizer as execution, while keeping
+// quoted delimiters in their borrowed source spans for existing name handling.
 const Tokens = struct {
     source: []const u8,
     at: usize = 0,
-    fn next(self: *Tokens) []const u8 {
-        while (self.at < self.source.len) {
-            const c = self.source[self.at];
-            if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
-                self.at += 1;
-                continue;
-            }
-            if (c == '-' and self.at + 1 < self.source.len and self.source[self.at + 1] == '-') {
-                while (self.at < self.source.len and self.source[self.at] != '\n') : (self.at += 1) {}
-                continue;
-            }
-            break;
-        }
-        const begin = self.at;
-        if (begin == self.source.len) return "";
-        self.at += 1;
-        const first = self.source[begin];
-        if (first == '\'' or first == '"') {
-            while (self.at < self.source.len) {
-                const c = self.source[self.at];
-                self.at += 1;
-                if (c == first) {
-                    if (self.at < self.source.len and self.source[self.at] == first) {
-                        self.at += 1;
-                        continue;
-                    }
-                    break;
-                }
-            }
-        } else if (identifier(self.source[begin .. begin + 1]) or first == '$' or (first >= '0' and first <= '9')) {
-            while (self.at < self.source.len) : (self.at += 1) {
-                const c = lower(self.source[self.at]);
-                if (!((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_')) break;
-            }
-        }
-        return self.source[begin..self.at];
+    fn next(self: *Tokens) ![]const u8 {
+        var tokenizer: sql.Tokenizer = .{ .source = self.source, .position = self.at, .text_limit = self.source.len };
+        const token = try tokenizer.next();
+        self.at = tokenizer.position;
+        if (token.kind == .end) return "";
+        if (token.kind == .string or token.kind == .quoted_word)
+            return self.source[token.start - 1 .. token.end + 1];
+        return self.source[token.start..token.end];
     }
 };
 fn inferOid(s: anytype, token: []const u8, oid: u32) !void {

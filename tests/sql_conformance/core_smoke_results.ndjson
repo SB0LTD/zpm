@@ -4,9 +4,9 @@
 {"id":"PG.PRED.OVERLAPS","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.PRED.REGEX","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.PRED.ESCAPE","status":"core_smoke_pass","statement":4,"detail":""}
-{"id":"PG.QUERY.WINDOW","status":"incomplete","statement":4,"detail":"UndefinedFunction"}
+{"id":"PG.QUERY.WINDOW","status":"core_smoke_pass","statement":4,"detail":""}
 {"id":"PG.QUERY.WINDOW_AGG","status":"core_smoke_pass","statement":4,"detail":""}
-{"id":"PG.QUERY.WINDOW_FRAMES","status":"incomplete","statement":4,"detail":"Syntax"}
+{"id":"PG.QUERY.WINDOW_FRAMES","status":"core_smoke_pass","statement":4,"detail":""}
 {"id":"PG.GROUP.ROLLUP","status":"core_smoke_pass","statement":4,"detail":""}
 {"id":"PG.GROUP.CUBE","status":"incomplete","statement":4,"detail":"UndefinedFunction"}
 {"id":"PG.GROUP.SETS","status":"incomplete","statement":4,"detail":"Syntax"}
@@ -32,7 +32,7 @@
 {"id":"PG.DDL.CREATE_VARIANTS","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.DDL.INHERITANCE","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.DDL.PARTITION","status":"incomplete","statement":4,"detail":"Syntax"}
-{"id":"PG.DDL.IF_EXISTS","status":"incomplete","statement":4,"detail":"Syntax"}
+{"id":"PG.DDL.IF_EXISTS","status":"core_smoke_pass","statement":7,"detail":""}
 {"id":"PG.DDL.TRUNCATE","status":"incomplete","statement":4,"detail":"UnsupportedStatement"}
 {"id":"PG.DDL.DATABASE","status":"incomplete","statement":0,"detail":"UnexecutedScopeOrComparator"}
 {"id":"PG.CONSTRAINT.COMPOSITE","status":"incomplete","statement":4,"detail":"Syntax"}
@@ -65,7 +65,7 @@
 {"id":"PG.TYPE.RANGE","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.TYPE.ENUM_DOMAIN_COMPOSITE","status":"incomplete","statement":4,"detail":"Syntax"}
 {"id":"PG.TYPE.CATALOG_IDS","status":"incomplete","statement":4,"detail":"Syntax"}
-{"id":"PG.JSON.OPS","status":"incomplete","statement":4,"detail":"UndefinedFunction"}
+{"id":"PG.JSON.OPS","status":"core_smoke_pass","statement":4,"detail":""}
 {"id":"PG.JSONB.MODIFY","status":"incomplete","statement":4,"detail":"UndefinedFunction"}
 {"id":"PG.JSON.PATH","status":"incomplete","statement":4,"detail":"UndefinedFunction"}
 {"id":"PG.JSON.TABLE","status":"incomplete","statement":4,"detail":"Syntax"}

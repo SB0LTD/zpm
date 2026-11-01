@@ -1,0 +1,17 @@
+{
+  "date": "2026-11-01",
+  "scope": "Reconciliation of previously recorded qualified SQRT run; not a new execution",
+  "source_revision": "8d8e5c92a5af8a4fa0ce3139f014d082912d90ad",
+  "merged_main": "69f75554b4e33d2421d20d389c13918d3ab3538f",
+  "programs": 118,
+  "smoke_pass": 12,
+  "failed": 89,
+  "unexecuted": 17,
+  "exit": 1,
+  "terminal_error": "SqlConformanceIncomplete",
+  "recorded_log_lf_sha256": "f277c0fa1eb121e0f02ac5424ad9b093febd59639f5288e5242a37fdb4a9594b",
+  "canonical_rows_lf_sha256": "ca5be4ba2ec40b7b57d06dec24bd9f7765f678ee718ce2b81b285697f99bc2b1",
+  "prior_consolidation_rows_lf_sha256": "5aa8164166bd998a70b162f4631a37242a10124279931ef6e972889dc1fea19b",
+  "source_evidence": "square_root_evidence.json",
+  "upstream_applicability": "755 records remain unreviewed"
+}

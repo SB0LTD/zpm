@@ -106,6 +106,9 @@ const sort_module = @import("sql/sort.sig");
 const sequence_module = @import("sql/sequence.sig");
 const deparse_module = @import("sql/deparse.sig");
 
+/// The canonical SQL tokenizer, also used by wire parameter binding.
+/// Source and token spans remain caller-owned; tokenization allocates nothing.
+pub const Tokenizer = lexer.Tokenizer;
 pub const Config = types.Config;
 /// Per-statement session values (TimeZone, zone resolver, clocks).
 pub const Session = value_module.Session;

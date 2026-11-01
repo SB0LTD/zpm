@@ -1,6 +1,6 @@
 # Basic numeric functions
 
-This candidate implements `abs`, `ceil`/`ceiling`, `floor`, `trunc` and `sign`
+This qualified slice implements `abs`, `ceil`/`ceiling`, `floor`, `trunc` and `sign`
 in ZPM Layer 0. RAMSQL remains the facade/server integration layer. Runtime
 storage and intermediate arithmetic are fixed-capacity and allocator-free.
 This is a slice of the numeric inventory, not the whole mathematical family.
@@ -71,7 +71,9 @@ Windows contract and native oracle successfully. The unchanged118-program
 inventory remains12 smoke passes,89 failures,17 unexecuted and exits1
 SqlConformanceIncomplete (PG.FUNC.NUMERIC still stops at SQRT). Hashes and
 counts are in [numeric_functions_evidence.json](../tests/sql_conformance/numeric_functions_evidence.json).
-RAMSQL wire integration and hosted qualification remain pending.
+RAMSQL PR47 qualified and merged as79d0fc0; CI41300988243 and release41300988055
+passed. Its original exact bundle is published as CI prerelease run41300988055.1.
+SQRT subsequently qualified in PR95/48; POWER/LN and remaining math stay open.
 
 ```powershell
 python .scratch/inventory/run_contract.py test_sql_numeric_functions sql src/core/sql.sig

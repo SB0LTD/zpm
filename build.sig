@@ -168,6 +168,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try ctx.addModule("db_store", "src/db/store.sig");
     const pg_module = try ctx.addModule("postgres", "src/db/postgres.sig");
     try wire(ctx, pg_module, "scram", "src/db/scram.sig");
+    try wire(ctx, pg_module, "sql", "src/core/sql.sig");
     _ = try ctx.addModule("mysql", "src/db/mysql.sig");
     _ = try ctx.addModule("tds", "src/db/tds.sig");
     _ = try ctx.addModule("tcp_server", "src/platform/tcp_server.sig");

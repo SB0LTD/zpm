@@ -1,6 +1,6 @@
 # SQL conformance TDD checkpoint
 
-## Latest candidate checkpoint - 1 November 2026
+## Latest qualified checkpoint - 1 November 2026
 
 The unchanged 118-program driver has **12 smoke passes, 89 failures and 17
 unexecuted scopes/comparators**, and still exits1 SqlConformanceIncomplete.
@@ -19,10 +19,20 @@ has24 active successes and2 policy skips. The initial release Windows job timed
 out at20 minutes; reviewed job budget30 preserves all checks. The broad legacy
 ZPM graph retains4 unrelated failures,316 successes and22 skips.
 
-SQRT is the next candidate; [SQL_SQUARE_ROOT.md](SQL_SQUARE_ROOT.md) records
-its current evidence and pending gates. The mathematical family remains open,
+SQRT qualified and merged in ZPM PR95 (main69f7555) and RAMSQL PR48
+(main2756280). ZPM database matrix41310830772 passed all three host platforms;
+RAMSQL CI41311411830 and release41311411851 passed. The initial PG18 durable
+RC2 timing observation failed; the unchanged failed-job retry passed, with
+original evidence retained and no relaxed waits. The automatic-publication
+follow-up RAMSQL PR49 qualified on CI41315141760 and release41315141691,
+then merged as0815419. Its exact bundle is published as a non-latest prerelease.
+[SQL_SQUARE_ROOT.md](SQL_SQUARE_ROOT.md) records the scoped implementation. The mathematical family remains open,
 including POWER/LN and the explicit planner/precision gaps.
-These results do not close the SQL inventory.
+The canonical core_smoke_results.ndjson now contains the recorded12/89/17
+result. Its older8/93/17 consolidation rows are preserved separately;
+[checkpoint_20261101.json](../tests/sql_conformance/checkpoint_20261101.json)
+binds both files to the prior execution evidence. No new run is claimed by this
+document reconciliation. These results do not close the SQL inventory.
 
 The dated checkpoints below preserve historical qualification evidence.
 
@@ -101,14 +111,15 @@ STO-05, NET-02 and the listed SQL feature gaps remain open.
    open. The temporal follow-up above changes temporal/value/binder source after
    the consolidation baseline; it does not close the remaining feature probes.
 2. **Common schema and types.** VARCHAR/CHAR, UUID/BYTEA, TIME/TIMETZ, arrays and
-   general records; SERIAL, IF [NOT] EXISTS, ALTER/TRUNCATE, views/schemas,
+   general records; SERIAL, ALTER/TRUNCATE, views/schemas,
    secondary indexes and table/composite/UNIQUE/CHECK/FK/deferred constraints
    still block ordinary application schemas. Virtual generation, inheritance
    and partitioning remain beyond the qualified stored-generation slice.
 3. **Ordinary functions/operators.** String/math/date/regex/discovery families,
    to_date/to_number, numeric/interval/localized/ISO/timezone formatting,
    remaining JSON/JSONB/SQL-JSON operations and additional aggregates/overloads.
-4. **Query composition.** Named and remaining built-in windows; nonintegral or
+4. **Query composition.** Remaining window forms beyond the qualified named,
+   offset, ranking and frame-value slices; nonintegral or
    temporal RANGE offsets; volatile moving inputs; CUBE/general GROUPING SETS
    and composite ROLLUP; LATERAL/NATURAL/parenthesized joins, table functions,
    modifying/materialized CTE forms, SEARCH/CYCLE, VALUES/TABLE, TABLESAMPLE,
@@ -134,7 +145,8 @@ The per-ID table in the inventory retains every failure/unexecuted entry.
 The newer [RAMSQL feature/divergence audit](https://github.com/SB0LTD/ramsql/blob/main/docs/compatibility/FEATURE_GAPS.md)
 and [hardening plan](https://github.com/SB0LTD/ramsql/blob/main/PLAN.md) add
 application priorities, safety findings and layer ownership. System findings
-such as NET-02 and STO-02/04/05 remain open after the four wave-zero fixes.
+NET-02 and STO-05 remain open; STO-02/04 have qualified snapshot/sequence fixes.
+The historical lists below must be read with these dated updates.
 
 ## Historical implementation checkpoints
 

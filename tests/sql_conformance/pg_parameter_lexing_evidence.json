@@ -1,0 +1,43 @@
+{
+  "date": "2026-11-01",
+  "baseline_revision": "69f75554b4e33d2421d20d389c13918d3ab3538f",
+  "runtime": "allocator-free L1 wire using named L0 sql.Tokenizer",
+  "baseline_red": {
+    "command": "python .scratch/parameters/run_pg.py (new regression, old codec)",
+    "exit": 1,
+    "error": "PostgresContractFailed",
+    "note": "Initial fixed-name log overwritten; independent scratch baseline reproduction requested"
+  },
+  "canonical_green": {
+    "command": "sig build run-contract-postgres -Doptimize=ReleaseSafe -j1",
+    "exit": 0,
+    "assertions": 20754,
+    "packets": 1033,
+    "fuzz_inputs": 4096,
+    "total_steps": 348,
+    "succeeded": 2,
+    "unselected": 346,
+    "log_lf_sha256": "98ca06f9fbeb61d9629f89f6d2586ef4a2751806b0bc25170744dcdaba1009c9"
+  },
+  "native": {
+    "local_diagnostic_queries": 5,
+    "version": "PostgreSQL16.15",
+    "full_oracle_cases": 78,
+    "full_oracle": "pending hosted PG16/18 jobs; WSL unavailable locally"
+  },
+  "inputs_lf_sha256": {
+    "src/db/postgres.sig": "8f5201b8191a578924783fd12d5d5d9e48ae82e31d3128ae04b71c4a90a4b10a",
+    "src/core/sql.sig": "3085306f6799a4145ef1d31c06750ee339144bc3b48055ea52978a13cb167884",
+    "build.sig": "5812b72287615cfab167a733bab98dd1174e98f16fccaa294b6a7af57e472292",
+    "tests/test_postgres.sig": "dc978d786f42c1d2495c794eeeb557475629f649684c903f77e35977ac5802e6",
+    "tools/verify_pg_parameter_lexing.py": "004295a759499b1e3770c8f6667fb667d441ca48aacd4f534cd6d184ae79ea55",
+    ".github/workflows/database-platforms.yml": "7aea98f97aad8aa3efb1291639615e2f7af836c6cb4f1d07e14940b0b7e855f2"
+  },
+  "scope_gaps": [
+    "Typed AST binding B1.1",
+    "General OID-0 inference",
+    "Remaining SQL grammar/literal forms",
+    "Other NET findings",
+    "SQL inventory still12/89/17; no family closed by this wire fix"
+  ]
+}

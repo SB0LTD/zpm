@@ -1,5 +1,13 @@
 # SQRT implementation and native qualification
 
+**Qualified checkpoint, 1 November 2026:** ZPM PR95 merged as69f7555;
+RAMSQL PR48 merged as2756280. ZPM database41310830772 passed Linux/macOS/Windows;
+RAMSQL CI41311411830 and release41311411851 passed after an unchanged retry of
+one RC2 timing observation (original failure retained, no weakened waits).
+The exact bundle is published under CI prerelease run41311411851.2. Broader
+planner/numeric scope gaps below remain open. Earlier pending-gate language in
+this design describes implementation history, not an outstanding merge gate.
+
 The candidate adds PostgreSQL-shaped SQRT overloads in ZPM Layer 0 SQL and
 reuses the existing allocator-free integer-root primitive in Sig
 `std.math.sqrt`. It introduces no duplicate public math module or runtime
