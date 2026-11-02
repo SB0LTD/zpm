@@ -211,7 +211,10 @@ pub const Work = struct {
 
 // ── Registers an instruction reads and writes ──────────────────────────────
 
-const RegRange = struct { num: u16, count: u16, half: bool, step: bool = true };
+/// `count` consecutive registers from `num` (or the same one `count` times
+/// when !step). `rpt`: register i is read or written on the i-th cycle, as
+/// (rptN) does; a load or store's components all go at once.
+const RegRange = struct { num: u16, count: u16, half: bool, step: bool = true, rpt: bool = false };
 
 fn unitsOf(r: RegRange, i: u16, out: *[2]u16) usize {
     const num = r.num + (if (r.step) i else 0);
@@ -252,7 +255,7 @@ const Access = struct {
 
 fn srcRange(src: Src, rpt: u8) ?RegRange {
     return switch (src.kind) {
-        .gpr => .{ .num = src.num, .count = if (src.r) rpt + 1 else 1, .half = src.half, .step = src.r },
+        .gpr => .{ .num = src.num, .count = if (src.r) rpt + 1 else 1, .half = src.half, .step = src.r, .rpt = src.r },
         // (relative reads: any register; tracked as r0.x only — kernels
         // here do not read registers relatively.)
         else => null,
@@ -273,7 +276,7 @@ fn access(in: *const Instr) Access {
         },
         1 => switch (in.op) {
             .mov, .movs => {
-                if (!in.dst.rel) a.d(.{ .num = in.dst.num, .count = rpt + 1, .half = in.dst.half });
+                if (!in.dst.rel) a.d(.{ .num = in.dst.num, .count = rpt + 1, .half = in.dst.half, .rpt = true });
                 if (srcRange(in.src[0], @intCast(rpt))) |r| a.s(r, 0);
             },
             .swz => {
@@ -295,7 +298,7 @@ fn access(in: *const Instr) Access {
             else => {},
         },
         2, 3, 4 => {
-            a.d(.{ .num = in.dst.num, .count = rpt + 1, .half = in.dst.half });
+            a.d(.{ .num = in.dst.num, .count = rpt + 1, .half = in.dst.half, .rpt = true });
             const n: usize = switch (in.op.category()) {
                 2 => 2,
                 3 => 3,
@@ -603,7 +606,7 @@ fn delayNeeded(e: *const Emit, st: *const State, in: *const Instr, acc: *const A
                     if (idx == 2 and in.op.category() == 3 and isMad(in.op)) d -|= e.delays.cat3_src2_read;
                 }
                 // (rpt) reads register i on the i-th cycle.
-                if (r.step) d -|= @intCast(i);
+                if (r.rpt) d -|= @intCast(i);
                 need = @max(need, d);
             }
         }
@@ -681,7 +684,7 @@ fn step(e: *Emit, st: *State, item: Item) Error!void {
     for (acc.dst[0..acc.n_dst]) |r| {
         for (0..r.count) |i| {
             const n = unitsOf(r, @intCast(i), &tmp);
-            const at: u32 = if (r.step) @intCast(i) else 0;
+            const at: u32 = if (r.rpt) @intCast(i) else 0;
             for (tmp[0..n]) |u| {
                 if (alu) {
                     st.rem_alu[u] = @intCast((at + 1 + alu_wait) -| slots);

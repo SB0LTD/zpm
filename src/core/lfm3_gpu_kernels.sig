@@ -362,6 +362,225 @@ pub fn q6kMatrixSource(comptime tokens: comptime_int) []const u8 {
     }
 }
 
+/// dst = a / b for normal f32 bit patterns in registers, correctly rounded
+/// (IEEE division, as the CPU's `/`): the 24-bit mantissas long-divided in
+/// 25 steps, rounded to nearest even. Wave-uniform; t is 8 scratch regs
+/// (t[7] must hold 0x800000 on entry and keeps it).
+fn fdivAsm(comptime dst: comptime_int, comptime a: comptime_int, comptime b: comptime_int, comptime t: [8]comptime_int, comptime label: []const u8) []const u8 {
+    comptime {
+        var s: []const u8 = "";
+        s = s ++ line("xor.b {s}, {s}, {s}", .{ r(t[0]), r(a), r(b) });
+        s = s ++ line("shr.b {s}, {s}, 31", .{ r(t[0]), r(t[0]) });
+        s = s ++ line("shl.b {s}, {s}, 31", .{ r(t[0]), r(t[0]) }); // sign
+        s = s ++ line("shrm {s}, 23, {s}, 255", .{ r(t[1]), r(a) });
+        s = s ++ line("shrm {s}, 23, {s}, 255", .{ r(t[2]), r(b) });
+        s = s ++ line("sub.u {s}, {s}, {s}", .{ r(t[1]), r(t[1]), r(t[2]) });
+        s = s ++ line("add.u {s}, {s}, 127", .{ r(t[1]), r(t[1]) }); // exponent
+        s = s ++ line("shl.b {s}, {s}, 9", .{ r(t[2]), r(a) });
+        s = s ++ line("shr.b {s}, {s}, 9", .{ r(t[2]), r(t[2]) });
+        s = s ++ line("or.b {s}, {s}, {s}", .{ r(t[2]), r(t[2]), r(t[7]) }); // dividend mantissa
+        s = s ++ line("shl.b {s}, {s}, 9", .{ r(t[3]), r(b) });
+        s = s ++ line("shr.b {s}, {s}, 9", .{ r(t[3]), r(t[3]) });
+        s = s ++ line("or.b {s}, {s}, {s}", .{ r(t[3]), r(t[3]), r(t[7]) }); // divisor mantissa
+        s = s ++ line("cmps.u.lt {s}, {s}, {s}", .{ r(t[4]), r(t[2]), r(t[3]) });
+        s = s ++ line("shl.b {s}, {s}, {s}", .{ r(t[2]), r(t[2]), r(t[4]) });
+        s = s ++ line("sub.u {s}, {s}, {s}", .{ r(t[1]), r(t[1]), r(t[4]) });
+        s = s ++ line("mov.u32u32 {s}, 0", .{r(dst)});
+        s = s ++ line("mov.u32u32 {s}, 25", .{r(t[6])});
+        s = s ++ label ++ ":\n";
+        s = s ++ line("shl.b {s}, {s}, 1", .{ r(dst), r(dst) });
+        s = s ++ line("cmps.u.ge {s}, {s}, {s}", .{ r(t[4]), r(t[2]), r(t[3]) });
+        s = s ++ line("or.b {s}, {s}, {s}", .{ r(dst), r(dst), r(t[4]) });
+        s = s ++ line("mul.u24 {s}, {s}, {s}", .{ r(t[5]), r(t[4]), r(t[3]) });
+        s = s ++ line("sub.u {s}, {s}, {s}", .{ r(t[2]), r(t[2]), r(t[5]) });
+        s = s ++ line("shl.b {s}, {s}, 1", .{ r(t[2]), r(t[2]) });
+        s = s ++ line("sub.u {s}, {s}, 1", .{ r(t[6]), r(t[6]) });
+        s = s ++ line("cmps.u.ne p0.x, {s}, 0", .{r(t[6])});
+        s = s ++ "br p0.x, #" ++ label ++ "\n";
+        // 25 bits: guard bit last; the remainder is the sticky bit
+        s = s ++ line("and.b {s}, {s}, 1", .{ r(t[4]), r(dst) });
+        s = s ++ line("shr.b {s}, {s}, 1", .{ r(dst), r(dst) });
+        s = s ++ line("cmps.u.ne {s}, {s}, 0", .{ r(t[5]), r(t[2]) });
+        s = s ++ line("and.b {s}, {s}, 1", .{ r(t[6]), r(dst) });
+        s = s ++ line("or.b {s}, {s}, {s}", .{ r(t[5]), r(t[5]), r(t[6]) });
+        s = s ++ line("and.b {s}, {s}, {s}", .{ r(t[4]), r(t[4]), r(t[5]) });
+        s = s ++ line("add.u {s}, {s}, {s}", .{ r(dst), r(dst), r(t[4]) });
+        // a carry out of the mantissa: one more exponent step
+        s = s ++ line("shr.b {s}, {s}, 24", .{ r(t[5]), r(dst) });
+        s = s ++ line("shr.b {s}, {s}, {s}", .{ r(dst), r(dst), r(t[5]) });
+        s = s ++ line("add.u {s}, {s}, {s}", .{ r(t[1]), r(t[1]), r(t[5]) });
+        s = s ++ line("shl.b {s}, {s}, 9", .{ r(dst), r(dst) });
+        s = s ++ line("shr.b {s}, {s}, 9", .{ r(dst), r(dst) });
+        s = s ++ line("shlg {s}, 23, {s}, {s}", .{ r(dst), r(t[1]), r(dst) });
+        s = s ++ line("or.b {s}, {s}, {s}", .{ r(dst), r(dst), r(t[0]) });
+        return s;
+    }
+}
+
+/// Constants of the quantization kernels (vec4 c0..c3).
+pub const QuantConsts = struct {
+    x: u64,
+    norm_weight: u64 = 0,
+    normalized: u64 = 0,
+    act_q: u64,
+    act_d: u64,
+    act_sums: u64,
+    k: u32,
+    epsilon: f32 = 0,
+
+    pub fn dwords(q: QuantConsts) [16]u32 {
+        const inv_k: f32 = 1.0 / @as(f32, @floatFromInt(q.k));
+        return .{
+            @truncate(q.x),     @truncate(q.x >> 32),     @truncate(q.norm_weight), @truncate(q.norm_weight >> 32),
+            @truncate(q.normalized), @truncate(q.normalized >> 32), @truncate(q.act_q), @truncate(q.act_q >> 32),
+            @truncate(q.act_d), @truncate(q.act_d >> 32), @truncate(q.act_sums), @truncate(q.act_sums >> 32),
+            q.k, @bitCast(q.epsilon), @bitCast(inv_k), q.k / QK_K,
+        };
+    }
+};
+
+/// Rows of f32 into Q8_K activations, as quantized_linear.quantizeQ8K does
+/// (the first element of largest magnitude sets the scale; -127/max and its
+/// reciprocal divided exactly; round to nearest even). One wave per 256-lane
+/// block. With `norm`, each workgroup is one row of `waves` blocks: RMSNorm
+/// first (f32 sums of squares; the CPU sums in f64, so the norm is a float
+/// path), the normalized row written out, then quantized. Without, the grid
+/// is (blocks, tokens) of single waves.
+pub fn quantSource(comptime norm: bool, comptime waves: comptime_int) []const u8 {
+    comptime {
+        @setEvalBranchQuota(10_000_000);
+        const lsize = 64 * waves;
+        var s: []const u8 = std.fmt.comptimePrint(
+            \\@localsize {d}, 1, 1
+            \\@invocationid(r0.x)
+            \\@wgid(r48.x)
+            \\@consts 4
+            \\@shared 64
+            \\
+        , .{lsize});
+        // 4 wave, 5 lane, 6 block, 7 element index, 8 byte offset (f32)
+        s = s ++ line("shr.b {s}, r0.x, 6", .{r(4)});
+        s = s ++ line("and.b {s}, r0.x, 63", .{r(5)});
+        s = s ++ (if (norm) line("mov.u32u32 {s}, {s}", .{ r(6), r(4) }) else line("mov.u32u32 {s}, r48.x", .{r(6)}));
+        s = s ++ line("mul.u24 {s}, r48.y, c3.x", .{r(7)});
+        s = s ++ line("shl.b {s}, {s}, 8", .{ r(9), r(6) });
+        s = s ++ line("add.u {s}, {s}, {s}", .{ r(7), r(7), r(9) });
+        s = s ++ line("shl.b {s}, {s}, 2", .{ r(9), r(5) });
+        s = s ++ line("add.u {s}, {s}, {s}", .{ r(7), r(7), r(9) });
+        s = s ++ line("shl.b {s}, {s}, 2", .{ r(8), r(7) });
+        s = s ++ line("ldg.a.f32 {s}, g[c0.x+{s}+0], 4", .{ r(12), r(8) }); // x0..x3 in r3
+        s = s ++ line("mov.u32u32 {s}, 0x800000", .{r(39)});
+        s = s ++ line("mov.u32u32 {s}, 0", .{r(50)});
+        if (norm) {
+            s = s ++ line("mul.f {s}, {s}, {s}", .{ r(16), r(12), r(12) });
+            for (1..4) |i| s = s ++ line("mad.f32 {s}, {s}, {s}, {s}", .{ r(16), r(12 + i), r(12 + i), r(16) });
+            for ([_]u32{ 1, 2, 4, 8, 16, 32 }) |m| {
+                s = s ++ line("shfl.xor.u32 {s}, {s}, {d}", .{ r(17), r(16), m });
+                s = s ++ line("add.f {s}, {s}, {s}", .{ r(16), r(16), r(17) });
+            }
+            s = s ++ line("shl.b {s}, {s}, 2", .{ r(18), r(4) });
+            s = s ++ line("cmps.u.eq p0.x, {s}, 0", .{r(5)});
+            s = s ++ "br !p0.x, #partial\n";
+            s = s ++ line("stl.f32 l[{s}], {s}, 1", .{ r(18), r(16) });
+            s = s ++ "partial:\nbar\nfence.l.r.w\n";
+            s = s ++ line("mov.u32u32 {s}, 0", .{r(18)});
+            s = s ++ line("ldl.f32 {s}, l[{s}], 1", .{ r(16), r(18) });
+            for (1..waves) |wv| s = s ++ line("ldl.f32 {s}, l[{s}+{d}], 1", .{ r(17), r(18), 4 * wv }) ++ line("add.f {s}, {s}, {s}", .{ r(16), r(16), r(17) });
+            // inverse = 1 / sqrt(mean + eps)
+            s = s ++ line("mul.f {s}, {s}, c3.z", .{ r(16), r(16) });
+            s = s ++ line("add.f {s}, {s}, c3.y", .{ r(16), r(16) });
+            s = s ++ line("rsq {s}, {s}", .{ r(16), r(16) });
+            // the weights of these four elements: byte offset block * 1024 + lane * 16
+            s = s ++ line("shl.b {s}, {s}, 10", .{ r(24), r(6) });
+            s = s ++ line("shl.b {s}, {s}, 4", .{ r(25), r(5) });
+            s = s ++ line("add.u {s}, {s}, {s}", .{ r(24), r(24), r(25) });
+            s = s ++ line("ldg.a.f32 {s}, g[c0.z+{s}+0], 4", .{ r(20), r(24) });
+            for (0..4) |i| {
+                s = s ++ line("mul.f {s}, {s}, {s}", .{ r(12 + i), r(12 + i), r(16) });
+                s = s ++ line("mul.f {s}, {s}, {s}", .{ r(12 + i), r(12 + i), r(20 + i) });
+            }
+            s = s ++ line("stg.a.f32 g[c1.x+{s}+0], {s}, 4", .{ r(8), r(12) });
+        }
+        // |x| (as bits: they order like unsigned integers) and the wave max
+        for (0..4) |i| s = s ++ line("absneg.f {s}, (abs){s}", .{ r(28 + i), r(12 + i) });
+        s = s ++ line("max.u {s}, {s}, {s}", .{ r(32), r(28), r(29) });
+        s = s ++ line("max.u {s}, {s}, {s}", .{ r(32), r(32), r(30) });
+        s = s ++ line("max.u {s}, {s}, {s}", .{ r(32), r(32), r(31) });
+        for ([_]u32{ 1, 2, 4, 8, 16, 32 }) |m| {
+            s = s ++ line("shfl.xor.u32 {s}, {s}, {d}", .{ r(33), r(32), m });
+            s = s ++ line("max.u {s}, {s}, {s}", .{ r(32), r(32), r(33) });
+        }
+        // the first element with that magnitude: key = index << 1 | sign, wave min
+        s = s ++ line("mov.u32u32 {s}, 0xffffffff", .{r(34)});
+        var i: usize = 4;
+        while (i > 0) {
+            i -= 1;
+            s = s ++ line("shl.b {s}, {s}, 2", .{ r(35), r(5) });
+            s = s ++ line("add.u {s}, {s}, {d}", .{ r(35), r(35), i });
+            s = s ++ line("shl.b {s}, {s}, 1", .{ r(35), r(35) });
+            s = s ++ line("shr.b {s}, {s}, 31", .{ r(36), r(12 + i) });
+            s = s ++ line("or.b {s}, {s}, {s}", .{ r(35), r(35), r(36) });
+            s = s ++ line("cmps.u.eq {s}, {s}, {s}", .{ r(36), r(28 + i), r(32) });
+            s = s ++ line("sel.b32 {s}, {s}, {s}, {s}", .{ r(34), r(35), r(36), r(34) });
+        }
+        for ([_]u32{ 1, 2, 4, 8, 16, 32 }) |m| {
+            s = s ++ line("shfl.xor.u32 {s}, {s}, {d}", .{ r(33), r(34), m });
+            s = s ++ line("min.u {s}, {s}, {s}", .{ r(34), r(34), r(33) });
+        }
+        // maximum = sign | magnitude; inverse = -127 / maximum; d = 1 / inverse
+        s = s ++ line("shl.b {s}, {s}, 31", .{ r(34), r(34) });
+        s = s ++ line("or.b {s}, {s}, {s}", .{ r(37), r(32), r(34) });
+        s = s ++ line("mov.u32u32 {s}, 0xc2fe0000", .{r(38)}); // -127.0
+        s = s ++ fdivAsm(40, 38, 37, .{ 41, 42, 43, 44, 45, 46, 47, 39 }, "div1");
+        s = s ++ line("mov.u32u32 {s}, 0x3f800000", .{r(38)}); // 1.0
+        s = s ++ fdivAsm(36, 38, 40, .{ 41, 42, 43, 44, 45, 46, 47, 39 }, "div2");
+        // q = min(127, nearest(inverse * x)); zero blocks stay zero
+        s = s ++ line("cmps.u.ne {s}, {s}, 0", .{ r(33), r(32) });
+        for (0..4) |k| {
+            s = s ++ line("mul.f {s}, {s}, {s}", .{ r(20 + k), r(40), r(12 + k) });
+            s = s ++ line("rndne.f {s}, {s}", .{ r(20 + k), r(20 + k) });
+            s = s ++ line("cov.f32s32 {s}, {s}", .{ r(20 + k), r(20 + k) });
+            s = s ++ line("min.s {s}, {s}, 127", .{ r(20 + k), r(20 + k) });
+            s = s ++ line("sel.b32 {s}, {s}, {s}, {s}", .{ r(20 + k), r(20 + k), r(33), r(50) });
+        }
+        // pack four bytes
+        s = s ++ line("and.b {s}, {s}, 255", .{ r(24), r(20) });
+        s = s ++ line("and.b {s}, {s}, 255", .{ r(25), r(21) });
+        s = s ++ line("shlg {s}, 8, {s}, {s}", .{ r(24), r(25), r(24) });
+        s = s ++ line("and.b {s}, {s}, 255", .{ r(25), r(22) });
+        s = s ++ line("shlg {s}, 16, {s}, {s}", .{ r(24), r(25), r(24) });
+        s = s ++ line("shlg {s}, 24, {s}, {s}", .{ r(24), r(23), r(24) });
+        s = s ++ line("stg.a.u32 g[c1.z+{s}+0], {s}, 1", .{ r(7), r(24) });
+        // sums of 16: four fibers' four values
+        s = s ++ line("add.s {s}, {s}, {s}", .{ r(26), r(20), r(21) });
+        s = s ++ line("add.s {s}, {s}, {s}", .{ r(26), r(26), r(22) });
+        s = s ++ line("add.s {s}, {s}, {s}", .{ r(26), r(26), r(23) });
+        s = s ++ line("shfl.xor.u32 {s}, {s}, 1", .{ r(27), r(26) });
+        s = s ++ line("add.s {s}, {s}, {s}", .{ r(26), r(26), r(27) });
+        s = s ++ line("shfl.xor.u32 {s}, {s}, 2", .{ r(27), r(26) });
+        s = s ++ line("add.s {s}, {s}, {s}", .{ r(26), r(26), r(27) });
+        // block number in the row of tokens: t * blocks + block
+        s = s ++ line("mul.u24 {s}, r48.y, c3.w", .{r(28)});
+        s = s ++ line("add.u {s}, {s}, {s}", .{ r(28), r(28), r(6) });
+        s = s ++ line("and.b {s}, {s}, 3", .{ r(29), r(5) });
+        s = s ++ line("cmps.u.eq p0.x, {s}, 0", .{r(29)});
+        s = s ++ "br !p0.x, #nosum\n";
+        s = s ++ line("shl.b {s}, {s}, 5", .{ r(30), r(28) });
+        s = s ++ line("shr.b {s}, {s}, 1", .{ r(31), r(5) });
+        s = s ++ line("add.u {s}, {s}, {s}", .{ r(30), r(30), r(31) });
+        s = s ++ line("cov.s32s16 {s}, {s}", .{ hr(27, false), r(26) });
+        s = s ++ line("stg.a.s16 g[c2.z+{s}+0], {s}, 1", .{ r(30), hr(27, false) });
+        s = s ++ "nosum:\n";
+        s = s ++ line("cmps.u.eq p0.x, {s}, 0", .{r(5)});
+        s = s ++ "br !p0.x, #done\n";
+        s = s ++ line("shl.b {s}, {s}, 2", .{ r(30), r(28) });
+        s = s ++ line("sel.b32 {s}, {s}, {s}, {s}", .{ r(36), r(36), r(33), r(50) });
+        s = s ++ line("stg.a.u32 g[c2.x+{s}+0], {s}, 1", .{ r(30), r(36) });
+        s = s ++ "done:\nend\n";
+        return s;
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 const quantized = @import("quantized_linear");
@@ -372,6 +591,15 @@ const TestRig = struct {
     var emu: device.EmuDevice = undefined;
     var asm_work: ir3_asm.Work = .{};
 };
+
+fn emuFailure(e: anyerror) anyerror {
+    const T = TestRig;
+    var buf: [160]u8 = undefined;
+    const at = T.emu.emu.err_pc;
+    const text = ir3.format(ir3.A7XX, &T.emu.emu.code[at], &buf) catch "?";
+    std.debug.print("emulated GPU: {s} at instruction {d}: {s}\n", .{ if (T.emu.last_error) |x| @errorName(x) else "?", at, text });
+    return e;
+}
 
 fn lcg(seed: *u32) u32 {
     seed.* = seed.* *% 1664525 +% 1013904223;
@@ -461,4 +689,82 @@ test "Q6_K x Q8_K: one token, bit-exact with the CPU kernel (odd blocks two byte
 
 test "Q6_K x Q8_K: eight tokens" {
     try runMatrix(8, false, 16, 9);
+}
+
+fn runQuant(comptime norm: bool, tokens: u32, comptime k_cols: u32) !void {
+    const T = TestRig;
+    T.emu = .{ .arena = &T.arena };
+    const d = T.emu.device();
+    const blocks = k_cols / QK_K;
+    const xb = try d.alloc(tokens * k_cols * 4);
+    const wb = try d.alloc(k_cols * 4);
+    const yb = try d.alloc(tokens * k_cols * 4);
+    const aq = try d.alloc(tokens * k_cols);
+    const ad = try d.alloc(tokens * blocks * 4);
+    const abs = try d.alloc(tokens * blocks * 32);
+    const code = try d.alloc(64 * 1024);
+    const ib = try d.alloc(64 * 1024);
+    var seed: u32 = 5;
+    const x: []f32 = @alignCast(std.mem.bytesAsSlice(f32, xb.cpu));
+    const w: []f32 = @alignCast(std.mem.bytesAsSlice(f32, wb.cpu));
+    for (x, 0..) |*v, i| {
+        v.* = (@as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0 - 0.5) * 6.0;
+        // a block of zeros, and ties of magnitude
+        if (i / QK_K == 3) v.* = 0;
+        if (i % 997 == 5) v.* = 9.0;
+        if (i % 997 == 9) v.* = -9.0;
+    }
+    for (w) |*v| v.* = 0.5 + @as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0;
+    const src = comptime quantSource(norm, if (norm) k_cols / QK_K else 1);
+    const k = ir3_asm.assemble(ir3.A7XX, src, &T.asm_work, @alignCast(std.mem.bytesAsSlice(u64, code.cpu))) catch |e| {
+        std.debug.print("assemble: line {d}: {s}\n", .{ T.asm_work.err_line, @errorName(e) });
+        return e;
+    };
+    var s = adreno.a7xx.Stream{ .buf = ib.words() };
+    s.computeSetup();
+    try s.program(&k, code.va);
+    const consts = (QuantConsts{ .x = xb.va, .norm_weight = wb.va, .normalized = yb.va, .act_q = aq.va, .act_d = ad.va, .act_sums = abs.va, .k = k_cols, .epsilon = 1e-5 }).dwords();
+    s.constants(0, &consts);
+    s.dispatch(&k, if (norm) .{ 1, tokens, 1 } else .{ blocks, tokens, 1 });
+    try s.check();
+    d.run(ib, @intCast(s.len), 1_000_000) catch |e| return emuFailure(e);
+    // what was quantized: x, or the GPU's normalized rows
+    const y: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, yb.cpu));
+    const q_in = if (norm) y else x;
+    if (norm) {
+        var worst: f64 = 0;
+        for (0..tokens) |t| {
+            var squares: f64 = 0;
+            for (x[t * k_cols ..][0..k_cols]) |v| squares += @as(f64, v) * v;
+            const mean: f32 = @floatCast(squares / @as(f64, @floatFromInt(k_cols)));
+            const inverse = 1.0 / @sqrt(mean + 1e-5);
+            for (0..k_cols) |i| {
+                const want = x[t * k_cols + i] * inverse * w[i];
+                const got = y[t * k_cols + i];
+                worst = @max(worst, @abs(@as(f64, got) - want) / @max(@abs(@as(f64, want)), 1e-3));
+            }
+        }
+        try std.testing.expect(worst < 2e-6);
+    }
+    var cpu: [64 * 30]quantized.Q8KBlock = undefined;
+    try quantized.quantizeQ8K(q_in[0 .. tokens * k_cols], cpu[0 .. tokens * blocks]);
+    const gq = std.mem.bytesAsSlice(i8, aq.cpu);
+    const gd: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, ad.cpu));
+    const gs: []const i16 = @alignCast(std.mem.bytesAsSlice(i16, abs.cpu));
+    for (cpu[0 .. tokens * blocks], 0..) |b, i| {
+        if (@as(u32, @bitCast(b.d)) != @as(u32, @bitCast(gd[i]))) {
+            std.debug.print("block {d}: d {e} want {e}\n", .{ i, gd[i], b.d });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqualSlices(i8, &b.qs, gq[i * QK_K ..][0..QK_K]);
+        try std.testing.expectEqualSlices(i16, &b.bsums, gs[i * 16 ..][0..16]);
+    }
+}
+
+test "Q8_K quantization: bit-exact with quantizeQ8K (zero block, magnitude ties)" {
+    try runQuant(false, 3, 7680);
+}
+
+test "RMSNorm then Q8_K: the norm within 2e-6, the quantization bit-exact" {
+    try runQuant(true, 2, 2048);
 }
