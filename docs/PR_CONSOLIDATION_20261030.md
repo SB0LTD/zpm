@@ -61,6 +61,17 @@ evidence remain available. Existing already-merged ancestors stay in main.
 Reconsider an experiment only with isolated current-source correctness and CI
 performance evidence. Do not silently revive its entire old branch.
 
+On 2 November 2026 the experiment and evidence branches were archived as tags
+so no unmerged branches remain: `archive/perf/typed-value-overhead` (53),
+`archive/perf/equality-fingerprints` (54), `archive/perf/fingerprint-predicate-cascade`
+(58), `archive/perf/projection-destination` (59), `archive/perf/specialize-predicate-cascade`
+(60), `archive/perf/exact-byte-domains` (61), `archive/perf/sparse-factor-masks` (66),
+`archive/perf/typed-multi-sparse-integration` and `archive/fix/sql-scalar-escape-validation`
+(the CI compositions), and `archive/evidence/sql-named-windows-20261031` and
+`archive/evidence/sql-window-values-20261031` (the pre-restack sources PR 91/92 cite,
+4bbb5de and fbd1ae6). Each tag points at the branch's last commit; GitHub also keeps
+`refs/pull/<n>/head` for the closed PRs.
+
 ## dbMeter and remaining work
 
 dbMeter PR 1 is closed without merging because run 41024725859 completed with
