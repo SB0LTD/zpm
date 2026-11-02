@@ -1,0 +1,103 @@
+{
+  "scope": "Native observations outside this plain-output slice; not counted as passing parity",
+  "cases": [
+    {
+      "sql": "SELECT 7 FROM (SELECT sum(1/0) AS x FROM t) q",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT sum(v) AS x,1/0 AS y FROM t) q",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT (SELECT 1/0) AS x) q",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1/0 AS x UNION ALL SELECT 1/0) q",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1/0 AS x UNION SELECT 1/0) q",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    }
+  ],
+  "needed": [
+    "Aggregate/window output and aggregate-state liveness",
+    "Unused scalar-subquery projection pruning",
+    "Broader pull-up, outer-join and correlated dependency proofs"
+  ],
+  "note": "Set operations are deliberately conservative; current frozen native UNION cases require constant errors even when outer outputs are unused."
+}

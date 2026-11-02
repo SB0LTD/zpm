@@ -406,7 +406,7 @@ pub fn Exec(comptime config: types.Config) type {
             fn projectRow(self: *Query, p: *const B.Plan, ctx: *E.Context, out: *List) Error!void {
                 const at = try self.cells(p.width);
                 for (p.targets[0..p.width], 0..) |id, column| {
-                    const value = try E.eval(ctx, id);
+                    const value:V.Cell = if(p.required[column]) try E.eval(ctx,id) else .null_value;
                     self.work.cells[at + column] = value;
                 }
                 try self.push(out, at);

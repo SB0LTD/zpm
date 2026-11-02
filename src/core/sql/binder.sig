@@ -143,6 +143,9 @@ pub fn Binder(comptime config: types.Config) type {
             session: *const value.Session = &value.default_session,
             /// Plan storage for general queries; null rejects subqueries.
             plans: ?*Plans = null,
+            planning_plan:?*const Plan=null,
+            constant_dependencies:?*[config.ctes]bool=null,
+            describe_only:bool=false,
 
             fn node(self: *const Context, id: u16) *ast.Node {
                 return &self.pool.nodes[id];
@@ -237,6 +240,14 @@ pub fn Binder(comptime config: types.Config) type {
             // arguments from CASE. Report only if this plan remains reachable.
             planned_checked:bool=false,
             planned_error:?Error=null,
+            planned_targets:[2*config.columns]?Error=@splat(null),
+            prunable:[2*config.columns]bool=@splat(false),
+            required:[2*config.columns]bool=@splat(true),
+            demanded:bool=false,
+            constant_source_safe:bool=false,
+            constant_outputs:[2*config.columns]V.Cell=undefined,
+            constant_known:[2*config.columns]bool=@splat(false),
+            constant_dependencies:[2*config.columns][config.ctes]bool=@splat(@splat(false)),
             windows:[config.columns]Window=undefined,window_count:usize=0,
             window_late:[2*config.columns]bool=.{false}**(2*config.columns),
             window_origins:[config.columns]u16=.{none}**config.columns,
@@ -278,6 +289,7 @@ pub fn Binder(comptime config: types.Config) type {
             /// branch reads the working table.
             recursive: bool = false,
             referenced: bool = false,
+            references:usize=0,
         };
 
         /// Statement-scoped plans (inside Database.workspace).
@@ -1266,8 +1278,37 @@ pub fn Binder(comptime config: types.Config) type {
             return id != none and context.node(id).ty != .unknown and isConstant(context, id) and immutableGenerated(context, id);
         }
 
+        fn constantColumn(context:*const Context,n:*const ast.Node) Error!bool {
+            try context.session.checkpoint();
+            const p=context.planning_plan orelse return false;
+            if(n.level!=0 or n.relation>=p.source_count) return false;
+            for(p.sources[0..p.source_count]) |source| if(source.join==.left or source.join==.right or source.join==.full) return false;
+            const source=p.sources[n.relation];if(source.plan==none) return false;
+            if(source.cte!=no_cte) {const cte=&plansOf(context).ctes[source.cte];if(cte.references>1 or cte.recursive) return false;}
+            const child=&plansOf(context).items[source.plan];
+            if(!child.constant_source_safe or child.set_op!=.none or child.grouped or child.window_count!=0 or child.correlated or
+                n.column>=child.count or !child.constant_known[n.column]) return false;
+            // A dependency set, not recursive re-proof of a shared expression
+            // DAG, invalidates a value when later consumers materialize a CTE.
+            const dependencies=&child.constant_dependencies[n.column];
+            for(dependencies,0..) |needed,index| if(needed) {
+                const cte=&plansOf(context).ctes[index];if(cte.references>1 or cte.recursive) return false;
+            };
+            if(context.constant_dependencies) |out| {
+                for(dependencies,0..) |needed,index| out[index]=out[index] or needed;
+                if(source.cte!=no_cte) out[source.cte]=true;
+            }
+            return true;
+        }
+        fn planningEvalContext(context:*const Context) E.Context {
+            var out:E.Context=.{.source=context.source,.pool=context.pool,.session=context.session};
+            if(context.planning_plan) |p| for(p.sources[0..p.source_count],0..) |source,index| {
+                if(source.plan!=none) {const child=&plansOf(context).items[source.plan];out.tuple[index]=&child.constant_outputs;}
+            };
+            return out;
+        }
         fn generatedValue(context: *const Context, id: u16) Error!V.Cell {
-            const eval_context: E.Context = .{ .source = context.source, .pool = context.pool, .session = context.session };
+            const eval_context=planningEvalContext(context);
             return E.eval(&eval_context, id);
         }
 
@@ -1567,23 +1608,67 @@ pub fn Binder(comptime config: types.Config) type {
             while (item != none) : (item = context.node(item).next) try context.pool.raise(id, item);
         }
 
-        fn foldableScalar(context: *const Context, id: u16) bool {
-            if (id == none) return true;
-            const n = context.node(id);
-            // Its arguments still need the discarded-constant pass before
-            // evaluating the resulting NULL, including nested strict calls.
+        fn foldableScalar(context: *const Context, id: u16) Error!bool {
+            if(id==none) return true;
+            const n=context.node(id);
             if(n.planned_null) return false;
-            if (!n.constant) return false;
-            switch (n.kind) {
-                .function => if (!ast.canRepeatFunction(n.func) and n.func != .jsonb_typeof and n.func != .jsonb_array_length) return false,
-                .row_constructor, .row_compare, .row_in => return false,
-                else => {},
+            if(n.kind==.column) return (try constantColumn(context,n));
+            if(n.kind==.case_expr) {
+                if(n.a!=none and !(try foldableScalar(context,n.a))) return false;
+                const operand=if(n.a!=none) generatedValue(context,n.a) catch |err| {if(planningControlError(err)) return err;return false;} else V.Cell.null_value;
+                var arm=n.b;
+                while(arm!=none):(arm=context.node(arm).next) {
+                    const entry=context.node(arm);if(!(try foldableScalar(context,entry.a))) return false;
+                    const candidate=generatedValue(context,entry.a) catch |err| {if(planningControlError(err)) return err;return false;};
+                    const hit=if(n.a==none) candidate==.boolean and candidate.boolean else E.compareOp(.eq,&operand,&candidate)==true;
+                    if(hit) return (try foldableScalar(context,entry.b));
+                }
+                return (try foldableScalar(context,n.c));
             }
-            if (!foldableScalar(context, n.a) or !foldableScalar(context, n.c)) return false;
-            if (!listOwner(n.kind)) return foldableScalar(context, n.b);
-            var item = n.b;
-            while (item != none) : (item = context.node(item).next) if (!foldableScalar(context, item)) return false;
+            if(n.kind==.coalesce) {
+                var item=n.b;
+                while(item!=none):(item=context.node(item).next) {
+                    if(!(try foldableScalar(context,item))) return false;
+                    const cell=generatedValue(context,item) catch |err| {if(planningControlError(err)) return err;return false;};
+                    if(cell!=.null_value) return true;
+                }
+                return true;
+            }
+            if(n.kind==.and_op or n.kind==.or_op) {
+                if(!(try foldableScalar(context,n.a))) return false;
+                const cell=generatedValue(context,n.a) catch |err| {if(planningControlError(err)) return err;return false;};
+                if(cell==.boolean and cell.boolean==(n.kind==.or_op)) return true;
+                return (try foldableScalar(context,n.b));
+            }
+            switch(n.kind) {
+                .scalar_subquery,.exists_subquery,.in_subquery,.aggregate,.default_value,.values_row,.row_constructor,.row_compare,.row_in=>return false,
+                .function=>if(!ast.immutableFunction(n.func)) return false,
+                else=>{},
+            }
+            if(!immutableGenerated(context,id)) return false;
+            if(!n.constant and context.planning_plan==null) return false;
+            if(!(try foldableScalar(context,n.a)) or !(try foldableScalar(context,n.c))) return false;
+            if(!listOwner(n.kind)) return (try foldableScalar(context,n.b));
+            var item=n.b;while(item!=none):(item=context.node(item).next) if(!(try foldableScalar(context,item))) return false;
             return true;
+        }
+
+        fn planningControlError(err:Error) bool {
+            return err==error.QueryCanceled or err==error.QueryWorkLimit;
+        }
+
+        fn constantTruth(context:*const Context,id:u16) Error!?V.Cell {
+            if(id==none) return null;
+            if((try foldableScalar(context,id))) return try generatedValue(context,id);
+            const n=context.node(id);
+            if(n.planned_null) return V.Cell.null_value;
+            if(n.kind==.and_op or n.kind==.or_op) {
+                const a=try constantTruth(context,n.a);
+                if(a) |v| if(v==.boolean and v.boolean==(n.kind==.or_op)) return v;
+                const b=try constantTruth(context,n.b);
+                if(b) |v| if(v==.boolean and v.boolean==(n.kind==.or_op)) return v;
+            }
+            return null;
         }
 
         // A strict NULL record comparison discards runtime evaluation, but
@@ -1592,8 +1677,13 @@ pub fn Binder(comptime config: types.Config) type {
         fn validateDiscardedConstants(context: *const Context, id: u16) Error!void {
             if (id == none) return;
             const n = context.node(id);
-            const eval_context: E.Context = .{ .source = context.source, .pool = context.pool, .session = context.session };
-            if (foldableScalar(context, id)) { _ = try E.eval(&eval_context, id); return; }
+            const eval_context=planningEvalContext(context);
+            if ((try foldableScalar(context, id))) { _ = try E.eval(&eval_context, id); return; }
+            if(n.kind==.and_op or n.kind==.or_op) {
+                try validateDiscardedConstants(context,n.a);
+                if(try constantTruth(context,n.a)) |v| if(v==.boolean and v.boolean==(n.kind==.or_op)) return;
+                return validateDiscardedConstants(context,n.b);
+            }
             if(n.window!=none) {
                 const spec=&context.pool.windows[n.window];
                 for(spec.partition[0..spec.partition_count]) |item| try validateDiscardedConstants(context,item);
@@ -1602,13 +1692,13 @@ pub fn Binder(comptime config: types.Config) type {
             }
             if (n.kind == .case_expr) {
                 try validateDiscardedConstants(context, n.a);
-                const known_operand = n.a == none or foldableScalar(context, n.a);
+                const known_operand = n.a == none or (try foldableScalar(context, n.a));
                 const operand = if (n.a != none and known_operand) try E.eval(&eval_context, n.a) else V.Cell.null_value;
                 var arm = n.b;
                 while (arm != none) : (arm = context.node(arm).next) {
                     const entry = context.node(arm);
                     try validateDiscardedConstants(context, entry.a);
-                    if (known_operand and foldableScalar(context, entry.a)) {
+                    if (known_operand and (try foldableScalar(context, entry.a))) {
                         const candidate = try E.eval(&eval_context, entry.a);
                         const matches = if (n.a == none) candidate == .boolean and candidate.boolean else E.compareOp(.eq, &operand, &candidate) == true;
                         if (!matches) continue;
@@ -1623,7 +1713,7 @@ pub fn Binder(comptime config: types.Config) type {
                 var item = n.b;
                 while (item != none) : (item = context.node(item).next) {
                     try validateDiscardedConstants(context, item);
-                    if (foldableScalar(context, item) and (try E.eval(&eval_context, item)) != .null_value) return;
+                    if ((try foldableScalar(context, item)) and (try E.eval(&eval_context, item)) != .null_value) return;
                 }
                 return;
             }
@@ -3074,7 +3164,7 @@ pub fn Binder(comptime config: types.Config) type {
                     rel.name = plans.ctes[cte].name;
                     source.cte = cte;
                     source.plan = rel.plan;
-                    plans.ctes[cte].referenced = true;
+                    plans.ctes[cte].referenced = true;plans.ctes[cte].references+=1;
                     if (plans.items[rel.plan].correlated) plans.items[id].correlated = true;
                 } else if (viewOf(context, item.schema, item.name)) |view| {
                     rel.view = view;
@@ -3132,24 +3222,41 @@ pub fn Binder(comptime config: types.Config) type {
             for (q.order[0..q.order_count], 0..) |*key, index| order_refs[index] = try orderRef(context, &scope, p, key.expr);
             var on_refs: [config.columns]OrderRef = undefined;
             for (q.distinct_on[0..q.distinct_on_count], 0..) |expr_id, index| on_refs[index] = try orderRef(context, &scope, p, expr_id);
-            if(context.pool.planned_nulls) {
+            // Preserve diagnostics before lowering, separately for each output.
+            // Child plans are validated later, after output demand is known.
+            if(!context.describe_only) {
+                var planning=context.*;planning.planning_plan=p;
+                const constant_context=&planning;
+                for(p.constant_outputs[0..p.width]) |*cell| cell.*=.null_value;
                 var state:PlannedValidation=.{};
                 var pending:?Error=null;
-                validatePlannedPlan(context,&state,id) catch |err| {pending=err;};
+                for(p.targets[0..p.width],0..) |target,column| {
+                    p.prunable[column]=immutableGenerated(context,target);
+                    planning.constant_dependencies=&p.constant_dependencies[column];
+                    validateDiscardedConstants(constant_context,target) catch |err| {if(planningControlError(err)) return err;p.planned_targets[column]=err;};
+                    if(p.planned_targets[column]==null) {
+                        if(p.prunable[column] and (try foldableScalar(constant_context,target))) {
+                            if(generatedValue(constant_context,target)) |value_cell| {p.constant_outputs[column]=value_cell;p.constant_known[column]=true;}
+                            else |err| {if(planningControlError(err)) return err;p.planned_targets[column]=err;}
+                        } else if(p.prunable[column] and context.node(target).planned_null) {p.constant_known[column]=true;p.constant_dependencies[column]=@splat(false);}
+                    }
+                    planning.constant_dependencies=null;
+                    validatePlannedWindowTree(constant_context,&state,target) catch |err| {if(planningControlError(err)) return err;if(pending==null) pending=err;};
+                }
+                for([_]u16{p.where,p.having}) |expression| validateDiscardedConstants(constant_context,expression) catch |err| {if(planningControlError(err)) return err;if(pending==null) pending=err;};
+                for(p.keys[0..p.key_count]) |expression| validateDiscardedConstants(constant_context,expression) catch |err| {if(planningControlError(err)) return err;if(pending==null) pending=err;};
+                for(p.sources[0..p.source_count]) |source| validateDiscardedConstants(constant_context,source.on) catch |err| {if(planningControlError(err)) return err;if(pending==null) pending=err;};
                 for(order_refs[0..q.order_count]) |ref| if(ref==.expr) {
-                    validatePlannedNullTree(context,&state,ref.expr) catch |err| {if(pending==null) pending=err;};
-                    validatePlannedWindowTree(context,&state,ref.expr) catch |err| {if(pending==null) pending=err;};
+                    validateDiscardedConstants(constant_context,ref.expr) catch |err| {if(planningControlError(err)) return err;if(pending==null) pending=err;};
+                    validatePlannedWindowTree(constant_context,&state,ref.expr) catch |err| {if(planningControlError(err)) return err;if(pending==null) pending=err;};
                 };
                 for(on_refs[0..q.distinct_on_count]) |ref| if(ref==.expr) {
-                    validatePlannedNullTree(context,&state,ref.expr) catch |err| {if(pending==null) pending=err;};
-                    validatePlannedWindowTree(context,&state,ref.expr) catch |err| {if(pending==null) pending=err;};
+                    validateDiscardedConstants(constant_context,ref.expr) catch |err| {if(planningControlError(err)) return err;if(pending==null) pending=err;};
+                    validatePlannedWindowTree(constant_context,&state,ref.expr) catch |err| {if(planningControlError(err)) return err;if(pending==null) pending=err;};
                 };
-                for(p.targets[0..p.width]) |target| {
-                    validatePlannedWindowTree(context,&state,target) catch |err| {if(pending==null) pending=err;};
-                }
                 window_def=q.window_defs;
                 while(window_def!=none):(window_def=context.pool.windows[window_def].next) {
-                    validatePlannedWindowSpec(context,&state,&context.pool.windows[window_def]) catch |err| {if(pending==null) pending=err;};
+                    validatePlannedWindowSpec(constant_context,&state,&context.pool.windows[window_def]) catch |err| {if(planningControlError(err)) return err;if(pending==null) pending=err;};
                 }
                 p.planned_checked=true;p.planned_error=pending;
             }
@@ -3216,6 +3323,7 @@ pub fn Binder(comptime config: types.Config) type {
                 for (order[0..order_count]) |key| appendKey(p, key);
             }
             try checkCounts(q, p);
+            p.constant_source_safe=!q.distinct and q.order_count==0 and !q.limit_present and !q.offset_present;
             try lowerWindows(context,id);
             return id;
         }
@@ -3403,6 +3511,7 @@ pub fn Binder(comptime config: types.Config) type {
             if(!active) return;
             for(p.targets[0..p.width]) |target| {if(generatedConstant(context,target)) _=try generatedValue(context,target);}
             const child=try plans.add();const input=&plans.items[child];input.*=p.*;
+            input.planned_checked=true;input.planned_error=null;input.planned_targets=@splat(null);input.constant_known=@splat(false);
             input.count=0;input.width=0;input.window_count=0;input.order_count=0;input.distinct=.none;
             input.limit=0xffffffffffffffff;input.offset=0;
             for(p.targets[0..p.width]) |*target| {
@@ -3470,9 +3579,111 @@ pub fn Binder(comptime config: types.Config) type {
                     if(bound!=.query or bound.query!=index) return error.UnsupportedStatement;
                 };
             };
-            try validateDiscardedRows(context);
-            try validatePlannedNulls(context,&bound);
+            if(context.describe_only) return bound;
+            try planOutputDemand(context,&bound);
+            try validatePlannedExpressions(context,&bound);
             return bound;
+        }
+
+        fn demandOutput(context:*const Context,plan_id:u16,column:?usize,changed:*bool) void {
+            if(plan_id==none) return;
+            const p=&plansOf(context).items[plan_id];
+            if(!p.demanded) {p.demanded=true;changed.*=true;}
+            if(column) |i| if(i<p.width and !p.required[i]) {p.required[i]=true;changed.*=true;};
+        }
+        fn demandAll(context:*const Context,plan_id:u16,changed:*bool) void {
+            if(plan_id==none) return;
+            demandOutput(context,plan_id,null,changed);
+            for(0..plansOf(context).items[plan_id].width) |i| demandOutput(context,plan_id,i,changed);
+        }
+        fn demandExpr(context:*const Context,owner:u16,id:u16,changed:*bool) Error!void {
+            if(id==none) return;
+            const n=context.node(id);
+            if(n.planned_null) return;
+            if(n.kind==.column) {
+                if(owner!=none and n.level==0) {
+                    const p=&plansOf(context).items[owner];
+                    if(n.relation<p.source_count) demandOutput(context,p.sources[n.relation].plan,n.column,changed);
+                }
+                return;
+            }
+            if(n.kind==.scalar_subquery or n.kind==.exists_subquery or n.kind==.in_subquery) {
+                demandAll(context,@intCast(n.integer),changed);
+                if(n.kind==.in_subquery) try demandExpr(context,owner,n.a,changed);
+                return;
+            }
+            if(n.kind==.case_expr) {
+                try demandExpr(context,owner,n.a,changed);
+                var known=n.a==none or (try foldableScalar(context,n.a));
+                const operand=if(n.a!=none and known) generatedValue(context,n.a) catch |err| blk:{if(planningControlError(err)) return err;known=false;break :blk V.Cell.null_value;} else V.Cell.null_value;
+                var arm=n.b;
+                while(arm!=none):(arm=context.node(arm).next) {
+                    const entry=context.node(arm);try demandExpr(context,owner,entry.a,changed);
+                    if(known and (try foldableScalar(context,entry.a))) {
+                        const candidate=generatedValue(context,entry.a) catch |err| {if(planningControlError(err)) return err;try demandExpr(context,owner,entry.b,changed);continue;};
+                        const hit=if(n.a==none) candidate==.boolean and candidate.boolean else E.compareOp(.eq,&operand,&candidate)==true;
+                        if(!hit) continue;
+                        try demandExpr(context,owner,entry.b,changed);return;
+                    }
+                    try demandExpr(context,owner,entry.b,changed);
+                }
+                return demandExpr(context,owner,n.c,changed);
+            }
+            if(n.kind==.and_op or n.kind==.or_op) {
+                try demandExpr(context,owner,n.a,changed);
+                if(constantTruth(context,n.a) catch |err| blk:{if(planningControlError(err)) return err;break :blk null;}) |v| if(v==.boolean and v.boolean==(n.kind==.or_op)) return;
+                return demandExpr(context,owner,n.b,changed);
+            }
+            if(n.kind==.coalesce) {
+                var item=n.b;while(item!=none):(item=context.node(item).next) {
+                    try demandExpr(context,owner,item,changed);
+                    if((try foldableScalar(context,item)) and (generatedValue(context,item) catch |err| blk:{if(planningControlError(err)) return err;break :blk V.Cell.null_value;})!=.null_value) return;
+                }
+                return;
+            }
+            try demandExpr(context,owner,n.a,changed);try demandExpr(context,owner,n.c,changed);
+            if(listOwner(n.kind)) {var item=n.b;while(item!=none):(item=context.node(item).next) try demandExpr(context,owner,item,changed);}
+            else try demandExpr(context,owner,n.b,changed);
+        }
+        fn planOutputDemand(context:*const Context,bound:*const Bound) Error!void {
+            const plans=context.plans orelse return;
+            // Correlation, grouping/windows and set operations retain conservative
+            // dependencies; plain derived outputs can be suppressed without changing
+            // width, column numbering, bags or row cardinality.
+            var conservative=bound.*!=.query;
+            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.correlated;
+            for(plans.items[0..plans.len]) |*p| {p.demanded=conservative;p.required=@splat(conservative);}
+            if(conservative) return;
+            var cte_references:[config.ctes]usize=@splat(0);
+            for(plans.items[0..plans.len]) |*consumer| for(consumer.sources[0..consumer.source_count]) |source| {if(source.cte!=no_cte) cte_references[source.cte]+=1;};
+            var changed=true;demandAll(context,bound.query,&changed);
+            while(changed) {
+                changed=false;try context.session.checkpoint();
+                for(plans.items[0..plans.len],0..) |*p,index| {
+                    if(!p.demanded) continue;
+                    const owner:u16=@intCast(index);
+                    if(p.set_op!=.none) {demandAll(context,p.left,&changed);demandAll(context,p.right,&changed);continue;}
+                    var planning=context.*;planning.planning_plan=p;const demand_context=&planning;
+                    const barrier=p.grouped or p.window_count!=0;
+                    for(0..p.width) |i| if(barrier or p.distinct!=.none or !p.prunable[i]) demandOutput(context,owner,i,&changed);
+                    for(p.order[0..p.order_count]) |key| demandOutput(context,owner,key.column,&changed);
+                    for(p.sources[0..p.source_count]) |source| {
+                        var materialized=false;
+                        if(source.cte!=no_cte) {
+                            materialized=cte_references[source.cte]>1 or plans.ctes[source.cte].recursive;
+                        }
+                        if(barrier or materialized) demandAll(context,source.plan,&changed) else demandOutput(context,source.plan,null,&changed);
+                        try demandExpr(demand_context,owner,source.on,&changed);
+                    }
+                    for(p.targets[0..p.width],0..) |expression,i| if(p.required[i]) try demandExpr(demand_context,owner,expression,&changed);
+                    for(p.keys[0..p.key_count]) |expression| try demandExpr(demand_context,owner,expression,&changed);
+                    for(p.aggs[0..p.agg_count]) |agg| {try demandExpr(demand_context,owner,agg.arg,&changed);try demandExpr(demand_context,owner,agg.filter,&changed);}
+                    try demandExpr(demand_context,owner,p.where,&changed);try demandExpr(demand_context,owner,p.having,&changed);
+                    for(p.windows[0..p.window_count]) |win| {
+                        for([_]u16{win.deferred_arg,win.deferred_filter,win.offset_arg,win.default_arg,win.start.offset,win.end.offset}) |expression| try demandExpr(demand_context,owner,expression,&changed);
+                    }
+                }
+            }
         }
 
         const PlannedValidation=struct { plans:[config.subqueries]bool=@splat(false) };
@@ -3481,9 +3692,9 @@ pub fn Binder(comptime config: types.Config) type {
         // unused named specification produces no WindowAgg. Its value/filter
         // arguments, in contrast, stay attached to the owning expression.
         fn validatePlannedWindowSpec(context:*const Context,seen:*PlannedValidation,spec:*const Ast.Window) Error!void {
-            for(spec.partition[0..spec.partition_count]) |id| try validatePlannedNullTree(context,seen,id);
-            for(spec.order[0..spec.order_count]) |key| try validatePlannedNullTree(context,seen,key.expr);
-            try validatePlannedNullTree(context,seen,spec.start.offset);try validatePlannedNullTree(context,seen,spec.end.offset);
+            for(spec.partition[0..spec.partition_count]) |id| try validatePlannedTree(context,seen,id);
+            for(spec.order[0..spec.order_count]) |key| try validatePlannedTree(context,seen,key.expr);
+            try validatePlannedTree(context,seen,spec.start.offset);try validatePlannedTree(context,seen,spec.end.offset);
         }
 
         fn validatePlannedWindowTree(context:*const Context,seen:*PlannedValidation,id:u16) Error!void {
@@ -3509,11 +3720,12 @@ pub fn Binder(comptime config: types.Config) type {
             return false;
         }
 
-        /// Runs after semantic binding, over live bound roots rather than
-        /// orphaned parser nodes. Only known-NULL numeric calls introduce
-        /// constant evaluation here. Reachability follows CASE/COALESCE;
-        /// runtime-NULL columns retain ordinary eager argument evaluation.
-        fn validatePlannedNullTree(context: *const Context, seen:*PlannedValidation, id: u16) Error!void {
+        /// Runs after semantic binding over live roots, preserving immutable
+        /// diagnostics and reachable scalar plans. Known-NULL calls retain
+        /// argument diagnostics without executing volatile/runtime children.
+        /// CASE/COALESCE and boolean reachability precede detached execution.
+        fn validatePlannedTree(context: *const Context, seen:*PlannedValidation, id: u16) Error!void {
+            try validateDiscardedConstants(context,id);
             if(!containsPlannedNull(context,id)) return;
             try context.session.checkpoint();
             const n=context.node(id);
@@ -3523,58 +3735,58 @@ pub fn Binder(comptime config: types.Config) type {
                 return;
             }
             if(n.kind==.scalar_subquery or n.kind==.exists_subquery or n.kind==.in_subquery) {
-                if(n.kind==.in_subquery) try validatePlannedNullTree(context,seen,n.a);
+                if(n.kind==.in_subquery) try validatePlannedTree(context,seen,n.a);
                 return validatePlannedPlan(context,seen,@intCast(n.integer));
             }
-            const eval_context:E.Context=.{.source=context.source,.pool=context.pool,.session=context.session};
+            const eval_context=planningEvalContext(context);
             if(n.kind==.case_expr) {
-                try validatePlannedNullTree(context,seen,n.a);
-                const known=n.a==none or foldableScalar(context,n.a);
+                try validatePlannedTree(context,seen,n.a);
+                const known=n.a==none or (try foldableScalar(context,n.a));
                 const operand=if(n.a!=none and known) try E.eval(&eval_context,n.a) else V.Cell.null_value;
                 var arm=n.b;
                 while(arm!=none):(arm=context.node(arm).next) {
                     const entry=context.node(arm);
-                    try validatePlannedNullTree(context,seen,entry.a);
-                    if(known and foldableScalar(context,entry.a)) {
+                    try validatePlannedTree(context,seen,entry.a);
+                    if(known and (try foldableScalar(context,entry.a))) {
                         const candidate=try E.eval(&eval_context,entry.a);
                         const hit=if(n.a==none) candidate==.boolean and candidate.boolean else E.compareOp(.eq,&operand,&candidate)==true;
                         if(!hit) continue;
-                        try validatePlannedNullTree(context,seen,entry.b);return;
+                        try validatePlannedTree(context,seen,entry.b);return;
                     }
-                    try validatePlannedNullTree(context,seen,entry.b);
+                    try validatePlannedTree(context,seen,entry.b);
                 }
-                return validatePlannedNullTree(context,seen,n.c);
+                return validatePlannedTree(context,seen,n.c);
             }
             if(n.kind==.coalesce) {
                 var item=n.b;
                 while(item!=none):(item=context.node(item).next) {
-                    try validatePlannedNullTree(context,seen,item);
-                    if(foldableScalar(context,item) and (try E.eval(&eval_context,item))!=.null_value) return;
+                    try validatePlannedTree(context,seen,item);
+                    if((try foldableScalar(context,item)) and (try E.eval(&eval_context,item))!=.null_value) return;
                 }
                 return;
             }
-            try validatePlannedNullTree(context,seen,n.a);try validatePlannedNullTree(context,seen,n.c);
+            try validatePlannedTree(context,seen,n.a);try validatePlannedTree(context,seen,n.c);
             if(listOwner(n.kind)) {
                 var item=n.b;
-                while(item!=none):(item=context.node(item).next) try validatePlannedNullTree(context,seen,item);
-            } else try validatePlannedNullTree(context,seen,n.b);
+                while(item!=none):(item=context.node(item).next) try validatePlannedTree(context,seen,item);
+            } else try validatePlannedTree(context,seen,n.b);
         }
 
         fn validatePlannedReturning(context:*const Context,seen:*PlannedValidation, returning:*const Returning) Error!void {
-            for(returning.targets[0..returning.count]) |target| try validatePlannedNullTree(context,seen,target);
+            for(returning.targets[0..returning.count]) |target| try validatePlannedTree(context,seen,target);
         }
 
         fn validatePlannedStored(context:*const Context,seen:*PlannedValidation, table:usize, ids:*const [config.columns]u16) Error!void {
             for(ids,0..) |id,column| if(id!=none) {
                 var sub=context.*;
                 sub.source=context.tables[table].columns[column].expression.slice();
-                try validatePlannedNullTree(&sub,seen,id);
+                try validatePlannedTree(&sub,seen,id);
             };
         }
 
         fn validatePlannedUpdate(context:*const Context,seen:*PlannedValidation, update:*const Update) Error!void {
-            for(update.values) |id| try validatePlannedNullTree(context,seen,id);
-            try validatePlannedNullTree(context,seen,update.where);
+            for(update.values) |id| try validatePlannedTree(context,seen,id);
+            try validatePlannedTree(context,seen,update.where);
             try validatePlannedStored(context,seen,update.table,&update.defaults);
             try validatePlannedStored(context,seen,update.table,&update.generated);
             try validatePlannedReturning(context,seen,&update.returning);
@@ -3584,38 +3796,44 @@ pub fn Binder(comptime config: types.Config) type {
             if(plan_id==none or seen.plans[plan_id]) return;
             seen.plans[plan_id]=true;
             const p=&plansOf(context).items[plan_id];
+            if(!p.demanded) return;
+            var planning=context.*;planning.planning_plan=p;const constant_context=&planning;
             if(p.planned_checked) {
+                // CTE materialization is known only after all consumers bind.
+                // Plain target trees remain intact, so refresh these diagnostics
+                // before clauses while keeping original pre-lowering group/window errors.
+                if(!p.grouped and p.window_count==0) for(p.targets[0..p.width],0..) |id,column| if(p.required[column]) try validateDiscardedConstants(constant_context,id);
+                for(p.planned_targets[0..p.width],0..) |pending,column| if(p.required[column]) {if(pending) |err| return err;};
                 if(p.planned_error) |err| return err;
-                return;
             }
             try validatePlannedPlan(context,seen,p.left);try validatePlannedPlan(context,seen,p.right);
+            if(p.set_op!=.none) return;
             for(p.sources[0..p.source_count]) |source| try validatePlannedPlan(context,seen,source.plan);
-            for(p.targets[0..p.width]) |id| try validatePlannedNullTree(context,seen,id);
-            for(p.keys[0..p.key_count]) |id| try validatePlannedNullTree(context,seen,id);
-            for(p.aggs[0..p.agg_count]) |agg| {try validatePlannedNullTree(context,seen,agg.arg);try validatePlannedNullTree(context,seen,agg.filter);}
-            for(p.sources[0..p.source_count]) |source| try validatePlannedNullTree(context,seen,source.on);
-            try validatePlannedNullTree(context,seen,p.where);try validatePlannedNullTree(context,seen,p.having);
-            for(p.windows[0..p.window_count]) |win| {
-                for([_]u16{win.deferred_arg,win.deferred_filter,win.offset_arg,win.default_arg,win.start.offset,win.end.offset}) |id| try validatePlannedNullTree(context,seen,id);
-            }
+            for(p.targets[0..p.width],0..) |id,column| if(p.required[column]) try validatePlannedTree(constant_context,seen,id);
+            for(p.keys[0..p.key_count]) |id| try validatePlannedTree(constant_context,seen,id);
+            if(!p.planned_checked) for(p.aggs[0..p.agg_count]) |agg| {try validatePlannedTree(constant_context,seen,agg.arg);try validatePlannedTree(constant_context,seen,agg.filter);};
+            for(p.sources[0..p.source_count]) |source| try validatePlannedTree(constant_context,seen,source.on);
+            try validatePlannedTree(constant_context,seen,p.where);try validatePlannedTree(constant_context,seen,p.having);
+            if(!p.planned_checked) for(p.windows[0..p.window_count]) |win| {
+                for([_]u16{win.deferred_arg,win.deferred_filter,win.offset_arg,win.default_arg,win.start.offset,win.end.offset}) |id| try validatePlannedTree(constant_context,seen,id);
+            };
         }
 
-        fn validatePlannedNulls(context:*const Context, bound:*const Bound) Error!void {
-            if(!context.pool.planned_nulls) return;
+        fn validatePlannedExpressions(context:*const Context, bound:*const Bound) Error!void {
             var state:PlannedValidation=.{};const seen=&state;
             switch(bound.*) {
                 .query=>|root| try validatePlannedPlan(context,seen,root),
                 .select=>|*select| {
-                    for(select.targets[0..select.count]) |id| try validatePlannedNullTree(context,seen,id);
-                    for(select.order[0..select.order_count]) |key| try validatePlannedNullTree(context,seen,key.expr);
-                    try validatePlannedNullTree(context,seen,select.where);
+                    for(select.targets[0..select.count]) |id| try validatePlannedTree(context,seen,id);
+                    for(select.order[0..select.order_count]) |key| try validatePlannedTree(context,seen,key.expr);
+                    try validatePlannedTree(context,seen,select.where);
                 },
                 .insert=>|*insert| {
                     try validatePlannedPlan(context,seen,insert.plan);
                     var row=insert.rows;
                     while(row!=none):(row=context.node(row).next) {
                         var item=context.node(row).b;
-                        while(item!=none):(item=context.node(item).next) try validatePlannedNullTree(context,seen,item);
+                        while(item!=none):(item=context.node(item).next) try validatePlannedTree(context,seen,item);
                     }
                     try validatePlannedStored(context,seen,insert.table,&insert.defaults);
                     try validatePlannedStored(context,seen,insert.table,&insert.generated);
@@ -3623,7 +3841,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try validatePlannedReturning(context,seen,&insert.returning);
                 },
                 .update=>|*update| try validatePlannedUpdate(context,seen,update),
-                .delete=>|*delete| {try validatePlannedNullTree(context,seen,delete.where);try validatePlannedReturning(context,seen,&delete.returning);},
+                .delete=>|*delete| {try validatePlannedTree(context,seen,delete.where);try validatePlannedReturning(context,seen,&delete.returning);},
                 else=>{},
             }
         }

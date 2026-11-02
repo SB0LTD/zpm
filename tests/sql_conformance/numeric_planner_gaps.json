@@ -1,5 +1,5 @@
 {
-  "scope": "Open planner follow-ups; excluded from the implemented numeric slice, not passing gates",
+  "scope": "Concrete examples repaired in candidate; hosted qualification and independent final review remain pending. Historical baseline observations retained.",
   "cases": [
     {
       "id": "PG.PLANNER.UNUSED_DERIVED_NUMERIC",
@@ -12,10 +12,21 @@
         ],
         "sqlstate": "00000"
       },
-      "candidate": {
+      "needed": "Propagate required output columns into derived plans and prune unused immutable projections before constant validation; preserve volatile semantics and grouping/window dependencies.",
+      "baseline_candidate": {
         "sqlstate": "22012"
       },
-      "needed": "Propagate required output columns into derived plans and prune unused immutable projections before constant validation; preserve volatile semantics and grouping/window dependencies."
+      "status": "candidate_fixed_concrete_case",
+      "candidate_observation": {
+        "sqlstate": "00000",
+        "rows": [
+          [
+            "7"
+          ]
+        ]
+      },
+      "evidence": "tests/test_sql_planner_demand.sig; tests/fixtures/planner_demand_pg16.json",
+      "remaining": "General planner parity is not closed; aggregate/window output-state, scalar-subquery projection, correlation and broader pull-up remain open."
     }
   ]
 }

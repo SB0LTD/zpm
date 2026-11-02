@@ -998,15 +998,15 @@ pub fn Parser(comptime config: types.Config) type {
             var offset_seen = false;
             while (true) {
                 if (!limited and try self.takeWord("LIMIT")) {
-                    limited = true;
+                    limited = true;block.limit_present=true;
                     if (!(try self.takeWord("ALL")) and !(try self.takeWord("NULL"))) try self.countValue(&block.limit, &block.negative_limit);
                 } else if (!offset_seen and self.mode == .standard and try self.takeWord("OFFSET")) {
-                    offset_seen = true;
+                    offset_seen = true;block.offset_present=true;
                     self.pool.complex = true;
                     try self.countValue(&block.offset, &block.negative_offset);
                     _ = (try self.takeWord("ROW")) or (try self.takeWord("ROWS"));
                 } else if (!limited and self.mode == .standard and try self.takeWord("FETCH")) {
-                    limited = true;
+                    limited = true;block.limit_present=true;
                     if (!(try self.takeWord("FIRST"))) try self.expectWord("NEXT");
                     block.limit = 1;
                     if (self.current.kind == .integer or self.isSymbol(.minus) or self.isSymbol(.lparen) or self.current.kind == .decimal) try self.countValue(&block.limit, &block.negative_limit);
