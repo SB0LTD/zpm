@@ -8,12 +8,18 @@
 //! the emulator in tests).
 //!
 //! Memory is the caller's device's, allocated once by `init` (no allocator
-//! in sight afterwards): the model file, the f16 KV cache and the conv
-//! state, activations for `max_batch` tokens, kernel code and the command
-//! stream. The KV cache and conv state keep lfm3_executor's layout, and
-//! `source()` maps the model file in the GPU's memory: a host can run the
-//! CPU executor on the very same state (cpuCache()) when the GPU fails,
-//! after restoreConv() undoes a half-run call's convolution state.
+//! in sight afterwards): the model file, activations for `max_batch`
+//! tokens, kernel code and the command stream. Each sequence's state is a
+//! `Cache` the host makes with newCache (one per slot): the f16 KV cache and
+//! the conv state in lfm3_executor's layout, in device memory the CPU maps
+//! too, with the executor's view of it (`Cache.cpu`). With `source()` (the
+//! model file in the GPU's memory) a host runs the CPU executor on the very
+//! same state when the GPU fails (toCpu first), or for a call the GPU does
+//! not take (error.LongContext).
+//!
+//! Between calls the conv state is the CPU's (a host keeps checkpoints of
+//! it, as galaxy-think does): each call hands it to the GPU and fetches it
+//! back. The KV cache is the GPU's until toCpu hands it over.
 
 const std = @import("std");
 const gguf = @import("gguf");
@@ -37,20 +43,27 @@ pub const Error = error{
     ContextCapacity,
     InvalidToken,
     StreamFull,
-    /// The GPU did not finish the call (it hung or faulted): the
-    /// host should run the call on the CPU (restoreConv first).
+    /// The GPU did not finish the call (it hung or faulted): the cache is
+    /// as it was before it, and the host runs the call on the CPU (toCpu
+    /// first).
     DeviceLost,
+    /// The call's attention would reach further back than the GPU's
+    /// kernel does (kernels.MAX_ATTENTION_SPAN positions): the host runs it
+    /// on the CPU (toCpu first).
+    LongContext,
 } || adreno.device.Error || ir3_asm.Error || a7xx.Error || executor.Error;
 
 pub const Options = struct {
     max_batch: u32 = 64,
-    context: u32 = 4096,
     /// How long one call may take on the GPU before it counts as slow (it
     /// is waited for still: see `finish`).
     timeout_us: u64 = 10_000_000,
 };
 
 const MATRIX_VARIANTS = kernels.MAX_TOKENS;
+/// The most positions an attention layer reads on the GPU (a call reaching
+/// further back is error.LongContext: the CPU's).
+pub const MAX_ATTENTION_SPAN = kernels.MAX_ATTENTION_SPAN;
 
 /// The assembled kernels and where their code lives.
 const Kernels = struct {
@@ -95,6 +108,18 @@ const Scratch = struct {
     rope_swa: Buffer = .{},
 };
 
+/// A sequence's state on the GPU: the KV cache and conv state in
+/// lfm3_executor's layout, in device memory the CPU maps too. `cpu` is the
+/// executor's view of it (its slices are kv's and conv's CPU views).
+pub const Cache = struct {
+    cpu: executor.Cache,
+    kv: Buffer,
+    conv: Buffer,
+    /// The CPU holds the KV rows (toCpu): they go to the GPU before its next
+    /// call on this cache.
+    kv_on_cpu: bool = false,
+};
+
 pub fn Backend(comptime tensor_capacity: usize) type {
     return struct {
         const Self = @This();
@@ -105,16 +130,13 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         index: *const gguf.Index(tensor_capacity),
         model: Buffer,
         model_size: u64,
-        kv: Buffer,
-        conv: Buffer,
+        /// The conv state as a call found it (the CPU's only): put back when
+        /// the call fails, the GPU having written part of it.
         conv_snapshot: Buffer,
         s: Scratch = .{},
         k: Kernels = .{},
         code: Buffer,
         ib: Buffer,
-        /// The CPU wrote the KV/conv state last (a CPU fallback): it goes to
-        /// the GPU before the next GPU call.
-        cpu_dirty: bool = false,
         /// GPU calls that did not finish (each one fell back to the CPU), and
         /// why the last one did not.
         lost: u32 = 0,
@@ -133,8 +155,6 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 .index = index,
                 .model = try dev.alloc(@intCast(file.size)),
                 .model_size = file.size,
-                .kv = try dev.alloc(try executor.requiredKvElements(plan, options.context) * 2),
-                .conv = try dev.alloc(@max(try executor.requiredConvElements(plan), 1) * 4),
                 .conv_snapshot = try dev.alloc(@max(try executor.requiredConvElements(plan), 1) * 4),
                 .code = try dev.alloc(256 * 1024),
                 .ib = try dev.alloc(1 << 20),
@@ -147,10 +167,6 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 at += n;
             }
             dev.toDevice(self.model, 0, @intCast(file.size));
-            @memset(self.kv.cpu, 0);
-            @memset(self.conv.cpu, 0);
-            dev.toDevice(self.kv, 0, self.kv.cpu.len);
-            dev.toDevice(self.conv, 0, self.conv.cpu.len);
             try self.allocScratch();
             try self.assemble(work);
             return self;
@@ -235,28 +251,33 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             return p;
         }
 
-        /// The KV cache and conv state, in the executor's layout, for the CPU.
-        pub fn cpuCache(self: *Self, position: usize) executor.Cache {
-            const kv: []u16 = @alignCast(std.mem.bytesAsSlice(u16, self.kv.cpu));
-            const conv: []f32 = @alignCast(std.mem.bytesAsSlice(f32, self.conv.cpu));
-            const kv_n = executor.requiredKvElements(self.plan, self.options.context) catch 0;
-            const conv_n = executor.requiredConvElements(self.plan) catch 0;
-            return .{ .kv = kv[0..kv_n], .conv = conv[0..conv_n], .context = self.options.context, .position = position };
+        /// A sequence's state for `context` positions, zeroed (position 0).
+        pub fn newCache(self: *Self, context: u32) Error!Cache {
+            const kv_n = try executor.requiredKvElements(self.plan, context);
+            const conv_n = try executor.requiredConvElements(self.plan);
+            const kv = try self.dev.alloc(kv_n * 2);
+            errdefer self.dev.free(kv);
+            const conv = try self.dev.alloc(@max(conv_n, 1) * 4);
+            @memset(kv.cpu, 0);
+            @memset(conv.cpu, 0);
+            self.dev.toDevice(kv, 0, kv.cpu.len);
+            self.dev.toDevice(conv, 0, conv.cpu.len);
+            const kv_view: []u16 = @alignCast(std.mem.bytesAsSlice(u16, kv.cpu));
+            const conv_view: []f32 = @alignCast(std.mem.bytesAsSlice(f32, conv.cpu));
+            return .{ .cpu = .{ .kv = kv_view[0..kv_n], .conv = conv_view[0..conv_n], .context = context }, .kv = kv, .conv = conv };
         }
 
-        /// Hand the state to the CPU (call before running the CPU executor
-        /// on cpuCache()); the next GPU call takes it back.
-        pub fn toCpu(self: *Self) void {
-            self.dev.fromDevice(self.kv, 0, self.kv.cpu.len);
-            self.dev.fromDevice(self.conv, 0, self.conv.cpu.len);
-            self.cpu_dirty = true;
+        pub fn freeCache(self: *Self, c: *Cache) void {
+            self.dev.free(c.kv);
+            self.dev.free(c.conv);
+            c.* = undefined;
         }
 
-        /// Undo what a failed GPU call did to the convolution state (KV rows
-        /// past the cache position are simply written again).
-        pub fn restoreConv(self: *Self) void {
-            @memcpy(self.conv.cpu, self.conv_snapshot.cpu);
-            self.dev.toDevice(self.conv, 0, self.conv.cpu.len);
+        /// Hand the cache to the CPU: call before running the CPU executor on
+        /// c.cpu. The next GPU call on it takes the KV rows back.
+        pub fn toCpu(self: *Self, c: *Cache) void {
+            self.dev.fromDevice(c.kv, 0, c.kv.cpu.len);
+            c.kv_on_cpu = true;
         }
 
         /// After the last call with Output.hidden or .logits: the output-normed
@@ -274,9 +295,10 @@ pub fn Backend(comptime tensor_capacity: usize) type {
 
         /// Run `input` at the cache's next positions (as the CPU's
         /// forwardInput) and advance it. With Output.logits, the greedy
-        /// token. error.DeviceLost: the GPU did not finish; the cache is not
-        /// advanced and restoreConv() + the CPU can redo the call.
-        pub fn forward(self: *Self, cache: *executor.Cache, input: executor.Input, output: executor.Output) Error!?u32 {
+        /// token. error.DeviceLost or error.LongContext: the cache is as it
+        /// was, and toCpu() + the CPU executor can do the call.
+        pub fn forward(self: *Self, c: *Cache, input: executor.Input, output: executor.Output) Error!?u32 {
+            const cache = &c.cpu;
             const plan = self.plan;
             const h: usize = plan.hidden_size;
             const count: usize = switch (input) {
@@ -284,16 +306,17 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 .embeddings => |e| e.len / h,
             };
             if (count == 0 or count > self.options.max_batch) return error.BatchCapacity;
-            if (cache.position + count > self.options.context) return error.ContextCapacity;
-            // State from a CPU fallback goes back to the GPU; the conv state is
-            // kept so a failed call can be undone.
-            if (self.cpu_dirty) {
-                self.dev.toDevice(self.kv, 0, self.kv.cpu.len);
-                self.dev.toDevice(self.conv, 0, self.conv.cpu.len);
-                self.cpu_dirty = false;
+            if (cache.position + count > cache.context) return error.ContextCapacity;
+            if (self.span(cache.position + count) > kernels.MAX_ATTENTION_SPAN) return error.LongContext;
+            // KV rows from a CPU fallback, and the CPU's conv state, to the GPU;
+            // the conv state kept so a failed call can be undone.
+            if (c.kv_on_cpu) {
+                self.dev.toDevice(c.kv, 0, c.kv.cpu.len);
+                c.kv_on_cpu = false;
             }
-            self.dev.fromDevice(self.conv, 0, self.conv.cpu.len);
-            @memcpy(self.conv_snapshot.cpu, self.conv.cpu);
+            const conv_bytes = cache.conv.len * 4;
+            self.dev.toDevice(c.conv, 0, conv_bytes);
+            @memcpy(self.conv_snapshot.cpu[0..conv_bytes], c.conv.cpu[0..conv_bytes]);
             // Inputs: token rows dequantized here (one row each), or given rows.
             const hid: []f32 = @alignCast(std.mem.bytesAsSlice(f32, self.s.hidden.cpu));
             switch (input) {
@@ -320,7 +343,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
 
             var st = a7xx.Stream{ .buf = self.ib.words() };
             st.computeSetup();
-            for (plan.layers[0..plan.layer_count]) |*l| try self.layer(&st, l, cache.position, count);
+            for (plan.layers[0..plan.layer_count]) |*l| try self.layer(&st, l, c, count);
             if (output != .none) {
                 // the last position's output norm (and its quantization)
                 try self.normQuant(&st, self.s.hidden.va + (count - 1) * h * 4, plan.output_norm, 1);
@@ -330,8 +353,9 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             st.waitForIdle();
             st.check() catch return error.StreamFull;
             self.dev.toDevice(self.ib, 0, st.len * 4);
-            const fence = self.dev.submit(self.ib, @intCast(st.len)) catch |e| return self.failed(e);
-            self.finish(fence) catch |e| return self.failed(e);
+            const fence = self.dev.submit(self.ib, @intCast(st.len)) catch |e| return self.failed(c, e);
+            self.finish(fence) catch |e| return self.failed(c, e);
+            self.dev.fromDevice(c.conv, 0, conv_bytes);
             cache.position += count;
             if (output == .none) return null;
             self.dev.fromDevice(self.s.normalized, 0, h * 4);
@@ -354,14 +378,31 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             };
         }
 
-        fn failed(self: *Self, e: adreno.device.Error) Error {
+        /// A call that did not finish: its conv state put back (the GPU may
+        /// have written part of it; KV rows past the position are written
+        /// again by the next call).
+        fn failed(self: *Self, c: *Cache, e: adreno.device.Error) Error {
             self.lost += 1;
             self.last_failure = e;
+            const n = c.cpu.conv.len * 4;
+            @memcpy(c.conv.cpu[0..n], self.conv_snapshot.cpu[0..n]);
             return error.DeviceLost;
         }
 
-        fn layer(self: *Self, st: *a7xx.Stream, l: *const lfm3.Layer, position: usize, count: usize) Error!void {
+        /// The most positions one attention layer reads for a call that
+        /// ends at `end`.
+        fn span(self: *const Self, end: usize) usize {
+            var most: usize = 0;
+            for (self.plan.layers[0..self.plan.layer_count]) |*l| {
+                if (l.kind != .attention) continue;
+                most = @max(most, if (l.sliding_window) @min(end, self.plan.sliding_window) else end);
+            }
+            return most;
+        }
+
+        fn layer(self: *Self, st: *a7xx.Stream, l: *const lfm3.Layer, c: *const Cache, count: usize) Error!void {
             const plan = self.plan;
+            const position = c.cpu.position;
             const h: u32 = plan.hidden_size;
             const n: u32 = @intCast(count);
             try self.normQuant(st, self.s.hidden.va, l.attn_norm, n);
@@ -369,7 +410,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 .short_conv => {
                     try self.linear(st, l.in_proj, n, self.s.mixed.va);
                     const taps = try self.tensorAddress(l.conv);
-                    const state = self.conv.va + @as(u64, l.slot) * (plan.conv_kernel - 1) * h * 4;
+                    const state = c.conv.va + @as(u64, l.slot) * (plan.conv_kernel - 1) * h * 4;
                     try st.program(&self.k.conv, self.k.conv_va);
                     st.constants(0, &(kernels.ConvConsts{ .mixed = self.s.mixed.va, .taps = taps, .state = state, .out = self.s.mixer.va, .hidden = h, .tokens = n }).dwords());
                     st.dispatch(&self.k.conv, .{ h / 64, 1, 1 });
@@ -393,11 +434,11 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                         .rope = if (l.sliding_window) self.s.rope_swa.va else self.s.rope_full.va,
                         .gate = self.s.gate.va,
                         .out = self.s.mixer.va,
-                        .kv = self.kv.va,
+                        .kv = c.kv.va,
                         .heads = plan.head_count,
                         .kv_heads = l.kv_head_count,
                         .head_size = hd,
-                        .context = self.options.context,
+                        .context = @intCast(c.cpu.context),
                         .slot = l.slot,
                         .max_kv_heads = plan.max_kv_head_count,
                         .first_position = @intCast(position),
@@ -521,7 +562,6 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             if (plan.attention_layer_count > 0 and plan.head_size != 128) return error.Unsupported;
             if (plan.conv_layer_count > 0 and (plan.conv_kernel < 2 or plan.conv_kernel > 8)) return error.Unsupported;
             if (plan.attention_layer_count > 0 and (plan.head_count % @max(plan.max_kv_head_count, 1) != 0)) return error.Unsupported;
-            if (options.context > kernels.MAX_ATTENTION_SPAN) return error.Unsupported;
             if (options.max_batch == 0 or options.max_batch > 64) return error.Unsupported;
             if (!plan.output.present()) return error.Unsupported;
             for (index.tensors[0..index.tensor_count]) |*t| {

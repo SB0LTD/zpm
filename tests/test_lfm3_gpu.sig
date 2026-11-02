@@ -2,7 +2,8 @@
 //! model (short conv, full attention, short conv, sliding attention, with
 //! sandwich norms), run on the emulated Adreno: a prompt longer than one
 //! matrix pass, then decode steps; logits compared at every step. Then the
-//! CPU executor takes over from the GPU's own state (the fallback path).
+//! CPU executor takes over from the GPU's own state (the fallback path), a
+//! failed call is undone, a slow one waited out, two caches kept apart.
 
 const std = @import("std");
 const gguf = @import("gguf");
@@ -188,13 +189,13 @@ test "the GPU backend follows the CPU executor, and the CPU takes over from its 
     const plan = &fixture.plan;
     const src = fixture.source();
     emu = .{ .arena = &arena, .gpu_view = &gpu_view };
-    var backend = try Backend.init(emu.device(), plan, &fixture.index, src, .{ .max_batch = 16, .context = CONTEXT }, &asm_work);
-    var gcache = backend.cpuCache(0);
-    var ccache = executor.Cache{ .kv = &kv_cpu, .conv = &conv_cpu, .context = CONTEXT };
+    var backend = try Backend.init(emu.device(), plan, &fixture.index, src, .{ .max_batch = 16 }, &asm_work);
+    var gc = try backend.newCache(CONTEXT);
+    var ccache = cpuCache();
     // A prompt of 11 (two matrix passes), then decode steps fed the CPU's tokens.
     const prompt = [_]u32{ 1, 5, 2, 7, 3, 9, 4, 4, 11, 0, 6 };
     var token = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &work, &ccache, .{ .tokens = &prompt }, .logits, .{})).?;
-    const gtok = (backend.forward(&gcache, .{ .tokens = &prompt }, .logits) catch |e| {
+    const gtok = (backend.forward(&gc, .{ .tokens = &prompt }, .logits) catch |e| {
         std.debug.print("GPU forward: {s} ({s})\n", .{ @errorName(e), if (emu.last_error) |x| @errorName(x) else "-" });
         return e;
     }).?;
@@ -202,23 +203,121 @@ test "the GPU backend follows the CPU executor, and the CPU takes over from its 
     try std.testing.expectEqual(token, gtok);
     for (1..8) |step| {
         const next = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &work, &ccache, .{ .tokens = &.{token} }, .logits, .{})).?;
-        const gnext = (try backend.forward(&gcache, .{ .tokens = &.{token} }, .logits)).?;
+        const gnext = (try backend.forward(&gc, .{ .tokens = &.{token} }, .logits)).?;
         worst = @max(worst, try compare(step, work.logits[0..VOCAB], backend.logits()));
         try std.testing.expectEqual(next, gnext);
         token = next;
     }
-    try std.testing.expectEqual(ccache.position, gcache.position);
+    try std.testing.expectEqual(ccache.position, gc.cpu.position);
     // The CPU continues on the GPU's own state (model, KV, conv) and agrees.
-    backend.toCpu();
-    const cpu_on_gpu_state = (try executor.forwardInput(CAPACITY, LIMITS, backend.source(), &fixture.index, plan, &unpacked, &work, &gcache, .{ .tokens = &.{token} }, .logits, .{})).?;
+    backend.toCpu(&gc);
+    const cpu_on_gpu_state = (try executor.forwardInput(CAPACITY, LIMITS, backend.source(), &fixture.index, plan, &unpacked, &work, &gc.cpu, .{ .tokens = &.{token} }, .logits, .{})).?;
     var logits_a: [VOCAB]f32 = undefined;
     @memcpy(&logits_a, work.logits[0..VOCAB]);
     const cpu_alone = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &work, &ccache, .{ .tokens = &.{token} }, .logits, .{})).?;
     try std.testing.expectEqual(cpu_alone, cpu_on_gpu_state);
     worst = @max(worst, try compare(99, work.logits[0..VOCAB], &logits_a));
     // And the GPU picks up again after the CPU step.
-    const gagain = (try backend.forward(&gcache, .{ .tokens = &.{cpu_alone} }, .logits)).?;
+    const gagain = (try backend.forward(&gc, .{ .tokens = &.{cpu_alone} }, .logits)).?;
     const cagain = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &work, &ccache, .{ .tokens = &.{cpu_alone} }, .logits, .{})).?;
     try std.testing.expectEqual(cagain, gagain);
     std.debug.print("GPU vs CPU logits: worst relative difference {e} over {d} steps\n", .{ worst, 10 });
+}
+
+/// The CPU executor's own cache (zeroed).
+fn cpuCache() executor.Cache {
+    @memset(&kv_cpu, 0);
+    @memset(&conv_cpu, 0);
+    return .{ .kv = &kv_cpu, .conv = &conv_cpu, .context = CONTEXT };
+}
+
+/// The emulated GPU, whose next wait fails (or runs out) when asked.
+const Flaky = struct {
+    inner: adreno.device.Device,
+    fail: ?adreno.device.Error = null,
+
+    fn device(f: *Flaky) adreno.device.Device {
+        return .{ .ctx = f, .vtable = &vtable };
+    }
+    const vtable = adreno.device.Device.VTable{ .alloc = alloc, .free = free, .submit = submit, .wait = wait, .toDevice = toDevice, .fromDevice = fromDevice };
+    fn of(ctx: *anyopaque) *Flaky {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn alloc(ctx: *anyopaque, size: usize) ?adreno.device.Buffer {
+        return of(ctx).inner.alloc(size) catch null;
+    }
+    fn free(ctx: *anyopaque, b: adreno.device.Buffer) void {
+        of(ctx).inner.free(b);
+    }
+    fn submit(ctx: *anyopaque, ib: adreno.device.Buffer, dwords: u32) adreno.device.Error!adreno.device.Fence {
+        return of(ctx).inner.submit(ib, dwords);
+    }
+    fn wait(ctx: *anyopaque, f: adreno.device.Fence, timeout_us: u64) adreno.device.Error!void {
+        const s = of(ctx);
+        if (s.fail) |e| {
+            s.fail = null;
+            return e;
+        }
+        return s.inner.wait(f, timeout_us);
+    }
+    fn toDevice(ctx: *anyopaque, b: adreno.device.Buffer, off: usize, len: usize) void {
+        of(ctx).inner.toDevice(b, off, len);
+    }
+    fn fromDevice(ctx: *anyopaque, b: adreno.device.Buffer, off: usize, len: usize) void {
+        of(ctx).inner.fromDevice(b, off, len);
+    }
+};
+
+test "a failed GPU call leaves its cache as it was, a slow one is waited out, caches are apart, long contexts are the CPU's" {
+    try fixture.initialize();
+    const plan = &fixture.plan;
+    const src = fixture.source();
+    // (memory shared, as on the Surface: what the GPU wrote of a failed call
+    // is in the CPU's view, and must be undone)
+    emu = .{ .arena = &arena };
+    var flaky = Flaky{ .inner = emu.device() };
+    var backend = try Backend.init(flaky.device(), plan, &fixture.index, src, .{ .max_batch = 16 }, &asm_work);
+    var gc = try backend.newCache(CONTEXT);
+    var ccache = cpuCache();
+    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
+    const token = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &work, &ccache, .{ .tokens = &prompt }, .logits, .{})).?;
+    try std.testing.expectEqual(token, (try backend.forward(&gc, .{ .tokens = &prompt }, .logits)).?);
+
+    // A call that does not finish: position and conv state as before it.
+    var conv_before: [conv_cpu.len]f32 = undefined;
+    @memcpy(&conv_before, gc.cpu.conv);
+    flaky.fail = error.DeviceLost;
+    try std.testing.expectError(error.DeviceLost, backend.forward(&gc, .{ .tokens = &.{token} }, .logits));
+    try std.testing.expectEqual(prompt.len, gc.cpu.position);
+    try std.testing.expectEqualSlices(f32, &conv_before, gc.cpu.conv);
+    try std.testing.expectEqual(@as(u32, 1), backend.lost);
+    // The CPU does it on that state, as the CPU alone does.
+    backend.toCpu(&gc);
+    const on_gpu_state = (try executor.forwardInput(CAPACITY, LIMITS, backend.source(), &fixture.index, plan, &unpacked, &work, &gc.cpu, .{ .tokens = &.{token} }, .logits, .{})).?;
+    const alone = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &work, &ccache, .{ .tokens = &.{token} }, .logits, .{})).?;
+    try std.testing.expectEqual(alone, on_gpu_state);
+
+    // A call slower than the timeout: waited out, its result kept.
+    flaky.fail = error.Timeout;
+    const slow = (try backend.forward(&gc, .{ .tokens = &.{alone} }, .logits)).?;
+    const slow_cpu = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &work, &ccache, .{ .tokens = &.{alone} }, .logits, .{})).?;
+    try std.testing.expectEqual(slow_cpu, slow);
+    try std.testing.expectEqual(@as(u32, 1), backend.slow);
+    try std.testing.expectEqual(@as(u32, 1), backend.lost);
+
+    // A second cache: its prompt leaves the first one's state alone.
+    var other = try backend.newCache(CONTEXT);
+    _ = try backend.forward(&other, .{ .tokens = &.{ 7, 7, 2, 0, 1 } }, .logits);
+    const after = (try backend.forward(&gc, .{ .tokens = &.{slow} }, .logits)).?;
+    const after_cpu = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &work, &ccache, .{ .tokens = &.{slow} }, .logits, .{})).?;
+    try std.testing.expectEqual(after_cpu, after);
+    try std.testing.expectEqual(@as(usize, 5), other.cpu.position);
+
+    // Attention reaching further back than the GPU's kernel: the CPU's.
+    var long = try backend.newCache(gpu.MAX_ATTENTION_SPAN + 8);
+    long.cpu.position = gpu.MAX_ATTENTION_SPAN - 1;
+    try std.testing.expectError(error.LongContext, backend.forward(&long, .{ .tokens = &.{ 1, 2 } }, .none));
+    try std.testing.expectEqual(@as(usize, gpu.MAX_ATTENTION_SPAN - 1), long.cpu.position);
+    backend.freeCache(&long);
+    backend.freeCache(&other);
 }
