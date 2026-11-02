@@ -24,6 +24,9 @@ pub const Log = *const fn (line: []const u8) void;
 pub const Result = struct {
     passed: u32 = 0,
     failed: u32 = 0,
+    /// mad.f32 rounds once (fused, as the CPU's @mulAdd), twice, or neither
+    /// matched every case.
+    mad: enum { unknown, fused, unfused, mixed } = .unknown,
     /// Measured: GB/s reading memory, fp32 GFLOP/s (mad = 2 flops).
     read_gbps: f64 = 0,
     gflops: f64 = 0,
@@ -144,6 +147,7 @@ pub fn runAll(dev: Device, w: *Work, log: Log, bandwidth: bool) Result {
     testShfl(&c);
     testLocal(&c);
     testSfu(&c);
+    testFloat(&c);
     if (bandwidth) testBandwidth(&c);
     testAlu(&c);
     c.say("compute self-test: {d} passed, {d} failed", .{ res.passed, res.failed });
@@ -386,6 +390,92 @@ fn testSfu(c: *Ctx) void {
     c.say("compute SFU worst relative error: rcp {e:.2} rsq {e:.2} exp2 {e:.2} log2 {e:.2} sin {e:.2} cos {e:.2} sqrt {e:.2}", .{ worst[0], worst[1], worst[2], worst[3], worst[4], worst[5], worst[6] });
     for (worst) |e| if (e > 1e-3) return c.fail(name, "error above 1e-3", .{});
     c.pass(name, n * 7);
+}
+
+/// What the float units round like: the quantized kernels match the CPU
+/// bit for bit only where mul.f and add.f round to nearest even, rndne.f
+/// and cov.f32f16 (even) do what the CPU's nearestInt and f16 cast do, and
+/// mad.f32 rounds as the CPU's @mulAdd does (once) or as a*b+c does (twice).
+fn testFloat(c: *Ctx) void {
+    const name = "float rounding (mul, add, mad, rndne, f32->f16)";
+    const n = 2048;
+    const in: []u32 = @alignCast(std.mem.bytesAsSlice(u32, c.data.cpu[0 .. n * 12]));
+    var seed: u32 = 777;
+    for (0..n) |i| {
+        // a, b with full mantissas; c near -a*b so a fused mad differs
+        const a: f32 = @as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0 * 8.0 - 4.0;
+        const b: f32 = @as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0 * 8.0 - 4.0;
+        const jitter: f32 = @as(f32, @floatFromInt(lcg(&seed) >> 20)) * 1e-7;
+        const cc: f32 = if (i % 2 == 0) -(a * b) + jitter else @as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0;
+        in[3 * i] = @bitCast(a);
+        in[3 * i + 1] = @bitCast(b);
+        in[3 * i + 2] = @bitCast(cc);
+    }
+    c.dev.toDevice(c.data, 0, n * 12);
+    const d = addr(c.data);
+    const o = addr(c.out);
+    if (!c.launch(name,
+        \\@localsize 64, 1, 1
+        \\@invocationid(r0.x)
+        \\@wgid(r48.x)
+        \\@consts 2
+        \\shl.b r1.x, r48.x, 6
+        \\add.u r1.x, r1.x, r0.x
+        \\mul.u24 r1.y, r1.x, 12
+        \\ldg.a.f32 r2.x, g[c0.x+r1.y+0], 3
+        \\mul.f r3.x, r2.x, r2.y
+        \\add.f r3.y, r2.x, r2.y
+        \\mad.f32 r3.z, r2.x, r2.y, r2.z
+        \\mul.f r4.x, r2.x, (4.0)
+        \\mul.f r4.x, r4.x, (4.0)
+        \\mul.f r4.x, r4.x, (4.0)
+        \\rndne.f r4.y, r4.x
+        \\cov.f32s32 r3.w, r4.y
+        \\cov.f32f16 (even)hr10.x, r2.x
+        \\cov.f32f16 hr10.y, r2.x
+        \\cov.u16u32 r4.z, hr10.x
+        \\cov.u16u32 r4.w, hr10.y
+        \\shl.b r1.z, r1.x, 5
+        \\stg.a.u32 g[c1.x+r1.z+0], r3.x, 4
+        \\add.u r1.w, r1.z, 16
+        \\stg.a.u32 g[c1.x+r1.w+0], r4.x, 4
+        \\end
+    , &.{ d[0], d[1], 0, 0, o[0], o[1], 0, 0 }, .{ n / 64, 1, 1 })) return;
+    const got = c.outU32();
+    var mul_ok: u32 = 0;
+    var add_ok: u32 = 0;
+    var fused: u32 = 0;
+    var unfused: u32 = 0;
+    var round_ok: u32 = 0;
+    var f16_even: u32 = 0;
+    var f16_default_even: u32 = 0;
+    var f16_default_rtz: u32 = 0;
+    for (0..n) |i| {
+        const a: f32 = @bitCast(in[3 * i]);
+        const b: f32 = @bitCast(in[3 * i + 1]);
+        const cc: f32 = @bitCast(in[3 * i + 2]);
+        const g = got[i * 8 ..][0..8];
+        if (g[0] == @as(u32, @bitCast(a * b))) mul_ok += 1;
+        if (g[1] == @as(u32, @bitCast(a + b))) add_ok += 1;
+        if (g[2] == @as(u32, @bitCast(@mulAdd(f32, a, b, cc)))) fused += 1;
+        if (g[2] == @as(u32, @bitCast(a * b + cc))) unfused += 1;
+        const scaled = a * 4.0 * 4.0 * 4.0;
+        const near: i32 = @intFromFloat(@round(scaled) - (if (@abs(scaled - @trunc(scaled)) == 0.5 and @mod(@round(scaled), 2.0) != 0) std.math.sign(scaled) else 0));
+        if (@as(i32, @bitCast(g[3])) == near) round_ok += 1;
+        const even: u16 = @bitCast(@as(f16, @floatCast(a)));
+        if (g[6] == even) f16_even += 1;
+        if (g[7] == even) f16_default_even += 1;
+        const rtz: u16 = blk: {
+            const r: f16 = @floatCast(a);
+            if (@abs(@as(f32, r)) > @abs(a)) break :blk @as(u16, @bitCast(r)) - 1;
+            break :blk @bitCast(r);
+        };
+        if (g[7] == rtz) f16_default_rtz += 1;
+    }
+    c.res.mad = if (fused == n) .fused else if (unfused == n) .unfused else .mixed;
+    c.say("compute float: mul {d}/{d} add {d}/{d} exact; mad.f32 like @mulAdd {d}, like a*b+c {d}; rndne {d}; f16 (even) {d}, f16 default: even {d} toward-zero {d}", .{ mul_ok, n, add_ok, n, fused, unfused, round_ok, f16_even, f16_default_even, f16_default_rtz });
+    if (mul_ok != n or add_ok != n or round_ok != n or f16_even != n) return c.fail(name, "not IEEE round-to-nearest-even", .{});
+    c.pass(name, n);
 }
 
 fn testBandwidth(c: *Ctx) void {
