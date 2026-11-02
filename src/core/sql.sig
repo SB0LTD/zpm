@@ -1688,7 +1688,7 @@ pub fn Database(comptime config: Config) type {
                                     try sink.add(&.{
                                         nameCell(database),                                       nameCell("public"),                          nameCell(name),            nameCell(column.name.slice()),
                                         intCell(attnum),                                          if (kind == .default) expressionTextWithPool(pool,column) else .null_value, nameCell(if (column.not_null) "NO" else "YES"), nameCell(types.sqlTypeName(column.data_type)),
-                                        .null_value,                                              optionalInt(numeric[0]),                     optionalInt(numeric[1]),   optionalInt(numeric[2]),
+                                        if(column.data_type==.varchar and column.typmod>=5) intCell(column.typmod-4) else .null_value, optionalInt(numeric[0]), optionalInt(numeric[1]), optionalInt(numeric[2]),
                                         optionalInt(datetimePrecision(column)),                   nameCell(if (identity.len != 0) "YES" else "NO"), if (identity.len == 0) .null_value else nameCell(if (kind == .identity_always) "ALWAYS" else "BY DEFAULT"), nameCell(if (kind == .generated) "ALWAYS" else "NEVER"),
                                         if (kind == .generated) expressionTextWithPool(pool,column) else .null_value,
                                     });

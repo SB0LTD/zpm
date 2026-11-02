@@ -1,0 +1,188 @@
+{
+  "status": "development candidate; hosted/product/exact-release qualification pending",
+  "date": "2026-11-03",
+  "baseline": "bb36cdc45c751f790fdc98774181446ab11d447c",
+  "scope": "VARCHAR / CHARACTER VARYING; CHAR/BPCHAR and broader compatibility remain open",
+  "observations": {
+    "initial23": {
+      "passing": 3,
+      "gaps": 20,
+      "expected_exit": 1
+    },
+    "final37": {
+      "passing": 37,
+      "gaps": 0,
+      "compile_exit": 0,
+      "run_exit": 0
+    },
+    "regressions": [
+      {
+        "name": "postgres",
+        "command": [
+          "C:/Users/Shado/AppData/Local/Programs/Sig/0.6.4/bin/sig.exe",
+          "build-exe",
+          "--Sig-lib-dir",
+          "C:/Just-Things/Projects/sb0/ramsql-pr-consolidation-20261030/.sig-cache/consolidation-sdk/lib",
+          "-OReleaseSafe",
+          "--dep",
+          "postgres",
+          "--dep",
+          "scram",
+          "--dep",
+          "sql",
+          "--dep",
+          "db_store",
+          "-Mroot=tests/test_postgres.sig",
+          "--dep",
+          "scram",
+          "--dep",
+          "sql",
+          "-Mpostgres=src/db/postgres.sig",
+          "--dep",
+          "sql",
+          "-Mdb_store=src/db/store.sig",
+          "-Mscram=src/db/scram.sig",
+          "-Msql=src/core/sql.sig",
+          "-femit-bin=.scratch\\character\\final-postgres.exe"
+        ],
+        "compile_exit": 0,
+        "run_exit": 0
+      },
+      {
+        "name": "character_storage",
+        "command": [
+          "C:/Users/Shado/AppData/Local/Programs/Sig/0.6.4/bin/sig.exe",
+          "build-exe",
+          "--Sig-lib-dir",
+          "C:/Just-Things/Projects/sb0/ramsql-pr-consolidation-20261030/.sig-cache/consolidation-sdk/lib",
+          "-OReleaseSafe",
+          "--dep",
+          "sql",
+          "--dep",
+          "pg_types",
+          "-Mroot=tests/test_sql_character_storage.sig",
+          "-Msql=src/core/sql.sig",
+          "-Mpg_types=src/db/pg_types.sig",
+          "-femit-bin=.scratch\\character\\final-character_storage.exe"
+        ],
+        "compile_exit": 0,
+        "run_exit": 0
+      },
+      {
+        "name": "change_log",
+        "command": [
+          "C:/Users/Shado/AppData/Local/Programs/Sig/0.6.4/bin/sig.exe",
+          "build-exe",
+          "--Sig-lib-dir",
+          "C:/Just-Things/Projects/sb0/ramsql-pr-consolidation-20261030/.sig-cache/consolidation-sdk/lib",
+          "-OReleaseSafe",
+          "--dep",
+          "sql",
+          "-Mroot=tests/test_sql_change_log.sig",
+          "-Msql=src/core/sql.sig",
+          "-femit-bin=.scratch\\character\\final-change_log.exe"
+        ],
+        "compile_exit": 0,
+        "run_exit": 0
+      },
+      {
+        "name": "types",
+        "command": [
+          "C:/Users/Shado/AppData/Local/Programs/Sig/0.6.4/bin/sig.exe",
+          "build-exe",
+          "--Sig-lib-dir",
+          "C:/Just-Things/Projects/sb0/ramsql-pr-consolidation-20261030/.sig-cache/consolidation-sdk/lib",
+          "-OReleaseSafe",
+          "--dep",
+          "sql",
+          "-Mroot=tests/test_sql_types.sig",
+          "-Msql=src/core/sql.sig",
+          "-femit-bin=.scratch\\character\\final-types.exe"
+        ],
+        "compile_exit": 0,
+        "run_exit": 0
+      },
+      {
+        "name": "catalog",
+        "command": [
+          "C:/Users/Shado/AppData/Local/Programs/Sig/0.6.4/bin/sig.exe",
+          "build-exe",
+          "--Sig-lib-dir",
+          "C:/Just-Things/Projects/sb0/ramsql-pr-consolidation-20261030/.sig-cache/consolidation-sdk/lib",
+          "-OReleaseSafe",
+          "--dep",
+          "sql",
+          "-Mroot=tests/test_sql_catalog.sig",
+          "-Msql=src/core/sql.sig",
+          "-femit-bin=.scratch\\character\\final-catalog.exe"
+        ],
+        "compile_exit": 0,
+        "run_exit": 0
+      },
+      {
+        "name": "planner_demand",
+        "command": [
+          "C:/Users/Shado/AppData/Local/Programs/Sig/0.6.4/bin/sig.exe",
+          "build-exe",
+          "--Sig-lib-dir",
+          "C:/Just-Things/Projects/sb0/ramsql-pr-consolidation-20261030/.sig-cache/consolidation-sdk/lib",
+          "-OReleaseSafe",
+          "--dep",
+          "sql",
+          "-Mroot=tests/test_sql_planner_demand.sig",
+          "-Msql=src/core/sql.sig",
+          "-femit-bin=.scratch\\character\\final-planner_demand.exe"
+        ],
+        "compile_exit": 0,
+        "run_exit": 0
+      },
+      {
+        "name": "aggregate_demand",
+        "command": [
+          "C:/Users/Shado/AppData/Local/Programs/Sig/0.6.4/bin/sig.exe",
+          "build-exe",
+          "--Sig-lib-dir",
+          "C:/Just-Things/Projects/sb0/ramsql-pr-consolidation-20261030/.sig-cache/consolidation-sdk/lib",
+          "-OReleaseSafe",
+          "--dep",
+          "sql",
+          "-Mroot=tests/test_sql_aggregate_demand.sig",
+          "-Msql=src/core/sql.sig",
+          "-femit-bin=.scratch\\character\\final-aggregate_demand.exe"
+        ],
+        "compile_exit": 0,
+        "run_exit": 0
+      }
+    ],
+    "inventory": {
+      "programs": 118,
+      "smoke_passes": 13,
+      "failures": 88,
+      "unexecuted": 17,
+      "expected_exit": 1
+    },
+    "review": "Independent runtime36 compile/replay and incremental37 native replay/executable rerun approved bounded scope; final storage318 and separate15event adversarial passed"
+  },
+  "commands": [
+    "python tools/generate_sql_character_types.py --check",
+    "python .scratch/character/run_core.py typed-literal-final",
+    "python .scratch/character/final_regressions.py",
+    "python tests/sql_conformance/generate_contracts.py --oracle-report tests/sql_conformance/postgres18_oracle.json --output .scratch/character/inventory.sig",
+    "python .scratch/character/run_inventory.py inventory-final"
+  ],
+  "evidence_sha256": {
+    ".scratch/character/baseline-red.log": "7cd115918ce3566ccfe238f7f62cf6ac31d1b18d25e72b574e7ee52cdbb2c134",
+    ".scratch/character/coercion-fixed-two.log": "81a7253fb1e286497ef2d63fb5ab8fa7419f2956b16bc31eb9ca5aae712347ff",
+    ".scratch/character/unknown-fixed-final.log": "89ec0bc158f10f6614a1486c0088da5882f55e94ea2edb25246f24152abd034a",
+    ".scratch/character/typed-literal-red.log": "4beaf70c864e0d8b19330b447ca79a65746f66162f087097d121a2946d8a15c2",
+    ".scratch/character/typed-literal-final.log": "21ff6bedb00a5aad8e87ad50c3382743e3c4e3015f4afe803148af9b316368b2",
+    ".scratch/character/final-regressions.json": "f274e1da84a53b97dfddf02d75c6b1c7154488e3e996ad7a76b9a5c627e41d5b",
+    ".scratch/character/inventory-final.log": "a4bb6a3a31583a4524ef63bf39730605ad92c180577d6ee0b25a585f6fd97437",
+    ".scratch/character-review/native16-parser37.json": "3689bc084b4425af022490fcfad135791fae8fad2f37be738e71dd87be428d3f",
+    ".scratch/character-review/parser37-core-rerun.log": "21ff6bedb00a5aad8e87ad50c3382743e3c4e3015f4afe803148af9b316368b2",
+    ".scratch/character-review/final-storage.log": "981206efb844c4e9edac1c98dee1543e8419b0adc12bf364b82c68003bfbe1a4",
+    ".scratch/character-review/adversarial-final.log": "65cf83fddb6a9e06e46c5caba202730644fc84a83be3489c615f8f5e2e0e0e99",
+    "tests/fixtures/character_types_pg16.json": "6dacc7ad4ac7e29ff3adba4e06d66efabe920b79a02b43b3314db8e1110b0e9e",
+    "tests/test_sql_character_types.sig": "a0841bf172507677d695adaa4d8f53a938e7d0d5f712d778d076fe768c367163"
+  }
+}

@@ -4,6 +4,7 @@
 const numeric = @import("numeric.sig");
 const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
+const character = @import("character.sig");
 
 pub const Config = struct {
     /// Caller supplies row/version/index buffers and query reference workspace.
@@ -146,6 +147,10 @@ pub const Error = error{
     CannotCoerce,
     /// SQLSTATE 22P02: text is not valid input for the target type.
     InvalidTextRepresentation,
+    /// SQLSTATE22001: assignment exceeds a declared character length.
+    StringDataRightTruncation,
+    /// SQLSTATE22021: malformed UTF-8 or an embedded NUL character.
+    CharacterNotInRepertoire,
     /// SQLSTATE 22012.
     DivisionByZero,
     /// SQLSTATE2201F: square root/power domain error.
@@ -305,11 +310,11 @@ pub const Dialect = enum { postgres, mysql, tds };
 
 /// Stored column / result types. `integer` is int8 (BIGINT) and
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
-pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb };
+pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet.
-pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb };
+pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar };
 
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
@@ -321,6 +326,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .float8 => .double,
         .boolean => .boolean,
         .text, .unknown => .text,
+        .varchar => .varchar,
         .name => .name,
         .oid => .oid,
         .date => .date,
@@ -342,6 +348,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .double => .float8,
         .boolean => .boolean,
         .text => .text,
+        .varchar => .varchar,
         .name => .name,
         .oid => .oid,
         .date => .date,
@@ -365,6 +372,7 @@ pub fn typeInfo(data_type: DataType) TypeInfo {
         .smallint => .{ .oid = 21, .name = "int2", .len = 2, .category = 'N', .array = 1005 },
         .integer32 => .{ .oid = 23, .name = "int4", .len = 4, .category = 'N', .array = 1007 },
         .text => .{ .oid = 25, .name = "text", .len = -1, .category = 'S', .array = 1009 },
+        .varchar => .{ .oid = 1043, .name = "varchar", .len = -1, .category = 'S', .array = 1015 },
         .oid => .{ .oid = 26, .name = "oid", .len = 4, .category = 'N', .array = 1028 },
         .json => .{ .oid = 114, .name = "json", .len = -1, .category = 'U', .array = 199 },
         .real => .{ .oid = 700, .name = "float4", .len = 4, .category = 'N', .array = 1021 },
@@ -392,6 +400,7 @@ pub fn sqlTypeName(data_type: DataType) []const u8 {
         .smallint => "smallint",
         .boolean => "boolean",
         .text => "text",
+        .varchar => "character varying",
         .numeric => "numeric",
         .real => "real",
         .double => "double precision",
@@ -414,6 +423,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .smallint => "int2in",
         .boolean => "boolin",
         .text => "textin",
+        .varchar => "varcharin",
         .numeric => "numeric_in",
         .real => "float4in",
         .double => "float8in",
@@ -454,6 +464,7 @@ pub fn typeByName(input: []const u8) ?DataType {
         .{ .name = "integer", .data_type = .integer32 },     .{ .name = "int", .data_type = .integer32 },
         .{ .name = "bigint", .data_type = .integer },        .{ .name = "smallint", .data_type = .smallint },
         .{ .name = "boolean", .data_type = .boolean },       .{ .name = "real", .data_type = .real },
+        .{ .name = "character varying", .data_type = .varchar },
         .{ .name = "double precision", .data_type = .double }, .{ .name = "decimal", .data_type = .numeric },
         .{ .name = "timestamp without time zone", .data_type = .timestamp }, .{ .name = "timestamp with time zone", .data_type = .timestamptz },
     };
@@ -572,7 +583,7 @@ pub fn Values(comptime config: Config) type {
             return switch (data_type) {
                 .integer, .integer32, .smallint, .oid => .integer,
                 .boolean => .boolean,
-                .text, .name, .json => .text,
+                .text, .name, .json, .varchar => .text,
                 .real => .float4,
                 .double => .float8,
                 .numeric => .numeric,
@@ -695,6 +706,10 @@ pub fn Values(comptime config: Config) type {
                 return;
             }
             if (@as(CellTag, value.*) != cellTag(column.data_type)) return error.TypeMismatch;
+            if(column.data_type==.varchar) {
+                const clipped=try character.coerce(value.text.slice(),column.typmod,false);
+                if(clipped.len!=value.text.len)return error.StringDataRightTruncation;
+            }
             if (value.* == .integer) {
                 const integer = value.integer;
                 switch (column.data_type) {

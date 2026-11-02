@@ -610,6 +610,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 column.data_type = types.typeFromOid(try reader.int(u32)) orelse return error.UnsupportedLogVersion;
                 column.typmod = try reader.int(i32);
                 const typmod_ok = switch (column.data_type) {
+                    .varchar => @import("character.sig").validTypmod(column.typmod),
                     .numeric => column.typmod == -1 or blk: {
                         const decoded = numeric.Ops(config.numeric_digits).decodeTypmod(column.typmod) orelse break :blk false;
                         break :blk decoded.precision >= 1 and decoded.precision <= config.numeric_digits and decoded.scale >= -1000 and decoded.scale <= 1000;

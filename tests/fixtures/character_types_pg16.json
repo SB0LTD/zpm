@@ -1,0 +1,3429 @@
+{
+  "schema": 1,
+  "native": "postgres (PostgreSQL) 16.15",
+  "native_session_setup": [
+    "SET TIME ZONE 'UTC'"
+  ],
+  "scope": "VARCHAR finite native observations; CHAR/BPCHAR and full type family remain open",
+  "cases": [
+    {
+      "id": "varchar_unbounded",
+      "setup": [],
+      "events": [
+        {
+          "sql": "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR)",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "CREATE TABLE",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "INSERT INTO t VALUES(1,''),(2,'abc '),(3,'\u00e9\ud83d\ude42'),(4,NULL)",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "INSERT 0 4",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT id,v FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "id",
+                23,
+                4,
+                -1,
+                0
+              ],
+              [
+                "v",
+                1043,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1",
+                ""
+              ],
+              [
+                "2",
+                "abc "
+              ],
+              [
+                "3",
+                "\u00e9\ud83d\ude42"
+              ],
+              [
+                "4",
+                null
+              ]
+            ],
+            "command": "SELECT 4",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_varying_alias",
+      "setup": [],
+      "events": [
+        {
+          "sql": "CREATE TABLE t(v CHARACTER VARYING(3))",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "CREATE TABLE",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "INSERT INTO t VALUES('abc ')",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "INSERT 0 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT v FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "abc"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_casts",
+      "setup": [],
+      "events": [
+        {
+          "sql": "SELECT 'abcdef'::varchar(3),CAST('\u00e9\ud83d\ude42x' AS CHARACTER VARYING(2)),NULL::varchar(3)",
+          "outcome": {
+            "columns": [
+              [
+                "varchar",
+                1043,
+                -1,
+                7,
+                0
+              ],
+              [
+                "varchar",
+                1043,
+                -1,
+                6,
+                0
+              ],
+              [
+                "varchar",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "abc",
+                "\u00e9\ud83d\ude42",
+                null
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 12345::varchar(2),true::varchar(3)",
+          "outcome": {
+            "columns": [
+              [
+                "varchar",
+                1043,
+                -1,
+                6,
+                0
+              ],
+              [
+                "varchar",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "12",
+                "tru"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 'ab  '::varchar(2),'abc '::varchar",
+          "outcome": {
+            "columns": [
+              [
+                "varchar",
+                1043,
+                -1,
+                6,
+                0
+              ],
+              [
+                "varchar",
+                1043,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "ab",
+                "abc "
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_assignment_spaces",
+      "setup": [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))"
+      ],
+      "events": [
+        {
+          "sql": "INSERT INTO t VALUES(1,'abc '),(2,'ab '),(3,'')",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "INSERT 0 3",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT id,v FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "id",
+                23,
+                4,
+                -1,
+                0
+              ],
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1",
+                "abc"
+              ],
+              [
+                "2",
+                "ab "
+              ],
+              [
+                "3",
+                ""
+              ]
+            ],
+            "command": "SELECT 3",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_assignment_error",
+      "setup": [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))"
+      ],
+      "events": [
+        {
+          "sql": "INSERT INTO t VALUES(1,'abc')",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "INSERT 0 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "INSERT INTO t VALUES(2,'xy'),(3,'abcd')",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22001",
+              "message": "value too long for type character varying(3)"
+            },
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT id,v FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "id",
+                23,
+                4,
+                -1,
+                0
+              ],
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1",
+                "abc"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_assignment_unicode",
+      "setup": [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))"
+      ],
+      "events": [
+        {
+          "sql": "INSERT INTO t VALUES(1,'\u00e9\ud83d\ude42x'),(2,'a\u0301b'),(3,'\ud83d\ude42\ud83d\ude42\ud83d\ude42')",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "INSERT 0 3",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT id,v FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "id",
+                23,
+                4,
+                -1,
+                0
+              ],
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1",
+                "\u00e9\ud83d\ude42x"
+              ],
+              [
+                "2",
+                "a\u0301b"
+              ],
+              [
+                "3",
+                "\ud83d\ude42\ud83d\ude42\ud83d\ude42"
+              ]
+            ],
+            "command": "SELECT 3",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "INSERT INTO t VALUES(4,'\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42')",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22001",
+              "message": "value too long for type character varying(3)"
+            },
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT COUNT(*) FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "count",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_assignment_not_space",
+      "setup": [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))"
+      ],
+      "events": [
+        {
+          "sql": "INSERT INTO t VALUES(1,'abc\t')",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22001",
+              "message": "value too long for type character varying(3)"
+            },
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "INSERT INTO t VALUES(2,'abc\u00a0')",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22001",
+              "message": "value too long for type character varying(3)"
+            },
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT COUNT(*) FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "count",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_update_atomic",
+      "setup": [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))"
+      ],
+      "events": [
+        {
+          "sql": "INSERT INTO t VALUES(1,'a'),(2,'abc')",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "INSERT 0 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "UPDATE t SET v=v||'x'",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22001",
+              "message": "value too long for type character varying(3)"
+            },
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT id,v FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "id",
+                23,
+                4,
+                -1,
+                0
+              ],
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1",
+                "a"
+              ],
+              [
+                "2",
+                "abc"
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "UPDATE t SET v='xy '",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "UPDATE 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT id,v FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "id",
+                23,
+                4,
+                -1,
+                0
+              ],
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1",
+                "xy "
+              ],
+              [
+                "2",
+                "xy "
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_explicit_then_assignment",
+      "setup": [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))"
+      ],
+      "events": [
+        {
+          "sql": "INSERT INTO t VALUES(1,'abcd'::varchar(3))",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "INSERT 0 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "INSERT INTO t VALUES(2,'abcd'::varchar(4))",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22001",
+              "message": "value too long for type character varying(3)"
+            },
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT id,v FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "id",
+                23,
+                4,
+                -1,
+                0
+              ],
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1",
+                "abc"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_numeric_assignment",
+      "setup": [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))"
+      ],
+      "events": [
+        {
+          "sql": "INSERT INTO t VALUES(1,123)",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "INSERT 0 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "INSERT INTO t VALUES(2,1234)",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22001",
+              "message": "value too long for type character varying(3)"
+            },
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT id,v FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "id",
+                23,
+                4,
+                -1,
+                0
+              ],
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1",
+                "123"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_defaults_generated",
+      "setup": [],
+      "events": [
+        {
+          "sql": "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3) DEFAULT 'abcd'::varchar(2),g VARCHAR(3) GENERATED ALWAYS AS(v||'x') STORED)",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "CREATE TABLE",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "INSERT INTO t(id) VALUES(1)",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "INSERT 0 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT id,v,g FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "id",
+                23,
+                4,
+                -1,
+                0
+              ],
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ],
+              [
+                "g",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1",
+                "ab",
+                "abx"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "UPDATE t SET v='abc' WHERE id=1",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22001",
+              "message": "value too long for type character varying(3)"
+            },
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT id,v,g FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "id",
+                23,
+                4,
+                -1,
+                0
+              ],
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ],
+              [
+                "g",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1",
+                "ab",
+                "abx"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_default_overflow",
+      "setup": [],
+      "events": [
+        {
+          "sql": "CREATE TABLE t(v VARCHAR(3) DEFAULT 'abcd')",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "CREATE TABLE",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "INSERT INTO t DEFAULT VALUES",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22001",
+              "message": "value too long for type character varying(3)"
+            },
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT COUNT(*) FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "count",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_relational",
+      "setup": [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))"
+      ],
+      "events": [
+        {
+          "sql": "INSERT INTO t VALUES(1,'a'),(2,'a '),(3,'b')",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "INSERT 0 3",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT v,COUNT(*) FROM t GROUP BY v ORDER BY v",
+          "outcome": {
+            "columns": [
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ],
+              [
+                "count",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a",
+                "1"
+              ],
+              [
+                "a ",
+                "1"
+              ],
+              [
+                "b",
+                "1"
+              ]
+            ],
+            "command": "SELECT 3",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT v FROM t UNION SELECT v FROM t ORDER BY v",
+          "outcome": {
+            "columns": [
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a"
+              ],
+              [
+                "a "
+              ],
+              [
+                "b"
+              ]
+            ],
+            "command": "SELECT 3",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT MIN(v),MAX(v) FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "min",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "max",
+                25,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a",
+                "b"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT v,v='a',v LIKE 'a%' FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ],
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ],
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a",
+                "t",
+                "t"
+              ],
+              [
+                "a ",
+                "f",
+                "t"
+              ],
+              [
+                "b",
+                "f",
+                "f"
+              ]
+            ],
+            "command": "SELECT 3",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_coalesce_case",
+      "setup": [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))",
+        "INSERT INTO t VALUES(1,'a'),(2,'b')"
+      ],
+      "events": [
+        {
+          "sql": "SELECT COALESCE(NULL::varchar(3),'xy'::varchar(3)) AS a,CASE WHEN 1=1 THEN 'a'::varchar(3) ELSE 'b'::varchar(3) END AS b",
+          "outcome": {
+            "columns": [
+              [
+                "a",
+                1043,
+                -1,
+                7,
+                0
+              ],
+              [
+                "b",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "xy",
+                "a"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT COALESCE(NULL::varchar(2),'xyz'::varchar(3)),GREATEST('x'::varchar(2),'y'::varchar(3))",
+          "outcome": {
+            "columns": [
+              [
+                "coalesce",
+                1043,
+                -1,
+                7,
+                0
+              ],
+              [
+                "greatest",
+                1043,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "xyz",
+                "y"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT CASE WHEN id=1 THEN v ELSE 'x'::varchar(3) END AS v FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a"
+              ],
+              [
+                "x"
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_type_catalog",
+      "setup": [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 'varchar'::regtype::text,'character varying'::regtype::text,format_type(1043,-1),format_type(1043,7)",
+          "outcome": {
+            "columns": [
+              [
+                "text",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "text",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "format_type",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "format_type",
+                25,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "character varying",
+                "character varying",
+                "character varying",
+                "character varying(3)"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT attname,atttypid,atttypmod FROM pg_attribute WHERE attrelid='t'::regclass AND attnum>0 ORDER BY attnum",
+          "outcome": {
+            "columns": [
+              [
+                "attname",
+                19,
+                64,
+                -1,
+                0
+              ],
+              [
+                "atttypid",
+                26,
+                4,
+                -1,
+                0
+              ],
+              [
+                "atttypmod",
+                23,
+                4,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "id",
+                "23",
+                "-1"
+              ],
+              [
+                "v",
+                "1043",
+                "7"
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT column_name,data_type,character_maximum_length FROM information_schema.columns WHERE table_name='t' ORDER BY ordinal_position",
+          "outcome": {
+            "columns": [
+              [
+                "column_name",
+                19,
+                64,
+                -1,
+                0
+              ],
+              [
+                "data_type",
+                1043,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "character_maximum_length",
+                23,
+                4,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "id",
+                "integer",
+                null
+              ],
+              [
+                "v",
+                "character varying",
+                "3"
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_invalid_0",
+      "setup": [],
+      "events": [
+        {
+          "sql": "CREATE TABLE t(v VARCHAR(0))",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22023",
+              "message": "length for type varchar must be at least 1"
+            },
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_invalid_minus1",
+      "setup": [],
+      "events": [
+        {
+          "sql": "CREATE TABLE t(v VARCHAR(-1))",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "42601",
+              "message": "syntax error at or near \"-\""
+            },
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_invalid_10485761",
+      "setup": [],
+      "events": [
+        {
+          "sql": "CREATE TABLE t(v VARCHAR(10485761))",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22023",
+              "message": "length for type varchar cannot exceed 10485760"
+            },
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_invalid_2_3",
+      "setup": [],
+      "events": [
+        {
+          "sql": "CREATE TABLE t(v VARCHAR(2,3))",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "42601",
+              "message": "syntax error at or near \",\""
+            },
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_invalid_1_5",
+      "setup": [],
+      "events": [
+        {
+          "sql": "CREATE TABLE t(v VARCHAR(1.5))",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "42601",
+              "message": "syntax error at or near \"1.5\""
+            },
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_max_modifier",
+      "setup": [],
+      "events": [
+        {
+          "sql": "CREATE TABLE t(v VARCHAR(10485760))",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "CREATE TABLE",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "INSERT INTO t VALUES('x')",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "INSERT 0 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT v FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "v",
+                1043,
+                -1,
+                10485764,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "x"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_null_empty",
+      "setup": [],
+      "events": [
+        {
+          "sql": "SELECT NULL::varchar(1),''::varchar(1),''::character varying",
+          "outcome": {
+            "columns": [
+              [
+                "varchar",
+                1043,
+                -1,
+                5,
+                0
+              ],
+              [
+                "varchar",
+                1043,
+                -1,
+                5,
+                0
+              ],
+              [
+                "varchar",
+                1043,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                null,
+                "",
+                ""
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "CREATE TABLE t(v VARCHAR(1))",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "CREATE TABLE",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "INSERT INTO t VALUES(NULL),('')",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "INSERT 0 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT v FROM t ORDER BY v",
+          "outcome": {
+            "columns": [
+              [
+                "v",
+                1043,
+                -1,
+                5,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                ""
+              ],
+              [
+                null
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_text_conversion",
+      "setup": [],
+      "events": [
+        {
+          "sql": "SELECT '123'::varchar::int,('12'::varchar||'3') AS x,CAST('x ' AS varchar)='x'::text",
+          "outcome": {
+            "columns": [
+              [
+                "int4",
+                23,
+                4,
+                -1,
+                0
+              ],
+              [
+                "x",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "123",
+                "123",
+                "f"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_metadata_unreachable",
+      "setup": [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))",
+        "INSERT INTO t VALUES(1,'a'),(2,NULL)"
+      ],
+      "events": [
+        {
+          "sql": "SELECT COALESCE(v,NULL::varchar(2)),COALESCE(v,'x'::varchar(3)),GREATEST(v,'x'::varchar(3)) FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "coalesce",
+                1043,
+                -1,
+                7,
+                0
+              ],
+              [
+                "coalesce",
+                1043,
+                -1,
+                7,
+                0
+              ],
+              [
+                "greatest",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a",
+                "a",
+                "x"
+              ],
+              [
+                null,
+                "x",
+                "x"
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT CASE WHEN id=1 THEN v END AS a,CASE WHEN id=1 THEN v ELSE 'x'::varchar(2) END AS b FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "a",
+                1043,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "b",
+                1043,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a",
+                "a"
+              ],
+              [
+                null,
+                "x"
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT CASE WHEN TRUE THEN 'a'::varchar(2) ELSE 'b'::varchar(3) END,CASE WHEN FALSE THEN 'a'::varchar(2) ELSE 'b'::varchar(3) END",
+          "outcome": {
+            "columns": [
+              [
+                "case",
+                1043,
+                -1,
+                6,
+                0
+              ],
+              [
+                "case",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a",
+                "b"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_string_overloads",
+      "setup": [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))"
+      ],
+      "events": [
+        {
+          "sql": "SELECT to_regtype('integer'::varchar)::text,to_regclass('t'::varchar)::text,'integer'::varchar::regtype::text",
+          "outcome": {
+            "columns": [
+              [
+                "to_regtype",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "to_regclass",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "text",
+                25,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "integer",
+                "t",
+                "integer"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT '{\"a\":1}'::jsonb->'a'::varchar,'{\"a\":1}'::jsonb ? 'a'::varchar",
+          "outcome": {
+            "columns": [
+              [
+                "?column?",
+                3802,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1",
+                "t"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT TIMESTAMP '2026-01-02 03:04:05' AT TIME ZONE 'UTC'::varchar",
+          "outcome": {
+            "columns": [
+              [
+                "timezone",
+                1184,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "2026-01-02 03:04:05+00"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_independent_review_adversarial",
+      "setup": [
+        "CREATE TABLE t(id int,v varchar(3))",
+        "INSERT INTO t VALUES(1,'abc'),(2,NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT NULLIF(v,'x') AS a,NULLIF(v,'x'::varchar) AS b,NULLIF(v,'x'::text) AS c FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "a",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "b",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "c",
+                25,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "abc",
+                "abc",
+                "abc"
+              ],
+              [
+                null,
+                null,
+                null
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT COALESCE('a'::name,'b'::varchar) AS a,COALESCE('a'::varchar,'b'::name) AS b",
+          "outcome": {
+            "columns": [
+              [
+                "a",
+                19,
+                64,
+                -1,
+                0
+              ],
+              [
+                "b",
+                19,
+                64,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a",
+                "a"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT CASE WHEN id=1 THEN 'a'::name ELSE v END AS a FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "a",
+                19,
+                64,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a"
+              ],
+              [
+                null
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT GREATEST('a'::name,'b'::varchar) AS a",
+          "outcome": {
+            "columns": [
+              [
+                "a",
+                19,
+                64,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "b"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq'::varchar)",
+          "outcome": {
+            "columns": [
+              [
+                "nextval",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT currval('seq'::varchar)",
+          "outcome": {
+            "columns": [
+              [
+                "currval",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT setval('seq'::varchar,7)",
+          "outcome": {
+            "columns": [
+              [
+                "setval",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "7"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "outcome": {
+            "columns": [
+              [
+                "nextval",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "8"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT v FROM t UNION ALL SELECT 'de'::varchar(3)",
+          "outcome": {
+            "columns": [
+              [
+                "v",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "abc"
+              ],
+              [
+                null
+              ],
+              [
+                "de"
+              ]
+            ],
+            "command": "SELECT 3",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 'ab'::varchar(3) UNION ALL SELECT 'cd'::varchar(4)",
+          "outcome": {
+            "columns": [
+              [
+                "varchar",
+                1043,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "ab"
+              ],
+              [
+                "cd"
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT MIN(v),MAX(v) FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "min",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "max",
+                25,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "abc",
+                "abc"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT FIRST_VALUE(v) OVER(ORDER BY id),LAG(v) OVER(ORDER BY id) FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "first_value",
+                1043,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "lag",
+                1043,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "abc",
+                null
+              ],
+              [
+                "abc",
+                "abc"
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT COALESCE(NULL::varchar(2),v),GREATEST(v,NULL::varchar(3)) FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "coalesce",
+                1043,
+                -1,
+                7,
+                0
+              ],
+              [
+                "greatest",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "abc",
+                "abc"
+              ],
+              [
+                null,
+                null
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT CASE WHEN id=1 THEN v ELSE NULL::varchar(3) END FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "case",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "abc"
+              ],
+              [
+                null
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT v LIKE 'a%'::varchar ESCAPE '!'::varchar FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "t"
+              ],
+              [
+                null
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_name_utf8_boundary",
+      "setup": [],
+      "events": [
+        {
+          "sql": "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u00e9'::varchar::name::text",
+          "outcome": {
+            "columns": [
+              [
+                "text",
+                25,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_name_comparison",
+      "setup": [],
+      "events": [
+        {
+          "sql": "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar AS eq1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name AS eq2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name<'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar AS lt",
+          "outcome": {
+            "columns": [
+              [
+                "eq1",
+                16,
+                1,
+                -1,
+                0
+              ],
+              [
+                "eq2",
+                16,
+                1,
+                -1,
+                0
+              ],
+              [
+                "lt",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "f",
+                "f",
+                "t"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT NULLIF('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar) AS n1,NULLIF('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name) AS n2",
+          "outcome": {
+            "columns": [
+              [
+                "n1",
+                19,
+                64,
+                -1,
+                0
+              ],
+              [
+                "n2",
+                25,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_name_in_between",
+      "setup": [],
+      "events": [
+        {
+          "sql": "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name IN('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar) AS value",
+          "outcome": {
+            "columns": [
+              [
+                "value",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "f"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name IN('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac'::varchar) AS value",
+          "outcome": {
+            "columns": [
+              [
+                "value",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "t"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar IN('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name) AS value",
+          "outcome": {
+            "columns": [
+              [
+                "value",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "f"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar IN('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name,'z'::name) AS value",
+          "outcome": {
+            "columns": [
+              [
+                "value",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "f"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name NOT IN('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac'::varchar) AS value",
+          "outcome": {
+            "columns": [
+              [
+                "value",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "f"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name BETWEEN 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar AND 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac'::varchar AS value",
+          "outcome": {
+            "columns": [
+              [
+                "value",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "f"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar BETWEEN 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name AND 'z'::name AS value",
+          "outcome": {
+            "columns": [
+              [
+                "value",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "t"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name BETWEEN 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name AND 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar AS value",
+          "outcome": {
+            "columns": [
+              [
+                "value",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "t"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name BETWEEN SYMMETRIC 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar AND 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac'::varchar AS value",
+          "outcome": {
+            "columns": [
+              [
+                "value",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "f"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name) IN(('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar)) AS value",
+          "outcome": {
+            "columns": [
+              [
+                "value",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "f"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name) IN(('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar),('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac'::varchar,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac'::varchar)) AS value",
+          "outcome": {
+            "columns": [
+              [
+                "value",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "f"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_name_in_variables",
+      "setup": [
+        "CREATE TABLE t(n NAME,v VARCHAR,z VARCHAR)",
+        "INSERT INTO t VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac')"
+      ],
+      "events": [
+        {
+          "sql": "SELECT n IN(v,z),n IN(v,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac'::varchar),n IN(v||'',z||'') FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ],
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ],
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "f",
+                "f",
+                "f"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT n IN('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac'::varchar) FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "t"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT n IN(v,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'::varchar,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac'::varchar) FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "t"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_grouped_metadata",
+      "setup": [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))",
+        "INSERT INTO t VALUES(1,'abc'),(2,NULL)"
+      ],
+      "events": [
+        {
+          "sql": "SELECT (SELECT 'a'::varchar(3)) AS a",
+          "outcome": {
+            "columns": [
+              [
+                "a",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT COALESCE(v,'abc'::varchar(3)) AS a FROM t GROUP BY COALESCE(v,'abc'::varchar(3))",
+          "outcome": {
+            "columns": [
+              [
+                "a",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "abc"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT CASE WHEN id>0 THEN v ELSE NULL::varchar(3) END AS a FROM t GROUP BY CASE WHEN id>0 THEN v ELSE NULL::varchar(3) END ORDER BY a NULLS LAST",
+          "outcome": {
+            "columns": [
+              [
+                "a",
+                1043,
+                -1,
+                7,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "abc"
+              ],
+              [
+                null
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_in_array_effects",
+      "setup": [
+        "CREATE TABLE t(v VARCHAR)",
+        "INSERT INTO t VALUES('x')",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 'x'::name IN('x'::varchar,nextval('seq')::varchar)",
+          "outcome": {
+            "columns": [
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "t"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "outcome": {
+            "columns": [
+              [
+                "nextval",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 'x'::name IN(v||nextval('seq')::text,'x'::varchar,nextval('seq')::varchar) FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "t"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "outcome": {
+            "columns": [
+              [
+                "nextval",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "4"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_string_common_order",
+      "setup": [
+        "CREATE TABLE t(id int)",
+        "INSERT INTO t VALUES(0),(1)"
+      ],
+      "events": [
+        {
+          "sql": "SELECT COALESCE('a'::varchar(3),'b'::text) AS vt,COALESCE('a'::text,'b'::varchar(3)) AS tv",
+          "outcome": {
+            "columns": [
+              [
+                "vt",
+                1043,
+                -1,
+                7,
+                0
+              ],
+              [
+                "tv",
+                25,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a",
+                "a"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT GREATEST('a'::varchar(3),'b'::text) AS vt,GREATEST('a'::text,'b'::varchar(3)) AS tv",
+          "outcome": {
+            "columns": [
+              [
+                "vt",
+                1043,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "tv",
+                25,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "b",
+                "b"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT CASE WHEN id=1 THEN 'a'::varchar(3) ELSE 'b'::text END AS then_v_else_t,CASE WHEN id=1 THEN 'a'::text ELSE 'b'::varchar(3) END AS then_t_else_v FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "then_v_else_t",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "then_t_else_v",
+                1043,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "b",
+                "b"
+              ],
+              [
+                "a",
+                "a"
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT CASE WHEN id=1 THEN 'a'::name ELSE 'b'::text END AS then_n_else_t,CASE WHEN id=1 THEN 'a'::text ELSE 'b'::name END AS then_t_else_n FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "then_n_else_t",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "then_t_else_n",
+                19,
+                64,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "b",
+                "b"
+              ],
+              [
+                "a",
+                "a"
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT COALESCE('a'::name,'b'::text) AS nt,COALESCE('a'::text,'b'::name) AS tn",
+          "outcome": {
+            "columns": [
+              [
+                "nt",
+                19,
+                64,
+                -1,
+                0
+              ],
+              [
+                "tn",
+                25,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a",
+                "a"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT GREATEST('a'::name,'b'::text) AS nt,GREATEST('a'::text,'b'::name) AS tn",
+          "outcome": {
+            "columns": [
+              [
+                "nt",
+                19,
+                64,
+                -1,
+                0
+              ],
+              [
+                "tn",
+                25,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "b",
+                "b"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT CASE WHEN TRUE THEN 'a'::varchar(3) ELSE 'b'::text END AS then_v_else_t,CASE WHEN TRUE THEN 'a'::text ELSE 'b'::varchar(3) END AS then_t_else_v",
+          "outcome": {
+            "columns": [
+              [
+                "then_v_else_t",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "then_t_else_v",
+                1043,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "a",
+                "a"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT CASE WHEN id=1 THEN 'a'::varchar(3) WHEN id=0 THEN 'b'::varchar(4) ELSE 'c'::text END AS a,CASE WHEN id=1 THEN 'a'::text WHEN id=0 THEN 'b'::text ELSE 'c'::varchar(3) END AS b FROM t ORDER BY id",
+          "outcome": {
+            "columns": [
+              [
+                "a",
+                25,
+                -1,
+                -1,
+                0
+              ],
+              [
+                "b",
+                1043,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "b",
+                "b"
+              ],
+              [
+                "a",
+                "a"
+              ]
+            ],
+            "command": "SELECT 2",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_independent_unknown_in_priority",
+      "setup": [],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM(SELECT 'bad' IN(1,'x'::varchar) AS unused)q",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22P02",
+              "message": "invalid input syntax for type integer: \"bad\""
+            },
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 7 FROM(SELECT 'bad' IN('bad'::varchar,1) AS unused)q",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22P02",
+              "message": "invalid input syntax for type integer: \"bad\""
+            },
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 'bad' IN('bad'::varchar,1)",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22P02",
+              "message": "invalid input syntax for type integer: \"bad\""
+            },
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT '1' IN(1,'x'::varchar)",
+          "outcome": {
+            "columns": [
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "t"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_in_volatile_scalar",
+      "setup": [
+        "CREATE TABLE t(n NAME,v VARCHAR)",
+        "INSERT INTO t VALUES('0','2')",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT nextval('seq')::varchar IN(n,v) FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "t"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "outcome": {
+            "columns": [
+              [
+                "nextval",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')::varchar IN('0'::name,'0'::varchar,v) FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "f"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "outcome": {
+            "columns": [
+              [
+                "nextval",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "6"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_in_null_array",
+      "setup": [
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT NULL::varchar IN('x'::name,nextval('seq')::varchar)",
+          "outcome": {
+            "columns": [
+              [
+                "?column?",
+                16,
+                1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                null
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "outcome": {
+            "columns": [
+              [
+                "nextval",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT 'x'::name IN('x'::varchar,(1/0)::varchar)",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": null,
+            "error": {
+              "sqlstate": "22012",
+              "message": "division by zero"
+            },
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "outcome": {
+            "columns": [
+              [
+                "nextval",
+                20,
+                8,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    },
+    {
+      "id": "varchar_typed_literals_identifiers",
+      "setup": [],
+      "events": [
+        {
+          "sql": "SELECT VARCHAR(2) 'abcd',CHARACTER VARYING(2) '\u00e9\ud83d\ude42x',VARCHAR 'abc'",
+          "outcome": {
+            "columns": [
+              [
+                "varchar",
+                1043,
+                -1,
+                6,
+                0
+              ],
+              [
+                "varchar",
+                1043,
+                -1,
+                6,
+                0
+              ],
+              [
+                "varchar",
+                1043,
+                -1,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "ab",
+                "\u00e9\ud83d\ude42",
+                "abc"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "CREATE TABLE t(varchar INT,character INT,varying INT)",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "CREATE TABLE",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "INSERT INTO t VALUES(1,2,3)",
+          "outcome": {
+            "columns": [],
+            "rows": [],
+            "command": "INSERT 0 1",
+            "error": null,
+            "transaction": "I"
+          }
+        },
+        {
+          "sql": "SELECT varchar,character,varying FROM t",
+          "outcome": {
+            "columns": [
+              [
+                "varchar",
+                23,
+                4,
+                -1,
+                0
+              ],
+              [
+                "character",
+                23,
+                4,
+                -1,
+                0
+              ],
+              [
+                "varying",
+                23,
+                4,
+                -1,
+                0
+              ]
+            ],
+            "rows": [
+              [
+                "1",
+                "2",
+                "3"
+              ]
+            ],
+            "command": "SELECT 1",
+            "error": null,
+            "transaction": "I"
+          }
+        }
+      ]
+    }
+  ],
+  "catalog_sha256": "4e9a5d0ec0232379f9bd74308608ec407d9b6ef9cbf45759bec3d002b7211010"
+}

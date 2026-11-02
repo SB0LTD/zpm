@@ -583,7 +583,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .arrow, .arrow_text => {
                     if (right_node.ty == .unknown) try coerce(context, n.b, .text);
                     const right = context.node(n.b).ty;
-                    if (right != .text and right != .int2 and right != .int4) return error.UndefinedFunction;
+                    if (!value.stringType(right) and right != .int2 and right != .int4) return error.UndefinedFunction;
                     n.ty = if (n.op == .arrow) left else .text;
                 },
                 .path, .path_text => {
@@ -604,7 +604,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .exists => {
                     if (left != .jsonb) return error.UndefinedFunction;
                     if (right_node.ty == .unknown) try coerce(context, n.b, .text);
-                    if (context.node(n.b).ty != .text) return error.UndefinedFunction;
+                    if (!value.stringType(context.node(n.b).ty)) return error.UndefinedFunction;
                     n.ty = .boolean;
                 },
                 else => unreachable,
@@ -723,7 +723,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .min, .max => switch (arg_ty) {
                     .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval => arg_ty,
-                    .name => blk: {
+                    .name, .varchar => blk: {
                         n.b = try convert(context, arg, .text, -1, .implicit);
                         break :blk .text;
                     },
@@ -1102,7 +1102,7 @@ pub fn Binder(comptime config: types.Config) type {
                         const ty = context.node(args[index]).ty;
                         // A regclass (OID) names the sequence directly.
                         if (index == 0 and ty == .oid) continue;
-                        if (ty != .unknown and ty != target and !(value.integral(ty) and value.integral(target))) return error.UndefinedFunction;
+                        if (ty != .unknown and ty != target and !(value.integral(ty) and value.integral(target)) and !(target==.text and ty==.varchar)) return error.UndefinedFunction;
                         args[index] = try convert(context, args[index], target, -1, .implicit);
                     }
                     for (0..count) |index| context.node(args[index]).next = if (index + 1 < count) args[index + 1] else none;
@@ -1118,7 +1118,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .to_regtype, .to_regclass => {
                     if (count != 1) return error.UndefinedFunction;
                     const ty = context.node(n.b).ty;
-                    if (ty == .unknown) try coerce(context, n.b, .text) else if (ty != .text and ty != .name) return error.UndefinedFunction;
+                    if (ty == .unknown) try coerce(context, n.b, .text) else if (!value.stringType(ty)) return error.UndefinedFunction;
                     n.ty = .oid;
                     // PostgreSQL returns regtype / regclass: `::text` prints the name.
                     n.reg = if (n.func == .to_regtype) .regtype else .regclass;
@@ -1153,7 +1153,7 @@ pub fn Binder(comptime config: types.Config) type {
             const reg: ast.Reg = if (n.typmod == ast.regclass_typmod) .regclass else .regtype;
             try typeExpr(context, scope, n.a);
             const from = context.node(n.a).ty;
-            if (from == .unknown or from == .text or from == .name) {
+            if (from == .unknown or value.stringType(from)) {
                 if (from == .unknown) try coerce(context, n.a, .text);
                 n.kind = .function;
                 n.func = if (reg == .regclass) .regclass_in else .regtype_in;
@@ -1832,6 +1832,50 @@ pub fn Binder(comptime config: types.Config) type {
             try context.pool.raise(id, right);
         }
 
+        fn inArrayEligible(context:*const Context,id:u16) bool {
+            if(id==none)return true;const n=context.node(id);
+            // Subquery/window/correlation planning remains a conservative boundary.
+            if(n.kind==.column or n.window!=none or n.kind==.scalar_subquery or n.kind==.exists_subquery or n.kind==.in_subquery)return false;
+            if(!inArrayEligible(context,n.a) or !inArrayEligible(context,n.c))return false;
+            if(listOwner(n.kind)) {var item=n.b;while(item!=none):(item=context.node(item).next)if(!inArrayEligible(context,item))return false;return true;}
+            return inArrayEligible(context,n.b);
+        }
+        fn bindCharacterIn(context:*const Context,n:*ast.Node) Error!void {
+            const left=context.node(n.a).ty;var array_type=left;var array_ok=true;var count:usize=0;
+            var item=n.b;
+            while(item!=none):(item=context.node(item).next) if(inArrayEligible(context,item)) {
+                count+=1;const ty=context.node(item).ty;
+                if(array_type==.unknown)array_type=ty else if(ty!=.unknown) {
+                    if(value.common(array_type,ty)) |common_type| array_type=common_type else array_ok=false;
+                }
+            };
+            array_ok=array_ok and count>1;if(array_type==.unknown)array_type=.text;
+            var array_head=none;var array_tail=none;var scalar_head=none;var scalar_tail=none;
+            item=n.b;
+            while(item!=none) {
+                const next=context.node(item).next;const in_array=array_ok and inArrayEligible(context,item);
+                var rhs=if(in_array) try convert(context,item,array_type,-1,.implicit) else item;
+                const right=context.node(rhs).ty;
+                if(left==.json or right==.json)return error.UndefinedFunction;
+                const target:ast.Type=if(left==.unknown) (if(right==.unknown) .text else right)
+                    else if(right==.unknown) left else value.comparisonType(left,right) orelse return error.UndefinedFunction;
+                if(!value.castable(left,target,.implicit))return error.UndefinedFunction;
+                if(left==.unknown and context.node(n.a).kind==.text_literal) {
+                    // Each operator resolves an unknown literal independently.
+                    // Validate its input now without changing the shared scalar.
+                    const text=E.literalText(context.source,context.node(n.a).text);
+                    _=try Io.parse(target,-1,text.slice(),context.session);
+                }
+                rhs=try convert(context,rhs,target,-1,.implicit);context.node(rhs).next=none;
+                if(in_array) {if(array_head==none)array_head=rhs else context.node(array_tail).next=rhs;array_tail=rhs;}
+                else {if(scalar_head==none)scalar_head=rhs else context.node(scalar_tail).next=rhs;scalar_tail=rhs;}
+                item=next;
+            }
+            if(array_tail!=none)context.node(array_tail).next=scalar_head;
+            n.b=if(array_head!=none)array_head else scalar_head;
+            n.character_in=true;n.character_array_count=if(array_ok) @intCast(count) else 0;
+            n.ty=.boolean;n.constant=isConstant(context,n.a) and listConstant(context,n.b);
+        }
         fn typeExpr(context: *const Context, scope: *const Scope, id: u16) Error!void {
             const n = context.node(id);
             n.constant = true;
@@ -1938,11 +1982,17 @@ pub fn Binder(comptime config: types.Config) type {
                 .in_list => {
                     if (context.node(n.a).kind == .row_constructor) return bindRowIn(context, scope, id);
                     try typeExpr(context, scope, n.a);
+                    var character=context.node(n.a).ty==.varchar;var typed_item=n.b;
+                    while(typed_item!=none):(typed_item=context.node(typed_item).next) {
+                        try typeExpr(context,scope,typed_item);character=character or context.node(typed_item).ty==.varchar;
+                    }
+                    if(character)return bindCharacterIn(context,n);
                     var result: ast.Type = context.node(n.a).ty;
                     var item = n.b;
                     while (item != none) : (item = context.node(item).next) {
-                        try typeExpr(context, scope, item);
-                        try unifyInto(&result, context.node(item).ty);
+                        const ty=context.node(item).ty;
+                        if(value.stringType(result) and value.stringType(ty) and result!=ty)result=.text
+                        else try unifyInto(&result,ty);
                     }
                     if (result == .unknown) result = .text;
                     if (result == .json) return error.UndefinedFunction;
@@ -1969,12 +2019,12 @@ pub fn Binder(comptime config: types.Config) type {
                     // name LIKE text (namelike) shares text's representation.
                     const left_ty = context.node(n.a).ty;
                     const right_ty = context.node(n.b).ty;
-                    if ((left_ty != .text and left_ty != .name) or (right_ty != .text and right_ty != .name)) return error.UndefinedFunction;
+                    if (!value.stringType(left_ty) or !value.stringType(right_ty)) return error.UndefinedFunction;
                     if (n.c != none) {
                         try typeExpr(context, scope, n.c);
                         try coerce(context, n.c, .text);
                         const escape_ty = context.node(n.c).ty;
-                        if (escape_ty != .text and escape_ty != .name) return error.UndefinedFunction;
+                        if (!value.stringType(escape_ty)) return error.UndefinedFunction;
                     }
                     n.ty = .boolean;
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b) and isConstant(context, n.c);
@@ -2001,6 +2051,10 @@ pub fn Binder(comptime config: types.Config) type {
                         try unifyInto(&result, context.node(n.c).ty);
                         constant = constant and isConstant(context, n.c);
                     }
+                    // PostgreSQL selects the CASE result type with ELSE first,
+                    // after binding all arms in their original semantic order.
+                    result=if(n.c!=none) context.node(n.c).ty else .unknown;
+                    arm=n.b;while(arm!=none):(arm=context.node(arm).next)try unifyInto(&result,context.node(context.node(arm).b).ty);
                     if (result == .unknown) result = .text;
                     const widen = !value.integral(result);
                     arm = n.b;
@@ -2032,6 +2086,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .nullif => {
                     try typeExpr(context, scope, n.a);
                     try typeExpr(context, scope, n.b);
+                    if(context.node(n.a).ty==.varchar)n.a=try convert(context,n.a,.text,-1,.implicit);
+                    if(context.node(n.b).ty==.varchar)n.b=try convert(context,n.b,.text,-1,.implicit);
                     const original = context.node(n.a).ty;
                     const right = context.node(n.b).ty;
                     // PostgreSQL has direct cross-type equality operators for
@@ -2076,7 +2132,8 @@ pub fn Binder(comptime config: types.Config) type {
                     // Typmods are validated at bind time (eval applies them).
                     if (n.typmod >= 0 and context.node(n.a).kind == .text_literal) {
                         const text = E.literalText(context.source, context.node(n.a).text);
-                        _ = try Io.parse(target, n.typmod, text.slice(), context.session);
+                        if(target==.varchar) _=try Io.varcharText(text.slice(),n.typmod,true)
+                        else _ = try Io.parse(target, n.typmod, text.slice(), context.session);
                     }
                     n.ty = target;
                     n.constant = isConstant(context, n.a);
@@ -2095,7 +2152,7 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     if (ty != .timestamp and ty != .timestamptz) return error.UndefinedFunction;
                     try coerce(context, n.b, .text);
-                    if (context.node(n.b).ty != .text) return error.UndefinedFunction;
+                    if (!value.stringType(context.node(n.b).ty)) return error.UndefinedFunction;
                     n.ty = if (ty == .timestamptz) .timestamp else .timestamptz;
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b);
                 },
@@ -2291,10 +2348,54 @@ pub fn Binder(comptime config: types.Config) type {
             return if (scope.rel_count == 0) null else scope.rels[0].table;
         }
 
-        fn outputTypmod(context: *const Context, id: u16) i32 {
+        fn metadataConstant(context:*const Context,id:u16) Error!?V.Cell {
+            if(!generatedConstant(context,id))return null;
+            return generatedValue(context,id) catch |err| {
+                if(planningControlError(err))return err;
+                return null; // Execution diagnostics retain their existing owner/priority.
+            };
+        }
+        fn mergeTypmod(out:*?i32,typmod:i32) void {
+            if(out.*) |old| {if(old!=typmod)out.*=-1;}else out.*=typmod;
+        }
+        fn outputTypmod(context: *const Context, id: u16) Error!i32 {
+            if(id==none)return -1;
             const n = context.node(id);
+            if(n.ty==.varchar) {
+                if(n.kind==.coalesce) {
+                    var modifier:?i32=null;var item=n.b;
+                    while(item!=none):(item=context.node(item).next) {
+                        const known=try metadataConstant(context,item);
+                        if(known) |cell| if(cell==.null_value)continue;
+                        mergeTypmod(&modifier,try outputTypmod(context,item));
+                        if(known!=null)break;
+                    }
+                    return modifier orelse -1;
+                }
+                if(n.kind==.case_expr) {
+                    const operand=if(n.a!=none) try metadataConstant(context,n.a) else null;
+                    var modifier:?i32=null;var arm=n.b;var otherwise=true;
+                    while(arm!=none):(arm=context.node(arm).next) {
+                        const entry=context.node(arm);var hit:?bool=null;
+                        if(try metadataConstant(context,entry.a)) |condition| {
+                            if(n.a==none)hit=condition==.boolean and condition.boolean
+                            else if(operand) |left| hit=E.compareOp(.eq,&left,&condition) orelse false;
+                        }
+                        if(hit==false)continue;
+                        mergeTypmod(&modifier,try outputTypmod(context,entry.b));
+                        if(hit==true){otherwise=false;break;}
+                    }
+                    if(otherwise)mergeTypmod(&modifier,try outputTypmod(context,n.c));
+                    return modifier orelse -1;
+                }
+                if(n.kind==.function and (n.func==.greatest or n.func==.least)) {
+                    var modifier:?i32=null;var item=n.b;
+                    while(item!=none):(item=context.node(item).next)mergeTypmod(&modifier,try outputTypmod(context,item));
+                    return modifier orelse -1;
+                }
+            }
             return switch (n.kind) {
-                .column, .cast => n.typmod,
+                .column, .cast, .scalar_subquery => n.typmod,
                 else => -1,
             };
         }
@@ -2328,7 +2429,7 @@ pub fn Binder(comptime config: types.Config) type {
                 out.targets[out.count] = target.expr;
                 out.names[out.count] = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 out.types[out.count] = types.dataTypeOf(context.node(target.expr).ty);
-                out.typmods[out.count] = outputTypmod(context, target.expr);
+                out.typmods[out.count] = try outputTypmod(context, target.expr);
                 out.count += 1;
             }
             return out;
@@ -2406,7 +2507,7 @@ pub fn Binder(comptime config: types.Config) type {
                 out.targets[out.count] = target.expr;
                 out.names[out.count] = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 out.types[out.count] = types.dataTypeOf(context.node(target.expr).ty);
-                out.typmods[out.count] = outputTypmod(context, target.expr);
+                out.typmods[out.count] = try outputTypmod(context, target.expr);
                 out.count += 1;
             }
             out.where = try bindWhere(context, &scope, select.where);
@@ -3005,7 +3106,7 @@ pub fn Binder(comptime config: types.Config) type {
                 for(spec.order[0..spec.order_count]) |key| try groupify(context,p,key.expr);
             }
             for (p.keys[0..p.key_count], 0..) |key, index| {
-                if (sameExpr(context, id, key)) return groupColumn(n, index, context.node(key).typmod);
+                if (sameExpr(context, id, key)) return groupColumn(n, index, try outputTypmod(context,key));
             }
             if(n.planned_null) {
                 var item=n.b;
@@ -3069,7 +3170,7 @@ pub fn Binder(comptime config: types.Config) type {
             p.targets[p.count] = id;
             p.names[p.count] = name;
             p.tys[p.count] = context.node(id).ty;
-            p.typmods[p.count] = outputTypmod(context, id);
+            p.typmods[p.count] = try outputTypmod(context, id);
             p.count += 1;
         }
 
@@ -3284,7 +3385,7 @@ pub fn Binder(comptime config: types.Config) type {
                 for (on_refs[0..q.distinct_on_count]) |ref| if (ref == .expr) try groupify(context, p, ref.expr);
                 for (0..p.count) |column| {
                     p.tys[column] = context.node(p.targets[column]).ty;
-                    p.typmods[column] = outputTypmod(context, p.targets[column]);
+                    p.typmods[column] = try outputTypmod(context, p.targets[column]);
                 }
             }
             const plain_distinct = q.distinct and q.distinct_on_count == 0;
@@ -3366,7 +3467,7 @@ pub fn Binder(comptime config: types.Config) type {
             if(repeatableWindowInput(context,id)) for(input.targets[0..input.count],0..) |old,i| if(sameExpr(context,old,id)) return @intCast(i);
             if(input.count==config.columns) return error.StatementTooComplex;
             const index=input.count;input.count+=1;input.targets[index]=try cloneTree(context,id);input.window_origins[index]=none;
-            input.tys[index]=context.node(id).ty;input.typmods[index]=outputTypmod(context,id);
+            input.tys[index]=context.node(id).ty;input.typmods[index]=try outputTypmod(context,id);
             input.names[index]=literalName("window_input");return @intCast(index);
         }
         // Sort/group clauses reuse equal expressions even when volatile;

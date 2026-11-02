@@ -159,6 +159,9 @@ pub const Node = struct {
     /// BETWEEN SYMMETRIC; consumed by binding into ordinary comparisons.
     symmetric: bool = false,
     insensitive: bool = false,
+    /// Typed character IN: leading var-free array group, then scalar comparisons.
+    character_in: bool = false,
+    character_array_count: u16 = 0,
     /// Constant subtree (no column reference); set by the binder.
     constant: bool = false,
     /// Numeric strict call with a syntactic NULL argument. Keep its children

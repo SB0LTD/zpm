@@ -148,6 +148,8 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-square-root", "tests/test_sql_square_root.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-planner-demand", "tests/test_sql_planner_demand.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-aggregate-demand", "tests/test_sql_aggregate_demand.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-character-types", "tests/test_sql_character_types.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-character-storage", "tests/test_sql_character_storage.sig", &.{importEntry("sql", "src/core/sql.sig"),importEntry("pg_types", "src/db/pg_types.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-math-composition", "tests/test_sql_math_composition.sig", &.{importEntry("sql", "src/core/sql.sig"),importEntry("math", "src/core/math.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-named-windows", "tests/test_sql_named_windows.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-datetime-format", "tests/test_datetime_format.sig", &.{importEntry("datetime_format", "src/core/sql/datetime_format.sig")});

@@ -25,7 +25,7 @@ pub fn Dml(comptime config: types.Config) type {
         pub fn store(column: *const V.Column, evaluated: V.Cell, session: *const value.Session) Error!V.Cell {
             var cell = evaluated;
             switch (column.data_type) {
-                .text, .name => if (cell != .null_value and cell != .text) {
+                .text, .name, .varchar => if (cell != .null_value and cell != .text) {
                     cell = try E.toText(&evaluated, true, session);
                 },
                 .boolean => if (cell == .integer) {

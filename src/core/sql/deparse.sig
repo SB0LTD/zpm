@@ -250,6 +250,9 @@ pub fn Deparse(comptime config: types.Config) type {
                     }
                     try w.bytes("::");
                     try w.bytes(types.sqlTypeName(types.dataTypeOf(n.cast_type)));
+                    if(n.cast_type==.varchar and n.typmod>=5) {
+                        try w.bytes("(");try integer(n.typmod-4,w);try w.bytes(")");
+                    }
                 },
                 else => return error.UnsupportedStatement,
             }

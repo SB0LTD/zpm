@@ -69,6 +69,15 @@ jobs:
           python tools/verify_sql_aggregate_demand.py
           --port ${{ job.services.postgres.ports[5432] }}
           --expected-major ${{ matrix.major }} --report aggregate-demand-oracle.json
+      - name: Verify VARCHAR values, typmods and failure observations
+        # The generated runtime contract must use this exact frozen corpus.
+        run: >-
+          python tools/generate_sql_character_types.py --check
+      - name: Replay VARCHAR native observations
+        run: >-
+          python tools/verify_sql_character_types.py
+          --port ${{ job.services.postgres.ports[5432] }}
+          --expected-major ${{ matrix.major }} --report character-types-oracle.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -77,6 +86,7 @@ jobs:
             parameter-oracle.json
             planner-demand-oracle.json
             aggregate-demand-oracle.json
+            character-types-oracle.json
           if-no-files-found: error
 
   native:

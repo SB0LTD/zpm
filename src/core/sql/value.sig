@@ -15,6 +15,7 @@ const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
 const expr = @import("expr.sig");
 const ast = @import("ast.sig");
+const character = @import("character.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -71,7 +72,7 @@ pub fn integral(ty: Type) bool {
 }
 
 pub fn stringType(ty: Type) bool {
-    return ty == .text or ty == .name;
+    return ty == .text or ty == .name or ty == .varchar;
 }
 
 pub fn datetime(ty: Type) bool {
@@ -104,6 +105,7 @@ fn datetimeRank(ty: Type) u8 {
 pub fn castable(from: Type, to: Type, context: Context) bool {
     if (from == to) return true;
     if (from == .unknown) return true;
+    if(from==.name and to==.varchar)return context!=.implicit;
     // Implicit promotions.
     if (numericCategory(from) and numericCategory(to) and numericRank(from) < numericRank(to)) return true;
     if (datetime(from) and datetime(to) and datetimeRank(from) < datetimeRank(to)) return true;
@@ -129,6 +131,7 @@ pub fn castable(from: Type, to: Type, context: Context) bool {
 /// common-type selection. Rounding an exact int/numeric to float4 first can
 /// turn distinct values into equal ones (e.g. 16777217 and 16777216::real).
 pub fn comparisonType(a: Type, b: Type) ?Type {
+    if(stringType(a) and stringType(b))return .text;
     if (a != b and numericCategory(a) and numericCategory(b) and (a == .float4 or b == .float4)) return .float8;
     return common(a, b);
 }
@@ -140,7 +143,10 @@ pub fn common(a: Type, b: Type) ?Type {
         return high;
     }
     if (datetime(a) and datetime(b)) return if (datetimeRank(a) > datetimeRank(b)) a else b;
-    if (stringType(a) and stringType(b)) return .text;
+    if (stringType(a) and stringType(b)) {
+        if((a==.name and b==.varchar) or (a==.varchar and b==.name))return .name;
+        return a; // Bidirectional implicit string casts retain the first type.
+    }
     // int2/int4/int8 -> oid is implicit (catalog OID comparisons).
     if ((a == .oid and (b == .int2 or b == .int4 or b == .int8)) or (b == .oid and (a == .int2 or a == .int4 or a == .int8))) return .oid;
     return null;
@@ -274,6 +280,7 @@ pub fn Io(comptime config: types.Config) type {
 
         /// Input function of `ty` (typmod applied).
         pub fn parse(ty: Type, typmod: i32, input: []const u8, session: *const Session) Error!V.Cell {
+            if(ty==.varchar)return varcharText(input,typmod,false);
             const cell: V.Cell = switch (ty) {
                 .int2, .int4, .int8 => .{ .integer = blk: {
                     const value = try expr.parseInteger(input, if (ty == .int2) .int4 else ty);
@@ -287,11 +294,11 @@ pub fn Io(comptime config: types.Config) type {
                     break :blk if (value < 0) value + 4294967296 else value;
                 } },
                 .boolean => .{ .boolean = try expr.parseBoolean(input) },
-                .text, .unknown, .json => blk: {
+                .text, .unknown, .json, .varchar => blk: {
                     if (ty == .json) try J.validateJsonControlled(input, session.control);
                     break :blk try textCell(input);
                 },
-                .name => try textCell(input[0..@min(input.len, 63)]),
+                .name => try textCell(try character.bytePrefix(input,63)),
                 .numeric => .{ .numeric = try N.parse(input) },
                 .float4 => .{ .float4 = try float_text.parse(f32, input) },
                 .float8 => .{ .float8 = try float_text.parse(f64, input) },
@@ -306,6 +313,7 @@ pub fn Io(comptime config: types.Config) type {
 
         /// Length coercion: NUMERIC(p,s) and TIMESTAMP[TZ](p).
         pub fn applyTypmod(cell: V.Cell, ty: Type, typmod: i32) Error!V.Cell {
+            if(ty==.varchar and cell!=.null_value)return varcharText(cell.text.slice(),typmod,false);
             if (typmod < 0 or cell == .null_value) return cell;
             return switch (ty) {
                 .numeric => .{ .numeric = try N.applyTypmod(&cell.numeric, typmod) },
@@ -314,6 +322,11 @@ pub fn Io(comptime config: types.Config) type {
                 else => cell,
             };
         }
+
+        pub fn varcharText(input:[]const u8,typmod:i32,explicit:bool) Error!V.Cell {
+            return textCell(try character.coerce(input,typmod,explicit));
+        }
+        pub fn validateCharacters(input:[]const u8) Error!void {_=try character.coerce(input,-1,false);}
 
         fn floatToNumeric(value: f64, significant: usize) Error!numeric.Numeric {
             if (value != value) return numeric.nan();
@@ -360,6 +373,11 @@ pub fn Io(comptime config: types.Config) type {
         pub fn cast(cell: V.Cell, from: Type, to: Type, typmod: i32, session: *const Session) Error!V.Cell {
             if (cell == .null_value) return .null_value;
             if (from == to and typmod < 0) return cell;
+            if(to==.varchar) {
+                if(cell==.text)return varcharText(cell.text.slice(),typmod,true);
+                var buffer:[format_bytes]u8=undefined;
+                return varcharText(try format(&cell,true,session,&buffer),typmod,true);
+            }
             const out: V.Cell = switch (to) {
                 .int2, .int4, .int8 => switch (cell) {
                     .integer => |value| blk: {
@@ -422,14 +440,14 @@ pub fn Io(comptime config: types.Config) type {
                     .text => |*value| try parse(.float8, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
-                .text, .name => blk: {
+                .text, .name, .varchar => blk: {
                     if (cell == .text) {
                         const bytes = cell.text.slice();
-                        break :blk try textCell(if (to == .name) bytes[0..@min(bytes.len, 63)] else bytes);
+                        break :blk try textCell(if (to == .name) try character.bytePrefix(bytes,63) else bytes);
                     }
                     var buffer: [format_bytes]u8 = undefined;
                     const bytes = try format(&cell, true, session, &buffer);
-                    break :blk try textCell(if (to == .name) bytes[0..@min(bytes.len, 63)] else bytes);
+                    break :blk try textCell(if (to == .name) try character.bytePrefix(bytes,63) else bytes);
                 },
                 .json => switch (cell) {
                     .text => |*value| blk: {

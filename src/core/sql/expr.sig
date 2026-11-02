@@ -337,6 +337,10 @@ pub fn Eval(comptime config: types.Config) type {
                 }
             }.f;
             switch (known) {
+                .varchar => if(typmod>=5) {
+                    append(&buffer,&at,"character varying(");number(&buffer,&at,typmod-4);append(&buffer,&at,")");
+                    return textCell(buffer[0..at]);
+                },
                 .numeric => if (typmod >= 4) {
                     const packed_value = typmod - 4;
                     append(&buffer, &at, "numeric(");
@@ -640,6 +644,24 @@ pub fn Eval(comptime config: types.Config) type {
                     return if (n.negated) (if (result) |b| !b else null) else result;
                 },
                 .in_list => {
+                    if(n.character_in) {
+                        var item=n.b;var index:usize=0;var found=false;var saw_null=false;
+                        var array_left:V.Cell=.null_value;
+                        const from=node(ctx,n.a).ty;
+                        if(n.character_array_count!=0)array_left=try cast(try eval(ctx,n.a),from,node(ctx,item).ty,-1,ctx.session);
+                        while(item!=none):(index+=1) {
+                            if(index==n.character_array_count and found)return !n.negated;
+                            const left=if(index<n.character_array_count) array_left
+                                else try cast(try eval(ctx,n.a),from,node(ctx,item).ty,-1,ctx.session);
+                            const right=try eval(ctx,item);
+                            if(compareOp(.eq,&left,&right)) |equal| {
+                                if(equal) {if(index>=n.character_array_count)return !n.negated;found=true;}
+                            }else saw_null=true;
+                            item=node(ctx,item).next;
+                        }
+                        const answer:?bool=if(found) true else if(saw_null) null else false;
+                        return if(n.negated) (if(answer) |b| !b else null) else answer;
+                    }
                     // Every list element is evaluated (PostgreSQL builds the array first).
                     const value = try eval(ctx, n.a);
                     var found = false;

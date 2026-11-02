@@ -993,7 +993,7 @@ pub fn Session(comptime DB: type) type {
                 var used: usize = 0;
                 for (fields[0..count], 0..) |*field, index| if (field.*) |bytes| {
                     const out = self.copy.scratch[used..];
-                    const text = T.receiveText(bytes, info.types[index], out) catch |err| return if (err == error.BufferTooSmall) error.TextCapacity else error.InvalidBinaryRepresentation;
+                    const text = T.receiveText(bytes, info.types[index], out) catch |err| return if (err == error.BufferTooSmall) error.TextCapacity else if(err==error.CharacterNotInRepertoire) err else error.InvalidBinaryRepresentation;
                     if (text.len != 0 and @intFromPtr(text.ptr) == @intFromPtr(out.ptr)) used += text.len;
                     field.* = text;
                 };
@@ -1521,6 +1521,8 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "PrimaryKeyViolation")) return "23505";
     if (equal(name, "NotNullViolation")) return "23502";
     if (equal(name, "TypeMismatch")) return "42804";
+    if (equal(name, "StringDataRightTruncation")) return "22001";
+    if (equal(name, "CharacterNotInRepertoire")) return "22021";
     if (equal(name, "IntegerOverflow")) return "22003";
     if (equal(name, "ProtocolViolation")) return "08P01";
     if (equal(name, "StatementNotFound")) return "26000";

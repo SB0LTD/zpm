@@ -730,6 +730,24 @@ fn splicedParameterValues() !void {
     try state(try bind(&s, &db, "", "", &minimum_values, 1, 0), "54000");
     try sync(&s, &db);
 }
+/// Validate VARCHAR parameter bytes before SQL literal substitution.
+fn characterParameters() !void {
+    var db:DB=.{};var s:Session=.{};try startup(&s,&db);
+    try tags(try parse(&s,&db,"","SELECT $1::varchar(2)",&.{1043}),"1");
+    for([_]u16{0,1}) |format| {
+        for([_][]const u8{"a\x00b","\x80","\xc0\xaf","\xed\xa0\x80","\xf0\x9f"}) |bad| {
+            const values=[_]?[]const u8{bad};
+            try state(try bind(&s,&db,"","",&values,format,format),"22021");
+            try sync(&s,&db);
+        }
+        const values=[_]?[]const u8{"\xc3\xa9\xf0\x9f\x99\x82x"};
+        try tags(try bind(&s,&db,"","",&values,format,format),"2");
+        try tags(try execute(&s,&db,"",0),"DC");
+        try check(s.result.column_types[0]==.varchar and s.result.column_typmods[0]==6);
+        try check(equal(s.result.rows[0].cells[0].text.slice(),"\xc3\xa9\xf0\x9f\x99\x82"));
+        try sync(&s,&db);
+    }
+}
 /// A negative bound LIMIT or OFFSET is spliced as `(-1)` (NET-01) and still
 /// reports 2201W / 2201X, as PostgreSQL does. Non-negative counts stay bare.
 fn negativeCounts() !void {
@@ -1300,6 +1318,7 @@ pub fn main(init: std.process.Init) !void {
     try parameterConstantSelect();
     try inference();
     try negativeParameters();
+    try characterParameters();
     try splicedParameterValues();
     try negativeCounts();
     try errorStates();

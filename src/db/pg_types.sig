@@ -11,7 +11,7 @@
 //! so binary input is decoded and re-encoded as text; malformed binary input
 //! is a protocol violation (08P01).
 
-pub const Error = error{ BufferTooSmall, ProtocolViolation, UnsupportedBinaryType };
+pub const Error = error{ BufferTooSmall, ProtocolViolation, UnsupportedBinaryType, CharacterNotInRepertoire };
 
 fn put(out: []u8, at: *usize, bytes: []const u8) Error!void {
     if (bytes.len > out.len - at.*) return error.BufferTooSmall;
@@ -141,6 +141,7 @@ pub fn Types(comptime Result: type) type {
         /// A parameter value as a typed SQL literal.
         pub fn literal(bytes: []const u8, type_oid: u32, format: u16, out: []u8) Error!usize {
             const name = castName(type_oid) orelse return error.UnsupportedBinaryType;
+            if(type_oid==1043)Io.validateCharacters(bytes) catch return error.CharacterNotInRepertoire;
             var at: usize = 0;
             if (format == 0) {
                 try quote(out, &at, bytes);
@@ -162,6 +163,7 @@ pub fn Types(comptime Result: type) type {
         /// are returned in place; others are rendered into `out`.
         pub fn receiveText(bytes: []const u8, data_type: DataType, out: []u8) Error![]const u8 {
             switch (data_type) {
+                .varchar => {Io.validateCharacters(bytes) catch return error.CharacterNotInRepertoire;return bytes;},
                 .text, .name, .json => return bytes,
                 .jsonb => {
                     if (bytes.len == 0 or bytes[0] != 1) return error.ProtocolViolation;
@@ -237,7 +239,7 @@ pub fn Types(comptime Result: type) type {
                     text.len = bytes.len - 1;
                     break :blk Cell{ .text = text };
                 },
-                .name, .json => blk: {
+                .name, .json, .varchar => blk: {
                     var text: Io.Text = .{};
                     if (bytes.len > text.bytes.len) return error.ProtocolViolation;
                     @memcpy(text.bytes[0..bytes.len], bytes);

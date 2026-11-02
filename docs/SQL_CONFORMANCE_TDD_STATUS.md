@@ -1,5 +1,44 @@
 # SQL conformance TDD checkpoint
 
+## VARCHAR development checkpoint - 3 November 2026
+
+The APP-01 VARCHAR / CHARACTER VARYING candidate passes 37 native-reference
+programs and independent native PostgreSQL 16 replay. The storage contract passes
+318 assertions; final-source PostgreSQL protocol 21,000, typed change-log 940,
+types 901,501, catalog 36, planner 444, and aggregate 53 programs also pass.
+Independent runtime and incremental parser reviews found no introduced blocker.
+These are local candidate results: PostgreSQL 18, hosted platforms, product wire
+and durable-restart checks, and exact release qualification remain gates.
+
+The unchanged 118-program audit now reports **13 smoke passes, 88 failures and
+17 unexecuted scopes/comparators**, expected exit 1. PG.TYPE.CHARACTER is the one
+new smoke match; despite its VARCHAR/CHAR title, its SQL exercises only VARCHAR.
+CHAR/BPCHAR remains open. The counts are not a compatibility percentage.
+See [SQL_CHARACTER_TYPES.md](SQL_CHARACTER_TYPES.md) for implementation scope,
+known boundaries and evidence; all APP stages remain incomplete.
+
+## Qualified aggregate checkpoint - 2 November 2026
+
+Aggregate-state demand is qualified, merged and published: ZPM PR99 (9b0900c),
+RAMSQL PR52 (89e790a), immutable source pin fbaeee24. The final53-program corpus
+passes native PostgreSQL16.15/18.3 and the allocator-free core. Local wire
+comparisons match108/108 cases across memory and durable-SCRAM, including bound
+parameters and binary results. ZPM database41449373536 passed all5 jobs; broad
+CI41449373346 passed331 steps with21 skips and no failures. RAMSQL CI41449898535
+passed8/8; exact release41449898796 passed25 active jobs plus one intentional
+duplicate differential skip. The eight-target prerelease has29 verified assets:
+ci-v0.3.0-beta.2-run.41449898796.1. Its source tree exactly matches RAMSQL main.
+
+Unused named WINDOW aggregate dependencies were a real regression in the first
+candidate; full CI found it and the final three native-backed cases retain the
+evidence. Existing right-hand boolean/dead named-definition pruning, DML-root
+demand, window/correlation and numeric-capacity gaps remain open. The unchanged
+118-program audit remains12smoke passes/89failures/17unexecuted, expected exit1.
+The candidate sections below are historical checkpoints, not current merge status.
+
+Application-facing compatibility now follows the dependency order in
+[SQL_APPLICATION_COMPATIBILITY_PLAN.md](SQL_APPLICATION_COMPATIBILITY_PLAN.md).
+
 ## Qualified planner checkpoint - 2 November 2026
 
 Plain derived-output demand and immutable error timing qualified and merged in

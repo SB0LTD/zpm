@@ -557,7 +557,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn typeWord(token: Token) bool {
             return switch (token.keyword) {
-                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
+                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .varchar, .character, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
                 else => false,
             };
         }
@@ -591,6 +591,14 @@ pub fn Parser(comptime config: types.Config) type {
                 .smallint, .int2 => .{ .ty = .int2 },
                 .boolean, .@"bool" => .{ .ty = .boolean },
                 .text => .{ .ty = .text },
+                .varchar, .character => blk: {
+                    if(word.keyword==.character)try self.expectWord("VARYING");
+                    if(!try self.takeSymbol(.lparen))break :blk .{.ty=.varchar};
+                    if(self.current.kind!=.integer)return error.Syntax;
+                    const length=self.current.integer;try self.advance();try self.expectSymbol(.rparen);
+                    if(length>10485760 or length<1)return error.InvalidParameterValue;
+                    break :blk .{.ty=.varchar,.typmod=try @import("character.sig").encodeTypmod(@intCast(length))};
+                },
                 .name => .{ .ty = .name },
                 .oid => .{ .ty = .oid },
                 .real, .float4 => .{ .ty = .float4 },
@@ -1294,7 +1302,11 @@ pub fn Parser(comptime config: types.Config) type {
             // Fast path for the common bare column (projection lists).
             const niladic = wordIs(self.source, self.current, "current_timestamp") or wordIs(self.source, self.current, "current_date");
             if ((self.current.kind == .word and !lexer.reserved(self.current.keyword) and !niladic) or self.current.kind == .quoted_word) {
-                if (ends(try self.peek())) {
+                const after = try self.peek();
+                // CHARACTER VARYING starts a typed literal, not a bare column
+                // followed by an unreserved alias. Bare CHARACTER stays legal.
+                const varying_type = self.current.isWord("CHARACTER") and after.isWord("VARYING");
+                if (!varying_type and ends(after)) {
                     const name = try self.identifier();
                     return self.pool.add(.{ .kind = .column, .name = name });
                 }
@@ -1809,6 +1821,8 @@ pub fn Parser(comptime config: types.Config) type {
                 if (typeWord(token)) {
                     const after = try self.peek();
                     const multiword = (token.isWord("DOUBLE") and after.isWord("PRECISION")) or
+                        (token.isWord("CHARACTER") and after.isWord("VARYING")) or
+                        (token.isWord("VARCHAR") and after.kind==.symbol and after.symbol==.lparen) or
                         (token.isWord("TIMESTAMP") and (after.isWord("WITH") or after.isWord("WITHOUT"))) or
                         ((token.isWord("NUMERIC") or token.isWord("DECIMAL") or token.isWord("TIMESTAMP") or token.isWord("TIMESTAMPTZ")) and after.kind == .symbol and after.symbol == .lparen);
                     if (after.kind == .string or multiword) {
