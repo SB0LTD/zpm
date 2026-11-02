@@ -2518,7 +2518,8 @@ pub fn Database(comptime config: Config) type {
             if (slot) |owner| if (self.active(owner)) {
                 snap = .{ .csn = self.csn, .slot = owner, .epoch = self.txs[owner].epoch, .cid = self.txs[owner].cid +% 1 };
             };
-            const context = self.bindContext(source, .standard, snap);
+            var context = self.bindContext(source, .standard, snap);
+            context.describe_only=true;
             const bound = try B.bind(&context, &parsed);
             result.clear(0);
             result.command = B.command(&bound);

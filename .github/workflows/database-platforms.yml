@@ -55,11 +55,18 @@ jobs:
           python tools/verify_pg_parameter_lexing.py
           --port ${{ job.services.postgres.ports[5432] }}
           --expected-major ${{ matrix.major }} --report parameter-oracle.json
+      - name: Verify immutable diagnostics and plain output demand
+        run: >-
+          python tools/verify_sql_planner_demand.py
+          --port ${{ job.services.postgres.ports[5432] }}
+          --expected-major ${{ matrix.major }} --report planner-demand-oracle.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: parameter-oracle-pg${{ matrix.major }}
-          path: parameter-oracle.json
+          path: |
+            parameter-oracle.json
+            planner-demand-oracle.json
           if-no-files-found: error
 
   native:

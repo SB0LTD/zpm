@@ -399,6 +399,8 @@ pub fn Ast(comptime config: types.Config) type {
             /// No LIMIT (or LIMIT ALL) is maxInt(u64).
             limit: u64 = 0xffffffffffffffff,
             offset: u64 = 0,
+            limit_present:bool=false,
+            offset_present:bool=false,
             negative_limit: bool = false,
             negative_offset: bool = false,
             lock: Locking = .{},

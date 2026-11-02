@@ -1,5 +1,22 @@
 # SQL conformance TDD checkpoint
 
+## Planner candidate checkpoint - 2 November 2026
+
+The concrete unused-derived TRUNC and empty-input SQRT examples have candidate
+fixes in [SQL_PLANNER_DEMAND.md](SQL_PLANNER_DEMAND.md). Native PostgreSQL16.15
+verifies94 execution cases plus4 Parse/Describe probes. The core contract adds
+metadata/type checks,80 one-shot cancellation positions and existing depth bounds.
+Required output bits and owned constant values are caller-backed, with no AST
+substitution or hidden allocator. General grouping/window-state, scalar-subquery
+output pruning, correlation and complete planner parity remain open. This is not
+a SQL-family closure or a full-inventory compatibility percentage. Fresh hosted
+qualification and final independent review are required before this candidate merges.
+
+NET-02's shared-tokenizer slice qualified and merged in ZPM PR96 (main1440f9a)
+and RAMSQL PR50 (main1c13ab7). Native16.15/18.3 each passed78 template cases;
+all three ZPM database hosts, RAMSQL CI41339791061 and release41339791138 passed.
+The exact eight-target bundle published automatically as a non-latest CI prerelease.
+
 ## Latest qualified checkpoint - 1 November 2026
 
 The unchanged 118-program driver has **12 smoke passes, 89 failures and 17
