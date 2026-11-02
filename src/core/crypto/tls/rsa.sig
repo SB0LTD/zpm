@@ -15,8 +15,13 @@
 const sha256 = @import("sha256");
 const sha512_mod = @import("sha512.sig");
 
-/// Max modulus size: 4096 bits = 512 bytes = 64 limbs of 64 bits.
-pub const MAX_LIMBS: usize = 64;
+/// Max modulus size: 4096 bits = 512 bytes.
+pub const MAX_MODULUS_BYTES: usize = 512;
+/// Bignum width: 64 limbs hold the modulus, plus one spare limb of headroom —
+/// reduce() shifts the running remainder left before its conditional subtract,
+/// so it briefly needs modulus_bits + 1 bits. Without the spare limb a full
+/// 4096-bit modulus (ISRG Root X1, GTS Root R1) silently lost its top bit.
+pub const MAX_LIMBS: usize = MAX_MODULUS_BYTES / 8 + 1;
 const LIMB_BITS: usize = 64;
 
 pub const Error = error{
@@ -168,28 +173,22 @@ fn reduce(wide: *const [MAX_LIMBS * 2]u64, n: *const Big) Big {
     var bit_i = total_bits;
     while (bit_i > 0) {
         bit_i -= 1;
-        // r <<= 1 (carry_out is bit 2^(MAX_LIMBS*64) that falls off the top)
-        const carry_out = shl1(&r);
+        // r <<= 1
+        shl1(&r);
         // bring in the current bit
         const limb = bit_i / LIMB_BITS;
         const shift: u6 = @intCast(bit_i % LIMB_BITS);
         const bit: u64 = (wide[limb] >> shift) & 1;
         r.limbs[0] |= bit;
-        // Reduce. When shl1 overflowed (4096-bit modulus case), the true
-        // value is r + 2^(MAX_LIMBS*64) >= n, so subtract n; one subtraction
-        // suffices because 2^(MAX_LIMBS*64) < 2n for a normalized top-bit modulus.
-        if (carry_out != 0) {
-            r.subInPlace(n);
-        } else if (r.cmp(n) >= 0) {
-            r.subInPlace(n);
-        }
+        // if r >= n, r -= n
+        if (r.cmp(n) >= 0) r.subInPlace(n);
     }
     r.n = r.sigLimbs();
     return r;
 }
 
 /// r <<= 1 across all limbs.
-fn shl1(r: *Big) u64 {
+fn shl1(r: *Big) void {
     var carry: u64 = 0;
     var i: usize = 0;
     while (i < MAX_LIMBS) : (i += 1) {
@@ -197,7 +196,6 @@ fn shl1(r: *Big) u64 {
         r.limbs[i] = (r.limbs[i] << 1) | carry;
         carry = new_carry;
     }
-    return carry; // bit shifted out of the top (bit MAX_LIMBS*64)
 }
 
 /// Modular multiply: (a * b) mod n.
@@ -238,6 +236,7 @@ pub const PublicKey = struct {
 
 /// Build an RSA public key from big-endian modulus and exponent bytes.
 pub fn publicKey(modulus_be: []const u8, exponent_be: []const u8) Error!PublicKey {
+    if (modulus_be.len > MAX_MODULUS_BYTES) return Error.ModulusTooLarge;
     const n = try Big.fromBytesBE(modulus_be);
     const e = try Big.fromBytesBE(exponent_be);
     return .{ .n = n, .e = e, .k = modulus_be.len };
@@ -264,7 +263,7 @@ pub const Hash = enum { sha256, sha384, sha512 };
 /// Returns true iff the signature is valid.
 pub fn verifyPkcs1(pk: *const PublicKey, hash: Hash, msg: []const u8, sig: []const u8) bool {
     if (sig.len != pk.k) return false;
-    if (pk.k > MAX_LIMBS * 8) return false;
+    if (pk.k > MAX_MODULUS_BYTES) return false;
 
     // m = sig^e mod n; reject s >= n (RFC 8017 §5.2.2 step 1).
     const s = Big.fromBytesBE(sig) catch return false;
@@ -365,7 +364,7 @@ pub fn verifyPssSha256(pk: *const PublicKey, msg: []const u8, sig: []const u8) b
     const hlen: usize = 32;
     const slen: usize = 32; // TLS uses salt length == hash length
     if (sig.len != pk.k) return false;
-    if (pk.k > MAX_LIMBS * 8) return false;
+    if (pk.k > MAX_MODULUS_BYTES) return false;
 
     const s = Big.fromBytesBE(sig) catch return false;
     if (s.cmp(&pk.n) >= 0) return false;
