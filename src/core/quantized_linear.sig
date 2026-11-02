@@ -15,6 +15,8 @@ pub const Error = error{
 pub const QK_K: usize = 256;
 pub const Q4_K_BLOCK_BYTES: usize = 144;
 pub const Q6_K_BLOCK_BYTES: usize = 210;
+pub const QK8_0: usize = 32;
+pub const Q8_0_BLOCK_BYTES: usize = 34;
 
 /// SB0-native symmetric four-bit row block.  A 32-element block is small
 /// enough to divide every linear dimension in the first-class SmolVLM2
@@ -318,6 +320,91 @@ pub fn dotQ6KQ8K(weight_bytes: []const u8, activations: []const Q8KBlock) Error!
 }
 
 pub const MAX_TILE: usize = 4;
+
+/// GGML Q8_0 activation block, the vec_dot_type of Q8_0 weights: the scale
+/// is kept as the f32 value of its f16 rounding, so dots multiply what GGML
+/// multiplies without converting per row.
+pub const Q80Block = struct {
+    d: f32 = 0,
+    qs: [QK8_0]i8 = @splat(0),
+};
+
+/// Quantize complete 32-lane blocks as GGML's x86 quantize_row_q8_0 does:
+/// d = amax / 127 rounded to f16, values multiplied by 127 / amax and rounded
+/// to nearest, ties to even. (GGML's NEON path multiplies by 1 / d instead,
+/// which can move a tie; the x86 rule is the parity reference.)
+pub fn quantizeQ80(input: []const f32, output: []Q80Block) Error!void {
+    if (input.len == 0 or input.len % QK8_0 != 0) return error.InvalidDimensions;
+    if (output.len < input.len / QK8_0) return error.BufferTooSmall;
+    for (output[0 .. input.len / QK8_0], 0..) |*block, block_index| {
+        const source: @Vector(QK8_0, f32) = input[block_index * QK8_0 ..][0..QK8_0].*;
+        const magnitude = @reduce(.Max, @abs(source));
+        block.d = @floatCast(@as(f16, @floatCast(magnitude / 127.0)));
+        const inverse: f32 = if (magnitude != 0) 127.0 / magnitude else 0;
+        const scaled: [QK8_0]f32 = source * @as(@Vector(QK8_0, f32), @splat(inverse));
+        for (&block.qs, 0..) |*quantized, lane| quantized.* = @intCast(@max(-127, @min(127, nearestInt(scaled[lane]))));
+    }
+}
+
+/// Q8_0 weight row x Q8_0 activations, GGML's x86 ggml_vec_dot_q8_0_q8_0.
+pub fn dotQ80Q80(weight_bytes: []const u8, activations: []const Q80Block) Error!f32 {
+    if (activations.len == 0) return error.InvalidDimensions;
+    if (weight_bytes.len < activations.len * Q8_0_BLOCK_BYTES) return error.BufferTooSmall;
+    return dotQ80Q80Tile(1, weight_bytes, .{activations.ptr}, activations.len)[0];
+}
+
+/// One Q8_0 weight row against up to MAX_TILE activation rows. Per block the
+/// eight four-product lane sums are scaled by d_w * d_x and fused into eight
+/// f32 accumulators, then reduced pairwise (hi + lo, then even + odd) as
+/// GGML's AVX2 kernel and llamafile's tinyBLAS do: x86 results are bit-equal.
+pub fn dotQ80Q80Tile(comptime count: usize, weight_bytes: []const u8, activations: [count][*]const Q80Block, blocks: usize) [count]f32 {
+    var sums: [count]F32x8 = @splat(@splat(0));
+    for (0..blocks) |block_index| {
+        const block = weight_bytes[block_index * Q8_0_BLOCK_BYTES ..][0..Q8_0_BLOCK_BYTES];
+        const d = halfAt(block, 0);
+        const quants: Signed32 = @bitCast(block[2..34].*);
+        // |w| as unsigned bytes with w's sign moved onto the activations is
+        // the operand shape of vpdpbusd and vpmaddubsw (Q8_0 never holds -128).
+        const magnitude: Bytes32 = @bitCast(@abs(quants));
+        const negative = quants < @as(Signed32, @splat(0));
+        inline for (0..count) |row| {
+            const activation = &activations[row][block_index];
+            const values: Signed32 = activation.qs;
+            const signed = @select(i8, negative, -%values, values);
+            const integer = quadSums(magnitude, signed);
+            sums[row] = @mulAdd(F32x8, @splat(d * activation.d), @floatFromInt(integer), sums[row]);
+        }
+    }
+    var result: [count]f32 = undefined;
+    inline for (0..count) |row| result[row] = reduceLikeAvx(sums[row]);
+    return result;
+}
+
+/// The four-product lane sums of unsigned x signed bytes: vpdpbusd with
+/// AVX-VNNI, sdot on AArch64 (operands stay below 128, so the signed reading
+/// of `weights` is the same), vpmaddubsw + vpmaddwd otherwise.
+inline fn quadSums(weights: Bytes32, activations: Signed32) I32x8 {
+    if (quad_dots) return dotQuads(@splat(0), weights, activations);
+    return mulAddWords(mulAddPairs(weights, activations), @splat(1));
+}
+
+/// _mm256_extractf128 + _mm_add_ps, then movehl + add, then movehdup + add_ss.
+inline fn reduceLikeAvx(lanes: F32x8) f32 {
+    const quarter = @shuffle(f32, lanes, undefined, [4]i32{ 4, 5, 6, 7 }) + @shuffle(f32, lanes, undefined, [4]i32{ 0, 1, 2, 3 });
+    const half = @shuffle(f32, quarter, undefined, [2]i32{ 0, 1 }) + @shuffle(f32, quarter, undefined, [2]i32{ 2, 3 });
+    return half[0] + half[1];
+}
+
+/// Rows of a Q8_0 matrix as f32 (ggml_get_rows of a Q8_0 table).
+pub fn dequantizeQ80(output: []f32, weight_bytes: []const u8) Error!void {
+    if (output.len % QK8_0 != 0) return error.InvalidDimensions;
+    if (weight_bytes.len < output.len / QK8_0 * Q8_0_BLOCK_BYTES) return error.BufferTooSmall;
+    for (0..output.len / QK8_0) |block_index| {
+        const block = weight_bytes[block_index * Q8_0_BLOCK_BYTES ..][0..Q8_0_BLOCK_BYTES];
+        const d = halfAt(block, 0);
+        for (output[block_index * QK8_0 ..][0..QK8_0], block[2..34]) |*value, quant| value.* = d * @as(f32, @floatFromInt(@as(i8, @bitCast(quant))));
+    }
+}
 
 /// One weight row against up to MAX_TILE activation rows of `blocks` blocks:
 /// each weight block is unpacked once and reused, which is what makes batched
@@ -1365,6 +1452,90 @@ test "packed Q6_K x8 tiles equal the row kernels" {
         };
     }
     try std.testing.expectError(error.BufferTooSmall, packQ6KX8(packed_rows[0 .. rows.len - 1], &rows, 2));
+}
+
+test "Q8_0 quantization matches GGML's x86 rule" {
+    // amax 127/64 makes 127/amax exactly 64: 0.5/64 and 1.5/64 are ties that
+    // round to even, and d is amax/127 = 1/64 exactly.
+    var input: [QK8_0]f32 = @splat(0);
+    input[0] = -1.984375;
+    input[1] = 1.0;
+    input[2] = 0.5 / 64.0;
+    input[3] = 1.5 / 64.0;
+    input[4] = -2.5 / 64.0;
+    var blocks: [1]Q80Block = undefined;
+    try quantizeQ80(&input, &blocks);
+    const qs = blocks[0].qs;
+    if (qs[0] != -127 or qs[1] != 64 or qs[2] != 0 or qs[3] != 2 or qs[4] != -2) return error.TestUnexpectedResult;
+    if (blocks[0].d != 1.0 / 64.0) return error.TestUnexpectedResult;
+    // An all-zero block has a zero scale and zero quants.
+    @memset(&input, 0);
+    try quantizeQ80(&input, &blocks);
+    if (blocks[0].d != 0 or blocks[0].qs[5] != 0) return error.TestUnexpectedResult;
+    try std.testing.expectError(error.InvalidDimensions, quantizeQ80(input[0..31], &blocks));
+}
+
+fn patternedQ80Rows(comptime rows: usize, comptime blocks: usize, seed: u32) [rows * blocks * Q8_0_BLOCK_BYTES]u8 {
+    var bytes: [rows * blocks * Q8_0_BLOCK_BYTES]u8 = undefined;
+    var state = seed;
+    for (0..rows * blocks) |block| {
+        const out = bytes[block * Q8_0_BLOCK_BYTES ..][0..Q8_0_BLOCK_BYTES];
+        state = state *% 1664525 +% 1013904223;
+        const d: f16 = @floatCast(0.001 + @as(f32, @floatFromInt(state >> 24)) / 25600.0);
+        std.mem.writeInt(u16, out[0..2], @bitCast(d), .little);
+        for (out[2..]) |*quant| {
+            state = state *% 1664525 +% 1013904223;
+            quant.* = @bitCast(@as(i8, @intCast(@as(i32, @intCast((state >> 24) % 255)) - 127)));
+        }
+    }
+    return bytes;
+}
+
+test "Q8_0 dots equal the dequantized products" {
+    const blocks = 3;
+    const input = patternedInput(9);
+    var activations: [blocks]Q80Block = undefined;
+    try quantizeQ80(input[0 .. blocks * QK8_0], &activations);
+    const row = patternedQ80Rows(1, blocks, 5);
+    var weights: [blocks * QK8_0]f32 = undefined;
+    try dequantizeQ80(&weights, &row);
+    var expected: f64 = 0;
+    var magnitude: f64 = 0;
+    for (weights, 0..) |weight, element| {
+        const block = activations[element / QK8_0];
+        const product = @as(f64, weight) * block.d * @as(f64, @floatFromInt(block.qs[element % QK8_0]));
+        expected += product;
+        magnitude += @abs(product);
+    }
+    const actual = try dotQ80Q80(&row, &activations);
+    if (@abs(actual - expected) > 1e-5 * magnitude) return error.TestUnexpectedResult;
+    try std.testing.expectError(error.BufferTooSmall, dotQ80Q80(row[0 .. row.len - 1], &activations));
+}
+
+test "tiled Q8_0 dots equal one row at a time" {
+    const blocks = 4;
+    var activations: [MAX_TILE][blocks]Q80Block = undefined;
+    for (&activations, 0..) |*tokens, index| {
+        const input = patternedInput(@intCast(80 + index));
+        try quantizeQ80(input[0 .. blocks * QK8_0], tokens);
+    }
+    const row = patternedQ80Rows(1, blocks, 17);
+    const pointers = [MAX_TILE][*]const Q80Block{ &activations[0], &activations[1], &activations[2], &activations[3] };
+    const tile = dotQ80Q80Tile(MAX_TILE, &row, pointers, blocks);
+    for (0..MAX_TILE) |token| {
+        if (tile[token] != try dotQ80Q80(&row, &activations[token])) return error.TestUnexpectedResult;
+        // The portable pair sums give the same integers as the quad dots.
+        var portable: F32x8 = @splat(0);
+        for (0..blocks) |block_index| {
+            const block = row[block_index * Q8_0_BLOCK_BYTES ..][0..Q8_0_BLOCK_BYTES];
+            const quants: Signed32 = @bitCast(block[2..34].*);
+            const negative = quants < @as(Signed32, @splat(0));
+            const values: Signed32 = activations[token][block_index].qs;
+            const integer = mulAddWords(mulAddPairs(@bitCast(@abs(quants)), @select(i8, negative, -%values, values)), @splat(1));
+            portable = @mulAdd(F32x8, @splat(halfAt(block, 0) * activations[token][block_index].d), @floatFromInt(integer), portable);
+        }
+        if (reduceLikeAvx(portable) != tile[token]) return error.TestUnexpectedResult;
+    }
 }
 
 test "Q4_K dot product smoke" {

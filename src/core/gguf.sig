@@ -328,6 +328,48 @@ pub fn parse(comptime tensor_capacity: usize, source: Source, out: *Index(tensor
     }
 }
 
+/// The scalar numeric (or boolean) value stored under exactly `key`, or null
+/// when the file has no such key or it holds another type. A second bounded
+/// pass over the metadata, for keys the Summary does not keep: an mmproj file
+/// carries both `clip.audio.*` and `clip.gen.audio.*`, which suffix matching
+/// would mix up.
+pub fn metadataNumber(source: Source, key: []const u8) Error!?f64 {
+    var cursor = Cursor{ .source = source };
+    var magic: [4]u8 = undefined;
+    try cursor.readBytes(&magic);
+    if (!mem.eql(u8, &magic, "GGUF")) return error.InvalidMagic;
+    if (try cursor.readU32() != 3) return error.UnsupportedVersion;
+    _ = try cursor.readU64();
+    const metadata_count = try cursor.readU64();
+    var ignored: Summary = .{};
+    var metadata_index: u64 = 0;
+    while (metadata_index < metadata_count) : (metadata_index += 1) {
+        const key_length = try cursor.readU64();
+        if (key_length == 0 or key_length > MAX_KEY_BYTES) return error.InvalidMetadataKey;
+        const reference = KeyRef{ .offset = cursor.position, .length = key_length };
+        try cursor.skip(key_length);
+        const value_type = metadataType(try cursor.readU32()) orelse return error.InvalidMetadataType;
+        if (key_length == key.len and try keyEquals(source, reference, key)) {
+            return switch (value_type) {
+                .uint8 => @floatFromInt(try cursor.readU8()),
+                .int8 => @floatFromInt(@as(i8, @bitCast(try cursor.readU8()))),
+                .uint16 => @floatFromInt(try cursor.readU16()),
+                .int16 => @floatFromInt(@as(i16, @bitCast(try cursor.readU16()))),
+                .uint32 => @floatFromInt(try cursor.readU32()),
+                .int32 => @floatFromInt(@as(i32, @bitCast(try cursor.readU32()))),
+                .uint64 => @floatFromInt(try cursor.readU64()),
+                .int64 => @floatFromInt(@as(i64, @bitCast(try cursor.readU64()))),
+                .float32 => @as(f32, @bitCast(try cursor.readU32())),
+                .float64 => @bitCast(try cursor.readU64()),
+                .boolean => @floatFromInt(try cursor.readU8()),
+                .string, .array => null,
+            };
+        }
+        try consumeMetadataValue(&cursor, value_type, 0, null, &ignored);
+    }
+    return null;
+}
+
 fn consumeMetadataValue(
     cursor: *Cursor,
     value_type: MetadataType,
@@ -640,3 +682,30 @@ fn basicFixture(dimension: u64, file_size: *usize) FixtureWriter {
     return writer;
 }
 
+
+test "metadataNumber reads exact keys only" {
+    var writer = FixtureWriter{};
+    writer.put("GGUF");
+    writer.putU32(3);
+    writer.putU64(0);
+    writer.putU64(4);
+    writer.string("clip.audio.embedding_length");
+    writer.putU32(@intFromEnum(MetadataType.uint32));
+    writer.putU32(768);
+    writer.string("general.name");
+    writer.putU32(@intFromEnum(MetadataType.string));
+    writer.string("x");
+    writer.string("clip.gen.audio.embedding_length");
+    writer.putU32(@intFromEnum(MetadataType.uint32));
+    writer.putU32(1024);
+    writer.string("clip.audio.attention.layer_norm_epsilon");
+    writer.putU32(@intFromEnum(MetadataType.float32));
+    writer.putU32(@bitCast(@as(f32, 0.5)));
+    const slice = SliceSource{ .bytes = writer.bytes[0..writer.position] };
+    const source = slice.source();
+    if (try metadataNumber(source, "clip.audio.embedding_length") != 768) return error.TestUnexpectedResult;
+    if (try metadataNumber(source, "clip.gen.audio.embedding_length") != 1024) return error.TestUnexpectedResult;
+    if (try metadataNumber(source, "clip.audio.attention.layer_norm_epsilon") != 0.5) return error.TestUnexpectedResult;
+    if (try metadataNumber(source, "audio.embedding_length") != null) return error.TestUnexpectedResult;
+    if (try metadataNumber(source, "general.name") != null) return error.TestUnexpectedResult;
+}

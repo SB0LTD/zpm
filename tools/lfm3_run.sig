@@ -6,6 +6,8 @@
 //!   lfm3-run <model.gguf> chat <threads> <max_new> <prompt>
 //!   lfm3-run <model.gguf> raw <threads> <max_new> <text>
 //!   lfm3-run <model.gguf> bench <threads> <prompt_tokens> <generated_tokens>
+//!   lfm3-run <model.gguf> asr <threads> <max_new> <mmproj.gguf> <16k-mono.wav> [dump_prefix]
+//!   lfm3-run <model.gguf> tts <threads> <max_frames> <mmproj.gguf> <female|male> <seed> <out.f32> <text>
 const std = @import("std");
 const builtin = @import("builtin");
 const process = @import("sig_process");
@@ -15,6 +17,8 @@ const executor = @import("lfm3_executor");
 const codec = @import("lfm3_tokenizer");
 const indexes = @import("tokenizer_index");
 const worker = @import("worker_thread");
+const mel = @import("lfm3_audio_mel");
+const encoder = @import("lfm3_audio_encoder");
 
 const capacity = 512;
 const limits = executor.lfm3_audio_2b_limits;
@@ -227,6 +231,7 @@ pub fn main(init: std.process.Init) !void {
     if (raw_mode.len > mode_buffer.len) return error.InvalidArguments;
     @memcpy(mode_buffer[0..raw_mode.len], raw_mode);
     const mode = mode_buffer[0..raw_mode.len];
+    if (std.mem.eql(u8, mode, "asr") or std.mem.eql(u8, mode, "tts")) return audioMain(init, &argv, path, mode);
     var numbers: [3]usize = @splat(0);
     const numeric = !std.mem.eql(u8, mode, "tokens");
     const numeric_count: usize = if (std.mem.eql(u8, mode, "bench")) 3 else if (numeric) 2 else 0;
@@ -358,4 +363,246 @@ pub fn main(init: std.process.Init) !void {
         steps, milliseconds(generate_ns), if (steps == 0) 0 else @as(f64, @floatFromInt(steps)) * 1000.0 / milliseconds(generate_ns),
     });
     try out.flush();
+}
+
+// ── LFM3-Audio: hearing and speaking ────────────────────────────────────────
+
+const audio_capacity = 512;
+const audio_limits = encoder.lfm3_audio_limits;
+const MAX_SAMPLES = 16_000 * 120;
+const MAX_FRAMES = mel.frameCount(MAX_SAMPLES);
+const MAX_ROWS = encoder.positionsFor(MAX_FRAMES);
+
+var audio_index: gguf.Index(audio_capacity) = .{};
+var audio_plan: encoder.Plan = .{};
+var audio_state: encoder.State(audio_limits) = .{};
+var audio_work: encoder.Workspace(audio_limits) = .{};
+var mel_work: mel.Workspace = .{};
+var samples: [MAX_SAMPLES]f32 = undefined;
+var mel_frames: [MAX_FRAMES * mel.MELS]f32 = undefined;
+var audio_rows: [MAX_ROWS * audio_limits.projection]f32 = undefined;
+var wav_buffer: [MAX_SAMPLES * 2 + 4096]u8 = undefined;
+
+const Mapped = struct {
+    file: std.Io.File,
+    mapping: std.Io.File.MemoryMap,
+    memory: Memory,
+
+    fn open(io: std.Io, path: []const u8) !Mapped {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        errdefer file.close(io);
+        const size = try file.length(io);
+        const mapping = try file.createMemoryMap(io, .{ .len = @intCast(size), .protection = .{ .read = true, .write = false }, .populate = true });
+        if (mapping.section == null) return error.NativeMappingRequired;
+        return .{ .file = file, .mapping = mapping, .memory = .{ .bytes = mapping.memory } };
+    }
+
+    fn close(self: *Mapped, io: std.Io) void {
+        self.mapping.destroy(io);
+        self.file.close(io);
+    }
+};
+
+/// 16-bit PCM samples of a WAV's "data" chunk as f32 (x / 32768, as
+/// miniaudio converts them); the format must be mono at `rate`.
+fn pcm16Mono(bytes: []const u8, rate: u32, out: []f32) !usize {
+    if (bytes.len < 12 or !std.mem.eql(u8, bytes[0..4], "RIFF") or !std.mem.eql(u8, bytes[8..12], "WAVE")) return error.NotWav;
+    var at: usize = 12;
+    var format_ok = false;
+    while (at + 8 <= bytes.len) {
+        const size = std.mem.readInt(u32, bytes[at + 4 ..][0..4], .little);
+        const body = bytes[at + 8 ..][0..@min(size, bytes.len - at - 8)];
+        if (std.mem.eql(u8, bytes[at..][0..4], "fmt ")) {
+            if (body.len < 16) return error.NotWav;
+            const tag = std.mem.readInt(u16, body[0..2], .little);
+            const channels = std.mem.readInt(u16, body[2..4], .little);
+            const sample_rate = std.mem.readInt(u32, body[4..8], .little);
+            const bits = std.mem.readInt(u16, body[14..16], .little);
+            if (tag != 1 or channels != 1 or bits != 16 or sample_rate != rate) return error.UnsupportedWavFormat;
+            format_ok = true;
+        } else if (std.mem.eql(u8, bytes[at..][0..4], "data")) {
+            if (!format_ok) return error.NotWav;
+            const count = body.len / 2;
+            if (count > out.len) return error.AudioTooLong;
+            for (out[0..count], 0..) |*value, i| value.* = @as(f32, @floatFromInt(std.mem.readInt(i16, body[2 * i ..][0..2], .little))) * 0.000030517578125;
+            return count;
+        }
+        at += 8 + size + (size & 1);
+    }
+    return error.NotWav;
+}
+
+/// Feed one input through the backbone in batch-sized slices; only the last
+/// slice produces `output`.
+fn feed(source: gguf.Source, cache: *executor.Cache, input: executor.Input, output: executor.Output, parallel: executor.Parallel) !?u32 {
+    const hidden = plan.hidden_size;
+    const total = switch (input) {
+        .tokens => |ids| ids.len,
+        .embeddings => |rows| rows.len / hidden,
+    };
+    var start: usize = 0;
+    while (true) {
+        const end = @min(total, start + limits.batch);
+        const slice: executor.Input = switch (input) {
+            .tokens => |ids| .{ .tokens = ids[start..end] },
+            .embeddings => |rows| .{ .embeddings = rows[start * hidden .. end * hidden] },
+        };
+        const result = try executor.forwardInput(capacity, limits, source, &index, &plan, &weights, &work, cache, slice, if (end == total) output else .none, parallel);
+        if (end == total) return result;
+        start = end;
+    }
+}
+
+fn writeFloats(io: std.Io, prefix: []const u8, suffix: []const u8, values: []const f32) !void {
+    var name: [1024]u8 = undefined;
+    const path = try std.fmt.bufPrint(&name, "{s}{s}", .{ prefix, suffix });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(values) });
+}
+
+fn nextArgument(argv: anytype, buffer: []u8) ![]const u8 {
+    const raw = try argv.next() orelse return error.InvalidArguments;
+    if (raw.len > buffer.len) return error.InvalidArguments;
+    @memcpy(buffer[0..raw.len], raw);
+    return buffer[0..raw.len];
+}
+
+fn audioMain(init: std.process.Init, argv: anytype, model_path: []const u8, mode: []const u8) !void {
+    var threads_buffer: [16]u8 = undefined;
+    var maximum_buffer: [16]u8 = undefined;
+    var mmproj_buffer: [4096]u8 = undefined;
+    const threads = @max(1, try std.fmt.parseInt(usize, try nextArgument(argv, &threads_buffer), 10));
+    const maximum = try std.fmt.parseInt(usize, try nextArgument(argv, &maximum_buffer), 10);
+    const mmproj_path = try nextArgument(argv, &mmproj_buffer);
+    if (threads > MAX_WORKERS + 1) return error.InvalidArguments;
+
+    var model = try Mapped.open(init.io, model_path);
+    defer model.close(init.io);
+    var projector = try Mapped.open(init.io, mmproj_path);
+    defer projector.close(init.io);
+    const source = model.memory.source();
+    const audio_source = projector.memory.source();
+    try gguf.parse(capacity, source, &index);
+    try plan_mod.build(capacity, source, &index, &plan);
+    try vocabulary.build(source, index.summary.tokenizer_tokens);
+    try merges.build(source, index.summary.tokenizer_merges, &vocabulary);
+    try specials.build(source, index.summary.tokenizer_token_types, &vocabulary);
+    try gguf.parse(audio_capacity, audio_source, &audio_index);
+
+    var output_buffer: [8192]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(init.io, &output_buffer);
+    const out = &writer.interface;
+
+    try pool.start(threads - 1);
+    defer pool.stop();
+    const parallel = pool.parallel();
+    try executor.packWeights(capacity, source, &index, &plan, &packed_storage, &weights, parallel);
+    var cache = executor.Cache{
+        .kv = kv_storage[0..try executor.requiredKvElements(&plan, limits.context)],
+        .conv = conv_storage[0..try executor.requiredConvElements(&plan)],
+        .context = limits.context,
+    };
+    cache.reset();
+
+    if (std.mem.eql(u8, mode, "asr")) {
+        var wav_path_buffer: [4096]u8 = undefined;
+        const wav_path = try nextArgument(argv, &wav_path_buffer);
+        var dump_buffer: [1024]u8 = undefined;
+        const dump: ?[]const u8 = if (try argv.next()) |raw| blk: {
+            if (raw.len > dump_buffer.len) return error.InvalidArguments;
+            @memcpy(dump_buffer[0..raw.len], raw);
+            break :blk dump_buffer[0..raw.len];
+        } else null;
+        try hear(init.io, out, source, audio_source, &cache, parallel, wav_path, maximum, dump);
+    } else {
+        return error.InvalidArguments;
+    }
+    try out.flush();
+}
+
+/// Writes traced rows of the first encoder chunk to `<prefix>.<name>[-<layer>].bin`.
+const TraceFiles = struct {
+    io: std.Io,
+    prefix: []const u8,
+    active: bool = true,
+
+    fn emit(context: ?*anyopaque, name: []const u8, layer: ?usize, values: []const f32) void {
+        const self: *TraceFiles = @ptrCast(@alignCast(context.?));
+        if (!self.active) return;
+        var suffix: [96]u8 = undefined;
+        const tail = (if (layer) |number| std.fmt.bufPrint(&suffix, ".{s}-{d}.bin", .{ name, number }) else std.fmt.bufPrint(&suffix, ".{s}.bin", .{name})) catch return;
+        writeFloats(self.io, self.prefix, tail, values) catch {};
+    }
+};
+
+fn hear(io: std.Io, out: anytype, source: gguf.Source, audio_source: gguf.Source, cache: *executor.Cache, parallel: executor.Parallel, wav_path: []const u8, maximum: usize, dump: ?[]const u8) !void {
+    try encoder.build(audio_capacity, audio_source, &audio_index, &audio_plan);
+    const wav = try std.Io.Dir.cwd().readFile(io, wav_path, &wav_buffer);
+    const count = try pcm16Mono(wav, mel.SAMPLE_RATE, &samples);
+    try out.print("audio samples={d} seconds={d:.2} encoder layers={d} conv={d} attention={d}\n", .{
+        count, @as(f64, @floatFromInt(count)) / mel.SAMPLE_RATE, audio_plan.layer_count, audio_plan.conv_layer_count, audio_plan.attention_layer_count,
+    });
+
+    const mel_start = now(io);
+    const frames = try mel.compute(samples[0..count], &mel_frames, &mel_work);
+    const mel_ns = now(io) - mel_start;
+    var trace_files = TraceFiles{ .io = io, .prefix = dump orelse "" };
+    if (dump != null) audio_work.trace = .{ .context = &trace_files, .emit = &TraceFiles.emit };
+    const encode_start = now(io);
+    audio_state.reset();
+    var rows: usize = 0;
+    var first: usize = 0;
+    const chunk = encoder.DOWNSAMPLE * audio_limits.positions;
+    while (first < frames) {
+        const end = @min(frames, first + chunk);
+        rows += try encoder.encode(audio_capacity, audio_limits, audio_source, &audio_index, &audio_plan, &audio_state, &audio_work, mel_frames[first * mel.MELS .. end * mel.MELS], audio_rows[rows * audio_plan.projection ..], parallel);
+        trace_files.active = false;
+        first = end;
+    }
+    const encode_ns = now(io) - encode_start;
+    if (dump) |prefix| {
+        try writeFloats(io, prefix, ".mel.bin", mel_frames[0 .. frames * mel.MELS]);
+        try writeFloats(io, prefix, ".embd.bin", audio_rows[0 .. rows * audio_plan.projection]);
+    }
+    if (audio_plan.projection != plan.hidden_size) return error.InvalidModel;
+
+    // Galaxy's hearing request: the instruction as the system turn, the audio
+    // alone as the user's turn.
+    const prefix_text = "<|startoftext|><|im_start|>system\nPerform ASR in English.<|im_end|>\n<|im_start|>user\n";
+    const suffix_text = "<|im_end|>\n<|im_start|>assistant\n";
+    var prefix_ids: [64]u32 = undefined;
+    var suffix_ids: [16]u32 = undefined;
+    const prefix_count = try codec.encode(source, &vocabulary, &merges, &specials, prefix_text, true, &prefix_ids);
+    const suffix_count = try codec.encode(source, &vocabulary, &merges, &specials, suffix_text, true, &suffix_ids);
+    try printIds(out, "prefix_ids", prefix_ids[0..prefix_count]);
+    try out.print("audio_rows={d}\n", .{rows});
+    try printIds(out, "suffix_ids", suffix_ids[0..suffix_count]);
+    if (prefix_count + rows + suffix_count + maximum > limits.context) return error.ContextCapacity;
+
+    const prompt_start = now(io);
+    _ = try feed(source, cache, .{ .tokens = prefix_ids[0..prefix_count] }, .none, parallel);
+    _ = try feed(source, cache, .{ .embeddings = audio_rows[0 .. rows * plan.hidden_size] }, .none, parallel);
+    var selected = (try feed(source, cache, .{ .tokens = suffix_ids[0..suffix_count] }, .logits, parallel)).?;
+    const prompt_ns = now(io) - prompt_start;
+    const end_turn = vocabulary.lookup(source, "<|im_end|>") orelse return error.MissingStopToken;
+    var generated: usize = 0;
+    const decode_start = now(io);
+    while (generated < maximum) {
+        tokens[generated] = selected;
+        generated += 1;
+        if (selected == end_turn or generated == maximum) break;
+        selected = (try executor.forward(capacity, limits, source, &index, &plan, &weights, &work, cache, &.{selected}, true, parallel)).?;
+    }
+    const decode_ns = now(io) - decode_start;
+    try printIds(out, "generated_ids", tokens[0..generated]);
+    try out.writeAll("text=");
+    var scratch: [512]u8 = undefined;
+    var decoded: [512]u8 = undefined;
+    for (tokens[0..generated]) |token| {
+        if (token == end_turn) break;
+        const piece = try codec.decode(source, &vocabulary, &specials, token, &scratch, &decoded);
+        try out.writeAll(decoded[0..piece.bytes_written]);
+    }
+    try out.print("\ntiming mel_ms={d:.1} encode_ms={d:.1} prompt_tokens={d} prompt_ms={d:.1} decode_steps={d} decode_ms={d:.1}\n", .{
+        milliseconds(mel_ns), milliseconds(encode_ns), prefix_count + rows + suffix_count, milliseconds(prompt_ns), generated -| 1, milliseconds(decode_ns),
+    });
 }

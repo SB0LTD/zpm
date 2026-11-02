@@ -263,18 +263,65 @@ pub fn forward(
     produce_logits: bool,
     parallel: Parallel,
 ) Error!?u32 {
-    try validateRuntime(limits, index, plan, cache, tokens);
-    const count = tokens.len;
+    return forwardInput(tensor_capacity, limits, source, index, plan, weights, work, cache, .{ .tokens = tokens }, if (produce_logits) .logits else .none, parallel);
+}
+
+/// A batch of consecutive positions: token ids, or rows of `hidden_size`
+/// input embeddings (audio from the hearing encoder, feedback of spoken
+/// frames) that take the place of token embeddings.
+pub const Input = union(enum) {
+    tokens: []const u32,
+    embeddings: []const f32,
+
+    fn count(self: Input, hidden: usize) usize {
+        return switch (self) {
+            .tokens => |tokens| tokens.len,
+            .embeddings => |rows| rows.len / hidden,
+        };
+    }
+};
+
+/// What the last position leaves behind: nothing; the output-normed hidden
+/// state in `work.normalized[0..hidden_size]` (llama.cpp's embeddings, what the
+/// speech generator reads); or that and the logits with the greedy token.
+pub const Output = enum { none, hidden, logits };
+
+pub fn forwardInput(
+    comptime tensor_capacity: usize,
+    comptime limits: Limits,
+    source: gguf.Source,
+    index: *const gguf.Index(tensor_capacity),
+    plan: *const lfm3.Plan,
+    weights: *const PackedWeights(tensor_capacity),
+    work: *Workspace(limits),
+    cache: *Cache,
+    input: Input,
+    output: Output,
+    parallel: Parallel,
+) Error!?u32 {
     const hidden: usize = plan.hidden_size;
+    if (hidden == 0) return error.InvalidPlan;
+    const count = input.count(hidden);
+    try validateRuntime(limits, index, plan, cache, count);
     const feed_forward: usize = plan.feed_forward_size;
-    const embedding = try matrixView(source, index, plan.token_embedding);
-    for (tokens, 0..) |token, slot| {
-        const row = embedding.bytes[@as(usize, token) * embedding.row_bytes ..][0..embedding.row_bytes];
-        const destination = work.hidden[slot * hidden ..][0..hidden];
-        switch (embedding.ggml_type) {
-            12 => try quantized.dequantizeQ4K(destination, row),
-            else => try quantized.dequantizeQ6K(destination, row),
-        }
+    switch (input) {
+        .tokens => |tokens| {
+            for (tokens) |token| if (token >= plan.vocabulary_size) return error.InvalidToken;
+            const embedding = try matrixView(source, index, plan.token_embedding);
+            for (tokens, 0..) |token, slot| {
+                const row = embedding.bytes[@as(usize, token) * embedding.row_bytes ..][0..embedding.row_bytes];
+                const destination = work.hidden[slot * hidden ..][0..hidden];
+                switch (embedding.ggml_type) {
+                    12 => try quantized.dequantizeQ4K(destination, row),
+                    else => try quantized.dequantizeQ6K(destination, row),
+                }
+            }
+        },
+        .embeddings => |rows| {
+            if (rows.len % hidden != 0) return error.InvalidToken;
+            if (!allFinite(rows)) return error.NonFinite;
+            @memcpy(work.hidden[0..rows.len], rows);
+        },
     }
 
     for (plan.layers[0..plan.layer_count]) |*layer| {
@@ -327,7 +374,7 @@ pub fn forward(
         try addResidual(source, index, plan, layer.post_ffw_norm, work.hidden[0 .. count * hidden], work.projected[0 .. count * hidden], parallel);
     }
     cache.position += count;
-    if (!produce_logits) return null;
+    if (output == .none) return null;
 
     const output_norm = NormQuantizeTask{
         .input = work.hidden[(count - 1) * hidden ..][0..hidden],
@@ -337,6 +384,7 @@ pub fn forward(
         .activations = &work.activations,
     };
     output_norm.run(0, 1);
+    if (output == .hidden) return null;
     try linear(source, index, weights, plan.output, &work.activations, 1, work.logits[0..plan.vocabulary_size], parallel);
     return @intCast(try transformer.argmax(work.logits[0..plan.vocabulary_size]));
 }
@@ -866,7 +914,7 @@ const MatmulTask = struct {
     }
 };
 
-fn validateRuntime(comptime limits: Limits, index: anytype, plan: *const lfm3.Plan, cache: *const Cache, tokens: []const u32) Error!void {
+fn validateRuntime(comptime limits: Limits, index: anytype, plan: *const lfm3.Plan, cache: *const Cache, count: usize) Error!void {
     if (plan.layer_count == 0 or plan.layer_count > lfm3.MAX_LAYERS or
         plan.hidden_size == 0 or plan.hidden_size > limits.hidden or plan.hidden_size % quantized.QK_K != 0 or
         plan.queryWidth() == 0 or plan.queryWidth() > limits.query or plan.queryWidth() % quantized.QK_K != 0 or
@@ -876,10 +924,9 @@ fn validateRuntime(comptime limits: Limits, index: anytype, plan: *const lfm3.Pl
         plan.vocabulary_size == 0 or plan.vocabulary_size > limits.vocabulary or
         plan.conv_kernel < 2 or plan.conv_kernel > lfm3.MAX_CONV_KERNEL or
         index.tensor_count == 0 or index.tensor_count > index.tensors.len) return error.InvalidPlan;
-    if (tokens.len == 0 or tokens.len > limits.batch) return error.BatchCapacity;
-    for (tokens) |token| if (token >= plan.vocabulary_size) return error.InvalidToken;
+    if (count == 0 or count > limits.batch) return error.BatchCapacity;
     if (cache.context == 0 or cache.context > limits.context or cache.position > cache.context or
-        tokens.len > cache.context - cache.position) return error.ContextCapacity;
+        count > cache.context - cache.position) return error.ContextCapacity;
     if (cache.kv.len < try requiredKvElements(plan, cache.context)) return error.KvCapacity;
     if (cache.conv.len < try requiredConvElements(plan)) return error.ConvCapacity;
 }

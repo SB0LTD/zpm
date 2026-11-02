@@ -1020,6 +1020,26 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
     });
+
+    // ── LFM3-Audio: hearing (mel, encoder) and speaking (MaskGIT codes, codec) ──
+    _ = try ctx.addModule("lfm3_audio_mel", "src/core/lfm3_audio_mel.sig");
+    const lfm3_audio_ops = try ctx.addModule("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig");
+    try wire(ctx, lfm3_audio_ops, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_audio_ops, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, lfm3_audio_ops, "lfm3_executor", "src/core/lfm3_executor.sig");
+    try wire(ctx, lfm3_audio_ops, "lfm3_plan", "src/core/lfm3_plan.sig");
+    const lfm3_audio_encoder = try ctx.addModule("lfm3_audio_encoder", "src/core/lfm3_audio_encoder.sig");
+    try wire(ctx, lfm3_audio_encoder, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_audio_encoder, "lfm3_audio_ops", "src/core/lfm3_audio_ops.sig");
+    const test_lfm3_audio = try ctx.addStep("test-lfm3-audio", "Execute LFM3-Audio front end, encoder and speech generation contracts", &noopStep);
+    try ctx.addDependency(test_all, test_lfm3_audio);
+    _ = try addTest(ctx, test_lfm3_audio, "test-lfm3-audio-mel", "src/core/lfm3_audio_mel.sig", &.{});
+    _ = try addTest(ctx, test_lfm3_audio, "test-lfm3-audio-ops", "src/core/lfm3_audio_ops.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+        importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+    });
     _ = try ctx.addCompileStep(.{
         .source_path = "tools/lfm3_run.sig",
         .output_name = "lfm3-run",
@@ -1035,8 +1055,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
             importEntry("worker_thread", "src/platform/worker_thread.sig"),
             importEntry("sig_process", process_source),
+            importEntry("lfm3_audio_mel", "src/core/lfm3_audio_mel.sig"),
+            importEntry("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig"),
+            importEntry("lfm3_audio_encoder", "src/core/lfm3_audio_encoder.sig"),
         },
     });
+
     const tts_gpu = try ctx.addModule("tts_gpu", "src/tts/gpu.sig");
     try wire(ctx, tts_gpu, "tts_model_container", "src/tts/model_container.sig");
     try wire(ctx, tts_gpu, "quantized_linear", "src/core/quantized_linear.sig");
