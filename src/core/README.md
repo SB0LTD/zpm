@@ -58,6 +58,13 @@ activation load and scale unpack serve eight rows in prefill and decode.
 `tools/lfm3_run.sig` is the Windows host runner used for llama.cpp parity and
 speed checks.
 
+The Q4_K/Q6_K x Q8_K kernels pick their four-byte dot instruction at comptime:
+AVX-VNNI `vpdpbusd` on x86, `sdot` on AArch64 with the dotprod feature (the
+Surface Laptop's Snapdragon X), and portable vector code otherwise; all paths
+produce the same integers. `tools/aarch64_qemu/run.ps1` runs these kernel
+tests and the LFM3 contract on emulated AArch64 from an x86 host, and with
+`-HostRunner` builds `lfm3-run.exe` for Windows on ARM.
+
 ### Supported Models
 - Qwen3-0.6B (Q4_K, Q6_K) — tested, ~2s/token on ARM64
 - Qwen3-1.7B, Qwen3-4B — supported via configurable limits

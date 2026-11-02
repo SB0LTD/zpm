@@ -324,6 +324,12 @@ pub const MAX_TILE: usize = 4;
 /// prefill cheaper per token than decode. Callers guarantee that the weight
 /// row and every activation row hold `blocks` complete blocks.
 pub fn dotQ4KQ8KTile(comptime count: usize, weight_bytes: []const u8, activations: [count][*]const Q8KBlock, blocks: usize) [count]f32 {
+    return dotQ4KQ8KTileWith(neon_dotprod, count, weight_bytes, activations, blocks);
+}
+
+/// `quads` selects dotQuads (AArch64 sdot) for the sub-block dots; x86 keeps
+/// its vpmaddubsw row kernels. Both produce the same integers and floats.
+fn dotQ4KQ8KTileWith(comptime quads: bool, comptime count: usize, weight_bytes: []const u8, activations: [count][*]const Q8KBlock, blocks: usize) [count]f32 {
     var sums: [count]F32x8 = @splat(@splat(0));
     for (0..blocks) |block_index| {
         const block = weight_bytes[block_index * Q4_K_BLOCK_BYTES ..][0..Q4_K_BLOCK_BYTES];
@@ -335,12 +341,24 @@ pub fn dotQ4KQ8KTile(comptime count: usize, weight_bytes: []const u8, activation
             const quants: Bytes32 = block[16 + pair * 32 ..][0..32].*;
             const low = quants & @as(Bytes32, @splat(0x0f));
             const high = quants >> @as(Bytes32, @splat(4));
-            const low_scale: Words16 = @splat(scales[pair * 2]);
-            const high_scale: Words16 = @splat(scales[pair * 2 + 1]);
-            inline for (0..count) |row| {
-                const qs = &activations[row][block_index].qs;
-                integer[row] += mulAddWords(mulAddPairs(low, qs[pair * 64 ..][0..32].*), low_scale) +
-                    mulAddWords(mulAddPairs(high, qs[pair * 64 + 32 ..][0..32].*), high_scale);
+            if (quads) {
+                // Lane l of a dotQuads sum covers the same four elements as
+                // lane l of mulAddWords(mulAddPairs(..)): equal integers.
+                const low_scale: I32x8 = @splat(scales[pair * 2]);
+                const high_scale: I32x8 = @splat(scales[pair * 2 + 1]);
+                inline for (0..count) |row| {
+                    const qs = &activations[row][block_index].qs;
+                    integer[row] += dotQuads(@splat(0), low, qs[pair * 64 ..][0..32].*) * low_scale +
+                        dotQuads(@splat(0), high, qs[pair * 64 + 32 ..][0..32].*) * high_scale;
+                }
+            } else {
+                const low_scale: Words16 = @splat(scales[pair * 2]);
+                const high_scale: Words16 = @splat(scales[pair * 2 + 1]);
+                inline for (0..count) |row| {
+                    const qs = &activations[row][block_index].qs;
+                    integer[row] += mulAddWords(mulAddPairs(low, qs[pair * 64 ..][0..32].*), low_scale) +
+                        mulAddWords(mulAddPairs(high, qs[pair * 64 + 32 ..][0..32].*), high_scale);
+                }
             }
         }
         // Each minimum covers two 16-lane bsums.
@@ -383,6 +401,10 @@ inline fn unpackScalesQ4K(packed_scales: *const [12]u8) [2][8]i16 {
 /// Q6_K counterpart of dotQ4KQ8KTile. Quants enter the multiply unsigned
 /// (0..63); the -32 offset is applied once per block through the bsums.
 pub fn dotQ6KQ8KTile(comptime count: usize, weight_bytes: []const u8, activations: [count][*]const Q8KBlock, blocks: usize) [count]f32 {
+    return dotQ6KQ8KTileWith(neon_dotprod, count, weight_bytes, activations, blocks);
+}
+
+fn dotQ6KQ8KTileWith(comptime quads: bool, comptime count: usize, weight_bytes: []const u8, activations: [count][*]const Q8KBlock, blocks: usize) [count]f32 {
     var sums: [count]F32x8 = @splat(@splat(0));
     const nibble: Bytes32 = @splat(0x0f);
     const three: Bytes32 = @splat(3);
@@ -406,10 +428,18 @@ pub fn dotQ6KQ8KTile(comptime count: usize, weight_bytes: []const u8, activation
                 // one scale, the last eight the next.
                 const index = half * 8 + quarter * 2;
                 const scale_pair = @Vector(2, i16){ scales[index], scales[index + 1] };
-                const lane_scales: Words16 = @shuffle(i16, scale_pair, undefined, [16]i32{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 });
-                inline for (0..count) |row| {
-                    const qs = &activations[row][block_index].qs;
-                    integer[row] += mulAddWords(mulAddPairs(quants, qs[half * 128 + quarter * 32 ..][0..32].*), lane_scales);
+                if (quads) {
+                    const lane_scales: I32x8 = @shuffle(i16, scale_pair, undefined, [8]i32{ 0, 0, 0, 0, 1, 1, 1, 1 });
+                    inline for (0..count) |row| {
+                        const qs = &activations[row][block_index].qs;
+                        integer[row] += dotQuads(@splat(0), quants, qs[half * 128 + quarter * 32 ..][0..32].*) * lane_scales;
+                    }
+                } else {
+                    const lane_scales: Words16 = @shuffle(i16, scale_pair, undefined, [16]i32{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 });
+                    inline for (0..count) |row| {
+                        const qs = &activations[row][block_index].qs;
+                        integer[row] += mulAddWords(mulAddPairs(quants, qs[half * 128 + quarter * 32 ..][0..32].*), lane_scales);
+                    }
                 }
             }
         }
@@ -478,29 +508,30 @@ pub fn packQ4KX8(output: []u8, rows: []const u8, blocks: usize) Error!void {
 /// blocks; result[token][row]. Per row and token this is exactly
 /// dotQ4KQ8K's integer arithmetic, summed in a different float order.
 pub fn dotQ4KX8Q8KTile(comptime count: usize, weight_bytes: []const u8, activations: [count][*]const Q8KBlock, blocks: usize) [count][PACKED_ROWS]f32 {
-    return dotQ4KX8Q8KTileWith(avx_vnni, count, weight_bytes, activations, blocks);
+    return dotQ4KX8Q8KTileWith(quad_dots, count, weight_bytes, activations, blocks);
 }
 
-/// `vnni` selects vpdpbusd sub-block dots scaled with vpmulld instead of
-/// vpmaddubsw pairs summed in i16; both produce the same integers.
-fn dotQ4KX8Q8KTileWith(comptime vnni: bool, comptime count: usize, weight_bytes: []const u8, activations: [count][*]const Q8KBlock, blocks: usize) [count][PACKED_ROWS]f32 {
+/// `quads` selects dotQuads sub-block dots (vpdpbusd, sdot) scaled with an
+/// i32 multiply instead of vpmaddubsw pairs summed in i16; both produce the
+/// same integers.
+fn dotQ4KX8Q8KTileWith(comptime quads: bool, comptime count: usize, weight_bytes: []const u8, activations: [count][*]const Q8KBlock, blocks: usize) [count][PACKED_ROWS]f32 {
     const nibble: Bytes32 = @splat(0x0f);
     var sums: [count]F32x8 = @splat(@splat(0));
     for (0..blocks) |block_index| {
         const block = weight_bytes[block_index * Q4_K_X8_BLOCK_BYTES ..][0..Q4_K_X8_BLOCK_BYTES];
         prefetchAhead(weight_bytes, block_index, Q4_K_X8_BLOCK_BYTES);
-        const unpacked = unpackScalesQ4KX8(block[32..128], vnni);
+        const unpacked = unpackScalesQ4KX8(block[32..128], quads);
         var integer: [count]I32x8 = @splat(@splat(0));
         for (0..4) |pair| {
-            if (vnni) {
-                // Both halves at once: up to eight independent vpdpbusd chains.
+            if (quads) {
+                // Both halves at once: up to eight independent dot chains.
                 var halves: [2][count]I32x8 = @splat(@splat(@splat(0)));
                 inline for (0..8) |group| {
                     const raw: Bytes32 = block[128 + (pair * 8 + group) * 32 ..][0..32].*;
                     const quants = [2]Bytes32{ raw & nibble, raw >> @as(Bytes32, @splat(4)) };
                     inline for (0..count) |row| inline for (0..2) |half| {
                         const lanes = broadcastQuad(&activations[row][block_index].qs, pair * 64 + half * 32 + group * 4);
-                        halves[half][row] = dotBytesVnni(halves[half][row], quants[half], lanes);
+                        halves[half][row] = dotQuads(halves[half][row], quants[half], lanes);
                     };
                 }
                 inline for (0..count) |row| integer[row] += halves[0][row] * unpacked.lanes[pair * 2] +
@@ -590,12 +621,13 @@ fn quantQ6K(block: *const [Q6_K_BLOCK_BYTES]u8, element: usize) u8 {
 /// blocks; result[token][row]. Per row and token this is exactly
 /// dotQ6KQ8K's integer arithmetic, summed in a different float order.
 pub fn dotQ6KX8Q8KTile(comptime count: usize, weight_bytes: []const u8, activations: [count][*]const Q8KBlock, blocks: usize) [count][PACKED_ROWS]f32 {
-    return dotQ6KX8Q8KTileWith(avx_vnni, count, weight_bytes, activations, blocks);
+    return dotQ6KX8Q8KTileWith(quad_dots, count, weight_bytes, activations, blocks);
 }
 
-/// `vnni` selects vpdpbusd sub-block dots scaled with vpmulld instead of
-/// vpmaddubsw pairs summed in i16; both produce the same integers.
-fn dotQ6KX8Q8KTileWith(comptime vnni: bool, comptime count: usize, weight_bytes: []const u8, activations: [count][*]const Q8KBlock, blocks: usize) [count][PACKED_ROWS]f32 {
+/// `quads` selects dotQuads sub-block dots (vpdpbusd, sdot) scaled with an
+/// i32 multiply instead of vpmaddubsw pairs summed in i16; both produce the
+/// same integers.
+fn dotQ6KX8Q8KTileWith(comptime quads: bool, comptime count: usize, weight_bytes: []const u8, activations: [count][*]const Q8KBlock, blocks: usize) [count][PACKED_ROWS]f32 {
     const nibble: Bytes32 = @splat(0x0f);
     const top: Bytes32 = @splat(0x30);
     var sums: [count]F32x8 = @splat(@splat(0));
@@ -619,12 +651,12 @@ fn dotQ6KX8Q8KTileWith(comptime vnni: bool, comptime count: usize, weight_bytes:
                     (next & nibble) | (high & top),
                     (next >> @as(Bytes32, @splat(4))) | ((high >> @as(Bytes32, @splat(2))) & top),
                 };
-                if (vnni) {
+                if (quads) {
                     const scales: I32x8 = @shuffle(i8, scale_bytes[quad], undefined, lanesFrom(offset * 8));
                     inline for (0..count) |row| {
                         const qs = &activations[row][block_index].qs;
                         var dot: I32x8 = @splat(0);
-                        inline for (0..4) |group| dot = dotBytesVnni(dot, raw[group], broadcastQuad(qs, sub * 16 + group * 4));
+                        inline for (0..4) |group| dot = dotQuads(dot, raw[group], broadcastQuad(qs, sub * 16 + group * 4));
                         integer[row] += dot * scales;
                     }
                 } else {
@@ -692,14 +724,14 @@ inline fn widenSignedPairs(bytes: @Vector(32, i8), comptime even: usize, comptim
 const ScalesQ4KX8 = struct {
     /// Per sub-block: word lanes 2 * row and 2 * row + 1 both hold the scale.
     scales: [8]Words16,
-    /// Per sub-block, for the vnni path: lane `row` holds the scale.
+    /// Per sub-block, for the dotQuads path: lane `row` holds the scale.
     lanes: [8]I32x8,
     /// Per sub-block pair q: word lanes 2 * row and 2 * row + 1 hold the
     /// minimums of sub-blocks 2 * q and 2 * q + 1.
     minimums: [4]Words16,
 };
 
-inline fn unpackScalesQ4KX8(packed_scales: *const [96]u8, comptime vnni: bool) ScalesQ4KX8 {
+inline fn unpackScalesQ4KX8(packed_scales: *const [96]u8, comptime quads: bool) ScalesQ4KX8 {
     const nibble: Bytes32 = @splat(0x0f);
     const top_mask: Bytes32 = @splat(0x30);
     const low = [2]Bytes32{ packed_scales[0..32].*, packed_scales[32..64].* };
@@ -715,7 +747,7 @@ inline fn unpackScalesQ4KX8(packed_scales: *const [96]u8, comptime vnni: bool) S
     };
     var result: ScalesQ4KX8 = undefined;
     inline for (0..8) |sub| {
-        if (vnni) {
+        if (quads) {
             result.lanes[sub] = widenLanes(scales[sub / 4], (sub % 4) * 8);
         } else {
             result.scales[sub] = opaqueWords(widenPairs(scales[sub / 4], (sub % 4) * 8, (sub % 4) * 8));
@@ -834,14 +866,37 @@ inline fn opaqueWords(value: Words16) Words16 {
 }
 
 const avx_vnni = avx2 and std.Target.x86.featureSetHas(builtin.cpu.features, .avxvnni);
+const neon_dotprod = builtin.cpu.arch == .aarch64 and std.Target.aarch64.featureSetHas(builtin.cpu.features, .dotprod);
+/// One instruction per four-byte dot: AVX-VNNI vpdpbusd or AArch64 sdot.
+const quad_dots = avx_vnni or neon_dotprod;
 
-/// AVX-VNNI vpdpbusd: each i32 lane adds the four products of unsigned weight
-/// bytes and signed activation bytes, without the i16 saturation of vpmaddubsw.
-inline fn dotBytesVnni(accumulator: I32x8, weights: Bytes32, activations: Signed32) I32x8 {
+/// Each i32 lane adds the four products of its weight and activation bytes,
+/// without the i16 saturation of vpmaddubsw. Weights are at most 63, so
+/// sdot's signed weight bytes hold them unchanged.
+inline fn dotQuads(accumulator: I32x8, weights: Bytes32, activations: Signed32) I32x8 {
+    if (neon_dotprod) {
+        const low = [4]i32{ 0, 1, 2, 3 };
+        const high = [4]i32{ 4, 5, 6, 7 };
+        const bytes_low = [16]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        const bytes_high = [16]i32{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
+        const signed: Signed32 = @bitCast(weights);
+        return @shuffle(i32, dotQuadsNeon(@shuffle(i32, accumulator, undefined, low), @shuffle(i8, signed, undefined, bytes_low), @shuffle(i8, activations, undefined, bytes_low)),
+            dotQuadsNeon(@shuffle(i32, accumulator, undefined, high), @shuffle(i8, signed, undefined, bytes_high), @shuffle(i8, activations, undefined, bytes_high)),
+            [8]i32{ 0, 1, 2, 3, -1, -2, -3, -4 });
+    }
     return asm ("{vex} vpdpbusd %[activations], %[weights], %[accumulator]"
         : [accumulator] "=x" (-> I32x8),
         : [weights] "x" (weights),
           [activations] "x" (activations),
+          [input] "0" (accumulator),
+    );
+}
+
+inline fn dotQuadsNeon(accumulator: @Vector(4, i32), weights: @Vector(16, i8), activations: @Vector(16, i8)) @Vector(4, i32) {
+    return asm ("sdot %[accumulator].4s, %[weights].16b, %[activations].16b"
+        : [accumulator] "=w" (-> @Vector(4, i32)),
+        : [weights] "w" (weights),
+          [activations] "w" (activations),
           [input] "0" (accumulator),
     );
 }
@@ -1201,6 +1256,16 @@ test "tiled Q8_K dots equal one row at a time" {
         if (q4_tile[row] != try dotQ4KQ8K(&q4, &activations[row])) return error.TestUnexpectedResult;
         if (q6_tile[row] != try dotQ6KQ8K(&q6, &activations[row])) return error.TestUnexpectedResult;
     }
+    if (quad_dots) {
+        // The dotQuads row kernels equal the portable ones bit for bit.
+        const q4_quads = dotQ4KQ8KTileWith(true, 4, &q4, pointers, 2);
+        const q6_quads = dotQ6KQ8KTileWith(true, 4, &q6, pointers, 2);
+        const q4_portable = dotQ4KQ8KTileWith(false, 4, &q4, pointers, 2);
+        const q6_portable = dotQ6KQ8KTileWith(false, 4, &q6, pointers, 2);
+        for (0..4) |row| {
+            if (q4_quads[row] != q4_portable[row] or q6_quads[row] != q6_portable[row]) return error.TestUnexpectedResult;
+        }
+    }
 }
 
 fn patternedActivations(comptime tokens: usize, seed: u32) ![tokens][2]Q8KBlock {
@@ -1253,7 +1318,7 @@ test "packed Q4_K x8 tiles equal the row kernels" {
             try expectReferenceDot(dequantizeQ4K, rows[row * 2 * Q4_K_BLOCK_BYTES ..][0 .. 2 * Q4_K_BLOCK_BYTES], &activations[token], tile[token][row]);
         }
     }
-    if (avx_vnni) {
+    if (quad_dots) {
         const portable = dotQ4KX8Q8KTileWith(false, 4, &packed_rows, pointers, 2);
         for (0..4) |token| for (0..PACKED_ROWS) |row| {
             if (portable[token][row] != tile[token][row]) return error.TestUnexpectedResult;
@@ -1293,7 +1358,7 @@ test "packed Q6_K x8 tiles equal the row kernels" {
             if (value != weights[element]) return error.TestUnexpectedResult;
         }
     }
-    if (avx_vnni) {
+    if (quad_dots) {
         const portable = dotQ6KX8Q8KTileWith(false, 4, &packed_rows, pointers, 2);
         for (0..4) |token| for (0..PACKED_ROWS) |row| {
             if (portable[token][row] != tile[token][row]) return error.TestUnexpectedResult;

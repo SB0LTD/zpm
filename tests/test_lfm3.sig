@@ -532,17 +532,7 @@ fn chatTemplate() !void {
     executed_cases += 1;
 }
 
-pub fn main(init: std.process.Init) !void {
-    if (comptime @import("builtin").os.tag == .windows) {
-        if (std.mem.indexOf(u16, init.minimal.args.vector,
-            std.unicode.utf8ToUtf16LeStringLiteral("--prove-failure")) != null) try check(false);
-    } else {
-        var args = std.process.Args.Iterator.init(init.minimal.args);
-        _ = args.next();
-        if (args.next()) |argument| {
-            if (std.mem.eql(u8, argument, "--prove-failure")) try check(false) else return error.UnknownArgument;
-        }
-    }
+fn runCases() !void {
     try layerSchedule();
     try scheduleRejections();
     try slidingWindowBounds();
@@ -554,6 +544,26 @@ pub fn main(init: std.process.Init) !void {
     try preTokenizer();
     try specialTokens();
     try chatTemplate();
+}
+
+// The cases again as a test, for targets with no process to run `main` on
+// (tools/aarch64_qemu runs them on bare-metal AArch64).
+test "lfm3 contract cases" {
+    try runCases();
+}
+
+pub fn main(init: std.process.Init) !void {
+    if (comptime @import("builtin").os.tag == .windows) {
+        if (std.mem.indexOf(u16, init.minimal.args.vector,
+            std.unicode.utf8ToUtf16LeStringLiteral("--prove-failure")) != null) try check(false);
+    } else {
+        var args = std.process.Args.Iterator.init(init.minimal.args);
+        _ = args.next();
+        if (args.next()) |argument| {
+            if (std.mem.eql(u8, argument, "--prove-failure")) try check(false) else return error.UnknownArgument;
+        }
+    }
+    try runCases();
     var buffer: [256]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer,
         "{{\"suite\":\"lfm3\",\"pass\":true,\"cases\":{d},\"assertions\":{d}}}\n",
