@@ -7,6 +7,10 @@ on:
     branches: [main, master]
   workflow_dispatch:
     inputs:
+      native_oracles_only:
+        description: 'Native oracle calibration only; skips host builds and is not full qualification'
+        type: boolean
+        default: false
       large_columns:
         description: 'Also validate 100M actual packed values (about 1.2 GB memory)'
         type: boolean
@@ -60,6 +64,11 @@ jobs:
           python tools/verify_sql_planner_demand.py
           --port ${{ job.services.postgres.ports[5432] }}
           --expected-major ${{ matrix.major }} --report planner-demand-oracle.json
+      - name: Verify aggregate-state demand native observations
+        run: >-
+          python tools/verify_sql_aggregate_demand.py
+          --port ${{ job.services.postgres.ports[5432] }}
+          --expected-major ${{ matrix.major }} --report aggregate-demand-oracle.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -67,9 +76,12 @@ jobs:
           path: |
             parameter-oracle.json
             planner-demand-oracle.json
+            aggregate-demand-oracle.json
           if-no-files-found: error
 
   native:
+    # Oracle-only calibration never disables host gates on push or pull_request.
+    if: github.event_name != 'workflow_dispatch' || inputs.native_oracles_only != true
     name: Database contracts (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # Two Windows attempts passed all 169 contract steps but exhausted 30 minutes

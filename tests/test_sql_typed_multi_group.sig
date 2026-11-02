@@ -70,6 +70,14 @@ pub fn main() !void {
     }
     try execute(query);try model();try check(fast.workspace.query.stream_stats.typed_group_plans==1 and fast.workspace.query.stream_stats.typed_group_channels==6);
     try check(fast.workspace.query.stream_stats.gathered_rows==0 and fast.workspace.query.stream_stats.rows==n);
+    const before=fr;
+    try execute("SELECT k,total FROM (SELECT k,SUM(b) AS total,SUM(a) AS unused FROM fact GROUP BY k) q ORDER BY k NULLS FIRST");
+    try check(fr.row_count==before.row_count and fr.column_count==2);
+    for(fr.rows[0..fr.row_count],before.rows[0..before.row_count]) |a,b| {
+        try check(Fast.compareCells(&a.cells[0],&b.cells[0])==0 and a.cells[1].integer==b.cells[3].integer);
+    }
+    try check(fast.workspace.query.stream_stats.typed_group_plans==0 and fast.workspace.query.stream_stats.gathered_rows==0);
+
     try execute("SELECT k,SUM(a),SUM(b),AVG(c),COUNT(label) FROM fact GROUP BY k HAVING COUNT(*)>4 ORDER BY k DESC NULLS LAST LIMIT 8 OFFSET 1");
     try check(fast.workspace.query.stream_stats.typed_group_plans==1);
     try execute("WITH totals AS (SELECT k,SUM(b) AS units,SUM(a) AS revenue FROM fact GROUP BY k) SELECT k,units,revenue FROM totals ORDER BY revenue DESC,k LIMIT 3");

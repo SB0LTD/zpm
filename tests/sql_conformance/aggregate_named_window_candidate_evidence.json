@@ -1,0 +1,47 @@
+{
+  "status": "corrected named-window candidate; final platform/product gates pending",
+  "date": "2026-11-02",
+  "first_full_ci": 41447674861,
+  "initial_failure": "unused named WINDOW aggregate dependency pruned; existing named-windows contract failed",
+  "red": {
+    "passing": 50,
+    "gaps": 3,
+    "programs": 53,
+    "exit": 1
+  },
+  "corrected_first_run": {
+    "aggregate": 53,
+    "named_window_assertions": 1892,
+    "planner_assertions": 444,
+    "exit": 0
+  },
+  "independent_review": "aggregate_runtime_review: native16 reproduced ORDER/PARTITION errors, sequence effects, derived retention and LIMIT0; final prefix/copy/reset static review found no blocker",
+  "final_source_rerun": {
+    "exit": 0,
+    "aggregate_programs": 53,
+    "named_window_assertions": 1892,
+    "frame_assertions": 113928
+  },
+  "evidence": [
+    {
+      "path": ".scratch/aggregate-demand-inventory/native-window.json",
+      "sha256": "d618fe265d0240e948d432241e99fb1eda8a12540c4524af0d87ce4922f8e7d4"
+    },
+    {
+      "path": ".scratch/aggregate-demand-inventory/named-red.log",
+      "sha256": "c117144ebce197c46207e68e68539a7dd53b53fd808bb3d369cd932efcb34bf2"
+    },
+    {
+      "path": ".scratch/aggregate-demand-inventory/named-fixed.log",
+      "sha256": "f0c7bfb2932c898112e5611b0ec96c7e80ab8aef5400a1bcc9cc0d32f213085e"
+    },
+    {
+      "path": ".scratch/aggregate-runtime-review/native-named-window.log",
+      "sha256": "15f444daef70009533d584689e8e5a1b749f880e824f0410ccb3557f8ee008b2"
+    },
+    {
+      "path": ".scratch/aggregate-demand-inventory/final-window.log",
+      "sha256": "e7639b2fdaa8b0150a16511c3ea4d2d6221220966425486ea3c2965c95204517"
+    }
+  ]
+}

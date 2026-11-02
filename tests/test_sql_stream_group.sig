@@ -36,6 +36,22 @@ fn grouped(n: usize) !void {
     try check(db.workspace.query.stream_stats.probes == n and db.workspace.query.stream_stats.dense_plans == 1);
 }
 
+// The input exceeds query handles: partial aggregate demand must stay streaming.
+const partial_source="SELECT g,total FROM (SELECT g,SUM(n) AS total,SUM(1/(id-id)) AS unused FROM data GROUP BY g) q ORDER BY g";
+fn partialCancel(_: ?*anyopaque) sql.Error!void {
+    if(db.workspace.query.stream_stats.rows>=1024) return error.QueryCanceled;
+}
+fn partialGrouped(n:usize) !void {
+    try db.execute(partial_source,&result);
+    try check(result.row_count==64 and result.column_count==2);
+    for(0..64) |g| {
+        const size=(n-1-g)/64+1;
+        const sum=size*g+64*size*(size-1)/2;
+        try check(result.rows[g].cells[0].integer==g and result.rows[g].cells[1].integer==sum);
+    }
+    try check(db.workspace.query.stream_stats.rows==n and db.workspace.query.stream_stats.gathered_rows==0);
+}
+
 fn rejected(source: []const u8, expected: sql.Error) !void {
     const before = result;
     if (db.execute(source, &result)) |_| return error.FailureExpected else |err| try check(err == expected);
@@ -103,6 +119,7 @@ fn large() !void {
     try check(db.workspace.query.stream_stats.scratch_cells == small_stats.scratch_cells);
     try check(db.workspace.query.stream_stats.scratch_refs == small_stats.scratch_refs);
     try check(db.workspace.query.stream_stats.scratch_refs <= refs.len);
+    try partialGrouped(count);
     try roundedGroups();
     try db.execute("SELECT COUNT(*), SUM(n), MIN(n), MAX(n) FROM data", &result);
     try check(result.rows[0].cells[0].integer == count and result.rows[0].cells[1].integer == @as(i64, count)*(count-1)/2 and result.rows[0].cells[2].integer == 0 and result.rows[0].cells[3].integer == count-1);
@@ -135,8 +152,21 @@ fn large() !void {
     db.session.control = &control;
     try rejected("SELECT COUNT(*), SUM(n) FROM data WHERE id >= 0", error.QueryWorkLimit);
     db.session.control = null;
+    // Cancel/exhaust after partial-state execution has actually begun, retaining
+    // the previous result and leaving no transaction or lock ownership behind.
+    db.workspace.query.stream_stats=.{};
+    control=.{.poll=partialCancel,.poll_interval=1};db.session.control=&control;
+    try rejected(partial_source,error.QueryCanceled);
+    db.session.control=null;
+    try check(db.workspace.query.stream_stats.rows>=1024 and db.workspace.query.stream_stats.rows<count);
+    db.workspace.query.stream_stats=.{};
+    control=.{.max_work=10000};db.session.control=&control;
+    try rejected(partial_source,error.QueryWorkLimit);
+    db.session.control=null;
+    try check(db.workspace.query.stream_stats.rows>0 and db.workspace.query.stream_stats.rows<count);
     @memset(&db.workspace.query.cells, .{ .integer = 0x55555555 });
     @memset(&refs, 0xaaaaaaaa);
+    try partialGrouped(count);
     try grouped(count);
     // Reader must ignore the other transaction's pending version, while the
     // writer's aggregate sees its own update. Abort restores subsequent reads.
@@ -147,6 +177,11 @@ fn large() !void {
     try check(result.rows[0].cells[0].integer == @as(i64,count)*(count-1)/2);
     try db.statement(writer, "SELECT g, COUNT(*), SUM(n) FROM data WHERE id = 0 GROUP BY g", &result, .{});
     try check(result.row_count == 1 and result.rows[0].cells[0] == .null_value and result.rows[0].cells[1].integer == 1 and result.rows[0].cells[2].integer == -1);
+    const partial_visible="SELECT g,total FROM (SELECT g,SUM(n) AS total,SUM(1/(id-id)) AS unused FROM data WHERE id=0 GROUP BY g) q";
+    try db.statement(reader,partial_visible,&result,.{});
+    try check(result.row_count==1 and result.rows[0].cells[0].integer==0 and result.rows[0].cells[1].integer==0);
+    try db.statement(writer,partial_visible,&result,.{});
+    try check(result.row_count==1 and result.rows[0].cells[0]==.null_value and result.rows[0].cells[1].integer==-1);
     db.abort(reader); db.abort(writer);
     try grouped(count);
 }
@@ -179,7 +214,7 @@ fn equality() !void {
     try small.execute("SELECT COUNT(DISTINCT n) FROM numbers", &sr);
     try check(sr.rows[0].cells[0].integer == 1 and small.workspace.query.stream_stats.rows == 0);
     try small.execute("SELECT n, COUNT(*) FROM numbers GROUP BY n ORDER BY n LIMIT 0", &sr);
-    try check(sr.row_count == 0 and small.workspace.query.stream_stats.rows == 2);
+    try check(sr.row_count == 0 and small.workspace.query.stream_stats.rows == 0);
 }
 
 // Many aggregate states can need more memory than sorted one-row runs. The

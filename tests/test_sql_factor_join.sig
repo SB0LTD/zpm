@@ -107,8 +107,25 @@ const Cancel=struct {
         if(fast.workspace.query.stream_stats.factor_selected_rows>0) return error.QueryCanceled;
     }
 };
+fn partialDemand() !void {
+    var text:[2048]u8=undefined;
+    try execute(try std.fmt.bufPrint(&text,query,.{0}));try model(0);
+    try check(fast.workspace.query.stream_stats.factor_plans==1);
+    const before=fr;
+    try execute("SELECT label,n FROM (SELECT c.label AS label,COUNT(*) AS n,SUM(f.quantity) AS unused FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE f.store=0 AND f.day BETWEEN DATE '2025-03-01' AND DATE '2025-08-31' GROUP BY c.label) q ORDER BY label");
+    try check(fr.row_count==before.row_count and fr.column_count==2);
+    for(fr.rows[0..fr.row_count],before.rows[0..before.row_count]) |a,b| {
+        try check(Fast.compareCells(&a.cells[0],&b.cells[0])==0 and a.cells[1].integer==b.cells[1].integer);
+    }
+    // Partial channels require the proven generic stream fallback, not factor state.
+    try check(fast.workspace.query.stream_stats.factor_plans==0 and fast.workspace.query.stream_stats.nested_factor_plans==0);
+    // Compact gathers rebuild one transient row; stream rows/groups and the
+    // caller's fixed scratch budget establish the bounded streaming operator.
+    try check(fast.workspace.query.stream_stats.rows==n and fast.workspace.query.stream_stats.groups==fr.row_count);
+    try check(fast.workspace.query.stream_stats.scratch_refs<=4096);
+}
 pub fn main() !void {
-    try init();var text:[2048]u8=undefined;
+    try init();try partialDemand();var text:[2048]u8=undefined;
     for(0..5) |store| {
         const source=try std.fmt.bufPrint(&text,query,.{store});try execute(source);try model(store);
         const stats=fast.workspace.query.stream_stats;

@@ -239,6 +239,9 @@ pub fn Exec(comptime config: types.Config) type {
 
             pub fn run(self: *Query, plan_id: u16, outer: ?*const E.Context) Error!List {
                 const p = &self.plans.items[plan_id];
+                // Binding already validates live planning diagnostics. LIMIT 0
+                // must not start an aggregate, sort, window or set input at runtime.
+                if(p.limit==0) {try self.session.checkpoint();return .{};}
                 if (p.set_op != .none) return self.setOperation(p, outer);
                 return self.core(p, outer);
             }
@@ -486,7 +489,7 @@ pub fn Exec(comptime config: types.Config) type {
                         for (0..p.key_count) |column| self.work.cells[group_row + column] = self.work.cells[source_row + column];
                     }
                     for (p.aggs[0..p.agg_count], 0..) |*agg, index| {
-                        self.work.cells[group_row + p.key_count + index] = try self.aggregate(p, agg, tuples, order, first, end, outer);
+                        self.work.cells[group_row + p.key_count + index] = if(p.aggregate_required[index]) try self.aggregate(p, agg, tuples, order, first, end, outer) else .null_value;
                     }
                     var group_ctx = self.context(outer);
                     group_ctx.tuple[group_relation] = self.row(group_row);
@@ -536,7 +539,7 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 // Integral COUNT(DISTINCT) may use exact caller-backed bitmap
                 // states. Other types/aggregates keep the general operator.
-                for (p.aggs[0..p.agg_count]) |agg| if (agg.distinct and
+                for (p.aggs[0..p.agg_count],0..) |agg,index| if (p.aggregate_required[index] and agg.distinct and
                     (agg.kind!=.count or !value_module.integral(agg.arg_ty))) return false;
                 // Keep the existing lazy evaluation contract for finite LIMITs.
                 if (p.limit != 0xffffffffffffffff and p.order_count == 0 and p.distinct == .none) {
@@ -555,7 +558,8 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn addAggregates(self: *Query, p: *const B.Plan, ctx: *E.Context, states: []Accumulator) Error!void {
-                for (p.aggs[0..p.agg_count], states) |*agg, *acc| {
+                for (p.aggs[0..p.agg_count], states,0..) |*agg, *acc,index| {
+                    if(!p.aggregate_required[index]) continue;
                     if (agg.filter != none and (try E.truth(ctx, agg.filter)) != true) continue;
                     if (agg.kind == .count_star) {
                         acc.count += 1;
@@ -575,6 +579,7 @@ pub fn Exec(comptime config: types.Config) type {
                 var layout:DistinctLayout=.{};
                 const available=self.work.cell_high-self.work.cell_low;
                 for(p.aggs[0..p.agg_count],0..) |agg,i| {
+                    if(!p.aggregate_required[i]) continue;
                     if(!agg.distinct) continue;
                     layout.active=true;
                     const node=&self.pool.nodes[agg.arg];
@@ -604,6 +609,7 @@ pub fn Exec(comptime config: types.Config) type {
             fn addDistinctAggregates(self:*Query,p:*const B.Plan,ctx:*E.Context,states:[]Accumulator,
                 layout:*const DistinctLayout,seen:[]align(@alignOf(V.Cell)) u64) Error!void {
                 for(p.aggs[0..p.agg_count],states,0..) |*agg,*acc,i| {
+                    if(!p.aggregate_required[i]) continue;
                     if(agg.filter!=none and (try E.truth(ctx,agg.filter))!=true) continue;
                     if(agg.kind==.count_star) {acc.count+=1;continue;}
                     var temporary:V.Cell=undefined;
@@ -628,7 +634,7 @@ pub fn Exec(comptime config: types.Config) type {
             }
             fn projectGroupMask(self:*Query,p:*const B.Plan,at:u32,states:[]const Accumulator,outer:?*const E.Context,out:*List,mask:u64) Error!void {
                 for (p.aggs[0..p.agg_count], states, 0..) |*agg, *acc, index| {
-                    self.work.cells[at + p.key_count + index] = try self.finishAggregate(agg, acc);
+                    self.work.cells[at + p.key_count + index] = if(p.aggregate_required[index]) try self.finishAggregate(agg, acc) else .null_value;
                 }
                 var ctx = self.context(outer);
                 ctx.tuple[group_relation] = self.row(at);ctx.grouping_mask=mask;
@@ -654,7 +660,8 @@ pub fn Exec(comptime config: types.Config) type {
             fn summaryEligible(self: *const Query, p: *const B.Plan, table: *const S.Table) bool {
                 if(p.source_count!=1) return false;
                 if (!self.committed_only or !table.summary.valid or table.summary.csn > self.snap.csn or p.where != none) return false;
-                for (p.aggs[0..p.agg_count]) |agg| {
+                for (p.aggs[0..p.agg_count],0..) |agg,index| {
+                    if(!p.aggregate_required[index]) continue;
                     if (agg.distinct or agg.filter != none) return false;
                     if (agg.kind == .count_star) continue;
                     if (agg.kind != .count and !((agg.kind == .sum or agg.kind == .avg) and value_module.integral(agg.arg_ty))) return false;
@@ -668,9 +675,10 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn summaryStates(self: *Query, p: *const B.Plan, columns: *const [config.columns]S.ColumnSummary, rows: i64, states: []Accumulator) Error!void {
-                for (p.aggs[0..p.agg_count], states) |agg, *state| {
+                for (p.aggs[0..p.agg_count], states,0..) |agg, *state,index| {
                     try self.session.checkpoint();
                     state.* = .{};
+                    if(!p.aggregate_required[index]) continue;
                     if (agg.kind == .count_star) { state.count = rows; continue; }
                     const column = &columns[self.pool.nodes[agg.arg].column];
                     state.count = column.nonnull;
@@ -725,11 +733,21 @@ pub fn Exec(comptime config: types.Config) type {
                 column: u16 = 0,
             };
 
-            fn prepareTransitions(self: *const Query, p: *const B.Plan, output: []Transition) bool {
-                return self.prepareTransitionsMode(p,output,false);
+            fn allAggregatesRequired(p:*const B.Plan) bool {
+                for(p.aggregate_required[0..p.agg_count]) |required| if(!required) return false;
+                return true;
             }
-            fn prepareTransitionsMode(self:*const Query,p:*const B.Plan,output:[]Transition,allow_distinct:bool) bool {
-                for (p.aggs[0..p.agg_count], output) |agg, *item| {
+            fn prepareTransitions(self: *const Query, p: *const B.Plan, output: []Transition) bool {
+                return self.prepareTransitionsMode(p,output,false,false);
+            }
+            fn prepareTransitionsMode(self:*const Query,p:*const B.Plan,output:[]Transition,allow_distinct:bool,count_presence_helper:bool) bool {
+                // Specialized channels retain all-state layouts until partial
+                // transitions are proved; the generic streaming path handles them.
+                for (p.aggs[0..p.agg_count], output,0..) |agg, *item,index| {
+                    // A fused producer may need its pure COUNT(*) as an internal
+                    // group-presence channel. It has no argument/filter/effects;
+                    // bounded row identifiers keep its count representable.
+                    if(!p.aggregate_required[index] and !(count_presence_helper and agg.kind==.count_star and agg.filter==none and !agg.distinct)) return false;
                     if (agg.filter!=none or (agg.distinct and (!allow_distinct or agg.kind!=.count or !value_module.integral(agg.arg_ty)))) return false;
                     if (agg.kind == .count_star) { item.* = .{ .kind = .count_star }; continue; }
                     if (agg.kind != .count and !((agg.kind == .sum or agg.kind == .avg) and value_module.integral(agg.arg_ty))) return false;
@@ -1545,6 +1563,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// Carry a non-null COUNT/SUM producer directly into a grouped
             /// unique-key consumer. No producer Cell table or NUMERIC per key.
             noinline fn nestedFactorGroup(self:*Query,p:*const B.Plan,outer:?*const E.Context) Error!?List {
+                if(!allAggregatesRequired(p)) return null;
                 if(outer!=null or p.set_op!=.none or p.correlated or !p.grouped or p.source_count!=2 or p.key_count==0 or p.agg_count==0 or !self.committed_only) return null;
                 if(comptime config.numeric_digits<39) return null;
                 const source=p.sources[0];var producer_id=source.plan;
@@ -1567,7 +1586,7 @@ pub fn Exec(comptime config: types.Config) type {
                 if(!table.summary.valid or table.summary.rows<0 or table.summary.csn>self.snap.csn or table.scan_high!=table.row_high) return null;
                 const key=self.pool.nodes[producer.keys[0]];
                 if(key.kind!=.column or key.level!=0 or key.relation!=0 or !value_module.integral(key.ty)) return null;
-                var transitions:[2]Transition=undefined;if(!self.prepareTransitions(producer,&transitions)) return null;
+                var transitions:[2]Transition=undefined;if(!self.prepareTransitionsMode(producer,&transitions,false,true)) return null;
                 const count_index:usize=if(transitions[0].kind==.count_star) 0 else 1;const sum_index=1-count_index;
                 if(transitions[count_index].kind!=.count_star or (transitions[sum_index].kind!=.sum_integer and transitions[sum_index].kind!=.sum_wide)) return null;
                 const sum_column=transitions[sum_index].column;
@@ -1940,7 +1959,7 @@ pub fn Exec(comptime config: types.Config) type {
                 if(label.kind!=.column or label.level!=0 or label.relation==0 or label.relation>=p.source_count or
                     !S.summaryKeyType(self.tables[p.sources[label.relation].table.?].columns[label.column].data_type)) return null;
                 var transitions:[config.columns]Transition=undefined;
-                if(!self.prepareTransitionsMode(p,transitions[0..p.agg_count],true)) return null;
+                if(!self.prepareTransitionsMode(p,transitions[0..p.agg_count],true,false)) return null;
                 const distinct=self.distinctLayout(p) orelse return null;if(!distinct.active) return null;
                 for(transitions[0..p.agg_count]) |item| if(item.kind==.sum_integer and table.summary.columns[item.column].nonnull!=0) {
                     const amounts=table.integer_bounds[item.column];if(!amounts.known) return null;const n=@as(i128,table.summary.rows);
@@ -2482,7 +2501,7 @@ pub fn Exec(comptime config: types.Config) type {
                 var scan_plan=p.*;scan_plan.limit=0xffffffffffffffff;scan_plan.offset=0;
                 const streamed=streamEligible(&scan_plan);
                 var tuples:Tuples=undefined;if(!streamed) tuples=try self.join(p,outer);
-                for(p.aggs[0..p.agg_count]) |agg| if(agg.distinct) {
+                for(p.aggs[0..p.agg_count],0..) |agg,index| if(p.aggregate_required[index] and agg.distinct) {
                     if(agg.kind!=.count or !value_module.integral(agg.arg_ty)) return error.UnsupportedStatement;
                     const argument=self.pool.nodes[agg.arg];
                     if(argument.kind!=.column or argument.level!=0 or argument.relation>=p.source_count or p.sources[argument.relation].table==null) return error.UnsupportedStatement;
@@ -2507,6 +2526,7 @@ pub fn Exec(comptime config: types.Config) type {
                     for(p.keys[0..p.key_count],0..) |id,index| keys[index]=try E.eval(&ctx,id);
                     var values:[config.columns]V.Cell=undefined;var allowed:[config.columns]bool=@splat(false);
                     for(p.aggs[0..p.agg_count],0..) |agg,index| {
+                        if(!p.aggregate_required[index]) continue;
                         if(agg.filter!=none and try E.truth(&ctx,agg.filter)!=true) continue;
                         if(agg.kind==.count_star){allowed[index]=true;continue;}
                         values[index]=try E.eval(&ctx,agg.arg);allowed[index]=values[index]!=.null_value;

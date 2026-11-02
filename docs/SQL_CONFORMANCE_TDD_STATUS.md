@@ -1,6 +1,50 @@
 # SQL conformance TDD checkpoint
 
-## Planner candidate checkpoint - 2 November 2026
+## Qualified planner checkpoint - 2 November 2026
+
+Plain derived-output demand and immutable error timing qualified and merged in
+ZPM PR97 (main fe4479c) and RAMSQL PR51 (main c68e8f9). Database matrix41405262720
+passed all five host/native-oracle jobs; Windows retained every check with an
+independently reviewed45-minute job budget after two30-minute timeouts in the
+final CLI checks. Core444 and parallel46 assertions/2400queries/eight threads
+were independently reproduced. RAMSQL CI41367643673 passed all8 jobs and release
+41367643674 passed25 active jobs plus one intentional duplicate skip.
+
+The exact eight-target bundle is published as non-latest CI prerelease
+ci-v0.3.0-beta.2-run.41367643674.1; all29 digests were verified. RAMSQL main,
+qualified candidate and published source share tree e3a2624. Its immutable ZPM
+pin ef6e3c0 is a merged ancestor; only the Windows CI budget file differs from
+qualified ZPM main. Every runtime and test file is identical.
+
+The broader ZPM graph still has four unchanged SABR/TLS/TTS failures, with324
+successes and22skips. This is separate from the passing database/platform gates.
+The original118-program inventory remains12smoke passes/89failures/17unexecuted,
+with expected SqlConformanceIncomplete. No SQL family, production drop-in scope,
+capacity limit or performance-superiority claim is closed by this slice.
+
+## Aggregate-state demand investigation - 2 November 2026
+
+A separate50-program native16.15 corpus reproduced25matches and25gaps on the
+test-first baseline. The runtime candidate now passes all50 in ReleaseSafe.
+These probes do not change the original118-program audit. Runtime aggregate-state
+liveness is implemented in the candidate, but not yet qualified or merged.
+Full CI caught a missing dependency for aggregates in unused named WINDOW
+definitions. A native16 supplement adds three programs (53total), with a red
+50pass/3gap checkpoint and a fixed aggregate-prefix dependency under qualification.
+Duplicate groups, NULL/empty aggregates, row-dependent
+errors, FILTER/DISTINCT, volatility and semantic errors now have frozen probes.
+Native16.15/18.3 expectations each replay50/50 in oracle-calibration CI41407604728.
+Physical-path tests now cover bounded streaming, typed/factorized fallbacks,
+cancellation/work exhaustion, poisoned reuse and reader/private-write visibility.
+Independent runtime review found no introduced blocking defect. Parameters and
+full platform/product qualification remain open. See [the implementation scope](SQL_AGGREGATE_DEMAND.md)
+and [historical test-first plan](SQL_AGGREGATE_DEMAND_PLAN.md). Existing right-hand
+boolean absorbers still evaluate aggregates that PostgreSQL eliminates; that
+separate parity gap is explicitly open. A separate
+high-exponent numeric-literal capacity finding is retained rather than hidden by
+the explicit float8 inputs used to isolate aggregate overflow.
+
+## Historical planner candidate checkpoint - 2 November 2026
 
 The concrete unused-derived TRUNC and empty-input SQRT examples have candidate
 fixes in [SQL_PLANNER_DEMAND.md](SQL_PLANNER_DEMAND.md). Native PostgreSQL16.15

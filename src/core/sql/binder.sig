@@ -264,6 +264,10 @@ pub fn Binder(comptime config: types.Config) type {
             key_count: usize = 0,
             aggs: [config.columns]Agg = undefined,
             agg_count: usize = 0,
+            aggregate_required:[config.columns]bool=@splat(true),
+            /// Conservatively retain aggregates registered from named WINDOW
+            /// clauses, including definitions with no consuming WindowAgg.
+            window_aggregate_count:usize=0,
             having: u16 = none,
             targets: [2 * config.columns]u16 = undefined,
             count: usize = 0,
@@ -1239,7 +1243,10 @@ pub fn Binder(comptime config: types.Config) type {
             return n.kind == .null_literal or (n.kind == .cast and knownNull(context, n.a));
         }
 
-        fn immutableGenerated(context: *const Context, id: u16) bool {
+        fn immutableGenerated(context:*const Context,id:u16) bool {
+            return immutableExpression(context,id,false);
+        }
+        fn immutableExpression(context: *const Context, id: u16, allow_aggregates:bool) bool {
             if (id == none) return true;
             const n = context.node(id);
             switch (n.kind) {
@@ -1254,23 +1261,24 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .binary => if ((n.op == .add or n.op == .sub) and n.ty == .timestamptz and
                     (context.node(n.a).ty == .interval or context.node(n.b).ty == .interval)) return false,
-                .scalar_subquery, .exists_subquery, .in_subquery, .aggregate => return false,
+                .scalar_subquery, .exists_subquery, .in_subquery => return false,
+                .aggregate => if(!allow_aggregates) return false,
                 .row_compare => {
                     if (n.a != none) return true;
                     var item = n.b;
                     while (item != none) : (item = context.node(item).next) {
                         const pair = context.node(item);
                         if ((n.op == .eq or n.op == .ne) and (knownNull(context, pair.a) or knownNull(context, pair.b))) continue;
-                        if (!immutableGenerated(context, pair.a) or !immutableGenerated(context, pair.b)) return false;
+                        if (!immutableExpression(context, pair.a, allow_aggregates) or !immutableExpression(context, pair.b, allow_aggregates)) return false;
                     }
                     return true;
                 },
                 else => {},
             }
-            if (!immutableGenerated(context, n.a) or !immutableGenerated(context, n.c)) return false;
-            if (!listOwner(n.kind)) return immutableGenerated(context, n.b);
+            if (!immutableExpression(context, n.a, allow_aggregates) or !immutableExpression(context, n.c, allow_aggregates)) return false;
+            if (!listOwner(n.kind)) return immutableExpression(context, n.b, allow_aggregates);
             var item = n.b;
-            while (item != none) : (item = context.node(item).next) if (!immutableGenerated(context, item)) return false;
+            while (item != none) : (item = context.node(item).next) if (!immutableExpression(context, item, allow_aggregates)) return false;
             return true;
         }
 
@@ -3231,7 +3239,7 @@ pub fn Binder(comptime config: types.Config) type {
                 var state:PlannedValidation=.{};
                 var pending:?Error=null;
                 for(p.targets[0..p.width],0..) |target,column| {
-                    p.prunable[column]=immutableGenerated(context,target);
+                    p.prunable[column]=immutableExpression(context,target,true);
                     planning.constant_dependencies=&p.constant_dependencies[column];
                     validateDiscardedConstants(constant_context,target) catch |err| {if(planningControlError(err)) return err;p.planned_targets[column]=err;};
                     if(p.planned_targets[column]==null) {
@@ -3269,6 +3277,7 @@ pub fn Binder(comptime config: types.Config) type {
                     for(spec.partition[0..spec.partition_count]) |item| try groupify(context,p,item);
                     for(spec.order[0..spec.order_count]) |key| try groupify(context,p,key.expr);
                 }
+                p.window_aggregate_count=p.agg_count;
                 for (p.targets[0..p.count]) |target| try groupify(context, p, target);
                 try groupify(context, p, p.having);
                 for (order_refs[0..q.order_count]) |ref| if (ref == .expr) try groupify(context, p, ref.expr);
@@ -3541,7 +3550,7 @@ pub fn Binder(comptime config: types.Config) type {
                 if(p.window_count!=1 or (p.limit!=0xffffffffffffffff and !win.offset_prefix)) return error.UnsupportedStatement;
                 for(p.window_late[0..p.width]) |late| if(late) return error.UnsupportedStatement;
             }
-            p.source_count=1;p.sources[0]=.{.plan=child};p.where=none;p.grouped=false;p.rollup=false;p.key_count=0;p.agg_count=0;p.having=none;
+            p.source_count=1;p.sources[0]=.{.plan=child};p.where=none;p.grouped=false;p.rollup=false;p.key_count=0;p.agg_count=0;p.window_aggregate_count=0;p.having=none;
         }
 
         fn member(list: []const u16, column: u16) bool {
@@ -3603,7 +3612,12 @@ pub fn Binder(comptime config: types.Config) type {
             if(n.kind==.column) {
                 if(owner!=none and n.level==0) {
                     const p=&plansOf(context).items[owner];
-                    if(n.relation<p.source_count) demandOutput(context,p.sources[n.relation].plan,n.column,changed);
+                    if(p.grouped and n.relation==group_relation) {
+                        if(n.column>=p.key_count) {
+                            const index=n.column-p.key_count;
+                            if(index<p.agg_count and !p.aggregate_required[index]) {p.aggregate_required[index]=true;changed.*=true;}
+                        }
+                    } else if(n.relation<p.source_count) demandOutput(context,p.sources[n.relation].plan,n.column,changed);
                 }
                 return;
             }
@@ -3647,12 +3661,12 @@ pub fn Binder(comptime config: types.Config) type {
         }
         fn planOutputDemand(context:*const Context,bound:*const Bound) Error!void {
             const plans=context.plans orelse return;
-            // Correlation, grouping/windows and set operations retain conservative
+            // Correlation, windows and set operations retain conservative
             // dependencies; plain derived outputs can be suppressed without changing
             // width, column numbering, bags or row cardinality.
             var conservative=bound.*!=.query;
             for(plans.items[0..plans.len]) |*p| conservative=conservative or p.correlated;
-            for(plans.items[0..plans.len]) |*p| {p.demanded=conservative;p.required=@splat(conservative);}
+            for(plans.items[0..plans.len]) |*p| {p.demanded=conservative;p.required=@splat(conservative);p.aggregate_required=@splat(conservative);}
             if(conservative) return;
             var cte_references:[config.ctes]usize=@splat(0);
             for(plans.items[0..plans.len]) |*consumer| for(consumer.sources[0..consumer.source_count]) |source| {if(source.cte!=no_cte) cte_references[source.cte]+=1;};
@@ -3662,9 +3676,10 @@ pub fn Binder(comptime config: types.Config) type {
                 for(plans.items[0..plans.len],0..) |*p,index| {
                     if(!p.demanded) continue;
                     const owner:u16=@intCast(index);
+                    for(0..p.window_aggregate_count) |i| if(!p.aggregate_required[i]) {p.aggregate_required[i]=true;changed=true;};
                     if(p.set_op!=.none) {demandAll(context,p.left,&changed);demandAll(context,p.right,&changed);continue;}
                     var planning=context.*;planning.planning_plan=p;const demand_context=&planning;
-                    const barrier=p.grouped or p.window_count!=0;
+                    const barrier=p.window_count!=0;
                     for(0..p.width) |i| if(barrier or p.distinct!=.none or !p.prunable[i]) demandOutput(context,owner,i,&changed);
                     for(p.order[0..p.order_count]) |key| demandOutput(context,owner,key.column,&changed);
                     for(p.sources[0..p.source_count]) |source| {
@@ -3677,7 +3692,7 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     for(p.targets[0..p.width],0..) |expression,i| if(p.required[i]) try demandExpr(demand_context,owner,expression,&changed);
                     for(p.keys[0..p.key_count]) |expression| try demandExpr(demand_context,owner,expression,&changed);
-                    for(p.aggs[0..p.agg_count]) |agg| {try demandExpr(demand_context,owner,agg.arg,&changed);try demandExpr(demand_context,owner,agg.filter,&changed);}
+                    for(p.aggs[0..p.agg_count],0..) |agg,i| if(p.aggregate_required[i]) {try demandExpr(demand_context,owner,agg.arg,&changed);try demandExpr(demand_context,owner,agg.filter,&changed);};
                     try demandExpr(demand_context,owner,p.where,&changed);try demandExpr(demand_context,owner,p.having,&changed);
                     for(p.windows[0..p.window_count]) |win| {
                         for([_]u16{win.deferred_arg,win.deferred_filter,win.offset_arg,win.default_arg,win.start.offset,win.end.offset}) |expression| try demandExpr(demand_context,owner,expression,&changed);
