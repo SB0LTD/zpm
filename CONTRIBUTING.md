@@ -56,8 +56,8 @@ checkout. Nexus additionally accepts the explicit `-Dzpm-root=../zpm` override.
 ## Code Style
 
 The Linux CI graph includes SABR, manifest/player transforms, TLS and disarmed
-GPU contracts. Reproduce those targets with the pinned CI release before using
-a newer compiler as an additional check:
+GPU contracts. CI uses the latest stable Sig release. Reproduce those targets
+with the same release:
 
 ```bash
 sig build test-sabr-loop test-manifest-sabr test-tls-client test-tts-gpu --keep-going
