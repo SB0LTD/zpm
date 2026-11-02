@@ -1,28 +1,30 @@
-//! Full TCP Implementation (RFC 793, RFC 7323, RFC 5681, RFC 6298, RFC 2018)
+//! TCP (RFC 9293) — zero allocation, fixed connection pool, freestanding.
 //!
-//! Complete TCP stack supporting:
-//!   - All 11 RFC 793 states (CLOSED→LISTEN→SYN_RCVD→SYN_SENT→ESTABLISHED→
-//!     FIN_WAIT_1→FIN_WAIT_2→CLOSING→TIME_WAIT→CLOSE_WAIT→LAST_ACK)
-//!   - Active open (connect) and passive open (listen/accept)
-//!   - Window scaling (RFC 7323 §2) — up to 1GB windows
-//!   - TCP timestamps / RTTM (RFC 7323 §3) — precise RTT measurement
-//!   - Selective Acknowledgment / SACK (RFC 2018) — gap reporting
-//!   - MSS negotiation (option kind 2)
-//!   - Nagle algorithm (RFC 896) — small-packet coalescing
-//!   - NewReno congestion control (RFC 5681) — slow start, cong. avoidance,
-//!     fast retransmit, fast recovery
-//!   - RTO computation per RFC 6298 (Karn's algorithm, exponential backoff)
-//!   - Delayed ACK (200ms timer or every 2 segments)
-//!   - Keepalive probes
-//!   - Proper sequence number arithmetic with 32-bit wraparound
-//!   - Zero-window probing (persist timer)
-//!   - RST generation for invalid segments
-//!   - Simultaneous open and simultaneous close
-//!   - TIME_WAIT with 2MSL timeout
-//!   - Urgent pointer (expedited data delivery)
+//! Built to carry long-lived TLS streams over real (lossy, reordering) links:
+//! the sb0s Galaxy genie streams its answers over it. Features:
+//!   - Active and passive open, all RFC 9293 states, RST validation (RFC 5961)
+//!   - MSS, window scale and SACK-permitted options; SYN windows are never
+//!     scaled and scaling is off unless both SYNs carry the option
+//!   - Send/receive ring buffers; the advertised receive window is the free
+//!     space, so the right edge never shrinks
+//!   - Retransmission per RFC 6298 (Karn, exponential backoff, 200 ms floor)
+//!     with go-back-N from SND.UNA
+//!   - NewReno (RFC 5681/6582): slow start, congestion avoidance, fast
+//!     retransmit on the 3rd duplicate ACK, fast recovery with partial-ACK
+//!     retransmission
+//!   - Out-of-order reassembly (one contiguous range) reported with an honest
+//!     SACK block, immediate ACKs for gaps and duplicates
+//!   - Delayed ACK (40 ms / every 2nd full segment)
+//!   - Window updates when the application reads (SWS avoidance), zero-window
+//!     probing
+//!   - Graceful close: FIN after all queued data; FIN carried with data;
+//!     short client-side TIME_WAIT
+//!   - RFC 6528-style ISNs and randomized ephemeral ports from a caller seed
 //!
-//! Zero allocation. Fixed connection pool. Static buffers.
-//! Designed for bare-metal kernel use (GCP metadata server, general networking).
+//! Time is supplied by the caller in microseconds: tick(now_us, ...) runs the
+//! timers and emits segments; processSegment() handles one inbound segment and
+//! may return one immediate reply (ACK or RST). Packets produced here are
+//! IPv4 + TCP (no link-layer header).
 
 const checksum = @import("net_checksum");
 const ipv4 = @import("net_ipv4");
@@ -33,20 +35,24 @@ const ipv4 = @import("net_ipv4");
 
 pub const HEADER_MIN: usize = 20;
 pub const HEADER_MAX: usize = 60; // With options
-pub const MAX_CONNECTIONS: usize = 16;
-pub const RECV_BUF_SIZE: usize = 16384; // 16KB per connection
-pub const SEND_BUF_SIZE: usize = 16384; // 16KB per connection
+pub const MAX_CONNECTIONS: usize = 32;
+pub const RECV_BUF_SIZE: usize = 512 * 1024; // the window: at 64 KiB a download ran at ~2-3 MB/s (window / round trip)
+pub const SEND_BUF_SIZE: usize = 32 * 1024;
 pub const DEFAULT_MSS: u16 = 1460; // Ethernet MTU - IP(20) - TCP(20)
-pub const DEFAULT_WINDOW: u16 = 16384;
 pub const MAX_WINDOW: u32 = 1073741824; // 1GB with scaling
+/// Our window scale shift (the window field counts in 16-byte units).
+const RCV_WSCALE: u8 = 4; // 65535 << 4 covers the 512 KiB window
 
-// Timers (in poll ticks — caller provides tick rate)
-pub const MSL: u32 = 60_000_000; // 60s Maximum Segment Lifetime
-pub const TIME_WAIT_DURATION: u32 = 2 * MSL;
-pub const DELAYED_ACK_TICKS: u32 = 200_000; // 200ms
-pub const KEEPALIVE_TICKS: u32 = 7_200_000_000; // 2 hours
-pub const PERSIST_MIN_TICKS: u32 = 1_000_000; // 1s
-pub const NAGLE_THRESHOLD: usize = 1; // Single byte triggers Nagle
+// Timers (microseconds).
+pub const INITIAL_RTO_US: u32 = 1_000_000; // RFC 6298 §2.1
+pub const MIN_RTO_US: u32 = 200_000; // Linux's floor; RFC 6298's 1 s is too sluggish
+pub const MAX_RTO_US: u32 = 60_000_000;
+pub const DELAYED_ACK_US: u64 = 40_000;
+pub const TIME_WAIT_US: u64 = 10_000_000; // short: we are a client with random ports
+pub const PERSIST_MIN_US: u64 = 500_000;
+const MAX_SYN_RETRIES: u8 = 6; // 1+2+4+8+16+32 s
+const MAX_DATA_RETRIES: u8 = 12;
+const MAX_BURST: usize = 64; // segments per connection per tick
 
 // TCP flags
 pub const FLAG_FIN: u8 = 0x01;
@@ -65,10 +71,9 @@ const OPT_MSS: u8 = 2;
 const OPT_WINDOW_SCALE: u8 = 3;
 const OPT_SACK_PERMITTED: u8 = 4;
 const OPT_SACK: u8 = 5;
-const OPT_TIMESTAMP: u8 = 8;
 
 // ══════════════════════════════════════════════════════════════════════════════
-// TCP State Machine (RFC 793 Figure 6)
+// State machine (RFC 9293 §3.3.2)
 // ══════════════════════════════════════════════════════════════════════════════
 
 pub const State = enum(u8) {
@@ -85,16 +90,8 @@ pub const State = enum(u8) {
     last_ack,
 };
 
-// ══════════════════════════════════════════════════════════════════════════════
-// SACK Block (RFC 2018)
-// ══════════════════════════════════════════════════════════════════════════════
-
-pub const MAX_SACK_BLOCKS: usize = 4;
-
-pub const SackBlock = struct {
-    left_edge: u32, // First sequence number of this block
-    right_edge: u32, // Sequence number immediately following this block
-};
+/// Why a connection reached CLOSED without a graceful exchange.
+pub const CloseReason = enum(u8) { none, refused, reset, timeout };
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Congestion Control (RFC 5681 NewReno)
@@ -103,9 +100,9 @@ pub const SackBlock = struct {
 pub const CongestionState = struct {
     cwnd: u32, // Congestion window (bytes)
     ssthresh: u32, // Slow-start threshold
-    recovery_point: u32, // SND.NXT when fast recovery entered
-    in_recovery: bool, // Currently in fast recovery
-    dup_ack_count: u8, // Duplicate ACK counter
+    recovery_point: u32, // SND.MAX when fast recovery was entered
+    in_recovery: bool,
+    dup_ack_count: u8,
 
     pub fn init(mss: u16) CongestionState {
         return .{
@@ -117,1104 +114,1220 @@ pub const CongestionState = struct {
         };
     }
 
-    /// Increase window on new ACK (slow start or congestion avoidance).
+    /// Grow the window on a new ACK (slow start or congestion avoidance).
     pub fn onAck(self: *CongestionState, bytes_acked: u32, mss: u16) void {
-        if (self.in_recovery) return; // No increase during recovery
-
+        if (self.in_recovery) return;
         if (self.cwnd < self.ssthresh) {
-            // Slow start: increase by bytes_acked (exponential growth)
             self.cwnd += bytes_acked;
         } else {
-            // Congestion avoidance: increase by MSS per RTT
-            // Approximated as MSS * MSS / cwnd per ACK
-            self.cwnd += @as(u32, mss) * @as(u32, mss) / self.cwnd;
+            self.cwnd += @max(1, @as(u32, mss) * @as(u32, mss) / self.cwnd);
         }
-
-        // Cap at MAX_WINDOW
         if (self.cwnd > MAX_WINDOW) self.cwnd = MAX_WINDOW;
     }
 
-    /// Enter fast recovery on 3rd duplicate ACK (RFC 5681 §3.2).
-    pub fn enterFastRecovery(self: *CongestionState, flight_size: u32, snd_nxt: u32) void {
+    /// Enter fast recovery on the 3rd duplicate ACK (RFC 5681 §3.2).
+    pub fn enterFastRecovery(self: *CongestionState, flight_size: u32, snd_max: u32) void {
         self.ssthresh = @max(flight_size / 2, @as(u32, 2) * DEFAULT_MSS);
-        self.cwnd = self.ssthresh + 3 * DEFAULT_MSS; // Inflate for segments in flight
-        self.recovery_point = snd_nxt;
+        self.cwnd = self.ssthresh + 3 * DEFAULT_MSS;
+        self.recovery_point = snd_max;
         self.in_recovery = true;
         self.dup_ack_count = 0;
     }
 
-    /// Process duplicate ACK during fast recovery (inflate cwnd).
+    /// Inflate the window for each further duplicate ACK in recovery.
     pub fn onDupAckInRecovery(self: *CongestionState) void {
         self.cwnd += DEFAULT_MSS;
     }
 
-    /// Exit fast recovery on new data ACK (RFC 5681 §3.2).
+    /// Leave fast recovery once the recovery point is acknowledged.
     pub fn exitRecovery(self: *CongestionState) void {
         self.cwnd = self.ssthresh;
         self.in_recovery = false;
         self.dup_ack_count = 0;
     }
 
-    /// On RTO timeout (RFC 5681 §3.1).
+    /// Collapse the window on a retransmission timeout (RFC 5681 §3.1).
     pub fn onTimeout(self: *CongestionState, mss: u16) void {
         self.ssthresh = @max(self.cwnd / 2, @as(u32, 2) * mss);
-        self.cwnd = mss; // Reset to 1 MSS
+        self.cwnd = mss;
         self.in_recovery = false;
         self.dup_ack_count = 0;
     }
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
-// RTT Estimation (RFC 6298)
+// RTT Estimation (RFC 6298), microseconds
 // ══════════════════════════════════════════════════════════════════════════════
 
 pub const RttState = struct {
-    srtt: u32, // Smoothed RTT (ticks, scaled ×8)
-    rttvar: u32, // RTT variance (ticks, scaled ×4)
-    rto: u32, // Retransmission Timeout (ticks)
+    srtt: u32, // Smoothed RTT (µs, scaled ×8)
+    rttvar: u32, // RTT variance (µs, scaled ×4)
+    rto: u32, // Retransmission timeout (µs)
     has_sample: bool,
 
     pub fn init() RttState {
-        return .{
-            .srtt = 0,
-            .rttvar = 0,
-            .rto = 3_000_000, // Initial RTO = 3s (RFC 6298 §2.1)
-            .has_sample = false,
-        };
+        return .{ .srtt = 0, .rttvar = 0, .rto = INITIAL_RTO_US, .has_sample = false };
     }
 
-    /// Update RTT from a new measurement (RFC 6298 §2).
-    pub fn update(self: *RttState, rtt_ticks: u32) void {
+    /// Fold in one RTT measurement (RFC 6298 §2).
+    pub fn update(self: *RttState, rtt_us: u32) void {
+        const r = @min(rtt_us, MAX_RTO_US);
         if (!self.has_sample) {
-            // First measurement
-            self.srtt = rtt_ticks << 3; // ×8
-            self.rttvar = rtt_ticks << 1; // ×4 (half of first sample)
+            self.srtt = r << 3;
+            self.rttvar = r << 1;
             self.has_sample = true;
         } else {
-            // RTTVAR = (1-β) × RTTVAR + β × |SRTT/8 - R|
-            // β = 1/4, α = 1/8
-            const diff = if ((self.srtt >> 3) > rtt_ticks)
-                (self.srtt >> 3) - rtt_ticks
-            else
-                rtt_ticks - (self.srtt >> 3);
+            const s = self.srtt >> 3;
+            const diff = if (s > r) s - r else r - s;
             self.rttvar = (self.rttvar * 3 + (diff << 2)) >> 2;
-            // SRTT = (1-α) × SRTT + α × R
-            self.srtt = (self.srtt * 7 + (rtt_ticks << 3)) >> 3;
+            self.srtt = (self.srtt * 7 + (r << 3)) >> 3;
         }
-        // RTO = SRTT/8 + max(G, 4×RTTVAR/4)
-        // G = clock granularity ≈ 1 tick
-        self.rto = (self.srtt >> 3) + @max(1, self.rttvar);
-        // Clamp: min 1s, max 60s
-        if (self.rto < 1_000_000) self.rto = 1_000_000;
-        if (self.rto > 60_000_000) self.rto = 60_000_000;
+        // RTO = SRTT + max(G, 4·RTTVAR); rttvar is stored ×4 already.
+        self.rto = (self.srtt >> 3) + @max(1000, self.rttvar);
+        self.rto = @max(MIN_RTO_US, @min(self.rto, MAX_RTO_US));
     }
 
-    /// Back off RTO on timeout (RFC 6298 §5.5).
+    /// Exponential backoff after a timeout (RFC 6298 §5.5).
     pub fn backoff(self: *RttState) void {
-        self.rto = @min(self.rto * 2, 60_000_000);
+        self.rto = @min(self.rto *| 2, MAX_RTO_US);
     }
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
-// TCP Connection
+// Connection
 // ══════════════════════════════════════════════════════════════════════════════
 
 pub const Connection = struct {
     state: State,
     active: bool,
+    user_closed: bool, // close() was called; release the slot on reaching CLOSED
+    accepted: bool, // passive side handed out by accept()
+    listener: u8, // passive side: index of the LISTEN slot that spawned it
+    reason: CloseReason,
 
-    // Addresses
     local_ip: [4]u8,
     local_port: u16,
     remote_ip: [4]u8,
     remote_port: u16,
 
-    // ── Send Sequence Space (RFC 793 §3.2) ──
-    // SND.UNA < SND.NXT <= SND.UNA + SND.WND
-    snd_una: u32, // Oldest unacknowledged sequence number
-    snd_nxt: u32, // Next sequence number to send
-    snd_wnd: u32, // Send window (from receiver's advertisement)
-    snd_wl1: u32, // Segment seq used for last window update
-    snd_wl2: u32, // Segment ack used for last window update
-    iss: u32, // Initial send sequence number
+    // Send sequence space. SND.MAX is the highest sequence number sent (it
+    // stays put when a timeout rewinds SND.NXT for go-back-N).
+    iss: u32,
+    snd_una: u32,
+    snd_nxt: u32,
+    snd_max: u32,
+    snd_wnd: u32,
+    snd_wl1: u32,
+    snd_wl2: u32,
 
-    // ── Receive Sequence Space ──
-    rcv_nxt: u32, // Next expected sequence number
-    rcv_wnd: u32, // Receive window (advertised to peer)
-    irs: u32, // Initial receive sequence number
+    // Receive sequence space. rcv_adv is the right window edge last advertised.
+    irs: u32,
+    rcv_nxt: u32,
+    rcv_adv: u32,
 
-    // ── Buffers ──
-    recv_buf: [RECV_BUF_SIZE]u8,
-    recv_len: usize,
-    send_buf: [SEND_BUF_SIZE]u8,
-    send_len: usize,
-    send_una_offset: usize, // Offset of SND.UNA in send_buf
+    // Options
+    mss: u16,
+    snd_wscale: u8,
+    rcv_wscale: u8,
+    sack_ok: bool,
+    nagle: bool,
 
-    // ── Options ──
-    mss: u16, // Negotiated MSS (peer's MSS or default)
-    snd_wscale: u8, // Peer's window scale factor (we apply to rcv'd wnd)
-    rcv_wscale: u8, // Our window scale factor (peer applies to our wnd)
-    ts_enabled: bool, // Timestamps negotiated
-    sack_permitted: bool, // SACK negotiated
-    nagle_enabled: bool, // Nagle algorithm active
+    // Send ring: snd_count bytes, the first at sequence number SND.UNA.
+    snd_head: usize,
+    snd_count: usize,
+    fin_queued: bool, // close() called: FIN follows the queued data
+    fin_sent: bool, // FIN is in flight (cleared by a go-back-N rewind)
+    fin_acked: bool,
+    fin_seq: u32, // sequence number of our FIN (valid once fin_seq_set)
+    fin_seq_set: bool,
 
-    // ── Timestamps (RFC 7323 §3) ──
-    ts_recent: u32, // Most recent timestamp from peer
-    ts_last_ack: u32, // Timestamp of last ACK sent (for RTTM)
-    ts_offset: u32, // Our timestamp clock base
+    // Receive ring: rcv_count readable bytes; out-of-order bytes live after
+    // them at offset (ooo_start - RCV.NXT).
+    rcv_head: usize,
+    rcv_count: usize,
+    ooo_valid: bool,
+    ooo_start: u32,
+    ooo_end: u32,
+    fin_received: bool,
 
-    // ── SACK (RFC 2018) ──
-    sack_blocks: [MAX_SACK_BLOCKS]SackBlock, // Received out-of-order blocks
-    sack_count: u8,
-
-    // ── Congestion Control ──
     cc: CongestionState,
     rtt: RttState,
 
-    // ── Timers (all in ticks) ──
-    retransmit_timer: u32, // Ticks until RTO fires
-    retransmit_active: bool,
-    delayed_ack_timer: u32, // Ticks until delayed ACK fires
-    delayed_ack_pending: bool,
-    time_wait_timer: u32, // Ticks remaining in TIME_WAIT
-    persist_timer: u32, // Zero-window probe timer
-    keepalive_timer: u32,
-    rto_backoff_count: u8, // Number of consecutive timeouts
+    // Timers: absolute deadlines in µs, 0 = off.
+    rto_deadline: u64,
+    retries: u8,
+    rtt_active: bool,
+    rtt_seq: u32,
+    rtt_start: u64,
+    syn_time: u64,
+    syn_retransmitted: bool,
+    ack_now: bool,
+    delack_deadline: u64,
+    segs_unacked: u8,
+    persist_deadline: u64,
+    persist_backoff: u8,
+    fast_rexmit: bool,
+    time_wait_deadline: u64,
+    backlog: u8,
 
-    // ── Retransmission ──
-    retransmit_seq: u32, // Start of retransmit segment
-    unacked_segments: u8, // Segments since last ACK (for delayed ACK)
-
-    // ── Passive open (LISTEN state) ──
-    backlog: u8, // Max pending connections (LISTEN mode)
-
-    // ── Stats ──
     total_sent: u64,
     total_recv: u64,
     retransmits: u32,
 
+    send_buf: [SEND_BUF_SIZE]u8,
+    recv_buf: [RECV_BUF_SIZE]u8,
+
+    /// Reset everything but the buffers (their contents are dead once the
+    /// counters are zero; clearing 96 KB per connection would be waste).
     pub fn reset(self: *Connection) void {
-        self.* = Connection{
-            .state = .closed,
-            .active = false,
-            .local_ip = .{ 0, 0, 0, 0 },
-            .local_port = 0,
-            .remote_ip = .{ 0, 0, 0, 0 },
-            .remote_port = 0,
-            .snd_una = 0,
-            .snd_nxt = 0,
-            .snd_wnd = 0,
-            .snd_wl1 = 0,
-            .snd_wl2 = 0,
-            .iss = 0,
-            .rcv_nxt = 0,
-            .rcv_wnd = RECV_BUF_SIZE,
-            .irs = 0,
-            .recv_buf = @splat(0),
-            .recv_len = 0,
-            .send_buf = @splat(0),
-            .send_len = 0,
-            .send_una_offset = 0,
-            .mss = DEFAULT_MSS,
-            .snd_wscale = 0,
-            .rcv_wscale = 0,
-            .ts_enabled = false,
-            .sack_permitted = false,
-            .nagle_enabled = true,
-            .ts_recent = 0,
-            .ts_last_ack = 0,
-            .ts_offset = 0,
-            .sack_blocks = @splat(SackBlock{ .left_edge = 0, .right_edge = 0 }),
-            .sack_count = 0,
-            .cc = CongestionState.init(DEFAULT_MSS),
-            .rtt = RttState.init(),
-            .retransmit_timer = 0,
-            .retransmit_active = false,
-            .delayed_ack_timer = 0,
-            .delayed_ack_pending = false,
-            .time_wait_timer = 0,
-            .persist_timer = 0,
-            .keepalive_timer = 0,
-            .rto_backoff_count = 0,
-            .retransmit_seq = 0,
-            .unacked_segments = 0,
-            .backlog = 0,
-            .total_sent = 0,
-            .total_recv = 0,
-            .retransmits = 0,
-        };
+        self.state = .closed;
+        self.active = false;
+        self.user_closed = false;
+        self.accepted = false;
+        self.listener = 0xFF;
+        self.reason = .none;
+        self.local_ip = .{ 0, 0, 0, 0 };
+        self.local_port = 0;
+        self.remote_ip = .{ 0, 0, 0, 0 };
+        self.remote_port = 0;
+        self.iss = 0;
+        self.snd_una = 0;
+        self.snd_nxt = 0;
+        self.snd_max = 0;
+        self.snd_wnd = 0;
+        self.snd_wl1 = 0;
+        self.snd_wl2 = 0;
+        self.irs = 0;
+        self.rcv_nxt = 0;
+        self.rcv_adv = 0;
+        self.mss = DEFAULT_MSS;
+        self.snd_wscale = 0;
+        self.rcv_wscale = 0;
+        self.sack_ok = false;
+        self.nagle = true;
+        self.snd_head = 0;
+        self.snd_count = 0;
+        self.fin_queued = false;
+        self.fin_sent = false;
+        self.fin_acked = false;
+        self.fin_seq = 0;
+        self.fin_seq_set = false;
+        self.rcv_head = 0;
+        self.rcv_count = 0;
+        self.ooo_valid = false;
+        self.ooo_start = 0;
+        self.ooo_end = 0;
+        self.fin_received = false;
+        self.cc = CongestionState.init(DEFAULT_MSS);
+        self.rtt = RttState.init();
+        self.rto_deadline = 0;
+        self.retries = 0;
+        self.rtt_active = false;
+        self.rtt_seq = 0;
+        self.rtt_start = 0;
+        self.syn_time = 0;
+        self.syn_retransmitted = false;
+        self.ack_now = false;
+        self.delack_deadline = 0;
+        self.segs_unacked = 0;
+        self.persist_deadline = 0;
+        self.persist_backoff = 0;
+        self.fast_rexmit = false;
+        self.time_wait_deadline = 0;
+        self.backlog = 0;
+        self.total_sent = 0;
+        self.total_recv = 0;
+        self.retransmits = 0;
     }
 
-    /// Effective send window: min(receiver window, congestion window).
+    /// Effective send window: min(peer's receive window, congestion window).
     pub fn effectiveWindow(self: *const Connection) u32 {
         return @min(self.snd_wnd, self.cc.cwnd);
     }
 
-    /// Bytes currently in flight (sent but unacknowledged).
+    /// Bytes in flight (sent, not yet acknowledged).
     pub fn flightSize(self: *const Connection) u32 {
-        return seqDiff(self.snd_nxt, self.snd_una);
+        return self.snd_nxt -% self.snd_una;
     }
 
-    /// Available send window (can we send more?).
+    /// Room left in the effective window.
     pub fn availableWindow(self: *const Connection) u32 {
         const eff = self.effectiveWindow();
         const flight = self.flightSize();
-        if (flight >= eff) return 0;
-        return eff - flight;
+        return if (flight >= eff) 0 else eff - flight;
     }
 
-    /// Bytes available to read from receive buffer.
     pub fn readable(self: *const Connection) usize {
-        return self.recv_len;
+        return self.rcv_count;
     }
 
-    /// Space available in send buffer.
     pub fn writable(self: *const Connection) usize {
-        return SEND_BUF_SIZE - self.send_len;
+        return SEND_BUF_SIZE - self.snd_count;
+    }
+
+    /// RTO with exponential backoff for consecutive timeouts. The backoff is
+    /// dropped as soon as new data is acknowledged (as Linux does): after a
+    /// go-back-N rewind no fresh RTT sample may arrive for a long time, and a
+    /// stuck 60 s RTO would stall the stream.
+    fn rto(self: *const Connection) u64 {
+        const shift: u6 = @intCast(@min(self.retries, 16));
+        return @min(@as(u64, self.rtt.rto) << shift, MAX_RTO_US);
+    }
+
+    fn rcvFree(self: *const Connection) usize {
+        return RECV_BUF_SIZE - self.rcv_count;
+    }
+
+    fn dataEnd(self: *const Connection) u32 {
+        return self.snd_una +% @as(u32, @intCast(self.snd_count));
+    }
+
+    fn synchronized(self: *const Connection) bool {
+        return switch (self.state) {
+            .closed, .listen, .syn_sent, .syn_received => false,
+            else => true,
+        };
+    }
+
+    fn canSendData(self: *const Connection) bool {
+        return switch (self.state) {
+            .established, .close_wait, .fin_wait_1, .closing, .last_ack => true,
+            else => false,
+        };
+    }
+
+    fn canReceiveData(self: *const Connection) bool {
+        return switch (self.state) {
+            .established, .fin_wait_1, .fin_wait_2 => true,
+            else => false,
+        };
     }
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Connection Pool
+// Pool, clock, entropy
 // ══════════════════════════════════════════════════════════════════════════════
 
-var connections: [MAX_CONNECTIONS]Connection = blk: {
-    var conns: [MAX_CONNECTIONS]Connection = undefined;
-    for (&conns) |*c| {
-        c.state = .closed;
-        c.active = false;
-        c.local_ip = .{ 0, 0, 0, 0 };
-        c.local_port = 0;
-        c.remote_ip = .{ 0, 0, 0, 0 };
-        c.remote_port = 0;
-        c.snd_una = 0;
-        c.snd_nxt = 0;
-        c.snd_wnd = 0;
-        c.snd_wl1 = 0;
-        c.snd_wl2 = 0;
-        c.iss = 0;
-        c.rcv_nxt = 0;
-        c.rcv_wnd = RECV_BUF_SIZE;
-        c.irs = 0;
-        c.recv_buf = @splat(0);
-        c.recv_len = 0;
-        c.send_buf = @splat(0);
-        c.send_len = 0;
-        c.send_una_offset = 0;
-        c.mss = DEFAULT_MSS;
-        c.snd_wscale = 0;
-        c.rcv_wscale = 0;
-        c.ts_enabled = false;
-        c.sack_permitted = false;
-        c.nagle_enabled = true;
-        c.ts_recent = 0;
-        c.ts_last_ack = 0;
-        c.ts_offset = 0;
-        c.sack_blocks = @splat(SackBlock{ .left_edge = 0, .right_edge = 0 });
-        c.sack_count = 0;
-        c.cc = CongestionState.init(DEFAULT_MSS);
-        c.rtt = RttState.init();
-        c.retransmit_timer = 0;
-        c.retransmit_active = false;
-        c.delayed_ack_timer = 0;
-        c.delayed_ack_pending = false;
-        c.time_wait_timer = 0;
-        c.persist_timer = 0;
-        c.keepalive_timer = 0;
-        c.rto_backoff_count = 0;
-        c.retransmit_seq = 0;
-        c.unacked_segments = 0;
-        c.backlog = 0;
-        c.total_sent = 0;
-        c.total_recv = 0;
-        c.retransmits = 0;
-    }
-    break :blk conns;
-};
-
+var connections: [MAX_CONNECTIONS]Connection = undefined;
+var pool_ready = false;
+var clock_us: u64 = 0;
+var isn_key: u64 = 0x9E37_79B9_7F4A_7C15;
 var next_local_port: u16 = 49152;
-var timestamp_clock: u32 = 0;
 
-// ══════════════════════════════════════════════════════════════════════════════
-// ISN Generation
-// ══════════════════════════════════════════════════════════════════════════════
-
-var isn_counter: u32 = 0x4A17B5C3; // Seeded with non-zero value
-pub fn seed(value: u64) void { isn_counter = @truncate(value); if (isn_counter == 0) isn_counter = 1; }
-pub fn tick(_: u64, pkt_buf: []u8, send_fn: *const fn ([]const u8) void) void { tickAll(pkt_buf, send_fn); }
-pub fn pendingBytes(handle: u8) usize { return if (handle < MAX_CONNECTIONS) connections[handle].recv_len else 0; }
-pub fn writable(handle: u8) usize { return if (handle < MAX_CONNECTIONS) connections[handle].writable() else 0; }
-pub fn eof(handle: u8) bool {
-    if (handle >= MAX_CONNECTIONS) return true;
-    const c = &connections[handle];
-    return c.recv_len == 0 and (c.state == .close_wait or c.state == .closed or c.state == .closing or c.state == .time_wait);
+fn pool() *[MAX_CONNECTIONS]Connection {
+    if (!pool_ready) {
+        for (&connections) |*c| c.reset();
+        pool_ready = true;
+    }
+    return &connections;
 }
 
-
-fn generateISN() u32 {
-    // RFC 6528 recommends a cryptographic ISN; we use a simple hash
-    // that's sufficient for our non-adversarial environment.
-    isn_counter +%= 64000; // Increment by ~1 per μs equivalent
-    isn_counter ^= isn_counter << 13;
-    isn_counter ^= isn_counter >> 17;
-    isn_counter ^= isn_counter << 5;
-    return isn_counter;
+fn conn(handle: u8) ?*Connection {
+    if (handle >= MAX_CONNECTIONS) return null;
+    const c = &pool()[handle];
+    return if (c.active) c else null;
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Public API — Active Open
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Open a TCP connection (active open). Returns handle or null if pool full.
-pub fn connect(local_ip: [4]u8, remote_ip: [4]u8, remote_port: u16) ?u8 {
-    const conn = allocConn() orelse return null;
-    const handle = connHandle(conn);
-
-    conn.reset();
-    conn.active = true;
-    conn.state = .syn_sent;
-    conn.local_ip = local_ip;
-    conn.local_port = allocPort();
-    conn.remote_ip = remote_ip;
-    conn.remote_port = remote_port;
-    conn.iss = generateISN();
-    conn.snd_una = conn.iss;
-    conn.snd_nxt = conn.iss +% 1; // SYN consumes one sequence number
-    conn.rcv_wnd = RECV_BUF_SIZE;
-    conn.rcv_wscale = 7; // We support up to 128KB × 128 = 16MB effective window
-    conn.cc = CongestionState.init(DEFAULT_MSS);
-    conn.retransmit_active = true;
-    conn.retransmit_timer = conn.rtt.rto;
-
-    return handle;
+/// Mix caller entropy into ISN and ephemeral-port generation. Call once at
+/// boot with a hardware/firmware seed; ISNs are then unpredictable (RFC 6528).
+pub fn seed(entropy: u64) void {
+    isn_key = mix64(isn_key ^ entropy);
+    next_local_port = 49152 + @as(u16, @truncate(mix64(isn_key) % 16384));
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Public API — Passive Open
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Put a connection in LISTEN state (passive open / server).
-/// Returns handle or null if pool full.
-pub fn listen(local_ip: [4]u8, local_port: u16, backlog: u8) ?u8 {
-    const conn = allocConn() orelse return null;
-    const handle = connHandle(conn);
-
-    conn.reset();
-    conn.active = true;
-    conn.state = .listen;
-    conn.local_ip = local_ip;
-    conn.local_port = local_port;
-    conn.backlog = backlog;
-    conn.rcv_wscale = 7;
-
-    return handle;
+/// Set the stack's clock (µs, monotonic). tick() sets it too.
+pub fn setClock(now_us: u64) void {
+    if (now_us > clock_us) clock_us = now_us;
 }
 
-/// Accept a pending connection from a LISTEN socket.
-/// When a SYN arrives on a LISTEN connection, a new connection is created
-/// in SYN_RECEIVED state. This returns the handle of that new connection.
-pub fn accept(listen_handle: u8) ?u8 {
-    if (listen_handle >= MAX_CONNECTIONS) return null;
-    const listener = &connections[listen_handle];
-    if (listener.state != .listen) return null;
+fn mix64(x0: u64) u64 {
+    var x = x0 +% 0x9E37_79B9_7F4A_7C15;
+    x = (x ^ (x >> 30)) *% 0xBF58_476D_1CE4_E5B9;
+    x = (x ^ (x >> 27)) *% 0x94D0_49BB_1331_11EB;
+    return x ^ (x >> 31);
+}
 
-    // Find a SYN_RECEIVED connection spawned from this listener
-    for (&connections, 0..) |*c, idx| {
-        if (c.active and c.state == .syn_received and
-            c.local_port == listener.local_port and
-            ipEqual(c.local_ip, listener.local_ip))
-        {
-            return @intCast(idx);
+fn generateISN(c: *const Connection) u32 {
+    const tuple = (@as(u64, c.local_port) << 48) | (@as(u64, c.remote_port) << 32) |
+        (@as(u64, c.remote_ip[0]) << 24) | (@as(u64, c.remote_ip[1]) << 16) |
+        (@as(u64, c.remote_ip[2]) << 8) | c.remote_ip[3];
+    // RFC 6528: ISN = M + F(4-tuple, secret), M a 4 µs clock.
+    return @as(u32, @truncate(mix64(isn_key ^ tuple))) +% @as(u32, @truncate(clock_us >> 2));
+}
+
+fn allocPort(remote_ip: [4]u8, remote_port: u16) u16 {
+    var tries: usize = 0;
+    while (tries < 16384) : (tries += 1) {
+        const port = next_local_port;
+        next_local_port = if (next_local_port >= 65535) 49152 else next_local_port + 1;
+        var used = false;
+        for (pool()) |*c| {
+            if (c.active and c.local_port == port and c.remote_port == remote_port and ipEqual(c.remote_ip, remote_ip)) used = true;
         }
+        if (!used) return port;
+    }
+    return next_local_port;
+}
+
+fn allocConn() ?*Connection {
+    for (pool()) |*c| {
+        if (!c.active) return c;
+    }
+    return null;
+}
+
+fn connHandle(c: *const Connection) u8 {
+    const base = @intFromPtr(&connections[0]);
+    return @intCast((@intFromPtr(c) - base) / @sizeOf(Connection));
+}
+
+/// Connection reached CLOSED: free the slot if the user already closed it,
+/// otherwise keep it (state .closed + reason) until close()/abort().
+fn toClosed(c: *Connection, reason: CloseReason) void {
+    if (c.user_closed) {
+        c.reset();
+        return;
+    }
+    c.state = .closed;
+    c.reason = reason;
+    c.rto_deadline = 0;
+    c.delack_deadline = 0;
+    c.persist_deadline = 0;
+    c.ack_now = false;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Public API — open
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Active open. The SYN goes out on the next tick()/generatePacket().
+/// Returns a handle, or null if the pool is full.
+pub fn connect(local_ip: [4]u8, remote_ip: [4]u8, remote_port: u16) ?u8 {
+    const c = allocConn() orelse return null;
+    c.reset();
+    c.active = true;
+    c.state = .syn_sent;
+    c.local_ip = local_ip;
+    c.remote_ip = remote_ip;
+    c.remote_port = remote_port;
+    c.local_port = allocPort(remote_ip, remote_port);
+    c.iss = generateISN(c);
+    c.snd_una = c.iss;
+    c.snd_nxt = c.iss;
+    c.snd_max = c.iss;
+    c.rcv_wscale = RCV_WSCALE;
+    return connHandle(c);
+}
+
+/// Passive open. Returns the LISTEN handle, or null if the pool is full.
+pub fn listen(local_ip: [4]u8, local_port: u16, backlog: u8) ?u8 {
+    const c = allocConn() orelse return null;
+    c.reset();
+    c.active = true;
+    c.state = .listen;
+    c.local_ip = local_ip;
+    c.local_port = local_port;
+    c.backlog = @max(backlog, 1);
+    return connHandle(c);
+}
+
+/// Take a connection spawned by a LISTEN socket (established ones first).
+pub fn accept(listen_handle: u8) ?u8 {
+    const l = conn(listen_handle) orelse return null;
+    if (l.state != .listen) return null;
+    var fallback: ?*Connection = null;
+    for (pool()) |*c| {
+        if (!c.active or c.accepted or c.listener != listen_handle) continue;
+        if (c.state == .established or c.state == .close_wait) {
+            c.accepted = true;
+            return connHandle(c);
+        }
+        if (c.state == .syn_received and fallback == null) fallback = c;
+    }
+    if (fallback) |c| {
+        c.accepted = true;
+        return connHandle(c);
     }
     return null;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Public API — Data Transfer
+// Public API — data
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Read received data from connection. Returns bytes read.
+/// Read in-order received data. Returns bytes read (0 = nothing yet, or EOF —
+/// see eof()).
 pub fn recv(handle: u8, buf: []u8) usize {
-    if (handle >= MAX_CONNECTIONS) return 0;
-    const conn = &connections[handle];
-    if (conn.recv_len == 0) return 0;
-
-    const to_read = @min(buf.len, conn.recv_len);
-    @memcpy(buf[0..to_read], conn.recv_buf[0..to_read]);
-
-    // Shift remaining data
-    if (to_read < conn.recv_len) {
-        const remaining = conn.recv_len - to_read;
-        var i: usize = 0;
-        while (i < remaining) : (i += 1) {
-            conn.recv_buf[i] = conn.recv_buf[to_read + i];
+    const c = conn(handle) orelse return 0;
+    const n = @min(buf.len, c.rcv_count);
+    if (n == 0) return 0;
+    ringRead(&c.recv_buf, c.rcv_head, buf[0..n]);
+    c.rcv_head = (c.rcv_head + n) % RECV_BUF_SIZE;
+    c.rcv_count -= n;
+    // Window update when the right edge can move by a meaningful amount.
+    if (c.synchronized() and !c.fin_received) {
+        const edge = c.rcv_nxt +% advertisedWindow(c);
+        const moved = edge -% c.rcv_adv;
+        if (seqGt(edge, c.rcv_adv) and moved >= @min(@as(u32, RECV_BUF_SIZE / 2), 2 * @as(u32, c.mss))) {
+            c.ack_now = true;
         }
     }
-    conn.recv_len -= to_read;
-
-    // Update receive window (we freed buffer space)
-    conn.rcv_wnd = @intCast(RECV_BUF_SIZE - conn.recv_len);
-
-    return to_read;
+    return n;
 }
 
-/// Queue data for sending. Returns bytes queued.
+/// recv without taking: the bytes stay queued (MSG_PEEK).
+pub fn peek(handle: u8, buf: []u8) usize {
+    const c = conn(handle) orelse return 0;
+    const n = @min(buf.len, c.rcv_count);
+    if (n == 0) return 0;
+    ringRead(&c.recv_buf, c.rcv_head, buf[0..n]);
+    return n;
+}
+
+/// Queue data for sending. Returns bytes accepted (limited by buffer space).
 pub fn send(handle: u8, data: []const u8) usize {
-    if (handle >= MAX_CONNECTIONS) return 0;
-    const conn = &connections[handle];
-    if (conn.state != .established and conn.state != .close_wait) return 0;
-
-    const space = SEND_BUF_SIZE - conn.send_len;
-    const to_send = @min(data.len, space);
-    if (to_send == 0) return 0;
-
-    @memcpy(conn.send_buf[conn.send_len..][0..to_send], data[0..to_send]);
-    conn.send_len += to_send;
-    return to_send;
+    const c = conn(handle) orelse return 0;
+    if (c.state != .established and c.state != .close_wait) return 0;
+    if (c.fin_queued) return 0;
+    const n = @min(data.len, SEND_BUF_SIZE - c.snd_count);
+    if (n == 0) return 0;
+    ringWrite(&c.send_buf, (c.snd_head + c.snd_count) % SEND_BUF_SIZE, data[0..n]);
+    c.snd_count += n;
+    return n;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Public API — Connection Control
+// Public API — control and status
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Initiate graceful close (send FIN).
+/// Graceful close: FIN after all queued data. The slot is released when the
+/// close completes (or immediately if the connection is already dead).
 pub fn close(handle: u8) void {
-    if (handle >= MAX_CONNECTIONS) return;
-    const conn = &connections[handle];
-
-    switch (conn.state) {
-        .established => { conn.state = .fin_wait_1; },
-        .close_wait => { conn.state = .last_ack; },
-        .listen, .syn_sent => { conn.reset(); },
+    const c = conn(handle) orelse return;
+    c.user_closed = true;
+    switch (c.state) {
+        .closed, .listen, .syn_sent, .syn_received => c.reset(),
+        .established => {
+            c.fin_queued = true;
+            c.state = .fin_wait_1;
+        },
+        .close_wait => {
+            c.fin_queued = true;
+            c.state = .last_ack;
+        },
         else => {},
     }
 }
 
-/// Abort connection (send RST, immediate cleanup).
+/// Drop the connection immediately (the peer's next segment draws a RST).
 pub fn abort(handle: u8) void {
-    if (handle >= MAX_CONNECTIONS) return;
-    connections[handle].reset();
+    const c = conn(handle) orelse return;
+    c.reset();
 }
 
-/// Get connection state.
 pub fn getState(handle: u8) State {
-    if (handle >= MAX_CONNECTIONS) return .closed;
-    return connections[handle].state;
+    const c = conn(handle) orelse return .closed;
+    return c.state;
 }
 
-/// Check if data is available to read.
+pub fn closeReason(handle: u8) CloseReason {
+    const c = conn(handle) orelse return .none;
+    return c.reason;
+}
+
 pub fn hasData(handle: u8) bool {
-    if (handle >= MAX_CONNECTIONS) return false;
-    return connections[handle].recv_len > 0;
+    const c = conn(handle) orelse return false;
+    return c.rcv_count > 0;
 }
 
-/// Check if connection is fully closed.
+/// Bytes received and not read yet.
+pub fn pendingBytes(handle: u8) usize {
+    const c = conn(handle) orelse return 0;
+    return c.rcv_count;
+}
+
+/// True once the peer's FIN arrived and every byte before it was read.
+pub fn eof(handle: u8) bool {
+    const c = conn(handle) orelse return true;
+    return (c.fin_received or c.state == .closed) and c.rcv_count == 0;
+}
+
 pub fn isClosed(handle: u8) bool {
-    if (handle >= MAX_CONNECTIONS) return true;
-    return connections[handle].state == .closed;
+    const c = conn(handle) orelse return true;
+    return c.state == .closed;
 }
 
-/// Disable Nagle algorithm (for latency-sensitive connections).
+pub fn localPort(handle: u8) u16 {
+    const c = conn(handle) orelse return 0;
+    return c.local_port;
+}
+
+pub fn writable(handle: u8) usize {
+    const c = conn(handle) orelse return 0;
+    return c.writable();
+}
+
+/// All queued data sent and acknowledged.
+pub fn sendDrained(handle: u8) bool {
+    const c = conn(handle) orelse return true;
+    return c.snd_count == 0;
+}
+
 pub fn setNoDelay(handle: u8, no_delay: bool) void {
-    if (handle >= MAX_CONNECTIONS) return;
-    connections[handle].nagle_enabled = !no_delay;
+    const c = conn(handle) orelse return;
+    c.nagle = !no_delay;
 }
 
-/// Get connection statistics.
 pub fn getStats(handle: u8) struct { sent: u64, recv: u64, retransmits: u32, rtt_us: u32 } {
-    if (handle >= MAX_CONNECTIONS) return .{ .sent = 0, .recv = 0, .retransmits = 0, .rtt_us = 0 };
-    const conn = &connections[handle];
+    const c = conn(handle) orelse return .{ .sent = 0, .recv = 0, .retransmits = 0, .rtt_us = 0 };
     return .{
-        .sent = conn.total_sent,
-        .recv = conn.total_recv,
-        .retransmits = conn.retransmits,
-        .rtt_us = if (conn.rtt.has_sample) conn.rtt.srtt >> 3 else 0,
+        .sent = c.total_sent,
+        .recv = c.total_recv,
+        .retransmits = c.retransmits,
+        .rtt_us = if (c.rtt.has_sample) c.rtt.srtt >> 3 else 0,
     };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Packet Generation — called by net_stack to get outgoing segments
+// Output
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Generate the next outgoing TCP segment for a connection.
-/// Returns IPv4+TCP packet length, or null if nothing to send.
+/// Produce the next segment this connection wants to send (SYN, data, FIN or
+/// a pending ACK), or null. Returns the IPv4+TCP packet length.
 pub fn generatePacket(handle: u8, pkt_buf: []u8) ?usize {
-    if (handle >= MAX_CONNECTIONS) return null;
-    const conn = &connections[handle];
-    if (!conn.active) return null;
-
-    return switch (conn.state) {
-        .syn_sent => buildSynPacket(conn, pkt_buf),
-        .syn_received => buildSynAckPacket(conn, pkt_buf),
-        .established, .close_wait => buildDataOrAck(conn, pkt_buf),
-        .fin_wait_1, .last_ack => buildFinPacket(conn, pkt_buf),
-        .closing => buildAckPacket(conn, pkt_buf),
-        else => null,
-    };
+    const c = conn(handle) orelse return null;
+    return output(c, pkt_buf);
 }
 
-/// Advance all connection timers and generate retransmissions.
-/// Call once per tick. The sendFn is called for each outgoing packet.
-pub fn tickAll(pkt_buf: []u8, sendFn: *const fn ([]const u8) void) void {
-    timestamp_clock +%= 1;
-
-    for (&connections, 0..) |*conn, idx| {
-        if (!conn.active) continue;
-
-        // TIME_WAIT expiry
-        if (conn.state == .time_wait) {
-            if (conn.time_wait_timer > 0) {
-                conn.time_wait_timer -= 1;
-            } else {
-                conn.reset();
-                continue;
-            }
-        }
-
-        // Retransmission timer
-        if (conn.retransmit_active) {
-            if (conn.retransmit_timer > 0) {
-                conn.retransmit_timer -= 1;
-            } else {
-                // RTO expired — retransmit
-                conn.rto_backoff_count += 1;
-                if (conn.rto_backoff_count > 15) {
-                    // Connection dead
-                    conn.reset();
+/// Run every connection's timers and emit what is due, at time now_us.
+/// sendFn receives complete IPv4+TCP packets.
+pub fn tick(now_us: u64, pkt_buf: []u8, sendFn: *const fn ([]const u8) void) void {
+    setClock(now_us);
+    const now = clock_us;
+    for (pool()) |*c| {
+        if (!c.active) continue;
+        switch (c.state) {
+            .closed, .listen => continue,
+            .time_wait => {
+                if (now >= c.time_wait_deadline) {
+                    toClosed(c, .none);
                     continue;
                 }
-                conn.rtt.backoff();
-                conn.cc.onTimeout(conn.mss);
-                conn.retransmit_timer = conn.rtt.rto;
-                conn.retransmits += 1;
-
-                // Retransmit earliest unacked segment
-                if (generatePacket(@intCast(idx), pkt_buf)) |len| {
-                    sendFn(pkt_buf[0..len]);
-                }
-            }
+            },
+            else => {},
         }
 
-        // Delayed ACK timer
-        if (conn.delayed_ack_pending) {
-            if (conn.delayed_ack_timer > 0) {
-                conn.delayed_ack_timer -= 1;
-            } else {
-                conn.delayed_ack_pending = false;
-                if (buildAckPacket(conn, pkt_buf)) |len| {
-                    sendFn(pkt_buf[0..len]);
-                }
-            }
+        // Retransmission timeout.
+        if (c.rto_deadline != 0 and now >= c.rto_deadline) {
+            if (!onRetransmitTimeout(c, pkt_buf, sendFn)) continue;
         }
 
-        // Zero-window probing (persist timer)
-        if (conn.snd_wnd == 0 and conn.send_len > 0 and conn.state == .established) {
-            if (conn.persist_timer > 0) {
-                conn.persist_timer -= 1;
-            } else {
-                conn.persist_timer = PERSIST_MIN_TICKS;
-                // Send 1-byte probe
-                if (buildProbePacket(conn, pkt_buf)) |len| {
-                    sendFn(pkt_buf[0..len]);
-                }
-            }
+        // Fast retransmit / NewReno partial-ACK retransmit.
+        if (c.fast_rexmit) {
+            c.fast_rexmit = false;
+            if (buildRetransmit(c, pkt_buf)) |len| sendFn(pkt_buf[0..len]);
         }
 
-        // Generate new data segments if window allows
-        if (conn.state == .established or conn.state == .close_wait) {
-            if (shouldSendData(conn)) {
-                if (buildDataOrAck(conn, pkt_buf)) |len| {
-                    sendFn(pkt_buf[0..len]);
-                }
+        // Zero-window probing: data waiting, window shut, nothing in flight.
+        if (c.canSendData() and c.snd_wnd == 0 and c.snd_count > 0 and c.snd_una == c.snd_max) {
+            if (c.persist_deadline == 0) {
+                c.persist_deadline = now + @max(c.rto(), PERSIST_MIN_US);
+            } else if (now >= c.persist_deadline) {
+                if (buildProbe(c, pkt_buf)) |len| sendFn(pkt_buf[0..len]);
+                if (c.persist_backoff < 7) c.persist_backoff += 1;
+                const wait = @min(c.rto() << @as(u6, @intCast(c.persist_backoff)), MAX_RTO_US);
+                c.persist_deadline = now + @max(wait, PERSIST_MIN_US);
             }
+        } else {
+            c.persist_deadline = 0;
+            c.persist_backoff = 0;
+        }
+
+        // Delayed ACK.
+        if (c.delack_deadline != 0 and now >= c.delack_deadline) {
+            c.delack_deadline = 0;
+            c.ack_now = true;
+        }
+
+        var burst: usize = 0;
+        while (burst < MAX_BURST) : (burst += 1) {
+            const len = output(c, pkt_buf) orelse break;
+            sendFn(pkt_buf[0..len]);
         }
     }
 }
 
+/// Compatibility driver for callers without a clock: advances 1 ms per call.
+pub fn tickAll(pkt_buf: []u8, sendFn: *const fn ([]const u8) void) void {
+    tick(clock_us + 1000, pkt_buf, sendFn);
+}
+
+/// Returns false if the connection died.
+fn onRetransmitTimeout(c: *Connection, pkt_buf: []u8, sendFn: *const fn ([]const u8) void) bool {
+    const now = clock_us;
+    const handshaking = c.state == .syn_sent or c.state == .syn_received;
+    if (!handshaking and c.snd_una == c.snd_max) {
+        c.rto_deadline = 0; // nothing outstanding
+        return true;
+    }
+    c.retries += 1;
+    if (c.retries > (if (handshaking) MAX_SYN_RETRIES else MAX_DATA_RETRIES)) {
+        toClosed(c, .timeout);
+        return false;
+    }
+    c.retransmits += 1;
+    c.rtt_active = false; // Karn: no samples across a retransmission
+    c.cc.onTimeout(c.mss);
+    c.rto_deadline = now + c.rto();
+    switch (c.state) {
+        .syn_sent => {
+            c.syn_retransmitted = true;
+            if (buildControl(c, FLAG_SYN, c.iss, pkt_buf)) |len| sendFn(pkt_buf[0..len]);
+        },
+        .syn_received => {
+            c.syn_retransmitted = true;
+            if (buildControl(c, FLAG_SYN | FLAG_ACK, c.iss, pkt_buf)) |len| sendFn(pkt_buf[0..len]);
+        },
+        else => {
+            // Go-back-N: resend from SND.UNA; output() refills the window
+            // (which is now one segment) in tick's burst loop.
+            c.snd_nxt = c.snd_una;
+            if (c.fin_sent and !c.fin_acked) c.fin_sent = false;
+        },
+    }
+    return true;
+}
+
+fn output(c: *Connection, buf: []u8) ?usize {
+    const now = clock_us;
+    switch (c.state) {
+        .closed, .listen, .time_wait => {
+            if (c.state == .time_wait and c.ack_now) return buildAck(c, buf);
+            return null;
+        },
+        .syn_sent => {
+            if (c.syn_time != 0) return null; // retransmission is timer-driven
+            c.syn_time = now;
+            c.snd_nxt = c.iss +% 1;
+            c.snd_max = c.snd_nxt;
+            c.rto_deadline = now + c.rto();
+            return buildControl(c, FLAG_SYN, c.iss, buf);
+        },
+        .syn_received => {
+            if (c.syn_time != 0) return if (c.ack_now) buildControl(c, FLAG_SYN | FLAG_ACK, c.iss, buf) else null;
+            c.syn_time = now;
+            c.rto_deadline = now + c.rto();
+            return buildControl(c, FLAG_SYN | FLAG_ACK, c.iss, buf);
+        },
+        else => {},
+    }
+
+    if (c.canSendData()) {
+        const data_end = c.dataEnd();
+        if (seqLt(c.snd_nxt, data_end)) {
+            const avail: u32 = data_end -% c.snd_nxt;
+            const win = c.availableWindow();
+            var len: u32 = @min(avail, @min(win, @as(u32, c.mss)));
+            // Nagle (RFC 896): hold back a runt while data is in flight,
+            // unless the window (not the data) is what limits the segment.
+            if (len > 0 and c.nagle and len < c.mss and len == avail and c.snd_nxt != c.snd_una) len = 0;
+            if (len > 0) {
+                const first_send = seqGeq(c.snd_nxt, c.snd_max);
+                const push = c.snd_nxt +% len == data_end;
+                const r = buildData(c, c.snd_nxt, len, push, buf) orelse return null;
+                if (first_send and !c.rtt_active) {
+                    c.rtt_active = true;
+                    c.rtt_seq = c.snd_nxt;
+                    c.rtt_start = now;
+                }
+                c.snd_nxt +%= len;
+                if (seqGt(c.snd_nxt, c.snd_max)) c.snd_max = c.snd_nxt;
+                if (first_send) c.total_sent += len;
+                if (c.rto_deadline == 0) c.rto_deadline = now + c.rto();
+                return r;
+            }
+        }
+        // FIN once every data byte has been sent.
+        if (c.fin_queued and !c.fin_sent and !c.fin_acked and c.snd_nxt == data_end) {
+            if (!c.fin_seq_set) {
+                c.fin_seq = data_end; // send() refuses data after close()
+                c.fin_seq_set = true;
+            }
+            c.fin_sent = true;
+            c.snd_nxt = c.fin_seq +% 1;
+            if (seqGt(c.snd_nxt, c.snd_max)) c.snd_max = c.snd_nxt;
+            if (c.rto_deadline == 0) c.rto_deadline = now + c.rto();
+            return buildControl(c, FLAG_FIN | FLAG_ACK, c.fin_seq, buf);
+        }
+    }
+
+    if (c.ack_now) return buildAck(c, buf);
+    return null;
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
-// Incoming Segment Processing (RFC 793 §3.9)
+// Input (RFC 9293 §3.10.7)
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Process an incoming TCP segment. Updates connection state.
-/// Writes any immediate response into reply_buf.
-/// Returns reply length or null if no reply.
+/// Process one inbound TCP segment (the IP payload, exactly the IP total
+/// length minus the IP header). Updates state; may write an immediate reply
+/// (ACK or RST) into reply_buf and return its length.
 pub fn processSegment(
     tcp_data: []const u8,
     src_ip: [4]u8,
     dst_ip: [4]u8,
     reply_buf: []u8,
 ) ?usize {
-    if (tcp_data.len < HEADER_MIN) return null;
-
-    // Parse header
+    if (tcp_data.len < HEADER_MIN or tcp_data.len > 0xFFFF) return null;
     const seg = parseHeader(tcp_data) orelse return null;
 
-    // Verify checksum
-    const tcp_len: u16 = @intCast(tcp_data.len);
-    var csum_acc = checksum.pseudoHeaderSum(src_ip, dst_ip, ipv4.PROTO_TCP, tcp_len);
-    csum_acc = checksum.combine(csum_acc, checksum.sum(tcp_data));
-    if (checksum.fold(csum_acc) != 0) return null;
+    var acc = checksum.pseudoHeaderSum(src_ip, dst_ip, ipv4.PROTO_TCP, @intCast(tcp_data.len));
+    acc = checksum.combine(acc, checksum.sum(tcp_data));
+    if (checksum.fold(acc) != 0) return null;
 
-    // Find matching connection
-    if (findConn(seg.dst_port, src_ip, seg.src_port)) |conn| {
-        return processForConnection(conn, &seg, tcp_data, src_ip, dst_ip, reply_buf);
+    if (findConn(dst_ip, seg.dst_port, src_ip, seg.src_port)) |c| {
+        return processForConnection(c, &seg, tcp_data, reply_buf);
     }
-
-    // Check for LISTEN socket matching dst_port
-    if (findListener(seg.dst_port, dst_ip)) |listener| {
-        return processForListener(listener, &seg, tcp_data, src_ip, dst_ip, reply_buf);
+    if (findListener(seg.dst_port, dst_ip)) |l| {
+        return processForListener(l, &seg, tcp_data, src_ip, dst_ip, reply_buf);
     }
-
-    // No connection — send RST (unless it's a RST)
     if (seg.flags & FLAG_RST != 0) return null;
-    return buildRstForSegment(&seg, src_ip, dst_ip, reply_buf);
+    return buildRstFor(&seg, tcp_data.len - seg.data_offset, src_ip, dst_ip, reply_buf);
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Segment Processing — Per-State Handlers
-// ══════════════════════════════════════════════════════════════════════════════
-
-fn processForConnection(
-    conn: *Connection,
-    seg: *const Segment,
-    tcp_data: []const u8,
-    src_ip: [4]u8,
-    dst_ip: [4]u8,
-    reply_buf: []u8,
-) ?usize {
-    _ = dst_ip;
-
-    // RST processing (RFC 793 §3.4)
-    if (seg.flags & FLAG_RST != 0) {
-        if (conn.state == .syn_received) {
-            conn.state = .listen; // Return to LISTEN
-        } else {
-            conn.reset();
-        }
-        return null;
+fn processForConnection(c: *Connection, seg: *const Segment, tcp_data: []const u8, reply_buf: []u8) ?usize {
+    const payload = tcp_data[seg.data_offset..];
+    switch (c.state) {
+        .syn_sent => return processSynSent(c, seg, tcp_data, reply_buf),
+        .closed, .listen => return null,
+        else => {},
     }
 
-    return switch (conn.state) {
-        .syn_sent => processSynSent(conn, seg, tcp_data, src_ip, reply_buf),
-        .syn_received => processSynReceived(conn, seg, reply_buf),
-        .established => processEstablished(conn, seg, tcp_data, src_ip, reply_buf),
-        .fin_wait_1 => processFinWait1(conn, seg, tcp_data, src_ip, reply_buf),
-        .fin_wait_2 => processFinWait2(conn, seg, tcp_data, src_ip, reply_buf),
-        .closing => processClosing(conn, seg, reply_buf),
-        .time_wait => processTimeWait(conn, seg, reply_buf),
-        .close_wait => processEstablished(conn, seg, tcp_data, src_ip, reply_buf),
-        .last_ack => processLastAck(conn, seg),
-        else => null,
-    };
-}
-
-fn processSynSent(conn: *Connection, seg: *const Segment, tcp_data: []const u8, _: [4]u8, reply_buf: []u8) ?usize {
-    if (seg.flags & FLAG_ACK != 0) {
-        // Validate ACK
-        if (!seqBetween(conn.iss +% 1, seg.ack, conn.snd_nxt)) {
-            if (seg.flags & FLAG_RST == 0) {
-                // Invalid ACK, send RST
-                return null;
+    // RST: accept only an exact hit on RCV.NXT (RFC 5961 §3.2); anything
+    // else in the window draws a challenge ACK.
+    if (seg.flags & FLAG_RST != 0) {
+        if (seg.seq == c.rcv_nxt) {
+            if (c.state == .syn_received and c.listener != 0xFF and !c.accepted) {
+                c.reset(); // never surfaced to the user
+            } else {
+                toClosed(c, .reset);
             }
             return null;
         }
+        if (inWindow(c, seg.seq)) return buildAck(c, reply_buf);
+        return null;
     }
 
+    // A SYN in a synchronized state: challenge ACK (RFC 5961 §4). In
+    // SYN-RECEIVED a repeated SYN means our SYN-ACK was lost: resend it.
     if (seg.flags & FLAG_SYN != 0) {
-        conn.irs = seg.seq;
-        conn.rcv_nxt = seg.seq +% 1;
-
-        // Parse options from SYN-ACK
-        parseOptions(conn, tcp_data, seg.data_offset);
-
-        if (seg.flags & FLAG_ACK != 0) {
-            // SYN+ACK received — handshake complete
-            conn.snd_una = seg.ack;
-            conn.snd_wnd = @as(u32, seg.window) << @as(u5, @intCast(conn.snd_wscale));
-            conn.snd_wl1 = seg.seq;
-            conn.snd_wl2 = seg.ack;
-            conn.state = .established;
-            conn.retransmit_active = false;
-            conn.rto_backoff_count = 0;
-            conn.cc = CongestionState.init(conn.mss);
-            // Send ACK to complete 3-way handshake
-            return buildAckPacket(conn, reply_buf);
-        } else {
-            // Simultaneous open: received SYN without ACK
-            conn.state = .syn_received;
-            return buildSynAckPacket(conn, reply_buf);
-        }
+        if (c.state == .syn_received) {
+            if (seg.flags & FLAG_ACK == 0) return buildControl(c, FLAG_SYN | FLAG_ACK, c.iss, reply_buf);
+        } else return buildAck(c, reply_buf);
     }
 
+    const seg_len: u32 = @as(u32, @intCast(payload.len)) + @as(u32, @intFromBool(seg.flags & FLAG_FIN != 0));
+
+    // Segments entirely before RCV.NXT (retransmissions of data we have):
+    // re-ACK so a peer that lost our ACK can move on.
+    if (seg_len > 0 and seqLeq(seg.seq +% seg_len, c.rcv_nxt)) {
+        c.ack_now = true;
+    }
+
+    if (seg.flags & FLAG_ACK == 0) return flushAck(c, reply_buf);
+
+    // SYN-RECEIVED: the ACK of our SYN completes the passive open.
+    if (c.state == .syn_received) {
+        if (seg.ack != c.iss +% 1) return buildRstFor(seg, payload.len, c.remote_ip, c.local_ip, reply_buf);
+        c.snd_una = seg.ack;
+        if (seqLt(c.snd_nxt, c.snd_una)) c.snd_nxt = c.snd_una;
+        c.snd_wnd = @as(u32, seg.window) << @as(u5, @intCast(c.snd_wscale));
+        c.snd_wl1 = seg.seq;
+        c.snd_wl2 = seg.ack;
+        c.state = .established;
+        c.rto_deadline = 0;
+        c.retries = 0;
+        if (!c.syn_retransmitted and c.syn_time != 0) c.rtt.update(@intCast(@min(clock_us - c.syn_time, MAX_RTO_US)));
+    } else {
+        processAck(c, seg, payload.len);
+    }
+    if (!c.active) return null; // LAST-ACK completed
+
+    // Data and FIN.
+    if (c.canReceiveData() and seg_len > 0) receive(c, seg, payload);
+
+    return flushAck(c, reply_buf);
+}
+
+fn flushAck(c: *Connection, reply_buf: []u8) ?usize {
+    if (!c.ack_now) return null;
+    return buildAck(c, reply_buf);
+}
+
+fn processSynSent(c: *Connection, seg: *const Segment, tcp_data: []const u8, reply_buf: []u8) ?usize {
+    const has_ack = seg.flags & FLAG_ACK != 0;
+    if (has_ack and seg.ack != c.iss +% 1) {
+        if (seg.flags & FLAG_RST != 0) return null;
+        return buildRstFor(seg, tcp_data.len - seg.data_offset, c.remote_ip, c.local_ip, reply_buf);
+    }
+    if (seg.flags & FLAG_RST != 0) {
+        if (has_ack) toClosed(c, .refused);
+        return null;
+    }
+    if (seg.flags & FLAG_SYN == 0) return null;
+
+    c.irs = seg.seq;
+    c.rcv_nxt = seg.seq +% 1;
+    const peer = parseSynOptions(tcp_data, seg.data_offset);
+    c.mss = @min(peer.mss, DEFAULT_MSS);
+    if (peer.wscale) |ws| {
+        c.snd_wscale = ws;
+    } else {
+        c.snd_wscale = 0;
+        c.rcv_wscale = 0; // scaling needs both sides
+    }
+    c.sack_ok = peer.sack_ok;
+    c.cc = CongestionState.init(c.mss);
+
+    if (has_ack) {
+        c.snd_una = seg.ack;
+        c.snd_wnd = seg.window; // SYN windows are never scaled (RFC 7323 §2.2)
+        c.snd_wl1 = seg.seq;
+        c.snd_wl2 = seg.ack;
+        c.state = .established;
+        c.rto_deadline = 0;
+        c.retries = 0;
+        if (!c.syn_retransmitted and c.syn_time != 0) c.rtt.update(@intCast(@min(clock_us - c.syn_time, MAX_RTO_US)));
+        c.ack_now = true;
+        return buildAck(c, reply_buf);
+    }
+    // Simultaneous open.
+    c.state = .syn_received;
+    c.syn_time = 0; // output() sends the SYN-ACK
+    c.snd_wnd = seg.window;
     return null;
 }
 
-fn processSynReceived(conn: *Connection, seg: *const Segment, reply_buf: []u8) ?usize {
-    if (seg.flags & FLAG_ACK != 0) {
-        if (seqBetween(conn.snd_una, seg.ack, conn.snd_nxt +% 1)) {
-            conn.snd_una = seg.ack;
-            conn.state = .established;
-            conn.retransmit_active = false;
-            // Window update
-            conn.snd_wnd = @as(u32, seg.window) << @as(u5, @intCast(conn.snd_wscale));
-            return null; // No reply needed
-        }
-    }
-    _ = reply_buf;
-    return null;
-}
-
-fn processEstablished(conn: *Connection, seg: *const Segment, tcp_data: []const u8, _: [4]u8, reply_buf: []u8) ?usize {
-    // ── ACK processing ──
-    if (seg.flags & FLAG_ACK != 0) {
-        processAck(conn, seg);
-    }
-
-    // ── Window update (RFC 793 §3.7) ──
-    if (seg.flags & FLAG_ACK != 0) {
-        if (seqLt(conn.snd_wl1, seg.seq) or
-            (conn.snd_wl1 == seg.seq and seqLeq(conn.snd_wl2, seg.ack)))
-        {
-            conn.snd_wnd = @as(u32, seg.window) << @as(u5, @intCast(conn.snd_wscale));
-            conn.snd_wl1 = seg.seq;
-            conn.snd_wl2 = seg.ack;
-        }
-    }
-
-    // ── Data processing ──
-    const hdr_len: usize = seg.data_offset;
-    if (tcp_data.len > hdr_len) {
-        const payload = tcp_data[hdr_len..];
-        if (seg.seq == conn.rcv_nxt) {
-            // In-order data
-            const space = RECV_BUF_SIZE - conn.recv_len;
-            const to_copy = @min(payload.len, space);
-            if (to_copy > 0) {
-                @memcpy(conn.recv_buf[conn.recv_len..][0..to_copy], payload[0..to_copy]);
-                conn.recv_len += to_copy;
-                conn.rcv_nxt +%= @intCast(to_copy);
-                conn.total_recv += to_copy;
-            }
-            // Trigger ACK (delayed or immediate based on segment count)
-            conn.unacked_segments += 1;
-            if (conn.unacked_segments >= 2 or seg.flags & FLAG_PSH != 0) {
-                conn.unacked_segments = 0;
-                conn.delayed_ack_pending = false;
-                return buildAckPacket(conn, reply_buf);
-            } else {
-                conn.delayed_ack_pending = true;
-                conn.delayed_ack_timer = DELAYED_ACK_TICKS;
-                return null;
-            }
-        } else if (seqGt(seg.seq, conn.rcv_nxt)) {
-            // Out-of-order: record SACK block and send immediate ACK
-            addSackBlock(conn, seg.seq, seg.seq +% @as(u32, @intCast(payload.len)));
-            return buildAckPacket(conn, reply_buf);
-        }
-    }
-
-    // ── FIN processing ──
-    if (seg.flags & FLAG_FIN != 0) {
-        conn.rcv_nxt +%= 1;
-        conn.state = .close_wait;
-        return buildAckPacket(conn, reply_buf);
-    }
-
-    // Pure ACK with no data — might need to send data back
-    if (conn.send_len > conn.send_una_offset and conn.availableWindow() > 0) {
-        return buildDataOrAck(conn, reply_buf);
-    }
-
-    return null;
-}
-
-fn processFinWait1(conn: *Connection, seg: *const Segment, tcp_data: []const u8, src_ip: [4]u8, reply_buf: []u8) ?usize {
-    // Process data first
-    _ = processEstablished(conn, seg, tcp_data, src_ip, reply_buf);
-
-    if (seg.flags & FLAG_ACK != 0) {
-        if (seg.ack == conn.snd_nxt) {
-            if (seg.flags & FLAG_FIN != 0) {
-                // Simultaneous close
-                conn.rcv_nxt +%= 1;
-                conn.state = .time_wait;
-                conn.time_wait_timer = TIME_WAIT_DURATION;
-                return buildAckPacket(conn, reply_buf);
-            }
-            conn.state = .fin_wait_2;
-        }
-    }
-
-    if (seg.flags & FLAG_FIN != 0 and conn.state == .fin_wait_1) {
-        conn.rcv_nxt +%= 1;
-        conn.state = .closing;
-        return buildAckPacket(conn, reply_buf);
-    }
-
-    return null;
-}
-
-fn processFinWait2(conn: *Connection, seg: *const Segment, tcp_data: []const u8, src_ip: [4]u8, reply_buf: []u8) ?usize {
-    // Can still receive data in FIN_WAIT_2
-    _ = processEstablished(conn, seg, tcp_data, src_ip, reply_buf);
-
-    if (seg.flags & FLAG_FIN != 0) {
-        conn.rcv_nxt +%= 1;
-        conn.state = .time_wait;
-        conn.time_wait_timer = TIME_WAIT_DURATION;
-        return buildAckPacket(conn, reply_buf);
-    }
-    return null;
-}
-
-fn processClosing(conn: *Connection, seg: *const Segment, reply_buf: []u8) ?usize {
-    if (seg.flags & FLAG_ACK != 0 and seg.ack == conn.snd_nxt) {
-        conn.state = .time_wait;
-        conn.time_wait_timer = TIME_WAIT_DURATION;
-    }
-    _ = reply_buf;
-    return null;
-}
-
-fn processTimeWait(conn: *Connection, seg: *const Segment, reply_buf: []u8) ?usize {
-    // Restart 2MSL timer on any segment
-    conn.time_wait_timer = TIME_WAIT_DURATION;
-    if (seg.flags & FLAG_FIN != 0) {
-        return buildAckPacket(conn, reply_buf);
-    }
-    return null;
-}
-
-fn processLastAck(conn: *Connection, seg: *const Segment) ?usize {
-    if (seg.flags & FLAG_ACK != 0 and seg.ack == conn.snd_nxt) {
-        conn.reset();
-    }
-    return null;
-}
-
-fn processForListener(
-    listener: *Connection,
-    seg: *const Segment,
-    tcp_data: []const u8,
-    src_ip: [4]u8,
-    dst_ip: [4]u8,
-    reply_buf: []u8,
-) ?usize {
-    if (seg.flags & FLAG_SYN == 0) return null; // Only accept SYN
-    if (seg.flags & FLAG_ACK != 0) return null; // SYN must not have ACK
+fn processForListener(l: *Connection, seg: *const Segment, tcp_data: []const u8, src_ip: [4]u8, dst_ip: [4]u8, reply_buf: []u8) ?usize {
     if (seg.flags & FLAG_RST != 0) return null;
+    if (seg.flags & FLAG_ACK != 0) return buildRstFor(seg, tcp_data.len - seg.data_offset, src_ip, dst_ip, reply_buf);
+    if (seg.flags & FLAG_SYN == 0) return null;
 
-    _ = dst_ip;
+    const lh = connHandle(l);
+    var pending: usize = 0;
+    for (pool()) |*p| {
+        if (p.active and p.listener == lh and !p.accepted) pending += 1;
+    }
+    if (pending >= l.backlog) return null; // drop; the peer retries
 
-    // Create new connection for this SYN
-    const new_conn = allocConn() orelse return null;
-    new_conn.reset();
-    new_conn.active = true;
-    new_conn.state = .syn_received;
-    new_conn.local_ip = listener.local_ip;
-    new_conn.local_port = listener.local_port;
-    new_conn.remote_ip = src_ip;
-    new_conn.remote_port = seg.src_port;
-    new_conn.irs = seg.seq;
-    new_conn.rcv_nxt = seg.seq +% 1;
-    new_conn.iss = generateISN();
-    new_conn.snd_una = new_conn.iss;
-    new_conn.snd_nxt = new_conn.iss +% 1;
-    new_conn.rcv_wscale = 7;
-
-    // Parse peer's options from SYN
-    parseOptions(new_conn, tcp_data, seg.data_offset);
-    new_conn.snd_wnd = @as(u32, seg.window) << @as(u5, @intCast(new_conn.snd_wscale));
-
-    new_conn.cc = CongestionState.init(new_conn.mss);
-    new_conn.retransmit_active = true;
-    new_conn.retransmit_timer = new_conn.rtt.rto;
-
-    // Send SYN+ACK
-    return buildSynAckPacket(new_conn, reply_buf);
+    const c = allocConn() orelse return null;
+    c.reset();
+    c.active = true;
+    c.state = .syn_received;
+    c.listener = lh;
+    c.local_ip = dst_ip;
+    c.local_port = l.local_port;
+    c.remote_ip = src_ip;
+    c.remote_port = seg.src_port;
+    c.irs = seg.seq;
+    c.rcv_nxt = seg.seq +% 1;
+    const peer = parseSynOptions(tcp_data, seg.data_offset);
+    c.mss = @min(peer.mss, DEFAULT_MSS);
+    if (peer.wscale) |ws| {
+        c.snd_wscale = ws;
+        c.rcv_wscale = RCV_WSCALE;
+    }
+    c.sack_ok = peer.sack_ok;
+    c.cc = CongestionState.init(c.mss);
+    c.iss = generateISN(c);
+    c.snd_una = c.iss;
+    c.snd_nxt = c.iss +% 1;
+    c.snd_max = c.snd_nxt;
+    c.snd_wnd = seg.window;
+    c.syn_time = clock_us;
+    c.rto_deadline = clock_us + c.rto();
+    return buildControl(c, FLAG_SYN | FLAG_ACK, c.iss, reply_buf);
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// ACK Processing (RFC 5681)
-// ══════════════════════════════════════════════════════════════════════════════
+fn processAck(c: *Connection, seg: *const Segment, payload_len: usize) void {
+    const now = clock_us;
+    if (seqGt(seg.ack, c.snd_max)) {
+        c.ack_now = true; // acks something we never sent
+        return;
+    }
+    if (seqLt(seg.ack, c.snd_una)) return; // old
 
-fn processAck(conn: *Connection, seg: *const Segment) void {
-    if (!seqBetween(conn.snd_una, seg.ack, conn.snd_nxt +% 1)) return;
+    const window = @as(u32, seg.window) << @as(u5, @intCast(c.snd_wscale));
 
-    if (seg.ack == conn.snd_una) {
-        // Duplicate ACK
-        if (conn.flightSize() > 0) {
-            conn.cc.dup_ack_count += 1;
-            if (conn.cc.dup_ack_count == 3) {
-                // Enter fast recovery (RFC 5681 §3.2)
-                conn.cc.enterFastRecovery(conn.flightSize(), conn.snd_nxt);
-            } else if (conn.cc.in_recovery) {
-                conn.cc.onDupAckInRecovery();
+    if (seqGt(seg.ack, c.snd_una)) {
+        // New data acknowledged.
+        var acked: u32 = seg.ack -% c.snd_una;
+        c.snd_una = seg.ack;
+        if (seqLt(c.snd_nxt, c.snd_una)) c.snd_nxt = c.snd_una;
+        const data_acked: u32 = @min(acked, @as(u32, @intCast(c.snd_count)));
+        c.snd_head = (c.snd_head + data_acked) % SEND_BUF_SIZE;
+        c.snd_count -= data_acked;
+        acked = data_acked;
+        // Our FIN occupies fin_seq; it is acknowledged once SND.UNA passes it
+        // (whether or not a rewind has since cleared fin_sent).
+        if (c.fin_seq_set and seqGt(c.snd_una, c.fin_seq)) {
+            c.fin_acked = true;
+            c.fin_sent = false;
+        }
+
+        if (c.rtt_active and seqGt(seg.ack, c.rtt_seq)) {
+            c.rtt_active = false;
+            c.rtt.update(@intCast(@min(now - c.rtt_start, MAX_RTO_US)));
+        }
+
+        if (c.cc.in_recovery) {
+            if (seqGeq(seg.ack, c.cc.recovery_point)) {
+                c.cc.exitRecovery();
+            } else {
+                // Partial ACK (RFC 6582): the next hole is lost too.
+                c.fast_rexmit = true;
+                c.cc.cwnd -|= acked;
+                c.cc.cwnd += c.mss;
+            }
+        } else {
+            c.cc.onAck(acked, c.mss);
+        }
+        c.cc.dup_ack_count = 0;
+        c.retries = 0;
+        c.rto_deadline = if (c.snd_una == c.snd_max) 0 else now + c.rto();
+        c.persist_backoff = 0;
+    } else if (payload_len == 0 and seg.flags & FLAG_FIN == 0 and window == c.snd_wnd and c.snd_una != c.snd_max) {
+        // Duplicate ACK (RFC 5681 §2).
+        c.cc.dup_ack_count +|= 1;
+        if (c.cc.dup_ack_count == 3 and !c.cc.in_recovery) {
+            c.cc.enterFastRecovery(c.snd_max -% c.snd_una, c.snd_max);
+            c.cc.dup_ack_count = 3;
+            c.fast_rexmit = true;
+            c.rtt_active = false;
+        } else if (c.cc.in_recovery) {
+            c.cc.onDupAckInRecovery();
+        }
+    }
+
+    // Window update (RFC 9293 §3.10.7.4).
+    if (seqLt(c.snd_wl1, seg.seq) or (c.snd_wl1 == seg.seq and seqLeq(c.snd_wl2, seg.ack))) {
+        c.snd_wnd = window;
+        c.snd_wl1 = seg.seq;
+        c.snd_wl2 = seg.ack;
+    }
+
+    // Close-sequence transitions driven by the ACK of our FIN.
+    if (c.fin_acked) {
+        switch (c.state) {
+            .fin_wait_1 => c.state = .fin_wait_2,
+            .closing => enterTimeWait(c),
+            .last_ack => toClosed(c, .none),
+            else => {},
+        }
+    }
+}
+
+fn receive(c: *Connection, seg: *const Segment, payload_in: []const u8) void {
+    const now = clock_us;
+    var seq = seg.seq;
+    var payload = payload_in;
+    var fin = seg.flags & FLAG_FIN != 0;
+
+    // Trim the part we already have.
+    if (seqLt(seq, c.rcv_nxt)) {
+        const dup: u32 = c.rcv_nxt -% seq;
+        if (dup >= payload.len) {
+            // Only (maybe) a FIN is new.
+            if (fin and dup == payload.len) {
+                payload = payload[payload.len..];
+                seq = c.rcv_nxt;
+            } else {
+                c.ack_now = true;
+                return;
+            }
+        } else {
+            payload = payload[dup..];
+            seq = c.rcv_nxt;
+        }
+    }
+
+    const free = c.rcvFree();
+    if (seq == c.rcv_nxt) {
+        const take = @min(payload.len, free);
+        if (take > 0) {
+            ringWrite(&c.recv_buf, (c.rcv_head + c.rcv_count) % RECV_BUF_SIZE, payload[0..take]);
+            c.rcv_count += take;
+            c.rcv_nxt +%= @intCast(take);
+            c.total_recv += take;
+        }
+        if (take < payload.len) {
+            fin = false; // window overflow: the rest (and any FIN) comes again
+            c.ack_now = true;
+        }
+        // Did this close the gap before our out-of-order range?
+        if (c.ooo_valid and seqGeq(c.rcv_nxt, c.ooo_start)) {
+            if (seqGt(c.ooo_end, c.rcv_nxt)) {
+                const extra: u32 = c.ooo_end -% c.rcv_nxt;
+                c.rcv_count += extra;
+                c.total_recv += extra;
+                c.rcv_nxt = c.ooo_end;
+            }
+            c.ooo_valid = false;
+            c.ack_now = true; // RFC 5681 §4.2: ACK at once when a gap fills
+        }
+        if (fin and !c.ooo_valid) {
+            c.rcv_nxt +%= 1;
+            c.fin_received = true;
+            c.ack_now = true;
+            switch (c.state) {
+                .established => c.state = .close_wait,
+                .fin_wait_1 => if (c.fin_acked) enterTimeWait(c) else {
+                    c.state = .closing;
+                },
+                .fin_wait_2 => enterTimeWait(c),
+                else => {},
+            }
+        } else if (take > 0 and !c.ack_now) {
+            c.segs_unacked += 1;
+            if (c.segs_unacked >= 2 or seg.flags & FLAG_PSH != 0 and take < c.mss) {
+                c.ack_now = true;
+            } else if (c.delack_deadline == 0) {
+                c.delack_deadline = now + DELAYED_ACK_US;
             }
         }
         return;
     }
 
-    // New ACK — advances SND.UNA
-    const bytes_acked = seqDiff(seg.ack, conn.snd_una);
-    conn.snd_una = seg.ack;
-
-    // Advance send buffer
-    if (bytes_acked <= conn.send_len) {
-        conn.send_una_offset += bytes_acked;
-        if (conn.send_una_offset >= conn.send_len) {
-            conn.send_una_offset = 0;
-            conn.send_len = 0;
+    // Out of order: keep it if it fits and extends/starts our one range.
+    c.ack_now = true; // duplicate ACK tells the sender about the hole
+    if (payload.len == 0) return;
+    const off: usize = seq -% c.rcv_nxt;
+    if (off + payload.len > free) return;
+    const end = seq +% @as(u32, @intCast(payload.len));
+    if (c.ooo_valid) {
+        const touches = seqLeq(seq, c.ooo_end) and seqGeq(end, c.ooo_start);
+        if (!touches) {
+            if (seqGt(seq, c.ooo_start)) return; // keep the range nearer RCV.NXT
+            c.ooo_valid = false; // new range is nearer: replace
         }
     }
-
-    // RTT measurement (Karn's algorithm: only from non-retransmitted segments)
-    if (conn.ts_enabled and conn.rto_backoff_count == 0) {
-        const echo_ts = seg.ts_ecr;
-        if (echo_ts != 0 and timestamp_clock >= echo_ts) {
-            conn.rtt.update(timestamp_clock -% echo_ts);
-        }
-    }
-
-    // Congestion control
-    if (conn.cc.in_recovery) {
-        if (seqGeq(seg.ack, conn.cc.recovery_point)) {
-            conn.cc.exitRecovery();
-        }
+    ringWrite(&c.recv_buf, (c.rcv_head + c.rcv_count + off) % RECV_BUF_SIZE, payload);
+    if (!c.ooo_valid) {
+        c.ooo_valid = true;
+        c.ooo_start = seq;
+        c.ooo_end = end;
     } else {
-        conn.cc.onAck(bytes_acked, conn.mss);
+        if (seqLt(seq, c.ooo_start)) c.ooo_start = seq;
+        if (seqGt(end, c.ooo_end)) c.ooo_end = end;
     }
+}
 
-    // Reset retransmit timer
-    if (conn.snd_una == conn.snd_nxt) {
-        conn.retransmit_active = false;
-    } else {
-        conn.retransmit_timer = conn.rtt.rto;
-        conn.rto_backoff_count = 0;
-    }
+fn enterTimeWait(c: *Connection) void {
+    c.state = .time_wait;
+    c.time_wait_deadline = clock_us + TIME_WAIT_US;
+    c.rto_deadline = 0;
+}
 
-    conn.cc.dup_ack_count = 0;
+fn inWindow(c: *const Connection, seq: u32) bool {
+    const wnd: u32 = @max(@as(u32, @intCast(c.rcvFree())), 1);
+    return seqBetween(c.rcv_nxt, seq, c.rcv_nxt +% wnd);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Segment Building
+// Segment building
 // ══════════════════════════════════════════════════════════════════════════════
 
-fn buildSynPacket(conn: *Connection, buf: []u8) ?usize {
-    const opts = buildSynOptions(conn);
-    return buildSegmentFull(conn, FLAG_SYN, conn.iss, &.{}, opts.slice(), buf);
+fn advertisedWindow(c: *const Connection) u32 {
+    const free: u32 = @intCast(c.rcvFree());
+    const field: u32 = @min(free >> @as(u5, @intCast(c.rcv_wscale)), 0xFFFF);
+    return field << @as(u5, @intCast(c.rcv_wscale));
 }
 
-fn buildSynAckPacket(conn: *Connection, buf: []u8) ?usize {
-    const opts = buildSynOptions(conn);
-    return buildSegmentFull(conn, FLAG_SYN | FLAG_ACK, conn.iss, &.{}, opts.slice(), buf);
+fn windowField(c: *Connection, syn: bool) u16 {
+    const free: u32 = @intCast(c.rcvFree());
+    if (syn) return @intCast(@min(free, 0xFFFF));
+    const field: u32 = @min(free >> @as(u5, @intCast(c.rcv_wscale)), 0xFFFF);
+    const edge = c.rcv_nxt +% (field << @as(u5, @intCast(c.rcv_wscale)));
+    if (seqGt(edge, c.rcv_adv) or c.rcv_adv == 0) c.rcv_adv = edge;
+    return @intCast(field);
 }
 
-fn buildAckPacket(conn: *Connection, buf: []u8) ?usize {
-    const opts = buildDataOptions(conn);
-    return buildSegmentFull(conn, FLAG_ACK, conn.snd_nxt, &.{}, opts.slice(), buf);
+/// Every segment that carries our ACK satisfies pending/delayed ACKs.
+fn ackSent(c: *Connection) void {
+    c.ack_now = false;
+    c.delack_deadline = 0;
+    c.segs_unacked = 0;
 }
 
-fn buildFinPacket(conn: *Connection, buf: []u8) ?usize {
-    const opts = buildDataOptions(conn);
-    return buildSegmentFull(conn, FLAG_FIN | FLAG_ACK, conn.snd_nxt, &.{}, opts.slice(), buf);
-}
-
-fn buildProbePacket(conn: *Connection, buf: []u8) ?usize {
-    // Send 1 byte to probe zero window
-    if (conn.send_len == 0) return null;
-    const opts = buildDataOptions(conn);
-    return buildSegmentFull(conn, FLAG_ACK, conn.snd_nxt, conn.send_buf[conn.send_una_offset..][0..1], opts.slice(), buf);
-}
-
-fn buildDataOrAck(conn: *Connection, buf: []u8) ?usize {
-    const unsent_start = conn.send_una_offset + seqDiff(conn.snd_nxt, conn.snd_una);
-    if (unsent_start >= conn.send_len) {
-        // No new data — send pure ACK if needed
-        if (conn.delayed_ack_pending) {
-            conn.delayed_ack_pending = false;
-            return buildAckPacket(conn, buf);
-        }
-        return null;
+fn buildAck(c: *Connection, buf: []u8) ?usize {
+    ackSent(c);
+    var opts = OptionsBuffer{};
+    if (c.sack_ok and c.ooo_valid) {
+        opts.put(&.{ OPT_NOP, OPT_NOP, OPT_SACK, 10 });
+        opts.put32(c.ooo_start);
+        opts.put32(c.ooo_end);
     }
+    return buildRawSegment(c.local_ip, c.remote_ip, c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt, FLAG_ACK, windowField(c, false), opts.slice(), &.{}, &.{}, buf);
+}
 
-    const available = conn.send_len - unsent_start;
-    const window_avail = conn.availableWindow();
-    if (window_avail == 0) return null;
-
-    // Nagle: don't send small segments if data in flight
-    if (conn.nagle_enabled and available < conn.mss and conn.flightSize() > 0) {
-        return null;
+fn buildControl(c: *Connection, flags: u8, seq: u32, buf: []u8) ?usize {
+    const syn = flags & FLAG_SYN != 0;
+    var opts = OptionsBuffer{};
+    if (syn) {
+        opts.put(&.{ OPT_MSS, 4, @intCast(DEFAULT_MSS >> 8), @intCast(DEFAULT_MSS & 0xFF) });
+        // Offer scaling on an active open; on a passive open echo it only if
+        // the peer offered (rcv_wscale was set from its SYN).
+        if (c.state == .syn_sent or c.rcv_wscale != 0) opts.put(&.{ OPT_NOP, OPT_WINDOW_SCALE, 3, RCV_WSCALE });
+        if (c.state == .syn_sent or c.sack_ok) opts.put(&.{ OPT_NOP, OPT_NOP, OPT_SACK_PERMITTED, 2 });
     }
+    if (flags & FLAG_ACK != 0) ackSent(c);
+    const ack = if (flags & FLAG_ACK != 0) c.rcv_nxt else 0;
+    return buildRawSegment(c.local_ip, c.remote_ip, c.local_port, c.remote_port, seq, ack, flags, windowField(c, syn), opts.slice(), &.{}, &.{}, buf);
+}
 
-    const send_size = @min(@min(available, window_avail), @as(usize, conn.mss));
-    const payload = conn.send_buf[unsent_start..][0..send_size];
+/// A data segment of `len` bytes starting at sequence number `seq`, copied
+/// out of the send ring (which may wrap: up to two slices).
+fn buildData(c: *Connection, seq: u32, len: u32, push: bool, buf: []u8) ?usize {
+    const off: usize = seq -% c.snd_una;
+    const start = (c.snd_head + off) % SEND_BUF_SIZE;
+    const first = @min(@as(usize, len), SEND_BUF_SIZE - start);
+    const a = c.send_buf[start..][0..first];
+    const b = c.send_buf[0 .. @as(usize, len) - first];
+    ackSent(c);
+    const flags: u8 = FLAG_ACK | (if (push) FLAG_PSH else 0);
+    return buildRawSegment(c.local_ip, c.remote_ip, c.local_port, c.remote_port, seq, c.rcv_nxt, flags, windowField(c, false), &.{}, a, b, buf);
+}
 
-    const opts = buildDataOptions(conn);
-    const flags: u8 = FLAG_ACK | (if (unsent_start + send_size >= conn.send_len) FLAG_PSH else 0);
-
-    const result = buildSegmentFull(conn, flags, conn.snd_nxt, payload, opts.slice(), buf);
-    if (result != null) {
-        conn.snd_nxt +%= @intCast(send_size);
-        conn.total_sent += send_size;
-        // Arm retransmit timer if not already running
-        if (!conn.retransmit_active) {
-            conn.retransmit_active = true;
-            conn.retransmit_timer = conn.rtt.rto;
-        }
+fn buildRetransmit(c: *Connection, buf: []u8) ?usize {
+    if (c.snd_una == c.snd_max) return null;
+    c.retransmits += 1;
+    c.rtt_active = false;
+    if (c.rto_deadline == 0) c.rto_deadline = clock_us + c.rto();
+    const outstanding_data: u32 = @min(c.snd_max -% c.snd_una, @as(u32, @intCast(c.snd_count)));
+    if (outstanding_data > 0) {
+        const len = @min(outstanding_data, @as(u32, c.mss));
+        return buildData(c, c.snd_una, len, false, buf);
     }
-    return result;
+    if (c.fin_seq_set and !c.fin_acked) return buildControl(c, FLAG_FIN | FLAG_ACK, c.fin_seq, buf);
+    return null;
 }
 
-fn buildRstForSegment(seg: *const Segment, src_ip: [4]u8, dst_ip: [4]u8, buf: []u8) ?usize {
-    // RFC 793: if ACK, RST seq = seg.ack; else RST seq = 0, ack = seg.seq + seg.len
-    const rst_seq: u32 = if (seg.flags & FLAG_ACK != 0) seg.ack else 0;
-    const rst_ack: u32 = if (seg.flags & FLAG_ACK == 0) seg.seq +% 1 else 0;
-    const flags: u8 = FLAG_RST | (if (seg.flags & FLAG_ACK == 0) FLAG_ACK else 0);
-
-    return buildRawSegment(dst_ip, src_ip, seg.dst_port, seg.src_port, rst_seq, rst_ack, flags, 0, &.{}, &.{}, buf);
+fn buildProbe(c: *Connection, buf: []u8) ?usize {
+    if (c.snd_count == 0) return null;
+    // One byte at SND.UNA; if the receiver takes it, it ACKs SND.UNA+1.
+    if (seqLt(c.snd_max, c.snd_una +% 1)) c.snd_max = c.snd_una +% 1;
+    return buildData(c, c.snd_una, 1, false, buf);
 }
 
-fn shouldSendData(conn: *Connection) bool {
-    if (conn.send_len == 0) return false;
-    const unsent_start = conn.send_una_offset + seqDiff(conn.snd_nxt, conn.snd_una);
-    if (unsent_start >= conn.send_len) return false;
-    if (conn.availableWindow() == 0) return false;
-
-    const available = conn.send_len - unsent_start;
-    // Nagle check
-    if (conn.nagle_enabled and available < conn.mss and conn.flightSize() > 0) return false;
-    return true;
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// Low-Level Segment Construction
-// ══════════════════════════════════════════════════════════════════════════════
-
-fn buildSegmentFull(
-    conn: *Connection,
-    flags: u8,
-    seq: u32,
-    payload: []const u8,
-    options: []const u8,
-    buf: []u8,
-) ?usize {
-    const ack_num = if (flags & FLAG_ACK != 0) conn.rcv_nxt else @as(u32, 0);
-    const window = @as(u16, @intCast(@min(conn.rcv_wnd >> @as(u5, @intCast(conn.rcv_wscale)), 0xFFFF)));
-    return buildRawSegment(
-        conn.local_ip,
-        conn.remote_ip,
-        conn.local_port,
-        conn.remote_port,
-        seq,
-        ack_num,
-        flags,
-        window,
-        options,
-        payload,
-        buf,
-    );
+fn buildRstFor(seg: *const Segment, payload_len: usize, src_ip: [4]u8, dst_ip: [4]u8, buf: []u8) ?usize {
+    // RFC 9293 §3.10.7.1: reply from the segment's destination.
+    if (seg.flags & FLAG_ACK != 0) {
+        return buildRawSegment(dst_ip, src_ip, seg.dst_port, seg.src_port, seg.ack, 0, FLAG_RST, 0, &.{}, &.{}, &.{}, buf);
+    }
+    var seg_len: u32 = @intCast(payload_len);
+    if (seg.flags & FLAG_SYN != 0) seg_len += 1;
+    if (seg.flags & FLAG_FIN != 0) seg_len += 1;
+    return buildRawSegment(dst_ip, src_ip, seg.dst_port, seg.src_port, 0, seg.seq +% seg_len, FLAG_RST | FLAG_ACK, 0, &.{}, &.{}, &.{}, buf);
 }
 
 fn buildRawSegment(
@@ -1227,226 +1340,66 @@ fn buildRawSegment(
     flags: u8,
     window: u16,
     options: []const u8,
-    payload: []const u8,
+    payload_a: []const u8,
+    payload_b: []const u8,
     buf: []u8,
 ) ?usize {
-    // Options must be padded to 4-byte boundary
     const opts_padded = (options.len + 3) & ~@as(usize, 3);
     const hdr_len = HEADER_MIN + opts_padded;
-    const tcp_len = hdr_len + payload.len;
+    const tcp_len = hdr_len + payload_a.len + payload_b.len;
     const total_len = ipv4.HEADER_SIZE + tcp_len;
-    if (total_len > buf.len) return null;
+    if (total_len > buf.len or tcp_len > 0xFFFF) return null;
 
-    const tcp_buf = buf[ipv4.HEADER_SIZE..];
+    const t = buf[ipv4.HEADER_SIZE..];
+    t[0] = @intCast(src_port >> 8);
+    t[1] = @intCast(src_port & 0xFF);
+    t[2] = @intCast(dst_port >> 8);
+    t[3] = @intCast(dst_port & 0xFF);
+    writeBe32(t, 4, seq);
+    writeBe32(t, 8, ack);
+    t[12] = @intCast((hdr_len / 4) << 4);
+    t[13] = flags;
+    t[14] = @intCast(window >> 8);
+    t[15] = @intCast(window & 0xFF);
+    t[16] = 0;
+    t[17] = 0;
+    t[18] = 0;
+    t[19] = 0;
+    if (options.len > 0) @memcpy(t[HEADER_MIN..][0..options.len], options);
+    var i = HEADER_MIN + options.len;
+    while (i < hdr_len) : (i += 1) t[i] = OPT_END;
+    @memcpy(t[hdr_len..][0..payload_a.len], payload_a);
+    @memcpy(t[hdr_len + payload_a.len ..][0..payload_b.len], payload_b);
 
-    // Source port
-    tcp_buf[0] = @intCast(src_port >> 8);
-    tcp_buf[1] = @intCast(src_port & 0xFF);
-    // Destination port
-    tcp_buf[2] = @intCast(dst_port >> 8);
-    tcp_buf[3] = @intCast(dst_port & 0xFF);
-    // Sequence number
-    writeBe32(tcp_buf, 4, seq);
-    // ACK number
-    writeBe32(tcp_buf, 8, ack);
-    // Data offset (in 32-bit words) + reserved
-    tcp_buf[12] = @intCast((hdr_len / 4) << 4);
-    // Flags
-    tcp_buf[13] = flags;
-    // Window
-    tcp_buf[14] = @intCast(window >> 8);
-    tcp_buf[15] = @intCast(window & 0xFF);
-    // Checksum (zeroed for computation)
-    tcp_buf[16] = 0;
-    tcp_buf[17] = 0;
-    // Urgent pointer
-    tcp_buf[18] = 0;
-    tcp_buf[19] = 0;
-
-    // Options
-    if (options.len > 0) {
-        @memcpy(tcp_buf[HEADER_MIN..][0..options.len], options);
-        // Pad with NOP (kind 1) to 4-byte boundary
-        var pad_idx = HEADER_MIN + options.len;
-        while (pad_idx < HEADER_MIN + opts_padded) : (pad_idx += 1) {
-            tcp_buf[pad_idx] = OPT_NOP;
-        }
-    }
-
-    // Payload
-    if (payload.len > 0) {
-        @memcpy(tcp_buf[hdr_len..][0..payload.len], payload);
-    }
-
-    // TCP checksum with pseudo-header
-    const seg_len: u16 = @intCast(tcp_len);
-    var acc = checksum.pseudoHeaderSum(src_ip, dst_ip, ipv4.PROTO_TCP, seg_len);
-    acc = checksum.combine(acc, checksum.sum(tcp_buf[0..tcp_len]));
+    var acc = checksum.pseudoHeaderSum(src_ip, dst_ip, ipv4.PROTO_TCP, @intCast(tcp_len));
+    acc = checksum.combine(acc, checksum.sum(t[0..tcp_len]));
     const cksum = checksum.fold(acc);
-    tcp_buf[16] = @intCast(cksum >> 8);
-    tcp_buf[17] = @intCast(cksum & 0xFF);
+    t[16] = @intCast(cksum >> 8);
+    t[17] = @intCast(cksum & 0xFF);
 
-    // IPv4 header
-    _ = ipv4.writeHeader(buf, src_ip, dst_ip, ipv4.PROTO_TCP, seg_len) orelse return null;
-
+    _ = ipv4.writeHeader(buf, src_ip, dst_ip, ipv4.PROTO_TCP, @intCast(tcp_len)) orelse return null;
     return total_len;
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// TCP Options
-// ══════════════════════════════════════════════════════════════════════════════
-
 const OptionsBuffer = struct {
-    data: [40]u8,
-    len: usize,
+    data: [40]u8 = undefined,
+    len: usize = 0,
 
-    pub fn slice(self: *const OptionsBuffer) []const u8 {
+    fn put(self: *OptionsBuffer, bytes: []const u8) void {
+        @memcpy(self.data[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+    fn put32(self: *OptionsBuffer, v: u32) void {
+        writeBe32(&self.data, self.len, v);
+        self.len += 4;
+    }
+    fn slice(self: *const OptionsBuffer) []const u8 {
         return self.data[0..self.len];
     }
 };
 
-fn buildSynOptions(conn: *Connection) OptionsBuffer {
-    var opts = OptionsBuffer{ .data = @splat(0), .len = 0 };
-    var pos: usize = 0;
-
-    // MSS (kind=2, len=4)
-    opts.data[pos] = OPT_MSS; pos += 1;
-    opts.data[pos] = 4; pos += 1;
-    opts.data[pos] = @intCast(DEFAULT_MSS >> 8); pos += 1;
-    opts.data[pos] = @intCast(DEFAULT_MSS & 0xFF); pos += 1;
-
-    // Window Scale (kind=3, len=3)
-    opts.data[pos] = OPT_WINDOW_SCALE; pos += 1;
-    opts.data[pos] = 3; pos += 1;
-    opts.data[pos] = conn.rcv_wscale; pos += 1;
-
-    // SACK Permitted (kind=4, len=2)
-    opts.data[pos] = OPT_SACK_PERMITTED; pos += 1;
-    opts.data[pos] = 2; pos += 1;
-
-    // Timestamps (kind=8, len=10)
-    opts.data[pos] = OPT_NOP; pos += 1; // Alignment
-    opts.data[pos] = OPT_TIMESTAMP; pos += 1;
-    opts.data[pos] = 10; pos += 1;
-    writeBe32(opts.data[pos..], 0, timestamp_clock); pos += 4;
-    writeBe32(opts.data[pos..], 0, 0); pos += 4; // TSecr = 0 for SYN
-
-    opts.len = pos;
-    return opts;
-}
-
-fn buildDataOptions(conn: *Connection) OptionsBuffer {
-    var opts = OptionsBuffer{ .data = @splat(0), .len = 0 };
-    var pos: usize = 0;
-
-    // Timestamps (if negotiated)
-    if (conn.ts_enabled) {
-        opts.data[pos] = OPT_NOP; pos += 1;
-        opts.data[pos] = OPT_NOP; pos += 1;
-        opts.data[pos] = OPT_TIMESTAMP; pos += 1;
-        opts.data[pos] = 10; pos += 1;
-        writeBe32(opts.data[pos..], 0, timestamp_clock); pos += 4;
-        writeBe32(opts.data[pos..], 0, conn.ts_recent); pos += 4;
-    }
-
-    // SACK blocks (if we have out-of-order data)
-    if (conn.sack_permitted and conn.sack_count > 0) {
-        opts.data[pos] = OPT_NOP; pos += 1;
-        opts.data[pos] = OPT_NOP; pos += 1;
-        opts.data[pos] = OPT_SACK; pos += 1;
-        const sack_len: u8 = 2 + conn.sack_count * 8;
-        opts.data[pos] = sack_len; pos += 1;
-        var i: u8 = 0;
-        while (i < conn.sack_count) : (i += 1) {
-            writeBe32(opts.data[pos..], 0, conn.sack_blocks[i].left_edge); pos += 4;
-            writeBe32(opts.data[pos..], 0, conn.sack_blocks[i].right_edge); pos += 4;
-        }
-    }
-
-    opts.len = pos;
-    return opts;
-}
-
 // ══════════════════════════════════════════════════════════════════════════════
-// Option Parsing
-// ══════════════════════════════════════════════════════════════════════════════
-
-fn parseOptions(conn: *Connection, tcp_data: []const u8, data_offset: usize) void {
-    if (data_offset <= HEADER_MIN) return;
-    const opts = tcp_data[HEADER_MIN..data_offset];
-    var i: usize = 0;
-
-    while (i < opts.len) {
-        const kind = opts[i];
-        if (kind == OPT_END) break;
-        if (kind == OPT_NOP) { i += 1; continue; }
-
-        if (i + 1 >= opts.len) break;
-        const opt_len: usize = opts[i + 1];
-        if (opt_len < 2 or i + opt_len > opts.len) break;
-
-        switch (kind) {
-            OPT_MSS => {
-                if (opt_len == 4) {
-                    conn.mss = @as(u16, opts[i + 2]) << 8 | opts[i + 3];
-                    if (conn.mss < 536) conn.mss = 536; // RFC 1122 minimum
-                }
-            },
-            OPT_WINDOW_SCALE => {
-                if (opt_len == 3) {
-                    conn.snd_wscale = @min(opts[i + 2], 14); // Max shift = 14
-                }
-            },
-            OPT_SACK_PERMITTED => {
-                conn.sack_permitted = true;
-            },
-            OPT_TIMESTAMP => {
-                if (opt_len == 10) {
-                    conn.ts_enabled = true;
-                    conn.ts_recent = readBe32(opts, i + 2);
-                }
-            },
-            else => {},
-        }
-
-        i += opt_len;
-    }
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// SACK Management
-// ══════════════════════════════════════════════════════════════════════════════
-
-fn addSackBlock(conn: *Connection, left: u32, right: u32) void {
-    // Merge with existing blocks if adjacent
-    var i: u8 = 0;
-    while (i < conn.sack_count) : (i += 1) {
-        if (seqLeq(conn.sack_blocks[i].left_edge, right) and
-            seqGeq(conn.sack_blocks[i].right_edge, left))
-        {
-            // Overlapping or adjacent — merge
-            conn.sack_blocks[i].left_edge = if (seqLt(left, conn.sack_blocks[i].left_edge)) left else conn.sack_blocks[i].left_edge;
-            conn.sack_blocks[i].right_edge = if (seqGt(right, conn.sack_blocks[i].right_edge)) right else conn.sack_blocks[i].right_edge;
-            return;
-        }
-    }
-
-    // Add new block (evict oldest if full)
-    if (conn.sack_count < MAX_SACK_BLOCKS) {
-        conn.sack_blocks[conn.sack_count] = .{ .left_edge = left, .right_edge = right };
-        conn.sack_count += 1;
-    } else {
-        // Shift and add at end
-        var j: u8 = 0;
-        while (j < MAX_SACK_BLOCKS - 1) : (j += 1) {
-            conn.sack_blocks[j] = conn.sack_blocks[j + 1];
-        }
-        conn.sack_blocks[MAX_SACK_BLOCKS - 1] = .{ .left_edge = left, .right_edge = right };
-    }
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// Segment Parsing
+// Parsing
 // ══════════════════════════════════════════════════════════════════════════════
 
 const Segment = struct {
@@ -1454,22 +1407,16 @@ const Segment = struct {
     dst_port: u16,
     seq: u32,
     ack: u32,
-    data_offset: usize, // In bytes
+    data_offset: usize, // bytes
     flags: u8,
     window: u16,
-    urgent_ptr: u16,
-    // Timestamp option values (if present)
-    ts_val: u32,
-    ts_ecr: u32,
 };
 
 fn parseHeader(data: []const u8) ?Segment {
     if (data.len < HEADER_MIN) return null;
-
     const data_offset: usize = @as(usize, data[12] >> 4) * 4;
     if (data_offset < HEADER_MIN or data_offset > data.len) return null;
-
-    var seg = Segment{
+    return .{
         .src_port = @as(u16, data[0]) << 8 | data[1],
         .dst_port = @as(u16, data[2]) << 8 | data[3],
         .seq = readBe32(data, 4),
@@ -1477,40 +1424,45 @@ fn parseHeader(data: []const u8) ?Segment {
         .data_offset = data_offset,
         .flags = data[13],
         .window = @as(u16, data[14]) << 8 | data[15],
-        .urgent_ptr = @as(u16, data[18]) << 8 | data[19],
-        .ts_val = 0,
-        .ts_ecr = 0,
     };
-
-    // Parse timestamp option if present
-    if (data_offset > HEADER_MIN) {
-        var i: usize = HEADER_MIN;
-        while (i < data_offset) {
-            if (data[i] == OPT_END) break;
-            if (data[i] == OPT_NOP) { i += 1; continue; }
-            if (i + 1 >= data_offset) break;
-            const opt_len: usize = data[i + 1];
-            if (opt_len < 2 or i + opt_len > data_offset) break;
-            if (data[i] == OPT_TIMESTAMP and opt_len == 10) {
-                seg.ts_val = readBe32(data, i + 2);
-                seg.ts_ecr = readBe32(data, i + 6);
-            }
-            i += opt_len;
-        }
-    }
-
-    return seg;
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Connection Lookup
-// ══════════════════════════════════════════════════════════════════════════════
+const SynOptions = struct { mss: u16 = 536, wscale: ?u8 = null, sack_ok: bool = false };
 
-fn findConn(local_port: u16, remote_ip: [4]u8, remote_port: u16) ?*Connection {
-    for (&connections) |*c| {
-        if (c.active and c.state != .listen and c.state != .closed and
-            c.local_port == local_port and c.remote_port == remote_port and
-            ipEqual(c.remote_ip, remote_ip))
+fn parseSynOptions(tcp_data: []const u8, data_offset: usize) SynOptions {
+    var out = SynOptions{};
+    const opts = tcp_data[HEADER_MIN..data_offset];
+    var i: usize = 0;
+    while (i < opts.len) {
+        const kind = opts[i];
+        if (kind == OPT_END) break;
+        if (kind == OPT_NOP) {
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= opts.len) break;
+        const len: usize = opts[i + 1];
+        if (len < 2 or i + len > opts.len) break;
+        switch (kind) {
+            OPT_MSS => if (len == 4) {
+                out.mss = @max(@as(u16, opts[i + 2]) << 8 | opts[i + 3], 536);
+            },
+            OPT_WINDOW_SCALE => if (len == 3) {
+                out.wscale = @min(opts[i + 2], 14);
+            },
+            OPT_SACK_PERMITTED => out.sack_ok = true,
+            else => {},
+        }
+        i += len;
+    }
+    return out;
+}
+
+fn findConn(local_ip: [4]u8, local_port: u16, remote_ip: [4]u8, remote_port: u16) ?*Connection {
+    for (pool()) |*c| {
+        if (c.active and c.state != .listen and c.local_port == local_port and
+            c.remote_port == remote_port and ipEqual(c.remote_ip, remote_ip) and
+            (ipEqual(c.local_ip, local_ip) or ipEqual(c.local_ip, .{ 0, 0, 0, 0 })))
         {
             return c;
         }
@@ -1519,7 +1471,7 @@ fn findConn(local_port: u16, remote_ip: [4]u8, remote_port: u16) ?*Connection {
 }
 
 fn findListener(local_port: u16, local_ip: [4]u8) ?*Connection {
-    for (&connections) |*c| {
+    for (pool()) |*c| {
         if (c.active and c.state == .listen and c.local_port == local_port and
             (ipEqual(c.local_ip, local_ip) or ipEqual(c.local_ip, .{ 0, 0, 0, 0 })))
         {
@@ -1529,31 +1481,23 @@ fn findListener(local_port: u16, local_ip: [4]u8) ?*Connection {
     return null;
 }
 
-fn allocConn() ?*Connection {
-    for (&connections) |*c| {
-        if (!c.active) return c;
-    }
-    return null;
-}
-
-fn connHandle(conn: *Connection) u8 {
-    const base = @intFromPtr(&connections[0]);
-    const ptr = @intFromPtr(conn);
-    return @intCast((ptr - base) / @sizeOf(Connection));
-}
-
-fn allocPort() u16 {
-    const port = next_local_port;
-    next_local_port +%= 1;
-    if (next_local_port < 49152) next_local_port = 49152;
-    return port;
-}
-
 // ══════════════════════════════════════════════════════════════════════════════
-// Sequence Number Arithmetic (32-bit wraparound safe)
+// Rings, sequence arithmetic, helpers
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// a < b (accounting for wraparound)
+fn ringWrite(ring: []u8, start: usize, data: []const u8) void {
+    const first = @min(data.len, ring.len - start);
+    @memcpy(ring[start..][0..first], data[0..first]);
+    @memcpy(ring[0 .. data.len - first], data[first..]);
+}
+
+fn ringRead(ring: []const u8, start: usize, out: []u8) void {
+    const first = @min(out.len, ring.len - start);
+    @memcpy(out[0..first], ring[start..][0..first]);
+    @memcpy(out[first..], ring[0 .. out.len - first]);
+}
+
+/// a < b (modulo 2^32)
 pub fn seqLt(a: u32, b: u32) bool {
     return @as(i32, @bitCast(a -% b)) < 0;
 }
@@ -1573,29 +1517,18 @@ pub fn seqGeq(a: u32, b: u32) bool {
     return @as(i32, @bitCast(a -% b)) >= 0;
 }
 
-/// Check if seq is in range [low, high) with wraparound.
+/// seq in [low, high) with wraparound.
 pub fn seqBetween(low: u32, seq: u32, high: u32) bool {
     return seqGeq(seq, low) and seqLt(seq, high);
 }
 
-/// Difference b - a (assuming b >= a in sequence space).
-fn seqDiff(b: u32, a: u32) u32 {
-    return b -% a;
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// Helpers
-// ══════════════════════════════════════════════════════════════════════════════
-
 fn readBe32(data: []const u8, offset: usize) u32 {
-    return @as(u32, data[offset]) << 24 |
-        @as(u32, data[offset + 1]) << 16 |
-        @as(u32, data[offset + 2]) << 8 |
-        data[offset + 3];
+    return @as(u32, data[offset]) << 24 | @as(u32, data[offset + 1]) << 16 |
+        @as(u32, data[offset + 2]) << 8 | data[offset + 3];
 }
 
 fn writeBe32(buf: []u8, offset: usize, val: u32) void {
-    buf[offset] = @intCast((val >> 24) & 0xFF);
+    buf[offset] = @intCast(val >> 24);
     buf[offset + 1] = @intCast((val >> 16) & 0xFF);
     buf[offset + 2] = @intCast((val >> 8) & 0xFF);
     buf[offset + 3] = @intCast(val & 0xFF);
@@ -1605,99 +1538,371 @@ fn ipEqual(a: [4]u8, b: [4]u8) bool {
     return a[0] == b[0] and a[1] == b[1] and a[2] == b[2] and a[3] == b[3];
 }
 
-
 // ══════════════════════════════════════════════════════════════════════════════
-// Tests
+// Tests — two endpoints in one pool over a simulated wire
 // ══════════════════════════════════════════════════════════════════════════════
 
-test "sequence arithmetic: wraparound lt" {
-    if (!seqLt(0xFFFFFFFF, 0x00000001)) return error.TestUnexpectedResult;
-    if (!seqLt(0x80000000, 0x80000001)) return error.TestUnexpectedResult;
-    if (seqLt(0x00000001, 0xFFFFFFFF)) return error.TestUnexpectedResult;
-    if (seqLt(5, 5)) return error.TestUnexpectedResult;
+const testing = @import("std").testing;
+
+const CLIENT_IP = [4]u8{ 10, 0, 0, 1 };
+const SERVER_IP = [4]u8{ 10, 0, 0, 2 };
+
+/// A deterministic lossy link: every packet gets a delivery time; some are
+/// dropped, duplicated or delayed (which reorders them).
+const Wire = struct {
+    const CAP = 4096;
+    const Pkt = struct { at: u64, order: u64, len: u16, data: [1600]u8 };
+    q: [CAP]Pkt = undefined,
+    n: usize = 0,
+    rng: u64 = 1,
+    drop_pct: u64 = 0,
+    dup_pct: u64 = 0,
+    reorder_pct: u64 = 0,
+    delay_us: u64 = 5_000,
+    sent: usize = 0,
+    dropped: usize = 0,
+    order: u64 = 0,
+
+    fn rand(self: *Wire) u64 {
+        self.rng = mix64(self.rng);
+        return self.rng;
+    }
+
+    fn push(self: *Wire, pkt: []const u8) void {
+        self.sent += 1;
+        if (self.rand() % 100 < self.drop_pct) {
+            self.dropped += 1;
+            return;
+        }
+        var copies: usize = if (self.rand() % 100 < self.dup_pct) 2 else 1;
+        while (copies > 0) : (copies -= 1) {
+            if (self.n == CAP) return;
+            var at = clock_us + self.delay_us;
+            if (self.rand() % 100 < self.reorder_pct) at += 1_000 + self.rand() % 20_000;
+            self.q[self.n].at = at;
+            self.q[self.n].order = self.order;
+            self.order += 1;
+            self.q[self.n].len = @intCast(pkt.len);
+            @memcpy(self.q[self.n].data[0..pkt.len], pkt);
+            self.n += 1;
+        }
+    }
+
+    /// Deliver every packet due by `now` to the stack (earliest first).
+    fn deliver(self: *Wire, now: u64) void {
+        while (true) {
+            var best: ?usize = null;
+            for (self.q[0..self.n], 0..) |*p, i| {
+                if (p.at > now) continue;
+                if (best) |b| {
+                    const q = &self.q[b];
+                    if (p.at > q.at or (p.at == q.at and p.order > q.order)) continue;
+                }
+                best = i;
+            }
+            const i = best orelse return;
+            var pkt: [1600]u8 = undefined;
+            const len = self.q[i].len;
+            @memcpy(pkt[0..len], self.q[i].data[0..len]);
+            self.q[i] = self.q[self.n - 1];
+            self.n -= 1;
+            const src = pkt[12..16].*;
+            const dst = pkt[16..20].*;
+            var reply: [1600]u8 = undefined;
+            if (processSegment(pkt[20..len], src, dst, &reply)) |rlen| self.push(reply[0..rlen]);
+        }
+    }
+};
+
+var wire = Wire{};
+
+fn wireSend(pkt: []const u8) void {
+    wire.push(pkt);
 }
 
-test "sequence arithmetic: wraparound gt" {
-    if (!seqGt(0x00000001, 0xFFFFFFFF)) return error.TestUnexpectedResult;
-    if (seqGt(0xFFFFFFFF, 0x00000001)) return error.TestUnexpectedResult;
-    if (seqGt(5, 5)) return error.TestUnexpectedResult;
+fn resetPool() void {
+    for (pool()) |*c| c.reset();
+    clock_us = 1_000_000;
+    wire = Wire{};
+    t_have_server = false;
 }
 
-test "sequence arithmetic: between" {
-    if (!seqBetween(10, 15, 20)) return error.TestUnexpectedResult;
-    if (!seqBetween(10, 10, 20)) return error.TestUnexpectedResult; // inclusive left
-    if (seqBetween(10, 20, 20)) return error.TestUnexpectedResult; // exclusive right
-    // Wraparound
-    if (!seqBetween(0xFFFFFFF0, 0xFFFFFFF5, 0x00000005)) return error.TestUnexpectedResult;
-    if (!seqBetween(0xFFFFFFF0, 0x00000001, 0x00000005)) return error.TestUnexpectedResult;
+fn pattern(i: usize, salt: u8) u8 {
+    return @truncate((i *% 131) ^ (i >> 7) ^ salt);
 }
 
-test "sequence arithmetic: consistency" {
+/// Run the simulation until `done` or the deadline, 1 ms per step.
+fn run(ms: usize, pkt_buf: []u8, comptime done: fn () bool) bool {
+    var step: usize = 0;
+    while (step < ms) : (step += 1) {
+        const now = clock_us + 1000;
+        tick(now, pkt_buf, wireSend);
+        wire.deliver(now);
+        if (done()) return true;
+    }
+    return false;
+}
+
+var t_client: u8 = 0;
+var t_server: u8 = 0;
+var t_listener: u8 = 0;
+
+var t_have_server = false;
+
+fn bothEstablished() bool {
+    if (!t_have_server) {
+        if (accept(t_listener)) |h| {
+            t_server = h;
+            t_have_server = true;
+        }
+    }
+    return t_have_server and getState(t_client) == .established and getState(t_server) == .established;
+}
+
+fn openPair(pkt_buf: []u8) !void {
+    t_listener = listen(SERVER_IP, 443, 4) orelse return error.Pool;
+    t_client = connect(CLIENT_IP, SERVER_IP, 443) orelse return error.Pool;
+    try testing.expect(run(60_000, pkt_buf, bothEstablished));
+}
+
+/// Pump `total` bytes each way through the pair and verify every byte.
+fn transfer(total: usize, pkt_buf: []u8, max_ms: usize) !void {
+    var c_sent: usize = 0;
+    var s_sent: usize = 0;
+    var c_got: usize = 0;
+    var s_got: usize = 0;
+    var chunk: [3000]u8 = undefined;
+    var step: usize = 0;
+    while (step < max_ms) : (step += 1) {
+        // Producers
+        while (c_sent < total) {
+            var k: usize = 0;
+            const want = @min(chunk.len, total - c_sent);
+            while (k < want) : (k += 1) chunk[k] = pattern(c_sent + k, 0x5A);
+            const n = send(t_client, chunk[0..want]);
+            if (n == 0) break;
+            c_sent += n;
+        }
+        while (s_sent < total) {
+            var k: usize = 0;
+            const want = @min(chunk.len, total - s_sent);
+            while (k < want) : (k += 1) chunk[k] = pattern(s_sent + k, 0xA5);
+            const n = send(t_server, chunk[0..want]);
+            if (n == 0) break;
+            s_sent += n;
+        }
+        const now = clock_us + 1000;
+        tick(now, pkt_buf, wireSend);
+        wire.deliver(now);
+        // Consumers
+        while (true) {
+            const n = recv(t_server, &chunk);
+            if (n == 0) break;
+            for (chunk[0..n], 0..) |b, k| if (b != pattern(c_got + k, 0x5A)) return error.Corrupt;
+            c_got += n;
+        }
+        while (true) {
+            const n = recv(t_client, &chunk);
+            if (n == 0) break;
+            for (chunk[0..n], 0..) |b, k| if (b != pattern(s_got + k, 0xA5)) return error.Corrupt;
+            s_got += n;
+        }
+        if (c_got == total and s_got == total) return;
+    }
+    return error.Stalled;
+}
+
+test "tcp: sequence arithmetic wraps" {
+    try testing.expect(seqLt(0xFFFFFFFF, 1));
+    try testing.expect(seqGt(1, 0xFFFFFFFF));
+    try testing.expect(seqBetween(0xFFFFFFF0, 2, 5));
+    try testing.expect(!seqBetween(10, 20, 20));
+}
+
+test "tcp: handshake, options and a clean transfer" {
+    resetPool();
+    var pkt: [1600]u8 = undefined;
+    try openPair(&pkt);
+    const c = &pool()[t_client];
+    try testing.expectEqual(@as(u8, RCV_WSCALE), c.snd_wscale);
+    try testing.expect(c.sack_ok);
+    try testing.expectEqual(DEFAULT_MSS, c.mss);
+    try transfer(300_000, &pkt, 20_000);
+    try testing.expectEqual(@as(u32, 0), getStats(t_client).retransmits);
+}
+
+test "tcp: survives 10% loss, duplication and reordering" {
+    resetPool();
+    var pkt: [1600]u8 = undefined;
+    wire.rng = 0xC0FFEE;
+    try openPair(&pkt);
+    wire.drop_pct = 10;
+    wire.dup_pct = 3;
+    wire.reorder_pct = 10;
+    try transfer(400_000, &pkt, 600_000);
+    try testing.expect(wire.dropped > 0);
+    try testing.expect(getStats(t_client).retransmits + getStats(t_server).retransmits > 0);
+}
+
+test "tcp: graceful close both ways, FIN after queued data" {
+    resetPool();
+    var pkt: [1600]u8 = undefined;
+    try openPair(&pkt);
+    wire.drop_pct = 5;
+    wire.rng = 77;
+    const msg = "last words";
+    try testing.expectEqual(msg.len, send(t_client, msg));
+    close(t_client); // FIN must follow the data
+    const S = struct {
+        fn serverSawEof() bool {
+            var b: [32]u8 = undefined;
+            const n = recv(t_server, &b);
+            if (n > 0) got += n;
+            return eof(t_server);
+        }
+        var got: usize = 0;
+    };
+    S.got = 0;
+    try testing.expect(run(60_000, &pkt, S.serverSawEof));
+    try testing.expectEqual(msg.len, S.got);
+    try testing.expectEqual(State.close_wait, getState(t_server));
+    close(t_server);
+    const Done = struct {
+        fn bothGone() bool {
+            return isClosed(t_server) and (getState(t_client) == .time_wait or isClosed(t_client));
+        }
+    };
+    try testing.expect(run(60_000, &pkt, Done.bothGone));
+    // TIME_WAIT expires and frees the client slot.
+    const Gone = struct {
+        fn clientFreed() bool {
+            return !pool()[t_client].active;
+        }
+    };
+    try testing.expect(run(20_000, &pkt, Gone.clientFreed));
+}
+
+test "tcp: connection refused and unreachable peer time out" {
+    resetPool();
+    var pkt: [1600]u8 = undefined;
+    // No listener on 444: the SYN draws a RST.
+    t_client = connect(CLIENT_IP, SERVER_IP, 444) orelse return error.Pool;
+    const R = struct {
+        fn closed() bool {
+            return isClosed(t_client);
+        }
+    };
+    try testing.expect(run(5_000, &pkt, R.closed));
+    try testing.expectEqual(CloseReason.refused, closeReason(t_client));
+    abort(t_client);
+    // Every packet lost: SYN retries back off, then give up.
+    wire.drop_pct = 100;
+    t_client = connect(CLIENT_IP, SERVER_IP, 443) orelse return error.Pool;
+    try testing.expect(run(200_000, &pkt, R.closed));
+    try testing.expectEqual(CloseReason.timeout, closeReason(t_client));
+    abort(t_client);
+}
+
+test "tcp: zero window stalls then resumes" {
+    resetPool();
+    var pkt: [1600]u8 = undefined;
+    try openPair(&pkt);
+    // Fill the server's receive buffer without reading it.
+    var buf: [4096]u8 = @splat(0x42);
+    var queued: usize = 0;
+    var step: usize = 0;
+    while (step < 5_000) : (step += 1) {
+        queued += send(t_client, &buf);
+        tick(clock_us + 1000, &pkt, wireSend);
+        wire.deliver(clock_us);
+    }
+    try testing.expectEqual(RECV_BUF_SIZE, pool()[t_server].rcv_count);
+    try testing.expectEqual(@as(u32, 0), pool()[t_client].snd_wnd);
+    // Drain it; the window update (or a probe) restarts the flow.
+    var drained: usize = 0;
+    step = 0;
+    while (step < 20_000 and drained < queued) : (step += 1) {
+        drained += recv(t_server, &buf);
+        tick(clock_us + 1000, &pkt, wireSend);
+        wire.deliver(clock_us);
+    }
+    try testing.expectEqual(queued, drained);
+}
+
+test "tcp: congestion control and RTT estimator" {
+    var cc = CongestionState.init(1460);
+    const iw = cc.cwnd;
+    cc.onAck(1460, 1460);
+    try testing.expectEqual(iw + 1460, cc.cwnd);
+    cc.enterFastRecovery(15000, 50000);
+    try testing.expectEqual(@as(u32, 7500), cc.ssthresh);
+    try testing.expect(cc.in_recovery);
+    cc.onTimeout(1460);
+    try testing.expectEqual(@as(u32, 1460), cc.cwnd);
+
+    var rtt = RttState.init();
+    rtt.update(20_000);
+    try testing.expectEqual(MIN_RTO_US, rtt.rto); // 20 ms RTT → floor
+    rtt.update(400_000);
+    try testing.expect(rtt.rto > 400_000);
+    rtt.rto = 50_000_000;
+    rtt.backoff();
+    try testing.expectEqual(MAX_RTO_US, rtt.rto);
+}
+
+// Carried over from zpm's earlier inline tests (edge values the tests above
+// do not pin down).
+
+test "tcp: sequence comparisons are consistent across the wrap" {
+    try testing.expect(seqLt(0x80000000, 0x80000001));
+    try testing.expect(!seqLt(5, 5));
+    try testing.expect(!seqGt(5, 5));
+    try testing.expect(seqBetween(10, 10, 20)); // inclusive left
+    try testing.expect(seqBetween(0xFFFFFFF0, 0xFFFFFFF5, 0x00000005));
     const vals = [_]u32{ 0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFE, 0xFFFFFFFF };
     for (vals) |a| {
         for (vals) |b| {
             if (a == b) {
-                if (seqLt(a, b)) return error.TestUnexpectedResult;
-                if (seqGt(a, b)) return error.TestUnexpectedResult;
+                try testing.expect(!seqLt(a, b) and !seqGt(a, b));
+                try testing.expect(seqLeq(a, b) and seqGeq(a, b));
             } else {
-                // Exactly one of lt/gt must be true
-                const lt = seqLt(a, b);
-                const gt = seqGt(a, b);
-                if (lt == gt) return error.TestUnexpectedResult;
+                try testing.expect(seqLt(a, b) != seqGt(a, b)); // exactly one
             }
         }
     }
 }
 
-test "congestion control: slow start" {
-    var cc = CongestionState.init(1460);
-    const initial = cc.cwnd;
-    cc.onAck(1460, 1460);
-    if (cc.cwnd != initial + 1460) return error.TestUnexpectedResult;
-    cc.onAck(1460, 1460);
-    if (cc.cwnd != initial + 2920) return error.TestUnexpectedResult;
-}
-
-test "congestion control: timeout resets" {
+test "tcp: timeout and fast-recovery window arithmetic" {
     var cc = CongestionState.init(1460);
     cc.cwnd = 50000;
     cc.onTimeout(1460);
-    if (cc.cwnd != 1460) return error.TestUnexpectedResult;
-    if (cc.ssthresh != 25000) return error.TestUnexpectedResult;
-}
+    try testing.expectEqual(@as(u32, 1460), cc.cwnd);
+    try testing.expectEqual(@as(u32, 25000), cc.ssthresh); // cwnd / 2
 
-test "congestion control: fast recovery entry" {
-    var cc = CongestionState.init(1460);
+    cc = CongestionState.init(1460);
     cc.cwnd = 20000;
     cc.enterFastRecovery(15000, 50000);
-    if (cc.ssthresh != 7500) return error.TestUnexpectedResult;
-    if (cc.cwnd != 7500 + 3 * 1460) return error.TestUnexpectedResult;
-    if (!cc.in_recovery) return error.TestUnexpectedResult;
-}
+    try testing.expectEqual(@as(u32, 7500 + 3 * 1460), cc.cwnd); // ssthresh + 3 MSS
+    try testing.expectEqual(@as(u32, 50000), cc.recovery_point);
 
-test "RTT estimation: first sample" {
     var rtt = RttState.init();
     rtt.update(100_000);
-    if (!rtt.has_sample) return error.TestUnexpectedResult;
-    if (rtt.srtt != 100_000 * 8) return error.TestUnexpectedResult;
+    try testing.expect(rtt.has_sample);
+    try testing.expectEqual(@as(u32, 100_000 << 3), rtt.srtt);
 }
 
-test "RTT estimation: backoff capped at 60s" {
-    var rtt = RttState.init();
-    rtt.rto = 50_000_000;
-    rtt.backoff();
-    if (rtt.rto != 60_000_000) return error.TestUnexpectedResult;
-}
+test "tcp: connect and listen allocate slots; abort frees them" {
+    resetPool();
+    const h = connect(CLIENT_IP, SERVER_IP, 80) orelse return error.Pool;
+    try testing.expectEqual(State.syn_sent, getState(h));
+    try testing.expect(localPort(h) >= 49152);
+    abort(h);
+    try testing.expectEqual(State.closed, getState(h));
+    try testing.expect(!pool()[h].active);
 
-test "connect allocates SYN_SENT" {
-    const handle = connect(.{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 }, 80) orelse return error.TestUnexpectedResult;
-    if (getState(handle) != .syn_sent) return error.TestUnexpectedResult;
-    abort(handle);
-    if (getState(handle) != .closed) return error.TestUnexpectedResult;
-}
-
-test "listen allocates LISTEN" {
-    const handle = listen(.{ 0, 0, 0, 0 }, 8080, 5) orelse return error.TestUnexpectedResult;
-    if (getState(handle) != .listen) return error.TestUnexpectedResult;
-    abort(handle);
+    const l = listen(.{ 0, 0, 0, 0 }, 8080, 5) orelse return error.Pool;
+    try testing.expectEqual(State.listen, getState(l));
+    try testing.expect(accept(l) == null);
+    abort(l);
+    try testing.expectEqual(State.closed, getState(l));
 }

@@ -7,9 +7,9 @@ Zero-allocation, freestanding-compatible network protocol modules. Designed for 
 ```
 Application (QUIC server, HTTP client, metadata reporting)
     ├── http.sig        ← HTTP/1.1 client (GET/PUT, chunked, GCP metadata)
-    ├── dns.sig         ← DNS resolver (A records, 8-entry cache)
-    ├── dhcp.sig        ← DHCP client (DISCOVER→ACK, lease renewal)
-    ├── tcp.sig         ← Full TCP (RFC 793/7323/5681, 16 connections)
+    ├── dns.sig         ← DNS resolver (A records, 8-entry cache, anti-spoofing)
+    ├── dhcp.sig        ← DHCP client (DISCOVER→ACK, T1 renew / T2 rebind)
+    ├── tcp.sig         ← TCP (RFC 9293/5681/6298/7323, 32 connections)
     ├── udp.sig         ← UDP (port binding, checksum, dispatch)
     ├── icmp.sig        ← ICMP (echo reply, dest unreachable)
     ├── ipv4.sig        ← IPv4 (build/parse, routing, checksums)
@@ -19,18 +19,20 @@ Application (QUIC server, HTTP client, metadata reporting)
     └── checksum.sig    ← RFC 1071 Internet checksum
 ```
 
-## TCP Features (Full RFC Compliance)
-- All 11 states (CLOSED through TIME_WAIT)
-- Active open (connect) and passive open (listen/accept)
-- SACK (4 blocks, RFC 2018)
-- Window scaling (RFC 7323, shift up to 14)
-- TCP timestamps / RTTM (RFC 7323)
-- Nagle algorithm (configurable)
-- NewReno congestion control (RFC 5681)
-- RTO per RFC 6298 with exponential backoff
-- Delayed ACK (200ms / 2 segments)
-- Zero-window probing
-- 32-bit sequence wraparound arithmetic
+## TCP Features
+- All RFC 9293 states; active open (connect) and passive open (listen/accept)
+- RST/SYN validation with challenge ACKs (RFC 5961)
+- MSS, window scale (shift up to 14) and SACK-permitted options
+- Send/receive ring buffers (32 KiB / 512 KiB per connection); the advertised
+  window is the free space, so its right edge never shrinks
+- RTO per RFC 6298 (Karn, exponential backoff, 200 ms floor), go-back-N
+- NewReno congestion control (RFC 5681/6582): fast retransmit, fast recovery
+- Out-of-order reassembly (one range) reported with a SACK block
+- Delayed ACK (40 ms / every 2nd segment), Nagle (configurable)
+- Window updates on read, zero-window probing
+- Graceful close (FIN after queued data), short client TIME_WAIT
+- RFC 6528-style ISNs and randomized ephemeral ports from a caller seed (`seed`)
+- Time comes from the caller: `tick(now_us, ...)`
 
 ## Usage in Kernel
 
@@ -58,7 +60,7 @@ sig build-obj src/net/tcp.sig -target aarch64-freestanding
 Each module has inline `test` blocks. Run via build steps:
 
 ```
-sig build test-net-checksum test-net-ethernet test-net-ipv4 test-net-udp test-net-tcp --zig-lib-dir <lib>
+sig build test-net-checksum test-net-ethernet test-net-ipv4 test-net-udp test-net-tcp test-net-dns test-net-dhcp
 ```
 
 ## Design Principles
