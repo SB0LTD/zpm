@@ -24,6 +24,7 @@ const ump = @import("ump.sig");
 const request = @import("request.sig");
 const http = @import("youtube_net");
 const profiling = @import("../download_profile.sig");
+const builtin = @import("builtin");
 
 // ── Win32 file sink (append writer) ──
 extern "kernel32" fn CreateFileA([*:0]const u8, u32, u32, ?*anyopaque, u32, u32, ?*anyopaque) ?*anyopaque;
@@ -33,6 +34,30 @@ extern "kernel32" fn FlushFileBuffers(?*anyopaque) c_int;
 extern "kernel32" fn MoveFileExA([*:0]const u8, [*:0]const u8, u32) c_int;
 extern "kernel32" fn Sleep(u32) void;
 extern "kernel32" fn GetTickCount64() u64;
+
+fn elapsedClockMs() u64 {
+    if (builtin.os.tag == .windows) return GetTickCount64();
+    if (builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.errno(std.os.linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) @panic("SABR monotonic clock unavailable");
+        return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+    }
+    @compileError("SABR timing requires a Windows or Linux host backend");
+}
+
+fn sleepMs(ms: u32) void {
+    if (builtin.os.tag == .windows) { Sleep(ms); return; }
+    if (builtin.os.tag == .linux) {
+        var request_time = std.os.linux.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast(@as(u64, ms % 1000) * 1_000_000) };
+        var remaining: std.os.linux.timespec = undefined;
+        while (true) switch (std.os.linux.errno(std.os.linux.nanosleep(&request_time, &remaining))) {
+            .SUCCESS => return,
+            .INTR => request_time = remaining,
+            else => @panic("SABR retry sleep failed"),
+        };
+    }
+    @compileError("SABR timing requires a Windows or Linux host backend");
+}
 
 const GENERIC_WRITE: u32 = 0x40000000;
 const CREATE_ALWAYS: u32 = 2;
@@ -58,7 +83,7 @@ const ProfiledSink = struct {
 };
 fn sleepProfiled(ms: u32, profile: ?*profiling.Profile) void {
     const started = profiling.clock(profile);
-    Sleep(ms);
+    sleepMs(ms);
     profiling.add(profile, "sleep_ns", started);
 }
 
@@ -298,7 +323,7 @@ pub fn runLoopWithOptions(
     var ctx_update_type: i32 = 0;
 
     var pending_passes: u16 = 0;
-    const started = GetTickCount64();
+    const started = elapsedClockMs();
     var iter: u16 = 0;
     while (iter < MAX_ITERATIONS) : (iter += 1) {
         // Build the request body for this round.
@@ -315,7 +340,7 @@ pub fn runLoopWithOptions(
         };
         const params = request.AbrParams{
             .player_time_ms = player_time_ms,
-            .elapsed_wall_time_ms = @intCast(@min(GetTickCount64() - started, 0x7fffffffffffffff)),
+            .elapsed_wall_time_ms = @intCast(@min(elapsedClockMs() - started, 0x7fffffffffffffff)),
             .audio_formats = audio,
             .video_formats = video,
             .initialized_formats = if (progress.initialized) &.{selected} else &.{},

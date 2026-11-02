@@ -20,6 +20,7 @@
 //!     the CPU.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sb0m = @import("tts_model_container");
 const quantized = @import("quantized_linear");
 const cuda = @import("matmul_cuda");
@@ -64,6 +65,12 @@ pub var down_ns: u64 = 0;
 extern "kernel32" fn QueryPerformanceCounter(*u64) c_int;
 extern "kernel32" fn QueryPerformanceFrequency(*u64) c_int;
 pub fn nowNs() u64 {
+    if (builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.errno(std.os.linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    }
+    if (builtin.os.tag != .windows) return 0;
     var c: u64 = 0;
     var f: u64 = 0;
     _ = QueryPerformanceCounter(&c);
@@ -98,6 +105,9 @@ var h_staging: ?[*]f32 = null;
 /// Attempt to bring up cuBLAS and the device scratch. Returns true when the GPU
 /// path is usable. Safe to call more than once.
 pub fn init() bool {
+    // The shared CUDA loader and staging allocator currently support Windows.
+    // Portable callers keep the tested CPU path on other hosts.
+    if (builtin.os.tag != .windows) return false;
     if (armed_flag) return true;
     if (!cuda.init()) return false;
     if (!cuda.isAvailable()) return false;
@@ -129,7 +139,7 @@ pub fn deinit() void {
     cuda.gpuFree(d_out);
     d_out = 0;
     if (h_staging) |s| {
-        _ = VirtualFree(@ptrCast(s), 0, MEM_RELEASE);
+        if (builtin.os.tag == .windows) _ = VirtualFree(@ptrCast(s), 0, MEM_RELEASE);
         h_staging = null;
     }
     armed_flag = false;
@@ -361,4 +371,17 @@ test "matvec is a no-op (returns false) when the GPU is not armed" {
 test "find returns null on an empty cache" {
     entry_count = 0;
     try std.testing.expect(find(123) == null);
+}
+
+test "host diagnostics are monotonic and unsupported GPU initialization is explicit" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .linux) {
+        const before = nowNs();
+        const after = nowNs();
+        try std.testing.expect(before > 0 and after >= before);
+    }
+    if (builtin.os.tag != .windows) {
+        try std.testing.expect(!init());
+        try std.testing.expect(!armed());
+        deinit();
+    }
 }
