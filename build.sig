@@ -1325,6 +1325,16 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("net_checksum", "src/net/checksum.sig"),
         importEntry("net_ipv4", "src/net/ipv4.sig"),
     });
+    _ = try addTest(ctx, test_all, "test-net-dns", "src/net/dns.sig", &.{
+        importEntry("net_udp", "src/net/udp.sig"),
+        importEntry("net_ipv4", "src/net/ipv4.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-net-dhcp", "src/net/dhcp.sig", &.{
+        importEntry("net_ethernet", "src/net/ethernet.sig"),
+        importEntry("net_ipv4", "src/net/ipv4.sig"),
+        importEntry("net_udp", "src/net/udp.sig"),
+        importEntry("net_checksum", "src/net/checksum.sig"),
+    });
     const window = try ctx.addModule("window", "src/platform/window.sig");
     try wire(ctx, window, "win32", win32_path);
     try wire(ctx, window, "gl", "src/platform/gl.sig");
