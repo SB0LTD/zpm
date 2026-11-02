@@ -49,7 +49,7 @@ pub const Region = struct { va: u64, bytes: []u8 };
 pub const Memory = struct {
     regions: []const Region,
 
-    fn find(m: *const Memory, va: u64, len: usize) ?[]u8 {
+    pub fn find(m: *const Memory, va: u64, len: usize) ?[]u8 {
         for (m.regions) |r| {
             if (va >= r.va and va + len <= r.va + r.bytes.len) return r.bytes[@intCast(va - r.va)..][0..len];
         }

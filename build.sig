@@ -1079,6 +1079,13 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         },
     });
 
+    // ── Adreno a7xx compute: ir3 ISA and assembler, command streams,
+    //    emulator, bring-up tests (one module, files import each other) ──
+    _ = try ctx.addModule("adreno", "src/adreno/adreno.sig");
+    const test_adreno = try ctx.addStep("test-adreno", "Execute the ir3 ISA vectors, the assembler, the emulator and the A7xx compute self-tests", &noopStep);
+    try ctx.addDependency(test_all, test_adreno);
+    _ = try addTest(ctx, test_adreno, "test-adreno-module", "src/adreno/adreno.sig", &.{});
+
     const tts_gpu = try ctx.addModule("tts_gpu", "src/tts/gpu.sig");
     try wire(ctx, tts_gpu, "tts_model_container", "src/tts/model_container.sig");
     try wire(ctx, tts_gpu, "quantized_linear", "src/core/quantized_linear.sig");
