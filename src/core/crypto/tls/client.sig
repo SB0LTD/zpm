@@ -32,7 +32,9 @@ pub const parseRootsDer = tls.parseRootsDer;
 pub const Cert = tls.Cert;
 pub const Conn = tls.Conn;
 pub const Transport = tls.Transport;
-// Windows transport + entropy.
+// Windows hostname resolver; native buffered Socket/entropy also support Linux.
+// Other hosts inject a Transport. Query availability before opening by name.
+pub const native_socket_available = winsock.available;
 pub const connectHost = winsock.connectHost;
 pub const fillEntropy = winsock.fillEntropy;
 pub const Socket = winsock.Socket;
