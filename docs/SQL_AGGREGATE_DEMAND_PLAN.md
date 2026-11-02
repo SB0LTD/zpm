@@ -63,3 +63,45 @@ Test first, independent review, full existing grouped/window/rollup suites, orig
 platforms and exact release qualification. No family closure or speedup claim from
 passing these finite cases. This file is a next-slice investigation note, not evidence
 that the work is implemented.
+
+## Independent test-first review
+
+Fresh review reproduced the6/10 red result and independently recaptured all16
+complete native event arrays on PostgreSQL16.15. It found no incorrect expected
+result, but these tests are insufficient for implementation qualification.
+
+Before modifying runtime code, expand the corpus with duplicate group keys,
+empty grouped input, selected NULL aggregates, live group keys/results and
+selective HAVING. Add row-dependent failing aggregate arguments (constant1/0
+alone cannot isolate transition suppression), multiple/deduplicated aggregates,
+live/dead FILTER and aggregate DISTINCT. Exercise generic, streaming and
+factorized paths or require an explicit tested fallback. Semantic-invalid dead
+expressions, prepared/binary modes, poisoned reuse, cancellation/grants,
+snapshot/private writes, failed DML and PostgreSQL18 also remain open.
+
+## Reproduction from a clean checkout
+
+Native verification requires an explicitly selected loopback trust/peer native
+test instance as postgres/postgres; it creates only session-local TEMP objects
+and records the actual server version. No RAMSQL or sibling repository import
+is needed. Invoke:
+
+```text
+python tools/verify_sql_aggregate_demand.py --port <native-port> --expected-major 16 --report <report-path>
+```
+
+For the standalone red core contract, use a matched Sig compiler and SDK, create
+an output directory, and run these exact arguments (quote the -M/-femit arguments
+in PowerShell):
+
+```text
+sig build-exe --Sig-lib-dir <matched-SDK-lib> -OReleaseSafe --dep sql "-Mroot=tests/test_sql_aggregate_demand.sig" "-Msql=src/core/sql.sig" "-femit-bin=<output-executable>"
+<output-executable>
+```
+
+Compilation must exit0; the baseline executable must exit1 with
+SqlAggregateDemandIncomplete and6passing/10gaps/16programs. A later corrected
+implementation needs expanded passing contracts and the full qualification gates,
+not this baseline red result. Frozen16 fixture fields cover integer OIDs, names,
+values, row counts, command tags, SQLSTATE and sequence effects; the public
+verifier does not claim all possible types or typmods.
