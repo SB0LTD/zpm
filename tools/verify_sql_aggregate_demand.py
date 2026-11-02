@@ -52,7 +52,7 @@ def main():
         for case in fixture['cases']:
             pg = connect()
             try:
-                for source in fixture['setup']:
+                for source in case.get('setup', fixture['setup']):
                     source = source.replace('CREATE TABLE ', 'CREATE TEMP TABLE ', 1).replace('CREATE SEQUENCE ', 'CREATE TEMP SEQUENCE ', 1)
                     outcome = pg.query(source)
                     if outcome['error']:

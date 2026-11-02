@@ -7,6 +7,10 @@ on:
     branches: [main, master]
   workflow_dispatch:
     inputs:
+      native_oracles_only:
+        description: 'Native oracle calibration only; skips host builds and is not full qualification'
+        type: boolean
+        default: false
       large_columns:
         description: 'Also validate 100M actual packed values (about 1.2 GB memory)'
         type: boolean
@@ -60,6 +64,11 @@ jobs:
           python tools/verify_sql_planner_demand.py
           --port ${{ job.services.postgres.ports[5432] }}
           --expected-major ${{ matrix.major }} --report planner-demand-oracle.json
+      - name: Verify aggregate-state demand native observations
+        run: >-
+          python tools/verify_sql_aggregate_demand.py
+          --port ${{ job.services.postgres.ports[5432] }}
+          --expected-major ${{ matrix.major }} --report aggregate-demand-oracle.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -67,23 +76,31 @@ jobs:
           path: |
             parameter-oracle.json
             planner-demand-oracle.json
+            aggregate-demand-oracle.json
           if-no-files-found: error
 
   native:
+    # Oracle-only calibration never disables host gates on push or pull_request.
+    if: github.event_name != 'workflow_dispatch' || inputs.native_oracles_only != true
     name: Database contracts (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Two Windows attempts passed all 169 contract steps but exhausted 30 minutes
+    # in the final CLI checks. Preserve every check; budget that host separately.
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
+            timeout_minutes: 30
             asset: sig-0.6.4-zig0.17.0.90a898d-x86_64-linux.tar.xz
             sha256: 8dd32622531b5f81dbb12502c78e187141dd42ea3553f4d9e2c09c3e82d64a89
           - os: macos-latest
+            timeout_minutes: 30
             asset: sig-0.6.4-zig0.17.0.90a898d-aarch64-macos.tar.xz
             sha256: 75ae868e63b6a90ffd3e282f410b18e5098ea87d02cbdc0fd95224f5e922491f
           - os: windows-latest
+            timeout_minutes: 45
             asset: sig-0.6.4-zig0.17.0.90a898d-x86_64-windows.zip
             sha256: 49fc99ac20af7841a5b686c68a8720515deda9c28dcad0cb9191fa0de30e33a0
     defaults:

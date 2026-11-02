@@ -1,28 +1,19 @@
 {
-  "schema": 1,
+  "schema": 2,
   "date": "2026-11-02",
-  "baseline": "ef6e3c0486ca76a3bfe70f3d91acda22c7491c16",
-  "scope": "Test-first aggregate-state demand, not implemented or qualified",
-  "raw_windows_file_sha256": {
-    "tests/test_sql_aggregate_demand.sig": "490e9524eb94dc5562398653ef059115a553f1671d091bde519e92005f0bac6e",
-    "tests/fixtures/aggregate_demand_pg16.json": "0002bb7b0afbe69335154698d7599b9060aa24753798bdf2966bf3d9ff66192f",
-    ".scratch/aggregate-demand/red.log": "fa7047a09dae49cc7a5bacdf28a1ce0c3a17df5e894820a960ed41431a48b895",
-    ".scratch/aggregate-demand/compile-final.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "tools/verify_sql_aggregate_demand.py": "dbe4299e72135d276903aa603cda4b0d4df11b7a24152dd3e3b245cb3d70832d",
-    ".scratch/aggregate-demand/native-public.json": "5aff9e06ac4e3d553098a8074195cc37cfa120090626aa7c23e528a5620eb565",
-    ".scratch/aggregate-demand-review/native-recapture.json": "0235c3ec03a12e25e65874ba56d43cbcd2d885e01ff3cf3cb45126f03952fdea",
-    ".scratch/aggregate-demand-review/native-public-independent.json": "5aff9e06ac4e3d553098a8074195cc37cfa120090626aa7c23e528a5620eb565",
-    ".scratch/aggregate-demand-review/native-public-wrong-major.json": "28f5fa0db9d0dcc7e24d2198781d2d9c9f3082fce02a281bb050ed66dff1d24f"
-  },
-  "execution": {
-    "command": "<output-executable> (compile_argv above)",
+  "baseline_runtime": "ef6e3c0486ca76a3bfe70f3d91acda22c7491c16",
+  "scope": "Test-first aggregate-state demand; runtime not implemented or qualified",
+  "current_checkpoint": {
+    "programs": 50,
+    "matching": 25,
+    "gaps": 25,
     "compile_exit": 0,
     "run_exit": 1,
     "expected_error": "SqlAggregateDemandIncomplete",
-    "programs": 16,
-    "matching": 6,
-    "gaps": 10,
-    "compile_argv": [
+    "native_server_version_num": "160015",
+    "native_replay_cases": 50,
+    "native_replay_exit": 0,
+    "core_compile_argv": [
       "sig",
       "build-exe",
       "--Sig-lib-dir",
@@ -33,19 +24,9 @@
       "-Mroot=tests/test_sql_aggregate_demand.sig",
       "-Msql=src/core/sql.sig",
       "-femit-bin=<output-executable>"
-    ]
-  },
-  "native_wire_observation": {
-    "command": "Historical capture; reproducible native_public_verifier argv retained below",
-    "harness_exit": 0,
-    "native": "16.15",
-    "matching": 6,
-    "gaps": 10,
-    "note": "Observation harness success means capture completed, not candidate compatibility"
-  },
-  "original_118_program_inventory": "Unchanged; do not add these sixteen to its pass count",
-  "native_public_verifier": {
-    "argv": [
+    ],
+    "run_command": "<output-executable>",
+    "native_argv": [
       "python",
       "tools/verify_sql_aggregate_demand.py",
       "--port",
@@ -55,46 +36,127 @@
       "--report",
       "<report-path>"
     ],
-    "observed_exit": 0,
-    "server_version_num": "160015",
-    "cases": 16,
-    "failures": 0
+    "generate_command": "python tools/generate_sql_aggregate_demand.py --check",
+    "note": "Core rows compare bags, duplicate counts, NULLs, OIDs/names and sequence effects; not full ORDER BY/typmod qualification"
   },
-  "independent_review": {
-    "red_result_reproduced": true,
-    "native_event_arrays_reproduced": 16,
-    "incorrect_expectations_found": 0,
-    "implementation_ready": false,
-    "remaining_test_dimensions": "See docs/SQL_AGGREGATE_DEMAND_PLAN.md independent review section"
+  "raw_windows_file_sha256": {
+    "tests/test_sql_aggregate_demand.sig": "495a2c0de5a7d79cae395ce08d586cd4370f5eb1f445fa3fb2229a108dea6638",
+    "tests/fixtures/aggregate_demand_pg16.json": "04a1c3382aa111b0f4b08b786acb06b353eb040c4c3b7d5c70b75ead25c3bdf3",
+    "tools/generate_sql_aggregate_demand.py": "2970e90a1fb6540d1b10be1e60b174e84d858401c4af3981410909695abcfdb9",
+    "tools/verify_sql_aggregate_demand.py": "5c5ccc7cbddaeaecf1d1f75b092e6ea69b43e4856c1f7c5119c4b253bcc3e27b",
+    ".scratch/aggregate-demand-expansion/core-red-cast.log": "4057f10dad0b98f649128ddd84b38c7ea10ccb38d676d127a74492d888d361ef",
+    ".scratch/aggregate-demand-expansion/compile-final.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    ".scratch/aggregate-demand-expansion/native-capture-cast.json": "c248c54f3c252142598cb727707de138977aaa61661eabd07a56e1ed8db3cf46",
+    ".scratch/aggregate-demand-expansion/native-public.json": "5ffd4a43af129415ff3e818021c884f97a473c117731dd3208fb0eb4b4b49e44",
+    ".scratch/aggregate-demand-expansion/initial-core-red.log": "2f62ca6dbff1f6cbdb9939a6c052648cbfdf8a3a77f6254fbfcfa3cece514a02"
   },
-  "public_verifier_independent_review": {
-    "approved_delta": "1d9cca9",
-    "native_exit": 0,
-    "native_version_num": "160015",
-    "cases": 16,
-    "failures": 0,
-    "wrong_major_exit": 2
+  "review_status": "Expanded50 corpus and oracle-only CI mode pending independent review. Initial16 expectations and public verifier independently reviewed.",
+  "remaining": [
+    "Generic/streaming/factorized path-specific proof",
+    "Prepared/binary and PG18 native characterization",
+    "Poisoned reuse, cancellation/grants, snapshots/private writes and failed DML",
+    "Runtime implementation and full platform/product/exact-release gates"
+  ],
+  "separate_literal_capacity_finding": "PG.LITERAL.FLOAT_CONTEXT_HIGH_EXPONENT remains open; initial expanded run had two NumericCapacity setup failures. Explicit float8 input isolates aggregate overflow without closing that literal-input finding.",
+  "historical_initial16": {
+    "schema": 1,
+    "date": "2026-11-02",
+    "baseline": "ef6e3c0486ca76a3bfe70f3d91acda22c7491c16",
+    "scope": "Test-first aggregate-state demand, not implemented or qualified",
+    "raw_windows_file_sha256": {
+      "tests/test_sql_aggregate_demand.sig": "490e9524eb94dc5562398653ef059115a553f1671d091bde519e92005f0bac6e",
+      "tests/fixtures/aggregate_demand_pg16.json": "0002bb7b0afbe69335154698d7599b9060aa24753798bdf2966bf3d9ff66192f",
+      ".scratch/aggregate-demand/red.log": "fa7047a09dae49cc7a5bacdf28a1ce0c3a17df5e894820a960ed41431a48b895",
+      ".scratch/aggregate-demand/compile-final.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tools/verify_sql_aggregate_demand.py": "dbe4299e72135d276903aa603cda4b0d4df11b7a24152dd3e3b245cb3d70832d",
+      ".scratch/aggregate-demand/native-public.json": "5aff9e06ac4e3d553098a8074195cc37cfa120090626aa7c23e528a5620eb565",
+      ".scratch/aggregate-demand-review/native-recapture.json": "0235c3ec03a12e25e65874ba56d43cbcd2d885e01ff3cf3cb45126f03952fdea",
+      ".scratch/aggregate-demand-review/native-public-independent.json": "5aff9e06ac4e3d553098a8074195cc37cfa120090626aa7c23e528a5620eb565",
+      ".scratch/aggregate-demand-review/native-public-wrong-major.json": "28f5fa0db9d0dcc7e24d2198781d2d9c9f3082fce02a281bb050ed66dff1d24f"
+    },
+    "execution": {
+      "command": "<output-executable> (compile_argv above)",
+      "compile_exit": 0,
+      "run_exit": 1,
+      "expected_error": "SqlAggregateDemandIncomplete",
+      "programs": 16,
+      "matching": 6,
+      "gaps": 10,
+      "compile_argv": [
+        "sig",
+        "build-exe",
+        "--Sig-lib-dir",
+        "<matched-SDK-lib>",
+        "-OReleaseSafe",
+        "--dep",
+        "sql",
+        "-Mroot=tests/test_sql_aggregate_demand.sig",
+        "-Msql=src/core/sql.sig",
+        "-femit-bin=<output-executable>"
+      ]
+    },
+    "native_wire_observation": {
+      "command": "Historical capture; reproducible native_public_verifier argv retained below",
+      "harness_exit": 0,
+      "native": "16.15",
+      "matching": 6,
+      "gaps": 10,
+      "note": "Observation harness success means capture completed, not candidate compatibility"
+    },
+    "original_118_program_inventory": "Unchanged; do not add these sixteen to its pass count",
+    "native_public_verifier": {
+      "argv": [
+        "python",
+        "tools/verify_sql_aggregate_demand.py",
+        "--port",
+        "<native-port>",
+        "--expected-major",
+        "16",
+        "--report",
+        "<report-path>"
+      ],
+      "observed_exit": 0,
+      "server_version_num": "160015",
+      "cases": 16,
+      "failures": 0
+    },
+    "independent_review": {
+      "red_result_reproduced": true,
+      "native_event_arrays_reproduced": 16,
+      "incorrect_expectations_found": 0,
+      "implementation_ready": false,
+      "remaining_test_dimensions": "See docs/SQL_AGGREGATE_DEMAND_PLAN.md independent review section"
+    },
+    "public_verifier_independent_review": {
+      "approved_delta": "1d9cca9",
+      "native_exit": 0,
+      "native_version_num": "160015",
+      "cases": 16,
+      "failures": 0,
+      "wrong_major_exit": 2
+    },
+    "review_findings": [
+      {
+        "id": "AGG-REPRO-01",
+        "status": "closed",
+        "scope": "Public native verifier and full standalone compile argv, independently replayed"
+      },
+      {
+        "id": "AGG-GROUP-01",
+        "status": "open",
+        "scope": "Duplicate group keys, empty grouped input, selected NULLs, live keys and selective HAVING"
+      },
+      {
+        "id": "AGG-TRANSITION-01",
+        "status": "open",
+        "scope": "Row-dependent failing arguments, aggregate positions/deduplication, FILTER/DISTINCT, generic/streamed/factorized paths"
+      },
+      {
+        "id": "AGG-QUALIFICATION-01",
+        "status": "open",
+        "scope": "PG18, prepared/binary, semantic-invalid dead expressions, cancellation/grants, poisoned reuse, snapshots/private writes, failed DML"
+      }
+    ]
   },
-  "review_findings": [
-    {
-      "id": "AGG-REPRO-01",
-      "status": "closed",
-      "scope": "Public native verifier and full standalone compile argv, independently replayed"
-    },
-    {
-      "id": "AGG-GROUP-01",
-      "status": "open",
-      "scope": "Duplicate group keys, empty grouped input, selected NULLs, live keys and selective HAVING"
-    },
-    {
-      "id": "AGG-TRANSITION-01",
-      "status": "open",
-      "scope": "Row-dependent failing arguments, aggregate positions/deduplication, FILTER/DISTINCT, generic/streamed/factorized paths"
-    },
-    {
-      "id": "AGG-QUALIFICATION-01",
-      "status": "open",
-      "scope": "PG18, prepared/binary, semantic-invalid dead expressions, cancellation/grants, poisoned reuse, snapshots/private writes, failed DML"
-    }
-  ]
+  "original_118_program_inventory": "Unchanged; do not add these50 to its pass count"
 }

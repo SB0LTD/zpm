@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "native": "PostgreSQL 16.15",
-  "scope": "Next aggregate-demand slice, not implemented or qualified",
+  "scope": "50 finite native16.15 aggregate-demand observations; runtime incomplete, not family closure",
   "setup": [
     "CREATE TABLE t(v INT)",
     "INSERT INTO t VALUES(1),(2)",
@@ -885,6 +885,2050 @@
           }
         }
       ]
+    },
+    {
+      "id": "aggregate_duplicate_groups",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/0) AS dead FROM t GROUP BY v) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ],
+              [
+                7
+              ],
+              [
+                7
+              ]
+            ],
+            "rowcount": 3,
+            "status": "SELECT 3"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_empty_groups",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/0) AS dead FROM t GROUP BY v) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [],
+            "rowcount": 0,
+            "status": "SELECT 0"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_live_group_keys",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT g FROM (SELECT v AS g,sum(1/(v-1)) AS dead FROM t GROUP BY v) q ORDER BY g NULLS LAST",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "g",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                null
+              ]
+            ],
+            "rowcount": 3,
+            "status": "SELECT 3"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_selective_having",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/(v-1)) AS dead FROM t GROUP BY v HAVING count(*)>1) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_row_dependent",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/(v-1)) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_dead_before_live",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT live FROM (SELECT sum(1/(v-1)) AS dead,sum(v) AS live FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "live",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                4
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_dead_after_live",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT live FROM (SELECT sum(v) AS live,sum(1/(v-1)) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "live",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                4
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_deduplicated_dead",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/(v-1)) AS a,sum(1/(v-1)) AS b FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_deduplicated_live",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT a+b FROM (SELECT sum(1/(v-1)) AS a,sum(1/(v-1)) AS b FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "22012",
+            "error_class": "DivisionByZero",
+            "message": "division by zero"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_live_false_filter",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT x FROM (SELECT sum(1/(v-1)) FILTER(WHERE FALSE) AS x FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "x",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                null
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_live_selective_filter",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT x FROM (SELECT sum(1/(v-1)) FILTER(WHERE v<>1) AS x FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "x",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_dead_false_filter",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/(v-1)) FILTER(WHERE FALSE) AS x FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_dead_distinct_arg",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(DISTINCT 1/(v-1)) AS x FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_live_distinct_and_dead",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT live FROM (SELECT count(DISTINCT v) AS live,sum(1/(v-1)) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "live",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                2
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_live_having_dependency",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(v) AS x FROM t HAVING sum(1/(v-1))>0) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "22012",
+            "error_class": "DivisionByZero",
+            "message": "division by zero"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_hidden_order_dependency",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(v) AS x FROM t ORDER BY sum(1/(v-1))) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "22012",
+            "error_class": "DivisionByZero",
+            "message": "division by zero"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_hidden_order_limit_zero",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/(v-1)) AS x FROM t ORDER BY x LIMIT 0) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [],
+            "rowcount": 0,
+            "status": "SELECT 0"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_distinct_dependency",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT DISTINCT sum(1/(v-1)) AS x FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "22012",
+            "error_class": "DivisionByZero",
+            "message": "division by zero"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_shared_cte_dependency",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "WITH q AS(SELECT sum(1/(v-1)) AS x FROM t) SELECT 7 FROM q a,q b",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "22012",
+            "error_class": "DivisionByZero",
+            "message": "division by zero"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_single_cte_pruning",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "WITH q AS(SELECT sum(1/(v-1)) AS x FROM t) SELECT 7 FROM q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_empty_null_outputs",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT s,c,mn,mx,av FROM (SELECT sum(v) AS s,count(v) AS c,min(v) AS mn,max(v) AS mx,avg(v) AS av,sum(1/(v-1)) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "s",
+                "oid": 20
+              },
+              {
+                "name": "c",
+                "oid": 20
+              },
+              {
+                "name": "mn",
+                "oid": 23
+              },
+              {
+                "name": "mx",
+                "oid": 23
+              },
+              {
+                "name": "av",
+                "oid": 1700
+              }
+            ],
+            "rows": [
+              [
+                null,
+                0,
+                null,
+                null,
+                null
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_all_null_outputs",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(NULL),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT s,c,mn,mx,av FROM (SELECT sum(v) AS s,count(v) AS c,min(v) AS mn,max(v) AS mx,avg(v) AS av,sum(1/(v-1)) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "s",
+                "oid": 20
+              },
+              {
+                "name": "c",
+                "oid": 20
+              },
+              {
+                "name": "mn",
+                "oid": 23
+              },
+              {
+                "name": "mx",
+                "oid": 23
+              },
+              {
+                "name": "av",
+                "oid": 1700
+              }
+            ],
+            "rows": [
+              [
+                null,
+                0,
+                null,
+                null,
+                null
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_semantic_missing_column",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(missing) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "42703",
+            "error_class": "UndefinedColumn",
+            "message": "column \"missing\" does not exist"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_semantic_wrong_type",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum('bad'::text) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "42883",
+            "error_class": "UndefinedFunction",
+            "message": "function sum(text) does not exist"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_semantic_nested_aggregate",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(sum(v)) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "42803",
+            "error_class": "GroupingError",
+            "message": "aggregate function calls cannot be nested"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_semantic_ungrouped_column",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT v,sum(v) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "42803",
+            "error_class": "GroupingError",
+            "message": "column \"t.v\" must appear in the GROUP BY clause or be used in an aggregate function"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_volatile_filter",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT count(*) FILTER(WHERE nextval('seq')>0) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                5
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_volatile_dead_case",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(CASE WHEN FALSE THEN nextval('seq') ELSE 1 END) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_volatile_row_case",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(CASE WHEN v=1 THEN nextval('seq') ELSE 0 END) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                3
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_volatile_throwing_filter",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/(v-1)) FILTER(WHERE nextval('seq')>0) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "22012",
+            "error_class": "DivisionByZero",
+            "message": "division by zero"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                2
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_float_overflow_dead",
+      "setup": [
+        "CREATE TABLE t(v DOUBLE PRECISION)",
+        "INSERT INTO t VALUES('1e308'::float8),('1e308'::float8)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(v) AS dead FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_float_overflow_live",
+      "setup": [
+        "CREATE TABLE t(v DOUBLE PRECISION)",
+        "INSERT INTO t VALUES('1e308'::float8),('1e308'::float8)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT x FROM (SELECT sum(v) AS x FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "22003",
+            "error_class": "NumericValueOutOfRange",
+            "message": "value out of range: overflow"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_rollup_cardinality",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/(v-1)) AS dead FROM t GROUP BY ROLLUP(v)) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ],
+              [
+                7
+              ],
+              [
+                7
+              ],
+              [
+                7
+              ]
+            ],
+            "rowcount": 4,
+            "status": "SELECT 4"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_live_having_group",
+      "setup": [
+        "CREATE TABLE t(v INT)",
+        "INSERT INTO t VALUES(1),(1),(2),(NULL)",
+        "CREATE SEQUENCE seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT g,n FROM (SELECT v AS g,count(*) AS n,sum(1/(v-1)) AS dead FROM t GROUP BY v HAVING count(*)>1) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "g",
+                "oid": 23
+              },
+              {
+                "name": "n",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1,
+                2
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
     }
-  ]
+  ],
+  "expanded_capture_sha256": "c248c54f3c252142598cb727707de138977aaa61661eabd07a56e1ed8db3cf46"
 }

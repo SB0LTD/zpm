@@ -1,6 +1,22 @@
 # Aggregate-state demand gap-closing plan
 
 Status: test-first investigation on a separate branch; implementation is missing.
+
+Current expanded checkpoint:50 native16.15 programs, with25 matching and25 gaps
+in the standalone core test (expected exit1). All50 native observations replay
+through the public verifier. The initial16-case record below remains historical.
+The expanded test generates deterministically from the fixture, compares NULLs,
+column names/OIDs, row bags and sequence effects, and adds duplicate keys,
+empty groups, selective HAVING, row-dependent failures, FILTER/DISTINCT,
+deduplication, semantic errors and volatile controls. It does not prove optimized
+path coverage or close the runtime gap. Independent expansion review and PG18
+characterization remain pending.
+
+A separate finding records NumericCapacity for untyped1e308 assigned to float8
+under the64-digit numeric configuration. The initial observation is preserved in
+aggregate_literal_capacity_open.json; explicit text-to-float8 input in the SUM
+overflow cases isolates aggregation and does not close the literal capacity limit.
+
 This does not change the original118-program inventory or claim SQL compatibility.
 The baseline is ZPM ef6e3c0486ca76a3bfe70f3d91acda22c7491c16, still under hosted
 qualification in PR97 when these observations were captured.
@@ -12,7 +28,7 @@ CTE needs that aggregate result. Volatile sequence calls must retain their nativ
 effects. Simply removing a binder barrier would hide required dependencies while
 leaving optimized aggregate execution inconsistent.
 
-Sixteen probes match native PostgreSQL16.15 reference observations at the wire.
+Historical initial16 checkpoint: sixteen probes match native PostgreSQL16.15 reference observations at the wire.
 On the baseline, six match and ten expose gaps. The standalone allocator-free
 contract reproduces exactly6matches/10gaps, exits1 SqlAggregateDemandIncomplete,
 and checks OIDs, integer values, row counts and sequence effects. It is deliberately
@@ -111,3 +127,22 @@ helper on native16.15 (all16pass) and verified that an intentionally wrong major
 exits2 with a harness error. The remaining group-cardinality, transition-path and
 qualification findings stay open with stable IDs in aggregate_demand_red_evidence.json.
 No runtime fix or merge readiness follows from this test-harness improvement.
+
+## Expanded corpus reproduction and CI calibration
+
+Regenerate/check the standalone contract from the frozen fixture with:
+
+```text
+python tools/generate_sql_aggregate_demand.py
+python tools/generate_sql_aggregate_demand.py --check
+```
+
+Use the same compiler argv above; the expanded baseline must report25matching /
+25gaps /50programs and exit1. The public native verifier now replays50programs,
+with a fresh connection and TEMP objects for each case, including case-specific
+setup. Native16 and18 still require independent verification.
+
+An explicit workflow_dispatch native_oracles_only=true mode runs only native
+oracle calibration. It skips host builds and is NOT full qualification; push and
+pull_request keep all host gates. This supports fixture/version calibration
+without claiming green runtime implementation or spending a full host matrix.
