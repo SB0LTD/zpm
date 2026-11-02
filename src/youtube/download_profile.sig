@@ -1,6 +1,8 @@
 // Opt-in, caller-owned wall-clock profiling for native YouTube downloads.
 // Nested timings overlap: VM/exchange are inside tokens; HTTP/UMP/sink/sleep
 // are inside transfer. UMP includes sink time. No clocks run when disabled.
+const builtin = @import("builtin");
+const std = @import("std");
 extern "kernel32" fn QueryPerformanceCounter(*i64) c_int;
 extern "kernel32" fn QueryPerformanceFrequency(*i64) c_int;
 var frequency: u64 = 0;
@@ -68,6 +70,12 @@ pub const Profile = struct {
 
 pub fn clock(profile: ?*Profile) u64 {
     if (profile == null) return 0;
+    if (builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.errno(std.os.linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    }
+    if (builtin.os.tag != .windows) return 0;
     if (frequency == 0) {
         var value: i64 = 0;
         if (QueryPerformanceFrequency(&value) == 0 or value <= 0) return 0;
@@ -96,4 +104,13 @@ test "profile: bounded samples retain aggregate counts after overflow" {
     try testing.expectEqual(@as(u64, (p.samples.len + 3) * 7), p.http_ns);
     try testing.expectEqual(@as(u64, (p.samples.len + 3) * 11), p.response_bytes);
     try testing.expectEqual(@as(u64, 0), clock(null));
+}
+
+test "profile: enabled native host clocks advance monotonically" {
+    if (builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
+    var profile: Profile = .{};
+    const first = clock(&profile);
+    const second = clock(&profile);
+    try std.testing.expect(first > 0 and second >= first);
+    try std.testing.expectEqual(@as(u64, 0), clock(null));
 }

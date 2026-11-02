@@ -508,14 +508,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("protobuf", "src/core/protobuf.sig"),
     });
     _ = try addTest(ctx, test_all, "test-sabr-player-fields", "src/youtube/sabr/player_fields.sig", &.{});
-    _ = try addTest(ctx, test_all, "test-sabr-loop", "src/youtube/sabr/stream.sig", &.{
+    _ = try addTest(ctx, test_all, "test-sabr-loop", "src/youtube_sabr_test.sig", &.{
         importEntry("protobuf", "src/core/protobuf.sig"),
         importEntry("youtube_net", "src/youtube/net.sig"),
         importEntry("zpm_http", "src/net/http/client.sig"),
         importEntry("tls_client", "src/core/crypto/tls/client.sig"),
         importEntry("win32", win32_path),
     });
-    _ = try addTest(ctx, test_all, "test-manifest-sabr", "src/youtube/manifest.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-manifest-sabr", "src/youtube_manifest_test.sig", &.{});
     const jsonl = try ctx.addModule("jsonl", "src/core/jsonl.sig");
     try wire(ctx, jsonl, "json", "src/core/json.sig");
     try wire(ctx, jsonl, "sig_mem", "src/core/sig_mem.sig");
