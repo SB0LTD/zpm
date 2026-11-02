@@ -9,8 +9,9 @@ The expanded test generates deterministically from the fixture, compares NULLs,
 column names/OIDs, row bags and sequence effects, and adds duplicate keys,
 empty groups, selective HAVING, row-dependent failures, FILTER/DISTINCT,
 deduplication, semantic errors and volatile controls. It does not prove optimized
-path coverage or close the runtime gap. Independent expansion review and PG18
-characterization remain pending.
+path coverage or close the runtime gap. Independent expansion review reproduced25/25/50, and native PG16.15/18.3
+calibration each passed all50 expectations. These remain finite native observations,
+not full host/runtime qualification.
 
 A separate finding records NumericCapacity for untyped1e308 assigned to float8
 under the64-digit numeric configuration. The initial observation is preserved in
@@ -115,8 +116,9 @@ sig build-exe --Sig-lib-dir <matched-SDK-lib> -OReleaseSafe --dep sql "-Mroot=te
 <output-executable>
 ```
 
-Compilation must exit0; the baseline executable must exit1 with
-SqlAggregateDemandIncomplete and6passing/10gaps/16programs. A later corrected
+Compilation must exit0; the current expanded baseline executable must exit1 with
+SqlAggregateDemandIncomplete and25passing/25gaps/50programs. The historical
+initial16 version reported6passing/10gaps; it is not the current checkout. A later corrected
 implementation needs expanded passing contracts and the full qualification gates,
 not this baseline red result. Frozen16 fixture fields cover integer OIDs, names,
 values, row counts, command tags, SQLSTATE and sequence effects; the public
@@ -140,9 +142,22 @@ python tools/generate_sql_aggregate_demand.py --check
 Use the same compiler argv above; the expanded baseline must report25matching /
 25gaps /50programs and exit1. The public native verifier now replays50programs,
 with a fresh connection and TEMP objects for each case, including case-specific
-setup. Native16 and18 still require independent verification.
+setup. Native16.15 was independently replayed, and hosted16.15/18.3 each passed50cases
+in run41407604728. Oracle-only calibration does not count as host qualification.
 
 An explicit workflow_dispatch native_oracles_only=true mode runs only native
 oracle calibration. It skips host builds and is NOT full qualification; push and
 pull_request keep all host gates. This supports fixture/version calibration
 without claiming green runtime implementation or spending a full host matrix.
+
+## Expanded independent review checkpoint
+
+Fresh review reproduced the generated25/25/50 core result, replayed50 native16.15
+programs, checked both hosted16.15/18.3 reports, and independently reproduced the
+numeric-literal capacity finding and successful explicit float8 input. No blocking
+harness/oracle-mode defect was found. Its stale reproduction-count note is fixed.
+
+AGG-TRANSITION-01 remains open: this generated database has factorized_aggregates
+and typed_grouped_aggregates disabled. There are no join/external-storage fixtures
+or path assertions. Passing these50 cases after a generic fix would not establish
+streaming/factorized correctness or justify a release claiming the gap is closed.

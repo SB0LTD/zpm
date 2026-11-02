@@ -48,9 +48,11 @@
     ".scratch/aggregate-demand-expansion/compile-final.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     ".scratch/aggregate-demand-expansion/native-capture-cast.json": "c248c54f3c252142598cb727707de138977aaa61661eabd07a56e1ed8db3cf46",
     ".scratch/aggregate-demand-expansion/native-public.json": "5ffd4a43af129415ff3e818021c884f97a473c117731dd3208fb0eb4b4b49e44",
-    ".scratch/aggregate-demand-expansion/initial-core-red.log": "2f62ca6dbff1f6cbdb9939a6c052648cbfdf8a3a77f6254fbfcfa3cece514a02"
+    ".scratch/aggregate-demand-expansion/initial-core-red.log": "2f62ca6dbff1f6cbdb9939a6c052648cbfdf8a3a77f6254fbfcfa3cece514a02",
+    ".scratch/aggregate-demand-expansion/hosted-pg16/aggregate-demand-oracle.json": "9695d4246bdf0682de84f74933d4067f1212b77cc7ab382ebf6fd38cf3c85df7",
+    ".scratch/aggregate-demand-expansion/hosted-pg18/aggregate-demand-oracle.json": "df89f7ac14f97fdf0152cab8adf05d22c5d691214a74819ee224d928a2ffaff6"
   },
-  "review_status": "Expanded50 corpus and oracle-only CI mode pending independent review. Initial16 expectations and public verifier independently reviewed.",
+  "review_status": "Expanded50 corpus/oracle-only mode independently reviewed; no blocking defect. Current reproduction-count doc note corrected. Runtime implementation remains missing.",
   "remaining": [
     "Generic/streaming/factorized path-specific proof",
     "Prepared/binary and PG18 native characterization",
@@ -158,5 +160,38 @@
       }
     ]
   },
-  "original_118_program_inventory": "Unchanged; do not add these50 to its pass count"
+  "original_118_program_inventory": "Unchanged; do not add these50 to its pass count",
+  "hosted_native_calibration": {
+    "run": 41407604728,
+    "event": "workflow_dispatch",
+    "input_native_oracles_only": true,
+    "head": "7aa76afd29d81c4db4aaf697dabd66aa69372c68",
+    "reports": [
+      {
+        "version": "160015",
+        "cases": 50,
+        "failures": 0
+      },
+      {
+        "version": "180003",
+        "cases": 50,
+        "failures": 0
+      }
+    ],
+    "host_job": "intentionally skipped; not full qualification"
+  },
+  "independent_expansion_review": {
+    "head": "7aa76afd29d81c4db4aaf697dabd66aa69372c68",
+    "compile_exit": 0,
+    "run_exit": 1,
+    "matching": 25,
+    "gaps": 25,
+    "native16_cases": 50,
+    "wrong_major_exit": 2,
+    "capacity_probe_reproduced": true,
+    "findings": [
+      "Doc reproduction count corrected",
+      "Physical-path coverage remains insufficient; AGG-TRANSITION-01 open"
+    ]
+  }
 }

@@ -7,8 +7,9 @@ allocator-free core contract, with expected SqlAggregateDemandIncomplete exit1.
 These probes do not change the original118-program audit. Runtime aggregate-state
 liveness is not implemented. Duplicate groups, NULL/empty aggregates, row-dependent
 errors, FILTER/DISTINCT, volatility and semantic errors now have frozen probes.
-Path-specific proof, PG18, parameters, cancellation/reuse and full qualification
-remain open. See [the closing plan](SQL_AGGREGATE_DEMAND_PLAN.md). A separate
+Native16.15/18.3 expectations each replay50/50 in oracle-calibration CI41407604728.
+Path-specific proof, parameters, cancellation/reuse and full implementation
+qualification remain open. See [the closing plan](SQL_AGGREGATE_DEMAND_PLAN.md). A separate
 high-exponent numeric-literal capacity finding is retained rather than hidden by
 the explicit float8 inputs used to isolate aggregate overflow.
 
