@@ -1031,6 +1031,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const lfm3_audio_encoder = try ctx.addModule("lfm3_audio_encoder", "src/core/lfm3_audio_encoder.sig");
     try wire(ctx, lfm3_audio_encoder, "gguf", "src/core/gguf.sig");
     try wire(ctx, lfm3_audio_encoder, "lfm3_audio_ops", "src/core/lfm3_audio_ops.sig");
+    const lfm3_audio_gen = try ctx.addModule("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig");
+    try wire(ctx, lfm3_audio_gen, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_audio_gen, "lfm3_audio_ops", "src/core/lfm3_audio_ops.sig");
     const test_lfm3_audio = try ctx.addStep("test-lfm3-audio", "Execute LFM3-Audio front end, encoder and speech generation contracts", &noopStep);
     try ctx.addDependency(test_all, test_lfm3_audio);
     _ = try addTest(ctx, test_lfm3_audio, "test-lfm3-audio-mel", "src/core/lfm3_audio_mel.sig", &.{});
@@ -1039,6 +1042,17 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
         importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
         importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+    });
+    _ = try addTest(ctx, test_lfm3_audio, "test-lfm3-audio-gen", "src/core/lfm3_audio_gen.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig"),
+    });
+    _ = try addContract(ctx, test_lfm3_audio, "contract-lfm3-audio", "tests/test_lfm3_audio.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig"),
+        importEntry("lfm3_audio_encoder", "src/core/lfm3_audio_encoder.sig"),
+        importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
     });
     _ = try ctx.addCompileStep(.{
         .source_path = "tools/lfm3_run.sig",
@@ -1058,6 +1072,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("lfm3_audio_mel", "src/core/lfm3_audio_mel.sig"),
             importEntry("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig"),
             importEntry("lfm3_audio_encoder", "src/core/lfm3_audio_encoder.sig"),
+            importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
         },
     });
 

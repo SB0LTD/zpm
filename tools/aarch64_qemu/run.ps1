@@ -1,4 +1,4 @@
-# Run the quantized-kernel tests and the LFM3 contract on emulated AArch64
+# Run the quantized-kernel tests, the LFM3 contract and the LFM3-Audio suites on emulated AArch64
 # (QEMU `virt`, -cpu max) built for the Surface Laptop's Snapdragon X
 # features, from an x86 Windows host. runner.sig is the bare-metal test
 # runner; each suite prints its tests and the script fails on the first
@@ -43,6 +43,10 @@ try {
         tokenizer        = @("src/core/tokenizer.sig", "sig_math", "sig_mem", "gguf", "tokenizer_index")
         unicode_class    = @("src/core/unicode_class.sig")
         lfm3_tokenizer   = @("src/core/lfm3_tokenizer.sig", "sig_mem", "gguf", "tokenizer", "unicode_class")
+        lfm3_audio_mel   = @("src/core/lfm3_audio_mel.sig")
+        lfm3_audio_ops   = @("src/core/lfm3_audio_ops.sig", "gguf", "quantized_linear", "lfm3_executor", "lfm3_plan")
+        lfm3_audio_encoder = @("src/core/lfm3_audio_encoder.sig", "gguf", "lfm3_audio_ops")
+        lfm3_audio_gen   = @("src/core/lfm3_audio_gen.sig", "gguf", "lfm3_audio_ops")
         worker_thread    = @("src/platform/worker_thread.sig")
         sig_process      = @("$lib/sig/process.sig")
     }
@@ -66,7 +70,12 @@ try {
 
     $suites = @(
         @{ Name = "quantized_linear"; Root = "src/core/quantized_linear.sig"; Imports = @() },
-        @{ Name = "lfm3"; Root = "tests/test_lfm3.sig"; Imports = @("gguf", "lfm3_plan", "lfm3_executor", "lfm3_tokenizer", "quantized_linear") }
+        @{ Name = "lfm3"; Root = "tests/test_lfm3.sig"; Imports = @("gguf", "lfm3_plan", "lfm3_executor", "lfm3_tokenizer", "quantized_linear") },
+        @{ Name = "gguf"; Root = "src/core/gguf.sig"; Imports = @("sig_math", "sig_mem") },
+        @{ Name = "lfm3_audio_mel"; Root = "src/core/lfm3_audio_mel.sig"; Imports = @() },
+        @{ Name = "lfm3_audio_ops"; Root = "src/core/lfm3_audio_ops.sig"; Imports = @("gguf", "quantized_linear", "lfm3_executor", "lfm3_plan") },
+        @{ Name = "lfm3_audio_gen"; Root = "src/core/lfm3_audio_gen.sig"; Imports = @("gguf", "lfm3_audio_ops") },
+        @{ Name = "lfm3_audio"; Root = "tests/test_lfm3_audio.sig"; Imports = @("gguf", "quantized_linear", "lfm3_audio_ops", "lfm3_audio_encoder", "lfm3_audio_gen") }
     )
     foreach ($suite in $suites) {
         $elf = Join-Path $out "$($suite.Name)-tests.elf"
@@ -80,7 +89,7 @@ try {
 
     if ($HostRunner) {
         $exe = Join-Path $out "lfm3-run.exe"
-        $imports = @("sig_process", "gguf", "lfm3_plan", "lfm3_executor", "lfm3_tokenizer", "tokenizer_index", "worker_thread")
+        $imports = @("sig_process", "gguf", "lfm3_plan", "lfm3_executor", "lfm3_tokenizer", "tokenizer_index", "worker_thread", "lfm3_audio_mel", "lfm3_audio_ops", "lfm3_audio_encoder", "lfm3_audio_gen")
         & $sig build-exe -target aarch64-windows "-mcpu=$Cpu" -O $Optimize @(Module-Arguments "tools/lfm3_run.sig" $imports) "-femit-bin=$exe"
         if ($LASTEXITCODE -ne 0) { throw "lfm3-run: build failed" }
         Write-Host "`nWindows on ARM runner: $exe"

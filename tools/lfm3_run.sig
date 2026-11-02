@@ -7,7 +7,17 @@
 //!   lfm3-run <model.gguf> raw <threads> <max_new> <text>
 //!   lfm3-run <model.gguf> bench <threads> <prompt_tokens> <generated_tokens>
 //!   lfm3-run <model.gguf> asr <threads> <max_new> <mmproj.gguf> <16k-mono.wav> [dump_prefix]
-//!   lfm3-run <model.gguf> tts <threads> <max_frames> <mmproj.gguf> <female|male> <seed> <out.f32> <text>
+//!   lfm3-run <model.gguf> tts <threads> <max_frames> <mmproj.gguf> <female|male> <seed> <greedy|sample> <out.f32> <text>
+//!   lfm3-run <model.gguf> tts-forced <threads> 0 <mmproj.gguf> <seed> <reference_prefix> <out.f32>
+//!
+//! asr prints the prompt ids, the greedy transcript and timings; with a dump
+//! prefix it writes the mel frames, the audio rows and the first encoder
+//! chunk's traced layers (llama.cpp's tensor names) as raw f32. tts writes
+//! raw f32 PCM at 24 kHz and `<out>.h.bin`, the text model's hidden state of
+//! every frame. tts-forced replays a llama.cpp harness run (`<ref>.txt`,
+//! `<ref>.h.bin`, `<ref>.pcm.f32`): its hidden states and codes in, codes
+//! and waveform compared, the codec's first twelve frames traced next to
+//! `<out>`.
 const std = @import("std");
 const builtin = @import("builtin");
 const process = @import("sig_process");
@@ -19,6 +29,7 @@ const indexes = @import("tokenizer_index");
 const worker = @import("worker_thread");
 const mel = @import("lfm3_audio_mel");
 const encoder = @import("lfm3_audio_encoder");
+const speech = @import("lfm3_audio_gen");
 
 const capacity = 512;
 const limits = executor.lfm3_audio_2b_limits;
@@ -231,7 +242,7 @@ pub fn main(init: std.process.Init) !void {
     if (raw_mode.len > mode_buffer.len) return error.InvalidArguments;
     @memcpy(mode_buffer[0..raw_mode.len], raw_mode);
     const mode = mode_buffer[0..raw_mode.len];
-    if (std.mem.eql(u8, mode, "asr") or std.mem.eql(u8, mode, "tts")) return audioMain(init, &argv, path, mode);
+    if (std.mem.eql(u8, mode, "asr") or std.mem.eql(u8, mode, "tts") or std.mem.eql(u8, mode, "tts-forced")) return audioMain(init, &argv, path, mode);
     var numbers: [3]usize = @splat(0);
     const numeric = !std.mem.eql(u8, mode, "tokens");
     const numeric_count: usize = if (std.mem.eql(u8, mode, "bench")) 3 else if (numeric) 2 else 0;
@@ -513,8 +524,27 @@ fn audioMain(init: std.process.Init, argv: anytype, model_path: []const u8, mode
             break :blk dump_buffer[0..raw.len];
         } else null;
         try hear(init.io, out, source, audio_source, &cache, parallel, wav_path, maximum, dump);
+    } else if (std.mem.eql(u8, mode, "tts-forced")) {
+        var seed_buffer: [16]u8 = undefined;
+        var reference_buffer: [4096]u8 = undefined;
+        var path_buffer: [4096]u8 = undefined;
+        const seed = try std.fmt.parseInt(u32, try nextArgument(argv, &seed_buffer), 10);
+        const reference = try nextArgument(argv, &reference_buffer);
+        const pcm_path = try nextArgument(argv, &path_buffer);
+        try speakForced(init.io, out, audio_source, parallel, seed, reference, pcm_path);
     } else {
-        return error.InvalidArguments;
+        var voice_buffer: [16]u8 = undefined;
+        var seed_buffer: [16]u8 = undefined;
+        var how_buffer: [16]u8 = undefined;
+        var path_buffer: [4096]u8 = undefined;
+        var text_buffer_tts: [2048]u8 = undefined;
+        const voice = try nextArgument(argv, &voice_buffer);
+        if (!std.mem.eql(u8, voice, "female") and !std.mem.eql(u8, voice, "male")) return error.InvalidArguments;
+        const seed = try std.fmt.parseInt(u32, try nextArgument(argv, &seed_buffer), 10);
+        const how = try nextArgument(argv, &how_buffer);
+        const pcm_path = try nextArgument(argv, &path_buffer);
+        const text = try nextArgument(argv, &text_buffer_tts);
+        try speak(init.io, out, source, audio_source, &cache, parallel, maximum, voice, seed, std.mem.eql(u8, how, "greedy"), pcm_path, text);
     }
     try out.flush();
 }
@@ -604,5 +634,276 @@ fn hear(io: std.Io, out: anytype, source: gguf.Source, audio_source: gguf.Source
     }
     try out.print("\ntiming mel_ms={d:.1} encode_ms={d:.1} prompt_tokens={d} prompt_ms={d:.1} decode_steps={d} decode_ms={d:.1}\n", .{
         milliseconds(mel_ns), milliseconds(encode_ns), prefix_count + rows + suffix_count, milliseconds(prompt_ns), generated -| 1, milliseconds(decode_ns),
+    });
+}
+
+const gen_limits = speech.lfm3_audio_limits;
+const MAX_SPOKEN_FRAMES = 1024;
+var gen_plan: speech.Plan = .{};
+var depth_work: speech.DepthWorkspace(gen_limits) = .{};
+var codec_state: speech.CodecState(gen_limits) = .{};
+var codec_work: speech.CodecWorkspace(gen_limits) = .{};
+var pcm: [MAX_SPOKEN_FRAMES * speech.SAMPLES_PER_FRAME + speech.FFT_SIZE]f32 = undefined;
+var hidden_states: [MAX_SPOKEN_FRAMES * 2048]f32 = undefined;
+var feedback_row: [2048]f32 = undefined;
+var feedback_scratch: [speech.CODEBOOKS * 2048]f32 = undefined;
+
+/// LFM3-Audio's "tts" chat template (lang "en"; voice female or male).
+fn ttsPrompt(buffer: []u8, voice: []const u8, text: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "<|startoftext|><|im_start|>system\nPerform TTS in American English using a {s} voice.<|im_end|>\n" ++
+        "<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n<|audio_start|>", .{ voice, text });
+}
+
+/// Writes every traced call to `<prefix>.<name>.<call>.bin` (llama.cpp
+/// harness naming), for the first `limit` calls of each name.
+const TraceCalls = struct {
+    io: std.Io,
+    prefix: []const u8,
+    limit: usize,
+    names: [4][32]u8 = undefined,
+    lengths: [4]usize = @splat(0),
+    counts: [4]usize = @splat(0),
+    used: usize = 0,
+
+    fn emit(context: ?*anyopaque, name: []const u8, layer: ?usize, values: []const f32) void {
+        _ = layer;
+        const self: *TraceCalls = @ptrCast(@alignCast(context.?));
+        var slot: usize = 0;
+        while (slot < self.used and !std.mem.eql(u8, self.names[slot][0..self.lengths[slot]], name)) slot += 1;
+        if (slot == self.used) {
+            if (self.used == self.names.len or name.len > 32) return;
+            @memcpy(self.names[slot][0..name.len], name);
+            self.lengths[slot] = name.len;
+            self.used += 1;
+        }
+        const call = self.counts[slot];
+        self.counts[slot] += 1;
+        if (call >= self.limit) return;
+        var suffix: [96]u8 = undefined;
+        const tail = std.fmt.bufPrint(&suffix, ".{s}.{d}.bin", .{ name, call }) catch return;
+        writeFloats(self.io, self.prefix, tail, values) catch {};
+    }
+};
+
+fn speak(io: std.Io, out: anytype, source: gguf.Source, audio_source: gguf.Source, cache: *executor.Cache, parallel: executor.Parallel, maximum: usize, voice: []const u8, seed: u32, greedy: bool, pcm_path: []const u8, text: []const u8) !void {
+    try speech.build(audio_capacity, audio_source, &audio_index, &gen_plan);
+    if (gen_plan.backbone != plan.hidden_size) return error.InvalidModel;
+    if (maximum > MAX_SPOKEN_FRAMES) return error.InvalidArguments;
+    try out.print("speech depth layers={d} codec layers={d} conv={d} attention={d} vocabulary={d} sampling temp={d:.2} top_k={d} penalty={d:.2}/{d}\n", .{
+        gen_plan.depth.layer_count, gen_plan.codec.layer_count, gen_plan.codec.conv_layer_count, gen_plan.codec.attention_layer_count,
+        gen_plan.vocabulary, gen_plan.temperature, gen_plan.top_k, gen_plan.penalty, gen_plan.penalty_window,
+    });
+    var prompt_buffer: [4096]u8 = undefined;
+    const prompt = try ttsPrompt(&prompt_buffer, voice, text);
+    const prompt_count = try codec.encode(source, &vocabulary, &merges, &specials, prompt, true, &tokens);
+    try printIds(out, "prompt_ids", tokens[0..prompt_count]);
+    if (prompt_count + maximum + 1 > limits.context) return error.ContextCapacity;
+
+    var sampling = speech.modelSampling(&gen_plan, seed);
+    if (greedy) sampling.temperature = 0;
+    var speaker = speech.Speaker(gen_limits).init(sampling);
+    codec_state.reset();
+    const hidden = plan.hidden_size;
+
+    const prompt_start = now(io);
+    _ = try feed(source, cache, .{ .tokens = tokens[0..prompt_count] }, .hidden, parallel);
+    const prompt_ns = now(io) - prompt_start;
+    var h = hidden_states[0..hidden];
+    @memcpy(h, work.normalized[0..hidden]);
+    var samples_out: usize = 0;
+    var frames: usize = 0;
+    var ended = false;
+    var code_ns: i96 = 0;
+    var wav_ns: i96 = 0;
+    var back_ns: i96 = 0;
+    while (frames < maximum) : (frames += 1) {
+        const code_start = now(io);
+        const step = try speaker.frame(audio_capacity, audio_source, &audio_index, &gen_plan, &depth_work, h, parallel);
+        try out.print("frame={d} codes=", .{frames});
+        for (step.codes, 0..) |code, book| try out.print("{s}{d}", .{ if (book == 0) "" else ",", code });
+        try out.writeByte('\n');
+        if (step.end) {
+            code_ns += now(io) - code_start;
+            ended = true;
+            break;
+        }
+        try speech.feedback(audio_capacity, audio_source, &audio_index, &gen_plan, &step.codes, &feedback_row, &feedback_scratch);
+        code_ns += now(io) - code_start;
+        const wav_start = now(io);
+        samples_out += try speech.decode(audio_capacity, gen_limits, audio_source, &audio_index, &gen_plan, &codec_state, &codec_work, &step.codes, pcm[samples_out..], parallel);
+        wav_ns += now(io) - wav_start;
+        const back_start = now(io);
+        _ = try feed(source, cache, .{ .embeddings = &feedback_row }, .hidden, parallel);
+        back_ns += now(io) - back_start;
+        h = hidden_states[(frames + 1) * hidden ..][0..hidden];
+        @memcpy(h, work.normalized[0..hidden]);
+    }
+    samples_out += try speech.finish(gen_limits, &codec_state, pcm[samples_out..]);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = pcm_path, .data = std.mem.sliceAsBytes(pcm[0..samples_out]) });
+    try writeFloats(io, pcm_path, ".h.bin", hidden_states[0 .. frames * hidden]);
+    try out.print("frames={d} eos={d} samples={d}\n", .{ frames, @intFromBool(ended), samples_out });
+    try out.print("timing prompt_tokens={d} prompt_ms={d:.1} code_ms={d:.1} wav_ms={d:.1} backbone_ms={d:.1} audio_s={d:.2}\n", .{
+        prompt_count, milliseconds(prompt_ns), milliseconds(code_ns), milliseconds(wav_ns), milliseconds(back_ns),
+        @as(f64, @floatFromInt(samples_out)) / speech.SAMPLE_RATE,
+    });
+}
+
+var reference_text: [1 << 20]u8 = undefined;
+var reference_pcm_bytes: [(MAX_SPOKEN_FRAMES * speech.SAMPLES_PER_FRAME + speech.FFT_SIZE) * 4]u8 = undefined;
+var reference_hidden_bytes: [MAX_SPOKEN_FRAMES * 2048 * 4]u8 align(4) = undefined;
+
+/// Comma-separated integers after `key=` on `line`.
+fn parseList(line: []const u8, key: []const u8, out: []i32) !usize {
+    const at = std.mem.indexOf(u8, line, key) orelse return error.InvalidReference;
+    var rest = line[at + key.len ..];
+    if (std.mem.indexOfAny(u8, rest, " \r")) |end| rest = rest[0..end];
+    var count: usize = 0;
+    var fields = std.mem.splitScalar(u8, rest, ',');
+    while (fields.next()) |field| {
+        if (count == out.len) return error.InvalidReference;
+        out[count] = try std.fmt.parseInt(i32, field, 10);
+        count += 1;
+    }
+    return count;
+}
+
+/// Teacher-forced speech parity against a llama.cpp harness run
+/// (`<ref>.txt` frame lines, `<ref>.h.bin` hidden states, `<ref>.pcm.f32`):
+/// each frame is sampled from llama.cpp's hidden state with the same reveal
+/// order, the history keeps llama.cpp's codes, and llama.cpp's codes are
+/// decoded; codes must match exactly and the waveform within tolerance.
+const ops_negative: f32 = -std.math.inf(f32);
+
+/// Smallest top-1 minus top-2 logit gaps over every pick of a forced run.
+const Margins = struct {
+    smallest: [5]f32 = @splat(std.math.inf(f32)),
+    count: usize = 0,
+
+    fn record(self: *Margins, gap: f32) void {
+        self.count += 1;
+        var i: usize = self.smallest.len;
+        while (i > 0 and gap < self.smallest[i - 1]) : (i -= 1) {
+            if (i < self.smallest.len) self.smallest[i] = self.smallest[i - 1];
+        }
+        if (i < self.smallest.len) self.smallest[i] = gap;
+    }
+};
+var margins: Margins = .{};
+
+fn speakForced(io: std.Io, out: anytype, audio_source: gguf.Source, parallel: executor.Parallel, seed: u32, reference: []const u8, pcm_path: []const u8) !void {
+    try speech.build(audio_capacity, audio_source, &audio_index, &gen_plan);
+    var name: [1024]u8 = undefined;
+    const text = try std.Io.Dir.cwd().readFile(io, try std.fmt.bufPrint(&name, "{s}.txt", .{reference}), &reference_text);
+    const hidden_bytes = try std.Io.Dir.cwd().readFile(io, try std.fmt.bufPrint(&name, "{s}.h.bin", .{reference}), &reference_hidden_bytes);
+    const pcm_bytes = try std.Io.Dir.cwd().readFile(io, try std.fmt.bufPrint(&name, "{s}.pcm.f32", .{reference}), &reference_pcm_bytes);
+    const hidden_rows: []const f32 = @as([*]const f32, @ptrCast(@alignCast(hidden_bytes.ptr)))[0 .. hidden_bytes.len / 4];
+    const width = gen_plan.backbone;
+
+    var speaker = speech.Speaker(gen_limits).init(.{ .temperature = 0, .top_k = 0, .penalty = gen_plan.penalty, .penalty_window = gen_plan.penalty_window, .seed = seed });
+    var order_rng = speech.Mt19937.init(seed);
+    var trace_calls = TraceCalls{ .io = io, .prefix = pcm_path, .limit = 12 };
+    codec_work.trace = .{ .context = &trace_calls, .emit = &TraceCalls.emit };
+    codec_state.reset();
+    var frames: usize = 0;
+    var matched: usize = 0;
+    var order_matched: usize = 0;
+    var samples_out: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var start = now(io);
+    var code_ns: i96 = 0;
+    var wav_ns: i96 = 0;
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "frame=")) continue;
+        var expected: [speech.CODEBOOKS]i32 = undefined;
+        var expected_order: [speech.CODEBOOKS]i32 = undefined;
+        if (try parseList(line, "codes=", &expected) != speech.CODEBOOKS) return error.InvalidReference;
+        if (try parseList(line, "order=", &expected_order) != speech.CODEBOOKS) return error.InvalidReference;
+        if ((frames + 1) * width > hidden_rows.len) return error.InvalidReference;
+        const order = speech.frameOrder(&order_rng);
+        var same_order = true;
+        for (order, expected_order) |a, b| same_order = same_order and a == b;
+        order_matched += @intFromBool(same_order);
+
+        start = now(io);
+        const step = try speaker.frame(audio_capacity, audio_source, &audio_index, &gen_plan, &depth_work, hidden_rows[frames * width ..][0..width], parallel);
+        code_ns += now(io) - start;
+        // Logit gaps of the reference's picks: the passes again, revealing
+        // llama.cpp's codes, recording top-1 minus the reference code's logit.
+        {
+            var revealed: [speech.CODEBOOKS]i32 = @splat(-1);
+            var at: usize = 0;
+            try speech.projectState(audio_capacity, gen_limits, audio_source, &audio_index, &gen_plan, &depth_work, hidden_rows[frames * width ..][0..width], parallel);
+            for (speech.SCHEDULE) |count| {
+                try speech.codePass(audio_capacity, gen_limits, audio_source, &audio_index, &gen_plan, &depth_work, &revealed, parallel);
+                for (0..count) |_| {
+                    const book: usize = order[at];
+                    at += 1;
+                    const logits = depth_work.logits[book * gen_plan.vocabulary ..][0..gen_plan.vocabulary];
+                    // The history at this frame already holds this frame's codes when
+                    // they did not end the audio; penalize against the frames before.
+                    const saved = speaker.frames;
+                    if (!step.end) speaker.frames -= 1;
+                    speaker.penalize(logits, book);
+                    speaker.frames = saved;
+                    var best: usize = 0;
+                    var second: f32 = ops_negative;
+                    for (logits, 0..) |value, code| if (value > logits[best]) {
+                        best = code;
+                    };
+                    for (logits, 0..) |value, code| if (code != best and value > second) {
+                        second = value;
+                    };
+                    const target: usize = @intCast(expected[book]);
+                    margins.record(logits[best] - second);
+                    if (target != best) try out.print("frame={d} book={d} near-tie: zpm top {d} ({d:.5}) ref {d} ({d:.5}) gap {d:.5}\n", .{ frames, book, best, logits[best], target, logits[target], logits[best] - logits[target] });
+                    revealed[book] = expected[book];
+                }
+            }
+        }
+        var expected_end = false;
+        for (expected) |code| expected_end = expected_end or code == gen_plan.endCode();
+        const same = if (expected_end) step.end else std.mem.eql(i32, &step.codes, &expected);
+        matched += @intFromBool(same);
+        if (!same) {
+            try out.print("frame={d} MISMATCH zpm=", .{frames});
+            for (step.codes, 0..) |code, book| try out.print("{s}{d}", .{ if (book == 0) "" else ",", code });
+            try out.print(" ref=", .{});
+            for (expected, 0..) |code, book| try out.print("{s}{d}", .{ if (book == 0) "" else ",", code });
+            try out.writeByte('\n');
+        }
+        frames += 1;
+        const end_code = gen_plan.endCode();
+        var ended = false;
+        for (expected) |code| ended = ended or code == end_code;
+        if (ended) break;
+        // The history follows llama.cpp's codes.
+        if (!step.end and speaker.frames > 0) {
+            for (&speaker.history[@min(speaker.frames, gen_limits.history) - 1], expected) |*slot, code| slot.* = @intCast(code);
+        }
+        if (frames == 1) {
+            try speech.feedback(audio_capacity, audio_source, &audio_index, &gen_plan, &expected, &feedback_row, &feedback_scratch);
+            try writeFloats(io, pcm_path, ".fb0.bin", &feedback_row);
+        }
+        start = now(io);
+        samples_out += try speech.decode(audio_capacity, gen_limits, audio_source, &audio_index, &gen_plan, &codec_state, &codec_work, &expected, pcm[samples_out..], parallel);
+        wav_ns += now(io) - start;
+    }
+    samples_out += try speech.finish(gen_limits, &codec_state, pcm[samples_out..]);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = pcm_path, .data = std.mem.sliceAsBytes(pcm[0..samples_out]) });
+
+    const reference_pcm: []const f32 = @as([*]const f32, @ptrCast(@alignCast(pcm_bytes.ptr)))[0 .. pcm_bytes.len / 4];
+    var error_sum: f64 = 0;
+    var signal_sum: f64 = 0;
+    var worst: f32 = 0;
+    const compared = @min(samples_out, reference_pcm.len);
+    for (pcm[0..compared], reference_pcm[0..compared]) |a, b| {
+        error_sum += @as(f64, a - b) * (a - b);
+        signal_sum += @as(f64, b) * b;
+        worst = @max(worst, @abs(a - b));
+    }
+    try out.print("picks={d} smallest top1-top2 gaps: {d:.4} {d:.4} {d:.4} {d:.4} {d:.4}\n", .{ margins.count, margins.smallest[0], margins.smallest[1], margins.smallest[2], margins.smallest[3], margins.smallest[4] });
+    try out.print("forced frames={d} codes_identical={d} order_identical={d} samples zpm={d} ref={d} pcm_max_abs={e:.3} pcm_rel_rms={e:.3} code_ms={d:.1} wav_ms={d:.1}\n", .{
+        frames, matched, order_matched, samples_out, reference_pcm.len, worst,
+        if (signal_sum > 0) @sqrt(error_sum / signal_sum) else 0, milliseconds(code_ns), milliseconds(wav_ns),
     });
 }

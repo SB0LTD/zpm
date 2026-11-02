@@ -178,6 +178,16 @@ pub fn linear(parallel: Parallel, weights: Matrix, activations: []const Q80Block
     if (!allFinite(output[0 .. tokens * weights.rows])) return error.NonFinite;
 }
 
+/// One Q8_0 row as f32 (ggml_get_rows of a Q8_0 table).
+pub fn dequantizeRow(row: []const u8, out: []f32) Error!void {
+    try quantized.dequantizeQ80(out, row);
+}
+
+/// One Q8_0 row against one quantized activation row of the same width.
+pub fn dotRow(row: []const u8, activations: []const Q80Block) f32 {
+    return quantized.dotQ80Q80Tile(1, row, .{activations.ptr}, activations.len)[0];
+}
+
 /// Quantize then multiply: the common pattern of every matrix input.
 pub fn project(parallel: Parallel, weights: Matrix, input: []const f32, tokens: usize, activations: []Q80Block, output: []f32, bias: ?[]const f32) Error!void {
     if (input.len < tokens * weights.columns) return error.Capacity;
@@ -231,10 +241,11 @@ pub fn linearF32(weights: []const f32, inputs: usize, input: []const f32, tokens
     }
 }
 
-/// RMSNorm of one row (squares summed in f64, as ggml_rms_norm).
+/// RMSNorm of one row as ggml_rms_norm: each square rounded to f32, the
+/// squares summed in f64, then x * (1 / sqrt(mean + eps)) * weight.
 pub fn rmsNorm(input: []const f32, weight: []const f32, output: []f32, epsilon: f32) void {
     var squares: f64 = 0;
-    for (input) |value| squares += @as(f64, value) * value;
+    for (input) |value| squares += value * value;
     const mean: f32 = @floatCast(squares / @as(f64, @floatFromInt(input.len)));
     const inverse = 1.0 / @sqrt(mean + epsilon);
     for (input, weight, output[0..input.len]) |value, scale, *destination| destination.* = value * inverse * scale;
@@ -256,8 +267,56 @@ pub fn layerNorm(input: []const f32, weight: []const f32, bias: []const f32, out
     for (output[0..input.len], weight, bias) |*destination, scale, offset| destination.* = destination.* * inverse * scale + offset;
 }
 
+/// ggml_v_silu: x / (1 + ggml_v_expf(0 - x)).
 pub fn silu(value: f32) f32 {
-    return value / (1.0 + @exp(-value));
+    return value / (1.0 + expGgml(0.0 - value));
+}
+
+/// ggml_v_expf, the vector exp of ggml's CPU backend (x86 AVX2/AVX-512 and
+/// NEON share the algorithm and constants): lane-independent, so this scalar
+/// port gives its bits. SiLU and softmax go through it in llama.cpp.
+pub fn expGgml(x: f32) f32 {
+    const r: f32 = 0x1.8p23;
+    const z = @mulAdd(f32, x, 0x1.715476p+0, r);
+    const n = z - r;
+    const b = @mulAdd(f32, -n, 0x1.7f7d1cp-20, @mulAdd(f32, -n, 0x1.62e4p-1, x));
+    const e: u32 = @as(u32, @bitCast(z)) << 23;
+    const k: f32 = @bitCast(e +% @as(u32, @bitCast(@as(f32, 1.0))));
+    const u = b * b;
+    const j = @mulAdd(f32, @mulAdd(f32, @mulAdd(f32, 0x1.0e4020p-7, b, 0x1.573e2ep-5), u, @mulAdd(f32, 0x1.555e66p-3, b, 0x1.fffdb6p-2)), u, 0x1.ffffecp-1 * b);
+    if (!(@abs(n) > 126)) return @mulAdd(f32, j, k, k);
+    const g: u32 = if (n <= 0) 0x82000000 else 0;
+    const s1: f32 = @bitCast(g +% 0x7f000000);
+    const s2: f32 = @bitCast(e -% g);
+    if (@abs(n) > 192) return s1 * s1;
+    return @mulAdd(f32, s2, j, s2) * s1;
+}
+
+/// ggml_vec_dot_f32 on x86 AVX2: four 8-lane FMA accumulators over 32-wide
+/// steps, reduced (0+2, 1+3, then 0+1, then lo+hi and two horizontal adds),
+/// then the tail accumulated one product at a time (fused, as clang
+/// contracts `sumf += x*y`).
+pub fn dotGgml(x: []const f32, y: []const f32) f32 {
+    const Lanes = @Vector(8, f32);
+    const n = x.len;
+    const np = n & ~@as(usize, 31);
+    var sums: [4]Lanes = @splat(@splat(0));
+    var i: usize = 0;
+    while (i < np) : (i += 32) {
+        inline for (0..4) |lane| {
+            const ax: Lanes = x[i + lane * 8 ..][0..8].*;
+            const ay: Lanes = y[i + lane * 8 ..][0..8].*;
+            sums[lane] = @mulAdd(Lanes, ax, ay, sums[lane]);
+        }
+    }
+    sums[0] += sums[2];
+    sums[1] += sums[3];
+    sums[0] += sums[1];
+    const t0 = @shuffle(f32, sums[0], undefined, [4]i32{ 0, 1, 2, 3 }) + @shuffle(f32, sums[0], undefined, [4]i32{ 4, 5, 6, 7 });
+    // _mm_hadd_ps(t0, t0) = [t0+t1, t2+t3, ..]; again: (t0+t1) + (t2+t3).
+    var total: f32 = (t0[0] + t0[1]) + (t0[2] + t0[3]);
+    while (i < n) : (i += 1) total = @mulAdd(f32, x[i], y[i], total);
+    return total;
 }
 
 pub fn sigmoid(value: f32) f32 {
@@ -298,6 +357,58 @@ pub const ropeNeox = executor.ropeNeox;
 
 pub fn roundHalf(value: f32) f32 {
     return @floatCast(@as(f16, @floatCast(value)));
+}
+
+/// llama.cpp's attention without flash attention, for one query head over a
+/// key row of `row` keys of which [first, last] are visible: Q.K with
+/// ggml_vec_dot_f32, scale, softmax over the whole row (masked keys give
+/// ggml_v_expf(-inf) = 0) summing groups of eight in f32 into an f64 total
+/// (tail through libm exp), then each output lane as ggml_vec_dot_f32 of the
+/// value column with the weights. `scratch` holds 2 * row floats.
+pub fn attendHeadGgml(
+    query: []const f32,
+    keys: []const f32,
+    values: []const f32,
+    kv_width: usize,
+    kv_offset: usize,
+    row: usize,
+    first: usize,
+    last: usize,
+    scale: f32,
+    scratch: []f32,
+    output: []f32,
+) void {
+    const head_size = query.len;
+    const weights = scratch[0..row];
+    const column = scratch[row .. 2 * row];
+    var maximum: f32 = NEGATIVE_INFINITY;
+    for (weights, 0..) |*weight, key| {
+        if (key < first or key > last) {
+            weight.* = NEGATIVE_INFINITY;
+            continue;
+        }
+        weight.* = dotGgml(keys[key * kv_width + kv_offset ..][0..head_size], query) * scale + 0.0;
+        maximum = @max(maximum, weight.*);
+    }
+    var total: f64 = 0;
+    var key: usize = 0;
+    while (key + 8 <= row) : (key += 8) {
+        var group: [8]f32 = undefined;
+        for (&group, weights[key..][0..8]) |*value, score| value.* = expGgml(score - maximum);
+        @memcpy(weights[key..][0..8], &group);
+        const quarter = [4]f32{ group[4] + group[0], group[5] + group[1], group[6] + group[2], group[7] + group[3] };
+        total += (quarter[0] + quarter[2]) + (quarter[1] + quarter[3]);
+    }
+    while (key < row) : (key += 1) {
+        weights[key] = @exp(weights[key] - maximum);
+        total += weights[key];
+    }
+    const inverse: f32 = @floatCast(1.0 / total);
+    for (weights) |*weight| weight.* *= inverse;
+    for (output[0..head_size], 0..) |*destination, lane| {
+        for (column, 0..) |*value, index| value.* = values[index * kv_width + kv_offset + lane];
+        destination.* = dotGgml(column, weights);
+    }
 }
 
 /// One query head against keys [first, last] (rows of `kv_width`, the head's
