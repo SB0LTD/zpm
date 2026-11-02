@@ -28,6 +28,9 @@ A separate50-program native16.15 corpus reproduced25matches and25gaps on the
 test-first baseline. The runtime candidate now passes all50 in ReleaseSafe.
 These probes do not change the original118-program audit. Runtime aggregate-state
 liveness is implemented in the candidate, but not yet qualified or merged.
+Full CI caught a missing dependency for aggregates in unused named WINDOW
+definitions. A native16 supplement adds three programs (53total), with a red
+50pass/3gap checkpoint and a fixed aggregate-prefix dependency under qualification.
 Duplicate groups, NULL/empty aggregates, row-dependent
 errors, FILTER/DISTINCT, volatility and semantic errors now have frozen probes.
 Native16.15/18.3 expectations each replay50/50 in oracle-calibration CI41407604728.

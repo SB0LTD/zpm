@@ -235,6 +235,18 @@ const cases=[_]Case{
   .{.source="SELECT g,n FROM (SELECT v AS g,count(*) AS n,sum(1/(v-1)) AS dead FROM t GROUP BY v HAVING count(*)>1) q",.state="00000",.columns=&.{.{.name="g",.oid=23},.{.name="n",.oid=20}},.rows=&.{&.{"1","2"}}},
   .{.source="SELECT nextval('seq')",.state="00000",.columns=&.{.{.name="nextval",.oid=20}},.rows=&.{&.{"1"}}},
  }},
+ .{.id="aggregate_unused_named_window_sequence",.setup=&.{"CREATE TABLE w(id INT,v INT)","INSERT INTO w VALUES(1,0),(2,1)","CREATE SEQUENCE unused_seq"},.events=&.{
+  .{.source="SELECT 1 AS id,1 AS value FROM w WINDOW n AS(ORDER BY sum(nextval('unused_seq')))",.state="00000",.columns=&.{.{.name="id",.oid=23},.{.name="value",.oid=23}},.rows=&.{&.{"1","1"}}},
+  .{.source="SELECT currval('unused_seq')",.state="00000",.columns=&.{.{.name="currval",.oid=20}},.rows=&.{&.{"2"}}},
+  .{.source="SELECT 1 FROM w WINDOW n AS(ORDER BY sum(nextval('unused_seq'))) LIMIT 0",.state="00000",.columns=&.{.{.name="?column?",.oid=23}},.rows=&.{}},
+  .{.source="SELECT currval('unused_seq')",.state="00000",.columns=&.{.{.name="currval",.oid=20}},.rows=&.{&.{"2"}}},
+ }},
+ .{.id="aggregate_unused_named_window_order_error",.setup=&.{"CREATE TABLE w(id INT,v INT)","INSERT INTO w VALUES(1,0),(2,1)","CREATE SEQUENCE unused_seq"},.events=&.{
+  .{.source="SELECT 1 FROM w WINDOW n AS(ORDER BY sum(1/v))",.state="22012"},
+ }},
+ .{.id="aggregate_unused_named_window_partition_error",.setup=&.{"CREATE TABLE w(id INT,v INT)","INSERT INTO w VALUES(1,0),(2,1)","CREATE SEQUENCE unused_seq"},.events=&.{
+  .{.source="SELECT 1 FROM w WINDOW n AS(PARTITION BY sum(1/v))",.state="22012"},
+ }},
 };
 pub fn main() !void {
  var passed:usize=0;var failed:usize=0;

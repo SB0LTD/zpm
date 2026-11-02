@@ -14,6 +14,9 @@ monotone fixed point; keys always retain cardinality dependencies, and lowered
 group columns identify the required aggregate slots. HAVING, hidden ORDER BY,
 DISTINCT, materialized/shared/recursive CTEs and volatile outputs retain required
 work. Non-query binding, correlation and windows retain conservative boundaries.
+Named WINDOW definitions retain their registered aggregate prefix even when no
+runtime WindowAgg consumes the definition. This prefix is copied into the grouped
+input and cleared on a lowered outer window projection.
 
 Output pruning admits aggregates only through a separate immutability walk mode.
 Generated-column/default restrictions keep their previous aggregate prohibition.
@@ -70,6 +73,12 @@ restriction assertions, then compared adversarial probes against isolated HEAD
 and the candidate. This approves the bounded implementation for qualification;
 it does not replace the outstanding platform/product gates.
 
+Full CI41447674861 exposed a missed named WINDOW dependency in the initial
+candidate. Three supplemental native16 programs first failed50/53, covering unused
+named ORDER/PARTITION aggregate errors and sequence effects, then LIMIT0 suppression.
+The corrected corpus has53programs. The earlier50-case observations above remain
+historical evidence; final-source qualification must include the supplement.
+
 ## Open boundaries
 
 This does not close aggregate or general planner parity. DML-root demand remains
@@ -87,3 +96,6 @@ Native also eliminates sequence calls in the analogous SUM(nextval(...)) forms;
 both host versions still consume them. Right-hand absorbing boolean simplification
 needs a separate native-backed contract preserving immutable planning errors and
 volatile evaluation rules. The current output-demand slice does not close it.
+Constant-dead CASE/boolean expressions inside named WINDOW definitions also remain
+conservative pre-existing parity gaps; prefix retention does not prove those
+aggregates are necessary in every expression context.

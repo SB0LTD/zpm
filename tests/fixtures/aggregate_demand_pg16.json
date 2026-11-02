@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "native": "PostgreSQL 16.15",
-  "scope": "50 finite native16.15 aggregate-demand observations; runtime incomplete, not family closure",
+  "scope": "53 finite native16.15 aggregate-demand observations; candidate, not family closure",
   "setup": [
     "CREATE TABLE t(v INT)",
     "INSERT INTO t VALUES(1),(2)",
@@ -2928,7 +2928,143 @@
           }
         }
       ]
+    },
+    {
+      "id": "aggregate_unused_named_window_sequence",
+      "setup": [
+        "CREATE TABLE w(id INT,v INT)",
+        "INSERT INTO w VALUES(1,0),(2,1)",
+        "CREATE SEQUENCE unused_seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 1 AS id,1 AS value FROM w WINDOW n AS(ORDER BY sum(nextval('unused_seq')))",
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "id",
+                "oid": 23
+              },
+              {
+                "name": "value",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                1,
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameters": null,
+          "binary": false
+        },
+        {
+          "sql": "SELECT currval('unused_seq')",
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "currval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                2
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameters": null,
+          "binary": false
+        },
+        {
+          "sql": "SELECT 1 FROM w WINDOW n AS(ORDER BY sum(nextval('unused_seq'))) LIMIT 0",
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [],
+            "rowcount": 0,
+            "status": "SELECT 0"
+          },
+          "parameters": null,
+          "binary": false
+        },
+        {
+          "sql": "SELECT currval('unused_seq')",
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "currval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                2
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameters": null,
+          "binary": false
+        }
+      ]
+    },
+    {
+      "id": "aggregate_unused_named_window_order_error",
+      "setup": [
+        "CREATE TABLE w(id INT,v INT)",
+        "INSERT INTO w VALUES(1,0),(2,1)",
+        "CREATE SEQUENCE unused_seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 1 FROM w WINDOW n AS(ORDER BY sum(1/v))",
+          "outcome": {
+            "sqlstate": "22012",
+            "error_class": "DivisionByZero",
+            "message": "division by zero"
+          },
+          "parameters": null,
+          "binary": false
+        }
+      ]
+    },
+    {
+      "id": "aggregate_unused_named_window_partition_error",
+      "setup": [
+        "CREATE TABLE w(id INT,v INT)",
+        "INSERT INTO w VALUES(1,0),(2,1)",
+        "CREATE SEQUENCE unused_seq"
+      ],
+      "events": [
+        {
+          "sql": "SELECT 1 FROM w WINDOW n AS(PARTITION BY sum(1/v))",
+          "outcome": {
+            "sqlstate": "22012",
+            "error_class": "DivisionByZero",
+            "message": "division by zero"
+          },
+          "parameters": null,
+          "binary": false
+        }
+      ]
     }
   ],
-  "expanded_capture_sha256": "c248c54f3c252142598cb727707de138977aaa61661eabd07a56e1ed8db3cf46"
+  "expanded_capture_sha256": "c248c54f3c252142598cb727707de138977aaa61661eabd07a56e1ed8db3cf46",
+  "named_window_supplement_sha256": "d618fe265d0240e948d432241e99fb1eda8a12540c4524af0d87ce4922f8e7d4"
 }

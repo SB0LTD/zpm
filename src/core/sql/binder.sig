@@ -265,6 +265,9 @@ pub fn Binder(comptime config: types.Config) type {
             aggs: [config.columns]Agg = undefined,
             agg_count: usize = 0,
             aggregate_required:[config.columns]bool=@splat(true),
+            /// Conservatively retain aggregates registered from named WINDOW
+            /// clauses, including definitions with no consuming WindowAgg.
+            window_aggregate_count:usize=0,
             having: u16 = none,
             targets: [2 * config.columns]u16 = undefined,
             count: usize = 0,
@@ -3274,6 +3277,7 @@ pub fn Binder(comptime config: types.Config) type {
                     for(spec.partition[0..spec.partition_count]) |item| try groupify(context,p,item);
                     for(spec.order[0..spec.order_count]) |key| try groupify(context,p,key.expr);
                 }
+                p.window_aggregate_count=p.agg_count;
                 for (p.targets[0..p.count]) |target| try groupify(context, p, target);
                 try groupify(context, p, p.having);
                 for (order_refs[0..q.order_count]) |ref| if (ref == .expr) try groupify(context, p, ref.expr);
@@ -3546,7 +3550,7 @@ pub fn Binder(comptime config: types.Config) type {
                 if(p.window_count!=1 or (p.limit!=0xffffffffffffffff and !win.offset_prefix)) return error.UnsupportedStatement;
                 for(p.window_late[0..p.width]) |late| if(late) return error.UnsupportedStatement;
             }
-            p.source_count=1;p.sources[0]=.{.plan=child};p.where=none;p.grouped=false;p.rollup=false;p.key_count=0;p.agg_count=0;p.having=none;
+            p.source_count=1;p.sources[0]=.{.plan=child};p.where=none;p.grouped=false;p.rollup=false;p.key_count=0;p.agg_count=0;p.window_aggregate_count=0;p.having=none;
         }
 
         fn member(list: []const u16, column: u16) bool {
@@ -3672,6 +3676,7 @@ pub fn Binder(comptime config: types.Config) type {
                 for(plans.items[0..plans.len],0..) |*p,index| {
                     if(!p.demanded) continue;
                     const owner:u16=@intCast(index);
+                    for(0..p.window_aggregate_count) |i| if(!p.aggregate_required[i]) {p.aggregate_required[i]=true;changed=true;};
                     if(p.set_op!=.none) {demandAll(context,p.left,&changed);demandAll(context,p.right,&changed);continue;}
                     var planning=context.*;planning.planning_plan=p;const demand_context=&planning;
                     const barrier=p.window_count!=0;
