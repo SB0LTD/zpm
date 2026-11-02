@@ -33,7 +33,7 @@ jobs:
           ASSET=$(gh release view "$TAG" --repo "$REPO" --json assets \
             --jq '[.assets[].name | select(test("^sig-[0-9].*-x86_64-linux[.]tar[.]xz$"))] | if length == 1 then .[0] else error("expected one versioned Linux asset") end')
           gh release download "$TAG" --repo "$REPO" --pattern "$ASSET" --pattern SHA256SUMS.txt --dir /tmp
-          (cd /tmp && grep -F "  $ASSET" SHA256SUMS.txt | sha256sum -c -)
+          (cd /tmp && awk -v name="$ASSET" '$2 == name { print; n++ } END { if (n != 1) exit 1 }' SHA256SUMS.txt | sha256sum -c -)
           echo "Using latest Sig release $TAG ($ASSET)"
           mkdir -p /tmp/sig
           tar -xf "/tmp/$ASSET" -C /tmp/sig
