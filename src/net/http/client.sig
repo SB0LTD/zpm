@@ -70,6 +70,9 @@ fn connectTraced(u: url_mod.Url, req: *const Request) Error!tlsc.Socket {
 fn handshakeTraced(sock: *tlsc.Socket, u: url_mod.Url, req: *const Request, now: i64) Error!tlsc.Conn {
     const started = traceClock(req.trace);
     defer traceAdd(req.trace, "tls_ns", started);
+    // Every handshake consumes the TLS entropy pool (a key share is never
+    // reused across connections), so seed it fresh right before each one.
+    tlsc.fillEntropy();
     return tlsc.handshake(sock.transport(), u.host, now) catch |e| return classifyTls(e, req.trace);
 }
 fn exchangeTraced(u: url_mod.Url, req: *const Request, tr: *transport.Transport, bufs: Buffers, keep_alive: bool) Error!Response {
@@ -88,14 +91,6 @@ fn exchangeTraced(u: url_mod.Url, req: *const Request, tr: *transport.Transport,
     return resp;
 }
 
-var g_entropy_seeded: bool = false;
-
-fn seedEntropyOnce() void {
-    if (g_entropy_seeded) return;
-    tlsc.fillEntropy();
-    g_entropy_seeded = true;
-}
-
 fn classifyTls(e: tlsc.tls.Error, trace: ?*Trace) Error {
     const kind: TlsFailKind = switch (e) {
         error.CertInvalid => .cert_invalid,
@@ -109,8 +104,6 @@ fn classifyTls(e: tlsc.tls.Error, trace: ?*Trace) Error {
 /// Perform one request/response lifecycle against an already-parsed URL over a
 /// fresh connection. No redirect/retry logic here. Fills timing into `trace`.
 fn fetchOnce(u: url_mod.Url, req: *const Request, bufs: Buffers, now: i64, keep_alive: bool) Error!Response {
-    seedEntropyOnce();
-
     // 1. Connect with a deadline.
     var sock = try connectTraced(u, req);
     errdefer sock.close();
@@ -262,7 +255,6 @@ pub const Client = struct {
     }
 
     fn openTo(self: *Client, u: url_mod.Url, req: *const Request, now: i64) Error!void {
-        seedEntropyOnce();
         self.sock = try connectTraced(u, req);
         errdefer self.sock.close();
         socket_ext.setRecvTimeout(self.sock.fd, req.timeouts.recv_ms);

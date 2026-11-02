@@ -2,9 +2,14 @@
 // Layer 0: pure computation, no platform deps, no allocator.
 //
 // Verify-only: supports TLS cert chains whose intermediates/leaves are signed
-// with ECDSA-P384-SHA384 (common on Google/Cloudflare/DigiCert chains). Field
+// with ECDSA-P384 (common on Google/Cloudflare/DigiCert chains). Field
 // arithmetic uses 6x64-bit limbs with Montgomery CIOS multiplication, mirroring
 // the proven p256.sig structure. Constants computed from the NIST parameters.
+// All inputs are public, so the arithmetic is not constant-time. The public
+// key is checked to be on the curve before use, and the digest may be any
+// length (SHA-256 or SHA-384): its leftmost 384 bits are used (FIPS 186-4 6.4).
+
+const std = @import("std");
 
 pub const SIG_LEN = 96;      // r(48) || s(48)
 pub const PUBKEY_XY_LEN = 96; // X(48) || Y(48), no 0x04 prefix
@@ -246,9 +251,36 @@ fn modN(a: U384) U384 {
     return a;
 }
 
-/// Verify an ECDSA-P384 signature. `pub_xy` = X(48)||Y(48); `hash` is the
-/// message digest (SHA-384, 48 bytes); `sig` = r(48)||s(48). Returns true iff valid.
-pub fn verify(pub_xy: *const [96]u8, hash: *const [48]u8, sig: *const [96]u8) bool {
+/// Is (x, y) a point on P-384: x, y < p and y^2 = x^3 - 3x + b (mod p)?
+fn onCurve(x: U384, y: U384) bool {
+    if (geq(&x, &P) or geq(&y, &P)) return false;
+    const lhs = mulModP(y, y);
+    const x3 = mulModP(mulModP(x, x), x);
+    const rhs = addModP(addModP(x3, mulModP(A, x)), B);
+    return eq(lhs, rhs);
+}
+
+/// The ECDSA integer e: the leftmost min(384, 8 * digest.len) bits of the
+/// digest (FIPS 186-4 6.4), reduced mod n.
+fn digestToScalar(digest: []const u8) U384 {
+    var buf: [48]u8 = @splat(0);
+    if (digest.len >= 48) {
+        @memcpy(&buf, digest[0..48]);
+    } else {
+        @memcpy(buf[48 - digest.len ..], digest);
+    }
+    return modN(bytesToU384(&buf));
+}
+
+/// Verify an ECDSA-P384 signature. Returns true iff valid.
+///   pub_xy : X(48) || Y(48) of the public key (uncompressed, no 0x04 prefix)
+///   digest : message hash (SHA-384 normally; any length, leftmost 384 bits used)
+///   sig    : r(48) || s(48), big-endian, left-zero-padded
+pub fn verify(pub_xy: *const [96]u8, digest: []const u8, sig: *const [96]u8) bool {
+    var qx: [48]u8 = undefined; @memcpy(&qx, pub_xy[0..48]);
+    var qy: [48]u8 = undefined; @memcpy(&qy, pub_xy[48..96]);
+    const q = JacobianPoint{ .x = bytesToU384(&qx), .y = bytesToU384(&qy), .z = ONE };
+    if (!onCurve(q.x, q.y)) return false;
     var rx: [48]u8 = undefined; @memcpy(&rx, sig[0..48]);
     var sx: [48]u8 = undefined; @memcpy(&sx, sig[48..96]);
     const r = bytesToU384(&rx);
@@ -256,13 +288,10 @@ pub fn verify(pub_xy: *const [96]u8, hash: *const [48]u8, sig: *const [96]u8) bo
     // r, s must be in [1, n-1]
     if (isZero(&r) or isZero(&s)) return false;
     if (geq(&r, &N) or geq(&s, &N)) return false;
-    const z = modN(bytesToU384(hash));
+    const z = digestToScalar(digest);
     const w = invModN(s);
     const vu1 = mulModN(z, w);
     const vu2 = mulModN(r, w);
-    var qx: [48]u8 = undefined; @memcpy(&qx, pub_xy[0..48]);
-    var qy: [48]u8 = undefined; @memcpy(&qy, pub_xy[48..96]);
-    const q = JacobianPoint{ .x = bytesToU384(&qx), .y = bytesToU384(&qy), .z = ONE };
     const p1 = scalarMultG(&vu1);
     const p2 = scalarMult(&q, &vu2);
     const sum = pointAdd(p1, p2);
@@ -272,7 +301,7 @@ pub fn verify(pub_xy: *const [96]u8, hash: *const [48]u8, sig: *const [96]u8) bo
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
-const testing = @import("std").testing;
+const testing = std.testing;
 
 test "p384: verify ECDSA-SHA384 test vector" {
     // Generated from deterministic private key d=0x0123..cdef via Python cryptography.
@@ -309,4 +338,50 @@ test "p384: tampered signature rejected" {
     var sig: [96]u8 = @splat(0);
     sig[0] = 1;
     try testing.expect(!verify(&pub_xy, &digest, &sig));
+}
+
+test "p384: generator is on the curve" {
+    try testing.expect(onCurve(GX, GY));
+}
+
+test "p384: off-curve public key rejected" {
+    var pub_xy: [96]u8 = @splat(0x11);
+    const digest: [48]u8 = @splat(0x22);
+    var sig: [96]u8 = @splat(0x33);
+    try testing.expect(!verify(&pub_xy, &digest, &sig));
+    pub_xy = @splat(0xff); // coordinates >= p
+    sig[0] = 0x01;
+    try testing.expect(!verify(&pub_xy, &digest, &sig));
+}
+
+fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
+    var out: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
+    return out;
+}
+
+// Real-world vector: Google Trust Services "WE1" intermediate (the issuer of
+// api.anthropic.com) is signed ecdsa-with-SHA384 by GTS Root R4 (P-384).
+// pub = GTS Root R4 key, digest = SHA-384(WE1 tbsCertificate), sig = r||s.
+test "p384: verifies GTS Root R4 signature over the WE1 certificate" {
+    const pub_xy = comptime hexBytes("f37473a7688b60ae43b835c581307b4b499dfbc161cee6de46bd6bd5611835ae40dd73f78991305aeb3cee857ca240763ba9c6b847d82ae792916a73e9b172399f299fa298d35f5e5886650fa1846506d1dc8bc9c773c88c6a2fe5c4abd11d8a");
+    const digest = comptime hexBytes("fa36511759e809304f73b2563e0001bcfe69b477ab2e12a9c8011efae875c532c3e1cf9b37ce5fa3d6d5cc4face13486");
+    var sig = comptime hexBytes("e702ab51d6f74395ce75fed11194d5cc40417a26bed80cf3322d3d90ae150f234812528f3e647913aff5a62c026e55b12689cc680162e789ab7e17e814d6447ee34c490ebf6c806234b8b2a17e3a168850bca788a09f7d731eec52414deee256");
+    try testing.expect(verify(&pub_xy, &digest, &sig));
+    // The same check through a runtime-length slice.
+    const as_slice: []const u8 = &digest;
+    try testing.expect(verify(&pub_xy, as_slice, &sig));
+    sig[10] ^= 1;
+    try testing.expect(!verify(&pub_xy, &digest, &sig));
+}
+
+test "p384: short digests are used whole, long ones truncated to 384 bits" {
+    var short: [32]u8 = undefined;
+    for (&short, 0..) |*b, i| b.* = @intCast(i + 1);
+    var padded: [48]u8 = @splat(0);
+    @memcpy(padded[16..], &short);
+    try testing.expect(eq(digestToScalar(&short), digestToScalar(&padded)));
+    var long: [64]u8 = undefined;
+    for (&long, 0..) |*b, i| b.* = @intCast(0xA0 ^ i);
+    try testing.expect(eq(digestToScalar(&long), digestToScalar(long[0..48])));
 }

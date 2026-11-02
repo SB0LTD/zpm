@@ -130,8 +130,9 @@ pub fn connectHost(host: []const u8, port: u16) Error!Socket {
     return Error.Io;
 }
 
-/// Seed the TLS entropy from the OS CSPRNG. Call once at startup (and it is
-/// cheap to call again). Without this, the TLS client uses fixed dev bytes.
+/// Seed the TLS entropy from the OS CSPRNG for the next handshake. Call it
+/// right before every handshake: each one consumes the pool, and without a
+/// fresh seed the handshake fails with error.NoEntropy.
 pub fn fillEntropy() void {
     var e: [64]u8 = undefined;
     // BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002; alg handle may be null then.
