@@ -1,0 +1,112 @@
+{
+  "status": "candidate; full platform/product/release qualification pending",
+  "date": "2026-11-02",
+  "source_before_evidence": "766f966fa8a80aaf5d5889400efce3913f239107",
+  "compiler": "Sig 0.6.4, matched consolidation SDK, ReleaseSafe",
+  "aggregate_contract": {
+    "programs": 50,
+    "passing": 50,
+    "gaps": 0,
+    "baseline_matching": 25,
+    "baseline_gaps": 25,
+    "native_calibration_run": 41407604728,
+    "native_versions": [
+      "16.15",
+      "18.3"
+    ]
+  },
+  "physical_assertions": {
+    "stream_group": 1856,
+    "factor_join": 1896,
+    "typed_multi_group": 3542,
+    "nested_factor_cte": 1141
+  },
+  "regression_assertions": {
+    "planner_demand": 444,
+    "generated_restrictions": 132,
+    "query": 63417,
+    "windows": 9971,
+    "window_frames": 113928,
+    "numeric_functions": 1266,
+    "square_root": 375,
+    "rollup": 6409,
+    "grouping_rollup": 21396
+  },
+  "original_inventory": {
+    "programs": 118,
+    "smoke_pass": 12,
+    "failures": 89,
+    "unexecuted": 17,
+    "compile_exit": 0,
+    "run_exit": 1,
+    "expected_error": "SqlConformanceIncomplete"
+  },
+  "independent_review": {
+    "reviewer": "aggregate_runtime_review",
+    "decision": "no introduced blocking defect; approved bounded candidate for qualification",
+    "independent_native16": 50,
+    "independent_aggregate_core": 50,
+    "independent_generated_restrictions": 132,
+    "not_repeated": [
+      "PG18",
+      "wire/prepared/binary",
+      "full platform/product/release matrix"
+    ]
+  },
+  "open": [
+    "AGG-BOOL-ABSORBER-01: existing right-hand AND FALSE / OR TRUE aggregate evaluation parity",
+    "numeric literal capacity",
+    "DML-root demand",
+    "windows/correlation/scalar-subquery pruning",
+    "full PostgreSQL parity"
+  ],
+  "commands": [
+    "sig build run-contract-sql-planner-demand run-contract-sql-aggregate-demand run-contract-sql-generated-restrictions run-contract-sql-query run-contract-sql-windows run-contract-sql-window-frames run-contract-sql-grouping-rollup run-contract-sql-rollup run-contract-sql-numeric-functions run-contract-sql-square-root -Doptimize=ReleaseSafe -j1",
+    "sig build run-contract-sql-stream-group run-contract-sql-factor-cte -Doptimize=ReleaseSafe -j1",
+    "sig build run-contract-sql-factor-join run-contract-sql-typed-multi-group -Doptimize=ReleaseSafe -j1",
+    "python tools/generate_sql_aggregate_demand.py --check",
+    "python -m unittest discover -s tests/sql_conformance -p test_*.py"
+  ],
+  "evidence": [
+    {
+      "path": ".scratch/aggregate-demand-regressions/contracts.log",
+      "sha256": "948a7850bf19704357910fd8391fd1107a5f617ad200382b931a1f3d24f2967c"
+    },
+    {
+      "path": ".scratch/aggregate-demand-paths/baseline-red.log",
+      "sha256": "b8401e808e4e31f88c666868101538e7d26156272530aa8f2d67fa0b653924de"
+    },
+    {
+      "path": ".scratch/aggregate-demand-paths/presence-and-control.log",
+      "sha256": "83abf30e16a5717403283cb9fe1b269ff28d87ef9687a9a60039b11c56a10ca9"
+    },
+    {
+      "path": ".scratch/aggregate-demand-paths/final-specialized.log",
+      "sha256": "cd36047ee2bad20d4635efca12af1c204b94b98bca656187c6922d23af107667"
+    },
+    {
+      "path": ".scratch/aggregate-demand-inventory/results.ndjson",
+      "sha256": "ffcf51b0e83b138fc8afa79a981ffa95202a5d6e17abc296076935856cdba40c"
+    },
+    {
+      "path": ".scratch/aggregate-demand-inventory/stderr.log",
+      "sha256": "1c7452014ede01e1808677b5dd4c030ee2d753ef07b2ef30b9572e000a4c1fdc"
+    },
+    {
+      "path": ".scratch/aggregate-runtime-review/candidate.log",
+      "sha256": "65a543dca885b9406c242b1905e05570615d550569d486be898e4d84de0abfb7"
+    },
+    {
+      "path": ".scratch/aggregate-runtime-review/baseline.log",
+      "sha256": "d37c2a6a92ba458e47e052abdf199f761ad7ec90030baa5cae980c7c1a2bb905"
+    },
+    {
+      "path": ".scratch/aggregate-runtime-review/native-right-absorbing.log",
+      "sha256": "44c33b8c1b5fd378578b49a25f80ab60e28d29d04c21ae1c1f9933cc08611e49"
+    },
+    {
+      "path": ".scratch/aggregate-runtime-review/native16-corpus.json",
+      "sha256": "5ffd4a43af129415ff3e818021c884f97a473c117731dd3208fb0eb4b4b49e44"
+    }
+  ]
+}
