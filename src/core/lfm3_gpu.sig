@@ -37,7 +37,7 @@ pub const Error = error{
     ContextCapacity,
     InvalidToken,
     StreamFull,
-    /// The GPU did not finish the call (a hang, a fault, a timeout): the
+    /// The GPU did not finish the call (it hung or faulted): the
     /// host should run the call on the CPU (restoreConv first).
     DeviceLost,
 } || adreno.device.Error || ir3_asm.Error || a7xx.Error || executor.Error;
@@ -45,7 +45,8 @@ pub const Error = error{
 pub const Options = struct {
     max_batch: u32 = 64,
     context: u32 = 4096,
-    /// How long one call may take on the GPU before it counts as hung.
+    /// How long one call may take on the GPU before it counts as slow (it
+    /// is waited for still: see `finish`).
     timeout_us: u64 = 10_000_000,
 };
 
@@ -118,6 +119,8 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         /// why the last one did not.
         lost: u32 = 0,
         last_failure: ?adreno.device.Error = null,
+        /// Calls that took longer than options.timeout_us (and finished).
+        slow: u32 = 0,
 
         /// Check the model, allocate everything, copy the model file in,
         /// assemble the kernels. `work` is the assembler's working storage.
@@ -328,13 +331,27 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             st.check() catch return error.StreamFull;
             self.dev.toDevice(self.ib, 0, st.len * 4);
             const fence = self.dev.submit(self.ib, @intCast(st.len)) catch |e| return self.failed(e);
-            self.dev.wait(fence, self.options.timeout_us) catch |e| return self.failed(e);
+            self.finish(fence) catch |e| return self.failed(e);
             cache.position += count;
             if (output == .none) return null;
             self.dev.fromDevice(self.s.normalized, 0, h * 4);
             if (output == .hidden) return null;
             self.dev.fromDevice(self.s.logits, 0, self.s.logits.cpu.len);
             return @intCast(argmax(self.logits()));
+        }
+
+        /// Wait for a call's stream. One slower than options.timeout_us is
+        /// counted and waited for still: until it is done the GPU may write
+        /// the state a CPU fallback would take over, so only the driver ends
+        /// the wait, with the work done or the GPU lost. (The device's wait
+        /// must end by itself when the GPU hangs: Galaxy's do, the driver
+        /// finding a fence that stopped moving.)
+        fn finish(self: *Self, fence: adreno.device.Fence) adreno.device.Error!void {
+            self.dev.wait(fence, self.options.timeout_us) catch |e| {
+                if (e != error.Timeout) return e;
+                self.slow += 1;
+                return self.dev.wait(fence, std.math.maxInt(u64));
+            };
         }
 
         fn failed(self: *Self, e: adreno.device.Error) Error {

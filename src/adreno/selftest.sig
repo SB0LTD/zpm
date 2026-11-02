@@ -629,6 +629,7 @@ fn testAlu(c: *Ctx) void {
 test "the bring-up tests pass on the emulated device" {
     const S = struct {
         var arena: [24 << 20]u8 align(4096) = undefined;
+        var gpu_view: [24 << 20]u8 align(4096) = undefined;
         var dev: device.EmuDevice = undefined;
         var work: Work = .{};
         var lines: usize = 0;
@@ -637,7 +638,7 @@ test "the bring-up tests pass on the emulated device" {
             if (std.mem.indexOf(u8, line, "FAILED") != null) std.debug.print("{s}\n", .{line});
         }
     };
-    S.dev = .{ .arena = &S.arena };
+    S.dev = .{ .arena = &S.arena, .gpu_view = &S.gpu_view };
     const r = runAll(S.dev.device(), &S.work, S.log, true);
     try std.testing.expectEqual(@as(u32, 0), r.failed);
     try std.testing.expect(r.passed >= 9);

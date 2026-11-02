@@ -164,6 +164,8 @@ var work: executor.Workspace(LIMITS) = .{};
 var kv_cpu: [2 * 2 * KV_HEADS * CONTEXT * HEAD]u16 = @splat(0);
 var conv_cpu: [2 * (KERNEL - 1) * HIDDEN]f32 = @splat(0);
 var arena: [24 << 20]u8 align(4096) = undefined;
+/// The GPU's own memory: a missing toDevice/fromDevice shows.
+var gpu_view: [24 << 20]u8 align(4096) = undefined;
 var emu: adreno.device.EmuDevice = undefined;
 var asm_work: adreno.ir3_asm.Work = .{};
 const unpacked: executor.PackedWeights(CAPACITY) = .{};
@@ -185,7 +187,7 @@ test "the GPU backend follows the CPU executor, and the CPU takes over from its 
     try fixture.initialize();
     const plan = &fixture.plan;
     const src = fixture.source();
-    emu = .{ .arena = &arena };
+    emu = .{ .arena = &arena, .gpu_view = &gpu_view };
     var backend = try Backend.init(emu.device(), plan, &fixture.index, src, .{ .max_batch = 16, .context = CONTEXT }, &asm_work);
     var gcache = backend.cpuCache(0);
     var ccache = executor.Cache{ .kv = &kv_cpu, .conv = &conv_cpu, .context = CONTEXT };

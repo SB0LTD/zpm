@@ -1125,9 +1125,21 @@ const device = adreno.device;
 
 const TestRig = struct {
     var arena: [24 << 20]u8 align(4096) = undefined;
+    /// The GPU's own memory: a missing toDevice/fromDevice shows.
+    var gpu_view: [24 << 20]u8 align(4096) = undefined;
     var emu: device.EmuDevice = undefined;
     var asm_work: ir3_asm.Work = .{};
 };
+
+/// Run a stream with every buffer handed to the GPU first and fetched back
+/// after (these tests check the kernels' arithmetic; the Backend's own
+/// hand-overs are checked by tests/test_lfm3_gpu.sig).
+fn runSynced(d: device.Device, ib: device.Buffer, dwords: u32) !void {
+    const T = TestRig;
+    T.emu.cpuToGpu(@intFromPtr(&T.arena), T.emu.used);
+    try d.run(ib, dwords, 1_000_000);
+    T.emu.gpuToCpu(@intFromPtr(&T.arena), T.emu.used);
+}
 
 fn emuFailure(e: anyerror) anyerror {
     const T = TestRig;
@@ -1154,7 +1166,7 @@ fn splitActivations(blocks: []const quantized.Q8KBlock, aq: []i8, ad: []f32, abs
 
 fn runMatrix(comptime tokens: comptime_int, comptime q4: bool, rows: u32, blocks: u32) !void {
     const T = TestRig;
-    T.emu = .{ .arena = &T.arena };
+    T.emu = .{ .arena = &T.arena, .gpu_view = &T.gpu_view };
     const d = T.emu.device();
     const k_cols = blocks * QK_K;
     const block_bytes: u32 = if (q4) Q4_K_BLOCK else Q6_K_BLOCK;
@@ -1194,7 +1206,7 @@ fn runMatrix(comptime tokens: comptime_int, comptime q4: bool, rows: u32, blocks
     s.constants(0, &consts);
     s.dispatch(&k, .{ rows / MATRIX_ROWS_PER_GROUP, 1, 1 });
     try s.check();
-    try d.run(ib, @intCast(s.len), 1_000_000);
+    try runSynced(d, ib, @intCast(s.len));
     const got: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, out.cpu));
     var mismatches: usize = 0;
     for (0..rows) |row| {
@@ -1230,7 +1242,7 @@ test "Q6_K x Q8_K: eight tokens" {
 
 fn runQuant(comptime norm: bool, tokens: u32, comptime k_cols: u32) !void {
     const T = TestRig;
-    T.emu = .{ .arena = &T.arena };
+    T.emu = .{ .arena = &T.arena, .gpu_view = &T.gpu_view };
     const d = T.emu.device();
     const blocks = k_cols / QK_K;
     const xb = try d.alloc(tokens * k_cols * 4);
@@ -1264,7 +1276,7 @@ fn runQuant(comptime norm: bool, tokens: u32, comptime k_cols: u32) !void {
     s.constants(0, &consts);
     s.dispatch(&k, if (norm) .{ 1, tokens, 1 } else .{ blocks, tokens, 1 });
     try s.check();
-    d.run(ib, @intCast(s.len), 1_000_000) catch |e| return emuFailure(e);
+    runSynced(d, ib, @intCast(s.len)) catch |e| return emuFailure(e);
     // what was quantized: x, or the GPU's normalized rows
     const y: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, yb.cpu));
     const q_in = if (norm) y else x;
@@ -1366,7 +1378,7 @@ fn fillRandom(b: []u8, seed: *u32, scale: f32, bias: f32) []f32 {
 
 test "short convolution: the CPU's floats exactly, state carried" {
     const T = TestRig;
-    T.emu = .{ .arena = &T.arena };
+    T.emu = .{ .arena = &T.arena, .gpu_view = &T.gpu_view };
     const d = T.emu.device();
     const hidden = 256;
     const tokens = 5;
@@ -1395,7 +1407,7 @@ test "short convolution: the CPU's floats exactly, state carried" {
     s.constants(0, &(ConvConsts{ .mixed = mixed.va, .taps = tw.va, .state = state.va, .out = out.va, .hidden = hidden, .tokens = tokens }).dwords());
     s.dispatch(&k, .{ hidden / 64, 1, 1 });
     try s.check();
-    d.run(ib, @intCast(s.len), 1_000_000) catch |e| return emuFailure(e);
+    runSynced(d, ib, @intCast(s.len)) catch |e| return emuFailure(e);
     const got: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, out.cpu));
     for (cpu_out, got) |a, b| try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
     for (cpu_state, st) |a, b| try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
@@ -1403,7 +1415,7 @@ test "short convolution: the CPU's floats exactly, state carried" {
 
 test "attention: prepare (norms, RoPE, f16 KV) then scores, softmax, values, gate" {
     const T = TestRig;
-    T.emu = .{ .arena = &T.arena };
+    T.emu = .{ .arena = &T.arena, .gpu_view = &T.gpu_view };
     const d = T.emu.device();
     const heads = 8;
     const kvh = 2;
@@ -1515,7 +1527,7 @@ test "attention: prepare (norms, RoPE, f16 KV) then scores, softmax, values, gat
     s.constants(6, &ac.outDwords());
     s.dispatch(&ka, .{ heads, tokens, 1 });
     try s.check();
-    d.run(ib, @intCast(s.len), 1_000_000) catch |e| return emuFailure(e);
+    runSynced(d, ib, @intCast(s.len)) catch |e| return emuFailure(e);
     // the cache rows and the output: float paths, close
     for (ccache, cache, 0..) |a, b, i| {
         const fa: f32 = @floatCast(@as(f16, @bitCast(a)));

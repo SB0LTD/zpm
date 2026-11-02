@@ -105,6 +105,12 @@ pub const EmuDevice = struct {
     last_error: ?anyerror = null,
     /// Run only every n-th workgroup in x (sampled runs of huge grids).
     group_stride: u32 = 1,
+    /// The GPU's own memory (as long as `arena`), or none: the GPU then sees
+    /// the CPU's bytes directly. With it, the two views are apart, as on an
+    /// Adreno that does not snoop the CPU's caches: the GPU sees what
+    /// toDevice copied over and the CPU what fromDevice copied back, so a
+    /// missing call gives wrong results here, not only on hardware.
+    gpu_view: []u8 = &.{},
 
     pub fn device(e: *EmuDevice) Device {
         return .{ .ctx = e, .vtable = &vtable };
@@ -115,18 +121,23 @@ pub const EmuDevice = struct {
         .free = emuFree,
         .submit = emuSubmit,
         .wait = emuWait,
-        .toDevice = emuNoop,
-        .fromDevice = emuNoop,
+        .toDevice = emuToDevice,
+        .fromDevice = emuFromDevice,
     };
 
     fn emuAlloc(ctx: *anyopaque, size: usize) ?Buffer {
         const e: *EmuDevice = @ptrCast(@alignCast(ctx));
         const at = std.mem.alignForward(usize, e.used, 4096);
         if (at + size > e.arena.len or e.n_regions >= EMU_MAX_BUFFERS) return null;
+        if (e.gpu_view.len != 0 and e.gpu_view.len < e.arena.len) return null;
         e.used = at + size;
         const va = e.va_base + at;
         const bytes = e.arena[at..][0..size];
-        e.regions[e.n_regions] = .{ .va = va, .bytes = bytes };
+        const seen = if (e.gpu_view.len != 0) e.gpu_view[at..][0..size] else bytes;
+        // (fresh memory reads as zeros from both sides, as the drivers' does)
+        @memset(bytes, 0);
+        @memset(seen, 0);
+        e.regions[e.n_regions] = .{ .va = va, .bytes = seen };
         e.n_regions += 1;
         return .{ .va = va, .cpu = bytes, .handle = @intCast(e.n_regions) };
     }
@@ -136,11 +147,35 @@ pub const EmuDevice = struct {
         _ = b;
     }
 
-    fn emuNoop(ctx: *anyopaque, b: Buffer, off: usize, len: usize) void {
-        _ = ctx;
-        _ = b;
-        _ = off;
-        _ = len;
+    /// The CPU's bytes at [cpu, cpu+len) (inside the arena) to the GPU's view.
+    pub fn cpuToGpu(e: *EmuDevice, cpu: usize, len: usize) void {
+        const at = e.viewOffset(cpu, len) orelse return;
+        @memcpy(e.gpu_view[at..][0..len], e.arena[at..][0..len]);
+    }
+
+    /// The GPU's bytes back to the CPU's view of [cpu, cpu+len).
+    pub fn gpuToCpu(e: *EmuDevice, cpu: usize, len: usize) void {
+        const at = e.viewOffset(cpu, len) orelse return;
+        @memcpy(e.arena[at..][0..len], e.gpu_view[at..][0..len]);
+    }
+
+    fn viewOffset(e: *const EmuDevice, cpu: usize, len: usize) ?usize {
+        if (e.gpu_view.len == 0 or len == 0) return null;
+        const base = @intFromPtr(e.arena.ptr);
+        std.debug.assert(cpu >= base and cpu - base + len <= e.arena.len);
+        return cpu - base;
+    }
+
+    fn emuToDevice(ctx: *anyopaque, b: Buffer, off: usize, len: usize) void {
+        const e: *EmuDevice = @ptrCast(@alignCast(ctx));
+        std.debug.assert(off + len <= b.cpu.len);
+        e.cpuToGpu(@intFromPtr(b.cpu.ptr) + off, len);
+    }
+
+    fn emuFromDevice(ctx: *anyopaque, b: Buffer, off: usize, len: usize) void {
+        const e: *EmuDevice = @ptrCast(@alignCast(ctx));
+        std.debug.assert(off + len <= b.cpu.len);
+        e.gpuToCpu(@intFromPtr(b.cpu.ptr) + off, len);
     }
 
     fn emuWait(ctx: *anyopaque, f: Fence, timeout_us: u64) Error!void {
@@ -280,13 +315,14 @@ pub const EmuDevice = struct {
     }
 };
 
-test "an emulated device runs a stream built by a7xx.Stream" {
+test "an emulated device runs a stream built by a7xx.Stream (the GPU's memory apart)" {
     const S = struct {
         var arena: [1 << 20]u8 align(4096) = undefined;
+        var gpu_view: [1 << 20]u8 align(4096) = undefined;
         var dev: EmuDevice = undefined;
         var asm_work: ir3_asm.Work = .{};
     };
-    S.dev = .{ .arena = &S.arena };
+    S.dev = .{ .arena = &S.arena, .gpu_view = &S.gpu_view };
     const d = S.dev.device();
     const code_buf = try d.alloc(4096);
     const out = try d.alloc(4096);
@@ -311,7 +347,13 @@ test "an emulated device runs a stream built by a7xx.Stream" {
     s.dispatch(&k, .{ 4, 1, 1 });
     s.waitForIdle();
     try s.check();
+    // (the kernel's code not handed over: the GPU sees zeros, no program)
+    try std.testing.expectError(error.DeviceLost, d.run(ib, @intCast(s.len), 1_000_000));
+    d.toDevice(code_buf, 0, k.code.len * 8);
     try d.run(ib, @intCast(s.len), 1_000_000);
     const got: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, out.cpu[0 .. 128 * 4]));
+    // (and what it wrote, not seen until it is fetched)
+    try std.testing.expectEqual(@as(u32, 0), got[1]);
+    d.fromDevice(out, 0, 128 * 4);
     for (got, 0..) |v, i| try std.testing.expectEqual(@as(u32, @intCast(3 * i)), v);
 }
