@@ -19,8 +19,10 @@ aggregate_literal_capacity_open.json; explicit text-to-float8 input in the SUM
 overflow cases isolates aggregation and does not close the literal capacity limit.
 
 This does not change the original118-program inventory or claim SQL compatibility.
-The baseline is ZPM ef6e3c0486ca76a3bfe70f3d91acda22c7491c16, still under hosted
-qualification in PR97 when these observations were captured.
+The baseline is ZPM ef6e3c0486ca76a3bfe70f3d91acda22c7491c16, under hosted
+qualification when these observations were captured. PR97 is now merged as
+fe4479c after the full matrix passed; only a CI budget file differs from this
+runtime baseline. RAMSQL PR51 is merged as c68e8f9 and its exact bundle published.
 
 An unused calculation such as SUM(1/0) currently makes a derived query fail even
 when its parent only requests the number7. PostgreSQL can return7 in that case.
