@@ -1,4 +1,4 @@
-//! Generated native-reference aggregate-state demand probes; intentionally red.
+//! Native-reference aggregate-state demand regressions; baseline ef6e3c0 was red.
 const std=@import("std");const sql=@import("sql");
 const DB=sql.Database(.{.tables=3,.columns=8,.rows_per_table=16,.work_rows=128,.result_rows=64,.expr_nodes=512,.text_bytes=128});
 var db:DB=.{};var result:DB.Result=.{};

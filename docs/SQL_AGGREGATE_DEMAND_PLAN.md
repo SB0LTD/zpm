@@ -1,8 +1,12 @@
 # Aggregate-state demand gap-closing plan
 
-Status: test-first investigation on a separate branch; implementation is missing.
+Status: historical test-first plan. A runtime candidate now passes50/50 locally;
+see [current scope and remaining gates](SQL_AGGREGATE_DEMAND.md). The baseline
+results and open IDs below are retained as investigation history, not current
+candidate results. Physical streaming/typed/factorized regressions have been added;
+full platform and product qualification remain pending.
 
-Current expanded checkpoint:50 native16.15 programs, with25 matching and25 gaps
+Historical expanded checkpoint:50 native16.15 programs, with25 matching and25 gaps
 in the standalone core test (expected exit1). All50 native observations replay
 through the public verifier. The initial16-case record below remains historical.
 The expanded test generates deterministically from the fixture, compares NULLs,

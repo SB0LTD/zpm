@@ -24,14 +24,20 @@ capacity limit or performance-superiority claim is closed by this slice.
 
 ## Aggregate-state demand investigation - 2 November 2026
 
-A separate50-program native16.15 corpus reproduces25matches and25gaps in the
-allocator-free core contract, with expected SqlAggregateDemandIncomplete exit1.
+A separate50-program native16.15 corpus reproduced25matches and25gaps on the
+test-first baseline. The runtime candidate now passes all50 in ReleaseSafe.
 These probes do not change the original118-program audit. Runtime aggregate-state
-liveness is not implemented. Duplicate groups, NULL/empty aggregates, row-dependent
+liveness is implemented in the candidate, but not yet qualified or merged.
+Duplicate groups, NULL/empty aggregates, row-dependent
 errors, FILTER/DISTINCT, volatility and semantic errors now have frozen probes.
 Native16.15/18.3 expectations each replay50/50 in oracle-calibration CI41407604728.
-Path-specific proof, parameters, cancellation/reuse and full implementation
-qualification remain open. See [the closing plan](SQL_AGGREGATE_DEMAND_PLAN.md). A separate
+Physical-path tests now cover bounded streaming, typed/factorized fallbacks,
+cancellation/work exhaustion, poisoned reuse and reader/private-write visibility.
+Independent runtime review found no introduced blocking defect. Parameters and
+full platform/product qualification remain open. See [the implementation scope](SQL_AGGREGATE_DEMAND.md)
+and [historical test-first plan](SQL_AGGREGATE_DEMAND_PLAN.md). Existing right-hand
+boolean absorbers still evaluate aggregates that PostgreSQL eliminates; that
+separate parity gap is explicitly open. A separate
 high-exponent numeric-literal capacity finding is retained rather than hidden by
 the explicit float8 inputs used to isolate aggregate overflow.
 

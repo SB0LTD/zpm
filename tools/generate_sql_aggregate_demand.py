@@ -1,4 +1,4 @@
-"""Generate the intentionally red allocator-free aggregate-demand core contract."""
+"""Generate the allocator-free native-reference aggregate-demand core contract."""
 import argparse
 import json
 from pathlib import Path
@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tests/sql_conformance'))
 from generate_contracts import literal
 
-PRELUDE = r'''//! Generated native-reference aggregate-state demand probes; intentionally red.
+PRELUDE = r'''//! Native-reference aggregate-state demand regressions; baseline ef6e3c0 was red.
 const std=@import("std");const sql=@import("sql");
 const DB=sql.Database(.{.tables=3,.columns=8,.rows_per_table=16,.work_rows=128,.result_rows=64,.expr_nodes=512,.text_bytes=128});
 var db:DB=.{};var result:DB.Result=.{};
