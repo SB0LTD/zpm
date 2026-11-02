@@ -3,7 +3,7 @@
   "date": "2026-11-02",
   "scope": "Plain-query output demand and immutable diagnostics; not full planner parity",
   "sha256": {
-    "src/core/sql.sig": "9a967ebcb8058de8c32c1445654d59c96e1e7b3d92fa508ae7f830bbccaf702a",
+    "src/core/sql.sig": "1ded27895466dbf467328348abfa422e1034187f19a7fa541d9ca391e5b83bd6",
     "src/core/sql/ast.sig": "80b19ac514fa4eeff809e69e349aecef2e5a923e2c217b0cd2ce4c6501e1e0a0",
     "src/core/sql/binder.sig": "f2bd1b946ad6d85dcb424f38bb6bee53e113b16d0126e566ec7cd2c9e12c8d46",
     "src/core/sql/exec.sig": "231664f30000458db9a4d6143d590b8d2d8ea7cf294d2f762950da1b2ceee806",
@@ -14,7 +14,14 @@
     ".scratch/planner/canonical-final.log": "b6e74cc926a6aa842ae9c8a812cd62d080551dd28be38af8f4678fcc15562c2d",
     ".scratch/planner/native-verified.json": "0f2c3e78afee53f600fba73a34ef2bfe4af47d3cfdd095404635652caf99ec06",
     ".scratch/planner/reviewer-final-dependencies.log": "226b54151950dc450181f3e2b6fcf92d2ecbdd9fa97ba6b5f4b9fe57d84f199f",
-    ".scratch/planner/conformance.log": "f976dbfb9b1a6a1706b1ca3a635167b6ade201db93a2204dbafe8758823381d3"
+    ".scratch/planner/conformance.log": "f976dbfb9b1a6a1706b1ca3a635167b6ade201db93a2204dbafe8758823381d3",
+    "src/db/store.sig": "e6337ab624385fe8c97103770a698758144cbe39f6f10ee67fd725b618f8aa6a",
+    "tests/test_sql_parallel_read.sig": "17845f605ec37229eaed99681e61ea6c9adb233823fa69597f2ae25a96401afc",
+    ".scratch/planner/parallel-red.log": "c2df31b693e715020c13f52f7f41c5597ed084189a7001c28a1f99c3add34056",
+    ".scratch/planner/parallel-debug.log": "a7cfece024d7165f966d1b19ecdfbd04bfff60a7fc09b2e9cc69ea5a8bf3b290",
+    ".scratch/planner/parallel-final.log": "c46061cfee3397f657be2e770f1736c55515c5e57104ababaeeed4acf72398c3",
+    ".scratch/planner/reviewer-correction-final.log": "a98e03a47fb7c8df37314310cb19637e50e8a016eea6a1cf10d8f354caaad03e",
+    ".scratch/planner/broad-ci.log": "e08fcfbc910ea2d50ed233adea3269b29f9d735da5bba8db6f61fd199b287aa2"
   },
   "commands": [
     {
@@ -38,6 +45,15 @@
       "smoke_pass": 12,
       "failed": 89,
       "unexecuted": 17
+    },
+    {
+      "command": "sig build test-parallel-read run-contract-sql-planner-demand -Doptimize=ReleaseSafe -j1",
+      "executor": "independent reviewer, final exact source",
+      "exit": 0,
+      "core_assertions": 444,
+      "parallel_assertions": 46,
+      "real_queries": 2400,
+      "native_threads": 8
     }
   ],
   "review": {
@@ -51,5 +67,12 @@
     "passed": 18,
     "scope": "Pre-final dependency-bit refinement; not final-source platform qualification"
   },
-  "hosted_qualification": "Pending; required before merge"
+  "hosted_qualification": "Pending; required before merge",
+  "introduced_regression": {
+    "run": 41366403540,
+    "error": "Private ReadContext Describe raised DivisionByZero; separate from four known legacy failures",
+    "test_first_exit": 1,
+    "correction": "Separate metadata binding, invalidate metadata plans and re-prepare Store Execute against same snapshot",
+    "review": "Independent re-review approved, fresh exact-source rebuild passed"
+  }
 }

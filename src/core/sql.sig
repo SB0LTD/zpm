@@ -444,12 +444,22 @@ pub fn Database(comptime config: Config) type {
             /// Callbacks in session (clock/zone resolver/control) must themselves
             /// be safe for concurrent reads. Sequence hooks are always disabled.
             pub fn prepare(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot) Error!void {
+                return self.prepareMode(db,source,snapshot,false);
+            }
+            /// Metadata binding is separate from executable preparation. It
+            /// never leaves a metadata-only plan available to run().
+            pub fn describe(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,result:*Result) Error!void {
+                defer self.prepared=null;
+                try self.prepareMode(db,source,snapshot,true);
+                try self.describeResult(result);
+            }
+            fn prepareMode(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool) Error!void {
                 try self.validate(db,source,null);
                 self.prepared=null;
                 self.preparation_error=null;self.database=db;self.source=source;self.snapshot=snapshot;
-                self.prepareBody(db,source,snapshot) catch |err| {self.preparation_error=err;return err;};
+                self.prepareBody(db,source,snapshot,describe_only) catch |err| {self.preparation_error=err;return err;};
             }
-            fn prepareBody(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot) Error!void {
+            fn prepareBody(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool) Error!void {
                 self.session.sequences=null;
                 const parsed=try P.parse(source,&self.workspace.nodes,.standard);
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
@@ -458,7 +468,7 @@ pub fn Database(comptime config: Config) type {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
                 }
                 const context:B.Context=.{.source=source,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
-                    .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans};
+                    .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only};
                 const bound=try B.bind(&context,&parsed);
                 for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
                     .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,

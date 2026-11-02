@@ -79,3 +79,17 @@ parity. Configured numeric/AST/workspace capacities still apply. The original
 Core regression, fresh independent review, PG16/18 differential, all supported
 platforms and exact-artifact release qualification remain required before merge.
 No speedup or production-readiness claim is made by this correctness slice.
+
+## Hosted read-context correction
+
+The first hosted broad graph exposed a separate private ReadContext metadata
+path that used executable preparation and raised DivisionByZero during Describe.
+Its failing log is preserved; this was an introduced regression, not one of the
+four legacy transport/media failures. ReadContext now has a metadata-specific
+describe operation. It retains semantic checks and cancellation, always clears
+its prepared plan on return, and cannot feed a metadata-only plan to run().
+Executable preparation still reports immutable errors on empty inputs. Store
+Describe uses this operation for private readers. A subsequent Store Execute
+re-prepares against the same caller-held snapshot; cancellation/preparation errors
+remain sticky rather than being silently retried. The extended parallel-read
+contract checks error timing, unusable metadata plans, semantic errors and reuse.

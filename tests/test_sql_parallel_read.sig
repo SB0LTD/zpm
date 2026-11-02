@@ -31,9 +31,9 @@ fn insideExecution(raw:?*anyopaque) DB.SqlError!void {
     while(arrivals.load(.acquire)!=255) std.atomic.spinLoopHint();
 }
 fn canceled(_: ?*anyopaque) DB.SqlError!void {return error.QueryCanceled;}
-fn check(ok:bool) !void {assertions+=1;if(!ok) return error.ParallelReadContract;}
+fn check(ok:bool) !void {assertions+=1;if(!ok) {std.debug.print("parallel assertion {d} failed\n",.{assertions});return error.ParallelReadContract;}}
 fn rejected(comptime expected:anyerror,actual:anytype) !void {
-    if(actual) |_| return error.ExpectedFailure else |err| try check(err==expected);
+    if(actual) |_| return error.ExpectedFailure else |err| {if(err!=expected) std.debug.print("expected {s}, got {s}\n",.{@errorName(expected),@errorName(err)});try check(err==expected);}
 }
 fn queries(index:usize) !void {
     const context=&contexts[index];const result=&results[index];var text:[512]u8=undefined;
@@ -124,6 +124,16 @@ pub fn main(init:std.process.Init) !void {
     try connection.describe("SELECT 1/0 AS unevaluated",result);
     try check(result.row_count==0 and result.column_count==1);
     try rejected(error.DivisionByZero,connection.execute("SELECT 1/0 AS unevaluated",result));
+    try connection.describe("SELECT sqrt(-1::numeric) WHERE FALSE",result);
+    try check(result.row_count==0 and result.column_count==1 and result.column_types[0]==.numeric);
+    try rejected(error.InvalidParameterValue,context.run(result));
+    try rejected(error.InvalidArgumentForPowerFunction,connection.execute("SELECT sqrt(-1::numeric) WHERE FALSE",result));
+    try rejected(error.ColumnNotFound,connection.describe("SELECT 1/0,missing FROM points",result));
+    try connection.describe("SELECT 1 AS reusable",result);
+    try check(result.row_count==0 and result.column_count==1);
+    try connection.execute("SELECT 1 AS reusable",result);
+    try check(result.row_count==1 and result.rows[0].cells[0].integer==1);
+
     try connection.describe("WITH p AS(SELECT id,amount FROM points) SELECT id,amount FROM p",result);
     try check(result.row_count==0 and result.column_count==2);
     try rejected(error.UnsupportedStatement,connection.describe("DELETE FROM points",result));
