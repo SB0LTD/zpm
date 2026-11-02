@@ -7,6 +7,7 @@
 //!   lfm3-run <model.gguf> raw <threads> <max_new> <text>
 //!   lfm3-run <model.gguf> bench <threads> <prompt_tokens> <generated_tokens>
 const std = @import("std");
+const builtin = @import("builtin");
 const process = @import("sig_process");
 const gguf = @import("gguf");
 const plan_mod = @import("lfm3_plan");
@@ -55,29 +56,66 @@ const Memory = struct {
     }
 };
 
+const Win = struct {
+    extern "kernel32" fn SetProcessInformation(?*anyopaque, u32, *const anyopaque, u32) callconv(.winapi) c_int;
+    extern "kernel32" fn GetProcessAffinityMask(?*anyopaque, *usize, *usize) callconv(.winapi) c_int;
+};
+const process_power_throttling = 4;
+
 /// Spin-then-sleep worker pool. Workers claim fixed-size chunks from a shared
-/// counter, so faster cores take more of a task. The caller works too.
+/// counter, so faster cores take more of a task. The caller works too, and
+/// returns once every chunk is done: a worker that wakes late, or is
+/// descheduled while idle, holds up only the chunk it claimed, if any.
 const Pool = struct {
     threads: [MAX_WORKERS]worker.Thread = @splat(.{}),
     count: usize = 0,
     task: ?*const executor.Task = null,
     chunk: usize = 1,
     stopping: bool = false,
+    // More threads than CPUs: a descheduled chunk owner may be ready behind
+    // a spinning thread, so spinners yield. On dedicated CPUs a yield only
+    // hands time to background work (3-10% of 24-thread prefill here).
+    share_cpus: bool = false,
     // Spinning workers read `generation` while claims hit `next` and
-    // completions hit `pending`: one cache line each, or they ping-pong.
+    // completions hit `done`: one cache line each, or they ping-pong.
     generation: std.atomic.Value(u32) align(64) = .init(0),
-    pending: std.atomic.Value(u32) align(64) = .init(0),
-    next: std.atomic.Value(usize) align(64) = .init(0),
+    // (chunks << 32) | next chunk. A claim adds one, so a worker that wakes
+    // late either takes a chunk of the current task or overshoots harmlessly.
+    // `task` and `chunk` change only while no chunk is claimed and unfinished.
+    next: std.atomic.Value(u64) align(64) = .init(0),
+    done: std.atomic.Value(u32) align(64) = .init(0),
     sleepers: std.atomic.Value(u32) align(64) = .init(0),
 
     fn start(self: *Pool, workers: usize) !void {
+        runAtFullSpeed();
         self.count = workers;
+        self.share_cpus = workers + 1 > availableCpus();
         for (self.threads[0..workers]) |*thread| try thread.start(&workerMain, self);
+    }
+
+    fn availableCpus() usize {
+        if (builtin.os.tag == .windows) {
+            var process_mask: usize = 0;
+            var system_mask: usize = 0;
+            if (Win.GetProcessAffinityMask(std.os.windows.GetCurrentProcess(), &process_mask, &system_mask) == 0) return MAX_WORKERS + 1;
+            return @popCount(process_mask);
+        }
+        return std.Thread.getCpuCount() catch MAX_WORKERS + 1;
+    }
+
+    /// Windows 11 power management throttles a background process after a few
+    /// seconds of work: on the i9-14900HX it packed every thread onto the
+    /// E-cores while the P-cores idled (24 threads on 16 cores). Opt out of
+    /// execution-speed throttling, as ggml does per thread.
+    fn runAtFullSpeed() void {
+        if (builtin.os.tag != .windows) return;
+        // PROCESS_POWER_THROTTLING_STATE: version 1, EXECUTION_SPEED controlled, state off.
+        const state = [3]u32{ 1, 1, 0 };
+        _ = Win.SetProcessInformation(std.os.windows.GetCurrentProcess(), process_power_throttling, &state, @sizeOf(@TypeOf(state)));
     }
 
     fn stop(self: *Pool) void {
         self.stopping = true;
-        self.pending.store(@intCast(self.count), .seq_cst);
         _ = self.generation.fetchAdd(1, .seq_cst);
         worker.wakeAll(&self.generation);
         for (self.threads[0..self.count]) |*thread| thread.join() catch {};
@@ -90,21 +128,28 @@ const Pool = struct {
     fn dispatch(context: *anyopaque, task: *const executor.Task) void {
         const self: *Pool = @ptrCast(@alignCast(context));
         if (self.count == 0 or task.count < 2) return task.execute(task.context, 0, task.count);
+        std.debug.assert(task.count <= std.math.maxInt(u32));
         self.task = task;
         self.chunk = @max(1, task.count / ((self.count + 1) * 4));
-        self.next.store(0, .seq_cst);
-        self.pending.store(@intCast(self.count), .seq_cst);
+        const chunks: u32 = @intCast((task.count + self.chunk - 1) / self.chunk);
+        self.done.store(0, .monotonic);
+        self.next.store(@as(u64, chunks) << 32, .release);
         _ = self.generation.fetchAdd(1, .seq_cst);
         if (self.sleepers.load(.seq_cst) != 0) worker.wakeAll(&self.generation);
-        self.drain(task);
-        while (self.pending.load(.acquire) != 0) std.atomic.spinLoopHint();
+        self.drain();
+        var spins: u32 = 0;
+        while (self.done.load(.acquire) != chunks) : (spins +%= 1) self.relax(spins);
     }
 
-    fn drain(self: *Pool, task: *const executor.Task) void {
+    fn drain(self: *Pool) void {
         while (true) {
-            const first = self.next.fetchAdd(self.chunk, .acq_rel);
-            if (first >= task.count) return;
+            const claim = self.next.fetchAdd(1, .acq_rel);
+            const ordinal: u32 = @truncate(claim);
+            if (ordinal >= claim >> 32) return;
+            const task = self.task.?;
+            const first = ordinal * self.chunk;
             task.execute(task.context, first, @min(task.count, first + self.chunk));
+            _ = self.done.fetchAdd(1, .release);
         }
     }
 
@@ -116,7 +161,7 @@ const Pool = struct {
             while (self.generation.load(.acquire) == seen) {
                 spins += 1;
                 if (spins < 200_000) {
-                    std.atomic.spinLoopHint();
+                    self.relax(spins);
                 } else {
                     _ = self.sleepers.fetchAdd(1, .seq_cst);
                     worker.waitForChange(&self.generation, seen, 50);
@@ -124,13 +169,15 @@ const Pool = struct {
                 }
             }
             seen = self.generation.load(.acquire);
-            if (self.stopping) {
-                _ = self.pending.fetchSub(1, .acq_rel);
-                return;
-            }
-            self.drain(self.task.?);
-            _ = self.pending.fetchSub(1, .acq_rel);
+            if (self.stopping) return;
+            self.drain();
         }
+    }
+
+    /// One busy-wait step; past a short spin on shared CPUs, yield now and then.
+    fn relax(self: *const Pool, spins: u32) void {
+        if (!self.share_cpus or spins < 2048 or spins % 64 != 0) return std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 };
 
