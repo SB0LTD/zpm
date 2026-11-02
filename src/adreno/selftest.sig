@@ -120,18 +120,17 @@ fn lcg(state: *u32) u32 {
     return state.*;
 }
 
-/// Run every test. Buffers are allocated from `dev` (about 70 MB with the
-/// bandwidth test, 6 MB without).
+/// Run every test. Buffers come from `dev`: 4 MB, and for the bandwidth
+/// test (`bandwidth`) 64 MB more, or 16 MB when that is not to be had.
 pub fn runAll(dev: Device, w: *Work, log: Log, bandwidth: bool) Result {
     var res = Result{};
-    const big: usize = if (bandwidth) 64 << 20 else 1 << 20;
     var c = Ctx{
         .dev = dev,
         .log = log,
         .w = w,
         .code = dev.alloc(64 * 1024) catch return failAlloc(log, &res),
         .ib = dev.alloc(64 * 1024) catch return failAlloc(log, &res),
-        .data = dev.alloc(big) catch return failAlloc(log, &res),
+        .data = dev.alloc(1 << 20) catch return failAlloc(log, &res),
         .data2 = dev.alloc(1 << 20) catch return failAlloc(log, &res),
         .out = dev.alloc(1 << 20) catch return failAlloc(log, &res),
         .ts = dev.alloc(4096) catch return failAlloc(log, &res),
@@ -391,10 +390,12 @@ fn testSfu(c: *Ctx) void {
 
 fn testBandwidth(c: *Ctx) void {
     const name = "memory read bandwidth";
-    const bytes = c.data.cpu.len;
+    const buf = c.dev.alloc(64 << 20) catch c.dev.alloc(16 << 20) catch return c.fail(name, "no memory for it", .{});
+    defer c.dev.free(buf);
+    const bytes = buf.cpu.len;
     const vec4s = bytes / 16;
     const groups = vec4s / (128 * 16);
-    const d = addr(c.data);
+    const d = addr(buf);
     const o = addr(c.out);
     // Each fiber sums 16 vec4s strided by the grid (coalesced per wave).
     if (!c.launch(name,
@@ -408,11 +409,12 @@ fn testBandwidth(c: *Ctx) void {
         \\add.u r1.x, r1.x, r1.y
         \\mov.u32u32 r2.x, 0
         \\mov.u32u32 r1.z, 16
+        \\mov.u32u32 r1.w, 2048
         \\loop:
         \\ldg.a.u32 r3.x, g[c0.x+r1.x+0], 4
         \\add.u r2.x, r2.x, r3.x
         \\add.u r2.x, r2.x, r3.w
-        \\add.u r1.x, r1.x, 2048
+        \\add.u r1.x, r1.x, r1.w
         \\sub.u r1.z, r1.z, 1
         \\cmps.u.ne p0.x, r1.z, 0
         \\br p0.x, #loop
@@ -484,7 +486,7 @@ fn testAlu(c: *Ctx) void {
 
 test "the bring-up tests pass on the emulated device" {
     const S = struct {
-        var arena: [12 << 20]u8 align(4096) = undefined;
+        var arena: [24 << 20]u8 align(4096) = undefined;
         var dev: device.EmuDevice = undefined;
         var work: Work = .{};
         var lines: usize = 0;
@@ -494,7 +496,7 @@ test "the bring-up tests pass on the emulated device" {
         }
     };
     S.dev = .{ .arena = &S.arena };
-    const r = runAll(S.dev.device(), &S.work, S.log, false);
+    const r = runAll(S.dev.device(), &S.work, S.log, true);
     try std.testing.expectEqual(@as(u32, 0), r.failed);
-    try std.testing.expect(r.passed >= 8);
+    try std.testing.expect(r.passed >= 9);
 }
