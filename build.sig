@@ -994,6 +994,91 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("sig_process", process_source),
         },
     });
+
+    // ── LFM3 (LFM3-Audio-2B text backbone): short-conv + GQA hybrid on CPU ──
+    _ = try ctx.addModule("unicode_class", "src/core/unicode_class.sig");
+    const lfm3_plan = try ctx.addModule("lfm3_plan", "src/core/lfm3_plan.sig");
+    try wire(ctx, lfm3_plan, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_plan, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, lfm3_plan, "sig_mem", "src/core/sig_mem.sig");
+    const lfm3_executor = try ctx.addModule("lfm3_executor", "src/core/lfm3_executor.sig");
+    try wire(ctx, lfm3_executor, "sig_math", "src/core/sig_math.sig");
+    try wire(ctx, lfm3_executor, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_executor, "lfm3_plan", "src/core/lfm3_plan.sig");
+    try wire(ctx, lfm3_executor, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, lfm3_executor, "transformer_ops", "src/core/transformer_ops.sig");
+    const lfm3_tokenizer = try ctx.addModule("lfm3_tokenizer", "src/core/lfm3_tokenizer.sig");
+    try wire(ctx, lfm3_tokenizer, "sig_mem", "src/core/sig_mem.sig");
+    try wire(ctx, lfm3_tokenizer, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_tokenizer, "tokenizer", "src/core/tokenizer.sig");
+    try wire(ctx, lfm3_tokenizer, "unicode_class", "src/core/unicode_class.sig");
+    const test_lfm3 = try ctx.addStep("test-lfm3", "Execute LFM3 schedule, conv-state, tokenizer and executor contracts", &noopStep);
+    try ctx.addDependency(test_all, test_lfm3);
+    _ = try addTest(ctx, test_lfm3, "test-unicode-class", "src/core/unicode_class.sig", &.{});
+    _ = try addContract(ctx, test_lfm3, "contract-lfm3", "tests/test_lfm3.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+        importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+        importEntry("lfm3_tokenizer", "src/core/lfm3_tokenizer.sig"),
+        importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+    });
+
+    // ── LFM3-Audio: hearing (mel, encoder) and speaking (MaskGIT codes, codec) ──
+    _ = try ctx.addModule("lfm3_audio_mel", "src/core/lfm3_audio_mel.sig");
+    const lfm3_audio_ops = try ctx.addModule("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig");
+    try wire(ctx, lfm3_audio_ops, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_audio_ops, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, lfm3_audio_ops, "lfm3_executor", "src/core/lfm3_executor.sig");
+    try wire(ctx, lfm3_audio_ops, "lfm3_plan", "src/core/lfm3_plan.sig");
+    const lfm3_audio_encoder = try ctx.addModule("lfm3_audio_encoder", "src/core/lfm3_audio_encoder.sig");
+    try wire(ctx, lfm3_audio_encoder, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_audio_encoder, "lfm3_audio_ops", "src/core/lfm3_audio_ops.sig");
+    const lfm3_audio_gen = try ctx.addModule("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig");
+    try wire(ctx, lfm3_audio_gen, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_audio_gen, "lfm3_audio_ops", "src/core/lfm3_audio_ops.sig");
+    const test_lfm3_audio = try ctx.addStep("test-lfm3-audio", "Execute LFM3-Audio front end, encoder and speech generation contracts", &noopStep);
+    try ctx.addDependency(test_all, test_lfm3_audio);
+    _ = try addTest(ctx, test_lfm3_audio, "test-lfm3-audio-mel", "src/core/lfm3_audio_mel.sig", &.{});
+    _ = try addTest(ctx, test_lfm3_audio, "test-lfm3-audio-ops", "src/core/lfm3_audio_ops.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+        importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+    });
+    _ = try addTest(ctx, test_lfm3_audio, "test-lfm3-audio-gen", "src/core/lfm3_audio_gen.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig"),
+    });
+    _ = try addContract(ctx, test_lfm3_audio, "contract-lfm3-audio", "tests/test_lfm3_audio.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig"),
+        importEntry("lfm3_audio_encoder", "src/core/lfm3_audio_encoder.sig"),
+        importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
+    });
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/lfm3_run.sig",
+        .output_name = "lfm3-run",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{
+            importEntry("gguf", "src/core/gguf.sig"),
+            importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+            importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+            importEntry("lfm3_tokenizer", "src/core/lfm3_tokenizer.sig"),
+            importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
+            importEntry("worker_thread", "src/platform/worker_thread.sig"),
+            importEntry("sig_process", process_source),
+            importEntry("lfm3_audio_mel", "src/core/lfm3_audio_mel.sig"),
+            importEntry("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig"),
+            importEntry("lfm3_audio_encoder", "src/core/lfm3_audio_encoder.sig"),
+            importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
+        },
+    });
+
     const tts_gpu = try ctx.addModule("tts_gpu", "src/tts/gpu.sig");
     try wire(ctx, tts_gpu, "tts_model_container", "src/tts/model_container.sig");
     try wire(ctx, tts_gpu, "quantized_linear", "src/core/quantized_linear.sig");
@@ -1240,6 +1325,16 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-net-tcp", "src/net/tcp.sig", &.{
         importEntry("net_checksum", "src/net/checksum.sig"),
         importEntry("net_ipv4", "src/net/ipv4.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-net-dns", "src/net/dns.sig", &.{
+        importEntry("net_udp", "src/net/udp.sig"),
+        importEntry("net_ipv4", "src/net/ipv4.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-net-dhcp", "src/net/dhcp.sig", &.{
+        importEntry("net_ethernet", "src/net/ethernet.sig"),
+        importEntry("net_ipv4", "src/net/ipv4.sig"),
+        importEntry("net_udp", "src/net/udp.sig"),
+        importEntry("net_checksum", "src/net/checksum.sig"),
     });
     const window = try ctx.addModule("window", "src/platform/window.sig");
     try wire(ctx, window, "win32", win32_path);

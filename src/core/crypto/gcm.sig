@@ -10,7 +10,14 @@
 // - Arbitrary AAD (additional authenticated data)
 // - 128-bit authentication tag
 
+// Constant-time: AES is the bitsliced aes.sig core, and GHASH is
+// std.crypto.onetimeauth.Ghash, which uses PMULL/PCLMUL when the target has
+// them and otherwise a branch-free, table-free carry-less multiply (integer
+// multiplies with masked "holes"). Neither indexes memory by H or the data.
+
+const std = @import("std");
 const aes = @import("aes");
+const Ghash = std.crypto.onetimeauth.Ghash;
 
 /// Authentication tag length in bytes.
 pub const TAG_LEN = 16;
@@ -21,273 +28,131 @@ pub const NONCE_LEN = 12;
 /// Key length in bytes.
 pub const KEY_LEN = 16;
 
-/// GCM context with pre-computed H table for GHASH.
-pub const Gcm = struct {
-    cipher: aes.Aes128,
-    h: [16]u8, // H = AES_K(0^128) for GHASH
-
-    /// Initialize GCM with a 128-bit key.
-    pub fn init(key: *const [KEY_LEN]u8) Gcm {
-        const cipher = aes.Aes128.init(key);
-
-        // Compute H = E(K, 0^128)
-        var h: [16]u8 = @splat(0);
-        cipher.encryptBlock(&h);
-
-        return .{
-            .cipher = cipher,
-            .h = h,
-        };
-    }
-
-    /// Authenticated encryption (seal).
-    /// Encrypts `plaintext` in place, appends 16-byte tag to `tag_out`.
-    /// nonce must be exactly 12 bytes.
-    pub fn seal(
-        self: *const Gcm,
-        nonce: *const [NONCE_LEN]u8,
-        plaintext: []u8,
-        aad: []const u8,
-        tag_out: *[TAG_LEN]u8,
-    ) void {
-        // J0 = nonce || 0x00000001 (for tag computation)
-        var j0: [16]u8 = undefined;
-        @memcpy(j0[0..12], nonce);
-        j0[12] = 0;
-        j0[13] = 0;
-        j0[14] = 0;
-        j0[15] = 1;
-
-        // Encrypt plaintext using CTR starting at counter = 2
-        self.cipher.ctr(nonce, 2, plaintext);
-
-        // Compute GHASH over AAD and ciphertext
-        var ghash_state: [16]u8 = @splat(0);
-        ghashUpdate(&self.h, &ghash_state, aad);
-        ghashUpdate(&self.h, &ghash_state, plaintext);
-
-        // Final GHASH block: len(A) || len(C) in bits, both as 64-bit big-endian
-        var len_block: [16]u8 = @splat(0);
-        const aad_bits: u64 = @as(u64, @intCast(aad.len)) * 8;
-        const ct_bits: u64 = @as(u64, @intCast(plaintext.len)) * 8;
-        putU64BE(len_block[0..8], aad_bits);
-        putU64BE(len_block[8..16], ct_bits);
-        ghashBlock(&self.h, &ghash_state, &len_block);
-
-        // Tag = GHASH_result XOR E(K, J0)
-        var enc_j0: [16]u8 = j0;
-        self.cipher.encryptBlock(&enc_j0);
-        for (0..16) |i| tag_out[i] = ghash_state[i] ^ enc_j0[i];
-    }
-
-    /// Authenticated decryption (open).
-    /// Verifies tag, then decrypts `ciphertext` in place.
-    /// Returns true if authentication succeeds, false if tag mismatch.
-    /// On failure, ciphertext is zeroed to prevent use of unauthenticated data.
-    pub fn open(
-        self: *const Gcm,
-        nonce: *const [NONCE_LEN]u8,
-        ciphertext: []u8,
-        aad: []const u8,
-        tag: *const [TAG_LEN]u8,
-    ) bool {
-        // J0 = nonce || 0x00000001
-        var j0: [16]u8 = undefined;
-        @memcpy(j0[0..12], nonce);
-        j0[12] = 0;
-        j0[13] = 0;
-        j0[14] = 0;
-        j0[15] = 1;
-
-        // Compute GHASH over AAD and ciphertext (before decryption)
-        var ghash_state: [16]u8 = @splat(0);
-        ghashUpdate(&self.h, &ghash_state, aad);
-        ghashUpdate(&self.h, &ghash_state, ciphertext);
-
-        // Final GHASH block
-        var len_block: [16]u8 = @splat(0);
-        const aad_bits: u64 = @as(u64, @intCast(aad.len)) * 8;
-        const ct_bits: u64 = @as(u64, @intCast(ciphertext.len)) * 8;
-        putU64BE(len_block[0..8], aad_bits);
-        putU64BE(len_block[8..16], ct_bits);
-        ghashBlock(&self.h, &ghash_state, &len_block);
-
-        // Compute expected tag
-        var enc_j0: [16]u8 = j0;
-        self.cipher.encryptBlock(&enc_j0);
-        var expected_tag: [16]u8 = undefined;
-        for (0..16) |i| expected_tag[i] = ghash_state[i] ^ enc_j0[i];
-
-        // Constant-time tag comparison
-        var diff: u8 = 0;
-        for (0..16) |i| diff |= expected_tag[i] ^ tag[i];
-
-        if (diff != 0) {
-            // Authentication failed — zero the output
-            @memset(ciphertext, 0);
-            return false;
-        }
-
-        // Decrypt in place using CTR starting at counter = 2
-        self.cipher.ctr(nonce, 2, ciphertext);
-        return true;
-    }
-};
+/// GCM over AES-128 (TLS_AES_128_GCM_SHA256, QUIC).
+pub const Gcm = GcmWith(aes.Aes128, KEY_LEN);
 
 /// AES-256-GCM key length in bytes.
 pub const KEY_LEN_256 = 32;
 
-/// GCM context over AES-256. Mirrors `Gcm` exactly but with a 256-bit key;
-/// GHASH, J0, CTR offset (counter=2), and tag construction are identical.
-pub const Gcm256 = struct {
-    cipher: aes.Aes256,
-    h: [16]u8,
+/// GCM over AES-256 (TLS_AES_256_GCM_SHA384): the same GHASH, J0, CTR
+/// offset (counter = 2) and tag construction with a 256-bit key.
+pub const Gcm256 = GcmWith(aes.Aes256, KEY_LEN_256);
 
-    pub fn init(key: *const [KEY_LEN_256]u8) Gcm256 {
-        const cipher = aes.Aes256.init(key);
-        var h: [16]u8 = @splat(0);
-        cipher.encryptBlock(&h);
-        return .{ .cipher = cipher, .h = h };
-    }
+/// GCM context with pre-computed powers of H for GHASH.
+fn GcmWith(comptime Cipher: type, comptime key_len: usize) type {
+    return struct {
+        const Self = @This();
 
-    pub fn seal(self: *const Gcm256, nonce: *const [NONCE_LEN]u8, plaintext: []u8, aad: []const u8, tag_out: *[TAG_LEN]u8) void {
-        var j0: [16]u8 = undefined;
-        @memcpy(j0[0..12], nonce);
-        j0[12] = 0; j0[13] = 0; j0[14] = 0; j0[15] = 1;
-        self.cipher.ctr(nonce, 2, plaintext);
-        var ghash_state: [16]u8 = @splat(0);
-        ghashUpdate(&self.h, &ghash_state, aad);
-        ghashUpdate(&self.h, &ghash_state, plaintext);
-        var len_block: [16]u8 = @splat(0);
-        putU64BE(len_block[0..8], @as(u64, @intCast(aad.len)) * 8);
-        putU64BE(len_block[8..16], @as(u64, @intCast(plaintext.len)) * 8);
-        ghashBlock(&self.h, &ghash_state, &len_block);
-        var enc_j0: [16]u8 = j0;
-        self.cipher.encryptBlock(&enc_j0);
-        for (0..16) |i| tag_out[i] = ghash_state[i] ^ enc_j0[i];
-    }
+        cipher: Cipher,
+        ghash: Ghash, // keyed with H = AES_K(0^128); copied per message
 
-    pub fn open(self: *const Gcm256, nonce: *const [NONCE_LEN]u8, ciphertext: []u8, aad: []const u8, tag: *const [TAG_LEN]u8) bool {
-        var j0: [16]u8 = undefined;
-        @memcpy(j0[0..12], nonce);
-        j0[12] = 0; j0[13] = 0; j0[14] = 0; j0[15] = 1;
-        var ghash_state: [16]u8 = @splat(0);
-        ghashUpdate(&self.h, &ghash_state, aad);
-        ghashUpdate(&self.h, &ghash_state, ciphertext);
-        var len_block: [16]u8 = @splat(0);
-        putU64BE(len_block[0..8], @as(u64, @intCast(aad.len)) * 8);
-        putU64BE(len_block[8..16], @as(u64, @intCast(ciphertext.len)) * 8);
-        ghashBlock(&self.h, &ghash_state, &len_block);
-        var enc_j0: [16]u8 = j0;
-        self.cipher.encryptBlock(&enc_j0);
-        var expected_tag: [16]u8 = undefined;
-        for (0..16) |i| expected_tag[i] = ghash_state[i] ^ enc_j0[i];
-        var diff: u8 = 0;
-        for (0..16) |i| diff |= expected_tag[i] ^ tag[i];
-        if (diff != 0) { @memset(ciphertext, 0); return false; }
-        self.cipher.ctr(nonce, 2, ciphertext);
-        return true;
-    }
-};
+        /// Initialize GCM with the cipher's key.
+        pub fn init(key: *const [key_len]u8) Self {
+            const cipher = Cipher.init(key);
 
-test "gcm256: NIST round-trip AES-256-GCM" {
-    // AES-256-GCM: encrypt then open recovers plaintext; tamper fails.
-    const key: [32]u8 = .{
-        0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c, 0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30, 0x83, 0x08,
-        0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c, 0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30, 0x83, 0x08,
+            // Compute H = E(K, 0^128)
+            var h: [16]u8 = @splat(0);
+            cipher.encryptBlock(&h);
+            const ghash = Ghash.init(&h);
+            std.crypto.secureZero(u8, &h);
+
+            return .{
+                .cipher = cipher,
+                .ghash = ghash,
+            };
+        }
+
+        /// Authenticated encryption (seal).
+        /// Encrypts `plaintext` in place, appends 16-byte tag to `tag_out`.
+        /// nonce must be exactly 12 bytes.
+        pub fn seal(
+            self: *const Self,
+            nonce: *const [NONCE_LEN]u8,
+            plaintext: []u8,
+            aad: []const u8,
+            tag_out: *[TAG_LEN]u8,
+        ) void {
+            // J0 = nonce || 0x00000001 (for tag computation)
+            var j0: [16]u8 = undefined;
+            @memcpy(j0[0..12], nonce);
+            j0[12] = 0;
+            j0[13] = 0;
+            j0[14] = 0;
+            j0[15] = 1;
+
+            // Encrypt plaintext using CTR starting at counter = 2
+            self.cipher.ctr(nonce, 2, plaintext);
+
+            // Compute GHASH over AAD and ciphertext
+            var ghash_state: [16]u8 = undefined;
+            self.ghashAll(aad, plaintext, &ghash_state);
+
+            // Tag = GHASH_result XOR E(K, J0)
+            var enc_j0: [16]u8 = j0;
+            self.cipher.encryptBlock(&enc_j0);
+            for (0..16) |i| tag_out[i] = ghash_state[i] ^ enc_j0[i];
+        }
+
+        /// Authenticated decryption (open).
+        /// Verifies tag, then decrypts `ciphertext` in place.
+        /// Returns true if authentication succeeds, false if tag mismatch.
+        /// On failure, ciphertext is zeroed to prevent use of unauthenticated data.
+        pub fn open(
+            self: *const Self,
+            nonce: *const [NONCE_LEN]u8,
+            ciphertext: []u8,
+            aad: []const u8,
+            tag: *const [TAG_LEN]u8,
+        ) bool {
+            // J0 = nonce || 0x00000001
+            var j0: [16]u8 = undefined;
+            @memcpy(j0[0..12], nonce);
+            j0[12] = 0;
+            j0[13] = 0;
+            j0[14] = 0;
+            j0[15] = 1;
+
+            // Compute GHASH over AAD and ciphertext (before decryption)
+            var ghash_state: [16]u8 = undefined;
+            self.ghashAll(aad, ciphertext, &ghash_state);
+
+            // Compute expected tag
+            var enc_j0: [16]u8 = j0;
+            self.cipher.encryptBlock(&enc_j0);
+            var expected_tag: [16]u8 = undefined;
+            for (0..16) |i| expected_tag[i] = ghash_state[i] ^ enc_j0[i];
+
+            // Constant-time tag comparison
+            var diff: u8 = 0;
+            for (0..16) |i| diff |= expected_tag[i] ^ tag[i];
+
+            if (diff != 0) {
+                // Authentication failed — zero the output
+                @memset(ciphertext, 0);
+                return false;
+            }
+
+            // Decrypt in place using CTR starting at counter = 2
+            self.cipher.ctr(nonce, 2, ciphertext);
+            return true;
+        }
+
+        /// GHASH_H(A || pad || C || pad || len(A) || len(C)), lengths in bits as
+        /// 64-bit big-endian.
+        fn ghashAll(self: *const Self, aad: []const u8, ct: []const u8, out: *[16]u8) void {
+            var st = self.ghash;
+            st.update(aad);
+            st.pad();
+            st.update(ct);
+            st.pad();
+
+            var len_block: [16]u8 = undefined;
+            putU64BE(len_block[0..8], @as(u64, @intCast(aad.len)) * 8);
+            putU64BE(len_block[8..16], @as(u64, @intCast(ct.len)) * 8);
+            st.update(&len_block);
+            st.final(out); // also zeroes the copied state
+        }
     };
-    const nonce: [12]u8 = .{ 0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce, 0xdb, 0xad, 0xde, 0xca, 0xf8, 0x88 };
-    const aad = [_]u8{ 0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef };
-    var pt = [_]u8{ 0xd9, 0x31, 0x32, 0x25, 0xf8, 0x84, 0x06, 0xe5, 0xa5, 0x59, 0x09, 0xc5, 0xaf, 0xf5, 0x26, 0x9a };
-    const orig = pt;
-    const g = Gcm256.init(&key);
-    var tag: [16]u8 = undefined;
-    g.seal(&nonce, &pt, &aad, &tag);
-    // ciphertext differs from plaintext
-    var changed = false;
-    for (0..pt.len) |i| { if (pt[i] != orig[i]) { changed = true; break; } }
-    if (!changed) return error.TestUnexpectedResult;
-    // open recovers plaintext
-    const ok = g.open(&nonce, &pt, &aad, &tag);
-    if (!ok) return error.TestUnexpectedResult;
-    for (0..pt.len) |i| { if (pt[i] != orig[i]) return error.TestUnexpectedResult; }
-}
-
-test "gcm256: tampered tag rejected" {
-    const key: [32]u8 = @splat(0);
-    const nonce: [12]u8 = @splat(0);
-    const g = Gcm256.init(&key);
-    var pt = [_]u8{ 1, 2, 3, 4, 5 };
-    var tag: [16]u8 = undefined;
-    g.seal(&nonce, &pt, "", &tag);
-    tag[0] ^= 0xFF; // corrupt
-    const ok = g.open(&nonce, &pt, "", &tag);
-    if (ok) return error.TestUnexpectedResult;
-}
-
-// ── GHASH (GF(2^128) multiplication) ────────────────────────────────────
-
-/// Process complete and partial blocks through GHASH.
-fn ghashUpdate(h: *const [16]u8, state: *[16]u8, data: []const u8) void {
-    var offset: usize = 0;
-
-    // Process full 16-byte blocks
-    while (offset + 16 <= data.len) {
-        var block: [16]u8 = undefined;
-        @memcpy(&block, data[offset..][0..16]);
-        ghashBlock(h, state, &block);
-        offset += 16;
-    }
-
-    // Process partial final block (zero-padded)
-    if (offset < data.len) {
-        var block: [16]u8 = @splat(0);
-        const remaining = data.len - offset;
-        @memcpy(block[0..remaining], data[offset..][0..remaining]);
-        ghashBlock(h, state, &block);
-    }
-}
-
-/// Process a single 16-byte block: state = (state XOR block) * H in GF(2^128).
-fn ghashBlock(h: *const [16]u8, state: *[16]u8, block: *const [16]u8) void {
-    // XOR block into state
-    for (0..16) |i| state[i] ^= block[i];
-
-    // Multiply state by H in GF(2^128) using the "schoolbook" algorithm
-    // with reduction polynomial x^128 + x^7 + x^2 + x + 1
-    gfMul(state, h);
-}
-
-/// GF(2^128) multiplication: a = a * b, with reduction.
-/// Uses bit-by-bit multiplication (simple, constant-time).
-fn gfMul(a: *[16]u8, b: *const [16]u8) void {
-    var z: [16]u8 = @splat(0); // accumulator
-    var v: [16]u8 = undefined; // shifted copy of a
-    @memcpy(&v, a);
-
-    for (0..128) |i| {
-        // If bit i of b is set, XOR v into z
-        const byte_idx = i / 8;
-        const bit_idx: u3 = @intCast(7 - (i % 8));
-        if (((b[byte_idx] >> bit_idx) & 1) != 0) {
-            for (0..16) |j| z[j] ^= v[j];
-        }
-
-        // v = v >> 1 in GF(2^128) (right shift with reduction)
-        const lsb = v[15] & 1;
-        var j: usize = 15;
-        while (j > 0) : (j -= 1) {
-            v[j] = (v[j] >> 1) | (v[j - 1] << 7);
-        }
-        v[0] = v[0] >> 1;
-
-        // If LSB was 1, XOR reduction polynomial (0xE1 in MSB position)
-        if (lsb != 0) {
-            v[0] ^= 0xE1;
-        }
-    }
-
-    @memcpy(a, &z);
 }
 
 // ── Utility ─────────────────────────────────────────────────────────────
@@ -430,5 +295,130 @@ test "gcm: tampered tag fails authentication" {
     tag[0] ^= 0x01;
 
     const ok = gcm.open(&nonce, &data, "", &tag);
+    if (ok) return error.TestUnexpectedResult;
+}
+
+test "gcm: NIST test case 4 - 60 byte plaintext with AAD" {
+    // Key: feffe9928665731c6d6a8f9467308308, IV: cafebabefacedbaddecaf888
+    const key = [16]u8{ 0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c, 0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30, 0x83, 0x08 };
+    const nonce = [12]u8{ 0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce, 0xdb, 0xad, 0xde, 0xca, 0xf8, 0x88 };
+    const aad = [20]u8{
+        0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed,
+        0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef, 0xab, 0xad, 0xda, 0xd2,
+    };
+    const pt = [60]u8{
+        0xd9, 0x31, 0x32, 0x25, 0xf8, 0x84, 0x06, 0xe5, 0xa5, 0x59, 0x09, 0xc5, 0xaf, 0xf5, 0x26, 0x9a,
+        0x86, 0xa7, 0xa9, 0x53, 0x15, 0x34, 0xf7, 0xda, 0x2e, 0x4c, 0x30, 0x3d, 0x8a, 0x31, 0x8a, 0x72,
+        0x1c, 0x3c, 0x0c, 0x95, 0x95, 0x68, 0x09, 0x53, 0x2f, 0xcf, 0x0e, 0x24, 0x49, 0xa6, 0xb5, 0x25,
+        0xb1, 0x6a, 0xed, 0xf5, 0xaa, 0x0d, 0xe6, 0x57, 0xba, 0x63, 0x7b, 0x39,
+    };
+    const expected_ct = [60]u8{
+        0x42, 0x83, 0x1e, 0xc2, 0x21, 0x77, 0x74, 0x24, 0x4b, 0x72, 0x21, 0xb7, 0x84, 0xd0, 0xd4, 0x9c,
+        0xe3, 0xaa, 0x21, 0x2f, 0x2c, 0x02, 0xa4, 0xe0, 0x35, 0xc1, 0x7e, 0x23, 0x29, 0xac, 0xa1, 0x2e,
+        0x21, 0xd5, 0x14, 0xb2, 0x54, 0x66, 0x93, 0x1c, 0x7d, 0x8f, 0x6a, 0x5a, 0xac, 0x84, 0xaa, 0x05,
+        0x1b, 0xa3, 0x0b, 0x39, 0x6a, 0x0a, 0xac, 0x97, 0x3d, 0x58, 0xe0, 0x91,
+    };
+    const expected_tag = [16]u8{
+        0x5b, 0xc9, 0x4f, 0xbc, 0x32, 0x21, 0xa5, 0xdb, 0x94, 0xfa, 0xe9, 0x5a, 0xe7, 0x12, 0x1a, 0x47,
+    };
+
+    const gcm = Gcm.init(&key);
+    var data = pt;
+    var tag: [16]u8 = undefined;
+    gcm.seal(&nonce, &data, &aad, &tag);
+    try std.testing.expectEqualSlices(u8, &expected_ct, &data);
+    try std.testing.expectEqualSlices(u8, &expected_tag, &tag);
+
+    try std.testing.expect(gcm.open(&nonce, &data, &aad, &tag));
+    try std.testing.expectEqualSlices(u8, &pt, &data);
+}
+
+test "gcm: cross-check seal/open against std.crypto.aead.aes_gcm on random inputs" {
+    const StdGcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    var prng = std.Random.DefaultPrng.init(0x67636d5f78636865);
+    const rnd = prng.random();
+
+    var pt_buf: [6000]u8 = undefined;
+    var aad_buf: [300]u8 = undefined;
+    var ours: [6000]u8 = undefined;
+    var theirs: [6000]u8 = undefined;
+    for (0..300) |iter| {
+        var key: [16]u8 = undefined;
+        var nonce: [12]u8 = undefined;
+        rnd.bytes(&key);
+        rnd.bytes(&nonce);
+        // Cover empty, sub-block, exact-block and multi-block (incl. the
+        // 4/8/16-block aggregated GHASH paths) lengths.
+        const pt_len = if (iter < 40) iter else rnd.uintLessThan(usize, pt_buf.len + 1);
+        const aad_len = if (iter % 7 == 0) 0 else rnd.uintLessThan(usize, aad_buf.len + 1);
+        const pt = pt_buf[0..pt_len];
+        const aad = aad_buf[0..aad_len];
+        rnd.bytes(pt);
+        rnd.bytes(aad);
+
+        var want_tag: [16]u8 = undefined;
+        StdGcm.encrypt(theirs[0..pt_len], &want_tag, pt, aad, nonce, key);
+
+        const gcm = Gcm.init(&key);
+        var tag: [16]u8 = undefined;
+        @memcpy(ours[0..pt_len], pt);
+        gcm.seal(&nonce, ours[0..pt_len], aad, &tag);
+        try std.testing.expectEqualSlices(u8, theirs[0..pt_len], ours[0..pt_len]);
+        try std.testing.expectEqualSlices(u8, &want_tag, &tag);
+
+        try std.testing.expect(gcm.open(&nonce, ours[0..pt_len], aad, &tag));
+        try std.testing.expectEqualSlices(u8, pt, ours[0..pt_len]);
+
+        // A one-bit flip anywhere in ciphertext, AAD or tag must be rejected,
+        // matching std.
+        @memcpy(ours[0..pt_len], theirs[0..pt_len]);
+        var bad_tag = tag;
+        const where = rnd.uintLessThan(usize, 3);
+        if (where == 0 and pt_len > 0) {
+            ours[rnd.uintLessThan(usize, pt_len)] ^= @as(u8, 1) << rnd.int(u3);
+        } else if (where == 1 and aad_len > 0) {
+            aad[rnd.uintLessThan(usize, aad_len)] ^= @as(u8, 1) << rnd.int(u3);
+        } else {
+            bad_tag[rnd.uintLessThan(usize, 16)] ^= @as(u8, 1) << rnd.int(u3);
+        }
+        var std_out: [6000]u8 = undefined;
+        const std_ok = if (StdGcm.decrypt(std_out[0..pt_len], ours[0..pt_len], bad_tag, aad, nonce, key)) |_| true else |_| false;
+        try std.testing.expect(!std_ok);
+        try std.testing.expect(!gcm.open(&nonce, ours[0..pt_len], aad, &bad_tag));
+    }
+}
+
+test "gcm256: NIST round-trip AES-256-GCM" {
+    // AES-256-GCM: encrypt then open recovers plaintext; tamper fails.
+    const key: [32]u8 = .{
+        0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c, 0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30, 0x83, 0x08,
+        0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c, 0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30, 0x83, 0x08,
+    };
+    const nonce: [12]u8 = .{ 0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce, 0xdb, 0xad, 0xde, 0xca, 0xf8, 0x88 };
+    const aad = [_]u8{ 0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef };
+    var pt = [_]u8{ 0xd9, 0x31, 0x32, 0x25, 0xf8, 0x84, 0x06, 0xe5, 0xa5, 0x59, 0x09, 0xc5, 0xaf, 0xf5, 0x26, 0x9a };
+    const orig = pt;
+    const g = Gcm256.init(&key);
+    var tag: [16]u8 = undefined;
+    g.seal(&nonce, &pt, &aad, &tag);
+    // ciphertext differs from plaintext
+    var changed = false;
+    for (0..pt.len) |i| { if (pt[i] != orig[i]) { changed = true; break; } }
+    if (!changed) return error.TestUnexpectedResult;
+    // open recovers plaintext
+    const ok = g.open(&nonce, &pt, &aad, &tag);
+    if (!ok) return error.TestUnexpectedResult;
+    for (0..pt.len) |i| { if (pt[i] != orig[i]) return error.TestUnexpectedResult; }
+}
+
+test "gcm256: tampered tag rejected" {
+    const key: [32]u8 = @splat(0);
+    const nonce: [12]u8 = @splat(0);
+    const g = Gcm256.init(&key);
+    var pt = [_]u8{ 1, 2, 3, 4, 5 };
+    var tag: [16]u8 = undefined;
+    g.seal(&nonce, &pt, "", &tag);
+    tag[0] ^= 0xFF; // corrupt
+    const ok = g.open(&nonce, &pt, "", &tag);
     if (ok) return error.TestUnexpectedResult;
 }

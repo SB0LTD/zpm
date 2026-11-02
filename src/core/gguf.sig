@@ -105,6 +105,14 @@ pub const Summary = struct {
     ssm_group_count: u64 = 0, // GDN head count
     ssm_time_step_rank: u64 = 0,
     ssm_inner_size: u64 = 0,
+    // Short-convolution hybrid (lfm2 / lfm3) fields. Per-layer arrays stay in
+    // model storage: a zero KV head count marks a convolution layer, and the
+    // boolean pattern marks sliding-window attention layers.
+    shortconv_l_cache: u64 = 0,
+    sliding_window: u64 = 0,
+    rope_frequency_base_swa: f32 = 0,
+    head_count_kv_layers: ArrayRef = .{},
+    sliding_window_pattern: ArrayRef = .{},
     tokenizer_tokens: ArrayRef = .{},
     tokenizer_merges: ArrayRef = .{},
     tokenizer_scores: ArrayRef = .{},
@@ -320,6 +328,48 @@ pub fn parse(comptime tensor_capacity: usize, source: Source, out: *Index(tensor
     }
 }
 
+/// The scalar numeric (or boolean) value stored under exactly `key`, or null
+/// when the file has no such key or it holds another type. A second bounded
+/// pass over the metadata, for keys the Summary does not keep: an mmproj file
+/// carries both `clip.audio.*` and `clip.gen.audio.*`, which suffix matching
+/// would mix up.
+pub fn metadataNumber(source: Source, key: []const u8) Error!?f64 {
+    var cursor = Cursor{ .source = source };
+    var magic: [4]u8 = undefined;
+    try cursor.readBytes(&magic);
+    if (!mem.eql(u8, &magic, "GGUF")) return error.InvalidMagic;
+    if (try cursor.readU32() != 3) return error.UnsupportedVersion;
+    _ = try cursor.readU64();
+    const metadata_count = try cursor.readU64();
+    var ignored: Summary = .{};
+    var metadata_index: u64 = 0;
+    while (metadata_index < metadata_count) : (metadata_index += 1) {
+        const key_length = try cursor.readU64();
+        if (key_length == 0 or key_length > MAX_KEY_BYTES) return error.InvalidMetadataKey;
+        const reference = KeyRef{ .offset = cursor.position, .length = key_length };
+        try cursor.skip(key_length);
+        const value_type = metadataType(try cursor.readU32()) orelse return error.InvalidMetadataType;
+        if (key_length == key.len and try keyEquals(source, reference, key)) {
+            return switch (value_type) {
+                .uint8 => @floatFromInt(try cursor.readU8()),
+                .int8 => @floatFromInt(@as(i8, @bitCast(try cursor.readU8()))),
+                .uint16 => @floatFromInt(try cursor.readU16()),
+                .int16 => @floatFromInt(@as(i16, @bitCast(try cursor.readU16()))),
+                .uint32 => @floatFromInt(try cursor.readU32()),
+                .int32 => @floatFromInt(@as(i32, @bitCast(try cursor.readU32()))),
+                .uint64 => @floatFromInt(try cursor.readU64()),
+                .int64 => @floatFromInt(@as(i64, @bitCast(try cursor.readU64()))),
+                .float32 => @as(f32, @bitCast(try cursor.readU32())),
+                .float64 => @bitCast(try cursor.readU64()),
+                .boolean => @floatFromInt(try cursor.readU8()),
+                .string, .array => null,
+            };
+        }
+        try consumeMetadataValue(&cursor, value_type, 0, null, &ignored);
+    }
+    return null;
+}
+
 fn consumeMetadataValue(
     cursor: *Cursor,
     value_type: MetadataType,
@@ -399,6 +449,10 @@ fn recordArray(
         summary.tokenizer_scores = value;
     } else if (try keyEquals(source, key, "tokenizer.ggml.token_type")) {
         summary.tokenizer_token_types = value;
+    } else if (try keyEndsWith(source, key, ".attention.head_count_kv")) {
+        summary.head_count_kv_layers = value;
+    } else if (try keyEndsWith(source, key, ".attention.sliding_window_pattern")) {
+        summary.sliding_window_pattern = value;
     }
 }
 
@@ -437,12 +491,18 @@ fn recordInteger(source: Source, key: KeyRef, value: u64, summary: *Summary) voi
         summary.ssm_time_step_rank = value;
     } else if (keyEndsWith(source, key, ".ssm.inner_size") catch false) {
         summary.ssm_inner_size = value;
+    } else if (keyEndsWith(source, key, ".shortconv.l_cache") catch false) {
+        summary.shortconv_l_cache = value;
+    } else if (keyEndsWith(source, key, ".attention.sliding_window") catch false) {
+        summary.sliding_window = value;
     }
 }
 
 fn recordFloat(source: Source, key: KeyRef, value: f32, summary: *Summary) void {
     if (keyEndsWith(source, key, ".rope.freq_base") catch false) {
         summary.rope_frequency_base = value;
+    } else if (keyEndsWith(source, key, ".rope.freq_base_swa") catch false) {
+        summary.rope_frequency_base_swa = value;
     } else if (keyEndsWith(source, key, ".attention.layer_norm_rms_epsilon") catch false) {
         summary.rms_norm_epsilon = value;
     }
@@ -622,3 +682,30 @@ fn basicFixture(dimension: u64, file_size: *usize) FixtureWriter {
     return writer;
 }
 
+
+test "metadataNumber reads exact keys only" {
+    var writer = FixtureWriter{};
+    writer.put("GGUF");
+    writer.putU32(3);
+    writer.putU64(0);
+    writer.putU64(4);
+    writer.string("clip.audio.embedding_length");
+    writer.putU32(@intFromEnum(MetadataType.uint32));
+    writer.putU32(768);
+    writer.string("general.name");
+    writer.putU32(@intFromEnum(MetadataType.string));
+    writer.string("x");
+    writer.string("clip.gen.audio.embedding_length");
+    writer.putU32(@intFromEnum(MetadataType.uint32));
+    writer.putU32(1024);
+    writer.string("clip.audio.attention.layer_norm_epsilon");
+    writer.putU32(@intFromEnum(MetadataType.float32));
+    writer.putU32(@bitCast(@as(f32, 0.5)));
+    const slice = SliceSource{ .bytes = writer.bytes[0..writer.position] };
+    const source = slice.source();
+    if (try metadataNumber(source, "clip.audio.embedding_length") != 768) return error.TestUnexpectedResult;
+    if (try metadataNumber(source, "clip.gen.audio.embedding_length") != 1024) return error.TestUnexpectedResult;
+    if (try metadataNumber(source, "clip.audio.attention.layer_norm_epsilon") != 0.5) return error.TestUnexpectedResult;
+    if (try metadataNumber(source, "audio.embedding_length") != null) return error.TestUnexpectedResult;
+    if (try metadataNumber(source, "general.name") != null) return error.TestUnexpectedResult;
+}
