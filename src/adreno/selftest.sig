@@ -148,6 +148,7 @@ pub fn runAll(dev: Device, w: *Work, log: Log, bandwidth: bool) Result {
     testLocal(&c);
     testSfu(&c);
     testFloat(&c);
+    testUnaligned(&c);
     if (bandwidth) testBandwidth(&c);
     testAlu(&c);
     c.say("compute self-test: {d} passed, {d} failed", .{ res.passed, res.failed });
@@ -476,6 +477,57 @@ fn testFloat(c: *Ctx) void {
     c.say("compute float: mul {d}/{d} add {d}/{d} exact; mad.f32 like @mulAdd {d}, like a*b+c {d}; rndne {d}; f16 (even) {d}, f16 default: even {d} toward-zero {d}", .{ mul_ok, n, add_ok, n, fused, unfused, round_ok, f16_even, f16_default_even, f16_default_rtz });
     if (mul_ok != n or add_ok != n or round_ok != n or f16_even != n) return c.fail(name, "not IEEE round-to-nearest-even", .{});
     c.pass(name, n);
+}
+
+/// Q6_K (210-byte) and Q8_0 (34-byte) blocks put every other block two
+/// bytes off a 4-byte boundary: do u32 loads from such addresses read the
+/// bytes there (and u16 loads, into half registers)?
+fn testUnaligned(c: *Ctx) void {
+    const name = "unaligned global loads";
+    const bytes = c.data.cpu[0..4096];
+    for (bytes, 0..) |*b, i| b.* = @truncate(i * 7 + 3);
+    c.dev.toDevice(c.data, 0, 4096);
+    const d = addr(c.data);
+    const o = addr(c.out);
+    // fiber f: offset f (0..63) bytes + 64: a u32, a u32 x 4, two u16
+    if (!c.launch(name,
+        \\@localsize 64, 1, 1
+        \\@invocationid(r0.x)
+        \\@consts 2
+        \\add.u r1.x, r0.x, 64
+        \\ldg.a.u32 r2.x, g[c0.x+r1.x+0], 1
+        \\ldg.a.u32 r3.x, g[c0.x+r1.x+0], 4
+        \\ldg.a.u16 hr8.x, g[c0.x+r1.x+0], 2
+        \\cov.u16u32 r2.y, hr8.x
+        \\cov.u16u32 r2.z, hr8.y
+        \\mov.u32u32 r2.w, 0
+        \\shl.b r1.y, r0.x, 5
+        \\stg.a.u32 g[c1.x+r1.y+0], r2.x, 4
+        \\add.u r1.z, r1.y, 16
+        \\stg.a.u32 g[c1.x+r1.z+0], r3.x, 4
+        \\end
+    , &.{ d[0], d[1], 0, 0, o[0], o[1], 0, 0 }, .{ 1, 1, 1 })) return;
+    const got = c.outU32();
+    var ok32 = [_]u32{0} ** 4;
+    var ok128 = [_]u32{0} ** 4;
+    var ok16 = [_]u32{0} ** 2;
+    for (0..64) |f| {
+        const at = 64 + f;
+        const g = got[f * 8 ..][0..8];
+        const w = std.mem.readInt(u32, bytes[at..][0..4], .little);
+        if (g[0] == w) ok32[f % 4] += 1;
+        var all = true;
+        for (0..4) |k| if (g[4 + k] != std.mem.readInt(u32, bytes[at + 4 * k ..][0..4], .little)) {
+            all = false;
+        };
+        if (all) ok128[f % 4] += 1;
+        if (f % 2 == 0) {
+            if (g[1] == std.mem.readInt(u16, bytes[at..][0..2], .little) and g[2] == std.mem.readInt(u16, bytes[at + 2 ..][0..2], .little)) ok16[0] += 1;
+        } else if (g[1] == std.mem.readInt(u16, bytes[at..][0..2], .little)) ok16[1] += 1;
+    }
+    c.say("compute unaligned: u32 at +0/+1/+2/+3: {d}/{d}/{d}/{d} of 16; u32x4: {d}/{d}/{d}/{d}; u16x2 even {d}/32 odd {d}/32", .{ ok32[0], ok32[1], ok32[2], ok32[3], ok128[0], ok128[1], ok128[2], ok128[3], ok16[0], ok16[1] });
+    if (ok32[0] != 16 or ok128[0] != 16) return c.fail(name, "aligned loads are wrong", .{});
+    c.pass(name, 64);
 }
 
 fn testBandwidth(c: *Ctx) void {
