@@ -12,6 +12,11 @@
 //! Activations live as three arrays per row of tokens, where the CPU has
 //! one Q8KBlock per 256 lanes: `aq` (the i8 values), `ad` (one f32 scale per
 //! block) and `abs` (the sixteen i16 sums per block).
+//!
+//! Q8_0 (LFM3-Audio's encoder, depthformer and codec) has `aq` and `ad` only
+//! (one scale per 32 lanes). Its integer sums are the CPU's; its float
+//! epilogue is the CPU's fused multiply-add only where the GPU's mad.f32 is
+//! fused (the bring-up self-test tells), and otherwise rounds twice.
 
 const std = @import("std");
 const adreno = @import("adreno");
@@ -651,6 +656,240 @@ fn quantTail() []const u8 {
     }
 }
 
+// ── Q8_0 (LFM3-Audio's encoder, depthformer and codec) ───────────────────────
+
+pub const QK8_0 = 32;
+pub const Q8_0_BLOCK = 34;
+
+/// Constants of the Q8_0 matrix kernel (vec4 c0..c3).
+pub const Q80MatrixConsts = struct {
+    weights: u64,
+    act_q: u64,
+    act_d: u64,
+    out: u64,
+    row_bytes: u32,
+    blocks: u32,
+    rows: u32,
+
+    pub fn dwords(m: Q80MatrixConsts) [16]u32 {
+        return .{
+            @truncate(m.weights), @truncate(m.weights >> 32), @truncate(m.act_q), @truncate(m.act_q >> 32),
+            @truncate(m.act_d),   @truncate(m.act_d >> 32),   @truncate(m.out),   @truncate(m.out >> 32),
+            m.row_bytes,          m.blocks,                   m.blocks * QK8_0,   m.blocks * 4,
+            m.rows * 4,           m.rows,                     0,                  0,
+        };
+    }
+};
+
+// Register plan of the Q8_0 matrix kernel:
+//   4 lane (0..7)   5 row in group   6 row   7 lane * 4   8 row byte offset
+//   9 rows - 1, then the row loads use   10 row bytes   11 block byte offset
+//   12 block counter   13 block * 32   14 block * 4   15 row < rows
+//   16 0x80808080   17 0x01010101   18 zero   20 weight word (hr40, hr41)
+//   21 scale (hr42)   22 d (f32)   23 address   24 address   25 shuffled
+//   32 + 8 t  per token t: A, D, S, I, X, A base, D base
+const Q80_TOK = 32;
+fn q8reg(comptime t: comptime_int, comptime k: comptime_int) []const u8 {
+    return r(Q80_TOK + 8 * t + k);
+}
+
+/// out[t][row] = Q8_0 row . Q8_0 activations of token t, as quantized_linear's
+/// dotQ80Q80 does: lane l of a row holds bytes 4l..4l+3 of every 32-byte
+/// block, its integer sum times d_w * d_x added in with mad.f32 (the CPU's
+/// fused multiply-add: bit-exact where the GPU's mad is fused, two roundings
+/// otherwise), then the lanes added pairwise (4, 2, 1 apart) as GGML's AVX
+/// reduction does. Weights are signed: w ^ 0x80 is the unsigned w + 128 that
+/// dp4acc takes, and 128 * the lane's activation sum comes back off. Blocks
+/// are 34 bytes, so the four weight bytes are two u16 loads. Rows in eights
+/// per workgroup; a last group past `rows` loads the last row and stores
+/// nothing.
+pub fn q80MatrixSource(comptime tokens: comptime_int) []const u8 {
+    comptime {
+        @setEvalBranchQuota(10_000_000);
+        if (tokens < 1 or tokens > MAX_TOKENS) @compileError("tokens");
+        var s: []const u8 =
+            \\@localsize 64, 1, 1
+            \\@invocationid(r0.x)
+            \\@wgid(r48.x)
+            \\@consts 4
+            \\
+        ;
+        s = s ++ line("and.b {s}, r0.x, 7", .{r(4)});
+        s = s ++ line("shr.b {s}, r0.x, 3", .{r(5)});
+        s = s ++ line("shl.b {s}, r48.x, 3", .{r(6)});
+        s = s ++ line("add.u {s}, {s}, {s}", .{ r(6), r(6), r(5) });
+        s = s ++ line("mov.u32u32 {s}, c3.y", .{r(9)});
+        s = s ++ line("cmps.u.lt {s}, {s}, {s}", .{ r(15), r(6), r(9) });
+        s = s ++ line("sub.u {s}, {s}, 1", .{ r(9), r(9) });
+        s = s ++ line("min.u {s}, {s}, {s}", .{ r(9), r(6), r(9) });
+        s = s ++ line("mov.u32u32 {s}, c2.x", .{r(10)});
+        // row * row_bytes in 32 bits (as matrixPrologue)
+        s = s ++ line("mull.u {s}, {s}, {s}", .{ r(8), r(9), r(10) });
+        s = s ++ line("madsh.m16 {s}, {s}, {s}, {s}", .{ r(8), r(9), r(10), r(8) });
+        s = s ++ line("madsh.m16 {s}, {s}, {s}, {s}", .{ r(8), r(10), r(9), r(8) });
+        s = s ++ line("shl.b {s}, {s}, 2", .{ r(7), r(4) });
+        s = s ++ line("mov.u32u32 {s}, 0x80808080", .{r(16)});
+        s = s ++ line("mov.u32u32 {s}, 0x01010101", .{r(17)});
+        s = s ++ line("mov.u32u32 {s}, 0", .{r(18)});
+        for (0..tokens) |t| {
+            s = s ++ line("mul.u24 {s}, c2.z, {d}", .{ q8reg(t, 5), t });
+            s = s ++ line("add.u {s}, {s}, {s}", .{ q8reg(t, 5), q8reg(t, 5), r(7) });
+            s = s ++ line("mul.u24 {s}, c2.w, {d}", .{ q8reg(t, 6), t });
+            s = s ++ line("mov.f32f32 {s}, (0.0)", .{q8reg(t, 2)});
+        }
+        s = s ++ line("mov.u32u32 {s}, {s}", .{ r(11), r(8) });
+        s = s ++ line("mov.u32u32 {s}, 0", .{r(12)});
+        s = s ++ line("mov.u32u32 {s}, 0", .{r(13)});
+        s = s ++ line("mov.u32u32 {s}, 0", .{r(14)});
+        s = s ++ "loop:\n";
+        s = s ++ line("add.u {s}, {s}, {s}", .{ r(23), r(11), r(7) });
+        s = s ++ line("ldg.a.u16 {s}, g[c0.x+{s}+2], 2", .{ hr(20, false), r(23) });
+        s = s ++ line("ldg.a.u16 {s}, g[c0.x+{s}+0], 1", .{ hr(21, false), r(11) });
+        for (0..tokens) |t| {
+            s = s ++ line("add.u {s}, {s}, {s}", .{ r(23), q8reg(t, 5), r(13) });
+            s = s ++ line("ldg.a.u32 {s}, g[c0.z+{s}+0], 1", .{ q8reg(t, 0), r(23) });
+            s = s ++ line("add.u {s}, {s}, {s}", .{ r(24), q8reg(t, 6), r(14) });
+            s = s ++ line("ldg.a.f32 {s}, g[c1.x+{s}+0], 1", .{ q8reg(t, 1), r(24) });
+        }
+        s = s ++ line("xor.b {s}, {s}, {s}", .{ r(20), r(20), r(16) });
+        s = s ++ line("cov.f16f32 {s}, {s}", .{ r(22), hr(21, false) });
+        for (0..tokens) |t| {
+            s = s ++ line("dp4acc.mixed.low {s}, {s}, {s}, {s}", .{ q8reg(t, 3), q8reg(t, 0), r(20), r(18) });
+            s = s ++ line("dp4acc.mixed.low {s}, {s}, {s}, {s}", .{ q8reg(t, 4), q8reg(t, 0), r(17), r(18) });
+            s = s ++ line("shl.b {s}, {s}, 7", .{ q8reg(t, 4), q8reg(t, 4) });
+            s = s ++ line("sub.u {s}, {s}, {s}", .{ q8reg(t, 3), q8reg(t, 3), q8reg(t, 4) });
+            s = s ++ line("cov.s32f32 {s}, {s}", .{ q8reg(t, 3), q8reg(t, 3) });
+            s = s ++ line("mul.f {s}, {s}, {s}", .{ q8reg(t, 1), r(22), q8reg(t, 1) });
+            s = s ++ line("mad.f32 {s}, {s}, {s}, {s}", .{ q8reg(t, 2), q8reg(t, 1), q8reg(t, 3), q8reg(t, 2) });
+        }
+        s = s ++ line("add.u {s}, {s}, {d}", .{ r(11), r(11), Q8_0_BLOCK });
+        s = s ++ line("add.u {s}, {s}, {d}", .{ r(13), r(13), QK8_0 });
+        s = s ++ line("add.u {s}, {s}, 4", .{ r(14), r(14) });
+        s = s ++ line("add.u {s}, {s}, 1", .{ r(12), r(12) });
+        s = s ++ "cmps.u.lt p0.x, " ++ r(12) ++ ", c2.y\n";
+        s = s ++ "br p0.x, #loop\n";
+        // (l + l^4), then 2 apart, then 1: GGML's hi + lo, even + odd
+        for (0..tokens) |t| {
+            for ([_]u32{ 4, 2, 1 }) |m| {
+                s = s ++ line("shfl.xor.u32 {s}, {s}, {d}", .{ r(25), q8reg(t, 2), m });
+                s = s ++ line("add.f {s}, {s}, {s}", .{ q8reg(t, 2), q8reg(t, 2), r(25) });
+            }
+        }
+        s = s ++ line("cmps.u.eq {s}, {s}, 0", .{ r(24), r(4) });
+        s = s ++ line("and.b {s}, {s}, {s}", .{ r(24), r(24), r(15) });
+        s = s ++ line("cmps.u.ne p0.x, {s}, 0", .{r(24)});
+        s = s ++ "br !p0.x, #done\n";
+        s = s ++ line("shl.b {s}, {s}, 2", .{ r(23), r(6) });
+        for (0..tokens) |t| {
+            s = s ++ line("mul.u24 {s}, c3.x, {d}", .{ r(24), t });
+            s = s ++ line("add.u {s}, {s}, {s}", .{ r(24), r(24), r(23) });
+            s = s ++ line("stg.a.f32 g[c1.z+{s}+0], {s}, 1", .{ r(24), q8reg(t, 2) });
+        }
+        s = s ++ "done:\nend\n";
+        return s;
+    }
+}
+
+/// Constants of the Q8_0 activation quantization (vec4 c0..c1).
+pub const Q80QuantConsts = struct {
+    x: u64,
+    act_q: u64,
+    act_d: u64,
+    k: u32,
+
+    pub fn dwords(q: Q80QuantConsts) [8]u32 {
+        return .{
+            @truncate(q.x),     @truncate(q.x >> 32),     @truncate(q.act_q), @truncate(q.act_q >> 32),
+            @truncate(q.act_d), @truncate(q.act_d >> 32), q.k,                q.k / QK8_0,
+        };
+    }
+};
+
+/// Rows of f32 into Q8_0 activations, as quantized_linear.quantizeQ80 does
+/// (GGML's x86 rule): d = amax / 127 rounded to f16, the values times
+/// 127 / amax rounded to nearest even and held to [-127, 127]; both
+/// quotients divided exactly; a zero block stays zero. Eight fibers per
+/// 32-lane block, eight blocks per workgroup; the grid is (blocks / 8
+/// rounded up, tokens), a last group past the row's blocks stores nothing.
+/// `aq` holds the i8 values (k per token), `ad` the f32 scales (k / 32).
+/// Magnitudes are normal floats or zero.
+pub fn q80QuantSource() []const u8 {
+    comptime {
+        @setEvalBranchQuota(10_000_000);
+        var s: []const u8 =
+            \\@localsize 64, 1, 1
+            \\@invocationid(r0.x)
+            \\@wgid(r48.x)
+            \\@consts 2
+            \\
+        ;
+        // r4 lane, r5 block (clamped into the row; r18: it is the row's),
+        // r6 element index t * k + block * 32 + lane * 4, r7 its f32 bytes
+        s = s ++ line("and.b {s}, r0.x, 7", .{r(4)});
+        s = s ++ line("shr.b {s}, r0.x, 3", .{r(5)});
+        s = s ++ line("shl.b {s}, r48.x, 3", .{r(9)});
+        s = s ++ line("add.u {s}, {s}, {s}", .{ r(5), r(5), r(9) });
+        s = s ++ line("mov.u32u32 {s}, c1.w", .{r(9)});
+        s = s ++ line("cmps.u.lt {s}, {s}, {s}", .{ r(18), r(5), r(9) });
+        s = s ++ line("sub.u {s}, {s}, 1", .{ r(9), r(9) });
+        s = s ++ line("min.u {s}, {s}, {s}", .{ r(5), r(5), r(9) });
+        s = s ++ line("mul.u24 {s}, r48.y, c1.z", .{r(6)});
+        s = s ++ line("shl.b {s}, {s}, 5", .{ r(9), r(5) });
+        s = s ++ line("add.u {s}, {s}, {s}", .{ r(6), r(6), r(9) });
+        s = s ++ line("shl.b {s}, {s}, 2", .{ r(9), r(4) });
+        s = s ++ line("add.u {s}, {s}, {s}", .{ r(6), r(6), r(9) });
+        s = s ++ line("shl.b {s}, {s}, 2", .{ r(7), r(6) });
+        s = s ++ line("mov.u32u32 {s}, 0x800000", .{r(39)});
+        s = s ++ line("mov.u32u32 {s}, 0", .{r(50)});
+        s = s ++ line("ldg.a.f32 {s}, g[c0.x+{s}+0], 4", .{ r(12), r(7) });
+        // the block's magnitude (|x| bits order as unsigned integers)
+        for (0..4) |i| s = s ++ line("absneg.f {s}, (abs){s}", .{ r(28 + i), r(12 + i) });
+        s = s ++ line("max.u {s}, {s}, {s}", .{ r(32), r(28), r(29) });
+        s = s ++ line("max.u {s}, {s}, {s}", .{ r(32), r(32), r(30) });
+        s = s ++ line("max.u {s}, {s}, {s}", .{ r(32), r(32), r(31) });
+        for ([_]u32{ 1, 2, 4 }) |m| {
+            s = s ++ line("shfl.xor.u32 {s}, {s}, {d}", .{ r(33), r(32), m });
+            s = s ++ line("max.u {s}, {s}, {s}", .{ r(32), r(32), r(33) });
+        }
+        // d = f16(amax / 127) as f32; inverse = 127 / amax (0 for a zero block)
+        s = s ++ line("mov.u32u32 {s}, 0x42fe0000", .{r(38)}); // 127.0
+        s = s ++ line("cmps.u.ne {s}, {s}, 0", .{ r(33), r(32) });
+        s = s ++ line("sel.b32 {s}, {s}, {s}, {s}", .{ r(37), r(32), r(33), r(38) }); // (a zero block divides 127 by 127)
+        s = s ++ fdivAsm(40, 37, 38, .{ 41, 42, 43, 44, 45, 46, 47, 39 }, "div1");
+        s = s ++ fdivAsm(36, 38, 37, .{ 41, 42, 43, 44, 45, 46, 47, 39 }, "div2");
+        s = s ++ line("cov.f32f16 (even){s}, {s}", .{ hr(34, false), r(40) });
+        s = s ++ line("cov.f16f32 {s}, {s}", .{ r(40), hr(34, false) });
+        s = s ++ line("sel.b32 {s}, {s}, {s}, {s}", .{ r(40), r(40), r(33), r(50) });
+        s = s ++ line("sel.b32 {s}, {s}, {s}, {s}", .{ r(36), r(36), r(33), r(50) });
+        // q = clamp(nearest(x * inverse), -127, 127)
+        for (0..4) |k| {
+            s = s ++ line("mul.f {s}, {s}, {s}", .{ r(20 + k), r(12 + k), r(36) });
+            s = s ++ line("rndne.f {s}, {s}", .{ r(20 + k), r(20 + k) });
+            s = s ++ line("cov.f32s32 {s}, {s}", .{ r(20 + k), r(20 + k) });
+            s = s ++ line("min.s {s}, {s}, 127", .{ r(20 + k), r(20 + k) });
+            s = s ++ line("max.s {s}, {s}, -127", .{ r(20 + k), r(20 + k) });
+        }
+        s = s ++ line("cmps.u.ne p0.x, {s}, 0", .{r(18)});
+        s = s ++ "br !p0.x, #done\n";
+        s = s ++ line("and.b {s}, {s}, 255", .{ r(24), r(20) });
+        s = s ++ line("and.b {s}, {s}, 255", .{ r(25), r(21) });
+        s = s ++ line("shlg {s}, 8, {s}, {s}", .{ r(24), r(25), r(24) });
+        s = s ++ line("and.b {s}, {s}, 255", .{ r(25), r(22) });
+        s = s ++ line("shlg {s}, 16, {s}, {s}", .{ r(24), r(25), r(24) });
+        s = s ++ line("shlg {s}, 24, {s}, {s}", .{ r(24), r(23), r(24) });
+        s = s ++ line("stg.a.u32 g[c0.z+{s}+0], {s}, 1", .{ r(6), r(24) });
+        s = s ++ line("cmps.u.eq p0.x, {s}, 0", .{r(4)});
+        s = s ++ "br !p0.x, #done\n";
+        // the scale: (t * blocks + block) * 4
+        s = s ++ line("mul.u24 {s}, r48.y, c1.w", .{r(26)});
+        s = s ++ line("add.u {s}, {s}, {s}", .{ r(26), r(26), r(5) });
+        s = s ++ line("shl.b {s}, {s}, 2", .{ r(26), r(26) });
+        s = s ++ line("stg.a.u32 g[c1.x+{s}+0], {s}, 1", .{ r(26), r(40) });
+        s = s ++ "done:\nend\n";
+        return s;
+    }
+}
+
 /// Constants of the short convolution (vec4 c0..c2).
 pub const ConvConsts = struct {
     mixed: u64,
@@ -1238,6 +1477,150 @@ test "Q6_K x Q8_K: one token, bit-exact with the CPU kernel (odd blocks two byte
 
 test "Q6_K x Q8_K: eight tokens" {
     try runMatrix(8, false, 16, 9);
+}
+
+/// quantized_linear's Q8_0 dot with mul then add (two roundings) in place of
+/// its fused multiply-add, the lanes and the pairwise sum as there: what a
+/// GPU whose mad.f32 rounds twice gives (the emulator's does).
+fn dotQ80Unfused(wrow: []const u8, acts: []const quantized.Q80Block) f32 {
+    var lanes: [8]f32 = @splat(0);
+    for (acts, 0..) |a, b| {
+        const blk = wrow[b * Q8_0_BLOCK ..][0..Q8_0_BLOCK];
+        const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, blk[0..2], .little))));
+        const scale = d * a.d;
+        for (0..8) |l| {
+            var sum: i32 = 0;
+            for (0..4) |j| sum += @as(i32, @as(i8, @bitCast(blk[2 + 4 * l + j]))) * a.qs[4 * l + j];
+            const p = scale * @as(f32, @floatFromInt(sum));
+            lanes[l] = lanes[l] + p;
+        }
+    }
+    const q = [4]f32{ lanes[4] + lanes[0], lanes[5] + lanes[1], lanes[6] + lanes[2], lanes[7] + lanes[3] };
+    return (q[0] + q[2]) + (q[1] + q[3]);
+}
+
+fn runQ80Matrix(comptime tokens: comptime_int, rows: u32, blocks: u32) !void {
+    const T = TestRig;
+    T.emu = .{ .arena = &T.arena, .gpu_view = &T.gpu_view };
+    const d = T.emu.device();
+    const k_cols = blocks * QK8_0;
+    const row_bytes = blocks * Q8_0_BLOCK;
+    const w = try d.alloc(rows * row_bytes);
+    const aq = try d.alloc(tokens * k_cols);
+    const ad = try d.alloc(tokens * blocks * 4);
+    const out = try d.alloc(tokens * rows * 4);
+    const code = try d.alloc(64 * 1024);
+    const ib = try d.alloc(64 * 1024);
+    var seed: u32 = 7;
+    for (0..rows * blocks) |blk| {
+        const b = w.cpu[blk * Q8_0_BLOCK ..][0..Q8_0_BLOCK];
+        // d of either sign, |d| in [2^-10, 2^-6); quants in [-127, 127]
+        const sign: u32 = (lcg(&seed) >> 7) & 1;
+        const h: u16 = @intCast((0x1400 + (lcg(&seed) >> 22)) | (sign << 15));
+        std.mem.writeInt(u16, b[0..2], h, .little);
+        for (b[2..]) |*q| q.* = @bitCast(@as(i8, @intCast(@as(i32, @intCast((lcg(&seed) >> 8) % 255)) - 127)));
+    }
+    var x: [MAX_TOKENS * 4096]f32 = undefined;
+    for (x[0 .. tokens * k_cols]) |*v| v.* = (@as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0 - 0.5) * 3.0;
+    var q8: [MAX_TOKENS * 128]quantized.Q80Block = undefined;
+    try quantized.quantizeQ80(x[0 .. tokens * k_cols], q8[0 .. tokens * blocks]);
+    const gq = std.mem.bytesAsSlice(i8, aq.cpu);
+    const gd: []f32 = @alignCast(std.mem.bytesAsSlice(f32, ad.cpu));
+    for (q8[0 .. tokens * blocks], 0..) |b, i| {
+        @memcpy(gq[i * QK8_0 ..][0..QK8_0], &b.qs);
+        gd[i] = b.d;
+    }
+    const src = comptime q80MatrixSource(tokens);
+    const k = ir3_asm.assemble(ir3.A7XX, src, &T.asm_work, @alignCast(std.mem.bytesAsSlice(u64, code.cpu))) catch |e| {
+        std.debug.print("assemble: line {d}: {s}\n", .{ T.asm_work.err_line, @errorName(e) });
+        return e;
+    };
+    var s = adreno.a7xx.Stream{ .buf = ib.words() };
+    s.computeSetup();
+    try s.program(&k, code.va);
+    s.constants(0, &(Q80MatrixConsts{ .weights = w.va, .act_q = aq.va, .act_d = ad.va, .out = out.va, .row_bytes = row_bytes, .blocks = blocks, .rows = rows }).dwords());
+    s.dispatch(&k, .{ (rows + MATRIX_ROWS_PER_GROUP - 1) / MATRIX_ROWS_PER_GROUP, 1, 1 });
+    try s.check();
+    runSynced(d, ib, @intCast(s.len)) catch |e| return emuFailure(e);
+    const got: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, out.cpu));
+    var mismatches: usize = 0;
+    var unfused_hits: usize = 0;
+    for (0..rows) |row| {
+        const wrow = w.cpu[row * row_bytes ..][0..row_bytes];
+        for (0..tokens) |t| {
+            const acts = q8[t * blocks ..][0..blocks];
+            const fused = quantized.dotQ80Q80Tile(1, wrow, .{acts.ptr}, blocks)[0];
+            const unfused = dotQ80Unfused(wrow, acts);
+            const g = got[t * rows + row];
+            // (the two roundings stay within a few ulps of the sum's terms)
+            try std.testing.expect(@abs(fused - unfused) <= 1e-5 * @max(@abs(fused), 1.0));
+            const bits: u32 = @bitCast(g);
+            if (bits == @as(u32, @bitCast(unfused)) and bits != @as(u32, @bitCast(fused))) unfused_hits += 1;
+            if (bits != @as(u32, @bitCast(fused)) and bits != @as(u32, @bitCast(unfused))) {
+                if (mismatches < 5) std.debug.print("row {d} token {d}: {d} want {d} (fused) or {d}\n", .{ row, t, g, fused, unfused });
+                mismatches += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatches);
+    // (the emulated mad rounds twice: it is that reference it follows)
+    try std.testing.expect(unfused_hits > 0 or rows * tokens < 8);
+}
+
+test "Q8_0 x Q8_0: one token, rows and blocks not in eights, the CPU's sums to the bit" {
+    try runQ80Matrix(1, 21, 37);
+}
+
+test "Q8_0 x Q8_0: eight tokens, 4096-wide rows" {
+    try runQ80Matrix(8, 16, 128);
+}
+
+fn runQ80Quant(tokens: u32, k_cols: u32) !void {
+    const T = TestRig;
+    T.emu = .{ .arena = &T.arena, .gpu_view = &T.gpu_view };
+    const d = T.emu.device();
+    const blocks = k_cols / QK8_0;
+    const xb = try d.alloc(tokens * k_cols * 4);
+    const aq = try d.alloc(tokens * k_cols);
+    const ad = try d.alloc(tokens * blocks * 4);
+    const code = try d.alloc(64 * 1024);
+    const ib = try d.alloc(64 * 1024);
+    var seed: u32 = 11;
+    const x: []f32 = @alignCast(std.mem.bytesAsSlice(f32, xb.cpu));
+    for (x, 0..) |*v, i| {
+        v.* = (@as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0 - 0.5) * 6.0;
+        // a block of zeros, magnitude ties of either sign, values on the half steps
+        if (i / QK8_0 == 2) v.* = 0;
+        if (i % 331 == 5) v.* = 9.0;
+        if (i % 331 == 9) v.* = -9.0;
+        if (i % 331 == 13) v.* = 9.0 * 2.5 / 127.0;
+    }
+    const k = ir3_asm.assemble(ir3.A7XX, comptime q80QuantSource(), &T.asm_work, @alignCast(std.mem.bytesAsSlice(u64, code.cpu))) catch |e| {
+        std.debug.print("assemble: line {d}: {s}\n", .{ T.asm_work.err_line, @errorName(e) });
+        return e;
+    };
+    var s = adreno.a7xx.Stream{ .buf = ib.words() };
+    s.computeSetup();
+    try s.program(&k, code.va);
+    s.constants(0, &(Q80QuantConsts{ .x = xb.va, .act_q = aq.va, .act_d = ad.va, .k = k_cols }).dwords());
+    s.dispatch(&k, .{ (blocks + 7) / 8, tokens, 1 });
+    try s.check();
+    runSynced(d, ib, @intCast(s.len)) catch |e| return emuFailure(e);
+    var cpu: [3 * 64]quantized.Q80Block = undefined;
+    try quantized.quantizeQ80(x[0 .. tokens * k_cols], cpu[0 .. tokens * blocks]);
+    const gq = std.mem.bytesAsSlice(i8, aq.cpu);
+    const gd: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, ad.cpu));
+    for (cpu[0 .. tokens * blocks], 0..) |b, i| {
+        if (@as(u32, @bitCast(b.d)) != @as(u32, @bitCast(gd[i]))) {
+            std.debug.print("block {d}: d {e} want {e}\n", .{ i, gd[i], b.d });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqualSlices(i8, &b.qs, gq[i * QK8_0 ..][0..QK8_0]);
+    }
+}
+
+test "Q8_0 quantization: bit-exact with quantizeQ80 (a zero block, ties, a last partial group)" {
+    try runQ80Quant(3, 32 * 37);
 }
 
 fn runQuant(comptime norm: bool, tokens: u32, comptime k_cols: u32) !void {
