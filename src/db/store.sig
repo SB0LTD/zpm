@@ -850,8 +850,7 @@ pub fn Store(comptime Raw: type) type {
                     };
                     // Describe may receive a transient interpolation buffer;
                     // never inspect a source retained from an earlier call.
-                    try context.prepare(&self.store.database,source,.{.csn=self.store.database.csn});
-                    return context.describeResult(result);
+                    return context.describe(&self.store.database,source,.{.csn=self.store.database.csn},result);
                 };
                 const raw = self.db();
                 const command = try raw.control(source);
@@ -1260,6 +1259,10 @@ pub fn Store(comptime Raw: type) type {
                 if(comptime @hasDecl(Raw,"ReadContext")) if(self.read_context) |context| {
                     if(self.failed or self.in_transaction or self.tx!=null or !self.autocommit or self.pending.active or
                         context.database==null or context.database.?!=&self.store.database or !same(source,context.source)) return error.InvalidParameterValue;
+                    // Metadata-only Describe invalidates executable preparation.
+                    // Rebind under the same caller-held read snapshot before run.
+                    if(context.prepared==null and context.preparation_error==null)
+                        try context.prepare(&self.store.database,source,context.snapshot);
                     return context.run(result);
                 };
                 if (self.pending.active) return self.resumeStatement(source, result);
