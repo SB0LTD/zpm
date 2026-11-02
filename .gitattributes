@@ -1,6 +1,8 @@
 # Package source digests are cross-platform release identities. Keep Sig source
 # bytes canonical so Windows and Unix hosts verify the same content locks.
 *.sig text eol=lf
+# The generated contract records the exact input bytes, including newlines.
+/tools/testdata/sample_contract.json text eol=lf
 tests/evidence/to-char-pg16.tsv -text
 tests/evidence/windows-pg16.tsv -text
 tests/evidence/window-frames-pg16.tsv -text

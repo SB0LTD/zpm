@@ -1,4 +1,4 @@
-// Winsock transport + entropy for the TLS client (Windows).
+// Native socket transport + entropy for the TLS client.
 // Layer 1: platform glue for the tls_client module.
 //
 // Provides:
@@ -8,14 +8,17 @@
 //     giving the X25519 client key and ClientHello.random real randomness
 //     (forward secrecy). Call once before handshakes.
 //
-// This is the only Windows-specific file in the TLS stack; everything else is
-// pure computation. A different OS would provide its own transport with the
-// same tls.Transport shape.
+// connectHost/available describe the Windows resolver convenience API. Linux
+// consumers can supply an already-connected fd or their own tls.Transport;
+// buffered reads/writes, close and OS entropy are native on both hosts.
 
 const w32 = @import("win32");
 const tls = @import("tls.sig");
+const builtin = @import("builtin");
+const std = @import("std");
 
-pub const Error = tls.Error;
+pub const Error = if (builtin.os.tag == .windows) tls.Error else tls.Error || error{UnsupportedPlatform};
+pub const available = builtin.os.tag == .windows;
 
 /// A live TCP socket bound to the tls.Transport interface.
 ///
@@ -38,8 +41,12 @@ pub const Socket = struct {
 
     pub fn close(self: *Socket) void {
         if (self.fd != w32.INVALID_SOCKET) {
-            _ = w32.shutdown(self.fd, w32.SD_BOTH);
-            _ = w32.closesocket(self.fd);
+            if (builtin.os.tag == .windows) {
+                _ = w32.shutdown(self.fd, w32.SD_BOTH);
+                _ = w32.closesocket(self.fd);
+            } else if (builtin.os.tag == .linux) {
+                _ = std.os.linux.close(self.fd);
+            }
             self.fd = w32.INVALID_SOCKET;
         }
     }
@@ -53,8 +60,7 @@ pub const Socket = struct {
         const self: *Socket = @ptrCast(@alignCast(ctx));
         if (buf.len == 0) return 0;
         if (self.r_off >= self.r_len) {
-            const got = w32.recv(self.fd, &self.rbuf, @intCast(self.rbuf.len), 0);
-            if (got < 0) return tls.Error.Io;
+            const got = try readSocket(self.fd, &self.rbuf);
             if (got == 0) return 0; // peer closed → EOF
             self.r_off = 0;
             self.r_len = @intCast(got);
@@ -70,14 +76,52 @@ pub const Socket = struct {
         const self: *Socket = @ptrCast(@alignCast(ctx));
         var off: usize = 0;
         while (off < data.len) {
-            const n = w32.send(self.fd, data[off..].ptr, @intCast(data.len - off), 0);
-            if (n <= 0) return tls.Error.Io;
-            off += @intCast(n);
+            const n = try writeSocket(self.fd, data[off..]);
+            if (n == 0) return tls.Error.Io;
+            off += n;
         }
     }
 };
 
 var g_wsa_started: bool = false;
+
+fn readSocket(fd: w32.SOCKET, output: []u8) tls.Error!usize {
+    if (builtin.os.tag == .windows) {
+        const n = w32.recv(fd, output.ptr, @intCast(@min(output.len, 0x7fffffff)), 0);
+        if (n < 0) return error.Io;
+        return @intCast(n);
+    }
+    if (builtin.os.tag == .linux) {
+        while (true) {
+            const rc = std.os.linux.recvfrom(fd, output.ptr, output.len, 0, null, null);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => return rc,
+                .INTR => continue,
+                else => return error.Io,
+            }
+        }
+    }
+    return error.Io;
+}
+
+fn writeSocket(fd: w32.SOCKET, input: []const u8) tls.Error!usize {
+    if (builtin.os.tag == .windows) {
+        const n = w32.send(fd, input.ptr, @intCast(@min(input.len, 0x7fffffff)), 0);
+        if (n < 0) return error.Io;
+        return @intCast(n);
+    }
+    if (builtin.os.tag == .linux) {
+        while (true) {
+            const rc = std.os.linux.sendto(fd, input.ptr, input.len, std.os.linux.MSG.NOSIGNAL, null, 0);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => return rc,
+                .INTR => continue,
+                else => return error.Io,
+            }
+        }
+    }
+    return error.Io;
+}
 
 fn ensureWsa() void {
     if (g_wsa_started) return;
@@ -89,6 +133,9 @@ fn ensureWsa() void {
 /// Resolve `host` and open a blocking TCP connection to host:port.
 /// `host` must be null-terminated-able (we copy into a small buffer).
 pub fn connectHost(host: []const u8, port: u16) Error!Socket {
+    // Only this convenience adapter is Windows-specific. TLS over an injected
+    // Transport and OS entropy remain available to native Linux consumers.
+    if (!available) return error.UnsupportedPlatform;
     ensureWsa();
 
     // Null-terminate host and port for getaddrinfo.
@@ -135,9 +182,24 @@ pub fn connectHost(host: []const u8, port: u16) Error!Socket {
 /// fresh seed the handshake fails with error.NoEntropy.
 pub fn fillEntropy() void {
     var e: [64]u8 = undefined;
+    if (builtin.os.tag == .linux) {
+        var done: usize = 0;
+        while (done < e.len) {
+            const rc = std.os.linux.getrandom(e[done..].ptr, e.len - done, 0);
+            switch (std.os.linux.errno(rc)) {
+                .INTR => continue,
+                .SUCCESS => { if (rc == 0 or rc > e.len - done) @panic("TLS OS entropy unavailable"); done += rc; },
+                else => @panic("TLS OS entropy unavailable"),
+            }
+        }
+        tls.setEntropy(&e);
+        return;
+    }
+    if (!available) @panic("TLS OS entropy backend unavailable");
     // BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002; alg handle may be null then.
     const status = w32.BCryptGenRandom(null, &e, 64, 0x00000002);
-    if (status == 0) tls.setEntropy(&e);
+    if (status != 0) @panic("TLS OS entropy unavailable");
+    tls.setEntropy(&e);
 }
 
 fn fmtPort(buf: *[8]u8, port: u16) usize {
@@ -155,4 +217,40 @@ fn fmtPort(buf: *[8]u8, port: u16) usize {
     var i: usize = 0;
     while (i < tl) : (i += 1) buf[i] = tmp[tl - 1 - i];
     return tl;
+}
+
+test "TLS host adapter keeps unsupported sockets explicit and native entropy available" {
+    if (builtin.os.tag != .windows) try std.testing.expectError(error.UnsupportedPlatform, connectHost("localhost", 443));
+    if (builtin.os.tag == .windows or builtin.os.tag == .linux) fillEntropy();
+    var closed: Socket = .{};
+    closed.close();
+    try std.testing.expectEqual(w32.INVALID_SOCKET, closed.fd);
+    const io = closed.transport();
+    try std.testing.expectEqual(@as(usize, 0), try io.readFn(io.ctx, &.{}));
+    try io.writeFn(io.ctx, &.{});
+}
+
+test "TLS transport buffers native Linux socket IO without a Winsock shim" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var pair: [2]i32 = undefined;
+    if (std.os.linux.errno(std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &pair)) != .SUCCESS) return error.SocketPairFailed;
+    var left: Socket = .{ .fd = pair[0] };
+    var right: Socket = .{ .fd = pair[1] };
+    defer left.close();
+    defer right.close();
+    const a = left.transport();
+    const b = right.transport();
+    try a.writeFn(a.ctx, "record-header-and-body");
+    var header: [6]u8 = undefined;
+    var body: [32]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 6), try b.readFn(b.ctx, &header));
+    try std.testing.expectEqualSlices(u8, "record", &header);
+    const count = try b.readFn(b.ctx, &body);
+    try std.testing.expectEqualSlices(u8, "-header-and-body", body[0..count]);
+    try b.writeFn(b.ctx, "reply");
+    const reply_count = try a.readFn(a.ctx, &body);
+    try std.testing.expectEqualSlices(u8, "reply", body[0..reply_count]);
+    right.close();
+    try std.testing.expectEqual(@as(usize, 0), try a.readFn(a.ctx, &body));
+    try std.testing.expectError(error.Io, a.writeFn(a.ctx, "closed"));
 }

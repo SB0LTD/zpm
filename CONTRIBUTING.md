@@ -55,6 +55,27 @@ checkout. Nexus additionally accepts the explicit `-Dzpm-root=../zpm` override.
 
 ## Code Style
 
+The Linux CI graph includes SABR, manifest/player transforms, TLS and disarmed
+GPU contracts. CI uses the latest stable Sig release. Reproduce those targets
+with the same release:
+
+```bash
+sig build test-sabr-loop test-manifest-sabr test-tls-client test-tts-gpu --keep-going
+```
+
+Source-level test wrappers keep relative imports inside the `src/` module root.
+Keep host calls behind comptime platform selection: a runtime `armed` flag does
+not stop the compiler from analyzing Windows calls on Linux. The Linux VM uses
+native clocks/entropy and an explicit UTC calendar profile; Windows retains its
+OS local timezone. The TLS hostname resolver and GPU loader remain Windows
+convenience backends. Linux TLS consumers inject an already-connected socket fd
+or a `Transport`; unsupported hostname resolution returns `UnsupportedPlatform`.
+
+The checked-in SB0 contract fixture hashes the exact source JSON bytes. Its
+input is pinned to LF by `.gitattributes`; regenerate it with
+`python tools/generate_sb0_contract.py tools/testdata/sample_contract.json tools/testdata/sample_contract.sig`
+and verify it using the same command with `--check`.
+
 zpm follows strict conventions:
 
 - **Zero allocation** — all storage is stack or comptime-sized. No heap
