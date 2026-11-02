@@ -105,3 +105,9 @@ implementation needs expanded passing contracts and the full qualification gates
 not this baseline red result. Frozen16 fixture fields cover integer OIDs, names,
 values, row counts, command tags, SQLSTATE and sequence effects; the public
 verifier does not claim all possible types or typmods.
+
+The reproducibility finding is closed: fresh independent review invoked the public
+helper on native16.15 (all16pass) and verified that an intentionally wrong major
+exits2 with a harness error. The remaining group-cardinality, transition-path and
+qualification findings stay open with stable IDs in aggregate_demand_red_evidence.json.
+No runtime fix or merge readiness follows from this test-harness improvement.

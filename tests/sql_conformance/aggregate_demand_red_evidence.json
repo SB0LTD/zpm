@@ -10,7 +10,9 @@
     ".scratch/aggregate-demand/compile-final.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "tools/verify_sql_aggregate_demand.py": "dbe4299e72135d276903aa603cda4b0d4df11b7a24152dd3e3b245cb3d70832d",
     ".scratch/aggregate-demand/native-public.json": "5aff9e06ac4e3d553098a8074195cc37cfa120090626aa7c23e528a5620eb565",
-    ".scratch/aggregate-demand-review/native-recapture.json": "0235c3ec03a12e25e65874ba56d43cbcd2d885e01ff3cf3cb45126f03952fdea"
+    ".scratch/aggregate-demand-review/native-recapture.json": "0235c3ec03a12e25e65874ba56d43cbcd2d885e01ff3cf3cb45126f03952fdea",
+    ".scratch/aggregate-demand-review/native-public-independent.json": "5aff9e06ac4e3d553098a8074195cc37cfa120090626aa7c23e528a5620eb565",
+    ".scratch/aggregate-demand-review/native-public-wrong-major.json": "28f5fa0db9d0dcc7e24d2198781d2d9c9f3082fce02a281bb050ed66dff1d24f"
   },
   "execution": {
     "command": "<output-executable> (compile_argv above)",
@@ -64,5 +66,35 @@
     "incorrect_expectations_found": 0,
     "implementation_ready": false,
     "remaining_test_dimensions": "See docs/SQL_AGGREGATE_DEMAND_PLAN.md independent review section"
-  }
+  },
+  "public_verifier_independent_review": {
+    "approved_delta": "1d9cca9",
+    "native_exit": 0,
+    "native_version_num": "160015",
+    "cases": 16,
+    "failures": 0,
+    "wrong_major_exit": 2
+  },
+  "review_findings": [
+    {
+      "id": "AGG-REPRO-01",
+      "status": "closed",
+      "scope": "Public native verifier and full standalone compile argv, independently replayed"
+    },
+    {
+      "id": "AGG-GROUP-01",
+      "status": "open",
+      "scope": "Duplicate group keys, empty grouped input, selected NULLs, live keys and selective HAVING"
+    },
+    {
+      "id": "AGG-TRANSITION-01",
+      "status": "open",
+      "scope": "Row-dependent failing arguments, aggregate positions/deduplication, FILTER/DISTINCT, generic/streamed/factorized paths"
+    },
+    {
+      "id": "AGG-QUALIFICATION-01",
+      "status": "open",
+      "scope": "PG18, prepared/binary, semantic-invalid dead expressions, cancellation/grants, poisoned reuse, snapshots/private writes, failed DML"
+    }
+  ]
 }
