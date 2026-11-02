@@ -1,0 +1,890 @@
+{
+  "schema": 1,
+  "native": "PostgreSQL 16.15",
+  "scope": "Next aggregate-demand slice, not implemented or qualified",
+  "setup": [
+    "CREATE TABLE t(v INT)",
+    "INSERT INTO t VALUES(1),(2)",
+    "CREATE SEQUENCE seq"
+  ],
+  "source_report_sha256": "34c177449bcd63db686f470c8134afe1a9f1911c7c6497b3be4c4e88e60e0c7f",
+  "cases": [
+    {
+      "id": "aggregate_probe_0",
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/0) AS x FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_1",
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(v) AS x,1/0 AS y FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_2",
+      "events": [
+        {
+          "sql": "SELECT x FROM (SELECT sum(v) AS x,sum(1/0) AS y FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "x",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                3
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_3",
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/0) AS x FROM t WHERE FALSE) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_4",
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/0) AS x FROM t GROUP BY v) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ],
+              [
+                7
+              ]
+            ],
+            "rowcount": 2,
+            "status": "SELECT 2"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_5",
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/0) AS x FROM t GROUP BY v HAVING count(*)>0) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ],
+              [
+                7
+              ]
+            ],
+            "rowcount": 2,
+            "status": "SELECT 2"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_6",
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/0) AS x FROM t ORDER BY x) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "22012",
+            "error_class": "DivisionByZero",
+            "message": "division by zero"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_7",
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT DISTINCT sum(1/0) AS x FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "22012",
+            "error_class": "DivisionByZero",
+            "message": "division by zero"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_8",
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/0) FILTER(WHERE FALSE) AS x FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_9",
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(nextval('seq')) AS x FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                3
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_10",
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT count(*) FILTER(WHERE nextval('seq')>0) AS x FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                3
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_11",
+      "events": [
+        {
+          "sql": "SELECT x FROM (SELECT sum(v) AS x,sum(nextval('seq')) AS y FROM t) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "x",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                3
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                3
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_12",
+      "events": [
+        {
+          "sql": "WITH q AS(SELECT sum(1/0) AS x FROM t) SELECT 7 FROM q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [
+              [
+                7
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_13",
+      "events": [
+        {
+          "sql": "WITH q AS(SELECT sum(1/0) AS x FROM t) SELECT 7 FROM q a,q b",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "22012",
+            "error_class": "DivisionByZero",
+            "message": "division by zero"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_14",
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/0) AS x FROM t LIMIT 0) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [],
+            "rowcount": 0,
+            "status": "SELECT 0"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": "aggregate_probe_15",
+      "events": [
+        {
+          "sql": "SELECT 7 FROM (SELECT sum(1/0) AS x FROM t HAVING FALSE) q",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "?column?",
+                "oid": 23
+              }
+            ],
+            "rows": [],
+            "rowcount": 0,
+            "status": "SELECT 0"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        },
+        {
+          "sql": "SELECT nextval('seq')",
+          "parameters": null,
+          "binary": false,
+          "outcome": {
+            "sqlstate": "00000",
+            "columns": [
+              {
+                "name": "nextval",
+                "oid": 20
+              }
+            ],
+            "rows": [
+              [
+                1
+              ]
+            ],
+            "rowcount": 1,
+            "status": "SELECT 1"
+          },
+          "parameter_status": {
+            "TimeZone": "UTC",
+            "DateStyle": "ISO, MDY",
+            "IntervalStyle": "postgres"
+          }
+        }
+      ]
+    }
+  ]
+}

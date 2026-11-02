@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "date": "2026-11-02",
+  "baseline": "ef6e3c0486ca76a3bfe70f3d91acda22c7491c16",
+  "scope": "Test-first aggregate-state demand, not implemented or qualified",
+  "raw_windows_file_sha256": {
+    "tests/test_sql_aggregate_demand.sig": "490e9524eb94dc5562398653ef059115a553f1671d091bde519e92005f0bac6e",
+    "tests/fixtures/aggregate_demand_pg16.json": "0002bb7b0afbe69335154698d7599b9060aa24753798bdf2966bf3d9ff66192f",
+    ".scratch/aggregate-demand/red.log": "fa7047a09dae49cc7a5bacdf28a1ce0c3a17df5e894820a960ed41431a48b895",
+    ".scratch/aggregate-demand/compile-final.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "execution": {
+    "command": "python .scratch/aggregate-demand/run_red.py",
+    "compile_exit": 0,
+    "run_exit": 1,
+    "expected_error": "SqlAggregateDemandIncomplete",
+    "programs": 16,
+    "matching": 6,
+    "gaps": 10
+  },
+  "native_wire_observation": {
+    "command": "python .scratch/planner/next_aggregate_observe.py (RAMSQL worktree)",
+    "harness_exit": 0,
+    "native": "16.15",
+    "matching": 6,
+    "gaps": 10,
+    "note": "Observation harness success means capture completed, not candidate compatibility"
+  },
+  "original_118_program_inventory": "Unchanged; do not add these sixteen to its pass count"
+}
