@@ -1079,6 +1079,41 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         },
     });
 
+    // ── Adreno a7xx compute: ir3 ISA and assembler, command streams,
+    //    emulator, bring-up tests (one module, files import each other) ──
+    _ = try ctx.addModule("adreno", "src/adreno/adreno.sig");
+    const test_adreno = try ctx.addStep("test-adreno", "Execute the ir3 ISA vectors, the assembler, the emulator and the A7xx compute self-tests", &noopStep);
+    try ctx.addDependency(test_all, test_adreno);
+    _ = try addTest(ctx, test_adreno, "test-adreno-module", "src/adreno/adreno.sig", &.{});
+    // LFM3 on the Adreno: the kernels (each against quantized_linear and the
+    // executor's arithmetic) and the backend against lfm3_executor.
+    const lfm3_gpu_kernels = try ctx.addModule("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig");
+    try wire(ctx, lfm3_gpu_kernels, "adreno", "src/adreno/adreno.sig");
+    try wire(ctx, lfm3_gpu_kernels, "quantized_linear", "src/core/quantized_linear.sig");
+    const lfm3_gpu = try ctx.addModule("lfm3_gpu", "src/core/lfm3_gpu.sig");
+    try wire(ctx, lfm3_gpu, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_gpu, "lfm3_plan", "src/core/lfm3_plan.sig");
+    try wire(ctx, lfm3_gpu, "lfm3_executor", "src/core/lfm3_executor.sig");
+    try wire(ctx, lfm3_gpu, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, lfm3_gpu, "adreno", "src/adreno/adreno.sig");
+    try wire(ctx, lfm3_gpu, "lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig");
+    _ = try addTest(ctx, test_adreno, "test-lfm3-gpu-kernels", "src/core/lfm3_gpu_kernels.sig", &.{
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+    });
+    _ = try addTest(ctx, test_adreno, "test-lfm3-gpu", "tests/test_lfm3_gpu.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("transformer_ops", "src/core/transformer_ops.sig"),
+        importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig"),
+        importEntry("lfm3_gpu", "src/core/lfm3_gpu.sig"),
+    });
+
     const tts_gpu = try ctx.addModule("tts_gpu", "src/tts/gpu.sig");
     try wire(ctx, tts_gpu, "tts_model_container", "src/tts/model_container.sig");
     try wire(ctx, tts_gpu, "quantized_linear", "src/core/quantized_linear.sig");

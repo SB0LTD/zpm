@@ -952,7 +952,10 @@ inline fn opaqueWords(value: Words16) Words16 {
     return asm ("" : [ret] "=x" (-> Words16) : [value] "0" (value));
 }
 
-const avx_vnni = avx2 and std.Target.x86.featureSetHas(builtin.cpu.features, .avxvnni);
+/// (LLVM's assembler only: the self-hosted x86 backend, which debug builds
+/// on x86-64 Linux use, rejects the {vex} prefix; they take the vpmaddubsw
+/// path, which gives the same sums)
+const avx_vnni = avx2 and std.Target.x86.featureSetHas(builtin.cpu.features, .avxvnni) and builtin.zig_backend == .stage2_llvm;
 const neon_dotprod = builtin.cpu.arch == .aarch64 and std.Target.aarch64.featureSetHas(builtin.cpu.features, .dotprod);
 /// One instruction per four-byte dot: AVX-VNNI vpdpbusd or AArch64 sdot.
 const quad_dots = avx_vnni or neon_dotprod;
