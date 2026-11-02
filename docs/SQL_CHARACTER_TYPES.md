@@ -82,3 +82,17 @@ indexes, CHAR/BPCHAR, remaining types, general collations, catalog/application
 compatibility and production-scale guarantees remain separate open work. The
 existing permissive bare-alias policy also remains open: PostgreSQL rejects an
 unquoted VARYING alias in contexts this parser may accept.
+
+### Wire Describe regression caught during integration
+
+Adding raw RowDescription typmods to RAMSQL's live comparator exposed stale
+metadata in the raw simple-SELECT Describe path: names/types were copied after
+clearing active counts, but modifiers were not. The first integration run matched
+75/77 cases; both parameter cases failed on typmods, while the durable restart
+passed. The new protocol Parse/Describe regression fails before the fix. Copying
+the bound modifiers, as the other Describe paths already do, preserves buffer
+reuse without execution or whole-result clearing. Poisoned/repeated core result
+metadata and actual wire Describe frames now cover the path.
+
+The Describe correction passes 21,044 protocol assertions and 321 storage
+assertions on final source. Product wire requalification remains required.

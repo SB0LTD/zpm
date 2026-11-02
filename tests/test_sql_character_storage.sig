@@ -81,4 +81,13 @@ fn transactions() !void{
  db=.{};try run("CREATE TABLE t(id VARCHAR(2) PRIMARY KEY)");try run("INSERT INTO t VALUES('ab')");
  try rejected("INSERT INTO t VALUES('ab ')",error.PrimaryKeyViolation);try run("SELECT id FROM t WHERE id='ab'");try check(result.row_count==1);
 }
-pub fn main() !void{try values();try replay();try transactions();std.debug.print("character storage: {d} assertions\n",.{assertions});}
+fn descriptions() !void {
+ db=.{};result=.{};
+ result.column_typmods[0]=123;result.column_typmods[1]=456;
+ try db.describe("SELECT 'x'::varchar(2)",&result);
+ try check(result.column_count==1 and result.column_types[0]==.varchar and result.column_typmods[0]==6);
+ try db.describe("SELECT 1 AS id,'x'::varchar(3) AS v",&result);
+ try check(result.column_count==2 and result.column_typmods[0]==-1 and result.column_typmods[1]==7);
+ try check(db.usage().transactions==0);
+}
+pub fn main() !void{try values();try replay();try transactions();try descriptions();std.debug.print("character storage: {d} assertions\n",.{assertions});}

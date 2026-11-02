@@ -731,6 +731,28 @@ fn splicedParameterValues() !void {
     try sync(&s, &db);
 }
 /// Validate VARCHAR parameter bytes before SQL literal substitution.
+fn characterDescriptions() !void {
+    var db:Counting=.{};var s:CountingSession=.{};
+    var start=Packet.init(0);start.len=4;start.number32(196608);start.string("user");start.string("ramsql");start.byte(0);
+    put32(start.bytes[0..4],@intCast(start.len));
+    _=try s.handle(&db,start.bytes[0..start.len],&counting_output);
+    for([_][]const u8{"SELECT $1::varchar(2)","SELECT 1 AS id,'x'::varchar(3) AS v"},0..) |source,step| {
+        var p=Packet.init('P');p.string("");p.string(source);p.number16(if(step==0) 1 else 0);if(step==0)p.number32(1043);
+        try tags(try countingSend(&s,&db,&p),"1");
+        var d=Packet.init('D');d.byte('S');d.string("");
+        const bytes=try countingSend(&s,&db,&d);try tags(bytes,"tT");
+        var frames:Frames=.{.bytes=bytes};_=try frames.next();const row=(try frames.next()).?;
+        const expected:[]const i32=if(step==0) &.{6} else &.{-1,7};
+        try check(row.tag=='T' and row.body[0]==0 and row.body[1]==expected.len);
+        var at:usize=2;
+        for(expected) |modifier| {
+            while(at<row.body.len and row.body[at]!=0)at+=1;
+            at+=1;try check(at+18<=row.body.len);
+            try check(@as(i32,@bitCast(u32be(row.body[at+12..][0..4])))==modifier);at+=18;
+        }
+        try check(at==row.body.len and db.executions==0);
+    }
+}
 fn characterParameters() !void {
     var db:DB=.{};var s:Session=.{};try startup(&s,&db);
     try tags(try parse(&s,&db,"","SELECT $1::varchar(2)",&.{1043}),"1");
@@ -1319,6 +1341,7 @@ pub fn main(init: std.process.Init) !void {
     try inference();
     try negativeParameters();
     try characterParameters();
+    try characterDescriptions();
     try splicedParameterValues();
     try negativeCounts();
     try errorStates();

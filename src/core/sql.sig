@@ -2550,6 +2550,7 @@ pub fn Database(comptime config: Config) type {
                 for (0..bound.select.count) |index| {
                     result.column_names[index] = bound.select.names[index];
                     result.column_types[index] = bound.select.types[index];
+                    result.column_typmods[index] = bound.select.typmods[index];
                 }
             }
             if (bound == .query) {

@@ -7,6 +7,9 @@ programs and independent native PostgreSQL 16 replay. The storage contract passe
 318 assertions; final-source PostgreSQL protocol 21,000, typed change-log 940,
 types 901,501, catalog 36, planner 444, and aggregate 53 programs also pass.
 Independent runtime and incremental parser reviews found no introduced blocker.
+Integration then exposed a raw simple-SELECT Describe typmod omission. A new
+protocol regression failed before the correction; the corrected path passes
+21,044 protocol and 321 storage assertions, with independent root-cause review.
 These are local candidate results: PostgreSQL 18, hosted platforms, product wire
 and durable-restart checks, and exact release qualification remain gates.
 

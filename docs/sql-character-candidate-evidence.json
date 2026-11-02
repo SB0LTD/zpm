@@ -183,6 +183,77 @@
     ".scratch/character-review/final-storage.log": "981206efb844c4e9edac1c98dee1543e8419b0adc12bf364b82c68003bfbe1a4",
     ".scratch/character-review/adversarial-final.log": "65cf83fddb6a9e06e46c5caba202730644fc84a83be3489c615f8f5e2e0e0e99",
     "tests/fixtures/character_types_pg16.json": "6dacc7ad4ac7e29ff3adba4e06d66efabe920b79a02b43b3314db8e1110b0e9e",
-    "tests/test_sql_character_types.sig": "a0841bf172507677d695adaa4d8f53a938e7d0d5f712d778d076fe768c367163"
+    "tests/test_sql_character_types.sig": "a0841bf172507677d695adaa4d8f53a938e7d0d5f712d778d076fe768c367163",
+    ".scratch/character/describe-red-postgres.log": "34d69d049c4cef2b8f316a015aebccd0fbe22016002258c6056904db2a5fd72d",
+    ".scratch/character/describe-green-postgres.log": "b2a5f412a22e9e248c825d4c9d205d6cb0d1a35c0e5d8f465130c05b97122b81",
+    ".scratch/character/describe-green-character_storage.log": "84bf458e77ba57e6086adaa66170a0415b00f0ca7a1b79feed0d2d1052661286",
+    ".scratch/character/describe-green-regressions.json": "b9c7b9a788215c83d15e42ee407370dff11fcc605b5f355a3af437e2d7b9255f"
+  },
+  "describe_regression": {
+    "red_command": "python .scratch/character/describe_red.py",
+    "red_compile_exit": 0,
+    "red_run_exit": 1,
+    "green_command": "python .scratch/character/describe_green.py",
+    "root_cause": "Raw describeIn simple SELECT omitted active typmods; counts-only clear allowed stale metadata",
+    "review": "Independent root-cause and one-line-fix review found no additional runtime blocker",
+    "red_log_sha256": "34d69d049c4cef2b8f316a015aebccd0fbe22016002258c6056904db2a5fd72d",
+    "green_regressions": [
+      {
+        "name": "postgres",
+        "command": [
+          "C:/Users/Shado/AppData/Local/Programs/Sig/0.6.4/bin/sig.exe",
+          "build-exe",
+          "--Sig-lib-dir",
+          "C:/Just-Things/Projects/sb0/ramsql-pr-consolidation-20261030/.sig-cache/consolidation-sdk/lib",
+          "-OReleaseSafe",
+          "--dep",
+          "postgres",
+          "--dep",
+          "scram",
+          "--dep",
+          "sql",
+          "--dep",
+          "db_store",
+          "-Mroot=tests/test_postgres.sig",
+          "--dep",
+          "scram",
+          "--dep",
+          "sql",
+          "-Mpostgres=src/db/postgres.sig",
+          "--dep",
+          "sql",
+          "-Mdb_store=src/db/store.sig",
+          "-Mscram=src/db/scram.sig",
+          "-Msql=src/core/sql.sig",
+          "-femit-bin=.scratch\\character\\describe-green-postgres.exe"
+        ],
+        "compile_exit": 0,
+        "run_exit": 0
+      },
+      {
+        "name": "character_storage",
+        "command": [
+          "C:/Users/Shado/AppData/Local/Programs/Sig/0.6.4/bin/sig.exe",
+          "build-exe",
+          "--Sig-lib-dir",
+          "C:/Just-Things/Projects/sb0/ramsql-pr-consolidation-20261030/.sig-cache/consolidation-sdk/lib",
+          "-OReleaseSafe",
+          "--dep",
+          "sql",
+          "--dep",
+          "pg_types",
+          "-Mroot=tests/test_sql_character_storage.sig",
+          "-Msql=src/core/sql.sig",
+          "-Mpg_types=src/db/pg_types.sig",
+          "-femit-bin=.scratch\\character\\describe-green-character_storage.exe"
+        ],
+        "compile_exit": 0,
+        "run_exit": 0
+      }
+    ],
+    "green_assertions": {
+      "postgres": 21044,
+      "storage": 321
+    }
   }
 }
