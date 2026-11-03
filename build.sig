@@ -1085,6 +1085,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_adreno = try ctx.addStep("test-adreno", "Execute the ir3 ISA vectors, the assembler, the emulator and the A7xx compute self-tests", &noopStep);
     try ctx.addDependency(test_all, test_adreno);
     _ = try addTest(ctx, test_adreno, "test-adreno-module", "src/adreno/adreno.sig", &.{});
+    // ── NVIDIA sm_120 (Blackwell GeForce) compute: the SASS instruction set
+    //    and an assembler for kernels (one module, files import each other) ──
+    _ = try ctx.addModule("nvidia", "src/nvidia/nvidia.sig");
+    const test_nvidia = try ctx.addStep("test-nvidia", "Encode ptxas's sm_120 vectors and assemble its kernels from their listings", &noopStep);
+    try ctx.addDependency(test_all, test_nvidia);
+    _ = try addTest(ctx, test_nvidia, "test-nvidia-module", "src/nvidia/nvidia.sig", &.{});
     // LFM3 on the Adreno: the kernels (each against quantized_linear and the
     // executor's arithmetic) and the backend against lfm3_executor.
     const lfm3_gpu_kernels = try ctx.addModule("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig");
