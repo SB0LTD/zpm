@@ -1101,6 +1101,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_gpu, "test-gpu-module", "src/gpu/gpu.sig", &.{
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
     });
+    _ = try addTest(ctx, test_gpu, "test-gpu-ops", "tests/test_gpu_ops.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+    });
     _ = try addTest(ctx, test_gpu, "test-gpu-flow", "tests/test_gpu_flow.sig", &.{
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
@@ -1115,6 +1119,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("lfm3_nv_matrix", "src/core/lfm3_nv_matrix.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+    });
+    _ = try addTest(ctx, test_gpu, "test-gpu-emu", "tests/test_gpu_emu.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
     });
     // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
     _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{
