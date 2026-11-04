@@ -1091,6 +1091,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_nvidia = try ctx.addStep("test-nvidia", "Encode ptxas's sm_120 vectors and assemble its kernels from their listings", &noopStep);
     try ctx.addDependency(test_all, test_nvidia);
     _ = try addTest(ctx, test_nvidia, "test-nvidia-module", "src/nvidia/nvidia.sig", &.{});
+    // ── GPU-neutral compute: KIR, devices, the interpreter and EmuDevice
+    //    (one module; the backends' files join it) ──
+    _ = try ctx.addModule("gpu", "src/gpu/gpu.sig");
+    const test_gpu = try ctx.addStep("test-gpu", "Execute KIR's verifier, interpreter, exact fdiv/fsqrt expansions and EmuDevice", &noopStep);
+    try ctx.addDependency(test_all, test_gpu);
+    _ = try addTest(ctx, test_gpu, "test-gpu-module", "src/gpu/gpu.sig", &.{});
     // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
     _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
