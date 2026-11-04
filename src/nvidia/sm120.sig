@@ -238,6 +238,8 @@ pub const ImmKind = enum {
     /// One half of a pair (HFMA2's c is printed "1.875, 0", the high half
     /// first): the half's 16 bits.
     f16,
+    /// The same with .BF16_V2: a bfloat16's 16 bits.
+    bf16,
 };
 
 /// A decoded immediate: the field's bits as encoded (a sign-extended
@@ -478,7 +480,9 @@ pub fn parseOperand(text: []const u8) Error!Operand {
     var neg = false;
     var not = false;
     var abs = false;
-    if (t[0] == '-' and t.len > 1 and !std.ascii.isDigit(t[1]) and t[1] != 'I' and t[1] != 'Q') {
+    // (a minus sign is a negation, but for numbers: -0x40, -INF, -SNAN)
+    const negative_number = t.len > 1 and (std.ascii.isDigit(t[1]) or eql(t, "-INF") or eql(t, "-QNAN") or eql(t, "-SNAN"));
+    if (t[0] == '-' and !negative_number) {
         neg = true;
         t = t[1..];
     } else if (t[0] == '!') {
@@ -599,11 +603,29 @@ fn floatOf(t: []const u8) ?f64 {
     return std.fmt.parseFloat(f64, t) catch null;
 }
 
+/// nvdisasm's names for a float's NaNs (a payload is not printed: these
+/// are the bits they read back as) and its negative zero.
+fn special(t: []const u8, kind: ImmKind) ?u64 {
+    const names = [_][]const u8{ "+QNAN", "-QNAN", "+SNAN", "-SNAN", "-0.0" };
+    const f32s = [_]u64{ 0x7fc00000, 0xffc00000, 0x7f800001, 0xff800001, 0x80000000 };
+    const f16s = [_]u64{ 0x7e00, 0xfe00, 0x7c01, 0xfc01, 0x8000 };
+    const bf16s = [_]u64{ 0x7fc0, 0xffc0, 0x7f81, 0xff81, 0x8000 };
+    if (kind != .f32 and kind != .f16 and kind != .bf16) return null;
+    for (names, 0..) |name, i| {
+        if (eql(t, name)) return switch (kind) {
+            .f32 => f32s[i],
+            .f16 => f16s[i],
+            else => bf16s[i],
+        };
+    }
+    return null;
+}
+
 /// An immediate operand's bits for an `n`-bit field.
 fn immValue(o: Operand, kind: ImmKind, n: u7) Error!u64 {
     const v: u64 = switch (o) {
         .imm => |x| x.bits,
-        .num => |t| switch (kind) {
+        .num => |t| if (special(t, kind)) |bits| bits else switch (kind) {
             .hex, .signed => blk: {
                 const s = try number(t);
                 if (s < 0) {
@@ -621,8 +643,15 @@ fn immValue(o: Operand, kind: ImmKind, n: u7) Error!u64 {
             },
             .f16 => blk: {
                 const f = floatOf(t) orelse return error.Syntax;
-                if (std.math.isNan(f)) break :blk if (std.math.signbit(f)) 0xfe00 else 0x7fff;
+                if (std.math.isNan(f)) break :blk if (std.math.signbit(f)) 0xfe00 else 0x7e00;
                 break :blk @as(u16, @bitCast(@as(f16, @floatCast(f))));
+            },
+            .bf16 => blk: {
+                const f = floatOf(t) orelse return error.Syntax;
+                if (std.math.isNan(f)) break :blk if (std.math.signbit(f)) 0xffc0 else 0x7fc0;
+                // (the f32 rounded to its top half, to nearest even)
+                const b: u32 = @bitCast(@as(f32, @floatCast(f)));
+                break :blk (b + 0x7fff + ((b >> 16) & 1)) >> 16;
             },
         },
         else => return error.Syntax,
@@ -734,6 +763,42 @@ const Cx = struct {
         if (v >= names.len or eql(names[v], "?")) return error.Unknown;
         if (names[v].len > 0) try cx.addMod(names[v]);
         return v;
+    }
+
+    /// A modifier field whose values nvdisasm names with several modifiers
+    /// (LDG's STRONG.GPU): table[v] is value v's names in order, table[0]
+    /// the unprinted default. Encoding takes the longest entry written in a
+    /// row.
+    fn modParts(cx: *Cx, at: u7, n: u7, table: []const []const []const u8) Error!void {
+        if (!cx.enc()) {
+            const v = cx.get(at, n);
+            if (v >= table.len) return error.Unknown;
+            for (table[v]) |m| try cx.addMod(m);
+            return;
+        }
+        var best: usize = 0;
+        var best_at: usize = 0;
+        for (table, 0..) |parts, v| {
+            if (parts.len == 0 or parts.len <= table[best].len) continue;
+            if (cx.findRun(parts)) |i| {
+                best = v;
+                best_at = i;
+            }
+        }
+        for (0..table[best].len) |k| cx.used |= @as(u32, 1) << @intCast(best_at + k);
+        cx.w.put(at, n, best);
+    }
+
+    /// Where `parts` are written in a row among the modifiers not matched.
+    fn findRun(cx: *const Cx, parts: []const []const u8) ?usize {
+        const m = cx.in.mods[0..cx.in.n_mods];
+        var i: usize = 0;
+        while (i + parts.len <= m.len) : (i += 1) {
+            for (parts, 0..) |x, k| {
+                if (cx.used & (@as(u32, 1) << @intCast(i + k)) != 0 or !eql(m[i + k], x)) break;
+            } else return i;
+        }
+        return null;
     }
 
     /// A modifier field of `n` bits at `at`.
@@ -975,8 +1040,10 @@ const Cx = struct {
             if (a.wide) |b| cx.w.bit(b, x.wide);
             if (a.desc) |d| cx.w.put(d, 8, x.desc.?);
             if (a.ureg) |u| {
-                cx.w.put(u, 8, x.ureg orelse 0);
-                cx.w.bit(91, x.ureg != null);
+                if (a.ureg_always) cx.w.put(u, 8, x.ureg orelse RZ) else {
+                    cx.w.put(u, 8, x.ureg orelse 0);
+                    cx.w.bit(91, x.ureg != null);
+                }
             }
             const lim = @as(i64, 1) << @intCast(a.off_n - 1);
             if (x.offset < -lim or x.offset >= lim) return error.OutOfRange;
@@ -987,7 +1054,7 @@ const Cx = struct {
         if (a.wide) |b| x.wide = cx.get(b, 1) == 1;
         if (a.desc) |d| x.desc = @intCast(cx.get(d, 8));
         if (a.ureg) |u| {
-            if (cx.get(91, 1) == 1) x.ureg = @intCast(cx.get(u, 8));
+            if (a.ureg_always or cx.get(91, 1) == 1) x.ureg = @intCast(cx.get(u, 8));
         }
         const raw = cx.get(a.off_at, a.off_n);
         const shift: u6 = @intCast(64 - @as(u7, a.off_n));
@@ -1001,6 +1068,8 @@ const AddrForm = struct {
     desc: ?u7 = null,
     wide: ?u7 = null,
     ureg: ?u7 = null,
+    /// The uniform register is always there (else bit 91 says).
+    ureg_always: bool = false,
     off_at: u7 = 40,
     off_n: u7 = 24,
 };
@@ -1057,6 +1126,8 @@ const Alu = struct {
     bc: ?SrcSpec = null,
     /// fp16 ops: c's sign bits at 83 and 84.
     half: bool = false,
+    /// A uniform c (form 7): only the ops nvdisasm takes it for.
+    ureg_c: bool = false,
 };
 
 /// The operand slots an ALU instruction reads, for `.reuse` (bits 122..).
@@ -1137,16 +1208,14 @@ fn srcIn(cx: *Cx, o: Operand, s: SrcSpec, uniform: bool) Error!In {
             }
             return .{ .src = .{ .reg = r }, .sel = sel };
         },
-        .cbuf => |cb| {
-            if (uniform or cb.reg != RZ or (cb.neg and !s.neg) or (cb.abs and !s.abs)) return error.Syntax;
-            if (cb.offset > 0xffff) return error.OutOfRange;
-            return .{ .src = .{ .cbuf = cb } };
-        },
+        // (sm_120's ALU ops read no constants: nvdisasm calls every such
+        // form illegal, and ptxas loads them with LDC and LDCU)
+        .cbuf => return error.Syntax,
         .num, .imm => {
-            if (s.imm == .f16) {
+            if (s.imm == .f16 or s.imm == .bf16) {
                 // (two operands: the high half, then the low)
-                const h = try immValue(o, .f16, 16);
-                const l = try immValue(try cx.take(), .f16, 16);
+                const h = try immValue(o, s.imm, 16);
+                const l = try immValue(try cx.take(), s.imm, 16);
                 return .{ .src = .{ .imm = @intCast(h << 16 | l) } };
             }
             return .{ .src = .{ .imm = @intCast(try immValue(o, s.imm, 32)) } };
@@ -1237,6 +1306,7 @@ fn alu(cx: *Cx, d: Alu) Error!void {
             }
             switch (c.src) {
                 .ureg => |r| {
+                    if (!d.ureg_c) return error.Syntax;
                     putReg(w, AT_B, r, c.sel);
                     w.bit(91, true);
                     break :blk 7;
@@ -1275,16 +1345,9 @@ fn aluDecode(cx: *Cx, d: Alu, at_c: RegAt) Error!void {
             c_at = .imm32;
             b_at = .reg64;
         },
-        3 => {
-            c_at = .cbuf32;
-            b_at = .reg64;
-        },
+        3, 5 => return error.Unknown,
         4 => {
             b_at = .imm32;
-            c_at = .reg64;
-        },
-        5 => {
-            b_at = .cbuf32;
             c_at = .reg64;
         },
         6 => {
@@ -1292,6 +1355,7 @@ fn aluDecode(cx: *Cx, d: Alu, at_c: RegAt) Error!void {
             c_at = .reg64;
         },
         7 => {
+            if (!d.ureg_c) return error.Unknown;
             c_at = .ureg32;
             b_at = .reg64;
         },
@@ -1329,9 +1393,9 @@ fn pushWhere(cx: *Cx, at: Where, s: SrcSpec, uniform: bool, at_c: RegAt) Error!v
         .reg64 => try pushSrc(cx, at_c, s, uniform),
         .imm32 => {
             const v = cx.get(32, 32);
-            if (s.imm == .f16) {
-                try cx.push(.{ .imm = .{ .bits = v >> 16, .kind = .f16 } });
-                try cx.push(.{ .imm = .{ .bits = v & 0xffff, .kind = .f16 } });
+            if (s.imm == .f16 or s.imm == .bf16) {
+                try cx.push(.{ .imm = .{ .bits = v >> 16, .kind = s.imm } });
+                try cx.push(.{ .imm = .{ .bits = v & 0xffff, .kind = s.imm } });
             } else try cx.push(.{ .imm = .{ .bits = v, .kind = s.imm } });
         },
         .cbuf32 => try cx.push(.{ .cbuf = .{
@@ -1347,9 +1411,31 @@ fn pushWhere(cx: *Cx, at: Where, s: SrcSpec, uniform: bool, at_c: RegAt) Error!v
 
 /// Loads' and stores' sizes (73..75).
 const SIZES = [_][]const u8{ "U8", "S8", "U16", "S16", "", "64", "128", "?" };
-/// Global memory's ordering (77..80): weak, or .CONSTANT (read-only for
-/// the kernel: ld.global.nc).
-const ORDER = [_][]const u8{ "", "?", "?", "?", "CONSTANT" };
+/// LDC's and LDCU's (no 128 bits).
+const SIZES_LDC = [_][]const u8{ "U8", "S8", "U16", "S16", "", "64", "?", "?" };
+/// Global memory's ordering and scope (77..80), as nvdisasm names each
+/// value (CONSTANT: read-only for the kernel, ld.global.nc; STRONG.GPU: a
+/// relaxed or acquire access at the GPU's scope).
+const ORDERS = [_][]const []const u8{
+    &.{},                           &.{ "CONSTANT", "PRIVATE" },        &.{ "CONSTANT", "CTA" },
+    &.{ "CONSTANT", "CTA", "PRIVATE" }, &.{"CONSTANT"},                 &.{ "STRONG", "SM" },
+    &.{ "STRONG", "GPU", "PRIVATE" }, &.{ "STRONG", "GPU" },            &.{ "MMIO", "GPU" },
+    &.{ "CONSTANT", "SM" },         &.{ "STRONG", "SYS" },              &.{ "CONSTANT", "SM", "PRIVATE" },
+    &.{ "MMIO", "SYS" },            &.{ "CONSTANT", "VC" },             &.{ "CONSTANT", "VC", "PRIVATE" },
+    &.{ "CONSTANT", "GPU" },
+};
+/// A store's orders (the same, but for 4 and 13..15).
+const ORDERS_ST = [_][]const []const u8{
+    &.{},                           &.{ "CONSTANT", "PRIVATE" },        &.{ "CONSTANT", "CTA" },
+    &.{ "CONSTANT", "CTA", "PRIVATE" }, &.{ "STRONG", "SM", "PRIVATE" }, &.{ "STRONG", "SM" },
+    &.{ "STRONG", "GPU", "PRIVATE" }, &.{ "STRONG", "GPU" },            &.{ "MMIO", "GPU" },
+    &.{ "CONSTANT", "SM" },         &.{ "STRONG", "SYS" },              &.{ "CONSTANT", "SM", "PRIVATE" },
+    &.{ "MMIO", "SYS" },            &.{ "SYS", "ORDERED" },             &.{ "STRONG", "SYS", "ORDERED" },
+    &.{ "MMIO", "SYS", "ORDERED" },
+};
+/// Global memory's eviction priority (84..86): evict first, normal, last,
+/// last use, unchanged, no allocate.
+const EVICT = [_][]const u8{ "EF", "", "EL", "LU", "EU", "NA", "?", "?" };
 /// ISETP's comparisons (76..78) and how the result joins the accumulator
 /// (74..75).
 const ICMP = [_][]const u8{ "F", "LT", "EQ", "LE", "GT", "NE", "GE", "T" };
@@ -1368,7 +1454,8 @@ const ITYPES_S32 = [_][]const u8{ "U8", "S8", "U16", "S16", "U32", "", "U64", "S
 const FTYPES = [_][]const u8{ "?", "F16", "F32", "F64" };
 const FTYPES_F32 = [_][]const u8{ "?", "F16", "", "F64" };
 /// The special-function unit's functions (74..79).
-const MUFU = [_][]const u8{ "COS", "SIN", "EX2", "LG2", "RCP", "RSQ", "RCP64H", "RSQ64H", "SQRT", "TANH" };
+/// (RCP64H and RSQ64H, of a double's high word, are not covered.)
+const MUFU = [_][]const u8{ "COS", "SIN", "EX2", "LG2", "RCP", "RSQ", "?", "?", "SQRT", "TANH" };
 
 // ── The codecs ──────────────────────────────────────────────────────────────
 
@@ -1446,8 +1533,12 @@ fn cWarpsync(cx: *Cx) Error!void {
 /// thread count, printed when not 0, in 42..53).
 fn cBar(cx: *Cx) Error!void {
     cx.put(0, 12, 0xb1d);
-    _ = try cx.mod(77, 2, &.{ "SYNC", "ARV", "RED", "SCAN" });
-    _ = try cx.flag(80, "DEFER_BLOCKING");
+    // (BAR.RED and BAR.SCAN have more fields: not covered; ARV does not
+    // defer)
+    const arv = (try cx.mod(77, 2, &.{ "SYNC", "ARV", "?", "?" })) == 1;
+    if (try cx.flag(80, "DEFER_BLOCKING")) {
+        if (arv) return if (cx.enc()) error.Syntax else error.Unknown;
+    }
     _ = try cx.imm(54, 4, .hex);
     if (cx.enc()) {
         if (cx.peek() != null) _ = try cx.imm(42, 12, .hex);
@@ -1486,9 +1577,11 @@ fn cR2ur(cx: *Cx) Error!void {
 // Constant, global, local and shared memory ------------------------------------
 
 /// LDC Rd, c[bank][offset] (a register index in 24); LDCU URd, ...
-/// (offset in 37..53, a uniform index in 24).
+/// (offset in 37..53, a uniform index in 24; the uniform datapath's, its
+/// guard a uniform predicate). The offsets are signed fields: negative
+/// ones are not covered.
 fn cLdc(cx: *Cx, uniform: bool) Error!void {
-    _ = try cx.mod(73, 3, &SIZES);
+    _ = try cx.mod(73, 3, &SIZES_LDC);
     if (uniform) {
         cx.put(0, 12, 0x7ac);
         _ = try cx.ureg(16);
@@ -1504,13 +1597,15 @@ fn cLdc(cx: *Cx, uniform: bool) Error!void {
         if (o != .cbuf) return error.Syntax;
         const cb = o.cbuf;
         if (cb.neg or cb.abs or (cb.reg != RZ and cb.ureg != uniform)) return error.Syntax;
-        if (cb.offset >> @intCast(off_n) != 0) return error.OutOfRange;
+        // (the offset is signed: nvdisasm prints 0x837c as -0x7c84)
+        if (cb.offset >> @intCast(off_n - 1) != 0) return error.OutOfRange;
         cx.w.put(24, 8, cb.reg);
         cx.w.put(off_at, off_n, cb.offset);
         cx.w.put(54, 5, cb.bank);
         return;
     }
     const index: u8 = @intCast(cx.get(24, 8));
+    if (cx.get(off_at + off_n - 1, 1) == 1) return error.Unknown;
     try cx.push(.{ .cbuf = .{
         .bank = @intCast(cx.get(54, 5)),
         .offset = @intCast(cx.get(off_at, off_n)),
@@ -1527,28 +1622,37 @@ fn cLdcU(cx: *Cx) Error!void {
     return cLdc(cx, true);
 }
 
-fn cLdg(cx: *Cx) Error!void {
-    cx.put(0, 12, 0x981);
-    _ = try cx.flag(76, "E");
+/// LDG.E(.evict)(.size)(.order) Rd, desc[URd][Ra.64+offset] and STG's
+/// mirror. Bit 72 is .E (a 64-bit address); bit 76 picks the descriptor
+/// form, else the uniform register (in the descriptor's place) is added:
+/// [Ra.64+URb+offset]. Ra is 64 bits in both (a 32-bit Ra, .U32, is not
+/// covered).
+fn global(cx: *Cx, load: bool) Error!void {
+    cx.put(0, 12, if (load) 0x981 else 0x986);
+    try cx.always("E");
+    cx.put(72, 1, 1);
+    _ = try cx.mod(84, 3, &EVICT);
     _ = try cx.mod(73, 3, &SIZES);
-    _ = try cx.mod(77, 4, &ORDER);
-    _ = try cx.reg(16);
-    _ = try cx.addr(.{ .desc = 32, .wide = 90 });
-    cx.put(72, 1, 1); // (the descriptor is 64 bits)
-    cx.put(81, 3, PT);
-    cx.put(84, 3, 1); // (eviction: normal)
+    try cx.modParts(77, 4, if (load) &ORDERS else &ORDERS_ST);
+    if (load) _ = try cx.reg(16);
+    const at: u7 = if (load) 32 else 64;
+    const desc = if (cx.enc()) blk: {
+        const o = cx.peek() orelse return error.Syntax;
+        break :blk o == .addr and o.addr.desc != null;
+    } else cx.get(76, 1) == 1;
+    cx.put(76, 1, @intFromBool(desc));
+    const a = try cx.addr(if (desc) .{ .desc = at, .wide = 90 } else .{ .ureg = at, .ureg_always = true, .wide = 90 });
+    if (!a.wide) return if (cx.enc()) error.Syntax else error.Unknown;
+    if (load) cx.put(81, 3, PT) else _ = try cx.reg(32);
     cx.put(91, 1, 1);
 }
 
+fn cLdg(cx: *Cx) Error!void {
+    return global(cx, true);
+}
+
 fn cStg(cx: *Cx) Error!void {
-    cx.put(0, 12, 0x986);
-    _ = try cx.flag(76, "E");
-    _ = try cx.mod(73, 3, &SIZES);
-    _ = try cx.addr(.{ .desc = 64, .wide = 90 });
-    _ = try cx.reg(32);
-    cx.put(72, 1, 1);
-    cx.put(84, 3, 1);
-    cx.put(91, 1, 1);
+    return global(cx, false);
 }
 
 fn cLdl(cx: *Cx) Error!void {
@@ -1644,38 +1748,62 @@ fn cUiadd3(cx: *Cx) Error!void {
     return iadd3(cx, true);
 }
 
-/// IMAD(.WIDE)(.HI)(.U32) Rd, a, b, c. nvdisasm names IMAD.U32 by a power
-/// of two and no addend IMAD.SHL.
+/// IMAD(.WIDE)(.HI)(.U32) Rd, a, b, c, its immediates signed even with
+/// .U32. nvdisasm names a plain IMAD by what it computes: IMAD.MOV when
+/// the product is a or zero (a or b zero, or b 1 and no addend), else
+/// IMAD.IADD when b is 1, else IMAD.SHL when b is a power of two (2 to
+/// 2^30) and there is no addend; all only when c is a register.
 fn cImad(cx: *Cx) Error!void {
     const op9 = cx.get(0, 9);
     const wide = cx.sense("WIDE", op9 == 0x025);
     const hi = cx.sense("HI", op9 == 0x027);
-    const unsigned = cx.sense("U32", cx.get(73, 1) == 0);
-    const s = Slot{ .src = .{ .imm = if (unsigned) .hex else .signed } };
     _ = try cx.reg(16);
-    try alu(cx, .{ .op = if (wide) 0x025 else if (hi) 0x027 else 0x024, .a = s, .b = s, .c = s });
+    try alu(cx, .{ .op = if (wide) 0x025 else if (hi) 0x027 else 0x024, .a = SINT, .b = SINT, .c = SINT, .ureg_c = true });
     cx.put(81, 3, PT);
     cx.put(87, 4, 0xf);
     _ = try cx.derived("WIDE", wide);
     _ = try cx.derived("HI", hi);
-    const o = cx.in.ops[0..cx.in.n_ops];
-    const shl = !cx.enc() and !wide and !hi and unsigned and o.len == 4 and o[2] == .imm and
-        o[2].imm.bits != 0 and std.math.isPowerOfTwo(o[2].imm.bits) and o[3] == .gpr and o[3].gpr.n == RZ;
-    _ = try cx.derived("SHL", shl);
+    var alias: ?[]const u8 = null;
+    if (!cx.enc() and !wide and !hi) alias = imadAlias(cx.in.ops[1..cx.in.n_ops]);
+    for ([_][]const u8{ "MOV", "IADD", "SHL" }) |name| {
+        _ = try cx.derived(name, alias != null and eql(alias.?, name));
+    }
     _ = try cx.mod(73, 1, &.{ "U32", "" });
+}
+
+fn imadAlias(o: []const Operand) ?[]const u8 {
+    // (none when c is an immediate, a constant or uniform: b is in c's slot)
+    if (o.len != 3 or o[2] != .gpr) return null;
+    const zero = struct {
+        fn of(x: Operand) bool {
+            return switch (x) {
+                .gpr => |r| r.n == RZ,
+                .imm => |i| i.bits == 0,
+                else => false,
+            };
+        }
+    }.of;
+    const b_imm: ?i32 = if (o[1] == .imm) @bitCast(@as(u32, @truncate(o[1].imm.bits))) else null;
+    const no_c = o[2] == .gpr and o[2].gpr.n == RZ;
+    if (zero(o[0]) or zero(o[1]) or (b_imm != null and b_imm.? == 1 and no_c)) return "MOV";
+    if (b_imm) |v| {
+        if (v == 1) return "IADD";
+        if (v >= 2 and std.math.isPowerOfTwo(v) and no_c) return "SHL";
+    }
+    return null;
 }
 
 /// ISETP.cmp(.U32 | .U64 | .S64).bool Pd, Pd1, a, b, Paccum (UISETP on
 /// the uniform datapath).
 fn isetp(cx: *Cx, uniform: bool) Error!void {
-    const signed = if (cx.enc()) !(cx.sense("U32", false) or cx.sense("U64", false)) else cx.get(73, 1) == 1;
     _ = try cx.pred(81, uniform);
     _ = try cx.pred(84, uniform);
     try alu(cx, .{
         .op = if (uniform) 0x08c else 0x00c,
         .uniform = uniform,
         .a = INT,
-        .b = .{ .src = .{ .imm = if (signed) .signed else .hex } },
+        // (nvdisasm prints the immediate signed, .U32 or not)
+        .b = SINT,
     });
     _ = try cx.predNot(87, uniform);
     cx.put(68, 4, PT);
@@ -1744,12 +1872,14 @@ fn lea(cx: *Cx, uniform: bool) Error!void {
     const hi = cx.sense("HI", cx.get(80, 1) == 1);
     const x = cx.sense("X", cx.get(74, 1) == 1);
     const sx = cx.sense("SX32", cx.get(73, 1) == 1);
+    if (sx and !hi) return if (cx.enc()) error.Syntax else error.Unknown;
     _ = try cx.regOf(16, uniform);
     try cx.optPred(81, uniform);
     try alu(cx, .{
         .op = if (uniform) 0x091 else 0x011,
         .uniform = uniform,
-        .a = .{ .src = .{ .neg = true } },
+        // (a's negation; with .X its bit is a NOT, ~Ra, not covered)
+        .a = if (x) INT else .{ .src = .{ .neg = true } },
         .b = INT,
         .c = if (hi and !sx) INT else .rz,
     });
@@ -1771,7 +1901,7 @@ fn cUlea(cx: *Cx) Error!void {
 /// SHF.L/R(.W).type(.HI) Rd, low, shift, high: a funnel shift.
 fn shf(cx: *Cx, uniform: bool) Error!void {
     _ = try cx.regOf(16, uniform);
-    try alu(cx, .{ .op = if (uniform) 0x099 else 0x019, .uniform = uniform, .a = INT, .b = INT, .c = INT });
+    try alu(cx, .{ .op = if (uniform) 0x099 else 0x019, .uniform = uniform, .a = INT, .b = INT, .c = INT, .ureg_c = true });
     _ = try cx.mod(76, 1, &.{ "L", "R" });
     _ = try cx.flag(75, "W");
     _ = try cx.mod(73, 2, &.{ "S64", "U64", "S32", "U32" });
@@ -1809,9 +1939,9 @@ fn cSel(cx: *Cx) Error!void {
 
 /// VIMNMX.S32/U32 Rd, a, b, Pmin: min when the predicate is true, else max.
 fn cVimnmx(cx: *Cx) Error!void {
-    const signed = cx.sense("S32", cx.get(72, 1) == 1);
     _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x048, .a = INT, .b = .{ .src = .{ .imm = if (signed) .signed else .hex } } });
+    // (the immediate prints signed, .U32 or not)
+    try alu(cx, .{ .op = 0x048, .a = INT, .b = SINT });
     _ = try cx.predNot(87, false);
     cx.put(81, 6, 0x3f);
     _ = try cx.mod(72, 1, &.{ "U32", "S32" });
@@ -1904,15 +2034,16 @@ fn cVoteu(cx: *Cx) Error!void {
 
 // Floats ---------------------------------------------------------------------------
 
+/// nvdisasm's order: FADD.FTZ.RM.SAT.
 fn fmods(cx: *Cx) Error!void {
-    _ = try cx.mod(78, 2, &RND);
     _ = try cx.flag(80, "FTZ");
+    _ = try cx.mod(78, 2, &RND);
     _ = try cx.flag(77, "SAT");
 }
 
 fn ffma(cx: *Cx, uniform: bool) Error!void {
     _ = try cx.regOf(16, uniform);
-    try alu(cx, .{ .op = if (uniform) 0x055 else 0x023, .uniform = uniform, .a = FNEG, .b = FNEG, .c = FNEG });
+    try alu(cx, .{ .op = if (uniform) 0x055 else 0x023, .uniform = uniform, .a = FNEG, .b = FNEG, .c = FNEG, .ureg_c = true });
     try fmods(cx);
 }
 
@@ -1926,7 +2057,7 @@ fn cUffma(cx: *Cx) Error!void {
 
 fn cFadd(cx: *Cx) Error!void {
     _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x021, .a = FABS, .bc = F32_ABS });
+    try alu(cx, .{ .op = 0x021, .a = FABS, .bc = F32_ABS, .ureg_c = true });
     try fmods(cx);
 }
 
@@ -1985,30 +2116,50 @@ fn hmods(cx: *Cx, f32_bit: bool) Error!void {
     _ = try cx.flag(77, "SAT");
 }
 
+/// Whether a half op is .BF16_V2 (its immediates bfloat16s): refused with
+/// .F32, which nvdisasm calls illegal.
+fn bf16Of(cx: *Cx, f32_bit: bool) Error!bool {
+    const bf = cx.sense("BF16_V2", cx.get(85, 1) == 1);
+    if (bf and f32_bit and cx.sense("F32", cx.get(78, 1) == 1)) return if (cx.enc()) error.Syntax else error.Unknown;
+    return bf;
+}
+
+/// A half op's source: f16 or bf16 immediates, the sign and selector bits
+/// (and |..| unless `no_abs`).
+fn halfSrc(bf: bool, no_abs: bool) Slot {
+    return .{ .src = .{ .imm = if (bf) .bf16 else .f16, .neg = true, .abs = !no_abs, .sel = .half } };
+}
+
 /// HADD2(.F32) Rd, a, b: two halves at once (.F32: one f32 result, how
 /// ptxas widens a half).
 fn cHadd2(cx: *Cx) Error!void {
+    const bf = try bf16Of(cx, true);
     _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x030, .a = HALF, .bc = HALF_SPEC, .half = true });
+    // (a has no |..|: nvdisasm prints nothing for bit 73)
+    try alu(cx, .{ .op = 0x030, .a = halfSrc(bf, true), .bc = halfSrc(bf, false).src, .half = true, .ureg_c = true });
     try hmods(cx, true);
 }
 
 fn cHmul2(cx: *Cx) Error!void {
+    const bf = try bf16Of(cx, false);
     _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x032, .a = HALF, .b = HALF, .half = true });
+    try alu(cx, .{ .op = 0x032, .a = halfSrc(bf, false), .b = halfSrc(bf, false), .half = true });
     try hmods(cx, false);
 }
 
 /// HFMA2 Rd, a, b, c (an immediate b or c as two halves)
 fn cHfma2(cx: *Cx) Error!void {
+    const bf = try bf16Of(cx, true);
+    const h = halfSrc(bf, false);
     _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x031, .a = HALF, .b = HALF, .c = HALF, .half = true });
+    try alu(cx, .{ .op = 0x031, .a = h, .b = h, .c = h, .half = true, .ureg_c = true });
     try hmods(cx, true);
 }
 
 fn cHmnmx2(cx: *Cx) Error!void {
+    const bf = try bf16Of(cx, false);
     _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x040, .a = HALF, .b = HALF, .half = true });
+    try alu(cx, .{ .op = 0x040, .a = halfSrc(bf, false), .b = halfSrc(bf, false), .half = true });
     _ = try cx.predNot(87, false);
     _ = try cx.flag(85, "BF16_V2");
     _ = try cx.flag(80, "FTZ");
@@ -2031,36 +2182,39 @@ fn wideOp(cx: *Cx, op64: u9) void {
     if (cx.enc() and (cx.w.get(76, 1) == 1 and cx.w.get(75, 1) == 1 or cx.w.get(84, 2) == 3)) cx.w.put(0, 9, op64);
 }
 
-/// F2I(.type)(.F64)(.round)(.NTZ) Rd, b
+/// F2I(.FTZ)(.type)(.F64)(.round)(.NTZ) Rd, b
 fn cF2i(cx: *Cx) Error!void {
     _ = try cx.reg(16);
     try alu(cx, .{ .op = 0x105, .b = FABS });
+    _ = try cx.flag(80, "FTZ");
     _ = try cx.modBits(&.{ 72, 75, 76 }, &ITYPES_S32);
     _ = try cx.mod(84, 2, &FTYPES_F32);
     _ = try cx.mod(78, 2, &FRND);
     _ = try cx.flag(77, "NTZ");
-    _ = try cx.flag(80, "FTZ");
     wideOp(cx, 0x111);
 }
 
-/// I2F(.F64)(.type)(.round) Rd, b (a byte of b with .B1..B3)
+/// I2F(.F64)(.type)(.round) Rd, b (a byte of b with .B1..B3, for a byte
+/// source only: nvdisasm ignores the selector otherwise)
 fn cI2f(cx: *Cx) Error!void {
     _ = try cx.reg(16);
     try alu(cx, .{ .op = 0x106, .b = .{ .src = .{ .imm = .signed, .sel = .byte } } });
     _ = try cx.mod(75, 2, &FTYPES_F32);
-    _ = try cx.modBits(&.{ 74, 84, 85 }, &ITYPES_S32);
+    const st = try cx.modBits(&.{ 74, 84, 85 }, &ITYPES_S32);
     _ = try cx.mod(78, 2, &RND);
+    if (st >> 1 != 0 and cx.in.n_ops > 1 and cx.in.ops[1] == .gpr and cx.in.ops[1].gpr.sel != .none)
+        return if (cx.enc()) error.Syntax else error.Unknown;
     wideOp(cx, 0x112);
 }
 
-/// F2F.dst.src(.round)(.FTZ) Rd, b
+/// F2F(.FTZ).dst.src(.round) Rd, b
 fn cF2f(cx: *Cx) Error!void {
     _ = try cx.reg(16);
     try alu(cx, .{ .op = 0x104, .b = FABS });
+    _ = try cx.flag(80, "FTZ");
     _ = try cx.mod(75, 2, &FTYPES);
     _ = try cx.mod(84, 2, &FTYPES);
     _ = try cx.mod(78, 2, &RND);
-    _ = try cx.flag(80, "FTZ");
     wideOp(cx, 0x110);
 }
 
@@ -2068,8 +2222,10 @@ fn cF2f(cx: *Cx) Error!void {
 fn cI2fp(cx: *Cx) Error!void {
     _ = try cx.reg(16);
     try alu(cx, .{ .op = 0x045, .b = SINT });
-    _ = try cx.mod(75, 2, &FTYPES);
-    _ = try cx.modBits(&.{ 74, 84, 85 }, &ITYPES);
+    // (an f32 result only: nvdisasm calls the others INVALID)
+    _ = try cx.mod(75, 2, &.{ "?", "?", "F32", "?" });
+    // (and 32-bit sources only)
+    _ = try cx.modBits(&.{ 74, 84, 85 }, &.{ "?", "?", "?", "?", "U32", "S32", "?", "?" });
 }
 
 /// F2IP.U8.F32.NTZ Rd, a, b, c: a float to a saturated byte (the one
@@ -2080,7 +2236,7 @@ fn cF2ip(cx: *Cx) Error!void {
     try cx.always("F32");
     try cx.always("NTZ");
     _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x043, .a = INT, .b = INT, .c = INT });
+    try alu(cx, .{ .op = 0x043, .a = INT, .b = INT, .c = INT, .ureg_c = true });
     cx.put(74, 1, 1);
 }
 
@@ -2101,7 +2257,8 @@ fn cHmma(cx: *Cx) Error!void {
 /// IMMA.shape.atype.btype Rd, a.ROW, b.COL, c: int8 (or int4) a, b; s32
 /// c, d.
 fn cImma(cx: *Cx) Error!void {
-    const types = [_][]const u8{ "U8", "S8", "U4", "S4" };
+    // (int4 a and b are not covered: nvdisasm has none at m16n8k32)
+    const types = [_][]const u8{ "U8", "S8", "?", "?" };
     cx.put(0, 12, 0x237);
     _ = try cx.modBits(&.{ 75, 85, 86 }, &.{ "8816", "?", "8832", "?", "16816", "16832", "16864", "?" });
     _ = try cx.modBits(&.{ 76, 83 }, &types);
@@ -2140,11 +2297,11 @@ const FORMS = [_]Form{
     .{ .name = "WARPSYNC", .opcode = 0x348, .codec = cWarpsync },
     .{ .name = "BAR", .opcode = 0xb1d, .codec = cBar },
     .{ .name = "S2R", .opcode = 0x919, .codec = cS2r },
-    .{ .name = "S2UR", .opcode = 0x9c3, .codec = cS2ur },
+    .{ .name = "S2UR", .opcode = 0x9c3, .uniform = true, .codec = cS2ur },
     .{ .name = "CS2R", .opcode = 0x805, .codec = cCs2r },
     .{ .name = "R2UR", .opcode = 0x2ca, .codec = cR2ur },
     .{ .name = "LDC", .opcode = 0xb82, .codec = cLdcR },
-    .{ .name = "LDCU", .opcode = 0x7ac, .codec = cLdcU },
+    .{ .name = "LDCU", .opcode = 0x7ac, .uniform = true, .codec = cLdcU },
     .{ .name = "LDG", .opcode = 0x981, .codec = cLdg },
     .{ .name = "STG", .opcode = 0x986, .codec = cStg },
     .{ .name = "LDL", .opcode = 0x983, .codec = cLdl },
@@ -2164,7 +2321,7 @@ const FORMS = [_]Form{
     .{ .name = "HMMA", .opcode = 0x23c, .codec = cHmma },
     .{ .name = "IMMA", .opcode = 0x237, .codec = cImma },
     .{ .name = "MOV", .opcode = 0x002, .alu = true, .codec = cMov },
-    .{ .name = "UMOV", .opcode = 0x082, .alu = true, .codec = cUmov },
+    .{ .name = "UMOV", .opcode = 0x082, .alu = true, .uniform = true, .codec = cUmov },
     .{ .name = "IADD", .opcode = 0x035, .alu = true, .codec = cIadd },
     .{ .name = "IADD3", .opcode = 0x010, .alu = true, .codec = cIadd3 },
     .{ .name = "UIADD3", .opcode = 0x090, .alu = true, .uniform = true, .codec = cUiadd3 },
@@ -2356,7 +2513,9 @@ fn fmtOperand(o: *Out, x: Operand) FormatError!void {
             .hex => try o.print("0x{x}", .{i.bits}),
             .signed => try fmtSigned(o, @as(i32, @bitCast(@as(u32, @truncate(i.bits))))),
             .f32 => try fmtFloat(o, @bitCast(@as(u32, @truncate(i.bits)))),
-            .f16 => try fmtFloat(o, @as(f16, @bitCast(@as(u16, @truncate(i.bits))))),
+            .f16 => try fmtHalf(o, @truncate(i.bits)),
+            // (a bfloat16 is a float's top half)
+            .bf16 => try fmtFloat(o, @bitCast(@as(u32, @as(u16, @truncate(i.bits))) << 16)),
         },
         .cbuf => |c| {
             if (c.neg) try o.str("-");
@@ -2400,18 +2559,34 @@ fn fmtOperand(o: *Out, x: Operand) FormatError!void {
     }
 }
 
+/// A half as nvdisasm prints it: its specials, else its value as a float.
+fn fmtHalf(o: *Out, bits: u16) FormatError!void {
+    const neg = bits >> 15 == 1;
+    if (bits & 0x7c00 == 0x7c00) {
+        const frac = bits & 0x3ff;
+        return fmtSpecial(o, neg, frac == 0, frac >> 9 == 1);
+    }
+    return fmtFloat(o, @as(f16, @bitCast(bits)));
+}
+
+fn fmtSpecial(o: *Out, neg: bool, inf: bool, quiet: bool) FormatError!void {
+    try o.str(if (neg) "-" else "+");
+    try o.str(if (inf) "INF " else if (quiet) "QNAN " else "SNAN ");
+}
+
 /// A float as nvdisasm prints it: below 1e9, C's %.20g of its value (the
 /// float's exact decimal expansion rounded half to even at 20 digits,
 /// trailing zeros dropped); from 1e9 up, %.20e (21 digits, all kept); and
-/// +INF, -INF, +QNAN, -QNAN, which nvdisasm follows with a space.
+/// +INF, -INF, +QNAN, -QNAN (the quiet bit set), +SNAN, -SNAN and -0.0,
+/// which nvdisasm follows with a space.
 fn fmtFloat(o: *Out, x: f32) FormatError!void {
     const bits: u32 = @bitCast(x);
     const neg = bits >> 31 == 1;
     const e_bits: u32 = (bits >> 23) & 0xff;
     const frac: u32 = bits & 0x7fffff;
-    if (e_bits == 0xff) return o.str(if (frac != 0) (if (neg) "-QNAN " else "+QNAN ") else if (neg) "-INF " else "+INF ");
+    if (e_bits == 0xff) return fmtSpecial(o, neg, frac == 0, frac >> 22 == 1);
+    if (e_bits == 0 and frac == 0) return o.str(if (neg) "-0.0 " else "0");
     if (neg) try o.str("-");
-    if (e_bits == 0 and frac == 0) return o.str("0");
     var m: u32 = if (e_bits == 0) frac else frac | (1 << 23);
     var e: i32 = if (e_bits == 0) -149 else @as(i32, @intCast(e_bits)) - 150;
     while (m & 1 == 0) {
@@ -2844,6 +3019,51 @@ test "ptxas's vectors decoded: the same 128 bits encoded again, nvdisasm's text 
         std.debug.print("{d} of {d} vectors failed\n", .{ failures, n });
         return error.TestUnexpectedResult;
     }
+}
+
+test "words ptxas does not emit, as nvdisasm prints them (testdata/sm120_raw.txt)" {
+    // (IMAD's aliases, floats' specials, global memory's orders, eviction
+    // and uniform-register addresses, and what checking decode against
+    // nvdisasm on mutated vectors found: see tools/gen_sm120_vectors.py)
+    const data = @embedFile("testdata/sm120_raw.txt");
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    var n: usize = 0;
+    var failures: usize = 0;
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len < 34 or line[0] == '#') continue;
+        const hi = try std.fmt.parseInt(u64, line[0..16], 16);
+        const lo = try std.fmt.parseInt(u64, line[17..33], 16);
+        const text = line[34..];
+        n += 1;
+        const in = decode(lo, hi, 0) catch |e| {
+            std.debug.print("decode \"{s}\": {s}\n", .{ text, @errorName(e) });
+            failures += 1;
+            continue;
+        };
+        var buf: [256]u8 = undefined;
+        const got = try format(&in, &buf);
+        if (!eql(got, text)) {
+            std.debug.print("format: \"{s}\"\n  want: \"{s}\"\n", .{ got, text });
+            failures += 1;
+            continue;
+        }
+        const again = parse(text) catch |e| {
+            std.debug.print("parse \"{s}\": {s}\n", .{ text, @errorName(e) });
+            failures += 1;
+            continue;
+        };
+        const w = try encode(&again, 0, null);
+        if (w.lo() != lo or w.hi() != hi) {
+            std.debug.print("encode \"{s}\": got {x:0>16}_{x:0>16}\n", .{ text, w.hi(), w.lo() });
+            failures += 1;
+        }
+    }
+    if (failures != 0) {
+        std.debug.print("{d} of {d} raw words failed\n", .{ failures, n });
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(n > 100);
 }
 
 /// `text` encoded at `pc`, then decoded: what an emulator sees.
