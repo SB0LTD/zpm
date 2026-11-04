@@ -478,7 +478,8 @@ fn tileCopy(t: *Text, comptime tokens: u32, comptime L: type) void {
                 'q' => {
                     // act_q + t * K + tb * cols + 16 tid (and + 0x400)
                     t.put("IMAD R{d}, R{d}, 0x{x}, R{d}", .{ M.X0, M.TB, L.block_cols, M.TID16 });
-                    if (tok > 0) t.put("IMAD R{d}, R{d}, 0x{x}, R{d}", .{ M.X0, M.KB, tok, M.X0 });
+                    // (a multiplier of 1 is nvdisasm's IMAD.IADD: the same word)
+                    if (tok == 1) t.put("IMAD.IADD R{d}, R{d}, 0x1, R{d}", .{ M.X0, M.KB, M.X0 }) else if (tok > 0) t.put("IMAD R{d}, R{d}, 0x{x}, R{d}", .{ M.X0, M.KB, tok, M.X0 });
                     t.put("IMAD.WIDE.U32 R{d}, R{d}, 0x1, R{d}", .{ M.XA, M.X0, M.AQ });
                     t.put("@P3 LDG.E.128 R{d}, desc[UR4][R{d}.64]", .{ dst[k], M.XA });
                     t.put("@P4 LDG.E.128 R{d}, desc[UR4][R{d}.64+0x400]", .{ dst[k] + 4, M.XA });
@@ -486,7 +487,7 @@ fn tileCopy(t: *Text, comptime tokens: u32, comptime L: type) void {
                 's' => {
                     // act_sums + (t * blocks + tb) * 32 + 16 tid
                     if (tok > 0) {
-                        t.put("IMAD R{d}, R{d}, 0x{x}, R{d}", .{ M.X0, M.NBLK, tok, M.TB });
+                        if (tok == 1) t.put("IMAD.IADD R{d}, R{d}, 0x1, R{d}", .{ M.X0, M.NBLK, M.TB }) else t.put("IMAD R{d}, R{d}, 0x{x}, R{d}", .{ M.X0, M.NBLK, tok, M.TB });
                         t.put("IMAD R{d}, R{d}, 0x20, R{d}", .{ M.X0, M.X0, M.TID16 });
                     } else t.put("IMAD R{d}, R{d}, 0x20, R{d}", .{ M.X0, M.TB, M.TID16 });
                     t.put("IMAD.WIDE.U32 R{d}, R{d}, 0x1, R{d}", .{ M.XA, M.X0, M.AS });
@@ -495,7 +496,7 @@ fn tileCopy(t: *Text, comptime tokens: u32, comptime L: type) void {
                 else => {
                     // act_d + (t * blocks + tb + tid) * 4
                     if (tok > 0) {
-                        t.put("IMAD R{d}, R{d}, 0x{x}, R{d}", .{ M.X0, M.NBLK, tok, M.TB });
+                        if (tok == 1) t.put("IMAD.IADD R{d}, R{d}, 0x1, R{d}", .{ M.X0, M.NBLK, M.TB }) else t.put("IMAD R{d}, R{d}, 0x{x}, R{d}", .{ M.X0, M.NBLK, tok, M.TB });
                         t.put("IADD R{d}, R{d}, R{d}", .{ M.X0, M.X0, M.TID });
                     } else t.put("IADD R{d}, R{d}, R{d}", .{ M.X0, M.TB, M.TID });
                     t.put("IMAD.WIDE.U32 R{d}, R{d}, 0x4, R{d}", .{ M.XA, M.X0, M.AD });
