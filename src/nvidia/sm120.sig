@@ -1301,7 +1301,11 @@ fn alu(cx: *Cx, d: Alu) Error!void {
         .ureg, .imm, .cbuf => blk: {
             switch (b.src) {
                 .none => {},
-                .reg => |r| putReg(w, at_c, r, b.sel),
+                .reg => |r| {
+                    // (with a uniform c, nvdisasm calls b's .reuse illegal)
+                    if (c.src == .ureg and r.reuse) return error.Syntax;
+                    putReg(w, at_c, r, b.sel);
+                },
                 else => return error.Unknown,
             }
             switch (c.src) {
@@ -1355,7 +1359,7 @@ fn aluDecode(cx: *Cx, d: Alu, at_c: RegAt) Error!void {
             c_at = .reg64;
         },
         7 => {
-            if (!d.ureg_c) return error.Unknown;
+            if (!d.ureg_c or cx.get(SLOT_C, 1) == 1) return error.Unknown;
             c_at = .ureg32;
             b_at = .reg64;
         },
@@ -2212,8 +2216,9 @@ fn cF2f(cx: *Cx) Error!void {
     _ = try cx.reg(16);
     try alu(cx, .{ .op = 0x104, .b = FABS });
     _ = try cx.flag(80, "FTZ");
-    _ = try cx.mod(75, 2, &FTYPES);
-    _ = try cx.mod(84, 2, &FTYPES);
+    const dt = try cx.mod(75, 2, &FTYPES);
+    // (between two types: nvdisasm calls F2F.F64.F64 illegal)
+    if (dt == try cx.mod(84, 2, &FTYPES)) return if (cx.enc()) error.Syntax else error.Unknown;
     _ = try cx.mod(78, 2, &RND);
     wideOp(cx, 0x110);
 }
@@ -2260,7 +2265,8 @@ fn cImma(cx: *Cx) Error!void {
     // (int4 a and b are not covered: nvdisasm has none at m16n8k32)
     const types = [_][]const u8{ "U8", "S8", "?", "?" };
     cx.put(0, 12, 0x237);
-    _ = try cx.modBits(&.{ 75, 85, 86 }, &.{ "8816", "?", "8832", "?", "16816", "16832", "16864", "?" });
+    // (m8n8k32 and m16n8k64 are int4 shapes: not covered)
+    _ = try cx.modBits(&.{ 75, 85, 86 }, &.{ "8816", "?", "?", "?", "16816", "16832", "?", "?" });
     _ = try cx.modBits(&.{ 76, 83 }, &types);
     _ = try cx.modBits(&.{ 78, 84 }, &types);
     _ = try cx.flag(82, "SAT");
@@ -3134,6 +3140,14 @@ test "decode refuses words it does not account for" {
     try testing.expectError(error.Unknown, decode(0x0000_0000_0001_7918, 0x000f_c000_0000_0000, 0));
     try testing.expectError(error.Unknown, decode(0x0000_0000_0000_7fff, 0x000f_c000_0000_0000, 0));
     try testing.expectError(error.Unknown, decode(0x0000_0000_0000_7918, 0x000f_8000_0000_0000, 0));
+    // (words nvdisasm calls INVALID or illegal: IMMA.16864 of bytes,
+    // F2F.F64.F64, b's .reuse beside a uniform c, BAR.ARV.DEFER_BLOCKING,
+    // an ALU constant source, MOV R2, c[0x0][0x0])
+    try testing.expectError(error.Unknown, decode(0x0000_0002_0414_7237, 0x000f_f000_0060_5414, 0));
+    try testing.expectError(error.Unknown, decode(0x0000_000a_000a_7310, 0x008e_a400_0030_1800, 0));
+    try testing.expectError(error.Unknown, decode(0x0000_0004_1915_7e24, 0x100f_e400_0f8e_0200, 0));
+    try testing.expectError(error.Unknown, decode(0x0000_0000_0000_7b1d, 0x000f_ec00_0001_2000, 0));
+    try testing.expectError(error.Unknown, decode(0x0000_0000_0002_7a02, 0x000f_e200_0000_0f00, 0));
     // (a decoded instruction's modifiers come out in nvdisasm's order)
     const in = try parse("ISETP.U32.GE.AND P0, PT, R2, R5, PT");
     const w = try encode(&in, 0, null);
