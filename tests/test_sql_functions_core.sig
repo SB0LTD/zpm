@@ -519,11 +519,125 @@ fn bitwise() void {
     report("bitwise",before);
 }
 
+// ---- PG.FUNC.TEMPORAL --------------------------------------------------------
+
+fn temporals() void {
+    const before=begin("temporal");
+    // Oracle fixture (PG.FUNC.TEMPORAL).
+    shaped("SELECT extract(year FROM DATE '2025-03-01'),date_trunc('month',TIMESTAMP '2025-03-15 12:00:00'),age(DATE '2025-03-01',DATE '2024-03-01')",
+        &.{.{.name="extract",.oid=1700},.{.name="date_trunc",.oid=1114},.{.name="age",.oid=1186}},&.{"2025","2025-03-01 00:00:00","1 year"});
+    // PostgreSQL 18 documentation examples (functions-datetime.html).
+    value("SELECT age(timestamp '2001-04-10',timestamp '1957-06-13')",1186,"43 years 9 mons 27 days");
+    value("SELECT date_part('hour',timestamp '2001-02-16 20:38:40')",701,"20");
+    value("SELECT date_part('month',interval '2 years 3 months')",701,"3");
+    value("SELECT date_trunc('hour',timestamp '2001-02-16 20:38:40')",1114,"2001-02-16 20:00:00");
+    value("SELECT date_trunc('hour',interval '2 days 3 hours 40 minutes')",1186,"2 days 03:00:00");
+    value("SELECT extract(hour from timestamp '2001-02-16 20:38:40')",1700,"20");
+    value("SELECT extract(month from interval '2 years 3 months')",1700,"3");
+    value("SELECT extract(month from interval '2 years 13 months')",1700,"1");
+    value("SELECT justify_days(interval '1 year 65 days')",1186,"1 year 2 mons 5 days");
+    value("SELECT justify_hours(interval '50 hours 10 minutes')",1186,"2 days 02:10:00");
+    value("SELECT justify_interval(interval '1 mon -1 hour')",1186,"29 days 23:00:00");
+    value("SELECT make_date(2013,7,15)",1082,"2013-07-15");
+    value("SELECT make_date(-44,3,15)",1082,"0044-03-15 BC");
+    value("SELECT make_timestamp(2013,7,15,8,15,23.5)",1114,"2013-07-15 08:15:23.5");
+    value("SELECT isfinite(date '2001-02-16')",16,"t");
+    value("SELECT isfinite(timestamp 'infinity')",16,"f");
+    value("SELECT EXTRACT(CENTURY FROM TIMESTAMP '2000-12-16 12:21:13')",1700,"20");
+    value("SELECT EXTRACT(CENTURY FROM TIMESTAMP '2001-02-16 20:38:40')",1700,"21");
+    value("SELECT EXTRACT(DAY FROM TIMESTAMP '2001-02-16 20:38:40')",1700,"16");
+    value("SELECT EXTRACT(DAY FROM INTERVAL '40 days 1 minute')",1700,"40");
+    value("SELECT EXTRACT(DECADE FROM TIMESTAMP '2001-02-16 20:38:40')",1700,"200");
+    value("SELECT EXTRACT(DOW FROM TIMESTAMP '2001-02-16 20:38:40')",1700,"5");
+    value("SELECT EXTRACT(DOY FROM TIMESTAMP '2001-02-16 20:38:40')",1700,"47");
+    value("SELECT EXTRACT(EPOCH FROM TIMESTAMP WITH TIME ZONE '2001-02-16 20:38:40.12-08')",1700,"982384720.120000");
+    value("SELECT EXTRACT(EPOCH FROM TIMESTAMP '2001-02-16 20:38:40.12')",1700,"982355920.120000");
+    value("SELECT EXTRACT(EPOCH FROM INTERVAL '5 days 3 hours')",1700,"442800.000000");
+    value("SELECT EXTRACT(ISODOW FROM TIMESTAMP '2001-02-18 20:38:40')",1700,"7");
+    value("SELECT EXTRACT(ISOYEAR FROM DATE '2006-01-01')",1700,"2005");
+    value("SELECT EXTRACT(ISOYEAR FROM DATE '2006-01-02')",1700,"2006");
+    value("SELECT EXTRACT(JULIAN FROM DATE '2006-01-01')",1700,"2453737");
+    value("SELECT EXTRACT(JULIAN FROM TIMESTAMP '2006-01-01 12:00')",1700,"2453737.50000000000000000000");
+    value("SELECT EXTRACT(MICROSECONDS FROM TIMESTAMP '2001-02-16 17:12:28.5')",1700,"28500000");
+    value("SELECT EXTRACT(MILLENNIUM FROM TIMESTAMP '2001-02-16 20:38:40')",1700,"3");
+    value("SELECT EXTRACT(MILLISECONDS FROM TIMESTAMP '2001-02-16 17:12:28.5')",1700,"28500.000");
+    value("SELECT EXTRACT(MINUTE FROM TIMESTAMP '2001-02-16 20:38:40')",1700,"38");
+    value("SELECT EXTRACT(MONTH FROM TIMESTAMP '2001-02-16 20:38:40')",1700,"2");
+    value("SELECT EXTRACT(QUARTER FROM TIMESTAMP '2001-02-16 20:38:40')",1700,"1");
+    value("SELECT EXTRACT(SECOND FROM TIMESTAMP '2001-02-16 20:38:40')",1700,"40.000000");
+    value("SELECT EXTRACT(SECOND FROM TIMESTAMP '2001-02-16 17:12:28.5')",1700,"28.500000");
+    value("SELECT EXTRACT(WEEK FROM TIMESTAMP '2001-02-16 20:38:40')",1700,"7");
+    value("SELECT EXTRACT(YEAR FROM TIMESTAMP '2001-02-16 20:38:40')",1700,"2001");
+    // Units are case-insensitive, aliases and 10-character prefixes count.
+    value("SELECT extract('YEARS' FROM DATE '2025-03-01')",1700,"2025");
+    value("SELECT extract(\"Year\" FROM DATE '2025-03-01')",1700,"2025");
+    value("SELECT date_part('microsecondsxyz',timestamp '2001-02-16 17:12:28.5')",701,"28500000");
+    value("SELECT date_part('mm',timestamp '2001-02-16 17:12:28.5')",701,"12");
+    value("SELECT date_part('second',timestamp '2001-02-16 17:12:28.5')",701,"28.5");
+    value("SELECT date_part('day',DATE '2001-02-16')",701,"16");
+    value("SELECT date_part('epoch',DATE '1970-01-02')",701,"86400");
+    value("SELECT extract(year from DATE '0001-01-01' - 1)",1700,"-1");
+    value("SELECT extract(century from DATE '0001-12-31 BC')",1700,"-1");
+    value("SELECT extract(timezone from TIMESTAMPTZ '2001-02-16 20:38:40+00')",1700,"0");
+    value("SELECT extract(quarter from interval '-7 months')",1700,"-3");
+    // Infinite inputs.
+    value("SELECT extract(year from timestamp 'infinity')",1700,"Infinity");
+    value("SELECT extract(day from date 'infinity')",1700,null);
+    value("SELECT date_part('year',timestamp '-infinity')",701,"-Infinity");
+    value("SELECT date_trunc('day',timestamp 'infinity')",1114,"infinity");
+    // date_trunc over every unit; date and timestamptz use the session zone (UTC).
+    value("SELECT date_trunc('week',timestamp '2001-02-16 20:38:40')",1114,"2001-02-12 00:00:00");
+    value("SELECT date_trunc('week',timestamp '2005-01-01 10:00')",1114,"2004-12-27 00:00:00");
+    value("SELECT date_trunc('quarter',timestamp '2001-08-16 20:38:40')",1114,"2001-07-01 00:00:00");
+    value("SELECT date_trunc('year',timestamp '2001-08-16 20:38:40')",1114,"2001-01-01 00:00:00");
+    value("SELECT date_trunc('decade',timestamp '2001-08-16 20:38:40')",1114,"2000-01-01 00:00:00");
+    value("SELECT date_trunc('century',timestamp '2001-08-16 20:38:40')",1114,"2001-01-01 00:00:00");
+    value("SELECT date_trunc('millennium',timestamp '2001-08-16 20:38:40')",1114,"2001-01-01 00:00:00");
+    value("SELECT date_trunc('minute',timestamp '2001-08-16 20:38:40.5')",1114,"2001-08-16 20:38:00");
+    value("SELECT date_trunc('second',timestamp '2001-08-16 20:38:40.5')",1114,"2001-08-16 20:38:40");
+    value("SELECT date_trunc('milliseconds',timestamp '2001-08-16 20:38:40.123456')",1114,"2001-08-16 20:38:40.123");
+    value("SELECT date_trunc('month',DATE '2001-08-16')",1184,"2001-08-01 00:00:00+00");
+    value("SELECT date_trunc('day',TIMESTAMPTZ '2001-08-16 20:38:40+00')",1184,"2001-08-16 00:00:00+00");
+    value("SELECT date_trunc('year',interval '3 years 5 months 2 days')",1186,"3 years");
+    value("SELECT date_trunc('quarter',interval '3 years 5 months 2 days')",1186,"3 years 3 mons");
+    // age(): month lengths of the earlier operand, sign symmetry.
+    value("SELECT age(timestamp '2001-03-01',timestamp '2001-01-31')",1186,"1 mon 1 day");
+    value("SELECT age(timestamp '2001-01-31',timestamp '2001-03-01')",1186,"-1 mons -1 days");
+    value("SELECT age(timestamp '2001-01-01 10:00',timestamp '2001-01-01 12:30')",1186,"-02:30:00");
+    value("SELECT age(NULL::timestamp,timestamp '2001-01-01')",1186,null);
+    setup(&.{"CREATE TABLE tm_t(id INT PRIMARY KEY,d DATE,ts TIMESTAMP)","INSERT INTO tm_t VALUES(1,'2024-02-29','2024-02-29 10:00'),(2,NULL,NULL)"});
+    rowsOf("SELECT extract(doy from d) FROM tm_t ORDER BY id",1700,&.{"60",null});
+    rowsOf("SELECT date_trunc('month',ts) FROM tm_t ORDER BY id",1114,&.{"2024-02-01 00:00:00",null});
+    // Errors.
+    rejects("SELECT extract(foo from timestamp '2001-02-16')",error.InvalidParameterValue);
+    rejects("SELECT extract(timezone from timestamp '2001-02-16')",error.UnsupportedStatement);
+    rejects("SELECT extract(hour from date '2001-02-16')",error.UnsupportedStatement);
+    rejects("SELECT extract(now from date '2001-02-16')",error.UnsupportedStatement);
+    rejects("SELECT extract(dow from interval '1 day')",error.UnsupportedStatement);
+    rejects("SELECT date_trunc('dow',timestamp '2001-02-16')",error.InvalidParameterValue);
+    rejects("SELECT date_trunc('timezone',timestamp '2001-02-16')",error.UnsupportedStatement);
+    rejects("SELECT date_trunc('week',interval '1 day')",error.UnsupportedStatement);
+    rejects("SELECT date_trunc('foo',timestamp 'infinity')",error.InvalidParameterValue);
+    rejects("SELECT extract(year from '2020-01-01')",error.AmbiguousFunction);
+    rejects("SELECT extract(year from 1)",error.UndefinedFunction);
+    rejects("SELECT extract(from from date '2001-02-16')",error.Syntax);
+    rejects("SELECT make_date(2013,2,30)",error.DatetimeFieldOverflow);
+    rejects("SELECT make_date(0,1,1)",error.DatetimeFieldOverflow);
+    rejects("SELECT make_date(2013,13,1)",error.DatetimeFieldOverflow);
+    rejects("SELECT make_timestamp(2013,7,15,25,0,0)",error.DatetimeFieldOverflow);
+    rejects("SELECT make_timestamp(2013,7,15,24,0,0.5)",error.DatetimeFieldOverflow);
+    rejects("SELECT age(timestamp 'infinity',timestamp '2001-01-01')",error.DatetimeFieldOverflow);
+    rejects("SELECT age(timestamp '2001-01-01')",error.ClockUnavailable);
+    rejects("SELECT justify_days(interval '2147483647 months 30 days')",error.DatetimeFieldOverflow);
+    report("temporal",before);
+}
+
 pub fn main(init:std.process.Init) !void {
     literals();
     strings();
     numerics();
     bitwise();
+    temporals();
     var buffer:[160]u8=undefined;
     const line=try std.fmt.bufPrint(&buffer,"{{\"suite\":\"sql-functions-core\",\"pass\":{s},\"assertions\":{d},\"failures\":{d}}}\n",.{if(failures==0) "true" else "false",assertions,failures});
     try std.Io.File.stdout().writeStreamingAll(init.io,line);

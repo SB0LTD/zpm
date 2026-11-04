@@ -1821,8 +1821,8 @@ pub fn Parser(comptime config: types.Config) type {
                 try self.advance();
                 return try self.functionCall(name);
             }
-            const Form = enum { trim, substring, position, overlay };
-            const form: Form = if (wordIs(self.source, token, "trim")) .trim else if (wordIs(self.source, token, "substring")) .substring else if (wordIs(self.source, token, "position")) .position else if (wordIs(self.source, token, "overlay")) .overlay else return null;
+            const Form = enum { trim, substring, position, overlay, extract };
+            const form: Form = if (wordIs(self.source, token, "trim")) .trim else if (wordIs(self.source, token, "substring")) .substring else if (wordIs(self.source, token, "position")) .position else if (wordIs(self.source, token, "overlay")) .overlay else if (wordIs(self.source, token, "extract")) .extract else return null;
             try self.advance();
             try self.advance();
             try self.enter();
@@ -1873,6 +1873,23 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectWord("IN");
                     list.push(self.pool, try self.other());
                     list.push(self.pool, needle);
+                },
+                .extract => if (!self.isSymbol(.rparen)) {
+                    // extract_arg: an identifier, keyword or string constant,
+                    // passed to extract(text, source) as a text literal.
+                    const field = self.current;
+                    const literal: lexer.Quoted = switch (field.kind) {
+                        .string => field.quoted(),
+                        .word, .quoted_word => blk: {
+                            if (field.kind == .word and lexer.reserved(field.keyword)) return error.Syntax;
+                            break :blk .{ .start = field.start, .end = field.end, .len = field.end - field.start };
+                        },
+                        else => return error.Syntax,
+                    };
+                    try self.advance();
+                    list.push(self.pool, try self.pool.add(.{ .kind = .text_literal, .text = literal }));
+                    try self.expectWord("FROM");
+                    list.push(self.pool, try self.expression());
                 },
                 .overlay => if (!self.isSymbol(.rparen)) {
                     list.push(self.pool, try self.expression());

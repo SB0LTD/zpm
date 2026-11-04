@@ -46,7 +46,10 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // String functions (B11, functions_string.sig).
     lower, upper, initcap, char_length, octet_length, bit_length, substring, btrim, ltrim, rtrim, strpos, replace, left, right, repeat, reverse, lpad, rpad, split_part, starts_with, ascii, chr, translate, concat, concat_ws, overlay, to_hex,
     // Mathematical functions (B11, numeric_math.sig).
-    power, ln, log, log10, exp, mod, div, pi, degrees, radians, cbrt, sin, cos, tan, cot, asin, acos, atan, atan2, gcd, lcm, scale, min_scale, trim_scale };
+    power, ln, log, log10, exp, mod, div, pi, degrees, radians, cbrt, sin, cos, tan, cot, asin, acos, atan, atan2, gcd, lcm, scale, min_scale, trim_scale,
+    // Date/time functions (B11, functions_temporal.sig); *_tz are the STABLE
+    // timestamptz (session time zone) overloads chosen by the binder.
+    extract, extract_tz, date_part, date_part_tz, date_trunc, date_trunc_tz, age, age_tz, justify_days, justify_hours, justify_interval, make_date, make_timestamp, isfinite };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
@@ -54,7 +57,8 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
 pub fn canRepeatFunction(func: Func) bool {
     return switch (func) {
         .grouping, .window_call, .to_char, .round, .abs, .ceil, .floor, .trunc, .sign, .sqrt, .greatest, .least => true,
-        else => immutableBuiltin(func) or func == .concat or func == .concat_ws,
+        else => immutableBuiltin(func) or func == .concat or func == .concat_ws or
+            func == .extract_tz or func == .date_part_tz or func == .date_trunc_tz,
     };
 }
 
@@ -74,6 +78,7 @@ pub fn immutableBuiltin(func: Func) bool {
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
+        .extract, .date_part, .date_trunc, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
         else => false,
     };
 }
@@ -89,6 +94,7 @@ pub fn strictFunction(func: Func) bool {
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
+        .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
         else => false,
     };
 }

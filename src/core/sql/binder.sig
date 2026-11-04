@@ -766,6 +766,12 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "gcd", .func = .gcd },                   .{ .name = "lcm", .func = .lcm },
                 .{ .name = "scale", .func = .scale },               .{ .name = "min_scale", .func = .min_scale },
                 .{ .name = "trim_scale", .func = .trim_scale },
+                // Date/time functions (B11).
+                .{ .name = "extract", .func = .extract },           .{ .name = "date_part", .func = .date_part },
+                .{ .name = "date_trunc", .func = .date_trunc },     .{ .name = "age", .func = .age },
+                .{ .name = "justify_days", .func = .justify_days }, .{ .name = "justify_hours", .func = .justify_hours },
+                .{ .name = "justify_interval", .func = .justify_interval }, .{ .name = "make_date", .func = .make_date },
+                .{ .name = "make_timestamp", .func = .make_timestamp }, .{ .name = "isfinite", .func = .isfinite },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -1272,6 +1278,70 @@ pub fn Binder(comptime config: types.Config) type {
                 .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
                 .overlay, .to_hex => try typeStringFunction(context, n, count),
                 .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
+                .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
+            }
+        }
+
+        /// Date/time functions; timestamptz overloads (date arguments prefer
+        /// timestamptz, the datetime category's preferred type) are STABLE.
+        fn typeTemporalFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            switch (n.func) {
+                .extract, .extract_tz, .date_part, .date_part_tz => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const source = argumentType(context, n, 1);
+                    const extract = n.func == .extract or n.func == .extract_tz;
+                    const ty: T = switch (source) {
+                        .unknown => return error.AmbiguousFunction,
+                        .date => if (extract) .date else .timestamp,
+                        .timestamp, .timestamptz, .interval => source,
+                        else => return error.UndefinedFunction,
+                    };
+                    try bindSignature(context, n, &[_]T{ .text, ty }, if (extract) .numeric else .float8, true);
+                    n.func = if (ty == .timestamptz) (if (extract) .extract_tz else .date_part_tz) else (if (extract) .extract else .date_part);
+                },
+                .date_trunc, .date_trunc_tz => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const source = argumentType(context, n, 1);
+                    const ty: T = switch (source) {
+                        .unknown => return error.AmbiguousFunction,
+                        .date, .timestamptz => .timestamptz,
+                        .timestamp, .interval => source,
+                        else => return error.UndefinedFunction,
+                    };
+                    try bindSignature(context, n, &[_]T{ .text, ty }, ty, true);
+                    n.func = if (ty == .timestamptz) .date_trunc_tz else .date_trunc;
+                },
+                .age, .age_tz => {
+                    if (count != 1 and count != 2) return error.UndefinedFunction;
+                    var zoned = false;
+                    var plain = false;
+                    var item = n.b;
+                    while (item != none) : (item = context.node(item).next) switch (context.node(item).ty) {
+                        .timestamptz => zoned = true,
+                        .timestamp => plain = true,
+                        .date, .unknown => {},
+                        else => return error.UndefinedFunction,
+                    };
+                    const ty: T = if (zoned or !plain) .timestamptz else .timestamp;
+                    try bindSignature(context, n, if (count == 1) &[_]T{ty} else &[_]T{ ty, ty }, .interval, true);
+                    // age(x) measures from current_date: STABLE.
+                    n.func = if (ty == .timestamptz or count == 1) .age_tz else .age;
+                },
+                .justify_days, .justify_hours, .justify_interval => try bindSignature(context, n, &[_]T{.interval}, .interval, true),
+                .make_date => try bindSignature(context, n, &[_]T{ .int4, .int4, .int4 }, .date, true),
+                .make_timestamp => try bindSignature(context, n, &[_]T{ .int4, .int4, .int4, .int4, .int4, .float8 }, .timestamp, true),
+                .isfinite => {
+                    if (count != 1) return error.UndefinedFunction;
+                    const ty = argumentType(context, n, 0);
+                    switch (ty) {
+                        .unknown => return error.AmbiguousFunction,
+                        .date, .timestamp, .timestamptz, .interval => {},
+                        else => return error.UndefinedFunction,
+                    }
+                    try bindSignature(context, n, &[_]T{ty}, .boolean, true);
+                },
+                else => unreachable,
             }
         }
 

@@ -12,6 +12,8 @@ const strings = @import("functions_string.sig");
 const numeric = @import("numeric.sig");
 const numeric_math = @import("numeric_math.sig");
 const float_text = @import("float_text.sig");
+const temporal = @import("temporal.sig");
+const times = @import("functions_temporal.sig");
 const std = @import("std");
 const Error = types.Error;
 const none = ast.none;
@@ -19,7 +21,7 @@ const none = ast.none;
 pub fn Builtins(comptime config: types.Config, comptime E: type) type {
     const V = types.Values(config);
     return struct {
-        const max_args = 4;
+        const max_args = 6;
 
         fn node(ctx: *const E.Context, id: u16) *const ast.Node {
             return &ctx.pool.nodes[id];
@@ -98,6 +100,8 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
                 .to_hex => try strings.toHex(cells[0].integer, if (node(ctx, n.b).ty == .int8) 64 else 32, &out),
                 .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2,
                 .gcd, .lcm, .scale, .min_scale, .trim_scale => return mathematical(n, &cells, count, control),
+                .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours,
+                .justify_interval, .make_date, .make_timestamp, .isfinite => return temporalValue(ctx, n, &cells, count),
                 else => unreachable,
             }
             result.len = out.len;
@@ -263,6 +267,117 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
 
         const radians_per_degree: f64 = 0.0174532925199432957692;
 
+        // ---- date/time ------------------------------------------------------
+
+        fn partCell(part: times.Part) Error!V.Cell {
+            return switch (part) {
+                .integer => |value| .{ .numeric = NOps.fromInt(value) },
+                .decimal => |decimal| .{ .numeric = try M.make(decimal.value, decimal.scale) },
+                .julian => |julian| blk: {
+                    const day = NOps.fromInt(julian.day);
+                    const fraction = try NOps.div(&NOps.fromInt(julian.time), &NOps.fromInt(86400000000));
+                    break :blk .{ .numeric = try NOps.add(&day, &fraction) };
+                },
+                .float => |value| .{ .float8 = value },
+                .infinity => |positive| .{ .numeric = .{ .special = if (positive) .pinf else .ninf } },
+                .none => .null_value,
+            };
+        }
+
+        /// date_part's double precision form of a part.
+        fn floatPart(part: times.Part) V.Cell {
+            return switch (part) {
+                .integer => |value| .{ .float8 = @floatFromInt(value) },
+                .decimal => |decimal| .{ .float8 = @as(f64, @floatFromInt(decimal.value)) / (if (decimal.scale == 3) @as(f64, 1000.0) else 1000000.0) },
+                .julian => |julian| .{ .float8 = @as(f64, @floatFromInt(julian.day)) + @as(f64, @floatFromInt(julian.time)) / 1000000.0 / 86400.0 },
+                .float => |value| .{ .float8 = value },
+                .infinity => |positive| .{ .float8 = if (positive) float_text.inf(f64) else -float_text.inf(f64) },
+                .none => .null_value,
+            };
+        }
+
+        fn offsetSeconds(local: i64, utc: i64) i64 {
+            return @divTrunc(local - utc, 1000000);
+        }
+
+        fn temporalValue(ctx: *const E.Context, n: *const ast.Node, cells: *const [max_args]V.Cell, count: usize) Error!V.Cell {
+            const zone = &ctx.session.zone;
+            switch (n.func) {
+                .extract, .extract_tz, .date_part, .date_part_tz => {
+                    const numeric_result = n.func == .extract or n.func == .extract_tz;
+                    const field = times.decodeField(textOf(&cells[0]), true);
+                    const part: times.Part = switch (cells[1]) {
+                        .date => |days| try times.datePart(field, days),
+                        .timestamp => |us| try times.timestampPart(field, us, @as(i128, us) + 946684800000000, null, numeric_result),
+                        .timestamptz => |us| blk: {
+                            const local = if (temporal.finiteTimestamp(us)) temporal.toLocal(zone, us) else us;
+                            break :blk try times.timestampPart(field, local, @as(i128, us) + 946684800000000, offsetSeconds(local, us), numeric_result);
+                        },
+                        .interval => |span| try times.intervalPart(field, span, numeric_result),
+                        else => unreachable,
+                    };
+                    return if (numeric_result) partCell(part) else floatPart(part);
+                },
+                .date_trunc, .date_trunc_tz => {
+                    const field = times.decodeField(textOf(&cells[0]), false);
+                    switch (cells[1]) {
+                        .interval => |span| return .{ .interval = try times.truncateInterval(field, span) },
+                        .timestamp, .timestamptz => |us| {
+                            const zoned = cells[1] == .timestamptz;
+                            if (!temporal.finiteTimestamp(us)) {
+                                var ignored = false;
+                                _ = times.truncate(field, 0, &ignored) catch |err| return err;
+                                return cells[1];
+                            }
+                            const local = if (zoned) temporal.toLocal(zone, us) else us;
+                            var whole_days = false;
+                            const truncated = try times.truncate(field, local, &whole_days);
+                            if (!zoned) return .{ .timestamp = truncated };
+                            // Units of a day or more re-resolve the zone offset
+                            // (DetermineTimeZoneOffset); smaller ones keep it.
+                            const utc = if (whole_days) try temporal.toUtc(zone, truncated) else truncated - (local - us);
+                            return .{ .timestamptz = utc };
+                        },
+                        else => unreachable,
+                    }
+                },
+                .age, .age_tz => {
+                    const zoned = n.func == .age_tz and (cells[0] == .timestamptz);
+                    var first: i64 = undefined;
+                    var second: i64 = undefined;
+                    if (count == 1) {
+                        // age(x) = age(current_date at midnight, x).
+                        const now = ctx.session.transaction_us orelse return error.ClockUnavailable;
+                        const today = temporal.timestampToDate(temporal.toLocal(zone, now));
+                        const midnight = try temporal.dateToTimestamp(today);
+                        first = midnight;
+                        second = if (cells[0] == .timestamptz) localOf(zone, cells[0].timestamptz) else cells[0].timestamp;
+                    } else if (zoned) {
+                        first = localOf(zone, cells[0].timestamptz);
+                        second = localOf(zone, cells[1].timestamptz);
+                    } else {
+                        first = cells[0].timestamp;
+                        second = cells[1].timestamp;
+                    }
+                    return .{ .interval = try times.age(first, second) };
+                },
+                .justify_days => return .{ .interval = try times.justifyDays(cells[0].interval) },
+                .justify_hours => return .{ .interval = try times.justifyHours(cells[0].interval) },
+                .justify_interval => return .{ .interval = try times.justifyInterval(cells[0].interval) },
+                .make_date => return .{ .date = try times.makeDate(cells[0].integer, cells[1].integer, cells[2].integer) },
+                .make_timestamp => return .{ .timestamp = try times.makeTimestamp(cells[0].integer, cells[1].integer, cells[2].integer, cells[3].integer, cells[4].integer, cells[5].float8) },
+                .isfinite => return .{ .boolean = switch (cells[0]) {
+                    .date => |days| temporal.finiteDate(days),
+                    .timestamp, .timestamptz => |us| temporal.finiteTimestamp(us),
+                    else => true,
+                } },
+                else => unreachable,
+            }
+        }
+
+        fn localOf(zone: *const temporal.Zone, us: i64) i64 {
+            return if (temporal.finiteTimestamp(us)) temporal.toLocal(zone, us) else us;
+        }
 
         fn argumentCount(ctx: *const E.Context, n: *const ast.Node) usize {
             var count: usize = 0;
