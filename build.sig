@@ -1097,6 +1097,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_gpu = try ctx.addStep("test-gpu", "Execute KIR's verifier, interpreter, exact fdiv/fsqrt expansions and EmuDevice", &noopStep);
     try ctx.addDependency(test_all, test_gpu);
     _ = try addTest(ctx, test_gpu, "test-gpu-module", "src/gpu/gpu.sig", &.{});
+    _ = try addTest(ctx, test_gpu, "test-gpu-ops", "tests/test_gpu_ops.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+    });
     _ = try addTest(ctx, test_gpu, "test-gpu-flow", "tests/test_gpu_flow.sig", &.{
         importEntry("gpu", "src/gpu/gpu.sig"),
     });
