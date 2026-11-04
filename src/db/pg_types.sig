@@ -7,8 +7,9 @@
 //! base-10000 digits}, DATE i32 days and TIMESTAMP[TZ] i64 microseconds
 //! since 2000-01-01, INTERVAL {us i64, days i32, months i32}, JSONB version
 //! byte 1 + text, and text/name/json/varchar/bpchar raw bytes (bpchar
-//! padded), UUID 16 bytes and BYTEA raw bytes (hex text). Parameters are
-//! rendered as
+//! padded), UUID 16 bytes, BYTEA raw bytes (hex text), TIME i64
+//! microseconds and TIMETZ {i64 microseconds, i32 seconds west}. Parameters
+//! are rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
 //! is a protocol violation (08P01).
@@ -114,6 +115,11 @@ pub fn Types(comptime Result: type) type {
                 .bpchar => |*value| try put(out, &at, value.slice()),
                 .uuid => |*value| try put(out, &at, value),
                 .bytea => |*value| try put(out, &at, value.slice()),
+                .time => |value| try putInt(i64, out, &at, value),
+                .timetz => |value| {
+                    try putInt(i64, out, &at, value.us);
+                    try putInt(i32, out, &at, value.zone);
+                },
             }
             return at;
         }
@@ -201,7 +207,8 @@ pub fn Types(comptime Result: type) type {
             const need: usize = switch (data_type) {
                 .smallint => 2,
                 .integer32, .oid, .real, .date => 4,
-                .integer, .double, .timestamp, .timestamptz => 8,
+                .integer, .double, .timestamp, .timestamptz, .time => 8,
+                .timetz => 12,
                 .interval, .uuid => 16,
                 else => 0,
             };
@@ -216,6 +223,17 @@ pub fn Types(comptime Result: type) type {
                 .timestamptz => .{ .timestamptz = getInt(i64, bytes) },
                 .interval => .{ .interval = .{ .us = getInt(i64, bytes[0..8]), .days = getInt(i32, bytes[8..12]), .months = getInt(i32, bytes[12..16]) } },
                 .uuid => .{ .uuid = bytes[0..16].* },
+                .time => blk: {
+                    const us = getInt(i64, bytes);
+                    if (us < 0 or us > 86400000000) return error.ProtocolViolation;
+                    break :blk Cell{ .time = us };
+                },
+                .timetz => blk: {
+                    const us = getInt(i64, bytes[0..8]);
+                    const zone = getInt(i32, bytes[8..12]);
+                    if (us < 0 or us > 86400000000 or zone < -57599 or zone > 57599) return error.ProtocolViolation;
+                    break :blk Cell{ .timetz = .{ .us = us, .zone = zone } };
+                },
                 .numeric => blk: {
                     if (bytes.len < 8) return error.ProtocolViolation;
                     const ndigits: usize = getInt(u16, bytes[0..2]);

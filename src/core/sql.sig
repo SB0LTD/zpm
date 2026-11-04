@@ -1618,7 +1618,7 @@ pub fn Database(comptime config: Config) type {
         fn datetimePrecision(column: *const V.Column) ?i64 {
             return switch (column.data_type) {
                 .date => 0,
-                .timestamp, .timestamptz => if (column.typmod >= 0) column.typmod else 6,
+                .timestamp, .timestamptz, .time, .timetz => if (column.typmod >= 0) column.typmod else 6,
                 .interval => 6,
                 else => null,
             };

@@ -18,6 +18,7 @@ const ast = @import("ast.sig");
 const character = @import("character.sig");
 const uuid = @import("uuid.sig");
 const bytea = @import("bytea.sig");
+const time_of_day = @import("time_of_day.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -92,6 +93,19 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         // I/O conversion: to a string type in assignment, from one explicitly.
         if (to == .bpchar) return context != .implicit;
         return context == .explicit;
+    }
+    if (from == .time or to == .time or from == .timetz or to == .timetz) {
+        // pg_cast: time -> interval and time -> timetz are implicit;
+        // interval/timestamp/timestamptz/timetz -> time and timestamptz ->
+        // timetz are assignment casts; strings by I/O conversion.
+        const implicit = (from == .time and (to == .interval or to == .timetz));
+        const assignment = (to == .time and (from == .interval or from == .timestamp or from == .timestamptz or from == .timetz)) or
+            (to == .timetz and from == .timestamptz);
+        if (implicit) return true;
+        if (assignment) return context != .implicit;
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
     }
     return null;
 }
@@ -171,6 +185,9 @@ pub fn comparisonType(a: Type, b: Type) ?Type {
 
 pub fn common(a: Type, b: Type) ?Type {
     if (a == b) return a;
+    // time -> timetz and time -> interval are implicit one way only.
+    if ((a == .time and b == .timetz) or (a == .timetz and b == .time)) return .timetz;
+    if ((a == .time and b == .interval) or (a == .interval and b == .time)) return .interval;
     if ((a == .bpchar and stringType(b)) or (stringType(a) and b == .bpchar) or
         (a == .varchar and stringType(b)) or (stringType(a) and b == .varchar)) return characterCommon(a, b);
     if (numericCategory(a) and numericCategory(b)) {
@@ -269,6 +286,8 @@ pub fn Io(comptime config: types.Config) type {
                 .bpchar => |*value| copy(buffer, value.slice()),
                 .uuid => |*value| uuid.format(value, buffer),
                 .bytea => |*value| bytea.format(value.slice(), buffer),
+                .time => |value| time_of_day.format(value, buffer),
+                .timetz => |value| time_of_day.formatTz(value, buffer),
             };
         }
 
@@ -349,8 +368,34 @@ pub fn Io(comptime config: types.Config) type {
                     bytes.len = try bytea.parse(input, &bytes.bytes);
                     break :blk .{ .bytea = bytes };
                 },
+                .time, .timetz => try parseTime(ty, input, session),
             };
             return applyTypmod(cell, ty, typmod);
+        }
+
+        /// The session zone's offset (seconds west) on the transaction date,
+        /// at local time `us` (a TIMETZ without an explicit zone).
+        fn sessionZoneWest(zone: *const temporal.Zone, session: *const Session, us: i64) Error!i32 {
+            const now = session.transaction_us orelse session.statement_us orelse 0;
+            const today = @divFloor(temporal.toLocal(zone, now), temporal.usecs_per_day);
+            return time_of_day.zoneWest(zone, today * temporal.usecs_per_day + us);
+        }
+
+        fn parseTime(ty: Type, input: []const u8, session: *const Session) Error!V.Cell {
+            const parsed = try time_of_day.parse(input);
+            var zone_west = parsed.zone;
+            if (parsed.named) |name| {
+                var zone: temporal.Zone = .{};
+                const lookup = session.resolver.lookup orelse return error.InvalidParameterValue;
+                lookup(session.resolver.context, name, &zone) catch return error.InvalidParameterValue;
+                if (ty == .timetz) {
+                    const day = parsed.date orelse @divFloor(temporal.toLocal(&zone, session.transaction_us orelse session.statement_us orelse 0), temporal.usecs_per_day);
+                    zone_west = try time_of_day.zoneWest(&zone, day * temporal.usecs_per_day + parsed.us);
+                }
+            }
+            if (ty == .time) return .{ .time = parsed.us };
+            const west = zone_west orelse try sessionZoneWest(&session.zone, session, parsed.us);
+            return .{ .timetz = .{ .us = parsed.us, .zone = west } };
         }
 
         /// Input of a cast's literal (`'...'::type(n)`): PostgreSQL passes typmod
@@ -399,6 +444,14 @@ pub fn Io(comptime config: types.Config) type {
                 },
                 .bpchar => switch (cell) {
                     .bpchar => |*value| try characterCell(value.slice(), .bpchar, typmod, .implicit),
+                    else => cell,
+                },
+                .time => switch (cell) {
+                    .time => |value| .{ .time = time_of_day.round(value, typmod) },
+                    else => cell,
+                },
+                .timetz => switch (cell) {
+                    .timetz => |value| .{ .timetz = .{ .us = time_of_day.round(value.us, typmod), .zone = value.zone } },
                     else => cell,
                 },
                 else => cell,
@@ -571,6 +624,7 @@ pub fn Io(comptime config: types.Config) type {
                 .interval => switch (cell) {
                     .interval => cell,
                     .text => |*value| try parse(.interval, -1, value.slice(), session),
+                    .time => |value| V.Cell{ .interval = .{ .us = value } },
                     else => return error.CannotCoerce,
                 },
                 .unknown => cell,
@@ -599,6 +653,28 @@ pub fn Io(comptime config: types.Config) type {
                     .text => |*value| try parse(.bytea, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
+                .time => switch (cell) {
+                    .time => cell,
+                    .timetz => |value| V.Cell{ .time = value.us },
+                    // timestamp_time / timestamptz_time: infinity is NULL.
+                    .timestamp => |value| if (temporal.finiteTimestamp(value)) V.Cell{ .time = time_of_day.ofTimestamp(value) } else @as(V.Cell, .null_value),
+                    .timestamptz => |value| if (temporal.finiteTimestamp(value)) V.Cell{ .time = time_of_day.ofTimestamp(temporal.toLocal(&session.zone, value)) } else @as(V.Cell, .null_value),
+                    .interval => |value| V.Cell{ .time = time_of_day.fromInterval(value) },
+                    .text => |*value| try parse(.time, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .timetz => switch (cell) {
+                    .timetz => cell,
+                    .time => |value| V.Cell{ .timetz = .{ .us = value, .zone = try sessionZoneWest(&session.zone, session, value) } },
+                    .timestamptz => |value| blk: {
+                        if (!temporal.finiteTimestamp(value)) break :blk @as(V.Cell, .null_value);
+                        const local = temporal.toLocal(&session.zone, value);
+                        const east = @divFloor(local - value, temporal.usecs_per_second);
+                        break :blk V.Cell{ .timetz = .{ .us = time_of_day.ofTimestamp(local), .zone = @intCast(-east) } };
+                    },
+                    .text => |*value| try parse(.timetz, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
             };
             return applyTypmodExplicit(out, to, typmod);
         }
@@ -611,6 +687,7 @@ pub fn Io(comptime config: types.Config) type {
         /// + - * / % over same-typed numeric operands (the binder casts
         /// both sides to the operator's type) and the datetime operators.
         pub fn arithmetic(op: ast.Op, left: *const V.Cell, right: *const V.Cell, result: Type, session: *const Session) Error!V.Cell {
+            if (try timeArithmetic(op, left, right)) |cell| return cell;
             switch (left.*) {
                 .integer => |a| switch (right.*) {
                     .integer => |b| {
@@ -652,6 +729,8 @@ pub fn Io(comptime config: types.Config) type {
                     } };
                 },
                 .date => |a| switch (right.*) {
+                    .time => |b| return .{ .timestamp = try time_of_day.dateTime(a, b) },
+                    .timetz => |b| return .{ .timestamptz = try dateTimeTz(a, b) },
                     .integer => |b| return .{ .date = try temporal.datePlusDays(a, if (op == .sub) -b else b) },
                     .date => |b| {
                         if (!temporal.finiteDate(a) or !temporal.finiteDate(b)) return error.DatetimeFieldOverflow;
@@ -670,6 +749,8 @@ pub fn Io(comptime config: types.Config) type {
                     else => {},
                 },
                 .interval => |a| switch (right.*) {
+                    .time => |b| return .{ .time = time_of_day.plus(b, a, false) },
+                    .timetz => |b| return .{ .timetz = .{ .us = time_of_day.plus(b.us, a, false), .zone = b.zone } },
                     .interval => |b| return .{ .interval = try temporal.addIntervals(a, if (op == .sub) try temporal.negateInterval(b) else b) },
                     .timestamp => |b| return .{ .timestamp = try temporal.timestampPlus(b, a) },
                     .timestamptz => |b| return .{ .timestamptz = try temporal.timestamptzPlus(b, a, &session.zone) },
@@ -678,6 +759,34 @@ pub fn Io(comptime config: types.Config) type {
                 else => {},
             }
             return error.UndefinedFunction;
+        }
+
+        /// time - time, time +- interval, time + date and the TIMETZ forms.
+        fn timeArithmetic(op: ast.Op, left: *const V.Cell, right: *const V.Cell) Error!?V.Cell {
+            switch (left.*) {
+                .time => |a| switch (right.*) {
+                    .time => |b| if (op == .sub) return .{ .interval = .{ .us = a - b } },
+                    .interval => |b| return .{ .time = time_of_day.plus(a, b, op == .sub) },
+                    .date => |b| if (op == .add) return .{ .timestamp = try time_of_day.dateTime(b, a) },
+                    else => {},
+                },
+                .timetz => |a| switch (right.*) {
+                    .interval => |b| return .{ .timetz = .{ .us = time_of_day.plus(a.us, b, op == .sub), .zone = a.zone } },
+                    .date => |b| if (op == .add) return .{ .timestamptz = try dateTimeTz(b, a) },
+                    else => {},
+                },
+                else => {},
+            }
+            return null;
+        }
+
+        /// date + timetz: the local date and time at the value's zone.
+        fn dateTimeTz(days: i32, value: time_of_day.TimeTz) Error!i64 {
+            const local = try time_of_day.dateTime(days, value.us);
+            if (!temporal.finiteTimestamp(local)) return local;
+            const sum = @addWithOverflow(local, @as(i64, value.zone) * temporal.usecs_per_second);
+            if (sum[1] != 0 or !temporal.validTimestamp(sum[0])) return error.DatetimeFieldOverflow;
+            return sum[0];
         }
 
         pub fn negate(cell: *const V.Cell, ty: Type) Error!V.Cell {

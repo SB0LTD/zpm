@@ -27,7 +27,8 @@
 //!   dscale u16, coefficient 4 x u64} | 7 date i32 | 8 timestamp i64
 //!   | 9 timestamptz i64 | 10 interval {months i32, days i32, us i64}
 //!   | 11 jsonb len u32 + canonical bytes | 12 bpchar len u32 + padded bytes
-//!   (VARCHAR values use 3) | 13 uuid 16 bytes | 14 bytea len u32 + bytes. Every value is checked against the
+//!   (VARCHAR values use 3) | 13 uuid 16 bytes | 14 bytea len u32 + bytes
+//!   | 15 time i64 | 16 timetz {us i64, zone i32 seconds west}. Every value is checked against the
 //!   column's type OID (create_table) before anything applies.
 //! Ops may repeat a (table, rowid) and apply in record order.
 //!
@@ -46,6 +47,7 @@ const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
 const sequence = @import("sequence.sig");
 const character = @import("character.sig");
+const time_of_day = @import("time_of_day.sig");
 const Error = types.Error;
 
 pub const format_version: u16 = 1;
@@ -241,6 +243,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 14);
                     try writer.int(u32, @intCast(bytes.len));
                     try writer.bytes(bytes.slice());
+                },
+                .time => |value| {
+                    try writer.int(u8, 15);
+                    try writer.int(i64, value);
+                },
+                .timetz => |value| {
+                    try writer.int(u8, 16);
+                    try writer.int(i64, value.us);
+                    try writer.int(i32, value.zone);
                 },
             }
         }
@@ -579,6 +590,17 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 },
                 10 => .{ .interval = .{ .months = try reader.int(i32), .days = try reader.int(i32), .us = try reader.int(i64) } },
                 13 => .{ .uuid = (try reader.take(16))[0..16].* },
+                15 => blk: {
+                    const us = try reader.int(i64);
+                    if (!time_of_day.validTime(us)) return error.InvalidChangeRecord;
+                    break :blk .{ .time = us };
+                },
+                16 => blk: {
+                    const us = try reader.int(i64);
+                    const zone = try reader.int(i32);
+                    if (!time_of_day.validTime(us) or !time_of_day.validZone(zone)) return error.InvalidChangeRecord;
+                    break :blk .{ .timetz = .{ .us = us, .zone = zone } };
+                },
                 else => return error.InvalidChangeRecord,
             };
             return .{ .cell = cell, .offset = offset };
@@ -634,7 +656,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const decoded = numeric.Ops(config.numeric_digits).decodeTypmod(column.typmod) orelse break :blk false;
                         break :blk decoded.precision >= 1 and decoded.precision <= config.numeric_digits and decoded.scale >= -1000 and decoded.scale <= 1000;
                     },
-                    .timestamp, .timestamptz => column.typmod >= -1 and column.typmod <= 6,
+                    .timestamp, .timestamptz, .time, .timetz => column.typmod >= -1 and column.typmod <= 6,
                     .varchar, .bpchar => character.validTypmod(column.typmod),
                     else => column.typmod == -1,
                 };

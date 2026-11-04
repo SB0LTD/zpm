@@ -559,7 +559,7 @@ pub fn Parser(comptime config: types.Config) type {
         fn typeWord(token: Token) bool {
             return switch (token.keyword) {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
-                .varchar, .character, .char, .bpchar, .uuid, .bytea => true,
+                .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz => true,
                 else => false,
             };
         }
@@ -652,6 +652,20 @@ pub fn Parser(comptime config: types.Config) type {
                 .bpchar => .{ .ty = .bpchar, .typmod = try self.characterLength(false) },
                 .uuid => .{ .ty = .uuid },
                 .bytea => .{ .ty = .bytea },
+                .time => blk: {
+                    const p = try self.precision();
+                    var zoned = false;
+                    if (try self.takeWord("WITH")) {
+                        try self.expectWord("TIME");
+                        try self.expectWord("ZONE");
+                        zoned = true;
+                    } else if (try self.takeWord("WITHOUT")) {
+                        try self.expectWord("TIME");
+                        try self.expectWord("ZONE");
+                    }
+                    break :blk .{ .ty = if (zoned) .timetz else .time, .typmod = p };
+                },
+                .timetz => .{ .ty = .timetz, .typmod = try self.precision() },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };
@@ -1294,6 +1308,18 @@ pub fn Parser(comptime config: types.Config) type {
         // ---- expressions ------------------------------------------------
 
         /// A token that cannot continue an expression after a bare column.
+        /// A type name that continues past its first word (or into a
+        /// modifier) before a typed literal: DOUBLE PRECISION, TIMESTAMP/TIME
+        /// WITH[OUT] TIME ZONE, CHARACTER VARYING, NUMERIC(p,s), ...
+        fn multiwordType(token: Token, after: Token) bool {
+            const lparen = after.kind == .symbol and after.symbol == .lparen;
+            return (token.isWord("DOUBLE") and after.isWord("PRECISION")) or
+                ((token.isWord("TIMESTAMP") or token.isWord("TIME")) and (after.isWord("WITH") or after.isWord("WITHOUT"))) or
+                ((token.isWord("CHARACTER") or token.isWord("CHAR")) and after.isWord("VARYING")) or
+                (lparen and (token.isWord("NUMERIC") or token.isWord("DECIMAL") or token.isWord("TIMESTAMP") or token.isWord("TIMESTAMPTZ") or
+                token.isWord("TIME") or token.isWord("TIMETZ") or token.isWord("VARCHAR") or token.isWord("CHARACTER") or token.isWord("CHAR") or token.isWord("BPCHAR")));
+        }
+
         fn ends(token: Token) bool {
             return switch (token.kind) {
                 .end => true,
@@ -1316,7 +1342,8 @@ pub fn Parser(comptime config: types.Config) type {
             // Fast path for the common bare column (projection lists).
             const niladic = wordIs(self.source, self.current, "current_timestamp") or wordIs(self.source, self.current, "current_date");
             if ((self.current.kind == .word and !lexer.reserved(self.current.keyword) and !niladic) or self.current.kind == .quoted_word) {
-                if (ends(try self.peek())) {
+                const after = try self.peek();
+                if (ends(after) and !(typeWord(self.current) and multiwordType(self.current, after))) {
                     const name = try self.identifier();
                     return self.pool.add(.{ .kind = .column, .name = name });
                 }
@@ -1830,12 +1857,7 @@ pub fn Parser(comptime config: types.Config) type {
                 // Typed literal: DATE '...', TIMESTAMP [WITH TIME ZONE] '...', ...
                 if (typeWord(token)) {
                     const after = try self.peek();
-                    const multiword = (token.isWord("DOUBLE") and after.isWord("PRECISION")) or
-                        (token.isWord("TIMESTAMP") and (after.isWord("WITH") or after.isWord("WITHOUT"))) or
-                        ((token.isWord("NUMERIC") or token.isWord("DECIMAL") or token.isWord("TIMESTAMP") or token.isWord("TIMESTAMPTZ")) and after.kind == .symbol and after.symbol == .lparen) or
-                        ((token.isWord("CHARACTER") or token.isWord("CHAR")) and after.isWord("VARYING")) or
-                        ((token.isWord("VARCHAR") or token.isWord("CHARACTER") or token.isWord("CHAR") or token.isWord("BPCHAR")) and after.kind == .symbol and after.symbol == .lparen);
-                    if (after.kind == .string or multiword) {
+                    if (after.kind == .string or multiwordType(token, after)) {
                         const target = try self.typeName();
                         if (self.current.kind != .string) return error.Syntax;
                         const literal = self.current;

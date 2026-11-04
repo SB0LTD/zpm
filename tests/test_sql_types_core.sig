@@ -85,10 +85,26 @@ fn rejects(source: []const u8, wanted: anyerror) !void {
     try check(db.usage().pending_versions == 0 and db.usage().transactions == 0);
 }
 
+/// SQLSTATEs of the errors this contract expects, as src/db/postgres.sig
+/// knownSqlstate maps them (test_postgres checks that every engine error is
+/// mapped; this pins the exact codes of the B11 type errors).
 fn sqlstate(err: anyerror, wanted: []const u8) !void {
-    // Exact SQLSTATE mapping used by the PostgreSQL codec.
-    const name = @errorName(err);
-    const state: []const u8 = if (std.mem.eql(u8, name, "StringDataRightTruncation")) "22001" else if (std.mem.eql(u8, name, "StringDataLengthMismatch")) "22026" else if (std.mem.eql(u8, name, "InvalidTextRepresentation")) "22P02" else if (std.mem.eql(u8, name, "InvalidParameterValue")) "22023" else if (std.mem.eql(u8, name, "InvalidDatetimeFormat")) "22007" else if (std.mem.eql(u8, name, "DatetimeFieldOverflow")) "22008" else if (std.mem.eql(u8, name, "NumericValueOutOfRange")) "22003" else "?";
+    const table = [_]struct { name: []const u8, state: []const u8 }{
+        .{ .name = "StringDataRightTruncation", .state = "22001" },
+        .{ .name = "StringDataLengthMismatch", .state = "22026" },
+        .{ .name = "InvalidTimeZoneDisplacement", .state = "22009" },
+        .{ .name = "InvalidTextRepresentation", .state = "22P02" },
+        .{ .name = "InvalidParameterValue", .state = "22023" },
+        .{ .name = "InvalidDatetimeFormat", .state = "22007" },
+        .{ .name = "DatetimeFieldOverflow", .state = "22008" },
+        .{ .name = "NumericValueOutOfRange", .state = "22003" },
+        .{ .name = "DivisionByZero", .state = "22012" },
+    };
+    var state: []const u8 = "?";
+    for (table) |entry| {
+        if (std.mem.eql(u8, entry.name, @errorName(err))) state = entry.state;
+    }
+    if (!std.mem.eql(u8, state, wanted)) std.debug.print("{s}: SQLSTATE {s}, expected {s}\n", .{ @errorName(err), state, wanted });
     try check(std.mem.eql(u8, state, wanted));
 }
 
@@ -444,10 +460,131 @@ fn bytea() !void {
     try meta(1, 17, -1);
 }
 
+// ---- TIME / TIMETZ -----------------------------------------------------------
+
+fn time() !void {
+    // oracle: PG.TYPE.TIME.
+    try exec("CREATE TABLE tdd_type(v TIME)");
+    try exec("INSERT INTO tdd_type VALUES(TIME '12:34:56'),(NULL)");
+    try rows("SELECT v FROM tdd_type ORDER BY v NULLS LAST", "12:34:56;NULL");
+    try meta(0, 1083, -1);
+    try exec("DROP TABLE tdd_type");
+
+    // Input forms (DecodeTimeOnly subset); TIME ignores a zone.
+    try rows("SELECT '04:05:06.789'::time, '04:05'::time, '040506'::time, '04:05 PM'::time, '12:00 AM'::time, '12:30 pm'::time",
+        "04:05:06.789|04:05:00|04:05:06|16:05:00|00:00:00|12:30:00");
+    try rows("SELECT '04:05:06-08:00'::time, '2003-04-12 04:05:06'::time, 'allballs'::time, '24:00:00'::time, '23:59:60'::time, ' 1:02:03 '::time",
+        "04:05:06|04:05:06|00:00:00|24:00:00|24:00:00|01:02:03");
+    try rows("SELECT '12:34:56.1234567'::time, '00:00:00.0000004'::time, CAST('7:08' AS TIME WITHOUT TIME ZONE), TIME WITHOUT TIME ZONE '09:10'", "12:34:56.123457|00:00:00|07:08:00|09:10:00");
+    try meta(2, 1083, -1);
+    // Multiword type names before a literal are not a column with an alias.
+    try rows("SELECT TIMESTAMP WITHOUT TIME ZONE '2026-01-01', CHARACTER VARYING 'xy', DOUBLE PRECISION '1.5'", "2026-01-01 00:00:00|xy|1.5");
+    try rejects("SELECT '25:00'::time", error.DatetimeFieldOverflow);
+    try sqlstate(error.DatetimeFieldOverflow, "22008");
+    try rejects("SELECT '24:00:01'::time", error.DatetimeFieldOverflow);
+    try rejects("SELECT '12:60'::time", error.DatetimeFieldOverflow);
+    try rejects("SELECT '13:00 PM'::time", error.DatetimeFieldOverflow);
+    try rejects("SELECT 'abc'::time", error.InvalidDatetimeFormat);
+    try sqlstate(error.InvalidDatetimeFormat, "22007");
+    try rejects("SELECT ''::time", error.InvalidDatetimeFormat);
+    try rejects("SELECT '12:34:56 xyz!'::time", error.InvalidDatetimeFormat);
+
+    // TIME(p): typmod p, half-up rounding; precision above 6 is 6.
+    try rows("SELECT '12:34:56.789'::time(1), '23:59:59.9'::time(0), TIME(2) '01:02:03.456', '01:02:03.4'::time(7)", "12:34:56.8|24:00:00|01:02:03.46|01:02:03.4");
+    try meta(0, 1083, 1);
+    try meta(1, 1083, 0);
+    try meta(2, 1083, 2);
+    try meta(3, 1083, 6);
+
+    try exec("CREATE TABLE times(id INT PRIMARY KEY, t TIME, p TIME(3), z TIMETZ, ts TIMESTAMP)");
+    try exec("INSERT INTO times VALUES(1, '23:00', '10:00:00.12345', '12:00+01', '2026-01-02 03:04:05.5'), (2, '01:00', NULL, '11:00+00', NULL), (3, NULL, '00:00:00.0005', NULL, NULL), (4, '12:00', '23:59:59.9999', '12:00-01', 'infinity')");
+    try rows("SELECT t FROM times ORDER BY t NULLS LAST", "01:00:00;12:00:00;23:00:00;NULL");
+    try rows("SELECT p FROM times ORDER BY id", "10:00:00.123;NULL;00:00:00.001;24:00:00");
+    try meta(0, 1083, 3);
+    try rows("SELECT id FROM times WHERE t > '11:59' ORDER BY id", "1;4");
+    try rows("SELECT id FROM times WHERE t BETWEEN '00:30' AND '12:00' ORDER BY id", "2;4");
+    try rows("SELECT MIN(t), MAX(t), MIN(z), MAX(z), COUNT(DISTINCT t) FROM times", "01:00:00|23:00:00|12:00:00+01|12:00:00-01|3");
+    try meta(0, 1083, -1);
+    try meta(2, 1266, -1);
+    try rejects("INSERT INTO times(id, t) VALUES(5, '10:00'), (6, '99:00')", error.DatetimeFieldOverflow);
+    try rows("SELECT COUNT(*) FROM times", "4");
+    // Assignment from TIMESTAMP keeps the time of day; infinity gives NULL.
+    try exec("UPDATE times SET t = ts WHERE ts IS NOT NULL");
+    try rows("SELECT t FROM times WHERE id IN (1, 4) ORDER BY id", "03:04:05.5;NULL");
+
+    // Operators.
+    try rows("SELECT TIME '12:00' - TIME '10:30', TIME '23:00' + INTERVAL '2 hours', TIME '01:00' - INTERVAL '2 hours', INTERVAL '1 hour' + TIME '10:00', TIME '10:00' - '09:00'",
+        "01:30:00|01:00:00|23:00:00|11:00:00|01:00:00");
+    try meta(0, 1186, -1);
+    try meta(1, 1083, -1);
+    try rows("SELECT DATE '2026-01-02' + TIME '03:04:05', TIME '03:04:05' + DATE '2026-01-02', DATE 'infinity' + TIME '01:00'", "2026-01-02 03:04:05|2026-01-02 03:04:05|infinity");
+    try meta(0, 1114, -1);
+    try rejects("SELECT TIME '10:00' + '1 hour'", error.AmbiguousFunction);
+    try rejects("SELECT TIME '10:00' + TIME '01:00'", error.UndefinedFunction);
+    try rejects("SELECT TIME '10:00' * 2", error.UndefinedFunction);
+    // Casts.
+    try rows("SELECT TIME '12:34:56'::text, TIMESTAMP '2026-01-02 03:04:05.5'::time, 'infinity'::timestamp::time, TIME '01:02:03'::interval, INTERVAL '1 day 02:00'::time, INTERVAL '-1 hour'::time",
+        "12:34:56|03:04:05.5|NULL|01:02:03|02:00:00|23:00:00");
+    try meta(3, 1186, -1);
+    try rejects("SELECT TIME '10:00' = '10:00'::text", error.UndefinedFunction);
+    try rejects("SELECT 1::time", error.CannotCoerce);
+    try rows("SELECT NULL::time, format_type(1083, 3), format_type(1266, -1), 'time'::regtype::text, 'timetz'::regtype::text",
+        "NULL|time(3) without time zone|time with time zone|time without time zone|time with time zone");
+    try rows("SELECT data_type, datetime_precision FROM information_schema.columns WHERE table_name = 'times' AND column_name IN ('t', 'p', 'z') ORDER BY ordinal_position",
+        "time without time zone|6;time without time zone|3;time with time zone|6");
+
+    // TIMETZ: zone kept and printed, east positive; the session zone (UTC
+    // here) fills a missing one. Order is UTC-equivalent time, then zone.
+    try rows("SELECT '12:34:56+05:30'::timetz, '12:34:56-08'::timetz, '12:34:56'::timetz, '12:34:56 UTC'::timetz, '01:02:03.5+01:02:03'::timetz, TIME WITH TIME ZONE '01:00+02'",
+        "12:34:56+05:30|12:34:56-08|12:34:56+00|12:34:56+00|01:02:03.5+01:02:03|01:00:00+02");
+    try meta(0, 1266, -1);
+    try rows("SELECT '12:00+01'::timetz = '11:00+00'::timetz, '12:00+01'::timetz < '11:00+00'::timetz, '12:00+01'::timetz = '12:00+01:00'::timetz, '10:00'::timetz(0) > '09:00+00'",
+        "f|t|t|t");
+    try rows("SELECT z FROM times ORDER BY z NULLS FIRST", "NULL;12:00:00+01;11:00:00+00;12:00:00-01");
+    try rows("SELECT TIME '10:00'::timetz, '10:00+05'::timetz::time, TIMESTAMPTZ '2026-01-02 03:04:05+00'::timetz, '23:30+02'::timetz + INTERVAL '1 hour', '12:34:56.789+01'::timetz(1)",
+        "10:00:00+00|10:00:00|03:04:05+00|00:30:00+02|12:34:56.8+01");
+    try meta(4, 1266, 1);
+    try rows("SELECT DATE '2026-01-02' + '03:00+02'::timetz", "2026-01-02 01:00:00+00");
+    try meta(0, 1184, -1);
+    try rejects("SELECT '12:00+16'::timetz", error.InvalidTimeZoneDisplacement);
+    try sqlstate(error.InvalidTimeZoneDisplacement, "22009");
+    try rejects("SELECT '12:00+05:60'::timetz", error.InvalidTimeZoneDisplacement);
+    try exec("DROP TABLE times");
+
+    // Wire: TIME is i64 microseconds; TIMETZ adds i32 seconds west of UTC.
+    try check(Wire.oid(.time) == 1083 and Wire.length(.time) == 8 and Wire.oid(.timetz) == 1266 and Wire.length(.timetz) == 12);
+    try exec("SELECT '12:34:56'::time, '12:34:56+05:30'::timetz");
+    const time_bytes = [_]u8{ 0, 0, 0, 0x0a, 0x8b, 0xda, 0x1c, 0x00 };
+    const timetz_bytes = time_bytes ++ [_]u8{ 0xff, 0xff, 0xb2, 0xa8 };
+    try sendText(&result.rows[0].cells[0], "12:34:56");
+    try sendBinary(&result.rows[0].cells[0], .time, &time_bytes);
+    try sendText(&result.rows[0].cells[1], "12:34:56+05:30");
+    try sendBinary(&result.rows[0].cells[1], .timetz, &timetz_bytes);
+    try receive(&time_bytes, .time, "12:34:56");
+    try receive(&timetz_bytes, .timetz, "12:34:56+05:30");
+    try literal(&time_bytes, 1083, 1, "'12:34:56'::time");
+    try literal(&timetz_bytes, 1266, 1, "'12:34:56+05:30'::timetz");
+    var out: [64]u8 = undefined;
+    const late = [_]u8{ 0, 0, 0, 0x14, 0x1d, 0xd7, 0x60, 0x01 };
+    try check(if (Wire.receiveText(&late, .time, &out)) |_| false else |err| err == error.ProtocolViolation);
+    try check(if (Wire.receiveText(time_bytes[0..7], .time, &out)) |_| false else |err| err == error.ProtocolViolation);
+
+    // Durability.
+    try replay(&.{
+        "CREATE TABLE r(id INT PRIMARY KEY, t TIME, p TIME(2), z TIMETZ(3))",
+        "INSERT INTO r VALUES(1, '12:34:56', '01:02:03.456', '04:05:06.7891-07:30'), (2, NULL, '24:00', NULL)",
+        "UPDATE r SET t = t + INTERVAL '1 minute' WHERE id = 1",
+    }, "SELECT * FROM r ORDER BY id");
+    try shown("replica", "1|12:35:56|01:02:03.46|04:05:06.789-07:30;2|NULL|24:00:00|NULL");
+    try meta(2, 1083, 2);
+    try meta(3, 1266, 3);
+}
+
 pub fn main(init: std.process.Init) !void {
     try character();
     try uuid();
     try bytea();
+    try time();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-types-core\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

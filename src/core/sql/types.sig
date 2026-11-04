@@ -6,6 +6,7 @@ const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
 const character = @import("character.sig");
 const uuid = @import("uuid.sig");
+const time_of_day = @import("time_of_day.sig");
 
 pub const Config = struct {
     /// Caller supplies row/version/index buffers and query reference workspace.
@@ -252,6 +253,8 @@ pub const Error = error{
     /// SQLSTATE 22001: a value is longer than its declared length
     /// (VARCHAR(n)/CHAR(n) assignment or input).
     StringDataRightTruncation,
+    /// SQLSTATE 22009: a time zone displacement beyond +-15:59:59.
+    InvalidTimeZoneDisplacement,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -310,11 +313,11 @@ pub const Dialect = enum { postgres, mysql, tds };
 
 /// Stored column / result types. `integer` is int8 (BIGINT) and
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
-pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea };
+pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet.
-pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea };
+pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz };
 
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
@@ -338,6 +341,8 @@ pub fn dataTypeOf(ty: Type) DataType {
         .bpchar => .bpchar,
         .uuid => .uuid,
         .bytea => .bytea,
+        .time => .time,
+        .timetz => .timetz,
     };
 }
 
@@ -363,6 +368,8 @@ pub fn typeOfData(data_type: DataType) Type {
         .bpchar => .bpchar,
         .uuid => .uuid,
         .bytea => .bytea,
+        .time => .time,
+        .timetz => .timetz,
     };
 }
 
@@ -392,6 +399,8 @@ pub fn typeInfo(data_type: DataType) TypeInfo {
         .varchar => .{ .oid = 1043, .name = "varchar", .len = -1, .category = 'S', .array = 1015 },
         .uuid => .{ .oid = 2950, .name = "uuid", .len = 16, .category = 'U', .array = 2951 },
         .bytea => .{ .oid = 17, .name = "bytea", .len = -1, .category = 'U', .array = 1001 },
+        .time => .{ .oid = 1083, .name = "time", .len = 8, .category = 'D', .array = 1183 },
+        .timetz => .{ .oid = 1266, .name = "timetz", .len = 12, .category = 'D', .array = 1270 },
     };
 }
 
@@ -424,6 +433,8 @@ pub fn sqlTypeName(data_type: DataType) []const u8 {
         .bpchar => "character",
         .uuid => "uuid",
         .bytea => "bytea",
+        .time => "time without time zone",
+        .timetz => "time with time zone",
     };
 }
 
@@ -450,6 +461,8 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .bpchar => "bpcharin",
         .uuid => "uuid_in",
         .bytea => "byteain",
+        .time => "time_in",
+        .timetz => "timetz_in",
     };
 }
 
@@ -483,6 +496,7 @@ pub fn typeByName(input: []const u8) ?DataType {
         .{ .name = "timestamp without time zone", .data_type = .timestamp }, .{ .name = "timestamp with time zone", .data_type = .timestamptz },
         .{ .name = "character varying", .data_type = .varchar }, .{ .name = "char varying", .data_type = .varchar },
         .{ .name = "character", .data_type = .bpchar },      .{ .name = "char", .data_type = .bpchar },
+        .{ .name = "time without time zone", .data_type = .time }, .{ .name = "time with time zone", .data_type = .timetz },
     };
     for (aliases) |alias| if (same(name, alias.name)) return alias.data_type;
     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
@@ -562,7 +576,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -581,6 +595,9 @@ pub fn Values(comptime config: Config) type {
             uuid: uuid.Uuid,
             /// BYTEA raw bytes (not text).
             bytea: Text,
+            /// TIME: microseconds since midnight (0 through 24:00:00).
+            time: i64,
+            timetz: time_of_day.TimeTz,
         };
 
         pub const Row = struct {
@@ -617,6 +634,8 @@ pub fn Values(comptime config: Config) type {
                 .bpchar => .bpchar,
                 .uuid => .uuid,
                 .bytea => .bytea,
+                .time => .time,
+                .timetz => .timetz,
             };
         }
 
@@ -645,6 +664,8 @@ pub fn Values(comptime config: Config) type {
                 .bpchar => |*value| bytesOrder(character.trimmed(value.slice()), character.trimmed(right.bpchar.slice())),
                 .uuid => |*value| bytesOrder(value, &right.uuid),
                 .bytea => |*value| bytesOrder(value.slice(), right.bytea.slice()),
+                .time => |value| order(i64, value, right.time),
+                .timetz => |value| time_of_day.compareTimeTz(value, right.timetz),
             };
         }
 
@@ -702,7 +723,12 @@ pub fn Values(comptime config: Config) type {
                     for (numeric.numeric_hash(number)) |limb| mix(&code, limb);
                 },
                 .date => |days| return wordHash(@bitCast(@as(i64, days)), tag),
-                .timestamp, .timestamptz => |us| return wordHash(@bitCast(us), tag),
+                .timestamp, .timestamptz, .time => |us| return wordHash(@bitCast(us), tag),
+                .timetz => |time| {
+                    mix(&code, tag);
+                    mix(&code, @bitCast(time.us));
+                    mix(&code, @as(u32, @bitCast(time.zone)));
+                },
                 .interval => |span| {
                     mix(&code, tag);
                     const total = temporal.intervalSpan(span);

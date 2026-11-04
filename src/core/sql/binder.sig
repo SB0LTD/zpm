@@ -507,8 +507,54 @@ pub fn Binder(comptime config: types.Config) type {
             return true;
         }
 
+        fn timeType(ty: ast.Type) bool {
+            return ty == .time or ty == .timetz;
+        }
+
+        /// Operators of TIME/TIMETZ (date.c): time - time -> interval;
+        /// time/timetz +- interval and interval + time/timetz keep the
+        /// operand type; date + time -> timestamp and date + timetz ->
+        /// timestamptz (either order). An untyped operand of `-` takes the
+        /// time type (time - time) or interval (timetz - interval); for `+`
+        /// both interval and date candidates remain, so it is ambiguous.
+        fn timeArithmetic(context: *const Context, n: *ast.Node) Error!void {
+            const add = n.op == .add;
+            const sub = n.op == .sub;
+            if (!add and !sub) return error.UndefinedFunction;
+            var left = context.node(n.a).ty;
+            var right = context.node(n.b).ty;
+            if (left == .unknown or right == .unknown) {
+                if (add) return error.AmbiguousFunction;
+                if (right == .unknown) try coerce(context, n.b, if (left == .time) .time else .interval);
+                if (left == .unknown) {
+                    if (right != .time) return error.UndefinedFunction;
+                    try coerce(context, n.a, .time);
+                }
+                left = context.node(n.a).ty;
+                right = context.node(n.b).ty;
+            }
+            if (sub and left == .time and right == .time) {
+                n.ty = .interval;
+                return;
+            }
+            if (timeType(left) and right == .interval) {
+                n.ty = left;
+                return;
+            }
+            if (add and left == .interval and timeType(right)) {
+                n.ty = right;
+                return;
+            }
+            if (add and ((left == .date and timeType(right)) or (timeType(left) and right == .date))) {
+                n.ty = if (left == .timetz or right == .timetz) .timestamptz else .timestamp;
+                return;
+            }
+            return error.UndefinedFunction;
+        }
+
         fn arithmeticType(context: *const Context, n: *ast.Node) Error!void {
             if (context.node(n.a).ty == .unknown and context.node(n.b).ty == .unknown) return error.AmbiguousFunction;
+            if (timeType(context.node(n.a).ty) or timeType(context.node(n.b).ty)) return timeArithmetic(context, n);
             var left = context.node(n.a).ty;
             var right = context.node(n.b).ty;
             // An untyped literal takes the other operand's type, except
@@ -722,7 +768,7 @@ pub fn Binder(comptime config: types.Config) type {
                     else => return error.UndefinedFunction,
                 },
                 .min, .max => switch (arg_ty) {
-                    .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval, .bpchar => arg_ty,
+                    .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval, .bpchar, .time, .timetz => arg_ty,
                     .name, .varchar => blk: {
                         n.b = try convert(context, arg, .text, -1, .implicit);
                         break :blk .text;
