@@ -114,12 +114,13 @@ The model stays on the safe side of each.
   - The uniform datapath: `UMOV`, `UMOV.64`, `UIADD3`, `UISETP`, `ULOP3.LUT`, `ULEA`, `USHF`, `UPLOP3.LUT`, `UFFMA`, `R2UR`, `S2UR`, `LDCU`, `VOTEU`.
   - Floats: `FFMA`, `FADD`, `FMUL` (with rounding, `.FTZ`, `.SAT`), `FMNMX`, `FSEL`, `FSETP` (every comparison), `FCHK`, `MUFU` (`EX2`, `RCP`, `RSQ`, `LG2`, `SQRT`, `SIN`, `COS`, and the rest of its table).
   - Halves: `HADD2`, `HMUL2`, `HFMA2`, `HMNMX2` (`.F32`, `.BF16_V2`, `.H0_H0`/`.H1_H1` selectors, half immediates).
-  - Conversions: `F2FP.F16` and `.BF16.F32.PACK_AB`, `F2I` (`FLOOR`, `CEIL`, `TRUNC`, `NTZ`, 64-bit), `I2F` (byte selects, 64-bit), `F2F`, `I2FP`, `F2IP.U8.F32.NTZ`.
+  - Conversions: `F2FP.F16` and `.BF16.F32.PACK_AB`, `F2I` (`FLOOR`, `CEIL`, `TRUNC`, `NTZ`, 64-bit), `I2F` (byte selects, 64-bit), `F2F`, `I2FP`, `F2IP.U8.F32.NTZ`, `FRND` (`FLOOR`, `CEIL`, `TRUNC`, `FTZ`; f32 only).
+  - Atomics (32-bit, with the old value): `ATOMG.E` (`ADD`, `MIN`, `MAX`, `INC`, `DEC`, `AND`, `OR`, `XOR`, `EXCH`; `.S32`; the orders and scopes, `desc[URd][Ra.64+offset]`) and `ATOMS` (`[Ra+offset]`). Their words are ptxas's and nvdisasm's (`testdata/sm120_kir_raw.txt`, `gen_sm120_vectors.py --raw-kir`); the emulator runs them a thread at a time.
   - Memory: `LDG` and `STG` (`.E`, every size, every order and eviction priority, `desc[URd][Ra.64]` and `[Ra.64+URb]`), `LDS` and `STS` (every size, `[Ra+URb+offset]`), `LDL`, `STL`, `LDC` (every size, a register index), `LDCU` (a uniform index).
   - Warps: `SHFL` (`IDX`, `UP`, `DOWN`, `BFLY`; lane and clamp registers or immediates), `VOTE` (`ALL`, `ANY`, `EQ`), `BAR.SYNC.DEFER_BLOCKING` and `BAR.ARV`, `WARPSYNC`, `S2R`, `CS2R`.
   - Control flow: `BRA` (with a predicate), `BRA.U`, `BSSY` and `BSYNC` (`.RECONVERGENT`), `CALL.REL.NOINC`, `RET.REL.NODEC`, `EXIT`, `NOP`.
   - Tensor cores: `HMMA.16816.F32`, `HMMA.16816.F32.BF16`, `HMMA.1688.F16`, `IMMA.16832.S8.S8`, `IMMA.16832.U8.S8`, `IMMA.16816.S8.S8`.
-- **Not covered:** what ptxas emits for warp-collective code it can't prove converged (`BRA.DIV`, `WARPSYNC.COLLECTIVE`, `MATCH`, `REDUX`), `BAR.RED` and `BAR.SCAN`, `BAR` with its barrier in a register, `LDS`'s scaled index (`[R9.X4]`), a 32-bit register in a global address (`.U32`), negative constant offsets, `MUFU.RCP64H` and `RSQ64H`, int4 `IMMA`, `FFMA.FMZ`, the atomics, textures and surfaces.
+- **Not covered:** what ptxas emits for warp-collective code it can't prove converged (`BRA.DIV`, `WARPSYNC.COLLECTIVE`, `MATCH`, `REDUX`), `BAR.RED` and `BAR.SCAN`, `BAR` with its barrier in a register, `LDS`'s scaled index (`[R9.X4]`), a 32-bit register in a global address (`.U32`), negative constant offsets, `MUFU.RCP64H` and `RSQ64H`, int4 `IMMA`, `FFMA.FMZ`, 64-bit and float atomics, `RED`, `ATOMG.CAS`, textures and surfaces.
 
 ## Writing kernels: the syntax
 

@@ -2223,6 +2223,60 @@ fn cF2f(cx: *Cx) Error!void {
     wideOp(cx, 0x110);
 }
 
+/// FRND(.FTZ)(.FLOOR|.CEIL|.TRUNC) Rd, b: an f32 rounded to an integral
+/// f32 (ptxas's cvt.rmi/rpi/rzi/rni.f32.f32). Both types are f32 (75..76
+/// and 84..85 hold 2: nvdisasm calls the others illegal); b takes no sign
+/// bits (nvdisasm prints none for them).
+fn cFrnd(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x107, .b = .{ .src = .{ .imm = .f32 } } });
+    _ = try cx.flag(80, "FTZ");
+    _ = try cx.mod(78, 2, &FRND);
+    cx.put(75, 2, 2);
+    cx.put(84, 2, 2);
+}
+
+/// The atomics' operations (87..90) and types (73..75), as nvdisasm names
+/// them; SAFEADD and the 64- and 128-bit types are not covered.
+const ATOM_OPS = [_][]const u8{ "ADD", "MIN", "MAX", "INC", "DEC", "AND", "OR", "XOR", "EXCH", "?", "?", "?", "?", "?", "?", "?" };
+const ATOM_TYPES = [_][]const u8{ "", "S32", "?", "?", "?", "?", "?", "?" };
+
+/// ATOMG.E.op(.type).order Pd, Rd, desc[URd][Ra.64+offset], Rb: a global
+/// atomic with its old value (ptxas's atom.global). Bit 63 is the
+/// address's .64 (nvdisasm calls the word illegal without it), the offset
+/// 23 bits at 40; the order and scope as a load's (77..80), the eviction
+/// priority the default only (84..86: 1), the predicate (81..83) always
+/// printed. The form without a descriptor ([Ra.64+URb], bit 76 clear) is
+/// not covered.
+fn cAtomg(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x9a8);
+    try cx.always("E");
+    cx.put(72, 1, 1);
+    _ = try cx.mod(87, 4, &ATOM_OPS);
+    _ = try cx.mod(84, 3, &.{ "?", "" });
+    _ = try cx.mod(73, 3, &ATOM_TYPES);
+    try cx.modParts(77, 4, &ORDERS);
+    _ = try cx.pred(81, false);
+    _ = try cx.reg(16);
+    cx.put(76, 1, 1);
+    const a = try cx.addr(.{ .desc = 64, .wide = 63, .off_n = 23 });
+    if (!a.wide) return if (cx.enc()) error.Syntax else error.Unknown;
+    _ = try cx.reg(32);
+    cx.put(91, 1, 1);
+}
+
+/// ATOMS.op(.type) Rd, [Ra+offset], Rb: a shared-memory atomic (ptxas's
+/// atom.shared). The offset is 24 bits at 40; the address's scale (78..79:
+/// .X4 ..) and the uniform register's form (0x98c) are not covered.
+fn cAtoms(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x38c);
+    _ = try cx.mod(87, 4, &ATOM_OPS);
+    _ = try cx.mod(73, 3, &ATOM_TYPES);
+    _ = try cx.reg(16);
+    _ = try cx.addr(.{});
+    _ = try cx.reg(32);
+}
+
 /// I2FP.F32.U32 / .S32 Rd, b (sm_90's integer to float)
 fn cI2fp(cx: *Cx) Error!void {
     _ = try cx.reg(16);
@@ -2371,6 +2425,9 @@ const FORMS = [_]Form{
     .{ .name = "F2F", .opcode = 0x104, .alu = true, .codec = cF2f },
     .{ .name = "F2F", .opcode = 0x110, .alu = true, .codec = cF2f },
     .{ .name = "I2FP", .opcode = 0x045, .alu = true, .codec = cI2fp },
+    .{ .name = "FRND", .opcode = 0x107, .alu = true, .codec = cFrnd },
+    .{ .name = "ATOMG", .opcode = 0x9a8, .codec = cAtomg },
+    .{ .name = "ATOMS", .opcode = 0x38c, .codec = cAtoms },
     .{ .name = "F2IP", .opcode = 0x043, .alu = true, .codec = cF2ip },
 };
 
@@ -3070,6 +3127,46 @@ test "words ptxas does not emit, as nvdisasm prints them (testdata/sm120_raw.txt
         return error.TestUnexpectedResult;
     }
     try testing.expect(n > 100);
+}
+
+test "FRND and the 32-bit atomics: ptxas's words and nvdisasm's (testdata/sm120_kir_raw.txt)" {
+    // (the forms KIR's sm_120 backend added: tools/gen_sm120_vectors.py
+    // --raw-kir; each word decodes, prints as nvdisasm printed it, and its
+    // text encodes to the word again)
+    const data = @embedFile("testdata/sm120_kir_raw.txt");
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    var n: usize = 0;
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len < 34 or line[0] == '#') continue;
+        const hi = try std.fmt.parseInt(u64, line[0..16], 16);
+        const lo = try std.fmt.parseInt(u64, line[17..33], 16);
+        const text = line[34..];
+        n += 1;
+        const in = decode(lo, hi, 0) catch |e| {
+            std.debug.print("decode \"{s}\": {s}\n", .{ text, @errorName(e) });
+            return e;
+        };
+        var buf: [256]u8 = undefined;
+        try testing.expectEqualStrings(text, try format(&in, &buf));
+        const w = try encode(&(try parse(text)), 0, null);
+        try testing.expectEqual(hi, w.hi());
+        try testing.expectEqual(lo, w.lo());
+    }
+    try testing.expectEqual(@as(usize, 46), n);
+    // what nvdisasm calls illegal, or prints without a field, is refused
+    const frnd = Word.of(0x0000000a00087307, 0x000fe20000205000);
+    for ([_]struct { u7, u7, u64 }{ .{ 75, 2, 1 }, .{ 84, 2, 1 }, .{ 73, 1, 1 }, .{ 72, 1, 1 }, .{ 77, 1, 1 } }) |f| {
+        var w = frnd;
+        w.put(f[0], f[1], f[2]);
+        try testing.expectError(error.Unknown, decode(w.lo(), w.hi(), 0));
+    }
+    const atomg = Word.of(0x80000007080b79a8, 0x000fe200081ef106);
+    for ([_]struct { u7, u7, u64 }{ .{ 63, 1, 0 }, .{ 87, 4, 9 }, .{ 84, 3, 2 }, .{ 73, 3, 2 } }) |f| {
+        var w = atomg;
+        w.put(f[0], f[1], f[2]);
+        try testing.expectError(error.Unknown, decode(w.lo(), w.hi(), 0));
+    }
 }
 
 /// `text` encoded at `pc`, then decoded: what an emulator sees.
