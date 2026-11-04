@@ -1251,7 +1251,12 @@ fn fallbackUses(op: *const Op, in: *const Instr) sched.Uses {
             const n = d.n +| @as(u8, @intCast(j));
             switch (d.file) {
                 .gpr => add(&u, true, .gpr, n, @intFromEnum(rcat)),
-                .ugpr => add(&u, true, .ugpr, n, @intFromEnum(if (op.kind == .mov) U.umov else if (op.kind == .s2r or op.kind == .ldc or op.kind == .vote) U.to_ur else U.udp)),
+                .ugpr => add(&u, true, .ugpr, n, @intFromEnum(switch (op.kind) {
+                    .mov => U.umov,
+                    .s2r, .ldc => U.to_ur,
+                    .vote => U.voteu,
+                    else => U.udp,
+                })),
                 .pred => add(&u, true, .pred, d.n, @intFromEnum(pcat)),
                 else => {},
             }
@@ -2607,6 +2612,39 @@ test "a warp-collective waits for the lanes still running, wherever they are" {
         \\BRA `(back)
     , &l, &regions);
     for (out) |v| try testing.expectEqual(@as(u32, 31), v);
+}
+
+test "the uniform datapath: once a warp, its own registers and predicates" {
+    var out = [_]u32{0} ** 64;
+    const regions = [_]Region{.{ .va = 0x8000, .bytes = std.mem.sliceAsBytes(&out) }};
+    var cb: [qmd.CBUF0_WORDS]u32 = undefined;
+    const p = [_]u64{0x8000};
+    var l = try launchOf(&cb, .{ 32, 1, 1 }, std.mem.asBytes(&p));
+    l.grid = .{ 2, 1, 1 };
+    _ = try runText(
+        \\S2R R0, SR_TID.X
+        \\LDC.64 R2, c[0x0][0x380]
+        \\LDCU.64 UR4, c[0x0][0x358]
+        \\S2UR UR6, SR_CTAID.X
+        \\UIADD3 UR7, UPT, UPT, UR6, 0x10, URZ
+        \\ULOP3.LUT UR8, UR7, 0x1f, URZ, 0xc0, !UPT
+        \\USHF.L.U32 UR9, UR8, 0x2, URZ
+        \\UISETP.GT.U32.AND UP0, UPT, UR9, 0x40, UPT
+        \\USEL UR10, UR9, URZ, UP0
+        \\UMOV UR11, 0x5
+        \\VOTEU.ANY UR12, UPT, PT
+        \\MOV R5, UR10
+        \\IADD R5, R5, UR11
+        \\IMAD R6, R0, 0x4, R5
+        \\S2R R7, SR_CTAID.X
+        \\IMAD R8, R7, 0x20, R0
+        \\IMAD.WIDE.U32 R8, R8, 0x4, R2
+        \\STG.E desc[UR4][R8.64], R6
+        \\EXIT
+    , &l, &regions);
+    // CTA 0: UR9 = 0x40, not above 0x40: UR10 = 0; CTA 1: 0x44
+    for (0..32) |t| try testing.expectEqual(@as(u32, @intCast(5 + 4 * t)), out[t]);
+    for (0..32) |t| try testing.expectEqual(@as(u32, @intCast(0x44 + 5 + 4 * t)), out[32 + t]);
 }
 
 test "LDC with an index register, and its read checked" {
