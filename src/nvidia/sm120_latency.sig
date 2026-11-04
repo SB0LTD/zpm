@@ -251,3 +251,44 @@ pub const ureg_waw = [17][17]u8{
     .{ N, N, N, N, N, N, N, 0x81, N, N, N, 0x07, 0x01, 0x01, 0x01, 0x01, 0x01 }, // r2ur
     .{ N, N, N, N, N, N, N, 0x81, N, N, N, 0x07, 0x01, 0x01, 0x01, 0x0b, 0x01 }, // voteu
 };
+
+/// The uniform predicate register file's latency categories.
+pub const Upred = enum(u8) {
+    coupled,
+    udp,
+    voteu,
+    u_guard,
+    bra_jmp,
+    uldc_mma,
+    usetmaxreg,
+};
+
+pub const upred_raw = [7][7]u8{
+    .{ N, 0x06, 0x01, N, N, N, 0x81 }, // coupled
+    .{ N, 0x04, 0x01, N, N, N, 0x81 }, // udp
+    .{ N, N, N, N, N, N, N }, // voteu
+    .{ N, 0x0b, 0x05, N, N, N, 0x81 }, // u_guard
+    .{ N, 0x09, 0x02, N, N, N, 0x81 }, // bra_jmp
+    .{ N, 0x0b, 0x05, N, N, N, 0x81 }, // uldc_mma
+    .{ N, N, N, N, N, N, N }, // usetmaxreg
+};
+
+pub const upred_war = [7][7]u8{
+    .{ N, N, N, N, N, N, N }, // coupled
+    .{ 0x01, 0x01, N, 0x01, 0x01, 0x01, N }, // udp
+    .{ 0x02, 0x02, N, 0x01, 0x01, 0x01, N }, // voteu
+    .{ N, N, N, N, N, N, N }, // u_guard
+    .{ N, N, N, N, N, N, N }, // bra_jmp
+    .{ N, N, N, N, N, N, N }, // uldc_mma
+    .{ 0x01, 0x01, N, 0x01, 0x01, 0x01, N }, // usetmaxreg
+};
+
+pub const upred_waw = [7][7]u8{
+    .{ N, N, N, N, N, N, N }, // coupled
+    .{ N, 0x01, 0x01, N, N, N, 0x81 }, // udp
+    .{ N, 0x07, 0x01, N, N, N, 0x81 }, // voteu
+    .{ N, N, N, N, N, N, N }, // u_guard
+    .{ N, N, N, N, N, N, N }, // bra_jmp
+    .{ N, N, N, N, N, N, N }, // uldc_mma
+    .{ N, 0x0a, 0x08, N, N, N, 0x81 }, // usetmaxreg
+};

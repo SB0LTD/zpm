@@ -276,7 +276,7 @@ test "a kernel without control fields: scheduled, ptxas's bits below the fields,
     try testing.expect(STG.get(116, 6) & (@as(u64, 1) << @intCast(LDCU.get(110, 3))) != 0);
 }
 
-test "ptxas's kernels from their listings (Galaxy's five probes, the coverage one): its words, registers, stack, parameters" {
+test "ptxas's kernels from their listings (Galaxy's probes, the coverage and LFM3-shaped ones): its words, registers, stack, parameters" {
     const data = @embedFile("sm120_vectors.txt");
     var kernels = std.mem.splitSequence(u8, data, "# kernel ");
     _ = kernels.next();
@@ -323,5 +323,5 @@ test "ptxas's kernels from their listings (Galaxy's five probes, the coverage on
         try testing.expectEqual(try want.field(head, "params"), k.params);
         n += 1;
     }
-    try testing.expectEqual(@as(usize, 6), n);
+    try testing.expectEqual(@as(usize, 25), n);
 }

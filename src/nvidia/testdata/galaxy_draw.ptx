@@ -1,0 +1,286 @@
+// Galaxy's 2D drawing, the shape its sm_120 kernels will take (galaxy's
+// ui/raster.sig draws on the CPU), for sm120_vectors.txt: alpha blending
+// of RGBA8 pixels, a box blur through a shared-memory tile, integer and
+// float conversions, and 8-, 16-, 64- and 128-bit loads and stores.
+.version 8.8
+.target sm_120
+.address_size 64
+
+// dst = src over dst for RGBA8 (straight alpha, a / 255), each channel
+// rounded and saturated; a coverage byte per pixel scales the source's
+// alpha (8-bit loads), and a 16-bit depth is written where drawn.
+.visible .entry draw_blend(.param .u64 src, .param .u64 dst, .param .u64 cov, .param .u64 depth, .param .u32 n, .param .u32 z)
+{
+    .reg .pred %p<8>;
+    .reg .b16 %rs<8>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<32>;
+
+    ld.param.u64 %rd1, [src];
+    ld.param.u64 %rd2, [dst];
+    ld.param.u64 %rd3, [cov];
+    ld.param.u64 %rd4, [depth];
+    ld.param.u32 %r1, [n];
+    ld.param.u32 %r2, [z];
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mad.lo.s32 %r6, %r4, %r5, %r3;
+    setp.ge.u32 %p1, %r6, %r1;
+    @%p1 bra BL_END;
+    mul.wide.u32 %rd5, %r6, 4;
+    add.s64 %rd6, %rd1, %rd5;
+    add.s64 %rd7, %rd2, %rd5;
+    ld.global.nc.u32 %r7, [%rd6];
+    ld.global.u32 %r8, [%rd7];
+    cvt.u64.u32 %rd8, %r6;
+    add.s64 %rd9, %rd3, %rd8;
+    ld.global.nc.u8 %r9, [%rd9];
+    // the source's alpha times the coverage, over 255
+    bfe.u32 %r10, %r7, 24, 8;
+    mul.lo.u32 %r11, %r10, %r9;
+    cvt.rn.f32.u32 %f1, %r11;
+    mul.f32 %f2, %f1, 0f377BB2D2;
+    setp.eq.f32 %p2, %f2, 0f00000000;
+    @%p2 bra BL_END;
+    mov.f32 %f3, 0f3F800000;
+    sub.f32 %f4, %f3, %f2;
+    // red, green, blue: s * a + d * (1 - a), rounded, held to 255
+    bfe.u32 %r12, %r7, 0, 8;
+    bfe.u32 %r13, %r7, 8, 8;
+    bfe.u32 %r14, %r7, 16, 8;
+    bfe.u32 %r15, %r8, 0, 8;
+    bfe.u32 %r16, %r8, 8, 8;
+    bfe.u32 %r17, %r8, 16, 8;
+    bfe.u32 %r18, %r8, 24, 8;
+    cvt.rn.f32.u32 %f5, %r12;
+    cvt.rn.f32.u32 %f6, %r13;
+    cvt.rn.f32.u32 %f7, %r14;
+    cvt.rn.f32.u32 %f8, %r15;
+    cvt.rn.f32.u32 %f9, %r16;
+    cvt.rn.f32.u32 %f10, %r17;
+    cvt.rn.f32.u32 %f11, %r18;
+    mul.f32 %f12, %f8, %f4;
+    fma.rn.f32 %f12, %f5, %f2, %f12;
+    mul.f32 %f13, %f9, %f4;
+    fma.rn.f32 %f13, %f6, %f2, %f13;
+    mul.f32 %f14, %f10, %f4;
+    fma.rn.f32 %f14, %f7, %f2, %f14;
+    mul.f32 %f15, %f11, %f4;
+    fma.rn.f32 %f15, %f3, 0f437F0000, %f15;
+    cvt.rni.sat.u8.f32 %r19, %f12;
+    cvt.rni.u32.f32 %r20, %f13;
+    min.u32 %r20, %r20, 255;
+    cvt.rzi.s32.f32 %r21, %f14;
+    max.s32 %r21, %r21, 0;
+    min.s32 %r21, %r21, 255;
+    cvt.rmi.s32.f32 %r22, %f15;
+    min.u32 %r22, %r22, 255;
+    shl.b32 %r23, %r20, 8;
+    or.b32 %r24, %r19, %r23;
+    bfi.b32 %r25, %r21, %r24, 16, 8;
+    bfi.b32 %r26, %r22, %r25, 24, 8;
+    st.global.u32 [%rd7], %r26;
+    // the depth, 16 bits a pixel
+    cvt.u16.u32 %rs1, %r2;
+    mul.wide.u32 %rd10, %r6, 2;
+    add.s64 %rd11, %rd4, %rd10;
+    st.global.u16 [%rd11], %rs1;
+BL_END:
+    ret;
+}
+
+// A box blur of one channel (bytes), a 16x16 tile with a one-pixel halo
+// in shared memory: each thread one pixel in (an 8-bit load, a 16-bit
+// shared store of it and its neighbour), the tile synchronized, then the
+// five-point average out (signed 8- and 16-bit loads for the edge
+// weights, 8-bit stores).
+.visible .entry draw_blur(.param .u64 img, .param .u64 out, .param .u64 wts, .param .u32 width, .param .u32 height)
+{
+    .reg .pred %p<8>;
+    .reg .b16 %rs<16>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<32>;
+    .shared .align 4 .b8 tile[324];
+
+    ld.param.u64 %rd1, [img];
+    ld.param.u64 %rd2, [out];
+    ld.param.u64 %rd3, [wts];
+    ld.param.u32 %r1, [width];
+    ld.param.u32 %r2, [height];
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %tid.y;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ctaid.y;
+    shl.b32 %r7, %r5, 4;
+    shl.b32 %r8, %r6, 4;
+    add.s32 %r9, %r7, %r3;
+    add.s32 %r10, %r8, %r4;
+    // clamp to the image (the halo reads the edge)
+    sub.s32 %r11, %r1, 1;
+    sub.s32 %r12, %r2, 1;
+    min.u32 %r13, %r9, %r11;
+    min.u32 %r14, %r10, %r12;
+    mad.lo.s32 %r15, %r14, %r1, %r13;
+    cvt.u64.u32 %rd4, %r15;
+    add.s64 %rd5, %rd1, %rd4;
+    ld.global.nc.u8 %rs1, [%rd5];
+    // tile[(y + 1) * 18 + x + 1]
+    add.s32 %r16, %r4, 1;
+    mul.lo.u32 %r17, %r16, 18;
+    add.s32 %r18, %r17, %r3;
+    add.s32 %r18, %r18, 1;
+    mov.u32 %r19, tile;
+    add.s32 %r20, %r19, %r18;
+    st.shared.u8 [%r20], %rs1;
+    // the left and right halo columns: threads x = 0 and 15
+    setp.ne.u32 %p1, %r3, 0;
+    @%p1 bra BU_RIGHT;
+    max.s32 %r21, %r9, 1;
+    sub.s32 %r21, %r21, 1;
+    mad.lo.s32 %r22, %r14, %r1, %r21;
+    cvt.u64.u32 %rd6, %r22;
+    add.s64 %rd7, %rd1, %rd6;
+    ld.global.nc.u8 %rs2, [%rd7];
+    st.shared.u8 [%r20+-1], %rs2;
+BU_RIGHT:
+    setp.ne.u32 %p2, %r3, 15;
+    @%p2 bra BU_SYNC;
+    add.s32 %r23, %r9, 1;
+    min.u32 %r23, %r23, %r11;
+    mad.lo.s32 %r24, %r14, %r1, %r23;
+    cvt.u64.u32 %rd8, %r24;
+    add.s64 %rd9, %rd1, %rd8;
+    ld.global.nc.u8 %rs3, [%rd9];
+    st.shared.u8 [%r20+1], %rs3;
+BU_SYNC:
+    bar.sync 0;
+    // the five-point sum, weights from a table (signed bytes and halves)
+    ld.shared.u8 %r25, [%r20];
+    ld.shared.u8 %r26, [%r20+-1];
+    ld.shared.u8 %r27, [%r20+1];
+    ld.shared.u8 %r28, [%r20+-18];
+    ld.shared.u8 %r29, [%r20+18];
+    ld.global.nc.s8 %r30, [%rd3];
+    ld.global.nc.s16 %r31, [%rd3+2];
+    ld.global.nc.u16 %r32, [%rd3+4];
+    mul.lo.s32 %r33, %r25, %r30;
+    add.s32 %r34, %r26, %r27;
+    add.s32 %r34, %r34, %r28;
+    add.s32 %r34, %r34, %r29;
+    mad.lo.s32 %r35, %r34, %r31, %r33;
+    cvt.rn.f32.s32 %f1, %r35;
+    cvt.rn.f32.u32 %f2, %r32;
+    rcp.approx.f32 %f3, %f2;
+    mul.f32 %f4, %f1, %f3;
+    cvt.rni.sat.u8.f32 %rs4, %f4;
+    setp.ge.u32 %p3, %r9, %r1;
+    setp.ge.u32 %p4, %r10, %r2;
+    or.pred %p5, %p3, %p4;
+    @%p5 bra BU_END;
+    mad.lo.s32 %r36, %r10, %r1, %r9;
+    cvt.u64.u32 %rd10, %r36;
+    add.s64 %rd11, %rd2, %rd10;
+    st.global.u8 [%rd11], %rs4;
+BU_END:
+    ret;
+}
+
+// Shared memory in every size: a 16-byte vector, 8 bytes, signed and
+// unsigned bytes and halves, written then read back by the neighbour; a
+// 64-bit integer path (64-bit adds and shifts, a 64-bit compare), and
+// f64 conversions.
+.visible .entry draw_sizes(.param .u64 a, .param .u64 b, .param .u64 c)
+{
+    .reg .pred %p<8>;
+    .reg .b16 %rs<16>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<32>;
+    .reg .f32 %f<16>;
+    .reg .f64 %fd<8>;
+    .shared .align 16 .b8 sm[2048];
+
+    ld.param.u64 %rd1, [a];
+    ld.param.u64 %rd2, [b];
+    ld.param.u64 %rd3, [c];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd4, %r1, 16;
+    add.s64 %rd5, %rd1, %rd4;
+    ld.global.v4.u32 {%r2, %r3, %r4, %r5}, [%rd5];
+    mov.u32 %r6, sm;
+    shl.b32 %r7, %r1, 4;
+    add.s32 %r8, %r6, %r7;
+    st.shared.v4.u32 [%r8], {%r2, %r3, %r4, %r5};
+    shl.b32 %r9, %r1, 3;
+    add.s32 %r10, %r6, %r9;
+    st.shared.v2.u32 [%r10+1024], {%r3, %r2};
+    shl.b32 %r11, %r1, 1;
+    add.s32 %r12, %r6, %r11;
+    cvt.u16.u32 %rs1, %r4;
+    st.shared.u16 [%r12+1536], %rs1;
+    add.s32 %r13, %r6, %r1;
+    cvt.u16.u32 %rs2, %r5;
+    st.shared.u8 [%r13+1792], %rs2;
+    bar.sync 0;
+    xor.b32 %r14, %r1, 1;
+    shl.b32 %r15, %r14, 4;
+    add.s32 %r16, %r6, %r15;
+    ld.shared.v4.u32 {%r17, %r18, %r19, %r20}, [%r16];
+    shl.b32 %r21, %r14, 3;
+    add.s32 %r22, %r6, %r21;
+    ld.shared.v2.u32 {%r23, %r24}, [%r22+1024];
+    shl.b32 %r25, %r14, 1;
+    add.s32 %r26, %r6, %r25;
+    ld.shared.s16 %r27, [%r26+1536];
+    ld.shared.u16 %r28, [%r26+1536];
+    add.s32 %r29, %r6, %r14;
+    ld.shared.s8 %r30, [%r29+1792];
+    ld.shared.u8 %r31, [%r29+1792];
+    add.s32 %r32, %r17, %r23;
+    add.s32 %r33, %r18, %r24;
+    add.s32 %r34, %r19, %r27;
+    add.s32 %r35, %r20, %r30;
+    add.s32 %r34, %r34, %r28;
+    add.s32 %r35, %r35, %r31;
+    // 64-bit integers
+    mov.b64 %rd6, {%r32, %r33};
+    shl.b64 %rd7, %rd6, 3;
+    shr.u64 %rd8, %rd6, 7;
+    shr.s64 %rd9, %rd6, 11;
+    add.s64 %rd10, %rd7, %rd8;
+    sub.s64 %rd10, %rd10, %rd9;
+    mul.lo.s64 %rd11, %rd10, %rd6;
+    setp.lt.u64 %p1, %rd11, %rd6;
+    selp.b64 %rd12, %rd11, %rd10, %p1;
+    // f64: from the integers, scaled, back to f32 and s64
+    cvt.rn.f64.s64 %fd1, %rd12;
+    cvt.f64.f32 %fd2, %f1;
+    cvt.rn.f32.f64 %f2, %fd1;
+    cvt.rzi.s64.f32 %rd13, %f2;
+    cvt.rn.f32.s64 %f3, %rd13;
+    cvt.rn.f32.u64 %f4, %rd12;
+    cvt.rzi.u32.f32 %r36, %f3;
+    add.f32 %f5, %f3, %f4;
+    mov.b32 %r37, %f5;
+    xor.b32 %r38, %r36, %r37;
+    mul.wide.u32 %rd14, %r1, 32;
+    add.s64 %rd15, %rd2, %rd14;
+    st.global.v4.u32 [%rd15], {%r32, %r33, %r34, %r35};
+    st.global.u64 [%rd15+16], %rd12;
+    st.global.v2.u32 [%rd15+24], {%r38, %r36};
+    mul.wide.u32 %rd16, %r1, 8;
+    add.s64 %rd17, %rd3, %rd16;
+    ld.global.s16 %r39, [%rd17];
+    ld.global.s8 %r40, [%rd17+2];
+    ld.global.u8 %r41, [%rd17+3];
+    ld.global.u16 %r42, [%rd17+4];
+    add.s32 %r43, %r39, %r40;
+    add.s32 %r43, %r43, %r41;
+    add.s32 %r43, %r43, %r42;
+    cvt.u16.u32 %rs3, %r43;
+    st.global.u8 [%rd17+6], %rs3;
+    st.global.u16 [%rd17], %rs3;
+    ret;
+}

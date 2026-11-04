@@ -9,6 +9,11 @@ text into exactly the words next to it.
 
     python tools/gen_sm120_vectors.py OUT.txt KERNELS.ptx...
 
+(src/nvidia/sm120_vectors.txt is made from every file in
+src/nvidia/testdata/, Galaxy's probe kernels first:
+galaxy_m4.ptx galaxy_m5.ptx coverage.ptx lfm3_quant.ptx lfm3_layers.ptx
+galaxy_draw.ptx sm120_ops.ptx.)
+
 Each kernel becomes a block:
 
     # kernel galaxy_m4 (galaxy_m4.ptx): registers 8, stack 0, params 0
@@ -39,7 +44,9 @@ import tempfile
 
 INSTR = re.compile(r"^\s*/\*([0-9a-f]{4})\*/\s+(.*?)\s*;\s*/\*\s*0x([0-9a-f]{16})\s*\*/\s*$")
 HI = re.compile(r"^\s*/\*\s*0x([0-9a-f]{16})\s*\*/\s*$")
-LABEL = re.compile(r"^(\.L_x_\d+):\s*$")
+# (a branch target, or a subroutine of the kernel's: ptxas's IEEE division
+# slow path is $__internal_0_$__cuda_sm3x_div_rn_noftz_f32_slowpath)
+LABEL = re.compile(r"^(\.L_x_\d+|\$[\w$]+):\s*$")
 KERNEL = re.compile(r"^\.text\.(\S+):\s*$")
 
 
@@ -100,6 +107,9 @@ def blocks(listing, source, used):
             name = m.group(1)
             r, st, pa = used[name]
             out.append(f"# kernel {name} ({source}): registers {r}, stack {st}, params {pa}")
+            # (the kernel's own label, as nvdisasm's listing has it: RET's
+            # target)
+            out.append(f"{name}:")
             i += 1
             continue
         m = LABEL.match(line.strip())
