@@ -363,6 +363,42 @@ test "float ops: ir3 equals the interpreter (NaNs as NaNs; the SFU within its bo
     for (0..6) |cc| try checkOp(.{ .name = "fcmp", .op = .fcmp, .ty = .f32, .ta = .f32, .tb = .f32, .aux = @intCast(cc), .dst = .pred, .float_pool = true });
 }
 
+test "exact fdiv and fsqrt (kir's mul/add-only expansions) equal the interpreter" {
+    try checkOp(flt2("fdiv", .fdiv));
+    try checkOp(withImm(flt2("fdiv imm", .fdiv), fb(3.0), .rri));
+    try checkOp(withImm(flt2("fdiv imm", .fdiv), fb(-0.75), .rir));
+    try checkOp(flt1("fsqrt", .fsqrt, .nan_any));
+    // random operands, many more of them
+    var seed: u32 = 1234;
+    for (0..8) |round| {
+        var k = newKernel("fdiv random", .{ 128, 1, 1 });
+        const ba = k.binding();
+        const bb = k.binding();
+        const bo = k.binding();
+        const t = k.op2(.iadd, .u32, r(k.tid(0)), r(k.op2(.shl, .u32, r(k.gid(0)), u(7))));
+        const off = k.op2(.shl, .u32, r(t), u(3));
+        const a = k.load(.f32, kir.global(ba, 32), r(off));
+        const b = k.load(.f32, kir.global(bb, 32), r(off));
+        const q = k.div(r(a), r(b));
+        const s = k.sqrt(r(a));
+        k.store(.f32, kir.global(bo, 32), r(off), r(q));
+        var m = kir.global(bo, 32);
+        m.imm = 4;
+        k.store(.f32, m, r(off), r(s));
+        var av = zeros(4096 * 8);
+        var bv = zeros(4096 * 8);
+        for (0..4096 * 2) |i| {
+            // magnitudes over the whole range, denormals included
+            const ea = (lcg(&seed) >> 24) & 0xff;
+            const eb = if (round % 2 == 0) (lcg(&seed) >> 24) & 0xff else 100 + ((lcg(&seed) >> 24) & 63);
+            std.mem.writeInt(u32, av[i * 4 ..][0..4], (lcg(&seed) & 0x807fffff) | (ea << 23), .little);
+            std.mem.writeInt(u32, bv[i * 4 ..][0..4], (lcg(&seed) & 0x807fffff) | (eb << 23), .little);
+        }
+        var out = zeros(4096 * 8);
+        _ = try both(&k, .{ 32, 1, 1 }, &.{ &av, &bv, &out }, &.{});
+    }
+}
+
 test "selects, predicates and conversions" {
     try checkOp(.{ .name = "sel.u32", .op = .sel, .ty = .u32, .ta = .u32, .tb = .u32, .tc = .pred, .nc = 1, .dst = .u32 });
     try checkOp(.{ .name = "sel.f32", .op = .sel, .ty = .f32, .ta = .f32, .tb = .f32, .tc = .pred, .nc = 1, .dst = .f32, .float_pool = true });
