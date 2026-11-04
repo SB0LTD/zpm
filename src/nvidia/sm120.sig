@@ -33,17 +33,22 @@
 //!
 //! The forms and their bit positions are Mesa's NAK compiler's
 //! (src/nouveau/compiler/nak/sm70_encode.rs, MIT license, read as
-//! documentation only: none of it is copied), and for what NAK does not emit
-//! (the two-source IADD and IADD.64, MOV.64 and UMOV.64, STL's 0x387, the
-//! constant bits ptxas sets), ptxas's own output. The tests assemble every
-//! instruction in sm120_vectors.txt (ptxas output, see
+//! documentation only: none of it is copied), and for what NAK does not
+//! emit, ptxas's own output: the two-source IADD and IADD.64, MOV.64 and
+//! UMOV.64, STL's 0x387, VIMNMX, SEL.64, I2FP and F2IP, CALL and RET,
+//! LDS's and STS's uniform register, BAR's barrier and thread count,
+//! WARPSYNC's register, the second source's reuse slot in FADD and HADD2,
+//! and the constant bits ptxas sets. The tests assemble every instruction
+//! in sm120_vectors.txt (ptxas output for LFM3-shaped kernels, see
 //! tools/gen_sm120_vectors.py), compare all 128 bits, decode the words
 //! again and print them as nvdisasm did.
 //!
 //! What nvdisasm prints that `format` cannot: a branch's label (.L_x_3) is
 //! the kernel's numbering of its targets, which one instruction does not
 //! know, so a decoded branch prints its absolute byte target, `(0x1a0),
-//! and parses back as one.
+//! and parses back as one. Everything else, floats included (%.20g below
+//! 1e9, %.20e from there, +INF with its trailing space), prints as
+//! nvdisasm prints it.
 //!
 //! Allocation-free: instructions are plain values parsed in place from the
 //! caller's text; decoded ones point only at static strings.
@@ -179,11 +184,19 @@ pub const Control = struct {
 pub const RZ: u8 = 255;
 pub const PT: u3 = 7;
 
+/// A register's selector suffix: which halves an fp16 op reads (.H0_H0,
+/// .H1_H1), which byte I2F converts (.B1..B3), an IMMA operand's layout
+/// (.ROW, .COL: always so, printed by nvdisasm).
+pub const Sel = enum { none, h0_h0, h1_h1, b1, b2, b3, row, col };
+
+const SEL_NAMES = [_][]const u8{ "", ".H0_H0", ".H1_H1", ".B1", ".B2", ".B3", ".ROW", ".COL" };
+
 pub const Reg = struct {
     n: u8,
     neg: bool = false,
     abs: bool = false,
     reuse: bool = false,
+    sel: Sel = .none,
 };
 
 pub const Pred = struct {
@@ -191,22 +204,26 @@ pub const Pred = struct {
     not: bool = false,
 };
 
-/// c[bank][offset], or c[bank][Rn+offset] through an index register (LDC);
-/// an ALU source may be negated or its absolute value taken.
+/// c[bank][offset], or c[bank][Rn+offset] through an index register (LDC;
+/// a uniform one, c[0x3][UR4], for LDCU); an ALU source may be negated or
+/// its absolute value taken.
 pub const CBuf = struct {
     bank: u5,
     offset: u32,
     reg: u8 = RZ,
+    ureg: bool = false,
     neg: bool = false,
     abs: bool = false,
 };
 
-/// A memory address: [Rn(.64)+offset], or desc[URd][Rn.64+offset] (a
-/// global address through the 64-bit descriptor URd:URd+1).
+/// A memory address: [Rn(.64)+offset], [Rn+URm+offset] (shared memory adds
+/// a uniform register), or desc[URd][Rn.64+offset] (a global address
+/// through the 64-bit descriptor URd:URd+1).
 pub const Addr = struct {
     desc: ?u8 = null,
     reg: u8 = RZ,
     wide: bool = false,
+    ureg: ?u8 = null,
     offset: i32 = 0,
 };
 
@@ -248,6 +265,8 @@ pub const Operand = union(enum) {
     /// A branch's target, the absolute byte address in its kernel (decoded,
     /// or written `(0x1a0)).
     target: u64,
+    /// A convergence barrier register, B0..B15 (BSSY, BSYNC).
+    barrier: u8,
 };
 
 pub const MAX_OPERANDS = 8;
@@ -256,6 +275,9 @@ pub const MAX_MODS = 8;
 pub const Instr = struct {
     control: Control = .{},
     guard: Pred = .{},
+    /// The guard is a uniform predicate (@!UP0): the uniform datapath's ops
+    /// take theirs from that file.
+    uguard: bool = false,
     op: []const u8 = "",
     mods: [MAX_MODS][]const u8 = undefined,
     n_mods: usize = 0,
@@ -301,6 +323,9 @@ const SREGS = [_]struct { []const u8, u8 }{
     .{ "SR_CLOCKHI", 0x51 },
     .{ "SR_GLOBALTIMERLO", 0x52 },
     .{ "SR_GLOBALTIMERHI", 0x53 },
+    // (the CTA's index in its cluster, which ptxas reads for shared
+    // memory's window)
+    .{ "SR_CgaCtaId", 0x88 },
 };
 
 fn sregName(n: u8) ?[]const u8 {
@@ -346,32 +371,53 @@ fn predName(t: []const u8) ?struct { uniform: bool, n: u3 } {
     return .{ .uniform = uniform, .n = @intCast(d[0] - '0') };
 }
 
-/// "Rn", "Rn.64", "Rn+0x8", "Rn.64+-0x10", "0x40": an address's register
-/// part and offset.
-fn addrInner(t: []const u8, a: *Addr) Error!void {
-    var s = t;
-    const cut = std.mem.indexOfAny(u8, s, "+-") orelse s.len;
-    const head = std.mem.trim(u8, s[0..cut], " ");
-    if (cut < s.len) {
-        a.offset = std.math.cast(i32, try number(std.mem.trim(u8, s[cut..], " +"))) orelse return error.OutOfRange;
-        if (s[cut] == '-') a.offset = -a.offset;
-    }
-    if (head.len == 0) return;
-    if (head[0] == '0' or std.ascii.isDigit(head[0])) {
-        a.offset = std.math.cast(i32, try number(head)) orelse return error.OutOfRange;
+/// One term of an address: "R2", "R2.64", "UR4", "0x40", "-0x10".
+fn addrTerm(t: []const u8, a: *Addr, seen_reg: *bool) Error!void {
+    if (t.len == 0) return error.Syntax;
+    if (t[0] == '-' or std.ascii.isDigit(t[0])) {
+        a.offset = std.math.cast(i32, try number(t)) orelse return error.OutOfRange;
         return;
     }
-    s = head;
+    var s = t;
+    var wide = false;
     if (std.mem.endsWith(u8, s, ".64")) {
-        a.wide = true;
+        wide = true;
         s = s[0 .. s.len - 3];
     }
     const r = regName(s) orelse return error.Syntax;
-    if (r.uniform) return error.Syntax;
-    a.reg = r.n;
+    if (r.uniform) {
+        if (wide or a.ureg != null) return error.Syntax;
+        a.ureg = r.n;
+    } else {
+        if (seen_reg.*) return error.Syntax;
+        seen_reg.* = true;
+        a.reg = r.n;
+        a.wide = wide;
+    }
 }
 
-/// "c[0x0][0x37c]", "c[0x3][R2+0x10]": a constant buffer reference.
+/// "Rn", "Rn.64", "Rn+0x8", "Rn.64+-0x10", "R2+UR4+0x700", "UR4", "0x40":
+/// an address's registers and offset.
+fn addrInner(t: []const u8, a: *Addr) Error!void {
+    const s = std.mem.trim(u8, t, " ");
+    if (s.len == 0) return;
+    var seen = false;
+    var terms = std.mem.splitScalar(u8, s, '+');
+    while (terms.next()) |raw| {
+        var term = std.mem.trim(u8, raw, " ");
+        // ("R2-0x10")
+        if (term.len > 0 and term[0] != '-') {
+            if (std.mem.indexOfScalar(u8, term, '-')) |m| {
+                try addrTerm(term[0..m], a, &seen);
+                term = term[m..];
+            }
+        }
+        try addrTerm(term, a, &seen);
+    }
+}
+
+/// "c[0x0][0x37c]", "c[0x3][R2+0x10]", "c[0x3][UR4]": a constant buffer
+/// reference.
 fn cbufOf(t: []const u8) Error!CBuf {
     const mid = std.mem.indexOf(u8, t, "][") orelse return error.Syntax;
     if (!std.mem.endsWith(u8, t, "]")) return error.Syntax;
@@ -379,17 +425,15 @@ fn cbufOf(t: []const u8) Error!CBuf {
     if (bank < 0 or bank > 31) return error.OutOfRange;
     const inner = t[mid + 2 .. t.len - 1];
     var cb = CBuf{ .bank = @intCast(bank), .offset = 0 };
-    if (inner.len > 0 and inner[0] == 'R') {
-        var a = Addr{};
-        try addrInner(inner, &a);
-        if (a.wide or a.offset < 0) return error.Syntax;
-        cb.reg = a.reg;
-        cb.offset = @intCast(a.offset);
-    } else {
-        const off = try number(inner);
-        if (off < 0 or off > 0xffff) return error.OutOfRange;
-        cb.offset = @intCast(off);
-    }
+    var a = Addr{};
+    try addrInner(inner, &a);
+    if (a.wide or a.offset < 0 or a.desc != null) return error.Syntax;
+    if (a.ureg) |u| {
+        if (a.reg != RZ) return error.Syntax;
+        cb.reg = u;
+        cb.ureg = true;
+    } else cb.reg = a.reg;
+    cb.offset = @intCast(a.offset);
     return cb;
 }
 
@@ -426,6 +470,11 @@ pub fn parseOperand(text: []const u8) Error!Operand {
         }
         return error.Unknown;
     }
+    if (t.len >= 2 and t.len <= 3 and t[0] == 'B' and std.ascii.isDigit(t[1])) {
+        const n = std.fmt.parseInt(u8, t[1..], 10) catch return error.Syntax;
+        if (n > 15) return error.OutOfRange;
+        return .{ .barrier = n };
+    }
     var neg = false;
     var not = false;
     var abs = false;
@@ -435,6 +484,14 @@ pub fn parseOperand(text: []const u8) Error!Operand {
     } else if (t[0] == '!') {
         not = true;
         t = t[1..];
+    }
+    var sel: Sel = .none;
+    for (SEL_NAMES[1..], 1..) |name, i| {
+        if (std.mem.endsWith(u8, t, name)) {
+            sel = @enumFromInt(i);
+            t = t[0 .. t.len - name.len];
+            break;
+        }
     }
     var reuse = false;
     if (std.mem.endsWith(u8, t, ".reuse")) {
@@ -452,23 +509,23 @@ pub fn parseOperand(text: []const u8) Error!Operand {
         t = t[0 .. t.len - 6];
     }
     if (std.mem.startsWith(u8, t, "c[")) {
-        if (not or reuse) return error.Syntax;
+        if (not or reuse or sel != .none) return error.Syntax;
         var cb = try cbufOf(t);
         cb.neg = neg;
         cb.abs = abs;
         return .{ .cbuf = cb };
     }
     if (predName(t)) |p| {
-        if (neg or abs or reuse) return error.Syntax;
+        if (neg or abs or reuse or sel != .none) return error.Syntax;
         const v = Pred{ .n = p.n, .not = not };
         return if (p.uniform) .{ .upred = v } else .{ .pred = v };
     }
     if (regName(t)) |r| {
         if (not) return error.Syntax;
-        const v = Reg{ .n = r.n, .neg = neg, .abs = abs, .reuse = reuse };
+        const v = Reg{ .n = r.n, .neg = neg, .abs = abs, .reuse = reuse, .sel = sel };
         return if (r.uniform) .{ .ugpr = v } else .{ .gpr = v };
     }
-    if (not or abs or reuse or neg) return error.Syntax;
+    if (not or abs or reuse or neg or sel != .none) return error.Syntax;
     // (a number: a leading - stays in the text)
     return .{ .num = std.mem.trim(u8, text, " ") };
 }
@@ -492,7 +549,7 @@ pub fn parse(line: []const u8) Error!Instr {
             g = g[1..];
         }
         const p = predName(g) orelse return error.Syntax;
-        if (p.uniform) return error.Unknown;
+        in.uguard = p.uniform;
         in.guard.n = p.n;
         t = std.mem.trimStart(u8, t[end + 1 ..], " ");
     }
@@ -508,22 +565,25 @@ pub fn parse(line: []const u8) Error!Instr {
     }
     const rest = std.mem.trim(u8, t[sp..], " ");
     if (rest.len == 0) return in;
-    // Operands split on commas outside brackets.
+    // Operands split on commas outside brackets (and before a target that
+    // follows a register without one: RET.REL.NODEC R12 `(kernel)).
     var depth: usize = 0;
     var start: usize = 0;
     var i: usize = 0;
     while (i <= rest.len) : (i += 1) {
         const ch: u8 = if (i < rest.len) rest[i] else ',';
+        const split_target = ch == ' ' and depth == 0 and i + 1 < rest.len and rest[i + 1] == '`' and
+            std.mem.trim(u8, rest[start..i], " ").len > 0;
         switch (ch) {
             '[', '(' => depth += 1,
             ']', ')' => depth -|= 1,
-            ',' => if (depth == 0) {
-                if (in.n_ops == MAX_OPERANDS) return error.Syntax;
-                in.ops[in.n_ops] = try parseOperand(rest[start..i]);
-                in.n_ops += 1;
-                start = i + 1;
-            },
             else => {},
+        }
+        if ((ch == ',' and depth == 0) or split_target) {
+            if (in.n_ops == MAX_OPERANDS) return error.Syntax;
+            in.ops[in.n_ops] = try parseOperand(rest[start..i]);
+            in.n_ops += 1;
+            start = i + 1;
         }
     }
     return in;
@@ -556,10 +616,12 @@ fn immValue(o: Operand, kind: ImmKind, n: u7) Error!u64 {
             .f32 => blk: {
                 if (std.mem.startsWith(u8, t, "0x")) break :blk std.fmt.parseInt(u32, t[2..], 16) catch return error.Syntax;
                 const f = floatOf(t) orelse return error.Syntax;
+                if (std.math.isNan(f)) break :blk if (std.math.signbit(f)) 0xffc00000 else 0x7fffffff;
                 break :blk @as(u32, @bitCast(@as(f32, @floatCast(f))));
             },
             .f16 => blk: {
                 const f = floatOf(t) orelse return error.Syntax;
+                if (std.math.isNan(f)) break :blk if (std.math.signbit(f)) 0xfe00 else 0x7fff;
                 break :blk @as(u16, @bitCast(@as(f16, @floatCast(f))));
             },
         },
@@ -617,10 +679,12 @@ const Cx = struct {
         cx.in.n_ops += 1;
     }
 
+    /// Encoding: the first modifier not yet matched that is `m`, matched.
     fn hasMod(cx: *Cx, m: []const u8) bool {
         for (cx.in.mods[0..cx.in.n_mods], 0..) |x, i| {
-            if (std.mem.eql(u8, x, m)) {
-                cx.used |= @as(u32, 1) << @intCast(i);
+            const bit = @as(u32, 1) << @intCast(i);
+            if (cx.used & bit == 0 and std.mem.eql(u8, x, m)) {
+                cx.used |= bit;
                 return true;
             }
         }
@@ -633,33 +697,50 @@ const Cx = struct {
         cx.in.n_mods += 1;
     }
 
-    /// A modifier field: value v prints as names[v] ("" prints nothing; the
-    /// first "" is what encoding puts when none of the names is written).
-    fn mod(cx: *Cx, at: u7, n: u7, names: []const []const u8) Error!u64 {
+    /// A modifier field, its value's bits at `bits` (low first): value v
+    /// prints as names[v]; "" prints nothing (the first "" is what encoding
+    /// puts when no name is written), "?" is no form this module knows.
+    /// Encoding takes the first modifier not yet matched that is one of the
+    /// names: the fields are visited in nvdisasm's order, so repeated names
+    /// (IDP.4A.S8.S8) go to their fields in turn.
+    fn modBits(cx: *Cx, bits: []const u7, names: []const []const u8) Error!u64 {
         if (cx.enc()) {
             var pick: ?usize = null;
-            for (names, 0..) |name, i| {
-                if (name.len > 0 and cx.hasMod(name)) {
-                    pick = i;
-                    break;
+            outer: for (cx.in.mods[0..cx.in.n_mods], 0..) |x, i| {
+                const bit = @as(u32, 1) << @intCast(i);
+                if (cx.used & bit != 0) continue;
+                for (names, 0..) |name, v| {
+                    if (name.len > 0 and !eql(name, "?") and eql(name, x)) {
+                        cx.used |= bit;
+                        pick = v;
+                        break :outer;
+                    }
                 }
             }
             if (pick == null) {
-                for (names, 0..) |name, i| {
+                for (names, 0..) |name, v| {
                     if (name.len == 0) {
-                        pick = i;
+                        pick = v;
                         break;
                     }
                 }
             }
             const v = pick orelse return error.Unknown;
-            cx.w.put(at, n, v);
+            for (bits, 0..) |at, k| cx.w.bit(at, (v >> @intCast(k)) & 1 == 1);
             return v;
         }
-        const v = cx.get(at, n);
-        if (v >= names.len) return error.Unknown;
+        var v: u64 = 0;
+        for (bits, 0..) |at, k| v |= cx.get(at, 1) << @intCast(k);
+        if (v >= names.len or eql(names[v], "?")) return error.Unknown;
         if (names[v].len > 0) try cx.addMod(names[v]);
         return v;
+    }
+
+    /// A modifier field of `n` bits at `at`.
+    fn mod(cx: *Cx, at: u7, n: u7, names: []const []const u8) Error!u64 {
+        var bits: [8]u7 = undefined;
+        for (0..n) |k| bits[k] = at + @as(u7, @intCast(k));
+        return cx.modBits(bits[0..n], names);
     }
 
     /// A one-bit modifier, printed when set.
@@ -682,41 +763,63 @@ const Cx = struct {
         return on;
     }
 
-    /// Whether a modifier is in force (decoding: `on`), before its place in
-    /// nvdisasm's order is reached: what an operand's form depends on.
-    fn sense(cx: *Cx, name: []const u8, on: bool) bool {
-        return if (cx.enc()) cx.hasMod(name) else on;
+    /// Whether a modifier is written (decoding: `on`), before its field's
+    /// place in nvdisasm's order is reached: what a form or an immediate's
+    /// reading depends on. Nothing is matched.
+    fn sense(cx: *const Cx, name: []const u8, on: bool) bool {
+        if (!cx.enc()) return on;
+        for (cx.in.mods[0..cx.in.n_mods]) |x| {
+            if (eql(x, name)) return true;
+        }
+        return false;
     }
 
     // Operands -------------------------------------------------------------
 
-    /// A general register in an 8-bit field, without modifiers.
+    /// A general (or uniform) register in an 8-bit field, without
+    /// modifiers.
+    fn regOf(cx: *Cx, at: u7, uniform: bool) Error!u8 {
+        if (cx.enc()) {
+            const o = try cx.take();
+            const r = switch (o) {
+                .gpr => |g| if (uniform) return error.Syntax else g,
+                .ugpr => |g| if (uniform) g else return error.Syntax,
+                else => return error.Syntax,
+            };
+            if (r.neg or r.abs or r.reuse or r.sel != .none) return error.Syntax;
+            cx.w.put(at, 8, r.n);
+            return r.n;
+        }
+        const n: u8 = @intCast(cx.get(at, 8));
+        try cx.push(if (uniform) .{ .ugpr = .{ .n = n } } else .{ .gpr = .{ .n = n } });
+        return n;
+    }
+
     fn reg(cx: *Cx, at: u7) Error!u8 {
+        return cx.regOf(at, false);
+    }
+
+    fn ureg(cx: *Cx, at: u7) Error!u8 {
+        return cx.regOf(at, true);
+    }
+
+    /// A register read at a fixed place (not an ALU slot): its `.reuse` bit
+    /// at `slot`, and a selector nvdisasm always prints (IMMA's .ROW).
+    fn srcReg(cx: *Cx, at: u7, slot: ?u7, decor: Sel) Error!void {
         if (cx.enc()) {
             const o = try cx.take();
             if (o != .gpr) return error.Syntax;
             const r = o.gpr;
-            if (r.neg or r.abs or r.reuse) return error.Syntax;
+            if (r.neg or r.abs or (r.reuse and slot == null) or (r.sel != .none and r.sel != decor)) return error.Syntax;
             cx.w.put(at, 8, r.n);
-            return r.n;
+            if (slot) |s| cx.w.bit(s, r.reuse);
+            return;
         }
-        const n: u8 = @intCast(cx.get(at, 8));
-        try cx.push(.{ .gpr = .{ .n = n } });
-        return n;
-    }
-
-    fn ureg(cx: *Cx, at: u7) Error!u8 {
-        if (cx.enc()) {
-            const o = try cx.take();
-            if (o != .ugpr) return error.Syntax;
-            const r = o.ugpr;
-            if (r.neg or r.abs or r.reuse) return error.Syntax;
-            cx.w.put(at, 8, r.n);
-            return r.n;
-        }
-        const n: u8 = @intCast(cx.get(at, 8));
-        try cx.push(.{ .ugpr = .{ .n = n } });
-        return n;
+        try cx.push(.{ .gpr = .{
+            .n = @intCast(cx.get(at, 8)),
+            .reuse = if (slot) |s| cx.get(s, 1) == 1 else false,
+            .sel = decor,
+        } });
     }
 
     /// A predicate written (no negation) in a 3-bit field.
@@ -732,6 +835,22 @@ const Cx = struct {
         return p.n;
     }
 
+    /// A predicate written that nvdisasm prints only when it is not PT
+    /// (LOP3's, LEA's carry out).
+    fn optPred(cx: *Cx, at: u7, uniform: bool) Error!void {
+        if (cx.enc()) {
+            if (cx.peek()) |o| {
+                if ((o == .pred and !uniform) or (o == .upred and uniform)) {
+                    _ = try cx.pred(at, uniform);
+                    return;
+                }
+            }
+            cx.w.put(at, 3, PT);
+            return;
+        }
+        if (cx.get(at, 3) != PT) _ = try cx.pred(at, uniform);
+    }
+
     /// A predicate read: three bits, its negation in the fourth.
     fn predNot(cx: *Cx, at: u7, uniform: bool) Error!Pred {
         if (cx.enc()) {
@@ -743,6 +862,22 @@ const Cx = struct {
         const p = Pred{ .n = @intCast(cx.get(at, 3)), .not = cx.get(at + 3, 1) == 1 };
         try cx.push(if (uniform) .{ .upred = p } else .{ .pred = p });
         return p;
+    }
+
+    /// A predicate read that nvdisasm prints only when it is not PT (a
+    /// branch's condition).
+    fn optPredNot(cx: *Cx, at: u7, uniform: bool) Error!void {
+        if (cx.enc()) {
+            if (cx.peek()) |o| {
+                if ((o == .pred and !uniform) or (o == .upred and uniform)) {
+                    _ = try cx.predNot(at, uniform);
+                    return;
+                }
+            }
+            cx.w.put(at, 4, PT);
+            return;
+        }
+        if (cx.get(at, 4) != PT) _ = try cx.predNot(at, uniform);
     }
 
     /// An immediate operand in an `n`-bit field.
@@ -769,33 +904,65 @@ const Cx = struct {
         try cx.push(.{ .sreg = n });
     }
 
-    /// A branch target, in instruction words of 4 bytes from the next
-    /// instruction: the low 8 bits in 16..23, the rest in 34..81 (sm_100's
-    /// split).
+    /// A convergence barrier register in a 4-bit field.
+    fn barrier(cx: *Cx, at: u7) Error!void {
+        if (cx.enc()) {
+            const o = try cx.take();
+            if (o != .barrier) return error.Syntax;
+            cx.w.put(at, 4, o.barrier);
+            return;
+        }
+        try cx.push(.{ .barrier = @intCast(cx.get(at, 4)) });
+    }
+
+    /// A target's distance in instruction words of 4 bytes from the next
+    /// instruction (encoding: from the label's address or a .target).
+    fn relTo(cx: *Cx) Error!i64 {
+        const to: u64 = switch (try cx.take()) {
+            .label => cx.target orelse return error.NoTarget,
+            .target => |t| t,
+            else => return error.Syntax,
+        };
+        const d = @as(i64, @intCast(to)) - @as(i64, @intCast(cx.pc + 16));
+        if (@mod(d, 4) != 0) return error.OutOfRange;
+        return @divExact(d, 4);
+    }
+
+    fn pushTarget(cx: *Cx, rel: i64) Error!void {
+        const to = @as(i64, @intCast(cx.pc + 16)) + rel * 4;
+        if (to < 0) return error.Unknown;
+        try cx.push(.{ .target = @intCast(to) });
+    }
+
+    /// A branch target: the low 8 bits of the distance in 16..23, the rest
+    /// in 34..81 (sm_100's split).
     fn branch(cx: *Cx) Error!void {
         if (cx.enc()) {
-            const to: u64 = switch (try cx.take()) {
-                .label => cx.target orelse return error.NoTarget,
-                .target => |t| t,
-                else => return error.Syntax,
-            };
-            const d = @as(i64, @intCast(to)) - @as(i64, @intCast(cx.pc + 16));
-            if (@mod(d, 4) != 0) return error.OutOfRange;
-            const bits: u64 = @bitCast(@divExact(d, 4));
+            const bits: u64 = @bitCast(try cx.relTo());
             cx.w.put(16, 8, bits & 0xff);
             cx.w.put(34, 48, bits >> 8);
             return;
         }
         const raw: u64 = cx.get(16, 8) | cx.get(34, 48) << 8;
         // (56 bits, signed)
-        const rel: i64 = @as(i64, @bitCast(raw << 8)) >> 8;
-        const to = @as(i64, @intCast(cx.pc + 16)) + rel * 4;
-        if (to < 0) return error.Unknown;
-        try cx.push(.{ .target = @intCast(to) });
+        try cx.pushTarget(@as(i64, @bitCast(raw << 8)) >> 8);
     }
 
-    /// A memory address: its register at 24 (with `wide_at`, .64 allowed),
-    /// a signed offset, a descriptor's uniform register when `desc_at`.
+    /// BSSY's target: the distance in 34..63.
+    fn rel30(cx: *Cx) Error!void {
+        if (cx.enc()) {
+            const rel = try cx.relTo();
+            if (rel < -(1 << 29) or rel >= (1 << 29)) return error.OutOfRange;
+            cx.w.put(34, 30, @as(u64, @bitCast(rel)));
+            return;
+        }
+        const raw = cx.get(34, 30);
+        try cx.pushTarget(@as(i64, @bitCast(raw << 34)) >> 34);
+    }
+
+    /// A memory address: its register at 24 (with `wide`, .64 allowed), a
+    /// signed offset, a descriptor's uniform register at `desc`, a uniform
+    /// register added at `ureg` (present when bit 91 is set).
     fn addr(cx: *Cx, a: AddrForm) Error!Addr {
         if (cx.enc()) {
             const o = try cx.take();
@@ -803,9 +970,14 @@ const Cx = struct {
             const x = o.addr;
             if ((x.desc != null) != (a.desc != null)) return error.Syntax;
             if (x.wide and a.wide == null) return error.Syntax;
+            if (x.ureg != null and a.ureg == null) return error.Syntax;
             cx.w.put(24, 8, x.reg);
             if (a.wide) |b| cx.w.bit(b, x.wide);
             if (a.desc) |d| cx.w.put(d, 8, x.desc.?);
+            if (a.ureg) |u| {
+                cx.w.put(u, 8, x.ureg orelse 0);
+                cx.w.bit(91, x.ureg != null);
+            }
             const lim = @as(i64, 1) << @intCast(a.off_n - 1);
             if (x.offset < -lim or x.offset >= lim) return error.OutOfRange;
             cx.w.put(a.off_at, a.off_n, @as(u64, @bitCast(@as(i64, x.offset))));
@@ -814,6 +986,9 @@ const Cx = struct {
         var x = Addr{ .reg = @intCast(cx.get(24, 8)) };
         if (a.wide) |b| x.wide = cx.get(b, 1) == 1;
         if (a.desc) |d| x.desc = @intCast(cx.get(d, 8));
+        if (a.ureg) |u| {
+            if (cx.get(91, 1) == 1) x.ureg = @intCast(cx.get(u, 8));
+        }
         const raw = cx.get(a.off_at, a.off_n);
         const shift: u6 = @intCast(64 - @as(u7, a.off_n));
         x.offset = @intCast(@as(i64, @bitCast(raw << shift)) >> shift);
@@ -825,6 +1000,7 @@ const Cx = struct {
 const AddrForm = struct {
     desc: ?u7 = null,
     wide: ?u7 = null,
+    ureg: ?u7 = null,
     off_at: u7 = 40,
     off_n: u7 = 24,
 };
@@ -839,12 +1015,16 @@ fn predIn(o: Operand, uniform: bool) Error!Pred {
 
 // ── ALU sources ─────────────────────────────────────────────────────────────
 
+/// What a register's two selector bits mean in an op's source slots.
+const SelKind = enum { none, half, byte };
+
 /// What a printed ALU source may be: how an immediate in its place reads,
-/// and whether it takes - and |..|.
+/// whether it takes - and |..|, what its selector bits mean.
 const SrcSpec = struct {
     imm: ImmKind = .hex,
     neg: bool = false,
     abs: bool = false,
+    sel: SelKind = .none,
 };
 
 const Slot = union(enum) {
@@ -857,6 +1037,13 @@ const Slot = union(enum) {
 
 const INT: Slot = .{ .src = .{} };
 const SINT: Slot = .{ .src = .{ .imm = .signed } };
+const SNEG: Slot = .{ .src = .{ .imm = .signed, .neg = true } };
+const F32_NEG: SrcSpec = .{ .imm = .f32, .neg = true };
+const F32_ABS: SrcSpec = .{ .imm = .f32, .neg = true, .abs = true };
+const FNEG: Slot = .{ .src = F32_NEG };
+const FABS: Slot = .{ .src = F32_ABS };
+const HALF_SPEC: SrcSpec = .{ .imm = .f16, .neg = true, .abs = true, .sel = .half };
+const HALF: Slot = .{ .src = HALF_SPEC };
 
 const Alu = struct {
     op: u9,
@@ -866,7 +1053,7 @@ const Alu = struct {
     b: Slot = .none,
     c: Slot = .none,
     /// One printed second source in b's place when a register, else in
-    /// c's (FADD's).
+    /// c's (FADD's, HADD2's); its `.reuse` is c's slot's either way.
     bc: ?SrcSpec = null,
     /// fp16 ops: c's sign bits at 83 and 84.
     half: bool = false,
@@ -876,6 +1063,17 @@ const Alu = struct {
 const SLOT_A: u7 = 122;
 const SLOT_B: u7 = 123;
 const SLOT_C: u7 = 124;
+
+/// A source register's place: the register, its sign bits, its `.reuse`
+/// bit and its selector's two bits.
+const RegAt = struct { at: u7, abs: u7, neg: u7, slot: u7, sel: u7 };
+
+const AT_A = RegAt{ .at = 24, .abs = 73, .neg = 72, .slot = SLOT_A, .sel = 74 };
+const AT_B = RegAt{ .at = 32, .abs = 62, .neg = 63, .slot = SLOT_B, .sel = 60 };
+
+fn atC(half: bool) RegAt {
+    return .{ .at = 64, .abs = if (half) 83 else 74, .neg = if (half) 84 else 75, .slot = SLOT_C, .sel = 81 };
+}
 
 const Src = union(enum) {
     none,
@@ -887,39 +1085,82 @@ const Src = union(enum) {
     cbuf: CBuf,
 };
 
-fn srcIn(cx: *Cx, o: Operand, s: SrcSpec, uniform: bool) Error!Src {
+/// A source's selector as its two bits.
+fn selBits(r: Reg, kind: SelKind) Error!u2 {
+    return switch (kind) {
+        .none => if (r.sel == .none) 0 else error.Syntax,
+        .half => switch (r.sel) {
+            .none => 0,
+            .h0_h0 => 2,
+            .h1_h1 => 3,
+            else => error.Syntax,
+        },
+        .byte => switch (r.sel) {
+            .none => 0,
+            .b1 => 1,
+            .b2 => 2,
+            .b3 => 3,
+            else => error.Syntax,
+        },
+    };
+}
+
+fn selOf(v: u64, kind: SelKind) Error!Sel {
+    return switch (kind) {
+        .none => .none,
+        .half => switch (v) {
+            0 => .none,
+            2 => .h0_h0,
+            3 => .h1_h1,
+            else => error.Unknown,
+        },
+        .byte => switch (v) {
+            0 => .none,
+            1 => .b1,
+            2 => .b2,
+            else => .b3,
+        },
+    };
+}
+
+/// A source as encoding reads it, with the bits its selector takes.
+const In = struct { src: Src, sel: u2 = 0 };
+
+fn srcIn(cx: *Cx, o: Operand, s: SrcSpec, uniform: bool) Error!In {
     switch (o) {
         .gpr, .ugpr => |r| {
             if ((r.neg and !s.neg) or (r.abs and !s.abs)) return error.Syntax;
+            const sel = try selBits(r, s.sel);
             if ((o == .gpr) == uniform) {
                 if (uniform) return error.Syntax;
-                return .{ .ureg = r };
+                return .{ .src = .{ .ureg = r }, .sel = sel };
             }
-            return .{ .reg = r };
+            return .{ .src = .{ .reg = r }, .sel = sel };
         },
         .cbuf => |cb| {
             if (uniform or cb.reg != RZ or (cb.neg and !s.neg) or (cb.abs and !s.abs)) return error.Syntax;
             if (cb.offset > 0xffff) return error.OutOfRange;
-            return .{ .cbuf = cb };
+            return .{ .src = .{ .cbuf = cb } };
         },
         .num, .imm => {
             if (s.imm == .f16) {
                 // (two operands: the high half, then the low)
                 const h = try immValue(o, .f16, 16);
                 const l = try immValue(try cx.take(), .f16, 16);
-                return .{ .imm = @intCast(h << 16 | l) };
+                return .{ .src = .{ .imm = @intCast(h << 16 | l) } };
             }
-            return .{ .imm = @intCast(try immValue(o, s.imm, 32)) };
+            return .{ .src = .{ .imm = @intCast(try immValue(o, s.imm, 32)) } };
         },
         else => return error.Syntax,
     }
 }
 
-fn putReg(w: *Word, at: u7, r: Reg, abs_bit: u7, neg_bit: u7, slot: u7) void {
-    w.put(at, 8, r.n);
-    if (r.abs) w.bit(abs_bit, true);
-    if (r.neg) w.bit(neg_bit, true);
-    if (r.reuse) w.bit(slot, true);
+fn putReg(w: *Word, f: RegAt, r: Reg, sel: u2) void {
+    w.put(f.at, 8, r.n);
+    if (r.abs) w.bit(f.abs, true);
+    if (r.neg) w.bit(f.neg, true);
+    if (r.reuse) w.bit(f.slot, true);
+    if (sel != 0) w.put(f.sel, 2, sel);
 }
 
 fn putCbuf(w: *Word, cb: CBuf) void {
@@ -935,45 +1176,46 @@ fn putCbuf(w: *Word, cb: CBuf) void {
 /// uniform). A uniform op's registers are all uniform, and it has no
 /// constant or mixed forms.
 fn alu(cx: *Cx, d: Alu) Error!void {
-    const c_abs: u7 = if (d.half) 83 else 74;
-    const c_neg: u7 = if (d.half) 84 else 75;
-    if (!cx.enc()) return aluDecode(cx, d, c_abs, c_neg);
-    var a: Src = .none;
-    var b: Src = .none;
-    var c: Src = .none;
+    const at_c = atC(d.half);
+    if (!cx.enc()) return aluDecode(cx, d, at_c);
+    var a: In = .{ .src = .none };
+    var b: In = .{ .src = .none };
+    var c: In = .{ .src = .none };
     switch (d.a) {
         .none => {},
-        .rz => a = .{ .reg = .{ .n = RZ } },
+        .rz => a = .{ .src = .{ .reg = .{ .n = RZ } } },
         .src => |s| a = try srcIn(cx, try cx.take(), s, d.uniform),
     }
-    if (a != .none and a != .reg) return error.Syntax;
+    if (a.src != .none and a.src != .reg) return error.Syntax;
     switch (d.b) {
         .none => {},
-        .rz => b = .{ .reg = .{ .n = RZ } },
+        .rz => b = .{ .src = .{ .reg = .{ .n = RZ } } },
         .src => |s| b = try srcIn(cx, try cx.take(), s, d.uniform),
     }
+    var at_b = AT_B;
     if (d.bc) |s| {
         const x = try srcIn(cx, try cx.take(), s, d.uniform);
-        if (x == .reg) b = x else c = x;
+        if (x.src == .reg) b = x else c = x;
+        at_b.slot = SLOT_C;
     }
     switch (d.c) {
         .none => {},
-        .rz => c = .{ .reg = .{ .n = RZ } },
+        .rz => c = .{ .src = .{ .reg = .{ .n = RZ } } },
         .src => |s| c = try srcIn(cx, try cx.take(), s, d.uniform),
     }
     const w = &cx.w;
-    if (a == .reg) putReg(w, 24, a.reg, 73, 72, SLOT_A);
-    const form: u3 = switch (c) {
+    if (a.src == .reg) putReg(w, AT_A, a.src.reg, a.sel);
+    const form: u3 = switch (c.src) {
         .none, .reg => blk: {
-            if (c == .reg) putReg(w, 64, c.reg, c_abs, c_neg, SLOT_C);
-            break :blk switch (b) {
+            if (c.src == .reg) putReg(w, at_c, c.src.reg, c.sel);
+            break :blk switch (b.src) {
                 .none => 1,
                 .reg => |r| inner: {
-                    putReg(w, 32, r, 62, 63, SLOT_B);
+                    putReg(w, at_b, r, b.sel);
                     break :inner 1;
                 },
                 .ureg => |r| inner: {
-                    putReg(w, 32, r, 62, 63, SLOT_B);
+                    putReg(w, AT_B, r, b.sel);
                     w.bit(91, true);
                     break :inner 6;
                 },
@@ -988,14 +1230,14 @@ fn alu(cx: *Cx, d: Alu) Error!void {
             };
         },
         .ureg, .imm, .cbuf => blk: {
-            switch (b) {
+            switch (b.src) {
                 .none => {},
-                .reg => |r| putReg(w, 64, r, c_abs, c_neg, SLOT_C),
+                .reg => |r| putReg(w, at_c, r, b.sel),
                 else => return error.Unknown,
             }
-            switch (c) {
+            switch (c.src) {
                 .ureg => |r| {
-                    putReg(w, 32, r, 62, 63, SLOT_B);
+                    putReg(w, AT_B, r, c.sel);
                     w.bit(91, true);
                     break :blk 7;
                 },
@@ -1019,9 +1261,9 @@ fn alu(cx: *Cx, d: Alu) Error!void {
 
 const Where = enum { reg32, ureg32, imm32, cbuf32, reg64 };
 
-fn aluDecode(cx: *Cx, d: Alu, c_abs: u7, c_neg: u7) Error!void {
+fn aluDecode(cx: *Cx, d: Alu, at_c: RegAt) Error!void {
     const form = cx.get(9, 3);
-    if (d.a == .src) try pushSrc(cx, .{ .at = 24, .abs = 73, .neg = 72, .slot = SLOT_A }, d.a.src, d.uniform);
+    if (d.a == .src) try pushSrc(cx, AT_A, d.a.src, d.uniform);
     var b_at: Where = undefined;
     var c_at: Where = undefined;
     switch (form) {
@@ -1058,13 +1300,16 @@ fn aluDecode(cx: *Cx, d: Alu, c_abs: u7, c_neg: u7) Error!void {
     if (d.uniform and form != 1 and form != 2 and form != 4) return error.Unknown;
     if (d.bc) |s| {
         const at = if (form == 1 or form == 4 or form == 5 or form == 6) b_at else c_at;
-        return pushWhere(cx, at, s, d.uniform, c_abs, c_neg);
+        if (at == .reg32) {
+            var f = AT_B;
+            f.slot = SLOT_C;
+            return pushSrc(cx, f, s, d.uniform);
+        }
+        return pushWhere(cx, at, s, d.uniform, at_c);
     }
-    if (d.b == .src) try pushWhere(cx, b_at, d.b.src, d.uniform, c_abs, c_neg);
-    if (d.c == .src) try pushWhere(cx, c_at, d.c.src, d.uniform, c_abs, c_neg);
+    if (d.b == .src) try pushWhere(cx, b_at, d.b.src, d.uniform, at_c);
+    if (d.c == .src) try pushWhere(cx, c_at, d.c.src, d.uniform, at_c);
 }
-
-const RegAt = struct { at: u7, abs: u7, neg: u7, slot: u7 };
 
 fn pushSrc(cx: *Cx, f: RegAt, s: SrcSpec, uniform: bool) Error!void {
     const r = Reg{
@@ -1072,15 +1317,16 @@ fn pushSrc(cx: *Cx, f: RegAt, s: SrcSpec, uniform: bool) Error!void {
         .abs = s.abs and cx.get(f.abs, 1) == 1,
         .neg = s.neg and cx.get(f.neg, 1) == 1,
         .reuse = cx.get(f.slot, 1) == 1,
+        .sel = try selOf(if (s.sel != .none) cx.get(f.sel, 2) else 0, s.sel),
     };
     try cx.push(if (uniform) .{ .ugpr = r } else .{ .gpr = r });
 }
 
-fn pushWhere(cx: *Cx, at: Where, s: SrcSpec, uniform: bool, c_abs: u7, c_neg: u7) Error!void {
+fn pushWhere(cx: *Cx, at: Where, s: SrcSpec, uniform: bool, at_c: RegAt) Error!void {
     switch (at) {
-        .reg32 => try pushSrc(cx, .{ .at = 32, .abs = 62, .neg = 63, .slot = SLOT_B }, s, uniform),
-        .ureg32 => try pushSrc(cx, .{ .at = 32, .abs = 62, .neg = 63, .slot = SLOT_B }, s, true),
-        .reg64 => try pushSrc(cx, .{ .at = 64, .abs = c_abs, .neg = c_neg, .slot = SLOT_C }, s, uniform),
+        .reg32 => try pushSrc(cx, AT_B, s, uniform),
+        .ureg32 => try pushSrc(cx, AT_B, s, true),
+        .reg64 => try pushSrc(cx, at_c, s, uniform),
         .imm32 => {
             const v = cx.get(32, 32);
             if (s.imm == .f16) {
@@ -1100,15 +1346,33 @@ fn pushWhere(cx: *Cx, at: Where, s: SrcSpec, uniform: bool, c_abs: u7, c_neg: u7
 // ── Modifier tables ─────────────────────────────────────────────────────────
 
 /// Loads' and stores' sizes (73..75).
-const SIZES = [_][]const u8{ "U8", "S8", "U16", "S16", "", "64", "128", "" };
+const SIZES = [_][]const u8{ "U8", "S8", "U16", "S16", "", "64", "128", "?" };
+/// Global memory's ordering (77..80): weak, or .CONSTANT (read-only for
+/// the kernel: ld.global.nc).
+const ORDER = [_][]const u8{ "", "?", "?", "?", "CONSTANT" };
 /// ISETP's comparisons (76..78) and how the result joins the accumulator
 /// (74..75).
 const ICMP = [_][]const u8{ "F", "LT", "EQ", "LE", "GT", "NE", "GE", "T" };
-const BOOL = [_][]const u8{ "AND", "OR", "XOR", "" };
+const BOOL = [_][]const u8{ "AND", "OR", "XOR", "?" };
+/// FSETP's comparisons (76..79): ordered, then unordered (NaN true).
+const FCMP = [_][]const u8{ "F", "LT", "EQ", "LE", "GT", "NE", "GE", "NUM", "NAN", "LTU", "EQU", "LEU", "GTU", "NEU", "GEU", "T" };
 /// Rounding (78..79 in float ops).
 const RND = [_][]const u8{ "", "RM", "RP", "RZ" };
+/// Float to integer rounding.
+const FRND = [_][]const u8{ "", "FLOOR", "CEIL", "TRUNC" };
+/// Integer types by size (log2 of bytes) and signedness: index size * 2 +
+/// signed; the second leaves S32 unprinted (F2I's, I2F's default).
+const ITYPES = [_][]const u8{ "U8", "S8", "U16", "S16", "U32", "S32", "U64", "S64" };
+const ITYPES_S32 = [_][]const u8{ "U8", "S8", "U16", "S16", "U32", "", "U64", "S64" };
+/// Float types by size; the second leaves F32 unprinted.
+const FTYPES = [_][]const u8{ "?", "F16", "F32", "F64" };
+const FTYPES_F32 = [_][]const u8{ "?", "F16", "", "F64" };
+/// The special-function unit's functions (74..79).
+const MUFU = [_][]const u8{ "COS", "SIN", "EX2", "LG2", "RCP", "RSQ", "RCP64H", "RSQ64H", "SQRT", "TANH" };
 
 // ── The codecs ──────────────────────────────────────────────────────────────
+
+// Control flow ---------------------------------------------------------------
 
 fn cNop(cx: *Cx) Error!void {
     cx.put(0, 12, 0x918);
@@ -1119,11 +1383,78 @@ fn cExit(cx: *Cx) Error!void {
     cx.put(87, 3, PT);
 }
 
+/// BRA (its condition printed when not PT), or BRA.U on a uniform
+/// predicate.
 fn cBra(cx: *Cx) Error!void {
-    cx.put(0, 12, 0x947);
-    cx.put(87, 3, PT);
+    if (try cx.derived("U", cx.get(0, 12) == 0x547)) {
+        cx.put(0, 12, 0x547);
+        _ = try cx.predNot(24, true);
+        cx.put(32, 1, 1);
+        cx.put(87, 3, PT);
+        cx.put(91, 1, 1);
+    } else {
+        cx.put(0, 12, 0x947);
+        try cx.optPredNot(87, false);
+    }
     try cx.branch();
 }
+
+/// CALL.REL.NOINC `(subroutine): ptxas's call into its own slow paths
+/// (the return address in a register the caller set).
+fn cCall(cx: *Cx) Error!void {
+    try cx.always("REL");
+    try cx.always("NOINC");
+    cx.put(0, 12, 0x944);
+    cx.put(86, 4, 0xf);
+    try cx.branch();
+}
+
+/// RET.REL.NODEC Rn `(kernel): back to the kernel's start plus Rn.
+fn cRet(cx: *Cx) Error!void {
+    try cx.always("REL");
+    try cx.always("NODEC");
+    cx.put(0, 12, 0x950);
+    _ = try cx.reg(24);
+    cx.put(86, 4, 0xf);
+    try cx.branch();
+}
+
+/// BSSY(.RECONVERGENT) Bn, `(join): where the warp's threads meet again.
+fn cBssy(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x945);
+    _ = try cx.flag(73, "RECONVERGENT");
+    try cx.barrier(16);
+    try cx.rel30();
+    cx.put(87, 3, PT);
+}
+
+fn cBsync(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x941);
+    _ = try cx.flag(73, "RECONVERGENT");
+    try cx.barrier(16);
+    cx.put(87, 3, PT);
+}
+
+/// WARPSYNC Rn: the lanes in Rn's mask wait for each other.
+fn cWarpsync(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x348);
+    _ = try cx.reg(24);
+    cx.put(87, 3, PT);
+}
+
+/// BAR.SYNC.DEFER_BLOCKING id(, threads): the CTA's barrier `id` (the
+/// thread count, printed when not 0, in 42..53).
+fn cBar(cx: *Cx) Error!void {
+    cx.put(0, 12, 0xb1d);
+    _ = try cx.mod(77, 2, &.{ "SYNC", "ARV", "RED", "SCAN" });
+    _ = try cx.flag(80, "DEFER_BLOCKING");
+    _ = try cx.imm(54, 4, .hex);
+    if (cx.enc()) {
+        if (cx.peek() != null) _ = try cx.imm(42, 12, .hex);
+    } else if (cx.get(42, 12) != 0) _ = try cx.imm(42, 12, .hex);
+}
+
+// Special registers ------------------------------------------------------------
 
 fn cS2r(cx: *Cx) Error!void {
     cx.put(0, 12, 0x919);
@@ -1137,6 +1468,14 @@ fn cS2ur(cx: *Cx) Error!void {
     try cx.sreg(72);
 }
 
+/// CS2R(.32) Rd, SR: the clock without a scoreboard (.32: one register).
+fn cCs2r(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x805);
+    _ = try cx.mod(80, 1, &.{ "32", "" });
+    _ = try cx.reg(16);
+    try cx.sreg(72);
+}
+
 fn cR2ur(cx: *Cx) Error!void {
     cx.put(0, 12, 0x2ca);
     _ = try cx.ureg(16);
@@ -1144,8 +1483,10 @@ fn cR2ur(cx: *Cx) Error!void {
     cx.put(81, 3, PT);
 }
 
-/// LDC Rd, c[bank][offset] (an index register in 24); LDCU URd, ...
-/// (offset in 37..53).
+// Constant, global, local and shared memory ------------------------------------
+
+/// LDC Rd, c[bank][offset] (a register index in 24); LDCU URd, ...
+/// (offset in 37..53, a uniform index in 24).
 fn cLdc(cx: *Cx, uniform: bool) Error!void {
     _ = try cx.mod(73, 3, &SIZES);
     if (uniform) {
@@ -1162,17 +1503,19 @@ fn cLdc(cx: *Cx, uniform: bool) Error!void {
         const o = try cx.take();
         if (o != .cbuf) return error.Syntax;
         const cb = o.cbuf;
-        if (cb.neg or cb.abs or (uniform and cb.reg != RZ)) return error.Syntax;
+        if (cb.neg or cb.abs or (cb.reg != RZ and cb.ureg != uniform)) return error.Syntax;
         if (cb.offset >> @intCast(off_n) != 0) return error.OutOfRange;
         cx.w.put(24, 8, cb.reg);
         cx.w.put(off_at, off_n, cb.offset);
         cx.w.put(54, 5, cb.bank);
         return;
     }
+    const index: u8 = @intCast(cx.get(24, 8));
     try cx.push(.{ .cbuf = .{
         .bank = @intCast(cx.get(54, 5)),
         .offset = @intCast(cx.get(off_at, off_n)),
-        .reg = if (uniform) RZ else @intCast(cx.get(24, 8)),
+        .reg = index,
+        .ureg = uniform and index != RZ,
     } });
 }
 
@@ -1184,176 +1527,11 @@ fn cLdcU(cx: *Cx) Error!void {
     return cLdc(cx, true);
 }
 
-fn cMov(cx: *Cx) Error!void {
-    if (try cx.derived("64", cx.get(9, 3) == 2)) {
-        // MOV.64 Rd, imm64: the immediate in bits 24..87
-        cx.put(0, 12, 0x402);
-        _ = try cx.reg(16);
-        _ = try cx.imm(24, 64, .hex);
-        return;
-    }
-    _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x002, .b = INT });
-    cx.put(72, 4, 0xf);
-}
-
-fn cUmov(cx: *Cx) Error!void {
-    if (!try cx.derived("64", cx.get(9, 3) == 2)) return error.Unknown;
-    cx.put(0, 12, 0x482);
-    _ = try cx.ureg(16);
-    _ = try cx.imm(24, 64, .hex);
-    cx.put(91, 1, 1); // (a uniform destination)
-}
-
-/// sm_100's two-source add; .64 adds register pairs.
-fn cIadd(cx: *Cx) Error!void {
-    _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x035, .a = .{ .src = .{ .neg = true } }, .b = .{ .src = .{ .imm = .signed, .neg = true } } });
-    _ = try cx.flag(73, "64");
-    cx.put(81, 3, PT);
-    cx.put(87, 4, 0xf); // (!PT)
-}
-
-/// IADD3 Rd, Pcarry0, Pcarry1, a, b, c
-fn cIadd3(cx: *Cx) Error!void {
-    const s = Slot{ .src = .{ .imm = .signed, .neg = true } };
-    _ = try cx.reg(16);
-    _ = try cx.pred(81, false);
-    _ = try cx.pred(84, false);
-    try alu(cx, .{ .op = 0x010, .a = s, .b = s, .c = s });
-    cx.put(77, 4, 0xf);
-    cx.put(87, 4, 0xf);
-}
-
-/// IMAD(.WIDE)(.U32) Rd, a, b, c. nvdisasm names IMAD.U32 by a power of
-/// two and no addend IMAD.SHL; ptxas's moves IMAD.MOV (a and b RZ).
-fn cImad(cx: *Cx) Error!void {
-    const wide = cx.sense("WIDE", cx.get(0, 9) == 0x025);
-    const unsigned = cx.sense("U32", cx.get(73, 1) == 0);
-    const s = Slot{ .src = .{ .imm = if (unsigned) .hex else .signed } };
-    _ = try cx.reg(16);
-    try alu(cx, .{ .op = if (wide) 0x025 else 0x024, .a = s, .b = s, .c = s });
-    cx.put(81, 3, PT);
-    cx.put(87, 4, 0xf);
-    _ = try cx.derived("WIDE", wide);
-    const o = cx.in.ops[0..cx.in.n_ops];
-    const shl = !cx.enc() and !wide and unsigned and o.len == 4 and o[2] == .imm and
-        o[2].imm.bits != 0 and std.math.isPowerOfTwo(o[2].imm.bits) and o[3] == .gpr and o[3].gpr.n == RZ;
-    _ = try cx.derived("SHL", shl);
-    _ = try cx.mod(73, 1, &.{ "U32", "" });
-}
-
-/// ISETP.cmp(.U32).bool Pd, Pd1, a, b, Paccum
-fn cIsetp(cx: *Cx) Error!void {
-    const unsigned = cx.sense("U32", cx.get(73, 1) == 0);
-    _ = try cx.pred(81, false);
-    _ = try cx.pred(84, false);
-    try alu(cx, .{ .op = 0x00c, .a = INT, .b = .{ .src = .{ .imm = if (unsigned) .hex else .signed } } });
-    _ = try cx.predNot(87, false);
-    cx.put(68, 4, PT);
-    _ = try cx.mod(76, 3, &ICMP);
-    _ = try cx.mod(73, 1, &.{ "U32", "" });
-    _ = try cx.mod(74, 2, &BOOL);
-}
-
-/// LOP3.LUT Rd, a, b, c, lut, Psrc
-fn cLop3(cx: *Cx) Error!void {
-    try cx.always("LUT");
-    _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x012, .a = INT, .b = INT, .c = INT });
-    _ = try cx.imm(72, 8, .hex);
-    _ = try cx.predNot(87, false);
-    cx.put(81, 3, PT);
-}
-
-/// PLOP3.LUT Pd0, Pd1, P0, P1, P2, lut0, lut1 (lut0 split: 64..66 and
-/// 72..76)
-fn cPlop3(cx: *Cx) Error!void {
-    try cx.always("LUT");
-    cx.put(0, 12, 0x81c);
-    _ = try cx.pred(81, false);
-    _ = try cx.pred(84, false);
-    _ = try cx.predNot(87, false);
-    _ = try cx.predNot(77, false);
-    _ = try cx.predNot(68, false);
-    if (cx.enc()) {
-        const l0 = try immValue(try cx.take(), .hex, 8);
-        cx.w.put(64, 3, l0 & 7);
-        cx.w.put(72, 5, l0 >> 3);
-    } else try cx.push(.{ .imm = .{ .bits = cx.get(64, 3) | cx.get(72, 5) << 3 } });
-    _ = try cx.imm(16, 8, .hex);
-}
-
-const F32_NEG: SrcSpec = .{ .imm = .f32, .neg = true };
-const F32_ABS: SrcSpec = .{ .imm = .f32, .neg = true, .abs = true };
-
-fn fmods(cx: *Cx) Error!void {
-    _ = try cx.mod(78, 2, &RND);
-    _ = try cx.flag(80, "FTZ");
-    _ = try cx.flag(77, "SAT");
-}
-
-fn cFfma(cx: *Cx) Error!void {
-    _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x023, .a = .{ .src = F32_NEG }, .b = .{ .src = F32_NEG }, .c = .{ .src = F32_NEG } });
-    try fmods(cx);
-}
-
-fn cFadd(cx: *Cx) Error!void {
-    _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x021, .a = .{ .src = F32_ABS }, .bc = F32_ABS });
-    try fmods(cx);
-}
-
-fn cFmul(cx: *Cx) Error!void {
-    _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x020, .a = .{ .src = F32_NEG }, .b = .{ .src = F32_NEG }, .c = .rz });
-    try fmods(cx);
-    cx.put(84, 3, 4);
-}
-
-/// HFMA2 Rd, a, b, c (or c's immediate as two halves)
-fn cHfma2(cx: *Cx) Error!void {
-    const h = Slot{ .src = .{ .imm = .f16, .neg = true, .abs = true } };
-    _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x031, .a = h, .b = h, .c = h, .half = true });
-    _ = try cx.flag(78, "F32");
-    _ = try cx.flag(80, "FTZ");
-}
-
-/// Integer types as conversions name them: the size (log2 of its bytes)
-/// and signedness.
-const ITYPES = [_][]const u8{ "U8", "S8", "U16", "S16", "U32", "S32", "U64", "S64" };
-
-/// I2FP.F32.U32 / .S32 Rd, b (sm_90's integer to float)
-fn cI2fp(cx: *Cx) Error!void {
-    _ = try cx.reg(16);
-    try alu(cx, .{ .op = 0x045, .b = SINT });
-    // (NAK's I2F fields: the destination's size as log2 of its bytes, then
-    // the source signed and its size)
-    _ = try cx.mod(75, 2, &.{ "", "F16", "F32", "F64" });
-    try intType(cx, 74, 84);
-}
-
-/// An integer type split over a signedness bit and a size field.
-fn intType(cx: *Cx, sign_at: u7, size_at: u7) Error!void {
-    if (cx.enc()) {
-        for (ITYPES, 0..) |name, i| {
-            if (cx.hasMod(name)) {
-                cx.w.put(sign_at, 1, i & 1);
-                cx.w.put(size_at, 2, i >> 1);
-                return;
-            }
-        }
-        return error.Unknown;
-    }
-    try cx.addMod(ITYPES[cx.get(size_at, 2) * 2 + cx.get(sign_at, 1)]);
-}
-
 fn cLdg(cx: *Cx) Error!void {
     cx.put(0, 12, 0x981);
     _ = try cx.flag(76, "E");
     _ = try cx.mod(73, 3, &SIZES);
+    _ = try cx.mod(77, 4, &ORDER);
     _ = try cx.reg(16);
     _ = try cx.addr(.{ .desc = 32, .wide = 90 });
     cx.put(72, 1, 1); // (the descriptor is 64 bits)
@@ -1389,6 +1567,553 @@ fn cStl(cx: *Cx) Error!void {
     cx.put(84, 3, 1);
 }
 
+/// LDS Rd, [Ra+URb+offset] (the uniform register in 32 when bit 91 is set).
+fn cLds(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x984);
+    _ = try cx.mod(73, 3, &SIZES);
+    _ = try cx.reg(16);
+    _ = try cx.addr(.{ .ureg = 32 });
+}
+
+/// STS [Ra(+URb)+offset], Rd: with a uniform register the opcode is 0x988
+/// and it sits in 64.
+fn cSts(cx: *Cx) Error!void {
+    const with_u = if (cx.enc()) blk: {
+        const o = cx.peek() orelse return error.Syntax;
+        break :blk o == .addr and o.addr.ureg != null;
+    } else cx.get(0, 12) == 0x988;
+    cx.put(0, 12, if (with_u) 0x988 else 0x388);
+    _ = try cx.mod(73, 3, &SIZES);
+    _ = try cx.addr(if (with_u) .{ .ureg = 64 } else .{});
+    _ = try cx.reg(32);
+}
+
+// Moves and integers -----------------------------------------------------------
+
+fn cMov(cx: *Cx) Error!void {
+    if (try cx.derived("64", cx.get(9, 3) == 2)) {
+        // MOV.64 Rd, imm64: the immediate in bits 24..87
+        cx.put(0, 12, 0x402);
+        _ = try cx.reg(16);
+        _ = try cx.imm(24, 64, .hex);
+        return;
+    }
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x002, .b = INT });
+    cx.put(72, 4, 0xf);
+}
+
+/// UMOV URd, imm or URs (encoded as a warp ALU op with a uniform source);
+/// UMOV.64 URd, imm64.
+fn cUmov(cx: *Cx) Error!void {
+    if (try cx.derived("64", cx.get(9, 3) == 2)) {
+        cx.put(0, 12, 0x482);
+        _ = try cx.ureg(16);
+        _ = try cx.imm(24, 64, .hex);
+        cx.put(91, 1, 1); // (a uniform destination)
+        return;
+    }
+    _ = try cx.ureg(16);
+    try alu(cx, .{ .op = 0x082, .b = INT });
+}
+
+/// sm_100's two-source add; .64 adds register pairs.
+fn cIadd(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x035, .a = .{ .src = .{ .neg = true } }, .b = SNEG });
+    _ = try cx.flag(73, "64");
+    cx.put(81, 3, PT);
+    cx.put(87, 4, 0xf); // (!PT)
+}
+
+/// IADD3 Rd, Pcarry0, Pcarry1, a, b, c (UIADD3 on the uniform datapath).
+fn iadd3(cx: *Cx, uniform: bool) Error!void {
+    _ = try cx.regOf(16, uniform);
+    _ = try cx.pred(81, uniform);
+    _ = try cx.pred(84, uniform);
+    try alu(cx, .{ .op = if (uniform) 0x090 else 0x010, .uniform = uniform, .a = SNEG, .b = SNEG, .c = SNEG });
+    cx.put(77, 4, 0xf);
+    cx.put(87, 4, 0xf);
+}
+
+fn cIadd3(cx: *Cx) Error!void {
+    return iadd3(cx, false);
+}
+
+fn cUiadd3(cx: *Cx) Error!void {
+    return iadd3(cx, true);
+}
+
+/// IMAD(.WIDE)(.HI)(.U32) Rd, a, b, c. nvdisasm names IMAD.U32 by a power
+/// of two and no addend IMAD.SHL.
+fn cImad(cx: *Cx) Error!void {
+    const op9 = cx.get(0, 9);
+    const wide = cx.sense("WIDE", op9 == 0x025);
+    const hi = cx.sense("HI", op9 == 0x027);
+    const unsigned = cx.sense("U32", cx.get(73, 1) == 0);
+    const s = Slot{ .src = .{ .imm = if (unsigned) .hex else .signed } };
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = if (wide) 0x025 else if (hi) 0x027 else 0x024, .a = s, .b = s, .c = s });
+    cx.put(81, 3, PT);
+    cx.put(87, 4, 0xf);
+    _ = try cx.derived("WIDE", wide);
+    _ = try cx.derived("HI", hi);
+    const o = cx.in.ops[0..cx.in.n_ops];
+    const shl = !cx.enc() and !wide and !hi and unsigned and o.len == 4 and o[2] == .imm and
+        o[2].imm.bits != 0 and std.math.isPowerOfTwo(o[2].imm.bits) and o[3] == .gpr and o[3].gpr.n == RZ;
+    _ = try cx.derived("SHL", shl);
+    _ = try cx.mod(73, 1, &.{ "U32", "" });
+}
+
+/// ISETP.cmp(.U32 | .U64 | .S64).bool Pd, Pd1, a, b, Paccum (UISETP on
+/// the uniform datapath).
+fn isetp(cx: *Cx, uniform: bool) Error!void {
+    const signed = if (cx.enc()) !(cx.sense("U32", false) or cx.sense("U64", false)) else cx.get(73, 1) == 1;
+    _ = try cx.pred(81, uniform);
+    _ = try cx.pred(84, uniform);
+    try alu(cx, .{
+        .op = if (uniform) 0x08c else 0x00c,
+        .uniform = uniform,
+        .a = INT,
+        .b = .{ .src = .{ .imm = if (signed) .signed else .hex } },
+    });
+    _ = try cx.predNot(87, uniform);
+    cx.put(68, 4, PT);
+    _ = try cx.mod(76, 3, &ICMP);
+    _ = try cx.modBits(&.{ 73, 80 }, &.{ "U32", "", "U64", "S64" });
+    _ = try cx.mod(74, 2, &BOOL);
+}
+
+fn cIsetp(cx: *Cx) Error!void {
+    return isetp(cx, false);
+}
+
+fn cUisetp(cx: *Cx) Error!void {
+    return isetp(cx, true);
+}
+
+/// LOP3.LUT (Pd,) Rd, a, b, c, lut, Psrc: a predicate result (whether the
+/// result is not zero) is printed first when there is one.
+fn lop3(cx: *Cx, uniform: bool) Error!void {
+    try cx.always("LUT");
+    try cx.optPred(81, uniform);
+    _ = try cx.regOf(16, uniform);
+    try alu(cx, .{ .op = if (uniform) 0x092 else 0x012, .uniform = uniform, .a = INT, .b = INT, .c = INT });
+    _ = try cx.imm(72, 8, .hex);
+    _ = try cx.predNot(87, uniform);
+}
+
+fn cLop3(cx: *Cx) Error!void {
+    return lop3(cx, false);
+}
+
+fn cUlop3(cx: *Cx) Error!void {
+    return lop3(cx, true);
+}
+
+/// PLOP3.LUT Pd0, Pd1, P0, P1, P2, lut0, lut1 (lut0 split: 64..66 and
+/// 72..76); UPLOP3 on uniform predicates.
+fn plop3(cx: *Cx, uniform: bool) Error!void {
+    try cx.always("LUT");
+    cx.put(0, 12, if (uniform) 0x89c else 0x81c);
+    _ = try cx.pred(81, uniform);
+    _ = try cx.pred(84, uniform);
+    _ = try cx.predNot(87, uniform);
+    _ = try cx.predNot(77, uniform);
+    _ = try cx.predNot(68, uniform);
+    if (cx.enc()) {
+        const l0 = try immValue(try cx.take(), .hex, 8);
+        cx.w.put(64, 3, l0 & 7);
+        cx.w.put(72, 5, l0 >> 3);
+    } else try cx.push(.{ .imm = .{ .bits = cx.get(64, 3) | cx.get(72, 5) << 3 } });
+    _ = try cx.imm(16, 8, .hex);
+}
+
+fn cPlop3(cx: *Cx) Error!void {
+    return plop3(cx, false);
+}
+
+fn cUplop3(cx: *Cx) Error!void {
+    return plop3(cx, true);
+}
+
+/// LEA(.HI)(.X)(.SX32) Rd, (Pd,) a, b, (c,) shift(, Pcarry): (a << shift)
+/// + b, or with .HI the high part of (c:a << shift) + b; c is printed with
+/// .HI unless .SX32 (a's sign), the carry in with .X.
+fn lea(cx: *Cx, uniform: bool) Error!void {
+    const hi = cx.sense("HI", cx.get(80, 1) == 1);
+    const x = cx.sense("X", cx.get(74, 1) == 1);
+    const sx = cx.sense("SX32", cx.get(73, 1) == 1);
+    _ = try cx.regOf(16, uniform);
+    try cx.optPred(81, uniform);
+    try alu(cx, .{
+        .op = if (uniform) 0x091 else 0x011,
+        .uniform = uniform,
+        .a = .{ .src = .{ .neg = true } },
+        .b = INT,
+        .c = if (hi and !sx) INT else .rz,
+    });
+    _ = try cx.imm(75, 5, .hex);
+    if (x) _ = try cx.predNot(87, uniform) else cx.put(87, 4, 0xf);
+    _ = try cx.flag(80, "HI");
+    _ = try cx.flag(74, "X");
+    _ = try cx.flag(73, "SX32");
+}
+
+fn cLea(cx: *Cx) Error!void {
+    return lea(cx, false);
+}
+
+fn cUlea(cx: *Cx) Error!void {
+    return lea(cx, true);
+}
+
+/// SHF.L/R(.W).type(.HI) Rd, low, shift, high: a funnel shift.
+fn shf(cx: *Cx, uniform: bool) Error!void {
+    _ = try cx.regOf(16, uniform);
+    try alu(cx, .{ .op = if (uniform) 0x099 else 0x019, .uniform = uniform, .a = INT, .b = INT, .c = INT });
+    _ = try cx.mod(76, 1, &.{ "L", "R" });
+    _ = try cx.flag(75, "W");
+    _ = try cx.mod(73, 2, &.{ "S64", "U64", "S32", "U32" });
+    _ = try cx.flag(80, "HI");
+}
+
+fn cShf(cx: *Cx) Error!void {
+    return shf(cx, false);
+}
+
+fn cUshf(cx: *Cx) Error!void {
+    return shf(cx, true);
+}
+
+/// PRMT Rd, a, selector, c: bytes of c:a picked.
+fn cPrmt(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x016, .a = INT, .b = INT, .c = INT });
+    _ = try cx.mod(72, 3, &.{ "", "F4E", "B4E", "RC8", "ECL", "ECR", "RC16", "?" });
+}
+
+/// SEL(.64) Rd, a, b, P: a where P, else b (.64: register pairs).
+fn cSel(cx: *Cx) Error!void {
+    if (try cx.derived("64", cx.get(0, 12) == 0x607)) {
+        cx.put(0, 12, 0x607);
+        _ = try cx.reg(16);
+        try cx.srcReg(24, SLOT_A, .none);
+        try cx.srcReg(32, SLOT_B, .none);
+    } else {
+        _ = try cx.reg(16);
+        try alu(cx, .{ .op = 0x007, .a = INT, .b = INT });
+    }
+    _ = try cx.predNot(87, false);
+}
+
+/// VIMNMX.S32/U32 Rd, a, b, Pmin: min when the predicate is true, else max.
+fn cVimnmx(cx: *Cx) Error!void {
+    const signed = cx.sense("S32", cx.get(72, 1) == 1);
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x048, .a = INT, .b = .{ .src = .{ .imm = if (signed) .signed else .hex } } });
+    _ = try cx.predNot(87, false);
+    cx.put(81, 6, 0x3f);
+    _ = try cx.mod(72, 1, &.{ "U32", "S32" });
+}
+
+fn oneSource(cx: *Cx, op: u9) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = op, .b = INT });
+}
+
+fn cIabs(cx: *Cx) Error!void {
+    return oneSource(cx, 0x013);
+}
+
+fn cPopc(cx: *Cx) Error!void {
+    return oneSource(cx, 0x109);
+}
+
+fn cBrev(cx: *Cx) Error!void {
+    return oneSource(cx, 0x101);
+}
+
+/// FLO(.U32)(.SH) Rd, b: the highest set bit's position (or, signed, the
+/// highest bit unlike the sign).
+fn cFlo(cx: *Cx) Error!void {
+    try oneSource(cx, 0x100);
+    cx.put(81, 3, PT);
+    _ = try cx.mod(73, 1, &.{ "U32", "" });
+    _ = try cx.flag(74, "SH");
+}
+
+/// IDP.4A.(U8|S8).(U8|S8) Rd, a, b, c: c + the dot of a's and b's bytes.
+fn cIdp(cx: *Cx) Error!void {
+    try cx.always("4A");
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x026, .a = INT, .b = INT, .c = INT });
+    _ = try cx.mod(73, 1, &.{ "U8", "S8" });
+    _ = try cx.mod(74, 1, &.{ "U8", "S8" });
+}
+
+// Warp operations ----------------------------------------------------------------
+
+/// SHFL.op Pin, Rd, Ra, lane, clamp: the lane and the clamp each a
+/// register (32, 64) or an immediate (53..57, 40..52), which the opcode
+/// says.
+fn cShfl(cx: *Cx) Error!void {
+    _ = try cx.mod(58, 2, &.{ "IDX", "UP", "DOWN", "BFLY" });
+    _ = try cx.pred(81, false);
+    _ = try cx.reg(16);
+    _ = try cx.reg(24);
+    var lane_imm: bool = undefined;
+    var c_imm: bool = undefined;
+    if (cx.enc()) {
+        if (cx.in.n_ops != 5) return error.Syntax;
+        lane_imm = cx.in.ops[3] != .gpr;
+        c_imm = cx.in.ops[4] != .gpr;
+    } else {
+        const op = cx.get(0, 12);
+        lane_imm = op == 0x989 or op == 0xf89;
+        c_imm = op == 0x589 or op == 0xf89;
+        if (op != 0x389 and !lane_imm and !c_imm) return error.Unknown;
+    }
+    cx.put(0, 12, if (lane_imm and c_imm) 0xf89 else if (lane_imm) 0x989 else if (c_imm) 0x589 else 0x389);
+    if (lane_imm) _ = try cx.imm(53, 5, .hex) else _ = try cx.reg(32);
+    if (c_imm) _ = try cx.imm(40, 13, .hex) else _ = try cx.reg(64);
+}
+
+/// VOTE.ALL/ANY/EQ (Rd,) Pd, Psrc: the ballot in Rd (printed when not RZ),
+/// the vote in Pd.
+fn cVote(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x806);
+    _ = try cx.mod(72, 2, &.{ "ALL", "ANY", "EQ", "?" });
+    if (cx.enc()) {
+        if (cx.peek()) |o| {
+            if (o == .gpr) _ = try cx.reg(16) else cx.w.put(16, 8, RZ);
+        }
+    } else if (cx.get(16, 8) != RZ) _ = try cx.reg(16);
+    _ = try cx.pred(81, false);
+    _ = try cx.predNot(87, false);
+}
+
+/// VOTEU.ANY URd, UPd, Psrc: the ballot into a uniform register.
+fn cVoteu(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x886);
+    _ = try cx.mod(72, 2, &.{ "ALL", "ANY", "EQ", "?" });
+    _ = try cx.ureg(16);
+    _ = try cx.pred(81, true);
+    _ = try cx.predNot(87, false);
+}
+
+// Floats ---------------------------------------------------------------------------
+
+fn fmods(cx: *Cx) Error!void {
+    _ = try cx.mod(78, 2, &RND);
+    _ = try cx.flag(80, "FTZ");
+    _ = try cx.flag(77, "SAT");
+}
+
+fn ffma(cx: *Cx, uniform: bool) Error!void {
+    _ = try cx.regOf(16, uniform);
+    try alu(cx, .{ .op = if (uniform) 0x055 else 0x023, .uniform = uniform, .a = FNEG, .b = FNEG, .c = FNEG });
+    try fmods(cx);
+}
+
+fn cFfma(cx: *Cx) Error!void {
+    return ffma(cx, false);
+}
+
+fn cUffma(cx: *Cx) Error!void {
+    return ffma(cx, true);
+}
+
+fn cFadd(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x021, .a = FABS, .bc = F32_ABS });
+    try fmods(cx);
+}
+
+fn cFmul(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x020, .a = FNEG, .b = FNEG });
+    try fmods(cx);
+    cx.put(84, 3, 4);
+}
+
+/// FMNMX Rd, a, b, Pmin: min when the predicate is true, else max.
+fn cFmnmx(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x009, .a = FABS, .b = FABS });
+    _ = try cx.predNot(87, false);
+    _ = try cx.flag(80, "FTZ");
+}
+
+/// FSEL Rd, a, b, P: a where P, else b.
+fn cFsel(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x008, .a = FABS, .b = FABS });
+    _ = try cx.predNot(87, false);
+}
+
+/// FSETP.cmp(.FTZ).bool Pd, Pd1, a, b, Paccum
+fn cFsetp(cx: *Cx) Error!void {
+    _ = try cx.pred(81, false);
+    _ = try cx.pred(84, false);
+    try alu(cx, .{ .op = 0x00b, .a = FABS, .b = FABS });
+    _ = try cx.predNot(87, false);
+    _ = try cx.mod(76, 4, &FCMP);
+    _ = try cx.flag(80, "FTZ");
+    _ = try cx.mod(74, 2, &BOOL);
+}
+
+/// FCHK Pd, a, b: whether a / b needs the slow path (IEEE division).
+fn cFchk(cx: *Cx) Error!void {
+    _ = try cx.pred(81, false);
+    try alu(cx, .{ .op = 0x102, .a = INT, .b = .{ .src = .{ .imm = .f32 } } });
+}
+
+/// MUFU.fn Rd, b: the special-function unit (exp2, rcp, rsqrt, ...).
+fn cMufu(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x108, .b = FABS });
+    _ = try cx.mod(74, 6, &MUFU);
+}
+
+// Halves ---------------------------------------------------------------------------
+
+fn hmods(cx: *Cx, f32_bit: bool) Error!void {
+    if (f32_bit) _ = try cx.flag(78, "F32");
+    _ = try cx.flag(85, "BF16_V2");
+    _ = try cx.flag(80, "FTZ");
+    _ = try cx.flag(77, "SAT");
+}
+
+/// HADD2(.F32) Rd, a, b: two halves at once (.F32: one f32 result, how
+/// ptxas widens a half).
+fn cHadd2(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x030, .a = HALF, .bc = HALF_SPEC, .half = true });
+    try hmods(cx, true);
+}
+
+fn cHmul2(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x032, .a = HALF, .b = HALF, .half = true });
+    try hmods(cx, false);
+}
+
+/// HFMA2 Rd, a, b, c (an immediate b or c as two halves)
+fn cHfma2(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x031, .a = HALF, .b = HALF, .c = HALF, .half = true });
+    try hmods(cx, true);
+}
+
+fn cHmnmx2(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x040, .a = HALF, .b = HALF, .half = true });
+    _ = try cx.predNot(87, false);
+    _ = try cx.flag(85, "BF16_V2");
+    _ = try cx.flag(80, "FTZ");
+}
+
+// Conversions ----------------------------------------------------------------------
+
+/// F2FP.(F16|BF16).F32.PACK_AB Rd, a, b: two f32 rounded into halves, a's
+/// high, b's low.
+fn cF2fp(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x03e, .a = INT, .b = INT, .c = .rz });
+    _ = try cx.mod(76, 1, &.{ "F16", "BF16" });
+    try cx.always("F32");
+    try cx.always("PACK_AB");
+}
+
+/// After a conversion's types: the 64-bit opcode when either is 64 bits.
+fn wideOp(cx: *Cx, op64: u9) void {
+    if (cx.enc() and (cx.w.get(76, 1) == 1 and cx.w.get(75, 1) == 1 or cx.w.get(84, 2) == 3)) cx.w.put(0, 9, op64);
+}
+
+/// F2I(.type)(.F64)(.round)(.NTZ) Rd, b
+fn cF2i(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x105, .b = FABS });
+    _ = try cx.modBits(&.{ 72, 75, 76 }, &ITYPES_S32);
+    _ = try cx.mod(84, 2, &FTYPES_F32);
+    _ = try cx.mod(78, 2, &FRND);
+    _ = try cx.flag(77, "NTZ");
+    _ = try cx.flag(80, "FTZ");
+    wideOp(cx, 0x111);
+}
+
+/// I2F(.F64)(.type)(.round) Rd, b (a byte of b with .B1..B3)
+fn cI2f(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x106, .b = .{ .src = .{ .imm = .signed, .sel = .byte } } });
+    _ = try cx.mod(75, 2, &FTYPES_F32);
+    _ = try cx.modBits(&.{ 74, 84, 85 }, &ITYPES_S32);
+    _ = try cx.mod(78, 2, &RND);
+    wideOp(cx, 0x112);
+}
+
+/// F2F.dst.src(.round)(.FTZ) Rd, b
+fn cF2f(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x104, .b = FABS });
+    _ = try cx.mod(75, 2, &FTYPES);
+    _ = try cx.mod(84, 2, &FTYPES);
+    _ = try cx.mod(78, 2, &RND);
+    _ = try cx.flag(80, "FTZ");
+    wideOp(cx, 0x110);
+}
+
+/// I2FP.F32.U32 / .S32 Rd, b (sm_90's integer to float)
+fn cI2fp(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x045, .b = SINT });
+    _ = try cx.mod(75, 2, &FTYPES);
+    _ = try cx.modBits(&.{ 74, 84, 85 }, &ITYPES);
+}
+
+/// F2IP.U8.F32.NTZ Rd, a, b, c: a float to a saturated byte (the one
+/// form ptxas emits for cvt.rni.sat.u8.f32; its fields are not otherwise
+/// known).
+fn cF2ip(cx: *Cx) Error!void {
+    try cx.always("U8");
+    try cx.always("F32");
+    try cx.always("NTZ");
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x043, .a = INT, .b = INT, .c = INT });
+    cx.put(74, 1, 1);
+}
+
+// Tensor cores ---------------------------------------------------------------------
+
+/// HMMA.shape.dst(.src) Rd, a, b, c: f16 (or bf16) a, b; f16 or f32 c, d.
+fn cHmma(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x23c);
+    _ = try cx.modBits(&.{ 75, 78, 79 }, &.{ "1688", "16816", "1684", "?" });
+    _ = try cx.mod(76, 1, &.{ "F16", "F32" });
+    _ = try cx.mod(82, 2, &.{ "", "BF16", "TF32", "?" });
+    _ = try cx.reg(16);
+    try cx.srcReg(24, SLOT_A, .none);
+    try cx.srcReg(32, SLOT_B, .none);
+    try cx.srcReg(64, SLOT_C, .none);
+}
+
+/// IMMA.shape.atype.btype Rd, a.ROW, b.COL, c: int8 (or int4) a, b; s32
+/// c, d.
+fn cImma(cx: *Cx) Error!void {
+    const types = [_][]const u8{ "U8", "S8", "U4", "S4" };
+    cx.put(0, 12, 0x237);
+    _ = try cx.modBits(&.{ 75, 85, 86 }, &.{ "8816", "?", "8832", "?", "16816", "16832", "16864", "?" });
+    _ = try cx.modBits(&.{ 76, 83 }, &types);
+    _ = try cx.modBits(&.{ 78, 84 }, &types);
+    _ = try cx.flag(82, "SAT");
+    _ = try cx.reg(16);
+    try cx.srcReg(24, SLOT_A, .row);
+    try cx.srcReg(32, SLOT_B, .col);
+    try cx.srcReg(64, SLOT_C, .none);
+    cx.put(74, 1, 1); // (b is column-major)
+}
+
 // ── The forms ───────────────────────────────────────────────────────────────
 
 const Codec = *const fn (*Cx) Error!void;
@@ -1398,36 +2123,92 @@ const Form = struct {
     /// Bits 0..11, or with `alu` bits 0..8 (the form in 9..11 any).
     opcode: u12,
     alu: bool = false,
+    /// On the uniform datapath: its guard is a uniform predicate.
+    uniform: bool = false,
     codec: Codec,
 };
 
-const FORMS = [_]Form{
+pub const FORMS = [_]Form{
     .{ .name = "NOP", .opcode = 0x918, .codec = cNop },
     .{ .name = "EXIT", .opcode = 0x94d, .codec = cExit },
     .{ .name = "BRA", .opcode = 0x947, .codec = cBra },
+    .{ .name = "BRA", .opcode = 0x547, .codec = cBra },
+    .{ .name = "CALL", .opcode = 0x944, .codec = cCall },
+    .{ .name = "RET", .opcode = 0x950, .codec = cRet },
+    .{ .name = "BSSY", .opcode = 0x945, .codec = cBssy },
+    .{ .name = "BSYNC", .opcode = 0x941, .codec = cBsync },
+    .{ .name = "WARPSYNC", .opcode = 0x348, .codec = cWarpsync },
+    .{ .name = "BAR", .opcode = 0xb1d, .codec = cBar },
     .{ .name = "S2R", .opcode = 0x919, .codec = cS2r },
     .{ .name = "S2UR", .opcode = 0x9c3, .codec = cS2ur },
+    .{ .name = "CS2R", .opcode = 0x805, .codec = cCs2r },
     .{ .name = "R2UR", .opcode = 0x2ca, .codec = cR2ur },
     .{ .name = "LDC", .opcode = 0xb82, .codec = cLdcR },
     .{ .name = "LDCU", .opcode = 0x7ac, .codec = cLdcU },
-    .{ .name = "PLOP3", .opcode = 0x81c, .codec = cPlop3 },
     .{ .name = "LDG", .opcode = 0x981, .codec = cLdg },
     .{ .name = "STG", .opcode = 0x986, .codec = cStg },
     .{ .name = "LDL", .opcode = 0x983, .codec = cLdl },
     .{ .name = "STL", .opcode = 0x387, .codec = cStl },
+    .{ .name = "LDS", .opcode = 0x984, .codec = cLds },
+    .{ .name = "STS", .opcode = 0x388, .codec = cSts },
+    .{ .name = "STS", .opcode = 0x988, .codec = cSts },
+    .{ .name = "PLOP3", .opcode = 0x81c, .codec = cPlop3 },
+    .{ .name = "UPLOP3", .opcode = 0x89c, .uniform = true, .codec = cUplop3 },
+    .{ .name = "SEL", .opcode = 0x607, .codec = cSel },
+    .{ .name = "SHFL", .opcode = 0x389, .codec = cShfl },
+    .{ .name = "SHFL", .opcode = 0x589, .codec = cShfl },
+    .{ .name = "SHFL", .opcode = 0x989, .codec = cShfl },
+    .{ .name = "SHFL", .opcode = 0xf89, .codec = cShfl },
+    .{ .name = "VOTE", .opcode = 0x806, .codec = cVote },
+    .{ .name = "VOTEU", .opcode = 0x886, .codec = cVoteu },
+    .{ .name = "HMMA", .opcode = 0x23c, .codec = cHmma },
+    .{ .name = "IMMA", .opcode = 0x237, .codec = cImma },
     .{ .name = "MOV", .opcode = 0x002, .alu = true, .codec = cMov },
     .{ .name = "UMOV", .opcode = 0x082, .alu = true, .codec = cUmov },
     .{ .name = "IADD", .opcode = 0x035, .alu = true, .codec = cIadd },
     .{ .name = "IADD3", .opcode = 0x010, .alu = true, .codec = cIadd3 },
+    .{ .name = "UIADD3", .opcode = 0x090, .alu = true, .uniform = true, .codec = cUiadd3 },
     .{ .name = "IMAD", .opcode = 0x024, .alu = true, .codec = cImad },
     .{ .name = "IMAD", .opcode = 0x025, .alu = true, .codec = cImad },
+    .{ .name = "IMAD", .opcode = 0x027, .alu = true, .codec = cImad },
     .{ .name = "ISETP", .opcode = 0x00c, .alu = true, .codec = cIsetp },
+    .{ .name = "UISETP", .opcode = 0x08c, .alu = true, .uniform = true, .codec = cUisetp },
     .{ .name = "LOP3", .opcode = 0x012, .alu = true, .codec = cLop3 },
+    .{ .name = "ULOP3", .opcode = 0x092, .alu = true, .uniform = true, .codec = cUlop3 },
+    .{ .name = "LEA", .opcode = 0x011, .alu = true, .codec = cLea },
+    .{ .name = "ULEA", .opcode = 0x091, .alu = true, .uniform = true, .codec = cUlea },
+    .{ .name = "SHF", .opcode = 0x019, .alu = true, .codec = cShf },
+    .{ .name = "USHF", .opcode = 0x099, .alu = true, .uniform = true, .codec = cUshf },
+    .{ .name = "PRMT", .opcode = 0x016, .alu = true, .codec = cPrmt },
+    .{ .name = "SEL", .opcode = 0x007, .alu = true, .codec = cSel },
+    .{ .name = "VIMNMX", .opcode = 0x048, .alu = true, .codec = cVimnmx },
+    .{ .name = "IABS", .opcode = 0x013, .alu = true, .codec = cIabs },
+    .{ .name = "POPC", .opcode = 0x109, .alu = true, .codec = cPopc },
+    .{ .name = "BREV", .opcode = 0x101, .alu = true, .codec = cBrev },
+    .{ .name = "FLO", .opcode = 0x100, .alu = true, .codec = cFlo },
+    .{ .name = "IDP", .opcode = 0x026, .alu = true, .codec = cIdp },
     .{ .name = "FFMA", .opcode = 0x023, .alu = true, .codec = cFfma },
+    .{ .name = "UFFMA", .opcode = 0x055, .alu = true, .uniform = true, .codec = cUffma },
     .{ .name = "FADD", .opcode = 0x021, .alu = true, .codec = cFadd },
     .{ .name = "FMUL", .opcode = 0x020, .alu = true, .codec = cFmul },
+    .{ .name = "FMNMX", .opcode = 0x009, .alu = true, .codec = cFmnmx },
+    .{ .name = "FSEL", .opcode = 0x008, .alu = true, .codec = cFsel },
+    .{ .name = "FSETP", .opcode = 0x00b, .alu = true, .codec = cFsetp },
+    .{ .name = "FCHK", .opcode = 0x102, .alu = true, .codec = cFchk },
+    .{ .name = "MUFU", .opcode = 0x108, .alu = true, .codec = cMufu },
+    .{ .name = "HADD2", .opcode = 0x030, .alu = true, .codec = cHadd2 },
+    .{ .name = "HMUL2", .opcode = 0x032, .alu = true, .codec = cHmul2 },
     .{ .name = "HFMA2", .opcode = 0x031, .alu = true, .codec = cHfma2 },
+    .{ .name = "HMNMX2", .opcode = 0x040, .alu = true, .codec = cHmnmx2 },
+    .{ .name = "F2FP", .opcode = 0x03e, .alu = true, .codec = cF2fp },
+    .{ .name = "F2I", .opcode = 0x105, .alu = true, .codec = cF2i },
+    .{ .name = "F2I", .opcode = 0x111, .alu = true, .codec = cF2i },
+    .{ .name = "I2F", .opcode = 0x106, .alu = true, .codec = cI2f },
+    .{ .name = "I2F", .opcode = 0x112, .alu = true, .codec = cI2f },
+    .{ .name = "F2F", .opcode = 0x104, .alu = true, .codec = cF2f },
+    .{ .name = "F2F", .opcode = 0x110, .alu = true, .codec = cF2f },
     .{ .name = "I2FP", .opcode = 0x045, .alu = true, .codec = cI2fp },
+    .{ .name = "F2IP", .opcode = 0x043, .alu = true, .codec = cF2ip },
 };
 
 fn formOf(name: []const u8) ?*const Form {
@@ -1447,12 +2228,21 @@ fn formAt(op12: u12) ?*const Form {
     return null;
 }
 
+/// Whether `in` runs on the uniform datapath (its guard a uniform
+/// predicate).
+pub fn isUniform(in: *const Instr) bool {
+    const f = formOf(in.op) orelse return false;
+    return f.uniform;
+}
+
 // ── Encoding and decoding ───────────────────────────────────────────────────
 
 /// `in`'s 128 bits, as the instruction at byte `pc` of its kernel; a branch
 /// goes to byte `target` (or to its own .target operand).
 pub fn encode(in: *const Instr, pc: u64, target: ?u64) Error!Word {
     const form = formOf(in.op) orelse return error.Unknown;
+    // (a uniform op's guard is a uniform predicate, a warp op's a warp one)
+    if (in.uguard != form.uniform and (in.guard.n != PT or in.guard.not)) return error.Syntax;
     var cx = Cx{ .dir = .enc, .in = in.*, .pc = pc, .target = target };
     cx.w.put(12, 3, in.guard.n);
     cx.w.bit(15, in.guard.not);
@@ -1471,7 +2261,7 @@ pub fn encode(in: *const Instr, pc: u64, target: ?u64) Error!Word {
 pub fn decode(lo: u64, hi: u64, pc: u64) Error!Instr {
     const w = Word.of(lo, hi);
     const form = formAt(@intCast(w.get(0, 12))) orelse return error.Unknown;
-    var cx = Cx{ .dir = .dec, .w = w, .in = .{ .op = form.name }, .pc = pc };
+    var cx = Cx{ .dir = .dec, .w = w, .in = .{ .op = form.name, .uguard = form.uniform }, .pc = pc };
     cx.in.control = Control.of(w);
     if (cx.in.control.read == 6 or cx.in.control.write == 6) return error.Unknown;
     cx.in.guard = .{ .n = @intCast(w.get(12, 3)), .not = w.get(15, 1) == 1 };
@@ -1516,7 +2306,7 @@ pub fn format(in: *const Instr, buf: []u8) FormatError![]const u8 {
     try o.str(" ");
     if (in.guard.n != PT or in.guard.not) {
         try o.str("@");
-        try fmtPred(&o, "P", in.guard);
+        try fmtPred(&o, if (in.uguard) "UP" else "P", in.guard);
         try o.str(" ");
     }
     try o.str(in.op);
@@ -1525,9 +2315,13 @@ pub fn format(in: *const Instr, buf: []u8) FormatError![]const u8 {
         try o.str(m);
     }
     for (in.operands(), 0..) |x, i| {
-        try o.str(if (i == 0) " " else ", ");
+        // (RET's target follows its register with no comma)
+        const bare = i > 0 and eql(in.op, "RET") and (x == .target or x == .label);
+        try o.str(if (i == 0 or bare) " " else ", ");
         try fmtOperand(&o, x);
     }
+    // (nvdisasm prints +INF and QNAN with a space after; not at the end)
+    while (o.len > 0 and o.buf[o.len - 1] == ' ') o.len -= 1;
     return o.buf[0..o.len];
 }
 
@@ -1544,6 +2338,7 @@ fn fmtReg(o: *Out, file: []const u8, r: Reg) FormatError!void {
     if (r.n == RZ) try o.str("Z") else try o.print("{d}", .{r.n});
     if (r.abs) try o.str("|");
     if (r.reuse) try o.str(".reuse");
+    try o.str(SEL_NAMES[@intFromEnum(r.sel)]);
 }
 
 fn fmtSigned(o: *Out, v: i64) FormatError!void {
@@ -1568,7 +2363,7 @@ fn fmtOperand(o: *Out, x: Operand) FormatError!void {
             if (c.abs) try o.str("|");
             try o.print("c[0x{x}][", .{c.bank});
             if (c.reg != RZ) {
-                try o.print("R{d}", .{c.reg});
+                try o.print("{s}{d}", .{ if (c.ureg) "UR" else "R", c.reg });
                 if (c.offset != 0) try o.print("+0x{x}", .{c.offset});
             } else try o.print("0x{x}", .{c.offset});
             try o.str("]");
@@ -1581,31 +2376,40 @@ fn fmtOperand(o: *Out, x: Operand) FormatError!void {
                 try o.str("]");
             }
             try o.str("[");
+            var any = false;
             if (a.reg != RZ) {
                 try o.print("R{d}", .{a.reg});
                 if (a.wide) try o.str(".64");
-                if (a.offset != 0) {
-                    try o.str("+");
-                    try fmtSigned(o, a.offset);
-                }
-            } else try fmtSigned(o, a.offset);
+                any = true;
+            }
+            if (a.ureg) |u| {
+                if (any) try o.str("+");
+                try fmtReg(o, "UR", .{ .n = u });
+                any = true;
+            }
+            if (a.offset != 0 or !any) {
+                if (any) try o.str("+");
+                if (!any and a.offset == 0) try o.str("RZ") else try fmtSigned(o, a.offset);
+            }
             try o.str("]");
         },
         .sreg => |n| try o.str(sregName(n) orelse "SR_?"),
         .label => |l| try o.print("`({s})", .{l}),
         .target => |t| try o.print("`(0x{x})", .{t}),
+        .barrier => |b| try o.print("B{d}", .{b}),
     }
 }
 
-/// A float as nvdisasm prints it: C's %.20g of its value (exact: the
-/// float's decimal expansion, rounded half to even at 20 digits, trailing
-/// zeros dropped), or +INF, -INF, +QNAN, -QNAN.
+/// A float as nvdisasm prints it: below 1e9, C's %.20g of its value (the
+/// float's exact decimal expansion rounded half to even at 20 digits,
+/// trailing zeros dropped); from 1e9 up, %.20e (21 digits, all kept); and
+/// +INF, -INF, +QNAN, -QNAN, which nvdisasm follows with a space.
 fn fmtFloat(o: *Out, x: f32) FormatError!void {
     const bits: u32 = @bitCast(x);
     const neg = bits >> 31 == 1;
     const e_bits: u32 = (bits >> 23) & 0xff;
     const frac: u32 = bits & 0x7fffff;
-    if (e_bits == 0xff) return o.str(if (frac != 0) (if (neg) "-QNAN" else "+QNAN") else if (neg) "-INF" else "+INF");
+    if (e_bits == 0xff) return o.str(if (frac != 0) (if (neg) "-QNAN " else "+QNAN ") else if (neg) "-INF " else "+INF ");
     if (neg) try o.str("-");
     if (e_bits == 0 and frac == 0) return o.str("0");
     var m: u32 = if (e_bits == 0) frac else frac | (1 << 23);
@@ -1627,17 +2431,19 @@ fn fmtFloat(o: *Out, x: f32) FormatError!void {
     var nd = n.decimal(&digits);
     // the first digit's power of ten
     var x10: i32 = @as(i32, @intCast(nd)) + p - 1;
-    if (nd > 20) {
+    const sci = x10 >= 9;
+    const keep: usize = if (sci) 21 else 20;
+    if (nd > keep) {
         const up = blk: {
-            if (digits[20] != '5') break :blk digits[20] > '5';
-            for (digits[21..nd]) |dg| {
+            if (digits[keep] != '5') break :blk digits[keep] > '5';
+            for (digits[keep + 1 .. nd]) |dg| {
                 if (dg != '0') break :blk true;
             }
-            break :blk (digits[19] - '0') % 2 == 1;
+            break :blk (digits[keep - 1] - '0') % 2 == 1;
         };
-        nd = 20;
+        nd = keep;
         if (up) {
-            var i: usize = 20;
+            var i: usize = keep;
             while (i > 0) {
                 i -= 1;
                 if (digits[i] != '9') {
@@ -1651,15 +2457,23 @@ fn fmtFloat(o: *Out, x: f32) FormatError!void {
             }
         }
     }
+    if (sci) {
+        // %.20e: the digits padded to 21
+        while (nd < 21) : (nd += 1) digits[nd] = '0';
+        try o.str(digits[0..1]);
+        try o.str(".");
+        try o.str(digits[1..21]);
+        try o.print("e+{d:0>2}", .{@as(u32, @intCast(x10))});
+        return;
+    }
     while (nd > 1 and digits[nd - 1] == '0') nd -= 1;
-    if (x10 < -4 or x10 >= 20) {
+    if (x10 < -4) {
         try o.str(digits[0..1]);
         if (nd > 1) {
             try o.str(".");
             try o.str(digits[1..nd]);
         }
-        const ax: u32 = @intCast(if (x10 < 0) -x10 else x10);
-        try o.print("e{c}{d:0>2}", .{ @as(u8, if (x10 < 0) '-' else '+'), ax });
+        try o.print("e-{d:0>2}", .{@as(u32, @intCast(-x10))});
     } else if (x10 >= 0) {
         const whole: usize = @intCast(x10 + 1);
         if (nd <= whole) {
@@ -1739,34 +2553,65 @@ const Big = struct {
     }
 };
 
-/// The highest general register an instruction touches (its 64- and
-/// 128-bit operands' pairs and quads included), or null.
+/// The registers a load's destination or a store's data spans: 4 for
+/// .128, 2 for .64.
+pub fn dataWidth(in: *const Instr) u8 {
+    if (in.has("128")) return 4;
+    if (in.has("64")) return 2;
+    return 1;
+}
+
+/// How many consecutive registers operand `i` of `in` spans, when it is a
+/// register: a load's destination or a store's data (dataWidth), MOV.64's
+/// and LDCU.64's destination, every register of IADD.64 and SEL.64,
+/// IMAD.WIDE's destination and c, 64-bit compares' sources, conversions'
+/// 64-bit sides, CS2R's pair, the MMAs' fragments (m16n8k16: a four, b
+/// two, c and d four).
+pub fn regsAt(in: *const Instr, i: usize) u8 {
+    const op = in.op;
+    if (eql(op, "HMMA") or eql(op, "IMMA")) {
+        const hmma = eql(op, "HMMA");
+        const small = in.has("1688") or in.has("16816") and !hmma;
+        return switch (i) {
+            0, 3 => if (hmma and in.has("F16")) 2 else 4,
+            1 => if (small) 2 else 4,
+            2 => if (small) 1 else 2,
+            else => 1,
+        };
+    }
+    if (eql(op, "IADD") or eql(op, "SEL")) return dataWidth(in);
+    if (isData(in, i)) return dataWidth(in);
+    if (eql(op, "ISETP") or eql(op, "UISETP")) return if ((in.has("U64") or in.has("S64")) and (i == 2 or i == 3)) 2 else 1;
+    if (eql(op, "IMAD")) return if (in.has("WIDE") and (i == 0 or i == 3)) 2 else 1;
+    if (eql(op, "CS2R")) return if (i == 0 and !in.has("32")) 2 else 1;
+    if (eql(op, "F2I") or eql(op, "I2F") or eql(op, "F2F")) {
+        const int64 = in.has("S64") or in.has("U64");
+        const dst64 = if (eql(op, "F2I")) int64 else if (eql(op, "I2F")) in.has("F64") else in.n_mods > 0 and eql(in.mods[0], "F64");
+        const src64 = if (eql(op, "F2I")) in.has("F64") else if (eql(op, "I2F")) int64 else in.n_mods > 1 and eql(in.mods[1], "F64");
+        return if ((i == 0 and dst64) or (i == 1 and src64)) 2 else 1;
+    }
+    if (i == 0) return dataWidth(in);
+    return 1;
+}
+
+/// The highest general register an instruction touches (regsAt's groups
+/// included), or null.
 pub fn highestGpr(in: *const Instr) ?u8 {
-    const width: u8 = blk: {
-        if (in.has("128")) break :blk 4;
-        if (in.has("64") or in.has("WIDE")) break :blk 2;
-        break :blk 1;
-    };
     var top: ?u8 = null;
     for (in.operands(), 0..) |o, i| {
-        const r: u8 = switch (o) {
-            .gpr => |g| g.n,
+        const t: u8 = switch (o) {
+            .gpr => |g| if (g.n != RZ) g.n + regsAt(in, i) - 1 else continue,
             .addr => |a| if (a.reg != RZ) a.reg + @as(u8, if (a.wide) 1 else 0) else continue,
-            .cbuf => |c| if (c.reg != RZ) c.reg else continue,
+            .cbuf => |c| if (c.reg != RZ and !c.ureg) c.reg else continue,
             else => continue,
         };
-        if (r == RZ) continue;
-        // (a load's destination, a store's data, a wide result: the whole
-        // register group; IMAD.WIDE's c is a pair too)
-        const group: u8 = if (o == .gpr and (i == 0 or isData(in, i) or (in.has("WIDE") and i == 3))) width else 1;
-        const t = r + group - 1;
         top = if (top) |x| @max(x, t) else t;
     }
     return top;
 }
 
 fn isData(in: *const Instr, i: usize) bool {
-    return (eql(in.op, "STG") or eql(in.op, "STL")) and i == 1;
+    return (eql(in.op, "STG") or eql(in.op, "STL") or eql(in.op, "STS")) and i == 1;
 }
 
 // ── Host tests ──────────────────────────────────────────────────────────────
@@ -1808,13 +2653,23 @@ test "operands: registers, predicates, constants, addresses, labels" {
     try testing.expectEqualStrings(".L_x_2", br.label().?);
     const to = try parse("BRA `(0x1a0)");
     try testing.expectEqual(@as(u64, 0x1a0), to.ops[0].target);
+    const sh = try parse("LDS.U8 R21, [R2+UR4+0x700]");
+    try testing.expectEqual(Addr{ .reg = 2, .ureg = 4, .offset = 0x700 }, sh.ops[1].addr);
+    const hs = try parse("HADD2.F32 R6, -RZ, R4.reuse.H0_H0");
+    try testing.expectEqual(Reg{ .n = 4, .reuse = true, .sel = .h0_h0 }, hs.ops[2].gpr);
+    const ret = try parse("RET.REL.NODEC R12 `(lfm3_q80_quant)");
+    try testing.expectEqual(@as(usize, 2), ret.n_ops);
+    try testing.expectEqualStrings("lfm3_q80_quant", ret.label().?);
+    const ug = try parse("@!UPT UIADD3 URZ, UPT, UPT, URZ, URZ, URZ");
+    try testing.expect(ug.uguard and ug.guard.not);
+    try testing.expectEqual(@as(u8, 3), (try parseOperand("B3")).barrier);
     const fa = try parse("FADD R0, -|R2|.reuse, -c[0x0][R3+0x10]");
     try testing.expectEqual(Reg{ .n = 2, .neg = true, .abs = true, .reuse = true }, fa.ops[1].gpr);
     try testing.expectEqual(CBuf{ .bank = 0, .offset = 0x10, .reg = 3, .neg = true }, fa.ops[2].cbuf);
     try testing.expectEqualStrings("-INF", (try parseOperand("-INF")).num);
 }
 
-test "floats as nvdisasm prints them (%.20g)" {
+test "floats as nvdisasm prints them (%.20g below 1e9, %.20e from it)" {
     const cases = [_]struct { f32, []const u8 }{
         .{ 1.0, "1" },
         .{ 0.5, "0.5" },
@@ -1822,10 +2677,14 @@ test "floats as nvdisasm prints them (%.20g)" {
         .{ 0.0, "0" },
         .{ 1.4426950408889634, "1.4426950216293334961" },
         .{ 1.1754943508222875e-38, "1.175494350822287508e-38" },
-        .{ 3.4028234663852886e38, "3.4028234663852885981e+38" },
-        .{ 1e20, "1.0000000200408773427e+20" },
-        .{ 1e19, "9999999980506447872" },
+        .{ 3.4028234663852886e38, "3.40282346638528859812e+38" },
+        .{ 1e20, "1.00000002004087734272e+20" },
+        .{ 1e9, "1.00000000000000000000e+09" },
+        .{ 1e8, "100000000" },
+        .{ 123456.789, "123456.7890625" },
         .{ 0.0001, "9.9999997473787516356e-05" },
+        .{ 1e-10, "1.00000001335143196e-10" },
+        .{ 0.1, "0.10000000149011611938" },
         .{ 1.875, "1.875" },
         .{ std.math.inf(f32), "+INF" },
         .{ -std.math.inf(f32), "-INF" },
@@ -1834,7 +2693,7 @@ test "floats as nvdisasm prints them (%.20g)" {
         var buf: [64]u8 = undefined;
         var o = Out{ .buf = &buf };
         try fmtFloat(&o, c[0]);
-        try testing.expectEqualStrings(c[1], o.buf[0..o.len]);
+        try testing.expectEqualStrings(c[1], std.mem.trimEnd(u8, o.buf[0..o.len], " "));
     }
 }
 
@@ -1864,7 +2723,7 @@ const Vectors = struct {
         k.n_labels = 0;
         var pc: u64 = 0;
         var lines = std.mem.splitScalar(u8, block, '\n');
-        _ = lines.next(); // (the kernel's name)
+        _ = lines.next(); // (the kernel's name: its label follows)
         while (lines.next()) |raw| {
             const line = std.mem.trimEnd(u8, raw, "\r");
             if (line.len == 0 or line[0] == '#') continue;
@@ -1919,7 +2778,7 @@ test "ptxas's vectors: every instruction's 128 bits (sm120_vectors.txt)" {
         std.debug.print("{d} of {d} vectors failed\n", .{ failures, n });
         return error.TestUnexpectedResult;
     }
-    try testing.expect(n > 250);
+    try testing.expect(n > 2500);
 }
 
 /// The vector's text as format prints it: a branch's label as its address.
@@ -1975,6 +2834,69 @@ test "ptxas's vectors decoded: the same 128 bits encoded again, nvdisasm's text 
     }
 }
 
+/// `text` encoded at `pc`, then decoded: what an emulator sees.
+fn roundTrip(text: []const u8, pc: u64) !Instr {
+    const in = try parse(text);
+    const w = try encode(&in, pc, null);
+    return decode(w.lo(), w.hi(), pc);
+}
+
+test "decoded operands: what the emulator sees" {
+    // a shuffle: the in-range predicate, then lane and clamp as numbers
+    const sh = try roundTrip("SHFL.BFLY PT, R0, R3, 0x4, 0x181f", 0);
+    try testing.expectEqualStrings("SHFL", sh.op);
+    try testing.expectEqualStrings("BFLY", sh.mods[0]);
+    try testing.expectEqual(Pred{}, sh.ops[0].pred);
+    try testing.expectEqual(@as(u8, 0), sh.ops[1].gpr.n);
+    try testing.expectEqual(Imm{ .bits = 4 }, sh.ops[3].imm);
+    try testing.expectEqual(Imm{ .bits = 0x181f }, sh.ops[4].imm);
+    // shared memory: a register, a uniform register and an offset
+    const ld = try roundTrip("LDS.U8 R21, [R2+UR4+0x700]", 0);
+    try testing.expectEqual(Addr{ .reg = 2, .ureg = 4, .offset = 0x700 }, ld.ops[1].addr);
+    const st = try roundTrip("STS.128 [R3+-0x10], R8", 0);
+    try testing.expectEqual(Addr{ .reg = 3, .offset = -0x10 }, st.ops[0].addr);
+    // a branch and a convergence barrier: absolute targets
+    const bra = try roundTrip("@!P0 BRA `(0x1a0)", 0x100);
+    try testing.expectEqual(@as(u64, 0x1a0), bra.ops[0].target);
+    try testing.expectEqual(Pred{ .n = 0, .not = true }, bra.guard);
+    const bssy = try roundTrip("BSSY.RECONVERGENT B1, `(0x40)", 0x200);
+    try testing.expectEqual(@as(u8, 1), bssy.ops[0].barrier);
+    try testing.expectEqual(@as(u64, 0x40), bssy.ops[1].target);
+    // two halves of an immediate, high first
+    const hf = try roundTrip("HFMA2 R0, R4, 1, 1, R5.reuse", 0);
+    try testing.expectEqual(Imm{ .bits = 0x3c00, .kind = .f16 }, hf.ops[2].imm);
+    try testing.expectEqual(Reg{ .n = 5, .reuse = true }, hf.ops[4].gpr);
+    // a half's selector, a byte's
+    const ha = try roundTrip("HADD2.F32 R7, -RZ, R4.H1_H1", 0);
+    try testing.expectEqual(Reg{ .n = RZ, .neg = true }, ha.ops[1].gpr);
+    try testing.expectEqual(Sel.h1_h1, ha.ops[2].gpr.sel);
+    try testing.expectEqual(Sel.b2, (try roundTrip("I2F.U8 R11, R0.B2", 0)).ops[1].gpr.sel);
+    // a float immediate's bits; the special function in the modifiers
+    const mu = try roundTrip("MUFU.RSQ R13, -QNAN", 0);
+    try testing.expectEqualStrings("RSQ", mu.mods[0]);
+    try testing.expectEqual(Imm{ .bits = 0xffc00000, .kind = .f32 }, mu.ops[1].imm);
+    // the operands printed only when they are not RZ or PT
+    const vo = try roundTrip("VOTE.ANY P3, P1", 0);
+    try testing.expectEqual(@as(usize, 2), vo.n_ops);
+    try testing.expectEqual(@as(usize, 3), (try roundTrip("VOTE.ANY R21, PT, P1", 0)).n_ops);
+    const lp = try roundTrip("LOP3.LUT P0, RZ, R9, 0x7, RZ, 0xc0, !PT", 0);
+    try testing.expectEqual(Pred{ .n = 0 }, lp.ops[0].pred);
+    try testing.expectEqual(@as(usize, 7), lp.n_ops);
+    const lx = try roundTrip("LEA.HI.X R9, R4, R3, R5, 0x3, P0", 0);
+    try testing.expectEqual(@as(usize, 6), lx.n_ops);
+    const bar = try roundTrip("BAR.SYNC.DEFER_BLOCKING 0x2, 0x40", 0);
+    try testing.expectEqual(Imm{ .bits = 0x40 }, bar.ops[1].imm);
+    // the uniform datapath's guard
+    const ug = try roundTrip("@!UPT UIADD3 URZ, UPT, UPT, URZ, URZ, URZ", 0);
+    try testing.expect(ug.uguard);
+    // an IMMA's layouts and fragments
+    const im = try roundTrip("IMMA.16832.S8.S8 R20, R4.ROW, R2.reuse.COL, R8", 0);
+    try testing.expectEqual(Sel.row, im.ops[1].gpr.sel);
+    try testing.expectEqual(@as(u8, 4), regsAt(&im, 1));
+    try testing.expectEqual(@as(u8, 2), regsAt(&im, 2));
+    try testing.expectEqual(@as(?u8, 23), highestGpr(&im));
+}
+
 test "decode refuses words it does not account for" {
     // (a NOP with a stray bit; an opcode no form has; scoreboard 6)
     try testing.expectError(error.Unknown, decode(0x0000_0000_0001_7918, 0x000f_c000_0000_0000, 0));
@@ -1991,13 +2913,13 @@ test "decode refuses words it does not account for" {
     try testing.expectError(error.Unknown, encode(&what, 0, null));
 }
 
-test "every alu form's opcode stays clear of the exact ones" {
+test "every alu form's opcode stays clear of the exact ones (but its own: SEL.64 is SEL's unused form 3)" {
     for (FORMS) |f| {
         if (!f.alu) continue;
         for (1..8) |form| {
             const op: u12 = @intCast(f.opcode | form << 9);
             for (FORMS) |g| {
-                if (!g.alu) try testing.expect(g.opcode != op);
+                if (!g.alu and g.opcode == op) try testing.expect(g.codec == f.codec);
             }
         }
     }
