@@ -41,7 +41,33 @@ pub const Error = error{
     Divergence,
     Timeout,
     BadDispatch,
+    /// The group needs more waves resident at once than the kernel's
+    /// register footprint lets the GPU keep (maxWaves): it would not launch.
+    TooManyWaves,
 } || ir3.Error;
+
+/// The waves of `threadsize` fibers an SP keeps resident with a footprint
+/// of `full_regs` vec4 registers: Mesa's ir3_get_reg_dependent_max_waves,
+/// reg_size_vec4 / (registers x (2 for 128-fiber waves)) x wave_granularity,
+/// with the a7xx values of the X1-45 (96 and 2; freedreno_devices.py). A
+/// group's waves must all be resident, so a group needing more cannot
+/// launch. Other generations differ per GPU: no limit is applied to them.
+pub fn maxWaves(gen: u16, full_regs: u32, threadsize: u32) u32 {
+    if (gen < ir3.A7XX) return std.math.maxInt(u32);
+    const reg_size_vec4: u32 = 96;
+    const wave_granularity: u32 = 2;
+    const max_waves: u32 = 16;
+    const regs = @max(full_regs, 1);
+    const per = regs * (if (threadsize == 128) @as(u32, 2) else 1);
+    return @min(reg_size_vec4 / per * wave_granularity, max_waves);
+}
+
+/// Whether a group of `threads` fibers in waves of `threadsize` can launch
+/// with `full_regs` vec4 registers.
+pub fn groupFits(gen: u16, full_regs: u32, threadsize: u32, threads: u32) bool {
+    const waves = (threads + threadsize - 1) / @max(threadsize, 1);
+    return waves <= maxWaves(gen, full_regs, threadsize);
+}
 
 /// A region of GPU-visible memory.
 pub const Region = struct { va: u64, bytes: []u8 };
@@ -935,6 +961,7 @@ pub fn run(w: *Work, mem: *const Memory, d: *const Dispatch, stats: *Stats) Erro
     if (lsz == 0 or lsz > MAX_FIBERS) return error.BadDispatch;
     const ts: u32 = k.threadsize;
     const waves = (lsz + ts - 1) / ts;
+    if (!groupFits(k.gen, k.full_regs, ts, lsz)) return error.TooManyWaves;
     var gz: u32 = 0;
     while (gz < d.groups[2]) : (gz += 1) {
         var gy: u32 = 0;
@@ -1317,4 +1344,29 @@ test "a divergent if/else: the else fibers run right after the then-part's jump"
         \\end
     , &mem, &consts, .{ 1, 1, 1 });
     for (out, 0..) |v, i| try std.testing.expectEqual(@as(u32, @intCast(if (i < 32) 5 + i else 100 + i)), v);
+}
+
+test "a group needing more resident waves than its registers allow does not launch" {
+    // Mesa's formula on a7xx: 96 / 25 vec4 x 2 = 6 waves of 64; 100
+    // registers fit 384 threads, not 1024
+    try std.testing.expectEqual(@as(u32, 6), maxWaves(ir3.A7XX, 25, 64));
+    try std.testing.expectEqual(@as(u32, 16), maxWaves(ir3.A7XX, 12, 64));
+    try std.testing.expectEqual(@as(u32, 2), maxWaves(ir3.A7XX, 25, 128));
+    try std.testing.expect(groupFits(ir3.A7XX, 25, 64, 256));
+    try std.testing.expect(!groupFits(ir3.A7XX, 25, 64, 1024));
+    try std.testing.expect(groupFits(ir3.A7XX, 12, 64, 1024));
+    var code: [64]u64 = undefined;
+    // a kernel touching r24.w: a footprint of 25 vec4, in 1024-fiber groups
+    const k = try ir3_asm.assemble(ir3.A7XX,
+        \\@localsize 1024, 1, 1
+        \\@invocationid(r0.x)
+        \\mov.u32u32 r24.w, r0.x
+        \\end
+    , &asm_work, &code);
+    try std.testing.expectEqual(@as(u8, 25), k.full_regs);
+    try load(&emu_work, &k);
+    var stats = Stats{};
+    const regions = [_]Region{};
+    const mem = Memory{ .regions = &regions };
+    try std.testing.expectError(error.TooManyWaves, run(&emu_work, &mem, &.{ .kernel = &k, .consts = &.{}, .groups = .{ 1, 1, 1 } }, &stats));
 }
