@@ -31,8 +31,8 @@ const ir3 = @import("ir3.sig");
 pub const Instr = ir3.Instr;
 pub const Src = ir3.Src;
 
-pub const MAX_INSTRS = 4096;
-pub const MAX_LABELS = 128;
+pub const MAX_INSTRS = 16384;
+pub const MAX_LABELS = 512;
 /// The register id meaning "not delivered" (Mesa's INVALID_REG, r63.x).
 pub const INVALID_REG: u8 = 0xfc;
 
@@ -202,7 +202,7 @@ pub const Work = struct {
     n_out: u32 = 0,
     /// Item index -> output index of its first instruction (labels resolve here).
     item_at: [MAX_INSTRS + 1]u32 = undefined,
-    block_in: [MAX_LABELS + 1]State = undefined,
+    block_in: [MAX_LABELS * 2 + 2]State = undefined,
     scratch: State = .{},
     /// Line of the last error (1-based), 0 when none.
     err_line: u32 = 0,
