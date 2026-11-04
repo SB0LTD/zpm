@@ -1220,6 +1220,16 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
         importEntry("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig"),
     });
+    // The GPU self-test: every KIR op on a gpu.Device against the
+    // interpreter, on the reference device (several caps), the emulated RTX
+    // and the emulated Adreno, and a broken device reported, not a crash.
+    const test_gpu_selftest = try ctx.addStep("test-gpu-selftest", "Run the GPU self-test (KIR on a Device against the interpreter) on EmuDevice, the emulated RTX and the emulated Adreno", &noopStep);
+    try ctx.addDependency(test_all, test_gpu_selftest);
+    _ = try addTest(ctx, test_gpu_selftest, "test-gpu-selftest-run", "tests/test_gpu_selftest.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
     // LFM3 on any GPU: the KIR kernels (each against quantized_linear and the
     // executor's arithmetic, on the interpreter) and the forward pass over a
     // gpu.Device against lfm3_executor.

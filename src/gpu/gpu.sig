@@ -58,6 +58,11 @@ pub const EmuDevice = emu_device.EmuDevice;
 pub const kir_ir3 = @import("kir_ir3.sig");
 pub const adreno_device = @import("adreno_device.sig");
 
+/// The self-test: KIR on a real Device against the interpreter, case by
+/// case, logged line by line (the first boot on a GPU names any op it gets
+/// wrong).
+pub const selftest = @import("selftest.sig");
+
 test {
     _ = kir;
     _ = device;
