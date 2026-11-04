@@ -1091,6 +1091,13 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_nvidia = try ctx.addStep("test-nvidia", "Encode ptxas's sm_120 vectors and assemble its kernels from their listings", &noopStep);
     try ctx.addDependency(test_all, test_nvidia);
     _ = try addTest(ctx, test_nvidia, "test-nvidia-module", "src/nvidia/nvidia.sig", &.{});
+    // ── AMD GCN3/GCN4 (gfx803, Polaris) compute: the ISA, a kernel assembler,
+    //    the kernel descriptor and dispatch registers, a wave64 emulator ──
+    _ = try ctx.addModule("amdgpu", "src/amdgpu/amdgpu.sig");
+    const test_amdgpu = try ctx.addStep("test-amdgpu", "Execute LLVM's gfx803 vectors and kernels, the descriptor, and the wave64 emulator's copy and matmul", &noopStep);
+    try ctx.addDependency(test_all, test_amdgpu);
+    _ = try addTest(ctx, test_amdgpu, "test-amdgpu-module", "src/amdgpu/amdgpu.sig", &.{});
+
     // ── GPU-neutral compute: KIR, devices, the interpreter and EmuDevice
     //    (one module; the backends' files join it) ──
     const gpu_module = try ctx.addModule("gpu", "src/gpu/gpu.sig");
@@ -1098,31 +1105,38 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     // the Adreno backend's files, kir_ir3 and adreno_device, use adreno)
     try wire(ctx, gpu_module, "nvidia", "src/nvidia/nvidia.sig");
     try wire(ctx, gpu_module, "adreno", "src/adreno/adreno.sig");
+    // (kir_gcn4 and amd_device: the AMD backend, with amdgpu)
+    try wire(ctx, gpu_module, "amdgpu", "src/amdgpu/amdgpu.sig");
     const test_gpu = try ctx.addStep("test-gpu", "Execute KIR's verifier, interpreter, exact fdiv/fsqrt expansions and EmuDevice", &noopStep);
     try ctx.addDependency(test_all, test_gpu);
     _ = try addTest(ctx, test_gpu, "test-gpu-module", "src/gpu/gpu.sig", &.{
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
     });
     _ = try addTest(ctx, test_gpu, "test-gpu-ops", "tests/test_gpu_ops.sig", &.{
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
     });
     _ = try addTest(ctx, test_gpu, "test-gpu-flow", "tests/test_gpu_flow.sig", &.{
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
     });
     _ = try addTest(ctx, test_gpu, "test-gpu-exact", "tests/test_gpu_exact.sig", &.{
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
     });
     _ = try addTest(ctx, test_gpu, "test-gpu-emu", "tests/test_gpu_emu.sig", &.{
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
     });
     // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
     _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{
@@ -1184,6 +1198,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, lfm3_gpu, "lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig");
     _ = try addTest(ctx, test_adreno, "test-lfm3-gpu-kernels", "src/core/lfm3_gpu_kernels.sig", &.{
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
     });
     _ = try addTest(ctx, test_adreno, "test-lfm3-gpu", "tests/test_lfm3_gpu.sig", &.{
@@ -1195,6 +1210,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("transformer_ops", "src/core/transformer_ops.sig"),
         importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
         importEntry("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig"),
         importEntry("lfm3_gpu", "src/core/lfm3_gpu.sig"),
     });
@@ -1206,6 +1222,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_gpu, "test-gpu-sm120", "src/gpu/nvidia_device.sig", &.{
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
         importEntry("lfm3_nv_matrix", "src/core/lfm3_nv_matrix.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
     });
@@ -1217,16 +1234,19 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
         importEntry("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig"),
     });
-
-    // ── AMD GCN3/GCN4 (gfx803, Polaris) compute: the ISA, a kernel assembler,
-    //    the kernel descriptor and dispatch registers, a wave64 emulator ──
-    _ = try ctx.addModule("amdgpu", "src/amdgpu/amdgpu.sig");
-    const test_amdgpu = try ctx.addStep("test-amdgpu", "Execute LLVM's gfx803 vectors and kernels, the descriptor, and the wave64 emulator's copy and matmul", &noopStep);
-    try ctx.addDependency(test_all, test_amdgpu);
-    _ = try addTest(ctx, test_amdgpu, "test-amdgpu-module", "src/amdgpu/amdgpu.sig", &.{});
+    // The AMD backend: every KIR op through gcn3_emu against the interpreter.
+    const test_gpu_gcn4 = try ctx.addStep("test-gpu-gcn4", "Compile KIR for GCN 4 (gfx803) and run it in gcn3_emu against kir_interp", &noopStep);
+    try ctx.addDependency(test_all, test_gpu_gcn4);
+    _ = try addTest(ctx, test_gpu_gcn4, "test-gpu-gcn4-kernels", "tests/test_kir_gcn4.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
+    });
 
     const tts_gpu = try ctx.addModule("tts_gpu", "src/tts/gpu.sig");
     try wire(ctx, tts_gpu, "tts_model_container", "src/tts/model_container.sig");

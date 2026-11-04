@@ -76,6 +76,10 @@ pub const Dispatch = struct {
     /// Where the code is (s_getpc_b64 reads it).
     code_va: u64 = 0x7f00_0000_0000,
     max_steps: u64 = 200_000_000,
+    /// A buffer access past its V#'s records is an error (Fault), not the
+    /// hardware's zero read and dropped write: for code that never means to
+    /// rely on the range check.
+    strict_buffers: bool = false,
 };
 
 pub const Stats = struct {
@@ -140,6 +144,8 @@ pub const Work = struct {
     nwaves: usize = 0,
     lds_limit: u32 = 0,
     ftz32: bool = true,
+    /// MODE.IEEE: min/max quiet a signaling NaN rather than take the other operand.
+    ieee: bool = true,
     steps: u64 = 0,
     // Where the last error happened.
     err_pc: u32 = 0,
@@ -198,6 +204,7 @@ pub fn load(w: *Work, k: *const gcn3_asm.Kernel) Error!void {
         at += n;
     }
     w.ftz32 = k.config.float_denorm_mode_32 == 0;
+    w.ieee = k.config.ieee_mode;
 }
 
 /// Run a dispatch: every workgroup of the grid, every wave of each.
@@ -404,7 +411,7 @@ fn step(w: *Work, mem: *const Memory, d: *const Dispatch, wv: *Wave, in: *const 
         .smem => try smem(w, mem, wv, in, stats),
         .vop1, .vop2, .vopc, .vop3 => try valu(w, wv, in, stats),
         .ds => try lds(w, wv, in, stats),
-        .mubuf, .mtbuf => try buffer(w, mem, wv, in, stats),
+        .mubuf, .mtbuf => try buffer(w, mem, wv, in, stats, d.strict_buffers),
         .flat => try flat(w, mem, wv, in, stats),
     }
     wv.ws = ws_before + (if (in.op == op("s_nop")) in.imm + 1 else 1);
@@ -924,6 +931,25 @@ fn frexpExp(comptime T: type, x: T) i32 {
     return std.math.frexp(x).exponent;
 }
 
+/// V_MIN_F32 / V_MAX_F32 as the GCN3 guide's pseudocode has them: with
+/// IEEE mode a signaling NaN comes out quieted; otherwise a NaN operand
+/// gives the other one; between equal operands (-0 and +0 included) the
+/// second.
+fn minMax(ieee: bool, a: f32, b: f32, want_max: bool) f32 {
+    const ab: u32 = @bitCast(a);
+    const bb: u32 = @bitCast(b);
+    const a_nan = std.math.isNan(a);
+    const b_nan = std.math.isNan(b);
+    if (ieee) {
+        if (a_nan and ab & 0x0040_0000 == 0) return @bitCast(ab | 0x0040_0000);
+        if (b_nan and bb & 0x0040_0000 == 0) return @bitCast(bb | 0x0040_0000);
+    }
+    if (a_nan) return b;
+    if (b_nan) return a;
+    if (want_max) return if (a > b) a else b;
+    return if (a < b) a else b;
+}
+
 fn med3(comptime T: type, a: T, b: T, c: T) T {
     return @max(@min(a, b), @min(@max(a, b), c));
 }
@@ -1069,8 +1095,8 @@ fn lane1(w: *const Work, o: gcn3.Op, a: u64, b: u64, c: u64, old: u64, ln: u32) 
         op("v_subrev_f32") => F(fb - fa, ftz),
         op("v_mul_f32") => F(fa * fb, ftz),
         op("v_mul_legacy_f32") => if (fa == 0 or fb == 0) 0 else F(fa * fb, ftz),
-        op("v_min_f32") => F(@min(fa, fb), ftz),
-        op("v_max_f32") => F(@max(fa, fb), ftz),
+        op("v_min_f32") => F(minMax(w.ieee, fa, fb, false), ftz),
+        op("v_max_f32") => F(minMax(w.ieee, fa, fb, true), ftz),
         op("v_min3_f32") => F(@min(fa, fb, fc), ftz),
         op("v_max3_f32") => F(@max(fa, fb, fc), ftz),
         op("v_med3_f32") => F(med3(f32, fa, fb, fc), ftz),
@@ -1308,7 +1334,8 @@ fn valu(w: *Work, wv: *Wave, in: *const Instr, stats: *Stats) Error!void {
                 const t = df.s[0];
                 const hit = if (code < 0x20) class(a, t, @truncate(b)) else if (code < 0x80) switch (t) {
                     .f16 => fcmp(code & 15, f16of(a), f16of(b)),
-                    .f32 => fcmp(code & 15, f32of(a), f32of(b)),
+                    // (f32 compares see flushed inputs in flush mode)
+                    .f32 => if (w.ftz32) fcmp(code & 15, flush32(f32of(a)), flush32(f32of(b))) else fcmp(code & 15, f32of(a), f32of(b)),
                     else => fcmp(code & 15, f64of(a), f64of(b)),
                 } else blk: {
                     const unsigned = code & 8 != 0;
@@ -1648,7 +1675,7 @@ fn baseName(name: []const u8) []const u8 {
 
 // ── MUBUF / MTBUF ───────────────────────────────────────────────────────────
 
-fn buffer(w: *Work, mem: *const Memory, wv: *Wave, in: *const Instr, stats: *Stats) Error!void {
+fn buffer(w: *Work, mem: *const Memory, wv: *Wave, in: *const Instr, stats: *Stats, strict: bool) Error!void {
     const df = in.d();
     const name = df.name;
     wv.vm_issued += 1;
@@ -1691,6 +1718,7 @@ fn buffer(w: *Work, mem: *const Memory, wv: *Wave, in: *const Instr, stats: *Sta
         const dr = in.dst - gcn3.VGPR0;
         // range: raw buffers check the offset, structured ones the index
         const in_range = if (rsrc.stride == 0) offset + size <= rsrc.num_records else index < rsrc.num_records;
+        if (!in_range and strict) return w.fail(error.Fault, "{s} lane {d}: offset 0x{x} past the V#'s 0x{x} records", .{ name, ln, offset, rsrc.num_records });
         if (atomic) {
             const is64 = ndw == 2 and !std.mem.endsWith(u8, name, "cmpswap") or ndw == 4;
             const n: usize = if (is64) 8 else 4;

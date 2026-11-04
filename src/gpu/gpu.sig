@@ -58,6 +58,10 @@ pub const EmuDevice = emu_device.EmuDevice;
 pub const kir_ir3 = @import("kir_ir3.sig");
 pub const adreno_device = @import("adreno_device.sig");
 
+// AMD GCN 4 (gfx803, Polaris): KIR to gcn3 words, and the emulated GPU as a Device.
+pub const kir_gcn4 = @import("kir_gcn4.sig");
+pub const amd_device = @import("amd_device.sig");
+
 test {
     _ = kir;
     _ = device;
@@ -65,4 +69,6 @@ test {
     _ = emu_device;
     _ = kir_ir3;
     _ = adreno_device;
+    _ = kir_gcn4;
+    _ = amd_device;
 }
