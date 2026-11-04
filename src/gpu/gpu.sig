@@ -15,6 +15,8 @@ pub const kir = @import("kir.sig");
 pub const device = @import("device.sig");
 pub const interp = @import("kir_interp.sig");
 pub const emu_device = @import("emu_device.sig");
+/// The RTX as a Device (Galaxy's driver or the emulated RTX), running kir_sm120.
+pub const nvidia_device = @import("nvidia_device.sig");
 
 // KIR
 pub const Ty = kir.Ty;
@@ -45,6 +47,9 @@ pub const Fence = device.Fence;
 pub const Device = device.Device;
 pub const Work = device.Work;
 pub const compile = device.compile;
+/// compile with only the listed targets' backends linked (kernel images).
+pub const compileFor = device.compileFor;
+pub const all_targets = device.all_targets;
 pub const interp_caps = device.interp_caps;
 
 pub const EmuDevice = emu_device.EmuDevice;
