@@ -1015,8 +1015,14 @@ pub fn Eval(comptime config: types.Config) type {
                             return error.WorkspaceCapacity;
                         } else {
                             var pair: V.Text = .{ .len = 16 };
-                            @memcpy(pair.bytes[0..8], &@as([8]u8, @bitCast(y.float8)));
-                            @memcpy(pair.bytes[8..16], &@as([8]u8, @bitCast(x.float8)));
+                            // Little-endian bytes through u64: the native SB0
+                            // compiler rejects array/float @bitCast.
+                            const y_bits: u64 = @bitCast(y.float8);
+                            const x_bits: u64 = @bitCast(x.float8);
+                            for (0..8) |i| {
+                                pair.bytes[i] = @truncate(y_bits >> @intCast(i * 8));
+                                pair.bytes[8 + i] = @truncate(x_bits >> @intCast(i * 8));
+                            }
                             return .{ .text = pair };
                         }
                     },

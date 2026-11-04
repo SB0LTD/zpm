@@ -2396,8 +2396,15 @@ pub fn Exec(comptime config: types.Config) type {
                             return error.WorkspaceCapacity;
                         } else {
                             const bytes = &input.text.bytes;
-                            const y: f64 = @bitCast(bytes[0..8].*);
-                            const x: f64 = @bitCast(bytes[8..16].*);
+                            // Read back through u64 (see the writer in expr.sig).
+                            var y_bits: u64 = 0;
+                            var x_bits: u64 = 0;
+                            for (0..8) |i| {
+                                y_bits |= @as(u64, bytes[i]) << @intCast(i * 8);
+                                x_bits |= @as(u64, bytes[8 + i]) << @intCast(i * 8);
+                            }
+                            const y: f64 = @bitCast(y_bits);
+                            const x: f64 = @bitCast(x_bits);
                             const pair = sumsYY(acc);
                             try aggregate_stats.accumulatePair(acc.count - 1, y, x, .{ .sx = &acc.sx, .sxx = &acc.sxx, .sy = sumY(acc), .syy = &pair[0], .sxy = &pair[1] });
                         }
