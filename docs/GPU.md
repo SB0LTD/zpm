@@ -303,9 +303,11 @@ A new GPU is a KIR backend plus a device adapter. Nothing else changes.
      barriers, the shader config).
 
    Work and output memory come from the caller, through `Work.take`.
-3. **Register the backend.** In `device.sig`'s backend table, replace that
-   target's `none` with an import of the backend file, and add a switch
-   prong. Each target is one line, so branches merge cleanly.
+3. **Register the backend.** In `device.sig`'s backend table, add a line
+   importing the backend file, and add a prong to `compileOne`'s switch.
+   Each target is one line, so branches merge cleanly. Because `compileFor`
+   switches on a comptime target, an image that doesn't list the new target
+   doesn't link it.
 4. **The adapter: `src/gpu/<vendor>_device.sig`.** It provides `over(raw
    driver device, caps) gpu.Device`. Its jobs:
    - allocation by kind;
@@ -338,7 +340,16 @@ The usual sequence:
 2. Allocate bindings with `k.binding()` and read parameters with
    `k.param(ty, w)`.
 3. Emit the body with the helpers, then call `try k.finish()`.
-4. Compile: `gpu.compile(&k, dev.caps, &work, &out)`.
+4. Compile: `gpu.compile(&k, dev.caps, &work, &out)`. `compile` links every
+   backend, which suits tests and tools. An image for one machine uses
+   `gpu.compileFor(&.{ .ir3_a7xx }, &k, dev.caps, &work, &out)` instead:
+   only the listed targets' backends are referenced, and so linked. Any
+   other target returns `error.Unsupported` at run time. On a freestanding
+   AArch64 object (ReleaseSmall), compileFor with only the interpreter is
+   6.6 KB; with only ir3_a7xx, 276 KB; with only sm_120, 230 KB; compile
+   with all of them, 453 KB. `kir_interp` is linked only by code that runs
+   kernels on the interpreter (EmuDevice, the backends' tests), never by
+   compile.
 5. Load: `dev.load(&bin)`.
 6. Run: `dev.run(&.{ .{ .prog = &p, .groups = ..., .buffers = ..., .params = ... } })`.
 7. Wait: `dev.wait(fence, timeout_us)`.

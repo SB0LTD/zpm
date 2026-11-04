@@ -47,6 +47,9 @@ pub const Fence = device.Fence;
 pub const Device = device.Device;
 pub const Work = device.Work;
 pub const compile = device.compile;
+/// compile with only the listed targets' backends linked (kernel images).
+pub const compileFor = device.compileFor;
+pub const all_targets = device.all_targets;
 pub const interp_caps = device.interp_caps;
 
 pub const EmuDevice = emu_device.EmuDevice;

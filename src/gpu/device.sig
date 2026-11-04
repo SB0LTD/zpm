@@ -240,12 +240,32 @@ const none = struct {
     }
 };
 
+/// Every target there is: what `compile` links.
+pub const all_targets: []const Target = std.enums.values(Target);
+
 /// Compile `k` for `caps.target` (the backends: kir_ir3, kir_sm120; interp
 /// keeps the KIR itself, in its 24-byte form, in `out`). Verifies `k`
-/// against caps first.
+/// against caps first. Links every backend: for tests and tools; a kernel
+/// image uses compileFor.
 pub fn compile(k: *const kir.Kernel, caps: Caps, work: *Work, out: []u8) !Binary {
+    return compileFor(all_targets, k, caps, work, out);
+}
+
+/// compile, with only the backends `targets` names referenced (and so
+/// linked): an image for one machine carries its GPU's backend and no
+/// other. A target not in the list is error.Unsupported at run time.
+pub fn compileFor(comptime targets: []const Target, k: *const kir.Kernel, caps: Caps, work: *Work, out: []u8) !Binary {
     try kir.verify(k, caps);
-    return switch (caps.target) {
+    inline for (targets) |t| {
+        if (caps.target == t) return compileOne(t, k, caps, work, out);
+    }
+    return error.Unsupported;
+}
+
+/// One target's backend; the switch is on a comptime value, so only that
+/// prong is analyzed.
+fn compileOne(comptime t: Target, k: *const kir.Kernel, caps: Caps, work: *Work, out: []u8) !Binary {
+    return switch (t) {
         .interp => interpBinary(k, out),
         .ir3_a7xx => backend_ir3_a7xx.compile(k, caps, work, out),
         .sm_120 => backend_sm_120.compile(k, caps, work, out),
@@ -287,6 +307,40 @@ test "device: compile for the interpreter" {
     caps.target = .sm_120;
     // (sm_120 is kir_sm120's: a 256-byte Work is too small for its State)
     try std.testing.expectError(error.TooBig, compile(&k, caps, &work, &out));
+}
+
+test "device: compileFor links and compiles only the targets it names" {
+    var insts: [16]kir.Inst = undefined;
+    var tys: [16]kir.Ty = undefined;
+    var k = kir.Kernel.init(.{ .insts = &insts, .tys = &tys }, "one", .{ 32, 1, 1 });
+    const b = k.binding();
+    const t = k.tid(0);
+    k.store(.u32, kir.global(b, 32), kir.r(k.op2(.shl, .u32, kir.r(t), kir.u(2))), kir.r(t));
+    try k.finish();
+    var mem: [256]u8 = undefined;
+    var work = Work.init(&mem);
+    var out: [16 * kir.INST_BYTES]u8 = undefined;
+    const interp_only = [_]Target{.interp};
+    const bin = try compileFor(&interp_only, &k, interp_caps, &work, &out);
+    try std.testing.expectEqual(Target.interp, bin.target);
+    try std.testing.expectEqual(@as(u32, 3), bin.extra[0]);
+    // the other targets are not there: Unsupported, at run time
+    for ([_]Target{ .ir3_a7xx, .sm_120 }) |other| {
+        var caps = interp_caps;
+        caps.target = other;
+        try std.testing.expectError(error.Unsupported, compileFor(&interp_only, &k, caps, &work, &out));
+    }
+    // an image with one GPU's backend, asked for the interpreter
+    try std.testing.expectError(error.Unsupported, compileFor(&.{.ir3_a7xx}, &k, interp_caps, &work, &out));
+    try std.testing.expectError(error.Unsupported, compileFor(&.{}, &k, interp_caps, &work, &out));
+    // verification comes first, whatever the list
+    var bad = interp_caps;
+    bad.max_group = 16;
+    try std.testing.expectError(error.Limits, compileFor(&interp_only, &k, bad, &work, &out));
+    // compile is compileFor over every target
+    try std.testing.expectEqual(@typeInfo(Target).@"enum".field_names.len, all_targets.len);
+    const all = try compile(&k, interp_caps, &work, &out);
+    try std.testing.expectEqualSlices(u8, bin.code, all.code);
 }
 
 test "device: work storage" {
