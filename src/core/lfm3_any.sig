@@ -106,6 +106,13 @@ pub const Options = struct {
     /// the kernel, the layer and the tensor. Slow: for checking a GPU.
     diagnose: ?*const fn (what: []const u8) void = null,
     diagnose_timeout_us: u64 = 2_000_000,
+    /// Every fsqrt (and fdiv) expanded in KIR (kir.expand) before the
+    /// backend sees it: MUFU only as the seed of an expansion proved exact
+    /// for any seed within its bound. kir_sm120's own fsqrt is ptxas's
+    /// sqrt.rn (MUFU.RSQ and one FFMA correction), checked only on
+    /// sm120_emu, whose MUFU is exact: on hardware a wrong step would show
+    /// only there. For checking a GPU against its emulator; slower.
+    exact_sqrt: bool = false,
 };
 
 pub const MATRIX_VARIANTS = kernels.MAX_TOKENS;
@@ -339,6 +346,15 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 return if (e == error.Unsupported) error.Unsupported else error.CompileFailed;
             };
             var cw = gpu.Work.init(&self.work.compile_mem);
+            if (self.options.exact_sqrt) {
+                // (the expansions' KIR in the compile memory's first part)
+                const n = 2 * k.insts.len;
+                const store = kir.Storage{ .insts = cw.take(kir.Inst, n) orelse return error.CompileFailed, .tys = cw.take(kir.Ty, n) orelse return error.CompileFailed };
+                k = kir.expand(&k, self.caps, store) catch |e| {
+                    self.compile_error = e;
+                    return error.CompileFailed;
+                };
+            }
             const bin = gpu.compile(&k, self.caps, &cw, &self.work.code) catch |e| {
                 self.compile_error = e;
                 return error.CompileFailed;
@@ -595,6 +611,47 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         /// token. error.DeviceLost or error.LongContext: the cache is as it
         /// was, and toCpu() + the CPU executor can do the call.
         pub fn forward(self: *Self, c: *Cache, input: executor.Input, output: executor.Output) Error!?u32 {
+            var call = try self.begin(c, input, output);
+            const l = &call.list;
+            const count = call.count;
+            const cache = &c.cpu;
+            var ns: u64 = 0;
+            if (self.options.diagnose) |log| {
+                for (l.slice(), 0..) |*d, i| {
+                    var buf: [256]u8 = undefined;
+                    const what = self.describe(l, i, count, &buf);
+                    log(what);
+                    const fence = self.dev.run(d[0..1]) catch |e| return self.diagnoseFailed(log, c, e, what);
+                    self.dev.wait(fence, self.options.diagnose_timeout_us) catch |e| {
+                        if (e != error.Timeout) return self.diagnoseFailed(log, c, e, what);
+                        var b2: [320]u8 = undefined;
+                        log(std.fmt.bufPrint(&b2, "lfm3-any: still running after {d} ms (a hang?): {s}", .{ self.options.diagnose_timeout_us / 1000, what["lfm3-any: ".len..] }) catch what);
+                        self.slow += 1;
+                        self.dev.wait(fence, std.math.maxInt(u64)) catch |e2| return self.diagnoseFailed(log, c, e2, what);
+                    };
+                    ns += self.dev.lastRunNs();
+                }
+                var b3: [128]u8 = undefined;
+                log(std.fmt.bufPrint(&b3, "lfm3-any: forward of {d} tokens at position {d}: all {d} dispatches done", .{ count, cache.position, l.n }) catch "lfm3-any: forward done");
+            } else {
+                var at: usize = 0;
+                while (at < l.n) {
+                    const part = l.slice()[at..@min(l.n, at + self.options.max_run)];
+                    const fence = self.dev.run(part) catch |e| return self.failed(c, e);
+                    self.finish(fence) catch |e| return self.failed(c, e);
+                    ns += self.dev.lastRunNs();
+                    at += part.len;
+                }
+            }
+            self.last_ns = ns;
+            return self.complete(c, &call, output);
+        }
+
+        /// A call made and not yet run: its dispatches, its tokens.
+        const Call = struct { list: List, count: usize, kv_back: bool, conv_bytes: usize };
+
+        /// A call's checks, uploads and dispatch list (forward's first half).
+        fn begin(self: *Self, c: *Cache, input: executor.Input, output: executor.Output) Error!Call {
             const cache = &c.cpu;
             const plan = self.plan;
             const h: usize = plan.hidden_size;
@@ -659,38 +716,15 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             }
             self.dispatches = @intCast(l.n);
             self.total_dispatches += l.n;
-            var ns: u64 = 0;
-            if (self.options.diagnose) |log| {
-                for (l.slice(), 0..) |*d, i| {
-                    var buf: [256]u8 = undefined;
-                    const what = self.describe(&l, i, count, &buf);
-                    log(what);
-                    const fence = self.dev.run(d[0..1]) catch |e| return self.diagnoseFailed(log, c, e, what);
-                    self.dev.wait(fence, self.options.diagnose_timeout_us) catch |e| {
-                        if (e != error.Timeout) return self.diagnoseFailed(log, c, e, what);
-                        var b2: [320]u8 = undefined;
-                        log(std.fmt.bufPrint(&b2, "lfm3-any: still running after {d} ms (a hang?): {s}", .{ self.options.diagnose_timeout_us / 1000, what["lfm3-any: ".len..] }) catch what);
-                        self.slow += 1;
-                        self.dev.wait(fence, std.math.maxInt(u64)) catch |e2| return self.diagnoseFailed(log, c, e2, what);
-                    };
-                    ns += self.dev.lastRunNs();
-                }
-                var b3: [128]u8 = undefined;
-                log(std.fmt.bufPrint(&b3, "lfm3-any: forward of {d} tokens at position {d}: all {d} dispatches done", .{ count, cache.position, l.n }) catch "lfm3-any: forward done");
-            } else {
-                var at: usize = 0;
-                while (at < l.n) {
-                    const part = l.slice()[at..@min(l.n, at + self.options.max_run)];
-                    const fence = self.dev.run(part) catch |e| return self.failed(c, e);
-                    self.finish(fence) catch |e| return self.failed(c, e);
-                    ns += self.dev.lastRunNs();
-                    at += part.len;
-                }
-            }
-            self.last_ns = ns;
-            if (kv_back) c.kv_on_cpu = false;
-            self.dev.fromDevice(c.conv, 0, conv_bytes);
-            cache.position += count;
+            return .{ .list = l, .count = count, .kv_back = kv_back, .conv_bytes = conv_bytes };
+        }
+
+        /// A call run: its state back, the cache advanced (forward's last part).
+        fn complete(self: *Self, c: *Cache, call: *const Call, output: executor.Output) ?u32 {
+            const h: usize = self.plan.hidden_size;
+            if (call.kv_back) c.kv_on_cpu = false;
+            self.dev.fromDevice(c.conv, 0, call.conv_bytes);
+            c.cpu.position += call.count;
             if (output == .none) return null;
             self.dev.fromDevice(self.out_hidden, 0, h * 4);
             if (output == .hidden) return null;
@@ -793,6 +827,604 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 most = @max(most, if (l.sliding_window) @min(end, self.plan.sliding_window) else end);
             }
             return most;
+        }
+
+        // ── Locating a difference from the CPU (diagnose boots) ────────────
+
+        /// What locate found.
+        pub const Where = struct {
+            /// The first layer whose output differs from the CPU's (null:
+            /// every layer's agrees; the output norm or the logits differ).
+            layer: ?u8 = null,
+            /// The dispatch (in that layer's run) whose output is not what
+            /// the CPU computes from that dispatch's own inputs, and its
+            /// kernel ("?" when every dispatch of the layer reproduces: then
+            /// the difference came in through an input).
+            dispatch: u32 = 0,
+            kernel: []const u8 = "?",
+            tensor: ?u16 = null,
+            /// The buffer compared, the first element that differs, the
+            /// largest difference, and it relative to the largest value.
+            buffer: []const u8 = "",
+            index: usize = 0,
+            max_abs: f32 = 0,
+            relative: f32 = 0,
+        };
+
+        /// The CPU executor locate compares with: the model as the CPU
+        /// reads it, its packed weights (empty: the row kernels), a
+        /// Workspace, and KV and conv storage for the call's context.
+        pub fn CpuReference(comptime limits: executor.Limits) type {
+            return struct {
+                source: gguf.Source,
+                weights: *const executor.PackedWeights(tensor_capacity),
+                work: *executor.Workspace(limits),
+                kv: []u16,
+                conv: []f32,
+                parallel: executor.Parallel = .{},
+            };
+        }
+
+        /// Find where the GPU and the CPU executor part, for `input` run from
+        /// position 0 of a fresh cache of `context` positions on both:
+        ///
+        /// 1. the whole model; equal hidden rows and logits: null;
+        /// 2. the first layer whose hidden rows differ, by bisecting the
+        ///    number of layers (each run from a fresh cache on both sides);
+        /// 3. that layer's buffers against the CPU Workspace's (logged);
+        /// 4. that layer run again one dispatch at a time, each dispatch's
+        ///    output checked against what the CPU computes from its own
+        ///    inputs (read back before it ran): the first that differs is
+        ///    the kernel.
+        ///
+        /// "Differs": a difference larger than `tolerance` times the
+        /// largest value compared (0: any bit). Every comparison is logged.
+        /// For diagnose boots: slow (several forward passes on both sides);
+        /// buffers without a CPU view (VRAM) are read back through the copy
+        /// kernel into `.host` memory. The backend's caches are untouched.
+        pub fn locate(self: *Self, comptime limits: executor.Limits, cpu: CpuReference(limits), input: executor.Input, context: u32, tolerance: f32, log: *const fn (what: []const u8) void) Error!?Where {
+            const full = self.plan;
+            defer self.plan = full;
+            // (its runs are not diagnose mode's: their lines would drown its own)
+            const diagnose = self.options.diagnose;
+            self.options.diagnose = null;
+            defer self.options.diagnose = diagnose;
+            var plan: lfm3.Plan = undefined;
+            const n = full.layer_count;
+            var line: [320]u8 = undefined;
+            // 1. the whole model
+            truncate(&plan, full, n);
+            self.plan = &plan;
+            const whole = try self.compareRun(limits, cpu, input, context, .logits, tolerance, log, n);
+            if (!whole.hidden and !whole.output) {
+                log("lfm3-any locate: the GPU's hidden rows and logits are the CPU's");
+                return null;
+            }
+            if (!whole.hidden) {
+                log(std.fmt.bufPrint(&line, "lfm3-any locate: every layer agrees; the {s} differs", .{whole.where.buffer}) catch "lfm3-any locate: the output differs");
+                return whole.where;
+            }
+            // 2. bisect: differs(hi) and not differs(lo) (no layers: the CPU's rows)
+            var lo: u8 = 0;
+            var hi: u8 = n;
+            while (hi - lo > 1) {
+                const mid = lo + (hi - lo) / 2;
+                truncate(&plan, full, mid);
+                const r = try self.compareRun(limits, cpu, input, context, .none, tolerance, log, mid);
+                if (r.hidden) hi = mid else lo = mid;
+            }
+            const li = hi - 1;
+            log(std.fmt.bufPrint(&line, "lfm3-any locate: the first layer that differs is layer {d} of {d} ({s})", .{ li, n, if (full.layers[li].kind == .attention) "attention" else "short conv" }) catch "lfm3-any locate: a layer differs");
+            // 3. its buffers against the Workspace's (both runs of hi layers)
+            truncate(&plan, full, hi);
+            _ = try self.compareRun(limits, cpu, input, context, .none, tolerance, log, hi);
+            try self.compareWorkspace(limits, cpu, &full.layers[li], li, input, log);
+            // 4. one dispatch at a time
+            var where = try self.verifyLayer(input, context, li, tolerance, log);
+            where.layer = li;
+            return where;
+        }
+
+        fn truncate(plan: *lfm3.Plan, full: *const lfm3.Plan, layers: u8) void {
+            plan.* = full.*;
+            plan.layer_count = layers;
+            plan.conv_layer_count = 0;
+            plan.attention_layer_count = 0;
+            for (plan.layers[0..layers]) |l| {
+                if (l.kind == .attention) plan.attention_layer_count += 1 else plan.conv_layer_count += 1;
+            }
+        }
+
+        const RunDiff = struct { hidden: bool, output: bool, where: Where = .{} };
+
+        /// The CPU and the GPU on self.plan (truncated) from fresh caches;
+        /// their hidden rows (and with `output`, the output norm's row and
+        /// the logits) compared.
+        fn compareRun(self: *Self, comptime limits: executor.Limits, cpu: CpuReference(limits), input: executor.Input, context: u32, output: executor.Output, tolerance: f32, log: *const fn (what: []const u8) void, layers: u8) Error!RunDiff {
+            const plan = self.plan;
+            const h: usize = plan.hidden_size;
+            const count: usize = switch (input) {
+                .tokens => |t| t.len,
+                .embeddings => |e| e.len / h,
+            };
+            // the CPU
+            const kv_n = if (plan.attention_layer_count > 0) try executor.requiredKvElements(plan, context) else 0;
+            const conv_n = try executor.requiredConvElements(plan);
+            if (cpu.kv.len < kv_n or cpu.conv.len < conv_n) return error.ContextCapacity;
+            @memset(cpu.kv[0..kv_n], 0);
+            @memset(cpu.conv[0..conv_n], 0);
+            var cc = executor.Cache{ .kv = cpu.kv[0..kv_n], .conv = cpu.conv[0..conv_n], .context = context };
+            _ = try executor.forwardInput(tensor_capacity, limits, cpu.source, self.index, plan, cpu.weights, cpu.work, &cc, input, output, cpu.parallel);
+            // the GPU
+            var gc = try self.newCache(context);
+            defer self.freeCache(&gc);
+            _ = try self.forward(&gc, input, output);
+            const area = try self.dev.alloc(std.mem.alignForward(u64, self.s.hidden.bytes, 16), .host);
+            defer self.dev.free(area);
+            var at: u64 = 0;
+            const rows = try self.readBack(self.s.hidden, area, &at);
+            var r = RunDiff{ .hidden = false, .output = false };
+            var line: [320]u8 = undefined;
+            const hd = Check.of(f32s(rows)[0 .. count * h], cpu.work.hidden[0 .. count * h]);
+            r.hidden = hd.differs(tolerance);
+            log(hd.say(&line, "hidden rows", layers));
+            if (output == .logits) {
+                const nd = Check.of(self.hidden(), cpu.work.normalized[0..h]);
+                log(nd.say(&line, "output norm's row", layers));
+                const ld = Check.of(self.logits(), cpu.work.logits[0..plan.vocabulary_size]);
+                log(ld.say(&line, "logits", layers));
+                if (nd.differs(tolerance)) {
+                    r.output = true;
+                    r.where = nd.where("output norm's row", "norm+quant (output)", plan.output_norm.index);
+                } else if (ld.differs(tolerance)) {
+                    r.output = true;
+                    r.where = ld.where("logits", if (self.index.tensors[plan.output.index].ggml_type == 12) "matrix q4k" else "matrix q6k", plan.output.index);
+                }
+            }
+            return r;
+        }
+
+        /// The layer's buffers the CPU's Workspace also holds, after a run of
+        /// layers 0..li on both: logged.
+        fn compareWorkspace(self: *Self, comptime limits: executor.Limits, cpu: CpuReference(limits), ly: *const lfm3.Layer, li: u8, input: executor.Input, log: *const fn (what: []const u8) void) Error!void {
+            const plan = self.plan;
+            const h: usize = plan.hidden_size;
+            const count: usize = switch (input) {
+                .tokens => |t| t.len,
+                .embeddings => |e| e.len / h,
+            };
+            const w = cpu.work;
+            const s = &self.s;
+            var line: [320]u8 = undefined;
+            const Pair = struct { name: []const u8, gpu: Buffer, cpu: []const f32 };
+            const q = plan.queryWidth();
+            const kvw = @as(usize, ly.kv_head_count) * plan.head_size;
+            const ff: usize = plan.feed_forward_size;
+            const conv_pairs = [_]Pair{
+                .{ .name = "mixed (in_proj)", .gpu = s.mixed, .cpu = w.mixed[0 .. count * 3 * h] },
+                .{ .name = "mixer (conv)", .gpu = s.mixer, .cpu = w.mixer[0 .. count * h] },
+            };
+            const attn_pairs = [_]Pair{
+                .{ .name = "value (attn_v)", .gpu = s.value, .cpu = w.value[0 .. count * kvw] },
+                .{ .name = "gate (attn_gate)", .gpu = s.gate, .cpu = w.gate[0 .. count * plan.head_count] },
+                .{ .name = "query (attn_q, prepared)", .gpu = s.query, .cpu = w.query[0 .. count * q] },
+                .{ .name = "mixer (attention)", .gpu = s.mixer, .cpu = w.mixer[0 .. count * q] },
+            };
+            const ffn_pairs = [_]Pair{
+                .{ .name = "normalized (ffn_norm)", .gpu = s.normalized, .cpu = w.normalized[0 .. count * h] },
+                .{ .name = "ffn_up", .gpu = s.ffn_up, .cpu = w.ffn_up[0 .. count * ff] },
+            };
+            const first: []const Pair = if (ly.kind == .attention) &attn_pairs else &conv_pairs;
+            var most: u64 = 16;
+            for ([_][]const Pair{ first, &ffn_pairs }) |pairs| for (pairs) |p| {
+                most = @max(most, std.mem.alignForward(u64, p.gpu.bytes, 16));
+            };
+            const area = try self.dev.alloc(most, .host);
+            defer self.dev.free(area);
+            for ([_][]const Pair{ first, &ffn_pairs }) |pairs| for (pairs) |p| {
+                var at: u64 = 0;
+                const got = try self.readBack(p.gpu, area, &at);
+                log(Check.of(f32s(got)[0..p.cpu.len], p.cpu).say(&line, p.name, li + 1));
+            };
+        }
+
+        fn f32s(bytes: []u8) []f32 {
+            return @alignCast(std.mem.bytesAsSlice(f32, bytes[0 .. bytes.len & ~@as(usize, 3)]));
+        }
+
+        /// A comparison of what the GPU wrote with what the CPU computes.
+        const Check = struct {
+            max_abs: f32 = 0,
+            max_ref: f32 = 0,
+            first: ?usize = null,
+            differing: usize = 0,
+            count: usize = 0,
+
+            fn add(c: *Check, i: usize, got: f32, want: f32) void {
+                c.count += 1;
+                c.max_ref = @max(c.max_ref, @abs(want));
+                if (@as(u32, @bitCast(got)) == @as(u32, @bitCast(want))) return;
+                c.differing += 1;
+                if (c.first == null) c.first = i;
+                const d = @abs(got - want);
+                c.max_abs = if (d != d) std.math.inf(f32) else @max(c.max_abs, d);
+            }
+
+            fn of(got: []const f32, want: []const f32) Check {
+                var c = Check{};
+                for (got, want, 0..) |g, w, i| c.add(i, g, w);
+                return c;
+            }
+
+            fn differs(c: *const Check, tolerance: f32) bool {
+                if (c.differing == 0) return false;
+                return !(c.max_abs <= tolerance * @max(c.max_ref, 1e-30));
+            }
+
+            fn relative(c: *const Check) f32 {
+                return c.max_abs / @max(c.max_ref, 1e-30);
+            }
+
+            fn say(c: *const Check, buf: []u8, what: []const u8, layers: u8) []const u8 {
+                if (c.differing == 0) return std.fmt.bufPrint(buf, "lfm3-any locate: {d} layers: {s}: the CPU's bits ({d} values)", .{ layers, what, c.count }) catch "lfm3-any locate";
+                return std.fmt.bufPrint(buf, "lfm3-any locate: {d} layers: {s}: {d} of {d} differ, the first at {d}; max |diff| {e} = {e} of the largest", .{ layers, what, c.differing, c.count, c.first.?, c.max_abs, c.relative() }) catch "lfm3-any locate";
+            }
+
+            fn where(c: *const Check, buffer: []const u8, kernel: []const u8, tensor: ?u16) Where {
+                return .{ .kernel = kernel, .tensor = tensor, .buffer = buffer, .index = c.first orelse 0, .max_abs = c.max_abs, .relative = c.relative() };
+            }
+        };
+
+        /// Run layers 0..li from a fresh cache, layer li a dispatch at a
+        /// time: each one's output against the CPU's from its own inputs.
+        fn verifyLayer(self: *Self, input: executor.Input, context: u32, li: u8, tolerance: f32, log: *const fn (what: []const u8) void) Error!Where {
+            var gc = try self.newCache(context);
+            defer self.freeCache(&gc);
+            var call = try self.begin(&gc, input, .none);
+            const l = &call.list;
+            const ds = l.slice();
+            const descs = self.work.descs[0..l.n];
+            // the snapshot area: the most bytes any of the layer's dispatches binds
+            var most: u64 = 0;
+            for (ds, descs) |d, w| {
+                if (w.layer != li) continue;
+                most = @max(most, self.boundBytes(d));
+            }
+            // (in four parts: the inputs before it ran (two), the outputs read
+            // back (VRAM without a CPU view), the CPU's scratch)
+            const third = std.mem.alignForward(u64, @max(most, 16), 16);
+            const snap = try self.dev.alloc(third * 4, .host);
+            defer self.dev.free(snap);
+            var line: [320]u8 = undefined;
+            var i: usize = 0;
+            while (i < ds.len) {
+                if (descs[i].layer != li) {
+                    // (the dispatches before the layer, as one run)
+                    var j = i;
+                    while (j < ds.len and descs[j].layer != li) j += 1;
+                    if (i > 0 and descs[i - 1].layer == li) break;
+                    try self.runNowSlice(ds[i..j]);
+                    i = j;
+                    continue;
+                }
+                const group: usize = if (std.mem.eql(u8, descs[i].kernel, "attention scores")) 4 else 1;
+                var buf: [256]u8 = undefined;
+                const what = self.describe(l, i, call.count, &buf);
+                const scratch = f32s(snap.cpu[@intCast(3 * third)..][0..@intCast(third)]);
+                const r = try self.checkDispatch(ds[i..][0..group], descs[i], li, snap, 2 * third, scratch);
+                if (r.c.count == 0) {
+                    log(std.fmt.bufPrint(&line, "lfm3-any locate: {s}: not checked", .{what["lfm3-any: ".len..]}) catch "?");
+                } else {
+                    var b2: [320]u8 = undefined;
+                    log(std.fmt.bufPrint(&line, "{s} <- {s}", .{ r.c.say(&b2, r.buffer, li + 1), what["lfm3-any: ".len..] }) catch "?");
+                }
+                if (r.c.differs(tolerance)) {
+                    // (attention's four kernels are checked as one: by their output)
+                    const name = if (group == 4) "attention (scores, softmax, values, combine)" else descs[i].kernel;
+                    var w = r.c.where(r.buffer, name, descs[i].tensor);
+                    w.dispatch = @intCast(i);
+                    log(std.fmt.bufPrint(&line, "lfm3-any locate: FOUND: {s} (dispatch {d}) is not what the CPU computes from its own inputs", .{ name, i }) catch "?");
+                    return w;
+                }
+                i += group;
+            }
+            log("lfm3-any locate: every dispatch of the layer is the CPU's from its own inputs: the difference came in through an input");
+            return .{};
+        }
+
+        /// Run `ds` now (one run) and wait.
+        fn runNowSlice(self: *Self, ds: []const gpu.Dispatch) Error!void {
+            if (ds.len == 0) return;
+            const fence = try self.dev.run(ds);
+            try self.dev.wait(fence, std.math.maxInt(u64));
+        }
+
+        /// The bytes a dispatch binds, but the model's (each from a 16-byte
+        /// boundary).
+        fn boundBytes(self: *const Self, d: gpu.Dispatch) u64 {
+            var n: u64 = 0;
+            for (d.buffers) |b| {
+                if (b.gpu != self.weights.gpu) n += std.mem.alignForward(u64, b.bytes, 16);
+            }
+            return n;
+        }
+
+        /// A buffer's bytes as the CPU sees them now: its own view (after
+        /// fromDevice), or (VRAM without one) a copy the copy kernel makes
+        /// into `area`, a `.host` buffer, at `at.*` (16-byte aligned), which
+        /// it advances.
+        fn readBack(self: *Self, b: Buffer, area: Buffer, at: *u64) Error![]u8 {
+            const n: usize = @intCast(b.bytes);
+            if (b.cpu.len >= n) {
+                self.dev.fromDevice(b, 0, b.bytes);
+                return b.cpu[0..n];
+            }
+            const start = at.*;
+            if (b.bytes % 16 != 0 or start % 16 != 0 or start + b.bytes > area.cpu.len or start + b.bytes > std.math.maxInt(u32)) return error.Unsupported;
+            const prog = if (self.k.copy) |*p| p else return error.Unsupported;
+            const total = b.bytes / 16;
+            var done_words: u64 = 0;
+            while (done_words < total) {
+                const words: u32 = @intCast(@min(total - done_words, 1 << 20));
+                const bufs = [2]Buffer{ b, area };
+                const ps = [3]u32{ words, @intCast(done_words * 16), @intCast(start + done_words * 16) };
+                const d = gpu.Dispatch{ .prog = prog, .groups = kernels.copyGroups(words), .buffers = &bufs, .params = &ps };
+                try self.runNowSlice((&d)[0..1]);
+                done_words += words;
+            }
+            self.dev.fromDevice(area, start, b.bytes);
+            at.* = start + b.bytes;
+            return area.cpu[@intCast(start)..][0..n];
+        }
+
+        const DispatchCheck = struct { c: Check = .{}, buffer: []const u8 = "" };
+
+        /// Snapshot a binding at `at` of the snapshot buffer (then the next
+        /// 16-byte boundary).
+        fn keep(self: *Self, snap: Buffer, at: *u64, b: Buffer) Error![]u8 {
+            const n: usize = @intCast(b.bytes);
+            const start = at.*;
+            if (start + b.bytes > snap.cpu.len) return error.Unsupported;
+            const dst = if (b.cpu.len >= n) blk: {
+                self.dev.fromDevice(b, 0, b.bytes);
+                const to = snap.cpu[@intCast(start)..][0..n];
+                @memcpy(to, b.cpu[0..n]);
+                break :blk to;
+            } else try self.readBack(b, snap, at);
+            at.* = std.mem.alignForward(u64, start + b.bytes, 16);
+            return dst;
+        }
+
+        fn model(self: *const Self, off: u32, len: usize) ?[]const u8 {
+            if (self.file.view(off, len, 1)) |v| return v;
+            if (self.weights.cpu.len >= @as(usize, off) + len) return self.weights.cpu[off..][0..len];
+            return null;
+        }
+
+        fn modelF32(self: *const Self, off: u32, n: usize) ?[]const f32 {
+            const b = self.model(off, n * 4) orelse return null;
+            if (@intFromPtr(b.ptr) % 4 != 0) return null;
+            return @alignCast(std.mem.bytesAsSlice(f32, b));
+        }
+
+        /// Run a dispatch (or attention's four) alone, its output checked
+        /// against the CPU's from its inputs as they were before it ran.
+        fn checkDispatch(self: *Self, ds: []const gpu.Dispatch, w: Desc, li: u8, snap: Buffer, outs: u64, scratch: []f32) Error!DispatchCheck {
+            const d = ds[0];
+            const k = w.kernel;
+            const plan = self.plan;
+            var at: u64 = 0;
+            var before: [8][]u8 = undefined;
+            for (d.buffers, 0..) |b, bi| before[bi] = if (b.gpu == self.weights.gpu) &.{} else try self.keep(snap, &at, b);
+            // attention's group: the gate (combine's binding 1) before too
+            var gate_before: []u8 = &.{};
+            if (ds.len == 4) gate_before = try self.keep(snap, &at, ds[3].buffers[1]);
+            try self.runNowSlice(ds);
+            const last = ds[ds.len - 1];
+            // (what it wrote, read back: from `outs` of the snapshot buffer)
+            var oat: u64 = outs;
+            var r = DispatchCheck{};
+            const p = d.params;
+            var y: [8192]f32 = undefined;
+            if (std.mem.eql(u8, k, "norm+quant") or std.mem.eql(u8, k, "quant") or std.mem.eql(u8, k, "swiglu+quant")) {
+                // rows of K: (norm) the CPU's rmsNormRow, then quantizeQ8K, against
+                // the normalized rows and the activation arrays
+                const width: usize = p[0];
+                const tokens: usize = d.groups[1];
+                const xb = f32s(before[0]);
+                const ub = f32s(before[1]);
+                const normalized: []u8 = if (std.mem.eql(u8, k, "norm+quant")) try self.readBack(d.buffers[2], snap, &oat) else &.{};
+                const aq_out = try self.readBack(d.buffers[3], snap, &oat);
+                const ad_out = try self.readBack(d.buffers[4], snap, &oat);
+                const as_out = try self.readBack(d.buffers[5], snap, &oat);
+                for (0..tokens) |t| {
+                    const x = xb[(p[3] / 4) + t * width ..][0..width];
+                    if (std.mem.eql(u8, k, "norm+quant")) {
+                        const wv = self.modelF32(p[4], width) orelse return r;
+                        rmsNormRow(x, wv, y[0..width], @bitCast(p[2]));
+                        const got = f32s(normalized)[(p[5] / 4) + t * width ..][0..width];
+                        for (got, y[0..width], 0..) |g, v, e| r.c.add(t * width + e, g, v);
+                        if (r.c.differing != 0) {
+                            r.buffer = "normalized rows";
+                            return r;
+                        }
+                    } else if (std.mem.eql(u8, k, "swiglu+quant")) {
+                        const u = ub[t * width ..][0..width];
+                        for (y[0..width], x, u) |*o, g, uv| o.* = (g / (1.0 + @exp(-g))) * uv;
+                    } else @memcpy(y[0..width], x);
+                    const blocks = width / quantized.QK_K;
+                    var q8: [32]quantized.Q8KBlock = undefined;
+                    quantized.quantizeQ8K(y[0..width], q8[0..blocks]) catch return r;
+                    for (q8[0..blocks], 0..) |blk, bi| {
+                        const index = t * blocks + bi;
+                        const aq = aq_out[index * 256 ..][0..256];
+                        const ad: f32 = @bitCast(std.mem.readInt(u32, ad_out[index * 4 ..][0..4], .little));
+                        r.c.add(index * 256, ad, blk.d);
+                        for (blk.qs, 0..) |qv, e| r.c.add(index * 256 + e, @floatFromInt(@as(i8, @bitCast(aq[e]))), @floatFromInt(qv));
+                        for (blk.bsums, 0..) |bs, e| r.c.add(index * 256 + e, @floatFromInt(std.mem.readInt(i16, as_out[index * 32 + 2 * e ..][0..2], .little)), @floatFromInt(bs));
+                    }
+                }
+                r.buffer = "activations (Q8_K)";
+                return r;
+            }
+            if (std.mem.startsWith(u8, k, "matrix")) {
+                // MatrixParams: row_bytes, blocks, rows, out_stride, strides, offsets
+                const q4 = std.mem.eql(u8, k, "matrix q4k");
+                const blocks: usize = p[1];
+                const rows: usize = p[2];
+                const tokens: usize = w.count;
+                const wm = self.model(p[7], rows * p[0]) orelse return r;
+                const out = try self.readBack(d.buffers[4], snap, &oat);
+                for (0..tokens) |t| {
+                    var acts: [32]quantized.Q8KBlock = undefined;
+                    for (0..blocks) |bi| {
+                        const aq = before[1][p[8] + t * p[4] + bi * 256 ..][0..256];
+                        @memcpy(std.mem.asBytes(&acts[bi].qs), aq);
+                        acts[bi].d = @bitCast(std.mem.readInt(u32, before[2][p[9] + t * p[5] + bi * 4 ..][0..4], .little));
+                        @memcpy(std.mem.asBytes(&acts[bi].bsums), before[3][p[10] + t * p[6] + bi * 32 ..][0..32]);
+                    }
+                    for (0..rows) |row| {
+                        const wrow = wm[row * p[0] ..][0..p[0]];
+                        const want = if (q4) quantized.dotQ4KQ8KTile(1, wrow, .{&acts}, blocks)[0] else quantized.dotQ6KQ8KTile(1, wrow, .{&acts}, blocks)[0];
+                        const got: f32 = @bitCast(std.mem.readInt(u32, out[p[11] + t * p[3] + row * 4 ..][0..4], .little));
+                        r.c.add(t * rows + row, got, want);
+                    }
+                }
+                r.buffer = "matrix outputs";
+                return r;
+            }
+            if (std.mem.eql(u8, k, "residual")) {
+                const width: usize = p[0];
+                const tokens: usize = d.groups[1];
+                const rows = f32s(try self.readBack(d.buffers[0], snap, &oat));
+                for (0..tokens) |t| {
+                    const blk = f32s(before[1])[t * width ..][0..width];
+                    @memcpy(y[0..width], blk);
+                    if (plan.sandwich_norms) {
+                        const wv = self.modelF32(p[2], width) orelse return r;
+                        rmsNormRow(blk, wv, y[0..width], @bitCast(p[1]));
+                    }
+                    const hb = f32s(before[0])[t * width ..][0..width];
+                    const got = rows[t * width ..][0..width];
+                    for (got, hb, y[0..width], 0..) |g, hv, v, e| r.c.add(t * width + e, g, hv + v);
+                }
+                r.buffer = "hidden rows";
+                return r;
+            }
+            if (std.mem.eql(u8, k, "conv")) {
+                const hw: usize = p[0];
+                const tokens: usize = p[1];
+                const taps: usize = plan.conv_kernel;
+                const tw = self.modelF32(p[2], hw * taps) orelse return r;
+                const state_n = (taps - 1) * hw;
+                if (state_n + tokens * hw > scratch.len) return r;
+                const state = scratch[0..state_n];
+                const out = scratch[state_n..][0 .. tokens * hw];
+                @memcpy(state, f32s(before[2])[p[3] / 4 ..][0..state_n]);
+                executor.shortConvChannels(taps, hw, tw, state, f32s(before[0])[0 .. tokens * 3 * hw], tokens, out, 0, hw);
+                const got = f32s(try self.readBack(d.buffers[3], snap, &oat))[0 .. tokens * hw];
+                for (got, out, 0..) |g, v, e| r.c.add(e, g, v);
+                const sgot = f32s(try self.readBack(d.buffers[2], snap, &oat))[p[3] / 4 ..][0..state_n];
+                for (sgot, state, 0..) |g, v, e| r.c.add(tokens * hw + e, g, v);
+                r.buffer = "conv outputs and state";
+                return r;
+            }
+            if (std.mem.eql(u8, k, "prepare")) {
+                // PrepareParams: heads, kv_heads, eps, first, context, slot, max_kv, qn, kn
+                const heads: usize = p[0];
+                const kvh: usize = p[1];
+                const hd: usize = HEAD_SIZE;
+                const tokens: usize = d.groups[1];
+                const ly = &plan.layers[li];
+                const qn = self.modelF32(p[7], hd) orelse return r;
+                const kn = self.modelF32(p[8], hd) orelse return r;
+                const factors: ?[]const f32 = if (!ly.sliding_window and self.has_factors) &self.factors else null;
+                const base = if (ly.sliding_window) plan.rope_frequency_base_swa else plan.rope_frequency_base;
+                const kv_out = try self.readBack(d.buffers[6], snap, &oat);
+                const kvc: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, kv_out[0 .. kv_out.len & ~@as(usize, 1)]));
+                const q_out = f32s(try self.readBack(d.buffers[0], snap, &oat));
+                for (0..tokens) |t| {
+                    const pos = p[3] + t;
+                    var qrow: [64 * HEAD_SIZE]f32 = undefined;
+                    var krow: [16 * HEAD_SIZE]f32 = undefined;
+                    if (heads * hd > qrow.len or kvh * hd > krow.len) return r;
+                    @memcpy(qrow[0 .. heads * hd], f32s(before[0])[t * heads * hd ..][0 .. heads * hd]);
+                    @memcpy(krow[0 .. kvh * hd], f32s(before[1])[t * kvh * hd ..][0 .. kvh * hd]);
+                    for (0..heads) |hh| rmsNormRow(qrow[hh * hd ..][0..hd], qn, qrow[hh * hd ..][0..hd], @bitCast(p[2]));
+                    for (0..kvh) |hh| rmsNormRow(krow[hh * hd ..][0..hd], kn, krow[hh * hd ..][0..hd], @bitCast(p[2]));
+                    executor.ropeNeox(qrow[0 .. heads * hd], heads, hd, pos, base, factors);
+                    executor.ropeNeox(krow[0 .. kvh * hd], kvh, hd, pos, base, factors);
+                    const qgot = q_out[t * heads * hd ..][0 .. heads * hd];
+                    for (qgot, qrow[0 .. heads * hd], 0..) |g, v, e| r.c.add(t * heads * hd + e, g, @floatCast(@as(f16, @floatCast(v))));
+                    const vrow = f32s(before[2])[t * kvh * hd ..][0 .. kvh * hd];
+                    for (0..kvh) |hh| for (0..2) |isv| {
+                        const row = ((((p[5] * 2 + isv) * p[6] + hh) * p[4]) + pos) * hd;
+                        for (0..hd) |e| {
+                            const want: f16 = @floatCast(if (isv == 0) krow[hh * hd + e] else vrow[hh * hd + e]);
+                            r.c.add(t * heads * hd + e, @floatCast(@as(f16, @bitCast(kvc[row + e]))), @floatCast(want));
+                        }
+                    };
+                }
+                r.buffer = "prepared queries and KV rows";
+                return r;
+            }
+            if (ds.len == 4) {
+                // attention: AttnParams words; the CPU's AttentionTask on the
+                // prepared queries and the KV cache as they were
+                const heads: usize = p[0];
+                const first: usize = p[2];
+                const tokens: usize = p[3];
+                const window: u32 = p[4];
+                const context: usize = p[5];
+                const slot: usize = p[6];
+                const max_kv: usize = p[7];
+                const group: usize = @as(usize, 1) << @intCast(p[10]);
+                const hd: usize = HEAD_SIZE;
+                const scale: f32 = @bitCast(p[11]);
+                const qb = f32s(before[0]);
+                const kvc: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, before[1][0 .. before[1].len & ~@as(usize, 1)]));
+                const gb = f32s(gate_before);
+                const outv = f32s(try self.readBack(last.buffers[2], snap, &oat));
+                var scores: [8192]f32 = undefined;
+                for (0..tokens) |t| for (0..heads) |hh| {
+                    const pos = first + t;
+                    const visible = lfm3.firstVisiblePosition(window != 0, window, pos);
+                    const kh = hh / group;
+                    const query = qb[(p[12] / 4) + (t * heads + hh) * hd ..][0..hd];
+                    const kblock = ((slot * 2) * max_kv + kh) * context * hd;
+                    const vblock = ((slot * 2 + 1) * max_kv + kh) * context * hd;
+                    var maximum: f32 = -std.math.inf(f32);
+                    if (pos + 1 - visible > scores.len) return r;
+                    for (visible..pos + 1) |kp| {
+                        var lanes: [8]f32 = @splat(0);
+                        for (0..hd / 8) |ii| for (0..8) |ln| {
+                            lanes[ln] += query[8 * ii + ln] * @as(f32, @floatCast(@as(f16, @bitCast(kvc[kblock + kp * hd + 8 * ii + ln]))));
+                        };
+                        var sum = lanes[0];
+                        for (1..8) |ln| sum += lanes[ln];
+                        scores[kp - visible] = sum * scale;
+                        maximum = @max(maximum, scores[kp - visible]);
+                    }
+                    const length = pos + 1 - visible;
+                    var total: f64 = 0;
+                    for (scores[0..length]) |*sc| {
+                        sc.* = @exp(sc.* - maximum);
+                        total += sc.*;
+                    }
+                    const inverse: f32 = @floatCast(1.0 / total);
+                    var acc: [HEAD_SIZE]f32 = @splat(0);
+                    for (scores[0..length], visible..) |sc, kp| {
+                        const wgt: f32 = @floatCast(@as(f16, @floatCast(sc * inverse)));
+                        for (&acc, 0..) |*a, e| a.* += wgt * @as(f32, @floatCast(@as(f16, @bitCast(kvc[vblock + kp * hd + e]))));
+                    }
+                    const g = 1.0 / (1.0 + @exp(-gb[(p[13] / 4) + t * heads + hh]));
+                    const got = outv[(p[14] / 4) + (t * heads + hh) * hd ..][0..hd];
+                    for (got, acc, 0..) |gv, a, e| r.c.add((t * heads + hh) * hd + e, gv, a * g);
+                };
+                r.buffer = "attention outputs";
+                return r;
+            }
+            return r;
         }
 
         fn layer(self: *Self, l: *List, ly: *const lfm3.Layer, c: *const Cache, n: u32) Error!void {
@@ -1066,6 +1698,17 @@ pub fn launchesFor(plan: *const lfm3.Plan, tokens: u32, attention_tokens: u32) u
         };
     }
     return n;
+}
+
+const HEAD_SIZE = kernels.HEAD_SIZE;
+
+/// lfm3_executor's rmsNormRow (locate's CPU side).
+fn rmsNormRow(input: []const f32, weight: []const f32, output: []f32, epsilon: f32) void {
+    var squares: f64 = 0;
+    for (input) |value| squares += @as(f64, value) * value;
+    const mean: f32 = @floatCast(squares / @as(f64, @floatFromInt(input.len)));
+    const inverse = 1.0 / @sqrt(mean + epsilon);
+    for (input, weight, output[0..input.len]) |value, scale, *destination| destination.* = value * inverse * scale;
 }
 
 fn blockBytes(ggml_type: u32) usize {
