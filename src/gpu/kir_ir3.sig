@@ -346,6 +346,8 @@ pub const Work = struct {
     stats: Stats = .{},
     diag: [256]u8 = undefined,
     diag_len: usize = 0,
+    /// The live registers past which the scheduler favours freeing them.
+    sched_pressure: i32 = SCHED_PRESSURE,
 };
 
 pub const Stats = struct {
@@ -387,13 +389,26 @@ pub fn compileWith(k: *const kir.Kernel, caps: device.Caps, w: *Work, out: []u8)
     w.bindings = k.bindings;
     w.param_words = k.param_words;
     w.shared_bytes = k.shared_bytes;
-    try expand(w, k);
-    try analyze(w);
-    try lower(w);
-    schedule(w);
-    try allocate(w);
-    try emitText(w);
-    return assembleOut(w, k, out);
+    // All of a group's waves must be resident at once: a footprint that
+    // keeps fewer cannot launch (ir3_emu.maxWaves, Mesa's a7xx formula).
+    // Tighter scheduling first; then the group is too big for the kernel.
+    const threads = k.group[0] * k.group[1] * k.group[2];
+    var last: device.Binary = undefined;
+    for ([_]i32{ SCHED_PRESSURE, 16, 0 }) |pressure| {
+        w.sched_pressure = pressure;
+        try expand(w, k);
+        try analyze(w);
+        try lower(w);
+        schedule(w);
+        try allocate(w);
+        try emitText(w);
+        last = try assembleOut(w, k, out);
+        const cfg = Config.fromExtra(last.extra).?;
+        if (adreno.ir3_emu.groupFits(w.gen, cfg.full_regs, w.threadsize, threads)) return last;
+    }
+    const cfg = Config.fromExtra(last.extra).?;
+    note(w, "a group of {d} threads needs {d} waves of {d} resident; {d} vec4 registers keep {d} (a7xx): use smaller groups", .{ threads, (threads + w.threadsize - 1) / w.threadsize, w.threadsize, cfg.full_regs, adreno.ir3_emu.maxWaves(w.gen, cfg.full_regs, w.threadsize) });
+    return error.TooManyRegs;
 }
 
 /// Why the last compile failed, when the backend knows more than the
@@ -2751,7 +2766,7 @@ fn scheduleBlock(w: *Work, start: u32, end: u32) void {
         var pick: ?u32 = null;
         var pick_ready: u32 = std.math.maxInt(u32);
         var pick_delta: i32 = 0;
-        const tight = pressure >= SCHED_PRESSURE;
+        const tight = pressure >= w.sched_pressure;
         var k: u32 = 0;
         while (k < n) : (k += 1) {
             if (w.sched_done[k] or w.sched_npred[k] != 0) continue;
