@@ -199,10 +199,10 @@ pub fn castable(from: Type, to: Type, context: Context) bool {
 /// turn distinct values into equal ones (e.g. 16777217 and 16777216::real).
 pub fn comparisonType(a: Type, b: Type) ?Type {
     if (a != b and numericCategory(a) and numericCategory(b) and (a == .float4 or b == .float4)) return .float8;
-    // bpchar with varchar resolves bpchareq (one exact operand, varchar is
-    // binary-coercible); any other string mix compares as TEXT.
     // bit and varbit compare with varbit's operators (varbit is preferred).
     if (a != b and bitType(a) and bitType(b)) return .varbit;
+    // bpchar with varchar resolves bpchareq (one exact operand, varchar is
+    // binary-coercible); any other string mix compares as TEXT.
     if (a != b and characterType(a) and characterType(b) and (a == .bpchar or b == .bpchar))
         return if ((a == .bpchar or a == .varchar) and (b == .bpchar or b == .varchar)) .bpchar else .text;
     return common(a, b);
@@ -420,7 +420,11 @@ pub fn Io(comptime config: types.Config) type {
                 lookup(session.resolver.context, name, &zone) catch return error.InvalidParameterValue;
                 if (ty == .timetz) {
                     const day = parsed.date orelse @divFloor(temporal.toLocal(&zone, session.transaction_us orelse session.statement_us orelse 0), temporal.usecs_per_day);
-                    zone_west = try time_of_day.zoneWest(&zone, day * temporal.usecs_per_day + parsed.us);
+                    // A leading date far outside the timestamp range has no
+                    // zone offset (22008), never an overflow.
+                    const midnight = @mulWithOverflow(day, temporal.usecs_per_day);
+                    if (midnight[1] != 0 or !temporal.validTimestamp(midnight[0])) return error.DatetimeFieldOverflow;
+                    zone_west = try time_of_day.zoneWest(&zone, midnight[0] + parsed.us);
                 }
             }
             if (ty == .time) return .{ .time = parsed.us };

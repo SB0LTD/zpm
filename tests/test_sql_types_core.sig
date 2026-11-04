@@ -777,6 +777,30 @@ fn moneyType() !void {
     try meta(1, 790, -1);
 }
 
+// ---- TIME/TIMETZ with session zones and zone names ---------------------------
+
+/// A caller zone provider that knows one fixed-offset name.
+fn testZone(context: ?*anyopaque, name: []const u8, zone: *sql.temporal.Zone) sql.Error!void {
+    _ = context;
+    if (!std.mem.eql(u8, name, "Test/Plus2")) return error.InvalidParameterValue;
+    zone.* = .{ .kind = .fixed, .offset = 7200 };
+}
+
+fn timeZones() !void {
+    db.session.resolver = .{ .lookup = &testZone };
+    defer db.session.resolver = .{};
+    try rows("SELECT '12:00 Test/Plus2'::timetz, '12:00 Test/Plus2'::time, '2026-07-01 12:00 Test/Plus2'::timetz", "12:00:00+02|12:00:00|12:00:00+02");
+    try rejects("SELECT '12:00 Nowhere/Zone'::time", error.InvalidParameterValue);
+    try rejects("SELECT '12:00 Nowhere/Zone'::timetz", error.InvalidParameterValue);
+    // A date far beyond the timestamp range has no offset: 22008, no overflow.
+    try rejects("SELECT '999999999-01-01 12:00 Test/Plus2'::timetz", error.DatetimeFieldOverflow);
+    // Without a zone in the input, TIMETZ takes the session zone's offset.
+    db.session.zone = .{ .kind = .fixed, .offset = 5 * 3600 + 1800 };
+    defer db.session.zone = .{};
+    try rows("SELECT '12:00'::timetz, TIME '10:00'::timetz, TIMESTAMPTZ '2026-01-02 03:04:05+00'::timetz, TIMESTAMPTZ '2026-01-02 23:00:00+00'::time",
+        "12:00:00+05:30|10:00:00+05:30|08:34:05+05:30|04:30:00");
+}
+
 pub fn main(init: std.process.Init) !void {
     try character();
     try uuid();
@@ -784,6 +808,7 @@ pub fn main(init: std.process.Init) !void {
     try time();
     try bit();
     try moneyType();
+    try timeZones();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-types-core\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);
