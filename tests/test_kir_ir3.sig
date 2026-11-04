@@ -749,6 +749,44 @@ test "votes and divergent control flow: nested ifs, loops with brk and cont, ret
     _ = try both(&k, .{ 2, 1, 1 }, &.{&out}, &.{});
 }
 
+test "loop-carried registers with one definition, read at the top of the next turn" {
+    // (gfx_kir's tile loop kept its clip predicate this way: written once
+    // per turn, read by the next turn before that write; a register with
+    // one definition is not SSA when a read comes first)
+    var k = newKernel("carried", .{ 64, 1, 1 });
+    const o = k.binding();
+    const t = k.tid(0);
+    const acc = k.mov(.u32, u(0));
+    const prev_p = k.reg(.pred);
+    const prev_v = k.reg(.u32);
+    const i = k.mov(.u32, u(0));
+    k.loop();
+    {
+        // the tail of the previous turn (garbage-free: i > 0 guards it)
+        const later = k.cmp(.u32, .ne, r(i), u(0));
+        k.ifp(r(later));
+        k.set(acc, .iadd, r(acc), r(k.sel(.u32, r(prev_p), r(prev_v), u(1000))), no);
+        k.endif();
+        // much in between, so the registers would be reused
+        var x = k.op2(.imul, .u32, r(t), r(i));
+        for (0..12) |n| x = k.op2(.xor, .u32, r(k.op2(.iadd, .u32, r(x), u(@intCast(n * 7 + 1)))), r(k.op2(.shl, .u32, r(x), u(3))));
+        // this turn's, for the next
+        k.setAux(prev_p, .icmp, r(k.op2(.@"and", .u32, r(x), u(1))), u(0), no, @intFromEnum(kir.Cmp.eq));
+        k.set(prev_v, .mov, r(x), no, no);
+        // fresh values after the writes, which a short live range would let
+        // take their registers
+        var y = k.op2(.imul, .u32, r(t), u(77));
+        for (0..8) |n| y = k.op2(.iadd, .u32, r(k.op2(.xor, .u32, r(y), r(i))), u(@intCast(n + 3)));
+        k.set(acc, .iadd, r(acc), r(k.op2(.@"and", .u32, r(y), u(15))), no);
+        k.set(i, .iadd, r(i), u(1), no);
+        k.brk(r(k.cmp(.u32, .ge, r(i), u(9))));
+    }
+    k.endloop();
+    k.store(.u32, kir.global(o, 32), r(k.op2(.shl, .u32, r(t), u(2))), r(acc));
+    var out = zeros(64 * 4);
+    _ = try both(&k, .{ 2, 1, 1 }, &.{&out}, &.{});
+}
+
 // ── The hand-written kernels, rewritten in KIR ──────────────────────────────
 
 const hand = @import("lfm3_gpu_kernels");
