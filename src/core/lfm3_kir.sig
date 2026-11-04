@@ -964,12 +964,19 @@ pub fn quantParams(k: u32, epsilon: f32, x: u32, weight: u32, normalized: u32) [
     return .{ k, k / QK_K, @bitCast(epsilon), x, weight, normalized };
 }
 
-/// Workgroups: (1, T) with the norm (a workgroup a row), else (K / 2048
-/// rounded up, T).
-pub fn quantGroups(mode: QuantMode, k: u32, tokens: u32) [3]u32 {
+/// Threads of the row kernels on a device: ROW_THREADS, or the device's
+/// largest group when that is smaller.
+pub fn rowThreads(caps: Caps) u32 {
+    return @min(ROW_THREADS, caps.max_group);
+}
+
+/// Workgroups: (1, T) with the norm (a workgroup a row), else (K / 256
+/// blocks over the blocks a workgroup quantizes, rounded up; T).
+pub fn quantGroups(caps: Caps, mode: QuantMode, k: u32, tokens: u32) [3]u32 {
     if (mode == .norm) return .{ 1, tokens, 1 };
     const blocks = k / QK_K;
-    return .{ (blocks + 7) / 8, tokens, 1 };
+    const per = rowThreads(caps) / 32;
+    return .{ (blocks + per - 1) / per, tokens, 1 };
 }
 
 /// Q8_K of the 256-lane block whose elements 8i .. 8i + 7 thread `i` (of its
@@ -1032,7 +1039,7 @@ fn quantQ8K(b: *Builder, x: [8]V, i: V, t: V, index: V, ok: V, AQ: u8, AD: u8, A
 /// Bindings: QuantBinding. Params: quantParams. Groups: quantGroups. Rows
 /// 16-byte aligned (K a multiple of 256).
 pub fn quant(s: kir.Storage, caps: Caps, mode: QuantMode) Error!kir.Kernel {
-    const threads: u32 = @min(ROW_THREADS, caps.max_group);
+    const threads: u32 = rowThreads(caps);
     if (threads < 32) return error.Unsupported;
     var k = begin(s, switch (mode) {
         .plain => "lfm3_quant",
@@ -1221,7 +1228,7 @@ pub const ResidualBinding = enum(u8) { hidden, block, weight };
 /// norms) or += block[t], as lfm3_executor's ResidualTask. K a multiple of
 /// ROW_THREADS.
 pub fn residual(s: kir.Storage, caps: Caps, postnorm: bool) Error!kir.Kernel {
-    const threads: u32 = @min(ROW_THREADS, caps.max_group);
+    const threads: u32 = rowThreads(caps);
     var k = begin(s, if (postnorm) "lfm3_residual_norm" else "lfm3_residual", threads);
     var b = Builder.init(&k, caps);
     const HID = k.binding();
@@ -2126,7 +2133,9 @@ fn expectQ8K(cpu: []const quantized.Q8KBlock, aq: []const u8, ad: []const u8, as
 test "Q8_K quantization: quantizeQ8K's bits (a zero block, magnitude ties), any subgroup" {
     const T = TestRig;
     for ([_]u32{ 8, 32, 64 }) |sg| {
-        const caps = caps32(false, sg);
+        var caps = caps32(false, sg);
+        // (groups of 64 on the narrow one: two blocks a workgroup)
+        if (sg == 8) caps.max_group = 64;
         const tokens = 3;
         const k_cols = 7680;
         const blocks = k_cols / QK_K;
@@ -2134,7 +2143,7 @@ test "Q8_K quantization: quantizeQ8K's bits (a zero block, magnitude ties), any 
         const x = f32s(T.a[64..][0 .. tokens * k_cols * 4]);
         quantInput(x, &seed);
         var k = try quant(testStorage(), caps, .plain);
-        _ = try runOn(&k, caps, quantGroups(.plain, k_cols, tokens), &.{ T.a[0 .. 64 + tokens * k_cols * 4], T.a[0..16], T.a[0..16], T.b[0 .. tokens * k_cols], T.c[0 .. tokens * blocks * 4], T.d[0 .. tokens * blocks * 32] }, &quantParams(k_cols, 0, 64, 0, 0));
+        _ = try runOn(&k, caps, quantGroups(caps, .plain, k_cols, tokens), &.{ T.a[0 .. 64 + tokens * k_cols * 4], T.a[0..16], T.a[0..16], T.b[0 .. tokens * k_cols], T.c[0 .. tokens * blocks * 4], T.d[0 .. tokens * blocks * 32] }, &quantParams(k_cols, 0, 64, 0, 0));
         var cpu: [tokens * blocks]quantized.Q8KBlock = undefined;
         try quantized.quantizeQ8K(x, &cpu);
         try expectQ8K(&cpu, &T.b, &T.c, &T.d);
@@ -2153,7 +2162,8 @@ fn rmsNormRow(input: []const f32, weight: []const f32, output: []f32, epsilon: f
 test "RMSNorm then Q8_K: the CPU's normalized rows (its f64 sums met by double-f32), then quantizeQ8K's bits" {
     const T = TestRig;
     for ([_]u32{ 8, 32, 128 }) |sg| for ([_]bool{ false, true }) |fused| {
-        const caps = caps32(fused, sg);
+        var caps = caps32(fused, sg);
+        if (sg == 8 and fused) caps.max_group = 64;
         const tokens = 4;
         const k_cols = 2048 + 256;
         const blocks = k_cols / QK_K;
@@ -2163,7 +2173,7 @@ test "RMSNorm then Q8_K: the CPU's normalized rows (its f64 sums met by double-f
         const wv = f32s(T.e[32..][0 .. k_cols * 4]);
         for (wv) |*v| v.* = 0.5 + unit(&seed) + 0.5;
         var k = try quant(testStorage(), caps, .norm);
-        _ = try runOn(&k, caps, quantGroups(.norm, k_cols, tokens), &.{ T.a[0 .. tokens * k_cols * 4], T.e[0 .. 32 + k_cols * 4], T.f[0 .. 16 + tokens * k_cols * 4], T.b[0 .. tokens * k_cols], T.c[0 .. tokens * blocks * 4], T.d[0 .. tokens * blocks * 32] }, &quantParams(k_cols, 1e-5, 0, 32, 16));
+        _ = try runOn(&k, caps, quantGroups(caps, .norm, k_cols, tokens), &.{ T.a[0 .. tokens * k_cols * 4], T.e[0 .. 32 + k_cols * 4], T.f[0 .. 16 + tokens * k_cols * 4], T.b[0 .. tokens * k_cols], T.c[0 .. tokens * blocks * 4], T.d[0 .. tokens * blocks * 32] }, &quantParams(k_cols, 1e-5, 0, 32, 16));
         const y = f32s(T.f[16..][0 .. tokens * k_cols * 4]);
         var want: [tokens * k_cols]f32 = undefined;
         var mismatches: usize = 0;
@@ -2213,7 +2223,7 @@ test "exp: the CPU's @exp is compiler_rt's expf (expRef's bits); the kernels' to
         if (i == 78) gv.* = 90.0;
     }
     var k = try quant(testStorage(), caps, .swiglu);
-    _ = try runOn(&k, caps, quantGroups(.swiglu, k_cols, tokens), &.{ T.a[0 .. tokens * k_cols * 4], T.e[0 .. tokens * k_cols * 4], T.a[0..16], T.b[0 .. tokens * k_cols], T.c[0 .. tokens * blocks * 4], T.d[0 .. tokens * blocks * 32] }, &quantParams(k_cols, 0, 0, 0, 0));
+    _ = try runOn(&k, caps, quantGroups(caps, .swiglu, k_cols, tokens), &.{ T.a[0 .. tokens * k_cols * 4], T.e[0 .. tokens * k_cols * 4], T.a[0..16], T.b[0 .. tokens * k_cols], T.c[0 .. tokens * blocks * 4], T.d[0 .. tokens * blocks * 32] }, &quantParams(k_cols, 0, 0, 0, 0));
     var v: [tokens * k_cols]f32 = undefined;
     for (&v, g, u) |*o, gv, uv| o.* = (gv / (1.0 + @exp(-gv))) * uv;
     var cpu: [tokens * blocks]quantized.Q8KBlock = undefined;
