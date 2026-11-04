@@ -828,69 +828,174 @@ pub fn Parser(comptime config: types.Config) type {
             return if (self.current.kind == .string or self.current.kind == .quoted_word) self.current.start - 1 else self.current.start;
         }
 
+        /// Constraint list filled by CREATE TABLE or ALTER TABLE ADD.
+        const ConstraintSink = struct { items: []Ast.ConstraintDef, count: *usize };
+
+        fn pushConstraint(sink: ConstraintSink, definition: Ast.ConstraintDef) Error!void {
+            if (sink.count.* == sink.items.len) return error.ColumnCapacity;
+            sink.items[sink.count.*] = definition;
+            sink.count.* += 1;
+        }
+
+        /// `(expr) [NO INHERIT]` after CHECK.
+        fn checkConstraint(self: *Self, name: ?ast.Ident) Error!Ast.ConstraintDef {
+            try self.expectSymbol(.lparen);
+            const start = self.tokenStart();
+            const node = try self.expression();
+            var out: Ast.ConstraintDef = .{ .name = name, .kind = .check, .node = node };
+            out.expression = self.spanTo(start);
+            try self.expectSymbol(.rparen);
+            if (self.isWord("NO") and wordIs(self.source, try self.peek(), "inherit")) {
+                try self.advance();
+                try self.advance();
+            }
+            return out;
+        }
+
+        /// `[NULLS [NOT] DISTINCT]` after UNIQUE; true for NOT DISTINCT.
+        fn nullsDistinct(self: *Self) Error!bool {
+            if (!try self.takeWord("NULLS")) return false;
+            const not_distinct = try self.takeWord("NOT");
+            try self.expectWord("DISTINCT");
+            return not_distinct;
+        }
+
+        /// `(column, ...)` of a table-level UNIQUE or PRIMARY KEY.
+        fn keyColumns(self: *Self, out: *Ast.ConstraintDef) Error!void {
+            try self.expectSymbol(.lparen);
+            while (true) {
+                if (out.column_count == config.columns) return error.ColumnCapacity;
+                out.columns[out.column_count] = try self.identifier();
+                out.column_count += 1;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            try self.expectSymbol(.rparen);
+        }
+
+        /// A table constraint element ([CONSTRAINT name] CHECK (...) |
+        /// UNIQUE [NULLS [NOT] DISTINCT] (...) | PRIMARY KEY (...)), or null
+        /// when the element is a column definition.
+        fn tableConstraint(self: *Self) Error!?Ast.ConstraintDef {
+            if (self.mode != .standard) return null;
+            var name: ?ast.Ident = null;
+            if (try self.takeWord("CONSTRAINT")) {
+                name = try self.identifier();
+            } else {
+                const next = try self.peek();
+                const paren = next.kind == .symbol and next.symbol == .lparen;
+                const starts = (self.rawWord("check") and paren) or (self.rawWord("unique") and (paren or next.isWord("NULLS"))) or self.isWord("PRIMARY");
+                if (!starts) return null;
+            }
+            if (try self.takeRaw("check")) return try self.checkConstraint(name);
+            if (try self.takeRaw("unique")) {
+                var out: Ast.ConstraintDef = .{ .name = name, .kind = .unique, .nulls_not_distinct = try self.nullsDistinct() };
+                try self.keyColumns(&out);
+                return out;
+            }
+            if (try self.takeWord("PRIMARY")) {
+                try self.expectWord("KEY");
+                var out: Ast.ConstraintDef = .{ .name = name, .kind = .primary };
+                try self.keyColumns(&out);
+                return out;
+            }
+            return error.Syntax;
+        }
+
+        /// One column definition with its column constraints; CHECK, UNIQUE
+        /// and named PRIMARY KEY constraints go to `sink`.
+        fn columnDef(self: *Self, if_not_exists: bool, invalid: *bool, has_primary: *bool, sink: ConstraintSink) Error!Ast.ColumnDef {
+            var column: Ast.ColumnDef = .{ .name = try self.identifier() };
+            const spec = try self.typeName();
+            // regclass/regtype columns are outside the subset.
+            if (spec.typmod < -1) return error.UnsupportedStatement;
+            column.type_name = spec.ty;
+            column.typmod = spec.typmod;
+            var has_not_null = false;
+            while (true) {
+                var name: ?ast.Ident = null;
+                if (self.mode == .standard and try self.takeWord("CONSTRAINT")) name = try self.identifier();
+                if (self.mode == .standard and try self.takeWord("DEFAULT")) {
+                    if (column.default_kind != .none) {if(if_not_exists) invalid.*=true else return error.Syntax;}
+                    column.default_kind = .default;
+                    const start = self.tokenStart();
+                    _ = try self.other();
+                    column.expression = self.spanTo(start);
+                } else if (self.mode == .standard and try self.takeWord("GENERATED")) {
+                    if (column.default_kind != .none) {if(if_not_exists) invalid.*=true else return error.Syntax;}
+                    var always = true;
+                    if (try self.takeWord("BY")) {
+                        try self.expectWord("DEFAULT");
+                        always = false;
+                    } else try self.expectWord("ALWAYS");
+                    try self.expectWord("AS");
+                    if (try self.takeWord("IDENTITY")) {
+                        column.default_kind = if (always) .identity_always else .identity_by_default;
+                        if (try self.takeSymbol(.lparen)) {
+                            try self.sequenceOptions(&column.sequence);
+                            try self.expectSymbol(.rparen);
+                        }
+                    } else {
+                        if (!always) return error.Syntax;
+                        try self.expectSymbol(.lparen);
+                        const start = self.tokenStart();
+                        _ = try self.expression();
+                        column.expression = self.spanTo(start);
+                        try self.expectSymbol(.rparen);
+                        try self.expectWord("STORED");
+                        column.default_kind = .generated;
+                    }
+                } else if (self.mode == .standard and self.isWord("NULL")) {
+                    try self.advance();
+                } else if (try self.takeWord("NOT")) {
+                    if (has_not_null) {if(if_not_exists) invalid.*=true else return error.Syntax;}
+                    try self.expectWord("NULL");
+                    has_not_null = true;
+                    column.not_null = true;
+                } else if (try self.takeWord("PRIMARY")) {
+                    if (has_primary.*) {if(if_not_exists) invalid.*=true else return error.Syntax;}
+                    try self.expectWord("KEY");
+                    has_primary.* = true;
+                    column.primary_key = true;
+                    column.not_null = true;
+                    if (name != null) {
+                        var definition: Ast.ConstraintDef = .{ .name = name, .kind = .primary, .column_count = 1 };
+                        definition.columns[0] = column.name;
+                        try pushConstraint(sink, definition);
+                    }
+                } else if (self.mode == .standard and try self.takeRaw("check")) {
+                    try pushConstraint(sink, try self.checkConstraint(name));
+                } else if (self.mode == .standard and try self.takeRaw("unique")) {
+                    var definition: Ast.ConstraintDef = .{ .name = name, .kind = .unique, .nulls_not_distinct = try self.nullsDistinct(), .column_count = 1 };
+                    definition.columns[0] = column.name;
+                    try pushConstraint(sink, definition);
+                } else {
+                    if (name != null) return error.Syntax;
+                    break;
+                }
+            }
+            return column;
+        }
+
         fn create(self: *Self) Error!Ast.CreateTable {
             try self.expectWord("TABLE");
             const conditional = try self.ifNotExists();
-            var out: Ast.CreateTable = .{ .name = try self.identifier(), .if_not_exists = conditional };
+            const reference = try self.qualifiedName();
+            var out: Ast.CreateTable = .{ .schema = reference.schema, .name = reference.name, .if_not_exists = conditional };
             try self.expectSymbol(.lparen);
             var has_primary = false;
+            const sink: ConstraintSink = .{ .items = out.constraints[0..], .count = &out.constraint_count };
             while (true) {
-                if (out.count == config.columns) return error.ColumnCapacity;
-                var column: Ast.ColumnDef = .{ .name = try self.identifier() };
-                const spec = try self.typeName();
-                // regclass/regtype columns are outside the subset.
-                if (spec.typmod < -1) return error.UnsupportedStatement;
-                column.type_name = spec.ty;
-                column.typmod = spec.typmod;
-                var has_not_null = false;
-                while (true) {
-                    if (self.mode == .standard and try self.takeWord("DEFAULT")) {
-                        if (column.default_kind != .none) {if(out.if_not_exists) out.invalid_definition=true else return error.Syntax;}
-                        column.default_kind = .default;
-                        const start = self.tokenStart();
-                        _ = try self.other();
-                        column.expression = self.spanTo(start);
-                    } else if (self.mode == .standard and try self.takeWord("GENERATED")) {
-                        if (column.default_kind != .none) {if(out.if_not_exists) out.invalid_definition=true else return error.Syntax;}
-                        var always = true;
-                        if (try self.takeWord("BY")) {
-                            try self.expectWord("DEFAULT");
-                            always = false;
-                        } else try self.expectWord("ALWAYS");
-                        try self.expectWord("AS");
-                        if (try self.takeWord("IDENTITY")) {
-                            column.default_kind = if (always) .identity_always else .identity_by_default;
-                            if (try self.takeSymbol(.lparen)) {
-                                try self.sequenceOptions(&column.sequence);
-                                try self.expectSymbol(.rparen);
-                            }
-                        } else {
-                            if (!always) return error.Syntax;
-                            try self.expectSymbol(.lparen);
-                            const start = self.tokenStart();
-                            _ = try self.expression();
-                            column.expression = self.spanTo(start);
-                            try self.expectSymbol(.rparen);
-                            try self.expectWord("STORED");
-                            column.default_kind = .generated;
-                        }
-                    } else if (self.mode == .standard and self.isWord("NULL")) {
-                        try self.advance();
-                    } else if (try self.takeWord("NOT")) {
-                        if (has_not_null) {if(out.if_not_exists) out.invalid_definition=true else return error.Syntax;}
-                        try self.expectWord("NULL");
-                        has_not_null = true;
-                        column.not_null = true;
-                    } else if (try self.takeWord("PRIMARY")) {
-                        if (has_primary) {if(out.if_not_exists) out.invalid_definition=true else return error.Syntax;}
-                        try self.expectWord("KEY");
+                if (try self.tableConstraint()) |constraint| {
+                    if (constraint.kind == .primary) {
+                        if (has_primary) {if(out.if_not_exists) out.invalid_definition=true else return error.InvalidTableDefinition;}
                         has_primary = true;
-                        column.primary_key = true;
-                        column.not_null = true;
-                    } else break;
+                    }
+                    try pushConstraint(sink, constraint);
+                } else {
+                    if (out.count == config.columns) return error.ColumnCapacity;
+                    out.columns[out.count] = try self.columnDef(out.if_not_exists, &out.invalid_definition, &has_primary, sink);
+                    out.count += 1;
                 }
-                out.columns[out.count] = column;
-                out.count += 1;
                 if (!try self.takeSymbol(.comma)) break;
             }
             try self.expectSymbol(.rparen);

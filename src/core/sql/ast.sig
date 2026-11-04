@@ -267,12 +267,31 @@ pub fn Ast(comptime config: types.Config) type {
             sequence: sequence.Options = .{},
         };
 
+        pub const ConstraintKind = enum { check, unique, primary };
+
+        /// A CHECK, UNIQUE or PRIMARY KEY constraint as written, at column
+        /// or table level. Column-level UNIQUE / PRIMARY KEY list their own
+        /// column. `expression` is the CHECK source text and `node` its parsed
+        /// root (statement pool) for naming.
+        pub const ConstraintDef = struct {
+            name: ?Ident = null,
+            kind: ConstraintKind = .check,
+            expression: Span = .{},
+            node: u16 = none,
+            columns: [config.columns]Ident = undefined,
+            column_count: usize = 0,
+            nulls_not_distinct: bool = false,
+        };
+
         pub const CreateTable = struct {
             if_not_exists: bool = false,
             invalid_definition: bool = false,
+            schema: ?Ident = null,
             name: Ident = .{},
             columns: [config.columns]ColumnDef = undefined,
             count: usize = 0,
+            constraints: [config.table_constraints]ConstraintDef = undefined,
+            constraint_count: usize = 0,
         };
 
         pub const CreateSequence = struct {

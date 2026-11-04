@@ -145,7 +145,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                         const table = &db.tables[entry.table];
                         table.pending_create = false;
                         table.live = false;
-                        const width: u32 = 1 + @as(u32, @intFromBool(table.primary_column != null));
+                        const width: u32 = S.oidWidth(table);
                         if (db.oid_counter + types_first_oid == table.oid + width) db.oid_counter -= width;
                     },
                     .drop_table => db.tables[entry.table].pending_drop = false,

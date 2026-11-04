@@ -11,7 +11,13 @@
 //!                     default kind: 1 DEFAULT, 2 identity ALWAYS, 3 identity
 //!                     BY DEFAULT, 4 GENERATED ... STORED),
 //!                     expression_len u16 + canonical expression source text
-//!                     (DEFAULT / generation; 0 otherwise)
+//!                     (DEFAULT / generation; 0 otherwise); with
+//!                     expr_format_version 2 (written only when needed, so
+//!                     version-1 records stay byte-identical) then:
+//!                     namespace u32, constraint_count u8, constraints: kind
+//!                     u8 (1 CHECK, 2 UNIQUE, 3 PRIMARY KEY), name, flags u8
+//!                     (1 NULLS NOT DISTINCT), key column_count u8 + column
+//!                     indexes u8, CHECK text_len u16 + source text
 //!     2 drop_table    oid u32
 //!     3 insert        oid u32, rowid u64, count u8, values
 //!     4 update        oid u32, rowid u64, count u8, values (complete row)
@@ -60,6 +66,8 @@ pub const format_version: u16 = 1;
 pub const header_size: usize = 8;
 pub const first_oid: u32 = 16384;
 pub const expr_format_version: u16 = 1;
+/// create_table definitions that carry a namespace and table constraints.
+pub const definition_format_version: u16 = 2;
 
 pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11 };
 
@@ -274,8 +282,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
         pub fn encodeCreate(writer: *Writer, table: *const S.Table) Error!void {
             try writer.op(.create_table);
             try writer.int(u32, table.oid);
+            try encodeDefinition(writer, table);
+        }
+
+        /// Name, format version, columns and (version 2) namespace and
+        /// constraints of a table definition.
+        pub fn encodeDefinition(writer: *Writer, table: *const S.Table) Error!void {
+            const extended = table.namespace != public_namespace or table.constraint_count != 0;
             try writer.name(table.name.slice());
-            try writer.int(u16, expr_format_version);
+            try writer.int(u16, if (extended) definition_format_version else expr_format_version);
             try writer.int(u8, @intCast(table.column_count));
             for (table.columns[0..table.column_count]) |*column| {
                 try writer.name(column.name.slice());
@@ -283,6 +298,19 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 try writer.int(i32, column.typmod);
                 try writer.int(u8, @as(u8, @intFromBool(column.not_null)) | (@as(u8, @intFromBool(column.primary_key)) << 1) | (@as(u8, @intFromEnum(column.default_kind)) << 2));
                 const text = column.expression.slice();
+                try writer.int(u16, @intCast(text.len));
+                try writer.bytes(text);
+            }
+            if (!extended) return;
+            try writer.int(u32, table.namespace);
+            try writer.int(u8, @intCast(table.constraint_count));
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                try writer.int(u8, @intFromEnum(constraint.kind));
+                try writer.name(constraint.name.slice());
+                try writer.int(u8, @intFromBool(constraint.nulls_not_distinct));
+                try writer.int(u8, constraint.column_count);
+                try writer.bytes(constraint.keyColumns());
+                const text = constraint.expression.slice();
                 try writer.int(u16, @intCast(text.len));
                 try writer.bytes(text);
             }
@@ -375,6 +403,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
             live: bool = false,
             /// Rows of this slot still come from the database (not recreated).
             base: bool = false,
+            /// A primary key (its index owns oid + 1).
+            keyed: bool = false,
             oid: u32 = 0,
             name: V.Name = .{},
             column_count: usize = 0,
@@ -441,9 +471,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
         /// still holds: a table and its primary-key index (oid + 1), or a
         /// sequence. Database slots count until reclaimed, even uncommitted.
         fn oidTaken(db: anytype, scratch: *const Scratch, oid: u32, width: u32) bool {
-            for (&scratch.tables) |*vt| if (vt.live and overlaps(vt.oid, 1 + @as(u32, @intFromBool(vt.primary != null)), oid, width)) return true;
+            for (&scratch.tables) |*vt| if (vt.live and overlaps(vt.oid, 1 + @as(u32, @intFromBool(vt.keyed)), oid, width)) return true;
             for (&scratch.seqs) |*vs| if (vs.live and overlaps(vs.oid, 1, oid, width)) return true;
-            for (&db.tables) |*table| if (table.live and overlaps(table.oid, 1 + @as(u32, @intFromBool(table.primary_column != null)), oid, width)) return true;
+            for (&db.tables) |*table| if (table.live and overlaps(table.oid, S.oidWidth(table), oid, width)) return true;
             for (&db.seqs) |*seq| if (seq.live and overlaps(seq.oid, 1, oid, width)) return true;
             return false;
         }
@@ -651,7 +681,18 @@ pub fn ChangeLog(comptime config: types.Config) type {
             name: V.Name,
             columns: [config.columns]V.Column,
             count: usize,
+            namespace: u32 = public_namespace,
+            constraints: [S.constraint_capacity]S.Constraint = undefined,
+            constraint_count: usize = 0,
+
+            fn keyed(self: *const Definition) bool {
+                for (self.columns[0..self.count]) |*column| if (column.primary_key) return true;
+                for (self.constraints[0..self.constraint_count]) |*constraint| if (constraint.kind == .primary) return true;
+                return false;
+            }
         };
+
+        const public_namespace: u32 = 2200;
 
         fn validName(value: []const u8) bool {
             // These are decoded identifier bytes, not unquoted SQL tokens.
@@ -663,11 +704,74 @@ pub fn ChangeLog(comptime config: types.Config) type {
 
         fn decodeCreate(reader: *Reader) Error!Definition {
             var out: Definition = .{ .oid = try reader.int(u32), .name = .{}, .columns = @splat(.{}), .count = 0 };
+            try decodeDefinition(reader, &out);
+            return out;
+        }
+
+        /// Version-2 tail: namespace and constraints, each checked against
+        /// the decoded columns.
+        fn decodeConstraints(reader: *Reader, out: *Definition) Error!void {
+            out.namespace = try reader.int(u32);
+            const count = try reader.int(u8);
+            if (count > S.constraint_capacity) return error.ChangeRecordConflict;
+            var primary_entries: usize = 0;
+            var flagged: ?usize = null;
+            for (out.columns[0..out.count], 0..) |*column, index| if (column.primary_key) {
+                flagged = index;
+            };
+            for (0..count) |index| {
+                var constraint: S.Constraint = .{};
+                const kind = try reader.int(u8);
+                if (kind < 1 or kind > 3) return error.InvalidChangeRecord;
+                constraint.kind = @enumFromInt(kind);
+                const constraint_name = try reader.name();
+                if (!validName(constraint_name)) return error.InvalidChangeRecord;
+                constraint.name.len = constraint_name.len;
+                @memcpy(constraint.name.bytes[0..constraint_name.len], constraint_name);
+                for (out.constraints[0..index]) |*previous| if (types.same(previous.name.slice(), constraint.name.slice())) return error.InvalidChangeRecord;
+                const flags = try reader.int(u8);
+                if (flags > 1) return error.InvalidChangeRecord;
+                constraint.nulls_not_distinct = flags == 1;
+                constraint.column_count = try reader.int(u8);
+                if (constraint.column_count > out.count) return error.InvalidChangeRecord;
+                const columns = try reader.take(constraint.column_count);
+                for (columns, 0..) |column, position| {
+                    if (column >= out.count) return error.InvalidChangeRecord;
+                    for (columns[0..position]) |previous| if (previous == column) return error.InvalidChangeRecord;
+                    constraint.columns[position] = column;
+                }
+                const text_len = try reader.int(u16);
+                if (text_len > config.text_bytes) return error.ChangeRecordConflict;
+                const text = try reader.take(text_len);
+                constraint.expression.len = text_len;
+                @memcpy(constraint.expression.bytes[0..text_len], text);
+                switch (constraint.kind) {
+                    .check => if (constraint.column_count != 0 or text_len == 0) return error.InvalidChangeRecord,
+                    .unique => if (constraint.column_count == 0 or text_len != 0) return error.InvalidChangeRecord,
+                    .primary => {
+                        primary_entries += 1;
+                        if (constraint.column_count == 0 or text_len != 0 or constraint.nulls_not_distinct) return error.InvalidChangeRecord;
+                        if (constraint.column_count == 1) {
+                            if (flagged != constraint.columns[0]) return error.InvalidChangeRecord;
+                        } else {
+                            if (flagged != null) return error.InvalidChangeRecord;
+                            for (constraint.keyColumns()) |column| if (!out.columns[column].not_null) return error.InvalidChangeRecord;
+                        }
+                    },
+                }
+                out.constraints[index] = constraint;
+            }
+            if (primary_entries > 1) return error.InvalidChangeRecord;
+            out.constraint_count = count;
+        }
+
+        fn decodeDefinition(reader: *Reader, out: *Definition) Error!void {
             const table_name = try reader.name();
             if (!validName(table_name)) return error.InvalidChangeRecord;
             out.name.len = table_name.len;
             @memcpy(out.name.bytes[0..table_name.len], table_name);
-            if (try reader.int(u16) != expr_format_version) return error.UnsupportedLogVersion;
+            const version = try reader.int(u16);
+            if (version != expr_format_version and version != definition_format_version) return error.UnsupportedLogVersion;
             out.count = try reader.int(u8);
             if (out.count == 0) return error.InvalidChangeRecord;
             if (out.count > config.columns) return error.ChangeRecordConflict;
@@ -713,7 +817,12 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     return error.InvalidChangeRecord;
                 out.columns[index] = column;
             }
-            return out;
+            if (version == definition_format_version) try decodeConstraints(reader, out);
+        }
+
+        /// Namespaces a replayed definition may name.
+        fn knownNamespace(namespace: u32) bool {
+            return namespace == public_namespace;
         }
 
         fn findVTable(scratch: *Scratch, oid: u32) Error!u8 {
@@ -784,6 +893,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 vt.* = .{ .live = committed, .base = committed };
                 if (!committed) continue;
                 vt.oid = table.oid;
+                vt.keyed = S.keyed(table);
                 vt.name = table.name;
                 vt.column_count = table.column_count;
                 vt.columns = table.columns;
@@ -807,10 +917,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         // commits in any OID order (STO-01): an OID need only
                         // be unused, not ascending. A primary key's index owns
                         // the next OID.
-                        var width: u32 = 1;
-                        for (definition.columns[0..definition.count]) |column| if (column.primary_key) {
-                            width = 2;
-                        };
+                        const width: u32 = 1 + @as(u32, @intFromBool(definition.keyed()));
+                        if (!knownNamespace(definition.namespace)) return error.ChangeRecordConflict;
                         if (definition.oid < first_oid or definition.oid >= 0xfffffffe or oidTaken(db, scratch, definition.oid, width)) return error.ChangeRecordConflict;
                         if (nameTaken(scratch, definition.name.slice())) return error.ChangeRecordConflict;
                         var free: ?usize = null;
@@ -820,7 +928,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const index = free orelse return error.ChangeRecordConflict;
                         purge(scratch, @intCast(index));
                         const vt = &scratch.tables[index];
-                        vt.* = .{ .live = true, .oid = definition.oid, .name = definition.name, .column_count = definition.count, .columns = definition.columns, .next_rowid = 1 };
+                        vt.* = .{ .live = true, .keyed = definition.keyed(), .oid = definition.oid, .name = definition.name, .column_count = definition.count, .columns = definition.columns, .next_rowid = 1 };
                         for (definition.columns[0..definition.count], 0..) |column, position| if (column.primary_key) {
                             vt.primary = position;
                         };
@@ -991,10 +1099,12 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const definition = try decodeCreate(&reader);
                         for (&db.tables, 0..) |*table, index| if (!table.live) {
                             S.reset(table, definition.oid, definition.name, definition.columns[0..definition.count]);
+                            table.namespace = definition.namespace;
+                            S.setConstraints(table, definition.constraints[0..definition.constraint_count]);
                             S.initSummary(table, csn);
                             try db.replayCreate(index, csn);
                             // Creates arrive in any OID order: keep the maximum.
-                            db.oid_counter = @max(db.oid_counter, definition.oid + 1 + @as(u32, @intFromBool(table.primary_column != null)) - first_oid);
+                            db.oid_counter = @max(db.oid_counter, definition.oid + S.oidWidth(table) - first_oid);
                             break;
                         };
                     },

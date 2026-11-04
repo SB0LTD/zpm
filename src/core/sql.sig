@@ -1480,14 +1480,17 @@ pub fn Database(comptime config: Config) type {
             for (relations[0..count]) |found| {
                 if (found.kind != 'r') continue;
                 const table = &self.tables[found.slot];
-                if (table.primary_column == null) continue;
+                if (!S.keyed(table)) continue;
                 const index_name = indexName(table) catch continue;
                 if (types.same(index_name.slice(), name.slice())) return table.oid + 1;
             }
             return missing;
         }
 
+        /// The primary-key index (and constraint) name: CONSTRAINT name, else
+        /// `<table>_pkey`.
         fn indexName(table: *const S.Table) Error!Name {
+            if (S.primaryConstraint(table)) |index| return table.constraints[index].name;
             var out: Name = .{};
             for ([_][]const u8{ table.name.slice(), "_pkey" }) |part| {
                 if (part.len > config.name_bytes - out.len) return error.NameCapacity;
@@ -1510,7 +1513,7 @@ pub fn Database(comptime config: Config) type {
                     const table = &self.tables[found.slot];
                     if (table.oid == oid) {
                         name = table.name;
-                    } else if (table.primary_column != null and table.oid + 1 == oid) {
+                    } else if (S.keyed(table) and table.oid + 1 == oid) {
                         name = indexName(table) catch return null;
                     } else continue;
                 }
@@ -1665,22 +1668,35 @@ pub fn Database(comptime config: Config) type {
                     const name = table.name.slice();
                     const oid: i64 = table.oid;
                     const pkey = indexName(table) catch Name{};
+                    var key_columns: [config.columns]u8 = undefined;
+                    const primary_columns = primaryColumns(table, &key_columns);
                     switch (view) {
                         .pg_class => {
                             try sink.add(&.{ intCell(oid), nameCell(name), intCell(public), nameCell("r"), intCell(@intCast(table.column_count)) });
-                            if (table.primary_column != null) try sink.add(&.{ intCell(oid + 1), nameCell(pkey.slice()), intCell(public), nameCell("i"), intCell(1) });
+                            if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), nameCell(pkey.slice()), intCell(public), nameCell("i"), intCell(@intCast(primary_columns.len)) });
                         },
                         .tables => try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(name), nameCell("BASE TABLE") }),
-                        .pg_index => if (table.primary_column) |column| {
-                            var key: [4]u8 = undefined;
-                            const digits = formatSmall(column + 1, &key);
-                            try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(digits) });
+                        .pg_index => if (S.keyed(table)) {
+                            var key: [4 * config.columns]u8 = undefined;
+                            try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)) });
                         },
-                        .table_constraints => if (table.primary_column != null) {
-                            try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(pkey.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell("PRIMARY KEY") });
+                        .table_constraints => {
+                            if (S.keyed(table)) try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(pkey.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell("PRIMARY KEY") });
+                            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                                if (constraint.kind == .primary) continue;
+                                try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(constraint.name.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell(if (constraint.kind == .check) "CHECK" else "UNIQUE") });
+                            }
                         },
-                        .key_column_usage => if (table.primary_column) |column| {
-                            try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(pkey.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(1) });
+                        .key_column_usage => {
+                            for (primary_columns, 0..) |column, position| {
+                                try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(pkey.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
+                            }
+                            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                                if (constraint.kind != .unique) continue;
+                                for (constraint.keyColumns(), 0..) |column, position| {
+                                    try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(constraint.name.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
+                                }
+                            }
                         },
                         .pg_attribute, .pg_attrdef, .columns => for (table.columns[0..table.column_count], 0..) |*column, index| {
                             const attnum: i64 = @intCast(index + 1);
@@ -1713,6 +1729,34 @@ pub fn Database(comptime config: Config) type {
                     }
                 },
             }
+        }
+
+        /// Primary-key columns in key order (empty without a primary key).
+        fn primaryColumns(table: *const S.Table, out: *[config.columns]u8) []const u8 {
+            if (table.primary_column) |column| {
+                out[0] = @intCast(column);
+                return out[0..1];
+            }
+            const index = S.primaryConstraint(table) orelse return out[0..0];
+            const keys = table.constraints[index].keyColumns();
+            @memcpy(out[0..keys.len], keys);
+            return out[0..keys.len];
+        }
+
+        /// pg_index.indkey text: 1-based column numbers separated by spaces.
+        fn indexKey(columns: []const u8, out: *[4 * config.columns]u8) []const u8 {
+            var at: usize = 0;
+            for (columns, 0..) |column, position| {
+                if (position != 0) {
+                    out[at] = ' ';
+                    at += 1;
+                }
+                var digits: [4]u8 = undefined;
+                const text = formatSmall(@as(usize, column) + 1, &digits);
+                @memcpy(out[at..][0..text.len], text);
+                at += text.len;
+            }
+            return out[0..at];
         }
 
         fn formatSmall(value: usize, out: *[4]u8) []const u8 {
@@ -1841,10 +1885,12 @@ pub fn Database(comptime config: Config) type {
             if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
             const table = &self.tables[index];
             S.reset(table, change_log.first_oid + self.oid_counter, create.name, create.columns[0..create.count]);
+            table.namespace = create.namespace;
+            S.setConstraints(table, create.constraints[0..create.constraint_count]);
             table.live = true;
             table.pending_create = true;
             // A primary key's index owns the next OID (pg_class relkind i).
-            self.oid_counter += 1 + @as(u32, @intFromBool(table.primary_column != null));
+            self.oid_counter += S.oidWidth(table);
             tx.push(.{ .kind = .create_table, .table = @intCast(index) }) catch unreachable;
             var changes: [K.max_changes]K.Change = undefined;
             const count = try self.catalog.create(index, table, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
@@ -1852,6 +1898,7 @@ pub fn Database(comptime config: Config) type {
             if (create.identity) |identity| try self.createSequence(slot, identity.name, identity.spec, table.oid, identity.column, snap);
             const generated_context = self.bindContext("", .standard, snap);
             try B.validateGenerated(&generated_context, index);
+            try B.validateConstraints(&generated_context, index);
             return 0;
         }
 
@@ -1906,7 +1953,7 @@ pub fn Database(comptime config: Config) type {
             const tx = &self.txs[slot];
             const done = tx.progress;
             var ctx = self.evalContext(source);
-            const derived: D.Derived = .{ .defaults = &insert.defaults, .generated = &insert.generated };
+            const derived: D.Derived = .{ .defaults = &insert.defaults, .generated = &insert.generated, .checks = &insert.checks };
             var position: usize = 0;
             if (insert.plan != ast.none) {
                 const work = &self.workspace.query;
@@ -1990,8 +2037,34 @@ pub fn Database(comptime config: Config) type {
                     return self.park(slot, waits);
                 },
             };
+            if (try self.uniqueTaken(slot, table_index, &cells, 0xffffffff, null, snap)) |_| {
+                if (insert.conflict.action == .nothing and insert.conflict.inferred) return 0;
+                return error.PrimaryKeyViolation;
+            }
             try self.appendRow(slot, table_index, &cells, snap);
             return 1;
+        }
+
+        /// UNIQUE and composite PRIMARY KEY checks after the key index
+        /// (23505 for the caller): the conflicting version, null when free;
+        /// a live writer of the same key parks the statement like a primary
+        /// key does. An UPDATE (`old`) skips constraints whose key it keeps.
+        fn uniqueTaken(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, own_slot: u32, old: ?*const E.Row, snap: Snapshot) Error!?u32 {
+            const table = &self.tables[table_index];
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if (!S.scannedUnique(table, constraint)) continue;
+                if (old) |previous| if (!S.keyChanged(constraint, previous, cells)) continue;
+                switch (S.uniqueCheck(table, constraint, cells, own_slot, snap)) {
+                    .free => {},
+                    .taken => |version| return version,
+                    .wait => |owner| {
+                        var waits: L.Set = .{};
+                        waits.add(owner);
+                        return self.park(slot, waits);
+                    },
+                }
+            }
+            return null;
         }
 
         /// Places a new row version (key already checked). Capacity errors
@@ -2253,7 +2326,7 @@ pub fn Database(comptime config: Config) type {
                 provided[bound.mapping[position]] = if (field) |text| try Io.parse(types.typeOfData(column.data_type), column.typmod, text, &self.session) else .null_value;
             }
             var ctx = self.evalContext(source);
-            out.cells = try D.copiedRow(&ctx, table, &provided, .{ .defaults = &bound.defaults, .generated = &bound.generated });
+            out.cells = try D.copiedRow(&ctx, table, &provided, .{ .defaults = &bound.defaults, .generated = &bound.generated, .checks = &bound.checks });
         }
 
         /// Inserts a built row under the open COPY. A key held by a live
@@ -2278,6 +2351,12 @@ pub fn Database(comptime config: Config) type {
                     return self.park(slot, waits);
                 },
             };
+            if (self.uniqueTaken(slot, table_index, &row.cells, 0xffffffff, null, snap)) |taken| {
+                if (taken != null) return error.PrimaryKeyViolation;
+            } else |err| {
+                if (err == error.WouldBlock) tx.pin = snap;
+                return err;
+            }
             try self.appendRow(slot, table_index, &row.cells, snap);
             tx.copy_rows += 1;
         }
@@ -2345,7 +2424,7 @@ pub fn Database(comptime config: Config) type {
         fn updateOne(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, row: u32, old: u32, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const table = &self.tables[update.table];
-            const cells = try D.updatedRow(ctx, table, &update.values, .{ .defaults = &update.defaults, .generated = &update.generated }, &table.versions[old].cells);
+            const cells = try D.updatedRow(ctx, table, &update.values, .{ .defaults = &update.defaults, .generated = &update.generated, .checks = &update.checks }, &table.versions[old].cells);
             if (table.primary_column) |column| {
                 if (update.values[column] != ast.none) switch (D.keyCheck(table, &cells[column], row, snap)) {
                     .free => {},
@@ -2357,6 +2436,7 @@ pub fn Database(comptime config: Config) type {
                     },
                 };
             }
+            if ((try self.uniqueTaken(slot, update.table, &cells, row, &table.versions[old].cells, snap)) != null) return error.PrimaryKeyViolation;
             try self.reserveWrites(slot, 1);
             try S.ensureVersions(table, 1, self.horizon());
             const version = S.allocVersion(table);

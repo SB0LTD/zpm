@@ -267,6 +267,10 @@ pub const Error = error{
     StringDataLengthMismatch,
     /// SQLSTATE 23514: a row fails a CHECK constraint.
     CheckViolation,
+    /// SQLSTATE 42710: a constraint or schema name is already in use.
+    DuplicateObject,
+    /// SQLSTATE 42P16: invalid table definition (several primary keys).
+    InvalidTableDefinition,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent

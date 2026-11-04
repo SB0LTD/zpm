@@ -46,6 +46,10 @@ pub fn Binder(comptime config: types.Config) type {
             columns: [config.columns]V.Column,
             count: usize,
             identity: ?Identity = null,
+            /// CHECK / UNIQUE / named or composite PRIMARY KEY, named.
+            constraints: [config.table_constraints]S.Constraint = undefined,
+            constraint_count: usize = 0,
+            namespace: u32 = catalog.public_namespace,
         };
 
         pub const CreateSequence = struct { name: V.Name, spec: sequence.Spec };
@@ -79,6 +83,8 @@ pub fn Binder(comptime config: types.Config) type {
             generated: [config.columns]u16 = @splat(none),
             conflict: Conflict = .{},
             returning: Returning = .{},
+            /// Bound CHECK expressions by constraint index (source: its text).
+            checks: [config.table_constraints]u16 = @splat(none),
         };
 
         pub const Key = struct { expr: u16, descending: bool, nulls_first: ?bool };
@@ -101,7 +107,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// `values[c]` is the expression assigned to column c (a
         /// default_value node for SET c = DEFAULT), or none.
-        pub const Update = struct { table: usize, values: [config.columns]u16, where: u16, key: u16, returning: Returning = .{}, defaults: [config.columns]u16 = @splat(none), generated: [config.columns]u16 = @splat(none) };
+        pub const Update = struct { table: usize, values: [config.columns]u16, where: u16, key: u16, returning: Returning = .{}, defaults: [config.columns]u16 = @splat(none), generated: [config.columns]u16 = @splat(none), checks: [config.table_constraints]u16 = @splat(none) };
 
         pub const Delete = struct { table: usize, where: u16, key: u16, returning: Returning = .{} };
 
@@ -111,6 +117,8 @@ pub fn Binder(comptime config: types.Config) type {
         pub const Conflict = struct {
             action: ast.ConflictAction = .none,
             update: Update = .{ .table = 0, .values = @splat(none), .where = none, .key = none },
+            /// No conflict target: DO NOTHING arbitrates every unique index.
+            inferred: bool = false,
         };
 
         pub const Bound = union(enum) {
@@ -1542,6 +1550,35 @@ pub fn Binder(comptime config: types.Config) type {
             return needed;
         }
 
+        /// Binds a CHECK constraint's text over the table row (relation 0):
+        /// boolean (42804), no subquery (0A000), aggregate (42803) or window
+        /// function (42P20).
+        fn bindCheckText(context: *const Context, text: []const u8, table: usize) Error!u16 {
+            var sub = context.*;
+            sub.source = text;
+            const id = try P.parseExpression(text, context.pool);
+            try generatedSubqueries(&sub, id);
+            const scope = tableScope(&sub, table);
+            try typeExpr(&sub, &scope, id);
+            try booleanArgument(&sub, id);
+            markStoredSources(&sub, id, -1);
+            return id;
+        }
+
+        /// Every CHECK constraint of the table, by constraint index.
+        fn bindChecks(context: *const Context, index: usize, entry: *const S.Table, checks: *[config.table_constraints]u16) Error!void {
+            for (entry.constraints[0..entry.constraint_count], 0..) |*constraint, position| {
+                if (constraint.kind == .check) checks[position] = try bindCheckText(context, constraint.expression.slice(), index);
+            }
+        }
+
+        /// CHECK expressions of a table definition just written to storage
+        /// (CREATE / ALTER), before its transaction publishes.
+        pub fn validateConstraints(context: *const Context, index: usize) Error!void {
+            var checks: [config.table_constraints]u16 = @splat(none);
+            try bindChecks(context, index, &context.tables[index], &checks);
+        }
+
         fn bindDefaults(context: *const Context, index: usize, entry: *const S.Table, needed: *const [config.columns]bool, defaults: *[config.columns]u16, generated: *[config.columns]u16) Error!void {
             for (entry.columns[0..entry.column_count], 0..) |*column, position| switch (column.default_kind) {
                 .none => {},
@@ -1568,8 +1605,10 @@ pub fn Binder(comptime config: types.Config) type {
             return true;
         }
 
-        /// PostgreSQL's primary-key constraint name `<table>_pkey`.
+        /// PostgreSQL's primary-key constraint name `<table>_pkey`, or the
+        /// name given with CONSTRAINT.
         fn primaryKeyName(entry: *const S.Table) Error!V.Name {
+            if (S.primaryConstraint(entry)) |index| return entry.constraints[index].name;
             var out: V.Name = .{};
             for ([_][]const u8{ entry.name.slice(), "_pkey" }) |part| {
                 if (part.len > config.name_bytes - out.len) return error.NameCapacity;
@@ -1611,6 +1650,7 @@ pub fn Binder(comptime config: types.Config) type {
                 for (used, 0..) |flag, column| if (flag != (column == primary)) return error.InvalidColumnReference;
             } else if (conflict.action == .update) return error.Syntax;
             out.action = conflict.action;
+            out.inferred = conflict.constraint == null and conflict.column_count == 0;
             if (conflict.action != .update) return;
             var scope = tableScope(context, index);
             if (table_alias) |name| scope.rels[0].name = toName(context, name);
@@ -1623,6 +1663,7 @@ pub fn Binder(comptime config: types.Config) type {
             update.where = try bindWhere(context, &scope, conflict.where);
             const needed = assignedDefaults(context, &update.values);
             try bindDefaults(context, index, entry, &needed, &update.defaults, &update.generated);
+            try bindChecks(context, index, entry, &update.checks);
             out.update = update;
         }
 
@@ -3984,6 +4025,7 @@ pub fn Binder(comptime config: types.Config) type {
                         return error.TableExists;
                     }
                     if (create.invalid_definition) return error.Syntax;
+                    if (create.schema != null) return error.UnsupportedStatement;
                     var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count };
                     for (create.columns[0..create.count], 0..) |*definition, index| {
                         var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod, .default_kind = definition.default_kind };
@@ -4012,6 +4054,7 @@ pub fn Binder(comptime config: types.Config) type {
                         }
                         out.columns[index] = column;
                     }
+                    try bindTableConstraints(context, create.constraints[0..create.constraint_count], &out);
                     return .{ .create_table = out };
                 },
                 .drop_table => |drop| {
@@ -4067,6 +4110,7 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     const needed = insertedDefaults(context, &out);
                     try bindDefaults(context, index, entry, &needed, &out.defaults, &out.generated);
+                    try bindChecks(context, index, entry, &out.checks);
                     if (insert.conflict) |*conflict| try bindConflict(context, index, entry, insert.alias, conflict, &out.conflict);
                     out.returning = try bindReturning(context, index, &insert.returning, insert.alias);
                     return .{ .insert = out };
@@ -4112,6 +4156,7 @@ pub fn Binder(comptime config: types.Config) type {
                     out.key = primaryKey(context, entry, out.where);
                     const needed = assignedDefaults(context, &out.values);
                     try bindDefaults(context, index, entry, &needed, &out.defaults, &out.generated);
+                    try bindChecks(context, index, entry, &out.checks);
                     out.returning = try bindReturning(context, index, &update.returning, null);
                     return .{ .update = out };
                 },
@@ -4126,6 +4171,200 @@ pub fn Binder(comptime config: types.Config) type {
                 // COPY runs through Database.copyInfo/copyBegin, never as a statement.
                 .copy => return error.UnsupportedStatement,
                 .truncate => |*truncate| return .{ .truncate = try bindTruncate(context, truncate) },
+            }
+        }
+
+        // ---- table constraints (CREATE TABLE / ALTER TABLE ADD) ----------
+
+        /// PostgreSQL makeObjectName: name1[_name2]_label, shortening the
+        /// longer part first so the whole fits NAMEDATALEN - 1 (63) bytes and
+        /// Config.name_bytes.
+        fn objectName(name1: []const u8, name2: []const u8, label: []const u8) V.Name {
+            const limit = @min(@as(usize, 63), config.name_bytes);
+            const overhead = label.len + 1 + (if (name2.len != 0) @as(usize, 1) else 0);
+            const available = if (limit > overhead) limit - overhead else 0;
+            var first = name1.len;
+            var second = name2.len;
+            while (first + second > available) {
+                if (first > second) first -= 1 else second -= 1;
+            }
+            var out: V.Name = .{};
+            const parts = [_][]const u8{ name1[0..first], if (name2.len != 0) "_" else "", name2[0..second], "_", label };
+            for (parts) |part| {
+                const room = config.name_bytes - out.len;
+                const take = @min(room, part.len);
+                @memcpy(out.bytes[out.len..][0..take], part[0..take]);
+                out.len += take;
+            }
+            return out;
+        }
+
+        /// A constraint name already used by this definition, by another
+        /// visible table's constraint (PostgreSQL names are per schema) or,
+        /// for index-backed kinds, by a relation.
+        fn constraintNameUsed(context: *const Context, table_name: []const u8, taken: []const S.Constraint, name: []const u8, relation: bool) bool {
+            for (taken) |*constraint| if (types.same(constraint.name.slice(), name)) return true;
+            if (relation) {
+                if (types.same(table_name, name)) return true;
+                if (context.catalog.find(name, context.snapshot) != null) return true;
+            }
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = context.catalog.visibleRelations(context.snapshot, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind != 'r') continue;
+                const entry = &context.tables[found.slot];
+                if (types.same(entry.name.slice(), table_name)) continue;
+                for (entry.constraints[0..entry.constraint_count]) |*constraint| if (types.same(constraint.name.slice(), name)) return true;
+            }
+            return false;
+        }
+
+        /// ChooseConstraintName / ChooseRelationName: label, then label1,
+        /// label2, ... until unused.
+        fn chooseName(context: *const Context, table_name: []const u8, name2: []const u8, label: []const u8, taken: []const S.Constraint, relation: bool) V.Name {
+            var pass: usize = 0;
+            while (true) : (pass += 1) {
+                var buffer: [24]u8 = undefined;
+                @memcpy(buffer[0..label.len], label);
+                var length = label.len;
+                if (pass != 0) {
+                    var digits: [20]u8 = undefined;
+                    var at: usize = digits.len;
+                    var rest = pass;
+                    while (true) {
+                        at -= 1;
+                        digits[at] = @intCast('0' + rest % 10);
+                        rest /= 10;
+                        if (rest == 0) break;
+                    }
+                    @memcpy(buffer[length..][0 .. digits.len - at], digits[at..]);
+                    length += digits.len - at;
+                }
+                const candidate = objectName(table_name, name2, buffer[0..length]);
+                if (!constraintNameUsed(context, table_name, taken, candidate.slice(), relation)) return candidate;
+            }
+        }
+
+        fn definitionColumn(columns: []const V.Column, name: []const u8) ?u8 {
+            for (columns, 0..) |*column, index| if (types.same(column.name.slice(), name)) return @intCast(index);
+            return null;
+        }
+
+        /// Distinct columns of the definition a parsed expression names.
+        fn referencedColumns(context: *const Context, id: u16, columns: []const V.Column, seen: *[config.columns]bool) void {
+            if (id == none) return;
+            const n = context.node(id);
+            if (n.kind == .column and !n.star) {
+                const name = toName(context, n.name);
+                if (definitionColumn(columns, name.slice())) |column| seen[column] = true;
+            }
+            referencedColumns(context, n.a, columns, seen);
+            referencedColumns(context, n.c, columns, seen);
+            if (listOwner(n.kind)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) referencedColumns(context, item, columns, seen);
+            } else referencedColumns(context, n.b, columns, seen);
+        }
+
+        /// Resolves CHECK / UNIQUE / PRIMARY KEY definitions against the
+        /// column list into named constraints. A single-column PRIMARY KEY
+        /// marks its column (and keeps an entry only for a CONSTRAINT name);
+        /// key columns become NOT NULL. Explicit duplicate names are 42710,
+        /// index names already used by a relation 42P07, more than
+        /// Config.table_constraints entries ColumnCapacity (54000).
+        fn bindTableConstraints(context: *const Context, definitions: []const Ast.ConstraintDef, out: *Create) Error!void {
+            const columns = out.columns[0..out.count];
+            // Explicit names first, so generated names avoid them.
+            for (definitions, 0..) |*definition, position| if (definition.name) |ident| {
+                const name = toName(context, ident);
+                for (definitions[0..position]) |*earlier| if (earlier.name) |other| {
+                    if (types.same(toName(context, other).slice(), name.slice())) return error.DuplicateObject;
+                };
+                if (definition.kind != .check and (types.same(name.slice(), out.name.slice()) or context.catalog.find(name.slice(), context.snapshot) != null)) return error.TableExists;
+            };
+            var named: [config.table_constraints]S.Constraint = undefined;
+            var named_count: usize = 0;
+            for (definitions) |*definition| if (definition.name) |ident| {
+                named[named_count] = .{ .name = toName(context, ident) };
+                named_count += 1;
+            };
+            for (definitions) |*definition| {
+                var entry: S.Constraint = .{ .nulls_not_distinct = definition.nulls_not_distinct, .kind = switch (definition.kind) {
+                    .check => .check,
+                    .unique => .unique,
+                    .primary => .primary,
+                } };
+                for (definition.columns[0..definition.column_count]) |ident| {
+                    const wanted = toName(context, ident);
+                    const column = definitionColumn(columns, wanted.slice()) orelse return error.ColumnNotFound;
+                    for (entry.keyColumns()) |previous| if (previous == column) return error.DuplicateColumn;
+                    if (out.columns[column].data_type == .json) return error.UndefinedFunction;
+                    entry.columns[entry.column_count] = column;
+                    entry.column_count += 1;
+                }
+                var name2: [256]u8 = undefined;
+                var name2_len: usize = 0;
+                switch (definition.kind) {
+                    .check => {
+                        const text = definition.expression.slice(context.source);
+                        if (text.len > config.text_bytes) return error.TextCapacity;
+                        entry.expression.len = text.len;
+                        @memcpy(entry.expression.bytes[0..text.len], text);
+                        var seen: [config.columns]bool = @splat(false);
+                        referencedColumns(context, definition.node, columns, &seen);
+                        var referenced: ?usize = null;
+                        var distinct: usize = 0;
+                        for (seen, 0..) |hit, column| if (hit) {
+                            distinct += 1;
+                            referenced = column;
+                        };
+                        if (distinct == 1) {
+                            const column_name = columns[referenced.?].name.slice();
+                            @memcpy(name2[0..column_name.len], column_name);
+                            name2_len = column_name.len;
+                        }
+                    },
+                    .unique => for (entry.keyColumns(), 0..) |column, position| {
+                        const column_name = columns[column].name.slice();
+                        if (position != 0) {
+                            name2[name2_len] = '_';
+                            name2_len += 1;
+                        }
+                        const take = @min(column_name.len, name2.len - name2_len);
+                        @memcpy(name2[name2_len..][0..take], column_name[0..take]);
+                        name2_len += take;
+                    },
+                    .primary => {
+                        for (entry.keyColumns()) |column| out.columns[column].not_null = true;
+                        if (entry.column_count == 1) {
+                            for (columns, 0..) |*column, index| if (column.primary_key and index != entry.columns[0]) return error.InvalidTableDefinition;
+                            out.columns[entry.columns[0]].primary_key = true;
+                            if (definition.name == null) continue;
+                        } else for (columns) |*column| if (column.primary_key) return error.InvalidTableDefinition;
+                    },
+                }
+                if (definition.name) |ident| {
+                    entry.name = toName(context, ident);
+                } else {
+                    const label: []const u8 = switch (definition.kind) {
+                        .check => "check",
+                        .unique => "key",
+                        .primary => "pkey",
+                    };
+                    const taken = out.constraints[0..out.constraint_count];
+                    entry.name = if (definition.kind == .primary)
+                        objectName(out.name.slice(), "", label)
+                    else blk: {
+                        // Generated names also avoid every explicit name.
+                        var avoid: [2 * config.table_constraints]S.Constraint = undefined;
+                        @memcpy(avoid[0..taken.len], taken);
+                        @memcpy(avoid[taken.len..][0..named_count], named[0..named_count]);
+                        break :blk chooseName(context, out.name.slice(), name2[0..name2_len], label, avoid[0 .. taken.len + named_count], definition.kind != .check);
+                    };
+                }
+                if (out.constraint_count == config.table_constraints) return error.ColumnCapacity;
+                out.constraints[out.constraint_count] = entry;
+                out.constraint_count += 1;
             }
         }
 
@@ -4162,6 +4401,7 @@ pub fn Binder(comptime config: types.Config) type {
             count: usize = 0,
             defaults: [config.columns]u16 = @splat(none),
             generated: [config.columns]u16 = @splat(none),
+            checks: [config.table_constraints]u16 = @splat(none),
         };
 
         /// PostgreSQL CopyGetAttnums: without a column list every
@@ -4193,6 +4433,7 @@ pub fn Binder(comptime config: types.Config) type {
                 var needed: [config.columns]bool = @splat(true);
                 for (out.mapping[0..out.count]) |column| needed[column] = false;
                 try bindDefaults(context, index, entry, &needed, &out.defaults, &out.generated);
+                try bindChecks(context, index, entry, &out.checks);
             }
             try validateDiscardedRows(context);
             if(context.pool.planned_nulls) {
