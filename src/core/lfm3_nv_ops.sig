@@ -890,29 +890,19 @@ pub const attention = struct {
 //
 // Every kernel runs on nvidia.device's emulated RTX from a pushbuffer, a
 // QMD and constant buffer 0 as Galaxy's driver makes them, against
-// lfm3_executor's arithmetic. A kernel sm120_asm assembles runs from its
-// words with its scheduled control fields checked at NAK's level (the
-// emulator's strict mode); one using a form sm120 does not encode yet runs
-// from its parsed instructions through the device's program hook, each
-// with a safe control field (wait on every scoreboard, stall 15): its
-// arithmetic checked, its schedule not yet.
+// lfm3_executor's arithmetic. Each is sm120_asm's: the device decodes its
+// words (sm120.decode), and the emulator checks the control fields
+// sm120_sched worked out at NAK's level (strict), so a hazard fails a test
+// as surely as a wrong number.
 
 const testing = std.testing;
 const executor = @import("lfm3_executor");
 const sm120 = nvidia.sm120;
 const sm120_asm = nvidia.sm120_asm;
 const emu = nvidia.sm120_emu;
+const sched = nvidia.sm120_sched;
 const push = nvidia.push;
 const device = nvidia.device;
-
-const MAX_PARSED = 1536;
-
-const Parsed = struct {
-    instrs: [MAX_PARSED]sm120.Instr = undefined,
-    targets: [MAX_PARSED]?u64 = undefined,
-    words: [2 * MAX_PARSED]u64 = undefined,
-    program: emu.Program = undefined,
-};
 
 const T = struct {
     var arena: [16 << 20]u8 align(4096) = undefined;
@@ -921,15 +911,12 @@ const T = struct {
     var work: emu.Work = .{};
     var asm_work: sm120_asm.Work = .{};
     var code: [2 * sm120_asm.MAX_INSTRS]u64 = undefined;
-    var parsed: [2]Parsed = .{ .{}, .{} };
-    var n_parsed: usize = 0;
 };
 
 /// A fresh emulated RTX whose memory the CPU sees only through toDevice
 /// and fromDevice (as VRAM behind BAR1).
 fn fresh() device.Device {
     T.dev = .{ .arena = &T.arena, .gpu_view = &T.gpu_view, .work = &T.work, .tpcs = 1 };
-    T.n_parsed = 0;
     return T.dev.device();
 }
 
@@ -938,76 +925,17 @@ const Kernel = struct {
     bytes: usize,
     registers: u32,
     params: u32,
-    /// sm120_asm's words and control fields (else parsed, safe fields).
-    scheduled: bool,
 };
 
-const SAFE = sm120.Control{ .wait = 0x3f, .read = 0, .write = 0, .stall = 15 };
-
-/// `text` in the device's memory, assembled when sm120 encodes all of it.
+/// `text` assembled by sm120_asm (its control fields worked out) into a
+/// code buffer of its own, handed to the GPU.
 fn load(d: device.Device, text: []const u8) !Kernel {
-    if (sm120_asm.assemble(text, &T.code, &T.asm_work)) |k| {
-        const b = try d.alloc(k.code.len * 8 + 4096);
-        @memcpy(@as([]u64, @alignCast(std.mem.bytesAsSlice(u64, b.cpu[0 .. k.code.len * 8]))), k.code);
-        d.toDevice(b, 0, b.cpu.len);
-        return .{ .code = b, .bytes = k.code.len * 8, .registers = k.registers, .params = k.params, .scheduled = true };
-    } else |e| {
-        if (e != error.Unknown) return e;
-    }
-    if (T.n_parsed == T.parsed.len) return error.OutOfMemory;
-    const p = &T.parsed[T.n_parsed];
-    T.n_parsed += 1;
-    var labels: [16]struct { name: []const u8, at: u64 } = undefined;
-    var n_labels: usize = 0;
-    var params: u32 = 0;
-    var top: u32 = 0;
-    var n: usize = 0;
-    for (0..2) |pass| {
-        n = 0;
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        while (lines.next()) |raw| {
-            const t = std.mem.trim(u8, raw, " \t\r");
-            if (t.len == 0) continue;
-            if (std.mem.startsWith(u8, t, ".params ")) {
-                params = try std.fmt.parseInt(u32, t[8..], 10);
-                continue;
-            }
-            if (t[t.len - 1] == ':') {
-                if (pass == 0) {
-                    labels[n_labels] = .{ .name = t[0 .. t.len - 1], .at = n * 16 };
-                    n_labels += 1;
-                }
-                continue;
-            }
-            if (n == MAX_PARSED) return error.OutOfMemory;
-            if (pass == 1) {
-                var in = try sm120.parse(t);
-                in.control = SAFE;
-                p.targets[n] = null;
-                if (in.label()) |l| {
-                    for (labels[0..n_labels]) |x| {
-                        if (std.mem.eql(u8, x.name, l)) p.targets[n] = x.at;
-                    }
-                    if (p.targets[n] == null) return error.NoTarget;
-                }
-                if (sm120.highestGpr(&in)) |r| top = @max(top, r);
-                p.instrs[n] = in;
-            }
-            n += 1;
-        }
-    }
-    // (words no other kernel has: the text's hash, the slot)
-    const tag = std.hash.Wyhash.hash(0, text);
-    for (0..n) |i| {
-        p.words[2 * i] = tag ^ i;
-        p.words[2 * i + 1] = 0x5160_0000_0000_0000 | i;
-    }
-    p.program = .{ .words = p.words[0 .. 2 * n], .instrs = p.instrs[0..n], .targets = p.targets[0..n] };
-    try T.dev.addProgram(&p.program);
-    const b = try d.alloc(n * 16 + 4096);
-    @memcpy(@as([]u64, @alignCast(std.mem.bytesAsSlice(u64, b.cpu[0 .. n * 16]))), p.words[0 .. 2 * n]);
+    const k = try sm120_asm.assemble(text, &T.code, &T.asm_work);
+    try testing.expect(k.scheduled);
+    const b = try d.alloc(k.code.len * 8 + 4096);
+    @memcpy(@as([]u64, @alignCast(std.mem.bytesAsSlice(u64, b.cpu[0 .. k.code.len * 8]))), k.code);
     d.toDevice(b, 0, b.cpu.len);
-    return .{ .code = b, .bytes = n * 16, .registers = top + 3, .params = params, .scheduled = false };
+    return .{ .code = b, .bytes = k.code.len * 8, .registers = k.registers, .params = k.params };
 }
 
 /// One launch as Galaxy's runBatch makes it, run and waited for.
@@ -1023,7 +951,7 @@ fn run(d: device.Device, k: Kernel, l: Launch, params: anytype) !void {
     const sem = try d.alloc(16);
     const pb = try d.alloc(4096);
     const n = try push.batchPush(pb.words(), &.{slot.va}, null, sem.va, 0x600d);
-    T.work.strict = k.scheduled;
+    T.work.strict = true;
     defer T.work.strict = false;
     d.run(pb, @intCast(n), 1_000_000) catch |e| {
         var buf: [256]u8 = undefined;
@@ -1524,20 +1452,33 @@ test "launch shapes: grids, blocks, shared bytes; the span limit; shapes the ker
     try testing.expectEqual(@as(usize, 64), @sizeOf(attention.Params));
 }
 
-/// A variant's text: it parses, the emulator runs every form in it, and
-/// sm120_asm either assembles it or lacks only forms sm120 does not
-/// encode yet.
+/// A variant's text: the emulator runs every form in it; sm120_asm
+/// assembles it, its schedule leaving nothing open by sm120_sched's own
+/// check; and every word decodes and prints back as the line it came from
+/// (a branch's label as its address).
 fn checkText(text: []const u8) !void {
     try emu.loadText(&T.work, text);
     for (T.work.ops[0..T.work.n_ops]) |op| try testing.expect(op.kind != .unsupported and op.kind != .invalid);
-    if (sm120_asm.assemble(text, &T.code, &T.asm_work)) |k| {
-        try testing.expect(k.scheduled);
-    } else |e| {
-        try testing.expectEqual(error.Unknown, e);
+    const k = try sm120_asm.assemble(text, &T.code, &T.asm_work);
+    try testing.expect(k.scheduled);
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const t = std.mem.trim(u8, raw, " \t\r");
+        if (t.len == 0 or t[0] == '.' or t[t.len - 1] == ':') continue;
+        const slot: usize = @intCast(T.asm_work.at[n] / 16);
+        const d = try sm120.decode(k.code[2 * slot], k.code[2 * slot + 1], slot * 16);
+        var buf: [160]u8 = undefined;
+        const printed = try sm120.format(&d, &buf);
+        // (after the control field: "[B------:R-:W-:-:S01] ")
+        if (T.asm_work.instrs[n].label() == null) try testing.expectEqualStrings(t, printed[22..]);
+        n += 1;
     }
+    const rep = try sched.check(T.asm_work.instrs[0..n], T.asm_work.slots[0..n], &T.asm_work.sched);
+    try testing.expectEqual(@as(u32, 0), rep.open);
 }
 
-test "every kernel's text: nvdisasm syntax the emulator runs; sm120_asm assembles it or lacks only unencoded forms" {
+test "every kernel's text: forms the emulator runs, assembled by sm120_asm, decoded back to its lines" {
     inline for (.{ 1024, 2048, 4096, 8192 }) |w| {
         try checkText(comptime residual.source(false, w));
         try checkText(comptime residual.source(true, w));
