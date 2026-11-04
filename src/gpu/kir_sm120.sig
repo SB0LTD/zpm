@@ -206,7 +206,9 @@ pub const State = struct {
     writes: [MAX_VREGS]u16 = undefined,
     def_at: [MAX_VREGS]u32 = undefined,
     uniform: [MAX_VREGS]bool = undefined,
-    /// A KIR instruction folded into a later one (not lowered itself).
+    /// A KIR instruction not lowered (none now: an op folded into a later
+    /// one is lowered too, and dropped as dead code when nothing else
+    /// reads it, so a fold can never leave a value undefined).
     folded: [MAX_INSTS]bool = undefined,
     /// For if and loop: whether the region diverges; whether a brk or cont
     /// leaves it; the matching else/endif/endloop.
@@ -252,6 +254,15 @@ pub const Stats = struct {
     predicated: u32 = 0,
 };
 
+/// How `compile` compiles.
+pub const Options = struct {
+    /// fsqrt as ptxas's sqrt.rn (MUFU.RSQ and one FFMA correction on
+    /// [2^-101, 2^128), the small, zero and special inputs on their own
+    /// paths: Galaxy's frame kernels' square root), else kir.expandSqrt's
+    /// (exact for any frsq within its bound, about twice as long).
+    native_sqrt: bool = true,
+};
+
 /// Binary.extra's words for sm_120.
 pub const EXTRA_INSTRUCTIONS = 0;
 pub const EXTRA_STACK = 1;
@@ -267,12 +278,13 @@ pub fn compile(k: *const kir.Kernel, caps: device.Caps, work: *device.Work, out:
     const mark = work.mark();
     defer work.release(mark);
     const st = &(work.take(State, 1) orelse return error.TooBig)[0];
-    return compileIn(k, caps, st, out);
+    st.asm_work.sched = .{};
+    return compileIn(k, caps, st, out, .{});
 }
 
 /// The same with a State of the caller's (tests, and callers that keep one).
-pub fn compileIn(k: *const kir.Kernel, caps: device.Caps, st: *State, out: []u8) Error!device.Binary {
-    const text = try compileText(k, caps, st);
+pub fn compileIn(k: *const kir.Kernel, caps: device.Caps, st: *State, out: []u8, opts: Options) Error!device.Binary {
+    const text = try compileText(k, caps, st, opts);
     const ak = try sm120_asm.assemble(text, &st.words, &st.asm_work);
     const bytes = ak.code.len * 8;
     if (out.len < bytes) return error.BufferTooSmall;
@@ -297,9 +309,9 @@ pub fn compileIn(k: *const kir.Kernel, caps: device.Caps, st: *State, out: []u8)
 
 /// The assembly text `compile` assembles (for reading and tests); it
 /// lives in `st`.
-pub fn compileText(k: *const kir.Kernel, caps: device.Caps, st: *State) Error![]const u8 {
+pub fn compileText(k: *const kir.Kernel, caps: device.Caps, st: *State, opts: Options) Error![]const u8 {
     const gen = genOf(caps.target) orelse SM120;
-    var c = Ctx{ .w = st, .caps = caps, .gen = gen, .k = k };
+    var c = Ctx{ .w = st, .caps = caps, .gen = gen, .k = k, .opts = opts };
     try c.expand();
     try c.analyze();
     try c.lower();
@@ -315,6 +327,7 @@ const Ctx = struct {
     gen: Gen,
     /// The kernel as given, then its expansion (in the Work).
     k: *const kir.Kernel,
+    opts: Options = .{},
     n: usize = 0,
     nv_kir: u32 = 0,
     labels: u16 = 0,
@@ -341,10 +354,26 @@ const Ctx = struct {
 
     // ── 1. Expansion ────────────────────────────────────────────────────
 
+    /// fdiv as kir.expandDiv's KIR; fsqrt too unless `native_sqrt`
+    /// (then it is lowered here, as ptxas's sqrt.rn).
     fn expand(c: *Ctx) Error!void {
         const k = c.k;
+        if (k.err) |e| return e;
         if (k.n > MAX_INSTS or k.nv > MAX_VREGS) return error.TooBig;
-        const x = try kir.expand(k, c.caps, .{ .insts = &c.w.insts, .tys = &c.w.tys });
+        var x = kir.Kernel.init(.{ .insts = &c.w.insts, .tys = &c.w.tys }, k.name, k.group);
+        x.shared_bytes = k.shared_bytes;
+        x.bindings = k.bindings;
+        x.param_words = k.param_words;
+        @memcpy(c.w.tys[0..k.nv], k.tys[0..k.nv]);
+        x.nv = k.nv;
+        for (k.insts[0..k.n]) |in| {
+            switch (in.op) {
+                .fdiv => kir.expandDiv(&x, c.caps, in.dst, in.a, in.b),
+                .fsqrt => if (c.opts.native_sqrt) x.emit(in) else kir.expandSqrt(&x, c.caps, in.dst, in.a),
+                else => x.emit(in),
+            }
+        }
+        if (x.err) |e| return e;
         c.n = x.n;
         c.nv_kir = x.nv;
     }
@@ -425,7 +454,6 @@ const Ctx = struct {
         }
         if (sp != 0) return error.Unbalanced;
         try c.uniformity();
-        c.folds();
     }
 
     /// Warp-uniform registers, and the divergent regions, to a fixpoint.
@@ -530,25 +558,6 @@ const Ctx = struct {
             }
         }
         return true;
-    }
-
-    /// Which instructions fold into a later one (marked in w.folded).
-    fn folds(c: *Ctx) void {
-        const w = c.w;
-        for (c.insts(), 0..) |in, idx| {
-            switch (in.op) {
-                .@"and", .@"or", .xor, .not => {
-                    var t = Lop{};
-                    if (c.lopTree(&t, idx, true)) {
-                        // mark the folded operands' definitions
-                        for (t.folded[0..t.n_folded]) |f| w.folded[f] = true;
-                    }
-                },
-                else => {},
-            }
-        }
-        // a fold must not have been folded itself and folded again: lopTree
-        // only takes single-read, single-write sources
     }
 
     /// A value `v` defined once, read once, at instruction `def` before
@@ -770,14 +779,24 @@ const Ctx = struct {
         }
     }
 
-    /// A float operand, fneg/fabs folded in as sign bits.
+    /// A float operand, fneg/fabs folded in as sign bits: FADD, FMNMX,
+    /// FSETP and F2I take both, FMUL and FFMA only the negation (a fabs
+    /// then stays an instruction of its own).
     fn fsrc(c: *Ctx, a: kir.Arg) Opd {
+        return c.fsrcM(a, true);
+    }
+
+    fn fsrcNeg(c: *Ctx, a: kir.Arg) Opd {
+        return c.fsrcM(a, false);
+    }
+
+    fn fsrcM(c: *Ctx, a: kir.Arg, abs_ok: bool) Opd {
         var o = c.src(a);
-        if (o == .reg) o = c.fmods(o);
+        if (o == .reg) o = c.fmods(o, abs_ok);
         return o;
     }
 
-    fn fmods(c: *Ctx, o: Opd) Opd {
+    fn fmods(c: *Ctx, o: Opd, abs_ok: bool) Opd {
         var x = o;
         var guard: usize = 0;
         while (x.reg.v < c.nv_kir and guard < 8) : (guard += 1) {
@@ -786,21 +805,17 @@ const Ctx = struct {
             const din = c.w.insts[d];
             if (din.op != .fneg and din.op != .fabs) break;
             if (!isReg(din.a) or c.w.writes[vOf(din.a)] != 1) break;
+            // (outermost first: a sign inside an |..| does not matter, an
+            // |..| inside a sign keeps it: -|x|)
             if (din.op == .fneg) {
-                if (x.reg.abs) break; // (-|x| kept)
-                x.reg.neg = !x.reg.neg;
+                if (!x.reg.abs) x.reg.neg = !x.reg.neg;
             } else {
+                if (!abs_ok) break;
                 x.reg.abs = true;
-                x.reg.neg = false;
             }
             x.reg.v = vOf(din.a);
         }
         return x;
-    }
-
-    fn fregm(c: *Ctx, a: kir.Arg) Error!Opd {
-        if (a == .imm) return c.reg(a);
-        return c.fsrc(a);
     }
 
     fn pred(c: *Ctx, a: kir.Arg) Error!Opd {
@@ -1251,8 +1266,9 @@ const Ctx = struct {
             },
             .pnot => try c.plop(pdst(in), try c.pred(in.a), .{ .pt = true }, .{ .pt = true }, 0x0f),
             .fadd, .fsub, .fmul => {
-                var a = c.fsrc(in.a);
-                var b = c.fsrc(in.b);
+                const abs_ok = in.op != .fmul;
+                var a = c.fsrcM(in.a, abs_ok);
+                var b = c.fsrcM(in.b, abs_ok);
                 if (in.op == .fsub) b = fnegO(b);
                 if (a != .reg) std.mem.swap(Opd, &a, &b);
                 if (a != .reg) a = try c.reg(in.a);
@@ -1263,11 +1279,11 @@ const Ctx = struct {
                 try c.ins(name, 1, &.{ c.dst(in), a, b });
             },
             .ffma, .fmad => {
-                var a = c.fsrc(in.a);
-                var b = c.fsrc(in.b);
+                var a = c.fsrcNeg(in.a);
+                var b = c.fsrcNeg(in.b);
                 if (a != .reg) std.mem.swap(Opd, &a, &b);
                 if (a != .reg) a = try c.reg(in.a);
-                var cc = c.fsrc(in.c);
+                var cc = c.fsrcNeg(in.c);
                 if (b != .reg and cc != .reg) cc = try c.reg(in.c);
                 try c.ins(if (c.ftz()) "FFMA.FTZ" else "FFMA", 1, &.{ c.dst(in), a, b, cc });
             },
@@ -1340,10 +1356,99 @@ const Ctx = struct {
                 const name = if (@as(kir.Vote, @enumFromInt(in.aux)) == .any) "VOTE.ANY" else "VOTE.ALL";
                 try c.eff(name, 1, &.{ pdst(in), try c.pred(in.a) });
             },
-            .fdiv, .fsqrt => return error.Unsupported,
+            .fsqrt => try c.sqrtNative(in),
+            .fdiv => return error.Unsupported,
             .@"if", .@"else", .endif, .loop, .brk, .cont, .endloop, .ret => unreachable,
         }
         _ = w;
+    }
+
+    /// d = sqrt(x), correctly rounded: ptxas's sqrt.rn. x in [2^-101,
+    /// 2^128): MUFU.RSQ and one FFMA correction (Markstein's, with the
+    /// fused FFMA); a small x scaled by 2^64 first (exactly) and the root
+    /// back by 2^-32; +0 itself; the rest (negative, infinite, NaN) MUFU's
+    /// SQRT, a negative denormal (which MUFU flushes to -0) NaN. Under
+    /// flushing the input is flushed first. A divergent one between
+    /// BSSY/BSYNC.
+    fn sqrtNative(c: *Ctx, in: kir.Inst) Error!void {
+        const d = c.dst(in);
+        var x = try c.reg(in.a);
+        if (c.ftz()) {
+            const t = try c.newV(.r);
+            try c.ins("FADD.FTZ", 1, &.{ R(t), x, .{ .reg = .{ .v = NOV, .neg = true } } });
+            x = R(t);
+        }
+        const done = c.label();
+        const slow = c.label();
+        const special = c.label();
+        var bar: ?u8 = null;
+        if (c.guard != .none) return error.Unsupported;
+        if (!c.uniformArg(in.a)) {
+            if (c.depth >= MAX_DEPTH) return error.TooBig;
+            bar = c.depth;
+            c.depth += 1;
+            c.w.stats.bssy += 1;
+            try c.eff("BSSY.RECONVERGENT", 0, &.{ .{ .bar = bar.? }, .{ .label = done } });
+        }
+        const off = try c.newV(.r);
+        const p = try c.newV(.p);
+        const P = Opd{ .pred = .{ .v = p } };
+        try c.ins("IADD", 1, &.{ R(off), x, .{ .imm = 0xf300_0000 } });
+        try c.ins("ISETP.GT.U32.AND", 2, &.{ P, .{ .pt = true }, R(off), .{ .imm = 0x727f_ffff }, .{ .pt = true } });
+        try c.bra(P, slow);
+        try c.rsqStep(d, x);
+        try c.bra(.none, done);
+        try c.at(slow);
+        const q = try c.newV(.p);
+        const Q = Opd{ .pred = .{ .v = q } };
+        try c.ins("ISETP.GE.U32.AND", 2, &.{ Q, .{ .pt = true }, x, .{ .imm = 0x0d00_0000 }, .{ .pt = true } });
+        try c.bra(Q, special);
+        const z = try c.newV(.p);
+        const Z = Opd{ .pred = .{ .v = z } };
+        try c.ins("ISETP.EQ.U32.AND", 2, &.{ Z, .{ .pt = true }, x, .rz, .{ .pt = true } });
+        var m = MI{ .op = "MOV", .nd = 1, .n = 2, .guard = Z };
+        m.o[0] = d;
+        m.o[1] = .rz;
+        try c.put(m);
+        try c.bra(Z, done);
+        const t = try c.newV(.r);
+        try c.ins("FMUL", 1, &.{ R(t), x, .{ .imm = 0x5f80_0000 } }); // 2^64
+        try c.rsqStep(d, R(t));
+        try c.ins("FMUL", 1, &.{ d, d, .{ .imm = 0x2f80_0000 } }); // 2^-32
+        try c.bra(.none, done);
+        try c.at(special);
+        // (x read before d is written: d may be x)
+        if (c.ftz()) {
+            try c.ins("MUFU.SQRT", 1, &.{ d, x });
+        } else {
+            const n = try c.newV(.p);
+            const N = Opd{ .pred = .{ .v = n } };
+            try c.ins("ISETP.GT.U32.AND", 2, &.{ N, .{ .pt = true }, x, .{ .imm = 0x8000_0000 }, .{ .pt = true } });
+            try c.ins("MUFU.SQRT", 1, &.{ d, x });
+            var nan = MI{ .op = "MOV", .nd = 1, .n = 2, .guard = N };
+            nan.o[0] = d;
+            nan.o[1] = .{ .imm = 0x7fff_ffff };
+            try c.put(nan);
+        }
+        try c.at(done);
+        if (bar) |b| {
+            try c.eff("BSYNC.RECONVERGENT", 0, &.{.{ .bar = b }});
+            c.depth -= 1;
+        }
+    }
+
+    /// d = x * rsq(x), corrected once: s = x*r, h = r/2, d = fma(fma(-s,
+    /// s, x), h, s).
+    fn rsqStep(c: *Ctx, d: Opd, x: Opd) Error!void {
+        const r0 = try c.newV(.r);
+        const s0 = try c.newV(.r);
+        const h = try c.newV(.r);
+        const e = try c.newV(.r);
+        try c.ins("MUFU.RSQ", 1, &.{ R(r0), x });
+        try c.ins("FMUL", 1, &.{ R(s0), x, R(r0) });
+        try c.ins("FMUL", 1, &.{ R(h), R(r0), .{ .imm = 0x3f00_0000 } });
+        try c.ins("FFMA", 1, &.{ R(e), .{ .reg = .{ .v = s0, .neg = true } }, R(s0), x });
+        try c.ins("FFMA", 1, &.{ d, R(e), R(h), R(s0) });
     }
 
     fn iadd(c: *Ctx, d: Opd, a0: kir.Arg, b0: kir.Arg, idx: usize) Error!void {
@@ -1358,7 +1463,6 @@ const Ctx = struct {
             const din = c.w.insts[dv];
             if (din.op != .shl or din.b != .imm or din.b.imm == 0 or din.b.imm > 31 or !isReg(din.a)) continue;
             if (!isReg(p.o) and p.o != .imm) continue;
-            c.w.folded[dv] = true;
             try c.ins("LEA", 1, &.{ d, R(vOf(din.a)), try c.reg(p.o), .{ .imm = din.b.imm } });
             return;
         }
@@ -1448,21 +1552,27 @@ const Ctx = struct {
             try c.ins("SHF.L.U32", 1, &.{ R(t), a, .{ .imm = 32 - off - len }, .rz });
             return c.ins("SHF.R.S32.HI", 1, &.{ d, .rz, .{ .imm = 32 - len }, R(t) });
         }
-        // registers: x = a >> b; len 0 gives 0, len >= 32 all of x
+        // registers: off = b & 31, w = min(c, 32 - off); the field shifted
+        // to the top and back (arithmetically for i32), 0 when w is 0
         const a = try c.reg(in.a);
-        const sh = c.src(in.b);
-        const len = try c.reg(in.c);
+        const off = try c.newV(.r);
+        if (in.b == .imm) {
+            try c.ins("MOV", 1, &.{ R(off), c.src(.{ .imm = in.b.imm & 31 }) });
+        } else try c.ins("LOP3.LUT", 1, &.{ R(off), c.src(in.b), .{ .imm = 31 }, .rz, .{ .imm = 0xc0 }, .{ .pt = false } });
         const x = try c.newV(.r);
-        try c.ins(if (sgn) "SHF.R.S32.HI" else "SHF.R.U32.HI", 1, &.{ R(x), .rz, sh, a });
+        try c.ins("SHF.R.U32.HI", 1, &.{ R(x), .rz, R(off), a });
+        const room = try c.newV(.r);
+        try c.ins("IADD", 1, &.{ R(room), negR(R(off)), .{ .imm = 32 } });
+        const wv = try c.newV(.r);
+        try c.ins("VIMNMX.U32", 1, &.{ R(wv), R(room), c.src(in.c), .{ .pt = true } });
         const s = try c.newV(.r);
-        // s = 32 - len (clamped at 0 by SHF's own clamp to 32 when len > 32)
-        try c.ins("IADD", 1, &.{ R(s), negR(len), .{ .imm = 32 } });
+        try c.ins("IADD", 1, &.{ R(s), negR(R(wv)), .{ .imm = 32 } });
         const y = try c.newV(.r);
         try c.ins("SHF.L.U32", 1, &.{ R(y), R(x), R(s), .rz });
         const z = try c.newV(.r);
         try c.ins(if (sgn) "SHF.R.S32.HI" else "SHF.R.U32.HI", 1, &.{ R(z), .rz, R(s), R(y) });
         const p = try c.newV(.p);
-        try c.ins("ISETP.EQ.U32.AND", 2, &.{ .{ .pred = .{ .v = p } }, .{ .pt = true }, len, .rz, .{ .pt = true } });
+        try c.ins("ISETP.EQ.U32.AND", 2, &.{ .{ .pred = .{ .v = p } }, .{ .pt = true }, R(wv), .rz, .{ .pt = true } });
         try c.ins("SEL", 1, &.{ d, .rz, R(z), .{ .pred = .{ .v = p } } });
     }
 
@@ -1570,10 +1680,11 @@ const Ctx = struct {
         }
         if (from == .f32 and to == .f16) {
             if (cv.round == .rne) return c.ins("F2FP.F16.F32.PACK_AB", 1, &.{ d, .rz, try c.reg(in.a) });
+            const fz = c.ftz();
             const name: []const u8 = switch (cv.round) {
-                .rz => "F2F.F16.F32.RZ",
-                .rd => "F2F.F16.F32.RM",
-                else => "F2F.F16.F32.RP",
+                .rz => if (fz) "F2F.FTZ.F16.F32.RZ" else "F2F.F16.F32.RZ",
+                .rd => if (fz) "F2F.FTZ.F16.F32.RM" else "F2F.F16.F32.RM",
+                else => if (fz) "F2F.FTZ.F16.F32.RP" else "F2F.F16.F32.RP",
             };
             return c.ins(name, 1, &.{ d, try c.reg(in.a) });
         }
@@ -1604,7 +1715,8 @@ const Ctx = struct {
                 break;
             }
             if (o == .reg) o.reg.half = half;
-            return c.ins(if (c.ftz()) "HADD2.F32.FTZ" else "HADD2.F32", 1, &.{ d, .{ .reg = .{ .v = NOV, .neg = true } }, o });
+            // (an f16 is never flushed: its denormals are normal f32s)
+            return c.ins("HADD2.F32", 1, &.{ d, .{ .reg = .{ .v = NOV, .neg = true } }, o });
         }
         if (intTy.is(from) and intTy.is(to)) return c.ins("MOV", 1, &.{ d, c.src(in.a) });
         if (from == .f32 and to == .f32) {
@@ -2007,18 +2119,53 @@ const Ctx = struct {
 
     const Scratch = struct { v: u16, p: u8 };
 
+    /// The assembly text, written by hand (no formatting library: Galaxy
+    /// builds kernels freestanding through this path).
     const Text = struct {
         buf: []u8,
         len: usize = 0,
         full: bool = false,
 
-        fn print(t: *Text, comptime fmt: []const u8, args: anytype) void {
+        fn str(t: *Text, x: []const u8) void {
             if (t.full) return;
-            const s = std.fmt.bufPrint(t.buf[t.len..], fmt, args) catch {
+            if (t.buf.len - t.len < x.len) {
                 t.full = true;
                 return;
-            };
-            t.len += s.len;
+            }
+            @memcpy(t.buf[t.len..][0..x.len], x);
+            t.len += x.len;
+        }
+
+        fn digits(t: *Text, v: u32, base: u32) void {
+            var tmp: [10]u8 = undefined;
+            var n: usize = 0;
+            var x = v;
+            while (true) {
+                const dgt: u8 = @intCast(x % base);
+                tmp[n] = if (dgt < 10) '0' + dgt else 'a' + dgt - 10;
+                n += 1;
+                x /= base;
+                if (x == 0) break;
+            }
+            var out: [10]u8 = undefined;
+            for (0..n) |i| out[i] = tmp[n - 1 - i];
+            t.str(out[0..n]);
+        }
+
+        fn dec(t: *Text, v: u32) void {
+            t.digits(v, 10);
+        }
+
+        /// 0x and the hex digits.
+        fn hex(t: *Text, v: u32) void {
+            t.str("0x");
+            t.digits(v, 16);
+        }
+
+        /// A letter and a register number (R5, P0, B1, L12).
+        fn reg(t: *Text, prefix: []const u8, v: u32) void {
+            t.str(prefix);
+            t.dec(v);
         }
     };
 
@@ -2031,12 +2178,15 @@ const Ctx = struct {
     fn emitText(c: *Ctx) Error![]const u8 {
         const w = c.w;
         var t = Text{ .buf = &w.text };
-        t.print(".params {d}\n", .{8 * @as(u32, c.k.bindings) + 4 * @as(u32, c.k.param_words)});
+        t.str(".params ");
+        t.dec(8 * @as(u32, c.k.bindings) + 4 * @as(u32, c.k.param_words));
+        t.str("\n");
         for (w.mi[0..w.n_mi]) |*m| {
             switch (m.kind) {
                 .dead => continue,
                 .label => {
-                    t.print("L{d}:\n", .{m.o[0].label});
+                    t.reg("L", m.o[0].label);
+                    t.str(":\n");
                     continue;
                 },
                 .inst => {},
@@ -2067,29 +2217,31 @@ const Ctx = struct {
             if (scratch + 2 < SCRATCH_P) return error.TooManyRegs;
             var spilled_dst: ?u16 = null;
             if (m.guard != .none) {
-                t.print("@", .{});
+                t.str("@");
                 c.printOpd(&t, m.guard, map[0..n_map], null);
-                t.print(" ", .{});
+                t.str(" ");
             }
-            t.print("{s}", .{m.op});
+            t.str(m.op);
             for (m.o[0..m.n], 0..) |o, i| {
-                t.print("{s}", .{if (i == 0) " " else ", "});
+                t.str(if (i == 0) " " else ", ");
                 if (i < m.nd and o == .pred and o.pred.v != NOV and w.spilled[o.pred.v]) {
                     spilled_dst = o.pred.v;
-                    t.print("P{d}", .{SCRATCH_P});
+                    t.reg("P", SCRATCH_P);
                     continue;
                 }
                 c.printOpd(&t, o, map[0..n_map], m);
             }
-            t.print("\n", .{});
+            t.str("\n");
             if (spilled_dst) |v| {
                 // (a guarded write keeps the old value when the guard is off)
                 if (m.guard != .none) {
-                    t.print("@", .{});
+                    t.str("@");
                     c.printOpd(&t, m.guard, map[0..n_map], null);
-                    t.print(" ", .{});
+                    t.str(" ");
                 }
-                t.print("SEL R{d}, RZ, 0x1, !P{d}\n", .{ c.physOf(v), SCRATCH_P });
+                t.reg("SEL R", c.physOf(v));
+                t.reg(", RZ, 0x1, !P", SCRATCH_P);
+                t.str("\n");
             }
         }
         if (t.full) return error.TooBig;
@@ -2101,7 +2253,9 @@ const Ctx = struct {
             if (x.v == v) return;
         }
         if (n_map.* == map.len) return error.TooManyRegs;
-        t.print("ISETP.NE.U32.AND P{d}, PT, R{d}, RZ, PT\n", .{ p, c.physOf(v) });
+        t.reg("ISETP.NE.U32.AND P", p);
+        t.reg(", PT, R", c.physOf(v));
+        t.str(", RZ, PT\n");
         map[n_map.*] = .{ .v = v, .p = p };
         n_map.* += 1;
     }
@@ -2111,42 +2265,55 @@ const Ctx = struct {
         switch (o) {
             .none => {},
             .reg => |r| {
-                if (r.neg) t.print("-", .{});
-                if (r.abs) t.print("|", .{});
-                if (r.v == NOV) t.print("RZ", .{}) else t.print("R{d}", .{c.physOf(r.v)});
-                if (r.abs) t.print("|", .{});
+                if (r.neg) t.str("-");
+                if (r.abs) t.str("|");
+                if (r.v == NOV) t.str("RZ") else t.reg("R", c.physOf(r.v));
+                if (r.abs) t.str("|");
                 switch (r.half) {
-                    1 => t.print(".H0_H0", .{}),
-                    2 => t.print(".H1_H1", .{}),
+                    1 => t.str(".H0_H0"),
+                    2 => t.str(".H1_H1"),
                     else => {},
                 }
             },
-            .rz => t.print("RZ", .{}),
+            .rz => t.str("RZ"),
             .pred => |p| {
-                if (p.not) t.print("!", .{});
+                if (p.not) t.str("!");
                 var n: u8 = c.physOf(p.v);
                 if (c.w.spilled[p.v]) {
                     for (map) |x| {
                         if (x.v == p.v) n = x.p;
                     }
                 }
-                t.print("P{d}", .{n});
+                t.reg("P", n);
             },
-            .pt => |b| t.print("{s}", .{if (b) "PT" else "!PT"}),
-            .imm => |x| t.print("0x{x}", .{x}),
-            .cbuf => |x| t.print("c[0x0][0x{x}]", .{x}),
-            .sreg => |s| t.print("{s}", .{s}),
+            .pt => |b| t.str(if (b) "PT" else "!PT"),
+            .imm => |x| t.hex(x),
+            .cbuf => |x| {
+                t.str("c[0x0][");
+                t.hex(x);
+                t.str("]");
+            },
+            .sreg => |x| t.str(x),
             .mem => |x| {
-                if (x.desc) t.print("desc[UR4]", .{});
-                t.print("[", .{});
-                if (x.base == NOV) t.print("RZ", .{}) else t.print("R{d}", .{c.physOf(x.base)});
-                if (x.wide) t.print(".64", .{});
-                if (x.off > 0) t.print("+0x{x}", .{@as(u32, @intCast(x.off))}) else if (x.off < 0) t.print("+-0x{x}", .{@as(u32, @intCast(-x.off))});
-                t.print("]", .{});
+                if (x.desc) t.str("desc[UR4]");
+                t.str("[");
+                if (x.base == NOV) t.str("RZ") else t.reg("R", c.physOf(x.base));
+                if (x.wide) t.str(".64");
+                if (x.off > 0) {
+                    t.str("+");
+                    t.hex(@intCast(x.off));
+                } else if (x.off < 0) {
+                    t.str("+-");
+                    t.hex(@intCast(-x.off));
+                }
+                t.str("]");
             },
-            .label => |l| t.print("`(L{d})", .{l}),
-            .bar => |b| t.print("B{d}", .{b}),
-            .ur4 => t.print("UR4", .{}),
+            .label => |l| {
+                t.reg("`(L", l);
+                t.str(")");
+            },
+            .bar => |b| t.reg("B", b),
+            .ur4 => t.str("UR4"),
         }
     }
 };
