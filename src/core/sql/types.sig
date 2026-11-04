@@ -5,6 +5,7 @@ const numeric = @import("numeric.sig");
 const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
 const character = @import("character.sig");
+const uuid = @import("uuid.sig");
 
 pub const Config = struct {
     /// Caller supplies row/version/index buffers and query reference workspace.
@@ -309,11 +310,11 @@ pub const Dialect = enum { postgres, mysql, tds };
 
 /// Stored column / result types. `integer` is int8 (BIGINT) and
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
-pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar };
+pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet.
-pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar };
+pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid };
 
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
@@ -335,6 +336,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .jsonb => .jsonb,
         .varchar => .varchar,
         .bpchar => .bpchar,
+        .uuid => .uuid,
     };
 }
 
@@ -358,6 +360,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .jsonb => .jsonb,
         .varchar => .varchar,
         .bpchar => .bpchar,
+        .uuid => .uuid,
     };
 }
 
@@ -385,6 +388,7 @@ pub fn typeInfo(data_type: DataType) TypeInfo {
         .jsonb => .{ .oid = 3802, .name = "jsonb", .len = -1, .category = 'U', .array = 3807 },
         .bpchar => .{ .oid = 1042, .name = "bpchar", .len = -1, .category = 'S', .array = 1014 },
         .varchar => .{ .oid = 1043, .name = "varchar", .len = -1, .category = 'S', .array = 1015 },
+        .uuid => .{ .oid = 2950, .name = "uuid", .len = 16, .category = 'U', .array = 2951 },
     };
 }
 
@@ -415,6 +419,7 @@ pub fn sqlTypeName(data_type: DataType) []const u8 {
         .jsonb => "jsonb",
         .varchar => "character varying",
         .bpchar => "character",
+        .uuid => "uuid",
     };
 }
 
@@ -439,6 +444,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .jsonb => "jsonb_in",
         .varchar => "varcharin",
         .bpchar => "bpcharin",
+        .uuid => "uuid_in",
     };
 }
 
@@ -551,7 +557,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -567,6 +573,7 @@ pub fn Values(comptime config: Config) type {
             interval: temporal.Interval,
             jsonb: Text,
             bpchar: Text,
+            uuid: uuid.Uuid,
         };
 
         pub const Row = struct {
@@ -601,6 +608,7 @@ pub fn Values(comptime config: Config) type {
                 .interval => .interval,
                 .jsonb => .jsonb,
                 .bpchar => .bpchar,
+                .uuid => .uuid,
             };
         }
 
@@ -627,6 +635,7 @@ pub fn Values(comptime config: Config) type {
                 .interval => |value| temporal.compareInterval(value, right.interval),
                 .jsonb => |*value| J.compare(value.slice(), right.jsonb.slice()),
                 .bpchar => |*value| bytesOrder(character.trimmed(value.slice()), character.trimmed(right.bpchar.slice())),
+                .uuid => |*value| bytesOrder(value, &right.uuid),
             };
         }
 
@@ -698,6 +707,10 @@ pub fn Values(comptime config: Config) type {
                 .bpchar => |*text| {
                     mix(&code, tag);
                     for (character.trimmed(text.slice())) |byte| code = (code ^ byte) *% 1099511628211;
+                },
+                .uuid => |*bytes| {
+                    mix(&code, tag);
+                    for (bytes) |byte| code = (code ^ byte) *% 1099511628211;
                 },
                 .null_value => unreachable,
             }

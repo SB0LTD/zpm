@@ -275,8 +275,98 @@ fn character() !void {
     try meta(2, 1042, 7);
 }
 
+// ---- UUID ------------------------------------------------------------------
+
+fn uuid() !void {
+    // oracle: PG.TYPE.UUID.
+    try exec("CREATE TABLE tdd_type(v UUID)");
+    try exec("INSERT INTO tdd_type VALUES('12345678-1234-1234-1234-123456789abc'),(NULL)");
+    try rows("SELECT v FROM tdd_type ORDER BY v NULLS LAST", "12345678-1234-1234-1234-123456789abc;NULL");
+    try meta(0, 2950, -1);
+    try exec("DROP TABLE tdd_type");
+
+    // Every input form uuid_in accepts: case-insensitive hex, optional
+    // braces, hyphens after any group of four digits.
+    const canonical = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
+    for ([_][]const u8{
+        "SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid",
+        "SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid",
+        "SELECT 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid",
+        "SELECT 'a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11'::uuid",
+        "SELECT '{a0eebc99-9c0b4ef8-bb6d6bb9-bd380a11}'::uuid",
+        "SELECT CAST('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' AS UUID)",
+        "SELECT UUID 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'",
+    }) |source| {
+        try rows(source, canonical);
+        try meta(0, 2950, -1);
+    }
+    for ([_][]const u8{
+        "SELECT 'xyz'::uuid",
+        "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1'::uuid",
+        "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a111'::uuid",
+        "SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",
+        "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid",
+        "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11-'::uuid",
+        "SELECT '-a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",
+        "SELECT 'a0eeb-c99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",
+        "SELECT 'a0eebc99--9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",
+        "SELECT ' a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",
+        "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 '::uuid",
+        "SELECT 'g0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",
+        "SELECT ''::uuid",
+    }) |source| try rejects(source, error.InvalidTextRepresentation);
+    try sqlstate(error.InvalidTextRepresentation, "22P02");
+
+    try exec("CREATE TABLE ids(id UUID PRIMARY KEY, label TEXT, other UUID)");
+    try exec("INSERT INTO ids VALUES('ffffffff-ffff-ffff-ffff-ffffffffffff', 'max', NULL), ('00000000-0000-0000-0000-000000000000', 'nil', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'a', '00000000-0000-0000-0000-000000000001')");
+    try rows("SELECT id, label FROM ids ORDER BY id", "00000000-0000-0000-0000-000000000000|nil;a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a;ffffffff-ffff-ffff-ffff-ffffffffffff|max");
+    try rows("SELECT other FROM ids ORDER BY other DESC NULLS LAST", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11;00000000-0000-0000-0000-000000000001;NULL");
+    try rows("SELECT label FROM ids WHERE id = '{A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11}'", "a");
+    try rows("SELECT label FROM ids WHERE id > '80000000-0000-0000-0000-000000000000' ORDER BY id", "a;max");
+    try rows("SELECT a.label, b.label FROM ids a JOIN ids b ON a.other = b.id ORDER BY a.label", "nil|a");
+    try rows("SELECT COUNT(DISTINCT other), COUNT(*) FROM ids", "2|3");
+    try rejects("INSERT INTO ids VALUES('A0EEBC999C0B4EF8BB6D6BB9BD380A11', 'dup', NULL)", error.PrimaryKeyViolation);
+    try rejects("INSERT INTO ids(id) VALUES('00000000-0000-0000-0000-00000000000g')", error.InvalidTextRepresentation);
+    try rejects("INSERT INTO ids(id, label) VALUES('11111111-1111-1111-1111-111111111111', 'ok'), ('bad', 'no')", error.InvalidTextRepresentation);
+    try rows("SELECT COUNT(*) FROM ids", "3");
+    // Casts: to text by assignment or explicitly; from text explicitly only.
+    try rows("SELECT id::text, CAST(other AS VARCHAR(8)) FROM ids WHERE label = 'nil'", "00000000-0000-0000-0000-000000000000|a0eebc99");
+    try meta(0, 25, -1);
+    try exec("UPDATE ids SET label = id WHERE label = 'a'");
+    try rows("SELECT label FROM ids WHERE id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'", canonical);
+    try rows("SELECT label::uuid = id FROM ids WHERE id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'", "t");
+    try rejects("UPDATE ids SET other = label", error.TypeMismatch);
+    try rejects("SELECT id = label FROM ids", error.UndefinedFunction);
+    try rejects("SELECT 1::uuid", error.CannotCoerce);
+    try rows("SELECT NULL::uuid, format_type(2950, NULL), 'uuid'::regtype::text", "NULL|uuid|uuid");
+    try meta(0, 2950, -1);
+    try exec("DROP TABLE ids");
+
+    // Wire: 16-byte binary form.
+    try check(Wire.oid(.uuid) == 2950 and Wire.length(.uuid) == 16);
+    try exec("SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid");
+    const binary = [_]u8{ 0xa0, 0xee, 0xbc, 0x99, 0x9c, 0x0b, 0x4e, 0xf8, 0xbb, 0x6d, 0x6b, 0xb9, 0xbd, 0x38, 0x0a, 0x11 };
+    try sendText(&result.rows[0].cells[0], canonical);
+    try sendBinary(&result.rows[0].cells[0], .uuid, &binary);
+    try receive(&binary, .uuid, canonical);
+    try literal(&binary, 2950, 1, "'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid");
+    try literal(canonical, 2950, 0, "'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid");
+    var out: [64]u8 = undefined;
+    try check(if (Wire.receiveText(binary[0..15], .uuid, &out)) |_| false else |err| err == error.ProtocolViolation);
+
+    // Durability.
+    try replay(&.{
+        "CREATE TABLE r(id UUID PRIMARY KEY, v UUID)",
+        "INSERT INTO r VALUES('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', NULL), ('00000000-0000-0000-0000-000000000000', 'ffffffff-ffff-ffff-ffff-ffffffffffff')",
+        "UPDATE r SET v = id WHERE v IS NULL",
+    }, "SELECT * FROM r ORDER BY id");
+    try shown("replica", "00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff;a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+    try meta(0, 2950, -1);
+}
+
 pub fn main(init: std.process.Init) !void {
     try character();
+    try uuid();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-types-core\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

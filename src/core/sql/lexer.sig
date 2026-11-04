@@ -195,6 +195,7 @@ pub const Keyword = enum {
     char,
     varying,
     bpchar,
+    uuid,
 };
 
 /// Words that cannot be unquoted identifiers.

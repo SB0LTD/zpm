@@ -16,6 +16,7 @@ const jsonb = @import("jsonb.sig");
 const expr = @import("expr.sig");
 const ast = @import("ast.sig");
 const character = @import("character.sig");
+const uuid = @import("uuid.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -265,6 +266,7 @@ pub fn Io(comptime config: types.Config) type {
                     break :blk buffer[0..out.len];
                 },
                 .bpchar => |*value| copy(buffer, value.slice()),
+                .uuid => |*value| uuid.format(value, buffer),
             };
         }
 
@@ -339,6 +341,7 @@ pub fn Io(comptime config: types.Config) type {
                 .jsonb => try jsonbCellControlled(input, session.control),
                 .varchar => try textCell(input),
                 .bpchar => .{ .bpchar = (try textCell(input)).text },
+                .uuid => .{ .uuid = try uuid.parse(input) },
             };
             return applyTypmod(cell, ty, typmod);
         }
@@ -578,6 +581,11 @@ pub fn Io(comptime config: types.Config) type {
                         var buffer: [format_bytes]u8 = undefined;
                         break :blk V.Cell{ .bpchar = (try textCell(try format(&cell, true, session, &buffer))).text };
                     },
+                },
+                .uuid => switch (cell) {
+                    .uuid => cell,
+                    .text => |*value| try parse(.uuid, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
                 },
             };
             return applyTypmodExplicit(out, to, typmod);

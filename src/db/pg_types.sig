@@ -7,7 +7,7 @@
 //! base-10000 digits}, DATE i32 days and TIMESTAMP[TZ] i64 microseconds
 //! since 2000-01-01, INTERVAL {us i64, days i32, months i32}, JSONB version
 //! byte 1 + text, and text/name/json/varchar/bpchar raw bytes (bpchar
-//! padded). Parameters are rendered as
+//! padded) and UUID 16 bytes. Parameters are rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
 //! is a protocol violation (08P01).
@@ -111,6 +111,7 @@ pub fn Types(comptime Result: type) type {
                     at += try sendText(cell, session, out[at..]);
                 },
                 .bpchar => |*value| try put(out, &at, value.slice()),
+                .uuid => |*value| try put(out, &at, value),
             }
             return at;
         }
@@ -199,7 +200,7 @@ pub fn Types(comptime Result: type) type {
                 .smallint => 2,
                 .integer32, .oid, .real, .date => 4,
                 .integer, .double, .timestamp, .timestamptz => 8,
-                .interval => 16,
+                .interval, .uuid => 16,
                 else => 0,
             };
             if (need != 0 and bytes.len != need) return error.ProtocolViolation;
@@ -212,6 +213,7 @@ pub fn Types(comptime Result: type) type {
                 .timestamp => .{ .timestamp = getInt(i64, bytes) },
                 .timestamptz => .{ .timestamptz = getInt(i64, bytes) },
                 .interval => .{ .interval = .{ .us = getInt(i64, bytes[0..8]), .days = getInt(i32, bytes[8..12]), .months = getInt(i32, bytes[12..16]) } },
+                .uuid => .{ .uuid = bytes[0..16].* },
                 .numeric => blk: {
                     if (bytes.len < 8) return error.ProtocolViolation;
                     const ndigits: usize = getInt(u16, bytes[0..2]);

@@ -27,7 +27,7 @@
 //!   dscale u16, coefficient 4 x u64} | 7 date i32 | 8 timestamp i64
 //!   | 9 timestamptz i64 | 10 interval {months i32, days i32, us i64}
 //!   | 11 jsonb len u32 + canonical bytes | 12 bpchar len u32 + padded bytes
-//!   (VARCHAR values use 3). Every value is checked against the
+//!   (VARCHAR values use 3) | 13 uuid 16 bytes. Every value is checked against the
 //!   column's type OID (create_table) before anything applies.
 //! Ops may repeat a (table, rowid) and apply in record order.
 //!
@@ -232,6 +232,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 12);
                     try writer.int(u32, @intCast(text.len));
                     try writer.bytes(text.slice());
+                },
+                .uuid => |*bytes| {
+                    try writer.int(u8, 13);
+                    try writer.bytes(bytes);
                 },
             }
         }
@@ -568,6 +572,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     break :blk if (tag == 8) V.Cell{ .timestamp = us } else V.Cell{ .timestamptz = us };
                 },
                 10 => .{ .interval = .{ .months = try reader.int(i32), .days = try reader.int(i32), .us = try reader.int(i64) } },
+                13 => .{ .uuid = (try reader.take(16))[0..16].* },
                 else => return error.InvalidChangeRecord,
             };
             return .{ .cell = cell, .offset = offset };
