@@ -1376,6 +1376,11 @@ pub fn Session(comptime DB: type) type {
                 .drop_table => "drop",
                 .create_sequence => "create_sequence",
                 .drop_sequence => "drop_sequence",
+                .truncate => "truncate",
+                .alter_table => "alter_table",
+                .alter_sequence => "alter_sequence",
+                .create_schema => "create_schema",
+                .drop_schema => "drop_schema",
                 .begin => "begin",
                 .commit => "commit",
                 .rollback => "rollback",
@@ -1396,6 +1401,16 @@ pub fn Session(comptime DB: type) type {
                 try w.append("CREATE SEQUENCE");
             } else if (equal(completed_command, "drop_sequence")) {
                 try w.append("DROP SEQUENCE");
+            } else if (equal(completed_command, "truncate")) {
+                try w.append("TRUNCATE TABLE");
+            } else if (equal(completed_command, "alter_table")) {
+                try w.append("ALTER TABLE");
+            } else if (equal(completed_command, "alter_sequence")) {
+                try w.append("ALTER SEQUENCE");
+            } else if (equal(completed_command, "create_schema")) {
+                try w.append("CREATE SCHEMA");
+            } else if (equal(completed_command, "drop_schema")) {
+                try w.append("DROP SCHEMA");
             } else if (isCommand(completed_command, source, "select")) {
                 try w.append("SELECT ");
                 try w.number(@intCast(row_count));
@@ -1527,6 +1542,11 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "DuplicateColumn")) return "42701";
     if (equal(name, "PrimaryKeyViolation")) return "23505";
     if (equal(name, "NotNullViolation")) return "23502";
+    if (equal(name, "CheckViolation")) return "23514";
+    if (equal(name, "DuplicateObject")) return "42710";
+    if (equal(name, "InvalidTableDefinition")) return "42P16";
+    if (equal(name, "UndefinedSchema")) return "3F000";
+    if (equal(name, "DuplicateSchema")) return "42P06";
     if (equal(name, "TypeMismatch")) return "42804";
     if (equal(name, "IntegerOverflow")) return "22003";
     if (equal(name, "ProtocolViolation")) return "08P01";

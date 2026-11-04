@@ -41,11 +41,35 @@ pub fn Dml(comptime config: types.Config) type {
             return cell;
         }
 
-        /// Bound column defaults and generation expressions (binder).
+        /// Bound column defaults and generation expressions (binder), and the
+        /// table's CHECK constraints by constraint index (null: none bound).
         pub const Derived = struct {
             defaults: *const [config.columns]u16,
             generated: *const [config.columns]u16,
+            checks: ?*const [config.table_constraints]u16 = null,
         };
+
+        /// The bound CHECK constraints over an existing row (ALTER TABLE).
+        pub fn checkRow(ctx: *const E.Context, table: *const S.Table, checks: *const [config.table_constraints]u16, cells: *const E.Row) Error!void {
+            const empty: [config.columns]u16 = @splat(none);
+            return checkConstraints(ctx, table, .{ .defaults = &empty, .generated = &empty, .checks = checks }, cells);
+        }
+
+        /// PostgreSQL ExecConstraints after NOT NULL: a CHECK that yields
+        /// FALSE rejects the row (23514); NULL satisfies it.
+        fn checkConstraints(ctx: *const E.Context, table: *const S.Table, derived: Derived, cells: *const E.Row) Error!void {
+            const checks = derived.checks orelse return;
+            for (table.constraints[0..table.constraint_count], 0..) |*constraint, index| {
+                if (constraint.kind != .check) continue;
+                const id = checks[index];
+                if (id == none) continue;
+                var sub = ctx.*;
+                sub.source = constraint.expression.slice();
+                sub.row = cells;
+                const verdict = try E.eval(&sub, id);
+                if (verdict == .boolean and !verdict.boolean) return error.CheckViolation;
+            }
+        }
 
         /// The column default (DEFAULT expression, identity nextval) for an
         /// unlisted column or a DEFAULT item; NULL without one.
@@ -86,6 +110,7 @@ pub fn Dml(comptime config: types.Config) type {
                 cells[index] = try store(column, evaluated, ctx.session);
             }
             try computeGenerated(ctx, table, derived, &cells);
+            try checkConstraints(ctx, table, derived, &cells);
             return cells;
         }
 
@@ -101,6 +126,7 @@ pub fn Dml(comptime config: types.Config) type {
                 cells[index] = try store(column, evaluated, ctx.session);
             }
             try computeGenerated(ctx, table, derived, &cells);
+            try checkConstraints(ctx, table, derived, &cells);
             return cells;
         }
 
@@ -114,6 +140,7 @@ pub fn Dml(comptime config: types.Config) type {
                 cells[index] = try store(column, evaluated, ctx.session);
             }
             try computeGenerated(ctx, table, derived, &cells);
+            try checkConstraints(ctx, table, derived, &cells);
             ctx.row = old;
             return cells;
         }

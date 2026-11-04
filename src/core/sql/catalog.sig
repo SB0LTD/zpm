@@ -10,7 +10,9 @@
 //!   cat_attrdef    (adrelid, adnum, adbin)                       tables x columns (empty until defaults)
 //!   cat_sequences  (seqrelid, start, increment, max, min, cycle)  sequences
 //!                  (values are non-transactional and live in the sequence slots)
-//!   cat_namespaces pg_catalog (11), public (2200), information_schema: static
+//!   cat_namespaces pg_catalog (11), public (2200), information_schema: static;
+//!                  user schemas are cat_relations rows of relkind 'n'
+//!                  (Config.schemas slots) and tables carry their namespace
 //!
 //! Every relation is sized by the user-object limits (Config.tables,
 //! columns, sequences) with two versions per row, so user DDL hits
@@ -98,7 +100,7 @@ pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
 }
 
 pub fn Catalog(comptime config: types.Config) type {
-    const rows = @max(config.tables * config.columns, config.tables + config.sequences);
+    const rows = @max(config.tables * config.columns, config.tables + config.sequences + config.schemas);
     const cat_config: types.Config = .{
         .tables = 1,
         .columns = 6,
@@ -149,6 +151,65 @@ pub fn Catalog(comptime config: types.Config) type {
             return config.tables + slot + 1;
         }
 
+        fn schemaRow(slot: usize) u64 {
+            return config.tables + config.sequences + slot + 1;
+        }
+
+        /// A user schema: cat_relations row (oid, name, 'n', 0, slot).
+        pub fn createSchema(self: *Self, slot: usize, oid: u32, name: []const u8, xmin: storage.TxRef, cid: u32, csn: u64, horizon: u64, out: *[max_changes]Change) Error!usize {
+            const cells = [_]CV.Cell{ int(oid), text(name), text("n"), int(0), int(@intCast(slot)) };
+            out[0] = .{ .relation = .relations, .version = try self.addVersion(.relations, schemaRow(slot), &cells, xmin, cid, csn, horizon) };
+            return 1;
+        }
+
+        pub fn dropSchema(self: *Self, slot: usize, snap: storage.Snapshot, xmax: storage.TxRef, cid: u32, csn: u64, out: *[max_changes]Change) usize {
+            const relations = self.relation(.relations);
+            const version = visibleRow(relations, schemaRow(slot), snap) orelse return 0;
+            mark(relations, version, xmax, cid, csn);
+            out[0] = .{ .relation = .relations, .version = version };
+            return 1;
+        }
+
+        pub const SchemaFound = struct { oid: u32, slot: usize };
+
+        /// A user schema named `name` visible to `snap`.
+        pub fn findSchema(self: *const Self, name: []const u8, snap: storage.Snapshot) ?SchemaFound {
+            const relations = self.relationConst(.relations);
+            for (0..relations.row_high) |row| {
+                const version = SC.visibleAt(relations, row, snap) orelse continue;
+                const cells = &relations.versions[version].cells;
+                if (cells[2].text.bytes[0] != 'n' or !sameName(&cells[1], name)) continue;
+                return .{ .oid = @intCast(cells[0].integer), .slot = @intCast(cells[4].integer) };
+            }
+            return null;
+        }
+
+        /// Every user schema visible to `snap`, in catalog row order.
+        pub fn visibleSchemas(self: *const Self, snap: storage.Snapshot, out: *[rows]SchemaFound) usize {
+            const relations = self.relationConst(.relations);
+            var count: usize = 0;
+            for (0..relations.row_high) |row| {
+                const version = SC.visibleAt(relations, row, snap) orelse continue;
+                const cells = &relations.versions[version].cells;
+                if (cells[2].text.bytes[0] != 'n') continue;
+                out[count] = .{ .oid = @intCast(cells[0].integer), .slot = @intCast(cells[4].integer) };
+                count += 1;
+            }
+            return count;
+        }
+
+        /// A live transaction other than the snapshot's own with an
+        /// uncommitted relation row in namespace `namespace`.
+        pub fn namespaceCreator(self: *const Self, namespace: u32, snap: storage.Snapshot) ?u16 {
+            const relations = self.relationConst(.relations);
+            for (relations.versions[0..relations.version_high]) |*version| {
+                if (version.row == 0 or version.xmin_csn != 0 or snap.own(version.xmin)) continue;
+                if (version.xmax.epoch != 0) continue;
+                if (version.cells[3] == .integer and version.cells[3].integer == namespace and version.cells[2].text.bytes[0] != 'n') return version.xmin.slot;
+            }
+            return null;
+        }
+
         /// cat_relations (relkind S) and cat_sequences rows for a sequence slot.
         pub fn createSequence(self: *Self, slot: usize, seq: anytype, xmin: storage.TxRef, cid: u32, csn: u64, horizon: u64, out: *[max_changes]Change) Error!usize {
             var count: usize = 0;
@@ -184,25 +245,33 @@ pub fn Catalog(comptime config: types.Config) type {
         pub const relation_rows = rows;
 
         /// Every relation (table or sequence) visible to `snap`, in
-        /// catalog row order.
+        /// catalog row order. Schemas are listed by visibleSchemas.
         pub fn visibleRelations(self: *const Self, snap: storage.Snapshot, out: *[rows]Found) usize {
             const relations = self.relationConst(.relations);
             var count: usize = 0;
             for (0..relations.row_high) |row| {
                 const version = SC.visibleAt(relations, row, snap) orelse continue;
                 const cells = &relations.versions[version].cells;
+                if (cells[2].text.bytes[0] == 'n') continue;
                 out[count] = .{ .kind = cells[2].text.bytes[0], .slot = @intCast(cells[4].integer) };
                 count += 1;
             }
             return count;
         }
 
-        /// Any relation (table or sequence) named `name` visible to `snap`.
+        /// Any relation (table or sequence) named `name` in the public
+        /// schema (the default search_path) visible to `snap`.
         pub fn find(self: *const Self, name: []const u8, snap: storage.Snapshot) ?Found {
+            return self.findIn(public_namespace, name, snap);
+        }
+
+        /// A table or sequence named `name` in schema `namespace`.
+        pub fn findIn(self: *const Self, namespace: u32, name: []const u8, snap: storage.Snapshot) ?Found {
             const relations = self.relationConst(.relations);
             for (0..relations.row_high) |row| {
                 const version = SC.visibleAt(relations, row, snap) orelse continue;
                 const cells = &relations.versions[version].cells;
+                if (cells[2].text.bytes[0] == 'n' or cells[3].integer != namespace) continue;
                 if (sameName(&cells[1], name)) return .{ .kind = cells[2].text.bytes[0], .slot = @intCast(cells[4].integer) };
             }
             return null;
@@ -229,7 +298,7 @@ pub fn Catalog(comptime config: types.Config) type {
             var count: usize = 0;
             errdefer for (out[0..count]) |change| SC.reclaimVersion(self.relation(change.relation), change.version);
             const oid: i64 = table.oid;
-            const relation_cells = [_]CV.Cell{ int(oid), text(table.name.slice()), text("r"), int(public_namespace), int(@intCast(slot)) };
+            const relation_cells = [_]CV.Cell{ int(oid), text(table.name.slice()), text("r"), int(table.namespace), int(@intCast(slot)) };
             out[count] = .{ .relation = .relations, .version = try self.addVersion(.relations, slot + 1, &relation_cells, xmin, cid, csn, horizon) };
             count += 1;
             for (table.columns[0..table.column_count], 0..) |*column, index| {

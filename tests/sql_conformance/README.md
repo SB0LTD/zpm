@@ -70,28 +70,28 @@ component is missing. The annotations below separate those cases.
 | PG.QUERY.SAMPLE | TABLESAMPLE | Syntax |
 | PG.QUERY.FETCH_TIES | FETCH WITH TIES | Syntax |
 | PG.QUERY.LIMIT_EXPR | Expression LIMIT/OFFSET | Syntax |
-| PG.DDL.SCHEMA | Schema lifecycle | Syntax |
-| PG.DDL.ALTER | ALTER TABLE | UnsupportedStatement |
+| PG.DDL.SCHEMA | Schema lifecycle | pass (B11 candidate); schema-qualified tables, closure incomplete |
+| PG.DDL.ALTER | ALTER TABLE | pass (B11 candidate); column/default/NOT NULL/constraint actions, closure incomplete |
 | PG.DDL.CREATE_VARIANTS | Temporary/CTAS/LIKE | Syntax |
 | PG.DDL.INHERITANCE | Table inheritance | Syntax |
 | PG.DDL.PARTITION | Partition lifecycle | Syntax |
 | PG.DDL.IF_EXISTS | Conditional DDL | qualified smoke pass; table/sequence clauses, wider DDL/notice parity incomplete |
-| PG.DDL.TRUNCATE | TRUNCATE | UnsupportedStatement |
+| PG.DDL.TRUNCATE | TRUNCATE | pass (B11 candidate); closure incomplete |
 | PG.DDL.DATABASE | Database lifecycle | UnexecutedScopeOrComparator |
-| PG.CONSTRAINT.COMPOSITE | Composite/table-level primary key | Syntax |
-| PG.CONSTRAINT.UNIQUE | UNIQUE/NULL rules | Syntax |
-| PG.CONSTRAINT.CHECK | CHECK | Syntax |
+| PG.CONSTRAINT.COMPOSITE | Composite/table-level primary key | pass (B11 candidate); closure incomplete |
+| PG.CONSTRAINT.UNIQUE | UNIQUE/NULL rules | pass (B11 candidate); scan-enforced, closure incomplete |
+| PG.CONSTRAINT.CHECK | CHECK | pass (B11 candidate); closure incomplete |
 | PG.CONSTRAINT.FK | Foreign-key actions | Syntax |
 | PG.CONSTRAINT.DEFERRED | Deferred constraints | Syntax |
 | PG.CONSTRAINT.EXCLUSION | Exclusion constraints | Syntax |
 | PG.INDEX.SECONDARY | Secondary/index catalog | Syntax |
 | PG.INDEX.ADVANCED | Composite/expression/partial/covering index | Syntax |
-| PG.DML.UPDATE_FROM | UPDATE FROM | Syntax |
-| PG.DML.DELETE_USING | DELETE USING | Syntax |
-| PG.DML.TUPLE_ASSIGN | Tuple assignment | Syntax |
+| PG.DML.UPDATE_FROM | UPDATE FROM | pass (B11 candidate); RETURNING of source columns open |
+| PG.DML.DELETE_USING | DELETE USING | pass (B11 candidate); closure incomplete |
+| PG.DML.TUPLE_ASSIGN | Tuple assignment | pass (B11 candidate); sub-SELECT source open |
 | PG.DML.MERGE | MERGE | UnsupportedStatement |
 | PG.DML.UPSERT_UNIQUE | Non-PK upsert | Syntax |
-| PG.SEQUENCE.EXTENDED | Sequence lifecycle/cache/SERIAL | Syntax |
+| PG.SEQUENCE.EXTENDED | Sequence lifecycle/cache/SERIAL | pass (B11 candidate); OWNED BY/RENAME open |
 | PG.DDL.VIRTUAL | Virtual generated columns | Syntax |
 | PG.VIEW.ORDINARY | Views | Syntax |
 | PG.VIEW.MATERIALIZED | Materialized views | Syntax |

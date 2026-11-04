@@ -361,6 +361,23 @@ pub fn Database(comptime config: Config) type {
 
         pub const Outcome = struct { affected: usize = 0, command: CommandTag = .none, returning: Returned = .{}, noop: bool = false };
 
+        /// A user schema slot: like a sequence slot, `creator` owns a pending
+        /// CREATE or DROP; `dead_csn` marks a committed DROP until reclaimed.
+        pub const Schema = struct {
+            live: bool = false,
+            pending_create: bool = false,
+            pending_drop: bool = false,
+            creator: u16 = 0,
+            dead_csn: u64 = 0,
+            oid: u32 = 0,
+            name: Name = .{},
+        };
+
+        pub const AlterRecord = struct {
+            sources: [config.columns]u8 = @splat(0),
+            fills: [config.columns]V.Cell = @splat(.null_value),
+        };
+
         /// Statement-scoped scratch inside caller-owned database storage.
         pub const Workspace = struct {
             nodes: A.Pool = .{},
@@ -544,6 +561,11 @@ pub fn Database(comptime config: Config) type {
         pub const work_rows = X.work_rows;
 
         tables: [config.tables]S.Table = @splat(.{}),
+        /// ALTER TABLE column mapping of the table slot it filled (indexed by
+        /// that slot), read when the transaction encodes its record.
+        alters: [config.tables]AlterRecord = @splat(.{}),
+        /// User schemas (Config.schemas); visibility is the catalog's.
+        schemas: [config.schemas]Schema = @splat(.{}),
         catalog: K = .{},
         /// Sequence slots (Config.sequences); values are non-transactional.
         seqs: [config.sequences]Q.Seq = @splat(.{}),
@@ -800,6 +822,11 @@ pub fn Database(comptime config: Config) type {
             self.epoch = source.epoch;
             self.catalog = source.catalog;
             self.seqs = source.seqs;
+            self.schemas = source.schemas;
+            for (&self.schemas) |*schema| {
+                schema.pending_create = false;
+                schema.pending_drop = false;
+            }
             self.seq_carried = source.seq_carried;
             // A logical copy has fresh session/execution state. In particular,
             // never copy caller-owned interrupt or sequence-hook pointers.
@@ -1273,15 +1300,38 @@ pub fn Database(comptime config: Config) type {
                 },
                 .insert => |*insert| blk: {
                     try self.lockTable(slot, insert.table, .row_exclusive);
+                    try self.lockSources(slot);
                     break :blk try self.insertRows(slot, source, insert, snap);
                 },
                 .update => |*update| blk: {
                     try self.lockTable(slot, update.table, .row_exclusive);
+                    try self.lockSources(slot);
                     break :blk try self.updateRows(slot, source, update, snap);
                 },
                 .delete => |*delete| blk: {
                     try self.lockTable(slot, delete.table, .row_exclusive);
+                    try self.lockSources(slot);
                     break :blk try self.deleteRows(slot, source, delete, snap);
+                },
+                .truncate => |*truncate| blk: {
+                    try self.truncateTables(slot, truncate, snap);
+                    break :blk 0;
+                },
+                .alter_table => |*alter| blk: {
+                    try self.alterTable(slot, alter, snap);
+                    break :blk 0;
+                },
+                .alter_sequence => |*alter| blk: {
+                    try self.alterSequence(slot, alter.slot, alter.options, snap);
+                    break :blk 0;
+                },
+                .create_schema => |name| blk: {
+                    try self.createSchema(slot, name, snap);
+                    break :blk 0;
+                },
+                .drop_schema => |*drop| blk: {
+                    try self.dropSchema(slot, drop, snap);
+                    break :blk 0;
                 },
                 .select, .query, .control => unreachable,
             };
@@ -1356,7 +1406,82 @@ pub fn Database(comptime config: Config) type {
                 seq.dead_csn = 0;
                 freed = true;
             };
+            for (&self.schemas) |*schema| if (schema.live and schema.dead_csn != 0 and schema.dead_csn <= at) {
+                schema.live = false;
+                schema.dead_csn = 0;
+                freed = true;
+            };
             if (freed) _ = self.catalog.vacuum(at);
+        }
+
+        // ---- schemas ---------------------------------------------------------
+
+        /// CREATE SCHEMA: a schema slot, an OID and a cat_relations row
+        /// (relkind 'n'), all transactional. A concurrent creator of the same
+        /// name is waited for; the binder already rejected a visible name.
+        fn createSchema(self: *Self, slot: u16, name: Name, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            if (self.catalog.creator(name.slice(), snap)) |other| {
+                var waits: L.Set = .{};
+                waits.add(other);
+                tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                return self.park(slot, waits);
+            }
+            try self.reserveWrites(slot, 2);
+            var destination: ?usize = null;
+            for (0..2) |attempt| {
+                for (&self.schemas, 0..) |*schema, index| if (!schema.live) {
+                    destination = index;
+                    break;
+                };
+                if (destination != null or attempt == 1) break;
+                self.reclaimTables(self.horizon());
+            }
+            const index = destination orelse return error.TableCapacity;
+            if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
+            const schema = &self.schemas[index];
+            schema.* = .{ .live = true, .pending_create = true, .creator = slot, .oid = change_log.first_oid + self.oid_counter, .name = name };
+            self.oid_counter += 1;
+            tx.push(.{ .kind = .create_schema, .table = @intCast(index) }) catch unreachable;
+            var changes: [K.max_changes]K.Change = undefined;
+            const count = try self.catalog.createSchema(index, schema.oid, name.slice(), tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
+            for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
+        }
+
+        /// DROP SCHEMA: RESTRICT refuses a schema that holds tables (2BP01);
+        /// CASCADE drops them first. A table another transaction is creating
+        /// in it, or its pending DROP, is waited for.
+        fn dropSchema(self: *Self, slot: u16, drop: *const B.DropSchema, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            const schema = &self.schemas[drop.slot];
+            var waits: L.Set = .{};
+            if (schema.pending_drop and schema.creator != slot) waits.add(schema.creator);
+            if (self.catalog.namespaceCreator(drop.oid, snap)) |other| waits.add(other);
+            if (waits.any()) {
+                tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                return self.park(slot, waits);
+            }
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind != 'r' or self.tables[found.slot].namespace != drop.oid) continue;
+                if (!drop.cascade) return error.DependentObjects;
+                _ = try self.dropTable(slot, found.slot, snap);
+            }
+            try self.reserveWrites(slot, 2);
+            schema.pending_drop = true;
+            schema.creator = slot;
+            tx.push(.{ .kind = .drop_schema, .table = @intCast(drop.slot) }) catch unreachable;
+            var changes: [K.max_changes]K.Change = undefined;
+            const changed = self.catalog.dropSchema(drop.slot, snap, tx.ref(slot), snap.cid, 0, &changes);
+            for (changes[0..changed]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
+        }
+
+        /// Schema name of a namespace OID for the system views.
+        fn namespaceName(self: *const Self, oid: u32) []const u8 {
+            for (catalog_module.namespaces) |namespace| if (namespace.oid == oid) return namespace.name;
+            for (&self.schemas) |*schema| if (schema.live and schema.oid == oid) return schema.name.slice();
+            return "";
         }
 
         // ---- sequences (design §4.11) ---------------------------------------
@@ -1421,9 +1546,66 @@ pub fn Database(comptime config: Config) type {
             for (&self.seqs, 0..) |*seq, index| {
                 if (!seq.live or seq.owner != oid or seq.owner_column != column or seq.dead_csn != 0) continue;
                 if (seq.pending_create and seq.creator != self.seq_slot) continue;
+                // This transaction replaced it (ALTER SEQUENCE) or dropped it.
+                if (seq.pending_drop and seq.creator == self.seq_slot) continue;
                 return index;
             }
             return error.TableNotFound;
+        }
+
+        /// ALTER SEQUENCE (PostgreSQL 10+ makes it transactional): the
+        /// sequence is copied into a free sequence slot with the new options
+        /// and, for RESTART, the new state; the catalog swaps the relation in
+        /// this transaction, as ALTER TABLE does. Other sessions' nextval
+        /// waits for it (PostgreSQL's lock); abort discards the copy. The
+        /// own session forgets its cached values.
+        fn alterSequence(self: *Self, slot: u16, index: usize, options: sequence_module.Options, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            const seq = &self.seqs[index];
+            if (seq.pending_drop and seq.creator != slot) {
+                var waits: L.Set = .{};
+                waits.add(seq.creator);
+                tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                return self.park(slot, waits);
+            }
+            const altered = try sequence_module.alter(seq.spec, seq.last_value, options);
+            try self.reserveWrites(slot, 5);
+            var destination: ?usize = null;
+            for (0..2) |attempt| {
+                for (&self.seqs, 0..) |*candidate, position| if (!candidate.live) {
+                    destination = position;
+                    break;
+                };
+                if (destination != null or attempt == 1) break;
+                self.reclaimTables(self.horizon());
+            }
+            const fresh_slot = destination orelse return error.TableCapacity;
+            const copy = &self.seqs[fresh_slot];
+            copy.* = seq.*;
+            copy.spec = altered.spec;
+            // The copy logs again before handing out a value.
+            copy.log_cnt = 0;
+            if (altered.restart) |value| {
+                copy.last_value = value;
+                copy.is_called = false;
+                copy.logged_value = value;
+                copy.logged_called = false;
+            }
+            copy.live = true;
+            copy.pending_create = true;
+            copy.pending_drop = false;
+            copy.dead_csn = 0;
+            copy.creator = slot;
+            seq.pending_drop = true;
+            seq.creator = slot;
+            tx.push(.{ .kind = .alter_sequence, .table = @intCast(fresh_slot), .old = @intCast(index) }) catch unreachable;
+            var changes: [K.max_changes]K.Change = undefined;
+            var count = self.catalog.dropSequence(index, snap, tx.ref(slot), snap.cid, 0, &changes);
+            for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
+            count = try self.catalog.createSequence(fresh_slot, copy, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
+            for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
+            const session = self.sequence_session orelse &self.default_sequences;
+            session.forget(copy.oid);
         }
 
         /// regclass text input: optional `public.` qualifier, quoted names
@@ -1443,6 +1625,23 @@ pub fn Database(comptime config: Config) type {
                 if (found.kind == 'r' and self.tables[found.slot].oid == oid) return error.WrongObjectType;
             }
             return error.TableNotFound;
+        }
+
+        /// The dot separating `schema.name` in regclass text outside double
+        /// quotes, unless the schema is public (regclassName strips that).
+        fn std_dot(text: []const u8) ?usize {
+            var quoted = false;
+            for (text, 0..) |byte, index| {
+                if (byte == '"') quoted = !quoted;
+                if (byte == '.' and !quoted) {
+                    const head = text[0..index];
+                    var trimmed = head;
+                    while (trimmed.len != 0 and (trimmed[0] == ' ' or trimmed[0] == '\t')) trimmed = trimmed[1..];
+                    if (types.keyword(trimmed, "public")) return null;
+                    return index;
+                }
+            }
+            return null;
         }
 
         fn regclassName(text: []const u8) ?Name {
@@ -1467,6 +1666,18 @@ pub fn Database(comptime config: Config) type {
         /// (`<table>_pkey`) or a sequence; -1 (or 42P01) when missing.
         fn regclassOid(self: *const Self, text: []const u8, strict: bool) Error!i64 {
             const missing: Error!i64 = if (strict) error.TableNotFound else -1;
+            // `schema.name` of a user schema (unquoted parts fold to lower case).
+            if (std_dot(text)) |dot| {
+                const schema = regclassName(text[0..dot]) orelse return missing;
+                const relation = regclassName(text[dot + 1 ..]) orelse return missing;
+                var schemas: [K.relation_rows]K.SchemaFound = undefined;
+                const count = self.catalog.visibleSchemas(self.seq_snap, &schemas);
+                for (schemas[0..count]) |found| {
+                    if (!types.same(self.schemas[found.slot].name.slice(), schema.slice())) continue;
+                    const hit = self.catalog.findIn(found.oid, relation.slice(), self.seq_snap) orelse return missing;
+                    return if (hit.kind == 'S') self.seqs[hit.slot].oid else self.tables[hit.slot].oid;
+                }
+            }
             const name = regclassName(text) orelse return missing;
             if (self.catalog.find(name.slice(), self.seq_snap)) |found| {
                 return if (found.kind == 'S') self.seqs[found.slot].oid else self.tables[found.slot].oid;
@@ -1476,14 +1687,17 @@ pub fn Database(comptime config: Config) type {
             for (relations[0..count]) |found| {
                 if (found.kind != 'r') continue;
                 const table = &self.tables[found.slot];
-                if (table.primary_column == null) continue;
+                if (!S.keyed(table)) continue;
                 const index_name = indexName(table) catch continue;
                 if (types.same(index_name.slice(), name.slice())) return table.oid + 1;
             }
             return missing;
         }
 
+        /// The primary-key index (and constraint) name: CONSTRAINT name, else
+        /// `<table>_pkey`.
         fn indexName(table: *const S.Table) Error!Name {
+            if (S.primaryConstraint(table)) |index| return table.constraints[index].name;
             var out: Name = .{};
             for ([_][]const u8{ table.name.slice(), "_pkey" }) |part| {
                 if (part.len > config.name_bytes - out.len) return error.NameCapacity;
@@ -1506,7 +1720,7 @@ pub fn Database(comptime config: Config) type {
                     const table = &self.tables[found.slot];
                     if (table.oid == oid) {
                         name = table.name;
-                    } else if (table.primary_column != null and table.oid + 1 == oid) {
+                    } else if (S.keyed(table) and table.oid + 1 == oid) {
                         name = indexName(table) catch return null;
                     } else continue;
                 }
@@ -1536,8 +1750,27 @@ pub fn Database(comptime config: Config) type {
             const index = if (kind == .identity) try self.identitySequence(oid, @intCast(amount)) else if (oid != 0) try self.sequenceByOid(oid) else try self.sequenceByName(name);
             const seq = &self.seqs[index];
             const tx = &self.txs[self.seq_slot];
+            if (kind != .currval and seq.pending_drop and seq.creator != self.seq_slot and self.active(seq.creator)) {
+                // Another transaction is replacing or dropping it: wait, as
+                // nextval/setval wait for PostgreSQL's sequence lock.
+                if (tx.running_snap == null) return error.LockNotAvailable;
+                var waits: L.Set = .{};
+                waits.add(seq.creator);
+                tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                return self.park(self.seq_slot, waits);
+            }
             switch (kind) {
                 .nextval, .identity => {
+                    if (seq.spec.cache > 1) {
+                        if (session.cachedNext(seq.oid)) |value| return value;
+                        const batch = try Q.nextCached(seq);
+                        if (batch.logged) {
+                            tx.seq_dirty.add(index);
+                            self.seq_carried.add(index);
+                        }
+                        session.recordBatch(seq.oid, batch.value, batch.last, seq.spec.increment, LiveOids{ .db = self });
+                        return batch.value;
+                    }
                     const out = try Q.next(seq);
                     if (out.logged) {
                         tx.seq_dirty.add(index);
@@ -1549,6 +1782,7 @@ pub fn Database(comptime config: Config) type {
                 .currval => return session.currval(seq.oid) orelse error.SequenceNotReady,
                 .setval => {
                     try Q.set(seq, amount, called);
+                    session.forget(seq.oid);
                     tx.seq_dirty.add(index);
                     self.seq_carried.add(index);
                     if (called) {
@@ -1641,42 +1875,61 @@ pub fn Database(comptime config: Config) type {
                     var category: [1]u8 = .{info.category};
                     try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), nameCell("b"), nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)) });
                 },
-                .pg_namespace => for (catalog_module.namespaces) |namespace| {
-                    try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name) });
-                },
-                .schemata => for (catalog_module.namespaces) |namespace| {
-                    try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
+                .pg_namespace, .schemata => {
+                    for (catalog_module.namespaces) |namespace| {
+                        if (view == .pg_namespace) try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name) }) else try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
+                    }
+                    var schemas: [K.relation_rows]K.SchemaFound = undefined;
+                    const schema_count = self.catalog.visibleSchemas(snapshot, &schemas);
+                    for (schemas[0..schema_count]) |found| {
+                        const schema_name = self.schemas[found.slot].name.slice();
+                        if (view == .pg_namespace) try sink.add(&.{ intCell(found.oid), nameCell(schema_name) }) else try sink.add(&.{ nameCell(database), nameCell(schema_name) });
+                    }
                 },
                 else => for (relations[0..count]) |found| {
                     if (found.kind == 'S') {
                         const seq = &self.seqs[found.slot];
                         switch (view) {
                             .pg_class => try sink.add(&.{ intCell(seq.oid), nameCell(seq.name.slice()), intCell(public), nameCell("S"), intCell(3) }),
-                            .pg_sequence => try sink.add(&.{ intCell(seq.oid), intCell(seq.spec.type_oid), intCell(seq.spec.start), intCell(seq.spec.increment), intCell(seq.spec.max), intCell(seq.spec.min), intCell(1), boolCell(seq.spec.cycle) }),
+                            .pg_sequence => try sink.add(&.{ intCell(seq.oid), intCell(seq.spec.type_oid), intCell(seq.spec.start), intCell(seq.spec.increment), intCell(seq.spec.max), intCell(seq.spec.min), intCell(seq.spec.cache), boolCell(seq.spec.cycle) }),
                             else => {},
                         }
                         continue;
                     }
                     const table = &self.tables[found.slot];
+                    const schema_name = self.namespaceName(table.namespace);
                     const name = table.name.slice();
                     const oid: i64 = table.oid;
                     const pkey = indexName(table) catch Name{};
+                    var key_columns: [config.columns]u8 = undefined;
+                    const primary_columns = primaryColumns(table, &key_columns);
                     switch (view) {
                         .pg_class => {
-                            try sink.add(&.{ intCell(oid), nameCell(name), intCell(public), nameCell("r"), intCell(@intCast(table.column_count)) });
-                            if (table.primary_column != null) try sink.add(&.{ intCell(oid + 1), nameCell(pkey.slice()), intCell(public), nameCell("i"), intCell(1) });
+                            try sink.add(&.{ intCell(oid), nameCell(name), intCell(table.namespace), nameCell("r"), intCell(@intCast(table.column_count)) });
+                            if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), nameCell(pkey.slice()), intCell(table.namespace), nameCell("i"), intCell(@intCast(primary_columns.len)) });
                         },
-                        .tables => try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(name), nameCell("BASE TABLE") }),
-                        .pg_index => if (table.primary_column) |column| {
-                            var key: [4]u8 = undefined;
-                            const digits = formatSmall(column + 1, &key);
-                            try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(digits) });
+                        .tables => try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(name), nameCell("BASE TABLE") }),
+                        .pg_index => if (S.keyed(table)) {
+                            var key: [4 * config.columns]u8 = undefined;
+                            try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)) });
                         },
-                        .table_constraints => if (table.primary_column != null) {
-                            try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(pkey.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell("PRIMARY KEY") });
+                        .table_constraints => {
+                            if (S.keyed(table)) try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(pkey.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell("PRIMARY KEY") });
+                            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                                if (constraint.kind == .primary) continue;
+                                try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(constraint.name.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(if (constraint.kind == .check) "CHECK" else "UNIQUE") });
+                            }
                         },
-                        .key_column_usage => if (table.primary_column) |column| {
-                            try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(pkey.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(1) });
+                        .key_column_usage => {
+                            for (primary_columns, 0..) |column, position| {
+                                try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(pkey.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
+                            }
+                            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                                if (constraint.kind != .unique) continue;
+                                for (constraint.keyColumns(), 0..) |column, position| {
+                                    try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(constraint.name.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
+                                }
+                            }
                         },
                         .pg_attribute, .pg_attrdef, .columns => for (table.columns[0..table.column_count], 0..) |*column, index| {
                             const attnum: i64 = @intCast(index + 1);
@@ -1695,7 +1948,7 @@ pub fn Database(comptime config: Config) type {
                                 .columns => {
                                     const numeric = numericPrecision(column);
                                     try sink.add(&.{
-                                        nameCell(database),                                       nameCell("public"),                          nameCell(name),            nameCell(column.name.slice()),
+                                        nameCell(database),                                       nameCell(schema_name),                          nameCell(name),            nameCell(column.name.slice()),
                                         intCell(attnum),                                          if (kind == .default) expressionTextWithPool(pool,column) else .null_value, nameCell(if (column.not_null) "NO" else "YES"), nameCell(types.sqlTypeName(column.data_type)),
                                         optionalInt(characterMaximumLength(column)),              optionalInt(numeric[0]),                     optionalInt(numeric[1]),   optionalInt(numeric[2]),
                                         optionalInt(datetimePrecision(column)),                   nameCell(if (identity.len != 0) "YES" else "NO"), if (identity.len == 0) .null_value else nameCell(if (kind == .identity_always) "ALWAYS" else "BY DEFAULT"), nameCell(if (kind == .generated) "ALWAYS" else "NEVER"),
@@ -1709,6 +1962,34 @@ pub fn Database(comptime config: Config) type {
                     }
                 },
             }
+        }
+
+        /// Primary-key columns in key order (empty without a primary key).
+        fn primaryColumns(table: *const S.Table, out: *[config.columns]u8) []const u8 {
+            if (table.primary_column) |column| {
+                out[0] = @intCast(column);
+                return out[0..1];
+            }
+            const index = S.primaryConstraint(table) orelse return out[0..0];
+            const keys = table.constraints[index].keyColumns();
+            @memcpy(out[0..keys.len], keys);
+            return out[0..keys.len];
+        }
+
+        /// pg_index.indkey text: 1-based column numbers separated by spaces.
+        fn indexKey(columns: []const u8, out: *[4 * config.columns]u8) []const u8 {
+            var at: usize = 0;
+            for (columns, 0..) |column, position| {
+                if (position != 0) {
+                    out[at] = ' ';
+                    at += 1;
+                }
+                var digits: [4]u8 = undefined;
+                const text = formatSmall(@as(usize, column) + 1, &digits);
+                @memcpy(out[at..][0..text.len], text);
+                at += text.len;
+            }
+            return out[0..at];
         }
 
         fn formatSmall(value: usize, out: *[4]u8) []const u8 {
@@ -1823,6 +2104,13 @@ pub fn Database(comptime config: Config) type {
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
             }
+            // A schema another transaction is dropping: wait for it.
+            for (&self.schemas) |*schema| if (schema.live and schema.oid == create.namespace and schema.pending_drop and schema.creator != slot) {
+                var waits: L.Set = .{};
+                waits.add(schema.creator);
+                tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                return self.park(slot, waits);
+            };
             try self.reserveWrites(slot, 2 + create.count);
             var destination: ?usize = null;
             for (0..2) |attempt| {
@@ -1837,17 +2125,21 @@ pub fn Database(comptime config: Config) type {
             if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
             const table = &self.tables[index];
             S.reset(table, change_log.first_oid + self.oid_counter, create.name, create.columns[0..create.count]);
+            table.namespace = create.namespace;
+            S.setConstraints(table, create.constraints[0..create.constraint_count]);
             table.live = true;
             table.pending_create = true;
             // A primary key's index owns the next OID (pg_class relkind i).
-            self.oid_counter += 1 + @as(u32, @intFromBool(table.primary_column != null));
+            self.oid_counter += S.oidWidth(table);
             tx.push(.{ .kind = .create_table, .table = @intCast(index) }) catch unreachable;
             var changes: [K.max_changes]K.Change = undefined;
             const count = try self.catalog.create(index, table, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
             if (create.identity) |identity| try self.createSequence(slot, identity.name, identity.spec, table.oid, identity.column, snap);
+            for (create.serials[0..create.serial_count]) |serial| try self.createSequence(slot, serial.name, serial.spec, table.oid, serial.column, snap);
             const generated_context = self.bindContext("", .standard, snap);
             try B.validateGenerated(&generated_context, index);
+            try B.validateConstraints(&generated_context, index);
             return 0;
         }
 
@@ -1870,6 +2162,138 @@ pub fn Database(comptime config: Config) type {
             return 0;
         }
 
+        /// TRUNCATE (PostgreSQL ExecuteTruncate): AccessExclusive on every
+        /// target first, so a lock wait parks before any write; then every
+        /// row version visible to the statement is marked deleted in place.
+        /// One write entry per table covers all of its rows (no write-set or
+        /// version cost per row); commit publishes the marks and frees the
+        /// dead versions, abort or ROLLBACK TO clears exactly these marks.
+        /// RESTART IDENTITY is not provided (0A000).
+        fn truncateTables(self: *Self, slot: u16, truncate: *const B.Truncate, snap: Snapshot) Error!void {
+            for (truncate.tables[0..truncate.count]) |index| try self.lockTable(slot, index, .access_exclusive);
+            try self.reserveWrites(slot, truncate.count);
+            // RESTART IDENTITY: every sequence a column of the table owns
+            // (identity, SERIAL) restarts, transactionally (ALTER SEQUENCE).
+            if (truncate.restart_identity) {
+                // Collect first: each restart fills another sequence slot.
+                var owned: [config.sequences]bool = @splat(false);
+                for (truncate.tables[0..truncate.count]) |index| {
+                    const oid = self.tables[index].oid;
+                    for (&self.seqs, 0..) |*seq, position| {
+                        if (!seq.live or seq.owner != oid or seq.dead_csn != 0) continue;
+                        if (seq.pending_create and seq.creator != slot) continue;
+                        if (seq.pending_drop and seq.creator == slot) continue;
+                        owned[position] = true;
+                    }
+                }
+                for (owned, 0..) |restart, position| if (restart) try self.alterSequence(slot, position, .{ .restart = true }, snap);
+            }
+            const tx = &self.txs[slot];
+            for (truncate.tables[0..truncate.count]) |index| {
+                const table = &self.tables[index];
+                for (0..table.row_high) |row| {
+                    if (table.rows[row].newest == 0) continue;
+                    const version = S.visibleAt(table, row, snap) orelse continue;
+                    const entry = &table.versions[version];
+                    entry.xmax = tx.ref(slot);
+                    entry.xmax_cid = snap.cid;
+                }
+                tx.push(.{ .kind = .truncate, .table = index, .old = snap.cid }) catch unreachable;
+            }
+        }
+
+        /// ALTER TABLE (copy on write): AccessExclusive on the table, then
+        /// every row slot and version is copied into a free table slot with
+        /// the new definition and the same OID. The catalog swaps the
+        /// relation in this transaction only: other snapshots, including
+        /// detached reads, keep the old slot and definition until commit;
+        /// abort or ROLLBACK TO discards the copy. Added columns take their
+        /// DEFAULT evaluated once (non-volatile only). Existing rows are then
+        /// re-checked for new NOT NULL, CHECK and UNIQUE constraints. Needs a
+        /// free table slot (TableCapacity, 54000) until the old one is
+        /// reclaimed after commit.
+        fn alterTable(self: *Self, slot: u16, alter: *const B.AlterTable, snap: Snapshot) Error!void {
+            try self.lockTable(slot, alter.table, .access_exclusive);
+            const tx = &self.txs[slot];
+            try self.reserveWrites(slot, 3 + 2 * config.columns);
+            var destination: ?usize = null;
+            for (0..2) |attempt| {
+                for (&self.tables, 0..) |*table, index| if (!table.live) {
+                    destination = index;
+                    break;
+                };
+                if (destination != null or attempt == 1) break;
+                self.reclaimTables(self.horizon());
+            }
+            const index = destination orelse return error.TableCapacity;
+            const source = &self.tables[alter.table];
+            // Owned sequences (identity, SERIAL) record their column: it must
+            // keep its position (dropping or shifting it is 0A000).
+            for (&self.seqs) |*seq| {
+                if (!seq.live or seq.owner != source.oid or seq.dead_csn != 0) continue;
+                if (seq.owner_column >= alter.count or alter.sources[seq.owner_column] != seq.owner_column) return error.UnsupportedStatement;
+            }
+            const copy = &self.tables[index];
+            if (copy.rows.len < source.row_high or copy.versions.len < source.version_high) return error.TableCapacity;
+            var fills: [config.columns]Cell = @splat(.null_value);
+            for (alter.columns[0..alter.count], 0..) |*column, position| {
+                if (alter.sources[position] != 0xff or alter.fills[position] == ast.none) continue;
+                var ctx = self.evalContext(column.expression.slice());
+                const value = try E.eval(&ctx, alter.fills[position]);
+                if (value != .null_value) fills[position] = try D.store(column, value, &self.session);
+            }
+            S.reset(copy, source.oid, alter.name, alter.columns[0..alter.count]);
+            copy.namespace = source.namespace;
+            S.setConstraints(copy, alter.constraints[0..alter.constraint_count]);
+            S.copyRelayout(copy, source, alter.sources[0..alter.count], fills[0..alter.count]);
+            copy.live = true;
+            copy.pending_create = true;
+            source.pending_drop = true;
+            self.alters[index] = .{ .sources = alter.sources, .fills = fills };
+            tx.push(.{ .kind = .alter_table, .table = @intCast(index), .old = @intCast(alter.table), .new = snap.cid }) catch unreachable;
+            var changes: [K.max_changes]K.Change = undefined;
+            var count = self.catalog.drop(alter.table, source.column_count, snap, tx.ref(slot), snap.cid, 0, &changes);
+            for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
+            count = try self.catalog.create(index, copy, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
+            for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
+            try self.validateAltered(slot, index, alter, snap);
+        }
+
+        /// Existing rows against the constraints ALTER TABLE added or
+        /// tightened (23502, 23514, 23505), and generation/CHECK texts that
+        /// must still bind over the new definition.
+        fn validateAltered(self: *Self, slot: u16, index: usize, alter: *const B.AlterTable, snap: Snapshot) Error!void {
+            const context = self.bindContext("", .standard, snap);
+            try B.validateGenerated(&context, index);
+            try B.validateConstraints(&context, index);
+            var checks: [config.table_constraints]u16 = @splat(ast.none);
+            try B.bindFlaggedChecks(&context, index, &alter.check_constraint, &checks);
+            const table = &self.tables[index];
+            var ctx = self.evalContext("");
+            for (0..table.row_high) |row| {
+                if (table.rows[row].newest == 0) continue;
+                const version = S.visibleAt(table, row, snap) orelse continue;
+                try self.session.checkpoint();
+                const cells = &table.versions[version].cells;
+                for (0..table.column_count) |column| {
+                    if (alter.check_not_null[column] and cells[column] == .null_value) return error.NotNullViolation;
+                }
+                try D.checkRow(&ctx, table, &checks, cells);
+                for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
+                    if (!alter.check_constraint[position] or !S.scannedUnique(table, constraint)) continue;
+                    switch (S.uniqueCheck(table, constraint, cells, @intCast(row), snap)) {
+                        .free => {},
+                        .taken => return error.PrimaryKeyViolation,
+                        .wait => |owner| {
+                            var waits: L.Set = .{};
+                            waits.add(owner);
+                            return self.park(slot, waits);
+                        },
+                    }
+                }
+            }
+        }
+
         /// Inserts every VALUES row, SELECT row or the DEFAULT VALUES row in
         /// order. A resumed statement continues after the rows it already
         /// handled (Tx.progress); their writes are in its write slice.
@@ -1877,7 +2301,7 @@ pub fn Database(comptime config: Config) type {
             const tx = &self.txs[slot];
             const done = tx.progress;
             var ctx = self.evalContext(source);
-            const derived: D.Derived = .{ .defaults = &insert.defaults, .generated = &insert.generated };
+            const derived: D.Derived = .{ .defaults = &insert.defaults, .generated = &insert.generated, .checks = &insert.checks };
             var position: usize = 0;
             if (insert.plan != ast.none) {
                 const work = &self.workspace.query;
@@ -1961,8 +2385,34 @@ pub fn Database(comptime config: Config) type {
                     return self.park(slot, waits);
                 },
             };
+            if (try self.uniqueTaken(slot, table_index, &cells, 0xffffffff, null, snap)) |_| {
+                if (insert.conflict.action == .nothing and insert.conflict.inferred) return 0;
+                return error.PrimaryKeyViolation;
+            }
             try self.appendRow(slot, table_index, &cells, snap);
             return 1;
+        }
+
+        /// UNIQUE and composite PRIMARY KEY checks after the key index
+        /// (23505 for the caller): the conflicting version, null when free;
+        /// a live writer of the same key parks the statement like a primary
+        /// key does. An UPDATE (`old`) skips constraints whose key it keeps.
+        fn uniqueTaken(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, own_slot: u32, old: ?*const E.Row, snap: Snapshot) Error!?u32 {
+            const table = &self.tables[table_index];
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if (!S.scannedUnique(table, constraint)) continue;
+                if (old) |previous| if (!S.keyChanged(constraint, previous, cells)) continue;
+                switch (S.uniqueCheck(table, constraint, cells, own_slot, snap)) {
+                    .free => {},
+                    .taken => |version| return version,
+                    .wait => |owner| {
+                        var waits: L.Set = .{};
+                        waits.add(owner);
+                        return self.park(slot, waits);
+                    },
+                }
+            }
+            return null;
         }
 
         /// Places a new row version (key already checked). Capacity errors
@@ -2224,7 +2674,7 @@ pub fn Database(comptime config: Config) type {
                 provided[bound.mapping[position]] = if (field) |text| try Io.parse(types.typeOfData(column.data_type), column.typmod, text, &self.session) else .null_value;
             }
             var ctx = self.evalContext(source);
-            out.cells = try D.copiedRow(&ctx, table, &provided, .{ .defaults = &bound.defaults, .generated = &bound.generated });
+            out.cells = try D.copiedRow(&ctx, table, &provided, .{ .defaults = &bound.defaults, .generated = &bound.generated, .checks = &bound.checks });
         }
 
         /// Inserts a built row under the open COPY. A key held by a live
@@ -2249,6 +2699,12 @@ pub fn Database(comptime config: Config) type {
                     return self.park(slot, waits);
                 },
             };
+            if (self.uniqueTaken(slot, table_index, &row.cells, 0xffffffff, null, snap)) |taken| {
+                if (taken != null) return error.PrimaryKeyViolation;
+            } else |err| {
+                if (err == error.WouldBlock) tx.pin = snap;
+                return err;
+            }
             try self.appendRow(slot, table_index, &row.cells, snap);
             tx.copy_rows += 1;
         }
@@ -2275,6 +2731,41 @@ pub fn Database(comptime config: Config) type {
             return self.active(slot) and self.txs[slot].copy_table != null;
         }
 
+        /// AccessShare on every table a statement's plans read (INSERT ...
+        /// SELECT, UPDATE FROM, DELETE USING, subqueries), after the target's
+        /// RowExclusive and before any row is touched (STO-11): concurrent
+        /// TRUNCATE, ALTER and DROP wait for the statement's transaction.
+        fn lockSources(self: *Self, slot: u16) Error!void {
+            const plans = &self.workspace.plans;
+            for (plans.items[0..plans.len]) |*plan| {
+                for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| try self.lockTable(slot, table, .access_share);
+            }
+        }
+
+        /// UPDATE FROM / DELETE USING source rows, materialized once per
+        /// statement execution under the statement snapshot.
+        const Joined = struct { list: X.List, offsets: *const [config.relations]u16 };
+
+        fn joinedRows(self: *Self, source: []const u8, root: u16, offsets: *const [config.relations]u16, snap: Snapshot) Error!?Joined {
+            if (root == ast.none) return null;
+            const list = try X.queryRows(&self.tables, source, &self.workspace.nodes, &self.workspace.plans, root, snap, &self.session, &self.workspace.query);
+            return .{ .list = list, .offsets = offsets };
+        }
+
+        /// WHERE over the target row and, with FROM/USING, the first joined
+        /// source row that satisfies it (PostgreSQL updates or deletes a
+        /// target row once, with one arbitrary matching source row). The
+        /// matching row stays installed in `ctx` for SET.
+        fn keepJoined(self: *Self, ctx: *E.Context, where: u16, joined: ?Joined, cells: *const E.Row) Error!bool {
+            const join = joined orelse return X.keep(ctx, where, cells);
+            for (0..join.list.count) |index| {
+                const row = X.rowAt(&self.workspace.query, join.list, index);
+                for (1..config.relations) |relation| ctx.tuple[relation] = row + join.offsets[relation];
+                if (try X.keep(ctx, where, cells)) return true;
+            }
+            return false;
+        }
+
         /// Rows are visited in rowid order and updated one at a time, as a
         /// PostgreSQL heap scan does: WHERE, SET and key checks interleave.
         /// On resume, rows this statement already handled are skipped by
@@ -2283,18 +2774,19 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[update.table];
             var ctx = self.evalContext(source);
             var affected: usize = 0;
+            const joined = try self.joinedRows(source, update.from, &update.offsets, snap);
             switch (try X.candidates(&ctx, table, update.key, snap)) {
                 .empty => {},
-                .slot => |hit| affected += try self.updateSlot(slot, &ctx, update, hit.row, snap),
+                .slot => |hit| affected += try self.updateSlot(slot, &ctx, update, hit.row, snap, joined),
                 .scan => {
                     const high = table.row_high;
-                    for (0..high) |row| affected += try self.updateSlot(slot, &ctx, update, @intCast(row), snap);
+                    for (0..high) |row| affected += try self.updateSlot(slot, &ctx, update, @intCast(row), snap, joined);
                 },
             }
             return affected;
         }
 
-        fn updateSlot(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, row: u32, snap: Snapshot) Error!usize {
+        fn updateSlot(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, row: u32, snap: Snapshot, joined: ?Joined) Error!usize {
             try self.session.checkpoint();
             const table = &self.tables[update.table];
             if (table.rows[row].newest == 0) return 0;
@@ -2302,13 +2794,13 @@ pub fn Database(comptime config: Config) type {
             var waits: L.Set = .{};
             const plan = self.target(slot, update.table, version, snap, .write, &waits);
             if (plan == .authored) return 1;
-            if (!try X.keep(ctx, update.where, &table.versions[version].cells)) return 0;
+            if (!try self.keepJoined(ctx, update.where, joined, &table.versions[version].cells)) return 0;
             const goal = switch (plan) {
                 .skip, .authored => return 0,
                 .wait => return self.park(slot, waits),
                 .ready => |newest| newest,
             };
-            if (goal != version and !try X.keep(ctx, update.where, &table.versions[goal].cells)) return 0;
+            if (goal != version and !try self.keepJoined(ctx, update.where, joined, &table.versions[goal].cells)) return 0;
             try self.updateOne(slot, ctx, update, row, goal, snap);
             return 1;
         }
@@ -2316,7 +2808,7 @@ pub fn Database(comptime config: Config) type {
         fn updateOne(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, row: u32, old: u32, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const table = &self.tables[update.table];
-            const cells = try D.updatedRow(ctx, table, &update.values, .{ .defaults = &update.defaults, .generated = &update.generated }, &table.versions[old].cells);
+            const cells = try D.updatedRow(ctx, table, &update.values, .{ .defaults = &update.defaults, .generated = &update.generated, .checks = &update.checks }, &table.versions[old].cells);
             if (table.primary_column) |column| {
                 if (update.values[column] != ast.none) switch (D.keyCheck(table, &cells[column], row, snap)) {
                     .free => {},
@@ -2328,6 +2820,7 @@ pub fn Database(comptime config: Config) type {
                     },
                 };
             }
+            if ((try self.uniqueTaken(slot, update.table, &cells, row, &table.versions[old].cells, snap)) != null) return error.PrimaryKeyViolation;
             try self.reserveWrites(slot, 1);
             try S.ensureVersions(table, 1, self.horizon());
             const version = S.allocVersion(table);
@@ -2343,18 +2836,19 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[delete.table];
             var ctx = self.evalContext(source);
             var affected: usize = 0;
+            const joined = try self.joinedRows(source, delete.using, &delete.offsets, snap);
             switch (try X.candidates(&ctx, table, delete.key, snap)) {
                 .empty => {},
-                .slot => |hit| affected += try self.deleteSlot(slot, &ctx, delete, hit.row, snap),
+                .slot => |hit| affected += try self.deleteSlot(slot, &ctx, delete, hit.row, snap, joined),
                 .scan => {
                     const high = table.row_high;
-                    for (0..high) |row| affected += try self.deleteSlot(slot, &ctx, delete, @intCast(row), snap);
+                    for (0..high) |row| affected += try self.deleteSlot(slot, &ctx, delete, @intCast(row), snap, joined);
                 },
             }
             return affected;
         }
 
-        fn deleteSlot(self: *Self, slot: u16, ctx: *E.Context, delete: *const B.Delete, row: u32, snap: Snapshot) Error!usize {
+        fn deleteSlot(self: *Self, slot: u16, ctx: *E.Context, delete: *const B.Delete, row: u32, snap: Snapshot, joined: ?Joined) Error!usize {
             try self.session.checkpoint();
             const tx = &self.txs[slot];
             const table = &self.tables[delete.table];
@@ -2363,13 +2857,13 @@ pub fn Database(comptime config: Config) type {
             var waits: L.Set = .{};
             const plan = self.target(slot, delete.table, version, snap, .write, &waits);
             if (plan == .authored) return 1;
-            if (!try X.keep(ctx, delete.where, &table.versions[version].cells)) return 0;
+            if (!try self.keepJoined(ctx, delete.where, joined, &table.versions[version].cells)) return 0;
             const goal = switch (plan) {
                 .skip, .authored => return 0,
                 .wait => return self.park(slot, waits),
                 .ready => |newest| newest,
             };
-            if (goal != version and !try X.keep(ctx, delete.where, &table.versions[goal].cells)) return 0;
+            if (goal != version and !try self.keepJoined(ctx, delete.where, joined, &table.versions[goal].cells)) return 0;
             try self.reserveWrites(slot, 1);
             table.versions[goal].xmax = tx.ref(slot);
             table.versions[goal].xmax_cid = snap.cid;
@@ -2397,6 +2891,14 @@ pub fn Database(comptime config: Config) type {
                     .drop_table => try C.encodeDrop(writer, self.tables[entry.table].oid),
                     .create_sequence => try C.encodeCreateSequence(writer, &self.seqs[entry.table]),
                     .drop_sequence => try C.encodeDropSequence(writer, self.seqs[entry.table].oid),
+                    .truncate => try C.encodeTruncate(writer, self.tables[entry.table].oid),
+                    .alter_sequence => try C.encodeAlterSequence(writer, &self.seqs[entry.table]),
+                    .create_schema => try C.encodeCreateSchema(writer, self.schemas[entry.table].oid, self.schemas[entry.table].name.slice()),
+                    .drop_schema => try C.encodeDropSchema(writer, self.schemas[entry.table].oid),
+                    .alter_table => {
+                        const table = &self.tables[entry.table];
+                        try C.encodeAlter(writer, table, self.alters[entry.table].sources[0..table.column_count], self.alters[entry.table].fills[0..table.column_count]);
+                    },
                     .catalog_insert, .catalog_delete => {},
                 }
             }
@@ -2604,6 +3106,27 @@ pub fn Database(comptime config: Config) type {
         pub fn replayDropSequence(self: *Self, index: usize, csn: u64) void {
             var changes: [K.max_changes]K.Change = undefined;
             _ = self.catalog.dropSequence(index, storage.committed_view, .{ .epoch = self.epoch }, self.cid, csn, &changes);
+        }
+
+        /// Replay hook: ALTER TABLE redefined a table slot in place; its
+        /// catalog rows are replaced at the record's csn.
+        pub fn replayAlter(self: *Self, index: usize, old_count: usize, csn: u64) Error!void {
+            var changes: [K.max_changes]K.Change = undefined;
+            _ = self.catalog.drop(index, old_count, storage.committed_view, .{ .epoch = self.epoch }, self.cid, csn, &changes);
+            _ = try self.catalog.create(index, &self.tables[index], .{ .epoch = self.epoch }, self.cid, csn, csn, &changes);
+        }
+
+        /// Replay hook: a committed CREATE SCHEMA in schema slot `index`.
+        pub fn replayCreateSchema(self: *Self, index: usize, csn: u64) Error!void {
+            var changes: [K.max_changes]K.Change = undefined;
+            const schema = &self.schemas[index];
+            _ = try self.catalog.createSchema(index, schema.oid, schema.name.slice(), .{ .epoch = self.epoch }, self.cid, csn, csn, &changes);
+        }
+
+        /// Replay hook: a committed DROP SCHEMA.
+        pub fn replayDropSchema(self: *Self, index: usize, csn: u64) void {
+            var changes: [K.max_changes]K.Change = undefined;
+            _ = self.catalog.dropSchema(index, storage.committed_view, .{ .epoch = self.epoch }, self.cid, csn, &changes);
         }
 
         /// Replay hook: a committed DROP TABLE.
