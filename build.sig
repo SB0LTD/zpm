@@ -1093,12 +1093,27 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_nvidia, "test-nvidia-module", "src/nvidia/nvidia.sig", &.{});
     // ── GPU-neutral compute: KIR, devices, the interpreter and EmuDevice
     //    (one module; the backends' files join it) ──
-    _ = try ctx.addModule("gpu", "src/gpu/gpu.sig");
+    const gpu_module = try ctx.addModule("gpu", "src/gpu/gpu.sig");
+    // (the Adreno backend's files, kir_ir3 and adreno_device, use the adreno module)
+    try wire(ctx, gpu_module, "adreno", "src/adreno/adreno.sig");
     const test_gpu = try ctx.addStep("test-gpu", "Execute KIR's verifier, interpreter, exact fdiv/fsqrt expansions and EmuDevice", &noopStep);
     try ctx.addDependency(test_all, test_gpu);
-    _ = try addTest(ctx, test_gpu, "test-gpu-module", "src/gpu/gpu.sig", &.{});
+    _ = try addTest(ctx, test_gpu, "test-gpu-module", "src/gpu/gpu.sig", &.{
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
     _ = try addTest(ctx, test_gpu, "test-gpu-flow", "tests/test_gpu_flow.sig", &.{
         importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    // The Adreno backend: every KIR op through ir3_emu against the
+    // interpreter, and KIR rewrites of lfm3_gpu_kernels' kernels.
+    const test_gpu_ir3 = try ctx.addStep("test-gpu-ir3", "Compile KIR for the Adreno and run it in ir3_emu against kir_interp and the hand-written kernels", &noopStep);
+    try ctx.addDependency(test_all, test_gpu_ir3);
+    _ = try addTest(ctx, test_gpu_ir3, "test-gpu-ir3-kernels", "tests/test_kir_ir3.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig"),
     });
     // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
     _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{

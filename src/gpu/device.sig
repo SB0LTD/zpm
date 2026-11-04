@@ -224,7 +224,7 @@ pub const Work = struct {
 //    (Comments here name files in prose only: Galaxy's module resolver
 //    scans the source text, comments included.) ──
 
-const backend_ir3_a7xx = none; // Q: the import of kir_ir3.sig
+const backend_ir3_a7xx = @import("kir_ir3.sig"); // Q
 
 //
 
