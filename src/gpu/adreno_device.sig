@@ -146,6 +146,10 @@ pub const Over = struct {
         if (bin.target != .ir3_a7xx) return error.BadProgram;
         const cfg = kir_ir3.Config.fromExtra(bin.extra) orelse return error.BadProgram;
         if (cfg.code_bytes == 0 or cfg.code_bytes > bin.code.len) return error.BadProgram;
+        // A group whose waves cannot all be resident with this footprint
+        // does not launch (Mesa's a7xx formula): refused here, not hung.
+        const threads = bin.group[0] * bin.group[1] * bin.group[2];
+        if (!adreno.ir3_emu.groupFits(cfg.gen, cfg.full_regs, cfg.threadsize, threads)) return error.BadProgram;
         // (SP_CS_BASE: 128-byte aligned; the raw devices hand out pages)
         const b = o.raw.vtable.alloc(o.raw.ctx, std.mem.alignForward(usize, bin.code.len, 128)) orelse return error.OutOfMemory;
         if (b.va & 127 != 0) {
@@ -274,6 +278,8 @@ pub const Emu = struct {
     bounds: [64]adreno.ir3_emu.Bound = undefined,
     /// GPU time of the last run, all its dispatches.
     run_ns: u64 = 0,
+    /// The operand rule the last refused program broke (load).
+    illegal: ?raw.Illegal = null,
     fence: Fence = 0,
     failed: ?Fence = null,
 
@@ -284,7 +290,10 @@ pub const Emu = struct {
         var c = x1_45_caps(arena.len);
         c.name = "ir3_emu (Adreno X1-45)";
         c.coherent = gpu_view.len == 0;
+        // (the strict device: each dispatch's code checked, buffers apart)
+        e.gpu.check_operands = true;
         e.adapter = Over.init(e.gpu.device(), c);
+        e.illegal = null;
         e.run_ns = 0;
         e.fence = 0;
         e.failed = null;
@@ -331,8 +340,28 @@ pub const Emu = struct {
     fn fwdFromDevice(ctx: *anyopaque, b: Buffer, off: u64, len: u64) void {
         Over.fromDevice(&of(ctx).adapter, b, off, len);
     }
+    /// Every program's code against ir3's operand rules, its constlen and
+    /// footprint (adreno.device.checkWords) before it is loaded; the strict
+    /// EmuDevice checks each dispatch's code again when it runs.
     fn fwdLoad(ctx: *anyopaque, bin: *const Binary) Error!Program {
-        return Over.load(&of(ctx).adapter, bin);
+        const e = of(ctx);
+        e.illegal = null;
+        if (bin.target == .ir3_a7xx) if (kir_ir3.Config.fromExtra(bin.extra)) |cfg| {
+            if (cfg.code_bytes > bin.code.len or cfg.code_bytes % 8 != 0) return error.BadProgram;
+            const words: []align(1) const u64 = std.mem.bytesAsSlice(u64, bin.code[0..cfg.code_bytes]);
+            var pc: u32 = 0;
+            while (pc < cfg.count) : (pc += 1) {
+                const in = adreno.ir3.decode(cfg.gen, words[pc]) catch {
+                    e.illegal = .{ .pc = pc, .rule = "an instruction word that does not decode" };
+                    return error.BadProgram;
+                };
+                if (raw.checkInstr(cfg.gen, &in, pc, cfg.constlen, cfg.full_regs)) |bad| {
+                    e.illegal = bad;
+                    return error.BadProgram;
+                }
+            }
+        };
+        return Over.load(&e.adapter, bin);
     }
     fn fwdUnload(ctx: *anyopaque, p: *const Program) void {
         Over.unload(&of(ctx).adapter, p);
@@ -467,4 +496,60 @@ test "the emulated Adreno faults on a read past its binding, into the next buffe
     const f = try d.run(&.{.{ .prog = &p, .groups = .{ 1, 1, 1 }, .buffers = &.{ a, b }, .params = &.{} }});
     try std.testing.expectError(error.DeviceLost, d.wait(f, 1000));
     try std.testing.expectEqual(a.gpu + 256, Rig.emu.fault().va);
+}
+
+test "the emulated Adreno refuses code that breaks ir3's operand rules, at load" {
+    Rig.emu.init(&Rig.arena, &Rig.view);
+    const d = Rig.emu.device();
+    var k = newKernel("legal", .{ 64, 1, 1 });
+    const out = k.binding();
+    const v = k.op2(.imul, .u32, kir.r(k.gid(1)), kir.r(k.param(.u32, 0)));
+    k.store(.u32, kir.global(out, 32), kir.r(k.op2(.shl, .u32, kir.r(k.tid(0)), kir.u(2))), kir.r(v));
+    try k.finish();
+    var bin = try kir_ir3.compileWith(&k, d.caps, &Rig.work, &Rig.out);
+    _ = try d.load(&bin);
+    // the shape of the Surface's fault, written over the first instruction
+    const bad = try adreno.ir3.assembleLine(adreno.ir3.A7XX, "mul.u24 r1.w, r48.y, c0.x");
+    const code = Rig.out[0..bin.code.len];
+    std.mem.writeInt(u64, code[0..8], bad, .little);
+    bin.code = code;
+    try std.testing.expectError(error.BadProgram, d.load(&bin));
+    try std.testing.expect(Rig.emu.illegal != null);
+    try std.testing.expectEqual(@as(u32, 0), Rig.emu.illegal.?.pc);
+}
+
+test "a group whose waves its registers cannot keep resident: kir_ir3 refuses it, the adapter too" {
+    Rig.emu.init(&Rig.arena, &Rig.view);
+    const d = Rig.emu.device();
+    // 96 values live at once: more than a 1024-thread group's 12 vec4
+    const build = struct {
+        fn f(k: *kir.Kernel) !void {
+            const src = k.binding();
+            const out = k.binding();
+            const t = k.op2(.shl, .u32, kir.r(k.tid(0)), kir.u(2));
+            var vals: [96]kir.V = undefined;
+            for (&vals, 0..) |*x, i| {
+                var m = kir.global(src, 32);
+                m.imm = @intCast(4 * i);
+                x.* = k.load(.u32, m, kir.r(t));
+            }
+            // every value used twice, the passes apart: all live at once
+            var acc = k.op2(.xor, .u32, kir.r(vals[0]), kir.r(vals[1]));
+            for (2..96) |i| acc = k.op2(.iadd, .u32, kir.r(acc), kir.r(vals[i]));
+            for (0..96) |i| acc = k.op2(.xor, .u32, kir.r(k.op2(.shl, .u32, kir.r(acc), kir.u(1))), kir.r(vals[i]));
+            k.store(.u32, kir.global(out, 32), kir.r(t), kir.r(acc));
+            try k.finish();
+        }
+    }.f;
+    var big = newKernel("1024 threads", .{ 1024, 1, 1 });
+    try build(&big);
+    try std.testing.expectError(error.TooManyRegs, kir_ir3.compileWith(&big, d.caps, &Rig.work, &Rig.out));
+    try std.testing.expect(std.mem.indexOf(u8, kir_ir3.diagnostic(&Rig.work), "waves") != null);
+    var small = newKernel("64 threads", .{ 64, 1, 1 });
+    try build(&small);
+    var bin = try kir_ir3.compileWith(&small, d.caps, &Rig.work, &Rig.out);
+    _ = try d.load(&bin);
+    // the same code claimed for 1024 threads: the adapter refuses it
+    bin.group = .{ 1024, 1, 1 };
+    try std.testing.expectError(error.BadProgram, d.load(&bin));
 }
