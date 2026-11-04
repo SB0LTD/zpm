@@ -781,13 +781,13 @@ pub fn Parser(comptime config: types.Config) type {
         fn spanTo(self: *const Self, start: usize) ast.Span {
             var end = self.current.start;
             if (self.current.kind == .end) end = self.source.len;
-            if (self.current.kind == .string or self.current.kind == .quoted_word) end -= 1;
+            if (self.current.kind == .string or self.current.kind == .quoted_word) end -= self.current.prefix;
             while (end > start and (self.source[end - 1] == ' ' or self.source[end - 1] == '\t' or self.source[end - 1] == '\r' or self.source[end - 1] == '\n')) end -= 1;
             return .{ .start = start, .len = end - start };
         }
 
         fn tokenStart(self: *const Self) usize {
-            return if (self.current.kind == .string or self.current.kind == .quoted_word) self.current.start - 1 else self.current.start;
+            return if (self.current.kind == .string or self.current.kind == .quoted_word) self.current.start - self.current.prefix else self.current.start;
         }
 
         fn create(self: *Self) Error!Ast.CreateTable {
@@ -1403,6 +1403,10 @@ pub fn Parser(comptime config: types.Config) type {
                     left = try self.pool.add(.{ .kind = .binary, .op = if (negated) .is_not_distinct else .is_distinct, .a = left, .b = right });
                     continue;
                 }
+                if (self.mode == .standard and (self.rawWord("normalized") or self.rawWord("nfc") or self.rawWord("nfd") or self.rawWord("nfkc") or self.rawWord("nfkd"))) {
+                    left = try self.normalizedTail(left, negated);
+                    continue;
+                }
                 const kind: ast.Test = if (try self.takeWord("NULL"))
                     (if (negated) .is_not_null else .is_null)
                 else if (try self.takeWord("TRUE"))
@@ -1546,6 +1550,11 @@ pub fn Parser(comptime config: types.Config) type {
                     .contains => .contains,
                     .contained => .contained,
                     .question => .exists,
+                    .ampersand => .bit_and,
+                    .pipe => .bit_or,
+                    .hash => .bit_xor,
+                    .shift_left => .shift_left,
+                    .shift_right => .shift_right,
                     else => break,
                 };
                 try self.advance();
@@ -1605,6 +1614,15 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn unary(self: *Self) Error!u16 {
+            if (self.mode == .standard and self.isSymbol(.tilde)) {
+                // Prefix operators bind like PostgreSQL's generic Op: `~1+2`
+                // is ~(1+2), while `~1||x` applies ~ first.
+                try self.enter();
+                defer self.leave();
+                try self.advance();
+                const operand = try self.additive();
+                return self.pool.add(.{ .kind = .unary, .op = .bit_not, .a = operand });
+            }
             if (!self.isSymbol(.minus) and !self.isSymbol(.plus)) return self.castExpr();
             const negative = self.isSymbol(.minus);
             try self.enter();
@@ -1661,7 +1679,10 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn aggregateName(self: *const Self, name: ast.Ident) bool {
             const raw = name.span.slice(self.source);
-            for ([_][]const u8{ "count", "sum", "avg", "min", "max", "bool_and", "bool_or", "every" }) |word| {
+            for ([_][]const u8{ "count", "sum", "avg", "min", "max", "bool_and", "bool_or", "every",
+                "stddev", "stddev_pop", "stddev_samp", "variance", "var_pop", "var_samp", "corr", "covar_pop", "covar_samp",
+                "regr_count", "regr_sxx", "regr_syy", "regr_sxy", "regr_avgx", "regr_avgy", "regr_slope", "regr_intercept",
+                "regr_r2", "bit_and", "bit_or", "bit_xor" }) |word| {
                 if (types.keyword(raw, word)) return true;
             }
             return false;
@@ -1774,6 +1795,193 @@ pub fn Parser(comptime config: types.Config) type {
             try self.expectWord("FOLLOWING");return .{.kind=.following,.offset=offset};
         }
 
+        /// unicode_normal_form: NFC, NFD, NFKC or NFKD as a text literal.
+        fn normalForm(self: *Self) Error!u16 {
+            const token = self.current;
+            if (!(self.rawWord("nfc") or self.rawWord("nfd") or self.rawWord("nfkc") or self.rawWord("nfkd"))) return error.Syntax;
+            try self.advance();
+            return self.pool.add(.{ .kind = .text_literal, .text = .{ .start = token.start, .end = token.end, .len = token.len } });
+        }
+
+        /// `x IS [NOT] [form] NORMALIZED` (is_normalized), after IS [NOT].
+        fn normalizedTail(self: *Self, left: u16, negated: bool) Error!u16 {
+            var list: ArgList = .{};
+            list.push(self.pool, left);
+            if (!self.rawWord("normalized")) list.push(self.pool, try self.normalForm());
+            const token = self.current;
+            if (!self.rawWord("normalized")) return error.Syntax;
+            try self.advance();
+            const name: ast.Ident = .{ .span = .{ .start = token.start, .len = token.len }, .len = token.len };
+            const call = try self.callNode(name, .is_normalized, list);
+            return if (negated) try self.pool.add(.{ .kind = .not_op, .a = call }) else call;
+        }
+
+        /// `row OVERLAPS row` (gram.y): both rows need exactly two members
+        /// (42601); the call is overlaps(a, b, c, d).
+        fn overlapsTail(self: *Self, left: u16) Error!u16 {
+            if (self.mode != .standard or !self.rawWord("overlaps")) return left;
+            const token = self.current;
+            try self.advance();
+            var right: u16 = none;
+            if (self.isWord("ROW") and lparenNext(try self.peek())) {
+                try self.advance();
+                if ((try self.peek()).kind == .symbol and (try self.peek()).symbol == .rparen) return error.Syntax;
+                right = try self.arguments(.row_constructor, false);
+            } else {
+                try self.expectSymbol(.lparen);
+                const first = try self.expression();
+                if (!self.isSymbol(.comma)) return error.Syntax;
+                right = try self.pool.add(.{ .kind = .row_constructor, .b = first });
+                var last = first;
+                while (try self.takeSymbol(.comma)) {
+                    const item = try self.expression();
+                    self.pool.nodes[last].next = item;
+                    try self.pool.raise(right, item);
+                    last = item;
+                }
+                try self.expectSymbol(.rparen);
+            }
+            var list: ArgList = .{};
+            var count: usize = 0;
+            for ([_]u16{ left, right }) |row| {
+                var members: usize = 0;
+                var item = self.pool.nodes[row].b;
+                while (item != none) {
+                    const next = self.pool.nodes[item].next;
+                    self.pool.nodes[item].next = none;
+                    list.push(self.pool, item);
+                    members += 1;
+                    item = next;
+                }
+                if (members != 2) return error.Syntax;
+                count += members;
+            }
+            const name: ast.Ident = .{ .span = .{ .start = token.start, .len = token.len }, .len = token.len };
+            return try self.callNode(name, .overlaps, list);
+        }
+
+        /// A function argument list under construction (`next`-linked).
+        const ArgList = struct {
+            head: u16 = none,
+            tail: u16 = none,
+
+            fn push(list: *ArgList, pool: *Ast.Pool, item: u16) void {
+                if (list.head == none) list.head = item else pool.nodes[list.tail].next = item;
+                list.tail = item;
+            }
+        };
+
+        fn callNode(self: *Self, name: ast.Ident, func: ast.Func, list: ArgList) Error!u16 {
+            const node = try self.pool.add(.{ .kind = .function, .name = name, .func = func, .b = list.head });
+            var item = list.head;
+            while (item != none) : (item = self.pool.nodes[item].next) try self.pool.raise(node, item);
+            return node;
+        }
+
+        fn expressionList(self: *Self, list: *ArgList) Error!void {
+            list.push(self.pool, try self.expression());
+            while (try self.takeSymbol(.comma)) list.push(self.pool, try self.expression());
+        }
+
+        /// SQL-syntax functions of gram.y func_expr_common_subexpr: TRIM,
+        /// SUBSTRING, POSITION and OVERLAY, plus LEFT/RIGHT (reserved join
+        /// words that also name functions). The current word precedes `(`.
+        fn specialFunction(self: *Self) Error!?u16 {
+            const token = self.current;
+            const name: ast.Ident = .{ .span = .{ .start = token.start, .len = token.len }, .len = token.len };
+            if (token.isWord("LEFT") or token.isWord("RIGHT")) {
+                try self.advance();
+                return try self.functionCall(name);
+            }
+            const Form = enum { trim, substring, position, overlay, extract, normalize };
+            const form: Form = if (wordIs(self.source, token, "trim")) .trim else if (wordIs(self.source, token, "substring")) .substring else if (wordIs(self.source, token, "position")) .position else if (wordIs(self.source, token, "overlay")) .overlay else if (wordIs(self.source, token, "extract")) .extract else if (wordIs(self.source, token, "normalize")) .normalize else return null;
+            try self.advance();
+            try self.advance();
+            try self.enter();
+            defer self.leave();
+            var list: ArgList = .{};
+            var func: ast.Func = .none;
+            switch (form) {
+                .trim => {
+                    func = .btrim;
+                    if (try self.takeRaw("both")) {} else if (try self.takeRaw("leading")) {
+                        func = .ltrim;
+                    } else if (try self.takeRaw("trailing")) func = .rtrim;
+                    // trim_list: a_expr FROM expr_list | FROM expr_list | expr_list.
+                    if (try self.takeWord("FROM")) {
+                        try self.expressionList(&list);
+                    } else {
+                        const first = try self.expression();
+                        if (try self.takeWord("FROM")) {
+                            try self.expressionList(&list);
+                            list.push(self.pool, first);
+                        } else {
+                            list.push(self.pool, first);
+                            while (try self.takeSymbol(.comma)) list.push(self.pool, try self.expression());
+                        }
+                    }
+                },
+                .substring => if (!self.isSymbol(.rparen)) {
+                    list.push(self.pool, try self.expression());
+                    if (try self.takeWord("FROM")) {
+                        const start = try self.expression();
+                        list.push(self.pool, start);
+                        if (try self.takeWord("FOR")) list.push(self.pool, try self.expression());
+                    } else if (try self.takeWord("FOR")) {
+                        // substring(x FOR n) is substring(x, 1, n::int4); FROM may follow.
+                        const count = try self.expression();
+                        if (try self.takeWord("FROM")) {
+                            list.push(self.pool, try self.expression());
+                            list.push(self.pool, count);
+                        } else {
+                            list.push(self.pool, try self.pool.add(.{ .kind = .int_literal, .integer = 1 }));
+                            list.push(self.pool, try self.pool.add(.{ .kind = .cast, .cast_type = .int4, .a = count }));
+                        }
+                    } else while (try self.takeSymbol(.comma)) list.push(self.pool, try self.expression());
+                },
+                .position => if (!self.isSymbol(.rparen)) {
+                    func = .strpos;
+                    const needle = try self.other();
+                    try self.expectWord("IN");
+                    list.push(self.pool, try self.other());
+                    list.push(self.pool, needle);
+                },
+                .extract => if (!self.isSymbol(.rparen)) {
+                    // extract_arg: an identifier, keyword or string constant,
+                    // passed to extract(text, source) as a text literal.
+                    const field = self.current;
+                    const literal: lexer.Quoted = switch (field.kind) {
+                        .string => field.quoted(),
+                        .word, .quoted_word => blk: {
+                            if (field.kind == .word and lexer.reserved(field.keyword)) return error.Syntax;
+                            break :blk .{ .start = field.start, .end = field.end, .len = field.end - field.start };
+                        },
+                        else => return error.Syntax,
+                    };
+                    try self.advance();
+                    list.push(self.pool, try self.pool.add(.{ .kind = .text_literal, .text = literal }));
+                    try self.expectWord("FROM");
+                    list.push(self.pool, try self.expression());
+                },
+                .normalize => if (!self.isSymbol(.rparen)) {
+                    // NORMALIZE(a [, NFC|NFD|NFKC|NFKD]): the form is a keyword.
+                    list.push(self.pool, try self.expression());
+                    if (try self.takeSymbol(.comma)) list.push(self.pool, try self.normalForm());
+                },
+                .overlay => if (!self.isSymbol(.rparen)) {
+                    list.push(self.pool, try self.expression());
+                    if (try self.takeRaw("placing")) {
+                        list.push(self.pool, try self.expression());
+                        try self.expectWord("FROM");
+                        list.push(self.pool, try self.expression());
+                        if (try self.takeWord("FOR")) list.push(self.pool, try self.expression());
+                    } else while (try self.takeSymbol(.comma)) list.push(self.pool, try self.expression());
+                },
+            }
+            try self.expectSymbol(.rparen);
+            return try self.callNode(name, func, list);
+        }
+
         fn caseExpr(self: *Self) Error!u16 {
             const operand = if (self.isWord("WHEN")) none else try self.expression();
             var first: u16 = none;
@@ -1841,7 +2049,7 @@ pub fn Parser(comptime config: types.Config) type {
                             if (!try self.takeSymbol(.comma)) break;
                         }
                         try self.expectSymbol(.rparen);
-                        return row;
+                        return self.overlapsTail(row);
                     }
                     try self.expectSymbol(.rparen);
                     return inner;
@@ -1860,9 +2068,9 @@ pub fn Parser(comptime config: types.Config) type {
                     if (after.kind == .symbol and after.symbol == .rparen) {
                         try self.advance();
                         try self.advance();
-                        return self.pool.add(.{ .kind = .row_constructor });
+                        return self.overlapsTail(try self.pool.add(.{ .kind = .row_constructor }));
                     }
-                    return self.arguments(.row_constructor, false);
+                    return self.overlapsTail(try self.arguments(.row_constructor, false));
                 }
                 if (try self.takeWord("CAST")) {
                     try self.expectSymbol(.lparen);
@@ -1900,6 +2108,9 @@ pub fn Parser(comptime config: types.Config) type {
                 if (wordIs(self.source, token, "current_timestamp") or wordIs(self.source, token, "current_date")) {
                     const name = try self.identifier();
                     return self.pool.add(.{ .kind = .function, .name = name });
+                }
+                if (self.mode == .standard and lparenNext(try self.peek())) {
+                    if (try self.specialFunction()) |id| return id;
                 }
                 if ((self.isWord("GREATEST") or self.isWord("LEAST")) and lparenNext(try self.peek())) {
                     const func: ast.Func = if (self.isWord("GREATEST")) .greatest else .least;

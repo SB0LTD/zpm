@@ -584,7 +584,16 @@ pub fn Binder(comptime config: types.Config) type {
             var left = context.node(n.a).ty;
             var right = context.node(n.b).ty;
             // An untyped literal takes the other operand's type, except
-            // that datetime arithmetic takes an interval.
+            // that datetime arithmetic takes an interval, and an interval
+            // is scaled by double precision.
+            if ((n.op == .mul or n.op == .div) and left == .interval and right == .unknown) {
+                try coerce(context, n.b, .float8);
+                right = .float8;
+            }
+            if (n.op == .mul and right == .interval and left == .unknown) {
+                try coerce(context, n.a, .float8);
+                left = .float8;
+            }
             if (left == .unknown) {
                 try coerce(context, n.a, if (value.datetime(right) and right != .date) .interval else right);
                 left = context.node(n.a).ty;
@@ -602,6 +611,16 @@ pub fn Binder(comptime config: types.Config) type {
                     n.b = try convert(context, n.b, result, -1, .implicit);
                 }
                 n.ty = result;
+                return;
+            }
+            // interval * double precision, double precision * interval and
+            // interval / double precision (interval_mul / interval_div).
+            if ((n.op == .mul and (left == .interval) != (right == .interval)) or (n.op == .div and left == .interval)) {
+                const factor_left = n.op == .mul and right == .interval;
+                const factor_ty = if (factor_left) left else right;
+                if (!value.numericCategory(factor_ty)) return error.UndefinedFunction;
+                if (factor_left) n.a = try convert(context, n.a, .float8, -1, .implicit) else n.b = try convert(context, n.b, .float8, -1, .implicit);
+                n.ty = .interval;
                 return;
             }
             const add = n.op == .add;
@@ -644,6 +663,27 @@ pub fn Binder(comptime config: types.Config) type {
                 return;
             }
             return error.UndefinedFunction;
+        }
+
+        /// int2/int4/int8 & | # (common integer type) and << >> (int4 count).
+        fn bitwiseType(context: *const Context, n: *ast.Node) Error!void {
+            const left = context.node(n.a).ty;
+            const right = context.node(n.b).ty;
+            if (n.op == .shift_left or n.op == .shift_right) {
+                // An unknown left operand also matches bit and inet shifts.
+                if (left == .unknown) return error.AmbiguousFunction;
+                if (!value.integral(left)) return error.UndefinedFunction;
+                if (right != .unknown and right != .int2 and right != .int4) return error.UndefinedFunction;
+                n.b = try convert(context, n.b, .int4, -1, .implicit);
+                n.ty = left;
+                return;
+            }
+            if (left == .unknown and right == .unknown) return error.AmbiguousFunction;
+            const target: ast.Type = if (left == .unknown) right else if (right == .unknown) left else if (value.integral(left) and value.integral(right)) value.arithmeticType(left, right) else return error.UndefinedFunction;
+            if (!value.integral(target)) return error.UndefinedFunction;
+            try coerce(context, n.a, target);
+            try coerce(context, n.b, target);
+            n.ty = target;
         }
 
         fn jsonOperator(context: *const Context, n: *ast.Node) Error!void {
@@ -714,6 +754,48 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "to_regclass", .func = .to_regclass },
                 .{ .name = "format_type", .func = .format_type },
                 .{ .name = "pg_get_expr", .func = .pg_get_expr },
+                // String functions (B11).
+                .{ .name = "lower", .func = .lower },               .{ .name = "upper", .func = .upper },
+                .{ .name = "initcap", .func = .initcap },           .{ .name = "length", .func = .char_length },
+                .{ .name = "char_length", .func = .char_length },   .{ .name = "character_length", .func = .char_length },
+                .{ .name = "octet_length", .func = .octet_length }, .{ .name = "bit_length", .func = .bit_length },
+                .{ .name = "substring", .func = .substring },       .{ .name = "substr", .func = .substring },
+                .{ .name = "btrim", .func = .btrim },               .{ .name = "ltrim", .func = .ltrim },
+                .{ .name = "rtrim", .func = .rtrim },               .{ .name = "strpos", .func = .strpos },
+                .{ .name = "position", .func = .strpos },           .{ .name = "replace", .func = .replace },
+                .{ .name = "left", .func = .left },                 .{ .name = "right", .func = .right },
+                .{ .name = "repeat", .func = .repeat },             .{ .name = "reverse", .func = .reverse },
+                .{ .name = "lpad", .func = .lpad },                 .{ .name = "rpad", .func = .rpad },
+                .{ .name = "split_part", .func = .split_part },     .{ .name = "starts_with", .func = .starts_with },
+                .{ .name = "ascii", .func = .ascii },               .{ .name = "chr", .func = .chr },
+                .{ .name = "translate", .func = .translate },       .{ .name = "concat", .func = .concat },
+                .{ .name = "concat_ws", .func = .concat_ws },       .{ .name = "overlay", .func = .overlay },
+                .{ .name = "to_hex", .func = .to_hex },
+                // Mathematical functions (B11).
+                .{ .name = "power", .func = .power },               .{ .name = "pow", .func = .power },
+                .{ .name = "ln", .func = .ln },                     .{ .name = "log", .func = .log },
+                .{ .name = "log10", .func = .log10 },               .{ .name = "exp", .func = .exp },
+                .{ .name = "mod", .func = .mod },                   .{ .name = "div", .func = .div },
+                .{ .name = "pi", .func = .pi },                     .{ .name = "degrees", .func = .degrees },
+                .{ .name = "radians", .func = .radians },           .{ .name = "cbrt", .func = .cbrt },
+                .{ .name = "sin", .func = .sin },                   .{ .name = "cos", .func = .cos },
+                .{ .name = "tan", .func = .tan },                   .{ .name = "cot", .func = .cot },
+                .{ .name = "asin", .func = .asin },                 .{ .name = "acos", .func = .acos },
+                .{ .name = "atan", .func = .atan },                 .{ .name = "atan2", .func = .atan2 },
+                .{ .name = "gcd", .func = .gcd },                   .{ .name = "lcm", .func = .lcm },
+                .{ .name = "scale", .func = .scale },               .{ .name = "min_scale", .func = .min_scale },
+                .{ .name = "trim_scale", .func = .trim_scale },
+                // Date/time functions (B11).
+                .{ .name = "extract", .func = .extract },           .{ .name = "date_part", .func = .date_part },
+                .{ .name = "date_trunc", .func = .date_trunc },     .{ .name = "age", .func = .age },
+                .{ .name = "justify_days", .func = .justify_days }, .{ .name = "justify_hours", .func = .justify_hours },
+                .{ .name = "justify_interval", .func = .justify_interval }, .{ .name = "make_date", .func = .make_date },
+                .{ .name = "make_timestamp", .func = .make_timestamp }, .{ .name = "isfinite", .func = .isfinite },
+                // Formatting input functions (B11).
+                .{ .name = "to_date", .func = .to_date },           .{ .name = "to_number", .func = .to_number },
+                .{ .name = "to_timestamp", .func = .to_timestamp },
+                // Unicode normalization (B11); NORMALIZE(...) is also SQL syntax.
+                .{ .name = "normalize", .func = .normalize },       .{ .name = "is_normalized", .func = .is_normalized },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -730,6 +812,18 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "bool_and", .agg = .bool_and },
                 .{ .name = "every", .agg = .bool_and },
                 .{ .name = "bool_or", .agg = .bool_or },
+                // B11 statistical and bitwise aggregates.
+                .{ .name = "stddev", .agg = .stddev_samp },        .{ .name = "stddev_samp", .agg = .stddev_samp },
+                .{ .name = "stddev_pop", .agg = .stddev_pop },      .{ .name = "variance", .agg = .var_samp },
+                .{ .name = "var_samp", .agg = .var_samp },          .{ .name = "var_pop", .agg = .var_pop },
+                .{ .name = "corr", .agg = .corr },                  .{ .name = "covar_pop", .agg = .covar_pop },
+                .{ .name = "covar_samp", .agg = .covar_samp },      .{ .name = "regr_count", .agg = .regr_count },
+                .{ .name = "regr_sxx", .agg = .regr_sxx },          .{ .name = "regr_syy", .agg = .regr_syy },
+                .{ .name = "regr_sxy", .agg = .regr_sxy },          .{ .name = "regr_avgx", .agg = .regr_avgx },
+                .{ .name = "regr_avgy", .agg = .regr_avgy },        .{ .name = "regr_slope", .agg = .regr_slope },
+                .{ .name = "regr_intercept", .agg = .regr_intercept }, .{ .name = "regr_r2", .agg = .regr_r2 },
+                .{ .name = "bit_and", .agg = .bit_and },            .{ .name = "bit_or", .agg = .bit_or },
+                .{ .name = "bit_xor", .agg = .bit_xor },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.agg;
             return .none;
@@ -749,6 +843,8 @@ pub fn Binder(comptime config: types.Config) type {
             if (n.star) {
                 if (kind != .count or n.distinct) return error.Syntax;
                 kind = .count_star;
+            } else if (ast.pairAggregate(kind)) {
+                try typePairAggregate(context, &inner, n);
             } else if (n.b == none or context.node(n.b).next != none) return error.UndefinedFunction;
             const arg = n.b;
             var arg_ty: ast.Type = .unknown;
@@ -758,6 +854,8 @@ pub fn Binder(comptime config: types.Config) type {
                 if (arg_ty == .unknown) switch (kind) {
                     .count, .min, .max => try coerce(context, arg, .text),
                     .bool_and, .bool_or => try coerce(context, arg, .boolean),
+                    // Every overload is numeric: float8 is preferred.
+                    .stddev_pop, .stddev_samp, .var_pop, .var_samp => try coerce(context, arg, .float8),
                     else => return error.AmbiguousFunction,
                 };
                 arg_ty = context.node(arg).ty;
@@ -778,6 +876,28 @@ pub fn Binder(comptime config: types.Config) type {
             if (scope.saw_aggregate) |flag| flag.* = true;
         }
 
+        /// corr/covar/regr_*(Y, X): both float8 (implicit numeric casts),
+        /// wrapped in one aggregate_pair input; DISTINCT pairs are not provided.
+        fn typePairAggregate(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            const y = n.b;
+            if (y == none) return error.UndefinedFunction;
+            const x = context.node(y).next;
+            if (x == none or context.node(x).next != none) return error.UndefinedFunction;
+            if (n.distinct) return error.UnsupportedStatement;
+            context.node(y).next = none;
+            var operands = [2]u16{ y, x };
+            for (&operands) |*operand| {
+                try typeExpr(context, scope, operand.*);
+                const ty = context.node(operand.*).ty;
+                if (ty != .unknown and !value.numericCategory(ty)) return error.UndefinedFunction;
+                operand.* = try convert(context, operand.*, .float8, -1, .implicit);
+            }
+            context.node(operands[0]).next = operands[1];
+            context.node(operands[1]).next = none;
+            n.b = try context.pool.add(.{ .kind = .function, .func = .aggregate_pair, .b = operands[0], .ty = .text, .name = n.name });
+            try context.pool.raise(n.b, operands[1]);
+        }
+
         fn aggregateType(context:*const Context,n:*ast.Node,kind:ast.Agg,arg:u16,arg_ty:ast.Type) Error!ast.Type {
             return switch (kind) {
                 .count, .count_star => .int8,
@@ -790,6 +910,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .avg => switch (arg_ty) {
                     .int2, .int4, .int8, .numeric => .numeric,
                     .float4, .float8 => .float8,
+                    // interval_avg (PostgreSQL 18).
+                    .interval => .interval,
                     // AVG(interval) is not provided (no interval / number).
                     else => return error.UndefinedFunction,
                 },
@@ -802,6 +924,14 @@ pub fn Binder(comptime config: types.Config) type {
                     else => return error.UndefinedFunction,
                 },
                 .bool_and, .bool_or => if (arg_ty == .boolean) .boolean else return error.UndefinedFunction,
+                .stddev_pop, .stddev_samp, .var_pop, .var_samp => switch (arg_ty) {
+                    .int2, .int4, .int8, .numeric => .numeric,
+                    .float4, .float8 => .float8,
+                    else => return error.UndefinedFunction,
+                },
+                .regr_count => .int8,
+                .corr, .covar_pop, .covar_samp, .regr_sxx, .regr_syy, .regr_sxy, .regr_avgx, .regr_avgy, .regr_slope, .regr_intercept, .regr_r2 => .float8,
+                .bit_and, .bit_or, .bit_xor => if (value.integral(arg_ty)) arg_ty else return error.UndefinedFunction,
                 .none => unreachable,
             };
         }
@@ -1062,13 +1192,16 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = false;
                     return;
                 },
+                // Built by typePairAggregate with typed arguments.
+                .aggregate_pair => return,
                 else => {},
             }
             const agg = aggregateKind(context, n);
             if (agg != .none) return typeAggregate(context, scope, n, agg);
             if (n.distinct or n.c != none or n.star) return error.UndefinedFunction;
             // GREATEST/LEAST are grammar forms, not ordinary named functions.
-            if (n.func != .greatest and n.func != .least) n.func = functionName(context, n);
+            // GREATEST/LEAST and SQL-syntax calls (TRIM, POSITION) arrive bound.
+            if (n.func == .none) n.func = functionName(context, n);
             var count: usize = 0;
             var item = n.b;
             while (item != none) : (item = context.node(item).next) {
@@ -1215,6 +1348,296 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = false;
                 },
                 .identity_next, .regclass_in, .regtype_in, .regclass_out, .regtype_out => unreachable,
+                .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
+                .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
+                .overlay, .to_hex => try typeStringFunction(context, n, count),
+                .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
+                .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
+                .overlaps, .overlaps_tz => try typeOverlaps(context, n, count),
+                .aggregate_pair => unreachable,
+                .normalize, .is_normalized => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.text} else &[_]ast.Type{ .text, .text }, if (n.func == .normalize) .text else .boolean, true),
+                .to_date => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .date, true),
+                .to_number => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .numeric, true),
+                // to_timestamp(text, text) or to_timestamp(double precision).
+                .to_timestamp => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.float8} else &[_]ast.Type{ .text, .text }, .timestamptz, true),
+            }
+        }
+
+        /// overlaps(start, end|interval, start, end|interval): timestamp
+        /// when no argument is timestamptz and one is timestamp, else
+        /// timestamptz (dates prefer it). Not strict: overlaps_timestamp
+        /// has its own NULL rules. The interval forms of timestamptz are
+        /// STABLE (zone-dependent addition).
+        fn typeOverlaps(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            if (count != 4) return error.UndefinedFunction;
+            var zoned = false;
+            var plain = false;
+            var interval = false;
+            var item = n.b;
+            var index: usize = 0;
+            while (item != none) : ({
+                item = context.node(item).next;
+                index += 1;
+            }) switch (context.node(item).ty) {
+                .timestamptz => zoned = true,
+                .timestamp => plain = true,
+                .date => {},
+                .interval => if (index % 2 == 1) {
+                    interval = true;
+                } else return error.UndefinedFunction,
+                // An unknown end could be a datetime or an interval.
+                .unknown => if (index % 2 == 1 and !knownNull(context, item)) return error.AmbiguousFunction,
+                else => return error.UndefinedFunction,
+            };
+            const start: ast.Type = if (zoned or !plain) .timestamptz else .timestamp;
+            var params: [4]ast.Type = .{ start, start, start, start };
+            item = n.b;
+            index = 0;
+            while (item != none) : ({
+                item = context.node(item).next;
+                index += 1;
+            }) if (context.node(item).ty == .interval) {
+                params[index] = .interval;
+            };
+            try bindSignature(context, n, &params, .boolean, false);
+            n.func = if (start == .timestamptz and interval) .overlaps_tz else .overlaps;
+        }
+
+        /// Date/time functions; timestamptz overloads (date arguments prefer
+        /// timestamptz, the datetime category's preferred type) are STABLE.
+        fn typeTemporalFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            switch (n.func) {
+                .extract, .extract_tz, .date_part, .date_part_tz => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const source = argumentType(context, n, 1);
+                    const extract = n.func == .extract or n.func == .extract_tz;
+                    const ty: T = switch (source) {
+                        .unknown => return error.AmbiguousFunction,
+                        .date => if (extract) .date else .timestamp,
+                        .timestamp, .timestamptz, .interval => source,
+                        else => return error.UndefinedFunction,
+                    };
+                    try bindSignature(context, n, &[_]T{ .text, ty }, if (extract) .numeric else .float8, true);
+                    n.func = if (ty == .timestamptz) (if (extract) .extract_tz else .date_part_tz) else (if (extract) .extract else .date_part);
+                },
+                .date_trunc, .date_trunc_tz => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const source = argumentType(context, n, 1);
+                    const ty: T = switch (source) {
+                        .unknown => return error.AmbiguousFunction,
+                        .date, .timestamptz => .timestamptz,
+                        .timestamp, .interval => source,
+                        else => return error.UndefinedFunction,
+                    };
+                    try bindSignature(context, n, &[_]T{ .text, ty }, ty, true);
+                    n.func = if (ty == .timestamptz) .date_trunc_tz else .date_trunc;
+                },
+                .age, .age_tz => {
+                    if (count != 1 and count != 2) return error.UndefinedFunction;
+                    var zoned = false;
+                    var plain = false;
+                    var item = n.b;
+                    while (item != none) : (item = context.node(item).next) switch (context.node(item).ty) {
+                        .timestamptz => zoned = true,
+                        .timestamp => plain = true,
+                        .date, .unknown => {},
+                        else => return error.UndefinedFunction,
+                    };
+                    const ty: T = if (zoned or !plain) .timestamptz else .timestamp;
+                    try bindSignature(context, n, if (count == 1) &[_]T{ty} else &[_]T{ ty, ty }, .interval, true);
+                    // age(x) measures from current_date: STABLE.
+                    n.func = if (ty == .timestamptz or count == 1) .age_tz else .age;
+                },
+                .justify_days, .justify_hours, .justify_interval => try bindSignature(context, n, &[_]T{.interval}, .interval, true),
+                .make_date => try bindSignature(context, n, &[_]T{ .int4, .int4, .int4 }, .date, true),
+                .make_timestamp => try bindSignature(context, n, &[_]T{ .int4, .int4, .int4, .int4, .int4, .float8 }, .timestamp, true),
+                .isfinite => {
+                    if (count != 1) return error.UndefinedFunction;
+                    const ty = argumentType(context, n, 0);
+                    switch (ty) {
+                        .unknown => return error.AmbiguousFunction,
+                        .date, .timestamp, .timestamptz, .interval => {},
+                        else => return error.UndefinedFunction,
+                    }
+                    try bindSignature(context, n, &[_]T{ty}, .boolean, true);
+                },
+                else => unreachable,
+            }
+        }
+
+        /// numeric when any argument is numeric and none is real/double,
+        /// else double precision (PostgreSQL prefers float8 for integers).
+        fn floatOrNumeric(context: *const Context, n: *const ast.Node) Error!ast.Type {
+            var numeric_seen = false;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                switch (context.node(item).ty) {
+                    .float4, .float8 => return .float8,
+                    .numeric => numeric_seen = true,
+                    .unknown, .int2, .int4, .int8 => {},
+                    else => return error.UndefinedFunction,
+                }
+            }
+            return if (numeric_seen) .numeric else .float8;
+        }
+
+        /// mod/gcd/lcm: the integer or numeric type of both operands.
+        fn exactPair(context: *const Context, n: *const ast.Node, smallest: ast.Type) Error!ast.Type {
+            const left = argumentType(context, n, 0);
+            const right = argumentType(context, n, 1);
+            if (left == .unknown and right == .unknown) return error.AmbiguousFunction;
+            var result: ast.Type = smallest;
+            for ([_]ast.Type{ left, right }) |ty| switch (ty) {
+                .unknown => {},
+                .int2, .int4, .int8, .numeric => if (value.numericRank(ty) > value.numericRank(result)) {
+                    result = ty;
+                },
+                else => return error.UndefinedFunction,
+            };
+            return result;
+        }
+
+        /// PostgreSQL mathematical functions (float8 and numeric overloads).
+        fn typeMathFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            switch (n.func) {
+                .pi => try bindSignature(context, n, &[_]T{}, .float8, true),
+                .ln, .log10, .exp => {
+                    if (count != 1) return error.UndefinedFunction;
+                    const ty = try floatOrNumeric(context, n);
+                    try bindSignature(context, n, &[_]T{ty}, ty, true);
+                },
+                .log => {
+                    if (count == 1) {
+                        const ty = try floatOrNumeric(context, n);
+                        try bindSignature(context, n, &[_]T{ty}, ty, true);
+                    } else try bindSignature(context, n, &[_]T{ .numeric, .numeric }, .numeric, true);
+                },
+                .power => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const ty = try floatOrNumeric(context, n);
+                    try bindSignature(context, n, &[_]T{ ty, ty }, ty, true);
+                },
+                .cbrt, .degrees, .radians, .sin, .cos, .tan, .cot, .asin, .acos, .atan => try bindSignature(context, n, &[_]T{.float8}, .float8, true),
+                .atan2 => try bindSignature(context, n, &[_]T{ .float8, .float8 }, .float8, true),
+                .mod, .gcd, .lcm => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const ty = try exactPair(context, n, if (n.func == .mod) .int2 else .int4);
+                    try bindSignature(context, n, &[_]T{ ty, ty }, ty, true);
+                },
+                .div => try bindSignature(context, n, &[_]T{ .numeric, .numeric }, .numeric, true),
+                .scale, .min_scale => try bindSignature(context, n, &[_]T{.numeric}, .int4, true),
+                .trim_scale => try bindSignature(context, n, &[_]T{.numeric}, .numeric, true),
+                else => unreachable,
+            }
+        }
+
+        // ---- B11 builtins ----------------------------------------------------
+
+        /// Binds a call to one fixed signature: an unknown argument takes the
+        /// parameter type, a typed one needs an implicit cast (42883). A
+        /// strict call with a syntactic NULL argument is planned NULL.
+        fn bindSignature(context: *const Context, n: *ast.Node, params: []const ast.Type, result: ast.Type, strict: bool) Error!void {
+            var args: [8]u16 = undefined;
+            var count: usize = 0;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                if (count == args.len) return error.UndefinedFunction;
+                args[count] = item;
+                count += 1;
+            }
+            if (count != params.len) return error.UndefinedFunction;
+            for (params, args[0..count]) |target, arg| {
+                const ty = context.node(arg).ty;
+                if (ty != .unknown and !value.castable(ty, target, .implicit)) return error.UndefinedFunction;
+            }
+            for (params, args[0..count]) |target, *arg| arg.* = try convert(context, arg.*, target, -1, .implicit);
+            var constant = true;
+            var planned = false;
+            for (args[0..count], 0..) |arg, index| {
+                context.node(arg).next = if (index + 1 < count) args[index + 1] else none;
+                constant = constant and isConstant(context, arg);
+                planned = planned or knownNull(context, arg);
+            }
+            if (count != 0) n.b = args[0];
+            n.ty = result;
+            n.constant = constant;
+            n.planned_null = strict and planned;
+            if (n.planned_null) context.pool.planned_nulls = true;
+        }
+
+        fn argumentType(context: *const Context, n: *const ast.Node, index: usize) ast.Type {
+            var item = n.b;
+            for (0..index) |_| item = context.node(item).next;
+            return context.node(item).ty;
+        }
+
+        /// PostgreSQL string functions (pg_proc signatures over text/int4).
+        fn typeStringFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            switch (n.func) {
+                .lower, .upper, .initcap, .reverse => try bindSignature(context, n, &[_]T{.text}, .text, true),
+                // octet_length(bpchar) counts CHAR(n) padding; the others read
+                // CHAR(n) through text, which drops trailing spaces.
+                .char_length, .octet_length, .bit_length, .ascii => try bindSignature(context, n, &[_]T{if (n.func == .octet_length and count == 1 and argumentType(context, n, 0) == .bpchar) .bpchar else .text}, .int4, true),
+                .substring => {
+                    // Unknown or text arguments after the first select the
+                    // regular-expression overloads substring(text,text[,text]),
+                    // which are not provided. With only NULL literals there the
+                    // strict result is NULL text under either overload.
+                    if (count >= 2 and count <= 3) {
+                        var regex = true;
+                        var concrete = false;
+                        var item = context.node(n.b).next;
+                        while (item != none) : (item = context.node(item).next) {
+                            const ty = context.node(item).ty;
+                            if (ty != .unknown and !value.stringType(ty)) regex = false;
+                            if (!knownNull(context, item)) concrete = true;
+                        }
+                        if (regex and concrete) return error.UnsupportedStatement;
+                    }
+                    try bindSignature(context, n, if (count == 2) &[_]T{ .text, .int4 } else &[_]T{ .text, .int4, .int4 }, .text, true);
+                },
+                .btrim, .ltrim, .rtrim => try bindSignature(context, n, if (count == 1) &[_]T{.text} else &[_]T{ .text, .text }, .text, true),
+                .strpos => try bindSignature(context, n, &[_]T{ .text, .text }, .int4, true),
+                .starts_with => try bindSignature(context, n, &[_]T{ .text, .text }, .boolean, true),
+                .replace, .translate => try bindSignature(context, n, &[_]T{ .text, .text, .text }, .text, true),
+                .left, .right, .repeat => try bindSignature(context, n, &[_]T{ .text, .int4 }, .text, true),
+                .lpad, .rpad => try bindSignature(context, n, if (count == 2) &[_]T{ .text, .int4 } else &[_]T{ .text, .int4, .text }, .text, true),
+                .split_part => try bindSignature(context, n, &[_]T{ .text, .text, .int4 }, .text, true),
+                .chr => try bindSignature(context, n, &[_]T{.int4}, .text, true),
+                .overlay => try bindSignature(context, n, if (count == 3) &[_]T{ .text, .text, .int4 } else &[_]T{ .text, .text, .int4, .int4 }, .text, true),
+                .to_hex => {
+                    if (count != 1) return error.UndefinedFunction;
+                    const ty = argumentType(context, n, 0);
+                    try bindSignature(context, n, &[_]T{if (ty == .int8) .int8 else .int4}, .text, true);
+                },
+                .concat, .concat_ws => {
+                    // VARIADIC "any": at least one variadic argument; values
+                    // print through their output functions (STABLE, not strict).
+                    if (count < (if (n.func == .concat) @as(usize, 1) else 2)) return error.UndefinedFunction;
+                    var item = n.b;
+                    var constant = true;
+                    var index: usize = 0;
+                    while (item != none) : (item = context.node(item).next) {
+                        if (context.node(item).ty == .unknown) try coerce(context, item, .text);
+                        if (index == 0 and n.func == .concat_ws and !value.castable(context.node(item).ty, .text, .implicit)) return error.UndefinedFunction;
+                        constant = constant and isConstant(context, item);
+                        index += 1;
+                    }
+                    if (n.func == .concat_ws and context.node(n.b).ty != .text) {
+                        const separator = n.b;
+                        const rest = context.node(separator).next;
+                        const converted = try convert(context, separator, .text, -1, .implicit);
+                        context.node(converted).next = rest;
+                        if (converted != separator) context.node(separator).next = none;
+                        n.b = converted;
+                    }
+                    n.ty = .text;
+                    n.constant = constant;
+                },
+                else => unreachable,
             }
         }
 
@@ -1937,6 +2360,7 @@ pub fn Binder(comptime config: types.Config) type {
                     const ty = context.node(n.a).ty;
                     if (ty == .unknown) return error.AmbiguousFunction;
                     if (!value.numericCategory(ty) and ty != .interval) return error.UndefinedFunction;
+                    if (n.op == .bit_not and !value.integral(ty)) return error.UndefinedFunction;
                     n.ty = ty;
                     n.constant = isConstant(context, n.a);
                 },
@@ -1978,7 +2402,8 @@ pub fn Binder(comptime config: types.Config) type {
                             n.ty = .text;
                         },
                         .arrow, .arrow_text, .path, .path_text, .contains, .contained, .exists => try jsonOperator(context, n),
-                        .neg, .pos => unreachable,
+                        .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => try bitwiseType(context, n),
+                        .neg, .pos, .bit_not => unreachable,
                     }
                 },
                 .and_op, .or_op => {
@@ -2300,6 +2725,9 @@ pub fn Binder(comptime config: types.Config) type {
                             if (inner.strength > 1) break :blk inner;
                             break :blk .{ .name = if (n.func == .regclass_in) "regclass" else "regtype", .strength = 1 };
                         },
+                        // TRIM(...) calls btrim/ltrim/rtrim, named after them.
+                        // IS [form] NORMALIZED calls is_normalized.
+                        .btrim, .ltrim, .rtrim, .is_normalized => break :blk .{ .name = @tagName(n.func), .strength = 2 },
                         else => {},
                     }
                     buffer.* = toName(context, n.name);

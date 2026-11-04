@@ -37,10 +37,27 @@ pub const TypeName = types.Type;
 
 /// `arrow` ->, `arrow_text` ->>, `path` #>, `path_text` #>>, `contains` @>,
 /// `contained` <@, `exists` ?.
-pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists, is_distinct, is_not_distinct };
+pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists, is_distinct, is_not_distinct,
+    // Integer bitwise operators (B11): & | # << >> and prefix ~.
+    bit_and, bit_or, bit_xor, shift_left, shift_right, bit_not };
 
 /// Built-in functions bound by name.
-pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least };
+pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least,
+    // String functions (B11, functions_string.sig).
+    lower, upper, initcap, char_length, octet_length, bit_length, substring, btrim, ltrim, rtrim, strpos, replace, left, right, repeat, reverse, lpad, rpad, split_part, starts_with, ascii, chr, translate, concat, concat_ws, overlay, to_hex,
+    // Mathematical functions (B11, numeric_math.sig).
+    power, ln, log, log10, exp, mod, div, pi, degrees, radians, cbrt, sin, cos, tan, cot, asin, acos, atan, atan2, gcd, lcm, scale, min_scale, trim_scale,
+    // Date/time functions (B11, functions_temporal.sig); *_tz are the STABLE
+    // timestamptz (session time zone) overloads chosen by the binder.
+    extract, extract_tz, date_part, date_part_tz, date_trunc, date_trunc_tz, age, age_tz, justify_days, justify_hours, justify_interval, make_date, make_timestamp, isfinite,
+    // (a, b) OVERLAPS (c, d); overlaps_tz is the STABLE timestamptz + interval form.
+    overlaps, overlaps_tz,
+    // Internal: the (Y, X) input of a two-argument aggregate, NULL when either is.
+    aggregate_pair,
+    // Formatting input functions (B11, functions_format.sig); STABLE.
+    to_date, to_number, to_timestamp,
+    // Unicode normalization (B11, functions_unicode.sig).
+    normalize, is_normalized };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
@@ -48,7 +65,9 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
 pub fn canRepeatFunction(func: Func) bool {
     return switch (func) {
         .grouping, .window_call, .to_char, .round, .abs, .ceil, .floor, .trunc, .sign, .sqrt, .greatest, .least => true,
-        else => false,
+        else => immutableBuiltin(func) or func == .concat or func == .concat_ws or
+            func == .extract_tz or func == .date_part_tz or func == .date_trunc_tz or func == .overlaps_tz or
+            func == .to_date or func == .to_number or func == .to_timestamp,
     };
 }
 
@@ -57,6 +76,19 @@ pub fn canRepeatFunction(func: Func) bool {
 pub fn immutableFunction(func: Func) bool {
     return switch (func) {
         .round, .abs, .ceil, .floor, .trunc, .sign, .sqrt, .greatest, .least, .jsonb_typeof, .jsonb_array_length => true,
+        else => immutableBuiltin(func),
+    };
+}
+
+/// IMMUTABLE B11 builtins (pg_proc provolatile 'i'). concat/concat_ws are
+/// STABLE: they use type output functions.
+pub fn immutableBuiltin(func: Func) bool {
+    return switch (func) {
+        .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
+        .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
+        .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
+        .extract, .date_part, .date_trunc, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
+        .overlaps, .aggregate_pair, .normalize, .is_normalized => true,
         else => false,
     };
 }
@@ -69,6 +101,11 @@ pub fn strictFunction(func: Func) bool {
         .current_timestamp, .current_date, .current_database, .current_schema,
         .to_regtype, .to_regclass, .pg_get_expr,
         .regclass_in, .regtype_in, .regclass_out, .regtype_out => true,
+        .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
+        .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
+        .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
+        .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
+        .to_date, .to_number, .to_timestamp, .aggregate_pair, .normalize, .is_normalized => true,
         else => false,
     };
 }
@@ -83,7 +120,19 @@ pub const Reg = enum(u8) { none, regclass, regtype };
 pub const Test = enum { is_null, is_not_null, is_true, is_not_true, is_false, is_not_false, is_unknown, is_not_unknown };
 
 /// Aggregate functions (design §4.9). `count_star` is COUNT(*).
-pub const Agg = enum { none, count, count_star, sum, avg, min, max, bool_and, bool_or };
+pub const Agg = enum { none, count, count_star, sum, avg, min, max, bool_and, bool_or,
+    // Statistical (B11, aggregates_stat.sig): one-argument variance family and
+    // two-argument (Y, X) float8 regression aggregates; integer bitwise folds.
+    stddev_pop, stddev_samp, var_pop, var_samp, corr, covar_pop, covar_samp, regr_count, regr_sxx, regr_syy,
+    regr_sxy, regr_avgx, regr_avgy, regr_slope, regr_intercept, regr_r2, bit_and, bit_or, bit_xor };
+
+/// Two-argument (Y, X) aggregates; their argument is an aggregate_pair node.
+pub fn pairAggregate(agg: Agg) bool {
+    return switch (agg) {
+        .corr, .covar_pop, .covar_samp, .regr_count, .regr_sxx, .regr_syy, .regr_sxy, .regr_avgx, .regr_avgy, .regr_slope, .regr_intercept, .regr_r2 => true,
+        else => false,
+    };
+}
 
 /// Relation slot of the grouped row (keys then aggregates) after grouping.
 pub fn groupRelation(comptime config: types.Config) u8 {
