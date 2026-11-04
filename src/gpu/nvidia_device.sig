@@ -38,7 +38,8 @@
 
 const std = @import("std");
 const gpu = @import("device.sig");
-const kir_sm120 = @import("kir_sm120.sig");
+/// The backend whose binaries the adapter runs.
+pub const kir_sm120 = @import("kir_sm120.sig");
 const nvidia = @import("nvidia");
 const nv = nvidia.device;
 const qmd = nvidia.qmd;
@@ -695,8 +696,8 @@ test "Q4_K x Q8_K in KIR: the hand kernel's bits (33 rows, 9 blocks: two tiles, 
     q4kKir(&k);
     k.shared_bytes = matrix.Q8K_TILE_BYTES;
     try k.finish();
-    const text = try kir_sm120.compileText(&k, d.caps, &T.st);
-    const bin = kir_sm120.compileIn(&k, d.caps, &T.st, &T.code) catch |e| {
+    const text = try kir_sm120.compileText(&k, d.caps, &T.st, .{});
+    const bin = kir_sm120.compileIn(&k, d.caps, &T.st, &T.code, .{}) catch |e| {
         std.debug.print("{s}\n", .{text});
         return e;
     };
@@ -733,4 +734,719 @@ test "Q4_K x Q8_K in KIR: the hand kernel's bits (33 rows, 9 blocks: two tiles, 
     const hand_count = hbin.extra[kir_sm120.EXTRA_INSTRUCTIONS];
     std.debug.print("Q4_K, one token: KIR {d} instructions, {d} registers; hand {d} instructions, {d} registers\n", .{ kir_count, kir_regs, hand_count, hbin.regs });
     try testing.expect(kir_count * 10 <= hand_count * 11);
+}
+
+// ── Every KIR op against the interpreter ────────────────────────────────────
+//
+// Each case is a kernel of 128 threads (two groups of 64): thread t reads
+// a[t], b[t], c[t] (registers, or immediates in their place), computes one
+// op and stores it; the same kernel runs in the interpreter with the same
+// caps, and every word must be the same (NaNs as NaNs: the interpreter's
+// NaN is 0x7fffffff, the GPU's may be any). The approximate ops are
+// compared within their documented bounds instead.
+
+const interp = @import("kir_interp.sig");
+
+const NT = 128;
+
+const X = struct {
+    var in: [3][NT]u32 = undefined;
+    var ref: [16 * NT]u32 = undefined;
+    var iwork: [8 << 20]u8 align(64) = undefined;
+    var cases: usize = 0;
+};
+
+const Src = union(enum) { reg, imm: u32, pred };
+
+fn caseCaps(flush: bool) gpu.Caps {
+    var c = emuCaps();
+    if (flush) c.denormals = .flush;
+    return c;
+}
+
+/// The float inputs: specials first (zeros, infinities, NaNs, denormals,
+/// the sqrt and division paths' edges), then random bits.
+fn fillFloats(seed: u32) void {
+    const specials = [_]u32{
+        0x0000_0000, 0x8000_0000, 0x3f80_0000, 0xbf80_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0xffc0_0001,
+        0x0000_0001, 0x8000_0001, 0x007f_ffff, 0x807f_ffff, 0x0080_0000, 0x7f7f_ffff, 0xff7f_ffff, 0x0d00_0000,
+        0x0cff_ffff, 0x3fc0_0000, 0x4049_0fdb, 0xc049_0fdb, 0x3eaa_aaab, 0x4b00_0000, 0xcb00_0001, 0x4f00_0000,
+        0xcf00_0000, 0x4f80_0000, 0x3f00_0000, 0xbf00_0000, 0x3fc0_0001, 0x4040_0000, 0x2780_0000, 0x5880_0000,
+    };
+    var s = seed;
+    for (0..3) |j| {
+        for (0..NT) |i| {
+            X.in[j][i] = if (i < specials.len) specials[(i + 7 * j) % specials.len] else lcg(&s);
+            // (some sane magnitudes too)
+            if (i >= 96) X.in[j][i] = @bitCast(@as(f32, @floatFromInt(@as(i32, @bitCast(lcg(&s))) >> 12)) / 1024.0);
+        }
+    }
+}
+
+fn fillInts(seed: u32) void {
+    const specials = [_]u32{ 0, 1, 2, 31, 32, 33, 63, 0xffff_ffff, 0x8000_0000, 0x7fff_ffff, 0xffff, 0x10000, 0x80, 0xff, 0x7f, 0xfffe, 5, 7, 8, 16, 24, 0xdead_beef, 0x0102_0304, 0x8081_7f7e };
+    var s = seed;
+    for (0..3) |j| {
+        for (0..NT) |i| {
+            X.in[j][i] = if (i < specials.len) specials[(i + 5 * j) % specials.len] else lcg(&s);
+            if (i >= 100) X.in[j][i] = lcg(&s) % 40; // (small: shift amounts, widths)
+        }
+    }
+}
+
+const OpCase = struct {
+    op: kir.Op,
+    ty: kir.Ty,
+    aux: u32 = 0,
+    a: Src = .reg,
+    b: Src = .{ .imm = 0 },
+    c: Src = .{ .imm = 0 },
+    /// the inputs' register types (the op's ty when null)
+    in_ty: ?kir.Ty = null,
+    /// compare within this relative error (approximate ops)
+    tol: ?f64 = null,
+};
+
+fn unused(op: kir.Op, which: u2) bool {
+    return switch (op) {
+        .mov, .ineg, .iabs, .not, .pnot, .fabs, .fneg, .ffloor, .fceil, .ftrunc, .frne, .fsqrt, .frcp, .frsq, .fexp2, .flog2, .fsin, .fcos, .cvt => which >= 1,
+        .sel, .imad, .bfe, .dot4, .ffma, .fmad => false,
+        else => which >= 2,
+    };
+}
+
+/// The case's kernel into `k`.
+fn buildCase(k: *kir.Kernel, cs: OpCase) void {
+    const A = k.binding();
+    const Bb = k.binding();
+    const C = k.binding();
+    const O = k.binding();
+    const t = k.op3(.imad, .u32, r(k.gid(0)), u(64), r(k.tid(0)));
+    const off = k.op2(.shl, .u32, r(t), u(2));
+    const bins = [3]u8{ A, Bb, C };
+    const srcs = [3]Src{ cs.a, cs.b, cs.c };
+    var args: [3]kir.Arg = .{ no, no, no };
+    const in_ty = cs.in_ty orelse cs.ty;
+    for (0..3) |j| {
+        if (unused(cs.op, @intCast(j))) continue;
+        args[j] = switch (srcs[j]) {
+            .imm => |x| u(x),
+            .pred => r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(k.load(.u32, kir.global(bins[j], 32), r(off))), u(1))), u(0))),
+            .reg => blk: {
+                const want: kir.Ty = if (cs.op == .sel and j == 2) .pred else if (j == 2 and cs.op == .dot4) .u32 else in_ty;
+                if (want == .pred) break :blk r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(k.load(.u32, kir.global(bins[j], 32), r(off))), u(1))), u(0)));
+                if (want == .f16) break :blk r(k.mov(.f16, r(k.load(.u32, kir.global(bins[j], 32), r(off)))));
+                break :blk r(k.load(want, kir.global(bins[j], 32), r(off)));
+            },
+        };
+    }
+    // (sel's predicate is c; a pred op's operands are preds)
+    var res = k.opAux(cs.op, cs.ty, args[0], args[1], args[2], cs.aux);
+    const out_ty = k.tys[@intFromEnum(res)];
+    if (out_ty == .pred) res = k.sel(.u32, r(res), u(1), u(0));
+    const st_ty: kir.Ty = if (out_ty == .pred) .u32 else out_ty;
+    if (st_ty == .f16) {
+        k.store(.f16, kir.global(O, 16), r(k.op2(.shl, .u32, r(t), u(1))), r(res));
+    } else k.store(st_ty, kir.global(O, 32), r(off), r(res));
+}
+
+/// The interpreter's and the emulated RTX's outputs of `k` on X.in.
+fn runBoth(caps: gpu.Caps, k: *kir.Kernel, groups: [3]u32, params: []const u32, out_bytes: usize, emu_out: []u8, opts: kir_sm120.Options) !void {
+    try k.finish();
+    // the interpreter
+    var iw = gpu.Work.init(&X.iwork);
+    var trap: interp.Trap = .{};
+    var ina: [3][NT]u32 = X.in;
+    @memset(std.mem.sliceAsBytes(&X.ref), 0);
+    const bindings = [_][]u8{ std.mem.sliceAsBytes(&ina[0]), std.mem.sliceAsBytes(&ina[1]), std.mem.sliceAsBytes(&ina[2]), std.mem.sliceAsBytes(&X.ref)[0..out_bytes] };
+    _ = interp.runKernel(k, caps, groups, bindings[0..k.bindings], params, &iw, &trap) catch |e| {
+        std.debug.print("interp: {s} at {d} ({s})\n", .{ @errorName(e), trap.pc, @tagName(trap.what) });
+        return e;
+    };
+    // the emulated RTX
+    const d = freshEmu();
+    const bin = kir_sm120.compileIn(k, caps, &T.st, &T.code, opts) catch |e| {
+        std.debug.print("compile {s}: {s}\n", .{ k.name, @errorName(e) });
+        return e;
+    };
+    const prog = try d.load(&bin);
+    var bufs: [4]gpu.Buffer = undefined;
+    for (0..3) |j| {
+        bufs[j] = try d.alloc(NT * 4, .upload);
+        @memcpy(bufs[j].cpu[0 .. NT * 4], std.mem.sliceAsBytes(&X.in[j]));
+        d.toDevice(bufs[j], 0, NT * 4);
+    }
+    bufs[3] = try d.alloc(@max(out_bytes, 16), .host);
+    @memset(bufs[3].cpu, 0);
+    d.toDevice(bufs[3], 0, bufs[3].bytes);
+    const used: []const gpu.Buffer = if (k.bindings == 4) &bufs else bufs[0..k.bindings];
+    runWait(d, &.{.{ .prog = &prog, .groups = groups, .buffers = used, .params = params }}) catch |e| {
+        var buf: [96 * 1024]u8 = undefined;
+        std.debug.print("{s}\n", .{kir_sm120.compileText(k, caps, &T.st, opts) catch &buf});
+        return e;
+    };
+    d.fromDevice(bufs[3], 0, out_bytes);
+    @memcpy(emu_out[0..out_bytes], bufs[3].cpu[0..out_bytes]);
+    X.cases += 1;
+}
+
+fn isNan32(x: u32) bool {
+    return x & 0x7fff_ffff > 0x7f80_0000;
+}
+
+fn runCase(caps: gpu.Caps, cs: OpCase) !void {
+    var k = newKernel(@tagName(cs.op), .{ 64, 1, 1 });
+    buildCase(&k, cs);
+    var got: [NT * 4]u8 align(4) = undefined;
+    const half = k.tys[@intFromEnum(k.code()[k.n - 1].b.reg)] == .f16;
+    const bytes: usize = if (half) NT * 2 else NT * 4;
+    try runBoth(caps, &k, .{ 2, 1, 1 }, &.{}, bytes, &got, .{});
+    var bad: usize = 0;
+    const words: usize = if (half) NT / 2 else NT;
+    const g32: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, got[0 .. words * 4]));
+    for (0..words) |i| {
+        const want = X.ref[i];
+        const have = g32[i];
+        if (want == have) continue;
+        const float_out = !half and cs.ty == .f32 and cs.op != .cvt or (cs.op == .cvt and @as(kir.Cvt, @bitCast(cs.aux)).to == .f32);
+        if (float_out and isNan32(want) and isNan32(have)) continue;
+        if (half) {
+            // (two halves a word: NaNs as NaNs)
+            var ok = true;
+            for (0..2) |h| {
+                const wv: u16 = @truncate(want >> @intCast(16 * h));
+                const hv: u16 = @truncate(have >> @intCast(16 * h));
+                if (wv != hv and !(wv & 0x7fff > 0x7c00 and hv & 0x7fff > 0x7c00)) ok = false;
+            }
+            if (ok) continue;
+        }
+        if (cs.tol) |tol| {
+            const wf: f64 = @as(f32, @bitCast(want));
+            const hf: f64 = @as(f32, @bitCast(have));
+            if (std.math.isInf(wf) and wf == hf) continue;
+            const absolute = cs.op == .fsin or cs.op == .fcos;
+            if (@abs(wf - hf) <= tol * (if (absolute) 1.0 else @max(@abs(wf), 1e-30))) continue;
+            // (the SFU flushes denormals, in and out; the interpreter's
+            // approximations do not)
+            if (@abs(wf) < 1.2e-38 and @abs(hf) < 1.2e-38) continue;
+            const ax = X.in[0][i] & 0x7fff_ffff;
+            if (ax != 0 and ax < 0x0080_0000) continue;
+        }
+        if (bad < 4) std.debug.print("{s} ({s}, aux {x}) lane {d}: a {x} b {x} c {x}: interp {x}, RTX {x}\n", .{ @tagName(cs.op), @tagName(cs.ty), cs.aux, i, X.in[0][i], X.in[1][i], X.in[2][i], want, have });
+        bad += 1;
+    }
+    if (bad != 0) {
+        std.debug.print("{s}\n", .{try kir_sm120.compileText(&k, caps, &T.st, .{})});
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn cvtAux(from: kir.Ty, to: kir.Ty, round: kir.Round) u32 {
+    return @bitCast(kir.Cvt{ .from = from, .to = to, .round = round });
+}
+
+test "every integer op equals the interpreter (registers and immediates in each slot)" {
+    for ([_]bool{ false, true }) |flush| {
+        const caps = caseCaps(flush);
+        fillInts(0x1234);
+        const int_ops = [_]kir.Op{ .iadd, .isub, .imul, .imulhi, .imin, .imax, .@"and", .@"or", .xor, .shl, .shr };
+        for ([_]kir.Ty{ .u32, .i32 }) |ty| {
+            for (int_ops) |op| {
+                try runCase(caps, .{ .op = op, .ty = ty });
+                try runCase(caps, .{ .op = op, .ty = ty, .b = .reg });
+                try runCase(caps, .{ .op = op, .ty = ty, .b = .{ .imm = 0xffff_fff3 } });
+                try runCase(caps, .{ .op = op, .ty = ty, .b = .{ .imm = 37 } });
+                try runCase(caps, .{ .op = op, .ty = ty, .a = .{ .imm = 0x8000_0005 }, .b = .reg });
+            }
+            try runCase(caps, .{ .op = .imad, .ty = ty, .b = .reg, .c = .reg });
+            try runCase(caps, .{ .op = .imad, .ty = ty, .b = .{ .imm = 0x10000 }, .c = .reg });
+            try runCase(caps, .{ .op = .imad, .ty = ty, .b = .reg, .c = .{ .imm = 0x7fff_fff0 } });
+            try runCase(caps, .{ .op = .imad, .ty = ty, .b = .{ .imm = 3 }, .c = .{ .imm = 5 } });
+            try runCase(caps, .{ .op = .ineg, .ty = ty });
+            try runCase(caps, .{ .op = .not, .ty = ty });
+            try runCase(caps, .{ .op = .mov, .ty = ty });
+            for ([_]u32{ 0, 1, 8, 13, 16, 24, 31, 32 }) |off| {
+                for ([_]u32{ 0, 1, 5, 8, 16, 31, 32, 40 }) |len| try runCase(caps, .{ .op = .bfe, .ty = ty, .b = .{ .imm = off }, .c = .{ .imm = len } });
+            }
+            try runCase(caps, .{ .op = .bfe, .ty = ty, .b = .reg, .c = .reg });
+            try runCase(caps, .{ .op = .bfe, .ty = ty, .b = .reg, .c = .{ .imm = 7 } });
+            try runCase(caps, .{ .op = .sel, .ty = ty, .b = .reg, .c = .reg });
+            try runCase(caps, .{ .op = .sel, .ty = ty, .a = .{ .imm = 77 }, .b = .reg, .c = .reg });
+            try runCase(caps, .{ .op = .sel, .ty = ty, .a = .reg, .b = .{ .imm = 99 }, .c = .reg });
+            try runCase(caps, .{ .op = .sel, .ty = ty, .a = .{ .imm = 1 }, .b = .{ .imm = 2 }, .c = .reg });
+            for (0..6) |cmp| {
+                try runCase(caps, .{ .op = .icmp, .ty = ty, .aux = @intCast(cmp), .b = .reg });
+                try runCase(caps, .{ .op = .icmp, .ty = ty, .aux = @intCast(cmp), .b = .{ .imm = 0x8000_0000 } });
+                try runCase(caps, .{ .op = .icmp, .ty = ty, .aux = @intCast(cmp), .a = .{ .imm = 31 }, .b = .reg });
+            }
+            for (0..3) |m| {
+                try runCase(caps, .{ .op = .dot4, .ty = ty, .aux = @intCast(m), .b = .reg, .c = .reg });
+                try runCase(caps, .{ .op = .dot4, .ty = ty, .aux = @intCast(m), .b = .{ .imm = 0x80ff_7f01 }, .c = .{ .imm = 0x1234_5678 } });
+            }
+        }
+        try runCase(caps, .{ .op = .iabs, .ty = .i32 });
+        // predicates
+        for ([_]kir.Op{ .pand, .por }) |op| {
+            try runCase(caps, .{ .op = op, .ty = .pred, .a = .pred, .b = .pred });
+            try runCase(caps, .{ .op = op, .ty = .pred, .a = .pred, .b = .{ .imm = 1 } });
+            try runCase(caps, .{ .op = op, .ty = .pred, .a = .pred, .b = .{ .imm = 0 } });
+        }
+        try runCase(caps, .{ .op = .pnot, .ty = .pred, .a = .pred });
+        try runCase(caps, .{ .op = .mov, .ty = .pred, .a = .pred });
+        try runCase(caps, .{ .op = .sel, .ty = .pred, .a = .pred, .b = .pred, .c = .reg });
+    }
+    std.debug.print("integer ops: {d} kernels\n", .{X.cases});
+}
+
+test "every float op equals the interpreter, denormals kept and flushed" {
+    for ([_]bool{ false, true }) |flush| {
+        const caps = caseCaps(flush);
+        fillFloats(0x51ce);
+        for ([_]kir.Op{ .fadd, .fsub, .fmul, .fmin, .fmax }) |op| {
+            try runCase(caps, .{ .op = op, .ty = .f32, .b = .reg });
+            try runCase(caps, .{ .op = op, .ty = .f32, .b = .{ .imm = 0x3fc0_0000 } });
+            try runCase(caps, .{ .op = op, .ty = .f32, .b = .{ .imm = 0x8000_0000 } });
+            try runCase(caps, .{ .op = op, .ty = .f32, .b = .{ .imm = 0x0000_0003 } });
+            try runCase(caps, .{ .op = op, .ty = .f32, .a = .{ .imm = 0xc0a0_0000 }, .b = .reg });
+        }
+        for ([_]kir.Op{ .ffma, .fmad }) |op| {
+            try runCase(caps, .{ .op = op, .ty = .f32, .b = .reg, .c = .reg });
+            try runCase(caps, .{ .op = op, .ty = .f32, .b = .{ .imm = 0xbf80_0000 }, .c = .reg });
+            try runCase(caps, .{ .op = op, .ty = .f32, .b = .reg, .c = .{ .imm = 0x3400_0000 } });
+            try runCase(caps, .{ .op = op, .ty = .f32, .b = .{ .imm = 0x4000_0000 }, .c = .{ .imm = 0x0000_0001 } });
+        }
+        for ([_]kir.Op{ .fabs, .fneg, .ffloor, .fceil, .ftrunc, .frne, .mov }) |op| try runCase(caps, .{ .op = op, .ty = .f32 });
+        try runCase(caps, .{ .op = .sel, .ty = .f32, .b = .reg, .c = .reg });
+        for (0..6) |cmp| {
+            try runCase(caps, .{ .op = .fcmp, .ty = .f32, .aux = @intCast(cmp), .b = .reg });
+            try runCase(caps, .{ .op = .fcmp, .ty = .f32, .aux = @intCast(cmp), .b = .{ .imm = 0x0000_0001 } });
+            try runCase(caps, .{ .op = .fcmp, .ty = .f32, .aux = @intCast(cmp), .a = .{ .imm = 0x7fc0_0000 }, .b = .reg });
+        }
+        // the approximate ops: within 2^-21 relative (the emulator's SFU is
+        // exact to f64; the hardware's bounds are docs/GPU.md's)
+        for ([_]kir.Op{ .frcp, .frsq, .fexp2, .flog2 }) |op| try runCase(caps, .{ .op = op, .ty = .f32, .tol = 1.0 / 2097152.0 });
+    }
+    std.debug.print("float ops: {d} kernels so far\n", .{X.cases});
+}
+
+test "fsin and fcos within their bounds" {
+    const caps = caseCaps(false);
+    var s: u32 = 9;
+    for (0..3) |j| {
+        for (0..NT) |i| X.in[j][i] = @bitCast((@as(f32, @floatFromInt(lcg(&s) >> 8)) / 16777216.0 - 0.5) * 20.0);
+    }
+    for ([_]kir.Op{ .fsin, .fcos }) |op| try runCase(caps, .{ .op = op, .ty = .f32, .tol = 1.0 / 65536.0 });
+}
+
+test "every conversion equals the interpreter, in each rounding" {
+    for ([_]bool{ false, true }) |flush| {
+        const caps = caseCaps(flush);
+        const tys = [_]kir.Ty{ .u32, .i32, .f32, .f16 };
+        for (tys) |from| {
+            for (tys) |to| {
+                const c0 = kir.Cvt{ .from = from, .to = to, .round = .rne };
+                // (the pairs the verifier takes)
+                if (from == to) continue;
+                if ((from == .u32 or from == .i32) and to == .f16) continue;
+                if (from == .f16 and (to == .u32 or to == .i32)) continue;
+                _ = c0;
+                for ([_]kir.Round{ .rne, .rz, .rd, .ru }) |rd| {
+                    if (from == .f32 or from == .f16) fillFloats(0x77 + @intFromEnum(rd)) else fillInts(0x99 + @intFromEnum(rd));
+                    if (from == .f32 and (to == .u32 or to == .i32)) {
+                        // (and the values around the integers' limits)
+                        for ([_]u32{ 0x4f00_0000, 0x4eff_ffff, 0xcf00_0000, 0xcf00_0001, 0x4f80_0000, 0x4f7f_ffff, 0xbf00_0000, 0x3f00_0000, 0xbfc0_0000, 0x3fc0_0000 }, 0..) |v, i| X.in[0][60 + i] = v;
+                    }
+                    try runCase(caps, .{ .op = .cvt, .ty = to, .aux = cvtAux(from, to, rd), .in_ty = from });
+                }
+            }
+        }
+    }
+}
+
+test "fdiv and fsqrt bit-exact: kir.expandDiv's fused path, sqrt native and expanded, denormals kept and flushed" {
+    var s: u32 = 0xd1;
+    for ([_]bool{ false, true }) |flush| {
+        const caps = caseCaps(flush);
+        for (0..12) |round| {
+            fillFloats(0x2000 + @as(u32, @intCast(round)));
+            // (random magnitudes over the whole range in later rounds)
+            if (round >= 4) {
+                for (0..3) |j| {
+                    for (32..NT) |i| X.in[j][i] = lcg(&s) & if (round % 2 == 0) @as(u32, 0x7fff_ffff) else 0xffff_ffff;
+                }
+            }
+            try runCase(caps, .{ .op = .fdiv, .ty = .f32, .b = .reg });
+            try runCase(caps, .{ .op = .fsqrt, .ty = .f32 });
+            var k = newKernel("fsqrt-expanded", .{ 64, 1, 1 });
+            buildCase(&k, .{ .op = .fsqrt, .ty = .f32 });
+            var got: [NT * 4]u8 align(4) = undefined;
+            try runBoth(caps, &k, .{ 2, 1, 1 }, &.{}, NT * 4, &got, .{ .native_sqrt = false });
+            const g32: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, &got));
+            for (0..NT) |i| {
+                if (X.ref[i] != g32[i] and !(isNan32(X.ref[i]) and isNan32(g32[i]))) {
+                    std.debug.print("expanded fsqrt({x}): interp {x}, RTX {x}\n", .{ X.in[0][i], X.ref[i], g32[i] });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+        try runCase(caps, .{ .op = .fdiv, .ty = .f32, .b = .{ .imm = 0x4040_0000 } });
+        try runCase(caps, .{ .op = .fdiv, .ty = .f32, .a = .{ .imm = 0x3f80_0000 }, .b = .reg });
+    }
+}
+
+/// `k` on both, every output word the same (or only those `pick` says).
+fn same(caps: gpu.Caps, k: *kir.Kernel, groups: [3]u32, params: []const u32, out_words: usize, pick: ?[]const usize) !void {
+    var got: [16 * NT * 4]u8 align(4) = undefined;
+    try runBoth(caps, k, groups, params, out_words * 4, &got, .{});
+    const g32: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, got[0 .. out_words * 4]));
+    var bad: usize = 0;
+    if (pick) |idx| {
+        for (idx) |i| {
+            if (X.ref[i] != g32[i]) {
+                if (bad < 6) std.debug.print("{s} word {d}: interp {x}, RTX {x}\n", .{ k.name, i, X.ref[i], g32[i] });
+                bad += 1;
+            }
+        }
+    } else for (0..out_words) |i| {
+        if (X.ref[i] != g32[i]) {
+            if (bad < 6) std.debug.print("{s} word {d}: interp {x}, RTX {x}\n", .{ k.name, i, X.ref[i], g32[i] });
+            bad += 1;
+        }
+    }
+    if (bad != 0) {
+        std.debug.print("{s}\n", .{try kir_sm120.compileText(k, caps, &T.st, .{})});
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn lin(k: *kir.Kernel) kir.V {
+    return k.op3(.imad, .u32, r(k.gid(0)), u(64), r(k.tid(0)));
+}
+
+test "memory: 8- to 128-bit loads and stores, signed, global and shared, immediate and register addresses" {
+    const caps = caseCaps(false);
+    fillInts(0x3e3);
+    var k = newKernel("memory", .{ 64, 1, 1 });
+    const A = k.binding();
+    const Bb = k.binding();
+    _ = k.binding();
+    const O = k.binding();
+    const t = lin(&k);
+    const tid = k.tid(0);
+    var m8 = kir.global(A, 8);
+    const b8 = k.load(.u32, m8, r(k.op2(.iadd, .u32, r(t), u(3))));
+    m8.signed = true;
+    const s8 = k.load(.i32, m8, r(k.op2(.@"and", .u32, r(k.op2(.imul, .u32, r(t), u(5))), u(511))));
+    var m16 = kir.global(A, 16);
+    const h16 = k.load(.u32, m16, r(k.op2(.shl, .u32, r(t), u(1))));
+    m16.signed = true;
+    m16.imm = 6;
+    const s16 = k.load(.i32, m16, r(k.op2(.shl, .u32, r(t), u(1))));
+    const v2 = k.load(.u32, kir.global(Bb, 64), r(k.op2(.@"and", .u32, r(k.op2(.shl, .u32, r(t), u(3))), u(0x1f8))));
+    const v4 = k.load(.u32, kir.global(Bb, 128), r(k.op2(.@"and", .u32, r(k.op2(.shl, .u32, r(t), u(4))), u(0x1f0))));
+    const f16v = k.load(.f16, kir.global(A, 16), u(10));
+    const ob = k.op2(.shl, .u32, r(t), u(5));
+    k.store(.i32, kir.global(O, 32), r(ob), r(s8));
+    var m = kir.global(O, 16);
+    m.imm = 4;
+    k.store(.u32, m, r(ob), r(h16));
+    m = kir.global(O, 8);
+    m.imm = 6;
+    k.store(.u32, m, r(ob), r(b8));
+    m = kir.global(O, 8);
+    m.imm = 7;
+    k.store(.u32, m, r(ob), r(s16));
+    m = kir.global(O, 64);
+    m.imm = 8;
+    k.store(.u32, m, r(ob), r(v2));
+    m = kir.global(O, 128);
+    m.imm = 16;
+    k.store(.u32, m, r(ob), r(v4));
+    // shared: each thread's quad at 16 tid, the neighbour's read back, its
+    // bytes and halves too
+    k.shared_bytes = 64 * 16 + 16;
+    const st16 = k.op2(.shl, .u32, r(tid), u(4));
+    k.store(.u32, kir.shared(128), r(st16), r(v4));
+    var sm = kir.shared(16);
+    sm.imm = 64 * 16;
+    k.ifp(r(k.cmp(.u32, .eq, r(tid), u(0))));
+    k.store(.f16, sm, u(0), r(f16v));
+    k.endif();
+    k.barrier();
+    const nb = k.op2(.shl, .u32, r(k.op2(.xor, .u32, r(tid), u(1))), u(4));
+    const w4 = k.load(.u32, kir.shared(128), r(nb));
+    var sb = kir.shared(8);
+    sb.signed = true;
+    sb.imm = 5;
+    const sbyte = k.load(.i32, sb, r(nb));
+    var sh = kir.shared(16);
+    sh.imm = 10;
+    const shalf = k.load(.u32, sh, r(nb));
+    var shf = kir.shared(16);
+    shf.imm = 64 * 16;
+    const f16b = k.load(.f16, shf, u(0));
+    const f32b = k.cvt(.f16, .f32, .rne, r(f16b));
+    // O's second and third regions: the neighbour's quad; the signed
+    // byte, the half and the f16 as f32
+    const ob2 = k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(t), u(4))), u(32 * NT));
+    k.store(.u32, kir.global(O, 128), r(ob2), r(w4));
+    const ob3 = k.op2(.iadd, .u32, r(ob2), u(16 * NT));
+    k.store(.i32, kir.global(O, 32), r(ob3), r(sbyte));
+    m = kir.global(O, 32);
+    m.imm = 4;
+    k.store(.u32, m, r(ob3), r(shalf));
+    m.imm = 8;
+    k.store(.f32, m, r(ob3), r(f32b));
+    try same(caps, &k, .{ 2, 1, 1 }, &.{}, 16 * NT, null);
+}
+
+test "atomics, barriers, shuffles, votes" {
+    const caps = caseCaps(false);
+    fillInts(0xa70);
+    {
+        // global and shared atomics: the final words (the old values depend on
+        // the order lanes run in, and are not compared)
+        var k = newKernel("atomics", .{ 64, 1, 1 });
+        const A = k.binding();
+        _ = k.binding();
+        _ = k.binding();
+        const O = k.binding();
+        k.shared_bytes = 16;
+        const t = lin(&k);
+        const tid = k.tid(0);
+        const x = k.load(.u32, kir.global(A, 32), r(k.op2(.shl, .u32, r(t), u(2))));
+        const g = kir.global(O, 32);
+        _ = k.atomic(.u32, .add, g, u(0), r(x));
+        var g4 = g;
+        g4.imm = 4;
+        _ = k.atomic(.u32, .min, g4, u(0), r(x));
+        _ = k.atomic(.i32, .max, g, u(8), r(x));
+        _ = k.atomic(.i32, .min, g, u(12), r(x));
+        _ = k.atomic(.u32, .xchg, g, u(16), r(x));
+        // (thread 0 sets the shared words)
+        const first = k.cmp(.u32, .eq, r(tid), u(0));
+        k.ifp(r(first));
+        k.store(.u32, kir.shared(32), u(0), u(0));
+        k.store(.u32, kir.shared(32), u(4), u(0xffff_ffff));
+        k.store(.u32, kir.shared(32), u(8), u(0x8000_0000));
+        k.endif();
+        k.barrier();
+        _ = k.atomic(.u32, .add, kir.shared(32), u(0), r(x));
+        _ = k.atomic(.u32, .min, kir.shared(32), u(4), r(x));
+        _ = k.atomic(.i32, .max, kir.shared(32), u(8), r(x));
+        _ = k.atomic(.u32, .xchg, kir.shared(32), u(12), r(tid));
+        k.barrier();
+        k.ifp(r(first));
+        const ob = k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(k.gid(0)), u(4))), u(32));
+        const s0 = k.load(.u32, kir.shared(128), u(0));
+        k.store(.u32, kir.global(O, 128), r(ob), r(s0));
+        k.endif();
+        // (O starts zeroed: min's starting 0 stays; give it a start)
+        try same(caps, &k, .{ 2, 1, 1 }, &.{}, 16, &.{ 0, 1, 2, 3, 8, 9, 10, 12, 13, 14 });
+    }
+    {
+        // shuffles in each mode, lanes as immediates and registers; votes
+        var k = newKernel("warp", .{ 64, 1, 1 });
+        const A = k.binding();
+        const Bb = k.binding();
+        _ = k.binding();
+        const O = k.binding();
+        const t = lin(&k);
+        const off = k.op2(.shl, .u32, r(t), u(2));
+        const x = k.load(.u32, kir.global(A, 32), r(off));
+        const y = k.load(.u32, kir.global(Bb, 32), r(off));
+        const ob = k.op2(.shl, .u32, r(t), u(5));
+        var vals: [8]kir.V = undefined;
+        vals[0] = k.shfl(.u32, .idx, r(x), r(y));
+        vals[1] = k.shfl(.u32, .idx, r(x), u(5));
+        vals[2] = k.shfl(.u32, .xor, r(x), u(1));
+        vals[3] = k.shfl(.u32, .xor, r(x), r(k.op2(.@"and", .u32, r(y), u(31))));
+        vals[4] = k.shfl(.u32, .up, r(x), u(3));
+        vals[5] = k.shfl(.u32, .down, r(x), u(7));
+        vals[6] = k.shfl(.f32, .down, r(k.load(.f32, kir.global(A, 32), r(off))), r(k.op2(.@"and", .u32, r(y), u(15))));
+        const p = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(x), u(1))), u(0));
+        const q = k.cmp(.u32, .lt, r(k.lane()), u(31));
+        const any = k.vote(.any, r(p));
+        const all = k.vote(.all, r(q));
+        vals[7] = k.op2(.iadd, .u32, r(k.sel(.u32, r(any), u(1), u(0))), r(k.sel(.u32, r(all), u(2), u(0))));
+        for (vals, 0..) |v, j| {
+            var m = kir.global(O, 32);
+            m.imm = @intCast(4 * j);
+            k.store(if (j == 6) .f32 else .u32, m, r(ob), r(v));
+        }
+        try same(caps, &k, .{ 2, 1, 1 }, &.{}, 8 * NT, null);
+    }
+}
+
+test "control flow: divergent ifs, loops with brk and cont, nesting, an early ret" {
+    for ([_]bool{ false, true }) |flush| {
+        const caps = caseCaps(flush);
+        fillInts(0xc0f);
+        var k = newKernel("flow", .{ 64, 1, 1 });
+        const A = k.binding();
+        const Bb = k.binding();
+        _ = k.binding();
+        const O = k.binding();
+        const t = lin(&k);
+        const off = k.op2(.shl, .u32, r(t), u(2));
+        const x = k.load(.u32, kir.global(A, 32), r(off));
+        const y = k.load(.u32, kir.global(Bb, 32), r(off));
+        const acc = k.mov(.u32, u(0));
+        const i = k.mov(.u32, u(0));
+        const n = k.op2(.@"and", .u32, r(x), u(15));
+        // a loop whose trip count differs by lane, an if/else in it, a cont
+        k.loop();
+        {
+            k.brk(r(k.cmp(.u32, .ge, r(i), r(n))));
+            k.set(i, .iadd, r(i), u(1), no);
+            const odd = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(i), u(1))), u(0));
+            k.ifp(r(odd));
+            k.set(acc, .imad, r(i), u(3), r(acc));
+            k.els();
+            k.set(acc, .xor, r(acc), r(k.op2(.shl, .u32, r(i), u(4))), no);
+            // (a nested if with a long body: branched)
+            const big = k.cmp(.u32, .gt, r(y), u(0x8000_0000));
+            k.ifp(r(big));
+            var z = k.op2(.imul, .u32, r(acc), r(y));
+            for (0..8) |j| z = k.op2(.iadd, .u32, r(z), r(k.op2(.shr, .u32, r(z), u(@intCast(j + 1)))));
+            k.set(acc, .mov, r(z), no, no);
+            k.endif();
+            k.endif();
+            const skip = k.cmp(.u32, .eq, r(k.op2(.@"and", .u32, r(i), u(3))), u(2));
+            k.cont(r(skip));
+            k.set(acc, .iadd, r(acc), u(100), no);
+        }
+        k.endloop();
+        // nested loops, the inner one's trip count by lane
+        const s = k.mov(.u32, u(0));
+        const a = k.mov(.u32, u(0));
+        k.loop();
+        {
+            const b = k.mov(.u32, u(0));
+            k.loop();
+            {
+                k.set(s, .iadd, r(s), r(k.op2(.imul, .u32, r(a), r(b))), no);
+                k.set(b, .iadd, r(b), u(1), no);
+                k.brk(r(k.cmp(.u32, .gt, r(b), r(k.op2(.@"and", .u32, r(y), u(7))))));
+            }
+            k.endloop();
+            k.set(a, .iadd, r(a), u(1), no);
+            k.brk(r(k.cmp(.u32, .ge, r(a), u(4))));
+        }
+        k.endloop();
+        const ob = k.op2(.shl, .u32, r(t), u(3));
+        k.store(.u32, kir.global(O, 32), r(ob), r(acc));
+        var m = kir.global(O, 32);
+        m.imm = 4;
+        k.store(.u32, m, r(ob), r(s));
+        // an early return for some lanes after their first store
+        const early = k.cmp(.u32, .lt, r(k.op2(.@"and", .u32, r(x), u(0xff))), u(0x40));
+        k.ifp(r(early));
+        k.ret();
+        k.endif();
+        // (a float tail: some ifs on float compares)
+        const f = k.cvt(.u32, .f32, .rne, r(acc));
+        const g = k.op2(.fmul, .f32, r(f), kir.f(0.5));
+        const fp = k.cmp(.f32, .lt, r(g), kir.f(1000.0));
+        const h = k.sel(.f32, r(fp), r(g), r(k.op1(.fneg, .f32, r(g))));
+        m.imm = 4;
+        k.store(.f32, m, r(ob), r(h));
+        try same(caps, &k, .{ 2, 1, 1 }, &.{}, 2 * NT, null);
+    }
+}
+
+test "ids, parameters and predicates past the six registers" {
+    const caps = caseCaps(false);
+    fillInts(0x1d5);
+    {
+        var k = newKernel("ids", .{ 8, 4, 2 });
+        _ = k.binding();
+        _ = k.binding();
+        _ = k.binding();
+        const O = k.binding();
+        const tx = k.tid(0);
+        const ty = k.tid(1);
+        const tz = k.tid(2);
+        const lin3 = k.op3(.imad, .u32, r(tz), u(32), r(k.op3(.imad, .u32, r(ty), u(8), r(tx))));
+        const g = k.op3(.imad, .u32, r(k.gid(1)), u(2), r(k.gid(0)));
+        const t = k.op3(.imad, .u32, r(g), u(64), r(lin3));
+        const ob = k.op2(.shl, .u32, r(t), u(5));
+        const vals = [_]kir.V{ tx, ty, tz, k.gid(0), k.gid(1), k.op3(.imad, .u32, r(k.gsize(1)), u(16), r(k.gsize(0))), k.op2(.iadd, .u32, r(k.lane()), r(k.op2(.shl, .u32, r(k.subgroupWidth()), u(8)))), k.op2(.xor, .u32, r(k.param(.u32, 0)), r(k.param(.u32, 1))) };
+        for (vals, 0..) |v, j| {
+            var m = kir.global(O, 32);
+            m.imm = @intCast(4 * j);
+            k.store(.u32, m, r(ob), r(v));
+        }
+        // (2 x 2 groups of 64: 256 threads, 8 words each)
+        try same(caps, &k, .{ 2, 2, 1 }, &.{ 0x1234, 0xff00 }, 16 * NT, null);
+    }
+    {
+        // ten predicates live at once: four of them in registers
+        var k = newKernel("preds", .{ 64, 1, 1 });
+        const A = k.binding();
+        _ = k.binding();
+        _ = k.binding();
+        const O = k.binding();
+        const t = lin(&k);
+        const off = k.op2(.shl, .u32, r(t), u(2));
+        const x = k.load(.u32, kir.global(A, 32), r(off));
+        var p: [10]kir.V = undefined;
+        for (&p, 0..) |*q, j| q.* = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(x), u(@as(u32, 1) << @intCast(j)))), u(0));
+        var acc = k.mov(.u32, u(0));
+        for (p, 0..) |q, j| acc = k.sel(.u32, r(q), r(k.op2(.iadd, .u32, r(acc), u(@intCast(j * j + 1)))), r(acc));
+        var pp = p[0];
+        for (p[1..]) |q| pp = k.op2(if (@intFromEnum(q) % 2 == 0) .pand else .por, .pred, r(pp), r(q));
+        acc = k.op2(.iadd, .u32, r(acc), r(k.sel(.u32, r(pp), u(0x1000), u(0))));
+        // (and the predicates read again, in reverse, after all are made)
+        for (0..10) |j| acc = k.op2(.xor, .u32, r(acc), r(k.sel(.u32, r(p[9 - j]), u(@as(u32, 1) << @intCast(16 + j)), u(0))));
+        k.store(.u32, kir.global(O, 32), r(off), r(acc));
+        try same(caps, &k, .{ 2, 1, 1 }, &.{}, NT, null);
+        try testing.expect(T.st.stats.spills > 0);
+    }
+}
+
+test "fneg and fabs: source modifiers where the op takes them (FADD, FMNMX, FSETP, F2I), instructions where not (FMUL, FFMA)" {
+    for ([_]bool{ false, true }) |flush| {
+        const caps = caseCaps(flush);
+        fillFloats(0xab5);
+        var k = newKernel("modifiers", .{ 64, 1, 1 });
+        const A = k.binding();
+        const Bb = k.binding();
+        const C = k.binding();
+        const O = k.binding();
+        const t = lin(&k);
+        const off = k.op2(.shl, .u32, r(t), u(2));
+        const x = k.load(.f32, kir.global(A, 32), r(off));
+        const y = k.load(.f32, kir.global(Bb, 32), r(off));
+        const z = k.load(.f32, kir.global(C, 32), r(off));
+        const ax = k.op1(.fabs, .f32, r(x));
+        const ny = k.op1(.fneg, .f32, r(y));
+        const az = k.op1(.fabs, .f32, r(z));
+        const nax = k.op1(.fneg, .f32, r(ax));
+        const vals = [_]kir.V{
+            k.op2(.fmul, .f32, r(ax), r(ny)),
+            k.op3(.ffma, .f32, r(ax), r(ny), r(az)),
+            k.op3(.fmad, .f32, r(ny), kir.f(1.25), r(az)),
+            k.op2(.fadd, .f32, r(ax), r(ny)),
+            k.op2(.fsub, .f32, r(nax), r(az)),
+            k.op2(.fmax, .f32, r(ax), r(ny)),
+            k.sel(.f32, r(k.cmp(.f32, .lt, r(ax), r(ny))), r(az), r(nax)),
+            k.cvt(.f32, .i32, .rz, r(nax)),
+        };
+        const ob = k.op2(.shl, .u32, r(t), u(5));
+        for (vals, 0..) |v, j| {
+            var m = kir.global(O, 32);
+            m.imm = @intCast(4 * j);
+            k.store(if (j == 7) .i32 else .f32, m, r(ob), r(v));
+        }
+        var got: [16 * NT * 4]u8 align(4) = undefined;
+        try runBoth(caps, &k, .{ 2, 1, 1 }, &.{}, 8 * NT * 4, &got, .{});
+        const g32: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, got[0 .. 8 * NT * 4]));
+        for (0..8 * NT) |i| {
+            if (X.ref[i] != g32[i] and !(isNan32(X.ref[i]) and isNan32(g32[i]) and i % 8 != 7)) {
+                std.debug.print("modifiers word {d}: interp {x}, RTX {x}\n", .{ i, X.ref[i], g32[i] });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
 }
