@@ -712,3 +712,543 @@ test "votes and divergent control flow: nested ifs, loops with brk and cont, ret
     var out = zeros(128 * 16 + 128 * 4);
     _ = try both(&k, .{ 2, 1, 1 }, &.{&out}, &.{});
 }
+
+// ── The hand-written kernels, rewritten in KIR ──────────────────────────────
+
+const hand = @import("lfm3_gpu_kernels");
+const ir3 = adreno.ir3;
+const ir3_asm = adreno.ir3_asm;
+const a7xx = adreno.a7xx;
+
+/// Print the KIR attention kernel's listing (debugging).
+const show_listing = false;
+
+const Hand = struct {
+    var asm_work: ir3_asm.Work = undefined;
+};
+
+/// Counts of a kernel: static (machine instructions, after legalization)
+/// and dynamic (instructions the emulator issued, per wave, and registers).
+const Counts = struct {
+    static: u32,
+    legalized: u32,
+    issued: u64,
+    full_regs: u32,
+};
+
+/// A hand-written kernel's source through the raw emulated GPU: buffers
+/// (already on the GPU), its constants, a grid. Returns its counts.
+fn runHand(src: []const u8, consts: []const u32, extra: ?struct { first: u32, words: []const u32 }, groups: [3]u32) !Counts {
+    const raw = Rig.emu.gpu.device();
+    const code = try raw.alloc(256 * 1024);
+    const ib = try raw.alloc(64 * 1024);
+    const k = ir3_asm.assemble(ir3.A7XX, src, &Hand.asm_work, @alignCast(std.mem.bytesAsSlice(u64, code.cpu))) catch |e| {
+        std.debug.print("hand kernel: line {d}: {s}\n", .{ Hand.asm_work.err_line, @errorName(e) });
+        return e;
+    };
+    raw.toDevice(code, 0, k.code.len * 8);
+    var nops: u32 = 0;
+    for (Hand.asm_work.out[0..Hand.asm_work.n_out]) |it| if (it.in.op == .nop) {
+        nops += 1;
+    };
+    var s = a7xx.Stream{ .buf = ib.words() };
+    s.computeSetup();
+    try s.program(&k, code.va);
+    s.constants(0, consts);
+    if (extra) |x| s.constants(x.first, x.words);
+    s.dispatch(&k, groups);
+    s.waitForIdle();
+    try s.check();
+    const before = Rig.emu.gpu.stats.instructions;
+    try raw.run(ib, @intCast(s.len), 1_000_000);
+    return .{ .static = k.count - nops, .legalized = k.count, .issued = Rig.emu.gpu.stats.instructions - before, .full_regs = k.full_regs };
+}
+
+/// A KIR kernel on the same emulated GPU (its buffers already there).
+fn runKir(k: *kir.Kernel, groups: [3]u32, bufs: []const gpu.Buffer, params: []const u32) !Counts {
+    try k.finish();
+    const d = Rig.emu.device();
+    const bin = kir_ir3.compileWith(k, d.caps, &Rig.work, &Rig.out) catch |e| {
+        std.debug.print("{s}: compile: {s} {s}\n{s}\n", .{ k.name, @errorName(e), kir_ir3.diagnostic(&Rig.work), kir_ir3.source(&Rig.work) });
+        return e;
+    };
+    const st = Rig.work.stats;
+    const p = try d.load(&bin);
+    const before = Rig.emu.gpu.stats.instructions;
+    const fence = try d.run(&.{.{ .prog = &p, .groups = groups, .buffers = bufs, .params = params }});
+    d.wait(fence, 1_000_000) catch |e| {
+        const at = Rig.emu.gpu.emu.err_pc;
+        var buf: [160]u8 = undefined;
+        const text = ir3.format(ir3.A7XX, &Rig.emu.gpu.emu.code[at], &buf) catch "?";
+        std.debug.print("{s}: emulated Adreno: {s} at {d}: {s}\n{s}\n", .{ k.name, if (Rig.emu.lastError()) |x| @errorName(x) else "?", at, text, kir_ir3.listing(&Rig.work, &Rig.listing) });
+        return e;
+    };
+    return .{ .static = st.instructions, .legalized = st.legalized, .issued = Rig.emu.gpu.stats.instructions - before, .full_regs = st.full_regs };
+}
+
+fn report(name: []const u8, h: Counts, q: Counts) void {
+    const pct = struct {
+        fn f(a: u64, b: u64) f64 {
+            return 100.0 * (@as(f64, @floatFromInt(a)) - @as(f64, @floatFromInt(b))) / @as(f64, @floatFromInt(b));
+        }
+    }.f;
+    std.debug.print("{s}: hand {d} instructions ({d} legalized), {d} issued, {d} vec4 regs | KIR {d} ({d}), {d} issued, {d} regs | static {d:.1}%, legalized {d:.1}%, issued {d:.1}%\n", .{ name, h.static, h.legalized, h.issued, h.full_regs, q.static, q.legalized, q.issued, q.full_regs, pct(q.static, h.static), pct(q.legalized, h.legalized), pct(q.issued, h.issued) });
+}
+
+/// The Q4_K x Q8_K matrix kernel in KIR, as lfm3_gpu_kernels.q4kMatrixSource:
+/// 8 fibers per row, 8 rows per group, the same integer sums and the same
+/// float epilogue in the same order (so the same bits).
+fn q4kKernel(k: *kir.Kernel, tokens: u32) void {
+    const W = k.binding();
+    const AQ = k.binding();
+    const AD = k.binding();
+    const AS = k.binding();
+    const OUT = k.binding();
+    const row_bytes = k.param(.u32, 0);
+    const blocks = k.param(.u32, 1);
+    const kcols = k.param(.u32, 2);
+    const blocks4 = k.param(.u32, 3);
+    const blocks32 = k.param(.u32, 4);
+    const rows4 = k.param(.u32, 5);
+    const t = k.tid(0);
+    const lane = k.op2(.@"and", .u32, r(t), u(7));
+    const row = k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(k.gid(0)), u(3))), r(k.op2(.shr, .u32, r(t), u(3))));
+    const lane4 = k.op2(.shl, .u32, r(lane), u(2));
+    // (loop-invariant: the lane's min byte shift and word)
+    const min_shift = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(lane), u(3))), u(3));
+    const high_lanes = k.cmp(.u32, .ge, r(lane), u(4));
+    var ta: [8]kir.V = undefined;
+    var td: [8]kir.V = undefined;
+    var tsb: [8]kir.V = undefined;
+    var sum: [8]kir.V = undefined;
+    for (0..tokens) |ti| {
+        const tt: u32 = @intCast(ti);
+        if (tt == 0) {
+            ta[ti] = lane4;
+            td[ti] = k.mov(.u32, u(0));
+            tsb[ti] = lane4;
+        } else {
+            ta[ti] = k.op3(.imad, .u32, r(kcols), u(tt), r(lane4));
+            td[ti] = k.op2(.imul, .u32, r(blocks4), u(tt));
+            tsb[ti] = k.op3(.imad, .u32, r(blocks32), u(tt), r(lane4));
+        }
+        sum[ti] = k.mov(.f32, f(0));
+    }
+    const blk = k.op2(.imul, .u32, r(row), r(row_bytes));
+    const b256 = k.mov(.u32, u(0));
+    const b4 = k.mov(.u32, u(0));
+    const b32 = k.mov(.u32, u(0));
+    const cnt = k.mov(.u32, u(0));
+    k.loop();
+    {
+        const hdr = k.load(.u32, kir.global(W, 128), r(blk));
+        const q = k.op2(.iadd, .u32, r(blk), r(lane4));
+        var qs: [4]kir.V = undefined;
+        for (0..4) |p| {
+            var m = kir.global(W, 32);
+            m.imm = @intCast(16 + 32 * p);
+            qs[p] = k.load(.u32, m, r(q));
+        }
+        var acts: [8][8]kir.V = undefined;
+        var ad: [8]kir.V = undefined;
+        var bs: [8]kir.V = undefined;
+        for (0..tokens) |ti| {
+            const ao = k.op2(.iadd, .u32, r(ta[ti]), r(b256));
+            for (0..8) |j| {
+                var m = kir.global(AQ, 32);
+                m.imm = @intCast(32 * j);
+                acts[ti][j] = k.load(.u32, m, r(ao));
+            }
+            ad[ti] = k.load(.f32, kir.global(AD, 32), r(k.op2(.iadd, .u32, r(td[ti]), r(b4))));
+            bs[ti] = k.load(.u32, kir.global(AS, 32), r(k.op2(.iadd, .u32, r(tsb[ti]), r(b32))));
+        }
+        const h1 = kir.Kernel.at(hdr, 1);
+        const h2 = kir.Kernel.at(hdr, 2);
+        const h3 = kir.Kernel.at(hdr, 3);
+        // the 6-bit scales and minimums (GGML's mask sequence)
+        const sc_lo = k.op2(.@"and", .u32, r(h1), u(0x3f3f3f3f));
+        const hi1 = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(h1), u(6))), u(0x03030303))), u(4));
+        const sc_hi = k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(h3), u(0x0f0f0f0f))), r(hi1));
+        const mn_lo = k.op2(.@"and", .u32, r(h2), u(0x3f3f3f3f));
+        const hi2 = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(h2), u(6))), u(0x03030303))), u(4));
+        const mn_hi = k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(h3), u(4))), u(0x0f0f0f0f))), r(hi2));
+        var sc: [8]kir.V = undefined;
+        for (0..8) |j| sc[j] = k.op3(.bfe, .u32, r(if (j < 4) sc_lo else sc_hi), u(@intCast(8 * (j % 4))), u(8));
+        const mins = k.sel(.u32, r(high_lanes), r(mn_hi), r(mn_lo));
+        const min_lane = k.op3(.bfe, .u32, r(mins), r(min_shift), u(8));
+        const h0 = kir.Kernel.at(hdr, 0);
+        const dd = k.cvt(.f16, .f32, .rne, r(k.mov(.f16, r(h0))));
+        const dmin = k.cvt(.f16, .f32, .rne, r(k.mov(.f16, r(k.op2(.shr, .u32, r(h0), u(16))))));
+        var wq: [8]kir.V = undefined;
+        for (0..4) |p| {
+            wq[2 * p] = k.op2(.@"and", .u32, r(qs[p]), u(0x0f0f0f0f));
+            wq[2 * p + 1] = k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(qs[p]), u(4))), u(0x0f0f0f0f));
+        }
+        for (0..tokens) |ti| {
+            var acc: kir.V = undefined;
+            for (0..8) |j| {
+                const m = k.opAux(.dot4, .i32, r(acts[ti][j]), r(wq[j]), kir.i(0), @intFromEnum(kir.Dot4.s8u8));
+                acc = if (j == 0) k.op2(.imul, .i32, r(m), r(sc[j])) else k.op3(.imad, .i32, r(m), r(sc[j]), r(acc));
+            }
+            const bsum = k.op2(.iadd, .i32, r(k.op3(.bfe, .i32, r(bs[ti]), u(0), u(16))), r(k.op3(.bfe, .i32, r(bs[ti]), u(16), u(16))));
+            const mm = k.op2(.imul, .i32, r(bsum), r(min_lane));
+            const fi = k.cvt(.i32, .f32, .rne, r(acc));
+            const fm = k.cvt(.i32, .f32, .rne, r(mm));
+            const x0 = k.op2(.fmul, .f32, r(dd), r(ad[ti]));
+            const y0 = k.op2(.fmul, .f32, r(dmin), r(ad[ti]));
+            const x1 = k.op2(.fmul, .f32, r(x0), r(fi));
+            const y1 = k.op2(.fmul, .f32, r(y0), r(fm));
+            k.set(sum[ti], .fadd, r(sum[ti]), r(k.op2(.fsub, .f32, r(x1), r(y1))), no);
+        }
+        k.set(blk, .iadd, r(blk), u(144), no);
+        k.set(b256, .iadd, r(b256), u(256), no);
+        k.set(b4, .iadd, r(b4), u(4), no);
+        k.set(b32, .iadd, r(b32), u(32), no);
+        k.set(cnt, .iadd, r(cnt), u(1), no);
+        k.brk(r(k.cmp(.u32, .ge, r(cnt), r(blocks))));
+    }
+    k.endloop();
+    // the lanes' sums in order: s0 + s1 + ... + s7
+    var tot: [8]kir.V = undefined;
+    for (0..tokens) |ti| {
+        tot[ti] = sum[ti];
+        for (1..8) |kk| tot[ti] = k.op2(.fadd, .f32, r(tot[ti]), r(k.shfl(.f32, .down, r(sum[ti]), u(@intCast(kk)))));
+    }
+    k.ifp(r(k.cmp(.u32, .eq, r(lane), u(0))));
+    const ro = k.op2(.shl, .u32, r(row), u(2));
+    for (0..tokens) |ti| {
+        const o = if (ti == 0) ro else k.op3(.imad, .u32, r(rows4), u(@intCast(ti)), r(ro));
+        k.store(.f32, kir.global(OUT, 32), r(o), r(tot[ti]));
+    }
+    k.endif();
+}
+
+fn q4kCase(comptime tokens: comptime_int, rows: u32, blocks: u32) !void {
+    Rig.emu.init(&Rig.arena, &Rig.view);
+    emu_ready = true;
+    const d = Rig.emu.device();
+    const row_bytes = blocks * hand.Q4_K_BLOCK;
+    const kc = blocks * hand.QK_K;
+    const w = try d.alloc(rows * row_bytes, .host);
+    const aq = try d.alloc(tokens * kc, .host);
+    const ad = try d.alloc(tokens * blocks * 4, .host);
+    const abs = try d.alloc(tokens * blocks * 32, .host);
+    const out_hand = try d.alloc(tokens * rows * 4, .host);
+    const out_kir = try d.alloc(tokens * rows * 4, .host);
+    var seed: u32 = 4242;
+    for (w.cpu, 0..) |*b, i| b.* = @truncate(lcg(&seed) >> 13 ^ i);
+    for (0..rows * blocks) |bi| {
+        const at = bi * hand.Q4_K_BLOCK;
+        std.mem.writeInt(u16, w.cpu[at..][0..2], @intCast(0x1400 + (lcg(&seed) >> 22)), .little);
+        std.mem.writeInt(u16, w.cpu[at + 2 ..][0..2], @intCast(0x1400 + (lcg(&seed) >> 22)), .little);
+    }
+    for (aq.cpu) |*b| b.* = @truncate(lcg(&seed) >> 11);
+    const adf: []f32 = @alignCast(std.mem.bytesAsSlice(f32, ad.cpu));
+    for (adf) |*x| x.* = @as(f32, @floatFromInt(lcg(&seed) >> 16)) / 65536.0 * 0.01;
+    for (abs.cpu) |*b| b.* = @truncate(lcg(&seed) >> 9);
+    for ([_]gpu.Buffer{ w, aq, ad, abs }) |b| d.toDevice(b, 0, b.bytes);
+    const mc = hand.MatrixConsts{ .weights = w.gpu, .act_q = aq.gpu, .act_d = ad.gpu, .act_sums = abs.gpu, .out = out_hand.gpu, .row_bytes = row_bytes, .blocks = blocks, .rows = rows };
+    const groups = [3]u32{ rows / hand.MATRIX_ROWS_PER_GROUP, 1, 1 };
+    const hc = try runHand(comptime hand.q4kMatrixSource(tokens), &mc.dwords(), null, groups);
+    var k = newKernel("q4k", .{ 64, 1, 1 });
+    q4kKernel(&k, tokens);
+    const params = [_]u32{ row_bytes, blocks, kc, blocks * 4, blocks * 32, rows * 4 };
+    const qc = try runKir(&k, groups, &.{ w, aq, ad, abs, out_kir }, &params);
+    d.fromDevice(out_hand, 0, out_hand.bytes);
+    d.fromDevice(out_kir, 0, out_kir.bytes);
+    // the interpreter too (KIR's definition), on the CPU's copies
+    var interp_out = zeros(8 * 64 * 4);
+    _ = try runInterp(&k, groups, &.{ w.cpu, aq.cpu, ad.cpu, abs.cpu, interp_out[0..out_kir.cpu.len] }, &params);
+    try std.testing.expectEqualSlices(u8, out_hand.cpu, out_kir.cpu);
+    try std.testing.expect(sameBuffers(out_kir.cpu, interp_out[0..out_kir.cpu.len]));
+    var name_buf: [64]u8 = undefined;
+    report(std.fmt.bufPrint(&name_buf, "Q4_K x Q8_K, {d} token(s), {d} blocks", .{ tokens, blocks }) catch "q4k", hc, qc);
+    if (tokens == 1) {
+        try std.testing.expect(qc.legalized * 10 <= hc.legalized * 11);
+        try std.testing.expect(qc.issued * 10 <= hc.issued * 11);
+    }
+}
+
+test "Q4_K matrix: KIR equals the hand-written kernel to the bit, within 10% of its instructions" {
+    try q4kCase(1, 32, 8);
+    try q4kCase(4, 16, 6);
+    try q4kCase(8, 16, 3);
+}
+
+/// hidden[t] += rmsnorm(x[t]) * weight, as lfm3_gpu_kernels.residualSource
+/// (postnorm): one wave per 256-element block, four elements per fiber;
+/// squares summed with mad (the GPU's), the waves' sums through shared
+/// memory, 1/sqrt by the SFU.
+fn rmsKernel(k: *kir.Kernel, waves: u32) void {
+    const X = k.binding();
+    const NW = k.binding();
+    const HID = k.binding();
+    const kk = k.param(.u32, 0);
+    const eps = k.param(.f32, 1);
+    const inv_k = k.param(.f32, 2);
+    const t = k.tid(0);
+    const wave = k.op2(.shr, .u32, r(t), u(6));
+    const lane = k.op2(.@"and", .u32, r(t), u(63));
+    const tok = k.gid(1);
+    const e = k.op3(.imad, .u32, r(tok), r(kk), r(k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(wave), u(8))), r(k.op2(.shl, .u32, r(lane), u(2))))));
+    const off = k.op2(.shl, .u32, r(e), u(2));
+    const x = k.load(.f32, kir.global(X, 128), r(off));
+    var s = k.op2(.fmul, .f32, r(x), r(x));
+    for (1..4) |i| s = k.op3(.fmad, .f32, r(kir.Kernel.at(x, @intCast(i))), r(kir.Kernel.at(x, @intCast(i))), r(s));
+    for ([_]u32{ 1, 2, 4, 8, 16, 32 }) |m| s = k.op2(.fadd, .f32, r(s), r(k.shfl(.f32, .xor, r(s), u(m))));
+    const sh = k.sharedAlloc(64, 4);
+    var ms = kir.shared(32);
+    ms.imm = @intCast(sh);
+    k.ifp(r(k.cmp(.u32, .eq, r(lane), u(0))));
+    k.store(.f32, ms, r(k.op2(.shl, .u32, r(wave), u(2))), r(s));
+    k.endif();
+    k.barrier();
+    var tot = k.load(.f32, ms, u(0));
+    for (1..waves) |wv| tot = k.op2(.fadd, .f32, r(tot), r(k.load(.f32, ms, u(@intCast(4 * wv)))));
+    const inv = k.op1(.frsq, .f32, r(k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(tot), r(inv_k))), r(eps))));
+    const wo = k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(wave), u(10))), r(k.op2(.shl, .u32, r(lane), u(4))));
+    const wt = k.load(.f32, kir.global(NW, 128), r(wo));
+    const h = k.load(.f32, kir.global(HID, 128), r(off));
+    const res = k.vec(.f32, 4);
+    for (0..4) |i| {
+        const ix: u16 = @intCast(i);
+        const y = k.op2(.fmul, .f32, r(k.op2(.fmul, .f32, r(kir.Kernel.at(x, ix)), r(inv))), r(kir.Kernel.at(wt, ix)));
+        k.set(kir.Kernel.at(res, ix), .fadd, r(kir.Kernel.at(h, ix)), r(y), no);
+    }
+    k.store(.f32, kir.global(HID, 128), r(off), r(res));
+}
+
+fn rmsCase(comptime waves: comptime_int, tokens: u32) !void {
+    Rig.emu.init(&Rig.arena, &Rig.view);
+    emu_ready = true;
+    const d = Rig.emu.device();
+    const kc: u32 = waves * 256;
+    const x = try d.alloc(tokens * kc * 4, .host);
+    const nw = try d.alloc(kc * 4, .host);
+    const hid_hand = try d.alloc(tokens * kc * 4, .host);
+    const hid_kir = try d.alloc(tokens * kc * 4, .host);
+    var seed: u32 = 31337;
+    const xf: []f32 = @alignCast(std.mem.bytesAsSlice(f32, x.cpu));
+    for (xf) |*v| v.* = (@as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0 - 0.5) * 4.0;
+    const wf: []f32 = @alignCast(std.mem.bytesAsSlice(f32, nw.cpu));
+    for (wf) |*v| v.* = @as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0 + 0.5;
+    const hf: []f32 = @alignCast(std.mem.bytesAsSlice(f32, hid_hand.cpu));
+    for (hf) |*v| v.* = (@as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0 - 0.5) * 2.0;
+    @memcpy(hid_kir.cpu, hid_hand.cpu);
+    for ([_]gpu.Buffer{ x, nw, hid_hand, hid_kir }) |b| d.toDevice(b, 0, b.bytes);
+    const eps: f32 = 1e-5;
+    const qc = hand.QuantConsts{ .x = x.gpu, .norm_weight = nw.gpu, .normalized = hid_hand.gpu, .act_q = 0, .act_d = 0, .act_sums = 0, .k = kc, .epsilon = eps };
+    const groups = [3]u32{ 1, tokens, 1 };
+    const hc = try runHand(comptime hand.residualSource(true, waves), &qc.dwords(), null, groups);
+    var k = newKernel("rmsnorm", .{ 64 * waves, 1, 1 });
+    rmsKernel(&k, waves);
+    const inv_k: f32 = 1.0 / @as(f32, @floatFromInt(kc));
+    const kq = try runKir(&k, groups, &.{ x, nw, hid_kir }, &.{ kc, fb(eps), fb(inv_k) });
+    d.fromDevice(hid_hand, 0, hid_hand.bytes);
+    d.fromDevice(hid_kir, 0, hid_kir.bytes);
+    try std.testing.expectEqualSlices(u8, hid_hand.cpu, hid_kir.cpu);
+    var name_buf: [64]u8 = undefined;
+    report(std.fmt.bufPrint(&name_buf, "RMSNorm + residual, {d} waves, {d} tokens", .{ waves, tokens }) catch "rms", hc, kq);
+    try std.testing.expect(kq.legalized * 10 <= hc.legalized * 11);
+    try std.testing.expect(kq.issued * 10 <= hc.issued * 11);
+}
+
+test "RMSNorm: KIR equals the hand-written kernel to the bit, within 10% of its instructions" {
+    try rmsCase(8, 3);
+    try rmsCase(2, 1);
+}
+
+/// One (query head, token) per group of 64, as lfm3_gpu_kernels'
+/// attentionSource: the query in shared memory; scores q . k over the
+/// visible keys (f16 keys, eight lane sums in order), times the scale;
+/// the maximum, exp2((s - max) * log2 e) and their sum; weights through
+/// f16 times the f16 values in position order; the head's sigmoid gate.
+fn attnKernel(k: *kir.Kernel, span: u32) void {
+    const Q = k.binding();
+    const KV = k.binding();
+    const GATE = k.binding();
+    const OUT = k.binding();
+    const heads = k.param(.u32, 0);
+    const block_bytes = k.param(.u32, 1);
+    const slot = k.param(.u32, 2);
+    const max_kv = k.param(.u32, 3);
+    const first_pos = k.param(.u32, 4);
+    const scale = k.param(.f32, 5);
+    const window = k.param(.u32, 6);
+    const log2group = k.param(.u32, 7);
+    const qbase = k.sharedAlloc(512, 16);
+    const sbase = k.sharedAlloc((span + 64) * 4, 16);
+    const h = k.gid(0);
+    const t = k.gid(1);
+    const j = k.tid(0);
+    const pos = k.op2(.iadd, .u32, r(first_pos), r(t));
+    // the first visible position (a sliding window) and how many
+    const in_win = k.op2(.pand, .pred, r(k.cmp(.u32, .ge, r(pos), r(window))), r(k.cmp(.u32, .ne, r(window), u(0))));
+    const visible = k.sel(.u32, r(in_win), r(k.op2(.iadd, .u32, r(k.op2(.isub, .u32, r(pos), r(window))), u(1))), u(0));
+    const L = k.op2(.isub, .u32, r(k.op2(.iadd, .u32, r(pos), u(1))), r(visible));
+    const kvh = k.op2(.shr, .u32, r(h), r(log2group));
+    const kblock_ix = k.op2(.iadd, .u32, r(k.op2(.imul, .u32, r(k.op2(.shl, .u32, r(slot), u(1))), r(max_kv))), r(kvh));
+    const kblock = k.op2(.imul, .u32, r(kblock_ix), r(block_bytes));
+    const vblock = k.op2(.imul, .u32, r(k.op2(.iadd, .u32, r(kblock_ix), r(max_kv))), r(block_bytes));
+    // the query into shared memory
+    const qrow = k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(t), r(heads), r(h))), u(9));
+    const j4 = k.op2(.shl, .u32, r(j), u(2));
+    const qo = k.op2(.iadd, .u32, r(qrow), r(j4));
+    const qo2 = k.op2(.iadd, .u32, r(qo), u(256));
+    var mq = kir.shared(32);
+    mq.imm = @intCast(qbase);
+    k.store(.f32, mq, r(j4), r(k.load(.f32, kir.global(Q, 32), r(qo))));
+    var mq2 = mq;
+    mq2.imm = @intCast(qbase + 256);
+    k.store(.f32, mq2, r(j4), r(k.load(.f32, kir.global(Q, 32), r(qo2))));
+    k.barrier();
+    const passes = k.op2(.shr, .u32, r(k.op2(.iadd, .u32, r(L), u(63))), u(6));
+    var ms = kir.shared(32);
+    ms.imm = @intCast(sbase);
+    // scores
+    const pass = k.mov(.u32, u(0));
+    k.loop();
+    {
+        const p_rel = k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(pass), u(6))), r(j));
+        const valid = k.cmp(.u32, .lt, r(p_rel), r(L));
+        const krow = k.sel(.u32, r(valid), r(k.op2(.iadd, .u32, r(visible), r(p_rel))), r(visible));
+        const ko = k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(krow), u(8))), r(kblock));
+        var acc: [8]kir.V = undefined;
+        for (0..16) |i| {
+            var m1 = kir.shared(128);
+            m1.imm = @intCast(qbase + 32 * i);
+            const q1 = k.load(.f32, m1, u(0));
+            m1.imm = @intCast(qbase + 32 * i + 16);
+            const q2 = k.load(.f32, m1, u(0));
+            var mk = kir.global(KV, 128);
+            mk.imm = @intCast(16 * i);
+            const kw = k.load(.u32, mk, r(ko));
+            for (0..8) |l| {
+                const word = kir.Kernel.at(kw, @intCast(l / 2));
+                const half = if (l % 2 == 0) k.mov(.f16, r(word)) else k.mov(.f16, r(k.op2(.shr, .u32, r(word), u(16))));
+                const kf = k.cvt(.f16, .f32, .rne, r(half));
+                const qf = kir.Kernel.at(if (l < 4) q1 else q2, @intCast(l % 4));
+                const p = k.op2(.fmul, .f32, r(qf), r(kf));
+                acc[l] = if (i == 0) p else k.op2(.fadd, .f32, r(acc[l]), r(p));
+            }
+        }
+        var sc = acc[0];
+        for (1..8) |l| sc = k.op2(.fadd, .f32, r(sc), r(acc[l]));
+        sc = k.op2(.fmul, .f32, r(sc), r(scale));
+        const at = k.sel(.u32, r(valid), r(p_rel), r(k.op2(.iadd, .u32, r(L), r(j))));
+        k.store(.f32, ms, r(k.op2(.shl, .u32, r(at), u(2))), r(sc));
+        k.set(pass, .iadd, r(pass), u(1), no);
+        k.brk(r(k.cmp(.u32, .ge, r(pass), r(passes))));
+    }
+    k.endloop();
+    k.barrier();
+    // the maximum
+    const mx = k.mov(.f32, f(-std.math.inf(f32)));
+    k.set(pass, .mov, u(0), no, no);
+    k.loop();
+    {
+        const p_rel = k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(pass), u(6))), r(j));
+        const valid = k.cmp(.u32, .lt, r(p_rel), r(L));
+        const s = k.load(.f32, ms, r(k.op2(.shl, .u32, r(p_rel), u(2))));
+        k.set(mx, .sel, r(k.op2(.fmax, .f32, r(mx), r(s))), r(mx), r(valid));
+        k.set(pass, .iadd, r(pass), u(1), no);
+        k.brk(r(k.cmp(.u32, .ge, r(pass), r(passes))));
+    }
+    k.endloop();
+    var mxr = mx;
+    for ([_]u32{ 1, 2, 4, 8, 16, 32 }) |m| mxr = k.op2(.fmax, .f32, r(mxr), r(k.shfl(.f32, .xor, r(mxr), u(m))));
+    // e = exp2((s - max) * log2 e) in place, and their sum
+    const total = k.mov(.f32, f(0));
+    k.set(pass, .mov, u(0), no, no);
+    k.loop();
+    {
+        const p_rel = k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(pass), u(6))), r(j));
+        const valid = k.cmp(.u32, .lt, r(p_rel), r(L));
+        const a = k.op2(.shl, .u32, r(p_rel), u(2));
+        const s = k.load(.f32, ms, r(a));
+        const e = k.op1(.fexp2, .f32, r(k.op2(.fmul, .f32, r(k.op2(.fsub, .f32, r(s), r(mxr))), f(1.44269504))));
+        k.store(.f32, ms, r(a), r(e));
+        k.set(total, .fadd, r(total), r(k.sel(.f32, r(valid), r(e), f(0))), no);
+        k.set(pass, .iadd, r(pass), u(1), no);
+        k.brk(r(k.cmp(.u32, .ge, r(pass), r(passes))));
+    }
+    k.endloop();
+    var tot = total;
+    for ([_]u32{ 1, 2, 4, 8, 16, 32 }) |m| tot = k.op2(.fadd, .f32, r(tot), r(k.shfl(.f32, .xor, r(tot), u(m))));
+    const inv = k.op1(.frcp, .f32, r(tot));
+    k.barrier();
+    // out = sum over positions of f16(e * inv) * f16 value
+    const o1 = k.mov(.f32, f(0));
+    const o2 = k.mov(.f32, f(0));
+    const vo = k.op2(.iadd, .u32, r(k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(visible), u(8))), r(vblock))), r(k.op2(.shl, .u32, r(j), u(1))));
+    const n = k.mov(.u32, u(0));
+    const so = k.mov(.u32, u(0));
+    k.loop();
+    {
+        const e = k.load(.f32, ms, r(so));
+        const wgt = k.cvt(.f16, .f32, .rne, r(k.cvt(.f32, .f16, .rne, r(k.op2(.fmul, .f32, r(e), r(inv))))));
+        const v1 = k.cvt(.f16, .f32, .rne, r(k.load(.f16, kir.global(KV, 16), r(vo))));
+        var mv = kir.global(KV, 16);
+        mv.imm = 128;
+        const v2 = k.cvt(.f16, .f32, .rne, r(k.load(.f16, mv, r(vo))));
+        k.set(o1, .fadd, r(o1), r(k.op2(.fmul, .f32, r(wgt), r(v1))), no);
+        k.set(o2, .fadd, r(o2), r(k.op2(.fmul, .f32, r(wgt), r(v2))), no);
+        k.set(vo, .iadd, r(vo), u(256), no);
+        k.set(so, .iadd, r(so), u(4), no);
+        k.set(n, .iadd, r(n), u(1), no);
+        k.brk(r(k.cmp(.u32, .ge, r(n), r(L))));
+    }
+    k.endloop();
+    // the gate: 1 / (1 + exp2(-logit * log2 e))
+    const go = k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(t), r(heads), r(h))), u(2));
+    const g = k.load(.f32, kir.global(GATE, 32), r(go));
+    const gate = k.op1(.frcp, .f32, r(k.op2(.fadd, .f32, r(k.op1(.fexp2, .f32, r(k.op2(.fmul, .f32, r(g), f(-1.44269504))))), f(1.0))));
+    k.store(.f32, kir.global(OUT, 32), r(qo), r(k.op2(.fmul, .f32, r(o1), r(gate))));
+    k.store(.f32, kir.global(OUT, 32), r(qo2), r(k.op2(.fmul, .f32, r(o2), r(gate))));
+}
+
+fn attnCase(heads: u32, kv_heads: u32, tokens: u32, first_pos: u32, window: u32) !void {
+    Rig.emu.init(&Rig.arena, &Rig.view);
+    emu_ready = true;
+    const d = Rig.emu.device();
+    const hs = 128;
+    const context: u32 = 512;
+    const span: u32 = 512;
+    const max_kv = kv_heads;
+    const slot: u32 = 1;
+    const q = try d.alloc(tokens * heads * hs * 4, .host);
+    const kvb = try d.alloc((slot + 1) * 2 * max_kv * context * hs * 2, .host);
+    const gate = try d.alloc(tokens * heads * 4, .host);
+    const out_hand = try d.alloc(tokens * heads * hs * 4, .host);
+    const out_kir = try d.alloc(tokens * heads * hs * 4, .host);
+    var seed: u32 = 2718;
+    const qf: []f32 = @alignCast(std.mem.bytesAsSlice(f32, q.cpu));
+    for (qf) |*v| v.* = @floatCast(@as(f16, @floatCast((@as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0 - 0.5) * 2.0)));
+    const kvh: []u16 = @alignCast(std.mem.bytesAsSlice(u16, kvb.cpu));
+    for (kvh) |*v| v.* = @bitCast(@as(f16, @floatCast((@as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0 - 0.5) * 2.0)));
+    const gf: []f32 = @alignCast(std.mem.bytesAsSlice(f32, gate.cpu));
+    for (gf) |*v| v.* = (@as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0 - 0.5) * 6.0;
+    for ([_]gpu.Buffer{ q, kvb, gate }) |b| d.toDevice(b, 0, b.bytes);
+    const ac = hand.AttnConsts{ .query = q.gpu, .gate = gate.gpu, .out = out_hand.gpu, .kv = kvb.gpu, .heads = heads, .kv_heads = kv_heads, .head_size = hs, .context = context, .slot = slot, .max_kv_heads = max_kv, .first_position = first_pos, .window = window };
+    const groups = [3]u32{ heads, tokens, 1 };
+    const hc = try runHand(comptime hand.attentionSource(), &ac.dwords(), .{ .first = 6, .words = &ac.outDwords() }, groups);
+    var k = newKernel("attention", .{ 64, 1, 1 });
+    attnKernel(&k, span);
+    const scale: f32 = 1.0 / @sqrt(@as(f32, hs));
+    const params = [_]u32{ heads, context * hs * 2, slot, max_kv, first_pos, fb(scale), window, std.math.log2_int(u32, heads / kv_heads) };
+    const kc = try runKir(&k, groups, &.{ q, kvb, gate, out_kir }, &params);
+    if (show_listing) std.debug.print("{s}\n", .{kir_ir3.listing(&Rig.work, &Rig.listing)});
+    d.fromDevice(out_hand, 0, out_hand.bytes);
+    d.fromDevice(out_kir, 0, out_kir.bytes);
+    try std.testing.expectEqualSlices(u8, out_hand.cpu, out_kir.cpu);
+    var name_buf: [80]u8 = undefined;
+    report(std.fmt.bufPrint(&name_buf, "attention, {d} heads, {d} tokens from {d}, window {d}", .{ heads, tokens, first_pos, window }) catch "attention", hc, kc);
+    try std.testing.expect(kc.legalized * 10 <= hc.legalized * 11);
+    try std.testing.expect(kc.issued * 10 <= hc.issued * 11);
+}
+
+test "attention: KIR equals the hand-written kernel to the bit, within 10% of its instructions" {
+    try attnCase(4, 2, 3, 37, 0);
+    try attnCase(2, 1, 2, 300, 256);
+    try attnCase(2, 2, 1, 130, 0);
+}
