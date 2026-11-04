@@ -61,14 +61,35 @@
 //!
 //! # Other SM generations
 //!
-//! Selection reads `Gen`, what a generation has (two-source IADD, VIMNMX,
-//! I2FP, LDCU, the descriptor addressing). Only sm_120 has an encoder in
-//! zpm (src/nvidia/sm120.sig); sm_75 to sm_90 would each need theirs
-//! (NAK's sm70_encode.rs documents them: the same 128-bit format, other
-//! opcodes and fields) and a latency table. See notes in docs/GPU.md.
+//! Selection reads `Gen`, what a generation has; the lowering above it is
+//! the same for every SM from Volta on (one 128-bit format, the control
+//! fields in 105..125, BSSY/BSYNC, SHFL, IDP.4A, the uniform datapath from
+//! sm_75). Only sm_120 has an encoder in zpm (src/nvidia/sm120.sig). A
+//! generation joins as: its encoder (NAK's sm70_encode.rs documents each
+//! field by `e.sm`), its latency tables for sm120_sched, a Gen, and its
+//! constant buffer 0 (QMD and cbuf0 in nvidia_device). What differs:
+//!
+//! (read off ptxas 13.4's output for sm_75, 80, 89, 90 and 120, and NAK)
+//!
+//! - sm_100/120: two-source IADD and IADD.64 (sm_90: VIADD; before:
+//!   IADD3 a, b, RZ), LDCU (else ULDC.64), a branch's offset split over
+//!   16..23 and 34..81, the atomics' 64-bit address bit at 63; sm_120 sets
+//!   no yield or reuse bits.
+//! - sm_90 and later: desc[UR][R.64] addresses, VIMNMX (VIADDMNMX; before:
+//!   IMNMX), the CGA shared window with its reserved 1 KiB
+//!   (Gen.shared_base 0 before).
+//! - sm_89 and later: I2FP (else I2F).
+//! - sm_75 to sm_89: ALU ops read c[bank][offset] directly (sm_120 loads
+//!   constants with LDC/LDCU), addresses are plain [R.64] (sm_80/89 load
+//!   the implicit descriptor, ULDC.64 c[0x0][0x118]), sm_75 has
+//!   BAR.SYNC without DEFER_BLOCKING and LDG.E.SYS.
+//! - Constant buffer 0: parameters from 0x160 (sm_75..89), 0x210 (sm_90),
+//!   0x380 (sm_100/120); the stack top at 0x28 (to sm_90), 0x37c; the
+//!   descriptor at 0x118, 0x208, 0x358. QMD v02_02 (Volta, Turing),
+//!   v03_00 (Ampere, Ada), v04_00 (Hopper), v05_00 (Blackwell).
 //!
 //! Allocation-free: the State comes from the caller's device.Work
-//! (WORK_BYTES, about 5 MB), the code goes to the caller's bytes.
+//! (WORK_BYTES: 4.46 MB), the code goes to the caller's bytes.
 
 const std = @import("std");
 const kir = @import("kir.sig");
