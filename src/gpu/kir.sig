@@ -814,15 +814,332 @@ pub fn expand(src: *const Kernel, caps: Caps, s: Storage) Error!Kernel {
     return k;
 }
 
-// (the expansions follow in their own commit; until then they emit the
-// op itself, which the interpreter runs exactly)
-fn exactDiv(k: *Kernel, caps: Caps, dst: V, a: Arg, b: Arg) void {
-    _ = caps;
-    k.set(dst, .fdiv, a, b, no);
+// How the expansions work (docs/GPU.md has the proofs' outline):
+//
+// Fast path, for operands whose exponents are well inside the normal range
+// (|e| <= 48 for fdiv, -60..100 for fsqrt, positive: every remainder and
+// every product of Dekker's stays normal): the core works on the
+// magnitudes directly. Otherwise (one if-block before the core, one after,
+// both skipped when every lane is fast) the operands are reduced to
+// mantissas in [1,2) (fsqrt: [1,4), keeping the exponent's parity), the
+// core runs on those, and the result is put back together with integer
+// ops: the exponent, gradual underflow (rounded from the truncated quotient
+// and a sticky bit), overflow, the special values, then flushing if caps
+// say so.
+//
+// The core: a seed from frcp (frsq), one Newton step, a quotient (root),
+// one correction with its remainder: a faithful result (within an ulp).
+// Then the exact decision: with the remainder of the faithful candidate
+// (exact: the remainder of a faithful quotient is representable), take the
+// truncation c of the true value and add one ulp iff the value lies above
+// c's midpoint. Remainders come from ffma where fused, or from Dekker's
+// two-product with Veltkamp's splitting (4097 = 2^12 + 1) where not. The
+// result does not depend on the seed's accuracy (proven by tests with
+// frcp/frsq off by up to 600 ulps, about 2^-14).
+
+const Ex = struct {
+    k: *Kernel,
+
+    fn iu(x: Ex, op: Op, a: Arg, b: Arg) V {
+        return x.k.op2(op, .u32, a, b);
+    }
+    fn s2(x: Ex, op: Op, a: Arg, b: Arg) V {
+        return x.k.op2(op, .i32, a, b);
+    }
+    fn f2(x: Ex, op: Op, a: Arg, b: Arg) V {
+        return x.k.op2(op, .f32, a, b);
+    }
+    fn f3(x: Ex, op: Op, a: Arg, b: Arg, c: Arg) V {
+        return x.k.op3(op, .f32, a, b, c);
+    }
+    fn f1(x: Ex, op: Op, a: Arg) V {
+        return x.k.op1(op, .f32, a);
+    }
+    fn ucmp(x: Ex, c: Cmp, a: Arg, b: Arg) V {
+        return x.k.cmp(.u32, c, a, b);
+    }
+    fn scmp(x: Ex, c: Cmp, a: Arg, b: Arg) V {
+        return x.k.cmp(.i32, c, a, b);
+    }
+    fn fcmp(x: Ex, c: Cmp, a: Arg, b: Arg) V {
+        return x.k.cmp(.f32, c, a, b);
+    }
+    fn sel(x: Ex, p: V, a: Arg, b: Arg) V {
+        return x.k.sel(.u32, r(p), a, b);
+    }
+    fn p2(x: Ex, op: Op, a: V, b: V) V {
+        return x.k.op2(op, .pred, r(a), r(b));
+    }
+    /// The bits of an f32 (a reinterpreting mov).
+    fn bitsOf(x: Ex, a: Arg) V {
+        return x.k.mov(.u32, a);
+    }
+    fn asF(x: Ex, v: V) V {
+        return x.k.mov(.f32, r(v));
+    }
+    /// 1 where p, else 0.
+    fn one(x: Ex, p: V) V {
+        return x.sel(p, u(1), u(0));
+    }
+
+    /// x = hi + lo, hi with the top 12 bits (Veltkamp).
+    fn split(x: Ex, a: V) [2]V {
+        const c = x.f2(.fmul, r(a), f(4097.0));
+        const hi = x.f2(.fsub, r(c), r(x.f2(.fsub, r(c), r(a))));
+        const lo = x.f2(.fsub, r(a), r(hi));
+        return .{ hi, lo };
+    }
+
+    /// a - b*q: exact when it is representable, else correctly rounded,
+    /// from correctly rounded mul and add only (Dekker's product).
+    fn remainder(x: Ex, a: V, b: V, bs: [2]V, q: V) V {
+        const qs = x.split(q);
+        const p = x.f2(.fmul, r(b), r(q));
+        var e = x.f2(.fsub, r(x.f2(.fmul, r(bs[0]), r(qs[0]))), r(p));
+        e = x.f2(.fadd, r(e), r(x.f2(.fmul, r(bs[0]), r(qs[1]))));
+        e = x.f2(.fadd, r(e), r(x.f2(.fmul, r(bs[1]), r(qs[0]))));
+        e = x.f2(.fadd, r(e), r(x.f2(.fmul, r(bs[1]), r(qs[1]))));
+        return x.f2(.fsub, r(x.f2(.fsub, r(a), r(p))), r(e));
+    }
+
+    /// a - s*s, as remainder.
+    fn sqRemainder(x: Ex, a: V, s: V) V {
+        const ss = x.split(s);
+        const p = x.f2(.fmul, r(s), r(s));
+        const hl = x.f2(.fmul, r(ss[0]), r(ss[1]));
+        var e = x.f2(.fsub, r(x.f2(.fmul, r(ss[0]), r(ss[0]))), r(p));
+        e = x.f2(.fadd, r(e), r(x.f2(.fadd, r(hl), r(hl))));
+        e = x.f2(.fadd, r(e), r(x.f2(.fmul, r(ss[1]), r(ss[1]))));
+        return x.f2(.fsub, r(x.f2(.fsub, r(a), r(p))), r(e));
+    }
+};
+
+/// The core's answer: c, the truncation of the true quotient or root at
+/// c's precision; up, whether the result is c's successor; rc, c's
+/// remainder (0 iff c is exact).
+const Core = struct { cb: V, up: V, rc: V };
+
+/// a/b for positive normal a, b with the quotient and its remainders in
+/// the normal range.
+fn divCore(x: Ex, fused: bool, a: V, b: V) Core {
+    const y0 = x.f1(.frcp, r(b));
+    if (fused) {
+        const nb = x.f1(.fneg, r(b));
+        const e = x.f3(.ffma, r(nb), r(y0), f(1.0));
+        const y1 = x.f3(.ffma, r(e), r(y0), r(y0));
+        const q0 = x.f2(.fmul, r(a), r(y1));
+        const r0 = x.f3(.ffma, r(nb), r(q0), r(a));
+        const q1 = x.f3(.ffma, r(r0), r(y1), r(q0)); // faithful
+        const r1 = x.f3(.ffma, r(nb), r(q1), r(a)); // exact (an exact 0 is +0)
+        // c: q1, or its predecessor when r1 < 0 (r1's sign bit)
+        const cb = x.iu(.isub, r(x.bitsOf(r(q1))), r(x.iu(.shr, r(x.bitsOf(r(r1))), u(31))));
+        const c = x.asF(cb);
+        const hu = x.iu(.isub, r(x.iu(.@"and", r(cb), u(0x7f80_0000))), u(24 << 23));
+        const hc = x.f2(.fmul, r(b), r(x.asF(hu))); // b * ulp(c) / 2, exact
+        const rc = x.f3(.ffma, r(nb), r(c), r(a)); // exact: c is faithful
+        const up = x.fcmp(.gt, r(rc), r(hc));
+        return .{ .cb = cb, .up = up, .rc = rc };
+    }
+    const t = x.f2(.fmul, r(b), r(y0));
+    const e = x.f2(.fsub, f(1.0), r(t));
+    const y1 = x.f2(.fadd, r(y0), r(x.f2(.fmul, r(y0), r(e))));
+    const q0 = x.f2(.fmul, r(a), r(y1));
+    const bs = x.split(b);
+    const r0 = x.remainder(a, b, bs, q0);
+    const q1 = x.f2(.fadd, r(q0), r(x.f2(.fmul, r(r0), r(y1)))); // faithful
+    const r1 = x.remainder(a, b, bs, q1); // exact
+    const neg = x.fcmp(.lt, r(r1), f(0));
+    const cb = x.iu(.isub, r(x.bitsOf(r(q1))), r(x.one(neg)));
+    const hu = x.iu(.isub, r(x.iu(.@"and", r(cb), u(0x7f80_0000))), u(24 << 23));
+    const hc = x.f2(.fmul, r(b), r(x.asF(hu)));
+    // c's remainder: r1, or r1 + b*ulp(c) when c is q1's predecessor (exact)
+    const rp = x.f2(.fadd, r(r1), r(x.f2(.fadd, r(hc), r(hc))));
+    const rc = x.k.sel(.f32, r(neg), r(rp), r(r1));
+    const up = x.fcmp(.gt, r(rc), r(hc));
+    return .{ .cb = cb, .up = up, .rc = rc };
 }
+
+/// sqrt(a) for a positive normal a with the root and its remainders in
+/// the normal range. (rc is unused: a root is never in gradual underflow.)
+fn sqrtCore(x: Ex, fused: bool, a: V) Core {
+    const y = x.f1(.frsq, r(a));
+    const s0 = x.f2(.fmul, r(a), r(y));
+    const h = x.f2(.fmul, r(y), f(0.5));
+    if (fused) {
+        const r0 = x.f3(.ffma, r(x.f1(.fneg, r(s0))), r(s0), r(a));
+        const s1 = x.f3(.ffma, r(r0), r(h), r(s0)); // faithful
+        const r1 = x.f3(.ffma, r(x.f1(.fneg, r(s1))), r(s1), r(a));
+        const cb = x.iu(.isub, r(x.bitsOf(r(s1))), r(x.iu(.shr, r(x.bitsOf(r(r1))), u(31))));
+        const c = x.asF(cb);
+        const rc = x.f3(.ffma, r(x.f1(.fneg, r(c))), r(c), r(a));
+        const ub = x.iu(.isub, r(x.iu(.@"and", r(cb), u(0x7f80_0000))), u(23 << 23));
+        const cu = x.f2(.fmul, r(c), r(x.asF(ub))); // c * ulp(c), exact
+        const up = x.fcmp(.gt, r(rc), r(cu));
+        return .{ .cb = cb, .up = up, .rc = rc };
+    }
+    const r0 = x.sqRemainder(a, s0);
+    const s1 = x.f2(.fadd, r(s0), r(x.f2(.fmul, r(r0), r(h)))); // faithful
+    const r1 = x.sqRemainder(a, s1);
+    // up iff r1 > s1*ulp(s1); down iff r1 <= -s1*ulp(the predecessor)
+    const sb = x.bitsOf(r(s1));
+    const ub = x.iu(.isub, r(x.iu(.@"and", r(sb), u(0x7f80_0000))), u(23 << 23));
+    const db = x.iu(.isub, r(x.iu(.@"and", r(x.iu(.isub, r(sb), u(1))), u(0x7f80_0000))), u(23 << 23));
+    const su = x.f2(.fmul, r(s1), r(x.asF(ub)));
+    const sd = x.f2(.fmul, r(s1), r(x.asF(db)));
+    const up = x.fcmp(.gt, r(r1), r(su));
+    const dn = x.fcmp(.le, r(r1), r(x.f1(.fneg, r(sd))));
+    // (as a Core: c = s1 - dn, up as found)
+    const cb = x.iu(.isub, r(sb), r(x.one(dn)));
+    return .{ .cb = cb, .up = up, .rc = r1 };
+}
+
+const INF: u32 = 0x7f80_0000;
+
+/// One operand of fdiv's slow path: its magnitude's mantissa in [1,2) (as
+/// f32 bits) and biased exponent (denormals normalized; flushed ones are
+/// zeros, which the specials handle).
+fn unpack(x: Ex, flush: bool, mag: V) [2]V {
+    var m = mag;
+    var e: V = undefined;
+    if (flush) {
+        e = x.iu(.shr, r(mag), u(23));
+    } else {
+        const den = x.ucmp(.lt, r(mag), u(0x0080_0000));
+        const scaled = x.bitsOf(r(x.f2(.fmul, r(x.asF(mag)), f(16777216.0))));
+        m = x.sel(den, r(scaled), r(mag));
+        e = x.iu(.isub, r(x.iu(.shr, r(m), u(23))), r(x.sel(den, u(24), u(0))));
+    }
+    const mant = x.iu(.@"or", r(x.iu(.@"and", r(m), u(0x007f_ffff))), u(0x3f80_0000));
+    return .{ mant, e };
+}
+
+fn exactDiv(k: *Kernel, caps: Caps, dst: V, a: Arg, b: Arg) void {
+    const x = Ex{ .k = k };
+    const fused = caps.fused_fma;
+    const flush = caps.denormals == .flush;
+    const ab = x.bitsOf(a);
+    const bb = x.bitsOf(b);
+    const sign = x.iu(.@"and", r(x.iu(.xor, r(ab), r(bb))), u(0x8000_0000));
+    const ax = x.iu(.@"and", r(ab), u(0x7fff_ffff));
+    const bx = x.iu(.@"and", r(bb), u(0x7fff_ffff));
+    // fast: both exponents in [-48, 48] (each magnitude's offset from
+    // 2^-48, unsigned, within the range)
+    const da = x.iu(.isub, r(ax), u(0x2780_0000));
+    const db = x.iu(.isub, r(bx), u(0x2780_0000));
+    const slow = x.ucmp(.gt, r(x.iu(.imax, r(da), r(db))), u(0x307f_ffff));
+    const am = k.reg(.f32);
+    const bm = k.reg(.f32);
+    const de = k.reg(.u32); // the exponents' difference (slow path)
+    k.set(am, .mov, r(ax), no, no);
+    k.set(bm, .mov, r(bx), no, no);
+    k.ifp(r(slow));
+    {
+        const ua = unpack(x, flush, ax);
+        const ub = unpack(x, flush, bx);
+        k.set(am, .mov, r(ua[0]), no, no);
+        k.set(bm, .mov, r(ub[0]), no, no);
+        k.set(de, .isub, r(ua[1]), r(ub[1]), no);
+    }
+    k.endif();
+    const core = divCore(x, fused, am, bm);
+    const res = x.iu(.iadd, r(core.cb), r(x.one(core.up)));
+    const out = k.reg(.u32);
+    k.set(out, .@"or", r(res), r(sign), no);
+    k.ifp(r(slow));
+    {
+        // the result's biased exponent, from c and from the rounded value
+        const fc = x.iu(.iadd, r(x.iu(.shr, r(core.cb), u(23))), r(de));
+        const ff = x.iu(.iadd, r(x.iu(.shr, r(res), u(23))), r(de));
+        const normal = x.iu(.iadd, r(res), r(x.iu(.shl, r(de), u(23))));
+        const ovf = x.scmp(.ge, r(ff), u(255));
+        const sub = x.scmp(.le, r(fc), u(0));
+        // gradual underflow: c's significand shifted right by 1 - fc,
+        // rounded to nearest even with c's sticky bit
+        const sh = x.s2(.imin, r(x.iu(.isub, u(1), r(fc))), u(25));
+        const sig = x.iu(.@"or", r(x.iu(.@"and", r(core.cb), u(0x007f_ffff))), u(0x0080_0000));
+        const qt = x.iu(.shr, r(sig), r(sh));
+        const rem = x.iu(.@"and", r(sig), r(x.iu(.isub, r(x.iu(.shl, u(1), r(sh))), u(1))));
+        const half = x.iu(.shl, u(1), r(x.iu(.isub, r(sh), u(1))));
+        const sticky = x.fcmp(.ne, r(core.rc), f(0));
+        const odd = x.ucmp(.ne, r(x.iu(.@"and", r(qt), u(1))), u(0));
+        const above = x.ucmp(.gt, r(rem), r(half));
+        const tie = x.ucmp(.eq, r(rem), r(half));
+        const rup = x.p2(.por, above, x.p2(.pand, tie, x.p2(.por, sticky, odd)));
+        var mant = x.iu(.iadd, r(qt), r(x.one(rup)));
+        if (flush) mant = x.sel(x.ucmp(.lt, r(mant), u(0x0080_0000)), u(0), r(mant));
+        const v = x.sel(sub, r(mant), r(x.sel(ovf, u(INF), r(normal))));
+        const vs = x.iu(.@"or", r(v), r(sign));
+        // the special values
+        const zmax: u32 = if (flush) 0x0080_0000 else 1;
+        const a_nan = x.ucmp(.gt, r(ax), u(INF));
+        const b_nan = x.ucmp(.gt, r(bx), u(INF));
+        const a_inf = x.ucmp(.eq, r(ax), u(INF));
+        const b_inf = x.ucmp(.eq, r(bx), u(INF));
+        const a_zero = x.ucmp(.lt, r(ax), u(zmax));
+        const b_zero = x.ucmp(.lt, r(bx), u(zmax));
+        const nan = x.p2(.por, x.p2(.por, a_nan, b_nan), x.p2(.por, x.p2(.pand, a_inf, b_inf), x.p2(.pand, a_zero, b_zero)));
+        const to_inf = x.p2(.por, a_inf, b_zero);
+        const to_zero = x.p2(.por, a_zero, b_inf);
+        const sinf = x.iu(.@"or", r(sign), u(INF));
+        const w = x.sel(nan, u(0x7fff_ffff), r(x.sel(to_inf, r(sinf), r(x.sel(to_zero, r(sign), r(vs))))));
+        k.set(out, .mov, r(w), no, no);
+    }
+    k.endif();
+    k.set(dst, .mov, r(out), no, no);
+}
+
 fn exactSqrt(k: *Kernel, caps: Caps, dst: V, a: Arg) void {
-    _ = caps;
-    k.set(dst, .fsqrt, a, no, no);
+    const x = Ex{ .k = k };
+    const fused = caps.fused_fma;
+    const flush = caps.denormals == .flush;
+    const ab = x.bitsOf(a);
+    // fast: positive, exponent in [-60, 100] (Dekker's smallest product,
+    // about a * 2^-46, stays normal)
+    const slow = x.ucmp(.gt, r(x.iu(.isub, r(ab), u(67 << 23))), u((227 << 23 | 0x007f_ffff) - (67 << 23)));
+    const am = k.reg(.f32);
+    const eh = k.reg(.u32); // half the exponent (slow path)
+    k.set(am, .mov, r(ab), no, no);
+    k.ifp(r(slow));
+    {
+        const ax = x.iu(.@"and", r(ab), u(0x7fff_ffff));
+        var m = ax;
+        var be: V = undefined;
+        if (flush) {
+            be = x.iu(.shr, r(ax), u(23));
+        } else {
+            const den = x.ucmp(.lt, r(ax), u(0x0080_0000));
+            const scaled = x.bitsOf(r(x.f2(.fmul, r(x.asF(ax)), f(16777216.0))));
+            m = x.sel(den, r(scaled), r(ax));
+            be = x.iu(.isub, r(x.iu(.shr, r(m), u(23))), r(x.sel(den, u(24), u(0))));
+        }
+        // a = mant * 2^e, e even: mant in [1,4)
+        const e = x.iu(.isub, r(be), u(127));
+        const odd = x.ucmp(.ne, r(x.iu(.@"and", r(e), u(1))), u(0));
+        const top = x.sel(odd, u(0x4000_0000), u(0x3f80_0000));
+        const mant = x.iu(.@"or", r(x.iu(.@"and", r(m), u(0x007f_ffff))), r(top));
+        k.set(am, .mov, r(mant), no, no);
+        // (an arithmetic shift: e may be below zero)
+        k.emit(.{ .op = .shr, .ty = .i32, .dst = eh, .a = r(x.iu(.isub, r(e), r(x.one(odd)))), .b = u(1), .c = no, .aux = 0 });
+    }
+    k.endif();
+    const core = sqrtCore(x, fused, am);
+    const res = x.iu(.iadd, r(core.cb), r(x.one(core.up)));
+    const out = k.reg(.u32);
+    k.set(out, .mov, r(res), no, no);
+    k.ifp(r(slow));
+    {
+        const v = x.iu(.iadd, r(res), r(x.iu(.shl, r(eh), u(23))));
+        const ax = x.iu(.@"and", r(ab), u(0x7fff_ffff));
+        const zmax: u32 = if (flush) 0x0080_0000 else 1;
+        const zero = x.ucmp(.lt, r(ax), u(zmax));
+        const nan = x.ucmp(.gt, r(ab), u(INF)); // NaN, or below zero
+        const pinf = x.ucmp(.eq, r(ab), u(INF));
+        const sign = x.iu(.@"and", r(ab), u(0x8000_0000));
+        const w = x.sel(zero, r(sign), r(x.sel(nan, u(0x7fff_ffff), r(x.sel(pinf, u(INF), r(v))))));
+        k.set(out, .mov, r(w), no, no);
+    }
+    k.endif();
+    k.set(dst, .mov, r(out), no, no);
 }
 
 test "kir: build, verify, encode" {
