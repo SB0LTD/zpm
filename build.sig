@@ -1101,6 +1101,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_gpu, "test-gpu-module", "src/gpu/gpu.sig", &.{
         importEntry("adreno", "src/adreno/adreno.sig"),
     });
+    _ = try addTest(ctx, test_gpu, "test-gpu-ops", "tests/test_gpu_ops.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
     _ = try addTest(ctx, test_gpu, "test-gpu-flow", "tests/test_gpu_flow.sig", &.{
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
@@ -1114,6 +1118,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("adreno", "src/adreno/adreno.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
         importEntry("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig"),
+    });
+    _ = try addTest(ctx, test_gpu, "test-gpu-exact", "tests/test_gpu_exact.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gpu, "test-gpu-emu", "tests/test_gpu_emu.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
     });
     // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
     _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{
