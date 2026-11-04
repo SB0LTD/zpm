@@ -1005,6 +1005,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => return builtins.Builtins(config, @This()).call(ctx, n),
                     .overlaps, .overlaps_tz => return builtins.Builtins(config, @This()).call(ctx, n),
                     .to_date, .to_number, .to_timestamp => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .normalize, .is_normalized => return builtins.Builtins(config, @This()).call(ctx, n),
                     .aggregate_pair => {
                         // Both inputs are evaluated; NULL skips the row (strict).
                         const y = try eval(ctx, n.b);

@@ -794,6 +794,8 @@ pub fn Binder(comptime config: types.Config) type {
                 // Formatting input functions (B11).
                 .{ .name = "to_date", .func = .to_date },           .{ .name = "to_number", .func = .to_number },
                 .{ .name = "to_timestamp", .func = .to_timestamp },
+                // Unicode normalization (B11); NORMALIZE(...) is also SQL syntax.
+                .{ .name = "normalize", .func = .normalize },       .{ .name = "is_normalized", .func = .is_normalized },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -1353,6 +1355,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
                 .overlaps, .overlaps_tz => try typeOverlaps(context, n, count),
                 .aggregate_pair => unreachable,
+                .normalize, .is_normalized => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.text} else &[_]ast.Type{ .text, .text }, if (n.func == .normalize) .text else .boolean, true),
                 .to_date => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .date, true),
                 .to_number => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .numeric, true),
                 // to_timestamp(text, text) or to_timestamp(double precision).
@@ -2721,7 +2724,8 @@ pub fn Binder(comptime config: types.Config) type {
                             break :blk .{ .name = if (n.func == .regclass_in) "regclass" else "regtype", .strength = 1 };
                         },
                         // TRIM(...) calls btrim/ltrim/rtrim, named after them.
-                        .btrim, .ltrim, .rtrim => break :blk .{ .name = @tagName(n.func), .strength = 2 },
+                        // IS [form] NORMALIZED calls is_normalized.
+                        .btrim, .ltrim, .rtrim, .is_normalized => break :blk .{ .name = @tagName(n.func), .strength = 2 },
                         else => {},
                     }
                     buffer.* = toName(context, n.name);

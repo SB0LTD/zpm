@@ -55,7 +55,9 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // Internal: the (Y, X) input of a two-argument aggregate, NULL when either is.
     aggregate_pair,
     // Formatting input functions (B11, functions_format.sig); STABLE.
-    to_date, to_number, to_timestamp };
+    to_date, to_number, to_timestamp,
+    // Unicode normalization (B11, functions_unicode.sig).
+    normalize, is_normalized };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
@@ -86,7 +88,7 @@ pub fn immutableBuiltin(func: Func) bool {
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
         .extract, .date_part, .date_trunc, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
-        .overlaps, .aggregate_pair => true,
+        .overlaps, .aggregate_pair, .normalize, .is_normalized => true,
         else => false,
     };
 }
@@ -103,7 +105,7 @@ pub fn strictFunction(func: Func) bool {
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
         .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
-        .to_date, .to_number, .to_timestamp, .aggregate_pair => true,
+        .to_date, .to_number, .to_timestamp, .aggregate_pair, .normalize, .is_normalized => true,
         else => false,
     };
 }

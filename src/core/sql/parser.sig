@@ -1403,6 +1403,10 @@ pub fn Parser(comptime config: types.Config) type {
                     left = try self.pool.add(.{ .kind = .binary, .op = if (negated) .is_not_distinct else .is_distinct, .a = left, .b = right });
                     continue;
                 }
+                if (self.mode == .standard and (self.rawWord("normalized") or self.rawWord("nfc") or self.rawWord("nfd") or self.rawWord("nfkc") or self.rawWord("nfkd"))) {
+                    left = try self.normalizedTail(left, negated);
+                    continue;
+                }
                 const kind: ast.Test = if (try self.takeWord("NULL"))
                     (if (negated) .is_not_null else .is_null)
                 else if (try self.takeWord("TRUE"))
@@ -1791,6 +1795,27 @@ pub fn Parser(comptime config: types.Config) type {
             try self.expectWord("FOLLOWING");return .{.kind=.following,.offset=offset};
         }
 
+        /// unicode_normal_form: NFC, NFD, NFKC or NFKD as a text literal.
+        fn normalForm(self: *Self) Error!u16 {
+            const token = self.current;
+            if (!(self.rawWord("nfc") or self.rawWord("nfd") or self.rawWord("nfkc") or self.rawWord("nfkd"))) return error.Syntax;
+            try self.advance();
+            return self.pool.add(.{ .kind = .text_literal, .text = .{ .start = token.start, .end = token.end, .len = token.len } });
+        }
+
+        /// `x IS [NOT] [form] NORMALIZED` (is_normalized), after IS [NOT].
+        fn normalizedTail(self: *Self, left: u16, negated: bool) Error!u16 {
+            var list: ArgList = .{};
+            list.push(self.pool, left);
+            if (!self.rawWord("normalized")) list.push(self.pool, try self.normalForm());
+            const token = self.current;
+            if (!self.rawWord("normalized")) return error.Syntax;
+            try self.advance();
+            const name: ast.Ident = .{ .span = .{ .start = token.start, .len = token.len }, .len = token.len };
+            const call = try self.callNode(name, .is_normalized, list);
+            return if (negated) try self.pool.add(.{ .kind = .not_op, .a = call }) else call;
+        }
+
         /// `row OVERLAPS row` (gram.y): both rows need exactly two members
         /// (42601); the call is overlaps(a, b, c, d).
         fn overlapsTail(self: *Self, left: u16) Error!u16 {
@@ -1868,8 +1893,8 @@ pub fn Parser(comptime config: types.Config) type {
                 try self.advance();
                 return try self.functionCall(name);
             }
-            const Form = enum { trim, substring, position, overlay, extract };
-            const form: Form = if (wordIs(self.source, token, "trim")) .trim else if (wordIs(self.source, token, "substring")) .substring else if (wordIs(self.source, token, "position")) .position else if (wordIs(self.source, token, "overlay")) .overlay else if (wordIs(self.source, token, "extract")) .extract else return null;
+            const Form = enum { trim, substring, position, overlay, extract, normalize };
+            const form: Form = if (wordIs(self.source, token, "trim")) .trim else if (wordIs(self.source, token, "substring")) .substring else if (wordIs(self.source, token, "position")) .position else if (wordIs(self.source, token, "overlay")) .overlay else if (wordIs(self.source, token, "extract")) .extract else if (wordIs(self.source, token, "normalize")) .normalize else return null;
             try self.advance();
             try self.advance();
             try self.enter();
@@ -1937,6 +1962,11 @@ pub fn Parser(comptime config: types.Config) type {
                     list.push(self.pool, try self.pool.add(.{ .kind = .text_literal, .text = literal }));
                     try self.expectWord("FROM");
                     list.push(self.pool, try self.expression());
+                },
+                .normalize => if (!self.isSymbol(.rparen)) {
+                    // NORMALIZE(a [, NFC|NFD|NFKC|NFKD]): the form is a keyword.
+                    list.push(self.pool, try self.expression());
+                    if (try self.takeSymbol(.comma)) list.push(self.pool, try self.normalForm());
                 },
                 .overlay => if (!self.isSymbol(.rparen)) {
                     list.push(self.pool, try self.expression());

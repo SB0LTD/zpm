@@ -15,6 +15,7 @@ const float_text = @import("float_text.sig");
 const temporal = @import("temporal.sig");
 const times = @import("functions_temporal.sig");
 const formats = @import("functions_format.sig");
+const unicode = @import("functions_unicode.sig");
 const std = @import("std");
 const Error = types.Error;
 const none = ast.none;
@@ -105,6 +106,20 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
                 .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours,
                 .justify_interval, .make_date, .make_timestamp, .isfinite => return temporalValue(ctx, n, &cells, count),
                 .to_date, .to_number, .to_timestamp => return formatValue(ctx, n, &cells, count),
+                .normalize, .is_normalized => {
+                    const form = if (count == 2) unicode.formOf(textOf(&cells[1])) orelse return error.InvalidParameterValue else .nfc;
+                    const input = textOf(&cells[0]);
+                    if (n.func == .normalize) {
+                        result.len = try unicode.normalize(input, form, &result.bytes, control);
+                        return .{ .text = result };
+                    }
+                    // A form longer than the buffer cannot equal the input.
+                    const length = unicode.normalize(input, form, &result.bytes, control) catch |err| {
+                        if (err == error.TextCapacity) return .{ .boolean = false };
+                        return err;
+                    };
+                    return .{ .boolean = length == input.len and types.same(result.bytes[0..length], input) };
+                },
                 else => unreachable,
             }
             result.len = out.len;

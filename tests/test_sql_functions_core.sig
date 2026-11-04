@@ -831,6 +831,44 @@ fn intervalAggregates() void {
     report("agg-interval",before);
 }
 
+// ---- PG.TEXT.ENCODING --------------------------------------------------------
+
+fn encoding() void {
+    const before=begin("encoding");
+    // Oracle fixture (PG.TEXT.ENCODING).
+    shaped("SELECT char_length('\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d'),octet_length('\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d'),normalize('a',NFC)",
+        &.{.{.name="char_length",.oid=23},.{.name="octet_length",.oid=23},.{.name="normalize",.oid=25}},&.{"4","8","a"});
+    // Unicode 16.0 normalization (UAX #15).
+    value("SELECT normalize('a')",25,"a");
+    value("SELECT normalize(U&'\\0065\\0301',NFC)",25,"\xc3\xa9");
+    value("SELECT normalize(U&'\\00E9',NFD)",25,"e\xcc\x81");
+    value("SELECT normalize(U&'\\FB01',NFKC)",25,"fi");
+    value("SELECT normalize(U&'\\2460',NFKD)",25,"1");
+    value("SELECT normalize(U&'\\1100\\1161\\11A8',NFC)",25,"\xea\xb0\x81");
+    value("SELECT normalize(U&'\\AC01',NFD)",25,"\xe1\x84\x80\xe1\x85\xa1\xe1\x86\xa8");
+    value("SELECT normalize(U&'\\0065\\0323\\0302',NFC)",25,"\xe1\xbb\x87");
+    value("SELECT normalize(U&'\\0065\\0302\\0323',NFC)",25,"\xe1\xbb\x87");
+    value("SELECT normalize(U&'\\1EC7',NFD)",25,"e\xcc\xa3\xcc\x82");
+    value("SELECT normalize(U&'\\212B',NFC)",25,"\xc3\x85");
+    value("SELECT normalize(U&'\\212B',NFD)",25,"A\xcc\x8a");
+    value("SELECT normalize(U&'\\0061\\0301\\0301',NFC)",25,"\xc3\xa1\xcc\x81");
+    value("SELECT length(normalize(U&'\\FDFA',NFKC))",23,"18");
+    value("SELECT \"normalize\"('A\xcc\x8a','nfc')",25,"\xc3\x85");
+    value("SELECT normalize(NULL,NFC)",25,null);
+    shaped("SELECT U&'\\00E9' IS NFC NORMALIZED,U&'\\0065\\0301' IS NFC NORMALIZED,U&'\\0065\\0301' IS NFD NORMALIZED,'a' IS NOT NORMALIZED",
+        &.{.{.name="is_normalized",.oid=16},.{.name="is_normalized",.oid=16},.{.name="is_normalized",.oid=16},.{.name="?column?",.oid=16}},&.{"t","f","t","f"});
+    value("SELECT NULL::text IS NORMALIZED",16,null);
+    value("SELECT octet_length(U&'\\+01F600')",23,"4");
+    value("SELECT char_length(U&'\\+01F600x')",23,"2");
+    // Errors.
+    rejects("SELECT normalize('a',XYZ)",error.Syntax);
+    rejects("SELECT normalize('a','NFC')",error.Syntax);
+    rejects("SELECT \"normalize\"('a','xyz')",error.InvalidParameterValue);
+    rejects("SELECT normalize(1)",error.UndefinedFunction);
+    rejects("SELECT 'a' IS NFQ NORMALIZED",error.Syntax);
+    report("encoding",before);
+}
+
 pub fn main(init:std.process.Init) !void {
     literals();
     strings();
@@ -842,6 +880,7 @@ pub fn main(init:std.process.Init) !void {
     statistical();
     bitAggregates();
     intervalAggregates();
+    encoding();
     var buffer:[160]u8=undefined;
     const line=try std.fmt.bufPrint(&buffer,"{{\"suite\":\"sql-functions-core\",\"pass\":{s},\"assertions\":{d},\"failures\":{d}}}\n",.{if(failures==0) "true" else "false",assertions,failures});
     try std.Io.File.stdout().writeStreamingAll(init.io,line);
