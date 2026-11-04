@@ -33,6 +33,16 @@ pub const Result = struct {
     /// The "edges" measurement: what the GPU does where KIR's definition
     /// is exact and the ISA documents nothing (bits set: differs from KIR).
     edges: Edges = .{},
+    /// What `mul.u24 r, r48.y, c0.z` (a shared register and a const, both
+    /// through the uniform port, which ir3 forbids) gives: the true product
+    /// y * c (`separate`), the const twice, c * c (`const_twice`: the
+    /// Surface's fault), something else, or not run (a device that refuses
+    /// the instruction, as the strict emulator does).
+    uniform_port: enum { unmeasured, refused, separate, const_twice, other } = .unmeasured,
+    /// f32 denormals through add.f, mul.f and mad.f32 (a denormal input),
+    /// and a product that underflows to a denormal: kept, flushed to zero,
+    /// or a mix (per op in the log line).
+    denormals: enum { unmeasured, preserve, flush, mixed } = .unmeasured,
 };
 
 pub const Edges = packed struct(u8) {
@@ -67,6 +77,9 @@ const Ctx = struct {
     ts: Buffer,
     res: *Result,
     timeout_us: u64,
+    /// A measurement that may not run (the device refuses its code): a
+    /// failure is reported, not counted.
+    measuring: bool = false,
 
     fn say(c: *Ctx, comptime fmt: []const u8, args: anytype) void {
         const s = std.fmt.bufPrint(&c.w.line, fmt, args) catch return;
@@ -79,9 +92,13 @@ const Ctx = struct {
     }
 
     fn fail(c: *Ctx, name: []const u8, comptime fmt: []const u8, args: anytype) void {
-        c.res.failed += 1;
         var tmp: [160]u8 = undefined;
         const why = std.fmt.bufPrint(&tmp, fmt, args) catch "?";
+        if (c.measuring) {
+            c.say("compute {s}: not run ({s})", .{ name, why });
+            return;
+        }
+        c.res.failed += 1;
         c.say("compute {s}: FAILED: {s}", .{ name, why });
     }
 
@@ -167,6 +184,8 @@ pub fn runAll(dev: Device, w: *Work, log: Log, bandwidth: bool) Result {
     testFloat(&c);
     testUnaligned(&c);
     testEdges(&c);
+    testUniformPort(&c);
+    testDenormals(&c);
     if (bandwidth) testBandwidth(&c);
     testAlu(&c);
     c.say("compute self-test: {d} passed, {d} failed", .{ res.passed, res.failed });
@@ -573,6 +592,101 @@ fn testEdges(c: *Ctx) void {
     c.pass(name, 64);
 }
 
+/// Not pass/fail: the uniform port. ir3 reads at most one cat2 source from
+/// the const/shared file; galaxy-think's first forward faulted 16 MiB past
+/// a buffer where a kernel did `mul.u24 r, r48.y, c3.x` and got c * c. Here
+/// on a 2D grid (so r48.y differs per row): y * c0.z, c0.z * c0.z, other.
+fn testUniformPort(c: *Ctx) void {
+    const name = "uniform port (mul.u24 of a shared register and a const)";
+    const o = addr(c.out);
+    @memset(c.out.cpu[0 .. 4 * 64 * 4], 0);
+    c.dev.toDevice(c.out, 0, 4 * 64 * 4);
+    const k: u32 = 2048;
+    c.measuring = true;
+    const ran = c.launch(name,
+        \\@localsize 64, 1, 1
+        \\@invocationid(r0.x)
+        \\@wgid(r48.x)
+        \\@consts 2
+        \\; (r48.y, a shared register, and c0.z, a const: both through the
+        \\; uniform port, which ir3 does not allow; the GPU's reading is measured)
+        \\mul.u24 r1.x, r48.y, c0.z
+        \\shl.b r2.x, r48.y, 6
+        \\add.u r2.x, r2.x, r0.x
+        \\shl.b r2.x, r2.x, 2
+        \\stg.a.u32 g[c1.x+r2.x+0], r1.x, 1
+        \\end
+    , &.{ 0, 0, k, 0, o[0], o[1], 0, 0 }, .{ 1, 4, 1 });
+    c.measuring = false;
+    if (!ran) {
+        c.res.uniform_port = .refused;
+        return;
+    }
+    const got = c.outU32();
+    var separate: u32 = 0;
+    var twice: u32 = 0;
+    for (0..4) |y| for (0..64) |f| {
+        const g = got[y * 64 + f];
+        if (g == @as(u32, @intCast(y)) * k) separate += 1;
+        if (g == k * k) twice += 1;
+    };
+    // (row 0: y * c = 0; c * c tells only from rows 1..3)
+    c.res.uniform_port = if (separate == 256) .separate else if (twice >= 192) .const_twice else .other;
+    c.say("compute uniform port: mul.u24 r, r48.y, c0.z gave y*c on {d}/256 fibers, c*c on {d}: {s}", .{ separate, twice, @tagName(c.res.uniform_port) });
+    c.pass(name, 256);
+}
+
+/// Not pass/fail: f32 denormals. A denormal input through add.f, mul.f and
+/// mad.f32, and a product of normals that underflows: kept or flushed
+/// (Caps.denormals: the x1_45 caps assume preserve until this says).
+fn testDenormals(c: *Ctx) void {
+    const name = "f32 denormals (add, mul, mad inputs; an underflowing product)";
+    const o = addr(c.out);
+    if (!c.launch(name,
+        \\@localsize 64, 1, 1
+        \\@invocationid(r0.x)
+        \\@consts 2
+        \\; d = 5 x 2^-149 (a denormal), one = 1.0, zero = 0.0
+        \\mov.u32u32 r1.x, 0x5
+        \\mov.u32u32 r1.y, 0x3f800000
+        \\mov.u32u32 r1.z, 0
+        \\; 2^-100 and 2^-30: their product 2^-130 is a denormal result
+        \\mov.u32u32 r1.w, 0x0d800000
+        \\mov.u32u32 r2.x, 0x30800000
+        \\add.f r3.x, r1.x, r1.z
+        \\mul.f r3.y, r1.x, r1.y
+        \\mad.f32 r3.z, r1.x, r1.y, r1.z
+        \\mul.f r3.w, r1.w, r2.x
+        \\shl.b r4.x, r0.x, 4
+        \\stg.a.u32 g[c0.x+r4.x+0], r3.x, 4
+        \\end
+    , &.{ o[0], o[1], 0, 0, 0, 0, 0, 0 }, .{ 1, 1, 1 })) return;
+    const got = c.outU32();
+    const want = [4]u32{ 0x5, 0x5, 0x5, 0x00080000 }; // (2^-130 = 2^19 x 2^-149)
+    var kept: u32 = 0;
+    var flushed: u32 = 0;
+    var per: [4]u8 = .{ '?', '?', '?', '?' };
+    for (0..4) |i| {
+        var k_all = true;
+        var f_all = true;
+        for (0..64) |f| {
+            const g = got[f * 4 + i];
+            if (g != want[i]) k_all = false;
+            if (g != 0) f_all = false;
+        }
+        if (k_all) {
+            kept += 1;
+            per[i] = 'k';
+        } else if (f_all) {
+            flushed += 1;
+            per[i] = 'f';
+        }
+    }
+    c.res.denormals = if (kept == 4) .preserve else if (flushed == 4) .flush else .mixed;
+    c.say("compute denormals: add {c}, mul {c}, mad {c}, underflow {c} (k kept, f flushed): {s}", .{ per[0], per[1], per[2], per[3], @tagName(c.res.denormals) });
+    c.pass(name, 4 * 64);
+}
+
 fn testUnaligned(c: *Ctx) void {
     const name = "unaligned global loads";
     const bytes = c.data.cpu[0..4096];
@@ -735,4 +849,16 @@ test "the bring-up tests pass on the emulated device" {
     try std.testing.expect(r.passed >= 9);
     // the emulator models KIR's edges (min/max, cov, shfl): none differ
     try std.testing.expectEqual(Edges{ .unmeasured = false }, r.edges);
+    // the strict emulator refuses the uniform-port instruction (not a
+    // failure); its floats keep denormals
+    try std.testing.expectEqual(.refused, r.uniform_port);
+    try std.testing.expectEqual(.preserve, r.denormals);
+    // Not checking operands, it runs: as written (both sources read), and
+    // with the emulator's model of the Surface's reading, the const twice.
+    S.dev = .{ .arena = &S.arena, .gpu_view = &S.gpu_view, .check_operands = false };
+    try std.testing.expectEqual(.separate, runAll(S.dev.device(), &S.work, S.log, false).uniform_port);
+    S.dev = .{ .arena = &S.arena, .gpu_view = &S.gpu_view, .check_operands = false, .uniform_port_quirk = true };
+    const q = runAll(S.dev.device(), &S.work, S.log, false);
+    try std.testing.expectEqual(.const_twice, q.uniform_port);
+    try std.testing.expectEqual(@as(u32, 0), q.failed);
 }

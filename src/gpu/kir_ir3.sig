@@ -50,8 +50,10 @@ pub const MAX_CACHED = 128;
 pub const TEXT_BYTES = 768 * 1024;
 /// Units of the register file: half registers (full rN.c = units 2(4N+c), +1).
 const UNITS = 384;
-/// Half registers live in the first 256 units (hr0.x..hr63.w).
-const HALF_UNITS = 256;
+/// Half registers live in the first 192 units (hr0.x..hr47.w): in the
+/// merged file they alias r0..r23 only, and hr48 and up are not the fiber's
+/// (adreno.device.checkInstr's footprint rule).
+const HALF_UNITS = 192;
 
 pub const Error = kir.Error || ir3_asm.Error || error{ Unsupported, TooComplex, OutOfMemory };
 
@@ -344,6 +346,8 @@ pub const Work = struct {
     stats: Stats = .{},
     diag: [256]u8 = undefined,
     diag_len: usize = 0,
+    /// The live registers past which the scheduler favours freeing them.
+    sched_pressure: i32 = SCHED_PRESSURE,
 };
 
 pub const Stats = struct {
@@ -385,13 +389,26 @@ pub fn compileWith(k: *const kir.Kernel, caps: device.Caps, w: *Work, out: []u8)
     w.bindings = k.bindings;
     w.param_words = k.param_words;
     w.shared_bytes = k.shared_bytes;
-    try expand(w, k);
-    try analyze(w);
-    try lower(w);
-    schedule(w);
-    try allocate(w);
-    try emitText(w);
-    return assembleOut(w, k, out);
+    // All of a group's waves must be resident at once: a footprint that
+    // keeps fewer cannot launch (ir3_emu.maxWaves, Mesa's a7xx formula).
+    // Tighter scheduling first; then the group is too big for the kernel.
+    const threads = k.group[0] * k.group[1] * k.group[2];
+    var last: device.Binary = undefined;
+    for ([_]i32{ SCHED_PRESSURE, 16, 0 }) |pressure| {
+        w.sched_pressure = pressure;
+        try expand(w, k);
+        try analyze(w);
+        try lower(w);
+        schedule(w);
+        try allocate(w);
+        try emitText(w);
+        last = try assembleOut(w, k, out);
+        const cfg = Config.fromExtra(last.extra).?;
+        if (adreno.ir3_emu.groupFits(w.gen, cfg.full_regs, w.threadsize, threads)) return last;
+    }
+    const cfg = Config.fromExtra(last.extra).?;
+    note(w, "a group of {d} threads needs {d} waves of {d} resident; {d} vec4 registers keep {d} (a7xx): use smaller groups", .{ threads, (threads + w.threadsize - 1) / w.threadsize, w.threadsize, cfg.full_regs, adreno.ir3_emu.maxWaves(w.gen, cfg.full_regs, w.threadsize) });
+    return error.TooManyRegs;
 }
 
 /// Why the last compile failed, when the backend knows more than the
@@ -994,9 +1011,12 @@ const Slot = enum {
     c6imm,
 };
 
+/// An immediate a cat2/cat4 source takes: Mesa's ir3_valid_immediate allows
+/// 10 bits sign-extended (the field is 11 wide, but not all of it is the
+/// value), so -511..511.
 fn fitsImm11(x: u32) bool {
     const v: i32 = @bitCast(x);
-    return v >= -1024 and v <= 1023;
+    return v >= -511 and v <= 511;
 }
 
 /// The float table entries the hardware's table certainly holds exactly.
@@ -1293,6 +1313,8 @@ fn lower(w: *Work) Error!void {
         try lowerOne(w, i);
     }
     if (w.n_ctl != 0) return error.Unbalanced;
+    // ir3's operand rules (what adreno.device.checkInstr checks).
+    try legalizeOperands(w);
     // The end: every ret comes here.
     try putLabel(w, w.ret_label);
     var e = MI{};
@@ -1757,6 +1779,127 @@ fn lowerBfe(l: *Lw) Error!void {
     try alu2(w, .ashr_b, r0, false, Opnd.reg(y, false), Opnd.reg(s2, false));
     try cmp2(w, .cmps_u, .eq, z, Opnd.reg(width, false), Opnd.imm(0));
     try alu3(w, .sel_b32, d, false, try fit(w, Opnd.imm(0), .c3, false, l.loop), Opnd.reg(z, false), Opnd.reg(r0, false));
+}
+
+// ── ir3's operand rules ─────────────────────────────────────────────────────
+//
+// Mesa's ir3_valid_flags (read as documentation), as adreno.device's
+// checker enforces them:
+// - cat2: at most one source from the const/shared ("uniform") file (the
+//   hardware hands one's value to both: the Surface's 16 MiB fault), and
+//   not two immediates;
+// - cat3: the second source a per-fiber register; immediates only in the
+//   shift-and-mask forms' first and third; no plain const in those forms or
+//   the dot products;
+// - cat4 (SFU): a per-fiber register source (no const, immediate, shared);
+// - cat6: addresses, offsets, stored values and shuffled values in
+//   per-fiber registers, a shuffle's lane not a const.
+// What breaks one goes through a register, copied once at the start (every
+// such operand is a constant, an immediate or a shared register: the same
+// for the whole kernel).
+
+fn srcUniform(m: *const MI, i: usize) bool {
+    const s = m.in.src[i];
+    if (s.kind == .cnst or s.kind == .rel_cnst) return true;
+    return s.kind == .gpr and !s.half and m.src[i] != NONE and isPhys(m.src[i]) and
+        (m.src[i] & ~PHYS) >= ir3.SHARED_BASE and (m.src[i] & ~PHYS) < ir3.A0_X;
+}
+
+fn srcImm(m: *const MI, i: usize) bool {
+    return m.in.src[i].kind == .imm or m.in.src[i].kind == .flut;
+}
+
+/// An ordinary per-fiber register (not shared, not a const or immediate).
+fn srcPlain(m: *const MI, i: usize) bool {
+    const s = m.in.src[i];
+    if (s.kind != .gpr) return false;
+    if (m.src[i] == NONE) return false;
+    if (!isPhys(m.src[i])) return true;
+    return (m.src[i] & ~PHYS) < ir3.SHARED_BASE;
+}
+
+/// The value of float-table entry `idx` as bits (the entries flutIndex uses).
+fn flutBits(idx: u32, half: bool) u32 {
+    const f32s = [_]u32{ 0x00000000, 0x3f000000, 0x3f800000, 0x40000000, 0, 0, 0, 0, 0, 0, 0, 0x40800000 };
+    const f16s = [_]u32{ 0x0000, 0x3800, 0x3c00, 0x4000, 0, 0, 0, 0, 0, 0, 0, 0x4400 };
+    if (idx >= f32s.len) return 0;
+    return if (half) f16s[idx] else f32s[idx];
+}
+
+/// Put source `i` of `m` in a register (a copy made at the start).
+fn srcToReg(w: *Work, m: *MI, i: usize) Error!void {
+    const s = m.in.src[i];
+    var o = Opnd{ .half = s.half, .neg = s.neg, .abs = s.abs, .bnot = s.bnot };
+    switch (s.kind) {
+        .gpr => {
+            o.k = .vreg;
+            o.v = m.src[i];
+        },
+        .cnst => {
+            o.k = .cnst;
+            o.x = s.num;
+        },
+        .imm => {
+            o.k = .imm;
+            o.x = s.imm;
+        },
+        .flut => {
+            o.k = .imm;
+            o.x = flutBits(s.imm, s.half);
+        },
+        else => return error.BadOperand,
+    }
+    const reg = try materialize(w, o, true);
+    setSrc(m, i, reg);
+    m.in.src[i].half = s.half;
+}
+
+fn legalizeOperands(w: *Work) Error!void {
+    for (w.mi[0..w.n_mi]) |*m| {
+        if (m.kind != .op and m.kind != .copy) continue;
+        switch (m.in.op.category()) {
+            2 => {
+                // (an integer immediate past -511..511 is not encodable)
+                for ([_]usize{ 0, 1 }) |i| {
+                    if (m.in.src[i].kind == .imm and !fitsImm11(m.in.src[i].imm)) try srcToReg(w, m, i);
+                }
+                if (m.in.src[1].kind == .none) continue;
+                if ((srcUniform(m, 0) and srcUniform(m, 1)) or (srcImm(m, 0) and srcImm(m, 1))) try srcToReg(w, m, 1);
+            },
+            3 => {
+                const alt = switch (m.in.op) {
+                    .shrm, .shlm, .shrg, .shlg, .andg => true,
+                    else => false,
+                };
+                const dot = m.in.op == .dp4acc or m.in.op == .dp2acc;
+                if (!srcPlain(m, 1)) try srcToReg(w, m, 1);
+                for ([_]usize{ 0, 2 }) |i| {
+                    const s = m.in.src[i];
+                    if (s.kind == .none) continue;
+                    if (s.kind == .cnst and (alt or dot)) try srcToReg(w, m, i) else if (srcImm(m, i) and !alt) try srcToReg(w, m, i);
+                }
+            },
+            4 => if (!srcPlain(m, 0)) try srcToReg(w, m, 0),
+            // (the shift-and-mask forms' immediates are 12 bits, unsigned:
+            // fit keeps them so; the others take none, handled above)
+            6 => switch (m.in.op) {
+                .ldg_a, .stg_a => {
+                    if (!srcPlain(m, 1)) try srcToReg(w, m, 1);
+                    if (m.in.op == .stg_a and !srcPlain(m, 2)) try srcToReg(w, m, 2);
+                },
+                .ldl, .stl => {
+                    if (!srcPlain(m, 0)) try srcToReg(w, m, 0);
+                    if (m.in.op == .stl and !srcPlain(m, 1)) try srcToReg(w, m, 1);
+                },
+                .shfl => {
+                    if (!srcPlain(m, 0)) try srcToReg(w, m, 0);
+                    if (m.in.src[1].kind == .cnst or m.in.src[1].kind == .rel_cnst) try srcToReg(w, m, 1);
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
 }
 
 fn lowerDot4(l: *Lw) Error!void {
@@ -2632,7 +2775,7 @@ fn scheduleBlock(w: *Work, start: u32, end: u32) void {
         var pick: ?u32 = null;
         var pick_ready: u32 = std.math.maxInt(u32);
         var pick_delta: i32 = 0;
-        const tight = pressure >= SCHED_PRESSURE;
+        const tight = pressure >= w.sched_pressure;
         var k: u32 = 0;
         while (k < n) : (k += 1) {
             if (w.sched_done[k] or w.sched_npred[k] != 0) continue;
