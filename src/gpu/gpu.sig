@@ -47,13 +47,27 @@ pub const Fence = device.Fence;
 pub const Device = device.Device;
 pub const Work = device.Work;
 pub const compile = device.compile;
+/// compile with only the listed targets' backends linked (kernel images).
+pub const compileFor = device.compileFor;
+pub const all_targets = device.all_targets;
 pub const interp_caps = device.interp_caps;
 
 pub const EmuDevice = emu_device.EmuDevice;
+
+// The Adreno: KIR to ir3, and the Adreno (or its emulator) as a Device.
+pub const kir_ir3 = @import("kir_ir3.sig");
+pub const adreno_device = @import("adreno_device.sig");
+
+/// The self-test: KIR on a real Device against the interpreter, case by
+/// case, logged line by line (the first boot on a GPU names any op it gets
+/// wrong).
+pub const selftest = @import("selftest.sig");
 
 test {
     _ = kir;
     _ = device;
     _ = interp;
     _ = emu_device;
+    _ = kir_ir3;
+    _ = adreno_device;
 }

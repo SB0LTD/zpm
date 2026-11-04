@@ -41,7 +41,33 @@ pub const Error = error{
     Divergence,
     Timeout,
     BadDispatch,
+    /// The group needs more waves resident at once than the kernel's
+    /// register footprint lets the GPU keep (maxWaves): it would not launch.
+    TooManyWaves,
 } || ir3.Error;
+
+/// The waves of `threadsize` fibers an SP keeps resident with a footprint
+/// of `full_regs` vec4 registers: Mesa's ir3_get_reg_dependent_max_waves,
+/// reg_size_vec4 / (registers x (2 for 128-fiber waves)) x wave_granularity,
+/// with the a7xx values of the X1-45 (96 and 2; freedreno_devices.py). A
+/// group's waves must all be resident, so a group needing more cannot
+/// launch. Other generations differ per GPU: no limit is applied to them.
+pub fn maxWaves(gen: u16, full_regs: u32, threadsize: u32) u32 {
+    if (gen < ir3.A7XX) return std.math.maxInt(u32);
+    const reg_size_vec4: u32 = 96;
+    const wave_granularity: u32 = 2;
+    const max_waves: u32 = 16;
+    const regs = @max(full_regs, 1);
+    const per = regs * (if (threadsize == 128) @as(u32, 2) else 1);
+    return @min(reg_size_vec4 / per * wave_granularity, max_waves);
+}
+
+/// Whether a group of `threads` fibers in waves of `threadsize` can launch
+/// with `full_regs` vec4 registers.
+pub fn groupFits(gen: u16, full_regs: u32, threadsize: u32, threads: u32) bool {
+    const waves = (threads + threadsize - 1) / @max(threadsize, 1);
+    return waves <= maxWaves(gen, full_regs, threadsize);
+}
 
 /// A region of GPU-visible memory.
 pub const Region = struct { va: u64, bytes: []u8 };
@@ -101,7 +127,21 @@ pub const Work = struct {
     /// Where an error happened (instruction index), for messages.
     err_pc: u32 = 0,
     check_hazards: bool = true,
+    /// Optional, stricter than the memory regions: the buffers this
+    /// dispatch was given. Every global access must lie inside one, and an
+    /// ldg.a/stg.a whose base is a constant (a binding's address) inside
+    /// the one starting at that base, so running past a binding is a fault
+    /// even where another buffer happens to follow.
+    bounds: []const Bound = &.{},
+    /// Local memory the kernel was given (bytes); past it is a fault.
+    local_limit: u32 = LOCAL_BYTES,
+    /// The address of the last fault (global, or local with `fault_local`).
+    fault_va: u64 = 0,
+    fault_local: bool = false,
 };
+
+/// A buffer a dispatch may access.
+pub const Bound = struct { va: u64, bytes: u64 };
 
 // ── Register access ─────────────────────────────────────────────────────────
 
@@ -216,19 +256,41 @@ fn isrc(c: *const Ctx, f: u32, s: Src, i: u32) u32 {
     var b = srcBits(c, f, s, i);
     if (s.half and s.kind != .imm) b = @as(u32, @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(b)))))));
     if (s.kind == .imm) b = s.imm;
-    if (s.abs) b = @bitCast(@as(i32, @intCast(@abs(@as(i32, @bitCast(b))))));
+    if (s.abs) b = absWrap(b);
     if (s.neg) b = 0 -% b;
     if (s.bnot) b = ~b;
     return b;
 }
 
+/// (abs) of a 32-bit integer: |INT_MIN| wraps to INT_MIN, as the ALU's
+/// two's complement negation does.
+fn absWrap(b: u32) u32 {
+    return if (@as(i32, @bitCast(b)) < 0) 0 -% b else b;
+}
+
 fn usrc(c: *const Ctx, f: u32, s: Src, i: u32) u32 {
     var b = srcBits(c, f, s, i);
     if (s.half and s.kind != .imm) b &= 0xffff;
-    if (s.abs) b = @bitCast(@as(i32, @intCast(@abs(@as(i32, @bitCast(b))))));
+    if (s.abs) b = absWrap(b);
     if (s.neg) b = 0 -% b;
     if (s.bnot) b = ~b;
     return b;
+}
+
+/// min.f/max.f as IEEE 754-2019's minimumNumber/maximumNumber: a NaN
+/// operand gives the other one, and -0 orders below +0 (the host's @min
+/// leaves the zeros' order open). The hardware's own choice is not
+/// measured yet: the bring-up self-test's "edges" case reports it.
+fn minMax(a: f32, b: f32, max: bool) f32 {
+    if (std.math.isNan(a)) return b;
+    if (std.math.isNan(b)) return a;
+    if (a == b) {
+        // equal: only the zeros' signs differ
+        const neg = std.math.signbit(a) and std.math.signbit(b);
+        const any_neg = std.math.signbit(a) or std.math.signbit(b);
+        return if (max) (if (neg) a else @abs(a)) else (if (any_neg) -@abs(a) else a);
+    }
+    return if (max) @max(a, b) else @min(a, b);
 }
 
 fn putF(c: *Ctx, f: u32, dst: u16, half: bool, v: f32, sat: bool) void {
@@ -449,7 +511,7 @@ fn execute(c: *Ctx, pc: u32, fibers: []const u32) Error!void {
                         };
                         w.pc[f] = if (take) @intCast(@as(i64, pc) + in.imm) else pc + 1;
                     }
-                    w.slot[wave] = slot0 + reps;
+                    // (a branch's slot does not count: ir3_asm.countsSlots)
                     return;
                 },
                 else => return error.Unsupported,
@@ -464,7 +526,10 @@ fn execute(c: *Ctx, pc: u32, fibers: []const u32) Error!void {
         else => return error.Unsupported,
     }
     for (fibers) |f| w.pc[f] = pc + 1;
-    w.slot[wave] = slot0 + reps + in.nop;
+    // Only the vector ALU and cat0 let ALU latency pass, as Mesa counts
+    // delay slots: a load, store, SFU op, fence or barrier between an ALU
+    // result and its reader does not.
+    if (ir3_asm.countsSlots(in)) w.slot[wave] = slot0 + reps + in.nop;
 }
 
 fn execCat1(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!void {
@@ -521,8 +586,8 @@ fn execCat2(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
             switch (in.op) {
                 .add_f => fres = fsrc(c, f, s0, i) + fsrc(c, f, s1, i),
                 .mul_f => fres = fsrc(c, f, s0, i) * fsrc(c, f, s1, i),
-                .min_f => fres = @min(fsrc(c, f, s0, i), fsrc(c, f, s1, i)),
-                .max_f => fres = @max(fsrc(c, f, s0, i), fsrc(c, f, s1, i)),
+                .min_f => fres = minMax(fsrc(c, f, s0, i), fsrc(c, f, s1, i), false),
+                .max_f => fres = minMax(fsrc(c, f, s0, i), fsrc(c, f, s1, i), true),
                 .sign_f => {
                     const x = fsrc(c, f, s0, i);
                     fres = if (x > 0) 1.0 else if (x < 0) -1.0 else 0.0;
@@ -738,6 +803,7 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
         .ldg, .ldg_a => {
             for (fibers) |f| {
                 const va = globalAddr(c, f, in);
+                try checkBounds(c, f, in, va, tb * in.size);
                 const bytes = c.mem.find(va, tb * in.size) orelse return faultAt(c, va);
                 for (0..in.size) |k| writeReg(c, f, in.dst.num + @as(u16, @intCast(k)), in.dst.half, loadValue(bytes[k * tb ..], in.ty));
             }
@@ -747,6 +813,7 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
         .stg, .stg_a => {
             for (fibers) |f| {
                 const va = globalAddr(c, f, in);
+                try checkBounds(c, f, in, va, tb * in.size);
                 const bytes = c.mem.find(va, tb * in.size) orelse return faultAt(c, va);
                 for (0..in.size) |k| storeValue(bytes[k * tb ..], in.ty, readReg(c, f, in.src[2].num + @as(u16, @intCast(k)), in.src[2].half));
             }
@@ -755,7 +822,7 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
         .ldl => {
             for (fibers) |f| {
                 const a: i64 = @as(i64, readFull(c, f, in.src[0].num)) + in.off;
-                if (a < 0 or a + tb * in.size > LOCAL_BYTES) return error.Fault;
+                if (a < 0 or a + tb * in.size > c.w.local_limit) return localFault(c, a);
                 const at: usize = @intCast(a);
                 for (0..in.size) |k| writeReg(c, f, in.dst.num + @as(u16, @intCast(k)), in.dst.half, loadValue(w.local[at + k * tb ..], in.ty));
             }
@@ -764,7 +831,7 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
         .stl => {
             for (fibers) |f| {
                 const a: i64 = @as(i64, readFull(c, f, in.src[0].num)) + in.off;
-                if (a < 0 or a + tb * in.size > LOCAL_BYTES) return error.Fault;
+                if (a < 0 or a + tb * in.size > c.w.local_limit) return localFault(c, a);
                 const at: usize = @intCast(a);
                 for (0..in.size) |k| storeValue(w.local[at + k * tb ..], in.ty, readReg(c, f, in.src[1].num + @as(u16, @intCast(k)), in.src[1].half));
             }
@@ -797,14 +864,89 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
             for (fibers) |f| writeReg(c, f, in.dst.num, false, f - c.wave * c.threadsize);
             noteWrite(c, in.dst.num, false, .sy, slot0);
         },
+        .atomic_g_add, .atomic_g_sub, .atomic_g_xchg, .atomic_g_min, .atomic_g_max, .atomic_g_and, .atomic_g_or, .atomic_g_xor => {
+            // dst = the old word; the word = op(old, value); fiber by fiber
+            if (in.src[0].kind == .gpr) {
+                try checkRead(c, in.src[0].num, false, false, slot0);
+                try checkRead(c, in.src[0].num + 1, false, false, slot0);
+            }
+            if (in.src[1].kind == .gpr) try checkRead(c, in.src[1].num, false, false, slot0);
+            for (fibers) |f| {
+                const va = @as(u64, readFull(c, f, in.src[0].num + 1)) << 32 | readFull(c, f, in.src[0].num);
+                if (va & 3 != 0) return error.Fault;
+                try checkBounds(c, f, in, va, 4);
+                const bytes = c.mem.find(va, 4) orelse return faultAt(c, va);
+                const v = if (in.src[1].kind == .imm) in.src[1].imm else readFull(c, f, in.src[1].num);
+                const old = std.mem.readInt(u32, bytes[0..4], .little);
+                std.mem.writeInt(u32, bytes[0..4], atomicOp(in.op, in.ty, old, v), .little);
+                writeReg(c, f, in.dst.num, false, old);
+            }
+            c.stats.global_bytes_read += fibers.len * 4;
+            c.stats.global_bytes_written += fibers.len * 4;
+            noteWrite(c, in.dst.num, false, .sy, slot0);
+        },
+        .atomic_add, .atomic_sub, .atomic_xchg, .atomic_min, .atomic_max, .atomic_and, .atomic_or, .atomic_xor => {
+            if (in.src[0].kind == .gpr) try checkRead(c, in.src[0].num, false, false, slot0);
+            if (in.src[1].kind == .gpr) try checkRead(c, in.src[1].num, false, false, slot0);
+            for (fibers) |f| {
+                const a = if (in.src[0].kind == .imm) in.src[0].imm else readFull(c, f, in.src[0].num);
+                if (a & 3 != 0 or @as(u64, a) + 4 > c.w.local_limit) return localFault(c, a);
+                const v = if (in.src[1].kind == .imm) in.src[1].imm else readFull(c, f, in.src[1].num);
+                const word = w.local[a..][0..4];
+                const old = std.mem.readInt(u32, word, .little);
+                std.mem.writeInt(u32, word, atomicOp(in.op, in.ty, old, v), .little);
+                writeReg(c, f, in.dst.num, false, old);
+            }
+            noteWrite(c, in.dst.num, false, .ss, slot0);
+        },
         else => return error.Unsupported,
     }
 }
 
+/// The new word of a read-modify-write atomic (min/max signed for s32).
+fn atomicOp(op: ir3.Op, ty: ir3.Type, old: u32, v: u32) u32 {
+    const signed = ty == .s32;
+    return switch (op) {
+        .atomic_g_add, .atomic_add => old +% v,
+        .atomic_g_sub, .atomic_sub => old -% v,
+        .atomic_g_xchg, .atomic_xchg => v,
+        .atomic_g_min, .atomic_min => if (signed) @bitCast(@min(@as(i32, @bitCast(old)), @as(i32, @bitCast(v)))) else @min(old, v),
+        .atomic_g_max, .atomic_max => if (signed) @bitCast(@max(@as(i32, @bitCast(old)), @as(i32, @bitCast(v)))) else @max(old, v),
+        .atomic_g_and, .atomic_and => old & v,
+        .atomic_g_or, .atomic_or => old | v,
+        .atomic_g_xor, .atomic_xor => old ^ v,
+        else => old,
+    };
+}
+
 fn faultAt(c: *Ctx, va: u64) Error {
-    _ = c;
-    _ = va;
+    c.w.fault_va = va;
+    c.w.fault_local = false;
     return error.Fault;
+}
+
+fn localFault(c: *Ctx, a: i64) Error {
+    c.w.fault_va = @bitCast(a);
+    c.w.fault_local = true;
+    return error.Fault;
+}
+
+/// A global access of `len` bytes at `va` against the dispatch's buffers.
+fn checkBounds(c: *Ctx, f: u32, in: *const Instr, va: u64, len: u64) Error!void {
+    const bounds = c.w.bounds;
+    if (bounds.len == 0) return;
+    // a binding's base in the constants: that buffer, and no other
+    if ((in.op == .ldg_a or in.op == .stg_a) and in.src[0].kind == .cnst) {
+        const base = addr64(c, f, in.src[0]);
+        for (bounds) |b| if (b.va == base) {
+            if (va < b.va or va + len > b.va + b.bytes) return faultAt(c, va);
+            return;
+        };
+    }
+    for (bounds) |b| {
+        if (va >= b.va and va + len <= b.va + b.bytes) return;
+    }
+    return faultAt(c, va);
 }
 
 // ── Dispatch ────────────────────────────────────────────────────────────────
@@ -822,6 +964,7 @@ pub fn run(w: *Work, mem: *const Memory, d: *const Dispatch, stats: *Stats) Erro
     if (lsz == 0 or lsz > MAX_FIBERS) return error.BadDispatch;
     const ts: u32 = k.threadsize;
     const waves = (lsz + ts - 1) / ts;
+    if (!groupFits(k.gen, k.full_regs, ts, lsz)) return error.TooManyWaves;
     var gz: u32 = 0;
     while (gz < d.groups[2]) : (gz += 1) {
         var gy: u32 = 0;
@@ -1073,4 +1216,200 @@ test "the hazard checker catches a read before (sy)" {
     const consts = [_]u32{ 0x100, 0, 0, 0 };
     var stats = Stats{};
     try std.testing.expectError(error.Hazard, run(w, &mem, &.{ .kernel = &k, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats));
+}
+
+test "a store, a fence and a barrier are no delay slots: an address read across them is a hazard" {
+    var w = &emu_work;
+    w.check_hazards = true;
+    var data = [_]u32{ 7, 0 };
+    const regions = [_]Region{.{ .va = 0x100, .bytes = std.mem.sliceAsBytes(&data) }};
+    const mem = Memory{ .regions = &regions };
+    var code: [32]u64 = undefined;
+    // Six instructions between the shl and the ldl, three of them nops: as
+    // Mesa counts, three slots of the five passed (counting all but the
+    // barrier, five would have).
+    const lines = [_][]const u8{
+        "mov.u32u32 r0.x, 1",
+        "mov.u32u32 r1.y, 0",
+        "mov.u32u32 r2.x, 5",
+        "(rpt5)nop",
+        "shl.b r1.x, r0.x, 2",
+        "stl.u32 l[r1.y], r2.x, 1",
+        "fence.g.r.w",
+        "(sy)(ss)bar",
+        "(ss)nop",
+        "nop",
+        "nop",
+        "(sy)ldl.u32 r2.y, l[r1.x], 1",
+        "end",
+    };
+    for (lines, 0..) |l, i| code[i] = try ir3.assembleLine(ir3.A7XX, l);
+    var k = ir3_asm.Kernel{ .gen = ir3.A7XX, .code = code[0..lines.len], .count = lines.len, .instrlen = 1, .local_size = .{ 1, 1, 1 } };
+    k.constlen = 4;
+    k.shared_bytes = 64;
+    try load(w, &k);
+    const consts = [_]u32{ 0x100, 0, 0, 0 };
+    var stats = Stats{};
+    try std.testing.expectError(error.Hazard, run(w, &mem, &.{ .kernel = &k, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats));
+    // with (rpt4) on the nop, five slots pass
+    code[8] = try ir3.assembleLine(ir3.A7XX, "(ss)(rpt4)nop");
+    code[9] = try ir3.assembleLine(ir3.A7XX, "nop");
+    try load(w, &k);
+    _ = try run(w, &mem, &.{ .kernel = &k, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats);
+}
+
+test "(abs) of the most negative integer wraps to itself" {
+    var out = [_]u32{ 1, 1 };
+    const regions = [_]Region{.{ .va = 0x9000, .bytes = std.mem.sliceAsBytes(&out) }};
+    const mem = Memory{ .regions = &regions };
+    const consts = [_]u32{ 0x9000, 0, 0x80000000, 0 };
+    _ = try runSource(
+        \\@localsize 1, 1, 1
+        \\@consts 1
+        \\mov.u32u32 r0.x, c0.z
+        \\absneg.s r0.y, (abs)r0.x
+        \\absneg.s r0.z, (neg)r0.x
+        \\mov.u32u32 r1.x, 0
+        \\stg.a.u32 g[c0.x+r1.x+0], r0.y, 2
+        \\end
+    , &mem, &consts, .{ 1, 1, 1 });
+    try std.testing.expectEqual(@as(u32, 0x80000000), out[0]);
+    try std.testing.expectEqual(@as(u32, 0x80000000), out[1]);
+}
+
+test "atomics: global add and max, local add, fiber by fiber" {
+    var data = [_]u32{ 5, 7, 0, 0 } ++ [_]u32{0} ** 128;
+    const regions = [_]Region{.{ .va = 0x1_0000_0000, .bytes = std.mem.sliceAsBytes(&data) }};
+    const mem = Memory{ .regions = &regions };
+    const consts = [_]u32{ 0x0000_0000, 1, 0, 0 };
+    _ = try runSource(
+        \\@localsize 64, 1, 1
+        \\@invocationid(r0.x)
+        \\@consts 1
+        \\@shared 64
+        \\mov.u32u32 r1.x, c0.x
+        \\mov.u32u32 r1.y, c0.y
+        \\atomic.g.add.untyped.1d.u32.1.g r2.x, r1.x, r0.x
+        \\add.u r3.x, r1.x, 4
+        \\mov.u32u32 r3.y, r1.y
+        \\atomic.g.max.untyped.1d.u32.1.g r2.y, r3.x, r0.x
+        \\mov.u32u32 r4.x, 0
+        \\stl.u32 l[r4.x], r4.x, 1
+        \\bar
+        \\atomic.add.untyped.1d.u32.1.l r2.z, l[r4.x], 1
+        \\shl.b r5.x, r0.x, 3
+        \\add.u r5.x, r5.x, 16
+        \\stg.a.u32 g[c0.x+r5.x+0], r2.x, 1
+        \\add.u r5.x, r5.x, 4
+        \\stg.a.u32 g[c0.x+r5.x+0], r2.z, 1
+        \\end
+    , &mem, &consts, .{ 1, 1, 1 });
+    try std.testing.expectEqual(@as(u32, 5 + 63 * 64 / 2), data[0]);
+    try std.testing.expectEqual(@as(u32, 63), data[1]);
+    var before: u32 = 5;
+    for (0..64) |t| {
+        // each fiber saw the sum of the ones before it, and its count
+        try std.testing.expectEqual(before, data[4 + 2 * t]);
+        try std.testing.expectEqual(@as(u32, @intCast(t)), data[5 + 2 * t]);
+        before += @intCast(t);
+    }
+}
+
+test "bounds: a read past its binding faults, even into the next buffer" {
+    // two buffers back to back: reading a's word 64 lands in b
+    var a = [_]u32{1} ** 64;
+    var b = [_]u32{2} ** 64;
+    const regions = [_]Region{
+        .{ .va = 0x1_0000_0000, .bytes = std.mem.sliceAsBytes(&a) },
+        .{ .va = 0x1_0000_0100, .bytes = std.mem.sliceAsBytes(&b) },
+    };
+    const mem = Memory{ .regions = &regions };
+    const consts = [_]u32{ 0x0000_0000, 1, 0x0000_0100, 1 };
+    const src =
+        \\@localsize 1, 1, 1
+        \\@consts 1
+        \\mov.u32u32 r1.x, 256
+        \\ldg.a.u32 r0.x, g[c0.x+r1.x+0], 1
+        \\mov.u32u32 r1.y, 0
+        \\stg.a.u32 g[c0.z+r1.y+4], r0.x, 1
+        \\end
+    ;
+    // without bounds the regions allow it
+    emu_work.bounds = &.{};
+    _ = try runSource(src, &mem, &consts, .{ 1, 1, 1 });
+    try std.testing.expectEqual(@as(u32, 2), b[1]);
+    const bounds = [_]Bound{ .{ .va = 0x1_0000_0000, .bytes = 256 }, .{ .va = 0x1_0000_0100, .bytes = 256 } };
+    emu_work.bounds = &bounds;
+    defer emu_work.bounds = &.{};
+    var code: [64]u64 = undefined;
+    const k = try ir3_asm.assemble(ir3.A7XX, src, &asm_work, &code);
+    try load(&emu_work, &k);
+    var stats = Stats{};
+    try std.testing.expectError(error.Fault, run(&emu_work, &mem, &.{ .kernel = &k, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats));
+    try std.testing.expectEqual(@as(u64, 0x1_0000_0100), emu_work.fault_va);
+    // local memory past the kernel's share
+    emu_work.local_limit = 64;
+    defer emu_work.local_limit = LOCAL_BYTES;
+    emu_work.bounds = &.{};
+    const k2 = try ir3_asm.assemble(ir3.A7XX,
+        \\@localsize 1, 1, 1
+        \\@shared 64
+        \\mov.u32u32 r1.x, 64
+        \\stl.u32 l[r1.x], r1.x, 1
+        \\end
+    , &asm_work, &code);
+    try load(&emu_work, &k2);
+    try std.testing.expectError(error.Fault, run(&emu_work, &mem, &.{ .kernel = &k2, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats));
+    try std.testing.expect(emu_work.fault_local);
+}
+
+test "a divergent if/else: the else fibers run right after the then-part's jump" {
+    // (the then-part's last write is two slots before the else's read, in
+    // the same wave: the legalizer must carry its delay across the jump)
+    var out = [_]u32{0} ** 64;
+    const regions = [_]Region{.{ .va = 0x9000, .bytes = std.mem.sliceAsBytes(&out) }};
+    const mem = Memory{ .regions = &regions };
+    const consts = [_]u32{ 0x9000, 0, 0, 0 };
+    _ = try runSource(
+        \\@localsize 64, 1, 1
+        \\@invocationid(r0.x)
+        \\@consts 1
+        \\mov.u32u32 r1.x, 5
+        \\cmps.u.lt p0.x, r0.x, 32
+        \\br p0.x, #else
+        \\add.u r1.x, r0.x, 100
+        \\jump #done
+        \\else:
+        \\add.u r1.x, r1.x, r0.x
+        \\done:
+        \\shl.b r2.x, r0.x, 2
+        \\stg.a.u32 g[c0.x+r2.x+0], r1.x, 1
+        \\end
+    , &mem, &consts, .{ 1, 1, 1 });
+    for (out, 0..) |v, i| try std.testing.expectEqual(@as(u32, @intCast(if (i < 32) 5 + i else 100 + i)), v);
+}
+
+test "a group needing more resident waves than its registers allow does not launch" {
+    // Mesa's formula on a7xx: 96 / 25 vec4 x 2 = 6 waves of 64; 100
+    // registers fit 384 threads, not 1024
+    try std.testing.expectEqual(@as(u32, 6), maxWaves(ir3.A7XX, 25, 64));
+    try std.testing.expectEqual(@as(u32, 16), maxWaves(ir3.A7XX, 12, 64));
+    try std.testing.expectEqual(@as(u32, 2), maxWaves(ir3.A7XX, 25, 128));
+    try std.testing.expect(groupFits(ir3.A7XX, 25, 64, 256));
+    try std.testing.expect(!groupFits(ir3.A7XX, 25, 64, 1024));
+    try std.testing.expect(groupFits(ir3.A7XX, 12, 64, 1024));
+    var code: [64]u64 = undefined;
+    // a kernel touching r24.w: a footprint of 25 vec4, in 1024-fiber groups
+    const k = try ir3_asm.assemble(ir3.A7XX,
+        \\@localsize 1024, 1, 1
+        \\@invocationid(r0.x)
+        \\mov.u32u32 r24.w, r0.x
+        \\end
+    , &asm_work, &code);
+    try std.testing.expectEqual(@as(u8, 25), k.full_regs);
+    try load(&emu_work, &k);
+    var stats = Stats{};
+    const regions = [_]Region{};
+    const mem = Memory{ .regions = &regions };
+    try std.testing.expectError(error.TooManyWaves, run(&emu_work, &mem, &.{ .kernel = &k, .consts = &.{}, .groups = .{ 1, 1, 1 } }, &stats));
 }
