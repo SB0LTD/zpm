@@ -280,6 +280,9 @@ pub const Stats = struct {
     spills: u32 = 0,
     bssy: u32 = 0,
     predicated: u32 = 0,
+    /// SHFL/VOTE in divergent code, and those in a loop out of step.
+    div_collectives: u32 = 0,
+    nobar_collectives: u32 = 0,
 };
 
 /// How `compile` compiles.
@@ -1298,10 +1301,8 @@ const Ctx = struct {
                     .s8s8 => "IDP.4A.S8.S8",
                     .u8u8 => "IDP.4A.U8.U8",
                 };
-                var cc = c.src(in.c);
-                const b = c.src(in.b);
-                if (b == .imm and cc == .imm) cc = try c.reg(in.c);
-                try c.ins(name, 1, &.{ c.dst(in), try c.reg(in.a), b, cc });
+                // (IDP.4A reads registers only: GB206 takes no immediate)
+                try c.ins(name, 1, &.{ c.dst(in), try c.reg(in.a), try c.reg(in.b), try c.reg(in.c) });
             },
             .icmp => try c.cmp(in, .{ .pt = true }, true),
             .fcmp => try c.cmp(in, .{ .pt = true }, true),
@@ -1513,15 +1514,23 @@ const Ctx = struct {
         try c.ins("FFMA", 1, &.{ d, R(e), R(h), R(s0) });
     }
 
-    /// In divergent code a collective may let the warp's other path run
-    /// while this one waits (sm120_emu runs it so): nothing of this path
-    /// may be pending then. A branch to the next instruction drains (as
-    /// sm120_sched drains at every branch).
+    /// A SHFL or VOTE not in uniform control flow, made safe on the
+    /// hardware as ptxas makes __shfl_sync(__activemask(), ..): the lanes
+    /// here are the active mask (VOTE.ANY R, PT, PT), and WARPSYNC on it
+    /// has them converged before the collective. A branch to the next
+    /// instruction first drains (as sm120_sched drains at every branch):
+    /// the collective's lanes may wait while the warp's other path runs
+    /// (sm120_emu runs it so), and nothing of theirs may be pending then.
     fn drainIfDivergent(c: *Ctx) Error!void {
+        if (c.nobar > 0) c.w.stats.nobar_collectives += 1;
         if (c.div_depth == 0) return;
+        c.w.stats.div_collectives += 1;
         const next = c.label();
         try c.bra(.none, next);
         try c.at(next);
+        const mask = try c.newV(.r);
+        try c.eff("VOTE.ANY", 2, &.{ R(mask), .{ .pt = true }, .{ .pt = true } });
+        try c.eff("WARPSYNC", 0, &.{R(mask)});
     }
 
     fn iadd(c: *Ctx, d: Opd, a0: kir.Arg, b0: kir.Arg, idx: usize) Error!void {
