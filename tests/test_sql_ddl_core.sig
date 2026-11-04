@@ -1035,6 +1035,28 @@ fn deleteUsing() !void {
     try sameState(&join_probes);
 }
 
+fn tupleAssignment() !void {
+    try joinFixture();
+    try run("UPDATE tdd_a SET (g, v) = (3, 4) WHERE id = 1");
+    try expect("SELECT g, v FROM tdd_a WHERE id = 1", "3|4");
+    // Every source sees the old row; ROW(...) and DEFAULT items.
+    try run("UPDATE tdd_a SET (g, v) = ROW(v, g) WHERE id = 2");
+    try expect("SELECT g, v FROM tdd_a WHERE id = 2", "20|1");
+    try run("UPDATE tdd_a SET (v) = ROW(5), g = 6 WHERE id = 3");
+    try run("UPDATE tdd_a SET (g, v) = (DEFAULT, v + 1) WHERE id = 3");
+    try expect("SELECT g, v FROM tdd_a WHERE id = 3", "NULL|6");
+    try run("INSERT INTO tdd_a VALUES (1, 0, 0) ON CONFLICT (id) DO UPDATE SET (g, v) = (excluded.g + 100, tdd_a.v)");
+    try expect("SELECT g, v FROM tdd_a WHERE id = 1", "100|4");
+    try run("UPDATE tdd_a a SET (g, v) = (b.v, b.id) FROM tdd_b b WHERE a.id = b.id AND b.id = 1");
+    try expect("SELECT g, v FROM tdd_a WHERE id = 1", "11|1");
+    try sameState(&join_probes);
+    // 42601 for a count mismatch or a bare parenthesized scalar.
+    try rejects("UPDATE tdd_a SET (g, v) = (1) WHERE id = 1", error.Syntax, "SELECT g, v FROM tdd_a WHERE id = 1", "11|1");
+    try rejects("UPDATE tdd_a SET (g, v) = (1, 2, 3) WHERE id = 1", error.Syntax, "SELECT g, v FROM tdd_a WHERE id = 1", "11|1");
+    try rejects("UPDATE tdd_a SET (g) = (1) WHERE id = 1", error.Syntax, "SELECT g, v FROM tdd_a WHERE id = 1", "11|1");
+    try rejects("UPDATE tdd_a SET (g, nope) = (1, 2) WHERE id = 1", error.ColumnNotFound, "SELECT g, v FROM tdd_a WHERE id = 1", "11|1");
+}
+
 pub fn main(init: std.process.Init) !void {
     try truncateTable();
     try truncateErrors();
@@ -1054,6 +1076,7 @@ pub fn main(init: std.process.Init) !void {
     try updateFrom();
     try updateFromConcurrency();
     try deleteUsing();
+    try tupleAssignment();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-ddl-core\",\"pass\":true,\"assertions\":{d},\"records\":{d},\"database_bytes\":{d}}}\n", .{ assertions, records_applied, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
