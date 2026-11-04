@@ -50,8 +50,10 @@ pub const MAX_CACHED = 128;
 pub const TEXT_BYTES = 768 * 1024;
 /// Units of the register file: half registers (full rN.c = units 2(4N+c), +1).
 const UNITS = 384;
-/// Half registers live in the first 256 units (hr0.x..hr63.w).
-const HALF_UNITS = 256;
+/// Half registers live in the first 192 units (hr0.x..hr47.w): in the
+/// merged file they alias r0..r23 only, and hr48 and up are not the fiber's
+/// (adreno.device.checkInstr's footprint rule).
+const HALF_UNITS = 192;
 
 pub const Error = kir.Error || ir3_asm.Error || error{ Unsupported, TooComplex, OutOfMemory };
 
@@ -1293,6 +1295,8 @@ fn lower(w: *Work) Error!void {
         try lowerOne(w, i);
     }
     if (w.n_ctl != 0) return error.Unbalanced;
+    // ir3's operand rules (what adreno.device.checkInstr checks).
+    try legalizeOperands(w);
     // The end: every ret comes here.
     try putLabel(w, w.ret_label);
     var e = MI{};
@@ -1757,6 +1761,121 @@ fn lowerBfe(l: *Lw) Error!void {
     try alu2(w, .ashr_b, r0, false, Opnd.reg(y, false), Opnd.reg(s2, false));
     try cmp2(w, .cmps_u, .eq, z, Opnd.reg(width, false), Opnd.imm(0));
     try alu3(w, .sel_b32, d, false, try fit(w, Opnd.imm(0), .c3, false, l.loop), Opnd.reg(z, false), Opnd.reg(r0, false));
+}
+
+// ── ir3's operand rules ─────────────────────────────────────────────────────
+//
+// Mesa's ir3_valid_flags (read as documentation), as adreno.device's
+// checker enforces them:
+// - cat2: at most one source from the const/shared ("uniform") file (the
+//   hardware hands one's value to both: the Surface's 16 MiB fault), and
+//   not two immediates;
+// - cat3: the second source a per-fiber register; immediates only in the
+//   shift-and-mask forms' first and third; no plain const in those forms or
+//   the dot products;
+// - cat4 (SFU): a per-fiber register source (no const, immediate, shared);
+// - cat6: addresses, offsets, stored values and shuffled values in
+//   per-fiber registers, a shuffle's lane not a const.
+// What breaks one goes through a register, copied once at the start (every
+// such operand is a constant, an immediate or a shared register: the same
+// for the whole kernel).
+
+fn srcUniform(m: *const MI, i: usize) bool {
+    const s = m.in.src[i];
+    if (s.kind == .cnst or s.kind == .rel_cnst) return true;
+    return s.kind == .gpr and !s.half and m.src[i] != NONE and isPhys(m.src[i]) and
+        (m.src[i] & ~PHYS) >= ir3.SHARED_BASE and (m.src[i] & ~PHYS) < ir3.A0_X;
+}
+
+fn srcImm(m: *const MI, i: usize) bool {
+    return m.in.src[i].kind == .imm or m.in.src[i].kind == .flut;
+}
+
+/// An ordinary per-fiber register (not shared, not a const or immediate).
+fn srcPlain(m: *const MI, i: usize) bool {
+    const s = m.in.src[i];
+    if (s.kind != .gpr) return false;
+    if (m.src[i] == NONE) return false;
+    if (!isPhys(m.src[i])) return true;
+    return (m.src[i] & ~PHYS) < ir3.SHARED_BASE;
+}
+
+/// The value of float-table entry `idx` as bits (the entries flutIndex uses).
+fn flutBits(idx: u32, half: bool) u32 {
+    const f32s = [_]u32{ 0x00000000, 0x3f000000, 0x3f800000, 0x40000000, 0, 0, 0, 0, 0, 0, 0, 0x40800000 };
+    const f16s = [_]u32{ 0x0000, 0x3800, 0x3c00, 0x4000, 0, 0, 0, 0, 0, 0, 0, 0x4400 };
+    if (idx >= f32s.len) return 0;
+    return if (half) f16s[idx] else f32s[idx];
+}
+
+/// Put source `i` of `m` in a register (a copy made at the start).
+fn srcToReg(w: *Work, m: *MI, i: usize) Error!void {
+    const s = m.in.src[i];
+    var o = Opnd{ .half = s.half, .neg = s.neg, .abs = s.abs, .bnot = s.bnot };
+    switch (s.kind) {
+        .gpr => {
+            o.k = .vreg;
+            o.v = m.src[i];
+        },
+        .cnst => {
+            o.k = .cnst;
+            o.x = s.num;
+        },
+        .imm => {
+            o.k = .imm;
+            o.x = s.imm;
+        },
+        .flut => {
+            o.k = .imm;
+            o.x = flutBits(s.imm, s.half);
+        },
+        else => return error.BadOperand,
+    }
+    const reg = try materialize(w, o, true);
+    setSrc(m, i, reg);
+    m.in.src[i].half = s.half;
+}
+
+fn legalizeOperands(w: *Work) Error!void {
+    for (w.mi[0..w.n_mi]) |*m| {
+        if (m.kind != .op and m.kind != .copy) continue;
+        switch (m.in.op.category()) {
+            2 => {
+                if (m.in.src[1].kind == .none) continue;
+                if ((srcUniform(m, 0) and srcUniform(m, 1)) or (srcImm(m, 0) and srcImm(m, 1))) try srcToReg(w, m, 1);
+            },
+            3 => {
+                const alt = switch (m.in.op) {
+                    .shrm, .shlm, .shrg, .shlg, .andg => true,
+                    else => false,
+                };
+                const dot = m.in.op == .dp4acc or m.in.op == .dp2acc;
+                if (!srcPlain(m, 1)) try srcToReg(w, m, 1);
+                for ([_]usize{ 0, 2 }) |i| {
+                    const s = m.in.src[i];
+                    if (s.kind == .none) continue;
+                    if (s.kind == .cnst and (alt or dot)) try srcToReg(w, m, i) else if (srcImm(m, i) and !alt) try srcToReg(w, m, i);
+                }
+            },
+            4 => if (!srcPlain(m, 0)) try srcToReg(w, m, 0),
+            6 => switch (m.in.op) {
+                .ldg_a, .stg_a => {
+                    if (!srcPlain(m, 1)) try srcToReg(w, m, 1);
+                    if (m.in.op == .stg_a and !srcPlain(m, 2)) try srcToReg(w, m, 2);
+                },
+                .ldl, .stl => {
+                    if (!srcPlain(m, 0)) try srcToReg(w, m, 0);
+                    if (m.in.op == .stl and !srcPlain(m, 1)) try srcToReg(w, m, 1);
+                },
+                .shfl => {
+                    if (!srcPlain(m, 0)) try srcToReg(w, m, 0);
+                    if (m.in.src[1].kind == .cnst or m.in.src[1].kind == .rel_cnst) try srcToReg(w, m, 1);
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
 }
 
 fn lowerDot4(l: *Lw) Error!void {
