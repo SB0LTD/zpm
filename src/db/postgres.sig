@@ -1215,7 +1215,7 @@ pub fn Session(comptime DB: type) type {
                         column_index += 1;
                         continue;
                     }
-                    if (token[0] == '$') {
+                    if (parameterToken(token)) {
                         if (column_index >= count_columns) return error.ColumnCapacity;
                         try inferOid(s, token, T.oid(self.result.column_types[mapping[column_index]]));
                     }
@@ -1226,7 +1226,7 @@ pub fn Session(comptime DB: type) type {
                 while (true) {
                     const token = try tokens.next();
                     if (token.len == 0) break;
-                    if (token[0] == '$') {
+                    if (parameterToken(token)) {
                         if (column_index) |i| try inferOid(s, token, T.oid(self.result.column_types[i]));
                     } else if (identifier(token)) {
                         column_index = self.column(token);
@@ -1477,6 +1477,10 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "DivisionByZero")) return "22012";
     if (equal(name, "InvalidArgumentForPowerFunction")) return "2201F";
     if (equal(name, "InvalidEscapeSequence")) return "22025";
+    if (equal(name, "CharacterNotInRepertoire")) return "22021";
+    if (equal(name, "SubstringError")) return "22011";
+    if (equal(name, "InvalidArgumentForLogarithm")) return "2201E";
+    if (equal(name, "NullCharacterNotPermitted")) return "54000";
     if (equal(name, "UndefinedParameter")) return "42P02";
     if (equal(name, "InvalidColumnReference")) return "42P10";
     if (equal(name, "WorkspaceCapacity")) return "54000";
@@ -1602,6 +1606,10 @@ fn parameterCount(source: []const u8) !usize {
 fn interpolate(source: []const u8, values: []const []const u8, w: *Writer) !void {
     _ = try scan(source, values, w);
 }
+/// `$n`: a dollar-quoted string (`$$x$$`, `$q$x$q$`) is not a parameter.
+fn parameterToken(token: []const u8) bool {
+    return token.len > 1 and token[0] == '$' and token[1] >= '0' and token[1] <= '9';
+}
 fn identifier(token: []const u8) bool {
     if (token.len == 0) return false;
     const first = lower(token[0]);
@@ -1618,7 +1626,7 @@ const Tokens = struct {
         self.at = tokenizer.position;
         if (token.kind == .end) return "";
         if (token.kind == .string or token.kind == .quoted_word)
-            return self.source[token.start - 1 .. token.end + 1];
+            return token.whole(self.source);
         return self.source[token.start..token.end];
     }
 };

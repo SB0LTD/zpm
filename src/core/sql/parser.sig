@@ -781,13 +781,13 @@ pub fn Parser(comptime config: types.Config) type {
         fn spanTo(self: *const Self, start: usize) ast.Span {
             var end = self.current.start;
             if (self.current.kind == .end) end = self.source.len;
-            if (self.current.kind == .string or self.current.kind == .quoted_word) end -= 1;
+            if (self.current.kind == .string or self.current.kind == .quoted_word) end -= self.current.prefix;
             while (end > start and (self.source[end - 1] == ' ' or self.source[end - 1] == '\t' or self.source[end - 1] == '\r' or self.source[end - 1] == '\n')) end -= 1;
             return .{ .start = start, .len = end - start };
         }
 
         fn tokenStart(self: *const Self) usize {
-            return if (self.current.kind == .string or self.current.kind == .quoted_word) self.current.start - 1 else self.current.start;
+            return if (self.current.kind == .string or self.current.kind == .quoted_word) self.current.start - self.current.prefix else self.current.start;
         }
 
         fn create(self: *Self) Error!Ast.CreateTable {

@@ -2446,7 +2446,7 @@ pub fn Database(comptime config: Config) type {
                 },
                 .string => {
                     if (value.quoted.len > out.bytes.len) return error.InvalidSettingValue;
-                    lexer.decodeQuotedWith(source, value.quoted, '\'', &out.bytes);
+                    lexer.decodeQuoted(source, value.quoted, &out.bytes);
                     out.len = value.quoted.len;
                 },
             }

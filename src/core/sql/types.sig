@@ -156,6 +156,14 @@ pub const Error = error{
     InvalidArgumentForPowerFunction,
     /// SQLSTATE 22025: invalid LIKE escape string or reached trailing escape.
     InvalidEscapeSequence,
+    /// SQLSTATE 22021: bytes that are not valid UTF-8 (pg_verifymbstr).
+    CharacterNotInRepertoire,
+    /// SQLSTATE 22011: negative substring length.
+    SubstringError,
+    /// SQLSTATE 2201E: logarithm of zero or a negative number.
+    InvalidArgumentForLogarithm,
+    /// SQLSTATE 54000: chr(0) / a NUL character in text.
+    NullCharacterNotPermitted,
     /// SQLSTATE 42P02: a $n placeholder reached the engine unbound.
     UndefinedParameter,
     /// SQLSTATE 42P10: invalid ORDER BY reference or window-frame variable.
