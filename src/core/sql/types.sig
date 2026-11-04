@@ -316,11 +316,11 @@ pub const Dialect = enum { postgres, mysql, tds };
 
 /// Stored column / result types. `integer` is int8 (BIGINT) and
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
-pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit };
+pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet.
-pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit };
+pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money };
 
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
@@ -348,6 +348,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .timetz => .timetz,
         .bit => .bit,
         .varbit => .varbit,
+        .money => .money,
     };
 }
 
@@ -377,6 +378,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .timetz => .timetz,
         .bit => .bit,
         .varbit => .varbit,
+        .money => .money,
     };
 }
 
@@ -410,6 +412,7 @@ pub fn typeInfo(data_type: DataType) TypeInfo {
         .timetz => .{ .oid = 1266, .name = "timetz", .len = 12, .category = 'D', .array = 1270 },
         .bit => .{ .oid = 1560, .name = "bit", .len = -1, .category = 'V', .array = 1561 },
         .varbit => .{ .oid = 1562, .name = "varbit", .len = -1, .category = 'V', .array = 1563 },
+        .money => .{ .oid = 790, .name = "money", .len = 8, .category = 'N', .array = 791 },
     };
 }
 
@@ -446,6 +449,7 @@ pub fn sqlTypeName(data_type: DataType) []const u8 {
         .timetz => "time with time zone",
         .bit => "bit",
         .varbit => "bit varying",
+        .money => "money",
     };
 }
 
@@ -476,6 +480,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .timetz => "timetz_in",
         .bit => "bit_in",
         .varbit => "varbit_in",
+        .money => "cash_in",
     };
 }
 
@@ -593,7 +598,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -617,6 +622,8 @@ pub fn Values(comptime config: Config) type {
             timetz: time_of_day.TimeTz,
             /// BIT and BIT VARYING.
             bits: BitString,
+            /// MONEY: cents (money.sig).
+            money: i64,
         };
 
         pub const Row = struct {
@@ -656,6 +663,7 @@ pub fn Values(comptime config: Config) type {
                 .time => .time,
                 .timetz => .timetz,
                 .bit, .varbit => .bits,
+                .money => .money,
             };
         }
 
@@ -687,6 +695,7 @@ pub fn Values(comptime config: Config) type {
                 .time => |value| order(i64, value, right.time),
                 .timetz => |value| time_of_day.compareTimeTz(value, right.timetz),
                 .bits => |*value| BitString.compare(value, &right.bits),
+                .money => |value| order(i64, value, right.money),
             };
         }
 
@@ -744,7 +753,7 @@ pub fn Values(comptime config: Config) type {
                     for (numeric.numeric_hash(number)) |limb| mix(&code, limb);
                 },
                 .date => |days| return wordHash(@bitCast(@as(i64, days)), tag),
-                .timestamp, .timestamptz, .time => |us| return wordHash(@bitCast(us), tag),
+                .timestamp, .timestamptz, .time, .money => |us| return wordHash(@bitCast(us), tag),
                 .timetz => |time| {
                     mix(&code, tag);
                     mix(&code, @bitCast(time.us));

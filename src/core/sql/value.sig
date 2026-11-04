@@ -20,6 +20,7 @@ const uuid = @import("uuid.sig");
 const bytea = @import("bytea.sig");
 const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
+const money = @import("money.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -98,6 +99,15 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         // I/O conversion: to a string type in assignment, from one explicitly.
         if (to == .bpchar) return context != .implicit;
         return context == .explicit;
+    }
+    if (from == .money or to == .money) {
+        // int4/int8/numeric -> money and money -> numeric are assignment
+        // casts; strings by I/O conversion; nothing else.
+        if (to == .money and (from == .int4 or from == .int8 or from == .numeric)) return context != .implicit;
+        if (from == .money and to == .numeric) return context != .implicit;
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
     }
     if (bitType(from) or bitType(to)) {
         // bit <-> varbit are implicit (binary); int4/int8 <-> bit explicit.
@@ -305,6 +315,7 @@ pub fn Io(comptime config: types.Config) type {
                 .time => |value| time_of_day.format(value, buffer),
                 .timetz => |value| time_of_day.formatTz(value, buffer),
                 .bits => |*value| value.format(buffer),
+                .money => |value| money.format(value, buffer),
             };
         }
 
@@ -387,6 +398,7 @@ pub fn Io(comptime config: types.Config) type {
                 },
                 .time, .timetz => try parseTime(ty, input, session),
                 .bit, .varbit => .{ .bits = try V.BitString.parse(input) },
+                .money => .{ .money = try money.parse(input) },
             };
             return applyTypmod(cell, ty, typmod);
         }
@@ -580,6 +592,11 @@ pub fn Io(comptime config: types.Config) type {
                     .float4 => |value| V.Cell{ .numeric = try floatToNumeric(value, 6) },
                     .float8 => |value| V.Cell{ .numeric = try floatToNumeric(value, 15) },
                     .text => |*value| try parse(.numeric, -1, value.slice(), session),
+                    // cash_numeric: the amount with scale 2.
+                    .money => |value| blk: {
+                        var digits: [32]u8 = undefined;
+                        break :blk V.Cell{ .numeric = try N.parse(money.decimal(value, &digits)) };
+                    },
                     else => return error.CannotCoerce,
                 },
                 .float4 => switch (cell) {
@@ -694,6 +711,19 @@ pub fn Io(comptime config: types.Config) type {
                     .text => |*value| try parse(.time, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
+                .money => switch (cell) {
+                    .money => cell,
+                    // int4_cash / int8_cash.
+                    .integer => |value| V.Cell{ .money = try money.fromInteger(value) },
+                    // numeric_cash: amount * 100 rounded half away from zero.
+                    .numeric => |*value| blk: {
+                        const hundred = N.fromInt(money.scale);
+                        const cents = try N.mul(value, &hundred);
+                        break :blk V.Cell{ .money = try N.toInt(&cents, -9223372036854775808, 9223372036854775807) };
+                    },
+                    .text => |*value| try parse(.money, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
                 .bit, .varbit => switch (cell) {
                     .bits => cell,
                     .text => |*value| try parse(to, -1, value.slice(), session),
@@ -729,6 +759,7 @@ pub fn Io(comptime config: types.Config) type {
         /// both sides to the operator's type) and the datetime operators.
         pub fn arithmetic(op: ast.Op, left: *const V.Cell, right: *const V.Cell, result: Type, session: *const Session) Error!V.Cell {
             if (try timeArithmetic(op, left, right)) |cell| return cell;
+            if (try moneyArithmetic(op, left, right)) |cell| return cell;
             switch (left.*) {
                 .integer => |a| switch (right.*) {
                     .integer => |b| {
@@ -816,6 +847,40 @@ pub fn Io(comptime config: types.Config) type {
                     .date => |b| if (op == .add) return .{ .timestamptz = try dateTimeTz(b, a) },
                     else => {},
                 },
+                else => {},
+            }
+            return null;
+        }
+
+        /// MONEY operators (cash.c): money +- money, money * / integer or
+        /// float8, number * money and money / money (float8).
+        fn moneyArithmetic(op: ast.Op, left: *const V.Cell, right: *const V.Cell) Error!?V.Cell {
+            switch (left.*) {
+                .money => |a| switch (right.*) {
+                    .money => |b| return switch (op) {
+                        .add => .{ .money = try money.add(a, b) },
+                        .sub => .{ .money = try money.sub(a, b) },
+                        .div => .{ .float8 = try money.ratio(a, b) },
+                        else => error.UndefinedFunction,
+                    },
+                    .integer => |b| return switch (op) {
+                        .mul => .{ .money = try money.mulInteger(a, b) },
+                        .div => .{ .money = try money.divInteger(a, b) },
+                        else => error.UndefinedFunction,
+                    },
+                    .float8, .float4 => {
+                        const b: f64 = if (right.* == .float8) right.float8 else right.float4;
+                        return switch (op) {
+                            .mul => .{ .money = try money.mulFloat(a, b) },
+                            .div => .{ .money = try money.divFloat(a, b) },
+                            else => error.UndefinedFunction,
+                        };
+                    },
+                    else => {},
+                },
+                .integer => |a| if (right.* == .money and op == .mul) return .{ .money = try money.mulInteger(right.money, a) },
+                .float8 => |a| if (right.* == .money and op == .mul) return .{ .money = try money.mulFloat(right.money, a) },
+                .float4 => |a| if (right.* == .money and op == .mul) return .{ .money = try money.mulFloat(right.money, a) },
                 else => {},
             }
             return null;

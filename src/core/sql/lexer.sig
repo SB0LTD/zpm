@@ -200,6 +200,7 @@ pub const Keyword = enum {
     timetz,
     bit,
     varbit,
+    money,
 };
 
 /// Words that cannot be unquoted identifiers.

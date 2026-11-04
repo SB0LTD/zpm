@@ -29,7 +29,8 @@
 //!   | 11 jsonb len u32 + canonical bytes | 12 bpchar len u32 + padded bytes
 //!   (VARCHAR values use 3) | 13 uuid 16 bytes | 14 bytea len u32 + bytes
 //!   | 15 time i64 | 16 timetz {us i64, zone i32 seconds west}
-//!   | 17 bit/varbit bit length u32 + packed bytes (zero padded). Every value is checked against the
+//!   | 17 bit/varbit bit length u32 + packed bytes (zero padded)
+//!   | 18 money i64 cents. Every value is checked against the
 //!   column's type OID (create_table) before anything applies.
 //! Ops may repeat a (table, rowid) and apply in record order.
 //!
@@ -254,6 +255,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 16);
                     try writer.int(i64, value.us);
                     try writer.int(i32, value.zone);
+                },
+                .money => |value| {
+                    try writer.int(u8, 18);
+                    try writer.int(i64, value);
                 },
                 .bits => |*value| {
                     try writer.int(u8, 17);
@@ -602,6 +607,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     if (!time_of_day.validTime(us)) return error.InvalidChangeRecord;
                     break :blk .{ .time = us };
                 },
+                18 => .{ .money = try reader.int(i64) },
                 17 => blk: {
                     const bits = try reader.int(u32);
                     if (bits > V.BitString.max_bits) return error.ChangeRecordConflict;

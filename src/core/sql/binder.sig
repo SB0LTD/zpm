@@ -552,8 +552,34 @@ pub fn Binder(comptime config: types.Config) type {
             return error.UndefinedFunction;
         }
 
+        /// Operators of MONEY (cash.c): money +- money -> money; money *
+        /// int2/int4/int8/float4/float8 and the reverse -> money; money /
+        /// those -> money; money / money -> float8. NUMERIC operands resolve
+        /// the float8 operators (numeric -> float8 is implicit). An untyped
+        /// operand is money, except for `*` (float8, the preferred type).
+        fn moneyArithmetic(context: *const Context, n: *ast.Node) Error!void {
+            if (n.op != .add and n.op != .sub and n.op != .mul and n.op != .div) return error.UndefinedFunction;
+            if (context.node(n.a).ty == .unknown) try coerce(context, n.a, if (n.op == .mul) .float8 else .money);
+            if (context.node(n.b).ty == .unknown) try coerce(context, n.b, if (n.op == .mul) .float8 else .money);
+            const left = context.node(n.a).ty;
+            const right = context.node(n.b).ty;
+            if (left == .money and right == .money) {
+                if (n.op == .mul) return error.UndefinedFunction;
+                n.ty = if (n.op == .div) .float8 else .money;
+                return;
+            }
+            const scalar = if (left == .money) right else left;
+            if (n.op == .add or n.op == .sub or (n.op == .div and right == .money)) return error.UndefinedFunction;
+            if (!value.numericCategory(scalar)) return error.UndefinedFunction;
+            if (scalar == .numeric) {
+                if (left == .money) n.b = try convert(context, n.b, .float8, -1, .implicit) else n.a = try convert(context, n.a, .float8, -1, .implicit);
+            }
+            n.ty = .money;
+        }
+
         fn arithmeticType(context: *const Context, n: *ast.Node) Error!void {
             if (context.node(n.a).ty == .unknown and context.node(n.b).ty == .unknown) return error.AmbiguousFunction;
+            if (context.node(n.a).ty == .money or context.node(n.b).ty == .money) return moneyArithmetic(context, n);
             if (timeType(context.node(n.a).ty) or timeType(context.node(n.b).ty)) return timeArithmetic(context, n);
             var left = context.node(n.a).ty;
             var right = context.node(n.b).ty;
@@ -758,7 +784,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .sum => switch (arg_ty) {
                     .int2, .int4 => .int8,
                     .int8, .numeric => .numeric,
-                    .float4, .float8, .interval => arg_ty,
+                    .float4, .float8, .interval, .money => arg_ty,
                     else => return error.UndefinedFunction,
                 },
                 .avg => switch (arg_ty) {
@@ -768,7 +794,7 @@ pub fn Binder(comptime config: types.Config) type {
                     else => return error.UndefinedFunction,
                 },
                 .min, .max => switch (arg_ty) {
-                    .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval, .bpchar, .time, .timetz => arg_ty,
+                    .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval, .bpchar, .time, .timetz, .money => arg_ty,
                     .name, .varchar => blk: {
                         n.b = try convert(context, arg, .text, -1, .implicit);
                         break :blk .text;

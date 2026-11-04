@@ -686,12 +686,104 @@ fn bit() !void {
     try meta(2, 1562, 12);
 }
 
+// ---- MONEY -------------------------------------------------------------------
+
+fn moneyType() !void {
+    // oracle: PG.TYPE.MONEY (lc_monetary = C).
+    try exec("CREATE TABLE tdd_type(v MONEY)");
+    try exec("INSERT INTO tdd_type VALUES(1),(NULL)");
+    try rows("SELECT v FROM tdd_type ORDER BY v NULLS LAST", "$1.00;NULL");
+    try meta(0, 790, -1);
+    try exec("DROP TABLE tdd_type");
+
+    // cash_in forms: symbol, separators, signs, parentheses, rounding of a
+    // third fraction digit.
+    try rows("SELECT '12.34'::money, '$1,234.5'::money, '-$1.00'::money, '(2.50)'::money, '12.345'::money, '12.344'::money, ' 7 '::money, '1000000'::money",
+        "$12.34|$1,234.50|-$1.00|-$2.50|$12.35|$12.34|$7.00|$1,000,000.00");
+    try meta(0, 790, -1);
+    try rows("SELECT '0.001'::money, '-0.005'::money, '0.005'::money, '+$3'::money, '$-4'::money, '5-'::money, MONEY '6.1'",
+        "$0.00|-$0.01|$0.01|$3.00|-$4.00|-$5.00|$6.10");
+    try rows("SELECT '92233720368547758.07'::money, '-92233720368547758.08'::money", "$92,233,720,368,547,758.07|-$92,233,720,368,547,758.08");
+    try rejects("SELECT '92233720368547758.08'::money", error.NumericValueOutOfRange);
+    try sqlstate(error.NumericValueOutOfRange, "22003");
+    try rejects("SELECT '100000000000000000000'::money", error.NumericValueOutOfRange);
+    try rejects("SELECT 'abc'::money", error.InvalidTextRepresentation);
+    try rejects("SELECT '1.2.3'::money", error.InvalidTextRepresentation);
+    try rejects("SELECT '12 34'::money", error.InvalidTextRepresentation);
+
+    // Casts: int4/int8/numeric -> money by assignment; money -> numeric;
+    // text by I/O; no float casts.
+    try rows("SELECT 1::money, 12345678901::bigint::money, 1.555::money, '1.5'::money::numeric, (-2.5)::money::numeric, '1'::money::text",
+        "$1.00|$12,345,678,901.00|$1.56|1.50|-2.50|$1.00");
+    try meta(3, 1700, -1);
+    try meta(5, 25, -1);
+    try rejects("SELECT 100000000000000000::bigint::money", error.NumericValueOutOfRange);
+    try rejects("SELECT 1.5::float8::money", error.CannotCoerce);
+    try rejects("SELECT '1'::money::float8", error.CannotCoerce);
+    try rejects("SELECT '1'::money::int4", error.CannotCoerce);
+
+    // Operators.
+    try rows("SELECT '1.50'::money + '2.25'::money, '5'::money - '7.5'::money, '1.50'::money * 2, 2 * '1.50'::money, '1'::money * 1.5, '10'::money / 4, '10'::money / 3, '-10'::money / 3",
+        "$3.75|-$2.50|$3.00|$3.00|$1.50|$2.50|$3.33|-$3.33");
+    try meta(0, 790, -1);
+    try meta(4, 790, -1);
+    try rows("SELECT '10'::money / 4.0, '10'::money / '4'::money, '0.03'::money * 0.5, '0.05'::money * 0.5, '1'::money + '2'", "$2.50|2.5|$0.02|$0.02|$3.00");
+    try meta(1, 701, -1);
+    try rejects("SELECT '1'::money / 0", error.DivisionByZero);
+    try sqlstate(error.DivisionByZero, "22012");
+    try rejects("SELECT '1'::money / '0'::money", error.DivisionByZero);
+    try rejects("SELECT '1'::money / 0.0", error.DivisionByZero);
+    try rejects("SELECT '92233720368547758.07'::money + '0.01'::money", error.NumericValueOutOfRange);
+    try rejects("SELECT '92233720368547758.07'::money * 2", error.NumericValueOutOfRange);
+    try rejects("SELECT '1'::money + 1", error.UndefinedFunction);
+    try rejects("SELECT '1'::money = 1", error.UndefinedFunction);
+    try rejects("SELECT '1'::money * '2'::money", error.UndefinedFunction);
+
+    try exec("CREATE TABLE cash(id INT PRIMARY KEY, amount MONEY NOT NULL, fee MONEY)");
+    try exec("INSERT INTO cash VALUES(1, '12.50', NULL), (2, 3, '0.25'), (3, -1.005, '1'), (4, '$1,000', '0.25')");
+    try rows("SELECT amount FROM cash ORDER BY amount", "-$1.01;$3.00;$12.50;$1,000.00");
+    try rows("SELECT id FROM cash WHERE amount > '2.99' AND fee = '0.25' ORDER BY id", "2;4");
+    try rows("SELECT SUM(amount), MIN(amount), MAX(fee), COUNT(DISTINCT fee), SUM(fee) FROM cash", "$1,014.49|-$1.01|$1.00|2|$1.50");
+    try meta(0, 790, -1);
+    try meta(1, 790, -1);
+    try rows("SELECT amount + COALESCE(fee, '0') FROM cash ORDER BY id", "$12.50;$3.25;-$0.01;$1,000.25");
+    try rejects("INSERT INTO cash VALUES(5, 'oops', NULL)", error.InvalidTextRepresentation);
+    try rejects("INSERT INTO cash VALUES(5, 1, NULL), (6, NULL, NULL)", error.NotNullViolation);
+    try rejects("UPDATE cash SET amount = amount * 100000000000000", error.NumericValueOutOfRange);
+    try rows("SELECT COUNT(*), SUM(amount) FROM cash", "4|$1,014.49");
+    try rejects("INSERT INTO cash VALUES(5, 1.5::float8, NULL)", error.TypeMismatch);
+    try rows("SELECT NULL::money, format_type(790, NULL), 'money'::regtype::text", "NULL|money|money");
+    try rows("SELECT data_type, numeric_precision FROM information_schema.columns WHERE table_name = 'cash' AND column_name = 'fee'", "money|NULL");
+    try exec("DROP TABLE cash");
+
+    // Wire: i64 cents.
+    try check(Wire.oid(.money) == 790 and Wire.length(.money) == 8);
+    try exec("SELECT '-1234.56'::money");
+    try sendText(&result.rows[0].cells[0], "-$1,234.56");
+    try sendBinary(&result.rows[0].cells[0], .money, &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x1d, 0xc0 });
+    try receive(&.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x1d, 0xc0 }, .money, "-$1,234.56");
+    try literal(&.{ 0, 0, 0, 0, 0, 0, 0, 100 }, 790, 1, "'$1.00'::money");
+    try literal("$1,000.00", 790, 0, "'$1,000.00'::money");
+    var out: [64]u8 = undefined;
+    try check(if (Wire.receiveText(&.{ 0, 0, 0, 1 }, .money, &out)) |_| false else |err| err == error.ProtocolViolation);
+
+    // Durability.
+    try replay(&.{
+        "CREATE TABLE r(id INT PRIMARY KEY, m MONEY)",
+        "INSERT INTO r VALUES(1, '12.34'), (2, NULL), (3, '-92233720368547758.08')",
+        "UPDATE r SET m = m * 2 WHERE id = 1",
+    }, "SELECT * FROM r ORDER BY id");
+    try shown("replica", "1|$24.68;2|NULL;3|-$92,233,720,368,547,758.08");
+    try meta(1, 790, -1);
+}
+
 pub fn main(init: std.process.Init) !void {
     try character();
     try uuid();
     try bytea();
     try time();
     try bit();
+    try moneyType();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-types-core\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);
