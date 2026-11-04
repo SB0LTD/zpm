@@ -17,3 +17,6 @@ cli/zig-out/
 # Tooling
 graphify-out/
 
+
+# tools/sweep_sm120.py --keep
+.sm120-sweep/

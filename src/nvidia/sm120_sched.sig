@@ -32,7 +32,8 @@
 //!   follows latencies across blocks; this is simpler, and costs a few
 //!   cycles a loop iteration.)
 //! - NAK's exec latency: BAR holds the next instruction back 6 cycles
-//!   (NAK's extra NOP after it is left out: ptxas's S06 is the same).
+//!   (NAK's extra NOP after it is left out: ptxas's S06 is the same);
+//!   WARPSYNC 5, as ptxas's S05 after it.
 //! - A stall over 15 cycles is split with NOPs after the instruction.
 //!
 //! `check` verifies a scheduled kernel against the same model on its own,
@@ -234,7 +235,7 @@ fn decoupledCats(cat: lat.Reg) Cats {
 /// as a 64-bit dispatch's, UMOV.64 as UMOV, VIMNMX as IMNMX, FSEL and
 /// FCHK as NAK's notes have them (alu, decoupled; FSEL's predicate as
 /// SEL's), F2IP as F2FP, LOP3's predicate result as PLOP3's, CALL as a
-/// branch, WARPSYNC's and RET's registers as a branch's reads.
+/// branch, RET's registers as a branch's reads, WARPSYNC's as an ALU's.
 pub fn usesOf(in: *const sm120.Instr) Error!Uses {
     var u = Uses{};
     const o = in.operands();
@@ -255,7 +256,11 @@ pub fn usesOf(in: *const sm120.Instr) Error!Uses {
         u.ends = (eql(op, "EXIT") or eql(op, "RET")) and in.guard.n == sm120.PT and !in.guard.not;
         regs(&u, in, 0, .{ .gpr = r(.branch), .pred = p(.decoupled), .upred = up(.bra_jmp) });
     } else if (eql(op, "WARPSYNC")) {
-        regs(&u, in, 0, .{ .gpr = r(.branch) });
+        // (its register read at issue, as an ALU's: the word cannot take
+        // the scoreboard a branch's register read would; and ptxas's S05
+        // after it, as BAR's exec latency)
+        regs(&u, in, 0, .{ .gpr = r(.alu) });
+        u.exec = 5;
     } else if (eql(op, "BAR")) {
         u.decoupled = true;
         u.exec = 6;
