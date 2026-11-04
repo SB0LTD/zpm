@@ -61,6 +61,25 @@ fn emuDevice() gpu.Device {
 
 const EmuRun = struct { stats: kir_ir3.Stats, ir3: adreno.ir3_emu.Stats };
 
+/// Kernels checked against ir3's operand rules (adreno.device.checkWords).
+var checked_kernels: u32 = 0;
+
+/// What kir_ir3 made must obey every operand rule the strict emulated
+/// Adreno enforces (const/shared sources per category, immediates, the
+/// constants and registers the kernel declares).
+fn checkBinary(name: []const u8, bin: *const gpu.Binary) !void {
+    const cfg = kir_ir3.Config.fromExtra(bin.extra) orelse return error.TestUnexpectedResult;
+    const code: []const u64 = @alignCast(std.mem.bytesAsSlice(u64, bin.code[0..cfg.code_bytes]));
+    if (adreno.device.checkWords(cfg.gen, code[0..cfg.count], cfg.constlen, cfg.full_regs)) |bad| {
+        var buf: [160]u8 = undefined;
+        const in = adreno.ir3.decode(cfg.gen, code[bad.pc]) catch adreno.ir3.Instr{};
+        const text = adreno.ir3.format(cfg.gen, &in, &buf) catch "?";
+        std.debug.print("{s}: instruction {d} ({s}) breaks an operand rule: {s}\n{s}\n", .{ name, bad.pc, text, bad.rule, kir_ir3.listing(&Rig.work, &Rig.listing) });
+        return error.TestUnexpectedResult;
+    }
+    checked_kernels += 1;
+}
+
 /// The kernel on the emulated Adreno: buffers copied in, run, copied back.
 fn runEmu(k: *kir.Kernel, groups: [3]u32, bufs: []const []u8, params: []const u32) !EmuRun {
     // (a fresh device per run: buffers do not pile up)
@@ -72,6 +91,7 @@ fn runEmu(k: *kir.Kernel, groups: [3]u32, bufs: []const []u8, params: []const u3
         return e;
     };
     const stats = Rig.work.stats;
+    try checkBinary(k.name, &bin);
     const p = try d.load(&bin);
     var gb: [16]gpu.Buffer = undefined;
     for (bufs, 0..) |b, i| {
@@ -85,7 +105,7 @@ fn runEmu(k: *kir.Kernel, groups: [3]u32, bufs: []const []u8, params: []const u3
         const at = Rig.emu.gpu.emu.err_pc;
         var buf: [160]u8 = undefined;
         const text = adreno.ir3.format(adreno.ir3.A7XX, &Rig.emu.gpu.emu.code[at], &buf) catch "?";
-        std.debug.print("{s}: emulated Adreno: {s} at {d}: {s} (fault at 0x{x})\n{s}\n", .{ k.name, if (Rig.emu.lastError()) |x| @errorName(x) else "?", at, text, Rig.emu.fault().va, kir_ir3.listing(&Rig.work, &Rig.listing) });
+        std.debug.print("{s}: emulated Adreno: {s} at {d}: {s} (fault at 0x{x}; {s})\n{s}\n", .{ k.name, if (Rig.emu.lastError()) |x| @errorName(x) else "?", at, text, Rig.emu.fault().va, Rig.emu.gpu.fault.rule, kir_ir3.listing(&Rig.work, &Rig.listing) });
         return e;
     };
     for (bufs, 0..) |b, i| {
@@ -847,6 +867,7 @@ fn runKir(k: *kir.Kernel, groups: [3]u32, bufs: []const gpu.Buffer, params: []co
         return e;
     };
     const st = Rig.work.stats;
+    try checkBinary(k.name, &bin);
     const p = try d.load(&bin);
     const before = Rig.emu.gpu.stats.instructions;
     const fence = try d.run(&.{.{ .prog = &p, .groups = groups, .buffers = bufs, .params = params }});
