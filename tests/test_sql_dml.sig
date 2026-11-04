@@ -236,7 +236,7 @@ fn sequences() !void {
     try expect("SELECT nextval('c'), nextval('c'), nextval('c')", "1|2|1");
     try autocommit("CREATE SEQUENCE d INCREMENT BY -2 START WITH -1");
     try expect("SELECT nextval('d'), nextval('d')", "-1|-3");
-    try rejectsOnly("CREATE SEQUENCE z CACHE 5", error.UnsupportedStatement);
+    try rejectsOnly("CREATE SEQUENCE z CACHE 0", error.InvalidParameterValue);
     try rejectsOnly("CREATE SEQUENCE z INCREMENT 0", error.InvalidParameterValue);
     try rejectsOnly("CREATE SEQUENCE z MINVALUE 5 MAXVALUE 5", error.InvalidParameterValue);
     try rejectsOnly("CREATE SEQUENCE z START 100 MAXVALUE 10", error.InvalidParameterValue);

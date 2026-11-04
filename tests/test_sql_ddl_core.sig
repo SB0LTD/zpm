@@ -23,6 +23,7 @@ fn check(ok: bool) !void {
     assertions += 1;
     if (!ok) {
         std.debug.print("ddl-core contract failed at assertion {d}\n", .{assertions});
+        std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress() });
         return error.DdlCoreContractFailed;
     }
 }
@@ -218,7 +219,7 @@ fn truncateErrors() !void {
     try rejects("TRUNCATE t, missing", error.TableNotFound, "SELECT COUNT(*) FROM t", "1");
     try run("CREATE SEQUENCE trunc_seq");
     try rejects("TRUNCATE trunc_seq", error.WrongObjectType, "SELECT COUNT(*) FROM t", "1");
-    try rejects("TRUNCATE t RESTART IDENTITY", error.UnsupportedStatement, "SELECT COUNT(*) FROM t", "1");
+
     try rejects("TRUNCATE", error.Syntax, "SELECT COUNT(*) FROM t", "1");
     try rejects("TRUNCATE t RESTART", error.Syntax, "SELECT COUNT(*) FROM t", "1");
 }
@@ -766,6 +767,177 @@ fn alterIsolation() !void {
     try check(db.usage().transactions == 0 and db.usage().table_locks == 0);
 }
 
+// ---- sequences: SERIAL, CACHE, ALTER SEQUENCE ----------------------------------
+
+const sequence_probes = [_][]const u8{
+    "SELECT relname, relkind FROM pg_class WHERE relnamespace = 2200 ORDER BY relname",
+    "SELECT seqtypid, seqstart, seqincrement, seqmax, seqmin, seqcache, seqcycle FROM pg_sequence ORDER BY seqrelid",
+    "SELECT table_name, column_name, column_default, is_nullable, data_type FROM information_schema.columns WHERE column_default IS NOT NULL ORDER BY table_name, ordinal_position",
+};
+
+fn int(target: *DB, source: []const u8) !i64 {
+    var result: DB.Result = .{};
+    target.execute(source, &result) catch |err| {
+        std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
+        return err;
+    };
+    return result.rows[0].cells[0].integer;
+}
+
+fn serialColumns() !void {
+    reset();
+    try run("CREATE TABLE tdd_serial (id SERIAL PRIMARY KEY, label TEXT)");
+    try run("INSERT INTO tdd_serial (label) VALUES ('a'), ('b')");
+    try run("INSERT INTO tdd_serial VALUES (10, 'explicit')");
+    try run("INSERT INTO tdd_serial (label) VALUES ('c')");
+    try expect("SELECT id, label FROM tdd_serial ORDER BY id", "1|a;2|b;3|c;10|explicit");
+    try expect(sequence_probes[0], "tdd_serial|r;tdd_serial_id_seq|S;tdd_serial_pkey|i");
+    try expect(sequence_probes[2], "tdd_serial|id|nextval('tdd_serial_id_seq'::regclass)|NO|integer");
+    try expect(sequence_probes[1], "23|1|1|2147483647|1|1|f");
+    try run("CREATE TABLE big (b BIGSERIAL, s SMALLSERIAL, x SERIAL4)");
+    try run("INSERT INTO big DEFAULT VALUES");
+    try expect("SELECT b, s, x FROM big", "1|1|1");
+    try expect("SELECT data_type FROM information_schema.columns WHERE table_name = 'big' ORDER BY ordinal_position", "bigint;smallint;integer");
+    try expect("SELECT seqtypid, seqmax FROM pg_sequence WHERE seqrelid = 'big_s_seq'::regclass", "21|32767");
+    // A taken name gets a number (ChooseRelationName).
+    try run("CREATE SEQUENCE clash_id_seq");
+    try run("CREATE TABLE clash (id SERIAL)");
+    try expect("SELECT column_default FROM information_schema.columns WHERE table_name = 'clash'", "nextval('clash_id_seq1'::regclass)");
+    try rejects("CREATE TABLE bad (id SERIAL DEFAULT 1)", error.Syntax, sequence_probes[0], "big|r;big_b_seq|S;big_s_seq|S;big_x_seq|S;clash|r;clash_id_seq|S;clash_id_seq1|S;tdd_serial|r;tdd_serial_id_seq|S;tdd_serial_pkey|i");
+    try rejects("DROP SEQUENCE tdd_serial_id_seq", error.DependentObjects, "SELECT COUNT(*) FROM tdd_serial", "4");
+    try rejects("INSERT INTO tdd_serial (id) VALUES (NULL)", error.NotNullViolation, "SELECT COUNT(*) FROM tdd_serial", "4");
+    try sameState(&sequence_probes);
+    try sameState(&.{"SELECT id, label FROM tdd_serial ORDER BY id"});
+    // The replica continues beyond every value the primary handed out.
+    try check(try int(&replica, "SELECT nextval('tdd_serial_id_seq')") > 3);
+    try run("DROP TABLE tdd_serial");
+    try expect("SELECT COUNT(*) FROM pg_class WHERE relname = 'tdd_serial_id_seq'", "0");
+    try sameState(&sequence_probes);
+}
+
+var session_a: DB.SequenceSession = .{};
+var session_b: DB.SequenceSession = .{};
+
+/// A replicated statement in one session (Store.Connection installs each
+/// connection's own sequence state the same way).
+fn sessionValue(session: *DB.SequenceSession, source: []const u8) !i64 {
+    db.sequence_session = session;
+    defer db.sequence_session = null;
+    const result = try replicate(source);
+    return result.rows[0].cells[0].integer;
+}
+
+/// The primary's value from a replicated statement.
+fn primaryValue(source: []const u8) !i64 {
+    const result = try replicate(source);
+    return result.rows[0].cells[0].integer;
+}
+
+fn sequenceCache() !void {
+    reset();
+    session_a = .{};
+    session_b = .{};
+    try run("CREATE SEQUENCE tdd_seq CACHE 4");
+    try expect("SELECT seqcache FROM pg_sequence", "4");
+    // PostgreSQL: each session preallocates CACHE values.
+    try check(try sessionValue(&session_a, "SELECT nextval('tdd_seq')") == 1);
+    try check(try sessionValue(&session_b, "SELECT nextval('tdd_seq')") == 5);
+    try check(try sessionValue(&session_a, "SELECT nextval('tdd_seq')") == 2);
+    try check(try sessionValue(&session_b, "SELECT nextval('tdd_seq')") == 6);
+    try check(try sessionValue(&session_a, "SELECT nextval('tdd_seq')") == 3);
+    try check(try sessionValue(&session_a, "SELECT nextval('tdd_seq')") == 4);
+    try check(try sessionValue(&session_a, "SELECT nextval('tdd_seq')") == 9);
+    try check(try sessionValue(&session_a, "SELECT currval('tdd_seq')") == 9);
+    // setval forgets the session's preallocated values.
+    try check(try sessionValue(&session_b, "SELECT setval('tdd_seq', 100)") == 100);
+    try check(try sessionValue(&session_b, "SELECT nextval('tdd_seq')") == 101);
+    try check(try sessionValue(&session_a, "SELECT nextval('tdd_seq')") == 10);
+    // Durable watermark: the replica starts beyond every fetched value.
+    _ = try replicate("SELECT nextval('tdd_seq')");
+    try check(try int(&replica, "SELECT nextval('tdd_seq')") > 104);
+    try rejects("CREATE SEQUENCE bad CACHE 0", error.InvalidParameterValue, "SELECT COUNT(*) FROM pg_sequence", "1");
+    try sameState(&sequence_probes);
+    // A cached identity sequence.
+    try run("CREATE TABLE ci (id INT GENERATED ALWAYS AS IDENTITY (CACHE 3), v INT)");
+    try run("INSERT INTO ci (v) VALUES (1), (2)");
+    try expect("SELECT id FROM ci ORDER BY id", "1;2");
+    try sameState(&.{ "SELECT id, v FROM ci ORDER BY id", sequence_probes[1] });
+}
+
+fn alterSequences() !void {
+    reset();
+    try run("CREATE TABLE tdd_serial (id SERIAL PRIMARY KEY)");
+    try run("CREATE SEQUENCE tdd_seq CACHE 4");
+    const altered = try replicate("ALTER SEQUENCE tdd_seq RESTART WITH 9");
+    try check(altered.command == .alter_sequence);
+    try check(try primaryValue("SELECT nextval('tdd_seq')") == 9);
+    try run("ALTER SEQUENCE tdd_seq INCREMENT BY 5 CACHE 1 MAXVALUE 40 NO CYCLE");
+    try check(try primaryValue("SELECT nextval('tdd_seq')") == 17);
+    try check(try primaryValue("SELECT nextval('tdd_seq')") == 22);
+    try expect("SELECT seqstart, seqincrement, seqmax, seqcache, seqcycle FROM pg_sequence WHERE seqrelid = 'tdd_seq'::regclass", "1|5|40|1|f");
+    try run("ALTER SEQUENCE tdd_seq RESTART");
+    try check(try primaryValue("SELECT nextval('tdd_seq')") == 1);
+    try run("ALTER SEQUENCE tdd_seq START WITH 3 RESTART CYCLE");
+    try check(try primaryValue("SELECT nextval('tdd_seq')") == 3);
+    try run("ALTER SEQUENCE IF EXISTS missing RESTART");
+    // 22023 when the current value leaves the new bounds; 42P01, 42809,
+    // 0A000 for OWNED BY / RENAME; nothing changes.
+    try run("ALTER SEQUENCE tdd_seq RESTART WITH 30");
+    try rejects("ALTER SEQUENCE tdd_seq MAXVALUE 20", error.InvalidParameterValue, "SELECT seqmax FROM pg_sequence WHERE seqrelid = 'tdd_seq'::regclass", "40");
+    try rejects("ALTER SEQUENCE tdd_seq RESTART WITH 41", error.InvalidParameterValue, "SELECT seqmax FROM pg_sequence WHERE seqrelid = 'tdd_seq'::regclass", "40");
+    try rejects("ALTER SEQUENCE missing RESTART", error.TableNotFound, "SELECT COUNT(*) FROM pg_sequence", "2");
+    try rejects("ALTER SEQUENCE tdd_serial RESTART", error.WrongObjectType, "SELECT COUNT(*) FROM pg_sequence", "2");
+    try rejects("ALTER SEQUENCE tdd_seq OWNED BY NONE", error.UnsupportedStatement, "SELECT COUNT(*) FROM pg_sequence", "2");
+    try rejects("ALTER SEQUENCE tdd_seq INCREMENT BY 0", error.InvalidParameterValue, "SELECT seqincrement FROM pg_sequence WHERE seqrelid = 'tdd_seq'::regclass", "5");
+    try sameState(&sequence_probes);
+    try check(try int(&replica, "SELECT nextval('tdd_seq')") == 30);
+    try check(try primaryValue("SELECT nextval('tdd_seq')") == 30);
+    // Transactional: abort and ROLLBACK TO restore the previous sequence.
+    var tx = try db.begin();
+    try statement(tx, "ALTER SEQUENCE tdd_seq RESTART WITH 2");
+    try same(try rows(tx, "SELECT nextval('tdd_seq')"), "2");
+    db.abort(tx);
+    try check(try primaryValue("SELECT nextval('tdd_seq')") == 35);
+    tx = try db.begin();
+    try db.savepoint(tx, "s");
+    try statement(tx, "ALTER SEQUENCE tdd_seq INCREMENT BY -1");
+    _ = try db.rollbackTo(tx, "s");
+    try same(try rows(tx, "SELECT nextval('tdd_seq')"), "40");
+    try commit(tx);
+    // Another session's nextval waits for an uncommitted ALTER SEQUENCE.
+    const alterer = try db.begin();
+    try statement(alterer, "ALTER SEQUENCE tdd_seq RESTART WITH 7 INCREMENT BY 1 MAXVALUE 100");
+    const consumer = try db.begin();
+    try parks(consumer, "SELECT nextval('tdd_seq')");
+    try check(db.waitingFor(consumer).has(alterer));
+    try commit(alterer);
+    try same(try resumed(consumer, "SELECT nextval('tdd_seq')"), "7");
+    try commit(consumer);
+    try sameState(&sequence_probes);
+    // An identity sequence, and TRUNCATE ... RESTART IDENTITY.
+    try run("CREATE TABLE ident (id INT GENERATED ALWAYS AS IDENTITY, v INT)");
+    try run("INSERT INTO ident (v) VALUES (1), (2), (3)");
+    try run("ALTER SEQUENCE ident_id_seq RESTART WITH 50");
+    try run("INSERT INTO ident (v) VALUES (4)");
+    try expect("SELECT id FROM ident ORDER BY id", "1;2;3;50");
+    tx = try db.begin();
+    try statement(tx, "TRUNCATE ident RESTART IDENTITY");
+    try statement(tx, "INSERT INTO ident (v) VALUES (5)");
+    try same(try rows(tx, "SELECT id, v FROM ident"), "1|5");
+    db.abort(tx);
+    try run("INSERT INTO ident (v) VALUES (6)");
+    try expect("SELECT id FROM ident ORDER BY id", "1;2;3;50;51");
+    try run("TRUNCATE ident, tdd_serial RESTART IDENTITY");
+    try run("INSERT INTO ident (v) VALUES (7)");
+    try run("INSERT INTO tdd_serial DEFAULT VALUES");
+    try expect("SELECT id, v FROM ident", "1|7");
+    try expect("SELECT id FROM tdd_serial", "1");
+    try sameState(&sequence_probes);
+    try sameState(&.{ "SELECT id, v FROM ident", "SELECT id FROM tdd_serial" });
+    try check(try int(&replica, "SELECT nextval('ident_id_seq')") > 1);
+    try check(db.usage().transactions == 0 and db.usage().pending_versions == 0);
+}
+
 pub fn main(init: std.process.Init) !void {
     try truncateTable();
     try truncateErrors();
@@ -779,6 +951,9 @@ pub fn main(init: std.process.Init) !void {
     try alterErrors();
     try alterTransactions();
     try alterIsolation();
+    try serialColumns();
+    try sequenceCache();
+    try alterSequences();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-ddl-core\",\"pass\":true,\"assertions\":{d},\"records\":{d},\"database_bytes\":{d}}}\n", .{ assertions, records_applied, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

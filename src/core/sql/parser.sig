@@ -205,6 +205,15 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and self.rawWord("alter")) {
                 try self.advance();
                 if (try self.takeWord("TABLE")) return .{ .alter_table = try self.alterTable() };
+                if (try self.takeWord("SEQUENCE")) {
+                    var out: Ast.AlterSequence = .{ .if_exists = try self.ifExists() };
+                    out.name = try self.qualifiedName();
+                    try self.sequenceOptions(&out.options);
+                    // OWNED BY, RENAME TO, SET SCHEMA ... are outside the subset.
+                    if (self.current.kind != .end and !self.isSymbol(.semicolon)) return error.UnsupportedStatement;
+                    try self.finish();
+                    return .{ .alter_sequence = out };
+                }
                 return error.UnsupportedStatement;
             }
             if (self.mode == .legacy_alpha) {
@@ -864,6 +873,15 @@ pub fn Parser(comptime config: types.Config) type {
                 } else if (try self.takeWord("CYCLE")) {
                     option=32;
                     out.cycle = true;
+                    out.cycle_set = true;
+                } else if (self.mode == .standard and try self.takeRaw("restart")) {
+                    option=128;
+                    out.restart = true;
+                    if (try self.takeWord("WITH")) {
+                        out.restart_value = try self.signedInteger();
+                    } else if (self.current.kind == .integer or (self.current.kind == .symbol and (self.current.symbol == .minus or self.current.symbol == .plus))) {
+                        out.restart_value = try self.signedInteger();
+                    }
                 } else if (try self.takeWord("NO")) {
                     if (try self.takeWord("MINVALUE")) {
                         option=2;
@@ -877,6 +895,7 @@ pub fn Parser(comptime config: types.Config) type {
                         try self.expectWord("CYCLE");
                         option=32;
                         out.cycle = false;
+                        out.cycle_set = true;
                     }
                 } else if (try self.takeWord("AS")) {
                     option=64;
@@ -999,11 +1018,27 @@ pub fn Parser(comptime config: types.Config) type {
         /// and named PRIMARY KEY constraints go to `sink`.
         fn columnDef(self: *Self, if_not_exists: bool, invalid: *bool, has_primary: *bool, sink: ConstraintSink) Error!Ast.ColumnDef {
             var column: Ast.ColumnDef = .{ .name = try self.identifier() };
-            const spec = try self.typeName();
-            // regclass/regtype columns are outside the subset.
-            if (spec.typmod < -1) return error.UnsupportedStatement;
-            column.type_name = spec.ty;
-            column.typmod = spec.typmod;
+            // SMALLSERIAL / SERIAL / BIGSERIAL: an integer column owning a
+            // sequence that its DEFAULT draws from (binder).
+            const serials = [_]struct { word: []const u8, ty: ast.TypeName, oid: u32 }{
+                .{ .word = "serial", .ty = .int4, .oid = 23 },      .{ .word = "serial4", .ty = .int4, .oid = 23 },
+                .{ .word = "bigserial", .ty = .int8, .oid = 20 },   .{ .word = "serial8", .ty = .int8, .oid = 20 },
+                .{ .word = "smallserial", .ty = .int2, .oid = 21 }, .{ .word = "serial2", .ty = .int2, .oid = 21 },
+            };
+            for (serials) |serial| {
+                if (self.mode == .standard and self.current.kind == .word and types.keyword(self.current.raw(self.source), serial.word)) {
+                    try self.advance();
+                    column.type_name = serial.ty;
+                    column.serial = serial.oid;
+                    break;
+                }
+            } else {
+                const spec = try self.typeName();
+                // regclass/regtype columns are outside the subset.
+                if (spec.typmod < -1) return error.UnsupportedStatement;
+                column.type_name = spec.ty;
+                column.typmod = spec.typmod;
+            }
             var has_not_null = false;
             while (true) {
                 var name: ?ast.Ident = null;

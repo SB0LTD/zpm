@@ -50,7 +50,14 @@ pub fn Binder(comptime config: types.Config) type {
             constraints: [config.table_constraints]S.Constraint = undefined,
             constraint_count: usize = 0,
             namespace: u32 = catalog.public_namespace,
+            /// SERIAL columns' owned sequences, created after the table.
+            serials: [config.columns]Identity = undefined,
+            serial_count: usize = 0,
         };
+
+        /// ALTER SEQUENCE target slot and options (resolved against the
+        /// sequence's current state when it runs).
+        pub const AlterSequence = struct { slot: usize, options: sequence.Options };
 
         pub const CreateSequence = struct { name: V.Name, spec: sequence.Spec };
 
@@ -137,6 +144,7 @@ pub fn Binder(comptime config: types.Config) type {
             control: ast.Control,
             truncate: Truncate,
             alter_table: AlterTable,
+            alter_sequence: AlterSequence,
         };
 
         /// ALTER TABLE: the complete new definition of table `table`. New
@@ -360,6 +368,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .delete => .delete,
                 .truncate => .truncate,
                 .alter_table => .alter_table,
+                .alter_sequence => .alter_sequence,
                 .control => |control| switch (control) {
                     .begin, .set_transaction => .begin,
                     .commit => .commit,
@@ -4065,6 +4074,16 @@ pub fn Binder(comptime config: types.Config) type {
                         if (text.len > config.text_bytes) return error.TextCapacity;
                         column.expression.len = text.len;
                         @memcpy(column.expression.bytes[0..text.len], text);
+                        if (definition.serial != 0) {
+                            // PostgreSQL: multiple default values (42601).
+                            if (definition.default_kind != .none) return error.Syntax;
+                            const seq_name = try serialSequence(context, &out, column.name);
+                            column.not_null = true;
+                            column.default_kind = .default;
+                            column.expression = try serialDefault(seq_name);
+                            out.serials[out.serial_count] = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(.{ .type_oid = definition.serial }) };
+                            out.serial_count += 1;
+                        }
                         switch (definition.default_kind) {
                             .identity_always, .identity_by_default => {
                                 if (!integerColumn(column.data_type)) return error.TypeMismatch;
@@ -4200,7 +4219,49 @@ pub fn Binder(comptime config: types.Config) type {
                 .copy => return error.UnsupportedStatement,
                 .truncate => |*truncate| return .{ .truncate = try bindTruncate(context, truncate) },
                 .alter_table => |*alter| return bindAlter(context, alter),
+                .alter_sequence => |*alter| {
+                    if (alter.name.schema) |qualifier| {
+                        if (!types.same(toName(context, qualifier).slice(), "public")) return error.TableNotFound;
+                    }
+                    const wanted = toName(context, alter.name.name);
+                    const found = context.catalog.find(wanted.slice(), context.snapshot) orelse {
+                        if (alter.if_exists) return .{ .noop = .alter_sequence };
+                        return error.TableNotFound;
+                    };
+                    if (found.kind != 'S') return error.WrongObjectType;
+                    return .{ .alter_sequence = .{ .slot = found.slot, .options = alter.options } };
+                },
             }
+        }
+
+        /// A SERIAL column's sequence `<table>_<column>_seq` (ChooseRelationName
+        /// numbering when taken) and its DEFAULT text nextval('name'::regclass).
+        fn serialSequence(context: *const Context, out: *const Create, column: V.Name) Error!V.Name {
+            var taken: [config.columns + 1]S.Constraint = undefined;
+            var count: usize = 0;
+            for (out.serials[0..out.serial_count]) |serial| {
+                taken[count] = .{ .name = serial.name };
+                count += 1;
+            }
+            if (out.identity) |identity| {
+                taken[count] = .{ .name = identity.name };
+                count += 1;
+            }
+            return chooseName(context, out.name.slice(), column.slice(), "seq", taken[0..count], true);
+        }
+
+        fn serialDefault(name: V.Name) Error!V.Text {
+            var out: V.Text = .{};
+            try appendText(&out, "nextval('");
+            var plain = name.len != 0 and !types.digit(name.bytes[0]);
+            for (name.slice()) |byte| {
+                if (!((byte >= 'a' and byte <= 'z') or types.digit(byte) or byte == '_')) plain = false;
+            }
+            if (!plain) try appendText(&out, "\"");
+            for (name.slice()) |byte| try appendText(&out, if (byte == '\'') "''" else if (byte == '"') "\"\"" else &[_]u8{byte});
+            if (!plain) try appendText(&out, "\"");
+            try appendText(&out, "'::regclass)");
+            return out;
         }
 
         // ---- ALTER TABLE ------------------------------------------------

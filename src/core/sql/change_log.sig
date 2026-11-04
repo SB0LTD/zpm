@@ -34,6 +34,11 @@
 //!    12 alter_table   oid u32, the new definition (as create_table after its
 //!                     OID), then per new column: source u8 (old column index,
 //!                     or 255 for an added column followed by its fill value)
+//!    13 create_sequence_cached  op 7's fields, then cache i64 (CACHE > 1;
+//!                     CACHE 1 keeps writing op 7)
+//!    14 alter_sequence oid u32, type_oid u32, increment i64, min i64, max
+//!                     i64, start i64, cycle u8, cache i64, last_value i64,
+//!                     is_called u8 (options and state after ALTER SEQUENCE)
 //!   name: len u8 + bytes. value: 0 null | 1 i64 | 2 bool u8 | 3 len u32 + bytes
 //!   | 4 f32 bits u32 | 5 f64 bits u64 | 6 numeric {special u8, negative u8,
 //!   dscale u16, coefficient 4 x u64} | 7 date i32 | 8 timestamp i64
@@ -72,7 +77,7 @@ pub const expr_format_version: u16 = 1;
 /// create_table definitions that carry a namespace and table constraints.
 pub const definition_format_version: u16 = 2;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12 };
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14 };
 
 fn Unsigned(comptime T: type) type {
     return switch (T) {
@@ -320,7 +325,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
         }
 
         pub fn encodeCreateSequence(writer: *Writer, seq: anytype) Error!void {
-            try writer.op(.create_sequence);
+            try writer.op(if (seq.spec.cache != 1) .create_sequence_cached else .create_sequence);
             try writer.int(u32, seq.oid);
             try writer.name(seq.name.slice());
             try writer.int(u32, seq.spec.type_oid);
@@ -331,6 +336,21 @@ pub fn ChangeLog(comptime config: types.Config) type {
             try writer.int(u8, @intFromBool(seq.spec.cycle));
             try writer.int(u32, seq.owner);
             try writer.int(u8, seq.owner_column);
+            if (seq.spec.cache != 1) try writer.int(i64, seq.spec.cache);
+        }
+
+        pub fn encodeAlterSequence(writer: *Writer, seq: anytype) Error!void {
+            try writer.op(.alter_sequence);
+            try writer.int(u32, seq.oid);
+            try writer.int(u32, seq.spec.type_oid);
+            try writer.int(i64, seq.spec.increment);
+            try writer.int(i64, seq.spec.min);
+            try writer.int(i64, seq.spec.max);
+            try writer.int(i64, seq.spec.start);
+            try writer.int(u8, @intFromBool(seq.spec.cycle));
+            try writer.int(i64, seq.spec.cache);
+            try writer.int(i64, seq.last_value);
+            try writer.int(u8, @intFromBool(seq.is_called));
         }
 
         pub fn encodeDropSequence(writer: *Writer, oid: u32) Error!void {
@@ -466,6 +486,32 @@ pub fn ChangeLog(comptime config: types.Config) type {
             const spec = out.spec;
             if ((spec.type_oid != 20 and spec.type_oid != 21 and spec.type_oid != 23) or spec.increment == 0 or spec.min >= spec.max or spec.start < spec.min or spec.start > spec.max)
                 return error.InvalidChangeRecord;
+            return out;
+        }
+
+        fn validSpec(spec: sequence.Spec) bool {
+            return (spec.type_oid == 20 or spec.type_oid == 21 or spec.type_oid == 23) and spec.increment != 0 and spec.min < spec.max and
+                spec.start >= spec.min and spec.start <= spec.max and spec.cache >= 1;
+        }
+
+        /// Op 14 fields after the OID.
+        const SequenceState = struct { spec: sequence.Spec, last_value: i64, is_called: bool };
+
+        fn decodeSequenceState(reader: *Reader) Error!SequenceState {
+            var out: SequenceState = .{ .spec = .{}, .last_value = 0, .is_called = false };
+            out.spec.type_oid = try reader.int(u32);
+            out.spec.increment = try reader.int(i64);
+            out.spec.min = try reader.int(i64);
+            out.spec.max = try reader.int(i64);
+            out.spec.start = try reader.int(i64);
+            const cycle = try reader.int(u8);
+            out.spec.cache = try reader.int(i64);
+            out.last_value = try reader.int(i64);
+            const called = try reader.int(u8);
+            if (cycle > 1 or called > 1 or !validSpec(out.spec)) return error.InvalidChangeRecord;
+            out.spec.cycle = cycle == 1;
+            out.is_called = called == 1;
+            if (out.last_value < out.spec.min or out.last_value > out.spec.max) return error.InvalidChangeRecord;
             return out;
         }
 
@@ -1079,8 +1125,16 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             scratch.tables[index].next_rowid = next;
                         }
                     },
-                    @intFromEnum(Op.create_sequence) => {
-                        const definition = try decodeCreateSequence(&reader);
+                    @intFromEnum(Op.alter_sequence) => {
+                        _ = try findVSeq(scratch, try reader.int(u32));
+                        _ = try decodeSequenceState(&reader);
+                    },
+                    @intFromEnum(Op.create_sequence), @intFromEnum(Op.create_sequence_cached) => {
+                        var definition = try decodeCreateSequence(&reader);
+                        if (tag == @intFromEnum(Op.create_sequence_cached)) {
+                            definition.spec.cache = try reader.int(i64);
+                            if (definition.spec.cache <= 1) return error.InvalidChangeRecord;
+                        }
                         if (definition.oid < first_oid or definition.oid == 0xffffffff or oidTaken(db, scratch, definition.oid, 1)) return error.ChangeRecordConflict;
                         if (nameTaken(scratch, definition.name.slice())) return error.ChangeRecordConflict;
                         if (definition.owner != 0) {
@@ -1239,8 +1293,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             table.next_rowid = try reader.int(u64);
                         }
                     },
-                    @intFromEnum(Op.create_sequence) => {
-                        const definition = try decodeCreateSequence(&reader);
+                    @intFromEnum(Op.alter_sequence) => {
+                        const index = try seqByOid(db, try reader.int(u32));
+                        const state = try decodeSequenceState(&reader);
+                        db.seqs[index].spec = state.spec;
+                        sequence.Sequences(config).restore(&db.seqs[index], state.last_value, state.is_called);
+                    },
+                    @intFromEnum(Op.create_sequence), @intFromEnum(Op.create_sequence_cached) => {
+                        var definition = try decodeCreateSequence(&reader);
+                        if (tag == @intFromEnum(Op.create_sequence_cached)) definition.spec.cache = try reader.int(i64);
                         for (&db.seqs, 0..) |*seq, index| if (!seq.live) {
                             sequence.Sequences(config).init(seq, definition.oid, definition.name, definition.spec, definition.owner, definition.owner_column);
                             try db.replayCreateSequence(index, csn);

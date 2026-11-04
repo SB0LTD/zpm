@@ -265,6 +265,15 @@ pub fn Ast(comptime config: types.Config) type {
             expression: Span = .{},
             /// Identity sequence options.
             sequence: sequence.Options = .{},
+            /// SERIAL family: the owned sequence's AS type OID (0: none).
+            serial: u32 = 0,
+        };
+
+        /// ALTER SEQUENCE [IF EXISTS] name options (RESTART included).
+        pub const AlterSequence = struct {
+            if_exists: bool = false,
+            name: TableRef = .{},
+            options: sequence.Options = .{},
         };
 
         pub const ConstraintKind = enum { check, unique, primary };
@@ -510,6 +519,7 @@ pub fn Ast(comptime config: types.Config) type {
             copy: Copy,
             truncate: Truncate,
             alter_table: AlterTable,
+            alter_sequence: AlterSequence,
         };
     };
 }

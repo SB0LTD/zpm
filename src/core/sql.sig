@@ -1299,6 +1299,10 @@ pub fn Database(comptime config: Config) type {
                     try self.alterTable(slot, alter, snap);
                     break :blk 0;
                 },
+                .alter_sequence => |*alter| blk: {
+                    try self.alterSequence(slot, alter.slot, alter.options, snap);
+                    break :blk 0;
+                },
                 .select, .query, .control => unreachable,
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound), .noop = bound == .noop };
@@ -1437,9 +1441,66 @@ pub fn Database(comptime config: Config) type {
             for (&self.seqs, 0..) |*seq, index| {
                 if (!seq.live or seq.owner != oid or seq.owner_column != column or seq.dead_csn != 0) continue;
                 if (seq.pending_create and seq.creator != self.seq_slot) continue;
+                // This transaction replaced it (ALTER SEQUENCE) or dropped it.
+                if (seq.pending_drop and seq.creator == self.seq_slot) continue;
                 return index;
             }
             return error.TableNotFound;
+        }
+
+        /// ALTER SEQUENCE (PostgreSQL 10+ makes it transactional): the
+        /// sequence is copied into a free sequence slot with the new options
+        /// and, for RESTART, the new state; the catalog swaps the relation in
+        /// this transaction, as ALTER TABLE does. Other sessions' nextval
+        /// waits for it (PostgreSQL's lock); abort discards the copy. The
+        /// own session forgets its cached values.
+        fn alterSequence(self: *Self, slot: u16, index: usize, options: sequence_module.Options, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            const seq = &self.seqs[index];
+            if (seq.pending_drop and seq.creator != slot) {
+                var waits: L.Set = .{};
+                waits.add(seq.creator);
+                tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                return self.park(slot, waits);
+            }
+            const altered = try sequence_module.alter(seq.spec, seq.last_value, options);
+            try self.reserveWrites(slot, 5);
+            var destination: ?usize = null;
+            for (0..2) |attempt| {
+                for (&self.seqs, 0..) |*candidate, position| if (!candidate.live) {
+                    destination = position;
+                    break;
+                };
+                if (destination != null or attempt == 1) break;
+                self.reclaimTables(self.horizon());
+            }
+            const fresh_slot = destination orelse return error.TableCapacity;
+            const copy = &self.seqs[fresh_slot];
+            copy.* = seq.*;
+            copy.spec = altered.spec;
+            // The copy logs again before handing out a value.
+            copy.log_cnt = 0;
+            if (altered.restart) |value| {
+                copy.last_value = value;
+                copy.is_called = false;
+                copy.logged_value = value;
+                copy.logged_called = false;
+            }
+            copy.live = true;
+            copy.pending_create = true;
+            copy.pending_drop = false;
+            copy.dead_csn = 0;
+            copy.creator = slot;
+            seq.pending_drop = true;
+            seq.creator = slot;
+            tx.push(.{ .kind = .alter_sequence, .table = @intCast(fresh_slot), .old = @intCast(index) }) catch unreachable;
+            var changes: [K.max_changes]K.Change = undefined;
+            var count = self.catalog.dropSequence(index, snap, tx.ref(slot), snap.cid, 0, &changes);
+            for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
+            count = try self.catalog.createSequence(fresh_slot, copy, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
+            for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
+            const session = self.sequence_session orelse &self.default_sequences;
+            session.forget(copy.oid);
         }
 
         /// regclass text input: optional `public.` qualifier, quoted names
@@ -1555,8 +1616,27 @@ pub fn Database(comptime config: Config) type {
             const index = if (kind == .identity) try self.identitySequence(oid, @intCast(amount)) else if (oid != 0) try self.sequenceByOid(oid) else try self.sequenceByName(name);
             const seq = &self.seqs[index];
             const tx = &self.txs[self.seq_slot];
+            if (kind != .currval and seq.pending_drop and seq.creator != self.seq_slot and self.active(seq.creator)) {
+                // Another transaction is replacing or dropping it: wait, as
+                // nextval/setval wait for PostgreSQL's sequence lock.
+                if (tx.running_snap == null) return error.LockNotAvailable;
+                var waits: L.Set = .{};
+                waits.add(seq.creator);
+                tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                return self.park(self.seq_slot, waits);
+            }
             switch (kind) {
                 .nextval, .identity => {
+                    if (seq.spec.cache > 1) {
+                        if (session.cachedNext(seq.oid)) |value| return value;
+                        const batch = try Q.nextCached(seq);
+                        if (batch.logged) {
+                            tx.seq_dirty.add(index);
+                            self.seq_carried.add(index);
+                        }
+                        session.recordBatch(seq.oid, batch.value, batch.last, seq.spec.increment, LiveOids{ .db = self });
+                        return batch.value;
+                    }
                     const out = try Q.next(seq);
                     if (out.logged) {
                         tx.seq_dirty.add(index);
@@ -1568,6 +1648,7 @@ pub fn Database(comptime config: Config) type {
                 .currval => return session.currval(seq.oid) orelse error.SequenceNotReady,
                 .setval => {
                     try Q.set(seq, amount, called);
+                    session.forget(seq.oid);
                     tx.seq_dirty.add(index);
                     self.seq_carried.add(index);
                     if (called) {
@@ -1671,7 +1752,7 @@ pub fn Database(comptime config: Config) type {
                         const seq = &self.seqs[found.slot];
                         switch (view) {
                             .pg_class => try sink.add(&.{ intCell(seq.oid), nameCell(seq.name.slice()), intCell(public), nameCell("S"), intCell(3) }),
-                            .pg_sequence => try sink.add(&.{ intCell(seq.oid), intCell(seq.spec.type_oid), intCell(seq.spec.start), intCell(seq.spec.increment), intCell(seq.spec.max), intCell(seq.spec.min), intCell(1), boolCell(seq.spec.cycle) }),
+                            .pg_sequence => try sink.add(&.{ intCell(seq.oid), intCell(seq.spec.type_oid), intCell(seq.spec.start), intCell(seq.spec.increment), intCell(seq.spec.max), intCell(seq.spec.min), intCell(seq.spec.cache), boolCell(seq.spec.cycle) }),
                             else => {},
                         }
                         continue;
@@ -1908,6 +1989,7 @@ pub fn Database(comptime config: Config) type {
             const count = try self.catalog.create(index, table, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
             if (create.identity) |identity| try self.createSequence(slot, identity.name, identity.spec, table.oid, identity.column, snap);
+            for (create.serials[0..create.serial_count]) |serial| try self.createSequence(slot, serial.name, serial.spec, table.oid, serial.column, snap);
             const generated_context = self.bindContext("", .standard, snap);
             try B.validateGenerated(&generated_context, index);
             try B.validateConstraints(&generated_context, index);
@@ -1941,9 +2023,24 @@ pub fn Database(comptime config: Config) type {
         /// dead versions, abort or ROLLBACK TO clears exactly these marks.
         /// RESTART IDENTITY is not provided (0A000).
         fn truncateTables(self: *Self, slot: u16, truncate: *const B.Truncate, snap: Snapshot) Error!void {
-            if (truncate.restart_identity) return error.UnsupportedStatement;
             for (truncate.tables[0..truncate.count]) |index| try self.lockTable(slot, index, .access_exclusive);
             try self.reserveWrites(slot, truncate.count);
+            // RESTART IDENTITY: every sequence a column of the table owns
+            // (identity, SERIAL) restarts, transactionally (ALTER SEQUENCE).
+            if (truncate.restart_identity) {
+                // Collect first: each restart fills another sequence slot.
+                var owned: [config.sequences]bool = @splat(false);
+                for (truncate.tables[0..truncate.count]) |index| {
+                    const oid = self.tables[index].oid;
+                    for (&self.seqs, 0..) |*seq, position| {
+                        if (!seq.live or seq.owner != oid or seq.dead_csn != 0) continue;
+                        if (seq.pending_create and seq.creator != slot) continue;
+                        if (seq.pending_drop and seq.creator == slot) continue;
+                        owned[position] = true;
+                    }
+                }
+                for (owned, 0..) |restart, position| if (restart) try self.alterSequence(slot, position, .{ .restart = true }, snap);
+            }
             const tx = &self.txs[slot];
             for (truncate.tables[0..truncate.count]) |index| {
                 const table = &self.tables[index];
@@ -2605,6 +2702,7 @@ pub fn Database(comptime config: Config) type {
                     .create_sequence => try C.encodeCreateSequence(writer, &self.seqs[entry.table]),
                     .drop_sequence => try C.encodeDropSequence(writer, self.seqs[entry.table].oid),
                     .truncate => try C.encodeTruncate(writer, self.tables[entry.table].oid),
+                    .alter_sequence => try C.encodeAlterSequence(writer, &self.seqs[entry.table]),
                     .alter_table => {
                         const table = &self.tables[entry.table];
                         try C.encodeAlter(writer, table, self.alters[entry.table].sources[0..table.column_count], self.alters[entry.table].fills[0..table.column_count]);
