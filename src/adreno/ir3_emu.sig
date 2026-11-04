@@ -101,7 +101,21 @@ pub const Work = struct {
     /// Where an error happened (instruction index), for messages.
     err_pc: u32 = 0,
     check_hazards: bool = true,
+    /// Optional, stricter than the memory regions: the buffers this
+    /// dispatch was given. Every global access must lie inside one, and an
+    /// ldg.a/stg.a whose base is a constant (a binding's address) inside
+    /// the one starting at that base, so running past a binding is a fault
+    /// even where another buffer happens to follow.
+    bounds: []const Bound = &.{},
+    /// Local memory the kernel was given (bytes); past it is a fault.
+    local_limit: u32 = LOCAL_BYTES,
+    /// The address of the last fault (global, or local with `fault_local`).
+    fault_va: u64 = 0,
+    fault_local: bool = false,
 };
+
+/// A buffer a dispatch may access.
+pub const Bound = struct { va: u64, bytes: u64 };
 
 // ── Register access ─────────────────────────────────────────────────────────
 
@@ -744,6 +758,7 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
         .ldg, .ldg_a => {
             for (fibers) |f| {
                 const va = globalAddr(c, f, in);
+                try checkBounds(c, f, in, va, tb * in.size);
                 const bytes = c.mem.find(va, tb * in.size) orelse return faultAt(c, va);
                 for (0..in.size) |k| writeReg(c, f, in.dst.num + @as(u16, @intCast(k)), in.dst.half, loadValue(bytes[k * tb ..], in.ty));
             }
@@ -753,6 +768,7 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
         .stg, .stg_a => {
             for (fibers) |f| {
                 const va = globalAddr(c, f, in);
+                try checkBounds(c, f, in, va, tb * in.size);
                 const bytes = c.mem.find(va, tb * in.size) orelse return faultAt(c, va);
                 for (0..in.size) |k| storeValue(bytes[k * tb ..], in.ty, readReg(c, f, in.src[2].num + @as(u16, @intCast(k)), in.src[2].half));
             }
@@ -761,7 +777,7 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
         .ldl => {
             for (fibers) |f| {
                 const a: i64 = @as(i64, readFull(c, f, in.src[0].num)) + in.off;
-                if (a < 0 or a + tb * in.size > LOCAL_BYTES) return error.Fault;
+                if (a < 0 or a + tb * in.size > c.w.local_limit) return localFault(c, a);
                 const at: usize = @intCast(a);
                 for (0..in.size) |k| writeReg(c, f, in.dst.num + @as(u16, @intCast(k)), in.dst.half, loadValue(w.local[at + k * tb ..], in.ty));
             }
@@ -770,7 +786,7 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
         .stl => {
             for (fibers) |f| {
                 const a: i64 = @as(i64, readFull(c, f, in.src[0].num)) + in.off;
-                if (a < 0 or a + tb * in.size > LOCAL_BYTES) return error.Fault;
+                if (a < 0 or a + tb * in.size > c.w.local_limit) return localFault(c, a);
                 const at: usize = @intCast(a);
                 for (0..in.size) |k| storeValue(w.local[at + k * tb ..], in.ty, readReg(c, f, in.src[1].num + @as(u16, @intCast(k)), in.src[1].half));
             }
@@ -813,6 +829,7 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
             for (fibers) |f| {
                 const va = @as(u64, readFull(c, f, in.src[0].num + 1)) << 32 | readFull(c, f, in.src[0].num);
                 if (va & 3 != 0) return error.Fault;
+                try checkBounds(c, f, in, va, 4);
                 const bytes = c.mem.find(va, 4) orelse return faultAt(c, va);
                 const v = if (in.src[1].kind == .imm) in.src[1].imm else readFull(c, f, in.src[1].num);
                 const old = std.mem.readInt(u32, bytes[0..4], .little);
@@ -828,7 +845,7 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
             if (in.src[1].kind == .gpr) try checkRead(c, in.src[1].num, false, false, slot0);
             for (fibers) |f| {
                 const a = if (in.src[0].kind == .imm) in.src[0].imm else readFull(c, f, in.src[0].num);
-                if (a & 3 != 0 or @as(u64, a) + 4 > LOCAL_BYTES) return error.Fault;
+                if (a & 3 != 0 or @as(u64, a) + 4 > c.w.local_limit) return localFault(c, a);
                 const v = if (in.src[1].kind == .imm) in.src[1].imm else readFull(c, f, in.src[1].num);
                 const word = w.local[a..][0..4];
                 const old = std.mem.readInt(u32, word, .little);
@@ -858,9 +875,33 @@ fn atomicOp(op: ir3.Op, ty: ir3.Type, old: u32, v: u32) u32 {
 }
 
 fn faultAt(c: *Ctx, va: u64) Error {
-    _ = c;
-    _ = va;
+    c.w.fault_va = va;
+    c.w.fault_local = false;
     return error.Fault;
+}
+
+fn localFault(c: *Ctx, a: i64) Error {
+    c.w.fault_va = @bitCast(a);
+    c.w.fault_local = true;
+    return error.Fault;
+}
+
+/// A global access of `len` bytes at `va` against the dispatch's buffers.
+fn checkBounds(c: *Ctx, f: u32, in: *const Instr, va: u64, len: u64) Error!void {
+    const bounds = c.w.bounds;
+    if (bounds.len == 0) return;
+    // a binding's base in the constants: that buffer, and no other
+    if ((in.op == .ldg_a or in.op == .stg_a) and in.src[0].kind == .cnst) {
+        const base = addr64(c, f, in.src[0]);
+        for (bounds) |b| if (b.va == base) {
+            if (va < b.va or va + len > b.va + b.bytes) return faultAt(c, va);
+            return;
+        };
+    }
+    for (bounds) |b| {
+        if (va >= b.va and va + len <= b.va + b.bytes) return;
+    }
+    return faultAt(c, va);
 }
 
 // ── Dispatch ────────────────────────────────────────────────────────────────
@@ -1186,4 +1227,52 @@ test "atomics: global add and max, local add, fiber by fiber" {
         try std.testing.expectEqual(@as(u32, @intCast(t)), data[5 + 2 * t]);
         before += @intCast(t);
     }
+}
+
+test "bounds: a read past its binding faults, even into the next buffer" {
+    // two buffers back to back: reading a's word 64 lands in b
+    var a = [_]u32{1} ** 64;
+    var b = [_]u32{2} ** 64;
+    const regions = [_]Region{
+        .{ .va = 0x1_0000_0000, .bytes = std.mem.sliceAsBytes(&a) },
+        .{ .va = 0x1_0000_0100, .bytes = std.mem.sliceAsBytes(&b) },
+    };
+    const mem = Memory{ .regions = &regions };
+    const consts = [_]u32{ 0x0000_0000, 1, 0x0000_0100, 1 };
+    const src =
+        \\@localsize 1, 1, 1
+        \\@consts 1
+        \\mov.u32u32 r1.x, 256
+        \\ldg.a.u32 r0.x, g[c0.x+r1.x+0], 1
+        \\mov.u32u32 r1.y, 0
+        \\stg.a.u32 g[c0.z+r1.y+4], r0.x, 1
+        \\end
+    ;
+    // without bounds the regions allow it
+    emu_work.bounds = &.{};
+    _ = try runSource(src, &mem, &consts, .{ 1, 1, 1 });
+    try std.testing.expectEqual(@as(u32, 2), b[1]);
+    const bounds = [_]Bound{ .{ .va = 0x1_0000_0000, .bytes = 256 }, .{ .va = 0x1_0000_0100, .bytes = 256 } };
+    emu_work.bounds = &bounds;
+    defer emu_work.bounds = &.{};
+    var code: [64]u64 = undefined;
+    const k = try ir3_asm.assemble(ir3.A7XX, src, &asm_work, &code);
+    try load(&emu_work, &k);
+    var stats = Stats{};
+    try std.testing.expectError(error.Fault, run(&emu_work, &mem, &.{ .kernel = &k, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats));
+    try std.testing.expectEqual(@as(u64, 0x1_0000_0100), emu_work.fault_va);
+    // local memory past the kernel's share
+    emu_work.local_limit = 64;
+    defer emu_work.local_limit = LOCAL_BYTES;
+    emu_work.bounds = &.{};
+    const k2 = try ir3_asm.assemble(ir3.A7XX,
+        \\@localsize 1, 1, 1
+        \\@shared 64
+        \\mov.u32u32 r1.x, 64
+        \\stl.u32 l[r1.x], r1.x, 1
+        \\end
+    , &asm_work, &code);
+    try load(&emu_work, &k2);
+    try std.testing.expectError(error.Fault, run(&emu_work, &mem, &.{ .kernel = &k2, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats));
+    try std.testing.expect(emu_work.fault_local);
 }
