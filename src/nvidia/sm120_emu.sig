@@ -790,8 +790,18 @@ fn compile(in: *const Instr, given: ?u64, n_code: usize) Error!Op {
     const o = in.operands();
     try body(&op, in, name, o, given, n_code);
     op.uses = sched.usesOf(in) catch fallbackUses(&op, in);
+    // (an LDC's index register is read too: NAK's category, decoupled)
+    if (op.kind == .ldc and op.s[0].index != RZ and !reads(&op.uses, .gpr, op.s[0].index)) add(&op.uses, false, .gpr, op.s[0].index, @intFromEnum(lat.Reg.decoupled));
     op.top = sm120.highestGpr(in);
+    if (op.kind == .ldc and op.s[0].index != RZ) op.top = @max(op.top orelse 0, op.s[0].index);
     return op;
+}
+
+fn reads(u: *const sched.Uses, file: sched.File, n: u8) bool {
+    for (u.srcs()) |x| {
+        if (x.file == file and x.n == n) return true;
+    }
+    return false;
 }
 
 fn body(op: *Op, in: *const Instr, name: []const u8, o: []const Operand, given: ?u64, n_code: usize) Error!void {
@@ -2569,6 +2579,54 @@ test "divergence reconverges; a loop; BAR.SYNC; shared memory; SHFL.BFLY; VOTE" 
         try testing.expectEqual(sum + 1600, out[wv * 2]);
         try testing.expectEqual(@as(u32, 0xaaaa_aaaa), out[8 + wv * 2]);
     }
+}
+
+test "a warp-collective waits for the lanes still running, wherever they are" {
+    var out = [_]u32{0} ** 32;
+    const regions = [_]Region{.{ .va = 0x6000, .bytes = std.mem.sliceAsBytes(&out) }};
+    var cb: [qmd.CBUF0_WORDS]u32 = undefined;
+    const p = [_]u64{0x6000};
+    const l = try launchOf(&cb, .{ 32, 1, 1 }, std.mem.asBytes(&p));
+    // (lanes 0..15 reach the SHFL first, while 16..31 still run a detour
+    // further on that comes back to it: the SHFL must wait for them, so
+    // every lane reads lane 31's index)
+    _ = try runText(
+        \\S2R R0, SR_TID.X
+        \\LDC.64 R6, c[0x0][0x380]
+        \\LDCU.64 UR4, c[0x0][0x358]
+        \\ISETP.GE.U32.AND P0, PT, R0, 0x10, PT
+        \\@P0 BRA `(detour)
+        \\back:
+        \\SHFL.IDX PT, R3, R0, 0x1f, 0x1f
+        \\VOTE.ALL R4, P1, PT
+        \\IMAD.WIDE.U32 R8, R0, 0x4, R6
+        \\STG.E desc[UR4][R8.64], R3
+        \\EXIT
+        \\detour:
+        \\IADD R5, R0, 0x1
+        \\BRA `(back)
+    , &l, &regions);
+    for (out) |v| try testing.expectEqual(@as(u32, 31), v);
+}
+
+test "LDC with an index register, and its read checked" {
+    var out = [_]u32{0} ** 4;
+    const regions = [_]Region{.{ .va = 0x7000, .bytes = std.mem.sliceAsBytes(&out) }};
+    var cb: [qmd.CBUF0_WORDS]u32 = undefined;
+    const p = [_]u64{ 0x7000, 0x1111_2222_3333_4444 };
+    const l = try launchOf(&cb, .{ 1, 1, 1 }, std.mem.asBytes(&p));
+    _ = try runText(
+        \\LDC.64 R2, c[0x0][0x380]
+        \\LDCU.64 UR4, c[0x0][0x358]
+        \\MOV R4, 0x4
+        \\LDC R5, c[0x0][R4+0x388]
+        \\STG.E desc[UR4][R2.64], R5
+        \\EXIT
+    , &l, &regions);
+    try testing.expectEqual(@as(u32, 0x1111_2222), out[0]);
+    // (the index from S2R, read before its scoreboard is waited on)
+    try testing.expectError(error.Hazard, runText("[B------:R-:W0:Y:S02] S2R R4, SR_TID.X\n[B------:R-:W1:Y:S02] LDC R5, c[0x0][R4+0x388]\n[B------:R-:W-:Y:S05] EXIT", &l, &regions));
+    try testing.expectEqual(@as(u8, 4), test_work.trap.reg);
 }
 
 test "local memory: the stack window, faults outside it" {
