@@ -803,8 +803,58 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
             for (fibers) |f| writeReg(c, f, in.dst.num, false, f - c.wave * c.threadsize);
             noteWrite(c, in.dst.num, false, .sy, slot0);
         },
+        .atomic_g_add, .atomic_g_sub, .atomic_g_xchg, .atomic_g_min, .atomic_g_max, .atomic_g_and, .atomic_g_or, .atomic_g_xor => {
+            // dst = the old word; the word = op(old, value); fiber by fiber
+            if (in.src[0].kind == .gpr) {
+                try checkRead(c, in.src[0].num, false, false, slot0);
+                try checkRead(c, in.src[0].num + 1, false, false, slot0);
+            }
+            if (in.src[1].kind == .gpr) try checkRead(c, in.src[1].num, false, false, slot0);
+            for (fibers) |f| {
+                const va = @as(u64, readFull(c, f, in.src[0].num + 1)) << 32 | readFull(c, f, in.src[0].num);
+                if (va & 3 != 0) return error.Fault;
+                const bytes = c.mem.find(va, 4) orelse return faultAt(c, va);
+                const v = if (in.src[1].kind == .imm) in.src[1].imm else readFull(c, f, in.src[1].num);
+                const old = std.mem.readInt(u32, bytes[0..4], .little);
+                std.mem.writeInt(u32, bytes[0..4], atomicOp(in.op, in.ty, old, v), .little);
+                writeReg(c, f, in.dst.num, false, old);
+            }
+            c.stats.global_bytes_read += fibers.len * 4;
+            c.stats.global_bytes_written += fibers.len * 4;
+            noteWrite(c, in.dst.num, false, .sy, slot0);
+        },
+        .atomic_add, .atomic_sub, .atomic_xchg, .atomic_min, .atomic_max, .atomic_and, .atomic_or, .atomic_xor => {
+            if (in.src[0].kind == .gpr) try checkRead(c, in.src[0].num, false, false, slot0);
+            if (in.src[1].kind == .gpr) try checkRead(c, in.src[1].num, false, false, slot0);
+            for (fibers) |f| {
+                const a = if (in.src[0].kind == .imm) in.src[0].imm else readFull(c, f, in.src[0].num);
+                if (a & 3 != 0 or @as(u64, a) + 4 > LOCAL_BYTES) return error.Fault;
+                const v = if (in.src[1].kind == .imm) in.src[1].imm else readFull(c, f, in.src[1].num);
+                const word = w.local[a..][0..4];
+                const old = std.mem.readInt(u32, word, .little);
+                std.mem.writeInt(u32, word, atomicOp(in.op, in.ty, old, v), .little);
+                writeReg(c, f, in.dst.num, false, old);
+            }
+            noteWrite(c, in.dst.num, false, .ss, slot0);
+        },
         else => return error.Unsupported,
     }
+}
+
+/// The new word of a read-modify-write atomic (min/max signed for s32).
+fn atomicOp(op: ir3.Op, ty: ir3.Type, old: u32, v: u32) u32 {
+    const signed = ty == .s32;
+    return switch (op) {
+        .atomic_g_add, .atomic_add => old +% v,
+        .atomic_g_sub, .atomic_sub => old -% v,
+        .atomic_g_xchg, .atomic_xchg => v,
+        .atomic_g_min, .atomic_min => if (signed) @bitCast(@min(@as(i32, @bitCast(old)), @as(i32, @bitCast(v)))) else @min(old, v),
+        .atomic_g_max, .atomic_max => if (signed) @bitCast(@max(@as(i32, @bitCast(old)), @as(i32, @bitCast(v)))) else @max(old, v),
+        .atomic_g_and, .atomic_and => old & v,
+        .atomic_g_or, .atomic_or => old | v,
+        .atomic_g_xor, .atomic_xor => old ^ v,
+        else => old,
+    };
 }
 
 fn faultAt(c: *Ctx, va: u64) Error {
@@ -1098,4 +1148,42 @@ test "(abs) of the most negative integer wraps to itself" {
     , &mem, &consts, .{ 1, 1, 1 });
     try std.testing.expectEqual(@as(u32, 0x80000000), out[0]);
     try std.testing.expectEqual(@as(u32, 0x80000000), out[1]);
+}
+
+test "atomics: global add and max, local add, fiber by fiber" {
+    var data = [_]u32{ 5, 7, 0, 0 } ++ [_]u32{0} ** 128;
+    const regions = [_]Region{.{ .va = 0x1_0000_0000, .bytes = std.mem.sliceAsBytes(&data) }};
+    const mem = Memory{ .regions = &regions };
+    const consts = [_]u32{ 0x0000_0000, 1, 0, 0 };
+    _ = try runSource(
+        \\@localsize 64, 1, 1
+        \\@invocationid(r0.x)
+        \\@consts 1
+        \\@shared 64
+        \\mov.u32u32 r1.x, c0.x
+        \\mov.u32u32 r1.y, c0.y
+        \\atomic.g.add.untyped.1d.u32.1.g r2.x, r1.x, r0.x
+        \\add.u r3.x, r1.x, 4
+        \\mov.u32u32 r3.y, r1.y
+        \\atomic.g.max.untyped.1d.u32.1.g r2.y, r3.x, r0.x
+        \\mov.u32u32 r4.x, 0
+        \\stl.u32 l[r4.x], r4.x, 1
+        \\bar
+        \\atomic.add.untyped.1d.u32.1.l r2.z, l[r4.x], 1
+        \\shl.b r5.x, r0.x, 3
+        \\add.u r5.x, r5.x, 16
+        \\stg.a.u32 g[c0.x+r5.x+0], r2.x, 1
+        \\add.u r5.x, r5.x, 4
+        \\stg.a.u32 g[c0.x+r5.x+0], r2.z, 1
+        \\end
+    , &mem, &consts, .{ 1, 1, 1 });
+    try std.testing.expectEqual(@as(u32, 5 + 63 * 64 / 2), data[0]);
+    try std.testing.expectEqual(@as(u32, 63), data[1]);
+    var before: u32 = 5;
+    for (0..64) |t| {
+        // each fiber saw the sum of the ones before it, and its count
+        try std.testing.expectEqual(before, data[4 + 2 * t]);
+        try std.testing.expectEqual(@as(u32, @intCast(t)), data[5 + 2 * t]);
+        before += @intCast(t);
+    }
 }
