@@ -2,7 +2,7 @@
 
 `src/gpu/` is zpm's GPU-neutral compute layer. A kernel is written once, in
 KIR, and runs on whatever GPU the machine has: Qualcomm's Adreno, NVIDIA's
-RTX, and later Apple, Intel and AMD. It is pure Sig and allocation-free:
+RTX, AMD's GCN 4 (Polaris), and later Apple and Intel. It is pure Sig and allocation-free:
 storage always comes from the caller. No C, Mesa, CUDA, Vulkan or vendor user
 space is involved at build or run time.
 
@@ -18,6 +18,7 @@ Galaxy's kernel already has a module named `gpu`.
 | `emu_device.sig` | `EmuDevice`, the reference device, which runs on the interpreter. |
 | `kir_ir3.sig`, `adreno_device.sig` | The Adreno backend and its device adapter (agent Q's branch). |
 | `kir_sm120.sig`, `nvidia_device.sig` | The NVIDIA backend and its device adapter (agent N's branch). |
+| `kir_gcn4.sig`, `amd_device.sig` | The AMD GCN 4 (gfx803) backend and the emulated Polaris as a device; see `docs/AMD_GCN3.md`. |
 
 Comments in `src/gpu/*.sig` name files in prose only. Galaxy's module resolver
 scans source text, comments included, so a commented-out import of a file
