@@ -734,6 +734,103 @@ fn formatting() void {
     report("format",before);
 }
 
+// ---- PG.AGG.STATISTICAL / PG.AGG.BITWISE / PG.AGG.INTERVAL --------------------
+
+const base_fixture=[_][]const u8{"CREATE TABLE tdd_a(id INT PRIMARY KEY,g INT,v INT)","INSERT INTO tdd_a VALUES(1,1,10),(2,1,20),(3,2,30),(4,2,NULL)"};
+
+fn statistical() void {
+    const before=begin("agg-statistical");
+    setup(&base_fixture);
+    // Oracle fixture (PG.AGG.STATISTICAL).
+    shaped("SELECT STDDEV_POP(v),VAR_POP(v),CORR(id,v),COVAR_POP(id,v),REGR_COUNT(id,v) FROM tdd_a",
+        &.{.{.name="stddev_pop",.oid=1700},.{.name="var_pop",.oid=1700},.{.name="corr",.oid=701},.{.name="covar_pop",.oid=701},.{.name="regr_count",.oid=20}},
+        &.{"8.1649658092772603","66.6666666666666667","1","6.666666666666667","3"});
+    // Sample forms and aliases (numeric_stddev_internal scales).
+    shaped("SELECT stddev(v),stddev_samp(v),variance(v),var_samp(v) FROM tdd_a",
+        &.{.{.name="stddev",.oid=1700},.{.name="stddev_samp",.oid=1700},.{.name="variance",.oid=1700},.{.name="var_samp",.oid=1700}},
+        &.{"10.0000000000000000","10.0000000000000000","100.0000000000000000","100.0000000000000000"});
+    rowsOf("SELECT stddev_samp(v) FROM tdd_a GROUP BY g ORDER BY g",1700,&.{"7.0710678118654752",null});
+    rowsOf("SELECT var_pop(v) FROM tdd_a GROUP BY g ORDER BY g",1700,&.{"25.0000000000000000","0"});
+    value("SELECT var_pop(v) FROM tdd_a WHERE id=1",1700,"0");
+    value("SELECT var_samp(v) FROM tdd_a WHERE id=1",1700,null);
+    value("SELECT stddev_pop(v) FROM tdd_a WHERE id>9",1700,null);
+    // Double precision inputs use float8_accum.
+    value("SELECT stddev_pop(v::float8) FROM tdd_a",701,"8.16496580927726");
+    value("SELECT var_pop(v::float8) FROM tdd_a",701,"66.66666666666667");
+    value("SELECT var_samp(v::real) FROM tdd_a",701,"100");
+    value("SELECT stddev('1')",701,null);
+    // Numeric inputs and NaN.
+    setup(&.{"CREATE TABLE stat_n(id INT PRIMARY KEY,x NUMERIC)","INSERT INTO stat_n VALUES(1,1.5),(2,2.5)"});
+    value("SELECT var_pop(x) FROM stat_n",1700,"0.25000000000000000000");
+    value("SELECT stddev_pop(x) FROM stat_n",1700,"0.50000000000000000000");
+    value("SELECT var_samp(x) FROM stat_n",1700,"0.50000000000000000000");
+    _=run("INSERT INTO stat_n VALUES(3,'NaN')");
+    value("SELECT var_pop(x) FROM stat_n",1700,"NaN");
+    // Regression family over (Y=id, X=v).
+    shaped("SELECT covar_samp(id,v),regr_sxx(id,v),regr_syy(id,v),regr_sxy(id,v),regr_avgx(id,v),regr_avgy(id,v) FROM tdd_a",
+        &.{.{.name="covar_samp",.oid=701},.{.name="regr_sxx",.oid=701},.{.name="regr_syy",.oid=701},.{.name="regr_sxy",.oid=701},.{.name="regr_avgx",.oid=701},
+            .{.name="regr_avgy",.oid=701}},&.{"10","200","2","20","20","2"});
+    shaped("SELECT regr_slope(id,v),regr_intercept(id,v),regr_r2(id,v) FROM tdd_a",
+        &.{.{.name="regr_slope",.oid=701},.{.name="regr_intercept",.oid=701},.{.name="regr_r2",.oid=701}},&.{"0.1","0","1"});
+    rowsOf("SELECT regr_count(id,v) FROM tdd_a GROUP BY g ORDER BY g",20,&.{"2","1"});
+    value("SELECT regr_count(id,v) FROM tdd_a WHERE id>9",20,"0");
+    value("SELECT corr(id,v) FROM tdd_a WHERE id>9",701,null);
+    value("SELECT corr(id,v) FROM tdd_a WHERE id=1",701,null);
+    value("SELECT covar_samp(id,v) FROM tdd_a WHERE id=1",701,null);
+    value("SELECT corr(id,v) FILTER (WHERE g=1) FROM tdd_a",701,"1");
+    value("SELECT regr_slope(v,id)*2 FROM tdd_a",701,"20");
+    // Errors.
+    rejects("SELECT corr(v) FROM tdd_a",error.UndefinedFunction);
+    rejects("SELECT corr(id,v,g) FROM tdd_a",error.UndefinedFunction);
+    rejects("SELECT corr(id,'x') FROM tdd_a",error.InvalidTextRepresentation);
+    rejects("SELECT corr(id,TRUE) FROM tdd_a",error.UndefinedFunction);
+    rejects("SELECT corr(DISTINCT id,v) FROM tdd_a",error.UnsupportedStatement);
+    rejects("SELECT stddev(TRUE) FROM tdd_a",error.UndefinedFunction);
+    rejects("SELECT var_pop(v) FROM tdd_a WHERE stddev(v)>0",error.GroupingError);
+    report("agg-statistical",before);
+}
+
+fn bitAggregates() void {
+    const before=begin("agg-bitwise");
+    setup(&base_fixture);
+    // Oracle fixture (PG.AGG.BITWISE).
+    shaped("SELECT BIT_AND(id),BIT_OR(id),BIT_XOR(id) FROM tdd_a",&.{.{.name="bit_and",.oid=23},.{.name="bit_or",.oid=23},.{.name="bit_xor",.oid=23}},&.{"0","7","4"});
+    shaped("SELECT bit_and(v),bit_or(v),bit_xor(v) FROM tdd_a",&.{.{.name="bit_and",.oid=23},.{.name="bit_or",.oid=23},.{.name="bit_xor",.oid=23}},&.{"0","30","0"});
+    value("SELECT bit_or(id::int8) FROM tdd_a",20,"7");
+    value("SELECT bit_and(id::int2) FROM tdd_a WHERE id IN (1,3)",21,"1");
+    value("SELECT bit_xor(id) FROM tdd_a WHERE id>9",23,null);
+    rowsOf("SELECT bit_or(id) FROM tdd_a GROUP BY g ORDER BY g",23,&.{"3","7"});
+    value("SELECT bit_and(-1)",23,"-1");
+    rejects("SELECT bit_and(1.5)",error.UndefinedFunction);
+    rejects("SELECT bit_or('1')",error.AmbiguousFunction);
+    report("agg-bitwise",before);
+}
+
+fn intervalAggregates() void {
+    const before=begin("agg-interval");
+    setup(&base_fixture);
+    // Oracle fixture (PG.AGG.INTERVAL).
+    shaped("SELECT AVG(id*INTERVAL '1 day') FROM tdd_a",&.{.{.name="avg",.oid=1186}},&.{"2 days 12:00:00"});
+    // interval * / double precision (interval_mul / interval_div).
+    value("SELECT 2*INTERVAL '1 day'",1186,"2 days");
+    value("SELECT INTERVAL '1 day'*1.5",1186,"1 day 12:00:00");
+    value("SELECT INTERVAL '1 month'/2",1186,"15 days");
+    value("SELECT INTERVAL '1 mon 1 day'*0.5",1186,"15 days 12:00:00");
+    value("SELECT INTERVAL '1 hour'*'2'",1186,"02:00:00");
+    value("SELECT '3'*INTERVAL '1 minute'",1186,"00:03:00");
+    value("SELECT avg(v*INTERVAL '1 hour') FROM tdd_a",1186,"20:00:00");
+    value("SELECT avg(INTERVAL '1 month') FROM tdd_a WHERE id<=3",1186,"1 mon");
+    value("SELECT avg(id*INTERVAL '1 month') FROM tdd_a WHERE id<=2",1186,"1 mon 15 days");
+    value("SELECT avg(id*INTERVAL '1 day') FROM tdd_a WHERE id>9",1186,null);
+    rowsOf("SELECT avg(id*INTERVAL '1 day') FROM tdd_a GROUP BY g ORDER BY g",1186,&.{"1 day 12:00:00","3 days 12:00:00"});
+    rejects("SELECT INTERVAL '1 day'/0",error.DivisionByZero);
+    rejects("SELECT INTERVAL '1 day'*'NaN'::float8",error.DatetimeFieldOverflow);
+    rejects("SELECT INTERVAL '2000000000 days'*2",error.DatetimeFieldOverflow);
+    rejects("SELECT INTERVAL '1 day'*INTERVAL '1 day'",error.UndefinedFunction);
+    rejects("SELECT 2/INTERVAL '1 day'",error.UndefinedFunction);
+    report("agg-interval",before);
+}
+
 pub fn main(init:std.process.Init) !void {
     literals();
     strings();
@@ -742,6 +839,9 @@ pub fn main(init:std.process.Init) !void {
     temporals();
     overlapsPredicate();
     formatting();
+    statistical();
+    bitAggregates();
+    intervalAggregates();
     var buffer:[160]u8=undefined;
     const line=try std.fmt.bufPrint(&buffer,"{{\"suite\":\"sql-functions-core\",\"pass\":{s},\"assertions\":{d},\"failures\":{d}}}\n",.{if(failures==0) "true" else "false",assertions,failures});
     try std.Io.File.stdout().writeStreamingAll(init.io,line);

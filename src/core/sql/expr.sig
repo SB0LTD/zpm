@@ -16,6 +16,7 @@ const datetime_format = @import("datetime_format.sig");
 const float_text = @import("float_text.sig");
 const bytea_module = @import("bytea.sig");
 const builtins = @import("functions_eval.sig");
+const stats = @import("aggregates_stat.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -827,6 +828,11 @@ pub fn Eval(comptime config: types.Config) type {
                         if (left.* == .null_value or right.* == .null_value) return .null_value;
                         if (left.* == .integer and right.* == .integer and value_module.integral(n.ty))
                             return .{ .integer = try arithmetic(n.op, n.ty, left.integer, right.integer) };
+                        if (n.ty == .interval and (n.op == .mul or n.op == .div)) {
+                            const span = if (left.* == .interval) left.interval else right.interval;
+                            const factor = if (left.* == .interval) right.float8 else left.float8;
+                            return .{ .interval = if (n.op == .mul) try stats.intervalMultiply(span, factor) else try stats.intervalDivide(span, factor) };
+                        }
                         return Io.arithmetic(n.op, left, right, n.ty, ctx.session);
                     },
                     .arrow, .arrow_text => {
@@ -999,6 +1005,20 @@ pub fn Eval(comptime config: types.Config) type {
                     .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => return builtins.Builtins(config, @This()).call(ctx, n),
                     .overlaps, .overlaps_tz => return builtins.Builtins(config, @This()).call(ctx, n),
                     .to_date, .to_number, .to_timestamp => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .aggregate_pair => {
+                        // Both inputs are evaluated; NULL skips the row (strict).
+                        const y = try eval(ctx, n.b);
+                        const x = try eval(ctx, node(ctx, n.b).next);
+                        if (y == .null_value or x == .null_value) return .null_value;
+                        if (comptime config.text_bytes < 16) {
+                            return error.WorkspaceCapacity;
+                        } else {
+                            var pair: V.Text = .{ .len = 16 };
+                            @memcpy(pair.bytes[0..8], &@as([8]u8, @bitCast(y.float8)));
+                            @memcpy(pair.bytes[8..16], &@as([8]u8, @bitCast(x.float8)));
+                            return .{ .text = pair };
+                        }
+                    },
                     .none => unreachable,
                 },
                 .param, .when_arm => unreachable,

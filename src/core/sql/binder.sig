@@ -584,7 +584,16 @@ pub fn Binder(comptime config: types.Config) type {
             var left = context.node(n.a).ty;
             var right = context.node(n.b).ty;
             // An untyped literal takes the other operand's type, except
-            // that datetime arithmetic takes an interval.
+            // that datetime arithmetic takes an interval, and an interval
+            // is scaled by double precision.
+            if ((n.op == .mul or n.op == .div) and left == .interval and right == .unknown) {
+                try coerce(context, n.b, .float8);
+                right = .float8;
+            }
+            if (n.op == .mul and right == .interval and left == .unknown) {
+                try coerce(context, n.a, .float8);
+                left = .float8;
+            }
             if (left == .unknown) {
                 try coerce(context, n.a, if (value.datetime(right) and right != .date) .interval else right);
                 left = context.node(n.a).ty;
@@ -602,6 +611,16 @@ pub fn Binder(comptime config: types.Config) type {
                     n.b = try convert(context, n.b, result, -1, .implicit);
                 }
                 n.ty = result;
+                return;
+            }
+            // interval * double precision, double precision * interval and
+            // interval / double precision (interval_mul / interval_div).
+            if ((n.op == .mul and (left == .interval) != (right == .interval)) or (n.op == .div and left == .interval)) {
+                const factor_left = n.op == .mul and right == .interval;
+                const factor_ty = if (factor_left) left else right;
+                if (!value.numericCategory(factor_ty)) return error.UndefinedFunction;
+                if (factor_left) n.a = try convert(context, n.a, .float8, -1, .implicit) else n.b = try convert(context, n.b, .float8, -1, .implicit);
+                n.ty = .interval;
                 return;
             }
             const add = n.op == .add;
@@ -791,6 +810,18 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "bool_and", .agg = .bool_and },
                 .{ .name = "every", .agg = .bool_and },
                 .{ .name = "bool_or", .agg = .bool_or },
+                // B11 statistical and bitwise aggregates.
+                .{ .name = "stddev", .agg = .stddev_samp },        .{ .name = "stddev_samp", .agg = .stddev_samp },
+                .{ .name = "stddev_pop", .agg = .stddev_pop },      .{ .name = "variance", .agg = .var_samp },
+                .{ .name = "var_samp", .agg = .var_samp },          .{ .name = "var_pop", .agg = .var_pop },
+                .{ .name = "corr", .agg = .corr },                  .{ .name = "covar_pop", .agg = .covar_pop },
+                .{ .name = "covar_samp", .agg = .covar_samp },      .{ .name = "regr_count", .agg = .regr_count },
+                .{ .name = "regr_sxx", .agg = .regr_sxx },          .{ .name = "regr_syy", .agg = .regr_syy },
+                .{ .name = "regr_sxy", .agg = .regr_sxy },          .{ .name = "regr_avgx", .agg = .regr_avgx },
+                .{ .name = "regr_avgy", .agg = .regr_avgy },        .{ .name = "regr_slope", .agg = .regr_slope },
+                .{ .name = "regr_intercept", .agg = .regr_intercept }, .{ .name = "regr_r2", .agg = .regr_r2 },
+                .{ .name = "bit_and", .agg = .bit_and },            .{ .name = "bit_or", .agg = .bit_or },
+                .{ .name = "bit_xor", .agg = .bit_xor },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.agg;
             return .none;
@@ -810,6 +841,8 @@ pub fn Binder(comptime config: types.Config) type {
             if (n.star) {
                 if (kind != .count or n.distinct) return error.Syntax;
                 kind = .count_star;
+            } else if (ast.pairAggregate(kind)) {
+                try typePairAggregate(context, &inner, n);
             } else if (n.b == none or context.node(n.b).next != none) return error.UndefinedFunction;
             const arg = n.b;
             var arg_ty: ast.Type = .unknown;
@@ -819,6 +852,8 @@ pub fn Binder(comptime config: types.Config) type {
                 if (arg_ty == .unknown) switch (kind) {
                     .count, .min, .max => try coerce(context, arg, .text),
                     .bool_and, .bool_or => try coerce(context, arg, .boolean),
+                    // Every overload is numeric: float8 is preferred.
+                    .stddev_pop, .stddev_samp, .var_pop, .var_samp => try coerce(context, arg, .float8),
                     else => return error.AmbiguousFunction,
                 };
                 arg_ty = context.node(arg).ty;
@@ -839,6 +874,28 @@ pub fn Binder(comptime config: types.Config) type {
             if (scope.saw_aggregate) |flag| flag.* = true;
         }
 
+        /// corr/covar/regr_*(Y, X): both float8 (implicit numeric casts),
+        /// wrapped in one aggregate_pair input; DISTINCT pairs are not provided.
+        fn typePairAggregate(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            const y = n.b;
+            if (y == none) return error.UndefinedFunction;
+            const x = context.node(y).next;
+            if (x == none or context.node(x).next != none) return error.UndefinedFunction;
+            if (n.distinct) return error.UnsupportedStatement;
+            context.node(y).next = none;
+            var operands = [2]u16{ y, x };
+            for (&operands) |*operand| {
+                try typeExpr(context, scope, operand.*);
+                const ty = context.node(operand.*).ty;
+                if (ty != .unknown and !value.numericCategory(ty)) return error.UndefinedFunction;
+                operand.* = try convert(context, operand.*, .float8, -1, .implicit);
+            }
+            context.node(operands[0]).next = operands[1];
+            context.node(operands[1]).next = none;
+            n.b = try context.pool.add(.{ .kind = .function, .func = .aggregate_pair, .b = operands[0], .ty = .text, .name = n.name });
+            try context.pool.raise(n.b, operands[1]);
+        }
+
         fn aggregateType(context:*const Context,n:*ast.Node,kind:ast.Agg,arg:u16,arg_ty:ast.Type) Error!ast.Type {
             return switch (kind) {
                 .count, .count_star => .int8,
@@ -851,6 +908,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .avg => switch (arg_ty) {
                     .int2, .int4, .int8, .numeric => .numeric,
                     .float4, .float8 => .float8,
+                    // interval_avg (PostgreSQL 18).
+                    .interval => .interval,
                     // AVG(interval) is not provided (no interval / number).
                     else => return error.UndefinedFunction,
                 },
@@ -863,6 +922,14 @@ pub fn Binder(comptime config: types.Config) type {
                     else => return error.UndefinedFunction,
                 },
                 .bool_and, .bool_or => if (arg_ty == .boolean) .boolean else return error.UndefinedFunction,
+                .stddev_pop, .stddev_samp, .var_pop, .var_samp => switch (arg_ty) {
+                    .int2, .int4, .int8, .numeric => .numeric,
+                    .float4, .float8 => .float8,
+                    else => return error.UndefinedFunction,
+                },
+                .regr_count => .int8,
+                .corr, .covar_pop, .covar_samp, .regr_sxx, .regr_syy, .regr_sxy, .regr_avgx, .regr_avgy, .regr_slope, .regr_intercept, .regr_r2 => .float8,
+                .bit_and, .bit_or, .bit_xor => if (value.integral(arg_ty)) arg_ty else return error.UndefinedFunction,
                 .none => unreachable,
             };
         }
@@ -1123,6 +1190,8 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = false;
                     return;
                 },
+                // Built by typePairAggregate with typed arguments.
+                .aggregate_pair => return,
                 else => {},
             }
             const agg = aggregateKind(context, n);
@@ -1283,6 +1352,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
                 .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
                 .overlaps, .overlaps_tz => try typeOverlaps(context, n, count),
+                .aggregate_pair => unreachable,
                 .to_date => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .date, true),
                 .to_number => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .numeric, true),
                 // to_timestamp(text, text) or to_timestamp(double precision).

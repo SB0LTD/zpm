@@ -1675,7 +1675,10 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn aggregateName(self: *const Self, name: ast.Ident) bool {
             const raw = name.span.slice(self.source);
-            for ([_][]const u8{ "count", "sum", "avg", "min", "max", "bool_and", "bool_or", "every" }) |word| {
+            for ([_][]const u8{ "count", "sum", "avg", "min", "max", "bool_and", "bool_or", "every",
+                "stddev", "stddev_pop", "stddev_samp", "variance", "var_pop", "var_samp", "corr", "covar_pop", "covar_samp",
+                "regr_count", "regr_sxx", "regr_syy", "regr_sxy", "regr_avgx", "regr_avgy", "regr_slope", "regr_intercept",
+                "regr_r2", "bit_and", "bit_or", "bit_xor" }) |word| {
                 if (types.keyword(raw, word)) return true;
             }
             return false;

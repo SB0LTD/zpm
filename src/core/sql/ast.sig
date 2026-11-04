@@ -52,6 +52,8 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     extract, extract_tz, date_part, date_part_tz, date_trunc, date_trunc_tz, age, age_tz, justify_days, justify_hours, justify_interval, make_date, make_timestamp, isfinite,
     // (a, b) OVERLAPS (c, d); overlaps_tz is the STABLE timestamptz + interval form.
     overlaps, overlaps_tz,
+    // Internal: the (Y, X) input of a two-argument aggregate, NULL when either is.
+    aggregate_pair,
     // Formatting input functions (B11, functions_format.sig); STABLE.
     to_date, to_number, to_timestamp };
 
@@ -84,7 +86,7 @@ pub fn immutableBuiltin(func: Func) bool {
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
         .extract, .date_part, .date_trunc, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
-        .overlaps => true,
+        .overlaps, .aggregate_pair => true,
         else => false,
     };
 }
@@ -101,7 +103,7 @@ pub fn strictFunction(func: Func) bool {
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
         .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
-        .to_date, .to_number, .to_timestamp => true,
+        .to_date, .to_number, .to_timestamp, .aggregate_pair => true,
         else => false,
     };
 }
@@ -116,7 +118,19 @@ pub const Reg = enum(u8) { none, regclass, regtype };
 pub const Test = enum { is_null, is_not_null, is_true, is_not_true, is_false, is_not_false, is_unknown, is_not_unknown };
 
 /// Aggregate functions (design §4.9). `count_star` is COUNT(*).
-pub const Agg = enum { none, count, count_star, sum, avg, min, max, bool_and, bool_or };
+pub const Agg = enum { none, count, count_star, sum, avg, min, max, bool_and, bool_or,
+    // Statistical (B11, aggregates_stat.sig): one-argument variance family and
+    // two-argument (Y, X) float8 regression aggregates; integer bitwise folds.
+    stddev_pop, stddev_samp, var_pop, var_samp, corr, covar_pop, covar_samp, regr_count, regr_sxx, regr_syy,
+    regr_sxy, regr_avgx, regr_avgy, regr_slope, regr_intercept, regr_r2, bit_and, bit_or, bit_xor };
+
+/// Two-argument (Y, X) aggregates; their argument is an aggregate_pair node.
+pub fn pairAggregate(agg: Agg) bool {
+    return switch (agg) {
+        .corr, .covar_pop, .covar_samp, .regr_count, .regr_sxx, .regr_syy, .regr_sxy, .regr_avgx, .regr_avgy, .regr_slope, .regr_intercept, .regr_r2 => true,
+        else => false,
+    };
+}
 
 /// Relation slot of the grouped row (keys then aggregates) after grouping.
 pub fn groupRelation(comptime config: types.Config) u8 {

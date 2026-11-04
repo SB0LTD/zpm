@@ -418,6 +418,21 @@ pub fn Math(comptime digits: usize) type {
             return if (negative) N.negate(result) else result;
         }
 
+        /// sqrt_var: the square root rounded half up to `scale` decimals.
+        pub fn sqrtAt(value: *const Numeric, scale: usize) Error!Numeric {
+            if (value.special != .finite) return value.*;
+            if (value.negative and !value.isZero()) return error.InvalidArgumentForPowerFunction;
+            if (scale > numeric.max_scale) return error.NumericCapacity;
+            // Work at an even exponent: sqrt(c 10^-d) 10^w = sqrt(c 10^(2w - d)).
+            var w = scale;
+            if (2 * w < value.dscale) w = (value.dscale + 1) / 2;
+            const raw: Big = @intCast(value.coef());
+            const radicand = raw * try ten(2 * w - value.dscale);
+            const root = isqrt(radicand);
+            const nearest = root + @as(Big, if (radicand - root * root > root) 1 else 0);
+            return make(try roundDown(nearest, w - scale), scale);
+        }
+
         /// numeric_div_trunc: the integer quotient toward zero (scale 0).
         pub fn divTrunc(a: *const Numeric, b: *const Numeric) Error!Numeric {
             if (a.special == .nan or b.special == .nan) return numeric.nan();
