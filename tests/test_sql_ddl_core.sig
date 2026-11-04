@@ -1243,6 +1243,21 @@ fn walFormats() !void {
     try check(try int(&replica, "SELECT nextval('four_cache')") == 5);
 }
 
+/// The types lane's column types under this lane's DDL and constraints.
+fn newTypes() !void {
+    reset();
+    try run("CREATE TABLE ty (id INT PRIMARY KEY, tag CHAR(2) CHECK (tag <> 'zz'))");
+    try run("INSERT INTO ty VALUES (1, 'a')");
+    try run("ALTER TABLE ty ADD COLUMN code VARCHAR(3) DEFAULT 'abc' UNIQUE");
+    try expect("SELECT id, tag, code FROM ty", "1|a |abc");
+    try rejects("INSERT INTO ty (id, tag) VALUES (2, 'b')", error.PrimaryKeyViolation, "SELECT COUNT(*) FROM ty", "1");
+    try rejects("INSERT INTO ty VALUES (2, 'zz', 'x')", error.CheckViolation, "SELECT COUNT(*) FROM ty", "1");
+    try rejects("ALTER TABLE ty ADD COLUMN bad VARCHAR(2) DEFAULT 'abc'", error.StringDataRightTruncation, "SELECT COUNT(*) FROM ty", "1");
+    try run("INSERT INTO ty VALUES (2, 'b', 'xyz')");
+    try run("UPDATE ty SET (tag, code) = ('c', 'pq') WHERE id = 2");
+    try sameState(&.{ "SELECT id, tag, code FROM ty ORDER BY id", "SELECT column_name, data_type, character_maximum_length FROM information_schema.columns WHERE table_name = 'ty' ORDER BY ordinal_position" });
+}
+
 pub fn main(init: std.process.Init) !void {
     try truncateTable();
     try truncateErrors();
@@ -1266,6 +1281,7 @@ pub fn main(init: std.process.Init) !void {
     try schemas();
     try schemaTransactions();
     try walFormats();
+    try newTypes();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-ddl-core\",\"pass\":true,\"assertions\":{d},\"records\":{d},\"database_bytes\":{d}}}\n", .{ assertions, records_applied, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
