@@ -198,6 +198,10 @@ pub fn Parser(comptime config: types.Config) type {
                 try self.advance();
                 return .{ .copy = try self.copyStatement() };
             }
+            if (self.mode == .standard and self.rawWord("truncate")) {
+                try self.advance();
+                return .{ .truncate = try self.truncateStatement() };
+            }
             if (self.mode == .legacy_alpha) {
                 if (try self.takeWord("BEGIN")) return self.legacyControl(.{ .begin = .default });
                 if (try self.takeWord("COMMIT")) return self.legacyControl(.commit);
@@ -205,6 +209,40 @@ pub fn Parser(comptime config: types.Config) type {
                 return error.UnsupportedStatement;
             }
             return .{ .control = try self.controlStatement() };
+        }
+
+        /// `name` or `schema.name`.
+        fn qualifiedName(self: *Self) Error!Ast.TableRef {
+            var out: Ast.TableRef = .{ .name = try self.identifier() };
+            if (try self.takeSymbol(.dot)) {
+                out.schema = out.name;
+                out.name = try self.identifier();
+            }
+            return out;
+        }
+
+        /// TRUNCATE [TABLE] [ONLY] name [*] [, ...] [RESTART IDENTITY |
+        /// CONTINUE IDENTITY] [CASCADE | RESTRICT].
+        fn truncateStatement(self: *Self) Error!Ast.Truncate {
+            var out: Ast.Truncate = .{};
+            _ = try self.takeWord("TABLE");
+            while (true) {
+                _ = try self.takeRaw("only");
+                if (out.count == config.tables) return error.TableCapacity;
+                out.tables[out.count] = try self.qualifiedName();
+                out.count += 1;
+                _ = try self.takeSymbol(.star);
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            if (try self.takeRaw("restart")) {
+                if (!try self.takeRaw("identity")) return error.Syntax;
+                out.restart_identity = true;
+            } else if (try self.takeRaw("continue")) {
+                if (!try self.takeRaw("identity")) return error.Syntax;
+            }
+            if (!try self.takeRaw("cascade")) _ = try self.takeRaw("restrict");
+            try self.finish();
+            return out;
         }
 
         /// The current token is the unquoted word `wanted` (any keyword

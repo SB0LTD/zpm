@@ -1283,6 +1283,10 @@ pub fn Database(comptime config: Config) type {
                     try self.lockTable(slot, delete.table, .row_exclusive);
                     break :blk try self.deleteRows(slot, source, delete, snap);
                 },
+                .truncate => |*truncate| blk: {
+                    try self.truncateTables(slot, truncate, snap);
+                    break :blk 0;
+                },
                 .select, .query, .control => unreachable,
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound), .noop = bound == .noop };
@@ -1870,6 +1874,31 @@ pub fn Database(comptime config: Config) type {
             return 0;
         }
 
+        /// TRUNCATE (PostgreSQL ExecuteTruncate): AccessExclusive on every
+        /// target first, so a lock wait parks before any write; then every
+        /// row version visible to the statement is marked deleted in place.
+        /// One write entry per table covers all of its rows (no write-set or
+        /// version cost per row); commit publishes the marks and frees the
+        /// dead versions, abort or ROLLBACK TO clears exactly these marks.
+        /// RESTART IDENTITY is not provided (0A000).
+        fn truncateTables(self: *Self, slot: u16, truncate: *const B.Truncate, snap: Snapshot) Error!void {
+            if (truncate.restart_identity) return error.UnsupportedStatement;
+            for (truncate.tables[0..truncate.count]) |index| try self.lockTable(slot, index, .access_exclusive);
+            try self.reserveWrites(slot, truncate.count);
+            const tx = &self.txs[slot];
+            for (truncate.tables[0..truncate.count]) |index| {
+                const table = &self.tables[index];
+                for (0..table.row_high) |row| {
+                    if (table.rows[row].newest == 0) continue;
+                    const version = S.visibleAt(table, row, snap) orelse continue;
+                    const entry = &table.versions[version];
+                    entry.xmax = tx.ref(slot);
+                    entry.xmax_cid = snap.cid;
+                }
+                tx.push(.{ .kind = .truncate, .table = index, .old = snap.cid }) catch unreachable;
+            }
+        }
+
         /// Inserts every VALUES row, SELECT row or the DEFAULT VALUES row in
         /// order. A resumed statement continues after the rows it already
         /// handled (Tx.progress); their writes are in its write slice.
@@ -2397,6 +2426,7 @@ pub fn Database(comptime config: Config) type {
                     .drop_table => try C.encodeDrop(writer, self.tables[entry.table].oid),
                     .create_sequence => try C.encodeCreateSequence(writer, &self.seqs[entry.table]),
                     .drop_sequence => try C.encodeDropSequence(writer, self.seqs[entry.table].oid),
+                    .truncate => try C.encodeTruncate(writer, self.tables[entry.table].oid),
                     .catalog_insert, .catalog_delete => {},
                 }
             }

@@ -22,6 +22,9 @@
 //!                     none), owner column u8
 //!     8 drop_sequence oid u32
 //!     9 sequence      oid u32, last_value i64, is_called u8 (log-ahead value)
+//!    (10 stays unassigned: existing contracts use it as the unknown-op probe)
+//!    11 truncate      oid u32 (every row of the table is deleted; rows the
+//!                     same record inserts later survive)
 //!   name: len u8 + bytes. value: 0 null | 1 i64 | 2 bool u8 | 3 len u32 + bytes
 //!   | 4 f32 bits u32 | 5 f64 bits u64 | 6 numeric {special u8, negative u8,
 //!   dscale u16, coefficient 4 x u64} | 7 date i32 | 8 timestamp i64
@@ -58,7 +61,7 @@ pub const header_size: usize = 8;
 pub const first_oid: u32 = 16384;
 pub const expr_format_version: u16 = 1;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9 };
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11 };
 
 fn Unsigned(comptime T: type) type {
     return switch (T) {
@@ -313,6 +316,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
 
         pub fn encodeDrop(writer: *Writer, oid: u32) Error!void {
             try writer.op(.drop_table);
+            try writer.int(u32, oid);
+        }
+
+        pub fn encodeTruncate(writer: *Writer, oid: u32) Error!void {
+            try writer.op(.truncate);
             try writer.int(u32, oid);
         }
 
@@ -824,6 +832,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         scratch.tables[index].base = false;
                         purge(scratch, index);
                     },
+                    @intFromEnum(Op.truncate) => {
+                        // Every database row and every row created so far by
+                        // this record is gone; later inserts may reuse keys.
+                        const index = try findVTable(scratch, try reader.int(u32));
+                        const vt = &scratch.tables[index];
+                        purge(scratch, index);
+                        vt.base = false;
+                        vt.live_rows = 0;
+                    },
                     @intFromEnum(Op.insert) => {
                         const index = try findVTable(scratch, try reader.int(u32));
                         const vt = &scratch.tables[index];
@@ -980,6 +997,16 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             db.oid_counter = @max(db.oid_counter, definition.oid + 1 + @as(u32, @intFromBool(table.primary_column != null)) - first_oid);
                             break;
                         };
+                    },
+                    @intFromEnum(Op.truncate) => {
+                        const table = try tableByOid(db, try reader.int(u32));
+                        for (0..table.row_high) |slot| {
+                            if (table.rows[slot].newest == 0) continue;
+                            const old = S.visible(table, slot) orelse continue;
+                            S.summarize(table, &table.versions[old].cells, false, csn);
+                            S.scanPublish(table, old, false);
+                            retire(db, table, old, csn);
+                        }
                     },
                     @intFromEnum(Op.drop_table) => {
                         const table = try tableByOid(db, try reader.int(u32));

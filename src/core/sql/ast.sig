@@ -444,6 +444,14 @@ pub fn Ast(comptime config: types.Config) type {
             options: CopyOptions = .{},
         };
 
+        /// TRUNCATE [TABLE] [ONLY] name [, ...] [RESTART | CONTINUE IDENTITY]
+        /// [CASCADE | RESTRICT].
+        pub const Truncate = struct {
+            tables: [config.tables]TableRef = undefined,
+            count: usize = 0,
+            restart_identity: bool = false,
+        };
+
         pub const Statement = union(enum) {
             create_table: CreateTable,
             drop_table: Drop,
@@ -458,6 +466,7 @@ pub fn Ast(comptime config: types.Config) type {
             delete: Delete,
             control: Control,
             copy: Copy,
+            truncate: Truncate,
         };
     };
 }

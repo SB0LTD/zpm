@@ -127,7 +127,11 @@ pub fn Binder(comptime config: types.Config) type {
             update: Update,
             delete: Delete,
             control: ast.Control,
+            truncate: Truncate,
         };
+
+        /// TRUNCATE targets: distinct table slots in statement order.
+        pub const Truncate = struct { tables: [config.tables]u8 = undefined, count: usize = 0, restart_identity: bool = false };
 
         pub const Context = struct {
             source: []const u8,
@@ -327,6 +331,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .select, .query => .select,
                 .update => .update,
                 .delete => .delete,
+                .truncate => .truncate,
                 .control => |control| switch (control) {
                     .begin, .set_transaction => .begin,
                     .commit => .commit,
@@ -4120,7 +4125,32 @@ pub fn Binder(comptime config: types.Config) type {
                 .control => |control| return .{ .control = control },
                 // COPY runs through Database.copyInfo/copyBegin, never as a statement.
                 .copy => return error.UnsupportedStatement,
+                .truncate => |*truncate| return .{ .truncate = try bindTruncate(context, truncate) },
             }
+        }
+
+        /// A user table (not a sequence or view): 42P01 when missing, 42809
+        /// for another relation kind.
+        fn resolveRelationTable(context: *const Context, reference: Ast.TableRef) Error!usize {
+            if (reference.schema != null) return resolveQualified(context, reference.schema, reference.name);
+            const wanted = toName(context, reference.name);
+            const found = context.catalog.find(wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+            if (found.kind != 'r') return error.WrongObjectType;
+            return found.slot;
+        }
+
+        fn bindTruncate(context: *const Context, truncate: *const Ast.Truncate) Error!Truncate {
+            var out: Truncate = .{ .restart_identity = truncate.restart_identity };
+            for (truncate.tables[0..truncate.count]) |reference| {
+                const index: u8 = @intCast(try resolveRelationTable(context, reference));
+                for (out.tables[0..out.count]) |previous| {
+                    if (previous == index) break;
+                } else {
+                    out.tables[out.count] = index;
+                    out.count += 1;
+                }
+            }
+            return out;
         }
 
         /// COPY's target: field p fills column mapping[p]; every other

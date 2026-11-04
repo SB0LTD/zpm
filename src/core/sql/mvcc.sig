@@ -32,7 +32,10 @@ pub fn Mvcc(comptime config: types.Config) type {
         pub const write_capacity: usize = if (config.tx_writes == 0) @max(config.rows_per_table * 2, 64) else config.tx_writes;
         pub const sub_capacity: usize = config.savepoints + 1;
 
-        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence };
+        /// `truncate`: every row version visible to the TRUNCATE statement was
+        /// marked deleted in place with xmax = (this transaction, `old` as
+        /// command id); one entry covers the whole table.
+        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate };
 
         /// `table` is the table slot (catalog relation, sequence slot);
         /// `old`/`new` are version indices.
@@ -156,6 +159,12 @@ pub fn Mvcc(comptime config: types.Config) type {
                         tx.seq_dirty.remove(entry.table);
                     },
                     .drop_sequence => db.seqs[entry.table].pending_drop = false,
+                    .truncate => {
+                        const table = &db.tables[entry.table];
+                        for (table.versions[0..table.version_high]) |*version| {
+                            if (truncated(version, tx, slot, entry.old)) clearMark(version);
+                        }
+                    },
                 }
             }
             tx.write_len = start;
@@ -163,6 +172,13 @@ pub fn Mvcc(comptime config: types.Config) type {
         }
 
         const types_first_oid: u32 = 16384;
+
+        /// A version this transaction's TRUNCATE (command `cid`) marked and
+        /// has not published.
+        pub fn truncated(version: *const S.Version, tx: *const Tx, slot: usize, cid: u32) bool {
+            return version.row != 0 and version.xmax.epoch == tx.epoch and version.xmax.slot == slot and
+                version.xmax_cid == cid and version.xmax_csn == 0;
+        }
 
         /// Lists a lock just granted to `slot`. When the list is full the
         /// grant is released again, so the failing statement leaves the
@@ -226,6 +242,15 @@ pub fn Mvcc(comptime config: types.Config) type {
                         seq.pending_drop = false;
                         seq.dead_csn = csn;
                     },
+                    .truncate => {
+                        const table = &db.tables[entry.table];
+                        for (table.versions[0..table.version_high], 0..) |*version, index| {
+                            if (!truncated(version, tx, slot, entry.old)) continue;
+                            S.summarize(table, &version.cells, false, csn);
+                            S.scanPublish(table, @intCast(index), false);
+                            version.xmax_csn = csn;
+                        }
+                    },
                 }
             }
         }
@@ -236,6 +261,12 @@ pub fn Mvcc(comptime config: types.Config) type {
             const tx = &db.txs[slot];
             var budget: usize = S.reclaim_budget;
             for (tx.writes[0..tx.write_len]) |entry| {
+                // A published TRUNCATE frees its table's dead versions at once.
+                if (entry.kind == .truncate) {
+                    const table = &db.tables[entry.table];
+                    if (table.live and table.dead_csn == 0) _ = S.vacuum(table, horizon);
+                    continue;
+                }
                 if (budget == 0) break;
                 if (entry.kind != .update and entry.kind != .delete) continue;
                 const table = &db.tables[entry.table];
