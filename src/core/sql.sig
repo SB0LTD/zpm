@@ -2227,6 +2227,12 @@ pub fn Database(comptime config: Config) type {
             }
             const index = destination orelse return error.TableCapacity;
             const source = &self.tables[alter.table];
+            // Owned sequences (identity, SERIAL) record their column: it must
+            // keep its position (dropping or shifting it is 0A000).
+            for (&self.seqs) |*seq| {
+                if (!seq.live or seq.owner != source.oid or seq.dead_csn != 0) continue;
+                if (seq.owner_column >= alter.count or alter.sources[seq.owner_column] != seq.owner_column) return error.UnsupportedStatement;
+            }
             const copy = &self.tables[index];
             if (copy.rows.len < source.row_high or copy.versions.len < source.version_high) return error.TableCapacity;
             var fills: [config.columns]Cell = @splat(.null_value);

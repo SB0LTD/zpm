@@ -678,7 +678,16 @@ fn alterErrors() !void {
     try rejects("ALTER TABLE a ADD COLUMN x INT DEFAULT 'text'", error.InvalidTextRepresentation, probe, "id;v");
     try rejects("ALTER TABLE ident DROP COLUMN id", error.UnsupportedStatement, "SELECT COUNT(*) FROM ident", "0");
     try rejects("ALTER TABLE ident ALTER COLUMN id SET DEFAULT 1", error.Syntax, "SELECT COUNT(*) FROM ident", "0");
-    // An identity column after the dropped one keeps its position: refused.
+    // An owned-sequence column (identity or SERIAL) keeps its position:
+    // dropping it or a column before it is refused (0A000, a documented
+    // gap; PostgreSQL drops or renumbers), so replay never sees a moved owner.
+    try run("CREATE TABLE sr (a INT, s SERIAL, b INT)");
+    try rejects("ALTER TABLE sr DROP COLUMN a", error.UnsupportedStatement, "SELECT column_name FROM information_schema.columns WHERE table_name = 'sr' ORDER BY ordinal_position", "a;s;b");
+    try rejects("ALTER TABLE sr DROP COLUMN s", error.UnsupportedStatement, "SELECT column_name FROM information_schema.columns WHERE table_name = 'sr' ORDER BY ordinal_position", "a;s;b");
+    try run("ALTER TABLE sr DROP COLUMN b");
+    try run("INSERT INTO sr (a) VALUES (1)");
+    try sameState(&.{"SELECT a, s FROM sr"});
+    // A column after the identity column may go.
     try run("ALTER TABLE ident DROP COLUMN y");
     try run("INSERT INTO ident (x) VALUES (5)");
     try expect("SELECT id, x FROM ident", "1|5");
