@@ -31,8 +31,8 @@ const ir3 = @import("ir3.sig");
 pub const Instr = ir3.Instr;
 pub const Src = ir3.Src;
 
-pub const MAX_INSTRS = 4096;
-pub const MAX_LABELS = 128;
+pub const MAX_INSTRS = 16384;
+pub const MAX_LABELS = 512;
 /// The register id meaning "not delivered" (Mesa's INVALID_REG, r63.x).
 pub const INVALID_REG: u8 = 0xfc;
 
@@ -202,7 +202,7 @@ pub const Work = struct {
     n_out: u32 = 0,
     /// Item index -> output index of its first instruction (labels resolve here).
     item_at: [MAX_INSTRS + 1]u32 = undefined,
-    block_in: [MAX_LABELS + 1]State = undefined,
+    block_in: [MAX_LABELS * 2 + 2]State = undefined,
     scratch: State = .{},
     /// Line of the last error (1-based), 0 when none.
     err_line: u32 = 0,
@@ -752,8 +752,11 @@ fn legalize(gen: u16, w: *Work) Error!void {
             const end = if (b + 1 < n_blocks) starts[b + 1] else w.n_items;
             for (w.items[starts[b]..end]) |it| try step(&e, st, it);
             const last = &w.items[end - 1].in;
-            // Fall through.
-            if (b + 1 < n_blocks and last.op != .jump and last.op != .end) {
+            // Fall through, and the physical edge after a jump: fibers parked
+            // at the next block (an if's else, a loop's exit) run right after
+            // the jump in the same wave, so its hazards reach them too (Mesa's
+            // physical successors).
+            if (b + 1 < n_blocks and last.op != .end) {
                 if (w.block_in[b + 1].merge(st)) changed = true;
             }
             // Branch target.

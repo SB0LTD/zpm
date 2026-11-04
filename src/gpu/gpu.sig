@@ -51,9 +51,15 @@ pub const interp_caps = device.interp_caps;
 
 pub const EmuDevice = emu_device.EmuDevice;
 
+// The Adreno: KIR to ir3, and the Adreno (or its emulator) as a Device.
+pub const kir_ir3 = @import("kir_ir3.sig");
+pub const adreno_device = @import("adreno_device.sig");
+
 test {
     _ = kir;
     _ = device;
     _ = interp;
     _ = emu_device;
+    _ = kir_ir3;
+    _ = adreno_device;
 }

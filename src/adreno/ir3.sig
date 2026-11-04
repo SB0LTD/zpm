@@ -1082,6 +1082,10 @@ pub fn encode(gen: u16, in: *const Instr) Error!u64 {
             const s1 = in.src[0];
             const s2 = in.src[1];
             const s3 = in.src[2];
+            // The alternate forms (shrm/shlm/shrg/shlg/andg, wmm) have no
+            // plain const sources: their bit 12 means an immediate, so a
+            // const would be read as the immediate of its number.
+            if (alt and (s1.kind == .cnst or s3.kind == .cnst)) return error.NoForm;
             try put(&w, 32, 8, in.dst.num);
             putb(&w, 45, in.ul);
             try put(&w, 47, 8, try needGpr(s2));
@@ -3170,4 +3174,12 @@ test "Mesa's disassembler vectors: decode, print, parse, encode" {
         return error.TestUnexpectedResult;
     }
     try std.testing.expect(n > 150);
+}
+
+test "the shift-and-mask forms refuse const sources (their bit 12 is an immediate)" {
+    try std.testing.expectError(error.NoForm, assembleLine(A7XX, "shrm r0.x, c1.x, r0.y, r0.z"));
+    try std.testing.expectError(error.NoForm, assembleLine(A7XX, "shlg r0.x, 8, r0.y, c1.x"));
+    try std.testing.expectError(error.NoForm, assembleLine(A7XX, "andg r0.x, c0.y, r0.y, r0.z"));
+    _ = try assembleLine(A7XX, "shlg r0.x, 8, r0.y, 255");
+    _ = try assembleLine(A7XX, "mad.u24 r0.x, c1.x, r0.y, c2.z");
 }
