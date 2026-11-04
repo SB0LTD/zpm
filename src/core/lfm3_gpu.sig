@@ -58,6 +58,16 @@ pub const Options = struct {
     /// How long one call may take on the GPU before it counts as slow (it
     /// is waited for still: see `finish`).
     timeout_us: u64 = 10_000_000,
+    /// Diagnose mode, for a GPU the kernels have not run on before: each
+    /// kernel dispatch of a forward is a submission of its own, waited for
+    /// before the next, and `diagnose` is called with what it is (the
+    /// layer, the kernel, the tensor, the tokens, the grid) just before it
+    /// is submitted. The last line before a fault or a hang names the
+    /// culprit; a dispatch that failed, or ran past diagnose_timeout_us,
+    /// gets a line of its own. Slow (a submission and a wait per kernel),
+    /// so null (one submission per call) unless looking for one.
+    diagnose: ?*const fn (what: []const u8) void = null,
+    diagnose_timeout_us: u64 = 2_000_000,
 };
 
 const MATRIX_VARIANTS = kernels.MAX_TOKENS;
@@ -143,6 +153,13 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         last_failure: ?adreno.device.Error = null,
         /// Calls that took longer than options.timeout_us (and finished).
         slow: u32 = 0,
+        /// Diagnose mode: the layer being encoded (null: the output), the
+        /// dispatches the last call submitted, and why the one that failed
+        /// did.
+        at_layer: ?u32 = null,
+        call_tokens: u32 = 0,
+        dispatches: u32 = 0,
+        diag_failure: ?adreno.device.Error = null,
 
         /// Check the model, allocate everything, copy the model file in,
         /// assemble the kernels. `work` is the assembler's working storage.
@@ -342,19 +359,27 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             self.dev.toDevice(self.s.rope_swa, 0, count * half * 8);
 
             var st = a7xx.Stream{ .buf = self.ib.words() };
-            st.computeSetup();
-            for (plan.layers[0..plan.layer_count]) |*l| try self.layer(&st, l, c, count);
-            if (output != .none) {
-                // the last position's output norm (and its quantization)
-                try self.normQuant(&st, self.s.hidden.va + (count - 1) * h * 4, plan.output_norm, 1);
-                if (output == .logits) try self.linear(&st, plan.output, 1, self.s.logits.va);
+            self.dispatches = 0;
+            self.call_tokens = @intCast(count);
+            if (self.options.diagnose) |log| {
+                // a submission per dispatch (launchAlone), each waited for
+                self.diag_failure = null;
+                self.encode(&st, c, count, output) catch |e| {
+                    if (e == error.DeviceLost) return self.failed(c, self.diag_failure orelse error.DeviceLost);
+                    return e;
+                };
+                var line: [128]u8 = undefined;
+                log(std.fmt.bufPrint(&line, "lfm3-gpu: forward of {d} tokens at position {d}: all {d} dispatches done", .{ count, cache.position, self.dispatches }) catch "lfm3-gpu: forward done");
+            } else {
+                st.computeSetup();
+                try self.encode(&st, c, count, output);
+                st.cleanCaches();
+                st.waitForIdle();
+                st.check() catch return error.StreamFull;
+                self.dev.toDevice(self.ib, 0, st.len * 4);
+                const fence = self.dev.submit(self.ib, @intCast(st.len)) catch |e| return self.failed(c, e);
+                self.finish(fence) catch |e| return self.failed(c, e);
             }
-            st.cleanCaches();
-            st.waitForIdle();
-            st.check() catch return error.StreamFull;
-            self.dev.toDevice(self.ib, 0, st.len * 4);
-            const fence = self.dev.submit(self.ib, @intCast(st.len)) catch |e| return self.failed(c, e);
-            self.finish(fence) catch |e| return self.failed(c, e);
             self.dev.fromDevice(c.conv, 0, conv_bytes);
             cache.position += count;
             if (output == .none) return null;
@@ -362,6 +387,133 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             if (output == .hidden) return null;
             self.dev.fromDevice(self.s.logits, 0, self.s.logits.cpu.len);
             return @intCast(argmax(self.logits()));
+        }
+
+        /// The call's kernels: every layer, then the output's norm and logits.
+        fn encode(self: *Self, st: *a7xx.Stream, c: *const Cache, count: usize, output: executor.Output) Error!void {
+            const plan = self.plan;
+            const h: usize = plan.hidden_size;
+            for (plan.layers[0..plan.layer_count], 0..) |*l, li| {
+                self.at_layer = @intCast(li);
+                try self.layer(st, l, c, count);
+            }
+            self.at_layer = null;
+            if (output != .none) {
+                // the last position's output norm (and its quantization)
+                try self.normQuant(st, self.s.hidden.va + (count - 1) * h * 4, plan.output_norm, 1);
+                if (output == .logits) try self.linear(st, plan.output, 1, self.s.logits.va);
+            }
+        }
+
+        /// What a dispatch is, for diagnose mode's lines.
+        const What = struct {
+            kernel: []const u8,
+            tensor: ?lfm3.TensorRef = null,
+            first: u32 = 0,
+            tokens: u32 = 0,
+        };
+
+        /// One kernel's launch: its program, its constants (c0.., and c6..
+        /// when `c6` is not empty), the dispatch, then a wait for idle unless
+        /// `chain` (the next dispatch reads the same inputs). In diagnose
+        /// mode it is a submission of its own (launchAlone).
+        fn launch(self: *Self, st: *a7xx.Stream, k: *const ir3_asm.Kernel, va: u64, c0: []const u32, c6: []const u32, groups: [3]u32, chain: bool, what: What) Error!void {
+            if (self.options.diagnose) |log| return self.launchAlone(log, k, va, c0, c6, groups, what);
+            try st.program(k, va);
+            st.constants(0, c0);
+            if (c6.len != 0) st.constants(6, c6);
+            st.dispatch(k, groups);
+            if (!chain) st.waitForIdle();
+            self.dispatches += 1;
+        }
+
+        /// Diagnose mode's launch: what it is logged, then a stream of its
+        /// own (set-up, program, constants, dispatch, idle, cache clean)
+        /// submitted and waited for. A failure is logged and recorded
+        /// (diag_failure), and is error.DeviceLost.
+        fn launchAlone(self: *Self, log: *const fn ([]const u8) void, k: *const ir3_asm.Kernel, va: u64, c0: []const u32, c6: []const u32, groups: [3]u32, what: What) Error!void {
+            var line: [256]u8 = undefined;
+            const text = self.whatText(&line, what, groups);
+            var st = a7xx.Stream{ .buf = self.ib.words() };
+            st.computeSetup();
+            try st.program(k, va);
+            st.constants(0, c0);
+            if (c6.len != 0) st.constants(6, c6);
+            st.dispatch(k, groups);
+            st.waitForIdle();
+            st.cleanCaches();
+            st.waitForIdle();
+            st.check() catch return error.StreamFull;
+            self.dev.toDevice(self.ib, 0, st.len * 4);
+            self.dispatches += 1;
+            log(text);
+            const fence = self.dev.submit(self.ib, @intCast(st.len)) catch |e| return self.diagFailed(log, text, e);
+            self.dev.wait(fence, self.options.diagnose_timeout_us) catch |e| {
+                if (e != error.Timeout) return self.diagFailed(log, text, e);
+                // (still waited for: until it is done the GPU may write the
+                // state a CPU fallback would take over; the driver ends the
+                // wait if the GPU hangs)
+                var slow: [320]u8 = undefined;
+                log(std.fmt.bufPrint(&slow, "lfm3-gpu: still running after {d} ms (a hang?): {s}", .{ self.options.diagnose_timeout_us / 1000, text }) catch "lfm3-gpu: still running");
+                self.slow += 1;
+                self.dev.wait(fence, std.math.maxInt(u64)) catch |e2| return self.diagFailed(log, text, e2);
+            };
+        }
+
+        fn diagFailed(self: *Self, log: *const fn ([]const u8) void, text: []const u8, e: adreno.device.Error) Error {
+            var line: [320]u8 = undefined;
+            log(std.fmt.bufPrint(&line, "lfm3-gpu: FAILED ({s}): {s}", .{ @errorName(e), text }) catch "lfm3-gpu: FAILED");
+            self.diag_failure = e;
+            return error.DeviceLost;
+        }
+
+        /// "lfm3-gpu: dispatch 12, layer 2 of 24 (attention): matrix q4k x8,
+        /// blk.2.attn_q.weight, tokens 0-7, groups 256x1x1".
+        fn whatText(self: *const Self, buf: []u8, what: What, groups: [3]u32) []const u8 {
+            var t = ir3.Text{ .buf = buf };
+            t.print("lfm3-gpu: dispatch {d}, ", .{self.dispatches});
+            if (self.at_layer) |li| {
+                const l = &self.plan.layers[li];
+                const kind = if (l.kind == .short_conv) "short conv" else if (l.sliding_window) "sliding attention" else "attention";
+                t.print("layer {d} of {d} ({s})", .{ li, self.plan.layer_count, kind });
+            } else t.s("output");
+            t.print(": {s}", .{what.kernel});
+            if (what.tensor) |ref| {
+                if (ref.present()) {
+                    const ti = &self.index.tensors[ref.index];
+                    t.print(", {s}", .{ti.name[0..ti.name_len]});
+                }
+            }
+            if (what.tokens != 0) {
+                if (what.first == 0 and what.tokens == self.call_tokens) {
+                    t.print(", {d} token{s}", .{ what.tokens, if (what.tokens == 1) "" else "s" });
+                } else t.print(", tokens {d}-{d} of {d}", .{ what.first, what.first + what.tokens - 1, self.call_tokens });
+            }
+            t.print(", groups {d}x{d}x{d}", .{ groups[0], groups[1], groups[2] });
+            return t.buf[0..t.len];
+        }
+
+        /// A wait for idle between dependent dispatches (in diagnose mode
+        /// each one is waited for already).
+        fn idle(self: *const Self, st: *a7xx.Stream) void {
+            if (self.options.diagnose == null) st.waitForIdle();
+        }
+
+        /// The name of the kernel whose code is at `code_va` (an emulated
+        /// device's fault names its kernel by address).
+        pub fn kernelAt(self: *const Self, code_va: u64) []const u8 {
+            inline for (0..MATRIX_VARIANTS) |t| {
+                if (code_va == self.k.q4k_va[t]) return std.fmt.comptimePrint("matrix q4k x{d}", .{t + 1});
+                if (code_va == self.k.q6k_va[t]) return std.fmt.comptimePrint("matrix q6k x{d}", .{t + 1});
+            }
+            if (code_va == self.k.norm_quant_va) return "norm+quant";
+            if (code_va == self.k.quant_va) return "quant";
+            if (code_va == self.k.residual_va) return "residual";
+            if (code_va == self.k.swiglu_va) return "swiglu";
+            if (code_va == self.k.conv_va) return "short conv";
+            if (code_va == self.k.prepare_va) return "attention prepare";
+            if (code_va == self.k.attention_va) return "attention";
+            return "(not one of lfm3-gpu's kernels)";
         }
 
         /// Wait for a call's stream. One slower than options.timeout_us is
@@ -411,10 +563,8 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                     try self.linear(st, l.in_proj, n, self.s.mixed.va);
                     const taps = try self.tensorAddress(l.conv);
                     const state = c.conv.va + @as(u64, l.slot) * (plan.conv_kernel - 1) * h * 4;
-                    try st.program(&self.k.conv, self.k.conv_va);
-                    st.constants(0, &(kernels.ConvConsts{ .mixed = self.s.mixed.va, .taps = taps, .state = state, .out = self.s.mixer.va, .hidden = h, .tokens = n }).dwords());
-                    st.dispatch(&self.k.conv, .{ h / 64, 1, 1 });
-                    st.waitForIdle();
+                    const cc = (kernels.ConvConsts{ .mixed = self.s.mixed.va, .taps = taps, .state = state, .out = self.s.mixer.va, .hidden = h, .tokens = n }).dwords();
+                    try self.launch(st, &self.k.conv, self.k.conv_va, &cc, &.{}, .{ h / 64, 1, 1 }, false, .{ .kernel = "short conv", .tensor = l.conv, .tokens = n });
                     try self.quant(st, self.s.mixer.va, h, n);
                     try self.linear(st, l.out_proj, n, self.s.projected.va);
                 },
@@ -445,15 +595,10 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                         .epsilon = plan.rms_norm_epsilon,
                         .window = if (l.sliding_window) plan.sliding_window else 0,
                     };
-                    try st.program(&self.k.prepare, self.k.prepare_va);
-                    st.constants(0, &ac.dwords());
-                    st.dispatch(&self.k.prepare, .{ plan.head_count + 2 * @as(u32, l.kv_head_count), n, 1 });
-                    st.waitForIdle();
-                    try st.program(&self.k.attention, self.k.attention_va);
-                    st.constants(0, &ac.dwords());
-                    st.constants(6, &ac.outDwords());
-                    st.dispatch(&self.k.attention, .{ plan.head_count, n, 1 });
-                    st.waitForIdle();
+                    const ad = ac.dwords();
+                    const ao = ac.outDwords();
+                    try self.launch(st, &self.k.prepare, self.k.prepare_va, &ad, &.{}, .{ plan.head_count + 2 * @as(u32, l.kv_head_count), n, 1 }, false, .{ .kernel = "attention prepare", .tokens = n });
+                    try self.launch(st, &self.k.attention, self.k.attention_va, &ad, &ao, .{ plan.head_count, n, 1 }, false, .{ .kernel = "attention", .tokens = n });
                     try self.quant(st, self.s.mixer.va, @intCast(plan.queryWidth()), n);
                     try self.linear(st, l.attn_output, n, self.s.projected.va);
                 },
@@ -463,10 +608,8 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             try self.linearNoWait(st, l.ffn_gate, n, self.s.ffn_gate.va);
             try self.linear(st, l.ffn_up, n, self.s.ffn_up.va);
             const ff: u32 = plan.feed_forward_size;
-            try st.program(&self.k.swiglu, self.k.swiglu_va);
-            st.constants(0, &(kernels.QuantConsts{ .x = self.s.ffn_gate.va, .norm_weight = self.s.ffn_up.va, .act_q = self.s.act_q.va, .act_d = self.s.act_d.va, .act_sums = self.s.act_sums.va, .k = ff }).dwords());
-            st.dispatch(&self.k.swiglu, .{ ff / kernels.QK_K, n, 1 });
-            st.waitForIdle();
+            const sc = (kernels.QuantConsts{ .x = self.s.ffn_gate.va, .norm_weight = self.s.ffn_up.va, .act_q = self.s.act_q.va, .act_d = self.s.act_d.va, .act_sums = self.s.act_sums.va, .k = ff }).dwords();
+            try self.launch(st, &self.k.swiglu, self.k.swiglu_va, &sc, &.{}, .{ ff / kernels.QK_K, n, 1 }, false, .{ .kernel = "swiglu+quant", .tokens = n });
             try self.linear(st, l.ffn_down, n, self.s.projected.va);
             try self.residual(st, l.post_ffw_norm, n);
         }
@@ -475,32 +618,26 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         /// quantize them into the activation arrays.
         fn normQuant(self: *Self, st: *a7xx.Stream, x: u64, norm: lfm3.TensorRef, n: u32) Error!void {
             const h = self.plan.hidden_size;
-            try st.program(&self.k.norm_quant, self.k.norm_quant_va);
-            st.constants(0, &(kernels.QuantConsts{ .x = x, .norm_weight = try self.tensorAddress(norm), .normalized = self.s.normalized.va, .act_q = self.s.act_q.va, .act_d = self.s.act_d.va, .act_sums = self.s.act_sums.va, .k = h, .epsilon = self.plan.rms_norm_epsilon }).dwords());
-            st.dispatch(&self.k.norm_quant, .{ 1, n, 1 });
-            st.waitForIdle();
+            const qc = (kernels.QuantConsts{ .x = x, .norm_weight = try self.tensorAddress(norm), .normalized = self.s.normalized.va, .act_q = self.s.act_q.va, .act_d = self.s.act_d.va, .act_sums = self.s.act_sums.va, .k = h, .epsilon = self.plan.rms_norm_epsilon }).dwords();
+            try self.launch(st, &self.k.norm_quant, self.k.norm_quant_va, &qc, &.{}, .{ 1, n, 1 }, false, .{ .kernel = "norm+quant", .tensor = norm, .tokens = n });
         }
 
         fn quant(self: *Self, st: *a7xx.Stream, x: u64, width: u32, n: u32) Error!void {
-            try st.program(&self.k.quant, self.k.quant_va);
-            st.constants(0, &(kernels.QuantConsts{ .x = x, .act_q = self.s.act_q.va, .act_d = self.s.act_d.va, .act_sums = self.s.act_sums.va, .k = width }).dwords());
-            st.dispatch(&self.k.quant, .{ width / kernels.QK_K, n, 1 });
-            st.waitForIdle();
+            const qc = (kernels.QuantConsts{ .x = x, .act_q = self.s.act_q.va, .act_d = self.s.act_d.va, .act_sums = self.s.act_sums.va, .k = width }).dwords();
+            try self.launch(st, &self.k.quant, self.k.quant_va, &qc, &.{}, .{ width / kernels.QK_K, n, 1 }, false, .{ .kernel = "quant", .tokens = n });
         }
 
         /// hidden += post_norm(projected) (sandwich norms) or + projected.
         fn residual(self: *Self, st: *a7xx.Stream, norm: lfm3.TensorRef, n: u32) Error!void {
             const h = self.plan.hidden_size;
             const w = if (self.plan.sandwich_norms) try self.tensorAddress(norm) else 0;
-            try st.program(&self.k.residual, self.k.residual_va);
-            st.constants(0, &(kernels.QuantConsts{ .x = self.s.projected.va, .norm_weight = w, .normalized = self.s.hidden.va, .act_q = 0, .act_d = 0, .act_sums = 0, .k = h, .epsilon = self.plan.rms_norm_epsilon }).dwords());
-            st.dispatch(&self.k.residual, .{ 1, n, 1 });
-            st.waitForIdle();
+            const qc = (kernels.QuantConsts{ .x = self.s.projected.va, .norm_weight = w, .normalized = self.s.hidden.va, .act_q = 0, .act_d = 0, .act_sums = 0, .k = h, .epsilon = self.plan.rms_norm_epsilon }).dwords();
+            try self.launch(st, &self.k.residual, self.k.residual_va, &qc, &.{}, .{ 1, n, 1 }, false, .{ .kernel = "residual", .tensor = if (self.plan.sandwich_norms) norm else null, .tokens = n });
         }
 
         fn linear(self: *Self, st: *a7xx.Stream, ref: lfm3.TensorRef, n: u32, out: u64) Error!void {
             try self.linearNoWait(st, ref, n, out);
-            st.waitForIdle();
+            self.idle(st);
         }
 
         /// out[t][row] = W[row] . activations[t]: passes of up to 8 tokens.
@@ -512,8 +649,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 const tokens = @min(n - first, MATRIX_VARIANTS);
                 const k = if (m.q4) &self.k.q4k[tokens - 1] else &self.k.q6k[tokens - 1];
                 const va = if (m.q4) self.k.q4k_va[tokens - 1] else self.k.q6k_va[tokens - 1];
-                try st.program(k, va);
-                st.constants(0, &(kernels.MatrixConsts{
+                const mc = (kernels.MatrixConsts{
                     .weights = self.model.va + m.offset,
                     .act_q = self.s.act_q.va + @as(u64, first) * m.columns,
                     .act_d = self.s.act_d.va + @as(u64, first) * blocks * 4,
@@ -522,8 +658,9 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                     .row_bytes = @intCast(m.row_bytes),
                     .blocks = blocks,
                     .rows = @intCast(m.rows),
-                }).dwords());
-                st.dispatch(k, .{ @intCast(m.rows / kernels.MATRIX_ROWS_PER_GROUP), 1, 1 });
+                }).dwords();
+                const name = if (m.q4) "matrix q4k" else "matrix q6k";
+                try self.launch(st, k, va, &mc, &.{}, .{ @intCast(m.rows / kernels.MATRIX_ROWS_PER_GROUP), 1, 1 }, true, .{ .kernel = name, .tensor = ref, .first = first, .tokens = tokens });
                 first += tokens;
             }
         }

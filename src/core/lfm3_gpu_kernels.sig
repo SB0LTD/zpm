@@ -524,7 +524,12 @@ fn rowSetup(comptime one_row_per_group: bool, comptime waves: comptime_int) []co
         s = s ++ line("shr.b {s}, r0.x, 6", .{r(4)});
         s = s ++ line("and.b {s}, r0.x, 63", .{r(5)});
         s = s ++ (if (one_row_per_group) line("mov.u32u32 {s}, {s}", .{ r(6), r(4) }) else line("mov.u32u32 {s}, r48.x", .{r(6)}));
-        s = s ++ line("mul.u24 {s}, r48.y, c3.x", .{r(7)});
+        // (the workgroup's y through a register first: a cat2 instruction
+        // reads at most one source from the const/shared file. With r48.y
+        // and c3.x together the GPU hands c3.x to both: k * k, 16 MiB past
+        // `hidden` for k = 2048, the adreno1 boot's fault.)
+        s = s ++ line("mov.u32u32 {s}, r48.y", .{r(7)});
+        s = s ++ line("mul.u24 {s}, {s}, c3.x", .{ r(7), r(7) });
         s = s ++ line("shl.b {s}, {s}, 8", .{ r(9), r(6) });
         s = s ++ line("add.u {s}, {s}, {s}", .{ r(7), r(7), r(9) });
         s = s ++ line("shl.b {s}, {s}, 2", .{ r(9), r(5) });
@@ -635,8 +640,10 @@ fn quantTail() []const u8 {
         s = s ++ line("add.s {s}, {s}, {s}", .{ r(26), r(26), r(27) });
         s = s ++ line("shfl.xor.u32 {s}, {s}, 2", .{ r(27), r(26) });
         s = s ++ line("add.s {s}, {s}, {s}", .{ r(26), r(26), r(27) });
-        // block number in the row of tokens: t * blocks + block
-        s = s ++ line("mul.u24 {s}, r48.y, c3.w", .{r(28)});
+        // block number in the row of tokens: t * blocks + block (r48.y
+        // through a register: one const/shared source per cat2 instruction)
+        s = s ++ line("mov.u32u32 {s}, r48.y", .{r(28)});
+        s = s ++ line("mul.u24 {s}, {s}, c3.w", .{ r(28), r(28) });
         s = s ++ line("add.u {s}, {s}, {s}", .{ r(28), r(28), r(6) });
         s = s ++ line("and.b {s}, {s}, 3", .{ r(29), r(5) });
         s = s ++ line("cmps.u.eq p0.x, {s}, 0", .{r(29)});
@@ -833,7 +840,9 @@ pub fn q80QuantSource() []const u8 {
         s = s ++ line("cmps.u.lt {s}, {s}, {s}", .{ r(18), r(5), r(9) });
         s = s ++ line("sub.u {s}, {s}, 1", .{ r(9), r(9) });
         s = s ++ line("min.u {s}, {s}, {s}", .{ r(5), r(5), r(9) });
-        s = s ++ line("mul.u24 {s}, r48.y, c1.z", .{r(6)});
+        // (r48.y through a register: one const/shared source per cat2 instruction)
+        s = s ++ line("mov.u32u32 {s}, r48.y", .{r(6)});
+        s = s ++ line("mul.u24 {s}, {s}, c1.z", .{ r(6), r(6) });
         s = s ++ line("shl.b {s}, {s}, 5", .{ r(9), r(5) });
         s = s ++ line("add.u {s}, {s}, {s}", .{ r(6), r(6), r(9) });
         s = s ++ line("shl.b {s}, {s}, 2", .{ r(9), r(4) });
@@ -881,7 +890,8 @@ pub fn q80QuantSource() []const u8 {
         s = s ++ line("cmps.u.eq p0.x, {s}, 0", .{r(4)});
         s = s ++ "br !p0.x, #done\n";
         // the scale: (t * blocks + block) * 4
-        s = s ++ line("mul.u24 {s}, r48.y, c1.w", .{r(26)});
+        s = s ++ line("mov.u32u32 {s}, r48.y", .{r(26)});
+        s = s ++ line("mul.u24 {s}, {s}, c1.w", .{ r(26), r(26) });
         s = s ++ line("add.u {s}, {s}, {s}", .{ r(26), r(26), r(5) });
         s = s ++ line("shl.b {s}, {s}, 2", .{ r(26), r(26) });
         s = s ++ line("stg.a.u32 g[c1.x+{s}+0], {s}, 1", .{ r(26), r(40) });
@@ -1222,7 +1232,6 @@ pub fn prepareSource() []const u8 {
         s = s ++ line("mov.u32u32 {s}, r48.y", .{r(5)});
         s = s ++ line("shl.b {s}, r0.x, 2", .{r(8)});
         s = s ++ line("mov.u32u32 {s}, c3.z", .{r(9)}); // heads
-        s = s ++ line("add.u {s}, c3.z, c3.w", .{r(10)}); // heads + kv_heads
         // kind: 0 query, 1 key, 2 value; local head index
         s = s ++ line("cmps.u.lt p0.x, r48.x, {s}", .{r(9)});
         s = s ++ "br !p0.x, #notq\n";
@@ -1382,11 +1391,34 @@ fn runSynced(d: device.Device, ib: device.Buffer, dwords: u32) !void {
 
 fn emuFailure(e: anyerror) anyerror {
     const T = TestRig;
-    var buf: [160]u8 = undefined;
-    const at = T.emu.emu.err_pc;
-    const text = ir3.format(ir3.A7XX, &T.emu.emu.code[at], &buf) catch "?";
-    std.debug.print("emulated GPU: {s} at instruction {d}: {s}\n", .{ if (T.emu.last_error) |x| @errorName(x) else "?", at, text });
+    var buf: [512]u8 = undefined;
+    std.debug.print("emulated GPU: {s}\n", .{T.emu.describe(null, &buf)});
     return e;
+}
+
+test "every kernel keeps ir3's operand rules, its constlen and its register footprint" {
+    const T = TestRig;
+    var code: [ir3_asm.MAX_INSTRS + 16]u64 = undefined;
+    const sources = comptime blk: {
+        var list: []const []const u8 = &.{};
+        for (1..MAX_TOKENS + 1) |t| list = list ++ &[_][]const u8{ q4kMatrixSource(t), q6kMatrixSource(t), q80MatrixSource(t) };
+        for ([_]comptime_int{ 1, 2, 4, 8, 16 }) |w| list = list ++ &[_][]const u8{ quantSource(true, w), residualSource(true, w), residualSource(false, w) };
+        for (2..9) |taps| list = list ++ &[_][]const u8{convSource(taps)};
+        list = list ++ &[_][]const u8{ quantSource(false, 1), swigluSource(), prepareSource(), attentionSource(), q80QuantSource() };
+        break :blk list;
+    };
+    for (sources, 0..) |src, i| {
+        const k = ir3_asm.assemble(ir3.A7XX, src, &T.asm_work, &code) catch |e| {
+            std.debug.print("kernel {d}: assemble: line {d}: {s}\n", .{ i, T.asm_work.err_line, @errorName(e) });
+            return e;
+        };
+        if (device.checkKernel(&k)) |bad| {
+            var buf: [160]u8 = undefined;
+            const in = try ir3.decode(ir3.A7XX, k.code[bad.pc]);
+            std.debug.print("kernel {d}, instruction {d}: {s}: {s}\n", .{ i, bad.pc, ir3.format(ir3.A7XX, &in, &buf) catch "?", bad.rule });
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 fn lcg(seed: *u32) u32 {
