@@ -2924,6 +2924,21 @@ fn allocate(w: *Work) Error!void {
             }
         }
     }
+    // The input registers arrive before every loop: read in one, they live
+    // to its end (the next turn reads them again), outer loops included.
+    for (0..3) |a| if (tid_used[a]) {
+        var grew = true;
+        while (grew) {
+            grew = false;
+            for (w.loops[0..w.n_loops]) |lp| {
+                const e = 2 * lp.end + 1;
+                if (tid_last[a] >= 2 * lp.head and tid_last[a] < e) {
+                    tid_last[a] = e;
+                    grew = true;
+                }
+            }
+        }
+    };
     // Multiple machine definitions (vote, set) inside straight code are
     // covered by first..last already.
     // Order the allocation units by start.
