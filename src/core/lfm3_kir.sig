@@ -39,7 +39,8 @@
 //!   float epilogue per block in the CPU's order, and the lanes added in the
 //!   CPU's order: Q4_K and Q6_K are the CPU's to the bit under any Caps.
 //!   Q8_0's epilogue is the CPU's fused multiply-add: ffma where
-//!   Caps.fused_fma, otherwise fmad (the CPU's bits only where it fuses).
+//!   Caps.fused_fma, otherwise an exact emulation (Builder.fma): the CPU's
+//!   bits either way.
 //! - The quantizations (Q8_K, Q8_0) divide exactly (fdiv) and round to
 //!   nearest even: the CPU's bits for the same input.
 //! - RMSNorm: the CPU sums squares in f64. Here each square is split exactly
@@ -501,6 +502,44 @@ pub const Builder = struct {
         return b.fadd(R(t3), R(b.fmul(R(al), R(cl))));
     }
 
+    fn toReg(b: *Builder, a: Arg) V {
+        return switch (a) {
+            .reg => |v| v,
+            .imm => b.mov(.f32, a),
+        };
+    }
+
+    /// a * x + c rounded once, as the CPU's @mulAdd: ffma where the GPU
+    /// fuses; elsewhere emulated exactly from correctly rounded multiplies
+    /// and adds (Boldo and Melquiond's: the product split exactly (Dekker),
+    /// c + its high part by TwoSum, the two low parts added with rounding
+    /// to odd, then one rounding to nearest). Exact but for overflow and
+    /// underflow; about 35 operations.
+    fn fma(b: *Builder, a: Arg, x: Arg, c: Arg) V {
+        if (b.caps.fused_fma) return b.op3(.ffma, .f32, a, x, c);
+        const av = b.toReg(a);
+        const xv = b.toReg(x);
+        const cv = b.toReg(c);
+        const ph = b.fmul(R(av), R(xv));
+        const pl = b.prodErr(av, xv, ph);
+        // (th, tl) = TwoSum(c, ph)
+        const th = b.fadd(R(cv), R(ph));
+        const t1 = b.fsub(R(th), R(cv));
+        const tl = b.fadd(R(b.fsub(R(cv), R(b.fsub(R(th), R(t1))))), R(b.fsub(R(ph), R(t1))));
+        // v = RO(tl + pl): the nearest sum, moved one ulp toward the exact one
+        // when it was inexact and came out even
+        const sn = b.fadd(R(tl), R(pl));
+        const s1 = b.fsub(R(sn), R(tl));
+        const err = b.fadd(R(b.fsub(R(tl), R(b.fsub(R(sn), R(s1))))), R(b.fsub(R(pl), R(s1))));
+        const sb = b.as(.u32, sn);
+        const even = b.icmp(.u32, .eq, R(b.band(R(sb), U(1))), U(0));
+        const inexact = b.fcmp(.ne, R(err), F(0));
+        const same = b.icmp(.u32, .eq, R(b.shr(R(b.op2(.xor, .u32, R(b.as(.u32, err)), R(sb))), 31)), U(0));
+        const moved = b.sel(.u32, same, R(b.add(R(sb), U(1))), R(b.sub(R(sb), U(1))));
+        const v = b.as(.f32, b.sel(.u32, b.pand(even, inexact), R(moved), R(sb)));
+        return b.fadd(R(th), R(v));
+    }
+
     /// a + c as a double-f32, symmetric in a and c (the butterfly's
     /// partners get the same bits).
     fn ddAdd(b: *Builder, a: DD, c: DD) DD {
@@ -939,8 +978,7 @@ fn q80Body(b: *Builder, m: MB, lpt: u32, tokens: u32, l0x4: V, boff: V, blk: V, 
         for (0..lpt) |j| {
             const dot = b.dot4(.s8s8, R(at(aw, j)), R(w[j]), I(0));
             // the CPU's @mulAdd: fused where the GPU fuses
-            const op: Op = if (b.caps.fused_fma) .ffma else .fmad;
-            b.set(acc[ti][j], op, .f32, R(da), R(b.i2f(dot)), R(acc[ti][j]));
+            b.set(acc[ti][j], .mov, .f32, R(b.fma(R(da), R(b.i2f(dot)), R(acc[ti][j]))), NO, NO);
         }
     }
     nextBlock(b, boff, blk, blocks, Q8_0_BLOCK);
@@ -1869,6 +1907,351 @@ pub fn copy(s: kir.Storage, caps: Caps) Error!kir.Kernel {
     return k;
 }
 
+// ── LFM3-Audio (the depthformer, as lfm3_audio_gen and lfm3_audio_ops) ──────
+//
+// The audio networks are ggml's CPU graph (lfm3_audio_ops): its RMSNorm
+// rounds each square to f32 before the f64 sum, its exp (ggml_v_expf) and
+// its dot products (ggml_vec_dot_f32) are built of fused multiply-adds, as
+// is the Q8_0 matrices' epilogue. Each fused step is ffma where the GPU
+// fuses and Builder.fma's exact emulation where it does not: the CPU's bits
+// on every GPU.
+
+/// a * b + c, as the CPU's @mulAdd where the GPU fuses.
+fn mulAdd(b: *Builder, a: Arg, x: Arg, c: Arg) V {
+    return b.fma(a, x, c);
+}
+
+/// ggml_v_expf (lfm3_audio_ops.expGgml), op for op, branch-free.
+fn expGgml(b: *Builder, x: V) V {
+    const r = F(0x1.8p23);
+    const z = mulAdd(b, R(x), F(0x1.715476p+0), r);
+    const n = b.fsub(R(z), r);
+    const nn = b.fneg(R(n));
+    const bb = mulAdd(b, R(nn), F(0x1.7f7d1cp-20), R(mulAdd(b, R(nn), F(0x1.62e4p-1), R(x))));
+    const e = b.shl(R(b.as(.u32, z)), 23);
+    const k = b.as(.f32, b.add(R(e), U(@bitCast(@as(f32, 1.0)))));
+    const u = b.fmul(R(bb), R(bb));
+    const inner = mulAdd(b, R(mulAdd(b, F(0x1.0e4020p-7), R(bb), F(0x1.573e2ep-5))), R(u), R(mulAdd(b, F(0x1.555e66p-3), R(bb), F(0x1.fffdb6p-2))));
+    const j = mulAdd(b, R(inner), R(u), R(b.fmul(F(0x1.ffffecp-1), R(bb))));
+    const normal = mulAdd(b, R(j), R(k), R(k));
+    const an = b.fabs(R(n));
+    const g = b.sel(.u32, b.fcmp(.le, R(n), F(0)), U(0x82000000), U(0));
+    const s1 = b.as(.f32, b.add(R(g), U(0x7f000000)));
+    const s2 = b.as(.f32, b.sub(R(e), R(g)));
+    const huge = b.fmul(R(s1), R(s1));
+    const scaled = b.fmul(R(mulAdd(b, R(s2), R(j), R(s2))), R(s1));
+    const far = b.sel(.f32, b.fcmp(.gt, R(an), F(192)), R(huge), R(scaled));
+    // !(|n| > 126): the normal path (NaN included, as the CPU's test)
+    return b.sel(.f32, b.fcmp(.gt, R(an), F(126)), R(far), R(normal));
+}
+
+/// The host's twin of expGgml with the twice-rounded mad an unfused GPU
+/// has (fused: lfm3_audio_ops.expGgml itself).
+pub fn expGgmlUnfused(x: f32) f32 {
+    const M = struct {
+        fn mad(a: f32, c: f32, d: f32) f32 {
+            return a * c + d;
+        }
+    };
+    const r: f32 = 0x1.8p23;
+    const z = M.mad(x, 0x1.715476p+0, r);
+    const n = z - r;
+    const bb = M.mad(-n, 0x1.7f7d1cp-20, M.mad(-n, 0x1.62e4p-1, x));
+    const e: u32 = @as(u32, @bitCast(z)) << 23;
+    const k: f32 = @bitCast(e +% @as(u32, @bitCast(@as(f32, 1.0))));
+    const u = bb * bb;
+    const j = M.mad(M.mad(M.mad(0x1.0e4020p-7, bb, 0x1.573e2ep-5), u, M.mad(0x1.555e66p-3, bb, 0x1.fffdb6p-2)), u, 0x1.ffffecp-1 * bb);
+    if (!(@abs(n) > 126)) return M.mad(j, k, k);
+    const g: u32 = if (n <= 0) 0x82000000 else 0;
+    const s1: f32 = @bitCast(g +% 0x7f000000);
+    const s2: f32 = @bitCast(e -% g);
+    if (@abs(n) > 192) return s1 * s1;
+    return M.mad(s2, j, s2) * s1;
+}
+
+/// RMSNorm of rows as lfm3_audio_ops.rmsNorm (each square rounded to f32,
+/// the squares summed as the CPU's f64 does, mean = sum / width rounded
+/// once), and with `twice` a second one over the result (the depthformer's
+/// output norm then its codebook's head norm). Bindings: x, weight, out.
+/// Params: width, epsilon's bits, x's first row (bytes), the weights'
+/// offset and stride between rows (0: one vector), out's first row, the
+/// second weights' offset and stride. Groups (1, rows).
+pub fn normRows(s: kir.Storage, caps: Caps, twice: bool) Error!kir.Kernel {
+    const threads = rowThreads(caps);
+    var k = begin(s, if (twice) "lfm3a_norm2" else "lfm3a_norm", threads);
+    var b = Builder.init(&k, caps);
+    const X = k.binding();
+    const WB = k.binding();
+    const OUT = k.binding();
+    k.param_words = 8;
+    b.needExchange(threads);
+    const t = b.tid(0);
+    const row = b.gid(1);
+    const width = b.param(0);
+    const eps = b.as(.f32, b.param(1));
+    const nf = b.cvt(.u32, .f32, .rne, R(width));
+    const row_bytes = b.shl(R(b.mul(R(row), R(width))), 2);
+    const x_base = b.add(R(b.param(2)), R(row_bytes));
+    const o_base = b.add(R(b.param(5)), R(row_bytes));
+    const chunks = b.shr(R(b.add(R(width), U(threads - 1))), log2(threads));
+    const t4 = b.shl(R(t), 2);
+    const step = threads * 4;
+    for (0..@as(usize, if (twice) 2 else 1)) |pass| {
+        const src = if (pass == 0) X else OUT;
+        const src_base = if (pass == 0) x_base else o_base;
+        const w_base = b.add(R(b.param(if (pass == 0) 3 else 6)), R(b.mul(R(row), R(b.param(if (pass == 0) 4 else 7)))));
+        const sum = b.ddZero();
+        const c = b.mov(.u32, U(0));
+        b.loop();
+        {
+            const col = b.add(R(b.mul(R(c), U(step))), R(t4));
+            const ok = b.icmp(.u32, .lt, R(col), R(b.shl(R(width), 2)));
+            const v = b.ld(src, .f32, R(b.add(R(src_base), R(b.sel(.u32, ok, R(col), U(0))))), 0, 5);
+            const sq = b.sel(.f32, ok, R(b.fmul(R(v), R(v))), F(0));
+            b.ddAccumulate(sum, .{ .hi = sq, .lo = b.mov(.f32, F(0)) });
+            b.set(c, .iadd, .u32, R(c), U(1), NO);
+            b.brk(b.icmp(.u32, .ge, R(c), R(chunks)));
+        }
+        b.endloop();
+        const inverse = b.normInverse(b.xorReduceDD(sum, threads, t), R(nf), R(eps));
+        b.set(c, .mov, .u32, U(0), NO, NO);
+        b.loop();
+        {
+            const col = b.add(R(b.mul(R(c), U(step))), R(t4));
+            const ok = b.icmp(.u32, .lt, R(col), R(b.shl(R(width), 2)));
+            b.if_(ok);
+            const v = b.ld(src, .f32, R(b.add(R(src_base), R(col))), 0, 5);
+            const w = b.ld(WB, .f32, R(b.add(R(w_base), R(col))), 0, 5);
+            b.st(OUT, R(b.add(R(o_base), R(col))), 0, 5, b.fmul(R(b.fmul(R(v), R(inverse))), R(w)));
+            b.endif();
+            b.set(c, .iadd, .u32, R(c), U(1), NO);
+            b.brk(b.icmp(.u32, .ge, R(c), R(chunks)));
+        }
+        b.endloop();
+    }
+    try k.finish();
+    return k;
+}
+
+/// A small head's RMSNorm (f32 squares) then NeoX RoPE by the host's table,
+/// in place, as lfm3_audio_gen's attention prepares queries and keys. A
+/// workgroup of head_size / 2 threads a (head, position), thread j holding
+/// elements j and j + head_size / 2. Bindings: x (f32 [T][heads][head]),
+/// weight (head f32), rope (f32 [T][head / 2][2]). Params: heads, epsilon's
+/// bits, x's offset, the weights' offset. Groups (heads, T).
+pub fn headNormRope(s: kir.Storage, caps: Caps, head_size: u32) Error!kir.Kernel {
+    if (head_size < 2 or head_size > 256 or !std.math.isPowerOfTwo(head_size)) return error.Unsupported;
+    const half = head_size / 2;
+    var k = begin(s, "lfm3a_head", half);
+    var b = Builder.init(&k, caps);
+    const X = k.binding();
+    const WB = k.binding();
+    const ROPE = k.binding();
+    k.param_words = 4;
+    b.needExchange(half);
+    const t = b.tid(0);
+    const h = b.gid(0);
+    const tok = b.gid(1);
+    const heads = b.param(0);
+    const row = b.add(R(b.param(2)), R(b.mul(R(b.add(R(b.mul(R(tok), R(heads))), R(h))), U(head_size * 4))));
+    const t4 = b.shl(R(t), 2);
+    const lo = b.ld(X, .f32, R(b.add(R(row), R(t4))), 0, 5);
+    const hi = b.ld(X, .f32, R(b.add(R(row), R(t4))), half * 4, 5);
+    const sq = b.ddAdd(.{ .hi = b.fmul(R(lo), R(lo)), .lo = b.mov(.f32, F(0)) }, .{ .hi = b.fmul(R(hi), R(hi)), .lo = b.mov(.f32, F(0)) });
+    const inverse = b.normInverse(b.xorReduceDD(sq, half, t), F(@floatFromInt(head_size)), R(b.as(.f32, b.param(1))));
+    const wo = b.add(R(b.param(3)), R(t4));
+    const a = b.fmul(R(b.fmul(R(lo), R(inverse))), R(b.ld(WB, .f32, R(wo), 0, 5)));
+    const c = b.fmul(R(b.fmul(R(hi), R(inverse))), R(b.ld(WB, .f32, R(wo), half * 4, 5)));
+    const cs = b.ldv(ROPE, .f32, R(b.shl(R(b.add(R(b.mul(R(tok), U(half))), R(t))), 3)), 0, 2);
+    const cosv = at(cs, 0);
+    const sinv = at(cs, 1);
+    b.st(X, R(b.add(R(row), R(t4))), 0, 5, b.fsub(R(b.fmul(R(a), R(cosv))), R(b.fmul(R(c), R(sinv)))));
+    b.st(X, R(b.add(R(row), R(t4))), half * 4, 5, b.fadd(R(b.fmul(R(a), R(sinv))), R(b.fmul(R(c), R(cosv)))));
+    try k.finish();
+    return k;
+}
+
+/// The depthformer's attention, as lfm3_audio_ops.attendHeadGgml with every
+/// key visible: a workgroup a (query head, position), 32 threads (thread j
+/// key j, then element j). Scores by ggml_vec_dot_f32's tree, scaled, + 0;
+/// the maximum; exps by ggml_v_expf over whole groups of eight keys and the
+/// CPU's expf over the rest; the total (groups of eight summed in f32 as
+/// ggml does, then all in the CPU's f64 order); weights times the inverse;
+/// each element the fused sum over the keys in order; then the head's
+/// sigmoid gate (`gated`). Up to 31 keys, heads of 32. Bindings: query
+/// (f32 [T][heads][32]), key and value ([T][kv_heads][32]), gate
+/// ([T][heads]), out ([T][heads][32]). Params: heads, kv_heads' log2 group,
+/// T (the keys), the scale's bits. Groups (heads, T).
+pub fn attendGgml(s: kir.Storage, caps: Caps, gated: bool) Error!kir.Kernel {
+    const hs = 32;
+    var k = begin(s, "lfm3a_attend", 32);
+    var b = Builder.init(&k, caps);
+    const Q = k.binding();
+    const KB = k.binding();
+    const VB = k.binding();
+    const G = k.binding();
+    const OUT = k.binding();
+    k.param_words = 4;
+    const wbase = k.shared_bytes;
+    k.shared_bytes += 32 * 4;
+    b.needExchange(32);
+    const t = b.tid(0);
+    const h = b.gid(0);
+    const pos = b.gid(1);
+    const heads = b.param(0);
+    const n = b.param(2);
+    const kvh = b.op2(.shr, .u32, R(h), R(b.param(1)));
+    const kv_heads = b.op2(.shr, .u32, R(heads), R(b.param(1)));
+    const qrow = b.mul(R(b.add(R(b.mul(R(pos), R(heads))), R(h))), U(hs * 4));
+    const valid = b.icmp(.u32, .lt, R(t), R(n));
+    const key = b.sel(.u32, valid, R(t), U(0));
+    const krow = b.mul(R(b.add(R(b.mul(R(key), R(kv_heads))), R(kvh))), U(hs * 4));
+    // ggml_vec_dot_f32(key, query) over one 32-wide step: four 8-lane
+    // products, (0 + 2), (1 + 3), (0 + 1), the halves, then pairs
+    var p: [32]V = undefined;
+    for (0..32) |i| {
+        const kv = b.ld(KB, .f32, R(krow), @intCast(4 * i), 5);
+        const qv = b.ld(Q, .f32, R(qrow), @intCast(4 * i), 5);
+        p[i] = b.fadd(R(b.fmul(R(kv), R(qv))), F(0));
+    }
+    var s0: [8]V = undefined;
+    for (0..8) |l| {
+        const a0 = b.fadd(R(p[l]), R(p[16 + l]));
+        const a1 = b.fadd(R(p[8 + l]), R(p[24 + l]));
+        s0[l] = b.fadd(R(a0), R(a1));
+    }
+    var t0: [4]V = undefined;
+    for (0..4) |i| t0[i] = b.fadd(R(s0[i]), R(s0[i + 4]));
+    const dot = b.fadd(R(b.fadd(R(t0[0]), R(t0[1]))), R(b.fadd(R(t0[2]), R(t0[3]))));
+    const score = b.fadd(R(b.fmul(R(dot), R(b.as(.f32, b.param(3))))), F(0));
+    const ninf = F(-std.math.inf(f32));
+    const maximum = b.xorReduce(.fmax, .f32, b.sel(.f32, valid, R(score), ninf), 32, t);
+    // exps: ggml's over whole groups of eight keys, expf over the rest
+    const d = b.fsub(R(score), R(maximum));
+    const grouped = b.icmp(.u32, .lt, R(t), R(b.band(R(n), U(0xfffffff8))));
+    const e = b.sel(.f32, valid, R(b.sel(.f32, grouped, R(expGgml(&b, d)), R(b.expCpu(d)))), F(0));
+    // the total: every thread gathers the 32 exps (the same order everywhere)
+    var ev: [32]V = undefined;
+    for (0..32) |i| ev[i] = b.shfl(.idx, e, U(@intCast(i)));
+    const groups = b.shr(R(n), 3);
+    var total = b.ddZero();
+    for (0..4) |g| {
+        var q: [4]V = undefined;
+        for (0..4) |i| q[i] = b.fadd(R(ev[8 * g + i + 4]), R(ev[8 * g + i]));
+        const gsum = b.fadd(R(b.fadd(R(q[0]), R(q[2]))), R(b.fadd(R(q[1]), R(q[3]))));
+        const in = b.icmp(.u32, .lt, U(@intCast(g)), R(groups));
+        total = b.ddAdd(total, .{ .hi = b.sel(.f32, in, R(gsum), F(0)), .lo = b.mov(.f32, F(0)) });
+    }
+    // (the tail: the keys past the groups, in order)
+    for (0..32) |i| {
+        const tail = b.pand(b.icmp(.u32, .ge, U(@intCast(i)), R(b.shl(R(groups), 3))), b.icmp(.u32, .lt, U(@intCast(i)), R(n)));
+        total = b.ddAdd(total, .{ .hi = b.sel(.f32, tail, R(ev[i]), F(0)), .lo = b.mov(.f32, F(0)) });
+    }
+    const inverse = b.ddRecip(total);
+    const w = b.fmul(R(e), R(inverse));
+    b.sts(R(b.shl(R(t), 2)), wbase, w, 1);
+    b.barrier();
+    // element t: ggml_vec_dot_f32(column, weights) for fewer than 32 keys:
+    // (0 + 0) + (0 + 0), then fused products in key order
+    const acc = b.mov(.f32, F(0));
+    const kk = b.mov(.u32, U(0));
+    b.if_(b.icmp(.u32, .ne, R(n), U(0)));
+    b.loop();
+    {
+        const vrow = b.mul(R(b.add(R(b.mul(R(kk), R(kv_heads))), R(kvh))), U(hs * 4));
+        const v = b.ld(VB, .f32, R(b.add(R(vrow), R(b.shl(R(t), 2)))), 0, 5);
+        const wk = b.lds(.f32, R(b.shl(R(kk), 2)), wbase, 1);
+        b.set(acc, .mov, .f32, R(b.fma(R(v), R(wk), R(acc))), NO, NO);
+        b.set(kk, .iadd, .u32, R(kk), U(1), NO);
+        b.brk(b.icmp(.u32, .ge, R(kk), R(n)));
+    }
+    b.endloop();
+    b.endif();
+    var out = acc;
+    if (gated) {
+        const g = b.ld(G, .f32, R(b.shl(R(b.add(R(b.mul(R(pos), R(heads))), R(h))), 2)), 0, 5);
+        out = b.fmul(R(out), R(b.sigmoid(g)));
+    }
+    b.st(OUT, R(b.add(R(qrow), R(b.shl(R(t), 2)))), 0, 5, out);
+    try k.finish();
+    return k;
+}
+
+/// gate = silu(gate) * up elementwise with ggml's silu (x / (1 +
+/// ggml_v_expf(0 - x))), as lfm3_audio_gen's FFN. Bindings: gate (updated),
+/// up. Params: count. Groups (count / 64 rounded up).
+pub fn gluGgml(s: kir.Storage, caps: Caps) Error!kir.Kernel {
+    var k = begin(s, "lfm3a_glu", 64);
+    var b = Builder.init(&k, caps);
+    const GB = k.binding();
+    const UB = k.binding();
+    k.param_words = 1;
+    const i = b.add(R(b.shl(R(b.gid(0)), 6)), R(b.tid(0)));
+    b.if_(b.icmp(.u32, .lt, R(i), R(b.param(0))));
+    const off = b.shl(R(i), 2);
+    const g = b.ld(GB, .f32, R(off), 0, 5);
+    const silu = b.fdiv(R(g), R(b.fadd(F(1.0), R(expGgml(&b, b.fsub(F(0), R(g)))))));
+    b.st(GB, R(off), 0, 5, b.fmul(R(silu), R(b.ld(UB, .f32, R(off), 0, 5))));
+    b.endif();
+    try k.finish();
+    return k;
+}
+
+/// The depthformer's input rows: row `book` = the projected state's row +
+/// the code's embedding (a Q8_0 row of the table, dequantized: d * q) or
+/// the mask embedding when the code is -1. Bindings: projected (f32 [12][d]),
+/// weights (the model: table and mask), out (f32 [12][d]). Params: d, the
+/// table's offset, its row bytes, the vocabulary, the mask's offset, then
+/// the twelve codes (i32 bits). Groups (d / 64 rounded up, 12).
+pub fn depthInput(s: kir.Storage, caps: Caps) Error!kir.Kernel {
+    var k = begin(s, "lfm3a_input", 64);
+    var b = Builder.init(&k, caps);
+    const P = k.binding();
+    const WB = k.binding();
+    const OUT = k.binding();
+    k.param_words = 5 + 12;
+    const e = b.add(R(b.shl(R(b.gid(0)), 6)), R(b.tid(0)));
+    const book = b.gid(1);
+    const d = b.param(0);
+    b.if_(b.icmp(.u32, .lt, R(e), R(d)));
+    // the book's code: params 5 + book (selected: a param's word is static)
+    var code = b.mov(.u32, R(b.param(5)));
+    for (1..12) |i| code = b.sel(.u32, b.icmp(.u32, .eq, R(book), U(@intCast(i))), R(b.param(@intCast(5 + i))), R(code));
+    const masked = b.icmp(.i32, .lt, R(code), I(0));
+    const off = b.shl(R(b.add(R(b.mul(R(book), R(d))), R(e))), 2);
+    const base = b.ld(P, .f32, R(off), 0, 5);
+    const mask = b.ld(WB, .f32, R(b.add(R(b.param(4)), R(b.shl(R(e), 2)))), 0, 5);
+    // the table row (book * vocabulary + code), block e / 32, quant e % 32
+    const trow = b.add(R(b.mul(R(book), R(b.param(3)))), R(b.sel(.u32, masked, U(0), R(code))));
+    const blk = b.add(R(b.add(R(b.param(1)), R(b.mul(R(trow), R(b.param(2)))))), R(b.mul(R(b.shr(R(e), 5)), U(Q8_0_BLOCK))));
+    const dh = b.half(b.ld(WB, .u32, R(blk), 0, 4), false);
+    const q = b.ld(WB, .i32, R(b.add(R(blk), R(b.add(R(b.band(R(e), U(31))), U(2))))), 0, 3);
+    const emb = b.fmul(R(dh), R(b.cvt(.i32, .f32, .rne, R(q))));
+    b.st(OUT, R(off), 0, 5, b.fadd(R(base), R(b.sel(.f32, masked, R(mask), R(emb)))));
+    b.endif();
+    try k.finish();
+    return k;
+}
+
+/// out[t][i] += v[i] (a bias). Bindings: out, v. Params: width, v's
+/// offset. Groups (width / 64 rounded up, T).
+pub fn addBias(s: kir.Storage, caps: Caps) Error!kir.Kernel {
+    var k = begin(s, "lfm3a_bias", 64);
+    var b = Builder.init(&k, caps);
+    const OUT = k.binding();
+    const VB = k.binding();
+    k.param_words = 2;
+    const i = b.add(R(b.shl(R(b.gid(0)), 6)), R(b.tid(0)));
+    const width = b.param(0);
+    b.if_(b.icmp(.u32, .lt, R(i), R(width)));
+    const off = b.shl(R(b.add(R(b.mul(R(b.gid(1)), R(width))), R(i))), 2);
+    const v = b.ld(VB, .f32, R(b.add(R(b.param(1)), R(b.shl(R(i), 2)))), 0, 5);
+    b.st(OUT, R(off), 0, 5, b.fadd(R(b.ld(OUT, .f32, R(off), 0, 5)), R(v)));
+    b.endif();
+    try k.finish();
+    return k;
+}
+
 // ── Host helpers ────────────────────────────────────────────────────────────
 
 /// The cosines and sines prepare rotates by, for `tokens` positions from
@@ -1997,25 +2380,6 @@ fn caps32(fused: bool, subgroup: u32) Caps {
     return c;
 }
 
-/// quantized_linear's Q8_0 dot with mul then add (two roundings) for its
-/// fused multiply-add: what an unfused GPU's fmad gives.
-fn dotQ80Unfused(wrow: []const u8, acts: []const quantized.Q80Block) f32 {
-    var lanes: [8]f32 = @splat(0);
-    for (acts, 0..) |act, blk| {
-        const w = wrow[blk * Q8_0_BLOCK ..][0..Q8_0_BLOCK];
-        const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, w[0..2], .little))));
-        const scale = d * act.d;
-        for (0..8) |l| {
-            var sum: i32 = 0;
-            for (0..4) |j| sum += @as(i32, @as(i8, @bitCast(w[2 + 4 * l + j]))) * act.qs[4 * l + j];
-            const p = scale * @as(f32, @floatFromInt(sum));
-            lanes[l] = lanes[l] + p;
-        }
-    }
-    const q = [4]f32{ lanes[4] + lanes[0], lanes[5] + lanes[1], lanes[6] + lanes[2], lanes[7] + lanes[3] };
-    return (q[0] + q[2]) + (q[1] + q[3]);
-}
-
 fn testMatrix(caps: Caps, lay: Layout, format: Format, tokens: u32, rows: u32, blocks: u32) !void {
     const T = TestRig;
     const k_cols: u32 = blocks * (if (format == .q8_0) @as(u32, QK8_0) else QK_K);
@@ -2071,7 +2435,7 @@ fn testMatrix(caps: Caps, lay: Layout, format: Format, tokens: u32, rows: u32, b
             const want = switch (format) {
                 .q4_k => quantized.dotQ4KQ8KTile(1, wrow, .{q8k[t * blocks ..].ptr}, blocks)[0],
                 .q6_k => quantized.dotQ6KQ8KTile(1, wrow, .{q8k[t * blocks ..].ptr}, blocks)[0],
-                .q8_0 => if (caps.fused_fma) quantized.dotQ80Q80Tile(1, wrow, .{q80[t * blocks ..].ptr}, blocks)[0] else dotQ80Unfused(wrow, q80[t * blocks ..][0..blocks]),
+                .q8_0 => quantized.dotQ80Q80Tile(1, wrow, .{q80[t * blocks ..].ptr}, blocks)[0],
             };
             const g = got[t * rows + row];
             if (@as(u32, @bitCast(g)) != @as(u32, @bitCast(want))) {
@@ -2100,7 +2464,7 @@ test "Q6_K x Q8_K: the CPU's bits, odd blocks two bytes off, odd block counts" {
     try testMatrix(caps32(true, 32), .{ .lanes = 4 }, .q6_k, 8, 33, 1);
 }
 
-test "Q8_0 x Q8_0: the CPU's fused bits where the GPU fuses, its twice-rounded ones where not" {
+test "Q8_0 x Q8_0: the CPU's fused bits, ffma where the GPU fuses, the exact emulation where not" {
     for ([_]u32{ 1, 4 }) |lanes| {
         try testMatrix(caps32(true, 32), .{ .lanes = lanes }, .q8_0, 1, 21, 37);
         try testMatrix(caps32(false, 32), .{ .lanes = lanes }, .q8_0, 8, 16, 24);
@@ -2128,6 +2492,44 @@ fn expectQ8K(cpu: []const quantized.Q8KBlock, aq: []const u8, ad: []const u8, as
         try std.testing.expectEqualSlices(u8, std.mem.asBytes(&blk.qs), aq[i * QK_K ..][0..QK_K]);
         try std.testing.expectEqualSlices(u8, std.mem.asBytes(&blk.bsums), as_[i * 32 ..][0..32]);
     }
+}
+
+test "fma: the emulation where the GPU does not fuse is the CPU's @mulAdd, on 4 million triples" {
+    const T = TestRig;
+    const caps = caps32(false, 32);
+    var k = begin(testStorage(), "fma", 64);
+    var b = Builder.init(&k, caps);
+    const X = k.binding();
+    const Y = k.binding();
+    const ix4 = b.shl(R(b.add(R(b.shl(R(b.gid(0)), 6)), R(b.tid(0)))), 2);
+    const o12 = b.mul(R(ix4), U(3));
+    const r = b.fma(R(b.ld(X, .f32, R(o12), 0, 5)), R(b.ld(X, .f32, R(o12), 4, 5)), R(b.ld(X, .f32, R(o12), 8, 5)));
+    b.st(Y, R(ix4), 0, 5, r);
+    try k.finish();
+    const n = 1 << 16;
+    const xs = f32s(T.a[0 .. 3 * n * 4]);
+    const ys = f32s(T.b[0 .. n * 4]);
+    var seed: u32 = 12;
+    var mismatches: usize = 0;
+    for (0..64) |round| {
+        for (0..n) |i| {
+            // products near the addend (cancellation), moderate exponents
+            const a = unit(&seed) * @as(f32, @floatFromInt(1 + (lcg(&seed) >> 20)));
+            const c2 = unit(&seed) * 3;
+            xs[3 * i] = a;
+            xs[3 * i + 1] = c2;
+            xs[3 * i + 2] = if (round % 2 == 0) -(a * c2) * (1 + unit(&seed) * 1e-6) else unit(&seed) * 100;
+        }
+        _ = try runOn(&k, caps, .{ n / 64, 1, 1 }, &.{ T.a[0 .. 3 * n * 4], T.b[0 .. n * 4] }, &.{});
+        for (0..n) |i| {
+            const want = @mulAdd(f32, xs[3 * i], xs[3 * i + 1], xs[3 * i + 2]);
+            if (@as(u32, @bitCast(want)) != @as(u32, @bitCast(ys[i]))) {
+                if (mismatches < 4) std.debug.print("fma({e}, {e}, {e}) = {e}, want {e}\n", .{ xs[3 * i], xs[3 * i + 1], xs[3 * i + 2], ys[i], want });
+                mismatches += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatches);
 }
 
 test "Q8_K quantization: quantizeQ8K's bits (a zero block, magnitude ties), any subgroup" {
