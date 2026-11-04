@@ -599,7 +599,11 @@ fn execCat2(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
                 .rndne_f => {
                     const x = fsrc(c, f, s0, i);
                     const r = @round(x);
-                    fres = if (@abs(x - @trunc(x)) == 0.5 and @mod(r, 2.0) != 0) r - std.math.sign(x) else r;
+                    const e = if (@abs(x - @trunc(x)) == 0.5 and @mod(r, 2.0) != 0) r - std.math.sign(x) else r;
+                    // Rounding to an integral value keeps the sign (IEEE
+                    // roundToIntegralTiesToEven, NIR's fround_even, which
+                    // Mesa emits as rndne.f): -0.5 is -0, not +0.
+                    fres = std.math.copysign(e, x);
                 },
                 .rndaz_f => fres = @round(fsrc(c, f, s0, i)),
                 .cmps_f => res = @intFromBool(cmp(in.cond, f32, fsrc(c, f, s0, i), fsrc(c, f, s1, i))),
@@ -1256,6 +1260,32 @@ test "a store, a fence and a barrier are no delay slots: an address read across 
     code[9] = try ir3.assembleLine(ir3.A7XX, "nop");
     try load(w, &k);
     _ = try run(w, &mem, &.{ .kernel = &k, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats);
+}
+
+test "rndne.f rounds halves to even and keeps the sign of a zero: -0.5 is -0" {
+    var out = [_]u32{0} ** 8;
+    const regions = [_]Region{.{ .va = 0x9000, .bytes = std.mem.sliceAsBytes(&out) }};
+    const mem = Memory{ .regions = &regions };
+    // -0.5, -2.5, 0.5, -0.3, 2.5, -0, -1.5, 3.5
+    const consts = [_]u32{ 0x9000, 0, 0, 0, 0xbf00_0000, 0xc020_0000, 0x3f00_0000, 0xbe99_999a, 0x4020_0000, 0x8000_0000, 0xbfc0_0000, 0x4060_0000 };
+    _ = try runSource(
+        \\@localsize 1, 1, 1
+        \\@consts 3
+        \\rndne.f r0.x, c1.x
+        \\rndne.f r0.y, c1.y
+        \\rndne.f r0.z, c1.z
+        \\rndne.f r0.w, c1.w
+        \\rndne.f r1.x, c2.x
+        \\rndne.f r1.y, c2.y
+        \\rndne.f r1.z, c2.z
+        \\rndne.f r1.w, c2.w
+        \\mov.u32u32 r2.x, 0
+        \\stg.a.u32 g[c0.x+r2.x+0], r0.x, 4
+        \\mov.u32u32 r2.y, 16
+        \\stg.a.u32 g[c0.x+r2.y+0], r1.x, 4
+        \\end
+    , &mem, &consts, .{ 1, 1, 1 });
+    try std.testing.expectEqualSlices(u32, &.{ 0x8000_0000, 0xc000_0000, 0x0000_0000, 0x8000_0000, 0x4000_0000, 0x8000_0000, 0xc000_0000, 0x4080_0000 }, &out);
 }
 
 test "(abs) of the most negative integer wraps to itself" {
