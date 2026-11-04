@@ -178,15 +178,34 @@ pub fn Parser(comptime config: types.Config) type {
         fn statement(self: *Self) Error!Ast.Statement {
             if (try self.takeWord("CREATE")) {
                 if (self.mode == .standard and try self.takeWord("SEQUENCE")) return .{ .create_sequence = try self.createSequence() };
+                if (self.mode == .standard and try self.takeRaw("schema")) {
+                    var out: Ast.CreateSchema = .{ .if_not_exists = try self.ifNotExists() };
+                    out.name = try self.identifier();
+                    // AUTHORIZATION and schema elements are outside the subset.
+                    if (self.current.kind != .end and !self.isSymbol(.semicolon)) return error.UnsupportedStatement;
+                    try self.finish();
+                    return .{ .create_schema = out };
+                }
                 return .{ .create_table = try self.create() };
             }
             if (try self.takeWord("DROP")) {
+                if (self.mode == .standard and try self.takeRaw("schema")) {
+                    var out: Ast.DropSchema = .{ .if_exists = try self.ifExists() };
+                    out.name = try self.identifier();
+                    if (try self.takeRaw("cascade")) out.cascade = true else _ = try self.takeRaw("restrict");
+                    try self.finish();
+                    return .{ .drop_schema = out };
+                }
                 const sequence_kind = self.mode == .standard and try self.takeWord("SEQUENCE");
                 if (!sequence_kind) try self.expectWord("TABLE");
                 const conditional = self.mode == .standard and self.rawWord("if") and (try self.peek()).isWord("EXISTS");
                 if (conditional) try self.advance();
                 if (conditional) try self.expectWord("EXISTS");
-                const drop: Ast.Drop = .{ .name = try self.identifier(), .if_exists = conditional };
+                var drop: Ast.Drop = .{ .name = try self.identifier(), .if_exists = conditional };
+                if (self.mode == .standard and try self.takeSymbol(.dot)) {
+                    drop.schema = drop.name;
+                    drop.name = try self.identifier();
+                }
                 try self.finish();
                 return if (sequence_kind) .{ .drop_sequence = drop } else .{ .drop_table = drop };
             }
@@ -1135,6 +1154,10 @@ pub fn Parser(comptime config: types.Config) type {
         fn insert(self: *Self) Error!Ast.Insert {
             try self.expectWord("INTO");
             var out: Ast.Insert = .{ .table = try self.identifier() };
+            if (self.mode == .standard and try self.takeSymbol(.dot)) {
+                out.schema = out.table;
+                out.table = try self.identifier();
+            }
             if (self.mode == .standard and try self.takeWord("AS")) out.alias = try self.identifier();
             if (try self.takeSymbol(.lparen)) {
                 out.explicit_columns = true;
@@ -1636,6 +1659,10 @@ pub fn Parser(comptime config: types.Config) type {
         fn update(self: *Self) Error!Ast.Update {
             if (self.mode == .standard) _ = try self.takeWord("ONLY");
             var out: Ast.Update = .{ .table = try self.identifier() };
+            if (self.mode == .standard and try self.takeSymbol(.dot)) {
+                out.schema = out.table;
+                out.table = try self.identifier();
+            }
             if (self.mode == .standard) out.alias = try self.targetAlias();
             try self.expectWord("SET");
             while (true) {
@@ -1653,6 +1680,10 @@ pub fn Parser(comptime config: types.Config) type {
             try self.expectWord("FROM");
             if (self.mode == .standard) _ = try self.takeWord("ONLY");
             var out: Ast.Delete = .{ .table = try self.identifier() };
+            if (self.mode == .standard and try self.takeSymbol(.dot)) {
+                out.schema = out.table;
+                out.table = try self.identifier();
+            }
             if (self.mode == .standard) out.alias = try self.targetAlias();
             if (self.mode == .standard and try self.takeWord("USING")) out.using = try self.fromBlock();
             out.where = try self.where();

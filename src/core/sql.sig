@@ -361,6 +361,18 @@ pub fn Database(comptime config: Config) type {
 
         pub const Outcome = struct { affected: usize = 0, command: CommandTag = .none, returning: Returned = .{}, noop: bool = false };
 
+        /// A user schema slot: like a sequence slot, `creator` owns a pending
+        /// CREATE or DROP; `dead_csn` marks a committed DROP until reclaimed.
+        pub const Schema = struct {
+            live: bool = false,
+            pending_create: bool = false,
+            pending_drop: bool = false,
+            creator: u16 = 0,
+            dead_csn: u64 = 0,
+            oid: u32 = 0,
+            name: Name = .{},
+        };
+
         pub const AlterRecord = struct {
             sources: [config.columns]u8 = @splat(0),
             fills: [config.columns]V.Cell = @splat(.null_value),
@@ -552,6 +564,8 @@ pub fn Database(comptime config: Config) type {
         /// ALTER TABLE column mapping of the table slot it filled (indexed by
         /// that slot), read when the transaction encodes its record.
         alters: [config.tables]AlterRecord = @splat(.{}),
+        /// User schemas (Config.schemas); visibility is the catalog's.
+        schemas: [config.schemas]Schema = @splat(.{}),
         catalog: K = .{},
         /// Sequence slots (Config.sequences); values are non-transactional.
         seqs: [config.sequences]Q.Seq = @splat(.{}),
@@ -808,6 +822,11 @@ pub fn Database(comptime config: Config) type {
             self.epoch = source.epoch;
             self.catalog = source.catalog;
             self.seqs = source.seqs;
+            self.schemas = source.schemas;
+            for (&self.schemas) |*schema| {
+                schema.pending_create = false;
+                schema.pending_drop = false;
+            }
             self.seq_carried = source.seq_carried;
             // A logical copy has fresh session/execution state. In particular,
             // never copy caller-owned interrupt or sequence-hook pointers.
@@ -1306,6 +1325,14 @@ pub fn Database(comptime config: Config) type {
                     try self.alterSequence(slot, alter.slot, alter.options, snap);
                     break :blk 0;
                 },
+                .create_schema => |name| blk: {
+                    try self.createSchema(slot, name, snap);
+                    break :blk 0;
+                },
+                .drop_schema => |*drop| blk: {
+                    try self.dropSchema(slot, drop, snap);
+                    break :blk 0;
+                },
                 .select, .query, .control => unreachable,
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound), .noop = bound == .noop };
@@ -1379,7 +1406,82 @@ pub fn Database(comptime config: Config) type {
                 seq.dead_csn = 0;
                 freed = true;
             };
+            for (&self.schemas) |*schema| if (schema.live and schema.dead_csn != 0 and schema.dead_csn <= at) {
+                schema.live = false;
+                schema.dead_csn = 0;
+                freed = true;
+            };
             if (freed) _ = self.catalog.vacuum(at);
+        }
+
+        // ---- schemas ---------------------------------------------------------
+
+        /// CREATE SCHEMA: a schema slot, an OID and a cat_relations row
+        /// (relkind 'n'), all transactional. A concurrent creator of the same
+        /// name is waited for; the binder already rejected a visible name.
+        fn createSchema(self: *Self, slot: u16, name: Name, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            if (self.catalog.creator(name.slice(), snap)) |other| {
+                var waits: L.Set = .{};
+                waits.add(other);
+                tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                return self.park(slot, waits);
+            }
+            try self.reserveWrites(slot, 2);
+            var destination: ?usize = null;
+            for (0..2) |attempt| {
+                for (&self.schemas, 0..) |*schema, index| if (!schema.live) {
+                    destination = index;
+                    break;
+                };
+                if (destination != null or attempt == 1) break;
+                self.reclaimTables(self.horizon());
+            }
+            const index = destination orelse return error.TableCapacity;
+            if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
+            const schema = &self.schemas[index];
+            schema.* = .{ .live = true, .pending_create = true, .creator = slot, .oid = change_log.first_oid + self.oid_counter, .name = name };
+            self.oid_counter += 1;
+            tx.push(.{ .kind = .create_schema, .table = @intCast(index) }) catch unreachable;
+            var changes: [K.max_changes]K.Change = undefined;
+            const count = try self.catalog.createSchema(index, schema.oid, name.slice(), tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
+            for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
+        }
+
+        /// DROP SCHEMA: RESTRICT refuses a schema that holds tables (2BP01);
+        /// CASCADE drops them first. A table another transaction is creating
+        /// in it, or its pending DROP, is waited for.
+        fn dropSchema(self: *Self, slot: u16, drop: *const B.DropSchema, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            const schema = &self.schemas[drop.slot];
+            var waits: L.Set = .{};
+            if (schema.pending_drop and schema.creator != slot) waits.add(schema.creator);
+            if (self.catalog.namespaceCreator(drop.oid, snap)) |other| waits.add(other);
+            if (waits.any()) {
+                tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                return self.park(slot, waits);
+            }
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind != 'r' or self.tables[found.slot].namespace != drop.oid) continue;
+                if (!drop.cascade) return error.DependentObjects;
+                _ = try self.dropTable(slot, found.slot, snap);
+            }
+            try self.reserveWrites(slot, 2);
+            schema.pending_drop = true;
+            schema.creator = slot;
+            tx.push(.{ .kind = .drop_schema, .table = @intCast(drop.slot) }) catch unreachable;
+            var changes: [K.max_changes]K.Change = undefined;
+            const changed = self.catalog.dropSchema(drop.slot, snap, tx.ref(slot), snap.cid, 0, &changes);
+            for (changes[0..changed]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
+        }
+
+        /// Schema name of a namespace OID for the system views.
+        fn namespaceName(self: *const Self, oid: u32) []const u8 {
+            for (catalog_module.namespaces) |namespace| if (namespace.oid == oid) return namespace.name;
+            for (&self.schemas) |*schema| if (schema.live and schema.oid == oid) return schema.name.slice();
+            return "";
         }
 
         // ---- sequences (design §4.11) ---------------------------------------
@@ -1525,6 +1627,23 @@ pub fn Database(comptime config: Config) type {
             return error.TableNotFound;
         }
 
+        /// The dot separating `schema.name` in regclass text outside double
+        /// quotes, unless the schema is public (regclassName strips that).
+        fn std_dot(text: []const u8) ?usize {
+            var quoted = false;
+            for (text, 0..) |byte, index| {
+                if (byte == '"') quoted = !quoted;
+                if (byte == '.' and !quoted) {
+                    const head = text[0..index];
+                    var trimmed = head;
+                    while (trimmed.len != 0 and (trimmed[0] == ' ' or trimmed[0] == '\t')) trimmed = trimmed[1..];
+                    if (types.keyword(trimmed, "public")) return null;
+                    return index;
+                }
+            }
+            return null;
+        }
+
         fn regclassName(text: []const u8) ?Name {
             var raw = text;
             while (raw.len != 0 and (raw[0] == ' ' or raw[0] == '\t')) raw = raw[1..];
@@ -1547,6 +1666,18 @@ pub fn Database(comptime config: Config) type {
         /// (`<table>_pkey`) or a sequence; -1 (or 42P01) when missing.
         fn regclassOid(self: *const Self, text: []const u8, strict: bool) Error!i64 {
             const missing: Error!i64 = if (strict) error.TableNotFound else -1;
+            // `schema.name` of a user schema (unquoted parts fold to lower case).
+            if (std_dot(text)) |dot| {
+                const schema = regclassName(text[0..dot]) orelse return missing;
+                const relation = regclassName(text[dot + 1 ..]) orelse return missing;
+                var schemas: [K.relation_rows]K.SchemaFound = undefined;
+                const count = self.catalog.visibleSchemas(self.seq_snap, &schemas);
+                for (schemas[0..count]) |found| {
+                    if (!types.same(self.schemas[found.slot].name.slice(), schema.slice())) continue;
+                    const hit = self.catalog.findIn(found.oid, relation.slice(), self.seq_snap) orelse return missing;
+                    return if (hit.kind == 'S') self.seqs[hit.slot].oid else self.tables[hit.slot].oid;
+                }
+            }
             const name = regclassName(text) orelse return missing;
             if (self.catalog.find(name.slice(), self.seq_snap)) |found| {
                 return if (found.kind == 'S') self.seqs[found.slot].oid else self.tables[found.slot].oid;
@@ -1744,11 +1875,16 @@ pub fn Database(comptime config: Config) type {
                     var category: [1]u8 = .{info.category};
                     try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), nameCell("b"), nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)) });
                 },
-                .pg_namespace => for (catalog_module.namespaces) |namespace| {
-                    try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name) });
-                },
-                .schemata => for (catalog_module.namespaces) |namespace| {
-                    try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
+                .pg_namespace, .schemata => {
+                    for (catalog_module.namespaces) |namespace| {
+                        if (view == .pg_namespace) try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name) }) else try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
+                    }
+                    var schemas: [K.relation_rows]K.SchemaFound = undefined;
+                    const schema_count = self.catalog.visibleSchemas(snapshot, &schemas);
+                    for (schemas[0..schema_count]) |found| {
+                        const schema_name = self.schemas[found.slot].name.slice();
+                        if (view == .pg_namespace) try sink.add(&.{ intCell(found.oid), nameCell(schema_name) }) else try sink.add(&.{ nameCell(database), nameCell(schema_name) });
+                    }
                 },
                 else => for (relations[0..count]) |found| {
                     if (found.kind == 'S') {
@@ -1761,6 +1897,7 @@ pub fn Database(comptime config: Config) type {
                         continue;
                     }
                     const table = &self.tables[found.slot];
+                    const schema_name = self.namespaceName(table.namespace);
                     const name = table.name.slice();
                     const oid: i64 = table.oid;
                     const pkey = indexName(table) catch Name{};
@@ -1768,29 +1905,29 @@ pub fn Database(comptime config: Config) type {
                     const primary_columns = primaryColumns(table, &key_columns);
                     switch (view) {
                         .pg_class => {
-                            try sink.add(&.{ intCell(oid), nameCell(name), intCell(public), nameCell("r"), intCell(@intCast(table.column_count)) });
-                            if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), nameCell(pkey.slice()), intCell(public), nameCell("i"), intCell(@intCast(primary_columns.len)) });
+                            try sink.add(&.{ intCell(oid), nameCell(name), intCell(table.namespace), nameCell("r"), intCell(@intCast(table.column_count)) });
+                            if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), nameCell(pkey.slice()), intCell(table.namespace), nameCell("i"), intCell(@intCast(primary_columns.len)) });
                         },
-                        .tables => try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(name), nameCell("BASE TABLE") }),
+                        .tables => try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(name), nameCell("BASE TABLE") }),
                         .pg_index => if (S.keyed(table)) {
                             var key: [4 * config.columns]u8 = undefined;
                             try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)) });
                         },
                         .table_constraints => {
-                            if (S.keyed(table)) try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(pkey.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell("PRIMARY KEY") });
+                            if (S.keyed(table)) try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(pkey.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell("PRIMARY KEY") });
                             for (table.constraints[0..table.constraint_count]) |*constraint| {
                                 if (constraint.kind == .primary) continue;
-                                try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(constraint.name.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell(if (constraint.kind == .check) "CHECK" else "UNIQUE") });
+                                try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(constraint.name.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(if (constraint.kind == .check) "CHECK" else "UNIQUE") });
                             }
                         },
                         .key_column_usage => {
                             for (primary_columns, 0..) |column, position| {
-                                try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(pkey.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
+                                try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(pkey.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
                             }
                             for (table.constraints[0..table.constraint_count]) |*constraint| {
                                 if (constraint.kind != .unique) continue;
                                 for (constraint.keyColumns(), 0..) |column, position| {
-                                    try sink.add(&.{ nameCell(database), nameCell("public"), nameCell(constraint.name.slice()), nameCell(database), nameCell("public"), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
+                                    try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(constraint.name.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
                                 }
                             }
                         },
@@ -1811,7 +1948,7 @@ pub fn Database(comptime config: Config) type {
                                 .columns => {
                                     const numeric = numericPrecision(column);
                                     try sink.add(&.{
-                                        nameCell(database),                                       nameCell("public"),                          nameCell(name),            nameCell(column.name.slice()),
+                                        nameCell(database),                                       nameCell(schema_name),                          nameCell(name),            nameCell(column.name.slice()),
                                         intCell(attnum),                                          if (kind == .default) expressionTextWithPool(pool,column) else .null_value, nameCell(if (column.not_null) "NO" else "YES"), nameCell(types.sqlTypeName(column.data_type)),
                                         optionalInt(characterMaximumLength(column)),              optionalInt(numeric[0]),                     optionalInt(numeric[1]),   optionalInt(numeric[2]),
                                         optionalInt(datetimePrecision(column)),                   nameCell(if (identity.len != 0) "YES" else "NO"), if (identity.len == 0) .null_value else nameCell(if (kind == .identity_always) "ALWAYS" else "BY DEFAULT"), nameCell(if (kind == .generated) "ALWAYS" else "NEVER"),
@@ -1967,6 +2104,13 @@ pub fn Database(comptime config: Config) type {
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
             }
+            // A schema another transaction is dropping: wait for it.
+            for (&self.schemas) |*schema| if (schema.live and schema.oid == create.namespace and schema.pending_drop and schema.creator != slot) {
+                var waits: L.Set = .{};
+                waits.add(schema.creator);
+                tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                return self.park(slot, waits);
+            };
             try self.reserveWrites(slot, 2 + create.count);
             var destination: ?usize = null;
             for (0..2) |attempt| {
@@ -2743,6 +2887,8 @@ pub fn Database(comptime config: Config) type {
                     .drop_sequence => try C.encodeDropSequence(writer, self.seqs[entry.table].oid),
                     .truncate => try C.encodeTruncate(writer, self.tables[entry.table].oid),
                     .alter_sequence => try C.encodeAlterSequence(writer, &self.seqs[entry.table]),
+                    .create_schema => try C.encodeCreateSchema(writer, self.schemas[entry.table].oid, self.schemas[entry.table].name.slice()),
+                    .drop_schema => try C.encodeDropSchema(writer, self.schemas[entry.table].oid),
                     .alter_table => {
                         const table = &self.tables[entry.table];
                         try C.encodeAlter(writer, table, self.alters[entry.table].sources[0..table.column_count], self.alters[entry.table].fills[0..table.column_count]);
@@ -2962,6 +3108,19 @@ pub fn Database(comptime config: Config) type {
             var changes: [K.max_changes]K.Change = undefined;
             _ = self.catalog.drop(index, old_count, storage.committed_view, .{ .epoch = self.epoch }, self.cid, csn, &changes);
             _ = try self.catalog.create(index, &self.tables[index], .{ .epoch = self.epoch }, self.cid, csn, csn, &changes);
+        }
+
+        /// Replay hook: a committed CREATE SCHEMA in schema slot `index`.
+        pub fn replayCreateSchema(self: *Self, index: usize, csn: u64) Error!void {
+            var changes: [K.max_changes]K.Change = undefined;
+            const schema = &self.schemas[index];
+            _ = try self.catalog.createSchema(index, schema.oid, schema.name.slice(), .{ .epoch = self.epoch }, self.cid, csn, csn, &changes);
+        }
+
+        /// Replay hook: a committed DROP SCHEMA.
+        pub fn replayDropSchema(self: *Self, index: usize, csn: u64) void {
+            var changes: [K.max_changes]K.Change = undefined;
+            _ = self.catalog.dropSchema(index, storage.committed_view, .{ .epoch = self.epoch }, self.cid, csn, &changes);
         }
 
         /// Replay hook: a committed DROP TABLE.

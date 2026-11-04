@@ -309,7 +309,13 @@ pub fn Ast(comptime config: types.Config) type {
             options: sequence.Options = .{},
         };
 
-        pub const Drop = struct { name: Ident, if_exists: bool = false };
+        pub const Drop = struct { name: Ident, if_exists: bool = false, schema: ?Ident = null };
+
+        /// CREATE SCHEMA [IF NOT EXISTS] name.
+        pub const CreateSchema = struct { name: Ident = .{}, if_not_exists: bool = false };
+
+        /// DROP SCHEMA [IF EXISTS] name [CASCADE | RESTRICT].
+        pub const DropSchema = struct { name: Ident = .{}, if_exists: bool = false, cascade: bool = false };
 
         pub const Target = struct {
             expr: u16 = none,
@@ -338,6 +344,7 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const Insert = struct {
+            schema: ?Ident = null,
             table: Ident = .{},
             alias: ?Ident = null,
             explicit_columns: bool = false,
@@ -447,6 +454,7 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const Update = struct {
+            schema: ?Ident = null,
             table: Ident = .{},
             assignments: [config.columns]Assignment = undefined,
             count: usize = 0,
@@ -459,6 +467,7 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const Delete = struct {
+            schema: ?Ident = null,
             table: Ident = .{},
             where: u16 = none,
             returning: Returning = .{},
@@ -527,6 +536,8 @@ pub fn Ast(comptime config: types.Config) type {
             truncate: Truncate,
             alter_table: AlterTable,
             alter_sequence: AlterSequence,
+            create_schema: CreateSchema,
+            drop_schema: DropSchema,
         };
     };
 }

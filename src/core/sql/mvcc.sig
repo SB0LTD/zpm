@@ -40,7 +40,8 @@ pub fn Mvcc(comptime config: types.Config) type {
         /// at commit, the new one is discarded at abort.
         /// `alter_sequence`: ALTER SEQUENCE copied sequence slot `old` into
         /// slot `table` (same OID, new options/state).
-        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate, alter_table, alter_sequence };
+        /// `create_schema` / `drop_schema`: schema slot `table`.
+        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate, alter_table, alter_sequence, create_schema, drop_schema };
 
         /// `table` is the table slot (catalog relation, sequence slot);
         /// `old`/`new` are version indices.
@@ -183,6 +184,13 @@ pub fn Mvcc(comptime config: types.Config) type {
                         tx.seq_dirty.remove(entry.table);
                         db.seqs[entry.old].pending_drop = false;
                     },
+                    .create_schema => {
+                        const schema = &db.schemas[entry.table];
+                        schema.live = false;
+                        schema.pending_create = false;
+                        if (db.oid_counter + types_first_oid == schema.oid + 1) db.oid_counter -= 1;
+                    },
+                    .drop_schema => db.schemas[entry.table].pending_drop = false,
                 }
             }
             tx.write_len = start;
@@ -290,6 +298,12 @@ pub fn Mvcc(comptime config: types.Config) type {
                         old.pending_drop = false;
                         old.dead_csn = csn;
                         db.seqs[entry.table].pending_create = false;
+                    },
+                    .create_schema => db.schemas[entry.table].pending_create = false,
+                    .drop_schema => {
+                        const schema = &db.schemas[entry.table];
+                        schema.pending_drop = false;
+                        schema.dead_csn = csn;
                     },
                 }
             }

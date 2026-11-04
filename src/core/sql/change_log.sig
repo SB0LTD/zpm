@@ -39,6 +39,8 @@
 //!    14 alter_sequence oid u32, type_oid u32, increment i64, min i64, max
 //!                     i64, start i64, cycle u8, cache i64, last_value i64,
 //!                     is_called u8 (options and state after ALTER SEQUENCE)
+//!    15 create_schema oid u32, name
+//!    16 drop_schema   oid u32 (the schema holds no table at that point)
 //!   name: len u8 + bytes. value: 0 null | 1 i64 | 2 bool u8 | 3 len u32 + bytes
 //!   | 4 f32 bits u32 | 5 f64 bits u64 | 6 numeric {special u8, negative u8,
 //!   dscale u16, coefficient 4 x u64} | 7 date i32 | 8 timestamp i64
@@ -77,7 +79,7 @@ pub const expr_format_version: u16 = 1;
 /// create_table definitions that carry a namespace and table constraints.
 pub const definition_format_version: u16 = 2;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14 };
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16 };
 
 fn Unsigned(comptime T: type) type {
     return switch (T) {
@@ -339,6 +341,17 @@ pub fn ChangeLog(comptime config: types.Config) type {
             if (seq.spec.cache != 1) try writer.int(i64, seq.spec.cache);
         }
 
+        pub fn encodeCreateSchema(writer: *Writer, oid: u32, schema_name: []const u8) Error!void {
+            try writer.op(.create_schema);
+            try writer.int(u32, oid);
+            try writer.name(schema_name);
+        }
+
+        pub fn encodeDropSchema(writer: *Writer, oid: u32) Error!void {
+            try writer.op(.drop_schema);
+            try writer.int(u32, oid);
+        }
+
         pub fn encodeAlterSequence(writer: *Writer, seq: anytype) Error!void {
             try writer.op(.alter_sequence);
             try writer.int(u32, seq.oid);
@@ -442,6 +455,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             base: bool = false,
             /// A primary key (its index owns oid + 1).
             keyed: bool = false,
+            namespace: u32 = 2200,
             oid: u32 = 0,
             name: V.Name = .{},
             column_count: usize = 0,
@@ -453,6 +467,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
         };
 
         const VSeq = struct { live: bool = false, oid: u32 = 0, name: V.Name = .{} };
+        const VSchema = struct { live: bool = false, oid: u32 = 0, name: V.Name = .{} };
 
         /// Caller-owned replay overlay. Bounded by 2 x rows x tables live
         /// entries (rows touched from the database plus rows created by the
@@ -463,6 +478,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             keys: [overlay_capacity]KeyEntry = @splat(.{}),
             tables: [config.tables]VTable = undefined,
             seqs: [config.sequences]VSeq = undefined,
+            schemas: [config.schemas]VSchema = undefined,
         };
 
         const SequenceDefinition = struct { oid: u32, name: V.Name, spec: sequence.Spec, owner: u32, owner_column: u8 };
@@ -520,10 +536,16 @@ pub fn ChangeLog(comptime config: types.Config) type {
             return error.ChangeRecordConflict;
         }
 
-        fn nameTaken(scratch: *const Scratch, name: []const u8) bool {
-            for (&scratch.tables) |*vt| if (vt.live and types.same(vt.name.slice(), name)) return true;
-            for (&scratch.seqs) |*seq| if (seq.live and types.same(seq.name.slice(), name)) return true;
+        /// Relation names are unique per schema; sequences live in public.
+        fn nameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
+            for (&scratch.tables) |*vt| if (vt.live and vt.namespace == namespace and types.same(vt.name.slice(), name)) return true;
+            if (namespace == public_namespace) for (&scratch.seqs) |*seq| if (seq.live and types.same(seq.name.slice(), name)) return true;
             return false;
+        }
+
+        fn findVSchema(scratch: *Scratch, oid: u32) Error!usize {
+            for (&scratch.schemas, 0..) |*schema, index| if (schema.live and schema.oid == oid) return index;
+            return error.ChangeRecordConflict;
         }
 
         fn overlaps(start: u32, width: u32, oid: u32, oid_width: u32) bool {
@@ -538,6 +560,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
             for (&scratch.seqs) |*vs| if (vs.live and overlaps(vs.oid, 1, oid, width)) return true;
             for (&db.tables) |*table| if (table.live and overlaps(table.oid, S.oidWidth(table), oid, width)) return true;
             for (&db.seqs) |*seq| if (seq.live and overlaps(seq.oid, 1, oid, width)) return true;
+            for (&scratch.schemas) |*vs| if (vs.live and overlaps(vs.oid, 1, oid, width)) return true;
+            for (&db.schemas) |*schema| if (schema.live and overlaps(schema.oid, 1, oid, width)) return true;
             return false;
         }
 
@@ -883,9 +907,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
             if (version == definition_format_version) try decodeConstraints(reader, out);
         }
 
-        /// Namespaces a replayed definition may name.
-        fn knownNamespace(namespace: u32) bool {
-            return namespace == public_namespace;
+        /// Namespaces a replayed definition may name: public or a live schema.
+        fn knownNamespace(scratch: *Scratch, namespace: u32) bool {
+            if (namespace == public_namespace) return true;
+            _ = findVSchema(scratch, namespace) catch return false;
+            return true;
         }
 
         fn findVTable(scratch: *Scratch, oid: u32) Error!u8 {
@@ -957,6 +983,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 if (!committed) continue;
                 vt.oid = table.oid;
                 vt.keyed = S.keyed(table);
+                vt.namespace = table.namespace;
                 vt.name = table.name;
                 vt.column_count = table.column_count;
                 vt.columns = table.columns;
@@ -967,6 +994,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
             }
             for (&scratch.seqs, &db.seqs) |*vs, *seq| {
                 vs.* = .{ .live = seq.live and !seq.pending_create and seq.dead_csn == 0, .oid = seq.oid, .name = seq.name };
+            }
+            for (&scratch.schemas, &db.schemas) |*vs, *schema| {
+                vs.* = .{ .live = schema.live and !schema.pending_create and schema.dead_csn == 0, .oid = schema.oid, .name = schema.name };
             }
             var next_oid: u32 = first_oid + db.oid_counter;
             var reader = Reader{ .bytes = record };
@@ -981,9 +1011,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         // be unused, not ascending. A primary key's index owns
                         // the next OID.
                         const width: u32 = 1 + @as(u32, @intFromBool(definition.keyed()));
-                        if (!knownNamespace(definition.namespace)) return error.ChangeRecordConflict;
+                        if (!knownNamespace(scratch, definition.namespace)) return error.ChangeRecordConflict;
                         if (definition.oid < first_oid or definition.oid >= 0xfffffffe or oidTaken(db, scratch, definition.oid, width)) return error.ChangeRecordConflict;
-                        if (nameTaken(scratch, definition.name.slice())) return error.ChangeRecordConflict;
+                        if (nameTaken(scratch, definition.name.slice(), definition.namespace)) return error.ChangeRecordConflict;
                         var free: ?usize = null;
                         for (&scratch.tables, 0..) |*vt, index| {
                             if (!vt.live and free == null) free = index;
@@ -991,7 +1021,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const index = free orelse return error.ChangeRecordConflict;
                         purge(scratch, @intCast(index));
                         const vt = &scratch.tables[index];
-                        vt.* = .{ .live = true, .keyed = definition.keyed(), .oid = definition.oid, .name = definition.name, .column_count = definition.count, .columns = definition.columns, .next_rowid = 1 };
+                        vt.* = .{ .live = true, .keyed = definition.keyed(), .namespace = definition.namespace, .oid = definition.oid, .name = definition.name, .column_count = definition.count, .columns = definition.columns, .next_rowid = 1 };
                         for (definition.columns[0..definition.count], 0..) |column, position| if (column.primary_key) {
                             vt.primary = position;
                         };
@@ -1008,8 +1038,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const vt = &scratch.tables[index];
                         var definition: Definition = .{ .oid = vt.oid, .name = .{}, .columns = @splat(.{}), .count = 0 };
                         try decodeDefinition(&reader, &definition);
-                        if (!knownNamespace(definition.namespace)) return error.ChangeRecordConflict;
-                        if (!types.same(definition.name.slice(), vt.name.slice()) and nameTaken(scratch, definition.name.slice())) return error.ChangeRecordConflict;
+                        if (definition.namespace != vt.namespace) return error.ChangeRecordConflict;
+                        if (!types.same(definition.name.slice(), vt.name.slice()) and nameTaken(scratch, definition.name.slice(), vt.namespace)) return error.ChangeRecordConflict;
                         var sources: [config.columns]u8 = undefined;
                         var used: [config.columns]bool = @splat(false);
                         for (definition.columns[0..definition.count], 0..) |*column, position| {
@@ -1129,6 +1159,26 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         _ = try findVSeq(scratch, try reader.int(u32));
                         _ = try decodeSequenceState(&reader);
                     },
+                    @intFromEnum(Op.create_schema) => {
+                        const oid = try reader.int(u32);
+                        const schema_name = try reader.name();
+                        if (!validName(schema_name)) return error.InvalidChangeRecord;
+                        if (oid < first_oid or oid == 0xffffffff or oidTaken(db, scratch, oid, 1)) return error.ChangeRecordConflict;
+                        for (&scratch.schemas) |*vs| if (vs.live and types.same(vs.name.slice(), schema_name)) return error.ChangeRecordConflict;
+                        var free: ?usize = null;
+                        for (&scratch.schemas, 0..) |*vs, index| if (!vs.live and free == null) {
+                            free = index;
+                        };
+                        const index = free orelse return error.ChangeRecordConflict;
+                        scratch.schemas[index] = .{ .live = true, .oid = oid, .name = .{ .len = schema_name.len } };
+                        @memcpy(scratch.schemas[index].name.bytes[0..schema_name.len], schema_name);
+                        next_oid = @max(next_oid, oid + 1);
+                    },
+                    @intFromEnum(Op.drop_schema) => {
+                        const index = try findVSchema(scratch, try reader.int(u32));
+                        for (&scratch.tables) |*vt| if (vt.live and vt.namespace == scratch.schemas[index].oid) return error.ChangeRecordConflict;
+                        scratch.schemas[index].live = false;
+                    },
                     @intFromEnum(Op.create_sequence), @intFromEnum(Op.create_sequence_cached) => {
                         var definition = try decodeCreateSequence(&reader);
                         if (tag == @intFromEnum(Op.create_sequence_cached)) {
@@ -1136,7 +1186,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             if (definition.spec.cache <= 1) return error.InvalidChangeRecord;
                         }
                         if (definition.oid < first_oid or definition.oid == 0xffffffff or oidTaken(db, scratch, definition.oid, 1)) return error.ChangeRecordConflict;
-                        if (nameTaken(scratch, definition.name.slice())) return error.ChangeRecordConflict;
+                        if (nameTaken(scratch, definition.name.slice(), public_namespace)) return error.ChangeRecordConflict;
                         if (definition.owner != 0) {
                             const owner = try findVTable(scratch, definition.owner);
                             if (definition.owner_column >= scratch.tables[owner].column_count) return error.ChangeRecordConflict;
@@ -1298,6 +1348,25 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const state = try decodeSequenceState(&reader);
                         db.seqs[index].spec = state.spec;
                         sequence.Sequences(config).restore(&db.seqs[index], state.last_value, state.is_called);
+                    },
+                    @intFromEnum(Op.create_schema) => {
+                        const oid = try reader.int(u32);
+                        const schema_name = try reader.name();
+                        for (&db.schemas, 0..) |*schema, index| if (!schema.live) {
+                            schema.* = .{ .live = true, .oid = oid, .name = .{ .len = schema_name.len } };
+                            @memcpy(schema.name.bytes[0..schema_name.len], schema_name);
+                            try db.replayCreateSchema(index, csn);
+                            break;
+                        };
+                        db.oid_counter = @max(db.oid_counter, oid + 1 - first_oid);
+                    },
+                    @intFromEnum(Op.drop_schema) => {
+                        const oid = try reader.int(u32);
+                        for (&db.schemas, 0..) |*schema, index| if (schema.live and schema.oid == oid) {
+                            db.replayDropSchema(index, csn);
+                            schema.live = false;
+                            break;
+                        };
                     },
                     @intFromEnum(Op.create_sequence), @intFromEnum(Op.create_sequence_cached) => {
                         var definition = try decodeCreateSequence(&reader);

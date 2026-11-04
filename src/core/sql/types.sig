@@ -271,6 +271,10 @@ pub const Error = error{
     DuplicateObject,
     /// SQLSTATE 42P16: invalid table definition (several primary keys).
     InvalidTableDefinition,
+    /// SQLSTATE 3F000: a schema name does not exist.
+    UndefinedSchema,
+    /// SQLSTATE 42P06: CREATE SCHEMA of an existing name.
+    DuplicateSchema,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent

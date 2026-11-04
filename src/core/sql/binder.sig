@@ -184,7 +184,12 @@ pub fn Binder(comptime config: types.Config) type {
             truncate: Truncate,
             alter_table: AlterTable,
             alter_sequence: AlterSequence,
+            create_schema: V.Name,
+            drop_schema: DropSchema,
         };
+
+        /// DROP SCHEMA target: its slot and OID.
+        pub const DropSchema = struct { slot: usize, oid: u32, cascade: bool };
 
         /// ALTER TABLE: the complete new definition of table `table`. New
         /// column i reads old column sources[i], or is added (0xff) and
@@ -408,6 +413,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .truncate => .truncate,
                 .alter_table => .alter_table,
                 .alter_sequence => .alter_sequence,
+                .create_schema => .create_schema,
+                .drop_schema => .drop_schema,
                 .control => |control| switch (control) {
                     .begin, .set_transaction => .begin,
                     .commit => .commit,
@@ -2471,13 +2478,28 @@ pub fn Binder(comptime config: types.Config) type {
             return catalog.findView(null, wanted.slice());
         }
 
-        /// A user table, optionally qualified with `public`.
+        /// The OID of a schema name: pg_catalog, public, information_schema
+        /// or a user schema visible to the statement (3F000 otherwise).
+        fn namespaceOf(context: *const Context, name: []const u8) Error!u32 {
+            for (catalog.namespaces) |namespace| if (types.same(namespace.name, name)) return namespace.oid;
+            const found = context.catalog.findSchema(name, context.snapshot) orelse return error.UndefinedSchema;
+            return found.oid;
+        }
+
+        fn qualifierNamespace(context: *const Context, schema: ?ast.Ident) Error!u32 {
+            const qualifier = schema orelse return catalog.public_namespace;
+            return namespaceOf(context, toName(context, qualifier).slice());
+        }
+
+        /// A user table, optionally schema-qualified (public by default,
+        /// as the default search_path).
         fn resolveQualified(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!usize {
-            if (schema) |qualifier| {
-                const schema_name = toName(context, qualifier);
-                if (!types.same(schema_name.slice(), "public")) return error.TableNotFound;
-            }
-            return resolveTable(context, name);
+            // PostgreSQL reports a relation in a missing schema as 42P01.
+            const namespace = qualifierNamespace(context, schema) catch |err| return if (err == error.UndefinedSchema) error.TableNotFound else err;
+            const wanted = toName(context, name);
+            const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+            if (found.kind != 'r') return error.TableNotFound;
+            return found.slot;
         }
 
         fn scopeFor(context: *const Context, from: ?Ast.TableRef) Error!Scope {
@@ -4096,13 +4118,20 @@ pub fn Binder(comptime config: types.Config) type {
             switch (statement.*) {
                 .create_table => |*create| {
                     const table_name = toName(context, create.name);
-                    if (context.catalog.find(table_name.slice(), context.snapshot) != null) {
+                    const namespace = try qualifierNamespace(context, create.schema);
+                    // pg_catalog / information_schema are not writable here.
+                    if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace) return error.UnsupportedStatement;
+                    if (context.catalog.findIn(namespace, table_name.slice(), context.snapshot) != null) {
                         if (create.if_not_exists) return .{ .noop = .create_table };
                         return error.TableExists;
                     }
                     if (create.invalid_definition) return error.Syntax;
-                    if (create.schema != null) return error.UnsupportedStatement;
-                    var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count };
+                    var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count, .namespace = namespace };
+                    // Owned sequences live in public: identity and SERIAL
+                    // columns stay outside other schemas (0A000).
+                    if (namespace != catalog.public_namespace) for (create.columns[0..create.count]) |*definition| {
+                        if (definition.serial != 0 or definition.default_kind == .identity_always or definition.default_kind == .identity_by_default) return error.UnsupportedStatement;
+                    };
                     for (create.columns[0..create.count], 0..) |*definition, index| {
                         var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod, .default_kind = definition.default_kind };
                         for (out.columns[0..index]) |*previous|
@@ -4145,7 +4174,11 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .drop_table => |drop| {
                     const wanted = toName(context, drop.name);
-                    const found = context.catalog.find(wanted.slice(), context.snapshot) orelse {
+                    const namespace = qualifierNamespace(context, drop.schema) catch |err| {
+                        if (err == error.UndefinedSchema and drop.if_exists) return .{ .noop = .drop_table };
+                        return err;
+                    };
+                    const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse {
                         if (drop.if_exists) return .{ .noop = .drop_table };
                         return error.TableNotFound;
                     };
@@ -4170,7 +4203,7 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .drop_sequence = found.slot };
                 },
                 .insert => |*insert| {
-                    const index = try resolveTable(context, insert.table);
+                    const index = try resolveQualified(context, insert.schema, insert.table);
                     const entry = &context.tables[index];
                     var mapping: [config.columns]usize = @splat(0);
                     var mapped: [config.columns]bool = @splat(false);
@@ -4220,7 +4253,7 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .query = root };
                 },
                 .update => |*update| {
-                    const index = try resolveTable(context, update.table);
+                    const index = try resolveQualified(context, update.schema, update.table);
                     const entry = &context.tables[index];
                     var scope = tableScope(context, index);
                     if (update.alias) |alias| scope.rels[0].name = toName(context, alias);
@@ -4250,7 +4283,7 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .update = out };
                 },
                 .delete => |*delete| {
-                    const index = try resolveTable(context, delete.table);
+                    const index = try resolveQualified(context, delete.schema, delete.table);
                     var scope = tableScope(context, index);
                     if (delete.alias) |alias| scope.rels[0].name = toName(context, alias);
                     var out: Delete = .{ .table = index, .where = none, .key = none };
@@ -4265,6 +4298,25 @@ pub fn Binder(comptime config: types.Config) type {
                 .copy => return error.UnsupportedStatement,
                 .truncate => |*truncate| return .{ .truncate = try bindTruncate(context, truncate) },
                 .alter_table => |*alter| return bindAlter(context, alter),
+                .create_schema => |*create| {
+                    const name = toName(context, create.name);
+                    var exists = context.catalog.findSchema(name.slice(), context.snapshot) != null;
+                    for (catalog.namespaces) |namespace| exists = exists or types.same(namespace.name, name.slice());
+                    if (exists) {
+                        if (create.if_not_exists) return .{ .noop = .create_schema };
+                        return error.DuplicateSchema;
+                    }
+                    return .{ .create_schema = name };
+                },
+                .drop_schema => |*drop| {
+                    const name = toName(context, drop.name);
+                    for (catalog.namespaces) |namespace| if (types.same(namespace.name, name.slice())) return error.UnsupportedStatement;
+                    const found = context.catalog.findSchema(name.slice(), context.snapshot) orelse {
+                        if (drop.if_exists) return .{ .noop = .drop_schema };
+                        return error.UndefinedSchema;
+                    };
+                    return .{ .drop_schema = .{ .slot = found.slot, .oid = found.oid, .cascade = drop.cascade } };
+                },
                 .alter_sequence => |*alter| {
                     if (alter.name.schema) |qualifier| {
                         if (!types.same(toName(context, qualifier).slice(), "public")) return error.TableNotFound;
@@ -4430,9 +4482,12 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn bindAlter(context: *const Context, alter: *const Ast.AlterTable) Error!Bound {
-            if (alter.table.schema != null) return error.UnsupportedStatement;
             const wanted = toName(context, alter.table.name);
-            const found = context.catalog.find(wanted.slice(), context.snapshot) orelse {
+            const namespace = qualifierNamespace(context, alter.table.schema) catch |err| {
+                if (err == error.UndefinedSchema and alter.if_exists) return .{ .noop = .alter_table };
+                return err;
+            };
+            const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse {
                 if (alter.if_exists) return .{ .noop = .alter_table };
                 return error.TableNotFound;
             };
@@ -4606,7 +4661,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .rename_table => |ident| {
                     const name = toName(context, ident);
-                    if (context.catalog.find(name.slice(), context.snapshot) != null) return error.TableExists;
+                    if (context.catalog.findIn(entry.namespace, name.slice(), context.snapshot) != null) return error.TableExists;
                     // PostgreSQL keeps the index name `<old>_pkey`.
                     var primary = false;
                     for (out.columns[0..out.count]) |*column| primary = primary or column.primary_key;

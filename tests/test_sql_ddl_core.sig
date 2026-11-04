@@ -1057,6 +1057,183 @@ fn tupleAssignment() !void {
     try rejects("UPDATE tdd_a SET (g, nope) = (1, 2) WHERE id = 1", error.ColumnNotFound, "SELECT g, v FROM tdd_a WHERE id = 1", "11|1");
 }
 
+// ---- schemas -----------------------------------------------------------------
+
+const schema_probes = [_][]const u8{
+    "SELECT nspname FROM pg_namespace ORDER BY nspname",
+    "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
+    "SELECT table_schema, table_name FROM information_schema.tables ORDER BY table_schema, table_name",
+    "SELECT n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname <> 'pg_catalog' ORDER BY n.nspname, c.relname",
+    "SELECT * FROM tdd_schema.t ORDER BY id",
+};
+
+fn schemas() !void {
+    reset();
+    const created = try replicate("CREATE SCHEMA tdd_schema");
+    try check(created.command == .create_schema);
+    try run("CREATE TABLE tdd_schema.t (id INT PRIMARY KEY, v TEXT)");
+    try run("INSERT INTO tdd_schema.t VALUES (1, 'one')");
+    try expect("SELECT * FROM tdd_schema.t", "1|one");
+    // The same name in public is another table; unqualified means public.
+    try run("CREATE TABLE t (x INT)");
+    try run("INSERT INTO public.t VALUES (9)");
+    try expect("SELECT * FROM t", "9");
+    try expect("SELECT * FROM public.t", "9");
+    try run("UPDATE tdd_schema.t SET v = 'uno' WHERE id = 1");
+    try run("INSERT INTO tdd_schema.t VALUES (2, 'two'), (3, 'three')");
+    try run("DELETE FROM tdd_schema.t WHERE id = 3");
+    try run("ALTER TABLE tdd_schema.t ADD COLUMN w INT DEFAULT 5");
+    try expect(schema_probes[4], "1|uno|5;2|two|5");
+    try expect(schema_probes[0], "information_schema;pg_catalog;public;tdd_schema");
+    try expect(schema_probes[2] ++ "", "public|t;tdd_schema|t");
+    try expect("SELECT relname FROM pg_class WHERE oid = 'tdd_schema.t'::regclass", "t");
+    try expect("SELECT table_schema, column_name FROM information_schema.columns WHERE table_schema = 'tdd_schema' ORDER BY ordinal_position", "tdd_schema|id;tdd_schema|v;tdd_schema|w");
+    try sameState(&schema_probes);
+    try run("TRUNCATE tdd_schema.t");
+    try expect(schema_probes[4], "");
+    try run("INSERT INTO tdd_schema.t VALUES (4, 'four', 4)");
+    try sameState(&schema_probes);
+    // 42P06 for an existing schema (IF NOT EXISTS skips), 3F000 creating in
+    // a missing one, 42P01 reading through one, 42P07 for a taken name.
+    try rejects("CREATE SCHEMA tdd_schema", error.DuplicateSchema, schema_probes[0], "information_schema;pg_catalog;public;tdd_schema");
+    try rejects("CREATE SCHEMA public", error.DuplicateSchema, schema_probes[0], "information_schema;pg_catalog;public;tdd_schema");
+    try run("CREATE SCHEMA IF NOT EXISTS tdd_schema");
+    try rejects("CREATE TABLE nosuch.t (id INT)", error.UndefinedSchema, schema_probes[2], "public|t;tdd_schema|t");
+    try rejects("SELECT * FROM nosuch.t", error.TableNotFound, schema_probes[2], "public|t;tdd_schema|t");
+    try rejects("INSERT INTO nosuch.t VALUES (1)", error.TableNotFound, schema_probes[2], "public|t;tdd_schema|t");
+    try rejects("CREATE TABLE tdd_schema.t (id INT)", error.TableExists, schema_probes[2], "public|t;tdd_schema|t");
+    try rejects("SELECT * FROM tdd_schema.missing", error.TableNotFound, schema_probes[2], "public|t;tdd_schema|t");
+    // DROP SCHEMA: RESTRICT with tables is 2BP01, CASCADE drops them.
+    try rejects("DROP SCHEMA tdd_schema", error.DependentObjects, schema_probes[0], "information_schema;pg_catalog;public;tdd_schema");
+    try rejects("DROP SCHEMA nosuch", error.UndefinedSchema, schema_probes[0], "information_schema;pg_catalog;public;tdd_schema");
+    try run("DROP SCHEMA IF EXISTS nosuch");
+    try run("CREATE SCHEMA empty_one");
+    try run("DROP SCHEMA empty_one RESTRICT");
+    const dropped = try replicate("DROP SCHEMA tdd_schema CASCADE");
+    try check(dropped.command == .drop_schema);
+    try expect(schema_probes[0], "information_schema;pg_catalog;public");
+    try expect(schema_probes[2], "public|t");
+    try expect("SELECT * FROM t", "9");
+    try sameState(&schema_probes[0..4].*);
+    // Capacity: Config.schemas user schemas (TableCapacity, 54000).
+    try run("CREATE SCHEMA s1");
+    try run("CREATE SCHEMA s2");
+    try run("CREATE SCHEMA s3");
+    try run("CREATE SCHEMA s4");
+    try rejects("CREATE SCHEMA s5", error.TableCapacity, schema_probes[0], "information_schema;pg_catalog;public;s1;s2;s3;s4");
+    try run("DROP SCHEMA s4");
+    try run("CREATE SCHEMA s5");
+    try sameState(&schema_probes[0..4].*);
+}
+
+fn schemaTransactions() !void {
+    reset();
+    // Abort removes the schema and its tables.
+    const tx = try db.begin();
+    try statement(tx, "CREATE SCHEMA tdd_schema");
+    try statement(tx, "CREATE TABLE tdd_schema.t (id INT)");
+    try statement(tx, "INSERT INTO tdd_schema.t VALUES (1)");
+    try same(try rows(tx, "SELECT * FROM tdd_schema.t"), "1");
+    db.abort(tx);
+    try expect(schema_probes[0], "information_schema;pg_catalog;public");
+    try check(db.usage().pending_versions == 0);
+    // An uncommitted CREATE SCHEMA makes a second creator wait; it then
+    // fails with 42P06.
+    const first = try db.begin();
+    try statement(first, "CREATE SCHEMA tdd_schema");
+    const second = try db.begin();
+    try parks(second, "CREATE SCHEMA tdd_schema");
+    try commit(first);
+    var result: DB.Result = .{};
+    try check(db.statement(second, "CREATE SCHEMA tdd_schema", &result, .{ .@"resume" = true }) == error.DuplicateSchema);
+    db.abort(second);
+    // CREATE TABLE in a schema another transaction is dropping waits, then
+    // finds no schema (3F000).
+    const dropper = try db.begin();
+    try statement(dropper, "DROP SCHEMA tdd_schema");
+    const creator = try db.begin();
+    try parks(creator, "CREATE TABLE tdd_schema.x (id INT)");
+    try commit(dropper);
+    try check(db.statement(creator, "CREATE TABLE tdd_schema.x (id INT)", &result, .{ .@"resume" = true }) == error.UndefinedSchema);
+    db.abort(creator);
+    // DROP SCHEMA waits for a table another transaction is creating in it.
+    try run("CREATE SCHEMA busy");
+    const maker = try db.begin();
+    try statement(maker, "CREATE TABLE busy.t (id INT)");
+    const remover = try db.begin();
+    try parks(remover, "DROP SCHEMA busy");
+    try commit(maker);
+    try check(db.statement(remover, "DROP SCHEMA busy", &result, .{ .@"resume" = true }) == error.DependentObjects);
+    db.abort(remover);
+    try sameState(&schema_probes[0..4].*);
+    try check(db.usage().transactions == 0 and db.usage().table_locks == 0);
+}
+
+// ---- change-record format compatibility ------------------------------------------
+
+/// The record of one autocommit statement on `db` (not applied).
+fn recordOf(source: []const u8, out: []u8) ![]const u8 {
+    var result: DB.Result = .{};
+    var used: usize = 0;
+    try db.executeChanges(source, &result, out, &used, null, null);
+    return out[0..used];
+}
+
+/// Every proper prefix of `bytes` is rejected by the replica and changes
+/// nothing (whole-record validation before apply).
+fn prefixesRejected(bytes: []const u8, probe: []const u8) !void {
+    var before: [8192]u8 = undefined;
+    const wanted = try query(&replica, probe);
+    @memcpy(before[0..wanted.len], wanted);
+    for (0..bytes.len) |length| {
+        if (replica.applyChangeRecord(bytes[0..length], &scratch)) |_| {
+            std.debug.print("accepted a {d}-byte prefix of a {d}-byte record\n", .{ length, bytes.len });
+            return error.TruncatedRecordAccepted;
+        } else |_| {}
+    }
+    try same(try query(&replica, probe), before[0..wanted.len]);
+}
+
+fn walFormats() !void {
+    reset();
+    var buffer: [4096]u8 = undefined;
+    // Tables without constraints keep the version-1 definition bytes and
+    // op 7 for CACHE 1 sequences: older readers and logs are unaffected.
+    var bytes = try recordOf("CREATE TABLE plain (id INT PRIMARY KEY, v TEXT)", &buffer);
+    try check(bytes[8] == 1 and bytes[13] == 5 and bytes[19] == 1 and bytes[20] == 0);
+    try replica.applyChangeRecord(bytes, &scratch);
+    bytes = try recordOf("CREATE TABLE chk_t (id INT CHECK (id > 0))", &buffer);
+    try check(bytes[8] == 1 and bytes[13] == 5 and bytes[19] == 2 and bytes[20] == 0);
+    try replica.applyChangeRecord(bytes, &scratch);
+    bytes = try recordOf("CREATE SEQUENCE one_cache", &buffer);
+    try check(bytes[8] == 7);
+    try replica.applyChangeRecord(bytes, &scratch);
+    bytes = try recordOf("CREATE SEQUENCE four_cache CACHE 4", &buffer);
+    try check(bytes[8] == 13);
+    try replica.applyChangeRecord(bytes, &scratch);
+    try run("INSERT INTO plain VALUES (1, 'a'), (2, 'b')");
+    // New ops fail closed when truncated, and leave the replica unchanged.
+    const probe = "SELECT relname, relkind FROM pg_class WHERE relnamespace = 2200 ORDER BY relname";
+    var copy: [4096]u8 = undefined;
+    for ([_][]const u8{
+        "ALTER TABLE plain ADD COLUMN w INT DEFAULT 3, DROP COLUMN v",
+        "TRUNCATE plain",
+        "ALTER SEQUENCE four_cache RESTART WITH 5 INCREMENT BY 2",
+        "CREATE SCHEMA wal_schema",
+    }) |source| {
+        bytes = try recordOf(source, &buffer);
+        @memcpy(copy[0..bytes.len], bytes);
+        try prefixesRejected(copy[0..bytes.len], probe);
+        try replica.applyChangeRecord(copy[0..bytes.len], &scratch);
+        // Applying the same record twice conflicts and changes nothing.
+        if (std.mem.startsWith(u8, source, "CREATE SCHEMA")) {
+            try check(replica.applyChangeRecord(copy[0..bytes.len], &scratch) == error.ChangeRecordConflict);
+        }
+    }
+    try sameState(&.{ probe, "SELECT * FROM plain ORDER BY id", "SELECT nspname FROM pg_namespace ORDER BY nspname", "SELECT seqincrement, seqcache FROM pg_sequence ORDER BY seqrelid" });
+    try check(try int(&replica, "SELECT nextval('four_cache')") == 5);
+}
+
 pub fn main(init: std.process.Init) !void {
     try truncateTable();
     try truncateErrors();
@@ -1077,6 +1254,9 @@ pub fn main(init: std.process.Init) !void {
     try updateFromConcurrency();
     try deleteUsing();
     try tupleAssignment();
+    try schemas();
+    try schemaTransactions();
+    try walFormats();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-ddl-core\",\"pass\":true,\"assertions\":{d},\"records\":{d},\"database_bytes\":{d}}}\n", .{ assertions, records_applied, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
