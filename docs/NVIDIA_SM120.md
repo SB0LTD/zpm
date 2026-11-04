@@ -25,7 +25,20 @@ Nothing from NVIDIA is needed to build or test it. Galaxy launches its kernels o
   - `BAR`'s barrier (54..57) and thread count (42..53, printed when not 0); `WARPSYNC`'s register (in 24);
   - `CALL.REL.NOINC` and `RET.REL.NODEC` (a branch's offset; `RET`'s to the kernel's start);
   - `.reuse` on `FADD`'s and `HADD2`'s second source is c's slot (124), wherever the source sits;
-  - nvdisasm's names for operand patterns (`IMAD.SHL`) and its operands printed only when they're not `PT` or `RZ`.
+  - nvdisasm's names for operand patterns and its operands printed only when they're not `PT` or `RZ`.
+- **nvdisasm on raw words.** nvdisasm also disassembles raw instruction words (`-b SM120`), so field values and forms ptxas never emits were checked against it too. `decode` and `format` were run on every vector's word with each of bits 9..104 flipped, and their text compared with nvdisasm's for each word `decode` accepted. What that found, and the families it led to, are in `testdata/sm120_raw.txt` (`gen_sm120_vectors.py --raw`), which the tests decode, print and encode again:
+  - `IMAD`'s names for what it computes, signed or not: `IMAD.MOV` when a or b is zero, or b is 1 with no addend; else `IMAD.IADD` when b is 1; else `IMAD.SHL` when b is a power of two from 2 to 2^30 with no addend. There are none when c is an immediate, a constant or uniform, and none for `.WIDE` or `.HI`;
+  - integer immediates print signed in `IMAD`, `ISETP` and `VIMNMX`, `.U32` or not (`ISETP.LE.U32.OR P1, PT, R9, -0x7ffffffd, P0`);
+  - sm_120's ALU ops read no constants: nvdisasm calls every constant-buffer form (forms 3 and 5) illegal, and ptxas loads constants with `LDC` and `LDCU`. A uniform c (form 7) exists only for `IMAD` (all three), `FFMA`, `FADD`, `SHF`, `HADD2`, `HFMA2` and `F2IP`;
+  - global memory's bits: 72 is `.E` (a 64-bit address); 76 picks `desc[URd][Ra.64+offset]`, else the uniform register is added, `[Ra.64+URb+offset]`; 84..86 the eviction priority (`EF`, `EL`, `LU`, `EU`, `NA`); 77..80 the order and scope (`CONSTANT`, `STRONG.SM`, `STRONG.GPU`, `STRONG.SYS`, `MMIO.GPU` and the `.PRIVATE` and `CTA`/`SM`/`VC` variants; a store's 4 and 13..15 are `STRONG.SM.PRIVATE` and the `SYS.ORDERED` ones). They print in that order, `LDG.E.EL.128.STRONG.GPU`;
+  - `LDC`'s and `LDCU`'s offsets are signed fields (nvdisasm prints 0x837c as `-0x7c84`): only the non-negative ones are covered;
+  - floats print `.FTZ`, then the rounding, then `.SAT` (`FFMA.FTZ.RM.SAT`), and `F2I` and `F2F` put `.FTZ` first too;
+  - `.BF16_V2` halves' immediates are bfloat16s (`HFMA2.BF16_V2 R3, -RZ, RZ, 127, 0`), and it takes no `.F32`;
+  - `I2FP` has only an f32 result from a 32-bit source; `I2F`'s byte selects are for byte sources only; `HADD2`'s a takes no `|..|`; `LDC` has no `.128`; `LEA.X`'s bit 72 is a NOT (`~R4`), not covered; `BAR.ARV` takes no `DEFER_BLOCKING`;
+  - `UMOV`, `S2UR` and `LDCU` are on the uniform datapath (their guards uniform predicates); `R2UR` and `VOTEU` aren't;
+  - floats' specials: `-0.0`, `+QNAN` and `-QNAN` (the quiet bit set), `+SNAN` and `-SNAN`, each followed by a space like `+INF`. A NaN's payload isn't printed: written, they read back as 0x7fc00000, 0xffc00000, 0x7f800001 and 0xff800001.
+
+  After these, every word `decode` accepts among the 208,128 mutations prints as nvdisasm prints it. A few it accepts nvdisasm still calls illegal (combinations ptxas never emits, such as `F2F.F64.F64`).
 
 nvdisasm's text is reproduced exactly, with one exception: a branch's label (`.L_x_3`) is the kernel's numbering of its targets, which one instruction doesn't know, so `format` prints a decoded target as its address, `` `(0x1a0) ``, which parses back. Floats print as nvdisasm prints them: C's `%.20g` below 1e9, `%.20e` from there up, and `+INF ` and `+QNAN ` with nvdisasm's trailing space.
 
@@ -93,26 +106,27 @@ The model stays on the safe side of each.
 
 - **The tests (`sig build test-nvidia`):**
   - All 2908 vectors (25 kernels) encode to ptxas's 128 bits. Each decodes, encodes again to the same 128 bits, prints as nvdisasm printed it (labels as addresses), and that text parses back to the same instruction.
+  - The 196 raw words decode, print as nvdisasm printed them, and encode again from that text.
   - The 25 kernels assemble from their listings to ptxas's exact words, registers, stack and parameter bytes. Galaxy's five probe kernels among them are the words Galaxy runs on the RTX today (galaxy `nv_kernels.sig`).
   - The same 25, with their fields removed, are scheduled and checked against the model and against ptxas (above). M4, written with no fields, assembles to ptxas's bits below the control field.
 - **The forms:**
-  - Moves and integers: `MOV`, `MOV.64`, `IADD`, `IADD.64`, `IADD3`, `IMAD` (`.WIDE`, `.HI`, `.U32`; nvdisasm's `.SHL`), `ISETP` (`.U32`, `.U64`, `.S64`), `LOP3.LUT` (with a predicate result), `PLOP3.LUT`, `LEA` (`.HI`, `.X`, `.SX32`, a carry out), `SHF` (`.L`, `.R`, `.W`, `.HI`; `U32`, `S32`, `U64`, `S64`), `PRMT`, `SEL`, `SEL.64`, `VIMNMX`, `IABS`, `POPC`, `FLO`, `BREV`, `IDP.4A` (`U8`/`S8` each side).
+  - Moves and integers: `MOV`, `MOV.64`, `IADD`, `IADD.64`, `IADD3`, `IMAD` (`.WIDE`, `.HI`, `.U32`; nvdisasm's `.MOV`, `.IADD`, `.SHL`), `ISETP` (`.U32`, `.U64`, `.S64`), `LOP3.LUT` (with a predicate result), `PLOP3.LUT`, `LEA` (`.HI`, `.X`, `.SX32`, a carry out), `SHF` (`.L`, `.R`, `.W`, `.HI`; `U32`, `S32`, `U64`, `S64`), `PRMT`, `SEL`, `SEL.64`, `VIMNMX`, `IABS`, `POPC`, `FLO`, `BREV`, `IDP.4A` (`U8`/`S8` each side).
   - The uniform datapath: `UMOV`, `UMOV.64`, `UIADD3`, `UISETP`, `ULOP3.LUT`, `ULEA`, `USHF`, `UPLOP3.LUT`, `UFFMA`, `R2UR`, `S2UR`, `LDCU`, `VOTEU`.
   - Floats: `FFMA`, `FADD`, `FMUL` (with rounding, `.FTZ`, `.SAT`), `FMNMX`, `FSEL`, `FSETP` (every comparison), `FCHK`, `MUFU` (`EX2`, `RCP`, `RSQ`, `LG2`, `SQRT`, `SIN`, `COS`, and the rest of its table).
   - Halves: `HADD2`, `HMUL2`, `HFMA2`, `HMNMX2` (`.F32`, `.BF16_V2`, `.H0_H0`/`.H1_H1` selectors, half immediates).
   - Conversions: `F2FP.F16` and `.BF16.F32.PACK_AB`, `F2I` (`FLOOR`, `CEIL`, `TRUNC`, `NTZ`, 64-bit), `I2F` (byte selects, 64-bit), `F2F`, `I2FP`, `F2IP.U8.F32.NTZ`.
-  - Memory: `LDG` and `STG` (`.E`, `U8`, `S8`, `U16`, `S16`, `64`, `128`, `.CONSTANT`), `LDS` and `STS` (every size, `[Ra+URb+offset]`), `LDL`, `STL`, `LDC` (every size, a register index), `LDCU` (a uniform index).
+  - Memory: `LDG` and `STG` (`.E`, every size, every order and eviction priority, `desc[URd][Ra.64]` and `[Ra.64+URb]`), `LDS` and `STS` (every size, `[Ra+URb+offset]`), `LDL`, `STL`, `LDC` (every size, a register index), `LDCU` (a uniform index).
   - Warps: `SHFL` (`IDX`, `UP`, `DOWN`, `BFLY`; lane and clamp registers or immediates), `VOTE` (`ALL`, `ANY`, `EQ`), `BAR.SYNC.DEFER_BLOCKING` and `BAR.ARV`, `WARPSYNC`, `S2R`, `CS2R`.
   - Control flow: `BRA` (with a predicate), `BRA.U`, `BSSY` and `BSYNC` (`.RECONVERGENT`), `CALL.REL.NOINC`, `RET.REL.NODEC`, `EXIT`, `NOP`.
   - Tensor cores: `HMMA.16816.F32`, `HMMA.16816.F32.BF16`, `HMMA.1688.F16`, `IMMA.16832.S8.S8`, `IMMA.16832.U8.S8`, `IMMA.16816.S8.S8`.
-- **Not covered:** what ptxas emits for warp-collective code it can't prove converged (`BRA.DIV`, `WARPSYNC.COLLECTIVE`, `MATCH`, `REDUX`), `BAR` with its barrier in a register, the atomics, textures and surfaces.
+- **Not covered:** what ptxas emits for warp-collective code it can't prove converged (`BRA.DIV`, `WARPSYNC.COLLECTIVE`, `MATCH`, `REDUX`), `BAR.RED` and `BAR.SCAN`, `BAR` with its barrier in a register, `LDS`'s scaled index (`[R9.X4]`), a 32-bit register in a global address (`.U32`), negative constant offsets, `MUFU.RCP64H` and `RSQ64H`, int4 `IMMA`, `FFMA.FMZ`, the atomics, textures and surfaces.
 
 ## Writing kernels: the syntax
 
 Kernels are written as nvdisasm prints, with or without control fields. These are the forms the tests check, spelled as ptxas emits them:
 
 - **Shared memory:** `LDS.U8 R21, [R2+UR4+0x700]`, `LDS.128 R8, [UR4]`, `STS.64 [R12+0x400], R18`, `STS [UR4+0x20], R4`. A negative offset is `[R3+-0x10]`. ptxas makes a shared variable's address from the CTA's place in its cluster: `S2UR UR5, SR_CgaCtaId`, `UMOV UR4, 0x400`, `ULEA UR4, UR5, UR4, 0x18`.
-- **Global memory:** `LDG.E.128.CONSTANT R4, desc[UR6][R4.64]` (`ld.global.nc`), `STG.E.U16 desc[UR4][R8.64], R10`; the descriptor from `LDCU.64 UR4, c[0x0][0x358]`.
+- **Global memory:** `LDG.E.128.CONSTANT R4, desc[UR6][R4.64]` (`ld.global.nc`), `STG.E.U16 desc[UR4][R8.64], R10`; the descriptor from `LDCU.64 UR4, c[0x0][0x358]`. Eviction goes before the size, order after: `LDG.E.EL.128.STRONG.GPU`. Without a descriptor a uniform register is added: `LDG.E R18, [R14.64+UR4]`.
 - **Constants:** `LDC R9, c[0x3][R9]`, `LDCU UR4, c[0x3][UR4]`, `LDC.U16 R11, c[0x0][0x3a4]`.
 - **Shuffles:** `SHFL.BFLY PT, R0, R3, 0x4, 0x181f` (the in-range predicate first, then destination, source, lane, clamp; the clamp's high byte is the segment mask, `0x1f` for the whole warp), `SHFL.UP PT, R14, R12, 0x1, RZ`, `SHFL.IDX PT, R10, R6, RZ, 0x1f`.
 - **The special-function unit:** `MUFU.EX2 R12, R9`, `MUFU.RCP R3, R0`, `MUFU.RSQ R15, R0`, `MUFU.LG2`, `MUFU.SQRT`, `MUFU.SIN` and `MUFU.COS` (of the angle in turns: ptxas multiplies by 1/2π first, `FMUL.RZ R17, R6, 0.15915493667125701904`).
