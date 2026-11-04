@@ -95,6 +95,17 @@ pub const Options = struct {
     /// Dispatches one Device.run takes at most (a call sends more as
     /// several runs, each waited for: nvidia_device takes 256).
     max_run: u32 = 256,
+    /// Diagnose mode (lfm3_gpu's): every dispatch of a call is a run of its
+    /// own, and `diagnose` is called with a line naming it before it is
+    /// sent ("lfm3-any: dispatch 12, layer 2 of 24 (attention): matrix
+    /// q4k, blk.2.attn_q.weight, tokens 0-7 of 16, groups 64x1x1"). Each is
+    /// waited for diagnose_timeout_us, then a line says it is still running
+    /// and the wait goes on until the device ends it; a failure is logged
+    /// ("FAILED (<error>): <what>") and the call is error.DeviceLost with
+    /// the cache as it was. So the last line before a fault or a hang names
+    /// the kernel, the layer and the tensor. Slow: for checking a GPU.
+    diagnose: ?*const fn (what: []const u8) void = null,
+    diagnose_timeout_us: u64 = 2_000_000,
 };
 
 pub const MATRIX_VARIANTS = kernels.MAX_TOKENS;
@@ -117,6 +128,8 @@ pub const Work = struct {
     compile_mem: [24 << 20]u8 align(16) = undefined,
     code: [512 << 10]u8 align(16) = undefined,
     dispatches: [MAX_DISPATCHES]gpu.Dispatch = undefined,
+    /// What each dispatch is (diagnose mode's lines).
+    descs: [MAX_DISPATCHES]Desc = undefined,
     buffers: [MAX_DISPATCHES * 4]Buffer = undefined,
     words: [MAX_DISPATCHES * 12]u32 = undefined,
 };
@@ -179,7 +192,19 @@ pub const Cache = struct {
     kv_on_cpu: bool = false,
 };
 
-const MatrixInfo = struct { offset: u32, row_bytes: u32, rows: u32, blocks: u32, q4: bool };
+const MatrixInfo = struct { offset: u32, row_bytes: u32, rows: u32, blocks: u32, q4: bool, tensor: u16 };
+
+/// What a dispatch is, for diagnose mode's lines.
+pub const Desc = struct {
+    kernel: []const u8 = "",
+    /// The layer (none: the inputs' copies, the output norm, the logits).
+    layer: ?u8 = null,
+    /// The tensor it reads (an index in the gguf Index).
+    tensor: ?u16 = null,
+    /// The call's tokens it takes.
+    first: u32 = 0,
+    count: u32 = 0,
+};
 
 /// A call's dispatches as they are written (in the Work).
 const List = struct {
@@ -187,6 +212,8 @@ const List = struct {
     n: usize = 0,
     nb: usize = 0,
     nw: usize = 0,
+    /// What the next dispatches are (set before they are added).
+    what: Desc = .{},
 
     fn add(l: *List, prog: *const Program, groups: [3]u32, buffers: []const Buffer, words: []const u32) Error!void {
         if (l.n >= l.work.dispatches.len or l.nb + buffers.len > l.work.buffers.len or l.nw + words.len > l.work.words.len) return error.StreamFull;
@@ -197,7 +224,16 @@ const List = struct {
         l.nb += buffers.len;
         l.nw += words.len;
         l.work.dispatches[l.n] = .{ .prog = prog, .groups = groups, .buffers = bs, .params = ws };
+        l.work.descs[l.n] = l.what;
         l.n += 1;
+    }
+
+    /// The next dispatches' kernel, tensor and tokens (in the same layer).
+    fn named(l: *List, kernel: []const u8, tensor: ?u16, first: u32, count: u32) void {
+        l.what.kernel = kernel;
+        l.what.tensor = tensor;
+        l.what.first = first;
+        l.what.count = count;
     }
 
     fn slice(l: *const List) []const gpu.Dispatch {
@@ -242,8 +278,8 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         /// Calls that took longer than options.timeout_us (and finished).
         slow: u32 = 0,
         /// Dispatches the last call sent, and every call's.
-        last_dispatches: u32 = 0,
-        dispatches: u64 = 0,
+        dispatches: u32 = 0,
+        total_dispatches: u64 = 0,
         /// The device's time for the last call (ns; 0 when it does not say).
         last_ns: u64 = 0,
         /// Why the last kernel did not compile.
@@ -403,6 +439,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         }
 
         fn copyInto(self: *Self, l: *List, from: Buffer, from_off: u32, to: Buffer, to_off: u32, words: u32) Error!void {
+            l.what = .{ .kernel = "copy" };
             try l.add(&self.k.copy.?, kernels.copyGroups(words), &.{ from, to }, &.{ words, from_off, to_off });
         }
 
@@ -610,22 +647,45 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             }
 
             const n: u32 = @intCast(count);
-            for (plan.layers[0..plan.layer_count]) |*ly| try self.layer(&l, ly, c, n);
+            for (plan.layers[0..plan.layer_count], 0..) |*ly, li| {
+                l.what = .{ .layer = @intCast(li) };
+                try self.layer(&l, ly, c, n);
+            }
+            l.what = .{};
             if (output != .none) {
                 // the last position's output norm (and its quantization)
                 try self.normQuant(&l, @intCast((count - 1) * h * 4), plan.output_norm, 1, self.out_hidden);
                 if (output == .logits) try self.linear(&l, try self.matrixOf(plan.output), 1, self.out_logits, plan.vocabulary_size * 4);
             }
-            self.last_dispatches = @intCast(l.n);
-            self.dispatches += l.n;
+            self.dispatches = @intCast(l.n);
+            self.total_dispatches += l.n;
             var ns: u64 = 0;
-            var at: usize = 0;
-            while (at < l.n) {
-                const part = l.slice()[at..@min(l.n, at + self.options.max_run)];
-                const fence = self.dev.run(part) catch |e| return self.failed(c, e);
-                self.finish(fence) catch |e| return self.failed(c, e);
-                ns += self.dev.lastRunNs();
-                at += part.len;
+            if (self.options.diagnose) |log| {
+                for (l.slice(), 0..) |*d, i| {
+                    var buf: [256]u8 = undefined;
+                    const what = self.describe(&l, i, count, &buf);
+                    log(what);
+                    const fence = self.dev.run(d[0..1]) catch |e| return self.diagnoseFailed(log, c, e, what);
+                    self.dev.wait(fence, self.options.diagnose_timeout_us) catch |e| {
+                        if (e != error.Timeout) return self.diagnoseFailed(log, c, e, what);
+                        var b2: [320]u8 = undefined;
+                        log(std.fmt.bufPrint(&b2, "lfm3-any: still running after {d} ms (a hang?): {s}", .{ self.options.diagnose_timeout_us / 1000, what["lfm3-any: ".len..] }) catch what);
+                        self.slow += 1;
+                        self.dev.wait(fence, std.math.maxInt(u64)) catch |e2| return self.diagnoseFailed(log, c, e2, what);
+                    };
+                    ns += self.dev.lastRunNs();
+                }
+                var b3: [128]u8 = undefined;
+                log(std.fmt.bufPrint(&b3, "lfm3-any: forward of {d} tokens at position {d}: all {d} dispatches done", .{ count, cache.position, l.n }) catch "lfm3-any: forward done");
+            } else {
+                var at: usize = 0;
+                while (at < l.n) {
+                    const part = l.slice()[at..@min(l.n, at + self.options.max_run)];
+                    const fence = self.dev.run(part) catch |e| return self.failed(c, e);
+                    self.finish(fence) catch |e| return self.failed(c, e);
+                    ns += self.dev.lastRunNs();
+                    at += part.len;
+                }
             }
             self.last_ns = ns;
             if (kv_back) c.kv_on_cpu = false;
@@ -663,6 +723,55 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             };
         }
 
+        fn diagnoseFailed(self: *Self, log: *const fn (what: []const u8) void, c: *Cache, e: gpu.Error, what: []const u8) Error {
+            var buf: [320]u8 = undefined;
+            log(std.fmt.bufPrint(&buf, "lfm3-any: FAILED ({s}): {s}", .{ @errorName(e), what["lfm3-any: ".len..] }) catch what);
+            return self.failed(c, e);
+        }
+
+        /// Dispatch `i` of the call in `l` as diagnose mode's line.
+        fn describe(self: *const Self, l: *const List, i: usize, count: usize, buf: []u8) []const u8 {
+            const d = l.work.dispatches[i];
+            const w = l.work.descs[i];
+            var at: usize = 0;
+            const put = struct {
+                fn f(b: []u8, n: *usize, comptime fmt: []const u8, args: anytype) void {
+                    const s2 = std.fmt.bufPrint(b[n.*..], fmt, args) catch return;
+                    n.* += s2.len;
+                }
+            }.f;
+            put(buf, &at, "lfm3-any: dispatch {d}", .{i});
+            if (w.layer) |li| {
+                const kind: []const u8 = if (self.plan.layers[li].kind == .attention) "attention" else "short conv";
+                put(buf, &at, ", layer {d} of {d} ({s})", .{ li, self.plan.layer_count, kind });
+            } else put(buf, &at, " (no layer)", .{});
+            put(buf, &at, ": {s}", .{w.kernel});
+            if (w.tensor) |t| {
+                const info = &self.index.tensors[t];
+                put(buf, &at, ", {s}", .{info.name[0..info.name_len]});
+            }
+            if (w.count != 0) put(buf, &at, ", tokens {d}-{d} of {d}", .{ w.first, w.first + w.count - 1, count });
+            put(buf, &at, ", groups {d}x{d}x{d}", .{ d.groups[0], d.groups[1], d.groups[2] });
+            return buf[0..at];
+        }
+
+        /// The kernel whose program's code is at `code_va` (a device's
+        /// fault address names it).
+        pub fn kernelAt(self: *const Self, code_va: u64) []const u8 {
+            const k = &self.k;
+            for (k.q4k) |p| if (p) |pp| if (pp.code.gpu == code_va) return "matrix q4k";
+            for (k.q6k) |p| if (p) |pp| if (pp.code.gpu == code_va) return "matrix q6k";
+            const named = [_]struct { []const u8, ?Program }{
+                .{ "norm+quant", k.norm_quant },      .{ "quant", k.quant },                       .{ "swiglu+quant", k.swiglu },
+                .{ "residual", k.residual },          .{ "conv", k.conv },                         .{ "prepare", k.prepare },
+                .{ "attention scores", k.scores_decode }, .{ "attention scores (tiles)", k.scores_prefill }, .{ "attention softmax", k.softmax },
+                .{ "attention values", k.values_decode }, .{ "attention values (tiles)", k.values_prefill }, .{ "attention combine", k.combine },
+                .{ "copy", k.copy },
+            };
+            for (named) |n| if (n[1]) |pp| if (pp.code.gpu == code_va) return n[0];
+            return "?";
+        }
+
         /// A call that did not finish: its conv state put back (the GPU may
         /// have written part of it; KV rows past the position are written
         /// again by the next call).
@@ -695,6 +804,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 .short_conv => {
                     try self.linear(l, try self.matrixOf(ly.in_proj), n, s.mixed, 3 * h * 4);
                     const taps: u32 = plan.conv_kernel;
+                    l.named("conv", ly.conv.index, 0, n);
                     try l.add(&self.k.conv.?, kernels.convGroups(h), &.{ s.mixed, self.weights, c.conv, s.mixer }, &.{ h, n, try self.tensorOffset(ly.conv), @as(u32, ly.slot) * (taps - 1) * h * 4 });
                     try self.quant(l, s.mixer, h, n);
                     try self.linear(l, try self.matrixOf(ly.out_proj), n, s.projected, h * 4);
@@ -706,6 +816,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             const ff: u32 = plan.feed_forward_size;
             try self.linear(l, try self.matrixOf(ly.ffn_gate), n, s.ffn_gate, ff * 4);
             try self.linear(l, try self.matrixOf(ly.ffn_up), n, s.ffn_up, ff * 4);
+            l.named("swiglu+quant", null, 0, n);
             try l.add(&self.k.swiglu.?, kernels.quantGroups(self.caps, .swiglu, ff, n), &.{ s.ffn_gate, s.ffn_up, s.ffn_gate, s.act_q, s.act_d, s.act_sums }, &kernels.quantParams(ff, 0, 0, 0, 0));
             try self.linear(l, try self.matrixOf(ly.ffn_down), n, s.projected, h * 4);
             try self.residual(l, ly.post_ffw_norm, n);
@@ -733,6 +844,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 .key_norm = try self.tensorOffset(ly.attn_k_norm),
             };
             const rope = if (ly.sliding_window) s.rope_swa else s.rope_full;
+            l.named("prepare", null, 0, n);
             try l.add(&self.k.prepare.?, kernels.prepareGroups(heads, kv_heads, n), &.{ s.query, s.key, s.value, self.weights, self.weights, rope, c.kv }, &pp.words());
             // split by keys, in launches of attention_tokens tokens
             const at = @min(self.options.attention_tokens, self.options.max_batch);
@@ -760,9 +872,13 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 const tt: u32 = if (prefill) self.tokens_per_group else 1;
                 const scores = if (prefill) &self.k.scores_prefill.? else &self.k.scores_decode.?;
                 const values = if (prefill) &self.k.values_prefill.? else &self.k.values_decode.?;
+                l.named("attention scores", null, t0, tokens);
                 try l.add(scores, kernels.scoreGroups(ap, hg, tt), &.{ s.query, c.kv, s.scores }, &words);
+                l.named("attention softmax", null, t0, tokens);
                 try l.add(&self.k.softmax.?, kernels.softmaxGroups(ap), &.{s.scores}, &words);
+                l.named("attention values", null, t0, tokens);
                 try l.add(values, kernels.valueGroups(ap, hg, tt), &.{ c.kv, s.scores, s.partial }, &words);
+                l.named("attention combine", null, t0, tokens);
                 try l.add(&self.k.combine.?, kernels.combineGroups(ap), &.{ s.partial, s.gate, s.mixer }, &words);
             }
             try self.quant(l, s.mixer, @intCast(plan.queryWidth()), n);
@@ -774,12 +890,14 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         fn normQuant(self: *Self, l: *List, x_off: u32, norm: lfm3.TensorRef, n: u32, normalized: Buffer) Error!void {
             const h = self.plan.hidden_size;
             const s = &self.s;
+            l.named("norm+quant", norm.index, x_off / (h * 4), n);
             try l.add(&self.k.norm_quant.?, kernels.quantGroups(self.caps, .norm, h, n), &.{ s.hidden, self.weights, normalized, s.act_q, s.act_d, s.act_sums }, &kernels.quantParams(h, self.plan.rms_norm_epsilon, x_off, try self.tensorOffset(norm), 0));
         }
 
         /// `n` rows of `width` in `x` into the activation arrays.
         fn quant(self: *Self, l: *List, x: Buffer, width: u32, n: u32) Error!void {
             const s = &self.s;
+            l.named("quant", null, 0, n);
             try l.add(&self.k.quant.?, kernels.quantGroups(self.caps, .plain, width, n), &.{ x, x, x, s.act_q, s.act_d, s.act_sums }, &kernels.quantParams(width, 0, 0, 0, 0));
         }
 
@@ -788,6 +906,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             const h = self.plan.hidden_size;
             const w = if (self.plan.sandwich_norms) try self.tensorOffset(norm) else 0;
             const s = &self.s;
+            l.named("residual", if (self.plan.sandwich_norms) norm.index else null, 0, n);
             try l.add(&self.k.residual.?, .{ 1, n, 1 }, &.{ s.hidden, s.projected, self.weights }, &.{ h, @as(u32, @bitCast(self.plan.rms_norm_epsilon)), w });
         }
 
@@ -812,6 +931,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                     .out = first * out_stride,
                 };
                 const program = if (prog.*) |*pp| pp else return error.Unsupported;
+                l.named(if (m.q4) "matrix q4k" else "matrix q6k", m.tensor, first, tokens);
                 try l.add(program, kernels.matrixGroups(self.caps, m.rows), &.{ self.weights, s.act_q, s.act_d, s.act_sums, out }, &p.words(.q4_k));
                 first += tokens;
             }
@@ -837,6 +957,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 .rows = @intCast(t.dimensions[1]),
                 .blocks = blocks,
                 .q4 = t.ggml_type == 12,
+                .tensor = ref.index,
             };
         }
 

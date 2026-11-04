@@ -279,7 +279,7 @@ fn followTheCpu(which: Device, tolerance: f64) !f64 {
     var token = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &prompt }, .logits, .{})).?;
     const gtok = (backend.forward(&gc, .{ .tokens = &prompt }, .logits) catch |e| return failure(&backend, e)).?;
     const prefill_ops = emu.stats.lane_ops;
-    const prefill_dispatches = backend.last_dispatches;
+    const prefill_dispatches = backend.dispatches;
     var worst = try compare(0, cpu_work.logits[0..VOCAB], backend.logits(), tolerance);
     try std.testing.expectEqual(token, gtok);
     var decode_ops: u64 = 0;
@@ -319,7 +319,7 @@ fn followTheCpu(which: Device, tolerance: f64) !f64 {
         t2 = c2;
     }
     std.debug.print("{s}: logits within {e} of the CPU's over 13 steps; prefill of 11: {d} lane-ops, {d} dispatches; decode: {d} lane-ops, {d} dispatches a token\n", .{
-        @tagName(which), worst, prefill_ops, prefill_dispatches, decode_ops / 7, backend.last_dispatches,
+        @tagName(which), worst, prefill_ops, prefill_dispatches, decode_ops / 7, backend.dispatches,
     });
     return worst;
 }
@@ -460,6 +460,61 @@ test "a failed GPU call leaves its cache as it was, a slow one is waited out, ca
     backend.freeCache(&long);
     backend.freeCache(&other);
     backend.freeCache(&gc);
+}
+
+/// Diagnose mode's lines, as a host's log gets them.
+const Log = struct {
+    var lines: usize = 0;
+    var last: [320]u8 = undefined;
+    var last_len: usize = 0;
+    var first: [320]u8 = undefined;
+    var first_len: usize = 0;
+    var failed: usize = 0;
+
+    fn put(what: []const u8) void {
+        if (lines == 0) {
+            first_len = @min(what.len, first.len);
+            @memcpy(first[0..first_len], what[0..first_len]);
+        }
+        lines += 1;
+        last_len = @min(what.len, last.len);
+        @memcpy(last[0..last_len], what[0..last_len]);
+        if (std.mem.indexOf(u8, what, "FAILED") != null) failed += 1;
+    }
+};
+
+test "diagnose mode: a run a dispatch, each named before it is sent; the CPU's logits still; a failure names its dispatch" {
+    try fixture.initialize();
+    const plan = &fixture.plan;
+    const src = fixture.source();
+    var flaky = Flaky{ .inner = makeDevice(.unfused) };
+    var backend = try Backend.init(flaky.device(), plan, &fixture.index, src, .{ .max_batch = 16, .diagnose = Log.put, .diagnose_timeout_us = 1000 }, &work);
+    defer backend.deinit();
+    var gc = try backend.newCache(CONTEXT);
+    defer backend.freeCache(&gc);
+    var ccache = cpuCache(CONTEXT);
+    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5 };
+    Log.lines = 0;
+    const token = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &prompt }, .logits, .{})).?;
+    try std.testing.expectEqual(token, (backend.forward(&gc, .{ .tokens = &prompt }, .logits) catch |e| return failure(&backend, e)).?);
+    _ = try compare(0, cpu_work.logits[0..VOCAB], backend.logits(), 0);
+    // a line a dispatch, then the summary
+    try std.testing.expectEqual(@as(usize, backend.dispatches) + 1, Log.lines);
+    std.debug.print("diagnose: {d} lines; the first: {s}\n  the last: {s}\n", .{ Log.lines, Log.first[0..Log.first_len], Log.last[0..Log.last_len] });
+    try std.testing.expect(std.mem.startsWith(u8, Log.first[0..Log.first_len], "lfm3-any: dispatch 0, layer 0 of 4 (short conv): norm+quant, blk.0.attn_norm.weight, tokens 0-8 of 9"));
+    try std.testing.expect(std.mem.indexOf(u8, Log.last[0..Log.last_len], "all ") != null);
+    // a failed dispatch: logged with its name, the call undone
+    flaky.fail = error.DeviceLost;
+    Log.lines = 0;
+    try std.testing.expectError(error.DeviceLost, backend.forward(&gc, .{ .tokens = &.{token} }, .logits));
+    try std.testing.expectEqual(@as(usize, 1), Log.failed);
+    std.debug.print("  on a failure: {s}\n", .{Log.last[0..Log.last_len]});
+    try std.testing.expect(std.mem.startsWith(u8, Log.last[0..Log.last_len], "lfm3-any: FAILED (DeviceLost): dispatch 0, layer 0 of 4"));
+    try std.testing.expectEqual(prompt.len, gc.cpu.position);
+    // and the GPU goes on after it, as the CPU does
+    const next = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &.{token} }, .logits, .{})).?;
+    try std.testing.expectEqual(next, (try backend.forward(&gc, .{ .tokens = &.{token} }, .logits)).?);
+    _ = try compare(1, cpu_work.logits[0..VOCAB], backend.logits(), 0);
 }
 
 /// Random f16 keys and values at positions [0, end) of every attention
@@ -605,7 +660,7 @@ test "LFM3-Audio-2B (its real shapes: vocabulary 128000, Q6_K rows of 30 blocks,
         try std.testing.expectEqual(next, gnext);
         token = next;
     }
-    std.debug.print("LFM3-Audio-2B: logits within {e} of the CPU's over a prompt of 16 and 2 decode steps; prefill {d} lane-ops, decode {d} lane-ops and {d} dispatches a token\n", .{ worst, prefill_ops, emu.stats.lane_ops, backend.last_dispatches });
+    std.debug.print("LFM3-Audio-2B: logits within {e} of the CPU's over a prompt of 16 and 2 decode steps; prefill {d} lane-ops, decode {d} lane-ops and {d} dispatches a token\n", .{ worst, prefill_ops, emu.stats.lane_ops, backend.dispatches });
 }
 
 const Backend2 = any.Backend(REAL_CAPACITY);
