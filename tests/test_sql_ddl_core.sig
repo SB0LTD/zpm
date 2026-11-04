@@ -1011,6 +1011,30 @@ fn updateFromConcurrency() !void {
     try check(db.usage().transactions == 0 and db.usage().table_locks == 0);
 }
 
+fn deleteUsing() !void {
+    try joinFixture();
+    const result = try replicate("DELETE FROM tdd_a a USING tdd_b b WHERE a.id = b.id");
+    try check(result.command == .delete and result.affected_rows == 2);
+    try expect("SELECT id FROM tdd_a ORDER BY id", "2;4");
+    try sameState(&join_probes);
+    try joinFixture();
+    try run("CREATE TABLE m (id INT, w INT)");
+    try run("INSERT INTO m VALUES (1, 1), (1, 2), (4, 4)");
+    const filtered = try replicate("DELETE FROM tdd_a USING tdd_b, m WHERE tdd_a.id = m.id AND tdd_b.v > 50");
+    try check(filtered.affected_rows == 2);
+    try expect("SELECT id FROM tdd_a ORDER BY id", "2;3");
+    try same(try render(&(try replicate("DELETE FROM tdd_a AS a USING tdd_b AS b WHERE a.id = b.id RETURNING a.id, a.g"))), "3|2");
+    try rejects("DELETE FROM tdd_a USING tdd_b WHERE v = 1", error.AmbiguousColumn, "SELECT id FROM tdd_a ORDER BY id", "2");
+    try sameState(&join_probes);
+    // Transactional: abort restores the rows.
+    const tx = try db.begin();
+    try statement(tx, "DELETE FROM tdd_b USING tdd_a WHERE tdd_b.id > tdd_a.id");
+    try same(try rows(tx, "SELECT id FROM tdd_b ORDER BY id"), "1");
+    db.abort(tx);
+    try expect(join_probes[1], "1|11;3|33;5|55");
+    try sameState(&join_probes);
+}
+
 pub fn main(init: std.process.Init) !void {
     try truncateTable();
     try truncateErrors();
@@ -1029,6 +1053,7 @@ pub fn main(init: std.process.Init) !void {
     try alterSequences();
     try updateFrom();
     try updateFromConcurrency();
+    try deleteUsing();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-ddl-core\",\"pass\":true,\"assertions\":{d},\"records\":{d},\"database_bytes\":{d}}}\n", .{ assertions, records_applied, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
