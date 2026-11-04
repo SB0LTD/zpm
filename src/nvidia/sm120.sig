@@ -1328,6 +1328,7 @@ fn alu(cx: *Cx, d: Alu) Error!void {
         },
     };
     if (d.uniform and (form == 3 or form == 5 or form == 6 or form == 7)) return error.Syntax;
+    if (!d.uniform and !immFormOk(d.op, form)) return error.Syntax;
     w.put(0, 9, d.op);
     w.put(9, 3, form);
     if (d.uniform) w.bit(91, true);
@@ -1335,8 +1336,33 @@ fn alu(cx: *Cx, d: Alu) Error!void {
 
 const Where = enum { reg32, ureg32, imm32, cbuf32, reg64 };
 
+/// The immediate forms GB206 runs for the warp's ALU ops, by opcode: an
+/// immediate third source (form 2) only for MOV, SEL, LEA, PRMT, SHF,
+/// FADD, FFMA, IMAD, HADD2, HFMA2, F2FP and F2IP, and an immediate second
+/// source (form 4) for all but FADD, IDP, HADD2 and I2F (FADD's and HADD2's
+/// immediate is in c's place). nvidia's disassembler calls the others
+/// illegal (each alu opcode's word from the vectors with its form set), and
+/// the SMs raise Xid 13, Illegal Instruction Encoding, on them: lfm3_nv's
+/// quantization had IADD3 with an immediate third source, which faulted
+/// the Legion's RTX. (The uniform datapath's ops are as their codecs take
+/// them.) tools/sweep_sm120.py checks every program zpm makes this way.
+fn immFormOk(op: u9, form: u64) bool {
+    return switch (form) {
+        2 => switch (op) {
+            0x002, 0x007, 0x011, 0x016, 0x019, 0x021, 0x023, 0x024, 0x030, 0x031, 0x03e, 0x043 => true,
+            else => false,
+        },
+        4 => switch (op) {
+            0x021, 0x026, 0x030, 0x106 => false,
+            else => true,
+        },
+        else => true,
+    };
+}
+
 fn aluDecode(cx: *Cx, d: Alu, at_c: RegAt) Error!void {
     const form = cx.get(9, 3);
+    if (!d.uniform and !immFormOk(d.op, form)) return error.Unknown;
     if (d.a == .src) try pushSrc(cx, AT_A, d.a.src, d.uniform);
     var b_at: Where = undefined;
     var c_at: Where = undefined;
@@ -3167,6 +3193,31 @@ test "FRND and the 32-bit atomics: ptxas's words and nvdisasm's (testdata/sm120_
         w.put(f[0], f[1], f[2]);
         try testing.expectError(error.Unknown, decode(w.lo(), w.hi(), 0));
     }
+}
+
+test "immediates where GB206 takes none are refused: IADD3's third source, IDP.4A's (Xid 13 on the Legion)" {
+    // (what lfm3_nv's quantization had, and kir_sm120's dot4 by immediates)
+    for ([_][]const u8{
+        "IADD3 R36, PT, PT, R34, R36, 0xe",
+        "IDP.4A.S8.U8 R8, R0, 0x80ff017f, R2",
+        "IDP.4A.S8.U8 R8, R0, R1, 0x7fffffff",
+        "LOP3.LUT R1, R2, R3, 0x5, 0xc0, !PT",
+        "ISETP.GE.U32.AND P0, PT, R2, R3, 0x5",
+    }) |t| {
+        const in = parse(t) catch continue;
+        try testing.expectError(error.Syntax, encode(&in, 0, null));
+    }
+    // the immediate in the second source is GB206's form
+    for ([_][]const u8{
+        "IADD3 R36, PT, PT, R34, 0xe, R36",
+        "IMAD R7, R5, R5, -0x1",
+        "FFMA R0, R1, R2, 1.5",
+        "SEL R1, R2, 0x5, P0",
+    }) |t| _ = try encode(&(try parse(t)), 0, null);
+    // and decoding refuses the illegal word
+    var w = (try encode(&(try parse("IADD3 R36, PT, PT, R34, 0xe, R36")), 0, null));
+    w.put(9, 3, 2);
+    try testing.expectError(error.Unknown, decode(w.lo(), w.hi(), 0));
 }
 
 /// `text` encoded at `pc`, then decoded: what an emulator sees.
