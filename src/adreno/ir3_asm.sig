@@ -359,6 +359,20 @@ fn isSfu(in: *const Instr) bool {
     return in.op.category() == 4;
 }
 
+/// Whether an instruction's slots let ALU latency pass: as Mesa's
+/// count_instruction (ir3_legalize.c, read as documentation), only the
+/// vector ALU (cat1-3) and cat0 other than branches count. An SFU op, a
+/// load or store, a fence or a barrier between an ALU result and its
+/// reader issues elsewhere and lets none pass; nor does a scalar ALU op
+/// (one writing a shared register) or a branch, which Mesa leaves out.
+pub fn countsSlots(in: *const Instr) bool {
+    return switch (in.op.category()) {
+        0 => !isBranch(in.op),
+        1, 2, 3 => !(in.dst.num >= ir3.SHARED_BASE and in.dst.num < ir3.A0_X and !in.dst.rel),
+        else => false,
+    };
+}
+
 fn isGlobalLoad(op: ir3.Op) bool {
     return switch (op) {
         .ldg, .ldg_a, .ldg_k, .ldib_b, .ldc, .ldc_k, .ldp => true,
@@ -624,12 +638,20 @@ fn isMad(op: ir3.Op) bool {
 fn emitNops(e: *Emit, st: *State, count: u32, ss: bool, sy: bool) Error!void {
     var left = count;
     var first = true;
-    // Merge into the previous cat2/cat3's (nopN) where possible.
+    // Merge into the previous cat2/cat3's (nopN) where possible (a vector
+    // ALU op's: a scalar one's slots do not count).
     if (!ss and !sy) if (e.last()) |prev| {
         const c = prev.op.category();
-        if ((c == 2 or c == 3) and prev.repeat == 0 and prev.nop < 3 and !(prev.src[0].r or prev.src[1].r)) {
+        if ((c == 2 or c == 3) and countsSlots(prev) and prev.repeat == 0 and prev.nop < 3 and !(prev.src[0].r or prev.src[1].r)) {
             const add = @min(left, 3 - prev.nop);
             prev.nop += @intCast(add);
+            left -= add;
+            st.advance(add);
+        } else if (prev.op == .nop and prev.repeat < 5) {
+            // or into a nop before it (a (ss)nop a load needed), as Mesa
+            // does, up to (rpt5)
+            const add = @min(left, 5 - @as(u32, prev.repeat));
+            prev.repeat += @intCast(add);
             left -= add;
             st.advance(add);
         }
@@ -672,8 +694,8 @@ fn step(e: *Emit, st: *State, item: Item) Error!void {
     // Barriers make the next instruction wait for everything.
     const barrier = in.op == .bar or in.op == .fence;
     // The slots of this instruction (its repeats, its (nopN)) pass for
-    // everything written before it.
-    const slots: u32 = 1 + @as(u32, in.repeat) + in.nop;
+    // everything written before it, if it is one that counts.
+    const slots: u32 = if (countsSlots(&in)) 1 + @as(u32, in.repeat) + in.nop else 0;
     st.advance(slots);
     // Its own results: the write of repeat i lands on slot i, and an ALU
     // reader may follow `wait` slots after that.
@@ -935,6 +957,26 @@ test "an ALU result feeding memory waits five slots" {
     );
 }
 
+test "a store, a fence and a barrier let no ALU slots pass: an address made before them waits its five" {
+    // (Mesa's count_instruction: only the vector ALU and cat0 count)
+    try expectListing(
+        \\shl.b r1.x, r0.x, 2
+        \\stl.u32 l[r0.y], r2.x, 1
+        \\fence.g.r.w
+        \\bar
+        \\ldl.u32 r2.y, l[r1.x], 1
+        \\end
+    ,
+        \\shl.b r1.x, r0.x, 2
+        \\stl.u32 l[r0.y], r2.x, 1
+        \\fence.g.r.w
+        \\(sy)(ss)bar
+        \\(ss)(rpt4)nop
+        \\(sy)ldl.u32 r2.y, l[r1.x], 1
+        \\end
+    );
+}
+
 test "overwriting a register a store still reads takes (ss)" {
     try expectListing(
         \\stg.u32 g[r4.x], r2.x, 1
@@ -948,6 +990,7 @@ test "overwriting a register a store still reads takes (ss)" {
 }
 
 test "a loop: the back edge carries hazards, its target gets (jp)" {
+    // (the mov's result waits two slots past the ldg, which counts none)
     try expectListing(
         \\@localsize 64, 1, 1
         \\mov.u32u32 r1.x, 0
@@ -960,7 +1003,7 @@ test "a loop: the back edge carries hazards, its target gets (jp)" {
     ,
         \\mov.u32u32 r1.x, 0
         \\(jp)ldg.u32 r2.x, g[r4.x], 1
-        \\nop
+        \\(rpt1)nop
         \\(sy)(nop2) add.u r1.x, r1.x, r2.x
         \\(nop3) cmps.u.lt p0.x, r1.x, 100
         \\(rpt1)nop
