@@ -217,15 +217,18 @@ pub const Work = struct {
     }
 };
 
-// ── The backends: one line each, its owner's. Replace `none` with the
-//    backend's file; it provides
-//    `pub fn compile(k: *const kir.Kernel, caps: Caps, work: *Work, out: []u8) !Binary`. ──
+// ── The backends: one line each, its owner's. Replace `none` with an
+//    import of the backend's file (Q: kir_ir3.sig, N: kir_sm120.sig); it
+//    provides
+//    `pub fn compile(k: *const kir.Kernel, caps: Caps, work: *Work, out: []u8) !Binary`.
+//    (Comments here name files in prose only: Galaxy's module resolver
+//    scans the source text, comments included.) ──
 
-const backend_ir3_a7xx = none; // Q: @import("kir_ir3.sig")
+const backend_ir3_a7xx = none; // Q: the import of kir_ir3.sig
 
 //
 
-const backend_sm_120 = none; // N: @import("kir_sm120.sig")
+const backend_sm_120 = none; // N: the import of kir_sm120.sig
 
 const none = struct {
     pub fn compile(k: *const kir.Kernel, caps: Caps, work: *Work, out: []u8) Error!Binary {
