@@ -251,6 +251,22 @@ fn usrc(c: *const Ctx, f: u32, s: Src, i: u32) u32 {
     return b;
 }
 
+/// min.f/max.f as IEEE 754-2019's minimumNumber/maximumNumber: a NaN
+/// operand gives the other one, and -0 orders below +0 (the host's @min
+/// leaves the zeros' order open). The hardware's own choice is not
+/// measured yet: the bring-up self-test's "edges" case reports it.
+fn minMax(a: f32, b: f32, max: bool) f32 {
+    if (std.math.isNan(a)) return b;
+    if (std.math.isNan(b)) return a;
+    if (a == b) {
+        // equal: only the zeros' signs differ
+        const neg = std.math.signbit(a) and std.math.signbit(b);
+        const any_neg = std.math.signbit(a) or std.math.signbit(b);
+        return if (max) (if (neg) a else @abs(a)) else (if (any_neg) -@abs(a) else a);
+    }
+    return if (max) @max(a, b) else @min(a, b);
+}
+
 fn putF(c: *Ctx, f: u32, dst: u16, half: bool, v: f32, sat: bool) void {
     const x = if (sat) std.math.clamp(v, 0.0, 1.0) else v;
     if (half) writeReg(c, f, dst, true, @as(u16, @bitCast(@as(f16, @floatCast(x))))) else writeReg(c, f, dst, false, @bitCast(x));
@@ -541,8 +557,8 @@ fn execCat2(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
             switch (in.op) {
                 .add_f => fres = fsrc(c, f, s0, i) + fsrc(c, f, s1, i),
                 .mul_f => fres = fsrc(c, f, s0, i) * fsrc(c, f, s1, i),
-                .min_f => fres = @min(fsrc(c, f, s0, i), fsrc(c, f, s1, i)),
-                .max_f => fres = @max(fsrc(c, f, s0, i), fsrc(c, f, s1, i)),
+                .min_f => fres = minMax(fsrc(c, f, s0, i), fsrc(c, f, s1, i), false),
+                .max_f => fres = minMax(fsrc(c, f, s0, i), fsrc(c, f, s1, i), true),
                 .sign_f => {
                     const x = fsrc(c, f, s0, i);
                     fres = if (x > 0) 1.0 else if (x < 0) -1.0 else 0.0;
