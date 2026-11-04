@@ -113,7 +113,7 @@ const keywords = [_]Keyword{
     .{ .name = "yy", .key = .yy, .digits = true, .len = 2 },           .{ .name = "y", .key = .y, .digits = true, .len = 1 },
 };
 
-const NodeKind = enum { action, space, separator, char, end };
+const NodeKind = enum { action, space, separator, char, skip, end };
 
 const Node = struct {
     kind: NodeKind = .end,
@@ -152,7 +152,8 @@ fn nodeAt(template: []const u8, at: usize) Node {
         node.width = end - at;
         return node;
     };
-    if (at_now >= template.len) return .{ .kind = .char, .width = at_now - at };
+    // A trailing FM/TM prefix adds no node (parse_format drops it).
+    if (at_now >= template.len) return .{ .kind = .skip, .width = at_now - at };
     var start = at_now;
     if (template[start] == '\\' and start + 1 < template.len and template[start + 1] == '"') start += 1;
     const width = utf8Width(template, start);
@@ -214,7 +215,7 @@ fn nextIsSeparator(template: []const u8, node: Node, after: usize) bool {
     if (node.th) return true;
     const next = nodeAt(template, after);
     return switch (next.kind) {
-        .end => true,
+        .end, .skip => true,
         .action => !next.keyword.digits,
         .char, .space, .separator => !(next.width == 1 and digit(template[after])),
     };
@@ -284,6 +285,10 @@ fn fromChar(input: []const u8, template: []const u8, out: *Fields, control: Cont
         const node = nodeAt(template, t);
         if (node.kind == .end or s >= input.len) break;
         const after = t + node.width;
+        if (node.kind == .skip) {
+            t = after;
+            continue;
+        }
         if (!fx and (node.kind != .action or node.keyword.key != .fx) and (node.kind == .action or first)) {
             while (s < input.len and space(input[s])) {
                 s += 1;

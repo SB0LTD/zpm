@@ -1578,7 +1578,9 @@ pub fn Binder(comptime config: types.Config) type {
             const T = ast.Type;
             switch (n.func) {
                 .lower, .upper, .initcap, .reverse => try bindSignature(context, n, &[_]T{.text}, .text, true),
-                .char_length, .octet_length, .bit_length, .ascii => try bindSignature(context, n, &[_]T{.text}, .int4, true),
+                // octet_length(bpchar) counts CHAR(n) padding; the others read
+                // CHAR(n) through text, which drops trailing spaces.
+                .char_length, .octet_length, .bit_length, .ascii => try bindSignature(context, n, &[_]T{if (n.func == .octet_length and count == 1 and argumentType(context, n, 0) == .bpchar) .bpchar else .text}, .int4, true),
                 .substring => {
                     // Unknown or text arguments after the first select the
                     // regular-expression overloads substring(text,text[,text]),

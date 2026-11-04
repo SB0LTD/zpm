@@ -304,6 +304,14 @@ fn strings() void {
     rowsOf("SELECT left(t,n) FROM str_t ORDER BY id",25,&.{"Ab",null,null});
     rowsOf("SELECT id FROM str_t WHERE lower(t)='cd'",23,&.{"3"});
     rowsOf("SELECT length(t) FROM str_t GROUP BY length(t) ORDER BY 1",23,&.{"2",null});
+    // VARCHAR(n) and CHAR(n) arguments (CHAR reads as text without padding,
+    // except octet_length, which counts it).
+    setup(&.{"CREATE TABLE chr_t(id INT PRIMARY KEY,c CHAR(4),v VARCHAR(5))","INSERT INTO chr_t VALUES(1,'ab','Ab c')"});
+    shaped("SELECT upper(c),length(c),octet_length(c),upper(v),replace(v,' ','_'),concat(c,'|') FROM chr_t",
+        &.{.{.name="upper",.oid=25},.{.name="length",.oid=23},.{.name="octet_length",.oid=23},.{.name="upper",.oid=25},.{.name="replace",.oid=25},.{.name="concat",.oid=25}},
+        &.{"AB","2","4","AB C","Ab_c","ab  |"});
+    value("SELECT lower('AB'::varchar(5))",25,"ab");
+    value("SELECT position('b' IN 'ab'::char(3))",23,"2");
     // Errors and overload resolution.
     rejects("SELECT substring('abc' FROM 2 FOR -1)",error.SubstringError);
     rejects("SELECT overlay('abc' placing 'x' from 0)",error.SubstringError);
@@ -689,6 +697,7 @@ fn formatting() void {
     value("SELECT to_timestamp(1284352323)",1184,"2010-09-13 04:32:03+00");
     // Field widths, separators, names, 12-hour clock, fractions, years.
     value("SELECT to_date('20250315','YYYYMMDD')",1082,"2025-03-15");
+    value("SELECT to_date('2025-3-5','YYYY-MM-DDFM')",1082,"2025-03-05");
     value("SELECT to_date('15/03/2025','DD/MM/YYYY')",1082,"2025-03-15");
     value("SELECT to_date('March 15 2025','Month DD YYYY')",1082,"2025-03-15");
     value("SELECT to_date('95-01-03','YY-MM-DD')",1082,"1995-01-03");

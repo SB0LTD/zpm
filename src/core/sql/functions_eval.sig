@@ -43,8 +43,12 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
             return any_null;
         }
 
+        /// The bytes of a bound text argument (CHAR(n) keeps its padding).
         fn textOf(cell: *const V.Cell) []const u8 {
-            return cell.text.slice();
+            return switch (cell.*) {
+                .bpchar => |*value| value.slice(),
+                else => cell.text.slice(),
+            };
         }
 
         fn int32Of(cell: *const V.Cell) i32 {
