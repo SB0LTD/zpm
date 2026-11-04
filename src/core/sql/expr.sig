@@ -15,6 +15,8 @@ const temporal = @import("temporal.sig");
 const datetime_format = @import("datetime_format.sig");
 const float_text = @import("float_text.sig");
 const bytea_module = @import("bytea.sig");
+const builtins = @import("functions_eval.sig");
+const stats = @import("aggregates_stat.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -145,6 +147,27 @@ pub fn arithmetic(op: ast.Op, ty: ast.Type, left: i64, right: i64) Error!i64 {
         else => unreachable,
     };
     return checkRange(value, ty);
+}
+
+/// int2/int4/int8 bitwise operators. Shift counts are masked to the
+/// operand width as on x86-64/AArch64 PostgreSQL builds (C shifts of the
+/// promoted int, then truncation for int2); bits shifted out are lost.
+pub fn bitwise(op: ast.Op, ty: ast.Type, left: i64, right: i64) i64 {
+    return switch (op) {
+        .bit_and => left & right,
+        .bit_or => left | right,
+        .bit_xor => left ^ right,
+        .shift_left, .shift_right => if (ty == .int8) blk: {
+            const count: u6 = @intCast(right & 63);
+            break :blk if (op == .shift_left) left << count else left >> count;
+        } else blk: {
+            const count: u5 = @intCast(right & 31);
+            const narrow: i32 = @intCast(left);
+            const shifted: i32 = if (op == .shift_left) narrow << count else narrow >> count;
+            break :blk if (ty == .int2) @as(i16, @truncate(shifted)) else shifted;
+        },
+        else => unreachable,
+    };
 }
 
 fn utf8Length(byte: u8) usize {
@@ -760,6 +783,7 @@ pub fn Eval(comptime config: types.Config) type {
                     const value = try eval(ctx, n.a);
                     if (value == .null_value) return .null_value;
                     if (n.op == .pos) return value;
+                    if (n.op == .bit_not) return .{ .integer = try checkRange(~value.integer, n.ty) };
                     return Io.negate(&value, n.ty);
                 },
                 .binary => switch (n.op) {
@@ -787,6 +811,12 @@ pub fn Eval(comptime config: types.Config) type {
                         try appendCell(&text, &right, true, ctx.session);
                         return .{ .text = text };
                     },
+                    .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => {
+                        const left = try eval(ctx, n.a);
+                        const right = try eval(ctx, n.b);
+                        if (left == .null_value or right == .null_value) return .null_value;
+                        return .{ .integer = bitwise(n.op, n.ty, left.integer, right.integer) };
+                    },
                     .add, .sub, .mul, .div, .mod => {
                         // Preserve left-to-right evaluation, including a right
                         // expression when the left is NULL. Borrow stable row
@@ -798,6 +828,11 @@ pub fn Eval(comptime config: types.Config) type {
                         if (left.* == .null_value or right.* == .null_value) return .null_value;
                         if (left.* == .integer and right.* == .integer and value_module.integral(n.ty))
                             return .{ .integer = try arithmetic(n.op, n.ty, left.integer, right.integer) };
+                        if (n.ty == .interval and (n.op == .mul or n.op == .div)) {
+                            const span = if (left.* == .interval) left.interval else right.interval;
+                            const factor = if (left.* == .interval) right.float8 else left.float8;
+                            return .{ .interval = if (n.op == .mul) try stats.intervalMultiply(span, factor) else try stats.intervalDivide(span, factor) };
+                        }
                         return Io.arithmetic(n.op, left, right, n.ty, ctx.session);
                     },
                     .arrow, .arrow_text => {
@@ -963,6 +998,28 @@ pub fn Eval(comptime config: types.Config) type {
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out => return catalogValue(ctx, n),
+                    .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
+                    .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
+                    .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .overlaps, .overlaps_tz => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .to_date, .to_number, .to_timestamp => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .normalize, .is_normalized => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .aggregate_pair => {
+                        // Both inputs are evaluated; NULL skips the row (strict).
+                        const y = try eval(ctx, n.b);
+                        const x = try eval(ctx, node(ctx, n.b).next);
+                        if (y == .null_value or x == .null_value) return .null_value;
+                        if (comptime config.text_bytes < 16) {
+                            return error.WorkspaceCapacity;
+                        } else {
+                            var pair: V.Text = .{ .len = 16 };
+                            @memcpy(pair.bytes[0..8], &@as([8]u8, @bitCast(y.float8)));
+                            @memcpy(pair.bytes[8..16], &@as([8]u8, @bitCast(x.float8)));
+                            return .{ .text = pair };
+                        }
+                    },
                     .none => unreachable,
                 },
                 .param, .when_arm => unreachable,

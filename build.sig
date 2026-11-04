@@ -145,6 +145,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-window-values", "tests/test_sql_window_values.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-conditional-ddl", "tests/test_sql_conditional_ddl.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-numeric-functions", "tests/test_sql_numeric_functions.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-functions-core", "tests/test_sql_functions_core.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-integer-square-root", "tests/test_integer_square_root.sig", &.{});
     _ = try addContract(ctx, test_sql, "contract-sql-square-root", "tests/test_sql_square_root.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-planner-demand", "tests/test_sql_planner_demand.sig", &.{importEntry("sql", "src/core/sql.sig")});

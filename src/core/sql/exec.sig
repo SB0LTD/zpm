@@ -11,6 +11,8 @@ const binder = @import("binder.sig");
 const value_module = @import("value.sig");
 const sort_module = @import("sort.sig");
 const catalog = @import("catalog.sig");
+const aggregate_stats = @import("aggregates_stat.sig");
+const numeric_module = @import("numeric.sig");
 const builtin = @import("builtin");
 const Error = types.Error;
 const none = ast.none;
@@ -513,6 +515,41 @@ pub fn Exec(comptime config: types.Config) type {
                 sx: f64 = 0,
                 sxx: f64 = 0,
             };
+
+            // B11 statistical aggregates reuse these slots, so the state size
+            // (and every workspace budget) is unchanged:
+            // - regression (Y, X): Sx/Sxx in sx/sxx, Sy in `integer`'s bits,
+            //   Syy and Sxy in `wide`'s bits;
+            // - integer variance: sum in `wide`, sum of squares as NUMERIC in
+            //   `value`; numeric variance: both sums packed in `value`'s text
+            //   bytes, `flag` marking a NaN/Infinity input;
+            // - float variance: float8_accum's Sx/Sxx in sx/sxx.
+            fn sumY(acc: *Accumulator) *f64 {
+                return @ptrCast(&acc.integer);
+            }
+
+            fn sumsYY(acc: *Accumulator) *[2]f64 {
+                return @ptrCast(&acc.wide);
+            }
+
+            const numeric_bytes = @sizeOf(numeric_module.Numeric);
+            /// Whether NUMERIC variance can pack both sums into one cell.
+            const packed_sums = config.text_bytes >= 2 * numeric_bytes;
+
+            fn numericSums(acc: *const Accumulator) [2]numeric_module.Numeric {
+                var sums: [2]numeric_module.Numeric = .{ .{}, .{} };
+                if (comptime packed_sums) {
+                    if (acc.value == .text) @memcpy(@as([*]u8, @ptrCast(&sums))[0 .. 2 * numeric_bytes], acc.value.text.bytes[0 .. 2 * numeric_bytes]);
+                }
+                return sums;
+            }
+
+            fn storeNumericSums(acc: *Accumulator, sums: *const [2]numeric_module.Numeric) void {
+                if (comptime packed_sums) {
+                    if (acc.value != .text) acc.value = .{ .text = .{ .len = 0 } };
+                    @memcpy(acc.value.text.bytes[0 .. 2 * numeric_bytes], @as([*]const u8, @ptrCast(sums))[0 .. 2 * numeric_bytes]);
+                }
+            }
 
             /// Accumulators borrow whole Cell slots from the existing workspace.
             /// No second arena, heap, input-sized handle list or per-row Cell
@@ -2319,6 +2356,52 @@ pub fn Exec(comptime config: types.Config) type {
                     },
                     .bool_and => acc.flag = (acc.flag orelse true) and input.boolean,
                     .bool_or => acc.flag = (acc.flag orelse false) or input.boolean,
+                    .bit_and, .bit_or, .bit_xor => {
+                        if (acc.flag == null) {
+                            acc.integer = input.integer;
+                            acc.flag = true;
+                        } else acc.integer = switch (agg.kind) {
+                            .bit_and => acc.integer & input.integer,
+                            .bit_or => acc.integer | input.integer,
+                            else => acc.integer ^ input.integer,
+                        };
+                    },
+                    .stddev_pop, .stddev_samp, .var_pop, .var_samp => switch (input.*) {
+                        .integer => |x| {
+                            acc.wide += x;
+                            if (acc.value != .numeric) acc.value = .{ .numeric = .{} };
+                            const square = Io.Numerics.fromInt(x);
+                            const squared = try Io.Numerics.mul(&square, &square);
+                            acc.value.numeric = try Io.Numerics.add(&acc.value.numeric, &squared);
+                        },
+                        .float4, .float8 => try aggregate_stats.accumulateOne(acc.count - 1, if (input.* == .float4) input.float4 else input.float8, &acc.sx, &acc.sxx),
+                        .numeric => |*x| {
+                            if (comptime !packed_sums) {
+                                return error.WorkspaceCapacity;
+                            } else if (x.special != .finite) {
+                                acc.flag = true;
+                            } else {
+                                var sums = numericSums(acc);
+                                sums[0] = try Io.Numerics.add(&sums[0], x);
+                                const squared = try Io.Numerics.mul(x, x);
+                                sums[1] = try Io.Numerics.add(&sums[1], &squared);
+                                storeNumericSums(acc, &sums);
+                            }
+                        },
+                        else => unreachable,
+                    },
+                    .regr_count => {},
+                    .corr, .covar_pop, .covar_samp, .regr_sxx, .regr_syy, .regr_sxy, .regr_avgx, .regr_avgy, .regr_slope, .regr_intercept, .regr_r2 => {
+                        if (comptime config.text_bytes < 16) {
+                            return error.WorkspaceCapacity;
+                        } else {
+                            const bytes = &input.text.bytes;
+                            const y: f64 = @bitCast(bytes[0..8].*);
+                            const x: f64 = @bitCast(bytes[8..16].*);
+                            const pair = sumsYY(acc);
+                            try aggregate_stats.accumulatePair(acc.count - 1, y, x, .{ .sx = &acc.sx, .sxx = &acc.sxx, .sy = sumY(acc), .syy = &pair[0], .sxy = &pair[1] });
+                        }
+                    },
                     .none => unreachable,
                 }
             }
@@ -2342,8 +2425,50 @@ pub fn Exec(comptime config: types.Config) type {
 
             fn finishAggregate(self: *Query, agg: *const B.Agg, acc: *const Accumulator) Error!V.Cell {
                 switch (agg.kind) {
-                    .count, .count_star => return .{ .integer = acc.count },
+                    .count, .count_star, .regr_count => return .{ .integer = acc.count },
                     .bool_and, .bool_or => return if (acc.flag) |flag| .{ .boolean = flag } else .null_value,
+                    .bit_and, .bit_or, .bit_xor => return if (acc.flag != null) .{ .integer = acc.integer } else .null_value,
+                    .stddev_pop, .stddev_samp, .var_pop, .var_samp => {
+                        const kind: aggregate_stats.Variance = switch (agg.kind) {
+                            .stddev_pop => .stddev_pop,
+                            .stddev_samp => .stddev_samp,
+                            .var_pop => .var_pop,
+                            else => .var_samp,
+                        };
+                        if (agg.ty == .float8) return if (aggregate_stats.varianceFloat(kind, acc.count, acc.sxx)) |result| .{ .float8 = result } else .null_value;
+                        var sum: numeric_module.Numeric = .{};
+                        var square: numeric_module.Numeric = .{};
+                        var special = false;
+                        if (value_module.integral(agg.arg_ty)) {
+                            sum = (try self.numericOf(acc.wide)).numeric;
+                            if (acc.value == .numeric) square = acc.value.numeric;
+                        } else {
+                            const sums = numericSums(acc);
+                            sum = sums[0];
+                            square = sums[1];
+                            special = acc.flag != null;
+                        }
+                        const result = try aggregate_stats.varianceNumeric(config.numeric_digits, kind, acc.count, &sum, &square, special);
+                        return if (result) |number| .{ .numeric = number } else .null_value;
+                    },
+                    .corr, .covar_pop, .covar_samp, .regr_sxx, .regr_syy, .regr_sxy, .regr_avgx, .regr_avgy, .regr_slope, .regr_intercept, .regr_r2 => {
+                        const kind: aggregate_stats.Regression = switch (agg.kind) {
+                            .corr => .corr,
+                            .covar_pop => .covar_pop,
+                            .covar_samp => .covar_samp,
+                            .regr_sxx => .regr_sxx,
+                            .regr_syy => .regr_syy,
+                            .regr_sxy => .regr_sxy,
+                            .regr_avgx => .regr_avgx,
+                            .regr_avgy => .regr_avgy,
+                            .regr_slope => .regr_slope,
+                            .regr_intercept => .regr_intercept,
+                            else => .regr_r2,
+                        };
+                        var state = acc.*;
+                        const pair = sumsYY(&state);
+                        return if (aggregate_stats.regression(kind, acc.count, acc.sx, acc.sxx, sumY(&state).*, pair[0], pair[1])) |result| .{ .float8 = result } else .null_value;
+                    },
                     .min, .max => return acc.value,
                     else => {},
                 }
@@ -2356,6 +2481,7 @@ pub fn Exec(comptime config: types.Config) type {
                     return Io.arithmetic(.div, &total, &count, .numeric, self.session);
                 }
                 if (agg.kind == .sum) return acc.value;
+                if (agg.ty == .interval) return .{ .interval = try aggregate_stats.intervalDivide(acc.value.interval, @floatFromInt(acc.count)) };
                 if (agg.ty == .float8) return .{ .float8 = acc.sx / @as(f64, @floatFromInt(acc.count)) };
                 const count = try self.numericOf(acc.count);
                 return Io.arithmetic(.div, &acc.value, &count, agg.ty, self.session);

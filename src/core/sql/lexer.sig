@@ -5,13 +5,20 @@
 //! case-folded on comparison), double-quoted identifiers that keep their case
 //! (`""` escapes), string literals with `''` escaping, integer, decimal and
 //! exponent literals, `$n` placeholders, the operators
-//! `= <> != < <= > >= + - * / % || :: -> ->> #> #>> @> <@ ?` and punctuation,
+//! `= <> != < <= > >= + - * / % || :: -> ->> #> #>> @> <@ ? & | # << >> ~` and punctuation,
 //! with whitespace, `--` and (nested) `/* */` comments between tokens.
+//! PostgreSQL's other string forms are string tokens too: `E'...'` escape
+//! strings, `$tag$...$tag$` dollar quoting and `U&'...' [UESCAPE 'c']`
+//! Unicode-escape strings. They are fully validated here (22025, 22021 or
+//! 42601, as scan.l/parser.c report them); `decodeQuoted` cannot fail later.
 //!
 //! `Lexer` is the frozen byte-level lexer of the alpha grammar. Only the
 //! `legacy_alpha` recognizer (alpha.sig) uses it; it must never grow.
 const types = @import("types.sig");
 const Error = types.Error;
+
+/// How a string token's raw span decodes.
+pub const QuoteForm = enum(u8) { standard, escape, dollar, unicode };
 
 pub const Quoted = struct {
     /// First raw byte after the opening quote.
@@ -20,6 +27,10 @@ pub const Quoted = struct {
     end: usize,
     /// Decoded length after collapsing the doubled quote.
     len: usize,
+    /// `''` doubling, E'' backslash escapes, verbatim dollar quoting or U&''.
+    form: QuoteForm = .standard,
+    /// The U&'' escape character (UESCAPE); backslash by default.
+    escape: u8 = '\\',
 };
 
 pub const Kind = enum { end, word, quoted_word, string, integer, decimal, parameter, symbol };
@@ -270,6 +281,13 @@ pub const Symbol = enum {
     contains,
     contained,
     question,
+    // Bitwise integer operators (B11): & | # << >> and prefix ~.
+    ampersand,
+    pipe,
+    hash,
+    shift_left,
+    shift_right,
+    tilde,
 };
 
 pub const Token = struct {
@@ -283,13 +301,25 @@ pub const Token = struct {
     len: usize = 0,
     /// Integer literal magnitude or parameter number.
     integer: u64 = 0,
+    /// String decoding form and U&'' escape character.
+    form: QuoteForm = .standard,
+    escape: u8 = '\\',
+    /// Delimiter bytes before `start` and after `end` (quoted forms only):
+    /// `'x'` is 1/1, `E'x'` 2/1, `$q$x$q$` 3/3, `U&'x' UESCAPE '!'` 3/13.
+    prefix: usize = 0,
+    suffix: usize = 0,
 
     pub fn raw(self: Token, source: []const u8) []const u8 {
         return source[self.start..self.end];
     }
 
     pub fn quoted(self: Token) Quoted {
-        return .{ .start = self.start, .end = self.end, .len = self.len };
+        return .{ .start = self.start, .end = self.end, .len = self.len, .form = self.form, .escape = self.escape };
+    }
+
+    /// The whole token as written, including its delimiters.
+    pub fn whole(self: Token, source: []const u8) []const u8 {
+        return source[self.start - self.prefix .. self.end + self.suffix];
     }
 
     pub fn isWord(self: Token, comptime expected: []const u8) bool {
@@ -386,12 +416,97 @@ pub const Tokenizer = struct {
         return token;
     }
 
+    fn sized(self: *const Tokenizer, len: usize) Error!usize {
+        if (len > self.text_limit) return error.TextCapacity;
+        return len;
+    }
+
+    /// `E'...'`: `\'` and `''` quote; the escapes are validated now.
+    fn escapeString(self: *Tokenizer) Error!Token {
+        const source = self.source;
+        const start = self.position + 2;
+        var at = start;
+        while (true) {
+            if (at >= source.len) return error.Syntax;
+            if (source[at] == '\\') {
+                at += 2;
+            } else if (source[at] == '\'') {
+                if (at + 1 < source.len and source[at + 1] == '\'') at += 2 else break;
+            } else at += 1;
+        }
+        const len = try self.sized(try decodeEscape(source[start..at], null));
+        self.position = at + 1;
+        return .{ .kind = .string, .form = .escape, .start = start, .end = at, .len = len, .prefix = 2, .suffix = 1 };
+    }
+
+    /// `$tag$...$tag$` (dollar quoting): verbatim content. A `$` that does
+    /// not open a delimiter is not a token (PostgreSQL's dolqfailed).
+    fn dollarString(self: *Tokenizer) Error!Token {
+        const source = self.source;
+        const open = self.position;
+        var at = open + 1;
+        if (at < source.len and dollarStart(source[at])) {
+            at += 1;
+            while (at < source.len and (dollarStart(source[at]) or types.digit(source[at]))) at += 1;
+        }
+        if (at >= source.len or source[at] != '$') return error.Syntax;
+        const delimiter = source[open .. at + 1];
+        const start = at + 1;
+        var scan = start;
+        while (scan + delimiter.len <= source.len) : (scan += 1) {
+            if (source[scan] == '$' and types.same(source[scan..][0..delimiter.len], delimiter)) {
+                const len = try self.sized(scan - start);
+                self.position = scan + delimiter.len;
+                return .{ .kind = .string, .form = .dollar, .start = start, .end = scan, .len = len, .prefix = delimiter.len, .suffix = delimiter.len };
+            }
+        }
+        return error.Syntax;
+    }
+
+    /// `U&'...'` with an optional `UESCAPE 'c'` clause (parser.c).
+    fn unicodeString(self: *Tokenizer) Error!Token {
+        self.position += 3;
+        var token = try self.quotedForm('\'', self.source.len, error.TextCapacity);
+        token.kind = .string;
+        token.form = .unicode;
+        token.prefix = 3;
+        token.suffix = 1;
+        const after = self.position;
+        var escape: u8 = '\\';
+        try self.skip();
+        const word_start = self.position;
+        while (self.position < self.source.len and (types.letter(self.source[self.position]) or types.digit(self.source[self.position]) or self.source[self.position] == '$')) self.position += 1;
+        if (types.keyword(self.source[word_start..self.position], "uescape")) {
+            try self.skip();
+            // UESCAPE takes a plain string constant (never another U&'').
+            const lead = if (self.position < self.source.len) self.source[self.position] else 0;
+            if ((lead == 'u' or lead == 'U') and self.position + 1 < self.source.len and self.source[self.position + 1] == '&') return error.Syntax;
+            const literal = try self.next();
+            if (literal.kind != .string or literal.len != 1) return error.Syntax;
+            var byte: [1]u8 = undefined;
+            decodeQuoted(self.source, literal.quoted(), &byte);
+            if (!uescapeCharacter(byte[0])) return error.Syntax;
+            escape = byte[0];
+            token.suffix = self.position - token.end;
+        } else self.position = after;
+        token.escape = escape;
+        token.len = try self.sized(try decodeUnicode(self.source[token.start..token.end], escape, null));
+        return token;
+    }
+
     pub fn next(self: *Tokenizer) Error!Token {
         try self.skip();
         const source = self.source;
         const start = self.position;
         if (start == source.len) return .{ .kind = .end, .start = start, .end = start };
         const byte = source[start];
+        if ((byte == 'e' or byte == 'E') and start + 1 < source.len and source[start + 1] == '\'') return self.escapeString();
+        if ((byte == 'u' or byte == 'U') and start + 2 < source.len and source[start + 1] == '&') {
+            if (source[start + 2] == '\'') return self.unicodeString();
+            // U&"..." Unicode identifiers are not supported (never `U & "x"`).
+            if (source[start + 2] == '"') return error.Syntax;
+        }
+        if (byte == '$' and start + 1 < source.len and !types.digit(source[start + 1])) return self.dollarString();
         if (types.letter(byte)) {
             self.position += 1;
             while (self.position < source.len and (types.letter(source[self.position]) or types.digit(source[self.position]) or source[self.position] == '$')) self.position += 1;
@@ -402,6 +517,8 @@ pub const Tokenizer = struct {
             self.position += 1;
             var token = try self.quotedForm('\'', self.text_limit, error.TextCapacity);
             token.kind = .string;
+            token.prefix = 1;
+            token.suffix = 1;
             return token;
         }
         if (byte == '"') {
@@ -409,6 +526,8 @@ pub const Tokenizer = struct {
             var token = try self.quotedForm('"', 255, error.NameCapacity);
             if (token.len == 0) return error.Syntax;
             token.kind = .quoted_word;
+            token.prefix = 1;
+            token.suffix = 1;
             return token;
         }
         if (byte == '$') {
@@ -450,10 +569,16 @@ pub const Tokenizer = struct {
             } else if (following == '@') blk: {
                 width = 2;
                 break :blk Symbol.contained;
+            } else if (following == '<') blk: {
+                width = 2;
+                break :blk Symbol.shift_left;
             } else .lt,
             '>' => if (following == '=') blk: {
                 width = 2;
                 break :blk Symbol.ge;
+            } else if (following == '>') blk: {
+                width = 2;
+                break :blk Symbol.shift_right;
             } else .gt,
             '!' => if (following == '=') blk: {
                 width = 2;
@@ -462,7 +587,9 @@ pub const Tokenizer = struct {
             '|' => if (following == '|') blk: {
                 width = 2;
                 break :blk Symbol.concat;
-            } else return error.Syntax,
+            } else .pipe,
+            '&' => .ampersand,
+            '~' => .tilde,
             ':' => if (following == ':') blk: {
                 width = 2;
                 break :blk Symbol.cast;
@@ -470,7 +597,7 @@ pub const Tokenizer = struct {
             '#' => if (following == '>') blk: {
                 width = if (third == '>') 3 else 2;
                 break :blk if (third == '>') Symbol.path_text else Symbol.path;
-            } else return error.Syntax,
+            } else .hash,
             '@' => if (following == '>') blk: {
                 width = 2;
                 break :blk Symbol.contains;
@@ -584,6 +711,274 @@ pub fn decodeQuotedWith(source: []const u8, quoted: Quoted, quote: u8, out: []u8
     }
 }
 
+/// Copies a string literal's decoded bytes (`quoted.len` of them) into
+/// `out`, according to its form. The tokenizer validated the literal.
 pub fn decodeQuoted(source: []const u8, quoted: Quoted, out: []u8) void {
-    decodeQuotedWith(source, quoted, '\'', out);
+    const raw = source[quoted.start..quoted.end];
+    switch (quoted.form) {
+        .standard => decodeQuotedWith(source, quoted, '\'', out),
+        .dollar => @memcpy(out[0..raw.len], raw),
+        .escape => _ = decodeEscape(raw, out[0..quoted.len]) catch {},
+        .unicode => _ = decodeUnicode(raw, quoted.escape, out[0..quoted.len]) catch {},
+    }
+}
+
+/// scan.l dolq_start: a letter, `_` or any non-ASCII byte.
+fn dollarStart(byte: u8) bool {
+    return types.letter(byte) or byte >= 0x80;
+}
+
+fn hexValue(byte: u8) ?u8 {
+    if (byte >= '0' and byte <= '9') return byte - '0';
+    if (byte >= 'a' and byte <= 'f') return byte - 'a' + 10;
+    if (byte >= 'A' and byte <= 'F') return byte - 'A' + 10;
+    return null;
+}
+
+/// parser.c check_uescapechar.
+fn uescapeCharacter(byte: u8) bool {
+    return hexValue(byte) == null and byte != '+' and byte != '\'' and byte != '"' and
+        byte != ' ' and byte != '\t' and byte != '\n' and byte != '\r' and byte != 0x0b and byte != 0x0c;
+}
+
+/// Appends to an optional output, counting the decoded length either way
+/// and checking that the decoded bytes form valid UTF-8.
+const Sink = struct {
+    out: ?[]u8,
+    len: usize = 0,
+    check: Utf8Check = .{},
+
+    fn byte(self: *Sink, value: u8) void {
+        if (self.out) |buffer| {
+            if (self.len < buffer.len) buffer[self.len] = value;
+        }
+        self.len += 1;
+        self.check.feed(value);
+    }
+
+    /// pg_unicode_to_server for a UTF-8 database; `code` is a valid scalar.
+    fn scalar(self: *Sink, code: u32) void {
+        if (code < 0x80) {
+            self.byte(@intCast(code));
+        } else if (code < 0x800) {
+            self.byte(@intCast(0xc0 | (code >> 6)));
+            self.byte(@intCast(0x80 | (code & 0x3f)));
+        } else if (code < 0x10000) {
+            self.byte(@intCast(0xe0 | (code >> 12)));
+            self.byte(@intCast(0x80 | ((code >> 6) & 0x3f)));
+            self.byte(@intCast(0x80 | (code & 0x3f)));
+        } else {
+            self.byte(@intCast(0xf0 | (code >> 18)));
+            self.byte(@intCast(0x80 | ((code >> 12) & 0x3f)));
+            self.byte(@intCast(0x80 | ((code >> 6) & 0x3f)));
+            self.byte(@intCast(0x80 | (code & 0x3f)));
+        }
+    }
+};
+
+/// Streaming pg_utf8_islegal: NUL, overlong forms, surrogates and values
+/// above U+10FFFF are invalid.
+pub const Utf8Check = struct {
+    need: u8 = 0,
+    low: u8 = 0x80,
+    high: u8 = 0xbf,
+    valid: bool = true,
+
+    pub fn feed(self: *Utf8Check, byte: u8) void {
+        if (self.need != 0) {
+            if (byte < self.low or byte > self.high) self.valid = false;
+            self.need -= 1;
+            self.low = 0x80;
+            self.high = 0xbf;
+            return;
+        }
+        switch (byte) {
+            0 => self.valid = false,
+            0x01...0x7f => {},
+            0xc2...0xdf => self.need = 1,
+            0xe0 => { self.need = 2; self.low = 0xa0; },
+            0xe1...0xec, 0xee, 0xef => self.need = 2,
+            0xed => { self.need = 2; self.high = 0x9f; },
+            0xf0 => { self.need = 3; self.low = 0x90; },
+            0xf1...0xf3 => self.need = 3,
+            0xf4 => { self.need = 3; self.high = 0x8f; },
+            else => self.valid = false,
+        }
+    }
+
+    pub fn finish(self: *const Utf8Check) bool {
+        return self.valid and self.need == 0;
+    }
+};
+
+fn surrogateFirst(code: u32) bool {
+    return code >= 0xd800 and code <= 0xdbff;
+}
+
+fn surrogateSecond(code: u32) bool {
+    return code >= 0xdc00 and code <= 0xdfff;
+}
+
+fn validScalarValue(code: u32) bool {
+    return code > 0 and code <= 0x10ffff;
+}
+
+fn hexDigits(raw: []const u8, at: usize, count: usize) ?u32 {
+    if (at + count > raw.len) return null;
+    var value: u32 = 0;
+    for (raw[at..][0..count]) |byte| value = value * 16 + (hexValue(byte) orelse return null);
+    return value;
+}
+
+/// E'' content (scan.l xe state): `''`, `\b \f \n \r \t \v`, octal `\ooo`,
+/// hex `\xhh`, `\uXXXX`, `\UXXXXXXXX` and `\c`. A malformed Unicode escape
+/// is 22025; an invalid code point or surrogate pair 42601; and when an
+/// escape produced NUL or a high-bit byte the result must be valid UTF-8
+/// (pg_verifymbstr, 22021). Returns the decoded length.
+pub fn decodeEscape(raw: []const u8, out: ?[]u8) Error!usize {
+    var sink: Sink = .{ .out = out };
+    var non_ascii = false;
+    var pair: u32 = 0;
+    var at: usize = 0;
+    while (at < raw.len) {
+        const byte = raw[at];
+        // A high surrogate must be followed directly by its low surrogate.
+        if (pair != 0 and !(byte == '\\' and at + 1 < raw.len and (raw[at + 1] == 'u' or raw[at + 1] == 'U'))) return error.Syntax;
+        if (byte == '\'') {
+            sink.byte('\'');
+            at += 2;
+            continue;
+        }
+        if (byte != '\\' or at + 1 >= raw.len) {
+            sink.byte(byte);
+            at += 1;
+            continue;
+        }
+        const kind = raw[at + 1];
+        switch (kind) {
+            'b' => sink.byte(0x08),
+            'f' => sink.byte(0x0c),
+            'n' => sink.byte('\n'),
+            'r' => sink.byte('\r'),
+            't' => sink.byte('\t'),
+            'v' => sink.byte(0x0b),
+            '0'...'7' => {
+                var value: u32 = 0;
+                var count: usize = 0;
+                while (count < 3 and at + 1 + count < raw.len and raw[at + 1 + count] >= '0' and raw[at + 1 + count] <= '7') : (count += 1) value = value * 8 + (raw[at + 1 + count] - '0');
+                const decoded: u8 = @truncate(value);
+                sink.byte(decoded);
+                if (decoded == 0 or decoded >= 0x80) non_ascii = true;
+                at += 1 + count;
+                continue;
+            },
+            'x' => if (at + 2 < raw.len and hexValue(raw[at + 2]) != null) {
+                var value: u8 = hexValue(raw[at + 2]).?;
+                var count: usize = 1;
+                if (at + 3 < raw.len) if (hexValue(raw[at + 3])) |digit| {
+                    value = value * 16 + digit;
+                    count = 2;
+                };
+                sink.byte(value);
+                if (value == 0 or value >= 0x80) non_ascii = true;
+                at += 2 + count;
+                continue;
+            } else sink.byte('x'),
+            'u', 'U' => {
+                const width: usize = if (kind == 'u') 4 else 8;
+                const code = hexDigits(raw, at + 2, width) orelse return error.InvalidEscapeSequence;
+                at += 2 + width;
+                if (pair != 0) {
+                    if (!surrogateSecond(code)) return error.Syntax;
+                    sink.scalar(0x10000 + ((pair & 0x3ff) << 10) + (code & 0x3ff));
+                    pair = 0;
+                } else if (surrogateFirst(code)) {
+                    pair = code;
+                } else if (surrogateSecond(code) or !validScalarValue(code)) {
+                    return error.Syntax;
+                } else sink.scalar(code);
+                continue;
+            },
+            else => {
+                sink.byte(kind);
+                if (kind == 0 or kind >= 0x80) non_ascii = true;
+            },
+        }
+        at += 2;
+    }
+    if (pair != 0) return error.Syntax;
+    if (non_ascii and !sink.check.finish()) return error.CharacterNotInRepertoire;
+    return sink.len;
+}
+
+/// The standard-string bytes of a U&'' body, collapsing `''`.
+const Plain = struct {
+    raw: []const u8,
+    at: usize = 0,
+
+    fn done(self: *const Plain) bool {
+        return self.at >= self.raw.len;
+    }
+
+    /// The decoded byte `ahead` positions on, without consuming it.
+    fn peek(self: *const Plain, ahead: usize) ?u8 {
+        var at = self.at;
+        for (0..ahead) |_| {
+            if (at >= self.raw.len) return null;
+            at += if (self.raw[at] == '\'') 2 else 1;
+        }
+        return if (at < self.raw.len) self.raw[at] else null;
+    }
+
+    fn skip(self: *Plain, count: usize) void {
+        for (0..count) |_| {
+            if (self.at >= self.raw.len) return;
+            self.at += if (self.raw[self.at] == '\'') 2 else 1;
+        }
+    }
+};
+
+/// U&'' content (parser.c str_udeescape): `cc` for the escape itself,
+/// `cXXXX` and `c+XXXXXX`; every malformed escape, invalid code point or
+/// unpaired surrogate is 42601.
+pub fn decodeUnicode(raw: []const u8, escape: u8, out: ?[]u8) Error!usize {
+    var sink: Sink = .{ .out = out };
+    var plain: Plain = .{ .raw = raw };
+    var pair: u32 = 0;
+    while (!plain.done()) {
+        const byte = plain.peek(0).?;
+        if (byte != escape) {
+            if (pair != 0) return error.Syntax;
+            sink.byte(byte);
+            plain.skip(1);
+            continue;
+        }
+        if (plain.peek(1) == escape) {
+            if (pair != 0) return error.Syntax;
+            sink.byte(escape);
+            plain.skip(2);
+            continue;
+        }
+        var code: u32 = 0;
+        var width: usize = 4;
+        var first: usize = 1;
+        if (plain.peek(1) == '+') {
+            width = 6;
+            first = 2;
+        }
+        for (0..width) |index| {
+            const digit = plain.peek(first + index) orelse return error.Syntax;
+            code = code * 16 + (hexValue(digit) orelse return error.Syntax);
+        }
+        plain.skip(first + width);
+        if (!validScalarValue(code)) return error.Syntax;
+        if (pair != 0) {
+            if (!surrogateSecond(code)) return error.Syntax;
+            code = 0x10000 + ((pair & 0x3ff) << 10) + (code & 0x3ff);
+            pair = 0;
+        } else if (surrogateSecond(code)) return error.Syntax;
+        if (surrogateFirst(code)) pair = code else sink.scalar(code);
+    }
+    if (pair != 0) return error.Syntax;
+    return sink.len;
 }
