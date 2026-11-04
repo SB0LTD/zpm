@@ -679,3 +679,73 @@ fn failure2(b: *const Backend2, e: anyerror) anyerror {
     _ = b;
     return e;
 }
+
+// ── LFM3-Audio's depthformer (lfm3_any_audio) ───────────────────────────────
+
+const gen = @import("lfm3_audio_gen");
+const any_audio = @import("lfm3_any_audio");
+const MMPROJ_PATH = "C:/Just-Things/models/lfm3/mmproj-LFM3-Audio-2B-Q8_0.gguf";
+const AUDIO_CAPACITY = 1024;
+var audio_index: gguf.Index(AUDIO_CAPACITY) = .{};
+var audio_plan: gen.Plan = .{};
+var depth_work: gen.DepthWorkspace(gen.lfm3_audio_limits) = .{};
+
+fn depthAgainstCpu(caps: gpu.Caps, src: gguf.Source, tolerance: f64) !void {
+    emu = gpu.EmuDevice.init(caps, &mem, &interp_work);
+    var depth = any_audio.Depth(AUDIO_CAPACITY).init(emu.device(), &audio_plan, &audio_index, src, .{}, &work) catch |e| {
+        std.debug.print("depth init: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    defer depth.deinit();
+    var seed: u32 = 77;
+    var state: [2048]f32 = undefined;
+    for (state[0..audio_plan.backbone]) |*v| {
+        seed = seed *% 1664525 +% 1013904223;
+        v.* = (@as(f32, @floatFromInt(seed >> 8)) / 16777216.0 - 0.5) * 4;
+    }
+    try gen.projectState(AUDIO_CAPACITY, gen.lfm3_audio_limits, src, &audio_index, &audio_plan, &depth_work, state[0..audio_plan.backbone], .{});
+    try depth.projectState(state[0..audio_plan.backbone]);
+    const n = gen.CODEBOOKS * audio_plan.vocabulary;
+    // three passes as the Speaker makes them: all masked, 4 revealed, 8 revealed
+    const passes = [3][gen.CODEBOOKS]i32{
+        .{ -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
+        .{ 17, -1, -1, 1200, -1, -1, 5, -1, -1, 2015, -1, -1 },
+        .{ 17, 300, -1, 1200, 44, -1, 5, 8, -1, 2015, 999, -1 },
+    };
+    for (passes, 0..) |codes, pass| {
+        try gen.codePass(AUDIO_CAPACITY, gen.lfm3_audio_limits, src, &audio_index, &audio_plan, &depth_work, &codes, .{});
+        const got = depth.codePass(&codes) catch |e| {
+            std.debug.print("depth pass {d}: {s} (device {s}, trap {s} at {d})\n", .{ pass, @errorName(e), if (emu.last_error) |x| @errorName(x) else "-", @tagName(emu.trap.what), emu.trap.pc });
+            return e;
+        };
+        var exact: usize = 0;
+        for (depth_work.logits[0..n], got) |a, b| {
+            if (@as(u32, @bitCast(a)) == @as(u32, @bitCast(b))) exact += 1;
+        }
+        const rel = try compare(pass, depth_work.logits[0..n], got, tolerance);
+        std.debug.print("depthformer ({s}) pass {d}: logits within {e} of the CPU's, {d} of {d} its bits; {d} dispatches, {d} lane-ops\n", .{ if (caps.fused_fma) "fused" else "unfused", pass, rel, exact, n, depth.dispatches, emu.stats.lane_ops });
+    }
+}
+
+test "LFM3-Audio's depthformer on the GPU (when its mmproj is here): projectState and three codePass passes, the CPU's logits" {
+    const io = std.testing.io;
+    const file = std.Io.Dir.cwd().openFile(io, MMPROJ_PATH, .{}) catch return error.SkipZigTest;
+    defer file.close(io);
+    const size = try file.length(io);
+    var mapping = try file.createMemoryMap(io, .{ .len = @intCast(size), .protection = .{ .read = true, .write = false }, .populate = true });
+    defer mapping.destroy(io);
+    const memory = Memory{ .bytes = mapping.memory };
+    const src = memory.source();
+    try gguf.parse(AUDIO_CAPACITY, src, &audio_index);
+    try gen.build(AUDIO_CAPACITY, src, &audio_index, &audio_plan);
+    const dp = &audio_plan.depth;
+    std.debug.print("depthformer: {d} layers, hidden {d}, ff {d}, {d} heads of {d} ({d} KV), vocabulary {d}\n", .{ dp.layer_count, dp.hidden, dp.feed_forward, dp.heads, dp.head_size, dp.kv_heads, audio_plan.vocabulary });
+    // a GPU that fuses (the RTX): the CPU's bits
+    try depthAgainstCpu(gpu.interp_caps, src, 0);
+    // the Adreno's measured caps (mad rounds twice): the exact fma emulation, the CPU's bits too
+    var caps = gpu.interp_caps;
+    caps.fused_fma = false;
+    caps.mad = .unfused;
+    caps.subgroup = 64;
+    try depthAgainstCpu(caps, src, 0);
+}

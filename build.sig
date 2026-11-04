@@ -1190,6 +1190,13 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, lfm3_any, "quantized_linear", "src/core/quantized_linear.sig");
     try wire(ctx, lfm3_any, "gpu", "src/gpu/gpu.sig");
     try wire(ctx, lfm3_any, "lfm3_kir", "src/core/lfm3_kir.sig");
+    const lfm3_any_audio = try ctx.addModule("lfm3_any_audio", "src/core/lfm3_any_audio.sig");
+    try wire(ctx, lfm3_any_audio, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_any_audio, "gpu", "src/gpu/gpu.sig");
+    try wire(ctx, lfm3_any_audio, "lfm3_audio_gen", "src/core/lfm3_audio_gen.sig");
+    try wire(ctx, lfm3_any_audio, "lfm3_audio_ops", "src/core/lfm3_audio_ops.sig");
+    try wire(ctx, lfm3_any_audio, "lfm3_kir", "src/core/lfm3_kir.sig");
+    try wire(ctx, lfm3_any_audio, "lfm3_any", "src/core/lfm3_any.sig");
     const test_lfm3_any = try ctx.addStep("test-lfm3-any", "Execute LFM3's KIR kernels and its any-GPU forward pass against the CPU", &noopStep);
     try ctx.addDependency(test_all, test_lfm3_any);
     _ = try addTest(ctx, test_lfm3_any, "test-lfm3-kir", "src/core/lfm3_kir.sig", &.{
@@ -1208,6 +1215,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("lfm3_kir", "src/core/lfm3_kir.sig"),
         importEntry("lfm3_any", "src/core/lfm3_any.sig"),
+        importEntry("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig"),
+        importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
+        importEntry("lfm3_any_audio", "src/core/lfm3_any_audio.sig"),
     });
 
     const tts_gpu = try ctx.addModule("tts_gpu", "src/tts/gpu.sig");

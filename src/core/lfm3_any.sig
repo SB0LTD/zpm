@@ -207,7 +207,7 @@ pub const Desc = struct {
 };
 
 /// A call's dispatches as they are written (in the Work).
-const List = struct {
+pub const List = struct {
     work: *Work,
     n: usize = 0,
     nb: usize = 0,
@@ -215,7 +215,7 @@ const List = struct {
     /// What the next dispatches are (set before they are added).
     what: Desc = .{},
 
-    fn add(l: *List, prog: *const Program, groups: [3]u32, buffers: []const Buffer, words: []const u32) Error!void {
+    pub fn add(l: *List, prog: *const Program, groups: [3]u32, buffers: []const Buffer, words: []const u32) Error!void {
         if (l.n >= l.work.dispatches.len or l.nb + buffers.len > l.work.buffers.len or l.nw + words.len > l.work.words.len) return error.StreamFull;
         const bs = l.work.buffers[l.nb..][0..buffers.len];
         @memcpy(bs, buffers);
@@ -229,14 +229,14 @@ const List = struct {
     }
 
     /// The next dispatches' kernel, tensor and tokens (in the same layer).
-    fn named(l: *List, kernel: []const u8, tensor: ?u16, first: u32, count: u32) void {
+    pub fn named(l: *List, kernel: []const u8, tensor: ?u16, first: u32, count: u32) void {
         l.what.kernel = kernel;
         l.what.tensor = tensor;
         l.what.first = first;
         l.what.count = count;
     }
 
-    fn slice(l: *const List) []const gpu.Dispatch {
+    pub fn slice(l: *const List) []const gpu.Dispatch {
         return l.work.dispatches[0..l.n];
     }
 };
