@@ -378,12 +378,118 @@ fn checkConstraints() !void {
     try sameState(&check_probes);
 }
 
+// ---- UNIQUE ------------------------------------------------------------------
+
+const unique_probes = [_][]const u8{
+    "SELECT a, b, c FROM uq ORDER BY a NULLS FIRST, b, c",
+    "SELECT a FROM und ORDER BY a NULLS FIRST",
+    "SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name IN ('uq', 'und', 'pu') AND constraint_type <> 'CHECK' ORDER BY constraint_name",
+    "SELECT constraint_name, column_name, ordinal_position FROM information_schema.key_column_usage WHERE table_name IN ('uq', 'und', 'pu') ORDER BY constraint_name, ordinal_position",
+};
+
+fn uniqueConstraints() !void {
+    reset();
+    try run("CREATE TABLE uq (a INT UNIQUE, b INT, c INT, UNIQUE (b, c))");
+    try run("INSERT INTO uq VALUES (1, 1, 1), (2, 1, 2), (NULL, 1, NULL), (NULL, 1, NULL)");
+    try expect(unique_probes[0], "NULL|1|NULL;NULL|1|NULL;1|1|1;2|1|2");
+    try expect(unique_probes[2], "uq_a_key|UNIQUE;uq_b_c_key|UNIQUE");
+    try expect(unique_probes[3], "uq_a_key|a|1;uq_b_c_key|b|1;uq_b_c_key|c|2");
+    // 23505 on INSERT, a duplicate inside one statement, UPDATE, and
+    // PostgreSQL's immediate per-row check (a = a + 1 meets row 2 first).
+    try rejects("INSERT INTO uq VALUES (1, 9, 9)", error.PrimaryKeyViolation, unique_probes[0], "NULL|1|NULL;NULL|1|NULL;1|1|1;2|1|2");
+    try rejects("INSERT INTO uq VALUES (3, 1, 1)", error.PrimaryKeyViolation, unique_probes[0], "NULL|1|NULL;NULL|1|NULL;1|1|1;2|1|2");
+    try rejects("INSERT INTO uq VALUES (5, 5, 5), (5, 6, 6)", error.PrimaryKeyViolation, unique_probes[0], "NULL|1|NULL;NULL|1|NULL;1|1|1;2|1|2");
+    try rejects("UPDATE uq SET c = 1 WHERE a = 2", error.PrimaryKeyViolation, unique_probes[0], "NULL|1|NULL;NULL|1|NULL;1|1|1;2|1|2");
+    try rejects("UPDATE uq SET a = a + 1", error.PrimaryKeyViolation, unique_probes[0], "NULL|1|NULL;NULL|1|NULL;1|1|1;2|1|2");
+    // Keeping a key, or moving it to a free value, is fine.
+    try run("UPDATE uq SET a = a + 10 WHERE a = 2");
+    try run("UPDATE uq SET b = b WHERE a = 1");
+    try expect(unique_probes[0], "NULL|1|NULL;NULL|1|NULL;1|1|1;12|1|2");
+    // NULLS NOT DISTINCT: one NULL key only.
+    try run("CREATE TABLE und (a INT UNIQUE NULLS NOT DISTINCT)");
+    try run("INSERT INTO und VALUES (NULL), (1)");
+    try rejects("INSERT INTO und VALUES (NULL)", error.PrimaryKeyViolation, unique_probes[1], "NULL;1");
+    try sameState(&unique_probes);
+    var result: DB.Result = .{};
+    try check(replica.execute("INSERT INTO und VALUES (NULL)", &result) == error.PrimaryKeyViolation);
+    // ON CONFLICT DO NOTHING without a target arbitrates every unique
+    // index; with the primary key as target another unique key still fails.
+    try run("CREATE TABLE pu (id INT PRIMARY KEY, e INT UNIQUE)");
+    try run("INSERT INTO pu VALUES (1, 10)");
+    const skipped = try replicate("INSERT INTO pu VALUES (2, 10) ON CONFLICT DO NOTHING");
+    try check(skipped.affected_rows == 0);
+    try rejects("INSERT INTO pu VALUES (2, 10) ON CONFLICT (id) DO NOTHING", error.PrimaryKeyViolation, "SELECT id, e FROM pu", "1|10");
+    try run("INSERT INTO pu VALUES (2, 20)");
+    try run("INSERT INTO pu VALUES (1, 11) ON CONFLICT (id) DO UPDATE SET e = 10, id = 3");
+    try rejects("INSERT INTO pu VALUES (3, 11) ON CONFLICT (id) DO UPDATE SET e = 20", error.PrimaryKeyViolation, "SELECT id, e FROM pu ORDER BY id", "2|20;3|10");
+    try rejects("CREATE TABLE bad (a INT CONSTRAINT dup UNIQUE, b INT CONSTRAINT dup UNIQUE)", error.DuplicateObject, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("CREATE TABLE bad (a INT CONSTRAINT uq UNIQUE)", error.TableExists, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("CREATE TABLE bad (a INT, UNIQUE (a, a))", error.DuplicateColumn, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("CREATE TABLE bad (a INT, UNIQUE (z))", error.ColumnNotFound, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    // Own deletes free a key inside the transaction; ROLLBACK TO restores.
+    var tx = try db.begin();
+    try statement(tx, "DELETE FROM uq WHERE a = 1");
+    try statement(tx, "INSERT INTO uq VALUES (1, 7, 7)");
+    try db.savepoint(tx, "s");
+    try statement(tx, "INSERT INTO uq VALUES (4, 8, 8)");
+    _ = try db.rollbackTo(tx, "s");
+    try statement(tx, "INSERT INTO uq VALUES (4, 9, 9)");
+    try statementFails(tx, "INSERT INTO uq VALUES (4, 3, 3)", error.PrimaryKeyViolation);
+    try commit(tx);
+    try expect(unique_probes[0], "NULL|1|NULL;NULL|1|NULL;1|7|7;4|9|9;12|1|2");
+    try sameState(&unique_probes);
+    // COPY enforces the key.
+    tx = try db.begin();
+    _ = try db.copyBegin(tx, "COPY uq FROM STDIN", false);
+    try copyRow(tx, "COPY uq FROM STDIN", &.{ "30", "30", "30" });
+    var row: DB.Row = .{};
+    try db.copyBuild(tx, "COPY uq FROM STDIN", &.{ "30", "31", "31" }, &row);
+    try check(db.copyInsert(tx, &row) == error.PrimaryKeyViolation);
+    db.abort(tx);
+    try uniqueConcurrency("INSERT INTO uq VALUES (50, 50, 50)", "DELETE FROM uq WHERE a = 4", "INSERT INTO uq VALUES (4, 40, 40)");
+    try sameState(&unique_probes);
+}
+
+/// Two transactions insert the same key: the second waits for the first
+/// (dirty snapshot), then fails with 23505 when the first commits or
+/// proceeds when it aborts; an uncommitted delete of a key is waited for too.
+fn uniqueConcurrency(insert: []const u8, delete: []const u8, reinsert: []const u8) !void {
+    for ([_]bool{ true, false }) |first_commits| {
+        const first = try db.begin();
+        try statement(first, insert);
+        const second = try db.begin();
+        try parks(second, insert);
+        try check(db.waitingFor(second).has(first));
+        if (first_commits) {
+            try commit(first);
+            var result: DB.Result = .{};
+            try check(db.statement(second, insert, &result, .{ .@"resume" = true }) == error.PrimaryKeyViolation);
+            db.abort(second);
+        } else {
+            db.abort(first);
+            _ = try resumed(second, insert);
+            try commit(second);
+        }
+        // Remove the row again for the next round.
+        try run("DELETE FROM uq WHERE a = 50");
+    }
+    const deleter = try db.begin();
+    try statement(deleter, delete);
+    const inserter = try db.begin();
+    try parks(inserter, reinsert);
+    try commit(deleter);
+    _ = try resumed(inserter, reinsert);
+    try commit(inserter);
+    try check(db.usage().transactions == 0 and db.usage().table_locks == 0);
+}
+
 pub fn main(init: std.process.Init) !void {
     try truncateTable();
     try truncateErrors();
     try truncateTransactions();
     try truncateLocks();
     try checkConstraints();
+    try uniqueConstraints();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-ddl-core\",\"pass\":true,\"assertions\":{d},\"records\":{d},\"database_bytes\":{d}}}\n", .{ assertions, records_applied, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
