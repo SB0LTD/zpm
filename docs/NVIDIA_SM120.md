@@ -38,7 +38,7 @@ Nothing from NVIDIA is needed to build or test it. Galaxy launches its kernels o
   - `UMOV`, `S2UR` and `LDCU` are on the uniform datapath (their guards uniform predicates); `R2UR` and `VOTEU` aren't;
   - floats' specials: `-0.0`, `+QNAN` and `-QNAN` (the quiet bit set), `+SNAN` and `-SNAN`, each followed by a space like `+INF`. A NaN's payload isn't printed: written, they read back as 0x7fc00000, 0xffc00000, 0x7f800001 and 0xff800001.
 
-  After these, every word `decode` accepts among the 208,128 mutations prints as nvdisasm prints it. A few it accepts nvdisasm still calls illegal (combinations ptxas never emits, such as `F2F.F64.F64`).
+  After these, `decode` accepts 100,709 of the 208,128 mutations, each prints as nvdisasm prints it, and none of them is one nvdisasm calls illegal: the last few it was too lenient on (`IMMA.16864` of bytes, `F2F.F64.F64`, b's `.reuse` beside a uniform c) are refused now.
 
 nvdisasm's text is reproduced exactly, with one exception: a branch's label (`.L_x_3`) is the kernel's numbering of its targets, which one instruction doesn't know, so `format` prints a decoded target as its address, `` `(0x1a0) ``, which parses back. Floats print as nvdisasm prints them: C's `%.20g` below 1e9, `%.20e` from there up, and `+INF ` and `+QNAN ` with nvdisasm's trailing space.
 
