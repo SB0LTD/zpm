@@ -343,7 +343,7 @@ are right only by construction. The first boot on a GPU names any op the
 hardware gets wrong.
 
 ```zig
-var w: gpu.selftest.Work = undefined; // WORK_BYTES, about 15 MB: keep it static
+var w: gpu.selftest.Work = undefined; // WORK_BYTES, 19.5 MB (kir_ir3's compile Work is 11.5 of it): keep it static
 const res = gpu.selftest.runAll(dev, &w, logLine, 2_000_000);
 // or, linking one backend: gpu.selftest.runAllFor(&.{.sm_120}, dev, &w, logLine, t)
 ```

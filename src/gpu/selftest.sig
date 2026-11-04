@@ -64,7 +64,8 @@ const LINE_BYTES = 256;
 
 /// The self-test's storage: compile and interpreter scratch, the kernel,
 /// its code, the inputs and three copies of the output. Caller-owned
-/// (static: `var w: selftest.Work = undefined;`), about 15 MB.
+/// (static: `var w: selftest.Work = undefined;`), 19.5 MB, most of it
+/// the largest backend's compile Work (kir_ir3's, 11.5 MB).
 pub const Work = struct {
     compile: [COMPILE_BYTES]u8 align(64) = undefined,
     interp: [INTERP_BYTES]u8 align(64) = undefined,
