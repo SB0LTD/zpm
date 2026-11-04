@@ -2033,10 +2033,12 @@ fn intIn(c: *const Ctx, wi: u32, t: u32, s: Src, ty: Ty) i128 {
 }
 
 fn putFloat(c: *Ctx, wi: u32, t: u32, op: *const Op, ty: Ty, hi: f64, lo: f64) void {
+    // (hi + lo, but -0 + 0 is -0: a conversion keeps the zero's sign)
+    const v = if (lo == 0) hi else hi + lo;
     switch (ty) {
-        .f64 => put64(c, wi, t, op.d[0], @bitCast(hi + lo)),
-        .f16 => put(c, wi, t, op.d[0], toF16(hi + lo, op.rnd)),
-        .bf16 => put(c, wi, t, op.d[0], toBf16(@floatCast(hi + lo), op.rnd)),
+        .f64 => put64(c, wi, t, op.d[0], @bitCast(v)),
+        .f16 => put(c, wi, t, op.d[0], toF16(v, op.rnd)),
+        .bf16 => put(c, wi, t, op.d[0], toBf16(@floatCast(v), op.rnd)),
         else => {
             const x = roundTo(f32, hi, lo, op.rnd);
             put(c, wi, t, op.d[0], if (std.math.isNan(x)) NAN32 else @bitCast(if (op.ftz) flush(x) else x));
