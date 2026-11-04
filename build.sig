@@ -1177,6 +1177,38 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig"),
         importEntry("lfm3_gpu", "src/core/lfm3_gpu.sig"),
     });
+    // LFM3 on any GPU: the KIR kernels (each against quantized_linear and the
+    // executor's arithmetic, on the interpreter) and the forward pass over a
+    // gpu.Device against lfm3_executor.
+    const lfm3_kir = try ctx.addModule("lfm3_kir", "src/core/lfm3_kir.sig");
+    try wire(ctx, lfm3_kir, "gpu", "src/gpu/gpu.sig");
+    try wire(ctx, lfm3_kir, "quantized_linear", "src/core/quantized_linear.sig");
+    const lfm3_any = try ctx.addModule("lfm3_any", "src/core/lfm3_any.sig");
+    try wire(ctx, lfm3_any, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_any, "lfm3_plan", "src/core/lfm3_plan.sig");
+    try wire(ctx, lfm3_any, "lfm3_executor", "src/core/lfm3_executor.sig");
+    try wire(ctx, lfm3_any, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, lfm3_any, "gpu", "src/gpu/gpu.sig");
+    try wire(ctx, lfm3_any, "lfm3_kir", "src/core/lfm3_kir.sig");
+    const test_lfm3_any = try ctx.addStep("test-lfm3-any", "Execute LFM3's KIR kernels and its any-GPU forward pass against the CPU", &noopStep);
+    try ctx.addDependency(test_all, test_lfm3_any);
+    _ = try addTest(ctx, test_lfm3_any, "test-lfm3-kir", "src/core/lfm3_kir.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+    });
+    _ = try addTest(ctx, test_lfm3_any, "test-lfm3-any-forward", "tests/test_lfm3_any.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("transformer_ops", "src/core/transformer_ops.sig"),
+        importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("lfm3_kir", "src/core/lfm3_kir.sig"),
+        importEntry("lfm3_any", "src/core/lfm3_any.sig"),
+    });
 
     const tts_gpu = try ctx.addModule("tts_gpu", "src/tts/gpu.sig");
     try wire(ctx, tts_gpu, "tts_model_container", "src/tts/model_container.sig");
