@@ -292,6 +292,9 @@ const Kind = enum(u8) {
     stl,
     lds,
     sts,
+    /// ATOMG, ATOMS: a read, an operation and a write, a thread at a time.
+    atomg,
+    atoms,
     shfl,
     vote,
 };
@@ -1085,6 +1088,8 @@ fn body(op: *Op, in: *const Instr, name: []const u8, o: []const Operand, given: 
         for (0..3) |k| op.s[k] = try srcOf(o[1 + k], .int);
     } else if (eql(name, "LDG") or eql(name, "STG") or eql(name, "LDL") or eql(name, "STL") or eql(name, "LDS") or eql(name, "STS")) {
         try memory(op, in, name, o);
+    } else if (eql(name, "ATOMG") or eql(name, "ATOMS")) {
+        try atomic(op, in, name, o);
     } else if (eql(name, "SHFL")) {
         // SHFL.IDX|UP|DOWN|BFLY Pd, Rd, a, lane, clamp
         try count(in, 5);
@@ -1192,6 +1197,32 @@ fn lea(op: *Op, in: *const Instr, o: []const Operand) Error!void {
         k += 1;
     }
     if (k != in.n_ops) return error.Syntax;
+}
+
+/// ATOMG.E.op(.S32).order Pd, Rd, desc[URd][Ra.64+offset], Rb; ATOMS.op(.S32)
+/// Rd, [Ra+offset], Rb: the 32-bit atomics (ADD, MIN, MAX, INC, DEC, AND,
+/// OR, XOR, EXCH), the old value to Rd.
+fn atomic(op: *Op, in: *const Instr, name: []const u8, o: []const Operand) Error!void {
+    const global_ = eql(name, "ATOMG");
+    try count(in, if (global_) 4 else 3);
+    const ops = [_][]const u8{ "ADD", "MIN", "MAX", "INC", "DEC", "AND", "OR", "XOR", "EXCH" };
+    op.kind = if (global_) .atomg else .atoms;
+    op.sub = try cmpOf(in, &ops);
+    op.signed = in.has("S32");
+    if (in.has("64") or in.has("S64") or in.has("128")) return error.Unsupported;
+    var k: usize = 0;
+    if (global_) {
+        op.d[1] = try dstOf(o[0]);
+        k = 1;
+    }
+    op.d[0] = try dstOf(o[k]);
+    if (o[k + 1] != .addr) return error.Syntax;
+    const ad = o[k + 1].addr;
+    if (global_ != ad.wide or (!global_ and ad.desc != null)) return error.Unsupported;
+    op.mem = .{ .base = .{ .kind = .gpr, .n = ad.reg }, .wide = ad.wide, .offset = ad.offset };
+    op.s[0] = try srcOf(o[k + 2], .int);
+    op.size = 4;
+    op.lsu = true;
 }
 
 fn memory(op: *Op, in: *const Instr, name: []const u8, o: []const Operand) Error!void {
@@ -2253,6 +2284,7 @@ fn lane(c: *Ctx, wi: u32, t: u32, op: *const Op) Error!void {
             if (op.size == 8) put64(c, wi, t, d, v) else put(c, wi, t, d, @truncate(v));
         },
         .ldg, .stg, .ldl, .stl, .lds, .sts => try access(c, wi, t, op),
+        .atomg, .atoms => try atomicAccess(c, wi, t, op),
         else => return error.Unsupported,
     }
 }
@@ -2354,6 +2386,45 @@ fn access(c: *Ctx, wi: u32, t: u32, op: *const Op) Error!void {
             std.mem.writeInt(u32, bytes[k * 4 ..][0..4], c.w.regs[t][r], .little);
         }
     }
+}
+
+/// An atomic: the word read, the operation, the word written, the old value
+/// to Rd (and true to ATOMG's predicate). Lanes run one after another, so
+/// each sees the ones before it.
+fn atomicAccess(c: *Ctx, wi: u32, t: u32, op: *const Op) Error!void {
+    const b = op.mem.base;
+    const base: u64 = if (op.mem.wide) raw64(c, wi, t, b) else raw32(c, wi, t, b);
+    const off: u64 = @bitCast(@as(i64, op.mem.offset));
+    const bytes: *[4]u8 = if (op.kind == .atomg) blk: {
+        const va = base +% off;
+        if (va % 4 != 0) return fault(c, t, va);
+        const x = c.mem.find(va, 4) orelse return fault(c, t, va);
+        c.stats.global_read += 4;
+        c.stats.global_written += 4;
+        break :blk x[0..4];
+    } else blk: {
+        const a = (base +% off) & 0xffff_ffff;
+        if (a % 4 != 0 or a + 4 > c.l.shared_bytes) return fault(c, t, a);
+        break :blk c.w.shared[@intCast(a)..][0..4];
+    };
+    const old = std.mem.readInt(u32, bytes, .little);
+    const v = raw32(c, wi, t, op.s[0]);
+    const so: i32 = @bitCast(old);
+    const sv: i32 = @bitCast(v);
+    const new: u32 = switch (op.sub) {
+        0 => old +% v,
+        1 => if (op.signed) @bitCast(@min(so, sv)) else @min(old, v),
+        2 => if (op.signed) @bitCast(@max(so, sv)) else @max(old, v),
+        3 => if (old >= v) 0 else old + 1,
+        4 => if (old == 0 or old > v) v else old - 1,
+        5 => old & v,
+        6 => old | v,
+        7 => old ^ v,
+        else => v,
+    };
+    std.mem.writeInt(u32, bytes, new, .little);
+    put(c, wi, t, op.d[0], old);
+    if (op.kind == .atomg) put(c, wi, t, op.d[1], 1);
 }
 
 // ── Warp-collective instructions ────────────────────────────────────────────
@@ -2752,6 +2823,77 @@ test "the hazard checker: a stall cut short, a missing wait, a write over a pend
     defer test_work.strict = false;
     try testing.expectError(error.Hazard, runText(ok, &l, &regions));
     try testing.expectEqual(@as(u32, 5), test_work.trap.need);
+}
+
+test "FRND's roundings and the atomics: scheduled by sm120_asm, run strict" {
+    var out = [_]u32{0} ** 256;
+    var counters = [_]u32{ 0, 0xffff_ffff, 0, 0xeeee_eeee, 0, 0 };
+    const regions = [_]Region{
+        .{ .va = 0x6000, .bytes = std.mem.sliceAsBytes(&out) },
+        .{ .va = 0x7000, .bytes = std.mem.sliceAsBytes(&counters) },
+    };
+    var cb: [qmd.CBUF0_WORDS]u32 = undefined;
+    const p = [_]u64{ 0x6000, 0x7000 };
+    var l = try launchOf(&cb, .{ 64, 1, 1 }, std.mem.asBytes(&p));
+    l.shared_bytes = 0x400 + 16;
+    // thread t: x = (t - 32) * 0.75 floored, ceiled, truncated and rounded
+    // to even into out[4t..]; a global add of 1, a min and a max of t, an
+    // exchange; a shared add of t and a shared signed max of 10 - t
+    // (thread 0 sets the shared words first), which thread 0 stores
+    const text =
+        \\S2R R0, SR_TID.X
+        \\LDC.64 R2, c[0x0][0x380]
+        \\LDC.64 R4, c[0x0][0x388]
+        \\LDCU.64 UR4, c[0x0][0x358]
+        \\ISETP.NE.AND P0, PT, R0, RZ, PT
+        \\MOV R24, RZ
+        \\MOV R25, 0x80000000
+        \\@!P0 STS.64 [RZ+0x400], R24
+        \\BAR.SYNC.DEFER_BLOCKING 0x0
+        \\IADD R6, R0, -0x20
+        \\I2FP.F32.S32 R6, R6
+        \\FMUL R6, R6, 0.75
+        \\FRND.FLOOR R8, R6
+        \\FRND.CEIL R9, R6
+        \\FRND.TRUNC R10, R6
+        \\FRND R11, R6
+        \\IMAD.WIDE.U32 R12, R0, 0x10, R2
+        \\STG.E.128 desc[UR4][R12.64], R8
+        \\MOV R14, 0x1
+        \\ATOMG.E.ADD.STRONG.GPU PT, R15, desc[UR4][R4.64], R14
+        \\ATOMG.E.MIN.STRONG.GPU PT, R16, desc[UR4][R4.64+0x4], R0
+        \\ATOMG.E.MAX.STRONG.GPU PT, R17, desc[UR4][R4.64+0x8], R0
+        \\ATOMG.E.EXCH.STRONG.GPU PT, R18, desc[UR4][R4.64+0xc], R0
+        \\ATOMS.ADD R19, [RZ+0x400], R0
+        \\IADD R20, -R0, 0xa
+        \\ATOMS.MAX.S32 R21, [RZ+0x404], R20
+        \\BAR.SYNC.DEFER_BLOCKING 0x0
+        \\LDS.64 R22, [RZ+0x400]
+        \\@P0 EXIT
+        \\STG.E.64 desc[UR4][R4.64+0x10], R22
+        \\EXIT
+    ;
+    var code: [512]u64 = undefined;
+    const k = try sm120_asm.assemble(text, &code, &test_asm);
+    try testing.expect(k.scheduled);
+    try loadAssembled(&test_work, &test_asm, k);
+    test_work.strict = true;
+    defer test_work.strict = false;
+    _ = try runLoaded(&l, &regions);
+    for (0..64) |t| {
+        const x = @as(f32, @floatFromInt(@as(i32, @intCast(t)) - 32)) * 0.75;
+        const even = if (@abs(x - @trunc(x)) == 0.5) 2.0 * @round(x / 2.0) else @round(x);
+        try testing.expectEqual(@floor(x), @as(f32, @bitCast(out[4 * t])));
+        try testing.expectEqual(@ceil(x), @as(f32, @bitCast(out[4 * t + 1])));
+        try testing.expectEqual(@trunc(x), @as(f32, @bitCast(out[4 * t + 2])));
+        try testing.expectEqual(even, @as(f32, @bitCast(out[4 * t + 3])));
+    }
+    try testing.expectEqual(@as(u32, 64), counters[0]);
+    try testing.expectEqual(@as(u32, 0), counters[1]);
+    try testing.expectEqual(@as(u32, 63), counters[2]);
+    try testing.expect(counters[3] < 64); // (some thread's, the last to run)
+    try testing.expectEqual(@as(u32, 63 * 64 / 2), counters[4]);
+    try testing.expectEqual(@as(u32, 10), counters[5]);
 }
 
 test "a launch the GPU would not take" {

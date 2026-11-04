@@ -265,6 +265,11 @@ pub fn usesOf(in: *const sm120.Instr) Error!Uses {
     } else if (eql(op, "STG") or eql(op, "STL") or eql(op, "STS")) {
         u.decoupled = true;
         regs(&u, in, 0, decoupledCats(.decoupled_agu));
+    } else if (eql(op, "ATOMG") or eql(op, "ATOMS")) {
+        // (an atomic is a load and a store: NAK's Atom, decoupled_agu;
+        // ATOMG writes its predicate and its old value)
+        u.decoupled = true;
+        regs(&u, in, if (eql(op, "ATOMG")) 2 else 1, decoupledCats(.decoupled_agu));
     } else if (eql(op, "SHFL")) {
         u.decoupled = true;
         regs(&u, in, 2, decoupledCats(.decoupled_agu));
@@ -320,7 +325,7 @@ pub fn usesOf(in: *const sm120.Instr) Error!Uses {
         regs(&u, in, 1, warp(.alu, .coupled));
         for (u.dst[0..u.n_dst]) |*d| d.cat = r(.disp_64);
     } else if (eql(op, "MUFU") or eql(op, "POPC") or eql(op, "FLO") or eql(op, "BREV") or eql(op, "FCHK") or
-        eql(op, "F2I") or eql(op, "I2F") or eql(op, "F2F"))
+        eql(op, "F2I") or eql(op, "I2F") or eql(op, "F2F") or eql(op, "FRND"))
     {
         u.decoupled = true;
         regs(&u, in, 1, decoupledCats(.decoupled));

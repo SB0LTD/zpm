@@ -9,6 +9,7 @@ text into exactly the words next to it.
 
     python tools/gen_sm120_vectors.py OUT.txt KERNELS.ptx...
     python tools/gen_sm120_vectors.py --raw src/nvidia/testdata/sm120_raw.txt
+    python tools/gen_sm120_vectors.py --raw-kir src/nvidia/testdata/sm120_kir_raw.txt
 
 (src/nvidia/sm120_vectors.txt is made from every file in
 src/nvidia/testdata/, Galaxy's probe kernels first:
@@ -295,11 +296,72 @@ def raw(out_path, nvdisasm):
     print(f"{out_path}: {len(out) - 3} words")
 
 
+# ── The forms KIR's sm_120 backend added ───────────────────────────────────
+#
+# FRND (cvt.rmi/rpi/rzi/rni.f32.f32) and the 32-bit atomics (atom.global,
+# atom.shared), from ptxas's words for them (CUDA 13.4) with their fields
+# set to each value nvdisasm names; written to
+# src/nvidia/testdata/sm120_kir_raw.txt by --raw-kir.
+
+def kir_words():
+    out = []
+    # ptxas's words, control fields and all
+    out += [
+        (0x0000000A00087307, 0x008FE20000205000),  # FRND.FLOOR R8, R10
+        (0x0000000A00097307, 0x000E620000209000),  # FRND.CEIL R9, R10
+        (0x0000000A000B7307, 0x000FE2000020D000),  # FRND.TRUNC R11, R10
+        (0x0000000A000C7307, 0x000E620000201000),  # FRND R12, R10
+        (0x0000000A000D7307, 0x000EA20000215000),  # FRND.FTZ.FLOOR R13, R10
+        (0x80000007080B89A8, 0x01056200081EF106),  # @!P0 ATOMG.E.ADD.STRONG.GPU PT, R11, desc[UR6][R8.64], R7
+        (0x80000007040879A8, 0x004EA800089EF106),  # ATOMG.E.MIN.STRONG.GPU
+        (0x80000407040979A8, 0x000EA800091EF106),  # ATOMG.E.MAX.STRONG.GPU (+0x4)
+        (0x80000807040A79A8, 0x000EE8000C1EF106),  # ATOMG.E.EXCH.STRONG.GPU (+0x8)
+        (0x80000C07040D79A8, 0x002EE200089EF306),  # ATOMG.E.MIN.S32.STRONG.GPU (+0xc)
+        (0x80001007040C79A8, 0x000F2200091EF306),  # ATOMG.E.MAX.S32.STRONG.GPU (+0x10)
+        (0x00000007000F738C, 0x000E280000000000),  # ATOMS.ADD R15, [R0], R7
+        (0x0000040F000F738C, 0x001E280000800000),  # ATOMS.MIN R15, [R0+0x4], R15
+        (0x0000080F0011738C, 0x001E280001000200),  # ATOMS.MAX.S32 R17, [R0+0x8], R15
+        (0x00000C110011738C, 0x001F220004000000),  # ATOMS.EXCH R17, [R0+0xc], R17
+    ]
+    atomg = (0x80000007080B79A8, 0x00000000081EF106 | CTL)
+    atoms = (0x00000007000F738C, CTL)
+    frnd = (0x0000000A00087307, 0x0000000000205000 | CTL)
+    for v in range(9):
+        out += [field(atomg, 87, 4, v), field(atoms, 87, 4, v)]
+    out += [field(atomg, 73, 3, 1), field(atoms, 73, 3, 1), field(atomg, 81, 3, 0)]
+    out += [field(atomg, 40, 23, 0x7FFFF0), field(atoms, 40, 24, 0xFFFFF0), field(atoms, 40, 24, 0x7FFFFC)]
+    for v in range(4):
+        out.append(field(frnd, 78, 2, v))
+    out += [field(field(frnd, 9, 3, 4), 32, 32, 0x3FC00000), field(frnd, 80, 1, 1), field(field(frnd, 80, 1, 1), 78, 2, 3)]
+    return out
+
+
+def raw_kir(out_path, nvdisasm):
+    version = subprocess.run([nvdisasm, "--version"], capture_output=True, text=True).stdout.strip().splitlines()[-1]
+    words = kir_words()
+    texts = disasm_raw(nvdisasm, words)
+    out = [
+        "# FRND and the 32-bit atomics: ptxas's words and fields set, as nvdisasm -b SM120",
+        f"# prints them ({version}). Test data only, made by tools/gen_sm120_vectors.py --raw-kir.",
+        "# <hi>_<lo> <control> <disassembly>",
+    ]
+    for (lo, hi), t in zip(words, texts):
+        if t is None:
+            print(f"illegal: {hi:016x}_{lo:016x}", file=sys.stderr)
+            continue
+        out.append(f"{hi:016x}_{lo:016x} {control(hi)} {t}")
+    with open(out_path, "w", newline="\n") as f:
+        f.write("\n".join(out) + "\n")
+    print(f"{out_path}: {len(out) - 3} words")
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     if sys.argv[1] == "--raw":
         return raw(sys.argv[2], tool("nvdisasm"))
+    if sys.argv[1] == "--raw-kir":
+        return raw_kir(sys.argv[2], tool("nvdisasm"))
     ptxas, nvdisasm, cuobjdump = tool("ptxas"), tool("nvdisasm"), tool("cuobjdump")
     version = subprocess.run([ptxas, "--version"], capture_output=True, text=True).stdout.strip().splitlines()[-1]
     out = [
