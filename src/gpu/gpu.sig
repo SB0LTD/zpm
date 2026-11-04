@@ -15,6 +15,8 @@ pub const kir = @import("kir.sig");
 pub const device = @import("device.sig");
 pub const interp = @import("kir_interp.sig");
 pub const emu_device = @import("emu_device.sig");
+/// The RTX as a Device (Galaxy's driver or the emulated RTX), running kir_sm120.
+pub const nvidia_device = @import("nvidia_device.sig");
 
 // KIR
 pub const Ty = kir.Ty;
