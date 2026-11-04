@@ -749,3 +749,163 @@ test "LFM3-Audio's depthformer on the GPU (when its mmproj is here): projectStat
     caps.subgroup = 64;
     try depthAgainstCpu(caps, src, 0);
 }
+
+// ── locate: where the GPU parts from the CPU ────────────────────────────────
+
+/// The emulated GPU, running each dispatch alone and changing one word of
+/// one binding after every dispatch of one program: a kernel that
+/// computes wrong.
+const Corrupt = struct {
+    inner: gpu.Device,
+    code: u64 = 0,
+    binding: usize = 0,
+    word: usize = 0,
+    hits: usize = 0,
+
+    fn device(c: *Corrupt) gpu.Device {
+        return .{ .ctx = c, .vtable = &vtable, .caps = c.inner.caps };
+    }
+    const vtable = gpu.Device.VTable{ .alloc = alloc, .free = free, .import = import, .toDevice = toDevice, .fromDevice = fromDevice, .load = load, .unload = unload, .run = run, .wait = wait, .done = done, .lastRunNs = lastRunNs };
+    fn of(ctx: *anyopaque) *Corrupt {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn alloc(ctx: *anyopaque, bytes: u64, kind: gpu.Kind) ?gpu.Buffer {
+        return of(ctx).inner.vtable.alloc(of(ctx).inner.ctx, bytes, kind);
+    }
+    fn free(ctx: *anyopaque, b: gpu.Buffer) void {
+        of(ctx).inner.free(b);
+    }
+    fn import(ctx: *anyopaque, cpu: []u8) ?gpu.Buffer {
+        return of(ctx).inner.import(cpu);
+    }
+    fn toDevice(ctx: *anyopaque, b: gpu.Buffer, off: u64, len: u64) void {
+        of(ctx).inner.toDevice(b, off, len);
+    }
+    fn fromDevice(ctx: *anyopaque, b: gpu.Buffer, off: u64, len: u64) void {
+        of(ctx).inner.fromDevice(b, off, len);
+    }
+    fn load(ctx: *anyopaque, bin: *const gpu.Binary) gpu.Error!gpu.Program {
+        return of(ctx).inner.load(bin);
+    }
+    fn unload(ctx: *anyopaque, p: *const gpu.Program) void {
+        of(ctx).inner.unload(p);
+    }
+    fn run(ctx: *anyopaque, ds: []const gpu.Dispatch) gpu.Error!gpu.Fence {
+        const c = of(ctx);
+        var f: gpu.Fence = 0;
+        for (ds) |*d| {
+            f = try c.inner.run(d[0..1]);
+            try c.inner.wait(f, std.math.maxInt(u64));
+            if (d.prog.code.gpu == c.code) {
+                const b = d.buffers[c.binding];
+                c.inner.fromDevice(b, 0, b.bytes);
+                // (VRAM without a CPU view: emu_device's arena, from its VRAM_VA)
+                const bytes = if (b.cpu.len != 0) b.cpu else vram[@intCast(b.gpu - EMU_VRAM_VA)..][0..@intCast(b.bytes)];
+                // (a large change: a last-bit one can vanish in the next int8 quantization)
+                const v: *align(1) f32 = @ptrCast(bytes[c.word * 4 ..][0..4]);
+                v.* = v.* * 4 + 3;
+                c.inner.toDevice(b, 0, b.bytes);
+                c.hits += 1;
+            }
+        }
+        return f;
+    }
+    fn wait(ctx: *anyopaque, f: gpu.Fence, t: u64) gpu.Error!void {
+        return of(ctx).inner.wait(f, t);
+    }
+    fn done(ctx: *anyopaque, f: gpu.Fence) bool {
+        return of(ctx).inner.done(f);
+    }
+    fn lastRunNs(ctx: *anyopaque) u64 {
+        return of(ctx).inner.lastRunNs();
+    }
+};
+
+/// emu_device's VRAM_VA: where its discrete `.device` buffers start.
+const EMU_VRAM_VA: u64 = 0x2_0000_0000;
+
+fn sayLine(what: []const u8) void {
+    std.debug.print("  {s}\n", .{what});
+}
+
+fn cpuReference() Backend.CpuReference(LIMITS) {
+    return .{ .source = fixture.source(), .weights = &unpacked, .work = &cpu_work, .kv = &kv_cpu, .conv = &conv_cpu };
+}
+
+test "locate: no difference on a GPU that agrees; a kernel made wrong is found and named" {
+    try fixture.initialize();
+    const plan = &fixture.plan;
+    const prompt = [_]u32{ 1, 5, 2, 7, 3, 9, 4, 4, 11, 0, 6 };
+    var corrupt = Corrupt{ .inner = makeDevice(.unfused) };
+    var backend = try Backend.init(corrupt.device(), plan, &fixture.index, fixture.source(), .{ .max_batch = 16 }, &work);
+    defer backend.deinit();
+    std.debug.print("locate, nothing wrong:\n", .{});
+    try std.testing.expect((try backend.locate(LIMITS, cpuReference(), .{ .tokens = &prompt }, CONTEXT, 0, sayLine)) == null);
+    // the short convolution's output: layer 0's conv
+    corrupt.code = backend.k.conv.?.code.gpu;
+    corrupt.binding = 3;
+    corrupt.word = 7;
+    std.debug.print("locate, the conv kernel made wrong:\n", .{});
+    const w1 = (try backend.locate(LIMITS, cpuReference(), .{ .tokens = &prompt }, CONTEXT, 0, sayLine)).?;
+    try std.testing.expectEqual(@as(?u8, 0), w1.layer);
+    try std.testing.expectEqualStrings("conv", w1.kernel);
+    // a Q6_K matrix's output (8-token passes): layer 1's attn_v, the first Q6_K
+    corrupt.code = backend.k.q6k[7].?.code.gpu;
+    corrupt.binding = 4;
+    corrupt.word = 3;
+    std.debug.print("locate, the 8-token Q6_K matrix made wrong:\n", .{});
+    const w2 = (try backend.locate(LIMITS, cpuReference(), .{ .tokens = &prompt }, CONTEXT, 0, sayLine)).?;
+    try std.testing.expectEqual(@as(?u8, 1), w2.layer);
+    try std.testing.expectEqualStrings("matrix q6k", w2.kernel);
+    const t = &fixture.index.tensors[w2.tensor.?];
+    try std.testing.expectEqualStrings("blk.1.attn_v.weight", t.name[0..t.name_len]);
+    // attention (its combine's output), layer 1
+    corrupt.code = backend.k.combine.?.code.gpu;
+    corrupt.binding = 2;
+    corrupt.word = 130;
+    std.debug.print("locate, attention made wrong:\n", .{});
+    const w3 = (try backend.locate(LIMITS, cpuReference(), .{ .tokens = &prompt }, CONTEXT, 0, sayLine)).?;
+    try std.testing.expectEqual(@as(?u8, 1), w3.layer);
+    try std.testing.expectEqualStrings("attention (scores, softmax, values, combine)", w3.kernel);
+    // the logits' matrix only (the last dispatch): every layer agrees
+    corrupt.code = 0;
+    try std.testing.expect(corrupt.hits > 0);
+}
+
+test "locate on discrete memory: VRAM without CPU views read back through the copy kernel; a kernel made wrong is found" {
+    try fixture.initialize();
+    const plan = &fixture.plan;
+    const prompt = [_]u32{ 1, 5, 2, 7, 3, 9, 4, 4, 11, 0, 6 };
+    var corrupt = Corrupt{ .inner = makeDevice(.discrete) };
+    var backend = try Backend.init(corrupt.device(), plan, &fixture.index, fixture.source(), .{ .max_batch = 16 }, &work);
+    defer backend.deinit();
+    try std.testing.expect(backend.s.hidden.cpu.len == 0 and backend.weights.cpu.len == 0);
+    std.debug.print("locate (discrete), nothing wrong:\n", .{});
+    try std.testing.expect((try backend.locate(LIMITS, cpuReference(), .{ .tokens = &prompt }, CONTEXT, 0, sayLine)) == null);
+    corrupt.code = backend.k.q6k[7].?.code.gpu;
+    corrupt.binding = 4;
+    corrupt.word = 3;
+    std.debug.print("locate (discrete), the 8-token Q6_K matrix made wrong:\n", .{});
+    const w = (try backend.locate(LIMITS, cpuReference(), .{ .tokens = &prompt }, CONTEXT, 0, sayLine)).?;
+    try std.testing.expectEqual(@as(?u8, 1), w.layer);
+    try std.testing.expectEqualStrings("matrix q6k", w.kernel);
+    corrupt.code = backend.k.conv.?.code.gpu;
+    corrupt.binding = 3;
+    corrupt.word = 7;
+    std.debug.print("locate (discrete), the conv kernel made wrong:\n", .{});
+    const w2 = (try backend.locate(LIMITS, cpuReference(), .{ .tokens = &prompt }, CONTEXT, 0, sayLine)).?;
+    try std.testing.expectEqual(@as(?u8, 0), w2.layer);
+    try std.testing.expectEqualStrings("conv", w2.kernel);
+    corrupt.code = 0;
+}
+
+test "exact_sqrt: every fsqrt and fdiv expanded in KIR before the backend, the CPU's bits still" {
+    try fixture.initialize();
+    const plan = &fixture.plan;
+    const prompt = [_]u32{ 1, 5, 2, 7, 3, 9, 4, 4, 11, 0, 6 };
+    inline for (.{ Device.ideal, Device.unfused }) |which| {
+        var backend = try Backend.init(makeDevice(which), plan, &fixture.index, fixture.source(), .{ .max_batch = 16, .exact_sqrt = true }, &work);
+        defer backend.deinit();
+        try std.testing.expect((try backend.locate(LIMITS, cpuReference(), .{ .tokens = &prompt }, CONTEXT, 0, sayLine)) == null);
+    }
+}
