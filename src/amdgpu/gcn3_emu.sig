@@ -42,7 +42,7 @@ const op = gcn3.op;
 pub const LANES = 64;
 pub const MAX_WAVES = 16;
 pub const LDS_BYTES = 65536;
-pub const MAX_CODE = 8192;
+pub const MAX_CODE = 65536;
 
 pub const Error = error{
     BadInstruction,
@@ -174,7 +174,8 @@ pub const Work = struct {
 
 /// Decode the kernel and check its registers fit its counts.
 pub fn load(w: *Work, k: *const gcn3_asm.Kernel) Error!void {
-    if (k.code.len > MAX_CODE) return error.BadDispatch;
+    w.err_pc = std.math.maxInt(@TypeOf(w.err_pc));
+    if (k.code.len > MAX_CODE) return w.fail(error.BadDispatch, "{d} code dwords (at most {d})", .{ k.code.len, MAX_CODE });
     @memset(w.starts[0..k.code.len], false);
     w.ncode = k.code.len;
     const vlimit = k.config.vgprs();
@@ -212,11 +213,11 @@ pub fn run(w: *Work, mem: *const Memory, d: *const Dispatch, stats: *Stats) Erro
     const k = d.kernel;
     try load(w, k);
     const cfg = &k.config;
-    if (d.user_sgprs.len != cfg.userSgprCount()) return error.BadDispatch;
+    if (d.user_sgprs.len != cfg.userSgprCount()) return w.fail(error.BadDispatch, "{d} user SGPRs given, the kernel takes {d}", .{ d.user_sgprs.len, cfg.userSgprCount() });
     const wg = k.workgroup_size;
     const lanes_per_group = @as(u32, wg[0]) * wg[1] * wg[2];
     const nwaves = (lanes_per_group + LANES - 1) / LANES;
-    if (nwaves > MAX_WAVES or nwaves == 0) return error.BadDispatch;
+    if (nwaves > MAX_WAVES or nwaves == 0) return w.fail(error.BadDispatch, "{d} waves a workgroup (1 to {d})", .{ nwaves, MAX_WAVES });
     w.nwaves = nwaves;
     w.lds_limit = @intCast(@min(LDS_BYTES, (cfg.group_segment_bytes + 511) / 512 * 512));
     w.steps = 0;

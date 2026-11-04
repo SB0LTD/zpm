@@ -343,6 +343,12 @@ fn floatOps() !void {
         try checkOp(withImm(c, fb(1.5), .rri));
         try checkOp(withImm(c, fb(-2.0), .rir));
         try checkOp(withImm(c, 0x80000000, .rri));
+        // (fmin and fmax against a constant: +-0, the infinities, a
+        // denormal, a NaN, a literal)
+        for ([_]u32{ 0, 0x80000000, 0x7f800000, 0xff800000, 1, 0x80000001, 0x7fc00000, fb(3.7), fb(-1e30) }) |x| {
+            try checkOp(withImm(c, x, .rri));
+            try checkOp(withImm(c, x, .rir));
+        }
     }
     try checkOp(.{ .name = "fmad", .op = .fmad, .ty = .f32, .ta = .f32, .tb = .f32, .tc = .f32, .nc = 1, .dst = .f32, .pool = &floats, .how = .nan_any });
     try checkOp(.{ .name = "ffma", .op = .ffma, .ty = .f32, .ta = .f32, .tb = .f32, .tc = .f32, .nc = 1, .dst = .f32, .pool = &floats, .how = .nan_any });
@@ -736,6 +742,51 @@ test "flow: a ret inside a loop, brk in an else, a predicate carried round the l
     }
     k.endloop();
     k.store(.u32, kir.global(o, 32), r(k.op2(.shl, .u32, r(t), u(2))), r(acc));
+    var out = zeros(128 * 4);
+    _ = try both(&k, .{ 1, 1, 1 }, &.{&out}, &.{});
+}
+
+test "flow: lanes leaving the loop from inside ifs (cont in a then-part with an else, two ifs deep, brk and cont in one if; predicates from before a lane left)" {
+    var k = newKernel("flow3", .{ 128, 1, 1 });
+    const o = k.binding();
+    const t = k.tid(0);
+    const acc = k.mov(.u32, u(0));
+    const n = k.mov(.u32, u(0));
+    const low = k.cmp(.u32, .lt, r(k.op2(.@"and", .u32, r(t), u(3))), u(2)); // (a compare from before the loop)
+    k.loop();
+    {
+        k.set(n, .iadd, r(n), u(1), no);
+        k.brk(r(k.cmp(.u32, .gt, r(n), u(12))));
+        const odd = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(k.op2(.iadd, .u32, r(n), r(t))), u(1))), u(0));
+        // a cont in the then-part: those lanes may not run the else-part
+        k.ifp(r(odd));
+        k.set(acc, .iadd, r(acc), u(1), no);
+        k.cont(r(k.cmp(.u32, .eq, r(k.op2(.@"and", .u32, r(t), u(7))), u(1))));
+        k.set(acc, .iadd, r(acc), u(10), no);
+        k.els();
+        k.set(acc, .iadd, r(acc), u(100), no);
+        k.endif();
+        // two ifs deep: a cont, then a brk, the lanes left out of both endifs
+        const c5 = k.cmp(.u32, .lt, r(k.op2(.@"and", .u32, r(t), u(15))), u(9));
+        k.ifp(r(c5));
+        k.set(acc, .imul, r(acc), u(3), no);
+        k.ifp(r(k.cmp(.u32, .gt, r(n), u(2))));
+        k.cont(r(k.cmp(.u32, .eq, r(k.op2(.@"and", .u32, r(t), u(3))), u(2))));
+        k.set(acc, .iadd, r(acc), u(7), no);
+        k.brk(r(k.cmp(.u32, .gt, r(n), r(k.op2(.@"and", .u32, r(t), u(31))))));
+        k.set(acc, .iadd, r(acc), u(1000), no);
+        k.endif();
+        // c5 after a lane left: no longer only active lanes
+        k.cont(r(c5));
+        k.endif();
+        k.set(acc, .iadd, r(acc), u(10000), no);
+        // a predicate from before the loop, after lanes left in it
+        k.brk(r(k.op2(.pand, .pred, r(low), r(k.cmp(.u32, .ge, r(n), u(4))))));
+    }
+    k.endloop();
+    // the lanes that broke out, by vote
+    const any = k.vote(.any, r(k.cmp(.u32, .gt, r(acc), u(50000))));
+    k.store(.u32, kir.global(o, 32), r(k.op2(.shl, .u32, r(t), u(2))), r(k.op2(.iadd, .u32, r(acc), r(k.sel(.u32, r(any), u(1 << 30), u(0))))));
     var out = zeros(128 * 4);
     _ = try both(&k, .{ 1, 1, 1 }, &.{&out}, &.{});
 }

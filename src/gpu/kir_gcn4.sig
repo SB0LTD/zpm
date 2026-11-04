@@ -85,6 +85,8 @@ pub const Info = struct {
     gsize_at: u16 = 0xffff,
     instructions: u32 = 0,
     shared_bytes: u32 = 0,
+    /// predicates that lived in VGPRs (more were live than the SGPRs hold)
+    spilled_preds: u32 = 0,
 
     pub fn toExtra(i: Info) [16]u32 {
         var e = [_]u32{0} ** 16;
@@ -95,6 +97,7 @@ pub const Info = struct {
         e[4] = i.kernarg_dwords;
         e[5] = i.gsize_at;
         e[6] = i.shared_bytes;
+        e[7] = i.spilled_preds;
         e[15] = MAGIC;
         return e;
     }
@@ -111,6 +114,7 @@ pub const Info = struct {
             .kernarg_dwords = @intCast(e[4]),
             .gsize_at = @intCast(e[5]),
             .shared_bytes = e[6],
+            .spilled_preds = e[7],
         };
     }
 
@@ -162,10 +166,11 @@ const MAGIC: u32 = 0x6763_6e34; // "gcn4"
 
 // ── Working storage ─────────────────────────────────────────────────────────
 
-const LocKind = enum(u8) { none, vgpr, sgpr, konst, mask };
+const LocKind = enum(u8) { none, vgpr, sgpr, konst, mask, pvgpr };
 /// Where a KIR register lives: a VGPR (index), an SGPR (operand code), an
-/// inline or literal constant (its bits), or a lane mask (an SGPR pair's
-/// first code).
+/// inline or literal constant (its bits), a lane mask (an SGPR pair's
+/// first code), or a lane mask spilled to a VGPR (0 or 1 per lane: when
+/// more predicates are live than the SGPRs hold).
 const Loc = struct { kind: LocKind = .none, x: u32 = 0 };
 
 const FrameKind = enum(u8) { if_then, if_else, loop };
@@ -179,6 +184,14 @@ const Frame = struct {
     l_latch: u16 = 0,
     has_else: bool = false,
     has_cont: bool = false,
+    /// if: lanes leave the innermost loop from inside (bit 0 cont, bit 1
+    /// brk), in the then-part and in either part; the else and the endif
+    /// take them out of the save mask then (the brk and cont themselves
+    /// leave the save mask alone)
+    then_drops: u2 = 0,
+    drops: u2 = 0,
+    /// the innermost loop's break pair (cont = + 2), when it drops lanes
+    loop_pair: u16 = 0,
 };
 
 /// A machine instruction, and the label it branches to (0xffff: none).
@@ -220,7 +233,10 @@ pub const Work = struct {
     vlen: [MAX_VREGS]u8 = undefined,
     depth: [MAX_KIR]u8 = undefined,
     match: [MAX_KIR]u32 = undefined,
+    /// extendLoops: the region (if arm, else arm, inner loop) of a
+    /// register's def in this iteration, and which regions are open
     dom: [MAX_VREGS]u16 = undefined,
+    region_open: [MAX_KIR]bool = undefined,
     loops_s: [MAX_LOOPS]u32 = undefined,
     loops_e: [MAX_LOOPS]u32 = undefined,
     nloops: usize = 0,
@@ -256,6 +272,10 @@ pub const Work = struct {
     vtmp_at: u16 = 0,
     vbase0: u16 = 0,
     vgpr_end: u16 = 0,
+    /// Predicates that did not fit the SGPRs and live in VGPRs.
+    spilled_preds: u32 = 0,
+    /// Machine instructions each KIR op lowered to (waits not counted).
+    mi_by_op: [256]u32 = undefined,
     uses_lds: bool = false,
     // lowering
     frames: [MAX_DEPTH]Frame = undefined,
@@ -270,11 +290,22 @@ pub const Work = struct {
     fn fail(w: *Work, e: Error, comptime fmt: []const u8, args: anytype) Error {
         const s = std.fmt.bufPrint(&w.diag_buf, fmt, args) catch w.diag_buf[0..0];
         w.diag_len = s.len;
+        @memcpy(last_diag_buf[0..s.len], s);
+        last_diag_len = s.len;
         return e;
     }
 };
 
 pub const WORK_BYTES = @sizeOf(Work) + @alignOf(Work);
+
+var last_diag_buf: [256]u8 = undefined;
+var last_diag_len: usize = 0;
+
+/// The last failed compile's diagnostic, whichever Work it ran in (for
+/// callers that compile through device.compile and never see the Work).
+pub fn lastDiagnostic() []const u8 {
+    return last_diag_buf[0..last_diag_len];
+}
 
 /// Why the last compile failed, when the backend knows more than the error.
 pub fn diagnostic(w: *const Work) []const u8 {
@@ -477,20 +508,29 @@ fn extendLoops(w: *Work) Error!void {
     for (order[0..w.nloops]) |l| {
         const s = w.loops_s[l];
         const e = w.loops_e[l];
-        const body_depth = w.depth[s] + 1;
+        // A read is this iteration's value when a def before it, in a
+        // region still open (the read's own region or one around it), wrote
+        // it: every lane reaching the read ran that def. Otherwise the value
+        // comes around the back edge (or from before the loop), and the
+        // register lives through the whole loop.
         @memset(w.dom[0..nv], 0);
+        var stack: [MAX_DEPTH + 2]u16 = undefined;
+        var sp: usize = 1;
+        var next_region: u16 = 1;
+        stack[0] = next_region;
+        w.region_open[next_region] = true;
         const Ctx = struct {
             w: *Work,
-            i: u32,
             s: u32,
             e: u32,
-            top: bool,
+            region: u16,
             fn ref(c: @This(), v: V, write: bool) void {
                 const x = @intFromEnum(v);
                 const ww = c.w;
+                const covered = ww.dom[x] != 0 and ww.region_open[ww.dom[x]];
                 var extend = ww.first[x] < c.s or ww.last[x] > c.e;
-                if (!write and ww.dom[x] == 0) extend = true;
-                if (write and c.top) ww.dom[x] = 1;
+                if (!write and !covered) extend = true;
+                if (write and !covered) ww.dom[x] = c.region;
                 if (extend) {
                     ww.first[x] = @min(ww.first[x], c.s);
                     ww.last[x] = @max(ww.last[x], c.e);
@@ -500,10 +540,17 @@ fn extendLoops(w: *Work) Error!void {
         var i = s + 1;
         while (i < e) : (i += 1) {
             const in = w.k.insts[i];
-            const top = w.depth[i] == body_depth;
+            switch (in.op) {
+                .@"else", .endif, .endloop => {
+                    if (sp <= 1) return w.fail(error.Unbalanced, "unbalanced flow at instruction {d}", .{i});
+                    sp -= 1;
+                    w.region_open[stack[sp]] = false;
+                },
+                else => {},
+            }
             // reads first, then the write (an instruction reading its own
             // destination reads the old value)
-            const c = Ctx{ .w = w, .i = i, .s = s, .e = e, .top = top };
+            const c = Ctx{ .w = w, .s = s, .e = e, .region = stack[sp - 1] };
             const RO = struct {
                 fn reads(cc: Ctx, v: V, write: bool) void {
                     if (!write) cc.ref(v, false);
@@ -514,7 +561,18 @@ fn extendLoops(w: *Work) Error!void {
             };
             eachReg(in, c, RO.reads);
             eachReg(in, c, RO.writes);
+            switch (in.op) {
+                .@"if", .@"else", .loop => {
+                    if (sp == stack.len or next_region + 1 >= MAX_KIR) return w.fail(error.TooComplex, "flow nested too deep at instruction {d}", .{i});
+                    next_region += 1;
+                    stack[sp] = next_region;
+                    sp += 1;
+                    w.region_open[next_region] = true;
+                },
+                else => {},
+            }
         }
+        w.region_open[stack[0]] = false;
     }
     // a vector lives as long as any of its registers
     for (0..nv) |x| {
@@ -586,6 +644,7 @@ fn allocate(w: *Work) Error!void {
     var pfree = [_]bool{true} ** 64;
     var pbusy = [_]u32{0} ** 64;
     const npairs: usize = (gcn3.SGPRS - w.pred_at) / 2;
+    w.spilled_preds = 0;
     var vmax: u16 = w.vbase0;
     var smax: u16 = w.pred_at;
     var i: u32 = 0;
@@ -604,14 +663,20 @@ fn allocate(w: *Work) Error!void {
             if (w.loc[v].kind == .mask) {
                 const p = for (0..npairs) |pp| {
                     if (pfree[pp]) break pp;
-                } else return w.fail(error.TooManyRegs, "more than {d} predicates live at once", .{npairs});
-                pfree[p] = false;
-                pbusy[p] = last;
-                const code: u16 = w.pred_at + 2 * @as(u16, @intCast(p));
-                w.loc[v].x = code;
-                smax = @max(smax, code + 2);
-                continue;
+                } else null;
+                if (p) |pp| {
+                    pfree[pp] = false;
+                    pbusy[pp] = last;
+                    const code: u16 = w.pred_at + 2 * @as(u16, @intCast(pp));
+                    w.loc[v].x = code;
+                    smax = @max(smax, code + 2);
+                    continue;
+                }
+                // the pool is full: this one lives in a VGPR as 0/1
+                w.loc[v].kind = .pvgpr;
+                w.spilled_preds += 1;
             }
+            const kind = w.loc[v].kind;
             const len = w.vlen[v];
             var r: u16 = w.vbase0;
             const found = while (r + len <= 256) : (r += 1) {
@@ -628,7 +693,7 @@ fn allocate(w: *Work) Error!void {
             for (0..len) |j| {
                 vfree[r + j] = false;
                 vbusy[r + j] = last;
-                w.loc[v + j] = .{ .kind = .vgpr, .x = r + @as(u16, @intCast(j)) };
+                w.loc[v + j] = .{ .kind = kind, .x = r + @as(u16, @intCast(j)) };
             }
             vmax = @max(vmax, r + len);
         }
@@ -662,6 +727,13 @@ const Src = struct {
         return s.code < 128 or s.code == LIT;
     }
 };
+
+/// One operand an immediate (its bits) and the other, for a commutative op.
+fn constOperand(in: Inst) ?struct { bits: u32, other: Arg } {
+    if (in.b == .imm and in.a != .imm) return .{ .bits = in.b.imm, .other = in.a };
+    if (in.a == .imm and in.b != .imm) return .{ .bits = in.a.imm, .other = in.b };
+    return null;
+}
 
 fn immSrc(x: u32) Src {
     const si: i32 = @bitCast(x);
@@ -738,10 +810,22 @@ fn psrc(w: *Work, a: Arg) Error!u16 {
         .imm => |x| return if (x != 0) MINUS_ONE else ZERO,
         .reg => |v| {
             const l = locOf(w, v);
+            if (l.kind == .pvgpr) {
+                // back to a mask: lanes holding 1 (inactive lanes read 0,
+                // and every use is under EXEC)
+                const t = try tmpPair(w);
+                try emit(w, .{ .op = op("v_cmp_ne_u32"), .e64 = true, .sdst = t, .src = .{ 128, vg(@as(u16, @intCast(l.x))), 0 } });
+                return t;
+            }
             if (l.kind != .mask) return w.fail(error.BadOperand, "%{d} is not a predicate", .{@intFromEnum(v)});
             return @intCast(l.x);
         },
     }
+}
+
+/// A scratch pair (one `psrc` may have just made) that may be overwritten.
+fn isScratchPair(w: *const Work, p: u16) bool {
+    return p >= w.stmp_at and p < w.stmp_at + 2 * SCRATCH_PAIRS;
 }
 
 fn dstV(w: *Work, v: V) Error!u16 {
@@ -837,13 +921,19 @@ fn sop1(w: *Work, o: gcn3.Op, dst: u16, a: u16) Error!void {
 /// more than one write) a scratch pair merged in under EXEC by `predDone`.
 fn predDst(w: *Work, v: V) Error!u16 {
     const l = locOf(w, v);
+    if (l.kind == .pvgpr) return tmpPair(w);
     if (l.kind != .mask) return w.fail(error.BadOperand, "%{d} is not a predicate", .{@intFromEnum(v)});
     if (w.ndef[@intFromEnum(v)] > 1) return tmpPair(w);
     return @intCast(l.x);
 }
 
 fn predDone(w: *Work, v: V, t: u16) Error!void {
-    const p: u16 = @intCast(locOf(w, v).x);
+    const l = locOf(w, v);
+    if (l.kind == .pvgpr) {
+        // 0/1 into the active lanes (the others keep theirs: the merge)
+        return emit(w, .{ .op = op("v_cndmask_b32"), .e64 = true, .dst = vg(@as(u16, @intCast(l.x))), .src = .{ 128, 129, t } });
+    }
+    const p: u16 = @intCast(l.x);
     if (t == p) return;
     try sop2(w, op("s_and_b64"), t, t, EXEC);
     try sop2(w, op("s_andn2_b64"), p, p, EXEC);
@@ -855,6 +945,7 @@ fn predDone(w: *Work, v: V, t: u16) Error!void {
 fn lower(w: *Work) Error!void {
     const k = &w.k;
     w.nframes = 0;
+    @memset(&w.mi_by_op, 0);
     w.cur = 0;
     // the kernarg segment
     var off: u16 = 0;
@@ -890,7 +981,9 @@ fn lower(w: *Work) Error!void {
         w.cur = @intCast(i);
         w.ntv = 0;
         w.nts = 0;
+        const before = w.nmi;
         try lowerInst(w, in);
+        w.mi_by_op[@intFromEnum(in.op)] += @intCast(w.nmi - before);
     }
     if (w.nframes != 0) return error.Unbalanced;
     try emit(w, .{ .op = op("s_endpgm") });
@@ -929,10 +1022,12 @@ fn lowerInst(w: *Work, in: Inst) Error!void {
             if (in.ty == .pred) {
                 const d = try predDst(w, in.dst);
                 const c = try psrc(w, in.c);
-                const t1 = try tmpPair(w);
-                const t2 = try tmpPair(w);
-                try sop2(w, op("s_and_b64"), t1, c, try psrc(w, in.a));
-                try sop2(w, op("s_andn2_b64"), t2, try psrc(w, in.b), c);
+                const a = try psrc(w, in.a);
+                const t1 = if (isScratchPair(w, a)) a else try tmpPair(w);
+                try sop2(w, op("s_and_b64"), t1, c, a);
+                const b = try psrc(w, in.b);
+                const t2 = if (isScratchPair(w, b)) b else try tmpPair(w);
+                try sop2(w, op("s_andn2_b64"), t2, b, c);
                 try sop2(w, op("s_or_b64"), d, t1, t2);
                 return predDone(w, in.dst, d);
             }
@@ -1031,11 +1126,31 @@ fn lowerInst(w: *Work, in: Inst) Error!void {
             // one: min(a, b) and min(b, a) differ only for -0 and +0, and
             // their or (and) is KIR's -0 (+0)
             const d = try dstV(w, in.dst);
+            const o = if (in.op == .fmin) op("v_min_f32") else op("v_max_f32");
+            // against a constant there is no tie to break, but at +-0
+            if (constOperand(in)) |kc| {
+                const c = kc.bits;
+                const x = try src(w, kc.other);
+                const normal = c & 0x7f80_0000 != 0 and c & 0x7f80_0000 != 0x7f80_0000;
+                if (normal or (c & 0x7fff_ffff == 0x7f80_0000)) {
+                    // (a normal number or an infinity: equal means the same bits)
+                    return valu(w, o, d, &.{ immSrc(c), x }, .{ .comm = true });
+                }
+                if (in.op == .fmax and c == 0) {
+                    // max(a, +0): +0 for a <= 0 and NaN, so -0 becomes +0
+                    try valu(w, o, d, &.{ immSrc(0), x }, .{ .comm = true });
+                    return valu(w, op("v_max_i32"), d, &.{ immSrc(0), .{ .code = d } }, .{ .comm = true });
+                }
+                if (in.op == .fmin and c == 0x8000_0000) {
+                    // min(a, -0): -0 for a >= -0 and NaN, so +0 becomes -0
+                    try valu(w, o, d, &.{ immSrc(0x8000_0000), x }, .{ .comm = true });
+                    return valu(w, op("v_or_b32"), d, &.{ immSrc(0x8000_0000), .{ .code = d } }, .{ .comm = true });
+                }
+            }
             const a = try src(w, in.a);
             const b = try src(w, in.b);
             const t0 = try tmpV(w);
             const t1 = try tmpV(w);
-            const o = if (in.op == .fmin) op("v_min_f32") else op("v_max_f32");
             try valu(w, o, t0, &.{ a, b }, .{});
             try valu(w, o, t1, &.{ b, a }, .{});
             if (in.op == .fmin) {
@@ -1092,8 +1207,12 @@ fn lowerInst(w: *Work, in: Inst) Error!void {
         .shfl => try lowerShfl(w, in),
         .vote => {
             const d = try predDst(w, in.dst);
-            const t = try tmpPair(w);
-            try sop2(w, op("s_and_b64"), t, try psrc(w, in.a), EXEC);
+            const p = try psrc(w, in.a);
+            var t = p;
+            if (!predClean(w, in.a, w.cur)) {
+                t = try tmpPair(w);
+                try sop2(w, op("s_and_b64"), t, p, EXEC);
+            }
             if (in.aux == @intFromEnum(kir.Vote.any)) {
                 try emit(w, .{ .op = op("s_cmp_lg_u64"), .src = .{ t, ZERO, 0 } });
             } else {
@@ -1398,6 +1517,104 @@ fn innermostJoin(w: *const Work) ?u16 {
     };
 }
 
+fn innermostLoop(w: *Work) ?*Frame {
+    var ix = w.nframes;
+    while (ix > 0) {
+        ix -= 1;
+        if (w.frames[ix].kind == .loop) return &w.frames[ix];
+    }
+    return null;
+}
+
+/// exec = from & ~(the lanes that left the loop the way `which` says).
+fn dropLeft(w: *Work, f: *const Frame, which: u2, from: u16) Error!void {
+    var src_ = from;
+    if (which & 1 != 0) {
+        try sop2(w, op("s_andn2_b64"), EXEC, src_, f.loop_pair + 2);
+        src_ = EXEC;
+    }
+    if (which & 2 != 0) {
+        try sop2(w, op("s_andn2_b64"), EXEC, src_, f.loop_pair);
+        src_ = EXEC;
+    }
+    if (src_ != EXEC) try sop1(w, op("s_mov_b64"), EXEC, src_);
+}
+
+/// The brk and cont an if holds for its innermost loop (bit 0 cont, bit 1
+/// brk): in its then-part, and in either part.
+const Drops = struct { then: u2 = 0, all: u2 = 0 };
+
+fn ifDrops(w: *const Work, at: u32) Drops {
+    var r: Drops = .{};
+    var ifs: u32 = 0;
+    var loops: u32 = 0;
+    var in_else = false;
+    var i = at + 1;
+    while (i < w.k.n) : (i += 1) {
+        const in = w.k.insts[i];
+        switch (in.op) {
+            .@"if" => ifs += 1,
+            .@"else" => if (ifs == 0) {
+                in_else = true;
+            },
+            .endif => {
+                if (ifs == 0) break;
+                ifs -= 1;
+            },
+            .loop => loops += 1,
+            .endloop => loops -= 1,
+            .brk, .cont => if (loops == 0 and !(in.a == .imm and in.a.imm == 0)) {
+                const bit: u2 = if (in.op == .cont) 1 else 2;
+                r.all |= bit;
+                if (!in_else) r.then |= bit;
+            },
+            else => {},
+        }
+    }
+    return r;
+}
+
+/// A predicate whose inactive lanes are 0 at instruction `at` (so `p &
+/// exec` is `p`): written once by a compare (VOPC writes 0 for the lanes
+/// EXEC leaves out), or an and/or of such, with no lane gone from EXEC
+/// between the write and `at`; or one in a VGPR (read back by a compare).
+fn predClean(w: *const Work, a: Arg, at: u32) bool {
+    return predCleanDepth(w, a, at, 0);
+}
+
+fn predCleanDepth(w: *const Work, a: Arg, at: u32, depth: u32) bool {
+    if (a != .reg or depth > 4) return false;
+    const x = @intFromEnum(a.reg);
+    if (w.loc[x].kind == .pvgpr) return true;
+    if (w.ndef[x] != 1) return false;
+    const def = w.def_at[x];
+    if (def >= at) return false;
+    const in = w.k.insts[def];
+    switch (in.op) {
+        .icmp, .fcmp => {},
+        .pand, .por => if (!predCleanDepth(w, in.a, at, depth + 1) or !predCleanDepth(w, in.b, at, depth + 1)) return false,
+        else => return false,
+    }
+    // EXEC between the write and `at`: no lane may leave, and `at` may
+    // not be in an if the write is outside of
+    var d: i32 = 0;
+    var lo: i32 = 0;
+    var i = def + 1;
+    while (i < at) : (i += 1) {
+        switch (w.k.insts[i].op) {
+            .@"if" => d += 1,
+            .@"else" => if (d <= lo) return false,
+            .endif => {
+                d -= 1;
+                lo = @min(lo, d);
+            },
+            .brk, .cont, .ret, .loop, .endloop => return false,
+            else => {},
+        }
+    }
+    return d == lo;
+}
+
 /// Lanes `m` (an SGPR pair) leave every frame up to the innermost loop
 /// (brk, cont) or all frames (ret).
 fn leave(w: *Work, m: u16, to_loop: bool) Error!?*Frame {
@@ -1436,6 +1653,10 @@ fn lowerFlow(w: *Work, in: Inst) Error!void {
             if (w.nframes == MAX_DEPTH) return error.TooComplex;
             const has_else = w.k.insts[w.match[i]].op == .@"else";
             var f = Frame{ .kind = .if_then, .pair = framePair(w, w.nframes, 0), .has_else = has_else };
+            const dr = ifDrops(w, i);
+            f.then_drops = dr.then;
+            f.drops = dr.all;
+            if (f.drops != 0) f.loop_pair = (innermostLoop(w) orelse return error.Unbalanced).pair;
             f.l_end = try newLabel(w);
             if (has_else) f.l_else = try newLabel(w);
             try sop1(w, op("s_and_saveexec_b64"), f.pair, try psrc(w, in.a));
@@ -1447,15 +1668,19 @@ fn lowerFlow(w: *Work, in: Inst) Error!void {
             const f = &w.frames[w.nframes - 1];
             f.kind = .if_else;
             place(w, f.l_else);
-            // the lanes still here, of those the if had, that were not in the then-part
+            // the lanes still here, of those the if had, that were not in
+            // the then-part (nor left the loop from it)
             try sop2(w, op("s_andn2_b64"), EXEC, f.pair, EXEC);
+            try dropLeft(w, f, f.then_drops, EXEC);
             try emitBranch(w, op("s_cbranch_execz"), f.l_end);
         },
         .endif => {
             w.nframes -= 1;
             const f = w.frames[w.nframes];
             place(w, f.l_end);
-            try sop1(w, op("s_mov_b64"), EXEC, f.pair);
+            if (f.drops == 0) {
+                try sop1(w, op("s_mov_b64"), EXEC, f.pair);
+            } else try dropLeft(w, &f, f.drops, f.pair);
         },
         .loop => {
             if (w.nframes == MAX_DEPTH) return error.TooComplex;
@@ -1470,10 +1695,21 @@ fn lowerFlow(w: *Work, in: Inst) Error!void {
         },
         .brk, .cont => {
             if (in.a == .imm and in.a.imm == 0) return;
-            const t = try tmpPair(w);
-            try sop2(w, op("s_and_b64"), t, EXEC, try psrc(w, in.a));
-            const lp = (try leave(w, t, true)) orelse return error.Unbalanced;
-            try sop2(w, op("s_or_b64"), if (in.op == .brk) lp.pair else lp.pair + 2, if (in.op == .brk) lp.pair else lp.pair + 2, t);
+            const lp = innermostLoop(w) orelse return error.Unbalanced;
+            const m = if (in.op == .brk) lp.pair else lp.pair + 2;
+            if (in.a == .imm) {
+                // every lane here
+                try sop2(w, op("s_or_b64"), m, m, EXEC);
+                try sop1(w, op("s_mov_b64"), EXEC, ZERO);
+                return emitBranch(w, op("s_branch"), innermostJoin(w).?);
+            }
+            const p = try psrc(w, in.a);
+            var t = p;
+            if (!predClean(w, in.a, w.cur)) {
+                t = try tmpPair(w);
+                try sop2(w, op("s_and_b64"), t, EXEC, p);
+            }
+            try sop2(w, op("s_or_b64"), m, m, t);
             try sop2(w, op("s_andn2_b64"), EXEC, EXEC, t);
             try emitBranch(w, op("s_cbranch_execz"), innermostJoin(w).?);
         },
@@ -1790,6 +2026,7 @@ fn binary(w: *Work, out: []u8) Error!device.Binary {
         .gsize_at = w.gsize_at,
         .instructions = @intCast(w.nmi),
         .shared_bytes = w.k.shared_bytes,
+        .spilled_preds = w.spilled_preds,
     };
     w.stats.vgprs = w.vgpr_end;
     w.stats.sgprs = w.sgpr_end;
