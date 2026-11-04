@@ -314,14 +314,42 @@ pub fn Ast(comptime config: types.Config) type {
             expression: Span = .{},
             /// Identity sequence options.
             sequence: sequence.Options = .{},
+            /// SERIAL family: the owned sequence's AS type OID (0: none).
+            serial: u32 = 0,
+        };
+
+        /// ALTER SEQUENCE [IF EXISTS] name options (RESTART included).
+        pub const AlterSequence = struct {
+            if_exists: bool = false,
+            name: TableRef = .{},
+            options: sequence.Options = .{},
+        };
+
+        pub const ConstraintKind = enum { check, unique, primary };
+
+        /// A CHECK, UNIQUE or PRIMARY KEY constraint as written, at column
+        /// or table level. Column-level UNIQUE / PRIMARY KEY list their own
+        /// column. `expression` is the CHECK source text and `node` its parsed
+        /// root (statement pool) for naming.
+        pub const ConstraintDef = struct {
+            name: ?Ident = null,
+            kind: ConstraintKind = .check,
+            expression: Span = .{},
+            node: u16 = none,
+            columns: [config.columns]Ident = undefined,
+            column_count: usize = 0,
+            nulls_not_distinct: bool = false,
         };
 
         pub const CreateTable = struct {
             if_not_exists: bool = false,
             invalid_definition: bool = false,
+            schema: ?Ident = null,
             name: Ident = .{},
             columns: [config.columns]ColumnDef = undefined,
             count: usize = 0,
+            constraints: [config.table_constraints]ConstraintDef = undefined,
+            constraint_count: usize = 0,
         };
 
         pub const CreateSequence = struct {
@@ -330,7 +358,13 @@ pub fn Ast(comptime config: types.Config) type {
             options: sequence.Options = .{},
         };
 
-        pub const Drop = struct { name: Ident, if_exists: bool = false };
+        pub const Drop = struct { name: Ident, if_exists: bool = false, schema: ?Ident = null };
+
+        /// CREATE SCHEMA [IF NOT EXISTS] name.
+        pub const CreateSchema = struct { name: Ident = .{}, if_not_exists: bool = false };
+
+        /// DROP SCHEMA [IF EXISTS] name [CASCADE | RESTRICT].
+        pub const DropSchema = struct { name: Ident = .{}, if_exists: bool = false, cascade: bool = false };
 
         pub const Target = struct {
             expr: u16 = none,
@@ -359,6 +393,7 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const Insert = struct {
+            schema: ?Ident = null,
             table: Ident = .{},
             alias: ?Ident = null,
             explicit_columns: bool = false,
@@ -468,17 +503,26 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const Update = struct {
+            schema: ?Ident = null,
             table: Ident = .{},
             assignments: [config.columns]Assignment = undefined,
             count: usize = 0,
             where: u16 = none,
             returning: Returning = .{},
+            alias: ?Ident = null,
+            /// UPDATE ... FROM items: a query block (index into Pool.queries)
+            /// holding only the FROM list, or none.
+            from: u16 = none,
         };
 
         pub const Delete = struct {
+            schema: ?Ident = null,
             table: Ident = .{},
             where: u16 = none,
             returning: Returning = .{},
+            alias: ?Ident = null,
+            /// DELETE ... USING items (a FROM-list query block), or none.
+            using: u16 = none,
         };
 
         /// COPY t [(columns)] FROM STDIN | COPY t [(columns)] | (query) TO
@@ -491,6 +535,37 @@ pub fn Ast(comptime config: types.Config) type {
             query: ?Span = null,
             direction: CopyDirection = .from,
             options: CopyOptions = .{},
+        };
+
+        /// TRUNCATE [TABLE] [ONLY] name [, ...] [RESTART | CONTINUE IDENTITY]
+        /// [CASCADE | RESTRICT].
+        pub const Truncate = struct {
+            tables: [config.tables]TableRef = undefined,
+            count: usize = 0,
+            restart_identity: bool = false,
+        };
+
+        /// One ALTER TABLE action. Column-level CHECK / UNIQUE of an ADD
+        /// COLUMN follow it as add_constraint actions.
+        pub const AlterAction = union(enum) {
+            add_column: struct { column: ColumnDef, if_not_exists: bool = false },
+            drop_column: struct { name: Ident, if_exists: bool = false },
+            rename_column: struct { from: Ident, to: Ident },
+            set_default: struct { column: Ident, expression: Span },
+            drop_default: Ident,
+            set_not_null: Ident,
+            drop_not_null: Ident,
+            add_constraint: ConstraintDef,
+            drop_constraint: struct { name: Ident, if_exists: bool = false },
+            rename_table: Ident,
+        };
+
+        /// ALTER TABLE [IF EXISTS] [ONLY] name action [, ...] | RENAME ...
+        pub const AlterTable = struct {
+            if_exists: bool = false,
+            table: TableRef = .{},
+            actions: [config.columns]AlterAction = undefined,
+            count: usize = 0,
         };
 
         pub const Statement = union(enum) {
@@ -507,6 +582,11 @@ pub fn Ast(comptime config: types.Config) type {
             delete: Delete,
             control: Control,
             copy: Copy,
+            truncate: Truncate,
+            alter_table: AlterTable,
+            alter_sequence: AlterSequence,
+            create_schema: CreateSchema,
+            drop_schema: DropSchema,
         };
     };
 }

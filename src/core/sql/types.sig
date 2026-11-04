@@ -103,6 +103,13 @@ pub const Config = struct {
     /// COPY FROM: longest data row (text/CSV line or binary tuple) a codec
     /// carries across CopyData messages; longer rows are TextCapacity (54000).
     copy_line_bytes: usize = 8192,
+    /// Table-level constraints per table beyond NOT NULL and a single-column
+    /// PRIMARY KEY: CHECK, UNIQUE and composite PRIMARY KEY. More raise
+    /// ColumnCapacity (54000) and change nothing.
+    table_constraints: usize = 8,
+    /// User schemas (CREATE SCHEMA) beyond pg_catalog, public and
+    /// information_schema. More raise TableCapacity (54000).
+    schemas: usize = 4,
 };
 
 pub fn workRows(comptime config: Config) usize {
@@ -267,6 +274,16 @@ pub const Error = error{
     InvalidTimeZoneDisplacement,
     /// SQLSTATE 22026: a BIT(n) value does not have exactly n bits.
     StringDataLengthMismatch,
+    /// SQLSTATE 23514: a row fails a CHECK constraint.
+    CheckViolation,
+    /// SQLSTATE 42710: a constraint or schema name is already in use.
+    DuplicateObject,
+    /// SQLSTATE 42P16: invalid table definition (several primary keys).
+    InvalidTableDefinition,
+    /// SQLSTATE 3F000: a schema name does not exist.
+    UndefinedSchema,
+    /// SQLSTATE 42P06: CREATE SCHEMA of an existing name.
+    DuplicateSchema,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -545,7 +562,7 @@ pub fn typeFromOid(oid: u32) ?DataType {
 pub const DefaultKind = enum(u8) { none = 0, default = 1, identity_always = 2, identity_by_default = 3, generated = 4 };
 
 /// Statement kind of a completed (or described) statement.
-pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy };
+pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy, truncate, alter_table, alter_sequence, create_schema, drop_schema };
 
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;

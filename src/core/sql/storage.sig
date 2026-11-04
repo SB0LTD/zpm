@@ -180,6 +180,27 @@ pub fn Storage(comptime config: types.Config) type {
             buckets: [pow2(config.summary_groups * 2)]u32 = @splat(0),
         };
 
+        /// Per-table constraints beyond NOT NULL and a single-column PRIMARY
+        /// KEY (that one keeps Column.primary_key and the key index; a
+        /// `primary` entry with one column only records its name). CHECK keeps
+        /// its source text (bound per statement like a generation expression);
+        /// UNIQUE and composite PRIMARY KEY list their key columns and are
+        /// enforced by uniqueCheck over every version (no secondary index).
+        pub const constraint_capacity: usize = config.table_constraints;
+        pub const ConstraintKind = enum(u8) { check = 1, unique = 2, primary = 3 };
+        pub const Constraint = struct {
+            kind: ConstraintKind = .check,
+            name: V.Name = .{},
+            nulls_not_distinct: bool = false,
+            column_count: u8 = 0,
+            columns: [config.columns]u8 = @splat(0),
+            expression: V.Text = .{},
+
+            pub fn keyColumns(self: *const Constraint) []const u8 {
+                return self.columns[0..self.column_count];
+            }
+        };
+
         pub const Table = struct {
             live: bool = false,
             pending_create: bool = false,
@@ -189,6 +210,10 @@ pub fn Storage(comptime config: types.Config) type {
             name: V.Name = .{},
             column_count: usize = 0,
             columns: [config.columns]V.Column = @splat(.{}),
+            /// Schema OID (cat_namespaces); public unless created in a schema.
+            namespace: u32 = 2200,
+            constraint_count: usize = 0,
+            constraints: [constraint_capacity]Constraint = @splat(.{}),
             primary_column: ?usize = null,
             primary_directory: PrimaryDirectory = .{},
             /// Conservative strict non-NULL order over physical row slots.
@@ -224,6 +249,187 @@ pub fn Storage(comptime config: types.Config) type {
             return table.live and !table.pending_create and table.dead_csn == 0;
         }
 
+        /// The PRIMARY KEY constraint entry (named or composite), if any.
+        pub fn primaryConstraint(table: *const Table) ?usize {
+            for (table.constraints[0..table.constraint_count], 0..) |*constraint, index| {
+                if (constraint.kind == .primary) return index;
+            }
+            return null;
+        }
+
+        /// A table with a primary key owns the next OID for its index.
+        pub fn keyed(table: *const Table) bool {
+            return table.primary_column != null or primaryConstraint(table) != null;
+        }
+
+        /// OIDs a table definition owns: itself and its primary-key index.
+        pub fn oidWidth(table: *const Table) u32 {
+            return 1 + @as(u32, @intFromBool(keyed(table)));
+        }
+
+        /// Conservative hints recomputed from every allocated version after
+        /// a relayout: integer bounds, no order proof, no dense key directory.
+        pub fn rebuildHints(table: *Table) void {
+            table.integer_bounds = @splat(.{});
+            for (table.versions[0..table.version_high]) |*version| {
+                if (version.row == 0) continue;
+                for (version.cells[0..table.column_count], table.integer_bounds[0..table.column_count]) |*cell, *bounds| {
+                    if (cell.* != .integer) continue;
+                    if (!bounds.known) {
+                        bounds.* = .{ .known = true, .low = cell.integer, .high = cell.integer };
+                    } else {
+                        bounds.low = @min(bounds.low, cell.integer);
+                        bounds.high = @max(bounds.high, cell.integer);
+                    }
+                }
+            }
+            table.column_order = @splat(.{ .state = .unordered });
+            table.primary_directory.state = .disabled;
+        }
+
+        /// Rebuilds the row and key indexes from the directory and arena.
+        fn rebuildIndexes(table: *Table) void {
+            @memset(table.row_index[0..], 0);
+            for (0..table.row_high) |slot| if (table.rows[slot].newest != 0) indexRow(table, @intCast(slot));
+            if (table.primary_column != null) {
+                @memset(table.key_index[0..], 0);
+                for (0..table.version_high) |version| {
+                    if (table.versions[version].row != 0) indexKeyOnly(table, @intCast(version));
+                }
+            }
+        }
+
+        fn relayoutCells(cells: *[config.columns]V.Cell, sources: []const u8, fills: []const V.Cell) void {
+            const old = cells.*;
+            for (sources, 0..) |origin, column| cells[column] = if (origin == 0xff) fills[column] else old[origin];
+            for (cells[sources.len..]) |*cell| cell.* = .null_value;
+        }
+
+        /// ALTER TABLE: copies every row slot and version of `source` into
+        /// `destination` (reset with the new definition), keeping rowids,
+        /// generations and MVCC headers; new column i reads old column
+        /// sources[i], or fills[i] when sources[i] is 0xff. The caller checked
+        /// capacity. Committed summaries are rebuilt at publication.
+        pub fn copyRelayout(destination: *Table, source: *const Table, sources: []const u8, fills: []const V.Cell) void {
+            destination.next_rowid = source.next_rowid;
+            destination.row_generation = source.row_generation;
+            destination.row_high = source.row_high;
+            destination.row_used = source.row_used;
+            destination.version_high = source.version_high;
+            destination.version_used = source.version_used;
+            destination.version_free = source.version_free;
+            @memcpy(destination.rows[0..source.row_high], source.rows[0..source.row_high]);
+            for (source.versions[0..source.version_high], destination.versions[0..source.version_high]) |*from, *to| {
+                to.* = from.*;
+                if (from.row != 0) relayoutCells(&to.cells, sources, fills);
+            }
+            rebuildIndexes(destination);
+            rebuildHints(destination);
+        }
+
+        /// Replay of ALTER TABLE in place (replay keeps no old snapshots):
+        /// relayout every version, install the definition, rebuild indexes.
+        pub fn redefine(table: *Table, name: V.Name, columns: []const V.Column, constraints: []const Constraint, sources: []const u8, fills: []const V.Cell) void {
+            for (table.versions[0..table.version_high]) |*version| {
+                if (version.row != 0) relayoutCells(&version.cells, sources, fills);
+            }
+            table.name = name;
+            table.column_count = columns.len;
+            @memcpy(table.columns[0..columns.len], columns);
+            table.primary_column = null;
+            for (columns, 0..) |column, index| if (column.primary_key) {
+                table.primary_column = index;
+            };
+            setConstraints(table, constraints);
+            rebuildIndexes(table);
+            rebuildHints(table);
+        }
+
+        /// Recomputes the committed summary, rollups and scan projection
+        /// from the committed view (publication or replay of a relayout).
+        pub fn rebuildCommitted(table: *Table, csn: u64) void {
+            initSummary(table, csn);
+            if (comptime compact_enabled) table.scan_high = 0;
+            for (0..table.row_high) |slot| {
+                if (table.rows[slot].newest == 0) continue;
+                if (visible(table, slot)) |version| {
+                    summarize(table, &table.versions[version].cells, true, csn);
+                    scanPublish(table, version, true);
+                } else scanPublish(table, table.rows[slot].newest - 1, false);
+            }
+            rebuildPresence(table);
+        }
+
+        /// Installs constraints after reset(); the caller checked capacity.
+        pub fn setConstraints(table: *Table, constraints: []const Constraint) void {
+            table.constraint_count = constraints.len;
+            @memcpy(table.constraints[0..constraints.len], constraints);
+        }
+
+        /// Constraints enforced by uniqueCheck: UNIQUE and a composite (or
+        /// named multi-column) PRIMARY KEY. A single-column primary key uses
+        /// the key index instead.
+        pub fn scannedUnique(table: *const Table, constraint: *const Constraint) bool {
+            return switch (constraint.kind) {
+                .check => false,
+                .unique => true,
+                .primary => table.primary_column == null,
+            };
+        }
+
+        pub const KeyState = union(enum) { free, taken: u32, wait: u16 };
+
+        fn sameKey(constraint: *const Constraint, left: *const [config.columns]V.Cell, right: *const [config.columns]V.Cell) bool {
+            for (constraint.keyColumns()) |column| {
+                if (V.compare(&left[column], &right[column]) != 0) return false;
+            }
+            return true;
+        }
+
+        /// Whether a proposed key can conflict at all: with NULLS DISTINCT
+        /// (the default) a key with any NULL member never does.
+        pub fn comparableKey(constraint: *const Constraint, cells: *const [config.columns]V.Cell) bool {
+            if (constraint.nulls_not_distinct or constraint.kind == .primary) return true;
+            for (constraint.keyColumns()) |column| if (cells[column] == .null_value) return false;
+            return true;
+        }
+
+        /// Whether an update changed any key column of the constraint.
+        pub fn keyChanged(constraint: *const Constraint, old: *const [config.columns]V.Cell, new: *const [config.columns]V.Cell) bool {
+            for (constraint.keyColumns()) |column| {
+                if (@as(V.CellTag, old[column]) != @as(V.CellTag, new[column]) or V.compare(&old[column], &new[column]) != 0) return true;
+            }
+            return false;
+        }
+
+        /// UNIQUE check against the newest state, with exactly the
+        /// dirty-snapshot rules of the primary-key keyCheck: a committed live
+        /// row or a version this transaction still holds takes the key; a
+        /// version created, or deleted, by another live transaction makes the
+        /// inserter wait for it. Row `own_slot` (the row being updated) never
+        /// conflicts. Scans the version arena: O(versions x key columns).
+        pub fn uniqueCheck(table: *const Table, constraint: *const Constraint, cells: *const [config.columns]V.Cell, own_slot: u32, snap: Snapshot) KeyState {
+            if (!comparableKey(constraint, cells)) return .free;
+            var waiting: ?u16 = null;
+            for (table.versions[0..table.version_high], 0..) |*version, index| {
+                if (version.row == 0 or version.row - 1 == own_slot) continue;
+                if (!sameKey(constraint, &version.cells, cells)) continue;
+                const marked = version.xmax.epoch != 0;
+                if (version.xmin_csn == 0) {
+                    if (snap.own(version.xmin)) {
+                        if (marked and snap.own(version.xmax)) continue;
+                        return .{ .taken = @intCast(index) };
+                    }
+                    if (!marked and waiting == null) waiting = version.xmin.slot;
+                    continue;
+                }
+                if (!marked) return .{ .taken = @intCast(index) };
+                if (version.xmax_csn != 0 or snap.own(version.xmax)) continue;
+                if (waiting == null) waiting = version.xmax.slot;
+            }
+            return if (waiting) |slot| .{ .wait = slot } else .free;
+        }
+
         /// Prepare a free table slot for a new definition. Unused capacity is
         /// neither cleared nor read; only both indices are reset.
         pub fn reset(table: *Table, oid: u32, name: V.Name, columns: []const V.Column) void {
@@ -235,6 +441,8 @@ pub fn Storage(comptime config: types.Config) type {
             for (columns, 0..) |column, index| if (column.primary_key) {
                 table.primary_column = index;
             };
+            table.namespace = 2200;
+            table.constraint_count = 0;
             table.next_rowid = 1;
             table.dead_csn = 0;
             table.pending_drop = false;
@@ -259,6 +467,9 @@ pub fn Storage(comptime config: types.Config) type {
             destination.name = source.name;
             destination.column_count = source.column_count;
             @memcpy(destination.columns[0..source.column_count], source.columns[0..source.column_count]);
+            destination.namespace = source.namespace;
+            destination.constraint_count = source.constraint_count;
+            @memcpy(destination.constraints[0..source.constraint_count], source.constraints[0..source.constraint_count]);
             destination.primary_column = source.primary_column;
             destination.primary_directory = source.primary_directory;
             destination.column_order = source.column_order;
