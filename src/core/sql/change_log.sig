@@ -5,7 +5,8 @@
 //!   ops, each: tag u8 then its fields
 //!     1 create_table  oid u32, name, expr_format_version u16 (= 1),
 //!                     column_count u8, columns: name, type_oid u32,
-//!                     typmod i32 (-1, NUMERIC(p,s) or TIMESTAMP[TZ](p)),
+//!                     typmod i32 (-1, NUMERIC(p,s), TIMESTAMP[TZ](p) or
+//!                     VARCHAR(n)/CHAR(n) n + 4),
 //!                     flags u8 (1 not null, 2 primary key, bits 2..4 the
 //!                     default kind: 1 DEFAULT, 2 identity ALWAYS, 3 identity
 //!                     BY DEFAULT, 4 GENERATED ... STORED),
@@ -25,7 +26,11 @@
 //!   | 4 f32 bits u32 | 5 f64 bits u64 | 6 numeric {special u8, negative u8,
 //!   dscale u16, coefficient 4 x u64} | 7 date i32 | 8 timestamp i64
 //!   | 9 timestamptz i64 | 10 interval {months i32, days i32, us i64}
-//!   | 11 jsonb len u32 + canonical bytes. Every value is checked against the
+//!   | 11 jsonb len u32 + canonical bytes | 12 bpchar len u32 + padded bytes
+//!   (VARCHAR values use 3) | 13 uuid 16 bytes | 14 bytea len u32 + bytes
+//!   | 15 time i64 | 16 timetz {us i64, zone i32 seconds west}
+//!   | 17 bit/varbit bit length u32 + packed bytes (zero padded)
+//!   | 18 money i64 cents. Every value is checked against the
 //!   column's type OID (create_table) before anything applies.
 //! Ops may repeat a (table, rowid) and apply in record order.
 //!
@@ -43,6 +48,9 @@ const numeric = @import("numeric.sig");
 const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
 const sequence = @import("sequence.sig");
+const character = @import("character.sig");
+const time_of_day = @import("time_of_day.sig");
+const bit_string = @import("bit_string.sig");
 const Error = types.Error;
 
 pub const format_version: u16 = 1;
@@ -224,6 +232,38 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 11);
                     try writer.int(u32, @intCast(document.len));
                     try writer.bytes(document.slice());
+                },
+                .bpchar => |*text| {
+                    try writer.int(u8, 12);
+                    try writer.int(u32, @intCast(text.len));
+                    try writer.bytes(text.slice());
+                },
+                .uuid => |*bytes| {
+                    try writer.int(u8, 13);
+                    try writer.bytes(bytes);
+                },
+                .bytea => |*bytes| {
+                    try writer.int(u8, 14);
+                    try writer.int(u32, @intCast(bytes.len));
+                    try writer.bytes(bytes.slice());
+                },
+                .time => |value| {
+                    try writer.int(u8, 15);
+                    try writer.int(i64, value);
+                },
+                .timetz => |value| {
+                    try writer.int(u8, 16);
+                    try writer.int(i64, value.us);
+                    try writer.int(i32, value.zone);
+                },
+                .money => |value| {
+                    try writer.int(u8, 18);
+                    try writer.int(i64, value);
+                },
+                .bits => |*value| {
+                    try writer.int(u8, 17);
+                    try writer.int(u32, @intCast(value.len));
+                    try writer.bytes(value.slice());
                 },
             }
         }
@@ -526,12 +566,14 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     if (value > 1) return error.InvalidChangeRecord;
                     break :blk .{ .boolean = value == 1 };
                 },
-                3, 11 => blk: {
+                3, 11, 12, 14 => blk: {
                     const len = try reader.int(u32);
                     if (len > config.text_bytes) return error.ChangeRecordConflict;
                     var text: V.Text = .{ .len = len };
                     @memcpy(text.bytes[0..len], try reader.take(len));
                     if (tag == 3) break :blk .{ .text = text };
+                    if (tag == 12) break :blk .{ .bpchar = text };
+                    if (tag == 14) break :blk .{ .bytea = text };
                     if (!jsonb.validBinary(text.slice(), config.json_depth, config.numeric_digits)) return error.InvalidChangeRecord;
                     break :blk .{ .jsonb = text };
                 },
@@ -559,6 +601,28 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     break :blk if (tag == 8) V.Cell{ .timestamp = us } else V.Cell{ .timestamptz = us };
                 },
                 10 => .{ .interval = .{ .months = try reader.int(i32), .days = try reader.int(i32), .us = try reader.int(i64) } },
+                13 => .{ .uuid = (try reader.take(16))[0..16].* },
+                15 => blk: {
+                    const us = try reader.int(i64);
+                    if (!time_of_day.validTime(us)) return error.InvalidChangeRecord;
+                    break :blk .{ .time = us };
+                },
+                18 => .{ .money = try reader.int(i64) },
+                17 => blk: {
+                    const bits = try reader.int(u32);
+                    if (bits > V.BitString.max_bits) return error.ChangeRecordConflict;
+                    var value: V.BitString = .{ .len = bits };
+                    const count = bit_string.byteLength(bits);
+                    @memcpy(value.bytes[0..count], try reader.take(count));
+                    if (!value.padded()) return error.InvalidChangeRecord;
+                    break :blk .{ .bits = value };
+                },
+                16 => blk: {
+                    const us = try reader.int(i64);
+                    const zone = try reader.int(i32);
+                    if (!time_of_day.validTime(us) or !time_of_day.validZone(zone)) return error.InvalidChangeRecord;
+                    break :blk .{ .timetz = .{ .us = us, .zone = zone } };
+                },
                 else => return error.InvalidChangeRecord,
             };
             return .{ .cell = cell, .offset = offset };
@@ -614,7 +678,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const decoded = numeric.Ops(config.numeric_digits).decodeTypmod(column.typmod) orelse break :blk false;
                         break :blk decoded.precision >= 1 and decoded.precision <= config.numeric_digits and decoded.scale >= -1000 and decoded.scale <= 1000;
                     },
-                    .timestamp, .timestamptz => column.typmod >= -1 and column.typmod <= 6,
+                    .timestamp, .timestamptz, .time, .timetz => column.typmod >= -1 and column.typmod <= 6,
+                    .varchar, .bpchar => character.validTypmod(column.typmod),
+                    .bit, .varbit => bit_string.validTypmod(column.typmod),
                     else => column.typmod == -1,
                 };
                 if (!typmod_ok) return error.InvalidChangeRecord;

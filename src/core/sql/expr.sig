@@ -14,6 +14,7 @@ const value_module = @import("value.sig");
 const temporal = @import("temporal.sig");
 const datetime_format = @import("datetime_format.sig");
 const float_text = @import("float_text.sig");
+const bytea_module = @import("bytea.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -352,6 +353,24 @@ pub fn Eval(comptime config: types.Config) type {
                     append(&buffer, &at, if (known == .timestamp) ") without time zone" else ") with time zone");
                     return textCell(buffer[0..at]);
                 },
+                .time, .timetz => if (typmod >= 0) {
+                    append(&buffer, &at, "time(");
+                    number(&buffer, &at, typmod);
+                    append(&buffer, &at, if (known == .time) ") without time zone" else ") with time zone");
+                    return textCell(buffer[0..at]);
+                },
+                .bit, .varbit => if (typmod > 0) {
+                    append(&buffer, &at, if (known == .bit) "bit(" else "bit varying(");
+                    number(&buffer, &at, typmod);
+                    append(&buffer, &at, ")");
+                    return textCell(buffer[0..at]);
+                },
+                .varchar, .bpchar => if (typmod > 4) {
+                    append(&buffer, &at, if (known == .varchar) "character varying(" else "character(");
+                    number(&buffer, &at, typmod - 4);
+                    append(&buffer, &at, ")");
+                    return textCell(buffer[0..at]);
+                },
                 else => {},
             }
             return textCell(types.sqlTypeName(known));
@@ -665,7 +684,9 @@ pub fn Eval(comptime config: types.Config) type {
                     const escape_text: []const u8 = if (n.c == none) "\\" else escape.text.slice();
                     try validateLikeEscape(escape_text);
                     if (value == .null_value) return null;
-                    const matched = try likeMatch(value.text.slice(), pattern.text.slice(), escape_text, n.insensitive, ctx.session.control);
+                    // bpchar LIKE text matches the padded value (bpcharlike).
+                    const subject = if (value == .bpchar) value.bpchar.slice() else value.text.slice();
+                    const matched = try likeMatch(subject, pattern.text.slice(), escape_text, n.insensitive, ctx.session.control);
                     return matched != n.negated;
                 },
                 else => {},
@@ -754,6 +775,11 @@ pub fn Eval(comptime config: types.Config) type {
                             @memcpy(value.bytes[0..out.len], out.bytes[0..out.len]);
                             value.len = out.len;
                             return .{ .jsonb = value };
+                        }
+                        if (n.ty == .bytea) {
+                            var bytes: V.Text = .{};
+                            bytes.len = try bytea_module.concat(left.bytea.slice(), right.bytea.slice(), &bytes.bytes);
+                            return .{ .bytea = bytes };
                         }
                         var text: V.Text = .{};
                         // anytextcat/textanycat cast booleans to 'true'/'false' (measured on PG18).

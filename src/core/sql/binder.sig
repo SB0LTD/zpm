@@ -507,8 +507,80 @@ pub fn Binder(comptime config: types.Config) type {
             return true;
         }
 
+        fn timeType(ty: ast.Type) bool {
+            return ty == .time or ty == .timetz;
+        }
+
+        /// Operators of TIME/TIMETZ (date.c): time - time -> interval;
+        /// time/timetz +- interval and interval + time/timetz keep the
+        /// operand type; date + time -> timestamp and date + timetz ->
+        /// timestamptz (either order). An untyped operand of `-` takes the
+        /// time type (time - time) or interval (timetz - interval); for `+`
+        /// both interval and date candidates remain, so it is ambiguous.
+        fn timeArithmetic(context: *const Context, n: *ast.Node) Error!void {
+            const add = n.op == .add;
+            const sub = n.op == .sub;
+            if (!add and !sub) return error.UndefinedFunction;
+            var left = context.node(n.a).ty;
+            var right = context.node(n.b).ty;
+            if (left == .unknown or right == .unknown) {
+                if (add) return error.AmbiguousFunction;
+                if (right == .unknown) try coerce(context, n.b, if (left == .time) .time else .interval);
+                if (left == .unknown) {
+                    if (right != .time) return error.UndefinedFunction;
+                    try coerce(context, n.a, .time);
+                }
+                left = context.node(n.a).ty;
+                right = context.node(n.b).ty;
+            }
+            if (sub and left == .time and right == .time) {
+                n.ty = .interval;
+                return;
+            }
+            if (timeType(left) and right == .interval) {
+                n.ty = left;
+                return;
+            }
+            if (add and left == .interval and timeType(right)) {
+                n.ty = right;
+                return;
+            }
+            if (add and ((left == .date and timeType(right)) or (timeType(left) and right == .date))) {
+                n.ty = if (left == .timetz or right == .timetz) .timestamptz else .timestamp;
+                return;
+            }
+            return error.UndefinedFunction;
+        }
+
+        /// Operators of MONEY (cash.c): money +- money -> money; money *
+        /// int2/int4/int8/float4/float8 and the reverse -> money; money /
+        /// those -> money; money / money -> float8. NUMERIC operands resolve
+        /// the float8 operators (numeric -> float8 is implicit). An untyped
+        /// operand is money, except for `*` (float8, the preferred type).
+        fn moneyArithmetic(context: *const Context, n: *ast.Node) Error!void {
+            if (n.op != .add and n.op != .sub and n.op != .mul and n.op != .div) return error.UndefinedFunction;
+            if (context.node(n.a).ty == .unknown) try coerce(context, n.a, if (n.op == .mul) .float8 else .money);
+            if (context.node(n.b).ty == .unknown) try coerce(context, n.b, if (n.op == .mul) .float8 else .money);
+            const left = context.node(n.a).ty;
+            const right = context.node(n.b).ty;
+            if (left == .money and right == .money) {
+                if (n.op == .mul) return error.UndefinedFunction;
+                n.ty = if (n.op == .div) .float8 else .money;
+                return;
+            }
+            const scalar = if (left == .money) right else left;
+            if (n.op == .add or n.op == .sub or (n.op == .div and right == .money)) return error.UndefinedFunction;
+            if (!value.numericCategory(scalar)) return error.UndefinedFunction;
+            if (scalar == .numeric) {
+                if (left == .money) n.b = try convert(context, n.b, .float8, -1, .implicit) else n.a = try convert(context, n.a, .float8, -1, .implicit);
+            }
+            n.ty = .money;
+        }
+
         fn arithmeticType(context: *const Context, n: *ast.Node) Error!void {
             if (context.node(n.a).ty == .unknown and context.node(n.b).ty == .unknown) return error.AmbiguousFunction;
+            if (context.node(n.a).ty == .money or context.node(n.b).ty == .money) return moneyArithmetic(context, n);
+            if (timeType(context.node(n.a).ty) or timeType(context.node(n.b).ty)) return timeArithmetic(context, n);
             var left = context.node(n.a).ty;
             var right = context.node(n.b).ty;
             // An untyped literal takes the other operand's type, except
@@ -712,7 +784,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .sum => switch (arg_ty) {
                     .int2, .int4 => .int8,
                     .int8, .numeric => .numeric,
-                    .float4, .float8, .interval => arg_ty,
+                    .float4, .float8, .interval, .money => arg_ty,
                     else => return error.UndefinedFunction,
                 },
                 .avg => switch (arg_ty) {
@@ -722,8 +794,8 @@ pub fn Binder(comptime config: types.Config) type {
                     else => return error.UndefinedFunction,
                 },
                 .min, .max => switch (arg_ty) {
-                    .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval => arg_ty,
-                    .name => blk: {
+                    .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval, .bpchar, .time, .timetz, .money => arg_ty,
+                    .name, .varchar => blk: {
                         n.b = try convert(context, arg, .text, -1, .implicit);
                         break :blk .text;
                     },
@@ -1889,9 +1961,19 @@ pub fn Binder(comptime config: types.Config) type {
                                 n.ty = .jsonb;
                                 return;
                             }
+                            // bytea || bytea (byteacat); an untyped side is bytea.
+                            if ((left_ty == .bytea and (right_ty == .bytea or right_ty == .unknown)) or
+                                (right_ty == .bytea and left_ty == .unknown)) {
+                                try coerce(context, n.a, .bytea);
+                                try coerce(context, n.b, .bytea);
+                                n.ty = .bytea;
+                                return;
+                            }
                             // text || text, text || anynonarray, anynonarray || text.
                             if (context.node(n.a).ty == .unknown) try coerce(context, n.a, .text);
                             if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .text);
+                            if (context.node(n.a).ty == .bpchar) n.a = try convert(context, n.a, .text, -1, .implicit);
+                            if (context.node(n.b).ty == .bpchar) n.b = try convert(context, n.b, .text, -1, .implicit);
                             if (!value.stringType(context.node(n.a).ty) and !value.stringType(context.node(n.b).ty)) return error.UndefinedFunction;
                             n.ty = .text;
                         },
@@ -1966,15 +2048,18 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeExpr(context, scope, n.b);
                     try coerce(context, n.a, .text);
                     try coerce(context, n.b, .text);
-                    // name LIKE text (namelike) shares text's representation.
+                    if (context.node(n.b).ty == .bpchar) n.b = try convert(context, n.b, .text, -1, .implicit);
+                    // name LIKE text (namelike) and varchar share text's
+                    // representation; bpchar LIKE text reads the padded value.
                     const left_ty = context.node(n.a).ty;
                     const right_ty = context.node(n.b).ty;
-                    if ((left_ty != .text and left_ty != .name) or (right_ty != .text and right_ty != .name)) return error.UndefinedFunction;
+                    if (!value.characterType(left_ty) or !value.stringType(right_ty)) return error.UndefinedFunction;
                     if (n.c != none) {
                         try typeExpr(context, scope, n.c);
                         try coerce(context, n.c, .text);
+                        if (context.node(n.c).ty == .bpchar) n.c = try convert(context, n.c, .text, -1, .implicit);
                         const escape_ty = context.node(n.c).ty;
-                        if (escape_ty != .text and escape_ty != .name) return error.UndefinedFunction;
+                        if (!value.stringType(escape_ty)) return error.UndefinedFunction;
                     }
                     n.ty = .boolean;
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b) and isConstant(context, n.c);
@@ -2076,7 +2161,7 @@ pub fn Binder(comptime config: types.Config) type {
                     // Typmods are validated at bind time (eval applies them).
                     if (n.typmod >= 0 and context.node(n.a).kind == .text_literal) {
                         const text = E.literalText(context.source, context.node(n.a).text);
-                        _ = try Io.parse(target, n.typmod, text.slice(), context.session);
+                        _ = try Io.parseCast(target, n.typmod, text.slice(), context.session);
                     }
                     n.ty = target;
                     n.constant = isConstant(context, n.a);

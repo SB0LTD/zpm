@@ -6,7 +6,11 @@
 //! float4/float8 IEEE bits, NUMERIC {ndigits, weight, sign, dscale,
 //! base-10000 digits}, DATE i32 days and TIMESTAMP[TZ] i64 microseconds
 //! since 2000-01-01, INTERVAL {us i64, days i32, months i32}, JSONB version
-//! byte 1 + text, and text/name/json raw bytes. Parameters are rendered as
+//! byte 1 + text, and text/name/json/varchar/bpchar raw bytes (bpchar
+//! padded), UUID 16 bytes, BYTEA raw bytes (hex text), TIME i64
+//! microseconds, TIMETZ {i64 microseconds, i32 seconds west} and BIT/VARBIT
+//! {i32 bit length, packed bits} and MONEY i64 cents. Parameters are
+//! rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
 //! is a protocol violation (08P01).
@@ -109,6 +113,19 @@ pub fn Types(comptime Result: type) type {
                     try put(out, &at, &.{1});
                     at += try sendText(cell, session, out[at..]);
                 },
+                .bpchar => |*value| try put(out, &at, value.slice()),
+                .uuid => |*value| try put(out, &at, value),
+                .bytea => |*value| try put(out, &at, value.slice()),
+                .time => |value| try putInt(i64, out, &at, value),
+                .timetz => |value| {
+                    try putInt(i64, out, &at, value.us);
+                    try putInt(i32, out, &at, value.zone);
+                },
+                .bits => |*value| {
+                    try putInt(i32, out, &at, @intCast(value.len));
+                    try put(out, &at, value.slice());
+                },
+                .money => |value| try putInt(i64, out, &at, value),
             }
             return at;
         }
@@ -118,6 +135,9 @@ pub fn Types(comptime Result: type) type {
             const data_type = Io.typeFromOid(type_oid) orelse return null;
             return switch (data_type) {
                 .text, .integer, .integer32, .boolean => null,
+                // `::bit` would mean BIT(1); varbit keeps every bit and is
+                // implicitly castable to BIT(n).
+                .bit => "varbit",
                 else => Io.typeInfo(data_type).name,
             };
         }
@@ -162,7 +182,7 @@ pub fn Types(comptime Result: type) type {
         /// are returned in place; others are rendered into `out`.
         pub fn receiveText(bytes: []const u8, data_type: DataType, out: []u8) Error![]const u8 {
             switch (data_type) {
-                .text, .name, .json => return bytes,
+                .text, .name, .json, .varchar, .bpchar => return bytes,
                 .jsonb => {
                     if (bytes.len == 0 or bytes[0] != 1) return error.ProtocolViolation;
                     return bytes[1..];
@@ -196,8 +216,9 @@ pub fn Types(comptime Result: type) type {
             const need: usize = switch (data_type) {
                 .smallint => 2,
                 .integer32, .oid, .real, .date => 4,
-                .integer, .double, .timestamp, .timestamptz => 8,
-                .interval => 16,
+                .integer, .double, .timestamp, .timestamptz, .time, .money => 8,
+                .timetz => 12,
+                .interval, .uuid => 16,
                 else => 0,
             };
             if (need != 0 and bytes.len != need) return error.ProtocolViolation;
@@ -210,6 +231,19 @@ pub fn Types(comptime Result: type) type {
                 .timestamp => .{ .timestamp = getInt(i64, bytes) },
                 .timestamptz => .{ .timestamptz = getInt(i64, bytes) },
                 .interval => .{ .interval = .{ .us = getInt(i64, bytes[0..8]), .days = getInt(i32, bytes[8..12]), .months = getInt(i32, bytes[12..16]) } },
+                .uuid => .{ .uuid = bytes[0..16].* },
+                .money => .{ .money = getInt(i64, bytes) },
+                .time => blk: {
+                    const us = getInt(i64, bytes);
+                    if (us < 0 or us > 86400000000) return error.ProtocolViolation;
+                    break :blk Cell{ .time = us };
+                },
+                .timetz => blk: {
+                    const us = getInt(i64, bytes[0..8]);
+                    const zone = getInt(i32, bytes[8..12]);
+                    if (us < 0 or us > 86400000000 or zone < -57599 or zone > 57599) return error.ProtocolViolation;
+                    break :blk Cell{ .timetz = .{ .us = us, .zone = zone } };
+                },
                 .numeric => blk: {
                     if (bytes.len < 8) return error.ProtocolViolation;
                     const ndigits: usize = getInt(u16, bytes[0..2]);
@@ -237,7 +271,27 @@ pub fn Types(comptime Result: type) type {
                     text.len = bytes.len - 1;
                     break :blk Cell{ .text = text };
                 },
-                .name, .json => blk: {
+                .bit, .varbit => blk: {
+                    const BitString = @TypeOf(@as(Cell, undefined).bits);
+                    if (bytes.len < 4) return error.ProtocolViolation;
+                    const bit_count = getInt(i32, bytes[0..4]);
+                    if (bit_count < 0 or @as(usize, @intCast(bit_count)) > BitString.max_bits) return error.ProtocolViolation;
+                    const count: usize = @intCast(@divTrunc(bit_count + 7, 8));
+                    if (bytes.len != 4 + count) return error.ProtocolViolation;
+                    var value: BitString = .{ .len = @intCast(bit_count) };
+                    @memcpy(value.bytes[0..count], bytes[4..]);
+                    // varbit_recv: VARBIT_PAD clears the unused low bits.
+                    if (@mod(bit_count, 8) != 0) value.bytes[count - 1] &= @as(u8, @truncate(@as(u16, 0xff00) >> @intCast(@mod(bit_count, 8))));
+                    break :blk Cell{ .bits = value };
+                },
+                .bytea => blk: {
+                    var raw: Io.Text = .{};
+                    if (bytes.len > raw.bytes.len) return error.ProtocolViolation;
+                    @memcpy(raw.bytes[0..bytes.len], bytes);
+                    raw.len = bytes.len;
+                    break :blk Cell{ .bytea = raw };
+                },
+                .name, .json, .varchar, .bpchar => blk: {
                     var text: Io.Text = .{};
                     if (bytes.len > text.bytes.len) return error.ProtocolViolation;
                     @memcpy(text.bytes[0..bytes.len], bytes);
