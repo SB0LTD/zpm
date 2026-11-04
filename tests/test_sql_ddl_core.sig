@@ -483,6 +483,65 @@ fn uniqueConcurrency(insert: []const u8, delete: []const u8, reinsert: []const u
     try check(db.usage().transactions == 0 and db.usage().table_locks == 0);
 }
 
+// ---- composite PRIMARY KEY ---------------------------------------------------
+
+const composite_probes = [_][]const u8{
+    "SELECT a, b FROM tdd_pk ORDER BY a, b",
+    "SELECT relname, relkind, relnatts FROM pg_class WHERE relname LIKE 'tdd_pk%' ORDER BY oid",
+    "SELECT indisprimary, indisunique, indkey FROM pg_index WHERE indrelid = 'tdd_pk'::regclass",
+    "SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'tdd_pk' AND constraint_type <> 'CHECK'",
+    "SELECT constraint_name, column_name, ordinal_position FROM information_schema.key_column_usage WHERE table_name = 'tdd_pk' ORDER BY ordinal_position",
+    "SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name = 'tdd_pk' ORDER BY ordinal_position",
+    "SELECT oid, relname FROM pg_class WHERE relnamespace = 2200 ORDER BY oid",
+};
+
+fn compositeKeys() !void {
+    reset();
+    try run("CREATE TABLE tdd_pk (a INT, b INT, CONSTRAINT tdd_pk_pk PRIMARY KEY (a, b))");
+    try run("INSERT INTO tdd_pk VALUES (1, 1), (1, 2)");
+    try expect(composite_probes[0], "1|1;1|2");
+    try expect(composite_probes[1], "tdd_pk|r|2;tdd_pk_pk|i|2");
+    try expect(composite_probes[2], "t|t|1 2");
+    try expect(composite_probes[3], "tdd_pk_pk|PRIMARY KEY");
+    try expect(composite_probes[4], "tdd_pk_pk|a|1;tdd_pk_pk|b|2");
+    try expect(composite_probes[5], "a|NO;b|NO");
+    try rejects("INSERT INTO tdd_pk VALUES (1, 2)", error.PrimaryKeyViolation, composite_probes[0], "1|1;1|2");
+    try rejects("INSERT INTO tdd_pk VALUES (2, NULL)", error.NotNullViolation, composite_probes[0], "1|1;1|2");
+    try rejects("UPDATE tdd_pk SET b = 1", error.PrimaryKeyViolation, composite_probes[0], "1|1;1|2");
+    try run("UPDATE tdd_pk SET b = b + 10 WHERE b = 2");
+    // Engine OID scheme: the key index owns the OID after its table.
+    const before = db.oid_counter;
+    try run("CREATE TABLE after_pk (x INT, y INT, PRIMARY KEY (x, y))");
+    try check(db.oid_counter == before + 2);
+    try run("CREATE TABLE after_plain (x INT)");
+    try check(db.oid_counter == before + 3);
+    try sameState(&composite_probes);
+    var result: DB.Result = .{};
+    try check(replica.execute("INSERT INTO tdd_pk VALUES (1, 1)", &result) == error.PrimaryKeyViolation);
+    // A named single-column key keeps the key index and its name.
+    try run("CREATE TABLE np (id INT CONSTRAINT np_key PRIMARY KEY, v INT)");
+    try run("INSERT INTO np VALUES (1, 1)");
+    try run("INSERT INTO np VALUES (1, 2) ON CONFLICT ON CONSTRAINT np_key DO UPDATE SET v = excluded.v");
+    try expect("SELECT id, v FROM np", "1|2");
+    try expect("SELECT relname FROM pg_class WHERE relkind = 'i' AND relname LIKE 'np%'", "np_key");
+    try run("CREATE TABLE tk (a INT, b TEXT, PRIMARY KEY (b))");
+    try expect("SELECT relname FROM pg_class WHERE relkind = 'i' AND relname LIKE 'tk%'", "tk_pkey");
+    try rejects("INSERT INTO tk VALUES (1, NULL)", error.NotNullViolation, "SELECT COUNT(*) FROM tk", "0");
+    try rejects("CREATE TABLE bad (a INT PRIMARY KEY, b INT, PRIMARY KEY (b))", error.InvalidTableDefinition, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("CREATE TABLE bad (a INT, b INT, PRIMARY KEY (a), PRIMARY KEY (b))", error.InvalidTableDefinition, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try sameState(&composite_probes);
+    try sameState(&.{ "SELECT id, v FROM np", "SELECT a, b FROM tk", "SELECT oid, relname, relkind FROM pg_class WHERE relnamespace = 2200 ORDER BY oid" });
+    // Concurrent inserts of the same composite key.
+    const first = try db.begin();
+    try statement(first, "INSERT INTO tdd_pk VALUES (7, 7)");
+    const second = try db.begin();
+    try parks(second, "INSERT INTO tdd_pk VALUES (7, 7)");
+    try commit(first);
+    try check(db.statement(second, "INSERT INTO tdd_pk VALUES (7, 7)", &result, .{ .@"resume" = true }) == error.PrimaryKeyViolation);
+    db.abort(second);
+    try sameState(&composite_probes);
+}
+
 pub fn main(init: std.process.Init) !void {
     try truncateTable();
     try truncateErrors();
@@ -490,6 +549,7 @@ pub fn main(init: std.process.Init) !void {
     try truncateLocks();
     try checkConstraints();
     try uniqueConstraints();
+    try compositeKeys();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-ddl-core\",\"pass\":true,\"assertions\":{d},\"records\":{d},\"database_bytes\":{d}}}\n", .{ assertions, records_applied, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
