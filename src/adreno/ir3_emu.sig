@@ -1292,3 +1292,29 @@ test "bounds: a read past its binding faults, even into the next buffer" {
     try std.testing.expectError(error.Fault, run(&emu_work, &mem, &.{ .kernel = &k2, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats));
     try std.testing.expect(emu_work.fault_local);
 }
+
+test "a divergent if/else: the else fibers run right after the then-part's jump" {
+    // (the then-part's last write is two slots before the else's read, in
+    // the same wave: the legalizer must carry its delay across the jump)
+    var out = [_]u32{0} ** 64;
+    const regions = [_]Region{.{ .va = 0x9000, .bytes = std.mem.sliceAsBytes(&out) }};
+    const mem = Memory{ .regions = &regions };
+    const consts = [_]u32{ 0x9000, 0, 0, 0 };
+    _ = try runSource(
+        \\@localsize 64, 1, 1
+        \\@invocationid(r0.x)
+        \\@consts 1
+        \\mov.u32u32 r1.x, 5
+        \\cmps.u.lt p0.x, r0.x, 32
+        \\br p0.x, #else
+        \\add.u r1.x, r0.x, 100
+        \\jump #done
+        \\else:
+        \\add.u r1.x, r1.x, r0.x
+        \\done:
+        \\shl.b r2.x, r0.x, 2
+        \\stg.a.u32 g[c0.x+r2.x+0], r1.x, 1
+        \\end
+    , &mem, &consts, .{ 1, 1, 1 });
+    for (out, 0..) |v, i| try std.testing.expectEqual(@as(u32, @intCast(if (i < 32) 5 + i else 100 + i)), v);
+}
