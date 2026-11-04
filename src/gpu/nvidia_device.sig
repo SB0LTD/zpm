@@ -291,6 +291,7 @@ pub const Adapter = struct {
         const a = self(ctx);
         a.vram.wait(f, timeout_us) catch |e| {
             if (e == error.DeviceLost) a.lost += 1;
+            a.last_error = e;
             return mapError(e);
         };
         for (&a.sets) |*s| {
@@ -336,7 +337,18 @@ pub const Emu = struct {
     raw: nv.EmuDevice,
     adapter: Adapter = .{},
 
+    /// `work` may be undefined memory (a static `= undefined`): its
+    /// control fields are set here (the step budget, the hazard checks at
+    /// NAK's level, no trap); its big arrays are the emulator's to fill.
     pub fn init(e: *Emu, arena: []u8, gpu_view: []u8, work: *emu.Work) void {
+        // (not `gen`: the emulator's per-CTA tracking keys on it, and a
+        // fresh value only has to differ from what its arrays hold)
+        work.n_ops = 0;
+        work.top = null;
+        work.trap = .{};
+        work.check_hazards = true;
+        work.strict = true;
+        work.max_steps = emu.DEFAULT_MAX_STEPS;
         e.* = .{ .raw = .{ .arena = arena, .gpu_view = gpu_view, .work = work, .tpcs = 1 } };
     }
 
@@ -348,6 +360,12 @@ pub const Emu = struct {
     /// What went wrong in the last run's kernel, as a sentence.
     pub fn explain(e: *Emu, buf: []u8) []const u8 {
         return emu.explain(e.raw.work, buf);
+    }
+
+    /// The emulated RTX's own error for the last run (Timeout, Fault,
+    /// Hazard ...: the kernel's, with `explain`), or null.
+    pub fn lastError(e: *const Emu) ?anyerror {
+        return e.raw.last_error;
     }
 };
 
@@ -388,6 +406,27 @@ const T = struct {
 fn freshEmu() gpu.Device {
     T.dev.init(&T.arena, &T.view, &T.work);
     return T.dev.device();
+}
+
+test "Emu over an emulator Work left undefined (a static `= undefined`): its controls are set by init" {
+    @memset(std.mem.asBytes(&T.work.max_steps), 0);
+    T.work.check_hazards = false;
+    T.work.trap = .{ .what = .timeout };
+    const d = freshEmu();
+    try testing.expectEqual(emu.DEFAULT_MAX_STEPS, T.work.max_steps);
+    try testing.expect(T.work.check_hazards and T.work.strict);
+    var k = newKernel("one", .{ 32, 1, 1 });
+    const o = k.binding();
+    const t = k.tid(0);
+    k.store(.u32, kir.global(o, 32), r(k.op2(.shl, .u32, r(t), u(2))), r(t));
+    try k.finish();
+    const bin = try kir_sm120.compileIn(&k, d.caps, &T.st, &T.code, .{});
+    const prog = try d.load(&bin);
+    const b = try d.alloc(128, .host);
+    try runWait(d, &.{.{ .prog = &prog, .groups = .{ 1, 1, 1 }, .buffers = &.{b}, .params = &.{} }});
+    d.fromDevice(b, 0, 128);
+    for (words32(b), 0..) |x, i| try testing.expectEqual(@as(u32, @intCast(i)), x);
+    try testing.expect(T.dev.lastError() == null);
 }
 
 fn newKernel(name: []const u8, group: [3]u32) kir.Kernel {
