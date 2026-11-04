@@ -452,12 +452,19 @@ pub fn Ast(comptime config: types.Config) type {
             count: usize = 0,
             where: u16 = none,
             returning: Returning = .{},
+            alias: ?Ident = null,
+            /// UPDATE ... FROM items: a query block (index into Pool.queries)
+            /// holding only the FROM list, or none.
+            from: u16 = none,
         };
 
         pub const Delete = struct {
             table: Ident = .{},
             where: u16 = none,
             returning: Returning = .{},
+            alias: ?Ident = null,
+            /// DELETE ... USING items (a FROM-list query block), or none.
+            using: u16 = none,
         };
 
         /// COPY t [(columns)] FROM STDIN | COPY t [(columns)] | (query) TO

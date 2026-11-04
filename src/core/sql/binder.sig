@@ -114,9 +114,48 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// `values[c]` is the expression assigned to column c (a
         /// default_value node for SET c = DEFAULT), or none.
-        pub const Update = struct { table: usize, values: [config.columns]u16, where: u16, key: u16, returning: Returning = .{}, defaults: [config.columns]u16 = @splat(none), generated: [config.columns]u16 = @splat(none), checks: [config.table_constraints]u16 = @splat(none) };
+        /// UPDATE ... FROM: `from` is the root plan of `SELECT * FROM items`;
+        /// FROM item i (relation i + 1 of WHERE/SET) starts at output
+        /// column offsets[i + 1] of each joined row.
+        pub const Update = struct { table: usize, values: [config.columns]u16, where: u16, key: u16, returning: Returning = .{}, defaults: [config.columns]u16 = @splat(none), generated: [config.columns]u16 = @splat(none), checks: [config.table_constraints]u16 = @splat(none), from: u16 = none, offsets: [config.relations]u16 = @splat(0) };
 
-        pub const Delete = struct { table: usize, where: u16, key: u16, returning: Returning = .{} };
+        /// DELETE ... USING: like Update.from.
+        pub const Delete = struct { table: usize, where: u16, key: u16, returning: Returning = .{}, using: u16 = none, offsets: [config.relations]u16 = @splat(0) };
+
+        /// Binds an UPDATE FROM / DELETE USING list as `SELECT * FROM items`
+        /// and adds every item to the statement scope after the target
+        /// (relation 0), so WHERE and SET resolve qualified and unqualified
+        /// names over target and sources (42702 when ambiguous).
+        fn bindSources(context: *const Context, block: u16, scope: *Scope, root: *u16, offsets: *[config.relations]u16) Error!void {
+            const plans = context.plans orelse return error.UnsupportedStatement;
+            const q = &context.pool.queries[block];
+            if (q.item_count + 1 > config.relations) return error.StatementTooComplex;
+            const plan_id = try bindPlan(context, block, null, null, false);
+            const p = &plans.items[plan_id];
+            var expected: usize = 0;
+            for (q.items[0..q.item_count], 0..) |*item, position| {
+                const source = p.sources[position];
+                var rel: Relation = .{ .table = source.table, .plan = source.plan, .cte = source.cte, .view = source.view };
+                if (source.table) |table| rel.name = context.tables[table].name;
+                if (source.view) |view| rel.name = literalName(@tagName(view));
+                if (source.cte != no_cte) rel.name = plans.ctes[source.cte].name;
+                if (item.alias) |alias| rel.name = toName(context, alias);
+                scope.rels[position + 1] = rel;
+                // The star output lists each item's columns in order; a
+                // USING merge would break the layout (0A000).
+                offsets[position + 1] = @intCast(expected);
+                const width = relationWidth(context, &rel);
+                for (0..width) |column| {
+                    if (expected + column >= p.count) return error.UnsupportedStatement;
+                    const n = context.node(p.targets[expected + column]);
+                    if (n.kind != .column or n.level != 0 or n.relation != position or n.column != column) return error.UnsupportedStatement;
+                }
+                expected += width;
+            }
+            if (expected != p.count) return error.UnsupportedStatement;
+            scope.rel_count = q.item_count + 1;
+            root.* = plan_id;
+        }
 
         /// ON CONFLICT on the primary key (the only unique index). DO UPDATE
         /// evaluates `update` with the existing row as relation 0 and the
@@ -4183,8 +4222,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .update => |*update| {
                     const index = try resolveTable(context, update.table);
                     const entry = &context.tables[index];
-                    const scope = tableScope(context, index);
+                    var scope = tableScope(context, index);
+                    if (update.alias) |alias| scope.rels[0].name = toName(context, alias);
                     var out: Update = .{ .table = index, .values = @splat(none), .where = none, .key = none };
+                    if (update.from != none) try bindSources(context, update.from, &scope, &out.from, &out.offsets);
                     for (update.assignments[0..update.count]) |*item| {
                         const column = try columnIndex(context, entry, item.column);
                         if (out.values[column] != none) return error.DuplicateColumn;
@@ -4200,19 +4241,24 @@ pub fn Binder(comptime config: types.Config) type {
                         out.values[column] = try assignment(context, item.value, &entry.columns[column]);
                     }
                     out.where = try bindWhere(context, &scope, update.where);
-                    out.key = primaryKey(context, entry, out.where);
+                    // The key probe reads relation 0 only: no probe with FROM.
+                    out.key = if (out.from != none) none else primaryKey(context, entry, out.where);
                     const needed = assignedDefaults(context, &out.values);
                     try bindDefaults(context, index, entry, &needed, &out.defaults, &out.generated);
                     try bindChecks(context, index, entry, &out.checks);
-                    out.returning = try bindReturning(context, index, &update.returning, null);
+                    out.returning = try bindReturning(context, index, &update.returning, update.alias);
                     return .{ .update = out };
                 },
                 .delete => |*delete| {
                     const index = try resolveTable(context, delete.table);
-                    const scope = tableScope(context, index);
-                    const where = try bindWhere(context, &scope, delete.where);
-                    const returning = try bindReturning(context, index, &delete.returning, null);
-                    return .{ .delete = .{ .table = index, .where = where, .key = primaryKey(context, &context.tables[index], where), .returning = returning } };
+                    var scope = tableScope(context, index);
+                    if (delete.alias) |alias| scope.rels[0].name = toName(context, alias);
+                    var out: Delete = .{ .table = index, .where = none, .key = none };
+                    if (delete.using != none) try bindSources(context, delete.using, &scope, &out.using, &out.offsets);
+                    out.where = try bindWhere(context, &scope, delete.where);
+                    out.returning = try bindReturning(context, index, &delete.returning, delete.alias);
+                    if (out.using == none) out.key = primaryKey(context, &context.tables[index], out.where);
+                    return .{ .delete = out };
                 },
                 .control => |control| return .{ .control = control },
                 // COPY runs through Database.copyInfo/copyBegin, never as a statement.

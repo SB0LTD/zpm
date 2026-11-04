@@ -938,6 +938,79 @@ fn alterSequences() !void {
     try check(db.usage().transactions == 0 and db.usage().pending_versions == 0);
 }
 
+// ---- UPDATE ... FROM, DELETE ... USING, tuple assignment ----------------------
+
+const join_probes = [_][]const u8{
+    "SELECT id, g, v FROM tdd_a ORDER BY id",
+    "SELECT id, v FROM tdd_b ORDER BY id",
+};
+
+fn joinFixture() !void {
+    reset();
+    try run("CREATE TABLE tdd_a (id INT PRIMARY KEY, g INT, v INT)");
+    try run("INSERT INTO tdd_a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, NULL)");
+    try run("CREATE TABLE tdd_b (id INT PRIMARY KEY, v INT)");
+    try run("INSERT INTO tdd_b VALUES (1, 11), (3, 33), (5, 55)");
+}
+
+fn updateFrom() !void {
+    try joinFixture();
+    const result = try replicate("UPDATE tdd_a a SET v = b.v FROM tdd_b b WHERE a.id = b.id");
+    try check(result.command == .update and result.affected_rows == 2);
+    try expect(join_probes[0], "1|1|11;2|1|20;3|2|33;4|2|NULL");
+    try sameState(&join_probes);
+    // A target row joined to several source rows is updated once.
+    try run("CREATE TABLE m (id INT, w INT)");
+    try run("INSERT INTO m VALUES (1, 100), (1, 200), (9, 900)");
+    const once = try replicate("UPDATE tdd_a SET v = m.w FROM m WHERE tdd_a.id = m.id");
+    try check(once.affected_rows == 1);
+    try expect("SELECT COUNT(*) FROM tdd_a WHERE id = 1 AND v IN (100, 200)", "1");
+    // Several items, a derived table, an unmatched join, AS aliases.
+    try run("UPDATE tdd_a AS t SET g = b.v + m.w FROM tdd_b AS b, m WHERE t.id = b.id AND m.id = 9");
+    try expect(join_probes[0] ++ "", "1|911|100;2|1|20;3|933|33;4|2|NULL");
+    try run("UPDATE tdd_a SET v = s.dv FROM (SELECT id, v * 2 AS dv FROM tdd_b) AS s WHERE tdd_a.id = s.id");
+    try expect(join_probes[0], "1|911|22;2|1|20;3|933|66;4|2|NULL");
+    const none_matched = try replicate("UPDATE tdd_a SET v = 0 FROM tdd_b WHERE tdd_a.id = tdd_b.id AND tdd_b.v > 1000");
+    try check(none_matched.affected_rows == 0);
+    try same(try render(&(try replicate("UPDATE tdd_a a SET v = b.v FROM tdd_b b WHERE a.id = b.id AND b.id = 3 RETURNING a.id, a.v"))), "3|33");
+    try sameState(&join_probes);
+    // 42702 for an unqualified name of both, 42P01 / 42703 for bad names,
+    // constraint failures leave nothing.
+    try rejects("UPDATE tdd_a SET g = v FROM tdd_b WHERE tdd_a.id = tdd_b.id", error.AmbiguousColumn, join_probes[0], "1|911|22;2|1|20;3|933|33;4|2|NULL");
+    try rejects("UPDATE tdd_a SET g = 1 FROM missing WHERE true", error.TableNotFound, join_probes[0], "1|911|22;2|1|20;3|933|33;4|2|NULL");
+    try rejects("UPDATE tdd_a SET g = b.nope FROM tdd_b b", error.ColumnNotFound, join_probes[0], "1|911|22;2|1|20;3|933|33;4|2|NULL");
+    try run("CREATE TABLE ck (id INT PRIMARY KEY, v INT CHECK (v < 50))");
+    try run("INSERT INTO ck VALUES (1, 1), (3, 3)");
+    try rejects("UPDATE ck SET v = b.v * 2 FROM tdd_b b WHERE ck.id = b.id", error.CheckViolation, "SELECT id, v FROM ck ORDER BY id", "1|1;3|3");
+    try rejects("UPDATE ck SET id = b.id + 2 FROM tdd_b b WHERE ck.id = b.id", error.PrimaryKeyViolation, "SELECT id, v FROM ck ORDER BY id", "1|1;3|3");
+    try sameState(&join_probes);
+}
+
+fn updateFromConcurrency() !void {
+    try joinFixture();
+    // A concurrent update of a target row: the joined update waits, then
+    // re-checks the join on the newest version (EvalPlanQual).
+    const writer = try db.begin();
+    try statement(writer, "UPDATE tdd_a SET g = 7 WHERE id = 1");
+    const joiner = try db.begin();
+    try parks(joiner, "UPDATE tdd_a a SET v = b.v FROM tdd_b b WHERE a.id = b.id");
+    try commit(writer);
+    _ = try resumed(joiner, "UPDATE tdd_a a SET v = b.v FROM tdd_b b WHERE a.id = b.id");
+    try commit(joiner);
+    try expect(join_probes[0], "1|7|11;2|1|20;3|2|33;4|2|NULL");
+    // The FROM table is read under AccessShare: TRUNCATE of it waits.
+    const reader = try db.begin();
+    try statement(reader, "UPDATE tdd_a a SET g = 0 FROM tdd_b b WHERE a.id = b.id");
+    const truncator = try db.begin();
+    try parks(truncator, "TRUNCATE tdd_b");
+    try check(db.waitingFor(truncator).has(reader));
+    db.abort(reader);
+    _ = try resumed(truncator, "TRUNCATE tdd_b");
+    db.abort(truncator);
+    try sameState(&join_probes);
+    try check(db.usage().transactions == 0 and db.usage().table_locks == 0);
+}
+
 pub fn main(init: std.process.Init) !void {
     try truncateTable();
     try truncateErrors();
@@ -954,6 +1027,8 @@ pub fn main(init: std.process.Init) !void {
     try serialColumns();
     try sequenceCache();
     try alterSequences();
+    try updateFrom();
+    try updateFromConcurrency();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-ddl-core\",\"pass\":true,\"assertions\":{d},\"records\":{d},\"database_bytes\":{d}}}\n", .{ assertions, records_applied, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

@@ -1281,14 +1281,17 @@ pub fn Database(comptime config: Config) type {
                 },
                 .insert => |*insert| blk: {
                     try self.lockTable(slot, insert.table, .row_exclusive);
+                    try self.lockSources(slot);
                     break :blk try self.insertRows(slot, source, insert, snap);
                 },
                 .update => |*update| blk: {
                     try self.lockTable(slot, update.table, .row_exclusive);
+                    try self.lockSources(slot);
                     break :blk try self.updateRows(slot, source, update, snap);
                 },
                 .delete => |*delete| blk: {
                     try self.lockTable(slot, delete.table, .row_exclusive);
+                    try self.lockSources(slot);
                     break :blk try self.deleteRows(slot, source, delete, snap);
                 },
                 .truncate => |*truncate| blk: {
@@ -2578,6 +2581,41 @@ pub fn Database(comptime config: Config) type {
             return self.active(slot) and self.txs[slot].copy_table != null;
         }
 
+        /// AccessShare on every table a statement's plans read (INSERT ...
+        /// SELECT, UPDATE FROM, DELETE USING, subqueries), after the target's
+        /// RowExclusive and before any row is touched (STO-11): concurrent
+        /// TRUNCATE, ALTER and DROP wait for the statement's transaction.
+        fn lockSources(self: *Self, slot: u16) Error!void {
+            const plans = &self.workspace.plans;
+            for (plans.items[0..plans.len]) |*plan| {
+                for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| try self.lockTable(slot, table, .access_share);
+            }
+        }
+
+        /// UPDATE FROM / DELETE USING source rows, materialized once per
+        /// statement execution under the statement snapshot.
+        const Joined = struct { list: X.List, offsets: *const [config.relations]u16 };
+
+        fn joinedRows(self: *Self, source: []const u8, root: u16, offsets: *const [config.relations]u16, snap: Snapshot) Error!?Joined {
+            if (root == ast.none) return null;
+            const list = try X.queryRows(&self.tables, source, &self.workspace.nodes, &self.workspace.plans, root, snap, &self.session, &self.workspace.query);
+            return .{ .list = list, .offsets = offsets };
+        }
+
+        /// WHERE over the target row and, with FROM/USING, the first joined
+        /// source row that satisfies it (PostgreSQL updates or deletes a
+        /// target row once, with one arbitrary matching source row). The
+        /// matching row stays installed in `ctx` for SET.
+        fn keepJoined(self: *Self, ctx: *E.Context, where: u16, joined: ?Joined, cells: *const E.Row) Error!bool {
+            const join = joined orelse return X.keep(ctx, where, cells);
+            for (0..join.list.count) |index| {
+                const row = X.rowAt(&self.workspace.query, join.list, index);
+                for (1..config.relations) |relation| ctx.tuple[relation] = row + join.offsets[relation];
+                if (try X.keep(ctx, where, cells)) return true;
+            }
+            return false;
+        }
+
         /// Rows are visited in rowid order and updated one at a time, as a
         /// PostgreSQL heap scan does: WHERE, SET and key checks interleave.
         /// On resume, rows this statement already handled are skipped by
@@ -2586,18 +2624,19 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[update.table];
             var ctx = self.evalContext(source);
             var affected: usize = 0;
+            const joined = try self.joinedRows(source, update.from, &update.offsets, snap);
             switch (try X.candidates(&ctx, table, update.key, snap)) {
                 .empty => {},
-                .slot => |hit| affected += try self.updateSlot(slot, &ctx, update, hit.row, snap),
+                .slot => |hit| affected += try self.updateSlot(slot, &ctx, update, hit.row, snap, joined),
                 .scan => {
                     const high = table.row_high;
-                    for (0..high) |row| affected += try self.updateSlot(slot, &ctx, update, @intCast(row), snap);
+                    for (0..high) |row| affected += try self.updateSlot(slot, &ctx, update, @intCast(row), snap, joined);
                 },
             }
             return affected;
         }
 
-        fn updateSlot(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, row: u32, snap: Snapshot) Error!usize {
+        fn updateSlot(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, row: u32, snap: Snapshot, joined: ?Joined) Error!usize {
             try self.session.checkpoint();
             const table = &self.tables[update.table];
             if (table.rows[row].newest == 0) return 0;
@@ -2605,13 +2644,13 @@ pub fn Database(comptime config: Config) type {
             var waits: L.Set = .{};
             const plan = self.target(slot, update.table, version, snap, .write, &waits);
             if (plan == .authored) return 1;
-            if (!try X.keep(ctx, update.where, &table.versions[version].cells)) return 0;
+            if (!try self.keepJoined(ctx, update.where, joined, &table.versions[version].cells)) return 0;
             const goal = switch (plan) {
                 .skip, .authored => return 0,
                 .wait => return self.park(slot, waits),
                 .ready => |newest| newest,
             };
-            if (goal != version and !try X.keep(ctx, update.where, &table.versions[goal].cells)) return 0;
+            if (goal != version and !try self.keepJoined(ctx, update.where, joined, &table.versions[goal].cells)) return 0;
             try self.updateOne(slot, ctx, update, row, goal, snap);
             return 1;
         }
@@ -2647,18 +2686,19 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[delete.table];
             var ctx = self.evalContext(source);
             var affected: usize = 0;
+            const joined = try self.joinedRows(source, delete.using, &delete.offsets, snap);
             switch (try X.candidates(&ctx, table, delete.key, snap)) {
                 .empty => {},
-                .slot => |hit| affected += try self.deleteSlot(slot, &ctx, delete, hit.row, snap),
+                .slot => |hit| affected += try self.deleteSlot(slot, &ctx, delete, hit.row, snap, joined),
                 .scan => {
                     const high = table.row_high;
-                    for (0..high) |row| affected += try self.deleteSlot(slot, &ctx, delete, @intCast(row), snap);
+                    for (0..high) |row| affected += try self.deleteSlot(slot, &ctx, delete, @intCast(row), snap, joined);
                 },
             }
             return affected;
         }
 
-        fn deleteSlot(self: *Self, slot: u16, ctx: *E.Context, delete: *const B.Delete, row: u32, snap: Snapshot) Error!usize {
+        fn deleteSlot(self: *Self, slot: u16, ctx: *E.Context, delete: *const B.Delete, row: u32, snap: Snapshot, joined: ?Joined) Error!usize {
             try self.session.checkpoint();
             const tx = &self.txs[slot];
             const table = &self.tables[delete.table];
@@ -2667,13 +2707,13 @@ pub fn Database(comptime config: Config) type {
             var waits: L.Set = .{};
             const plan = self.target(slot, delete.table, version, snap, .write, &waits);
             if (plan == .authored) return 1;
-            if (!try X.keep(ctx, delete.where, &table.versions[version].cells)) return 0;
+            if (!try self.keepJoined(ctx, delete.where, joined, &table.versions[version].cells)) return 0;
             const goal = switch (plan) {
                 .skip, .authored => return 0,
                 .wait => return self.park(slot, waits),
                 .ready => |newest| newest,
             };
-            if (goal != version and !try X.keep(ctx, delete.where, &table.versions[goal].cells)) return 0;
+            if (goal != version and !try self.keepJoined(ctx, delete.where, joined, &table.versions[goal].cells)) return 0;
             try self.reserveWrites(slot, 1);
             table.versions[goal].xmax = tx.ref(slot);
             table.versions[goal].xmax_cid = snap.cid;

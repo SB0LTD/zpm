@@ -1203,11 +1203,7 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectWord("UPDATE");
                     try self.expectWord("SET");
                     while (true) {
-                        if (conflict.count == config.columns) return error.DuplicateColumn;
-                        const column = try self.identifier();
-                        try self.expectSymbol(.eq);
-                        conflict.assignments[conflict.count] = .{ .column = column, .value = try self.valueItem() };
-                        conflict.count += 1;
+                        try self.setItem(&conflict.assignments, &conflict.count);
                         if (!try self.takeSymbol(.comma)) break;
                     }
                     conflict.where = try self.where();
@@ -1568,17 +1564,85 @@ pub fn Parser(comptime config: types.Config) type {
             if (minus and value.* != 0) negative.* = true;
         }
 
-        fn update(self: *Self) Error!Ast.Update {
-            var out: Ast.Update = .{ .table = try self.identifier() };
-            try self.expectWord("SET");
-            while (true) {
-                if (out.count == config.columns) return error.DuplicateColumn;
+        /// One SET item: `column = value`, or a multiple-column assignment
+        /// `(a, b) = (v1, v2)` / `= ROW(...)` expanded into one item per
+        /// column (42601 when the counts differ; a sub-SELECT source is 0A000).
+        fn setItem(self: *Self, items: *[config.columns]Ast.Assignment, count: *usize) Error!void {
+            if (self.mode != .standard or !self.isSymbol(.lparen)) {
+                if (count.* == config.columns) return error.DuplicateColumn;
                 const column = try self.identifier();
                 try self.expectSymbol(.eq);
-                out.assignments[out.count] = .{ .column = column, .value = try self.valueItem() };
-                out.count += 1;
+                items[count.*] = .{ .column = column, .value = try self.valueItem() };
+                count.* += 1;
+                return;
+            }
+            try self.advance();
+            var columns: [config.columns]ast.Ident = undefined;
+            var width: usize = 0;
+            while (true) {
+                if (width == config.columns) return error.DuplicateColumn;
+                columns[width] = try self.identifier();
+                width += 1;
                 if (!try self.takeSymbol(.comma)) break;
             }
+            try self.expectSymbol(.rparen);
+            try self.expectSymbol(.eq);
+            const row = try self.takeWord("ROW");
+            if (self.isSymbol(.lparen) and ((try self.peek()).isWord("SELECT") or (try self.peek()).isWord("WITH"))) return error.UnsupportedStatement;
+            // `(a) = (v)` is a parenthesized scalar, not a row: 42601.
+            if (!row and width == 1) return error.Syntax;
+            try self.expectSymbol(.lparen);
+            for (columns[0..width], 0..) |column, index| {
+                if (index != 0) try self.expectSymbol(.comma);
+                if (count.* == config.columns) return error.DuplicateColumn;
+                items[count.*] = .{ .column = column, .value = try self.valueItem() };
+                count.* += 1;
+            }
+            try self.expectSymbol(.rparen);
+        }
+
+        /// PostgreSQL reserved and type/function-name keywords the tokenizer
+        /// does not classify: never a bare (AS-less) UPDATE/DELETE alias.
+        fn reservedWord(raw: []const u8) bool {
+            const words = [_][]const u8{
+                "analyse", "analyze", "array", "both", "check", "collate", "column", "current_catalog", "current_role",
+                "current_time", "current_user", "deferrable", "foreign", "grant", "initially", "leading",
+                "localtime", "localtimestamp", "placing", "references", "session_user", "system_user", "trailing",
+                "unique", "user", "variadic", "authorization", "binary", "collation", "concurrently", "current_schema",
+                "freeze", "isnull", "notnull", "overlaps", "similar", "tablesample", "verbose",
+            };
+            for (words) |word| if (types.keyword(raw, word)) return true;
+            return false;
+        }
+
+        /// UPDATE / DELETE target alias: AS label, or a bare identifier that
+        /// is not a PostgreSQL reserved word.
+        fn targetAlias(self: *Self) Error!?ast.Ident {
+            if (try self.takeWord("AS")) return try self.label();
+            if (self.current.kind == .quoted_word) return try self.identifier();
+            if (self.current.kind == .word and !lexer.reserved(self.current.keyword) and !reservedWord(self.current.raw(self.source))) return try self.identifier();
+            return null;
+        }
+
+        /// A FROM / USING list parsed into its own query block.
+        fn fromBlock(self: *Self) Error!u16 {
+            const block = try self.pool.newQuery();
+            try self.fromList(&self.pool.queries[block]);
+            self.pool.queries[block].targets[0] = .{ .star = true };
+            self.pool.queries[block].count = 1;
+            return block;
+        }
+
+        fn update(self: *Self) Error!Ast.Update {
+            if (self.mode == .standard) _ = try self.takeWord("ONLY");
+            var out: Ast.Update = .{ .table = try self.identifier() };
+            if (self.mode == .standard) out.alias = try self.targetAlias();
+            try self.expectWord("SET");
+            while (true) {
+                try self.setItem(&out.assignments, &out.count);
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            if (self.mode == .standard and try self.takeWord("FROM")) out.from = try self.fromBlock();
             out.where = try self.where();
             try self.returningClause(&out.returning);
             try self.finish();
@@ -1587,7 +1651,10 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn delete(self: *Self) Error!Ast.Delete {
             try self.expectWord("FROM");
+            if (self.mode == .standard) _ = try self.takeWord("ONLY");
             var out: Ast.Delete = .{ .table = try self.identifier() };
+            if (self.mode == .standard) out.alias = try self.targetAlias();
+            if (self.mode == .standard and try self.takeWord("USING")) out.using = try self.fromBlock();
             out.where = try self.where();
             try self.returningClause(&out.returning);
             try self.finish();
