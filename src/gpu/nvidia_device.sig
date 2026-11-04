@@ -404,6 +404,14 @@ fn runWait(d: gpu.Device, ds: []const gpu.Dispatch) !void {
     };
 }
 
+/// One dispatch run alone: the emulated RTX's warp instructions issued and
+/// its longest warp's cycles.
+fn runCounted(d: gpu.Device, ds: gpu.Dispatch) !emu.Stats {
+    T.dev.raw.stats = .{};
+    try runWait(d, &.{ds});
+    return T.dev.raw.stats;
+}
+
 fn words32(b: gpu.Buffer) []u32 {
     return @alignCast(std.mem.bytesAsSlice(u32, b.cpu[0 .. b.cpu.len & ~@as(usize, 3)]));
 }
@@ -720,10 +728,9 @@ test "Q4_K x Q8_K in KIR: the hand kernel's bits (33 rows, 9 blocks: two tiles, 
     for ([_]gpu.Buffer{ w, aq, ad, as }) |b| d.toDevice(b, 0, b.bytes);
     const shape = try matrix.matrixLaunch(.q4_k, 1, rows, blocks);
     const params = [_]u32{ row_bytes, blocks, rows, rows * 4 };
-    try runWait(d, &.{
-        .{ .prog = &hand, .groups = shape.grid, .buffers = &.{ w, aq, ad, as, out1 }, .params = &params },
-        .{ .prog = &prog, .groups = shape.grid, .buffers = &.{ w, aq, ad, as, out2 }, .params = &params },
-    });
+    const hs = try runCounted(d, .{ .prog = &hand, .groups = shape.grid, .buffers = &.{ w, aq, ad, as, out1 }, .params = &params });
+    const ksx = try runCounted(d, .{ .prog = &prog, .groups = shape.grid, .buffers = &.{ w, aq, ad, as, out2 }, .params = &params });
+    std.debug.print("Q4_K emulated: KIR {d} warp instructions, {d} cycles; hand {d}, {d}\n", .{ ksx.instructions, ksx.cycles, hs.instructions, hs.cycles });
     d.fromDevice(out1, 0, out1.bytes);
     d.fromDevice(out2, 0, out2.bytes);
     try testing.expectEqualSlices(u32, words32(out1), words32(out2));
@@ -1449,4 +1456,234 @@ test "fneg and fabs: source modifiers where the op takes them (FADD, FMNMX, FSET
             }
         }
     }
+}
+
+// ── A frame-kernel piece, rewritten in KIR ──────────────────────────────────
+//
+// Galaxy's sdRoundRect then blendOver (galaxy/ui/gfx_kernels.sig's sdRR and
+// blendOver: the sm_120 text its emitter makes for them, between the
+// piece's comments below), in a harness: thread t reads px, py (f32), p, c,
+// al (u32) from in[8t..], the rounded rect's record (gfx_kernels.Sd: cx,
+// cy, kx, ky, rad) from rec, and writes the blended pixel to out[t] and the
+// distance to out[64 + t]. The KIR version does the same maths op for op,
+// with KIR's fsqrt (sm_120's sqrt.rn, the hand text's root) and an if/else
+// for blendOver.
+
+/// The hand text: the harness (16 instructions: S2R, LDCU, MOV of mul255's
+/// rounding, 3 LDC.64, 2 IMAD.WIDE, 5 LDG, 2 STG, EXIT) around the piece.
+const HAND_PIECE =
+    \\.params 24
+    \\S2R R0, SR_TID.X
+    \\LDCU.64 UR4, c[0x0][0x358]
+    \\MOV R1, 0x800080
+    \\LDC.64 R2, c[0x0][0x380]
+    \\LDC.64 R4, c[0x0][0x388]
+    \\LDC.64 R6, c[0x0][0x390]
+    \\IMAD.WIDE.U32 R2, R0, 0x20, R2
+    \\IMAD.WIDE.U32 R6, R0, 0x4, R6
+    \\LDG.E R8, desc[UR4][R2.64]
+    \\LDG.E R9, desc[UR4][R2.64+0x4]
+    \\LDG.E R10, desc[UR4][R2.64+0x8]
+    \\LDG.E R11, desc[UR4][R2.64+0xc]
+    \\LDG.E R12, desc[UR4][R2.64+0x10]
+    \\// piece
+    \\LDG.E.CONSTANT R16, desc[UR4][R4.64]
+    \\FADD R14, R8, -R16
+    \\LDG.E.CONSTANT R16, desc[UR4][R4.64+0x8]
+    \\FADD R14, |R14|, -R16
+    \\LDG.E.CONSTANT R16, desc[UR4][R4.64+0x4]
+    \\FADD R15, R9, -R16
+    \\LDG.E.CONSTANT R16, desc[UR4][R4.64+0xc]
+    \\FADD R15, |R15|, -R16
+    \\FMNMX R17, R14, RZ, !PT
+    \\FMNMX R18, R15, RZ, !PT
+    \\FMUL R17, R17, R17
+    \\FMUL R18, R18, R18
+    \\FADD R17, R17, R18
+    \\IADD R19, R17, -0xd000000
+    \\ISETP.GT.U32.AND P0, PT, R19, 0x727fffff, PT
+    \\@P0 BRA `(L2)
+    \\MUFU.RSQ R19, R17
+    \\FMUL R20, R17, R19
+    \\FMUL R19, R19, 0.5
+    \\FFMA R18, -R20, R20, R17
+    \\FFMA R18, R18, R19, R20
+    \\BRA `(L1)
+    \\L2:
+    \\ISETP.GE.U32.AND P0, PT, R17, 0xd000000, PT
+    \\@P0 BRA `(L3)
+    \\ISETP.EQ.U32.AND P0, PT, R17, RZ, PT
+    \\@P0 MOV R18, RZ
+    \\@P0 BRA `(L1)
+    \\FMUL R21, R17, 18446744073709552000
+    \\MUFU.RSQ R19, R21
+    \\FMUL R20, R21, R19
+    \\FMUL R19, R19, 0.5
+    \\FFMA R18, -R20, R20, R21
+    \\FFMA R18, R18, R19, R20
+    \\FMUL R18, R18, 0.00000000023283064365386963
+    \\BRA `(L1)
+    \\L3:
+    \\MUFU.SQRT R18, R17
+    \\L1:
+    \\FMNMX R14, R14, R15, !PT
+    \\FMNMX R14, R14, RZ, PT
+    \\FADD R18, R18, R14
+    \\LDG.E.CONSTANT R16, desc[UR4][R4.64+0x10]
+    \\FADD R13, R18, -R16
+    \\ISETP.GE.U32.AND P0, PT, R12, 0xff, PT
+    \\@P0 LOP3.LUT R10, R11, 0xff000000, RZ, 0xfc, !PT
+    \\@P0 BRA `(L4)
+    \\IADD R14, -R12, 0xff
+    \\LOP3.LUT R15, R11, 0xff00ff, RZ, 0xc0, !PT
+    \\IMAD R18, R15, R12, R1
+    \\SHF.R.U32.HI R19, RZ, 0x8, R18
+    \\LOP3.LUT R19, R19, 0xff00ff, RZ, 0xc0, !PT
+    \\IADD R18, R18, R19
+    \\SHF.R.U32.HI R15, RZ, 0x8, R18
+    \\LOP3.LUT R15, R15, 0xff00ff, RZ, 0xc0, !PT
+    \\LOP3.LUT R16, R10, 0xff00ff, RZ, 0xc0, !PT
+    \\IMAD R18, R16, R14, R1
+    \\SHF.R.U32.HI R19, RZ, 0x8, R18
+    \\LOP3.LUT R19, R19, 0xff00ff, RZ, 0xc0, !PT
+    \\IADD R18, R18, R19
+    \\SHF.R.U32.HI R16, RZ, 0x8, R18
+    \\LOP3.LUT R16, R16, 0xff00ff, RZ, 0xc0, !PT
+    \\IADD R17, R15, R16
+    \\SHF.R.U32.HI R15, RZ, 0x8, R11
+    \\LOP3.LUT R15, R15, 0xff00ff, RZ, 0xc0, !PT
+    \\IMAD R18, R15, R12, R1
+    \\SHF.R.U32.HI R19, RZ, 0x8, R18
+    \\LOP3.LUT R19, R19, 0xff00ff, RZ, 0xc0, !PT
+    \\IADD R18, R18, R19
+    \\SHF.R.U32.HI R15, RZ, 0x8, R18
+    \\LOP3.LUT R15, R15, 0xff00ff, RZ, 0xc0, !PT
+    \\SHF.R.U32.HI R16, RZ, 0x8, R10
+    \\LOP3.LUT R16, R16, 0xff00ff, RZ, 0xc0, !PT
+    \\IMAD R18, R16, R14, R1
+    \\SHF.R.U32.HI R19, RZ, 0x8, R18
+    \\LOP3.LUT R19, R19, 0xff00ff, RZ, 0xc0, !PT
+    \\IADD R18, R18, R19
+    \\SHF.R.U32.HI R16, RZ, 0x8, R18
+    \\LOP3.LUT R16, R16, 0xff00ff, RZ, 0xc0, !PT
+    \\IADD R15, R15, R16
+    \\LOP3.LUT R15, R15, 0xff, RZ, 0xc0, !PT
+    \\SHF.L.U32 R15, R15, 0x8, RZ
+    \\LOP3.LUT R10, R17, 0xff000000, R15, 0xfe, !PT
+    \\L4:
+    \\// end
+    \\STG.E desc[UR4][R6.64], R10
+    \\STG.E desc[UR4][R6.64+0x100], R13
+    \\EXIT
+;
+const HAND_HARNESS = 16;
+/// The KIR harness's: S2R, LDCU, 3 LDC.64, 2 IMAD.WIDE, 5 LDG, 2 STG, EXIT.
+const KIR_HARNESS = 15;
+
+fn mulLanes(k: *kir.Kernel, x: kir.V, y: kir.V) kir.V {
+    const t = k.op3(.imad, .u32, r(x), r(y), u(0x0080_0080));
+    const s = k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(t), u(8))), u(0x00ff_00ff));
+    const t2 = k.op2(.iadd, .u32, r(t), r(s));
+    return k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(t2), u(8))), u(0x00ff_00ff));
+}
+
+fn recField(k: *kir.Kernel, rec: u8, off: u32) kir.V {
+    var m = kir.global(rec, 32);
+    m.imm = @intCast(off);
+    return k.load(.f32, m, u(0));
+}
+
+fn pieceKir(k: *kir.Kernel) void {
+    const IN = k.binding();
+    const REC = k.binding();
+    const OUT = k.binding();
+    const t = k.tid(0);
+    const io = k.op2(.shl, .u32, r(t), u(5));
+    var m = kir.global(IN, 32);
+    const px = k.load(.f32, m, r(io));
+    m.imm = 4;
+    const py = k.load(.f32, m, r(io));
+    m.imm = 8;
+    const p = k.load(.u32, m, r(io));
+    m.imm = 12;
+    const c = k.load(.u32, m, r(io));
+    m.imm = 16;
+    const al = k.load(.u32, m, r(io));
+    // sdRoundRect: sqrt(max(qx,0)^2 + max(qy,0)^2) + min(max(qx,qy),0) - rad
+    const qx = k.op2(.fsub, .f32, r(k.op1(.fabs, .f32, r(k.op2(.fsub, .f32, r(px), r(recField(k, REC, 0)))))), r(recField(k, REC, 8)));
+    const qy = k.op2(.fsub, .f32, r(k.op1(.fabs, .f32, r(k.op2(.fsub, .f32, r(py), r(recField(k, REC, 4)))))), r(recField(k, REC, 12)));
+    const ox = k.op2(.fmax, .f32, r(qx), kir.f(0));
+    const oy = k.op2(.fmax, .f32, r(qy), kir.f(0));
+    const ss = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(ox), r(ox))), r(k.op2(.fmul, .f32, r(oy), r(oy))));
+    const root = k.sqrt(r(ss));
+    const mn = k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(qx), r(qy))), kir.f(0));
+    const d = k.op2(.fsub, .f32, r(k.op2(.fadd, .f32, r(root), r(mn))), r(recField(k, REC, 16)));
+    // blendOver(p, c, al)
+    k.ifp(r(k.cmp(.u32, .ge, r(al), u(0xff))));
+    k.set(p, .@"or", r(c), u(0xff00_0000), no);
+    k.els();
+    {
+        const inv = k.op2(.isub, .u32, u(0xff), r(al));
+        const x = mulLanes(k, k.op2(.@"and", .u32, r(c), u(0x00ff_00ff)), al);
+        const y = mulLanes(k, k.op2(.@"and", .u32, r(p), u(0x00ff_00ff)), inv);
+        const rb = k.op2(.iadd, .u32, r(x), r(y));
+        const x2 = mulLanes(k, k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(c), u(8))), u(0x00ff_00ff)), al);
+        const y2 = mulLanes(k, k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(p), u(8))), u(0x00ff_00ff)), inv);
+        const g = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(k.op2(.iadd, .u32, r(x2), r(y2))), u(0xff))), u(8));
+        k.set(p, .@"or", r(k.op2(.@"or", .u32, r(rb), u(0xff00_0000))), r(g), no);
+    }
+    k.endif();
+    const oo = k.op2(.shl, .u32, r(t), u(2));
+    k.store(.u32, kir.global(OUT, 32), r(oo), r(p));
+    var mo = kir.global(OUT, 32);
+    mo.imm = 0x100;
+    k.store(.f32, mo, r(oo), r(d));
+}
+
+test "sdRoundRect + blendOver in KIR: the hand text's bits, within 10% of its instructions" {
+    const d = freshEmu();
+    var k = newKernel("sd_blend", .{ 64, 1, 1 });
+    pieceKir(&k);
+    try k.finish();
+    const bin = try kir_sm120.compileIn(&k, d.caps, &T.st, &T.code, .{});
+    const kir_count = bin.extra[kir_sm120.EXTRA_INSTRUCTIONS];
+    const kir_regs = bin.regs;
+    const prog = try d.load(&bin);
+    const hbin = try handBinary(HAND_PIECE, .{ 64, 1, 1 }, 0, 3, 0);
+    const hand = try d.load(&hbin);
+    const in = try d.alloc(64 * 32, .upload);
+    const rec = try d.alloc(64, .upload);
+    const out1 = try d.alloc(128 * 4, .host);
+    const out2 = try d.alloc(128 * 4, .host);
+    var s: u32 = 0x5d;
+    const w = words32(in);
+    for (0..64) |t| {
+        // (pixels around and inside a 30 x 20 rect at (10, 12), radius 6;
+        // alphas across 0..300: some opaque)
+        w[8 * t + 0] = @bitCast(@as(f32, @floatFromInt(lcg(&s) % 640)) / 10.0 + 0.5);
+        w[8 * t + 1] = @bitCast(@as(f32, @floatFromInt(lcg(&s) % 520)) / 10.0 + 0.5);
+        w[8 * t + 2] = lcg(&s);
+        w[8 * t + 3] = lcg(&s);
+        w[8 * t + 4] = if (t % 9 == 0) 255 else lcg(&s) % 300;
+    }
+    // (gfx_kernels.sdOf for the rect: cx, cy, kx, ky, rad)
+    const recf: []f32 = @alignCast(std.mem.bytesAsSlice(f32, rec.cpu[0..20]));
+    recf[0] = 10 + 15;
+    recf[1] = 12 + 10;
+    recf[2] = 15 - 6;
+    recf[3] = 10 - 6;
+    recf[4] = 6;
+    d.toDevice(in, 0, in.bytes);
+    d.toDevice(rec, 0, rec.bytes);
+    const hs = try runCounted(d, .{ .prog = &hand, .groups = .{ 1, 1, 1 }, .buffers = &.{ in, rec, out1 }, .params = &.{} });
+    const ksx = try runCounted(d, .{ .prog = &prog, .groups = .{ 1, 1, 1 }, .buffers = &.{ in, rec, out2 }, .params = &.{} });
+    std.debug.print("sdRoundRect + blendOver emulated: KIR {d} warp instructions, {d} cycles; hand {d}, {d}\n", .{ ksx.instructions, ksx.cycles, hs.instructions, hs.cycles });
+    d.fromDevice(out1, 0, out1.bytes);
+    d.fromDevice(out2, 0, out2.bytes);
+    try testing.expectEqualSlices(u32, words32(out1), words32(out2));
+    const hand_count = hbin.extra[kir_sm120.EXTRA_INSTRUCTIONS];
+    const hp = hand_count - HAND_HARNESS;
+    const kp = kir_count - KIR_HARNESS;
+    std.debug.print("sdRoundRect + blendOver: KIR {d} instructions ({d} the piece), {d} registers; hand {d} ({d} the piece), {d} registers\n", .{ kir_count, kp, kir_regs, hand_count, hp, hbin.regs });
+    try testing.expect(kp * 10 <= hp * 11);
 }
