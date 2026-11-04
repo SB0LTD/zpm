@@ -5,7 +5,8 @@
 //!   ops, each: tag u8 then its fields
 //!     1 create_table  oid u32, name, expr_format_version u16 (= 1),
 //!                     column_count u8, columns: name, type_oid u32,
-//!                     typmod i32 (-1, NUMERIC(p,s) or TIMESTAMP[TZ](p)),
+//!                     typmod i32 (-1, NUMERIC(p,s), TIMESTAMP[TZ](p) or
+//!                     VARCHAR(n)/CHAR(n) n + 4),
 //!                     flags u8 (1 not null, 2 primary key, bits 2..4 the
 //!                     default kind: 1 DEFAULT, 2 identity ALWAYS, 3 identity
 //!                     BY DEFAULT, 4 GENERATED ... STORED),
@@ -25,7 +26,8 @@
 //!   | 4 f32 bits u32 | 5 f64 bits u64 | 6 numeric {special u8, negative u8,
 //!   dscale u16, coefficient 4 x u64} | 7 date i32 | 8 timestamp i64
 //!   | 9 timestamptz i64 | 10 interval {months i32, days i32, us i64}
-//!   | 11 jsonb len u32 + canonical bytes. Every value is checked against the
+//!   | 11 jsonb len u32 + canonical bytes | 12 bpchar len u32 + padded bytes
+//!   (VARCHAR values use 3). Every value is checked against the
 //!   column's type OID (create_table) before anything applies.
 //! Ops may repeat a (table, rowid) and apply in record order.
 //!
@@ -43,6 +45,7 @@ const numeric = @import("numeric.sig");
 const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
 const sequence = @import("sequence.sig");
+const character = @import("character.sig");
 const Error = types.Error;
 
 pub const format_version: u16 = 1;
@@ -224,6 +227,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 11);
                     try writer.int(u32, @intCast(document.len));
                     try writer.bytes(document.slice());
+                },
+                .bpchar => |*text| {
+                    try writer.int(u8, 12);
+                    try writer.int(u32, @intCast(text.len));
+                    try writer.bytes(text.slice());
                 },
             }
         }
@@ -526,12 +534,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     if (value > 1) return error.InvalidChangeRecord;
                     break :blk .{ .boolean = value == 1 };
                 },
-                3, 11 => blk: {
+                3, 11, 12 => blk: {
                     const len = try reader.int(u32);
                     if (len > config.text_bytes) return error.ChangeRecordConflict;
                     var text: V.Text = .{ .len = len };
                     @memcpy(text.bytes[0..len], try reader.take(len));
                     if (tag == 3) break :blk .{ .text = text };
+                    if (tag == 12) break :blk .{ .bpchar = text };
                     if (!jsonb.validBinary(text.slice(), config.json_depth, config.numeric_digits)) return error.InvalidChangeRecord;
                     break :blk .{ .jsonb = text };
                 },
@@ -615,6 +624,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         break :blk decoded.precision >= 1 and decoded.precision <= config.numeric_digits and decoded.scale >= -1000 and decoded.scale <= 1000;
                     },
                     .timestamp, .timestamptz => column.typmod >= -1 and column.typmod <= 6,
+                    .varchar, .bpchar => character.validTypmod(column.typmod),
                     else => column.typmod == -1,
                 };
                 if (!typmod_ok) return error.InvalidChangeRecord;

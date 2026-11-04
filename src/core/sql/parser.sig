@@ -27,6 +27,7 @@ const ast = @import("ast.sig");
 const alpha = @import("alpha.sig");
 const numeric = @import("numeric.sig");
 const sequence = @import("sequence.sig");
+const character = @import("character.sig");
 const Error = types.Error;
 const Token = lexer.Token;
 const Symbol = lexer.Symbol;
@@ -558,6 +559,7 @@ pub fn Parser(comptime config: types.Config) type {
         fn typeWord(token: Token) bool {
             return switch (token.keyword) {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
+                .varchar, .character, .char, .bpchar => true,
                 else => false,
             };
         }
@@ -579,6 +581,18 @@ pub fn Parser(comptime config: types.Config) type {
             try self.expectSymbol(.rparen);
             if (value < 0) return error.InvalidParameterValue;
             return @min(value, 6);
+        }
+
+        /// `(n)` of a character type: an unsigned integer constant (a sign
+        /// is a syntax error), 1..10485760 (22023 otherwise). Without it,
+        /// CHARACTER means CHARACTER(1) and VARCHAR/BPCHAR are unlimited.
+        fn characterLength(self: *Self, default_one: bool) Error!i32 {
+            if (!try self.takeSymbol(.lparen)) return if (default_one) character.typmodOf(1) else -1;
+            if (self.current.kind != .integer) return error.Syntax;
+            const length = self.current.integer;
+            try self.advance();
+            try self.expectSymbol(.rparen);
+            return character.typmodOf(length);
         }
 
         fn typeName(self: *Self) Error!TypeSpec {
@@ -634,6 +648,12 @@ pub fn Parser(comptime config: types.Config) type {
                 .jsonb => .{ .ty = .jsonb },
                 .regclass => .{ .ty = .oid, .typmod = ast.regclass_typmod },
                 .regtype => .{ .ty = .oid, .typmod = ast.regtype_typmod },
+                .varchar => .{ .ty = .varchar, .typmod = try self.characterLength(false) },
+                .bpchar => .{ .ty = .bpchar, .typmod = try self.characterLength(false) },
+                .character, .char => blk: {
+                    const varying = try self.takeWord("VARYING");
+                    break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };
+                },
                 else => unreachable,
             };
         }
@@ -1810,7 +1830,9 @@ pub fn Parser(comptime config: types.Config) type {
                     const after = try self.peek();
                     const multiword = (token.isWord("DOUBLE") and after.isWord("PRECISION")) or
                         (token.isWord("TIMESTAMP") and (after.isWord("WITH") or after.isWord("WITHOUT"))) or
-                        ((token.isWord("NUMERIC") or token.isWord("DECIMAL") or token.isWord("TIMESTAMP") or token.isWord("TIMESTAMPTZ")) and after.kind == .symbol and after.symbol == .lparen);
+                        ((token.isWord("NUMERIC") or token.isWord("DECIMAL") or token.isWord("TIMESTAMP") or token.isWord("TIMESTAMPTZ")) and after.kind == .symbol and after.symbol == .lparen) or
+                        ((token.isWord("CHARACTER") or token.isWord("CHAR")) and after.isWord("VARYING")) or
+                        ((token.isWord("VARCHAR") or token.isWord("CHARACTER") or token.isWord("CHAR") or token.isWord("BPCHAR")) and after.kind == .symbol and after.symbol == .lparen);
                     if (after.kind == .string or multiword) {
                         const target = try self.typeName();
                         if (self.current.kind != .string) return error.Syntax;

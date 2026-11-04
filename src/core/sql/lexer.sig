@@ -189,6 +189,12 @@ pub const Keyword = enum {
     some,
     symmetric,
     asymmetric,
+    // Character types (B11 types lane).
+    varchar,
+    character,
+    char,
+    varying,
+    bpchar,
 };
 
 /// Words that cannot be unquoted identifiers.

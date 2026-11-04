@@ -4,6 +4,7 @@
 const numeric = @import("numeric.sig");
 const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
+const character = @import("character.sig");
 
 pub const Config = struct {
     /// Caller supplies row/version/index buffers and query reference workspace.
@@ -247,6 +248,9 @@ pub const Error = error{
     InvalidBinaryRepresentation,
     /// SQLSTATE 54000: the configured statement work budget was exhausted.
     QueryWorkLimit,
+    /// SQLSTATE 22001: a value is longer than its declared length
+    /// (VARCHAR(n)/CHAR(n) assignment or input).
+    StringDataRightTruncation,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -305,11 +309,11 @@ pub const Dialect = enum { postgres, mysql, tds };
 
 /// Stored column / result types. `integer` is int8 (BIGINT) and
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
-pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb };
+pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet.
-pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb };
+pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar };
 
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
@@ -329,6 +333,8 @@ pub fn dataTypeOf(ty: Type) DataType {
         .interval => .interval,
         .json => .json,
         .jsonb => .jsonb,
+        .varchar => .varchar,
+        .bpchar => .bpchar,
     };
 }
 
@@ -350,6 +356,8 @@ pub fn typeOfData(data_type: DataType) Type {
         .interval => .interval,
         .json => .json,
         .jsonb => .jsonb,
+        .varchar => .varchar,
+        .bpchar => .bpchar,
     };
 }
 
@@ -375,6 +383,8 @@ pub fn typeInfo(data_type: DataType) TypeInfo {
         .interval => .{ .oid = 1186, .name = "interval", .len = 16, .category = 'T', .array = 1187 },
         .numeric => .{ .oid = 1700, .name = "numeric", .len = -1, .category = 'N', .array = 1231 },
         .jsonb => .{ .oid = 3802, .name = "jsonb", .len = -1, .category = 'U', .array = 3807 },
+        .bpchar => .{ .oid = 1042, .name = "bpchar", .len = -1, .category = 'S', .array = 1014 },
+        .varchar => .{ .oid = 1043, .name = "varchar", .len = -1, .category = 'S', .array = 1015 },
     };
 }
 
@@ -403,6 +413,8 @@ pub fn sqlTypeName(data_type: DataType) []const u8 {
         .interval => "interval",
         .json => "json",
         .jsonb => "jsonb",
+        .varchar => "character varying",
+        .bpchar => "character",
     };
 }
 
@@ -425,6 +437,8 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .interval => "interval_in",
         .json => "json_in",
         .jsonb => "jsonb_in",
+        .varchar => "varcharin",
+        .bpchar => "bpcharin",
     };
 }
 
@@ -456,6 +470,8 @@ pub fn typeByName(input: []const u8) ?DataType {
         .{ .name = "boolean", .data_type = .boolean },       .{ .name = "real", .data_type = .real },
         .{ .name = "double precision", .data_type = .double }, .{ .name = "decimal", .data_type = .numeric },
         .{ .name = "timestamp without time zone", .data_type = .timestamp }, .{ .name = "timestamp with time zone", .data_type = .timestamptz },
+        .{ .name = "character varying", .data_type = .varchar }, .{ .name = "char varying", .data_type = .varchar },
+        .{ .name = "character", .data_type = .bpchar },      .{ .name = "char", .data_type = .bpchar },
     };
     for (aliases) |alias| if (same(name, alias.name)) return alias.data_type;
     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
@@ -533,7 +549,9 @@ pub fn Values(comptime config: Config) type {
 
         /// smallint/int4/int8/oid are `integer`; text/name/json are `text`;
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb };
+        /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
+        /// compares/hashes without trailing spaces.
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -548,6 +566,7 @@ pub fn Values(comptime config: Config) type {
             timestamptz: i64,
             interval: temporal.Interval,
             jsonb: Text,
+            bpchar: Text,
         };
 
         pub const Row = struct {
@@ -558,7 +577,7 @@ pub fn Values(comptime config: Config) type {
             name: Name = .{},
             data_type: DataType = .integer,
             /// PostgreSQL atttypmod: NUMERIC(p,s) ((p << 16) | s) + 4,
-            /// TIMESTAMP[TZ](p) p; -1 when absent.
+            /// TIMESTAMP[TZ](p) p, VARCHAR(n)/CHAR(n) n + 4; -1 when absent.
             typmod: i32 = -1,
             not_null: bool = false,
             primary_key: bool = false,
@@ -572,7 +591,7 @@ pub fn Values(comptime config: Config) type {
             return switch (data_type) {
                 .integer, .integer32, .smallint, .oid => .integer,
                 .boolean => .boolean,
-                .text, .name, .json => .text,
+                .text, .name, .json, .varchar => .text,
                 .real => .float4,
                 .double => .float8,
                 .numeric => .numeric,
@@ -581,6 +600,7 @@ pub fn Values(comptime config: Config) type {
                 .timestamptz => .timestamptz,
                 .interval => .interval,
                 .jsonb => .jsonb,
+                .bpchar => .bpchar,
             };
         }
 
@@ -606,6 +626,7 @@ pub fn Values(comptime config: Config) type {
                 .timestamptz => |value| order(i64, value, right.timestamptz),
                 .interval => |value| temporal.compareInterval(value, right.interval),
                 .jsonb => |*value| J.compare(value.slice(), right.jsonb.slice()),
+                .bpchar => |*value| bytesOrder(character.trimmed(value.slice()), character.trimmed(right.bpchar.slice())),
             };
         }
 
@@ -674,6 +695,10 @@ pub fn Values(comptime config: Config) type {
                     mix(&code, tag);
                     J.hash(document.slice(), 0, &code);
                 },
+                .bpchar => |*text| {
+                    mix(&code, tag);
+                    for (character.trimmed(text.slice())) |byte| code = (code ^ byte) *% 1099511628211;
+                },
                 .null_value => unreachable,
             }
             // Mix low bits before the power-of-two table mask.
@@ -695,6 +720,11 @@ pub fn Values(comptime config: Config) type {
                 return;
             }
             if (@as(CellTag, value.*) != cellTag(column.data_type)) return error.TypeMismatch;
+            switch (column.data_type) {
+                .varchar => if (!character.fits(value.text.slice(), column.typmod)) return error.StringDataRightTruncation,
+                .bpchar => if (!character.fits(value.bpchar.slice(), column.typmod)) return error.StringDataRightTruncation,
+                else => {},
+            }
             if (value.* == .integer) {
                 const integer = value.integer;
                 switch (column.data_type) {

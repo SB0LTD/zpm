@@ -15,6 +15,7 @@ const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
 const expr = @import("expr.sig");
 const ast = @import("ast.sig");
+const character = @import("character.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -71,7 +72,35 @@ pub fn integral(ty: Type) bool {
 }
 
 pub fn stringType(ty: Type) bool {
-    return ty == .text or ty == .name;
+    return ty == .text or ty == .name or ty == .varchar;
+}
+
+/// The string category including CHAR(n), whose values are padded and so
+/// need a cast (rtrim) wherever TEXT operators read their bytes.
+pub fn characterType(ty: Type) bool {
+    return stringType(ty) or ty == .bpchar;
+}
+
+/// pg_cast entries of the B11 types; null when the pair is not one of them.
+fn extendedCast(from: Type, to: Type, context: Context) ?bool {
+    if (from == .bpchar or to == .bpchar) {
+        // text/varchar <-> bpchar and bpchar -> name are implicit; name ->
+        // bpchar is an assignment cast.
+        if (characterType(from) and characterType(to)) return from != .name or context != .implicit;
+        // I/O conversion: to a string type in assignment, from one explicitly.
+        if (to == .bpchar) return context != .implicit;
+        return context == .explicit;
+    }
+    return null;
+}
+
+/// select_common_type within the string category for the B11 types: TEXT is
+/// preferred, NAME wins over VARCHAR/CHAR (implicit only one way), and
+/// otherwise the first type wins.
+fn characterCommon(a: Type, b: Type) Type {
+    if (a == .text or b == .text) return .text;
+    if (a == .name or b == .name) return .name;
+    return a;
 }
 
 pub fn datetime(ty: Type) bool {
@@ -104,6 +133,7 @@ fn datetimeRank(ty: Type) u8 {
 pub fn castable(from: Type, to: Type, context: Context) bool {
     if (from == to) return true;
     if (from == .unknown) return true;
+    if (extendedCast(from, to, context)) |allowed| return allowed;
     // Implicit promotions.
     if (numericCategory(from) and numericCategory(to) and numericRank(from) < numericRank(to)) return true;
     if (datetime(from) and datetime(to) and datetimeRank(from) < datetimeRank(to)) return true;
@@ -130,11 +160,17 @@ pub fn castable(from: Type, to: Type, context: Context) bool {
 /// turn distinct values into equal ones (e.g. 16777217 and 16777216::real).
 pub fn comparisonType(a: Type, b: Type) ?Type {
     if (a != b and numericCategory(a) and numericCategory(b) and (a == .float4 or b == .float4)) return .float8;
+    // bpchar with varchar resolves bpchareq (one exact operand, varchar is
+    // binary-coercible); any other string mix compares as TEXT.
+    if (a != b and characterType(a) and characterType(b) and (a == .bpchar or b == .bpchar))
+        return if ((a == .bpchar or a == .varchar) and (b == .bpchar or b == .varchar)) .bpchar else .text;
     return common(a, b);
 }
 
 pub fn common(a: Type, b: Type) ?Type {
     if (a == b) return a;
+    if ((a == .bpchar and stringType(b)) or (stringType(a) and b == .bpchar) or
+        (a == .varchar and stringType(b)) or (stringType(a) and b == .varchar)) return characterCommon(a, b);
     if (numericCategory(a) and numericCategory(b)) {
         const high = if (numericRank(a) > numericRank(b)) a else b;
         return high;
@@ -228,6 +264,7 @@ pub fn Io(comptime config: types.Config) type {
                     try J.render(value.slice(), 0, &out);
                     break :blk buffer[0..out.len];
                 },
+                .bpchar => |*value| copy(buffer, value.slice()),
             };
         }
 
@@ -300,8 +337,43 @@ pub fn Io(comptime config: types.Config) type {
                 .timestamptz => .{ .timestamptz = try temporal.parseTimestamp(input, .timestamptz, &session.zone, session.resolver) },
                 .interval => .{ .interval = try temporal.parseInterval(input) },
                 .jsonb => try jsonbCellControlled(input, session.control),
+                .varchar => try textCell(input),
+                .bpchar => .{ .bpchar = (try textCell(input)).text },
             };
             return applyTypmod(cell, ty, typmod);
+        }
+
+        /// Input of a cast's literal (`'...'::type(n)`): PostgreSQL passes typmod
+        /// -1 to the input function and then applies the explicit length
+        /// coercion, so VARCHAR/CHAR truncate here instead of raising 22001.
+        pub fn parseCast(ty: Type, typmod: i32, input: []const u8, session: *const Session) Error!V.Cell {
+            return applyTypmodExplicit(try parse(ty, -1, input, session), ty, typmod);
+        }
+
+        /// A CHAR(n)/VARCHAR(n) value of `bytes` coerced to `typmod`.
+        fn characterCell(bytes: []const u8, ty: Type, typmod: i32, mode: character.Mode) Error!V.Cell {
+            const shape = if (ty == .bpchar) try character.bpchar(bytes, typmod, mode) else try character.varchar(bytes, typmod, mode);
+            if (shape.pad > config.text_bytes or shape.keep > config.text_bytes - shape.pad) return error.TextCapacity;
+            var text: V.Text = .{ .len = shape.keep + shape.pad };
+            @memcpy(text.bytes[0..shape.keep], bytes[0..shape.keep]);
+            @memset(text.bytes[shape.keep..text.len], ' ');
+            return if (ty == .bpchar) .{ .bpchar = text } else .{ .text = text };
+        }
+
+        /// Length coercion of the explicit-cast kind (truncation, padding).
+        pub fn applyTypmodExplicit(cell: V.Cell, ty: Type, typmod: i32) Error!V.Cell {
+            if (typmod < 0 or cell == .null_value) return cell;
+            return switch (ty) {
+                .varchar => switch (cell) {
+                    .text => |*value| characterCell(value.slice(), .varchar, typmod, .explicit),
+                    else => cell,
+                },
+                .bpchar => switch (cell) {
+                    .bpchar => |*value| characterCell(value.slice(), .bpchar, typmod, .explicit),
+                    else => cell,
+                },
+                else => applyTypmod(cell, ty, typmod),
+            };
         }
 
         /// Length coercion: NUMERIC(p,s) and TIMESTAMP[TZ](p).
@@ -311,6 +383,14 @@ pub fn Io(comptime config: types.Config) type {
                 .numeric => .{ .numeric = try N.applyTypmod(&cell.numeric, typmod) },
                 .timestamp => .{ .timestamp = temporal.roundTimestamp(cell.timestamp, typmod) },
                 .timestamptz => .{ .timestamptz = temporal.roundTimestamp(cell.timestamptz, typmod) },
+                .varchar => switch (cell) {
+                    .text => |*value| try characterCell(value.slice(), .varchar, typmod, .implicit),
+                    else => cell,
+                },
+                .bpchar => switch (cell) {
+                    .bpchar => |*value| try characterCell(value.slice(), .bpchar, typmod, .implicit),
+                    else => cell,
+                },
                 else => cell,
             };
         }
@@ -360,6 +440,13 @@ pub fn Io(comptime config: types.Config) type {
         pub fn cast(cell: V.Cell, from: Type, to: Type, typmod: i32, session: *const Session) Error!V.Cell {
             if (cell == .null_value) return .null_value;
             if (from == to and typmod < 0) return cell;
+            if (cell == .bpchar and to != .bpchar) {
+                // text(bpchar) drops trailing spaces for the string types;
+                // other targets read bpcharout's padded text (I/O conversion).
+                const bytes = cell.bpchar.slice();
+                const text = try textCell(if (characterType(to)) character.trimmed(bytes) else bytes);
+                return cast(text, .text, to, typmod, session);
+            }
             const out: V.Cell = switch (to) {
                 .int2, .int4, .int8 => switch (cell) {
                     .integer => |value| blk: {
@@ -477,8 +564,23 @@ pub fn Io(comptime config: types.Config) type {
                     else => return error.CannotCoerce,
                 },
                 .unknown => cell,
+                .varchar => switch (cell) {
+                    .text => cell,
+                    else => blk: {
+                        var buffer: [format_bytes]u8 = undefined;
+                        break :blk try textCell(try format(&cell, true, session, &buffer));
+                    },
+                },
+                .bpchar => switch (cell) {
+                    .text => |value| V.Cell{ .bpchar = value },
+                    .bpchar => cell,
+                    else => blk: {
+                        var buffer: [format_bytes]u8 = undefined;
+                        break :blk V.Cell{ .bpchar = (try textCell(try format(&cell, true, session, &buffer))).text };
+                    },
+                },
             };
-            return applyTypmod(out, to, typmod);
+            return applyTypmodExplicit(out, to, typmod);
         }
 
         // ---- operators --------------------------------------------------

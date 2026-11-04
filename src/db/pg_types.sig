@@ -6,7 +6,8 @@
 //! float4/float8 IEEE bits, NUMERIC {ndigits, weight, sign, dscale,
 //! base-10000 digits}, DATE i32 days and TIMESTAMP[TZ] i64 microseconds
 //! since 2000-01-01, INTERVAL {us i64, days i32, months i32}, JSONB version
-//! byte 1 + text, and text/name/json raw bytes. Parameters are rendered as
+//! byte 1 + text, and text/name/json/varchar/bpchar raw bytes (bpchar
+//! padded). Parameters are rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
 //! is a protocol violation (08P01).
@@ -109,6 +110,7 @@ pub fn Types(comptime Result: type) type {
                     try put(out, &at, &.{1});
                     at += try sendText(cell, session, out[at..]);
                 },
+                .bpchar => |*value| try put(out, &at, value.slice()),
             }
             return at;
         }
@@ -162,7 +164,7 @@ pub fn Types(comptime Result: type) type {
         /// are returned in place; others are rendered into `out`.
         pub fn receiveText(bytes: []const u8, data_type: DataType, out: []u8) Error![]const u8 {
             switch (data_type) {
-                .text, .name, .json => return bytes,
+                .text, .name, .json, .varchar, .bpchar => return bytes,
                 .jsonb => {
                     if (bytes.len == 0 or bytes[0] != 1) return error.ProtocolViolation;
                     return bytes[1..];
@@ -237,7 +239,7 @@ pub fn Types(comptime Result: type) type {
                     text.len = bytes.len - 1;
                     break :blk Cell{ .text = text };
                 },
-                .name, .json => blk: {
+                .name, .json, .varchar, .bpchar => blk: {
                     var text: Io.Text = .{};
                     if (bytes.len > text.bytes.len) return error.ProtocolViolation;
                     @memcpy(text.bytes[0..bytes.len], bytes);

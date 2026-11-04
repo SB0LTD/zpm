@@ -1500,6 +1500,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "UndefinedObject")) return "42704";
     if (equal(name, "BadCopyFormat")) return "22P04";
     if (equal(name, "InvalidBinaryRepresentation")) return "22P03";
+    if (equal(name, "StringDataRightTruncation")) return "22001";
     if (equal(name, "NumericValueOutOfRange")) return "22003";
     if (equal(name, "NumericCapacity")) return "54000";
     if (equal(name, "InvalidParameterValue")) return "22023";

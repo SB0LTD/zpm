@@ -352,6 +352,12 @@ pub fn Eval(comptime config: types.Config) type {
                     append(&buffer, &at, if (known == .timestamp) ") without time zone" else ") with time zone");
                     return textCell(buffer[0..at]);
                 },
+                .varchar, .bpchar => if (typmod > 4) {
+                    append(&buffer, &at, if (known == .varchar) "character varying(" else "character(");
+                    number(&buffer, &at, typmod - 4);
+                    append(&buffer, &at, ")");
+                    return textCell(buffer[0..at]);
+                },
                 else => {},
             }
             return textCell(types.sqlTypeName(known));
@@ -665,7 +671,9 @@ pub fn Eval(comptime config: types.Config) type {
                     const escape_text: []const u8 = if (n.c == none) "\\" else escape.text.slice();
                     try validateLikeEscape(escape_text);
                     if (value == .null_value) return null;
-                    const matched = try likeMatch(value.text.slice(), pattern.text.slice(), escape_text, n.insensitive, ctx.session.control);
+                    // bpchar LIKE text matches the padded value (bpcharlike).
+                    const subject = if (value == .bpchar) value.bpchar.slice() else value.text.slice();
+                    const matched = try likeMatch(subject, pattern.text.slice(), escape_text, n.insensitive, ctx.session.control);
                     return matched != n.negated;
                 },
                 else => {},

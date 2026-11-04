@@ -722,8 +722,8 @@ pub fn Binder(comptime config: types.Config) type {
                     else => return error.UndefinedFunction,
                 },
                 .min, .max => switch (arg_ty) {
-                    .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval => arg_ty,
-                    .name => blk: {
+                    .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval, .bpchar => arg_ty,
+                    .name, .varchar => blk: {
                         n.b = try convert(context, arg, .text, -1, .implicit);
                         break :blk .text;
                     },
@@ -1892,6 +1892,8 @@ pub fn Binder(comptime config: types.Config) type {
                             // text || text, text || anynonarray, anynonarray || text.
                             if (context.node(n.a).ty == .unknown) try coerce(context, n.a, .text);
                             if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .text);
+                            if (context.node(n.a).ty == .bpchar) n.a = try convert(context, n.a, .text, -1, .implicit);
+                            if (context.node(n.b).ty == .bpchar) n.b = try convert(context, n.b, .text, -1, .implicit);
                             if (!value.stringType(context.node(n.a).ty) and !value.stringType(context.node(n.b).ty)) return error.UndefinedFunction;
                             n.ty = .text;
                         },
@@ -1966,15 +1968,18 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeExpr(context, scope, n.b);
                     try coerce(context, n.a, .text);
                     try coerce(context, n.b, .text);
-                    // name LIKE text (namelike) shares text's representation.
+                    if (context.node(n.b).ty == .bpchar) n.b = try convert(context, n.b, .text, -1, .implicit);
+                    // name LIKE text (namelike) and varchar share text's
+                    // representation; bpchar LIKE text reads the padded value.
                     const left_ty = context.node(n.a).ty;
                     const right_ty = context.node(n.b).ty;
-                    if ((left_ty != .text and left_ty != .name) or (right_ty != .text and right_ty != .name)) return error.UndefinedFunction;
+                    if (!value.characterType(left_ty) or !value.stringType(right_ty)) return error.UndefinedFunction;
                     if (n.c != none) {
                         try typeExpr(context, scope, n.c);
                         try coerce(context, n.c, .text);
+                        if (context.node(n.c).ty == .bpchar) n.c = try convert(context, n.c, .text, -1, .implicit);
                         const escape_ty = context.node(n.c).ty;
-                        if (escape_ty != .text and escape_ty != .name) return error.UndefinedFunction;
+                        if (!value.stringType(escape_ty)) return error.UndefinedFunction;
                     }
                     n.ty = .boolean;
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b) and isConstant(context, n.c);
@@ -2076,7 +2081,7 @@ pub fn Binder(comptime config: types.Config) type {
                     // Typmods are validated at bind time (eval applies them).
                     if (n.typmod >= 0 and context.node(n.a).kind == .text_literal) {
                         const text = E.literalText(context.source, context.node(n.a).text);
-                        _ = try Io.parse(target, n.typmod, text.slice(), context.session);
+                        _ = try Io.parseCast(target, n.typmod, text.slice(), context.session);
                     }
                     n.ty = target;
                     n.constant = isConstant(context, n.a);
