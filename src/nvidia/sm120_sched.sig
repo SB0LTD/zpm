@@ -24,8 +24,8 @@
 //!   it was set.
 //! - Six scoreboards: a free one when there is one, else the one the most
 //!   recent instruction holds is shared (waiting on it then waits on both).
-//! - Branches (BRA, BRA.U, CALL, RET) end a block, and so does an EXIT or
-//!   RET without a predicate (nothing falls through it): a branch waits on
+//! - Branches (BRA, BRA.U, CALL, RET) and EXIT end a block (an EXIT
+//!   too: the warp's other lanes go on after it): a branch waits on
 //!   every scoreboard in flight and stalls until every fixed-latency result
 //!   before it is ready to any reader, so a block starts with nothing
 //!   pending whichever way it is entered (a BSYNC's join included). (NAK
@@ -242,9 +242,16 @@ pub fn usesOf(in: *const sm120.Instr) Error!Uses {
     if (eql(op, "NOP") or eql(op, "BSSY") or eql(op, "BSYNC")) {
         // (convergence barriers have their own scoreboard)
         u.decoupled = !eql(op, "NOP");
+        // (a BSYNC drains as a branch does: the lanes waiting there let
+        // the warp's other paths run, which must not find their reads and
+        // writes pending)
+        u.branch = eql(op, "BSYNC");
     } else if (eql(op, "EXIT") or eql(op, "BRA") or eql(op, "CALL") or eql(op, "RET")) {
         u.decoupled = true;
-        u.branch = !eql(op, "EXIT");
+        // (an EXIT drains as a branch does: the warp's lanes that did not
+        // exit go on, elsewhere, and must not find this lane's reads and
+        // writes still pending on the warp's scoreboards)
+        u.branch = true;
         u.ends = (eql(op, "EXIT") or eql(op, "RET")) and in.guard.n == sm120.PT and !in.guard.not;
         regs(&u, in, 0, .{ .gpr = r(.branch), .pred = p(.decoupled), .upred = up(.bra_jmp) });
     } else if (eql(op, "WARPSYNC")) {

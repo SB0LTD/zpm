@@ -18,7 +18,10 @@
 //!   at it together, so divergent paths of structured code reconverge where
 //!   they meet (Volta's model, as ir3_emu's). Warp-collective instructions
 //!   (SHFL, VOTE) wait until every lane still running has reached them, or
-//!   finished; BAR.SYNC waits for the whole CTA.
+//!   finished; BAR.SYNC waits for the whole CTA. BSSY Bn records the lanes
+//!   running it; a BSYNC Bn holds its lanes until every lane recorded has
+//!   reached it or exited (the hardware's reconvergence), and lanes held
+//!   there that nothing can release are error.Divergence.
 //! - Memory: global through flat 64-bit VAs (desc[URd][Rn.64]: the
 //!   descriptor is read, as the hardware reads it, but adds nothing), local
 //!   through each thread's 16 MiB window (the QMD's low size from 0, its
@@ -242,9 +245,14 @@ const Kind = enum(u8) {
     exit,
     bra,
     bar,
-    /// Convergence and memory-ordering hints the model has no use for
-    /// (BSSY, BSYNC, WARPSYNC, MEMBAR, ...).
+    /// Memory-ordering and other hints the model has no use for
+    /// (WARPSYNC, MEMBAR, ...).
     hint,
+    /// BSSY Bn: the lanes running it are barrier n's; BSYNC Bn: a lane
+    /// waits there until every lane of barrier n has reached it or exited
+    /// (the hardware's reconvergence: no lane runs past a BSYNC early).
+    bssy,
+    bsync,
     s2r,
     cs2r,
     r2ur,
@@ -379,7 +387,7 @@ fn isCollective(k: Kind) bool {
 
 // ── The work area ───────────────────────────────────────────────────────────
 
-const TState = enum(u8) { off, run, bar, coll, done };
+const TState = enum(u8) { off, run, bar, coll, done, bsync };
 
 /// A register's history in its warp: the last write, the last fixed-
 /// latency read, the last read through each pipe of the variable-latency
@@ -423,6 +431,8 @@ const WarpT = struct {
     /// Load/store-pipe instructions up to this one have read their
     /// registers.
     lsu_done: u32 = 0,
+    /// Each convergence barrier's lanes (BSSY's), by lane bit.
+    bmask: [16]u32 = .{0} ** 16,
 };
 
 pub const Work = struct {
@@ -788,7 +798,7 @@ const UNIFORM = [_]struct { []const u8, []const u8 }{
     .{ "S2UR", "S2R" },     .{ "LDCU", "LDC" },     .{ "ULDC", "LDC" },     .{ "UIADD", "IADD" },
 };
 
-const HINTS = [_][]const u8{ "BSSY", "BSYNC", "WARPSYNC", "MEMBAR", "ERRBAR", "CCTL", "NANOSLEEP", "YIELD", "CGAERRBAR", "FENCE" };
+const HINTS = [_][]const u8{ "WARPSYNC", "MEMBAR", "ERRBAR", "CCTL", "NANOSLEEP", "YIELD", "CGAERRBAR", "FENCE" };
 
 fn compile(in: *const Instr, given: ?u64, n_code: usize) Error!Op {
     var op = Op{ .guard = in.guard, .control = in.control };
@@ -839,6 +849,12 @@ fn body(op: *Op, in: *const Instr, name: []const u8, o: []const Operand, given: 
         if (!in.has("SYNC") or in.n_ops != 1) return error.Unsupported;
         op.kind = .bar;
         op.sub = @intCast(try numValue(o[0], .int) & 0xf);
+    } else if (eql(name, "BSSY") or eql(name, "BSYNC")) {
+        op.kind = if (eql(name, "BSSY")) .bssy else .bsync;
+        const b = for (o) |x| {
+            if (x == .barrier) break x.barrier;
+        } else return error.Syntax;
+        op.sub = b & 15;
     } else if (isHint(name)) {
         op.kind = .hint;
     } else if (eql(name, "S2R")) {
@@ -1425,7 +1441,16 @@ fn runCta(c: *Ctx) Error!void {
             }
             id = b;
         }
-        if (!at_bar) break;
+        if (!at_bar) {
+            // (a lane still waiting at a BSYNC whose other lanes never come)
+            for (0..c.nthreads) |t| {
+                if (w.st[t] == .bsync) {
+                    w.trap = .{ .what = .divergence, .pc = @as(u64, w.pc[t]) * 16, .cta = c.cta, .thread = @intCast(t) };
+                    return error.Divergence;
+                }
+            }
+            break;
+        }
         var latest: u32 = 0;
         for (0..nw) |k| latest = @max(latest, w.warps[k].cycle);
         for (0..nw) |k| w.warps[k].cycle = latest;
@@ -1453,6 +1478,7 @@ fn runWarp(c: *Ctx, wi: u32) Error!void {
             if (w.st[t] == .run and w.pc[t] < min) min = w.pc[t];
         }
         var parked = false;
+        if (min == NO_PC and releaseBsync(c, wi)) continue;
         if (min == NO_PC) {
             for (base..end) |t| {
                 if (w.st[t] == .coll and w.pc[t] < min) min = w.pc[t];
@@ -1485,6 +1511,35 @@ fn runWarp(c: *Ctx, wi: u32) Error!void {
         }
         try issue(c, wi, op, min, lanes[0..n]);
     }
+}
+
+/// The lanes waiting at a BSYNC go on when every lane of its barrier has
+/// reached that BSYNC or exited (or was never running). True when some did.
+fn releaseBsync(c: *Ctx, wi: u32) bool {
+    const w = c.w;
+    const base = wi * WARP;
+    const end = @min(base + WARP, c.nthreads);
+    var released = false;
+    for (base..end) |t| {
+        if (w.st[t] != .bsync) continue;
+        const pc = w.pc[t];
+        const mask = w.warps[wi].bmask[w.ops[pc].sub];
+        var all = true;
+        for (base..end) |u| {
+            if ((mask >> @intCast(u - base)) & 1 == 0) continue;
+            const ok = w.st[u] == .done or w.st[u] == .off or (w.st[u] == .bsync and w.pc[u] == pc);
+            if (!ok) all = false;
+        }
+        if (!all) continue;
+        for (base..end) |u| {
+            if (w.st[u] == .bsync and w.pc[u] == pc) {
+                w.st[u] = .run;
+                w.pc[u] = pc + 1;
+            }
+        }
+        released = true;
+    }
+    return released;
 }
 
 fn issue(c: *Ctx, wi: u32, op: *const Op, pc: u32, lanes: []const u32) Error!void {
@@ -1522,6 +1577,17 @@ fn issue(c: *Ctx, wi: u32, op: *const Op, pc: u32, lanes: []const u32) Error!voi
         .bar => {
             for (lanes) |t| {
                 if (guardOn(w, t, op.guard)) w.st[t] = .bar else w.pc[t] = pc + 1;
+            }
+            return;
+        },
+        .bssy => {
+            var mask: u32 = 0;
+            for (on[0..m]) |t| mask |= @as(u32, 1) << @intCast(t - wi * WARP);
+            w.warps[wi].bmask[op.sub] = mask;
+        },
+        .bsync => {
+            for (lanes) |t| {
+                if (guardOn(w, t, op.guard)) w.st[t] = .bsync else w.pc[t] = pc + 1;
             }
             return;
         },

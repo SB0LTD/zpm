@@ -213,6 +213,10 @@ const Region = struct {
     top_at: u32 = 0,
     loop: bool = false,
     has_cont: bool = false,
+    /// The region diverges (counted in Ctx.div_depth while open).
+    div: bool = false,
+    /// A loop that desyncs (counted in Ctx.nobar while open).
+    desync: bool = false,
     rotated: bool = false,
     /// The address-reuse depth outside the region.
     rdepth: u8 = 0,
@@ -236,6 +240,9 @@ pub const State = struct {
     diverge: [MAX_INSTS]bool = undefined,
     exits: [MAX_INSTS]bool = undefined,
     has_cont: [MAX_INSTS]bool = undefined,
+    /// A loop whose lanes can fall out of step (a cont, or a brk or cont
+    /// inside an if): no convergence barrier inside it (see openLoop).
+    desync: [MAX_INSTS]bool = undefined,
     match: [MAX_INSTS]u32 = undefined,
     // machine instructions over virtual registers
     mi: [MAX_MI]MI = undefined,
@@ -364,6 +371,11 @@ const Ctx = struct {
     /// made inside one is not reused after it).
     depth: u8 = 0,
     rdepth: u8 = 0,
+    /// Divergent regions open (a collective in one drains first).
+    div_depth: u8 = 0,
+    /// Loops open whose lanes can fall out of step: nothing inside them
+    /// gets a convergence barrier.
+    nobar: u8 = 0,
 
     fn insts(c: *const Ctx) []const kir.Inst {
         return c.w.insts[0..c.n];
@@ -415,6 +427,7 @@ const Ctx = struct {
         var else_at: [MAX_DEPTH * 2]?u32 = undefined;
         var sp: usize = 0;
         @memset(w.has_cont[0..c.n], false);
+        @memset(w.desync[0..c.n], false);
         for (c.insts(), 0..) |in, idx| {
             for (readsOf(in)) |a| {
                 if (a) |v| w.reads[v] += 1;
@@ -459,14 +472,18 @@ const Ctx = struct {
                     // every if between here and the loop is left
                     var s = sp;
                     var found = false;
+                    var in_if = false;
                     while (s > 0) {
                         s -= 1;
                         if (w.insts[stack[s]].op == .loop) {
                             found = true;
                             if (in.op == .cont) w.has_cont[stack[s]] = true;
+                            // (lanes out of step: a cont, or a way out of an if)
+                            if (in.op == .cont or in_if) w.desync[stack[s]] = true;
                             break;
                         }
                         w.exits[stack[s]] = true;
+                        in_if = true;
                     }
                     if (!found) return error.Unbalanced;
                 },
@@ -1050,7 +1067,8 @@ const Ctx = struct {
 
     fn openIf(c: *Ctx, idx: usize, in: kir.Inst) Error!Region {
         const w = c.w;
-        var r = Region{ .rdepth = c.rdepth };
+        var r = Region{ .rdepth = c.rdepth, .div = w.diverge[idx] };
+        if (r.div) c.div_depth += 1;
         const m = w.match[idx];
         r.has_else = w.insts[m].op == .@"else";
         const end = if (r.has_else) w.match[m] else m;
@@ -1070,7 +1088,7 @@ const Ctx = struct {
         }
         r.l_end = c.label();
         r.l_else = if (r.has_else) c.label() else r.l_end;
-        if (w.diverge[idx] and !w.exits[idx]) {
+        if (w.diverge[idx] and !w.exits[idx] and c.nobar == 0) {
             if (c.depth >= MAX_DEPTH) return error.TooBig;
             r.bssy = c.depth;
             c.depth += 1;
@@ -1109,6 +1127,7 @@ const Ctx = struct {
     fn closeIf(c: *Ctx, r: *Region) Error!void {
         c.dropAddrs(r.rdepth);
         c.rdepth = r.rdepth;
+        if (r.div) c.div_depth -= 1;
         if (r.mode == .predicate) {
             c.guard = .none;
             return;
@@ -1127,17 +1146,23 @@ const Ctx = struct {
         // iteration, one from inside it after the loop)
         c.n_addrs = 0;
         if (c.guard != .none) return error.Unsupported;
-        var r = Region{ .loop = true, .has_cont = w.has_cont[idx] };
+        var r = Region{ .loop = true, .has_cont = w.has_cont[idx], .div = w.diverge[idx], .desync = w.desync[idx] };
+        if (r.div) c.div_depth += 1;
         r.l_top = c.label();
         r.l_cont = c.label();
         r.l_end = c.label();
-        if (w.diverge[idx]) {
+        if (w.diverge[idx] and c.nobar == 0) {
             if (c.depth >= MAX_DEPTH) return error.TooBig;
             r.bssy = c.depth;
             c.depth += 1;
             w.stats.bssy += 1;
             try c.eff("BSSY.RECONVERGENT", 0, &.{ .{ .bar = r.bssy.? }, .{ .label = r.l_end } });
         }
+        // (lanes out of step inside this loop may run two regions that
+        // share a barrier register at once: one's BSSY would overwrite the
+        // other's lanes, and its BSYNC wait for ever. None inside, then;
+        // the loop's own, at its exit, every lane reaches)
+        if (r.desync) c.nobar += 1;
         try c.at(r.l_top);
         r.top_at = @intCast(w.n_mi - 1);
         return r;
@@ -1146,6 +1171,8 @@ const Ctx = struct {
     fn closeLoop(c: *Ctx, r: *Region) Error!void {
         const w = c.w;
         c.n_addrs = 0;
+        if (r.div) c.div_depth -= 1;
+        if (r.desync) c.nobar -= 1;
         try c.at(r.l_cont);
         if (!r.rotated) try c.bra(.none, r.l_top);
         if (w.n_loops == MAX_LOOPS) return error.TooBig;
@@ -1369,13 +1396,27 @@ const Ctx = struct {
                     .down => "SHFL.DOWN",
                 };
                 const clamp: Opd = if (mode == .up) .rz else .{ .imm = 0x1f };
+                // (up and down by 32 or more give the lane its own value;
+                // SHFL reads the delta's low 5 bits: a register is clamped
+                // to 32, which SHFL reads as 0, an immediate decided here)
+                if ((mode == .up or mode == .down) and in.b == .imm and in.b.imm >= 32)
+                    return c.ins("MOV", 1, &.{ c.dst(in), c.src(in.a) });
                 var lane = c.src(in.b);
                 if (lane == .rz) lane = .{ .imm = 0 };
-                try c.eff(name, 2, &.{ .{ .pt = true }, c.dst(in), try c.reg(in.a), lane, clamp });
+                if ((mode == .up or mode == .down) and lane == .reg) {
+                    const t = try c.newV(.r);
+                    try c.ins("VIMNMX.U32", 1, &.{ R(t), lane, .{ .imm = 32 }, .{ .pt = true } });
+                    lane = R(t);
+                }
+                const value = try c.reg(in.a);
+                try c.drainIfDivergent();
+                try c.eff(name, 2, &.{ .{ .pt = true }, c.dst(in), value, lane, clamp });
             },
             .vote => {
                 const name = if (@as(kir.Vote, @enumFromInt(in.aux)) == .any) "VOTE.ANY" else "VOTE.ALL";
-                try c.eff(name, 1, &.{ pdst(in), try c.pred(in.a) });
+                const p = try c.pred(in.a);
+                try c.drainIfDivergent();
+                try c.eff(name, 1, &.{ pdst(in), p });
             },
             .fsqrt => try c.sqrtNative(in),
             .fdiv => return error.Unsupported,
@@ -1404,7 +1445,7 @@ const Ctx = struct {
         const special = c.label();
         var bar: ?u8 = null;
         if (c.guard != .none) return error.Unsupported;
-        if (!c.uniformArg(in.a)) {
+        if (!c.uniformArg(in.a) and c.nobar == 0) {
             if (c.depth >= MAX_DEPTH) return error.TooBig;
             bar = c.depth;
             c.depth += 1;
@@ -1470,6 +1511,17 @@ const Ctx = struct {
         try c.ins("FMUL", 1, &.{ R(h), R(r0), .{ .imm = 0x3f00_0000 } });
         try c.ins("FFMA", 1, &.{ R(e), .{ .reg = .{ .v = s0, .neg = true } }, R(s0), x });
         try c.ins("FFMA", 1, &.{ d, R(e), R(h), R(s0) });
+    }
+
+    /// In divergent code a collective may let the warp's other path run
+    /// while this one waits (sm120_emu runs it so): nothing of this path
+    /// may be pending then. A branch to the next instruction drains (as
+    /// sm120_sched drains at every branch).
+    fn drainIfDivergent(c: *Ctx) Error!void {
+        if (c.div_depth == 0) return;
+        const next = c.label();
+        try c.bra(.none, next);
+        try c.at(next);
     }
 
     fn iadd(c: *Ctx, d: Opd, a0: kir.Arg, b0: kir.Arg, idx: usize) Error!void {

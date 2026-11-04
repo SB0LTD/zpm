@@ -162,11 +162,9 @@ test "self-test on the emulated RTX (kir_sm120, sm120_emu with its hazard checks
     Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
     Log.reset();
     const res = selftest.runWith(gpu.all_targets, Rtx.dev.device(), &work, Log.line, .{ .timeout_us = TIMEOUT_US, .stop_when_lost = false, .on_failure = rtxFailure });
-    // kir_sm120 bugs the self-test found (sig-gpu-selftest's notes, S.md):
-    // shfl up/down with a register delta past the subgroup wraps; the
-    // scheduler lets an STG's source register be rewritten before its
-    // read scoreboard (sm120_emu's WAR hazard) in both flow kernels
-    try expectAllPassBut(res, &.{ "shuffles", "divergent if/else", "divergent loops" });
+    // (24 of 24: kir_sm120 clamps shfl up/down's register delta, and the
+    // scheduler drains at EXIT and BSYNC; sm120_emu holds lanes at BSYNC)
+    try expectAllPass(res);
 }
 
 // ── The emulated Adreno ─────────────────────────────────────────────────────
