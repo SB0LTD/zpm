@@ -63,7 +63,7 @@
 //! nvdisasm prints them. Where sm120_sched has no latency categories for a
 //! form yet, NAK's are used here (`fallbackUses`) until it does.
 //!
-//! Allocation-free: the caller owns the Work (about 15 MB: keep it static).
+//! Allocation-free: the caller owns the Work (about 9 MB: keep it static).
 
 const std = @import("std");
 const sm120 = @import("sm120.sig");

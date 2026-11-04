@@ -123,7 +123,7 @@ pub const EmuDevice = struct {
     /// what fromDevice copied back, so a missing call gives wrong results
     /// here, not only on hardware.
     gpu_view: []u8 = &.{},
-    /// The emulator's working storage (the caller's: about 15 MB, static).
+    /// The emulator's working storage (the caller's: about 9 MB, static).
     work: *emu.Work,
     stats: emu.Stats = .{},
     /// The last submit's fence, and the device's own semaphore its release
