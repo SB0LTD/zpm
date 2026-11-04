@@ -7,6 +7,7 @@ const jsonb = @import("jsonb.sig");
 const character = @import("character.sig");
 const uuid = @import("uuid.sig");
 const time_of_day = @import("time_of_day.sig");
+const bit_string = @import("bit_string.sig");
 
 pub const Config = struct {
     /// Caller supplies row/version/index buffers and query reference workspace.
@@ -255,6 +256,8 @@ pub const Error = error{
     StringDataRightTruncation,
     /// SQLSTATE 22009: a time zone displacement beyond +-15:59:59.
     InvalidTimeZoneDisplacement,
+    /// SQLSTATE 22026: a BIT(n) value does not have exactly n bits.
+    StringDataLengthMismatch,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -313,11 +316,11 @@ pub const Dialect = enum { postgres, mysql, tds };
 
 /// Stored column / result types. `integer` is int8 (BIGINT) and
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
-pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz };
+pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet.
-pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz };
+pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit };
 
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
@@ -343,6 +346,8 @@ pub fn dataTypeOf(ty: Type) DataType {
         .bytea => .bytea,
         .time => .time,
         .timetz => .timetz,
+        .bit => .bit,
+        .varbit => .varbit,
     };
 }
 
@@ -370,6 +375,8 @@ pub fn typeOfData(data_type: DataType) Type {
         .bytea => .bytea,
         .time => .time,
         .timetz => .timetz,
+        .bit => .bit,
+        .varbit => .varbit,
     };
 }
 
@@ -401,6 +408,8 @@ pub fn typeInfo(data_type: DataType) TypeInfo {
         .bytea => .{ .oid = 17, .name = "bytea", .len = -1, .category = 'U', .array = 1001 },
         .time => .{ .oid = 1083, .name = "time", .len = 8, .category = 'D', .array = 1183 },
         .timetz => .{ .oid = 1266, .name = "timetz", .len = 12, .category = 'D', .array = 1270 },
+        .bit => .{ .oid = 1560, .name = "bit", .len = -1, .category = 'V', .array = 1561 },
+        .varbit => .{ .oid = 1562, .name = "varbit", .len = -1, .category = 'V', .array = 1563 },
     };
 }
 
@@ -435,6 +444,8 @@ pub fn sqlTypeName(data_type: DataType) []const u8 {
         .bytea => "bytea",
         .time => "time without time zone",
         .timetz => "time with time zone",
+        .bit => "bit",
+        .varbit => "bit varying",
     };
 }
 
@@ -463,6 +474,8 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .bytea => "byteain",
         .time => "time_in",
         .timetz => "timetz_in",
+        .bit => "bit_in",
+        .varbit => "varbit_in",
     };
 }
 
@@ -497,6 +510,7 @@ pub fn typeByName(input: []const u8) ?DataType {
         .{ .name = "character varying", .data_type = .varchar }, .{ .name = "char varying", .data_type = .varchar },
         .{ .name = "character", .data_type = .bpchar },      .{ .name = "char", .data_type = .bpchar },
         .{ .name = "time without time zone", .data_type = .time }, .{ .name = "time with time zone", .data_type = .timetz },
+        .{ .name = "bit varying", .data_type = .varbit },
     };
     for (aliases) |alias| if (same(name, alias.name)) return alias.data_type;
     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
@@ -572,11 +586,14 @@ pub fn Values(comptime config: Config) type {
             }
         };
 
+        /// BIT and BIT VARYING values (bit_string.sig).
+        pub const BitString = bit_string.Bits(config.text_bytes);
+
         /// smallint/int4/int8/oid are `integer`; text/name/json are `text`;
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -598,6 +615,8 @@ pub fn Values(comptime config: Config) type {
             /// TIME: microseconds since midnight (0 through 24:00:00).
             time: i64,
             timetz: time_of_day.TimeTz,
+            /// BIT and BIT VARYING.
+            bits: BitString,
         };
 
         pub const Row = struct {
@@ -636,6 +655,7 @@ pub fn Values(comptime config: Config) type {
                 .bytea => .bytea,
                 .time => .time,
                 .timetz => .timetz,
+                .bit, .varbit => .bits,
             };
         }
 
@@ -666,6 +686,7 @@ pub fn Values(comptime config: Config) type {
                 .bytea => |*value| bytesOrder(value.slice(), right.bytea.slice()),
                 .time => |value| order(i64, value, right.time),
                 .timetz => |value| time_of_day.compareTimeTz(value, right.timetz),
+                .bits => |*value| BitString.compare(value, &right.bits),
             };
         }
 
@@ -729,6 +750,11 @@ pub fn Values(comptime config: Config) type {
                     mix(&code, @bitCast(time.us));
                     mix(&code, @as(u32, @bitCast(time.zone)));
                 },
+                .bits => |*bits| {
+                    mix(&code, tag);
+                    mix(&code, bits.len);
+                    for (bits.slice()) |byte| code = (code ^ byte) *% 1099511628211;
+                },
                 .interval => |span| {
                     mix(&code, tag);
                     const total = temporal.intervalSpan(span);
@@ -771,6 +797,9 @@ pub fn Values(comptime config: Config) type {
             switch (column.data_type) {
                 .varchar => if (!character.fits(value.text.slice(), column.typmod)) return error.StringDataRightTruncation,
                 .bpchar => if (!character.fits(value.bpchar.slice(), column.typmod)) return error.StringDataRightTruncation,
+                .bit, .varbit => {
+                    _ = try bit_string.coercedLength(value.bits.len, column.typmod, column.data_type == .bit, .implicit);
+                },
                 else => {},
             }
             if (value.* == .integer) {

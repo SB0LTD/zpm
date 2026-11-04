@@ -19,6 +19,7 @@ const character = @import("character.sig");
 const uuid = @import("uuid.sig");
 const bytea = @import("bytea.sig");
 const time_of_day = @import("time_of_day.sig");
+const bit_string = @import("bit_string.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -84,6 +85,10 @@ pub fn characterType(ty: Type) bool {
     return stringType(ty) or ty == .bpchar;
 }
 
+pub fn bitType(ty: Type) bool {
+    return ty == .bit or ty == .varbit;
+}
+
 /// pg_cast entries of the B11 types; null when the pair is not one of them.
 fn extendedCast(from: Type, to: Type, context: Context) ?bool {
     if (from == .bpchar or to == .bpchar) {
@@ -93,6 +98,14 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         // I/O conversion: to a string type in assignment, from one explicitly.
         if (to == .bpchar) return context != .implicit;
         return context == .explicit;
+    }
+    if (bitType(from) or bitType(to)) {
+        // bit <-> varbit are implicit (binary); int4/int8 <-> bit explicit.
+        if (bitType(from) and bitType(to)) return true;
+        if ((to == .bit and (from == .int4 or from == .int8)) or (from == .bit and (to == .int4 or to == .int8))) return context == .explicit;
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
     }
     if (from == .time or to == .time or from == .timetz or to == .timetz) {
         // pg_cast: time -> interval and time -> timetz are implicit;
@@ -178,6 +191,8 @@ pub fn comparisonType(a: Type, b: Type) ?Type {
     if (a != b and numericCategory(a) and numericCategory(b) and (a == .float4 or b == .float4)) return .float8;
     // bpchar with varchar resolves bpchareq (one exact operand, varchar is
     // binary-coercible); any other string mix compares as TEXT.
+    // bit and varbit compare with varbit's operators (varbit is preferred).
+    if (a != b and bitType(a) and bitType(b)) return .varbit;
     if (a != b and characterType(a) and characterType(b) and (a == .bpchar or b == .bpchar))
         return if ((a == .bpchar or a == .varchar) and (b == .bpchar or b == .varchar)) .bpchar else .text;
     return common(a, b);
@@ -188,6 +203,7 @@ pub fn common(a: Type, b: Type) ?Type {
     // time -> timetz and time -> interval are implicit one way only.
     if ((a == .time and b == .timetz) or (a == .timetz and b == .time)) return .timetz;
     if ((a == .time and b == .interval) or (a == .interval and b == .time)) return .interval;
+    if (bitType(a) and bitType(b)) return a;
     if ((a == .bpchar and stringType(b)) or (stringType(a) and b == .bpchar) or
         (a == .varchar and stringType(b)) or (stringType(a) and b == .varchar)) return characterCommon(a, b);
     if (numericCategory(a) and numericCategory(b)) {
@@ -288,6 +304,7 @@ pub fn Io(comptime config: types.Config) type {
                 .bytea => |*value| bytea.format(value.slice(), buffer),
                 .time => |value| time_of_day.format(value, buffer),
                 .timetz => |value| time_of_day.formatTz(value, buffer),
+                .bits => |*value| value.format(buffer),
             };
         }
 
@@ -369,6 +386,7 @@ pub fn Io(comptime config: types.Config) type {
                     break :blk .{ .bytea = bytes };
                 },
                 .time, .timetz => try parseTime(ty, input, session),
+                .bit, .varbit => .{ .bits = try V.BitString.parse(input) },
             };
             return applyTypmod(cell, ty, typmod);
         }
@@ -427,6 +445,10 @@ pub fn Io(comptime config: types.Config) type {
                     .bpchar => |*value| characterCell(value.slice(), .bpchar, typmod, .explicit),
                     else => cell,
                 },
+                .bit, .varbit => switch (cell) {
+                    .bits => |*value| .{ .bits = try value.resized(try bit_string.coercedLength(value.len, typmod, ty == .bit, .explicit)) },
+                    else => cell,
+                },
                 else => applyTypmod(cell, ty, typmod),
             };
         }
@@ -452,6 +474,13 @@ pub fn Io(comptime config: types.Config) type {
                 },
                 .timetz => switch (cell) {
                     .timetz => |value| .{ .timetz = .{ .us = time_of_day.round(value.us, typmod), .zone = value.zone } },
+                    else => cell,
+                },
+                .bit, .varbit => switch (cell) {
+                    .bits => |*value| blk: {
+                        _ = try bit_string.coercedLength(value.len, typmod, ty == .bit, .implicit);
+                        break :blk cell;
+                    },
                     else => cell,
                 },
                 else => cell,
@@ -530,6 +559,8 @@ pub fn Io(comptime config: types.Config) type {
                         break :blk V.Cell{ .integer = float_text.toInt(value, range.low, range.high) catch return if (to == .int2) error.NumericValueOutOfRange else error.IntegerOverflow };
                     },
                     .text => |*value| try parse(to, -1, value.slice(), session),
+                    // bittoint4 / bittoint8.
+                    .bits => |*value| V.Cell{ .integer = try value.toInteger(if (to == .int4) 32 else 64) },
                     else => return error.CannotCoerce,
                 },
                 .oid => switch (cell) {
@@ -661,6 +692,16 @@ pub fn Io(comptime config: types.Config) type {
                     .timestamptz => |value| if (temporal.finiteTimestamp(value)) V.Cell{ .time = time_of_day.ofTimestamp(temporal.toLocal(&session.zone, value)) } else @as(V.Cell, .null_value),
                     .interval => |value| V.Cell{ .time = time_of_day.fromInterval(value) },
                     .text => |*value| try parse(.time, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .bit, .varbit => switch (cell) {
+                    .bits => cell,
+                    .text => |*value| try parse(to, -1, value.slice(), session),
+                    // bitfromint4 / bitfromint8: BIT(n), n defaulting to 1.
+                    .integer => |value| if (to == .bit and (from == .int4 or from == .int8))
+                        V.Cell{ .bits = try V.BitString.fromInteger(value, if (from == .int4) 32 else 64, if (typmod > 0) @intCast(typmod) else 1) }
+                    else
+                        return error.CannotCoerce,
                     else => return error.CannotCoerce,
                 },
                 .timetz => switch (cell) {

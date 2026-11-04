@@ -1611,6 +1611,7 @@ pub fn Database(comptime config: Config) type {
         fn characterMaximumLength(column: *const V.Column) ?i64 {
             return switch (column.data_type) {
                 .varchar, .bpchar => if (column.typmod > 4) column.typmod - 4 else null,
+                .bit, .varbit => if (column.typmod > 0) column.typmod else null,
                 else => null,
             };
         }

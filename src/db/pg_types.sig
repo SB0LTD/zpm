@@ -8,8 +8,8 @@
 //! since 2000-01-01, INTERVAL {us i64, days i32, months i32}, JSONB version
 //! byte 1 + text, and text/name/json/varchar/bpchar raw bytes (bpchar
 //! padded), UUID 16 bytes, BYTEA raw bytes (hex text), TIME i64
-//! microseconds and TIMETZ {i64 microseconds, i32 seconds west}. Parameters
-//! are rendered as
+//! microseconds, TIMETZ {i64 microseconds, i32 seconds west} and BIT/VARBIT
+//! {i32 bit length, packed bits}. Parameters are rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
 //! is a protocol violation (08P01).
@@ -120,6 +120,10 @@ pub fn Types(comptime Result: type) type {
                     try putInt(i64, out, &at, value.us);
                     try putInt(i32, out, &at, value.zone);
                 },
+                .bits => |*value| {
+                    try putInt(i32, out, &at, @intCast(value.len));
+                    try put(out, &at, value.slice());
+                },
             }
             return at;
         }
@@ -129,6 +133,9 @@ pub fn Types(comptime Result: type) type {
             const data_type = Io.typeFromOid(type_oid) orelse return null;
             return switch (data_type) {
                 .text, .integer, .integer32, .boolean => null,
+                // `::bit` would mean BIT(1); varbit keeps every bit and is
+                // implicitly castable to BIT(n).
+                .bit => "varbit",
                 else => Io.typeInfo(data_type).name,
             };
         }
@@ -260,6 +267,19 @@ pub fn Types(comptime Result: type) type {
                     @memcpy(text.bytes[0 .. bytes.len - 1], bytes[1..]);
                     text.len = bytes.len - 1;
                     break :blk Cell{ .text = text };
+                },
+                .bit, .varbit => blk: {
+                    const BitString = @TypeOf(@as(Cell, undefined).bits);
+                    if (bytes.len < 4) return error.ProtocolViolation;
+                    const bit_count = getInt(i32, bytes[0..4]);
+                    if (bit_count < 0 or @as(usize, @intCast(bit_count)) > BitString.max_bits) return error.ProtocolViolation;
+                    const count: usize = @intCast(@divTrunc(bit_count + 7, 8));
+                    if (bytes.len != 4 + count) return error.ProtocolViolation;
+                    var value: BitString = .{ .len = @intCast(bit_count) };
+                    @memcpy(value.bytes[0..count], bytes[4..]);
+                    // varbit_recv: VARBIT_PAD clears the unused low bits.
+                    if (@mod(bit_count, 8) != 0) value.bytes[count - 1] &= @as(u8, @truncate(@as(u16, 0xff00) >> @intCast(@mod(bit_count, 8))));
+                    break :blk Cell{ .bits = value };
                 },
                 .bytea => blk: {
                     var raw: Io.Text = .{};

@@ -359,6 +359,12 @@ pub fn Eval(comptime config: types.Config) type {
                     append(&buffer, &at, if (known == .time) ") without time zone" else ") with time zone");
                     return textCell(buffer[0..at]);
                 },
+                .bit, .varbit => if (typmod > 0) {
+                    append(&buffer, &at, if (known == .bit) "bit(" else "bit varying(");
+                    number(&buffer, &at, typmod);
+                    append(&buffer, &at, ")");
+                    return textCell(buffer[0..at]);
+                },
                 .varchar, .bpchar => if (typmod > 4) {
                     append(&buffer, &at, if (known == .varchar) "character varying(" else "character(");
                     number(&buffer, &at, typmod - 4);

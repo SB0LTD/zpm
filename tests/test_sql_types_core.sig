@@ -98,6 +98,8 @@ fn sqlstate(err: anyerror, wanted: []const u8) !void {
         .{ .name = "InvalidDatetimeFormat", .state = "22007" },
         .{ .name = "DatetimeFieldOverflow", .state = "22008" },
         .{ .name = "NumericValueOutOfRange", .state = "22003" },
+        .{ .name = "IntegerOverflow", .state = "22003" },
+        .{ .name = "AmbiguousFunction", .state = "42725" },
         .{ .name = "DivisionByZero", .state = "22012" },
     };
     var state: []const u8 = "?";
@@ -580,11 +582,116 @@ fn time() !void {
     try meta(3, 1266, 3);
 }
 
+// ---- BIT / BIT VARYING -------------------------------------------------------
+
+fn bit() !void {
+    // oracle: PG.TYPE.BIT.
+    try exec("CREATE TABLE tdd_type(v BIT(3))");
+    try exec("INSERT INTO tdd_type VALUES(B'101'),(NULL)");
+    try rows("SELECT v FROM tdd_type ORDER BY v NULLS LAST", "101;NULL");
+    try meta(0, 1560, 3);
+    try exec("DROP TABLE tdd_type");
+
+    // Bit-string constants are BIT without a typmod.
+    try rows("SELECT B'101', b'0', B''", "101|0|");
+    try meta(0, 1560, -1);
+    // Explicit casts pad/truncate BIT(n) and truncate BIT VARYING(n);
+    // input takes binary digits or, after an x, hex digits.
+    try rows("SELECT '101'::bit(3), '1'::bit(3), '10101'::bit(3), '101'::bit, '1'::varbit(3), '10101'::varbit(3)", "101|100|101|1|1|101");
+    try meta(0, 1560, 3);
+    try meta(3, 1560, 1);
+    try meta(4, 1562, 3);
+    try rows("SELECT 'x1F'::bit(8), 'X1f'::varbit, 'b101'::bit(3)", "00011111|00011111|101");
+    try meta(1, 1562, -1);
+    try rows("SELECT CAST(B'1' AS BIT VARYING(4)), BIT(2) '10', BIT VARYING '0110', VARBIT(2) '1'", "1|10|0110|1");
+    try meta(0, 1562, 4);
+    try meta(1, 1560, 2);
+    try rejects("SELECT '102'::bit(3)", error.InvalidTextRepresentation);
+    try rejects("SELECT 'xg'::bit(4)", error.InvalidTextRepresentation);
+    try rejects("SELECT ' 101'::varbit", error.InvalidTextRepresentation);
+    try rejects("SELECT B'12'", error.InvalidTextRepresentation);
+    try rejects("SELECT '1'::bit(0)", error.InvalidParameterValue);
+    try rejects("CREATE TABLE bad(v VARBIT(0))", error.InvalidParameterValue);
+
+    try exec("CREATE TABLE bits(id INT PRIMARY KEY, f BIT(3), v VARBIT(3), u BIT VARYING)");
+    try exec("INSERT INTO bits VALUES(1, B'101', B'1', B'1000'), (2, '011', '', '1'), (3, NULL, B'111', B'0'), (4, B'111', NULL, NULL)");
+    try rows("SELECT f, v, u FROM bits ORDER BY id", "101|1|1000;011||1;NULL|111|0;111|NULL|NULL");
+    try meta(0, 1560, 3);
+    try meta(1, 1562, 3);
+    try meta(2, 1562, -1);
+    // Assignment: BIT(n) needs exactly n bits (22026); VARBIT(n) at most n (22001).
+    try rejects("INSERT INTO bits(id, f) VALUES(5, B'10')", error.StringDataLengthMismatch);
+    try sqlstate(error.StringDataLengthMismatch, "22026");
+    try rejects("INSERT INTO bits(id, f) VALUES(5, B'1010')", error.StringDataLengthMismatch);
+    try rejects("INSERT INTO bits(id, f) VALUES(5, '11')", error.StringDataLengthMismatch);
+    try rejects("INSERT INTO bits(id, v) VALUES(5, B'1010')", error.StringDataRightTruncation);
+    try rejects("INSERT INTO bits(id, f) VALUES(5, B'111'), (6, B'1')", error.StringDataLengthMismatch);
+    try rejects("UPDATE bits SET v = u", error.StringDataRightTruncation);
+    try rows("SELECT COUNT(*), COUNT(v) FROM bits", "4|3");
+    try exec("UPDATE bits SET u = f WHERE id = 4");
+    try rows("SELECT u FROM bits WHERE id = 4", "111");
+    // bit_cmp ordering: common bytes, then the shorter string first.
+    try rows("SELECT u FROM bits ORDER BY u", "0;1;1000;111");
+    try rows("SELECT v FROM bits ORDER BY v DESC NULLS FIRST", "NULL;111;1;");
+    try rows("SELECT id FROM bits WHERE f = B'101' OR v = '111' ORDER BY id", "1;3");
+    try rows("SELECT B'101' = B'101', B'10' < B'101', B'11' > B'101', B'0' < B'1', B'1' < B'1000', B'101' = '101'::varbit, B'1' <> B'10'", "t|t|t|t|t|t|t");
+    try rows("SELECT COUNT(DISTINCT u) FROM bits", "4");
+    // Integer casts (explicit only).
+    try rows("SELECT B'101'::int4, B'11111111111111111111111111111111'::int4, 5::bit(3), (-1)::bit(4), 5::bigint::bit(4), B'101'::bigint, (-2)::bit(36)",
+        "5|-1|101|1111|0101|5|111111111111111111111111111111111110");
+    try meta(0, 23, -1);
+    try meta(2, 1560, 3);
+    try rejects("SELECT B'111111111111111111111111111111111'::int4", error.IntegerOverflow);
+    try sqlstate(error.IntegerOverflow, "22003");
+    try rejects("SELECT 1.5::bit", error.CannotCoerce);
+    try rejects("SELECT 1::smallint::bit(2)", error.CannotCoerce);
+    try rejects("SELECT B'1'::int4 + B'1'", error.UndefinedFunction);
+    try rejects("SELECT B'1'::varbit::int4", error.CannotCoerce);
+    // Text casts and type names.
+    try rows("SELECT B'101'::text, CAST(f AS VARCHAR(2)), f::varbit FROM bits WHERE id = 1", "101|10|101");
+    try meta(0, 25, -1);
+    try rejects("SELECT f = '101'::text FROM bits", error.UndefinedFunction);
+    try rows("SELECT NULL::bit(2), format_type(1560, 3), format_type(1562, 5), format_type(1562, -1), 'varbit'::regtype::text, 'bit'::regtype::text",
+        "NULL|bit(3)|bit varying(5)|bit varying|bit varying|bit");
+    try rows("SELECT data_type, character_maximum_length FROM information_schema.columns WHERE table_name = 'bits' AND column_name <> 'id' ORDER BY ordinal_position",
+        "bit|3;bit varying|3;bit varying|NULL");
+    try exec("DROP TABLE bits");
+    // Capacity: Config.text_bytes * 8 bits per value.
+    try exec("SELECT 5::bit(1024)");
+    try check(result.rows[0].cells[0] == .bits and result.rows[0].cells[0].bits.len == 1024);
+    try rejects("SELECT 5::bit(1025)", error.TextCapacity);
+
+    // Wire: i32 bit length then the packed bits (zero padded).
+    try check(Wire.oid(.bit) == 1560 and Wire.oid(.varbit) == 1562 and Wire.length(.bit) == -1 and Wire.length(.varbit) == -1);
+    try exec("SELECT B'101', '1000000011'::varbit");
+    try sendText(&result.rows[0].cells[0], "101");
+    try sendBinary(&result.rows[0].cells[0], .bit, &.{ 0, 0, 0, 3, 0xa0 });
+    try sendBinary(&result.rows[0].cells[1], .varbit, &.{ 0, 0, 0, 10, 0x80, 0xc0 });
+    try receive(&.{ 0, 0, 0, 3, 0xbf }, .bit, "101");
+    try receive(&.{ 0, 0, 0, 0 }, .varbit, "");
+    try literal(&.{ 0, 0, 0, 3, 0xa0 }, 1560, 1, "'101'::varbit");
+    try literal(&.{ 0, 0, 0, 2, 0x40 }, 1562, 1, "'01'::varbit");
+    var out: [64]u8 = undefined;
+    try check(if (Wire.receiveText(&.{ 0, 0, 0, 9, 0xff }, .varbit, &out)) |_| false else |err| err == error.ProtocolViolation);
+    try check(if (Wire.receiveText(&.{ 0xff, 0xff, 0xff, 0xff }, .varbit, &out)) |_| false else |err| err == error.ProtocolViolation);
+
+    // Durability.
+    try replay(&.{
+        "CREATE TABLE r(id INT PRIMARY KEY, f BIT(3), v VARBIT(12))",
+        "INSERT INTO r VALUES(1, B'101', '100000001'), (2, NULL, ''), (3, '000', NULL)",
+        "UPDATE r SET v = f WHERE id = 3",
+    }, "SELECT * FROM r ORDER BY id");
+    try shown("replica", "1|101|100000001;2|NULL|;3|000|000");
+    try meta(1, 1560, 3);
+    try meta(2, 1562, 12);
+}
+
 pub fn main(init: std.process.Init) !void {
     try character();
     try uuid();
     try bytea();
     try time();
+    try bit();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-types-core\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

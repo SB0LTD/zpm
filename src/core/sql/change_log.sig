@@ -28,7 +28,8 @@
 //!   | 9 timestamptz i64 | 10 interval {months i32, days i32, us i64}
 //!   | 11 jsonb len u32 + canonical bytes | 12 bpchar len u32 + padded bytes
 //!   (VARCHAR values use 3) | 13 uuid 16 bytes | 14 bytea len u32 + bytes
-//!   | 15 time i64 | 16 timetz {us i64, zone i32 seconds west}. Every value is checked against the
+//!   | 15 time i64 | 16 timetz {us i64, zone i32 seconds west}
+//!   | 17 bit/varbit bit length u32 + packed bytes (zero padded). Every value is checked against the
 //!   column's type OID (create_table) before anything applies.
 //! Ops may repeat a (table, rowid) and apply in record order.
 //!
@@ -48,6 +49,7 @@ const jsonb = @import("jsonb.sig");
 const sequence = @import("sequence.sig");
 const character = @import("character.sig");
 const time_of_day = @import("time_of_day.sig");
+const bit_string = @import("bit_string.sig");
 const Error = types.Error;
 
 pub const format_version: u16 = 1;
@@ -252,6 +254,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 16);
                     try writer.int(i64, value.us);
                     try writer.int(i32, value.zone);
+                },
+                .bits => |*value| {
+                    try writer.int(u8, 17);
+                    try writer.int(u32, @intCast(value.len));
+                    try writer.bytes(value.slice());
                 },
             }
         }
@@ -595,6 +602,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     if (!time_of_day.validTime(us)) return error.InvalidChangeRecord;
                     break :blk .{ .time = us };
                 },
+                17 => blk: {
+                    const bits = try reader.int(u32);
+                    if (bits > V.BitString.max_bits) return error.ChangeRecordConflict;
+                    var value: V.BitString = .{ .len = bits };
+                    const count = bit_string.byteLength(bits);
+                    @memcpy(value.bytes[0..count], try reader.take(count));
+                    if (!value.padded()) return error.InvalidChangeRecord;
+                    break :blk .{ .bits = value };
+                },
                 16 => blk: {
                     const us = try reader.int(i64);
                     const zone = try reader.int(i32);
@@ -658,6 +674,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     },
                     .timestamp, .timestamptz, .time, .timetz => column.typmod >= -1 and column.typmod <= 6,
                     .varchar, .bpchar => character.validTypmod(column.typmod),
+                    .bit, .varbit => bit_string.validTypmod(column.typmod),
                     else => column.typmod == -1,
                 };
                 if (!typmod_ok) return error.InvalidChangeRecord;

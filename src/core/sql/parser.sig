@@ -28,6 +28,7 @@ const alpha = @import("alpha.sig");
 const numeric = @import("numeric.sig");
 const sequence = @import("sequence.sig");
 const character = @import("character.sig");
+const bit_string = @import("bit_string.sig");
 const Error = types.Error;
 const Token = lexer.Token;
 const Symbol = lexer.Symbol;
@@ -559,7 +560,7 @@ pub fn Parser(comptime config: types.Config) type {
         fn typeWord(token: Token) bool {
             return switch (token.keyword) {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
-                .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz => true,
+                .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit => true,
                 else => false,
             };
         }
@@ -593,6 +594,16 @@ pub fn Parser(comptime config: types.Config) type {
             try self.advance();
             try self.expectSymbol(.rparen);
             return character.typmodOf(length);
+        }
+
+        /// `(n)` of BIT/VARBIT (typmod n, 1..83886080); BIT means BIT(1).
+        fn bitLength(self: *Self, default_one: bool) Error!i32 {
+            if (!try self.takeSymbol(.lparen)) return if (default_one) 1 else -1;
+            if (self.current.kind != .integer) return error.Syntax;
+            const length = self.current.integer;
+            try self.advance();
+            try self.expectSymbol(.rparen);
+            return bit_string.typmodOf(length);
         }
 
         fn typeName(self: *Self) Error!TypeSpec {
@@ -666,6 +677,11 @@ pub fn Parser(comptime config: types.Config) type {
                     break :blk .{ .ty = if (zoned) .timetz else .time, .typmod = p };
                 },
                 .timetz => .{ .ty = .timetz, .typmod = try self.precision() },
+                .bit => blk: {
+                    const varying = try self.takeWord("VARYING");
+                    break :blk .{ .ty = if (varying) .varbit else .bit, .typmod = try self.bitLength(!varying) };
+                },
+                .varbit => .{ .ty = .varbit, .typmod = try self.bitLength(false) },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };
@@ -1315,9 +1331,10 @@ pub fn Parser(comptime config: types.Config) type {
             const lparen = after.kind == .symbol and after.symbol == .lparen;
             return (token.isWord("DOUBLE") and after.isWord("PRECISION")) or
                 ((token.isWord("TIMESTAMP") or token.isWord("TIME")) and (after.isWord("WITH") or after.isWord("WITHOUT"))) or
-                ((token.isWord("CHARACTER") or token.isWord("CHAR")) and after.isWord("VARYING")) or
+                ((token.isWord("CHARACTER") or token.isWord("CHAR") or token.isWord("BIT")) and after.isWord("VARYING")) or
                 (lparen and (token.isWord("NUMERIC") or token.isWord("DECIMAL") or token.isWord("TIMESTAMP") or token.isWord("TIMESTAMPTZ") or
-                token.isWord("TIME") or token.isWord("TIMETZ") or token.isWord("VARCHAR") or token.isWord("CHARACTER") or token.isWord("CHAR") or token.isWord("BPCHAR")));
+                token.isWord("TIME") or token.isWord("TIMETZ") or token.isWord("VARCHAR") or token.isWord("CHARACTER") or token.isWord("CHAR") or token.isWord("BPCHAR") or
+                token.isWord("BIT") or token.isWord("VARBIT")));
         }
 
         fn ends(token: Token) bool {
@@ -1853,6 +1870,18 @@ pub fn Parser(comptime config: types.Config) type {
                     const target = try self.typeName();
                     try self.expectSymbol(.rparen);
                     return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
+                }
+                // Bit-string constant B'...' (the quote follows the B directly):
+                // BIT without a typmod, read by bit_in.
+                if (token.len == 1 and wordIs(self.source, token, "b")) {
+                    const after = try self.peek();
+                    if (after.kind == .string and after.start == token.end + 1) {
+                        try self.advance();
+                        const literal = self.current;
+                        try self.advance();
+                        const inner = try self.pool.add(.{ .kind = .text_literal, .text = literal.quoted() });
+                        return self.pool.add(.{ .kind = .cast, .cast_type = .bit, .typmod = -1, .a = inner });
+                    }
                 }
                 // Typed literal: DATE '...', TIMESTAMP [WITH TIME ZONE] '...', ...
                 if (typeWord(token)) {
