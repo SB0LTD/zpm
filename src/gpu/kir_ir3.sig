@@ -256,6 +256,8 @@ const VInfo = struct {
     hint: u16 = NONE,
     /// Read as a half register somewhere: lives in r0..r31 (hr0..hr63).
     low: bool = false,
+    /// The first position that writes it (machine level).
+    fdef: u32 = NOWHERE,
 };
 
 const Loop = struct { head: u32, end: u32, depth: u16 };
@@ -758,11 +760,14 @@ fn argImm(a: kir.Arg) ?u32 {
 
 /// The instruction that defines `a` (one definition, used once here), if
 /// it is `op`.
-fn singleUseDef(w: *const Work, a: kir.Arg, op: kir.Op) ?u32 {
+fn singleUseDef(w: *const Work, a: kir.Arg, op: kir.Op, at: u32) ?u32 {
     const v = argReg(a) orelse return null;
     if (v >= w.nv) return null;
     const info = w.vi[v];
     if (info.defs != 1 or info.uses != 1 or info.def_at == NOWHERE) return null;
+    // (a register read before its only definition is a loop-carried value:
+    // the read sees the previous turn's, so nothing is folded)
+    if (info.def_at >= at) return null;
     if (w.fuse[info.def_at] != .none) return null;
     const def = w.insts[info.def_at];
     if (def.op != op) return null;
@@ -790,14 +795,14 @@ fn patterns(w: *Work) void {
                     if (w.fuse[i] == .none) {
                         const m = pair[1];
                         if (argImm(m) != null or aliasConst(w, m)) {
-                            if (singleUseDef(w, pair[0], .shr)) |j| {
+                            if (singleUseDef(w, pair[0], .shr, i)) |j| {
                                 const s = w.insts[j];
                                 if (argImm(s.b)) |sh| if (sh < 32 and stable(w, s.a, j) and (s.ty != .i32 or maskFits(argImm(m), sh))) {
                                     w.fuse[i] = .shrm;
                                     w.fuse_with[i] = j;
                                     w.fuse[j] = .skip;
                                 };
-                            } else if (singleUseDef(w, pair[0], .shl)) |j| {
+                            } else if (singleUseDef(w, pair[0], .shl, i)) |j| {
                                 const s = w.insts[j];
                                 if (argImm(s.b)) |sh| if (sh < 32 and stable(w, s.a, j)) {
                                     w.fuse[i] = .shlm;
@@ -813,21 +818,21 @@ fn patterns(w: *Work) void {
                 if (in.ty == .pred) continue;
                 inline for (.{ .{ in.a, in.b }, .{ in.b, in.a } }) |pair| {
                     if (w.fuse[i] == .none) {
-                        if (singleUseDef(w, pair[0], .shl)) |j| {
+                        if (singleUseDef(w, pair[0], .shl, i)) |j| {
                             const s = w.insts[j];
                             if (argImm(s.b)) |sh| if (sh < 32 and stable(w, s.a, j)) {
                                 w.fuse[i] = .shlg;
                                 w.fuse_with[i] = j;
                                 w.fuse[j] = .skip;
                             };
-                        } else if (singleUseDef(w, pair[0], .shr)) |j| {
+                        } else if (singleUseDef(w, pair[0], .shr, i)) |j| {
                             const s = w.insts[j];
                             if (s.ty != .i32) if (argImm(s.b)) |sh| if (sh < 32 and stable(w, s.a, j)) {
                                 w.fuse[i] = .shrg;
                                 w.fuse_with[i] = j;
                                 w.fuse[j] = .skip;
                             };
-                        } else if (singleUseDef(w, pair[0], .@"and")) |j| {
+                        } else if (singleUseDef(w, pair[0], .@"and", i)) |j| {
                             const s = w.insts[j];
                             if (w.fuse[j] == .none and s.ty != .pred and stable(w, s.a, j) and stable(w, s.b, j)) {
                                 w.fuse[i] = .andg;
@@ -841,7 +846,7 @@ fn patterns(w: *Work) void {
             .iadd => {
                 // a * b + c in one mad.u24 / mad.s24 when the factors are small
                 inline for (.{ .{ in.a, in.b }, .{ in.b, in.a } }) |pair| {
-                    if (w.fuse[i] == .none) if (singleUseDef(w, pair[0], .imul)) |j| {
+                    if (w.fuse[i] == .none) if (singleUseDef(w, pair[0], .imul, i)) |j| {
                         const m = w.insts[j];
                         if (stable(w, m.a, j) and stable(w, m.b, j) and mul24(w, m.a, m.b, m.ty) != null) {
                             w.fuse[i] = .imad;
@@ -856,7 +861,7 @@ fn patterns(w: *Work) void {
                 // read x's low or high half directly
                 const cv: kir.Cvt = @bitCast(in.aux);
                 if (cv.from != .f16) continue;
-                const j = singleUseDef(w, in.a, .mov) orelse continue;
+                const j = singleUseDef(w, in.a, .mov, i) orelse continue;
                 const mv = w.insts[j];
                 if (mv.ty != .f16 or !stable(w, mv.a, j)) continue;
                 const x = argReg(mv.a) orelse continue;
@@ -864,7 +869,7 @@ fn patterns(w: *Work) void {
                 w.fuse[i] = .half_lo;
                 w.fuse_with[i] = j;
                 w.fuse[j] = .skip;
-                if (singleUseDef(w, mv.a, .shr)) |js| {
+                if (singleUseDef(w, mv.a, .shr, j)) |js| {
                     const sh = w.insts[js];
                     if (argImm(sh.b)) |n16| if (n16 == 16 and stable(w, sh.a, js)) if (argReg(sh.a)) |y| if (y < w.nv and w.vi[y].cls == .full) {
                         w.fuse[i] = .half_hi;
@@ -875,7 +880,7 @@ fn patterns(w: *Work) void {
             },
             .@"if", .brk, .cont => {
                 // A compare used only by this branch goes straight into p0.x.
-                if (singleUseDef(w, in.a, .icmp) orelse singleUseDef(w, in.a, .fcmp)) |j| {
+                if (singleUseDef(w, in.a, .icmp, i) orelse singleUseDef(w, in.a, .fcmp, i)) |j| {
                     const c = w.insts[j];
                     if (stable(w, c.a, j) and stable(w, c.b, j) or j + 1 == i) {
                         w.fuse[i] = .branch;
@@ -2710,12 +2715,20 @@ fn touch(w: *Work, v: u16, pos: u32) void {
     if (pos > info.last) info.last = pos;
 }
 
+fn touchDef(w: *Work, v: u16, pos: u32) void {
+    if (v == NONE or isPhys(v)) return;
+    touch(w, v, pos);
+    const info = &w.vi[unitHead(w, v)];
+    if (info.fdef == NOWHERE or pos < info.fdef) info.fdef = pos;
+}
+
 fn allocate(w: *Work) Error!void {
     for (0..w.nv) |v| {
         w.vi[v].first = NOWHERE;
         w.vi[v].last = 0;
         w.vi[v].unit = NONE;
         w.vi[v].hint = NONE;
+        w.vi[v].fdef = NOWHERE;
     }
     // Input registers: r0.x.. live until their last read.
     var tid_last = [3]u32{ 0, 0, 0 };
@@ -2735,7 +2748,7 @@ fn allocate(w: *Work) Error!void {
             for (0..n) |k| touch(w, s + @as(u16, @intCast(k)), 2 * i + @intFromBool(m.early));
         }
         if (m.dst != NONE and !isPhys(m.dst)) {
-            for (0..m.dn) |k| touch(w, m.dst + @as(u16, @intCast(k)), 2 * i + 1);
+            for (0..m.dn) |k| touchDef(w, m.dst + @as(u16, @intCast(k)), 2 * i + 1);
         }
         if (m.kind == .copy and m.src[0] != NONE and !isPhys(m.src[0]) and m.dst != NONE and w.vi[m.dst].head == NONE and w.vi[m.src[0]].head == NONE) {
             w.vi[m.dst].hint = m.src[0];
@@ -2753,7 +2766,9 @@ fn allocate(w: *Work) Error!void {
                 const info = &w.vi[vv];
                 if (info.first == NOWHERE) continue;
                 if (info.last < h or info.first > e) continue;
-                const crosses = info.first < h or info.last > e or (w.vi[vv].defs > 1);
+                // live into, out of, or round the loop (several definitions,
+                // or a read before the first: the last turn's value)
+                const crosses = info.first < h or info.last > e or w.vi[vv].defs > 1 or info.fdef == NOWHERE or info.fdef > info.first;
                 if (!crosses) continue;
                 if (info.first > h) {
                     info.first = h;
