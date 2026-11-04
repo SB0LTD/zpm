@@ -113,7 +113,8 @@ const STAGING_BYTES = 4 << 20;
 pub const Work = struct {
     insts: [16384]kir.Inst = undefined,
     tys: [16384]kir.Ty = undefined,
-    compile_mem: [8 << 20]u8 align(16) = undefined,
+    // (the backends' working storage: kir_ir3 takes about 12 MB)
+    compile_mem: [24 << 20]u8 align(16) = undefined,
     code: [512 << 10]u8 align(16) = undefined,
     dispatches: [MAX_DISPATCHES]gpu.Dispatch = undefined,
     buffers: [MAX_DISPATCHES * 4]Buffer = undefined,
@@ -268,11 +269,6 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             try self.placeWeights();
             try self.readFactors();
             try self.allocBuffers();
-            if (plan.attention_layer_count > 0) {
-                const group = plan.head_count / attentionGroupSize(plan);
-                self.heads_per_group = @min(group, kernels.MAX_ROWS);
-                self.tokens_per_group = kernels.MAX_ROWS / self.heads_per_group;
-            }
             return self;
         }
 
@@ -333,13 +329,28 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             if (plan.attention_layer_count > 0) {
                 const group = plan.head_count / attentionGroupSize(plan);
                 const hg = @min(group, kernels.MAX_ROWS);
-                const tt = kernels.MAX_ROWS / hg;
+                self.heads_per_group = hg;
+                self.tokens_per_group = 1;
                 try self.build(&self.k.prepare, kernels.prepare(s, caps));
                 try self.build(&self.k.scores_decode, kernels.attnScores(s, caps, hg, 1));
                 try self.build(&self.k.values_decode, kernels.attnValues(s, caps, hg, 1));
-                if (tt > 1 and self.options.max_batch > 1) {
-                    try self.build(&self.k.scores_prefill, kernels.attnScores(s, caps, hg, tt));
-                    try self.build(&self.k.values_prefill, kernels.attnValues(s, caps, hg, tt));
+                // The prefill tiles: as many tokens a workgroup as the
+                // target's registers take (8 rows, else fewer; one token
+                // is the decode kernels').
+                var tt = kernels.MAX_ROWS / hg;
+                while (tt > 1 and self.options.max_batch > 1) : (tt /= 2) {
+                    self.build(&self.k.scores_prefill, kernels.attnScores(s, caps, hg, tt)) catch |e| {
+                        if (e != error.CompileFailed) return e;
+                        continue;
+                    };
+                    self.build(&self.k.values_prefill, kernels.attnValues(s, caps, hg, tt)) catch |e| {
+                        self.unload(&self.k.scores_prefill);
+                        if (e != error.CompileFailed) return e;
+                        continue;
+                    };
+                    self.tokens_per_group = tt;
+                    self.compile_error = null;
+                    break;
                 }
                 try self.build(&self.k.softmax, kernels.attnSoftmax(s, caps));
                 try self.build(&self.k.combine, kernels.attnCombine(s, caps));
@@ -566,7 +577,10 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             var l = List{ .work = self.work };
             // KV rows from a CPU fallback, and the CPU's conv state, to the GPU;
             // the conv state kept so a failed call can be undone.
-            if (c.kv_on_cpu) {
+            // (the GPU's again once this call is done: a call that fails
+            // takes them over again next time)
+            const kv_back = c.kv_on_cpu;
+            if (kv_back) {
                 if (c.kv_host) |m| {
                     self.dev.toDevice(m, 0, m.bytes);
                     try self.copyInto(&l, m, 0, c.kv, 0, @intCast(c.kv.bytes / 16));
@@ -614,6 +628,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 at += part.len;
             }
             self.last_ns = ns;
+            if (kv_back) c.kv_on_cpu = false;
             self.dev.fromDevice(c.conv, 0, conv_bytes);
             cache.position += count;
             if (output == .none) return null;
@@ -691,7 +706,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             const ff: u32 = plan.feed_forward_size;
             try self.linear(l, try self.matrixOf(ly.ffn_gate), n, s.ffn_gate, ff * 4);
             try self.linear(l, try self.matrixOf(ly.ffn_up), n, s.ffn_up, ff * 4);
-            try l.add(&self.k.swiglu.?, kernels.quantGroups(.swiglu, ff, n), &.{ s.ffn_gate, s.ffn_up, s.ffn_gate, s.act_q, s.act_d, s.act_sums }, &kernels.quantParams(ff, 0, 0, 0, 0));
+            try l.add(&self.k.swiglu.?, kernels.quantGroups(self.caps, .swiglu, ff, n), &.{ s.ffn_gate, s.ffn_up, s.ffn_gate, s.act_q, s.act_d, s.act_sums }, &kernels.quantParams(ff, 0, 0, 0, 0));
             try self.linear(l, try self.matrixOf(ly.ffn_down), n, s.projected, h * 4);
             try self.residual(l, ly.post_ffw_norm, n);
         }
@@ -759,13 +774,13 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         fn normQuant(self: *Self, l: *List, x_off: u32, norm: lfm3.TensorRef, n: u32, normalized: Buffer) Error!void {
             const h = self.plan.hidden_size;
             const s = &self.s;
-            try l.add(&self.k.norm_quant.?, kernels.quantGroups(.norm, h, n), &.{ s.hidden, self.weights, normalized, s.act_q, s.act_d, s.act_sums }, &kernels.quantParams(h, self.plan.rms_norm_epsilon, x_off, try self.tensorOffset(norm), 0));
+            try l.add(&self.k.norm_quant.?, kernels.quantGroups(self.caps, .norm, h, n), &.{ s.hidden, self.weights, normalized, s.act_q, s.act_d, s.act_sums }, &kernels.quantParams(h, self.plan.rms_norm_epsilon, x_off, try self.tensorOffset(norm), 0));
         }
 
         /// `n` rows of `width` in `x` into the activation arrays.
         fn quant(self: *Self, l: *List, x: Buffer, width: u32, n: u32) Error!void {
             const s = &self.s;
-            try l.add(&self.k.quant.?, kernels.quantGroups(.plain, width, n), &.{ x, x, x, s.act_q, s.act_d, s.act_sums }, &kernels.quantParams(width, 0, 0, 0, 0));
+            try l.add(&self.k.quant.?, kernels.quantGroups(self.caps, .plain, width, n), &.{ x, x, x, s.act_q, s.act_d, s.act_sums }, &kernels.quantParams(width, 0, 0, 0, 0));
         }
 
         /// hidden += post_norm(projected) (sandwich norms) or + projected.
@@ -829,7 +844,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         fn supported(plan: *const lfm3.Plan, index: *const gguf.Index(tensor_capacity), options: Options, caps: Caps) Error!void {
             const h = plan.hidden_size;
             if (caps.subgroup < 8 or !std.math.isPowerOfTwo(caps.subgroup) or caps.max_group < 64) return error.Unsupported;
-            const row_threads = @min(kernels.ROW_THREADS, caps.max_group);
+            const row_threads = kernels.rowThreads(caps);
             if (!std.math.isPowerOfTwo(row_threads)) return error.Unsupported;
             if (h == 0 or h % quantized.QK_K != 0 or h % row_threads != 0) return error.Unsupported;
             if (plan.feed_forward_size == 0 or plan.feed_forward_size % quantized.QK_K != 0) return error.Unsupported;

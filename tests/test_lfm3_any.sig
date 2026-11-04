@@ -224,7 +224,11 @@ fn makeDevice(which: Device) gpu.Device {
             caps.import = false;
         },
         .noncoherent => caps.coherent = false,
-        .narrow => caps.subgroup = 8,
+        .narrow => {
+            // (and groups of at most 64: the row kernels' smaller shape)
+            caps.subgroup = 8;
+            caps.max_group = 64;
+        },
         .wide => {
             caps.subgroup = 128;
             caps.fused_fma = false;
@@ -304,7 +308,17 @@ fn followTheCpu(which: Device, tolerance: f64) !f64 {
     const cagain = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &.{cpu_alone} }, .logits, .{})).?;
     try std.testing.expectEqual(cagain, gagain);
     worst = @max(worst, try compare(100, cpu_work.logits[0..VOCAB], backend.logits(), tolerance));
-    std.debug.print("{s}: logits within {e} of the CPU's over 10 steps; prefill of 11: {d} lane-ops, {d} dispatches; decode: {d} lane-ops, {d} dispatches a token\n", .{
+    // ...and keeps the KV rows it writes from then on (they are the GPU's
+    // again: a device with views apart shows when they are not)
+    var t2 = cagain;
+    for (101..104) |step| {
+        const c2 = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &.{t2} }, .logits, .{})).?;
+        const g2 = (backend.forward(&gc, .{ .tokens = &.{t2} }, .logits) catch |e| return failure(&backend, e)).?;
+        worst = @max(worst, try compare(step, cpu_work.logits[0..VOCAB], backend.logits(), tolerance));
+        try std.testing.expectEqual(c2, g2);
+        t2 = c2;
+    }
+    std.debug.print("{s}: logits within {e} of the CPU's over 13 steps; prefill of 11: {d} lane-ops, {d} dispatches; decode: {d} lane-ops, {d} dispatches a token\n", .{
         @tagName(which), worst, prefill_ops, prefill_dispatches, decode_ops / 7, backend.last_dispatches,
     });
     return worst;
@@ -326,7 +340,7 @@ test "...on non-coherent unified memory (every hand-over checked)" {
     _ = try followTheCpu(.noncoherent, 1e-4);
 }
 
-test "...with subgroups of 8 (reductions through shared memory) and of 128" {
+test "...with subgroups of 8 (reductions through shared memory) in groups of 64, and of 128" {
     _ = try followTheCpu(.narrow, 1e-4);
     _ = try followTheCpu(.wide, 1e-4);
 }
@@ -470,7 +484,16 @@ test "a context past 4096 positions on the GPU: split-K attention over 4150 keys
     try fixture.initialize();
     const plan = &fixture.plan;
     const src = fixture.source();
-    const d = makeDevice(.unfused);
+    // (unfused, and the GPU's memory apart from the CPU's: every hand-over
+    // of the history checked)
+    var caps = gpu.interp_caps;
+    caps.fused_fma = false;
+    caps.mad = .unfused;
+    caps.subgroup = 64;
+    caps.coherent = false;
+    emu = gpu.EmuDevice.init(caps, &mem, &interp_work);
+    emu.shadow = &shadow;
+    const d = emu.device();
     var backend = try Backend.init(d, plan, &fixture.index, src, .{ .max_batch = 16, .attention_tokens = 4 }, &work);
     defer backend.deinit();
     var gc = try backend.newCache(LONG);
