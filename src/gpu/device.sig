@@ -228,7 +228,7 @@ const backend_ir3_a7xx = none; // Q: the import of kir_ir3.sig
 
 //
 
-const backend_sm_120 = none; // N: the import of kir_sm120.sig
+const backend_sm_120 = @import("kir_sm120.sig"); // N
 
 const none = struct {
     pub fn compile(k: *const kir.Kernel, caps: Caps, work: *Work, out: []u8) Error!Binary {
@@ -285,7 +285,8 @@ test "device: compile for the interpreter" {
     try std.testing.expectEqual(@as(usize, 3 * kir.INST_BYTES), bin.code.len);
     var caps = interp_caps;
     caps.target = .sm_120;
-    try std.testing.expectError(error.Unsupported, compile(&k, caps, &work, &out));
+    // (sm_120 is kir_sm120's: a 256-byte Work is too small for its State)
+    try std.testing.expectError(error.TooBig, compile(&k, caps, &work, &out));
 }
 
 test "device: work storage" {
