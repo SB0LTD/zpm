@@ -1011,9 +1011,12 @@ const Slot = enum {
     c6imm,
 };
 
+/// An immediate a cat2/cat4 source takes: Mesa's ir3_valid_immediate allows
+/// 10 bits sign-extended (the field is 11 wide, but not all of it is the
+/// value), so -511..511.
 fn fitsImm11(x: u32) bool {
     const v: i32 = @bitCast(x);
-    return v >= -1024 and v <= 1023;
+    return v >= -511 and v <= 511;
 }
 
 /// The float table entries the hardware's table certainly holds exactly.
@@ -1856,6 +1859,10 @@ fn legalizeOperands(w: *Work) Error!void {
         if (m.kind != .op and m.kind != .copy) continue;
         switch (m.in.op.category()) {
             2 => {
+                // (an integer immediate past -511..511 is not encodable)
+                for ([_]usize{ 0, 1 }) |i| {
+                    if (m.in.src[i].kind == .imm and !fitsImm11(m.in.src[i].imm)) try srcToReg(w, m, i);
+                }
                 if (m.in.src[1].kind == .none) continue;
                 if ((srcUniform(m, 0) and srcUniform(m, 1)) or (srcImm(m, 0) and srcImm(m, 1))) try srcToReg(w, m, 1);
             },
@@ -1873,6 +1880,8 @@ fn legalizeOperands(w: *Work) Error!void {
                 }
             },
             4 => if (!srcPlain(m, 0)) try srcToReg(w, m, 0),
+            // (the shift-and-mask forms' immediates are 12 bits, unsigned:
+            // fit keeps them so; the others take none, handled above)
             6 => switch (m.in.op) {
                 .ldg_a, .stg_a => {
                     if (!srcPlain(m, 1)) try srcToReg(w, m, 1);

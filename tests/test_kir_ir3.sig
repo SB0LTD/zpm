@@ -306,6 +306,8 @@ test "integer ops: ir3 equals the interpreter, register and immediate operands" 
         try checkOp(c);
         try checkOp(withImm(c, 5, .rri));
         try checkOp(withImm(c, 0x12345, .rri));
+        // (past cat2's -511..511, inside the 11-bit field)
+        try checkOp(withImm(c, 700, .rri));
         try checkOp(withImm(c, 0xfffffff0, .rir));
     }
     const one = [_]OpCaseX{
