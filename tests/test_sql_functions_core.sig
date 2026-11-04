@@ -77,6 +77,24 @@ fn rejects(source:[]const u8,wanted:anyerror) void {
     assertions+=1;
     if(r.row_count!=rows or r.column_count!=columns) fail(source,"result changed on error",.{});
 }
+/// One column over several rows in order.
+fn rowsOf(source:[]const u8,oid:u32,wanted:[]const ?[]const u8) void {
+    if(!run(source)) return;
+    assertions+=1;
+    if(r.row_count!=wanted.len or r.column_count!=1) return fail(source,"shape {d}x{d}",.{r.row_count,r.column_count});
+    assertions+=1;
+    if(sql.typeOid(r.column_types[0])!=oid) return fail(source,"type oid {d}, expected {d}",.{sql.typeOid(r.column_types[0]),oid});
+    for(wanted,0..) |text,index| cellIs(source,index,0,text);
+}
+/// The statement stops at the configured work budget (cancellation
+/// checkpoints inside input-sized loops), then succeeds without a budget.
+fn budgeted(source:[]const u8,limit:u64) void {
+    var control:sql.ExecutionControl=.{.max_work=limit};
+    db.session.control=&control;
+    rejects(source,error.QueryWorkLimit);
+    db.session.control=null;
+    _=run(source);
+}
 fn setup(statements:[]const []const u8) void {
     for(statements) |statement| _=run(statement);
 }
@@ -174,8 +192,154 @@ fn literals() void {
     report("literals",before);
 }
 
+// ---- PG.FUNC.STRING ----------------------------------------------------------
+
+fn strings() void {
+    const before=begin("strings");
+    // Oracle fixture (PG.FUNC.STRING): names, types and values.
+    shaped("SELECT lower('ABC'),upper('abc'),length('abcd'),substring('abcd' FROM 2 FOR 2),trim(' x '),position('b' IN 'abc'),replace('abc','b','x')",
+        &.{.{.name="lower",.oid=25},.{.name="upper",.oid=25},.{.name="length",.oid=23},.{.name="substring",.oid=25},.{.name="btrim",.oid=25},.{.name="position",.oid=23},.{.name="replace",.oid=25}},
+        &.{"abc","ABC","4","bc","x","2","axc"});
+    // PostgreSQL 18 documentation examples (functions-string.html).
+    value("SELECT initcap('hi THOMAS')",25,"Hi Thomas");
+    value("SELECT initcap('a1b c_d')",25,"A1b C_D");
+    value("SELECT upper('abc-xyz 09')",25,"ABC-XYZ 09");
+    value("SELECT char_length('jose')",23,"4");
+    value("SELECT character_length('')",23,"0");
+    value("SELECT octet_length('jose')",23,"4");
+    value("SELECT bit_length('jose')",23,"32");
+    value("SELECT length(NULL)",23,null);
+    value("SELECT lower(NULL)",25,null);
+    value("SELECT substring('Thomas' FROM 2 FOR 3)",25,"hom");
+    value("SELECT substring('Thomas' FROM 3)",25,"omas");
+    value("SELECT substring('Thomas' FOR 2)",25,"Th");
+    value("SELECT substring('Thomas' FOR 2 FROM 2)",25,"ho");
+    value("SELECT substr('alphabet',3)",25,"phabet");
+    value("SELECT substr('alphabet',3,2)",25,"ph");
+    value("SELECT substring('abc' FROM 0 FOR 2)",25,"a");
+    value("SELECT substring('abc' FROM -5 FOR 3)",25,"");
+    value("SELECT substring('abc',2,2147483647)",25,"bc");
+    value("SELECT substring('h\xc3\xa9llo',2,2)",25,"\xc3\xa9l");
+    value("SELECT substring('abc',2::smallint)",25,"bc");
+    value("SELECT substring('abc',NULL)",25,null);
+    value("SELECT trim(both 'xyz' from 'yxTomxx')",25,"Tom");
+    shaped("SELECT trim(leading 'xyz' from 'yxTomxx'),trim(trailing 'xyz' from 'yxTomxx'),trim(BOTH FROM '  a  ')",
+        &.{.{.name="ltrim",.oid=25},.{.name="rtrim",.oid=25},.{.name="btrim",.oid=25}},&.{"Tomxx","yxTom","a"});
+    value("SELECT btrim('xyxtrimyyx','xyz')",25,"trim");
+    value("SELECT ltrim('zzzytest','xyz')",25,"test");
+    value("SELECT rtrim('testxxzx','xyz')",25,"test");
+    value("SELECT ltrim('  x ')",25,"x ");
+    value("SELECT rtrim('  x ')",25,"  x");
+    value("SELECT trim(E'\\tx ')",25,"\tx");
+    value("SELECT trim(FROM ' x ')",25,"x");
+    value("SELECT trim('x' FROM 'xxaxx')",25,"a");
+    value("SELECT trim('a\xc3\xa9' FROM '\xc3\xa9a\xc3\xa9b\xc3\xa9')",25,"b");
+    value("SELECT btrim('xx','x')",25,"");
+    value("SELECT btrim('abc','')",25,"abc");
+    value("SELECT position('om' IN 'Thomas')",23,"3");
+    value("SELECT position('' IN 'abc')",23,"1");
+    value("SELECT position('z' IN 'abc')",23,"0");
+    value("SELECT position('\xc3\xa9' IN 'a\xc3\xa9b')",23,"2");
+    value("SELECT position(NULL IN 'a')",23,null);
+    value("SELECT strpos('high','ig')",23,"2");
+    value("SELECT replace('abcdefabcdef','cd','XX')",25,"abXXefabXXef");
+    value("SELECT replace('aaa','aa','b')",25,"ba");
+    value("SELECT replace('abc','','x')",25,"abc");
+    value("SELECT left('abcde',2)",25,"ab");
+    value("SELECT left('abcde',-2)",25,"abc");
+    value("SELECT left('abc',10)",25,"abc");
+    value("SELECT left('abc',-10)",25,"");
+    value("SELECT right('abcde',2)",25,"de");
+    value("SELECT right('abcde',-2)",25,"cde");
+    value("SELECT right('abc',-10)",25,"");
+    value("SELECT right('a\xc3\xa9',1)",25,"\xc3\xa9");
+    value("SELECT repeat('Pg',4)",25,"PgPgPgPg");
+    value("SELECT repeat('x',-1)",25,"");
+    value("SELECT reverse('abcde')",25,"edcba");
+    value("SELECT reverse('a\xc3\xa9b')",25,"b\xc3\xa9a");
+    value("SELECT lpad('hi',5,'xy')",25,"xyxhi");
+    value("SELECT rpad('hi',5,'xy')",25,"hixyx");
+    value("SELECT lpad('hello',2)",25,"he");
+    value("SELECT lpad('hi',5)",25,"   hi");
+    value("SELECT lpad('hi',-1,'x')",25,"");
+    value("SELECT lpad('hi',5,'')",25,"hi");
+    value("SELECT rpad('\xc3\xa9',3,'\xc3\xbc')",25,"\xc3\xa9\xc3\xbc\xc3\xbc");
+    value("SELECT split_part('abc~@~def~@~ghi','~@~',2)",25,"def");
+    value("SELECT split_part('abc,def,ghi,jkl',',',-2)",25,"ghi");
+    value("SELECT split_part('abc,def,ghi,jkl',',',-1)",25,"jkl");
+    value("SELECT split_part('a,b',',',5)",25,"");
+    value("SELECT split_part('a,b',',',-5)",25,"");
+    value("SELECT split_part('',',',1)",25,"");
+    value("SELECT split_part('abc','',1)",25,"abc");
+    value("SELECT split_part('abc','',2)",25,"");
+    value("SELECT split_part('abc',',',-1)",25,"abc");
+    value("SELECT starts_with('alphabet','alph')",16,"t");
+    value("SELECT starts_with('a','ab')",16,"f");
+    value("SELECT ascii('x')",23,"120");
+    value("SELECT ascii('')",23,"0");
+    value("SELECT ascii('\xc3\xa9')",23,"233");
+    value("SELECT ascii('\xf0\x9f\x98\x80')",23,"128512");
+    value("SELECT chr(65)",25,"A");
+    value("SELECT chr(233)",25,"\xc3\xa9");
+    value("SELECT chr(128512)",25,"\xf0\x9f\x98\x80");
+    value("SELECT translate('12345','143','ax')",25,"a2x5");
+    value("SELECT translate('abc','ab','')",25,"c");
+    value("SELECT translate('a\xc3\xa9b','\xc3\xa9','e')",25,"aeb");
+    value("SELECT concat('abcde',2,NULL,22)",25,"abcde222");
+    value("SELECT concat_ws(',','abcde',2,NULL,22)",25,"abcde,2,22");
+    value("SELECT concat(true,1.50,DATE '2025-03-01')",25,"t1.502025-03-01");
+    value("SELECT concat(NULL)",25,"");
+    value("SELECT concat_ws(NULL,'a')",25,null);
+    value("SELECT overlay('Txxxxas' placing 'hom' from 2 for 4)",25,"Thomas");
+    value("SELECT overlay('Txxxxas' placing 'hom' from 2)",25,"Thomxas");
+    value("SELECT overlay('abc','x',2,1)",25,"axc");
+    value("SELECT to_hex(2147483647)",25,"7fffffff");
+    value("SELECT to_hex(-1)",25,"ffffffff");
+    value("SELECT to_hex(-1::bigint)",25,"ffffffffffffffff");
+    value("SELECT to_hex(255::smallint)",25,"ff");
+    value("SELECT \"position\"('abc','c')",23,"3");
+    // Columns, WHERE and GROUP BY use the same kernels.
+    setup(&.{"CREATE TABLE str_t(id INT PRIMARY KEY,t TEXT,n INT)","INSERT INTO str_t VALUES(1,'Ab',2),(2,NULL,1),(3,'cD',NULL)"});
+    rowsOf("SELECT upper(t) FROM str_t ORDER BY id",25,&.{"AB",null,"CD"});
+    rowsOf("SELECT left(t,n) FROM str_t ORDER BY id",25,&.{"Ab",null,null});
+    rowsOf("SELECT id FROM str_t WHERE lower(t)='cd'",23,&.{"3"});
+    rowsOf("SELECT length(t) FROM str_t GROUP BY length(t) ORDER BY 1",23,&.{"2",null});
+    // Errors and overload resolution.
+    rejects("SELECT substring('abc' FROM 2 FOR -1)",error.SubstringError);
+    rejects("SELECT overlay('abc' placing 'x' from 0)",error.SubstringError);
+    rejects("SELECT overlay('abc' placing 'x' from 2147483647 for 1)",error.NumericValueOutOfRange);
+    rejects("SELECT split_part('a,b',',',0)",error.InvalidParameterValue);
+    rejects("SELECT chr(0)",error.ProgramLimitExceeded);
+    rejects("SELECT chr(-1)",error.InvalidParameterValue);
+    rejects("SELECT chr(1114112)",error.ProgramLimitExceeded);
+    rejects("SELECT chr(55296)",error.ProgramLimitExceeded);
+    rejects("SELECT repeat('ab',200)",error.TextCapacity);
+    rejects("SELECT lpad('a',300)",error.TextCapacity);
+    rejects("SELECT lower(1)",error.UndefinedFunction);
+    rejects("SELECT length(true)",error.UndefinedFunction);
+    rejects("SELECT repeat('a',2.5)",error.UndefinedFunction);
+    rejects("SELECT lpad('a',3::bigint)",error.UndefinedFunction);
+    rejects("SELECT substring('abc',2::bigint)",error.UndefinedFunction);
+    rejects("SELECT upper('a','b')",error.UndefinedFunction);
+    rejects("SELECT concat()",error.UndefinedFunction);
+    rejects("SELECT concat_ws(',')",error.UndefinedFunction);
+    rejects("SELECT substring()",error.UndefinedFunction);
+    rejects("SELECT position('a','b')",error.Syntax);
+    rejects("SELECT trim(leading)",error.Syntax);
+    rejects("SELECT repeat('a',(1/0)::int)",error.DivisionByZero);
+    // A strict call with a syntactic NULL still validates constant arguments.
+    rejects("SELECT substring('abc',NULL,1/0)",error.DivisionByZero);
+    rejects("SELECT substring('abc','b')",error.UnsupportedStatement);
+    // Input-sized loops honour the statement work budget.
+    budgeted("SELECT length(repeat('x',200))",40);
+    budgeted("SELECT reverse(repeat('ab',100))",40);
+    budgeted("SELECT position('y' IN repeat('x',200))",40);
+    report("strings",before);
+}
+
 pub fn main(init:std.process.Init) !void {
     literals();
+    strings();
     var buffer:[160]u8=undefined;
     const line=try std.fmt.bufPrint(&buffer,"{{\"suite\":\"sql-functions-core\",\"pass\":{s},\"assertions\":{d},\"failures\":{d}}}\n",.{if(failures==0) "true" else "false",assertions,failures});
     try std.Io.File.stdout().writeStreamingAll(init.io,line);

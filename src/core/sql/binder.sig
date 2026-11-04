@@ -714,6 +714,23 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "to_regclass", .func = .to_regclass },
                 .{ .name = "format_type", .func = .format_type },
                 .{ .name = "pg_get_expr", .func = .pg_get_expr },
+                // String functions (B11).
+                .{ .name = "lower", .func = .lower },               .{ .name = "upper", .func = .upper },
+                .{ .name = "initcap", .func = .initcap },           .{ .name = "length", .func = .char_length },
+                .{ .name = "char_length", .func = .char_length },   .{ .name = "character_length", .func = .char_length },
+                .{ .name = "octet_length", .func = .octet_length }, .{ .name = "bit_length", .func = .bit_length },
+                .{ .name = "substring", .func = .substring },       .{ .name = "substr", .func = .substring },
+                .{ .name = "btrim", .func = .btrim },               .{ .name = "ltrim", .func = .ltrim },
+                .{ .name = "rtrim", .func = .rtrim },               .{ .name = "strpos", .func = .strpos },
+                .{ .name = "position", .func = .strpos },           .{ .name = "replace", .func = .replace },
+                .{ .name = "left", .func = .left },                 .{ .name = "right", .func = .right },
+                .{ .name = "repeat", .func = .repeat },             .{ .name = "reverse", .func = .reverse },
+                .{ .name = "lpad", .func = .lpad },                 .{ .name = "rpad", .func = .rpad },
+                .{ .name = "split_part", .func = .split_part },     .{ .name = "starts_with", .func = .starts_with },
+                .{ .name = "ascii", .func = .ascii },               .{ .name = "chr", .func = .chr },
+                .{ .name = "translate", .func = .translate },       .{ .name = "concat", .func = .concat },
+                .{ .name = "concat_ws", .func = .concat_ws },       .{ .name = "overlay", .func = .overlay },
+                .{ .name = "to_hex", .func = .to_hex },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -1068,7 +1085,8 @@ pub fn Binder(comptime config: types.Config) type {
             if (agg != .none) return typeAggregate(context, scope, n, agg);
             if (n.distinct or n.c != none or n.star) return error.UndefinedFunction;
             // GREATEST/LEAST are grammar forms, not ordinary named functions.
-            if (n.func != .greatest and n.func != .least) n.func = functionName(context, n);
+            // GREATEST/LEAST and SQL-syntax calls (TRIM, POSITION) arrive bound.
+            if (n.func == .none) n.func = functionName(context, n);
             var count: usize = 0;
             var item = n.b;
             while (item != none) : (item = context.node(item).next) {
@@ -1215,6 +1233,115 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = false;
                 },
                 .identity_next, .regclass_in, .regtype_in, .regclass_out, .regtype_out => unreachable,
+                .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
+                .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
+                .overlay, .to_hex => try typeStringFunction(context, n, count),
+            }
+        }
+
+        // ---- B11 builtins ----------------------------------------------------
+
+        /// Binds a call to one fixed signature: an unknown argument takes the
+        /// parameter type, a typed one needs an implicit cast (42883). A
+        /// strict call with a syntactic NULL argument is planned NULL.
+        fn bindSignature(context: *const Context, n: *ast.Node, params: []const ast.Type, result: ast.Type, strict: bool) Error!void {
+            var args: [8]u16 = undefined;
+            var count: usize = 0;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                if (count == args.len) return error.UndefinedFunction;
+                args[count] = item;
+                count += 1;
+            }
+            if (count != params.len) return error.UndefinedFunction;
+            for (params, args[0..count]) |target, arg| {
+                const ty = context.node(arg).ty;
+                if (ty != .unknown and !value.castable(ty, target, .implicit)) return error.UndefinedFunction;
+            }
+            for (params, args[0..count]) |target, *arg| arg.* = try convert(context, arg.*, target, -1, .implicit);
+            var constant = true;
+            var planned = false;
+            for (args[0..count], 0..) |arg, index| {
+                context.node(arg).next = if (index + 1 < count) args[index + 1] else none;
+                constant = constant and isConstant(context, arg);
+                planned = planned or knownNull(context, arg);
+            }
+            if (count != 0) n.b = args[0];
+            n.ty = result;
+            n.constant = constant;
+            n.planned_null = strict and planned;
+            if (n.planned_null) context.pool.planned_nulls = true;
+        }
+
+        fn argumentType(context: *const Context, n: *const ast.Node, index: usize) ast.Type {
+            var item = n.b;
+            for (0..index) |_| item = context.node(item).next;
+            return context.node(item).ty;
+        }
+
+        /// PostgreSQL string functions (pg_proc signatures over text/int4).
+        fn typeStringFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            switch (n.func) {
+                .lower, .upper, .initcap, .reverse => try bindSignature(context, n, &[_]T{.text}, .text, true),
+                .char_length, .octet_length, .bit_length, .ascii => try bindSignature(context, n, &[_]T{.text}, .int4, true),
+                .substring => {
+                    // Unknown or text arguments after the first select the
+                    // regular-expression overloads substring(text,text[,text]),
+                    // which are not provided. With only NULL literals there the
+                    // strict result is NULL text under either overload.
+                    if (count >= 2 and count <= 3) {
+                        var regex = true;
+                        var concrete = false;
+                        var item = context.node(n.b).next;
+                        while (item != none) : (item = context.node(item).next) {
+                            const ty = context.node(item).ty;
+                            if (ty != .unknown and !value.stringType(ty)) regex = false;
+                            if (!knownNull(context, item)) concrete = true;
+                        }
+                        if (regex and concrete) return error.UnsupportedStatement;
+                    }
+                    try bindSignature(context, n, if (count == 2) &[_]T{ .text, .int4 } else &[_]T{ .text, .int4, .int4 }, .text, true);
+                },
+                .btrim, .ltrim, .rtrim => try bindSignature(context, n, if (count == 1) &[_]T{.text} else &[_]T{ .text, .text }, .text, true),
+                .strpos => try bindSignature(context, n, &[_]T{ .text, .text }, .int4, true),
+                .starts_with => try bindSignature(context, n, &[_]T{ .text, .text }, .boolean, true),
+                .replace, .translate => try bindSignature(context, n, &[_]T{ .text, .text, .text }, .text, true),
+                .left, .right, .repeat => try bindSignature(context, n, &[_]T{ .text, .int4 }, .text, true),
+                .lpad, .rpad => try bindSignature(context, n, if (count == 2) &[_]T{ .text, .int4 } else &[_]T{ .text, .int4, .text }, .text, true),
+                .split_part => try bindSignature(context, n, &[_]T{ .text, .text, .int4 }, .text, true),
+                .chr => try bindSignature(context, n, &[_]T{.int4}, .text, true),
+                .overlay => try bindSignature(context, n, if (count == 3) &[_]T{ .text, .text, .int4 } else &[_]T{ .text, .text, .int4, .int4 }, .text, true),
+                .to_hex => {
+                    if (count != 1) return error.UndefinedFunction;
+                    const ty = argumentType(context, n, 0);
+                    try bindSignature(context, n, &[_]T{if (ty == .int8) .int8 else .int4}, .text, true);
+                },
+                .concat, .concat_ws => {
+                    // VARIADIC "any": at least one variadic argument; values
+                    // print through their output functions (STABLE, not strict).
+                    if (count < (if (n.func == .concat) @as(usize, 1) else 2)) return error.UndefinedFunction;
+                    var item = n.b;
+                    var constant = true;
+                    var index: usize = 0;
+                    while (item != none) : (item = context.node(item).next) {
+                        if (context.node(item).ty == .unknown) try coerce(context, item, .text);
+                        if (index == 0 and n.func == .concat_ws and !value.castable(context.node(item).ty, .text, .implicit)) return error.UndefinedFunction;
+                        constant = constant and isConstant(context, item);
+                        index += 1;
+                    }
+                    if (n.func == .concat_ws and context.node(n.b).ty != .text) {
+                        const separator = n.b;
+                        const rest = context.node(separator).next;
+                        const converted = try convert(context, separator, .text, -1, .implicit);
+                        context.node(converted).next = rest;
+                        if (converted != separator) context.node(separator).next = none;
+                        n.b = converted;
+                    }
+                    n.ty = .text;
+                    n.constant = constant;
+                },
+                else => unreachable,
             }
         }
 
@@ -2300,6 +2427,8 @@ pub fn Binder(comptime config: types.Config) type {
                             if (inner.strength > 1) break :blk inner;
                             break :blk .{ .name = if (n.func == .regclass_in) "regclass" else "regtype", .strength = 1 };
                         },
+                        // TRIM(...) calls btrim/ltrim/rtrim, named after them.
+                        .btrim, .ltrim, .rtrim => break :blk .{ .name = @tagName(n.func), .strength = 2 },
                         else => {},
                     }
                     buffer.* = toName(context, n.name);

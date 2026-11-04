@@ -162,8 +162,9 @@ pub const Error = error{
     SubstringError,
     /// SQLSTATE 2201E: logarithm of zero or a negative number.
     InvalidArgumentForLogarithm,
-    /// SQLSTATE 54000: chr(0) / a NUL character in text.
-    NullCharacterNotPermitted,
+    /// SQLSTATE 54000: a requested character or value exceeds a fixed limit
+    /// (chr of 0, a surrogate or a code point above U+10FFFF).
+    ProgramLimitExceeded,
     /// SQLSTATE 42P02: a $n placeholder reached the engine unbound.
     UndefinedParameter,
     /// SQLSTATE 42P10: invalid ORDER BY reference or window-frame variable.

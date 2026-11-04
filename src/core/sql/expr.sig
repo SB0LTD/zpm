@@ -15,6 +15,7 @@ const temporal = @import("temporal.sig");
 const datetime_format = @import("datetime_format.sig");
 const float_text = @import("float_text.sig");
 const bytea_module = @import("bytea.sig");
+const builtins = @import("functions_eval.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -963,6 +964,9 @@ pub fn Eval(comptime config: types.Config) type {
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out => return catalogValue(ctx, n),
+                    .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
+                    .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
+                    .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),
                     .none => unreachable,
                 },
                 .param, .when_arm => unreachable,

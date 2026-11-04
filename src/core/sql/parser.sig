@@ -1774,6 +1774,106 @@ pub fn Parser(comptime config: types.Config) type {
             try self.expectWord("FOLLOWING");return .{.kind=.following,.offset=offset};
         }
 
+        /// A function argument list under construction (`next`-linked).
+        const ArgList = struct {
+            head: u16 = none,
+            tail: u16 = none,
+
+            fn push(list: *ArgList, pool: *Ast.Pool, item: u16) void {
+                if (list.head == none) list.head = item else pool.nodes[list.tail].next = item;
+                list.tail = item;
+            }
+        };
+
+        fn callNode(self: *Self, name: ast.Ident, func: ast.Func, list: ArgList) Error!u16 {
+            const node = try self.pool.add(.{ .kind = .function, .name = name, .func = func, .b = list.head });
+            var item = list.head;
+            while (item != none) : (item = self.pool.nodes[item].next) try self.pool.raise(node, item);
+            return node;
+        }
+
+        fn expressionList(self: *Self, list: *ArgList) Error!void {
+            list.push(self.pool, try self.expression());
+            while (try self.takeSymbol(.comma)) list.push(self.pool, try self.expression());
+        }
+
+        /// SQL-syntax functions of gram.y func_expr_common_subexpr: TRIM,
+        /// SUBSTRING, POSITION and OVERLAY, plus LEFT/RIGHT (reserved join
+        /// words that also name functions). The current word precedes `(`.
+        fn specialFunction(self: *Self) Error!?u16 {
+            const token = self.current;
+            const name: ast.Ident = .{ .span = .{ .start = token.start, .len = token.len }, .len = token.len };
+            if (token.isWord("LEFT") or token.isWord("RIGHT")) {
+                try self.advance();
+                return try self.functionCall(name);
+            }
+            const Form = enum { trim, substring, position, overlay };
+            const form: Form = if (wordIs(self.source, token, "trim")) .trim else if (wordIs(self.source, token, "substring")) .substring else if (wordIs(self.source, token, "position")) .position else if (wordIs(self.source, token, "overlay")) .overlay else return null;
+            try self.advance();
+            try self.advance();
+            try self.enter();
+            defer self.leave();
+            var list: ArgList = .{};
+            var func: ast.Func = .none;
+            switch (form) {
+                .trim => {
+                    func = .btrim;
+                    if (try self.takeRaw("both")) {} else if (try self.takeRaw("leading")) {
+                        func = .ltrim;
+                    } else if (try self.takeRaw("trailing")) func = .rtrim;
+                    // trim_list: a_expr FROM expr_list | FROM expr_list | expr_list.
+                    if (try self.takeWord("FROM")) {
+                        try self.expressionList(&list);
+                    } else {
+                        const first = try self.expression();
+                        if (try self.takeWord("FROM")) {
+                            try self.expressionList(&list);
+                            list.push(self.pool, first);
+                        } else {
+                            list.push(self.pool, first);
+                            while (try self.takeSymbol(.comma)) list.push(self.pool, try self.expression());
+                        }
+                    }
+                },
+                .substring => if (!self.isSymbol(.rparen)) {
+                    list.push(self.pool, try self.expression());
+                    if (try self.takeWord("FROM")) {
+                        const start = try self.expression();
+                        list.push(self.pool, start);
+                        if (try self.takeWord("FOR")) list.push(self.pool, try self.expression());
+                    } else if (try self.takeWord("FOR")) {
+                        // substring(x FOR n) is substring(x, 1, n::int4); FROM may follow.
+                        const count = try self.expression();
+                        if (try self.takeWord("FROM")) {
+                            list.push(self.pool, try self.expression());
+                            list.push(self.pool, count);
+                        } else {
+                            list.push(self.pool, try self.pool.add(.{ .kind = .int_literal, .integer = 1 }));
+                            list.push(self.pool, try self.pool.add(.{ .kind = .cast, .cast_type = .int4, .a = count }));
+                        }
+                    } else while (try self.takeSymbol(.comma)) list.push(self.pool, try self.expression());
+                },
+                .position => if (!self.isSymbol(.rparen)) {
+                    func = .strpos;
+                    const needle = try self.other();
+                    try self.expectWord("IN");
+                    list.push(self.pool, try self.other());
+                    list.push(self.pool, needle);
+                },
+                .overlay => if (!self.isSymbol(.rparen)) {
+                    list.push(self.pool, try self.expression());
+                    if (try self.takeRaw("placing")) {
+                        list.push(self.pool, try self.expression());
+                        try self.expectWord("FROM");
+                        list.push(self.pool, try self.expression());
+                        if (try self.takeWord("FOR")) list.push(self.pool, try self.expression());
+                    } else while (try self.takeSymbol(.comma)) list.push(self.pool, try self.expression());
+                },
+            }
+            try self.expectSymbol(.rparen);
+            return try self.callNode(name, func, list);
+        }
+
         fn caseExpr(self: *Self) Error!u16 {
             const operand = if (self.isWord("WHEN")) none else try self.expression();
             var first: u16 = none;
@@ -1900,6 +2000,9 @@ pub fn Parser(comptime config: types.Config) type {
                 if (wordIs(self.source, token, "current_timestamp") or wordIs(self.source, token, "current_date")) {
                     const name = try self.identifier();
                     return self.pool.add(.{ .kind = .function, .name = name });
+                }
+                if (self.mode == .standard and lparenNext(try self.peek())) {
+                    if (try self.specialFunction()) |id| return id;
                 }
                 if ((self.isWord("GREATEST") or self.isWord("LEAST")) and lparenNext(try self.peek())) {
                     const func: ast.Func = if (self.isWord("GREATEST")) .greatest else .least;

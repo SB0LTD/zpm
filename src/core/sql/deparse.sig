@@ -221,6 +221,9 @@ pub fn Deparse(comptime config: types.Config) type {
                     if (raw.len > lowered.len) return error.UnsupportedStatement;
                     for (raw, 0..) |byte, index| lowered[index] = types.lower(byte);
                     const name = lowered[0..raw.len];
+                    // SQL-syntax calls (TRIM(... FROM x), POSITION(a IN b), ...)
+                    // keep their source text rather than a misleading call form.
+                    if (types.same(name, "trim") or types.same(name, "position") or types.same(name, "substring") or types.same(name, "overlay")) return error.UnsupportedStatement;
                     if (types.same(name, "current_timestamp") or types.same(name, "current_date")) {
                         for (raw, 0..) |byte, index| lowered[index] = if (byte >= 'a' and byte <= 'z') byte - 32 else byte;
                         try w.bytes(lowered[0..raw.len]);

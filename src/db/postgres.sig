@@ -1480,7 +1480,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "CharacterNotInRepertoire")) return "22021";
     if (equal(name, "SubstringError")) return "22011";
     if (equal(name, "InvalidArgumentForLogarithm")) return "2201E";
-    if (equal(name, "NullCharacterNotPermitted")) return "54000";
+    if (equal(name, "ProgramLimitExceeded")) return "54000";
     if (equal(name, "UndefinedParameter")) return "42P02";
     if (equal(name, "InvalidColumnReference")) return "42P10";
     if (equal(name, "WorkspaceCapacity")) return "54000";
