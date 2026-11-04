@@ -337,9 +337,134 @@ fn strings() void {
     report("strings",before);
 }
 
+// ---- PG.FUNC.NUMERIC ---------------------------------------------------------
+
+fn numerics() void {
+    const before=begin("numeric");
+    // Oracle fixture (PG.FUNC.NUMERIC).
+    shaped("SELECT abs(-2),ceil(1.2),floor(1.8),trunc(1.8),sqrt(4.0),power(2,3),ln(1.0)",
+        &.{.{.name="abs",.oid=23},.{.name="ceil",.oid=1700},.{.name="floor",.oid=1700},.{.name="trunc",.oid=1700},.{.name="sqrt",.oid=1700},.{.name="power",.oid=701},.{.name="ln",.oid=1700}},
+        &.{"2","2","1","1","2.000000000000000","8","0.0000000000000000"});
+    // PostgreSQL 18 documentation examples (functions-math.html).
+    value("SELECT cbrt(64.0)",701,"4");
+    value("SELECT degrees(0.5)",701,"28.64788975654116");
+    value("SELECT div(9,4)",1700,"2");
+    value("SELECT exp(1.0)",1700,"2.7182818284590452");
+    value("SELECT gcd(1071,462)",23,"21");
+    value("SELECT lcm(1071,462)",23,"23562");
+    value("SELECT ln(2.0)",1700,"0.6931471805599453");
+    value("SELECT log(100)",701,"2");
+    value("SELECT log10(1000)",701,"3");
+    value("SELECT log(2,64.0)",1700,"6.0000000000000000");
+    value("SELECT min_scale(8.4100)",23,"2");
+    value("SELECT mod(9,4)",23,"1");
+    value("SELECT pi()",701,"3.141592653589793");
+    value("SELECT power(9,3)",701,"729");
+    value("SELECT radians(45.0)",701,"0.7853981633974483");
+    value("SELECT scale(8.4100)",23,"4");
+    value("SELECT trim_scale(8.4100)",1700,"8.41");
+    value("SELECT sin(1)",701,"0.8414709848078965");
+    value("SELECT cos(0)",701,"1");
+    value("SELECT tan(1)",701,"1.5574077246549023");
+    value("SELECT cot(0.5)",701,"1.830487721712452");
+    value("SELECT asin(1)",701,"1.5707963267948966");
+    value("SELECT acos(1)",701,"0");
+    value("SELECT atan(1)",701,"0.7853981633974483");
+    value("SELECT atan2(1,0)",701,"1.5707963267948966");
+    // numeric result scales (numeric.c ln_var/exp_var/power_var/log_var).
+    value("SELECT ln(10.0)",1700,"2.3025850929940457");
+    value("SELECT ln(1.5)",1700,"0.4054651081081644");
+    value("SELECT ln(1.01)",1700,"0.009950330853168083");
+    value("SELECT ln('Infinity'::numeric)",1700,"Infinity");
+    value("SELECT ln('NaN'::numeric)",1700,"NaN");
+    value("SELECT exp(0.0)",1700,"1.0000000000000000");
+    value("SELECT exp(-1.0)",1700,"0.3678794411714423");
+    value("SELECT exp(10.0)",1700,"22026.465794806717");
+    value("SELECT exp('-Infinity'::numeric)",1700,"0");
+    value("SELECT log(100.0)",1700,"2.0000000000000000");
+    value("SELECT log10(100.0)",1700,"2.0000000000000000");
+    value("SELECT power(2.0,3)",1700,"8.0000000000000000");
+    value("SELECT power(-2.0,3)",1700,"-8.0000000000000000");
+    value("SELECT power(2.0,-2)",1700,"0.2500000000000000");
+    value("SELECT power(0.0,0)",1700,"1.0000000000000000");
+    value("SELECT power(10.0,20)",1700,"100000000000000000000.0");
+    value("SELECT power(2.0,0.5)",1700,"1.4142135623730950");
+    value("SELECT power(1.1,100)",1700,"13780.612339822270");
+    value("SELECT power('NaN'::numeric,0)",1700,"1");
+    value("SELECT power(1,'NaN'::numeric)",1700,"1");
+    value("SELECT power(2.0,'Infinity'::numeric)",1700,"Infinity");
+    value("SELECT power(0.5,'Infinity'::numeric)",1700,"0");
+    // double precision: dpow/dexp/dlog special cases.
+    value("SELECT power(2::float8,0.5)",701,"1.4142135623730951");
+    value("SELECT power('NaN'::float8,0)",701,"1");
+    value("SELECT power(1::float8,'NaN')",701,"1");
+    value("SELECT power(0.5::float8,'Infinity')",701,"0");
+    value("SELECT power('-Infinity'::float8,3)",701,"-Infinity");
+    value("SELECT ln(2)",701,"0.6931471805599453");
+    value("SELECT exp(1)",701,"2.718281828459045");
+    value("SELECT exp('-Infinity'::float8)",701,"0");
+    value("SELECT cbrt(-27)",701,"-3");
+    value("SELECT sin('NaN'::float8)",701,"NaN");
+    value("SELECT ln(NULL)",701,null);
+    value("SELECT power(NULL,2.0)",1700,null);
+    // Exact integer/numeric mod, div, gcd, lcm and scale functions.
+    value("SELECT mod(-9,4)",23,"-1");
+    value("SELECT mod(9,-4)",23,"1");
+    value("SELECT mod(10.5,3)",1700,"1.5");
+    value("SELECT mod('7',4)",23,"3");
+    value("SELECT mod(5::int2,3::int2)",21,"2");
+    value("SELECT mod(2147483648,7)",20,"2");
+    value("SELECT mod(-2147483648,-1)",23,"0");
+    value("SELECT div(-9,4)",1700,"-2");
+    value("SELECT div(9.5,2)",1700,"4");
+    value("SELECT gcd(0,0)",23,"0");
+    value("SELECT gcd(-12,18)",23,"6");
+    value("SELECT gcd(1.5,2.25)",1700,"0.75");
+    value("SELECT lcm(1.5,2.25)",1700,"4.50");
+    value("SELECT lcm(0,5)",23,"0");
+    value("SELECT scale('NaN'::numeric)",23,null);
+    value("SELECT trim_scale(0.000)",1700,"0");
+    // Errors (2201E, 2201F, 22003, 22012) and overload resolution.
+    rejects("SELECT ln(0)",error.InvalidArgumentForLogarithm);
+    rejects("SELECT ln(-1)",error.InvalidArgumentForLogarithm);
+    rejects("SELECT ln(0.0)",error.InvalidArgumentForLogarithm);
+    rejects("SELECT ln('-Infinity'::numeric)",error.InvalidArgumentForLogarithm);
+    rejects("SELECT log(0,10)",error.InvalidArgumentForLogarithm);
+    rejects("SELECT log(1,10)",error.DivisionByZero);
+    rejects("SELECT power(0::float8,-1)",error.InvalidArgumentForPowerFunction);
+    rejects("SELECT power(-1::float8,0.5)",error.InvalidArgumentForPowerFunction);
+    rejects("SELECT power(0.0,-1)",error.InvalidArgumentForPowerFunction);
+    rejects("SELECT power(-8.0,0.5)",error.InvalidArgumentForPowerFunction);
+    rejects("SELECT power(10::float8,400)",error.NumericValueOutOfRange);
+    rejects("SELECT power(10::float8,-400)",error.NumericValueOutOfRange);
+    rejects("SELECT exp(1000)",error.NumericValueOutOfRange);
+    rejects("SELECT exp(-1000)",error.NumericValueOutOfRange);
+    rejects("SELECT asin(2)",error.NumericValueOutOfRange);
+    rejects("SELECT sin('Infinity'::float8)",error.NumericValueOutOfRange);
+    rejects("SELECT mod(5,0)",error.DivisionByZero);
+    rejects("SELECT mod(5.0,0)",error.DivisionByZero);
+    rejects("SELECT div(1,0)",error.DivisionByZero);
+    rejects("SELECT gcd(-2147483648,-2147483648)",error.IntegerOverflow);
+    rejects("SELECT gcd(-2147483648,0)",error.IntegerOverflow);
+    rejects("SELECT lcm(2147483647,2)",error.IntegerOverflow);
+    rejects("SELECT mod('7','4')",error.AmbiguousFunction);
+    rejects("SELECT mod(1.5::float8,1)",error.UndefinedFunction);
+    rejects("SELECT log(2::float8,8)",error.UndefinedFunction);
+    rejects("SELECT ln('a'::text)",error.UndefinedFunction);
+    rejects("SELECT pi(1)",error.UndefinedFunction);
+    rejects("SELECT ln(1.0,2)",error.UndefinedFunction);
+    // Column inputs, NULL rows and the work budget in series loops.
+    setup(&.{"CREATE TABLE num_t(id INT PRIMARY KEY,x NUMERIC,f FLOAT8)","INSERT INTO num_t VALUES(1,2.0,4),(2,NULL,NULL),(3,10.0,0.25)"});
+    rowsOf("SELECT ln(x) FROM num_t ORDER BY id",1700,&.{"0.6931471805599453",null,"2.3025850929940457"});
+    rowsOf("SELECT power(f,0.5) FROM num_t ORDER BY id",701,&.{"2",null,"0.5"});
+    budgeted("SELECT ln(2.0)",8);
+    report("numeric",before);
+}
+
 pub fn main(init:std.process.Init) !void {
     literals();
     strings();
+    numerics();
     var buffer:[160]u8=undefined;
     const line=try std.fmt.bufPrint(&buffer,"{{\"suite\":\"sql-functions-core\",\"pass\":{s},\"assertions\":{d},\"failures\":{d}}}\n",.{if(failures==0) "true" else "false",assertions,failures});
     try std.Io.File.stdout().writeStreamingAll(init.io,line);

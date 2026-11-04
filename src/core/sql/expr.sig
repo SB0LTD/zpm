@@ -967,6 +967,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
                     .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
                     .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => return builtins.Builtins(config, @This()).call(ctx, n),
                     .none => unreachable,
                 },
                 .param, .when_arm => unreachable,

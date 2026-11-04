@@ -9,6 +9,10 @@
 const types = @import("types.sig");
 const ast = @import("ast.sig");
 const strings = @import("functions_string.sig");
+const numeric = @import("numeric.sig");
+const numeric_math = @import("numeric_math.sig");
+const float_text = @import("float_text.sig");
+const std = @import("std");
 const Error = types.Error;
 const none = ast.none;
 
@@ -92,11 +96,173 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
                     try strings.overlay(textOf(&cells[0]), placing, int32Of(&cells[2]), length, &out, control);
                 },
                 .to_hex => try strings.toHex(cells[0].integer, if (node(ctx, n.b).ty == .int8) 64 else 32, &out),
+                .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2,
+                .gcd, .lcm, .scale, .min_scale, .trim_scale => return mathematical(n, &cells, count, control),
                 else => unreachable,
             }
             result.len = out.len;
             return .{ .text = result };
         }
+
+        const M = numeric_math.Math(config.numeric_digits);
+        const NOps = numeric.Ops(config.numeric_digits);
+
+        fn node_numeric(cells: *const [max_args]V.Cell) bool {
+            return cells[0] == .numeric;
+        }
+
+        /// check_float8_val: an infinite result from finite input overflows,
+        /// a zero result from non-zero input underflows (22003).
+        fn checked(result: f64, input_infinite: bool, may_be_zero: bool) Error!V.Cell {
+            if (float_text.isInf(result) and !input_infinite) return error.NumericValueOutOfRange;
+            if (result == 0 and !may_be_zero) return error.NumericValueOutOfRange;
+            return .{ .float8 = result };
+        }
+
+        fn nan() f64 {
+            return float_text.nan(f64);
+        }
+
+        /// dpow.
+        fn powFloat(x: f64, y: f64) Error!V.Cell {
+            if (x != x) return .{ .float8 = if (y != y or y != 0) nan() else 1 };
+            if (y != y) return .{ .float8 = if (x != 1) nan() else 1 };
+            if (x == 0 and y < 0) return error.InvalidArgumentForPowerFunction;
+            if (x < 0 and @floor(y) != y) return error.InvalidArgumentForPowerFunction;
+            if (float_text.isInf(y)) {
+                const magnitude = @abs(x);
+                if (magnitude == 1) return .{ .float8 = 1 };
+                if (y > 0) return .{ .float8 = if (magnitude > 1) y else 0 };
+                return .{ .float8 = if (magnitude > 1) 0 else -y };
+            }
+            if (float_text.isInf(x)) {
+                if (y == 0) return .{ .float8 = 1 };
+                if (x > 0) return .{ .float8 = if (y > 0) x else 0 };
+                const half = y / 2;
+                const odd = @floor(half) != half;
+                if (y > 0) return .{ .float8 = if (odd) x else -x };
+                return .{ .float8 = if (odd) -0.0 else 0.0 };
+            }
+            const odd = @abs(y) < 9007199254740992 and @rem(y, 2) != 0;
+            if (x == 0) {
+                if (y == 0) return .{ .float8 = 1 };
+                const negative_zero = odd and @as(u64, @bitCast(x)) >> 63 != 0;
+                return .{ .float8 = if (negative_zero) -0.0 else 0.0 };
+            }
+            return .{ .float8 = try numeric_math.Doubles.pow(x, y, x < 0 and odd) };
+        }
+
+        fn logFloat(x: f64, base10: bool) Error!V.Cell {
+            if (x == 0) return error.InvalidArgumentForLogarithm;
+            if (x < 0) return error.InvalidArgumentForLogarithm;
+            if (x != x or float_text.isInf(x)) return .{ .float8 = x };
+            return .{ .float8 = if (base10) try numeric_math.Doubles.log10(x) else try numeric_math.Doubles.ln(x) };
+        }
+
+        /// dsin/dcos/dtan/dcot: NaN passes through, infinities are 22003.
+        fn trigonometric(func: ast.Func, x: f64) Error!V.Cell {
+            if (x != x) return .{ .float8 = nan() };
+            if (float_text.isInf(x)) return error.NumericValueOutOfRange;
+            const result = switch (func) {
+                .sin => @sin(x),
+                .cos => @cos(x),
+                .tan => @tan(x),
+                .cot => 1.0 / @tan(x),
+                else => unreachable,
+            };
+            if (func != .cot and func != .tan and float_text.isInf(result)) return error.NumericValueOutOfRange;
+            return .{ .float8 = result };
+        }
+
+        fn integerGcd(a: i64, b: i64, ty: ast.Type, control: strings.Control) Error!i128 {
+            var x: i128 = if (a < 0) -@as(i128, a) else a;
+            var y: i128 = if (b < 0) -@as(i128, b) else b;
+            while (y != 0) {
+                if (control) |active| try active.checkpoint();
+                const t = @rem(x, y);
+                x = y;
+                y = t;
+            }
+            const high: i128 = if (ty == .int8) 9223372036854775807 else 2147483647;
+            if (x > high) return error.IntegerOverflow;
+            return x;
+        }
+
+        fn mathematical(n: *const ast.Node, cells: *const [max_args]V.Cell, count: usize, control: strings.Control) Error!V.Cell {
+            // One-argument numeric overloads; log(x) is log(10, x).
+            const unary_numeric = count == 1 and node_numeric(cells);
+            if (unary_numeric) {
+                const value = &cells[0].numeric;
+                switch (n.func) {
+                    .ln => return .{ .numeric = try M.ln(value, control) },
+                    .log, .log10 => {
+                        const base = M.make(10, 0) catch return error.NumericCapacity;
+                        return .{ .numeric = try M.log(&base, value, control) };
+                    },
+                    .exp => return .{ .numeric = try M.exp(value, control) },
+                    .scale => return if (value.special != .finite) .null_value else .{ .integer = value.dscale },
+                    .min_scale => return if (M.minScale(value)) |scale| .{ .integer = scale } else .null_value,
+                    .trim_scale => return .{ .numeric = M.trimScale(value) },
+                    else => {},
+                }
+            }
+            switch (n.func) {
+                .power => return if (n.ty == .numeric) .{ .numeric = try M.power(&cells[0].numeric, &cells[1].numeric, control) } else powFloat(cells[0].float8, cells[1].float8),
+                .log => if (count == 2) return .{ .numeric = try M.log(&cells[0].numeric, &cells[1].numeric, control) },
+                .div => return .{ .numeric = try M.divTrunc(&cells[0].numeric, &cells[1].numeric) },
+                .mod => {
+                    if (n.ty == .numeric) return .{ .numeric = try NOps.mod(&cells[0].numeric, &cells[1].numeric) };
+                    const a = cells[0].integer;
+                    const b = cells[1].integer;
+                    if (b == 0) return error.DivisionByZero;
+                    return .{ .integer = if (b == -1) 0 else @rem(a, b) };
+                },
+                .gcd, .lcm => {
+                    if (n.ty == .numeric) return .{ .numeric = try M.gcdLcm(&cells[0].numeric, &cells[1].numeric, n.func == .lcm, control) };
+                    const a = cells[0].integer;
+                    const b = cells[1].integer;
+                    const divisor = try integerGcd(a, b, n.ty, control);
+                    if (n.func == .gcd) return .{ .integer = @intCast(divisor) };
+                    if (a == 0 or b == 0) return .{ .integer = 0 };
+                    const product = @divTrunc(@as(i128, a), divisor) * @as(i128, b);
+                    const magnitude = if (product < 0) -product else product;
+                    const high: i128 = if (n.ty == .int8) 9223372036854775807 else 2147483647;
+                    if (magnitude > high) return error.IntegerOverflow;
+                    return .{ .integer = @intCast(magnitude) };
+                },
+                .pi => return .{ .float8 = 3.14159265358979323846 },
+                else => {},
+            }
+            const x = cells[0].float8;
+            switch (n.func) {
+                .ln => return logFloat(x, false),
+                .log, .log10 => return logFloat(x, true),
+                .exp => {
+                    if (x != x) return .{ .float8 = x };
+                    if (float_text.isInf(x)) return .{ .float8 = if (x > 0) x else 0 };
+                    return .{ .float8 = try numeric_math.Doubles.exp(x) };
+                },
+                .cbrt => return checked(std.math.cbrt(x), float_text.isInf(x), x == 0),
+                .degrees => return checked(x / radians_per_degree, float_text.isInf(x), x == 0),
+                .radians => return checked(x * radians_per_degree, float_text.isInf(x), x == 0),
+                .sin, .cos, .tan, .cot => return trigonometric(n.func, x),
+                .asin, .acos => {
+                    if (x != x) return .{ .float8 = x };
+                    if (x < -1 or x > 1) return error.NumericValueOutOfRange;
+                    return .{ .float8 = if (n.func == .asin) std.math.asin(x) else std.math.acos(x) };
+                },
+                .atan => return .{ .float8 = if (x != x) x else std.math.atan(x) },
+                .atan2 => {
+                    const y = cells[1].float8;
+                    if (x != x or y != y) return .{ .float8 = nan() };
+                    return .{ .float8 = std.math.atan2(x, y) };
+                },
+                else => unreachable,
+            }
+        }
+
+        const radians_per_degree: f64 = 0.0174532925199432957692;
+
 
         fn argumentCount(ctx: *const E.Context, n: *const ast.Node) usize {
             var count: usize = 0;

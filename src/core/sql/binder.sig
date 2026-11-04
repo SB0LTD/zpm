@@ -731,6 +731,20 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "translate", .func = .translate },       .{ .name = "concat", .func = .concat },
                 .{ .name = "concat_ws", .func = .concat_ws },       .{ .name = "overlay", .func = .overlay },
                 .{ .name = "to_hex", .func = .to_hex },
+                // Mathematical functions (B11).
+                .{ .name = "power", .func = .power },               .{ .name = "pow", .func = .power },
+                .{ .name = "ln", .func = .ln },                     .{ .name = "log", .func = .log },
+                .{ .name = "log10", .func = .log10 },               .{ .name = "exp", .func = .exp },
+                .{ .name = "mod", .func = .mod },                   .{ .name = "div", .func = .div },
+                .{ .name = "pi", .func = .pi },                     .{ .name = "degrees", .func = .degrees },
+                .{ .name = "radians", .func = .radians },           .{ .name = "cbrt", .func = .cbrt },
+                .{ .name = "sin", .func = .sin },                   .{ .name = "cos", .func = .cos },
+                .{ .name = "tan", .func = .tan },                   .{ .name = "cot", .func = .cot },
+                .{ .name = "asin", .func = .asin },                 .{ .name = "acos", .func = .acos },
+                .{ .name = "atan", .func = .atan },                 .{ .name = "atan2", .func = .atan2 },
+                .{ .name = "gcd", .func = .gcd },                   .{ .name = "lcm", .func = .lcm },
+                .{ .name = "scale", .func = .scale },               .{ .name = "min_scale", .func = .min_scale },
+                .{ .name = "trim_scale", .func = .trim_scale },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -1236,6 +1250,74 @@ pub fn Binder(comptime config: types.Config) type {
                 .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
                 .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
                 .overlay, .to_hex => try typeStringFunction(context, n, count),
+                .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
+            }
+        }
+
+        /// numeric when any argument is numeric and none is real/double,
+        /// else double precision (PostgreSQL prefers float8 for integers).
+        fn floatOrNumeric(context: *const Context, n: *const ast.Node) Error!ast.Type {
+            var numeric_seen = false;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                switch (context.node(item).ty) {
+                    .float4, .float8 => return .float8,
+                    .numeric => numeric_seen = true,
+                    .unknown, .int2, .int4, .int8 => {},
+                    else => return error.UndefinedFunction,
+                }
+            }
+            return if (numeric_seen) .numeric else .float8;
+        }
+
+        /// mod/gcd/lcm: the integer or numeric type of both operands.
+        fn exactPair(context: *const Context, n: *const ast.Node, smallest: ast.Type) Error!ast.Type {
+            const left = argumentType(context, n, 0);
+            const right = argumentType(context, n, 1);
+            if (left == .unknown and right == .unknown) return error.AmbiguousFunction;
+            var result: ast.Type = smallest;
+            for ([_]ast.Type{ left, right }) |ty| switch (ty) {
+                .unknown => {},
+                .int2, .int4, .int8, .numeric => if (value.numericRank(ty) > value.numericRank(result)) {
+                    result = ty;
+                },
+                else => return error.UndefinedFunction,
+            };
+            return result;
+        }
+
+        /// PostgreSQL mathematical functions (float8 and numeric overloads).
+        fn typeMathFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            switch (n.func) {
+                .pi => try bindSignature(context, n, &[_]T{}, .float8, true),
+                .ln, .log10, .exp => {
+                    if (count != 1) return error.UndefinedFunction;
+                    const ty = try floatOrNumeric(context, n);
+                    try bindSignature(context, n, &[_]T{ty}, ty, true);
+                },
+                .log => {
+                    if (count == 1) {
+                        const ty = try floatOrNumeric(context, n);
+                        try bindSignature(context, n, &[_]T{ty}, ty, true);
+                    } else try bindSignature(context, n, &[_]T{ .numeric, .numeric }, .numeric, true);
+                },
+                .power => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const ty = try floatOrNumeric(context, n);
+                    try bindSignature(context, n, &[_]T{ ty, ty }, ty, true);
+                },
+                .cbrt, .degrees, .radians, .sin, .cos, .tan, .cot, .asin, .acos, .atan => try bindSignature(context, n, &[_]T{.float8}, .float8, true),
+                .atan2 => try bindSignature(context, n, &[_]T{ .float8, .float8 }, .float8, true),
+                .mod, .gcd, .lcm => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const ty = try exactPair(context, n, if (n.func == .mod) .int2 else .int4);
+                    try bindSignature(context, n, &[_]T{ ty, ty }, ty, true);
+                },
+                .div => try bindSignature(context, n, &[_]T{ .numeric, .numeric }, .numeric, true),
+                .scale, .min_scale => try bindSignature(context, n, &[_]T{.numeric}, .int4, true),
+                .trim_scale => try bindSignature(context, n, &[_]T{.numeric}, .numeric, true),
+                else => unreachable,
             }
         }
 
