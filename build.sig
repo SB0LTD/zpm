@@ -1093,10 +1093,21 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_nvidia, "test-nvidia-module", "src/nvidia/nvidia.sig", &.{});
     // ── GPU-neutral compute: KIR, devices, the interpreter and EmuDevice
     //    (one module; the backends' files join it) ──
-    _ = try ctx.addModule("gpu", "src/gpu/gpu.sig");
+    const gpu_module = try ctx.addModule("gpu", "src/gpu/gpu.sig");
+    // (kir_sm120, device.compile's sm_120 backend, assembles with nvidia)
+    try wire(ctx, gpu_module, "nvidia", "src/nvidia/nvidia.sig");
     const test_gpu = try ctx.addStep("test-gpu", "Execute KIR's verifier, interpreter, exact fdiv/fsqrt expansions and EmuDevice", &noopStep);
     try ctx.addDependency(test_all, test_gpu);
-    _ = try addTest(ctx, test_gpu, "test-gpu-module", "src/gpu/gpu.sig", &.{});
+    _ = try addTest(ctx, test_gpu, "test-gpu-module", "src/gpu/gpu.sig", &.{
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+    });
+    // kir_sm120 and nvidia_device: KIR on the emulated RTX against the
+    // interpreter, and against lfm3_nv_matrix's hand-written Q4_K kernel.
+    _ = try addTest(ctx, test_gpu, "test-gpu-sm120", "src/gpu/nvidia_device.sig", &.{
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("lfm3_nv_matrix", "src/core/lfm3_nv_matrix.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+    });
     // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
     _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
