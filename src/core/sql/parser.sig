@@ -1788,6 +1788,50 @@ pub fn Parser(comptime config: types.Config) type {
             try self.expectWord("FOLLOWING");return .{.kind=.following,.offset=offset};
         }
 
+        /// `row OVERLAPS row` (gram.y): both rows need exactly two members
+        /// (42601); the call is overlaps(a, b, c, d).
+        fn overlapsTail(self: *Self, left: u16) Error!u16 {
+            if (self.mode != .standard or !self.rawWord("overlaps")) return left;
+            const token = self.current;
+            try self.advance();
+            var right: u16 = none;
+            if (self.isWord("ROW") and lparenNext(try self.peek())) {
+                try self.advance();
+                if ((try self.peek()).kind == .symbol and (try self.peek()).symbol == .rparen) return error.Syntax;
+                right = try self.arguments(.row_constructor, false);
+            } else {
+                try self.expectSymbol(.lparen);
+                const first = try self.expression();
+                if (!self.isSymbol(.comma)) return error.Syntax;
+                right = try self.pool.add(.{ .kind = .row_constructor, .b = first });
+                var last = first;
+                while (try self.takeSymbol(.comma)) {
+                    const item = try self.expression();
+                    self.pool.nodes[last].next = item;
+                    try self.pool.raise(right, item);
+                    last = item;
+                }
+                try self.expectSymbol(.rparen);
+            }
+            var list: ArgList = .{};
+            var count: usize = 0;
+            for ([_]u16{ left, right }) |row| {
+                var members: usize = 0;
+                var item = self.pool.nodes[row].b;
+                while (item != none) {
+                    const next = self.pool.nodes[item].next;
+                    self.pool.nodes[item].next = none;
+                    list.push(self.pool, item);
+                    members += 1;
+                    item = next;
+                }
+                if (members != 2) return error.Syntax;
+                count += members;
+            }
+            const name: ast.Ident = .{ .span = .{ .start = token.start, .len = token.len }, .len = token.len };
+            return try self.callNode(name, .overlaps, list);
+        }
+
         /// A function argument list under construction (`next`-linked).
         const ArgList = struct {
             head: u16 = none,
@@ -1972,7 +2016,7 @@ pub fn Parser(comptime config: types.Config) type {
                             if (!try self.takeSymbol(.comma)) break;
                         }
                         try self.expectSymbol(.rparen);
-                        return row;
+                        return self.overlapsTail(row);
                     }
                     try self.expectSymbol(.rparen);
                     return inner;
@@ -1991,9 +2035,9 @@ pub fn Parser(comptime config: types.Config) type {
                     if (after.kind == .symbol and after.symbol == .rparen) {
                         try self.advance();
                         try self.advance();
-                        return self.pool.add(.{ .kind = .row_constructor });
+                        return self.overlapsTail(try self.pool.add(.{ .kind = .row_constructor }));
                     }
-                    return self.arguments(.row_constructor, false);
+                    return self.overlapsTail(try self.arguments(.row_constructor, false));
                 }
                 if (try self.takeWord("CAST")) {
                     try self.expectSymbol(.lparen);

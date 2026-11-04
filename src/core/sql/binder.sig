@@ -1279,7 +1279,48 @@ pub fn Binder(comptime config: types.Config) type {
                 .overlay, .to_hex => try typeStringFunction(context, n, count),
                 .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
                 .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
+                .overlaps, .overlaps_tz => try typeOverlaps(context, n, count),
             }
+        }
+
+        /// overlaps(start, end|interval, start, end|interval): timestamp
+        /// when no argument is timestamptz and one is timestamp, else
+        /// timestamptz (dates prefer it). Not strict: overlaps_timestamp
+        /// has its own NULL rules. The interval forms of timestamptz are
+        /// STABLE (zone-dependent addition).
+        fn typeOverlaps(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            if (count != 4) return error.UndefinedFunction;
+            var zoned = false;
+            var plain = false;
+            var interval = false;
+            var item = n.b;
+            var index: usize = 0;
+            while (item != none) : ({
+                item = context.node(item).next;
+                index += 1;
+            }) switch (context.node(item).ty) {
+                .timestamptz => zoned = true,
+                .timestamp => plain = true,
+                .date => {},
+                .interval => if (index % 2 == 1) {
+                    interval = true;
+                } else return error.UndefinedFunction,
+                // An unknown end could be a datetime or an interval.
+                .unknown => if (index % 2 == 1 and !knownNull(context, item)) return error.AmbiguousFunction,
+                else => return error.UndefinedFunction,
+            };
+            const start: ast.Type = if (zoned or !plain) .timestamptz else .timestamp;
+            var params: [4]ast.Type = .{ start, start, start, start };
+            item = n.b;
+            index = 0;
+            while (item != none) : ({
+                item = context.node(item).next;
+                index += 1;
+            }) if (context.node(item).ty == .interval) {
+                params[index] = .interval;
+            };
+            try bindSignature(context, n, &params, .boolean, false);
+            n.func = if (start == .timestamptz and interval) .overlaps_tz else .overlaps;
         }
 
         /// Date/time functions; timestamptz overloads (date arguments prefer

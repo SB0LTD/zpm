@@ -632,12 +632,53 @@ fn temporals() void {
     report("temporal",before);
 }
 
+// ---- PG.PRED.OVERLAPS --------------------------------------------------------
+
+fn overlapsPredicate() void {
+    const before=begin("overlaps");
+    // Oracle fixture (PG.PRED.OVERLAPS).
+    shaped("SELECT (DATE '2025-01-01',DATE '2025-02-01') OVERLAPS (DATE '2025-01-15',DATE '2025-03-01')",&.{.{.name="overlaps",.oid=16}},&.{"t"});
+    // PostgreSQL 18 documentation examples (functions-datetime.html).
+    value("SELECT (DATE '2001-02-16', DATE '2001-12-21') OVERLAPS (DATE '2001-10-30', DATE '2002-10-30')",16,"t");
+    value("SELECT (DATE '2001-02-16', INTERVAL '100 days') OVERLAPS (DATE '2001-10-30', DATE '2002-10-30')",16,"f");
+    value("SELECT (DATE '2001-10-29', DATE '2001-10-30') OVERLAPS (DATE '2001-10-30', DATE '2001-10-31')",16,"f");
+    value("SELECT (DATE '2001-10-30', DATE '2001-10-30') OVERLAPS (DATE '2001-10-30', DATE '2001-10-31')",16,"t");
+    // Endpoints in either order; ROW syntax; timestamp and interval forms.
+    value("SELECT (DATE '2001-12-21', DATE '2001-02-16') OVERLAPS (DATE '2001-10-30', DATE '2002-10-30')",16,"t");
+    value("SELECT ROW(TIMESTAMP '2001-01-01', TIMESTAMP '2001-01-03') OVERLAPS ROW(TIMESTAMP '2001-01-02', INTERVAL '1 day')",16,"t");
+    value("SELECT (TIMESTAMP '2001-01-01 10:00', INTERVAL '1 hour') OVERLAPS (TIMESTAMP '2001-01-01 11:00', INTERVAL '1 hour')",16,"f");
+    value("SELECT (TIMESTAMPTZ '2001-01-01 10:00+00', INTERVAL '2 hours') OVERLAPS (TIMESTAMPTZ '2001-01-01 11:00+00', TIMESTAMPTZ '2001-01-01 13:00+00')",16,"t");
+    value("SELECT (DATE '2001-01-01', DATE '2001-01-05') OVERLAPS (DATE '2001-01-02', DATE '2001-01-03') AND TRUE",16,"t");
+    value("SELECT NOT (DATE '2001-01-01', DATE '2001-01-05') OVERLAPS (DATE '2001-02-02', DATE '2001-02-03')",16,"t");
+    // overlaps_timestamp NULL rules (not a strict function).
+    value("SELECT (NULL::date, NULL::date) OVERLAPS (DATE '2001-01-02', DATE '2001-01-03')",16,null);
+    value("SELECT (DATE '2001-01-01', NULL::date) OVERLAPS (DATE '2001-01-02', DATE '2001-01-03')",16,null);
+    value("SELECT (DATE '2001-01-05', NULL::date) OVERLAPS (DATE '2001-01-02', DATE '2001-01-07')",16,"t");
+    value("SELECT (NULL::date, DATE '2001-01-05') OVERLAPS (DATE '2001-01-02', DATE '2001-01-07')",16,"t");
+    value("SELECT (DATE '2001-01-05', NULL) OVERLAPS (DATE '2001-01-06', DATE '2001-01-07')",16,null);
+    value("SELECT (DATE '2001-01-05', DATE '2001-01-06') OVERLAPS (DATE '2001-01-05', NULL::date)",16,null);
+    value("SELECT (DATE '2001-01-05', NULL::interval) OVERLAPS (DATE '2001-01-01', DATE '2001-01-02')",16,null);
+    setup(&.{"CREATE TABLE ov_t(id INT PRIMARY KEY,s DATE,e DATE)","INSERT INTO ov_t VALUES(1,'2025-01-01','2025-01-10'),(2,'2025-02-01','2025-02-10'),(3,NULL,NULL)"});
+    rowsOf("SELECT id FROM ov_t WHERE (s,e) OVERLAPS (DATE '2025-01-05',DATE '2025-01-06') ORDER BY id",23,&.{"1"});
+    rowsOf("SELECT (s,e) OVERLAPS (DATE '2025-02-05',INTERVAL '1 day') FROM ov_t ORDER BY id",16,&.{"f","t",null});
+    // Errors: row arity (42601) and types (42883/42725).
+    rejects("SELECT (DATE '2001-01-01') OVERLAPS (DATE '2001-01-02', DATE '2001-01-03')",error.Syntax);
+    rejects("SELECT (DATE '2001-01-01', DATE '2001-01-02', DATE '2001-01-03') OVERLAPS (DATE '2001-01-02', DATE '2001-01-03')",error.Syntax);
+    rejects("SELECT (DATE '2001-01-01', DATE '2001-01-02') OVERLAPS ROW(DATE '2001-01-02')",error.Syntax);
+    rejects("SELECT (DATE '2001-01-01', DATE '2001-01-02') OVERLAPS (DATE '2001-01-02')",error.Syntax);
+    rejects("SELECT (1, 2) OVERLAPS (3, 4)",error.UndefinedFunction);
+    rejects("SELECT (INTERVAL '1 day', DATE '2001-01-02') OVERLAPS (DATE '2001-01-02', DATE '2001-01-03')",error.UndefinedFunction);
+    rejects("SELECT ('2001-01-01', '2001-02-01') OVERLAPS ('2001-01-15', '2001-03-01')",error.AmbiguousFunction);
+    report("overlaps",before);
+}
+
 pub fn main(init:std.process.Init) !void {
     literals();
     strings();
     numerics();
     bitwise();
     temporals();
+    overlapsPredicate();
     var buffer:[160]u8=undefined;
     const line=try std.fmt.bufPrint(&buffer,"{{\"suite\":\"sql-functions-core\",\"pass\":{s},\"assertions\":{d},\"failures\":{d}}}\n",.{if(failures==0) "true" else "false",assertions,failures});
     try std.Io.File.stdout().writeStreamingAll(init.io,line);
