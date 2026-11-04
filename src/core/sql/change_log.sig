@@ -27,7 +27,7 @@
 //!   dscale u16, coefficient 4 x u64} | 7 date i32 | 8 timestamp i64
 //!   | 9 timestamptz i64 | 10 interval {months i32, days i32, us i64}
 //!   | 11 jsonb len u32 + canonical bytes | 12 bpchar len u32 + padded bytes
-//!   (VARCHAR values use 3) | 13 uuid 16 bytes. Every value is checked against the
+//!   (VARCHAR values use 3) | 13 uuid 16 bytes | 14 bytea len u32 + bytes. Every value is checked against the
 //!   column's type OID (create_table) before anything applies.
 //! Ops may repeat a (table, rowid) and apply in record order.
 //!
@@ -236,6 +236,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 .uuid => |*bytes| {
                     try writer.int(u8, 13);
                     try writer.bytes(bytes);
+                },
+                .bytea => |*bytes| {
+                    try writer.int(u8, 14);
+                    try writer.int(u32, @intCast(bytes.len));
+                    try writer.bytes(bytes.slice());
                 },
             }
         }
@@ -538,13 +543,14 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     if (value > 1) return error.InvalidChangeRecord;
                     break :blk .{ .boolean = value == 1 };
                 },
-                3, 11, 12 => blk: {
+                3, 11, 12, 14 => blk: {
                     const len = try reader.int(u32);
                     if (len > config.text_bytes) return error.ChangeRecordConflict;
                     var text: V.Text = .{ .len = len };
                     @memcpy(text.bytes[0..len], try reader.take(len));
                     if (tag == 3) break :blk .{ .text = text };
                     if (tag == 12) break :blk .{ .bpchar = text };
+                    if (tag == 14) break :blk .{ .bytea = text };
                     if (!jsonb.validBinary(text.slice(), config.json_depth, config.numeric_digits)) return error.InvalidChangeRecord;
                     break :blk .{ .jsonb = text };
                 },

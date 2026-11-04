@@ -559,7 +559,7 @@ pub fn Parser(comptime config: types.Config) type {
         fn typeWord(token: Token) bool {
             return switch (token.keyword) {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
-                .varchar, .character, .char, .bpchar, .uuid => true,
+                .varchar, .character, .char, .bpchar, .uuid, .bytea => true,
                 else => false,
             };
         }
@@ -651,6 +651,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .varchar => .{ .ty = .varchar, .typmod = try self.characterLength(false) },
                 .bpchar => .{ .ty = .bpchar, .typmod = try self.characterLength(false) },
                 .uuid => .{ .ty = .uuid },
+                .bytea => .{ .ty = .bytea },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };

@@ -364,9 +364,90 @@ fn uuid() !void {
     try meta(0, 2950, -1);
 }
 
+// ---- BYTEA -----------------------------------------------------------------
+
+fn bytea() !void {
+    // oracle: PG.TYPE.BINARY.
+    try exec("CREATE TABLE tdd_type(v BYTEA)");
+    try exec("INSERT INTO tdd_type VALUES('\\x00ff'::bytea),(NULL)");
+    try rows("SELECT v FROM tdd_type ORDER BY v NULLS LAST", "\\x00ff;NULL");
+    try meta(0, 17, -1);
+    try exec("DROP TABLE tdd_type");
+
+    // Hex input (whitespace between digit pairs) and escape input; hex output.
+    try rows("SELECT '\\x'::bytea, '\\xDEADbeef'::bytea, '\\x de ad\tbe ef '::bytea, 'abc'::bytea, ''::bytea", "\\x|\\xdeadbeef|\\xdeadbeef|\\x616263|\\x");
+    try meta(0, 17, -1);
+    try rows("SELECT 'a\\\\b'::bytea, '\\001\\377'::bytea, '\\000x'::bytea, CAST('\\x41' AS BYTEA), BYTEA '\\x42'", "\\x615c62|\\x01ff|\\x0078|\\x41|\\x42");
+    try rejects("SELECT '\\x0'::bytea", error.InvalidParameterValue);
+    try rejects("SELECT '\\x0g'::bytea", error.InvalidParameterValue);
+    try rejects("SELECT '\\x0 1'::bytea", error.InvalidParameterValue);
+    try sqlstate(error.InvalidParameterValue, "22023");
+    try rejects("SELECT '\\X00'::bytea", error.InvalidTextRepresentation);
+    try rejects("SELECT '\\400'::bytea", error.InvalidTextRepresentation);
+    try rejects("SELECT '\\'::bytea", error.InvalidTextRepresentation);
+    try rejects("SELECT 'a\\9'::bytea", error.InvalidTextRepresentation);
+
+    try exec("CREATE TABLE blobs(k BYTEA PRIMARY KEY, label TEXT)");
+    try exec("INSERT INTO blobs VALUES('\\xff', 'ff'), ('\\x0000', 'zz'), ('\\x', 'empty'), ('\\x00', 'z'), ('\\x01', 'one')");
+    try rows("SELECT label FROM blobs ORDER BY k", "empty;z;zz;one;ff");
+    try rows("SELECT label FROM blobs ORDER BY k DESC LIMIT 2", "ff;one");
+    try rows("SELECT label FROM blobs WHERE k = '\\x0000'", "zz");
+    try rows("SELECT label FROM blobs WHERE k > '\\x00' AND k < '\\xff' ORDER BY k", "zz;one");
+    try rows("SELECT COUNT(*) FROM blobs WHERE k IN ('\\x01', '\\xff', '\\x02')", "2");
+    try rejects("INSERT INTO blobs VALUES('\\xFF', 'dup')", error.PrimaryKeyViolation);
+    try rejects("INSERT INTO blobs VALUES('\\x10', 'ok'), ('\\x1', 'odd')", error.InvalidParameterValue);
+    try rows("SELECT COUNT(*) FROM blobs", "5");
+    // Concatenation (byteacat) and casts.
+    try rows("SELECT '\\x01'::bytea || '\\x0203'::bytea, k || '\\xaa', k || k FROM blobs WHERE label = 'one'", "\\x010203|\\x01aa|\\x0101");
+    try meta(0, 17, -1);
+    try meta(1, 17, -1);
+    try rows("SELECT k::text, CAST(k AS VARCHAR(3)) FROM blobs WHERE label = 'ff'", "\\xff|\\xf");
+    try meta(0, 25, -1);
+    try exec("UPDATE blobs SET label = k WHERE label = 'one'");
+    try rows("SELECT label FROM blobs WHERE k = '\\x01'", "\\x01");
+    try rows("SELECT label::bytea = k FROM blobs WHERE k = '\\x01'", "t");
+    try rejects("UPDATE blobs SET k = label", error.TypeMismatch);
+    try rejects("SELECT k = label FROM blobs", error.UndefinedFunction);
+    try rejects("SELECT 1::bytea", error.CannotCoerce);
+    try rows("SELECT NULL::bytea, NULL::bytea || '\\x01', format_type(17, NULL), 'bytea'::regtype::text", "NULL|NULL|bytea|bytea");
+    try exec("DROP TABLE blobs");
+
+    // Capacity: values are bounded by Config.text_bytes (54000 beyond).
+    var hex: [98]u8 = undefined;
+    @memcpy(hex[0..2], "\\x");
+    for (0..48) |index| @memcpy(hex[2 + index * 2 ..][0..2], "ab");
+    var source: [400]u8 = undefined;
+    const twice = try std.fmt.bufPrint(&source, "SELECT '{s}'::bytea || '{s}'::bytea", .{ hex, hex });
+    try exec(twice);
+    try check(result.rows[0].cells[0] == .bytea and result.rows[0].cells[0].bytea.len == 96);
+    const thrice = try std.fmt.bufPrint(&source, "SELECT '{s}'::bytea || '{s}'::bytea || '{s}'::bytea", .{ hex, hex, hex });
+    try rejects(thrice, error.TextCapacity);
+
+    // Wire: raw bytes in binary, hex in text and in received COPY text.
+    try check(Wire.oid(.bytea) == 17 and Wire.length(.bytea) == -1);
+    try exec("SELECT '\\x00ff5c27'::bytea");
+    try sendText(&result.rows[0].cells[0], "\\x00ff5c27");
+    try sendBinary(&result.rows[0].cells[0], .bytea, "\x00\xff\\'");
+    try receive("\x00\xff\\'", .bytea, "\\x00ff5c27");
+    try receive("", .bytea, "\\x");
+    try literal("\x00\xff", 17, 1, "'\\x00ff'::bytea");
+    try literal("\\x00ff", 17, 0, "'\\x00ff'::bytea");
+
+    // Durability.
+    try replay(&.{
+        "CREATE TABLE r(k BYTEA PRIMARY KEY, v BYTEA)",
+        "INSERT INTO r VALUES('\\x00ff', NULL), ('\\x', '\\x5c00'), ('\\x01', 'abc')",
+        "UPDATE r SET v = k || '\\x02' WHERE v IS NULL",
+        "DELETE FROM r WHERE k = '\\x01'",
+    }, "SELECT * FROM r ORDER BY k");
+    try shown("replica", "\\x|\\x5c00;\\x00ff|\\x00ff02");
+    try meta(1, 17, -1);
+}
+
 pub fn main(init: std.process.Init) !void {
     try character();
     try uuid();
+    try bytea();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-types-core\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

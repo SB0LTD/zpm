@@ -7,7 +7,8 @@
 //! base-10000 digits}, DATE i32 days and TIMESTAMP[TZ] i64 microseconds
 //! since 2000-01-01, INTERVAL {us i64, days i32, months i32}, JSONB version
 //! byte 1 + text, and text/name/json/varchar/bpchar raw bytes (bpchar
-//! padded) and UUID 16 bytes. Parameters are rendered as
+//! padded), UUID 16 bytes and BYTEA raw bytes (hex text). Parameters are
+//! rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
 //! is a protocol violation (08P01).
@@ -112,6 +113,7 @@ pub fn Types(comptime Result: type) type {
                 },
                 .bpchar => |*value| try put(out, &at, value.slice()),
                 .uuid => |*value| try put(out, &at, value),
+                .bytea => |*value| try put(out, &at, value.slice()),
             }
             return at;
         }
@@ -240,6 +242,13 @@ pub fn Types(comptime Result: type) type {
                     @memcpy(text.bytes[0 .. bytes.len - 1], bytes[1..]);
                     text.len = bytes.len - 1;
                     break :blk Cell{ .text = text };
+                },
+                .bytea => blk: {
+                    var raw: Io.Text = .{};
+                    if (bytes.len > raw.bytes.len) return error.ProtocolViolation;
+                    @memcpy(raw.bytes[0..bytes.len], bytes);
+                    raw.len = bytes.len;
+                    break :blk Cell{ .bytea = raw };
                 },
                 .name, .json, .varchar, .bpchar => blk: {
                     var text: Io.Text = .{};

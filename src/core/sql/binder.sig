@@ -1889,6 +1889,14 @@ pub fn Binder(comptime config: types.Config) type {
                                 n.ty = .jsonb;
                                 return;
                             }
+                            // bytea || bytea (byteacat); an untyped side is bytea.
+                            if ((left_ty == .bytea and (right_ty == .bytea or right_ty == .unknown)) or
+                                (right_ty == .bytea and left_ty == .unknown)) {
+                                try coerce(context, n.a, .bytea);
+                                try coerce(context, n.b, .bytea);
+                                n.ty = .bytea;
+                                return;
+                            }
                             // text || text, text || anynonarray, anynonarray || text.
                             if (context.node(n.a).ty == .unknown) try coerce(context, n.a, .text);
                             if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .text);

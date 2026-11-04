@@ -14,6 +14,7 @@ const value_module = @import("value.sig");
 const temporal = @import("temporal.sig");
 const datetime_format = @import("datetime_format.sig");
 const float_text = @import("float_text.sig");
+const bytea_module = @import("bytea.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -762,6 +763,11 @@ pub fn Eval(comptime config: types.Config) type {
                             @memcpy(value.bytes[0..out.len], out.bytes[0..out.len]);
                             value.len = out.len;
                             return .{ .jsonb = value };
+                        }
+                        if (n.ty == .bytea) {
+                            var bytes: V.Text = .{};
+                            bytes.len = try bytea_module.concat(left.bytea.slice(), right.bytea.slice(), &bytes.bytes);
+                            return .{ .bytea = bytes };
                         }
                         var text: V.Text = .{};
                         // anytextcat/textanycat cast booleans to 'true'/'false' (measured on PG18).

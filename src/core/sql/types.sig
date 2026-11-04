@@ -310,11 +310,11 @@ pub const Dialect = enum { postgres, mysql, tds };
 
 /// Stored column / result types. `integer` is int8 (BIGINT) and
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
-pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid };
+pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet.
-pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid };
+pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea };
 
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
@@ -337,6 +337,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .varchar => .varchar,
         .bpchar => .bpchar,
         .uuid => .uuid,
+        .bytea => .bytea,
     };
 }
 
@@ -361,6 +362,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .varchar => .varchar,
         .bpchar => .bpchar,
         .uuid => .uuid,
+        .bytea => .bytea,
     };
 }
 
@@ -389,6 +391,7 @@ pub fn typeInfo(data_type: DataType) TypeInfo {
         .bpchar => .{ .oid = 1042, .name = "bpchar", .len = -1, .category = 'S', .array = 1014 },
         .varchar => .{ .oid = 1043, .name = "varchar", .len = -1, .category = 'S', .array = 1015 },
         .uuid => .{ .oid = 2950, .name = "uuid", .len = 16, .category = 'U', .array = 2951 },
+        .bytea => .{ .oid = 17, .name = "bytea", .len = -1, .category = 'U', .array = 1001 },
     };
 }
 
@@ -420,6 +423,7 @@ pub fn sqlTypeName(data_type: DataType) []const u8 {
         .varchar => "character varying",
         .bpchar => "character",
         .uuid => "uuid",
+        .bytea => "bytea",
     };
 }
 
@@ -445,6 +449,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .varchar => "varcharin",
         .bpchar => "bpcharin",
         .uuid => "uuid_in",
+        .bytea => "byteain",
     };
 }
 
@@ -557,7 +562,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -574,6 +579,8 @@ pub fn Values(comptime config: Config) type {
             jsonb: Text,
             bpchar: Text,
             uuid: uuid.Uuid,
+            /// BYTEA raw bytes (not text).
+            bytea: Text,
         };
 
         pub const Row = struct {
@@ -609,6 +616,7 @@ pub fn Values(comptime config: Config) type {
                 .jsonb => .jsonb,
                 .bpchar => .bpchar,
                 .uuid => .uuid,
+                .bytea => .bytea,
             };
         }
 
@@ -636,6 +644,7 @@ pub fn Values(comptime config: Config) type {
                 .jsonb => |*value| J.compare(value.slice(), right.jsonb.slice()),
                 .bpchar => |*value| bytesOrder(character.trimmed(value.slice()), character.trimmed(right.bpchar.slice())),
                 .uuid => |*value| bytesOrder(value, &right.uuid),
+                .bytea => |*value| bytesOrder(value.slice(), right.bytea.slice()),
             };
         }
 
@@ -681,7 +690,7 @@ pub fn Values(comptime config: Config) type {
             // Variable/composite representations retain their canonical hashing.
             switch (value.*) {
                 .integer => |integer| return wordHash(@bitCast(integer), tag),
-                .text => |*text| {
+                .text, .bytea => |*text| {
                     mix(&code, tag);
                     for (text.slice()) |byte| code = (code ^ byte) *% 1099511628211;
                 },

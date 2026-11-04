@@ -17,6 +17,7 @@ const expr = @import("expr.sig");
 const ast = @import("ast.sig");
 const character = @import("character.sig");
 const uuid = @import("uuid.sig");
+const bytea = @import("bytea.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -267,6 +268,7 @@ pub fn Io(comptime config: types.Config) type {
                 },
                 .bpchar => |*value| copy(buffer, value.slice()),
                 .uuid => |*value| uuid.format(value, buffer),
+                .bytea => |*value| bytea.format(value.slice(), buffer),
             };
         }
 
@@ -342,6 +344,11 @@ pub fn Io(comptime config: types.Config) type {
                 .varchar => try textCell(input),
                 .bpchar => .{ .bpchar = (try textCell(input)).text },
                 .uuid => .{ .uuid = try uuid.parse(input) },
+                .bytea => blk: {
+                    var bytes: V.Text = .{};
+                    bytes.len = try bytea.parse(input, &bytes.bytes);
+                    break :blk .{ .bytea = bytes };
+                },
             };
             return applyTypmod(cell, ty, typmod);
         }
@@ -585,6 +592,11 @@ pub fn Io(comptime config: types.Config) type {
                 .uuid => switch (cell) {
                     .uuid => cell,
                     .text => |*value| try parse(.uuid, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .bytea => switch (cell) {
+                    .bytea => cell,
+                    .text => |*value| try parse(.bytea, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
             };
