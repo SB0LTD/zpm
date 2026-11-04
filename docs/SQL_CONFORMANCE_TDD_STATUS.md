@@ -2,12 +2,14 @@
 
 ## DDL, constraint and DML candidate (lane B11) - 4 November 2026
 
-Branch `b11/ddl-constraints-dml` (base 4ed58c9) closes ten smoke programs
+Branch `b11/ddl-constraints-dml` (started on 4ed58c9, rebased on 16788d4
+with the types lane) closes ten smoke programs
 test-first: PG.DDL.TRUNCATE, PG.CONSTRAINT.CHECK, PG.CONSTRAINT.UNIQUE,
 PG.CONSTRAINT.COMPOSITE, PG.DDL.ALTER, PG.SEQUENCE.EXTENDED,
 PG.DML.UPDATE_FROM, PG.DML.DELETE_USING, PG.DML.TUPLE_ASSIGN and
 PG.DDL.SCHEMA. The unchanged driver moves from 12 passes/106 incomplete to
-22/96 and still exits 1 SqlConformanceIncomplete; no other program changed.
+22/96 on 4ed58c9, and from 18/100 to 28/90 on 16788d4; it still exits 1
+SqlConformanceIncomplete and no other program changed.
 `contract-sql-ddl-core` (tests/test_sql_ddl_core.sig) covers values, exact
 SQLSTATEs (23502, 23505, 23514, 42P16, 42710, 42P06, 3F000, 2BP01, 22023,
 42702), atomicity, concurrent schedules (UNIQUE and key waits, table locks,

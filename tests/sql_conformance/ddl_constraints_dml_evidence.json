@@ -1,14 +1,19 @@
 {
-  "baseline_commit": "4ed58c9",
+  "baseline_commit": "16788d4",
+  "lane_start_commit": "4ed58c9",
+  "lane_start_counts": {
+    "core_smoke_pass": 12,
+    "incomplete": 106
+  },
   "scope": "B11 DDL/constraints/DML finite candidate; smoke passes only, no full SQL/DDL/native parity claim",
   "exit_code": 1,
   "terminal_error": "SqlConformanceIncomplete",
   "baseline_counts": {
-    "core_smoke_pass": 12,
-    "incomplete": 106
+    "core_smoke_pass": 18,
+    "incomplete": 100
   },
-  "core_smoke_pass": 22,
-  "incomplete": 96,
+  "core_smoke_pass": 28,
+  "incomplete": 90,
   "programs": {
     "PG.DDL.TRUNCATE": "core_smoke_pass",
     "PG.DDL.ALTER": "core_smoke_pass",
@@ -21,30 +26,31 @@
     "PG.DML.DELETE_USING": "core_smoke_pass",
     "PG.DML.TUPLE_ASSIGN": "core_smoke_pass"
   },
-  "output_sha256_lf": "3f075d6e0686314d3740dfeacbf224e58d4f2c00958bb20dd126008b217884de",
+  "output_sha256_lf": "1746658217685ae8cb76a0eb0912bfcd286a3a3725be8341b35583a5b1c785db",
   "inputs_sha256_lf": {
-    "build.sig": "fa7d632751a5f09a402054ad5d9eed6171f50a36efcda9891e4c922b6e7529a6",
-    "src/core/sql.sig": "6a3aa42323024b95151b85df18e278285a7baf5f3aa046dfffff3ca96fb4c01b",
+    "build.sig": "9bd7ae6996850ed2de28f2d7155ffafb1b1c74a05de90681aefe614626ad30d1",
+    "src/core/sql.sig": "4a55fe7634f668b2bacb9825c9d2d22c9d21054329b83c13f07f41a9309fcef7",
     "src/core/sql/ast.sig": "66686a00b32f4b395fb826fe398a5020a57af0bb251fba4b4279825e1edd16e0",
-    "src/core/sql/parser.sig": "659f5a66b481543a7296f1baef68b8cc299740ddce2708b0d1b7f556ccdf6480",
-    "src/core/sql/binder.sig": "4251886c38809d9ed0327462ffe229da14d97f47506034c1cb7fe25dc290ff6f",
+    "src/core/sql/parser.sig": "669bff4284035c5e58f60e063ef86227ceb93685d7d545c6313d3d33082addda",
+    "src/core/sql/binder.sig": "833271ff20517bf41de597e91e5348f09dc2c176006f4e049719b51614955e85",
     "src/core/sql/catalog.sig": "07dfd796331290fbf0df7fb2b4ea5edaab2922b17c62b4a7cce8bae9a8254df7",
     "src/core/sql/storage.sig": "18364034b533a5122d9418d9fe7428e5a63dfc77a7469e233926d182e05e37d4",
-    "src/core/sql/change_log.sig": "491750b1978012aa44d5294a596c5e82d29bb7a192a3c1e5b4a04dd7611ebbeb",
+    "src/core/sql/change_log.sig": "914a73ab4e2e0d603dd7d4026fa8f4a077707123c3364675b96ef50e0872e76a",
     "src/core/sql/mvcc.sig": "e17f9c87fb78ed2f2342a69d797fca04a5035868661f7b7df446814432308840",
     "src/core/sql/dml.sig": "0cd2cc481a93a34a93529e3b4c0199c4435c9f53a1ec535ef33258998cc83701",
     "src/core/sql/sequence.sig": "0082b9b3af6ea5e14f854917d89357b50d54c1435988d09413fa3c283b79f794",
-    "src/core/sql/types.sig": "083f245cf584eb0d8e03aac3953e642c33f578ed43250f8bf353b885727e1572",
+    "src/core/sql/types.sig": "8410dd703e10a0c290c13903b7d4e0d7ca172a856660743d22a66a7f1551b824",
     "src/core/sql/deparse.sig": "f55312eea62a21338da85667c482d56b4fee8985b0851af31a614ce1c48549cb",
-    "src/db/postgres.sig": "7bbe3e515a86ee124516cb61434d8ce3121c21c4533870c69dffa212491d7d88",
-    "tests/test_sql_ddl_core.sig": "3a0772fd13f8a52c828a713308c113d08119c3cad4a8f9696d1120f351da52f9",
+    "src/db/postgres.sig": "adf7a44676a5bd452b055e435e54622623b4416bbb6478f0d26d876e9ddd336e",
+    "tests/test_sql_ddl_core.sig": "313dbcf1404810dfbd3b50e86cf0aedb21c938e64635985c0272dae60923582e",
     "tests/test_sql_dml.sig": "4ffab2c180ad5d731f574f157d8462047e054d1204a115d25f4fd19fe422debb",
     "tests/sql_conformance/cases.json": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c",
     "tests/sql_conformance/postgres18_oracle.json": "dcf2ef99e025d694cffc06c3e07f3b164d20e58f5103becef279335afb246120",
     "tests/sql_conformance/generate_contracts.py": "0952c368240d51046b899717ff1ca45476758ede29c160a6ab80bc62771c7cf5"
   },
   "release_safe_assertions": {
-    "ddl_core": 1018,
+    "ddl_core": 1038,
+    "types_core": 588,
     "sql": 8415,
     "sql_index": 239627,
     "sql_storage": 619,
