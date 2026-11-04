@@ -1552,8 +1552,14 @@ fn cBsync(cx: *Cx) Error!void {
     cx.put(87, 3, PT);
 }
 
-/// WARPSYNC Rn: the lanes in Rn's mask wait for each other.
+/// WARPSYNC Rn: the lanes in Rn's mask wait for each other. It reads Rn
+/// at issue and takes no scoreboard: nvdisasm calls the word with one
+/// illegal ("Unrecognized operation for functional unit 'uC'"), and ptxas
+/// never sets one.
 fn cWarpsync(cx: *Cx) Error!void {
+    if (cx.in.control.read != Control.NONE or cx.in.control.write != Control.NONE) {
+        return if (cx.enc()) error.Syntax else error.Unknown;
+    }
     cx.put(0, 12, 0x348);
     _ = try cx.reg(24);
     cx.put(87, 3, PT);
@@ -3218,6 +3224,18 @@ test "immediates where GB206 takes none are refused: IADD3's third source, IDP.4
     var w = (try encode(&(try parse("IADD3 R36, PT, PT, R34, 0xe, R36")), 0, null));
     w.put(9, 3, 2);
     try testing.expectError(error.Unknown, decode(w.lo(), w.hi(), 0));
+}
+
+test "WARPSYNC takes no scoreboard (nvdisasm: illegal for functional unit 'uC')" {
+    try testing.expectError(error.Syntax, encode(&(try parse("[B------:R0:W-:-:S02] WARPSYNC R3")), 0, null));
+    try testing.expectError(error.Syntax, encode(&(try parse("[B------:R-:W1:-:S02] WARPSYNC R3")), 0, null));
+    // ptxas's, waiting on one
+    const w = try encode(&(try parse("[B-1----:R-:W-:Y:S05] WARPSYNC R6")), 0, null);
+    try testing.expectEqual(@as(u64, 0x0000000006007348), w.lo());
+    try testing.expectEqual(@as(u64, 0x002fea0003800000), w.hi());
+    var bad = w;
+    bad.put(113, 3, 0);
+    try testing.expectError(error.Unknown, decode(bad.lo(), bad.hi(), 0));
 }
 
 /// `text` encoded at `pc`, then decoded: what an emulator sees.
