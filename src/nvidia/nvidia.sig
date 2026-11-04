@@ -15,9 +15,13 @@ pub const sm120 = @import("sm120.sig");
 pub const sm120_asm = @import("sm120_asm.sig");
 pub const sm120_sched = @import("sm120_sched.sig");
 pub const sm120_latency = @import("sm120_latency.sig");
+pub const qmd = @import("qmd.sig");
+pub const push = @import("push.sig");
 
 test {
     _ = sm120;
     _ = sm120_asm;
     _ = sm120_sched;
+    _ = qmd;
+    _ = push;
 }
