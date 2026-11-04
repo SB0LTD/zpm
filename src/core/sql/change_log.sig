@@ -31,6 +31,9 @@
 //!    (10 stays unassigned: existing contracts use it as the unknown-op probe)
 //!    11 truncate      oid u32 (every row of the table is deleted; rows the
 //!                     same record inserts later survive)
+//!    12 alter_table   oid u32, the new definition (as create_table after its
+//!                     OID), then per new column: source u8 (old column index,
+//!                     or 255 for an added column followed by its fill value)
 //!   name: len u8 + bytes. value: 0 null | 1 i64 | 2 bool u8 | 3 len u32 + bytes
 //!   | 4 f32 bits u32 | 5 f64 bits u64 | 6 numeric {special u8, negative u8,
 //!   dscale u16, coefficient 4 x u64} | 7 date i32 | 8 timestamp i64
@@ -69,7 +72,7 @@ pub const expr_format_version: u16 = 1;
 /// create_table definitions that carry a namespace and table constraints.
 pub const definition_format_version: u16 = 2;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11 };
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12 };
 
 fn Unsigned(comptime T: type) type {
     return switch (T) {
@@ -352,6 +355,18 @@ pub fn ChangeLog(comptime config: types.Config) type {
             try writer.int(u32, oid);
         }
 
+        /// ALTER TABLE: the definition after the statement and how each new
+        /// column is obtained from the previous one.
+        pub fn encodeAlter(writer: *Writer, table: *const S.Table, sources: []const u8, fills: []const V.Cell) Error!void {
+            try writer.op(.alter_table);
+            try writer.int(u32, table.oid);
+            try encodeDefinition(writer, table);
+            for (sources, 0..) |origin, column| {
+                try writer.int(u8, origin);
+                if (origin == 0xff) try encodeValue(writer, &fills[column]);
+            }
+        }
+
         pub fn encodeRow(writer: *Writer, tag: Op, oid: u32, rowid: u64, cells: []const V.Cell) Error!void {
             try writer.op(tag);
             try writer.int(u32, oid);
@@ -370,12 +385,14 @@ pub fn ChangeLog(comptime config: types.Config) type {
         pub fn encodeCounters(writer: *Writer, next_oid: u32, tables: *const [config.tables]S.Table) Error!void {
             try writer.op(.catalog_counters);
             try writer.int(u32, next_oid);
+            // Committed tables only: a dropped or ALTERed slot awaiting
+            // reclamation, or an uncommitted one, has no replayed OID.
             var count: u8 = 0;
-            for (tables) |*table| if (table.live) {
+            for (tables) |*table| if (S.committedTable(table)) {
                 count += 1;
             };
             try writer.int(u8, count);
-            for (tables) |*table| if (table.live) {
+            for (tables) |*table| if (S.committedTable(table)) {
                 try writer.int(u32, table.oid);
                 try writer.int(u64, table.next_rowid);
             };
@@ -940,6 +957,51 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         scratch.tables[index].base = false;
                         purge(scratch, index);
                     },
+                    @intFromEnum(Op.alter_table) => {
+                        const index = try findVTable(scratch, try reader.int(u32));
+                        const vt = &scratch.tables[index];
+                        var definition: Definition = .{ .oid = vt.oid, .name = .{}, .columns = @splat(.{}), .count = 0 };
+                        try decodeDefinition(&reader, &definition);
+                        if (!knownNamespace(definition.namespace)) return error.ChangeRecordConflict;
+                        if (!types.same(definition.name.slice(), vt.name.slice()) and nameTaken(scratch, definition.name.slice())) return error.ChangeRecordConflict;
+                        var sources: [config.columns]u8 = undefined;
+                        var used: [config.columns]bool = @splat(false);
+                        for (definition.columns[0..definition.count], 0..) |*column, position| {
+                            const origin = try reader.int(u8);
+                            sources[position] = origin;
+                            if (origin == 0xff) {
+                                const fill = (try decodeValue(&reader)).cell;
+                                V.validate(column, &fill) catch |err| {
+                                    // A NULL fill under NOT NULL is valid only for an empty table.
+                                    if (err != error.NotNullViolation or vt.live_rows != 0) return error.ChangeRecordConflict;
+                                };
+                                continue;
+                            }
+                            if (origin >= vt.column_count or used[origin]) return error.ChangeRecordConflict;
+                            used[origin] = true;
+                            const previous = &vt.columns[origin];
+                            if (previous.data_type != column.data_type or previous.typmod != column.typmod) return error.ChangeRecordConflict;
+                        }
+                        // The key column survives (moved or not) or the key is gone.
+                        var primary: ?usize = null;
+                        for (definition.columns[0..definition.count], 0..) |*column, position| if (column.primary_key) {
+                            primary = position;
+                        };
+                        if (primary) |column| {
+                            const old = vt.primary orelse return error.ChangeRecordConflict;
+                            if (sources[column] != old) return error.ChangeRecordConflict;
+                        }
+                        if (definition.keyed() and !vt.keyed) return error.ChangeRecordConflict;
+                        // Identity sequences keep their column positions.
+                        for (&db.seqs) |*seq| {
+                            if (!seq.live or seq.owner != vt.oid or !vt.base) continue;
+                            if (seq.owner_column >= definition.count or sources[seq.owner_column] != seq.owner_column) return error.ChangeRecordConflict;
+                        }
+                        vt.name = definition.name;
+                        vt.columns = definition.columns;
+                        vt.column_count = definition.count;
+                        vt.primary = primary;
+                    },
                     @intFromEnum(Op.truncate) => {
                         // Every database row and every row created so far by
                         // this record is gone; later inserts may reuse keys.
@@ -1107,6 +1169,21 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             db.oid_counter = @max(db.oid_counter, definition.oid + S.oidWidth(table) - first_oid);
                             break;
                         };
+                    },
+                    @intFromEnum(Op.alter_table) => {
+                        const table = try tableByOid(db, try reader.int(u32));
+                        var definition: Definition = .{ .oid = table.oid, .name = .{}, .columns = @splat(.{}), .count = 0 };
+                        try decodeDefinition(&reader, &definition);
+                        var sources: [config.columns]u8 = undefined;
+                        var fills: [config.columns]V.Cell = @splat(.null_value);
+                        for (0..definition.count) |position| {
+                            sources[position] = try reader.int(u8);
+                            if (sources[position] == 0xff) fills[position] = (try decodeValue(&reader)).cell;
+                        }
+                        const old_count = table.column_count;
+                        S.redefine(table, definition.name, definition.columns[0..definition.count], definition.constraints[0..definition.constraint_count], sources[0..definition.count], fills[0..definition.count]);
+                        S.rebuildCommitted(table, csn);
+                        try db.replayAlter((@intFromPtr(table) - @intFromPtr(&db.tables[0])) / @sizeOf(S.Table), old_count, csn);
                     },
                     @intFromEnum(Op.truncate) => {
                         const table = try tableByOid(db, try reader.int(u32));

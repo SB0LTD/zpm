@@ -471,6 +471,29 @@ pub fn Ast(comptime config: types.Config) type {
             restart_identity: bool = false,
         };
 
+        /// One ALTER TABLE action. Column-level CHECK / UNIQUE of an ADD
+        /// COLUMN follow it as add_constraint actions.
+        pub const AlterAction = union(enum) {
+            add_column: struct { column: ColumnDef, if_not_exists: bool = false },
+            drop_column: struct { name: Ident, if_exists: bool = false },
+            rename_column: struct { from: Ident, to: Ident },
+            set_default: struct { column: Ident, expression: Span },
+            drop_default: Ident,
+            set_not_null: Ident,
+            drop_not_null: Ident,
+            add_constraint: ConstraintDef,
+            drop_constraint: struct { name: Ident, if_exists: bool = false },
+            rename_table: Ident,
+        };
+
+        /// ALTER TABLE [IF EXISTS] [ONLY] name action [, ...] | RENAME ...
+        pub const AlterTable = struct {
+            if_exists: bool = false,
+            table: TableRef = .{},
+            actions: [config.columns]AlterAction = undefined,
+            count: usize = 0,
+        };
+
         pub const Statement = union(enum) {
             create_table: CreateTable,
             drop_table: Drop,
@@ -486,6 +509,7 @@ pub fn Ast(comptime config: types.Config) type {
             control: Control,
             copy: Copy,
             truncate: Truncate,
+            alter_table: AlterTable,
         };
     };
 }

@@ -202,6 +202,11 @@ pub fn Parser(comptime config: types.Config) type {
                 try self.advance();
                 return .{ .truncate = try self.truncateStatement() };
             }
+            if (self.mode == .standard and self.rawWord("alter")) {
+                try self.advance();
+                if (try self.takeWord("TABLE")) return .{ .alter_table = try self.alterTable() };
+                return error.UnsupportedStatement;
+            }
             if (self.mode == .legacy_alpha) {
                 if (try self.takeWord("BEGIN")) return self.legacyControl(.{ .begin = .default });
                 if (try self.takeWord("COMMIT")) return self.legacyControl(.commit);
@@ -218,6 +223,95 @@ pub fn Parser(comptime config: types.Config) type {
                 out.schema = out.name;
                 out.name = try self.identifier();
             }
+            return out;
+        }
+
+        fn ifExists(self: *Self) Error!bool {
+            if (!self.rawWord("if") or !(try self.peek()).isWord("EXISTS")) return false;
+            try self.advance();
+            try self.advance();
+            return true;
+        }
+
+        fn pushAction(out: *Ast.AlterTable, action: Ast.AlterAction) Error!void {
+            if (out.count == out.actions.len) return error.ColumnCapacity;
+            out.actions[out.count] = action;
+            out.count += 1;
+        }
+
+        /// ALTER TABLE [IF EXISTS] [ONLY] name [*] followed by
+        /// RENAME [COLUMN] a TO b | RENAME TO name, or a list of
+        /// ADD [COLUMN] [IF NOT EXISTS] column | ADD table_constraint |
+        /// DROP [COLUMN] [IF EXISTS] c | DROP CONSTRAINT [IF EXISTS] n
+        /// [RESTRICT | CASCADE] | ALTER [COLUMN] c SET DEFAULT e | DROP
+        /// DEFAULT | SET NOT NULL | DROP NOT NULL. Other forms are 0A000.
+        fn alterTable(self: *Self) Error!Ast.AlterTable {
+            var out: Ast.AlterTable = .{ .if_exists = try self.ifExists() };
+            _ = try self.takeWord("ONLY");
+            out.table = try self.qualifiedName();
+            _ = try self.takeSymbol(.star);
+            if (try self.takeRaw("rename")) {
+                if (try self.takeWord("TO")) {
+                    try pushAction(&out, .{ .rename_table = try self.identifier() });
+                } else {
+                    if (self.isWord("CONSTRAINT")) return error.UnsupportedStatement;
+                    _ = try self.takeRaw("column");
+                    const from = try self.identifier();
+                    try self.expectWord("TO");
+                    try pushAction(&out, .{ .rename_column = .{ .from = from, .to = try self.identifier() } });
+                }
+                try self.finish();
+                return out;
+            }
+            while (true) {
+                if (try self.takeRaw("add")) {
+                    if (try self.tableConstraint()) |constraint| {
+                        try pushAction(&out, .{ .add_constraint = constraint });
+                    } else {
+                        _ = try self.takeRaw("column");
+                        const conditional = try self.ifNotExists();
+                        var constraints: [config.table_constraints]Ast.ConstraintDef = undefined;
+                        var constraint_count: usize = 0;
+                        var invalid = false;
+                        var has_primary = false;
+                        const column = try self.columnDef(false, &invalid, &has_primary, .{ .items = constraints[0..], .count = &constraint_count });
+                        try pushAction(&out, .{ .add_column = .{ .column = column, .if_not_exists = conditional } });
+                        for (constraints[0..constraint_count]) |constraint| try pushAction(&out, .{ .add_constraint = constraint });
+                    }
+                } else if (try self.takeWord("DROP")) {
+                    if (try self.takeWord("CONSTRAINT")) {
+                        const conditional = try self.ifExists();
+                        try pushAction(&out, .{ .drop_constraint = .{ .if_exists = conditional, .name = try self.identifier() } });
+                    } else {
+                        _ = try self.takeRaw("column");
+                        const conditional = try self.ifExists();
+                        try pushAction(&out, .{ .drop_column = .{ .if_exists = conditional, .name = try self.identifier() } });
+                    }
+                    if (!try self.takeRaw("cascade")) _ = try self.takeRaw("restrict");
+                } else if (try self.takeRaw("alter")) {
+                    _ = try self.takeRaw("column");
+                    const name = try self.identifier();
+                    if (try self.takeWord("SET")) {
+                        if (try self.takeWord("DEFAULT")) {
+                            const start = self.tokenStart();
+                            _ = try self.expression();
+                            try pushAction(&out, .{ .set_default = .{ .column = name, .expression = self.spanTo(start) } });
+                        } else if (try self.takeWord("NOT")) {
+                            try self.expectWord("NULL");
+                            try pushAction(&out, .{ .set_not_null = name });
+                        } else return error.UnsupportedStatement;
+                    } else if (try self.takeWord("DROP")) {
+                        if (try self.takeWord("DEFAULT")) {
+                            try pushAction(&out, .{ .drop_default = name });
+                        } else if (try self.takeWord("NOT")) {
+                            try self.expectWord("NULL");
+                            try pushAction(&out, .{ .drop_not_null = name });
+                        } else return error.UnsupportedStatement;
+                    } else return error.UnsupportedStatement;
+                } else return error.Syntax;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            try self.finish();
             return out;
         }
 

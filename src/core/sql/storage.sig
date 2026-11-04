@@ -267,6 +267,99 @@ pub fn Storage(comptime config: types.Config) type {
             return 1 + @as(u32, @intFromBool(keyed(table)));
         }
 
+        /// Conservative hints recomputed from every allocated version after
+        /// a relayout: integer bounds, no order proof, no dense key directory.
+        pub fn rebuildHints(table: *Table) void {
+            table.integer_bounds = @splat(.{});
+            for (table.versions[0..table.version_high]) |*version| {
+                if (version.row == 0) continue;
+                for (version.cells[0..table.column_count], table.integer_bounds[0..table.column_count]) |*cell, *bounds| {
+                    if (cell.* != .integer) continue;
+                    if (!bounds.known) {
+                        bounds.* = .{ .known = true, .low = cell.integer, .high = cell.integer };
+                    } else {
+                        bounds.low = @min(bounds.low, cell.integer);
+                        bounds.high = @max(bounds.high, cell.integer);
+                    }
+                }
+            }
+            table.column_order = @splat(.{ .state = .unordered });
+            table.primary_directory.state = .disabled;
+        }
+
+        /// Rebuilds the row and key indexes from the directory and arena.
+        fn rebuildIndexes(table: *Table) void {
+            @memset(table.row_index[0..], 0);
+            for (0..table.row_high) |slot| if (table.rows[slot].newest != 0) indexRow(table, @intCast(slot));
+            if (table.primary_column != null) {
+                @memset(table.key_index[0..], 0);
+                for (0..table.version_high) |version| {
+                    if (table.versions[version].row != 0) indexKeyOnly(table, @intCast(version));
+                }
+            }
+        }
+
+        fn relayoutCells(cells: *[config.columns]V.Cell, sources: []const u8, fills: []const V.Cell) void {
+            const old = cells.*;
+            for (sources, 0..) |origin, column| cells[column] = if (origin == 0xff) fills[column] else old[origin];
+            for (cells[sources.len..]) |*cell| cell.* = .null_value;
+        }
+
+        /// ALTER TABLE: copies every row slot and version of `source` into
+        /// `destination` (reset with the new definition), keeping rowids,
+        /// generations and MVCC headers; new column i reads old column
+        /// sources[i], or fills[i] when sources[i] is 0xff. The caller checked
+        /// capacity. Committed summaries are rebuilt at publication.
+        pub fn copyRelayout(destination: *Table, source: *const Table, sources: []const u8, fills: []const V.Cell) void {
+            destination.next_rowid = source.next_rowid;
+            destination.row_generation = source.row_generation;
+            destination.row_high = source.row_high;
+            destination.row_used = source.row_used;
+            destination.version_high = source.version_high;
+            destination.version_used = source.version_used;
+            destination.version_free = source.version_free;
+            @memcpy(destination.rows[0..source.row_high], source.rows[0..source.row_high]);
+            for (source.versions[0..source.version_high], destination.versions[0..source.version_high]) |*from, *to| {
+                to.* = from.*;
+                if (from.row != 0) relayoutCells(&to.cells, sources, fills);
+            }
+            rebuildIndexes(destination);
+            rebuildHints(destination);
+        }
+
+        /// Replay of ALTER TABLE in place (replay keeps no old snapshots):
+        /// relayout every version, install the definition, rebuild indexes.
+        pub fn redefine(table: *Table, name: V.Name, columns: []const V.Column, constraints: []const Constraint, sources: []const u8, fills: []const V.Cell) void {
+            for (table.versions[0..table.version_high]) |*version| {
+                if (version.row != 0) relayoutCells(&version.cells, sources, fills);
+            }
+            table.name = name;
+            table.column_count = columns.len;
+            @memcpy(table.columns[0..columns.len], columns);
+            table.primary_column = null;
+            for (columns, 0..) |column, index| if (column.primary_key) {
+                table.primary_column = index;
+            };
+            setConstraints(table, constraints);
+            rebuildIndexes(table);
+            rebuildHints(table);
+        }
+
+        /// Recomputes the committed summary, rollups and scan projection
+        /// from the committed view (publication or replay of a relayout).
+        pub fn rebuildCommitted(table: *Table, csn: u64) void {
+            initSummary(table, csn);
+            if (comptime compact_enabled) table.scan_high = 0;
+            for (0..table.row_high) |slot| {
+                if (table.rows[slot].newest == 0) continue;
+                if (visible(table, slot)) |version| {
+                    summarize(table, &table.versions[version].cells, true, csn);
+                    scanPublish(table, version, true);
+                } else scanPublish(table, table.rows[slot].newest - 1, false);
+            }
+            rebuildPresence(table);
+        }
+
         /// Installs constraints after reset(); the caller checked capacity.
         pub fn setConstraints(table: *Table, constraints: []const Constraint) void {
             table.constraint_count = constraints.len;

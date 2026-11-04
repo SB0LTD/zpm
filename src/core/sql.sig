@@ -361,6 +361,11 @@ pub fn Database(comptime config: Config) type {
 
         pub const Outcome = struct { affected: usize = 0, command: CommandTag = .none, returning: Returned = .{}, noop: bool = false };
 
+        pub const AlterRecord = struct {
+            sources: [config.columns]u8 = @splat(0),
+            fills: [config.columns]V.Cell = @splat(.null_value),
+        };
+
         /// Statement-scoped scratch inside caller-owned database storage.
         pub const Workspace = struct {
             nodes: A.Pool = .{},
@@ -544,6 +549,9 @@ pub fn Database(comptime config: Config) type {
         pub const work_rows = X.work_rows;
 
         tables: [config.tables]S.Table = @splat(.{}),
+        /// ALTER TABLE column mapping of the table slot it filled (indexed by
+        /// that slot), read when the transaction encodes its record.
+        alters: [config.tables]AlterRecord = @splat(.{}),
         catalog: K = .{},
         /// Sequence slots (Config.sequences); values are non-transactional.
         seqs: [config.sequences]Q.Seq = @splat(.{}),
@@ -1287,6 +1295,10 @@ pub fn Database(comptime config: Config) type {
                     try self.truncateTables(slot, truncate, snap);
                     break :blk 0;
                 },
+                .alter_table => |*alter| blk: {
+                    try self.alterTable(slot, alter, snap);
+                    break :blk 0;
+                },
                 .select, .query, .control => unreachable,
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound), .noop = bound == .noop };
@@ -1946,6 +1958,92 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
+        /// ALTER TABLE (copy on write): AccessExclusive on the table, then
+        /// every row slot and version is copied into a free table slot with
+        /// the new definition and the same OID. The catalog swaps the
+        /// relation in this transaction only: other snapshots, including
+        /// detached reads, keep the old slot and definition until commit;
+        /// abort or ROLLBACK TO discards the copy. Added columns take their
+        /// DEFAULT evaluated once (non-volatile only). Existing rows are then
+        /// re-checked for new NOT NULL, CHECK and UNIQUE constraints. Needs a
+        /// free table slot (TableCapacity, 54000) until the old one is
+        /// reclaimed after commit.
+        fn alterTable(self: *Self, slot: u16, alter: *const B.AlterTable, snap: Snapshot) Error!void {
+            try self.lockTable(slot, alter.table, .access_exclusive);
+            const tx = &self.txs[slot];
+            try self.reserveWrites(slot, 3 + 2 * config.columns);
+            var destination: ?usize = null;
+            for (0..2) |attempt| {
+                for (&self.tables, 0..) |*table, index| if (!table.live) {
+                    destination = index;
+                    break;
+                };
+                if (destination != null or attempt == 1) break;
+                self.reclaimTables(self.horizon());
+            }
+            const index = destination orelse return error.TableCapacity;
+            const source = &self.tables[alter.table];
+            const copy = &self.tables[index];
+            if (copy.rows.len < source.row_high or copy.versions.len < source.version_high) return error.TableCapacity;
+            var fills: [config.columns]Cell = @splat(.null_value);
+            for (alter.columns[0..alter.count], 0..) |*column, position| {
+                if (alter.sources[position] != 0xff or alter.fills[position] == ast.none) continue;
+                var ctx = self.evalContext(column.expression.slice());
+                const value = try E.eval(&ctx, alter.fills[position]);
+                if (value != .null_value) fills[position] = try D.store(column, value, &self.session);
+            }
+            S.reset(copy, source.oid, alter.name, alter.columns[0..alter.count]);
+            copy.namespace = source.namespace;
+            S.setConstraints(copy, alter.constraints[0..alter.constraint_count]);
+            S.copyRelayout(copy, source, alter.sources[0..alter.count], fills[0..alter.count]);
+            copy.live = true;
+            copy.pending_create = true;
+            source.pending_drop = true;
+            self.alters[index] = .{ .sources = alter.sources, .fills = fills };
+            tx.push(.{ .kind = .alter_table, .table = @intCast(index), .old = @intCast(alter.table), .new = snap.cid }) catch unreachable;
+            var changes: [K.max_changes]K.Change = undefined;
+            var count = self.catalog.drop(alter.table, source.column_count, snap, tx.ref(slot), snap.cid, 0, &changes);
+            for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
+            count = try self.catalog.create(index, copy, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
+            for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
+            try self.validateAltered(slot, index, alter, snap);
+        }
+
+        /// Existing rows against the constraints ALTER TABLE added or
+        /// tightened (23502, 23514, 23505), and generation/CHECK texts that
+        /// must still bind over the new definition.
+        fn validateAltered(self: *Self, slot: u16, index: usize, alter: *const B.AlterTable, snap: Snapshot) Error!void {
+            const context = self.bindContext("", .standard, snap);
+            try B.validateGenerated(&context, index);
+            try B.validateConstraints(&context, index);
+            var checks: [config.table_constraints]u16 = @splat(ast.none);
+            try B.bindFlaggedChecks(&context, index, &alter.check_constraint, &checks);
+            const table = &self.tables[index];
+            var ctx = self.evalContext("");
+            for (0..table.row_high) |row| {
+                if (table.rows[row].newest == 0) continue;
+                const version = S.visibleAt(table, row, snap) orelse continue;
+                try self.session.checkpoint();
+                const cells = &table.versions[version].cells;
+                for (0..table.column_count) |column| {
+                    if (alter.check_not_null[column] and cells[column] == .null_value) return error.NotNullViolation;
+                }
+                try D.checkRow(&ctx, table, &checks, cells);
+                for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
+                    if (!alter.check_constraint[position] or !S.scannedUnique(table, constraint)) continue;
+                    switch (S.uniqueCheck(table, constraint, cells, @intCast(row), snap)) {
+                        .free => {},
+                        .taken => return error.PrimaryKeyViolation,
+                        .wait => |owner| {
+                            var waits: L.Set = .{};
+                            waits.add(owner);
+                            return self.park(slot, waits);
+                        },
+                    }
+                }
+            }
+        }
+
         /// Inserts every VALUES row, SELECT row or the DEFAULT VALUES row in
         /// order. A resumed statement continues after the rows it already
         /// handled (Tx.progress); their writes are in its write slice.
@@ -2507,6 +2605,10 @@ pub fn Database(comptime config: Config) type {
                     .create_sequence => try C.encodeCreateSequence(writer, &self.seqs[entry.table]),
                     .drop_sequence => try C.encodeDropSequence(writer, self.seqs[entry.table].oid),
                     .truncate => try C.encodeTruncate(writer, self.tables[entry.table].oid),
+                    .alter_table => {
+                        const table = &self.tables[entry.table];
+                        try C.encodeAlter(writer, table, self.alters[entry.table].sources[0..table.column_count], self.alters[entry.table].fills[0..table.column_count]);
+                    },
                     .catalog_insert, .catalog_delete => {},
                 }
             }
@@ -2714,6 +2816,14 @@ pub fn Database(comptime config: Config) type {
         pub fn replayDropSequence(self: *Self, index: usize, csn: u64) void {
             var changes: [K.max_changes]K.Change = undefined;
             _ = self.catalog.dropSequence(index, storage.committed_view, .{ .epoch = self.epoch }, self.cid, csn, &changes);
+        }
+
+        /// Replay hook: ALTER TABLE redefined a table slot in place; its
+        /// catalog rows are replaced at the record's csn.
+        pub fn replayAlter(self: *Self, index: usize, old_count: usize, csn: u64) Error!void {
+            var changes: [K.max_changes]K.Change = undefined;
+            _ = self.catalog.drop(index, old_count, storage.committed_view, .{ .epoch = self.epoch }, self.cid, csn, &changes);
+            _ = try self.catalog.create(index, &self.tables[index], .{ .epoch = self.epoch }, self.cid, csn, csn, &changes);
         }
 
         /// Replay hook: a committed DROP TABLE.

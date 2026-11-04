@@ -35,7 +35,10 @@ pub fn Mvcc(comptime config: types.Config) type {
         /// `truncate`: every row version visible to the TRUNCATE statement was
         /// marked deleted in place with xmax = (this transaction, `old` as
         /// command id); one entry covers the whole table.
-        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate };
+        /// `alter_table`: ALTER TABLE copied table slot `old` into slot `table`
+        /// (same OID, new definition) at command id `new`; the old slot dies
+        /// at commit, the new one is discarded at abort.
+        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate, alter_table };
 
         /// `table` is the table slot (catalog relation, sequence slot);
         /// `old`/`new` are version indices.
@@ -165,6 +168,12 @@ pub fn Mvcc(comptime config: types.Config) type {
                             if (truncated(version, tx, slot, entry.old)) clearMark(version);
                         }
                     },
+                    .alter_table => {
+                        const copy = &db.tables[entry.table];
+                        copy.live = false;
+                        copy.pending_create = false;
+                        db.tables[entry.old].pending_drop = false;
+                    },
                 }
             }
             tx.write_len = start;
@@ -250,6 +259,22 @@ pub fn Mvcc(comptime config: types.Config) type {
                             S.scanPublish(table, @intCast(index), false);
                             version.xmax_csn = csn;
                         }
+                    },
+                    .alter_table => {
+                        const old = &db.tables[entry.old];
+                        old.pending_drop = false;
+                        old.dead_csn = csn;
+                        // The copy's own versions from statements before the
+                        // ALTER have no write entries in this slot: publish
+                        // them here. Later statements' entries follow.
+                        const copy = &db.tables[entry.table];
+                        copy.pending_create = false;
+                        for (copy.versions[0..copy.version_high]) |*version| {
+                            if (version.row == 0) continue;
+                            if (version.xmin_csn == 0 and version.xmin.epoch == tx.epoch and version.xmin.slot == slot and version.xmin_cid < entry.new) version.xmin_csn = csn;
+                            if (version.xmax_csn == 0 and version.xmax.epoch == tx.epoch and version.xmax.slot == slot and version.xmax_cid < entry.new) version.xmax_csn = csn;
+                        }
+                        S.rebuildCommitted(copy, csn);
                     },
                 }
             }

@@ -542,6 +542,230 @@ fn compositeKeys() !void {
     try sameState(&composite_probes);
 }
 
+// ---- ALTER TABLE -------------------------------------------------------------
+
+const alter_probes = [_][]const u8{
+    "SELECT * FROM a ORDER BY id",
+    "SELECT COUNT(*), SUM(id) FROM a",
+    "SELECT column_name, ordinal_position, column_default, is_nullable, data_type FROM information_schema.columns WHERE table_name = 'a' ORDER BY ordinal_position",
+    "SELECT attname, attnum, attnotnull FROM pg_attribute WHERE attrelid = 'a'::regclass ORDER BY attnum",
+    "SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'a' AND constraint_type <> 'CHECK' ORDER BY constraint_name",
+    "SELECT oid, relname, relkind, relnatts FROM pg_class WHERE relnamespace = 2200 ORDER BY oid",
+};
+
+fn alterValues() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, g INT, v INT)");
+    try run("INSERT INTO a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, NULL)");
+    const altered = try replicate("ALTER TABLE a ADD COLUMN extra INT DEFAULT 7");
+    try check(altered.command == .alter_table);
+    try run("ALTER TABLE a RENAME COLUMN extra TO renamed");
+    try expect("SELECT renamed FROM a ORDER BY id", "7;7;7;7");
+    try run("INSERT INTO a (id, g, v) VALUES (5, 3, 50)");
+    try expect("SELECT id, renamed FROM a WHERE id = 5", "5|7");
+    // NULL fill, IF NOT EXISTS, several actions in one statement.
+    try run("ALTER TABLE a ADD COLUMN note TEXT, ADD COLUMN IF NOT EXISTS g INT");
+    try expect(alter_probes[0], "1|1|10|7|NULL;2|1|20|7|NULL;3|2|30|7|NULL;4|2|NULL|7|NULL;5|3|50|7|NULL");
+    try run("ALTER TABLE a DROP COLUMN g");
+    try expect(alter_probes[0], "1|10|7|NULL;2|20|7|NULL;3|30|7|NULL;4|NULL|7|NULL;5|50|7|NULL");
+    try expect(alter_probes[2], "id|1|NULL|NO|integer;v|2|NULL|YES|integer;renamed|3|7|YES|integer;note|4|NULL|YES|text");
+    try sameState(&alter_probes);
+    // Defaults and NOT NULL.
+    try run("ALTER TABLE a ALTER COLUMN v SET DEFAULT 99");
+    try run("INSERT INTO a (id) VALUES (6)");
+    try expect("SELECT v, renamed FROM a WHERE id = 6", "99|7");
+    try run("ALTER TABLE a ALTER v DROP DEFAULT, ALTER COLUMN renamed DROP DEFAULT");
+    try run("INSERT INTO a (id) VALUES (7)");
+    try expect("SELECT v, renamed FROM a WHERE id = 7", "NULL|NULL");
+    try rejects("ALTER TABLE a ALTER COLUMN v SET NOT NULL", error.NotNullViolation, alter_probes[2], "id|1|NULL|NO|integer;v|2|NULL|YES|integer;renamed|3|NULL|YES|integer;note|4|NULL|YES|text");
+    try run("DELETE FROM a WHERE v IS NULL");
+    try run("ALTER TABLE a ALTER COLUMN v SET NOT NULL");
+    try rejects("INSERT INTO a (id) VALUES (8)", error.NotNullViolation, "SELECT COUNT(*) FROM a", "5");
+    try run("ALTER TABLE a ALTER COLUMN v DROP NOT NULL");
+    try rejects("ALTER TABLE a ALTER COLUMN id DROP NOT NULL", error.InvalidTableDefinition, "SELECT COUNT(*) FROM a", "5");
+    // The primary key still holds and still probes after the relayout.
+    try rejects("INSERT INTO a (id, v) VALUES (1, 1)", error.PrimaryKeyViolation, "SELECT COUNT(*) FROM a", "5");
+    try expect("SELECT v FROM a WHERE id = 6", "99");
+    try expect(alter_probes[1], "5|17");
+    try sameState(&alter_probes);
+    // A primary key that moves left keeps its index.
+    try run("CREATE TABLE b (x INT, id INT PRIMARY KEY, w TEXT)");
+    try run("INSERT INTO b VALUES (1, 10, 'a'), (2, 20, 'b')");
+    try run("ALTER TABLE b DROP COLUMN x");
+    try expect("SELECT w FROM b WHERE id = 20", "b");
+    try rejects("INSERT INTO b VALUES (10, 'c')", error.PrimaryKeyViolation, "SELECT id, w FROM b ORDER BY id", "10|a;20|b");
+    try sameState(&.{ "SELECT * FROM b ORDER BY id", "SELECT attname, attnum FROM pg_attribute WHERE attrelid = 'b'::regclass ORDER BY attnum" });
+    // NOT NULL without a default needs an empty table.
+    try rejects("ALTER TABLE b ADD COLUMN must INT NOT NULL", error.NotNullViolation, "SELECT * FROM b ORDER BY id", "10|a;20|b");
+    try run("CREATE TABLE e (k INT)");
+    try run("ALTER TABLE e ADD COLUMN must INT NOT NULL");
+    try rejects("INSERT INTO e VALUES (1, NULL)", error.NotNullViolation, "SELECT COUNT(*) FROM e", "0");
+    try sameState(&.{"SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name = 'e' ORDER BY ordinal_position"});
+    // RENAME TO keeps the index name (PostgreSQL does not rename it).
+    try run("ALTER TABLE b RENAME TO b2");
+    try expect("SELECT id, w FROM b2 ORDER BY id", "10|a;20|b");
+    try expect("SELECT relname, relkind FROM pg_class WHERE relname LIKE 'b%' ORDER BY relname", "b2|r;b_pkey|i");
+    try rejects("SELECT * FROM b", error.TableNotFound, "SELECT COUNT(*) FROM b2", "2");
+    try sameState(&.{ "SELECT relname, relkind FROM pg_class WHERE relnamespace = 2200 ORDER BY relname", "SELECT id, w FROM b2 ORDER BY id" });
+}
+
+fn alterConstraints() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, v INT, w INT GENERATED ALWAYS AS (v * 2) STORED)");
+    try run("INSERT INTO a (id, v) VALUES (1, 10), (2, -20), (3, 30)");
+    // ADD CONSTRAINT validates existing rows.
+    try rejects("ALTER TABLE a ADD CONSTRAINT v_pos CHECK (v > 0)", error.CheckViolation, "SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 'a' AND constraint_type = 'CHECK' AND constraint_name LIKE 'v%'", "");
+    try run("UPDATE a SET v = 10 WHERE id = 2");
+    try run("ALTER TABLE a ADD CONSTRAINT v_pos CHECK (v > 0)");
+    try rejects("INSERT INTO a (id, v) VALUES (4, -1)", error.CheckViolation, "SELECT COUNT(*) FROM a", "3");
+    try rejects("ALTER TABLE a ADD UNIQUE (v)", error.PrimaryKeyViolation, "SELECT COUNT(*) FROM a", "3");
+    try run("UPDATE a SET v = 25 WHERE id = 2");
+    try run("ALTER TABLE a ADD UNIQUE (v)");
+    try rejects("INSERT INTO a (id, v) VALUES (4, 10)", error.PrimaryKeyViolation, "SELECT COUNT(*) FROM a", "3");
+    try expect(alter_probes[4], "a_pkey|PRIMARY KEY;a_v_key|UNIQUE");
+    // Renames rewrite stored CHECK and generation texts.
+    try run("ALTER TABLE a RENAME COLUMN v TO val");
+    try rejects("INSERT INTO a (id, val) VALUES (4, -1)", error.CheckViolation, "SELECT COUNT(*) FROM a", "3");
+    try run("INSERT INTO a (id, val) VALUES (4, 4)");
+    try expect("SELECT id, val, w FROM a ORDER BY id", "1|10|20;2|25|50;3|30|60;4|4|8");
+    try expect("SELECT generation_expression FROM information_schema.columns WHERE table_name = 'a' AND column_name = 'w'", "(val * 2)");
+    try sameState(&.{ "SELECT id, val, w FROM a ORDER BY id", alter_probes[4] });
+    // Dropping a column used by a generated column is 2BP01; dropping a
+    // column drops the constraints over it.
+    try rejects("ALTER TABLE a DROP COLUMN val", error.DependentObjects, "SELECT COUNT(*) FROM a", "4");
+    try run("ALTER TABLE a DROP COLUMN w");
+    try run("ALTER TABLE a DROP COLUMN val");
+    try expect(alter_probes[4], "a_pkey|PRIMARY KEY");
+    try expect("SELECT * FROM a ORDER BY id", "1;2;3;4");
+    // DROP CONSTRAINT, IF EXISTS, 42704.
+    try run("ALTER TABLE a ADD COLUMN q INT CHECK (q < 5) UNIQUE");
+    try expect("SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 'a' AND constraint_type <> 'PRIMARY KEY' AND constraint_name LIKE 'a_q%' ORDER BY constraint_name", "a_q_check;a_q_key");
+    try rejects("UPDATE a SET q = 9", error.CheckViolation, "SELECT COUNT(*) FROM a WHERE q IS NULL", "4");
+    try run("ALTER TABLE a DROP CONSTRAINT a_q_check");
+    try run("UPDATE a SET q = 9 WHERE id = 1");
+    try rejects("UPDATE a SET q = 9 WHERE id = 2", error.PrimaryKeyViolation, "SELECT COUNT(*) FROM a WHERE q IS NULL", "3");
+    try rejects("ALTER TABLE a DROP CONSTRAINT nothing_here", error.UndefinedObject, "SELECT COUNT(*) FROM a", "4");
+    try run("ALTER TABLE a DROP CONSTRAINT IF EXISTS nothing_here");
+    // Dropping the primary key frees the key.
+    try run("ALTER TABLE a DROP CONSTRAINT a_pkey");
+    try run("INSERT INTO a VALUES (1, NULL)");
+    try expect("SELECT COUNT(*) FROM a WHERE id = 1", "2");
+    try sameState(&.{ "SELECT * FROM a ORDER BY id, q", "SELECT oid, relname, relkind FROM pg_class WHERE relnamespace = 2200 ORDER BY oid", "SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'a' ORDER BY constraint_name" });
+}
+
+fn alterErrors() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, v INT)");
+    try run("INSERT INTO a VALUES (1, 1)");
+    try run("CREATE SEQUENCE s");
+    try run("CREATE TABLE ident (id INT GENERATED ALWAYS AS IDENTITY, x INT, y INT)");
+    const probe = "SELECT column_name FROM information_schema.columns WHERE table_name = 'a' ORDER BY ordinal_position";
+    try rejects("ALTER TABLE missing ADD COLUMN x INT", error.TableNotFound, probe, "id;v");
+    try run("ALTER TABLE IF EXISTS missing ADD COLUMN x INT");
+    try rejects("ALTER TABLE s ADD COLUMN x INT", error.WrongObjectType, probe, "id;v");
+    try rejects("ALTER TABLE a ADD COLUMN v INT", error.DuplicateColumn, probe, "id;v");
+    try rejects("ALTER TABLE a DROP COLUMN nope", error.ColumnNotFound, probe, "id;v");
+    try run("ALTER TABLE a DROP COLUMN IF EXISTS nope");
+    try rejects("ALTER TABLE a RENAME COLUMN nope TO x", error.ColumnNotFound, probe, "id;v");
+    try rejects("ALTER TABLE a RENAME COLUMN v TO id", error.DuplicateColumn, probe, "id;v");
+    try rejects("ALTER TABLE a RENAME TO s", error.TableExists, probe, "id;v");
+    // A failing later action leaves nothing of the earlier ones.
+    try rejects("ALTER TABLE a ADD COLUMN x INT, DROP COLUMN nope", error.ColumnNotFound, probe, "id;v");
+    try rejects("ALTER TABLE a ADD COLUMN x INT DEFAULT nextval('s')", error.UnsupportedStatement, probe, "id;v");
+    try rejects("ALTER TABLE a ADD COLUMN x INT PRIMARY KEY", error.UnsupportedStatement, probe, "id;v");
+    try rejects("ALTER TABLE a ALTER COLUMN v TYPE BIGINT", error.UnsupportedStatement, probe, "id;v");
+    try rejects("ALTER TABLE a ADD COLUMN x INT DEFAULT 'text'", error.InvalidTextRepresentation, probe, "id;v");
+    try rejects("ALTER TABLE ident DROP COLUMN id", error.UnsupportedStatement, "SELECT COUNT(*) FROM ident", "0");
+    try rejects("ALTER TABLE ident ALTER COLUMN id SET DEFAULT 1", error.Syntax, "SELECT COUNT(*) FROM ident", "0");
+    // An identity column after the dropped one keeps its position: refused.
+    try run("ALTER TABLE ident DROP COLUMN y");
+    try run("INSERT INTO ident (x) VALUES (5)");
+    try expect("SELECT id, x FROM ident", "1|5");
+    try sameState(&.{ "SELECT id, x FROM ident", probe });
+}
+
+fn alterTransactions() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, v INT)");
+    try run("INSERT INTO a VALUES (1, 10), (2, 20)");
+    // Abort restores the old definition and rows, including own rows.
+    var tx = try db.begin();
+    try statement(tx, "INSERT INTO a VALUES (3, 30)");
+    try statement(tx, "ALTER TABLE a ADD COLUMN extra INT DEFAULT 5");
+    try statement(tx, "UPDATE a SET extra = id WHERE id = 3");
+    try same(try rows(tx, "SELECT * FROM a ORDER BY id"), "1|10|5;2|20|5;3|30|3");
+    db.abort(tx);
+    try expect("SELECT * FROM a ORDER BY id", "1|10;2|20");
+    try check(db.usage().pending_versions == 0);
+    // ROLLBACK TO a savepoint between two ALTERs.
+    tx = try db.begin();
+    try statement(tx, "ALTER TABLE a ADD COLUMN one INT DEFAULT 1");
+    try db.savepoint(tx, "s");
+    try statement(tx, "ALTER TABLE a DROP COLUMN v");
+    try statement(tx, "INSERT INTO a VALUES (9, 9)");
+    _ = try db.rollbackTo(tx, "s");
+    try same(try rows(tx, "SELECT * FROM a ORDER BY id"), "1|10|1;2|20|1");
+    try statement(tx, "INSERT INTO a VALUES (3, 30, 3)");
+    try commit(tx);
+    try expect("SELECT * FROM a ORDER BY id", "1|10|1;2|20|1;3|30|3");
+    try sameState(&alter_probes);
+    // CREATE, rows, TRUNCATE and ALTER in one transaction replay in order.
+    tx = try db.begin();
+    try statement(tx, "CREATE TABLE fresh (k INT PRIMARY KEY, a INT, b INT)");
+    try statement(tx, "INSERT INTO fresh VALUES (1, 1, 1)");
+    try statement(tx, "ALTER TABLE fresh DROP COLUMN a");
+    try statement(tx, "INSERT INTO fresh VALUES (2, 2)");
+    try statement(tx, "ALTER TABLE fresh ADD COLUMN c TEXT DEFAULT 'c'");
+    try statement(tx, "INSERT INTO fresh VALUES (3, 3, 'x')");
+    try statement(tx, "TRUNCATE a");
+    try statement(tx, "ALTER TABLE a ADD COLUMN z INT DEFAULT 0");
+    try statement(tx, "INSERT INTO a VALUES (5, 50, 5, 5)");
+    try commit(tx);
+    try expect("SELECT * FROM fresh ORDER BY k", "1|1|c;2|2|c;3|3|x");
+    try expect("SELECT * FROM a ORDER BY id", "5|50|5|5");
+    try sameState(&.{ "SELECT * FROM fresh ORDER BY k", "SELECT * FROM a ORDER BY id", "SELECT COUNT(*), SUM(k) FROM fresh", alter_probes[3], alter_probes[5] });
+    try check(db.usage().transactions == 0 and db.usage().pending_versions == 0);
+    // The old slot is reclaimed after commit: repeated ALTERs do not run
+    // out of table slots.
+    for (0..12) |_| {
+        try run("ALTER TABLE fresh ADD COLUMN t INT DEFAULT 1");
+        try run("ALTER TABLE fresh DROP COLUMN t");
+    }
+    try sameState(&.{ "SELECT * FROM fresh ORDER BY k", "SELECT COUNT(*) FROM pg_class" });
+}
+
+fn alterIsolation() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, v INT)");
+    try run("INSERT INTO a VALUES (1, 10)");
+    // An uncommitted ALTER is invisible: readers wait for its lock, and
+    // the committed catalog keeps the old definition and rows.
+    const alterer = try db.begin();
+    try statement(alterer, "ALTER TABLE a ADD COLUMN extra INT DEFAULT 3");
+    const reader = try db.begin();
+    try parks(reader, "SELECT * FROM a");
+    try check(db.waitingFor(reader).has(alterer));
+    try check(db.storageStats("a").?.live_rows == 1);
+    var described: DB.Result = .{};
+    try db.describe("SELECT * FROM a", &described);
+    try check(described.column_count == 2);
+    try commit(alterer);
+    try same(try resumed(reader, "SELECT * FROM a"), "1|10|3");
+    try commit(reader);
+    // A reader's AccessShare lock makes ALTER wait.
+    const holder = try db.begin();
+    try same(try rows(holder, "SELECT COUNT(*) FROM a"), "1");
+    const second = try db.begin();
+    try parks(second, "ALTER TABLE a DROP COLUMN v");
+    try check(db.waitingFor(second).has(holder));
+    try commit(holder);
+    _ = try resumed(second, "ALTER TABLE a DROP COLUMN v");
+    try commit(second);
+    try expect("SELECT * FROM a", "1|3");
+    try sameState(&alter_probes);
+    try check(db.usage().transactions == 0 and db.usage().table_locks == 0);
+}
+
 pub fn main(init: std.process.Init) !void {
     try truncateTable();
     try truncateErrors();
@@ -550,6 +774,11 @@ pub fn main(init: std.process.Init) !void {
     try checkConstraints();
     try uniqueConstraints();
     try compositeKeys();
+    try alterValues();
+    try alterConstraints();
+    try alterErrors();
+    try alterTransactions();
+    try alterIsolation();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-ddl-core\",\"pass\":true,\"assertions\":{d},\"records\":{d},\"database_bytes\":{d}}}\n", .{ assertions, records_applied, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

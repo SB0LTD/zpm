@@ -49,6 +49,12 @@ pub fn Dml(comptime config: types.Config) type {
             checks: ?*const [config.table_constraints]u16 = null,
         };
 
+        /// The bound CHECK constraints over an existing row (ALTER TABLE).
+        pub fn checkRow(ctx: *const E.Context, table: *const S.Table, checks: *const [config.table_constraints]u16, cells: *const E.Row) Error!void {
+            const empty: [config.columns]u16 = @splat(none);
+            return checkConstraints(ctx, table, .{ .defaults = &empty, .generated = &empty, .checks = checks }, cells);
+        }
+
         /// PostgreSQL ExecConstraints after NOT NULL: a CHECK that yields
         /// FALSE rejects the row (23514); NULL satisfies it.
         fn checkConstraints(ctx: *const E.Context, table: *const S.Table, derived: Derived, cells: *const E.Row) Error!void {
