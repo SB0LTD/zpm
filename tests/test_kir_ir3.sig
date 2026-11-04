@@ -807,6 +807,121 @@ test "loop-carried registers with one definition, read at the top of the next tu
     _ = try both(&k, .{ 2, 1, 1 }, &.{&out}, &.{});
 }
 
+test "a predicate live across a loop's back edge, made before the loop and in it" {
+    // (G: the fill's edge coverage came out 0)
+    for (0..2) |variant| {
+        var k = newKernel("pred round the loop", .{ 64, 1, 1 });
+        const o = k.binding();
+        const t = k.tid(0);
+        // made before the loop (variant 0) or only in it (variant 1)
+        const p = if (variant == 0) k.cmp(.u32, .lt, r(t), u(24)) else k.reg(.pred);
+        const acc = k.mov(.u32, u(0));
+        const i = k.mov(.u32, u(0));
+        k.loop();
+        {
+            if (variant == 1) {
+                // the first turn reads what the last write left: guard it
+                k.ifp(r(k.cmp(.u32, .ne, r(i), u(0))));
+            }
+            k.set(acc, .iadd, r(acc), r(k.sel(.u32, r(p), u(1), u(100))), no);
+            if (variant == 1) k.endif();
+            var x = k.op2(.imul, .u32, r(t), r(k.op2(.iadd, .u32, r(i), u(3))));
+            for (0..10) |n| x = k.op2(.xor, .u32, r(k.op2(.iadd, .u32, r(x), u(@intCast(n * 13 + 5)))), r(k.op2(.shr, .u32, r(x), u(2))));
+            k.setAux(p, .icmp, r(k.op2(.@"and", .u32, r(x), u(3))), u(1), no, @intFromEnum(kir.Cmp.lt));
+            var y = k.op2(.imul, .u32, r(x), u(5));
+            for (0..6) |n| y = k.op2(.iadd, .u32, r(k.op2(.xor, .u32, r(y), r(t))), u(@intCast(n + 1)));
+            k.set(acc, .iadd, r(acc), r(k.op2(.@"and", .u32, r(y), u(7))), no);
+            k.set(i, .iadd, r(i), u(1), no);
+            k.brk(r(k.cmp(.u32, .ge, r(i), u(6))));
+        }
+        k.endloop();
+        k.store(.u32, kir.global(o, 32), r(k.op2(.shl, .u32, r(t), u(2))), r(acc));
+        var out = zeros(128 * 4);
+        _ = try both(&k, .{ 2, 1, 1 }, &.{&out}, &.{});
+    }
+}
+
+test "a loop counter written twice in the body and read at the top: every turn of the outer loop runs" {
+    // (G: a thread's second turn of an outer loop round the command loop
+    // never ran)
+    var k = newKernel("counter written twice", .{ 64, 1, 1 });
+    const o = k.binding();
+    const t = k.tid(0);
+    const c = k.mov(.u32, u(0));
+    const turns = k.mov(.u32, u(0));
+    const acc = k.mov(.u32, u(0));
+    const lim = k.op2(.iadd, .u32, r(k.op2(.@"and", .u32, r(t), u(3))), u(2));
+    k.loop();
+    {
+        // read at the top
+        const x = k.op2(.imul, .u32, r(c), u(3));
+        k.set(turns, .iadd, r(turns), u(1), no);
+        // an inner loop
+        const j = k.mov(.u32, u(0));
+        k.loop();
+        k.set(acc, .iadd, r(acc), r(k.op2(.iadd, .u32, r(x), r(j))), no);
+        k.set(j, .iadd, r(j), u(1), no);
+        k.brk(r(k.cmp(.u32, .ge, r(j), u(3))));
+        k.endloop();
+        // the counter, written twice
+        k.set(c, .iadd, r(c), u(1), no);
+        var y = k.op2(.imul, .u32, r(t), r(c));
+        for (0..6) |n| y = k.op2(.xor, .u32, r(k.op2(.iadd, .u32, r(y), u(@intCast(n + 7)))), r(acc));
+        k.set(acc, .iadd, r(acc), r(k.op2(.@"and", .u32, r(y), u(1))), no);
+        k.set(c, .iadd, r(c), r(k.op2(.@"and", .u32, r(t), u(1))), no);
+        k.brk(r(k.cmp(.u32, .ge, r(c), r(lim))));
+    }
+    k.endloop();
+    const ob = k.op2(.shl, .u32, r(t), u(4));
+    const v = k.vec(.u32, 4);
+    k.set(kir.Kernel.at(v, 0), .mov, r(c), no, no);
+    k.set(kir.Kernel.at(v, 1), .mov, r(turns), no, no);
+    k.set(kir.Kernel.at(v, 2), .mov, r(acc), no, no);
+    k.set(kir.Kernel.at(v, 3), .mov, r(lim), no, no);
+    k.store(.u32, kir.global(o, 128), r(ob), r(v));
+    var out = zeros(64 * 16);
+    _ = try both(&k, .{ 1, 1, 1 }, &.{&out}, &.{});
+}
+
+test "a loop counter that is an element of a loaded vector, written twice in the body" {
+    // (a vector's registers are allocated together: its first element's
+    // single load must not hide another element's loop-carried writes)
+    var k = newKernel("vector counter", .{ 64, 1, 1 });
+    const src = k.binding();
+    const o = k.binding();
+    const t = k.tid(0);
+    const v = k.load(.u32, kir.global(src, 128), r(k.op2(.shl, .u32, r(t), u(4))));
+    const c = kir.Kernel.at(v, 2);
+    const acc = k.mov(.u32, u(0));
+    k.loop();
+    {
+        const x = k.op2(.imul, .u32, r(c), u(3));
+        var y = k.op2(.iadd, .u32, r(x), r(kir.Kernel.at(v, 0)));
+        for (0..8) |n| y = k.op2(.xor, .u32, r(k.op2(.iadd, .u32, r(y), u(@intCast(n + 1)))), r(t));
+        k.set(acc, .iadd, r(acc), r(y), no);
+        k.set(c, .iadd, r(c), u(1), no);
+        var z = k.op2(.imul, .u32, r(acc), u(7));
+        for (0..6) |n| z = k.op2(.iadd, .u32, r(k.op2(.shr, .u32, r(z), u(1))), u(@intCast(n)));
+        k.set(acc, .xor, r(acc), r(z), no);
+        k.set(c, .iadd, r(c), r(k.op2(.@"and", .u32, r(t), u(1))), no);
+        k.brk(r(k.cmp(.u32, .ge, r(c), r(kir.Kernel.at(v, 1)))));
+    }
+    k.endloop();
+    const ob = k.op2(.shl, .u32, r(t), u(3));
+    k.store(.u32, kir.global(o, 32), r(ob), r(acc));
+    var m = kir.global(o, 32);
+    m.imm = 4;
+    k.store(.u32, m, r(ob), r(c));
+    var input = zeros(64 * 16);
+    for (0..64) |i| {
+        std.mem.writeInt(u32, input[i * 16 ..][0..4], @intCast(i * 5), .little);
+        std.mem.writeInt(u32, input[i * 16 + 4 ..][0..4], @intCast(4 + i % 5), .little);
+        std.mem.writeInt(u32, input[i * 16 + 8 ..][0..4], @intCast(i % 3), .little);
+    }
+    var out = zeros(64 * 8);
+    _ = try both(&k, .{ 1, 1, 1 }, &.{ &input, &out }, &.{});
+}
+
 // ── The hand-written kernels, rewritten in KIR ──────────────────────────────
 
 const hand = @import("lfm3_gpu_kernels");
