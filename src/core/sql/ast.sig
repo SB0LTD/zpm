@@ -51,7 +51,9 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // timestamptz (session time zone) overloads chosen by the binder.
     extract, extract_tz, date_part, date_part_tz, date_trunc, date_trunc_tz, age, age_tz, justify_days, justify_hours, justify_interval, make_date, make_timestamp, isfinite,
     // (a, b) OVERLAPS (c, d); overlaps_tz is the STABLE timestamptz + interval form.
-    overlaps, overlaps_tz };
+    overlaps, overlaps_tz,
+    // Formatting input functions (B11, functions_format.sig); STABLE.
+    to_date, to_number, to_timestamp };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
@@ -60,7 +62,8 @@ pub fn canRepeatFunction(func: Func) bool {
     return switch (func) {
         .grouping, .window_call, .to_char, .round, .abs, .ceil, .floor, .trunc, .sign, .sqrt, .greatest, .least => true,
         else => immutableBuiltin(func) or func == .concat or func == .concat_ws or
-            func == .extract_tz or func == .date_part_tz or func == .date_trunc_tz or func == .overlaps_tz,
+            func == .extract_tz or func == .date_part_tz or func == .date_trunc_tz or func == .overlaps_tz or
+            func == .to_date or func == .to_number or func == .to_timestamp,
     };
 }
 
@@ -98,6 +101,7 @@ pub fn strictFunction(func: Func) bool {
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
         .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
+        .to_date, .to_number, .to_timestamp => true,
         else => false,
     };
 }

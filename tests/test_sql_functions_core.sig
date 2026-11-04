@@ -672,6 +672,68 @@ fn overlapsPredicate() void {
     report("overlaps",before);
 }
 
+// ---- PG.FUNC.FORMAT ----------------------------------------------------------
+
+fn formatting() void {
+    const before=begin("format");
+    // Oracle fixture (PG.FUNC.FORMAT).
+    shaped("SELECT to_char(DATE '2025-03-15','YYYY-MM'),to_date('2025-03-15','YYYY-MM-DD'),to_number('12.3','99.9')",
+        &.{.{.name="to_char",.oid=25},.{.name="to_date",.oid=1082},.{.name="to_number",.oid=1700}},&.{"2025-03","2025-03-15","12.3"});
+    // PostgreSQL 18 documentation examples (functions-formatting.html).
+    value("SELECT to_date('05 Dec 2000','DD Mon YYYY')",1082,"2000-12-05");
+    value("SELECT to_number('12,454.8-','99G999D9S')",1700,"-12454.8");
+    value("SELECT to_timestamp('05 Dec 2000','DD Mon YYYY')",1184,"2000-12-05 00:00:00+00");
+    value("SELECT to_timestamp('2000    JUN','YYYY MON')",1184,"2000-06-01 00:00:00+00");
+    value("SELECT to_timestamp('2000+JUN','YYYY/MON')",1184,"2000-06-01 00:00:00+00");
+    value("SELECT to_date('20000-1130','YYYY-MMDD')",1082,"20000-11-30");
+    value("SELECT to_timestamp(1284352323)",1184,"2010-09-13 04:32:03+00");
+    // Field widths, separators, names, 12-hour clock, fractions, years.
+    value("SELECT to_date('20250315','YYYYMMDD')",1082,"2025-03-15");
+    value("SELECT to_date('15/03/2025','DD/MM/YYYY')",1082,"2025-03-15");
+    value("SELECT to_date('March 15 2025','Month DD YYYY')",1082,"2025-03-15");
+    value("SELECT to_date('95-01-03','YY-MM-DD')",1082,"1995-01-03");
+    value("SELECT to_date('05-01-03','YY-MM-DD')",1082,"2005-01-03");
+    value("SELECT to_date('2025 075','YYYY DDD')",1082,"2025-03-16");
+    value("SELECT to_date('2451545','J')",1082,"2000-01-01");
+    value("SELECT to_date('2025-03-15','YYYY-MM-DD HH24')",1082,"2025-03-15");
+    // Fields after the end of the input keep their defaults (non-FX mode).
+    value("SELECT to_date('2025','YYYYMMDD')",1082,"2025-01-01");
+    value("SELECT to_date('Sat 2025-03-15','Dy YYYY-MM-DD')",1082,"2025-03-15");
+    value("SELECT to_date('44-03-15 BC','YYYY-MM-DD BC')",1082,"0044-03-15 BC");
+    value("SELECT to_timestamp('2011-12-18 11:38 PM','YYYY-MM-DD HH12:MI PM')",1184,"2011-12-18 23:38:00+00");
+    value("SELECT to_timestamp('2011-12-18 12:05 a.m.','YYYY-MM-DD HH:MI a.m.')",1184,"2011-12-18 00:05:00+00");
+    value("SELECT to_timestamp('2025-03-15 12:34:56.789','YYYY-MM-DD HH24:MI:SS.MS')",1184,"2025-03-15 12:34:56.789+00");
+    value("SELECT to_timestamp('2025-03-15 12:34:56.5','YYYY-MM-DD HH24:MI:SS.US')",1184,"2025-03-15 12:34:56.5+00");
+    value("SELECT to_timestamp(0)",1184,"1970-01-01 00:00:00+00");
+    value("SELECT to_timestamp('Infinity'::float8)",1184,"infinity");
+    value("SELECT to_date(NULL,'YYYY')",1082,null);
+    // Number templates.
+    value("SELECT to_number('-12.5','99.9')",1700,"-12.5");
+    value("SELECT to_number('1,234','9,999')",1700,"1234");
+    value("SELECT to_number('12.35','99.9')",1700,"12.3");
+    value("SELECT to_number('$123','L999')",1700,"123");
+    value("SELECT to_number('12-','99MI')",1700,"-12");
+    value("SELECT to_number('+12','S99')",1700,"12");
+    value("SELECT to_number('0012.50','0000.00')",1700,"12.50");
+    value("SELECT to_number('5','')",1700,null);
+    // Errors.
+    rejects("SELECT to_date('2025-02-30','YYYY-MM-DD')",error.DatetimeFieldOverflow);
+    rejects("SELECT to_date('2025-13-01','YYYY-MM-DD')",error.DatetimeFieldOverflow);
+    rejects("SELECT to_date('abcd-01-01','YYYY-MM-DD')",error.InvalidDatetimeFormat);
+    rejects("SELECT to_date('Foo 2025','Mon YYYY')",error.InvalidDatetimeFormat);
+    rejects("SELECT to_date('2025-03-15','IYYY-MM-DD')",error.UnsupportedStatement);
+    rejects("SELECT to_timestamp('13 PM','HH12 PM')",error.InvalidDatetimeFormat);
+    rejects("SELECT to_timestamp('2000    JUN','FXYYYY MON')",error.InvalidDatetimeFormat);
+    rejects("SELECT to_timestamp('12:61','HH24:MI')",error.DatetimeFieldOverflow);
+    rejects("SELECT to_timestamp('NaN'::float8)",error.DatetimeFieldOverflow);
+    rejects("SELECT to_number('123.4','99.9')",error.NumericValueOutOfRange);
+    rejects("SELECT to_number('abc','999')",error.InvalidTextRepresentation);
+    rejects("SELECT to_number('12','9.9.9')",error.Syntax);
+    rejects("SELECT to_number('1e5','9EEEE')",error.UnsupportedStatement);
+    rejects("SELECT to_date(20250315,'YYYYMMDD')",error.UndefinedFunction);
+    report("format",before);
+}
+
 pub fn main(init:std.process.Init) !void {
     literals();
     strings();
@@ -679,6 +741,7 @@ pub fn main(init:std.process.Init) !void {
     bitwise();
     temporals();
     overlapsPredicate();
+    formatting();
     var buffer:[160]u8=undefined;
     const line=try std.fmt.bufPrint(&buffer,"{{\"suite\":\"sql-functions-core\",\"pass\":{s},\"assertions\":{d},\"failures\":{d}}}\n",.{if(failures==0) "true" else "false",assertions,failures});
     try std.Io.File.stdout().writeStreamingAll(init.io,line);

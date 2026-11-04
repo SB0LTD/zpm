@@ -14,6 +14,7 @@ const numeric_math = @import("numeric_math.sig");
 const float_text = @import("float_text.sig");
 const temporal = @import("temporal.sig");
 const times = @import("functions_temporal.sig");
+const formats = @import("functions_format.sig");
 const std = @import("std");
 const Error = types.Error;
 const none = ast.none;
@@ -103,6 +104,7 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
                 .gcd, .lcm, .scale, .min_scale, .trim_scale => return mathematical(n, &cells, count, control),
                 .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours,
                 .justify_interval, .make_date, .make_timestamp, .isfinite => return temporalValue(ctx, n, &cells, count),
+                .to_date, .to_number, .to_timestamp => return formatValue(ctx, n, &cells, count),
                 else => unreachable,
             }
             result.len = out.len;
@@ -438,6 +440,56 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
             }
             if (e1 == null or e2 == null) return .null_value;
             return .{ .boolean = true };
+        }
+
+        /// to_date / to_timestamp / to_number.
+        fn formatValue(ctx: *const E.Context, n: *const ast.Node, cells: *const [max_args]V.Cell, count: usize) Error!V.Cell {
+            const control = ctx.session.control;
+            switch (n.func) {
+                .to_date => return .{ .date = try formats.toDate(try formats.parseTimestamp(textOf(&cells[0]), textOf(&cells[1]), control)) },
+                .to_timestamp => {
+                    if (count == 1) return .{ .timestamptz = try epochTimestamp(cells[0].float8) };
+                    const local = try formats.toLocalTimestamp(try formats.parseTimestamp(textOf(&cells[0]), textOf(&cells[1]), control));
+                    const utc = try temporal.toUtc(&ctx.session.zone, local);
+                    if (!temporal.validTimestamp(utc)) return error.DatetimeFieldOverflow;
+                    return .{ .timestamptz = utc };
+                },
+                .to_number => {
+                    // An empty template is NULL (numeric_to_number).
+                    if (textOf(&cells[1]).len == 0) return .null_value;
+                    var number: formats.Number = .{};
+                    try formats.toNumber(textOf(&cells[0]), textOf(&cells[1]), &number, control);
+                    const text = number.bytes[0..number.len];
+                    var any_digit = false;
+                    for (text) |byte| if (byte >= '0' and byte <= '9') {
+                        any_digit = true;
+                    };
+                    if (!any_digit) return error.InvalidTextRepresentation;
+                    const parsed = try NOps.parse(text);
+                    // numeric_in with typmod (pre + post, post): round, then
+                    // the integer digits must fit (22003).
+                    const rounded = try NOps.round(&parsed, @intCast(number.post));
+                    var whole = rounded.coef() / @as(u256, @intCast(numeric.pow10[rounded.dscale]));
+                    var digits: usize = 0;
+                    while (whole != 0) : (whole /= 10) digits += 1;
+                    if (digits > number.pre) return error.NumericValueOutOfRange;
+                    return .{ .numeric = rounded };
+                },
+                else => unreachable,
+            }
+        }
+
+        /// float8_timestamptz: Unix seconds to timestamptz (22008 for NaN or
+        /// beyond the Julian timestamp range).
+        fn epochTimestamp(seconds: f64) Error!i64 {
+            if (seconds != seconds) return error.DatetimeFieldOverflow;
+            if (float_text.isInf(seconds)) return if (seconds < 0) temporal.timestamp_no_begin else temporal.timestamp_no_end;
+            // SECS_PER_DAY * (DATETIME_MIN_JULIAN or TIMESTAMP_END_JULIAN - UNIX_EPOCH_JDATE).
+            if (seconds < -210866803200.0 or seconds >= 9224318016000.0) return error.DatetimeFieldOverflow;
+            const micros = float_text.rint((seconds - 946684800.0) * 1000000.0);
+            const result: i64 = @intFromFloat(micros);
+            if (!temporal.validTimestamp(result)) return error.DatetimeFieldOverflow;
+            return result;
         }
 
         fn localOf(zone: *const temporal.Zone, us: i64) i64 {

@@ -772,6 +772,9 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "justify_days", .func = .justify_days }, .{ .name = "justify_hours", .func = .justify_hours },
                 .{ .name = "justify_interval", .func = .justify_interval }, .{ .name = "make_date", .func = .make_date },
                 .{ .name = "make_timestamp", .func = .make_timestamp }, .{ .name = "isfinite", .func = .isfinite },
+                // Formatting input functions (B11).
+                .{ .name = "to_date", .func = .to_date },           .{ .name = "to_number", .func = .to_number },
+                .{ .name = "to_timestamp", .func = .to_timestamp },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -1280,6 +1283,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
                 .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
                 .overlaps, .overlaps_tz => try typeOverlaps(context, n, count),
+                .to_date => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .date, true),
+                .to_number => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .numeric, true),
+                // to_timestamp(text, text) or to_timestamp(double precision).
+                .to_timestamp => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.float8} else &[_]ast.Type{ .text, .text }, .timestamptz, true),
             }
         }
 
