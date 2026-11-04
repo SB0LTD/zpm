@@ -193,9 +193,9 @@ test "self-test on the emulated Adreno (kir_ir3, ir3_emu, the strict device)" {
     Adreno.dev.init(&Adreno.arena, &Adreno.view);
     Log.reset();
     const res = selftest.runWith(gpu.all_targets, Adreno.dev.device(), &work, Log.line, .{ .timeout_us = TIMEOUT_US, .stop_when_lost = false, .on_failure = adrenoFailure });
-    // kir_ir3 bugs the self-test found (S.md): frne(-0.5) gives +0, not -0;
-    // a hazard at the ticket store after an atomic's result
-    try expectAllPassBut(res, &.{ "float", "global atomics" });
+    // (the two the self-test found, frne(-0.5) and the store after an
+    // atomic's result, were ir3_emu's: fixed on sig-gpu-ir3)
+    try expectAllPass(res);
 }
 
 // ── A broken device ─────────────────────────────────────────────────────────

@@ -423,8 +423,21 @@ fn noteWrite(c: *Ctx, num: u16, half: bool, kind: enum { alu, mova, ss, sy, none
                 c.w.ready_alu[w][x] = slot + 1 + c.delays.non_alu;
                 c.w.ready_non[w][x] = slot + 1 + c.delays.non_alu;
             },
-            .ss => bitSet(&c.w.pend_ss[w], x),
-            .sy => bitSet(&c.w.pend_sy[w], x),
+            // A write that (ss) or (sy) waits for is ordered after
+            // earlier ALU writes of the register: its reader waits for the
+            // sync, not for their latency (as Mesa's ir3_legalize resets
+            // the ready slot: "writes that require (ss) or (sy) are
+            // synchronized against previous writes").
+            .ss => {
+                bitSet(&c.w.pend_ss[w], x);
+                c.w.ready_alu[w][x] = 0;
+                c.w.ready_non[w][x] = 0;
+            },
+            .sy => {
+                bitSet(&c.w.pend_sy[w], x);
+                c.w.ready_alu[w][x] = 0;
+                c.w.ready_non[w][x] = 0;
+            },
             .none => {
                 c.w.ready_alu[w][x] = 0;
                 c.w.ready_non[w][x] = 0;
@@ -599,7 +612,11 @@ fn execCat2(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
                 .rndne_f => {
                     const x = fsrc(c, f, s0, i);
                     const r = @round(x);
-                    fres = if (@abs(x - @trunc(x)) == 0.5 and @mod(r, 2.0) != 0) r - std.math.sign(x) else r;
+                    const e = if (@abs(x - @trunc(x)) == 0.5 and @mod(r, 2.0) != 0) r - std.math.sign(x) else r;
+                    // Rounding to an integral value keeps the sign (IEEE
+                    // roundToIntegralTiesToEven, NIR's fround_even, which
+                    // Mesa emits as rndne.f): -0.5 is -0, not +0.
+                    fres = std.math.copysign(e, x);
                 },
                 .rndaz_f => fres = @round(fsrc(c, f, s0, i)),
                 .cmps_f => res = @intFromBool(cmp(in.cond, f32, fsrc(c, f, s0, i), fsrc(c, f, s1, i))),
@@ -1256,6 +1273,66 @@ test "a store, a fence and a barrier are no delay slots: an address read across 
     code[9] = try ir3.assembleLine(ir3.A7XX, "nop");
     try load(w, &k);
     _ = try run(w, &mem, &.{ .kernel = &k, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats);
+}
+
+test "rndne.f rounds halves to even and keeps the sign of a zero: -0.5 is -0" {
+    var out = [_]u32{0} ** 8;
+    const regions = [_]Region{.{ .va = 0x9000, .bytes = std.mem.sliceAsBytes(&out) }};
+    const mem = Memory{ .regions = &regions };
+    // -0.5, -2.5, 0.5, -0.3, 2.5, -0, -1.5, 3.5
+    const consts = [_]u32{ 0x9000, 0, 0, 0, 0xbf00_0000, 0xc020_0000, 0x3f00_0000, 0xbe99_999a, 0x4020_0000, 0x8000_0000, 0xbfc0_0000, 0x4060_0000 };
+    _ = try runSource(
+        \\@localsize 1, 1, 1
+        \\@consts 3
+        \\rndne.f r0.x, c1.x
+        \\rndne.f r0.y, c1.y
+        \\rndne.f r0.z, c1.z
+        \\rndne.f r0.w, c1.w
+        \\rndne.f r1.x, c2.x
+        \\rndne.f r1.y, c2.y
+        \\rndne.f r1.z, c2.z
+        \\rndne.f r1.w, c2.w
+        \\mov.u32u32 r2.x, 0
+        \\stg.a.u32 g[c0.x+r2.x+0], r0.x, 4
+        \\mov.u32u32 r2.y, 16
+        \\stg.a.u32 g[c0.x+r2.y+0], r1.x, 4
+        \\end
+    , &mem, &consts, .{ 1, 1, 1 });
+    try std.testing.expectEqualSlices(u32, &.{ 0x8000_0000, 0xc000_0000, 0x0000_0000, 0x8000_0000, 0x4000_0000, 0x8000_0000, 0xc000_0000, 0x4080_0000 }, &out);
+}
+
+test "a load's or atomic's write settles an earlier ALU write of its register" {
+    // (S's self-test: an atomic returned into a register an ALU op had
+    // just written; the (sy) reader was flagged for the ALU's latency)
+    emu_work.check_hazards = true;
+    var data = [_]u32{ 7, 0, 5, 0 };
+    const regions = [_]Region{.{ .va = 0x1_0000_0000, .bytes = std.mem.sliceAsBytes(&data) }};
+    const mem = Memory{ .regions = &regions };
+    const consts = [_]u32{ 0, 1, 0, 0 };
+    _ = try runSource(
+        \\@localsize 1, 1, 1
+        \\@consts 1
+        \\mov.u32u32 r1.x, 0
+        \\mov.u32u32 r1.y, 4
+        \\mov.u32u32 r1.z, 12
+        \\mov.u32u32 r2.x, c0.x
+        \\mov.u32u32 r2.y, c0.y
+        \\mov.u32u32 r3.x, 8
+        \\mov.u32u32 r3.y, 1
+        \\(rpt5)nop
+        \\add.u r0.x, r1.x, 1
+        \\ldg.a.u32 r0.x, g[c0.x+r1.x+0], 1
+        \\stg.a.u32 g[c0.x+r1.y+0], r0.x, 1
+        \\add.u r0.y, r1.x, 2
+        \\add.u r4.x, r2.x, r3.x
+        \\mov.u32u32 r4.y, r2.y
+        \\(rpt5)nop
+        \\add.u r0.y, r1.x, 3
+        \\atomic.g.add.untyped.1d.u32.1.g r0.y, r4.x, r3.y
+        \\stg.a.u32 g[c0.x+r1.z+0], r0.y, 1
+        \\end
+    , &mem, &consts, .{ 1, 1, 1 });
+    try std.testing.expectEqualSlices(u32, &.{ 7, 7, 6, 5 }, &data);
 }
 
 test "(abs) of the most negative integer wraps to itself" {
