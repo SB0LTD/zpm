@@ -1102,6 +1102,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("transformer_ops", "src/core/transformer_ops.sig"),
         importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
     });
+    // LFM3's quantized matrix and quantization kernels on sm_120, in the
+    // emulated RTX against quantized_linear, to the bit.
+    _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-matrix", "src/core/lfm3_nv_matrix.sig", &.{
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+    });
     // LFM3 on the Adreno: the kernels (each against quantized_linear and the
     // executor's arithmetic) and the backend against lfm3_executor.
     const lfm3_gpu_kernels = try ctx.addModule("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig");
