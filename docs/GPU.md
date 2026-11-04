@@ -331,6 +331,95 @@ A new GPU is a KIR backend plus a device adapter. Nothing else changes.
    exact paths are correct under any caps; only `fmad` users see the
    difference.
 
+## The self-test
+
+`selftest.sig` (`gpu.selftest`) checks a real `Device` against KIR's
+definition. Each case builds a small kernel, compiles it for
+`dev.caps.target`, runs it on the device, runs the same kernel on the CPU in
+`kir_interp` under the same Caps, and compares every output word. The
+emulators check the backends' code, but not everything the hardware does:
+the emulated RTX ignores BSSY/BSYNC, so divergence and reconvergence there
+are right only by construction. The first boot on a GPU names any op the
+hardware gets wrong.
+
+```zig
+var w: gpu.selftest.Work = undefined; // WORK_BYTES, about 15 MB: keep it static
+const res = gpu.selftest.runAll(dev, &w, logLine, 2_000_000);
+// or, linking one backend: gpu.selftest.runAllFor(&.{.sm_120}, dev, &w, logLine, t)
+```
+
+`runAll(dev, work, log, timeout_us) Result`. `Result` has `passed`,
+`failed`, `skipped`, `first_failure[0..first_failure_len]` (also
+`firstFailure()`), `gpu_ns` (the sum of `lastRunNs`) and `lost`.
+
+**The log.** A header line names the device and its caps. Then one line a
+case:
+
+```
+gpu self-test int u32: ok (106496 checked)
+gpu self-test shuffles: FAILED: lane 37, word 9: got 0x0000002a want 0x00000025 (inputs ...); 64 of 19456 wrong
+```
+
+`lane` is the thread, `word` the output row (for a table case, the op,
+named in brackets with its operands: `x0..x2` the inputs, `#..` an
+immediate, `p0..p2` an input's bit 0 as a predicate). Flat layouts
+(stores, atomics) name the word only. Then `gpu self-test: GPU time N us`
+and the summary, `gpu self-test: P passed, F failed, S skipped`.
+
+**Comparison.** Bit for bit. NaNs count as NaNs where an op may give any
+NaN (float arithmetic, cvt to f32 and f16), but moves, `sel`, `fabs`,
+`fneg` and shuffles must keep every bit. `fmad` may round either way (the
+mad probe says which). The approximate ops are held to the bounds above
+against the interpreter's value plus its own half ulp, inside their domains
+only, and denormal inputs and results are not checked (an SFU may flush
+them).
+
+**Failures.** A wrong word, a compile or load error, or a timeout fails
+the case, and the run goes on. A timeout waits once more; if the GPU is
+still running then, it is taken as lost. A lost device (`DeviceLost` from
+load, run or wait) ends the run: the cases left are skipped. An op the
+backend cannot compile (`Unsupported`, such as some of ir3's cvt roundings)
+is dropped from its case, which says so; a case with nothing left is
+skipped. Nothing panics.
+
+**The cases** (24; group sizes up to 256 and the subgroup width come from
+the Caps):
+
+| Case | What |
+|---|---|
+| int u32, int i32 | every integer op on 40 edge values crossed (and random words, small shift amounts and widths): add to bfe, imulhi, compares, sel, the predicate ops |
+| int immediates | every binary op with an immediate in either slot (small, 10-bit edges, 2^24, sign bits), imad, bfe offsets and widths |
+| dot4 | s8u8, s8s8 and u8u8, registers and immediates, wrapping sums |
+| float, float immediates | every f32 op on 48 edge values crossed (zeros, infinities, NaNs, denormals, 2^23/2^24, near-cancelling pairs): add, sub, mul, ffma (when fused), fmad, min/max, abs/neg, the roundings, compares |
+| approximate ops | rcp, rsq, log2, exp2, sin, cos against the bounds |
+| exact fdiv and fsqrt | 4096 divisions (specials crossed, 1536 quotients nearest a rounding midpoint, gradual underflow and overflow, denormals, random) and 4096 roots (roots nearest a midpoint, a stride through [1,4), denormals), plus divisions by and of immediates |
+| cvt rne, rz, rd, ru | f32 to u32/i32 (saturation, NaN), u32/i32 to f32, f32 to f16 (subnormals, overflow); rne also f16 to f32 (with garbage in the upper half) and the bit casts |
+| global loads 8-128 | unsigned and signed 8 and 16 bit, 32, 64, 128, immediate offsets up to 0x8000 |
+| global stores 8-128 | each width into a pattern, so a store that touches its neighbours shows |
+| shared memory and barriers | a tree sum with a barrier per step in a uniform loop; 8 to 128-bit shared accesses read back by other threads |
+| shuffles | idx (per lane, uniform, unmasked), xor (every mask), up and down past the edges, f32 payloads, a butterfly sum |
+| votes | any and all over dense, sparse, uniform and lane-shaped predicates |
+| global atomics, shared atomics | add/min/max/xchg u32 and i32 on own words (the old values), contended counters (the ends), tickets (every old value exactly once) |
+| divergent if/else | data-dependent nesting; shuffles and votes in both branches of a lane-parity if; a shuffle and a vote after the endif (reconvergence); a 16-lane block; an early ret |
+| divergent loops | per-lane trip counts with brk and cont, a vote among the lanes still looping, a predicate carried from turn to turn (and round an inner loop), shuffles in a loop whose trip count is per quad, nested loops left from inside an if |
+| grid ids and params | a (3, 2, 2) grid of (8, 4, 2) groups: tid, gid, gsize, lane, subgroup, param words |
+| mad probe | fused or unfused against `caps.mad` (logged, never failing) |
+| denormals probe | add, mul, an underflowing product and mad: preserve or flush against `caps.denormals` (logged, never failing) |
+
+**Cost.** One dispatch a case, 24 in all, of 1024 to 4096 threads: well
+under a second of GPU time. GPU memory: three 64 KiB input buffers and a
+1 MiB output buffer, allocated once. The CPU side compiles 24 kernels and
+interprets each once (twice for the probes and fmad's cases).
+
+**Where it runs.** It is allocator-free and freestanding-clean (no
+std.debug, std.Io or std.fmt outside the tests), so it runs in Galaxy's
+kernel and hosted, in galaxy-think. `tests/test_gpu_selftest.sig`
+(`sig build test-gpu-selftest`) runs it on EmuDevice (an ideal GPU; an
+Adreno-like one, unfused, flushing, subgroup 64, not coherent; a discrete
+one with subgroups of 128), on the emulated RTX and on the emulated
+Adreno, where every case must pass, and on a deliberately broken device,
+whose wrong words, timeout and loss must be reported as failures.
+
 ## Using it
 
 The usual sequence:
