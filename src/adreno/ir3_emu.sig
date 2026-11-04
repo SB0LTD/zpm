@@ -216,16 +216,22 @@ fn isrc(c: *const Ctx, f: u32, s: Src, i: u32) u32 {
     var b = srcBits(c, f, s, i);
     if (s.half and s.kind != .imm) b = @as(u32, @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(b)))))));
     if (s.kind == .imm) b = s.imm;
-    if (s.abs) b = @bitCast(@as(i32, @intCast(@abs(@as(i32, @bitCast(b))))));
+    if (s.abs) b = absWrap(b);
     if (s.neg) b = 0 -% b;
     if (s.bnot) b = ~b;
     return b;
 }
 
+/// (abs) of a 32-bit integer: |INT_MIN| wraps to INT_MIN, as the ALU's
+/// two's complement negation does.
+fn absWrap(b: u32) u32 {
+    return if (@as(i32, @bitCast(b)) < 0) 0 -% b else b;
+}
+
 fn usrc(c: *const Ctx, f: u32, s: Src, i: u32) u32 {
     var b = srcBits(c, f, s, i);
     if (s.half and s.kind != .imm) b &= 0xffff;
-    if (s.abs) b = @bitCast(@as(i32, @intCast(@abs(@as(i32, @bitCast(b))))));
+    if (s.abs) b = absWrap(b);
     if (s.neg) b = 0 -% b;
     if (s.bnot) b = ~b;
     return b;
@@ -1073,4 +1079,23 @@ test "the hazard checker catches a read before (sy)" {
     const consts = [_]u32{ 0x100, 0, 0, 0 };
     var stats = Stats{};
     try std.testing.expectError(error.Hazard, run(w, &mem, &.{ .kernel = &k, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats));
+}
+
+test "(abs) of the most negative integer wraps to itself" {
+    var out = [_]u32{ 1, 1 };
+    const regions = [_]Region{.{ .va = 0x9000, .bytes = std.mem.sliceAsBytes(&out) }};
+    const mem = Memory{ .regions = &regions };
+    const consts = [_]u32{ 0x9000, 0, 0x80000000, 0 };
+    _ = try runSource(
+        \\@localsize 1, 1, 1
+        \\@consts 1
+        \\mov.u32u32 r0.x, c0.z
+        \\absneg.s r0.y, (abs)r0.x
+        \\absneg.s r0.z, (neg)r0.x
+        \\mov.u32u32 r1.x, 0
+        \\stg.a.u32 g[c0.x+r1.x+0], r0.y, 2
+        \\end
+    , &mem, &consts, .{ 1, 1, 1 });
+    try std.testing.expectEqual(@as(u32, 0x80000000), out[0]);
+    try std.testing.expectEqual(@as(u32, 0x80000000), out[1]);
 }
