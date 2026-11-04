@@ -214,6 +214,8 @@ pub const Stats = struct {
     sgprs: u32 = 0,
     waits: u32 = 0,
     nops: u32 = 0,
+    /// shift-and-mask pairs folded into one bfe
+    folded: u32 = 0,
 };
 
 pub const Work = struct {
@@ -237,6 +239,9 @@ pub const Work = struct {
     /// register's def in this iteration, and which regions are open
     dom: [MAX_VREGS]u16 = undefined,
     region_open: [MAX_KIR]bool = undefined,
+    /// peephole: instructions folded into a later one, and register uses
+    dead: [MAX_KIR]bool = undefined,
+    nuse: [MAX_VREGS]u16 = undefined,
     loops_s: [MAX_LOOPS]u32 = undefined,
     loops_e: [MAX_LOOPS]u32 = undefined,
     nloops: usize = 0,
@@ -333,6 +338,7 @@ pub fn compileWith(k: *const kir.Kernel, caps: device.Caps, w: *Work, out: []u8)
     w.caps = caps;
     if (k.n > MAX_KIR or k.nv > MAX_VREGS) return error.TooManyInsts;
     w.k = try kir.expand(k, caps, .{ .insts = &w.insts, .tys = &w.tys });
+    peephole(w);
     try analyze(w);
     try layout(w);
     try allocate(w);
@@ -342,6 +348,73 @@ pub fn compileWith(k: *const kir.Kernel, caps: device.Caps, w: *Work, out: []u8)
     try waits(w);
     try encode(w);
     return binary(w, out);
+}
+
+// ── Peephole (on KIR, before the analysis) ──────────────────────────────────
+
+/// (x >> c) & (2^n - 1), the shift used only there, is one bfe (v_bfe_u32
+/// x, c, n) when x is the same at the and as at the shift: the two are
+/// next to each other, or x is written once, before the shift, with no
+/// loop boundary between them. The shift goes.
+fn peephole(w: *Work) void {
+    const k = &w.k;
+    const n = k.n;
+    const nv = k.nv;
+    @memset(w.ndef[0..nv], 0);
+    @memset(w.nuse[0..nv], 0);
+    @memset(w.dead[0..n], false);
+    const Count = struct {
+        w: *Work,
+        i: u32,
+        fn f(c: @This(), v: V, write: bool) void {
+            const x = @intFromEnum(v);
+            if (write) {
+                c.w.ndef[x] +|= 1;
+                c.w.def_at[x] = c.i;
+            } else c.w.nuse[x] +|= 1;
+        }
+    };
+    for (k.insts[0..n], 0..) |in, i| eachReg(in, Count{ .w = w, .i = @intCast(i) }, Count.f);
+    var folded: u32 = 0;
+    for (k.insts[0..n], 0..) |in, i_| {
+        const i: u32 = @intCast(i_);
+        if (in.op != .@"and" or (in.ty != .u32 and in.ty != .i32)) continue;
+        const kc = constOperand(in) orelse continue;
+        const m = kc.bits;
+        if (m == 0 or m == 0xffff_ffff or m & (m + 1) != 0) continue;
+        const width: u32 = @popCount(m);
+        const t = argReg(kc.other) orelse continue;
+        const tx = @intFromEnum(t);
+        if (w.ndef[tx] != 1 or w.nuse[tx] != 1) continue;
+        const s = w.def_at[tx];
+        if (s >= i or w.dead[s]) continue;
+        const sh = k.insts[s];
+        if (sh.op != .shr or sh.b != .imm or sh.b.imm >= 32 or sh.b.imm + width > 32) continue;
+        if (sh.ty != .u32 and sh.ty != .i32) continue;
+        if (s + 1 != i) {
+            const xr = argReg(sh.a) orelse continue;
+            const xx = @intFromEnum(xr);
+            if (w.ndef[xx] != 1 or w.def_at[xx] >= s) continue;
+            var ok = true;
+            for (k.insts[s + 1 .. i]) |mid| switch (mid.op) {
+                .loop, .endloop => ok = false,
+                else => {},
+            };
+            if (!ok) continue;
+        }
+        k.insts[i] = .{ .op = .bfe, .ty = .u32, .dst = in.dst, .a = sh.a, .b = .{ .imm = sh.b.imm }, .c = .{ .imm = width }, .aux = 0 };
+        w.dead[s] = true;
+        folded += 1;
+    }
+    if (folded == 0) return;
+    var o: u32 = 0;
+    for (0..n) |i| {
+        if (w.dead[i]) continue;
+        k.insts[o] = k.insts[i];
+        o += 1;
+    }
+    k.n = o;
+    w.stats.folded = folded;
 }
 
 // ── Analysis ────────────────────────────────────────────────────────────────
@@ -1258,24 +1331,27 @@ fn lowerBfe(w: *Work, in: Inst) Error!void {
 }
 
 fn lowerDot4(w: *Work, in: Inst) Error!void {
-    // no 4x8-bit dot on gfx8: four 24-bit multiply-adds of the bytes
+    // No 4x8-bit dot on gfx8: each byte product is one SDWA multiply (the
+    // two bytes selected, sign- or zero-extended, 24-bit), and three adds
+    // sum them (a fourth adds c): 7 or 8 instructions.
     const d = try dstV(w, in.dst);
     const mode: kir.Dot4 = @enumFromInt(in.aux);
-    const a_signed = mode != .u8u8;
-    const b_signed = mode == .s8s8;
-    const mad = if (mode == .u8u8) op("v_mad_u32_u24") else op("v_mad_i32_i24");
+    const sx: u2 = @as(u2, @intFromBool(mode != .u8u8)) | @as(u2, @intFromBool(mode == .s8s8)) << 1;
+    const mul = if (mode == .u8u8) op("v_mul_u32_u24") else op("v_mul_i32_i24");
+    // (SDWA sources are VGPRs)
     const a = try toV(w, try src(w, in.a));
     const b = try toV(w, try src(w, in.b));
-    const acc = try tmpV(w);
-    const ta = try tmpV(w);
-    const tb = try tmpV(w);
-    try valu(w, op("v_mov_b32"), acc, &.{try src(w, in.c)}, .{});
-    for (0..4) |byte| {
-        const off = immSrc(@intCast(8 * byte));
-        try valu(w, if (a_signed) op("v_bfe_i32") else op("v_bfe_u32"), ta, &.{ a, off, immSrc(8) }, .{});
-        try valu(w, if (b_signed) op("v_bfe_i32") else op("v_bfe_u32"), tb, &.{ b, off, immSrc(8) }, .{});
-        try valu(w, mad, if (byte == 3) d else acc, &.{ .{ .code = ta }, .{ .code = tb }, .{ .code = acc } }, .{});
+    const no_c = in.c == .imm and in.c.imm == 0;
+    const t0 = try tmpV(w);
+    const t1 = try tmpV(w);
+    try emit(w, .{ .op = mul, .dst = t0, .src = .{ a.code, b.code, 0 }, .sdwa = true, .sel = .{ 0, 0 }, .sext = sx, .dst_unused = 0 });
+    for (1..4) |byte| {
+        const sel: u3 = @intCast(byte);
+        try emit(w, .{ .op = mul, .dst = t1, .src = .{ a.code, b.code, 0 }, .sdwa = true, .sel = .{ sel, sel }, .sext = sx, .dst_unused = 0 });
+        const last = byte == 3 and no_c;
+        try valu(w, op("v_add_u32"), if (last) d else t0, &.{ .{ .code = t0 }, .{ .code = t1 } }, .{ .comm = true });
     }
+    if (!no_c) try valu(w, op("v_add_u32"), d, &.{ try src(w, in.c), .{ .code = t0 } }, .{ .comm = true });
 }
 
 fn lowerCvt(w: *Work, in: Inst) Error!void {

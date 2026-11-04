@@ -187,6 +187,8 @@ const OpCase = struct {
     how: Cmp = .exact,
     imm: u32 = 0,
     form: Form = .rrr,
+    /// the third operand the immediate 0
+    czero: bool = false,
 };
 
 fn operand(k: *kir.Kernel, ty: kir.Ty, binding: u8, off: kir.V) kir.V {
@@ -213,7 +215,7 @@ fn checkOp(c: OpCase) !void {
         var argb: kir.Arg = no;
         var argc: kir.Arg = no;
         if (c.nb > 0) argb = if (c.form == .rri) u(c.imm) else r(operand(&k, c.tb, bb, off));
-        if (c.nc > 0) argc = r(operand(&k, c.tc, bc, off));
+        if (c.nc > 0) argc = if (c.czero) u(0) else r(operand(&k, c.tc, bc, off));
         var arga: kir.Arg = r(a);
         if (c.form == .rir) {
             arga = u(c.imm);
@@ -297,8 +299,16 @@ test "integer ops: gcn4 equals the interpreter, register and immediate operands"
         .{ .name = "dot4.s8u8", .op = .dot4, .ty = .i32, .ta = .u32, .tb = .u32, .tc = .i32, .nc = 1, .aux = 0, .dst = .i32 },
         .{ .name = "dot4.s8s8", .op = .dot4, .ty = .i32, .ta = .u32, .tb = .u32, .tc = .i32, .nc = 1, .aux = 1, .dst = .i32 },
         .{ .name = "dot4.u8u8", .op = .dot4, .ty = .u32, .ta = .u32, .tb = .u32, .tc = .u32, .nc = 1, .aux = 2, .dst = .u32 },
+        .{ .name = "dot4.s8u8 +0", .op = .dot4, .ty = .i32, .ta = .u32, .tb = .u32, .tc = .i32, .nc = 1, .aux = 0, .dst = .i32, .czero = true },
+        .{ .name = "dot4.s8s8 +0", .op = .dot4, .ty = .i32, .ta = .u32, .tb = .u32, .tc = .i32, .nc = 1, .aux = 1, .dst = .i32, .czero = true },
+        .{ .name = "dot4.u8u8 +0", .op = .dot4, .ty = .u32, .ta = .u32, .tb = .u32, .tc = .u32, .nc = 1, .aux = 2, .dst = .u32, .czero = true },
     };
     for (three) |c| try checkOp(c);
+    // dot4 with an immediate (uniform) operand
+    for (three[3..]) |c| {
+        try checkOp(withImm(c, 0x80ff7f01, .rri));
+        try checkOp(withImm(c, 0x7f80fe02, .rir));
+    }
     // bfe with immediate offset and width
     for ([_][2]u32{ .{ 0, 8 }, .{ 4, 4 }, .{ 8, 8 }, .{ 24, 8 }, .{ 16, 16 }, .{ 0, 32 }, .{ 30, 5 }, .{ 7, 0 }, .{ 33, 3 }, .{ 1, 31 } }) |bc| {
         for ([_]kir.Ty{ .u32, .i32 }) |ty| try bfeImm(ty, bc[0], bc[1]);
@@ -791,6 +801,59 @@ test "flow: lanes leaving the loop from inside ifs (cont in a then-part with an 
     _ = try both(&k, .{ 1, 1, 1 }, &.{&out}, &.{});
 }
 
+test "shift-and-mask folded into one bfe (next to each other, apart, arithmetic), and the cases it may not fold" {
+    var k = newKernel("fold", .{ 128, 1, 1 });
+    const ib = k.binding();
+    const o = k.binding();
+    const t = k.tid(0);
+    const off = k.op2(.shl, .u32, r(t), u(2));
+    const x = k.load(.u32, kir.global(ib, 32), r(off));
+    const xi = k.load(.i32, kir.global(ib, 32), r(off));
+    const res = [_]kir.V{
+        // folded: next to each other
+        k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(x), u(8))), u(0xff)),
+        // folded: apart, x written once before the shift
+        blk: {
+            const s4 = k.op2(.shr, .u32, r(x), u(4));
+            const other = k.op2(.iadd, .u32, r(x), u(3));
+            break :blk k.op2(.iadd, .u32, r(k.op2(.@"and", .u32, u(0xf), r(s4))), r(other));
+        },
+        // folded: an arithmetic shift whose sign bits the mask drops
+        k.op2(.@"and", .i32, r(k.op2(.shr, .i32, r(xi), u(24))), u(0xff)),
+        // not folded: past bit 31 (the arithmetic shift's sign bits stay)
+        k.op2(.@"and", .i32, r(k.op2(.shr, .i32, r(xi), u(28))), u(0xff)),
+        // not folded: the shift used twice
+        blk: {
+            const s8 = k.op2(.shr, .u32, r(x), u(16));
+            break :blk k.op2(.iadd, .u32, r(k.op2(.@"and", .u32, r(s8), u(0xff))), r(s8));
+        },
+        // not folded: x written between the shift and the and
+        blk: {
+            const v = k.mov(.u32, r(x));
+            const s2 = k.op2(.shr, .u32, r(v), u(2));
+            k.set(v, .iadd, r(v), u(0x100), no);
+            break :blk k.op2(.iadd, .u32, r(k.op2(.@"and", .u32, r(s2), u(0x3f))), r(v));
+        },
+        // not folded: a loop between the shift and the and
+        blk: {
+            const s12 = k.op2(.shr, .u32, r(x), u(12));
+            const n = k.mov(.u32, u(0));
+            k.loop();
+            k.set(n, .iadd, r(n), u(1), no);
+            k.brk(r(k.cmp(.u32, .ge, r(n), u(3))));
+            k.endloop();
+            break :blk k.op2(.iadd, .u32, r(k.op2(.@"and", .u32, r(s12), u(0x7))), r(n));
+        },
+    };
+    for (res, 0..) |v, j| k.store(.u32, kir.global(o, 32), r(k.op2(.iadd, .u32, r(off), u(@intCast(j * 512)))), r(v));
+    var input: [128 * 4]u8 = undefined;
+    var seed: u32 = 99;
+    for (0..128) |ix| std.mem.writeInt(u32, input[4 * ix ..][0..4], lcg(&seed), .little);
+    var out = zeros(res.len * 512);
+    _ = try both(&k, .{ 1, 1, 1 }, &.{ &input, &out }, &.{});
+    try std.testing.expectEqual(@as(u32, 3), Rig.work.stats.folded);
+}
+
 test "four waves: a shared-memory tree sum with barriers" {
     var k = newKernel("tree", .{ 256, 1, 1 });
     const in = k.binding();
@@ -937,17 +1000,17 @@ test "instruction counts: the same KIR through kir_gcn4, kir_sm120 and kir_ir3" 
         var nv = gpu.nvidia_device.emuCaps();
         _ = &nv;
         var w = gpu.Work.init(&Other.sm_mem);
-        const sm = gpu.compile(&k, nv, &w, &Other.sm_out) catch |e| blk: {
-            std.debug.print("{s}: sm_120: {s}\n", .{ kk[0], @errorName(e) });
-            break :blk null;
-        };
+        // (the dot kernel's 64-lane shuffles do not fit sm_120's 32-lane warps)
+        const sm = gpu.compile(&k, nv, &w, &Other.sm_out) catch null;
         const ir = gpu.kir_ir3.compileWith(&k, gpu.adreno_device.x1_45_caps(1 << 30), &Other.ir3_work, &Other.ir3_out) catch |e| blk: {
             std.debug.print("{s}: ir3: {s}\n", .{ kk[0], @errorName(e) });
             break :blk null;
         };
-        std.debug.print("{s}: gcn4 {d} instructions ({d} dwords, {d} VGPRs, {d} SGPRs, {d} waits) | sm_120 {d} | ir3 {d} (legalized {d})\n", .{
-            kk[0],                                     gs.instructions,                    gs.words,                         gs.vgprs, gs.sgprs, gs.waits,
-            if (sm) |b| b.code.len / 16 else 0,             if (ir) |_| Other.ir3_work.stats.instructions else 0, if (ir) |_| Other.ir3_work.stats.legalized else 0,
+        var smb: [32]u8 = undefined;
+        const smt = if (sm) |b| std.fmt.bufPrint(&smb, "{d}", .{b.code.len / 16}) catch "?" else "- (64-lane shuffles)";
+        std.debug.print("{s}: gcn4 {d} instructions ({d} dwords, {d} VGPRs, {d} SGPRs, {d} waits) | sm_120 {s} | ir3 {d} (legalized {d})\n", .{
+            kk[0], gs.instructions, gs.words, gs.vgprs, gs.sgprs, gs.waits,
+            smt, if (ir) |_| Other.ir3_work.stats.instructions else 0, if (ir) |_| Other.ir3_work.stats.legalized else 0,
         });
         _ = g4;
     }

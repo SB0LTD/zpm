@@ -266,6 +266,48 @@ def lines_for(r, k):
         out += [f"{n} v[{2 * b}:{2 * b + 1}], {vr(a, s[1])}", f"{n} {vr(c, d)}, v[2:3], {vr(a, s[1])} glc", f"{n} v[8:9], {vr(c, s[1])} slc"]
     else:
         raise SystemExit(f"no template for shape {sh} ({n})")
+    out += sdwa_lines(r, k)
+    return out
+
+
+SELS = ["BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD"]
+UNUSED = ["UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE"]
+SDWA_SHAPES = ("vop", "vop_carry", "vop_carry_in", "vop_cndmask", "vopc")
+
+
+def sdwa_lines(r, k):
+    """SDWA forms (a second dword of byte/word selects) of a VOP1, VOP2 or
+    VOPC row whose operands are 32 bits or less; LLVM drops the rest."""
+    n, sh, d, s, enc = r["name"], r["shape"], r["d"], r["s"], r["enc"]
+    if enc not in ("vop1", "vop2", "vopc") or sh not in SDWA_SHAPES:
+        return []
+    if any(DWORDS[t] > 1 for t in s) or (sh != "vopc" and DWORDS[d] > 1):
+        return []
+    a, b, c = 1 + k % 7, 9 + k % 11, 20 + k % 13
+    out = []
+    for j in range(3):
+        s0, s1 = SELS[(k + j) % 7], SELS[(k + 2 * j + 3) % 7]
+        ds, du = SELS[(k + 3 * j + 6) % 7], UNUSED[(k + j) % 3]
+        def mod(i, t, reg):
+            if j == 0:
+                return reg
+            if isfloat(t):
+                return f"-{reg}" if (i + j) % 2 else f"|{reg}|"
+            return f"sext({reg})" if (i + j) % 2 else reg
+        clamp = " clamp" if j == 2 and isfloat(d) else ""
+        dst = f" dst_sel:{ds} dst_unused:{du}"
+        if sh == "vopc":
+            out.append(f"{n}_sdwa vcc, {mod(0, s[0], f'v{a}')}, {mod(1, s[1], f'v{b}')}{clamp} src0_sel:{s0} src1_sel:{s1}")
+        elif enc == "vop1":
+            out.append(f"{n}_sdwa v{a}, {mod(0, s[0], f'v{b}')}{clamp}{dst} src0_sel:{s0}")
+        elif sh == "vop":
+            out.append(f"{n}_sdwa v{a}, {mod(0, s[0], f'v{b}')}, {mod(1, s[1], f'v{c}')}{clamp}{dst} src0_sel:{s0} src1_sel:{s1}")
+        elif sh == "vop_carry":
+            out.append(f"{n}_sdwa v{a}, vcc, {mod(0, s[0], f'v{b}')}, {mod(1, s[1], f'v{c}')}{dst} src0_sel:{s0} src1_sel:{s1}")
+        elif sh == "vop_carry_in":
+            out.append(f"{n}_sdwa v{a}, vcc, {mod(0, s[0], f'v{b}')}, {mod(1, s[1], f'v{c}')}, vcc{dst} src0_sel:{s0} src1_sel:{s1}")
+        elif sh == "vop_cndmask":
+            out.append(f"{n}_sdwa v{a}, {mod(0, s[0], f'v{b}')}, {mod(1, s[1], f'v{c}')}, vcc{dst} src0_sel:{s0} src1_sel:{s1}")
     return out
 
 
@@ -326,6 +368,21 @@ def extras():
             "v_readlane_b32 m0, v255, m0", "v_readfirstlane_b32 exec_lo, v255", "v_writelane_b32 v255, m0, 63", "v_mbcnt_hi_u32_b32 v1, exec_hi, v1", "v_mbcnt_lo_u32_b32 v1, exec_lo, 0",
             "v_div_scale_f32 v1, vcc, v2, v2, v3", "v_div_fmas_f32 v1, v2, v3, v4", "v_div_fixup_f32 v1, v2, v3, v4", "v_mad_u64_u32 v[2:3], s[0:1], v4, v5, 0",
             "v_mac_f32_e64 v3, v1, v2 mul:2", "v_mov_b32_e64 v1, src_scc", "v_mov_b32_e64 v1, vcc_hi", "v_add_u32_e64 v1, s[2:3], s4, 1.0"]
+    # SDWA: every select with and without sign extension, every destination
+    # select with every way of filling the rest, the highest registers
+    for i, sel in enumerate(SELS):
+        for sx in ("", "sext"):
+            a0 = f"sext(v{i + 2})" if sx else f"v{i + 2}"
+            out.append(f"v_mul_i32_i24_sdwa v1, {a0}, v{i + 3} dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:{sel} src1_sel:{SELS[6 - i]}")
+            out.append(f"v_mul_u32_u24_sdwa v1, v{i + 2}, {sx}(v{i + 3}) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:{SELS[(i + 3) % 7]} src1_sel:{sel}" if sx else
+                       f"v_mul_u32_u24_sdwa v1, v{i + 2}, v{i + 3} dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:{SELS[(i + 3) % 7]} src1_sel:{sel}")
+        for du in UNUSED:
+            out.append(f"v_mov_b32_sdwa v5, v6 dst_sel:{sel} dst_unused:{du} src0_sel:{SELS[(i + 1) % 7]}")
+    out += ["v_mov_b32_sdwa v255, v255 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+            "v_add_f32_sdwa v0, -|v255|, -|v254| clamp dst_sel:WORD_1 dst_unused:UNUSED_SEXT src0_sel:WORD_1 src1_sel:BYTE_3",
+            "v_cmp_eq_u32_sdwa vcc, sext(v255), sext(v0) src0_sel:BYTE_3 src1_sel:WORD_1",
+            "v_cmp_class_f32_sdwa vcc, -|v1|, v2 src0_sel:DWORD src1_sel:BYTE_0",
+            "v_mov_b32_sdwa v1, v2", "v_add_u32_sdwa v1, vcc, v2, v3"]
     return out
 
 

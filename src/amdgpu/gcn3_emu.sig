@@ -1241,12 +1241,53 @@ fn outMods(x: u64, t: Ty, clamp: bool, omod: u2) u64 {
     }
 }
 
+/// An SDWA select: the byte or word `sel` names, zero- or sign-extended.
+fn sdwaSrc(x: u32, sel: u3, sext: bool) u32 {
+    const shift: u5, const width: u6 = switch (sel) {
+        0...3 => .{ @as(u5, sel) * 8, 8 },
+        4, 5 => .{ @as(u5, sel - 4) * 16, 16 },
+        else => return x,
+    };
+    const f = (x >> shift) & ((@as(u32, 1) << @intCast(width)) - 1);
+    if (sext and (f >> @intCast(width - 1)) & 1 != 0) return f | ~((@as(u32, 1) << @intCast(width)) - 1);
+    return f;
+}
+
+/// An SDWA result into its byte or word of `old`: the other bits zero,
+/// sign-extended above it (UNUSED_SEXT), or kept (UNUSED_PRESERVE).
+fn sdwaDst(x: u32, sel: u3, unused: u2, old: u32) u32 {
+    const shift: u5, const width: u6 = switch (sel) {
+        0...3 => .{ @as(u5, sel) * 8, 8 },
+        4, 5 => .{ @as(u5, sel - 4) * 16, 16 },
+        else => return x,
+    };
+    const field = ((@as(u32, 1) << @intCast(width)) - 1) << shift;
+    const v = (x << shift) & field;
+    switch (unused) {
+        2 => return (old & ~field) | v,
+        1 => {
+            const top = @as(u6, shift) + width;
+            if (top < 32 and (x >> @intCast(width - 1)) & 1 != 0) return v | ~((@as(u32, 1) << @intCast(top)) - 1);
+            return v;
+        },
+        else => return v,
+    }
+}
+
+/// A 32-bit (or narrower) VALU result into its VGPR, through the SDWA
+/// destination select when the instruction has one.
+fn vwrite32(wv: *Wave, in: *const Instr, ln: usize, x: u32) void {
+    const r = in.dst - gcn3.VGPR0;
+    wv.v[r][ln] = if (in.sdwa) sdwaDst(x, in.dst_sel, in.dst_unused, wv.v[r][ln]) else x;
+}
+
 fn vsrc(w: *Work, wv: *const Wave, in: *const Instr, i: usize, t: Ty, ln: usize) Error!u64 {
     const code = in.src[i];
     var x: u64 = 0;
     if (code >= gcn3.VGPR0) {
         const r = code - gcn3.VGPR0;
         x = wv.v[r][ln];
+        if (in.sdwa and i < 2) x = sdwaSrc(@truncate(x), in.sel[i], in.sext >> @intCast(i) & 1 != 0);
         if (t.dwords() == 2) x |= @as(u64, wv.v[r + 1][ln]) << 32;
         x &= mask(t);
     } else x = try sread(w, wv, code, in.lit, t);
@@ -1378,7 +1419,7 @@ fn valu(w: *Work, wv: *Wave, in: *const Instr, stats: *Stats) Error!void {
                     },
                 }
                 if (co) carry |= @as(u64, 1) << @intCast(ln);
-                wv.v[in.dst - gcn3.VGPR0][ln] = @truncate(r);
+                vwrite32(wv, in, ln, @truncate(r));
             }
             swrite(wv, in.sdst, .b64, carry);
         },
@@ -1388,7 +1429,7 @@ fn valu(w: *Work, wv: *Wave, in: *const Instr, stats: *Stats) Error!void {
                 if (exec >> @intCast(ln) & 1 == 0) continue;
                 const a = try vsrc(w, wv, in, 0, .b32, ln);
                 const b = try vsrc(w, wv, in, 1, .b32, ln);
-                wv.v[in.dst - gcn3.VGPR0][ln] = @truncate(if (m >> @intCast(ln) & 1 != 0) b else a);
+                vwrite32(wv, in, ln, @truncate(if (m >> @intCast(ln) & 1 != 0) b else a));
             }
         },
         .vop_sdst => {
@@ -1460,7 +1501,8 @@ fn valu(w: *Work, wv: *Wave, in: *const Instr, stats: *Stats) Error!void {
                 var old: u64 = wv.v[dr][ln];
                 if (df.d.dwords() == 2) old |= @as(u64, wv.v[dr + 1][ln]) << 32;
                 const r = lane1(w, o, a, b, c, old, @intCast(ln)) orelse return w.fail(error.Unsupported, "{s}", .{df.name});
-                vwrite(wv, in.dst, df.d, ln, outMods(r & mask(df.d), df.d, in.clamp, in.omod));
+                const res = outMods(r & mask(df.d), df.d, in.clamp, in.omod);
+                if (in.sdwa) vwrite32(wv, in, ln, @truncate(res)) else vwrite(wv, in.dst, df.d, ln, res);
             }
         },
         else => return w.fail(error.Unsupported, "{s}", .{df.name}),
@@ -2047,6 +2089,75 @@ test "scalar ALU: carries, SCC, bit fields, find-first, quad masks" {
     _ = try runTest(&k, &regions, &.{ @truncate(KARG_VA), 0 }, .{ 1, 1, 1 });
     const want = [16]u32{ 1, 1, 0x56, 0xffffffff, 8, 23, 0xffff8000, 7, 0xa, 64, 0, 0x100, 0xf8000000, @bitCast(@as(i32, -21)), 5, 7 };
     try std.testing.expectEqualSlices(u32, &want, copy_out[0..16]);
+}
+
+const sdwa_src =
+    \\ .amdhsa_user_sgpr_kernarg_segment_ptr 1
+    \\     s_load_dwordx2 s[2:3], s[0:1], 0x0
+    \\     v_mov_b32_e32 v1, 0x80ff7f01
+    \\     v_mov_b32_e32 v2, 0xfe0000
+    \\     v_mov_b32_e32 v3, 0x11223344
+    \\     v_mov_b32_sdwa v4, v1 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0
+    \\     v_mov_b32_sdwa v5, sext(v1) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_2
+    \\     v_mov_b32_sdwa v6, sext(v1) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1
+    \\     v_mov_b32_sdwa v7, v1 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0
+    \\     v_mul_i32_i24_sdwa v8, sext(v1), sext(v2) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:BYTE_2
+    \\     v_mul_u32_u24_sdwa v9, v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:BYTE_2
+    \\     v_mov_b32_sdwa v3, v1 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_3
+    \\     v_mov_b32_e32 v10, 0
+    \\     v_mov_b32_sdwa v10, v1 dst_sel:BYTE_1 dst_unused:UNUSED_SEXT src0_sel:BYTE_3
+    \\     v_mov_b32_sdwa v11, v1 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1
+    \\     v_add_u32_sdwa v12, vcc, sext(v1), v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_2 src1_sel:BYTE_2
+    \\     v_cndmask_b32_e64 v17, 0, 1, vcc
+    \\     v_cmp_gt_u32 vcc, v1, v2 src0_sel:BYTE_2 src1_sel:BYTE_2
+    \\     v_cndmask_b32_e64 v13, 0, 1, vcc
+    \\     v_mov_b32_e32 v15, 0x3c000000
+    \\     v_mov_b32_e32 v16, 0x4000
+    \\     v_mov_b32_e32 v14, 0x1234
+    \\     v_add_f16_sdwa v14, v15, v16 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1 src1_sel:WORD_0
+    \\     v_readfirstlane_b32 s4, v4
+    \\     v_readfirstlane_b32 s5, v5
+    \\     v_readfirstlane_b32 s6, v6
+    \\     v_readfirstlane_b32 s7, v7
+    \\     v_readfirstlane_b32 s8, v8
+    \\     v_readfirstlane_b32 s9, v9
+    \\     v_readfirstlane_b32 s10, v3
+    \\     v_readfirstlane_b32 s11, v10
+    \\     v_readfirstlane_b32 s12, v11
+    \\     v_readfirstlane_b32 s13, v12
+    \\     v_readfirstlane_b32 s14, v17
+    \\     v_readfirstlane_b32 s15, v13
+    \\     v_readfirstlane_b32 s16, v14
+    \\     s_mov_b32 s17, 0
+    \\     s_mov_b64 s[18:19], 0
+    \\     s_nop 4
+    \\     s_waitcnt lgkmcnt(0)
+    \\     s_store_dwordx4 s[4:7], s[2:3], 0x0 glc
+    \\     s_store_dwordx4 s[8:11], s[2:3], 0x10 glc
+    \\     s_store_dwordx4 s[12:15], s[2:3], 0x20 glc
+    \\     s_store_dwordx4 s[16:19], s[2:3], 0x30 glc
+    \\     s_waitcnt lgkmcnt(0)
+    \\     s_dcache_wb
+    \\     s_endpgm
+;
+
+test "SDWA: byte and word selects, sign-extended or not; the result into a byte or word, padded, sign-extended or kept" {
+    const k = try assembleTest(sdwa_src);
+    kernargs(&karg, &.{C_VA}, &.{});
+    @memset(&copy_out, 0);
+    const regions = [_]Region{
+        .{ .va = KARG_VA, .bytes = &karg },
+        .{ .va = C_VA, .bytes = std.mem.sliceAsBytes(&copy_out) },
+    };
+    _ = try runTest(&k, &regions, &.{ @truncate(KARG_VA), 0 }, .{ 1, 1, 1 });
+    const want = [13]u32{
+        0x01, 0xffffffff, 0xffff80ff, 0x7f01, // selects
+        256, 128 * 254, // (-128) * (-2), 128 * 254
+        0x11228044, 0xffff8000, 0x007f0000, // into byte 1 (kept, sign-extended), into word 1
+        253, 1, 1, // -1 + 254 and its carry; 0xff > 0xfe
+        0x42001234, // 1.0 + 2.0 into the high half, the low kept
+    };
+    try std.testing.expectEqualSlices(u32, &want, copy_out[0..13]);
 }
 
 const vmem_head =

@@ -12,9 +12,13 @@
 //! The test vectors (gcn3_vectors.txt) are LLVM's own encodings of every row
 //! (tools/gen_gcn3_vectors.py); LLVM was used as test data only.
 //!
+//! VOP1, VOP2 and VOPC instructions have their SDWA form too (a second
+//! dword selecting a byte or word of each source and of the result), for
+//! the instructions LLVM gives one.
+//!
 //! Decoding is strict: a word with a reserved or unused field set, or a form
-//! this module does not model (SDWA, DPP, VINTRP, EXP, MIMG), is NoMatch. So
-//! every word that decodes prints, parses and encodes back to itself.
+//! this module does not model (DPP, VINTRP, EXP, MIMG), is NoMatch. So every
+//! word that decodes prints, parses and encodes back to itself.
 //!
 //! Allocation-free: instructions are plain values, text goes into caller
 //! buffers.
@@ -53,6 +57,8 @@ pub const EXECZ: u16 = 252;
 pub const SCC: u16 = 253;
 pub const LDS_DIRECT: u16 = 254;
 pub const LITERAL: u16 = 255;
+/// src0 of a VOP1, VOP2 or VOPC instruction whose SDWA dword follows.
+pub const SDWA: u16 = 249;
 pub const VGPR0: u16 = 256;
 /// s0..s101 exist on gfx8.
 pub const SGPRS: u16 = 102;
@@ -997,6 +1003,16 @@ pub const Instr = struct {
     idxen: bool = false,
     soff_imm: bool = true,
     fmt: u8 = 1,
+    /// SDWA (a VOP1, VOP2 or VOPC instruction with a second dword): the
+    /// byte or word each source is (sel: 0-3 BYTE_n, 4-5 WORD_n, 6 DWORD),
+    /// sign-extended (sext, a bit per source), and where the result goes
+    /// (dst_sel; dst_unused: 0 zeros, 1 sign-extended, 2 the register's
+    /// own bits).
+    sdwa: bool = false,
+    sel: [2]u3 = .{ 6, 6 },
+    sext: u2 = 0,
+    dst_sel: u3 = 6,
+    dst_unused: u2 = 0,
 
     pub fn d(in: *const Instr) *const Def {
         return &defs[in.op];
@@ -1008,6 +1024,7 @@ pub const Instr = struct {
     }
     pub fn hasLiteral(in: *const Instr) bool {
         const df = in.d();
+        if (in.sdwa) return false;
         if (df.shape == .vop_madmk or df.shape == .vop_madak or df.shape == .sopk_setreg_imm) return true;
         switch (df.enc) {
             .sop2, .sop1, .sopc, .vop1, .vop2, .vopc => {
@@ -1023,6 +1040,7 @@ pub const Instr = struct {
     }
     /// Dwords the instruction takes (1 or 2; 3 is never needed on gfx8).
     pub fn dwords(in: *const Instr) u8 {
+        if (in.sdwa) return 2;
         const base: u8 = switch (in.enc()) {
             .smem, .vop3, .ds, .mubuf, .mtbuf, .flat => 2,
             else => 1,
@@ -1066,8 +1084,79 @@ fn fits(x: u32, nbits: u5) Error!u32 {
 
 /// Encode into `out` (at least 2 dwords for 64-bit forms, 3 never needed);
 /// returns the number of dwords.
+/// Whether the instruction has an SDWA form: a VOP1, VOP2 or VOPC one whose
+/// operands are 32 bits or less (not v_movrel*, v_mac_f16, v_readfirstlane,
+/// v_nop, the madmk/madak forms), as LLVM's gfx803 assembler has them.
+pub fn sdwaOk(df: *const Def) bool {
+    switch (df.enc) {
+        .vop1, .vop2, .vopc => {},
+        else => return false,
+    }
+    switch (df.shape) {
+        .vop, .vop_carry, .vop_carry_in, .vop_cndmask, .vopc => {},
+        else => return false,
+    }
+    if (df.shape != .vopc and df.d.dwords() > 1) return false;
+    for (df.s) |t| {
+        if (t.dwords() > 1) return false;
+    }
+    if (std.mem.startsWith(u8, df.name, "v_movrel") or std.mem.eql(u8, df.name, "v_mac_f16")) return false;
+    return true;
+}
+
+fn sdwaSrcs(df: *const Def) usize {
+    return if (df.enc == .vop1) 1 else 2;
+}
+
+/// The SDWA dword (and the checks LLVM makes: VGPR sources; neg and abs on
+/// float sources, sext on integer ones; v_mac_f32 writes the whole dword).
+fn sdwaWord(in: *const Instr) Error!u32 {
+    const df = in.d();
+    if (!sdwaOk(df) or in.e64 or in.omod != 0) return error.NoForm;
+    if (in.sel[0] > 6 or in.sel[1] > 6 or in.dst_sel > 6 or in.dst_unused > 2) return error.OutOfRange;
+    const ns = sdwaSrcs(df);
+    if (in.neg >> 2 != 0 or in.abs >> 2 != 0) return error.NoForm;
+    for (0..2) |i| {
+        const neg = in.neg >> @intCast(i) & 1 != 0;
+        const abs = in.abs >> @intCast(i) & 1 != 0;
+        const sx = in.sext >> @intCast(i) & 1 != 0;
+        if (i >= ns) {
+            if (neg or abs or sx or in.sel[i] != 6) return error.NoForm;
+            continue;
+        }
+        const fl = df.s[i].isFloat();
+        if ((neg or abs) and !fl) return error.NoForm;
+        if (sx and fl) return error.NoForm;
+    }
+    if (df.shape == .vopc and (in.dst_sel != 6 or in.dst_unused != 0)) return error.NoForm;
+    if (std.mem.eql(u8, df.name, "v_mac_f32") and (in.dst_sel != 6 or in.dst_unused != 0)) return error.NoForm;
+    var w = try vIdx(in.src[0]) | @as(u32, @intFromBool(in.clamp)) << 13 | @as(u32, in.sel[0]) << 16 | @as(u32, in.sext & 1) << 19 | @as(u32, in.neg & 1) << 20 | @as(u32, in.abs & 1) << 21;
+    if (df.shape != .vopc) w |= @as(u32, in.dst_sel) << 8 | @as(u32, in.dst_unused) << 11;
+    if (ns == 2) w |= @as(u32, in.sel[1]) << 24 | @as(u32, in.sext >> 1) << 27 | @as(u32, in.neg >> 1 & 1) << 28 | @as(u32, in.abs >> 1 & 1) << 29;
+    return w;
+}
+
+fn vop1Word(in: *const Instr, df: *const Def) Error!u32 {
+    if (in.neg != 0 or in.abs != 0 or in.clamp or in.omod != 0) return error.NoForm;
+    var dst: u32 = 0;
+    var s0: u32 = 0;
+    switch (df.shape) {
+        .vop_none => {},
+        .vop_sdst => {
+            dst = try sReg(in.dst);
+            s0 = try src9(in.src[0]);
+        },
+        else => {
+            dst = try vIdx(in.dst);
+            s0 = try src9(in.src[0]);
+        },
+    }
+    return 0b0111111 << 25 | dst << 17 | @as(u32, df.code) << 9 | s0;
+}
+
 pub fn encode(in: *const Instr, out: []u32) Error!usize {
     const df = in.d();
+    if (in.sdwa and (in.e64 or !sdwaOk(df))) return error.NoForm;
     const n = in.dwords();
     if (out.len < n) return error.BufferTooSmall;
     var w0: u32 = 0;
@@ -1113,30 +1202,29 @@ pub fn encode(in: *const Instr, out: []u32) Error!usize {
                 .vop_madmk, .vop_madak => if (in.src[0] == LITERAL) return error.NoForm,
                 else => {},
             }
-            if (in.neg != 0 or in.abs != 0 or in.clamp or in.omod != 0) return error.NoForm;
-            w0 = @as(u32, df.code) << 25 | try vIdx(in.dst) << 17 | try vIdx(in.src[1]) << 9 | try src9(in.src[0]);
+            if (in.sdwa) {
+                w0 = @as(u32, df.code) << 25 | try vIdx(in.dst) << 17 | try vIdx(in.src[1]) << 9 | SDWA;
+                w1 = try sdwaWord(in);
+            } else {
+                if (in.neg != 0 or in.abs != 0 or in.clamp or in.omod != 0) return error.NoForm;
+                w0 = @as(u32, df.code) << 25 | try vIdx(in.dst) << 17 | try vIdx(in.src[1]) << 9 | try src9(in.src[0]);
+            }
         },
         .vop1 => {
-            if (in.neg != 0 or in.abs != 0 or in.clamp or in.omod != 0) return error.NoForm;
-            var dst: u32 = 0;
-            var s0: u32 = 0;
-            switch (df.shape) {
-                .vop_none => {},
-                .vop_sdst => {
-                    dst = try sReg(in.dst);
-                    s0 = try src9(in.src[0]);
-                },
-                else => {
-                    dst = try vIdx(in.dst);
-                    s0 = try src9(in.src[0]);
-                },
-            }
-            w0 = 0b0111111 << 25 | dst << 17 | @as(u32, df.code) << 9 | s0;
+            if (in.sdwa) {
+                w0 = 0b0111111 << 25 | try vIdx(in.dst) << 17 | @as(u32, df.code) << 9 | SDWA;
+                w1 = try sdwaWord(in);
+            } else w0 = try vop1Word(in, df);
         },
         .vopc => {
             if (in.sdst != VCC_LO) return error.NoForm;
-            if (in.neg != 0 or in.abs != 0 or in.clamp or in.omod != 0) return error.NoForm;
-            w0 = 0b0111110 << 25 | @as(u32, df.code) << 17 | try vIdx(in.src[1]) << 9 | try src9(in.src[0]);
+            if (in.sdwa) {
+                w0 = 0b0111110 << 25 | @as(u32, df.code) << 17 | try vIdx(in.src[1]) << 9 | SDWA;
+                w1 = try sdwaWord(in);
+            } else {
+                if (in.neg != 0 or in.abs != 0 or in.clamp or in.omod != 0) return error.NoForm;
+                w0 = 0b0111110 << 25 | @as(u32, df.code) << 17 | try vIdx(in.src[1]) << 9 | try src9(in.src[0]);
+            }
         },
         .vop3 => {
             const code = vop3Code(df);
@@ -1347,20 +1435,20 @@ fn decodeFields(words: []const u32, in: *Instr) Error!usize {
                     in.src[0] = @intCast(s0);
                 },
             }
-            if (df.shape != .vop_none and !validSrc(s0)) return error.NoMatch;
+            if (df.shape != .vop_none and !validSrc(s0) and s0 != SDWA) return error.NoMatch;
         } else if (hi7 == 0x3e) {
             in.op = try lookupCode(.vopc, bits(w0, 17, 8));
             in.sdst = VCC_LO;
             in.src[0] = @intCast(bits(w0, 0, 9));
             in.src[1] = @intCast(VGPR0 + bits(w0, 9, 8));
-            if (!validSrc(in.src[0])) return error.NoMatch;
+            if (!validSrc(in.src[0]) and in.src[0] != SDWA) return error.NoMatch;
         } else {
             in.op = try lookupCode(.vop2, hi7);
             const df = in.d();
             in.dst = @intCast(VGPR0 + bits(w0, 17, 8));
             in.src[0] = @intCast(bits(w0, 0, 9));
             in.src[1] = @intCast(VGPR0 + bits(w0, 9, 8));
-            if (!validSrc(in.src[0])) return error.NoMatch;
+            if (!validSrc(in.src[0]) and in.src[0] != SDWA) return error.NoMatch;
             if ((df.shape == .vop_madmk or df.shape == .vop_madak) and in.src[0] == LITERAL) return error.NoMatch;
             switch (df.shape) {
                 .vop_carry => in.sdst = VCC_LO,
@@ -1371,6 +1459,11 @@ fn decodeFields(words: []const u32, in: *Instr) Error!usize {
                 .vop_cndmask => in.src[2] = VCC_LO,
                 else => {},
             }
+        }
+        if (in.src[0] == SDWA and in.d().shape != .vop_none) {
+            if (words.len < 2) return error.NoMatch;
+            try decodeSdwa(words[1], in);
+            return 2;
         }
         if (in.hasLiteral()) {
             if (words.len < 2) return error.NoMatch;
@@ -1448,6 +1541,37 @@ fn decodeFields(words: []const u32, in: *Instr) Error!usize {
         n = 2;
     }
     return n;
+}
+
+/// The SDWA dword after a VOP1, VOP2 or VOPC word (strict: only what
+/// encodes back to the same dword).
+fn decodeSdwa(w: u32, in: *Instr) Error!void {
+    const df = in.d();
+    if (!sdwaOk(df)) return error.NoMatch;
+    if (w & 0xc0c0_c000 != 0) return error.NoMatch;
+    in.sdwa = true;
+    in.src[0] = @intCast(VGPR0 + bits(w, 0, 8));
+    in.clamp = bits(w, 13, 1) != 0;
+    in.sel[0] = @intCast(bits(w, 16, 3));
+    in.sext = @intCast(bits(w, 19, 1));
+    in.neg = @intCast(bits(w, 20, 1));
+    in.abs = @intCast(bits(w, 21, 1));
+    if (df.shape == .vopc) {
+        in.dst_sel = 6;
+        in.dst_unused = 0;
+    } else {
+        in.dst_sel = @intCast(bits(w, 8, 3));
+        in.dst_unused = @intCast(bits(w, 11, 2));
+    }
+    if (sdwaSrcs(df) == 2) {
+        in.sel[1] = @intCast(bits(w, 24, 3));
+        in.sext |= @intCast(bits(w, 27, 1) << 1);
+        in.neg |= @intCast(bits(w, 28, 1) << 1);
+        in.abs |= @intCast(bits(w, 29, 1) << 1);
+    } else in.sel[1] = 6;
+    if (in.dst_unused > 2) return error.NoMatch;
+    const back = sdwaWord(in) catch return error.NoMatch;
+    if (back != w) return error.NoMatch;
 }
 
 fn decodeSmem(w0: u32, w1: u32, in: *Instr) Error!void {
@@ -1707,6 +1831,9 @@ pub fn putOperand(t: *Text, code: u16, ty: Ty, lit: u32) void {
 }
 
 fn putSrc(t: *Text, in: *const Instr, i: usize, ty: Ty) void {
+    const sx = in.sdwa and i < 2 and in.sext >> @intCast(i) & 1 != 0;
+    if (sx) t.str("sext(");
+    defer if (sx) t.str(")");
     const neg = in.neg >> @intCast(i) & 1 != 0;
     const abs = in.abs >> @intCast(i) & 1 != 0;
     // LLVM writes a negated constant neg(...): -1.0 is a constant of its own.
@@ -1816,6 +1943,11 @@ fn putImm32(t: *Text, x: u32) void {
 fn mnemonic(t: *Text, in: *const Instr) void {
     const df = in.d();
     t.str(df.name);
+    // (LLVM prints a VOPC's SDWA form without the suffix)
+    if (in.sdwa) {
+        if (df.enc != .vopc) t.str("_sdwa");
+        return;
+    }
     switch (df.enc) {
         .vop1, .vop2, .vopc => if (in.e64) t.str("_e64") else if (df.e64 and df.shape != .vop_none) t.str("_e32"),
         else => {},
@@ -1993,6 +2125,17 @@ pub fn formatInto(t: *Text, in: *const Instr) Error!void {
         .buf_load, .buf_store, .buf_atomic, .buf_none => formatBuf(t, in),
         .flat_load, .flat_store, .flat_atomic => formatFlat(t, in),
     }
+    if (in.sdwa) putSdwa(t, in);
+}
+
+const sel_names = [_][]const u8{ "BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD", "?" };
+const unused_names = [_][]const u8{ "UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE", "?" };
+
+fn putSdwa(t: *Text, in: *const Instr) void {
+    const df = in.d();
+    if (df.shape != .vopc) t.print(" dst_sel:{s} dst_unused:{s}", .{ sel_names[in.dst_sel], unused_names[in.dst_unused] });
+    t.print(" src0_sel:{s}", .{sel_names[in.sel[0]]});
+    if (sdwaSrcs(df) == 2) t.print(" src1_sel:{s}", .{sel_names[in.sel[1]]});
 }
 
 fn putVop3Mods(t: *Text, in: *const Instr) void {
@@ -2126,6 +2269,8 @@ const Opnd = struct {
     float: f64 = 0,
     neg: bool = false,
     abs: bool = false,
+    /// sext(...): an SDWA source sign-extended
+    sext: bool = false,
 };
 
 fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -2163,6 +2308,10 @@ fn parseRange(tok: []const u8, prefix: []const u8, first: *u32, n: *u8) bool {
 fn parseOpnd(tok_in: []const u8) Error!Opnd {
     var tok = std.mem.trim(u8, tok_in, " \t");
     var o = Opnd{};
+    if (std.mem.startsWith(u8, tok, "sext(") and tok[tok.len - 1] == ')') {
+        o.sext = true;
+        tok = std.mem.trim(u8, tok[5 .. tok.len - 1], " \t");
+    }
     if (std.mem.startsWith(u8, tok, "neg(") and tok[tok.len - 1] == ')') {
         o.neg = true;
         tok = tok[4 .. tok.len - 1];
@@ -2339,10 +2488,16 @@ const Parser = struct {
     data_n: u8 = 0,
     addr_n: u8 = 0,
     rtn: bool = false,
+    /// SDWA: dst_unused was written (LLVM's default is UNUSED_PRESERVE)
+    dst_unused_set: bool = false,
 
     /// A source operand of type `ty`: a register of its width, or a constant.
     fn src(p: *Parser, tok: []const u8, i: usize, ty: Ty) Error!void {
         const o = try parseOpnd(tok);
+        if (o.sext) {
+            if (i > 1) return error.Syntax;
+            p.in.sext |= @as(u2, 1) << @intCast(i);
+        }
         if (o.neg) p.in.neg |= @as(u3, 1) << @intCast(i);
         if (o.abs) p.in.abs |= @as(u3, 1) << @intCast(i);
         p.in.src[i] = try p.value(o, ty);
@@ -2362,14 +2517,14 @@ const Parser = struct {
     /// A register operand (no constants) of `n` dwords.
     fn reg(_: *Parser, tok: []const u8, ty: Ty) Error!u16 {
         const o = try parseOpnd(tok);
-        if (o.kind != .reg or o.neg or o.abs) return error.NoForm;
+        if (o.kind != .reg or o.neg or o.abs or o.sext) return error.NoForm;
         if (!o.named and o.n != @max(ty.dwords(), 1)) return error.NoForm;
         return o.code;
     }
 
     fn vreg(_: *Parser, tok: []const u8, n: u8) Error!u16 {
         const o = try parseOpnd(tok);
-        if (o.kind != .reg or o.code < VGPR0 or o.n != n or o.neg or o.abs) return error.NoForm;
+        if (o.kind != .reg or o.code < VGPR0 or o.n != n or o.neg or o.abs or o.sext) return error.NoForm;
         return o.code;
     }
 };
@@ -2580,8 +2735,11 @@ pub fn parseLabel(line_in: []const u8, label: ?*?[]const u8) Error!Instr {
     const sp = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
     var name = line[0..sp];
     const rest = std.mem.trim(u8, line[sp..], " \t");
-    var suffix: enum { none, e32, e64 } = .none;
-    if (std.mem.endsWith(u8, name, "_e32")) {
+    var suffix: enum { none, e32, e64, sdwa } = .none;
+    if (std.mem.endsWith(u8, name, "_sdwa")) {
+        suffix = .sdwa;
+        name = name[0 .. name.len - 5];
+    } else if (std.mem.endsWith(u8, name, "_e32")) {
         suffix = .e32;
         name = name[0 .. name.len - 4];
     } else if (std.mem.endsWith(u8, name, "_e64")) {
@@ -2590,11 +2748,13 @@ pub fn parseLabel(line_in: []const u8, label: ?*?[]const u8) Error!Instr {
     }
     const o = lookup(name) orelse return error.Syntax;
     const df = &defs[o];
-    if (suffix != .none) switch (df.enc) {
+    if (suffix == .sdwa) {
+        if (!sdwaOk(df)) return error.NoForm;
+    } else if (suffix != .none) switch (df.enc) {
         .vop1, .vop2, .vopc => if (!df.e64) return error.Syntax,
         else => return error.Syntax,
     };
-    var p = Parser{ .in = .{ .op = o, .e64 = suffix == .e64 } };
+    var p = Parser{ .in = .{ .op = o, .e64 = suffix == .e64, .sdwa = suffix == .sdwa } };
     if (df.enc == .mtbuf or df.enc == .mubuf) p.in.fmt = 1;
     var ops_buf: [8][]const u8 = undefined;
     var nops = try splitOperands(rest, &ops_buf);
@@ -2624,6 +2784,13 @@ pub fn parseLabel(line_in: []const u8, label: ?*?[]const u8) Error!Instr {
     const ops = ops_buf[0..nops];
     try parseOperands(&p, df, ops, label);
     try parseMods(&p, df, mods);
+    if (p.in.sdwa) {
+        // (selects make a VOPC instruction SDWA without the suffix)
+        if (suffix == .e32 or suffix == .e64 or !sdwaOk(df)) return error.Syntax;
+        if (!p.dst_unused_set and df.shape != .vopc) p.in.dst_unused = 2;
+        return p.in;
+    }
+    if (p.in.sext != 0) return error.Syntax;
     // An unsuffixed VOP1/VOP2/VOPC that only fits VOP3 becomes _e64.
     if (suffix == .none and df.e64 and !fitsE32(&p.in)) p.in.e64 = true;
     return p.in;
@@ -2633,12 +2800,19 @@ pub fn parse(line: []const u8) Error!Instr {
     return parseLabel(line, null);
 }
 
+fn parseSel(name: []const u8) Error!u3 {
+    for (sel_names[0..7], 0..) |nm, ix| {
+        if (std.mem.eql(u8, name, nm)) return @intCast(ix);
+    }
+    return error.Syntax;
+}
+
 fn isModifier(w: []const u8) bool {
     const names = [_][]const u8{ "glc", "slc", "tfe", "gds", "offen", "idxen", "clamp", "lds" };
     for (names) |n| {
         if (std.mem.eql(u8, w, n)) return true;
     }
-    const prefixes = [_][]const u8{ "offset:", "offset0:", "offset1:", "mul:", "div:", "format:" };
+    const prefixes = [_][]const u8{ "offset:", "offset0:", "offset1:", "mul:", "div:", "format:", "dst_sel:", "dst_unused:", "src0_sel:", "src1_sel:" };
     for (prefixes) |pf| {
         if (std.mem.startsWith(u8, w, pf)) return true;
     }
@@ -2919,6 +3093,22 @@ fn parseMods(p: *Parser, df: *const Def, mods: []const []const u8) Error!void {
         } else if (std.mem.startsWith(u8, m, "format:")) {
             if (df.enc != .mtbuf) return error.Syntax;
             in.fmt = try parseFormat(m[7..]);
+        } else if (std.mem.startsWith(u8, m, "dst_sel:")) {
+            in.dst_sel = try parseSel(m[8..]);
+            in.sdwa = true;
+        } else if (std.mem.startsWith(u8, m, "dst_unused:")) {
+            const names = [_][]const u8{ "UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE" };
+            in.dst_unused = for (names, 0..) |nm, ix| {
+                if (std.mem.eql(u8, m[11..], nm)) break @intCast(ix);
+            } else return error.Syntax;
+            p.dst_unused_set = true;
+            in.sdwa = true;
+        } else if (std.mem.startsWith(u8, m, "src0_sel:")) {
+            in.sel[0] = try parseSel(m[9..]);
+            in.sdwa = true;
+        } else if (std.mem.startsWith(u8, m, "src1_sel:")) {
+            in.sel[1] = try parseSel(m[9..]);
+            in.sdwa = true;
         } else return error.Syntax;
     }
     // Which modifiers each encoding has.
@@ -3084,6 +3274,8 @@ pub fn regs(in: *const Instr) RegList {
             if (in.glc) l.w(in.dst, df.d);
         },
     }
+    // an SDWA result that keeps the register's other bits reads it
+    if (in.sdwa and sh != .vopc and in.dst_sel != 6 and in.dst_unused == 2) l.r(in.dst, .b32);
     return l;
 }
 
@@ -3202,6 +3394,13 @@ test "random words: whatever decodes prints, parses and encodes back to itself" 
         words[0] = (words[0] & keep) | (pf[0] << pf[1]);
         // sparse fields decode more often
         if (r.boolean()) words[1] &= 0x00ff_01ff;
+        // SDWA: a VOP1, VOP2 or VOPC word with its dword (reserved bits
+        // mostly clear)
+        if (k % 5 == 0 and words[0] >> 31 == 0) {
+            words[0] = (words[0] & ~@as(u32, 0x1ff)) | SDWA;
+            words[1] = r.int(u32);
+            if (k % 3 != 0) words[1] &= 0x3f3f_3fff;
+        }
         var in: Instr = undefined;
         const n = decode(&words, &in) catch continue;
         decoded += 1;
