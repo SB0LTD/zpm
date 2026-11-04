@@ -217,6 +217,7 @@ pub fn explain(w: *const Work, buf: []u8) []const u8 {
         .gpr => "R",
         .ugpr => "UR",
         .pred => "P",
+        .upred => "UP",
     };
     const s = switch (t.what) {
         .hazard => switch (t.hazard) {
@@ -439,6 +440,8 @@ pub const Work = struct {
     tr_gpr: [MAX_WARPS][NREGS]Track = undefined,
     tr_ugpr: [MAX_WARPS][NREGS]Track = undefined,
     tr_pred: [MAX_WARPS][8]Track = undefined,
+    /// Uniform predicates: one set a warp, as the registers are.
+    tr_upred: [MAX_WARPS][8]Track = undefined,
     gen: u32 = 0,
     shared: [MAX_SHARED]u8 = undefined,
     local: [LOCAL_POOL]u8 = undefined,
@@ -657,7 +660,13 @@ fn swizzled(t: []const u8) ?Src {
 
 fn srcOf(o: Operand, want: Want) Error!Src {
     return switch (o) {
-        .gpr => |r| .{ .kind = .gpr, .n = r.n, .neg = r.neg, .abs = r.abs },
+        // (sm120 now parses and decodes a halves' selector into the
+        // register: R4.H1_H1 is .gpr with sel h1_h1, swizzle 2 here)
+        .gpr => |r| .{ .kind = .gpr, .n = r.n, .neg = r.neg, .abs = r.abs, .swz = switch (r.sel) {
+            .h0_h0 => 1,
+            .h1_h1 => 2,
+            else => 0,
+        } },
         .ugpr => |r| .{ .kind = .ugpr, .n = r.n, .neg = r.neg, .abs = r.abs },
         .pred => |p| .{ .kind = .pred, .n = p.n, .not = p.not },
         .upred => |p| .{ .kind = .upred, .n = p.n, .not = p.not },
@@ -1509,6 +1518,7 @@ fn track(c: *Ctx, wi: u32, file: sched.File, n: u8) *Track {
         .gpr => &c.w.tr_gpr[wi][n],
         .ugpr => &c.w.tr_ugpr[wi][n],
         .pred => &c.w.tr_pred[wi][n & 7],
+        .upred => &c.w.tr_upred[wi][n & 7],
     };
     if (t.gen != c.w.gen) t.* = .{ .gen = c.w.gen };
     return t;
@@ -1530,6 +1540,11 @@ fn entry(file: sched.File, kind: sched.Kind, second: u8, first: u8) u8 {
             .raw => lat.ureg_raw[second][first],
             .war => lat.ureg_war[second][first],
             .waw => lat.ureg_waw[second][first],
+        },
+        .upred => switch (kind) {
+            .raw => lat.upred_raw[second][first],
+            .war => lat.upred_war[second][first],
+            .waw => lat.upred_waw[second][first],
         },
     };
 }
