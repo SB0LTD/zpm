@@ -42,12 +42,12 @@ const ir3_asm = adreno.ir3_asm;
 
 pub const MAX_KIR = 16384;
 pub const MAX_VREGS = 16384;
-pub const MAX_MI = 8192;
+pub const MAX_MI = ir3_asm.MAX_INSTRS;
 pub const MAX_PROLOGUE = 256;
 pub const MAX_LOOPS = 256;
 pub const MAX_POOL = 512;
 pub const MAX_CACHED = 128;
-pub const TEXT_BYTES = 1024 * 1024;
+pub const TEXT_BYTES = 768 * 1024;
 /// Units of the register file: half registers (full rN.c = units 2(4N+c), +1).
 const UNITS = 384;
 /// Half registers live in the first 256 units (hr0.x..hr63.w).
@@ -290,7 +290,7 @@ pub const Work = struct {
     n_mi: u32 = 0,
     pro: [MAX_PROLOGUE]MI = undefined,
     n_pro: u32 = 0,
-    tmp_mi: [MAX_MI]MI = undefined,
+    tmp_mi: [SCHED_WINDOW]MI = undefined,
     loops: [MAX_LOOPS]Loop = undefined,
     n_loops: u32 = 0,
     n_labels: u32 = 0,
@@ -302,11 +302,15 @@ pub const Work = struct {
     cached: [MAX_CACHED]Cached = undefined,
     n_cached: u32 = 0,
     // scheduling
-    sched_order: [MAX_MI]u16 = undefined,
-    sched_prio: [MAX_MI]u32 = undefined,
-    sched_npred: [MAX_MI]u16 = undefined,
-    sched_ready: [MAX_MI]u32 = undefined,
-    sched_done: [MAX_MI]bool = undefined,
+    sched_order: [SCHED_WINDOW]u16 = undefined,
+    sched_prio: [SCHED_WINDOW]u32 = undefined,
+    sched_npred: [SCHED_WINDOW]u16 = undefined,
+    sched_ready: [SCHED_WINDOW]u32 = undefined,
+    sched_done: [SCHED_WINDOW]bool = undefined,
+    sched_succ: [SCHED_WINDOW][DEP_WORDS]u64 = undefined,
+    /// Reads of each register: all of them still to come, and in the window.
+    use_total: [MAX_VREGS]u16 = undefined,
+    use_win: [MAX_VREGS]u16 = undefined,
     // allocation
     by_start: [MAX_VREGS]u16 = undefined,
     active: [MAX_VREGS]u16 = undefined,
@@ -1701,6 +1705,21 @@ fn lowerBfe(l: *Lw) Error!void {
         try alu2(w, .shl_b, t, false, a, Opnd.imm(32 - b - c));
         return alu2(w, .ashr_b, d, false, Opnd.reg(t, false), Opnd.imm(32 - c));
     };
+    // A register offset whose bounds keep the field inside the word, and an
+    // immediate width: one shrm (u32), or shl + ashr (i32).
+    if (argImm(in.c)) |c0| if (argBounds(w, in.b, .u32)) |rb| if (rb[0] >= 0 and c0 > 0 and c0 < 32 and rb[1] + c0 <= 32) {
+        const x = try l.arg(in.a, .c3mid, false, false);
+        const off = try l.arg(in.b, .c3alt, false, false);
+        if (!signed) {
+            const mask: u32 = (@as(u32, 1) << @intCast(c0)) - 1;
+            return alu3(w, .shrm, d, false, off, x, try fit(w, Opnd.imm(mask), .c3alt, false, l.loop));
+        }
+        const s1 = try newVreg(w, .full);
+        const y = try newVreg(w, .full);
+        try alu2(w, .sub_u, s1, false, Opnd.imm(32 - c0), try l.arg(in.b, .c2, false, false));
+        try alu2(w, .shl_b, y, false, try l.arg(in.a, .c2, false, false), Opnd.reg(s1, false));
+        return alu2(w, .ashr_b, d, false, Opnd.reg(y, false), Opnd.imm(32 - c0));
+    };
     // General, with registers: offset & 31, width clamped to 32 - offset.
     const a = try l.arg(in.a, .c2, false, false);
     const b = try l.arg(in.b, .c2, false, false);
@@ -2373,7 +2392,13 @@ fn lowerControl(l: *Lw) Error!void {
             if (w.n_ctl == 0 or w.ctl[w.n_ctl - 1].kind != .loop) return error.Unbalanced;
             const c = w.ctl[w.n_ctl - 1];
             if (c.used_latch) try putLabel(w, c.l2);
-            try putBranch(w, .jump, false, c.l1);
+            // A brk right before endloop: one branch back while the
+            // condition is false (a do-while), not a branch out and a jump.
+            const last = &w.mi[w.n_mi - 1];
+            if (!c.used_latch and last.kind == .branch and last.in.op == .br and last.label == c.l3 and w.n_mi - 1 > c.head_mi) {
+                last.label = c.l1;
+                last.in.inv1 = !last.in.inv1;
+            } else try putBranch(w, .jump, false, c.l1);
             w.loops[c.loop_index].end = w.n_mi - 1;
             try putLabel(w, c.l3);
             w.n_ctl -= 1;
@@ -2490,7 +2515,25 @@ fn dependsOn(a: *const MI, b: *const MI) bool {
     return false;
 }
 
+/// Registers (32-bit) live in a window past which the scheduler prefers
+/// instructions that free registers to ones that start new values.
+pub const SCHED_PRESSURE = 40;
+
+fn countUses(w: *Work, m: *const MI, counts: []u16, delta: i32) void {
+    for (m.src, m.sn) |s, n| {
+        if (s == NONE or isPhys(s)) continue;
+        for (0..n) |k| {
+            const v = s + @as(u16, @intCast(k));
+            if (v >= w.nv) continue;
+            counts[v] = @intCast(@as(i32, counts[v]) + delta);
+        }
+    }
+}
+
 fn schedule(w: *Work) void {
+    @memset(w.use_total[0..w.nv], 0);
+    @memset(w.use_win[0..w.nv], 0);
+    for (w.mi[0..w.n_mi]) |*m| countUses(w, m, &w.use_total, 1);
     var start: u32 = 0;
     while (start < w.n_mi) {
         // a block: [start, end) of ordinary instructions
@@ -2500,66 +2543,157 @@ fn schedule(w: *Work) void {
         }
         var end = start;
         while (end < w.n_mi and !isBlockEnd(&w.mi[end])) end += 1;
-        if (end - start > 2 and end - start <= 512) scheduleBlock(w, start, end);
+        // long blocks in windows (the work is quadratic in their length)
+        var at = start;
+        while (at < end) {
+            const stop = @min(end, at + SCHED_WINDOW);
+            if (stop - at > 2) scheduleBlock(w, at, stop);
+            at = stop;
+        }
         start = end;
     }
+}
+
+/// Instructions scheduled together at most.
+pub const SCHED_WINDOW = 256;
+const DEP_WORDS = SCHED_WINDOW / 64;
+
+/// Registers instruction `m` frees (sources at their last use, all uses
+/// in this window) minus those it starts.
+fn pressureDelta(w: *const Work, m: *const MI) i32 {
+    var d: i32 = 0;
+    if (m.dst != NONE and !isPhys(m.dst)) d += m.dn;
+    for (m.src, m.sn, 0..) |s, n, si| {
+        if (s == NONE or isPhys(s)) continue;
+        // (a register read twice by m counts once)
+        var dup = false;
+        for (m.src[0..si]) |o| if (o == s) {
+            dup = true;
+        };
+        if (dup) continue;
+        for (0..n) |k| {
+            const v = s + @as(u16, @intCast(k));
+            if (v >= w.nv) continue;
+            const mine: u16 = usesBy(m, v);
+            if (w.use_total[v] == w.use_win[v] and w.use_win[v] == mine and w.vi[v].defs <= 1) d -= 1;
+        }
+    }
+    return d;
+}
+
+fn usesBy(m: *const MI, v: u16) u16 {
+    var c: u16 = 0;
+    for (m.src, m.sn) |s, n| {
+        if (s == NONE or isPhys(s)) continue;
+        if (v >= s and v < s + n) c += 1;
+    }
+    return c;
 }
 
 fn scheduleBlock(w: *Work, start: u32, end: u32) void {
     const n = end - start;
     const blk = w.mi[start..end];
-    // priorities: longest latency path to the block's end
+    for (blk) |*m| countUses(w, m, &w.use_win, 1);
+    defer for (blk) |*m| countUses(w, m, &w.use_win, -1);
+    var pressure: i32 = 0;
+    // successors as bit sets, predecessors as counts
+    for (0..n) |i| {
+        w.sched_succ[i] = [_]u64{0} ** DEP_WORDS;
+        w.sched_npred[i] = 0;
+        w.sched_done[i] = false;
+        w.sched_ready[i] = 0;
+    }
+    for (0..n) |i| {
+        for (i + 1..n) |j| {
+            if (dependsOn(&blk[i], &blk[j])) {
+                w.sched_succ[i][j >> 6] |= @as(u64, 1) << @intCast(j & 63);
+                w.sched_npred[j] += 1;
+            }
+        }
+    }
+    // priorities: the longest latency path to the block's end
     var i: u32 = n;
     while (i > 0) {
         i -= 1;
         var best: u32 = 0;
-        var j = i + 1;
-        while (j < n) : (j += 1) {
-            if (dependsOn(&blk[i], &blk[j])) best = @max(best, latency(&blk[i], &blk[j]) + w.sched_prio[j]);
-        }
+        var it = SuccIter{ .bits = &w.sched_succ[i], .n = n };
+        while (it.next()) |j| best = @max(best, latency(&blk[i], &blk[j]) + w.sched_prio[j]);
         w.sched_prio[i] = best + 1;
-        w.sched_done[i] = false;
-        w.sched_ready[i] = 0;
     }
-    // list scheduling by cycle
+    // list scheduling by cycle: the earliest ready, then the most urgent
     var cycle: u32 = 0;
     var placed: u32 = 0;
     while (placed < n) {
         var pick: ?u32 = null;
         var pick_ready: u32 = std.math.maxInt(u32);
+        var pick_delta: i32 = 0;
+        const tight = pressure >= SCHED_PRESSURE;
         var k: u32 = 0;
         while (k < n) : (k += 1) {
-            if (w.sched_done[k]) continue;
-            // all predecessors placed?
-            var ok = true;
-            var ready: u32 = 0;
-            var p: u32 = 0;
-            while (p < k) : (p += 1) {
-                if (dependsOn(&blk[p], &blk[k])) {
-                    if (!w.sched_done[p]) {
-                        ok = false;
-                        break;
-                    }
-                    ready = @max(ready, w.sched_ready[p] + latency(&blk[p], &blk[k]));
-                }
-            }
-            if (!ok) continue;
-            const r = @max(ready, cycle);
-            if (pick == null or r < pick_ready or (r == pick_ready and w.sched_prio[k] > w.sched_prio[pick.?])) {
+            if (w.sched_done[k] or w.sched_npred[k] != 0) continue;
+            const rdy = @max(w.sched_ready[k], cycle);
+            const dl = pressureDelta(w, &blk[k]);
+            // Under pressure: what can issue now, then what starts the fewest
+            // registers, then the source's order (it uses what it loads
+            // soon); otherwise the earliest ready, then the longest path.
+            const better = if (pick == null) true else if (tight and dl != pick_delta)
+                dl < pick_delta
+            else
+                rdy < pick_ready or (rdy == pick_ready and w.sched_prio[k] > w.sched_prio[pick.?]);
+            if (better) {
                 pick = k;
-                pick_ready = r;
+                pick_ready = rdy;
+                pick_delta = dl;
             }
         }
         const sel = pick.?;
+        pressure += pick_delta;
+        // its reads are done: later picks see the counts without them
+        countUses(w, &blk[sel], &w.use_win, -1);
+        countUses(w, &blk[sel], &w.use_total, -1);
         w.sched_done[sel] = true;
-        w.sched_ready[sel] = pick_ready;
         w.sched_order[placed] = @intCast(sel);
+        var it = SuccIter{ .bits = &w.sched_succ[sel], .n = n };
+        while (it.next()) |j| {
+            w.sched_npred[j] -= 1;
+            w.sched_ready[j] = @max(w.sched_ready[j], pick_ready + latency(&blk[sel], &blk[j]));
+        }
         cycle = pick_ready + 1;
         placed += 1;
     }
-    for (0..n) |k| w.tmp_mi[k] = blk[w.sched_order[k]];
+    for (0..n) |kk| w.tmp_mi[kk] = blk[w.sched_order[kk]];
     @memcpy(blk, w.tmp_mi[0..n]);
+    // (the window's reads were taken off use_total as they were placed and
+    // off use_win too; put use_win back for the deferred decrement)
+    for (blk) |*m| countUses(w, m, &w.use_win, 1);
 }
+
+const SuccIter = struct {
+    bits: *const [DEP_WORDS]u64,
+    n: u32,
+    word: u32 = 0,
+    cur: u64 = 0,
+    started: bool = false,
+
+    fn next(it: *SuccIter) ?u32 {
+        if (!it.started) {
+            it.started = true;
+            it.cur = it.bits[0];
+        }
+        while (true) {
+            if (it.cur != 0) {
+                const b: u32 = @ctz(it.cur);
+                it.cur &= it.cur - 1;
+                const j = it.word * 64 + b;
+                if (j < it.n) return j;
+                return null;
+            }
+            it.word += 1;
+            if (it.word >= DEP_WORDS) return null;
+            it.cur = it.bits[it.word];
+        }
+    }
+};
 
 // ── 5. Register allocation ──────────────────────────────────────────────────
 
