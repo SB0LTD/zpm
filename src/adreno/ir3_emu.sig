@@ -511,7 +511,7 @@ fn execute(c: *Ctx, pc: u32, fibers: []const u32) Error!void {
                         };
                         w.pc[f] = if (take) @intCast(@as(i64, pc) + in.imm) else pc + 1;
                     }
-                    w.slot[wave] = slot0 + reps;
+                    // (a branch's slot does not count: ir3_asm.countsSlots)
                     return;
                 },
                 else => return error.Unsupported,
@@ -526,7 +526,10 @@ fn execute(c: *Ctx, pc: u32, fibers: []const u32) Error!void {
         else => return error.Unsupported,
     }
     for (fibers) |f| w.pc[f] = pc + 1;
-    w.slot[wave] = slot0 + reps + in.nop;
+    // Only the vector ALU and cat0 let ALU latency pass, as Mesa counts
+    // delay slots: a load, store, SFU op, fence or barrier between an ALU
+    // result and its reader does not.
+    if (ir3_asm.countsSlots(in)) w.slot[wave] = slot0 + reps + in.nop;
 }
 
 fn execCat1(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!void {
@@ -1213,6 +1216,46 @@ test "the hazard checker catches a read before (sy)" {
     const consts = [_]u32{ 0x100, 0, 0, 0 };
     var stats = Stats{};
     try std.testing.expectError(error.Hazard, run(w, &mem, &.{ .kernel = &k, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats));
+}
+
+test "a store, a fence and a barrier are no delay slots: an address read across them is a hazard" {
+    var w = &emu_work;
+    w.check_hazards = true;
+    var data = [_]u32{ 7, 0 };
+    const regions = [_]Region{.{ .va = 0x100, .bytes = std.mem.sliceAsBytes(&data) }};
+    const mem = Memory{ .regions = &regions };
+    var code: [32]u64 = undefined;
+    // Six instructions between the shl and the ldl, three of them nops: as
+    // Mesa counts, three slots of the five passed (counting all but the
+    // barrier, five would have).
+    const lines = [_][]const u8{
+        "mov.u32u32 r0.x, 1",
+        "mov.u32u32 r1.y, 0",
+        "mov.u32u32 r2.x, 5",
+        "(rpt5)nop",
+        "shl.b r1.x, r0.x, 2",
+        "stl.u32 l[r1.y], r2.x, 1",
+        "fence.g.r.w",
+        "(sy)(ss)bar",
+        "(ss)nop",
+        "nop",
+        "nop",
+        "(sy)ldl.u32 r2.y, l[r1.x], 1",
+        "end",
+    };
+    for (lines, 0..) |l, i| code[i] = try ir3.assembleLine(ir3.A7XX, l);
+    var k = ir3_asm.Kernel{ .gen = ir3.A7XX, .code = code[0..lines.len], .count = lines.len, .instrlen = 1, .local_size = .{ 1, 1, 1 } };
+    k.constlen = 4;
+    k.shared_bytes = 64;
+    try load(w, &k);
+    const consts = [_]u32{ 0x100, 0, 0, 0 };
+    var stats = Stats{};
+    try std.testing.expectError(error.Hazard, run(w, &mem, &.{ .kernel = &k, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats));
+    // with (rpt4) on the nop, five slots pass
+    code[8] = try ir3.assembleLine(ir3.A7XX, "(ss)(rpt4)nop");
+    code[9] = try ir3.assembleLine(ir3.A7XX, "nop");
+    try load(w, &k);
+    _ = try run(w, &mem, &.{ .kernel = &k, .consts = &consts, .groups = .{ 1, 1, 1 } }, &stats);
 }
 
 test "(abs) of the most negative integer wraps to itself" {

@@ -924,6 +924,113 @@ test "a loop counter that is an element of a loaded vector, written twice in the
     _ = try both(&k, .{ 1, 1, 1 }, &.{ &input, &out }, &.{});
 }
 
+test "a butterfly over 256 threads, past one wave through shared memory: addresses made before a barrier wait their slots" {
+    // (L: norm+quant and the residual with a norm reduce over more than a
+    // wave; an exchange's ldl read an address shl'd before stl; fence; bar)
+    var k = newKernel("wide butterfly", .{ 256, 1, 1 });
+    const src = k.binding();
+    const o = k.binding();
+    const t = k.tid(0);
+    const t4 = k.op2(.shl, .u32, r(t), u(2));
+    var acc = k.load(.f32, kir.global(src, 32), r(t4));
+    var iacc = k.load(.u32, kir.global(src, 32), r(t4));
+    const sh = k.sharedAlloc(256 * 4, 16);
+    var ms = kir.shared(32);
+    ms.imm = @intCast(sh);
+    var m: u32 = 1;
+    while (m < 256) : (m *= 2) {
+        if (m < 64) {
+            acc = k.op2(.fadd, .f32, r(acc), r(k.shfl(.f32, .xor, r(acc), u(m))));
+            iacc = k.op2(.iadd, .u32, r(iacc), r(k.shfl(.u32, .xor, r(iacc), u(m))));
+            continue;
+        }
+        // lfm3_kir's xorPartner: the partner's address before the exchange
+        for (0..2) |which| {
+            const mine = k.op2(.shl, .u32, r(t), u(2));
+            const theirs = k.op2(.shl, .u32, r(k.op2(.xor, .u32, r(t), u(m))), u(2));
+            const ty: kir.Ty = if (which == 0) .f32 else .u32;
+            k.store(ty, ms, r(mine), r(if (which == 0) acc else iacc));
+            k.barrier();
+            const x = k.load(ty, ms, r(theirs));
+            k.barrier();
+            if (which == 0) acc = k.op2(.fadd, .f32, r(acc), r(x)) else iacc = k.op2(.iadd, .u32, r(iacc), r(x));
+        }
+    }
+    k.store(.f32, kir.global(o, 32), r(k.op2(.shl, .u32, r(t), u(3))), r(acc));
+    var mo = kir.global(o, 32);
+    mo.imm = 4;
+    k.store(.u32, mo, r(k.op2(.shl, .u32, r(t), u(3))), r(iacc));
+    var input = zeros(512 * 4);
+    var seed: u32 = 99;
+    for (0..512) |i| {
+        const x = (@as(f32, @floatFromInt(lcg(&seed) >> 8)) / 16777216.0 - 0.5) * 8.0;
+        std.mem.writeInt(u32, input[i * 4 ..][0..4], @bitCast(x), .little);
+    }
+    var out = zeros(512 * 8);
+    _ = try both(&k, .{ 2, 1, 1 }, &.{ &input, &out }, &.{});
+}
+
+/// Two or three loops in a row over one counter, reset with mov 0 between
+/// them, the later ones storing under an if (lfm3_kir's softmax: max, then
+/// exp and sum, then scale).
+fn loopsOverOneCounter(three: bool, keep_sum: bool) !void {
+    var k = newKernel("consecutive loops", .{ 64, 1, 1 });
+    const B = k.binding();
+    k.param_words = 1;
+    const t = k.tid(0);
+    const len = k.param(.u32, 0);
+    const passes = k.op2(.shr, .u32, r(k.op2(.iadd, .u32, r(len), u(63))), u(6));
+    const c = k.mov(.u32, u(0));
+    const acc = k.mov(.f32, f(0));
+    // loop 1: read
+    k.loop();
+    {
+        const e = k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(c), u(6))), r(t));
+        const ok = k.cmp(.u32, .lt, r(e), r(len));
+        const v = k.load(.f32, kir.global(B, 32), r(k.op2(.shl, .u32, r(k.min(.u32, r(e), r(k.op2(.isub, .u32, r(len), u(1))))), u(2))));
+        k.set(acc, .sel, r(k.op2(.fadd, .f32, r(acc), r(v))), r(acc), r(ok));
+        k.set(c, .iadd, r(c), u(1), no);
+        k.brk(r(k.cmp(.u32, .ge, r(c), r(passes))));
+    }
+    k.endloop();
+    const steps = [_]struct { op: kir.Op, by: f32 }{ .{ .op = .fadd, .by = 1 }, .{ .op = .fmul, .by = 2 } };
+    for (steps[0..if (three) 2 else 1]) |s| {
+        k.set(c, .mov, u(0), no, no);
+        // v = v + 1, then v = v * 2, stored under an if
+        k.loop();
+        {
+            const e = k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(c), u(6))), r(t));
+            const ok = k.cmp(.u32, .lt, r(e), r(len));
+            const off = k.op2(.shl, .u32, r(k.min(.u32, r(e), r(k.op2(.isub, .u32, r(len), u(1))))), u(2));
+            const v = k.load(.f32, kir.global(B, 32), r(off));
+            k.ifp(r(ok));
+            k.store(.f32, kir.global(B, 32), r(off), r(k.op2(s.op, .f32, r(v), f(s.by))));
+            k.endif();
+            k.set(c, .iadd, r(c), u(1), no);
+            k.brk(r(k.cmp(.u32, .ge, r(c), r(passes))));
+        }
+        k.endloop();
+    }
+    // (the first loop's sum, or a first loop that only counts)
+    if (keep_sum) {
+        var ma = kir.global(B, 32);
+        ma.imm = 300 * 4;
+        k.store(.f32, ma, r(k.op2(.shl, .u32, r(t), u(2))), r(acc));
+    }
+    var buf = zeros(364 * 4);
+    for (0..300) |i| std.mem.writeInt(u32, buf[i * 4 ..][0..4], @bitCast(@as(f32, @floatFromInt(i))), .little);
+    _ = try both(&k, .{ 1, 1, 1 }, &.{buf[0 .. if (keep_sum) buf.len else 300 * 4]}, &.{300});
+}
+
+test "consecutive loops over one counter reset with mov 0, the later ones storing under an if" {
+    // (L: lfm3_kir.attnSoftmax over spans past 64 lost its stores from the
+    // second loop's second pass on)
+    for ([_]bool{ false, true }) |keep_sum| {
+        try loopsOverOneCounter(false, keep_sum);
+        try loopsOverOneCounter(true, keep_sum);
+    }
+}
+
 // ── The hand-written kernels, rewritten in KIR ──────────────────────────────
 
 const hand = @import("lfm3_gpu_kernels");
