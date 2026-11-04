@@ -1221,6 +1221,13 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig"),
     });
 
+    // ── AMD GCN3/GCN4 (gfx803, Polaris) compute: the ISA, a kernel assembler,
+    //    the kernel descriptor and dispatch registers, a wave64 emulator ──
+    _ = try ctx.addModule("amdgpu", "src/amdgpu/amdgpu.sig");
+    const test_amdgpu = try ctx.addStep("test-amdgpu", "Execute LLVM's gfx803 vectors and kernels, the descriptor, and the wave64 emulator's copy and matmul", &noopStep);
+    try ctx.addDependency(test_all, test_amdgpu);
+    _ = try addTest(ctx, test_amdgpu, "test-amdgpu-module", "src/amdgpu/amdgpu.sig", &.{});
+
     const tts_gpu = try ctx.addModule("tts_gpu", "src/tts/gpu.sig");
     try wire(ctx, tts_gpu, "tts_model_container", "src/tts/model_container.sig");
     try wire(ctx, tts_gpu, "quantized_linear", "src/core/quantized_linear.sig");
