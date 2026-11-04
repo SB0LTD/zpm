@@ -1050,7 +1050,8 @@ fn q8kTail(t: *Text) void {
     while (k > 0) {
         k -= 1;
         t.put("SHF.R.U32.HI R{d}, RZ, 0x1f, R{d}", .{ QK.TK, V + k });
-        t.put("IADD3 R{d}, PT, PT, R{d}, R{d}, 0x{x}", .{ QK.TK, QK.KEY0, QK.TK, 2 * k });
+        // (the immediate second: GB206 takes none as IADD3's third source)
+        t.put("IADD3 R{d}, PT, PT, R{d}, 0x{x}, R{d}", .{ QK.TK, QK.KEY0, 2 * k, QK.TK });
         t.put("ISETP.EQ.U32.AND P0, PT, R{d}, R{d}, PT", .{ Q + k, QK.MAX });
         t.put("SEL R{d}, R{d}, R{d}, P0", .{ QK.KEY, QK.TK, QK.KEY });
     }
