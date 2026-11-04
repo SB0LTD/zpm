@@ -19,7 +19,8 @@ import csv
 import os
 import sys
 
-FILES = ["reg", "pred", "ureg"]
+FILES = ["reg", "pred", "ureg", "upred"]
+WHAT = {"reg": "general", "pred": "predicate", "ureg": "uniform", "upred": "uniform predicate"}
 KINDS = ["raw", "war", "waw"]
 
 
@@ -72,8 +73,8 @@ def main():
                 cats = c
             assert c == cats, f"{f}_{k}: categories differ"
             tables[k] = t
-        enum = {"reg": "Reg", "pred": "Pred", "ureg": "Ureg"}[f]
-        out.append(f"/// The {'general' if f == 'reg' else 'predicate' if f == 'pred' else 'uniform'} register file's latency categories.")
+        enum = {"reg": "Reg", "pred": "Pred", "ureg": "Ureg", "upred": "Upred"}[f]
+        out.append(f"/// The {WHAT[f]} register file's latency categories.")
         out.append(f"pub const {enum} = enum(u8) {{")
         for c in cats:
             out.append(f"    {c},")
