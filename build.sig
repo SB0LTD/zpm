@@ -1108,6 +1108,35 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
     });
+    // LFM3's forward pass on the RTX: the backend over an nvidia Device,
+    // against lfm3_executor on the emulated RTX.
+    const lfm3_nv_matrix = try ctx.addModule("lfm3_nv_matrix", "src/core/lfm3_nv_matrix.sig");
+    try wire(ctx, lfm3_nv_matrix, "nvidia", "src/nvidia/nvidia.sig");
+    try wire(ctx, lfm3_nv_matrix, "quantized_linear", "src/core/quantized_linear.sig");
+    const lfm3_nv_ops = try ctx.addModule("lfm3_nv_ops", "src/core/lfm3_nv_ops.sig");
+    try wire(ctx, lfm3_nv_ops, "nvidia", "src/nvidia/nvidia.sig");
+    try wire(ctx, lfm3_nv_ops, "lfm3_executor", "src/core/lfm3_executor.sig");
+    const lfm3_nv = try ctx.addModule("lfm3_nv", "src/core/lfm3_nv.sig");
+    try wire(ctx, lfm3_nv, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_nv, "lfm3_plan", "src/core/lfm3_plan.sig");
+    try wire(ctx, lfm3_nv, "lfm3_executor", "src/core/lfm3_executor.sig");
+    try wire(ctx, lfm3_nv, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, lfm3_nv, "nvidia", "src/nvidia/nvidia.sig");
+    try wire(ctx, lfm3_nv, "lfm3_nv_matrix", "src/core/lfm3_nv_matrix.sig");
+    try wire(ctx, lfm3_nv, "lfm3_nv_ops", "src/core/lfm3_nv_ops.sig");
+    _ = try addTest(ctx, test_nvidia, "test-lfm3-nv", "tests/test_lfm3_nv.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("transformer_ops", "src/core/transformer_ops.sig"),
+        importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("lfm3_nv_matrix", "src/core/lfm3_nv_matrix.sig"),
+        importEntry("lfm3_nv_ops", "src/core/lfm3_nv_ops.sig"),
+        importEntry("lfm3_nv", "src/core/lfm3_nv.sig"),
+    });
     // LFM3 on the Adreno: the kernels (each against quantized_linear and the
     // executor's arithmetic) and the backend against lfm3_executor.
     const lfm3_gpu_kernels = try ctx.addModule("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig");
