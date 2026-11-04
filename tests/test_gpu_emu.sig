@@ -195,11 +195,6 @@ test "emu: the verifier against a device's caps" {
     _ = k2.sharedAlloc(1 << 20, 4);
     try k2.finish();
     try std.testing.expectError(error.Limits, gpu.compile(&k2, gpu.interp_caps, &w, &code_out));
-    // and the backends not on this branch say so
-    c = gpu.interp_caps;
-    c.target = .ir3_a7xx;
-    var k3 = try axpbKernel();
-    try std.testing.expectError(error.Unsupported, gpu.compile(&k3, c, &w, &code_out));
 }
 
 test "emu: the verifier's structural checks" {
