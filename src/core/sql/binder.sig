@@ -646,6 +646,27 @@ pub fn Binder(comptime config: types.Config) type {
             return error.UndefinedFunction;
         }
 
+        /// int2/int4/int8 & | # (common integer type) and << >> (int4 count).
+        fn bitwiseType(context: *const Context, n: *ast.Node) Error!void {
+            const left = context.node(n.a).ty;
+            const right = context.node(n.b).ty;
+            if (n.op == .shift_left or n.op == .shift_right) {
+                // An unknown left operand also matches bit and inet shifts.
+                if (left == .unknown) return error.AmbiguousFunction;
+                if (!value.integral(left)) return error.UndefinedFunction;
+                if (right != .unknown and right != .int2 and right != .int4) return error.UndefinedFunction;
+                n.b = try convert(context, n.b, .int4, -1, .implicit);
+                n.ty = left;
+                return;
+            }
+            if (left == .unknown and right == .unknown) return error.AmbiguousFunction;
+            const target: ast.Type = if (left == .unknown) right else if (right == .unknown) left else if (value.integral(left) and value.integral(right)) value.arithmeticType(left, right) else return error.UndefinedFunction;
+            if (!value.integral(target)) return error.UndefinedFunction;
+            try coerce(context, n.a, target);
+            try coerce(context, n.b, target);
+            n.ty = target;
+        }
+
         fn jsonOperator(context: *const Context, n: *ast.Node) Error!void {
             const left = context.node(n.a).ty;
             if (left == .unknown) return error.AmbiguousFunction;
@@ -2146,6 +2167,7 @@ pub fn Binder(comptime config: types.Config) type {
                     const ty = context.node(n.a).ty;
                     if (ty == .unknown) return error.AmbiguousFunction;
                     if (!value.numericCategory(ty) and ty != .interval) return error.UndefinedFunction;
+                    if (n.op == .bit_not and !value.integral(ty)) return error.UndefinedFunction;
                     n.ty = ty;
                     n.constant = isConstant(context, n.a);
                 },
@@ -2187,7 +2209,8 @@ pub fn Binder(comptime config: types.Config) type {
                             n.ty = .text;
                         },
                         .arrow, .arrow_text, .path, .path_text, .contains, .contained, .exists => try jsonOperator(context, n),
-                        .neg, .pos => unreachable,
+                        .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => try bitwiseType(context, n),
+                        .neg, .pos, .bit_not => unreachable,
                     }
                 },
                 .and_op, .or_op => {

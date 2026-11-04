@@ -1546,6 +1546,11 @@ pub fn Parser(comptime config: types.Config) type {
                     .contains => .contains,
                     .contained => .contained,
                     .question => .exists,
+                    .ampersand => .bit_and,
+                    .pipe => .bit_or,
+                    .hash => .bit_xor,
+                    .shift_left => .shift_left,
+                    .shift_right => .shift_right,
                     else => break,
                 };
                 try self.advance();
@@ -1605,6 +1610,15 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn unary(self: *Self) Error!u16 {
+            if (self.mode == .standard and self.isSymbol(.tilde)) {
+                // Prefix operators bind like PostgreSQL's generic Op: `~1+2`
+                // is ~(1+2), while `~1||x` applies ~ first.
+                try self.enter();
+                defer self.leave();
+                try self.advance();
+                const operand = try self.additive();
+                return self.pool.add(.{ .kind = .unary, .op = .bit_not, .a = operand });
+            }
             if (!self.isSymbol(.minus) and !self.isSymbol(.plus)) return self.castExpr();
             const negative = self.isSymbol(.minus);
             try self.enter();

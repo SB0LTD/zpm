@@ -461,10 +461,69 @@ fn numerics() void {
     report("numeric",before);
 }
 
+// ---- PG.OP.BITWISE -----------------------------------------------------------
+
+fn bitwise() void {
+    const before=begin("bitwise");
+    // Oracle fixture (PG.OP.BITWISE).
+    shaped("SELECT 3&1,3|4,3#1,1<<2,8>>1",&.{.{.name="?column?",.oid=23},.{.name="?column?",.oid=23},.{.name="?column?",.oid=23},.{.name="?column?",.oid=23},.{.name="?column?",.oid=23}},&.{"1","7","2","4","4"});
+    // PostgreSQL 18 documentation examples (functions-math.html, table 9.4).
+    value("SELECT 91 & 15",23,"11");
+    value("SELECT 32 | 3",23,"35");
+    value("SELECT 17 # 5",23,"20");
+    value("SELECT ~1",23,"-2");
+    value("SELECT 1 << 4",23,"16");
+    value("SELECT 8 >> 2",23,"2");
+    // Types: common integer type; the shift count is int4.
+    value("SELECT 3::int2 & 1::int2",21,"1");
+    value("SELECT 3::int2 | 4",23,"7");
+    value("SELECT 3::int8 # 1",20,"2");
+    value("SELECT '6' & 3",23,"2");
+    value("SELECT 1::int8 << 40",20,"1099511627776");
+    value("SELECT 1::int2 << 2::int2",21,"4");
+    value("SELECT ~0::int8",20,"-1");
+    value("SELECT ~(-32768)::int2",21,"32767");
+    // Precedence: like ||, lower than + and *; prefix ~ takes 1+2.
+    value("SELECT 1 + 2 & 3",23,"3");
+    value("SELECT 2 * 3 | 1",23,"7");
+    value("SELECT 1 | 2 # 3",23,"0");
+    value("SELECT ~1+2",23,"-4");
+    value("SELECT (~1)+2",23,"0");
+    value("SELECT 1 << 2 = 4",16,"t");
+    // Shift counts wrap at the operand width (x86-64/AArch64 builds).
+    value("SELECT 1 << 31",23,"-2147483648");
+    value("SELECT 1 << 32",23,"1");
+    value("SELECT 1 << 33",23,"2");
+    value("SELECT -8 >> 1",23,"-4");
+    value("SELECT 1::int8 << 63",20,"-9223372036854775808");
+    value("SELECT 1::int8 << 64",20,"1");
+    value("SELECT 1::int2 << 16",21,"0");
+    value("SELECT (-1)::int2 >> 20",21,"-1");
+    value("SELECT 5 << -1",23,"-2147483648");
+    value("SELECT NULL::int & 1",23,null);
+    value("SELECT 1 << NULL",23,null);
+    setup(&.{"CREATE TABLE bit_t(id INT PRIMARY KEY,v INT)","INSERT INTO bit_t VALUES(1,12),(2,NULL),(3,5)"});
+    rowsOf("SELECT v & 4 FROM bit_t ORDER BY id",23,&.{"4",null,"4"});
+    rowsOf("SELECT id FROM bit_t WHERE v # 1 = 4",23,&.{"3"});
+    // Errors.
+    rejects("SELECT 1.5 & 1",error.UndefinedFunction);
+    rejects("SELECT 1 & 1.5",error.UndefinedFunction);
+    rejects("SELECT 1 << 2::int8",error.UndefinedFunction);
+    rejects("SELECT 1.5 << 1",error.UndefinedFunction);
+    rejects("SELECT ~1.5",error.UndefinedFunction);
+    rejects("SELECT '1' & '1'",error.AmbiguousFunction);
+    rejects("SELECT '1' << 2",error.AmbiguousFunction);
+    rejects("SELECT ~'1'",error.AmbiguousFunction);
+    rejects("SELECT 'x' & 1",error.InvalidTextRepresentation);
+    rejects("SELECT TRUE & 1",error.UndefinedFunction);
+    report("bitwise",before);
+}
+
 pub fn main(init:std.process.Init) !void {
     literals();
     strings();
     numerics();
+    bitwise();
     var buffer:[160]u8=undefined;
     const line=try std.fmt.bufPrint(&buffer,"{{\"suite\":\"sql-functions-core\",\"pass\":{s},\"assertions\":{d},\"failures\":{d}}}\n",.{if(failures==0) "true" else "false",assertions,failures});
     try std.Io.File.stdout().writeStreamingAll(init.io,line);

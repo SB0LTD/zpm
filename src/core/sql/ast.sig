@@ -37,7 +37,9 @@ pub const TypeName = types.Type;
 
 /// `arrow` ->, `arrow_text` ->>, `path` #>, `path_text` #>>, `contains` @>,
 /// `contained` <@, `exists` ?.
-pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists, is_distinct, is_not_distinct };
+pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists, is_distinct, is_not_distinct,
+    // Integer bitwise operators (B11): & | # << >> and prefix ~.
+    bit_and, bit_or, bit_xor, shift_left, shift_right, bit_not };
 
 /// Built-in functions bound by name.
 pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least,

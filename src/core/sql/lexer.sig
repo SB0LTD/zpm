@@ -5,7 +5,7 @@
 //! case-folded on comparison), double-quoted identifiers that keep their case
 //! (`""` escapes), string literals with `''` escaping, integer, decimal and
 //! exponent literals, `$n` placeholders, the operators
-//! `= <> != < <= > >= + - * / % || :: -> ->> #> #>> @> <@ ?` and punctuation,
+//! `= <> != < <= > >= + - * / % || :: -> ->> #> #>> @> <@ ? & | # << >> ~` and punctuation,
 //! with whitespace, `--` and (nested) `/* */` comments between tokens.
 //! PostgreSQL's other string forms are string tokens too: `E'...'` escape
 //! strings, `$tag$...$tag$` dollar quoting and `U&'...' [UESCAPE 'c']`
@@ -281,6 +281,13 @@ pub const Symbol = enum {
     contains,
     contained,
     question,
+    // Bitwise integer operators (B11): & | # << >> and prefix ~.
+    ampersand,
+    pipe,
+    hash,
+    shift_left,
+    shift_right,
+    tilde,
 };
 
 pub const Token = struct {
@@ -562,10 +569,16 @@ pub const Tokenizer = struct {
             } else if (following == '@') blk: {
                 width = 2;
                 break :blk Symbol.contained;
+            } else if (following == '<') blk: {
+                width = 2;
+                break :blk Symbol.shift_left;
             } else .lt,
             '>' => if (following == '=') blk: {
                 width = 2;
                 break :blk Symbol.ge;
+            } else if (following == '>') blk: {
+                width = 2;
+                break :blk Symbol.shift_right;
             } else .gt,
             '!' => if (following == '=') blk: {
                 width = 2;
@@ -574,7 +587,9 @@ pub const Tokenizer = struct {
             '|' => if (following == '|') blk: {
                 width = 2;
                 break :blk Symbol.concat;
-            } else return error.Syntax,
+            } else .pipe,
+            '&' => .ampersand,
+            '~' => .tilde,
             ':' => if (following == ':') blk: {
                 width = 2;
                 break :blk Symbol.cast;
@@ -582,7 +597,7 @@ pub const Tokenizer = struct {
             '#' => if (following == '>') blk: {
                 width = if (third == '>') 3 else 2;
                 break :blk if (third == '>') Symbol.path_text else Symbol.path;
-            } else return error.Syntax,
+            } else .hash,
             '@' => if (following == '>') blk: {
                 width = 2;
                 break :blk Symbol.contains;

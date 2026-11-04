@@ -148,6 +148,27 @@ pub fn arithmetic(op: ast.Op, ty: ast.Type, left: i64, right: i64) Error!i64 {
     return checkRange(value, ty);
 }
 
+/// int2/int4/int8 bitwise operators. Shift counts are masked to the
+/// operand width as on x86-64/AArch64 PostgreSQL builds (C shifts of the
+/// promoted int, then truncation for int2); bits shifted out are lost.
+pub fn bitwise(op: ast.Op, ty: ast.Type, left: i64, right: i64) i64 {
+    return switch (op) {
+        .bit_and => left & right,
+        .bit_or => left | right,
+        .bit_xor => left ^ right,
+        .shift_left, .shift_right => if (ty == .int8) blk: {
+            const count: u6 = @intCast(right & 63);
+            break :blk if (op == .shift_left) left << count else left >> count;
+        } else blk: {
+            const count: u5 = @intCast(right & 31);
+            const narrow: i32 = @intCast(left);
+            const shifted: i32 = if (op == .shift_left) narrow << count else narrow >> count;
+            break :blk if (ty == .int2) @as(i16, @truncate(shifted)) else shifted;
+        },
+        else => unreachable,
+    };
+}
+
 fn utf8Length(byte: u8) usize {
     if (byte < 0xc0) return 1;
     if (byte < 0xe0) return 2;
@@ -761,6 +782,7 @@ pub fn Eval(comptime config: types.Config) type {
                     const value = try eval(ctx, n.a);
                     if (value == .null_value) return .null_value;
                     if (n.op == .pos) return value;
+                    if (n.op == .bit_not) return .{ .integer = try checkRange(~value.integer, n.ty) };
                     return Io.negate(&value, n.ty);
                 },
                 .binary => switch (n.op) {
@@ -787,6 +809,12 @@ pub fn Eval(comptime config: types.Config) type {
                         try appendCell(&text, &left, true, ctx.session);
                         try appendCell(&text, &right, true, ctx.session);
                         return .{ .text = text };
+                    },
+                    .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => {
+                        const left = try eval(ctx, n.a);
+                        const right = try eval(ctx, n.b);
+                        if (left == .null_value or right == .null_value) return .null_value;
+                        return .{ .integer = bitwise(n.op, n.ty, left.integer, right.integer) };
                     },
                     .add, .sub, .mul, .div, .mod => {
                         // Preserve left-to-right evaluation, including a right
