@@ -41,6 +41,8 @@
 //! - Results: f32, `out + t * out_stride + row * 4`.
 //! - Quantization input: f32 rows of K, token after token (`x + t * K * 4`);
 //!   RMSNorm's weights K f32; the normalized rows written like x.
+//! - Every buffer starts 16-byte aligned (the kernels move activations,
+//!   rows of f32 and RMSNorm's weights in 16-byte loads and stores).
 //!
 //! # Numerics
 //!
@@ -81,13 +83,22 @@
 //! Q4_K weights in flight a block. Weights a token a row: K * 144 / 256
 //! bytes for Q4_K (0.56 B a column), K * 210 / 256 for Q6_K (0.82), K * 34
 //! / 32 for Q8_0 (1.06), plus the CTA's activation tile from L2 (2.3 KiB a
-//! token for 32 rows, about 6 % of the Q4_K weights at K = 2048). Issue: a
-//! Q4_K block is about 195 instructions a thread for one token (2.7 a weight
-//! byte; 112 more a token), Q6_K about 280, Q8_0 about 45 for 17 bytes; at
-//! 300 GB/s that is under a fifth of the SMs' issue rate for one token.
-//! Registers: about 150 (Q4_K) and 160 (Q6_K) a thread for one token, 180
-//! for eight: 13 to 16 warps an SM, 30 KiB or more of loads in flight an
-//! SM, well over what 300 GB/s needs (about 5 KiB an SM at 600 ns).
+//! token for 32 rows, about 6 % of the Q4_K weights at K = 2048).
+//!
+//! Issue, a thread a block for one token: Q4_K about 190 instructions (72
+//! weight bytes: 2.6 a byte) and about 120 more a token, Q6_K about 280
+//! (105 bytes) and 120 more a token, Q8_0 about 50 (17 bytes) and 15 more a
+//! token. At 300 GB/s one token is under a fifth of the SMs' issue rate;
+//! eight tokens (prefill) come near it, so a pass of eight costs about one
+//! pass of the weights. Kernel sizes (sm120_asm's count) and registers:
+//! Q4_K 275 instructions and 150 registers for one token, 1297 and 178 for
+//! eight; Q6_K 1424 and 158, 2439 and 186 (its eight blocks' loads written
+//! out); Q8_0 119 and 94, 427 and 122; the quantizations under 260 and 51.
+//! At 150 to 186 registers an SM holds 11 to 13 warps, 25 KiB or more of
+//! weights in flight, well over what 300 GB/s needs (about 5 KiB an SM at
+//! 600 ns). A row's blocks are summed in order, so a row is serial over
+//! its blocks: a small matrix (512 rows of LFM3's KV projections) runs at
+//! the latency of its K / 256 loads one after another, a few microseconds.
 //!
 //! Allocation-free: the texts are comptime constants, the launch helpers
 //! return values.
@@ -1196,6 +1207,31 @@ pub fn q80Quant() []const u8 {
     return comptime q80QuantKernel();
 }
 
+/// The matrix kernel's text for a token count known at run time (a forward
+/// pass assembles the eight variants of each format once).
+pub fn matrixSource(format: Format, tokens: u32) Error![]const u8 {
+    if (tokens == 0 or tokens > MAX_TOKENS) return error.Unsupported;
+    return switch (tokens) {
+        inline 1...MAX_TOKENS => |n| switch (format) {
+            .q4_k => q4kMatrix(n),
+            .q6_k => q6kMatrix(n),
+            .q8_0 => q80Matrix(n),
+        },
+        else => unreachable,
+    };
+}
+
+/// The fused RMSNorm and Q8_K quantization's text for a row of `waves`
+/// blocks (a power of two up to MAX_NORM_WAVES: hidden sizes of 256 to
+/// 8192), or the plain quantization's (`norm` false, any waves).
+pub fn q8kQuantSource(norm: bool, waves: u32) Error![]const u8 {
+    if (!norm) return q8kQuant(false, 1);
+    return switch (waves) {
+        inline 1, 2, 4, 8, 16, 32 => |w| q8kQuant(true, w),
+        else => error.Unsupported,
+    };
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 //
 // Every kernel is sm120_asm's (its control fields worked out), runs on
@@ -1614,6 +1650,14 @@ test "launch shapes: grids, blocks, shared bytes; shapes the kernels do not take
     try testing.expectError(error.Unsupported, q80QuantLaunch(1, 48));
     // (every shape fits the QMD's shared memory)
     _ = try qmd.sharedTotal((try matrixLaunch(.q6_k, 8, 1, 8)).shared);
+    // the run-time selectors
+    try testing.expectEqualStrings(q6kMatrix(3), try matrixSource(.q6_k, 3));
+    try testing.expectEqualStrings(q80Matrix(8), try matrixSource(.q8_0, 8));
+    try testing.expectError(error.Unsupported, matrixSource(.q4_k, 0));
+    try testing.expectError(error.Unsupported, matrixSource(.q4_k, 9));
+    try testing.expectEqualStrings(q8kQuant(true, 8), try q8kQuantSource(true, 8));
+    try testing.expectEqualStrings(q8kQuant(false, 1), try q8kQuantSource(false, 3));
+    try testing.expectError(error.Unsupported, q8kQuantSource(true, 6));
 }
 
 /// A kernel's text: every form the emulator runs, assembled by sm120_asm
