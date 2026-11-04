@@ -1091,6 +1091,17 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_nvidia = try ctx.addStep("test-nvidia", "Encode ptxas's sm_120 vectors and assemble its kernels from their listings", &noopStep);
     try ctx.addDependency(test_all, test_nvidia);
     _ = try addTest(ctx, test_nvidia, "test-nvidia-module", "src/nvidia/nvidia.sig", &.{});
+    // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
+    _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("transformer_ops", "src/core/transformer_ops.sig"),
+        importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+    });
     // LFM3 on the Adreno: the kernels (each against quantized_linear and the
     // executor's arithmetic) and the backend against lfm3_executor.
     const lfm3_gpu_kernels = try ctx.addModule("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig");
