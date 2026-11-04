@@ -1,0 +1,57 @@
+//! @zpm/gpu — GPU compute on any GPU, in pure Sig.
+//!
+//! A kernel is written once in KIR (kir.sig), built at run time into
+//! caller-owned storage, and compiled per GPU by a backend (kir_ir3 for
+//! the Adreno, kir_sm120 for the RTX; the interpreter runs KIR itself).
+//! A Device (device.sig) is any GPU: buffers by kind over unified or
+//! discrete memory, programs, ordered dispatches under one fence.
+//! EmuDevice (emu_device.sig) is the reference device, on kir_interp.
+//!
+//! No C, Mesa, CUDA, Vulkan or vendor user space at build or run time;
+//! allocation-free throughout. docs/GPU.md has the memory model, the
+//! exactness rules and how to add a GPU.
+
+pub const kir = @import("kir.sig");
+pub const device = @import("device.sig");
+pub const interp = @import("kir_interp.sig");
+pub const emu_device = @import("emu_device.sig");
+
+// KIR
+pub const Ty = kir.Ty;
+pub const V = kir.V;
+pub const Arg = kir.Arg;
+pub const Op = kir.Op;
+pub const Inst = kir.Inst;
+pub const Kernel = kir.Kernel;
+pub const Storage = kir.Storage;
+pub const Mem = kir.Mem;
+pub const r = kir.r;
+pub const u = kir.u;
+pub const f = kir.f;
+pub const i = kir.i;
+
+// Devices
+pub const Vendor = device.Vendor;
+pub const Target = device.Target;
+pub const MemoryModel = device.MemoryModel;
+pub const Caps = device.Caps;
+pub const Kind = device.Kind;
+pub const Buffer = device.Buffer;
+pub const Binary = device.Binary;
+pub const Program = device.Program;
+pub const Dispatch = device.Dispatch;
+pub const Error = device.Error;
+pub const Fence = device.Fence;
+pub const Device = device.Device;
+pub const Work = device.Work;
+pub const compile = device.compile;
+pub const interp_caps = device.interp_caps;
+
+pub const EmuDevice = emu_device.EmuDevice;
+
+test {
+    _ = kir;
+    _ = device;
+    _ = interp;
+    _ = emu_device;
+}
