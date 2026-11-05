@@ -865,15 +865,6 @@ pub fn Database(comptime config: Config) type {
         /// Settings provider for parameters the caller implements (the
         /// store's TimeZone, timeouts ...): current_setting / set_config.
         settings_provider: ?SettingsProvider = null,
-
-        /// current_setting / set_config of caller-owned parameters: `show`
-        /// writes the value (null: unknown name); `set` applies it (false:
-        /// unknown name).
-        pub const SettingsProvider = struct {
-            context: ?*anyopaque = null,
-            show: *const fn (?*anyopaque, []const u8, []u8) ?usize,
-            set: *const fn (?*anyopaque, []const u8, []const u8, bool, bool) Error!bool,
-        };
         // Routines, triggers and rules (B11 wave 3, routine_catalog.sig).
         /// Function / procedure, trigger and rule versions.
         objects: RC.Set = .{},
@@ -891,6 +882,15 @@ pub fn Database(comptime config: Config) type {
         /// Write-set index where the running statement's writes begin (its
         /// AFTER ROW triggers read them); kept across a park.
         statement_start: usize = 0,
+
+        /// current_setting / set_config of caller-owned parameters: `show`
+        /// writes the value (null: unknown name); `set` applies it (false:
+        /// unknown name).
+        pub const SettingsProvider = struct {
+            context: ?*anyopaque = null,
+            show: *const fn (?*anyopaque, []const u8, []u8) ?usize,
+            set: *const fn (?*anyopaque, []const u8, []const u8, bool, bool) Error!bool,
+        };
 
         const BackingLayout = struct {
             offsets: [config.tables][9]usize,
