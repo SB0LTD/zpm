@@ -6,8 +6,9 @@
 //!
 //! The driver behind EGL (egl.Driver): Galaxy's GPU through its render
 //! node (node.Gpu over Linux, with this image's backend: ir3 on AArch64,
-//! sm_120 on x86-64), the engine on it, PRIME for a window's frames, and
-//! the app's libwayland-client found by name (dl.sig). Opened at the
+//! sm_120 on x86-64), the engine on it, the app's libwayland-client found
+//! by name (dl.sig), and the process's side of things (host.Host): PRIME
+//! out and in, sync_files (Galaxy's G_FENCE_FD), dup, poll, mmap. Opened at the
 //! first eglInitialize; without a GPU EGL has no display and the app
 //! draws in software.
 
@@ -20,6 +21,7 @@ const wayland = gfxapi.wayland;
 const node = gfxapi.node;
 const engine = gfxapi.engine;
 const thread = gfxapi.thread;
+const Host = gfxapi.host.Host;
 const libgles = @import("libgles.sig");
 
 pub const panic = libgles.panic;
@@ -62,14 +64,63 @@ fn openDriver() ?*engine.Engine {
     return &the_engine;
 }
 
+const linux = std.os.linux;
+
+fn sysResult(r: usize) i64 {
+    return @as(isize, @bitCast(r));
+}
+
 fn exportFd(ctx: ?*anyopaque, buf: gpu.Buffer) i64 {
     _ = ctx;
     return the_gpu.exportFd(buf);
 }
 
+fn importFd(ctx: ?*anyopaque, fd: i32) ?gpu.Buffer {
+    _ = ctx;
+    if (!opened) return null;
+    return the_gpu.importFd(fd);
+}
+
+fn fenceFd(ctx: ?*anyopaque) i64 {
+    _ = ctx;
+    if (!opened) return -19; // ENODEV
+    return the_gpu.fenceFd();
+}
+
 fn closeFd(ctx: ?*anyopaque, fd: i32) void {
     _ = ctx;
-    _ = std.os.linux.close(fd);
+    _ = linux.close(fd);
+}
+
+fn dupFd(ctx: ?*anyopaque, fd: i32) i32 {
+    _ = ctx;
+    return @intCast(sysResult(linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 0)));
+}
+
+fn pollFd(ctx: ?*anyopaque, fd: i32, timeout_ms: i32) i32 {
+    _ = ctx;
+    var p = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    while (true) {
+        const r = sysResult(linux.poll(&p, 1, timeout_ms));
+        if (r == -4) continue; // EINTR
+        if (r < 0) return @intCast(r);
+        if (r == 0) return 0;
+        // (a sync_file that errored is done, as Linux says: its status tells)
+        return if (p[0].revents & (linux.POLL.IN | linux.POLL.ERR) != 0) 1 else -5;
+    }
+}
+
+fn mapFd(ctx: ?*anyopaque, fd: i32, size: usize) ?[]const u8 {
+    _ = ctx;
+    if (size == 0) return null;
+    const r = sysResult(linux.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0));
+    if (r < 0) return null;
+    return @as([*]const u8, @ptrFromInt(@as(usize, @intCast(r))))[0..size];
+}
+
+fn unmapFd(ctx: ?*anyopaque, s: []const u8) void {
+    _ = ctx;
+    _ = linux.munmap(s.ptr, s.len);
 }
 
 fn waylandClient() ?*const wayland.Client {
@@ -80,7 +131,7 @@ fn waylandClient() ?*const wayland.Client {
 /// What egl.sig takes as its driver (a test build sets its own).
 pub const egl_driver: ?egl.Driver = if (on_linux) .{
     .open = openDriver,
-    .exporter = .{ .exportFd = exportFd, .close = closeFd },
+    .host = .{ .exportFd = exportFd, .importFd = importFd, .fenceFd = fenceFd, .close = closeFd, .dup = dupFd, .poll = pollFd, .map = mapFd, .unmap = unmapFd },
     .wayland = waylandClient,
 } else null;
 
@@ -269,15 +320,25 @@ pub export fn eglGetSyncAttribKHR(dpy: ?*anyopaque, sync: ?*anyopaque, attribute
     return 1;
 }
 pub export fn eglCreateImage(dpy: ?*anyopaque, ctx: ?*anyopaque, target: u32, buffer: ?*anyopaque, attribs: ?[*]const isize) callconv(.c) ?*anyopaque {
-    // (EGLImages come with dma-buf import, the next step)
-    _ = .{ dpy, ctx, target, buffer, attribs };
-    egl.noSuch(egl.BAD_PARAMETER);
-    return null;
+    return h(egl.createImage(isize, dpy, ctx, target, buffer, attribs));
+}
+pub export fn eglCreateImageKHR(dpy: ?*anyopaque, ctx: ?*anyopaque, target: u32, buffer: ?*anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
+    return h(egl.createImage(i32, dpy, ctx, target, buffer, attribs));
 }
 pub export fn eglDestroyImage(dpy: ?*anyopaque, image: ?*anyopaque) callconv(.c) u32 {
-    _ = .{ dpy, image };
-    egl.noSuch(egl.BAD_PARAMETER);
-    return 0;
+    return b(egl.destroyImage(dpy, image));
+}
+pub export fn eglDestroyImageKHR(dpy: ?*anyopaque, image: ?*anyopaque) callconv(.c) u32 {
+    return b(egl.destroyImage(dpy, image));
+}
+pub export fn eglQueryDmaBufFormatsEXT(dpy: ?*anyopaque, max: i32, formats: ?[*]i32, num: ?*i32) callconv(.c) u32 {
+    return b(egl.queryDmaBufFormats(dpy, max, formats, num));
+}
+pub export fn eglQueryDmaBufModifiersEXT(dpy: ?*anyopaque, format: i32, max: i32, modifiers: ?[*]u64, external_only: ?[*]u32, num: ?*i32) callconv(.c) u32 {
+    return b(egl.queryDmaBufModifiers(dpy, format, max, modifiers, external_only, num));
+}
+pub export fn eglDupNativeFenceFDANDROID(dpy: ?*anyopaque, sync: ?*anyopaque) callconv(.c) i32 {
+    return egl.dupNativeFenceFd(dpy, sync);
 }
 pub export fn eglGetProcAddress(name: ?[*:0]const u8) callconv(.c) ?*const anyopaque {
     const n = name orelse return null;
@@ -319,17 +380,42 @@ fn testExport(ctx: ?*anyopaque, buf: gpu.Buffer) i64 {
     _ = buf;
     return -1;
 }
+fn testImport(ctx: ?*anyopaque, fd: i32) ?gpu.Buffer {
+    _ = ctx;
+    _ = fd;
+    return null;
+}
+fn testFence(ctx: ?*anyopaque) i64 {
+    _ = ctx;
+    return 42;
+}
 fn testClose(ctx: ?*anyopaque, fd: i32) void {
     _ = ctx;
     _ = fd;
 }
+fn testDup(ctx: ?*anyopaque, fd: i32) i32 {
+    _ = ctx;
+    return fd + 1;
+}
+fn testPoll(ctx: ?*anyopaque, fd: i32, ms: i32) i32 {
+    _ = .{ ctx, fd, ms };
+    return 1;
+}
+fn testMap(ctx: ?*anyopaque, fd: i32, size: usize) ?[]const u8 {
+    _ = .{ ctx, fd, size };
+    return null;
+}
+fn testUnmap(ctx: ?*anyopaque, s: []const u8) void {
+    _ = .{ ctx, s };
+}
+const test_host = Host{ .exportFd = testExport, .importFd = testImport, .fenceFd = testFence, .close = testClose, .dup = testDup, .poll = testPoll, .map = testMap, .unmap = testUnmap };
 fn noWayland() ?*const wayland.Client {
     return null;
 }
 
 test "libgalaxy_gl: EGL and GL through their C entry points (surfaceless, a pbuffer)" {
     t_eng.init(.{ .pool = &t_pool });
-    egl.setDriver(.{ .open = testOpen, .exporter = .{ .exportFd = testExport, .close = testClose }, .wayland = noWayland });
+    egl.setDriver(.{ .open = testOpen, .host = test_host, .wayland = noWayland });
     const dpy = eglGetDisplay(null);
     try std.testing.expect(dpy != null);
     var major: i32 = 0;
@@ -364,6 +450,13 @@ test "libgalaxy_gl: EGL and GL through their C entry points (surfaceless, a pbuf
     try std.testing.expect(sync != null);
     try std.testing.expectEqual(egl.CONDITION_SATISFIED, eglClientWaitSyncKHR(dpy, sync, egl.SYNC_FLUSH_COMMANDS_BIT, egl.FOREVER));
     try std.testing.expectEqual(@as(u32, 1), eglDestroySyncKHR(dpy, sync));
+    // a native fence of the work so far: Galaxy's sync_file (the host's 42)
+    const native = eglCreateSyncKHR(dpy, egl.SYNC_NATIVE_FENCE_ANDROID, null);
+    try std.testing.expectEqual(@as(i32, 42), eglDupNativeFenceFDANDROID(dpy, native));
+    try std.testing.expectEqual(@as(u32, 1), eglDestroySyncKHR(dpy, native));
+    var nf: i32 = 0;
+    try std.testing.expectEqual(@as(u32, 1), eglQueryDmaBufFormatsEXT(dpy, 0, null, &nf));
+    try std.testing.expectEqual(@as(i32, 4), nf);
     try std.testing.expectEqual(@as(u32, 1), eglSwapBuffers(dpy, pb)); // (a pbuffer's: nothing)
     try std.testing.expectEqual(@as(u32, 1), eglMakeCurrent(dpy, null, null, null));
     try std.testing.expect(eglGetCurrentContext() == null);

@@ -21,6 +21,10 @@
 //!   for bit. When a run fails, its batch is done again on the CPU and the
 //!   engine stays on the CPU (`lost`, which GL reports as a reset).
 //!
+//! - **Shared memory.** An EGLImage and the GL textures made of it name one
+//!   memory (`Shared`): what the GPU has pending on it is tracked once,
+//!   for every name, and it is freed with the last of them.
+//!
 //! Images are 32 bits a pixel (Format). Rectangles are in GL's
 //! coordinates, y from the bottom; an image whose row 0 is its top (a
 //! window's buffer) says so (`top_down`) and the engine flips rows.
@@ -86,10 +90,10 @@ pub const Image = struct {
     own: bool = false,
     /// in the engine's pool (CPU memory: no GPU address)
     pooled: bool = false,
-    /// the last batch that used it on the GPU (0: none)
-    last: u64 = 0,
-    /// the GPU wrote it since the CPU last fetched it
-    gpu_wrote: bool = false,
+    /// what the GPU has pending on it (a shared image's is its Shared's)
+    track: Track = .{},
+    /// memory other images name too (an EGLImage's), if any
+    share: ?*Shared = null,
     /// a color image without alpha (an XRGB surface's): read, and copied
     /// from, as opaque whatever its top byte holds
     no_alpha: bool = false,
@@ -104,10 +108,56 @@ pub const Image = struct {
     pub fn live(img: *const Image) bool {
         return img.width != 0 and img.buf.cpu.len != 0;
     }
+    fn trk(img: *Image) *Track {
+        return if (img.share) |s| &s.track else &img.track;
+    }
+    /// The GPU wrote it since the CPU last fetched it.
+    pub fn gpuWrote(img: *const Image) bool {
+        return if (img.share) |s| s.track.gpu_wrote else img.track.gpu_wrote;
+    }
+    /// The last batch that used it on the GPU (0: none).
+    pub fn lastBatch(img: *const Image) u64 {
+        return if (img.share) |s| s.track.last else img.track.last;
+    }
     fn words(img: *const Image) []u32 {
         return img.buf.words();
     }
 };
+
+pub const Track = struct {
+    /// the last batch that used it on the GPU (0: none)
+    last: u64 = 0,
+    /// the GPU wrote it since the CPU last fetched it
+    gpu_wrote: bool = false,
+};
+
+/// Memory several images name (an EGLImage, the GL textures and
+/// renderbuffers made of it): one track, freed with the last name.
+pub const Shared = struct {
+    refs: u32 = 0,
+    /// the whole buffer (an image may start inside it)
+    buf: gpu.Buffer = .{},
+    pooled: bool = false,
+    track: Track = .{},
+};
+
+/// The first name of memory to be shared (`whole`, its pixels from byte
+/// `off`: an imported dma-buf's plane), with `sh` holding it.
+pub fn adopt(sh: *Shared, whole: gpu.Buffer, off: usize, width: u32, height: u32, stride: u32, format: Format) Image {
+    sh.* = .{ .refs = 1, .buf = whole };
+    var view = whole;
+    if (view.gpu != 0) view.gpu += off;
+    view.cpu = whole.cpu[off..];
+    view.bytes = whole.bytes - off;
+    return .{ .buf = view, .width = width, .height = height, .stride = stride, .format = format, .own = true, .share = sh };
+}
+
+/// Another name for a shared image's memory.
+pub fn alias(img: *const Image) Image {
+    std.debug.assert(img.share != null);
+    img.share.?.refs += 1;
+    return img.*;
+}
 
 /// An image over memory someone else has (a window's buffer): `buf` with
 /// a CPU view, rows `stride` bytes apart.
@@ -429,7 +479,10 @@ pub const Engine = struct {
     /// The image's memory goes back (after the GPU is done with it), if it
     /// is the engine's; the image is empty after.
     pub fn freeImage(e: *Engine, img: *Image) void {
-        if (img.own and img.buf.cpu.len != 0) e.freeBytes(img.buf, img.pooled, img.last);
+        if (img.share) |sh| {
+            sh.refs -= 1;
+            if (sh.refs == 0) e.freeBytes(sh.buf, sh.pooled, sh.track.last);
+        } else if (img.own and img.buf.cpu.len != 0) e.freeBytes(img.buf, img.pooled, img.track.last);
         img.* = .{};
     }
 
@@ -532,7 +585,8 @@ pub const Engine = struct {
 
     /// The CPU may touch img: no batch in flight uses it.
     fn settle(e: *Engine, img: *Image) void {
-        if (img.last > e.done_upto) e.waitBatch(img.last);
+        const l = img.lastBatch();
+        if (l > e.done_upto) e.waitBatch(l);
     }
 
     fn gpuUsable(e: *const Engine, img: *const Image) bool {
@@ -549,9 +603,9 @@ pub const Engine = struct {
         const i = e.n_ops;
         for (bufs, 0..) |img, j| {
             e.op_bufs[i][j] = img.buf;
-            img.last = e.batch;
+            img.trk().last = e.batch;
         }
-        bufs[bufs.len - 1].gpu_wrote = true;
+        bufs[bufs.len - 1].trk().gpu_wrote = true;
         @memcpy(e.op_params[i][0..params.len], params);
         e.ops[i] = .{ .prog = &e.progs[@intFromEnum(prog)], .groups = groups, .buffers = e.op_bufs[i][0..bufs.len], .params = e.op_params[i][0..params.len] };
         e.op_cpu[i] = cpu;
@@ -613,7 +667,7 @@ pub const Engine = struct {
         for (0..h) |j| {
             const row = img.rowOf(y + @as(u32, @intCast(j)));
             const off = @as(usize, row) * img.stride + @as(usize, x) * 4;
-            if (img.gpu_wrote) e.fromDevice(img, off, @as(usize, w) * 4);
+            if (img.gpuWrote()) e.fromDevice(img, off, @as(usize, w) * 4);
             const s = src[j * src_stride ..][0 .. @as(usize, w) * 4];
             const base = off / 4;
             for (0..w) |i| {
@@ -636,7 +690,7 @@ pub const Engine = struct {
         for (0..h) |j| {
             const row = img.rowOf(y + @as(u32, @intCast(j)));
             const off = @as(usize, row) * img.stride + @as(usize, x) * 4;
-            if (img.gpu_wrote) e.fromDevice(img, off, @as(usize, w) * 4);
+            if (img.gpuWrote()) e.fromDevice(img, off, @as(usize, w) * 4);
             const d = dst[j * dst_stride ..][0 .. @as(usize, w) * 4];
             const base = off / 4;
             for (0..w) |i| {
@@ -652,7 +706,7 @@ pub const Engine = struct {
     /// it: `wrote`.
     pub fn hostView(e: *Engine, img: *Image, off: usize, len: usize) []u8 {
         e.settle(img);
-        if (img.gpu_wrote) e.fromDevice(img, off, len);
+        if (img.gpuWrote()) e.fromDevice(img, off, len);
         return img.buf.cpu[off..][0..len];
     }
 
@@ -666,7 +720,7 @@ pub const Engine = struct {
     pub fn writeBytes(e: *Engine, b: *Image, off: usize, src: []const u8) void {
         if (src.len == 0) return;
         e.settle(b);
-        if (b.gpu_wrote) e.fromDevice(b, off, src.len);
+        if (b.gpuWrote()) e.fromDevice(b, off, src.len);
         @memcpy(b.buf.cpu[off..][0..src.len], src);
         e.toDevice(b, off, src.len);
     }
@@ -675,7 +729,7 @@ pub const Engine = struct {
     pub fn readBytes(e: *Engine, b: *Image, off: usize, dst: []u8) void {
         if (dst.len == 0) return;
         e.settle(b);
-        if (b.gpu_wrote) e.fromDevice(b, off, dst.len);
+        if (b.gpuWrote()) e.fromDevice(b, off, dst.len);
         @memcpy(dst, b.buf.cpu[off..][0..dst.len]);
     }
 
@@ -704,7 +758,7 @@ pub const Engine = struct {
                     const len = @as(usize, f.rect.width()) * 4;
                     // (the GPU's writes first, the CPU's after: a lost GPU
                     // leaves its memory as it was)
-                    if (img.gpu_wrote) e.fromDevice(img, off, len);
+                    if (img.gpuWrote()) e.fromDevice(img, off, len);
                     const row = w[off / 4 ..][0..f.rect.width()];
                     for (row) |*p| p.* = (p.* & f.keep) | f.value;
                     e.toDevice(img, off, len);
@@ -720,8 +774,8 @@ pub const Engine = struct {
                     const so = @as(usize, c.src.rowOf(c.sy + jj)) * c.src.stride + @as(usize, c.sx) * 4;
                     const do_ = @as(usize, c.dst.rowOf(c.dy + jj)) * c.dst.stride + @as(usize, c.dx) * 4;
                     const len = @as(usize, c.w) * 4;
-                    if (c.src.gpu_wrote) e.fromDevice(&c.src, so, len);
-                    if (c.dst.gpu_wrote) e.fromDevice(&c.dst, do_, len);
+                    if (c.src.gpuWrote()) e.fromDevice(&c.src, so, len);
+                    if (c.dst.gpuWrote()) e.fromDevice(&c.dst, do_, len);
                     for (0..c.w) |i| {
                         const v = sw[so / 4 + i] | set;
                         dw[do_ / 4 + i] = if (swap) swapRB(v) else v;

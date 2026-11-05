@@ -11,7 +11,17 @@
 //! buffers, top-down; swap interval 1 waiting for the frame callback;
 //! buffers reused once released, buffer age; damage rectangles flipped
 //! to the buffer's rows; a resize; everything given back at the end; a
-//! compositor without dma-bufs, refused.
+//! compositor without dma-bufs, refused; zwp_linux_dmabuf_v1 version 4's
+//! feedback (the format table mapped, its tranches read) and version 3's
+//! events.
+//!
+//! Then EGLImages: a dma-buf of another program (an EmuDevice buffer,
+//! imported zero-copy as the kernel's PRIME does) as a GL texture, an
+//! external texture and a renderbuffer, read and drawn on the GPU, the
+//! producer seeing the consumer's pixels; the image kept by GL after its
+//! handle goes, freed with the last name; the errors EGL gives. And
+//! native fences: one of the GPU work handed out, one handed in (polled,
+//! owned, closed).
 
 const std = @import("std");
 const gpu = @import("gpu");
@@ -61,6 +71,7 @@ const Fake = struct {
     var queue_mark: u8 = 0;
     var queues: u32 = 0;
     var dmabuf_offered = true;
+    var offered_version: u32 = 4;
     var bound_version: u32 = 0;
     var flushes: u32 = 0;
     var commits: u32 = 0;
@@ -73,13 +84,41 @@ const Fake = struct {
     var buffers_made: u32 = 0;
     var buffers_destroyed: u32 = 0;
     var closes: u32 = 0;
+    var feedbacks: u32 = 0;
+    var table_closes: u32 = 0;
+    var maps: u32 = 0;
+    var unmaps: u32 = 0;
+    var last_closed: i32 = -1;
+    var fence_fds: u32 = 0;
+    var fence_signaled = false;
+    var imports: u32 = 0;
+
+    // version 4's feedback: a format table (format, pad, modifier), the
+    // render node 226:128, one tranche of all of it
+    const TABLE_FD: i32 = 55;
+    var table: [48]u8 = undefined;
+    var dev_bytes = [8]u8{ 0x80, 0xe2, 0, 0, 0, 0, 0, 0 };
+    var dev_array = wl.Array{ .size = 8, .alloc = 8, .data = &dev_bytes };
+    var idx = [3]u16{ 0, 1, 2 };
+    var idx_array = wl.Array{ .size = 6, .alloc = 6, .data = &idx };
+
+    fn tableFill() void {
+        const rows = [3]struct { u32, u64 }{ .{ wl.DRM_FORMAT_ARGB8888, 0 }, .{ wl.DRM_FORMAT_XRGB8888, 0 }, .{ wl.DRM_FORMAT_ARGB8888, 0x0100_0000_0000_0001 } };
+        @memset(&table, 0);
+        for (rows, 0..) |r, i| {
+            std.mem.writeInt(u32, table[i * 16 ..][0..4], r[0], .little);
+            std.mem.writeInt(u64, table[i * 16 + 8 ..][0..8], r[1], .little);
+        }
+    }
 
     fn reset() void {
         for (&proxies) |*p| p.* = .{};
         n_events = 0;
         queues = 0;
         dmabuf_offered = true;
+        offered_version = 4;
         bound_version = 0;
+        tableFill();
         flushes = 0;
         commits = 0;
         frames = 0;
@@ -89,6 +128,14 @@ const Fake = struct {
         buffers_made = 0;
         buffers_destroyed = 0;
         closes = 0;
+        feedbacks = 0;
+        table_closes = 0;
+        maps = 0;
+        unmaps = 0;
+        last_closed = -1;
+        fence_fds = 0;
+        fence_signaled = false;
+        imports = 0;
     }
 
     fn new(iface: ?*const wl.Interface, version: u32, queue: ?*wl.Queue) *P {
@@ -227,14 +274,27 @@ const Fake = struct {
         }.f;
         if (is(p, &display_iface) and opcode == 1) { // get_registry
             post(out.?, 0, .{ .{ .u = 7 }, .{ .s = "wl_compositor" }, .{ .u = 6 }, .{ .u = 0 } });
-            if (dmabuf_offered) post(out.?, 0, .{ .{ .u = 9 }, .{ .s = "zwp_linux_dmabuf_v1" }, .{ .u = 4 }, .{ .u = 0 } });
+            if (dmabuf_offered) post(out.?, 0, .{ .{ .u = 9 }, .{ .s = "zwp_linux_dmabuf_v1" }, .{ .u = offered_version }, .{ .u = 0 } });
         } else if (is(p, &registry_iface) and opcode == 0) { // bind
             std.debug.assert(args[0].u == 9);
             bound_version = version;
-            post(out.?, 1, .{ .{ .u = wl.DRM_FORMAT_ARGB8888 }, .{ .u = 0 }, .{ .u = 0 }, .{ .u = 0 } });
-            post(out.?, 1, .{ .{ .u = wl.DRM_FORMAT_XRGB8888 }, .{ .u = 0 }, .{ .u = 0 }, .{ .u = 0 } });
-            // (a format with a tiled modifier only: not a linear one)
-            post(out.?, 1, .{ .{ .u = 0x3231_4752 }, .{ .u = 0x0100_0000 }, .{ .u = 1 }, .{ .u = 0 } });
+            // (version 4 tells its formats by feedback only, as Galaxy's bridge)
+            if (version < 4) {
+                post(out.?, 1, .{ .{ .u = wl.DRM_FORMAT_ARGB8888 }, .{ .u = 0 }, .{ .u = 0 }, .{ .u = 0 } });
+                post(out.?, 1, .{ .{ .u = wl.DRM_FORMAT_XRGB8888 }, .{ .u = 0 }, .{ .u = 0 }, .{ .u = 0 } });
+                // (a format with a tiled modifier only: not a linear one)
+                post(out.?, 1, .{ .{ .u = 0x3231_4752 }, .{ .u = 0x0100_0000 }, .{ .u = 1 }, .{ .u = 0 } });
+            }
+        } else if (p.iface == &wl.dmabuf_interface and opcode == 2) { // get_default_feedback
+            const f = out.?;
+            post(f, 1, .{ .{ .h = TABLE_FD }, .{ .u = table.len }, .{ .u = 0 }, .{ .u = 0 } }); // format_table
+            post(f, 2, .{ .{ .a = &dev_array }, .{ .u = 0 }, .{ .u = 0 }, .{ .u = 0 } }); // main_device
+            post(f, 4, .{ .{ .a = &dev_array }, .{ .u = 0 }, .{ .u = 0 }, .{ .u = 0 } }); // tranche_target_device
+            post(f, 5, .{ .{ .a = &idx_array }, .{ .u = 0 }, .{ .u = 0 }, .{ .u = 0 } }); // tranche_formats
+            post(f, 6, .{ .{ .u = 0 }, .{ .u = 0 }, .{ .u = 0 }, .{ .u = 0 } }); // tranche_flags
+            post(f, 3, .{ .{ .u = 0 }, .{ .u = 0 }, .{ .u = 0 }, .{ .u = 0 } }); // tranche_done
+            post(f, 0, .{ .{ .u = 0 }, .{ .u = 0 }, .{ .u = 0 }, .{ .u = 0 } }); // done
+            feedbacks += 1;
         } else if (p.iface == &wl.params_interface) {
             switch (opcode) {
                 1 => { // add
@@ -331,17 +391,52 @@ fn exportFd(ctx: ?*anyopaque, b: gpu.Buffer) i64 {
     _ = ctx;
     return 200 + @as(i64, b.handle);
 }
+/// A dma-buf in: the EmuDevice buffer behind fd (200 + its handle),
+/// mapped again for the GPU, zero-copy (as another program's PRIME import
+/// would be: the same pages, a buffer of this context's).
+fn importFd(ctx: ?*anyopaque, fd: i32) ?gpu.Buffer {
+    _ = ctx;
+    if (fd < 201 or fd - 201 >= emu.n_regions) return null;
+    const rg = &emu.regions[@intCast(fd - 201)];
+    if (!rg.live or rg.cpu.len == 0) return null;
+    Fake.imports += 1;
+    return emu.device().import(rg.cpu);
+}
+fn fenceFd(ctx: ?*anyopaque) i64 {
+    _ = ctx;
+    Fake.fence_fds += 1;
+    return 400 + @as(i64, Fake.fence_fds);
+}
 fn closeFd(ctx: ?*anyopaque, fd: i32) void {
     _ = ctx;
-    _ = fd;
-    Fake.closes += 1;
+    Fake.last_closed = fd;
+    if (fd == Fake.TABLE_FD) Fake.table_closes += 1 else Fake.closes += 1;
 }
+fn dupFd(ctx: ?*anyopaque, fd: i32) i32 {
+    _ = ctx;
+    return fd + 1000;
+}
+fn pollFd(ctx: ?*anyopaque, fd: i32, ms: i32) i32 {
+    _ = .{ ctx, fd, ms };
+    return @intFromBool(Fake.fence_signaled);
+}
+fn mapFd(ctx: ?*anyopaque, fd: i32, size: usize) ?[]const u8 {
+    _ = ctx;
+    if (fd != Fake.TABLE_FD or size > Fake.table.len) return null;
+    Fake.maps += 1;
+    return Fake.table[0..size];
+}
+fn unmapFd(ctx: ?*anyopaque, s: []const u8) void {
+    _ = .{ ctx, s };
+    Fake.unmaps += 1;
+}
+const host = gfxapi.host.Host{ .exportFd = exportFd, .importFd = importFd, .fenceFd = fenceFd, .close = closeFd, .dup = dupFd, .poll = pollFd, .map = mapFd, .unmap = unmapFd };
 fn client() ?*const wl.Client {
     return &Fake.client;
 }
 
 fn useDriver() void {
-    egl.setDriver(.{ .open = open, .exporter = .{ .exportFd = exportFd, .close = closeFd }, .wayland = client });
+    egl.setDriver(.{ .open = open, .host = host, .wayland = client });
 }
 
 fn pixel(img: *engine.Image, x: u32, row: u32) [4]u8 {
@@ -373,8 +468,14 @@ test "egl: a Wayland window's frames go to the compositor as dma-bufs" {
     // (eglGetDisplay of the same wl_display: the same display)
     try std.testing.expectEqual(d, egl.getDisplay(native_display).?);
     try std.testing.expect(egl.initialize(d, null, null));
-    try std.testing.expectEqual(@as(u32, 3), Fake.bound_version);
+    // (version 4: the formats from the feedback's table, mapped, its fd
+    // closed, the table let go and the feedback destroyed after)
+    try std.testing.expectEqual(@as(u32, 4), Fake.bound_version);
     try std.testing.expect(d.wl.argb and d.wl.xrgb);
+    try std.testing.expectEqual(@as(u32, 1), Fake.feedbacks);
+    try std.testing.expectEqual(@as(u32, 1), Fake.maps);
+    try std.testing.expectEqual(@as(u32, 1), Fake.unmaps);
+    try std.testing.expectEqual(@as(u32, 1), Fake.table_closes);
     const ctx = egl.createContext(d, config(true), null, &[_]i32{ egl.CONTEXT_MAJOR_VERSION, 3, egl.NONE }).?;
     const s = egl.createWindowSurface(i32, d, config(true), &window, null).?;
     try std.testing.expect(window.driver_private != null);
@@ -563,4 +664,194 @@ test "egl: configs, contexts, current, syncs and their errors" {
     try std.testing.expect(egl.terminate(d));
     try std.testing.expect(egl.queryString(d, egl.VENDOR) == null);
     try std.testing.expectEqual(egl.NOT_INITIALIZED, egl.getError());
+}
+
+test "egl: a version 3 compositor tells its formats by modifier events" {
+    useDriver();
+    world(8, 8);
+    Fake.offered_version = 3;
+    const d = egl.getPlatformDisplay(egl.PLATFORM_WAYLAND_KHR, native_display).?;
+    try std.testing.expect(egl.initialize(d, null, null));
+    try std.testing.expectEqual(@as(u32, 3), Fake.bound_version);
+    try std.testing.expect(d.wl.argb and d.wl.xrgb);
+    try std.testing.expectEqual(@as(u32, 0), Fake.feedbacks);
+    try std.testing.expect(egl.terminate(d));
+}
+
+fn liveRegions() usize {
+    var n: usize = 0;
+    for (emu.regions[0..emu.n_regions]) |rg| n += @intFromBool(rg.live);
+    return n;
+}
+
+fn rgbaAt(c: *gfxapi.gles.Context, x: i32, y: i32) [4]u8 {
+    var px: [4]u8 = undefined;
+    c.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, &px);
+    return px;
+}
+
+test "egl: a dma-buf as an EGLImage: a texture, an external texture, a renderbuffer, shared and freed with its last name" {
+    useDriver();
+    Fake.reset();
+    const d = egl.getDisplay(null).?;
+    try std.testing.expect(egl.initialize(d, null, null));
+    const ctx = egl.createContext(d, config(true), null, &[_]i32{ egl.CONTEXT_MAJOR_VERSION, 3, egl.NONE }).?;
+    const pb = egl.createPbufferSurface(d, config(true), &[_]i32{ egl.WIDTH, 4, egl.HEIGHT, 4, egl.NONE }).?;
+    try std.testing.expect(egl.makeCurrent(d, pb, pb, ctx));
+    const c = thread.gl().?;
+    // another program's picture: 16 x 8 BGRA (ARGB8888), a pattern
+    var prod = eng.newImage(16, 8, .bgra8).?;
+    var src: [16 * 8 * 4]u8 = undefined;
+    for (&src, 0..) |*p, i| p.* = @truncate(i * 5 + 1);
+    eng.write(&prod, 0, 0, 16, 8, &src, 64, .bgra8);
+    const fd: i32 = @intCast(exportFd(null, prod.buf));
+    const base = liveRegions();
+    const argb: i32 = @bitCast(wl.DRM_FORMAT_ARGB8888);
+    const attribs = [_]i32{ egl.WIDTH, 16, egl.HEIGHT, 8, egl.LINUX_DRM_FOURCC_EXT, argb, egl.DMA_BUF_PLANE0_FD_EXT, fd, egl.DMA_BUF_PLANE0_OFFSET_EXT, 0, egl.DMA_BUF_PLANE0_PITCH_EXT, 64, egl.DMA_BUF_PLANE0_MODIFIER_LO_EXT, 0, egl.DMA_BUF_PLANE0_MODIFIER_HI_EXT, 0, egl.NONE };
+    const img = egl.createImage(i32, d, null, egl.LINUX_DMA_BUF_EXT, null, &attribs).?;
+    try std.testing.expectEqual(@as(u32, 1), Fake.imports);
+    try std.testing.expectEqual(base + 1, liveRegions());
+
+    // as a texture, in a framebuffer object: read, then drawn on the GPU
+    var tex: [2]u32 = undefined;
+    c.genTextures(&tex);
+    c.bindTexture(gl.TEXTURE_2D, tex[0]);
+    c.eglImageTargetTexture2D(gl.TEXTURE_2D, img);
+    try std.testing.expectEqual(gl.NO_ERROR, c.getError());
+    var fb: [1]u32 = undefined;
+    c.genFramebuffers(&fb);
+    c.bindFramebuffer(gl.FRAMEBUFFER, fb[0]);
+    c.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex[0], 0);
+    try std.testing.expectEqual(gl.FRAMEBUFFER_COMPLETE, c.checkFramebufferStatus(gl.FRAMEBUFFER));
+    // (GL row 2 is the buffer's row 2: B, G, R, A in memory, read as RGBA)
+    const at = (2 * 16 + 3) * 4;
+    try std.testing.expectEqual([4]u8{ src[at + 2], src[at + 1], src[at], src[at + 3] }, rgbaAt(c, 3, 2));
+    c.enable(gl.SCISSOR_TEST, true);
+    c.scissorSet(0, 0, 4, 4);
+    c.clearColor(0, 1, 0, 1);
+    c.clear(gl.COLOR_BUFFER_BIT);
+    c.enable(gl.SCISSOR_TEST, false);
+    try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, rgbaAt(c, 1, 1));
+    // the producer's memory is the same pages: what the GPU wrote, once
+    // fetched for the CPU (pixel 1, 1: the one read), is in it
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, prod.buf.cpu[(1 * 16 + 1) * 4 ..][0..4]);
+
+    // the handle goes; the texture keeps the memory
+    try std.testing.expect(egl.destroyImage(d, img));
+    try std.testing.expectEqual(base + 1, liveRegions());
+    try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, rgbaAt(c, 2, 3));
+    c.bindTexture(gl.TEXTURE_EXTERNAL_OES, tex[1]);
+    c.eglImageTargetTexture2D(gl.TEXTURE_EXTERNAL_OES, img);
+    try std.testing.expectEqual(gl.INVALID_VALUE, c.getError()); // (a handle destroyed)
+
+    // a second image of it: an external texture, a renderbuffer
+    const img2 = egl.createImage(isize, d, null, egl.LINUX_DMA_BUF_EXT, null, &[_]isize{ egl.WIDTH, 16, egl.HEIGHT, 8, egl.LINUX_DRM_FOURCC_EXT, argb, egl.DMA_BUF_PLANE0_FD_EXT, fd, egl.DMA_BUF_PLANE0_OFFSET_EXT, 0, egl.DMA_BUF_PLANE0_PITCH_EXT, 64, egl.NONE }).?;
+    c.eglImageTargetTexture2D(gl.TEXTURE_EXTERNAL_OES, img2);
+    try std.testing.expectEqual(gl.NO_ERROR, c.getError());
+    var ib: [1]i32 = undefined;
+    c.getIntegers(gl.TEXTURE_BINDING_EXTERNAL_OES, &ib);
+    try std.testing.expectEqual(@as(i32, @intCast(tex[1])), ib[0]);
+    c.texImage2D(gl.TEXTURE_EXTERNAL_OES, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(gl.INVALID_ENUM, c.getError());
+    c.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex[1], 0);
+    try std.testing.expectEqual(gl.INVALID_OPERATION, c.getError());
+    var rb: [1]u32 = undefined;
+    c.genRenderbuffers(&rb);
+    c.bindRenderbuffer(gl.RENDERBUFFER, rb[0]);
+    c.eglImageTargetRenderbufferStorage(gl.RENDERBUFFER, img2);
+    c.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, rb[0]);
+    try std.testing.expectEqual(gl.FRAMEBUFFER_COMPLETE, c.checkFramebufferStatus(gl.FRAMEBUFFER));
+    c.clearColor(1, 0, 0, 1);
+    c.clear(gl.COLOR_BUFFER_BIT);
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, rgbaAt(c, 15, 7));
+    try std.testing.expectEqual(gl.NO_ERROR, c.getError());
+
+    // every name gone: both imports freed
+    try std.testing.expectEqual(base + 2, liveRegions());
+    c.deleteFramebuffers(&fb);
+    c.deleteRenderbuffers(&rb);
+    c.deleteTextures(&tex);
+    try std.testing.expectEqual(base + 1, liveRegions()); // (img2's handle holds it yet)
+    try std.testing.expect(egl.destroyImage(d, img2));
+    c.finish();
+    try std.testing.expectEqual(base, liveRegions());
+
+    // what EGL refuses
+    const Bad = struct {
+        fn image(dd: *egl.Display, list: []const i32) ?*egl.EImage {
+            return egl.createImage(i32, dd, null, egl.LINUX_DMA_BUF_EXT, null, list.ptr);
+        }
+    };
+    try std.testing.expect(egl.createImage(i32, d, ctx, egl.LINUX_DMA_BUF_EXT, null, &attribs) == null);
+    try std.testing.expectEqual(egl.BAD_PARAMETER, egl.getError());
+    try std.testing.expect(Bad.image(d, &.{ egl.WIDTH, 16, egl.HEIGHT, 8, egl.LINUX_DRM_FOURCC_EXT, argb, egl.DMA_BUF_PLANE0_OFFSET_EXT, 0, egl.DMA_BUF_PLANE0_PITCH_EXT, 64, egl.NONE }) == null);
+    try std.testing.expectEqual(egl.BAD_PARAMETER, egl.getError()); // (no fd)
+    try std.testing.expect(Bad.image(d, &.{ egl.WIDTH, 16, egl.HEIGHT, 8, egl.LINUX_DRM_FOURCC_EXT, 0x3231_564e, egl.DMA_BUF_PLANE0_FD_EXT, fd, egl.DMA_BUF_PLANE0_OFFSET_EXT, 0, egl.DMA_BUF_PLANE0_PITCH_EXT, 64, egl.NONE }) == null);
+    try std.testing.expectEqual(egl.BAD_MATCH, egl.getError()); // (NV12)
+    try std.testing.expect(Bad.image(d, &.{ egl.WIDTH, 16, egl.HEIGHT, 8, egl.LINUX_DRM_FOURCC_EXT, argb, egl.DMA_BUF_PLANE0_FD_EXT, fd, egl.DMA_BUF_PLANE0_OFFSET_EXT, 0, egl.DMA_BUF_PLANE0_PITCH_EXT, 64, egl.DMA_BUF_PLANE0_MODIFIER_LO_EXT, 1, egl.DMA_BUF_PLANE0_MODIFIER_HI_EXT, 0x0100_0000, egl.NONE }) == null);
+    try std.testing.expectEqual(egl.BAD_MATCH, egl.getError()); // (tiled)
+    try std.testing.expect(Bad.image(d, &.{ egl.WIDTH, 16, egl.HEIGHT, 8, egl.LINUX_DRM_FOURCC_EXT, argb, egl.DMA_BUF_PLANE0_FD_EXT, fd, egl.DMA_BUF_PLANE0_OFFSET_EXT, 0, egl.DMA_BUF_PLANE0_PITCH_EXT, 32, egl.NONE }) == null);
+    try std.testing.expectEqual(egl.BAD_ACCESS, egl.getError()); // (rows shorter than the width)
+    try std.testing.expect(Bad.image(d, &.{ egl.WIDTH, 16, egl.HEIGHT, 4000, egl.LINUX_DRM_FOURCC_EXT, argb, egl.DMA_BUF_PLANE0_FD_EXT, fd, egl.DMA_BUF_PLANE0_OFFSET_EXT, 0, egl.DMA_BUF_PLANE0_PITCH_EXT, 64, egl.NONE }) == null);
+    try std.testing.expectEqual(egl.BAD_ACCESS, egl.getError()); // (larger than the buffer)
+    try std.testing.expectEqual(base, liveRegions()); // (its import let go)
+    try std.testing.expect(Bad.image(d, &.{ egl.WIDTH, 16, egl.HEIGHT, 8, egl.LINUX_DRM_FOURCC_EXT, argb, egl.DMA_BUF_PLANE0_FD_EXT, fd, egl.DMA_BUF_PLANE0_OFFSET_EXT, 0, egl.DMA_BUF_PLANE0_PITCH_EXT, 64, 0x3275, fd, egl.NONE }) == null);
+    try std.testing.expectEqual(egl.BAD_ATTRIBUTE, egl.getError()); // (a second plane)
+
+    // the formats and modifiers it takes
+    var formats: [8]i32 = undefined;
+    var n: i32 = 0;
+    try std.testing.expect(egl.queryDmaBufFormats(d, 8, &formats, &n));
+    try std.testing.expectEqual(@as(i32, 4), n);
+    var mods: [4]u64 = undefined;
+    var ext: [4]u32 = undefined;
+    try std.testing.expect(egl.queryDmaBufModifiers(d, argb, 4, &mods, &ext, &n));
+    try std.testing.expectEqual(@as(i32, 1), n);
+    try std.testing.expectEqual(@as(u64, 0), mods[0]);
+    try std.testing.expectEqual(egl.FALSE, ext[0]);
+    try std.testing.expect(!egl.queryDmaBufModifiers(d, 0x3231_564e, 4, &mods, &ext, &n));
+
+    eng.freeImage(&prod);
+    try std.testing.expect(egl.makeCurrent(d, null, null, null));
+    try std.testing.expect(egl.destroySurface(d, pb));
+    try std.testing.expect(egl.destroyContext(d, ctx));
+    try std.testing.expect(egl.terminate(d));
+}
+
+test "egl: native fences: one of the GPU's work handed out, one handed in" {
+    useDriver();
+    Fake.reset();
+    const d = egl.getDisplay(null).?;
+    try std.testing.expect(egl.initialize(d, null, null));
+    const ctx = egl.createContext(d, null, null, &[_]i32{ egl.CONTEXT_MAJOR_VERSION, 3, egl.NONE }).?;
+    try std.testing.expect(egl.makeCurrent(d, null, null, ctx));
+    // out: a sync_file of the work so far, each dup a new one
+    const out = egl.createSync(i32, d, egl.SYNC_NATIVE_FENCE_ANDROID, null).?;
+    try std.testing.expectEqual(@as(i32, 401), egl.dupNativeFenceFd(d, out));
+    try std.testing.expectEqual(@as(i32, 402), egl.dupNativeFenceFd(d, out));
+    try std.testing.expectEqual(@as(i32, @intCast(egl.SYNC_NATIVE_FENCE_ANDROID)), egl.getSyncAttrib(d, out, egl.SYNC_TYPE).?);
+    try std.testing.expectEqual(egl.CONDITION_SATISFIED, egl.clientWaitSync(d, out, 0, egl.FOREVER));
+    try std.testing.expect(egl.destroySync(d, out));
+    // in: a sync_file, owned by the sync, polled, closed with it
+    const in = egl.createSync(isize, d, egl.SYNC_NATIVE_FENCE_ANDROID, &[_]isize{ egl.SYNC_NATIVE_FENCE_FD_ANDROID, 77, egl.NONE }).?;
+    try std.testing.expectEqual(egl.SYNC_NATIVE_FENCE_SIGNALED_ANDROID, egl.getSyncAttrib(d, in, egl.SYNC_CONDITION).?);
+    try std.testing.expectEqual(egl.UNSIGNALED, egl.getSyncAttrib(d, in, egl.SYNC_STATUS).?);
+    try std.testing.expectEqual(egl.TIMEOUT_EXPIRED, egl.clientWaitSync(d, in, 0, 0));
+    Fake.fence_signaled = true;
+    try std.testing.expectEqual(egl.CONDITION_SATISFIED, egl.clientWaitSync(d, in, 0, egl.FOREVER));
+    try std.testing.expectEqual(egl.SIGNALED, egl.getSyncAttrib(d, in, egl.SYNC_STATUS).?);
+    try std.testing.expect(egl.waitSync(d, in, 0));
+    try std.testing.expectEqual(@as(i32, 1077), egl.dupNativeFenceFd(d, in));
+    try std.testing.expect(egl.destroySync(d, in));
+    try std.testing.expectEqual(@as(i32, 77), Fake.last_closed);
+    // a plain fence is no file; a native fd on a plain fence is no attribute
+    const plain = egl.createSync(i32, d, egl.SYNC_FENCE, null).?;
+    try std.testing.expectEqual(egl.NO_NATIVE_FENCE_FD_ANDROID, egl.dupNativeFenceFd(d, plain));
+    try std.testing.expectEqual(egl.BAD_PARAMETER, egl.getError());
+    try std.testing.expect(egl.destroySync(d, plain));
+    try std.testing.expect(egl.createSync(i32, d, egl.SYNC_FENCE, &[_]i32{ egl.SYNC_NATIVE_FENCE_FD_ANDROID, 3, egl.NONE }) == null);
+    try std.testing.expectEqual(egl.BAD_ATTRIBUTE, egl.getError());
+    try std.testing.expect(egl.makeCurrent(d, null, null, null));
+    try std.testing.expect(egl.destroyContext(d, ctx));
+    try std.testing.expect(egl.terminate(d));
 }

@@ -12,8 +12,11 @@
 //! arguments as wl_argument.
 //!
 //! - **The display:** the registry's zwp_linux_dmabuf_v1, bound at version
-//!   3, whose `modifier` events say whether linear ARGB8888 and XRGB8888
-//!   are taken. Galaxy's bridge offers them only while the GPU runs and
+//!   4 where offered (else 3, else what there is). Version 4 tells its
+//!   formats by the default feedback: a format table (a file, mapped) and
+//!   tranches of indices into it. Versions 3 and below tell them by
+//!   `modifier` (or `format`) events. EGL wants linear ARGB8888 and
+//!   XRGB8888. Galaxy's bridge offers them only while the GPU runs and
 //!   this driver is installed; without them EGL has no Wayland display,
 //!   and the app draws in software.
 //! - **A window** (libwayland-egl's wl_egl_window, version 3): up to
@@ -38,6 +41,7 @@ const std = @import("std");
 const gpu = @import("gpu");
 const engine = @import("engine.sig");
 const dl = @import("dl.sig");
+const Host = @import("host.sig").Host;
 const Engine = engine.Engine;
 const Image = engine.Image;
 
@@ -220,6 +224,8 @@ const SURFACE_OFFSET = 10;
 const BUFFER_DESTROY = 0;
 const DMABUF_DESTROY = 0;
 const DMABUF_CREATE_PARAMS = 1;
+const DMABUF_GET_DEFAULT_FEEDBACK = 2;
+const FEEDBACK_DESTROY = 0;
 const PARAMS_DESTROY = 0;
 const PARAMS_ADD = 1;
 const PARAMS_CREATE_IMMED = 3;
@@ -228,6 +234,7 @@ const PARAMS_CREATE_IMMED = 3;
 
 pub const Display = struct {
     c: *const Client,
+    host: Host,
     native: *Proxy,
     queue: ?*Queue = null,
     wrapper: ?*Proxy = null,
@@ -238,12 +245,14 @@ pub const Display = struct {
     /// linear ARGB8888 and XRGB8888 are taken
     argb: bool = false,
     xrgb: bool = false,
+    /// version 4's feedback: its format table, mapped, while it is read
+    table: ?[]const u8 = null,
 
     /// The display in place (it stays at `d`: events find it there): its
     /// queue, the registry, zwp_linux_dmabuf_v1 and its formats. False
     /// when the compositor takes no linear ARGB or XRGB dma-bufs.
-    pub fn init(d: *Display, c: *const Client, native: *Proxy) bool {
-        d.* = .{ .c = c, .native = native };
+    pub fn init(d: *Display, c: *const Client, host: Host, native: *Proxy) bool {
+        d.* = .{ .c = c, .host = host, .native = native };
         linkProtocol(c);
         d.queue = c.create_queue(native) orelse return false;
         d.wrapper = c.create_wrapper(native) orelse return d.fail();
@@ -252,11 +261,16 @@ pub const Display = struct {
         d.registry = c.send(d.wrapper.?, DISPLAY_GET_REGISTRY, c.registry_interface, null, 0, &none) orelse return d.fail();
         _ = c.add_dispatcher(d.registry.?, &onRegistry, d, null);
         if (c.roundtrip_queue(native, d.queue.?) < 0 or d.dmabuf_name == 0) return d.fail();
-        const v = @min(d.dmabuf_version, 3);
+        const v = @min(d.dmabuf_version, 4);
         var bind = [_]Arg{ .{ .u = d.dmabuf_name }, .{ .s = dmabuf_interface.name }, .{ .u = v }, .{ .o = null } };
         d.dmabuf = c.send(d.registry.?, REGISTRY_BIND, &dmabuf_interface, v, 0, &bind) orelse return d.fail();
         _ = c.add_dispatcher(d.dmabuf.?, &onDmabuf, d, null);
-        if (c.roundtrip_queue(native, d.queue.?) < 0) return d.fail();
+        const feedback = if (v >= 4) c.send(d.dmabuf.?, DMABUF_GET_DEFAULT_FEEDBACK, &feedback_interface, null, 0, &none) else null;
+        if (feedback) |f| _ = c.add_dispatcher(f, &onFeedback, d, null);
+        const ok = c.roundtrip_queue(native, d.queue.?) >= 0;
+        if (feedback) |f| _ = c.send(f, FEEDBACK_DESTROY, null, null, DESTROY, &none);
+        d.dropTable();
+        if (!ok) return d.fail();
         // (version 1 and 2 servers say formats only: linear was the rule)
         if (!d.argb and !d.xrgb) return d.fail();
         return true;
@@ -265,6 +279,19 @@ pub const Display = struct {
     fn fail(d: *Display) bool {
         d.deinit();
         return false;
+    }
+
+    fn dropTable(d: *Display) void {
+        if (d.table) |t| d.host.unmap(d.host.ctx, t);
+        d.table = null;
+    }
+
+    /// A format and modifier from the table (version 4's): taken if linear
+    /// ARGB8888 or XRGB8888.
+    fn offered(d: *Display, format: u32, modifier: u64) void {
+        if (modifier != MOD_LINEAR) return;
+        if (format == DRM_FORMAT_ARGB8888) d.argb = true;
+        if (format == DRM_FORMAT_XRGB8888) d.xrgb = true;
     }
 
     pub fn deinit(d: *Display) void {
@@ -325,6 +352,36 @@ fn onRegistry(impl: ?*const anyopaque, target: ?*anyopaque, opcode: u32, msg: ?*
     return 0;
 }
 
+/// zwp_linux_dmabuf_feedback_v1 (the default one): format_table maps the
+/// table (its fd closed), tranche_formats names entries of it. The devices
+/// and flags do not change what EGL makes: linear buffers, any device.
+fn onFeedback(impl: ?*const anyopaque, target: ?*anyopaque, opcode: u32, msg: ?*const Message, args: [*]Arg) callconv(.c) c_int {
+    _ = target;
+    _ = msg;
+    const d = selfOf(Display, impl);
+    switch (opcode) {
+        1 => { // format_table(fd, size)
+            const fd = args[0].h;
+            d.dropTable();
+            d.table = d.host.map(d.host.ctx, fd, args[1].u);
+            d.host.close(d.host.ctx, fd);
+        },
+        5 => { // tranche_formats(array of u16 indices)
+            const t = d.table orelse return 0;
+            const a = args[0].a orelse return 0;
+            const data = a.data orelse return 0;
+            const idx: [*]const u16 = @ptrCast(@alignCast(data));
+            for (idx[0 .. a.size / 2]) |i| {
+                const at = @as(usize, i) * 16;
+                if (at + 16 > t.len) continue;
+                d.offered(std.mem.readInt(u32, t[at..][0..4], .little), std.mem.readInt(u64, t[at + 8 ..][0..8], .little));
+            }
+        },
+        else => {},
+    }
+    return 0;
+}
+
 fn onDmabuf(impl: ?*const anyopaque, target: ?*anyopaque, opcode: u32, msg: ?*const Message, args: [*]Arg) callconv(.c) c_int {
     _ = target;
     _ = msg;
@@ -359,13 +416,6 @@ pub const EglWindow = extern struct {
 };
 pub const EGL_WINDOW_VERSION = 3;
 
-/// A buffer of GPU memory as a dma-buf fd, and an fd closed.
-pub const Exporter = struct {
-    ctx: ?*anyopaque = null,
-    exportFd: *const fn (?*anyopaque, gpu.Buffer) i64,
-    close: *const fn (?*anyopaque, i32) void,
-};
-
 pub const MAX_BUFFERS = 4;
 
 pub const Buffer = struct {
@@ -384,7 +434,6 @@ pub const Buffer = struct {
 pub const Window = struct {
     d: *Display,
     eng: *Engine,
-    ex: Exporter,
     native: ?*EglWindow,
     surface: ?*Proxy = null,
     alpha: bool,
@@ -405,10 +454,10 @@ pub const Window = struct {
     /// A window in place over `native` (it stays at `w`: libwayland-egl
     /// and events find it there). False for an old wl_egl_window, one
     /// without a surface, or a format the compositor does not take.
-    pub fn init(w: *Window, d: *Display, eng: *Engine, ex: Exporter, native: *EglWindow, alpha: bool) bool {
+    pub fn init(w: *Window, d: *Display, eng: *Engine, native: *EglWindow, alpha: bool) bool {
         if (native.version < EGL_WINDOW_VERSION or native.surface == null) return false;
         if (!d.takes(alpha)) return false;
-        w.* = .{ .d = d, .eng = eng, .ex = ex, .native = native, .alpha = alpha };
+        w.* = .{ .d = d, .eng = eng, .native = native, .alpha = alpha };
         w.surface = d.c.create_wrapper(native.surface.?) orelse return false;
         d.c.set_queue(w.surface.?, d.queue);
         native.driver_private = w;
@@ -500,12 +549,13 @@ pub const Window = struct {
         img.top_down = true;
         img.no_alpha = !w.alpha;
         b.img = img;
-        const fd = w.ex.exportFd(w.ex.ctx, img.buf);
+        const host = w.d.host;
+        const fd = host.exportFd(host.ctx, img.buf);
         if (fd < 0) {
             w.eng.freeImage(&b.img);
             return false;
         }
-        defer w.ex.close(w.ex.ctx, @intCast(fd));
+        defer host.close(host.ctx, @intCast(fd));
         const c = w.d.c;
         var none = [_]Arg{.{ .o = null }};
         const params = c.send(w.d.dmabuf.?, DMABUF_CREATE_PARAMS, &params_interface, null, 0, &none) orelse {

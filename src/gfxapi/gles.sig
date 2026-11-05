@@ -9,8 +9,10 @@
 //! color attachments, draw and read buffers and ES 3.0's completeness;
 //! glClear and glClearBuffer*, glReadPixels (pack buffers too),
 //! glTexImage2D, glTexSubImage2D, glTexStorage2D (unpack buffers too),
-//! glCopyTexSubImage2D, glCopyTexImage2D. Draws, shaders, vertex arrays,
-//! samplers, queries and sync objects come with the rasterizer.
+//! glCopyTexSubImage2D, glCopyTexImage2D; EGLImages as textures and
+//! renderbuffers (OES_EGL_image, OES_EGL_image_external: the memory is
+//! the image's, shared). Draws, shaders, vertex arrays, samplers, queries
+//! and sync objects come with the rasterizer.
 //!
 //! Objects (textures, buffers, renderbuffers) live in an Objects table a
 //! share group's contexts hold; framebuffers are each context's. A name is
@@ -48,7 +50,13 @@ pub const GLSL_STRING: [:0]const u8 = "OpenGL ES GLSL ES 3.00";
 pub const EXTENSIONS = [_][:0]const u8{
     "GL_EXT_read_format_bgra",
     "GL_EXT_texture_format_BGRA8888",
+    "GL_OES_EGL_image",
+    "GL_OES_EGL_image_external",
 };
+
+/// EGL's EGLImage handles to their images (egl.sig sets it): what
+/// glEGLImageTargetTexture2DOES takes.
+pub var egl_image: ?*const fn (?*anyopaque) ?*Image = null;
 pub const EXTENSIONS_STRING: [:0]const u8 = blk: {
     var s: [:0]const u8 = "";
     for (EXTENSIONS, 0..) |e, i| s = s ++ (if (i == 0) "" else " ") ++ e;
@@ -360,8 +368,11 @@ pub const Context = struct {
     enabled: u32 = 1 << 3, // (DITHER is on at first)
     unit: u32 = 0,
     tex2d: [MAX_UNITS]u32 = [_]u32{0} ** MAX_UNITS,
-    /// texture 0 of TEXTURE_2D (each context has its own)
+    tex_ext: [MAX_UNITS]u32 = [_]u32{0} ** MAX_UNITS,
+    /// texture 0 of TEXTURE_2D and of TEXTURE_EXTERNAL_OES (each context
+    /// has its own)
     default_tex: Tex = .{ .named = true, .made = true, .target = g.TEXTURE_2D },
+    default_ext: Tex = .{ .named = true, .made = true, .target = g.TEXTURE_EXTERNAL_OES, .params = .{ .min = g.LINEAR, .wrap_s = g.CLAMP_TO_EDGE, .wrap_t = g.CLAMP_TO_EDGE, .wrap_r = g.CLAMP_TO_EDGE } },
     bufs: BufBinds = .{},
     pack: Store = .{},
     unpack: Store = .{},
@@ -392,6 +403,7 @@ pub const Context = struct {
             if (f.made) c.detachAll(f);
         }
         c.eng.freeImage(&c.default_tex.img);
+        c.eng.freeImage(&c.default_ext.img);
         c.objs.users -= 1;
         if (c.objs.users == 0) c.objs.release(c.eng);
     }
@@ -611,6 +623,8 @@ pub const Context = struct {
             g.READ_FRAMEBUFFER_BINDING => int(c.read_fb),
             g.RENDERBUFFER_BINDING => int(c.rb),
             g.TEXTURE_BINDING_2D => int(c.tex2d[c.unit]),
+            g.TEXTURE_BINDING_EXTERNAL_OES => int(c.tex_ext[c.unit]),
+            g.REQUIRED_TEXTURE_IMAGE_UNITS_OES => int(1),
             g.ACTIVE_TEXTURE => int(g.TEXTURE0 + c.unit),
             g.ARRAY_BUFFER_BINDING => int(c.bufs.array),
             g.ELEMENT_ARRAY_BUFFER_BINDING => int(c.bufs.element),
@@ -955,25 +969,68 @@ pub const Context = struct {
     }
 
     pub fn bindTexture(c: *Context, target: u32, name: u32) void {
-        if (target != g.TEXTURE_2D) return c.fail(g.INVALID_ENUM);
+        if (target != g.TEXTURE_2D and target != g.TEXTURE_EXTERNAL_OES) return c.fail(g.INVALID_ENUM);
         if (name != 0) {
             const t = slotIn(Tex, &c.objs.tex, name) orelse return c.fail(g.OUT_OF_MEMORY);
             if (t.made and t.target != target) return c.fail(g.INVALID_OPERATION);
+            const fresh = !t.made;
             const m = makeIn(Tex, &c.objs.tex, name) orelse return c.fail(g.OUT_OF_MEMORY);
             m.target = target;
+            // (an external texture's defaults: linear, clamped)
+            if (fresh and target == g.TEXTURE_EXTERNAL_OES) m.params = c.default_ext.params;
         }
-        c.tex2d[c.unit] = name;
+        if (target == g.TEXTURE_2D) c.tex2d[c.unit] = name else c.tex_ext[c.unit] = name;
     }
 
-    /// The texture bound to `target` on the active unit.
+    /// The texture bound to `target` (TEXTURE_2D or TEXTURE_EXTERNAL_OES)
+    /// on the active unit.
     fn boundTex(c: *Context, target: u32) ?*Tex {
+        const name = switch (target) {
+            g.TEXTURE_2D => c.tex2d[c.unit],
+            g.TEXTURE_EXTERNAL_OES => c.tex_ext[c.unit],
+            else => {
+                c.fail(g.INVALID_ENUM);
+                return null;
+            },
+        };
+        if (name == 0) return if (target == g.TEXTURE_2D) &c.default_tex else &c.default_ext;
+        return madeIn(Tex, &c.objs.tex, name);
+    }
+
+    /// boundTex for what only a 2D texture takes (an external texture's
+    /// storage is an EGLImage's).
+    fn boundTex2D(c: *Context, target: u32) ?*Tex {
         if (target != g.TEXTURE_2D) {
             c.fail(g.INVALID_ENUM);
             return null;
         }
-        const name = c.tex2d[c.unit];
-        if (name == 0) return &c.default_tex;
-        return madeIn(Tex, &c.objs.tex, name);
+        return c.boundTex(target);
+    }
+
+    /// glEGLImageTargetTexture2DOES: the bound texture's storage becomes
+    /// the EGLImage's (shared: drawn into, read, by either).
+    pub fn eglImageTargetTexture2D(c: *Context, target: u32, image: ?*anyopaque) void {
+        if (target != g.TEXTURE_2D and target != g.TEXTURE_EXTERNAL_OES) return c.fail(g.INVALID_ENUM);
+        const t = c.boundTex(target) orelse return;
+        const resolve = egl_image orelse return c.fail(g.INVALID_OPERATION);
+        const src = resolve(image) orelse return c.fail(g.INVALID_VALUE);
+        if (t.immutable) return c.fail(g.INVALID_OPERATION);
+        c.eng.freeImage(&t.img);
+        t.img = engine.alias(src);
+        t.internal = if (src.format == .bgra8) g.BGRA8_EXT else g.RGBA8;
+        t.levels = 1;
+    }
+
+    /// glEGLImageTargetRenderbufferStorageOES.
+    pub fn eglImageTargetRenderbufferStorage(c: *Context, target: u32, image: ?*anyopaque) void {
+        if (target != g.RENDERBUFFER) return c.fail(g.INVALID_ENUM);
+        const rb = madeIn(Rb, &c.objs.rbs, c.rb) orelse return c.fail(g.INVALID_OPERATION);
+        const resolve = egl_image orelse return c.fail(g.INVALID_OPERATION);
+        const src = resolve(image) orelse return c.fail(g.INVALID_VALUE);
+        c.eng.freeImage(&rb.img);
+        rb.img = engine.alias(src);
+        rb.internal = if (src.format == .bgra8) g.BGRA8_EXT else g.RGBA8;
+        rb.samples = 0;
     }
 
     pub fn deleteTextures(c: *Context, names: []const u32) void {
@@ -983,6 +1040,9 @@ pub const Context = struct {
                 continue;
             };
             for (&c.tex2d) |*b| {
+                if (b.* == name) b.* = 0;
+            }
+            for (&c.tex_ext) |*b| {
                 if (b.* == name) b.* = 0;
             }
             // (detached from the framebuffers bound here, as GL says)
@@ -1042,7 +1102,7 @@ pub const Context = struct {
     }
 
     pub fn texImage2D(c: *Context, target: u32, level: i32, internal: i32, w: i32, h: i32, border: i32, format: u32, ty: u32, pixels: ?*const anyopaque) void {
-        const t = c.boundTex(target) orelse return;
+        const t = c.boundTex2D(target) orelse return;
         if (level < 0 or w < 0 or h < 0 or w > MAX_SIZE or h > MAX_SIZE or border != 0) return c.fail(g.INVALID_VALUE);
         // (level 0 only, for now: mipmaps come with sampling)
         if (level > 0) return c.fail(g.INVALID_VALUE);
@@ -1066,7 +1126,7 @@ pub const Context = struct {
     }
 
     pub fn texSubImage2D(c: *Context, target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, pixels: ?*const anyopaque) void {
-        const t = c.boundTex(target) orelse return;
+        const t = c.boundTex2D(target) orelse return;
         if (level != 0 or x < 0 or y < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
         const fmt = switch (clientFormat(format, ty)) {
             .ok => |f| f,
@@ -1080,7 +1140,7 @@ pub const Context = struct {
     }
 
     pub fn texStorage2D(c: *Context, target: u32, levels: i32, internal: u32, w: i32, h: i32) void {
-        const t = c.boundTex(target) orelse return;
+        const t = c.boundTex2D(target) orelse return;
         if (levels < 1 or w < 1 or h < 1 or w > MAX_SIZE or h > MAX_SIZE) return c.fail(g.INVALID_VALUE);
         const fmt: Format = switch (internal) {
             g.RGBA8 => .rgba8,
@@ -1103,9 +1163,11 @@ pub const Context = struct {
             g.NEAREST, g.LINEAR, g.NEAREST_MIPMAP_NEAREST, g.LINEAR_MIPMAP_NEAREST, g.NEAREST_MIPMAP_LINEAR, g.LINEAR_MIPMAP_LINEAR => true,
             else => false,
         };
-        const wrap = p == g.REPEAT or p == g.CLAMP_TO_EDGE or p == g.MIRRORED_REPEAT;
+        // (an external texture filters without mipmaps and clamps)
+        const ext = t.target == g.TEXTURE_EXTERNAL_OES;
+        const wrap = p == g.CLAMP_TO_EDGE or (!ext and (p == g.REPEAT or p == g.MIRRORED_REPEAT));
         switch (pname) {
-            g.TEXTURE_MIN_FILTER => if (filter_min) {
+            g.TEXTURE_MIN_FILTER => if (filter_min and (!ext or p == g.NEAREST or p == g.LINEAR)) {
                 t.params.min = p;
             } else c.fail(g.INVALID_ENUM),
             g.TEXTURE_MAG_FILTER => if (p == g.NEAREST or p == g.LINEAR) {
@@ -1176,7 +1238,7 @@ pub const Context = struct {
     }
 
     pub fn copyTexSubImage2D(c: *Context, target: u32, level: i32, dx: i32, dy: i32, x: i32, y: i32, w: i32, h: i32) void {
-        const t = c.boundTex(target) orelse return;
+        const t = c.boundTex2D(target) orelse return;
         if (level != 0 or dx < 0 or dy < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
         if (@as(i64, dx) + w > t.img.width or @as(i64, dy) + h > t.img.height) return c.fail(g.INVALID_VALUE);
         const s = c.readSource() orelse return;
@@ -1186,7 +1248,7 @@ pub const Context = struct {
     }
 
     pub fn copyTexImage2D(c: *Context, target: u32, level: i32, internal: u32, x: i32, y: i32, w: i32, h: i32, border: i32) void {
-        const t = c.boundTex(target) orelse return;
+        const t = c.boundTex2D(target) orelse return;
         if (level != 0 or w < 0 or h < 0 or w > MAX_SIZE or h > MAX_SIZE or border != 0) return c.fail(g.INVALID_VALUE);
         const fmt: Format = switch (internal) {
             g.RGBA, g.RGBA8 => .rgba8,

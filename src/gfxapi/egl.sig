@@ -23,6 +23,14 @@
 //! - **Syncs.** EGL_KHR_fence_sync and EGL 1.5's: a fence is the engine's
 //!   mark (its work flushed), waited for on the CPU. eglWaitSync waits for
 //!   nothing: one in-order GPU ring already orders it.
+//!   EGL_ANDROID_native_fence_sync: a fence of this process's GPU work
+//!   handed out as a sync_file (Galaxy's G_FENCE_FD), or one handed in (a
+//!   sync_file fd, polled; owned and closed with the sync).
+//! - **Images.** EGL_KHR_image_base with EGL_EXT_image_dma_buf_import
+//!   (and _modifiers): a single-plane linear ARGB8888, XRGB8888, ABGR8888
+//!   or XBGR8888 dma-buf, imported into this context (PRIME), as GL's
+//!   textures and renderbuffers (gles: OES_EGL_image) name it, the memory
+//!   shared and freed with its last name.
 //!
 //! EGL's calls take one lock (its tables are the process's); GL calls take
 //! none.
@@ -35,6 +43,7 @@ const engine = @import("engine.sig");
 const gles = @import("gles.sig");
 const thread = @import("thread.sig");
 const wayland = @import("wayland.sig");
+const Host = @import("host.sig").Host;
 const Engine = engine.Engine;
 const Image = engine.Image;
 
@@ -172,16 +181,36 @@ pub const SYNC_FLUSH_COMMANDS_BIT: i32 = 0x0001;
 pub const CONDITION_SATISFIED: i32 = 0x30F6;
 pub const TIMEOUT_EXPIRED: i32 = 0x30F5;
 pub const FOREVER: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+pub const SYNC_NATIVE_FENCE_ANDROID: u32 = 0x3144;
+pub const SYNC_NATIVE_FENCE_FD_ANDROID: i32 = 0x3145;
+pub const SYNC_NATIVE_FENCE_SIGNALED_ANDROID: i32 = 0x3146;
+pub const NO_NATIVE_FENCE_FD_ANDROID: i32 = -1;
+
+// images (EGL_KHR_image_base, EGL_EXT_image_dma_buf_import)
+pub const LINUX_DMA_BUF_EXT: u32 = 0x3270;
+pub const LINUX_DRM_FOURCC_EXT: i32 = 0x3271;
+pub const DMA_BUF_PLANE0_FD_EXT: i32 = 0x3272;
+pub const DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
+pub const DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
+pub const DMA_BUF_PLANE0_MODIFIER_LO_EXT: i32 = 0x3443;
+pub const DMA_BUF_PLANE0_MODIFIER_HI_EXT: i32 = 0x3444;
+pub const IMAGE_PRESERVED_KHR: i32 = 0x30D2;
+/// DRM_FORMAT_MOD_INVALID: no modifier said (the buffer's own layout: linear here)
+const MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+pub const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
+pub const DRM_FORMAT_XBGR8888: u32 = 0x3432_4258;
+pub const dma_buf_formats = [_]u32{ wayland.DRM_FORMAT_ARGB8888, wayland.DRM_FORMAT_XRGB8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888 };
 
 pub const VERSION_STRING: [:0]const u8 = "1.5 Galaxy";
 pub const CLIENT_EXTENSIONS: [:0]const u8 = "EGL_EXT_client_extensions EGL_EXT_platform_base EGL_EXT_platform_wayland EGL_KHR_client_get_all_proc_addresses EGL_KHR_platform_wayland EGL_MESA_platform_surfaceless";
-pub const DISPLAY_EXTENSIONS: [:0]const u8 = "EGL_EXT_buffer_age EGL_EXT_create_context_robustness EGL_EXT_swap_buffers_with_damage EGL_KHR_create_context EGL_KHR_fence_sync EGL_KHR_get_all_proc_addresses EGL_KHR_no_config_context EGL_KHR_surfaceless_context EGL_KHR_swap_buffers_with_damage EGL_KHR_wait_sync";
+pub const DISPLAY_EXTENSIONS: [:0]const u8 = "EGL_ANDROID_native_fence_sync EGL_EXT_buffer_age EGL_EXT_create_context_robustness EGL_EXT_image_dma_buf_import EGL_EXT_image_dma_buf_import_modifiers EGL_EXT_swap_buffers_with_damage EGL_KHR_create_context EGL_KHR_fence_sync EGL_KHR_get_all_proc_addresses EGL_KHR_image_base EGL_KHR_no_config_context EGL_KHR_surfaceless_context EGL_KHR_swap_buffers_with_damage EGL_KHR_wait_sync";
 
 pub const MAX_DISPLAYS = 8;
 pub const MAX_CONTEXTS = 16;
 pub const MAX_SHARE = 4;
 pub const MAX_SURFACES = 32;
 pub const MAX_SYNCS = 64;
+pub const MAX_IMAGES = 64;
 pub const MAX_SIZE = gles.MAX_SIZE;
 
 // ── The driver (the library's root, or a test, gives it) ──────────────────
@@ -190,7 +219,7 @@ pub const Driver = struct {
     /// The GPU's engine, opened at the first eglInitialize (null: no GPU,
     /// or it is lost).
     open: *const fn () ?*Engine,
-    exporter: wayland.Exporter,
+    host: Host,
     /// libwayland-client (null: not in this process).
     wayland: *const fn () ?*const wayland.Client,
 };
@@ -219,6 +248,8 @@ fn fillTables() void {
     for (&contexts) |*c| c.* = .{};
     for (&surfaces) |*s| s.* = .{};
     for (&syncs) |*s| s.* = .{};
+    for (&eimages) |*m| m.* = .{};
+    gles.egl_image = resolveImage;
     tables_ready = true;
 }
 
@@ -523,7 +554,7 @@ pub fn initialize(handle: ?*anyopaque, major: ?*i32, minor: ?*i32) bool {
         if (d.platform == .wayland) {
             const c = drv.wayland() orelse return fail(bool, NOT_INITIALIZED, false);
             if (!c.isDisplay(d.native.?)) return fail(bool, BAD_DISPLAY, false);
-            if (!d.wl.init(c, @ptrCast(d.native.?))) return fail(bool, NOT_INITIALIZED, false);
+            if (!d.wl.init(c, drv.host, @ptrCast(d.native.?))) return fail(bool, NOT_INITIALIZED, false);
             d.client = c;
         }
         d.eng = eng;
@@ -554,7 +585,10 @@ pub fn terminate(handle: ?*anyopaque) bool {
         }
     }
     for (&syncs) |*s| {
-        if (s.used and s.display == d) s.* = .{};
+        if (s.used and s.display == d) dropSync(s);
+    }
+    for (&eimages) |*m| {
+        if (m.alive and m.display == d) dropImage(m);
     }
     d.initialized = false;
     d.terminating = d.platform == .wayland;
@@ -826,7 +860,7 @@ pub fn createWindowSurface(comptime T: type, handle: ?*anyopaque, config: ?*cons
     if (n.driver_private != null) return fail(?*Surface, BAD_ALLOC, null); // (a surface of it already)
     const s = newSurface(d, cfg) orelse return fail(?*Surface, BAD_ALLOC, null);
     s.kind = .window;
-    if (!s.win.init(&d.wl, d.eng.?, driver.?.exporter, n, cfg.alpha)) {
+    if (!s.win.init(&d.wl, d.eng.?, n, cfg.alpha)) {
         s.* = .{};
         return fail(?*Surface, BAD_NATIVE_WINDOW, null);
     }
@@ -1127,8 +1161,23 @@ pub fn swapInterval(handle: ?*anyopaque, interval: i32) bool {
 pub const Sync = struct {
     used: bool = false,
     display: ?*Display = null,
+    native: bool = false,
     mark: u64 = 0,
+    /// a native fence handed in: its sync_file (owned), else -1
+    fd: i32 = -1,
 };
+
+fn dropSync(s: *Sync) void {
+    if (s.fd >= 0) driver.?.host.close(driver.?.host.ctx, s.fd);
+    s.* = .{};
+}
+
+/// A handed-in fence's file readable (signalled) within timeout_ms: 1, 0,
+/// or -errno.
+fn pollFence(fd: i32, timeout_ms: i32) i32 {
+    const h = driver.?.host;
+    return h.poll(h.ctx, fd, timeout_ms);
+}
 
 var syncs: [MAX_SYNCS]Sync = undefined;
 
@@ -1141,22 +1190,53 @@ fn syncOf(handle: ?*anyopaque, d: *Display) ?*Sync {
 }
 
 /// eglCreateSync and eglCreateSyncKHR: EGL_SYNC_FENCE, after the current
-/// context's work (it is flushed).
+/// context's work (it is flushed); EGL_SYNC_NATIVE_FENCE_ANDROID, the same
+/// as a sync_file to hand out, or a sync_file handed in
+/// (EGL_SYNC_NATIVE_FENCE_FD_ANDROID: the sync owns it from now on).
 pub fn createSync(comptime T: type, handle: ?*anyopaque, ty: u32, attribs: ?[*]const T) ?*Sync {
     lock();
     defer unlock();
     const d = ready(handle) orelse return null;
-    if (ty != SYNC_FENCE) return fail(?*Sync, BAD_ATTRIBUTE, null);
+    if (ty != SYNC_FENCE and ty != SYNC_NATIVE_FENCE_ANDROID) return fail(?*Sync, BAD_ATTRIBUTE, null);
+    var fd: i32 = NO_NATIVE_FENCE_FD_ANDROID;
     if (attribs) |list| {
-        if (list[0] != NONE) return fail(?*Sync, BAD_ATTRIBUTE, null);
+        var i: usize = 0;
+        while (list[i] != NONE) : (i += 2) {
+            if (ty == SYNC_NATIVE_FENCE_ANDROID and list[i] == SYNC_NATIVE_FENCE_FD_ANDROID) {
+                fd = @intCast(list[i + 1]);
+            } else return fail(?*Sync, BAD_ATTRIBUTE, null);
+        }
     }
     const t = thread.get() orelse return fail(?*Sync, BAD_MATCH, null);
     if (t.display != @as(?*anyopaque, d) or t.context == null) return fail(?*Sync, BAD_MATCH, null);
     const s = for (&syncs) |*x| {
         if (!x.used) break x;
     } else return fail(?*Sync, BAD_ALLOC, null);
-    s.* = .{ .used = true, .display = d, .mark = d.eng.?.mark() };
+    if (fd >= 0) {
+        s.* = .{ .used = true, .display = d, .native = true, .fd = fd };
+    } else {
+        s.* = .{ .used = true, .display = d, .native = ty == SYNC_NATIVE_FENCE_ANDROID, .mark = d.eng.?.mark() };
+    }
     return ok(?*Sync, s);
+}
+
+/// eglDupNativeFenceFDANDROID: a new sync_file of a native fence, or
+/// EGL_NO_NATIVE_FENCE_FD_ANDROID.
+pub fn dupNativeFenceFd(handle: ?*anyopaque, sync: ?*anyopaque) i32 {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return NO_NATIVE_FENCE_FD_ANDROID;
+    const s = syncOf(sync, d) orelse return fail(i32, BAD_PARAMETER, NO_NATIVE_FENCE_FD_ANDROID);
+    if (!s.native) return fail(i32, BAD_PARAMETER, NO_NATIVE_FENCE_FD_ANDROID);
+    const h = driver.?.host;
+    if (s.fd >= 0) {
+        const nfd = h.dup(h.ctx, s.fd);
+        return if (nfd < 0) fail(i32, BAD_PARAMETER, NO_NATIVE_FENCE_FD_ANDROID) else ok(i32, nfd);
+    }
+    // (the last submission's fence: at or after the sync's, one ring)
+    _ = d.eng.?.mark();
+    const nfd = h.fenceFd(h.ctx);
+    return if (nfd < 0) fail(i32, BAD_PARAMETER, NO_NATIVE_FENCE_FD_ANDROID) else ok(i32, @intCast(nfd));
 }
 
 pub fn destroySync(handle: ?*anyopaque, sync: ?*anyopaque) bool {
@@ -1164,7 +1244,7 @@ pub fn destroySync(handle: ?*anyopaque, sync: ?*anyopaque) bool {
     defer unlock();
     const d = ready(handle) orelse return false;
     const s = syncOf(sync, d) orelse return fail(bool, BAD_PARAMETER, false);
-    s.* = .{};
+    dropSync(s);
     return ok(bool, true);
 }
 
@@ -1181,10 +1261,17 @@ pub fn clientWaitSync(handle: ?*anyopaque, sync: ?*anyopaque, flags: i32, timeou
         return fail(i32, BAD_PARAMETER, @intCast(FALSE));
     };
     const m = s.mark;
+    const fd = s.fd;
     const eng = d.eng.?;
     unlock();
     if (flags & SYNC_FLUSH_COMMANDS_BIT != 0) {
         if (thread.gl()) |g| g.flush();
+    }
+    if (fd >= 0) {
+        const ms: i32 = if (timeout_ns == FOREVER) -1 else @intCast(@min(timeout_ns / 1_000_000, std.math.maxInt(i32)));
+        const r = pollFence(fd, ms);
+        if (r < 0) return fail(i32, BAD_PARAMETER, @intCast(FALSE));
+        return ok(i32, if (r > 0) CONDITION_SATISFIED else TIMEOUT_EXPIRED);
     }
     const us: u64 = if (timeout_ns == FOREVER) std.math.maxInt(u64) else timeout_ns / 1000;
     return ok(i32, if (eng.waitMark(m, us)) CONDITION_SATISFIED else TIMEOUT_EXPIRED);
@@ -1207,9 +1294,161 @@ pub fn getSyncAttrib(handle: ?*anyopaque, sync: ?*anyopaque, a: i32) ?i32 {
     const d = ready(handle) orelse return null;
     const s = syncOf(sync, d) orelse return fail(?i32, BAD_PARAMETER, null);
     return switch (a) {
-        SYNC_TYPE => ok(?i32, @intCast(SYNC_FENCE)),
-        SYNC_STATUS => ok(?i32, if (d.eng.?.markDone(s.mark)) SIGNALED else UNSIGNALED),
-        SYNC_CONDITION => ok(?i32, SYNC_PRIOR_COMMANDS_COMPLETE),
+        SYNC_TYPE => ok(?i32, @intCast(if (s.native) SYNC_NATIVE_FENCE_ANDROID else SYNC_FENCE)),
+        SYNC_STATUS => blk: {
+            const done = if (s.fd >= 0) pollFence(s.fd, 0) > 0 else d.eng.?.markDone(s.mark);
+            break :blk ok(?i32, if (done) SIGNALED else UNSIGNALED);
+        },
+        SYNC_CONDITION => ok(?i32, if (s.fd >= 0) SYNC_NATIVE_FENCE_SIGNALED_ANDROID else SYNC_PRIOR_COMMANDS_COMPLETE),
         else => fail(?i32, BAD_ATTRIBUTE, null),
     };
+}
+
+// ── Images (EGL_KHR_image_base, EGL_EXT_image_dma_buf_import) ─────────────
+
+pub const EImage = struct {
+    /// its handle valid (its memory may outlive it: GL's names hold it)
+    alive: bool = false,
+    display: ?*Display = null,
+    img: Image = .{},
+    shared: engine.Shared = .{},
+};
+
+var eimages: [MAX_IMAGES]EImage = undefined;
+
+fn imageOf(handle: ?*anyopaque, d: *Display) ?*EImage {
+    const m = imageAt(handle) orelse return null;
+    return if (m.display == d) m else null;
+}
+
+fn imageAt(handle: ?*anyopaque) ?*EImage {
+    const p = @intFromPtr(handle orelse return null);
+    const base = @intFromPtr(&eimages[0]);
+    if (p < base or p >= base + @sizeOf(@TypeOf(eimages)) or (p - base) % @sizeOf(EImage) != 0) return null;
+    const m: *EImage = @ptrFromInt(p);
+    return if (m.alive) m else null;
+}
+
+/// gles' look-up of an EGLImage handle (glEGLImageTarget*).
+fn resolveImage(handle: ?*anyopaque) ?*Image {
+    const m = imageAt(handle) orelse return null;
+    return &m.img;
+}
+
+fn dropImage(m: *EImage) void {
+    m.alive = false;
+    // (the memory goes with the last of GL's names too)
+    m.display.?.eng.?.freeImage(&m.img);
+}
+
+/// A dma-buf fourcc as the engine's format, and whether it has alpha.
+fn fourccOf(f: u32) ?struct { format: engine.Format, alpha: bool } {
+    return switch (f) {
+        wayland.DRM_FORMAT_ARGB8888 => .{ .format = .bgra8, .alpha = true },
+        wayland.DRM_FORMAT_XRGB8888 => .{ .format = .bgra8, .alpha = false },
+        DRM_FORMAT_ABGR8888 => .{ .format = .rgba8, .alpha = true },
+        DRM_FORMAT_XBGR8888 => .{ .format = .rgba8, .alpha = false },
+        else => null,
+    };
+}
+
+/// eglCreateImage and eglCreateImageKHR: EGL_LINUX_DMA_BUF_EXT, one plane.
+/// The fd stays the caller's (the buffer is imported, not the file kept).
+pub fn createImage(comptime T: type, handle: ?*anyopaque, ctx: ?*anyopaque, target: u32, buffer: ?*anyopaque, attribs: ?[*]const T) ?*EImage {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return null;
+    if (target != LINUX_DMA_BUF_EXT or ctx != null or buffer != null) return fail(?*EImage, BAD_PARAMETER, null);
+    var width: i64 = -1;
+    var height: i64 = -1;
+    var fourcc: i64 = -1;
+    var fd: i64 = -1;
+    var offset: i64 = -1;
+    var pitch: i64 = -1;
+    var mod_lo: ?u32 = null;
+    var mod_hi: ?u32 = null;
+    const list = attribs orelse return fail(?*EImage, BAD_PARAMETER, null);
+    var i: usize = 0;
+    while (list[i] != NONE) : (i += 2) {
+        const v: i64 = @intCast(list[i + 1]);
+        switch (@as(i32, @intCast(list[i]))) {
+            WIDTH => width = v,
+            HEIGHT => height = v,
+            LINUX_DRM_FOURCC_EXT => fourcc = v,
+            DMA_BUF_PLANE0_FD_EXT => fd = v,
+            DMA_BUF_PLANE0_OFFSET_EXT => offset = v,
+            DMA_BUF_PLANE0_PITCH_EXT => pitch = v,
+            DMA_BUF_PLANE0_MODIFIER_LO_EXT => mod_lo = @truncate(@as(u64, @bitCast(v))),
+            DMA_BUF_PLANE0_MODIFIER_HI_EXT => mod_hi = @truncate(@as(u64, @bitCast(v))),
+            // (colour-space and siting hints: for YUV, which is not had)
+            0x327B, 0x327C, 0x327D, 0x327E, IMAGE_PRESERVED_KHR => {},
+            else => return fail(?*EImage, BAD_ATTRIBUTE, null),
+        }
+    }
+    if (width < 0 or height < 0 or fourcc < 0 or fd < 0 or offset < 0 or pitch < 0) return fail(?*EImage, BAD_PARAMETER, null);
+    const f = fourccOf(@truncate(@as(u64, @bitCast(fourcc)))) orelse return fail(?*EImage, BAD_MATCH, null);
+    if ((mod_lo == null) != (mod_hi == null)) return fail(?*EImage, BAD_PARAMETER, null);
+    if (mod_lo) |lo| {
+        const m = @as(u64, mod_hi.?) << 32 | lo;
+        if (m != 0 and m != MOD_INVALID) return fail(?*EImage, BAD_MATCH, null);
+    }
+    if (width == 0 or height == 0 or width > MAX_SIZE or height > MAX_SIZE) return fail(?*EImage, BAD_PARAMETER, null);
+    if (pitch < width * 4 or @mod(pitch, 4) != 0 or @mod(offset, 4) != 0) return fail(?*EImage, BAD_ACCESS, null);
+    const slot = for (&eimages) |*x| {
+        if (!x.alive and x.shared.refs == 0) break x;
+    } else return fail(?*EImage, BAD_ALLOC, null);
+    const h = driver.?.host;
+    const whole = h.importFd(h.ctx, @intCast(fd)) orelse return fail(?*EImage, BAD_PARAMETER, null);
+    slot.* = .{ .alive = true, .display = d };
+    const need = offset + pitch * (height - 1) + width * 4;
+    if (need > @as(i64, @intCast(whole.bytes))) {
+        // (the import goes again: a picture larger than its buffer)
+        slot.img = engine.adopt(&slot.shared, whole, 0, 1, 1, 4, f.format);
+        dropImage(slot);
+        return fail(?*EImage, BAD_ACCESS, null);
+    }
+    slot.img = engine.adopt(&slot.shared, whole, @intCast(offset), @intCast(width), @intCast(height), @intCast(pitch), f.format);
+    slot.img.no_alpha = !f.alpha;
+    return ok(?*EImage, slot);
+}
+
+pub fn destroyImage(handle: ?*anyopaque, image: ?*anyopaque) bool {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return false;
+    const m = imageOf(image, d) orelse return fail(bool, BAD_PARAMETER, false);
+    dropImage(m);
+    return ok(bool, true);
+}
+
+/// eglQueryDmaBufFormatsEXT: the fourccs an image takes.
+pub fn queryDmaBufFormats(handle: ?*anyopaque, max: i32, formats: ?[*]i32, num: ?*i32) bool {
+    lock();
+    defer unlock();
+    _ = ready(handle) orelse return false;
+    const n = num orelse return fail(bool, BAD_PARAMETER, false);
+    if (max < 0 or (max > 0 and formats == null)) return fail(bool, BAD_PARAMETER, false);
+    const k: usize = if (max == 0) dma_buf_formats.len else @min(dma_buf_formats.len, @as(usize, @intCast(max)));
+    if (max > 0) {
+        for (0..k) |i| formats.?[i] = @bitCast(dma_buf_formats[i]);
+    }
+    n.* = @intCast(k);
+    return ok(bool, true);
+}
+
+/// eglQueryDmaBufModifiersEXT: linear only, for every format; none
+/// external only.
+pub fn queryDmaBufModifiers(handle: ?*anyopaque, format: i32, max: i32, modifiers: ?[*]u64, external_only: ?[*]u32, num: ?*i32) bool {
+    lock();
+    defer unlock();
+    _ = ready(handle) orelse return false;
+    const n = num orelse return fail(bool, BAD_PARAMETER, false);
+    if (fourccOf(@bitCast(format)) == null) return fail(bool, BAD_PARAMETER, false);
+    if (max < 0 or (max > 0 and modifiers == null)) return fail(bool, BAD_PARAMETER, false);
+    if (max > 0) {
+        modifiers.?[0] = 0;
+        if (external_only) |e| e[0] = FALSE;
+    }
+    n.* = 1;
+    return ok(bool, true);
 }

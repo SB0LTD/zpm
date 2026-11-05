@@ -11,6 +11,13 @@
 //! - **PRIME export**: a buffer as a dma-buf fd (DRM_IOCTL_PRIME_HANDLE_TO_FD
 //!   on the buffer's handle), for a window's frames to go to the
 //!   compositor through zwp_linux_dmabuf_v1, zero-copy.
+//! - **PRIME import**: a dma-buf fd (another program's buffer, an
+//!   EGLImage's) as a buffer of this context: PRIME_FD_TO_HANDLE, then
+//!   MSM_GEM_INFO for its GPU address and its mmap offset. The kernel
+//!   answers an import of this context's own buffer, or of one imported
+//!   before, with the same handle: such an entry is counted, not doubled.
+//! - **Fence files** (G_FENCE_FD): a sync_file of the last submission, for
+//!   EGL_ANDROID_native_fence_sync.
 //!
 //! The open file is the program's own GPU context (its own page table).
 //! G_INFO's chip says which GPU answered; each GPU's raw Device is a view
@@ -63,6 +70,7 @@ pub const G_FREE: u32 = 0x4004_4703;
 pub const G_SUBMIT: u32 = 0xc010_4704;
 pub const G_WAIT: u32 = 0x4010_4705;
 pub const G_IMPORT: u32 = 0xc020_4706;
+pub const G_FENCE_FD: u32 = 0xc008_4707;
 pub const G_VERSION: u32 = 1;
 /// G_ALLOC's flags: write-combined for the CPU (the Adreno's); in VRAM
 /// (the RTX's; without it, system memory the GPU maps).
@@ -73,6 +81,11 @@ pub const G_VRAM: u32 = 2;
 pub const PRIME_HANDLE_TO_FD: u32 = 0xc00c_642d;
 pub const DRM_CLOEXEC: u32 = 0o2000000;
 pub const DRM_RDWR: u32 = 2;
+pub const PRIME_FD_TO_HANDLE: u32 = 0xc00c_642e;
+/// msm's struct drm_msm_gem_info {u32 handle, u32 info, u64 value, u32
+/// len, u32 pad}; info 0: the mmap offset, 1: the GPU address (given now
+/// if it has none).
+pub const MSM_GEM_INFO: u32 = 0xc018_6443;
 
 pub const CHIP_X1_45: u32 = 0x4303_0c00;
 /// The RTX 5070 Laptop GPU's (nv_dev.CHIP_GB206): NVIDIA's PCI vendor id
@@ -139,10 +152,14 @@ pub fn Node(comptime Sys: type) type {
         /// to whole units).
         piece: usize = PIECE,
         line: usize = 64,
+        /// the fence of the last submission (0: none yet)
+        last_seq: u32 = 0,
         buffers: [MAX_BUFFERS]Entry = [_]Entry{.{}} ** MAX_BUFFERS,
 
         const Entry = struct {
             used: bool = false,
+            /// names held (an import of the same kernel buffer again)
+            refs: u32 = 1,
             va: u64 = 0,
             cpu: usize = 0,
             /// Bytes mapped here (every piece, rounded to whole units; 0
@@ -372,7 +389,60 @@ pub fn Node(comptime Sys: type) type {
         }
 
         fn freeIn(g: *Self, handle: u32) void {
-            if (g.entryOf(handle)) |e| g.release(e);
+            const e = g.entryOf(handle) orelse return;
+            e.refs -= 1;
+            if (e.refs == 0) g.release(e);
+        }
+
+        /// A dma-buf of `size` bytes (its fd stays the caller's) as a
+        /// buffer of this context: its GPU address, mapped here; null when
+        /// the kernel refuses it.
+        pub fn importFd(g: *Self, fd: i32) ?Buffer {
+            if (g.fd < 0 or g.lost or g.kind != .adreno) return null;
+            const size_i = g.sys.fdSize(fd);
+            if (size_i <= 0) return null;
+            const size: usize = @intCast(size_i);
+            var a = [_]u8{0} ** 12;
+            wr32(&a, 8, @bitCast(fd));
+            if (g.call(PRIME_FD_TO_HANDLE, &a) != 0) return null;
+            const kh = rd32(&a, 0);
+            // (the same kernel buffer named already: one entry, counted)
+            for (&g.buffers, 0..) |*e, i| {
+                if (e.used and e.n == 1 and e.handles[0] == kh) {
+                    e.refs += 1;
+                    return .{ .va = e.va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..@min(size, e.len)], .handle = @intCast(i + 1) };
+                }
+            }
+            const idx = g.freeEntry() orelse return g.dropHandle(kh);
+            var gi = [_]u8{0} ** 24;
+            wr32(&gi, 0, kh);
+            wr32(&gi, 4, 1); // MSM_INFO_GET_IOVA
+            if (g.call(MSM_GEM_INFO, &gi) != 0) return g.dropHandle(kh);
+            const va = rd64(&gi, 8);
+            wr32(&gi, 4, 0); // MSM_INFO_GET_OFFSET
+            if (g.call(MSM_GEM_INFO, &gi) != 0) return g.dropHandle(kh);
+            const len = std.mem.alignForward(usize, size, PAGE);
+            const at = g.sys.mapBuffer(g.fd, 0, len, rd64(&gi, 8));
+            if (at < 0) return g.dropHandle(kh);
+            const e = &g.buffers[idx];
+            e.* = .{ .used = true, .va = va, .cpu = @intCast(at), .len = len, .first = len, .n = 1 };
+            e.handles[0] = kh;
+            return .{ .va = va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..size], .handle = @intCast(idx + 1) };
+        }
+
+        fn dropHandle(g: *Self, kh: u32) ?Buffer {
+            g.freeHandle(kh);
+            return null;
+        }
+
+        /// A sync_file of the last submission (of any of this process's
+        /// GPU work: one in-order ring), or -errno.
+        pub fn fenceFd(g: *Self) i64 {
+            var a = [_]u8{0} ** 8;
+            wr32(&a, 0, g.last_seq);
+            const r = g.call(G_FENCE_FD, &a);
+            if (r != 0) return r;
+            return @as(i32, @bitCast(rd32(&a, 4)));
         }
 
         /// `dwords` of command stream at `va`, in the buffer `handle` (its
@@ -386,7 +456,8 @@ pub fn Node(comptime Sys: type) type {
             wr32(&a, 4, @intCast(va - e.va));
             wr32(&a, 8, dwords);
             if (g.call(G_SUBMIT, &a) != 0) return if (g.lost) error.DeviceLost else error.SubmitFailed;
-            return rd32(&a, 12);
+            g.last_seq = rd32(&a, 12);
+            return g.last_seq;
         }
 
         fn waitFor(g: *Self, f: u64, timeout_us: u64) DeviceError!void {
@@ -563,6 +634,19 @@ pub fn Gpu(comptime Sys: type, comptime targets: []const gpu.Target) type {
             return g.node.exportFd(b.handle);
         }
 
+        /// A dma-buf as a gpu.Buffer of this GPU (freed as any of its
+        /// buffers), or null.
+        pub fn importFd(g: *Self, fd: i32) ?gpu.Buffer {
+            if (g.node.kind != .adreno) return null;
+            const b = g.node.importFd(fd) orelse return null;
+            return .{ .gpu = b.va, .cpu = b.cpu, .bytes = b.cpu.len, .handle = b.handle, .kind = .host };
+        }
+
+        /// A sync_file of the GPU work so far, or -errno.
+        pub fn fenceFd(g: *Self) i64 {
+            return g.node.fenceFd();
+        }
+
         pub fn close(g: *Self) void {
             g.node.close();
         }
@@ -600,6 +684,11 @@ pub const Linux = struct {
 
     pub fn unmap(_: Linux, at: usize, len: usize) void {
         _ = linux.munmap(@ptrFromInt(at), len);
+    }
+
+    /// A file's size (lseek to its end: a dma-buf's), or -errno.
+    pub fn fdSize(_: Linux, fd: i32) i64 {
+        return result(linux.lseek(fd, 0, linux.SEEK.END));
     }
 
     /// CLOCK_MONOTONIC by the system call itself: std's clock_gettime
@@ -696,6 +785,8 @@ pub const Fake = struct {
     live: u32 = 0,
     imports: u32 = 0,
     exports: u32 = 0,
+    prime_imports: u32 = 0,
+    fence_fds: u32 = 0,
     reserved: usize = 0,
     import_va: u64 = 0x80_0000_0000,
 
@@ -761,6 +852,27 @@ pub const Fake = struct {
                 if (k.slow) return -ETIMEDOUT;
                 k.emu.device().wait(rd32(a, 0), 0) catch return -EINVAL;
             },
+            G_FENCE_FD => {
+                k.fence_fds += 1;
+                wr32(a, 4, 300 + rd32(a, 0));
+            },
+            PRIME_FD_TO_HANDLE => {
+                // (fds 100 + handle: what PRIME_HANDLE_TO_FD gave; the
+                // same buffer, as the kernel's own context answers)
+                const fd = rd32(a, 8);
+                if (fd < 100 or fd - 100 >= k.pieces.len or k.pieces[fd - 100].va == 0) return -EINVAL;
+                k.prime_imports += 1;
+                wr32(a, 0, fd - 100);
+            },
+            MSM_GEM_INFO => {
+                const h = rd32(a, 0);
+                if (h >= k.pieces.len or k.pieces[h].va == 0) return -2;
+                switch (rd32(a, 4)) {
+                    0 => wr64(a, 8, @as(u64, h) << 32),
+                    1 => wr64(a, 8, k.pieces[h].va),
+                    else => return -EINVAL,
+                }
+            },
             PRIME_HANDLE_TO_FD => {
                 const h = rd32(a, 0);
                 if (h >= k.pieces.len or k.pieces[h].va == 0) return -2;
@@ -785,6 +897,11 @@ pub const Fake = struct {
         return @intCast(@intFromPtr(k.emu.arena.ptr) + k.next());
     }
     pub fn unmap(_: *Fake, _: usize, _: usize) void {}
+    pub fn fdSize(k: *Fake, fd: i32) i64 {
+        if (fd < 100 or fd - 100 >= k.pieces.len) return -9;
+        const b = k.pieces[@intCast(fd - 100)];
+        return if (b.va == 0) -9 else @intCast(b.cpu.len);
+    }
     pub fn nowNs(_: *Fake) i64 {
         return 1_000_000_000;
     }
@@ -854,6 +971,18 @@ test "node: buffers, an import, an export, a hang, no GPU" {
     try std.testing.expectEqual(@as(i64, -EINVAL), g.exportFd(m.handle)); // (an import is the program's)
     imp.release(imp.ctx, m.handle);
     try std.testing.expectEqual(@as(u32, 1), k.live);
+    // a dma-buf in: this context's own buffer, named twice, freed with the
+    // last name
+    const im = g.importFd(@intCast(fd)).?;
+    try std.testing.expectEqual(b.handle, im.handle);
+    try std.testing.expectEqual(b.va, im.va);
+    try std.testing.expectEqual(@intFromPtr(b.cpu.ptr), @intFromPtr(im.cpu.ptr));
+    d.free(im);
+    try std.testing.expect(g.entryOf(b.handle) != null);
+    try std.testing.expect(g.importFd(77) == null);
+    // a fence file of the last submission
+    try std.testing.expectEqual(@as(i64, 300), g.fenceFd());
+    try std.testing.expectEqual(@as(u32, 1), k.fence_fds);
     // a hang: lost from now on
     k.hung = true;
     try std.testing.expectError(error.DeviceLost, d.wait(1, 1000));

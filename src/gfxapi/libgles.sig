@@ -276,6 +276,12 @@ pub export fn glGetTexParameterfv(target: u32, pname: u32, params: ?[*]f32) call
     const v = c.getTexParameteri(target, pname) orelse return;
     if (params) |p| p[0] = @floatFromInt(v);
 }
+pub export fn glEGLImageTargetTexture2DOES(target: u32, image: ?*anyopaque) callconv(.c) void {
+    if (cur()) |c| c.eglImageTargetTexture2D(target, image);
+}
+pub export fn glEGLImageTargetRenderbufferStorageOES(target: u32, image: ?*anyopaque) callconv(.c) void {
+    if (cur()) |c| c.eglImageTargetRenderbufferStorage(target, image);
+}
 pub export fn glCopyTexSubImage2D(target: u32, level: i32, dx: i32, dy: i32, x: i32, y: i32, w: i32, h: i32) callconv(.c) void {
     if (cur()) |c| c.copyTexSubImage2D(target, level, dx, dy, x, y, w, h);
 }
