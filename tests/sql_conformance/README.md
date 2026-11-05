@@ -53,9 +53,9 @@ component is missing. The annotations below separate those cases.
 | PG.GROUP.ROLLUP | ROLLUP/GROUPING | pass; flat ROLLUP/GROUPING only, broader grouping remains partial |
 | PG.GROUP.CUBE | CUBE | UndefinedFunction |
 | PG.GROUP.SETS | GROUPING SETS | Syntax |
-| PG.AGG.COLLECTION | String/array aggregates | Syntax |
+| PG.AGG.COLLECTION | String/array aggregates | pass (B11 candidate); aggregate ORDER BY/DISTINCT, array_agg (scalars, arrays), string_agg (text, bytea); window and grouping-set forms 0A000 |
 | PG.AGG.STATISTICAL | Statistical aggregates | UndefinedFunction |
-| PG.AGG.ORDERED_SET | Ordered-set aggregates | Syntax |
+| PG.AGG.ORDERED_SET | Ordered-set aggregates | pass (B11 candidate); percentile_cont/disc, mode, hypothetical rank/dense_rank/percent_rank/cume_dist; array fractions open |
 | PG.AGG.BITWISE | Bitwise aggregates | UndefinedFunction |
 | PG.AGG.INTERVAL | AVG(interval) | UndefinedFunction |
 | PG.JOIN.LATERAL | LATERAL | Syntax |
@@ -109,10 +109,10 @@ component is missing. The annotations below separate those cases.
 | PG.TYPE.ENUM_DOMAIN_COMPOSITE | User-defined types | Syntax; not implemented (oracle expects database-local OIDs 18673/18682) |
 | PG.TYPE.CATALOG_IDS | Additional catalog identifiers | pass (B11 candidate); pg_lsn/xid8, closure incomplete |
 | PG.JSON.OPS | JSON operators | qualified smoke pass; lexical extraction, broader JSON closure incomplete |
-| PG.JSONB.MODIFY | Remaining JSONB operations | UndefinedFunction |
-| PG.JSON.PATH | JSONPATH/SQL-JSON | UndefinedFunction |
-| PG.JSON.TABLE | JSON_TABLE | Syntax |
-| PG.JSON.AGG | JSON aggregates | Syntax |
+| PG.JSONB.MODIFY | Remaining JSONB operations | pass (B11 candidate); jsonb_set/_lax/insert, - and #-, ?| ?&, strip_nulls, pretty, to_json[b]; subscript assignment open |
+| PG.JSON.PATH | JSONPATH/SQL-JSON | pass (B11 candidate); jsonpath type, lax/strict evaluator, jsonb_path_* and @? @@; like_regex, keyvalue, datetime methods 0A000 |
+| PG.JSON.TABLE | JSON_TABLE | pass (B11 candidate); PASSING, ORDINALITY, value/query/EXISTS columns, ON EMPTY/ON ERROR; NESTED PATH 0A000 |
+| PG.JSON.AGG | JSON aggregates | pass (B11 candidate); json[b]_agg, json[b]_object_agg with to_json[b] conversion; constructors and *_strict/_unique open |
 | PG.FUNC.STRING | String functions | Syntax |
 | PG.FUNC.NUMERIC | Numeric functions | UndefinedFunction |
 | PG.FUNC.TEMPORAL | Temporal functions | Syntax |

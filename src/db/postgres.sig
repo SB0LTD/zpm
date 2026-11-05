@@ -1657,6 +1657,17 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "StackDepthExceeded")) return "54001";
     if (equal(name, "NullValueNotAllowed")) return "22004";
     if (equal(name, "ErrorInAssignment")) return "22005";
+    if (equal(name, "SqlJsonArrayNotFound")) return "22039";
+    if (equal(name, "SqlJsonMemberNotFound")) return "2203A";
+    if (equal(name, "SqlJsonObjectNotFound")) return "2203C";
+    if (equal(name, "InvalidSqlJsonSubscript")) return "22033";
+    if (equal(name, "SingletonSqlJsonItemRequired")) return "22038";
+    if (equal(name, "NonNumericSqlJsonItem")) return "22036";
+    if (equal(name, "SqlJsonNumberNotFound")) return "2203B";
+    if (equal(name, "SqlJsonScalarRequired")) return "2203F";
+    if (equal(name, "SqlJsonItemCannotBeCast")) return "2203G";
+    if (equal(name, "MoreThanOneSqlJsonItem")) return "22034";
+    if (equal(name, "NoSqlJsonItem")) return "22035";
     if (equal(name, "TypeMismatch")) return "42804";
     if (equal(name, "IntegerOverflow")) return "22003";
     if (equal(name, "ProtocolViolation")) return "08P01";

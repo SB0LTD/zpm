@@ -498,7 +498,9 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// generate_series result family; `none` is a scalar function in
         /// FROM (one row).
-        pub const Series = enum { none, integer, numeric, timestamp };
+        pub const Series = enum { none, integer, numeric, timestamp,
+            // JSON_TABLE (B11 json-agg lane): `function` is the table node.
+            json_table };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -775,7 +777,7 @@ pub fn Binder(comptime config: types.Config) type {
             }
             if (left == .unknown) return coerce(context, a.*, right);
             if (right == .unknown) return coerce(context, b.*, left);
-            if (left == .json or right == .json) return error.UndefinedFunction;
+            if (left == .json or right == .json or left == .jsonpath or right == .jsonpath) return error.UndefinedFunction;
             // point and box have no ordinary comparison operators here.
             if (geometricType(left) or geometricType(right) or left == .xml or right == .xml) return error.UndefinedFunction;
             if (left == right) return;
@@ -1087,6 +1089,76 @@ pub fn Binder(comptime config: types.Config) type {
             }
         }
 
+        /// A JSONB operator (B11 json-agg lane) as a call of its *_op
+        /// function over the already typed operands.
+        fn jsonOperatorCall(context: *const Context, n: *ast.Node, func: ast.Func) Error!void {
+            const left = n.a;
+            const right = n.b;
+            context.node(left).next = right;
+            context.node(right).next = none;
+            n.kind = .function;
+            n.func = func;
+            n.a = none;
+            n.b = left;
+            n.name = .{};
+            try typeJsonFunction(context, n, 2);
+        }
+
+        /// pg_proc signatures of the JSONB / SQL/JSON path functions; the
+        /// optional trailing arguments default as in PostgreSQL (create /
+        /// insert_after / vars '{}' / silent false / strip_in_arrays false).
+        fn typeJsonFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            const text_array = types.arrayType(.text).?;
+            switch (n.func) {
+                .jsonb_set, .jsonb_insert => switch (count) {
+                    3 => try bindSignature(context, n, &[_]T{ .jsonb, text_array, .jsonb }, .jsonb, true),
+                    4 => try bindSignature(context, n, &[_]T{ .jsonb, text_array, .jsonb, .boolean }, .jsonb, true),
+                    else => return error.UndefinedFunction,
+                },
+                .jsonb_set_lax => switch (count) {
+                    3 => try bindSignature(context, n, &[_]T{ .jsonb, text_array, .jsonb }, .jsonb, false),
+                    4 => try bindSignature(context, n, &[_]T{ .jsonb, text_array, .jsonb, .boolean }, .jsonb, false),
+                    5 => try bindSignature(context, n, &[_]T{ .jsonb, text_array, .jsonb, .boolean, .text }, .jsonb, false),
+                    else => return error.UndefinedFunction,
+                },
+                .jsonb_delete_path, .jsonb_delete_path_op => try bindSignature(context, n, &[_]T{ .jsonb, text_array }, .jsonb, true),
+                .jsonb_exists_any, .jsonb_exists_all, .jsonb_exists_any_op, .jsonb_exists_all_op => try bindSignature(context, n, &[_]T{ .jsonb, text_array }, .boolean, true),
+                .jsonb_strip_nulls => switch (count) {
+                    1 => try bindSignature(context, n, &[_]T{.jsonb}, .jsonb, true),
+                    2 => try bindSignature(context, n, &[_]T{ .jsonb, .boolean }, .jsonb, true),
+                    else => return error.UndefinedFunction,
+                },
+                .jsonb_pretty => try bindSignature(context, n, &[_]T{.jsonb}, .text, true),
+                .to_json, .to_jsonb => {
+                    if (count != 1) return error.UndefinedFunction;
+                    // anyelement: an untyped literal is 42804.
+                    if (context.node(n.b).ty == .unknown) return error.TypeMismatch;
+                    n.ty = if (n.func == .to_json) .json else .jsonb;
+                    n.constant = isConstant(context, n.b);
+                    n.planned_null = knownNull(context, n.b);
+                    if (n.planned_null) context.pool.planned_nulls = true;
+                },
+                .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first => {
+                    const result: T = if (n.func == .jsonb_path_exists or n.func == .jsonb_path_match) .boolean else .jsonb;
+                    switch (count) {
+                        2 => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath }, result, true),
+                        3 => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath, .jsonb }, result, true),
+                        4 => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath, .jsonb, .boolean }, result, true),
+                        else => return error.UndefinedFunction,
+                    }
+                },
+                .jsonb_path_exists_op, .jsonb_path_match_op => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath }, .boolean, true),
+                .jsonb_minus_op => {
+                    // jsonb - text | int4 | text[]; an untyped operand is text.
+                    const right = context.node(context.node(n.b).next).ty;
+                    const target: T = if (right == .unknown or value.stringType(right)) .text else if (right == .int2 or right == .int4) .int4 else if (types.elementType(right)) |element| (if (value.stringType(element)) text_array else return error.UndefinedFunction) else return error.UndefinedFunction;
+                    try bindSignature(context, n, &[_]T{ .jsonb, target }, .jsonb, true);
+                },
+                else => return error.UndefinedFunction,
+            }
+        }
+
         fn functionName(context: *const Context, n: *const ast.Node) ast.Func {
             const name = toName(context, n.name);
             const table = [_]struct { name: []const u8, func: ast.Func }{
@@ -1195,6 +1267,14 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_advisory_unlock", .func = .pg_advisory_unlock },
                 .{ .name = "pg_advisory_unlock_shared", .func = .pg_advisory_unlock_shared },
                 .{ .name = "pg_backend_pid", .func = .pg_backend_pid },
+                // JSONB and SQL/JSON path functions (B11 json-agg lane).
+                .{ .name = "jsonb_set", .func = .jsonb_set },       .{ .name = "jsonb_set_lax", .func = .jsonb_set_lax },
+                .{ .name = "jsonb_insert", .func = .jsonb_insert }, .{ .name = "jsonb_delete_path", .func = .jsonb_delete_path },
+                .{ .name = "jsonb_strip_nulls", .func = .jsonb_strip_nulls }, .{ .name = "jsonb_pretty", .func = .jsonb_pretty },
+                .{ .name = "to_json", .func = .to_json },           .{ .name = "to_jsonb", .func = .to_jsonb },
+                .{ .name = "jsonb_path_exists", .func = .jsonb_path_exists }, .{ .name = "jsonb_path_match", .func = .jsonb_path_match },
+                .{ .name = "jsonb_path_query_array", .func = .jsonb_path_query_array }, .{ .name = "jsonb_path_query_first", .func = .jsonb_path_query_first },
+                .{ .name = "jsonb_exists_any", .func = .jsonb_exists_any }, .{ .name = "jsonb_exists_all", .func = .jsonb_exists_all },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -1223,9 +1303,238 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "regr_intercept", .agg = .regr_intercept }, .{ .name = "regr_r2", .agg = .regr_r2 },
                 .{ .name = "bit_and", .agg = .bit_and },            .{ .name = "bit_or", .agg = .bit_or },
                 .{ .name = "bit_xor", .agg = .bit_xor },
+                // B11 json-agg lane: collection, JSON and ordered-set aggregates.
+                .{ .name = "array_agg", .agg = .array_agg },        .{ .name = "string_agg", .agg = .string_agg },
+                .{ .name = "json_agg", .agg = .json_agg },          .{ .name = "jsonb_agg", .agg = .jsonb_agg },
+                .{ .name = "json_object_agg", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg", .agg = .jsonb_object_agg },
+                .{ .name = "percentile_cont", .agg = .percentile_cont }, .{ .name = "percentile_disc", .agg = .percentile_disc },
+                .{ .name = "mode", .agg = .mode },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.agg;
             return .none;
+        }
+
+        /// Collection and JSON aggregates (B11 json-agg lane, after
+        /// pg_aggregate): array_agg(anynonarray | anyarray), string_agg(text,
+        /// text | bytea, bytea), json[b]_agg(anyelement), json[b]_object_agg
+        /// ("any", "any"). Polymorphic arguments reject untyped literals
+        /// (42804); "any" ones read them as text. Returns the result type;
+        /// the typed arguments stay `next`-linked from n.b.
+        fn typeCollectAggregate(context: *const Context, inner: *const Scope, n: *ast.Node, kind: ast.Agg) Error!ast.Type {
+            if (n.star) return error.UndefinedFunction;
+            var args: [2]u16 = undefined;
+            var count: usize = 0;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                if (count == 2) return error.UndefinedFunction;
+                try typeExpr(context, inner, item);
+                args[count] = item;
+                count += 1;
+            }
+            const wanted: usize = switch (kind) {
+                .string_agg, .json_object_agg, .jsonb_object_agg => 2,
+                else => 1,
+            };
+            if (count != wanted) return error.UndefinedFunction;
+            const first = context.node(args[0]).ty;
+            switch (kind) {
+                .array_agg => {
+                    if (first == .unknown) return error.TypeMismatch;
+                    if (types.isArray(first)) return first;
+                    return types.arrayType(first) orelse error.UndefinedFunction;
+                },
+                .json_agg, .jsonb_agg => {
+                    if (first == .unknown) return error.TypeMismatch;
+                    return if (kind == .json_agg) .json else .jsonb;
+                },
+                .json_object_agg, .jsonb_object_agg => {
+                    for (args[0..2]) |arg| if (context.node(arg).ty == .unknown) try coerce(context, arg, .text);
+                    return if (kind == .json_object_agg) .json else .jsonb;
+                },
+                .string_agg => {
+                    const second = context.node(args[1]).ty;
+                    const binary = (first == .bytea or second == .bytea) and (first == .bytea or first == .unknown) and (second == .bytea or second == .unknown);
+                    const target: ast.Type = if (binary) .bytea else .text;
+                    for (args[0..2]) |arg| {
+                        const ty = context.node(arg).ty;
+                        if (ty != .unknown and !value.castable(ty, target, .implicit)) return error.UndefinedFunction;
+                    }
+                    const value_arg = try convert(context, args[0], target, -1, .implicit);
+                    const delimiter = try convert(context, args[1], target, -1, .implicit);
+                    context.node(value_arg).next = delimiter;
+                    context.node(delimiter).next = none;
+                    n.b = value_arg;
+                    return target;
+                },
+                else => return error.UndefinedFunction,
+            }
+        }
+
+        /// The ORDER BY keys of aggregate call `n` (B11): typed in the input
+        /// scope (untyped literals as text) and appended after the
+        /// `value_count` typed arguments listed from n.b into one
+        /// aggregate_input node, which becomes n.b. With DISTINCT, every key
+        /// must be one of the arguments (42P10).
+        fn aggregateInput(context: *const Context, inner: *const Scope, n: *ast.Node, value_count: usize) Error!void {
+            var layout: ast.AggregateInput = .{ .values = value_count };
+            var tail: u16 = none;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) tail = item;
+            if (n.order != none) {
+                const spec = &context.pool.windows[n.order];
+                if (spec.order_count > 24) return error.ColumnCapacity;
+                layout.keys = spec.order_count;
+                for (spec.order[0..spec.order_count], 0..) |*key, index| {
+                    try typeExpr(context, inner, key.expr);
+                    if (context.node(key.expr).ty == .unknown) try coerce(context, key.expr, .text);
+                    try sortableType(context.node(key.expr).ty);
+                    if (n.distinct) {
+                        var found = false;
+                        var value_item = n.b;
+                        for (0..value_count) |_| {
+                            if (value_item == none) break;
+                            if (sameExpr(context, value_item, key.expr)) found = true;
+                            value_item = context.node(value_item).next;
+                        }
+                        if (!found) return error.InvalidColumnReference;
+                    }
+                    const bit = @as(u64, 1) << @intCast(index);
+                    if (key.descending) layout.descending |= bit;
+                    if (key.nulls_first orelse (config.nulls_first_ascending != key.descending)) layout.nulls_first |= bit;
+                    context.node(key.expr).next = none;
+                    if (tail == none) n.b = key.expr else context.node(tail).next = key.expr;
+                    tail = key.expr;
+                }
+            }
+            try linkAggregateInput(context, n, layout);
+        }
+
+        /// Wraps the `next`-linked members from n.b in an aggregate_input
+        /// node with `layout`; it becomes n.b.
+        fn linkAggregateInput(context: *const Context, n: *ast.Node, layout: ast.AggregateInput) Error!void {
+            const input = try context.pool.add(.{ .kind = .function, .func = .aggregate_input, .b = n.b, .ty = .text, .name = n.name, .integer = layout.encode() });
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) try context.pool.raise(input, item);
+            context.node(input).constant = false;
+            n.b = input;
+        }
+
+        fn orderedSetName(context: *const Context, n: *const ast.Node) ast.Agg {
+            const name = toName(context, n.name);
+            const table = [_]struct { name: []const u8, agg: ast.Agg }{
+                .{ .name = "percentile_cont", .agg = .percentile_cont }, .{ .name = "percentile_disc", .agg = .percentile_disc },
+                .{ .name = "mode", .agg = .mode },                       .{ .name = "rank", .agg = .hypothetical_rank },
+                .{ .name = "dense_rank", .agg = .hypothetical_dense_rank }, .{ .name = "percent_rank", .agg = .hypothetical_percent_rank },
+                .{ .name = "cume_dist", .agg = .hypothetical_cume_dist },
+            };
+            for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.agg;
+            return .none;
+        }
+
+        /// `f(direct...) WITHIN GROUP (ORDER BY key...)` (B11, after
+        /// orderedsetaggs.c): percentile_cont(float8) over float8 or interval
+        /// keys, percentile_disc(float8) and mode() over any sortable key,
+        /// and the hypothetical-set rank/dense_rank/percent_rank/cume_dist
+        /// whose direct arguments pair with the keys (common types). Direct
+        /// arguments are evaluated once per group; groupify checks that
+        /// they read grouped columns only (42803). OVER is 0A000.
+        fn typeOrderedSet(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            if (n.window != none) return error.UnsupportedStatement;
+            const kind = orderedSetName(context, n);
+            if (kind == .none) return if (aggregateKind(context, n) != .none) error.WrongObjectType else error.UndefinedFunction;
+            if (!scope.aggregates) return error.GroupingError;
+            var inner = scope.*;
+            inner.aggregates = false;
+            inner.windows = false;
+            inner.window_error = if (scope.inside_window) error.WindowingError else error.GroupingError;
+            const spec = &context.pool.windows[n.order];
+            if (spec.order_count > 24) return error.ColumnCapacity;
+            var direct: [24]u16 = undefined;
+            var direct_count: usize = 0;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                if (direct_count == direct.len) return error.ColumnCapacity;
+                try typeExpr(context, &inner, item);
+                direct[direct_count] = item;
+                direct_count += 1;
+            }
+            const hypothetical = @intFromEnum(kind) >= @intFromEnum(ast.Agg.hypothetical_rank);
+            if (hypothetical) {
+                if (direct_count != spec.order_count) return error.UndefinedFunction;
+            } else {
+                if (spec.order_count != 1) return error.UndefinedFunction;
+                if (direct_count != @as(usize, if (kind == .mode) 0 else 1)) return error.UndefinedFunction;
+            }
+            for (spec.order[0..spec.order_count]) |*key| try typeExpr(context, &inner, key.expr);
+            var result: ast.Type = .unknown;
+            if (hypothetical) {
+                for (spec.order[0..spec.order_count], direct[0..direct_count]) |*key, *arg| {
+                    var target: ast.Type = .unknown;
+                    try unifyInto(&target, context.node(arg.*).ty);
+                    try unifyInto(&target, context.node(key.expr).ty);
+                    if (target == .unknown) target = .text;
+                    try sortableType(target);
+                    arg.* = try convert(context, arg.*, target, -1, .implicit);
+                    key.expr = try convert(context, key.expr, target, -1, .implicit);
+                }
+                result = if (kind == .hypothetical_rank or kind == .hypothetical_dense_rank) .int8 else .float8;
+            } else {
+                const key = &spec.order[0];
+                const key_ty = context.node(key.expr).ty;
+                switch (kind) {
+                    .percentile_cont => {
+                        // float8 and interval candidates: an untyped key is ambiguous.
+                        if (key_ty == .unknown) return error.AmbiguousFunction;
+                        const target: ast.Type = if (key_ty == .interval) .interval else .float8;
+                        if (target == .float8 and !value.castable(key_ty, .float8, .implicit)) return error.UndefinedFunction;
+                        key.expr = try convert(context, key.expr, target, -1, .implicit);
+                        result = target;
+                    },
+                    .percentile_disc, .mode => {
+                        if (key_ty == .unknown) return error.TypeMismatch;
+                        try sortableType(key_ty);
+                        result = key_ty;
+                    },
+                    else => return error.UndefinedFunction,
+                }
+                if (kind != .mode) {
+                    const ty = context.node(direct[0]).ty;
+                    if (ty != .unknown and !value.castable(ty, .float8, .implicit)) return error.UndefinedFunction;
+                    direct[0] = try convert(context, direct[0], .float8, -1, .implicit);
+                }
+            }
+            // Relink the direct arguments (casts may have replaced them),
+            // then the already typed keys.
+            n.b = none;
+            var tail: u16 = none;
+            for (direct[0..direct_count]) |arg| {
+                context.node(arg).next = none;
+                if (tail == none) n.b = arg else context.node(tail).next = arg;
+                tail = arg;
+            }
+            var layout: ast.AggregateInput = .{ .values = direct_count, .keys = spec.order_count };
+            for (spec.order[0..spec.order_count], 0..) |*key, index| {
+                const bit = @as(u64, 1) << @intCast(index);
+                if (key.descending) layout.descending |= bit;
+                if (key.nulls_first orelse (config.nulls_first_ascending != key.descending)) layout.nulls_first |= bit;
+                context.node(key.expr).next = none;
+                if (tail == none) n.b = key.expr else context.node(tail).next = key.expr;
+                tail = key.expr;
+            }
+            try linkAggregateInput(context, n, layout);
+            if (n.c != none) {
+                inner.window_error = error.WindowingError;
+                try typeExpr(context, &inner, n.c);
+                try booleanArgument(context, n.c);
+            }
+            n.kind = .aggregate;
+            n.agg = kind;
+            n.a = n.b;
+            n.b = none;
+            n.ty = result;
+            n.typmod = -1;
+            n.constant = false;
+            if (scope.saw_aggregate) |flag| flag.* = true;
         }
 
         /// Types an aggregate call (PostgreSQL result types: COUNT int8,
@@ -1239,8 +1548,28 @@ pub fn Binder(comptime config: types.Config) type {
             inner.windows = false;
             inner.window_error=if(scope.inside_window) error.WindowingError else error.GroupingError;
             var kind = kind_in;
+            // WITHIN GROUP is required for an ordered-set aggregate (42809).
+            if (ast.orderedSetAggregate(kind)) return error.WrongObjectType;
+            if (ast.collectingAggregate(kind)) {
+                const result = try typeCollectAggregate(context, &inner, n, kind);
+                try aggregateInput(context, &inner, n, if (kind == .string_agg or kind == .json_object_agg or kind == .jsonb_object_agg) 2 else 1);
+                if (n.c != none) {
+                    inner.window_error = error.WindowingError;
+                    try typeExpr(context, &inner, n.c);
+                    try booleanArgument(context, n.c);
+                }
+                n.kind = .aggregate;
+                n.agg = kind;
+                n.a = n.b;
+                n.b = none;
+                n.ty = result;
+                n.typmod = -1;
+                n.constant = false;
+                if (scope.saw_aggregate) |flag| flag.* = true;
+                return;
+            }
             if (n.star) {
-                if (kind != .count or n.distinct) return error.Syntax;
+                if (kind != .count or n.distinct or n.order != none) return error.Syntax;
                 kind = .count_star;
             } else if (ast.pairAggregate(kind)) {
                 try typePairAggregate(context, &inner, n);
@@ -1265,6 +1594,9 @@ pub fn Binder(comptime config: types.Config) type {
                 try booleanArgument(context, n.c);
             }
             const result=try aggregateType(context,n,kind,arg,arg_ty);
+            // ORDER BY inside an ordinary aggregate (B11): its inputs are
+            // sorted before the transition runs (Exec.collectAggregate).
+            if (n.order != none) try aggregateInput(context, &inner, n, 1);
             n.kind = .aggregate;
             n.agg = kind;
             n.a = n.b;
@@ -1339,6 +1671,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .regr_count => .int8,
                 .corr, .covar_pop, .covar_samp, .regr_sxx, .regr_syy, .regr_sxy, .regr_avgx, .regr_avgy, .regr_slope, .regr_intercept, .regr_r2 => .float8,
                 .bit_and, .bit_or, .bit_xor => if (value.integral(arg_ty)) arg_ty else return error.UndefinedFunction,
+                // Collection / ordered-set aggregates type elsewhere; as
+                // window functions they are not provided (0A000).
+                .array_agg, .string_agg, .json_agg, .jsonb_agg, .json_object_agg, .jsonb_object_agg,
+                .percentile_cont, .percentile_disc, .mode, .hypothetical_rank, .hypothetical_dense_rank, .hypothetical_percent_rank, .hypothetical_cume_dist => return error.UnsupportedStatement,
                 .none => unreachable,
             };
         }
@@ -1584,6 +1920,15 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn typeFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            // Built by linkAggregateInput with typed members (B11).
+            if (n.func == .aggregate_input) return;
+            if (n.within_group) return typeOrderedSet(context, scope, n);
+            if (n.order != none) {
+                // Aggregate ORDER BY is not implemented for window functions;
+                // elsewhere ORDER BY needs an aggregate (42809).
+                if (n.window != none) return error.UnsupportedStatement;
+                if (aggregateKind(context, n) == .none) return error.WrongObjectType;
+            }
             if(n.window!=none) return typeWindow(context,scope,n);
             if(valueWindowName(context,n)) {try typeValueArguments(context,scope,n);return error.WrongObjectType;}
             if(offsetWindowName(context,n)) {
@@ -1632,6 +1977,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .window_call => unreachable,
                 .routine, .routine_param => {},
                 .none => return bindRoutineCall(context, n, count),
+                .aggregate_input => return,
+                // Bound by bindJsonTable only (B11).
+                .json_table, .json_table_passing, .json_table_column => return error.Syntax,
+                .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => try typeJsonFunction(context, n, count),
                 .greatest, .least => {
                     if (count == 0) return error.Syntax;
                     var target: ast.Type = .unknown;
@@ -3200,7 +3549,12 @@ pub fn Binder(comptime config: types.Config) type {
                             try comparable(context, &n.a, &n.b);
                             n.ty = .boolean;
                         },
-                        .add, .sub, .mul, .div, .mod => try arithmeticType(context, n),
+                        .add, .sub, .mul, .div, .mod => if (n.op == .sub and context.node(n.a).ty == .jsonb) try jsonOperatorCall(context, n, .jsonb_minus_op) else try arithmeticType(context, n),
+                        .delete_path => try jsonOperatorCall(context, n, .jsonb_delete_path_op),
+                        .exists_any => try jsonOperatorCall(context, n, .jsonb_exists_any_op),
+                        .exists_all => try jsonOperatorCall(context, n, .jsonb_exists_all_op),
+                        .path_exists => try jsonOperatorCall(context, n, .jsonb_path_exists_op),
+                        .path_match => try jsonOperatorCall(context, n, .jsonb_path_match_op),
                         .concat => {
                             const left_ty = context.node(n.a).ty;
                             const right_ty = context.node(n.b).ty;
@@ -3572,6 +3926,7 @@ pub fn Binder(comptime config: types.Config) type {
                         .array_constructor => break :blk .{ .name = "array", .strength = 2 },
                         .array_subscript => break :blk figure(context, n.b, buffer),
                         .array_any => break :blk .{ .name = "?column?", .strength = 0 },
+                        .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => break :blk .{ .name = "?column?", .strength = 0 },
                         else => {},
                     }
                     buffer.* = toName(context, n.name);
@@ -4971,7 +5326,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (ty == .json) return error.UndefinedFunction;
             // No btree or hash operator classes (could not identify an
             // ordering/equality operator: 42883).
-            if (ty == .point or ty == .box or ty == .xml) return error.UndefinedFunction;
+            if (ty == .point or ty == .box or ty == .xml or ty == .jsonpath) return error.UndefinedFunction;
         }
 
         fn bindSetOp(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv) Error!u16 {
@@ -5237,6 +5592,36 @@ pub fn Binder(comptime config: types.Config) type {
             } else try validateDiscardedGroup(context, p, n.b);
         }
 
+        /// Direct arguments of an ordered-set aggregate (the leading members
+        /// of its aggregate_input) may read grouped expressions only (42803).
+        fn groupedDirectArguments(context: *const Context, p: *const Plan, input: u16) Error!void {
+            const layout = ast.AggregateInput.decode(context.node(input).integer);
+            var item = context.node(input).b;
+            for (0..layout.values) |_| {
+                if (item == none) break;
+                if (!groupedOnly(context, p, item)) return error.GroupingError;
+                item = context.node(item).next;
+            }
+        }
+
+        fn groupedOnly(context: *const Context, p: *const Plan, id: u16) bool {
+            if (id == none) return true;
+            for (p.keys[0..p.key_count]) |key| if (sameExpr(context, id, key)) return true;
+            const n = context.node(id);
+            switch (n.kind) {
+                .column => return n.level != 0,
+                .aggregate, .scalar_subquery, .exists_subquery => return true,
+                else => {},
+            }
+            if (!groupedOnly(context, p, n.a) or !groupedOnly(context, p, n.c)) return false;
+            if (listOwner(n.kind)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) if (!groupedOnly(context, p, item)) return false;
+                return true;
+            }
+            return groupedOnly(context, p, n.b);
+        }
+
         fn groupify(context: *const Context, p: *Plan, id: u16) Error!void {
             if (id == none) return;
             const n = context.node(id);
@@ -5267,6 +5652,7 @@ pub fn Binder(comptime config: types.Config) type {
             switch (n.kind) {
                 .row_compare => if (n.a != none) return validateDiscardedGroup(context, p, n.a),
                 .aggregate => {
+                    if (ast.orderedSetAggregate(n.agg)) try groupedDirectArguments(context, p, n.a);
                     const index = try registerAgg(context, p, id);
                     return groupColumn(n, p.key_count + index, -1);
                 },
@@ -5531,6 +5917,86 @@ pub fn Binder(comptime config: types.Config) type {
             return none;
         }
 
+        /// JSON_TABLE (B11 json-agg lane) as a plan of its own. The context
+        /// item becomes jsonb (untyped, json and string inputs convert;
+        /// others are 42804), the row and column paths jsonpath constants,
+        /// PASSING values keep their types (untyped as text), DEFAULT
+        /// expressions convert to their column's type. They see the FROM
+        /// items before it (implicit LATERAL). Column names must be
+        /// distinct (42701); behaviors a column kind does not allow are
+        /// 42601. Exec.jsonTableRows produces the rows (json_eval.sig).
+        fn bindJsonTable(context: *const Context, scope: *Scope, item: *const Ast.FromItem, env: ?*const CteEnv) Error!u16 {
+            const plans = plansOf(context);
+            const id = try plans.add();
+            var inner: Scope = .{ .parent = scope, .plan = id, .ctes = env };
+            const table = context.node(item.function);
+            try typeExpr(context, &inner, table.a);
+            switch (context.node(table.a).ty) {
+                .jsonb => {},
+                .unknown, .json, .text, .varchar, .bpchar, .name => table.a = try convert(context, table.a, .jsonb, -1, .explicit),
+                else => return error.TypeMismatch,
+            }
+            try typeExpr(context, &inner, table.c);
+            try coerce(context, table.c, .jsonpath);
+            const p = &plans.items[id];
+            var count: usize = 0;
+            var entry = table.b;
+            while (entry != none) : (entry = context.node(entry).next) {
+                const n = context.node(entry);
+                if (n.func == .json_table_passing) {
+                    try typeExpr(context, &inner, n.b);
+                    if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .text);
+                    n.ty = context.node(n.b).ty;
+                    continue;
+                }
+                if (count == config.columns) return error.ColumnCapacity;
+                const name = toName(context, n.name);
+                for (p.names[0..count]) |previous| if (types.same(previous.slice(), name.slice())) return error.DuplicateColumn;
+                const spec = ast.JsonTableColumn.decode(n.integer);
+                const B = ast.JsonTableColumn.Behavior;
+                switch (spec.kind) {
+                    .ordinality => {},
+                    .exists => {
+                        if (spec.on_empty != .unspecified) return error.Syntax;
+                        switch (spec.on_error) {
+                            .unspecified, .error_value, .true_value, .false_value, .unknown => {},
+                            else => return error.Syntax,
+                        }
+                    },
+                    .regular => {
+                        const formatted = spec.format_json or spec.wrapper != .unspecified or spec.quotes != .unspecified or n.cast_type == .json or n.cast_type == .jsonb;
+                        for ([_]B{ spec.on_empty, spec.on_error }) |behavior| switch (behavior) {
+                            .unspecified, .null_value, .error_value, .default_value => {},
+                            .empty_array, .empty_object => if (!formatted) return error.Syntax,
+                            else => return error.Syntax,
+                        };
+                        if (spec.wrapper != .unspecified and spec.wrapper != .without and spec.quotes == .omit) return error.Syntax;
+                    },
+                }
+                if (spec.kind != .ordinality and n.a != none) {
+                    try typeExpr(context, &inner, n.a);
+                    try coerce(context, n.a, .jsonpath);
+                }
+                const ty: ast.Type = if (spec.kind == .ordinality) .int4 else n.cast_type;
+                const typmod: i32 = if (spec.kind == .ordinality) -1 else n.typmod;
+                for ([_]*u16{ &n.b, &n.c }) |slot| if (slot.* != none) {
+                    try typeExpr(context, &inner, slot.*);
+                    slot.* = try convert(context, slot.*, ty, typmod, .assignment);
+                };
+                p.names[count] = name;
+                p.tys[count] = ty;
+                p.typmods[count] = typmod;
+                p.targets[count] = try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
+                count += 1;
+            }
+            if (count == 0) return error.Syntax;
+            p.function = item.function;
+            p.series = .json_table;
+            p.count = count;
+            p.width = count;
+            return id;
+        }
+
         /// A function in FROM (B11) as a plan of its own: generate_series
         /// over int4/int8/numeric (optional step) or timestamp[tz] with an
         /// interval step, otherwise any scalar function (one row). Arguments
@@ -5539,6 +6005,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// after the function, or the table alias; ORDINALITY adds a bigint
         /// `ordinality` column.
         fn bindTableFunction(context: *const Context, scope: *Scope, item: *const Ast.FromItem, env: ?*const CteEnv) Error!u16 {
+            if (context.node(item.function).func == .json_table) return bindJsonTable(context, scope, item, env);
             const plans = plansOf(context);
             const id = try plans.add();
             var inner: Scope = .{ .parent = scope, .plan = id, .ctes = env };

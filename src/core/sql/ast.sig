@@ -47,7 +47,10 @@ pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, n
     // Network <<= and >>=.
     within_eq, contains_eq,
     // Geometric <-> (distance) and ~= (same as).
-    distance, same };
+    distance, same,
+    // JSONB #- ?| ?& and SQL/JSON path @? @@ (B11 json-agg lane); the
+    // binder rewrites them into calls of the *_op functions.
+    delete_path, exists_any, exists_all, path_exists, path_match };
 
 /// Built-in functions bound by name.
 pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least,
@@ -93,7 +96,67 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // parameter types) and a bound routine variable (`relation` 0 a
     // parameter / PL/pgSQL variable `integer`, 1 NEW.`column`, 2
     // OLD.`column`), read from the evaluation frame.
-    routine, routine_param };
+    routine, routine_param,
+    // Internal (B11 json-agg lane): the inputs of an aggregate with ORDER BY
+    // keys or several arguments: `b` -> next lists the value arguments, then
+    // the sort keys; `integer` is an AggregateInput layout. Exec reads its
+    // members directly; evaluating it as a value is 0A000.
+    aggregate_input,
+    // JSONB modification, conversion and SQL/JSON path functions (B11
+    // json-agg lane, json_eval.sig); *_op are the operator forms
+    // (jsonb - x, #-, ?|, ?&, @?, @@), named ?column?.
+    jsonb_set, jsonb_set_lax, jsonb_insert, jsonb_delete_path, jsonb_strip_nulls, jsonb_pretty, to_json, to_jsonb,
+    jsonb_path_exists, jsonb_path_match, jsonb_path_query_array, jsonb_path_query_first, jsonb_exists_any, jsonb_exists_all,
+    jsonb_minus_op, jsonb_delete_path_op, jsonb_exists_any_op, jsonb_exists_all_op, jsonb_path_exists_op, jsonb_path_match_op,
+    // JSON_TABLE in FROM (B11 json-agg lane): the table node (`a` context
+    // item, `c` row path, `b` -> next PASSING values then columns,
+    // `integer` bit 0 ERROR ON ERROR), a PASSING value (`name` AS, `b`
+    // value) and a column (`name`, type in cast_type/typmod, `a` PATH, `b`
+    // / `c` DEFAULT ON EMPTY / ON ERROR, `integer` a JsonTableColumn).
+    // Exec reads them; evaluating one as a value is 0A000.
+    json_table, json_table_passing, json_table_column };
+
+/// JSON_TABLE column flags (Node.integer of a json_table_column).
+pub const JsonTableColumn = struct {
+    pub const Kind = enum(u2) { regular = 0, ordinality = 1, exists = 2 };
+    /// ON EMPTY / ON ERROR behaviors (0: not written).
+    pub const Behavior = enum(u4) { unspecified = 0, null_value = 1, error_value = 2, empty_array = 3, empty_object = 4, default_value = 5, true_value = 6, false_value = 7, unknown = 8 };
+    pub const Wrapper = enum(u2) { unspecified = 0, without = 1, unconditional = 2, conditional = 3 };
+    pub const Quotes = enum(u2) { unspecified = 0, keep = 1, omit = 2 };
+    kind: Kind = .regular,
+    format_json: bool = false,
+    wrapper: Wrapper = .unspecified,
+    quotes: Quotes = .unspecified,
+    on_empty: Behavior = .unspecified,
+    on_error: Behavior = .unspecified,
+
+    pub fn encode(self: JsonTableColumn) i64 {
+        return @as(i64, @intFromEnum(self.kind)) | (@as(i64, @intFromBool(self.format_json)) << 2) | (@as(i64, @intFromEnum(self.wrapper)) << 3) |
+            (@as(i64, @intFromEnum(self.quotes)) << 5) | (@as(i64, @intFromEnum(self.on_empty)) << 8) | (@as(i64, @intFromEnum(self.on_error)) << 12);
+    }
+
+    pub fn decode(raw: i64) JsonTableColumn {
+        const word: u64 = @bitCast(raw);
+        return .{
+            .kind = @enumFromInt(@as(u2, @truncate(word & 3))),
+            .format_json = (word >> 2) & 1 != 0,
+            .wrapper = @enumFromInt(@as(u2, @truncate((word >> 3) & 3))),
+            .quotes = @enumFromInt(@as(u2, @truncate((word >> 5) & 3))),
+            .on_empty = behavior(word >> 8),
+            .on_error = behavior(word >> 12),
+        };
+    }
+
+    fn behavior(word: u64) Behavior {
+        const code: u4 = @truncate(word & 15);
+        return if (code > 8) .unspecified else @enumFromInt(code);
+    }
+};
+
+/// The JSONB / SQL/JSON path functions of json_eval.sig.
+pub fn jsonFunction(func: Func) bool {
+    return @intFromEnum(func) >= @intFromEnum(Func.jsonb_set) and @intFromEnum(func) <= @intFromEnum(Func.jsonb_path_match_op);
+}
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
@@ -131,7 +194,9 @@ pub fn immutableBuiltin(func: Func) bool {
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
         .xmlparse, .xmlserialize, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
-        else => false,
+        // to_json / to_jsonb are STABLE (timestamptz output).
+        .to_json, .to_jsonb => false,
+        else => jsonFunction(func),
     };
 }
 
@@ -153,7 +218,9 @@ pub fn strictFunction(func: Func) bool {
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
         .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
-        else => false,
+        // jsonb_set_lax reads NULL arguments itself.
+        .jsonb_set_lax => false,
+        else => jsonFunction(func),
     };
 }
 
@@ -171,7 +238,23 @@ pub const Agg = enum { none, count, count_star, sum, avg, min, max, bool_and, bo
     // Statistical (B11, aggregates_stat.sig): one-argument variance family and
     // two-argument (Y, X) float8 regression aggregates; integer bitwise folds.
     stddev_pop, stddev_samp, var_pop, var_samp, corr, covar_pop, covar_samp, regr_count, regr_sxx, regr_syy,
-    regr_sxy, regr_avgx, regr_avgy, regr_slope, regr_intercept, regr_r2, bit_and, bit_or, bit_xor };
+    regr_sxy, regr_avgx, regr_avgy, regr_slope, regr_intercept, regr_r2, bit_and, bit_or, bit_xor,
+    // Collection, JSON and ordered-set aggregates (B11 json-agg lane,
+    // aggregates_collect.sig). They read every input of a group (sorted by
+    // their ORDER BY / WITHIN GROUP keys) and so run only on the sorted
+    // grouping operator; the other operators reject them with 0A000.
+    array_agg, string_agg, json_agg, jsonb_agg, json_object_agg, jsonb_object_agg,
+    percentile_cont, percentile_disc, mode, hypothetical_rank, hypothetical_dense_rank, hypothetical_percent_rank, hypothetical_cume_dist };
+
+/// Aggregates that need their group's whole input (Exec.collectAggregate).
+pub fn collectingAggregate(agg: Agg) bool {
+    return @intFromEnum(agg) >= @intFromEnum(Agg.array_agg);
+}
+
+/// Ordered-set and hypothetical-set aggregates (WITHIN GROUP).
+pub fn orderedSetAggregate(agg: Agg) bool {
+    return @intFromEnum(agg) >= @intFromEnum(Agg.percentile_cont);
+}
 
 /// Two-argument (Y, X) aggregates; their argument is an aggregate_pair node.
 pub fn pairAggregate(agg: Agg) bool {
@@ -289,6 +372,40 @@ pub const Node = struct {
     star: bool = false,
     agg: Agg = .none,
     reg: Reg = .none,
+    /// Aggregate ORDER BY (inside the call) or WITHIN GROUP (ORDER BY ...)
+    /// keys: an index into Pool.windows whose `order` keys hold them (B11).
+    order: u16 = none,
+    within_group: bool = false,
+};
+
+/// The member layout of an aggregate_input node (its `integer`): value
+/// argument count in bits 0..3, sort key count in bits 4..11, then per key
+/// two bits at 12 + 2 * index: DESC and NULLS FIRST.
+pub const AggregateInput = struct {
+    values: usize = 1,
+    keys: usize = 0,
+    descending: u64 = 0,
+    nulls_first: u64 = 0,
+
+    pub fn encode(self: *const AggregateInput) i64 {
+        var word: u64 = @as(u64, @intCast(self.values)) | (@as(u64, @intCast(self.keys)) << 4);
+        for (0..self.keys) |index| {
+            word |= ((self.descending >> @intCast(index)) & 1) << @intCast(12 + 2 * index);
+            word |= ((self.nulls_first >> @intCast(index)) & 1) << @intCast(13 + 2 * index);
+        }
+        return @bitCast(word);
+    }
+
+    pub fn decode(raw: i64) AggregateInput {
+        const word: u64 = @bitCast(raw);
+        var out: AggregateInput = .{ .values = @intCast(word & 15), .keys = @intCast((word >> 4) & 0xff) };
+        if (out.keys > 24) out.keys = 24;
+        for (0..out.keys) |index| {
+            out.descending |= ((word >> @intCast(12 + 2 * index)) & 1) << @intCast(index);
+            out.nulls_first |= ((word >> @intCast(13 + 2 * index)) & 1) << @intCast(index);
+        }
+        return out;
+    }
 };
 
 pub fn Ast(comptime config: types.Config) type {

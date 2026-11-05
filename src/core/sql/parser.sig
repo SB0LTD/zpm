@@ -1335,7 +1335,7 @@ pub fn Parser(comptime config: types.Config) type {
             return switch (token.keyword) {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
-                .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml => true,
+                .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath => true,
                 else => false,
             };
         }
@@ -1499,6 +1499,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .point => .{ .ty = .point },
                 .box => .{ .ty = .box },
                 .xml => .{ .ty = .xml },
+                .jsonpath => .{ .ty = .jsonpath },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };
@@ -2841,7 +2842,7 @@ pub fn Parser(comptime config: types.Config) type {
                 // A function call in FROM (B11), implicitly LATERAL, with
                 // optional WITH ORDINALITY.
                 if (self.mode == .standard and !item.only and self.isSymbol(.lparen)) {
-                    item.function = try self.functionCall(item.name);
+                    item.function = if (item.schema == null and !item.name.quoted and types.keyword(item.name.span.slice(self.source), "json_table")) try self.jsonTable(item.name) else try self.functionCall(item.name);
                     self.pool.complex = true;
                     if (self.isWord("WITH") and wordIs(self.source, try self.peek(), "ordinality")) {
                         try self.advance();
@@ -3303,6 +3304,11 @@ pub fn Parser(comptime config: types.Config) type {
                     .contains_eq => .contains_eq,
                     .distance => .distance,
                     .same => .same,
+                    .question_pipe => .exists_any,
+                    .question_amp => .exists_all,
+                    .hash_minus => .delete_path,
+                    .at_question => .path_exists,
+                    .at_at => .path_match,
                     else => break,
                 };
                 try self.advance();
@@ -3430,7 +3436,9 @@ pub fn Parser(comptime config: types.Config) type {
             for ([_][]const u8{ "count", "sum", "avg", "min", "max", "bool_and", "bool_or", "every",
                 "stddev", "stddev_pop", "stddev_samp", "variance", "var_pop", "var_samp", "corr", "covar_pop", "covar_samp",
                 "regr_count", "regr_sxx", "regr_syy", "regr_sxy", "regr_avgx", "regr_avgy", "regr_slope", "regr_intercept",
-                "regr_r2", "bit_and", "bit_or", "bit_xor" }) |word| {
+                "regr_r2", "bit_and", "bit_or", "bit_xor",
+                "array_agg", "string_agg", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
+                "percentile_cont", "percentile_disc", "mode" }) |word| {
                 if (types.keyword(raw, word)) return true;
             }
             return false;
@@ -3464,7 +3472,20 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.pool.raise(node, item);
                     last = item;
                 }
+                // Aggregate ORDER BY inside the call (B11).
+                if (self.mode == .standard and self.isWord("ORDER")) self.pool.nodes[node].order = try self.aggregateOrder(node);
                 try self.expectSymbol(.rparen);
+            }
+            // WITHIN GROUP (ORDER BY ...) of an ordered-set aggregate (B11).
+            if (self.mode == .standard and self.rawWord("within") and (try self.peek()).isWord("GROUP")) {
+                try self.advance();
+                try self.advance();
+                try self.expectSymbol(.lparen);
+                if (call.star or call.distinct or self.pool.nodes[node].order != none) return error.Syntax;
+                self.pool.nodes[node].order = try self.aggregateOrder(node);
+                self.pool.nodes[node].within_group = true;
+                try self.expectSymbol(.rparen);
+                self.pool.complex = true;
             }
             if (self.mode == .standard and self.isWord("FILTER") and lparenNext(try self.peek())) {
                 try self.advance();
@@ -3482,6 +3503,178 @@ pub fn Parser(comptime config: types.Config) type {
             const n = &self.pool.nodes[node];
             if (n.distinct or n.c != none or self.aggregateName(name)) self.pool.complex = true;
             return node;
+        }
+
+        /// JSON_TABLE(context, 'path' [AS name] [PASSING value AS name, ...]
+        /// COLUMNS (...) [ERROR | EMPTY [ARRAY] ON ERROR]) in FROM (B11
+        /// json-agg lane); see ast.JsonTableColumn. NESTED PATH is 0A000.
+        fn jsonTable(self: *Self, name: ast.Ident) Error!u16 {
+            try self.expectSymbol(.lparen);
+            try self.enter();
+            defer self.leave();
+            const context_item = try self.expression();
+            try self.expectSymbol(.comma);
+            const path = try self.jsonPathLiteral();
+            if (try self.takeWord("AS")) _ = try self.identifier();
+            var list: ArgList = .{};
+            if (try self.takeRaw("passing")) {
+                while (true) {
+                    const value_node = try self.expression();
+                    try self.expectWord("AS");
+                    const variable = try self.label();
+                    list.push(self.pool, try self.pool.add(.{ .kind = .function, .func = .json_table_passing, .name = variable, .b = value_node }));
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+            }
+            if (!try self.takeRaw("columns")) return error.Syntax;
+            try self.expectSymbol(.lparen);
+            while (true) {
+                if (self.rawWord("nested")) return error.UnsupportedStatement;
+                list.push(self.pool, try self.jsonTableColumn());
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            try self.expectSymbol(.rparen);
+            var flags: i64 = 0;
+            if (self.rawWord("error") or self.rawWord("empty")) {
+                if (try self.takeRaw("error")) {
+                    flags = 1;
+                } else {
+                    try self.advance();
+                    _ = try self.takeRaw("array");
+                }
+                try self.expectWord("ON");
+                if (!try self.takeRaw("error")) return error.Syntax;
+            }
+            try self.expectSymbol(.rparen);
+            const node = try self.pool.add(.{ .kind = .function, .func = .json_table, .name = name, .a = context_item, .c = path, .b = list.head, .integer = flags });
+            var item = list.head;
+            while (item != none) : (item = self.pool.nodes[item].next) try self.pool.raise(node, item);
+            return node;
+        }
+
+        fn jsonPathLiteral(self: *Self) Error!u16 {
+            if (self.current.kind != .string) return error.Syntax;
+            const token = self.current;
+            try self.advance();
+            return self.pool.add(.{ .kind = .text_literal, .text = token.quoted() });
+        }
+
+        fn jsonTableColumn(self: *Self) Error!u16 {
+            var column: ast.Node = .{ .kind = .function, .func = .json_table_column, .name = try self.identifier() };
+            var spec: ast.JsonTableColumn = .{};
+            if (try self.takeWord("FOR")) {
+                if (!try self.takeRaw("ordinality")) return error.Syntax;
+                spec.kind = .ordinality;
+                column.cast_type = .int4;
+                column.integer = spec.encode();
+                return self.pool.add(column);
+            }
+            const type_spec = try self.typeName();
+            column.cast_type = type_spec.ty;
+            column.typmod = type_spec.typmod;
+            if (try self.takeRaw("exists")) spec.kind = .exists;
+            if (spec.kind == .regular and try self.takeRaw("format")) {
+                if (!try self.takeRaw("json")) return error.Syntax;
+                if (try self.takeRaw("encoding")) {
+                    if (!try self.takeRaw("utf8")) return error.Syntax;
+                }
+                spec.format_json = true;
+            }
+            if (try self.takeRaw("path")) column.a = try self.jsonPathLiteral();
+            if (spec.kind == .regular) {
+                if (try self.takeRaw("without")) {
+                    _ = try self.takeRaw("array");
+                    if (!try self.takeRaw("wrapper")) return error.Syntax;
+                    spec.wrapper = .without;
+                } else if (self.isWord("WITH")) {
+                    const after = try self.peek();
+                    if (wordIs(self.source, after, "conditional") or wordIs(self.source, after, "unconditional") or wordIs(self.source, after, "array") or wordIs(self.source, after, "wrapper")) {
+                        try self.advance();
+                        spec.wrapper = if (try self.takeRaw("conditional")) .conditional else .unconditional;
+                        if (spec.wrapper == .unconditional) _ = try self.takeRaw("unconditional");
+                        _ = try self.takeRaw("array");
+                        if (!try self.takeRaw("wrapper")) return error.Syntax;
+                    }
+                }
+                if (self.rawWord("keep") or self.rawWord("omit")) {
+                    spec.quotes = if (try self.takeRaw("keep")) .keep else blk: {
+                        try self.advance();
+                        break :blk .omit;
+                    };
+                    if (!try self.takeRaw("quotes")) return error.Syntax;
+                    if (try self.takeWord("ON")) {
+                        if (!try self.takeRaw("scalar")) return error.Syntax;
+                        if (!try self.takeRaw("string")) return error.Syntax;
+                    }
+                }
+            }
+            // [behavior ON EMPTY] [behavior ON ERROR]
+            while (true) {
+                var behavior: ast.JsonTableColumn.Behavior = .unspecified;
+                var expression_node: u16 = none;
+                if (try self.takeRaw("error")) {
+                    behavior = .error_value;
+                } else if (try self.takeWord("NULL")) {
+                    behavior = .null_value;
+                } else if (try self.takeRaw("empty")) {
+                    if (try self.takeRaw("object")) behavior = .empty_object else {
+                        _ = try self.takeRaw("array");
+                        behavior = .empty_array;
+                    }
+                } else if (try self.takeWord("DEFAULT")) {
+                    behavior = .default_value;
+                    expression_node = try self.expression();
+                } else if (try self.takeWord("TRUE")) {
+                    behavior = .true_value;
+                } else if (try self.takeWord("FALSE")) {
+                    behavior = .false_value;
+                } else if (try self.takeRaw("unknown")) {
+                    behavior = .unknown;
+                } else break;
+                try self.expectWord("ON");
+                if (try self.takeRaw("empty")) {
+                    if (spec.on_empty != .unspecified or spec.on_error != .unspecified) return error.Syntax;
+                    spec.on_empty = behavior;
+                    column.b = expression_node;
+                } else if (try self.takeRaw("error")) {
+                    if (spec.on_error != .unspecified) return error.Syntax;
+                    spec.on_error = behavior;
+                    column.c = expression_node;
+                } else return error.Syntax;
+            }
+            column.integer = spec.encode();
+            return self.pool.add(column);
+        }
+
+        /// `ORDER BY key [ASC|DESC] [NULLS FIRST|LAST], ...` of an aggregate
+        /// call: the keys go to a Pool.windows slot of their own (B11).
+        fn aggregateOrder(self: *Self, owner: u16) Error!u16 {
+            try self.expectWord("ORDER");
+            try self.expectWord("BY");
+            if (self.pool.window_len == self.pool.windows.len) return error.StatementTooComplex;
+            const index = self.pool.window_len;
+            self.pool.window_len += 1;
+            self.pool.windows[index] = .{};
+            const spec = &self.pool.windows[index];
+            while (true) {
+                if (spec.order_count == config.columns) return error.ColumnCapacity;
+                const item = try self.expression();
+                try self.pool.raise(owner, item);
+                var key: Ast.OrderKey = .{ .expr = item };
+                if (try self.takeWord("DESC")) key.descending = true else _ = try self.takeWord("ASC");
+                if (try self.takeWord("NULLS")) {
+                    if (try self.takeWord("FIRST")) key.nulls_first = true else {
+                        try self.expectWord("LAST");
+                        key.nulls_first = false;
+                    }
+                }
+                spec.order[spec.order_count] = key;
+                spec.order_origin[spec.order_count] = item;
+                spec.order_count += 1;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            self.pool.complex = true;
+            return @intCast(index);
         }
 
         fn windowSpec(self:*Self,owner:u16,allow_bare:bool) Error!u16 {

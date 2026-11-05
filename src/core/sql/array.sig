@@ -357,6 +357,26 @@ pub fn Arrays(comptime V: type) type {
             };
         }
 
+        /// The elements of a text-like array (text, varchar, name) as slices
+        /// into `bytes` in row-major order, NULL elements as null; stores
+        /// the first out.len and returns the element count (B11).
+        pub fn textSlices(bytes: []const u8, out: []?[]const u8) usize {
+            var at = bodyStart(bytes);
+            const total = shape(bytes).count();
+            for (0..total) |index| {
+                const flag = bytes[at];
+                at += 1;
+                var item: ?[]const u8 = null;
+                if (flag != 0) {
+                    const len = getInt(u16, bytes, &at);
+                    item = bytes[at..][0..len];
+                    at += len;
+                }
+                if (index < out.len) out[index] = item;
+            }
+            return total;
+        }
+
         /// Sequential element access in row-major order.
         pub const Reader = struct {
             bytes: []const u8,

@@ -1,5 +1,25 @@
 # SQL conformance TDD checkpoint
 
+## JSON and aggregates candidate (lane B11, wave 3) - 5 November 2026
+
+Branch `b11/json-agg` (on 6f32405) closes six smoke programs test-first:
+PG.AGG.COLLECTION, PG.JSON.AGG, PG.AGG.ORDERED_SET, PG.JSONB.MODIFY,
+PG.JSON.PATH and PG.JSON.TABLE. The unchanged driver moves from 83 passes
+to 89; it still exits 1 SqlConformanceIncomplete and no other program
+changed. `contract-sql-json-agg` (tests/test_sql_json_agg.sig) covers
+values, column names and OIDs, NULLs and empty inputs, exact SQLSTATEs
+(22004, 22033-2203G, 42601, 42803, 42804, 42809, 42883, 42P10, 42701,
+42704, 22023, 22003, 22012, 22P02, 2202E, 0A000, 54000, 54001), statement
+atomicity, work budgets and cancellation, and replay into a replica. Only
+the six oracle programs are native-verified; every other expectation is
+pending native verification. Details, limits and open items:
+docs/SQL_JSON_AGG.md.
+
+Durability: no new change-record op (45-49 unused) and no new value tag
+(32-35 unused). The new jsonpath type (OID 4072) stores its canonical text
+with the existing text value tag; replay rejects a jsonpath that is not its
+own canonical text (InvalidChangeRecord). pg_type grows from 78 to 80 rows.
+
 ## Routines candidate (lane B11, wave 3) - 5 November 2026
 
 Branch `b11/routines` (rebased on f505a80) closes four smoke programs

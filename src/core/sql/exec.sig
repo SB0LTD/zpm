@@ -14,6 +14,8 @@ const catalog = @import("catalog.sig");
 const aggregate_stats = @import("aggregates_stat.sig");
 const numeric_module = @import("numeric.sig");
 const tablesample = @import("tablesample.sig");
+const collect_module = @import("aggregates_collect.sig");
+const json_eval = @import("json_eval.sig");
 const builtin = @import("builtin");
 const Error = types.Error;
 const none = ast.none;
@@ -266,6 +268,7 @@ pub fn Exec(comptime config: types.Config) type {
             fn tableFunction(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
                 var ctx = self.context(outer);
                 var out: List = .{ .start = @intCast(self.work.ref_low) };
+                if (p.series == .json_table) return self.jsonTableRows(p, outer);
                 if (p.series == .none) {
                     const at = try self.cells(p.width);
                     self.work.cells[at] = try E.eval(&ctx, p.function);
@@ -299,7 +302,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const zero: V.Cell = .{ .interval = .{} };
                         direction = V.compare(&step, &zero);
                     },
-                    .none => unreachable,
+                    .none, .json_table => unreachable,
                 }
                 if (direction == 0) return error.InvalidParameterValue;
                 var current = args[0];
@@ -322,6 +325,27 @@ pub fn Exec(comptime config: types.Config) type {
                         else => current = try Io.arithmetic(.add, &current, &step, ty, self.session),
                     }
                 }
+                return self.finish(p, out);
+            }
+
+            /// JSON_TABLE rows (B11 json-agg lane, json_eval.sig): each row's
+            /// cells go to the workspace as they are produced.
+            fn jsonTableRows(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                var ctx = self.context(outer);
+                var out: List = .{ .start = @intCast(self.work.ref_low) };
+                const Emit = struct {
+                    query: *Query,
+                    list: *List,
+                    width: usize,
+                    fn row(raw: *anyopaque, values: []const V.Cell) Error!void {
+                        const state: *@This() = @ptrCast(@alignCast(raw));
+                        const at = try state.query.cells(state.width);
+                        for (values, 0..) |cell, index| state.query.work.cells[at + index] = cell;
+                        try state.query.push(state.list, at);
+                    }
+                };
+                var rows: Emit = .{ .query = self, .list = &out, .width = p.width };
+                try json_eval.JsonEval(config, E).jsonTable(&ctx, p.function, p.names[0..p.count], p.tys[0..p.count], p.typmods[0..p.count], .{ .context = &rows, .row = Emit.row });
                 return self.finish(p, out);
             }
 
@@ -2681,6 +2705,10 @@ pub fn Exec(comptime config: types.Config) type {
                         else => unreachable,
                     },
                     .regr_count => {},
+                    // Collecting aggregates have no fixed-size transition
+                    // state: other operators reject them (B11, 0A000).
+                    .array_agg, .string_agg, .json_agg, .jsonb_agg, .json_object_agg, .jsonb_object_agg,
+                    .percentile_cont, .percentile_disc, .mode, .hypothetical_rank, .hypothetical_dense_rank, .hypothetical_percent_rank, .hypothetical_cume_dist => return error.UnsupportedStatement,
                     .corr, .covar_pop, .covar_samp, .regr_sxx, .regr_syy, .regr_sxy, .regr_avgx, .regr_avgy, .regr_slope, .regr_intercept, .regr_r2 => {
                         if (comptime config.text_bytes < 16) {
                             return error.WorkspaceCapacity;
@@ -2721,6 +2749,7 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn finishAggregate(self: *Query, agg: *const B.Agg, acc: *const Accumulator) Error!V.Cell {
+                if (ast.collectingAggregate(agg.kind)) return error.UnsupportedStatement;
                 switch (agg.kind) {
                     .count, .count_star, .regr_count => return .{ .integer = acc.count },
                     .bool_and, .bool_or => return if (acc.flag) |flag| .{ .boolean = flag } else .null_value,
@@ -2784,7 +2813,152 @@ pub fn Exec(comptime config: types.Config) type {
                 return Io.arithmetic(.div, &acc.value, &count, agg.ty, self.session);
             }
 
+            /// An aggregate over its argument with ORDER BY keys or several
+            /// arguments (an aggregate_input node, B11).
+            fn inputNode(self: *const Query, id: u16) bool {
+                if (id == none) return false;
+                const n = &self.pool.nodes[id];
+                return n.kind == .function and n.func == .aggregate_input;
+            }
+
+            /// Plans with an aggregate that needs its whole sorted input run
+            /// only on the sorted grouping operator (group / aggregate).
+            fn collectingPlan(self: *const Query, p: *const B.Plan) bool {
+                for (p.aggs[0..p.agg_count]) |agg| if (ast.collectingAggregate(agg.kind) or self.inputNode(agg.arg)) return true;
+                return false;
+            }
+
+            /// One group of a collecting aggregate (B11 json-agg lane): each
+            /// input row's values and sort keys are materialized (direct
+            /// arguments of an ordered-set aggregate are evaluated once, at
+            /// the group's first row), rows the aggregate ignores are
+            /// dropped, the rest sorted (stable merge sort) by the keys,
+            /// DISTINCT runs collapsed, and the fold runs in order.
+            fn collectAggregate(self: *Query, p: *const B.Plan, agg: *const B.Agg, tuples: Tuples, order: u32, first: usize, end: usize, outer: ?*const E.Context) Error!V.Cell {
+                var ctx = self.context(outer);
+                const at = self.mark();
+                defer self.release(at);
+                var members: [28]u16 = undefined;
+                var layout: ast.AggregateInput = .{};
+                if (self.inputNode(agg.arg)) {
+                    const input = &self.pool.nodes[agg.arg];
+                    layout = ast.AggregateInput.decode(input.integer);
+                    var item = input.b;
+                    for (0..layout.values + layout.keys) |index| {
+                        if (item == none or index == members.len) return error.UnsupportedStatement;
+                        members[index] = item;
+                        item = self.pool.nodes[item].next;
+                    }
+                } else members[0] = agg.arg;
+                const ordered_set = ast.orderedSetAggregate(agg.kind);
+                const direct = if (ordered_set) layout.values else 0;
+                const width = layout.values + layout.keys - direct;
+                const key_base = if (ordered_set) 0 else layout.values;
+                var direct_values: [24]V.Cell = undefined;
+                if (ordered_set) {
+                    if (first < end) self.setTuple(p, &ctx, tuples, self.work.refs[order + first]);
+                    for (members[0..direct], 0..) |id, index| direct_values[index] = try E.eval(&ctx, id);
+                }
+                const C = collect_module.Collect(config);
+                const hypothetical = @intFromEnum(agg.kind) >= @intFromEnum(ast.Agg.hypothetical_rank);
+                var rows: List = .{ .start = @intCast(self.work.ref_low) };
+                for (first..end) |position| {
+                    self.setTuple(p, &ctx, tuples, self.work.refs[order + position]);
+                    if (agg.filter != none and (try E.truth(&ctx, agg.filter)) != true) continue;
+                    const slot = try self.cells(width);
+                    for (members[direct..][0..width], 0..) |id, column| self.work.cells[slot + column] = try E.eval(&ctx, id);
+                    const first_cell = &self.work.cells[slot];
+                    const skip = switch (agg.kind) {
+                        .array_agg, .json_agg, .jsonb_agg, .json_object_agg, .jsonb_object_agg => false,
+                        .string_agg, .percentile_cont, .percentile_disc, .mode => first_cell.* == .null_value,
+                        .hypothetical_rank, .hypothetical_dense_rank, .hypothetical_percent_rank, .hypothetical_cume_dist => false,
+                        // Strict ordinary aggregates skip a NULL argument.
+                        else => first_cell.* == .null_value,
+                    };
+                    if (agg.kind == .json_object_agg or agg.kind == .jsonb_object_agg) {
+                        if (first_cell.* == .null_value) return error.NullValueNotAllowed;
+                    }
+                    if (!skip) try self.push(&rows, slot);
+                }
+                // Sort keys: the ORDER BY / WITHIN GROUP keys, then (DISTINCT)
+                // every value column as a tie-breaker.
+                var sort_keys: [28]B.SortKey = undefined;
+                var sort_count: usize = 0;
+                for (0..layout.keys) |index| {
+                    sort_keys[sort_count] = .{ .column = @intCast(key_base + index), .descending = (layout.descending >> @intCast(index)) & 1 != 0, .nulls_first = (layout.nulls_first >> @intCast(index)) & 1 != 0 };
+                    sort_count += 1;
+                }
+                if (agg.distinct) for (0..layout.values) |index| {
+                    sort_keys[sort_count] = .{ .column = @intCast(index), .descending = false, .nulls_first = config.nulls_first_ascending };
+                    sort_count += 1;
+                };
+                if (rows.count > 1 and sort_count != 0) {
+                    const scratch = try self.refs(rows.count);
+                    const sorter: RowSorter = .{ .query = self, .keys = &sort_keys, .key_count = sort_count };
+                    _ = try sort_module.mergeSort(self.handles(rows), self.work.refs[scratch..][0..rows.count], &sorter);
+                }
+                if (agg.distinct and rows.count > 1) {
+                    const items = self.handles(rows);
+                    var kept: u32 = 1;
+                    for (1..items.len) |index| {
+                        var same = true;
+                        for (0..layout.values) |column| {
+                            const x = &self.work.cells[items[index] + column];
+                            const y = &self.work.cells[items[kept - 1] + column];
+                            const x_null = x.* == .null_value;
+                            const y_null = y.* == .null_value;
+                            if (x_null != y_null or (!x_null and V.compare(x, y) != 0)) {
+                                same = false;
+                                break;
+                            }
+                        }
+                        if (same) continue;
+                        items[kept] = items[index];
+                        kept += 1;
+                    }
+                    rows.count = kept;
+                }
+                const sorted: C.Rows = .{ .cells = self.work.cells[0..], .handles = self.handles(rows) };
+                const node_ty = struct {
+                    fn of(query: *const Query, id: u16) ast.Type {
+                        return query.pool.nodes[id].ty;
+                    }
+                }.of;
+                switch (agg.kind) {
+                    .array_agg => return C.arrayAgg(sorted, node_ty(self, members[0]), self.session),
+                    .string_agg => return C.stringAgg(sorted, agg.ty == .bytea, self.session),
+                    .json_agg, .jsonb_agg => return C.jsonAgg(sorted, node_ty(self, members[0]), agg.kind == .jsonb_agg, self.session),
+                    .json_object_agg, .jsonb_object_agg => return C.objectAgg(sorted, node_ty(self, members[0]), node_ty(self, members[1]), agg.kind == .jsonb_object_agg, self.session),
+                    .percentile_cont, .percentile_disc => {
+                        const percentile = try C.fraction(&direct_values[0]) orelse return .null_value;
+                        if (agg.kind == .percentile_disc) return C.percentileDisc(sorted, percentile);
+                        return C.percentileCont(sorted, percentile, agg.ty);
+                    },
+                    .mode => return C.mode(sorted, self.session),
+                    .hypothetical_rank, .hypothetical_dense_rank, .hypothetical_percent_rank, .hypothetical_cume_dist => {
+                        var keys: [24]C.Key = undefined;
+                        for (0..layout.keys) |index| keys[index] = .{ .descending = (layout.descending >> @intCast(index)) & 1 != 0, .nulls_first = (layout.nulls_first >> @intCast(index)) & 1 != 0 };
+                        const kind: C.Hypothetical = switch (agg.kind) {
+                            .hypothetical_rank => .rank,
+                            .hypothetical_dense_rank => .dense_rank,
+                            .hypothetical_percent_rank => .percent_rank,
+                            else => .cume_dist,
+                        };
+                        return C.hypotheticalSet(sorted, direct_values[0..direct], keys[0..layout.keys], kind, self.session);
+                    },
+                    else => {
+                        // An ordinary aggregate with ORDER BY: its transition
+                        // over the sorted (and DISTINCT) inputs.
+                        _ = hypothetical;
+                        var acc: Accumulator = .{};
+                        for (sorted.handles) |handle| try self.accumulate(agg, &acc, &self.work.cells[handle]);
+                        return self.finishAggregate(agg, &acc);
+                    },
+                }
+            }
+
             fn aggregate(self: *Query, p: *const B.Plan, agg: *const B.Agg, tuples: Tuples, order: u32, first: usize, end: usize, outer: ?*const E.Context) Error!V.Cell {
+                if (ast.collectingAggregate(agg.kind) or self.inputNode(agg.arg)) return self.collectAggregate(p, agg, tuples, order, first, end, outer);
                 var ctx = self.context(outer);
                 var acc: Accumulator = .{};
                 const at = self.mark();
@@ -3565,7 +3739,7 @@ pub fn Exec(comptime config: types.Config) type {
                         self.release(at);self.work.stream_stats=stats;
                     }
                 };
-                if (streamEligible(p) and self.repeatable()) {
+                if (streamEligible(p) and self.repeatable() and !self.collectingPlan(p)) {
                     const at = self.mark();
                     const stats = self.work.stream_stats;
                     if (self.streamGroup(p, outer)) |rows| return rows else |err| {

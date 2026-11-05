@@ -27,6 +27,7 @@ const range_text = @import("range_text.sig");
 const network = @import("network.sig");
 const geometric = @import("geometric.sig");
 const xml = @import("xml.sig");
+const jsonpath = @import("jsonpath.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -157,6 +158,12 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         if (stringType(from)) return context == .explicit;
         return false;
     }
+    if (from == .jsonpath or to == .jsonpath) {
+        // jsonpath has no pg_cast entries: strings by I/O conversion only.
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
     if (from == .xml or to == .xml) {
         // xml -> text/varchar/bpchar by assignment (binary); text -> xml
         // explicitly (XMLPARSE CONTENT).
@@ -282,8 +289,8 @@ pub fn comparisonType(a: Type, b: Type) ?Type {
     // point has no = operator and box compares only by area: neither has
     // ordinary comparison operators here.
     if (a == .point or b == .point or a == .box or b == .box) return null;
-    // xml has no comparison operators.
-    if (a == .xml or b == .xml) return null;
+    // xml and jsonpath have no comparison operators.
+    if (a == .xml or b == .xml or a == .jsonpath or b == .jsonpath) return null;
     // anyarray operators need the same array type on both sides.
     if (a != b and (types.isArray(a) or types.isArray(b))) return null;
     if (a != b and numericCategory(a) and numericCategory(b) and (a == .float4 or b == .float4)) return .float8;
@@ -531,6 +538,11 @@ pub fn Io(comptime config: types.Config) type {
                 .xml => blk: {
                     if (!xml.validContent(input)) return error.InvalidXmlContent;
                     break :blk .{ .xml = (try textCell(input)).text };
+                },
+                // jsonpath_in: the canonical text of the parsed path (B11).
+                .jsonpath => blk: {
+                    var buffer: [config.text_bytes]u8 = undefined;
+                    break :blk try textCell(try jsonpath.Engine(config).canonical(input, &buffer, session.control));
                 },
                 // array_in applies the typmod to every element itself.
                 _ => return ArrayText.parse(types.elementType(ty) orelse return error.UndefinedFunction, typmod, input, session),
@@ -901,6 +913,10 @@ pub fn Io(comptime config: types.Config) type {
                 },
                 .xml => switch (cell) {
                     .text => |*value| try parse(.xml, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .jsonpath => switch (cell) {
+                    .text => |*value| try parse(.jsonpath, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
                 .point, .box => switch (cell) {
