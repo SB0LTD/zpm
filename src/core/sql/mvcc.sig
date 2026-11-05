@@ -57,6 +57,9 @@ pub fn Mvcc(comptime config: types.Config) type {
 
         pub const TableWait = struct { table: u8, mode: locks.TableMode, seq: u64 };
 
+        /// A SET CONSTRAINTS name: the table OID and constraint name.
+        pub const ConstraintMode = struct { oid: u32, name: V.Name, deferred: bool };
+
         pub const Tx = struct {
             active: bool = false,
             epoch: u32 = 0,
@@ -92,6 +95,14 @@ pub fn Mvcc(comptime config: types.Config) type {
             copy_table: ?u8 = null,
             copy_snap: storage.Snapshot = .{ .csn = 0 },
             copy_rows: usize = 0,
+            /// A deferred constraint skipped a check: COMMIT (or SET
+            /// CONSTRAINTS ... IMMEDIATE) re-checks this transaction's rows.
+            deferred_checks: bool = false,
+            /// SET CONSTRAINTS ALL mode (null: each constraint's INITIALLY).
+            constraints_all: ?bool = null,
+            /// SET CONSTRAINTS name modes, newest last.
+            constraint_modes: [config.constraint_modes]ConstraintMode = undefined,
+            constraint_mode_count: usize = 0,
 
             pub fn ref(self: *const Tx, slot: usize) storage.TxRef {
                 return .{ .slot = @intCast(slot), .epoch = self.epoch, .sub = @intCast(self.sub_len) };

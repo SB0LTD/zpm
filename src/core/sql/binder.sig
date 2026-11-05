@@ -5342,7 +5342,8 @@ pub fn Binder(comptime config: types.Config) type {
                         if (drop.if_exists) return .{ .noop = .drop_table };
                         return error.TableNotFound;
                     };
-                    if (found.kind != 'r') return error.WrongObjectType;
+                    if (found.kind != 'r' and found.kind != 'p') return error.WrongObjectType;
+                    if (drop.cascade) return .{ .drop_relation = .{ .slot = found.slot, .cascade = true, .command = .drop_table } };
                     return .{ .drop_table = found.slot };
                 },
                 .create_sequence => |*create| {
@@ -6165,14 +6166,99 @@ pub fn Binder(comptime config: types.Config) type {
             }
         }
 
+        /// FOREIGN KEY ... REFERENCES table [(columns)]: the referenced
+        /// columns default to its primary key and must be exactly a primary
+        /// key or non-deferrable UNIQUE constraint or index of it (42830);
+        /// the column types must match (42804). A reference to the table
+        /// being created keeps ref_oid 0 until CREATE assigns its OID.
         fn bindForeignKey(context: *const Context, definition: *const Ast.ConstraintDef, out: *Create, entry: *S.Constraint, name2: *[256]u8, name2_len: *usize) Error!void {
-            _ = context;
-            _ = definition;
-            _ = out;
-            _ = entry;
-            _ = name2;
-            _ = name2_len;
-            return error.UnsupportedStatement;
+            const columns = out.columns[0..out.count];
+            for (entry.keyColumns(), 0..) |column, position| {
+                if (position != 0) {
+                    name2[name2_len.*] = '_';
+                    name2_len.* += 1;
+                }
+                const column_name = columns[column].name.slice();
+                const take = @min(column_name.len, name2.len - name2_len.*);
+                @memcpy(name2[name2_len.*..][0..take], column_name[0..take]);
+                name2_len.* += take;
+            }
+            entry.on_delete = @enumFromInt(@intFromEnum(definition.on_delete));
+            entry.on_update = @enumFromInt(@intFromEnum(definition.on_update));
+            const referenced_name = toName(context, definition.ref_table.name);
+            const namespace = try qualifierNamespace(context, definition.ref_table.schema);
+            const self_reference = namespace == out.namespace and types.same(referenced_name.slice(), out.name.slice());
+            var parent_columns: []const V.Column = columns;
+            var parent: ?*const S.Table = null;
+            if (!self_reference) {
+                const slot = try resolveQualified(context, definition.ref_table.schema, definition.ref_table.name);
+                const table = &context.tables[slot];
+                if (table.relkind != 'r') return error.WrongObjectType;
+                parent = table;
+                parent_columns = table.columns[0..table.column_count];
+                entry.ref_oid = table.oid;
+            }
+            var used: [config.columns]bool = @splat(false);
+            if (definition.ref_count == 0) {
+                // The referenced table's primary key.
+                var found = false;
+                for (parent_columns, 0..) |*column, index| if (column.primary_key) {
+                    entry.ref_columns[0] = @intCast(index);
+                    used[index] = true;
+                    found = true;
+                    if (entry.column_count != 1) return error.InvalidForeignKey;
+                };
+                if (!found) {
+                    const keys: []const u8 = if (parent) |table| (if (S.primaryConstraint(table)) |index| table.constraints[index].keyColumns() else &.{}) else &.{};
+                    if (keys.len == 0 or keys.len != entry.column_count) return error.InvalidForeignKey;
+                    for (keys, 0..) |key, position| {
+                        entry.ref_columns[position] = key;
+                        used[key] = true;
+                    }
+                }
+            } else {
+                if (definition.ref_count != entry.column_count) return error.InvalidForeignKey;
+                for (definition.ref_columns[0..definition.ref_count], 0..) |ident, position| {
+                    const wanted = toName(context, ident);
+                    const column = definitionColumn(parent_columns, wanted.slice()) orelse return error.ColumnNotFound;
+                    if (used[column]) return error.InvalidForeignKey;
+                    used[column] = true;
+                    entry.ref_columns[position] = column;
+                }
+            }
+            // The referenced columns must carry a unique index.
+            var unique = false;
+            if (parent) |table| {
+                if (table.primary_column) |primary| {
+                    var exact = true;
+                    for (used, 0..) |flag, column| exact = exact and flag == (column == primary);
+                    unique = exact;
+                }
+                for (table.constraints[0..table.constraint_count]) |*constraint| {
+                    if (S.scannedUnique(table, constraint) and !constraint.deferrable and sameColumnSet(constraint.keyColumns(), &used)) unique = true;
+                }
+                for (table.indexes[0..table.index_count]) |*index| {
+                    if (index.unique and sameColumnSet(index.keyColumns(), &used)) unique = true;
+                }
+            } else {
+                for (columns, 0..) |*column, index| {
+                    if (column.primary_key) {
+                        var exact = true;
+                        for (used, 0..) |flag, other| exact = exact and flag == (other == index);
+                        unique = unique or exact;
+                    }
+                }
+                for (out.constraints[0..out.constraint_count]) |*constraint| {
+                    if ((constraint.kind == .unique or constraint.kind == .primary) and !constraint.deferrable and sameColumnSet(constraint.keyColumns(), &used)) unique = true;
+                }
+            }
+            if (!unique) return error.InvalidForeignKey;
+            for (entry.keyColumns(), entry.refColumns()) |child, key| {
+                const a = types.typeOfData(columns[child].data_type);
+                const b = types.typeOfData(parent_columns[key].data_type);
+                const integral = (a == .int2 or a == .int4 or a == .int8) and (b == .int2 or b == .int4 or b == .int8);
+                if (a != b and !integral) return error.TypeMismatch;
+            }
         }
 
         fn bindExclusion(context: *const Context, definition: *const Ast.ConstraintDef, out: *Create, entry: *S.Constraint, name2: *[256]u8, name2_len: *usize) Error!void {
@@ -6215,6 +6301,24 @@ pub fn Binder(comptime config: types.Config) type {
             _ = context;
             _ = set;
             return error.UnsupportedStatement;
+        }
+
+        /// The identity ALTER TABLE of a table (facade-built rewrites such as
+        /// DROP ... CASCADE removing a foreign key).
+        pub fn identityAlter(context: *const Context, index: usize) AlterTable {
+            return alterOf(context, index, .alter_table);
+        }
+
+        /// A bound DEFAULT of column `column` of table `index` (NULL when it
+        /// has none), for ON DELETE / UPDATE SET DEFAULT.
+        pub fn columnDefault(context: *const Context, index: usize, column: usize) Error!u16 {
+            const entry = &context.tables[index];
+            const definition = &entry.columns[column];
+            return switch (definition.default_kind) {
+                .default => try bindExpressionText(context, definition, null, storedSource(index, column)),
+                .identity_always, .identity_by_default => try context.pool.add(.{ .kind = .function, .func = .identity_next, .integer = @intCast(index), .column = @intCast(column), .ty = types.typeOfData(definition.data_type) }),
+                else => none,
+            };
         }
 
         /// A user table (not a sequence or view): 42P01 when missing, 42809

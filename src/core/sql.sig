@@ -992,6 +992,9 @@ pub fn Database(comptime config: Config) type {
                 tx.seq_dirty = .{};
                 tx.copy_table = null;
                 tx.copy_rows = 0;
+                tx.deferred_checks = false;
+                tx.constraints_all = null;
+                tx.constraint_mode_count = 0;
                 return @intCast(slot);
             };
             return error.TransactionCapacity;
@@ -1288,7 +1291,7 @@ pub fn Database(comptime config: Config) type {
             const affected: usize = switch (bound) {
                 .noop => 0,
                 .create_table => |*create| try self.createTable(slot, create, snap),
-                .drop_table => |index| try self.dropTable(slot, index, snap),
+                .drop_table => |index| try self.dropTable(slot, index, false, snap),
                 .create_sequence => |*create| blk: {
                     try self.createSequence(slot, create.name, create.spec, 0, 0, snap);
                     break :blk 0;
@@ -1333,7 +1336,8 @@ pub fn Database(comptime config: Config) type {
                     try self.dropSchema(slot, drop, snap);
                     break :blk 0;
                 },
-                .drop_relation, .refresh_view, .set_constraints, .merge => return error.UnsupportedStatement,
+                .drop_relation => |*drop| try self.dropTable(slot, drop.slot, drop.cascade, snap),
+                .refresh_view, .set_constraints, .merge => return error.UnsupportedStatement,
                 .select, .query, .control => unreachable,
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound), .noop = bound == .noop };
@@ -1467,7 +1471,7 @@ pub fn Database(comptime config: Config) type {
             for (relations[0..count]) |found| {
                 if (found.kind != 'r' or self.tables[found.slot].namespace != drop.oid) continue;
                 if (!drop.cascade) return error.DependentObjects;
-                _ = try self.dropTable(slot, found.slot, snap);
+                _ = try self.dropTable(slot, found.slot, true, snap);
             }
             try self.reserveWrites(slot, 2);
             schema.pending_drop = true;
@@ -1953,8 +1957,13 @@ pub fn Database(comptime config: Config) type {
                         .table_constraints => {
                             if (S.keyed(table)) try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(pkey.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell("PRIMARY KEY") });
                             for (table.constraints[0..table.constraint_count]) |*constraint| {
-                                if (constraint.kind == .primary) continue;
-                                try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(constraint.name.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(if (constraint.kind == .check) "CHECK" else "UNIQUE") });
+                                const kind: []const u8 = switch (constraint.kind) {
+                                    .primary, .exclusion => continue,
+                                    .check => "CHECK",
+                                    .unique => "UNIQUE",
+                                    .foreign => "FOREIGN KEY",
+                                };
+                                try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(constraint.name.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(kind) });
                             }
                         },
                         .key_column_usage => {
@@ -1962,7 +1971,7 @@ pub fn Database(comptime config: Config) type {
                                 try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(pkey.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
                             }
                             for (table.constraints[0..table.constraint_count]) |*constraint| {
-                                if (constraint.kind != .unique) continue;
+                                if (constraint.kind != .unique and constraint.kind != .foreign) continue;
                                 for (constraint.keyColumns(), 0..) |column, position| {
                                     try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(constraint.name.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
                                 }
@@ -2239,6 +2248,11 @@ pub fn Database(comptime config: Config) type {
             S.reset(table, change_log.first_oid + self.oid_counter, create.name, create.columns[0..create.count]);
             table.namespace = create.namespace;
             S.setConstraints(table, create.constraints[0..create.constraint_count]);
+            S.setExtras(table, &create.extras);
+            // A foreign key to the table itself takes its OID now.
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if (constraint.kind == .foreign and constraint.ref_oid == 0) constraint.ref_oid = table.oid;
+            }
             table.live = true;
             table.pending_create = true;
             // A primary key's index owns the next OID (pg_class relkind i).
@@ -2252,13 +2266,49 @@ pub fn Database(comptime config: Config) type {
             const generated_context = self.bindContext("", .standard, snap);
             try B.validateGenerated(&generated_context, index);
             try B.validateConstraints(&generated_context, index);
+            // Referenced tables cannot be dropped while this one is created.
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if (constraint.kind != .foreign or constraint.ref_oid == table.oid) continue;
+                try self.lockTable(slot, self.visibleTableSlot(constraint.ref_oid, snap) orelse return error.TableNotFound, .access_share);
+            }
             return 0;
         }
 
-        fn dropTable(self: *Self, slot: u16, index: usize, snap: Snapshot) Error!usize {
+        fn dropTable(self: *Self, slot: u16, index: usize, cascade: bool, snap: Snapshot) Error!usize {
             try self.lockTable(slot, index, .access_exclusive);
             const tx = &self.txs[slot];
             const table = &self.tables[index];
+            if (table.pending_drop) return 0;
+            // Dependents (pg_depend): other tables' foreign keys, views that
+            // read it and inheritance children / partitions. RESTRICT is
+            // 2BP01; CASCADE drops the views and children and removes the
+            // foreign keys from the referencing tables.
+            var relations: [K.relation_rows]K.Found = undefined;
+            const relation_count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..relation_count]) |found| {
+                if (found.kind == 'S' or found.slot == index) continue;
+                const other = &self.tables[found.slot];
+                if (other.pending_drop) continue;
+                var depends = other.parent == table.oid;
+                for (other.depends[0..other.depend_count]) |oid| depends = depends or oid == table.oid;
+                var references = false;
+                for (other.constraints[0..other.constraint_count]) |*constraint| references = references or (constraint.kind == .foreign and constraint.ref_oid == table.oid);
+                if ((depends or references) and !cascade) return error.DependentObjects;
+                if (depends) {
+                    _ = try self.dropTable(slot, found.slot, true, snap);
+                } else if (references) {
+                    const context = self.bindContext("", .standard, snap);
+                    var alter = B.identityAlter(&context, found.slot);
+                    var kept: usize = 0;
+                    for (alter.constraints[0..alter.constraint_count]) |constraint| {
+                        if (constraint.kind == .foreign and constraint.ref_oid == table.oid) continue;
+                        alter.constraints[kept] = constraint;
+                        kept += 1;
+                    }
+                    alter.constraint_count = kept;
+                    try self.alterTable(slot, &alter, snap);
+                }
+            }
             // Owned identity sequences go with the table (DROP ... CASCADE of
             // the dependency), encoded before the table.
             for (&self.seqs, 0..) |*seq, seq_index| {
@@ -2283,6 +2333,22 @@ pub fn Database(comptime config: Config) type {
         /// RESTART IDENTITY is not provided (0A000).
         fn truncateTables(self: *Self, slot: u16, truncate: *const B.Truncate, snap: Snapshot) Error!void {
             for (truncate.tables[0..truncate.count]) |index| try self.lockTable(slot, index, .access_exclusive);
+            // A table referenced by a foreign key of a table outside the
+            // list cannot be truncated (0A000; CASCADE is outside the subset).
+            var relations: [K.relation_rows]K.Found = undefined;
+            const relation_count = self.catalog.visibleRelations(snap, &relations);
+            for (truncate.tables[0..truncate.count]) |index| {
+                for (relations[0..relation_count]) |found| {
+                    if (found.kind == 'S') continue;
+                    var listed = false;
+                    for (truncate.tables[0..truncate.count]) |other| listed = listed or other == found.slot;
+                    if (listed) continue;
+                    const other = &self.tables[found.slot];
+                    for (other.constraints[0..other.constraint_count]) |*constraint| {
+                        if (constraint.kind == .foreign and constraint.ref_oid == self.tables[index].oid) return error.UnsupportedStatement;
+                    }
+                }
+            }
             try self.reserveWrites(slot, truncate.count);
             // RESTART IDENTITY: every sequence a column of the table owns
             // (identity, SERIAL) restarts, transactionally (ALTER SEQUENCE).
@@ -2400,6 +2466,13 @@ pub fn Database(comptime config: Config) type {
                     if (alter.check_not_null[column] and cells[column] == .null_value) return error.NotNullViolation;
                 }
                 try D.checkRow(&ctx, table, &checks, cells);
+                // An added FOREIGN KEY: every existing row must reference a row.
+                for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
+                    if (constraint.kind != .foreign or !alter.check_constraint[position]) continue;
+                    var has_null = false;
+                    for (constraint.keyColumns()) |column| has_null = has_null or cells[column] == .null_value;
+                    if (!has_null) try self.referencedRow(slot, index, constraint, cells, snap);
+                }
                 for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
                     if (!alter.check_constraint[position] or !S.scannedUnique(table, constraint)) continue;
                     switch (S.uniqueCheck(table, constraint, cells, @intCast(row), snap)) {
@@ -2519,8 +2592,270 @@ pub fn Database(comptime config: Config) type {
                 },
             };
             if (try self.uniqueTaken(slot, table_index, &cells, 0xffffffff, null, snap)) |_| return error.PrimaryKeyViolation;
+            try self.checkReferences(slot, table_index, &cells, null, snap);
             try self.appendRow(slot, table_index, &cells, snap);
             return 1;
+        }
+
+        // ---- foreign keys -------------------------------------------------
+
+        /// The table slot with `oid` visible to `snap` (ALTER keeps the OID
+        /// across slots), if any.
+        fn visibleTableSlot(self: *const Self, oid: u32, snap: Snapshot) ?usize {
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind != 'S' and self.tables[found.slot].oid == oid) return found.slot;
+            }
+            return null;
+        }
+
+        const KeyLookup = union(enum) { found: u32, missing, wait: u16 };
+
+        /// The newest live version of `table` whose `columns` equal
+        /// `key[key_columns]` (PostgreSQL's RI check under the latest state):
+        /// a committed live row or one this transaction wrote; another
+        /// transaction's uncommitted insert is invisible, a row it is
+        /// deleting or updating means waiting for it.
+        fn liveKey(table: *const S.Table, columns: []const u8, key: *const E.Row, key_columns: []const u8, snap: Snapshot) KeyLookup {
+            var waiting: ?u16 = null;
+            for (table.versions[0..table.version_high], 0..) |*version, index| {
+                if (version.row == 0) continue;
+                var equal = true;
+                for (columns, key_columns) |column, source| {
+                    if (version.cells[column] == .null_value or V.compare(&version.cells[column], &key[source]) != 0) equal = false;
+                }
+                if (!equal) continue;
+                if (version.xmin_csn == 0) {
+                    if (!snap.own(version.xmin)) continue;
+                    if (version.xmax.epoch != 0 and snap.own(version.xmax)) continue;
+                    return .{ .found = @intCast(index) };
+                }
+                if (version.xmax.epoch == 0) return .{ .found = @intCast(index) };
+                if (version.xmax_csn != 0 or snap.own(version.xmax)) continue;
+                if (waiting == null) waiting = version.xmax.slot;
+            }
+            return if (waiting) |slot| .{ .wait = slot } else .missing;
+        }
+
+        /// FOREIGN KEY checks of a new or updated referencing row (MATCH
+        /// SIMPLE: a NULL member skips the check): the referenced row must be
+        /// live (23503); it is share-locked so its DELETE or key UPDATE waits
+        /// for this transaction. A row may reference itself. Deferred
+        /// constraints are checked at COMMIT instead.
+        fn checkReferences(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, old: ?*const E.Row, snap: Snapshot) Error!void {
+            const table = &self.tables[table_index];
+            for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
+                if (constraint.kind != .foreign) continue;
+                if (old) |previous| if (!S.keyChanged(constraint, previous, cells)) continue;
+                var has_null = false;
+                for (constraint.keyColumns()) |column| has_null = has_null or cells[column] == .null_value;
+                if (has_null) continue;
+                if (self.deferredNow(slot, table, position)) {
+                    self.txs[slot].deferred_checks = true;
+                    continue;
+                }
+                try self.referencedRow(slot, table_index, constraint, cells, snap);
+            }
+        }
+
+        fn referencedRow(self: *Self, slot: u16, table_index: usize, constraint: *const S.Constraint, cells: *const E.Row, snap: Snapshot) Error!void {
+            const table = &self.tables[table_index];
+            if (constraint.ref_oid == table.oid) {
+                // A row referencing its own key.
+                var own = true;
+                for (constraint.keyColumns(), constraint.refColumns()) |child, key| {
+                    if (V.compare(&cells[child], &cells[key]) != 0) own = false;
+                }
+                if (own) return;
+            }
+            const parent_index = if (constraint.ref_oid == table.oid) table_index else (self.visibleTableSlot(constraint.ref_oid, snap) orelse return error.ForeignKeyViolation);
+            if (parent_index != table_index) try self.lockTable(slot, parent_index, .access_share);
+            const parent = &self.tables[parent_index];
+            switch (liveKey(parent, constraint.refColumns(), cells, constraint.keyColumns(), snap)) {
+                .missing => return error.ForeignKeyViolation,
+                .wait => |owner| {
+                    var waits: L.Set = .{};
+                    waits.add(owner);
+                    return self.park(slot, waits);
+                },
+                .found => |version| {
+                    if (parent.versions[version].xmin_csn == 0) return;
+                    const rowid = parent.rows[parent.versions[version].row - 1].rowid;
+                    var waits: L.Set = .{};
+                    self.locks.rowHolders(parent_index, rowid, slot, .share, &waits);
+                    if (waits.any()) return self.park(slot, waits);
+                    if (try self.locks.grantRow(parent_index, rowid, slot, .share)) |granted| try M.recordLock(self, slot, granted);
+                },
+            }
+        }
+
+        /// ON DELETE (`new` null) or ON UPDATE of referenced key `old` in
+        /// table `table_index`: every live referencing row is handled by its
+        /// constraint's action. NO ACTION / RESTRICT: 23503. CASCADE deletes
+        /// it (or copies the new key), SET NULL / SET DEFAULT update its
+        /// columns; cascaded rows are checked and cascade further. Rows of
+        /// live writers are waited for; nothing is written before every wait
+        /// of this row has passed (a resumed statement re-runs it).
+        fn referencedChange(self: *Self, slot: u16, table_index: usize, old: *const E.Row, new: ?*const E.Row, snap: Snapshot) Error!void {
+            const parent = &self.tables[table_index];
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                const child_index = found.slot;
+                const child = &self.tables[child_index];
+                for (child.constraints[0..child.constraint_count], 0..) |*constraint, position| {
+                    if (constraint.kind != .foreign or constraint.ref_oid != parent.oid) continue;
+                    var has_null = false;
+                    for (constraint.refColumns()) |column| has_null = has_null or old[column] == .null_value;
+                    if (has_null) continue;
+                    if (new) |cells| {
+                        var changed = false;
+                        for (constraint.refColumns()) |column| {
+                            if (@as(V.CellTag, old[column]) != @as(V.CellTag, cells[column]) or V.compare(&old[column], &cells[column]) != 0) changed = true;
+                        }
+                        if (!changed) continue;
+                    }
+                    const action = if (new == null) constraint.on_delete else constraint.on_update;
+                    if (action == .no_action and self.deferredNow(slot, child, position)) {
+                        self.txs[slot].deferred_checks = true;
+                        continue;
+                    }
+                    try self.referencingRows(slot, child_index, constraint, action, old, new, snap);
+                }
+            }
+        }
+
+        fn referencingRows(self: *Self, slot: u16, child_index: usize, constraint: *const S.Constraint, action: S.ForeignAction, old: *const E.Row, new: ?*const E.Row, snap: Snapshot) Error!void {
+            const child = &self.tables[child_index];
+            const tx = &self.txs[slot];
+            if (action == .no_action or action == .restrict) try self.lockTable(slot, child_index, .access_share) else try self.lockTable(slot, child_index, .row_exclusive);
+            var version: u32 = 0;
+            while (version < child.version_high) : (version += 1) {
+                const entry = &child.versions[version];
+                if (entry.row == 0) continue;
+                var equal = true;
+                for (constraint.keyColumns(), constraint.refColumns()) |column, key| {
+                    if (entry.cells[column] == .null_value or V.compare(&entry.cells[column], &old[key]) != 0) equal = false;
+                }
+                if (!equal) continue;
+                var goal = version;
+                if (entry.xmin_csn == 0) {
+                    if (!snap.own(entry.xmin)) {
+                        var waits: L.Set = .{};
+                        waits.add(entry.xmin.slot);
+                        return self.park(slot, waits);
+                    }
+                    if (entry.xmax.epoch != 0 and snap.own(entry.xmax)) continue;
+                } else {
+                    if (entry.xmax.epoch != 0 and (entry.xmax_csn != 0 or snap.own(entry.xmax))) continue;
+                    var waits: L.Set = .{};
+                    switch (self.target(slot, child_index, version, snap, .write, &waits)) {
+                        .wait => return self.park(slot, waits),
+                        .skip, .authored => continue,
+                        .ready => |newest| goal = newest,
+                    }
+                }
+                switch (action) {
+                    .no_action, .restrict => return error.ForeignKeyViolation,
+                    .cascade => if (new) |cells| {
+                        var updated = child.versions[goal].cells;
+                        for (constraint.keyColumns(), constraint.refColumns()) |column, key| updated[column] = try D.store(&child.columns[column], cells[key], &self.session);
+                        try self.cascadeUpdate(slot, child_index, goal, &updated, .none, snap);
+                    } else {
+                        try self.referencedChange(slot, child_index, &child.versions[goal].cells, null, snap);
+                        if (child.versions[goal].xmax.epoch != 0) continue;
+                        try self.reserveWrites(slot, 1);
+                        child.versions[goal].xmax = tx.ref(slot);
+                        child.versions[goal].xmax_cid = snap.cid;
+                        tx.push(.{ .kind = .delete, .table = @intCast(child_index), .old = goal }) catch unreachable;
+                    },
+                    .set_null, .set_default => {
+                        var updated = child.versions[goal].cells;
+                        for (constraint.keyColumns()) |column| {
+                            updated[column] = .null_value;
+                            if (action == .set_default) {
+                                const context = self.bindContext("", .standard, snap);
+                                const id = try B.columnDefault(&context, child_index, column);
+                                if (id != ast.none) {
+                                    var ctx = self.evalContext(child.columns[column].expression.slice());
+                                    updated[column] = try D.store(&child.columns[column], try E.eval(&ctx, id), &self.session);
+                                }
+                            }
+                            try V.validate(&child.columns[column], &updated[column]);
+                        }
+                        // A default equal to the removed key references nothing.
+                        var still = true;
+                        for (constraint.keyColumns(), constraint.refColumns()) |column, key| {
+                            if (updated[column] == .null_value or V.compare(&updated[column], &old[key]) != 0) still = false;
+                        }
+                        if (still) return error.ForeignKeyViolation;
+                        try self.cascadeUpdate(slot, child_index, goal, &updated, if (action == .set_default) .all else .changed, snap);
+                    },
+                }
+            }
+        }
+
+        /// A referencing row rewritten by a referential action: CHECK and
+        /// unique constraints of its table, its own foreign keys and the
+        /// rows that reference it, then the new version.
+        const ReferenceCheck = enum { none, changed, all };
+
+        /// `check`: none for ON UPDATE CASCADE (the new key is the parent's
+        /// own new key, written by this statement), the changed foreign keys,
+        /// or all of them (SET DEFAULT).
+        fn cascadeUpdate(self: *Self, slot: u16, table_index: usize, old: u32, cells: *const E.Row, check: ReferenceCheck, snap: Snapshot) Error!void {
+            const table = &self.tables[table_index];
+            const context = self.bindContext("", .standard, snap);
+            var flags: [config.table_constraints]bool = @splat(true);
+            var checks: [config.table_constraints]u16 = @splat(ast.none);
+            try B.bindFlaggedChecks(&context, table_index, &flags, &checks);
+            var ctx = self.evalContext("");
+            try D.checkRow(&ctx, table, &checks, cells);
+            const row = table.versions[old].row - 1;
+            if (table.primary_column) |column| if (V.compare(&cells[column], &table.versions[old].cells[column]) != 0) switch (D.keyCheck(table, &cells[column], row, snap)) {
+                .free => {},
+                .taken => return error.PrimaryKeyViolation,
+                .wait => |owner| {
+                    var waits: L.Set = .{};
+                    waits.add(owner);
+                    return self.park(slot, waits);
+                },
+            };
+            if ((try self.uniqueTaken(slot, table_index, cells, row, &table.versions[old].cells, snap)) != null) return error.PrimaryKeyViolation;
+            if (check != .none) try self.checkReferences(slot, table_index, cells, if (check == .all) null else &table.versions[old].cells, snap);
+            try self.referencedChange(slot, table_index, &table.versions[old].cells, cells, snap);
+            if (table.versions[old].xmax.epoch != 0) return;
+            try self.placeUpdate(slot, table_index, row, old, cells, snap);
+        }
+
+        /// Writes the new version of `row` over `old` (checks done).
+        fn placeUpdate(self: *Self, slot: u16, table_index: usize, row: u32, old: u32, cells: *const E.Row, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            const table = &self.tables[table_index];
+            try self.reserveWrites(slot, 1);
+            try S.ensureVersions(table, 1, self.horizon());
+            const version = S.allocVersion(table);
+            table.versions[version] = .{ .row = row + 1, .xmin = tx.ref(slot), .xmin_cid = snap.cid, .older = old + 1, .cells = cells.* };
+            table.rows[row].newest = version + 1;
+            table.versions[old].xmax = tx.ref(slot);
+            table.versions[old].xmax_cid = snap.cid;
+            S.indexKey(table, version);
+            tx.push(.{ .kind = .update, .table = @intCast(table_index), .old = old, .new = version }) catch unreachable;
+        }
+
+        /// Whether constraint `position` of `table` is deferred now in the
+        /// transaction (SET CONSTRAINTS, else INITIALLY DEFERRED).
+        fn deferredNow(self: *const Self, slot: u16, table: *const S.Table, position: usize) bool {
+            const constraint = &table.constraints[position];
+            if (!constraint.deferrable) return false;
+            const tx = &self.txs[slot];
+            for (tx.constraint_modes[0..tx.constraint_mode_count]) |mode| {
+                if (mode.oid == table.oid and types.same(mode.name.slice(), constraint.name.slice())) return mode.deferred;
+            }
+            if (tx.constraints_all) |deferred| return deferred;
+            return constraint.initially_deferred;
         }
 
         /// The conflicting version of an ON CONFLICT arbiter, null when the
@@ -2918,6 +3253,10 @@ pub fn Database(comptime config: Config) type {
                 if (err == error.WouldBlock) tx.pin = snap;
                 return err;
             }
+            self.checkReferences(slot, table_index, &row.cells, null, snap) catch |err| {
+                if (err == error.WouldBlock) tx.pin = snap;
+                return err;
+            };
             try self.appendRow(slot, table_index, &row.cells, snap);
             tx.copy_rows += 1;
         }
@@ -3034,15 +3373,12 @@ pub fn Database(comptime config: Config) type {
                 };
             }
             if ((try self.uniqueTaken(slot, update.table, &cells, row, &table.versions[old].cells, snap)) != null) return error.PrimaryKeyViolation;
-            try self.reserveWrites(slot, 1);
-            try S.ensureVersions(table, 1, self.horizon());
-            const version = S.allocVersion(table);
-            table.versions[version] = .{ .row = row + 1, .xmin = tx.ref(slot), .xmin_cid = snap.cid, .older = old + 1, .cells = cells };
-            table.rows[row].newest = version + 1;
-            table.versions[old].xmax = tx.ref(slot);
-            table.versions[old].xmax_cid = snap.cid;
-            S.indexKey(table, version);
-            tx.push(.{ .kind = .update, .table = @intCast(update.table), .old = old, .new = version }) catch unreachable;
+            try self.checkReferences(slot, update.table, &cells, &table.versions[old].cells, snap);
+            try self.referencedChange(slot, update.table, &table.versions[old].cells, &cells, snap);
+            // A referential action of this statement may have replaced it.
+            if (table.versions[old].xmax.epoch != 0) return;
+            _ = tx;
+            try self.placeUpdate(slot, update.table, row, old, &cells, snap);
         }
 
         fn deleteRows(self: *Self, slot: u16, source: []const u8, delete: *const B.Delete, snap: Snapshot) Error!usize {
@@ -3077,6 +3413,9 @@ pub fn Database(comptime config: Config) type {
                 .ready => |newest| newest,
             };
             if (goal != version and !try self.keepJoined(ctx, delete.where, joined, &table.versions[goal].cells)) return 0;
+            try self.referencedChange(slot, delete.table, &table.versions[goal].cells, null, snap);
+            // A self-referencing CASCADE of this statement already deleted it.
+            if (table.versions[goal].xmax.epoch != 0) return 1;
             try self.reserveWrites(slot, 1);
             table.versions[goal].xmax = tx.ref(slot);
             table.versions[goal].xmax_cid = snap.cid;

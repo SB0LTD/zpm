@@ -12,7 +12,7 @@
 const std = @import("std");
 const sql = @import("sql");
 
-const DB = sql.Database(.{ .tables = 8, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 8, .expr_nodes = 1024 });
+const DB = sql.Database(.{ .tables = 16, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 8, .expr_nodes = 1024 });
 /// One secondary index per table holding at most six entries.
 const Small = sql.Database(.{ .tables = 4, .columns = 4, .rows_per_table = 16, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .table_indexes = 1, .index_entries = 6 });
 
@@ -433,9 +433,133 @@ fn upsertUnique() !void {
     try sameState(&upsert_probes);
 }
 
+// ---- FOREIGN KEY actions (PG.CONSTRAINT.FK) ---------------------------------
+
+const fk_probes = [_][]const u8{
+    "SELECT id, g FROM p ORDER BY id",
+    "SELECT id, pid FROM c ORDER BY id",
+    "SELECT id, pid, note FROM n ORDER BY id",
+    "SELECT id, parent FROM tree ORDER BY id",
+    "SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_schema = 'public' ORDER BY constraint_name",
+};
+
+fn foreignKeys() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, g INT, v INT)");
+    try run("INSERT INTO a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, NULL)");
+    // The oracle program in one transaction: ON DELETE CASCADE.
+    const tx = try db.begin();
+    try statement(tx, "CREATE TABLE fk (id INT REFERENCES a(id) ON DELETE CASCADE)");
+    try statement(tx, "INSERT INTO fk VALUES (1)");
+    try statement(tx, "DELETE FROM a WHERE id = 1");
+    try same(try rows(tx, "SELECT COUNT(*) FROM fk"), "0");
+    db.abort(tx);
+    try expect("SELECT COUNT(*) FROM a", "4");
+    // NO ACTION (default) and RESTRICT: 23503 on both sides, atomically.
+    try run("CREATE TABLE p (id INT PRIMARY KEY, g INT UNIQUE)");
+    try run("INSERT INTO p VALUES (1, 10), (2, 20), (3, 30)");
+    try run("CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p)");
+    try expect("SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'c' ORDER BY constraint_name", "c_pid_fkey|FOREIGN KEY;c_pkey|PRIMARY KEY");
+    try run("INSERT INTO c VALUES (1, 1), (2, NULL), (3, 3)");
+    try rejects("INSERT INTO c VALUES (4, 9)", error.ForeignKeyViolation, fk_probes[1], "1|1;2|NULL;3|3");
+    try rejects("UPDATE c SET pid = 9 WHERE id = 1", error.ForeignKeyViolation, fk_probes[1], "1|1;2|NULL;3|3");
+    try rejects("DELETE FROM p WHERE id = 1", error.ForeignKeyViolation, fk_probes[0], "1|10;2|20;3|30");
+    try rejects("UPDATE p SET id = 7 WHERE id = 3", error.ForeignKeyViolation, fk_probes[0], "1|10;2|20;3|30");
+    try run("UPDATE p SET g = 11 WHERE id = 1");
+    try run("DELETE FROM p WHERE id = 2");
+    try run("UPDATE c SET pid = NULL WHERE id = 3");
+    try run("DELETE FROM p WHERE id = 3");
+    // A missing referenced table, column set or type: 42P01, 42830, 42804.
+    try rejects("CREATE TABLE bad (x INT REFERENCES missing)", error.TableNotFound, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("CREATE TABLE bad (x INT REFERENCES a(g))", error.InvalidForeignKey, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("CREATE TABLE bad (x TEXT REFERENCES a)", error.TypeMismatch, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("CREATE TABLE bad (x INT, y INT, FOREIGN KEY (x, y) REFERENCES a)", error.InvalidForeignKey, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    // Actions: CASCADE (delete and update), SET NULL, SET DEFAULT, RESTRICT.
+    try run("INSERT INTO p VALUES (2, 20), (3, 30), (4, 40)");
+    try run("CREATE TABLE n (id INT PRIMARY KEY, pid INT DEFAULT 4, note TEXT, CONSTRAINT n_cascade FOREIGN KEY (pid) REFERENCES p (id) ON DELETE CASCADE ON UPDATE CASCADE)");
+    try run("CREATE TABLE s (id INT PRIMARY KEY, pid INT REFERENCES p ON DELETE SET NULL ON UPDATE SET DEFAULT, g INT REFERENCES p (g) ON DELETE SET DEFAULT ON UPDATE RESTRICT)");
+    try run("INSERT INTO n VALUES (1, 2, 'two'), (2, 2, 'two again'), (3, 3, 'three')");
+    try run("INSERT INTO s VALUES (1, 2, 20), (2, 3, 30)");
+    try run("UPDATE p SET id = 5 WHERE id = 2");
+    try expect("SELECT id, pid, note FROM n ORDER BY id", "1|5|two;2|5|two again;3|3|three");
+    try expect("SELECT id, pid, g FROM s ORDER BY id", "1|NULL|20;2|3|30");
+    try rejects("UPDATE p SET g = 31 WHERE id = 3", error.ForeignKeyViolation, "SELECT id, g FROM p ORDER BY id", "1|11;3|30;4|40;5|20");
+    try run("DELETE FROM p WHERE id = 3");
+    try expect("SELECT id, pid, note FROM n ORDER BY id", "1|5|two;2|5|two again");
+    try expect("SELECT id, pid, g FROM s ORDER BY id", "1|NULL|20;2|NULL|NULL");
+    // SET DEFAULT needs the default key to exist (23503) and NOT NULL
+    // columns cannot be SET NULL (23502); both roll back the statement.
+    try run("CREATE TABLE d (id INT PRIMARY KEY, pid INT DEFAULT 99 REFERENCES p ON DELETE SET DEFAULT)");
+    try run("INSERT INTO d VALUES (1, 4)");
+    try rejects("DELETE FROM p WHERE id = 4", error.ForeignKeyViolation, "SELECT id, pid FROM d", "1|4");
+    try run("CREATE TABLE z (id INT PRIMARY KEY, pid INT NOT NULL REFERENCES p ON DELETE SET NULL)");
+    try run("INSERT INTO z VALUES (1, 5)");
+    try rejects("DELETE FROM p WHERE id = 5", error.NotNullViolation, "SELECT id, pid, note FROM n ORDER BY id", "1|5|two;2|5|two again");
+    try run("DROP TABLE z");
+    try run("DROP TABLE d");
+    // A self-referencing tree: a row may reference itself, CASCADE recurses.
+    try run("CREATE TABLE tree (id INT PRIMARY KEY, parent INT REFERENCES tree ON DELETE CASCADE)");
+    try run("INSERT INTO tree VALUES (1, 1), (2, 1), (3, 2), (4, 3), (5, NULL)");
+    try rejects("INSERT INTO tree VALUES (6, 9)", error.ForeignKeyViolation, fk_probes[3], "1|1;2|1;3|2;4|3;5|NULL");
+    const removed = try replicate("DELETE FROM tree WHERE id = 2");
+    try check(removed.affected_rows == 1);
+    try expect("SELECT id, parent FROM tree ORDER BY id", "1|1;5|NULL");
+    try sameState(&fk_probes);
+    // DROP and TRUNCATE of a referenced table: 2BP01 / 0A000; CASCADE
+    // removes the foreign key from the referencing table.
+    try rejects("DROP TABLE p", error.DependentObjects, fk_probes[0], "1|11;4|40;5|20");
+    try rejects("TRUNCATE p", error.UnsupportedStatement, fk_probes[0], "1|11;4|40;5|20");
+    try run("TRUNCATE p, c, n, s");
+    try run("INSERT INTO p VALUES (1, 10)");
+    try run("INSERT INTO c VALUES (1, 1)");
+    // ALTER TABLE ADD FOREIGN KEY checks existing rows.
+    try run("CREATE TABLE late (id INT PRIMARY KEY, pid INT)");
+    try run("INSERT INTO late VALUES (1, 1), (2, 7)");
+    try rejects("ALTER TABLE late ADD CONSTRAINT late_fk FOREIGN KEY (pid) REFERENCES p", error.ForeignKeyViolation, "SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_name = 'late'", "1");
+    try run("DELETE FROM late WHERE id = 2");
+    try run("ALTER TABLE late ADD CONSTRAINT late_fk FOREIGN KEY (pid) REFERENCES p");
+    try rejects("INSERT INTO late VALUES (3, 8)", error.ForeignKeyViolation, "SELECT COUNT(*) FROM late", "1");
+    try run("DROP TABLE p CASCADE");
+    try expect("SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_type = 'FOREIGN KEY' AND table_name IN ('c', 'n', 's', 'late')", "0");
+    try run("INSERT INTO c VALUES (2, 77)");
+    try sameState(&[_][]const u8{ fk_probes[1], fk_probes[4], "SELECT id, pid FROM late" });
+    // Concurrency: a referencing insert share-locks its parent row, so a
+    // parent DELETE waits and then fails; a parent DELETE in progress makes
+    // the referencing insert wait and then fail.
+    try run("CREATE TABLE p (id INT PRIMARY KEY)");
+    try run("CREATE TABLE r (id INT PRIMARY KEY, pid INT REFERENCES p)");
+    try run("INSERT INTO p VALUES (1), (2)");
+    const child = try db.begin();
+    try statement(child, "INSERT INTO r VALUES (1, 1)");
+    const remover = try db.begin();
+    try parks(remover, "DELETE FROM p WHERE id = 1");
+    try commit(child);
+    try resumeFails(remover, "DELETE FROM p WHERE id = 1", error.ForeignKeyViolation);
+    db.abort(remover);
+    const deleter = try db.begin();
+    try statement(deleter, "DELETE FROM p WHERE id = 2");
+    const inserter = try db.begin();
+    try parks(inserter, "INSERT INTO r VALUES (2, 2)");
+    try commit(deleter);
+    try resumeFails(inserter, "INSERT INTO r VALUES (2, 2)", error.ForeignKeyViolation);
+    db.abort(inserter);
+    // An uncommitted parent row is invisible to another transaction.
+    const creator = try db.begin();
+    try statement(creator, "INSERT INTO p VALUES (3)");
+    const early = try db.begin();
+    try statementFails(early, "INSERT INTO r VALUES (3, 3)", error.ForeignKeyViolation);
+    db.abort(early);
+    try statement(creator, "INSERT INTO r VALUES (3, 3)");
+    try commit(creator);
+    try expect("SELECT id, pid FROM r ORDER BY id", "1|1;3|3");
+    try check(db.usage().row_locks == 0 and db.usage().transactions == 0);
+    try sameState(&[_][]const u8{ "SELECT id FROM p ORDER BY id", "SELECT id, pid FROM r ORDER BY id" });
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
     try upsertUnique();
+    try foreignKeys();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }
