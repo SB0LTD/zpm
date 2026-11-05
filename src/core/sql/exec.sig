@@ -15,6 +15,7 @@ const aggregate_stats = @import("aggregates_stat.sig");
 const numeric_module = @import("numeric.sig");
 const tablesample = @import("tablesample.sig");
 const collect_module = @import("aggregates_collect.sig");
+const json_eval = @import("json_eval.sig");
 const builtin = @import("builtin");
 const Error = types.Error;
 const none = ast.none;
@@ -267,6 +268,7 @@ pub fn Exec(comptime config: types.Config) type {
             fn tableFunction(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
                 var ctx = self.context(outer);
                 var out: List = .{ .start = @intCast(self.work.ref_low) };
+                if (p.series == .json_table) return self.jsonTableRows(p, outer);
                 if (p.series == .none) {
                     const at = try self.cells(p.width);
                     self.work.cells[at] = try E.eval(&ctx, p.function);
@@ -300,7 +302,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const zero: V.Cell = .{ .interval = .{} };
                         direction = V.compare(&step, &zero);
                     },
-                    .none => unreachable,
+                    .none, .json_table => unreachable,
                 }
                 if (direction == 0) return error.InvalidParameterValue;
                 var current = args[0];
@@ -323,6 +325,27 @@ pub fn Exec(comptime config: types.Config) type {
                         else => current = try Io.arithmetic(.add, &current, &step, ty, self.session),
                     }
                 }
+                return self.finish(p, out);
+            }
+
+            /// JSON_TABLE rows (B11 json-agg lane, json_eval.sig): each row's
+            /// cells go to the workspace as they are produced.
+            fn jsonTableRows(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                var ctx = self.context(outer);
+                var out: List = .{ .start = @intCast(self.work.ref_low) };
+                const Emit = struct {
+                    query: *Query,
+                    list: *List,
+                    width: usize,
+                    fn row(raw: *anyopaque, values: []const V.Cell) Error!void {
+                        const state: *@This() = @ptrCast(@alignCast(raw));
+                        const at = try state.query.cells(state.width);
+                        for (values, 0..) |cell, index| state.query.work.cells[at + index] = cell;
+                        try state.query.push(state.list, at);
+                    }
+                };
+                var rows: Emit = .{ .query = self, .list = &out, .width = p.width };
+                try json_eval.JsonEval(config, E).jsonTable(&ctx, p.function, p.names[0..p.count], p.tys[0..p.count], p.typmods[0..p.count], .{ .context = &rows, .row = Emit.row });
                 return self.finish(p, out);
             }
 

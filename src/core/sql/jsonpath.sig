@@ -1224,8 +1224,13 @@ pub fn Engine(comptime config: types.Config) type {
         /// Starts an evaluation of `path` over `document` (the jsonb
         /// bytes); `vars` must be a JSONB object (22023).
         pub fn init(ctx: *Context, path: *const P, document: []const u8, vars: ?[]const u8, control: ?*types.ExecutionControl, session: *const value_module.Session) Error!void {
+            return initItem(ctx, path, .{ .bytes = document, .at = 0 }, vars, control, session);
+        }
+
+        /// As init, with an item of another evaluation as `$` (JSON_TABLE
+        /// column paths over a row item).
+        pub fn initItem(ctx: *Context, path: *const P, root: Item, vars: ?[]const u8, control: ?*types.ExecutionControl, session: *const value_module.Session) Error!void {
             if (vars) |object| if (object[0] != @intFromEnum(Tag.object)) return error.InvalidParameterValue;
-            const root: Item = .{ .bytes = document, .at = 0 };
             ctx.* = .{ .path = path, .root = root, .current = root, .vars = vars, .lax = path.lax, .ignore_structural = path.lax, .control = control, .session = session };
         }
 

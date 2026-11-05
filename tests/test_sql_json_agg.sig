@@ -456,6 +456,68 @@ fn jsonPath() !void {
     try controlled("SELECT jsonb_path_query_array('{\"a\":[1,2,3,4,5],\"b\":{\"c\":[{\"d\":3}]}}', 'strict $.**{1 to last} ? (@.type() == \"number\" && @ > 2)'), '$.a[*]'::jsonpath", "[3, 4, 5, 3]|$.\"a\"[*]");
 }
 
+// ---- PG.JSON.TABLE ---------------------------------------------------------------
+
+fn jsonTable() !void {
+    // oracle
+    try expectTyped("SELECT * FROM JSON_TABLE('[{\"a\":1}]','$[*]' COLUMNS(a INT PATH '$.a')) AS j", "a:23", "1");
+    // FOR ORDINALITY, the default PATH $."name", JSON_VALUE columns
+    // (strings through the type's input, JSON null as NULL, conversion
+    // errors as NULL ON ERROR), JSON_QUERY columns (jsonb) and EXISTS.
+    try expectTyped("SELECT * FROM JSON_TABLE('[{\"a\":1,\"b\":\"x\",\"c\":[1,2]},{\"a\":\"2\",\"d\":null},{\"a\":\"bad\"}]', '$[*]' COLUMNS (n FOR ORDINALITY, a INT, b TEXT PATH '$.b', c JSONB PATH '$.c', has_c BOOLEAN EXISTS PATH '$.c', d TEXT)) AS t", "n:23,a:23,b:25,c:3802,has_c:16,d:25", "1|1|x|[1, 2]|t|NULL;2|2|NULL|NULL|f|NULL;3|NULL|NULL|NULL|f|NULL");
+    // ON EMPTY / ON ERROR behaviors, wrappers and FORMAT JSON.
+    try expect("SELECT * FROM JSON_TABLE('{\"x\":[1,2]}', '$' COLUMNS (e INT PATH '$.missing' DEFAULT 7 ON EMPTY, f INT PATH '$.x[*]' DEFAULT -1 ON ERROR, g TEXT PATH '$.x' DEFAULT 'err' ON ERROR, h JSONB PATH '$.x[*]' WITH WRAPPER, i TEXT FORMAT JSON PATH '$.x', k JSONB PATH '$.missing' EMPTY ARRAY ON EMPTY, l JSON PATH '$.x' , m JSONB PATH '$.x[*]' EMPTY OBJECT ON ERROR)) AS t", "7|-1|err|[1, 2]|[1, 2]|[]|[1, 2]|{}");
+    try expect("SELECT * FROM JSON_TABLE('{\"s\":\"abc\"}', '$' COLUMNS (q TEXT FORMAT JSON PATH '$.s', u TEXT FORMAT JSON PATH '$.s' OMIT QUOTES, v JSON PATH '$.s', w TEXT PATH '$.s', x TEXT PATH '$.s' KEEP QUOTES)) AS t", "\"abc\"|abc|\"abc\"|abc|\"abc\"");
+    try expect("SELECT (SELECT a FROM JSON_TABLE('[1]', '$' COLUMNS (a JSONB PATH '$[*]' WITH CONDITIONAL WRAPPER)) t), (SELECT a FROM JSON_TABLE('[1,2]', '$' COLUMNS (a JSONB PATH '$[*]' WITH CONDITIONAL WRAPPER)) t), (SELECT a FROM JSON_TABLE('[1,2]', '$' COLUMNS (a JSONB PATH '$[*]' WITHOUT WRAPPER)) t)", "1|[1, 2]|NULL");
+    try expectTyped("SELECT * FROM JSON_TABLE('[\"abc\",\"2024-01-02\",1.5]', '$' COLUMNS (s VARCHAR(2) PATH '$[0]', d DATE PATH '$[1]', n NUMERIC PATH '$[2]', f FLOAT8 PATH '$[2]', i INT PATH '$[2]', b BOOLEAN PATH '$[3]' DEFAULT true ON EMPTY)) AS t", "s:1043,d:1082,n:1700,f:701,i:23,b:16", "NULL|2024-01-02|1.5|1.5|NULL|t");
+    // PASSING variables, column aliases and the default table name.
+    try expect("SELECT * FROM JSON_TABLE('[1,2,3]', '$[*] ? (@ > $min && @ < $\"Max\")' PASSING 1 AS min, 5 AS \"Max\" COLUMNS (v INT PATH '$')) AS t", "2;3");
+    try expectTyped("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (v INT PATH '$')) AS t(x)", "x:23", "1");
+    try expect("SELECT json_table.v FROM JSON_TABLE('[1]', '$[*]' AS p COLUMNS (v INT PATH '$'))", "1");
+    try expect("SELECT t.v + 1 FROM JSON_TABLE('[1,2]'::json, 'lax $[*]' COLUMNS (v INT PATH '$')) t ORDER BY 1 DESC", "3;2");
+    // Implicitly LATERAL over earlier FROM items; NULL context items give no rows.
+    try run("CREATE TABLE jt_src(id INT PRIMARY KEY, doc JSONB)");
+    try run("INSERT INTO jt_src VALUES (1, '[1,2]'), (2, '[]'), (3, NULL), (4, '{\"k\":[5]}')");
+    try expect("SELECT j.id, t.v FROM jt_src j, JSON_TABLE(j.doc, '$[*]' COLUMNS (v INT PATH '$')) AS t ORDER BY 1, 2", "1|1;1|2;4|NULL");
+    try expect("SELECT j.id, t.v FROM jt_src j LEFT JOIN LATERAL JSON_TABLE(j.doc, '$.k[*]' COLUMNS (v INT PATH '$')) AS t ON true ORDER BY 1", "1|NULL;2|NULL;3|NULL;4|5");
+    try expect("SELECT COUNT(*) FROM jt_src j, JSON_TABLE(j.doc, 'strict $.k' COLUMNS (v JSONB PATH '$')) AS t", "1");
+    // Row path errors: no rows (EMPTY ON ERROR) or the error (ERROR ON ERROR).
+    try expect("SELECT COUNT(*) FROM JSON_TABLE('{\"a\":1}', 'strict $.b' COLUMNS (v INT PATH '$')) AS t", "0");
+    try expect("SELECT COUNT(*) FROM JSON_TABLE('{\"a\":1}', 'strict $.b' COLUMNS (v INT PATH '$') EMPTY ARRAY ON ERROR) AS t", "0");
+    try rejects("SELECT * FROM JSON_TABLE('{\"a\":1}', 'strict $.b' COLUMNS (v INT PATH '$') ERROR ON ERROR) AS t", error.SqlJsonMemberNotFound);
+    // Column ERROR ON ERROR (also inherited from the table), ERROR ON
+    // EMPTY (handled by ON ERROR unless that is ERROR), EXISTS ON ERROR.
+    try rejects("SELECT * FROM JSON_TABLE('[{\"a\":\"x\"}]', '$[*]' COLUMNS (a INT PATH '$.a' ERROR ON ERROR)) AS t", error.InvalidTextRepresentation);
+    try rejects("SELECT * FROM JSON_TABLE('[{\"a\":\"x\"}]', '$[*]' COLUMNS (a INT PATH '$.a') ERROR ON ERROR) AS t", error.InvalidTextRepresentation);
+    try rejects("SELECT * FROM JSON_TABLE('[{\"a\":[1,2]}]', '$[*]' COLUMNS (a INT PATH '$.a[*]' ERROR ON ERROR)) AS t", error.MoreThanOneSqlJsonItem);
+    try rejects("SELECT * FROM JSON_TABLE('[{\"a\":[1]}]', '$[*]' COLUMNS (a INT PATH '$.a' ERROR ON ERROR)) AS t", error.SqlJsonScalarRequired);
+    try rejects("SELECT * FROM JSON_TABLE('[{}]', '$[*]' COLUMNS (a INT PATH '$.a' ERROR ON EMPTY ERROR ON ERROR)) AS t", error.NoSqlJsonItem);
+    try expect("SELECT * FROM JSON_TABLE('[{}]', '$[*]' COLUMNS (a INT PATH '$.a' ERROR ON EMPTY, b INT PATH '$.b' ERROR ON EMPTY DEFAULT 3 ON ERROR)) AS t", "NULL|3");
+    try expect("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (e1 BOOLEAN EXISTS PATH 'strict $.a', e2 BOOLEAN EXISTS PATH 'strict $.a' TRUE ON ERROR, e3 BOOLEAN EXISTS PATH 'strict $.a' UNKNOWN ON ERROR, e4 INT EXISTS PATH '$', e5 TEXT EXISTS PATH '$.a')) AS t", "f|t|NULL|1|false");
+    try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (e BOOLEAN EXISTS PATH 'strict $.a' ERROR ON ERROR)) AS t", error.SqlJsonMemberNotFound);
+    // Errors at parse and bind time.
+    try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (NESTED PATH '$' COLUMNS (v INT))) AS t", error.UnsupportedStatement);
+    try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (v INT, v TEXT)) AS t", error.DuplicateColumn);
+    try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (v INT EMPTY ARRAY ON EMPTY)) AS t", error.Syntax);
+    try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (v INT EXISTS NULL ON EMPTY)) AS t", error.Syntax);
+    try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (v INT TRUE ON ERROR)) AS t", error.Syntax);
+    try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (v INT NULL ON ERROR NULL ON EMPTY)) AS t", error.Syntax);
+    try rejects("SELECT * FROM JSON_TABLE(1, '$' COLUMNS (a INT)) AS t", error.TypeMismatch);
+    try rejects("SELECT * FROM JSON_TABLE('[]', '$' || '' COLUMNS (a INT)) AS t", error.Syntax);
+    try rejects("SELECT * FROM JSON_TABLE('[]', '$.' COLUMNS (a INT)) AS t", error.Syntax);
+    try rejects("SELECT * FROM JSON_TABLE('[]', '$' COLUMNS (a INT PATH '@')) AS t", error.Syntax);
+    try rejects("SELECT * FROM JSON_TABLE('[]', '$' COLUMNS ()) AS t", error.Syntax);
+    try rejects("SELECT * FROM JSON_TABLE('{bad', '$' COLUMNS (a INT)) AS t", error.InvalidTextRepresentation);
+    try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*] ? (@ > $x)' COLUMNS (a INT PATH '$')) AS t", error.UndefinedObject);
+    try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (a INT PATH '$' DEFAULT 'x' ON EMPTY)) AS t", error.InvalidTextRepresentation);
+    try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (a INT PATH '$' DEFAULT count(*) ON EMPTY)) AS t", error.GroupingError);
+    if (small.execute("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (a INT, b INT, c INT, d INT, e INT)) AS t", &small_result)) |_| {
+        try check(false);
+    } else |err| try check(err == error.ColumnCapacity);
+    try controlled("SELECT * FROM JSON_TABLE('[{\"a\":1}]','$[*]' COLUMNS(a INT PATH '$.a')) AS j", "1");
+    try controlled("SELECT * FROM JSON_TABLE('[{\"a\":1,\"b\":[1,2]},{\"a\":\"x\"}]', '$[*] ? (exists(@.a))' COLUMNS (n FOR ORDINALITY, a INT, b JSONB WITH WRAPPER, e BOOLEAN EXISTS PATH '$.b')) AS t", "1|1|[[1, 2]]|t;2|NULL|NULL|f");
+}
+
 // ---- replay ---------------------------------------------------------------------
 
 var replay_scratch: DB.ReplayScratch = .{};
@@ -520,6 +582,7 @@ fn replay() !void {
     try replicated("INSERT INTO tdd_a VALUES (9, 9, 90)");
     try replicated("INSERT INTO r SELECT 2, NULL, NULL, NULL, jsonb_set(b, '{9}', '90'), p, NULL, NULL FROM r WHERE id = 1");
     try replicated("UPDATE r SET b = b - '1' #- '{2}', p = '$.size()' WHERE id = 2");
+    try replicated("INSERT INTO r(id, s, b) SELECT 10 + n, b, c FROM JSON_TABLE('[{\"b\":\"x\",\"c\":{\"k\":1}},{\"b\":\"y\"}]', '$[*]' COLUMNS (n FOR ORDINALITY, b TEXT, c JSONB)) t");
     for ([_][]const u8{ "SELECT * FROM r ORDER BY id", "SELECT * FROM tdd_a ORDER BY id", "SELECT jsonb_path_query_array(b, '$.*'), b @? p FROM r ORDER BY id" }) |query|
         try check(try sameQuery(&replay_primary, &replay_replica, query));
     try check(replay_primary.tableCount() == replay_replica.tableCount() and replay_primary.oid_counter == replay_replica.oid_counter);
@@ -539,7 +602,9 @@ fn replay() !void {
     @memcpy(corrupt[at..][0..5], "$.a  ");
     try check(replay_replica.applyChangeRecord(corrupt[0..length], &replay_scratch) == error.InvalidChangeRecord);
     try replay_replica.execute("SELECT COUNT(*) FROM r", &result);
-    try same(try render(&result), "2");
+    try same(try render(&result), "4");
+    try replay_replica.execute("SELECT id, s, b FROM r WHERE id > 10 ORDER BY id", &result);
+    try same(try render(&result), "11|x|{\"k\": 1};12|y|NULL");
     try replay_replica.applyChangeRecord(record[0..length], &replay_scratch);
     try check(try sameQuery(&replay_primary, &replay_replica, "SELECT * FROM r ORDER BY id"));
 }
@@ -551,6 +616,7 @@ pub fn main(init: std.process.Init) !void {
     try orderedSetAggregates();
     try jsonbModify();
     try jsonPath();
+    try jsonTable();
     try replay();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-json-agg\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});

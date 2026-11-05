@@ -498,7 +498,9 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// generate_series result family; `none` is a scalar function in
         /// FROM (one row).
-        pub const Series = enum { none, integer, numeric, timestamp };
+        pub const Series = enum { none, integer, numeric, timestamp,
+            // JSON_TABLE (B11 json-agg lane): `function` is the table node.
+            json_table };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -1976,6 +1978,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .routine, .routine_param => {},
                 .none => return bindRoutineCall(context, n, count),
                 .aggregate_input => return,
+                // Bound by bindJsonTable only (B11).
+                .json_table, .json_table_passing, .json_table_column => return error.Syntax,
                 .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => try typeJsonFunction(context, n, count),
                 .greatest, .least => {
                     if (count == 0) return error.Syntax;
@@ -5913,6 +5917,86 @@ pub fn Binder(comptime config: types.Config) type {
             return none;
         }
 
+        /// JSON_TABLE (B11 json-agg lane) as a plan of its own. The context
+        /// item becomes jsonb (untyped, json and string inputs convert;
+        /// others are 42804), the row and column paths jsonpath constants,
+        /// PASSING values keep their types (untyped as text), DEFAULT
+        /// expressions convert to their column's type. They see the FROM
+        /// items before it (implicit LATERAL). Column names must be
+        /// distinct (42701); behaviors a column kind does not allow are
+        /// 42601. Exec.jsonTableRows produces the rows (json_eval.sig).
+        fn bindJsonTable(context: *const Context, scope: *Scope, item: *const Ast.FromItem, env: ?*const CteEnv) Error!u16 {
+            const plans = plansOf(context);
+            const id = try plans.add();
+            var inner: Scope = .{ .parent = scope, .plan = id, .ctes = env };
+            const table = context.node(item.function);
+            try typeExpr(context, &inner, table.a);
+            switch (context.node(table.a).ty) {
+                .jsonb => {},
+                .unknown, .json, .text, .varchar, .bpchar, .name => table.a = try convert(context, table.a, .jsonb, -1, .explicit),
+                else => return error.TypeMismatch,
+            }
+            try typeExpr(context, &inner, table.c);
+            try coerce(context, table.c, .jsonpath);
+            const p = &plans.items[id];
+            var count: usize = 0;
+            var entry = table.b;
+            while (entry != none) : (entry = context.node(entry).next) {
+                const n = context.node(entry);
+                if (n.func == .json_table_passing) {
+                    try typeExpr(context, &inner, n.b);
+                    if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .text);
+                    n.ty = context.node(n.b).ty;
+                    continue;
+                }
+                if (count == config.columns) return error.ColumnCapacity;
+                const name = toName(context, n.name);
+                for (p.names[0..count]) |previous| if (types.same(previous.slice(), name.slice())) return error.DuplicateColumn;
+                const spec = ast.JsonTableColumn.decode(n.integer);
+                const B = ast.JsonTableColumn.Behavior;
+                switch (spec.kind) {
+                    .ordinality => {},
+                    .exists => {
+                        if (spec.on_empty != .unspecified) return error.Syntax;
+                        switch (spec.on_error) {
+                            .unspecified, .error_value, .true_value, .false_value, .unknown => {},
+                            else => return error.Syntax,
+                        }
+                    },
+                    .regular => {
+                        const formatted = spec.format_json or spec.wrapper != .unspecified or spec.quotes != .unspecified or n.cast_type == .json or n.cast_type == .jsonb;
+                        for ([_]B{ spec.on_empty, spec.on_error }) |behavior| switch (behavior) {
+                            .unspecified, .null_value, .error_value, .default_value => {},
+                            .empty_array, .empty_object => if (!formatted) return error.Syntax,
+                            else => return error.Syntax,
+                        };
+                        if (spec.wrapper != .unspecified and spec.wrapper != .without and spec.quotes == .omit) return error.Syntax;
+                    },
+                }
+                if (spec.kind != .ordinality and n.a != none) {
+                    try typeExpr(context, &inner, n.a);
+                    try coerce(context, n.a, .jsonpath);
+                }
+                const ty: ast.Type = if (spec.kind == .ordinality) .int4 else n.cast_type;
+                const typmod: i32 = if (spec.kind == .ordinality) -1 else n.typmod;
+                for ([_]*u16{ &n.b, &n.c }) |slot| if (slot.* != none) {
+                    try typeExpr(context, &inner, slot.*);
+                    slot.* = try convert(context, slot.*, ty, typmod, .assignment);
+                };
+                p.names[count] = name;
+                p.tys[count] = ty;
+                p.typmods[count] = typmod;
+                p.targets[count] = try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
+                count += 1;
+            }
+            if (count == 0) return error.Syntax;
+            p.function = item.function;
+            p.series = .json_table;
+            p.count = count;
+            p.width = count;
+            return id;
+        }
+
         /// A function in FROM (B11) as a plan of its own: generate_series
         /// over int4/int8/numeric (optional step) or timestamp[tz] with an
         /// interval step, otherwise any scalar function (one row). Arguments
@@ -5921,6 +6005,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// after the function, or the table alias; ORDINALITY adds a bigint
         /// `ordinality` column.
         fn bindTableFunction(context: *const Context, scope: *Scope, item: *const Ast.FromItem, env: ?*const CteEnv) Error!u16 {
+            if (context.node(item.function).func == .json_table) return bindJsonTable(context, scope, item, env);
             const plans = plansOf(context);
             const id = try plans.add();
             var inner: Scope = .{ .parent = scope, .plan = id, .ctes = env };

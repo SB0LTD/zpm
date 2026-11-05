@@ -107,11 +107,55 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // (jsonb - x, #-, ?|, ?&, @?, @@), named ?column?.
     jsonb_set, jsonb_set_lax, jsonb_insert, jsonb_delete_path, jsonb_strip_nulls, jsonb_pretty, to_json, to_jsonb,
     jsonb_path_exists, jsonb_path_match, jsonb_path_query_array, jsonb_path_query_first, jsonb_exists_any, jsonb_exists_all,
-    jsonb_minus_op, jsonb_delete_path_op, jsonb_exists_any_op, jsonb_exists_all_op, jsonb_path_exists_op, jsonb_path_match_op };
+    jsonb_minus_op, jsonb_delete_path_op, jsonb_exists_any_op, jsonb_exists_all_op, jsonb_path_exists_op, jsonb_path_match_op,
+    // JSON_TABLE in FROM (B11 json-agg lane): the table node (`a` context
+    // item, `c` row path, `b` -> next PASSING values then columns,
+    // `integer` bit 0 ERROR ON ERROR), a PASSING value (`name` AS, `b`
+    // value) and a column (`name`, type in cast_type/typmod, `a` PATH, `b`
+    // / `c` DEFAULT ON EMPTY / ON ERROR, `integer` a JsonTableColumn).
+    // Exec reads them; evaluating one as a value is 0A000.
+    json_table, json_table_passing, json_table_column };
+
+/// JSON_TABLE column flags (Node.integer of a json_table_column).
+pub const JsonTableColumn = struct {
+    pub const Kind = enum(u2) { regular = 0, ordinality = 1, exists = 2 };
+    /// ON EMPTY / ON ERROR behaviors (0: not written).
+    pub const Behavior = enum(u4) { unspecified = 0, null_value = 1, error_value = 2, empty_array = 3, empty_object = 4, default_value = 5, true_value = 6, false_value = 7, unknown = 8 };
+    pub const Wrapper = enum(u2) { unspecified = 0, without = 1, unconditional = 2, conditional = 3 };
+    pub const Quotes = enum(u2) { unspecified = 0, keep = 1, omit = 2 };
+    kind: Kind = .regular,
+    format_json: bool = false,
+    wrapper: Wrapper = .unspecified,
+    quotes: Quotes = .unspecified,
+    on_empty: Behavior = .unspecified,
+    on_error: Behavior = .unspecified,
+
+    pub fn encode(self: JsonTableColumn) i64 {
+        return @as(i64, @intFromEnum(self.kind)) | (@as(i64, @intFromBool(self.format_json)) << 2) | (@as(i64, @intFromEnum(self.wrapper)) << 3) |
+            (@as(i64, @intFromEnum(self.quotes)) << 5) | (@as(i64, @intFromEnum(self.on_empty)) << 8) | (@as(i64, @intFromEnum(self.on_error)) << 12);
+    }
+
+    pub fn decode(raw: i64) JsonTableColumn {
+        const word: u64 = @bitCast(raw);
+        return .{
+            .kind = @enumFromInt(@as(u2, @truncate(word & 3))),
+            .format_json = (word >> 2) & 1 != 0,
+            .wrapper = @enumFromInt(@as(u2, @truncate((word >> 3) & 3))),
+            .quotes = @enumFromInt(@as(u2, @truncate((word >> 5) & 3))),
+            .on_empty = behavior(word >> 8),
+            .on_error = behavior(word >> 12),
+        };
+    }
+
+    fn behavior(word: u64) Behavior {
+        const code: u4 = @truncate(word & 15);
+        return if (code > 8) .unspecified else @enumFromInt(code);
+    }
+};
 
 /// The JSONB / SQL/JSON path functions of json_eval.sig.
 pub fn jsonFunction(func: Func) bool {
-    return @intFromEnum(func) >= @intFromEnum(Func.jsonb_set);
+    return @intFromEnum(func) >= @intFromEnum(Func.jsonb_set) and @intFromEnum(func) <= @intFromEnum(Func.jsonb_path_match_op);
 }
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
