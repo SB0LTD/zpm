@@ -11,8 +11,8 @@
 //! glTexImage2D, glTexSubImage2D, glTexStorage2D (unpack buffers too),
 //! glCopyTexSubImage2D, glCopyTexImage2D; EGLImages as textures and
 //! renderbuffers (OES_EGL_image, OES_EGL_image_external: the memory is
-//! the image's, shared). Draws, shaders, vertex arrays, samplers, queries
-//! and sync objects come with the rasterizer.
+//! the image (shared). Vertex arrays and draws (raster.sig), with the GLSL
+//! program in use (program.sig); samplers, queries and sync objects later.
 //!
 //! Objects (textures, buffers, renderbuffers) live in an Objects table a
 //! share group's contexts hold; framebuffers are each context's. A name is
@@ -425,7 +425,7 @@ pub const Context = struct {
     /// programs make them; for now the driver's own)
     pipeline: ?*raster.Pipeline = null,
     uniforms: []const u32 = &.{},
-    /// glUseProgram's (program.sig): while one is in use, draws are its
+    /// glUseProgram's (program.sig): while one is in use, draws run it
     program: u32 = 0,
     /// EGL's check of the default framebuffer (a window resized: a back
     /// buffer of its new size), before an operation reaches it
@@ -1861,12 +1861,20 @@ pub const Context = struct {
         if (count < 0 or instances < 0) return c.fail(g.INVALID_VALUE);
         var v = c.drawView() orelse return;
         if (c.enabled & bitOf(g.RASTERIZER_DISCARD) != 0) return;
-        // (a GLSL program's draws: the next stage's code; none drawn yet)
-        if (c.program != 0) return;
-        const pipe = c.pipeline orelse return;
+        // the program in use (its pipeline, its uniforms), else the driver's own
+        var pipe: *raster.Pipeline = undefined;
+        var uniforms: []const u32 = undefined;
+        if (c.program != 0) {
+            const ds = program.drawState(c) orelse return;
+            pipe = ds.pipe;
+            uniforms = ds.uniforms;
+        } else {
+            pipe = c.pipeline orelse return;
+            uniforms = c.uniforms;
+        }
         const color = v.color[0] orelse return;
         if (count == 0 or instances == 0) return;
-        var d = raster.Draw{ .pipe = pipe, .color = color, .topology = topology, .first = first, .count = @intCast(count), .instances = @intCast(instances), .uniforms = c.uniforms };
+        var d = raster.Draw{ .pipe = pipe, .color = color, .topology = topology, .first = first, .count = @intCast(count), .instances = @intCast(instances), .uniforms = uniforms };
         // the attributes: arrays from buffers, else the generic values
         const va = c.curVao();
         for (0..pipe.shaders.attrs) |j| {

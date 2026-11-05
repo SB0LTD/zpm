@@ -15,6 +15,7 @@ pub const lex = @import("lex.sig");
 pub const pp = @import("pp.sig");
 pub const parse = @import("parse.sig");
 pub const sema = @import("sema.sig");
+pub const gen = @import("gen.sig");
 
 pub const Type = sema.Type;
 pub const Base = sema.Base;
@@ -39,6 +40,8 @@ pub const Scratch = struct {
     checker: sema.Checker = undefined,
     root: u32 = 0,
     stage: Stage = .vertex,
+    /// the code generator's tables
+    gen: gen.Store = undefined,
 
     /// Compiles `src` as `stage`: whether it is a good shader. The log
     /// (log.text()) says what is wrong; after a good compile the checker

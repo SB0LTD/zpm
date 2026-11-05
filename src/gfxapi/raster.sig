@@ -30,7 +30,7 @@
 //! Not yet: points and lines; clipping (a triangle with a vertex at w <= 0,
 //! or beyond GUARD pixels, is dropped: a guard band); multisampling;
 //! several color attachments; stencil tests. Shaders are KIR emitters
-//! (`Shaders`); the GLSL compiler (the next stage) makes them.
+//! (`Shaders`): GLSL programs' (glsl/gen.sig), or Sig code.
 //!
 //! Allocation-free: kernels are built into the caller's storage.
 
@@ -55,8 +55,8 @@ pub const SUB = 16;
 pub const GUARD: f32 = 24576;
 /// GL ES 3.0's MAX_VERTEX_ATTRIBS at least.
 pub const MAX_ATTRS = 16;
-/// Scalar varyings (a vec4 is four).
-pub const MAX_VARYINGS = 16;
+/// Scalar varyings (a vec4 is four): GL ES 3.0's 15 vectors, and room.
+pub const MAX_VARYINGS = 64;
 pub const MAX_UNIFORM_WORDS = 1024;
 /// A tile's edge constants are clamped to +-LIMIT: the 32-bit per-pixel
 /// part then never overflows (fixed coordinates < 2^19, steps < 2^7).
@@ -98,8 +98,9 @@ pub const Shaders = struct {
     ctx: ?*const anyopaque = null,
     attrs: u8 = 0,
     varyings: u8 = 0,
-    /// bit i: varying i is flat (the provoking vertex's), else smooth
-    flat: u32 = 0,
+    /// bit i: varying i is flat (the provoking vertex's, its bits kept:
+    /// an integer's too), else smooth
+    flat: u64 = 0,
     vertex: *const fn (?*const anyopaque, *kir.Kernel, *VertexIO) void,
     fragment: *const fn (?*const anyopaque, *kir.Kernel, *FragmentIO) void,
 };
@@ -335,7 +336,7 @@ pub fn vertexKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
         k.store(.f32, memAt(b_out, 12), r(base), r(k.sel(.f32, r(ok), r(iw), f(-1))));
         for (0..sh.varyings) |j| {
             const val = io.varying[j];
-            const out = if (sh.flat & (@as(u32, 1) << @intCast(j)) != 0) val else k.op2(.fmul, .f32, r(val), r(iw));
+            const out = if (sh.flat & (@as(u64, 1) << @intCast(j)) != 0) val else k.op2(.fmul, .f32, r(val), r(iw));
             k.store(.f32, memAt(b_out, @intCast(16 + 4 * j)), r(base), r(out));
         }
     }
@@ -447,15 +448,17 @@ pub fn setupKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
         var vy: [3]V = undefined;
         var vz: [3]V = undefined;
         var vw: [3]V = undefined;
-        var vv: [3][MAX_VARYINGS]V = undefined;
+        // (each vertex's record; its varyings are loaded where their
+        // planes are made, a few live at a time)
+        var vbase: [3]V = undefined;
         for (0..3) |n| {
             const rec = k.op3(.imad, .u32, r(inst), r(count), r(iv[n]));
             const base = k.op2(.shl, .u32, r(k.op2(.imul, .u32, r(rec), r(vstride))), u(2));
+            vbase[n] = base;
             vx[n] = k.load(.i32, memAt(b_v, 0), r(base));
             vy[n] = k.load(.i32, memAt(b_v, 4), r(base));
             vz[n] = k.load(.f32, memAt(b_v, 8), r(base));
             vw[n] = k.load(.f32, memAt(b_v, 12), r(base));
-            for (0..sh.varyings) |j| vv[n][j] = k.load(.f32, memAt(b_v, @intCast(16 + 4 * j)), r(base));
         }
         var valid = k.cmp(.f32, .gt, r(vw[0]), f(0));
         valid = k.op2(.pand, .pred, r(valid), r(k.cmp(.f32, .gt, r(vw[1]), f(0))));
@@ -477,9 +480,6 @@ pub fn setupKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
         const cull_back = k.op2(.pand, .pred, r(k.op1(.pnot, .pred, r(same))), r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(cull), u(2))), u(0))));
         valid = k.op2(.pand, .pred, r(valid), r(k.op1(.pnot, .pred, r(zero))));
         valid = k.op2(.pand, .pred, r(valid), r(k.op1(.pnot, .pred, r(k.op2(.por, .pred, r(cull_front), r(cull_back))))));
-        // (flat varyings: the provoking vertex's, taken before any swap)
-        var flat_v: [MAX_VARYINGS]V = undefined;
-        for (0..sh.varyings) |j| flat_v[j] = vv[2][j];
         // counter-clockwise from here: a clockwise triangle's 1 and 2 swap
         const sw = k.op1(.pnot, .pred, r(ccw));
         const swap = struct {
@@ -494,7 +494,9 @@ pub fn setupKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
         swap(&k, .i32, sw, &vy[1], &vy[2]);
         swap(&k, .f32, sw, &vz[1], &vz[2]);
         swap(&k, .f32, sw, &vw[1], &vw[2]);
-        for (0..sh.varyings) |j| swap(&k, .f32, sw, &vv[1][j], &vv[2][j]);
+        swap(&k, .u32, sw, &vbase[1], &vbase[2]);
+        // (the provoking vertex's record, before any swap: flat varyings')
+        const pbase = k.sel(.u32, r(sw), r(vbase[1]), r(vbase[2]));
         // |area| (> 0 once valid)
         const nlo = k.op2(.isub, .u32, u(0), r(area.lo));
         const nhi = k.op2(.isub, .i32, r(k.op2(.isub, .i32, i(0), r(area.hi))), r(k.sel(.u32, r(k.cmp(.u32, .ne, r(area.lo), u(0))), u(1), u(0))));
@@ -568,11 +570,17 @@ pub fn setupKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
         Plane.emit(&k, b_out, base, S_W, vw[0], vw[1], vw[2], ex1, ey1, ex2, ey2, idet);
         for (0..sh.varyings) |j| {
             const w0: u32 = @intCast(SREC + 3 * j);
-            if (sh.flat & (@as(u32, 1) << @intCast(j)) != 0) {
-                st(&k, b_out, base, w0, .f32, r(flat_v[j]));
+            const at = memAt(b_v, @intCast(16 + 4 * j));
+            if (sh.flat & (@as(u64, 1) << @intCast(j)) != 0) {
+                st(&k, b_out, base, w0, .u32, r(k.load(.u32, at, r(pbase))));
                 st(&k, b_out, base, w0 + 1, .f32, f(0));
                 st(&k, b_out, base, w0 + 2, .f32, f(0));
-            } else Plane.emit(&k, b_out, base, w0, vv[0][j], vv[1][j], vv[2][j], ex1, ey1, ex2, ey2, idet);
+            } else {
+                const v0 = k.load(.f32, at, r(vbase[0]));
+                const v1 = k.load(.f32, at, r(vbase[1]));
+                const v2 = k.load(.f32, at, r(vbase[2]));
+                Plane.emit(&k, b_out, base, w0, v0, v1, v2, ex1, ey1, ex2, ey2, idet);
+            }
         }
     }
     k.endif();
@@ -755,8 +763,9 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
                 const wv = k.div(f(1), r(iw));
                 var io = FragmentIO{ .uniforms = b_uni };
                 for (0..sh.varyings) |j| {
-                    const val = plane(&k, b_t, base, @intCast(SREC + 3 * j), dX, dY);
-                    io.varying[j] = if (sh.flat & (@as(u32, 1) << @intCast(j)) != 0) val else k.op2(.fmul, .f32, r(val), r(wv));
+                    const w0: u32 = @intCast(SREC + 3 * j);
+                    // (flat: the provoking vertex's bits, untouched: an integer's too)
+                    io.varying[j] = if (sh.flat & (@as(u64, 1) << @intCast(j)) != 0) ld(&k, b_t, base, w0, .f32) else k.op2(.fmul, .f32, r(plane(&k, b_t, base, w0, dX, dY)), r(wv));
                 }
                 io.frag_coord = .{ X, Y, z, iw };
                 io.front_facing = k.cmp(.u32, .ne, r(ld(&k, b_t, base, S_FRONT, .u32)), u(0));

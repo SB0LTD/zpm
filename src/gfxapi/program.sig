@@ -5,11 +5,12 @@
 //! fragment outputs), uniform locations and values (glUniform*, glGet-
 //! Uniform*), the active attributes and uniforms, as Mesa answers them.
 //!
-//! What a draw with a program runs comes with the next stage (GLSL to
-//! KIR): a link here makes the program's interface, its uniform storage
-//! (tight words: a float, an int, a bool or a sampler's unit each one),
-//! and where each varying goes; a draw with a GLSL program draws nothing
-//! yet.
+//! A link makes the program's interface, its uniform storage (tight
+//! words: a float, an int, a bool or a sampler's unit each one), where
+//! each varying goes, and its pipeline (raster.sig): the shaders' code,
+//! generated (glsl/gen.sig) into the draw kernels when the engine builds
+//! them, from copies of the sources the link kept. The link generates
+//! both once to check them (what cannot be generated fails the link).
 //!
 //! Shaders and programs share one namespace, as GL says; names are the
 //! process's (one table), each object its share group's (another share
@@ -21,9 +22,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const gpu = @import("gpu");
 const gles = @import("gles.sig");
 const g = @import("glenum.sig");
+const engine = @import("engine.sig");
+const raster = @import("raster.sig");
 pub const glsl = @import("glsl/glsl.sig");
+const kir = gpu.kir;
 const Context = gles.Context;
 const Objects = gles.Objects;
 const Type = glsl.Type;
@@ -43,6 +48,9 @@ pub const PROGRAM_NAMES = 4096;
 pub const MAX_VERTEX_UNIFORM_VECTORS = 256;
 pub const MAX_FRAGMENT_UNIFORM_VECTORS = 224;
 pub const MAX_VARYING_VECTORS = 15;
+comptime {
+    std.debug.assert(MAX_VARYING_VECTORS * 4 <= raster.MAX_VARYINGS);
+}
 pub const MAX_TEXTURE_UNITS = 32;
 
 const Ref = struct { at: u32 = 0, len: u32 = 0 };
@@ -161,6 +169,20 @@ pub const Program = struct {
     binds: [MAX_BINDINGS]Binding = undefined,
     nbinds: usize = 0,
     out: Linked = .{},
+    /// the linked shaders' sources (the pool's), which the pipeline's
+    /// code is generated from
+    vs_src: Ref = .{},
+    fs_src: Ref = .{},
+    /// the pipeline draws run, and the engine that may have loaded it
+    pipe: raster.Pipeline = undefined,
+    has_pipe: bool = false,
+    eng: ?*engine.Engine = null,
+
+    fn unloadPipe(p: *Program) void {
+        if (!p.has_pipe) return;
+        if (p.eng) |e| e.unloadPipeline(&p.pipe);
+        p.has_pipe = false;
+    }
 
     fn boundTo(p: *const Program, s: []const u8) ?u32 {
         for (p.binds[0..p.nbinds]) |*b| {
@@ -226,6 +248,15 @@ fn poolAlloc(len: usize) ?Ref {
     return r;
 }
 
+/// A copy of the pool's text `src` (which a compaction may move: read
+/// after the room is made).
+fn poolDup(src: *const Ref) ?Ref {
+    if (src.len == 0) return .{};
+    const r = poolAlloc(src.len) orelse return null;
+    std.mem.copyForwards(u8, pool[r.at..][0..r.len], pool[src.at..][0..src.len]);
+    return r;
+}
+
 fn poolKeep(s: []const u8) ?Ref {
     if (s.len == 0) return .{};
     const r = poolAlloc(s.len) orelse return null;
@@ -242,6 +273,13 @@ fn compact() void {
         for (&objs) |*o| {
             if (o.kind == .free) continue;
             for ([_]*Ref{ &o.source, &o.log }) |r| {
+                if (r.len == 0 or r.at < cursor) continue;
+                if (best == null or r.at < best.?.at) best = r;
+            }
+        }
+        for (&progs, prog_used) |*p, used| {
+            if (!used) continue;
+            for ([_]*Ref{ &p.vs_src, &p.fs_src }) |r| {
                 if (r.len == 0 or r.at < cursor) continue;
                 if (best == null or r.at < best.?.at) best = r;
             }
@@ -303,6 +341,9 @@ fn programOf(c: *Context, name: u32) ?*Program {
 fn freeObj(o: *Obj) void {
     if (o.kind == .program) {
         const p = &progs[o.prog];
+        p.unloadPipe();
+        p.vs_src = .{};
+        p.fs_src = .{};
         for ([_]u32{ p.vs, p.fs }) |s| {
             if (s != 0) dropShader(&objs[s - 1]);
         }
@@ -336,6 +377,7 @@ pub fn dropOwner(owner: *Objects) void {
     start();
     defer unlock();
     for (&objs) |*o| {
+        if (o.kind == .program and o.owner == owner) progs[o.prog].unloadPipe();
         if (o.kind != .free and o.owner == owner) o.* = .{};
     }
     // (their programs' slots: those no live name holds)
@@ -514,6 +556,10 @@ pub fn createProgram(c: *Context) u32 {
     p.validated = false;
     p.binary_hint = false;
     p.nbinds = 0;
+    p.vs_src = .{};
+    p.fs_src = .{};
+    p.has_pipe = false;
+    p.eng = null;
     p.out.nattribs = 0;
     p.out.nuniforms = 0;
     p.out.nlocs = 0;
@@ -611,7 +657,11 @@ pub fn linkProgram(c: *Context, prog: u32) void {
     const o = &objs[prog - 1];
     var logbuf: [2048]u8 = undefined;
     var log = glsl.pp.Log{ .buf = &logbuf };
+    p.unloadPipe();
+    p.vs_src = .{};
+    p.fs_src = .{};
     p.linked = link(p, &log);
+    if (p.linked) p.eng = c.eng;
     p.validated = false;
     setLog(o, log.text());
 }
@@ -751,7 +801,148 @@ fn link(p: *Program, log: *glsl.pp.Log) bool {
     if (!linkUniforms(l, vs, fs, log)) return false;
     if (!linkOutputs(l, fs, log)) return false;
     @memset(l.values[0..l.nwords], 0);
+    // the sources kept, the code checked, the pipeline made
+    p.vs_src = poolDup(&objs[p.vs - 1].source) orelse return outOfPool(log);
+    p.fs_src = poolDup(&objs[p.fs - 1].source) orelse return outOfPool(log);
+    if (!checkCode(p, log)) return false;
+    var attrs: u32 = 0;
+    for (l.attribs[0..l.nattribs]) |a| attrs = @max(attrs, a.loc + slotsOf(a.ty));
+    var flat: u64 = 0;
+    for (l.varyings[0..l.nvaryings]) |v| {
+        if (!v.flat) continue;
+        for (0..wordsOf(v.ty)) |w| flat |= @as(u64, 1) << @intCast(v.word + w);
+    }
+    p.pipe = raster.Pipeline.init(.{ .ctx = p, .attrs = @intCast(attrs), .varyings = @intCast(l.vary_words), .flat = flat, .vertex = emitVertex, .fragment = emitFragment });
+    p.has_pipe = true;
     return true;
+}
+
+fn outOfPool(log: *glsl.pp.Log) bool {
+    log.err(0, "no room to keep the program's sources", .{});
+    return false;
+}
+
+// ── The code ───────────────────────────────────────────────────────────────
+
+fn layAttrib(ctx: *const anyopaque, name: []const u8) ?u32 {
+    const l = &@as(*const Program, @ptrCast(@alignCast(ctx))).out;
+    for (l.attribs[0..l.nattribs]) |a| {
+        if (std.mem.eql(u8, l.name(a.name), name)) return a.loc;
+    }
+    return null;
+}
+
+/// A uniform's first word: its own, or its first leaf's ("s.m", "s[0].m").
+fn layUniform(ctx: *const anyopaque, name: []const u8) ?u32 {
+    const l = &@as(*const Program, @ptrCast(@alignCast(ctx))).out;
+    for (l.uniforms[0..l.nuniforms]) |un| {
+        const nm = l.name(un.name);
+        if (std.mem.eql(u8, nm, name)) return un.word;
+        if (nm.len > name.len and std.mem.startsWith(u8, nm, name) and (nm[name.len] == '.' or nm[name.len] == '[')) return un.word;
+    }
+    return null;
+}
+
+fn layVarying(ctx: *const anyopaque, name: []const u8) ?u32 {
+    const l = &@as(*const Program, @ptrCast(@alignCast(ctx))).out;
+    for (l.varyings[0..l.nvaryings]) |v| {
+        if (std.mem.eql(u8, l.name(v.name), name)) return v.word;
+    }
+    return null;
+}
+
+fn layOutput(ctx: *const anyopaque, name: []const u8) ?u32 {
+    const l = &@as(*const Program, @ptrCast(@alignCast(ctx))).out;
+    for (l.outputs[0..l.noutputs]) |o| {
+        if (std.mem.eql(u8, l.name(o.name), name)) return o.loc;
+    }
+    return null;
+}
+
+fn layoutOf(p: *const Program) glsl.gen.Layout {
+    return .{ .ctx = p, .attrib = layAttrib, .uniform = layUniform, .varying = layVarying, .output = layOutput };
+}
+
+/// The vertex shader's code in a draw's vertex kernel (the engine builds
+/// it: at the pipeline's first draw on the GPU, at every draw on the CPU).
+fn emitVertex(ctx: ?*const anyopaque, k: *kir.Kernel, io: *raster.VertexIO) void {
+    const p: *const Program = @ptrCast(@alignCast(ctx.?));
+    start();
+    defer unlock();
+    var logbuf: [256]u8 = undefined;
+    var log = glsl.pp.Log{ .buf = &logbuf };
+    if (!scratch.compile(poolText(p.vs_src), .vertex) or !glsl.gen.vertex(&scratch, layoutOf(p), k, io, &log)) {
+        if (k.err == null) k.err = error.BadOperand;
+    }
+}
+
+fn emitFragment(ctx: ?*const anyopaque, k: *kir.Kernel, io: *raster.FragmentIO) void {
+    const p: *const Program = @ptrCast(@alignCast(ctx.?));
+    start();
+    defer unlock();
+    var logbuf: [256]u8 = undefined;
+    var log = glsl.pp.Log{ .buf = &logbuf };
+    if (!scratch.compile(poolText(p.fs_src), .fragment) or !glsl.gen.fragment(&scratch, layoutOf(p), k, io, &log)) {
+        if (k.err == null) k.err = error.BadOperand;
+    }
+}
+
+var check_insts: [engine.MAX_KIR]kir.Inst = undefined;
+var check_tys: [engine.MAX_KIR]kir.Ty = undefined;
+
+/// Both shaders generated once, into a kernel of their own, and verified:
+/// what cannot be generated fails the link, not a draw.
+fn checkCode(p: *const Program, log: *glsl.pp.Log) bool {
+    const st = kir.Storage{ .insts = &check_insts, .tys = &check_tys };
+    {
+        var k = kir.Kernel.init(st, "glsl_vertex", .{ raster.VERTEX_GROUP, 1, 1 });
+        var io = raster.VertexIO{ .uniforms = k.binding() };
+        for (&io.attr) |*a| {
+            for (a) |*c| c.* = k.reg(.u32);
+        }
+        io.vertex_id = k.reg(.u32);
+        io.instance_id = k.reg(.u32);
+        if (!scratch.compile(poolText(p.vs_src), .vertex)) return codeFailed(log, "vertex", "it no longer compiles");
+        if (!glsl.gen.vertex(&scratch, layoutOf(p), &k, &io, log)) return codeFailed(log, "vertex", "");
+        for (io.position) |v| {
+            if (v != .none) k.store(.f32, kir.global(io.uniforms, 32), kir.u(0), kir.r(v));
+        }
+        k.finish() catch |err| return codeFailed(log, "vertex", @errorName(err));
+    }
+    {
+        var k = kir.Kernel.init(st, "glsl_fragment", .{ raster.TILE, raster.TILE, 1 });
+        var io = raster.FragmentIO{ .uniforms = k.binding() };
+        for (&io.varying) |*v| v.* = k.reg(.f32);
+        for (&io.frag_coord) |*v| v.* = k.reg(.f32);
+        io.front_facing = k.reg(.pred);
+        if (!scratch.compile(poolText(p.fs_src), .fragment)) return codeFailed(log, "fragment", "it no longer compiles");
+        if (!glsl.gen.fragment(&scratch, layoutOf(p), &k, &io, log)) return codeFailed(log, "fragment", "");
+        for (io.color) |v| {
+            if (v != .none) k.store(.f32, kir.global(io.uniforms, 32), kir.u(0), kir.r(v));
+        }
+        k.finish() catch |err| return codeFailed(log, "fragment", @errorName(err));
+    }
+    return true;
+}
+
+fn codeFailed(log: *glsl.pp.Log, what: []const u8, why: []const u8) bool {
+    if (why.len > 0) log.err(0, "the {s} shader's code: {s}", .{ what, why });
+    return false;
+}
+
+pub const DrawState = struct { pipe: *raster.Pipeline, uniforms: []const u32 };
+
+/// What a draw with the program in use runs: its pipeline and uniforms.
+pub fn drawState(c: *Context) ?DrawState {
+    start();
+    defer unlock();
+    if (c.program == 0 or c.program > MAX_NAMES) return null;
+    const o = &objs[c.program - 1];
+    if (o.kind != .program) return null;
+    const p = &progs[o.prog];
+    if (!p.has_pipe) return null;
+    if (p.eng == null) p.eng = c.eng;
+    return .{ .pipe = &p.pipe, .uniforms = p.out.values[0..p.out.nwords] };
 }
 
 fn linkAttribs(p: *Program, vs: *const glsl.Iface, log: *glsl.pp.Log) bool {

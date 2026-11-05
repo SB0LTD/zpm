@@ -232,10 +232,11 @@ pub const CODE_BYTES = 16 * 1024;
 /// kernel has the most).
 const MAX_PARAMS = 160;
 const MAX_BIND = 3 + raster.MAX_ATTRS;
-/// KIR instructions a kernel built here may have (a pipeline's).
-pub const MAX_KIR = 8192;
+/// KIR instructions a kernel built here may have (a pipeline's, a GLSL
+/// shader inlined in it).
+pub const MAX_KIR = 65536;
 /// Bytes of a pipeline kernel's code as the backend emits it.
-pub const PIPE_CODE = 256 * 1024;
+pub const PIPE_CODE = 1024 * 1024;
 
 /// fill: rows y0.. (memory rows, one group row each), pixels x0..x0+w:
 ///   params 0 x0, 1 y0, 2 w, 3 stride (words), 4 value, and for
