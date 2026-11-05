@@ -4940,6 +4940,14 @@ pub fn Database(comptime config: Config) type {
 
         /// The next notification for the installed session (call between
         /// transactions, as PostgreSQL delivers them).
+        /// Count of notifications ever committed (monotonic). A server reads
+        /// it after each statement under its store lock and compares it with
+        /// the value it last saw, so idle LISTEN sessions only take the lock
+        /// to drain their queue when something new was published.
+        pub fn notificationSequence(self: *const Self) u64 {
+            return self.notify.head;
+        }
+
         pub fn takeNotification(self: *Self, out: *Notification) bool {
             const state = self.sessionState();
             return self.notify.take(state.id, out);
