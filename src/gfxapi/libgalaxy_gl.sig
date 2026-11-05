@@ -21,6 +21,7 @@ const wayland = gfxapi.wayland;
 const node = gfxapi.node;
 const engine = gfxapi.engine;
 const thread = gfxapi.thread;
+const report = gfxapi.report;
 const Host = gfxapi.host.Host;
 const libgles = @import("libgles.sig");
 
@@ -50,17 +51,20 @@ fn openDriver() ?*engine.Engine {
     if (opened) return if (the_engine.lost) null else &the_engine;
     if (refused) return null;
     the_gpu = .{ .node = .{ .sys = .{} } };
-    const d = the_gpu.open() catch {
+    const d = the_gpu.open() catch |err| {
+        report.say(.device, "no GPU ({s}): EGL has no display, and the app draws in software", .{@errorName(err)});
         refused = true;
         return null;
     };
     the_engine.init(.{ .dev = d, .compiler = G.compile, .work = &compile_work });
     if (!the_engine.onGpu()) {
         // (the kernels did not load: no GPU drawing at all)
+        report.say(.device, "the GPU's kernels did not load ({s}): EGL has no display, and the app draws in software", .{if (the_engine.why) |w| @errorName(w) else "?"});
         refused = true;
         return null;
     }
     opened = true;
+    report.say(.device, "drawing on {s}", .{d.caps.name});
     return &the_engine;
 }
 
@@ -346,7 +350,9 @@ pub export fn eglGetProcAddress(name: ?[*:0]const u8) callconv(.c) ?*const anyop
     for (entries) |e| {
         if (std.mem.eql(u8, s, e.name)) return e.ptr;
     }
-    return libgles.getProcAddress(n);
+    const p = libgles.getProcAddress(n);
+    if (p == null) report.say(.missing, "eglGetProcAddress(\"{s}\"): not in this driver", .{s});
+    return p;
 }
 
 const Entry = struct { name: []const u8, ptr: *const anyopaque };

@@ -175,6 +175,9 @@ pub const Pipeline = struct {
     progs: [3]?gpu.Program = .{ null, null, null },
     /// the engine that loaded them
     owner: ?*anyopaque = null,
+    /// the engine whose GPU refused them (their draws run on the CPU, not
+    /// compiled again at every draw)
+    refused_by: ?*anyopaque = null,
 
     pub fn init(sh: Shaders) Pipeline {
         std.debug.assert(sh.attrs <= MAX_ATTRS and sh.varyings <= MAX_VARYINGS and sh.textures <= texture.MAX_TEX);

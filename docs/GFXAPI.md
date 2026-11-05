@@ -191,6 +191,14 @@ The library is `libgalaxy-gl.so`, with 58 `egl*` and 209 `gl*` entry points. It 
 
 Each context is current per thread. The current context is kept in a fixed table keyed by the thread pointer (`TPIDR_EL0` on AArch64, `%fs:0` on x86-64), so the library needs no thread-local storage and no C library.
 
+**What it says of itself.** An app's stderr (on Galaxy, the kernel log) gets `galaxy-gl[pid]:` lines (`report.sig`), each kind a few times at most:
+- the device it draws on, or why it has none;
+- an entry point the app asked for that the driver lacks;
+- a program that did not link, with its log's first line;
+- a pipeline the GPU refuses: its draws then run on the CPU, and it isn't compiled again at every draw;
+- a lost GPU;
+- the first GL errors.
+
 The library's panic handler prints one line and exits, as a failed assertion in a C driver does. It needs neither TLS nor a stack walk. EGL's tables, and the render node's, are filled at first use, so they take no room in the file.
 
 As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library has no `DT_NEEDED` entries and no TLS segment. Its only undefined symbols are the weak `dlsym` and `dl_iterate_phdr`, which the dynamic linker binds from the program's C library. It is 1445 KB on aarch64 and 1482 KB on x86_64: the CPU fallback carries KIR's interpreter and the draw kernels' builders, and the GLSL compiler adds about 310 KB. Its tables (EGL's, the engine's kernel space, the compile scratch, the code generator's, the text pool, the programs) are bss, about 49 MB of address space, touched only as used.
@@ -268,7 +276,7 @@ That makes 187 GL entry points.
 sig build test-gfxapi
 ```
 
-- `test-gfxapi-module`: the engine and the pool on the CPU; float-to-unorm conversion (rounding to nearest even, as Mesa does); the render-node client against `node.Fake`, Galaxy's calls over the emulated Adreno, covering buffers, cache upkeep, import, export, a hang and a missing GPU.
+- `test-gfxapi-module`: the engine and the pool on the CPU; the driver's reports, each kind limited; float-to-unorm conversion (rounding to nearest even, as Mesa does); the render-node client against `node.Fake`, Galaxy's calls over the emulated Adreno, covering buffers, cache upkeep, import, export, a hang and a missing GPU.
 - `test-gfxapi-tex`: textures sampled by a GLSL program, a quad a case, on the CPU, on `EmuDevice` and on the emulated Adreno (ir3). Each run gives the same bytes and the texels GL says. The cases:
   - reads: nearest, bilinear clamped at the edge, repeat, mirrored repeat;
   - formats: LUMINANCE and ALPHA, BGRA, RGB565 with a `TEXTURE_SWIZZLE`, an RGBA32F `texelFetch`, an RGBA32I integer texture;

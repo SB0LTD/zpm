@@ -39,6 +39,7 @@ const std = @import("std");
 const gpu = @import("gpu");
 const raster = @import("raster.sig");
 const texture = @import("texture.sig");
+const report = @import("report.sig");
 const kir = gpu.kir;
 const r = kir.r;
 const u = kir.u;
@@ -956,6 +957,7 @@ pub const Engine = struct {
     }
 
     fn loseGpu(e: *Engine, err: anyerror) void {
+        if (!e.lost) report.say(.lost, "the GPU is lost ({s}): drawing goes on on the CPU, and GL reports a reset", .{@errorName(err)});
         e.lost = true;
         if (e.why == null) e.why = err;
         e.n_ops = 0;
@@ -1075,6 +1077,7 @@ pub const Engine = struct {
     /// not compile or load.
     pub fn loadPipeline(e: *Engine, p: *raster.Pipeline) bool {
         if (!e.onGpu() or p.owner == @as(?*anyopaque, e)) return true;
+        if (p.refused_by == @as(?*anyopaque, e)) return false;
         const d = e.dev.?;
         for (0..3) |n| {
             var k = e.build(@enumFromInt(n), p);
@@ -1089,6 +1092,9 @@ pub const Engine = struct {
 
     fn pipeFailed(e: *Engine, p: *raster.Pipeline, n: usize, err: anyerror) bool {
         e.why_pipe = err;
+        p.refused_by = e;
+        const stage = [_][]const u8{ "vertex", "setup", "tile" };
+        report.say(.pipeline, "a program's {s} kernel does not compile or load for the GPU ({s}): its draws run on the CPU", .{ stage[n], @errorName(err) });
         for (p.progs[0..n]) |*q| {
             if (q.*) |*prog| e.dev.?.unload(prog);
             q.* = null;
@@ -1202,6 +1208,7 @@ pub const Engine = struct {
         var k = e.build(st, p);
         k.finish() catch |err| {
             e.why_pipe = err;
+            report.say(.pipeline, "a {s} kernel does not build ({s}): the draw is dropped", .{ @tagName(st), @errorName(err) });
             return false;
         };
         var w = gpu.Work.init(e.cpu_work);
@@ -1218,6 +1225,7 @@ pub const Engine = struct {
         }, gpu.interp_caps, &w, &trap, &stats) catch |err| {
             e.why_pipe = err;
             e.trap = trap;
+            report.say(.pipeline, "a {s} kernel stopped on the CPU ({s} at {d}): the draw is dropped", .{ @tagName(st), @errorName(err), trap.pc });
             return false;
         };
         e.stats.cpu_lane_ops += stats.lane_ops;

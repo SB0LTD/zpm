@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const engine = @import("engine.sig");
+const report = @import("report.sig");
 const raster = @import("raster.sig");
 const program = @import("program.sig");
 const texture = @import("texture.sig");
@@ -636,6 +637,7 @@ pub const Context = struct {
 
     pub fn fail(c: *Context, e: u32) void {
         if (c.err == g.NO_ERROR) c.err = e;
+        report.say(.gl_error, "GL error 0x{x}", .{e});
     }
 
     // ── Errors, strings, state ─────────────────────────────────────────────

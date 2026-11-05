@@ -26,6 +26,7 @@ const gpu = @import("gpu");
 const gles = @import("gles.sig");
 const g = @import("glenum.sig");
 const engine = @import("engine.sig");
+const report = @import("report.sig");
 const raster = @import("raster.sig");
 const texture = @import("texture.sig");
 pub const glsl = @import("glsl/glsl.sig");
@@ -677,7 +678,7 @@ pub fn linkProgram(c: *Context, prog: u32) void {
     p.vs_src = .{};
     p.fs_src = .{};
     p.linked = link(p, &log);
-    if (p.linked) p.eng = c.eng;
+    if (p.linked) p.eng = c.eng else report.say(.link, "a program did not link: {s}", .{report.firstLine(log.text())});
     p.validated = false;
     setLog(o, log.text());
 }

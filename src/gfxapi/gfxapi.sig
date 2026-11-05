@@ -18,6 +18,7 @@
 //! - program: GL's shader and program objects, links and uniforms;
 //! - texture: texture reads in KIR (fetch, filters, wraps, sizes);
 //! - texfmt: GL's texture formats as stored, and their uploads;
+//! - report: what the driver says of itself on the app's stderr;
 //! - libgalaxy_gl.sig and libgles.sig (the shared library's root, not
 //!   imported here): the C entry points.
 //!
@@ -37,6 +38,7 @@ pub const program = @import("program.sig");
 pub const texture = @import("texture.sig");
 pub const texfmt = @import("texfmt.sig");
 pub const glsl = @import("glsl/glsl.sig");
+pub const report = @import("report.sig");
 
 test {
     _ = engine;
@@ -47,6 +49,7 @@ test {
     _ = program;
     _ = texture;
     _ = texfmt;
+    _ = report;
     _ = glsl;
     _ = glsl.lex;
     _ = glsl.pp;
