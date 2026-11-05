@@ -167,6 +167,8 @@ const Programs = struct {
     quant: ?Program = null,
     swiglu: ?Program = null,
     residual: ?Program = null,
+    /// residual and the norm+quant after it in one dispatch (null: apart)
+    residual_norm: ?Program = null,
     conv: ?Program = null,
     prepare: ?Program = null,
     scores_decode: ?Program = null,
@@ -309,6 +311,9 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         last_ns: u64 = 0,
         /// Why the last kernel did not compile.
         compile_error: ?anyerror = null,
+        /// Each residual and the norm after it in one dispatch where the
+        /// fused kernel built (locate turns it off: it checks them apart).
+        fuse: bool = true,
         /// Each matrix shape's layout for one-token passes (tuneMatrices).
         tuned: [MAX_TUNED]Tuned = undefined,
         n_tuned: usize = 0,
@@ -348,7 +353,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             for (&k.q6k) |*p| self.unload(p);
             for (&k.q4k1) |*p| self.unload(p);
             for (&k.q6k1) |*p| self.unload(p);
-            const progs = [_]*?Program{ &k.norm_quant, &k.quant, &k.swiglu, &k.residual, &k.conv, &k.prepare, &k.scores_decode, &k.scores_prefill, &k.softmax, &k.values_decode, &k.values_prefill, &k.combine, &k.copy };
+            const progs = [_]*?Program{ &k.norm_quant, &k.quant, &k.swiglu, &k.residual, &k.residual_norm, &k.conv, &k.prepare, &k.scores_decode, &k.scores_prefill, &k.softmax, &k.values_decode, &k.values_prefill, &k.combine, &k.copy };
             for (progs) |p| self.unload(p);
         }
 
@@ -414,6 +419,11 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             try self.build(&self.k.quant, kernels.quant(s, caps, .plain));
             try self.build(&self.k.swiglu, kernels.quant(s, caps, .swiglu));
             try self.build(&self.k.residual, kernels.residual(s, caps, plan.sandwich_norms));
+            // (fused where it builds; apart otherwise, the same bits)
+            self.build(&self.k.residual_norm, kernels.residualNormQuant(s, caps, plan.sandwich_norms)) catch {
+                self.k.residual_norm = null;
+            };
+            self.compile_error = null;
             try self.build(&self.k.copy, kernels.copy(s, caps));
             if (plan.conv_layer_count > 0) try self.build(&self.k.conv, kernels.conv(s, caps, plan.conv_kernel));
             if (plan.attention_layer_count > 0) {
@@ -768,12 +778,20 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             const n: u32 = @intCast(count);
             for (plan.layers[0..plan.layer_count], 0..) |*ly, li| {
                 l.what = .{ .layer = @intCast(li) };
-                try self.layer(&l, ly, c, n);
+                // (the norm after the layer's last residual: the next
+                // layer's, or for one row the output's, fused with it)
+                const next: ?NextNorm = if (li + 1 < plan.layer_count)
+                    .{ .norm = plan.layers[li + 1].attn_norm, .rows = n, .out = self.s.normalized }
+                else if (output != .none and count == 1)
+                    .{ .norm = plan.output_norm, .rows = 1, .out = self.out_hidden }
+                else
+                    null;
+                try self.layer(&l, ly, c, n, li == 0 or !self.fused(), next);
             }
             l.what = .{};
             if (output != .none) {
                 // the last position's output norm (and its quantization)
-                try self.normQuant(&l, @intCast((count - 1) * h * 4), plan.output_norm, 1, self.out_hidden);
+                if (!(count == 1 and self.fused())) try self.normQuant(&l, @intCast((count - 1) * h * 4), plan.output_norm, 1, self.out_hidden);
                 if (output == .logits) try self.linear(&l, try self.matrixOf(plan.output), 1, self.out_logits, plan.vocabulary_size * 4);
             }
             self.dispatches = @intCast(l.n);
@@ -859,7 +877,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             for (k.q6k) |p| if (p) |pp| if (pp.code.gpu == code_va) return "matrix q6k";
             const named = [_]struct { []const u8, ?Program }{
                 .{ "norm+quant", k.norm_quant },      .{ "quant", k.quant },                       .{ "swiglu+quant", k.swiglu },
-                .{ "residual", k.residual },          .{ "conv", k.conv },                         .{ "prepare", k.prepare },
+                .{ "residual", k.residual },          .{ "residual+norm+quant", k.residual_norm }, .{ "conv", k.conv },                         .{ "prepare", k.prepare },
                 .{ "attention scores", k.scores_decode }, .{ "attention scores (tiles)", k.scores_prefill }, .{ "attention softmax", k.softmax },
                 .{ "attention values", k.values_decode }, .{ "attention values (tiles)", k.values_prefill }, .{ "attention combine", k.combine },
                 .{ "copy", k.copy },
@@ -951,6 +969,10 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             const diagnose = self.options.diagnose;
             self.options.diagnose = null;
             defer self.options.diagnose = diagnose;
+            // (each dispatch checked against its CPU step: residual and norm apart)
+            const fuse = self.fuse;
+            self.fuse = false;
+            defer self.fuse = fuse;
             var plan: lfm3.Plan = undefined;
             const n = full.layer_count;
             var line: [320]u8 = undefined;
@@ -1489,11 +1511,21 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             return r;
         }
 
-        fn layer(self: *Self, l: *List, ly: *const lfm3.Layer, c: *const Cache, n: u32) Error!void {
+        /// The norm a layer's last residual is fused with.
+        const NextNorm = struct { norm: lfm3.TensorRef, rows: u32, out: Buffer };
+
+        fn fused(self: *const Self) bool {
+            return self.fuse and self.k.residual_norm != null;
+        }
+
+        /// One layer: its attention norm first when `first` (else the
+        /// layer before fused it with its last residual); its last residual
+        /// fused with `next` when there is one and the fused kernel is.
+        fn layer(self: *Self, l: *List, ly: *const lfm3.Layer, c: *const Cache, n: u32, first: bool, next: ?NextNorm) Error!void {
             const plan = self.plan;
             const h: u32 = plan.hidden_size;
             const s = &self.s;
-            try self.normQuant(l, 0, ly.attn_norm, n, s.normalized);
+            if (first) try self.normQuant(l, 0, ly.attn_norm, n, s.normalized);
             switch (ly.kind) {
                 .short_conv => {
                     try self.linear(l, try self.matrixOf(ly.in_proj), n, s.mixed, 3 * h * 4);
@@ -1505,15 +1537,34 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 },
                 .attention => try self.attention(l, ly, c, n),
             }
-            try self.residual(l, ly.post_attention_norm, n);
-            try self.normQuant(l, 0, ly.ffn_norm, n, s.normalized);
+            try self.residualNorm(l, ly.post_attention_norm, ly.ffn_norm, n, s.normalized);
             const ff: u32 = plan.feed_forward_size;
             try self.linear(l, try self.matrixOf(ly.ffn_gate), n, s.ffn_gate, ff * 4);
             try self.linear(l, try self.matrixOf(ly.ffn_up), n, s.ffn_up, ff * 4);
             l.named("swiglu+quant", null, 0, n);
             try l.add(&self.k.swiglu.?, kernels.quantGroups(self.caps, .swiglu, ff, n), &.{ s.ffn_gate, s.ffn_up, s.ffn_gate, s.act_q, s.act_d, s.act_sums }, &kernels.quantParams(ff, 0, 0, 0, 0));
             try self.linear(l, try self.matrixOf(ly.ffn_down), n, s.projected, h * 4);
+            if (next) |nx| {
+                if (self.fused() and nx.rows == n) {
+                    try self.residualNorm(l, ly.post_ffw_norm, nx.norm, n, nx.out);
+                    return;
+                }
+            }
             try self.residual(l, ly.post_ffw_norm, n);
+        }
+
+        /// residual(`post`), then normQuant(`norm`) of the same rows into
+        /// `normalized`: one dispatch where the fused kernel is.
+        fn residualNorm(self: *Self, l: *List, post: lfm3.TensorRef, norm: lfm3.TensorRef, n: u32, normalized: Buffer) Error!void {
+            if (!self.fused()) {
+                try self.residual(l, post, n);
+                return self.normQuant(l, 0, norm, n, normalized);
+            }
+            const h = self.plan.hidden_size;
+            const s = &self.s;
+            const w = if (self.plan.sandwich_norms) try self.tensorOffset(post) else 0;
+            l.named("residual+norm+quant", norm.index, 0, n);
+            try l.add(&self.k.residual_norm.?, .{ 1, n, 1 }, &.{ s.hidden, s.projected, self.weights, normalized, s.act_q, s.act_d, s.act_sums }, &kernels.ResidualNormParams.words(h, self.plan.rms_norm_epsilon, 0, try self.tensorOffset(norm), 0, w));
         }
 
         fn attention(self: *Self, l: *List, ly: *const lfm3.Layer, c: *const Cache, n: u32) Error!void {

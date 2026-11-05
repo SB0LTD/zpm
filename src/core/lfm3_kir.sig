@@ -1132,6 +1132,38 @@ pub fn quant(s: kir.Storage, caps: Caps, mode: QuantMode) Error!kir.Kernel {
         return k;
     }
 
+    normQuantBody(&b, .{ .X = X, .WB = WB, .NB = NB, .AQ = AQ, .AD = AD, .AS = AS }, threads, .{ .width = width, .blocks = blocks, .epsilon = b.param(2), .x = b.param(3), .weight = w_base, .normalized = b.param(5) });
+    try k.finish();
+    return k;
+}
+
+const NormBind = struct { X: u8, WB: u8, NB: u8, AQ: u8, AD: u8, AS: u8 };
+const NormArgs = struct { width: V, blocks: V, epsilon: V, x: V, weight: V, normalized: V };
+
+/// RMSNorm of each token's row (group y) at byte offset `x` of X, then
+/// each pass of eight blocks normalized, written to NB (at `normalized`)
+/// and quantized: the row's square sum as a double-f32, the CPU's bits.
+/// quant's `.norm`, and residualNormQuant's second half.
+fn normQuantBody(b: *Builder, m: NormBind, threads: u32, a: NormArgs) void {
+    const X = m.X;
+    const WB = m.WB;
+    const NB = m.NB;
+    const AQ = m.AQ;
+    const AD = m.AD;
+    const AS = m.AS;
+    const per_pass = threads / 32;
+    const t = b.tid(0);
+    const i = b.band(R(t), U(31));
+    const bin = b.shr(R(t), 5);
+    const width = a.width;
+    const blocks = a.blocks;
+    const tok = b.gid(1);
+    const row_blocks = b.mul(R(tok), R(blocks));
+    const row_bytes = b.shl(R(b.mul(R(tok), R(width))), 2);
+    const last = b.sub(R(blocks), U(1));
+    const lane_bytes = b.shl(R(i), 5);
+    const x_base = b.add(R(a.x), R(row_bytes));
+    const w_base = a.weight;
     // RMSNorm: the row's square sum (double-f32), then each pass of eight
     // blocks normalized, written out and quantized.
     const passes = b.shr(R(b.add(R(blocks), U(per_pass - 1))), log2(per_pass));
@@ -1153,7 +1185,7 @@ pub fn quant(s: kir.Storage, caps: Caps, mode: QuantMode) Error!kir.Kernel {
     }
     b.endloop();
     const total = b.xorReduceDD(sum, threads, t);
-    const inverse = b.normInverse(total, R(b.cvt(.u32, .f32, .rne, R(width))), R(b.as(.f32, b.param(2))));
+    const inverse = b.normInverse(total, R(b.cvt(.u32, .f32, .rne, R(width))), R(b.as(.f32, a.epsilon)));
     b.set(p, .mov, .u32, U(0), NO, NO);
     b.loop();
     {
@@ -1162,7 +1194,7 @@ pub fn quant(s: kir.Storage, caps: Caps, mode: QuantMode) Error!kir.Kernel {
         const blc = b.umin(R(bl), R(last));
         const col = b.add(R(b.shl(R(blc), 10)), R(lane_bytes));
         const off = b.add(R(x_base), R(col));
-        const noff = b.add(R(b.add(R(b.param(5)), R(row_bytes))), R(col));
+        const noff = b.add(R(b.add(R(a.normalized), R(row_bytes))), R(col));
         const wo = b.add(R(w_base), R(col));
         const x0 = b.ldv(X, .f32, R(off), 0, 4);
         const x1 = b.ldv(X, .f32, R(off), 16, 4);
@@ -1182,13 +1214,11 @@ pub fn quant(s: kir.Storage, caps: Caps, mode: QuantMode) Error!kir.Kernel {
         b.st(NB, R(noff), 0, 7, y0);
         b.st(NB, R(noff), 16, 7, y1);
         b.endif();
-        quantQ8K(&b, y, i, t, b.add(R(row_blocks), R(blc)), ok, AQ, AD, AS);
+        quantQ8K(b, y, i, t, b.add(R(row_blocks), R(blc)), ok, AQ, AD, AS);
         b.set(p, .iadd, .u32, R(p), U(1), NO);
         b.brk(b.icmp(.u32, .ge, R(p), R(passes)));
     }
     b.endloop();
-    try k.finish();
-    return k;
 }
 
 // ── Q8_0 quantization ───────────────────────────────────────────────────────
@@ -1274,8 +1304,62 @@ pub fn residual(s: kir.Storage, caps: Caps, postnorm: bool) Error!kir.Kernel {
     const WB = k.binding();
     k.param_words = 3;
     if (postnorm) b.needExchange(threads);
+    residualBody(&b, .{ .HID = HID, .BLK = BLK, .WB = WB }, threads, postnorm, .{ .width = b.param(0), .epsilon = b.param(1), .weight = b.param(2) });
+    try k.finish();
+    return k;
+}
+
+/// residual, then norm+quant over the same rows, in one kernel: lfm3_any's
+/// residual and the norm after it (the FFN's, the next layer's, the
+/// output's) without a dispatch, a barrier of the device's and a trip of
+/// the hidden rows through memory between them. hidden += post(block), a
+/// barrier (the group's global memory ordered), then norm+quant of the new
+/// hidden rows: both kernels' code, the same bits. Bindings: hidden, block,
+/// weights, normalized, AQ, AD, AS. Params: ResidualNormParams. Groups
+/// (1, tokens, 1).
+pub fn residualNormQuant(s: kir.Storage, caps: Caps, postnorm: bool) Error!kir.Kernel {
+    const threads: u32 = rowThreads(caps);
+    if (threads < 32) return error.Unsupported;
+    var k = begin(s, if (postnorm) "lfm3_residual_norm_quant_post" else "lfm3_residual_norm_quant", threads);
+    var b = Builder.init(&k, caps);
+    const HID = k.binding();
+    const BLK = k.binding();
+    const W = k.binding();
+    const NB = k.binding();
+    const AQ = k.binding();
+    const AD = k.binding();
+    const AS = k.binding();
+    k.param_words = ResidualNormParams.WORDS;
+    b.needExchange(threads);
+    residualBody(&b, .{ .HID = HID, .BLK = BLK, .WB = W }, threads, postnorm, .{ .width = b.param(0), .epsilon = b.param(2), .weight = b.param(6) });
+    b.barrier();
+    normQuantBody(&b, .{ .X = HID, .WB = W, .NB = NB, .AQ = AQ, .AD = AD, .AS = AS }, threads, .{ .width = b.param(0), .blocks = b.param(1), .epsilon = b.param(2), .x = b.param(3), .weight = b.param(4), .normalized = b.param(5) });
+    try k.finish();
+    return k;
+}
+
+/// residualNormQuant's words: quantParams' six (the width, its blocks, the
+/// epsilon, the rows' offset, the norm's weights, the normalized rows'
+/// offset), then the residual's post-norm weights.
+pub const ResidualNormParams = struct {
+    pub const WORDS = 7;
+    pub fn words(width: u32, epsilon: f32, x: u32, norm_weight: u32, normalized: u32, post_weight: u32) [WORDS]u32 {
+        const q = quantParams(width, epsilon, x, norm_weight, normalized);
+        return .{ q[0], q[1], q[2], q[3], q[4], q[5], post_weight };
+    }
+};
+
+const ResidualBind = struct { HID: u8, BLK: u8, WB: u8 };
+const ResidualArgs = struct { width: V, epsilon: V, weight: V };
+
+/// hidden += block for each token's row (group y), the block RMSNormed
+/// and weighted first with `postnorm` (sandwich norms): residual's body.
+fn residualBody(b: *Builder, m: ResidualBind, threads: u32, postnorm: bool, a: ResidualArgs) void {
+    const HID = m.HID;
+    const BLK = m.BLK;
+    const WB = m.WB;
     const t = b.tid(0);
-    const width = b.param(0);
+    const width = a.width;
     const row = b.shl(R(b.mul(R(b.gid(1)), R(width))), 2);
     const chunks = b.shr(R(width), log2(threads));
     const t4 = b.shl(R(t), 2);
@@ -1289,20 +1373,18 @@ pub fn residual(s: kir.Storage, caps: Caps, postnorm: bool) Error!kir.Kernel {
         b.set(c, .iadd, .u32, R(c), U(1), NO);
         b.brk(b.icmp(.u32, .ge, R(c), R(chunks)));
         b.endloop();
-        inverse = b.normInverse(b.xorReduceDD(sum, threads, t), R(b.cvt(.u32, .f32, .rne, R(width))), R(b.as(.f32, b.param(1))));
+        inverse = b.normInverse(b.xorReduceDD(sum, threads, t), R(b.cvt(.u32, .f32, .rne, R(width))), R(b.as(.f32, a.epsilon)));
         b.set(c, .mov, .u32, U(0), NO, NO);
     }
     b.loop();
     const col = b.add(R(b.shl(R(c), log2(threads) + 2)), R(t4));
     const off = b.add(R(row), R(col));
     var x = b.ld(BLK, .f32, R(off), 0, 5);
-    if (postnorm) x = b.fmul(R(b.fmul(R(x), R(inverse))), R(b.ld(WB, .f32, R(b.add(R(b.param(2)), R(col))), 0, 5)));
+    if (postnorm) x = b.fmul(R(b.fmul(R(x), R(inverse))), R(b.ld(WB, .f32, R(b.add(R(a.weight), R(col))), 0, 5)));
     b.st(HID, R(off), 0, 5, b.fadd(R(b.ld(HID, .f32, R(off), 0, 5)), R(x)));
     b.set(c, .iadd, .u32, R(c), U(1), NO);
     b.brk(b.icmp(.u32, .ge, R(c), R(chunks)));
     b.endloop();
-    try k.finish();
-    return k;
 }
 
 // ── Short convolution ───────────────────────────────────────────────────────
@@ -2718,6 +2800,44 @@ test "residual: hidden += rmsnorm(block) * w, and += block, the CPU's bits" {
         _ = try runOn(&k, caps, .{ 1, tokens, 1 }, &.{ T.a[0 .. tokens * width * 4], T.b[0 .. tokens * width * 4], T.c[0 .. 64 + width * 4] }, &.{ width, @as(u32, @bitCast(@as(f32, 1e-5))), 64 });
         for (want, hid) |a, b| try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
     }
+}
+
+test "residual then norm+quant in one kernel: the two kernels' bits (hidden, normalized rows, Q8_K)" {
+    const T = TestRig;
+    for ([_]bool{ true, false }) |postnorm| for ([_]bool{ true, false }) |fused| {
+        const caps = caps32(fused, 32);
+        const tokens = 3;
+        const width = 2048;
+        const blocks = width / QK_K;
+        var seed: u32 = 41 + @as(u32, @intFromBool(postnorm)) * 7;
+        const hid = f32s(T.a[0 .. tokens * width * 4]);
+        const blk = f32s(T.b[0 .. tokens * width * 4]);
+        // the weights: the residual's post-norm at 64, the norm's at 64 + width * 4
+        const post_w = f32s(T.e[64..][0 .. width * 4]);
+        const norm_w = f32s(T.e[64 + width * 4 ..][0 .. width * 4]);
+        for (hid) |*v| v.* = unit(&seed) * 8;
+        for (blk) |*v| v.* = unit(&seed) * 3;
+        for (post_w) |*v| v.* = 0.75 + unit(&seed);
+        for (norm_w) |*v| v.* = 0.5 + unit(&seed) + 0.5;
+        // the CPU: the residual, then RMSNorm and quantizeQ8K of the new rows
+        var want_hid: [tokens * width]f32 = undefined;
+        var want_y: [tokens * width]f32 = undefined;
+        for (0..tokens) |t| {
+            var row: [width]f32 = undefined;
+            @memcpy(&row, blk[t * width ..][0..width]);
+            if (postnorm) rmsNormRow(&row, post_w, &row, 1e-5);
+            for (want_hid[t * width ..][0..width], hid[t * width ..][0..width], row) |*o, h, r| o.* = h + r;
+            rmsNormRow(want_hid[t * width ..][0..width], norm_w, want_y[t * width ..][0..width], 1e-5);
+        }
+        var k = try residualNormQuant(testStorage(), caps, postnorm);
+        _ = try runOn(&k, caps, .{ 1, tokens, 1 }, &.{ T.a[0 .. tokens * width * 4], T.b[0 .. tokens * width * 4], T.e[0 .. 64 + 2 * width * 4], T.f[0 .. 16 + tokens * width * 4], T.c[0 .. tokens * width], T.d[0 .. tokens * blocks * 4], T.g[0 .. tokens * blocks * 32] }, &ResidualNormParams.words(width, 1e-5, 0, 64 + width * 4, 16, 64));
+        for (want_hid, hid) |a, b| try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+        const y = f32s(T.f[16..][0 .. tokens * width * 4]);
+        for (want_y, y) |a, b| try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+        var cpu: [tokens * blocks]quantized.Q8KBlock = undefined;
+        try quantized.quantizeQ8K(&want_y, &cpu);
+        try expectQ8K(&cpu, &T.c, &T.d, &T.g);
+    };
 }
 
 test "short convolution: the CPU's floats exactly, the state carried" {
