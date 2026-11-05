@@ -326,6 +326,12 @@ fn followTheCpu(which: Device, tolerance: f64) !f64 {
     // the model uses
     try std.testing.expect(backend.k.read != null);
     const read_gbps = backend.readSpeed(64 << 20);
+    // (a device that keeps no dispatch times: no profile, the cache as it was)
+    {
+        const at = gc.cpu.position;
+        try std.testing.expect(backend.profileStep(&gc, t2) == null);
+        try std.testing.expectEqual(at, gc.cpu.position);
+    }
     {
         const c3 = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &.{t2} }, .logits, .{})).?;
         const g3 = (backend.forward(&gc, .{ .tokens = &.{t2} }, .logits) catch |e| return failure(&backend, e)).?;
@@ -337,6 +343,51 @@ fn followTheCpu(which: Device, tolerance: f64) !f64 {
         @tagName(which), worst, prefill_ops, prefill_dispatches, decode_ops / 7, backend.dispatches,
     });
     return worst;
+}
+
+test "a profiled run: each dispatch's time from the latest end before it, matrices by their tensor's role" {
+    try std.testing.expectEqualStrings("ffn_down.weight", any.roleName("blk.17.ffn_down.weight"));
+    try std.testing.expectEqualStrings("output.weight", any.roleName("output.weight"));
+    const Roles = struct {
+        pub fn of(_: @This(), d: any.Desc) struct { role: []const u8, bytes: u64 } {
+            if (d.tensor) |t| return .{ .role = if (t == 1) "ffn_down.weight" else "attn_q.weight", .bytes = 100 };
+            return .{ .role = "", .bytes = 0 };
+        }
+    };
+    var p = any.Profile{};
+    const descs = [_]any.Desc{
+        .{ .kernel = "norm+quant", .layer = 0 },
+        .{ .kernel = "matrix q4k", .layer = 0, .tensor = 0 },
+        .{ .kernel = "matrix q6k", .layer = 0, .tensor = 1 },
+        .{ .kernel = "norm+quant", .layer = 1 },
+        .{ .kernel = "matrix q6k", .layer = 1, .tensor = 1 },
+    };
+    // (the third ends before the second: two that ran together; the
+    // second's time is from the first's end, the third's 0)
+    const ends = [_]u64{ 10, 50, 40, 70, 100 };
+    p.addRun(&descs, &ends, 120, Roles{});
+    try std.testing.expectEqual(@as(usize, 3), p.n);
+    try std.testing.expectEqualStrings("norm+quant", p.slice()[0].nameSlice());
+    try std.testing.expectEqual(@as(u64, 10 + 20), p.slice()[0].ns);
+    try std.testing.expectEqual(@as(u32, 2), p.slice()[0].count);
+    try std.testing.expectEqualStrings("matrix q4k attn_q.weight", p.slice()[1].nameSlice());
+    try std.testing.expectEqual(@as(u64, 40), p.slice()[1].ns);
+    try std.testing.expectEqualStrings("matrix q6k ffn_down.weight", p.slice()[2].nameSlice());
+    try std.testing.expectEqual(@as(u64, 0 + 30), p.slice()[2].ns);
+    try std.testing.expectEqual(@as(u64, 200), p.slice()[2].bytes);
+    try std.testing.expectEqual(@as(u64, 20), p.tail_ns);
+    try std.testing.expectEqual(@as(u64, 120), p.gpu_ns);
+    try std.testing.expectEqual(@as(u32, 5), p.dispatches);
+    // more kinds than it keeps: the rest in its last entry
+    var q = any.Profile{};
+    var names: [any.MAX_PROFILE + 5][8]u8 = undefined;
+    for (&names, 0..) |*nm, i| {
+        const t = std.fmt.bufPrint(nm, "k{d}", .{i}) catch unreachable;
+        q.add(t, "", 1, 0);
+    }
+    try std.testing.expectEqual(@as(usize, any.MAX_PROFILE), q.n);
+    try std.testing.expectEqualStrings("(more kinds)", q.slice()[any.MAX_PROFILE - 1].nameSlice());
+    try std.testing.expectEqual(@as(u64, 6), q.slice()[any.MAX_PROFILE - 1].ns);
 }
 
 test "the any-GPU backend follows the CPU executor on an ideal GPU, and the CPU takes over from its state" {

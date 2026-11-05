@@ -92,9 +92,10 @@ pub const Options = struct {
     /// Map the model file zero-copy where the device can (unified memory,
     /// caps.import, the file mapped).
     import: bool = true,
-    /// Dispatches one Device.run takes at most (a call sends more as
-    /// several runs, each waited for: nvidia_device takes 256).
-    max_run: u32 = 256,
+    /// Dispatches one Device.run takes at most, and never more than the
+    /// device's caps.max_run (a call sends more as several runs, each
+    /// waited for: one decode step is one run where the device takes it).
+    max_run: u32 = MAX_DISPATCHES,
     /// Diagnose mode (lfm3_gpu's): every dispatch of a call is a run of its
     /// own, and `diagnose` is called with a line naming it before it is
     /// sent ("lfm3-any: dispatch 12, layer 2 of 24 (attention): matrix
@@ -119,7 +120,96 @@ pub const Options = struct {
     /// that many lanes a thread for every shape. Every layout is the CPU's
     /// bits (lfm3_kir): only the time differs.
     matrix_lanes: u32 = 0,
+    /// The caller's clock (ns), for profileStep's account of a call's CPU
+    /// side (null: not timed).
+    clock: ?*const fn () u64 = null,
 };
+
+/// One kind of dispatch in a profiled call: a kernel, or for a matrix the
+/// tensor's role across layers ("matrix q4k ffn_gate.weight").
+pub const ProfileEntry = struct {
+    name: [56]u8 = undefined,
+    len: u8 = 0,
+    count: u32 = 0,
+    /// GPU time its dispatches took (each end less the latest end before it).
+    ns: u64 = 0,
+    /// The weights its dispatches read (matrices; 0 for the rest).
+    bytes: u64 = 0,
+
+    pub fn nameSlice(e: *const ProfileEntry) []const u8 {
+        return e.name[0..e.len];
+    }
+};
+
+pub const MAX_PROFILE = 48;
+
+/// Where one call's time went (profileStep).
+pub const Profile = struct {
+    entries: [MAX_PROFILE]ProfileEntry = undefined,
+    n: usize = 0,
+    /// The runs' GPU time (each from its start to its end timestamp), the
+    /// part of it after the last dispatch ended (the run's tail), and the
+    /// dispatches and runs.
+    gpu_ns: u64 = 0,
+    tail_ns: u64 = 0,
+    dispatches: u32 = 0,
+    runs: u32 = 0,
+    /// The call's CPU side by Options.clock (0: not timed): its dispatch
+    /// list and uploads, the runs submitted and waited for, the results
+    /// read back.
+    begin_ns: u64 = 0,
+    runs_ns: u64 = 0,
+    complete_ns: u64 = 0,
+
+    pub fn slice(p: *const Profile) []const ProfileEntry {
+        return p.entries[0..p.n];
+    }
+
+    /// `ns` and `bytes` added to the entry `kernel` (and `role`) names.
+    pub fn add(p: *Profile, kernel: []const u8, role: []const u8, ns: u64, bytes: u64) void {
+        var name: [56]u8 = undefined;
+        const text = if (role.len == 0) kernel else std.fmt.bufPrint(&name, "{s} {s}", .{ kernel, role }) catch kernel;
+        const t = text[0..@min(text.len, name.len)];
+        for (p.entries[0..p.n]) |*e| {
+            if (std.mem.eql(u8, e.nameSlice(), t)) {
+                e.count += 1;
+                e.ns += ns;
+                e.bytes += bytes;
+                return;
+            }
+        }
+        // (the last entry is the rest's)
+        if (p.n >= MAX_PROFILE - 1 and !std.mem.eql(u8, t, "(more kinds)")) return p.add("(more kinds)", "", ns, bytes);
+        const e = &p.entries[p.n];
+        e.* = .{ .count = 1, .ns = ns, .bytes = bytes, .len = @intCast(t.len) };
+        @memcpy(e.name[0..t.len], t);
+        p.n += 1;
+    }
+
+    /// One run's dispatches: `ends` (ns after the run's start, each dispatch's
+    /// completion) attributed to `descs` in order, each the time from the
+    /// latest end before it to its own; the rest of `run_ns` is the tail.
+    pub fn addRun(p: *Profile, descs: []const Desc, ends: []const u64, run_ns: u64, roleOf: anytype) void {
+        var latest: u64 = 0;
+        for (descs, ends) |d, end| {
+            const took = end -| latest;
+            latest = @max(latest, end);
+            const r = roleOf.of(d);
+            p.add(d.kernel, r.role, took, r.bytes);
+        }
+        p.tail_ns += run_ns -| latest;
+        p.gpu_ns += run_ns;
+        p.dispatches += @intCast(descs.len);
+        p.runs += 1;
+    }
+};
+
+/// A tensor's role across layers: its name less "blk.N.".
+pub fn roleName(name: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, name, "blk.")) return name;
+    const dot = std.mem.indexOfScalarPos(u8, name, 4, '.') orelse return name;
+    return name[dot + 1 ..];
+}
 
 pub const MATRIX_VARIANTS = kernels.MAX_TOKENS;
 /// The layouts a one-token matrix pass is tried in: lanes a thread (8 / lanes
@@ -311,6 +401,10 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         total_dispatches: u64 = 0,
         /// The device's time for the last call (ns; 0 when it does not say).
         last_ns: u64 = 0,
+        /// profileStep's call: each run's dispatch ends taken and added up.
+        profiling: bool = false,
+        prof: Profile = .{},
+        prof_ends: [MAX_DISPATCHES]u64 = undefined,
         /// Why the last kernel did not compile.
         compile_error: ?anyerror = null,
         /// Each residual and the norm after it in one dispatch where the
@@ -726,7 +820,10 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         /// token. error.DeviceLost or error.LongContext: the cache is as it
         /// was, and toCpu() + the CPU executor can do the call.
         pub fn forward(self: *Self, c: *Cache, input: executor.Input, output: executor.Output) Error!?u32 {
+            const clock = self.options.clock;
+            const t0: u64 = if (self.profiling) (if (clock) |f| f() else 0) else 0;
             var call = try self.begin(c, input, output);
+            const t1: u64 = if (self.profiling) (if (clock) |f| f() else 0) else 0;
             const l = &call.list;
             const count = call.count;
             const cache = &c.cpu;
@@ -750,16 +847,59 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 log(std.fmt.bufPrint(&b3, "lfm3-any: forward of {d} tokens at position {d}: all {d} dispatches done", .{ count, cache.position, l.n }) catch "lfm3-any: forward done");
             } else {
                 var at: usize = 0;
+                const most = @max(1, @min(self.options.max_run, self.dev.caps.max_run));
                 while (at < l.n) {
-                    const part = l.slice()[at..@min(l.n, at + self.options.max_run)];
+                    const part = l.slice()[at..@min(l.n, at + most)];
                     const fence = self.dev.run(part) catch |e| return self.failed(c, e);
                     self.finish(fence) catch |e| return self.failed(c, e);
-                    ns += self.dev.lastRunNs();
+                    const run_ns = self.dev.lastRunNs();
+                    if (self.profiling) {
+                        const got = self.dev.dispatchNs(self.prof_ends[0..part.len]);
+                        if (got == part.len) self.prof.addRun(l.work.descs[at..][0..part.len], self.prof_ends[0..part.len], run_ns, Roles{ .b = self });
+                    }
+                    ns += run_ns;
                     at += part.len;
                 }
             }
             self.last_ns = ns;
-            return self.complete(c, &call, output);
+            const t2: u64 = if (self.profiling) (if (clock) |f| f() else 0) else 0;
+            const token_out = self.complete(c, &call, output);
+            if (self.profiling and t0 != 0) {
+                const t3 = clock.?();
+                self.prof.begin_ns += t1 -| t0;
+                self.prof.runs_ns += t2 -| t1;
+                self.prof.complete_ns += t3 -| t2;
+            }
+            return token_out;
+        }
+
+        /// A dispatch's role for its profile entry: a matrix's tensor (less
+        /// "blk.N.") and the bytes it reads.
+        const Roles = struct {
+            b: *const Self,
+            pub fn of(r: Roles, d: Desc) struct { role: []const u8, bytes: u64 } {
+                if (!std.mem.startsWith(u8, d.kernel, "matrix")) return .{ .role = "", .bytes = 0 };
+                const ti = d.tensor orelse return .{ .role = "", .bytes = 0 };
+                if (ti >= r.b.index.tensor_count) return .{ .role = "", .bytes = 0 };
+                const t = &r.b.index.tensors[ti];
+                return .{ .role = roleName(t.nameSlice()), .bytes = t.byte_size };
+            }
+        };
+
+        /// One decode step (a token after `c`'s position, its logits) with
+        /// each dispatch's end timed: where its GPU time goes, by kernel and
+        /// by the tensor a matrix reads, and its CPU side (Options.clock).
+        /// The cache moves on a position. null: the device keeps no
+        /// dispatch times, or the call failed.
+        pub fn profileStep(self: *Self, c: *Cache, token: u32) ?*const Profile {
+            if (!self.dev.profile(true)) return null;
+            defer _ = self.dev.profile(false);
+            self.prof = .{};
+            self.profiling = true;
+            defer self.profiling = false;
+            _ = self.forward(c, .{ .tokens = &.{token} }, .logits) catch return null;
+            if (self.prof.runs == 0) return null;
+            return &self.prof;
         }
 
         /// A call made and not yet run: its dispatches, its tokens.

@@ -283,6 +283,17 @@ pub fn release(q: *[QMD_WORDS]u32, va: u64, payload: u32) void {
     put(q, F.RELEASE_SEMAPHORE0_PAYLOAD_LOWER, payload);
 }
 
+/// A release when the grid is done, with its completion time: `payload`
+/// (64 bits) then the GPU's timestamp written to `va` (four words, 16-byte
+/// aligned): a profile's per-dispatch end.
+pub fn releaseStamp(q: *[QMD_WORDS]u32, va: u64, payload: u32) void {
+    put(q, F.RELEASE_ENABLE0, 1);
+    put(q, F.RELEASE_STRUCTURE_SIZE0, 0); // SEMAPHORE_FOUR_WORDS
+    put(q, F.RELEASE_SEMAPHORE0_ADDR_LOWER, va & 0xffff_ffff);
+    put(q, F.RELEASE_SEMAPHORE0_ADDR_UPPER, va >> 32);
+    put(q, F.RELEASE_SEMAPHORE0_PAYLOAD_LOWER, payload);
+}
+
 // ── Reading one back ────────────────────────────────────────────────────────
 
 pub const ConstBuf = struct { va: u64 = 0, bytes: u32 = 0, valid: bool = false };
@@ -498,6 +509,9 @@ test "a QMD decoded: what was built, and a release" {
     release(&q, 0x20_0002_0010, 77);
     l = try decode(&q);
     try testing.expectEqual(Release{ .va = 0x20_0002_0010, .payload = 77, .structure = 1 }, l.release.?);
+    var q2 = q;
+    releaseStamp(&q2, 0x20_0002_0040, 5);
+    try testing.expectEqual(Release{ .va = 0x20_0002_0040, .payload = 5, .structure = 0 }, (try decode(&q2)).release.?);
     // what the engine does not take
     q[14] &= ~@as(u32, 0xf << 20);
     try testing.expectError(error.BadQmd, decode(&q));

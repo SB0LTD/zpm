@@ -45,6 +45,8 @@ pub const Caps = struct {
     /// zero-copy import of CPU memory (unified)
     import: bool,
     timestamp_hz: u64,
+    /// The most dispatches one run takes.
+    max_run: u32 = 256,
 };
 
 /// The interpreter's default: an ideal GPU (fused, denormals kept, a
@@ -304,6 +306,12 @@ pub const Device = struct {
         done: *const fn (ctx: *anyopaque, f: Fence) bool,
         /// GPU time of the last run's dispatches (ns), 0 when unknown.
         lastRunNs: *const fn (ctx: *anyopaque) u64,
+        /// Profiling on or off for the runs after it (each dispatch's end
+        /// timed); false: the device cannot (null: none can).
+        profile: ?*const fn (ctx: *anyopaque, on: bool) bool = null,
+        /// For the last run, profiled: each dispatch's end, ns after the
+        /// run's start, into `out` (as many as it ran); 0: none.
+        dispatchNs: ?*const fn (ctx: *anyopaque, out: []u64) usize = null,
     };
 
     /// A buffer of `bytes`, or error.OutOfMemory.
@@ -347,6 +355,16 @@ pub const Device = struct {
     }
     pub fn lastRunNs(d: Device) u64 {
         return d.vtable.lastRunNs(d.ctx);
+    }
+    /// Each dispatch's end timed in the runs after this (false: not here).
+    pub fn profile(d: Device, on: bool) bool {
+        const f = d.vtable.profile orelse return false;
+        return f(d.ctx, on);
+    }
+    /// The last profiled run's dispatch ends (ns after its start).
+    pub fn dispatchNs(d: Device, out: []u64) usize {
+        const f = d.vtable.dispatchNs orelse return 0;
+        return f(d.ctx, out);
     }
     /// Run and wait.
     pub fn runWait(d: Device, ds: []const Dispatch, timeout_us: u64) Error!void {
