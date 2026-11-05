@@ -421,6 +421,48 @@ test "exact fdiv and fsqrt (kir's mul/add-only expansions) equal the interpreter
     }
 }
 
+test "exact fdiv and fsqrt in a loop: their temporaries live only as long as they are used" {
+    // 60 divisions and 12 roots a pass of a loop, a group of 64: an
+    // expansion's registers written twice (its slow path in a branch)
+    // would live through the whole loop (4 each: 288 registers) and fit no
+    // group
+    var k = newKernel("divisions in a loop", .{ 64, 1, 1 });
+    const ba = k.binding();
+    const bo = k.binding();
+    const off = k.op2(.shl, .u32, r(k.tid(0)), u(2));
+    const a = k.load(.f32, kir.global(ba, 32), r(off));
+    const acc = k.reg(.f32);
+    k.set(acc, .mov, f(0), no, no);
+    const i = k.reg(.u32);
+    k.set(i, .mov, u(0), no, no);
+    k.loop();
+    {
+        k.brk(r(k.cmp(.u32, .ge, r(i), u(4))));
+        var v = k.op2(.fadd, .f32, r(a), r(k.cvt(.u32, .f32, .rne, r(i))));
+        for (0..60) |j| {
+            const d = k.op2(.fadd, .f32, r(a), f(@as(f32, @floatFromInt(j)) * 0.25 + 0.5));
+            v = k.div(r(v), r(d));
+            if (j % 5 == 4) v = k.sqrt(r(k.op1(.fabs, .f32, r(v))));
+            v = k.op2(.fadd, .f32, r(v), r(a));
+        }
+        k.set(acc, .fadd, r(acc), r(v), no);
+        k.set(i, .iadd, r(i), u(1), no);
+    }
+    k.endloop();
+    k.store(.f32, kir.global(bo, 32), r(off), r(acc));
+    // magnitudes over the whole range, denormals and huge ones included (the
+    // slow paths taken, by some lanes)
+    var seed: u32 = 77;
+    var av = zeros(64 * 4);
+    for (0..64) |n| {
+        const e = (lcg(&seed) >> 24) & 0xff;
+        std.mem.writeInt(u32, av[n * 4 ..][0..4], (lcg(&seed) & 0x007fffff) | (@as(u32, @min(e, 254)) << 23), .little);
+    }
+    var out = zeros(64 * 4);
+    const run = try both(&k, .{ 1, 1, 1 }, &.{ &av, &out }, &.{});
+    try std.testing.expect(run.stats.full_regs <= 48);
+}
+
 test "selects, predicates and conversions" {
     try checkOp(.{ .name = "sel.u32", .op = .sel, .ty = .u32, .ta = .u32, .tb = .u32, .tc = .pred, .nc = 1, .dst = .u32 });
     try checkOp(.{ .name = "sel.f32", .op = .sel, .ty = .f32, .ta = .f32, .tb = .f32, .tc = .pred, .nc = 1, .dst = .f32, .float_pool = true });

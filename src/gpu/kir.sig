@@ -859,6 +859,12 @@ pub fn expand(src: *const Kernel, caps: Caps, s: Storage) Error!Kernel {
 // and a sticky bit), overflow, the special values, then flushing if caps
 // say so.
 //
+// Every register is written once: what an if-block computes is picked by a
+// select after it (a lane that skipped the block reads whatever its
+// registers hold, and the select drops it). A register written twice lives
+// through every loop around it in a backend's allocation (ir3's): an
+// expansion in a loop would hold its registers for the whole loop.
+//
 // The core: a seed from frcp (frsq), one Newton step, a quotient (root),
 // one correction with its remainder: a faithful result (within an ulp).
 // Then the exact decision: with the remainder of the faithful candidate
@@ -1059,24 +1065,24 @@ fn exactDiv(k: *Kernel, caps: Caps, dst: V, a: Arg, b: Arg) void {
     const da = x.iu(.isub, r(ax), u(0x2780_0000));
     const db = x.iu(.isub, r(bx), u(0x2780_0000));
     const slow = x.ucmp(.gt, r(x.iu(.imax, r(da), r(db))), u(0x307f_ffff));
-    const am = k.reg(.f32);
-    const bm = k.reg(.f32);
-    const de = k.reg(.u32); // the exponents' difference (slow path)
-    k.set(am, .mov, r(ax), no, no);
-    k.set(bm, .mov, r(bx), no, no);
+    // (the slow path's mantissas and the exponents' difference, written
+    // once in the block; selected after it)
+    var ua: [2]V = undefined;
+    var ub: [2]V = undefined;
+    var de: V = undefined;
     k.ifp(r(slow));
     {
-        const ua = unpack(x, flush, ax);
-        const ub = unpack(x, flush, bx);
-        k.set(am, .mov, r(ua[0]), no, no);
-        k.set(bm, .mov, r(ub[0]), no, no);
-        k.set(de, .isub, r(ua[1]), r(ub[1]), no);
+        ua = unpack(x, flush, ax);
+        ub = unpack(x, flush, bx);
+        de = x.iu(.isub, r(ua[1]), r(ub[1]));
     }
     k.endif();
+    const am = x.asF(x.sel(slow, r(ua[0]), r(ax)));
+    const bm = x.asF(x.sel(slow, r(ub[0]), r(bx)));
     const core = divCore(x, fused, am, bm);
     const res = x.iu(.iadd, r(core.cb), r(x.one(core.up)));
-    const out = k.reg(.u32);
-    k.set(out, .@"or", r(res), r(sign), no);
+    const fast = x.iu(.@"or", r(res), r(sign));
+    var w: V = undefined;
     k.ifp(r(slow));
     {
         // the result's biased exponent, from c and from the rounded value
@@ -1113,11 +1119,10 @@ fn exactDiv(k: *Kernel, caps: Caps, dst: V, a: Arg, b: Arg) void {
         const to_inf = x.p2(.por, a_inf, b_zero);
         const to_zero = x.p2(.por, a_zero, b_inf);
         const sinf = x.iu(.@"or", r(sign), u(INF));
-        const w = x.sel(nan, u(0x7fff_ffff), r(x.sel(to_inf, r(sinf), r(x.sel(to_zero, r(sign), r(vs))))));
-        k.set(out, .mov, r(w), no, no);
+        w = x.sel(nan, u(0x7fff_ffff), r(x.sel(to_inf, r(sinf), r(x.sel(to_zero, r(sign), r(vs))))));
     }
     k.endif();
-    k.set(dst, .mov, r(out), no, no);
+    k.set(dst, .mov, r(x.sel(slow, r(w), r(fast))), no, no);
 }
 
 fn exactSqrt(k: *Kernel, caps: Caps, dst: V, a: Arg) void {
@@ -1128,9 +1133,10 @@ fn exactSqrt(k: *Kernel, caps: Caps, dst: V, a: Arg) void {
     // fast: positive, exponent in [-60, 100] (Dekker's smallest product,
     // about a * 2^-46, stays normal)
     const slow = x.ucmp(.gt, r(x.iu(.isub, r(ab), u(67 << 23))), u((227 << 23 | 0x007f_ffff) - (67 << 23)));
-    const am = k.reg(.f32);
-    const eh = k.reg(.u32); // half the exponent (slow path)
-    k.set(am, .mov, r(ab), no, no);
+    // (the slow path's mantissa and half its exponent, written once in the
+    // block; selected after it)
+    var mant: V = undefined;
+    var eh: V = undefined;
     k.ifp(r(slow));
     {
         const ax = x.iu(.@"and", r(ab), u(0x7fff_ffff));
@@ -1148,16 +1154,15 @@ fn exactSqrt(k: *Kernel, caps: Caps, dst: V, a: Arg) void {
         const e = x.iu(.isub, r(be), u(127));
         const odd = x.ucmp(.ne, r(x.iu(.@"and", r(e), u(1))), u(0));
         const top = x.sel(odd, u(0x4000_0000), u(0x3f80_0000));
-        const mant = x.iu(.@"or", r(x.iu(.@"and", r(m), u(0x007f_ffff))), r(top));
-        k.set(am, .mov, r(mant), no, no);
+        mant = x.iu(.@"or", r(x.iu(.@"and", r(m), u(0x007f_ffff))), r(top));
         // (an arithmetic shift: e may be below zero)
-        k.emit(.{ .op = .shr, .ty = .i32, .dst = eh, .a = r(x.iu(.isub, r(e), r(x.one(odd)))), .b = u(1), .c = no, .aux = 0 });
+        eh = x.s2(.shr, r(x.iu(.isub, r(e), r(x.one(odd)))), u(1));
     }
     k.endif();
+    const am = x.asF(x.sel(slow, r(mant), r(ab)));
     const core = sqrtCore(x, fused, am);
     const res = x.iu(.iadd, r(core.cb), r(x.one(core.up)));
-    const out = k.reg(.u32);
-    k.set(out, .mov, r(res), no, no);
+    var w: V = undefined;
     k.ifp(r(slow));
     {
         const v = x.iu(.iadd, r(res), r(x.iu(.shl, r(eh), u(23))));
@@ -1167,11 +1172,10 @@ fn exactSqrt(k: *Kernel, caps: Caps, dst: V, a: Arg) void {
         const nan = x.ucmp(.gt, r(ab), u(INF)); // NaN, or below zero
         const pinf = x.ucmp(.eq, r(ab), u(INF));
         const sign = x.iu(.@"and", r(ab), u(0x8000_0000));
-        const w = x.sel(zero, r(sign), r(x.sel(nan, u(0x7fff_ffff), r(x.sel(pinf, u(INF), r(v))))));
-        k.set(out, .mov, r(w), no, no);
+        w = x.sel(zero, r(sign), r(x.sel(nan, u(0x7fff_ffff), r(x.sel(pinf, u(INF), r(v))))));
     }
     k.endif();
-    k.set(dst, .mov, r(out), no, no);
+    k.set(dst, .mov, r(x.sel(slow, r(w), r(res))), no, no);
 }
 
 test "kir: build, verify, encode" {
