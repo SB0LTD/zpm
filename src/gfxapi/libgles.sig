@@ -7,17 +7,15 @@
 //! contexts current with makeCurrent; a call with no current context does
 //! nothing, as with Mesa's no-op table.
 //!
-//! The current context is per thread, kept in a fixed table keyed by the
-//! thread pointer (TPIDR_EL0 on AArch64, the TCB at %fs:0 on x86-64; the
-//! thread id elsewhere): no thread-local storage, so the library works
-//! whichever C library loaded it. A thread's slot stays its own once
-//! taken (MAX_THREADS threads may ever make a context current).
+//! The current context is per thread (thread.sig: a fixed table keyed by
+//! the thread pointer, no thread-local storage).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const gfxapi = @import("gfxapi");
 const gles = gfxapi.gles;
 const g = gfxapi.glenum;
+const thread = gfxapi.thread;
 const Context = gles.Context;
 
 /// A failed check in the driver (on Linux): one line on stderr, then the
@@ -37,62 +35,22 @@ fn stop(msg: []const u8, ra: ?usize) noreturn {
     linux.exit_group(134);
 }
 
-// ── The current context, per thread ────────────────────────────────────────
+// ── The current context, per thread (thread.sig) ───────────────────────────
 
-pub const MAX_THREADS = 256;
-
-var keys: [MAX_THREADS]std.atomic.Value(usize) = [_]std.atomic.Value(usize){.init(0)} ** MAX_THREADS;
-var currents: [MAX_THREADS]?*Context = [_]?*Context{null} ** MAX_THREADS;
-
-/// The calling thread's key: never 0 (bit 0 set; thread pointers are
-/// aligned).
-fn threadKey() usize {
-    const on_linux = comptime builtin.os.tag == .linux;
-    if (comptime on_linux and builtin.cpu.arch == .aarch64) {
-        return asm volatile ("mrs %[r], tpidr_el0"
-            : [r] "=r" (-> usize),
-        ) | 1;
-    } else if (comptime on_linux and builtin.cpu.arch == .x86_64) {
-        return asm volatile ("movq %%fs:0, %[r]"
-            : [r] "=r" (-> usize),
-        ) | 1;
-    } else {
-        return (@as(usize, std.Thread.getCurrentId()) << 1) | 1;
-    }
-}
-
-/// The slot of `key` (taken now with `claim`), or null.
-fn slotOf(key: usize, claim: bool) ?usize {
-    var i = (key >> 4) % MAX_THREADS;
-    for (0..MAX_THREADS) |_| {
-        const k = keys[i].load(.acquire);
-        if (k == key) return i;
-        if (k == 0) {
-            if (!claim) return null;
-            // (only this thread takes its own key: a lost race is another
-            // thread's key, and the probe goes on)
-            if (keys[i].cmpxchgStrong(0, key, .acq_rel, .acquire) == null) return i;
-        }
-        i = (i + 1) % MAX_THREADS;
-    }
-    return null;
-}
-
-/// `c` becomes the calling thread's current context (null: none). False
-/// when MAX_THREADS threads already have slots (EGL_BAD_ALLOC).
+/// `c` becomes the calling thread's current GL context (null: none); EGL's
+/// eglMakeCurrent does this. False when there is no room for the thread.
 pub fn makeCurrent(c: ?*Context) bool {
-    const i = slotOf(threadKey(), c != null) orelse return c == null;
-    currents[i] = c;
+    const t = (if (c != null) thread.mine() else thread.get()) orelse return c == null;
+    t.gl = c;
     return true;
 }
 
 pub fn getCurrent() ?*Context {
-    const i = slotOf(threadKey(), false) orelse return null;
-    return currents[i];
+    return thread.gl();
 }
 
 inline fn cur() ?*Context {
-    return getCurrent();
+    return thread.gl();
 }
 
 /// eglGetProcAddress's answer for a GL name: the entry point, or null.
@@ -500,16 +458,4 @@ test "libgles: getProcAddress finds every entry point, and nothing else" {
     try std.testing.expect(getProcAddress("glDrawArrays") == null);
     try std.testing.expect(getProcAddress("getProcAddress") == null);
     try std.testing.expect(entries.len > 70);
-}
-
-test "libgles: each thread's slot is its own" {
-    const a: usize = 0x7000_1001;
-    const b2: usize = a + (MAX_THREADS << 4); // (the same first slot)
-    const sa = slotOf(a, true).?;
-    const sb = slotOf(b2, true).?;
-    try std.testing.expect(sa != sb);
-    try std.testing.expectEqual(sa, slotOf(a, false).?);
-    try std.testing.expectEqual(sb, slotOf(b2, false).?);
-    try std.testing.expect(slotOf(0x5555_0001, false) == null);
-    try std.testing.expect(threadKey() & 1 == 1);
 }

@@ -1149,6 +1149,18 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
     });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-egl", "tests/test_gfxapi_egl.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-lib", "src/gfxapi/libgalaxy_gl.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
     // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
     _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{
         importEntry("nvidia", "src/nvidia/nvidia.sig"),

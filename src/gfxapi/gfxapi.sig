@@ -9,8 +9,12 @@
 //! - glenum: GL's enum values;
 //! - node: Galaxy's render node ('G' calls, G_IMPORT, PRIME) as a
 //!   gpu.Device;
-//! - libgles.sig (the shared library's root, not imported here): the C
-//!   entry points.
+//! - egl: EGL 1.5: displays, configs, contexts, surfaces, swaps, syncs;
+//! - wayland: EGL's Wayland platform (dma-buf frames to the compositor);
+//! - thread: what EGL and GL keep per thread;
+//! - dl: the host program's functions found by name;
+//! - libgalaxy_gl.sig and libgles.sig (the shared library's root, not
+//!   imported here): the C entry points.
 //!
 //! docs/GFXAPI.md has the plan and what each stage brings.
 
@@ -18,9 +22,15 @@ pub const engine = @import("engine.sig");
 pub const gles = @import("gles.sig");
 pub const glenum = @import("glenum.sig");
 pub const node = @import("node.sig");
+pub const egl = @import("egl.sig");
+pub const wayland = @import("wayland.sig");
+pub const thread = @import("thread.sig");
+pub const dl = @import("dl.sig");
 
 test {
     _ = engine;
     _ = gles;
     _ = node;
+    _ = thread;
+    _ = dl;
 }

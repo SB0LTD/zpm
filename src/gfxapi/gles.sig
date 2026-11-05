@@ -367,6 +367,15 @@ pub const Context = struct {
     unpack: Store = .{},
     hint_mipmap: u32 = g.DONT_CARE,
     hint_derivative: u32 = g.DONT_CARE,
+    /// EGL's check of the default framebuffer (a window resized: a back
+    /// buffer of its new size), before an operation reaches it
+    revalidate: ?Revalidate = null,
+
+    pub const Revalidate = struct {
+        ctx: *anyopaque,
+        f: *const fn (*anyopaque) void,
+        stale: *const std.atomic.Value(bool),
+    };
 
     /// A context in place over `eng`, holding `objs` (a new share group's,
     /// initialized by the caller, or another context's).
@@ -627,7 +636,8 @@ pub const Context = struct {
                 break :blk int(if (img.format == .bgra8) g.BGRA_EXT else g.RGBA);
             },
             g.IMPLEMENTATION_COLOR_READ_TYPE => int(g.UNSIGNED_BYTE),
-            g.RED_BITS, g.GREEN_BITS, g.BLUE_BITS, g.ALPHA_BITS => int(if (c.view(c.draw_fb, false).color[0] != null) 8 else 0),
+            g.RED_BITS, g.GREEN_BITS, g.BLUE_BITS => int(if (c.view(c.draw_fb, false).color[0] != null) 8 else 0),
+            g.ALPHA_BITS => int(if (c.view(c.draw_fb, false).color[0]) |img| (if (img.no_alpha) 0 else 8) else 0),
             g.DEPTH_BITS => int(if (c.view(c.draw_fb, false).depth != null) 24 else 0),
             g.STENCIL_BITS => int(if (c.view(c.draw_fb, false).stencil != null) 8 else 0),
             g.GENERATE_MIPMAP_HINT => int(c.hint_mipmap),
@@ -707,6 +717,9 @@ pub const Context = struct {
     fn view(c: *Context, name: u32, for_read: bool) View {
         var v = View{};
         if (name == 0) {
+            if (c.revalidate) |rv| {
+                if (rv.stale.load(.acquire)) rv.f(rv.ctx);
+            }
             const draw = if (c.default_draw == g.BACK) c.surf_draw else null;
             if (c.surf_draw == null and c.surf_read == null and c.surf_depth == null) {
                 v.status = g.FRAMEBUFFER_UNDEFINED;

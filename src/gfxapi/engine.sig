@@ -90,6 +90,9 @@ pub const Image = struct {
     last: u64 = 0,
     /// the GPU wrote it since the CPU last fetched it
     gpu_wrote: bool = false,
+    /// a color image without alpha (an XRGB surface's): read, and copied
+    /// from, as opaque whatever its top byte holds
+    no_alpha: bool = false,
 
     pub fn bounds(img: *const Image) Rect {
         return .{ .x0 = 0, .y0 = 0, .x1 = img.width, .y1 = img.height };
@@ -210,7 +213,8 @@ fn fillKernel(s: kir.Storage, masked: bool) kir.Kernel {
 /// orders). Bytes 0 and 2 of each pixel swap where `keep` lacks them (R
 /// and B between rgba8 and bgra8): pixel = (v & keep) | (swapped(v) & ~keep).
 ///   params 0 sx0, 1 sy0, 2 sstep (i32), 3 sstride, 4 dx0, 5 dy0,
-///   6 dstep (i32), 7 dstride, 8 w, 9 keep, 10 ~keep.
+///   6 dstep (i32), 7 dstride, 8 w, 9 keep, 10 ~keep, 11 bits set in
+///   every pixel (an opaque alpha, from an image without one).
 fn copyKernel(s: kir.Storage) kir.Kernel {
     var k = kir.Kernel.init(s, "gfx_copy", .{ GROUP, 1, 1 });
     const src = k.binding();
@@ -226,10 +230,16 @@ fn copyKernel(s: kir.Storage) kir.Kernel {
     const lo = k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(v), u(16))), u(0xff));
     const hi = k.op2(.@"and", .u32, r(k.op2(.shl, .u32, r(v), u(16))), u(0xff_0000));
     const swapped = k.op2(.@"and", .u32, r(k.op2(.@"or", .u32, r(lo), r(hi))), r(k.param(.u32, 10)));
-    const out = k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(v), r(k.param(.u32, 9)))), r(swapped));
+    const kept = k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(v), r(k.param(.u32, 9)))), r(swapped));
+    const out = k.op2(.@"or", .u32, r(kept), r(k.param(.u32, 11)));
     k.store(.u32, kir.global(dst, 32), r(k.op2(.shl, .u32, r(dat), u(2))), r(out));
     k.endif();
     return k;
+}
+
+/// The bits a read or copy of img sets: an opaque alpha without one.
+fn setOf(img: *const Image) u32 {
+    return if (img.no_alpha and img.format.isColor()) 0xff00_0000 else 0;
 }
 
 fn swapRB(v: u32) u32 {
@@ -472,16 +482,52 @@ pub const Engine = struct {
     /// The CPU waits until batch `b` is done (the GPU's batches finish in
     /// order: a later fence covers an earlier one).
     fn waitBatch(e: *Engine, b: u64) void {
-        if (b == 0 or !e.onGpu()) return;
+        _ = e.waitBatchFor(b, TIMEOUT_US, true);
+    }
+
+    /// waitBatch with a timeout of the caller's: false when it ran out
+    /// (the GPU called lost only with `lose_on_timeout`; a fence's client
+    /// wait may simply give up).
+    fn waitBatchFor(e: *Engine, b: u64, timeout_us: u64, lose_on_timeout: bool) bool {
+        if (b == 0 or !e.onGpu()) return true;
         if (b >= e.batch) e.flush();
-        if (!e.onGpu() or b <= e.done_upto) return;
+        if (!e.onGpu() or b <= e.done_upto) return true;
         const upto = if (e.ran - b >= RING) e.ran else b;
         e.stats.waits += 1;
-        e.dev.?.wait(e.fences[upto % RING], TIMEOUT_US) catch |err| {
+        e.dev.?.wait(e.fences[upto % RING], timeout_us) catch |err| {
+            if (err == error.Timeout and !lose_on_timeout) return false;
             e.loseGpu(err);
-            return;
+            return true;
         };
         e.done_upto = upto;
+        return true;
+    }
+
+    // ── Fences (EGL's sync objects) ────────────────────────────────────────
+
+    /// A point after all the work recorded so far, which is run now: what
+    /// a fence waits for.
+    pub fn mark(e: *Engine) u64 {
+        e.flush();
+        return e.ran;
+    }
+
+    /// Whether the work before mark `m` is done (without waiting).
+    pub fn markDone(e: *Engine, m: u64) bool {
+        if (!e.onGpu() or m <= e.done_upto) return true;
+        if (m > e.ran) return false;
+        // (a mark older than the ring: the newest fence stands for it)
+        const upto = if (e.ran - m >= RING) e.ran else m;
+        if (!e.dev.?.done(e.fences[upto % RING])) return false;
+        e.done_upto = @max(e.done_upto, upto);
+        return true;
+    }
+
+    /// The CPU waits for mark `m`, up to timeout_us: false when it ran out.
+    pub fn waitMark(e: *Engine, m: u64, timeout_us: u64) bool {
+        if (e.markDone(m)) return true;
+        if (timeout_us == 0) return false;
+        return e.waitBatchFor(m, timeout_us, false);
     }
 
     /// The CPU may touch img: no batch in flight uses it.
@@ -552,7 +598,7 @@ pub const Engine = struct {
         const d0: i32 = @intCast(dst.rowOf(dy));
         const ss: i32 = if (src.top_down) -1 else 1;
         const ds: i32 = if (dst.top_down) -1 else 1;
-        const p = [_]u32{ sx, @bitCast(s0), @bitCast(ss), src.stride / 4, dx, @bitCast(d0), @bitCast(ds), dst.stride / 4, w, keep, ~keep };
+        const p = [_]u32{ sx, @bitCast(s0), @bitCast(ss), src.stride / 4, dx, @bitCast(d0), @bitCast(ds), dst.stride / 4, w, keep, ~keep, setOf(src) };
         e.record(.copy, .{ std.math.divCeil(u32, w, GROUP) catch unreachable, h, 1 }, &.{ src, dst }, &p, op);
     }
 
@@ -585,6 +631,7 @@ pub const Engine = struct {
         if (w == 0 or h == 0) return;
         e.settle(img);
         const swap = keepOf(img.format, want) != 0xffff_ffff;
+        const set = setOf(img);
         const sw = img.words();
         for (0..h) |j| {
             const row = img.rowOf(y + @as(u32, @intCast(j)));
@@ -593,7 +640,7 @@ pub const Engine = struct {
             const d = dst[j * dst_stride ..][0 .. @as(usize, w) * 4];
             const base = off / 4;
             for (0..w) |i| {
-                const v = sw[base + i];
+                const v = sw[base + i] | set;
                 std.mem.writeInt(u32, d[i * 4 ..][0..4], if (swap) swapRB(v) else v, .little);
             }
         }
@@ -665,6 +712,7 @@ pub const Engine = struct {
             },
             .copy => |*c| {
                 const swap = keepOf(c.src.format, c.dst.format) != 0xffff_ffff;
+                const set = setOf(&c.src);
                 const sw = c.src.words();
                 const dw = c.dst.words();
                 for (0..c.h) |j| {
@@ -675,7 +723,7 @@ pub const Engine = struct {
                     if (c.src.gpu_wrote) e.fromDevice(&c.src, so, len);
                     if (c.dst.gpu_wrote) e.fromDevice(&c.dst, do_, len);
                     for (0..c.w) |i| {
-                        const v = sw[so / 4 + i];
+                        const v = sw[so / 4 + i] | set;
                         dw[do_ / 4 + i] = if (swap) swapRB(v) else v;
                     }
                     e.toDevice(&c.dst, do_, len);
