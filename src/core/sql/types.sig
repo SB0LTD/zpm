@@ -119,9 +119,9 @@ pub const Config = struct {
     table_indexes: usize = 4,
     /// Entries one secondary index can hold: every row version of its table
     /// (pending and dead ones until reclaimed). 0 selects the version arena
-    /// capacity (versions_per_table) with inline storage, and no secondary
-    /// index storage at all with external_storage (CREATE INDEX is then
-    /// IndexCapacity). A write past it, after reclamation, is IndexCapacity
+    /// capacity (versions_per_table) with inline storage. External storage
+    /// must leave it 0 and size index storage at runtime (external_indexes,
+    /// Backing.index_slots). A write past it, after reclamation, is IndexCapacity
     /// (54000) with the statement rolled back. Entries live inline in the
     /// table: table_indexes x 2 x index_entries u32 per table (power of two).
     index_entries: usize = 0,
@@ -133,6 +133,15 @@ pub const Config = struct {
     /// SET CONSTRAINTS name lists remembered per transaction (names beyond
     /// it are TableCapacity, 54000).
     constraint_modes: usize = 8,
+    /// external_storage only: secondary indexes per table whose entry
+    /// hashes Database.bindMemory/bindMemoryFor carve from the caller's
+    /// region (backingBytes/backingBytesFor count them), at most
+    /// table_indexes. Each takes key_index-sized storage, pow2(2 x the
+    /// table's runtime versions) u32, so its entries cover every version
+    /// (no cap below the version arena). 0 binds none: CREATE INDEX is
+    /// IndexCapacity (54000) and memory plans are unchanged. bindStorage
+    /// callers bind any count per table through Backing.index_slots.
+    external_indexes: usize = 0,
 };
 
 pub fn workRows(comptime config: Config) usize {

@@ -130,6 +130,9 @@ pub fn Storage(comptime config: types.Config) type {
             scan_nonnull: []u64 = &.{},
             scan_live: []u8 = &.{},
             scan_presence: []u64 = &.{},
+            /// Secondary index entry hashes: one run of key_index.len slots
+            /// per bound index (at most table_indexes runs; empty binds none).
+            index_slots: []u32 = &.{},
 
             pub fn valid(self: Backing) bool {
                 const scan_cells=@mulWithOverflow(self.rows.len,config.columns);
@@ -138,6 +141,7 @@ pub fn Storage(comptime config: types.Config) type {
                     self.versions.len > self.rows.len and self.versions.len <= 0x7fffffff and
                     self.row_index.len >= self.rows.len * 2 and powerOfTwo(self.row_index.len) and
                     self.key_index.len >= self.versions.len * 2 and powerOfTwo(self.key_index.len) and
+                    self.index_slots.len % self.key_index.len == 0 and self.index_slots.len / self.key_index.len <= index_capacity and
                     (!compact_enabled or (self.scan_values.len >= scan_cells[0] and self.scan_nonnull.len >= self.rows.len and self.scan_live.len >= self.rows.len)) and
                     (!presence_enabled or self.scan_presence.len >= (presenceWords(self.rows.len) catch return false));
             }
@@ -223,9 +227,24 @@ pub fn Storage(comptime config: types.Config) type {
         };
 
         /// Secondary indexes per table and entries per index (types.Config).
+        /// Inline storage keeps index_slot_capacity slots per index in the
+        /// table. External storage binds Table.index_slots (Backing): each
+        /// bound index owns key_index.len slots, the primary-key index's
+        /// size (>= 2 x the table's runtime versions), so its entries cover
+        /// every version and never cap a table that has version room.
         pub const index_capacity: usize = config.table_indexes;
         pub const index_entry_capacity: usize = if (config.index_entries != 0) config.index_entries else if (config.external_storage) 0 else versions_capacity;
         pub const index_slot_capacity: usize = if (index_entry_capacity == 0 or index_capacity == 0) 0 else pow2(index_entry_capacity * 2);
+        /// Whether any table can hold a secondary index entry.
+        pub const index_storage: bool = index_capacity != 0 and (config.external_storage or index_slot_capacity != 0);
+        /// Indexes per table that Database.bindMemory carves (external only).
+        pub const bound_indexes: usize = if (config.external_storage) config.external_indexes else 0;
+        pub const IndexSlots = if (config.external_storage) []u32 else [index_capacity][index_slot_capacity]u32;
+        comptime {
+            if (config.external_storage and config.index_entries != 0) @compileError("index_entries sizes inline index storage; external_storage binds index slots (external_indexes)");
+            if (!config.external_storage and config.external_indexes != 0) @compileError("external_indexes requires external_storage");
+            if (config.external_indexes > config.table_indexes) @compileError("external_indexes exceeds table_indexes");
+        }
         /// Key element that is an expression (its text is in `expressions`).
         pub const expression_key: u8 = 0xff;
 
@@ -291,10 +310,10 @@ pub fn Storage(comptime config: types.Config) type {
             /// 'p' partitioned table (views and partitioned tables hold no rows).
             relkind: u8 = 'r',
             /// Secondary indexes and their entry hashes (index i uses
-            /// index_slots[i]; entries = every allocated version).
+            /// slotsOf(table, i); entries = every allocated version).
             index_count: usize = 0,
             indexes: [index_capacity]Index = @splat(.{}),
-            index_slots: [index_capacity][index_slot_capacity]u32 = @splat(@splat(0)),
+            index_slots: IndexSlots = if (config.external_storage) &.{} else @splat(@splat(0)),
             /// View / materialized view defining query (SELECT text).
             query: V.Text = .{},
             /// A materialized view created WITH NO DATA is unpopulated.
@@ -415,6 +434,10 @@ pub fn Storage(comptime config: types.Config) type {
         pub fn setExtras(table: *Table, extras: *const Extras) void {
             table.relkind = extras.relkind;
             table.index_count = extras.index_count;
+            // Empty hashes for the installed indexes: external memory starts
+            // uninitialized and a reused slot keeps its last table's entries.
+            // Callers checked indexFits; a rebuild or copy fills them.
+            if (comptime index_storage) for (0..table.index_count) |which| @memset(slotsOf(table, which), 0);
             table.indexes = extras.indexes;
             table.query = extras.query;
             table.populated = extras.populated;
@@ -473,7 +496,7 @@ pub fn Storage(comptime config: types.Config) type {
             return false;
         }
 
-        fn secondaryHash(index: *const Index, cells: *const [config.columns]V.Cell) usize {
+        fn secondaryHash(index: *const Index, cells: *const [config.columns]V.Cell, mask: usize) usize {
             var hash: u64 = 0x51ed2701a5b3c4d9;
             for (index.keyColumns()) |column| {
                 if (column == expression_key) continue;
@@ -481,15 +504,51 @@ pub fn Storage(comptime config: types.Config) type {
                 const part: u64 = if (cell.* == .null_value) 0x9e3779b9 else V.hash(cell);
                 hash = mix(hash ^ part);
             }
-            return @intCast(hash & (index_slot_capacity -% 1));
+            return @intCast(hash & mask);
+        }
+
+        /// Entry hash of secondary index `which` (a power of two of slots).
+        /// Callers keep which < indexLimit(table).
+        fn slotsOf(table: *Table, which: usize) []u32 {
+            if (comptime config.external_storage) {
+                const stride = table.key_index.len;
+                return table.index_slots[which * stride ..][0..stride];
+            }
+            return table.index_slots[which][0..];
+        }
+
+        fn slotsConst(table: *const Table, which: usize) []const u32 {
+            if (comptime config.external_storage) {
+                const stride = table.key_index.len;
+                return table.index_slots[which * stride ..][0..stride];
+            }
+            return table.index_slots[which][0..];
+        }
+
+        /// Secondary indexes this table slot can carry: all of them inline
+        /// (when any entry fits), the runs bound to it with external storage.
+        pub fn indexLimit(table: *const Table) usize {
+            if (comptime !index_storage) return 0;
+            if (comptime !config.external_storage) return index_capacity;
+            if (table.key_index.len == 0) return 0;
+            return @min(index_capacity, table.index_slots.len / table.key_index.len);
+        }
+
+        /// Whether this table slot can carry `count` secondary indexes over
+        /// `versions` allocated versions (external entries cover every
+        /// version the slot can allocate).
+        pub fn indexFits(table: *const Table, count: usize, versions: usize) bool {
+            if (count == 0) return true;
+            if (count > indexLimit(table)) return false;
+            return config.external_storage or versions <= index_entry_capacity;
         }
 
         fn indexSecondary(table: *Table, version: u32) void {
-            if (comptime index_slot_capacity == 0) return;
-            const mask = index_slot_capacity - 1;
+            if (comptime !index_storage) return;
             for (0..table.index_count) |which| {
-                const slots = &table.index_slots[which];
-                var position = secondaryHash(&table.indexes[which], &table.versions[version].cells);
+                const slots = slotsOf(table, which);
+                const mask = slots.len - 1;
+                var position = secondaryHash(&table.indexes[which], &table.versions[version].cells, mask);
                 while (slots[position] != 0) position = (position + 1) & mask;
                 slots[position] = version + 1;
             }
@@ -497,15 +556,15 @@ pub fn Storage(comptime config: types.Config) type {
 
         /// Backward-shift deletion of slot `start` of secondary index `which`.
         fn removeSecondaryAt(table: *Table, which: usize, start: usize) void {
-            const mask = index_slot_capacity - 1;
-            const slots = &table.index_slots[which];
+            const slots = slotsOf(table, which);
+            const mask = slots.len - 1;
             var hole = start;
             var probe = start;
             while (true) {
                 probe = (probe + 1) & mask;
                 const entry = slots[probe];
                 if (entry == 0) break;
-                const home = secondaryHash(&table.indexes[which], &table.versions[entry - 1].cells);
+                const home = secondaryHash(&table.indexes[which], &table.versions[entry - 1].cells, mask);
                 if (((probe -% hole) & mask) <= ((probe -% home) & mask)) {
                     slots[hole] = entry;
                     hole = probe;
@@ -515,11 +574,11 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         fn unindexSecondary(table: *Table, version: u32) void {
-            if (comptime index_slot_capacity == 0) return;
-            const mask = index_slot_capacity - 1;
+            if (comptime !index_storage) return;
             for (0..table.index_count) |which| {
-                const slots = &table.index_slots[which];
-                var position = secondaryHash(&table.indexes[which], &table.versions[version].cells);
+                const slots = slotsOf(table, which);
+                const mask = slots.len - 1;
+                var position = secondaryHash(&table.indexes[which], &table.versions[version].cells, mask);
                 while (slots[position] != version + 1) {
                     if (slots[position] == 0) break;
                     position = (position + 1) & mask;
@@ -530,8 +589,8 @@ pub fn Storage(comptime config: types.Config) type {
 
         /// Rebuilds every secondary index from the version arena.
         pub fn rebuildSecondary(table: *Table) void {
-            if (comptime index_slot_capacity == 0) return;
-            for (table.index_slots[0..table.index_count]) |*slots| @memset(slots, 0);
+            if (comptime !index_storage) return;
+            for (0..table.index_count) |which| @memset(slotsOf(table, which), 0);
             for (0..table.version_high) |version| {
                 if (table.versions[version].row != 0) indexSecondary(table, @intCast(version));
             }
@@ -541,15 +600,16 @@ pub fn Storage(comptime config: types.Config) type {
         /// the allocated versions of the table).
         pub fn indexEntries(table: *const Table, which: usize) usize {
             var count: usize = 0;
-            for (table.index_slots[which]) |entry| {
+            for (slotsConst(table, which)) |entry| {
                 if (entry != 0) count += 1;
             }
             return count;
         }
 
-        /// Whether `count` more versions fit every secondary index.
+        /// Whether `count` more versions fit every secondary index. External
+        /// entries hold every version the arena can allocate.
         pub fn indexRoom(table: *const Table, count: usize) bool {
-            if (table.index_count == 0) return true;
+            if (table.index_count == 0 or config.external_storage) return true;
             return table.version_used + count <= index_entry_capacity;
         }
 
@@ -563,13 +623,14 @@ pub fn Storage(comptime config: types.Config) type {
         /// Versions visible to `snap` whose plain key columns of index
         /// `which` equal `cells`, found through the index (probe path).
         pub fn indexLookup(table: *const Table, which: usize, cells: *const [config.columns]V.Cell, snap: Snapshot, out: []u32) usize {
-            if (comptime index_slot_capacity == 0) return 0;
+            if (comptime !index_storage) return 0;
             const index = &table.indexes[which];
-            const mask = index_slot_capacity - 1;
+            const slots = slotsConst(table, which);
+            const mask = slots.len - 1;
             var count: usize = 0;
-            var position = secondaryHash(index, cells);
-            while (table.index_slots[which][position] != 0) : (position = (position + 1) & mask) {
-                const entry = table.index_slots[which][position] - 1;
+            var position = secondaryHash(index, cells, mask);
+            while (slots[position] != 0) : (position = (position + 1) & mask) {
+                const entry = slots[position] - 1;
                 const version = &table.versions[entry];
                 if (!plainKeyEqual(index, &version.cells, cells)) continue;
                 if (visibleAt(table, version.row - 1, snap) != entry) continue;
@@ -606,16 +667,17 @@ pub fn Storage(comptime config: types.Config) type {
         /// UNIQUE index check through the index, with exactly uniqueCheck's
         /// dirty-snapshot rules over the probed candidates.
         pub fn indexUniqueCheck(table: *const Table, which: usize, cells: *const [config.columns]V.Cell, own_slot: u32, snap: Snapshot) KeyState {
-            if (comptime index_slot_capacity == 0) return .free;
+            if (comptime !index_storage) return .free;
             const index = &table.indexes[which];
             if (!index.nulls_not_distinct) for (index.keyColumns()) |column| {
                 if (cells[column] == .null_value) return .free;
             };
-            const mask = index_slot_capacity - 1;
+            const slots = slotsConst(table, which);
+            const mask = slots.len - 1;
             var waiting: ?u16 = null;
-            var position = secondaryHash(index, cells);
-            while (table.index_slots[which][position] != 0) : (position = (position + 1) & mask) {
-                const entry = table.index_slots[which][position] - 1;
+            var position = secondaryHash(index, cells, mask);
+            while (slots[position] != 0) : (position = (position + 1) & mask) {
+                const entry = slots[position] - 1;
                 const version = &table.versions[entry];
                 if (version.row - 1 == own_slot) continue;
                 if (!sameColumns(index.keyColumns(), &version.cells, cells)) continue;
@@ -817,8 +879,9 @@ pub fn Storage(comptime config: types.Config) type {
             destination.constraint_count = source.constraint_count;
             @memcpy(destination.constraints[0..source.constraint_count], source.constraints[0..source.constraint_count]);
             setExtras(destination, &extrasOf(source));
-            // Entries are version indices, identical in the copy.
-            destination.index_slots = source.index_slots;
+            // Entries are version indices, identical in an inline copy; an
+            // external copy rehashes them for its own masks (below).
+            if (comptime !config.external_storage) destination.index_slots = source.index_slots;
             destination.primary_column = source.primary_column;
             destination.primary_directory = source.primary_directory;
             destination.column_order = source.column_order;
@@ -851,6 +914,7 @@ pub fn Storage(comptime config: types.Config) type {
                 if (destination.primary_column != null) for (0..destination.version_high) |version| {
                     if (destination.versions[version].row != 0) indexKeyOnly(destination, @intCast(version));
                 };
+                rebuildSecondary(destination);
             } else {
                 destination.row_index = source.row_index;
                 if (source.primary_column != null) destination.key_index = source.key_index;
