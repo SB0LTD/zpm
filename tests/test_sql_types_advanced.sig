@@ -111,6 +111,9 @@ fn sqlstate(err: anyerror, wanted: []const u8) !void {
         .{ .name = "IndeterminateDatatype", .state = "42P18" },
         .{ .name = "ArraySubscriptError", .state = "2202E" },
         .{ .name = "DataException", .state = "22000" },
+        .{ .name = "InvalidXmlContent", .state = "2200N" },
+        .{ .name = "InvalidXmlDocument", .state = "2200M" },
+        .{ .name = "NotAnXmlDocument", .state = "2200L" },
     };
     var state: []const u8 = "?";
     for (table) |entry| {
@@ -812,12 +815,88 @@ fn geometric() !void {
     try meta(2, 603, -1);
 }
 
+// ---- xml -----------------------------------------------------------------------
+
+fn xmlType() !void {
+    // oracle: PG.TYPE.XML.
+    try exec("CREATE TABLE tdd_type(v XML)");
+    try exec("INSERT INTO tdd_type VALUES(XMLPARSE(DOCUMENT '<x/>')),(NULL)");
+    try rows("SELECT v FROM tdd_type", "<x/>;NULL");
+    try meta(0, 142, -1);
+    try exec("DROP TABLE tdd_type");
+
+    // xml_in accepts well-formed content (xmloption CONTENT).
+    try rows("SELECT '<a>1</a><b/>'::xml, 'plain &amp; text &#x41;'::xml, '<a x=\"1\" y=''2''><![CDATA[<raw>]]><!-- c --><?pi data?></a>'::xml, ''::xml, XML '<q/>'",
+        "<a>1</a><b/>|plain &amp; text &#x41;|<a x=\"1\" y='2'><![CDATA[<raw>]]><!-- c --><?pi data?></a>||<q/>");
+    try meta(0, 142, -1);
+    // XMLPARSE: DOCUMENT needs exactly one root element; a declaration
+    // that says nothing beyond version 1.0 is not printed.
+    try rows("SELECT XMLPARSE(CONTENT 'a<b/>c'), XMLPARSE(DOCUMENT '<?xml version=\"1.0\"?>\n<r><c/></r>'), XMLPARSE(DOCUMENT '<!DOCTYPE r><!-- x --><r/>'), '<?xml version=\"1.0\" standalone=\"yes\"?><r/>'::xml, XMLPARSE(DOCUMENT NULL), XMLPARSE(CONTENT ' <a/> ' PRESERVE WHITESPACE)",
+        "a<b/>c|<r><c/></r>|<!DOCTYPE r><!-- x --><r/>|<?xml version=\"1.0\" standalone=\"yes\"?><r/>|NULL| <a/> ");
+    try meta(0, 142, -1);
+    try named(0, "xmlparse");
+    for ([_][]const u8{
+        "SELECT '<a>'::xml",          "SELECT '<a></b>'::xml",     "SELECT '<a x=1/>'::xml",
+        "SELECT '&nope;'::xml",       "SELECT '<a x=\"1\" x=\"2\"/>'::xml", "SELECT 'a < b'::xml",
+        "SELECT '<a><!-- -- --></a>'::xml", "SELECT XMLPARSE(CONTENT '</a>')", "SELECT '<?xml version=\"1.0\"?><a></a'::xml",
+    }) |source| try rejects(source, error.InvalidXmlContent);
+    try sqlstate(error.InvalidXmlContent, "2200N");
+    for ([_][]const u8{
+        "SELECT XMLPARSE(DOCUMENT 'text')", "SELECT XMLPARSE(DOCUMENT '<a/><b/>')", "SELECT XMLPARSE(DOCUMENT '')",
+        "SELECT XMLPARSE(DOCUMENT '<a>')",  "SELECT XMLPARSE(DOCUMENT '<a/>tail')",
+    }) |source| try rejects(source, error.InvalidXmlDocument);
+    try sqlstate(error.InvalidXmlDocument, "2200M");
+    try rows("SELECT xml_is_well_formed('<a/>b'), xml_is_well_formed('<a>'), xml_is_well_formed_document('<a/>'), xml_is_well_formed_document('x'), xml_is_well_formed_content('x')", "t|f|t|f|t");
+
+    // Casts: xml -> text keeps the stored text; text -> xml explicitly.
+    try rows("SELECT '<?xml version=\"1.0\"?><r/>'::xml::text, XMLSERIALIZE(CONTENT '<a/>'::xml AS text), XMLSERIALIZE(DOCUMENT '<r/>'::xml AS VARCHAR(10)), '<t/>'::text::xml", "<?xml version=\"1.0\"?><r/>|<a/>|<r/>|<t/>");
+    try meta(1, 25, -1);
+    try meta(2, 1043, 14);
+    try named(1, "xmlserialize");
+    try rejects("SELECT XMLSERIALIZE(DOCUMENT 'x'::xml AS text)", error.NotAnXmlDocument);
+    try sqlstate(error.NotAnXmlDocument, "2200L");
+    try rejects("SELECT 1::xml", error.CannotCoerce);
+    try rejects("SELECT '<a/>'::xml = '<a/>'::xml", error.UndefinedFunction);
+
+    // Columns: no ordering or grouping (42883); assignment from text needs a cast.
+    try exec("CREATE TABLE x(id INT PRIMARY KEY, d XML)");
+    try exec("INSERT INTO x VALUES(1, '<a>1</a>'), (2, NULL), (3, XMLPARSE(DOCUMENT '<b/>'))");
+    try rows("SELECT d FROM x ORDER BY id", "<a>1</a>;NULL;<b/>");
+    try rows("SELECT id FROM x WHERE d IS NULL", "2");
+    try rejects("SELECT d FROM x ORDER BY d", error.UndefinedFunction);
+    try rejects("SELECT DISTINCT d FROM x", error.UndefinedFunction);
+    try rejects("INSERT INTO x VALUES(4, '<a>'::text)", error.TypeMismatch);
+    try rejects("INSERT INTO x VALUES(4, '<ok/>'), (5, '<bad')", error.InvalidXmlContent);
+    try rows("SELECT COUNT(*) FROM x", "3");
+    try rows("SELECT data_type FROM information_schema.columns WHERE table_name = 'x' AND column_name = 'd'", "xml");
+    try rows("SELECT typname, typlen, typcategory, typarray FROM pg_type WHERE oid = 142", "xml|-1|U|143");
+    try exec("DROP TABLE x");
+
+    // Wire: the output text both ways.
+    try exec("SELECT '<?xml version=\"1.0\"?><r/>'::xml");
+    try check(Wire.oid(.xml) == 142 and Wire.length(.xml) == -1);
+    try sendText(&result.rows[0].cells[0], "<r/>");
+    try sendBinary(&result.rows[0].cells[0], .xml, "<r/>");
+    try receive("<r/>", .xml, "<r/>");
+    try literal("<r/>", 142, 0, "'<r/>'::xml");
+
+    // Durability: change-record value tag 27.
+    try replay(&.{
+        "CREATE TABLE r(id INT PRIMARY KEY, d XML)",
+        "INSERT INTO r VALUES(1, '<?xml version=\"1.0\" standalone=\"no\"?><a/>'), (2, NULL), (3, 'text only')",
+        "UPDATE r SET d = XMLPARSE(CONTENT '<u/>') WHERE id = 3",
+    }, &.{"r"}, "SELECT * FROM r ORDER BY id");
+    try shown("replica", "1|<?xml version=\"1.0\" standalone=\"no\"?><a/>;2|NULL;3|<u/>");
+    try meta(1, 142, -1);
+}
+
 pub fn main(init: std.process.Init) !void {
     try catalogIds();
     try arrays();
     try ranges();
     try network();
     try geometric();
+    try xmlType();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-types-advanced\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

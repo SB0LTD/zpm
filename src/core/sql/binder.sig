@@ -528,7 +528,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (right == .unknown) return coerce(context, b.*, left);
             if (left == .json or right == .json) return error.UndefinedFunction;
             // point and box have no ordinary comparison operators here.
-            if (geometricType(left) or geometricType(right)) return error.UndefinedFunction;
+            if (geometricType(left) or geometricType(right) or left == .xml or right == .xml) return error.UndefinedFunction;
             if (left == right) return;
             if (value.integral(left) and value.integral(right)) return;
             if (context.legacy) {
@@ -932,6 +932,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "point", .func = .point_constructor },   .{ .name = "box", .func = .box_constructor },
                 .{ .name = "area", .func = .area },                 .{ .name = "center", .func = .center },
                 .{ .name = "width", .func = .width },               .{ .name = "height", .func = .height },
+                // XML predicates (B11 advanced types).
+                .{ .name = "xml_is_well_formed", .func = .xml_is_well_formed },
+                .{ .name = "xml_is_well_formed_document", .func = .xml_is_well_formed_document },
+                .{ .name = "xml_is_well_formed_content", .func = .xml_is_well_formed_content },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -1509,6 +1513,21 @@ pub fn Binder(comptime config: types.Config) type {
                 .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
                 .array_append, .array_prepend, .array_cat, .array_to_string => try typeArrayFunction(context, n, count),
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => try typeRangeFunction(context, n, count),
+                .xmlparse => {
+                    n.b = try convert(context, n.b, .text, -1, .implicit);
+                    if (!value.stringType(context.node(n.b).ty)) return error.UndefinedFunction;
+                    n.ty = .xml;
+                    n.constant = isConstant(context, n.b);
+                },
+                .xmlserialize => {
+                    // The argument must be xml (42804); the target a string type.
+                    if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .xml);
+                    if (context.node(n.b).ty != .xml) return error.TypeMismatch;
+                    if (!value.characterType(n.cast_type)) return error.CannotCoerce;
+                    n.ty = n.cast_type;
+                    n.constant = isConstant(context, n.b);
+                },
+                .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => try bindSignature(context, n, &[_]ast.Type{.text}, .boolean, true),
                 .point_constructor => try bindSignature(context, n, &[_]ast.Type{ .float8, .float8 }, .point, true),
                 .box_constructor => try bindSignature(context, n, &[_]ast.Type{ .point, .point }, .box, true),
                 .area, .width, .height => try bindSignature(context, n, &[_]ast.Type{.box}, .float8, true),
@@ -3339,7 +3358,7 @@ pub fn Binder(comptime config: types.Config) type {
             return switch (n.kind) {
                 .column, .cast => n.typmod,
                 // A subscript keeps the array's typmod (reftypmod).
-                .function => if (n.func == .array_subscript) n.typmod else -1,
+                .function => if (n.func == .array_subscript or n.func == .xmlserialize) n.typmod else -1,
                 else => -1,
             };
         }
@@ -3777,7 +3796,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (ty == .json) return error.UndefinedFunction;
             // No btree or hash operator classes (could not identify an
             // ordering/equality operator: 42883).
-            if (ty == .point or ty == .box) return error.UndefinedFunction;
+            if (ty == .point or ty == .box or ty == .xml) return error.UndefinedFunction;
         }
 
         fn bindSetOp(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv) Error!u16 {

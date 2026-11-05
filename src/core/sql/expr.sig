@@ -21,6 +21,7 @@ const array_eval = @import("array_eval.sig");
 const range_eval = @import("range_eval.sig");
 const network = @import("network.sig");
 const geometric = @import("geometric.sig");
+const xml_module = @import("xml.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -1053,6 +1054,25 @@ pub fn Eval(comptime config: types.Config) type {
                     .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
                     .array_append, .array_prepend, .array_cat, .array_to_string => return array_eval.ArrayEval(config, @This()).call(ctx, n),
                     .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
+                    .xmlparse, .xmlserialize, .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => {
+                        const argument = try eval(ctx, n.b);
+                        if (argument == .null_value) return .null_value;
+                        const document = n.integer == 1;
+                        switch (n.func) {
+                            .xmlparse => {
+                                const bytes = argument.text.slice();
+                                if (document and !xml_module.validDocument(bytes)) return error.InvalidXmlDocument;
+                                if (!document and !xml_module.validContent(bytes)) return error.InvalidXmlContent;
+                                return .{ .xml = argument.text };
+                            },
+                            .xmlserialize => {
+                                if (document and !xml_module.validDocument(argument.xml.slice())) return error.NotAnXmlDocument;
+                                return cast(.{ .text = argument.xml }, .text, n.cast_type, n.typmod, ctx.session);
+                            },
+                            .xml_is_well_formed, .xml_is_well_formed_content => return .{ .boolean = xml_module.validContent(argument.text.slice()) },
+                            else => return .{ .boolean = xml_module.validDocument(argument.text.slice()) },
+                        }
+                    },
                     .point_constructor, .box_constructor, .area, .center, .width, .height => {
                         if (n.planned_null) return .null_value;
                         const first = try eval(ctx, n.b);

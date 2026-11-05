@@ -722,7 +722,7 @@ pub fn Parser(comptime config: types.Config) type {
             return switch (token.keyword) {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
-                .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box => true,
+                .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml => true,
                 else => false,
             };
         }
@@ -885,6 +885,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .macaddr => .{ .ty = .macaddr },
                 .point => .{ .ty = .point },
                 .box => .{ .ty = .box },
+                .xml => .{ .ty = .xml },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };
@@ -2538,6 +2539,30 @@ pub fn Parser(comptime config: types.Config) type {
                         const inner = try self.pool.add(.{ .kind = .text_literal, .text = literal.quoted() });
                         return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
                     }
+                }
+                // XMLPARSE({DOCUMENT|CONTENT} expr [{PRESERVE|STRIP} WHITESPACE])
+                // and XMLSERIALIZE({DOCUMENT|CONTENT} expr AS type).
+                if (self.mode == .standard and (wordIs(self.source, token, "xmlparse") or wordIs(self.source, token, "xmlserialize")) and lparenNext(try self.peek())) {
+                    const serialize = wordIs(self.source, token, "xmlserialize");
+                    const name = try self.identifier();
+                    try self.expectSymbol(.lparen);
+                    var document = false;
+                    if (try self.takeRaw("document")) {
+                        document = true;
+                    } else if (!try self.takeRaw("content")) return error.Syntax;
+                    const argument = try self.expression();
+                    var call: ast.Node = .{ .kind = .function, .func = if (serialize) .xmlserialize else .xmlparse, .name = name, .b = argument, .integer = @intFromBool(document) };
+                    if (serialize) {
+                        try self.expectWord("AS");
+                        const target = try self.typeName();
+                        call.cast_type = target.ty;
+                        call.typmod = target.typmod;
+                        if ((try self.takeRaw("indent")) or (try self.takeRaw("no"))) return error.UnsupportedStatement;
+                    } else if ((try self.takeRaw("preserve")) or (try self.takeRaw("strip"))) {
+                        if (!try self.takeRaw("whitespace")) return error.Syntax;
+                    }
+                    try self.expectSymbol(.rparen);
+                    return self.pool.add(call);
                 }
                 // ARRAY[...] constructors.
                 if (self.mode == .standard and wordIs(self.source, token, "array")) {

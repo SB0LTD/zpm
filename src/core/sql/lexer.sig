@@ -226,6 +226,7 @@ pub const Keyword = enum {
     macaddr,
     point,
     box,
+    xml,
 };
 
 /// Words that cannot be unquoted identifiers.

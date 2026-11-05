@@ -1550,6 +1550,9 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "IndeterminateDatatype")) return "42P18";
     if (equal(name, "ArraySubscriptError")) return "2202E";
     if (equal(name, "DataException")) return "22000";
+    if (equal(name, "InvalidXmlContent")) return "2200N";
+    if (equal(name, "InvalidXmlDocument")) return "2200M";
+    if (equal(name, "NotAnXmlDocument")) return "2200L";
     if (equal(name, "TypeMismatch")) return "42804";
     if (equal(name, "IntegerOverflow")) return "22003";
     if (equal(name, "ProtocolViolation")) return "08P01";

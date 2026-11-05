@@ -26,6 +26,7 @@ const array_text = @import("array_text.sig");
 const range_text = @import("range_text.sig");
 const network = @import("network.sig");
 const geometric = @import("geometric.sig");
+const xml = @import("xml.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -122,6 +123,12 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         if (stringType(to)) return context != .implicit;
         if (stringType(from)) return context == .explicit;
         return false;
+    }
+    if (from == .xml or to == .xml) {
+        // xml -> text/varchar/bpchar by assignment (binary); text -> xml
+        // explicitly (XMLPARSE CONTENT).
+        if (from == .xml) return characterType(to) and context != .implicit;
+        return characterType(from) and context == .explicit;
     }
     if (from == .point or to == .point or from == .box or to == .box) {
         // Geometric types: strings by I/O conversion only here.
@@ -242,6 +249,8 @@ pub fn comparisonType(a: Type, b: Type) ?Type {
     // point has no = operator and box compares only by area: neither has
     // ordinary comparison operators here.
     if (a == .point or b == .point or a == .box or b == .box) return null;
+    // xml has no comparison operators.
+    if (a == .xml or b == .xml) return null;
     // anyarray operators need the same array type on both sides.
     if (a != b and (types.isArray(a) or types.isArray(b))) return null;
     if (a != b and numericCategory(a) and numericCategory(b) and (a == .float4 or b == .float4)) return .float8;
@@ -388,6 +397,7 @@ pub fn Io(comptime config: types.Config) type {
                 .macaddr => |*value| network.formatMac(value, buffer),
                 .point => |value| geometric.formatPoint(value, buffer),
                 .box => |value| geometric.formatBox(value, buffer),
+                .xml => |*value| xml.output(value.slice(), buffer),
             };
         }
 
@@ -484,6 +494,11 @@ pub fn Io(comptime config: types.Config) type {
                 .macaddr => .{ .macaddr = try network.parseMac(input) },
                 .point => .{ .point = try geometric.parsePoint(input) },
                 .box => .{ .box = try geometric.parseBox(input) },
+                // xml_in with xmloption CONTENT.
+                .xml => blk: {
+                    if (!xml.validContent(input)) return error.InvalidXmlContent;
+                    break :blk .{ .xml = (try textCell(input)).text };
+                },
                 // array_in applies the typmod to every element itself.
                 _ => return ArrayText.parse(types.elementType(ty) orelse return error.UndefinedFunction, typmod, input, session),
             };
@@ -637,6 +652,11 @@ pub fn Io(comptime config: types.Config) type {
         pub fn cast(cell: V.Cell, from: Type, to: Type, typmod: i32, session: *const Session) Error!V.Cell {
             if (cell == .null_value) return .null_value;
             if (from == to and typmod < 0) return cell;
+            if (cell == .xml and to != .xml) {
+                // xml -> text is binary coercible: the stored text.
+                if (!characterType(to)) return error.CannotCoerce;
+                return cast(try textCell(cell.xml.slice()), .text, to, typmod, session);
+            }
             if (cell == .array and types.isArray(to)) {
                 if (from == to) return applyTypmodExplicit(cell, to, typmod);
                 return ArrayText.cast(cell.array.slice(), types.elementType(from) orelse return error.CannotCoerce, types.elementType(to).?, typmod, session);
@@ -844,6 +864,10 @@ pub fn Io(comptime config: types.Config) type {
                 .macaddr => switch (cell) {
                     .macaddr => cell,
                     .text => |*value| try parse(.macaddr, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .xml => switch (cell) {
+                    .text => |*value| try parse(.xml, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
                 .point, .box => switch (cell) {

@@ -219,7 +219,7 @@ pub fn Deparse(comptime config: types.Config) type {
                 .function => {
                     if (n.star or n.distinct or n.c != none) return error.UnsupportedStatement;
                     // ARRAY[...], subscripts and op ANY (array) keep their source text.
-                    if (n.func == .array_constructor or n.func == .array_subscript or n.func == .array_any) return error.UnsupportedStatement;
+                    if (n.func == .array_constructor or n.func == .array_subscript or n.func == .array_any or n.func == .xmlparse or n.func == .xmlserialize) return error.UnsupportedStatement;
                     const raw = n.name.span.slice(context.source);
                     var lowered: [64]u8 = undefined;
                     if (raw.len > lowered.len) return error.UnsupportedStatement;

@@ -229,7 +229,7 @@ pub fn Arrays(comptime V: type) type {
                     else => try putInt(out, i64, value),
                 },
                 .boolean => |value| try put(out, &.{@intFromBool(value)}),
-                .text, .jsonb, .bpchar, .bytea, .range => |*text| try putText(out, text.slice()),
+                .text, .jsonb, .bpchar, .bytea, .range, .xml => |*text| try putText(out, text.slice()),
                 .float4 => |value| try putInt(out, u32, @bitCast(value)),
                 .float8 => |value| try putInt(out, u64, @bitCast(value)),
                 .numeric => |*value| {
@@ -296,6 +296,7 @@ pub fn Arrays(comptime V: type) type {
                 .bpchar => .{ .bpchar = takeText(bytes, at) },
                 .bytea => .{ .bytea = takeText(bytes, at) },
                 .range => .{ .range = takeText(bytes, at) },
+                .xml => .{ .xml = takeText(bytes, at) },
                 .float4 => .{ .float4 = @bitCast(getInt(u32, bytes, at)) },
                 .float8 => .{ .float8 = @bitCast(getInt(u64, bytes, at)) },
                 .numeric => blk: {

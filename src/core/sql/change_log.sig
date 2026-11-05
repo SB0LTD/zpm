@@ -55,7 +55,8 @@
 //!   | 22 range {subtype OID u32, flags u8 (PostgreSQL's range flags), the
 //!   finite bounds as values} | 23 inet/cidr {family u8 (4/6), bits u8,
 //!   cidr u8, 16 address bytes} | 24 macaddr 6 bytes | 25 point {x, y as
-//!   f64 bits u64} | 26 box {high x, high y, low x, low y as f64 bits}.
+//!   f64 bits u64} | 26 box {high x, high y, low x, low y as f64 bits}
+//!   | 27 xml len u32 + the stored text.
 //!   Array type OIDs (1007, ...) name a column's array type. Every value is
 //!   checked against the column's type OID (create_table) before anything
 //!   applies.
@@ -318,6 +319,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 .macaddr => |*value| {
                     try writer.int(u8, 24);
                     try writer.bytes(value);
+                },
+                .xml => |*text| {
+                    try writer.int(u8, 27);
+                    try writer.int(u32, @intCast(text.len));
+                    try writer.bytes(text.slice());
                 },
                 .point => |value| {
                     try writer.int(u8, 25);
@@ -810,6 +816,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     break :blk .{ .inet = value };
                 },
                 24 => .{ .macaddr = (try reader.take(6))[0..6].* },
+                27 => blk: {
+                    const len = try reader.int(u32);
+                    if (len > config.text_bytes) return error.ChangeRecordConflict;
+                    var text: V.Text = .{ .len = len };
+                    @memcpy(text.bytes[0..len], try reader.take(len));
+                    break :blk .{ .xml = text };
+                },
                 25 => blk: {
                     const x: f64 = @bitCast(try reader.int(u64));
                     break :blk .{ .point = .{ .x = x, .y = @bitCast(try reader.int(u64)) } };

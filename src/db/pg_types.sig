@@ -17,7 +17,7 @@
 //! length and the subtype's binary form}. inet/cidr use inet_send
 //! {family 2 (IPv4) or 3 (IPv6), bits, is_cidr, address size, address};
 //! macaddr is six bytes. point is two float8 and box four (high corner
-//! first).
+//! first). xml is its output text.
 //! Parameters are rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
@@ -141,6 +141,7 @@ pub fn Types(comptime Result: type) type {
                     try put(out, &at, value.address[0..size]);
                 },
                 .macaddr => |*value| try put(out, &at, value),
+                .xml => at += try sendText(cell, session, out),
                 .point => |value| {
                     try putInt(u64, out, &at, @bitCast(value.x));
                     try putInt(u64, out, &at, @bitCast(value.y));
@@ -248,7 +249,7 @@ pub fn Types(comptime Result: type) type {
         /// are returned in place; others are rendered into `out`.
         pub fn receiveText(bytes: []const u8, data_type: DataType, out: []u8) Error![]const u8 {
             switch (data_type) {
-                .text, .name, .json, .varchar, .bpchar => return bytes,
+                .text, .name, .json, .varchar, .bpchar, .xml => return bytes,
                 .jsonb => {
                     if (bytes.len == 0 or bytes[0] != 1) return error.ProtocolViolation;
                     return bytes[1..];
@@ -372,6 +373,13 @@ pub fn Types(comptime Result: type) type {
                 .macaddr => {
                     if (bytes.len != 6) return error.ProtocolViolation;
                     return .{ .macaddr = bytes[0..6].* };
+                },
+                .xml => {
+                    var text: Io.Text = .{};
+                    if (bytes.len > text.bytes.len) return error.ProtocolViolation;
+                    @memcpy(text.bytes[0..bytes.len], bytes);
+                    text.len = bytes.len;
+                    return .{ .xml = text };
                 },
                 // point_recv / box_recv (box_recv reorders the corners).
                 .point => {

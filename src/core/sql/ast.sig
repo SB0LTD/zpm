@@ -80,7 +80,11 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // Network address functions (B11 advanced types, network.sig).
     inet_host, masklen, inet_family, inet_network, broadcast, netmask,
     // Geometric functions (B11 advanced types, geometric.sig).
-    point_constructor, box_constructor, area, center, width, height };
+    point_constructor, box_constructor, area, center, width, height,
+    // XML (B11 advanced types, xml.sig): XMLPARSE / XMLSERIALIZE (node
+    // `integer` 1 for DOCUMENT; XMLSERIALIZE's target in cast_type/typmod)
+    // and the well-formedness predicates.
+    xmlparse, xmlserialize, xml_is_well_formed, xml_is_well_formed_document, xml_is_well_formed_content };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
@@ -117,6 +121,7 @@ pub fn immutableBuiltin(func: Func) bool {
         .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
+        .xmlparse, .xmlserialize, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
         else => false,
     };
 }
@@ -138,6 +143,7 @@ pub fn strictFunction(func: Func) bool {
         .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
+        .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
         else => false,
     };
 }

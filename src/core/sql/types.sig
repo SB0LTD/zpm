@@ -295,6 +295,12 @@ pub const Error = error{
     ArraySubscriptError,
     /// SQLSTATE 22000: invalid data (array_append to a multi-dimensional array).
     DataException,
+    /// SQLSTATE 2200N: text is not well-formed XML content.
+    InvalidXmlContent,
+    /// SQLSTATE 2200M: text is not a well-formed XML document.
+    InvalidXmlDocument,
+    /// SQLSTATE 2200L: XMLSERIALIZE(DOCUMENT ...) of a value that is not one.
+    NotAnXmlDocument,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -355,12 +361,12 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -467,6 +473,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .macaddr => .macaddr,
         .point => .point,
         .box => .box,
+        .xml => .xml,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -511,6 +518,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .macaddr => .macaddr,
         .point => .point,
         .box => .box,
+        .xml => .xml,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -583,6 +591,7 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .macaddr => .{ .oid = 829, .name = "macaddr", .len = 6, .category = 'U', .array = 1040 },
         .point => .{ .oid = 600, .name = "point", .len = 16, .category = 'G', .array = 1017 },
         .box => .{ .oid = 603, .name = "box", .len = 32, .category = 'G', .array = 1020 },
+        .xml => .{ .oid = 142, .name = "xml", .len = -1, .category = 'U', .array = 143 },
         _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
@@ -639,6 +648,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .macaddr => "macaddr",
         .point => "point",
         .box => "box",
+        .xml => "xml",
         _ => "",
     };
 }
@@ -679,6 +689,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .macaddr => "macaddr_in",
         .point => "point_in",
         .box => "box_in",
+        .xml => "xml_in",
         _ => "array_in",
     };
 }
@@ -822,7 +833,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -861,6 +872,8 @@ pub fn Values(comptime config: Config) type {
             macaddr: network.Mac,
             point: geometric.Point,
             box: geometric.Box,
+            /// XML: the stored (validated) text.
+            xml: Text,
         };
 
         /// Range values of these cells (range.sig).
@@ -914,6 +927,7 @@ pub fn Values(comptime config: Config) type {
                 .macaddr => .macaddr,
                 .point => .point,
                 .box => .box,
+                .xml => .xml,
                 _ => .array,
             };
         }
@@ -955,6 +969,7 @@ pub fn Values(comptime config: Config) type {
                 .macaddr => |*value| bytesOrder(value, &right.macaddr),
                 .point => |value| geometric.comparePoints(value, right.point),
                 .box => |value| geometric.compareBoxes(value, right.box),
+                .xml => |*value| bytesOrder(value.slice(), right.xml.slice()),
             };
         }
 
@@ -1000,7 +1015,7 @@ pub fn Values(comptime config: Config) type {
             // Variable/composite representations retain their canonical hashing.
             switch (value.*) {
                 .integer => |integer| return wordHash(@bitCast(integer), tag),
-                .text, .bytea => |*text| {
+                .text, .bytea, .xml => |*text| {
                     mix(&code, tag);
                     for (text.slice()) |byte| code = (code ^ byte) *% 1099511628211;
                 },
