@@ -80,6 +80,7 @@ pub fn Locks(comptime config: types.Config) type {
     if (config.transactions == 0 or config.transactions > 0xfffe) @compileError("transactions must be 1..65534");
     if (config.share_holders == 0 or config.share_holders > 255) @compileError("share_holders must be 1..255");
     if (config.row_locks > 0xffff) @compileError("row_locks must fit u16");
+    if (config.advisory_locks > 0xffff) @compileError("advisory_locks must fit u16");
     const words = (config.transactions + 63) / 64;
     return struct {
         const Self = @This();

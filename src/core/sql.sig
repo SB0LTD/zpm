@@ -4758,7 +4758,7 @@ pub fn Database(comptime config: Config) type {
                     };
                     if (kind == .word) try lowerInto(&into.custom[index].value, value) else try into.custom[index].value.set(value);
                 },
-                .transaction_isolation, .transaction_read_only, .transaction_deferrable => unreachable,
+                .transaction_isolation, .transaction_read_only, .transaction_deferrable => return error.UnsupportedStatement,
             }
         }
 
@@ -4773,7 +4773,8 @@ pub fn Database(comptime config: Config) type {
                     if (source.findCustom(name)) |index| {
                         try assignSetting(into, .custom, name, .string, source.custom[index].value.slice());
                     } else if (into.findCustom(name)) |index| {
-                        into.custom[index] = .{};
+                        // A reset placeholder stays defined, empty.
+                        into.custom[index].value.len = 0;
                     }
                 },
                 .transaction_isolation, .transaction_read_only, .transaction_deferrable => {},

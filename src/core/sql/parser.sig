@@ -939,7 +939,7 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.finish();
                     return .{ .set = .{ .local = local, .name = .{ .special = .time_zone }, .value = value } };
                 }
-                const name: ast.SettingName = .{ .ident = try self.label() };
+                const name: ast.SettingName = .{ .ident = try self.settingLabel() };
                 if (!try self.takeWord("TO")) try self.expectSymbol(.eq);
                 const first = self.current;
                 var value = try self.settingValue();
@@ -982,7 +982,24 @@ pub fn Parser(comptime config: types.Config) type {
                 try self.expectWord("LEVEL");
                 return .{ .special = .transaction_isolation };
             }
-            return .{ .ident = try self.label() };
+            return .{ .ident = try self.settingLabel() };
+        }
+
+        /// A setting name: a word, or a placeholder `prefix.name` of
+        /// unquoted words (kept as one identifier span).
+        fn settingLabel(self: *Self) Error!ast.Ident {
+            var out = try self.label();
+            if (out.quoted) return out;
+            while (self.isSymbol(.dot)) {
+                try self.advance();
+                const part = self.current;
+                if (part.kind != .word) return error.Syntax;
+                try self.advance();
+                out.span.len = part.end - out.span.start;
+                out.len = out.span.len;
+                if (out.len > config.name_bytes) return error.NameCapacity;
+            }
+            return out;
         }
 
         fn settingValue(self: *Self) Error!ast.SettingValue {

@@ -3101,7 +3101,9 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .param => {
                     const params = context.params orelse return error.UndefinedParameter;
-                    if (n.integer < 1 or n.integer > params.count) return error.UndefinedParameter;
+                    // PREPARE without a declared type for $n (PostgreSQL
+                    // infers one from context; not here): 42P18.
+                    if (n.integer < 1 or n.integer > params.count) return error.IndeterminateDatatype;
                     n.ty = params.types[@intCast(n.integer - 1)];
                     n.typmod = -1;
                     n.constant = false;

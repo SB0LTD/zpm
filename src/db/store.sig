@@ -1165,7 +1165,9 @@ pub fn Store(comptime Raw: type) type {
                         return self.stillBlocked(slot, implicit);
                     }
                     self.terminal(implicit);
-                    return if (err == error.ReadOnlyTransaction) error.StorageUnavailable else err;
+                    // Writes refused for unavailable storage; a READ ONLY
+                    // transaction's own refusal stays 25006.
+                    return if (err == error.ReadOnlyTransaction and !writes) error.StorageUnavailable else err;
                 };
                 return self.finish(slot, implicit, result);
             }
