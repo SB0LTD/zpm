@@ -1668,6 +1668,11 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "SqlJsonItemCannotBeCast")) return "2203G";
     if (equal(name, "MoreThanOneSqlJsonItem")) return "22034";
     if (equal(name, "NoSqlJsonItem")) return "22035";
+    // Catalog objects (B11 wave 3).
+    if (equal(name, "InsufficientPrivilege")) return "42501";
+    if (equal(name, "ReservedName")) return "42939";
+    if (equal(name, "ObjectInUse")) return "55006";
+    if (equal(name, "InvalidGrantOperation")) return "0LP01";
     if (equal(name, "TypeMismatch")) return "42804";
     if (equal(name, "IntegerOverflow")) return "22003";
     if (equal(name, "ProtocolViolation")) return "08P01";

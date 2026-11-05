@@ -506,6 +506,52 @@ pub fn Eval(comptime config: types.Config) type {
             }
         }
 
+        /// Comments and role names through the session's catalog hook (B11
+        /// wave 3). obj_description(oid) matches any catalog; the two-argument
+        /// forms name the catalog (pg_class, pg_namespace, ...). Strict.
+        fn objectText(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+            const text_fn = hook.catalog_text orelse return error.UnsupportedStatement;
+            var buffer: [config.text_bytes]u8 = undefined;
+            const found = switch (n.func) {
+                .current_user, .session_user => try text_fn(hook.ptr, .role_name, if (n.func == .current_user) ctx.session.role else ctx.session.session_role, 0, 0, &buffer),
+                else => blk: {
+                    const first = try eval(ctx, n.b);
+                    if (first == .null_value) return .null_value;
+                    if (first.integer < 0 or first.integer > 0xffffffff) return .null_value;
+                    const object: u32 = @intCast(first.integer);
+                    const second_id = node(ctx, n.b).next;
+                    if (second_id == none) break :blk try text_fn(hook.ptr, .description, object, 0, 0, &buffer);
+                    const second = try eval(ctx, second_id);
+                    if (second == .null_value) return .null_value;
+                    switch (n.func) {
+                        .col_description => {
+                            if (second.integer < 0 or second.integer > 0x7fffffff) return .null_value;
+                            break :blk try text_fn(hook.ptr, .description, object, 1259, @intCast(second.integer), &buffer);
+                        },
+                        else => {
+                            const classoid = catalogClass(second.text.slice()) orelse return .null_value;
+                            break :blk try text_fn(hook.ptr, if (n.func == .shobj_description) .shared_description else .description, object, classoid, 0, &buffer);
+                        },
+                    }
+                },
+            };
+            const length = found orelse return .null_value;
+            return textCell(buffer[0..length]);
+        }
+
+        /// The catalog OID named by obj_description's second argument.
+        fn catalogClass(name: []const u8) ?u32 {
+            const known = [_]struct { name: []const u8, oid: u32 }{
+                .{ .name = "pg_class", .oid = 1259 },           .{ .name = "pg_namespace", .oid = 2615 },
+                .{ .name = "pg_authid", .oid = 1260 },          .{ .name = "pg_foreign_data_wrapper", .oid = 2328 },
+                .{ .name = "pg_foreign_server", .oid = 1417 },  .{ .name = "pg_publication", .oid = 6104 },
+                .{ .name = "pg_policy", .oid = 3256 },
+            };
+            for (known) |entry| if (types.same(entry.name, name)) return entry.oid;
+            return null;
+        }
+
         /// nextval/currval/setval/lastval and identity defaults through the
         /// session's sequence hook (strict: a NULL argument gives NULL).
         fn sequenceValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
@@ -1153,6 +1199,7 @@ pub fn Eval(comptime config: types.Config) type {
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out => return catalogValue(ctx, n),
+                    .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
                     .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
                     .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
                     .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),

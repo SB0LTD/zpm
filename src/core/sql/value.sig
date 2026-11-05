@@ -57,6 +57,11 @@ pub const Session = struct {
     /// The routine frame (Exec's ExprFrame) that routine variables of a
     /// statement run by a procedure or DO block read; null outside one.
     routine_frame: ?*const anyopaque = null,
+    /// current_user and session_user as role OIDs (B11 wave 3): privilege
+    /// and row-security checks use `role`. 10 is the bootstrap superuser
+    /// every wire session authenticates as; SET ROLE changes `role`.
+    role: u32 = 10,
+    session_role: u32 = 10,
 
     pub fn checkpoint(self: *const Session) Error!void {
         if (self.control) |control| try control.checkpoint();
@@ -77,6 +82,9 @@ pub const SequenceHook = struct {
     call: *const fn (ptr: *anyopaque, kind: SequenceCall, name: []const u8, oid: u32, value: i64, called: bool) Error!i64,
     /// regclass output: the relation named by `oid`, if any.
     relation_name: *const fn (ptr: *anyopaque, oid: u32, out: *[64]u8) ?usize,
+    /// Catalog-object text (B11 wave 3): a comment (obj_description,
+    /// col_description, shobj_description) or a role name, written to `out`.
+    catalog_text: ?*const fn (ptr: *anyopaque, kind: CatalogText, object: u32, classoid: u32, sub: i32, out: []u8) Error!?usize = null,
 };
 
 pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid };
@@ -99,6 +107,8 @@ pub const RoutineHook = struct {
     ptr: *anyopaque,
     call: *const fn (ptr: *anyopaque, routine: usize, args: *const anyopaque, count: usize, out: *anyopaque) Error!void,
 };
+
+pub const CatalogText = enum { description, shared_description, role_name };
 
 pub const default_session: Session = .{};
 const SessionType = Session;

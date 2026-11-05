@@ -30,6 +30,7 @@ const sequence = @import("sequence.sig");
 const character = @import("character.sig");
 const bit_string = @import("bit_string.sig");
 const array_module = @import("array.sig");
+const catalog_objects = @import("catalog_objects.sig");
 const Error = types.Error;
 const Token = lexer.Token;
 const Symbol = lexer.Symbol;
@@ -195,8 +196,9 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         /// An expression spanning exactly source[start..end] (a PL/pgSQL
-        /// expression or routine argument, B11 wave 3), parsed into the pool
-        /// without resetting it; spans stay absolute in `source`.
+        /// expression or routine argument, or a row-security predicate the
+        /// facade appends to the statement text; B11 wave 3), parsed into the
+        /// pool without resetting it; spans stay absolute in `source`.
         pub fn parseExpressionAt(source: []const u8, start: usize, end: usize, pool: *Ast.Pool) Error!u16 {
             var self = Self{ .tokens = .{ .source = source[0..end], .position = start, .text_limit = config.text_bytes }, .pool = pool, .source = source[0..end], .mode = .standard };
             try self.advance();
@@ -218,6 +220,7 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn statement(self: *Self) Error!Ast.Statement {
+            if (self.mode == .standard) if (try catalog_objects.parse(self.source, config.name_bytes, config.text_bytes)) |object| return .{ .catalog_object = object };
             if (try self.takeWord("CREATE")) {
                 if (self.mode == .standard) if (try self.schemaObject()) |object| return object;
                 if (self.mode == .standard and try self.takeWord("SEQUENCE")) return .{ .create_sequence = try self.createSequence() };
@@ -3084,7 +3087,9 @@ pub fn Parser(comptime config: types.Config) type {
             try self.enter();
             defer self.leave();
             // Fast path for the common bare column (projection lists).
-            const niladic = wordIs(self.source, self.current, "current_timestamp") or wordIs(self.source, self.current, "current_date");
+            const niladic = wordIs(self.source, self.current, "current_timestamp") or wordIs(self.source, self.current, "current_date") or
+                (self.mode == .standard and (wordIs(self.source, self.current, "current_user") or wordIs(self.source, self.current, "current_role") or
+                wordIs(self.source, self.current, "session_user") or wordIs(self.source, self.current, "user")));
             if ((self.current.kind == .word and !lexer.reserved(self.current.keyword) and !niladic) or self.current.kind == .quoted_word) {
                 const after = try self.peek();
                 if (ends(after) and !(typeWord(self.current) and multiwordType(self.current, after))) {
@@ -4081,6 +4086,14 @@ pub fn Parser(comptime config: types.Config) type {
                 if (wordIs(self.source, token, "current_timestamp") or wordIs(self.source, token, "current_date")) {
                     const name = try self.identifier();
                     return self.pool.add(.{ .kind = .function, .name = name });
+                }
+                // current_user / current_role / session_user / user (B11 wave 3).
+                if (self.mode == .standard and (wordIs(self.source, token, "current_user") or wordIs(self.source, token, "current_role") or
+                    wordIs(self.source, token, "session_user") or wordIs(self.source, token, "user")) and !lparenNext(try self.peek()))
+                {
+                    const session = wordIs(self.source, token, "session_user");
+                    const name = try self.identifier();
+                    return self.pool.add(.{ .kind = .function, .name = name, .func = if (session) .session_user else .current_user });
                 }
                 if (self.mode == .standard and lparenNext(try self.peek())) {
                     if (try self.specialFunction()) |id| return id;

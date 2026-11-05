@@ -21,6 +21,7 @@ const types = @import("types.sig");
 const storage = @import("storage.sig");
 const locks = @import("locks.sig");
 const sequence = @import("sequence.sig");
+const catalog_objects = @import("catalog_objects.sig");
 const Error = types.Error;
 
 pub fn Mvcc(comptime config: types.Config) type {
@@ -43,7 +44,10 @@ pub fn Mvcc(comptime config: types.Config) type {
         /// `create_schema` / `drop_schema`: schema slot `table`.
         /// `create_object` / `drop_object` (B11 wave 3): routine, trigger or
         /// rule slot `table` of class `new` (routine_catalog.Class).
-        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_object, drop_object };
+        /// `object_insert` / `object_delete`: catalog object entry `new` /
+        /// `old` (catalog_objects.sig, B11 wave 3); an insert's `table` is 1
+        /// when the version took a fresh OID.
+        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_object, drop_object, object_insert, object_delete };
 
         /// `table` is the table slot (catalog relation, sequence slot);
         /// `old`/`new` are version indices.
@@ -233,6 +237,13 @@ pub fn Mvcc(comptime config: types.Config) type {
                     },
                     .drop_schema => db.schemas[entry.table].pending_drop = false,
                     .create_object, .drop_object => db.undoObject(entry.kind == .create_object, entry.new, entry.table),
+                    .object_insert => {
+                        const object = &db.catalog_objects.items[entry.new];
+                        // `table` 1: this version took a fresh OID.
+                        if (entry.table == 1 and catalog_objects.ownsOid(object.kind) and db.oid_counter + types_first_oid == object.oid + 1) db.oid_counter -= 1;
+                        db.catalog_objects.undoInsert(entry.new);
+                    },
+                    .object_delete => db.catalog_objects.undoDelete(entry.old),
                 }
             }
             tx.write_len = start;
@@ -348,6 +359,8 @@ pub fn Mvcc(comptime config: types.Config) type {
                         schema.dead_csn = csn;
                     },
                     .create_object, .drop_object => db.stampObject(entry.kind == .create_object, entry.new, entry.table, csn),
+                    .object_insert => db.catalog_objects.stampInsert(entry.new, csn),
+                    .object_delete => db.catalog_objects.stampDelete(entry.old, csn),
                 }
             }
         }

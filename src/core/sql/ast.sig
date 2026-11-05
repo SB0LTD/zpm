@@ -7,6 +7,7 @@
 const types = @import("types.sig");
 const lexer = @import("lexer.sig");
 const sequence = @import("sequence.sig");
+const catalog_objects = @import("catalog_objects.sig");
 const Error = types.Error;
 
 /// Absent child / end of a sibling list.
@@ -114,7 +115,10 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // value) and a column (`name`, type in cast_type/typmod, `a` PATH, `b`
     // / `c` DEFAULT ON EMPTY / ON ERROR, `integer` a JsonTableColumn).
     // Exec reads them; evaluating one as a value is 0A000.
-    json_table, json_table_passing, json_table_column };
+    json_table, json_table_passing, json_table_column,
+    // Catalog objects (B11 wave 3, catalog_objects.sig): comments and the
+    // current / session role (STABLE).
+    obj_description, col_description, shobj_description, current_user, session_user };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -958,6 +962,9 @@ pub fn Ast(comptime config: types.Config) type {
             /// engine (tx-session lane, session.sig): LOCK TABLE, cursors,
             /// SQL prepared statements, LISTEN/NOTIFY/UNLISTEN.
             session: SessionCommand,
+            /// Roles, grants, policies, comments, foreign servers and
+            /// publications (catalog_objects.sig, B11 wave 3).
+            catalog_object: catalog_objects.Statement,
         };
 
         /// `body`: byte offset of the inner statement (DECLARE's query,
