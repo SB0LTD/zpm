@@ -64,7 +64,7 @@ InvalidParameterValue, 42P01, 42809, 3F000, 0A000 UnsupportedStatement,
 ## Capacities (Config, SessionCapacity 54000 unless noted)
 
 statement_parameters 16, prepared_statements 8, prepared_bytes 1024,
-cursors 4, cursor_rows 0 (= result_rows), custom_settings 4, setting_bytes
+cursors 4, cursor_rows 64 (0 = result_rows; the row pool is inline in the Database), custom_settings 4, setting_bytes
 64, setting_snapshots 4 (savepoint levels that change settings),
 listen_channels 8, listeners 8, notify_queue 32, notify_pending 16,
 notify_payload_bytes 256, advisory_locks 32, serializable_transactions 0

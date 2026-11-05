@@ -150,9 +150,9 @@ pub const Config = struct {
     prepared_statements: usize = 8,
     prepared_bytes: usize = 1024,
     /// Open cursors of all sessions, and the materialized rows they share
-    /// (0 selects result_rows).
+    /// (inline in the Database; 0 selects result_rows).
     cursors: usize = 4,
-    cursor_rows: usize = 0,
+    cursor_rows: usize = 64,
     /// Placeholder (`prefix.name`) settings per session, and the bytes of
     /// an engine setting name or value (search_path, placeholders).
     custom_settings: usize = 4,
