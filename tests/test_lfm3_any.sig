@@ -318,6 +318,16 @@ fn followTheCpu(which: Device, tolerance: f64) !f64 {
         try std.testing.expectEqual(c2, g2);
         t2 = c2;
     }
+    // The memory speed probe (a copy of the weights' first MiB): the GPU
+    // still agrees with the CPU after it (the copy writes its own buffer).
+    const gbps = backend.copySpeed(1 << 20);
+    {
+        const c3 = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &.{t2} }, .logits, .{})).?;
+        const g3 = (backend.forward(&gc, .{ .tokens = &.{t2} }, .logits) catch |e| return failure(&backend, e)).?;
+        worst = @max(worst, try compare(104, cpu_work.logits[0..VOCAB], backend.logits(), tolerance));
+        try std.testing.expectEqual(c3, g3);
+    }
+    std.debug.print("{s}: copySpeed {d:.1} GB/s (-1: no timestamps)\n", .{ @tagName(which), gbps orelse -1 });
     std.debug.print("{s}: logits within {e} of the CPU's over 13 steps; prefill of 11: {d} lane-ops, {d} dispatches; decode: {d} lane-ops, {d} dispatches a token\n", .{
         @tagName(which), worst, prefill_ops, prefill_dispatches, decode_ops / 7, backend.dispatches,
     });
@@ -338,6 +348,33 @@ test "...on discrete memory: VRAM without a CPU view, staging, the copy kernel" 
 
 test "...on non-coherent unified memory (every hand-over checked)" {
     _ = try followTheCpu(.noncoherent, 1e-4);
+}
+
+test "every matrix layout for one-token passes, asked for: the CPU's logits through the model" {
+    for ([_]u32{ 1, 2 }) |lanes| {
+        try fixture.initialize();
+        const plan = &fixture.plan;
+        const src = fixture.source();
+        var backend = try Backend.init(makeDevice(.ideal), plan, &fixture.index, src, .{ .max_batch = 16, .attention_tokens = 8, .matrix_lanes = lanes }, &work);
+        defer backend.deinit();
+        try std.testing.expect(backend.tunings().len > 0);
+        for (backend.tunings()) |t| try std.testing.expectEqual(lanes, t.lanes);
+        var gc = try backend.newCache(CONTEXT);
+        defer backend.freeCache(&gc);
+        var ccache = cpuCache(CONTEXT);
+        const prompt = [_]u32{ 1, 5, 2, 7 };
+        var token = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &prompt }, .logits, .{})).?;
+        const gtok = (try backend.forward(&gc, .{ .tokens = &prompt }, .logits)).?;
+        try std.testing.expectEqual(token, gtok);
+        _ = try compare(0, cpu_work.logits[0..VOCAB], backend.logits(), 1e-4);
+        for (1..5) |step| {
+            const next = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &.{token} }, .logits, .{})).?;
+            const gnext = (try backend.forward(&gc, .{ .tokens = &.{token} }, .logits)).?;
+            _ = try compare(step, cpu_work.logits[0..VOCAB], backend.logits(), 1e-4);
+            try std.testing.expectEqual(next, gnext);
+            token = next;
+        }
+    }
 }
 
 test "...with subgroups of 8 (reductions through shared memory) in groups of 64, and of 128" {

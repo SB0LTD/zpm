@@ -113,9 +113,23 @@ pub const Options = struct {
     /// sm120_emu, whose MUFU is exact: on hardware a wrong step would show
     /// only there. For checking a GPU against its emulator; slower.
     exact_sqrt: bool = false,
+    /// The matrices' layout for one-token passes (decode): 0, each shape's
+    /// fastest on this GPU, timed at init with the model's own weights (the
+    /// target's default where the device keeps no timestamps); 1, 2 or 4,
+    /// that many lanes a thread for every shape. Every layout is the CPU's
+    /// bits (lfm3_kir): only the time differs.
+    matrix_lanes: u32 = 0,
 };
 
 pub const MATRIX_VARIANTS = kernels.MAX_TOKENS;
+/// The layouts a one-token matrix pass is tried in: lanes a thread (8 / lanes
+/// threads a row). Few long rows (ffn_down: 2048 rows of 30 blocks) want
+/// many threads a row; many short ones, fewer.
+pub const LAYOUT_LANES = [_]u32{ 1, 2, 4 };
+/// A matrix shape of the model and the layout its one-token passes take,
+/// with what each layout took when timed (ns; 0: not timed).
+pub const Tuned = struct { q4: bool, rows: u32, blocks: u32, lanes: u32, ns: [LAYOUT_LANES.len]u64 = @splat(0) };
+pub const MAX_TUNED = 32;
 /// Dispatches one call may send (Work's capacity).
 pub const MAX_DISPATCHES = 4096;
 const MAX_BINDINGS = 8;
@@ -145,6 +159,10 @@ pub const Work = struct {
 const Programs = struct {
     q4k: [MATRIX_VARIANTS]?Program = @splat(null),
     q6k: [MATRIX_VARIANTS]?Program = @splat(null),
+    /// One-token passes in each of LAYOUT_LANES (null where it is the
+    /// target's default, which q4k[0] and q6k[0] are, or does not build).
+    q4k1: [LAYOUT_LANES.len]?Program = @splat(null),
+    q6k1: [LAYOUT_LANES.len]?Program = @splat(null),
     norm_quant: ?Program = null,
     quant: ?Program = null,
     swiglu: ?Program = null,
@@ -291,6 +309,9 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         last_ns: u64 = 0,
         /// Why the last kernel did not compile.
         compile_error: ?anyerror = null,
+        /// Each matrix shape's layout for one-token passes (tuneMatrices).
+        tuned: [MAX_TUNED]Tuned = undefined,
+        n_tuned: usize = 0,
 
         /// Check the model, place the weights by the memory model, allocate
         /// everything, compile the kernels. `file` must outlive the backend,
@@ -312,6 +333,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             try self.placeWeights();
             try self.readFactors();
             try self.allocBuffers();
+            self.tuneMatrices();
             return self;
         }
 
@@ -324,6 +346,8 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             const k = &self.k;
             for (&k.q4k) |*p| self.unload(p);
             for (&k.q6k) |*p| self.unload(p);
+            for (&k.q4k1) |*p| self.unload(p);
+            for (&k.q6k1) |*p| self.unload(p);
             const progs = [_]*?Program{ &k.norm_quant, &k.quant, &k.swiglu, &k.residual, &k.conv, &k.prepare, &k.scores_decode, &k.scores_prefill, &k.softmax, &k.values_decode, &k.values_prefill, &k.combine, &k.copy };
             for (progs) |p| self.unload(p);
         }
@@ -372,6 +396,20 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 if (used.q4) try self.build(&self.k.q4k[t], kernels.matrix(s, caps, .q4_k, tokens));
                 if (used.q6) try self.build(&self.k.q6k[t], kernels.matrix(s, caps, .q6_k, tokens));
             }
+            // (the other layouts of one-token passes: one that does not
+            // build for this GPU is left out)
+            const default_lanes = kernels.Layout.of(caps).lanes;
+            for (LAYOUT_LANES, 0..) |lanes, li| {
+                if (lanes == default_lanes) continue;
+                const lay = kernels.Layout{ .lanes = lanes };
+                if (used.q4) self.build(&self.k.q4k1[li], kernels.matrixWith(s, caps, lay, .q4_k, 1)) catch {
+                    self.k.q4k1[li] = null;
+                };
+                if (used.q6) self.build(&self.k.q6k1[li], kernels.matrixWith(s, caps, lay, .q6_k, 1)) catch {
+                    self.k.q6k1[li] = null;
+                };
+            }
+            self.compile_error = null;
             try self.build(&self.k.norm_quant, kernels.quant(s, caps, .norm));
             try self.build(&self.k.quant, kernels.quant(s, caps, .plain));
             try self.build(&self.k.swiglu, kernels.quant(s, caps, .swiglu));
@@ -457,6 +495,30 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         fn copyInto(self: *Self, l: *List, from: Buffer, from_off: u32, to: Buffer, to_off: u32, words: u32) Error!void {
             l.what = .{ .kernel = "copy" };
             try l.add(&self.k.copy.?, kernels.copyGroups(words), &.{ from, to }, &.{ words, from_off, to_off });
+        }
+
+        /// The GPU's memory speed now, in GB/s by its own timestamps: the
+        /// weights' first `bytes` (up to 64 MiB) copied to memory of the
+        /// device's own, read and written (2 x bytes moved). null: it keeps
+        /// no timestamps, or there is no memory for the copy. A clock or
+        /// power state shows here first (legion22: matrices 3 times faster
+        /// once the GPU had been busy a while).
+        pub fn copySpeed(self: *Self, bytes: u64) ?f64 {
+            const n = @min(bytes, 64 << 20, self.weights.bytes) / 16 * 16;
+            if (n < 16 or n > std.math.maxInt(u32)) return null;
+            const tmp = self.dev.alloc(n, .device) catch return null;
+            defer self.dev.free(tmp);
+            var l = List{ .work = self.work };
+            var at: u64 = 0;
+            while (at < n) {
+                const words: u32 = @intCast(@min((n - at) / 16, 1 << 20));
+                self.copyInto(&l, self.weights, @intCast(at), tmp, @intCast(at), words) catch return null;
+                at += @as(u64, words) * 16;
+            }
+            self.runNow(&l) catch return null;
+            const ns = self.dev.lastRunNs();
+            if (ns == 0) return null;
+            return @as(f64, @floatFromInt(2 * n)) / @as(f64, @floatFromInt(ns));
         }
 
         fn runNow(self: *Self, l: *const List) Error!void {
@@ -1562,11 +1624,123 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                     .act_sums = first * m.blocks * 32,
                     .out = first * out_stride,
                 };
-                const program = if (prog.*) |*pp| pp else return error.Unsupported;
+                var program: *const Program = if (prog.*) |*pp| pp else return error.Unsupported;
+                var groups = kernels.matrixGroups(self.caps, m.rows);
+                if (tokens == 1) {
+                    const lanes = self.lanesOf(m);
+                    if (self.matrixProgram(m.q4, lanes)) |alt| {
+                        program = alt;
+                        groups = kernels.matrixGroupsWith(.{ .lanes = lanes }, m.rows);
+                    }
+                }
                 l.named(if (m.q4) "matrix q4k" else "matrix q6k", m.tensor, first, tokens);
-                try l.add(program, kernels.matrixGroups(self.caps, m.rows), &.{ self.weights, s.act_q, s.act_d, s.act_sums, out }, &p.words(.q4_k));
+                try l.add(program, groups, &.{ self.weights, s.act_q, s.act_d, s.act_sums, out }, &p.words(.q4_k));
                 first += tokens;
             }
+        }
+
+        // ── The matrices' layouts (adaptive) ──
+
+        /// Each matrix shape's layouts and their times (for the log).
+        pub fn tunings(self: *const Self) []const Tuned {
+            return self.tuned[0..self.n_tuned];
+        }
+
+        /// The one-token program of `lanes` (the default's own, or an
+        /// alternate's); null when it was not built.
+        fn matrixProgram(self: *Self, q4: bool, lanes: u32) ?*const Program {
+            if (lanes == kernels.Layout.of(self.caps).lanes) {
+                const p = if (q4) &self.k.q4k[0] else &self.k.q6k[0];
+                return if (p.*) |*pp| pp else null;
+            }
+            for (LAYOUT_LANES, 0..) |x, li| if (x == lanes) {
+                const p = if (q4) &self.k.q4k1[li] else &self.k.q6k1[li];
+                return if (p.*) |*pp| pp else null;
+            };
+            return null;
+        }
+
+        /// The layout a one-token pass over `m` takes.
+        fn lanesOf(self: *const Self, m: MatrixInfo) u32 {
+            for (self.tuned[0..self.n_tuned]) |t| {
+                if (t.q4 == m.q4 and t.rows == m.rows and t.blocks == m.blocks) return t.lanes;
+            }
+            return kernels.Layout.of(self.caps).lanes;
+        }
+
+        /// Every matrix shape of the model file, its one-token pass timed
+        /// in each layout on the model's own weights (the best of two runs
+        /// each, the device's timestamps), the fastest kept. With
+        /// options.matrix_lanes, that layout everywhere; where the device
+        /// keeps no timestamps, the default. Only time differs: a failure
+        /// here leaves the default.
+        fn tuneMatrices(self: *Self) void {
+            const default_lanes = kernels.Layout.of(self.caps).lanes;
+            for (self.index.tensors[0..self.index.tensor_count], 0..) |*t, ti| {
+                if (t.dimension_count != 2 or (t.ggml_type != 12 and t.ggml_type != 14)) continue;
+                const blocks: u32 = @intCast(t.dimensions[0] / quantized.QK_K);
+                const m = MatrixInfo{
+                    .offset = @intCast(t.file_offset),
+                    .row_bytes = @intCast(blocks * blockBytes(t.ggml_type)),
+                    .rows = @intCast(t.dimensions[1]),
+                    .blocks = blocks,
+                    .q4 = t.ggml_type == 12,
+                    .tensor = @intCast(ti),
+                };
+                var seen = false;
+                for (self.tuned[0..self.n_tuned]) |x| {
+                    if (x.q4 == m.q4 and x.rows == m.rows and x.blocks == m.blocks) seen = true;
+                }
+                if (seen) continue;
+                if (self.n_tuned == MAX_TUNED) return;
+                var tu = Tuned{ .q4 = m.q4, .rows = m.rows, .blocks = m.blocks, .lanes = default_lanes };
+                if (self.options.matrix_lanes != 0) {
+                    if (self.matrixProgram(m.q4, self.options.matrix_lanes) != null) tu.lanes = self.options.matrix_lanes;
+                } else {
+                    var best: u64 = 0;
+                    for (LAYOUT_LANES, 0..) |lanes, li| {
+                        const ns = self.timeMatrix(m, lanes) orelse continue;
+                        tu.ns[li] = ns;
+                        if (best == 0 or ns < best) {
+                            best = ns;
+                            tu.lanes = lanes;
+                        }
+                    }
+                }
+                self.tuned[self.n_tuned] = tu;
+                self.n_tuned += 1;
+            }
+        }
+
+        /// One one-token pass over `m` in `lanes`: the device's time (ns,
+        /// the best of two), null when it cannot say.
+        fn timeMatrix(self: *Self, m: MatrixInfo, lanes: u32) ?u64 {
+            const prog = self.matrixProgram(m.q4, lanes) orelse return null;
+            const s = &self.s;
+            // (the scratch it writes: the FFN's, or the logits' for the vocabulary)
+            const out = if (@as(u64, m.rows) * 4 <= s.ffn_gate.bytes) s.ffn_gate else if (@as(u64, m.rows) * 4 <= self.out_logits.bytes) self.out_logits else return null;
+            const p = kernels.MatrixParams{
+                .row_bytes = m.row_bytes,
+                .blocks = m.blocks,
+                .rows = m.rows,
+                .out_stride = m.rows * 4,
+                .weights = m.offset,
+                .act_q = 0,
+                .act_d = 0,
+                .act_sums = 0,
+                .out = 0,
+            };
+            var best: u64 = std.math.maxInt(u64);
+            for (0..2) |_| {
+                var l = List{ .work = self.work };
+                l.named("matrix (timed)", m.tensor, 0, 1);
+                l.add(prog, kernels.matrixGroupsWith(.{ .lanes = lanes }, m.rows), &.{ self.weights, s.act_q, s.act_d, s.act_sums, out }, &p.words(.q4_k)) catch return null;
+                self.runNow(&l) catch return null;
+                const ns = self.dev.lastRunNs();
+                if (ns == 0) return null;
+                best = @min(best, ns);
+            }
+            return best;
         }
 
         fn tensorOf(self: *const Self, ref: lfm3.TensorRef) Error!*const gguf.TensorInfo {
