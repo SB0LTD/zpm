@@ -135,10 +135,10 @@ component is missing. The annotations below separate those cases.
 | PG.SESSION.NOTIFY | Notifications | pass (B11 candidate); delivered at commit, NotificationResponse on the wire; pg_notify() open |
 | PG.SECURITY.ROLE | Roles/privileges | Syntax |
 | PG.SECURITY.RLS | Row-level security | UnsupportedStatement |
-| PG.ROUTINE.FUNCTION | SQL functions | Syntax |
-| PG.ROUTINE.PROCEDURE | Procedures/DO | Syntax |
-| PG.ROUTINE.TRIGGER | Triggers | Syntax |
-| PG.ROUTINE.RULE | Rewrite rules | Syntax |
+| PG.ROUTINE.FUNCTION | SQL functions | pass (B11 candidate); SQL / PL/pgSQL functions, overloads, STRICT; SQL bodies beyond one SELECT expression open (docs/SQL_ROUTINES.md) |
+| PG.ROUTINE.PROCEDURE | Procedures/DO | pass (B11 candidate); CALL, DO, statements with INTO, EXCEPTION blocks; transaction control open |
+| PG.ROUTINE.TRIGGER | Triggers | pass (B11 candidate); BEFORE/AFTER ROW/STATEMENT, WHEN, UPDATE OF; INSTEAD OF and statements in trigger functions open |
+| PG.ROUTINE.RULE | Rewrite rules | pass (B11 candidate); DO [ALSO|INSTEAD] NOTHING with qualifications; rule actions open |
 | PG.CATALOG | Catalog expansion | RowShapeMismatch |
 | PG.UTILITY.EXPLAIN | Explain/analyze plans | UnexecutedScopeOrComparator |
 | PG.UTILITY.MAINTENANCE | Maintenance commands | UnexecutedScopeOrComparator |

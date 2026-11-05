@@ -4214,7 +4214,7 @@ pub fn Binder(comptime config: types.Config) type {
             var position: usize = 0;
             while (item != none) : (position += 1) {
                 const next = context.node(item).next;
-                const to = types.typeOfData(types.typeFromOid(routine.arg_oids[position]).?);
+                const to = types.typeOfData(types.typeFromOid(routine.arg_oids[position]) orelse return error.UndefinedFunction);
                 const converted = try convert(context, item, to, -1, .implicit);
                 context.node(converted).next = none;
                 if (tail == none) head = converted else context.node(tail).next = converted;
