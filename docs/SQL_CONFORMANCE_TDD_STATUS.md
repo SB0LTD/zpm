@@ -78,6 +78,38 @@ with change-record ops 60-65 (60/61 create/drop routine, 62/63 trigger,
 64/65 rule; 66-69 reserved), each a length-prefixed payload validated
 before anything applies. Existing records and the definition format are
 unchanged.
+## Text candidate (lane B11, wave 3) - 5 November 2026
+
+Branch `b11/text` (rebased on 6f32405) closes four smoke programs
+test-first: PG.FUNC.DISCOVERY, PG.TEXT.COLLATION, PG.PRED.REGEX and
+PG.TEXT.SEARCH. The unchanged driver moves from 83 passes (6f32405) to 87;
+it still exits 1 SqlConformanceIncomplete and no other program changed.
+`contract-sql-text` (tests/test_sql_text.sig, 3344 assertions) covers
+values, type OIDs, typmods and column names, NULLs, exact SQLSTATEs (new
+42P21, 2201B, 2200C; also 42804, 42704, 3F000, 0A000, 22P02, 22003, 22012,
+22023, 22025, 42601, 42883, 42P01, 42703, 23514, 54000, 54001, 57014),
+statement atomicity, work budgets and cancellation for regular expressions
+and text search, wire text and replay compared with
+sameDatabase/sameCatalog. Only the four oracle programs are
+native-verified; every other expectation is pending native verification
+(each was compared by hand with a local PostgreSQL 18.3, LOCALE 'C', not a
+recorded oracle run). Scope and limits: [SQL_TEXT.md](SQL_TEXT.md).
+
+pg_typeof returns a new regtype value type (2206) with oid's operators;
+pg_get_serial_sequence names SERIAL and identity sequences. COLLATE
+supports the collations identical to this C database ("default", "C",
+"POSIX", "ucs_basic") with parse_collate.c's explicit derivation (42P21);
+column collations other than "default" are 0A000. Regular expressions are
+regcomp.c's ARE language compiled to a bounded Pike VM (Config.regex_states,
+default 512; one checkpoint per text position), with `~ ~* !~ !~*`,
+SIMILAR TO, similar_to_escape and regexp_like; back references and BREs are
+0A000. Full text search adds tsvector/tsquery (canonical text), the
+default parser translated from wparser_def.c, the `simple` configuration,
+to_tsvector/to_tsquery/plainto_tsquery/phraseto_tsquery and `@@` with
+phrase semantics; Snowball configurations and default_text_search_config
+forms are 0A000. Durability: value tags 28 tsvector, 29 tsquery (canonical
+text, re-read on replay) and 30 regtype; ops 40-44 and tag 31 unused; no
+table-definition format change. The pg_type view has 84 rows.
 
 ## Transaction and session candidate (lane B11, wave 3) - 5 November 2026
 
