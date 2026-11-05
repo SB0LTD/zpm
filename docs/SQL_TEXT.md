@@ -2,8 +2,8 @@
 
 Branch `b11/text` closes four smoke programs of the 118-program inventory
 test-first: PG.FUNC.DISCOVERY, PG.TEXT.COLLATION, PG.PRED.REGEX and
-PG.TEXT.SEARCH. On main 4c028a6 (89 passes) the unchanged driver reports
-93; it still exits 1 (SqlConformanceIncomplete) and no other program
+PG.TEXT.SEARCH. On main 8ae0468 (96 passes) the unchanged driver reports
+100; it still exits 1 (SqlConformanceIncomplete) and no other program
 changed. A smoke pass is not family closure.
 
 `contract-sql-text` (tests/test_sql_text.sig, 3341 assertions) covers each

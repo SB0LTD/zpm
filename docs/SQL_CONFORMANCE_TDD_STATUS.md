@@ -80,9 +80,9 @@ before anything applies. Existing records and the definition format are
 unchanged.
 ## Text candidate (lane B11, wave 3) - 5 November 2026
 
-Branch `b11/text` (rebased on 4c028a6) closes four smoke programs
+Branch `b11/text` (rebased on 8ae0468) closes four smoke programs
 test-first: PG.FUNC.DISCOVERY, PG.TEXT.COLLATION, PG.PRED.REGEX and
-PG.TEXT.SEARCH. The unchanged driver moves from 89 passes (4c028a6) to 93;
+PG.TEXT.SEARCH. The unchanged driver moves from 96 passes (8ae0468) to 100;
 it still exits 1 SqlConformanceIncomplete and no other program changed.
 `contract-sql-text` (tests/test_sql_text.sig, 3341 assertions) covers
 values, type OIDs, typmods and column names, NULLs, exact SQLSTATEs (new
