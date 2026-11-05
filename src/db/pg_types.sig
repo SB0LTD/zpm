@@ -16,7 +16,8 @@
 //! range_send/range_recv: {flags byte, then each finite bound as an i32
 //! length and the subtype's binary form}. inet/cidr use inet_send
 //! {family 2 (IPv4) or 3 (IPv6), bits, is_cidr, address size, address};
-//! macaddr is six bytes.
+//! macaddr is six bytes. point is two float8 and box four (high corner
+//! first).
 //! Parameters are rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
@@ -140,6 +141,11 @@ pub fn Types(comptime Result: type) type {
                     try put(out, &at, value.address[0..size]);
                 },
                 .macaddr => |*value| try put(out, &at, value),
+                .point => |value| {
+                    try putInt(u64, out, &at, @bitCast(value.x));
+                    try putInt(u64, out, &at, @bitCast(value.y));
+                },
+                .box => |value| for ([_]f64{ value.high.x, value.high.y, value.low.x, value.low.y }) |coordinate| try putInt(u64, out, &at, @bitCast(coordinate)),
                 .range => |*span| {
                     const value = Io.Ranges.decode(span.slice());
                     try put(out, &at, &.{span.bytes[1]});
@@ -366,6 +372,19 @@ pub fn Types(comptime Result: type) type {
                 .macaddr => {
                     if (bytes.len != 6) return error.ProtocolViolation;
                     return .{ .macaddr = bytes[0..6].* };
+                },
+                // point_recv / box_recv (box_recv reorders the corners).
+                .point => {
+                    if (bytes.len != 16) return error.ProtocolViolation;
+                    return .{ .point = .{ .x = @bitCast(getInt(u64, bytes[0..8])), .y = @bitCast(getInt(u64, bytes[8..16])) } };
+                },
+                .box => {
+                    if (bytes.len != 32) return error.ProtocolViolation;
+                    var coordinates: [4]f64 = undefined;
+                    for (&coordinates, 0..) |*coordinate, index| coordinate.* = @bitCast(getInt(u64, bytes[index * 8 ..][0..8]));
+                    const a: @TypeOf(@as(Cell, undefined).point) = .{ .x = coordinates[0], .y = coordinates[1] };
+                    const b: @TypeOf(a) = .{ .x = coordinates[2], .y = coordinates[3] };
+                    return .{ .box = .{ .high = .{ .x = @max(a.x, b.x), .y = @max(a.y, b.y) }, .low = .{ .x = @min(a.x, b.x), .y = @min(a.y, b.y) } } };
                 },
                 else => {},
             }

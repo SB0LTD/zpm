@@ -739,11 +739,85 @@ fn network() !void {
     try meta(3, 829, -1);
 }
 
+// ---- point / box ---------------------------------------------------------------
+
+fn geometric() !void {
+    // oracle: PG.TYPE.GEOMETRIC.
+    try rows("SELECT POINT(1,2),BOX(POINT(1,2),POINT(3,4))", "(1,2)|(3,4),(1,2)");
+    try meta(0, 600, -1);
+    try meta(1, 603, -1);
+    try named(0, "point");
+    try named(1, "box");
+
+    // point_in / box_in forms; box corners reorder; float8 output.
+    try rows("SELECT '(1.5,-2)'::point, ' 3 , 4 '::point, '( 1e3 , 0.1 )'::point, '(1,2),(3,4)'::box, '((3,1),(1,3))'::box, '1,2,3,4'::box, '(4,3,2,1)'::box, '(NaN,Infinity)'::point",
+        "(1.5,-2)|(3,4)|(1000,0.1)|(3,4),(1,2)|(3,3),(1,1)|(3,4),(1,2)|(4,3),(2,1)|(NaN,Infinity)");
+    for ([_][]const u8{
+        "SELECT '(1,2'::point",       "SELECT '1'::point",          "SELECT '(1,2)x'::point",
+        "SELECT '(a,2)'::point",      "SELECT '(1,2),(3,4'::box",   "SELECT '(1,2)'::box",
+        "SELECT ''::point",           "SELECT '(1,2,3)'::point",
+    }) |source| try rejects(source, error.InvalidTextRepresentation);
+    try rejects("SELECT '(1e400,0)'::point", error.NumericValueOutOfRange);
+
+    // Functions and operators (fuzzy comparisons use EPSILON 1e-6).
+    try rows("SELECT area('(3,4),(1,2)'::box), center('(3,4),(1,2)'::box), width('(3,4),(1,2)'::box), height('(3,5),(1,2)'::box), '(0,0)'::point <-> '(3,4)'::point",
+        "4|(2,3)|2|3|5");
+    try meta(0, 701, -1);
+    try meta(1, 600, -1);
+    try meta(4, 701, -1);
+    try rows("SELECT '(3,4),(1,2)'::box @> '(2,3)'::point, '(5,5)'::point <@ '(3,4),(1,2)'::box, '(2,2),(0,0)'::box && '(3,3),(1,1)'::box, '(2,2),(0,0)'::box && '(5,5),(3,3)'::box, '(1,2)'::point ~= '(1.0000001,2)'::point, '(1,1),(0,0)'::box ~= '(0,0),(1,1)'::box, point(1, 2) ~= point(1, 3)",
+        "t|f|t|f|t|t|f");
+    try rejects("SELECT '(1,2)'::point = '(1,2)'::point", error.UndefinedFunction);
+    try rejects("SELECT point(1, 'x')", error.InvalidTextRepresentation);
+    try rejects("SELECT box(1, 2)", error.UndefinedFunction);
+
+    // Columns, NULLs, casts; no ordering or grouping operators (42883).
+    try exec("CREATE TABLE gm(id INT PRIMARY KEY, p POINT, b BOX)");
+    try exec("INSERT INTO gm VALUES(1, '(0.5,0.5)', '(1,1),(0,0)'), (2, NULL, NULL), (3, point(-1, 2.25), box(point(0, 0), point(-2, -2)))");
+    try rows("SELECT p, b FROM gm ORDER BY id", "(0.5,0.5)|(1,1),(0,0);NULL|NULL;(-1,2.25)|(0,0),(-2,-2)");
+    try rows("SELECT id FROM gm WHERE b @> p", "1");
+    try rows("SELECT p::text, b::text, '(7,8)'::text::point FROM gm WHERE id = 1", "(0.5,0.5)|(1,1),(0,0)|(7,8)");
+    try rejects("SELECT p FROM gm ORDER BY p", error.UndefinedFunction);
+    try rejects("SELECT b, COUNT(*) FROM gm GROUP BY b", error.UndefinedFunction);
+    try rejects("SELECT 1::point", error.CannotCoerce);
+    try rejects("INSERT INTO gm(id, p) VALUES(4, '(1,2)'::text)", error.TypeMismatch);
+    try rejects("INSERT INTO gm(id, p) VALUES(4, '(1,2)'), (5, '(x)')", error.InvalidTextRepresentation);
+    try rows("SELECT COUNT(*) FROM gm", "3");
+    try rows("SELECT data_type FROM information_schema.columns WHERE table_name = 'gm' ORDER BY ordinal_position", "integer;point;box");
+    try rows("SELECT typname, typlen, typcategory, typarray FROM pg_type WHERE oid IN (600, 603) ORDER BY oid", "point|16|G|1017;box|32|G|1020");
+    try exec("DROP TABLE gm");
+
+    // Wire: float8 coordinates, the box's high corner first.
+    try exec("SELECT point(1, 2), box(point(1, 2), point(3, 4))");
+    const point_bytes = [_]u8{ 0x3f, 0xf0, 0, 0, 0, 0, 0, 0, 0x40, 0, 0, 0, 0, 0, 0, 0 };
+    const box_bytes = [_]u8{ 0x40, 0x08, 0, 0, 0, 0, 0, 0, 0x40, 0x10, 0, 0, 0, 0, 0, 0, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0, 0x40, 0, 0, 0, 0, 0, 0, 0 };
+    try check(Wire.oid(.point) == 600 and Wire.length(.point) == 16 and Wire.oid(.box) == 603 and Wire.length(.box) == 32);
+    try sendBinary(&result.rows[0].cells[0], .point, &point_bytes);
+    try sendBinary(&result.rows[0].cells[1], .box, &box_bytes);
+    try receive(&point_bytes, .point, "(1,2)");
+    try receive(&box_bytes, .box, "(3,4),(1,2)");
+    try literal(&point_bytes, 600, 1, "'(1,2)'::point");
+    var out: [64]u8 = undefined;
+    try check(if (Wire.receiveText(point_bytes[0..15], .point, &out)) |_| false else |err| err == error.ProtocolViolation);
+    try check(if (Wire.receiveText(&point_bytes, .box, &out)) |_| false else |err| err == error.ProtocolViolation);
+
+    // Durability: change-record value tags 25 (point) and 26 (box).
+    try replay(&.{
+        "CREATE TABLE r(id INT PRIMARY KEY, p POINT, b BOX)",
+        "INSERT INTO r VALUES(1, '(1.5,2.5)', '(0,0),(2,2)'), (2, NULL, NULL), (3, '(-0.125,1e10)', '(1,1),(1,1)')",
+        "UPDATE r SET p = center(b) WHERE id = 1",
+    }, &.{"r"}, "SELECT * FROM r ORDER BY id");
+    try shown("replica", "1|(1,1)|(2,2),(0,0);2|NULL|NULL;3|(-0.125,10000000000)|(1,1),(1,1)");
+    try meta(1, 600, -1);
+    try meta(2, 603, -1);
+}
+
 pub fn main(init: std.process.Init) !void {
     try catalogIds();
     try arrays();
     try ranges();
     try network();
+    try geometric();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-types-advanced\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

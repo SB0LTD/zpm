@@ -20,6 +20,7 @@ const stats = @import("aggregates_stat.sig");
 const array_eval = @import("array_eval.sig");
 const range_eval = @import("range_eval.sig");
 const network = @import("network.sig");
+const geometric = @import("geometric.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -667,13 +668,19 @@ pub fn Eval(comptime config: types.Config) type {
                         const right = try operandRef(ctx, n.b, &right_value);
                         return compareOp(n.op, left, right);
                     }
-                    if (n.op == .contains or n.op == .contained or n.op == .exists or n.op == .overlap or n.op == .over_left or n.op == .over_right or n.op == .adjacent or n.op == .within_eq or n.op == .contains_eq or
+                    if (n.op == .contains or n.op == .contained or n.op == .exists or n.op == .overlap or n.op == .over_left or n.op == .over_right or n.op == .adjacent or n.op == .within_eq or n.op == .contains_eq or n.op == .same or
                         ((n.op == .shift_left or n.op == .shift_right) and n.ty == .boolean))
                     {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return null;
                         if (left == .range or right == .range) return try range_eval.RangeEval(config, @This()).predicate(n.op, &left, &right);
+                        if (left == .point or left == .box) return switch (n.op) {
+                            .same => if (left == .point) geometric.samePoint(left.point, right.point) else geometric.sameBox(left.box, right.box),
+                            .contains => geometric.containsPoint(left.box, right.point),
+                            .contained => geometric.containsPoint(right.box, left.point),
+                            else => geometric.overlaps(left.box, right.box),
+                        };
                         if (left == .inet) return switch (n.op) {
                             .shift_left => network.within(&left.inet, &right.inet, false),
                             .within_eq => network.within(&left.inet, &right.inet, true),
@@ -809,7 +816,13 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.negate(&value, n.ty);
                 },
                 .binary => switch (n.op) {
-                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap, .over_left, .over_right, .adjacent, .within_eq, .contains_eq => return boolCell(try truth(ctx, id)),
+                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap, .over_left, .over_right, .adjacent, .within_eq, .contains_eq, .same => return boolCell(try truth(ctx, id)),
+                    .distance => {
+                        const left = try eval(ctx, n.a);
+                        const right = try eval(ctx, n.b);
+                        if (left == .null_value or right == .null_value) return .null_value;
+                        return .{ .float8 = geometric.distance(left.point, right.point) };
+                    },
                     .concat => {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
@@ -1040,6 +1053,21 @@ pub fn Eval(comptime config: types.Config) type {
                     .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
                     .array_append, .array_prepend, .array_cat, .array_to_string => return array_eval.ArrayEval(config, @This()).call(ctx, n),
                     .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
+                    .point_constructor, .box_constructor, .area, .center, .width, .height => {
+                        if (n.planned_null) return .null_value;
+                        const first = try eval(ctx, n.b);
+                        const second_id = node(ctx, n.b).next;
+                        const second: V.Cell = if (second_id == none) .null_value else try eval(ctx, second_id);
+                        if (first == .null_value or (second_id != none and second == .null_value)) return .null_value;
+                        return switch (n.func) {
+                            .point_constructor => .{ .point = .{ .x = first.float8, .y = second.float8 } },
+                            .box_constructor => .{ .box = geometric.fromCorners(first.point, second.point) },
+                            .area => .{ .float8 = geometric.area(first.box) },
+                            .width => .{ .float8 = geometric.width(first.box) },
+                            .height => .{ .float8 = geometric.height(first.box) },
+                            else => .{ .point = geometric.center(first.box) },
+                        };
+                    },
                     .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => {
                         const argument = try eval(ctx, n.b);
                         if (argument == .null_value) return .null_value;

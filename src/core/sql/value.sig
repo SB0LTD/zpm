@@ -25,6 +25,7 @@ const catalog_ids = @import("catalog_ids.sig");
 const array_text = @import("array_text.sig");
 const range_text = @import("range_text.sig");
 const network = @import("network.sig");
+const geometric = @import("geometric.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -118,6 +119,12 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         // I/O conversion (text(inet) by assignment).
         if (from == .cidr and to == .inet) return true;
         if (from == .inet and to == .cidr) return context != .implicit;
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
+    if (from == .point or to == .point or from == .box or to == .box) {
+        // Geometric types: strings by I/O conversion only here.
         if (stringType(to)) return context != .implicit;
         if (stringType(from)) return context == .explicit;
         return false;
@@ -232,6 +239,9 @@ pub fn castable(from: Type, to: Type, context: Context) bool {
 /// common-type selection. Rounding an exact int/numeric to float4 first can
 /// turn distinct values into equal ones (e.g. 16777217 and 16777216::real).
 pub fn comparisonType(a: Type, b: Type) ?Type {
+    // point has no = operator and box compares only by area: neither has
+    // ordinary comparison operators here.
+    if (a == .point or b == .point or a == .box or b == .box) return null;
     // anyarray operators need the same array type on both sides.
     if (a != b and (types.isArray(a) or types.isArray(b))) return null;
     if (a != b and numericCategory(a) and numericCategory(b) and (a == .float4 or b == .float4)) return .float8;
@@ -376,6 +386,8 @@ pub fn Io(comptime config: types.Config) type {
                 // inet hides a full-length netmask except in its text cast.
                 .inet => |*value| network.format(value, value.cidr or verbose, buffer),
                 .macaddr => |*value| network.formatMac(value, buffer),
+                .point => |value| geometric.formatPoint(value, buffer),
+                .box => |value| geometric.formatBox(value, buffer),
             };
         }
 
@@ -470,6 +482,8 @@ pub fn Io(comptime config: types.Config) type {
                 .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => try RangeText.parse(ty, input, session),
                 .inet, .cidr => .{ .inet = try network.parse(input, ty == .cidr) },
                 .macaddr => .{ .macaddr = try network.parseMac(input) },
+                .point => .{ .point = try geometric.parsePoint(input) },
+                .box => .{ .box = try geometric.parseBox(input) },
                 // array_in applies the typmod to every element itself.
                 _ => return ArrayText.parse(types.elementType(ty) orelse return error.UndefinedFunction, typmod, input, session),
             };
@@ -830,6 +844,11 @@ pub fn Io(comptime config: types.Config) type {
                 .macaddr => switch (cell) {
                     .macaddr => cell,
                     .text => |*value| try parse(.macaddr, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .point, .box => switch (cell) {
+                    .point, .box => cell,
+                    .text => |*value| try parse(to, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
                 .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => switch (cell) {

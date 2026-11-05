@@ -54,7 +54,8 @@
 //!   i32), every element as a value (0 for NULL) in row-major order}.
 //!   | 22 range {subtype OID u32, flags u8 (PostgreSQL's range flags), the
 //!   finite bounds as values} | 23 inet/cidr {family u8 (4/6), bits u8,
-//!   cidr u8, 16 address bytes} | 24 macaddr 6 bytes.
+//!   cidr u8, 16 address bytes} | 24 macaddr 6 bytes | 25 point {x, y as
+//!   f64 bits u64} | 26 box {high x, high y, low x, low y as f64 bits}.
 //!   Array type OIDs (1007, ...) name a column's array type. Every value is
 //!   checked against the column's type OID (create_table) before anything
 //!   applies.
@@ -317,6 +318,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 .macaddr => |*value| {
                     try writer.int(u8, 24);
                     try writer.bytes(value);
+                },
+                .point => |value| {
+                    try writer.int(u8, 25);
+                    try writer.int(u64, @bitCast(value.x));
+                    try writer.int(u64, @bitCast(value.y));
+                },
+                .box => |value| {
+                    try writer.int(u8, 26);
+                    for ([_]f64{ value.high.x, value.high.y, value.low.x, value.low.y }) |coordinate| try writer.int(u64, @bitCast(coordinate));
                 },
                 .range => |*span| {
                     const value = V.Ranges.decode(span.slice());
@@ -800,6 +810,17 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     break :blk .{ .inet = value };
                 },
                 24 => .{ .macaddr = (try reader.take(6))[0..6].* },
+                25 => blk: {
+                    const x: f64 = @bitCast(try reader.int(u64));
+                    break :blk .{ .point = .{ .x = x, .y = @bitCast(try reader.int(u64)) } };
+                },
+                26 => blk: {
+                    var coordinates: [4]f64 = undefined;
+                    for (&coordinates) |*coordinate| coordinate.* = @bitCast(try reader.int(u64));
+                    // box_in keeps the high corner first.
+                    if (coordinates[0] < coordinates[2] or coordinates[1] < coordinates[3]) return error.InvalidChangeRecord;
+                    break :blk .{ .box = .{ .high = .{ .x = coordinates[0], .y = coordinates[1] }, .low = .{ .x = coordinates[2], .y = coordinates[3] } } };
+                },
                 17 => blk: {
                     const bits = try reader.int(u32);
                     if (bits > V.BitString.max_bits) return error.ChangeRecordConflict;

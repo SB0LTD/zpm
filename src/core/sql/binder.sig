@@ -527,6 +527,8 @@ pub fn Binder(comptime config: types.Config) type {
             if (left == .unknown) return coerce(context, a.*, right);
             if (right == .unknown) return coerce(context, b.*, left);
             if (left == .json or right == .json) return error.UndefinedFunction;
+            // point and box have no ordinary comparison operators here.
+            if (geometricType(left) or geometricType(right)) return error.UndefinedFunction;
             if (left == right) return;
             if (value.integral(left) and value.integral(right)) return;
             if (context.legacy) {
@@ -926,6 +928,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "host", .func = .inet_host },            .{ .name = "masklen", .func = .masklen },
                 .{ .name = "family", .func = .inet_family },        .{ .name = "network", .func = .inet_network },
                 .{ .name = "broadcast", .func = .broadcast },       .{ .name = "netmask", .func = .netmask },
+                // Geometric functions (B11 advanced types).
+                .{ .name = "point", .func = .point_constructor },   .{ .name = "box", .func = .box_constructor },
+                .{ .name = "area", .func = .area },                 .{ .name = "center", .func = .center },
+                .{ .name = "width", .func = .width },               .{ .name = "height", .func = .height },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -1503,6 +1509,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
                 .array_append, .array_prepend, .array_cat, .array_to_string => try typeArrayFunction(context, n, count),
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => try typeRangeFunction(context, n, count),
+                .point_constructor => try bindSignature(context, n, &[_]ast.Type{ .float8, .float8 }, .point, true),
+                .box_constructor => try bindSignature(context, n, &[_]ast.Type{ .point, .point }, .box, true),
+                .area, .width, .height => try bindSignature(context, n, &[_]ast.Type{.box}, .float8, true),
+                .center => try bindSignature(context, n, &[_]ast.Type{.box}, .point, true),
                 .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => {
                     // One inet argument (cidr converts implicitly).
                     if (count != 1) return error.UndefinedFunction;
@@ -1517,6 +1527,33 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = isConstant(context, n.b);
                 },
             }
+        }
+
+        fn geometricType(ty: ast.Type) bool {
+            return ty == .point or ty == .box;
+        }
+
+        /// point <-> point (float8), point ~= point, box ~= box, box @>
+        /// point, point <@ box and box && box; an untyped side takes the
+        /// operator's other operand type.
+        fn geometricOperator(context: *const Context, n: *ast.Node) Error!void {
+            const wanted: [2]ast.Type = switch (n.op) {
+                .contains => .{ .box, .point },
+                .contained => .{ .point, .box },
+                .overlap => .{ .box, .box },
+                .distance => .{ .point, .point },
+                .same => blk: {
+                    const known = if (context.node(n.a).ty != .unknown) context.node(n.a).ty else context.node(n.b).ty;
+                    if (!geometricType(known)) return error.UndefinedFunction;
+                    break :blk .{ known, known };
+                },
+                else => return error.UndefinedFunction,
+            };
+            for ([_]*u16{ &n.a, &n.b }, wanted) |side, target| {
+                if (context.node(side.*).ty == .unknown) try coerce(context, side.*, target);
+                if (context.node(side.*).ty != target) return error.UndefinedFunction;
+            }
+            n.ty = if (n.op == .distance) .float8 else .boolean;
         }
 
         fn networkType(ty: ast.Type) bool {
@@ -2864,8 +2901,9 @@ pub fn Binder(comptime config: types.Config) type {
                             if (!value.stringType(context.node(n.a).ty) and !value.stringType(context.node(n.b).ty)) return error.UndefinedFunction;
                             n.ty = .text;
                         },
-                        .contains, .contained => if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else if (types.isArray(context.node(n.a).ty) or types.isArray(context.node(n.b).ty)) try arrayContainment(context, n) else try jsonOperator(context, n),
-                        .overlap => if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else if (networkType(context.node(n.a).ty) or networkType(context.node(n.b).ty)) try networkOperator(context, n) else try arrayContainment(context, n),
+                        .contains, .contained => if (geometricType(context.node(n.a).ty) or geometricType(context.node(n.b).ty)) try geometricOperator(context, n) else if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else if (types.isArray(context.node(n.a).ty) or types.isArray(context.node(n.b).ty)) try arrayContainment(context, n) else try jsonOperator(context, n),
+                        .distance, .same => try geometricOperator(context, n),
+                        .overlap => if (geometricType(context.node(n.a).ty) or geometricType(context.node(n.b).ty)) try geometricOperator(context, n) else if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else if (networkType(context.node(n.a).ty) or networkType(context.node(n.b).ty)) try networkOperator(context, n) else try arrayContainment(context, n),
                         .within_eq, .contains_eq => try networkOperator(context, n),
                         .over_left, .over_right, .adjacent => try rangeOperator(context, n),
                         .arrow, .arrow_text, .path, .path_text, .exists => try jsonOperator(context, n),
@@ -3436,7 +3474,7 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     try valueExpr(context, &scope, id);
                 }
-                if (context.node(id).ty == .json) return error.UndefinedFunction;
+                try sortableType(context.node(id).ty);
                 out.order[out.order_count] = .{ .expr = id, .descending = key.descending, .nulls_first = key.nulls_first };
                 out.order_count += 1;
             }
@@ -3737,6 +3775,9 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn sortableType(ty: ast.Type) Error!void {
             if (ty == .json) return error.UndefinedFunction;
+            // No btree or hash operator classes (could not identify an
+            // ordering/equality operator: 42883).
+            if (ty == .point or ty == .box) return error.UndefinedFunction;
         }
 
         fn bindSetOp(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv) Error!u16 {

@@ -224,6 +224,8 @@ pub const Keyword = enum {
     inet,
     cidr,
     macaddr,
+    point,
+    box,
 };
 
 /// Words that cannot be unquoted identifiers.
@@ -312,6 +314,9 @@ pub const Symbol = enum {
     // Networks: <<= and >>=.
     within_eq,
     contains_eq,
+    // Geometric <-> and ~=.
+    distance,
+    same,
 };
 
 pub const Token = struct {
@@ -587,7 +592,10 @@ pub const Tokenizer = struct {
                 width = 3;
                 break :blk Symbol.adjacent;
             } else .minus,
-            '<' => if (following == '=') blk: {
+            '<' => if (following == '-' and third == '>') blk: {
+                width = 3;
+                break :blk Symbol.distance;
+            } else if (following == '=') blk: {
                 width = 2;
                 break :blk Symbol.le;
             } else if (following == '>') blk: {
@@ -627,7 +635,10 @@ pub const Tokenizer = struct {
             } else .ampersand,
             '[' => .lbracket,
             ']' => .rbracket,
-            '~' => .tilde,
+            '~' => if (following == '=') blk: {
+                width = 2;
+                break :blk Symbol.same;
+            } else .tilde,
             ':' => if (following == ':') blk: {
                 width = 2;
                 break :blk Symbol.cast;

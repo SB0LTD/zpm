@@ -11,6 +11,7 @@ const bit_string = @import("bit_string.sig");
 const array_module = @import("array.sig");
 const range_module = @import("range.sig");
 const network = @import("network.sig");
+const geometric = @import("geometric.sig");
 
 pub const Config = struct {
     /// Caller supplies row/version/index buffers and query reference workspace.
@@ -354,12 +355,12 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -464,6 +465,8 @@ pub fn dataTypeOf(ty: Type) DataType {
         .inet => .inet,
         .cidr => .cidr,
         .macaddr => .macaddr,
+        .point => .point,
+        .box => .box,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -506,6 +509,8 @@ pub fn typeOfData(data_type: DataType) Type {
         .inet => .inet,
         .cidr => .cidr,
         .macaddr => .macaddr,
+        .point => .point,
+        .box => .box,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -576,6 +581,8 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .inet => .{ .oid = 869, .name = "inet", .len = -1, .category = 'I', .array = 1041 },
         .cidr => .{ .oid = 650, .name = "cidr", .len = -1, .category = 'I', .array = 651 },
         .macaddr => .{ .oid = 829, .name = "macaddr", .len = 6, .category = 'U', .array = 1040 },
+        .point => .{ .oid = 600, .name = "point", .len = 16, .category = 'G', .array = 1017 },
+        .box => .{ .oid = 603, .name = "box", .len = 32, .category = 'G', .array = 1020 },
         _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
@@ -630,6 +637,8 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .inet => "inet",
         .cidr => "cidr",
         .macaddr => "macaddr",
+        .point => "point",
+        .box => "box",
         _ => "",
     };
 }
@@ -668,6 +677,8 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .inet => "inet_in",
         .cidr => "cidr_in",
         .macaddr => "macaddr_in",
+        .point => "point_in",
+        .box => "box_in",
         _ => "array_in",
     };
 }
@@ -811,7 +822,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -848,6 +859,8 @@ pub fn Values(comptime config: Config) type {
             /// inet and cidr (network.sig; `cidr` marks a cidr value).
             inet: network.Inet,
             macaddr: network.Mac,
+            point: geometric.Point,
+            box: geometric.Box,
         };
 
         /// Range values of these cells (range.sig).
@@ -899,6 +912,8 @@ pub fn Values(comptime config: Config) type {
                 .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => .range,
                 .inet, .cidr => .inet,
                 .macaddr => .macaddr,
+                .point => .point,
+                .box => .box,
                 _ => .array,
             };
         }
@@ -938,6 +953,8 @@ pub fn Values(comptime config: Config) type {
                 .range => |*value| Ranges.compare(value.slice(), right.range.slice()),
                 .inet => |*value| network.compare(value, &right.inet),
                 .macaddr => |*value| bytesOrder(value, &right.macaddr),
+                .point => |value| geometric.comparePoints(value, right.point),
+                .box => |value| geometric.compareBoxes(value, right.box),
             };
         }
 
@@ -1008,6 +1025,15 @@ pub fn Values(comptime config: Config) type {
                 .macaddr => |*bytes| {
                     mix(&code, tag);
                     for (bytes) |byte| code = (code ^ byte) *% 1099511628211;
+                },
+                .point => |point| {
+                    mix(&code, tag);
+                    mix(&code, @bitCast(normalFloat(point.x)));
+                    mix(&code, @bitCast(normalFloat(point.y)));
+                },
+                .box => |box| {
+                    mix(&code, tag);
+                    for ([_]f64{ box.high.x, box.high.y, box.low.x, box.low.y }) |coordinate| mix(&code, @bitCast(normalFloat(coordinate)));
                 },
                 .timetz => |time| {
                     mix(&code, tag);

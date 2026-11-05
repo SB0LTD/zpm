@@ -261,6 +261,11 @@ pub fn Arrays(comptime V: type) type {
                     try put(out, &value.address);
                 },
                 .macaddr => |*value| try put(out, value),
+                .point => |value| {
+                    try putInt(out, u64, @bitCast(value.x));
+                    try putInt(out, u64, @bitCast(value.y));
+                },
+                .box => |value| for ([_]f64{ value.high.x, value.high.y, value.low.x, value.low.y }) |coordinate| try putInt(out, u64, @bitCast(coordinate)),
                 .array => return error.TypeMismatch,
             }
         }
@@ -338,6 +343,15 @@ pub fn Arrays(comptime V: type) type {
                 .macaddr => blk: {
                     at.* += 6;
                     break :blk .{ .macaddr = bytes[at.* - 6 ..][0..6].* };
+                },
+                .point => blk: {
+                    const x: f64 = @bitCast(getInt(u64, bytes, at));
+                    break :blk .{ .point = .{ .x = x, .y = @bitCast(getInt(u64, bytes, at)) } };
+                },
+                .box => blk: {
+                    var coordinates: [4]f64 = undefined;
+                    for (&coordinates) |*coordinate| coordinate.* = @bitCast(getInt(u64, bytes, at));
+                    break :blk .{ .box = .{ .high = .{ .x = coordinates[0], .y = coordinates[1] }, .low = .{ .x = coordinates[2], .y = coordinates[3] } } };
                 },
             };
         }
