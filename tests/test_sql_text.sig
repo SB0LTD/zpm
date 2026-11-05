@@ -121,6 +121,8 @@ fn sqlstate(err: anyerror, wanted: []const u8) !void {
         .{ .name = "UnsupportedStatement", .state = "0A000" },
         .{ .name = "QueryWorkLimit", .state = "54000" },
         .{ .name = "QueryCanceled", .state = "57014" },
+        .{ .name = "CollationMismatch", .state = "42P21" },
+        .{ .name = "UndefinedSchema", .state = "3F000" },
     };
     var state: []const u8 = "?";
     for (table) |entry| {
@@ -353,9 +355,91 @@ fn discovery() !void {
     try replicaShows("bigint|NULL|regtype;integer|text|regtype");
 }
 
+// ---- collations -------------------------------------------------------------
+
+fn collations() !void {
+    // oracle: PG.TEXT.COLLATION.
+    try rows("SELECT 'a' COLLATE \"C\" < 'b' COLLATE \"C\"", "t");
+    try meta(0, "?column?", 16, -1);
+
+    // The built-in collations this C database honours; an untyped literal
+    // stays unknown under COLLATE and is text in the result.
+    try rows("SELECT 'a' COLLATE pg_catalog.\"C\", 'a' COLLATE \"default\", 'a' COLLATE \"POSIX\", 'a' COLLATE ucs_basic, 'b' COLLATE \"C\" COLLATE \"POSIX\"", "a|a|a|a|b");
+    try meta(0, "?column?", 25, -1);
+    try rows("SELECT pg_typeof('a' COLLATE \"C\"), 'a' COLLATE \"C\" || 'b' COLLATE \"C\", pg_typeof('a' COLLATE \"C\" || 'b'), NULL COLLATE \"C\"", "unknown|ab|text|NULL");
+    // A literal coerced to a non-collatable type drops the clause.
+    try rows("SELECT '1' COLLATE \"C\" = 1, '1' COLLATE \"C\" + 1", "t|2");
+    try rows("SELECT ARRAY['a'] COLLATE \"C\", ('a'::name) COLLATE \"POSIX\", 'a'::varchar COLLATE \"C\", 'a'::char(2) COLLATE \"C\"", "{a}|a|a|a ");
+    try meta(1, "name", 19, -1);
+    try meta(2, "varchar", 1043, -1);
+    try meta(3, "bpchar", 1042, 6);
+    try rows("SELECT x FROM (VALUES ('b'), ('B'), ('a')) v(x) ORDER BY x COLLATE \"C\"", "B;a;b");
+    try rows("SELECT x FROM (VALUES ('b'), ('B'), ('a')) v(x) ORDER BY x COLLATE \"POSIX\" DESC", "b;a;B");
+    try rows("SELECT max('a' COLLATE \"C\"), 'a' COLLATE \"C\" BETWEEN 'a' AND 'b', 'x' COLLATE \"C\" = 'x' COLLATE \"C\"", "a|t|t");
+    try rows("SELECT 1 WHERE 'a' COLLATE \"C\" IN ('a', 'b' COLLATE \"C\")", "1");
+    // Boolean results carry no collation: their operands may differ.
+    try rows("SELECT ('a' COLLATE \"C\" = 'b') = ('a' COLLATE \"POSIX\" = 'b'), 'a' < 'b' COLLATE \"C\" COLLATE \"POSIX\"", "t|t");
+    try rows("SELECT x FROM (SELECT 'a' COLLATE \"C\" AS x) s WHERE x < 'b' COLLATE \"POSIX\"", "a");
+
+    // 42P21: different explicit collations meeting in one expression.
+    for ([_][]const u8{
+        "SELECT 'a' COLLATE \"default\" < 'b' COLLATE \"C\"",
+        "SELECT ('a' COLLATE \"C\") < ('b' COLLATE \"POSIX\")",
+        "SELECT CASE WHEN true THEN 'a' COLLATE \"C\" ELSE 'b' COLLATE \"POSIX\" END",
+        "SELECT 'a' COLLATE \"C\" IN ('a' COLLATE \"POSIX\")",
+        "SELECT COALESCE('a' COLLATE \"C\", 'b' COLLATE \"POSIX\")",
+        "SELECT 'a' COLLATE \"C\" LIKE 'a' COLLATE \"POSIX\"",
+        "SELECT GREATEST('a' COLLATE \"C\", 'b' COLLATE \"POSIX\")",
+        "SELECT NULLIF('a' COLLATE \"C\", 'b' COLLATE \"POSIX\")",
+        "SELECT 'a' COLLATE \"C\" = ANY(ARRAY['a' COLLATE \"POSIX\"])",
+        "SELECT ('a' COLLATE \"C\" || 'b') || 'c' COLLATE ucs_basic",
+    }) |source| try rejects(source, error.CollationMismatch);
+    try sqlstate(error.CollationMismatch, "42P21");
+    // 42804 (checked before the name), 42704, 3F000 and 0A000.
+    try rejects("SELECT 1 COLLATE \"C\"", error.TypeMismatch);
+    try rejects("SELECT 1 COLLATE \"nope\"", error.TypeMismatch);
+    try rejects("SELECT -1 COLLATE \"C\"", error.TypeMismatch);
+    try sqlstate(error.TypeMismatch, "42804");
+    for ([_][]const u8{
+        "SELECT 'a' COLLATE \"nope\"",          "SELECT 'a' COLLATE C",
+        "SELECT 'a' COLLATE public.\"C\"",      "SELECT 'a' COLLATE \"nope\" COLLATE \"C\"",
+        "SELECT ('a' COLLATE \"C\" || 'b' COLLATE \"POSIX\") COLLATE \"nope\"", "SELECT 'a' COLLATE \"nope\" < 'b'",
+    }) |source| try rejects(source, error.UndefinedObject);
+    try sqlstate(error.UndefinedObject, "42704");
+    try rejects("SELECT 'a' COLLATE nope.\"C\"", error.UndefinedSchema);
+    try sqlstate(error.UndefinedSchema, "3F000");
+    try rejects("SELECT 'a' COLLATE pg_c_utf8", error.UnsupportedStatement);
+    try rejects("SELECT 'a' COLLATE \"unicode\" < 'b'", error.UnsupportedStatement);
+    try sqlstate(error.UnsupportedStatement, "0A000");
+    // A BETWEEN lower bound is a b_expr: COLLATE cannot follow it.
+    try rejects("SELECT 'a' BETWEEN 'a' COLLATE \"C\" AND 'b'", error.Syntax);
+
+    // Column collations: only the database collation (the default).
+    try rejects("CREATE TABLE ct(a TEXT COLLATE \"C\")", error.UnsupportedStatement);
+    try rejects("CREATE TABLE ct(a INT COLLATE \"C\")", error.TypeMismatch);
+    try rejects("CREATE TABLE ct(a TEXT COLLATE \"nope\")", error.UndefinedObject);
+    // DEFAULT takes a b_expr, so this COLLATE is the column's.
+    try rejects("CREATE TABLE ct(a TEXT DEFAULT 'x' COLLATE \"C\")", error.UnsupportedStatement);
+    try exec("CREATE TABLE ct(id INT PRIMARY KEY, a TEXT COLLATE \"default\" DEFAULT ('q' COLLATE \"C\"))");
+    try exec("INSERT INTO ct(id) VALUES (1)");
+    try exec("INSERT INTO ct VALUES (2, 'b' COLLATE \"POSIX\")");
+    try rows("SELECT id, a FROM ct ORDER BY a COLLATE \"C\" DESC", "1|q;2|b");
+    try rows("SELECT column_default FROM information_schema.columns WHERE table_name = 'ct' AND column_name = 'a'", "('q'::text COLLATE \"C\")");
+    try exec("DROP TABLE ct");
+
+    // Durability: COLLATE lives in stored expression text only.
+    try replay(&.{
+        "CREATE TABLE cr(id INT PRIMARY KEY, a TEXT DEFAULT ('q' COLLATE \"C\"))",
+        "INSERT INTO cr(id) VALUES (1)",
+        "INSERT INTO cr VALUES (2, 'b' COLLATE \"POSIX\")",
+    }, &.{"cr"}, "SELECT id, a FROM cr ORDER BY a COLLATE ucs_basic");
+    try replicaShows("2|b;1|q");
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try discovery();
+    try collations();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-text\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

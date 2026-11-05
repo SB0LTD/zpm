@@ -25,6 +25,7 @@ const sequence = @import("sequence.sig");
 const parser = @import("parser.sig");
 const array_module = @import("array.sig");
 const routine_catalog = @import("routine_catalog.sig");
+const collation = @import("collation.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -761,8 +762,10 @@ pub fn Binder(comptime config: types.Config) type {
             if (n.ty == target) return id;
             if (!value.castable(n.ty, target, mode)) return if (mode == .assignment) error.TypeMismatch else error.UndefinedFunction;
             const constant = n.constant;
+            const derived = if (collation.collatable(target)) n.collation else collation.none;
             const cast_id = try context.pool.add(.{ .kind = .cast, .cast_type = target, .typmod = typmod, .a = id, .ty = target });
             context.node(cast_id).constant = constant;
+            context.node(cast_id).collation = derived;
             return cast_id;
         }
 
@@ -3538,6 +3541,58 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn typeExpr(context: *const Context, scope: *const Scope, id: u16) Error!void {
+            try typeExprKind(context, scope, id);
+            try deriveCollation(context, id);
+        }
+
+        /// parse_collate.c for explicit collations (collation.sig): a COLLATE
+        /// clause needs a collatable (or still untyped) operand (42804) and an
+        /// existing collation (42704, 0A000); a collatable result inherits
+        /// its inputs' explicit collation, and two different explicit
+        /// collations among the inputs are 42P21. Only collatable inputs
+        /// count, and a CASE's result comes from its THEN / ELSE values.
+        fn deriveCollation(context: *const Context, id: u16) Error!void {
+            const n = context.node(id);
+            if (n.collate_clause) {
+                if (!collation.collatable(n.ty)) return error.TypeMismatch;
+                if (n.collation == collation.unknown) return error.UndefinedObject;
+                if (n.collation == collation.unsupported) return error.UnsupportedStatement;
+            }
+            var merged: u8 = collation.none;
+            const Collations = struct {
+                fn add(c: *const Context, child: u16, into: *u8) Error!void {
+                    if (child == none) return;
+                    const node = c.node(child);
+                    if (!collation.known(node.collation) or !collation.collatable(node.ty)) return;
+                    if (into.* == collation.none) {
+                        into.* = node.collation;
+                    } else if (into.* != node.collation) return error.CollationMismatch;
+                }
+            };
+            switch (n.kind) {
+                .case_expr => {
+                    var arm = n.b;
+                    while (arm != none) : (arm = context.node(arm).next) try Collations.add(context, context.node(arm).b, &merged);
+                    try Collations.add(context, n.c, &merged);
+                },
+                .function, .coalesce, .in_list => {
+                    try Collations.add(context, n.a, &merged);
+                    var item = n.b;
+                    while (item != none) : (item = context.node(item).next) try Collations.add(context, item, &merged);
+                    try Collations.add(context, n.c, &merged);
+                },
+                .scalar_subquery, .exists_subquery, .in_subquery, .column, .row_compare, .row_in => try Collations.add(context, n.a, &merged),
+                else => {
+                    try Collations.add(context, n.a, &merged);
+                    try Collations.add(context, n.b, &merged);
+                    try Collations.add(context, n.c, &merged);
+                },
+            }
+            if (n.collate_clause) return;
+            n.collation = if (collation.collatable(n.ty)) merged else collation.none;
+        }
+
+        fn typeExprKind(context: *const Context, scope: *const Scope, id: u16) Error!void {
             const n = context.node(id);
             n.constant = true;
             switch (n.kind) {

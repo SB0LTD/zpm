@@ -24,6 +24,7 @@
 const types = @import("types.sig");
 const lexer = @import("lexer.sig");
 const ast = @import("ast.sig");
+const collation_module = @import("collation.sig");
 const alpha = @import("alpha.sig");
 const numeric = @import("numeric.sig");
 const sequence = @import("sequence.sig");
@@ -55,6 +56,9 @@ pub fn Parser(comptime config: types.Config) type {
         recursion: usize = 0,
         /// Inside a data-modifying WITH entry: the statement ends at `)`.
         nested: usize = 0,
+        /// Parsing a b_expr (DEFAULT, a BETWEEN lower bound): COLLATE ends
+        /// it instead of applying; every nested expression() is an a_expr.
+        b_expr: bool = false,
 
         /// Parses exactly one statement. The pool is reset first.
         pub fn parse(source: []const u8, pool: *Ast.Pool, mode: Mode) Error!Ast.Statement {
@@ -1831,6 +1835,9 @@ pub fn Parser(comptime config: types.Config) type {
                     if (column.default_kind != .none) {if(if_not_exists) invalid.*=true else return error.Syntax;}
                     column.default_kind = .default;
                     const start = self.tokenStart();
+                    // DEFAULT takes a b_expr: a COLLATE after it is the column's.
+                    self.b_expr = true;
+                    defer self.b_expr = false;
                     _ = try self.other();
                     column.expression = self.spanTo(start);
                 } else if (self.mode == .standard and try self.takeWord("GENERATED")) {
@@ -1861,6 +1868,14 @@ pub fn Parser(comptime config: types.Config) type {
                         }
                         column.default_kind = .generated;
                     }
+                } else if (self.mode == .standard and name == null and try self.takeRaw("collate")) {
+                    // Column collations would need the table definition to
+                    // carry them: only the database collation ("default",
+                    // the same as no clause) is accepted.
+                    const value = try self.collationName();
+                    if (value == collation_module.unknown) return error.UndefinedObject;
+                    if (!collation_module.collatable(column.type_name)) return error.TypeMismatch;
+                    if (value != collation_module.database_default) return error.UnsupportedStatement;
                 } else if (self.mode == .standard and self.isWord("NULL")) {
                     try self.advance();
                 } else if (try self.takeWord("NOT")) {
@@ -3098,13 +3113,17 @@ pub fn Parser(comptime config: types.Config) type {
         pub fn expression(self: *Self) Error!u16 {
             try self.enter();
             defer self.leave();
+            const outer_b_expr = self.b_expr;
+            self.b_expr = false;
+            defer self.b_expr = outer_b_expr;
             // Fast path for the common bare column (projection lists).
             const niladic = wordIs(self.source, self.current, "current_timestamp") or wordIs(self.source, self.current, "current_date") or
                 (self.mode == .standard and (wordIs(self.source, self.current, "current_user") or wordIs(self.source, self.current, "current_role") or
                 wordIs(self.source, self.current, "session_user") or wordIs(self.source, self.current, "user")));
             if ((self.current.kind == .word and !lexer.reserved(self.current.keyword) and !niladic) or self.current.kind == .quoted_word) {
                 const after = try self.peek();
-                if (ends(after) and !(typeWord(self.current) and multiwordType(self.current, after))) {
+                // COLLATE (not a lexer keyword) continues the expression.
+                if (ends(after) and !wordIs(self.source, after, "collate") and !(typeWord(self.current) and multiwordType(self.current, after))) {
                     const name = try self.identifier();
                     return self.pool.add(.{ .kind = .column, .name = name });
                 }
@@ -3196,6 +3215,7 @@ pub fn Parser(comptime config: types.Config) type {
                         try self.pool.raise(any, left);
                         try self.pool.raise(any, array);
                         left = try self.castTail(any);
+                        left = try self.collateTail(left);
                         left = try self.atZoneTail(left);
                         left = try self.multiplicativeTail(left);
                         left = try self.additiveTail(left);
@@ -3212,6 +3232,7 @@ pub fn Parser(comptime config: types.Config) type {
                     // A completed sublink can itself be a higher-precedence
                     // operand: x=ANY(...)::text || 'suffix', or ... = TRUE.
                     left = try self.castTail(left);
+                    left = try self.collateTail(left);
                     left = try self.atZoneTail(left);
                     left = try self.multiplicativeTail(left);
                     left = try self.additiveTail(left);
@@ -3257,7 +3278,14 @@ pub fn Parser(comptime config: types.Config) type {
             if (try self.takeWord("BETWEEN")) {
                 const symmetric = try self.takeWord("SYMMETRIC");
                 if (!symmetric) _ = try self.takeWord("ASYMMETRIC");
-                const low = try self.other();
+                // The lower bound is a b_expr (no COLLATE).
+                const outer_b_expr = self.b_expr;
+                self.b_expr = true;
+                const low = self.other() catch |err| {
+                    self.b_expr = outer_b_expr;
+                    return err;
+                };
+                self.b_expr = outer_b_expr;
                 try self.expectWord("AND");
                 const high = try self.other();
                 return self.pool.add(.{ .kind = .between, .negated = negated, .symmetric = symmetric, .a = left, .b = low, .c = high });
@@ -3365,9 +3393,65 @@ pub fn Parser(comptime config: types.Config) type {
             return left;
         }
 
-        /// `x AT TIME ZONE z` binds tighter than `*` and looser than unary minus.
+        /// `x AT TIME ZONE z` binds tighter than `*` and looser than COLLATE.
         fn atZone(self: *Self) Error!u16 {
-            return self.atZoneTail(try self.unary());
+            return self.atZoneTail(try self.collated());
+        }
+
+        /// `x COLLATE name` binds tighter than AT TIME ZONE and looser than
+        /// unary minus.
+        fn collated(self: *Self) Error!u16 {
+            return self.collateTail(try self.unary());
+        }
+
+        /// COLLATE clauses mark their operand node (collation.sig): the
+        /// binder checks the operand's type before the name (42804, then
+        /// 42704 / 0A000). An outer clause replaces an inner valid one.
+        fn collateTail(self: *Self, initial: u16) Error!u16 {
+            while (self.mode == .standard and !self.b_expr and self.rawWord("collate")) {
+                try self.advance();
+                const value = try self.collationName();
+                const target = &self.pool.nodes[initial];
+                if (!target.collate_clause or collation_module.known(target.collation)) target.collation = value;
+                target.collate_clause = true;
+            }
+            return initial;
+        }
+
+        /// `any_name` after COLLATE: a collation of collation.sig. Only
+        /// pg_catalog qualifies built-in collations; public names nothing
+        /// (42704) and any other schema is 3F000.
+        fn collationName(self: *Self) Error!u8 {
+            const first = try self.identifier();
+            var name = first;
+            var schema: ?ast.Ident = null;
+            if (try self.takeSymbol(.dot)) {
+                schema = first;
+                name = try self.identifier();
+            }
+            var buffer: [64]u8 = undefined;
+            if (schema) |qualifier| {
+                const text = identText(self.source, qualifier, &buffer) orelse return error.UndefinedSchema;
+                if (!types.same(text, "pg_catalog")) {
+                    if (types.same(text, "public")) return collation_module.unknown;
+                    return error.UndefinedSchema;
+                }
+            }
+            const text = identText(self.source, name, &buffer) orelse return collation_module.unknown;
+            return collation_module.lookup(text);
+        }
+
+        /// An identifier's name (quotes decoded, unquoted folded to lower
+        /// case) when it fits `out`.
+        fn identText(source: []const u8, ident: ast.Ident, out: *[64]u8) ?[]const u8 {
+            if (ident.len > out.len) return null;
+            const raw = ident.span.slice(source);
+            if (ident.quoted) {
+                lexer.decodeQuotedWith(source, .{ .start = ident.span.start, .end = ident.span.start + ident.span.len, .len = ident.len }, '"', out);
+            } else for (raw, 0..) |byte, index| {
+                out[index] = types.lower(byte);
+            }
+            return out[0..ident.len];
         }
 
         fn atZoneTail(self: *Self, initial: u16) Error!u16 {
@@ -3378,7 +3462,7 @@ pub fn Parser(comptime config: types.Config) type {
                 try self.advance();
                 try self.advance();
                 try self.expectWord("ZONE");
-                const zone = try self.unary();
+                const zone = try self.collated();
                 left = try self.pool.add(.{ .kind = .at_zone, .a = left, .b = zone });
             }
             return left;

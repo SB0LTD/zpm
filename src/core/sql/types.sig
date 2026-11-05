@@ -481,6 +481,9 @@ pub const Error = error{
     ObjectInUse,
     /// SQLSTATE 0LP01: a role grant that would make a role its own member.
     InvalidGrantOperation,
+    /// SQLSTATE 42P21: two different explicit collations (COLLATE) meet in
+    /// one expression (B11 text).
+    CollationMismatch,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent

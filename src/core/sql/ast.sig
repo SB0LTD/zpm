@@ -384,6 +384,10 @@ pub const Node = struct {
     /// keys: an index into Pool.windows whose `order` keys hold them (B11).
     order: u16 = none,
     within_group: bool = false,
+    /// Explicit collation (collation.sig): set by a COLLATE clause on this
+    /// node (`collate_clause`) or derived by the binder from its inputs.
+    collation: u8 = 0,
+    collate_clause: bool = false,
 };
 
 /// The member layout of an aggregate_input node (its `integer`): value

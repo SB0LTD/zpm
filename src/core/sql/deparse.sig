@@ -8,6 +8,7 @@
 const types = @import("types.sig");
 const ast = @import("ast.sig");
 const lexer = @import("lexer.sig");
+const collation = @import("collation.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -59,6 +60,19 @@ pub fn Deparse(comptime config: types.Config) type {
         }
 
         fn top(context: *const Context, id: u16, data_type: types.DataType, w: *Writer) Error!void {
+            const n = context.node(id);
+            if (n.collate_clause and collation.known(n.collation)) {
+                try w.bytes("(");
+                try topBody(context, id, data_type, w);
+                try w.bytes(" COLLATE ");
+                try w.bytes(collation.sql_names[n.collation - 1]);
+                try w.bytes(")");
+                return;
+            }
+            return topBody(context, id, data_type, w);
+        }
+
+        fn topBody(context: *const Context, id: u16, data_type: types.DataType, w: *Writer) Error!void {
             const n = context.node(id);
             switch (n.kind) {
                 .int_literal => {
@@ -130,7 +144,21 @@ pub fn Deparse(comptime config: types.Config) type {
             try w.bytes(")");
         }
 
+        /// ruleutils' CollateExpr: `(operand COLLATE name)`.
         fn expression(context: *const Context, id: u16, w: *Writer) Error!void {
+            const n = context.node(id);
+            if (n.collate_clause and collation.known(n.collation)) {
+                try w.bytes("(");
+                try expressionBody(context, id, w);
+                try w.bytes(" COLLATE ");
+                try w.bytes(collation.sql_names[n.collation - 1]);
+                try w.bytes(")");
+                return;
+            }
+            return expressionBody(context, id, w);
+        }
+
+        fn expressionBody(context: *const Context, id: u16, w: *Writer) Error!void {
             const n = context.node(id);
             switch (n.kind) {
                 .and_op, .or_op => {
