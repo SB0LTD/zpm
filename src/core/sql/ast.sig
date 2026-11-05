@@ -93,7 +93,12 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // parameter types) and a bound routine variable (`relation` 0 a
     // parameter / PL/pgSQL variable `integer`, 1 NEW.`column`, 2
     // OLD.`column`), read from the evaluation frame.
-    routine, routine_param };
+    routine, routine_param,
+    // Internal (B11 json-agg lane): the inputs of an aggregate with ORDER BY
+    // keys or several arguments: `b` -> next lists the value arguments, then
+    // the sort keys; `integer` is an AggregateInput layout. Exec reads its
+    // members directly; evaluating it as a value is 0A000.
+    aggregate_input };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
@@ -171,7 +176,23 @@ pub const Agg = enum { none, count, count_star, sum, avg, min, max, bool_and, bo
     // Statistical (B11, aggregates_stat.sig): one-argument variance family and
     // two-argument (Y, X) float8 regression aggregates; integer bitwise folds.
     stddev_pop, stddev_samp, var_pop, var_samp, corr, covar_pop, covar_samp, regr_count, regr_sxx, regr_syy,
-    regr_sxy, regr_avgx, regr_avgy, regr_slope, regr_intercept, regr_r2, bit_and, bit_or, bit_xor };
+    regr_sxy, regr_avgx, regr_avgy, regr_slope, regr_intercept, regr_r2, bit_and, bit_or, bit_xor,
+    // Collection, JSON and ordered-set aggregates (B11 json-agg lane,
+    // aggregates_collect.sig). They read every input of a group (sorted by
+    // their ORDER BY / WITHIN GROUP keys) and so run only on the sorted
+    // grouping operator; the other operators reject them with 0A000.
+    array_agg, string_agg, json_agg, jsonb_agg, json_object_agg, jsonb_object_agg,
+    percentile_cont, percentile_disc, mode, hypothetical_rank, hypothetical_dense_rank, hypothetical_percent_rank, hypothetical_cume_dist };
+
+/// Aggregates that need their group's whole input (Exec.collectAggregate).
+pub fn collectingAggregate(agg: Agg) bool {
+    return @intFromEnum(agg) >= @intFromEnum(Agg.array_agg);
+}
+
+/// Ordered-set and hypothetical-set aggregates (WITHIN GROUP).
+pub fn orderedSetAggregate(agg: Agg) bool {
+    return @intFromEnum(agg) >= @intFromEnum(Agg.percentile_cont);
+}
 
 /// Two-argument (Y, X) aggregates; their argument is an aggregate_pair node.
 pub fn pairAggregate(agg: Agg) bool {
@@ -289,6 +310,40 @@ pub const Node = struct {
     star: bool = false,
     agg: Agg = .none,
     reg: Reg = .none,
+    /// Aggregate ORDER BY (inside the call) or WITHIN GROUP (ORDER BY ...)
+    /// keys: an index into Pool.windows whose `order` keys hold them (B11).
+    order: u16 = none,
+    within_group: bool = false,
+};
+
+/// The member layout of an aggregate_input node (its `integer`): value
+/// argument count in bits 0..3, sort key count in bits 4..11, then per key
+/// two bits at 12 + 2 * index: DESC and NULLS FIRST.
+pub const AggregateInput = struct {
+    values: usize = 1,
+    keys: usize = 0,
+    descending: u64 = 0,
+    nulls_first: u64 = 0,
+
+    pub fn encode(self: *const AggregateInput) i64 {
+        var word: u64 = @as(u64, @intCast(self.values)) | (@as(u64, @intCast(self.keys)) << 4);
+        for (0..self.keys) |index| {
+            word |= ((self.descending >> @intCast(index)) & 1) << @intCast(12 + 2 * index);
+            word |= ((self.nulls_first >> @intCast(index)) & 1) << @intCast(13 + 2 * index);
+        }
+        return @bitCast(word);
+    }
+
+    pub fn decode(raw: i64) AggregateInput {
+        const word: u64 = @bitCast(raw);
+        var out: AggregateInput = .{ .values = @intCast(word & 15), .keys = @intCast((word >> 4) & 0xff) };
+        if (out.keys > 24) out.keys = 24;
+        for (0..out.keys) |index| {
+            out.descending |= ((word >> @intCast(12 + 2 * index)) & 1) << @intCast(index);
+            out.nulls_first |= ((word >> @intCast(13 + 2 * index)) & 1) << @intCast(index);
+        }
+        return out;
+    }
 };
 
 pub fn Ast(comptime config: types.Config) type {

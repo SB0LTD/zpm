@@ -1223,9 +1223,238 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "regr_intercept", .agg = .regr_intercept }, .{ .name = "regr_r2", .agg = .regr_r2 },
                 .{ .name = "bit_and", .agg = .bit_and },            .{ .name = "bit_or", .agg = .bit_or },
                 .{ .name = "bit_xor", .agg = .bit_xor },
+                // B11 json-agg lane: collection, JSON and ordered-set aggregates.
+                .{ .name = "array_agg", .agg = .array_agg },        .{ .name = "string_agg", .agg = .string_agg },
+                .{ .name = "json_agg", .agg = .json_agg },          .{ .name = "jsonb_agg", .agg = .jsonb_agg },
+                .{ .name = "json_object_agg", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg", .agg = .jsonb_object_agg },
+                .{ .name = "percentile_cont", .agg = .percentile_cont }, .{ .name = "percentile_disc", .agg = .percentile_disc },
+                .{ .name = "mode", .agg = .mode },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.agg;
             return .none;
+        }
+
+        /// Collection and JSON aggregates (B11 json-agg lane, after
+        /// pg_aggregate): array_agg(anynonarray | anyarray), string_agg(text,
+        /// text | bytea, bytea), json[b]_agg(anyelement), json[b]_object_agg
+        /// ("any", "any"). Polymorphic arguments reject untyped literals
+        /// (42804); "any" ones read them as text. Returns the result type;
+        /// the typed arguments stay `next`-linked from n.b.
+        fn typeCollectAggregate(context: *const Context, inner: *const Scope, n: *ast.Node, kind: ast.Agg) Error!ast.Type {
+            if (n.star) return error.UndefinedFunction;
+            var args: [2]u16 = undefined;
+            var count: usize = 0;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                if (count == 2) return error.UndefinedFunction;
+                try typeExpr(context, inner, item);
+                args[count] = item;
+                count += 1;
+            }
+            const wanted: usize = switch (kind) {
+                .string_agg, .json_object_agg, .jsonb_object_agg => 2,
+                else => 1,
+            };
+            if (count != wanted) return error.UndefinedFunction;
+            const first = context.node(args[0]).ty;
+            switch (kind) {
+                .array_agg => {
+                    if (first == .unknown) return error.TypeMismatch;
+                    if (types.isArray(first)) return first;
+                    return types.arrayType(first) orelse error.UndefinedFunction;
+                },
+                .json_agg, .jsonb_agg => {
+                    if (first == .unknown) return error.TypeMismatch;
+                    return if (kind == .json_agg) .json else .jsonb;
+                },
+                .json_object_agg, .jsonb_object_agg => {
+                    for (args[0..2]) |arg| if (context.node(arg).ty == .unknown) try coerce(context, arg, .text);
+                    return if (kind == .json_object_agg) .json else .jsonb;
+                },
+                .string_agg => {
+                    const second = context.node(args[1]).ty;
+                    const binary = (first == .bytea or second == .bytea) and (first == .bytea or first == .unknown) and (second == .bytea or second == .unknown);
+                    const target: ast.Type = if (binary) .bytea else .text;
+                    for (args[0..2]) |arg| {
+                        const ty = context.node(arg).ty;
+                        if (ty != .unknown and !value.castable(ty, target, .implicit)) return error.UndefinedFunction;
+                    }
+                    const value_arg = try convert(context, args[0], target, -1, .implicit);
+                    const delimiter = try convert(context, args[1], target, -1, .implicit);
+                    context.node(value_arg).next = delimiter;
+                    context.node(delimiter).next = none;
+                    n.b = value_arg;
+                    return target;
+                },
+                else => return error.UndefinedFunction,
+            }
+        }
+
+        /// The ORDER BY keys of aggregate call `n` (B11): typed in the input
+        /// scope (untyped literals as text) and appended after the
+        /// `value_count` typed arguments listed from n.b into one
+        /// aggregate_input node, which becomes n.b. With DISTINCT, every key
+        /// must be one of the arguments (42P10).
+        fn aggregateInput(context: *const Context, inner: *const Scope, n: *ast.Node, value_count: usize) Error!void {
+            var layout: ast.AggregateInput = .{ .values = value_count };
+            var tail: u16 = none;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) tail = item;
+            if (n.order != none) {
+                const spec = &context.pool.windows[n.order];
+                if (spec.order_count > 24) return error.ColumnCapacity;
+                layout.keys = spec.order_count;
+                for (spec.order[0..spec.order_count], 0..) |*key, index| {
+                    try typeExpr(context, inner, key.expr);
+                    if (context.node(key.expr).ty == .unknown) try coerce(context, key.expr, .text);
+                    try sortableType(context.node(key.expr).ty);
+                    if (n.distinct) {
+                        var found = false;
+                        var value_item = n.b;
+                        for (0..value_count) |_| {
+                            if (value_item == none) break;
+                            if (sameExpr(context, value_item, key.expr)) found = true;
+                            value_item = context.node(value_item).next;
+                        }
+                        if (!found) return error.InvalidColumnReference;
+                    }
+                    const bit = @as(u64, 1) << @intCast(index);
+                    if (key.descending) layout.descending |= bit;
+                    if (key.nulls_first orelse (config.nulls_first_ascending != key.descending)) layout.nulls_first |= bit;
+                    context.node(key.expr).next = none;
+                    if (tail == none) n.b = key.expr else context.node(tail).next = key.expr;
+                    tail = key.expr;
+                }
+            }
+            try linkAggregateInput(context, n, layout);
+        }
+
+        /// Wraps the `next`-linked members from n.b in an aggregate_input
+        /// node with `layout`; it becomes n.b.
+        fn linkAggregateInput(context: *const Context, n: *ast.Node, layout: ast.AggregateInput) Error!void {
+            const input = try context.pool.add(.{ .kind = .function, .func = .aggregate_input, .b = n.b, .ty = .text, .name = n.name, .integer = layout.encode() });
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) try context.pool.raise(input, item);
+            context.node(input).constant = false;
+            n.b = input;
+        }
+
+        fn orderedSetName(context: *const Context, n: *const ast.Node) ast.Agg {
+            const name = toName(context, n.name);
+            const table = [_]struct { name: []const u8, agg: ast.Agg }{
+                .{ .name = "percentile_cont", .agg = .percentile_cont }, .{ .name = "percentile_disc", .agg = .percentile_disc },
+                .{ .name = "mode", .agg = .mode },                       .{ .name = "rank", .agg = .hypothetical_rank },
+                .{ .name = "dense_rank", .agg = .hypothetical_dense_rank }, .{ .name = "percent_rank", .agg = .hypothetical_percent_rank },
+                .{ .name = "cume_dist", .agg = .hypothetical_cume_dist },
+            };
+            for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.agg;
+            return .none;
+        }
+
+        /// `f(direct...) WITHIN GROUP (ORDER BY key...)` (B11, after
+        /// orderedsetaggs.c): percentile_cont(float8) over float8 or interval
+        /// keys, percentile_disc(float8) and mode() over any sortable key,
+        /// and the hypothetical-set rank/dense_rank/percent_rank/cume_dist
+        /// whose direct arguments pair with the keys (common types). Direct
+        /// arguments are evaluated once per group; groupify checks that
+        /// they read grouped columns only (42803). OVER is 0A000.
+        fn typeOrderedSet(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            if (n.window != none) return error.UnsupportedStatement;
+            const kind = orderedSetName(context, n);
+            if (kind == .none) return if (aggregateKind(context, n) != .none) error.WrongObjectType else error.UndefinedFunction;
+            if (!scope.aggregates) return error.GroupingError;
+            var inner = scope.*;
+            inner.aggregates = false;
+            inner.windows = false;
+            inner.window_error = if (scope.inside_window) error.WindowingError else error.GroupingError;
+            const spec = &context.pool.windows[n.order];
+            if (spec.order_count > 24) return error.ColumnCapacity;
+            var direct: [24]u16 = undefined;
+            var direct_count: usize = 0;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                if (direct_count == direct.len) return error.ColumnCapacity;
+                try typeExpr(context, &inner, item);
+                direct[direct_count] = item;
+                direct_count += 1;
+            }
+            const hypothetical = @intFromEnum(kind) >= @intFromEnum(ast.Agg.hypothetical_rank);
+            if (hypothetical) {
+                if (direct_count != spec.order_count) return error.UndefinedFunction;
+            } else {
+                if (spec.order_count != 1) return error.UndefinedFunction;
+                if (direct_count != @as(usize, if (kind == .mode) 0 else 1)) return error.UndefinedFunction;
+            }
+            for (spec.order[0..spec.order_count]) |*key| try typeExpr(context, &inner, key.expr);
+            var result: ast.Type = .unknown;
+            if (hypothetical) {
+                for (spec.order[0..spec.order_count], direct[0..direct_count]) |*key, *arg| {
+                    var target: ast.Type = .unknown;
+                    try unifyInto(&target, context.node(arg.*).ty);
+                    try unifyInto(&target, context.node(key.expr).ty);
+                    if (target == .unknown) target = .text;
+                    try sortableType(target);
+                    arg.* = try convert(context, arg.*, target, -1, .implicit);
+                    key.expr = try convert(context, key.expr, target, -1, .implicit);
+                }
+                result = if (kind == .hypothetical_rank or kind == .hypothetical_dense_rank) .int8 else .float8;
+            } else {
+                const key = &spec.order[0];
+                const key_ty = context.node(key.expr).ty;
+                switch (kind) {
+                    .percentile_cont => {
+                        // float8 and interval candidates: an untyped key is ambiguous.
+                        if (key_ty == .unknown) return error.AmbiguousFunction;
+                        const target: ast.Type = if (key_ty == .interval) .interval else .float8;
+                        if (target == .float8 and !value.castable(key_ty, .float8, .implicit)) return error.UndefinedFunction;
+                        key.expr = try convert(context, key.expr, target, -1, .implicit);
+                        result = target;
+                    },
+                    .percentile_disc, .mode => {
+                        if (key_ty == .unknown) return error.TypeMismatch;
+                        try sortableType(key_ty);
+                        result = key_ty;
+                    },
+                    else => return error.UndefinedFunction,
+                }
+                if (kind != .mode) {
+                    const ty = context.node(direct[0]).ty;
+                    if (ty != .unknown and !value.castable(ty, .float8, .implicit)) return error.UndefinedFunction;
+                    direct[0] = try convert(context, direct[0], .float8, -1, .implicit);
+                }
+            }
+            // Relink the direct arguments (casts may have replaced them),
+            // then the already typed keys.
+            n.b = none;
+            var tail: u16 = none;
+            for (direct[0..direct_count]) |arg| {
+                context.node(arg).next = none;
+                if (tail == none) n.b = arg else context.node(tail).next = arg;
+                tail = arg;
+            }
+            var layout: ast.AggregateInput = .{ .values = direct_count, .keys = spec.order_count };
+            for (spec.order[0..spec.order_count], 0..) |*key, index| {
+                const bit = @as(u64, 1) << @intCast(index);
+                if (key.descending) layout.descending |= bit;
+                if (key.nulls_first orelse (config.nulls_first_ascending != key.descending)) layout.nulls_first |= bit;
+                context.node(key.expr).next = none;
+                if (tail == none) n.b = key.expr else context.node(tail).next = key.expr;
+                tail = key.expr;
+            }
+            try linkAggregateInput(context, n, layout);
+            if (n.c != none) {
+                inner.window_error = error.WindowingError;
+                try typeExpr(context, &inner, n.c);
+                try booleanArgument(context, n.c);
+            }
+            n.kind = .aggregate;
+            n.agg = kind;
+            n.a = n.b;
+            n.b = none;
+            n.ty = result;
+            n.typmod = -1;
+            n.constant = false;
+            if (scope.saw_aggregate) |flag| flag.* = true;
         }
 
         /// Types an aggregate call (PostgreSQL result types: COUNT int8,
@@ -1239,8 +1468,28 @@ pub fn Binder(comptime config: types.Config) type {
             inner.windows = false;
             inner.window_error=if(scope.inside_window) error.WindowingError else error.GroupingError;
             var kind = kind_in;
+            // WITHIN GROUP is required for an ordered-set aggregate (42809).
+            if (ast.orderedSetAggregate(kind)) return error.WrongObjectType;
+            if (ast.collectingAggregate(kind)) {
+                const result = try typeCollectAggregate(context, &inner, n, kind);
+                try aggregateInput(context, &inner, n, if (kind == .string_agg or kind == .json_object_agg or kind == .jsonb_object_agg) 2 else 1);
+                if (n.c != none) {
+                    inner.window_error = error.WindowingError;
+                    try typeExpr(context, &inner, n.c);
+                    try booleanArgument(context, n.c);
+                }
+                n.kind = .aggregate;
+                n.agg = kind;
+                n.a = n.b;
+                n.b = none;
+                n.ty = result;
+                n.typmod = -1;
+                n.constant = false;
+                if (scope.saw_aggregate) |flag| flag.* = true;
+                return;
+            }
             if (n.star) {
-                if (kind != .count or n.distinct) return error.Syntax;
+                if (kind != .count or n.distinct or n.order != none) return error.Syntax;
                 kind = .count_star;
             } else if (ast.pairAggregate(kind)) {
                 try typePairAggregate(context, &inner, n);
@@ -1265,6 +1514,9 @@ pub fn Binder(comptime config: types.Config) type {
                 try booleanArgument(context, n.c);
             }
             const result=try aggregateType(context,n,kind,arg,arg_ty);
+            // ORDER BY inside an ordinary aggregate (B11): its inputs are
+            // sorted before the transition runs (Exec.collectAggregate).
+            if (n.order != none) try aggregateInput(context, &inner, n, 1);
             n.kind = .aggregate;
             n.agg = kind;
             n.a = n.b;
@@ -1339,6 +1591,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .regr_count => .int8,
                 .corr, .covar_pop, .covar_samp, .regr_sxx, .regr_syy, .regr_sxy, .regr_avgx, .regr_avgy, .regr_slope, .regr_intercept, .regr_r2 => .float8,
                 .bit_and, .bit_or, .bit_xor => if (value.integral(arg_ty)) arg_ty else return error.UndefinedFunction,
+                // Collection / ordered-set aggregates type elsewhere; as
+                // window functions they are not provided (0A000).
+                .array_agg, .string_agg, .json_agg, .jsonb_agg, .json_object_agg, .jsonb_object_agg,
+                .percentile_cont, .percentile_disc, .mode, .hypothetical_rank, .hypothetical_dense_rank, .hypothetical_percent_rank, .hypothetical_cume_dist => return error.UnsupportedStatement,
                 .none => unreachable,
             };
         }
@@ -1584,6 +1840,15 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn typeFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            // Built by linkAggregateInput with typed members (B11).
+            if (n.func == .aggregate_input) return;
+            if (n.within_group) return typeOrderedSet(context, scope, n);
+            if (n.order != none) {
+                // Aggregate ORDER BY is not implemented for window functions;
+                // elsewhere ORDER BY needs an aggregate (42809).
+                if (n.window != none) return error.UnsupportedStatement;
+                if (aggregateKind(context, n) == .none) return error.WrongObjectType;
+            }
             if(n.window!=none) return typeWindow(context,scope,n);
             if(valueWindowName(context,n)) {try typeValueArguments(context,scope,n);return error.WrongObjectType;}
             if(offsetWindowName(context,n)) {
@@ -1632,6 +1897,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .window_call => unreachable,
                 .routine, .routine_param => {},
                 .none => return bindRoutineCall(context, n, count),
+                .aggregate_input => return,
                 .greatest, .least => {
                     if (count == 0) return error.Syntax;
                     var target: ast.Type = .unknown;
@@ -5237,6 +5503,36 @@ pub fn Binder(comptime config: types.Config) type {
             } else try validateDiscardedGroup(context, p, n.b);
         }
 
+        /// Direct arguments of an ordered-set aggregate (the leading members
+        /// of its aggregate_input) may read grouped expressions only (42803).
+        fn groupedDirectArguments(context: *const Context, p: *const Plan, input: u16) Error!void {
+            const layout = ast.AggregateInput.decode(context.node(input).integer);
+            var item = context.node(input).b;
+            for (0..layout.values) |_| {
+                if (item == none) break;
+                if (!groupedOnly(context, p, item)) return error.GroupingError;
+                item = context.node(item).next;
+            }
+        }
+
+        fn groupedOnly(context: *const Context, p: *const Plan, id: u16) bool {
+            if (id == none) return true;
+            for (p.keys[0..p.key_count]) |key| if (sameExpr(context, id, key)) return true;
+            const n = context.node(id);
+            switch (n.kind) {
+                .column => return n.level != 0,
+                .aggregate, .scalar_subquery, .exists_subquery => return true,
+                else => {},
+            }
+            if (!groupedOnly(context, p, n.a) or !groupedOnly(context, p, n.c)) return false;
+            if (listOwner(n.kind)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) if (!groupedOnly(context, p, item)) return false;
+                return true;
+            }
+            return groupedOnly(context, p, n.b);
+        }
+
         fn groupify(context: *const Context, p: *Plan, id: u16) Error!void {
             if (id == none) return;
             const n = context.node(id);
@@ -5267,6 +5563,7 @@ pub fn Binder(comptime config: types.Config) type {
             switch (n.kind) {
                 .row_compare => if (n.a != none) return validateDiscardedGroup(context, p, n.a),
                 .aggregate => {
+                    if (ast.orderedSetAggregate(n.agg)) try groupedDirectArguments(context, p, n.a);
                     const index = try registerAgg(context, p, id);
                     return groupColumn(n, p.key_count + index, -1);
                 },

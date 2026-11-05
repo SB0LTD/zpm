@@ -3430,7 +3430,9 @@ pub fn Parser(comptime config: types.Config) type {
             for ([_][]const u8{ "count", "sum", "avg", "min", "max", "bool_and", "bool_or", "every",
                 "stddev", "stddev_pop", "stddev_samp", "variance", "var_pop", "var_samp", "corr", "covar_pop", "covar_samp",
                 "regr_count", "regr_sxx", "regr_syy", "regr_sxy", "regr_avgx", "regr_avgy", "regr_slope", "regr_intercept",
-                "regr_r2", "bit_and", "bit_or", "bit_xor" }) |word| {
+                "regr_r2", "bit_and", "bit_or", "bit_xor",
+                "array_agg", "string_agg", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
+                "percentile_cont", "percentile_disc", "mode" }) |word| {
                 if (types.keyword(raw, word)) return true;
             }
             return false;
@@ -3464,7 +3466,20 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.pool.raise(node, item);
                     last = item;
                 }
+                // Aggregate ORDER BY inside the call (B11).
+                if (self.mode == .standard and self.isWord("ORDER")) self.pool.nodes[node].order = try self.aggregateOrder(node);
                 try self.expectSymbol(.rparen);
+            }
+            // WITHIN GROUP (ORDER BY ...) of an ordered-set aggregate (B11).
+            if (self.mode == .standard and self.rawWord("within") and (try self.peek()).isWord("GROUP")) {
+                try self.advance();
+                try self.advance();
+                try self.expectSymbol(.lparen);
+                if (call.star or call.distinct or self.pool.nodes[node].order != none) return error.Syntax;
+                self.pool.nodes[node].order = try self.aggregateOrder(node);
+                self.pool.nodes[node].within_group = true;
+                try self.expectSymbol(.rparen);
+                self.pool.complex = true;
             }
             if (self.mode == .standard and self.isWord("FILTER") and lparenNext(try self.peek())) {
                 try self.advance();
@@ -3482,6 +3497,37 @@ pub fn Parser(comptime config: types.Config) type {
             const n = &self.pool.nodes[node];
             if (n.distinct or n.c != none or self.aggregateName(name)) self.pool.complex = true;
             return node;
+        }
+
+        /// `ORDER BY key [ASC|DESC] [NULLS FIRST|LAST], ...` of an aggregate
+        /// call: the keys go to a Pool.windows slot of their own (B11).
+        fn aggregateOrder(self: *Self, owner: u16) Error!u16 {
+            try self.expectWord("ORDER");
+            try self.expectWord("BY");
+            if (self.pool.window_len == self.pool.windows.len) return error.StatementTooComplex;
+            const index = self.pool.window_len;
+            self.pool.window_len += 1;
+            self.pool.windows[index] = .{};
+            const spec = &self.pool.windows[index];
+            while (true) {
+                if (spec.order_count == config.columns) return error.ColumnCapacity;
+                const item = try self.expression();
+                try self.pool.raise(owner, item);
+                var key: Ast.OrderKey = .{ .expr = item };
+                if (try self.takeWord("DESC")) key.descending = true else _ = try self.takeWord("ASC");
+                if (try self.takeWord("NULLS")) {
+                    if (try self.takeWord("FIRST")) key.nulls_first = true else {
+                        try self.expectWord("LAST");
+                        key.nulls_first = false;
+                    }
+                }
+                spec.order[spec.order_count] = key;
+                spec.order_origin[spec.order_count] = item;
+                spec.order_count += 1;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            self.pool.complex = true;
+            return @intCast(index);
         }
 
         fn windowSpec(self:*Self,owner:u16,allow_bare:bool) Error!u16 {

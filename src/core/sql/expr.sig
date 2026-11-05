@@ -1242,6 +1242,8 @@ pub fn Eval(comptime config: types.Config) type {
                     },
                     .routine => return routineCall(ctx, n),
                     .routine_param => return routineValue(ctx, n),
+                    // Exec.collectAggregate reads its members (B11).
+                    .aggregate_input => return error.UnsupportedStatement,
                     .none => unreachable,
                 },
                 // $n of an EXECUTEd SQL prepared statement (tx-session lane).
