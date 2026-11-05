@@ -168,7 +168,7 @@ fn log2(x: u32) u5 {
 }
 
 /// A double-f32: hi + lo, |lo| <= ulp(hi) / 2.
-const DD = struct { hi: V, lo: V };
+pub const DD = struct { hi: V, lo: V };
 
 /// Kernel text the way these kernels write it: SSA values (a fresh register
 /// each), `set` for what a loop carries.
@@ -187,226 +187,226 @@ pub const Builder = struct {
 
     /// Reserve the xor exchange's shared memory (when `span` threads exceed
     /// a subgroup).
-    fn needExchange(b: *Builder, span: u32) void {
+    pub fn needExchange(b: *Builder, span: u32) void {
         if (span <= b.caps.subgroup or b.xchg != null) return;
         b.xchg = b.k.shared_bytes;
         b.k.shared_bytes += b.threads * 8;
     }
 
-    fn reg(b: *Builder, ty: Ty) V {
+    pub fn reg(b: *Builder, ty: Ty) V {
         return b.k.reg(ty);
     }
 
-    fn emit(b: *Builder, op: Op, ty: Ty, dst: V, a: Arg, x: Arg, c: Arg, aux: u32) void {
+    pub fn emit(b: *Builder, op: Op, ty: Ty, dst: V, a: Arg, x: Arg, c: Arg, aux: u32) void {
         b.k.emit(.{ .op = op, .ty = ty, .dst = dst, .a = a, .b = x, .c = c, .aux = aux });
     }
 
-    fn op1(b: *Builder, op: Op, ty: Ty, a: Arg) V {
+    pub fn op1(b: *Builder, op: Op, ty: Ty, a: Arg) V {
         const d = b.reg(ty);
         b.emit(op, ty, d, a, NO, NO, 0);
         return d;
     }
-    fn op2(b: *Builder, op: Op, ty: Ty, a: Arg, x: Arg) V {
+    pub fn op2(b: *Builder, op: Op, ty: Ty, a: Arg, x: Arg) V {
         const d = b.reg(ty);
         b.emit(op, ty, d, a, x, NO, 0);
         return d;
     }
-    fn op3(b: *Builder, op: Op, ty: Ty, a: Arg, x: Arg, c: Arg) V {
+    pub fn op3(b: *Builder, op: Op, ty: Ty, a: Arg, x: Arg, c: Arg) V {
         const d = b.reg(ty);
         b.emit(op, ty, d, a, x, c, 0);
         return d;
     }
     /// dst = op(a, x, c), dst an existing register (what a loop carries).
-    fn set(b: *Builder, dst: V, op: Op, ty: Ty, a: Arg, x: Arg, c: Arg) void {
+    pub fn set(b: *Builder, dst: V, op: Op, ty: Ty, a: Arg, x: Arg, c: Arg) void {
         b.emit(op, ty, dst, a, x, c, 0);
     }
 
-    fn mov(b: *Builder, ty: Ty, a: Arg) V {
+    pub fn mov(b: *Builder, ty: Ty, a: Arg) V {
         return b.op1(.mov, ty, a);
     }
     /// The same 32 bits as another type.
-    fn as(b: *Builder, ty: Ty, v: V) V {
+    pub fn as(b: *Builder, ty: Ty, v: V) V {
         const have = b.k.tys[@intFromEnum(v)];
         if (have == ty or (isInt(have) and isInt(ty))) return v;
         return b.op1(.mov, ty, R(v));
     }
 
     // integers (u32 unless named)
-    fn add(b: *Builder, a: Arg, x: Arg) V {
+    pub fn add(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.iadd, .u32, a, x);
     }
-    fn sub(b: *Builder, a: Arg, x: Arg) V {
+    pub fn sub(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.isub, .u32, a, x);
     }
-    fn mul(b: *Builder, a: Arg, x: Arg) V {
+    pub fn mul(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.imul, .u32, a, x);
     }
-    fn shl(b: *Builder, a: Arg, n: u32) V {
+    pub fn shl(b: *Builder, a: Arg, n: u32) V {
         if (n == 0) return b.mov(.u32, a);
         return b.op2(.shl, .u32, a, U(n));
     }
-    fn shr(b: *Builder, a: Arg, n: u32) V {
+    pub fn shr(b: *Builder, a: Arg, n: u32) V {
         return b.op2(.shr, .u32, a, U(n));
     }
-    fn band(b: *Builder, a: Arg, x: Arg) V {
+    pub fn band(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.@"and", .u32, a, x);
     }
-    fn bor(b: *Builder, a: Arg, x: Arg) V {
+    pub fn bor(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.@"or", .u32, a, x);
     }
-    fn umin(b: *Builder, a: Arg, x: Arg) V {
+    pub fn umin(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.imin, .u32, a, x);
     }
-    fn umax(b: *Builder, a: Arg, x: Arg) V {
+    pub fn umax(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.imax, .u32, a, x);
     }
-    fn bfeU(b: *Builder, a: Arg, off: Arg, len: u32) V {
+    pub fn bfeU(b: *Builder, a: Arg, off: Arg, len: u32) V {
         return b.op3(.bfe, .u32, a, off, U(len));
     }
-    fn bfeS(b: *Builder, a: Arg, off: Arg, len: u32) V {
+    pub fn bfeS(b: *Builder, a: Arg, off: Arg, len: u32) V {
         return b.op3(.bfe, .i32, a, off, U(len));
     }
-    fn iaddS(b: *Builder, a: Arg, x: Arg) V {
+    pub fn iaddS(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.iadd, .i32, a, x);
     }
-    fn imulS(b: *Builder, a: Arg, x: Arg) V {
+    pub fn imulS(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.imul, .i32, a, x);
     }
-    fn imadS(b: *Builder, a: Arg, x: Arg, c: Arg) V {
+    pub fn imadS(b: *Builder, a: Arg, x: Arg, c: Arg) V {
         return b.op3(.imad, .i32, a, x, c);
     }
-    fn dot4(b: *Builder, kind: kir.Dot4, a: Arg, x: Arg, c: Arg) V {
+    pub fn dot4(b: *Builder, kind: kir.Dot4, a: Arg, x: Arg, c: Arg) V {
         const d = b.reg(.i32);
         b.emit(.dot4, .i32, d, a, x, c, @intFromEnum(kind));
         return d;
     }
 
     // predicates
-    fn icmp(b: *Builder, ty: Ty, c: kir.Cmp, a: Arg, x: Arg) V {
+    pub fn icmp(b: *Builder, ty: Ty, c: kir.Cmp, a: Arg, x: Arg) V {
         const d = b.reg(.pred);
         b.emit(.icmp, ty, d, a, x, NO, @intFromEnum(c));
         return d;
     }
-    fn fcmp(b: *Builder, c: kir.Cmp, a: Arg, x: Arg) V {
+    pub fn fcmp(b: *Builder, c: kir.Cmp, a: Arg, x: Arg) V {
         const d = b.reg(.pred);
         b.emit(.fcmp, .f32, d, a, x, NO, @intFromEnum(c));
         return d;
     }
-    fn pand(b: *Builder, a: V, x: V) V {
+    pub fn pand(b: *Builder, a: V, x: V) V {
         return b.op2(.pand, .pred, R(a), R(x));
     }
     /// p ? a : x
-    fn sel(b: *Builder, ty: Ty, p: V, a: Arg, x: Arg) V {
+    pub fn sel(b: *Builder, ty: Ty, p: V, a: Arg, x: Arg) V {
         return b.op3(.sel, ty, a, x, R(p));
     }
 
     // f32
-    fn fadd(b: *Builder, a: Arg, x: Arg) V {
+    pub fn fadd(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.fadd, .f32, a, x);
     }
-    fn fsub(b: *Builder, a: Arg, x: Arg) V {
+    pub fn fsub(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.fsub, .f32, a, x);
     }
-    fn fmul(b: *Builder, a: Arg, x: Arg) V {
+    pub fn fmul(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.fmul, .f32, a, x);
     }
-    fn fdiv(b: *Builder, a: Arg, x: Arg) V {
+    pub fn fdiv(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.fdiv, .f32, a, x);
     }
-    fn fsqrt(b: *Builder, a: Arg) V {
+    pub fn fsqrt(b: *Builder, a: Arg) V {
         return b.op1(.fsqrt, .f32, a);
     }
-    fn fmax(b: *Builder, a: Arg, x: Arg) V {
+    pub fn fmax(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.fmax, .f32, a, x);
     }
-    fn fmin(b: *Builder, a: Arg, x: Arg) V {
+    pub fn fmin(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.fmin, .f32, a, x);
     }
-    fn fabs(b: *Builder, a: Arg) V {
+    pub fn fabs(b: *Builder, a: Arg) V {
         return b.op1(.fabs, .f32, a);
     }
-    fn fneg(b: *Builder, a: Arg) V {
+    pub fn fneg(b: *Builder, a: Arg) V {
         return b.op1(.fneg, .f32, a);
     }
-    fn frne(b: *Builder, a: Arg) V {
+    pub fn frne(b: *Builder, a: Arg) V {
         return b.op1(.frne, .f32, a);
     }
-    fn cvt(b: *Builder, from: Ty, to: Ty, round: kir.Round, a: Arg) V {
+    pub fn cvt(b: *Builder, from: Ty, to: Ty, round: kir.Round, a: Arg) V {
         const d = b.reg(to);
         b.emit(.cvt, to, d, a, NO, NO, @bitCast(kir.Cvt{ .from = from, .to = to, .round = round }));
         return d;
     }
     /// An integer (|x| < 2^24) as f32.
-    fn i2f(b: *Builder, a: V) V {
+    pub fn i2f(b: *Builder, a: V) V {
         return b.cvt(.i32, .f32, .rne, R(a));
     }
 
     // halves
     /// The f16 in the low (hi = false) or high half of `word`, as f32.
-    fn half(b: *Builder, word: V, hi: bool) V {
+    pub fn half(b: *Builder, word: V, hi: bool) V {
         const bits = if (hi) b.shr(R(word), 16) else b.band(R(word), U(0xffff));
         return b.cvt(.f16, .f32, .rne, R(b.as(.f16, bits)));
     }
     /// x rounded to f16 (nearest even), its 16 bits in a u32.
-    fn halfBits(b: *Builder, x: V) V {
+    pub fn halfBits(b: *Builder, x: V) V {
         const h = b.cvt(.f32, .f16, .rne, R(x));
         return b.band(R(b.as(.u32, h)), U(0xffff));
     }
     /// x rounded through f16 and back.
-    fn f16r(b: *Builder, x: V) V {
+    pub fn f16r(b: *Builder, x: V) V {
         const h = b.cvt(.f32, .f16, .rne, R(x));
         return b.cvt(.f16, .f32, .rne, R(h));
     }
 
     // ids and parameters
-    fn tid(b: *Builder, axis: u32) V {
+    pub fn tid(b: *Builder, axis: u32) V {
         const d = b.reg(.u32);
         b.emit(.tid, .u32, d, NO, NO, NO, axis);
         return d;
     }
-    fn gid(b: *Builder, axis: u32) V {
+    pub fn gid(b: *Builder, axis: u32) V {
         const d = b.reg(.u32);
         b.emit(.gid, .u32, d, NO, NO, NO, axis);
         return d;
     }
-    fn param(b: *Builder, word: u32) V {
+    pub fn param(b: *Builder, word: u32) V {
         const d = b.reg(.u32);
         b.emit(.param, .u32, d, NO, NO, NO, word);
         return d;
     }
 
     // memory
-    fn mem(binding: u8, space: kir.Space, width_log2: u3, signed: bool, imm: u32) u32 {
+    pub fn mem(binding: u8, space: kir.Space, width_log2: u3, signed: bool, imm: u32) u32 {
         return @bitCast(kir.Mem{ .binding = binding, .space = space, .width_log2 = width_log2, .signed = signed, .imm = @intCast(imm) });
     }
     /// One 8, 16 or 32-bit load (zero-extended unless `ty` is i32).
-    fn ld(b: *Builder, binding: u8, ty: Ty, addr: Arg, imm: u32, width_log2: u3) V {
+    pub fn ld(b: *Builder, binding: u8, ty: Ty, addr: Arg, imm: u32, width_log2: u3) V {
         const d = b.reg(ty);
         b.emit(.ld, ty, d, addr, NO, NO, mem(binding, .global, width_log2, ty == .i32 and width_log2 < 5, imm));
         return d;
     }
     /// `n` consecutive 32-bit words (n = 1, 2 or 4) from one load.
-    fn ldv(b: *Builder, binding: u8, ty: Ty, addr: Arg, imm: u32, n: u32) V {
+    pub fn ldv(b: *Builder, binding: u8, ty: Ty, addr: Arg, imm: u32, n: u32) V {
         if (n == 1) return b.ld(binding, ty, addr, imm, 5);
         const d = b.k.vec(ty, @intCast(n));
         b.emit(.ld, ty, d, addr, NO, NO, mem(binding, .global, @intCast(5 + @as(u32, log2(n))), false, imm));
         return d;
     }
-    fn st(b: *Builder, binding: u8, addr: Arg, imm: u32, width_log2: u3, src: V) void {
+    pub fn st(b: *Builder, binding: u8, addr: Arg, imm: u32, width_log2: u3, src: V) void {
         b.emit(.st, b.k.tys[@intFromEnum(src)], .none, addr, R(src), NO, mem(binding, .global, width_log2, false, imm));
     }
-    fn lds(b: *Builder, ty: Ty, addr: Arg, imm: u32, n: u32) V {
+    pub fn lds(b: *Builder, ty: Ty, addr: Arg, imm: u32, n: u32) V {
         const d = if (n == 1) b.reg(ty) else b.k.vec(ty, @intCast(n));
         b.emit(.ld, ty, d, addr, NO, NO, mem(0, .shared, @intCast(5 + @as(u32, log2(n))), false, imm));
         return d;
     }
-    fn sts(b: *Builder, addr: Arg, imm: u32, src: V, n: u32) void {
+    pub fn sts(b: *Builder, addr: Arg, imm: u32, src: V, n: u32) void {
         b.emit(.st, b.k.tys[@intFromEnum(src)], .none, addr, R(src), NO, mem(0, .shared, @intCast(5 + @as(u32, log2(n))), false, imm));
     }
-    fn barrier(b: *Builder) void {
+    pub fn barrier(b: *Builder) void {
         b.emit(.barrier, .u32, .none, NO, NO, NO, 0);
     }
-    fn shfl(b: *Builder, mode: kir.Shfl, v: V, lane_arg: Arg) V {
+    pub fn shfl(b: *Builder, mode: kir.Shfl, v: V, lane_arg: Arg) V {
         const ty = b.k.tys[@intFromEnum(v)];
         const d = b.reg(ty);
         b.emit(.shfl, ty, d, R(v), lane_arg, NO, @intFromEnum(mode));
@@ -414,22 +414,22 @@ pub const Builder = struct {
     }
 
     // structured control flow
-    fn if_(b: *Builder, p: V) void {
+    pub fn if_(b: *Builder, p: V) void {
         b.emit(.@"if", .pred, .none, R(p), NO, NO, 0);
     }
-    fn else_(b: *Builder) void {
+    pub fn else_(b: *Builder) void {
         b.emit(.@"else", .pred, .none, NO, NO, NO, 0);
     }
-    fn endif(b: *Builder) void {
+    pub fn endif(b: *Builder) void {
         b.emit(.endif, .pred, .none, NO, NO, NO, 0);
     }
-    fn loop(b: *Builder) void {
+    pub fn loop(b: *Builder) void {
         b.emit(.loop, .pred, .none, NO, NO, NO, 0);
     }
-    fn brk(b: *Builder, p: V) void {
+    pub fn brk(b: *Builder, p: V) void {
         b.emit(.brk, .pred, .none, R(p), NO, NO, 0);
     }
-    fn endloop(b: *Builder) void {
+    pub fn endloop(b: *Builder) void {
         b.emit(.endloop, .pred, .none, NO, NO, NO, 0);
     }
 
@@ -438,7 +438,7 @@ pub const Builder = struct {
     /// v from the thread `m` apart (tid ^ m) in the workgroup: a shuffle
     /// within a subgroup, else through shared memory. Uniform control flow
     /// only (it may hold a barrier).
-    fn xorPartner(b: *Builder, v: V, m: u32, t: V) V {
+    pub fn xorPartner(b: *Builder, v: V, m: u32, t: V) V {
         if (m < b.caps.subgroup) return b.shfl(.xor, v, U(m));
         const base = b.xchg.?;
         const ty = b.k.tys[@intFromEnum(v)];
@@ -454,14 +454,14 @@ pub const Builder = struct {
     /// v combined over each aligned group of `span` threads by a butterfly
     /// (masks 1, 2, .. span / 2): the same value in every thread when `op`
     /// is commutative.
-    fn xorReduce(b: *Builder, op: Op, ty: Ty, v: V, span: u32, t: V) V {
+    pub fn xorReduce(b: *Builder, op: Op, ty: Ty, v: V, span: u32, t: V) V {
         var acc = v;
         var m: u32 = 1;
         while (m < span) : (m *= 2) acc = b.op2(op, ty, R(acc), R(b.xorPartner(acc, m, t)));
         return acc;
     }
 
-    fn xorReduceDD(b: *Builder, v: DD, span: u32, t: V) DD {
+    pub fn xorReduceDD(b: *Builder, v: DD, span: u32, t: V) DD {
         var acc = v;
         var m: u32 = 1;
         while (m < span) : (m *= 2) acc = b.ddAdd(acc, .{ .hi = b.xorPartner(acc.hi, m, t), .lo = b.xorPartner(acc.lo, m, t) });
@@ -471,7 +471,7 @@ pub const Builder = struct {
     // ── exact arithmetic helpers ──
 
     /// x * x as an exact double-f32 (no overflow: |x| < 2^60).
-    fn square(b: *Builder, x: V) DD {
+    pub fn square(b: *Builder, x: V) DD {
         const p = b.fmul(R(x), R(x));
         if (b.caps.fused_fma) {
             const e = b.op3(.ffma, .f32, R(x), R(x), R(b.fneg(R(p))));
@@ -488,7 +488,7 @@ pub const Builder = struct {
     }
 
     /// a * c's rounding error, exactly (a * c = p + e).
-    fn prodErr(b: *Builder, a: V, c: V, p: V) V {
+    pub fn prodErr(b: *Builder, a: V, c: V, p: V) V {
         if (b.caps.fused_fma) return b.op3(.ffma, .f32, R(a), R(c), R(b.fneg(R(p))));
         const ca = b.fmul(F(4097.0), R(a));
         const ah = b.fsub(R(ca), R(b.fsub(R(ca), R(a))));
@@ -502,7 +502,7 @@ pub const Builder = struct {
         return b.fadd(R(t3), R(b.fmul(R(al), R(cl))));
     }
 
-    fn toReg(b: *Builder, a: Arg) V {
+    pub fn toReg(b: *Builder, a: Arg) V {
         return switch (a) {
             .reg => |v| v,
             .imm => b.mov(.f32, a),
@@ -515,7 +515,7 @@ pub const Builder = struct {
     /// c + its high part by TwoSum, the two low parts added with rounding
     /// to odd, then one rounding to nearest). Exact but for overflow and
     /// underflow; about 35 operations.
-    fn fma(b: *Builder, a: Arg, x: Arg, c: Arg) V {
+    pub fn fma(b: *Builder, a: Arg, x: Arg, c: Arg) V {
         if (b.caps.fused_fma) return b.op3(.ffma, .f32, a, x, c);
         const av = b.toReg(a);
         const xv = b.toReg(x);
@@ -542,7 +542,7 @@ pub const Builder = struct {
 
     /// a + c as a double-f32, symmetric in a and c (the butterfly's
     /// partners get the same bits).
-    fn ddAdd(b: *Builder, a: DD, c: DD) DD {
+    pub fn ddAdd(b: *Builder, a: DD, c: DD) DD {
         const s = b.fadd(R(a.hi), R(c.hi));
         const bb = b.fsub(R(s), R(a.hi));
         const err = b.fadd(R(b.fsub(R(a.hi), R(b.fsub(R(s), R(bb))))), R(b.fsub(R(c.hi), R(bb))));
@@ -551,19 +551,19 @@ pub const Builder = struct {
         return .{ .hi = hi, .lo = b.fsub(R(lo), R(b.fsub(R(hi), R(s)))) };
     }
 
-    fn ddZero(b: *Builder) DD {
+    pub fn ddZero(b: *Builder) DD {
         return .{ .hi = b.mov(.f32, F(0)), .lo = b.mov(.f32, F(0)) };
     }
 
     /// acc += v (loop-carried: acc's registers are written).
-    fn ddAccumulate(b: *Builder, acc: DD, v: DD) void {
+    pub fn ddAccumulate(b: *Builder, acc: DD, v: DD) void {
         const r = b.ddAdd(acc, v);
         b.set(acc.hi, .mov, .f32, R(r.hi), NO, NO);
         b.set(acc.lo, .mov, .f32, R(r.lo), NO, NO);
     }
 
     /// 1 / (hi + lo), correctly rounded but for ties of the pair.
-    fn ddRecip(b: *Builder, s: DD) V {
+    pub fn ddRecip(b: *Builder, s: DD) V {
         const q = b.fdiv(F(1.0), R(s.hi));
         const p = b.fmul(R(q), R(s.hi));
         const e = b.prodErr(q, s.hi, p);
@@ -574,14 +574,14 @@ pub const Builder = struct {
 
     /// RMSNorm's 1 / sqrt(mean + eps) from the row's square sum, as
     /// lfm3_executor.rmsNormRow (mean = sum / n rounded once).
-    fn normInverse(b: *Builder, sum: DD, n: Arg, epsilon: Arg) V {
+    pub fn normInverse(b: *Builder, sum: DD, n: Arg, epsilon: Arg) V {
         const mean = b.ddDiv(sum, n);
         return b.fdiv(F(1.0), R(b.fsqrt(R(b.fadd(R(mean), epsilon)))));
     }
 
     /// (hi + lo) / n rounded once (but for ties of the pair): q = hi / n,
     /// then the remainder hi - q n (exact) + lo divided again.
-    fn ddDiv(b: *Builder, s: DD, n: Arg) V {
+    pub fn ddDiv(b: *Builder, s: DD, n: Arg) V {
         const nv = switch (n) {
             .reg => |v| v,
             .imm => b.mov(.f32, n),
@@ -598,7 +598,7 @@ pub const Builder = struct {
     /// rational step with its division, scalbn), in correctly rounded f32
     /// operations only, so the CPU's bits on every GPU. Branch-free: every
     /// path computed, the right one selected.
-    fn expCpu(b: *Builder, x: V) V {
+    pub fn expCpu(b: *Builder, x: V) V {
         const bits = b.as(.u32, x);
         const sign = b.shr(R(bits), 31);
         const hx = b.band(R(bits), U(0x7fffffff));
@@ -639,12 +639,12 @@ pub const Builder = struct {
     }
 
     /// x / (1 + e^-x), as the CPU's silu (exact division).
-    fn silu(b: *Builder, x: V) V {
+    pub fn silu(b: *Builder, x: V) V {
         return b.fdiv(R(x), R(b.fadd(F(1.0), R(b.expCpu(b.fneg(R(x)))))));
     }
 
     /// 1 / (1 + e^-x).
-    fn sigmoid(b: *Builder, x: V) V {
+    pub fn sigmoid(b: *Builder, x: V) V {
         return b.fdiv(F(1.0), R(b.fadd(F(1.0), R(b.expCpu(b.fneg(R(x)))))));
     }
 };
@@ -1922,7 +1922,7 @@ fn mulAdd(b: *Builder, a: Arg, x: Arg, c: Arg) V {
 }
 
 /// ggml_v_expf (lfm3_audio_ops.expGgml), op for op, branch-free.
-fn expGgml(b: *Builder, x: V) V {
+pub fn expGgml(b: *Builder, x: V) V {
     const r = F(0x1.8p23);
     const z = mulAdd(b, R(x), F(0x1.715476p+0), r);
     const n = b.fsub(R(z), r);
