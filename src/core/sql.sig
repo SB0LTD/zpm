@@ -697,6 +697,8 @@ pub fn Database(comptime config: Config) type {
                 const context:B.Context=.{.source=expanded,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
                     .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only};
                 const bound=try B.bind(&context,&parsed);
+                // Detached reads never mutate: no data-modifying WITH (B11).
+                if(self.workspace.plans.dml_len!=0) return error.UnsupportedStatement;
                 for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
                     .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
                     else=>{},
@@ -810,6 +812,9 @@ pub fn Database(comptime config: Config) type {
         /// Session dialect of the next statement (callers serialize access
         /// and set it per call; Store.Connection does). Not database state.
         dialect: Dialect = .postgres,
+        /// Per transaction: the running statement's data-modifying WITH
+        /// entries (B11), kept across a park so a resume continues them.
+        modifying: [config.transactions]Modifying = @splat(.{}),
         /// Session values of the next statement (TimeZone, clocks); set per
         /// call like `dialect`. Not database state.
         session: value_module.Session = .{},
@@ -1429,6 +1434,7 @@ pub fn Database(comptime config: Config) type {
                 tx.cid +%= 1;
                 tx.progress = 0;
                 tx.progress_affected = 0;
+                self.modifying[slot] = .{};
                 snap = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
                 tx.subs[tx.sub_len] = .{ .statement = true, .write_start = @intCast(tx.write_len), .lock_start = @intCast(tx.lock_len) };
                 tx.sub_len += 1;
@@ -1509,6 +1515,11 @@ pub fn Database(comptime config: Config) type {
                     for (plans.items[0..plans.len]) |*plan| {
                         for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| try self.lockTable(slot, table, .access_share);
                     }
+                    defer {
+                        self.workspace.query.pinned_cells = 0;
+                        self.workspace.query.pinned_refs = 0;
+                    }
+                    if (plans.dml_len != 0) try self.modifyingCtes(slot, source, snap);
                     return X.runQuery(&self.tables, source, &self.workspace.nodes, plans, root, snap, result, &self.session, &self.workspace.query, self.txs[slot].write_len == 0);
                 },
                 else => {},
@@ -1594,6 +1605,104 @@ pub fn Database(comptime config: Config) type {
                 .delete => |*delete| if (delete.returning.count != 0) try self.returnRows(slot, source, &delete.returning, delete.table, true, result.rows.len),
                 else => {},
             }
+        }
+
+        /// Data-modifying WITH entries (B11): each runs exactly once, in
+        /// statement order, under the statement snapshot (so neither the
+        /// other entries nor the main query see its writes), with its
+        /// table's row-exclusive lock and the usual row locks / waits. Its
+        /// RETURNING rows are captured from its own slice of the write set
+        /// into the pinned top of the workspace for the main query. A park
+        /// keeps each entry's write-slice start and INSERT progress, so a
+        /// resumed statement neither repeats nor loses writes. Every write is
+        /// part of the statement subtransaction: any later failure undoes all.
+        const Modifying = struct {
+            started: [config.ctes]bool = @splat(false),
+            start: [config.ctes]usize = @splat(0),
+            progress: [config.ctes]usize = @splat(0),
+            affected: [config.ctes]usize = @splat(0),
+        };
+
+        fn modifyingCtes(self: *Self, slot: u16, source: []const u8, snap: Snapshot) Error!void {
+            const plans = &self.workspace.plans;
+            const work = &self.workspace.query;
+            work.pinned_cells = 0;
+            work.pinned_refs = 0;
+            const state = &self.modifying[slot];
+            const tx = &self.txs[slot];
+            for (plans.dml[0..plans.dml_len], 0..) |*dml, k| {
+                if (!state.started[k]) {
+                    state.started[k] = true;
+                    state.start[k] = tx.write_len;
+                }
+                tx.progress = state.progress[k];
+                tx.progress_affected = state.affected[k];
+                const table_index: usize, const returning: *const B.Returning = switch (dml.*) {
+                    .insert => |*insert| .{ insert.table, &insert.returning },
+                    .update => |*update| .{ update.table, &update.returning },
+                    .delete => |*delete| .{ delete.table, &delete.returning },
+                };
+                self.runModifying(slot, source, dml, snap) catch |err| {
+                    state.progress[k] = tx.progress;
+                    state.affected[k] = tx.progress_affected;
+                    return err;
+                };
+                state.progress[k] = tx.progress;
+                state.affected[k] = tx.progress_affected;
+                const last = if (k + 1 < plans.dml_len and state.started[k + 1]) state.start[k + 1] else tx.write_len;
+                work.dml_rows[k] = try self.captureReturning(source, returning, table_index, state.start[k], last, slot);
+            }
+            tx.progress = 0;
+            tx.progress_affected = 0;
+        }
+
+        fn runModifying(self: *Self, slot: u16, source: []const u8, dml: *const B.DmlBound, snap: Snapshot) Error!void {
+            switch (dml.*) {
+                .insert => |*insert| {
+                    try self.lockTable(slot, insert.table, .row_exclusive);
+                    _ = try self.insertRows(slot, source, insert, snap);
+                },
+                .update => |*update| {
+                    try self.lockTable(slot, update.table, .row_exclusive);
+                    _ = try self.updateRows(slot, source, update, snap);
+                },
+                .delete => |*delete| {
+                    try self.lockTable(slot, delete.table, .row_exclusive);
+                    _ = try self.deleteRows(slot, source, delete, snap);
+                },
+            }
+        }
+
+        /// RETURNING of the rows `table_index` got from writes first..last,
+        /// in write order, into the pinned top of the query workspace.
+        fn captureReturning(self: *Self, source: []const u8, list: *const B.Returning, table_index: usize, first: usize, last: usize, slot: u16) Error!X.List {
+            const tx = &self.txs[slot];
+            const writes = tx.writes[first..last];
+            var count: usize = 0;
+            for (writes) |entry| if (rowWrite(entry.kind) and entry.table == table_index) {
+                count += 1;
+            };
+            const work = &self.workspace.query;
+            const width = list.count;
+            if ((work.cell_high - work.cell_low) / @max(width, 1) < count or work.ref_high - work.ref_low < count) return error.WorkspaceCapacity;
+            work.cell_high -= count * width;
+            work.ref_high -= count;
+            const out: X.List = .{ .start = @intCast(work.ref_high), .count = @intCast(count) };
+            var ctx = self.evalContext(source);
+            const table = &self.tables[table_index];
+            var row: usize = 0;
+            for (writes) |entry| {
+                if (!rowWrite(entry.kind) or entry.table != table_index) continue;
+                try self.session.checkpoint();
+                ctx.row = &table.versions[if (entry.kind == .delete) entry.old else entry.new].cells;
+                const at = work.cell_high + row * width;
+                for (list.targets[0..width], 0..) |id, column| work.cells[at + column] = try E.eval(&ctx, id);
+                work.refs[out.start + row] = @intCast(at);
+                row += 1;
+            }
+            work.pinned_cells = work.cells.len - work.cell_high;
+            work.pinned_refs = work.refs.len - work.ref_high;
+            return out;
         }
 
         /// RETURNING: one row per row this statement wrote, in write order

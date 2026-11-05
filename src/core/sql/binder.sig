@@ -320,6 +320,9 @@ pub fn Binder(comptime config: types.Config) type {
             planning_plan:?*const Plan=null,
             constant_dependencies:?*[config.ctes]bool=null,
             describe_only:bool=false,
+            /// Binding a data-modifying WITH entry (B11): plans of the
+            /// enclosing statement stay in place.
+            nested_dml: bool = false,
 
             fn node(self: *const Context, id: u16) *ast.Node {
                 return &self.pool.nodes[id];
@@ -346,7 +349,7 @@ pub fn Binder(comptime config: types.Config) type {
         };
 
         /// USING column merged from the relations joined before `right`.
-        const Using = struct { ident: ast.Ident, left: u8, left_column: u16, right: u8, right_column: u16, join: ast.JoinKind };
+        const Using = struct { name: V.Name, left: u8, left_column: u16, right: u8, right_column: u16, join: ast.JoinKind, item: u8 = 0 };
 
         /// CTE names visible to a query block (innermost WITH first).
         const CteEnv = struct {
@@ -358,6 +361,11 @@ pub fn Binder(comptime config: types.Config) type {
         const Scope = struct {
             rels: [config.relations]Relation = undefined,
             rel_count: usize = 0,
+            /// First visible FROM item: a parenthesized join operand's ON
+            /// and LATERAL items see only the items of their own group.
+            rel_first: usize = 0,
+            /// A plain ORDER BY column may name a SEARCH sequence column.
+            search_order: bool = false,
             using: [config.columns]Using = undefined,
             using_count: usize = 0,
             /// Enclosing query block (correlated column references).
@@ -389,6 +397,17 @@ pub fn Binder(comptime config: types.Config) type {
             /// Expression over earlier items equal to this table's primary
             /// key (nested-loop index probe), or none.
             probe: u16 = none,
+            // Query composition (B11).
+            /// A LATERAL derived table / table function, re-run per left row.
+            lateral: bool = false,
+            /// This item starts a parenthesized right operand ending at item
+            /// group_end; its `on` joins the whole operand.
+            group_end: u16 = none,
+            /// TABLESAMPLE on this table (1 BERNOULLI, 2 SYSTEM): the float4
+            /// percentage and float8 REPEATABLE seed expressions (B11).
+            sample_method: u8 = 0,
+            sample_percent: u16 = none,
+            sample_seed: u16 = none,
         };
 
         pub const Window=struct {
@@ -405,6 +424,10 @@ pub fn Binder(comptime config: types.Config) type {
         };
 
         pub const Distinct = enum { none, all, on };
+
+        /// generate_series result family; `none` is a scalar function in
+        /// FROM (one row).
+        pub const Series = enum { none, integer, numeric, timestamp };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -458,6 +481,34 @@ pub fn Binder(comptime config: types.Config) type {
             offset: u64 = 0,
             /// References a column of an enclosing block (re-run per row).
             correlated: bool = false,
+            // Query composition (B11).
+            /// LATERAL items or parenthesized right operands: the nested-loop
+            /// join tree runs in Exec.joinGeneral (no probes, no fast paths).
+            general_join: bool = false,
+            /// Standalone VALUES rows (values_row nodes linked by `next`),
+            /// each item already converted to its column's common type.
+            values: u16 = none,
+            /// LIMIT / OFFSET count expressions evaluated once per execution
+            /// (Exec.resolveCounts); constant ones are folded into limit/offset.
+            limit_expr: u16 = none,
+            offset_expr: u16 = none,
+            /// FETCH FIRST n ROWS WITH TIES: `limit` stays unbounded (so no
+            /// early-stop path cuts peers); finish keeps ties_limit rows and
+            /// every following row equal on the ORDER BY keys tie_keys.
+            /// GROUPING SETS / CUBE / composite ROLLUP: int_literal nodes
+            /// linked by `next`, each a bit mask over `keys` (Exec.groupingSets).
+            grouping_sets: u16 = none,
+            /// Function in FROM: the bound call node, its row generator and
+            /// WITH ORDINALITY (Exec.tableFunction).
+            function: u16 = none,
+            series: Series = .none,
+            ordinality: bool = false,
+            /// The RETURNING rows of data-modifying WITH entry `dml` (B11).
+            dml: u8 = no_dml,
+            with_ties: bool = false,
+            ties_limit: u64 = 0xffffffffffffffff,
+            tie_keys: [config.columns]SortKey = undefined,
+            tie_key_count: usize = 0,
         };
 
         pub const CteDef = struct {
@@ -468,7 +519,36 @@ pub fn Binder(comptime config: types.Config) type {
             recursive: bool = false,
             referenced: bool = false,
             references:usize=0,
+            // SEARCH / CYCLE (B11): columns appended after the `user_columns`
+            // output columns of the recursive UNION plan (Exec.searchCycleCte).
+            search: bool = false,
+            breadth: bool = false,
+            search_columns: [config.columns]u16 = undefined,
+            search_count: usize = 0,
+            cycle: bool = false,
+            cycle_columns: [config.columns]u16 = undefined,
+            cycle_count: usize = 0,
+            user_columns: usize = 0,
+            /// The sequence column: an opaque order-preserving key (text),
+            /// usable only as a plain ORDER BY item.
+            ord_column: u16 = none,
+            mark_column: u16 = none,
+            /// The path column: an opaque link to the parent row.
+            path_column: u16 = none,
+            /// Hidden: the row's own workspace handle (never visible).
+            self_column: u16 = none,
+            mark_value: V.Cell = .null_value,
+            mark_default: V.Cell = .null_value,
+            /// Data-modifying entry (B11): index into Plans.dml, and whether
+            /// it has RETURNING (needed to read it).
+            dml: u8 = no_dml,
+            returning: bool = false,
         };
+
+        pub const no_dml: u8 = 0xff;
+
+        /// The bound statement of a data-modifying WITH entry.
+        pub const DmlBound = union(enum) { insert: Insert, update: Update, delete: Delete };
 
         /// Statement-scoped plans (inside Database.workspace).
         pub const Plans = struct {
@@ -476,10 +556,14 @@ pub fn Binder(comptime config: types.Config) type {
             len: usize = 0,
             ctes: [config.ctes]CteDef = undefined,
             cte_len: usize = 0,
+            /// Data-modifying WITH entries in statement order (B11).
+            dml: [config.ctes]DmlBound = undefined,
+            dml_len: usize = 0,
 
             pub fn reset(self: *Plans) void {
                 self.len = 0;
                 self.cte_len = 0;
+                self.dml_len = 0;
             }
 
             fn add(self: *Plans) Error!u16 {
@@ -3764,7 +3848,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// type (PostgreSQL does not resolve unknowns in an INSERT's SELECT).
         fn bindInsertQuery(context: *const Context, entry: *const S.Table, query_index: u16, out: *Insert, overriding: ast.Overriding) Error!void {
             const plans = context.plans orelse return error.UnsupportedStatement;
-            plans.reset();
+            if (!context.nested_dml) plans.reset();
             const root = try bindPlan(context, query_index, null, null, true);
             const p = &plans.items[root];
             if (p.count != out.count) return error.Syntax;
@@ -3918,7 +4002,21 @@ pub fn Binder(comptime config: types.Config) type {
                     const head = try convertList(context, left, target);
                     n.* = .{ .kind = .coalesce, .b = head, .ty = target, .next = next, .name = name, .depth = 3 };
                 },
-                else => bindColumn(context, scope, n, owner, level, entry.left, entry.left_column),
+                else => {
+                    // PostgreSQL types the merged column with the operands'
+                    // common type (buildMergedJoinVar): int4 USING int8 is int8.
+                    const right = entry.join == .right;
+                    bindColumn(context, scope, n, owner, level, if (right) entry.right else entry.left, if (right) entry.right_column else entry.left_column);
+                    const other = relationColumnType(context, &owner.rels[if (right) entry.left else entry.right], if (right) entry.left_column else entry.right_column);
+                    const target = value.common(n.ty, other) orelse return;
+                    if (target == n.ty) return;
+                    const next = n.next;
+                    const column = try context.pool.add(n.*);
+                    context.node(column).next = none;
+                    const converted = try convert(context, column, target, -1, .implicit);
+                    n.* = context.node(converted).*;
+                    n.next = next;
+                },
             }
         }
 
@@ -3936,9 +4034,10 @@ pub fn Binder(comptime config: types.Config) type {
                     level += 1;
                 }
                 if (qualifier) |q| {
-                    for (s.rels[0..s.rel_count], 0..) |*rel, index| {
+                    for (s.rels[s.rel_first..s.rel_count], s.rel_first..) |*rel, index| {
                         if (!types.same(rel.name.slice(), q.slice())) continue;
                         const column = findColumn(context, rel, wanted.slice()) orelse return error.ColumnNotFound;
+                        try opaqueColumn(context, scope, rel, column);
                         return bindColumn(context, scope, n, s, level, index, column);
                     }
                     continue;
@@ -3947,18 +4046,32 @@ pub fn Binder(comptime config: types.Config) type {
                 while (position != 0) {
                     position -= 1;
                     const entry = &s.using[position];
-                    const name = toName(context, entry.ident);
-                    if (types.same(name.slice(), wanted.slice())) return bindUsing(context, scope, n, s, level, entry);
+                    if (entry.right < s.rel_first) continue;
+                    if (types.same(entry.name.slice(), wanted.slice())) return bindUsing(context, scope, n, s, level, entry);
                 }
                 var found: ?[2]usize = null;
-                for (s.rels[0..s.rel_count], 0..) |*rel, index| {
+                for (s.rels[s.rel_first..s.rel_count], s.rel_first..) |*rel, index| {
                     const column = findColumn(context, rel, wanted.slice()) orelse continue;
                     if (found != null) return error.AmbiguousColumn;
                     found = .{ index, column };
                 }
-                if (found) |hit| return bindColumn(context, scope, n, s, level, hit[0], hit[1]);
+                if (found) |hit| {
+                    try opaqueColumn(context, scope, &s.rels[hit[0]], hit[1]);
+                    return bindColumn(context, scope, n, s, level, hit[0], hit[1]);
+                }
             }
             return if (qualifier != null) error.TableNotFound else error.ColumnNotFound;
+        }
+
+        /// SEARCH sequence and CYCLE path columns have record-array types in
+        /// PostgreSQL; here they are opaque (0A000) except a plain ORDER BY
+        /// of the sequence column, which sorts by its order-preserving key.
+        fn opaqueColumn(context: *const Context, scope: *const Scope, rel: *const Relation, column: usize) Error!void {
+            if (rel.cte == no_cte) return;
+            const def = &plansOf(context).ctes[rel.cte];
+            if (!def.search and !def.cycle) return;
+            if (column == def.path_column or column == def.self_column) return error.UnsupportedStatement;
+            if (column == def.ord_column and !scope.search_order) return error.UnsupportedStatement;
         }
 
         fn typeSubquery(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
@@ -4042,12 +4155,120 @@ pub fn Binder(comptime config: types.Config) type {
                 for (q.ctes[0..q.cte_count]) |*cte| try bindCte(context, q, cte, parent, &local);
                 visible = &local;
             }
+            if (q.values != none) return bindValuesBlock(context, q, parent, visible);
             if (q.set_op != .none) {
                 const id = try bindSetOp(context, q, parent, visible);
                 if (!branch) try resolveUnknown(context, id);
                 return id;
             }
             return bindCore(context, q, parent, visible, branch);
+        }
+
+        /// `columnN`, PostgreSQL's VALUES output column name.
+        fn valuesName(number: usize) Error!V.Name {
+            var digits: [20]u8 = undefined;
+            var used: usize = 0;
+            var rest = number;
+            while (true) {
+                digits[used] = @intCast('0' + rest % 10);
+                used += 1;
+                rest /= 10;
+                if (rest == 0) break;
+            }
+            var name: V.Name = .{};
+            const prefix = "column";
+            if (prefix.len + used > name.bytes.len) return error.NameCapacity;
+            @memcpy(name.bytes[0..prefix.len], prefix);
+            for (0..used) |index| name.bytes[prefix.len + index] = digits[used - 1 - index];
+            name.len = prefix.len + used;
+            return name;
+        }
+
+        /// A VALUES block (PostgreSQL transformValuesClause): every column
+        /// takes the common type of its items (text when all are untyped)
+        /// and is named columnN. Items may be correlated; aggregates and
+        /// window calls are not allowed (42803 / 42P20). ORDER BY names
+        /// output columns or positions.
+        fn bindValuesBlock(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv) Error!u16 {
+            const plans = plansOf(context);
+            const id = try plans.add();
+            var scope: Scope = .{ .parent = parent, .plan = id, .ctes = env };
+            const width = q.count;
+            var targets: [config.columns]ast.Type = @splat(.unknown);
+            var typmods: [config.columns]i32 = @splat(-1);
+            var row = q.values;
+            var first = true;
+            while (row != none) : (row = context.node(row).next) {
+                var item = context.node(row).b;
+                var column: usize = 0;
+                while (item != none) : (item = context.node(item).next) {
+                    try typeExpr(context, &scope, item);
+                    const ty = context.node(item).ty;
+                    try unifyInto(&targets[column], ty);
+                    const typmod = outputTypmod(context, item);
+                    if (first) typmods[column] = typmod else if (typmods[column] != typmod) typmods[column] = -1;
+                    column += 1;
+                }
+                first = false;
+            }
+            const p = &plans.items[id];
+            p.values = q.values;
+            row = q.values;
+            while (row != none) : (row = context.node(row).next) {
+                var previous: u16 = none;
+                var item = context.node(row).b;
+                var column: usize = 0;
+                while (item != none) {
+                    const next = context.node(item).next;
+                    if (targets[column] == .unknown) targets[column] = .text;
+                    const target = targets[column];
+                    const ty = context.node(item).ty;
+                    var converted = item;
+                    if (ty == .unknown) {
+                        try coerce(context, item, target);
+                        typmods[column] = -1;
+                    } else if (ty != target) {
+                        typmods[column] = -1;
+                        if (!(value.integral(ty) and value.integral(target))) converted = try convert(context, item, target, -1, .implicit);
+                    }
+                    context.node(converted).next = next;
+                    if (previous == none) context.node(row).b = converted else context.node(previous).next = converted;
+                    if (column == 0) p.targets[0] = converted;
+                    previous = converted;
+                    item = next;
+                    column += 1;
+                }
+            }
+            p.count = width;
+            p.width = width;
+            for (0..width) |column| {
+                p.names[column] = try valuesName(column + 1);
+                p.tys[column] = targets[column];
+                p.typmods[column] = typmods[column];
+            }
+            for (q.order[0..q.order_count]) |*key| {
+                const n = context.node(key.expr);
+                var column: ?usize = null;
+                if (n.kind == .int_literal) {
+                    if (n.integer < 1 or n.integer > width) return error.InvalidColumnReference;
+                    column = @intCast(n.integer - 1);
+                } else if (n.kind == .column and n.qualifier.len == 0 and !n.star) {
+                    const wanted = toName(context, n.name);
+                    for (p.names[0..width], 0..) |*name, index| if (types.same(name.slice(), wanted.slice())) {
+                        column = index;
+                        break;
+                    };
+                    if (column == null) return error.ColumnNotFound;
+                }
+                const index = column orelse return error.UnsupportedStatement;
+                try sortableType(p.tys[index]);
+                p.order[p.order_count] = .{ .column = @intCast(index), .descending = key.descending, .nulls_first = nullsFirst(key) };
+                p.order_count += 1;
+            }
+            try checkCounts(q, p);
+            try bindCounts(context, &scope, q, p);
+            bindTies(q, p, p.order[0..p.order_count]);
+            return id;
         }
 
         fn applyAliases(context: *const Context, plan_id: u16, cte: *const Ast.Cte) Error!void {
@@ -4068,6 +4289,13 @@ pub fn Binder(comptime config: types.Config) type {
             const id: u8 = @intCast(plans.cte_len);
             plans.cte_len += 1;
             plans.ctes[id] = .{ .name = name };
+            if (cte.dml != .none) {
+                if (cte.search.present or cte.cycle.present) return error.Syntax;
+                try bindModifyingCte(context, cte, id);
+                local.ids[local.count] = id;
+                local.count += 1;
+                return;
+            }
             const body = &context.pool.queries[cte.query];
             if (q.recursive and body.set_op == .@"union" and body.cte_count == 0) {
                 if (body.order_count != 0 or body.limit != 0xffffffffffffffff or body.offset != 0) return error.UnsupportedStatement;
@@ -4105,13 +4333,200 @@ pub fn Binder(comptime config: types.Config) type {
                 }
                 p.correlated = l.correlated or r.correlated;
                 if (!plans.ctes[id].referenced) plans.ctes[id].recursive = false;
+                if (cte.search.present or cte.cycle.present) {
+                    // PostgreSQL: WITH query is not recursive (42601).
+                    if (!plans.ctes[id].recursive) return error.Syntax;
+                    try bindSearchCycle(context, cte, id, plan_id);
+                }
             } else {
+                if (cte.search.present or cte.cycle.present) return error.Syntax;
                 const plan_id = try bindPlan(context, cte.query, parent, local, false);
                 try applyAliases(context, plan_id, cte);
                 plans.ctes[id].plan = plan_id;
             }
             local.ids[local.count] = id;
             local.count += 1;
+        }
+
+        /// A data-modifying WITH entry (B11): its INSERT / UPDATE / DELETE is
+        /// parsed again from its offset and bound like the statement; the
+        /// CTE reads its RETURNING rows, which the Database captures when it
+        /// runs every entry once, before the main query, under the same
+        /// snapshot (Database.modifyingCtes). Reading an entry without
+        /// RETURNING is 0A000.
+        fn bindModifyingCte(context: *const Context, cte: *const Ast.Cte, id: u8) Error!void {
+            const plans = plansOf(context);
+            if (plans.dml_len == config.ctes) return error.StatementTooComplex;
+            const statement = try P.parseNested(context.source, cte.dml_start, context.pool);
+            var nested = context.*;
+            nested.nested_dml = true;
+            const bound = try bindStatement(&nested, &statement);
+            const k = plans.dml_len;
+            plans.dml[k] = switch (bound) {
+                .insert => |insert| .{ .insert = insert },
+                .update => |update| .{ .update = update },
+                .delete => |delete| .{ .delete = delete },
+                else => return error.UnsupportedStatement,
+            };
+            plans.dml_len += 1;
+            const returning: *const Returning = switch (plans.dml[k]) {
+                .insert => |*insert| &insert.returning,
+                .update => |*update| &update.returning,
+                .delete => |*delete| &delete.returning,
+            };
+            const plan_id = try plans.add();
+            const p = &plans.items[plan_id];
+            p.dml = @intCast(k);
+            for (0..returning.count) |column| {
+                const ty = types.typeOfData(returning.types[column]);
+                p.targets[column] = try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
+                p.names[column] = returning.names[column];
+                p.tys[column] = ty;
+                p.typmods[column] = returning.typmods[column];
+            }
+            p.count = returning.count;
+            p.width = p.count;
+            try applyAliases(context, plan_id, cte);
+            plans.ctes[id].plan = plan_id;
+            plans.ctes[id].dml = @intCast(k);
+            plans.ctes[id].returning = returning.count != 0;
+        }
+
+        /// The output column of `p` named by `node` (a name-only column node).
+        fn listedColumn(context: *const Context, p: *const Plan, count: usize, node: u16) Error!u16 {
+            const wanted = toName(context, context.node(node).name);
+            for (p.names[0..count], 0..) |*name, index| if (types.same(name.slice(), wanted.slice())) return @intCast(index);
+            // PostgreSQL: search/cycle column not in WITH query column list.
+            return error.Syntax;
+        }
+
+        fn searchListed(context: *const Context, p: *const Plan, count: usize, head: u16, out: *[config.columns]u16, used: *usize) Error!void {
+            var node = head;
+            while (node != none) : (node = context.node(node).next) {
+                const column = try listedColumn(context, p, count, node);
+                for (out[0..used.*]) |other| if (other == column) return error.DuplicateColumn;
+                if (used.* == config.columns) return error.ColumnCapacity;
+                out[used.*] = column;
+                used.* += 1;
+            }
+        }
+
+        fn appendColumn(context: *const Context, p: *Plan, target: u16, name: V.Name, ty: ast.Type) Error!void {
+            if (p.count == config.columns) return error.ColumnCapacity;
+            p.targets[p.count] = target;
+            p.names[p.count] = name;
+            p.tys[p.count] = ty;
+            p.typmods[p.count] = -1;
+            p.count += 1;
+            p.width = p.count;
+            _ = context;
+        }
+
+        /// SEARCH / CYCLE (PostgreSQL rewriteSearchAndCycle, B11). The CTE
+        /// rows gain [sequence] [mark, path] and a hidden self handle; the
+        /// non-recursive term emits placeholders, the recursive term emits
+        /// placeholders plus its working-table row's handle as the path
+        /// link. The executor fills sequence keys and cycle marks and never
+        /// expands a cycle-marked row. Names must be distinct from the CTE
+        /// columns and each other (42601); listed columns must exist (42601)
+        /// once (42701); TO / DEFAULT need a common type (42804). Both terms
+        /// must be plain SELECTs; the recursive one reads the CTE once
+        /// without grouping, DISTINCT, ORDER BY or windows (0A000).
+        fn bindSearchCycle(context: *const Context, cte: *const Ast.Cte, id: u8, plan_id: u16) Error!void {
+            const plans = plansOf(context);
+            const def = &plans.ctes[id];
+            const p = &plans.items[plan_id];
+            const user = p.count;
+            def.user_columns = user;
+            var names: [3]V.Name = undefined;
+            var name_count: usize = 0;
+            if (cte.search.present) {
+                try searchListed(context, p, user, cte.search.columns, &def.search_columns, &def.search_count);
+                for (def.search_columns[0..def.search_count]) |column| switch (p.tys[column]) {
+                    .int2, .int4, .int8, .boolean, .text, .date, .timestamp, .timestamptz => {},
+                    else => return error.UnsupportedStatement,
+                };
+                names[name_count] = toName(context, cte.search.set);
+                name_count += 1;
+                def.search = true;
+                def.breadth = cte.search.breadth;
+            }
+            var mark_ty: ast.Type = .boolean;
+            if (cte.cycle.present) {
+                try searchListed(context, p, user, cte.cycle.columns, &def.cycle_columns, &def.cycle_count);
+                for (def.cycle_columns[0..def.cycle_count]) |column| if (p.tys[column] == .json) return error.UndefinedFunction;
+                names[name_count] = toName(context, cte.cycle.mark);
+                names[name_count + 1] = toName(context, cte.cycle.path);
+                name_count += 2;
+                def.cycle = true;
+                if (cte.cycle.mark_value != none) {
+                    const marks = [2]u16{ cte.cycle.mark_value, cte.cycle.mark_default };
+                    var scope: Scope = .{};
+                    var common: ast.Type = .unknown;
+                    for (marks) |mark| {
+                        try typeExpr(context, &scope, mark);
+                        // PostgreSQL: CYCLE types %s and %s cannot be matched.
+                        try unifyInto(&common, context.node(mark).ty);
+                    }
+                    if (common == .unknown) common = .text;
+                    for (marks) |mark| if (context.node(mark).ty == .unknown) try coerce(context, mark, common);
+                    for (marks, 0..) |mark, index| {
+                        const typed = if (context.node(mark).ty != common and !(value.integral(context.node(mark).ty) and value.integral(common))) try convert(context, mark, common, -1, .implicit) else mark;
+                        const cell = try generatedValue(context, typed);
+                        if (index == 0) def.mark_value = cell else def.mark_default = cell;
+                    }
+                    mark_ty = common;
+                } else {
+                    def.mark_value = .{ .boolean = true };
+                    def.mark_default = .{ .boolean = false };
+                }
+            }
+            for (names[0..name_count], 0..) |*name, index| {
+                for (p.names[0..user]) |*column| if (types.same(column.slice(), name.slice())) return error.Syntax;
+                for (names[0..index]) |*other| if (types.same(other.slice(), name.slice())) return error.Syntax;
+            }
+            const left = &plans.items[p.left];
+            const right = &plans.items[p.right];
+            if (left.set_op != .none or left.values != none or left.function != none or left.window_count != 0 or left.width != left.count) return error.UnsupportedStatement;
+            if (right.set_op != .none or right.grouped or right.distinct != .none or right.order_count != 0 or right.window_count != 0 or right.width != right.count or right.general_join) return error.UnsupportedStatement;
+            var reference: ?usize = null;
+            for (right.sources[0..right.source_count], 0..) |source, index| if (source.cte == id) {
+                if (reference != null) return error.UnsupportedStatement;
+                reference = index;
+            };
+            const working = reference orelse return error.UnsupportedStatement;
+            // Without CYCLE the parent link is a hidden column too.
+            var hidden_parent: V.Name = .{ .len = 7 };
+            @memcpy(hidden_parent.bytes[0..7], "\x00parent");
+            var hidden_self: V.Name = .{ .len = 5 };
+            @memcpy(hidden_self.bytes[0..5], "\x00self");
+            if (!def.cycle) {
+                names[name_count] = hidden_parent;
+                name_count += 1;
+            }
+            if (user + name_count + 1 > config.columns) return error.ColumnCapacity;
+            // Final positions: user columns, then the extras in order.
+            var position: u16 = @intCast(user);
+            if (def.search) {
+                def.ord_column = position;
+                position += 1;
+            }
+            if (def.cycle) {
+                def.mark_column = position;
+                position += 1;
+            }
+            def.path_column = position;
+            def.self_column = position + 1;
+            var extra: usize = 0;
+            while (extra <= name_count) : (extra += 1) {
+                const column: u16 = @intCast(user + extra);
+                const ty: ast.Type = if (column == def.ord_column) .text else if (column == def.mark_column) mark_ty else .int8;
+                const name = if (extra < name_count) names[extra] else hidden_self;
+                try appendColumn(context, p, none, name, ty);
+                try appendColumn(context, left, try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true }), name, ty);
+                const link = if (column == def.path_column) try context.pool.add(.{ .kind = .column, .relation = @intCast(working), .column = def.self_column, .ty = .int8 }) else try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
+                try appendColumn(context, right, link, name, ty);
+            }
         }
 
         fn nullsFirst(key: *const Ast.OrderKey) bool {
@@ -4123,6 +4538,136 @@ pub fn Binder(comptime config: types.Config) type {
             p.offset = q.offset;
             if (q.negative_offset) return error.InvalidRowCountInResultOffset;
             if (q.negative_limit) return error.InvalidRowCountInLimit;
+        }
+
+        /// LIMIT / OFFSET expressions (PostgreSQL transformLimitClause): no
+        /// column of this query level (42P10), no aggregate (42803) or window
+        /// call (42P20); the value is bigint through implicit coercion only
+        /// (42804). Constants fold now (negative: 2201W / 2201X, NULL: no
+        /// limit / zero offset); the rest is evaluated at execution.
+        fn bindCounts(context: *const Context, scope: *Scope, q: *const Ast.Select, p: *Plan) Error!void {
+            for ([_]u16{ q.offset_expr, q.limit_expr }, 0..) |id, position| {
+                if (id == none) continue;
+                const is_limit = position == 1;
+                var inner = scope.*;
+                inner.aggregates = false;
+                inner.windows = false;
+                inner.saw_aggregate = null;
+                try typeExpr(context, &inner, id);
+                if (referencesLevel(context, id, 0)) return error.InvalidColumnReference;
+                // A correlated sublink would need this level's row (0A000).
+                if (correlatedSublink(context, id)) return error.UnsupportedStatement;
+                const ty = context.node(id).ty;
+                if (ty == .unknown) {
+                    try coerce(context, id, .int8);
+                } else if (!value.integral(ty)) return error.TypeMismatch;
+                if (try foldableScalar(context, id)) {
+                    const cell = try generatedValue(context, id);
+                    // ExecLimit: row count cannot be null in FETCH ... WITH TIES.
+                    if (is_limit and q.with_ties and cell == .null_value) return error.InvalidRowCountInLimit;
+                    if (is_limit) {
+                        if (cell == .null_value) p.limit = 0xffffffffffffffff else if (cell.integer < 0) return error.InvalidRowCountInLimit else p.limit = @intCast(cell.integer);
+                    } else {
+                        if (cell == .null_value) p.offset = 0 else if (cell.integer < 0) return error.InvalidRowCountInResultOffset else p.offset = @intCast(cell.integer);
+                    }
+                    continue;
+                }
+                // Window demand is planned against a known LIMIT.
+                if (p.window_count != 0) return error.UnsupportedStatement;
+                if (is_limit) p.limit_expr = id else p.offset_expr = id;
+            }
+        }
+
+        fn correlatedSublink(context: *const Context, id: u16) bool {
+            if (id == none) return false;
+            const n = context.node(id);
+            if (n.kind == .scalar_subquery or n.kind == .exists_subquery or n.kind == .in_subquery) {
+                if (plansOf(context).items[@intCast(n.integer)].correlated) return true;
+            }
+            if (correlatedSublink(context, n.a) or correlatedSublink(context, n.c)) return true;
+            if (listOwner(n.kind)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) if (correlatedSublink(context, item)) return true;
+                return false;
+            }
+            return correlatedSublink(context, n.b);
+        }
+
+        /// GROUPING SETS (B11): equal key expressions share one key, so a
+        /// key is NULL exactly in the sets that omit it; the masks are
+        /// rewritten in place over the deduplicated keys. GROUP BY DISTINCT
+        /// drops repeated sets (PostgreSQL keeps repeats otherwise).
+        fn bindGroupingSets(context: *const Context, q: *const Ast.Select, p: *Plan) Error!void {
+            var canonical: [64]u6 = undefined;
+            var kept: usize = 0;
+            var unique: [config.columns]u16 = undefined;
+            if (p.key_count > 64) return error.StatementTooComplex;
+            for (p.keys[0..p.key_count], 0..) |key, index| {
+                var found: ?usize = null;
+                for (unique[0..kept], 0..) |other, position| if (sameExpr(context, other, key)) {
+                    found = position;
+                    break;
+                };
+                if (found == null) {
+                    unique[kept] = key;
+                    found = kept;
+                    kept += 1;
+                }
+                canonical[index] = @intCast(found.?);
+            }
+            for (unique[0..kept], 0..) |key, index| p.keys[index] = key;
+            const original = p.key_count;
+            p.key_count = kept;
+            var head: u16 = none;
+            var last: u16 = none;
+            var node = q.grouping_sets;
+            while (node != none) {
+                const next = context.node(node).next;
+                const mask: u64 = @bitCast(context.node(node).integer);
+                var remapped: u64 = 0;
+                for (0..original) |bit| {
+                    if ((mask >> @intCast(bit)) & 1 != 0) remapped |= @as(u64, 1) << canonical[bit];
+                }
+                context.node(node).integer = @bitCast(remapped);
+                var duplicate = false;
+                if (q.group_distinct) {
+                    var seen = head;
+                    while (seen != none) : (seen = context.node(seen).next) {
+                        if (context.node(seen).integer == context.node(node).integer) duplicate = true;
+                    }
+                }
+                if (!duplicate) {
+                    context.node(node).next = none;
+                    if (head == none) head = node else context.node(last).next = node;
+                    last = node;
+                }
+                node = next;
+            }
+            p.grouping_sets = head;
+        }
+
+        /// FETCH ... WITH TIES over the ORDER BY keys `keys` (B11).
+        fn bindTies(q: *const Ast.Select, p: *Plan, keys: []const SortKey) void {
+            if (!q.with_ties) return;
+            p.with_ties = true;
+            p.ties_limit = p.limit;
+            p.limit = 0xffffffffffffffff;
+            for (keys, 0..) |key, index| p.tie_keys[index] = key;
+            p.tie_key_count = keys.len;
+        }
+
+        /// Whether expression `id` reads a column `level` query levels up.
+        fn referencesLevel(context: *const Context, id: u16, level: u8) bool {
+            if (id == none) return false;
+            const n = context.node(id);
+            if (n.kind == .column) return n.level == level;
+            if (referencesLevel(context, n.a, level) or referencesLevel(context, n.c, level)) return true;
+            if (listOwner(n.kind)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) if (referencesLevel(context, item, level)) return true;
+                return false;
+            }
+            return referencesLevel(context, n.b, level);
         }
 
         fn sortableType(ty: ast.Type) Error!void {
@@ -4182,6 +4727,9 @@ pub fn Binder(comptime config: types.Config) type {
                 p.order_count += 1;
             }
             try checkCounts(q, p);
+            var count_scope: Scope = .{ .parent = parent, .plan = id, .ctes = env };
+            try bindCounts(context, &count_scope, q, p);
+            bindTies(q, p, p.order[0..p.order_count]);
             return id;
         }
 
@@ -4198,6 +4746,12 @@ pub fn Binder(comptime config: types.Config) type {
             if (n.kind == .column and n.qualifier.len == 0 and !n.star) {
                 const wanted = toName(context, n.name);
                 for (p.names[0..p.count], 0..) |*name, index| if (types.same(name.slice(), wanted.slice())) return .{ .column = @intCast(index) };
+            }
+            if (n.kind == .column and !n.star) {
+                var inner = scope.*;
+                inner.search_order = true;
+                try valueExpr(context, &inner, id);
+                return .{ .expr = id };
             }
             try valueExpr(context, scope, id);
             return .{ .expr = id };
@@ -4229,8 +4783,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn inputHas(context: *const Context, scope: *const Scope, wanted: []const u8) bool {
             for (scope.using[0..scope.using_count]) |*entry| {
-                const name = toName(context, entry.ident);
-                if (types.same(name.slice(), wanted)) return true;
+                if (types.same(entry.name.slice(), wanted)) return true;
             }
             for (scope.rels[0..scope.rel_count]) |*rel| if (findColumn(context, rel, wanted) != null) return true;
             return false;
@@ -4433,7 +4986,7 @@ pub fn Binder(comptime config: types.Config) type {
             } else try groupify(context, p, n.b);
         }
 
-        fn expandStar(context: *const Context, scope: *const Scope, p: *Plan, target: *const Ast.Target) Error!void {
+        fn expandStar(context: *const Context, scope: *const Scope, q: *const Ast.Select, p: *Plan, target: *const Ast.Target) Error!void {
             var only: ?usize = null;
             if (target.expr != none) {
                 const qualifier = toName(context, context.node(target.expr).qualifier);
@@ -4444,26 +4997,58 @@ pub fn Binder(comptime config: types.Config) type {
                 if (only == null) return error.TableNotFound;
             } else {
                 if (scope.rel_count == 0) return error.Syntax;
-                for (scope.using[0..scope.using_count]) |*entry| {
-                    const id = try context.pool.add(.{ .kind = .column, .name = entry.ident });
-                    try typeExpr(context, scope, id);
-                    try addTarget(context, p, id, toName(context, entry.ident));
-                }
+                // A joined table lists each join's merged columns, then its
+                // left and right operands' remaining columns (PostgreSQL).
+                if (scope.using_count != 0) return starOperand(context, scope, q, p, 0, scope.rel_count - 1);
             }
             for (scope.rels[0..scope.rel_count], 0..) |*rel, index| {
                 if (only) |wanted| if (wanted != index) continue;
-                columns: for (0..relationWidth(context, rel)) |column| {
-                    if (only == null) for (scope.using[0..scope.using_count]) |*entry| {
-                        if ((entry.left == index and entry.left_column == column) or (entry.right == index and entry.right_column == column)) continue :columns;
-                    };
-                    const id = try columnNode(context, scope, index, column);
-                    var name: V.Name = .{};
-                    const raw = relationColumnName(context, rel, column);
-                    name.len = raw.len;
-                    @memcpy(name.bytes[0..raw.len], raw);
-                    try addTarget(context, p, id, name);
-                }
+                try starColumns(context, scope, p, index, rel, only == null);
             }
+        }
+
+        fn starColumns(context: *const Context, scope: *const Scope, p: *Plan, index: usize, rel: *const Relation, skip_merged: bool) Error!void {
+            columns: for (0..relationWidth(context, rel)) |column| {
+                // Hidden SEARCH / CYCLE bookkeeping columns start with NUL;
+                // the record-typed sequence and path columns are opaque.
+                const column_name = relationColumnName(context, rel, column);
+                if (column_name.len != 0 and column_name[0] == 0) continue;
+                try opaqueColumn(context, scope, rel, column);
+                if (skip_merged) for (scope.using[0..scope.using_count]) |*entry| {
+                    if ((entry.left == index and entry.left_column == column) or (entry.right == index and entry.right_column == column)) continue :columns;
+                };
+                const id = try columnNode(context, scope, index, column);
+                try addTarget(context, p, id, literalName(relationColumnName(context, rel, column)));
+            }
+        }
+
+        /// Star columns of the joined operand made of items first..last.
+        /// Recursion is bounded by the FROM item count.
+        fn starOperand(context: *const Context, scope: *const Scope, q: *const Ast.Select, p: *Plan, first: usize, last: usize) Error!void {
+            var join: ?usize = null;
+            var next = first + 1;
+            while (next <= last) {
+                join = next;
+                const end = if (next < q.item_count) q.items[next].group_end else none;
+                next = (if (end != none) end else next) + 1;
+            }
+            const k = join orelse return starColumns(context, scope, p, first, &scope.rels[first], true);
+            for (scope.using[0..scope.using_count], 0..) |*entry, position| {
+                if (entry.item != k) continue;
+                // A later join that merges this column again lists it instead.
+                var consumed = false;
+                for (scope.using[position + 1 .. scope.using_count]) |*later| {
+                    if (later.item == k) continue;
+                    if ((later.left == entry.left and later.left_column == entry.left_column) or
+                        (later.right == entry.left and later.right_column == entry.left_column)) consumed = true;
+                }
+                if (consumed) continue;
+                const id = try context.pool.add(.{ .kind = .column });
+                try bindUsing(context, scope, context.node(id), scope, 0, entry);
+                try addTarget(context, p, id, entry.name);
+            }
+            try starOperand(context, scope, q, p, first, k - 1);
+            try starOperand(context, scope, q, p, k, last);
         }
 
         fn addTarget(context: *const Context, p: *Plan, id: u16, name: V.Name) Error!void {
@@ -4477,39 +5062,133 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// JOIN ... USING (columns): records merged columns and returns the
         /// equality condition.
-        fn bindUsingClause(context: *const Context, scope: *Scope, item: *const Ast.FromItem, index: usize) Error!u16 {
+        fn bindUsingClause(context: *const Context, scope: *Scope, item: *const Ast.FromItem, index: usize, last: usize) Error!u16 {
             var condition: u16 = none;
-            for (item.using[0..item.using_count]) |ident| {
+            for (item.using[0..item.using_count], 0..) |ident, position| {
                 const wanted = toName(context, ident);
-                const right = findColumn(context, &scope.rels[index], wanted.slice()) orelse return error.ColumnNotFound;
-                var left: ?[2]usize = null;
-                var position = scope.using_count;
-                while (position != 0) {
-                    position -= 1;
-                    const entry = &scope.using[position];
-                    const name = toName(context, entry.ident);
-                    if (types.same(name.slice(), wanted.slice())) {
-                        left = .{ entry.left, entry.left_column };
-                        break;
-                    }
-                }
-                if (left == null) for (scope.rels[0..index], 0..) |*rel, rel_index| {
-                    const column = findColumn(context, rel, wanted.slice()) orelse continue;
-                    if (left != null) return error.AmbiguousColumn;
-                    left = .{ rel_index, column };
-                };
-                const hit = left orelse return error.ColumnNotFound;
-                if (scope.using_count == config.columns) return error.ColumnCapacity;
-                scope.using[scope.using_count] = .{ .ident = ident, .left = @intCast(hit[0]), .left_column = @intCast(hit[1]), .right = @intCast(index), .right_column = @intCast(right), .join = item.join };
-                scope.using_count += 1;
-                const a = try columnNode(context, scope, hit[0], hit[1]);
-                const b = try columnNode(context, scope, index, right);
-                const eq = try context.pool.add(.{ .kind = .binary, .op = .eq, .a = a, .b = b, .ty = .boolean });
-                const node = context.node(eq);
-                try comparable(context, &node.a, &node.b);
-                condition = if (condition == none) eq else try context.pool.add(.{ .kind = .and_op, .a = condition, .b = eq, .ty = .boolean });
+                // USING (a, a): PostgreSQL 42701, specified more than once.
+                for (item.using[0..position]) |earlier| if (types.same(toName(context, earlier).slice(), wanted.slice())) return error.DuplicateColumn;
+                condition = try usingColumn(context, scope, item.join, wanted, index, last, condition);
             }
             return condition;
+        }
+
+        /// One merged column `wanted` between the left operand (visible items
+        /// before `index`) and the right operand (items index..last). The
+        /// right operand must list the name exactly once (42703 / 42702).
+        fn usingColumn(context: *const Context, scope: *Scope, join: ast.JoinKind, wanted: V.Name, index: usize, last: usize, condition: u16) Error!u16 {
+            // A parenthesized right operand lists its own merged columns once.
+            switch (operandHas(context, scope, index, last, wanted.slice())) {
+                0 => return error.ColumnNotFound,
+                1 => {},
+                else => return error.AmbiguousColumn,
+            }
+            var right: ?[2]usize = null;
+            for (scope.using[0..scope.using_count]) |*entry| {
+                if (entry.left >= index and entry.right <= last and types.same(entry.name.slice(), wanted.slice())) right = .{ entry.left, entry.left_column };
+            }
+            if (right == null) for (scope.rels[index .. last + 1], index..) |*rel, rel_index| {
+                for (0..relationWidth(context, rel)) |column| {
+                    if (mergedIn(scope, index, last, rel_index, column)) continue;
+                    if (types.same(relationColumnName(context, rel, column), wanted.slice())) right = .{ rel_index, column };
+                }
+            };
+            const right_hit = right orelse return error.ColumnNotFound;
+            var left: ?[2]usize = null;
+            var position = scope.using_count;
+            while (position != 0) {
+                position -= 1;
+                const entry = &scope.using[position];
+                if (entry.right < scope.rel_first or entry.right >= index) continue;
+                if (types.same(entry.name.slice(), wanted.slice())) {
+                    left = .{ entry.left, entry.left_column };
+                    break;
+                }
+            }
+            if (left == null) for (scope.rels[scope.rel_first..index], scope.rel_first..) |*rel, rel_index| {
+                const column = findColumn(context, rel, wanted.slice()) orelse continue;
+                if (left != null) return error.AmbiguousColumn;
+                left = .{ rel_index, column };
+            };
+            const hit = left orelse return error.ColumnNotFound;
+            if (scope.using_count == config.columns) return error.ColumnCapacity;
+            scope.using[scope.using_count] = .{ .name = wanted, .left = @intCast(hit[0]), .left_column = @intCast(hit[1]), .right = @intCast(right_hit[0]), .right_column = @intCast(right_hit[1]), .join = join, .item = @intCast(index) };
+            scope.using_count += 1;
+            const a = try columnNode(context, scope, hit[0], hit[1]);
+            const b = try columnNode(context, scope, right_hit[0], right_hit[1]);
+            const eq = try context.pool.add(.{ .kind = .binary, .op = .eq, .a = a, .b = b, .ty = .boolean });
+            const node = context.node(eq);
+            try comparable(context, &node.a, &node.b);
+            return if (condition == none) eq else try context.pool.add(.{ .kind = .and_op, .a = condition, .b = eq, .ty = .boolean });
+        }
+
+        fn countColumn(context: *const Context, rel: *const Relation, wanted: []const u8) usize {
+            var count: usize = 0;
+            for (0..relationWidth(context, rel)) |column| {
+                if (types.same(relationColumnName(context, rel, column), wanted)) count += 1;
+            }
+            return count;
+        }
+
+        /// Whether column `column` of item `index` is merged by a USING /
+        /// NATURAL join inside items first..last.
+        fn mergedIn(scope: *const Scope, first: usize, last: usize, index: usize, column: usize) bool {
+            for (scope.using[0..scope.using_count]) |*entry| {
+                if (entry.left < first or entry.right > last) continue;
+                if ((entry.left == index and entry.left_column == column) or (entry.right == index and entry.right_column == column)) return true;
+            }
+            return false;
+        }
+
+        /// How often `wanted` names a column of the joined operand made of
+        /// items first..last (merged columns once, then the others).
+        fn operandHas(context: *const Context, scope: *const Scope, first: usize, last: usize, wanted: []const u8) usize {
+            var count: usize = 0;
+            for (scope.using[0..scope.using_count]) |*entry| {
+                if (entry.left < first or entry.right > last) continue;
+                if (types.same(entry.name.slice(), wanted)) count += 1;
+            }
+            for (scope.rels[first .. last + 1], first..) |*rel, index| {
+                for (0..relationWidth(context, rel)) |column| {
+                    if (mergedIn(scope, first, last, index, column)) continue;
+                    if (types.same(relationColumnName(context, rel, column), wanted)) count += 1;
+                }
+            }
+            return count;
+        }
+
+        /// NATURAL join: USING over the names both operands share, in the
+        /// left operand's column order (PostgreSQL transformFromClauseItem).
+        /// A shared name listed twice on either side is 42702; without a
+        /// shared name the join has no condition (a cross product).
+        fn bindNaturalClause(context: *const Context, scope: *Scope, item: *const Ast.FromItem, index: usize, last: usize) Error!u16 {
+            const first = scope.rel_first;
+            var names: [config.columns]V.Name = undefined;
+            var count: usize = 0;
+            for (scope.using[0..scope.using_count]) |*entry| {
+                if (entry.left < first or entry.right >= index) continue;
+                try naturalCandidate(context, scope, index, last, entry.name, &names, &count);
+            }
+            for (scope.rels[first..index], first..) |*rel, rel_index| {
+                for (0..relationWidth(context, rel)) |column| {
+                    if (mergedIn(scope, first, index - 1, rel_index, column)) continue;
+                    try naturalCandidate(context, scope, index, last, literalName(relationColumnName(context, rel, column)), &names, &count);
+                }
+            }
+            var condition: u16 = none;
+            for (names[0..count]) |name| {
+                if (operandHas(context, scope, first, index - 1, name.slice()) > 1) return error.AmbiguousColumn;
+                condition = try usingColumn(context, scope, item.join, name, index, last, condition);
+            }
+            return condition;
+        }
+
+        fn naturalCandidate(context: *const Context, scope: *const Scope, index: usize, last: usize, name: V.Name, names: *[config.columns]V.Name, count: *usize) Error!void {
+            for (names[0..count.*]) |*seen| if (types.same(seen.slice(), name.slice())) return;
+            if (operandHas(context, scope, index, last, name.slice()) == 0) return;
+            if (count.* == config.columns) return error.ColumnCapacity;
+            names[count.*] = name;
+            count.* += 1;
         }
 
         fn refsBelow(context: *const Context, id: u16, index: usize) bool {
@@ -4555,14 +5234,248 @@ pub fn Binder(comptime config: types.Config) type {
             return none;
         }
 
+        /// A function in FROM (B11) as a plan of its own: generate_series
+        /// over int4/int8/numeric (optional step) or timestamp[tz] with an
+        /// interval step, otherwise any scalar function (one row). Arguments
+        /// see the FROM items before it (implicit LATERAL); aggregates and
+        /// window calls are not allowed (42803 / 42P20). The column is named
+        /// after the function, or the table alias; ORDINALITY adds a bigint
+        /// `ordinality` column.
+        fn bindTableFunction(context: *const Context, scope: *Scope, item: *const Ast.FromItem, env: ?*const CteEnv) Error!u16 {
+            const plans = plansOf(context);
+            const id = try plans.add();
+            var inner: Scope = .{ .parent = scope, .plan = id, .ctes = env };
+            const call = context.node(item.function);
+            if (call.window != none) return error.WindowingError;
+            const name = toName(context, item.name);
+            var series: Series = .none;
+            var ty: ast.Type = .unknown;
+            if (!call.name.quoted and types.same(name.slice(), "generate_series")) {
+                if (call.star or call.distinct or call.c != none) return error.UndefinedFunction;
+                var args: [3]u16 = undefined;
+                var count: usize = 0;
+                var arg = call.b;
+                while (arg != none) : (arg = context.node(arg).next) {
+                    if (count == 3) return error.UndefinedFunction;
+                    try typeExpr(context, &inner, arg);
+                    args[count] = arg;
+                    count += 1;
+                }
+                if (count < 2) return error.UndefinedFunction;
+                var target: ast.Type = .unknown;
+                for (args[0..2]) |a| try unifyInto(&target, context.node(a).ty);
+                // A numeric step selects the numeric series (all three
+                // arguments share one type); a timestamp series steps by interval.
+                const step_ty: ast.Type = if (count == 3) context.node(args[2]).ty else .unknown;
+                if (count == 3 and target != .date and target != .timestamp and target != .timestamptz and step_ty != .interval) try unifyInto(&target, step_ty);
+                switch (target) {
+                    .unknown => return error.AmbiguousFunction,
+                    .int2, .int4 => target = .int4,
+                    .int8, .numeric => {},
+                    .date, .timestamp, .timestamptz => {
+                        if (target == .date) target = .timestamptz;
+                        if (count != 3) return error.UndefinedFunction;
+                    },
+                    else => return error.UndefinedFunction,
+                }
+                series = switch (target) {
+                    .int4, .int8 => .integer,
+                    .numeric => .numeric,
+                    else => .timestamp,
+                };
+                for (args[0..count], 0..) |a, position| {
+                    const want: ast.Type = if (series == .timestamp and position == 2) .interval else target;
+                    const arg_ty = context.node(a).ty;
+                    if (arg_ty == .unknown) {
+                        try coerce(context, a, want);
+                    } else if (arg_ty != want and !(value.integral(arg_ty) and value.integral(want))) {
+                        if (!value.castable(arg_ty, want, .implicit)) return error.UndefinedFunction;
+                        const converted = try convert(context, a, want, -1, .implicit);
+                        const next = context.node(a).next;
+                        context.node(converted).next = next;
+                        if (position == 0) {
+                            call.b = converted;
+                        } else context.node(args[position - 1]).next = converted;
+                        context.node(a).next = none;
+                        args[position] = converted;
+                    }
+                }
+                ty = target;
+            } else {
+                try typeExpr(context, &inner, item.function);
+                ty = context.node(item.function).ty;
+                if (ty == .unknown) ty = .text;
+            }
+            const p = &plans.items[id];
+            p.function = item.function;
+            p.series = series;
+            p.ordinality = item.ordinality;
+            // A series has no per-row expression; planning validation sees a
+            // typed NULL placeholder (the generator reads `function`).
+            p.targets[0] = if (series == .none) item.function else try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
+            p.names[0] = if (item.alias) |alias| toName(context, alias) else name;
+            p.tys[0] = ty;
+            p.typmods[0] = -1;
+            p.count = 1;
+            if (item.ordinality) {
+                p.targets[1] = try context.pool.add(.{ .kind = .null_literal, .ty = .int8, .constant = true });
+                p.names[1] = literalName("ordinality");
+                p.tys[1] = .int8;
+                p.typmods[1] = -1;
+                p.count = 2;
+            }
+            p.width = p.count;
+            return id;
+        }
+
+        /// `alias (c1, ...)` (B11): renames the leading columns of a derived
+        /// table or function plan in place; a table, view or CTE reference
+        /// is wrapped in its own projection plan first. More aliases than
+        /// columns is 42P10.
+        fn applyColumnAliases(context: *const Context, item: *const Ast.FromItem, rel: *Relation, source: *Source) Error!void {
+            const plans = plansOf(context);
+            if (rel.plan == none or rel.cte != no_cte) {
+                const wrapper = try wrapRelation(context, rel, source.*);
+                rel.* = .{ .name = rel.name, .plan = wrapper };
+                source.* = .{ .join = source.join, .plan = wrapper, .group_end = source.group_end };
+            }
+            const p = &plans.items[rel.plan];
+            var alias = item.column_aliases;
+            var column: usize = 0;
+            while (alias != none) : (alias = context.node(alias).next) {
+                if (column == p.count) return error.InvalidColumnReference;
+                p.names[column] = toName(context, context.node(alias).name);
+                column += 1;
+            }
+        }
+
+        /// TABLESAMPLE (B11): only on a table (PostgreSQL 42809 otherwise),
+        /// with exactly one argument (2202H). The percentage is real and the
+        /// REPEATABLE seed double precision, both by implicit coercion
+        /// (42804); they may reference enclosing queries only. The sampled
+        /// table becomes a projection plan of its own whose scan applies the
+        /// sample, so no fast path reads the table directly.
+        fn bindSample(context: *const Context, parent: ?*const Scope, env: ?*const CteEnv, item: *const Ast.FromItem, rel: *Relation, source: *Source) Error!void {
+            if (rel.table == null) return error.WrongObjectType;
+            const call = context.node(item.sample_percent);
+            const percent = call.b;
+            if (percent == none or context.node(percent).next != none) return error.InvalidTablesampleArgument;
+            var scope: Scope = .{ .parent = parent, .ctes = env };
+            const args = [2]u16{ percent, item.sample_seed };
+            for (args, 0..) |arg, index| {
+                if (arg == none) continue;
+                try typeExpr(context, &scope, arg);
+                const want: ast.Type = if (index == 0) .float4 else .float8;
+                const ty = context.node(arg).ty;
+                if (ty == .unknown) {
+                    try coerce(context, arg, want);
+                } else if (ty != want) {
+                    if (!value.castable(ty, want, .implicit)) return error.TypeMismatch;
+                }
+            }
+            const typed_percent = if (context.node(percent).ty == .float4) percent else try convert(context, percent, .float4, -1, .implicit);
+            const typed_seed = if (item.sample_seed == none or context.node(item.sample_seed).ty == .float8) item.sample_seed else try convert(context, item.sample_seed, .float8, -1, .implicit);
+            const wrapper = try wrapRelation(context, rel, source.*);
+            const p = &plansOf(context).items[wrapper];
+            p.sources[0].sample_method = item.sample_method;
+            p.sources[0].sample_percent = typed_percent;
+            p.sources[0].sample_seed = typed_seed;
+            // References to an enclosing query re-run the scan per outer row.
+            for ([_]u16{ typed_percent, typed_seed }) |arg| if (arg != none and (correlatedSublink(context, arg) or referencesLevel(context, arg, 1) or referencesLevel(context, arg, 2))) {
+                p.correlated = true;
+            };
+            rel.* = .{ .name = rel.name, .plan = wrapper };
+            source.* = .{ .join = source.join, .plan = wrapper, .group_end = source.group_end };
+        }
+
+        /// `SELECT *` over one relation as a plan of its own.
+        fn wrapRelation(context: *const Context, rel: *const Relation, source: Source) Error!u16 {
+            const plans = plansOf(context);
+            const id = try plans.add();
+            var scope: Scope = .{ .plan = id };
+            scope.rels[0] = rel.*;
+            scope.rel_count = 1;
+            const p = &plans.items[id];
+            p.sources[0] = .{ .table = source.table, .view = source.view, .plan = source.plan, .cte = source.cte };
+            p.source_count = 1;
+            for (0..relationWidth(context, rel)) |column| {
+                const node = try columnNode(context, &scope, 0, column);
+                try addTarget(context, p, node, literalName(relationColumnName(context, rel, column)));
+            }
+            p.width = p.count;
+            if (rel.plan != none and plans.items[rel.plan].correlated) p.correlated = true;
+            return id;
+        }
+
+        /// The first item of the innermost parenthesized join operand that
+        /// contains item `k` after its start (0: the whole FROM list).
+        fn enclosingGroup(q: *const Ast.Select, k: usize) usize {
+            var group = k;
+            while (group != 0) {
+                group -= 1;
+                const end = q.items[group].group_end;
+                if (end != none and end >= k) return group;
+            }
+            return 0;
+        }
+
+        /// Binds item k's join condition (ON, USING or NATURAL) once items
+        /// k..last (its right operand) are in scope; only the items of the
+        /// enclosing operand are visible.
+        fn bindJoinCondition(context: *const Context, scope: *Scope, q: *const Ast.Select, plan_id: u16, k: usize, last: usize) Error!void {
+            const item = &q.items[k];
+            const p = &plansOf(context).items[plan_id];
+            const saved = scope.rel_first;
+            scope.rel_first = enclosingGroup(q, k);
+            defer scope.rel_first = saved;
+            var on: u16 = none;
+            if (item.natural) {
+                on = try bindNaturalClause(context, scope, item, k, last);
+            } else if (item.using_count != 0) {
+                on = try bindUsingClause(context, scope, item, k, last);
+            } else if (item.on != none) on = try bindWhere(context, scope, item.on);
+            p.sources[k].on = on;
+            if (p.sources[k].table) |table| if ((item.join == .inner or item.join == .left) and last == k and !p.general_join) {
+                p.sources[k].probe = joinProbe(context, table, on, k);
+            };
+        }
+
         fn bindCore(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv, branch: bool) Error!u16 {
             const plans = plansOf(context);
             const id = try plans.add();
             var scope: Scope = .{ .parent = parent, .plan = id, .ctes = env, .window_defs=q.window_defs };
+            for (q.items[0..q.item_count]) |*item| if (item.group_end != none or item.lateral or item.function != none) {
+                plans.items[id].general_join = true;
+            };
             for (q.items[0..q.item_count], 0..) |*item, index| {
                 var rel: Relation = .{};
-                var source: Source = .{ .join = item.join };
-                if (item.query != none) {
+                var source: Source = .{ .join = item.join, .group_end = item.group_end };
+                if (item.function != none) {
+                    // A function in FROM is implicitly LATERAL (B11).
+                    const saved = scope.rel_first;
+                    scope.rel_first = enclosingGroup(q, index);
+                    const child = bindTableFunction(context, &scope, item, env);
+                    scope.rel_first = saved;
+                    rel.plan = try child;
+                    source.plan = rel.plan;
+                    rel.name = toName(context, item.name);
+                    source.lateral = plans.items[rel.plan].correlated;
+                    if (source.lateral and (item.join == .right or item.join == .full)) return error.InvalidColumnReference;
+                } else if (item.query != none and item.lateral) {
+                    // LATERAL (B11): the items before it (in its own join
+                    // operand) are the derived table's parent scope; outer
+                    // references mark this plan through markCorrelated.
+                    const saved = scope.rel_first;
+                    scope.rel_first = enclosingGroup(q, index);
+                    const child = bindPlan(context, item.query, &scope, env, false);
+                    scope.rel_first = saved;
+                    rel.plan = try child;
+                    source.plan = rel.plan;
+                    source.lateral = plans.items[rel.plan].correlated;
+                    // PostgreSQL: the combining JOIN type must be INNER or
+                    // LEFT for a LATERAL reference (42P10).
+                    if (source.lateral and (item.join == .right or item.join == .full)) return error.InvalidColumnReference;
+                } else if (item.query != none) {
                     // Derived tables are not LATERAL: they see enclosing blocks
                     // only; an expanded view sees neither (it is a stored query).
                     const child = try bindPlan(context, item.query, if (item.view) null else parent, if (item.view) null else env, false);
@@ -4576,6 +5489,8 @@ pub fn Binder(comptime config: types.Config) type {
                     source.cte = cte;
                     source.plan = rel.plan;
                     plans.ctes[cte].referenced = true;plans.ctes[cte].references+=1;
+                    // PostgreSQL: WITH query "x" does not have a RETURNING clause.
+                    if (plans.ctes[cte].dml != no_dml and !plans.ctes[cte].returning) return error.UnsupportedStatement;
                     if (plans.items[rel.plan].correlated) plans.items[id].correlated = true;
                 } else if (viewOf(context, item.schema, item.name)) |view| {
                     rel.view = view;
@@ -4588,15 +5503,23 @@ pub fn Binder(comptime config: types.Config) type {
                     source.table = table;
                 }
                 if (item.alias) |alias| rel.name = toName(context, alias);
+                if (item.sample_method != 0) {
+                    try bindSample(context, parent, env, item, &rel, &source);
+                    if (plans.items[rel.plan].correlated) plans.items[id].correlated = true;
+                }
+                if (item.column_aliases != none) try applyColumnAliases(context, item, &rel, &source);
                 scope.rels[index] = rel;
                 scope.rel_count = index + 1;
-                if (item.using_count != 0) {
-                    source.on = try bindUsingClause(context, &scope, item, index);
-                } else if (item.on != none) source.on = try bindWhere(context, &scope, item.on);
-                if (source.table) |table| if (item.join == .inner or item.join == .left) {
-                    source.probe = joinProbe(context, table, source.on, index);
-                };
                 plans.items[id].sources[index] = source;
+                // A parenthesized right operand's own condition waits for
+                // its last item; then every group ending here closes,
+                // innermost (latest start) first.
+                if (item.group_end == none) try bindJoinCondition(context, &scope, q, id, index, index);
+                var group = index;
+                while (group != 0) {
+                    group -= 1;
+                    if (q.items[group].group_end == index) try bindJoinCondition(context, &scope, q, id, group, index);
+                }
             }
             const p = &plans.items[id];
             p.source_count = q.item_count;
@@ -4606,6 +5529,7 @@ pub fn Binder(comptime config: types.Config) type {
                 p.keys[p.key_count] = try groupKey(context, &scope, q, expr_id);
                 p.key_count += 1;
             }
+            if (q.grouping_sets != none) try bindGroupingSets(context, q, p);
             var saw = false;
             scope.aggregates = true;
             scope.windows = true;
@@ -4614,7 +5538,7 @@ pub fn Binder(comptime config: types.Config) type {
             while(window_def!=none) : (window_def=context.pool.windows[window_def].next) try typeWindowSpec(context,&scope,&context.pool.windows[window_def]);
             for (q.targets[0..q.count]) |*target| {
                 if (target.star) {
-                    try expandStar(context, &scope, p, target);
+                    try expandStar(context, &scope, q, p, target);
                     continue;
                 }
                 if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
@@ -4672,7 +5596,7 @@ pub fn Binder(comptime config: types.Config) type {
                 p.planned_checked=true;p.planned_error=pending;
             }
             p.rollup=q.rollup;
-            p.grouped = q.rollup or p.key_count != 0 or saw or p.having != none;
+            p.grouped = q.rollup or p.key_count != 0 or saw or p.having != none or p.grouping_sets != none;
             if (p.grouped) {
                 window_def=q.window_defs;
                 while(window_def!=none) : (window_def=context.pool.windows[window_def].next) {
@@ -4735,6 +5659,8 @@ pub fn Binder(comptime config: types.Config) type {
                 for (order[0..order_count]) |key| appendKey(p, key);
             }
             try checkCounts(q, p);
+            try bindCounts(context, &scope, q, p);
+            bindTies(q, p, order[0..order_count]);
             p.constant_source_safe=!q.distinct and q.order_count==0 and !q.limit_present and !q.offset_present;
             try lowerWindows(context,id);
             return id;
@@ -4954,6 +5880,7 @@ pub fn Binder(comptime config: types.Config) type {
                 for(p.window_late[0..p.width]) |late| if(late) return error.UnsupportedStatement;
             }
             p.source_count=1;p.sources[0]=.{.plan=child};p.where=none;p.grouped=false;p.rollup=false;p.key_count=0;p.agg_count=0;p.window_aggregate_count=0;p.having=none;
+            p.grouping_sets=none;
         }
 
         fn member(list: []const u16, column: u16) bool {
@@ -5069,6 +5996,9 @@ pub fn Binder(comptime config: types.Config) type {
             // width, column numbering, bags or row cardinality.
             var conservative=bound.*!=.query;
             for(plans.items[0..plans.len]) |*p| conservative=conservative or p.correlated;
+            // B11 composition plans keep every output (no demand pruning).
+            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none or p.with_ties or p.grouping_sets!=none or p.function!=none or (p.source_count!=0 and p.sources[0].sample_method!=0);
+            for(plans.ctes[0..plans.cte_len]) |*def| conservative=conservative or def.search or def.cycle or def.dml!=no_dml;
             for(plans.items[0..plans.len]) |*p| {p.demanded=conservative;p.required=@splat(conservative);p.aggregate_required=@splat(conservative);}
             if(conservative) return;
             var cte_references:[config.ctes]usize=@splat(0);
@@ -5288,7 +6218,7 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn bindStatement(context: *const Context, statement: *const Ast.Statement) Error!Bound {
-            if (context.plans) |plans| plans.reset();
+            if (context.plans) |plans| if (!context.nested_dml) plans.reset();
             switch (statement.*) {
                 .create_table => |*create| {
                     const table_name = toName(context, create.name);

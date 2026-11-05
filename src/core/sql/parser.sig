@@ -52,6 +52,8 @@ pub fn Parser(comptime config: types.Config) type {
         source: []const u8,
         mode: Mode = .standard,
         recursion: usize = 0,
+        /// Inside a data-modifying WITH entry: the statement ends at `)`.
+        nested: usize = 0,
 
         /// Parses exactly one statement. The pool is reset first.
         pub fn parse(source: []const u8, pool: *Ast.Pool, mode: Mode) Error!Ast.Statement {
@@ -116,6 +118,10 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn finish(self: *Self) Error!void {
+            if (self.nested != 0) {
+                if (!self.isSymbol(.rparen)) return error.Syntax;
+                return;
+            }
             _ = try self.takeSymbol(.semicolon);
             if (self.current.kind != .end) return error.Syntax;
         }
@@ -163,6 +169,18 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))
                 return try self.identifier();
             return null;
+        }
+
+        /// The INSERT / UPDATE / DELETE of a data-modifying WITH entry, which
+        /// starts at offset `start` of `source` (B11). Parsed into the pool
+        /// without resetting it; the statement ends before the entry's `)`.
+        pub fn parseNested(source: []const u8, start: usize, pool: *Ast.Pool) Error!Ast.Statement {
+            var self = Self{ .tokens = .{ .source = source, .text_limit = config.text_bytes, .position = start }, .pool = pool, .source = source, .mode = .standard, .nested = 1 };
+            try self.advance();
+            if (try self.takeWord("INSERT")) return .{ .insert = try self.insert() };
+            if (try self.takeWord("UPDATE")) return .{ .update = try self.update() };
+            if (try self.takeWord("DELETE")) return .{ .delete = try self.delete() };
+            return error.Syntax;
         }
 
         /// A standalone expression (column DEFAULT / generation text) parsed
@@ -228,7 +246,7 @@ pub fn Parser(comptime config: types.Config) type {
                 return if (sequence_kind) .{ .drop_sequence = drop } else .{ .drop_table = drop };
             }
             if (try self.takeWord("INSERT")) return .{ .insert = try self.insert() };
-            if (self.isWord("SELECT") or (self.mode == .standard and self.isWord("WITH"))) return self.topQuery();
+            if (self.isWord("SELECT") or (self.mode == .standard and (self.isWord("WITH") or self.isWord("VALUES") or self.isWord("TABLE")))) return self.topQuery();
             if (try self.takeWord("UPDATE")) return .{ .update = try self.update() };
             if (try self.takeWord("DELETE")) return .{ .delete = try self.delete() };
             if (self.mode == .standard and self.rawWord("copy")) {
@@ -1860,9 +1878,38 @@ pub fn Parser(comptime config: types.Config) type {
                         try self.expectSymbol(.rparen);
                     }
                     try self.expectWord("AS");
+                    // [NOT] MATERIALIZED (B11): the engine always materializes
+                    // once; PostgreSQL never inlines volatile bodies, so rows
+                    // are the same either way.
+                    if (self.rawWord("materialized")) {
+                        try self.advance();
+                        cte.materialized = 1;
+                    } else if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "materialized")) {
+                        try self.advance();
+                        try self.advance();
+                        cte.materialized = 2;
+                    }
                     try self.expectSymbol(.lparen);
-                    cte.query = try self.query();
+                    if (self.mode == .standard and (self.isWord("INSERT") or self.isWord("UPDATE") or self.isWord("DELETE"))) {
+                        // Data-modifying WITH entry (B11): checked here, bound
+                        // again from its offset. PostgreSQL: only at the top
+                        // level of the statement (0A000).
+                        if (self.recursion != 1) return error.UnsupportedStatement;
+                        cte.dml_start = self.tokenStart();
+                        cte.dml = if (self.isWord("INSERT")) .insert else if (self.isWord("UPDATE")) .update else .delete;
+                        try self.advance();
+                        self.nested += 1;
+                        defer self.nested -= 1;
+                        switch (cte.dml) {
+                            .insert => _ = try self.insert(),
+                            .update => _ = try self.update(),
+                            .delete => _ = try self.delete(),
+                            .none => return error.Syntax,
+                        }
+                        self.pool.complex = true;
+                    } else cte.query = try self.query();
                     try self.expectSymbol(.rparen);
+                    if (self.mode == .standard) try self.searchCycle(&cte);
                     ctes[cte_count] = cte;
                     cte_count += 1;
                     if (!try self.takeSymbol(.comma)) break;
@@ -1896,21 +1943,28 @@ pub fn Parser(comptime config: types.Config) type {
             while (true) {
                 if (!limited and try self.takeWord("LIMIT")) {
                     limited = true;block.limit_present=true;
-                    if (!(try self.takeWord("ALL")) and !(try self.takeWord("NULL"))) try self.countValue(&block.limit, &block.negative_limit);
+                    if (!(try self.takeWord("ALL")) and !(self.mode != .standard and try self.takeWord("NULL"))) try self.countClause(&block.limit, &block.negative_limit, &block.limit_expr);
                 } else if (!offset_seen and self.mode == .standard and try self.takeWord("OFFSET")) {
                     offset_seen = true;block.offset_present=true;
                     self.pool.complex = true;
-                    try self.countValue(&block.offset, &block.negative_offset);
+                    try self.countClause(&block.offset, &block.negative_offset, &block.offset_expr);
                     _ = (try self.takeWord("ROW")) or (try self.takeWord("ROWS"));
                 } else if (!limited and self.mode == .standard and try self.takeWord("FETCH")) {
                     limited = true;block.limit_present=true;
                     if (!(try self.takeWord("FIRST"))) try self.expectWord("NEXT");
                     block.limit = 1;
-                    if (self.current.kind == .integer or self.isSymbol(.minus) or self.isSymbol(.lparen) or self.current.kind == .decimal) try self.countValue(&block.limit, &block.negative_limit);
+                    if (self.current.kind == .integer or self.isSymbol(.minus) or self.isSymbol(.lparen) or self.current.kind == .decimal or
+                        (self.mode == .standard and (self.current.kind == .parameter or self.isWord("NULL")))) try self.countClause(&block.limit, &block.negative_limit, &block.limit_expr);
                     if (!(try self.takeWord("ROW"))) try self.expectWord("ROWS");
-                    try self.expectWord("ONLY");
+                    if (self.mode == .standard and try self.takeWord("WITH")) {
+                        try self.expectWord("TIES");
+                        block.with_ties = true;
+                        self.pool.complex = true;
+                    } else try self.expectWord("ONLY");
                 } else break;
             }
+            // PostgreSQL: WITH TIES cannot be specified without ORDER BY (42601).
+            if (block.with_ties and block.order_count == 0) return error.Syntax;
             if (self.mode == .standard and try self.takeWord("FOR")) {
                 if (block.set_op != .none or block.item_count == 0) return error.Syntax;
                 if (try self.takeWord("UPDATE")) block.lock.strength = .update else {
@@ -1924,6 +1978,52 @@ pub fn Parser(comptime config: types.Config) type {
                 if (!limited and try self.takeWord("LIMIT")) try self.countValue(&block.limit, &block.negative_limit);
             }
             return top;
+        }
+
+        /// [SEARCH {DEPTH|BREADTH} FIRST BY c, ... SET seq]
+        /// [CYCLE c, ... SET mark [TO value DEFAULT value] USING path]
+        /// after a WITH entry (B11). Columns are name-only nodes.
+        fn searchCycle(self: *Self, cte: *Ast.Cte) Error!void {
+            if (self.rawWord("search")) {
+                try self.advance();
+                if (self.rawWord("breadth")) {
+                    cte.search.breadth = true;
+                } else if (!self.rawWord("depth")) return error.Syntax;
+                try self.advance();
+                try self.expectWord("FIRST");
+                try self.expectWord("BY");
+                cte.search.columns = try self.nameList();
+                try self.expectWord("SET");
+                cte.search.set = try self.identifier();
+                cte.search.present = true;
+            }
+            if (self.isWord("CYCLE")) {
+                try self.advance();
+                cte.cycle.columns = try self.nameList();
+                try self.expectWord("SET");
+                cte.cycle.mark = try self.identifier();
+                if (try self.takeWord("TO")) {
+                    cte.cycle.mark_value = try self.primary();
+                    try self.expectWord("DEFAULT");
+                    cte.cycle.mark_default = try self.primary();
+                }
+                try self.expectWord("USING");
+                cte.cycle.path = try self.identifier();
+                cte.cycle.present = true;
+            }
+        }
+
+        /// `name, ...` as column nodes linked by `next`.
+        fn nameList(self: *Self) Error!u16 {
+            var head: u16 = none;
+            var last: u16 = none;
+            while (true) {
+                const node = try self.pool.add(.{ .kind = .column, .name = try self.identifier() });
+                if (last == none) head = node else self.pool.nodes[last].next = node;
+                last = node;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            return head;
         }
 
         /// UNION/EXCEPT (left-associative) over INTERSECT terms.
@@ -1966,6 +2066,11 @@ pub fn Parser(comptime config: types.Config) type {
             return index;
         }
 
+        /// A token that starts a query block: SELECT, WITH, VALUES, TABLE.
+        fn queryWord(self: *const Self) bool {
+            return self.isWord("SELECT") or (self.mode == .standard and (self.isWord("WITH") or self.isWord("VALUES") or self.isWord("TABLE")));
+        }
+
         fn setPrimary(self: *Self) Error!u16 {
             if (self.mode == .standard and try self.takeSymbol(.lparen)) {
                 const inner = try self.query();
@@ -1973,8 +2078,247 @@ pub fn Parser(comptime config: types.Config) type {
                 self.pool.complex = true;
                 return inner;
             }
+            if (self.mode == .standard and self.isWord("VALUES")) return self.valuesBlock();
+            if (self.mode == .standard and self.isWord("TABLE")) return self.tableBlock();
             try self.expectWord("SELECT");
             return self.core();
+        }
+
+        const GroupingKind = enum { expression, empty, rollup, cube, sets };
+
+        /// PostgreSQL's limit on expanded grouping sets (54001).
+        const max_grouping_sets: usize = 4096;
+
+        /// GROUP BY [ALL | DISTINCT] element, ... (B11). Elements are
+        /// expressions, `()`, ROLLUP / CUBE (items may be composite `(a, b)`)
+        /// and GROUPING SETS (nested elements). A plain list, one ROLLUP of
+        /// plain expressions and a lone `()` keep the original grouping and
+        /// ROLLUP representation; anything else expands to the cross product
+        /// of the elements' sets (PostgreSQL expand_grouping_sets) as bit
+        /// masks over `out.group` positions in Select.grouping_sets.
+        fn groupClause(self: *Self, out: *Ast.Select) Error!void {
+            if (try self.takeWord("DISTINCT")) out.group_distinct = true else _ = try self.takeWord("ALL");
+            var sets = try self.maskNode(0);
+            var elements: usize = 0;
+            var plain = true;
+            var lone: GroupingKind = .expression;
+            var lone_simple = true;
+            while (true) {
+                const kind = try self.groupingKind();
+                var simple = true;
+                const element = try self.groupingElement(out, kind, true, &simple);
+                if (kind != .expression) plain = false;
+                lone = kind;
+                lone_simple = simple;
+                sets = try self.productSets(sets, element);
+                elements += 1;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            if (plain) return;
+            if (elements == 1 and (lone == .empty or (lone == .rollup and lone_simple))) {
+                out.rollup = true;
+                return;
+            }
+            if (out.group_count > 64) return error.StatementTooComplex;
+            out.grouping_sets = sets;
+        }
+
+        fn groupingKind(self: *Self) Error!GroupingKind {
+            if (self.mode != .standard) return .expression;
+            const next = try self.peek();
+            const lparen = next.kind == .symbol and next.symbol == .lparen;
+            if (self.isSymbol(.lparen) and next.kind == .symbol and next.symbol == .rparen) return .empty;
+            if (self.isWord("ROLLUP") and lparen) return .rollup;
+            if (self.rawWord("cube") and lparen) return .cube;
+            if (self.rawWord("grouping") and wordIs(self.source, next, "sets")) return .sets;
+            return .expression;
+        }
+
+        fn maskNode(self: *Self, mask: u64) Error!u16 {
+            return self.pool.add(.{ .kind = .int_literal, .integer = @bitCast(mask) });
+        }
+
+        fn maskOf(self: *const Self, node: u16) u64 {
+            return @bitCast(self.pool.nodes[node].integer);
+        }
+
+        /// Appends `id` as a grouping key and returns its bit.
+        fn groupBit(self: *Self, out: *Ast.Select, id: u16) Error!u64 {
+            if (out.group_count == config.columns) return error.ColumnCapacity;
+            if (out.group_count == 64) return error.StatementTooComplex;
+            self.pool.nodes[id].next = none;
+            out.group[out.group_count] = id;
+            out.group_count += 1;
+            return @as(u64, 1) << @intCast(out.group_count - 1);
+        }
+
+        /// One expression or, written as `(a, b, ...)`, a composite set.
+        /// `simple` turns false for a composite.
+        fn groupingItem(self: *Self, out: *Ast.Select, simple: *bool) Error!u64 {
+            const parenthesized = self.isSymbol(.lparen);
+            const id = try self.expression();
+            if (!parenthesized or self.pool.nodes[id].kind != .row_constructor) return self.groupBit(out, id);
+            simple.* = false;
+            var mask: u64 = 0;
+            var member = self.pool.nodes[id].b;
+            while (member != none) {
+                const next = self.pool.nodes[member].next;
+                mask |= try self.groupBit(out, member);
+                member = next;
+            }
+            return mask;
+        }
+
+        /// The grouping sets of one element as a mask list.
+        fn groupingElement(self: *Self, out: *Ast.Select, kind: GroupingKind, top: bool, simple: *bool) Error!u16 {
+            try self.enter();
+            defer self.leave();
+            switch (kind) {
+                .empty => {
+                    try self.advance();
+                    try self.advance();
+                    return self.maskNode(0);
+                },
+                .expression => return self.maskNode(try self.groupingItem(out, simple)),
+                .rollup, .cube => {
+                    try self.advance();
+                    try self.expectSymbol(.lparen);
+                    var items: [config.columns]u64 = undefined;
+                    var count: usize = 0;
+                    while (true) {
+                        if (count == config.columns) return error.ColumnCapacity;
+                        items[count] = try self.groupingItem(out, simple);
+                        count += 1;
+                        if (!try self.takeSymbol(.comma)) break;
+                    }
+                    try self.expectSymbol(.rparen);
+                    var head: u16 = none;
+                    var last: u16 = none;
+                    if (kind == .rollup) {
+                        // PostgreSQL order: the longest prefix first, () last.
+                        var size = count + 1;
+                        while (size != 0) {
+                            size -= 1;
+                            var mask: u64 = 0;
+                            for (items[0..size]) |item| mask |= item;
+                            try self.appendMask(&head, &last, mask);
+                        }
+                    } else {
+                        // PostgreSQL: CUBE is limited to 12 elements (54000).
+                        if (count > 12) return error.ProgramLimitExceeded;
+                        for (0..@as(usize, 1) << @intCast(count)) |subset| {
+                            var mask: u64 = 0;
+                            for (items[0..count], 0..) |item, bit| {
+                                if ((subset >> @intCast(bit)) & 1 != 0) mask |= item;
+                            }
+                            try self.appendMask(&head, &last, mask);
+                        }
+                    }
+                    return head;
+                },
+                .sets => {
+                    try self.advance();
+                    try self.advance();
+                    try self.expectSymbol(.lparen);
+                    simple.* = false;
+                    var head: u16 = none;
+                    var last: u16 = none;
+                    var total: usize = 0;
+                    while (true) {
+                        const inner = try self.groupingKind();
+                        var nested = try self.groupingElement(out, inner, false, simple);
+                        while (nested != none) : (nested = self.pool.nodes[nested].next) {
+                            total += 1;
+                            if (total > max_grouping_sets) return error.StatementTooComplex;
+                            try self.appendMask(&head, &last, self.maskOf(nested));
+                        }
+                        if (!try self.takeSymbol(.comma)) break;
+                    }
+                    try self.expectSymbol(.rparen);
+                    _ = top;
+                    return head;
+                },
+            }
+        }
+
+        fn appendMask(self: *Self, head: *u16, last: *u16, mask: u64) Error!void {
+            const node = try self.maskNode(mask);
+            if (head.* == none) head.* = node else self.pool.nodes[last.*].next = node;
+            last.* = node;
+        }
+
+        /// Cross product of two mask lists (left-major), at most 4096 sets.
+        fn productSets(self: *Self, left: u16, right: u16) Error!u16 {
+            var head: u16 = none;
+            var last: u16 = none;
+            var total: usize = 0;
+            var a = left;
+            while (a != none) : (a = self.pool.nodes[a].next) {
+                var b = right;
+                while (b != none) : (b = self.pool.nodes[b].next) {
+                    total += 1;
+                    if (total > max_grouping_sets) return error.StatementTooComplex;
+                    try self.appendMask(&head, &last, self.maskOf(a) | self.maskOf(b));
+                }
+            }
+            return head;
+        }
+
+        /// VALUES (e, ...) [, (e, ...)] ...: a query block of literal rows
+        /// whose columns are column1..columnN. Every row has the same width
+        /// (42601 otherwise); DEFAULT belongs to INSERT only.
+        fn valuesBlock(self: *Self) Error!u16 {
+            try self.expectWord("VALUES");
+            self.pool.complex = true;
+            const index = try self.pool.newQuery();
+            var width: usize = 0;
+            var previous: u16 = none;
+            while (true) {
+                try self.expectSymbol(.lparen);
+                const row = try self.pool.add(.{ .kind = .values_row });
+                var count: usize = 0;
+                var last: u16 = none;
+                while (true) {
+                    if (count == config.columns) return error.ColumnCapacity;
+                    const item = try self.expression();
+                    if (last == none) self.pool.nodes[row].b = item else self.pool.nodes[last].next = item;
+                    try self.pool.raise(row, item);
+                    last = item;
+                    count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                try self.expectSymbol(.rparen);
+                if (previous == none) {
+                    self.pool.queries[index].values = row;
+                    width = count;
+                } else {
+                    if (count != width) return error.Syntax;
+                    self.pool.nodes[previous].next = row;
+                }
+                previous = row;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            self.pool.queries[index].count = width;
+            return index;
+        }
+
+        /// TABLE [ONLY] name: SELECT * FROM name.
+        fn tableBlock(self: *Self) Error!u16 {
+            try self.expectWord("TABLE");
+            _ = try self.takeWord("ONLY");
+            const index = try self.pool.newQuery();
+            const out = &self.pool.queries[index];
+            var item: Ast.FromItem = .{ .join = .first, .name = try self.identifier() };
+            if (try self.takeSymbol(.dot)) {
+                item.schema = item.name;
+                item.name = try self.identifier();
+            }
+            out.items[0] = item;
+            out.item_count = 1;
+            out.targets[0] = .{ .star = true };
+            out.count = 1;
+            out.from = .{ .schema = item.schema, .name = item.name };
+            return index;
         }
 
         /// SELECT [DISTINCT [ON (exprs)] | ALL] targets [FROM items] [WHERE]
@@ -2024,22 +2368,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and try self.takeWord("GROUP")) {
                 try self.expectWord("BY");
                 self.pool.complex = true;
-                var empty=false;
-                if(self.isSymbol(.lparen)) {
-                    const next=try self.peek();
-                    if(next.kind==.symbol and next.symbol==.rparen) {try self.advance();try self.advance();empty=true;out.rollup=true;}
-                }
-                if(!empty) {
-                    out.rollup=try self.takeWord("ROLLUP");
-                    if(out.rollup){try self.expectSymbol(.lparen);if(self.isSymbol(.rparen)) return error.Syntax;}
-                    while (true) {
-                        if (out.group_count == config.columns) return error.ColumnCapacity;
-                        out.group[out.group_count] = try self.expression();
-                        out.group_count += 1;
-                        if (!try self.takeSymbol(.comma)) break;
-                    }
-                    if(out.rollup) try self.expectSymbol(.rparen);
-                }
+                try self.groupClause(out);
             }
             if (self.mode == .standard and try self.takeWord("HAVING")) {
                 self.pool.complex = true;
@@ -2066,46 +2395,102 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.fromItem(out, .cross);
                     continue;
                 }
-                var kind: ast.JoinKind = .inner;
-                if (try self.takeWord("JOIN")) {
-                    kind = .inner;
-                } else if (try self.takeWord("INNER")) {
-                    try self.expectWord("JOIN");
-                } else if (try self.takeWord("CROSS")) {
-                    try self.expectWord("JOIN");
-                    kind = .cross;
-                } else if (self.isWord("LEFT") or self.isWord("RIGHT") or self.isWord("FULL")) {
-                    kind = if (self.isWord("LEFT")) .left else if (self.isWord("RIGHT")) .right else .full;
-                    try self.advance();
-                    _ = try self.takeWord("OUTER");
-                    try self.expectWord("JOIN");
-                } else break;
-                try self.fromItem(out, kind);
-                if (kind == .cross) continue;
-                const item = &out.items[out.item_count - 1];
-                if (try self.takeWord("ON")) {
-                    item.on = try self.expression();
-                } else if (try self.takeWord("USING")) {
-                    try self.expectSymbol(.lparen);
-                    while (true) {
-                        if (item.using_count == config.columns) return error.ColumnCapacity;
-                        item.using[item.using_count] = try self.identifier();
-                        item.using_count += 1;
-                        if (!try self.takeSymbol(.comma)) break;
-                    }
-                    try self.expectSymbol(.rparen);
-                } else return error.Syntax;
+                if (!try self.joinClause(out)) break;
             }
-            if (out.item_count == 1 and out.items[0].query == none) {
+            if (out.item_count == 1 and out.items[0].query == none and plainItem(&out.items[0])) {
                 out.from = .{ .schema = out.items[0].schema, .name = out.items[0].name, .alias = out.items[0].alias };
             } else self.pool.complex = true;
+        }
+
+        /// `( joined_table )` after its `(`: a parenthesized join tree whose
+        /// items follow in `out.items`. The first item carries the outer
+        /// join `kind`; as a right operand it records the group's last
+        /// item, so the executor joins the whole group (a left operand is
+        /// already left-deep). `((SELECT ...)) alias` is one derived table.
+        /// An alias on a join tree is outside the subset (0A000).
+        fn joinGroup(self: *Self, out: *Ast.Select, kind: ast.JoinKind) Error!void {
+            const start = out.item_count;
+            try self.fromItem(out, kind);
+            var joined = false;
+            while (try self.joinClause(out)) joined = true;
+            try self.expectSymbol(.rparen);
+            self.pool.complex = true;
+            if (!joined and out.item_count == start + 1) {
+                const only = &out.items[start];
+                if (only.query == none or only.alias != null) return error.Syntax;
+                only.alias = try self.bareAlias();
+                return;
+            }
+            // `((a JOIN b ON ...))`: redundant parentheses keep the inner group.
+            if (self.isWord("AS") or self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword))) return error.UnsupportedStatement;
+            if (kind != .first) out.items[start].group_end = @intCast(out.item_count - 1);
+        }
+
+        /// A FROM item the simple single-table path can scan as written.
+        fn plainItem(item: *const Ast.FromItem) bool {
+            return item.function == none and item.sample_method == 0 and item.column_aliases == none and item.group_end == none;
+        }
+
+        /// One `[NATURAL] [INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN operand
+        /// [ON e | USING (c, ...)]`; false when no join keyword follows. The
+        /// condition belongs to the operand's first item (a parenthesized
+        /// group's start). NATURAL takes neither ON nor USING (42601).
+        fn joinClause(self: *Self, out: *Ast.Select) Error!bool {
+            const natural = try self.takeWord("NATURAL");
+            var kind: ast.JoinKind = .inner;
+            if (try self.takeWord("JOIN")) {
+                kind = .inner;
+            } else if (try self.takeWord("INNER")) {
+                try self.expectWord("JOIN");
+            } else if (!natural and try self.takeWord("CROSS")) {
+                try self.expectWord("JOIN");
+                kind = .cross;
+            } else if (self.isWord("LEFT") or self.isWord("RIGHT") or self.isWord("FULL")) {
+                kind = if (self.isWord("LEFT")) .left else if (self.isWord("RIGHT")) .right else .full;
+                try self.advance();
+                _ = try self.takeWord("OUTER");
+                try self.expectWord("JOIN");
+            } else {
+                if (natural) return error.Syntax;
+                return false;
+            }
+            const start = out.item_count;
+            try self.fromItem(out, kind);
+            if (kind == .cross) return true;
+            const item = &out.items[start];
+            if (natural) {
+                item.natural = true;
+                self.pool.complex = true;
+                return true;
+            }
+            if (try self.takeWord("ON")) {
+                item.on = try self.expression();
+            } else if (try self.takeWord("USING")) {
+                try self.expectSymbol(.lparen);
+                while (true) {
+                    if (item.using_count == config.columns) return error.ColumnCapacity;
+                    item.using[item.using_count] = try self.identifier();
+                    item.using_count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                try self.expectSymbol(.rparen);
+            } else return error.Syntax;
+            return true;
         }
 
         fn fromItem(self: *Self, out: *Ast.Select, kind: ast.JoinKind) Error!void {
             if (out.item_count == config.relations) return error.StatementTooComplex;
             var item: Ast.FromItem = .{ .join = kind };
+            // LATERAL (B11): the item sees the FROM items before it.
+            if (self.mode == .standard and try self.takeWord("LATERAL")) {
+                item.lateral = true;
+                self.pool.complex = true;
+            }
             if (self.mode == .standard and try self.takeSymbol(.lparen)) {
-                if (!self.isWord("SELECT") and !self.isWord("WITH")) return error.UnsupportedStatement;
+                if (!self.queryWord()) {
+                    if (item.lateral) return error.Syntax;
+                    return self.joinGroup(out, kind);
+                }
                 item.query = try self.query();
                 try self.expectSymbol(.rparen);
                 self.pool.complex = true;
@@ -2116,11 +2501,89 @@ pub fn Parser(comptime config: types.Config) type {
                     item.schema = item.name;
                     item.name = try self.identifier();
                 }
-                if (self.mode == .standard and !item.only) _ = try self.takeSymbol(.star);
+                // A function call in FROM (B11), implicitly LATERAL, with
+                // optional WITH ORDINALITY.
+                if (self.mode == .standard and !item.only and self.isSymbol(.lparen)) {
+                    item.function = try self.functionCall(item.name);
+                    self.pool.complex = true;
+                    if (self.isWord("WITH") and wordIs(self.source, try self.peek(), "ordinality")) {
+                        try self.advance();
+                        try self.advance();
+                        item.ordinality = true;
+                    }
+                } else {
+                    if (item.lateral) return error.Syntax;
+                    if (self.mode == .standard and !item.only) _ = try self.takeSymbol(.star);
+                }
             }
-            item.alias = try self.bareAlias();
+            item.alias = if (self.mode == .standard and self.rawWord("tablesample")) null else try self.bareAlias();
+            // `alias (column, ...)`: column aliases (B11).
+            if (self.mode == .standard and item.alias != null and self.isSymbol(.lparen)) {
+                try self.advance();
+                var last: u16 = none;
+                while (true) {
+                    const node = try self.pool.add(.{ .kind = .column, .name = try self.identifier() });
+                    if (last == none) item.column_aliases = node else self.pool.nodes[last].next = node;
+                    last = node;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                try self.expectSymbol(.rparen);
+                self.pool.complex = true;
+            }
+            // TABLESAMPLE method (argument, ...) [REPEATABLE (seed)] (B11).
+            if (self.mode == .standard and self.rawWord("tablesample")) {
+                if (item.query != none or item.function != none or item.lateral) return error.Syntax;
+                try self.advance();
+                if (self.rawWord("bernoulli")) {
+                    item.sample_method = 1;
+                } else if (self.isWord("SYSTEM") or self.rawWord("system")) {
+                    item.sample_method = 2;
+                } else {
+                    _ = try self.identifier();
+                    // PostgreSQL: tablesample method does not exist (42704).
+                    return error.UndefinedObject;
+                }
+                try self.advance();
+                // The argument list; the binder checks the count (2202H).
+                item.sample_percent = try self.arguments(.function, false);
+                if (try self.takeWord("REPEATABLE")) {
+                    try self.expectSymbol(.lparen);
+                    item.sample_seed = try self.expression();
+                    try self.expectSymbol(.rparen);
+                }
+                self.pool.complex = true;
+            }
             out.items[out.item_count] = item;
             out.item_count += 1;
+        }
+
+        /// A LIMIT/OFFSET/FETCH count. The integer forms of countValue keep
+        /// their exact behavior; any other expression (`(1+1)`, `'5'`, a
+        /// subquery or an outer reference) is kept in `expression` for the
+        /// binder (B11), which folds constants and otherwise evaluates it
+        /// once per execution of the query block.
+        fn countClause(self: *Self, value: *u64, negative: *bool, expr_out: *u16) Error!void {
+            const saved_tokens = self.tokens;
+            const saved_current = self.current;
+            const saved_peeked = self.peeked;
+            const saved_after = self.after_peek;
+            const saved_has = self.has_peek;
+            const saved_value = value.*;
+            const saved_negative = negative.*;
+            if (self.countValue(value, negative)) |_| {
+                if (!(self.mode == .standard and self.current.kind == .symbol and self.current.symbol != .rparen and self.current.symbol != .semicolon and self.current.symbol != .comma)) return;
+            } else |err| {
+                if (err != error.Syntax or self.mode != .standard) return err;
+            }
+            self.tokens = saved_tokens;
+            self.current = saved_current;
+            self.peeked = saved_peeked;
+            self.after_peek = saved_after;
+            self.has_peek = saved_has;
+            value.* = saved_value;
+            negative.* = saved_negative;
+            expr_out.* = try self.expression();
+            self.pool.complex = true;
         }
 
         /// A LIMIT/OFFSET/FETCH count; negative counts are reported by the
@@ -2446,7 +2909,7 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (try self.takeWord("IN")) {
                 try self.expectSymbol(.lparen);
-                if (self.mode == .standard and (self.isWord("SELECT") or self.isWord("WITH"))) {
+                if (self.mode == .standard and self.queryWord()) {
                     const inner = try self.query();
                     try self.expectSymbol(.rparen);
                     self.pool.complex = true;
@@ -2979,7 +3442,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .symbol => {
                     if (token.symbol != .lparen) return error.Syntax;
                     try self.advance();
-                    if (self.mode == .standard and (self.isWord("SELECT") or self.isWord("WITH"))) {
+                    if (self.mode == .standard and self.queryWord()) {
                         const query_index = try self.query();
                         try self.expectSymbol(.rparen);
                         self.pool.complex = true;
@@ -3119,7 +3582,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and token.kind == .word and self.isWord("EXISTS") and lparenNext(try self.peek())) {
                 try self.advance();
                 try self.advance();
-                if (!self.isWord("SELECT") and !self.isWord("WITH")) return error.Syntax;
+                if (!self.queryWord()) return error.Syntax;
                 const query_index = try self.query();
                 try self.expectSymbol(.rparen);
                 self.pool.complex = true;

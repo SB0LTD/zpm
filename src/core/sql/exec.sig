@@ -13,6 +13,7 @@ const sort_module = @import("sort.sig");
 const catalog = @import("catalog.sig");
 const aggregate_stats = @import("aggregates_stat.sig");
 const numeric_module = @import("numeric.sig");
+const tablesample = @import("tablesample.sig");
 const builtin = @import("builtin");
 const Error = types.Error;
 const none = ast.none;
@@ -117,12 +118,17 @@ pub fn Exec(comptime config: types.Config) type {
             /// System-view rows (catalog.sig View) for this statement; set by
             /// the Database before it runs a query (kept across resets).
             views: ?ViewHook = null,
+            /// RETURNING rows of data-modifying WITH entries (B11), held at
+            /// the top of the workspace across resets until the statement ends.
+            pinned_cells: usize = 0,
+            pinned_refs: usize = 0,
+            dml_rows: [config.ctes]List = undefined,
 
             fn reset(self: *Work) void {
                 self.cell_low = 0;
-                self.cell_high = self.cells.len;
+                self.cell_high = self.cells.len - self.pinned_cells;
                 self.ref_low = 0;
-                self.ref_high = self.refs.len;
+                self.ref_high = self.refs.len - self.pinned_refs;
                 self.stream_stats = .{};
                 self.read_stats = .{};
                 for (&self.ctes) |*cte| cte.* = .{};
@@ -241,16 +247,136 @@ pub fn Exec(comptime config: types.Config) type {
 
             pub fn run(self: *Query, plan_id: u16, outer: ?*const E.Context) Error!List {
                 const p = &self.plans.items[plan_id];
+                if (p.limit_expr != none or p.offset_expr != none) try self.resolveCounts(p, outer);
                 // Binding already validates live planning diagnostics. LIMIT 0
                 // must not start an aggregate, sort, window or set input at runtime.
                 if(p.limit==0) {try self.session.checkpoint();return .{};}
                 if (p.set_op != .none) return self.setOperation(p, outer);
+                if (p.values != none) return self.valuesRows(p, outer);
+                if (p.function != none) return self.tableFunction(p, outer);
                 return self.core(p, outer);
+            }
+
+            /// A function in FROM (B11). generate_series follows PostgreSQL:
+            /// a NULL argument yields no rows, a zero step is 22023, integer
+            /// series stop at the type's overflow, numeric NaN / infinite
+            /// bounds or steps are 22023. Rows count against the workspace
+            /// (54000) and every row passes a work checkpoint. Any other
+            /// function yields one row. ORDINALITY numbers rows from 1.
+            fn tableFunction(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                var ctx = self.context(outer);
+                var out: List = .{ .start = @intCast(self.work.ref_low) };
+                if (p.series == .none) {
+                    const at = try self.cells(p.width);
+                    self.work.cells[at] = try E.eval(&ctx, p.function);
+                    if (p.ordinality) self.work.cells[at + 1] = .{ .integer = 1 };
+                    try self.push(&out, at);
+                    return self.finish(p, out);
+                }
+                var args: [3]V.Cell = undefined;
+                var count: usize = 0;
+                var arg = self.pool.nodes[p.function].b;
+                while (arg != none) : (arg = self.pool.nodes[arg].next) {
+                    if (count == 3) return error.UndefinedFunction;
+                    args[count] = try E.eval(&ctx, arg);
+                    count += 1;
+                }
+                for (args[0..count]) |cell| if (cell == .null_value) return self.finish(p, out);
+                const ty = p.tys[0];
+                var one: numeric_module.Numeric = .{};
+                one.setCoef(1);
+                const step: V.Cell = if (count == 3) args[2] else if (p.series == .numeric) .{ .numeric = one } else .{ .integer = 1 };
+                var direction: i8 = 0;
+                switch (p.series) {
+                    .integer => direction = if (step.integer > 0) 1 else if (step.integer < 0) -1 else 0,
+                    .numeric => {
+                        for ([_]*const V.Cell{ &args[0], &args[1], &step }) |cell| {
+                            if (cell.numeric.special != .finite) return error.InvalidParameterValue;
+                        }
+                        direction = if (step.numeric.isZero()) 0 else if (step.numeric.negative) -1 else 1;
+                    },
+                    .timestamp => {
+                        const zero: V.Cell = .{ .interval = .{} };
+                        direction = V.compare(&step, &zero);
+                    },
+                    .none => unreachable,
+                }
+                if (direction == 0) return error.InvalidParameterValue;
+                var current = args[0];
+                var ordinal: i64 = 0;
+                while (true) {
+                    const order = V.compare(&current, &args[1]);
+                    if ((direction > 0 and order > 0) or (direction < 0 and order < 0)) break;
+                    const at = try self.cells(p.width);
+                    self.work.cells[at] = current;
+                    ordinal += 1;
+                    if (p.ordinality) self.work.cells[at + 1] = .{ .integer = ordinal };
+                    try self.push(&out, at);
+                    switch (p.series) {
+                        .integer => {
+                            const next = @addWithOverflow(current.integer, step.integer);
+                            if (next[1] != 0) break;
+                            if (ty == .int4 and (next[0] > 2147483647 or next[0] < -2147483648)) break;
+                            current = .{ .integer = next[0] };
+                        },
+                        else => current = try Io.arithmetic(.add, &current, &step, ty, self.session),
+                    }
+                }
+                return self.finish(p, out);
+            }
+
+            /// Evaluates non-constant LIMIT / OFFSET expressions once for this
+            /// execution of the plan, OFFSET first as PostgreSQL ExecLimit
+            /// does, and stores them in the plan's statement-scoped count
+            /// fields (plan storage is the statement's mutable workspace).
+            fn resolveCounts(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!void {
+                const plan: *B.Plan = @constCast(p);
+                var ctx = self.context(outer);
+                if (p.offset_expr != none) {
+                    const cell = try E.eval(&ctx, p.offset_expr);
+                    if (cell == .null_value) {
+                        plan.offset = 0;
+                    } else {
+                        if (cell.integer < 0) return error.InvalidRowCountInResultOffset;
+                        plan.offset = @intCast(cell.integer);
+                    }
+                }
+                if (p.limit_expr != none) {
+                    const cell = try E.eval(&ctx, p.limit_expr);
+                    if (cell == .null_value) {
+                        if (p.with_ties) return error.InvalidRowCountInLimit;
+                        plan.limit = 0xffffffffffffffff;
+                    } else {
+                        if (cell.integer < 0) return error.InvalidRowCountInLimit;
+                        if (p.with_ties) plan.ties_limit = @intCast(cell.integer) else plan.limit = @intCast(cell.integer);
+                    }
+                }
+            }
+
+            /// A VALUES block: each row's items in order, then ORDER BY /
+            /// OFFSET / LIMIT (B11).
+            fn valuesRows(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                var ctx = self.context(outer);
+                var out: List = .{ .start = @intCast(self.work.ref_low) };
+                var values_row = p.values;
+                while (values_row != none) : (values_row = self.pool.nodes[values_row].next) {
+                    const at = try self.cells(p.width);
+                    var item = self.pool.nodes[values_row].b;
+                    var column: usize = 0;
+                    while (item != none) : (item = self.pool.nodes[item].next) {
+                        if (column == p.width) return error.UnsupportedStatement;
+                        self.work.cells[at + column] = if (p.required[column]) try E.eval(&ctx, item) else .null_value;
+                        column += 1;
+                    }
+                    try self.push(&out, at);
+                }
+                return self.finish(p, out);
             }
 
             // ---- FROM items and joins ----------------------------------
 
             fn sourceRows(self: *Query, source: *const B.Source, outer: ?*const E.Context) Error!List {
+                if (source.sample_method != 0) return self.sampledRows(source, outer);
                 if (source.table) |index| {
                     const table = &self.tables[index];
                     var list: List = .{ .start = @intCast(self.work.ref_low) };
@@ -269,6 +395,37 @@ pub fn Exec(comptime config: types.Config) type {
                     return sink.list;
                 }
                 return self.run(source.plan, outer);
+            }
+
+            /// TABLESAMPLE BERNOULLI / SYSTEM over the snapshot-visible rows
+            /// (tablesample.sig). Arguments are evaluated once per scan: NULL
+            /// or out-of-range percentages are 2202H, a NULL seed 2202G.
+            /// Without REPEATABLE the seed comes from the statement snapshot.
+            fn sampledRows(self: *Query, source: *const B.Source, outer: ?*const E.Context) Error!List {
+                const index = source.table orelse return error.UnsupportedStatement;
+                var ctx = self.context(outer);
+                const percent_cell = try E.eval(&ctx, source.sample_percent);
+                if (percent_cell != .float4) return error.InvalidTablesampleArgument;
+                const percent = percent_cell.float4;
+                if (!(percent >= 0 and percent <= 100)) return error.InvalidTablesampleArgument;
+                var seed: u32 = undefined;
+                if (source.sample_seed != none) {
+                    const seed_cell = try E.eval(&ctx, source.sample_seed);
+                    if (seed_cell != .float8) return error.InvalidTablesampleRepeat;
+                    seed = tablesample.hashFloat8(seed_cell.float8);
+                } else {
+                    seed = tablesample.hash3(@truncate(self.snap.csn), @truncate(self.snap.csn >> 32), @truncate(@as(u64, self.snap.cid) ^ @as(u64, self.snap.slot)));
+                }
+                const threshold = tablesample.cutoff(percent);
+                const table = &self.tables[index];
+                var list: List = .{ .start = @intCast(self.work.ref_low) };
+                for (0..table.row_high) |slot| {
+                    try self.session.checkpoint();
+                    if (!tablesample.keep(source.sample_method, slot, seed, threshold)) continue;
+                    const version = S.visibleAt(table, slot, self.snap) orelse continue;
+                    try self.push(&list, version);
+                }
+                return list;
             }
 
             fn rowOf(self: *const Query, source: *const B.Source, handle: u32) [*]const V.Cell {
@@ -344,6 +501,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// Left-deep joins prune eligible WHERE conjuncts at their first
             /// complete tuple, before allocating the next intermediate stage.
             fn join(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!Tuples {
+                if (p.general_join) return self.joinGeneral(p, outer);
                 var ctx = self.context(outer);
                 if (p.source_count == 0) {
                     const kept = try keep(&ctx, p.where, null);
@@ -404,6 +562,138 @@ pub fn Exec(comptime config: types.Config) type {
                     current = next;
                 }
                 return current;
+            }
+
+            // ---- general join trees (B11) ------------------------------
+
+            /// Join tree with LATERAL items and parenthesized right operands
+            /// (binder Plan.general_join). Every tuple holds one handle per
+            /// FROM item, absent outside its operand. A right operand is
+            /// joined as a whole; a LATERAL item reruns per left tuple with
+            /// that tuple as its outer context. WHERE filters the complete
+            /// tree. No probe, early filter or streamed path applies.
+            fn joinGeneral(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!Tuples {
+                var ctx = self.context(outer);
+                const tree = try self.joinRange(p, &ctx, outer, 0, p.source_count - 1);
+                if (p.where == none) return tree;
+                var out: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 0, .width = tree.width };
+                for (0..tree.count) |index| {
+                    try self.session.checkpoint();
+                    self.setTuple(p, &ctx, tree, index);
+                    if (try keep(&ctx, p.where, null)) try self.emitPair(&out, tree, index, tree, null, tree.width);
+                }
+                return out;
+            }
+
+            /// Items first..last joined left-deep; each later operand is one
+            /// item or a parenthesized group (Source.group_end).
+            fn joinRange(self: *Query, p: *const B.Plan, ctx: *E.Context, outer: ?*const E.Context, first: usize, last: usize) Error!Tuples {
+                var current = try self.leafTuples(p, first, try self.sourceRows(&p.sources[first], outer));
+                var next = first + 1;
+                while (next <= last) {
+                    const end: usize = if (p.sources[next].group_end != none) p.sources[next].group_end else next;
+                    if (end < next or end > last) return error.UnsupportedStatement;
+                    current = try self.joinStep(p, ctx, outer, current, next, end);
+                    next = end + 1;
+                }
+                return current;
+            }
+
+            fn leafTuples(self: *Query, p: *const B.Plan, slot: usize, rows: List) Error!Tuples {
+                const width: u32 = @intCast(p.source_count);
+                var out: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 0, .width = width };
+                for (self.handles(rows)) |handle| {
+                    try self.session.checkpoint();
+                    const at = try self.refs(width);
+                    if (out.count == 0) out.start = at;
+                    @memset(self.work.refs[at..][0..width], absent);
+                    self.work.refs[at + slot] = handle;
+                    out.count += 1;
+                }
+                return out;
+            }
+
+            /// Appends left[li] slots before `split` and right[ri] slots from
+            /// it (a null index null-extends that side).
+            fn emitPair(self: *Query, out: *Tuples, left: Tuples, li: ?usize, right: Tuples, ri: ?usize, split: usize) Error!void {
+                try self.session.checkpoint();
+                const at = try self.refs(out.width);
+                if (out.count == 0) out.start = at;
+                if (out.start + out.count * out.width != at) return error.WorkspaceCapacity;
+                for (0..out.width) |slot| {
+                    const side = if (slot < split) left else right;
+                    const index = if (slot < split) li else ri;
+                    self.work.refs[at + slot] = if (index) |i| self.work.refs[side.start + i * side.width + slot] else absent;
+                }
+                out.count += 1;
+            }
+
+            fn setSlots(self: *const Query, p: *const B.Plan, ctx: *E.Context, tuples: Tuples, index: usize, first: usize, last: usize) void {
+                const base = tuples.start + index * tuples.width;
+                for (first..last + 1) |slot| {
+                    const handle = self.work.refs[base + slot];
+                    ctx.tuple[slot] = if (handle == absent) null else self.rowOf(&p.sources[slot], handle);
+                }
+            }
+
+            /// Joins the operand of items j..end (the item's join kind and
+            /// condition) to `left`.
+            fn joinStep(self: *Query, p: *const B.Plan, ctx: *E.Context, outer: ?*const E.Context, left: Tuples, j: usize, end: usize) Error!Tuples {
+                const source = &p.sources[j];
+                const width: u32 = @intCast(p.source_count);
+                const lateral = source.lateral and end == j;
+                // Every operand row is produced before the first output
+                // tuple, so the output stays one contiguous workspace range.
+                var lists: u32 = 0;
+                var right: Tuples = .{ .start = 0, .count = 0, .width = width };
+                if (lateral) {
+                    lists = try self.refs(@as(usize, left.count) * 2);
+                    for (0..left.count) |index| {
+                        self.setTuple(p, ctx, left, index);
+                        const rows = try self.run(source.plan, ctx);
+                        self.work.refs[lists + index * 2] = rows.start;
+                        self.work.refs[lists + index * 2 + 1] = rows.count;
+                    }
+                } else if (end == j) {
+                    right = try self.leafTuples(p, j, try self.sourceRows(source, outer));
+                } else right = try self.joinRange(p, ctx, outer, j, end);
+                const tracks = source.join == .right or source.join == .full;
+                if (lateral and tracks) return error.InvalidColumnReference;
+                const outer_join = source.join == .left or source.join == .full;
+                var matched: u32 = 0;
+                if (tracks) {
+                    matched = try self.refs(right.count);
+                    @memset(self.work.refs[matched..][0..right.count], 0);
+                }
+                var out: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 0, .width = width };
+                for (0..left.count) |li| {
+                    var any = false;
+                    if (lateral) {
+                        const rows: List = .{ .start = self.work.refs[lists + li * 2], .count = self.work.refs[lists + li * 2 + 1] };
+                        for (self.handles(rows)) |handle| {
+                            try self.session.checkpoint();
+                            self.setTuple(p, ctx, left, li);
+                            ctx.tuple[j] = self.rowOf(source, handle);
+                            if (source.on != none and (try E.truth(ctx, source.on)) != true) continue;
+                            any = true;
+                            try self.emitPair(&out, left, li, left, null, width);
+                            self.work.refs[out.start + (out.count - 1) * width + j] = handle;
+                        }
+                    } else for (0..right.count) |ri| {
+                        try self.session.checkpoint();
+                        self.setTuple(p, ctx, left, li);
+                        self.setSlots(p, ctx, right, ri, j, end);
+                        if (source.on != none and (try E.truth(ctx, source.on)) != true) continue;
+                        any = true;
+                        if (tracks) self.work.refs[matched + ri] = 1;
+                        try self.emitPair(&out, left, li, right, ri, j);
+                    }
+                    if (!any and outer_join) try self.emitPair(&out, left, li, right, null, j);
+                }
+                if (tracks) for (0..right.count) |ri| {
+                    if (self.work.refs[matched + ri] == 0) try self.emitPair(&out, left, null, right, ri, j);
+                };
+                return out;
             }
 
             // ---- projection and grouping -------------------------------
@@ -2595,7 +2885,26 @@ pub fn Exec(comptime config: types.Config) type {
                 list.start += skip;
                 list.count -= skip;
                 if (p.limit < list.count) list.count = @intCast(p.limit);
+                if (p.with_ties and p.ties_limit < list.count) list.count = try self.withTies(p, list);
                 return list;
+            }
+
+            /// FETCH ... WITH TIES: the first ties_limit rows plus every
+            /// following row equal (NULLs equal) to the last one on the
+            /// ORDER BY keys.
+            fn withTies(self: *Query, p: *const B.Plan, list: List) Error!u32 {
+                var kept: u32 = @intCast(p.ties_limit);
+                if (kept == 0) return 0;
+                const items = self.handles(list);
+                const last = items[kept - 1];
+                while (kept < list.count) : (kept += 1) {
+                    try self.session.checkpoint();
+                    const candidate = items[kept];
+                    for (p.tie_keys[0..p.tie_key_count]) |key| {
+                        if (V.compare(&self.work.cells[candidate + key.column], &self.work.cells[last + key.column]) != 0) return kept;
+                    }
+                }
+                return kept;
             }
 
             fn rollupRecord(self:*Query,p:*const B.Plan,keys:[]const V.Cell,prefix:usize,buckets:u32,slots:usize,
@@ -2696,6 +3005,156 @@ pub fn Exec(comptime config: types.Config) type {
                 self.work.stream_stats.scratch_cells=@max(self.work.stream_stats.scratch_cells,groups*record_cells);
                 self.work.stream_stats.scratch_refs=@max(self.work.stream_stats.scratch_refs,slots+capacity+groups);
                 return self.finish(p,out);
+            }
+
+            /// The group record of grouping set `set` (bit mask `mask` over
+            /// the keys) for `keys`; omitted keys are NULL. The set index is
+            /// part of the identity, so repeated sets keep separate groups.
+            fn groupingSetRecord(self: *Query, p: *const B.Plan, keys: []const V.Cell, set: usize, mask: u64, buckets: u32, slots: usize,
+                tickets: u32, groups: *usize, capacity: usize, record_cells: usize, ordinary_cells: usize, distinct: *const DistinctLayout) Error!u32 {
+                var code: usize = 2166136261 ^ set;
+                const null_value: V.Cell = .null_value;
+                for (keys, 0..) |*key, column| {
+                    const included = (mask >> @intCast(column)) & 1 != 0;
+                    const cell = if (included) key else &null_value;
+                    const hash: usize = if (cell.* == .null_value) 0x9e3779b9 else V.hash(cell);
+                    code = (code ^ hash) *% 16777619;
+                }
+                var bucket = code & (slots - 1);
+                while (true) {
+                    try self.session.checkpoint();
+                    self.work.stream_stats.probes += 1;
+                    const found = self.work.refs[buckets + bucket];
+                    if (found == absent) {
+                        if (groups.* == capacity) return error.WorkspaceCapacity;
+                        const at = try self.cells(record_cells);
+                        for (keys, 0..) |key, column| self.work.cells[at + column] = if ((mask >> @intCast(column)) & 1 != 0) key else .null_value;
+                        self.work.cells[at + p.key_count + p.agg_count] = .{ .integer = @intCast(set) };
+                        for (self.accumulators(at + @as(u32, @intCast(p.key_count + p.agg_count + 1)), p.agg_count)) |*state| state.* = .{};
+                        if (distinct.active) @memset(self.distinctWords(at + @as(u32, @intCast(ordinary_cells)), distinct.words), 0);
+                        self.work.refs[buckets + bucket] = at;
+                        self.work.refs[tickets + groups.*] = at;
+                        groups.* += 1;
+                        return at;
+                    }
+                    var equal = self.work.cells[found + p.key_count + p.agg_count].integer == @as(i64, @intCast(set));
+                    if (equal) for (keys, 0..) |*key, column| {
+                        if ((mask >> @intCast(column)) & 1 == 0) continue;
+                        if (V.compare(key, &self.work.cells[found + column]) != 0) {
+                            equal = false;
+                            break;
+                        }
+                    };
+                    if (equal) return found;
+                    bucket = (bucket + 1) & (slots - 1);
+                }
+            }
+
+            /// GROUPING SETS / CUBE / composite ROLLUP (B11): one input pass;
+            /// every input row updates one group of every set. A set with no
+            /// key (`()`) has a group even over no input. GROUPING() reads the
+            /// omitted-key mask of the row's set. Bounded by the workspace
+            /// (54000) and the execution checkpoints.
+            fn groupingSets(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                if (p.key_count > 64) return error.StatementTooComplex;
+                const tuples = try self.join(p, outer);
+                for (p.aggs[0..p.agg_count], 0..) |agg, index| if (p.aggregate_required[index] and agg.distinct) {
+                    if (agg.kind != .count or !value_module.integral(agg.arg_ty)) return error.UnsupportedStatement;
+                    const argument = self.pool.nodes[agg.arg];
+                    if (argument.kind != .column or argument.level != 0 or argument.relation >= p.source_count or p.sources[argument.relation].table == null) return error.UnsupportedStatement;
+                };
+                const distinct = self.distinctLayout(p) orelse return error.WorkspaceCapacity;
+                const ordinary_cells = p.key_count + p.agg_count + 1 + accumulatorCells(p.agg_count);
+                const record_sum = @addWithOverflow(ordinary_cells, distinct.cells);
+                if (record_sum[1] != 0) return error.WorkspaceCapacity;
+                const record_cells = record_sum[0];
+                const capacity = @min((self.work.cell_high - self.work.cell_low) / (record_cells + p.width), (self.work.ref_high - self.work.ref_low) / 8);
+                if (capacity == 0) return error.WorkspaceCapacity;
+                var slots: usize = 2;
+                while (slots < capacity * 2) slots *= 2;
+                const buckets = try self.refs(slots);
+                @memset(self.work.refs[buckets..][0..slots], absent);
+                const tickets = try self.refs(capacity);
+                var groups: usize = 0;
+                var keys: [config.columns]V.Cell = @splat(.null_value);
+                // Empty grouping sets yield their group even without input.
+                var set_node = p.grouping_sets;
+                var set: usize = 0;
+                while (set_node != none) : ({
+                    set_node = self.pool.nodes[set_node].next;
+                    set += 1;
+                }) {
+                    const mask: u64 = @bitCast(self.pool.nodes[set_node].integer);
+                    if (mask == 0) _ = try self.groupingSetRecord(p, keys[0..p.key_count], set, 0, buckets, slots, tickets, &groups, capacity, record_cells, ordinary_cells, &distinct);
+                }
+                var ctx = self.context(outer);
+                for (0..tuples.count) |row_index| {
+                    try self.session.checkpoint();
+                    self.setTuple(p, &ctx, tuples, row_index);
+                    for (p.keys[0..p.key_count], 0..) |id, index| keys[index] = try E.eval(&ctx, id);
+                    var values: [config.columns]V.Cell = undefined;
+                    var allowed: [config.columns]bool = @splat(false);
+                    for (p.aggs[0..p.agg_count], 0..) |agg, index| {
+                        if (!p.aggregate_required[index]) continue;
+                        if (agg.filter != none and try E.truth(&ctx, agg.filter) != true) continue;
+                        if (agg.kind == .count_star) {
+                            allowed[index] = true;
+                            continue;
+                        }
+                        values[index] = try E.eval(&ctx, agg.arg);
+                        allowed[index] = values[index] != .null_value;
+                    }
+                    set_node = p.grouping_sets;
+                    set = 0;
+                    while (set_node != none) : ({
+                        set_node = self.pool.nodes[set_node].next;
+                        set += 1;
+                    }) {
+                        const mask: u64 = @bitCast(self.pool.nodes[set_node].integer);
+                        const at = try self.groupingSetRecord(p, keys[0..p.key_count], set, mask, buckets, slots, tickets, &groups, capacity, record_cells, ordinary_cells, &distinct);
+                        const states = self.accumulators(at + @as(u32, @intCast(p.key_count + p.agg_count + 1)), p.agg_count);
+                        const seen = self.distinctWords(at + @as(u32, @intCast(ordinary_cells)), distinct.words);
+                        for (p.aggs[0..p.agg_count], states, 0..) |agg, *state, index| {
+                            try self.session.checkpoint();
+                            if (!allowed[index]) continue;
+                            if (agg.kind == .count_star) {
+                                state.count += 1;
+                                continue;
+                            }
+                            if (agg.distinct) {
+                                const domain = distinct.domains[index];
+                                const relative = @as(i128, values[index].integer) - domain.base;
+                                if (relative < 0 or relative >= domain.span) return error.WorkspaceCapacity;
+                                const position: usize = @intCast(relative);
+                                const bit = @as(u64, 1) << @as(u6, @intCast(position % 64));
+                                const word = &seen[domain.offset + position / 64];
+                                if (word.* & bit != 0) continue;
+                                word.* |= bit;
+                            }
+                            try self.accumulate(&agg, state, &values[index]);
+                        }
+                    }
+                }
+                if (groups > 1) {
+                    const scratch = try self.refs(groups);
+                    const sorter: GroupSorter = .{ .query = self, .width = p.key_count };
+                    _ = try sort_module.mergeSort(self.work.refs[tickets..][0..groups], self.work.refs[scratch..][0..groups], &sorter);
+                }
+                var out: List = .{};
+                for (self.work.refs[tickets..][0..groups]) |at| {
+                    const index: usize = @intCast(self.work.cells[at + p.key_count + p.agg_count].integer);
+                    var node = p.grouping_sets;
+                    for (0..index) |_| node = self.pool.nodes[node].next;
+                    const mask: u64 = @bitCast(self.pool.nodes[node].integer);
+                    // GROUPING() reads key i at bit key_count-1-i (as ROLLUP).
+                    var omitted: u64 = 0;
+                    for (0..p.key_count) |key| {
+                        if ((mask >> @intCast(key)) & 1 == 0) omitted |= @as(u64, 1) << @intCast(p.key_count - 1 - key);
+                    }
+                    try self.projectGroupMask(p, at, self.accumulators(at + @as(u32, @intCast(p.key_count + p.agg_count + 1)), p.agg_count), outer, &out, omitted);
+                }
+                self.work.stream_stats.groups += groups;
+                return self.finish(p, out);
             }
 
             fn windowIncluded(self:*const Query,win:*const B.Window,at:u32) bool {
@@ -3097,6 +3556,7 @@ pub fn Exec(comptime config: types.Config) type {
 
             fn core(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
                 if(p.window_count!=0) return self.windowCore(p,outer);
+                if (p.grouping_sets != none) return self.groupingSets(p, outer);
                 if(p.rollup) return self.groupingRollup(p,outer);
                 if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(self.repeatable()) {
                     const at=self.mark();const stats=self.work.stream_stats;
@@ -3231,6 +3691,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// a non-terminating recursion ends in WorkspaceCapacity.
             fn materializeCte(self: *Query, id: u8, outer: ?*const E.Context) Error!List {
                 const state = &self.work.ctes[id];
+                if (self.plans.ctes[id].dml != B.no_dml) return self.work.dml_rows[self.plans.ctes[id].dml];
                 switch (state.state) {
                     .done => return state.rows,
                     .iterating => return state.working,
@@ -3243,6 +3704,7 @@ pub fn Exec(comptime config: types.Config) type {
                     return self.run(definition.plan, outer);
                 }
                 const width = p.count;
+                if (definition.search or definition.cycle) return self.searchCycleCte(id, outer);
                 if (!definition.recursive) {
                     const at = self.mark();
                     const list = try self.run(definition.plan, outer);
@@ -3276,6 +3738,152 @@ pub fn Exec(comptime config: types.Config) type {
                 state.rows = result;
                 state.state = .done;
                 return result;
+            }
+
+            /// WITH RECURSIVE ... SEARCH / CYCLE (B11). Iterates like
+            /// materializeCte; every new row gets its sequence key (depth-
+            /// first: the parent's key plus this row's search columns;
+            /// breadth-first: depth then the columns) and its cycle mark (an
+            /// ancestor, the parent included, equal on every cycle column).
+            /// Marked rows are emitted but never expanded, so CYCLE ends on
+            /// any finite graph; otherwise the workspace bounds the recursion
+            /// (54000). Each iteration and ancestor step is a checkpoint.
+            fn searchCycleCte(self: *Query, id: u8, outer: ?*const E.Context) Error!List {
+                const state = &self.work.ctes[id];
+                const definition = &self.plans.ctes[id];
+                const p = &self.plans.items[definition.plan];
+                const width = p.count;
+                const compared = width - 1;
+                var at = self.mark();
+                var seed = try self.run(p.left, outer);
+                try self.searchCycleRows(definition, seed, true);
+                if (!p.set_all) seed = try self.fresh(.{}, seed, compared);
+                var result = try self.persist(seed, width);
+                self.release(at);
+                self.selfHandles(definition, result);
+                var working = result;
+                while (true) {
+                    state.state = .iterating;
+                    try self.session.checkpoint();
+                    at = self.mark();
+                    var expand: List = .{ .start = @intCast(self.work.ref_low) };
+                    for (self.handles(working)) |handle| {
+                        if (definition.cycle) {
+                            const flag = &self.work.cells[handle + definition.mark_column];
+                            if (flag.* == .null_value or V.compare(flag, &definition.mark_value) == 0) continue;
+                        }
+                        try self.push(&expand, handle);
+                    }
+                    state.working = expand;
+                    var step = try self.run(p.right, outer);
+                    try self.searchCycleRows(definition, step, false);
+                    if (!p.set_all) step = try self.fresh(result, step, compared);
+                    if (step.count == 0) {
+                        self.release(at);
+                        break;
+                    }
+                    const added = try self.persist(step, width);
+                    self.release(at);
+                    self.selfHandles(definition, added);
+                    result = try self.concatPersistent(result, added);
+                    working = added;
+                }
+                state.rows = result;
+                state.state = .done;
+                return result;
+            }
+
+            fn selfHandles(self: *Query, definition: *const B.CteDef, rows: List) void {
+                for (self.handles(rows)) |handle| self.work.cells[handle + definition.self_column] = .{ .integer = handle };
+            }
+
+            /// Sequence keys and cycle marks for new rows (`seed`: no parent).
+            fn searchCycleRows(self: *Query, definition: *const B.CteDef, rows: List, seed: bool) Error!void {
+                for (self.handles(rows)) |handle| {
+                    try self.session.checkpoint();
+                    const row_cells = self.work.cells[handle..];
+                    const parent: ?u32 = if (seed or row_cells[definition.path_column] == .null_value or !definition.cycle and !definition.search) null else @intCast(row_cells[definition.path_column].integer);
+                    if (definition.cycle) {
+                        var cycle = false;
+                        var ancestor = parent;
+                        while (ancestor) |up| {
+                            try self.session.checkpoint();
+                            var equal = true;
+                            for (definition.cycle_columns[0..definition.cycle_count]) |column| {
+                                if (E.compareOp(.eq, &row_cells[column], &self.work.cells[up + column]) != true) {
+                                    equal = false;
+                                    break;
+                                }
+                            }
+                            if (equal) {
+                                cycle = true;
+                                break;
+                            }
+                            const link = &self.work.cells[up + definition.path_column];
+                            ancestor = if (link.* == .null_value) null else @intCast(link.integer);
+                        }
+                        row_cells[definition.mark_column] = if (cycle) definition.mark_value else definition.mark_default;
+                    }
+                    if (definition.search) {
+                        var key: V.Text = .{};
+                        if (definition.breadth) {
+                            var depth: i64 = 0;
+                            if (parent) |up| {
+                                const above = &self.work.cells[up + definition.ord_column].text;
+                                depth = decodeDepth(above.slice()) + 1;
+                            }
+                            try appendKeyCell(&key, &.{ .integer = depth });
+                        } else if (parent) |up| {
+                            const above = &self.work.cells[up + definition.ord_column].text;
+                            try appendKeyBytes(&key, above.slice());
+                        }
+                        for (definition.search_columns[0..definition.search_count]) |column| try appendKeyCell(&key, &row_cells[column]);
+                        row_cells[definition.ord_column] = .{ .text = key };
+                    }
+                    if (definition.cycle and seed) row_cells[definition.path_column] = .null_value;
+                }
+            }
+
+            fn decodeDepth(bytes: []const u8) i64 {
+                if (bytes.len < 9) return 0;
+                var raw: u64 = 0;
+                for (bytes[1..9]) |byte| raw = (raw << 8) | byte;
+                return @bitCast(raw ^ (@as(u64, 1) << 63));
+            }
+
+            fn appendKeyBytes(key: *V.Text, bytes: []const u8) Error!void {
+                if (key.len + bytes.len > key.bytes.len) return error.TextCapacity;
+                @memcpy(key.bytes[key.len..][0..bytes.len], bytes);
+                key.len += bytes.len;
+            }
+
+            /// Order-preserving, self-delimiting key bytes: bytewise order of
+            /// the keys equals PostgreSQL's record (NULL last) / array order.
+            fn appendKeyCell(key: *V.Text, cell: *const V.Cell) Error!void {
+                if (cell.* == .null_value) return appendKeyBytes(key, &.{0x02});
+                try appendKeyBytes(key, &.{0x01});
+                const integer: ?i64 = switch (cell.*) {
+                    .integer => |value| value,
+                    .date => |value| value,
+                    .timestamp, .timestamptz => |value| value,
+                    .boolean => |value| @intFromBool(value),
+                    else => null,
+                };
+                if (integer) |value| {
+                    const raw: u64 = @as(u64, @bitCast(value)) ^ (@as(u64, 1) << 63);
+                    var bytes: [8]u8 = undefined;
+                    for (0..8) |index| bytes[index] = @truncate(raw >> @intCast(56 - index * 8));
+                    return appendKeyBytes(key, &bytes);
+                }
+                switch (cell.*) {
+                    .text => |*text| {
+                        for (text.slice()) |byte| {
+                            if (byte == 0) try appendKeyBytes(key, &.{ 0x00, 0x01 }) else try appendKeyBytes(key, &.{byte});
+                        }
+                        try appendKeyBytes(key, &.{ 0x00, 0x00 });
+                    },
+                    else => return error.UnsupportedStatement,
+                }
             }
 
             // ---- subqueries --------------------------------------------
