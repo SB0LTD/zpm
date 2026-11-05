@@ -665,9 +665,32 @@ pub fn Binder(comptime config: types.Config) type {
             n.ty = .money;
         }
 
+        /// pg_lsn operators: pg_lsn - pg_lsn -> numeric; pg_lsn + numeric,
+        /// numeric + pg_lsn and pg_lsn - numeric -> pg_lsn. An untyped
+        /// operand is taken as the other operand's type when that operator
+        /// exists (`-`), otherwise as numeric (`+`).
+        fn lsnArithmetic(context: *const Context, n: *ast.Node) Error!void {
+            if (n.op != .add and n.op != .sub) return error.UndefinedFunction;
+            if (context.node(n.a).ty == .unknown) try coerce(context, n.a, if (n.op == .sub) .pg_lsn else .numeric);
+            if (context.node(n.b).ty == .unknown) try coerce(context, n.b, if (n.op == .sub) .pg_lsn else .numeric);
+            const left = context.node(n.a).ty;
+            const right = context.node(n.b).ty;
+            if (left == .pg_lsn and right == .pg_lsn) {
+                if (n.op != .sub) return error.UndefinedFunction;
+                n.ty = .numeric;
+                return;
+            }
+            const scalar = if (left == .pg_lsn) right else left;
+            if (left != .pg_lsn and n.op == .sub) return error.UndefinedFunction;
+            if (!value.numericCategory(scalar) or !value.castable(scalar, .numeric, .implicit)) return error.UndefinedFunction;
+            if (left == .pg_lsn) n.b = try convert(context, n.b, .numeric, -1, .implicit) else n.a = try convert(context, n.a, .numeric, -1, .implicit);
+            n.ty = .pg_lsn;
+        }
+
         fn arithmeticType(context: *const Context, n: *ast.Node) Error!void {
             if (context.node(n.a).ty == .unknown and context.node(n.b).ty == .unknown) return error.AmbiguousFunction;
             if (context.node(n.a).ty == .money or context.node(n.b).ty == .money) return moneyArithmetic(context, n);
+            if (context.node(n.a).ty == .pg_lsn or context.node(n.b).ty == .pg_lsn) return lsnArithmetic(context, n);
             if (timeType(context.node(n.a).ty) or timeType(context.node(n.b).ty)) return timeArithmetic(context, n);
             var left = context.node(n.a).ty;
             var right = context.node(n.b).ty;
@@ -1005,6 +1028,8 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .min, .max => switch (arg_ty) {
                     .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval, .bpchar, .time, .timetz, .money => arg_ty,
+                    // pg_lsn_larger/smaller and xid8_larger/smaller.
+                    .pg_lsn, .xid8 => arg_ty,
                     .name, .varchar => blk: {
                         n.b = try convert(context, arg, .text, -1, .implicit);
                         break :blk .text;

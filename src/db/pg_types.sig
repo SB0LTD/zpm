@@ -9,8 +9,8 @@
 //! byte 1 + text, and text/name/json/varchar/bpchar raw bytes (bpchar
 //! padded), UUID 16 bytes, BYTEA raw bytes (hex text), TIME i64
 //! microseconds, TIMETZ {i64 microseconds, i32 seconds west} and BIT/VARBIT
-//! {i32 bit length, packed bits} and MONEY i64 cents. Parameters are
-//! rendered as
+//! {i32 bit length, packed bits}, MONEY i64 cents and pg_lsn/xid8 u64.
+//! Parameters are rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
 //! is a protocol violation (08P01).
@@ -126,6 +126,7 @@ pub fn Types(comptime Result: type) type {
                     try put(out, &at, value.slice());
                 },
                 .money => |value| try putInt(i64, out, &at, value),
+                .pg_lsn, .xid8 => |value| try putInt(u64, out, &at, value),
             }
             return at;
         }
@@ -216,7 +217,7 @@ pub fn Types(comptime Result: type) type {
             const need: usize = switch (data_type) {
                 .smallint => 2,
                 .integer32, .oid, .real, .date => 4,
-                .integer, .double, .timestamp, .timestamptz, .time, .money => 8,
+                .integer, .double, .timestamp, .timestamptz, .time, .money, .pg_lsn, .xid8 => 8,
                 .timetz => 12,
                 .interval, .uuid => 16,
                 else => 0,
@@ -233,6 +234,8 @@ pub fn Types(comptime Result: type) type {
                 .interval => .{ .interval = .{ .us = getInt(i64, bytes[0..8]), .days = getInt(i32, bytes[8..12]), .months = getInt(i32, bytes[12..16]) } },
                 .uuid => .{ .uuid = bytes[0..16].* },
                 .money => .{ .money = getInt(i64, bytes) },
+                .pg_lsn => .{ .pg_lsn = getInt(u64, bytes) },
+                .xid8 => .{ .xid8 = getInt(u64, bytes) },
                 .time => blk: {
                     const us = getInt(i64, bytes);
                     if (us < 0 or us > 86400000000) return error.ProtocolViolation;

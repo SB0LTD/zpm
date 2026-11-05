@@ -212,6 +212,9 @@ pub const Keyword = enum {
     bit,
     varbit,
     money,
+    // Advanced types (B11 advanced types lane).
+    pg_lsn,
+    xid8,
 };
 
 /// Words that cannot be unquoted identifiers.

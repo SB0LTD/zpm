@@ -342,11 +342,11 @@ pub const Dialect = enum { postgres, mysql, tds };
 
 /// Stored column / result types. `integer` is int8 (BIGINT) and
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
-pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money };
+pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8 };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet.
-pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money };
+pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8 };
 
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
@@ -375,6 +375,8 @@ pub fn dataTypeOf(ty: Type) DataType {
         .bit => .bit,
         .varbit => .varbit,
         .money => .money,
+        .pg_lsn => .pg_lsn,
+        .xid8 => .xid8,
     };
 }
 
@@ -405,6 +407,8 @@ pub fn typeOfData(data_type: DataType) Type {
         .bit => .bit,
         .varbit => .varbit,
         .money => .money,
+        .pg_lsn => .pg_lsn,
+        .xid8 => .xid8,
     };
 }
 
@@ -439,6 +443,8 @@ pub fn typeInfo(data_type: DataType) TypeInfo {
         .bit => .{ .oid = 1560, .name = "bit", .len = -1, .category = 'V', .array = 1561 },
         .varbit => .{ .oid = 1562, .name = "varbit", .len = -1, .category = 'V', .array = 1563 },
         .money => .{ .oid = 790, .name = "money", .len = 8, .category = 'N', .array = 791 },
+        .pg_lsn => .{ .oid = 3220, .name = "pg_lsn", .len = 8, .category = 'U', .array = 3221 },
+        .xid8 => .{ .oid = 5069, .name = "xid8", .len = 8, .category = 'U', .array = 271 },
     };
 }
 
@@ -476,6 +482,8 @@ pub fn sqlTypeName(data_type: DataType) []const u8 {
         .bit => "bit",
         .varbit => "bit varying",
         .money => "money",
+        .pg_lsn => "pg_lsn",
+        .xid8 => "xid8",
     };
 }
 
@@ -507,6 +515,8 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .bit => "bit_in",
         .varbit => "varbit_in",
         .money => "cash_in",
+        .pg_lsn => "pg_lsn_in",
+        .xid8 => "xid8in",
     };
 }
 
@@ -624,7 +634,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8 };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -650,6 +660,10 @@ pub fn Values(comptime config: Config) type {
             bits: BitString,
             /// MONEY: cents (money.sig).
             money: i64,
+            /// pg_lsn: a 64-bit WAL position (catalog_ids.sig).
+            pg_lsn: u64,
+            /// xid8: a 64-bit full transaction id (catalog_ids.sig).
+            xid8: u64,
         };
 
         pub const Row = struct {
@@ -690,6 +704,8 @@ pub fn Values(comptime config: Config) type {
                 .timetz => .timetz,
                 .bit, .varbit => .bits,
                 .money => .money,
+                .pg_lsn => .pg_lsn,
+                .xid8 => .xid8,
             };
         }
 
@@ -722,6 +738,8 @@ pub fn Values(comptime config: Config) type {
                 .timetz => |value| time_of_day.compareTimeTz(value, right.timetz),
                 .bits => |*value| BitString.compare(value, &right.bits),
                 .money => |value| order(i64, value, right.money),
+                .pg_lsn => |value| order(u64, value, right.pg_lsn),
+                .xid8 => |value| order(u64, value, right.xid8),
             };
         }
 
@@ -780,6 +798,7 @@ pub fn Values(comptime config: Config) type {
                 },
                 .date => |days| return wordHash(@bitCast(@as(i64, days)), tag),
                 .timestamp, .timestamptz, .time, .money => |us| return wordHash(@bitCast(us), tag),
+                .pg_lsn, .xid8 => |word| return wordHash(word, tag),
                 .timetz => |time| {
                     mix(&code, tag);
                     mix(&code, @bitCast(time.us));

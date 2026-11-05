@@ -49,8 +49,9 @@
 //!   (VARCHAR values use 3) | 13 uuid 16 bytes | 14 bytea len u32 + bytes
 //!   | 15 time i64 | 16 timetz {us i64, zone i32 seconds west}
 //!   | 17 bit/varbit bit length u32 + packed bytes (zero padded)
-//!   | 18 money i64 cents. Every value is checked against the
-//!   column's type OID (create_table) before anything applies.
+//!   | 18 money i64 cents | 19 pg_lsn u64 | 20 xid8 u64. Every value is
+//!   checked against the column's type OID (create_table) before anything
+//!   applies.
 //! Ops may repeat a (table, rowid) and apply in record order.
 //!
 //! apply() decodes and validates the WHOLE record against a bounded,
@@ -285,6 +286,14 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 17);
                     try writer.int(u32, @intCast(value.len));
                     try writer.bytes(value.slice());
+                },
+                .pg_lsn => |value| {
+                    try writer.int(u8, 19);
+                    try writer.int(u64, value);
+                },
+                .xid8 => |value| {
+                    try writer.int(u8, 20);
+                    try writer.int(u64, value);
                 },
             }
         }
@@ -733,6 +742,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     break :blk .{ .time = us };
                 },
                 18 => .{ .money = try reader.int(i64) },
+                19 => .{ .pg_lsn = try reader.int(u64) },
+                20 => .{ .xid8 = try reader.int(u64) },
                 17 => blk: {
                     const bits = try reader.int(u32);
                     if (bits > V.BitString.max_bits) return error.ChangeRecordConflict;

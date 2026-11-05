@@ -122,6 +122,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-mvcc", "tests/test_sql_mvcc.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-types", "tests/test_sql_types.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-types-core", "tests/test_sql_types_core.sig", &.{importEntry("sql", "src/core/sql.sig"), importEntry("pg_types", "src/db/pg_types.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-types-advanced", "tests/test_sql_types_advanced.sig", &.{importEntry("sql", "src/core/sql.sig"), importEntry("pg_types", "src/db/pg_types.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-json-operators", "tests/test_sql_json_operators.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-json-canonical", "tests/test_sql_json_canonical.sig", &.{importEntry("jsonb", "src/core/sql/jsonb.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-query", "tests/test_sql_query.sig", &.{importEntry("sql", "src/core/sql.sig")});

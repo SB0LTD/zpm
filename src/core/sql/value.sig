@@ -21,6 +21,7 @@ const bytea = @import("bytea.sig");
 const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
 const money = @import("money.sig");
+const catalog_ids = @import("catalog_ids.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -105,6 +106,13 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         // casts; strings by I/O conversion; nothing else.
         if (to == .money and (from == .int4 or from == .int8 or from == .numeric)) return context != .implicit;
         if (from == .money and to == .numeric) return context != .implicit;
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
+    if (from == .pg_lsn or to == .pg_lsn or from == .xid8 or to == .xid8) {
+        // pg_lsn and xid8 have no pg_cast entries for the supported types
+        // (xid8 -> xid is outside them): strings by I/O conversion only.
         if (stringType(to)) return context != .implicit;
         if (stringType(from)) return context == .explicit;
         return false;
@@ -316,6 +324,8 @@ pub fn Io(comptime config: types.Config) type {
                 .timetz => |value| time_of_day.formatTz(value, buffer),
                 .bits => |*value| value.format(buffer),
                 .money => |value| money.format(value, buffer),
+                .pg_lsn => |value| catalog_ids.formatLsn(value, buffer),
+                .xid8 => |value| catalog_ids.formatXid8(value, buffer),
             };
         }
 
@@ -399,6 +409,8 @@ pub fn Io(comptime config: types.Config) type {
                 .time, .timetz => try parseTime(ty, input, session),
                 .bit, .varbit => .{ .bits = try V.BitString.parse(input) },
                 .money => .{ .money = try money.parse(input) },
+                .pg_lsn => .{ .pg_lsn = try catalog_ids.parseLsn(input) },
+                .xid8 => .{ .xid8 = try catalog_ids.parseXid8(input) },
             };
             return applyTypmod(cell, ty, typmod);
         }
@@ -728,6 +740,11 @@ pub fn Io(comptime config: types.Config) type {
                     .text => |*value| try parse(.money, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
+                .pg_lsn, .xid8 => switch (cell) {
+                    .pg_lsn, .xid8 => cell,
+                    .text => |*value| try parse(to, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
                 .bit, .varbit => switch (cell) {
                     .bits => cell,
                     .text => |*value| try parse(to, -1, value.slice(), session),
@@ -764,6 +781,7 @@ pub fn Io(comptime config: types.Config) type {
         pub fn arithmetic(op: ast.Op, left: *const V.Cell, right: *const V.Cell, result: Type, session: *const Session) Error!V.Cell {
             if (try timeArithmetic(op, left, right)) |cell| return cell;
             if (try moneyArithmetic(op, left, right)) |cell| return cell;
+            if (try lsnArithmetic(op, left, right)) |cell| return cell;
             switch (left.*) {
                 .integer => |a| switch (right.*) {
                     .integer => |b| {
@@ -854,6 +872,40 @@ pub fn Io(comptime config: types.Config) type {
                 else => {},
             }
             return null;
+        }
+
+        /// pg_lsn operators (pg_lsn.c): pg_lsn - pg_lsn -> numeric, and
+        /// pg_lsn +- numeric / numeric + pg_lsn -> pg_lsn. The sum goes through
+        /// numeric and back (numeric_pg_lsn rounds to an integer): NaN bytes
+        /// are 22023, an infinite result 0A000 and anything outside
+        /// 0..2^64-1 is 22003.
+        fn lsnArithmetic(op: ast.Op, left: *const V.Cell, right: *const V.Cell) Error!?V.Cell {
+            if (left.* == .pg_lsn and right.* == .pg_lsn) {
+                if (op != .sub) return error.UndefinedFunction;
+                const a = try lsnNumeric(left.pg_lsn);
+                const b = try lsnNumeric(right.pg_lsn);
+                return .{ .numeric = try N.sub(&a, &b) };
+            }
+            const lsn_left = left.* == .pg_lsn and right.* == .numeric;
+            const lsn_right = left.* == .numeric and right.* == .pg_lsn;
+            if (!lsn_left and !lsn_right) return null;
+            if (op != .add and !(op == .sub and lsn_left)) return error.UndefinedFunction;
+            const bytes = if (lsn_left) &right.numeric else &left.numeric;
+            if (bytes.special == .nan) return error.InvalidParameterValue;
+            const position = try lsnNumeric(if (lsn_left) left.pg_lsn else right.pg_lsn);
+            const sum = if (op == .add) try N.add(&position, bytes) else try N.sub(&position, bytes);
+            if (sum.special != .finite) return error.UnsupportedStatement;
+            const rounded = try N.round(&sum, 0);
+            const raw = rounded.coef();
+            if ((rounded.negative and raw != 0) or raw > 0xffffffffffffffff) return error.NumericValueOutOfRange;
+            return .{ .pg_lsn = @intCast(raw) };
+        }
+
+        fn lsnNumeric(value: u64) Error!numeric.Numeric {
+            if (value != 0 and numeric.digitCount(value) > config.numeric_digits) return error.NumericCapacity;
+            var out: numeric.Numeric = .{};
+            out.setCoef(value);
+            return out;
         }
 
         /// MONEY operators (cash.c): money +- money, money * / integer or
