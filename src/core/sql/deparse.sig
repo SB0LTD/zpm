@@ -183,6 +183,19 @@ pub fn Deparse(comptime config: types.Config) type {
                     try w.bytes(")");
                 },
                 .like => {
+                    if (n.op == .regex_match) {
+                        // SIMILAR TO is stored as ~ similar_to_escape(...).
+                        try w.bytes("(");
+                        try expression(context, n.a, w);
+                        try w.bytes(if (n.negated) " !~ similar_to_escape(" else " ~ similar_to_escape(");
+                        try expression(context, n.b, w);
+                        if (n.c != none) {
+                            try w.bytes(", ");
+                            try expression(context, n.c, w);
+                        }
+                        try w.bytes("))");
+                        return;
+                    }
                     try w.bytes("(");
                     try expression(context, n.a, w);
                     try w.bytes(if (n.negated) " NOT " else " ");
@@ -237,7 +250,8 @@ pub fn Deparse(comptime config: types.Config) type {
                     try w.bytes(n.name.span.slice(context.source));
                 },
                 .binary => {
-                    const op = opText(n.op) orelse return error.UnsupportedStatement;
+                    const regex_text: []const u8 = if (n.negated) (if (n.insensitive) " !~* " else " !~ ") else (if (n.insensitive) " ~* " else " ~ ");
+                    const op = if (n.op == .regex_match) regex_text else opText(n.op) orelse return error.UnsupportedStatement;
                     try w.bytes("(");
                     try expression(context, n.a, w);
                     try w.bytes(op);

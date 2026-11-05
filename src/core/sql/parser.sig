@@ -3122,8 +3122,8 @@ pub fn Parser(comptime config: types.Config) type {
                 wordIs(self.source, self.current, "session_user") or wordIs(self.source, self.current, "user")));
             if ((self.current.kind == .word and !lexer.reserved(self.current.keyword) and !niladic) or self.current.kind == .quoted_word) {
                 const after = try self.peek();
-                // COLLATE (not a lexer keyword) continues the expression.
-                if (ends(after) and !wordIs(self.source, after, "collate") and !(typeWord(self.current) and multiwordType(self.current, after))) {
+                // COLLATE and SIMILAR (not lexer keywords) continue the expression.
+                if (ends(after) and !wordIs(self.source, after, "collate") and !wordIs(self.source, after, "similar") and !(typeWord(self.current) and multiwordType(self.current, after))) {
                     const name = try self.identifier();
                     return self.pool.add(.{ .kind = .column, .name = name });
                 }
@@ -3271,9 +3271,18 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn patternTail(self: *Self, left: u16) Error!u16 {
             var negated = false;
-            if (self.isWord("NOT") and patternKeyword(try self.peek())) {
+            if (self.isWord("NOT") and (patternKeyword(try self.peek()) or (self.mode == .standard and wordIs(self.source, try self.peek(), "similar")))) {
                 try self.advance();
                 negated = true;
+            }
+            // [NOT] SIMILAR TO pattern [ESCAPE escape]: a `.like` node with
+            // op regex_match (similar_to_escape, then ~).
+            if (self.mode == .standard and self.rawWord("similar") and wordIs(self.source, try self.peek(), "to")) {
+                try self.advance();
+                try self.advance();
+                const pattern_node = try self.other();
+                const escape_node = if (try self.takeRaw("escape")) try self.other() else none;
+                return self.pool.add(.{ .kind = .like, .op = .regex_match, .negated = negated, .a = left, .b = pattern_node, .c = escape_node });
             }
             if (try self.takeWord("BETWEEN")) {
                 const symmetric = try self.takeWord("SYMMETRIC");
@@ -3354,11 +3363,14 @@ pub fn Parser(comptime config: types.Config) type {
                     .hash_minus => .delete_path,
                     .at_question => .path_exists,
                     .at_at => .path_match,
+                    .tilde, .regex_icase, .not_regex, .not_regex_icase => .regex_match,
                     else => break,
                 };
+                const symbol = self.current.symbol;
                 try self.advance();
                 const right = try self.additive();
-                left = try self.pool.add(.{ .kind = .binary, .op = op, .a = left, .b = right });
+                left = try self.pool.add(.{ .kind = .binary, .op = op, .a = left, .b = right,
+                    .insensitive = symbol == .regex_icase or symbol == .not_regex_icase, .negated = symbol == .not_regex or symbol == .not_regex_icase });
             }
             return left;
         }

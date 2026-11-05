@@ -326,6 +326,10 @@ pub const Symbol = enum {
     hash_minus,
     at_question,
     at_at,
+    // Regular expressions (B11 text): ~* !~ !~* (~ is `tilde`).
+    regex_icase,
+    not_regex,
+    not_regex_icase,
 };
 
 pub const Token = struct {
@@ -633,6 +637,9 @@ pub const Tokenizer = struct {
             '!' => if (following == '=') blk: {
                 width = 2;
                 break :blk Symbol.ne;
+            } else if (following == '~') blk: {
+                width = if (third == '*') 3 else 2;
+                break :blk if (third == '*') Symbol.not_regex_icase else Symbol.not_regex;
             } else return error.Syntax,
             '|' => if (following == '|') blk: {
                 width = 2;
@@ -653,6 +660,9 @@ pub const Tokenizer = struct {
             '~' => if (following == '=') blk: {
                 width = 2;
                 break :blk Symbol.same;
+            } else if (following == '*') blk: {
+                width = 2;
+                break :blk Symbol.regex_icase;
             } else .tilde,
             ':' => if (following == ':') blk: {
                 width = 2;

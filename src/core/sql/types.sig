@@ -210,6 +210,11 @@ pub const Config = struct {
     object_text_bytes: usize = 256,
     /// Roles one policy names (TO ...). More raise ProgramLimitExceeded (54000).
     policy_roles: usize = 4,
+    /// Instructions of one compiled regular expression (regex.sig, B11
+    /// text): bounds expand into copies; a larger program is
+    /// ProgramLimitExceeded (54000). Bracket sets and their non-ASCII
+    /// ranges are sized from it.
+    regex_states: usize = 512,
 };
 
 pub fn workRows(comptime config: Config) usize {
@@ -484,6 +489,11 @@ pub const Error = error{
     /// SQLSTATE 42P21: two different explicit collations (COLLATE) meet in
     /// one expression (B11 text).
     CollationMismatch,
+    /// SQLSTATE 2201B: a malformed regular expression (B11 text).
+    InvalidRegularExpression,
+    /// SQLSTATE 2200C: more than two escape-double-quote separators in a
+    /// SIMILAR TO pattern (B11 text).
+    InvalidEscapeCharacterUse,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent

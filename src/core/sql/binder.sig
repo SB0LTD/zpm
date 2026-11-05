@@ -1038,6 +1038,17 @@ pub fn Binder(comptime config: types.Config) type {
             return error.UndefinedFunction;
         }
 
+        /// ~ ~* !~ !~* (textregexeq and friends): text, varchar and name
+        /// subjects, bpchar read with its padding (bpcharregexeq); the
+        /// pattern is text.
+        fn regexOperator(context: *const Context, n: *ast.Node) Error!void {
+            try coerce(context, n.a, .text);
+            try coerce(context, n.b, .text);
+            if (context.node(n.b).ty == .bpchar) n.b = try convert(context, n.b, .text, -1, .implicit);
+            if (!value.characterType(context.node(n.a).ty) or !value.stringType(context.node(n.b).ty)) return error.UndefinedFunction;
+            n.ty = .boolean;
+        }
+
         /// int2/int4/int8 & | # (common integer type) and << >> (int4 count).
         fn bitwiseType(context: *const Context, n: *ast.Node) Error!void {
             const left = context.node(n.a).ty;
@@ -1286,6 +1297,9 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "obj_description", .func = .obj_description },
                 .{ .name = "col_description", .func = .col_description },
                 .{ .name = "shobj_description", .func = .shobj_description },
+                // Regular expressions (B11 text lane).
+                .{ .name = "regexp_like", .func = .regexp_like },
+                .{ .name = "similar_to_escape", .func = .similar_to_escape },
                 // Discovery functions (B11 text lane).
                 .{ .name = "pg_typeof", .func = .pg_typeof },
                 .{ .name = "pg_get_serial_sequence", .func = .pg_get_serial_sequence },
@@ -2207,6 +2221,8 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = false;
                 },
                 .pg_get_serial_sequence => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .text, true),
+                .regexp_like => try bindSignature(context, n, if (count == 2) &[_]ast.Type{ .text, .text } else &[_]ast.Type{ .text, .text, .text }, .boolean, true),
+                .similar_to_escape => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.text} else &[_]ast.Type{ .text, .text }, .text, true),
                 .point_constructor => try bindSignature(context, n, &[_]ast.Type{ .float8, .float8 }, .point, true),
                 .box_constructor => try bindSignature(context, n, &[_]ast.Type{ .point, .point }, .box, true),
                 .area, .width, .height => try bindSignature(context, n, &[_]ast.Type{.box}, .float8, true),
@@ -3699,6 +3715,7 @@ pub fn Binder(comptime config: types.Config) type {
                         .arrow, .arrow_text, .path, .path_text, .exists => try jsonOperator(context, n),
                         .shift_left, .shift_right => if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else if (networkType(context.node(n.a).ty) or networkType(context.node(n.b).ty)) try networkOperator(context, n) else try bitwiseType(context, n),
                         .bit_and, .bit_or, .bit_xor => try bitwiseType(context, n),
+                        .regex_match => try regexOperator(context, n),
                         .neg, .pos, .bit_not => unreachable,
                     }
                 },

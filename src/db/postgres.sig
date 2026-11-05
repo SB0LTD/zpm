@@ -1677,6 +1677,8 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "InvalidXmlDocument")) return "2200M";
     if (equal(name, "NotAnXmlDocument")) return "2200L";
     if (equal(name, "CollationMismatch")) return "42P21";
+    if (equal(name, "InvalidRegularExpression")) return "2201B";
+    if (equal(name, "InvalidEscapeCharacterUse")) return "2200C";
     if (equal(name, "InvalidTablesampleArgument")) return "2202H";
     if (equal(name, "InvalidTablesampleRepeat")) return "2202G";
     // Routines, triggers and rules (B11 wave 3).

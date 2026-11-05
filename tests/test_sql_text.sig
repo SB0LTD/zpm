@@ -123,6 +123,12 @@ fn sqlstate(err: anyerror, wanted: []const u8) !void {
         .{ .name = "QueryCanceled", .state = "57014" },
         .{ .name = "CollationMismatch", .state = "42P21" },
         .{ .name = "UndefinedSchema", .state = "3F000" },
+        .{ .name = "ProgramLimitExceeded", .state = "54000" },
+        .{ .name = "InvalidRegularExpression", .state = "2201B" },
+        .{ .name = "InvalidEscapeCharacterUse", .state = "2200C" },
+        .{ .name = "InvalidEscapeSequence", .state = "22025" },
+        .{ .name = "InvalidParameterValue", .state = "22023" },
+        .{ .name = "CheckViolation", .state = "23514" },
     };
     var state: []const u8 = "?";
     for (table) |entry| {
@@ -436,10 +442,463 @@ fn collations() !void {
     try replicaShows("2|b;1|q");
 }
 
+// ---- regular expressions ---------------------------------------------------
+
+/// SQLSTATE of an engine error as postgres.sig maps the ones used here.
+fn stateOf(err: anyerror) []const u8 {
+    const table = [_][2][]const u8{
+        .{ "InvalidRegularExpression", "2201B" }, .{ "InvalidParameterValue", "22023" },     .{ "UnsupportedStatement", "0A000" },
+        .{ "InvalidEscapeSequence", "22025" },    .{ "InvalidEscapeCharacterUse", "2200C" }, .{ "UndefinedFunction", "42883" },
+        .{ "ProgramLimitExceeded", "54000" },     .{ "InvalidTextRepresentation", "22P02" },
+    };
+    for (table) |entry| if (std.mem.eql(u8, entry[0], @errorName(err))) return entry[1];
+    return @errorName(err);
+}
+
+/// One single-value query: `want` is its text output, NULL, or `!` and
+/// the SQLSTATE of the error it raises (statement atomicity checked).
+fn single(source: []const u8, want: []const u8) !void {
+    if (want[0] != '!') return rows(source, want);
+    try exec("SELECT 4242");
+    if (db.execute(source, &result)) |_| {
+        std.debug.print("accepted: {s}\n", .{source});
+        return error.InvalidSqlAccepted;
+    } else |err| {
+        const state = stateOf(err);
+        if (!std.mem.eql(u8, state, want[1..])) std.debug.print("{s}: {s} (wanted {s})\n", .{ source, @errorName(err), want[1..] });
+        try check(std.mem.eql(u8, state, want[1..]));
+    }
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 4242);
+    const usage = db.usage();
+    try check(usage.transactions == 0 and usage.pending_versions == 0);
+}
+
+/// Matched one by one against a local PostgreSQL 18.3 (LOCALE 'C'):
+/// syntax, escapes, classes, brackets, bounds, constraints, lookaround,
+/// options, errors, SIMILAR TO, similar_to_escape and regexp_like.
+const regex_battery = [_][2][]const u8{
+    .{ "SELECT 'abc' ~ '^a'", "t" },
+    .{ "SELECT 'abc' ~ 'c$'", "t" },
+    .{ "SELECT 'abc' ~ '^b'", "f" },
+    .{ "SELECT 'abc' ~ 'b'", "t" },
+    .{ "SELECT 'abc' ~ '^abc$'", "t" },
+    .{ "SELECT 'abc' ~ '^ab$'", "f" },
+    .{ "SELECT '' ~ '^$'", "t" },
+    .{ "SELECT '' ~ ''", "t" },
+    .{ "SELECT 'abc' ~ ''", "t" },
+    .{ "SELECT 'abc' ~ 'a.c'", "t" },
+    .{ "SELECT 'ac' ~ 'a.c'", "f" },
+    .{ "SELECT 'abbbc' ~ 'ab*c'", "t" },
+    .{ "SELECT 'ac' ~ 'ab*c'", "t" },
+    .{ "SELECT 'ac' ~ 'ab+c'", "f" },
+    .{ "SELECT 'abc' ~ 'ab?c'", "t" },
+    .{ "SELECT 'abbc' ~ 'ab?c'", "f" },
+    .{ "SELECT 'abc' ~ 'a|x'", "t" },
+    .{ "SELECT 'xyz' ~ 'a|x'", "t" },
+    .{ "SELECT 'xyz' ~ 'a|b|c'", "f" },
+    .{ "SELECT 'b' ~ 'a|b|c'", "t" },
+    .{ "SELECT 'abcabc' ~ '(abc){2}'", "t" },
+    .{ "SELECT 'abcab' ~ '^(abc){2}$'", "f" },
+    .{ "SELECT 'aaa' ~ '^a{3}$'", "t" },
+    .{ "SELECT 'aaaa' ~ '^a{3}$'", "f" },
+    .{ "SELECT 'aa' ~ '^a{2,3}$'", "t" },
+    .{ "SELECT 'aaaa' ~ '^a{2,3}$'", "f" },
+    .{ "SELECT 'a' ~ '^a{2,}$'", "f" },
+    .{ "SELECT 'aaaaa' ~ '^a{2,}$'", "t" },
+    .{ "SELECT '' ~ '^a{0}$'", "t" },
+    .{ "SELECT 'a' ~ '^a{0,1}$'", "t" },
+    .{ "SELECT 'b' ~ '^a{0}b$'", "t" },
+    .{ "SELECT 'ab' ~ '^(a|b)+$'", "t" },
+    .{ "SELECT 'abc' ~ '^(a|b)+$'", "f" },
+    .{ "SELECT 'foo' ~ 'fo{1,2}'", "t" },
+    .{ "SELECT 'f{' ~ 'f{'", "t" },
+    .{ "SELECT 'f{x' ~ 'f{x'", "t" },
+    .{ "SELECT 'f{,1}' ~ 'f{,1}'", "t" },
+    .{ "SELECT 'a' ~ 'a{'", "f" },
+    .{ "SELECT 'abc' ~ '[abc]'", "t" },
+    .{ "SELECT 'd' ~ '[abc]'", "f" },
+    .{ "SELECT 'd' ~ '[^abc]'", "t" },
+    .{ "SELECT 'a' ~ '[^abc]'", "f" },
+    .{ "SELECT 'b' ~ '[a-c]'", "t" },
+    .{ "SELECT '-' ~ '[a-]'", "t" },
+    .{ "SELECT '-' ~ '[-a]'", "t" },
+    .{ "SELECT 'b' ~ '[]b]'", "t" },
+    .{ "SELECT ']' ~ '[]b]'", "t" },
+    .{ "SELECT '^' ~ '[\\^]'", "t" },
+    .{ "SELECT '5' ~ '[[:digit:]]'", "t" },
+    .{ "SELECT 'a' ~ '[[:digit:]]'", "f" },
+    .{ "SELECT 'A' ~ '[[:upper:]]'", "t" },
+    .{ "SELECT 'a' ~ '[[:upper:]]'", "f" },
+    .{ "SELECT ' ' ~ '[[:space:]]'", "t" },
+    .{ "SELECT '_' ~ '[[:word:]]'", "t" },
+    .{ "SELECT '_' ~ '[[:alnum:]]'", "f" },
+    .{ "SELECT '!' ~ '[[:punct:]]'", "t" },
+    .{ "SELECT E'\\x09' ~ '[[:blank:]]'", "t" },
+    .{ "SELECT 'f' ~ '[[:xdigit:]]'", "t" },
+    .{ "SELECT 'g' ~ '[[:xdigit:]]'", "f" },
+    .{ "SELECT 'a' ~ '[[.a.]]'", "t" },
+    .{ "SELECT ' ' ~ '[[.space.]]'", "t" },
+    .{ "SELECT '-' ~ '[[.hyphen.]]'", "t" },
+    .{ "SELECT 'a' ~ '[[=a=]]'", "t" },
+    .{ "SELECT 'b' ~ '[a[.-.]z]'", "f" },
+    .{ "SELECT 'Ã©' ~ '[[:alpha:]]'", "f" },
+    .{ "SELECT 'Ã©' ~ '.'", "t" },
+    .{ "SELECT 'Ã©' ~ '^.$'", "f" },
+    .{ "SELECT 'Ã©' ~ '[Ã©]'", "t" },
+    .{ "SELECT 'Ã©' ~ '[Ã -Ã¼]'", "t" },
+    .{ "SELECT 'x' ~ '[Ã -Ã¼]'", "f" },
+    .{ "SELECT 'â‚¬' ~ '^[^a]$'", "f" },
+    .{ "SELECT '' ~ '[[:cntrl:]]'", "t" },
+    .{ "SELECT '5' ~ '\\d'", "t" },
+    .{ "SELECT 'a' ~ '\\d'", "f" },
+    .{ "SELECT 'a' ~ '\\D'", "t" },
+    .{ "SELECT ' ' ~ '\\s'", "t" },
+    .{ "SELECT 'a' ~ '\\S'", "t" },
+    .{ "SELECT 'a' ~ '\\w'", "t" },
+    .{ "SELECT '_' ~ '\\w'", "t" },
+    .{ "SELECT '-' ~ '\\w'", "f" },
+    .{ "SELECT '-' ~ '\\W'", "t" },
+    .{ "SELECT '5' ~ '[\\d]'", "t" },
+    .{ "SELECT 'a' ~ '[\\d]'", "f" },
+    .{ "SELECT 'a' ~ '[\\D]'", "t" },
+    .{ "SELECT '5' ~ '[\\D]'", "f" },
+    .{ "SELECT 'a' ~ '[\\w-]'", "t" },
+    .{ "SELECT '-' ~ '[\\w-]'", "t" },
+    .{ "SELECT 'foo bar' ~ '\\mbar'", "t" },
+    .{ "SELECT 'foobar' ~ '\\mbar'", "f" },
+    .{ "SELECT 'foo bar' ~ 'foo\\M'", "t" },
+    .{ "SELECT 'foobar' ~ 'foo\\M'", "f" },
+    .{ "SELECT 'foo bar' ~ '\\yfoo\\y'", "t" },
+    .{ "SELECT 'foobar' ~ '\\Ybar'", "t" },
+    .{ "SELECT 'foo bar' ~ '\\Ybar'", "f" },
+    .{ "SELECT 'foo bar' ~ '[[:<:]]bar'", "t" },
+    .{ "SELECT 'foobar' ~ '[[:<:]]bar'", "f" },
+    .{ "SELECT 'foo bar' ~ 'foo[[:>:]]'", "t" },
+    .{ "SELECT 'abc' ~ '\\Aabc\\Z'", "t" },
+    .{ "SELECT 'abc' ~ '\\Ab'", "f" },
+    .{ "SELECT 'a.c' ~ 'a\\.c'", "t" },
+    .{ "SELECT 'abc' ~ 'a\\.c'", "f" },
+    .{ "SELECT 'a+c' ~ 'a\\+c'", "t" },
+    .{ "SELECT 'a\\c' ~ 'a\\\\c'", "t" },
+    .{ "SELECT E'a\\x0ab' ~ 'a.b'", "t" },
+    .{ "SELECT E'a\\x0ab' ~ '(?n)a.b'", "f" },
+    .{ "SELECT E'a\\x0ab' ~ '(?n)^b'", "t" },
+    .{ "SELECT E'a\\x0ab' ~ '^b'", "f" },
+    .{ "SELECT E'a\\x0ab' ~ '(?p)^b'", "f" },
+    .{ "SELECT E'a\\x0ab' ~ '(?w)^b'", "t" },
+    .{ "SELECT E'a\\x0ab' ~ '(?w)a.b'", "t" },
+    .{ "SELECT E'a\\x0ab' ~ '(?p)a[^x]b'", "f" },
+    .{ "SELECT E'a\\x0ab' ~ 'a[^x]b'", "t" },
+    .{ "SELECT E'a\\x0ab' ~ '(?n)a$'", "t" },
+    .{ "SELECT E'a\\x0ab' ~ 'a$'", "f" },
+    .{ "SELECT E'a\\x0ab' ~ '(?n)a\\Z'", "f" },
+    .{ "SELECT E'a\\x0ab' ~ '(?n)a\\W'", "t" },
+    .{ "SELECT 'Ab' ~ '(?i)ab'", "t" },
+    .{ "SELECT 'Ab' ~ '(?c)ab'", "f" },
+    .{ "SELECT 'ab' ~ '***=a.'", "f" },
+    .{ "SELECT 'a.' ~ '***=a.'", "t" },
+    .{ "SELECT 'a' ~ '***:a'", "t" },
+    .{ "SELECT 'abc' ~ '(?x)a b c'", "t" },
+    .{ "SELECT 'a b c' ~ '(?x)a\\ b'", "t" },
+    .{ "SELECT 'abc' ~ E'(?x)a#x\\x0abc'", "t" },
+    .{ "SELECT 'aab' ~ '(?x)a { 2 } b'", "t" },
+    .{ "SELECT 'abc' ~ 'a(?#comment)bc'", "t" },
+    .{ "SELECT 'abc' ~ 'a(?#comment)*bc'", "t" },
+    .{ "SELECT 'abc' ~ '(?:ab)c'", "t" },
+    .{ "SELECT 'ab' ~ '(?=a)a'", "t" },
+    .{ "SELECT 'b' ~ '(?=a)'", "f" },
+    .{ "SELECT 'ab' ~ 'a(?=b)'", "t" },
+    .{ "SELECT 'ac' ~ 'a(?=b)'", "f" },
+    .{ "SELECT 'ac' ~ 'a(?!b)'", "t" },
+    .{ "SELECT 'ab' ~ 'a(?!b)'", "f" },
+    .{ "SELECT 'ab' ~ '(?<=a)b'", "t" },
+    .{ "SELECT 'cb' ~ '(?<=a)b'", "f" },
+    .{ "SELECT 'cb' ~ '(?<!a)b'", "t" },
+    .{ "SELECT 'ab' ~ '(?<!a)b'", "f" },
+    .{ "SELECT 'xab' ~ '(?<=xa)b'", "t" },
+    .{ "SELECT 'ab' ~ '(?<=^a)b'", "t" },
+    .{ "SELECT 'ab' ~ '(?<=a|xy)b'", "t" },
+    .{ "SELECT 'xyb' ~ '(?<=a|xy)b'", "t" },
+    .{ "SELECT 'ab' ~ 'a(?=(?=b))'", "t" },
+    .{ "SELECT 'abc' ~ 'a(?=b(?!d))'", "t" },
+    .{ "SELECT 'abd' ~ 'a(?=b(?!d))'", "f" },
+    .{ "SELECT 'a' ~ '\\x61'", "t" },
+    .{ "SELECT 'a' ~ '\\141'", "t" },
+    .{ "SELECT 'a' ~ '\\u0061'", "t" },
+    .{ "SELECT 'a' ~ '\\U00000061'", "t" },
+    .{ "SELECT E'\\x0a' ~ '\\n'", "t" },
+    .{ "SELECT E'\\x09' ~ '\\t'", "t" },
+    .{ "SELECT 'a' ~ '\\0141'", "f" },
+    .{ "SELECT E'\\x01' ~ '\\cA'", "t" },
+    .{ "SELECT E'\\x1b' ~ '\\e'", "t" },
+    .{ "SELECT E'\\x07' ~ '\\a'", "t" },
+    .{ "SELECT '\\' ~ '\\B'", "t" },
+    .{ "SELECT 'ab' ~ '(a)b'", "t" },
+    .{ "SELECT 'aab' ~ '(a*)*b'", "t" },
+    .{ "SELECT 'b' ~ '(a*)+b'", "t" },
+    .{ "SELECT '' ~ '()'", "t" },
+    .{ "SELECT 'a' ~ '()a'", "t" },
+    .{ "SELECT 'a' ~ 'a|'", "t" },
+    .{ "SELECT 'a' ~ '|a'", "t" },
+    .{ "SELECT 'ab' ~ 'a()b'", "t" },
+    .{ "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab' ~ '^(a+)+$'", "f" },
+    .{ "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaab' ~ '^(a|aa)*c'", "f" },
+    .{ "SELECT 'abc' ~ 'abc*?'", "t" },
+    .{ "SELECT 'abc' ~ 'a+?'", "t" },
+    .{ "SELECT 'abc' ~ 'a??'", "t" },
+    .{ "SELECT 'abc' ~ 'a{1,2}?'", "t" },
+    .{ "SELECT 'ABC' ~ 'abc'", "f" },
+    .{ "SELECT 'ABC' ~* '^a'", "t" },
+    .{ "SELECT 'abc' ~* '^A'", "t" },
+    .{ "SELECT 'Ã‰' ~* 'Ã©'", "f" },
+    .{ "SELECT 'X' ~* '[a-z]'", "t" },
+    .{ "SELECT 'x' ~* '[A-Z]'", "t" },
+    .{ "SELECT 'X' ~* '[[:lower:]]'", "t" },
+    .{ "SELECT 'x' ~* '[[:upper:]]'", "t" },
+    .{ "SELECT 'X' ~* '[^x]'", "f" },
+    .{ "SELECT 'b' ~* '[^B]'", "f" },
+    .{ "SELECT 'Ã€B' ~* '^.b$'", "f" },
+    .{ "SELECT 'abc' !~ '^a'", "f" },
+    .{ "SELECT 'abc' !~* '^a'", "f" },
+    .{ "SELECT 'abc' !~ '^b'", "t" },
+    .{ "SELECT 'abc' !~* '^b'", "t" },
+    .{ "SELECT 'ABC' !~* '^b'", "t" },
+    .{ "SELECT 'ABC' !~* '^a'", "f" },
+    .{ "SELECT 'a' ~ '('", "!2201B" },
+    .{ "SELECT 'a' ~ '(a'", "!2201B" },
+    .{ "SELECT 'a' ~ ')'", "!2201B" },
+    .{ "SELECT 'a' ~ 'a)'", "!2201B" },
+    .{ "SELECT 'a' ~ '[a'", "!2201B" },
+    .{ "SELECT 'a' ~ '['", "!2201B" },
+    .{ "SELECT 'a' ~ '*a'", "!2201B" },
+    .{ "SELECT 'a' ~ 'a**'", "!2201B" },
+    .{ "SELECT 'a' ~ '+'", "!2201B" },
+    .{ "SELECT 'a' ~ '?'", "!2201B" },
+    .{ "SELECT 'a' ~ 'a{2,1}'", "!2201B" },
+    .{ "SELECT 'a' ~ 'a{256}'", "!2201B" },
+    .{ "SELECT 'a' ~ '{1}'", "!2201B" },
+    .{ "SELECT 'a' ~ 'a\\'", "!2201B" },
+    .{ "SELECT 'a' ~ '\\q'", "!2201B" },
+    .{ "SELECT 'a' ~ '\\1'", "!2201B" },
+    .{ "SELECT 'a' ~ '(a)\\2'", "!2201B" },
+    .{ "SELECT 'a' ~ '(a\\1)'", "!2201B" },
+    .{ "SELECT 'a' ~ '[b-a]'", "!2201B" },
+    .{ "SELECT 'a' ~ '[[:foo:]]'", "!2201B" },
+    .{ "SELECT 'a' ~ '[[.foo.]]'", "!2201B" },
+    .{ "SELECT 'a' ~ '[[..]]'", "!2201B" },
+    .{ "SELECT 'a' ~ '[a-[:digit:]]'", "!2201B" },
+    .{ "SELECT 'a' ~ '[[:digit:]-z]'", "!2201B" },
+    .{ "SELECT 'a' ~ '[a-c-e]'", "!2201B" },
+    .{ "SELECT 'a' ~ '^*'", "!2201B" },
+    .{ "SELECT 'a' ~ '$+'", "!2201B" },
+    .{ "SELECT 'a' ~ '\\A*'", "!2201B" },
+    .{ "SELECT 'a' ~ '(?=a)*'", "!2201B" },
+    .{ "SELECT 'a' ~ '(?i'", "!2201B" },
+    .{ "SELECT 'a' ~ '(?z)a'", "!2201B" },
+    .{ "SELECT 'a' ~ 'a(?i)b'", "!2201B" },
+    .{ "SELECT 'a' ~ '***?'", "!2201B" },
+    .{ "SELECT 'a' ~ '***a'", "!2201B" },
+    .{ "SELECT 'a' ~ '(?<a)'", "!2201B" },
+    .{ "SELECT 'a' ~ '(?'", "!2201B" },
+    .{ "SELECT 'a' ~ '\\x'", "!2201B" },
+    .{ "SELECT 'a' ~ '\\u12'", "!2201B" },
+    .{ "SELECT 'a' ~ '\\c'", "!2201B" },
+    .{ "SELECT 'a' ~ '[\\m]'", "!2201B" },
+    .{ "SELECT 'a' ~ '[\\1]'", "!2201B" },
+    .{ "SELECT 'a' ~ '[\\A]'", "!2201B" },
+    .{ "SELECT 'a' ~ 'a{1'", "!2201B" },
+    .{ "SELECT 'a' ~ 'a{1,2'", "!2201B" },
+    .{ "SELECT 'a' ~ 'a{x}'", "f" },
+    .{ "SELECT 'a' ~ '(?<=a\\1)'", "!2201B" },
+    .{ "SELECT 'a' ~ 'x{1,2,3}'", "!2201B" },
+    .{ "SELECT 'a' ~ '\\8'", "!2201B" },
+    .{ "SELECT 'a' ~ '\\U7fffffff'", "!2201B" },
+    .{ "SELECT 'a' ~ '(?e)a{1}?'", "!2201B" },
+    .{ "SELECT 'a' ~ '\\12'", "f" },
+    .{ "SELECT E'\\x0a' ~ '\\12'", "t" },
+    .{ "SELECT 'abc' SIMILAR TO 'a%'", "t" },
+    .{ "SELECT 'abc' SIMILAR TO 'a_c'", "t" },
+    .{ "SELECT 'abc' SIMILAR TO 'abc'", "t" },
+    .{ "SELECT 'abc' SIMILAR TO 'ab'", "f" },
+    .{ "SELECT 'abc' SIMILAR TO '%(b|x)%'", "t" },
+    .{ "SELECT 'abc' SIMILAR TO 'a(b|x)c'", "t" },
+    .{ "SELECT 'ab' SIMILAR TO '(a|b)*'", "t" },
+    .{ "SELECT 'abc' SIMILAR TO 'a[bc]+'", "t" },
+    .{ "SELECT 'a.c' SIMILAR TO 'a.c'", "t" },
+    .{ "SELECT 'abc' SIMILAR TO 'a.c'", "f" },
+    .{ "SELECT 'a^c' SIMILAR TO 'a^c'", "t" },
+    .{ "SELECT 'a$' SIMILAR TO 'a$'", "t" },
+    .{ "SELECT 'abc' SIMILAR TO 'a\\%'", "f" },
+    .{ "SELECT 'a%' SIMILAR TO 'a\\%'", "t" },
+    .{ "SELECT 'a_' SIMILAR TO 'a\\_'", "t" },
+    .{ "SELECT 'ab' SIMILAR TO 'a\\_'", "f" },
+    .{ "SELECT 'ABC' SIMILAR TO 'abc'", "f" },
+    .{ "SELECT 'abc' SIMILAR TO 'abc|xyz'", "t" },
+    .{ "SELECT 'xyz' SIMILAR TO 'abc|xyz'", "t" },
+    .{ "SELECT 'aaa' SIMILAR TO 'a{3}'", "t" },
+    .{ "SELECT 'aa' SIMILAR TO 'a{3}'", "f" },
+    .{ "SELECT 'a' SIMILAR TO 'a*'", "t" },
+    .{ "SELECT '' SIMILAR TO 'a*'", "t" },
+    .{ "SELECT 'ab' SIMILAR TO 'a+b?'", "t" },
+    .{ "SELECT 'a\\b' SIMILAR TO 'a\\\\b'", "t" },
+    .{ "SELECT 'a[b' SIMILAR TO 'a[[]b'", "t" },
+    .{ "SELECT 'abc' SIMILAR TO '[a-c]%'", "t" },
+    .{ "SELECT 'abc' SIMILAR TO '%[^a]'", "t" },
+    .{ "SELECT 'abc' SIMILAR TO '%\\\"b\\\"%'", "t" },
+    .{ "SELECT 'abc' SIMILAR TO 'a\\'", "f" },
+    .{ "SELECT 'a' SIMILAR TO 'a\\'", "t" },
+    .{ "SELECT 'a\\b' SIMILAR TO 'a\\b'", "f" },
+    .{ "SELECT 'a(b' SIMILAR TO 'a\\(b'", "t" },
+    .{ "SELECT 'a_c' SIMILAR TO 'a#_c' ESCAPE '#'", "t" },
+    .{ "SELECT 'abc' SIMILAR TO 'a#_c' ESCAPE '#'", "f" },
+    .{ "SELECT 'a%' SIMILAR TO 'a!%' ESCAPE '!'", "t" },
+    .{ "SELECT 'a\\%' SIMILAR TO 'a\\%' ESCAPE ''", "t" },
+    .{ "SELECT 'ab' SIMILAR TO 'a%' ESCAPE ''", "t" },
+    .{ "SELECT 'abc' SIMILAR TO 'a#\"b#\"c' ESCAPE '#'", "t" },
+    .{ "SELECT 'ab' SIMILAR TO 'ab' ESCAPE 'xy'", "!22025" },
+    .{ "SELECT 'aÃ©' SIMILAR TO 'a%' ESCAPE 'Ã©'", "!22025" },
+    .{ "SELECT 'abc' NOT SIMILAR TO 'a%'", "f" },
+    .{ "SELECT 'abc' SIMILAR TO 'a%' ESCAPE NULL", "NULL" },
+    .{ "SELECT 'abc' SIMILAR TO '%\\\"a\\\"%\\\"b\\\"%'", "!2200C" },
+    .{ "SELECT 'abc' SIMILAR TO NULL", "NULL" },
+    .{ "SELECT similar_to_escape('a%')", "^(?:a.*)$" },
+    .{ "SELECT similar_to_escape('a_c')", "^(?:a.c)$" },
+    .{ "SELECT similar_to_escape('a.b')", "^(?:a\\.b)$" },
+    .{ "SELECT similar_to_escape('(a|b)')", "^(?:(?:a|b))$" },
+    .{ "SELECT similar_to_escape('a\\%b')", "^(?:a\\%b)$" },
+    .{ "SELECT similar_to_escape('a#%b', '#')", "^(?:a\\%b)$" },
+    .{ "SELECT similar_to_escape('a%', '')", "^(?:a.*)$" },
+    .{ "SELECT similar_to_escape('[a\\]]')", "^(?:[a\\]])$" },
+    .{ "SELECT similar_to_escape('[^]a]')", "^(?:[^]a])$" },
+    .{ "SELECT similar_to_escape('a\\\"b\\\"c')", "^(?:a){1,1}?(b){1,1}(?:c)$" },
+    .{ "SELECT regexp_like('Abc','^a')", "f" },
+    .{ "SELECT regexp_like('Abc','^a','i')", "t" },
+    .{ "SELECT regexp_like('Abc','^a','c')", "f" },
+    .{ "SELECT regexp_like(E'a\\x0ab','a.b','n')", "f" },
+    .{ "SELECT regexp_like('a.b','a.b','q')", "t" },
+    .{ "SELECT regexp_like('axb','a.b','q')", "f" },
+    .{ "SELECT regexp_like('Abc','^a','g')", "!22023" },
+    .{ "SELECT regexp_like('Abc','^a','z')", "!22023" },
+    .{ "SELECT regexp_like('a b','a b','x')", "f" },
+    .{ "SELECT regexp_like('a','a',NULL)", "NULL" },
+    .{ "SELECT regexp_like(NULL,'a')", "NULL" },
+    .{ "SELECT NULL ~ 'a'", "NULL" },
+    .{ "SELECT 'a' ~ NULL", "NULL" },
+    .{ "SELECT 'a  '::char(3) ~ 'a $'", "f" },
+    .{ "SELECT 'a  '::char(3) ~ 'a$'", "f" },
+    .{ "SELECT 'ab'::name ~ '^a'", "t" },
+    .{ "SELECT 'ab'::varchar ~ 'b$'", "t" },
+    .{ "SELECT 'a' ~ 'a'::char(3)", "t" },
+    .{ "SELECT 1 ~ '1'", "!42883" },
+    .{ "SELECT regexp_like('a','a','eq')", "t" },
+    .{ "SELECT regexp_like('a','a','bg')", "!22023" },
+    .{ "SELECT regexp_like('a','(?e)a{1}?')", "!2201B" },
+    .{ "SELECT 'a' ~ '(?e)a\\d'", "f" },
+    .{ "SELECT 'ad' ~ '(?e)a\\d'", "t" },
+    .{ "SELECT 'a' ~ '(?e)[\\d]'", "f" },
+    .{ "SELECT '\\' ~ '(?e)[\\d]'", "t" },
+    .{ "SELECT 'a+' ~ '(?e)a\\+'", "t" },
+    .{ "SELECT 'ab' ~ '(?e)(?:ab)'", "!2201B" },
+    .{ "SELECT 'aaa' ~ 'a{255}'", "f" },
+    .{ "SELECT 'x' ~ '[a-z]{0,200}x'", "t" },
+    .{ "SELECT 'abc' ~ '(?x) a [ ] b c'", "f" },
+    .{ "SELECT ' ' ~ '(?x)[ ]'", "t" },
+    .{ "SELECT 'abc' ~ '(?xi)A B'", "t" },
+    .{ "SELECT 'ab' ~ '(?q)a.'", "f" },
+    .{ "SELECT 'a.' ~ '(?q)a.'", "t" },
+    .{ "SELECT 'a.' ~* '(?q)A.'", "t" },
+    .{ "SELECT 'Abc' ~* '***=a'", "t" },
+    .{ "SELECT 'abc' ~ '(?n)c$'", "t" },
+    .{ "SELECT '' ~ '$'", "t" },
+    .{ "SELECT '' ~ '^'", "t" },
+    .{ "SELECT 'a' ~ '(?=a)(?!b)a'", "t" },
+    .{ "SELECT 'ba' ~ '(?<=b)(?<!c)a'", "t" },
+    .{ "SELECT 'a' ~ '[[:alpha:][:digit:]]'", "t" },
+    .{ "SELECT '5' ~ '[[:alpha:][:digit:]]'", "t" },
+    .{ "SELECT '_' ~ '[^[:alnum:]]'", "t" },
+    .{ "SELECT 'A' ~* '[[:lower:]]'", "t" },
+    .{ "SELECT 'é' ~* 'É'", "f" },
+    .{ "SELECT 'ab' ~ 'a(?=b(?=$))'", "t" },
+    .{ "SELECT 'ab' ~ 'a(?=(?=(?=b)))'", "t" },
+};
+
+fn regularExpressions() !void {
+    // oracle: PG.PRED.REGEX.
+    try rows("SELECT 'abc' ~ '^a','ABC' ~* '^a','abc' SIMILAR TO 'a%'", "t|t|t");
+    for (0..3) |index| try meta(index, "?column?", 16, -1);
+    for (regex_battery) |case| try single(case[0], case[1]);
+
+    // Not supported here (0A000), where PostgreSQL matches: back
+    // references, BREs (embedded `b`; regexp_like options `b` and `e`,
+    // which parse_re_flags turns into BREs) and lookarounds nested more
+    // than three deep.
+    for ([_][]const u8{
+        "SELECT 'aa' ~ '(a)\\1'",              "SELECT 'aa' ~ '(a)(b)\\2'",
+        "SELECT 'aa' ~ '(a)\\1*'",             "SELECT 'a' ~ '(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)\\12'",
+        "SELECT 'a' ~ '(?b)a'",                "SELECT regexp_like('Abc','^a','b')",
+        "SELECT regexp_like('a','a{1}?','e')", "SELECT regexp_like('a.','a.','qe')",
+        "SELECT 'ab' ~ 'a(?=(?=(?=(?=b))))'",
+    }) |source| try rejects(source, error.UnsupportedStatement);
+    // A program beyond Config.regex_states instructions is 54000 (the
+    // first one PostgreSQL also refuses, as too complex: 2201B).
+    try rejects("SELECT 'aaa' ~ '(a{255}){255}'", error.ProgramLimitExceeded);
+    try rejects("SELECT 'a' ~ 'a{255}a{255}a{255}'", error.ProgramLimitExceeded);
+    try sqlstate(error.ProgramLimitExceeded, "54000");
+
+    // Columns, NULLs and every operator form over a table.
+    try exec("CREATE TABLE rx(id INT PRIMARY KEY, name TEXT, code CHAR(4), tag VARCHAR(8))");
+    try exec("INSERT INTO rx VALUES (1, 'Berlin', 'DE1', 'eu'), (2, 'bern', 'CH2', NULL), (3, NULL, 'X', 'na'), (4, 'Boston', 'US03', 'na')");
+    try rows("SELECT id FROM rx WHERE name ~ '^B' ORDER BY id", "1;4");
+    try rows("SELECT id FROM rx WHERE name ~* '^b' ORDER BY id", "1;2;4");
+    try rows("SELECT id FROM rx WHERE name !~ 'in$' ORDER BY id", "2;4");
+    try rows("SELECT id FROM rx WHERE name !~* '^B' ORDER BY id", "");
+    try rows("SELECT id, name ~ 'er', tag ~ 'a' FROM rx ORDER BY id", "1|t|f;2|t|NULL;3|NULL|t;4|f|t");
+    // bpchar operands keep their padding (bpcharregexeq).
+    try rows("SELECT id FROM rx WHERE code ~ '^[A-Z]{2}[0-9] $' ORDER BY id", "1;2");
+    try rows("SELECT id FROM rx WHERE name SIMILAR TO 'B%n' OR tag NOT SIMILAR TO '(eu|na)' ORDER BY id", "1;4");
+    try rows("SELECT id, regexp_like(name, 'ER', 'i') FROM rx ORDER BY id", "1|t;2|t;3|NULL;4|f");
+    try rows("SELECT id FROM rx WHERE name ~ tag ORDER BY id", "");
+    try rows("SELECT COUNT(*) FROM rx WHERE name ~ (SELECT '^' || 'B')", "2");
+    try rejects("SELECT id FROM rx WHERE name ~ '('", error.InvalidRegularExpression);
+    try sqlstate(error.InvalidRegularExpression, "2201B");
+    try sqlstate(error.InvalidEscapeCharacterUse, "2200C");
+    try rejects("SELECT id FROM rx WHERE id ~ '1'", error.UndefinedFunction);
+    try sqlstate(error.UndefinedFunction, "42883");
+
+    // A hostile pattern stays linear (Pike VM) and every text position is
+    // a work-budget checkpoint and a cancellation point.
+    try controlled("SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab' ~ '^(a|aa)*(a+)+c'", "f");
+    try controlled("SELECT name FROM rx WHERE name ~* '(?<=b)e(?=r)' ORDER BY id", "Berlin;bern");
+    try controlled("SELECT 'xxxxxxxxxxxxxxxxxxxxy' SIMILAR TO '%(x|xx)%y'", "t");
+
+    // Stored expressions print as ruleutils does.
+    try exec("CREATE TABLE rd(id INT PRIMARY KEY, a BOOLEAN DEFAULT ('x' ~ 'y'), b BOOLEAN DEFAULT ('x' !~* 'y'), c BOOLEAN DEFAULT ('x' SIMILAR TO 'y%'), d BOOLEAN DEFAULT ('x' NOT SIMILAR TO 'y' ESCAPE '#'), e TEXT DEFAULT similar_to_escape('a%'), f BOOLEAN DEFAULT regexp_like('a', 'b', 'i'))");
+    try rows("SELECT column_default FROM information_schema.columns WHERE table_name = 'rd' AND column_default IS NOT NULL ORDER BY ordinal_position",
+        "('x'::text ~ 'y'::text);('x'::text !~* 'y'::text);('x'::text ~ similar_to_escape('y%'::text));('x'::text !~ similar_to_escape('y'::text, '#'::text));similar_to_escape('a%'::text);regexp_like('a'::text, 'b'::text, 'i'::text)");
+    try exec("INSERT INTO rd(id) VALUES (1)");
+    try rows("SELECT a, b, c, d, e, f FROM rd", "f|t|f|t|^(?:a.*)$|f");
+    try exec("DROP TABLE rd");
+
+    // CHECK constraints and replay: the expression is stored text.
+    try replay(&.{
+        "CREATE TABLE rc(id INT PRIMARY KEY, code TEXT CHECK (code ~ '^[A-Z]{2}[0-9]+$'), city TEXT CHECK (city SIMILAR TO '[A-Z]%'))",
+        "INSERT INTO rc VALUES (1, 'AB12', 'Bern'), (2, NULL, 'Oslo')",
+        "UPDATE rc SET code = 'ZZ9' WHERE id = 2",
+    }, &.{"rc"}, "SELECT * FROM rc ORDER BY id");
+    try replicaShows("1|AB12|Bern;2|ZZ9|Oslo");
+    try exec("CREATE TABLE rc(id INT PRIMARY KEY, code TEXT CHECK (code ~ '^[A-Z]{2}[0-9]+$'))");
+    try rejects("INSERT INTO rc VALUES (1, 'AB1'), (2, 'ab12')", error.CheckViolation);
+    try sqlstate(error.CheckViolation, "23514");
+    try rows("SELECT COUNT(*) FROM rc", "0");
+    try exec("DROP TABLE rc");
+    try exec("DROP TABLE rx");
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try discovery();
     try collations();
+    try regularExpressions();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-text\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);
