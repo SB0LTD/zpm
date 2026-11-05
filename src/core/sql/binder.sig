@@ -4183,9 +4183,13 @@ pub fn Binder(comptime config: types.Config) type {
                         break;
                     };
                     const to = types.typeOfData(data);
+                    // An exact type counts most; an untyped literal prefers
+                    // the string category's preferred type (text).
                     if (from == to) {
-                        exact += 1;
-                    } else if (from != .unknown and !value.castable(from, to, .implicit)) {
+                        exact += 2;
+                    } else if (from == .unknown) {
+                        if (to == .text) exact += 1;
+                    } else if (!value.castable(from, to, .implicit)) {
                         accepted = false;
                         break;
                     }

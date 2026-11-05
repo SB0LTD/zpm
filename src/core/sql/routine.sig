@@ -212,6 +212,17 @@ pub fn Routines(comptime config: types.Config) type {
                 return out;
             }
 
+            /// A label: any word, reserved ones included.
+            pub fn anyIdentifier(self: *Cursor) Error!Name {
+                const token = self.current;
+                if (token.kind != .word) return self.identifier();
+                if (token.len > config.name_bytes) return error.NameCapacity;
+                var out: Name = .{ .len = token.len };
+                for (token.raw(self.source), 0..) |byte, index| out.bytes[index] = types.lower(byte);
+                try self.advance();
+                return out;
+            }
+
             /// A string constant ('...', E'...', $$...$$), decoded into `out`.
             pub fn string(self: *Cursor, out: []u8) Error!usize {
                 if (self.current.kind != .string) return error.Syntax;
@@ -476,8 +487,10 @@ pub fn Routines(comptime config: types.Config) type {
                     var buffer: [32]u8 = undefined;
                     if (cursor.current.kind == .string) {
                         const len = try cursor.string(&buffer);
+                        if (types.keyword(buffer[0..len], "sql")) return error.UnsupportedStatement;
                         if (!types.keyword(buffer[0..len], "plpgsql")) return error.UndefinedObject;
                     } else {
+                        if (cursor.is("sql")) return error.UnsupportedStatement;
                         if (!cursor.is("plpgsql")) return error.UndefinedObject;
                         try cursor.advance();
                     }
@@ -631,9 +644,13 @@ pub fn Routines(comptime config: types.Config) type {
             out.table = try tableName(cursor);
             if (try cursor.take("where")) {
                 const begin = cursor.start();
-                while (!cursor.atEnd() and !cursor.is("do")) try cursor.advance();
-                if (cursor.atEnd() or cursor.start() == begin) return error.Syntax;
-                out.where = .{ .start = begin, .end = cursor.start() };
+                var end = begin;
+                while (!cursor.atEnd() and !cursor.is("do")) {
+                    end = cursor.after();
+                    try cursor.advance();
+                }
+                if (cursor.atEnd() or end == begin) return error.Syntax;
+                out.where = .{ .start = begin, .end = end };
             }
             try cursor.expect("do");
             if (try cursor.take("instead")) {
@@ -898,15 +915,14 @@ pub fn Routines(comptime config: types.Config) type {
                 fn label(self: *Self) Error!Name {
                     if (!self.cursor.symbol(.shift_left)) return .{};
                     try self.cursor.advance();
-                    const name = try self.cursor.identifier();
+                    const name = try self.cursor.anyIdentifier();
                     try self.cursor.expectSymbol(.shift_right);
                     return name;
                 }
 
                 fn endLabel(self: *Self, wanted: Name) Error!void {
                     if (self.cursor.current.kind == .word or self.cursor.current.kind == .quoted_word) {
-                        if (self.cursor.symbol(.semicolon)) return;
-                        const name = try self.cursor.identifier();
+                        const name = try self.cursor.anyIdentifier();
                         if (wanted.len == 0 or !types.same(name.slice(), wanted.slice())) return error.Syntax;
                     }
                 }
@@ -1467,7 +1483,7 @@ pub fn Routines(comptime config: types.Config) type {
                     const leave = c.is("exit");
                     try c.advance();
                     var name: Name = .{};
-                    if (c.current.kind == .word and !c.is("when") or c.current.kind == .quoted_word) name = try c.identifier();
+                    if (c.current.kind == .word and !c.is("when") or c.current.kind == .quoted_word) name = try c.anyIdentifier();
                     var condition: ?Span = null;
                     if (try c.take("when")) condition = try self.expression(.{});
                     try c.expectSymbol(.semicolon);

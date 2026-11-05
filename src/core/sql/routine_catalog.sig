@@ -498,7 +498,11 @@ pub fn Catalog(comptime config: types.Config) type {
             out.strict = strict == 1;
             out.arg_count = count;
             for (0..count) |index| {
-                try readName(&reader, &out.arg_names[index]);
+                // Unnamed arguments (`f(INT)`) have an empty name.
+                if (reader.position < payload.len and payload[reader.position] == 0) {
+                    reader.position += 1;
+                    out.arg_names[index] = .{};
+                } else try readName(&reader, &out.arg_names[index]);
                 out.arg_oids[index] = try reader.int(u32);
                 out.arg_typmods[index] = try reader.int(i32);
                 if (!knownType(out.arg_oids[index])) return error.InvalidChangeRecord;

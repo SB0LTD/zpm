@@ -1747,7 +1747,9 @@ pub fn Database(comptime config: Config) type {
                     break :blk affected;
                 },
                 .truncate => |*truncate| blk: {
+                    for (truncate.tables[0..truncate.count]) |index| try self.statementTriggers(index, routine_catalog.tg_before, &.{routine_catalog.tg_truncate}, snap);
                     try self.truncateTables(slot, truncate, snap);
+                    for (truncate.tables[0..truncate.count]) |index| try self.statementTriggers(index, 0, &.{routine_catalog.tg_truncate}, snap);
                     break :blk 0;
                 },
                 .alter_table => |*alter| blk: {
@@ -1900,7 +1902,9 @@ pub fn Database(comptime config: Config) type {
         /// into the workspace first; a failure leaves the result untouched.
         fn returnRows(self: *Self, slot: u16, source: []const u8, list: *const B.Returning, table_index: usize, fresh: bool, result_capacity: usize) Error!void {
             const tx = &self.txs[slot];
-            const start = tx.subs[tx.sub_len - 1].write_start;
+            // The statement's own writes (a routine's statement starts
+            // inside the CALL / DO statement's subtransaction).
+            const start = self.statement_start;
             const writes = tx.writes[start..tx.write_len];
             var count: usize = 0;
             for (writes) |entry| if (rowWrite(entry.kind) and (entry.table == table_index or self.descends(entry.table, table_index))) {
@@ -5967,9 +5971,13 @@ pub fn Database(comptime config: Config) type {
                 var accepted = true;
                 for (args[0..call.arg_count], routine.arg_oids[0..call.arg_count]) |arg, oid| {
                     const to = typeOfOid(oid);
-                    if (arg.unknown) continue;
+                    // An unknown literal prefers the string category (text).
+                    if (arg.unknown) {
+                        if (to == .text) exact += 1;
+                        continue;
+                    }
                     if (arg.ty == to) {
-                        exact += 1;
+                        exact += 2;
                     } else if (!value_module.castable(arg.ty, to, .implicit)) accepted = false;
                 }
                 if (!accepted) continue;
@@ -6673,7 +6681,7 @@ pub fn Database(comptime config: Config) type {
                     definition.add(".");
                     definition.add(table.name.slice());
                     if (rule.where.len != 0) {
-                        definition.add("\n  WHERE (");
+                        definition.add("\n   WHERE (");
                         definition.add(rule.where.slice());
                         definition.add(")");
                     }
