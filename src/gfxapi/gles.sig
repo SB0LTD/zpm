@@ -54,11 +54,23 @@ pub const MAX_ATTRS = raster.MAX_ATTRS;
 pub const VENDOR_STRING: [:0]const u8 = "Galaxy";
 pub const VERSION_STRING: [:0]const u8 = "OpenGL ES 3.0 Galaxy 0.1";
 pub const GLSL_STRING: [:0]const u8 = "OpenGL ES GLSL ES 3.00";
+/// What GL_EXTENSIONS names: what the driver has (WebRender asks for
+/// BGRA and external textures in ESSL 3.00; GLSL ES 1.00 programs for
+/// derivatives and texture LOD; ES 2 apps for sized renderbuffers and
+/// texture storage). The GLSL compiler's #extension takes the shading ones.
 pub const EXTENSIONS = [_][:0]const u8{
     "GL_EXT_read_format_bgra",
     "GL_EXT_texture_format_BGRA8888",
+    "GL_EXT_texture_storage",
+    "GL_EXT_shader_texture_lod",
     "GL_OES_EGL_image",
     "GL_OES_EGL_image_external",
+    "GL_OES_EGL_image_external_essl3",
+    "GL_OES_standard_derivatives",
+    "GL_OES_depth24",
+    "GL_OES_packed_depth_stencil",
+    "GL_OES_rgb8_rgba8",
+    "GL_OES_texture_npot",
 };
 
 /// EGL's EGLImage handles to their images (egl.sig sets it): what
