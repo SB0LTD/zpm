@@ -26,6 +26,11 @@
 //! Session settings (SET/SHOW/RESET, SET LOCAL, startup `-c` options) are
 //! transactional like PostgreSQL's: reverted by ROLLBACK and ROLLBACK TO,
 //! SET LOCAL ends with the transaction. Hooks must not reenter this store.
+//! The engine owns the transaction modes (BEGIN/SET TRANSACTION isolation,
+//! READ ONLY, DEFERRABLE), search_path, default_transaction_* and
+//! placeholder settings, cursors, SQL prepared statements, advisory locks
+//! and LISTEN/NOTIFY (sql/session.sig): each connection owns its engine
+//! session state and installs it with every call; disconnect() ends it.
 //!
 //! TimeZone (design §4.2/§4.8): UTC, a number of hours (ISO sign, shown as
 //! `<+05>-05`), a zone name resolved through the caller's zone provider
@@ -214,7 +219,9 @@ fn offsetName(east: i64, out: *[64]u8) u8 {
 /// One-time deadlock check delay (PostgreSQL's default deadlock_timeout).
 pub const deadlock_timeout_ms: u32 = 1000;
 
-const Parameter = enum { lock_timeout, statement_timeout, deadlock_timeout, transaction_isolation, default_transaction_isolation, timezone, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes, search_path };
+/// Settings this store implements; the engine owns the others it knows
+/// (transaction_*, default_transaction_*, search_path, placeholders).
+const Parameter = enum { lock_timeout, statement_timeout, deadlock_timeout, timezone, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes };
 
 fn parameter(name: []const u8) ?Parameter {
     inline for (@typeInfo(Parameter).@"enum".field_names) |field| {
@@ -289,6 +296,9 @@ pub fn Store(comptime Raw: type) type {
     const has_control = @hasDecl(Raw, "ExecutionControl");
     const ExecutionControl = if (has_control) Raw.ExecutionControl else struct {};
     const ExecutionError = if (@hasDecl(Raw, "SqlError")) Raw.SqlError else anyerror;
+    const has_engine_session = @hasDecl(Raw, "SessionState");
+    const EngineSession = if (has_engine_session) Raw.SessionState else struct {};
+    const NotificationType = if (has_engine_session) Raw.Notification else struct {};
     return struct {
         const Self = @This();
         pub const CommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
@@ -472,6 +482,66 @@ pub fn Store(comptime Raw: type) type {
             copy_rows: usize = 0,
             /// The COPY FROM row being inserted (kept while it is parked).
             copy_row: Raw.Row = .{},
+            /// Engine session state: transaction-mode defaults, engine
+            /// settings, cursors, prepared statements, LISTEN.
+            engine_session: EngineSession = .{},
+
+            pub const Notification = NotificationType;
+
+            /// The open block's transaction slot (null outside a block).
+            fn blockSlot(self: *const Connection) ?u16 {
+                return if (self.in_transaction) self.tx else null;
+            }
+
+            /// Backend pid reported with this session's NOTIFY (codec-set).
+            pub fn setBackendPid(self: *Connection, pid: u32) void {
+                if (comptime has_engine_session) self.engine_session.pid = pid;
+            }
+
+            /// The next committed notification for this session, between
+            /// transactions only (PostgreSQL never delivers inside a block).
+            pub fn takeNotification(self: *Connection, out: *NotificationType) bool {
+                if (comptime !has_engine_session) return false;
+                if (self.id == 0 or self.in_transaction or self.pending.active) return false;
+                return self.db().takeNotification(out);
+            }
+
+            fn providerShow(context: ?*anyopaque, name: []const u8, out: []u8) ?usize {
+                const self: *Connection = @ptrCast(@alignCast(context.?));
+                const which = parameter(name) orelse return null;
+                var buffer: [128]u8 = undefined;
+                const value = self.showValue(which, &buffer);
+                if (value.len > out.len) return null;
+                @memcpy(out[0..value.len], value);
+                return value.len;
+            }
+
+            fn providerSet(context: ?*anyopaque, name: []const u8, value: []const u8, local: bool, reset: bool) ExecutionError!bool {
+                const self: *Connection = @ptrCast(@alignCast(context.?));
+                const which = parameter(name) orelse return false;
+                self.applySet(which, local, reset, value) catch |err| return switch (err) {
+                    error.UnsupportedStatement => error.UnsupportedStatement,
+                    error.UndefinedSetting => error.UndefinedSetting,
+                    else => error.InvalidSettingValue,
+                };
+                return true;
+            }
+
+            /// SET [LOCAL] of a store setting (DEFAULT when `reset`).
+            fn applySet(self: *Connection, which: Parameter, local: bool, reset: bool, value: []const u8) !void {
+                var next = self.settings;
+                if (reset) {
+                    try self.assign(&next, which, "", true);
+                    restore(&next, &self.startup, which);
+                } else try self.assign(&next, which, value, false);
+                if (local) {
+                    // Outside a block SET LOCAL has no effect (PostgreSQL warns).
+                    if (self.in_transaction) self.settings = next;
+                } else {
+                    self.settings = next;
+                    restore(&self.base, &next, which);
+                }
+            }
 
             pub const CopyInfo = Raw.CopyInfo;
             pub const copy_line_bytes = Raw.copy_line_bytes;
@@ -559,6 +629,10 @@ pub fn Store(comptime Raw: type) type {
                     .database = if (self.database_len == 0) "postgres" else self.database_name[0..self.database_len],
                 };
                 if (comptime has_control) raw.session.control = if (self.running_statement) &self.execution else null;
+                if (comptime has_engine_session) {
+                    raw.session_state = &self.engine_session;
+                    raw.settings_provider = .{ .context = @ptrCast(self), .show = &providerShow, .set = &providerSet };
+                }
                 return raw;
             }
 
@@ -654,6 +728,7 @@ pub fn Store(comptime Raw: type) type {
                 if (self.id == 0) return;
                 self.rollbackTransaction() catch {};
                 self.pending = .{};
+                if (comptime has_engine_session) self.db().endSession();
             }
 
             pub fn blocked(self: *const Connection) bool {
@@ -740,15 +815,12 @@ pub fn Store(comptime Raw: type) type {
                         @memcpy(target.application_name[0..length], value[0..length]);
                         target.application_name_len = @intCast(length);
                     },
-                    .transaction_isolation, .default_transaction_isolation => {
-                        if (!(value.len == 0 or sameInsensitive(value, "read committed") or sameInsensitive(value, "read uncommitted"))) return error.UnsupportedStatement;
-                    },
                     .timezone => try self.assignZone(target, value),
                     .client_encoding => if (!(value.len == 0 or sameInsensitive(value, "UTF8") or sameInsensitive(value, "UTF-8"))) return error.InvalidSettingValue,
                     .standard_conforming_strings => if (!(value.len == 0 or sameInsensitive(value, "on") or sameInsensitive(value, "true"))) return error.InvalidSettingValue,
                     .datestyle => target.date_order = try dateOrder(value, target.date_order),
                     .intervalstyle => if (!(value.len == 0 or sameInsensitive(value, "postgres"))) return error.InvalidSettingValue,
-                    .deadlock_timeout, .server_version, .server_encoding, .integer_datetimes, .search_path => return error.InvalidSettingValue,
+                    .deadlock_timeout, .server_version, .server_encoding, .integer_datetimes => return error.InvalidSettingValue,
                 }
             }
 
@@ -812,14 +884,12 @@ pub fn Store(comptime Raw: type) type {
                     .statement_timeout => return formatMilliseconds(self.settings.statement_timeout_ms, out),
                     .deadlock_timeout => return formatMilliseconds(deadlock_timeout_ms, out),
                     .application_name => self.settings.applicationName(),
-                    .transaction_isolation, .default_transaction_isolation => "read committed",
                     .timezone => self.settings.timeZone(),
                     .client_encoding, .server_encoding => "UTF8",
                     .standard_conforming_strings, .integer_datetimes => "on",
                     .datestyle => self.settings.dateStyle(),
                     .intervalstyle => "postgres",
                     .server_version => "16.0",
-                    .search_path => "\"$user\", public",
                 };
                 @memcpy(out[0..value.len], value);
                 return out[0..value.len];
@@ -867,7 +937,14 @@ pub fn Store(comptime Raw: type) type {
                 switch (command) {
                     .none => return raw.describeIn(self.tx, source, result),
                     .show => |name| {
-                        const which = parameter(name.slice()) orelse return error.UndefinedSetting;
+                        const which = parameter(name.slice()) orelse {
+                            if (comptime has_engine_session) {
+                                try raw.sessionShow(self.blockSlot(), name.slice(), result);
+                                result.row_count = 0;
+                                return;
+                            }
+                            return error.UndefinedSetting;
+                        };
                         self.showResult(which, result, false);
                     },
                     else => result.clear(0),
@@ -877,9 +954,16 @@ pub fn Store(comptime Raw: type) type {
             fn control(self: *Connection, command: anytype, result: *Result) !void {
                 switch (command) {
                     .none => unreachable,
-                    .begin => |level| {
-                        if (level == .repeatable_read or level == .serializable) return error.UnsupportedStatement;
-                        try self.beginTransaction();
+                    .begin => |modes| {
+                        if (comptime has_engine_session) {
+                            const fresh = !self.in_transaction;
+                            try self.beginTransaction();
+                            // BEGIN inside a block only warns (its modes are ignored).
+                            if (fresh) try self.db().beginModes(self.tx.?, modes);
+                        } else {
+                            if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
+                            try self.beginTransaction();
+                        }
                         result.clear(0);
                         result.command = .begin;
                     },
@@ -922,41 +1006,53 @@ pub fn Store(comptime Raw: type) type {
                     },
                     .set => |set| {
                         if (self.failed) return error.TransactionFailed;
-                        const which = parameter(set.name.slice()) orelse return error.UndefinedSetting;
-                        const value = if (set.kind == .default) "" else set.value.slice();
-                        var next = self.settings;
-                        if (set.kind == .default) {
-                            try self.assign(&next, which, "", true);
-                            restore(&next, &self.startup, which);
-                        } else try self.assign(&next, which, value, false);
-                        if (set.local) {
-                            // Outside a block SET LOCAL has no effect (PostgreSQL warns).
-                            if (self.in_transaction) self.settings = next;
-                        } else {
-                            self.settings = next;
-                            restore(&self.base, &next, which);
-                        }
+                        const which = parameter(set.name.slice()) orelse {
+                            if (comptime !has_engine_session) return error.UndefinedSetting;
+                            try self.db().sessionSet(self.blockSlot(), set.local, set.name.slice(), set.kind, set.value.slice());
+                            result.clear(0);
+                            result.command = .set;
+                            return;
+                        };
+                        try self.applySet(which, set.local, set.kind == .default, if (set.kind == .default) "" else set.value.slice());
                         result.clear(0);
                         result.command = .set;
                     },
-                    .set_transaction => |level| {
+                    .set_transaction => |modes| {
                         if (self.failed) return error.TransactionFailed;
-                        if (level == .repeatable_read or level == .serializable) return error.UnsupportedStatement;
+                        if (comptime has_engine_session) {
+                            // Outside a block SET TRANSACTION only warns.
+                            if (self.in_transaction) try self.db().setTransaction(self.tx.?, modes);
+                        } else if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
+                        result.clear(0);
+                        result.command = .set;
+                    },
+                    .set_session_characteristics => |modes| {
+                        if (self.failed) return error.TransactionFailed;
+                        if (comptime !has_engine_session) return error.UnsupportedStatement;
+                        try self.db().sessionCharacteristics(self.blockSlot(), modes);
                         result.clear(0);
                         result.command = .set;
                     },
                     .show => |name| {
                         if (self.failed) return error.TransactionFailed;
-                        const which = parameter(name.slice()) orelse return error.UndefinedSetting;
+                        const which = parameter(name.slice()) orelse {
+                            if (comptime !has_engine_session) return error.UndefinedSetting;
+                            return self.db().sessionShow(self.blockSlot(), name.slice(), result);
+                        };
                         self.showResult(which, result, true);
                     },
                     .reset => |name| {
                         if (self.failed) return error.TransactionFailed;
                         if (name) |text| {
-                            const which = parameter(text.slice()) orelse return error.UndefinedSetting;
-                            restore(&self.settings, &self.startup, which);
-                            restore(&self.base, &self.startup, which);
+                            if (parameter(text.slice())) |which| {
+                                restore(&self.settings, &self.startup, which);
+                                restore(&self.base, &self.startup, which);
+                            } else {
+                                if (comptime !has_engine_session) return error.UndefinedSetting;
+                                try self.db().sessionReset(self.blockSlot(), text.slice());
+                            }
                         } else {
+                            if (comptime has_engine_session) try self.db().sessionReset(self.blockSlot(), null);
                             self.settings = self.startup;
                             self.base = self.startup;
                         }
@@ -1056,7 +1152,11 @@ pub fn Store(comptime Raw: type) type {
                     if (comptime has_control) self.store.database.session.control = null;
                 }
                 const writes = if (self.store.storageReady()) |_| true else |_| false;
-                self.db().statement(slot, source, result, .{ .@"resume" = resuming, .writes = writes, .hold_result = implicit }) catch |err| {
+                const outcome = if (comptime has_engine_session)
+                    self.db().statement(slot, source, result, .{ .@"resume" = resuming, .writes = writes, .hold_result = implicit, .implicit = implicit })
+                else
+                    self.db().statement(slot, source, result, .{ .@"resume" = resuming, .writes = writes, .hold_result = implicit });
+                outcome catch |err| {
                     if (err == error.WouldBlock) {
                         if (!resuming) {
                             self.park(source, implicit);

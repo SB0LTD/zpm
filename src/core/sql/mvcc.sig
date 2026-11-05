@@ -60,6 +60,10 @@ pub fn Mvcc(comptime config: types.Config) type {
         /// A SET CONSTRAINTS name: the table OID and constraint name.
         pub const ConstraintMode = struct { oid: u32, name: V.Name, deferred: bool };
 
+        /// Effective isolation levels (READ UNCOMMITTED is READ COMMITTED,
+        /// as in PostgreSQL).
+        pub const Level = enum(u8) { read_committed, repeatable_read, serializable, read_uncommitted };
+
         pub const Tx = struct {
             active: bool = false,
             epoch: u32 = 0,
@@ -103,6 +107,20 @@ pub fn Mvcc(comptime config: types.Config) type {
             /// SET CONSTRAINTS name modes, newest last.
             constraint_modes: [config.constraint_modes]ConstraintMode = undefined,
             constraint_mode_count: usize = 0,
+            /// Transaction modes (tx-session lane): isolation level (RC, RR
+            /// or SERIALIZABLE), READ ONLY and DEFERRABLE.
+            isolation: Level = .read_committed,
+            read_only: bool = false,
+            deferrable: bool = false,
+            /// REPEATABLE READ / SERIALIZABLE: the transaction snapshot
+            /// (commit sequence number), taken by the first statement that
+            /// needs one (command id `snapshot_cid`).
+            snapshot_csn: ?u64 = null,
+            snapshot_cid: u32 = 0,
+            /// The session (engine session-state id) that began it.
+            session: u64 = 0,
+            /// SERIALIZABLE conflict tracking record (ssi.sig), if any.
+            ssi: ?u16 = null,
 
             pub fn ref(self: *const Tx, slot: usize) storage.TxRef {
                 return .{ .slot = @intCast(slot), .epoch = self.epoch, .sub = @intCast(self.sub_len) };

@@ -84,7 +84,10 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // XML (B11 advanced types, xml.sig): XMLPARSE / XMLSERIALIZE (node
     // `integer` 1 for DOCUMENT; XMLSERIALIZE's target in cast_type/typmod)
     // and the well-formedness predicates.
-    xmlparse, xmlserialize, xml_is_well_formed, xml_is_well_formed_document, xml_is_well_formed_content };
+    xmlparse, xmlserialize, xml_is_well_formed, xml_is_well_formed_document, xml_is_well_formed_content,
+    // Session functions (tx-session lane, Database session hook; volatile).
+    current_setting, set_config, pg_try_advisory_lock, pg_try_advisory_lock_shared, pg_try_advisory_xact_lock, pg_try_advisory_xact_lock_shared,
+    pg_advisory_unlock, pg_advisory_unlock_shared, pg_backend_pid };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
@@ -828,6 +831,25 @@ pub fn Ast(comptime config: types.Config) type {
             refresh_view: Refresh,
             merge: Merge,
             set_constraints: SetConstraints,
+            /// Session and transaction-scoped commands executed by the
+            /// engine (tx-session lane, session.sig): LOCK TABLE, cursors,
+            /// SQL prepared statements, LISTEN/NOTIFY/UNLISTEN.
+            session: SessionCommand,
+        };
+
+        /// `body`: byte offset of the inner statement (DECLARE's query,
+        /// PREPARE's statement) in the source; it is re-parsed at run time.
+        pub const SessionCommand = union(enum) {
+            lock_table: struct { tables: [config.tables]TableRef = undefined, only: [config.tables]bool = undefined, count: usize = 0, mode: TableLockMode = .access_exclusive, nowait: bool = false },
+            declare: struct { name: Ident, scroll: ?bool = null, hold: bool = false, binary: bool = false, body: usize = 0 },
+            fetch: struct { name: Ident, direction: FetchDirection = .forward, count: i64 = 1, all: bool = false, move: bool = false },
+            close: struct { name: Ident = .{}, all: bool = false },
+            prepare: struct { name: Ident, types: [config.statement_parameters]TypeName = undefined, typmods: [config.statement_parameters]i32 = undefined, count: usize = 0, body: usize = 0 },
+            execute: struct { name: Ident, args: u16 = none, count: usize = 0 },
+            deallocate: struct { name: Ident = .{}, all: bool = false },
+            listen: Ident,
+            unlisten: struct { name: Ident = .{}, all: bool = false },
+            notify: struct { channel: Ident, payload: ?lexer.Quoted = null },
         };
     };
 }
@@ -870,12 +892,29 @@ pub const ConflictAction = enum { none, nothing, update };
 pub const JoinKind = enum { first, cross, inner, left, right, full };
 pub const SetOp = enum { none, @"union", intersect, except };
 
-/// SELECT ... FOR UPDATE|SHARE [NOWAIT|SKIP LOCKED].
-pub const LockStrength = enum { none, update, share };
+/// SELECT ... FOR {UPDATE|NO KEY UPDATE|SHARE|KEY SHARE} [OF name [, ...]]
+/// [NOWAIT|SKIP LOCKED]. `of` is the first OF name; `of_other` the first
+/// OF name spelled differently (single-table locking: 42P01 when bound).
+pub const LockStrength = enum { none, update, share, key_share, no_key_update };
 pub const LockWait = enum { block, nowait, skip_locked };
-pub const Locking = struct { strength: LockStrength = .none, wait: LockWait = .block };
+pub const Locking = struct {
+    strength: LockStrength = .none,
+    wait: LockWait = .block,
+    of: Ident = .{},
+    of_set: bool = false,
+    of_other: Ident = .{},
+    of_other_set: bool = false,
+};
 
 pub const Isolation = enum { default, read_uncommitted, read_committed, repeatable_read, serializable };
+
+/// Transaction modes of BEGIN / START TRANSACTION / SET TRANSACTION / SET
+/// SESSION CHARACTERISTICS AS TRANSACTION (null: not given).
+pub const Characteristics = struct {
+    isolation: Isolation = .default,
+    read_only: ?bool = null,
+    deferrable: ?bool = null,
+};
 
 /// A configuration parameter name: an identifier, or the special SQL forms
 /// TIME ZONE and TRANSACTION ISOLATION LEVEL.
@@ -890,20 +929,31 @@ pub const SettingValue = struct {
     kind: enum { default, word, string, number } = .default,
     span: Span = .{},
     quoted: lexer.Quoted = .{ .start = 0, .end = 0, .len = 0 },
+    /// A comma list (`SET search_path TO a, b`): its raw source bytes
+    /// [list_start, list_end); 0 when the value is a single item.
+    list_start: usize = 0,
+    list_end: usize = 0,
 };
 
 /// Transaction control and session commands; executed by the store, never
 /// by a single statement.
 pub const Control = union(enum) {
-    begin: Isolation,
+    begin: Characteristics,
     commit: void,
     rollback: void,
     savepoint: Ident,
     release: Ident,
     rollback_to: Ident,
     set: struct { local: bool, name: SettingName, value: SettingValue },
-    set_transaction: Isolation,
+    set_transaction: Characteristics,
     show: SettingName,
     /// null = RESET ALL.
     reset: ?SettingName,
+    set_session_characteristics: Characteristics,
 };
+
+/// LOCK TABLE modes (PostgreSQL's eight, weakest first).
+pub const TableLockMode = enum { access_share, row_share, row_exclusive, share_update_exclusive, share, share_row_exclusive, exclusive, access_exclusive };
+
+/// FETCH / MOVE direction; `count` is the row count or position.
+pub const FetchDirection = enum { forward, backward, absolute, relative };

@@ -303,11 +303,12 @@ pub fn Parser(comptime config: types.Config) type {
                 return error.UnsupportedStatement;
             }
             if (self.mode == .legacy_alpha) {
-                if (try self.takeWord("BEGIN")) return self.legacyControl(.{ .begin = .default });
+                if (try self.takeWord("BEGIN")) return self.legacyControl(.{ .begin = .{} });
                 if (try self.takeWord("COMMIT")) return self.legacyControl(.commit);
                 if (try self.takeWord("ROLLBACK")) return self.legacyControl(.rollback);
                 return error.UnsupportedStatement;
             }
+            if (self.mode == .standard) if (try self.sessionCommand()) |command| return .{ .session = command };
             return .{ .control = try self.controlStatement() };
         }
 
@@ -870,15 +871,15 @@ pub fn Parser(comptime config: types.Config) type {
             // unsupported statement (0A000), as before the pipeline split.
             if (try self.takeWord("BEGIN")) {
                 _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
-                const level = try self.isolationClause();
+                const modes = try self.transactionModes();
                 self.finish() catch return error.UnsupportedStatement;
-                return .{ .begin = level };
+                return .{ .begin = modes };
             }
             if (try self.takeWord("START")) {
                 try self.expectWord("TRANSACTION");
-                const level = try self.isolationClause();
+                const modes = try self.transactionModes();
                 self.finish() catch return error.UnsupportedStatement;
-                return .{ .begin = level };
+                return .{ .begin = modes };
             }
             if ((try self.takeWord("COMMIT")) or (try self.takeWord("END"))) {
                 _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
@@ -914,12 +915,22 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (try self.takeWord("SET")) {
                 var local = false;
-                if (try self.takeWord("LOCAL")) local = true else _ = try self.takeWord("SESSION");
-                if (try self.takeWord("TRANSACTION")) {
-                    const level = try self.isolationClause();
-                    if (level == .default) return error.Syntax;
+                var session = false;
+                if (try self.takeWord("LOCAL")) local = true else session = try self.takeWord("SESSION");
+                if (session and try self.takeRaw("characteristics")) {
+                    try self.expectWord("AS");
+                    try self.expectWord("TRANSACTION");
+                    const modes = try self.transactionModes();
+                    if (modes.isolation == .default and modes.read_only == null and modes.deferrable == null) return error.Syntax;
                     try self.finish();
-                    return .{ .set_transaction = level };
+                    return .{ .set_session_characteristics = modes };
+                }
+                if (try self.takeWord("TRANSACTION")) {
+                    if (self.rawWord("snapshot")) return error.UnsupportedStatement;
+                    const modes = try self.transactionModes();
+                    if (modes.isolation == .default and modes.read_only == null and modes.deferrable == null) return error.Syntax;
+                    try self.finish();
+                    return .{ .set_transaction = modes };
                 }
                 if (try self.takeWord("TIME")) {
                     try self.expectWord("ZONE");
@@ -930,7 +941,17 @@ pub fn Parser(comptime config: types.Config) type {
                 }
                 const name: ast.SettingName = .{ .ident = try self.label() };
                 if (!try self.takeWord("TO")) try self.expectSymbol(.eq);
-                const value = try self.settingValue();
+                const first = self.current;
+                var value = try self.settingValue();
+                if (value.kind != .default and self.isSymbol(.comma)) {
+                    value.list_start = first.start - first.prefix;
+                    while (try self.takeSymbol(.comma)) {
+                        const element = self.current;
+                        const item = try self.settingValue();
+                        if (item.kind == .default) return error.Syntax;
+                        value.list_end = element.end + element.suffix;
+                    }
+                }
                 try self.finish();
                 return .{ .set = .{ .local = local, .name = name, .value = value } };
             }
@@ -979,6 +1000,11 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.advance();
                     return .{ .kind = .word, .span = .{ .start = token.start, .len = token.len } };
                 },
+                // A quoted identifier ("$user"): its whole text, quotes included.
+                .quoted_word => {
+                    try self.advance();
+                    return .{ .kind = .word, .span = .{ .start = token.start - token.prefix, .len = token.end + token.suffix - (token.start - token.prefix) } };
+                },
                 .integer, .decimal => {
                     try self.advance();
                     return .{ .kind = .number, .span = .{ .start = token.start, .len = token.end - token.start } };
@@ -993,6 +1019,259 @@ pub fn Parser(comptime config: types.Config) type {
                 else => {},
             }
             return error.Syntax;
+        }
+
+        /// transaction_mode [[,] transaction_mode ...]: ISOLATION LEVEL ...,
+        /// READ WRITE | READ ONLY, [NOT] DEFERRABLE (gram.y
+        /// transaction_mode_list; the last of a repeated mode wins).
+        fn transactionModes(self: *Self) Error!ast.Characteristics {
+            var out: ast.Characteristics = .{};
+            var comma = false;
+            while (true) {
+                if (self.isWord("ISOLATION")) {
+                    out.isolation = try self.isolationClause();
+                } else if (self.isWord("READ")) {
+                    try self.advance();
+                    if (try self.takeRaw("only")) out.read_only = true else if (try self.takeRaw("write")) out.read_only = false else return error.Syntax;
+                } else if (try self.takeRaw("deferrable")) {
+                    out.deferrable = true;
+                } else if (self.isWord("NOT")) {
+                    try self.advance();
+                    if (!try self.takeRaw("deferrable")) return error.Syntax;
+                    out.deferrable = false;
+                } else {
+                    if (comma) return error.Syntax;
+                    return out;
+                }
+                comma = try self.takeSymbol(.comma);
+            }
+        }
+
+        // ---- session commands (tx-session lane) --------------------------
+
+        fn sessionCommand(self: *Self) Error!?Ast.SessionCommand {
+            if (try self.takeRaw("lock")) return try self.lockTable();
+            if (try self.takeRaw("declare")) return try self.declareCursor();
+            if (self.rawWord("fetch") or self.rawWord("move")) {
+                const move = self.rawWord("move");
+                try self.advance();
+                return try self.fetchCommand(move);
+            }
+            if (try self.takeRaw("close")) {
+                if (try self.takeWord("ALL")) {
+                    try self.finish();
+                    return .{ .close = .{ .all = true } };
+                }
+                const name = try self.identifier();
+                try self.finish();
+                return .{ .close = .{ .name = name } };
+            }
+            if (try self.takeRaw("prepare")) return try self.prepareStatement();
+            if (try self.takeRaw("execute")) {
+                const name = try self.identifier();
+                var args: ArgList = .{};
+                var count: usize = 0;
+                if (try self.takeSymbol(.lparen)) {
+                    try self.expressionList(&args);
+                    try self.expectSymbol(.rparen);
+                    var item = args.head;
+                    while (item != ast.none) : (item = self.pool.nodes[item].next) count += 1;
+                }
+                try self.finish();
+                return .{ .execute = .{ .name = name, .args = args.head, .count = count } };
+            }
+            if (try self.takeRaw("deallocate")) {
+                _ = try self.takeRaw("prepare");
+                if (try self.takeWord("ALL")) {
+                    try self.finish();
+                    return .{ .deallocate = .{ .all = true } };
+                }
+                const name = try self.identifier();
+                try self.finish();
+                return .{ .deallocate = .{ .name = name } };
+            }
+            if (try self.takeRaw("listen")) {
+                const name = try self.identifier();
+                try self.finish();
+                return .{ .listen = name };
+            }
+            if (try self.takeRaw("unlisten")) {
+                if (try self.takeSymbol(.star)) {
+                    try self.finish();
+                    return .{ .unlisten = .{ .all = true } };
+                }
+                const name = try self.identifier();
+                try self.finish();
+                return .{ .unlisten = .{ .name = name } };
+            }
+            if (try self.takeRaw("notify")) {
+                const channel = try self.identifier();
+                var payload: ?lexer.Quoted = null;
+                if (try self.takeSymbol(.comma)) {
+                    if (self.current.kind != .string) return error.Syntax;
+                    payload = self.current.quoted();
+                    try self.advance();
+                }
+                try self.finish();
+                return .{ .notify = .{ .channel = channel, .payload = payload } };
+            }
+            return null;
+        }
+
+        /// LOCK [TABLE] [ONLY] name [*] [, ...] [IN lockmode MODE] [NOWAIT]
+        fn lockTable(self: *Self) Error!Ast.SessionCommand {
+            _ = try self.takeWord("TABLE");
+            var out: Ast.SessionCommand = .{ .lock_table = .{} };
+            const lock = &out.lock_table;
+            while (true) {
+                if (lock.count == config.tables) return error.TableCapacity;
+                const only = try self.takeRaw("only");
+                lock.tables[lock.count] = try self.qualifiedName();
+                _ = try self.takeSymbol(.star);
+                lock.only[lock.count] = only;
+                lock.count += 1;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            if (try self.takeWord("IN")) {
+                lock.mode = try self.lockMode();
+                if (!try self.takeRaw("mode")) return error.Syntax;
+            }
+            lock.nowait = try self.takeRaw("nowait");
+            try self.finish();
+            return out;
+        }
+
+        fn lockMode(self: *Self) Error!ast.TableLockMode {
+            if (try self.takeRaw("access")) {
+                if (try self.takeRaw("share")) return .access_share;
+                if (!try self.takeRaw("exclusive")) return error.Syntax;
+                return .access_exclusive;
+            }
+            if (try self.takeRaw("row")) {
+                if (try self.takeRaw("share")) return .row_share;
+                if (!try self.takeRaw("exclusive")) return error.Syntax;
+                return .row_exclusive;
+            }
+            if (try self.takeRaw("share")) {
+                if (try self.takeRaw("update")) {
+                    if (!try self.takeRaw("exclusive")) return error.Syntax;
+                    return .share_update_exclusive;
+                }
+                if (try self.takeRaw("row")) {
+                    if (!try self.takeRaw("exclusive")) return error.Syntax;
+                    return .share_row_exclusive;
+                }
+                return .share;
+            }
+            if (try self.takeRaw("exclusive")) return .exclusive;
+            return error.Syntax;
+        }
+
+        /// DECLARE name [BINARY] [ASENSITIVE|INSENSITIVE] [[NO] SCROLL]
+        /// CURSOR [{WITH|WITHOUT} HOLD] FOR query
+        fn declareCursor(self: *Self) Error!Ast.SessionCommand {
+            const name = try self.identifier();
+            var scroll: ?bool = null;
+            var binary = false;
+            while (true) {
+                if (try self.takeRaw("binary")) {
+                    binary = true;
+                } else if ((try self.takeRaw("insensitive")) or (try self.takeRaw("asensitive"))) {
+                    // Materialized cursors are insensitive either way.
+                } else if (try self.takeWord("NO")) {
+                    if (!try self.takeRaw("scroll")) return error.Syntax;
+                    scroll = false;
+                } else if (try self.takeRaw("scroll")) {
+                    scroll = true;
+                } else break;
+            }
+            if (!try self.takeRaw("cursor")) return error.Syntax;
+            var hold = false;
+            if (self.isWord("WITH") or self.rawWord("without")) {
+                const with = self.isWord("WITH");
+                try self.advance();
+                if (!try self.takeRaw("hold")) return error.Syntax;
+                hold = with;
+            }
+            if (!try self.takeWord("FOR")) return error.Syntax;
+            const body = self.current.start;
+            if (!(self.isWord("SELECT") or self.isWord("WITH") or self.isWord("VALUES") or self.isWord("TABLE"))) return error.Syntax;
+            _ = try self.topQuery();
+            return .{ .declare = .{ .name = name, .scroll = scroll, .hold = hold, .binary = binary, .body = body } };
+        }
+
+        /// FETCH|MOVE [direction] [FROM|IN] name. NEXT/PRIOR/FORWARD/BACKWARD
+        /// [count|ALL] are relative row counts; FIRST/LAST/ABSOLUTE/RELATIVE
+        /// position the cursor (FIRST = ABSOLUTE 1, LAST = ABSOLUTE -1).
+        fn fetchCommand(self: *Self, move: bool) Error!Ast.SessionCommand {
+            var direction: ast.FetchDirection = .forward;
+            var count: i64 = 1;
+            var all = false;
+            if (try self.takeRaw("next")) {} else if (try self.takeRaw("prior")) {
+                direction = .backward;
+            } else if (try self.takeRaw("first")) {
+                direction = .absolute;
+            } else if (try self.takeRaw("last")) {
+                direction = .absolute;
+                count = -1;
+            } else if (try self.takeRaw("absolute")) {
+                direction = .absolute;
+                count = try self.signedInteger();
+            } else if (try self.takeRaw("relative")) {
+                direction = .relative;
+                count = try self.signedInteger();
+            } else if (try self.takeWord("ALL")) {
+                all = true;
+            } else if (self.rawWord("forward") or self.rawWord("backward")) {
+                if (self.rawWord("backward")) direction = .backward;
+                try self.advance();
+                if (try self.takeWord("ALL")) all = true else if (self.current.kind == .integer or self.isSymbol(.minus) or self.isSymbol(.plus)) count = try self.signedInteger();
+            } else if (self.current.kind == .integer or self.isSymbol(.minus) or self.isSymbol(.plus)) {
+                count = try self.signedInteger();
+            }
+            if (!try self.takeWord("FROM")) _ = try self.takeWord("IN");
+            const name = try self.identifier();
+            try self.finish();
+            return .{ .fetch = .{ .name = name, .direction = direction, .count = count, .all = all, .move = move } };
+        }
+
+        /// PREPARE name [(type [, ...])] AS {SELECT|VALUES|INSERT|UPDATE|DELETE|MERGE ...}
+        fn prepareStatement(self: *Self) Error!Ast.SessionCommand {
+            if (self.isWord("TRANSACTION")) return error.UnsupportedStatement;
+            var out: Ast.SessionCommand = .{ .prepare = .{ .name = try self.identifier() } };
+            const prepare = &out.prepare;
+            if (try self.takeSymbol(.lparen)) {
+                while (true) {
+                    if (prepare.count == config.statement_parameters) return error.SessionCapacity;
+                    const spec = try self.typeName();
+                    prepare.types[prepare.count] = spec.ty;
+                    prepare.typmods[prepare.count] = spec.typmod;
+                    prepare.count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                try self.expectSymbol(.rparen);
+            }
+            try self.expectWord("AS");
+            prepare.body = self.current.start;
+            const inner = try self.statement();
+            switch (inner) {
+                .select, .query, .insert, .update, .delete, .merge => {},
+                else => return error.Syntax,
+            }
+            return out;
+        }
+
+        /// Two identifiers name the same object (unquoted ones fold case).
+        fn sameIdent(self: *const Self, a: ast.Ident, b: ast.Ident) bool {
+            const x = a.span.slice(self.source);
+            const y = b.span.slice(self.source);
+            if (a.quoted != b.quoted or x.len != y.len) return false;
+            for (x, y) |left, right| {
+                if (a.quoted) {
+                    if (left != right) return false;
+                } else if (types.lower(left) != types.lower(right)) return false;
+            }
+            return true;
         }
 
         /// [ISOLATION LEVEL {READ COMMITTED|READ UNCOMMITTED|REPEATABLE READ|SERIALIZABLE}]
@@ -1967,10 +2246,28 @@ pub fn Parser(comptime config: types.Config) type {
             if (block.with_ties and block.order_count == 0) return error.Syntax;
             if (self.mode == .standard and try self.takeWord("FOR")) {
                 if (block.set_op != .none or block.item_count == 0) return error.Syntax;
-                if (try self.takeWord("UPDATE")) block.lock.strength = .update else {
+                if (try self.takeWord("UPDATE")) block.lock.strength = .update else if (try self.takeWord("NO")) {
+                    if (!try self.takeRaw("key")) return error.Syntax;
+                    try self.expectWord("UPDATE");
+                    block.lock.strength = .no_key_update;
+                } else if (try self.takeRaw("key")) {
+                    try self.expectWord("SHARE");
+                    block.lock.strength = .key_share;
+                } else {
                     try self.expectWord("SHARE");
                     block.lock.strength = .share;
                 }
+                if (try self.takeRaw("of")) while (true) {
+                    const name = (try self.qualifiedName()).name;
+                    if (!block.lock.of_set) {
+                        block.lock.of = name;
+                        block.lock.of_set = true;
+                    } else if (!block.lock.of_other_set and !self.sameIdent(block.lock.of, name)) {
+                        block.lock.of_other = name;
+                        block.lock.of_other_set = true;
+                    }
+                    if (!try self.takeSymbol(.comma)) break;
+                };
                 if (try self.takeWord("NOWAIT")) block.lock.wait = .nowait else if (try self.takeWord("SKIP")) {
                     try self.expectWord("LOCKED");
                     block.lock.wait = .skip_locked;
