@@ -1990,6 +1990,29 @@ pub fn copy(s: kir.Storage, caps: Caps) Error!kir.Kernel {
     return k;
 }
 
+/// The memory's read speed: 16 bytes a thread read from `from`, and written
+/// to `to` only where their words' sum is the mark (param 2), so almost
+/// nothing is written but no load can be left out. Bindings: from, to (16
+/// bytes). Params: 16-byte words, the byte offset in from, the mark. Groups
+/// as copyGroups.
+pub fn readProbe(s: kir.Storage, caps: Caps) Error!kir.Kernel {
+    var k = begin(s, "lfm3_read", 64);
+    var b = Builder.init(&k, caps);
+    const FROM = k.binding();
+    const TO = k.binding();
+    k.param_words = 3;
+    const w = b.add(R(b.shl(R(b.gid(0)), 6)), R(b.tid(0)));
+    b.if_(b.icmp(.u32, .lt, R(w), R(b.param(0))));
+    const v = b.ldv(FROM, .u32, R(b.add(R(b.param(1)), R(b.shl(R(w), 4)))), 0, 4);
+    const sum = b.add(R(b.add(R(at(v, 0)), R(at(v, 1)))), R(b.add(R(at(v, 2)), R(at(v, 3)))));
+    b.if_(b.icmp(.u32, .eq, R(sum), R(b.param(2))));
+    b.st(TO, U(0), 0, 7, v);
+    b.endif();
+    b.endif();
+    try k.finish();
+    return k;
+}
+
 // ── LFM3-Audio (the depthformer, as lfm3_audio_gen and lfm3_audio_ops) ──────
 //
 // The audio networks are ggml's CPU graph (lfm3_audio_ops): its RMSNorm
@@ -3042,4 +3065,21 @@ test "copy: 16-byte words between offsets" {
     _ = try runOn(&k, caps, copyGroups(100), &.{ T.a[0..4096], T.b[0..4096] }, &.{ 100, 32, 64 });
     try std.testing.expectEqualSlices(u8, T.a[32..][0..1600], T.b[64..][0..1600]);
     try std.testing.expect(T.b[63] == 0 and T.b[64 + 1600] == 0);
+}
+
+test "readProbe: writes only the 16 bytes whose sum is the mark" {
+    const T = TestRig;
+    const caps = caps32(true, 32);
+    for (T.a[0..4096], 0..) |*x, i| x.* = @truncate(i * 7 + 3);
+    const words: []align(16) const u32 = @alignCast(std.mem.bytesAsSlice(u32, T.a[0..4096]));
+    // the sum of the 16 bytes thread 37 reads (from byte 32 + 16 * 37)
+    const at_w = (32 + 16 * 37) / 4;
+    const mark = words[at_w] +% words[at_w + 1] +% words[at_w + 2] +% words[at_w + 3];
+    var k = try readProbe(testStorage(), caps);
+    @memset(T.b[0..4096], 0);
+    _ = try runOn(&k, caps, copyGroups(100), &.{ T.a[0..4096], T.b[0..4096] }, &.{ 100, 32, mark });
+    try std.testing.expectEqualSlices(u8, T.a[32 + 16 * 37 ..][0..16], T.b[0..16]);
+    @memset(T.b[0..4096], 0);
+    _ = try runOn(&k, caps, copyGroups(100), &.{ T.a[0..4096], T.b[0..4096] }, &.{ 100, 32, 0xdead_beef });
+    for (T.b[0..16]) |x| try std.testing.expect(x == 0);
 }

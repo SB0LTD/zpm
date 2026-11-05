@@ -178,6 +178,8 @@ const Programs = struct {
     values_prefill: ?Program = null,
     combine: ?Program = null,
     copy: ?Program = null,
+    /// the memory's read speed (readSpeed; null: not built)
+    read: ?Program = null,
 };
 
 /// Activation buffers, sized for max_batch.
@@ -353,7 +355,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             for (&k.q6k) |*p| self.unload(p);
             for (&k.q4k1) |*p| self.unload(p);
             for (&k.q6k1) |*p| self.unload(p);
-            const progs = [_]*?Program{ &k.norm_quant, &k.quant, &k.swiglu, &k.residual, &k.residual_norm, &k.conv, &k.prepare, &k.scores_decode, &k.scores_prefill, &k.softmax, &k.values_decode, &k.values_prefill, &k.combine, &k.copy };
+            const progs = [_]*?Program{ &k.norm_quant, &k.quant, &k.swiglu, &k.residual, &k.residual_norm, &k.conv, &k.prepare, &k.scores_decode, &k.scores_prefill, &k.softmax, &k.values_decode, &k.values_prefill, &k.combine, &k.copy, &k.read };
             for (progs) |p| self.unload(p);
         }
 
@@ -425,6 +427,10 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             };
             self.compile_error = null;
             try self.build(&self.k.copy, kernels.copy(s, caps));
+            self.build(&self.k.read, kernels.readProbe(s, caps)) catch {
+                self.k.read = null;
+            };
+            self.compile_error = null;
             if (plan.conv_layer_count > 0) try self.build(&self.k.conv, kernels.conv(s, caps, plan.conv_kernel));
             if (plan.attention_layer_count > 0) {
                 const group = plan.head_count / attentionGroupSize(plan);
@@ -512,7 +518,9 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         /// device's own, read and written (2 x bytes moved). null: it keeps
         /// no timestamps, or there is no memory for the copy. A clock or
         /// power state shows here first (legion22: matrices 3 times faster
-        /// once the GPU had been busy a while).
+        /// once the GPU had been busy a while). A copy that fits the GPU's
+        /// last-level cache (GB206's L2: 32 MiB) measures the cache, not
+        /// the memory: readSpeed is the memory's figure.
         pub fn copySpeed(self: *Self, bytes: u64) ?f64 {
             const n = @min(bytes, 64 << 20, self.weights.bytes) / 16 * 16;
             if (n < 16 or n > std.math.maxInt(u32)) return null;
@@ -529,6 +537,41 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             const ns = self.dev.lastRunNs();
             if (ns == 0) return null;
             return @as(f64, @floatFromInt(2 * n)) / @as(f64, @floatFromInt(ns));
+        }
+
+        /// The memory's read speed now, in GB/s by the GPU's timestamps: the
+        /// weights' first `bytes` (all of them at most) read once, nothing
+        /// written. Larger than the GPU's caches (a few hundred MiB), it is
+        /// the memory's own (VRAM on a discrete GPU, the shared DRAM on a
+        /// unified one). null: no read kernel, no timestamps, or no room for
+        /// its 16-byte targets.
+        pub fn readSpeed(self: *Self, bytes: u64) ?f64 {
+            const prog = if (self.k.read) |*p| p else return null;
+            const n = @min(bytes, self.weights.bytes) / 16 * 16;
+            if (n < 16 or n > std.math.maxInt(u32)) return null;
+            const PIECE: u64 = 16 << 20;
+            const pieces = (n + PIECE - 1) / PIECE;
+            if (pieces > 64) return null;
+            // a 16-byte target each, so no piece waits for another
+            const tmp = self.dev.alloc(pieces * 256, .device) catch return null;
+            defer self.dev.free(tmp);
+            var l = List{ .work = self.work };
+            l.what = .{ .kernel = "read probe" };
+            var at: u64 = 0;
+            var i: u64 = 0;
+            while (at < n) : (i += 1) {
+                const words: u32 = @intCast(@min(n - at, PIECE) / 16);
+                var to = tmp;
+                to.gpu += i * 256;
+                to.bytes = 16;
+                to.cpu = &.{};
+                l.add(prog, kernels.copyGroups(words), &.{ self.weights, to }, &.{ words, @intCast(at), 0x5a5a_a5a5 }) catch return null;
+                at += @as(u64, words) * 16;
+            }
+            self.runNow(&l) catch return null;
+            const ns = self.dev.lastRunNs();
+            if (ns == 0) return null;
+            return @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(ns));
         }
 
         fn runNow(self: *Self, l: *const List) Error!void {
@@ -880,7 +923,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 .{ "residual", k.residual },          .{ "residual+norm+quant", k.residual_norm }, .{ "conv", k.conv },                         .{ "prepare", k.prepare },
                 .{ "attention scores", k.scores_decode }, .{ "attention scores (tiles)", k.scores_prefill }, .{ "attention softmax", k.softmax },
                 .{ "attention values", k.values_decode }, .{ "attention values (tiles)", k.values_prefill }, .{ "attention combine", k.combine },
-                .{ "copy", k.copy },
+                .{ "copy", k.copy },                  .{ "read probe", k.read },
             };
             for (named) |n| if (n[1]) |pp| if (pp.code.gpu == code_va) return n[0];
             return "?";

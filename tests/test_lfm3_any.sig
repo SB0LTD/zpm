@@ -321,13 +321,18 @@ fn followTheCpu(which: Device, tolerance: f64) !f64 {
     // The memory speed probe (a copy of the weights' first MiB): the GPU
     // still agrees with the CPU after it (the copy writes its own buffer).
     const gbps = backend.copySpeed(1 << 20);
+    // ...and the read probe (all the weights read, 16 bytes written apart
+    // where their sum is the mark): built on every device, writing nothing
+    // the model uses
+    try std.testing.expect(backend.k.read != null);
+    const read_gbps = backend.readSpeed(64 << 20);
     {
         const c3 = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &.{t2} }, .logits, .{})).?;
         const g3 = (backend.forward(&gc, .{ .tokens = &.{t2} }, .logits) catch |e| return failure(&backend, e)).?;
         worst = @max(worst, try compare(104, cpu_work.logits[0..VOCAB], backend.logits(), tolerance));
         try std.testing.expectEqual(c3, g3);
     }
-    std.debug.print("{s}: copySpeed {d:.1} GB/s (-1: no timestamps)\n", .{ @tagName(which), gbps orelse -1 });
+    std.debug.print("{s}: copySpeed {d:.1} GB/s, readSpeed {d:.1} (-1: no timestamps)\n", .{ @tagName(which), gbps orelse -1, read_gbps orelse -1 });
     std.debug.print("{s}: logits within {e} of the CPU's over 13 steps; prefill of 11: {d} lane-ops, {d} dispatches; decode: {d} lane-ops, {d} dispatches a token\n", .{
         @tagName(which), worst, prefill_ops, prefill_dispatches, decode_ops / 7, backend.dispatches,
     });
