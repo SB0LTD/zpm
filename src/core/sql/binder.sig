@@ -3717,7 +3717,7 @@ pub fn Binder(comptime config: types.Config) type {
                     return error.TableExists;
                 }
             } else definition.name = chooseIndexName(context, entry.name.slice(), entry.namespace, entry.columns[0..entry.column_count], definition.keyColumns(), create.unique, entry.indexes[0..entry.index_count]);
-            if (entry.index_count == S.index_capacity or S.index_entry_capacity == 0) return error.IndexCapacity;
+            if (entry.index_count == S.index_capacity or !S.index_storage) return error.IndexCapacity;
             var out = alterOf(context, index, .create_index);
             out.extras.indexes[out.extras.index_count] = definition;
             if (create.unique) out.check_index = out.extras.index_count;

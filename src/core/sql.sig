@@ -662,7 +662,7 @@ pub fn Database(comptime config: Config) type {
                 for(mutable,0..) |part,index| {
                     if(overlaps(part,db_span) or overlaps(part,source_span)) return error.InvalidParameterValue;
                     for(mutable[0..index]) |earlier| if(overlaps(part,earlier)) return error.InvalidParameterValue;
-                    for(&db.tables) |*table| inline for(.{"rows","versions","row_index","key_index","scan_values","scan_nonnull","scan_live","scan_presence"}) |name| {
+                    for(&db.tables) |*table| inline for(.{"rows","versions","row_index","key_index","scan_values","scan_nonnull","scan_live","scan_presence","index_slots"}) |name| {
                         if(overlaps(part,try span(@field(table,name)[0..]))) return error.InvalidParameterValue;
                     };
                 }
@@ -821,7 +821,7 @@ pub fn Database(comptime config: Config) type {
         workspace: Workspace = .{},
 
         const BackingLayout = struct {
-            offsets: [config.tables][8]usize,
+            offsets: [config.tables][9]usize,
             refs: usize,
             bytes: usize,
             row_index: [config.tables]usize,
@@ -866,6 +866,9 @@ pub fn Database(comptime config: Config) type {
                 offsets[5] = try appendLayout(&cursor, u64, scan_rows);
                 offsets[6] = try appendLayout(&cursor, u8, scan_rows);
                 offsets[7] = if(S.presence_enabled) try appendLayout(&cursor,u64,try S.presenceWords(rows)) else cursor;
+                const index_slots = @mulWithOverflow(ki, S.bound_indexes);
+                if (index_slots[1] != 0) return error.InvalidParameterValue;
+                offsets[8] = if (S.bound_indexes != 0) try appendLayout(&cursor, u32, index_slots[0]) else cursor;
             }
             layout.refs = try appendLayout(&cursor, u32, refs);
             layout.bytes = cursor;
@@ -906,7 +909,7 @@ pub fn Database(comptime config: Config) type {
             if (comptime config.external_storage) {
                 const refs = StorageSpan.of(self.workspace.query.refs);
                 if (refs.start < refs.end and region.start < refs.end and refs.start < region.end) return error.InvalidParameterValue;
-                for (&self.tables) |*table| inline for (.{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence" }) |field| {
+                for (&self.tables) |*table| inline for (.{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence", "index_slots" }) |field| {
                     const part = StorageSpan.of(@field(table, field));
                     if (part.start < part.end and region.start < part.end and part.start < region.end) return error.InvalidParameterValue;
                 };
@@ -947,6 +950,7 @@ pub fn Database(comptime config: Config) type {
                 .scan_nonnull = try storageView(u64, bytes, offsets[5], if (S.compact_enabled) budget.rows else 0),
                 .scan_live = try storageView(u8, bytes, offsets[6], if (S.compact_enabled) budget.rows else 0),
                 .scan_presence = if(S.presence_enabled) try storageView(u64,bytes,offsets[7],try S.presenceWords(budget.rows)) else &.{},
+                .index_slots = if (S.bound_indexes != 0) try storageView(u32, bytes, offsets[8], ki * S.bound_indexes) else &.{},
             };
             try self.bindStorage(backings, try storageView(u32, bytes, layout.refs, refs));
         }
@@ -970,20 +974,21 @@ pub fn Database(comptime config: Config) type {
             if (self.csn != 0 or refs.len == 0 or refs.len > 0x7fffffff) return error.InvalidParameterValue;
             for (&self.tables) |*table| if (table.live) return error.InvalidParameterValue;
             for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
-            var spans: [config.tables * 8 + 3]StorageSpan = undefined;
+            var spans: [config.tables * 9 + 3]StorageSpan = undefined;
             spans[0] = .{ .start = @intFromPtr(self), .end = @intFromPtr(self) + @sizeOf(Self) };
             spans[1] = StorageSpan.of(refs);
             spans[spans.len - 1] = if (comptime config.external_workspace) StorageSpan.of(self.workspace.query.cells) else .{ .start = 0, .end = 0 };
             for (backings, 0..) |backing, i| {
                 if (!backing.valid()) return error.InvalidParameterValue;
-                spans[2 + i * 8] = StorageSpan.of(backing.rows);
-                spans[3 + i * 8] = StorageSpan.of(backing.versions);
-                spans[4 + i * 8] = StorageSpan.of(backing.row_index);
-                spans[5 + i * 8] = StorageSpan.of(backing.key_index);
-                spans[6 + i * 8] = StorageSpan.of(backing.scan_values);
-                spans[7 + i * 8] = StorageSpan.of(backing.scan_nonnull);
-                spans[8 + i * 8] = StorageSpan.of(backing.scan_live);
-                spans[9 + i * 8] = StorageSpan.of(backing.scan_presence);
+                spans[2 + i * 9] = StorageSpan.of(backing.rows);
+                spans[3 + i * 9] = StorageSpan.of(backing.versions);
+                spans[4 + i * 9] = StorageSpan.of(backing.row_index);
+                spans[5 + i * 9] = StorageSpan.of(backing.key_index);
+                spans[6 + i * 9] = StorageSpan.of(backing.scan_values);
+                spans[7 + i * 9] = StorageSpan.of(backing.scan_nonnull);
+                spans[8 + i * 9] = StorageSpan.of(backing.scan_live);
+                spans[9 + i * 9] = StorageSpan.of(backing.scan_presence);
+                spans[10 + i * 9] = StorageSpan.of(backing.index_slots);
             }
             for (spans, 0..) |a, i| for (spans[i + 1 ..]) |b| {
                 if (a.start == a.end or b.start == b.end) continue;
@@ -998,6 +1003,7 @@ pub fn Database(comptime config: Config) type {
                 table.scan_nonnull = backing.scan_nonnull;
                 table.scan_live = backing.scan_live;
                 table.scan_presence = backing.scan_presence;
+                table.index_slots = backing.index_slots;
             }
             self.workspace.query.refs = refs;
             self.workspace.query.ref_high = refs.len;
@@ -1025,6 +1031,7 @@ pub fn Database(comptime config: Config) type {
             for (&source.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
             for (&self.tables, &source.tables) |*dst, *src| if (src.live) {
                 if (dst.rows.len < src.row_high or dst.versions.len < src.version_high or dst.row_index.len == 0 or dst.key_index.len == 0) return error.WorkspaceCapacity;
+                if (!S.indexFits(dst, src.index_count, src.version_used)) return error.WorkspaceCapacity;
             };
             self.copyState(source);
         }
@@ -2625,6 +2632,7 @@ pub fn Database(comptime config: Config) type {
             const index = destination orelse return error.TableCapacity;
             if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
             const table = &self.tables[index];
+            if (!S.indexFits(table, create.extras.index_count, 0)) return error.IndexCapacity;
             S.reset(table, change_log.first_oid + self.oid_counter, create.name, create.columns[0..create.count]);
             table.namespace = create.namespace;
             S.setConstraints(table, create.constraints[0..create.constraint_count]);
@@ -2868,7 +2876,7 @@ pub fn Database(comptime config: Config) type {
                 const value = try E.eval(&ctx, alter.fills[position]);
                 if (value != .null_value) fills[position] = try D.store(column, value, &self.session);
             }
-            if (alter.extras.index_count != 0 and source.version_used > S.index_entry_capacity) return error.IndexCapacity;
+            if (!S.indexFits(copy, alter.extras.index_count, source.version_used)) return error.IndexCapacity;
             S.reset(copy, source.oid, alter.name, alter.columns[0..alter.count]);
             copy.namespace = source.namespace;
             S.setConstraints(copy, alter.constraints[0..alter.constraint_count]);

@@ -1362,6 +1362,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             if (!vt.live and free == null) free = index;
                         }
                         const index = free orelse return error.ChangeRecordConflict;
+                        if (!S.indexFits(&db.tables[index], definition.extras.index_count, 0)) return error.ChangeRecordConflict;
                         try validateExtras(db, scratch, &definition, null);
                         purge(scratch, @intCast(index));
                         const vt = &scratch.tables[index];
@@ -1414,6 +1415,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         }
                         if (definition.keyed() and !vt.keyed) return error.ChangeRecordConflict;
                         if (definition.extras.relkind != vt.relkind) return error.ChangeRecordConflict;
+                        if (!S.indexFits(&db.tables[index], definition.extras.index_count, 0)) return error.ChangeRecordConflict;
                         try validateExtras(db, scratch, &definition, vt);
                         noteIndexes(vt, &definition, &next_oid);
                         // Identity sequences keep their column positions.
@@ -1646,6 +1648,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.create_table) => {
                         const definition = try decodeCreate(&reader);
                         for (&db.tables, 0..) |*table, index| if (!table.live) {
+                            if (!S.indexFits(table, definition.extras.index_count, 0)) return error.ChangeRecordConflict;
                             S.reset(table, definition.oid, definition.name, definition.columns[0..definition.count]);
                             table.namespace = definition.namespace;
                             S.setConstraints(table, definition.constraints[0..definition.constraint_count]);
@@ -1668,6 +1671,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             if (sources[position] == 0xff) fills[position] = (try decodeValue(&reader)).cell;
                         }
                         const old_count = table.column_count;
+                        if (!S.indexFits(table, definition.extras.index_count, 0)) return error.ChangeRecordConflict;
                         S.redefine(table, definition.name, definition.columns[0..definition.count], definition.constraints[0..definition.constraint_count], &definition.extras, sources[0..definition.count], fills[0..definition.count]);
                         db.oid_counter = @max(db.oid_counter, indexOidWidth(&definition.extras));
                         S.rebuildCommitted(table, csn);
