@@ -999,11 +999,15 @@ fn notifications() !void {
     try small.statement(tx, "LISTEN q", &small_result, .{});
     small.publishCommit(tx);
     small.session_state = &sender;
+    const sequence = small.notificationSequence();
     for ([_][]const u8{ "NOTIFY q, '1'", "NOTIFY q, '2'" }) |source| {
         tx = try small.begin();
         try small.statement(tx, source, &small_result, .{});
         small.publishCommit(tx);
     }
+    // The sequence counts committed notifications (servers poll it to wake
+    // idle LISTEN sessions); a rolled-back NOTIFY publishes nothing.
+    try check(small.notificationSequence() == sequence + 2);
     tx = try small.begin();
     if (small.statement(tx, "NOTIFY q, '3'", &small_result, .{})) |_| return error.CapacityAccepted else |err| try check(err == error.SessionCapacity);
     small.session_state = &listener;
@@ -1016,6 +1020,7 @@ fn notifications() !void {
     try check(small.takeNotification(&note) and same(note.payloadSlice(), "2"));
     try check(small.takeNotification(&note) and same(note.payloadSlice(), "3"));
     try check(!small.takeNotification(&note));
+    try check(small.notificationSequence() == sequence + 3);
 }
 
 // ---- wire helpers --------------------------------------------------------
