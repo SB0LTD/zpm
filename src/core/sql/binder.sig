@@ -6297,10 +6297,29 @@ pub fn Binder(comptime config: types.Config) type {
             return error.UnsupportedStatement;
         }
 
+        /// SET CONSTRAINTS names: every visible constraint with the name
+        /// (42704 when none, 42809 when one is not deferrable).
         fn bindSetConstraints(context: *const Context, set: *const Ast.SetConstraints) Error!Bound {
-            _ = context;
-            _ = set;
-            return error.UnsupportedStatement;
+            var out: SetConstraints = .{ .all = set.all, .deferred = set.deferred };
+            var slots: [K.relation_rows]usize = undefined;
+            const count = visibleTables(context, &slots);
+            for (set.names[0..set.count]) |ident| {
+                const name = toName(context, ident);
+                var found = false;
+                for (slots[0..count]) |slot| {
+                    const entry = &context.tables[slot];
+                    for (entry.constraints[0..entry.constraint_count]) |*constraint| {
+                        if (!types.same(constraint.name.slice(), name.slice())) continue;
+                        if (!constraint.deferrable) return error.WrongObjectType;
+                        if (out.count == out.names.len) return error.TableCapacity;
+                        out.names[out.count] = .{ .oid = entry.oid, .name = name };
+                        out.count += 1;
+                        found = true;
+                    }
+                }
+                if (!found) return error.UndefinedObject;
+            }
+            return .{ .set_constraints = out };
         }
 
         /// The identity ALTER TABLE of a table (facade-built rewrites such as

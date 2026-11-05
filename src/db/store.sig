@@ -370,6 +370,12 @@ pub fn Store(comptime Raw: type) type {
         /// Read-only transactions publish directly; others persist first.
         fn commit(self: *Self, slot: u16) !void {
             const db = &self.database;
+            // Deferred constraints (SQL COMMIT checks) fail the commit and
+            // roll the transaction back, durable or not.
+            if (@hasDecl(@TypeOf(db.*), "deferredViolation")) db.deferredViolation(slot) catch |err| {
+                db.abort(slot);
+                return err;
+            };
             if (db.readOnly(slot)) {
                 db.publishCommit(slot);
                 return;

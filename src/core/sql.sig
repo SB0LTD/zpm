@@ -943,9 +943,15 @@ pub fn Database(comptime config: Config) type {
                 self.abort(slot);
                 return err;
             };
+            // Deferred constraints are checked as the transaction commits.
+            self.deferredViolation(slot) catch |err| {
+                self.abort(slot);
+                return err;
+            };
             // The hook may observe the database (read-only), which reuses
             // `outcome`; keep this statement's own.
             const outcome = self.outcome;
+
             sink.before(self, slot, (outcome.command == .select or outcome.noop) and self.readOnly(slot)) catch |err| {
                 self.abort(slot);
                 return err;
@@ -1014,6 +1020,7 @@ pub fn Database(comptime config: Config) type {
         /// Encodes the transaction's change record into `buffer`. Fallible,
         /// changes nothing (overflow is TransactionLogCapacity).
         pub fn prepareCommit(self: *const Self, slot: u16, buffer: []u8) Error![]const u8 {
+            try self.deferredViolation(slot);
             var writer = try change_log.Writer.init(buffer, 0);
             try self.encodeWrites(&writer, slot);
             return buffer[0..try writer.finish()];
@@ -1229,6 +1236,12 @@ pub fn Database(comptime config: Config) type {
                 self.wake_epoch +%= 1;
                 return legacy(options.mode, err);
             };
+            // DEFERRABLE constraints in IMMEDIATE mode: end of statement.
+            self.deferredCheck(slot, start, true) catch |err| {
+                self.dropStatement(slot);
+                self.wake_epoch +%= 1;
+                return err;
+            };
             if (!options.writes and tx.write_len > start) {
                 self.dropStatement(slot);
                 return error.ReadOnlyTransaction;
@@ -1337,7 +1350,11 @@ pub fn Database(comptime config: Config) type {
                     break :blk 0;
                 },
                 .drop_relation => |*drop| try self.dropTable(slot, drop.slot, drop.cascade, snap),
-                .refresh_view, .set_constraints, .merge => return error.UnsupportedStatement,
+                .set_constraints => |*set| blk: {
+                    try self.setConstraints(slot, set);
+                    break :blk 0;
+                },
+                .refresh_view, .merge => return error.UnsupportedStatement,
                 .select, .query, .control => unreachable,
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound), .noop = bound == .noop };
@@ -2645,13 +2662,13 @@ pub fn Database(comptime config: Config) type {
         /// constraints are checked at COMMIT instead.
         fn checkReferences(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, old: ?*const E.Row, snap: Snapshot) Error!void {
             const table = &self.tables[table_index];
-            for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
                 if (constraint.kind != .foreign) continue;
                 if (old) |previous| if (!S.keyChanged(constraint, previous, cells)) continue;
                 var has_null = false;
                 for (constraint.keyColumns()) |column| has_null = has_null or cells[column] == .null_value;
                 if (has_null) continue;
-                if (self.deferredNow(slot, table, position)) {
+                if (constraint.deferrable) {
                     self.txs[slot].deferred_checks = true;
                     continue;
                 }
@@ -2705,7 +2722,7 @@ pub fn Database(comptime config: Config) type {
                 if (found.kind == 'S') continue;
                 const child_index = found.slot;
                 const child = &self.tables[child_index];
-                for (child.constraints[0..child.constraint_count], 0..) |*constraint, position| {
+                for (child.constraints[0..child.constraint_count]) |*constraint| {
                     if (constraint.kind != .foreign or constraint.ref_oid != parent.oid) continue;
                     var has_null = false;
                     for (constraint.refColumns()) |column| has_null = has_null or old[column] == .null_value;
@@ -2718,7 +2735,7 @@ pub fn Database(comptime config: Config) type {
                         if (!changed) continue;
                     }
                     const action = if (new == null) constraint.on_delete else constraint.on_update;
-                    if (action == .no_action and self.deferredNow(slot, child, position)) {
+                    if (action == .no_action and constraint.deferrable) {
                         self.txs[slot].deferred_checks = true;
                         continue;
                     }
@@ -2845,6 +2862,108 @@ pub fn Database(comptime config: Config) type {
             tx.push(.{ .kind = .update, .table = @intCast(table_index), .old = old, .new = version }) catch unreachable;
         }
 
+        /// SET CONSTRAINTS: the transaction's ALL or per-name modes. Setting
+        /// IMMEDIATE checks every outstanding deferred row first; a
+        /// violation keeps the previous modes and fails the statement.
+        fn setConstraints(self: *Self, slot: u16, set: *const B.SetConstraints) Error!void {
+            const tx = &self.txs[slot];
+            const saved_all = tx.constraints_all;
+            const saved_count = tx.constraint_mode_count;
+            const saved = tx.constraint_modes;
+            errdefer {
+                tx.constraints_all = saved_all;
+                tx.constraint_mode_count = saved_count;
+                tx.constraint_modes = saved;
+            }
+            if (set.all) {
+                tx.constraints_all = set.deferred;
+                tx.constraint_mode_count = 0;
+            } else for (set.names[0..set.count]) |reference| {
+                const mode: M.ConstraintMode = .{ .oid = reference.oid, .name = reference.name, .deferred = set.deferred };
+                for (tx.constraint_modes[0..tx.constraint_mode_count]) |*existing| {
+                    if (existing.oid == mode.oid and types.same(existing.name.slice(), mode.name.slice())) {
+                        existing.deferred = mode.deferred;
+                        break;
+                    }
+                } else {
+                    if (tx.constraint_mode_count == config.constraint_modes) return error.TableCapacity;
+                    tx.constraint_modes[tx.constraint_mode_count] = mode;
+                    tx.constraint_mode_count += 1;
+                }
+            }
+            if (!set.deferred) try self.deferredCheck(slot, 0, true);
+        }
+
+        /// The deferred checks of a transaction (COMMIT, SET CONSTRAINTS
+        /// IMMEDIATE) over the newest state, without waiting: every live
+        /// row it wrote satisfies its deferrable UNIQUE (23505) and FOREIGN
+        /// KEY (23503) constraints, and no live row references a key it
+        /// removed under a deferrable NO ACTION foreign key (23503). A
+        /// conflicting version of another live transaction is left to that
+        /// transaction's own check, which then sees this commit.
+        pub fn deferredViolation(self: *const Self, slot: u16) Error!void {
+            return self.deferredCheck(slot, 0, false);
+        }
+
+        /// Writes from `start`; `immediate_only` skips constraints whose
+        /// mode is DEFERRED now (statement end, SET CONSTRAINTS IMMEDIATE).
+        fn deferredCheck(self: *const Self, slot: u16, start: usize, immediate_only: bool) Error!void {
+            const tx = &self.txs[slot];
+            if (!tx.active or !tx.deferred_checks) return;
+            const snap: Snapshot = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid +% 1 };
+            for (tx.writes[start..tx.write_len]) |entry| {
+                if (entry.kind != .insert and entry.kind != .update and entry.kind != .delete) continue;
+                const table = &self.tables[entry.table];
+                if (!table.live or table.pending_drop) continue;
+                if (entry.kind != .delete) {
+                    const version = &table.versions[entry.new];
+                    if (version.row != 0 and version.xmax.epoch == 0) try self.deferredRow(slot, table, &version.cells, version.row - 1, immediate_only, snap);
+                }
+                if (entry.kind != .insert) try self.deferredParent(slot, table, &table.versions[entry.old].cells, immediate_only, snap);
+            }
+        }
+
+        fn deferredRow(self: *const Self, slot: u16, table: *const S.Table, cells: *const E.Row, row: u32, immediate_only: bool, snap: Snapshot) Error!void {
+            for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
+                if (!constraint.deferrable or (immediate_only and self.deferredNow(slot, table, position))) continue;
+                switch (constraint.kind) {
+                    .unique, .primary => switch (S.uniqueCheck(table, constraint, cells, row, snap)) {
+                        .taken => return error.PrimaryKeyViolation,
+                        .free, .wait => {},
+                    },
+                    .foreign => {
+                        var has_null = false;
+                        for (constraint.keyColumns()) |column| has_null = has_null or cells[column] == .null_value;
+                        if (has_null) continue;
+                        const parent_index = self.visibleTableSlot(constraint.ref_oid, snap) orelse return error.ForeignKeyViolation;
+                        if (liveKey(&self.tables[parent_index], constraint.refColumns(), cells, constraint.keyColumns(), snap) == .missing) return error.ForeignKeyViolation;
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        /// A key this transaction removed or changed in `table`: unless the
+        /// key is live again, no live row may reference it through a
+        /// deferrable foreign key.
+        fn deferredParent(self: *const Self, slot: u16, table: *const S.Table, old: *const E.Row, immediate_only: bool, snap: Snapshot) Error!void {
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                const child = &self.tables[found.slot];
+                for (child.constraints[0..child.constraint_count], 0..) |*constraint, position| {
+                    if (constraint.kind != .foreign or !constraint.deferrable or constraint.ref_oid != table.oid) continue;
+                    if (immediate_only and self.deferredNow(slot, child, position)) continue;
+                    var has_null = false;
+                    for (constraint.refColumns()) |column| has_null = has_null or old[column] == .null_value;
+                    if (has_null) continue;
+                    if (liveKey(table, constraint.refColumns(), old, constraint.refColumns(), snap) != .missing) continue;
+                    if (liveKey(child, constraint.keyColumns(), old, constraint.refColumns(), snap) != .missing) return error.ForeignKeyViolation;
+                }
+            }
+        }
+
         /// Whether constraint `position` of `table` is deferred now in the
         /// transaction (SET CONSTRAINTS, else INITIALLY DEFERRED).
         fn deferredNow(self: *const Self, slot: u16, table: *const S.Table, position: usize) bool {
@@ -2893,9 +3012,16 @@ pub fn Database(comptime config: Config) type {
         /// key does. An UPDATE (`old`) skips constraints whose key it keeps.
         fn uniqueTaken(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, own_slot: u32, old: ?*const E.Row, snap: Snapshot) Error!?u32 {
             const table = &self.tables[table_index];
-            for (table.constraints[0..table.constraint_count]) |*constraint| {
+            for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
                 if (!S.scannedUnique(table, constraint)) continue;
                 if (old) |previous| if (!S.keyChanged(constraint, previous, cells)) continue;
+                // A DEFERRABLE constraint is checked at the end of the
+                // statement (IMMEDIATE) or at COMMIT (DEFERRED).
+                _ = position;
+                if (constraint.deferrable) {
+                    self.txs[slot].deferred_checks = true;
+                    continue;
+                }
                 switch (S.uniqueCheck(table, constraint, cells, own_slot, snap)) {
                     .free => {},
                     .taken => |version| return version,

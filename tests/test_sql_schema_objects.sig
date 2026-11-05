@@ -165,7 +165,10 @@ fn resumeFails(slot: u16, source: []const u8, wanted: anyerror) !void {
 /// Encodes, replays and publishes a transaction (Store.commit order).
 fn commit(slot: u16) !void {
     if (!db.readOnly(slot)) {
-        const payload = try db.prepareCommit(slot, &record);
+        const payload = db.prepareCommit(slot, &record) catch |err| {
+            std.debug.print("commit of slot {d} after assertion {d}: {s}\n", .{ slot, assertions, @errorName(err) });
+            return err;
+        };
         try replica.applyChangeRecord(payload, &scratch);
         records_applied += 1;
     }
@@ -556,10 +559,125 @@ fn foreignKeys() !void {
     try sameState(&[_][]const u8{ "SELECT id FROM p ORDER BY id", "SELECT id, pid FROM r ORDER BY id" });
 }
 
+// ---- deferred constraints (PG.CONSTRAINT.DEFERRED) --------------------------
+
+fn commitFails(slot: u16, wanted: anyerror) !void {
+    if (db.prepareCommit(slot, &record)) |_| {
+        std.debug.print("commit accepted\n", .{});
+        return error.InvalidStatementAccepted;
+    } else |err| {
+        if (err != wanted) std.debug.print("commit: {s} (wanted {s})\n", .{ @errorName(err), @errorName(wanted) });
+        try check(err == wanted);
+    }
+    db.abort(slot);
+}
+
+const deferred_probes = [_][]const u8{
+    "SELECT v FROM du ORDER BY v",
+    "SELECT k FROM di ORDER BY k",
+    "SELECT id FROM dp ORDER BY id",
+    "SELECT id, pid FROM dc ORDER BY id",
+};
+
+fn deferredConstraints() !void {
+    reset();
+    // The oracle program: duplicates while deferred, resolved before the
+    // explicit IMMEDIATE check.
+    try run("CREATE TABLE du (v INT UNIQUE DEFERRABLE INITIALLY DEFERRED)");
+    const tx = try db.begin();
+    try statement(tx, "INSERT INTO du VALUES (1), (1)");
+    try same(try rows(tx, "SELECT COUNT(*) FROM du"), "2");
+    try statement(tx, "DELETE FROM du");
+    try statement(tx, "SET CONSTRAINTS ALL IMMEDIATE");
+    try statement(tx, "INSERT INTO du VALUES (2)");
+    try statementFails(tx, "INSERT INTO du VALUES (2)", error.PrimaryKeyViolation);
+    try commit(tx);
+    try expect(deferred_probes[0], "2");
+    // A violation still present at COMMIT aborts the transaction (23505).
+    const late = try db.begin();
+    try statement(late, "INSERT INTO du VALUES (3), (3)");
+    try commitFails(late, error.PrimaryKeyViolation);
+    try expect(deferred_probes[0], "2");
+    // SET CONSTRAINTS ... IMMEDIATE checks the outstanding rows at once.
+    const set = try db.begin();
+    try statement(set, "INSERT INTO du VALUES (2)");
+    try statementFails(set, "SET CONSTRAINTS du_v_key IMMEDIATE", error.PrimaryKeyViolation);
+    db.abort(set);
+    // Fixed before commit: the duplicates are removed and one added back.
+    const fixed = try db.begin();
+    try statement(fixed, "INSERT INTO du VALUES (5), (5)");
+    try statement(fixed, "DELETE FROM du WHERE v = 5");
+    try statement(fixed, "INSERT INTO du VALUES (5)");
+    try commit(fixed);
+    try expect(deferred_probes[0], "2;5");
+    // Autocommit: the statement's own commit check fails it atomically.
+    try rejects("INSERT INTO du VALUES (6), (6)", error.PrimaryKeyViolation, deferred_probes[0], "2;5");
+    // DEFERRABLE INITIALLY IMMEDIATE is checked at the end of each
+    // statement (a shifting UPDATE passes), unless deferred.
+    try run("CREATE TABLE di (k INT, CONSTRAINT di_k UNIQUE (k) DEFERRABLE)");
+    try run("INSERT INTO di VALUES (1), (2)");
+    try run("UPDATE di SET k = k + 1");
+    try expect(deferred_probes[1], "2;3");
+    try rejects("UPDATE di SET k = 3 WHERE k = 2", error.PrimaryKeyViolation, deferred_probes[1], "2;3");
+    const swap = try db.begin();
+    try statement(swap, "SET CONSTRAINTS di_k DEFERRED");
+    try statement(swap, "UPDATE di SET k = 3 WHERE k = 2");
+    try same(try rows(swap, "SELECT k FROM di ORDER BY k"), "3;3");
+    try statement(swap, "DELETE FROM di WHERE k = 3");
+    try statement(swap, "INSERT INTO di VALUES (3), (4)");
+    try commit(swap);
+    try expect(deferred_probes[1], "3;4");
+    // Names: 42704 when missing, 42809 when not deferrable.
+    try run("CREATE TABLE fixed (k INT CONSTRAINT fixed_k UNIQUE)");
+    try rejects("SET CONSTRAINTS nope IMMEDIATE", error.UndefinedObject, deferred_probes[1], "3;4");
+    try rejects("SET CONSTRAINTS fixed_k DEFERRED", error.WrongObjectType, deferred_probes[1], "3;4");
+    // Deferred FOREIGN KEY: a child before its parent, a parent removed and
+    // added back; still missing at COMMIT is 23503.
+    try run("CREATE TABLE dp (id INT PRIMARY KEY)");
+    try run("CREATE TABLE dc (id INT PRIMARY KEY, pid INT REFERENCES dp DEFERRABLE INITIALLY DEFERRED)");
+    const order = try db.begin();
+    try statement(order, "INSERT INTO dc VALUES (1, 10)");
+    try statement(order, "INSERT INTO dp VALUES (10)");
+    try commit(order);
+    const missing = try db.begin();
+    try statement(missing, "INSERT INTO dc VALUES (2, 20)");
+    try commitFails(missing, error.ForeignKeyViolation);
+    const readd = try db.begin();
+    try statement(readd, "DELETE FROM dp WHERE id = 10");
+    try statement(readd, "INSERT INTO dp VALUES (10)");
+    try commit(readd);
+    const orphan = try db.begin();
+    try statement(orphan, "DELETE FROM dp WHERE id = 10");
+    try statementFails(orphan, "SET CONSTRAINTS ALL IMMEDIATE", error.ForeignKeyViolation);
+    db.abort(orphan);
+    try expect(deferred_probes[3], "1|10");
+    // Concurrency: two deferred inserts of one key both succeed until the
+    // second commit, which fails; the end-of-statement check leaves another
+    // live writer's version to that writer's own check (no wait).
+    const first = try db.begin();
+    const second = try db.begin();
+    try statement(first, "INSERT INTO du VALUES (7)");
+    try statement(second, "INSERT INTO du VALUES (7)");
+    try commit(first);
+    try commitFails(second, error.PrimaryKeyViolation);
+    const holder = try db.begin();
+    try statement(holder, "INSERT INTO du VALUES (8)");
+    const strict = try db.begin();
+    try statement(strict, "SET CONSTRAINTS ALL IMMEDIATE");
+    try statement(strict, "INSERT INTO du VALUES (8)");
+    try commit(holder);
+    try commitFails(strict, error.PrimaryKeyViolation);
+    try expect(deferred_probes[0], "2;5;7;8");
+    try check(db.usage().transactions == 0 and db.usage().pending_versions == 0);
+    try sameState(&deferred_probes);
+    try sameState(&[_][]const u8{"SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_schema = 'public' ORDER BY constraint_name"});
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
     try upsertUnique();
     try foreignKeys();
+    try deferredConstraints();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }
