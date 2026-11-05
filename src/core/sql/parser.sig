@@ -1909,9 +1909,15 @@ pub fn Parser(comptime config: types.Config) type {
                     if (self.current.kind == .integer or self.isSymbol(.minus) or self.isSymbol(.lparen) or self.current.kind == .decimal or
                         (self.mode == .standard and (self.current.kind == .parameter or self.isWord("NULL")))) try self.countClause(&block.limit, &block.negative_limit, &block.limit_expr);
                     if (!(try self.takeWord("ROW"))) try self.expectWord("ROWS");
-                    try self.expectWord("ONLY");
+                    if (self.mode == .standard and try self.takeWord("WITH")) {
+                        try self.expectWord("TIES");
+                        block.with_ties = true;
+                        self.pool.complex = true;
+                    } else try self.expectWord("ONLY");
                 } else break;
             }
+            // PostgreSQL: WITH TIES cannot be specified without ORDER BY (42601).
+            if (block.with_ties and block.order_count == 0) return error.Syntax;
             if (self.mode == .standard and try self.takeWord("FOR")) {
                 if (block.set_op != .none or block.item_count == 0) return error.Syntax;
                 if (try self.takeWord("UPDATE")) block.lock.strength = .update else {

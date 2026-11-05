@@ -15,7 +15,7 @@ const std = @import("std");
 const sql = @import("sql");
 
 const DB = sql.Database(.{ .tables = 10, .columns = 16, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 8, .expr_nodes = 2048, .work_rows = 256, .result_rows = 64, .relations = 6 });
-const Small = sql.Database(.{ .tables = 2, .columns = 4, .rows_per_table = 8, .work_rows = 4, .result_rows = 8, .nulls_first_ascending = false, .integer_bits = 32 });
+const Small = sql.Database(.{ .tables = 2, .columns = 4, .rows_per_table = 8, .work_rows = 1, .result_rows = 8, .nulls_first_ascending = false, .integer_bits = 32 });
 
 var assertions: usize = 0;
 var db: DB = .{};
@@ -378,12 +378,49 @@ fn limitExpressions() !void {
     try controlled("SELECT id FROM tdd_a ORDER BY id LIMIT (SELECT COUNT(*) FROM tdd_b) OFFSET (SELECT 1)", "2;3;4");
 }
 
+// ---- PG.QUERY.FETCH_TIES --------------------------------------------------
+
+fn fetchTies() !void {
+    // oracle
+    try expectTyped("SELECT g FROM tdd_a ORDER BY g FETCH FIRST 1 ROW WITH TIES", "g:23", "1;1");
+    try expect("SELECT g FROM tdd_a ORDER BY g FETCH FIRST 2 ROWS WITH TIES", "1;1");
+    try expect("SELECT g FROM tdd_a ORDER BY g FETCH FIRST 3 ROWS WITH TIES", "1;1;2;2");
+    try expect("SELECT g FROM tdd_a ORDER BY g FETCH FIRST 9 ROWS WITH TIES", "1;1;2;2");
+    try expect("SELECT g FROM tdd_a ORDER BY g DESC FETCH NEXT 1 ROW WITH TIES", "2;2");
+    try expect("SELECT g FROM tdd_a ORDER BY g FETCH FIRST ROW WITH TIES", "1;1");
+    try expect("SELECT g FROM tdd_a ORDER BY g FETCH FIRST 0 ROWS WITH TIES", "");
+    // Ties use every ORDER BY key; NULLs are peers.
+    try expect("SELECT g,v FROM tdd_a ORDER BY g,v FETCH FIRST 1 ROW WITH TIES", "1|10");
+    try expect("SELECT column1 FROM (VALUES (NULL::int),(NULL),(1)) v ORDER BY column1 NULLS FIRST FETCH FIRST 1 ROW WITH TIES", "NULL;NULL");
+    try expectBag("SELECT id FROM tdd_a ORDER BY g FETCH FIRST 1 ROW WITH TIES", "1;2");
+    // OFFSET applies first.
+    try expect("SELECT g FROM tdd_a ORDER BY g OFFSET 1 ROW FETCH FIRST 1 ROW WITH TIES", "1");
+    try expect("SELECT g FROM tdd_a ORDER BY g OFFSET 2 ROWS FETCH FIRST 1 ROW WITH TIES", "2;2");
+    // Expression counts, set operations, grouping and DISTINCT.
+    try expect("SELECT g FROM tdd_a ORDER BY g FETCH FIRST (1+0) ROWS WITH TIES", "1;1");
+    try expect("SELECT g FROM tdd_a ORDER BY g FETCH FIRST (SELECT 1) ROWS WITH TIES", "1;1");
+    try expect("SELECT g FROM tdd_a UNION ALL SELECT 1 ORDER BY 1 FETCH FIRST 1 ROW WITH TIES", "1;1;1");
+    try expectBag("SELECT g,COUNT(*) FROM tdd_a GROUP BY g ORDER BY COUNT(*) DESC FETCH FIRST 1 ROW WITH TIES", "1|2;2|2");
+    try expect("SELECT DISTINCT g FROM tdd_a ORDER BY g FETCH FIRST 1 ROW WITH TIES", "1");
+    try expect("VALUES (2),(1),(1) ORDER BY 1 FETCH FIRST 1 ROW WITH TIES", "1;1");
+    try expect("SELECT (SELECT COUNT(*) FROM (SELECT g FROM tdd_a i WHERE i.g>=o.g ORDER BY i.g FETCH FIRST 1 ROW WITH TIES) s) FROM tdd_a o WHERE o.id IN (1,4) ORDER BY o.id", "2;2");
+    // Errors.
+    try rejects("SELECT g FROM tdd_a FETCH FIRST 1 ROW WITH TIES", error.Syntax);
+    try rejects("SELECT g FROM tdd_a ORDER BY g LIMIT 1 WITH TIES", error.Syntax);
+    try rejects("SELECT g FROM tdd_a ORDER BY g FETCH FIRST 1 ROW WITH", error.Syntax);
+    try rejects("SELECT g FROM tdd_a ORDER BY g FETCH FIRST NULL ROWS WITH TIES", error.InvalidRowCountInLimit);
+    try rejects("SELECT g FROM tdd_a ORDER BY g FETCH FIRST (SELECT NULL::int) ROWS WITH TIES", error.InvalidRowCountInLimit);
+    try rejects("SELECT g FROM tdd_a ORDER BY g FETCH FIRST -1 ROWS WITH TIES", error.InvalidRowCountInLimit);
+    try controlled("SELECT g FROM tdd_a ORDER BY g DESC FETCH FIRST 1 ROW WITH TIES", "2;2");
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try naturalJoins();
     try joinTrees();
     try valuesAndTable();
     try limitExpressions();
+    try fetchTies();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-query-composition\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

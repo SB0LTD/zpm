@@ -269,10 +269,11 @@ pub fn Exec(comptime config: types.Config) type {
                 if (p.limit_expr != none) {
                     const cell = try E.eval(&ctx, p.limit_expr);
                     if (cell == .null_value) {
+                        if (p.with_ties) return error.InvalidRowCountInLimit;
                         plan.limit = 0xffffffffffffffff;
                     } else {
                         if (cell.integer < 0) return error.InvalidRowCountInLimit;
-                        plan.limit = @intCast(cell.integer);
+                        if (p.with_ties) plan.ties_limit = @intCast(cell.integer) else plan.limit = @intCast(cell.integer);
                     }
                 }
             }
@@ -2777,7 +2778,26 @@ pub fn Exec(comptime config: types.Config) type {
                 list.start += skip;
                 list.count -= skip;
                 if (p.limit < list.count) list.count = @intCast(p.limit);
+                if (p.with_ties and p.ties_limit < list.count) list.count = try self.withTies(p, list);
                 return list;
+            }
+
+            /// FETCH ... WITH TIES: the first ties_limit rows plus every
+            /// following row equal (NULLs equal) to the last one on the
+            /// ORDER BY keys.
+            fn withTies(self: *Query, p: *const B.Plan, list: List) Error!u32 {
+                var kept: u32 = @intCast(p.ties_limit);
+                if (kept == 0) return 0;
+                const items = self.handles(list);
+                const last = items[kept - 1];
+                while (kept < list.count) : (kept += 1) {
+                    try self.session.checkpoint();
+                    const candidate = items[kept];
+                    for (p.tie_keys[0..p.tie_key_count]) |key| {
+                        if (V.compare(&self.work.cells[candidate + key.column], &self.work.cells[last + key.column]) != 0) return kept;
+                    }
+                }
+                return kept;
             }
 
             fn rollupRecord(self:*Query,p:*const B.Plan,keys:[]const V.Cell,prefix:usize,buckets:u32,slots:usize,

@@ -478,6 +478,13 @@ pub fn Binder(comptime config: types.Config) type {
             /// (Exec.resolveCounts); constant ones are folded into limit/offset.
             limit_expr: u16 = none,
             offset_expr: u16 = none,
+            /// FETCH FIRST n ROWS WITH TIES: `limit` stays unbounded (so no
+            /// early-stop path cuts peers); finish keeps ties_limit rows and
+            /// every following row equal on the ORDER BY keys tie_keys.
+            with_ties: bool = false,
+            ties_limit: u64 = 0xffffffffffffffff,
+            tie_keys: [config.columns]SortKey = undefined,
+            tie_key_count: usize = 0,
         };
 
         pub const CteDef = struct {
@@ -4188,6 +4195,7 @@ pub fn Binder(comptime config: types.Config) type {
             }
             try checkCounts(q, p);
             try bindCounts(context, &scope, q, p);
+            bindTies(q, p, p.order[0..p.order_count]);
             return id;
         }
 
@@ -4289,6 +4297,8 @@ pub fn Binder(comptime config: types.Config) type {
                 } else if (!value.integral(ty)) return error.TypeMismatch;
                 if (try foldableScalar(context, id)) {
                     const cell = try generatedValue(context, id);
+                    // ExecLimit: row count cannot be null in FETCH ... WITH TIES.
+                    if (is_limit and q.with_ties and cell == .null_value) return error.InvalidRowCountInLimit;
                     if (is_limit) {
                         if (cell == .null_value) p.limit = 0xffffffffffffffff else if (cell.integer < 0) return error.InvalidRowCountInLimit else p.limit = @intCast(cell.integer);
                     } else {
@@ -4315,6 +4325,16 @@ pub fn Binder(comptime config: types.Config) type {
                 return false;
             }
             return correlatedSublink(context, n.b);
+        }
+
+        /// FETCH ... WITH TIES over the ORDER BY keys `keys` (B11).
+        fn bindTies(q: *const Ast.Select, p: *Plan, keys: []const SortKey) void {
+            if (!q.with_ties) return;
+            p.with_ties = true;
+            p.ties_limit = p.limit;
+            p.limit = 0xffffffffffffffff;
+            for (keys, 0..) |key, index| p.tie_keys[index] = key;
+            p.tie_key_count = keys.len;
         }
 
         /// Whether expression `id` reads a column `level` query levels up.
@@ -4390,6 +4410,7 @@ pub fn Binder(comptime config: types.Config) type {
             try checkCounts(q, p);
             var count_scope: Scope = .{ .parent = parent, .plan = id, .ctes = env };
             try bindCounts(context, &count_scope, q, p);
+            bindTies(q, p, p.order[0..p.order_count]);
             return id;
         }
 
@@ -5103,6 +5124,7 @@ pub fn Binder(comptime config: types.Config) type {
             }
             try checkCounts(q, p);
             try bindCounts(context, &scope, q, p);
+            bindTies(q, p, order[0..order_count]);
             p.constant_source_safe=!q.distinct and q.order_count==0 and !q.limit_present and !q.offset_present;
             try lowerWindows(context,id);
             return id;
@@ -5438,7 +5460,7 @@ pub fn Binder(comptime config: types.Config) type {
             var conservative=bound.*!=.query;
             for(plans.items[0..plans.len]) |*p| conservative=conservative or p.correlated;
             // B11 composition plans keep every output (no demand pruning).
-            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none;
+            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none or p.with_ties;
             for(plans.items[0..plans.len]) |*p| {p.demanded=conservative;p.required=@splat(conservative);p.aggregate_required=@splat(conservative);}
             if(conservative) return;
             var cte_references:[config.ctes]usize=@splat(0);
