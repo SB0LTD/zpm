@@ -52,8 +52,10 @@ version per index:
 A RAMSQL version is 1,200 bytes (8 columns, 128-byte text), so one index adds
 0.7% to 1.3% of the version arena. RAMSQL's default plan (8 tables, rows 4096,
 versions 8192) grows by 2 MiB with four indexes per table: 84,967,424 bytes
-instead of 82,870,272. The inline sql-storage server profile stays at
-12,684,176 bytes (its inline index slots are 8 x 4 x 8,192 = 262,144 bytes).
+instead of 82,870,272. The inline sql-storage suite reports the same sizes as
+unmodified main (20e7528): `server_profile_bytes` 13,172,624 and `small_bytes`
+298,304 (the server profile's inline index slots are 8 x 4 x 8,192 = 262,144
+bytes).
 
 ## Turning it on in RAMSQL
 
