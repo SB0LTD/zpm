@@ -2145,7 +2145,7 @@ pub fn Database(comptime config: Config) type {
                             };
                             const has_expression = kind == .default or kind == .generated;
                             switch (view) {
-                                .pg_attribute => try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(types.typeOid(column.data_type)), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), nameCell(identity), nameCell(if (kind == .generated) "s" else ""), boolCell(has_expression) }),
+                                .pg_attribute => try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(types.typeOid(column.data_type)), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), nameCell(identity), nameCell(if (kind != .generated) "" else if (column.virtual) "v" else "s"), boolCell(has_expression) }),
                                 .pg_attrdef => if (has_expression) {
                                     try sink.add(&.{ intCell(oid), intCell(attnum), expressionTextWithPool(pool,column) });
                                 },
@@ -2209,7 +2209,11 @@ pub fn Database(comptime config: Config) type {
                     text.add(")");
                     at = end + 1;
                 } else text.add(table.columns[column].name.slice());
-                if (index.options[position] & 1 != 0) text.add(" DESC");
+                const descending = index.options[position] & 1 != 0;
+                const nulls_first = index.options[position] & 2 != 0;
+                if (descending) text.add(" DESC");
+                if (nulls_first and !descending) text.add(" NULLS FIRST");
+                if (!nulls_first and descending) text.add(" NULLS LAST");
             }
             text.add(")");
             if (index.include_count != 0) {

@@ -3522,6 +3522,7 @@ pub fn Binder(comptime config: types.Config) type {
         fn chooseIndexName(context: *const Context, table_name: []const u8, namespace: u32, table_columns: []const V.Column, columns: []const u8, unique: bool, taken: []const S.Index) V.Name {
             var name2: [256]u8 = undefined;
             var length: usize = 0;
+            var expressions: usize = 0;
             for (columns, 0..) |column, position| {
                 if (position != 0) {
                     name2[length] = '_';
@@ -3531,6 +3532,14 @@ pub fn Binder(comptime config: types.Config) type {
                 const take = @min(part.len, name2.len - length);
                 @memcpy(name2[length..][0..take], part[0..take]);
                 length += take;
+                // ChooseIndexColumnNames: expr, expr1, expr2, ...
+                if (column == S.expression_key) {
+                    if (expressions != 0 and length < name2.len) {
+                        name2[length] = @intCast('0' + expressions % 10);
+                        length += 1;
+                    }
+                    expressions += 1;
+                }
             }
             const label: []const u8 = if (unique) "key" else "idx";
             var pass: usize = 0;
@@ -3581,6 +3590,8 @@ pub fn Binder(comptime config: types.Config) type {
                 if (element.column) |ident| {
                     column = @intCast(try columnIndex(context, entry, ident));
                     if (entry.columns[column].data_type == .json) return error.UndefinedFunction;
+                    // PostgreSQL 18: no index over a virtual generated column.
+                    if (entry.columns[column].virtual) return error.UnsupportedStatement;
                 } else {
                     const text = element.expression.slice(context.source);
                     if (expressions.len != 0) {
@@ -5297,7 +5308,7 @@ pub fn Binder(comptime config: types.Config) type {
                         if (definition.serial != 0 or definition.default_kind == .identity_always or definition.default_kind == .identity_by_default) return error.UnsupportedStatement;
                     };
                     for (create.columns[0..create.count], 0..) |*definition, index| {
-                        var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod, .default_kind = definition.default_kind };
+                        var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod, .default_kind = definition.default_kind, .virtual = definition.virtual };
                         for (out.columns[0..index]) |*previous|
                             if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
                         column.data_type = columnType(context, definition);

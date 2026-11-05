@@ -204,7 +204,10 @@ const index_probes = [_][]const u8{
 };
 
 fn probeCount(target: *DB, table: []const u8, index: []const u8, key: []const DB.Cell, probe: bool) !usize {
-    return target.indexMatches(table, index, key, probe) orelse error.IndexNotFound;
+    return target.indexMatches(table, index, key, probe) orelse {
+        std.debug.print("index {s} of {s} not found (assertion {d})\n", .{ index, table, assertions });
+        return error.IndexNotFound;
+    };
 }
 
 /// Index path = scan path for every key value 0..6 and NULL.
@@ -974,6 +977,91 @@ fn mergeStatement() !void {
     try sameState(&merge_probes);
 }
 
+// ---- composite, expression, partial and covering indexes (PG.INDEX.ADVANCED)
+
+fn advancedIndexes() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, g INT, v INT)");
+    try run("INSERT INTO a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, NULL)");
+    // The oracle program in one transaction.
+    const tx = try db.begin();
+    try statement(tx, "CREATE INDEX tdd_adv ON a(g,(v+1)) INCLUDE(id) WHERE v IS NOT NULL");
+    try same(try rows(tx, "SELECT indexname FROM pg_indexes WHERE indexname='tdd_adv'"), "tdd_adv");
+    db.abort(tx);
+    try run("CREATE INDEX a_adv ON a (g, (v + 1)) INCLUDE (id) WHERE v IS NOT NULL");
+    try run("CREATE INDEX a_multi ON a (g DESC, v NULLS FIRST, id)");
+    try run("CREATE INDEX ON a ((g * 2), (v - 1))");
+    try expect("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'a' AND indexname <> 'a_pkey' ORDER BY indexname",
+        "a_adv|CREATE INDEX a_adv ON public.a USING btree (g, (v + 1)) INCLUDE (id) WHERE (v IS NOT NULL);" ++
+        "a_expr_expr1_idx|CREATE INDEX a_expr_expr1_idx ON public.a USING btree ((g * 2), (v - 1));" ++
+        "a_multi|CREATE INDEX a_multi ON public.a USING btree (g DESC, v NULLS FIRST, id)");
+    try expect("SELECT c.relname, c.relnatts, i.indkey FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname <> 'a_pkey' ORDER BY c.relname", "a_adv|3|2 0;a_expr_expr1_idx|2|0 0;a_multi|3|2 3 1");
+    // Entries cover every version; probes over the plain key column g
+    // equal scans through updates, deletes and an abort.
+    try indexAgrees(&db, "a", "a_adv");
+    try run("UPDATE a SET v = v + 1");
+    try run("DELETE FROM a WHERE id = 2");
+    const writer = try db.begin();
+    try statement(writer, "INSERT INTO a VALUES (7, 1, 70)");
+    db.abort(writer);
+    try indexAgrees(&db, "a", "a_adv");
+    const triple = [_]DB.Cell{ .{ .integer = 1 }, .{ .integer = 11 }, .{ .integer = 1 } };
+    try check(try probeCount(&db, "a", "a_multi", &triple, true) == 1 and try probeCount(&db, "a", "a_multi", &triple, false) == 1);
+    const absent = [_]DB.Cell{ .{ .integer = 2 }, .null_value, .{ .integer = 4 } };
+    try check(try probeCount(&db, "a", "a_multi", &absent, true) == try probeCount(&db, "a", "a_multi", &absent, false));
+    try indexAgrees(&db, "a", "a_expr_expr1_idx");
+    // Expressions and predicates must be immutable (42P17), boolean
+    // (42804) and name real columns (42703); subqueries are 0A000.
+    const names = "SELECT indexname FROM pg_indexes WHERE tablename = 'a' ORDER BY indexname";
+    const listed = "a_adv;a_expr_expr1_idx;a_multi;a_pkey";
+    try rejects("CREATE INDEX bad ON a ((now()))", error.InvalidObjectDefinition, names, listed);
+    try rejects("CREATE INDEX bad ON a (g) WHERE v", error.TypeMismatch, names, listed);
+    try rejects("CREATE INDEX bad ON a ((missing + 1))", error.ColumnNotFound, names, listed);
+    try rejects("CREATE INDEX bad ON a (g) INCLUDE (missing)", error.ColumnNotFound, names, listed);
+    try rejects("CREATE INDEX bad ON a (g) INCLUDE (v, v)", error.DuplicateColumn, names, listed);
+    try rejects("CREATE INDEX bad ON a (g) WHERE v IN (SELECT 1)", error.UnsupportedStatement, names, listed);
+    try rejects("CREATE UNIQUE INDEX bad ON a (g) WHERE v > 0", error.UnsupportedStatement, names, listed);
+    try sameState(&[_][]const u8{ "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' ORDER BY indexname", "SELECT id, g, v FROM a ORDER BY id" });
+    try indexAgrees(&replica, "a", "a_adv");
+    // Renames reach the stored texts; a dropped column drops its indexes.
+    try run("ALTER TABLE a RENAME COLUMN v TO w");
+    try expect("SELECT indexdef FROM pg_indexes WHERE indexname = 'a_adv'", "CREATE INDEX a_adv ON public.a USING btree (g, (w + 1)) INCLUDE (id) WHERE (w IS NOT NULL)");
+    try run("ALTER TABLE a DROP COLUMN w");
+    try expect(names, "a_pkey");
+    try run("CREATE INDEX a_cover ON a (g) INCLUDE (id)");
+    try sameState(&[_][]const u8{ "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' ORDER BY indexname", "SELECT relname, relnatts FROM pg_class WHERE relnamespace = 2200 ORDER BY oid" });
+}
+
+// ---- virtual generated columns (PG.DDL.VIRTUAL) -----------------------------
+
+fn virtualColumns() !void {
+    reset();
+    // The oracle program in one transaction.
+    const tx = try db.begin();
+    try statement(tx, "CREATE TABLE tdd_vg(v INT,doubled INT GENERATED ALWAYS AS(v*2) VIRTUAL)");
+    try statement(tx, "INSERT INTO tdd_vg(v) VALUES(3)");
+    try same(try rows(tx, "SELECT * FROM tdd_vg"), "3|6");
+    db.abort(tx);
+    // VIRTUAL is PostgreSQL 18's default; STORED stays stored.
+    try run("CREATE TABLE vg (v INT, doubled INT GENERATED ALWAYS AS (v * 2) VIRTUAL, tripled INT GENERATED ALWAYS AS (v * 3), kept INT GENERATED ALWAYS AS (v + 1) STORED)");
+    try run("INSERT INTO vg (v) VALUES (3), (NULL)");
+    try expect("SELECT v, doubled, tripled, kept FROM vg ORDER BY v", "3|6|9|4;NULL|NULL|NULL|NULL");
+    try run("UPDATE vg SET v = 5 WHERE v = 3");
+    try expect("SELECT doubled, tripled, kept FROM vg WHERE v = 5", "10|15|6");
+    try expect("SELECT attname, attgenerated FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'vg' ORDER BY attnum", "v|;doubled|v;tripled|v;kept|s");
+    try expect("SELECT column_name, is_generated, generation_expression FROM information_schema.columns WHERE table_name = 'vg' AND is_generated = 'ALWAYS' ORDER BY ordinal_position", "doubled|ALWAYS|(v * 2);tripled|ALWAYS|(v * 3);kept|ALWAYS|(v + 1)");
+    // Values cannot be written (428C9); expressions must be immutable and
+    // reference no generated column; indexes on them are 0A000.
+    try rejects("INSERT INTO vg (v, doubled) VALUES (1, 2)", error.GeneratedAlways, "SELECT COUNT(*) FROM vg", "2");
+    try rejects("UPDATE vg SET doubled = 1", error.GeneratedAlways, "SELECT COUNT(*) FROM vg", "2");
+    try rejects("CREATE TABLE bad (t TIMESTAMPTZ GENERATED ALWAYS AS (now()) VIRTUAL)", error.InvalidObjectDefinition, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("CREATE INDEX vg_doubled ON vg (doubled)", error.UnsupportedStatement, "SELECT COUNT(*) FROM pg_indexes WHERE tablename = 'vg'", "0");
+    try sameState(&[_][]const u8{
+        "SELECT v, doubled, tripled, kept FROM vg ORDER BY v",
+        "SELECT attname, attgenerated FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'vg' ORDER BY attnum",
+    });
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -985,5 +1073,7 @@ pub fn main() !void {
     try materializedViews();
     try createVariants();
     try mergeStatement();
+    try advancedIndexes();
+    try virtualColumns();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }
