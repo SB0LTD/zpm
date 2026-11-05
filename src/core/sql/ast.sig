@@ -118,7 +118,10 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     json_table, json_table_passing, json_table_column,
     // Catalog objects (B11 wave 3, catalog_objects.sig): comments and the
     // current / session role (STABLE).
-    obj_description, col_description, shobj_description, current_user, session_user };
+    obj_description, col_description, shobj_description, current_user, session_user,
+    // Discovery (B11 text lane): pg_typeof (the argument's type OID in
+    // `integer`, set by the binder) and pg_get_serial_sequence.
+    pg_typeof, pg_get_serial_sequence };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -224,6 +227,7 @@ pub fn strictFunction(func: Func) bool {
         .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
         // jsonb_set_lax reads NULL arguments itself.
         .jsonb_set_lax => false,
+        .pg_get_serial_sequence => true,
         else => jsonFunction(func),
     };
 }

@@ -1196,6 +1196,22 @@ pub fn Eval(comptime config: types.Config) type {
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out => return catalogValue(ctx, n),
                     .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
+                    .pg_typeof => {
+                        // The argument is evaluated (its errors surface); its
+                        // bound type is the result.
+                        _ = try eval(ctx, n.b);
+                        return .{ .regtype = @intCast(n.integer) };
+                    },
+                    .pg_get_serial_sequence => {
+                        const table = try eval(ctx, n.b);
+                        const column = try eval(ctx, ctx.pool.nodes[n.b].next);
+                        if (table == .null_value or column == .null_value) return .null_value;
+                        const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                        const lookup = hook.serial_sequence orelse return error.UnsupportedStatement;
+                        var buffer: [value_module.serial_name_bytes]u8 = undefined;
+                        const length = (try lookup(hook.ptr, table.text.slice(), column.text.slice(), &buffer)) orelse return .null_value;
+                        return textCell(buffer[0..length]);
+                    },
                     .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
                     .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
                     .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),

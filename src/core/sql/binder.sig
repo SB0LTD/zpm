@@ -769,6 +769,10 @@ pub fn Binder(comptime config: types.Config) type {
         /// Operands of a comparison: unknown takes the other side's type;
         /// numeric and datetime operands promote to their common type.
         fn comparable(context: *const Context, a: *u16, b: *u16) Error!void {
+            // regtype has no operators of its own: oid's apply (binary
+            // coercible), so an untyped literal beside it is read as an oid.
+            if (context.node(a.*).ty == .regtype) a.* = try convert(context, a.*, .oid, -1, .implicit);
+            if (context.node(b.*).ty == .regtype) b.* = try convert(context, b.*, .oid, -1, .implicit);
             const left = context.node(a.*).ty;
             const right = context.node(b.*).ty;
             if (left == .unknown and right == .unknown) {
@@ -1279,6 +1283,9 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "obj_description", .func = .obj_description },
                 .{ .name = "col_description", .func = .col_description },
                 .{ .name = "shobj_description", .func = .shobj_description },
+                // Discovery functions (B11 text lane).
+                .{ .name = "pg_typeof", .func = .pg_typeof },
+                .{ .name = "pg_get_serial_sequence", .func = .pg_get_serial_sequence },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -2182,6 +2189,21 @@ pub fn Binder(comptime config: types.Config) type {
                     n.ty = .name;
                     n.constant = false;
                 },
+                // pg_typeof("any") is not strict: the argument is evaluated
+                // and its declared type is the result (unknown for an
+                // untyped literal, regclass/regtype for the OID casts).
+                .pg_typeof => {
+                    if (count != 1) return error.UndefinedFunction;
+                    const argument = context.node(n.b);
+                    n.integer = switch (argument.reg) {
+                        .regclass => 2205,
+                        .regtype => 2206,
+                        .none => if (argument.ty == .unknown) 705 else types.typeOid(types.dataTypeOf(argument.ty)),
+                    };
+                    n.ty = .regtype;
+                    n.constant = false;
+                },
+                .pg_get_serial_sequence => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .text, true),
                 .point_constructor => try bindSignature(context, n, &[_]ast.Type{ .float8, .float8 }, .point, true),
                 .box_constructor => try bindSignature(context, n, &[_]ast.Type{ .point, .point }, .box, true),
                 .area, .width, .height => try bindSignature(context, n, &[_]ast.Type{.box}, .float8, true),

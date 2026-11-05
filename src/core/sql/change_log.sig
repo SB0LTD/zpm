@@ -79,7 +79,7 @@
 //!   finite bounds as values} | 23 inet/cidr {family u8 (4/6), bits u8,
 //!   cidr u8, 16 address bytes} | 24 macaddr 6 bytes | 25 point {x, y as
 //!   f64 bits u64} | 26 box {high x, high y, low x, low y as f64 bits}
-//!   | 27 xml len u32 + the stored text.
+//!   | 27 xml len u32 + the stored text | 30 regtype OID u32.
 //!    70 object_create / 71 object_drop: catalog objects (roles, grants,
 //!                     policies, comments, wrappers, servers, publications);
 //!                     layout in catalog_objects.sig (B11 wave 3)
@@ -366,6 +366,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 27);
                     try writer.int(u32, @intCast(text.len));
                     try writer.bytes(text.slice());
+                },
+                .regtype => |oid| {
+                    try writer.int(u8, 30);
+                    try writer.int(u32, oid);
                 },
                 .point => |value| {
                     try writer.int(u8, 25);
@@ -978,6 +982,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     break :blk .{ .inet = value };
                 },
                 24 => .{ .macaddr = (try reader.take(6))[0..6].* },
+                30 => .{ .regtype = try reader.int(u32) },
                 27 => blk: {
                     const len = try reader.int(u32);
                     if (len > config.text_bytes) return error.ChangeRecordConflict;

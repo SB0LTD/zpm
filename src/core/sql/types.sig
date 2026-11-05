@@ -541,12 +541,12 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -655,6 +655,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .box => .box,
         .xml => .xml,
         .jsonpath => .jsonpath,
+        .regtype => .regtype,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -701,6 +702,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .box => .box,
         .xml => .xml,
         .jsonpath => .jsonpath,
+        .regtype => .regtype,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -775,6 +777,7 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .box => .{ .oid = 603, .name = "box", .len = 32, .category = 'G', .array = 1020 },
         .xml => .{ .oid = 142, .name = "xml", .len = -1, .category = 'U', .array = 143 },
         .jsonpath => .{ .oid = 4072, .name = "jsonpath", .len = -1, .category = 'U', .array = 4073 },
+        .regtype => .{ .oid = 2206, .name = "regtype", .len = 4, .category = 'N', .array = 2211 },
         _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
@@ -833,6 +836,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .box => "box",
         .xml => "xml",
         .jsonpath => "jsonpath",
+        .regtype => "regtype",
         _ => "",
     };
 }
@@ -875,6 +879,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .box => "box_in",
         .xml => "xml_in",
         .jsonpath => "jsonpath_in",
+        .regtype => "regtypein",
         _ => "array_in",
     };
 }
@@ -940,6 +945,38 @@ fn scalarByName(input: []const u8) ?DataType {
         if (name.len > 1 and name[0] == '_' and same(name[1..], typeInfo(data_type).name)) return arrayData(data_type);
     }
     return null;
+}
+
+/// regtypeout: the SQL name of a type OID ("-" for 0), including the
+/// pseudo/catalog types an expression can report without a DataType.
+pub fn regtypeName(oid: u32) ?[]const u8 {
+    switch (oid) {
+        0 => return "-",
+        705 => return "unknown",
+        2205 => return "regclass",
+        else => {},
+    }
+    const data_type = typeFromOid(oid) orelse return null;
+    return sqlTypeName(data_type);
+}
+
+/// regtypein: a numeric OID, "-" (0) or a type name (42704 when unknown).
+pub fn regtypeInput(input: []const u8) error{ UndefinedObject, NumericValueOutOfRange }!u32 {
+    if (input.len != 0 and input.len <= 10) {
+        var value: u64 = 0;
+        for (input) |byte| {
+            if (!digit(byte)) break;
+            value = value * 10 + (byte - '0');
+        } else {
+            if (value > 0xffffffff) return error.NumericValueOutOfRange;
+            return @intCast(value);
+        }
+    }
+    if (input.len == 1 and input[0] == '-') return 0;
+    if (keyword(input, "unknown")) return 705;
+    if (keyword(input, "regclass")) return 2205;
+    const data_type = typeByName(input) orelse return error.UndefinedObject;
+    return typeOid(data_type);
 }
 
 pub fn typeFromOid(oid: u32) ?DataType {
@@ -1021,7 +1058,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -1062,6 +1099,8 @@ pub fn Values(comptime config: Config) type {
             box: geometric.Box,
             /// XML: the stored (validated) text.
             xml: Text,
+            /// regtype (pg_typeof): a type OID that prints as the type name.
+            regtype: u32,
         };
 
         /// Range values of these cells (range.sig).
@@ -1120,6 +1159,7 @@ pub fn Values(comptime config: Config) type {
                 .point => .point,
                 .box => .box,
                 .xml => .xml,
+                .regtype => .regtype,
                 _ => .array,
             };
         }
@@ -1162,6 +1202,8 @@ pub fn Values(comptime config: Config) type {
                 .point => |value| geometric.comparePoints(value, right.point),
                 .box => |value| geometric.compareBoxes(value, right.box),
                 .xml => |*value| bytesOrder(value.slice(), right.xml.slice()),
+                // regtype sorts with oid's operators (binary coercible).
+                .regtype => |value| order(u32, value, right.regtype),
             };
         }
 
@@ -1221,6 +1263,7 @@ pub fn Values(comptime config: Config) type {
                 .date => |days| return wordHash(@bitCast(@as(i64, days)), tag),
                 .timestamp, .timestamptz, .time, .money => |us| return wordHash(@bitCast(us), tag),
                 .pg_lsn, .xid8 => |word| return wordHash(word, tag),
+                .regtype => |oid| return wordHash(oid, tag),
                 .array => |*items| return wordHash(Arrays.hash(items.slice()), tag),
                 .range => |*span| return wordHash(Ranges.hash(span.slice()), tag),
                 // network_cmp ignores the cidr flag; so does the hash.

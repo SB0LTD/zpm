@@ -146,6 +146,8 @@ pub fn Types(comptime Result: type) type {
                 },
                 .macaddr => |*value| try put(out, &at, value),
                 .xml => at += try sendText(cell, session, out),
+                // regtypesend is oidsend.
+                .regtype => |value| try putInt(u32, out, &at, value),
                 .point => |value| {
                     try putInt(u64, out, &at, @bitCast(value.x));
                     try putInt(u64, out, &at, @bitCast(value.y));
@@ -377,6 +379,10 @@ pub fn Types(comptime Result: type) type {
                 .macaddr => {
                     if (bytes.len != 6) return error.ProtocolViolation;
                     return .{ .macaddr = bytes[0..6].* };
+                },
+                .regtype => {
+                    if (bytes.len != 4) return error.ProtocolViolation;
+                    return .{ .regtype = getInt(u32, bytes) };
                 },
                 .xml => {
                     var text: Io.Text = .{};

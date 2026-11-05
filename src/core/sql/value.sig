@@ -85,6 +85,10 @@ pub const SequenceHook = struct {
     /// Catalog-object text (B11 wave 3): a comment (obj_description,
     /// col_description, shobj_description) or a role name, written to `out`.
     catalog_text: ?*const fn (ptr: *anyopaque, kind: CatalogText, object: u32, classoid: u32, sub: i32, out: []u8) Error!?usize = null,
+    /// pg_get_serial_sequence(table, column): the qualified name of the
+    /// sequence a column owns (SERIAL or identity) into `out`, null when it
+    /// owns none (42P01 / 42703 for a missing table / column).
+    serial_sequence: ?*const fn (ptr: *anyopaque, table: []const u8, column: []const u8, out: *[serial_name_bytes]u8) Error!?usize = null,
 };
 
 pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid };
@@ -99,6 +103,8 @@ pub const SessionHook = struct {
     ptr: *anyopaque,
     call: *const fn (ptr: *anyopaque, kind: SessionCall, a: []const u8, b: []const u8, x: i64, y: i64, flags: u8, out: []u8) Error!SessionReply,
 };
+/// Room for `schema.name` with both parts quoted (pg_get_serial_sequence).
+pub const serial_name_bytes = 520;
 
 /// A user function call: `routine` is the routine slot, `args` the
 /// evaluated argument cells (Values(config).Cell) and `out` receives the
@@ -179,6 +185,16 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         // explicitly (XMLPARSE CONTENT).
         if (from == .xml) return characterType(to) and context != .implicit;
         return characterType(from) and context == .explicit;
+    }
+    if (from == .regtype or to == .regtype) {
+        // pg_cast: oid/int4 <-> regtype binary and int2/int8 -> regtype
+        // implicit; regtype -> int4/int8 by assignment; strings by I/O
+        // conversion.
+        if (from == .oid or to == .oid or (to == .regtype and integral(from))) return true;
+        if (from == .regtype and (to == .int4 or to == .int8)) return context != .implicit;
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
     }
     if (from == .point or to == .point or from == .box or to == .box) {
         // Geometric types: strings by I/O conversion only here.
@@ -296,6 +312,8 @@ pub fn castable(from: Type, to: Type, context: Context) bool {
 /// common-type selection. Rounding an exact int/numeric to float4 first can
 /// turn distinct values into equal ones (e.g. 16777217 and 16777216::real).
 pub fn comparisonType(a: Type, b: Type) ?Type {
+    // regtype has no operators of its own: oid's apply (binary coercible).
+    if (a == .regtype or b == .regtype) return comparisonType(if (a == .regtype) .oid else a, if (b == .regtype) .oid else b);
     // point has no = operator and box compares only by area: neither has
     // ordinary comparison operators here.
     if (a == .point or b == .point or a == .box or b == .box) return null;
@@ -448,6 +466,8 @@ pub fn Io(comptime config: types.Config) type {
                 .point => |value| geometric.formatPoint(value, buffer),
                 .box => |value| geometric.formatBox(value, buffer),
                 .xml => |*value| xml.output(value.slice(), buffer),
+                // regtypeout: the type's SQL name, or the number.
+                .regtype => |oid| if (types.regtypeName(oid)) |name| copy(buffer, name) else integerText(oid, buffer),
             };
         }
 
@@ -554,6 +574,7 @@ pub fn Io(comptime config: types.Config) type {
                     var buffer: [config.text_bytes]u8 = undefined;
                     break :blk try textCell(try jsonpath.Engine(config).canonical(input, &buffer, session.control));
                 },
+                .regtype => .{ .regtype = try types.regtypeInput(input) },
                 // array_in applies the typmod to every element itself.
                 _ => return ArrayText.parse(types.elementType(ty) orelse return error.UndefinedFunction, typmod, input, session),
             };
@@ -712,6 +733,22 @@ pub fn Io(comptime config: types.Config) type {
                 if (!characterType(to)) return error.CannotCoerce;
                 return cast(try textCell(cell.xml.slice()), .text, to, typmod, session);
             }
+            if (cell == .regtype and to != .regtype) {
+                // regtype -> oid/int4/int8 reads the OID; strings by output.
+                if (to == .oid or to == .int8) return .{ .integer = cell.regtype };
+                if (to == .int4) return .{ .integer = @as(i32, @bitCast(cell.regtype)) };
+                if (!characterType(to)) return error.CannotCoerce;
+                var buffer: [format_bytes]u8 = undefined;
+                return cast(try textCell(try format(&cell, true, session, &buffer)), .text, to, typmod, session);
+            }
+            if (to == .regtype and cell == .integer) {
+                // int8 -> regtype checks the OID range (oidin); int4 wraps.
+                const value = cell.integer;
+                if (from == .int4 or from == .int2) return .{ .regtype = @bitCast(@as(i32, @intCast(value))) };
+                if (value < 0 or value > 4294967295) return error.NumericValueOutOfRange;
+                return .{ .regtype = @intCast(value) };
+            }
+            if (to == .regtype and cell == .text) return parse(.regtype, -1, cell.text.slice(), session);
             if (cell == .array and types.isArray(to)) {
                 if (from == to) return applyTypmodExplicit(cell, to, typmod);
                 return ArrayText.cast(cell.array.slice(), types.elementType(from) orelse return error.CannotCoerce, types.elementType(to).?, typmod, session);
@@ -927,6 +964,11 @@ pub fn Io(comptime config: types.Config) type {
                 },
                 .jsonpath => switch (cell) {
                     .text => |*value| try parse(.jsonpath, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                // Integers and text are converted above.
+                .regtype => switch (cell) {
+                    .regtype => cell,
                     else => return error.CannotCoerce,
                 },
                 .point, .box => switch (cell) {

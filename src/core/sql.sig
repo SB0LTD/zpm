@@ -3470,6 +3470,84 @@ pub fn Database(comptime config: Config) type {
             return null;
         }
 
+        /// pg_get_serial_sequence: the table is regclass text (42P01), the
+        /// column an exact attribute name (42703); the result names the
+        /// SERIAL or identity sequence the column owns (sequences live in
+        /// public), quoted like quote_identifier, or null.
+        fn serialSequence(ptr: *anyopaque, table_text: []const u8, column: []const u8, out: *[value_module.serial_name_bytes]u8) Error!?usize {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const oid = try self.regclassOid(table_text, true);
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(self.seq_snap, &relations);
+            var owner: ?*const S.Table = null;
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') {
+                    // A sequence's own attributes own nothing.
+                    if (self.seqs[found.slot].oid != oid) continue;
+                    for ([_][]const u8{ "last_value", "log_cnt", "is_called" }) |name| if (types.same(name, column)) return null;
+                    return error.ColumnNotFound;
+                }
+                const table = &self.tables[found.slot];
+                if (table.oid == oid) {
+                    owner = table;
+                    break;
+                }
+                if (S.keyed(table) and table.oid + 1 == oid) {
+                    // The primary-key index: its attributes are the key columns.
+                    var key_columns: [config.columns]u8 = undefined;
+                    for (primaryColumns(table, &key_columns)) |index| if (types.same(table.columns[index].name.slice(), column)) return null;
+                    return error.ColumnNotFound;
+                }
+            }
+            const table = owner orelse return error.TableNotFound;
+            const position = for (table.columns[0..table.column_count], 0..) |*entry, index| {
+                if (types.same(entry.name.slice(), column)) break index;
+            } else return error.ColumnNotFound;
+            for (&self.seqs) |*seq| {
+                if (!seq.live or seq.owner != table.oid or seq.owner_column != position or seq.dead_csn != 0) continue;
+                if (seq.pending_create and seq.creator != self.seq_slot) continue;
+                if (seq.pending_drop and seq.creator == self.seq_slot) continue;
+                var at: usize = 0;
+                for ([_][]const u8{ "public", seq.name.slice() }, 0..) |part, index| {
+                    if (2 * part.len + 3 > out.len - at) return error.NameCapacity;
+                    if (index != 0) {
+                        out[at] = '.';
+                        at += 1;
+                    }
+                    at += quoteIdentifier(part, out[at..]);
+                }
+                return at;
+            }
+            return null;
+        }
+
+        /// quote_identifier: quotes unless the name is lower-case letters,
+        /// digits and underscores not starting with a digit. `out` holds at
+        /// least 2 * name.len + 2 bytes.
+        fn quoteIdentifier(name: []const u8, out: []u8) usize {
+            var safe = name.len != 0 and !types.digit(name[0]);
+            for (name) |byte| {
+                if (!((byte >= 'a' and byte <= 'z') or types.digit(byte) or byte == '_')) safe = false;
+            }
+            if (safe) {
+                @memcpy(out[0..name.len], name);
+                return name.len;
+            }
+            var at: usize = 0;
+            out[at] = '"';
+            at += 1;
+            for (name) |byte| {
+                out[at] = byte;
+                at += 1;
+                if (byte == '"') {
+                    out[at] = '"';
+                    at += 1;
+                }
+            }
+            out[at] = '"';
+            return at + 1;
+        }
+
         const LiveOids = struct {
             db: *const Self,
             pub fn has(self: LiveOids, oid: u32) bool {
@@ -5308,7 +5386,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
