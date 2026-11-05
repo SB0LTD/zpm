@@ -277,6 +277,48 @@ pub export fn glGetTexParameterfv(target: u32, pname: u32, params: ?[*]f32) call
     const v = c.getTexParameteri(target, pname) orelse return;
     if (params) |p| p[0] = @floatFromInt(v);
 }
+pub export fn glGenerateMipmap(target: u32) callconv(.c) void {
+    if (cur()) |c| c.generateMipmap(target);
+}
+pub export fn glGenSamplers(n: i32, out: ?[*]u32) callconv(.c) void {
+    const c = cur() orelse return;
+    const k = count(n) orelse return;
+    if (out) |p| c.genSamplers(p[0..k]);
+}
+pub export fn glDeleteSamplers(n: i32, names: ?[*]const u32) callconv(.c) void {
+    const c = cur() orelse return;
+    const k = count(n) orelse return;
+    if (names) |p| c.deleteSamplers(p[0..k]);
+}
+pub export fn glIsSampler(name: u32) callconv(.c) u8 {
+    const c = cur() orelse return g.FALSE;
+    return @intFromBool(c.isSampler(name));
+}
+pub export fn glBindSampler(unit: u32, name: u32) callconv(.c) void {
+    if (cur()) |c| c.bindSampler(unit, name);
+}
+pub export fn glSamplerParameteri(name: u32, pname: u32, param: i32) callconv(.c) void {
+    if (cur()) |c| c.samplerParameteri(name, pname, param);
+}
+pub export fn glSamplerParameterf(name: u32, pname: u32, param: f32) callconv(.c) void {
+    glSamplerParameteri(name, pname, @intFromFloat(std.math.clamp(@round(param), -2147483648.0, 2147483520.0)));
+}
+pub export fn glSamplerParameteriv(name: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
+    if (params) |p| glSamplerParameteri(name, pname, p[0]);
+}
+pub export fn glSamplerParameterfv(name: u32, pname: u32, params: ?[*]const f32) callconv(.c) void {
+    if (params) |p| glSamplerParameterf(name, pname, p[0]);
+}
+pub export fn glGetSamplerParameteriv(name: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    const c = cur() orelse return;
+    const v = c.getSamplerParameteri(name, pname) orelse return;
+    if (params) |p| p[0] = v;
+}
+pub export fn glGetSamplerParameterfv(name: u32, pname: u32, params: ?[*]f32) callconv(.c) void {
+    const c = cur() orelse return;
+    const v = c.getSamplerParameteri(name, pname) orelse return;
+    if (params) |p| p[0] = @floatFromInt(v);
+}
 pub export fn glEGLImageTargetTexture2DOES(target: u32, image: ?*anyopaque) callconv(.c) void {
     if (cur()) |c| c.eglImageTargetTexture2D(target, image);
 }
@@ -1101,4 +1143,59 @@ test "libgles: a GLSL ES 1.00 program, as WebGL 1 writes them" {
     glDeleteShader(vs);
     glDeleteShader(fs);
     try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+test "libgles: texture formats and sampler objects through the C entry points" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    const E = std.testing.expectEqual;
+    var t: [1]u32 = undefined;
+    glGenTextures(1, &t);
+    glBindTexture(g.TEXTURE_2D, t[0]);
+    // R8, then RGBA16F from halves, then integers: as GL ES 3.0 takes them
+    const r8 = [_]u8{ 1, 2, 3, 4 };
+    glTexImage2D(g.TEXTURE_2D, 0, @intCast(g.R8), 4, 1, 0, g.RED, g.UNSIGNED_BYTE, &r8);
+    try E(g.NO_ERROR, glGetError());
+    try E(gfxapi.engine.Format.r8, t_objs.tex[t[0] - 1].img.format);
+    const halves = [_]u16{ 0x3c00, 0, 0, 0x3c00 };
+    glTexImage2D(g.TEXTURE_2D, 0, @intCast(g.RGBA16F), 1, 1, 0, g.RGBA, g.HALF_FLOAT, &halves);
+    try E(g.NO_ERROR, glGetError());
+    try E(gfxapi.engine.Format.rgba32f, t_objs.tex[t[0] - 1].img.format);
+    // a format the internal format does not take; an unknown internal format
+    glTexImage2D(g.TEXTURE_2D, 0, @intCast(g.RGBA8), 1, 1, 0, g.RGB, g.UNSIGNED_BYTE, &r8);
+    try E(g.INVALID_OPERATION, glGetError());
+    glTexImage2D(g.TEXTURE_2D, 0, 0x1234, 1, 1, 0, g.RGBA, g.UNSIGNED_BYTE, &r8);
+    try E(g.INVALID_VALUE, glGetError());
+    // mipmap levels past 0: taken
+    glTexImage2D(g.TEXTURE_2D, 1, @intCast(g.RGBA8), 1, 1, 0, g.RGBA, g.UNSIGNED_BYTE, &r8);
+    glGenerateMipmap(g.TEXTURE_2D);
+    try E(g.NO_ERROR, glGetError());
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_SWIZZLE_A, @intCast(g.ONE));
+    var v: i32 = 0;
+    glGetTexParameteriv(g.TEXTURE_2D, g.TEXTURE_SWIZZLE_A, @ptrCast(&v));
+    try E(@as(i32, @intCast(g.ONE)), v);
+    // samplers: named at once, bound per unit, their own state
+    var s: [2]u32 = undefined;
+    glGenSamplers(2, &s);
+    try E(g.TRUE, glIsSampler(s[0]));
+    glSamplerParameteri(s[0], g.TEXTURE_MAG_FILTER, @intCast(g.NEAREST));
+    glGetSamplerParameteriv(s[0], g.TEXTURE_MAG_FILTER, @ptrCast(&v));
+    try E(@as(i32, @intCast(g.NEAREST)), v);
+    glSamplerParameteri(s[0], g.TEXTURE_SWIZZLE_R, @intCast(g.GREEN));
+    try E(g.INVALID_ENUM, glGetError());
+    glActiveTexture(g.TEXTURE0 + 3);
+    glBindSampler(3, s[1]);
+    glGetIntegerv(g.SAMPLER_BINDING, @ptrCast(&v));
+    try E(@as(i32, @intCast(s[1])), v);
+    glBindSampler(3, 777);
+    try E(g.INVALID_OPERATION, glGetError());
+    glDeleteSamplers(2, &s);
+    glGetIntegerv(g.SAMPLER_BINDING, @ptrCast(&v));
+    try E(@as(i32, 0), v);
+    try E(g.FALSE, glIsSampler(s[0]));
+    try E(g.NO_ERROR, glGetError());
 }

@@ -16,6 +16,8 @@
 //! - raster: the draw pipeline (vertices, setup, tiles) as KIR kernels;
 //! - glsl: the GLSL ES compiler (preprocessor, parser, checker);
 //! - program: GL's shader and program objects, links and uniforms;
+//! - texture: texture reads in KIR (fetch, filters, wraps, sizes);
+//! - texfmt: GL's texture formats as stored, and their uploads;
 //! - libgalaxy_gl.sig and libgles.sig (the shared library's root, not
 //!   imported here): the C entry points.
 //!
@@ -32,6 +34,8 @@ pub const dl = @import("dl.sig");
 pub const host = @import("host.sig");
 pub const raster = @import("raster.sig");
 pub const program = @import("program.sig");
+pub const texture = @import("texture.sig");
+pub const texfmt = @import("texfmt.sig");
 pub const glsl = @import("glsl/glsl.sig");
 
 test {
@@ -41,6 +45,8 @@ test {
     _ = thread;
     _ = dl;
     _ = program;
+    _ = texture;
+    _ = texfmt;
     _ = glsl;
     _ = glsl.lex;
     _ = glsl.pp;

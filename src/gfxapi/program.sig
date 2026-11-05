@@ -27,6 +27,7 @@ const gles = @import("gles.sig");
 const g = @import("glenum.sig");
 const engine = @import("engine.sig");
 const raster = @import("raster.sig");
+const texture = @import("texture.sig");
 pub const glsl = @import("glsl/glsl.sig");
 const kir = gpu.kir;
 const Context = gles.Context;
@@ -90,6 +91,16 @@ pub const Uniform = struct {
 };
 
 pub const Varying = struct { name: Name, ty: Type, flat: bool, word: u32 };
+
+/// A sampler (an element of a sampler uniform): its word (the unit's
+/// number), the target its unit's texture is bound to, what it returns.
+pub const Slot = struct {
+    word: u32,
+    external: bool,
+    kind: texture.Kind,
+    /// a cube, 3D, array or shadow sampler: reads 0 (not yet)
+    unsupported: bool = false,
+};
 pub const Output = struct { name: Name, ty: Type, loc: u32 };
 
 /// A link's result: the program's interface and its uniforms' values.
@@ -115,6 +126,10 @@ pub const Linked = struct {
     nnames: usize = 0,
     values: [UNIFORM_WORDS]u32 = undefined,
     nwords: u32 = 0,
+    /// the samplers: texture slot i reads its unit's texture (the draw's
+    /// binding i, its descriptor at nwords + i * DESC_WORDS)
+    slots: [texture.MAX_TEX]Slot = undefined,
+    nslots: usize = 0,
 
     pub fn name(l: *const Linked, n: Name) []const u8 {
         return l.names[n.at..][0..n.len];
@@ -567,6 +582,7 @@ pub fn createProgram(c: *Context) u32 {
     p.out.noutputs = 0;
     p.out.nnames = 0;
     p.out.nwords = 0;
+    p.out.nslots = 0;
     return name;
 }
 
@@ -800,6 +816,7 @@ fn link(p: *Program, log: *glsl.pp.Log) bool {
     if (!linkVaryings(l, vs, fs, log)) return false;
     if (!linkUniforms(l, vs, fs, log)) return false;
     if (!linkOutputs(l, fs, log)) return false;
+    if (!linkSlots(l, log)) return false;
     @memset(l.values[0..l.nwords], 0);
     // the sources kept, the code checked, the pipeline made
     p.vs_src = poolDup(&objs[p.vs - 1].source) orelse return outOfPool(log);
@@ -812,7 +829,7 @@ fn link(p: *Program, log: *glsl.pp.Log) bool {
         if (!v.flat) continue;
         for (0..wordsOf(v.ty)) |w| flat |= @as(u64, 1) << @intCast(v.word + w);
     }
-    p.pipe = raster.Pipeline.init(.{ .ctx = p, .attrs = @intCast(attrs), .varyings = @intCast(l.vary_words), .flat = flat, .vertex = emitVertex, .fragment = emitFragment });
+    p.pipe = raster.Pipeline.init(.{ .ctx = p, .attrs = @intCast(attrs), .varyings = @intCast(l.vary_words), .flat = flat, .textures = @intCast(l.nslots), .vertex = emitVertex, .fragment = emitFragment });
     p.has_pipe = true;
     return true;
 }
@@ -859,8 +876,42 @@ fn layOutput(ctx: *const anyopaque, name: []const u8) ?u32 {
     return null;
 }
 
+fn laySampler(ctx: *const anyopaque, word: u32) ?u32 {
+    const l = &@as(*const Program, @ptrCast(@alignCast(ctx))).out;
+    for (l.slots[0..l.nslots], 0..) |s, i| {
+        if (s.word == word) return @intCast(i);
+    }
+    return null;
+}
+
 fn layoutOf(p: *const Program) glsl.gen.Layout {
-    return .{ .ctx = p, .attrib = layAttrib, .uniform = layUniform, .varying = layVarying, .output = layOutput };
+    return .{ .ctx = p, .attrib = layAttrib, .uniform = layUniform, .varying = layVarying, .output = layOutput, .sampler = laySampler, .desc_base = p.out.nwords };
+}
+
+/// A texture slot for each sampler the program uses (an array's each
+/// element).
+fn linkSlots(l: *Linked, log: *glsl.pp.Log) bool {
+    l.nslots = 0;
+    for (l.uniforms[0..l.nuniforms]) |un| {
+        const t = un.ty.elem();
+        if (!t.sampler()) continue;
+        const kind: texture.Kind = switch (t.base) {
+            .isampler2D, .isampler3D, .isamplerCube, .isampler2DArray => .int,
+            .usampler2D, .usampler3D, .usamplerCube, .usampler2DArray => .uint,
+            else => .float,
+        };
+        const supported = t.base == .sampler2D or t.base == .isampler2D or t.base == .usampler2D or t.base == .samplerExternalOES;
+        const n: u32 = if (un.ty.array != 0) un.ty.array else 1;
+        for (0..n) |e| {
+            if (l.nslots == texture.MAX_TEX) {
+                log.err(0, "too many samplers ({d} at most)", .{texture.MAX_TEX});
+                return false;
+            }
+            l.slots[l.nslots] = .{ .word = un.word + @as(u32, @intCast(e)), .external = t.base == .samplerExternalOES, .kind = kind, .unsupported = !supported };
+            l.nslots += 1;
+        }
+    }
+    return true;
 }
 
 /// The vertex shader's code in a draw's vertex kernel (the engine builds
@@ -897,6 +948,8 @@ fn checkCode(p: *const Program, log: *glsl.pp.Log) bool {
     {
         var k = kir.Kernel.init(st, "glsl_vertex", .{ raster.VERTEX_GROUP, 1, 1 });
         var io = raster.VertexIO{ .uniforms = k.binding() };
+        io.textures = k.bindings;
+        for (0..p.out.nslots) |_| _ = k.binding();
         for (&io.attr) |*a| {
             for (a) |*c| c.* = k.reg(.u32);
         }
@@ -912,6 +965,8 @@ fn checkCode(p: *const Program, log: *glsl.pp.Log) bool {
     {
         var k = kir.Kernel.init(st, "glsl_fragment", .{ raster.TILE, raster.TILE, 1 });
         var io = raster.FragmentIO{ .uniforms = k.binding() };
+        io.textures = k.bindings;
+        for (0..p.out.nslots) |_| _ = k.binding();
         for (&io.varying) |*v| v.* = k.reg(.f32);
         for (&io.frag_coord) |*v| v.* = k.reg(.f32);
         io.front_facing = k.reg(.pred);
@@ -930,7 +985,7 @@ fn codeFailed(log: *glsl.pp.Log, what: []const u8, why: []const u8) bool {
     return false;
 }
 
-pub const DrawState = struct { pipe: *raster.Pipeline, uniforms: []const u32 };
+pub const DrawState = struct { pipe: *raster.Pipeline, uniforms: []const u32, slots: []const Slot };
 
 /// What a draw with the program in use runs: its pipeline and uniforms.
 pub fn drawState(c: *Context) ?DrawState {
@@ -942,7 +997,7 @@ pub fn drawState(c: *Context) ?DrawState {
     const p = &progs[o.prog];
     if (!p.has_pipe) return null;
     if (p.eng == null) p.eng = c.eng;
-    return .{ .pipe = &p.pipe, .uniforms = p.out.values[0..p.out.nwords] };
+    return .{ .pipe = &p.pipe, .uniforms = p.out.values[0..p.out.nwords], .slots = p.out.slots[0..p.out.nslots] };
 }
 
 fn linkAttribs(p: *Program, vs: *const glsl.Iface, log: *glsl.pp.Log) bool {

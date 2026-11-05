@@ -13,6 +13,8 @@ Unmodified Firefox and Chromium (Alpine's and Flatpak's) are the first targets. 
 | `gles.sig` | OpenGL ES 3.0's objects and state: what the C entry points call. |
 | `raster.sig` | Drawing: GL's draws as three KIR kernels (vertices, triangle setup, tiles), the same on every GPU and on the CPU. |
 | `glenum.sig` | GL's enum values. |
+| `texture.sig` | Texture reads in KIR: `texelFetch`, sampled reads (nearest or bilinear; repeat, clamp, mirrored repeat), `textureSize`, one code for every format. |
+| `texfmt.sig` | GL ES's texture formats as the engine stores them: each upload GL allows, its conversion and its swizzle. |
 | `program.sig` | GL's shader and program objects: sources, compiles and their logs, links, attribute and uniform locations, uniform values. |
 | `glsl/` | The GLSL ES compiler: `lex.sig` (tokens, keywords by version), `pp.sig` (the preprocessor), `parse.sig` (the AST), `sema.sig` (types, scopes, built-ins, ES's rules), `glsl.sig` (a compile, its log and its interface), `gen.sig` (a checked shader as KIR, inside the draw kernels). |
 | `egl.sig` | EGL 1.5 for OpenGL ES: displays, configs, contexts with share groups, window and pbuffer surfaces, swaps, fence syncs, errors per thread. |
@@ -38,7 +40,7 @@ Unmodified Firefox and Chromium (Alpine's and Flatpak's) are the first targets. 
 
 ### GLES
 
-Textures, buffers and renderbuffers live in an `Objects` table held by a share group's contexts. Framebuffer objects and vertex array objects belong to each context. Every table is fixed, in memory the caller owns.
+Textures, buffers, renderbuffers and sampler objects live in an `Objects` table held by a share group's contexts. Framebuffer objects and vertex array objects belong to each context. Every table is fixed, in memory the caller owns.
 
 ### Draws
 
@@ -96,7 +98,29 @@ A link keeps copies of its shaders' sources and makes the program's pipeline. It
 - **`discard`** drops the fragment (the raster's discard pred). In main it also returns.
 - **Integer division** is exact: shifts for powers of two, else 32 steps of long division.
 - **Built-ins:** every one of the checker's. Approximate ones use KIR's approximate ops: `sin`, `cos`, `exp2`, `log2`, `inversesqrt`, `normalize`, and what is built of them. `atan` is a polynomial with an error of about 1e-5. `sqrt`, `length` and divisions are exact. Half floats are packed in integer arithmetic, exactly.
-- **Not yet:** texture sampling (a texture reads 0, stage 5d), derivatives (0: the raster has no helper pixels yet), `gl_FragDepth`, `gl_PointSize`, and color attachments past the first.
+- **Samplers** are their texture slots, as immediates, so they pass to functions as values. A texture function reads its slot through `texture.sig`.
+- **Divisions:** `/` by a power of two is a multiplication, which gives the same result. Each other division is KIR's exact `fdiv`. On ir3 its expansion's temporaries stay live through the raster's triangle loop, so a fragment shader affords about 35 of them.
+- **Not yet:** cube, 3D, array and shadow samplers (they read 0), a sampler chosen at run time, derivatives (0: the raster has no helper pixels yet), `gl_FragDepth`, `gl_PointSize`, and color attachments past the first.
+
+### Textures
+
+- **Formats.** A texture's image is in one of the engine's formats. Draws write RGBA8 and BGRA8. Draws only read the sampling formats: R8, RG8, f32, i32 and u32 with 1, 2 or 4 channels. `texfmt.sig` maps every upload GL ES 3.0 takes to them:
+  - the sized formats (RGBA8, SRGB8_ALPHA8, RGB8, RGB565, RGBA4, RGB5_A1, R8, RG8, the 16F and 32F ones, and the 8-, 16- and 32-bit integer ones);
+  - ES 2.0's unsized ones, LUMINANCE, ALPHA and LUMINANCE_ALPHA included;
+  - `OES_texture_float` and `_half_float`, and BGRA.
+
+  RGB is widened with alpha 1. The packed 16-bit formats are unpacked to bytes, half floats widened to f32, and 8- and 16-bit integers to 32 bits. LUMINANCE and ALPHA are R8 and RG8 with a swizzle. Unpack alignment, row length and skips work for any texel size, from client memory or an unpack buffer.
+- **Levels.** Uploads to mipmap levels past 0 are taken and not stored, and `glGenerateMipmap` stores nothing. Draws read level 0 with the magnification filter.
+- **Sampler objects.** `glGenSamplers` and the rest, bound per unit. A bound sampler object's filters, wraps, LOD range and compare mode replace its unit's texture's.
+- **In a draw.** Each sampler of the program (each element of a sampler array) is a texture slot, up to 16, read by both stages. The draw binds the slot's unit's texture image after each kernel's own buffers. It writes the slot's descriptor after the uniforms: size, row stride, format (texel bytes, kind, channels, sRGB), a swizzle, the wraps and the filter. The swizzle composes BGRA's byte order, the format's (LUMINANCE ...) and `TEXTURE_SWIZZLE_*`.
+- **The read** (`texture.sig`) is one code for every format, so a program's code doesn't depend on what is bound to its samplers:
+  - A texel is up to four aligned words, each clamped inside the image, so no read goes past it. Its channels are taken as the descriptor says, missing ones 0, 0, 0, 1.
+  - Unorm bytes are multiplied by 1/255. sRGB is decoded before filtering.
+  - Wraps are computed exactly in float: an approximate reciprocal, corrected. Bilinear filtering blends the four texels with exact operations; nearest takes the texel itself.
+  - Integer samplers read nearest. A unit with no complete texture reads (0, 0, 0, 1).
+
+  Every operation but sRGB's is one KIR defines bit for bit, so a sample is the same bytes on every GPU and on the CPU.
+- **Not yet:** mipmaps, cube, 3D and array textures, depth textures and shadow comparisons, compressed formats, RGB10_A2, R11F_G11F_B10F and RGB9_E5, norm16. Render targets other than RGBA8 and BGRA8 (WebRender's R8 masks) come with stage 5e. Every float sample reads four texels, nearest ones too, and loads four words a texel. A sampler's code specialized to its texture's format and filter is for later.
 
 Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
 
@@ -128,13 +152,13 @@ Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
 
 ### The C ABI
 
-The library is `libgalaxy-gl.so`, with 58 `egl*` and 187 `gl*` entry points. It is packaged as `libEGL.so.1` and `libGLESv2.so.2`, both links to the one file. The dynamic linker loads a file once, whatever name finds it, so EGL and GL share their state.
+The library is `libgalaxy-gl.so`, with 58 `egl*` and 198 `gl*` entry points. It is packaged as `libEGL.so.1` and `libGLESv2.so.2`, both links to the one file. The dynamic linker loads a file once, whatever name finds it, so EGL and GL share their state.
 
 Each context is current per thread. The current context is kept in a fixed table keyed by the thread pointer (`TPIDR_EL0` on AArch64, `%fs:0` on x86-64), so the library needs no thread-local storage and no C library.
 
 The library's panic handler prints one line and exits, as a failed assertion in a C driver does. It needs neither TLS nor a stack walk. EGL's tables, and the render node's, are filled at first use, so they take no room in the file.
 
-As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library has no `DT_NEEDED` entries and no TLS segment. Its only undefined symbols are the weak `dlsym` and `dl_iterate_phdr`, which the dynamic linker binds from the program's C library. It is 1293 KB on aarch64 and 1321 KB on x86_64: the CPU fallback carries KIR's interpreter and the draw kernels' builders, and the GLSL compiler adds about 310 KB. Its tables (EGL's, the engine's kernel space, the compile scratch, the code generator's, the text pool, the programs) are bss, about 48 MB of address space, touched only as used.
+As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library has no `DT_NEEDED` entries and no TLS segment. Its only undefined symbols are the weak `dlsym` and `dl_iterate_phdr`, which the dynamic linker binds from the program's C library. It is 1324 KB on aarch64 and 1370 KB on x86_64: the CPU fallback carries KIR's interpreter and the draw kernels' builders, and the GLSL compiler adds about 310 KB. Its tables (EGL's, the engine's kernel space, the compile scratch, the code generator's, the text pool, the programs) are bss, about 49 MB of address space, touched only as used.
 
 ## What is done
 
@@ -175,15 +199,16 @@ That makes 187 GL entry points.
 
 **Stage 5c, GLSL to KIR:** the code generator above; draws run the program in use, its uniforms and attributes as linked; 60 scalar varyings, flat ones bit-exact; kernels of up to 65536 KIR instructions.
 
+**Stage 5d, textures:** the formats, uploads, reads and sampler objects above. Both stages read textures, so vertex texture fetch works too. There are 11 new GL entry points (sampler objects, `glGenerateMipmap`), 198 in all.
+
 **Not yet:**
-- texture sampling and samplers (a texture reads 0), derivatives, uniform blocks, transform feedback, queries, GL sync objects;
+- derivatives, uniform blocks, transform feedback, queries, GL sync objects;
 - points and lines;
 - clipping: a triangle with a vertex at w ≤ 0, or past a guard band of 24576 pixels, is dropped;
 - stencil tests, several color attachments, depth-only drawing;
 - half-float and packed attribute formats, divisors past 1, attribute arrays in client memory;
 - binning triangles to tiles, which every tile now visits in turn;
-- texture levels above 0;
-- other texture targets and formats;
+- texture levels above 0, other texture targets, the texture formats listed under Textures;
 - multisampling;
 - EGLImages of GL textures (`EGL_KHR_gl_texture_2D_image`) and dma-buf export (`EGL_MESA_image_dma_buf_export`), with `libgbm` (stage 7);
 - multi-plane and YUV dma-bufs;
@@ -197,6 +222,13 @@ sig build test-gfxapi
 ```
 
 - `test-gfxapi-module`: the engine and the pool on the CPU; float-to-unorm conversion (rounding to nearest even, as Mesa does); the render-node client against `node.Fake`, Galaxy's calls over the emulated Adreno, covering buffers, cache upkeep, import, export, a hang and a missing GPU.
+- `test-gfxapi-tex`: textures sampled by a GLSL program, a quad a case, on the CPU, on `EmuDevice` and on the emulated Adreno (ir3). Each run gives the same bytes and the texels GL says. The cases:
+  - reads: nearest, bilinear clamped at the edge, repeat, mirrored repeat;
+  - formats: LUMINANCE and ALPHA, BGRA, RGB565 with a `TEXTURE_SWIZZLE`, an RGBA32F `texelFetch`, an RGBA32I integer texture;
+  - `textureSize`, a unit with no texture, a sampler object's filter over its texture's;
+  - a quad whose corners its vertex shader fetches from a float texture.
+
+  The cases are drawn in two halves, each on a fresh device: the emulated Adreno's memory is 64 buffers, never freed.
 - `test-gfxapi-glsl`: three GLSL programs compiled, linked and drawn through GL's shader and program objects, on the CPU, on `EmuDevice` and on the emulated Adreno (ir3). Each run gives the same bytes and the pixels GLSL says.
   - A 3.00 program: a mat4 uniform times a vec4; a uniform array indexed by `gl_VertexID / 3`; `gl_Position.xy +=`; a flat int varying; a struct uniform array read in a loop with an early return; a switch with a default; a local array indexed by a varying; out parameters; `for`, `do` and `while` with `continue` and `break`; `%` by 7; `discard`; `?:`, `mix`, `step` and `clamp`.
   - A 1.00 program as WebGL 1 writes it: attribute, varying, `gl_FragColor`, a bool uniform, a return from main.
@@ -242,8 +274,8 @@ sig build test-gfxapi
 | 5a | Done: draws. Vertex arrays, the three draw kernels (vertices, setup, tiles), exact coverage, depth, blending, culling, instancing; the same bytes on every GPU and the CPU | zpm |
 | 5b | Done: the GLSL ES 1.00 and 3.00 front end (the preprocessor, parser, types and built-ins); shader and program objects, linking, uniforms and attributes by name | zpm |
 | 5c | Done: GLSL to KIR, the vertex and fragment code draws run; the same bytes on the CPU and the emulated Adreno | zpm |
-| 5d | Texture sampling (filters, wraps, the formats WebRender uses: R8, RG8, RGBA16F, RGBA32F, ...), samplers; triangles binned to tiles | zpm |
-| 5e | What WebRender asks beyond that, until Firefox's WebRender draws on the GPU | zpm |
+| 5d | Done: textures. GL ES 3.0's formats (R8, RG8, the float and integer ones, the legacy ones), sampled reads (nearest, bilinear, every wrap), `texelFetch`, sampler objects, in both stages; the same bytes on the CPU and the emulated Adreno | zpm |
+| 5e | Triangles binned to tiles; render targets in R8 (WebRender's masks); helper pixels for derivatives; then what WebRender asks beyond that, until Firefox's WebRender draws on the GPU | zpm |
 | 6 | Chromium through ANGLE on GLES | zpm |
 | 7 | `libgbm.so.1` | zpm |
 | 8 | Packaging: the libraries in Galaxy's root under Mesa's names; `mesa-*` provided by Galaxy; a Flatpak GL extension | Galaxy |

@@ -33,14 +33,18 @@
 //!   also returns.
 //! - Integer division is exact: shifts for powers of two, else 32 steps
 //!   of long division.
-//! - Not yet: texture sampling (a texture reads 0: stage 5d), derivatives
-//!   (0), gl_FragDepth, gl_PointSize.
+//! - Samplers are their texture slots (immediates, so passed to functions
+//!   as values); a texture function reads the slot's binding through its
+//!   descriptor (texture.sig).
+//! - Not yet: cube, 3D, array and shadow samplers (they read 0), a sampler
+//!   chosen at run time, derivatives (0), gl_FragDepth, gl_PointSize.
 //!
 //! Allocation-free: its tables are the Scratch's (Store).
 
 const std = @import("std");
 const gpu = @import("gpu");
 const raster = @import("../raster.sig");
+const texture = @import("../texture.sig");
 const glsl = @import("glsl.sig");
 const lex = @import("lex.sig");
 const pp = @import("pp.sig");
@@ -75,7 +79,14 @@ pub const Layout = struct {
     varying: *const fn (*const anyopaque, []const u8) ?u32,
     /// a fragment output's location
     output: *const fn (*const anyopaque, []const u8) ?u32,
+    /// a sampler's texture slot, by its uniform word
+    sampler: *const fn (*const anyopaque, u32) ?u32,
+    /// where the slots' descriptors start in the uniform binding
+    desc_base: u32,
 };
+
+/// A sampler the program has no slot for.
+const NO_SLOT: u32 = 0xffff;
 
 pub const MAX_COMPS = 1 << 18;
 pub const MAX_VARS = 4096;
@@ -153,6 +164,8 @@ const Gen = struct {
     log: *pp.Log,
     stage: sema.Stage,
     uni: u8,
+    /// the first texture's binding
+    texb: u8,
     ncomps: u32 = 0,
     nvars: u32 = 0,
     nglobals: u32 = 0,
@@ -200,6 +213,15 @@ const Gen = struct {
             ix -= n;
         }
         return .float;
+    }
+
+    fn hasSampler(g: *Gen, t: Type) bool {
+        if (t.sampler()) return true;
+        if (t.base != .structure) return false;
+        for (g.s.checker.structFields(t)) |fd| {
+            if (g.hasSampler(fd.ty)) return true;
+        }
+        return false;
     }
 
     fn hasArray(g: *Gen, t: Type) bool {
@@ -620,6 +642,12 @@ const Gen = struct {
                 else => null,
             };
             if (z) |v| return f(v);
+        }
+        // x / 2^k is x * 2^-k exactly (the same real number, rounded once)
+        if (op == .fdiv and b == .imm) {
+            const y: f32 = @bitCast(b.imm);
+            const e = (b.imm >> 23) & 0xff;
+            if (b.imm & 0x7f_ffff == 0 and e > 1 and e < 253 and y != 0) return r(g.k.op2(.fmul, .f32, a, f(1.0 / y)));
         }
         return r(g.k.op2(op, .f32, a, b));
     }
@@ -1462,9 +1490,8 @@ const Gen = struct {
             args[nargs] = g.expr(a);
             nargs += 1;
         }
+        if (std.meta.stringToEnum(TexFn, name)) |tf| return g.textureCall(nd, t, tf, args[0..nargs]);
         const which = std.meta.stringToEnum(Fn, name) orelse {
-            // the texture functions: no sampling until stage 5d (zeros)
-            if (std.mem.startsWith(u8, name, "texture") or std.mem.startsWith(u8, name, "texel")) return g.zeros(t);
             g.fail(nd.line, "`{s}` cannot be generated yet", .{name});
             return g.zeros(t);
         };
@@ -1726,6 +1753,117 @@ const Gen = struct {
             // (no helper pixels yet: the raster runs covered pixels only)
             .dFdx, .dFdy, .fwidth => for (0..n) |ix| g.put(at, @intCast(ix), f(0)),
         }
+        return out;
+    }
+
+    // ── Textures ───────────────────────────────────────────────────────────
+
+    const TexFn = enum {
+        texture,
+        textureProj,
+        textureLod,
+        textureOffset,
+        texelFetch,
+        texelFetchOffset,
+        textureProjOffset,
+        textureLodOffset,
+        textureProjLod,
+        textureProjLodOffset,
+        textureGrad,
+        textureGradOffset,
+        textureProjGrad,
+        textureProjGradOffset,
+        textureSize,
+        texture2D,
+        texture2DProj,
+        texture2DLod,
+        texture2DProjLod,
+        textureCube,
+        textureCubeLod,
+        texture2DLodEXT,
+        texture2DProjLodEXT,
+        textureCubeLodEXT,
+        texture2DGradEXT,
+        texture2DProjGradEXT,
+        textureCubeGradEXT,
+    };
+
+    /// A constant ivec2 argument (an offset): its two ints.
+    fn offsetOf(g: *Gen, v: Val) [2]i32 {
+        const a = g.rv(v);
+        var out: [2]i32 = .{ 0, 0 };
+        for (0..2) |ix| {
+            const x = g.cp(a.at, @intCast(ix));
+            if (x == .imm) out[ix] = @bitCast(x.imm);
+        }
+        return out;
+    }
+
+    fn textureCall(g: *Gen, nd: *Node, t: Type, which: TexFn, args: []Val) Val {
+        const n = g.size(t);
+        const at = g.alloc(n);
+        for (0..n) |ix| g.put(at, @intCast(ix), u(0));
+        const out = Val{ .ty = t, .at = at };
+        const sv = g.rv(args[0]);
+        const sa = g.cp(sv.at, 0);
+        if (sa != .imm) {
+            g.fail(nd.line, "a sampler chosen at run time cannot be generated yet", .{});
+            return out;
+        }
+        const slot = sa.imm;
+        const base = args[0].ty.base;
+        const kind: texture.Kind = switch (base) {
+            .isampler2D => .int,
+            .usampler2D => .uint,
+            else => .float,
+        };
+        // (cube, 3D, array and shadow samplers: not yet; zeros, and alpha 1)
+        const two_d = base == .sampler2D or base == .isampler2D or base == .usampler2D or base == .samplerExternalOES;
+        if (slot == NO_SLOT or !two_d) {
+            if (n == 4) g.put(at, 3, if (kind == .float) f(1) else u(1));
+            return out;
+        }
+        const ts = texture.Slot{ .b = g.texb + @as(u8, @intCast(slot)), .uni = g.uni, .word = g.lay.desc_base + slot * texture.DESC_WORDS };
+        const k = g.k;
+        var res: [4]Arg = undefined;
+        switch (which) {
+            .textureSize => {
+                const lod = if (args.len > 1) g.cp(g.rv(args[1]).at, 0) else u(0);
+                const sz = texture.size(k, ts, lod);
+                g.put(at, 0, sz[0]);
+                if (n > 1) g.put(at, 1, sz[1]);
+                return out;
+            },
+            .texelFetch, .texelFetchOffset => {
+                const p = g.rv(args[1]);
+                const off = if (which == .texelFetchOffset) g.offsetOf(args[3]) else [2]i32{ 0, 0 };
+                res = texture.fetch(k, ts, g.cp(p.at, 0), g.cp(p.at, 1), kind, off);
+            },
+            else => {
+                const p = g.rv(args[1]);
+                var s = g.cp(p.at, 0);
+                var tt = g.cp(p.at, 1);
+                const proj = switch (which) {
+                    .textureProj, .textureProjOffset, .textureProjLod, .textureProjLodOffset, .textureProjGrad, .textureProjGradOffset, .texture2DProj, .texture2DProjLod, .texture2DProjLodEXT, .texture2DProjGradEXT => true,
+                    else => false,
+                };
+                if (proj) {
+                    const q = g.cp(p.at, g.size(p.ty) - 1);
+                    s = g.fop2(.fdiv, s, q);
+                    tt = g.fop2(.fdiv, tt, q);
+                }
+                // the offset: after the coordinates, a lod, or two gradients
+                const off_at: ?usize = switch (which) {
+                    .textureOffset, .textureProjOffset => 2,
+                    .textureLodOffset, .textureProjLodOffset => 3,
+                    .textureGradOffset, .textureProjGradOffset => 4,
+                    else => null,
+                };
+                const off = if (off_at) |ix| (if (ix < args.len) g.offsetOf(args[ix]) else [2]i32{ 0, 0 }) else [2]i32{ 0, 0 };
+                res = texture.sample(k, ts, s, tt, kind, off);
+            },
+        }
+        for (0..@min(n, 4)) |ix| g.put(at, @intCast(ix), res[ix]);
         return out;
     }
 
@@ -2121,9 +2259,26 @@ fn globals(g: *Gen, vio: ?*raster.VertexIO, fio: ?*raster.FragmentIO, outs: *[64
             const q = vn.flags;
             if (q & Q.uniform != 0) {
                 const word = g.lay.uniform(g.lay.ctx, name) orelse {
-                    g.declare(.{ .name = name, .ty = t, .at = g.zeros(t).at, .ro = true });
+                    const z = g.zeros(t);
+                    // (an unused sampler: no slot)
+                    for (0..g.size(t)) |ix| {
+                        if (isSampler(g.baseAt(t, @intCast(ix)))) g.put(z.at, @intCast(ix), u(NO_SLOT));
+                    }
+                    g.declare(.{ .name = name, .ty = t, .at = z.at, .ro = true });
                     continue;
                 };
+                if (g.hasSampler(t)) {
+                    // samplers are their texture slots; the rest is loaded
+                    const n = g.size(t);
+                    const at = g.alloc(n);
+                    for (0..n) |ix| {
+                        const i_: u32 = @intCast(ix);
+                        const b = g.baseAt(t, i_);
+                        g.put(at, i_, if (isSampler(b)) u(g.lay.sampler(g.lay.ctx, word + i_) orelse NO_SLOT) else g.loadUni(b, word + i_, no));
+                    }
+                    g.declare(.{ .name = name, .ty = t, .at = at, .ro = true });
+                    continue;
+                }
                 const mem = Val{ .ty = t, .mem = true, .word = word };
                 if (g.size(t) <= PRELOAD_WORDS and !g.hasArray(t)) {
                     const loaded = g.rv(mem);
@@ -2184,9 +2339,9 @@ fn globals(g: *Gen, vio: ?*raster.VertexIO, fio: ?*raster.FragmentIO, outs: *[64
     return main;
 }
 
-fn begin(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, log: *pp.Log, stage: sema.Stage, uni: u8) Gen {
+fn begin(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, log: *pp.Log, stage: sema.Stage, uni: u8, texb: u8) Gen {
     @memset(&s.gen.mut, 0);
-    return .{ .s = s, .st = &s.gen, .k = k, .lay = lay, .log = log, .stage = stage, .uni = uni };
+    return .{ .s = s, .st = &s.gen, .k = k, .lay = lay, .log = log, .stage = stage, .uni = uni, .texb = texb };
 }
 
 /// A component as an f32 register (a register's bits, or an immediate's).
@@ -2209,7 +2364,7 @@ fn runMain(g: *Gen, main: u32) void {
 /// code: io's position and varyings set. False (the log says why) when it
 /// cannot be generated.
 pub fn vertex(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.VertexIO, log: *pp.Log) bool {
-    var g = begin(s, lay, k, log, .vertex, io.uniforms);
+    var g = begin(s, lay, k, log, .vertex, io.uniforms, io.textures);
     g.bind("gl_Position", sema.vecT(.float, 4), null, false);
     const pos_ix = g.nvars - 1;
     g.bind("gl_PointSize", FLOAT, null, false);
@@ -2238,7 +2393,7 @@ pub fn vertex(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.VertexI
 /// The fragment shader in the scratch (compiled) as the raster kernel's
 /// fragment code: io's color (location 0) and discard set.
 pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.FragmentIO, log: *pp.Log) bool {
-    var g = begin(s, lay, k, log, .fragment, io.uniforms);
+    var g = begin(s, lay, k, log, .fragment, io.uniforms, io.textures);
     const v4 = sema.vecT(.float, 4);
     g.declare(.{ .name = "gl_FragCoord", .ty = v4, .at = g.imms(v4, &.{ r(io.frag_coord[0]), r(io.frag_coord[1]), r(io.frag_coord[2]), r(io.frag_coord[3]) }).at, .ro = true });
     g.declare(.{ .name = "gl_FrontFacing", .ty = BOOL, .at = g.imms(BOOL, &.{if (io.front_facing == .none) u(1) else r(io.front_facing)}).at, .ro = true });

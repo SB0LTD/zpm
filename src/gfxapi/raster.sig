@@ -37,6 +37,7 @@
 const std = @import("std");
 const gpu = @import("gpu");
 const engine = @import("engine.sig");
+const texture = @import("texture.sig");
 const kir = gpu.kir;
 const V = kir.V;
 const Arg = kir.Arg;
@@ -75,6 +76,8 @@ pub const VertexIO = struct {
     instance_id: V = .none,
     /// the binding uniforms are loaded from (uniform(k, io.uniforms, word))
     uniforms: u8 = 0,
+    /// the first texture's binding (the pipeline's textures follow)
+    textures: u8 = 0,
     /// outputs: the clip-space position, the varyings (f32)
     position: [4]V = .{ .none, .none, .none, .none },
     varying: [MAX_VARYINGS]V = [_]V{.none} ** MAX_VARYINGS,
@@ -87,6 +90,7 @@ pub const FragmentIO = struct {
     /// gl_FrontFacing (a pred)
     front_facing: V = .none,
     uniforms: u8 = 0,
+    textures: u8 = 0,
     /// outputs: the color (f32, 0..1 for unorm targets), and a pred that
     /// drops the fragment (discard), if the shader sets one
     color: [4]V = .{ .none, .none, .none, .none },
@@ -101,6 +105,9 @@ pub const Shaders = struct {
     /// bit i: varying i is flat (the provoking vertex's, its bits kept:
     /// an integer's too), else smooth
     flat: u64 = 0,
+    /// textures both stages may read (texture.sig), bound after each
+    /// kernel's own buffers
+    textures: u8 = 0,
     vertex: *const fn (?*const anyopaque, *kir.Kernel, *VertexIO) void,
     fragment: *const fn (?*const anyopaque, *kir.Kernel, *FragmentIO) void,
 };
@@ -128,7 +135,7 @@ pub const Pipeline = struct {
     owner: ?*anyopaque = null,
 
     pub fn init(sh: Shaders) Pipeline {
-        std.debug.assert(sh.attrs <= MAX_ATTRS and sh.varyings <= MAX_VARYINGS);
+        std.debug.assert(sh.attrs <= MAX_ATTRS and sh.varyings <= MAX_VARYINGS and sh.textures <= texture.MAX_TEX);
         return .{ .shaders = sh, .vstride = VREC + sh.varyings, .sstride = SREC + 3 * @as(u32, sh.varyings) };
     }
 };
@@ -201,6 +208,8 @@ pub const Draw = struct {
     color: *engine.Image,
     depth: ?*engine.Image = null,
     attrs: [MAX_ATTRS]Attr = [_]Attr{.{}} ** MAX_ATTRS,
+    /// the pipeline's textures' images (null: none bound: reads 0, 0, 0, 1)
+    textures: [texture.MAX_TEX]?*engine.Image = [_]?*engine.Image{null} ** texture.MAX_TEX,
     /// the element array: its buffer, byte offset, index size (1, 2, 4)
     index: ?*engine.Image = null,
     index_offset: u32 = 0,
@@ -283,7 +292,7 @@ const F_NORM = 1 << 10;
 const F_INT = 1 << 11;
 
 /// bindings: 0 vertex records (written), 1 uniforms, 2 the element array,
-/// 3.. each attribute's buffer
+/// 3.. each attribute's buffer, then the textures
 pub fn vertexKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     var k = kir.Kernel.init(s, "gl_vertex", .{ VERTEX_GROUP, 1, 1 });
     const b_out = k.binding();
@@ -292,6 +301,8 @@ pub fn vertexKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     var b_attr: [MAX_ATTRS]u8 = undefined;
     for (&b_attr) |*b| b.* = k.binding();
     const sh = p.shaders;
+    const b_tex = k.bindings;
+    for (0..sh.textures) |_| _ = k.binding();
     const count = k.param(.u32, V_COUNT);
     const x = k.op3(.imad, .u32, r(k.gid(0)), u(VERTEX_GROUP), r(k.tid(0)));
     const inst = k.gid(1);
@@ -311,7 +322,7 @@ pub fn vertexKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
             k.set(v, .bfe, r(word), r(shift), r(k.op2(.shl, .u32, r(idx_size), u(3))));
         }
         k.endif();
-        var io = VertexIO{ .vertex_id = v, .instance_id = inst, .uniforms = b_uni };
+        var io = VertexIO{ .vertex_id = v, .instance_id = inst, .uniforms = b_uni, .textures = b_tex };
         for (0..sh.attrs) |a| io.attr[a] = fetch(&k, b_attr[a], @intCast(V_ATTR + a * V_ATTR_WORDS), v, inst);
         sh.vertex(sh.ctx, &k, &io);
         // clip space to window space
@@ -618,7 +629,7 @@ const R_DST_A = 44;
 pub const RASTER_PARAMS = 49;
 
 /// bindings: 0 color (written), 1 depth (written when on), 2 triangle
-/// records, 3 uniforms
+/// records, 3 uniforms, then the textures
 pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     var k = kir.Kernel.init(s, "gl_raster", .{ TILE, TILE, 1 });
     const b_c = k.binding();
@@ -626,6 +637,8 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     const b_t = k.binding();
     const b_uni = k.binding();
     const sh = p.shaders;
+    const b_tex = k.bindings;
+    for (0..sh.textures) |_| _ = k.binding();
     const lx = k.tid(0);
     const ly = k.tid(1);
     const tx0 = k.op3(.imad, .i32, r(k.gid(0)), u(TILE), r(k.param(.i32, R_RECT)));
@@ -761,7 +774,7 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
             {
                 const iw = plane(&k, b_t, base, S_W, dX, dY);
                 const wv = k.div(f(1), r(iw));
-                var io = FragmentIO{ .uniforms = b_uni };
+                var io = FragmentIO{ .uniforms = b_uni, .textures = b_tex };
                 for (0..sh.varyings) |j| {
                     const w0: u32 = @intCast(SREC + 3 * j);
                     // (flat: the provoking vertex's bits, untouched: an integer's too)

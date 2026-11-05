@@ -31,6 +31,8 @@ const std = @import("std");
 const engine = @import("engine.sig");
 const raster = @import("raster.sig");
 const program = @import("program.sig");
+const texture = @import("texture.sig");
+const texfmt = @import("texfmt.sig");
 const g = @import("glenum.sig");
 const Engine = engine.Engine;
 const Image = engine.Image;
@@ -46,6 +48,7 @@ pub const MAX_SIZE = 8192;
 pub const MAX_UNITS = 32;
 pub const MAX_COLOR = 4;
 pub const MAX_VAOS = 256;
+pub const MAX_SAMPLERS = 256;
 pub const MAX_ATTRS = raster.MAX_ATTRS;
 
 pub const VENDOR_STRING: [:0]const u8 = "Galaxy";
@@ -75,6 +78,20 @@ pub const TexParams = struct {
     wrap_r: u32 = g.REPEAT,
     base_level: i32 = 0,
     max_level: i32 = 1000,
+    min_lod: i32 = -1000,
+    max_lod: i32 = 1000,
+    compare_mode: u32 = g.NONE,
+    compare_func: u32 = g.LEQUAL,
+    /// TEXTURE_SWIZZLE_R, _G, _B, _A (a texture's, not a sampler's)
+    swizzle: [4]u32 = .{ g.RED, g.GREEN, g.BLUE, g.ALPHA },
+};
+
+/// A sampler object (glGenSamplers): filters and wraps in place of its
+/// unit's texture's.
+pub const Smp = struct {
+    named: bool = false,
+    made: bool = false,
+    params: TexParams = .{},
 };
 
 pub const Tex = struct {
@@ -89,6 +106,10 @@ pub const Tex = struct {
     levels: u32 = 0,
     immutable: bool = false,
     params: TexParams = .{},
+    /// GL's R, G, B, A as the stored texel's channels (LUMINANCE ...),
+    /// and sRGB
+    fswz: [4]u3 = .{ 0, 1, 2, 3 },
+    srgb: bool = false,
 };
 
 pub const Buf = struct {
@@ -115,6 +136,7 @@ pub const Objects = struct {
     tex: [MAX_TEXTURES]Tex = undefined,
     bufs: [MAX_BUFFERS]Buf = undefined,
     rbs: [MAX_RENDERBUFFERS]Rb = undefined,
+    samplers: [MAX_SAMPLERS]Smp = undefined,
     /// contexts holding it
     users: u32 = 0,
 
@@ -122,6 +144,7 @@ pub const Objects = struct {
         for (&o.tex) |*t| t.* = .{};
         for (&o.bufs) |*b| b.* = .{};
         for (&o.rbs) |*b| b.* = .{};
+        for (&o.samplers) |*s| s.* = .{};
         o.users = 0;
     }
 
@@ -177,19 +200,19 @@ const Store = struct {
     skip_images: i32 = 0,
 
     /// Bytes from one row to the next, and to the first pixel, of w
-    /// pixels of 4 bytes.
-    fn layout(s: Store, w: u32) struct { row: usize, first: usize } {
+    /// pixels of `bpp` bytes.
+    fn layout(s: Store, w: u32, bpp: u32) struct { row: usize, first: usize } {
         const len: usize = if (s.row_length > 0) @intCast(s.row_length) else w;
         const a: usize = @intCast(s.alignment);
-        const row = std.mem.alignForward(usize, len * 4, a);
-        return .{ .row = row, .first = @as(usize, @intCast(s.skip_rows)) * row + @as(usize, @intCast(s.skip_pixels)) * 4 };
+        const row = std.mem.alignForward(usize, len * bpp, a);
+        return .{ .row = row, .first = @as(usize, @intCast(s.skip_rows)) * row + @as(usize, @intCast(s.skip_pixels)) * bpp };
     }
 };
 
-/// Bytes a w x h rectangle spans in client memory.
-fn spanOf(first: usize, row: usize, w: u32, h: u32) usize {
+/// Bytes a w x h rectangle of `bpp`-byte pixels spans in client memory.
+fn spanOf(first: usize, row: usize, w: u32, h: u32, bpp: u32) usize {
     if (w == 0 or h == 0) return 0;
-    return first + (@as(usize, h) - 1) * row + @as(usize, w) * 4;
+    return first + (@as(usize, h) - 1) * row + @as(usize, w) * bpp;
 }
 
 /// A vertex attribute's array (glVertexAttribPointer).
@@ -266,7 +289,7 @@ fn packColor(fmt: Format, c: [4]f32) u32 {
     return switch (fmt) {
         .rgba8 => r | gr << 8 | b << 16 | a << 24,
         .bgra8 => b | gr << 8 | r << 16 | a << 24,
-        .d24s8 => unreachable,
+        else => unreachable,
     };
 }
 
@@ -275,7 +298,7 @@ fn colorKeep(fmt: Format, m: [4]bool) u32 {
     const chan = switch (fmt) {
         .rgba8 => [4]u5{ 0, 8, 16, 24 },
         .bgra8 => [4]u5{ 16, 8, 0, 24 },
-        .d24s8 => unreachable,
+        else => unreachable,
     };
     var keep: u32 = 0;
     for (m, chan) |on, sh| {
@@ -366,6 +389,83 @@ fn makeIn(comptime T: type, table: []T, name: u32) ?*T {
     return t;
 }
 
+/// Sets a texture's or a sampler object's parameter; GL's error, or
+/// NO_ERROR. (External textures filter without mipmaps and clamp; the
+/// swizzle and the levels are a texture's.)
+fn setParam(p: *TexParams, ext: bool, sampler: bool, pname: u32, param: i32) u32 {
+    const v: u32 = @bitCast(param);
+    const filter_min = switch (v) {
+        g.NEAREST, g.LINEAR, g.NEAREST_MIPMAP_NEAREST, g.LINEAR_MIPMAP_NEAREST, g.NEAREST_MIPMAP_LINEAR, g.LINEAR_MIPMAP_LINEAR => true,
+        else => false,
+    };
+    const wrap = v == g.CLAMP_TO_EDGE or (!ext and (v == g.REPEAT or v == g.MIRRORED_REPEAT));
+    const chan = v == g.RED or v == g.GREEN or v == g.BLUE or v == g.ALPHA or v == g.ZERO or v == g.ONE;
+    const func = v >= g.NEVER and v <= g.NEVER + 7;
+    switch (pname) {
+        g.TEXTURE_MIN_FILTER => if (filter_min and (!ext or v == g.NEAREST or v == g.LINEAR)) {
+            p.min = v;
+        } else return g.INVALID_ENUM,
+        g.TEXTURE_MAG_FILTER => if (v == g.NEAREST or v == g.LINEAR) {
+            p.mag = v;
+        } else return g.INVALID_ENUM,
+        g.TEXTURE_WRAP_S => if (wrap) {
+            p.wrap_s = v;
+        } else return g.INVALID_ENUM,
+        g.TEXTURE_WRAP_T => if (wrap) {
+            p.wrap_t = v;
+        } else return g.INVALID_ENUM,
+        g.TEXTURE_WRAP_R => if (wrap) {
+            p.wrap_r = v;
+        } else return g.INVALID_ENUM,
+        g.TEXTURE_MIN_LOD => p.min_lod = param,
+        g.TEXTURE_MAX_LOD => p.max_lod = param,
+        g.TEXTURE_COMPARE_MODE => if (v == g.NONE or v == g.COMPARE_REF_TO_TEXTURE) {
+            p.compare_mode = v;
+        } else return g.INVALID_ENUM,
+        g.TEXTURE_COMPARE_FUNC => if (func) {
+            p.compare_func = v;
+        } else return g.INVALID_ENUM,
+        g.TEXTURE_BASE_LEVEL => if (sampler) return g.INVALID_ENUM else if (param >= 0) {
+            p.base_level = param;
+        } else return g.INVALID_VALUE,
+        g.TEXTURE_MAX_LEVEL => if (sampler) return g.INVALID_ENUM else if (param >= 0) {
+            p.max_level = param;
+        } else return g.INVALID_VALUE,
+        g.TEXTURE_SWIZZLE_R, g.TEXTURE_SWIZZLE_G, g.TEXTURE_SWIZZLE_B, g.TEXTURE_SWIZZLE_A => if (sampler) return g.INVALID_ENUM else if (chan) {
+            p.swizzle[pname - g.TEXTURE_SWIZZLE_R] = v;
+        } else return g.INVALID_ENUM,
+        else => return g.INVALID_ENUM,
+    }
+    return g.NO_ERROR;
+}
+
+fn getParam(p: *const TexParams, sampler: bool, pname: u32) ?i32 {
+    const v: u32 = switch (pname) {
+        g.TEXTURE_MIN_FILTER => p.min,
+        g.TEXTURE_MAG_FILTER => p.mag,
+        g.TEXTURE_WRAP_S => p.wrap_s,
+        g.TEXTURE_WRAP_T => p.wrap_t,
+        g.TEXTURE_WRAP_R => p.wrap_r,
+        g.TEXTURE_MIN_LOD => @bitCast(p.min_lod),
+        g.TEXTURE_MAX_LOD => @bitCast(p.max_lod),
+        g.TEXTURE_COMPARE_MODE => p.compare_mode,
+        g.TEXTURE_COMPARE_FUNC => p.compare_func,
+        g.TEXTURE_BASE_LEVEL => if (sampler) return null else @bitCast(p.base_level),
+        g.TEXTURE_MAX_LEVEL => if (sampler) return null else @bitCast(p.max_level),
+        g.TEXTURE_SWIZZLE_R, g.TEXTURE_SWIZZLE_G, g.TEXTURE_SWIZZLE_B, g.TEXTURE_SWIZZLE_A => if (sampler) return null else p.swizzle[pname - g.TEXTURE_SWIZZLE_R],
+        else => return null,
+    };
+    return @bitCast(v);
+}
+
+fn wrapOf(w: u32) texture.Wrap {
+    return switch (w) {
+        g.CLAMP_TO_EDGE => .clamp,
+        g.MIRRORED_REPEAT => .mirror,
+        else => .repeat,
+    };
+}
+
 pub const Context = struct {
     eng: *Engine,
     objs: *Objects,
@@ -427,6 +527,10 @@ pub const Context = struct {
     uniforms: []const u32 = &.{},
     /// glUseProgram's (program.sig): while one is in use, draws run it
     program: u32 = 0,
+    /// each unit's sampler object (0: its textures' own state)
+    smp: [MAX_UNITS]u32 = [_]u32{0} ** MAX_UNITS,
+    /// a draw's uniforms: the program's, then its textures' descriptors
+    draw_words: [program.UNIFORM_WORDS + texture.MAX_TEX * texture.DESC_WORDS]u32 = undefined,
     /// EGL's check of the default framebuffer (a window resized: a back
     /// buffer of its new size), before an operation reaches it
     revalidate: ?Revalidate = null,
@@ -675,6 +779,7 @@ pub const Context = struct {
             g.RENDERBUFFER_BINDING => int(c.rb),
             g.TEXTURE_BINDING_2D => int(c.tex2d[c.unit]),
             g.TEXTURE_BINDING_EXTERNAL_OES => int(c.tex_ext[c.unit]),
+            g.SAMPLER_BINDING => int(c.smp[c.unit]),
             g.REQUIRED_TEXTURE_IMAGE_UNITS_OES => int(1),
             g.ACTIVE_TEXTURE => int(g.TEXTURE0 + c.unit),
             g.ARRAY_BUFFER_BINDING => int(c.bufs.array),
@@ -1005,8 +1110,8 @@ pub const Context = struct {
         const src = v.read orelse return c.fail(g.INVALID_OPERATION);
         const uw: u32 = @intCast(w);
         const uh: u32 = @intCast(h);
-        const l = c.pack.layout(uw);
-        const span = spanOf(l.first, l.row, uw, uh);
+        const l = c.pack.layout(uw, 4);
+        const span = spanOf(l.first, l.row, uw, uh, 4);
         if (span == 0) return;
         var pbo: ?*Buf = null;
         const dst: []u8 = if (c.bufs.pack != 0) blk: {
@@ -1096,6 +1201,8 @@ pub const Context = struct {
         t.img = engine.alias(src);
         t.internal = if (src.format == .bgra8) g.BGRA8_EXT else g.RGBA8;
         t.levels = 1;
+        t.fswz = .{ 0, 1, 2, 3 };
+        t.srgb = false;
     }
 
     /// glEGLImageTargetRenderbufferStorageOES.
@@ -1157,9 +1264,9 @@ pub const Context = struct {
     /// The pixels a texture upload reads: client memory, or the unpack
     /// buffer's at the offset `pixels` gives. Null with nothing to read
     /// (no pointer), or after an error.
-    fn unpackSource(c: *Context, pixels: ?*const anyopaque, w: u32, h: u32) ?struct { bytes: []const u8, row: usize } {
-        const l = c.unpack.layout(w);
-        const span = spanOf(l.first, l.row, w, h);
+    fn unpackSource(c: *Context, pixels: ?*const anyopaque, w: u32, h: u32, bpp: u32) ?struct { bytes: []const u8, row: usize } {
+        const l = c.unpack.layout(w, bpp);
+        const span = spanOf(l.first, l.row, w, h, bpp);
         if (span == 0) return null;
         if (c.bufs.unpack != 0) {
             const b = madeIn(Buf, &c.objs.bufs, c.bufs.unpack) orelse {
@@ -1178,115 +1285,168 @@ pub const Context = struct {
         return .{ .bytes = @as([*]const u8, @ptrCast(p))[l.first..span], .row = l.row };
     }
 
+    /// Rows of client texels into img at (x, y), converted as `up` says.
+    fn uploadRows(c: *Context, img: *Image, up: texfmt.Upload, x: u32, y: u32, w: u32, h: u32, src: []const u8, row: usize) void {
+        const bpp: usize = img.format.bytes();
+        for (0..h) |j| {
+            const mrow = img.rowOf(y + @as(u32, @intCast(j)));
+            const off = @as(usize, mrow) * img.stride + @as(usize, x) * bpp;
+            const len = @as(usize, w) * bpp;
+            const dst = c.eng.hostView(img, off, len);
+            texfmt.convert(up, src[j * row ..], dst, w);
+            c.eng.wrote(img, off, len);
+        }
+    }
+
+    /// glTexImage2D. Levels past 0 are taken and not stored (draws read
+    /// level 0).
     pub fn texImage2D(c: *Context, target: u32, level: i32, internal: i32, w: i32, h: i32, border: i32, format: u32, ty: u32, pixels: ?*const anyopaque) void {
         const t = c.boundTex2D(target) orelse return;
         if (level < 0 or w < 0 or h < 0 or w > MAX_SIZE or h > MAX_SIZE or border != 0) return c.fail(g.INVALID_VALUE);
-        // (level 0 only, for now: mipmaps come with sampling)
-        if (level > 0) return c.fail(g.INVALID_VALUE);
-        const fmt = switch (clientFormat(format, ty)) {
-            .ok => |f| f,
+        const ifmt: u32 = @bitCast(internal);
+        const up = switch (texfmt.upload(ifmt, format, ty)) {
+            .ok => |x| x,
             .err => |e| return c.fail(e),
         };
-        const ifmt: u32 = @bitCast(internal);
-        const fits = switch (fmt) {
-            .rgba8 => ifmt == g.RGBA or ifmt == g.RGBA8,
-            .bgra8 => ifmt == g.BGRA_EXT or ifmt == g.BGRA8_EXT,
-            .d24s8 => false,
-        };
-        if (!fits) return c.fail(g.INVALID_OPERATION);
         if (t.immutable) return c.fail(g.INVALID_OPERATION);
+        if (level > 0) return;
         const uw: u32 = @intCast(w);
         const uh: u32 = @intCast(h);
-        if (!c.defineTex(t, uw, uh, fmt, ifmt)) return;
-        const src = c.unpackSource(pixels, uw, uh) orelse return;
-        c.eng.write(&t.img, 0, 0, uw, uh, src.bytes, src.row, fmt);
+        if (!c.defineTex(t, uw, uh, up.store, ifmt)) return;
+        t.fswz = up.swizzle;
+        t.srgb = up.srgb;
+        const src = c.unpackSource(pixels, uw, uh, up.client_bytes) orelse return;
+        c.uploadRows(&t.img, up, 0, 0, uw, uh, src.bytes, src.row);
     }
 
     pub fn texSubImage2D(c: *Context, target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, pixels: ?*const anyopaque) void {
         const t = c.boundTex2D(target) orelse return;
-        if (level != 0 or x < 0 or y < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
-        const fmt = switch (clientFormat(format, ty)) {
-            .ok => |f| f,
-            .err => |e| return c.fail(e),
-        };
+        if (level < 0 or x < 0 or y < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
+        if (level > 0) return;
         if (@as(i64, x) + w > t.img.width or @as(i64, y) + h > t.img.height) return c.fail(g.INVALID_VALUE);
+        const up = texfmt.subUpload(t.img.format, format, ty) orelse return c.fail(if (texfmt.known(format, ty)) g.INVALID_OPERATION else g.INVALID_ENUM);
         if (w == 0 or h == 0) return;
-        if (fmt != t.img.format) return c.fail(g.INVALID_OPERATION);
-        const src = c.unpackSource(pixels, @intCast(w), @intCast(h)) orelse return;
-        c.eng.write(&t.img, @intCast(x), @intCast(y), @intCast(w), @intCast(h), src.bytes, src.row, fmt);
+        const src = c.unpackSource(pixels, @intCast(w), @intCast(h), up.client_bytes) orelse return;
+        c.uploadRows(&t.img, up, @intCast(x), @intCast(y), @intCast(w), @intCast(h), src.bytes, src.row);
     }
 
     pub fn texStorage2D(c: *Context, target: u32, levels: i32, internal: u32, w: i32, h: i32) void {
         const t = c.boundTex2D(target) orelse return;
         if (levels < 1 or w < 1 or h < 1 or w > MAX_SIZE or h > MAX_SIZE) return c.fail(g.INVALID_VALUE);
-        const fmt: Format = switch (internal) {
-            g.RGBA8 => .rgba8,
-            g.BGRA8_EXT => .bgra8,
-            else => return c.fail(g.INVALID_ENUM),
-        };
+        const up = texfmt.storage(internal) orelse return c.fail(g.INVALID_ENUM);
         const most = std.math.log2_int(u32, @intCast(@max(w, h))) + 1;
         if (levels > most) return c.fail(g.INVALID_OPERATION);
         if (t.immutable or t == &c.default_tex) return c.fail(g.INVALID_OPERATION);
-        if (!c.defineTex(t, @intCast(w), @intCast(h), fmt, internal)) return;
-        // (levels past 0 are counted, not stored, until sampling needs them)
+        if (!c.defineTex(t, @intCast(w), @intCast(h), up.store, internal)) return;
+        t.fswz = up.swizzle;
+        t.srgb = up.srgb;
+        // (levels past 0 are counted, not stored: draws read level 0)
         t.levels = @intCast(levels);
         t.immutable = true;
     }
 
+    /// glGenerateMipmap: nothing stored (draws read level 0).
+    pub fn generateMipmap(c: *Context, target: u32) void {
+        const t = c.boundTex2D(target) orelse return;
+        if (!t.img.live()) return c.fail(g.INVALID_OPERATION);
+    }
+
     pub fn texParameteri(c: *Context, target: u32, pname: u32, param: i32) void {
         const t = c.boundTex(target) orelse return;
-        const p: u32 = @bitCast(param);
-        const filter_min = switch (p) {
-            g.NEAREST, g.LINEAR, g.NEAREST_MIPMAP_NEAREST, g.LINEAR_MIPMAP_NEAREST, g.NEAREST_MIPMAP_LINEAR, g.LINEAR_MIPMAP_LINEAR => true,
-            else => false,
-        };
-        // (an external texture filters without mipmaps and clamps)
-        const ext = t.target == g.TEXTURE_EXTERNAL_OES;
-        const wrap = p == g.CLAMP_TO_EDGE or (!ext and (p == g.REPEAT or p == g.MIRRORED_REPEAT));
-        switch (pname) {
-            g.TEXTURE_MIN_FILTER => if (filter_min and (!ext or p == g.NEAREST or p == g.LINEAR)) {
-                t.params.min = p;
-            } else c.fail(g.INVALID_ENUM),
-            g.TEXTURE_MAG_FILTER => if (p == g.NEAREST or p == g.LINEAR) {
-                t.params.mag = p;
-            } else c.fail(g.INVALID_ENUM),
-            g.TEXTURE_WRAP_S => if (wrap) {
-                t.params.wrap_s = p;
-            } else c.fail(g.INVALID_ENUM),
-            g.TEXTURE_WRAP_T => if (wrap) {
-                t.params.wrap_t = p;
-            } else c.fail(g.INVALID_ENUM),
-            g.TEXTURE_WRAP_R => if (wrap) {
-                t.params.wrap_r = p;
-            } else c.fail(g.INVALID_ENUM),
-            g.TEXTURE_BASE_LEVEL => if (param >= 0) {
-                t.params.base_level = param;
-            } else c.fail(g.INVALID_VALUE),
-            g.TEXTURE_MAX_LEVEL => if (param >= 0) {
-                t.params.max_level = param;
-            } else c.fail(g.INVALID_VALUE),
-            else => c.fail(g.INVALID_ENUM),
-        }
+        const e = setParam(&t.params, t.target == g.TEXTURE_EXTERNAL_OES, false, pname, param);
+        if (e != g.NO_ERROR) c.fail(e);
     }
 
     pub fn getTexParameteri(c: *Context, target: u32, pname: u32) ?i32 {
         const t = c.boundTex(target) orelse return null;
-        const v: u32 = switch (pname) {
-            g.TEXTURE_MIN_FILTER => t.params.min,
-            g.TEXTURE_MAG_FILTER => t.params.mag,
-            g.TEXTURE_WRAP_S => t.params.wrap_s,
-            g.TEXTURE_WRAP_T => t.params.wrap_t,
-            g.TEXTURE_WRAP_R => t.params.wrap_r,
-            g.TEXTURE_BASE_LEVEL => @bitCast(t.params.base_level),
-            g.TEXTURE_MAX_LEVEL => @bitCast(t.params.max_level),
-            g.TEXTURE_IMMUTABLE_FORMAT => @intFromBool(t.immutable),
-            g.TEXTURE_IMMUTABLE_LEVELS => if (t.immutable) t.levels else 0,
-            else => {
-                c.fail(g.INVALID_ENUM);
-                return null;
-            },
+        switch (pname) {
+            g.TEXTURE_IMMUTABLE_FORMAT => return @intFromBool(t.immutable),
+            g.TEXTURE_IMMUTABLE_LEVELS => return @intCast(if (t.immutable) t.levels else 0),
+            else => {},
+        }
+        return getParam(&t.params, false, pname) orelse {
+            c.fail(g.INVALID_ENUM);
+            return null;
         };
-        return @bitCast(v);
+    }
+
+    // ── Sampler objects ────────────────────────────────────────────────────
+
+    pub fn genSamplers(c: *Context, out: []u32) void {
+        if (!genIn(Smp, &c.objs.samplers, out)) return c.fail(g.OUT_OF_MEMORY);
+        // (a sampler's name is one at once, as GL says)
+        for (out) |name| _ = makeIn(Smp, &c.objs.samplers, name);
+    }
+
+    pub fn deleteSamplers(c: *Context, names: []const u32) void {
+        for (names) |name| {
+            const s = slotIn(Smp, &c.objs.samplers, name) orelse continue;
+            for (&c.smp) |*b| {
+                if (b.* == name) b.* = 0;
+            }
+            s.* = .{};
+        }
+    }
+
+    pub fn isSampler(c: *Context, name: u32) bool {
+        return madeIn(Smp, &c.objs.samplers, name) != null;
+    }
+
+    pub fn bindSampler(c: *Context, unit: u32, name: u32) void {
+        if (unit >= MAX_UNITS) return c.fail(g.INVALID_VALUE);
+        if (name != 0 and madeIn(Smp, &c.objs.samplers, name) == null) return c.fail(g.INVALID_OPERATION);
+        c.smp[unit] = name;
+    }
+
+    pub fn samplerParameteri(c: *Context, name: u32, pname: u32, param: i32) void {
+        const s = madeIn(Smp, &c.objs.samplers, name) orelse return c.fail(g.INVALID_OPERATION);
+        const e = setParam(&s.params, false, true, pname, param);
+        if (e != g.NO_ERROR) c.fail(e);
+    }
+
+    pub fn getSamplerParameteri(c: *Context, name: u32, pname: u32) ?i32 {
+        const s = madeIn(Smp, &c.objs.samplers, name) orelse {
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        };
+        return getParam(&s.params, true, pname) orelse {
+            c.fail(g.INVALID_ENUM);
+            return null;
+        };
+    }
+
+    /// What texture slot `sl` of a draw reads: its unit's texture (bound
+    /// to the slot's target) with the unit's sampler object's state, or
+    /// the texture's.
+    fn slotState(c: *Context, sl: program.Slot, values: []const u32) texture.State {
+        if (sl.unsupported) return .{};
+        const unit = values[sl.word];
+        if (unit >= MAX_UNITS) return .{};
+        const name = if (sl.external) c.tex_ext[unit] else c.tex2d[unit];
+        const t: *Tex = if (name == 0) (if (sl.external) &c.default_ext else &c.default_tex) else (madeIn(Tex, &c.objs.tex, name) orelse return .{});
+        if (!t.img.live()) return .{};
+        const p: *const TexParams = if (c.smp[unit] != 0) (if (madeIn(Smp, &c.objs.samplers, c.smp[unit])) |s| &s.params else &t.params) else &t.params;
+        // GL's R, G, B, A as the stored channels: bgra8's bytes are B, G, R, A
+        const base: [4]u3 = if (t.img.format == .bgra8) .{ 2, 1, 0, 3 } else .{ 0, 1, 2, 3 };
+        var rgba: [4]u3 = undefined;
+        for (t.fswz, 0..) |s, i| rgba[i] = if (s < 4) base[s] else s;
+        var swz: [4]u3 = undefined;
+        for (t.params.swizzle, 0..) |s, i| swz[i] = switch (s) {
+            g.RED => rgba[0],
+            g.GREEN => rgba[1],
+            g.BLUE => rgba[2],
+            g.ALPHA => rgba[3],
+            g.ZERO => texture.SWZ_ZERO,
+            else => texture.SWZ_ONE,
+        };
+        return .{
+            .img = &t.img,
+            .srgb = t.srgb,
+            .swizzle = swz,
+            .wrap_s = wrapOf(p.wrap_s),
+            .wrap_t = wrapOf(p.wrap_t),
+            .linear = p.mag == g.LINEAR,
+        };
     }
 
     /// The read framebuffer's read image, complete; else the error.
@@ -1319,7 +1479,7 @@ pub const Context = struct {
         if (level != 0 or dx < 0 or dy < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
         if (@as(i64, dx) + w > t.img.width or @as(i64, dy) + h > t.img.height) return c.fail(g.INVALID_VALUE);
         const s = c.readSource() orelse return;
-        if (!s.img.format.isColor()) return c.fail(g.INVALID_OPERATION);
+        if (!s.img.format.isColor() or !t.img.format.isColor()) return c.fail(g.INVALID_OPERATION);
         if (s.img == &t.img) return c.fail(g.INVALID_OPERATION);
         c.copyFrom(s.img, s.v, x, y, w, h, &t.img, dx, dy);
     }
@@ -1337,6 +1497,8 @@ pub const Context = struct {
         const s = c.readSource() orelse return;
         if (!s.img.format.isColor() or s.img == &t.img) return c.fail(g.INVALID_OPERATION);
         if (!c.defineTex(t, @intCast(w), @intCast(h), fmt, internal)) return;
+        t.fswz = .{ 0, 1, 2, 3 };
+        t.srgb = false;
         c.copyFrom(s.img, s.v, x, y, w, h, &t.img, 0, 0);
     }
 
@@ -1875,6 +2037,18 @@ pub const Context = struct {
         const color = v.color[0] orelse return;
         if (count == 0 or instances == 0) return;
         var d = raster.Draw{ .pipe = pipe, .color = color, .topology = topology, .first = first, .count = @intCast(count), .instances = @intCast(instances), .uniforms = uniforms };
+        if (c.program != 0) {
+            // the textures: each slot's image, its descriptor after the uniforms
+            const ds = program.drawState(c) orelse return;
+            const n = ds.uniforms.len;
+            @memcpy(c.draw_words[0..n], ds.uniforms);
+            for (ds.slots, 0..) |sl, i| {
+                const st = c.slotState(sl, ds.uniforms);
+                texture.descriptor(st, c.draw_words[n + i * texture.DESC_WORDS ..][0..texture.DESC_WORDS]);
+                d.textures[i] = st.img;
+            }
+            d.uniforms = c.draw_words[0 .. n + ds.slots.len * texture.DESC_WORDS];
+        }
         // the attributes: arrays from buffers, else the generic values
         const va = c.curVao();
         for (0..pipe.shaders.attrs) |j| {

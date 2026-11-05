@@ -25,7 +25,8 @@
 //!   memory (`Shared`): what the GPU has pending on it is tracked once,
 //!   for every name, and it is freed with the last of them.
 //!
-//! Images are 32 bits a pixel (Format). Rectangles are in GL's
+//! Images draws write are 32 bits a pixel; textures may be in other
+//! formats, which draws only read (Format). Rectangles are in GL's
 //! coordinates, y from the bottom; an image whose row 0 is its top (a
 //! window's buffer) says so (`top_down`) and the engine flips rows.
 //!
@@ -36,6 +37,7 @@
 const std = @import("std");
 const gpu = @import("gpu");
 const raster = @import("raster.sig");
+const texture = @import("texture.sig");
 const kir = gpu.kir;
 const r = kir.r;
 const u = kir.u;
@@ -48,9 +50,56 @@ pub const Format = enum(u8) {
     /// depth in the low 24 bits, stencil in the top 8: GL's
     /// DEPTH24_STENCIL8 (and its depth-only and stencil-only formats)
     d24s8,
+    // textures draws read (texture.sig), not draw into:
+    /// one and two bytes (unorm): R8, RG8 (and LUMINANCE, ALPHA,
+    /// LUMINANCE_ALPHA, swizzled)
+    r8,
+    rg8,
+    /// f32 x 1, 2, 4 (the half floats too, widened)
+    r32f,
+    rg32f,
+    rgba32f,
+    /// i32 and u32 x 1, 2, 4 (the 8- and 16-bit integer formats too)
+    r32i,
+    rg32i,
+    rgba32i,
+    r32ui,
+    rg32ui,
+    rgba32ui,
 
+    /// A color format draws, clears and copies write (four bytes a pixel).
     pub fn isColor(f: Format) bool {
-        return f != .d24s8;
+        return f == .rgba8 or f == .bgra8;
+    }
+
+    pub fn bytes(f: Format) u32 {
+        return switch (f) {
+            .r8 => 1,
+            .rg8 => 2,
+            .rg32f, .rg32i, .rg32ui => 8,
+            .rgba32f, .rgba32i, .rgba32ui => 16,
+            else => 4,
+        };
+    }
+
+    pub fn channels(f: Format) u32 {
+        return switch (f) {
+            .r8, .r32f, .r32i, .r32ui, .d24s8 => 1,
+            .rg8, .rg32f, .rg32i, .rg32ui => 2,
+            else => 4,
+        };
+    }
+
+    pub const Kind = enum(u2) { unorm8, float, int, uint };
+
+    /// What a texel's channels are.
+    pub fn kind(f: Format) Kind {
+        return switch (f) {
+            .r32f, .rg32f, .rgba32f => .float,
+            .r32i, .rg32i, .rgba32i => .int,
+            .r32ui, .rg32ui, .rgba32ui, .d24s8 => .uint,
+            else => .unorm8,
+        };
     }
 };
 
@@ -231,7 +280,7 @@ pub const CODE_BYTES = 16 * 1024;
 /// A dispatch's parameter words and bindings at most (a draw's vertex
 /// kernel has the most).
 const MAX_PARAMS = 160;
-const MAX_BIND = 3 + raster.MAX_ATTRS;
+const MAX_BIND = 3 + raster.MAX_ATTRS + texture.MAX_TEX;
 /// KIR instructions a kernel built here may have (a pipeline's, a GLSL
 /// shader inlined in it).
 pub const MAX_KIR = 65536;
@@ -500,11 +549,11 @@ pub const Engine = struct {
         }
     }
 
-    /// An image of width x height in `format` (rows width * 4 bytes), or
-    /// null when there is no memory for it.
+    /// An image of width x height in `format` (rows of width texels,
+    /// rounded up to 4 bytes), or null when there is no memory for it.
     pub fn newImage(e: *Engine, width: u32, height: u32, format: Format) ?Image {
         if (width == 0 or height == 0) return null;
-        const stride = width * 4;
+        const stride = std.mem.alignForward(u32, width * format.bytes(), 4);
         const m = e.allocBytes(@as(usize, stride) * height) orelse return null;
         return .{ .buf = m.buf, .width = width, .height = height, .stride = stride, .format = format, .own = true, .pooled = m.pooled };
     }
@@ -729,16 +778,28 @@ pub const Engine = struct {
         const sparams = raster.setupParams(d, &sp);
         const rparams = raster.rasterParams(d, &rp);
         // the bindings: vertex (records, uniforms, element array,
-        // attributes), setup (triangles, vertices), raster (color, depth,
-        // triangles, uniforms)
-        var vb: [MAX_BIND]*Image = undefined;
-        vb[0] = &verts;
-        vb[1] = &uni;
-        vb[2] = d.index orelse &e.zero;
-        for (d.attrs, 0..) |a, j| vb[3 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;
+        // attributes, textures), setup (triangles, vertices), raster
+        // (color, depth, triangles, uniforms, textures)
+        const ntex: usize = p.shaders.textures;
+        var vbs: [MAX_BIND]*Image = undefined;
+        vbs[0] = &verts;
+        vbs[1] = &uni;
+        vbs[2] = d.index orelse &e.zero;
+        for (d.attrs, 0..) |a, j| vbs[3 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;
         const depth = d.depth orelse &e.zero;
         const sb = [_]*Image{ &tris, &verts };
-        const rb = [_]*Image{ d.color, depth, &tris, &uni };
+        var rbs: [4 + texture.MAX_TEX]*Image = undefined;
+        rbs[0] = d.color;
+        rbs[1] = depth;
+        rbs[2] = &tris;
+        rbs[3] = &uni;
+        for (0..ntex) |j| {
+            const img = d.textures[j] orelse &e.zero;
+            vbs[3 + raster.MAX_ATTRS + j] = img;
+            rbs[4 + j] = img;
+        }
+        const vb = vbs[0 .. 3 + raster.MAX_ATTRS + ntex];
+        const rb = rbs[0 .. 4 + ntex];
         const groups_v = [3]u32{ divUp(d.count, raster.VERTEX_GROUP), d.instances, 1 };
         const groups_s = [3]u32{ divUp(ntri, raster.SETUP_GROUP), d.instances, 1 };
         const groups_r = [3]u32{ divUp(d.rect.width(), raster.TILE), divUp(d.rect.height(), raster.TILE), 1 };
@@ -747,9 +808,9 @@ pub const Engine = struct {
         for (rb) |img| all_gpu = all_gpu and e.gpuUsable(img);
         if (all_gpu) {
             const rw: u32 = if (d.depth != null and d.depth_test and d.depth_write) 0b11 else 0b01;
-            e.recordProg(&p.progs[0].?, groups_v, &vb, 1, vparams, null);
+            e.recordProg(&p.progs[0].?, groups_v, vb, 1, vparams, null);
             e.recordProg(&p.progs[1].?, groups_s, &sb, 1, sparams, null);
-            e.recordProg(&p.progs[2].?, groups_r, &rb, rw, rparams, null);
+            e.recordProg(&p.progs[2].?, groups_r, rb, rw, rparams, null);
             return true;
         }
         // on the CPU: every image settled (and fetched, if the GPU wrote it)
@@ -762,8 +823,9 @@ pub const Engine = struct {
         if (!e.runCpu(.vertex, p, groups_v, views[0..vb.len], vparams)) return false;
         const sv = [_][]u8{ tris.buf.cpu, verts.buf.cpu };
         if (!e.runCpu(.setup, p, groups_s, &sv, sparams)) return false;
-        const rv = [_][]u8{ d.color.buf.cpu, depth.buf.cpu, tris.buf.cpu, uni.buf.cpu };
-        if (!e.runCpu(.raster, p, groups_r, &rv, rparams)) return false;
+        var rv: [4 + texture.MAX_TEX][]u8 = undefined;
+        for (rb, 0..) |img, j| rv[j] = img.buf.cpu;
+        if (!e.runCpu(.raster, p, groups_r, rv[0..rb.len], rparams)) return false;
         for (rb[0..2]) |img| e.wrote(img, 0, img.buf.cpu.len);
         return true;
     }
@@ -847,19 +909,27 @@ pub const Engine = struct {
     pub fn write(e: *Engine, img: *Image, x: u32, y: u32, w: u32, h: u32, src: []const u8, src_stride: usize, src_format: Format) void {
         if (w == 0 or h == 0) return;
         e.settle(img);
-        const swap = keepOf(src_format, img.format) != 0xffff_ffff;
+        // (the same format: rows copied; rgba8 and bgra8: red and blue swapped)
+        const bpp: usize = img.format.bytes();
+        const raw = src_format == img.format;
+        const swap = !raw and keepOf(src_format, img.format) != 0xffff_ffff;
         const dw = img.words();
         for (0..h) |j| {
             const row = img.rowOf(y + @as(u32, @intCast(j)));
-            const off = @as(usize, row) * img.stride + @as(usize, x) * 4;
-            if (img.gpuWrote()) e.fromDevice(img, off, @as(usize, w) * 4);
-            const s = src[j * src_stride ..][0 .. @as(usize, w) * 4];
-            const base = off / 4;
-            for (0..w) |i| {
-                const v = std.mem.readInt(u32, s[i * 4 ..][0..4], .little);
-                dw[base + i] = if (swap) swapRB(v) else v;
+            const off = @as(usize, row) * img.stride + @as(usize, x) * bpp;
+            const len = @as(usize, w) * bpp;
+            if (img.gpuWrote()) e.fromDevice(img, off, len);
+            const s = src[j * src_stride ..][0..len];
+            if (raw) {
+                @memcpy(img.buf.cpu[off..][0..len], s);
+            } else {
+                const base = off / 4;
+                for (0..w) |i| {
+                    const v = std.mem.readInt(u32, s[i * 4 ..][0..4], .little);
+                    dw[base + i] = if (swap) swapRB(v) else v;
+                }
             }
-            e.toDevice(img, off, @as(usize, w) * 4);
+            e.toDevice(img, off, len);
         }
         e.stats.cpu_ops += 1;
     }
