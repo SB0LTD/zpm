@@ -741,6 +741,9 @@ pub fn Speaker(comptime limits: Limits) type {
             return .{ .sampling = sampling, .rng = Mt19937.init(sampling.seed) };
         }
 
+        /// The largest codebook vocabulary frameOn takes (penalize's own).
+        pub const MAX_FRAME_VOCABULARY = 4096;
+
         /// One audio frame from the text model's output-normed hidden state.
         pub fn frame(
             self: *Self,
@@ -766,6 +769,38 @@ pub fn Speaker(comptime limits: Limits) type {
                     codes[book] = @intCast(self.pick(logits));
                 }
             }
+            return self.close(plan, codes);
+        }
+
+        /// frame, with the depthformer's passes on `depth`: lfm3_any_audio's
+        /// Depth on a GPU, or anything with its projectState(hidden_state)
+        /// and codePass(&codes) -> the codebook-major logits. The order, the
+        /// penalties and the draws are frame's, here on the CPU: the same
+        /// codes from the same logits.
+        pub fn frameOn(self: *Self, depth: anytype, plan: *const Plan, hidden_state: []const f32) !Frame {
+            const order = frameOrder(&self.rng);
+            var codes: [CODEBOOKS]i32 = @splat(-1);
+            try depth.projectState(hidden_state);
+            var revealed: usize = 0;
+            var one: [MAX_FRAME_VOCABULARY]f32 = undefined;
+            if (plan.vocabulary > one.len) return error.VocabularyTooLarge;
+            for (SCHEDULE) |count| {
+                const all = try depth.codePass(&codes);
+                for (0..count) |_| {
+                    const book: usize = order[revealed];
+                    revealed += 1;
+                    // (a copy: the penalty changes the book's logits)
+                    const logits = one[0..plan.vocabulary];
+                    @memcpy(logits, all[book * plan.vocabulary ..][0..plan.vocabulary]);
+                    self.penalize(logits, book);
+                    codes[book] = @intCast(self.pick(logits));
+                }
+            }
+            return self.close(plan, codes);
+        }
+
+        /// A frame's codes kept (the history the penalty reads), or the end.
+        fn close(self: *Self, plan: *const Plan, codes: [CODEBOOKS]i32) Frame {
             const end_code = plan.endCode();
             for (codes) |code| if (code == end_code) return .{ .codes = @splat(end_code), .end = true };
             if (self.frames < limits.history) {

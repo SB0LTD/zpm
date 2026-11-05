@@ -762,6 +762,18 @@ fn depthAgainstCpu(caps: gpu.Caps, src: gguf.Source, tolerance: f64) !void {
         const rel = try compare(pass, depth_work.logits[0..n], got, tolerance);
         std.debug.print("depthformer ({s}) pass {d}: logits within {e} of the CPU's, {d} of {d} its bits; {d} dispatches, {d} lane-ops\n", .{ if (caps.fused_fma) "fused" else "unfused", pass, rel, exact, n, depth.dispatches, emu.stats.lane_ops });
     }
+    // Whole frames: the Speaker on the CPU's depthformer and on the GPU's
+    // (frameOn), the same sampling and seed: the same codes, frame by frame.
+    const L = gen.lfm3_audio_limits;
+    var on_cpu = gen.Speaker(L).init(gen.modelSampling(&audio_plan, 1234));
+    var on_gpu = gen.Speaker(L).init(gen.modelSampling(&audio_plan, 1234));
+    for (0..3) |f| {
+        for (state[0..audio_plan.backbone], 0..) |*v, i| v.* += @as(f32, @floatFromInt((i + f) % 7)) * 0.01;
+        const a = try on_cpu.frame(AUDIO_CAPACITY, src, &audio_index, &audio_plan, &depth_work, state[0..audio_plan.backbone], .{});
+        const b = try on_gpu.frameOn(&depth, &audio_plan, state[0..audio_plan.backbone]);
+        try std.testing.expectEqual(a.end, b.end);
+        try std.testing.expectEqualSlices(i32, &a.codes, &b.codes);
+    }
 }
 
 test "LFM3-Audio's depthformer on the GPU (when its mmproj is here): projectState and three codePass passes, the CPU's logits" {
