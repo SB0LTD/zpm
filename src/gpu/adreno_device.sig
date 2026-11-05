@@ -64,10 +64,32 @@ pub fn x1_45_caps(device_bytes: u64) Caps {
     };
 }
 
+/// The raw device's buffer (what an Importer hands back).
+pub const RawBuffer = raw.Buffer;
+
+/// Memory the CPU side lends the GPU in place (zero-copy import): on the
+/// Surface, Galaxy's galaxy_gpu_drm.kernelImport and kernelFree in the
+/// context the raw device submits in. `import` maps `cpu` for the GPU
+/// (its .va the GPU's address of cpu[0], its .handle what `release` gives
+/// back); `writable` false maps it read only.
+pub const Importer = struct {
+    ctx: *anyopaque,
+    import: *const fn (ctx: *anyopaque, cpu: []u8, writable: bool) ?raw.Buffer,
+    release: *const fn (ctx: *anyopaque, handle: u32) void,
+};
+
+/// Imports one adapter keeps at once.
+pub const MAX_IMPORTS = 64;
+
 /// A gpu.Device over a raw adreno Device.
 pub const Over = struct {
     raw: raw.Device,
     caps: Caps,
+    /// With one, caps.import: Device.import maps CPU memory in place.
+    importer: ?Importer = null,
+    /// The handles of the buffers imported and not freed.
+    imported: [MAX_IMPORTS]u32 = undefined,
+    n_imported: usize = 0,
     ib: ?raw.Buffer = null,
     ts: ?raw.Buffer = null,
     fence: Fence = 0,
@@ -83,6 +105,18 @@ pub const Over = struct {
         c.import = false;
         c.timestamp_hz = r.timestamp_hz;
         return .{ .raw = r, .caps = c };
+    }
+
+    /// init, with zero-copy import through `importer` (caps.import).
+    pub fn initWith(r: raw.Device, caps: Caps, importer: Importer) Over {
+        var o = init(r, caps);
+        o.setImporter(importer);
+        return o;
+    }
+
+    pub fn setImporter(o: *Over, importer: Importer) void {
+        o.importer = importer;
+        o.caps.import = true;
     }
 
     pub fn device(o: *Over) dv.Device {
@@ -120,13 +154,28 @@ pub const Over = struct {
 
     fn free(ctx: *anyopaque, b: Buffer) void {
         const o = self(ctx);
+        // (an import goes back to its importer, not the raw device)
+        for (o.imported[0..o.n_imported], 0..) |h, i| {
+            if (h != b.handle) continue;
+            o.imported[i] = o.imported[o.n_imported - 1];
+            o.n_imported -= 1;
+            if (o.importer) |imp| imp.release(imp.ctx, h);
+            return;
+        }
         o.raw.free(rawOf(b));
     }
 
+    /// `cpu` read by the GPU in place (read only: what the device's users
+    /// import, images and model files, they only read); null without an
+    /// importer, when it refuses, or with MAX_IMPORTS held.
     fn import(ctx: *anyopaque, cpu: []u8) ?Buffer {
-        _ = ctx;
-        _ = cpu;
-        return null;
+        const o = self(ctx);
+        const imp = o.importer orelse return null;
+        if (cpu.len == 0 or o.n_imported == MAX_IMPORTS) return null;
+        const b = imp.import(imp.ctx, cpu, false) orelse return null;
+        o.imported[o.n_imported] = b.handle;
+        o.n_imported += 1;
+        return .{ .gpu = b.va, .cpu = cpu, .bytes = cpu.len, .handle = b.handle, .kind = .host };
     }
 
     fn toDevice(ctx: *anyopaque, b: Buffer, off: u64, len: u64) void {
@@ -476,6 +525,63 @@ test "a kernel through the adapter: PM4, constants, the pool, cache maintenance"
     d.fromDevice(b, 0, b.bytes);
     for (b.words(), 0..) |x, n| try std.testing.expectEqual(@as(u32, @intCast(n * 7 + 0x12345)), x);
     try std.testing.expect(d.lastRunNs() > 0);
+}
+
+test "zero-copy import: the GPU reads the CPU's memory in place, and free gives it back" {
+    Rig.emu.init(&Rig.arena, &Rig.view);
+    // (the importer lends one of the emulator's own buffers: its memory is
+    // the "CPU's", mapped where the raw device placed it)
+    const Lend = struct {
+        var lent: raw.Buffer = .{};
+        var released: u32 = 0;
+        var asked_writable = true;
+        fn import(ctx: *anyopaque, cpu: []u8, writable: bool) ?raw.Buffer {
+            _ = ctx;
+            asked_writable = writable;
+            if (cpu.ptr != lent.cpu.ptr) return null;
+            return .{ .va = lent.va, .cpu = cpu, .handle = 0x8000_0001 };
+        }
+        fn release(ctx: *anyopaque, handle: u32) void {
+            _ = ctx;
+            if (handle == 0x8000_0001) released += 1;
+        }
+    };
+    try std.testing.expect(!Rig.emu.device().caps.import);
+    var dummy: u8 = 0;
+    Rig.emu.adapter.setImporter(.{ .ctx = &dummy, .import = Lend.import, .release = Lend.release });
+    const d = Rig.emu.device();
+    try std.testing.expect(d.caps.import);
+    Lend.lent = try Rig.emu.gpu.device().alloc(4 * 256);
+    for (Lend.lent.words(), 0..) |*w, n| w.* = @intCast(n * 3 + 1);
+    const in = d.import(Lend.lent.cpu) orelse return error.NotImported;
+    try std.testing.expect(!Lend.asked_writable);
+    try std.testing.expectEqual(Lend.lent.va, in.gpu);
+    d.toDevice(in, 0, in.bytes);
+    // out[i] = in[i] + 5, the input read where the CPU wrote it
+    var k = newKernel("copy_in_place", .{ 64, 1, 1 });
+    const src = k.binding();
+    const dst = k.binding();
+    const t = k.tid(0);
+    const g = k.gid(0);
+    const i = k.op2(.iadd, .u32, kir.r(k.op2(.shl, .u32, kir.r(g), kir.u(6))), kir.r(t));
+    const off = k.op2(.shl, .u32, kir.r(i), kir.u(2));
+    const x = k.load(.u32, kir.global(src, 32), kir.r(off));
+    k.store(.u32, kir.global(dst, 32), kir.r(off), kir.r(k.op2(.iadd, .u32, kir.r(x), kir.u(5))));
+    const p = try loadKernel(d, &k);
+    const out = try d.alloc(4 * 256, .host);
+    @memset(out.cpu, 0);
+    d.toDevice(out, 0, out.bytes);
+    try runOne(d, &p, .{ 4, 1, 1 }, &.{ in, out }, &.{});
+    d.fromDevice(out, 0, out.bytes);
+    for (out.words(), 0..) |w, n| try std.testing.expectEqual(@as(u32, @intCast(n * 3 + 6)), w);
+    // free: the import back to the importer, once; a plain buffer as before
+    d.free(in);
+    try std.testing.expectEqual(@as(u32, 1), Lend.released);
+    d.free(out);
+    try std.testing.expectEqual(@as(u32, 1), Lend.released);
+    // (memory it does not lend: refused)
+    var other: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(?Buffer, null), d.import(&other));
 }
 
 test "the emulated Adreno faults on a read past its binding, into the next buffer" {
