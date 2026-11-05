@@ -2214,8 +2214,8 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn update(self: *Self) Error!Ast.Update {
-            if (self.mode == .standard) _ = try self.takeWord("ONLY");
-            var out: Ast.Update = .{ .table = try self.identifier() };
+            const only = self.mode == .standard and try self.takeWord("ONLY");
+            var out: Ast.Update = .{ .table = try self.identifier(), .only = only };
             if (self.mode == .standard and try self.takeSymbol(.dot)) {
                 out.schema = out.table;
                 out.table = try self.identifier();
@@ -2235,8 +2235,8 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn delete(self: *Self) Error!Ast.Delete {
             try self.expectWord("FROM");
-            if (self.mode == .standard) _ = try self.takeWord("ONLY");
-            var out: Ast.Delete = .{ .table = try self.identifier() };
+            const only = self.mode == .standard and try self.takeWord("ONLY");
+            var out: Ast.Delete = .{ .table = try self.identifier(), .only = only };
             if (self.mode == .standard and try self.takeSymbol(.dot)) {
                 out.schema = out.table;
                 out.table = try self.identifier();

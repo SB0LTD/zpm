@@ -1062,6 +1062,142 @@ fn virtualColumns() !void {
     });
 }
 
+// ---- table inheritance (PG.DDL.INHERITANCE) ---------------------------------
+
+const inherit_probes = [_][]const u8{
+    "SELECT id, g, v FROM a ORDER BY id, v",
+    "SELECT id FROM ONLY a ORDER BY id",
+    "SELECT id, g, v, extra FROM child ORDER BY id",
+    "SELECT inhrelid, inhparent FROM pg_inherits ORDER BY inhrelid",
+    "SELECT attname, attnotnull FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'child' ORDER BY attnum",
+};
+
+fn inheritance() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, g INT NOT NULL DEFAULT 1 CHECK (g < 100), v INT)");
+    try run("INSERT INTO a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, NULL)");
+    // The oracle program in one transaction.
+    const tx = try db.begin();
+    try statement(tx, "CREATE TABLE tdd_child(extra INT) INHERITS(a)");
+    try statement(tx, "INSERT INTO tdd_child(id,g,v,extra) VALUES(9,1,2,3)");
+    try same(try rows(tx, "SELECT id FROM a ORDER BY id"), "1;2;3;4;9");
+    db.abort(tx);
+    try run("CREATE TABLE child (extra INT) INHERITS (a)");
+    try run("INSERT INTO child (id, v, extra) VALUES (9, 2, 3), (1, 5, 4)");
+    // Parent reads include the children (keys are per table), ONLY not.
+    try expect(inherit_probes[0], "1|1|5;1|1|10;2|1|20;3|2|30;4|2|NULL;9|1|2");
+    try expect(inherit_probes[1], "1;2;3;4");
+    try expect(inherit_probes[2], "1|1|5|4;9|1|2|3");
+    try expect("SELECT COUNT(*), SUM(v) FROM a WHERE g = 1", "4|37");
+    try expect("SELECT a.id FROM a JOIN child c ON c.id = a.id WHERE a.v > 5 ORDER BY a.id", "1");
+    try expect(inherit_probes[4], "id|t;g|t;v|f;extra|f");
+    // Inherited CHECK and NOT NULL; the child's own rows only through it.
+    try rejects("INSERT INTO child (id, g) VALUES (10, 100)", error.CheckViolation, inherit_probes[2], "1|1|5|4;9|1|2|3");
+    try rejects("INSERT INTO child (id, g) VALUES (10, NULL)", error.NotNullViolation, inherit_probes[2], "1|1|5|4;9|1|2|3");
+    try run("UPDATE ONLY a SET v = v + 1 WHERE id = 2");
+    try run("UPDATE child SET v = 7 WHERE id = 9");
+    try run("DELETE FROM ONLY a WHERE id = 4");
+    try expect(inherit_probes[0], "1|1|5;1|1|10;2|1|21;3|2|30;9|1|7");
+    // Parent writes that would reach the children, column changes and a
+    // conflicting column name are outside the subset or errors.
+    try rejects("UPDATE a SET v = 0", error.UnsupportedStatement, inherit_probes[0], "1|1|5;1|1|10;2|1|21;3|2|30;9|1|7");
+    try rejects("DELETE FROM a", error.UnsupportedStatement, inherit_probes[0], "1|1|5;1|1|10;2|1|21;3|2|30;9|1|7");
+    try rejects("ALTER TABLE a ADD COLUMN w INT", error.UnsupportedStatement, inherit_probes[0], "1|1|5;1|1|10;2|1|21;3|2|30;9|1|7");
+    try rejects("CREATE TABLE bad (v INT) INHERITS (a)", error.DuplicateColumn, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("CREATE TABLE bad (x INT) INHERITS (missing)", error.TableNotFound, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("DROP TABLE a", error.DependentObjects, inherit_probes[0], "1|1|5;1|1|10;2|1|21;3|2|30;9|1|7");
+    // A grandchild is read through both ancestors.
+    try run("CREATE TABLE grandchild (deep INT) INHERITS (child)");
+    try run("INSERT INTO grandchild (id, v, extra, deep) VALUES (20, 0, 0, 1)");
+    try expect("SELECT id FROM a WHERE v < 6 ORDER BY id", "1;20");
+    try expect("SELECT id FROM child ORDER BY id", "1;9;20");
+    try expect("SELECT relname FROM pg_class c JOIN pg_inherits i ON i.inhrelid = c.oid ORDER BY relname", "child;grandchild");
+    try sameState(&inherit_probes);
+    // TRUNCATE empties the children too; DROP ... CASCADE drops them.
+    try run("TRUNCATE child");
+    try expect("SELECT COUNT(*) FROM child", "0");
+    try expect("SELECT COUNT(*) FROM a", "3");
+    try run("DROP TABLE a CASCADE");
+    try check(db.tableCount() == 0);
+    try sameState(&[_][]const u8{inherit_probes[3]});
+}
+
+// ---- declarative partitioning (PG.DDL.PARTITION) ----------------------------
+
+const partition_probes = [_][]const u8{
+    "SELECT id, v FROM part ORDER BY id",
+    "SELECT id FROM part0 ORDER BY id",
+    "SELECT id FROM part1 ORDER BY id",
+    "SELECT id FROM part_other ORDER BY id",
+    "SELECT relname, relkind FROM pg_class WHERE relnamespace = 2200 ORDER BY oid",
+};
+
+fn partitions() !void {
+    reset();
+    // The oracle program in one transaction.
+    const tx = try db.begin();
+    try statement(tx, "CREATE TABLE tdd_part(id INT) PARTITION BY RANGE(id)");
+    try statement(tx, "CREATE TABLE tdd_part0 PARTITION OF tdd_part FOR VALUES FROM (0) TO (10)");
+    try statement(tx, "INSERT INTO tdd_part VALUES(1)");
+    try same(try rows(tx, "SELECT * FROM tdd_part"), "1");
+    db.abort(tx);
+    try run("CREATE TABLE part (id INT, v TEXT DEFAULT 'none' CHECK (v <> 'bad')) PARTITION BY RANGE (id)");
+    try expect("SELECT * FROM part", "");
+    try run("CREATE TABLE part0 PARTITION OF part FOR VALUES FROM (MINVALUE) TO (10)");
+    try run("CREATE TABLE part1 PARTITION OF part FOR VALUES FROM (10) TO (20)");
+    // Rows route by the key; RETURNING reports the routed rows.
+    const routed = try replicate("INSERT INTO part VALUES (1, 'one'), (15, 'fifteen'), (-5, 'minus') RETURNING id, v");
+    try same(try render(&routed), "1|one;15|fifteen;-5|minus");
+    try run("INSERT INTO part (id) VALUES (19)");
+    try expect(partition_probes[0], "-5|minus;1|one;15|fifteen;19|none");
+    try expect(partition_probes[1], "-5;1");
+    try expect(partition_probes[2], "15;19");
+    try expect("SELECT COUNT(*) FROM ONLY part", "0");
+    try expect("SELECT relname, relkind FROM pg_class WHERE relname LIKE 'part%' ORDER BY relname", "part|p;part0|r;part1|r");
+    // No partition for the key (or a NULL key) and an inherited CHECK: 23514.
+    try rejects("INSERT INTO part VALUES (25, 'x')", error.CheckViolation, partition_probes[0], "-5|minus;1|one;15|fifteen;19|none");
+    try rejects("INSERT INTO part VALUES (NULL, 'x')", error.CheckViolation, partition_probes[0], "-5|minus;1|one;15|fifteen;19|none");
+    try rejects("INSERT INTO part VALUES (5, 'bad')", error.CheckViolation, partition_probes[0], "-5|minus;1|one;15|fifteen;19|none");
+    // A partition keeps its bound for direct writes (no row movement).
+    try rejects("INSERT INTO part1 VALUES (5, 'x')", error.CheckViolation, partition_probes[2], "15;19");
+    try rejects("UPDATE part1 SET id = 25 WHERE id = 15", error.CheckViolation, partition_probes[2], "15;19");
+    try run("UPDATE part1 SET id = 16 WHERE id = 15");
+    try run("DELETE FROM part0 WHERE id = -5");
+    // Bounds: overlap and empty ranges 42P17, the wrong strategy 42P16, a
+    // non-partitioned parent 42809; writes through the parent beyond INSERT
+    // and keys on it are outside the subset (0A000).
+    const names = "SELECT relname FROM pg_class WHERE relname LIKE 'part%' ORDER BY relname";
+    try rejects("CREATE TABLE part2 PARTITION OF part FOR VALUES FROM (15) TO (30)", error.InvalidObjectDefinition, names, "part;part0;part1");
+    try rejects("CREATE TABLE part2 PARTITION OF part FOR VALUES FROM (30) TO (30)", error.InvalidObjectDefinition, names, "part;part0;part1");
+    try rejects("CREATE TABLE part2 PARTITION OF part FOR VALUES IN (30)", error.InvalidTableDefinition, names, "part;part0;part1");
+    try rejects("CREATE TABLE part2 PARTITION OF part0 FOR VALUES FROM (30) TO (40)", error.WrongObjectType, names, "part;part0;part1");
+    try rejects("UPDATE part SET v = 'x'", error.UnsupportedStatement, partition_probes[0], "1|one;16|fifteen;19|none");
+    try rejects("DELETE FROM part", error.UnsupportedStatement, partition_probes[0], "1|one;16|fifteen;19|none");
+    try rejects("CREATE TABLE keyed (id INT PRIMARY KEY) PARTITION BY RANGE (id)", error.UnsupportedStatement, names, "part;part0;part1");
+    try rejects("CREATE TABLE keyed (id INT) PARTITION BY RANGE (missing)", error.ColumnNotFound, names, "part;part0;part1");
+    // A DEFAULT partition takes the rest; LIST partitioning.
+    try run("CREATE TABLE part_other PARTITION OF part DEFAULT");
+    try run("INSERT INTO part VALUES (25, 'big'), (NULL, 'null')");
+    try expect(partition_probes[3], "25;NULL");
+    try rejects("INSERT INTO part_other VALUES (3, 'x')", error.CheckViolation, partition_probes[3], "25;NULL");
+    try rejects("CREATE TABLE part3 PARTITION OF part DEFAULT", error.InvalidObjectDefinition, names, "part;part0;part1;part_other");
+    try run("CREATE TABLE colors (c TEXT, n INT) PARTITION BY LIST (c)");
+    try run("CREATE TABLE warm PARTITION OF colors FOR VALUES IN ('red', 'orange')");
+    try run("CREATE TABLE cool PARTITION OF colors FOR VALUES IN ('blue')");
+    try run("INSERT INTO colors VALUES ('red', 1), ('blue', 2), ('orange', 3)");
+    try rejects("INSERT INTO colors VALUES ('green', 4)", error.CheckViolation, "SELECT c, n FROM colors ORDER BY n", "red|1;blue|2;orange|3");
+    try rejects("CREATE TABLE warm2 PARTITION OF colors FOR VALUES IN ('red')", error.InvalidObjectDefinition, "SELECT COUNT(*) FROM pg_class WHERE relname = 'warm2'", "0");
+    try expect("SELECT c FROM warm ORDER BY c", "orange;red");
+    try sameState(&partition_probes);
+    try sameState(&[_][]const u8{ "SELECT c, n FROM colors ORDER BY n", "SELECT inhrelid, inhparent FROM pg_inherits ORDER BY inhrelid" });
+    // Dropping the partitioned table drops its partitions (no CASCADE).
+    try run("DROP TABLE colors");
+    try expect("SELECT COUNT(*) FROM pg_class WHERE relname IN ('colors', 'warm', 'cool')", "0");
+    try run("DROP TABLE part1");
+    try expect(partition_probes[0], "1|one;25|big;NULL|null");
+    try sameState(&[_][]const u8{ partition_probes[0], partition_probes[4] });
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1073,6 +1209,8 @@ pub fn main() !void {
     try materializedViews();
     try createVariants();
     try mergeStatement();
+    try inheritance();
+    try partitions();
     try advancedIndexes();
     try virtualColumns();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });

@@ -431,7 +431,85 @@ pub fn Database(comptime config: Config) type {
         /// the workspace (Config.expansion_bytes, TextCapacity beyond) and
         /// parsed with absolute spans, recursively for views over views.
         /// Returns the source to bind and execute with.
-        fn expandRelations(workspace: *Workspace, tables: *const [config.tables]S.Table, catalog: *const K, source: []const u8, snap: Snapshot, bound_statement: *A.Statement) Error![]const u8 {
+        /// Inheritance parents and partitioned tables read as the UNION ALL
+        /// of `ONLY` each member (the parent and every descendant; a
+        /// partitioned table's leaf partitions), over the parent's columns.
+        fn appendFamily(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, root: usize, snap: Snapshot) Error!u16 {
+            if (length.* == 0) {
+                if (source.len > workspace.expansion.len) return error.TextCapacity;
+                @memcpy(workspace.expansion[0..source.len], source);
+                length.* = source.len;
+            }
+            var members: [config.tables]usize = undefined;
+            members[0] = root;
+            var count: usize = 1;
+            var relations: [K.relation_rows]K.Found = undefined;
+            const relation_count = db.catalog.visibleRelations(snap, &relations);
+            var next: usize = 0;
+            while (next < count) : (next += 1) {
+                const oid = db.tables[members[next]].oid;
+                for (relations[0..relation_count]) |found| {
+                    if (found.kind == 'S' or db.tables[found.slot].parent != oid or count == members.len) continue;
+                    members[count] = found.slot;
+                    count += 1;
+                }
+            }
+            var text: Expansion = .{ .buffer = &workspace.expansion, .len = length.* };
+            try text.add(" ");
+            const start = text.len;
+            const parent = &db.tables[root];
+            var first = true;
+            for (members[0..count]) |slot| {
+                const member = &db.tables[slot];
+                if (member.relkind == 'p' and count > 1) continue;
+                if (!first) try text.add(" UNION ALL ");
+                first = false;
+                try text.add("SELECT ");
+                for (parent.columns[0..parent.column_count], 0..) |*column, position| {
+                    if (position != 0) try text.add(", ");
+                    try text.quoted(column.name.slice());
+                }
+                try text.add(" FROM ONLY ");
+                try text.quoted(db.namespaceName(member.namespace));
+                try text.add(".");
+                try text.quoted(member.name.slice());
+            }
+            length.* = text.len;
+            return P.parseQueryAt(workspace.expansion[0..length.*], start, length.*, &workspace.nodes);
+        }
+
+        /// Bounded writer into the workspace expansion buffer (TextCapacity).
+        const Expansion = struct {
+            buffer: *[config.expansion_bytes]u8,
+            len: usize,
+            fn add(self: *Expansion, bytes: []const u8) Error!void {
+                if (bytes.len > self.buffer.len - self.len) return error.TextCapacity;
+                @memcpy(self.buffer[self.len..][0..bytes.len], bytes);
+                self.len += bytes.len;
+            }
+            fn quoted(self: *Expansion, name: []const u8) Error!void {
+                try self.add("\"");
+                for (name) |byte| {
+                    try self.add(&[1]u8{byte});
+                    if (byte == '"') try self.add("\"");
+                }
+                try self.add("\"");
+            }
+        };
+
+        /// A visible table inheriting from (or partitioning) `oid`.
+        fn hasChildren(self: *const Self, oid: u32, snap: Snapshot) bool {
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind != 'S' and self.tables[found.slot].parent == oid) return true;
+            }
+            return false;
+        }
+
+        fn expandRelations(db: *const Self, workspace: *Workspace, source: []const u8, snap: Snapshot, bound_statement: *A.Statement) Error![]const u8 {
+            const tables = &db.tables;
+            const catalog = &db.catalog;
             workspace.expanded_count = 0;
             const pool = &workspace.nodes;
             var length: usize = 0;
@@ -463,7 +541,17 @@ pub fn Database(comptime config: Config) type {
                     if (catalog_module.findView(if (item.schema != null) schema_name.slice() else null, name.slice()) != null) continue;
                     const namespace = namespaceFor(catalog, if (item.schema != null) schema_name.slice() else null, snap) orelse continue;
                     const found = catalog.findIn(namespace, name.slice(), snap) orelse continue;
-                    if (found.kind != 'v') continue;
+                    if (found.kind != 'v') {
+                        if (item.only or found.kind == 'S') continue;
+                        const table = &tables[found.slot];
+                        if (table.relkind != 'p' and !db.hasChildren(table.oid, snap)) continue;
+                        item.query = try appendFamily(db, workspace, &length, source, found.slot, snap);
+                        item.view = true;
+                        if (item.alias == null) item.alias = item.name;
+                        q.from = null;
+                        pool.complex = true;
+                        continue;
+                    }
                     const view = &tables[found.slot];
                     const parsed = try appendQuery(workspace, &length, source, view.query.slice());
                     // View columns keep the names CREATE VIEW gave them.
@@ -600,7 +688,7 @@ pub fn Database(comptime config: Config) type {
                 self.session.sequences=null;
                 var parsed=try P.parse(source,&self.workspace.nodes,.standard);
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
-                const expanded=try Self.expandRelations(&self.workspace,&db.tables,&db.catalog,source,snapshot,&parsed);
+                const expanded=try Self.expandRelations(db,&self.workspace,source,snapshot,&parsed);
                 try self.session.checkpoint();
                 for(self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |query| {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
@@ -1401,7 +1489,7 @@ pub fn Database(comptime config: Config) type {
             self.workspace.query.read_stats = .{};
             try self.session.checkpoint();
             var statement_copy = parsed.*;
-            const source = try expandRelations(&self.workspace, &self.tables, &self.catalog, original, snap, &statement_copy);
+            const source = try expandRelations(self, &self.workspace, original, snap, &statement_copy);
             const context = self.bindContext(source, mode, snap);
             const bound = try B.bind(&context, &statement_copy);
             switch (bound) {
@@ -1517,7 +1605,7 @@ pub fn Database(comptime config: Config) type {
             const start = tx.subs[tx.sub_len - 1].write_start;
             const writes = tx.writes[start..tx.write_len];
             var count: usize = 0;
-            for (writes) |entry| if (rowWrite(entry.kind) and entry.table == table_index) {
+            for (writes) |entry| if (rowWrite(entry.kind) and (entry.table == table_index or self.descends(entry.table, table_index))) {
                 count += 1;
             };
             if (count > result_capacity) return error.RowCapacity;
@@ -1526,10 +1614,10 @@ pub fn Database(comptime config: Config) type {
             const width = list.count;
             const base = try X.stageCells(work, count * width);
             var ctx = self.evalContext(source);
-            const table = &self.tables[table_index];
             var row: usize = 0;
             for (writes) |entry| {
-                if (!rowWrite(entry.kind) or entry.table != table_index) continue;
+                if (!rowWrite(entry.kind) or (entry.table != table_index and !self.descends(entry.table, table_index))) continue;
+                const table = &self.tables[entry.table];
                 ctx.row = &table.versions[if (entry.kind == .delete) entry.old else entry.new].cells;
                 for (list.targets[0..width], 0..) |id, column| work.cells[base + row * width + column] = try E.eval(&ctx, id);
                 row += 1;
@@ -2517,6 +2605,11 @@ pub fn Database(comptime config: Config) type {
                 if (found.kind == 'S' or found.slot == index) continue;
                 const other = &self.tables[found.slot];
                 if (other.pending_drop) continue;
+                // Partitions are part of their table: dropped with it.
+                if (other.parent == table.oid and other.partition.bound != .none) {
+                    _ = try self.dropTable(slot, found.slot, true, snap);
+                    continue;
+                }
                 var depends = other.parent == table.oid;
                 for (other.depends[0..other.depend_count]) |oid| depends = depends or oid == table.oid;
                 var references = false;
@@ -2800,9 +2893,10 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn insertOne(self: *Self, slot: u16, ctx: *E.Context, insert: *const B.Insert, values: *const [config.columns]u16, derived: D.Derived, snap: Snapshot) Error!usize {
-            const table_index = insert.table;
+            const cells = try D.insertedRow(ctx, &self.tables[insert.table], values, derived);
+            // A partitioned table routes the row to its partition.
+            const table_index = try self.routeRow(slot, insert.table, &cells, snap);
             const table = &self.tables[table_index];
-            const cells = try D.insertedRow(ctx, table, values, derived);
             // ON CONFLICT: the arbiter is checked first (PostgreSQL's
             // speculative pre-check); other unique indexes still raise 23505.
             const conflict = &insert.conflict;
@@ -3186,6 +3280,67 @@ pub fn Database(comptime config: Config) type {
             }
             if (tx.constraints_all) |deferred| return deferred;
             return constraint.initially_deferred;
+        }
+
+        /// The partition (leaf) of a partitioned table that admits the row
+        /// (else its DEFAULT partition, else 23514), row-exclusive locked;
+        /// any partition's own bound is checked (23514).
+        fn routeRow(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, snap: Snapshot) Error!usize {
+            var current = table_index;
+            var depth: usize = 0;
+            while (self.tables[current].relkind == 'p') : (depth += 1) {
+                if (depth == config.tables) return error.CheckViolation;
+                const parent = &self.tables[current];
+                const key = &cells[parent.partition.key];
+                var chosen: ?usize = null;
+                var fallback: ?usize = null;
+                var relations: [K.relation_rows]K.Found = undefined;
+                const count = self.catalog.visibleRelations(snap, &relations);
+                for (relations[0..count]) |found| {
+                    if (found.kind == 'S') continue;
+                    const child = &self.tables[found.slot];
+                    if (child.parent != parent.oid) continue;
+                    if (child.partition.bound == .default) fallback = found.slot else if (S.partitionContains(&child.partition, key)) chosen = found.slot;
+                }
+                current = chosen orelse fallback orelse return error.CheckViolation;
+                try self.lockTable(slot, current, .row_exclusive);
+            }
+            try self.partitionBound(current, cells, snap);
+            return current;
+        }
+
+        /// A row of partition `index` must satisfy its bound (a DEFAULT
+        /// partition: no sibling's bound) - 23514.
+        fn partitionBound(self: *const Self, index: usize, cells: *const E.Row, snap: Snapshot) Error!void {
+            const table = &self.tables[index];
+            if (table.parent == 0 or table.partition.bound == .none) return;
+            const parent_slot = self.visibleTableSlot(table.parent, snap) orelse return;
+            const key = &cells[self.tables[parent_slot].partition.key];
+            if (table.partition.bound != .default) {
+                if (!S.partitionContains(&table.partition, key)) return error.CheckViolation;
+                return;
+            }
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S' or found.slot == index) continue;
+                const sibling = &self.tables[found.slot];
+                if (sibling.parent == table.parent and S.partitionContains(&sibling.partition, key)) return error.CheckViolation;
+            }
+        }
+
+        /// Whether table `slot` is a partition (at any depth) of `ancestor`.
+        fn descends(self: *const Self, slot: usize, ancestor: usize) bool {
+            var current = slot;
+            for (0..config.tables) |_| {
+                const parent = self.tables[current].parent;
+                if (parent == 0) return false;
+                if (parent == self.tables[ancestor].oid) return true;
+                current = for (&self.tables, 0..) |*table, position| {
+                    if (table.live and !table.pending_drop and table.oid == parent) break position;
+                } else return false;
+            }
+            return false;
         }
 
         /// The conflicting version of an ON CONFLICT arbiter, null when the
@@ -3594,6 +3749,7 @@ pub fn Database(comptime config: Config) type {
                 if (err == error.WouldBlock) tx.pin = snap;
                 return err;
             };
+            try self.partitionBound(table_index, &row.cells, snap);
             try self.appendRow(slot, table_index, &row.cells, snap);
             tx.copy_rows += 1;
         }
@@ -3810,6 +3966,7 @@ pub fn Database(comptime config: Config) type {
             const tx = &self.txs[slot];
             const table = &self.tables[update.table];
             const cells = try D.updatedRow(ctx, table, &update.values, .{ .defaults = &update.defaults, .generated = &update.generated, .checks = &update.checks }, &table.versions[old].cells);
+            try self.partitionBound(update.table, &cells, snap);
             if (table.primary_column) |column| {
                 if (update.values[column] != ast.none) switch (D.keyCheck(table, &cells[column], row, snap)) {
                     .free => {},
@@ -4041,7 +4198,7 @@ pub fn Database(comptime config: Config) type {
                 snap = .{ .csn = self.csn, .slot = owner, .epoch = self.txs[owner].epoch, .cid = self.txs[owner].cid +% 1 };
             };
             var statement_copy = parsed;
-            const expanded = try expandRelations(&self.workspace, &self.tables, &self.catalog, source, snap, &statement_copy);
+            const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy);
             var context = self.bindContext(expanded, .standard, snap);
             context.describe_only=true;
             const bound = try B.bind(&context, &statement_copy);

@@ -424,6 +424,45 @@ pub fn Storage(comptime config: types.Config) type {
             table.partition = extras.partition;
         }
 
+        /// Whether a partition bound admits a key value (NULL only into a
+        /// DEFAULT partition or a list naming NULL).
+        pub fn partitionContains(partition: *const Partition, key: *const V.Cell) bool {
+            switch (partition.bound) {
+                .none, .default => return false,
+                .range => {
+                    if (key.* == .null_value) return false;
+                    if (partition.unbounded & 1 == 0 and V.compare(key, &partition.values[0]) < 0) return false;
+                    if (partition.unbounded & 2 == 0 and V.compare(key, &partition.values[1]) >= 0) return false;
+                    return true;
+                },
+                .list => {
+                    for (partition.values[0..partition.count]) |*value| {
+                        if (key.* != .null_value and V.compare(key, value) == 0) return true;
+                    }
+                    return false;
+                },
+            }
+        }
+
+        /// Whether two sibling partition bounds share a key value.
+        pub fn partitionsOverlap(a: *const Partition, b: *const Partition) bool {
+            if (a.bound == .default and b.bound == .default) return true;
+            if (a.bound != b.bound) return false;
+            switch (a.bound) {
+                .range => {
+                    // [a0, a1) and [b0, b1) meet iff a0 < b1 and b0 < a1.
+                    const a_below = (a.unbounded & 1 != 0) or (b.unbounded & 2 != 0) or V.compare(&a.values[0], &b.values[1]) < 0;
+                    const b_below = (b.unbounded & 1 != 0) or (a.unbounded & 2 != 0) or V.compare(&b.values[0], &a.values[1]) < 0;
+                    return a_below and b_below;
+                },
+                .list => {
+                    for (a.values[0..a.count]) |*value| if (partitionContains(b, value)) return true;
+                    return false;
+                },
+                else => return false,
+            }
+        }
+
         /// Whether any part of the definition needs format version 3.
         pub fn extended(table: *const Table) bool {
             if (table.relkind != 'r' or table.index_count != 0 or table.parent != 0 or table.partition.strategy != .none) return true;

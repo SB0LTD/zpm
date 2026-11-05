@@ -668,6 +668,8 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const Update = struct {
+            /// UPDATE ONLY: no inheritance children.
+            only: bool = false,
             schema: ?Ident = null,
             table: Ident = .{},
             assignments: [config.columns]Assignment = undefined,
@@ -681,6 +683,7 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const Delete = struct {
+            only: bool = false,
             schema: ?Ident = null,
             table: Ident = .{},
             where: u16 = none,
