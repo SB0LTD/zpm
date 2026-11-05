@@ -1,5 +1,33 @@
 # SQL conformance TDD checkpoint
 
+## Advanced types candidate (lane B11) - 5 November 2026
+
+Branch `b11/types-advanced` (on 8458d77) closes six smoke programs
+test-first: PG.TYPE.CATALOG_IDS, PG.TYPE.ARRAY, PG.TYPE.RANGE,
+PG.TYPE.NETWORK, PG.TYPE.GEOMETRIC and PG.TYPE.XML. The unchanged driver
+moves from 39 passes to 45; it still exits 1 SqlConformanceIncomplete and
+no other program changed. `contract-sql-types-advanced`
+(tests/test_sql_types_advanced.sig) covers values, OIDs/typmods, NULLs,
+ordering and hash consistency, casts, exact SQLSTATEs, atomicity, wire
+send/receive and replay compared with sameDatabase/sameCatalog. Only the
+six oracle fixtures are native-verified; every other expectation is pending
+native verification.
+
+Array types are the unnamed values of DataType/Type (element ordinal with
+bit 7 set), so every scalar type has its array type. Arrays, ranges and XML
+live inline in the cell's text_bytes budget (54000 beyond it). New
+change-record value tags: 19 pg_lsn, 20 xid8, 21 array, 22 range, 23
+inet/cidr, 24 macaddr, 25 point, 26 box, 27 xml. Older records never use
+them, so they replay unchanged. New SQLSTATEs: 42P18, 2202E, 22000, 2200N,
+2200M and 2200L. The built-in pg_type view grows from 25 to 78 rows;
+test_sql_catalog's workspace was raised to 128 rows to hold it.
+
+PG.TYPE.ENUM_DOMAIN_COMPOSITE is not implemented. Its oracle expects the
+database-local OIDs 18673/18682, which are artifacts of the native run's OID
+counter. In addition, `sql.typeOid(DataType)` has no per-database type
+identity. Multiranges, unnest, array element assignment, other geometric
+types, macaddr8 and XPath functions also remain open.
+
 ## DDL, constraint and DML candidate (lane B11) - 4 November 2026
 
 Branch `b11/ddl-constraints-dml` (started on 4ed58c9, rebased on 16788d4
