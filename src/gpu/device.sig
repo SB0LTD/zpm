@@ -101,7 +101,96 @@ pub const Binary = struct {
     /// target-specific (e.g. ir3 config, sm_120 register/barrier counts;
     /// interp: [0] the instruction count)
     extra: [16]u32 = [_]u32{0} ** 16,
+    /// The bindings it may write, bit i for binding i (compileFor: KIR's
+    /// stores and atomics); all of them for a binary made otherwise.
+    writes: u32 = ALL_WRITTEN,
 };
+pub const ALL_WRITTEN: u32 = 0xffff_ffff;
+
+/// The barriers a run needs. A dispatch waits for those before it only
+/// when it reads or writes memory one of them wrote, or writes memory one
+/// of them read, since the last barrier: whole buffers compared (the GPU
+/// address range each is bound as). Dispatches apart (a layer's gate and up
+/// matrices, its query, key and value) run together.
+pub const Hazards = struct {
+    const MAX = 96;
+    written: [MAX][2]u64 = undefined,
+    nw: usize = 0,
+    read: [MAX][2]u64 = undefined,
+    nr: usize = 0,
+    /// The sets ran out of room: the next dispatch waits.
+    full: bool = false,
+
+    fn rangeOf(b: Buffer) [2]u64 {
+        return .{ b.gpu, b.gpu +| @max(b.bytes, 1) };
+    }
+
+    fn meets(set: []const [2]u64, r: [2]u64) bool {
+        for (set) |x| if (r[0] < x[1] and x[0] < r[1]) return true;
+        return false;
+    }
+
+    fn writes(d: *const Dispatch, i: usize) bool {
+        return i >= 32 or d.prog.bin.writes & (@as(u32, 1) << @intCast(i)) != 0;
+    }
+
+    /// Whether `d` must wait for the dispatches before it; then the barrier
+    /// is counted as taken. d's accesses are noted either way.
+    pub fn barrierBefore(h: *Hazards, d: *const Dispatch) bool {
+        var need = h.full;
+        for (d.buffers, 0..) |b, i| {
+            const r = rangeOf(b);
+            if (meets(h.written[0..h.nw], r)) need = true;
+            if (writes(d, i) and meets(h.read[0..h.nr], r)) need = true;
+        }
+        if (need) h.* = .{};
+        for (d.buffers, 0..) |b, i| {
+            const r = rangeOf(b);
+            if (writes(d, i)) {
+                if (h.nw == MAX) {
+                    h.full = true;
+                    continue;
+                }
+                h.written[h.nw] = r;
+                h.nw += 1;
+            } else {
+                if (h.nr == MAX) {
+                    h.full = true;
+                    continue;
+                }
+                h.read[h.nr] = r;
+                h.nr += 1;
+            }
+        }
+        return need;
+    }
+};
+
+test "device: barriers only where a dispatch meets what came before" {
+    const prog_rw = Program{ .bin = .{ .target = .interp, .code = &.{}, .regs = 1, .shared_bytes = 0, .group = .{ 1, 1, 1 }, .bindings = 2, .param_words = 0, .writes = 0b10 }, .code = .{} };
+    const prog_all = Program{ .bin = .{ .target = .interp, .code = &.{}, .regs = 1, .shared_bytes = 0, .group = .{ 1, 1, 1 }, .bindings = 2, .param_words = 0 }, .code = .{} };
+    const a = Buffer{ .gpu = 0x1000, .bytes = 0x100 };
+    const b = Buffer{ .gpu = 0x2000, .bytes = 0x100 };
+    const c = Buffer{ .gpu = 0x3000, .bytes = 0x100 };
+    const d = Buffer{ .gpu = 0x4000, .bytes = 0x100 };
+    var h = Hazards{};
+    // a -> b, then a -> c: apart (both only read a)
+    try std.testing.expect(!h.barrierBefore(&.{ .prog = &prog_rw, .groups = .{ 1, 1, 1 }, .buffers = &.{ a, b }, .params = &.{} }));
+    try std.testing.expect(!h.barrierBefore(&.{ .prog = &prog_rw, .groups = .{ 1, 1, 1 }, .buffers = &.{ a, c }, .params = &.{} }));
+    // b -> d reads what the first wrote: waits
+    try std.testing.expect(h.barrierBefore(&.{ .prog = &prog_rw, .groups = .{ 1, 1, 1 }, .buffers = &.{ b, d }, .params = &.{} }));
+    // d -> a writes what nothing since the barrier read... but a dispatch
+    // that writes b, which the one before read: waits (write after read)
+    try std.testing.expect(h.barrierBefore(&.{ .prog = &prog_rw, .groups = .{ 1, 1, 1 }, .buffers = &.{ c, b }, .params = &.{} }));
+    // (noted now: c read, b written) a binary that writes all it binds:
+    // apart from them, it runs with them; writing c, read before, waits
+    try std.testing.expect(!h.barrierBefore(&.{ .prog = &prog_all, .groups = .{ 1, 1, 1 }, .buffers = &.{ a, d }, .params = &.{} }));
+    try std.testing.expect(h.barrierBefore(&.{ .prog = &prog_all, .groups = .{ 1, 1, 1 }, .buffers = &.{ c, .{ .gpu = 0x5000, .bytes = 16 } }, .params = &.{} }));
+    // a sub-range of a written buffer meets it
+    h = .{};
+    _ = h.barrierBefore(&.{ .prog = &prog_rw, .groups = .{ 1, 1, 1 }, .buffers = &.{ a, b }, .params = &.{} });
+    try std.testing.expect(h.barrierBefore(&.{ .prog = &prog_rw, .groups = .{ 1, 1, 1 }, .buffers = &.{ .{ .gpu = 0x2080, .bytes = 16 }, c }, .params = &.{} }));
+}
 /// A Binary placed in device memory.
 pub const Program = struct { bin: Binary, code: Buffer };
 
@@ -257,7 +346,11 @@ pub fn compile(k: *const kir.Kernel, caps: Caps, work: *Work, out: []u8) !Binary
 pub fn compileFor(comptime targets: []const Target, k: *const kir.Kernel, caps: Caps, work: *Work, out: []u8) !Binary {
     try kir.verify(k, caps);
     inline for (targets) |t| {
-        if (caps.target == t) return compileOne(t, k, caps, work, out);
+        if (caps.target == t) {
+            var bin = try compileOne(t, k, caps, work, out);
+            bin.writes = kir.writtenBindings(k);
+            return bin;
+        }
     }
     return error.Unsupported;
 }

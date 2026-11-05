@@ -215,6 +215,38 @@ pub fn memRegs(m: Mem) u8 {
         else => 1,
     };
 }
+/// The bindings `k` stores to or does atomics on, bit i for binding i (all
+/// bits for a binding of 32 or more): what a run's barriers are decided by
+/// (device.Hazards). Loads only read.
+pub fn writtenBindings(k: *const Kernel) u32 {
+    var mask: u32 = 0;
+    for (k.insts[0..k.n]) |in| switch (in.op) {
+        .st, .atom => {
+            const m: Mem = @bitCast(in.aux);
+            if (m.space != .global) continue;
+            mask |= if (m.binding < 32) @as(u32, 1) << @intCast(m.binding) else 0xffff_ffff;
+        },
+        else => {},
+    };
+    return mask;
+}
+
+test "kir: the bindings a kernel writes" {
+    var insts: [16]Inst = undefined;
+    var tys: [16]Ty = undefined;
+    var k = Kernel.init(.{ .insts = &insts, .tys = &tys }, "w", .{ 32, 1, 1 });
+    const a = k.binding();
+    const b = k.binding();
+    const c = k.binding();
+    const t = k.tid(0);
+    const off = k.op2(.shl, .u32, r(t), u(2));
+    const x = k.load(.u32, global(a, 32), r(off));
+    k.store(.u32, global(c, 32), r(off), r(x));
+    _ = k.atomic(.u32, .add, global(b, 32), r(off), r(x));
+    try k.finish();
+    try std.testing.expectEqual(@as(u32, 0b110), writtenBindings(&k));
+}
+
 /// The bytes an access of `m` moves.
 pub fn memBytes(m: Mem) u32 {
     return @as(u32, 1) << (@as(u5, m.width_log2) - 3);

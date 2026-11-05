@@ -115,6 +115,8 @@ pub const Adapter = struct {
     last_set: ?usize = null,
     /// Runs submitted, and the ones whose dispatches failed on the GPU.
     runs: u64 = 0,
+    /// The waits for idle the last run took between its dispatches.
+    barriers: u32 = 0,
     lost: u64 = 0,
     last_error: ?anyerror = null,
 
@@ -232,6 +234,8 @@ pub const Adapter = struct {
         p.computeSetup(.{});
         p.invalidateShaderCaches();
         p.reportTimestamp(s.stamps.va, 1);
+        var hz = gpu.Hazards{};
+        a.barriers = 0;
         for (ds, 0..) |d, i| {
             const bin = &d.prog.bin;
             if (d.buffers.len != bin.bindings or d.params.len != bin.param_words) return error.BadProgram;
@@ -258,9 +262,12 @@ pub const Adapter = struct {
             }
             const cb: *[qmd.CBUF0_WORDS]u32 = @ptrCast(@alignCast(s.slots.cpu[at + CBUF_AT ..][0..qmd.CBUF0_BYTES]));
             qmd.cbuf0(cb, d.groups, bin.group, params[0..n]) catch return error.BadProgram;
-            if (i > 0) {
+            // (each dispatch sees the writes of those before it that it
+            // meets; the others run with it)
+            if (hz.barrierBefore(&d) and i > 0) {
                 p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
                 p.invalidateShaderCaches();
+                a.barriers += 1;
             }
             p.launch(s.slots.va + at);
         }
