@@ -2900,6 +2900,156 @@ pub fn Exec(comptime config: types.Config) type {
                 return self.finish(p,out);
             }
 
+            /// The group record of grouping set `set` (bit mask `mask` over
+            /// the keys) for `keys`; omitted keys are NULL. The set index is
+            /// part of the identity, so repeated sets keep separate groups.
+            fn groupingSetRecord(self: *Query, p: *const B.Plan, keys: []const V.Cell, set: usize, mask: u64, buckets: u32, slots: usize,
+                tickets: u32, groups: *usize, capacity: usize, record_cells: usize, ordinary_cells: usize, distinct: *const DistinctLayout) Error!u32 {
+                var code: usize = 2166136261 ^ set;
+                const null_value: V.Cell = .null_value;
+                for (keys, 0..) |*key, column| {
+                    const included = (mask >> @intCast(column)) & 1 != 0;
+                    const cell = if (included) key else &null_value;
+                    const hash: usize = if (cell.* == .null_value) 0x9e3779b9 else V.hash(cell);
+                    code = (code ^ hash) *% 16777619;
+                }
+                var bucket = code & (slots - 1);
+                while (true) {
+                    try self.session.checkpoint();
+                    self.work.stream_stats.probes += 1;
+                    const found = self.work.refs[buckets + bucket];
+                    if (found == absent) {
+                        if (groups.* == capacity) return error.WorkspaceCapacity;
+                        const at = try self.cells(record_cells);
+                        for (keys, 0..) |key, column| self.work.cells[at + column] = if ((mask >> @intCast(column)) & 1 != 0) key else .null_value;
+                        self.work.cells[at + p.key_count + p.agg_count] = .{ .integer = @intCast(set) };
+                        for (self.accumulators(at + @as(u32, @intCast(p.key_count + p.agg_count + 1)), p.agg_count)) |*state| state.* = .{};
+                        if (distinct.active) @memset(self.distinctWords(at + @as(u32, @intCast(ordinary_cells)), distinct.words), 0);
+                        self.work.refs[buckets + bucket] = at;
+                        self.work.refs[tickets + groups.*] = at;
+                        groups.* += 1;
+                        return at;
+                    }
+                    var equal = self.work.cells[found + p.key_count + p.agg_count].integer == @as(i64, @intCast(set));
+                    if (equal) for (keys, 0..) |*key, column| {
+                        if ((mask >> @intCast(column)) & 1 == 0) continue;
+                        if (V.compare(key, &self.work.cells[found + column]) != 0) {
+                            equal = false;
+                            break;
+                        }
+                    };
+                    if (equal) return found;
+                    bucket = (bucket + 1) & (slots - 1);
+                }
+            }
+
+            /// GROUPING SETS / CUBE / composite ROLLUP (B11): one input pass;
+            /// every input row updates one group of every set. A set with no
+            /// key (`()`) has a group even over no input. GROUPING() reads the
+            /// omitted-key mask of the row's set. Bounded by the workspace
+            /// (54000) and the execution checkpoints.
+            fn groupingSets(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                if (p.key_count > 64) return error.StatementTooComplex;
+                const tuples = try self.join(p, outer);
+                for (p.aggs[0..p.agg_count], 0..) |agg, index| if (p.aggregate_required[index] and agg.distinct) {
+                    if (agg.kind != .count or !value_module.integral(agg.arg_ty)) return error.UnsupportedStatement;
+                    const argument = self.pool.nodes[agg.arg];
+                    if (argument.kind != .column or argument.level != 0 or argument.relation >= p.source_count or p.sources[argument.relation].table == null) return error.UnsupportedStatement;
+                };
+                const distinct = self.distinctLayout(p) orelse return error.WorkspaceCapacity;
+                const ordinary_cells = p.key_count + p.agg_count + 1 + accumulatorCells(p.agg_count);
+                const record_sum = @addWithOverflow(ordinary_cells, distinct.cells);
+                if (record_sum[1] != 0) return error.WorkspaceCapacity;
+                const record_cells = record_sum[0];
+                const capacity = @min((self.work.cell_high - self.work.cell_low) / (record_cells + p.width), (self.work.ref_high - self.work.ref_low) / 8);
+                if (capacity == 0) return error.WorkspaceCapacity;
+                var slots: usize = 2;
+                while (slots < capacity * 2) slots *= 2;
+                const buckets = try self.refs(slots);
+                @memset(self.work.refs[buckets..][0..slots], absent);
+                const tickets = try self.refs(capacity);
+                var groups: usize = 0;
+                var keys: [config.columns]V.Cell = @splat(.null_value);
+                // Empty grouping sets yield their group even without input.
+                var set_node = p.grouping_sets;
+                var set: usize = 0;
+                while (set_node != none) : ({
+                    set_node = self.pool.nodes[set_node].next;
+                    set += 1;
+                }) {
+                    const mask: u64 = @bitCast(self.pool.nodes[set_node].integer);
+                    if (mask == 0) _ = try self.groupingSetRecord(p, keys[0..p.key_count], set, 0, buckets, slots, tickets, &groups, capacity, record_cells, ordinary_cells, &distinct);
+                }
+                var ctx = self.context(outer);
+                for (0..tuples.count) |row_index| {
+                    try self.session.checkpoint();
+                    self.setTuple(p, &ctx, tuples, row_index);
+                    for (p.keys[0..p.key_count], 0..) |id, index| keys[index] = try E.eval(&ctx, id);
+                    var values: [config.columns]V.Cell = undefined;
+                    var allowed: [config.columns]bool = @splat(false);
+                    for (p.aggs[0..p.agg_count], 0..) |agg, index| {
+                        if (!p.aggregate_required[index]) continue;
+                        if (agg.filter != none and try E.truth(&ctx, agg.filter) != true) continue;
+                        if (agg.kind == .count_star) {
+                            allowed[index] = true;
+                            continue;
+                        }
+                        values[index] = try E.eval(&ctx, agg.arg);
+                        allowed[index] = values[index] != .null_value;
+                    }
+                    set_node = p.grouping_sets;
+                    set = 0;
+                    while (set_node != none) : ({
+                        set_node = self.pool.nodes[set_node].next;
+                        set += 1;
+                    }) {
+                        const mask: u64 = @bitCast(self.pool.nodes[set_node].integer);
+                        const at = try self.groupingSetRecord(p, keys[0..p.key_count], set, mask, buckets, slots, tickets, &groups, capacity, record_cells, ordinary_cells, &distinct);
+                        const states = self.accumulators(at + @as(u32, @intCast(p.key_count + p.agg_count + 1)), p.agg_count);
+                        const seen = self.distinctWords(at + @as(u32, @intCast(ordinary_cells)), distinct.words);
+                        for (p.aggs[0..p.agg_count], states, 0..) |agg, *state, index| {
+                            try self.session.checkpoint();
+                            if (!allowed[index]) continue;
+                            if (agg.kind == .count_star) {
+                                state.count += 1;
+                                continue;
+                            }
+                            if (agg.distinct) {
+                                const domain = distinct.domains[index];
+                                const relative = @as(i128, values[index].integer) - domain.base;
+                                if (relative < 0 or relative >= domain.span) return error.WorkspaceCapacity;
+                                const position: usize = @intCast(relative);
+                                const bit = @as(u64, 1) << @as(u6, @intCast(position % 64));
+                                const word = &seen[domain.offset + position / 64];
+                                if (word.* & bit != 0) continue;
+                                word.* |= bit;
+                            }
+                            try self.accumulate(&agg, state, &values[index]);
+                        }
+                    }
+                }
+                if (groups > 1) {
+                    const scratch = try self.refs(groups);
+                    const sorter: GroupSorter = .{ .query = self, .width = p.key_count };
+                    _ = try sort_module.mergeSort(self.work.refs[tickets..][0..groups], self.work.refs[scratch..][0..groups], &sorter);
+                }
+                var out: List = .{};
+                for (self.work.refs[tickets..][0..groups]) |at| {
+                    const index: usize = @intCast(self.work.cells[at + p.key_count + p.agg_count].integer);
+                    var node = p.grouping_sets;
+                    for (0..index) |_| node = self.pool.nodes[node].next;
+                    const mask: u64 = @bitCast(self.pool.nodes[node].integer);
+                    // GROUPING() reads key i at bit key_count-1-i (as ROLLUP).
+                    var omitted: u64 = 0;
+                    for (0..p.key_count) |key| {
+                        if ((mask >> @intCast(key)) & 1 == 0) omitted |= @as(u64, 1) << @intCast(p.key_count - 1 - key);
+                    }
+                    try self.projectGroupMask(p, at, self.accumulators(at + @as(u32, @intCast(p.key_count + p.agg_count + 1)), p.agg_count), outer, &out, omitted);
+                }
+                self.work.stream_stats.groups += groups;
+                return self.finish(p, out);
+            }
+
             fn windowIncluded(self:*const Query,win:*const B.Window,at:u32) bool {
                 if(win.filter_column==none) return true;
                 const flag=&self.work.cells[at+win.filter_column];return flag.*==.boolean and flag.boolean;
@@ -3299,6 +3449,7 @@ pub fn Exec(comptime config: types.Config) type {
 
             fn core(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
                 if(p.window_count!=0) return self.windowCore(p,outer);
+                if (p.grouping_sets != none) return self.groupingSets(p, outer);
                 if(p.rollup) return self.groupingRollup(p,outer);
                 if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(self.repeatable()) {
                     const at=self.mark();const stats=self.work.stream_stats;

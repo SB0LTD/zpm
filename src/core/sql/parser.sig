@@ -1991,6 +1991,185 @@ pub fn Parser(comptime config: types.Config) type {
             return self.core();
         }
 
+        const GroupingKind = enum { expression, empty, rollup, cube, sets };
+
+        /// PostgreSQL's limit on expanded grouping sets (54001).
+        const max_grouping_sets: usize = 4096;
+
+        /// GROUP BY [ALL | DISTINCT] element, ... (B11). Elements are
+        /// expressions, `()`, ROLLUP / CUBE (items may be composite `(a, b)`)
+        /// and GROUPING SETS (nested elements). A plain list, one ROLLUP of
+        /// plain expressions and a lone `()` keep the original grouping and
+        /// ROLLUP representation; anything else expands to the cross product
+        /// of the elements' sets (PostgreSQL expand_grouping_sets) as bit
+        /// masks over `out.group` positions in Select.grouping_sets.
+        fn groupClause(self: *Self, out: *Ast.Select) Error!void {
+            if (try self.takeWord("DISTINCT")) out.group_distinct = true else _ = try self.takeWord("ALL");
+            var sets = try self.maskNode(0);
+            var elements: usize = 0;
+            var plain = true;
+            var lone: GroupingKind = .expression;
+            var lone_simple = true;
+            while (true) {
+                const kind = try self.groupingKind();
+                var simple = true;
+                const element = try self.groupingElement(out, kind, true, &simple);
+                if (kind != .expression) plain = false;
+                lone = kind;
+                lone_simple = simple;
+                sets = try self.productSets(sets, element);
+                elements += 1;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            if (plain) return;
+            if (elements == 1 and (lone == .empty or (lone == .rollup and lone_simple))) {
+                out.rollup = true;
+                return;
+            }
+            if (out.group_count > 64) return error.StatementTooComplex;
+            out.grouping_sets = sets;
+        }
+
+        fn groupingKind(self: *Self) Error!GroupingKind {
+            if (self.mode != .standard) return .expression;
+            const next = try self.peek();
+            const lparen = next.kind == .symbol and next.symbol == .lparen;
+            if (self.isSymbol(.lparen) and next.kind == .symbol and next.symbol == .rparen) return .empty;
+            if (self.isWord("ROLLUP") and lparen) return .rollup;
+            if (self.rawWord("grouping") and wordIs(self.source, next, "sets")) return .sets;
+            return .expression;
+        }
+
+        fn maskNode(self: *Self, mask: u64) Error!u16 {
+            return self.pool.add(.{ .kind = .int_literal, .integer = @bitCast(mask) });
+        }
+
+        fn maskOf(self: *const Self, node: u16) u64 {
+            return @bitCast(self.pool.nodes[node].integer);
+        }
+
+        /// Appends `id` as a grouping key and returns its bit.
+        fn groupBit(self: *Self, out: *Ast.Select, id: u16) Error!u64 {
+            if (out.group_count == config.columns) return error.ColumnCapacity;
+            if (out.group_count == 64) return error.StatementTooComplex;
+            self.pool.nodes[id].next = none;
+            out.group[out.group_count] = id;
+            out.group_count += 1;
+            return @as(u64, 1) << @intCast(out.group_count - 1);
+        }
+
+        /// One expression or, written as `(a, b, ...)`, a composite set.
+        /// `simple` turns false for a composite.
+        fn groupingItem(self: *Self, out: *Ast.Select, simple: *bool) Error!u64 {
+            const parenthesized = self.isSymbol(.lparen);
+            const id = try self.expression();
+            if (!parenthesized or self.pool.nodes[id].kind != .row_constructor) return self.groupBit(out, id);
+            simple.* = false;
+            var mask: u64 = 0;
+            var member = self.pool.nodes[id].b;
+            while (member != none) {
+                const next = self.pool.nodes[member].next;
+                mask |= try self.groupBit(out, member);
+                member = next;
+            }
+            return mask;
+        }
+
+        /// The grouping sets of one element as a mask list.
+        fn groupingElement(self: *Self, out: *Ast.Select, kind: GroupingKind, top: bool, simple: *bool) Error!u16 {
+            try self.enter();
+            defer self.leave();
+            switch (kind) {
+                .empty => {
+                    try self.advance();
+                    try self.advance();
+                    return self.maskNode(0);
+                },
+                .expression => return self.maskNode(try self.groupingItem(out, simple)),
+                .rollup, .cube => {
+                    try self.advance();
+                    try self.expectSymbol(.lparen);
+                    var items: [config.columns]u64 = undefined;
+                    var count: usize = 0;
+                    while (true) {
+                        if (count == config.columns) return error.ColumnCapacity;
+                        items[count] = try self.groupingItem(out, simple);
+                        count += 1;
+                        if (!try self.takeSymbol(.comma)) break;
+                    }
+                    try self.expectSymbol(.rparen);
+                    var head: u16 = none;
+                    var last: u16 = none;
+                    if (kind == .rollup) {
+                        // PostgreSQL order: the longest prefix first, () last.
+                        var size = count + 1;
+                        while (size != 0) {
+                            size -= 1;
+                            var mask: u64 = 0;
+                            for (items[0..size]) |item| mask |= item;
+                            try self.appendMask(&head, &last, mask);
+                        }
+                    } else {
+                        // PostgreSQL: CUBE is limited to 12 elements (54000).
+                        if (count > 12) return error.ProgramLimitExceeded;
+                        for (0..@as(usize, 1) << @intCast(count)) |subset| {
+                            var mask: u64 = 0;
+                            for (items[0..count], 0..) |item, bit| {
+                                if ((subset >> @intCast(bit)) & 1 != 0) mask |= item;
+                            }
+                            try self.appendMask(&head, &last, mask);
+                        }
+                    }
+                    return head;
+                },
+                .sets => {
+                    try self.advance();
+                    try self.advance();
+                    try self.expectSymbol(.lparen);
+                    simple.* = false;
+                    var head: u16 = none;
+                    var last: u16 = none;
+                    var total: usize = 0;
+                    while (true) {
+                        const inner = try self.groupingKind();
+                        var nested = try self.groupingElement(out, inner, false, simple);
+                        while (nested != none) : (nested = self.pool.nodes[nested].next) {
+                            total += 1;
+                            if (total > max_grouping_sets) return error.StatementTooComplex;
+                            try self.appendMask(&head, &last, self.maskOf(nested));
+                        }
+                        if (!try self.takeSymbol(.comma)) break;
+                    }
+                    try self.expectSymbol(.rparen);
+                    _ = top;
+                    return head;
+                },
+            }
+        }
+
+        fn appendMask(self: *Self, head: *u16, last: *u16, mask: u64) Error!void {
+            const node = try self.maskNode(mask);
+            if (head.* == none) head.* = node else self.pool.nodes[last.*].next = node;
+            last.* = node;
+        }
+
+        /// Cross product of two mask lists (left-major), at most 4096 sets.
+        fn productSets(self: *Self, left: u16, right: u16) Error!u16 {
+            var head: u16 = none;
+            var last: u16 = none;
+            var total: usize = 0;
+            var a = left;
+            while (a != none) : (a = self.pool.nodes[a].next) {
+                var b = right;
+                while (b != none) : (b = self.pool.nodes[b].next) {
+                    total += 1;
+                    if (total > max_grouping_sets) return error.StatementTooComplex;
+                    try self.appendMask(&head, &last, self.maskOf(a) | self.maskOf(b));
+                }
+            }
+            return head;
+        }
+
         /// VALUES (e, ...) [, (e, ...)] ...: a query block of literal rows
         /// whose columns are column1..columnN. Every row has the same width
         /// (42601 otherwise); DEFAULT belongs to INSERT only.
@@ -2095,22 +2274,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and try self.takeWord("GROUP")) {
                 try self.expectWord("BY");
                 self.pool.complex = true;
-                var empty=false;
-                if(self.isSymbol(.lparen)) {
-                    const next=try self.peek();
-                    if(next.kind==.symbol and next.symbol==.rparen) {try self.advance();try self.advance();empty=true;out.rollup=true;}
-                }
-                if(!empty) {
-                    out.rollup=try self.takeWord("ROLLUP");
-                    if(out.rollup){try self.expectSymbol(.lparen);if(self.isSymbol(.rparen)) return error.Syntax;}
-                    while (true) {
-                        if (out.group_count == config.columns) return error.ColumnCapacity;
-                        out.group[out.group_count] = try self.expression();
-                        out.group_count += 1;
-                        if (!try self.takeSymbol(.comma)) break;
-                    }
-                    if(out.rollup) try self.expectSymbol(.rparen);
-                }
+                try self.groupClause(out);
             }
             if (self.mode == .standard and try self.takeWord("HAVING")) {
                 self.pool.complex = true;

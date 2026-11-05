@@ -481,6 +481,9 @@ pub fn Binder(comptime config: types.Config) type {
             /// FETCH FIRST n ROWS WITH TIES: `limit` stays unbounded (so no
             /// early-stop path cuts peers); finish keeps ties_limit rows and
             /// every following row equal on the ORDER BY keys tie_keys.
+            /// GROUPING SETS / CUBE / composite ROLLUP: int_literal nodes
+            /// linked by `next`, each a bit mask over `keys` (Exec.groupingSets).
+            grouping_sets: u16 = none,
             with_ties: bool = false,
             ties_limit: u64 = 0xffffffffffffffff,
             tie_keys: [config.columns]SortKey = undefined,
@@ -4327,6 +4330,59 @@ pub fn Binder(comptime config: types.Config) type {
             return correlatedSublink(context, n.b);
         }
 
+        /// GROUPING SETS (B11): equal key expressions share one key, so a
+        /// key is NULL exactly in the sets that omit it; the masks are
+        /// rewritten in place over the deduplicated keys. GROUP BY DISTINCT
+        /// drops repeated sets (PostgreSQL keeps repeats otherwise).
+        fn bindGroupingSets(context: *const Context, q: *const Ast.Select, p: *Plan) Error!void {
+            var canonical: [64]u6 = undefined;
+            var kept: usize = 0;
+            var unique: [config.columns]u16 = undefined;
+            if (p.key_count > 64) return error.StatementTooComplex;
+            for (p.keys[0..p.key_count], 0..) |key, index| {
+                var found: ?usize = null;
+                for (unique[0..kept], 0..) |other, position| if (sameExpr(context, other, key)) {
+                    found = position;
+                    break;
+                };
+                if (found == null) {
+                    unique[kept] = key;
+                    found = kept;
+                    kept += 1;
+                }
+                canonical[index] = @intCast(found.?);
+            }
+            for (unique[0..kept], 0..) |key, index| p.keys[index] = key;
+            const original = p.key_count;
+            p.key_count = kept;
+            var head: u16 = none;
+            var last: u16 = none;
+            var node = q.grouping_sets;
+            while (node != none) {
+                const next = context.node(node).next;
+                const mask: u64 = @bitCast(context.node(node).integer);
+                var remapped: u64 = 0;
+                for (0..original) |bit| {
+                    if ((mask >> @intCast(bit)) & 1 != 0) remapped |= @as(u64, 1) << canonical[bit];
+                }
+                context.node(node).integer = @bitCast(remapped);
+                var duplicate = false;
+                if (q.group_distinct) {
+                    var seen = head;
+                    while (seen != none) : (seen = context.node(seen).next) {
+                        if (context.node(seen).integer == context.node(node).integer) duplicate = true;
+                    }
+                }
+                if (!duplicate) {
+                    context.node(node).next = none;
+                    if (head == none) head = node else context.node(last).next = node;
+                    last = node;
+                }
+                node = next;
+            }
+            p.grouping_sets = head;
+        }
+
         /// FETCH ... WITH TIES over the ORDER BY keys `keys` (B11).
         fn bindTies(q: *const Ast.Select, p: *Plan, keys: []const SortKey) void {
             if (!q.with_ties) return;
@@ -4994,6 +5050,7 @@ pub fn Binder(comptime config: types.Config) type {
                 p.keys[p.key_count] = try groupKey(context, &scope, q, expr_id);
                 p.key_count += 1;
             }
+            if (q.grouping_sets != none) try bindGroupingSets(context, q, p);
             var saw = false;
             scope.aggregates = true;
             scope.windows = true;
@@ -5060,7 +5117,7 @@ pub fn Binder(comptime config: types.Config) type {
                 p.planned_checked=true;p.planned_error=pending;
             }
             p.rollup=q.rollup;
-            p.grouped = q.rollup or p.key_count != 0 or saw or p.having != none;
+            p.grouped = q.rollup or p.key_count != 0 or saw or p.having != none or p.grouping_sets != none;
             if (p.grouped) {
                 window_def=q.window_defs;
                 while(window_def!=none) : (window_def=context.pool.windows[window_def].next) {
@@ -5344,6 +5401,7 @@ pub fn Binder(comptime config: types.Config) type {
                 for(p.window_late[0..p.width]) |late| if(late) return error.UnsupportedStatement;
             }
             p.source_count=1;p.sources[0]=.{.plan=child};p.where=none;p.grouped=false;p.rollup=false;p.key_count=0;p.agg_count=0;p.window_aggregate_count=0;p.having=none;
+            p.grouping_sets=none;
         }
 
         fn member(list: []const u16, column: u16) bool {
@@ -5460,7 +5518,7 @@ pub fn Binder(comptime config: types.Config) type {
             var conservative=bound.*!=.query;
             for(plans.items[0..plans.len]) |*p| conservative=conservative or p.correlated;
             // B11 composition plans keep every output (no demand pruning).
-            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none or p.with_ties;
+            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none or p.with_ties or p.grouping_sets!=none;
             for(plans.items[0..plans.len]) |*p| {p.demanded=conservative;p.required=@splat(conservative);p.aggregate_required=@splat(conservative);}
             if(conservative) return;
             var cte_references:[config.ctes]usize=@splat(0);

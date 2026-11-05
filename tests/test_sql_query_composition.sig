@@ -414,6 +414,57 @@ fn fetchTies() !void {
     try controlled("SELECT g FROM tdd_a ORDER BY g DESC FETCH FIRST 1 ROW WITH TIES", "2;2");
 }
 
+// ---- PG.GROUP.SETS / PG.GROUP.CUBE ----------------------------------------
+
+fn groupingSets() !void {
+    // oracle
+    try expectTyped("SELECT g,COUNT(*) FROM tdd_a GROUP BY GROUPING SETS ((g),()) ORDER BY GROUPING(g),g", "g:23,count:20", "1|2;2|2;NULL|4");
+    try expect("SELECT g,v,SUM(v),GROUPING(g),GROUPING(v),GROUPING(g,v) FROM tdd_a GROUP BY GROUPING SETS ((g),(v),()) ORDER BY GROUPING(g,v),g,v NULLS FIRST",
+        "1|NULL|30|0|1|1;2|NULL|30|0|1|1;NULL|NULL|NULL|1|0|2;NULL|10|10|1|0|2;NULL|20|20|1|0|2;NULL|30|30|1|0|2;NULL|NULL|60|1|1|3");
+    // Repeated sets repeat their groups unless GROUP BY DISTINCT.
+    try expect("SELECT g,COUNT(*) FROM tdd_a GROUP BY GROUPING SETS ((g),(g)) ORDER BY g", "1|2;1|2;2|2;2|2");
+    try expect("SELECT g,COUNT(*) FROM tdd_a GROUP BY DISTINCT GROUPING SETS ((g),(g)) ORDER BY g", "1|2;2|2");
+    try expect("SELECT g,COUNT(*) FROM tdd_a GROUP BY ROLLUP(g),g ORDER BY g", "1|2;1|2;2|2;2|2");
+    try expect("SELECT g,COUNT(*) FROM tdd_a GROUP BY ALL GROUPING SETS ((g)) ORDER BY g", "1|2;2|2");
+    // Elements combine by cross product; composite and nested elements.
+    try expect("SELECT g,v,COUNT(*) FROM tdd_a GROUP BY g,GROUPING SETS ((v),()) ORDER BY g,GROUPING(v),v NULLS FIRST", "1|10|1;1|20|1;1|NULL|2;2|NULL|1;2|30|1;2|NULL|2");
+    try expect("SELECT g,v,COUNT(*) FROM tdd_a GROUP BY ROLLUP((g,v)) ORDER BY GROUPING(g,v),g,v", "1|10|1;1|20|1;2|30|1;2|NULL|1;NULL|NULL|4");
+    try expect("SELECT g,v,COUNT(*) FROM tdd_a GROUP BY GROUPING SETS (g,ROLLUP(v),GROUPING SETS ((),())) ORDER BY GROUPING(g,v),g,v NULLS FIRST", "1|NULL|2;2|NULL|2;NULL|NULL|1;NULL|10|1;NULL|20|1;NULL|30|1;NULL|NULL|4;NULL|NULL|4;NULL|NULL|4");
+    try expect("SELECT g,COUNT(*) FROM tdd_a GROUP BY (g) ORDER BY g", "1|2;2|2");
+    try expect("SELECT g,v,COUNT(*) FROM tdd_a GROUP BY (g,v) ORDER BY g,v", "1|10|1;1|20|1;2|30|1;2|NULL|1");
+    // Expression keys, HAVING, DISTINCT aggregates, windows and joins.
+    try expect("SELECT g+1,COUNT(*) FROM tdd_a GROUP BY GROUPING SETS ((g+1),()) ORDER BY 1", "2|2;3|2;NULL|4");
+    try expect("SELECT g,COUNT(*) FROM tdd_a GROUP BY GROUPING SETS ((g),()) HAVING COUNT(*)>2", "NULL|4");
+    try expect("SELECT g,COUNT(DISTINCT v) FROM tdd_a GROUP BY GROUPING SETS ((g),()) ORDER BY GROUPING(g),g", "1|2;2|1;NULL|3");
+    try expect("SELECT g,COUNT(*),RANK() OVER (ORDER BY COUNT(*) DESC) FROM tdd_a GROUP BY GROUPING SETS ((g),()) ORDER BY GROUPING(g),g", "1|2|2;2|2|2;NULL|4|1");
+    try expect("SELECT g,a.v,COUNT(*) FROM tdd_a a JOIN tdd_b b USING (id) GROUP BY GROUPING SETS ((g,a.v),(g),(a.v),()) ORDER BY GROUPING(g,a.v),g,a.v", "1|10|1;2|30|1;1|NULL|1;2|NULL|1;NULL|10|1;NULL|30|1;NULL|NULL|2");
+    // Empty input: only sets without keys produce a row.
+    try expect("SELECT g,COUNT(*) FROM tdd_a WHERE false GROUP BY GROUPING SETS ((g),())", "NULL|0");
+    try expect("SELECT g,COUNT(*),GROUPING(g) FROM tdd_a WHERE false GROUP BY GROUPING SETS ((),(g))", "NULL|0|1");
+    try expect("SELECT g,COUNT(*) FROM tdd_a WHERE false GROUP BY GROUPING SETS ((g))", "");
+    try expect("SELECT COUNT(*) FROM tdd_a WHERE false GROUP BY GROUPING SETS ((),())", "0;0");
+    // A volatile input is evaluated once per row and shared by every set.
+    try run("CREATE SEQUENCE gs");
+    try expect("SELECT GROUPING(g),SUM(nextval('gs')) FROM tdd_a GROUP BY GROUPING SETS ((g),()) ORDER BY 1,2", "0|3;0|7;1|10");
+    try expect("SELECT currval('gs')", "4");
+    // Errors.
+    try rejects("SELECT v,COUNT(*) FROM tdd_a GROUP BY GROUPING SETS ((g),())", error.GroupingError);
+    try rejects("SELECT GROUPING(v) FROM tdd_a GROUP BY GROUPING SETS ((g))", error.GroupingError);
+    try rejects("SELECT COUNT(*) FROM tdd_a GROUP BY GROUPING SETS ()", error.Syntax);
+    try rejects("SELECT COUNT(*) FROM tdd_a GROUP BY ROLLUP(())", error.Syntax);
+    try rejects("SELECT g,COUNT(DISTINCT v+1) FROM tdd_a GROUP BY GROUPING SETS ((g),())", error.UnsupportedStatement);
+    try rejects("SELECT g,COUNT(*) FROM tdd_a GROUP BY GROUPING SETS ((g),()) HAVING 1/(COUNT(*)-COUNT(*))>0", error.DivisionByZero);
+    // 4096 sets exceed the statement's expression-node budget (54001).
+    try rejects("SELECT COUNT(*) FROM tdd_a GROUP BY GROUPING SETS ((id),()),GROUPING SETS ((g),()),GROUPING SETS ((v),()),GROUPING SETS ((id+1),()),GROUPING SETS ((g+1),()),GROUPING SETS ((v+1),()),GROUPING SETS ((id+2),()),GROUPING SETS ((g+2),()),GROUPING SETS ((v+2),()),GROUPING SETS ((id+3),()),GROUPING SETS ((g+3),()),GROUPING SETS ((v+3),())", error.StatementTooComplex);
+    try controlled("SELECT g,v,COUNT(*) FROM tdd_a GROUP BY GROUPING SETS ((g),(v),()) ORDER BY GROUPING(g,v),g,v NULLS FIRST", "1|NULL|2;2|NULL|2;NULL|NULL|1;NULL|10|1;NULL|20|1;NULL|30|1;NULL|NULL|4");
+    // A one-row workspace cannot hold the groups (54000), atomically.
+    try small.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,k INTEGER)", &small_result);
+    try small.execute("INSERT INTO t VALUES(1,1),(2,2),(3,3)", &small_result);
+    try small.execute("SELECT 123", &small_result);
+    if (small.execute("SELECT k,COUNT(*) FROM t GROUP BY GROUPING SETS ((k),())", &small_result)) |_| return error.ExpectedCapacity else |err| try check(err == error.WorkspaceCapacity);
+    try check(small_result.row_count == 1 and small_result.rows[0].cells[0].integer == 123);
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try naturalJoins();
@@ -421,6 +472,7 @@ pub fn main(init: std.process.Init) !void {
     try valuesAndTable();
     try limitExpressions();
     try fetchTies();
+    try groupingSets();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-query-composition\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
