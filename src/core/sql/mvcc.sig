@@ -173,6 +173,16 @@ pub fn Mvcc(comptime config: types.Config) type {
                     },
                     .alter_table => {
                         const copy = &db.tables[entry.table];
+                        // Index OIDs this ALTER took, when still the tail.
+                        var position = copy.index_count;
+                        while (position > 0) {
+                            position -= 1;
+                            const taken = copy.indexes[position].oid;
+                            var kept = false;
+                            const old = &db.tables[entry.old];
+                            for (old.indexes[0..old.index_count]) |*existing| kept = kept or existing.oid == taken;
+                            if (taken != 0 and !kept and db.oid_counter + types_first_oid == taken + 1) db.oid_counter -= 1;
+                        }
                         copy.live = false;
                         copy.pending_create = false;
                         db.tables[entry.old].pending_drop = false;

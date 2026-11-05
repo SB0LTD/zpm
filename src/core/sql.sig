@@ -1333,6 +1333,7 @@ pub fn Database(comptime config: Config) type {
                     try self.dropSchema(slot, drop, snap);
                     break :blk 0;
                 },
+                .drop_relation, .refresh_view, .set_constraints, .merge => return error.UnsupportedStatement,
                 .select, .query, .control => unreachable,
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound), .noop = bound == .noop };
@@ -1908,15 +1909,46 @@ pub fn Database(comptime config: Config) type {
                     const pkey = indexName(table) catch Name{};
                     var key_columns: [config.columns]u8 = undefined;
                     const primary_columns = primaryColumns(table, &key_columns);
+                    const relkind = [1]u8{table.relkind};
                     switch (view) {
                         .pg_class => {
-                            try sink.add(&.{ intCell(oid), nameCell(name), intCell(table.namespace), nameCell("r"), intCell(@intCast(table.column_count)) });
+                            try sink.add(&.{ intCell(oid), nameCell(name), intCell(table.namespace), nameCell(&relkind), intCell(@intCast(table.column_count)) });
                             if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), nameCell(pkey.slice()), intCell(table.namespace), nameCell("i"), intCell(@intCast(primary_columns.len)) });
+                            for (table.indexes[0..table.index_count]) |*index| {
+                                if (index.oid == 0) continue;
+                                try sink.add(&.{ intCell(index.oid), nameCell(index.name.slice()), intCell(table.namespace), nameCell("i"), intCell(@intCast(index.key_count + index.include_count)) });
+                            }
                         },
-                        .tables => try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(name), nameCell("BASE TABLE") }),
-                        .pg_index => if (S.keyed(table)) {
+                        .tables => if (table.relkind != 'm') {
+                            try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(name), nameCell(if (table.relkind == 'v') "VIEW" else "BASE TABLE") });
+                        },
+                        .pg_index => {
                             var key: [4 * config.columns]u8 = undefined;
-                            try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)) });
+                            if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)) });
+                            for (table.indexes[0..table.index_count]) |*index| {
+                                if (index.oid == 0) continue;
+                                try sink.add(&.{ intCell(index.oid), intCell(oid), boolCell(false), boolCell(index.unique), nameCell(indexKey(index.keyColumns(), &key)) });
+                            }
+                        },
+                        .pg_indexes => {
+                            var text: [512]u8 = undefined;
+                            if (S.keyed(table)) try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(pkey.slice()), .null_value, nameCell(indexDefinition(table, schema_name, pkey.slice(), true, primary_columns, &text)) });
+                            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                                if (constraint.kind != .unique) continue;
+                                try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(constraint.name.slice()), .null_value, nameCell(indexDefinition(table, schema_name, constraint.name.slice(), true, constraint.keyColumns(), &text)) });
+                            }
+                            for (table.indexes[0..table.index_count]) |*index| {
+                                try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(index.name.slice()), .null_value, nameCell(secondaryDefinition(table, schema_name, index, &text)) });
+                            }
+                        },
+                        .pg_views => if (table.relkind == 'v') {
+                            try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell("ramsql"), nameCell(table.query.slice()) });
+                        },
+                        .pg_matviews => if (table.relkind == 'm') {
+                            try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell("ramsql"), .null_value, boolCell(table.index_count != 0), boolCell(table.populated), nameCell(table.query.slice()) });
+                        },
+                        .pg_inherits => if (table.parent != 0) {
+                            try sink.add(&.{ intCell(oid), intCell(table.parent), intCell(1), boolCell(false) });
                         },
                         .table_constraints => {
                             if (S.keyed(table)) try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(pkey.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell("PRIMARY KEY") });
@@ -1969,6 +2001,81 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
+        /// pg_indexes.indexdef of a primary key or UNIQUE constraint index.
+        fn indexDefinition(table: *const S.Table, schema_name: []const u8, index_name: []const u8, unique: bool, columns: []const u8, out: *[512]u8) []const u8 {
+            var text: Writer512 = .{ .out = out };
+            text.add(if (unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
+            text.add(index_name);
+            text.add(" ON ");
+            text.add(schema_name);
+            text.add(".");
+            text.add(table.name.slice());
+            text.add(" USING btree (");
+            for (columns, 0..) |column, position| {
+                if (position != 0) text.add(", ");
+                text.add(table.columns[column].name.slice());
+            }
+            text.add(")");
+            return text.slice();
+        }
+
+        /// pg_indexes.indexdef of a secondary index (expression elements and
+        /// the predicate are their stored source texts).
+        fn secondaryDefinition(table: *const S.Table, schema_name: []const u8, index: *const S.Index, out: *[512]u8) []const u8 {
+            var text: Writer512 = .{ .out = out };
+            text.add(if (index.unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
+            text.add(index.name.slice());
+            text.add(" ON ");
+            text.add(schema_name);
+            text.add(".");
+            text.add(table.name.slice());
+            text.add(" USING btree (");
+            var at: usize = 0;
+            const expressions = index.expressions.slice();
+            for (index.keyColumns(), 0..) |column, position| {
+                if (position != 0) text.add(", ");
+                if (column == S.expression_key) {
+                    var end = at;
+                    while (end < expressions.len and expressions[end] != 0) end += 1;
+                    text.add("(");
+                    text.add(expressions[at..end]);
+                    text.add(")");
+                    at = end + 1;
+                } else text.add(table.columns[column].name.slice());
+                if (index.options[position] & 1 != 0) text.add(" DESC");
+            }
+            text.add(")");
+            if (index.include_count != 0) {
+                text.add(" INCLUDE (");
+                for (index.includes[0..index.include_count], 0..) |column, position| {
+                    if (position != 0) text.add(", ");
+                    text.add(table.columns[column].name.slice());
+                }
+                text.add(")");
+            }
+            if (index.nulls_not_distinct) text.add(" NULLS NOT DISTINCT");
+            if (index.predicate.len != 0) {
+                text.add(" WHERE (");
+                text.add(index.predicate.slice());
+                text.add(")");
+            }
+            return text.slice();
+        }
+
+        /// Bounded text assembly (truncates at 512 bytes).
+        const Writer512 = struct {
+            out: *[512]u8,
+            len: usize = 0,
+            fn add(self: *Writer512, bytes: []const u8) void {
+                const take = @min(bytes.len, self.out.len - self.len);
+                @memcpy(self.out[self.len..][0..take], bytes[0..take]);
+                self.len += take;
+            }
+            fn slice(self: *const Writer512) []const u8 {
+                return self.out[0..self.len];
+            }
+        };
+
         /// Primary-key columns in key order (empty without a primary key).
         fn primaryColumns(table: *const S.Table, out: *[config.columns]u8) []const u8 {
             if (table.primary_column) |column| {
@@ -1990,7 +2097,7 @@ pub fn Database(comptime config: Config) type {
                     at += 1;
                 }
                 var digits: [4]u8 = undefined;
-                const text = formatSmall(@as(usize, column) + 1, &digits);
+                const text = formatSmall(if (column == S.expression_key) 0 else @as(usize, column) + 1, &digits);
                 @memcpy(out[at..][0..text.len], text);
                 at += text.len;
             }
@@ -2247,9 +2354,11 @@ pub fn Database(comptime config: Config) type {
                 const value = try E.eval(&ctx, alter.fills[position]);
                 if (value != .null_value) fills[position] = try D.store(column, value, &self.session);
             }
+            if (alter.extras.index_count != 0 and source.version_used > S.index_entry_capacity) return error.IndexCapacity;
             S.reset(copy, source.oid, alter.name, alter.columns[0..alter.count]);
             copy.namespace = source.namespace;
             S.setConstraints(copy, alter.constraints[0..alter.constraint_count]);
+            S.setExtras(copy, &alter.extras);
             S.copyRelayout(copy, source, alter.sources[0..alter.count], fills[0..alter.count]);
             copy.live = true;
             copy.pending_create = true;
@@ -2262,6 +2371,13 @@ pub fn Database(comptime config: Config) type {
             count = try self.catalog.create(index, copy, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
             try self.validateAltered(slot, index, alter, snap);
+            // CREATE INDEX: OIDs are taken last, so a failed statement
+            // leaves the counter as it was (abort restores a tail OID).
+            for (copy.indexes[0..copy.index_count]) |*created| if (created.oid == 0) {
+                if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
+                created.oid = change_log.first_oid + self.oid_counter;
+                self.oid_counter += 1;
+            };
         }
 
         /// Existing rows against the constraints ALTER TABLE added or
@@ -2296,6 +2412,15 @@ pub fn Database(comptime config: Config) type {
                         },
                     }
                 }
+                if (alter.check_index) |which| switch (S.indexUniqueCheck(table, which, cells, @intCast(row), snap)) {
+                    .free => {},
+                    .taken => return error.PrimaryKeyViolation,
+                    .wait => |owner| {
+                        var waits: L.Set = .{};
+                        waits.add(owner);
+                        return self.park(slot, waits);
+                    },
+                };
             }
         }
 
@@ -2417,7 +2542,61 @@ pub fn Database(comptime config: Config) type {
                     },
                 }
             }
+            // UNIQUE indexes (CREATE UNIQUE INDEX) probe their own entries.
+            for (table.indexes[0..table.index_count], 0..) |*index, which| {
+                if (!index.unique) continue;
+                if (old) |previous| {
+                    var changed = false;
+                    for (index.keyColumns()) |column| {
+                        if (@as(V.CellTag, previous[column]) != @as(V.CellTag, cells[column]) or V.compare(&previous[column], &cells[column]) != 0) changed = true;
+                    }
+                    if (!changed) continue;
+                }
+                switch (S.indexUniqueCheck(table, which, cells, own_slot, snap)) {
+                    .free => {},
+                    .taken => |version| return version,
+                    .wait => |owner| {
+                        var waits: L.Set = .{};
+                        waits.add(owner);
+                        return self.park(slot, waits);
+                    },
+                }
+            }
             return null;
+        }
+
+        /// Secondary index probe of a committed table by index name, for
+        /// contracts that compare the index path with a scan: the number of
+        /// rows visible to the committed view whose plain key columns equal
+        /// `key` (in index key order), from the index (`probe`) or a scan.
+        pub fn indexMatches(self: *const Self, table_name: []const u8, index_name: []const u8, key: []const Cell, probe: bool) ?usize {
+            const index = self.committedIndex(table_name) orelse return null;
+            const table = &self.tables[index];
+            for (table.indexes[0..table.index_count], 0..) |*definition, which| {
+                if (!types.same(definition.name.slice(), index_name)) continue;
+                var cells: E.Row = @splat(.null_value);
+                var position: usize = 0;
+                for (definition.keyColumns()) |column| {
+                    if (column == S.expression_key) continue;
+                    if (position == key.len) return null;
+                    cells[column] = key[position];
+                    position += 1;
+                }
+                var found: [64]u32 = undefined;
+                return if (probe) S.indexLookup(table, which, &cells, storage.committed_view, &found) else S.scanLookup(table, which, &cells, storage.committed_view, &found);
+            }
+            return null;
+        }
+
+        /// Index entries of every secondary index of a table, and whether
+        /// each equals the table's allocated versions (no stale entry).
+        pub fn indexConsistent(self: *const Self, table_name: []const u8) ?bool {
+            const index = self.committedIndex(table_name) orelse return null;
+            const table = &self.tables[index];
+            for (0..table.index_count) |which| {
+                if (S.indexEntries(table, which) != table.version_used) return false;
+            }
+            return true;
         }
 
         /// Places a new row version (key already checked). Capacity errors

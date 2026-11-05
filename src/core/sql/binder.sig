@@ -54,7 +54,27 @@ pub fn Binder(comptime config: types.Config) type {
             /// SERIAL columns' owned sequences, created after the table.
             serials: [config.columns]Identity = undefined,
             serial_count: usize = 0,
+            /// Relation kind, indexes (LIKE INCLUDING INDEXES), view query,
+            /// inheritance and partitioning.
+            extras: S.Extras = .{},
+            /// CREATE TABLE AS / CREATE MATERIALIZED VIEW: root plan of the
+            /// rows inserted (none: no rows).
+            plan: u16 = none,
+            command: types.CommandTag = .create_table,
+            /// PARTITION OF: bound values checked against sibling partitions.
+            parent_slot: ?usize = null,
         };
+
+        /// DROP TABLE / VIEW / MATERIALIZED VIEW [CASCADE].
+        pub const DropRelation = struct { slot: usize, cascade: bool, command: types.CommandTag };
+
+        /// REFRESH MATERIALIZED VIEW: the view slot and its bound query.
+        pub const Refresh = struct { slot: usize, plan: u16, with_data: bool };
+
+        /// SET CONSTRAINTS: ALL, or constraint names (by table OID and
+        /// constraint name), and the mode.
+        pub const ConstraintRef = struct { oid: u32, name: V.Name };
+        pub const SetConstraints = struct { all: bool, deferred: bool, names: [8]ConstraintRef = undefined, count: usize = 0 };
 
         /// ALTER SEQUENCE target slot and options (resolved against the
         /// sequence's current state when it runs).
@@ -187,6 +207,32 @@ pub fn Binder(comptime config: types.Config) type {
             alter_sequence: AlterSequence,
             create_schema: V.Name,
             drop_schema: DropSchema,
+            drop_relation: DropRelation,
+            refresh_view: Refresh,
+            set_constraints: SetConstraints,
+            merge: Merge,
+        };
+
+        /// MERGE: target table (relation 0) and source rows (`source` root
+        /// plan of `SELECT * FROM source`, relation 1 at offsets[1]); each
+        /// WHEN clause's condition, SET values / INSERT values and checks.
+        pub const MergeWhen = struct {
+            matched: bool,
+            by_source: bool,
+            condition: u16 = none,
+            action: Ast.MergeAction,
+            values: [config.columns]u16 = @splat(none),
+            defaults: [config.columns]u16 = @splat(none),
+            generated: [config.columns]u16 = @splat(none),
+        };
+        pub const Merge = struct {
+            table: usize,
+            source: u16,
+            offsets: [config.relations]u16 = @splat(0),
+            on: u16,
+            whens: [Ast.merge_clauses]MergeWhen = undefined,
+            when_count: usize = 0,
+            checks: [config.table_constraints]u16 = @splat(none),
         };
 
         /// DROP SCHEMA target: its slot and OID.
@@ -208,6 +254,13 @@ pub fn Binder(comptime config: types.Config) type {
             fills: [config.columns]u16 = @splat(none),
             check_not_null: [config.columns]bool = @splat(false),
             check_constraint: [config.table_constraints]bool = @splat(false),
+            /// Kind, secondary indexes, view and partition definition after
+            /// the statement (CREATE / DROP INDEX change only the indexes;
+            /// a new index has OID 0 until the statement assigns one).
+            extras: S.Extras = .{},
+            command: types.CommandTag = .alter_table,
+            /// CREATE UNIQUE INDEX: existing rows are checked for this index.
+            check_index: ?usize = null,
         };
 
         /// TRUNCATE targets: distinct table slots in statement order.
@@ -403,7 +456,11 @@ pub fn Binder(comptime config: types.Config) type {
         pub fn command(bound: *const Bound) types.CommandTag {
             return switch (bound.*) {
                 .noop => |tag| tag,
-                .create_table => .create_table,
+                .create_table => |*create| create.command,
+                .drop_relation => |*drop| drop.command,
+                .refresh_view => .refresh_materialized_view,
+                .set_constraints => .set_constraints,
+                .merge => .merge,
                 .drop_table => .drop_table,
                 .create_sequence => .create_sequence,
                 .drop_sequence => .drop_sequence,
@@ -412,7 +469,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .update => .update,
                 .delete => .delete,
                 .truncate => .truncate,
-                .alter_table => .alter_table,
+                .alter_table => |*alter| alter.command,
                 .alter_sequence => .alter_sequence,
                 .create_schema => .create_schema,
                 .drop_schema => .drop_schema,
@@ -3331,13 +3388,224 @@ pub fn Binder(comptime config: types.Config) type {
             const namespace = qualifierNamespace(context, schema) catch |err| return if (err == error.UndefinedSchema) error.TableNotFound else err;
             const wanted = toName(context, name);
             const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse return error.TableNotFound;
-            if (found.kind != 'r') return error.TableNotFound;
+            if (found.kind == 'S') return error.TableNotFound;
             return found.slot;
+        }
+
+        /// A FROM table: views, partitioned tables and inheritance parents
+        /// were expanded before binding (Database.expandRelations).
+        fn readableTable(context: *const Context, index: usize) Error!usize {
+            switch (context.tables[index].relkind) {
+                'r', 'm' => {},
+                else => return error.UnsupportedStatement,
+            }
+            if (!context.tables[index].populated) return error.ObjectNotInPrerequisiteState;
+            return index;
+        }
+
+        /// A DML target: a table (or a partitioned table for INSERT);
+        /// materialized views are 42809, views 0A000.
+        fn writableTable(context: *const Context, index: usize, routed: bool) Error!usize {
+            switch (context.tables[index].relkind) {
+                'r' => {},
+                'p' => if (!routed) return error.UnsupportedStatement,
+                'm' => return error.WrongObjectType,
+                else => return error.UnsupportedStatement,
+            }
+            return index;
+        }
+
+        /// Visible table slots (every relation kind but sequences).
+        fn visibleTables(context: *const Context, out: *[K.relation_rows]usize) usize {
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = context.catalog.visibleRelations(context.snapshot, &relations);
+            var used: usize = 0;
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                out[used] = found.slot;
+                used += 1;
+            }
+            return used;
+        }
+
+        /// An index-like relation name in `namespace`: a table's primary key
+        /// or UNIQUE constraint index, or a secondary index.
+        fn indexNameTaken(context: *const Context, namespace: u32, name: []const u8) bool {
+            var slots: [K.relation_rows]usize = undefined;
+            const count = visibleTables(context, &slots);
+            for (slots[0..count]) |slot| {
+                const entry = &context.tables[slot];
+                if (entry.namespace != namespace) continue;
+                for (entry.indexes[0..entry.index_count]) |*index| if (types.same(index.name.slice(), name)) return true;
+                for (entry.constraints[0..entry.constraint_count]) |*constraint| {
+                    if ((constraint.kind == .unique or constraint.kind == .primary or constraint.kind == .exclusion) and types.same(constraint.name.slice(), name)) return true;
+                }
+                if (entry.primary_column != null and S.primaryConstraint(entry) == null) {
+                    const pkey = objectName(entry.name.slice(), "", "pkey");
+                    if (types.same(pkey.slice(), name)) return true;
+                }
+            }
+            return false;
+        }
+
+        fn relationNameTaken(context: *const Context, namespace: u32, name: []const u8) bool {
+            return context.catalog.findIn(namespace, name, context.snapshot) != null or indexNameTaken(context, namespace, name);
+        }
+
+        /// Binds a stored expression text (index element or predicate) over
+        /// the table row: immutable (42P17), no subquery or aggregate.
+        fn bindIndexText(context: *const Context, text: []const u8, table: usize, predicate: bool) Error!u16 {
+            var sub = context.*;
+            sub.source = text;
+            const id = try P.parseExpression(text, context.pool);
+            try generatedSubqueries(&sub, id);
+            const scope = tableScope(&sub, table);
+            try typeExpr(&sub, &scope, id);
+            if (predicate) try booleanArgument(&sub, id);
+            if (!immutableExpression(&sub, id, false)) return error.InvalidObjectDefinition;
+            return id;
+        }
+
+        /// PostgreSQL ChooseIndexName: table_col1_col2_idx (`expr` for an
+        /// expression element), `key` for unique indexes, numbered until free.
+        fn chooseIndexName(context: *const Context, entry: *const S.Table, columns: []const u8, unique: bool) V.Name {
+            var name2: [256]u8 = undefined;
+            var length: usize = 0;
+            for (columns, 0..) |column, position| {
+                if (position != 0) {
+                    name2[length] = '_';
+                    length += 1;
+                }
+                const part = if (column == S.expression_key) "expr" else entry.columns[column].name.slice();
+                const take = @min(part.len, name2.len - length);
+                @memcpy(name2[length..][0..take], part[0..take]);
+                length += take;
+            }
+            const label: []const u8 = if (unique) "key" else "idx";
+            var pass: usize = 0;
+            while (true) : (pass += 1) {
+                var buffer: [24]u8 = undefined;
+                @memcpy(buffer[0..label.len], label);
+                var size = label.len;
+                if (pass != 0) {
+                    var digits: [20]u8 = undefined;
+                    var at: usize = digits.len;
+                    var rest = pass;
+                    while (true) {
+                        at -= 1;
+                        digits[at] = @intCast('0' + rest % 10);
+                        rest /= 10;
+                        if (rest == 0) break;
+                    }
+                    @memcpy(buffer[size..][0 .. digits.len - at], digits[at..]);
+                    size += digits.len - at;
+                }
+                const candidate = objectName(entry.name.slice(), name2[0..length], buffer[0..size]);
+                if (!relationNameTaken(context, entry.namespace, candidate.slice())) return candidate;
+            }
+        }
+
+        /// The identity definition of table `index` as an ALTER TABLE.
+        fn alterOf(context: *const Context, index: usize, tag: types.CommandTag) AlterTable {
+            const entry = &context.tables[index];
+            var out: AlterTable = .{ .table = index, .name = entry.name, .columns = entry.columns, .count = entry.column_count, .constraints = entry.constraints, .constraint_count = entry.constraint_count, .sources = undefined, .extras = S.extrasOf(entry), .command = tag };
+            for (0..config.columns) |column| out.sources[column] = @intCast(column);
+            return out;
+        }
+
+        fn bindCreateIndex(context: *const Context, create: *const Ast.CreateIndex) Error!Bound {
+            const index = try resolveQualified(context, create.table.schema, create.table.name);
+            const entry = &context.tables[index];
+            switch (entry.relkind) {
+                'r', 'm' => {},
+                'p' => return error.UnsupportedStatement,
+                else => return error.WrongObjectType,
+            }
+            var definition: S.Index = .{ .unique = create.unique, .nulls_not_distinct = create.nulls_not_distinct };
+            var expressions: V.Text = .{};
+            for (create.elements[0..create.count]) |*element| {
+                var column: u8 = S.expression_key;
+                if (element.column) |ident| {
+                    column = @intCast(try columnIndex(context, entry, ident));
+                    if (entry.columns[column].data_type == .json) return error.UndefinedFunction;
+                } else {
+                    const text = element.expression.slice(context.source);
+                    if (expressions.len != 0) {
+                        if (expressions.len == config.text_bytes) return error.TextCapacity;
+                        expressions.bytes[expressions.len] = 0;
+                        expressions.len += 1;
+                    }
+                    if (text.len > config.text_bytes - expressions.len) return error.TextCapacity;
+                    @memcpy(expressions.bytes[expressions.len..][0..text.len], text);
+                    expressions.len += text.len;
+                    _ = try bindIndexText(context, text, index, false);
+                }
+                definition.keys[definition.key_count] = column;
+                definition.options[definition.key_count] = @as(u8, @intFromBool(element.descending)) | (@as(u8, @intFromBool(element.nulls_first orelse element.descending)) << 1);
+                definition.key_count += 1;
+            }
+            definition.expressions = expressions;
+            for (create.includes[0..create.include_count]) |ident| {
+                const column: u8 = @intCast(try columnIndex(context, entry, ident));
+                for (definition.includes[0..definition.include_count]) |previous| if (previous == column) return error.DuplicateColumn;
+                definition.includes[definition.include_count] = column;
+                definition.include_count += 1;
+            }
+            if (create.predicate.len != 0) {
+                const text = create.predicate.slice(context.source);
+                if (text.len > config.text_bytes) return error.TextCapacity;
+                _ = try bindIndexText(context, text, index, true);
+                definition.predicate.len = text.len;
+                @memcpy(definition.predicate.bytes[0..text.len], text);
+            }
+            // A unique index over expressions or with a predicate needs
+            // per-row evaluation at every write: outside the subset.
+            if (create.unique and (expressions.len != 0 or definition.predicate.len != 0)) return error.UnsupportedStatement;
+            if (create.name) |ident| {
+                definition.name = toName(context, ident);
+                if (relationNameTaken(context, entry.namespace, definition.name.slice())) {
+                    if (create.if_not_exists) return .{ .noop = .create_index };
+                    return error.TableExists;
+                }
+            } else definition.name = chooseIndexName(context, entry, definition.keyColumns(), create.unique);
+            if (entry.index_count == S.index_capacity or S.index_entry_capacity == 0) return error.IndexCapacity;
+            var out = alterOf(context, index, .create_index);
+            out.extras.indexes[out.extras.index_count] = definition;
+            if (create.unique) out.check_index = out.extras.index_count;
+            out.extras.index_count += 1;
+            return .{ .alter_table = out };
+        }
+
+        fn bindDropIndex(context: *const Context, drop: *const Ast.Drop) Error!Bound {
+            const namespace = qualifierNamespace(context, drop.schema) catch |err| {
+                if (err == error.UndefinedSchema and drop.if_exists) return .{ .noop = .drop_index };
+                return err;
+            };
+            const wanted = toName(context, drop.name);
+            var slots: [K.relation_rows]usize = undefined;
+            const count = visibleTables(context, &slots);
+            for (slots[0..count]) |slot| {
+                const entry = &context.tables[slot];
+                if (entry.namespace != namespace) continue;
+                for (entry.indexes[0..entry.index_count], 0..) |*index, position| {
+                    if (!types.same(index.name.slice(), wanted.slice())) continue;
+                    var out = alterOf(context, slot, .drop_index);
+                    var at = position;
+                    while (at + 1 < out.extras.index_count) : (at += 1) out.extras.indexes[at] = out.extras.indexes[at + 1];
+                    out.extras.index_count -= 1;
+                    return .{ .alter_table = out };
+                }
+            }
+            // A constraint's index is dropped with the constraint (2BP01).
+            if (indexNameTaken(context, namespace, wanted.slice())) return error.DependentObjects;
+            if (context.catalog.findIn(namespace, wanted.slice(), context.snapshot) != null) return error.WrongObjectType;
+            if (drop.if_exists) return .{ .noop = .drop_index };
+            return error.UndefinedObject;
         }
 
         fn scopeFor(context: *const Context, from: ?Ast.TableRef) Error!Scope {
             const reference = from orelse return .{};
-            const index = try resolveQualified(context, reference.schema, reference.name);
+            const index = try readableTable(context, try resolveQualified(context, reference.schema, reference.name));
             var out = tableScope(context, index);
             if (reference.alias) |alias| out.rels[0].name = toName(context, alias);
             return out;
@@ -4248,7 +4516,7 @@ pub fn Binder(comptime config: types.Config) type {
                     rel.name = literalName(@tagName(view));
                     source.view = view;
                 } else {
-                    const table = try resolveQualified(context, item.schema, item.name);
+                    const table = try readableTable(context, try resolveQualified(context, item.schema, item.name));
                     rel.table = table;
                     rel.name = context.tables[table].name;
                     source.table = table;
@@ -4966,6 +5234,7 @@ pub fn Binder(comptime config: types.Config) type {
                         return error.TableExists;
                     }
                     if (create.invalid_definition) return error.Syntax;
+                    if (create.like != null or create.inherits != null or create.partition_by != .none or create.partition_of != null or create.as_query != none) return error.UnsupportedStatement;
                     var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count, .namespace = namespace };
                     // Owned sequences live in public: identity and SERIAL
                     // columns stay outside other schemas (0A000).
@@ -5043,7 +5312,7 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .drop_sequence = found.slot };
                 },
                 .insert => |*insert| {
-                    const index = try resolveQualified(context, insert.schema, insert.table);
+                    const index = try writableTable(context, try resolveQualified(context, insert.schema, insert.table), true);
                     const entry = &context.tables[index];
                     var mapping: [config.columns]usize = @splat(0);
                     var mapped: [config.columns]bool = @splat(false);
@@ -5093,7 +5362,7 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .query = root };
                 },
                 .update => |*update| {
-                    const index = try resolveQualified(context, update.schema, update.table);
+                    const index = try writableTable(context, try resolveQualified(context, update.schema, update.table), false);
                     const entry = &context.tables[index];
                     var scope = tableScope(context, index);
                     if (update.alias) |alias| scope.rels[0].name = toName(context, alias);
@@ -5123,7 +5392,7 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .update = out };
                 },
                 .delete => |*delete| {
-                    const index = try resolveQualified(context, delete.schema, delete.table);
+                    const index = try writableTable(context, try resolveQualified(context, delete.schema, delete.table), false);
                     var scope = tableScope(context, index);
                     if (delete.alias) |alias| scope.rels[0].name = toName(context, alias);
                     var out: Delete = .{ .table = index, .where = none, .key = none };
@@ -5157,6 +5426,13 @@ pub fn Binder(comptime config: types.Config) type {
                     };
                     return .{ .drop_schema = .{ .slot = found.slot, .oid = found.oid, .cascade = drop.cascade } };
                 },
+                .create_index => |*create| return bindCreateIndex(context, create),
+                .drop_index => |*drop| return bindDropIndex(context, drop),
+                .create_view => |*create| return bindCreateView(context, create),
+                .drop_view => |*drop| return bindDropView(context, &drop.drop, drop.materialized),
+                .refresh_view => |*refresh| return bindRefresh(context, refresh.name, refresh.with_data),
+                .merge => |*merge| return bindMerge(context, merge),
+                .set_constraints => |*set| return bindSetConstraints(context, set),
                 .alter_sequence => |*alter| {
                     if (alter.name.schema) |qualifier| {
                         if (!types.same(toName(context, qualifier).slice(), "public")) return error.TableNotFound;
@@ -5297,6 +5573,79 @@ pub fn Binder(comptime config: types.Config) type {
             return volatileDefault(context, n.b);
         }
 
+        /// NUL-separated index expression texts.
+        const Parts = struct {
+            text: []const u8,
+            at: usize = 0,
+            done: bool = false,
+            fn next(self: *Parts) ?[]const u8 {
+                if (self.done or self.text.len == 0) return null;
+                var end = self.at;
+                while (end < self.text.len and self.text[end] != 0) end += 1;
+                const part = self.text[self.at..end];
+                if (end == self.text.len) self.done = true else self.at = end + 1;
+                return part;
+            }
+        };
+
+        fn std_split(text: []const u8) Parts {
+            return .{ .text = text };
+        }
+
+        fn renameParts(text: []const u8, from: []const u8, to: []const u8) Error!V.Text {
+            var out: V.Text = .{};
+            var parts = std_split(text);
+            var first = true;
+            while (parts.next()) |part| {
+                const renamed = try renameReferences(part, from, to);
+                if (!first) {
+                    if (out.len == config.text_bytes) return error.TextCapacity;
+                    out.bytes[out.len] = 0;
+                    out.len += 1;
+                }
+                first = false;
+                if (renamed.len > config.text_bytes - out.len) return error.TextCapacity;
+                @memcpy(out.bytes[out.len..][0..renamed.len], renamed.slice());
+                out.len += renamed.len;
+            }
+            return out;
+        }
+
+        /// A visible table that inherits from (or is a partition of) `oid`.
+        fn hasChildren(context: *const Context, oid: u32) bool {
+            var slots: [K.relation_rows]usize = undefined;
+            const count = visibleTables(context, &slots);
+            for (slots[0..count]) |slot| if (context.tables[slot].parent == oid) return true;
+            return false;
+        }
+
+        /// A visible view or materialized view that reads relation `oid`.
+        fn dependentViews(context: *const Context, oid: u32) bool {
+            var slots: [K.relation_rows]usize = undefined;
+            const count = visibleTables(context, &slots);
+            for (slots[0..count]) |slot| {
+                const entry = &context.tables[slot];
+                for (entry.depends[0..entry.depend_count]) |depend| if (depend == oid) return true;
+            }
+            return false;
+        }
+
+        /// Column `column` of `entry` is referenced by another table's
+        /// FOREIGN KEY.
+        fn referencedColumn(context: *const Context, entry: *const S.Table, column: usize) bool {
+            var slots: [K.relation_rows]usize = undefined;
+            const count = visibleTables(context, &slots);
+            for (slots[0..count]) |slot| {
+                const other = &context.tables[slot];
+                if (other.oid == entry.oid) continue;
+                for (other.constraints[0..other.constraint_count]) |*constraint| {
+                    if (constraint.kind != .foreign or constraint.ref_oid != entry.oid) continue;
+                    for (constraint.refColumns()) |key| if (key == column) return true;
+                }
+            }
+            return false;
+        }
+
         fn alterColumn(out: *const AlterTable, name: []const u8) ?usize {
             for (out.columns[0..out.count], 0..) |*column, index| if (types.same(column.name.slice(), name)) return index;
             return null;
@@ -5334,8 +5683,19 @@ pub fn Binder(comptime config: types.Config) type {
             if (found.kind != 'r') return error.WrongObjectType;
             const index = found.slot;
             const entry = &context.tables[index];
-            var out: AlterTable = .{ .table = index, .name = entry.name, .columns = entry.columns, .count = entry.column_count, .constraints = entry.constraints, .constraint_count = entry.constraint_count, .sources = undefined };
-            for (0..config.columns) |column| out.sources[column] = @intCast(column);
+            if (entry.relkind != 'r') return error.WrongObjectType;
+            var out = alterOf(context, index, .alter_table);
+            // Inheritance and partition definitions keep their column lists.
+            if (entry.parent != 0 or hasChildren(context, entry.oid)) for (alter.actions[0..alter.count]) |*action| switch (action.*) {
+                .add_column, .drop_column, .rename_column => return error.UnsupportedStatement,
+                else => {},
+            };
+            // Views keep their stored text: their tables keep column names.
+            if (dependentViews(context, entry.oid)) for (alter.actions[0..alter.count]) |*action| switch (action.*) {
+                .drop_column => return error.DependentObjects,
+                .rename_column, .rename_table => return error.UnsupportedStatement,
+                else => {},
+            };
             for (alter.actions[0..alter.count]) |*action| switch (action.*) {
                 .add_column => |*add| {
                     const definition = &add.column;
@@ -5386,6 +5746,33 @@ pub fn Binder(comptime config: types.Config) type {
                         const seen = try textColumns(context, column.expression.slice(), out.columns[0..out.count]);
                         if (seen[position]) return error.DependentObjects;
                     }
+                    // Other tables' foreign keys referencing it: 2BP01.
+                    if (referencedColumn(context, entry, out.sources[position])) return error.DependentObjects;
+                    // Indexes over the column go with it (PostgreSQL drops them).
+                    var kept: usize = 0;
+                    for (out.extras.indexes[0..out.extras.index_count]) |*candidate| {
+                        var uses = false;
+                        for (candidate.keyColumns()) |key| uses = uses or key == position;
+                        for (candidate.includes[0..candidate.include_count]) |key| uses = uses or key == position;
+                        for ([_][]const u8{ candidate.expressions.slice(), candidate.predicate.slice() }) |text| {
+                            var parts = std_split(text);
+                            while (parts.next()) |part| {
+                                const seen = try textColumns(context, part, out.columns[0..out.count]);
+                                uses = uses or seen[position];
+                            }
+                        }
+                        if (uses) continue;
+                        var copy = candidate.*;
+                        for (copy.keys[0..copy.key_count]) |*key| if (key.* != S.expression_key and key.* > position) {
+                            key.* -= 1;
+                        };
+                        for (copy.includes[0..copy.include_count]) |*key| if (key.* > position) {
+                            key.* -= 1;
+                        };
+                        out.extras.indexes[kept] = copy;
+                        kept += 1;
+                    }
+                    out.extras.index_count = kept;
                     // Constraints over the column go with it.
                     var at: usize = 0;
                     while (at < out.constraint_count) {
@@ -5426,6 +5813,10 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     for (out.constraints[0..out.constraint_count]) |*constraint| {
                         if (constraint.kind == .check) constraint.expression = try renameReferences(constraint.expression.slice(), from.slice(), to.slice());
+                    }
+                    for (out.extras.indexes[0..out.extras.index_count]) |*candidate| {
+                        candidate.expressions = try renameParts(candidate.expressions.slice(), from.slice(), to.slice());
+                        candidate.predicate = try renameReferences(candidate.predicate.slice(), from.slice(), to.slice());
                     }
                 },
                 .set_default => |*set| {
@@ -5628,7 +6019,7 @@ pub fn Binder(comptime config: types.Config) type {
                 for (definitions[0..position]) |*earlier| if (earlier.name) |other| {
                     if (types.same(toName(context, other).slice(), name.slice())) return error.DuplicateObject;
                 };
-                if (definition.kind != .check and (types.same(name.slice(), out.name.slice()) or context.catalog.find(name.slice(), context.snapshot) != null)) return error.TableExists;
+                if (definition.kind != .check and definition.kind != .foreign and (types.same(name.slice(), out.name.slice()) or context.catalog.find(name.slice(), context.snapshot) != null)) return error.TableExists;
             };
             var named: [config.table_constraints]S.Constraint = undefined;
             var named_count: usize = 0;
@@ -5637,10 +6028,12 @@ pub fn Binder(comptime config: types.Config) type {
                 named_count += 1;
             };
             for (definitions) |*definition| {
-                var entry: S.Constraint = .{ .nulls_not_distinct = definition.nulls_not_distinct, .kind = switch (definition.kind) {
+                var entry: S.Constraint = .{ .nulls_not_distinct = definition.nulls_not_distinct, .deferrable = definition.deferrable, .initially_deferred = definition.initially_deferred, .kind = switch (definition.kind) {
                     .check => .check,
                     .unique => .unique,
                     .primary => .primary,
+                    .foreign => .foreign,
+                    .exclusion => .exclusion,
                 } };
                 for (definition.columns[0..definition.column_count]) |ident| {
                     const wanted = toName(context, ident);
@@ -5682,7 +6075,10 @@ pub fn Binder(comptime config: types.Config) type {
                         @memcpy(name2[name2_len..][0..take], column_name[0..take]);
                         name2_len += take;
                     },
+                    .foreign => try bindForeignKey(context, definition, out, &entry, &name2, &name2_len),
+                    .exclusion => try bindExclusion(context, definition, out, &entry, &name2, &name2_len),
                     .primary => {
+                        if (definition.deferrable) return error.UnsupportedStatement;
                         for (entry.keyColumns()) |column| out.columns[column].not_null = true;
                         if (entry.column_count == 1) {
                             for (columns, 0..) |*column, index| if (column.primary_key and index != entry.columns[0]) return error.InvalidTableDefinition;
@@ -5698,6 +6094,8 @@ pub fn Binder(comptime config: types.Config) type {
                         .check => "check",
                         .unique => "key",
                         .primary => "pkey",
+                        .foreign => "fkey",
+                        .exclusion => "excl",
                     };
                     const taken = out.constraints[0..out.constraint_count];
                     entry.name = if (definition.kind == .primary)
@@ -5707,13 +6105,65 @@ pub fn Binder(comptime config: types.Config) type {
                         var avoid: [2 * config.table_constraints]S.Constraint = undefined;
                         @memcpy(avoid[0..taken.len], taken);
                         @memcpy(avoid[taken.len..][0..named_count], named[0..named_count]);
-                        break :blk chooseName(context, out.name.slice(), name2[0..name2_len], label, avoid[0 .. taken.len + named_count], definition.kind != .check);
+                        break :blk chooseName(context, out.name.slice(), name2[0..name2_len], label, avoid[0 .. taken.len + named_count], definition.kind != .check and definition.kind != .foreign);
                     };
                 }
                 if (out.constraint_count == config.table_constraints) return error.ColumnCapacity;
                 out.constraints[out.constraint_count] = entry;
                 out.constraint_count += 1;
             }
+        }
+
+        fn bindForeignKey(context: *const Context, definition: *const Ast.ConstraintDef, out: *Create, entry: *S.Constraint, name2: *[256]u8, name2_len: *usize) Error!void {
+            _ = context;
+            _ = definition;
+            _ = out;
+            _ = entry;
+            _ = name2;
+            _ = name2_len;
+            return error.UnsupportedStatement;
+        }
+
+        fn bindExclusion(context: *const Context, definition: *const Ast.ConstraintDef, out: *Create, entry: *S.Constraint, name2: *[256]u8, name2_len: *usize) Error!void {
+            _ = context;
+            _ = definition;
+            _ = out;
+            _ = entry;
+            _ = name2;
+            _ = name2_len;
+            return error.UnsupportedStatement;
+        }
+
+        fn bindCreateView(context: *const Context, create: *const Ast.CreateView) Error!Bound {
+            _ = context;
+            _ = create;
+            return error.UnsupportedStatement;
+        }
+
+        fn bindDropView(context: *const Context, drop: *const Ast.Drop, materialized: bool) Error!Bound {
+            _ = context;
+            _ = drop;
+            _ = materialized;
+            return error.UnsupportedStatement;
+        }
+
+        fn bindRefresh(context: *const Context, name: Ast.TableRef, with_data: bool) Error!Bound {
+            _ = context;
+            _ = name;
+            _ = with_data;
+            return error.UnsupportedStatement;
+        }
+
+        fn bindMerge(context: *const Context, merge: *const Ast.Merge) Error!Bound {
+            _ = context;
+            _ = merge;
+            return error.UnsupportedStatement;
+        }
+
+        fn bindSetConstraints(context: *const Context, set: *const Ast.SetConstraints) Error!Bound {
+            _ = context;
+            _ = set;
+            return error.UnsupportedStatement;
         }
 
         /// A user table (not a sequence or view): 42P01 when missing, 42809
@@ -5757,7 +6207,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// 42P10, repeated ones 42701. Identity columns accept the supplied
         /// value (COPY ignores GENERATED ALWAYS, as PostgreSQL does).
         pub fn bindCopy(context: *const Context, copy: *const Ast.Copy, with_defaults: bool) Error!Copy {
-            const index = try resolveQualified(context, copy.table.schema, copy.table.name);
+            const index = try writableTable(context, try resolveQualified(context, copy.table.schema, copy.table.name), false);
             const entry = &context.tables[index];
             var out: Copy = .{ .table = index };
             if (copy.explicit_columns) {

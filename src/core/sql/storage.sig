@@ -187,7 +187,12 @@ pub fn Storage(comptime config: types.Config) type {
         /// UNIQUE and composite PRIMARY KEY list their key columns and are
         /// enforced by uniqueCheck over every version (no secondary index).
         pub const constraint_capacity: usize = config.table_constraints;
-        pub const ConstraintKind = enum(u8) { check = 1, unique = 2, primary = 3 };
+        pub const ConstraintKind = enum(u8) { check = 1, unique = 2, primary = 3, foreign = 4, exclusion = 5 };
+        /// FOREIGN KEY referential actions (pg_constraint confdeltype letters).
+        pub const ForeignAction = enum(u8) { no_action = 0, restrict = 1, cascade = 2, set_null = 3, set_default = 4 };
+        /// EXCLUDE element operators: `=` (btree/hash equality) and `&&`
+        /// (overlap; ranges once a range type exists).
+        pub const ExclusionOperator = enum(u8) { equal = 1, overlap = 2 };
         pub const Constraint = struct {
             kind: ConstraintKind = .check,
             name: V.Name = .{},
@@ -195,10 +200,78 @@ pub fn Storage(comptime config: types.Config) type {
             column_count: u8 = 0,
             columns: [config.columns]u8 = @splat(0),
             expression: V.Text = .{},
+            /// DEFERRABLE [INITIALLY DEFERRED] (UNIQUE, PRIMARY KEY, FOREIGN
+            /// KEY, EXCLUDE): checked at COMMIT while deferred.
+            deferrable: bool = false,
+            initially_deferred: bool = false,
+            /// FOREIGN KEY: referenced table OID and its key columns (a
+            /// primary key or UNIQUE constraint of that table), MATCH SIMPLE.
+            ref_oid: u32 = 0,
+            ref_columns: [config.columns]u8 = @splat(0),
+            on_delete: ForeignAction = .no_action,
+            on_update: ForeignAction = .no_action,
+            /// EXCLUDE: operator of each key column.
+            operators: [config.columns]ExclusionOperator = @splat(.equal),
 
             pub fn keyColumns(self: *const Constraint) []const u8 {
                 return self.columns[0..self.column_count];
             }
+
+            pub fn refColumns(self: *const Constraint) []const u8 {
+                return self.ref_columns[0..self.column_count];
+            }
+        };
+
+        /// Secondary indexes per table and entries per index (types.Config).
+        pub const index_capacity: usize = config.table_indexes;
+        pub const index_entry_capacity: usize = if (config.index_entries != 0) config.index_entries else if (config.external_storage) 0 else versions_capacity;
+        pub const index_slot_capacity: usize = if (index_entry_capacity == 0 or index_capacity == 0) 0 else pow2(index_entry_capacity * 2);
+        /// Key element that is an expression (its text is in `expressions`).
+        pub const expression_key: u8 = 0xff;
+
+        /// CREATE [UNIQUE] INDEX: key elements (columns or expressions),
+        /// INCLUDE columns and a partial-index predicate, plus a hash over
+        /// the plain key columns of every allocated row version (an index
+        /// entry is version + 1, exactly like the primary-key index), so a
+        /// probe validates visibility like the key index and abort or
+        /// reclamation removes entries with the version. Expression elements
+        /// and predicates are definitions (bound per statement); unique
+        /// indexes use plain columns only.
+        pub const Index = struct {
+            oid: u32 = 0,
+            name: V.Name = .{},
+            unique: bool = false,
+            nulls_not_distinct: bool = false,
+            key_count: u8 = 0,
+            keys: [config.columns]u8 = @splat(0),
+            /// DESC per key element (bit 0) and NULLS FIRST (bit 1).
+            options: [config.columns]u8 = @splat(0),
+            include_count: u8 = 0,
+            includes: [config.columns]u8 = @splat(0),
+            /// Expression elements' source texts in key order, NUL-separated.
+            expressions: V.Text = .{},
+            /// Partial-index WHERE source text (empty: none).
+            predicate: V.Text = .{},
+
+            pub fn keyColumns(self: *const Index) []const u8 {
+                return self.keys[0..self.key_count];
+            }
+        };
+
+        /// PARTITION BY strategy of a partitioned table ('p') and the bound
+        /// of a partition (`parent` != 0 with relkind 'r').
+        pub const PartitionStrategy = enum(u8) { none = 0, range = 1, list = 2 };
+        pub const PartitionBound = enum(u8) { none = 0, range = 1, list = 2, default = 3 };
+        pub const partition_values: usize = 4;
+        pub const Partition = struct {
+            strategy: PartitionStrategy = .none,
+            key: u8 = 0,
+            bound: PartitionBound = .none,
+            /// RANGE: values[0] FROM, values[1] TO; bit 0 / bit 1 of
+            /// `unbounded` mark MINVALUE / MAXVALUE. LIST: `count` values.
+            count: u8 = 0,
+            unbounded: u8 = 0,
+            values: [partition_values]V.Cell = @splat(.null_value),
         };
 
         pub const Table = struct {
@@ -214,6 +287,24 @@ pub fn Storage(comptime config: types.Config) type {
             namespace: u32 = 2200,
             constraint_count: usize = 0,
             constraints: [constraint_capacity]Constraint = @splat(.{}),
+            /// pg_class relkind: 'r' table, 'v' view, 'm' materialized view,
+            /// 'p' partitioned table (views and partitioned tables hold no rows).
+            relkind: u8 = 'r',
+            /// Secondary indexes and their entry hashes (index i uses
+            /// index_slots[i]; entries = every allocated version).
+            index_count: usize = 0,
+            indexes: [index_capacity]Index = @splat(.{}),
+            index_slots: [index_capacity][index_slot_capacity]u32 = @splat(@splat(0)),
+            /// View / materialized view defining query (SELECT text).
+            query: V.Text = .{},
+            /// A materialized view created WITH NO DATA is unpopulated.
+            populated: bool = true,
+            /// OIDs of the relations a view reads (DROP dependency checks).
+            depend_count: usize = 0,
+            depends: [config.tables]u32 = @splat(0),
+            /// INHERITS / PARTITION OF parent table OID (0: none).
+            parent: u32 = 0,
+            partition: Partition = .{},
             primary_column: ?usize = null,
             primary_directory: PrimaryDirectory = .{},
             /// Conservative strict non-NULL order over physical row slots.
@@ -297,6 +388,220 @@ pub fn Storage(comptime config: types.Config) type {
                     if (table.versions[version].row != 0) indexKeyOnly(table, @intCast(version));
                 }
             }
+            rebuildSecondary(table);
+        }
+
+        /// Relation-level definition beyond columns and constraints: kind,
+        /// secondary indexes, view query and dependencies, inheritance and
+        /// partitioning. Copied whole by CREATE, ALTER and replay.
+        pub const Extras = struct {
+            relkind: u8 = 'r',
+            index_count: usize = 0,
+            indexes: [index_capacity]Index = @splat(.{}),
+            query: V.Text = .{},
+            populated: bool = true,
+            depend_count: usize = 0,
+            depends: [config.tables]u32 = @splat(0),
+            parent: u32 = 0,
+            partition: Partition = .{},
+        };
+
+        pub fn extrasOf(table: *const Table) Extras {
+            return .{ .relkind = table.relkind, .index_count = table.index_count, .indexes = table.indexes, .query = table.query, .populated = table.populated, .depend_count = table.depend_count, .depends = table.depends, .parent = table.parent, .partition = table.partition };
+        }
+
+        /// Installs the extras after reset(); index entries are rebuilt by
+        /// the caller (copyRelayout, redefine or rebuildSecondary).
+        pub fn setExtras(table: *Table, extras: *const Extras) void {
+            table.relkind = extras.relkind;
+            table.index_count = extras.index_count;
+            table.indexes = extras.indexes;
+            table.query = extras.query;
+            table.populated = extras.populated;
+            table.depend_count = extras.depend_count;
+            table.depends = extras.depends;
+            table.parent = extras.parent;
+            table.partition = extras.partition;
+        }
+
+        /// Whether any part of the definition needs format version 3.
+        pub fn extended(table: *const Table) bool {
+            if (table.relkind != 'r' or table.index_count != 0 or table.parent != 0 or table.partition.strategy != .none) return true;
+            for (table.columns[0..table.column_count]) |*column| if (column.virtual) return true;
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if (constraint.kind == .foreign or constraint.kind == .exclusion or constraint.deferrable) return true;
+            }
+            return false;
+        }
+
+        fn secondaryHash(index: *const Index, cells: *const [config.columns]V.Cell) usize {
+            var hash: u64 = 0x51ed2701a5b3c4d9;
+            for (index.keyColumns()) |column| {
+                if (column == expression_key) continue;
+                const cell = &cells[column];
+                const part: u64 = if (cell.* == .null_value) 0x9e3779b9 else V.hash(cell);
+                hash = mix(hash ^ part);
+            }
+            return @intCast(hash & (index_slot_capacity -% 1));
+        }
+
+        fn indexSecondary(table: *Table, version: u32) void {
+            if (comptime index_slot_capacity == 0) return;
+            const mask = index_slot_capacity - 1;
+            for (0..table.index_count) |which| {
+                const slots = &table.index_slots[which];
+                var position = secondaryHash(&table.indexes[which], &table.versions[version].cells);
+                while (slots[position] != 0) position = (position + 1) & mask;
+                slots[position] = version + 1;
+            }
+        }
+
+        /// Backward-shift deletion of slot `start` of secondary index `which`.
+        fn removeSecondaryAt(table: *Table, which: usize, start: usize) void {
+            const mask = index_slot_capacity - 1;
+            const slots = &table.index_slots[which];
+            var hole = start;
+            var probe = start;
+            while (true) {
+                probe = (probe + 1) & mask;
+                const entry = slots[probe];
+                if (entry == 0) break;
+                const home = secondaryHash(&table.indexes[which], &table.versions[entry - 1].cells);
+                if (((probe -% hole) & mask) <= ((probe -% home) & mask)) {
+                    slots[hole] = entry;
+                    hole = probe;
+                }
+            }
+            slots[hole] = 0;
+        }
+
+        fn unindexSecondary(table: *Table, version: u32) void {
+            if (comptime index_slot_capacity == 0) return;
+            const mask = index_slot_capacity - 1;
+            for (0..table.index_count) |which| {
+                const slots = &table.index_slots[which];
+                var position = secondaryHash(&table.indexes[which], &table.versions[version].cells);
+                while (slots[position] != version + 1) {
+                    if (slots[position] == 0) break;
+                    position = (position + 1) & mask;
+                }
+                if (slots[position] == version + 1) removeSecondaryAt(table, which, position);
+            }
+        }
+
+        /// Rebuilds every secondary index from the version arena.
+        pub fn rebuildSecondary(table: *Table) void {
+            if (comptime index_slot_capacity == 0) return;
+            for (table.index_slots[0..table.index_count]) |*slots| @memset(slots, 0);
+            for (0..table.version_high) |version| {
+                if (table.versions[version].row != 0) indexSecondary(table, @intCast(version));
+            }
+        }
+
+        /// Entries of secondary index `which` (leak checks: always equal to
+        /// the allocated versions of the table).
+        pub fn indexEntries(table: *const Table, which: usize) usize {
+            var count: usize = 0;
+            for (table.index_slots[which]) |entry| {
+                if (entry != 0) count += 1;
+            }
+            return count;
+        }
+
+        /// Whether `count` more versions fit every secondary index.
+        pub fn indexRoom(table: *const Table, count: usize) bool {
+            if (table.index_count == 0) return true;
+            return table.version_used + count <= index_entry_capacity;
+        }
+
+        fn sameColumns(columns: []const u8, left: *const [config.columns]V.Cell, right: *const [config.columns]V.Cell) bool {
+            for (columns) |column| {
+                if (V.compare(&left[column], &right[column]) != 0) return false;
+            }
+            return true;
+        }
+
+        /// Versions visible to `snap` whose plain key columns of index
+        /// `which` equal `cells`, found through the index (probe path).
+        pub fn indexLookup(table: *const Table, which: usize, cells: *const [config.columns]V.Cell, snap: Snapshot, out: []u32) usize {
+            if (comptime index_slot_capacity == 0) return 0;
+            const index = &table.indexes[which];
+            const mask = index_slot_capacity - 1;
+            var count: usize = 0;
+            var position = secondaryHash(index, cells);
+            while (table.index_slots[which][position] != 0) : (position = (position + 1) & mask) {
+                const entry = table.index_slots[which][position] - 1;
+                const version = &table.versions[entry];
+                if (!plainKeyEqual(index, &version.cells, cells)) continue;
+                if (visibleAt(table, version.row - 1, snap) != entry) continue;
+                if (count < out.len) out[count] = entry;
+                count += 1;
+            }
+            return count;
+        }
+
+        fn plainKeyEqual(index: *const Index, left: *const [config.columns]V.Cell, right: *const [config.columns]V.Cell) bool {
+            for (index.keyColumns()) |column| {
+                if (column == expression_key) continue;
+                const a = &left[column];
+                const b = &right[column];
+                if ((a.* == .null_value) != (b.* == .null_value)) return false;
+                if (a.* != .null_value and V.compare(a, b) != 0) return false;
+            }
+            return true;
+        }
+
+        /// The same versions found by scanning every row (scan path).
+        pub fn scanLookup(table: *const Table, which: usize, cells: *const [config.columns]V.Cell, snap: Snapshot, out: []u32) usize {
+            var count: usize = 0;
+            for (0..table.row_high) |slot| {
+                if (table.rows[slot].newest == 0) continue;
+                const version = visibleAt(table, slot, snap) orelse continue;
+                if (!plainKeyEqual(&table.indexes[which], &table.versions[version].cells, cells)) continue;
+                if (count < out.len) out[count] = version;
+                count += 1;
+            }
+            return count;
+        }
+
+        /// UNIQUE index check through the index, with exactly uniqueCheck's
+        /// dirty-snapshot rules over the probed candidates.
+        pub fn indexUniqueCheck(table: *const Table, which: usize, cells: *const [config.columns]V.Cell, own_slot: u32, snap: Snapshot) KeyState {
+            if (comptime index_slot_capacity == 0) return .free;
+            const index = &table.indexes[which];
+            if (!index.nulls_not_distinct) for (index.keyColumns()) |column| {
+                if (cells[column] == .null_value) return .free;
+            };
+            const mask = index_slot_capacity - 1;
+            var waiting: ?u16 = null;
+            var position = secondaryHash(index, cells);
+            while (table.index_slots[which][position] != 0) : (position = (position + 1) & mask) {
+                const entry = table.index_slots[which][position] - 1;
+                const version = &table.versions[entry];
+                if (version.row - 1 == own_slot) continue;
+                if (!sameColumns(index.keyColumns(), &version.cells, cells)) continue;
+                if (classify(version, entry, snap, &waiting)) |state| return state;
+            }
+            return if (waiting) |slot| .{ .wait = slot } else .free;
+        }
+
+        /// One candidate of a unique check (PostgreSQL's dirty snapshot):
+        /// a committed live row or a version this transaction still holds
+        /// takes the key; another live transaction's version means waiting.
+        fn classify(version: *const Version, index: usize, snap: Snapshot, waiting: *?u16) ?KeyState {
+            const marked = version.xmax.epoch != 0;
+            if (version.xmin_csn == 0) {
+                if (snap.own(version.xmin)) {
+                    if (marked and snap.own(version.xmax)) return null;
+                    return .{ .taken = @intCast(index) };
+                }
+                if (!marked and waiting.* == null) waiting.* = version.xmin.slot;
+                return null;
+            }
+            if (!marked) return .{ .taken = @intCast(index) };
+            if (version.xmax_csn != 0 or snap.own(version.xmax)) return null;
+            if (waiting.* == null) waiting.* = version.xmax.slot;
+            return null;
         }
 
         fn relayoutCells(cells: *[config.columns]V.Cell, sources: []const u8, fills: []const V.Cell) void {
@@ -329,7 +634,7 @@ pub fn Storage(comptime config: types.Config) type {
 
         /// Replay of ALTER TABLE in place (replay keeps no old snapshots):
         /// relayout every version, install the definition, rebuild indexes.
-        pub fn redefine(table: *Table, name: V.Name, columns: []const V.Column, constraints: []const Constraint, sources: []const u8, fills: []const V.Cell) void {
+        pub fn redefine(table: *Table, name: V.Name, columns: []const V.Column, constraints: []const Constraint, extras: *const Extras, sources: []const u8, fills: []const V.Cell) void {
             for (table.versions[0..table.version_high]) |*version| {
                 if (version.row != 0) relayoutCells(&version.cells, sources, fills);
             }
@@ -341,6 +646,7 @@ pub fn Storage(comptime config: types.Config) type {
                 table.primary_column = index;
             };
             setConstraints(table, constraints);
+            setExtras(table, extras);
             rebuildIndexes(table);
             rebuildHints(table);
         }
@@ -371,7 +677,7 @@ pub fn Storage(comptime config: types.Config) type {
         /// the key index instead.
         pub fn scannedUnique(table: *const Table, constraint: *const Constraint) bool {
             return switch (constraint.kind) {
-                .check => false,
+                .check, .foreign, .exclusion => false,
                 .unique => true,
                 .primary => table.primary_column == null,
             };
@@ -443,6 +749,7 @@ pub fn Storage(comptime config: types.Config) type {
             };
             table.namespace = 2200;
             table.constraint_count = 0;
+            setExtras(table, &.{});
             table.next_rowid = 1;
             table.dead_csn = 0;
             table.pending_drop = false;
@@ -470,6 +777,9 @@ pub fn Storage(comptime config: types.Config) type {
             destination.namespace = source.namespace;
             destination.constraint_count = source.constraint_count;
             @memcpy(destination.constraints[0..source.constraint_count], source.constraints[0..source.constraint_count]);
+            setExtras(destination, &extrasOf(source));
+            // Entries are version indices, identical in the copy.
+            destination.index_slots = source.index_slots;
             destination.primary_column = source.primary_column;
             destination.primary_directory = source.primary_directory;
             destination.column_order = source.column_order;
@@ -763,6 +1073,7 @@ pub fn Storage(comptime config: types.Config) type {
             noteOrder(table, version);
             notePrimaryDirectory(table, version);
             indexKeyOnly(table, version);
+            indexSecondary(table, version);
         }
 
         fn notePrimaryDirectory(table: *Table, version: u32) void {
@@ -924,6 +1235,7 @@ pub fn Storage(comptime config: types.Config) type {
                 table.versions[previous].older = table.versions[version].older;
             }
             unindexKey(table, version);
+            unindexSecondary(table, version);
             freeVersion(table, version);
             if (row.newest == 0) freeRow(table, slot);
         }
@@ -981,9 +1293,10 @@ pub fn Storage(comptime config: types.Config) type {
 
         /// On-demand reclamation so `count` new versions fit, else 53200.
         pub fn ensureVersions(table: *Table, count: usize, horizon: u64) Error!void {
-            if (freeVersions(table) >= count) return;
+            if (freeVersions(table) >= count and indexRoom(table, count)) return;
             _ = vacuum(table, horizon);
             if (freeVersions(table) < count) return error.VersionCapacity;
+            if (!indexRoom(table, count)) return error.IndexCapacity;
         }
 
         /// On-demand reclamation and compaction so one new row slot fits.

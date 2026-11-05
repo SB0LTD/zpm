@@ -178,6 +178,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn statement(self: *Self) Error!Ast.Statement {
             if (try self.takeWord("CREATE")) {
+                if (self.mode == .standard) if (try self.schemaObject()) |object| return object;
                 if (self.mode == .standard and try self.takeWord("SEQUENCE")) return .{ .create_sequence = try self.createSequence() };
                 if (self.mode == .standard and try self.takeRaw("schema")) {
                     var out: Ast.CreateSchema = .{ .if_not_exists = try self.ifNotExists() };
@@ -190,6 +191,21 @@ pub fn Parser(comptime config: types.Config) type {
                 return .{ .create_table = try self.create() };
             }
             if (try self.takeWord("DROP")) {
+                if (self.mode == .standard and (self.rawWord("index") or self.rawWord("view") or self.rawWord("materialized"))) {
+                    const index = try self.takeRaw("index");
+                    const materialized = !index and try self.takeRaw("materialized");
+                    if (!index and !try self.takeRaw("view")) return error.Syntax;
+                    if (index) _ = try self.takeRaw("concurrently");
+                    var drop: Ast.Drop = .{ .if_exists = try self.ifExists(), .name = undefined };
+                    const reference = try self.qualifiedName();
+                    drop.name = reference.name;
+                    drop.schema = reference.schema;
+                    if (self.isSymbol(.comma)) return error.UnsupportedStatement;
+                    drop.cascade = try self.dropBehavior();
+                    try self.finish();
+                    if (index) return .{ .drop_index = drop };
+                    return .{ .drop_view = .{ .drop = drop, .materialized = materialized } };
+                }
                 if (self.mode == .standard and try self.takeRaw("schema")) {
                     var out: Ast.DropSchema = .{ .if_exists = try self.ifExists() };
                     out.name = try self.identifier();
@@ -207,6 +223,7 @@ pub fn Parser(comptime config: types.Config) type {
                     drop.schema = drop.name;
                     drop.name = try self.identifier();
                 }
+                if (self.mode == .standard) drop.cascade = try self.dropBehavior();
                 try self.finish();
                 return if (sequence_kind) .{ .drop_sequence = drop } else .{ .drop_table = drop };
             }
@@ -217,6 +234,37 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and self.rawWord("copy")) {
                 try self.advance();
                 return .{ .copy = try self.copyStatement() };
+            }
+            if (self.mode == .standard and self.rawWord("refresh")) {
+                try self.advance();
+                if (!try self.takeRaw("materialized") or !try self.takeRaw("view")) return error.Syntax;
+                if (try self.takeRaw("concurrently")) return error.UnsupportedStatement;
+                const name = try self.qualifiedName();
+                const with_data = try self.withData();
+                try self.finish();
+                return .{ .refresh_view = .{ .name = name, .with_data = with_data } };
+            }
+            if (self.mode == .standard and self.rawWord("merge")) {
+                try self.advance();
+                return .{ .merge = try self.merge() };
+            }
+            if (self.mode == .standard and self.isWord("SET") and wordIs(self.source, try self.peek(), "constraints")) {
+                try self.advance();
+                try self.advance();
+                var out: Ast.SetConstraints = .{};
+                if (try self.takeWord("ALL")) {
+                    out.all = true;
+                } else while (true) {
+                    if (out.count == out.names.len) return error.TableCapacity;
+                    out.names[out.count] = (try self.qualifiedName()).name;
+                    out.count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                if (try self.takeRaw("deferred")) {
+                    out.deferred = true;
+                } else if (!try self.takeRaw("immediate")) return error.Syntax;
+                try self.finish();
+                return .{ .set_constraints = out };
             }
             if (self.mode == .standard and self.rawWord("truncate")) {
                 try self.advance();
@@ -243,6 +291,234 @@ pub fn Parser(comptime config: types.Config) type {
                 return error.UnsupportedStatement;
             }
             return .{ .control = try self.controlStatement() };
+        }
+
+        /// `[CASCADE | RESTRICT]`: true for CASCADE.
+        fn dropBehavior(self: *Self) Error!bool {
+            if (try self.takeRaw("cascade")) return true;
+            _ = try self.takeRaw("restrict");
+            return false;
+        }
+
+        /// `[WITH [NO] DATA]`: false for WITH NO DATA.
+        fn withData(self: *Self) Error!bool {
+            if (!self.isWord("WITH")) return true;
+            const next = try self.peek();
+            if (!next.isWord("NO") and !wordIs(self.source, next, "data")) return true;
+            try self.advance();
+            const no = try self.takeWord("NO");
+            if (!try self.takeRaw("data")) return error.Syntax;
+            return !no;
+        }
+
+        /// CREATE [OR REPLACE] [UNIQUE] INDEX | [TEMP] [MATERIALIZED] VIEW |
+        /// TEMP TABLE; null for the other CREATE forms (nothing consumed
+        /// except a TEMP/TEMPORARY/UNLOGGED prefix, recorded for TABLE).
+        fn schemaObject(self: *Self) Error!?Ast.Statement {
+            if (self.isWord("OR") and wordIs(self.source, try self.peek(), "replace")) return error.UnsupportedStatement;
+            if (try self.takeRaw("unique")) {
+                if (!try self.takeRaw("index")) return error.Syntax;
+                return .{ .create_index = try self.createIndex(true) };
+            }
+            if (try self.takeRaw("index")) return .{ .create_index = try self.createIndex(false) };
+            var temporary = false;
+            if (try self.takeRaw("temp") or try self.takeRaw("temporary")) temporary = true else _ = try self.takeRaw("unlogged");
+            if (try self.takeRaw("materialized")) {
+                if (temporary or !try self.takeRaw("view")) return error.Syntax;
+                return .{ .create_view = try self.createView(true) };
+            }
+            if (try self.takeRaw("view")) return .{ .create_view = try self.createView(false) };
+            if (temporary) {
+                var out = try self.create();
+                out.temporary = true;
+                return .{ .create_table = out };
+            }
+            return null;
+        }
+
+        fn createIndex(self: *Self, unique: bool) Error!Ast.CreateIndex {
+            var out: Ast.CreateIndex = .{ .unique = unique };
+            if (try self.takeRaw("concurrently")) return error.UnsupportedStatement;
+            out.if_not_exists = try self.ifNotExists();
+            if (!self.isWord("ON")) out.name = try self.identifier();
+            if (out.if_not_exists and out.name == null) return error.Syntax;
+            try self.expectWord("ON");
+            _ = try self.takeWord("ONLY");
+            out.table = try self.qualifiedName();
+            if (try self.takeWord("USING")) {
+                // Hash entries serve btree and hash requests; others are 0A000.
+                if (!try self.takeRaw("btree") and !try self.takeRaw("hash")) return error.UnsupportedStatement;
+            }
+            try self.expectSymbol(.lparen);
+            while (true) {
+                if (out.count == config.columns) return error.ColumnCapacity;
+                var element: Ast.IndexElement = .{};
+                if (try self.takeSymbol(.lparen)) {
+                    const start = self.tokenStart();
+                    element.node = try self.expression();
+                    element.expression = self.spanTo(start);
+                    try self.expectSymbol(.rparen);
+                } else {
+                    element.column = try self.identifier();
+                }
+                if (try self.takeWord("DESC")) element.descending = true else _ = try self.takeWord("ASC");
+                if (try self.takeWord("NULLS")) {
+                    if (try self.takeWord("FIRST")) element.nulls_first = true else {
+                        try self.expectWord("LAST");
+                        element.nulls_first = false;
+                    }
+                }
+                out.elements[out.count] = element;
+                out.count += 1;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            try self.expectSymbol(.rparen);
+            if (try self.takeRaw("include")) {
+                try self.expectSymbol(.lparen);
+                while (true) {
+                    if (out.include_count == config.columns) return error.ColumnCapacity;
+                    out.includes[out.include_count] = try self.identifier();
+                    out.include_count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                try self.expectSymbol(.rparen);
+            }
+            out.nulls_not_distinct = try self.nullsDistinct();
+            if (try self.takeWord("WHERE")) {
+                const start = self.tokenStart();
+                out.predicate_node = try self.expression();
+                out.predicate = self.spanTo(start);
+            }
+            try self.finish();
+            return out;
+        }
+
+        fn createView(self: *Self, materialized: bool) Error!Ast.CreateView {
+            var out: Ast.CreateView = .{ .materialized = materialized };
+            if (materialized) out.if_not_exists = try self.ifNotExists();
+            out.name = try self.qualifiedName();
+            if (try self.takeSymbol(.lparen)) {
+                while (true) {
+                    if (out.column_count == config.columns) return error.ColumnCapacity;
+                    out.columns[out.column_count] = try self.identifier();
+                    out.column_count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                try self.expectSymbol(.rparen);
+            }
+            try self.expectWord("AS");
+            if (!self.isWord("SELECT") and !self.isWord("WITH")) return error.UnsupportedStatement;
+            const start = self.tokenStart();
+            out.query = try self.query();
+            out.text = self.spanTo(start);
+            if (materialized) out.with_data = try self.withData();
+            if (!materialized and self.isWord("WITH")) return error.UnsupportedStatement;
+            try self.finish();
+            return out;
+        }
+
+        /// A query block of a stored view text inside `source` from `start`
+        /// (statement source plus appended view texts): spans stay absolute.
+        pub fn parseQueryAt(source: []const u8, start: usize, end: usize, pool: *Ast.Pool) Error!u16 {
+            var self = Self{ .tokens = .{ .source = source[0..end], .position = start, .text_limit = config.text_bytes }, .pool = pool, .source = source[0..end], .mode = .standard };
+            try self.advance();
+            const complex = pool.complex;
+            const id = try self.query();
+            if (self.current.kind != .end) return error.Syntax;
+            pool.complex = complex;
+            return id;
+        }
+
+        /// MERGE INTO target [[AS] alias] USING source [[AS] alias] ON cond
+        /// WHEN MATCHED [AND cond] THEN UPDATE SET ... | DELETE | DO NOTHING
+        /// WHEN NOT MATCHED [BY TARGET] [AND cond] THEN INSERT [(cols)]
+        /// VALUES (...) | DEFAULT VALUES | DO NOTHING
+        /// WHEN NOT MATCHED BY SOURCE [AND cond] THEN UPDATE | DELETE | DO NOTHING.
+        fn merge(self: *Self) Error!Ast.Merge {
+            try self.expectWord("INTO");
+            _ = try self.takeWord("ONLY");
+            var out: Ast.Merge = .{ .table = try self.qualifiedName() };
+            out.table.alias = try self.targetAlias();
+            try self.expectWord("USING");
+            const block = try self.pool.newQuery();
+            try self.fromItem(&self.pool.queries[block], .first);
+            const q = &self.pool.queries[block];
+            if (q.items[0].query == none) q.from = .{ .schema = q.items[0].schema, .name = q.items[0].name, .alias = q.items[0].alias };
+            q.targets[0] = .{ .star = true };
+            q.count = 1;
+            out.source = block;
+            try self.expectWord("ON");
+            out.on = try self.expression();
+            while (try self.takeWord("WHEN")) {
+                if (out.when_count == Ast.merge_clauses) return error.StatementTooComplex;
+                var when: Ast.MergeWhen = .{};
+                if (try self.takeWord("NOT")) {
+                    when.matched = false;
+                    if (!try self.takeRaw("matched")) return error.Syntax;
+                    if (try self.takeWord("BY")) {
+                        if (try self.takeRaw("source")) {
+                            when.by_source = true;
+                            when.matched = true;
+                        } else if (!try self.takeRaw("target")) return error.Syntax;
+                    }
+                } else if (!try self.takeRaw("matched")) return error.Syntax;
+                if (try self.takeWord("AND")) when.condition = try self.expression();
+                try self.expectWord("THEN");
+                if (try self.takeWord("DO")) {
+                    try self.expectWord("NOTHING");
+                    when.action = .nothing;
+                } else if (when.matched) {
+                    if (try self.takeWord("UPDATE")) {
+                        try self.expectWord("SET");
+                        when.action = .update;
+                        while (true) {
+                            try self.setItem(&when.assignments, &when.count);
+                            if (!try self.takeSymbol(.comma)) break;
+                        }
+                    } else if (try self.takeWord("DELETE")) {
+                        when.action = .delete;
+                    } else return error.Syntax;
+                } else {
+                    try self.expectWord("INSERT");
+                    when.action = .insert;
+                    if (try self.takeSymbol(.lparen)) {
+                        while (true) {
+                            if (when.column_count == config.columns) return error.ColumnCapacity;
+                            when.columns[when.column_count] = try self.identifier();
+                            when.column_count += 1;
+                            if (!try self.takeSymbol(.comma)) break;
+                        }
+                        try self.expectSymbol(.rparen);
+                    }
+                    if (try self.takeWord("OVERRIDING")) return error.UnsupportedStatement;
+                    if (try self.takeWord("DEFAULT")) {
+                        try self.expectWord("VALUES");
+                    } else {
+                        try self.expectWord("VALUES");
+                        try self.expectSymbol(.lparen);
+                        const row = try self.pool.add(.{ .kind = .values_row });
+                        var last: u16 = none;
+                        var items: usize = 0;
+                        while (true) {
+                            if (items == config.columns) return error.Syntax;
+                            const item = try self.valueItem();
+                            if (last == none) self.pool.nodes[row].b = item else self.pool.nodes[last].next = item;
+                            last = item;
+                            items += 1;
+                            if (!try self.takeSymbol(.comma)) break;
+                        }
+                        try self.expectSymbol(.rparen);
+                        self.pool.nodes[row].integer = @intCast(items);
+                        when.values = row;
+                    }
+                }
+                out.whens[out.when_count] = when;
+                out.when_count += 1;
+            }
+            if (out.when_count == 0) return error.Syntax;
+            if (self.isWord("RETURNING")) return error.UnsupportedStatement;
+            try self.finish();
+            return out;
         }
 
         /// `name` or `schema.name`.
@@ -1058,22 +1334,117 @@ pub fn Parser(comptime config: types.Config) type {
             } else {
                 const next = try self.peek();
                 const paren = next.kind == .symbol and next.symbol == .lparen;
-                const starts = (self.rawWord("check") and paren) or (self.rawWord("unique") and (paren or next.isWord("NULLS"))) or self.isWord("PRIMARY");
+                const starts = (self.rawWord("check") and paren) or (self.rawWord("unique") and (paren or next.isWord("NULLS"))) or self.isWord("PRIMARY") or
+                    (self.rawWord("foreign") and next.isWord("KEY")) or (self.isWord("EXCLUDE") and (paren or next.isWord("USING")));
                 if (!starts) return null;
             }
             if (try self.takeRaw("check")) return try self.checkConstraint(name);
             if (try self.takeRaw("unique")) {
                 var out: Ast.ConstraintDef = .{ .name = name, .kind = .unique, .nulls_not_distinct = try self.nullsDistinct() };
                 try self.keyColumns(&out);
+                try self.deferrability(&out);
                 return out;
             }
             if (try self.takeWord("PRIMARY")) {
                 try self.expectWord("KEY");
                 var out: Ast.ConstraintDef = .{ .name = name, .kind = .primary };
                 try self.keyColumns(&out);
+                try self.deferrability(&out);
+                return out;
+            }
+            if (try self.takeRaw("foreign")) {
+                try self.expectWord("KEY");
+                var out: Ast.ConstraintDef = .{ .name = name, .kind = .foreign };
+                try self.keyColumns(&out);
+                if (!try self.takeRaw("references")) return error.Syntax;
+                try self.references(&out);
+                return out;
+            }
+            if (try self.takeWord("EXCLUDE")) {
+                var out: Ast.ConstraintDef = .{ .name = name, .kind = .exclusion };
+                if (try self.takeWord("USING")) {
+                    if (!try self.takeRaw("gist") and !try self.takeRaw("btree") and !try self.takeRaw("hash")) return error.UnsupportedStatement;
+                }
+                try self.expectSymbol(.lparen);
+                while (true) {
+                    if (out.column_count == config.columns) return error.ColumnCapacity;
+                    out.columns[out.column_count] = try self.identifier();
+                    try self.expectWord("WITH");
+                    if (try self.takeSymbol(.eq)) {
+                        out.operators[out.column_count] = 1;
+                    } else if (try self.takeSymbol(.ampersand)) {
+                        // `&&` tokenizes as two `&`.
+                        try self.expectSymbol(.ampersand);
+                        out.operators[out.column_count] = 2;
+                    } else return error.UnsupportedStatement;
+                    out.column_count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                try self.expectSymbol(.rparen);
+                if (self.isWord("WHERE") or self.rawWord("include")) return error.UnsupportedStatement;
+                try self.deferrability(&out);
                 return out;
             }
             return error.Syntax;
+        }
+
+        /// [NOT] DEFERRABLE [INITIALLY DEFERRED | IMMEDIATE], in any order.
+        fn deferrability(self: *Self, out: *Ast.ConstraintDef) Error!void {
+            while (true) {
+                if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "deferrable")) {
+                    try self.advance();
+                    try self.advance();
+                    out.deferrable = false;
+                } else if (try self.takeRaw("deferrable")) {
+                    out.deferrable = true;
+                } else if (try self.takeRaw("initially")) {
+                    if (try self.takeRaw("deferred")) out.initially_deferred = true else if (try self.takeRaw("immediate")) out.initially_deferred = false else return error.Syntax;
+                } else break;
+            }
+            if (out.initially_deferred) out.deferrable = true;
+        }
+
+        fn foreignAction(self: *Self) Error!Ast.ForeignAction {
+            if (try self.takeWord("NO")) {
+                if (!try self.takeRaw("action")) return error.Syntax;
+                return .no_action;
+            }
+            if (try self.takeRaw("restrict")) return .restrict;
+            if (try self.takeRaw("cascade")) return .cascade;
+            try self.expectWord("SET");
+            const action: Ast.ForeignAction = if (try self.takeWord("NULL")) .set_null else blk: {
+                try self.expectWord("DEFAULT");
+                break :blk .set_default;
+            };
+            // SET NULL / SET DEFAULT (column list) is outside the subset.
+            if (self.isSymbol(.lparen)) return error.UnsupportedStatement;
+            return action;
+        }
+
+        /// REFERENCES table [(columns)] [MATCH SIMPLE] [ON DELETE action]
+        /// [ON UPDATE action] [deferrability]; MATCH FULL/PARTIAL are 0A000.
+        fn references(self: *Self, out: *Ast.ConstraintDef) Error!void {
+            out.ref_table = try self.qualifiedName();
+            if (try self.takeSymbol(.lparen)) {
+                while (true) {
+                    if (out.ref_count == config.columns) return error.ColumnCapacity;
+                    out.ref_columns[out.ref_count] = try self.identifier();
+                    out.ref_count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                try self.expectSymbol(.rparen);
+            }
+            if (try self.takeRaw("match")) {
+                if (!try self.takeRaw("simple")) return error.UnsupportedStatement;
+            }
+            while (self.isWord("ON")) {
+                try self.advance();
+                if (try self.takeWord("DELETE")) out.on_delete = try self.foreignAction() else {
+                    try self.expectWord("UPDATE");
+                    out.on_update = try self.foreignAction();
+                }
+            }
+            try self.deferrability(out);
         }
 
         /// One column definition with its column constraints; CHECK, UNIQUE
@@ -1132,7 +1503,11 @@ pub fn Parser(comptime config: types.Config) type {
                         _ = try self.expression();
                         column.expression = self.spanTo(start);
                         try self.expectSymbol(.rparen);
-                        try self.expectWord("STORED");
+                        // PostgreSQL 18: VIRTUAL unless STORED is written.
+                        if (!try self.takeWord("STORED")) {
+                            _ = try self.takeRaw("virtual");
+                            column.virtual = true;
+                        }
                         column.default_kind = .generated;
                     }
                 } else if (self.mode == .standard and self.isWord("NULL")) {
@@ -1158,7 +1533,19 @@ pub fn Parser(comptime config: types.Config) type {
                 } else if (self.mode == .standard and try self.takeRaw("unique")) {
                     var definition: Ast.ConstraintDef = .{ .name = name, .kind = .unique, .nulls_not_distinct = try self.nullsDistinct(), .column_count = 1 };
                     definition.columns[0] = column.name;
+                    try self.deferrability(&definition);
                     try pushConstraint(sink, definition);
+                } else if (self.mode == .standard and try self.takeRaw("references")) {
+                    var definition: Ast.ConstraintDef = .{ .name = name, .kind = .foreign, .column_count = 1 };
+                    definition.columns[0] = column.name;
+                    try self.references(&definition);
+                    try pushConstraint(sink, definition);
+                } else if (self.mode == .standard and (self.rawWord("deferrable") or self.rawWord("initially") or (self.isWord("NOT") and wordIs(self.source, try self.peek(), "deferrable")))) {
+                    // After an unnamed column PRIMARY KEY: a deferrable
+                    // primary key index is outside the subset.
+                    var probe: Ast.ConstraintDef = .{};
+                    try self.deferrability(&probe);
+                    if (probe.deferrable) return error.UnsupportedStatement;
                 } else {
                     if (name != null) return error.Syntax;
                     break;
@@ -1172,10 +1559,73 @@ pub fn Parser(comptime config: types.Config) type {
             const conditional = try self.ifNotExists();
             const reference = try self.qualifiedName();
             var out: Ast.CreateTable = .{ .schema = reference.schema, .name = reference.name, .if_not_exists = conditional };
+            if (self.mode == .standard) {
+                if (try self.takeWord("AS")) return self.createAs(out);
+                if (try self.takeRaw("partition")) {
+                    if (!try self.takeRaw("of")) return error.Syntax;
+                    out.partition_of = try self.qualifiedName();
+                    try self.partitionBound(&out.bound);
+                    if (self.rawWord("partition")) return error.UnsupportedStatement;
+                    try self.finish();
+                    return out;
+                }
+                // CREATE TABLE t (a, b) AS query: a bare column-name list.
+                if (self.isSymbol(.lparen)) {
+                    const next = try self.peek();
+                    if (next.kind == .word or next.kind == .quoted_word) {
+                        var copy = self.*;
+                        try copy.advance();
+                        const named = if (copy.identifier()) |_| true else |_| false;
+                        if (named and (copy.isSymbol(.comma) or copy.isSymbol(.rparen))) {
+                            try self.advance();
+                            while (true) {
+                                if (out.as_column_count == config.columns) return error.ColumnCapacity;
+                                out.as_columns[out.as_column_count] = try self.identifier();
+                                out.as_column_count += 1;
+                                if (!try self.takeSymbol(.comma)) break;
+                            }
+                            try self.expectSymbol(.rparen);
+                            try self.expectWord("AS");
+                            return self.createAs(out);
+                        }
+                    }
+                }
+            }
             try self.expectSymbol(.lparen);
             var has_primary = false;
             const sink: ConstraintSink = .{ .items = out.constraints[0..], .count = &out.constraint_count };
             while (true) {
+                if (self.mode == .standard and self.isWord("LIKE")) {
+                    try self.advance();
+                    if (out.like != null) return error.UnsupportedStatement;
+                    var like: Ast.Like = .{ .table = try self.qualifiedName(), .position = out.count };
+                    while (self.rawWord("including") or self.rawWord("excluding")) {
+                        const including = try self.takeRaw("including");
+                        if (!including) try self.advance();
+                        const all = try self.takeWord("ALL");
+                        var defaults = all;
+                        var constraints = all;
+                        var indexes = all;
+                        var identity = all;
+                        var generated = all;
+                        if (!all) {
+                            if (try self.takeWord("DEFAULT") or try self.takeRaw("defaults")) defaults = true
+                            else if (try self.takeWord("CONSTRAINT") or try self.takeRaw("constraints")) constraints = true
+                            else if (try self.takeRaw("indexes")) indexes = true
+                            else if (try self.takeWord("IDENTITY")) identity = true
+                            else if (try self.takeWord("GENERATED")) generated = true
+                            else if (!try self.takeRaw("comments") and !try self.takeRaw("storage") and !try self.takeRaw("statistics") and !try self.takeRaw("compression")) return error.Syntax;
+                        }
+                        if (defaults) like.defaults = including;
+                        if (constraints) like.constraints = including;
+                        if (indexes) like.indexes = including;
+                        if (identity) like.identity = including;
+                        if (generated) like.generated = including;
+                    }
+                    out.like = like;
+                    if (!try self.takeSymbol(.comma)) break;
+                    continue;
+                }
                 if (try self.tableConstraint()) |constraint| {
                     if (constraint.kind == .primary) {
                         if (has_primary) {if(out.if_not_exists) out.invalid_definition=true else return error.InvalidTableDefinition;}
@@ -1190,8 +1640,70 @@ pub fn Parser(comptime config: types.Config) type {
                 if (!try self.takeSymbol(.comma)) break;
             }
             try self.expectSymbol(.rparen);
+            if (self.mode == .standard and try self.takeRaw("inherits")) {
+                try self.expectSymbol(.lparen);
+                out.inherits = try self.qualifiedName();
+                if (self.isSymbol(.comma)) return error.UnsupportedStatement;
+                try self.expectSymbol(.rparen);
+            }
+            if (self.mode == .standard and try self.takeRaw("partition")) {
+                try self.expectWord("BY");
+                if (try self.takeWord("RANGE")) out.partition_by = .range else if (try self.takeRaw("list")) out.partition_by = .list else return error.UnsupportedStatement;
+                try self.expectSymbol(.lparen);
+                out.partition_key = try self.identifier();
+                if (!self.isSymbol(.rparen)) return error.UnsupportedStatement;
+                try self.expectSymbol(.rparen);
+            }
             try self.finish();
             return out;
+        }
+
+        /// CREATE TABLE ... AS query [WITH [NO] DATA].
+        fn createAs(self: *Self, initial: Ast.CreateTable) Error!Ast.CreateTable {
+            var out = initial;
+            if (!self.isWord("SELECT") and !self.isWord("WITH")) return error.UnsupportedStatement;
+            out.as_query = try self.query();
+            out.with_data = try self.withData();
+            try self.finish();
+            return out;
+        }
+
+        /// FOR VALUES FROM (v) TO (v) | FOR VALUES IN (v, ...) | DEFAULT.
+        fn partitionBound(self: *Self, out: *Ast.PartitionBound) Error!void {
+            if (try self.takeWord("DEFAULT")) {
+                out.kind = .default;
+                return;
+            }
+            try self.expectWord("FOR");
+            try self.expectWord("VALUES");
+            if (try self.takeWord("FROM")) {
+                out.kind = .range;
+                for (0..2) |position| {
+                    if (position == 1) try self.expectWord("TO");
+                    try self.expectSymbol(.lparen);
+                    if (try self.takeWord("MINVALUE")) {
+                        out.minvalue = true;
+                        out.values[position] = none;
+                    } else if (try self.takeWord("MAXVALUE")) {
+                        out.maxvalue = true;
+                        out.values[position] = none;
+                    } else out.values[position] = try self.expression();
+                    if (self.isSymbol(.comma)) return error.UnsupportedStatement;
+                    try self.expectSymbol(.rparen);
+                }
+                out.count = 2;
+                return;
+            }
+            try self.expectWord("IN");
+            out.kind = .list;
+            try self.expectSymbol(.lparen);
+            while (true) {
+                if (out.count == out.values.len) return error.ColumnCapacity;
+                out.values[out.count] = try self.expression();
+                out.count += 1;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            try self.expectSymbol(.rparen);
         }
 
         fn insert(self: *Self) Error!Ast.Insert {
@@ -1600,11 +2112,13 @@ pub fn Parser(comptime config: types.Config) type {
                 try self.expectSymbol(.rparen);
                 self.pool.complex = true;
             } else {
+                if (self.mode == .standard and try self.takeWord("ONLY")) item.only = true;
                 item.name = try self.identifier();
                 if (self.mode == .standard and try self.takeSymbol(.dot)) {
                     item.schema = item.name;
                     item.name = try self.identifier();
                 }
+                if (self.mode == .standard and !item.only) _ = try self.takeSymbol(.star);
             }
             item.alias = try self.bareAlias();
             out.items[out.item_count] = item;
