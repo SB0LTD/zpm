@@ -1249,7 +1249,7 @@ pub fn Database(comptime config: Config) type {
             const slot = try self.begin();
             // A mutation's outcome reaches `result` only after the sink and
             // publication, so the hook observes the previous result.
-            self.statement(slot, source, result, .{ .mode = mode, .hold_result = true }) catch |err| {
+            self.statement(slot, source, result, .{ .mode = mode, .hold_result = true, .implicit = true }) catch |err| {
                 self.abort(slot);
                 return err;
             };
@@ -5081,7 +5081,12 @@ pub fn Database(comptime config: Config) type {
         fn runControl(self: *Self, slot: u16, source: []const u8, command: ast.Control, result: *Result) Error!void {
             switch (command) {
                 // Already in a transaction block: PostgreSQL warns and ignores it.
-                .begin => self.outcome = .{ .command = .begin },
+                // An implicit (autocommit) statement cannot open a block: it
+                // would commit at once while the caller believes it is open.
+                .begin => {
+                    if (self.statement_implicit) return error.UnsupportedStatement;
+                    self.outcome = .{ .command = .begin };
+                },
                 .commit, .rollback, .savepoint, .release, .rollback_to => return error.UnsupportedStatement,
                 .set => |set| {
                     var name: ControlText = .{};

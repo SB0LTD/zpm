@@ -4865,6 +4865,10 @@ pub fn Binder(comptime config: types.Config) type {
             }
             const p = &plans.items[id];
             p.values = q.values;
+            // Rows live in `values`; only targets[0] names an item. The other
+            // target slots must not stay undefined, because planned-expression
+            // validation walks targets[0..width].
+            @memset(p.targets[0..width], none);
             row = q.values;
             while (row != none) : (row = context.node(row).next) {
                 var previous: u16 = none;
