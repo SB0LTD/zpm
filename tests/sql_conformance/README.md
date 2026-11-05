@@ -124,15 +124,15 @@ component is missing. The annotations below separate those cases.
 | PG.TEXT.LITERALS | Escape/dollar/Unicode literals | Syntax |
 | PG.TEXT.SEARCH | Full text search | Syntax |
 | PG.OP.BITWISE | Bitwise operators | Syntax |
-| PG.TX.ISOLATION | Repeatable Read/Serializable | UnsupportedStatement |
-| PG.TX.CHARACTERISTICS | Transaction characteristics | Syntax |
-| PG.TX.LOCK_MODES | Additional row lock modes | Syntax |
-| PG.TX.TABLE_LOCK | Explicit table/advisory locking | UnsupportedStatement |
+| PG.TX.ISOLATION | Repeatable Read/Serializable | pass (B11 candidate); REPEATABLE READ snapshot + 40001, relation-granularity SSI (more 40001s than PostgreSQL) |
+| PG.TX.CHARACTERISTICS | Transaction characteristics | pass (B11 candidate); READ ONLY 25006, DEFERRABLE safe-snapshot wait, 25001 hooks; SET TRANSACTION SNAPSHOT open |
+| PG.TX.LOCK_MODES | Additional row lock modes | pass (B11 candidate); four strengths and OF; non-key UPDATE still FOR UPDATE strength |
+| PG.TX.TABLE_LOCK | Explicit table/advisory locking | pass (B11 candidate); eight LOCK modes, NOWAIT, try/unlock advisory forms; blocking (void) advisory forms open |
 | PG.TX.TWO_PHASE | Two-phase commit | UnexecutedScopeOrComparator |
-| PG.CURSOR | Cursor lifecycle | UnsupportedStatement |
-| PG.SQL_PREPARE | SQL prepared statements | UnsupportedStatement |
-| PG.SESSION.SETTINGS | General settings/search_path | UnsupportedStatement |
-| PG.SESSION.NOTIFY | Notifications | UnsupportedStatement |
+| PG.CURSOR | Cursor lifecycle | pass (B11 candidate); materialized at DECLARE, all FETCH/MOVE directions, SCROLL, WITH HOLD |
+| PG.SQL_PREPARE | SQL prepared statements | pass (B11 candidate); declared parameter types only (no inference) |
+| PG.SESSION.SETTINGS | General settings/search_path | pass (B11 candidate); transactional SET/SET LOCAL, placeholders, current_setting/set_config; search_path limited to public |
+| PG.SESSION.NOTIFY | Notifications | pass (B11 candidate); delivered at commit, NotificationResponse on the wire; pg_notify() open |
 | PG.SECURITY.ROLE | Roles/privileges | Syntax |
 | PG.SECURITY.RLS | Row-level security | UnsupportedStatement |
 | PG.ROUTINE.FUNCTION | SQL functions | Syntax |

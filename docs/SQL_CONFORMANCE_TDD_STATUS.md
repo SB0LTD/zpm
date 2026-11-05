@@ -1,5 +1,29 @@
 # SQL conformance TDD checkpoint
 
+## Transaction and session candidate (lane B11, wave 3) - 5 November 2026
+
+Branch `b11/tx-session` (on 20e7528) closes eight smoke programs
+test-first: PG.TX.ISOLATION, PG.TX.CHARACTERISTICS, PG.TX.LOCK_MODES,
+PG.TX.TABLE_LOCK, PG.CURSOR, PG.SQL_PREPARE, PG.SESSION.SETTINGS and
+PG.SESSION.NOTIFY. The unchanged driver moves from 71 passes to 79; it
+still exits 1 SqlConformanceIncomplete and no other program changed.
+`contract-sql-tx-session` (tests/test_sql_tx_session.sig) covers values,
+column names, OIDs and typmods, exact SQLSTATEs (40001, 25001, 25006,
+25P01, 55P03, 55000, 34000, 42P03, 26000, 42P05, 42601, 42804, 42P18,
+42704, 22023, 42P01, 3F000, 0A000, 54000), statement atomicity,
+two-connection schedules (REPEATABLE READ conflicts, SSI write skew and
+pivots, DEFERRABLE waits, LOCK TABLE and row-lock matrices, advisory locks,
+LISTEN/NOTIFY across store connections and the wire) and replay of
+REPEATABLE READ / SERIALIZABLE commits into a replica. Only the eight
+oracle programs are native-verified; every other expectation is pending
+native verification. Details, limits and open items: docs/SQL_TX_SESSION.md.
+
+Durability: no new change-record op (50-59 unused) and no definition format
+change; the lane adds transaction, lock and session state only.
+SERIALIZABLE is SSI at relation granularity: sound, with more serialization
+failures than PostgreSQL's tuple-level SSI; it is not claimed to match
+PostgreSQL's failure set.
+
 ## Schema-object candidate (lane B11, wave 2) - 5 November 2026
 
 Branch `b11/schema-objects` (rebased on d91020c) closes the thirteen
