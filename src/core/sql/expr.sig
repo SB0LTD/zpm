@@ -542,13 +542,9 @@ pub fn Eval(comptime config: types.Config) type {
 
         /// The catalog OID named by obj_description's second argument.
         fn catalogClass(name: []const u8) ?u32 {
-            const known = [_]struct { name: []const u8, oid: u32 }{
-                .{ .name = "pg_class", .oid = 1259 },           .{ .name = "pg_namespace", .oid = 2615 },
-                .{ .name = "pg_authid", .oid = 1260 },          .{ .name = "pg_foreign_data_wrapper", .oid = 2328 },
-                .{ .name = "pg_foreign_server", .oid = 1417 },  .{ .name = "pg_publication", .oid = 6104 },
-                .{ .name = "pg_policy", .oid = 3256 },
-            };
-            for (known) |entry| if (types.same(entry.name, name)) return entry.oid;
+            const names = [_][]const u8{ "pg_class", "pg_namespace", "pg_authid", "pg_foreign_data_wrapper", "pg_foreign_server", "pg_publication", "pg_policy" };
+            const oids = [_]u32{ 1259, 2615, 1260, 2328, 1417, 6104, 3256 };
+            for (names, oids) |known, oid| if (types.same(known, name)) return oid;
             return null;
         }
 

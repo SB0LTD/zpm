@@ -81,17 +81,11 @@ pub const priv_trigger: u32 = 1 << 6;
 pub const priv_maintain: u32 = 1 << 14;
 pub const table_privileges: u32 = priv_insert | priv_select | priv_update | priv_delete | priv_truncate | priv_references | priv_trigger | priv_maintain;
 
-pub const PrivilegeName = struct { bit: u32, letter: u8, word: []const u8, sql: []const u8 };
-pub const privilege_names = [_]PrivilegeName{
-    .{ .bit = priv_insert, .letter = 'a', .word = "insert", .sql = "INSERT" },
-    .{ .bit = priv_select, .letter = 'r', .word = "select", .sql = "SELECT" },
-    .{ .bit = priv_update, .letter = 'w', .word = "update", .sql = "UPDATE" },
-    .{ .bit = priv_delete, .letter = 'd', .word = "delete", .sql = "DELETE" },
-    .{ .bit = priv_truncate, .letter = 'D', .word = "truncate", .sql = "TRUNCATE" },
-    .{ .bit = priv_references, .letter = 'x', .word = "references", .sql = "REFERENCES" },
-    .{ .bit = priv_trigger, .letter = 't', .word = "trigger", .sql = "TRIGGER" },
-    .{ .bit = priv_maintain, .letter = 'm', .word = "maintain", .sql = "MAINTAIN" },
-};
+/// The table privileges in aclexplode order: bits, keywords and the
+/// information_schema spelling (parallel arrays: no slice-holding structs).
+pub const privilege_bits = [_]u32{ priv_insert, priv_select, priv_update, priv_delete, priv_truncate, priv_references, priv_trigger, priv_maintain };
+pub const privilege_words = [_][]const u8{ "insert", "select", "update", "delete", "truncate", "references", "trigger", "maintain" };
+pub const privilege_sql = [_][]const u8{ "INSERT", "SELECT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN" };
 
 /// relation flags (pg_class.relrowsecurity / relforcerowsecurity).
 pub const rls_enabled: u32 = 1;
@@ -454,30 +448,24 @@ const Parser = struct {
         _ = try self.take("with");
         var seen: u32 = 0;
         while (!self.atEnd()) {
-            const attributes = [_]struct { on: []const u8, off: []const u8, bit: u32 }{
-                .{ .on = "superuser", .off = "nosuperuser", .bit = role_superuser },
-                .{ .on = "inherit", .off = "noinherit", .bit = role_inherit },
-                .{ .on = "createrole", .off = "nocreaterole", .bit = role_createrole },
-                .{ .on = "createdb", .off = "nocreatedb", .bit = role_createdb },
-                .{ .on = "login", .off = "nologin", .bit = role_login },
-                .{ .on = "replication", .off = "noreplication", .bit = role_replication },
-                .{ .on = "bypassrls", .off = "nobypassrls", .bit = role_bypassrls },
-            };
+            const on_words = [_][]const u8{ "superuser", "inherit", "createrole", "createdb", "login", "replication", "bypassrls" };
+            const off_words = [_][]const u8{ "nosuperuser", "noinherit", "nocreaterole", "nocreatedb", "nologin", "noreplication", "nobypassrls" };
+            const bits = [_]u32{ role_superuser, role_inherit, role_createrole, role_createdb, role_login, role_replication, role_bypassrls };
             var matched = false;
             if (self.current.kind == .word) {
                 const raw = self.current.raw(self.source);
-                for (attributes) |attribute| {
-                    const on = types.keyword(raw, attribute.on);
-                    if (!on and !types.keyword(raw, attribute.off)) continue;
+                for (on_words, off_words, bits) |on_word, off_word, bit| {
+                    const on = types.keyword(raw, on_word);
+                    if (!on and !types.keyword(raw, off_word)) continue;
                     // Conflicting or redundant options (42601).
-                    if (seen & attribute.bit != 0) return error.Syntax;
-                    seen |= attribute.bit;
+                    if (seen & bit != 0) return error.Syntax;
+                    seen |= bit;
                     if (on) {
-                        out.set |= attribute.bit;
-                        out.clear &= ~attribute.bit;
+                        out.set |= bit;
+                        out.clear &= ~bit;
                     } else {
-                        out.clear |= attribute.bit;
-                        out.set &= ~attribute.bit;
+                        out.clear |= bit;
+                        out.set &= ~bit;
                     }
                     matched = true;
                     break;
@@ -629,7 +617,7 @@ const Parser = struct {
     }
 
     fn privilegeWord(raw: []const u8) ?u32 {
-        for (privilege_names) |entry| if (types.keyword(raw, entry.word)) return entry.bit;
+        for (privilege_words, privilege_bits) |spelled, bit| if (types.keyword(raw, spelled)) return bit;
         return null;
     }
 

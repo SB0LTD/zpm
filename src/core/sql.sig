@@ -3191,9 +3191,9 @@ pub fn Database(comptime config: Config) type {
 
         fn privilegeRows(self: *const Self, database: []const u8, schema_name: []const u8, table: *const S.Table, grantor: []const u8, grantee: []const u8, flags: u32, grant_flags: u32, sink: *X.RowSink) Error!void {
             _ = self;
-            for (CO.privilege_names) |entry| {
-                if (flags & entry.bit == 0) continue;
-                try sink.add(&.{ nameCell(grantor), nameCell(grantee), nameCell(database), nameCell(schema_name), nameCell(table.name.slice()), nameCell(entry.sql), nameCell(if (grant_flags & entry.bit != 0) "YES" else "NO"), nameCell(if (entry.bit == CO.priv_select) "YES" else "NO") });
+            for (CO.privilege_bits, CO.privilege_sql) |bit, spelling| {
+                if (flags & bit == 0) continue;
+                try sink.add(&.{ nameCell(grantor), nameCell(grantee), nameCell(database), nameCell(schema_name), nameCell(table.name.slice()), nameCell(spelling), nameCell(if (grant_flags & bit != 0) "YES" else "NO"), nameCell(if (bit == CO.priv_select) "YES" else "NO") });
             }
         }
 

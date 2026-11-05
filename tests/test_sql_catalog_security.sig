@@ -558,6 +558,12 @@ fn roles() !void {
     try expect(members, "");
     try expect(listing, "ramsql|t|t|t|t|t|t|-1|t;r_plain|f|t|f|f|t|f|5|f;r_admin|f|f|t|f|t|f|-1|t;r_member|f|t|f|f|f|f|-1|f");
     try sameState();
+    // READ ONLY transactions write no catalog objects (25006).
+    const read_only = try db.begin();
+    try statement(read_only, "SET TRANSACTION READ ONLY");
+    try statementFails(read_only, "CREATE ROLE r_read_only", error.ReadOnlyTransaction);
+    try statementFails(read_only, "COMMENT ON TABLE tdd_a IS 'x'", error.ReadOnlyTransaction);
+    db.abort(read_only);
     // Abort returns the role and its OID.
     const counter = db.oid_counter;
     const tx = try db.begin();
