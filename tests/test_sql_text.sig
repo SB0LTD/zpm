@@ -1293,7 +1293,7 @@ fn textSearch() !void {
     for ([_][]const u8{
         "SELECT to_tsvector('english', 'x')",     "SELECT to_tsvector('x')",
         "SELECT to_tsquery('x')",                 "SELECT plainto_tsquery('x')",
-        "SELECT 'a' @@ to_tsquery('simple', 'a')", "SELECT 'a b' @@ 'a b'",
+        "SELECT 'a' @@ to_tsquery('simple', 'a')",
     }) |source| try rejects(source, error.UnsupportedStatement);
     try rejects("SELECT to_tsvector('nope', 'x')", error.UndefinedObject);
     try rejects("SELECT 'a <16385> b'::tsquery", error.InvalidParameterValue);

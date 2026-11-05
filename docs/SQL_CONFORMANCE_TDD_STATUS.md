@@ -80,11 +80,11 @@ before anything applies. Existing records and the definition format are
 unchanged.
 ## Text candidate (lane B11, wave 3) - 5 November 2026
 
-Branch `b11/text` (rebased on 6f32405) closes four smoke programs
+Branch `b11/text` (rebased on 4c028a6) closes four smoke programs
 test-first: PG.FUNC.DISCOVERY, PG.TEXT.COLLATION, PG.PRED.REGEX and
-PG.TEXT.SEARCH. The unchanged driver moves from 83 passes (6f32405) to 87;
+PG.TEXT.SEARCH. The unchanged driver moves from 89 passes (4c028a6) to 93;
 it still exits 1 SqlConformanceIncomplete and no other program changed.
-`contract-sql-text` (tests/test_sql_text.sig, 3344 assertions) covers
+`contract-sql-text` (tests/test_sql_text.sig, 3341 assertions) covers
 values, type OIDs, typmods and column names, NULLs, exact SQLSTATEs (new
 42P21, 2201B, 2200C; also 42804, 42704, 3F000, 0A000, 22P02, 22003, 22012,
 22023, 22025, 42601, 42883, 42P01, 42703, 23514, 54000, 54001, 57014),
@@ -109,7 +109,7 @@ to_tsvector/to_tsquery/plainto_tsquery/phraseto_tsquery and `@@` with
 phrase semantics; Snowball configurations and default_text_search_config
 forms are 0A000. Durability: value tags 28 tsvector, 29 tsquery (canonical
 text, re-read on replay) and 30 regtype; ops 40-44 and tag 31 unused; no
-table-definition format change. The pg_type view has 84 rows.
+table-definition format change. The pg_type view has 86 rows.
 
 ## Transaction and session candidate (lane B11, wave 3) - 5 November 2026
 
