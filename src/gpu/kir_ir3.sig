@@ -260,9 +260,20 @@ const VInfo = struct {
     low: bool = false,
     /// The first position that writes it (machine level).
     fdef: u32 = NOWHERE,
+    /// The innermost region of that write (regions), or NONE_REGION.
+    home: u32 = NONE_REGION,
 };
 
+const NONE_REGION: u32 = 0xffff_ffff;
+
 const Loop = struct { head: u32, end: u32, depth: u16 };
+
+/// The machine instructions [lo, hi) of an if's then-part, an else-part
+/// or a loop's body: entered only at lo, so an instruction at its top
+/// level runs before any later one in it (in the same pass of a loop).
+const Region = struct { lo: u32, hi: u32 };
+
+pub const MAX_REGIONS = 4096;
 
 const Ctl = struct {
     kind: enum { if_, loop },
@@ -273,6 +284,8 @@ const Ctl = struct {
     used_latch: bool = false,
     loop_index: u16 = 0,
     head_mi: u32 = 0,
+    /// if: where the part now open (then, or else) starts
+    part_lo: u32 = 0,
 };
 
 const Fuse = enum(u8) { none, skip, shrm, shlm, shrg, shlg, andg, branch, imad, half_lo, half_hi };
@@ -297,6 +310,10 @@ pub const Work = struct {
     tmp_mi: [SCHED_WINDOW]MI = undefined,
     loops: [MAX_LOOPS]Loop = undefined,
     n_loops: u32 = 0,
+    regions: [MAX_REGIONS]Region = undefined,
+    n_regions: u32 = 0,
+    /// more regions than MAX_REGIONS: every loop's rule is the cautious one
+    regions_full: bool = false,
     n_labels: u32 = 0,
     ctl: [64]Ctl = undefined,
     n_ctl: u32 = 0,
@@ -1256,6 +1273,8 @@ fn lower(w: *Work) Error!void {
     w.n_mi = 0;
     w.n_pro = 0;
     w.n_loops = 0;
+    w.n_regions = 0;
+    w.regions_full = false;
     w.n_labels = 0;
     w.n_ctl = 0;
     w.n_pool = 0;
@@ -1328,6 +1347,10 @@ fn lower(w: *Work) Error!void {
         for (w.loops[0..w.n_loops]) |*lp| {
             lp.head += w.n_pro;
             lp.end += w.n_pro;
+        }
+        for (w.regions[0..w.n_regions]) |*rg| {
+            rg.lo += w.n_pro;
+            rg.hi += w.n_pro;
         }
         w.n_mi += w.n_pro;
     }
@@ -2478,6 +2501,16 @@ fn p0Inverted(l: *const Lw, inv: bool) bool {
     return true;
 }
 
+/// A region's span (lowering: then-parts, else-parts, loop bodies).
+fn addRegion(w: *Work, lo: u32, hi: u32) void {
+    if (w.n_regions == MAX_REGIONS) {
+        w.regions_full = true;
+        return;
+    }
+    w.regions[w.n_regions] = .{ .lo = lo, .hi = hi };
+    w.n_regions += 1;
+}
+
 fn lowerControl(l: *Lw) Error!void {
     const w = l.w;
     const in = l.in;
@@ -2488,6 +2521,7 @@ fn lowerControl(l: *Lw) Error!void {
             w.ctl[w.n_ctl] = .{ .kind = .if_, .l1 = l1 };
             w.n_ctl += 1;
             w.max_depth = @max(w.max_depth, w.n_ctl);
+            defer w.ctl[w.n_ctl - 1].part_lo = w.n_mi;
             if (argImm(in.a)) |x| {
                 if (x == 0) try putBranch(w, .jump, false, l1);
                 return;
@@ -2501,15 +2535,18 @@ fn lowerControl(l: *Lw) Error!void {
             if (w.n_ctl == 0 or w.ctl[w.n_ctl - 1].kind != .if_) return error.Unbalanced;
             const c = &w.ctl[w.n_ctl - 1];
             if (c.has_else) return error.Unbalanced;
+            addRegion(w, c.part_lo, w.n_mi);
             const l2 = newLabel(w);
             try putBranch(w, .jump, false, l2);
             try putLabel(w, c.l1);
             c.l2 = l2;
             c.has_else = true;
+            c.part_lo = w.n_mi;
         },
         .endif => {
             if (w.n_ctl == 0 or w.ctl[w.n_ctl - 1].kind != .if_) return error.Unbalanced;
             const c = w.ctl[w.n_ctl - 1];
+            addRegion(w, c.part_lo, w.n_mi);
             try putLabel(w, if (c.has_else) c.l2 else c.l1);
             w.n_ctl -= 1;
         },
@@ -2548,6 +2585,7 @@ fn lowerControl(l: *Lw) Error!void {
                 last.in.inv1 = !last.in.inv1;
             } else try putBranch(w, .jump, false, c.l1);
             w.loops[c.loop_index].end = w.n_mi - 1;
+            addRegion(w, c.head_mi, w.n_mi);
             try putLabel(w, c.l3);
             w.n_ctl -= 1;
         },
@@ -2897,7 +2935,24 @@ fn allocate(w: *Work) Error!void {
             w.vi[m.dst].hint = m.src[0];
         }
     }
-    // Loops: what is live into, out of or around a loop lives through all of it.
+    // Each register's home: the innermost region of its first write (none:
+    // the kernel's top level). A register first written at the top level
+    // of a region, every access of it inside that region, is written in
+    // every pass before it is read: no pass reads the last one's.
+    for (0..w.nv) |vv| {
+        const info = &w.vi[vv];
+        info.home = NONE_REGION;
+        if (info.fdef == NOWHERE or w.regions_full) continue;
+        const at = info.fdef / 2;
+        var best: u32 = NONE_REGION;
+        for (w.regions[0..w.n_regions], 0..) |rg, ri| {
+            if (at < rg.lo or at >= rg.hi) continue;
+            if (best == NONE_REGION or rg.lo >= w.regions[best].lo) best = @intCast(ri);
+        }
+        info.home = best;
+    }
+    // Loops: what is live into, out of or around a loop lives through all
+    // of it.
     var changed = true;
     var rounds: u32 = 0;
     while (changed and rounds < 16) : (rounds += 1) {
@@ -2909,9 +2964,12 @@ fn allocate(w: *Work) Error!void {
                 const info = &w.vi[vv];
                 if (info.first == NOWHERE) continue;
                 if (info.last < h or info.first > e) continue;
-                // live into, out of, or round the loop (several definitions,
-                // or a read before the first: the last turn's value)
-                const crosses = info.first < h or info.last > e or w.vi[vv].defs > 1 or info.fdef == NOWHERE or info.fdef > info.first;
+                // live into, out of, or round the loop: several definitions,
+                // or a read before the first (the last turn's value), unless
+                // its first access writes it at the top of a region every
+                // later access lies in (a pass writes it before reading it)
+                const own = info.fdef == info.first and info.home != NONE_REGION and info.last < 2 * w.regions[info.home].hi;
+                const crosses = info.first < h or info.last > e or ((w.vi[vv].defs > 1 or info.fdef == NOWHERE or info.fdef > info.first) and !own);
                 if (!crosses) continue;
                 if (info.first > h) {
                     info.first = h;
