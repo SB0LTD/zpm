@@ -191,6 +191,19 @@ pub fn Arrays(comptime V: type) type {
             }
         };
 
+        /// Element payloads for other in-cell layouts (range bounds).
+        pub fn encodeElement(out: *Text, element: DataType, cell: *const Cell) Error!void {
+            return encode(out, element, cell);
+        }
+
+        pub fn decodeElement(bytes: []const u8, at: *usize, element: DataType) Cell {
+            return decode(bytes, at, element);
+        }
+
+        pub fn putBytes(out: *Text, bytes: []const u8) Error!void {
+            return put(out, bytes);
+        }
+
         fn putText(out: *Text, bytes: []const u8) Error!void {
             if (bytes.len > 0xffff) return error.TextCapacity;
             try putInt(out, u16, @intCast(bytes.len));
@@ -216,7 +229,7 @@ pub fn Arrays(comptime V: type) type {
                     else => try putInt(out, i64, value),
                 },
                 .boolean => |value| try put(out, &.{@intFromBool(value)}),
-                .text, .jsonb, .bpchar, .bytea => |*text| try putText(out, text.slice()),
+                .text, .jsonb, .bpchar, .bytea, .range => |*text| try putText(out, text.slice()),
                 .float4 => |value| try putInt(out, u32, @bitCast(value)),
                 .float8 => |value| try putInt(out, u64, @bitCast(value)),
                 .numeric => |*value| {
@@ -272,6 +285,7 @@ pub fn Arrays(comptime V: type) type {
                 .jsonb => .{ .jsonb = takeText(bytes, at) },
                 .bpchar => .{ .bpchar = takeText(bytes, at) },
                 .bytea => .{ .bytea = takeText(bytes, at) },
+                .range => .{ .range = takeText(bytes, at) },
                 .float4 => .{ .float4 = @bitCast(getInt(u32, bytes, at)) },
                 .float8 => .{ .float8 = @bitCast(getInt(u64, bytes, at)) },
                 .numeric => blk: {

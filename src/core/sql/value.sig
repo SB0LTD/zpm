@@ -23,6 +23,7 @@ const bit_string = @import("bit_string.sig");
 const money = @import("money.sig");
 const catalog_ids = @import("catalog_ids.sig");
 const array_text = @import("array_text.sig");
+const range_text = @import("range_text.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -107,6 +108,12 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         // casts; strings by I/O conversion; nothing else.
         if (to == .money and (from == .int4 or from == .int8 or from == .numeric)) return context != .implicit;
         if (from == .money and to == .numeric) return context != .implicit;
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
+    if (types.isRange(from) or types.isRange(to)) {
+        // Ranges have no pg_cast entries: strings by I/O conversion only.
         if (stringType(to)) return context != .implicit;
         if (stringType(from)) return context == .explicit;
         return false;
@@ -289,7 +296,10 @@ pub fn Io(comptime config: types.Config) type {
         pub const elementData = types.elementData;
         pub const arrayData = types.arrayData;
         pub const typeOfData = types.typeOfData;
+        pub const dataTypeOf = types.dataTypeOf;
+        pub const rangeSubtype = types.rangeSubtype;
         pub const Arrays = V.Arrays;
+        pub const Ranges = V.Ranges;
         pub const ArrayShape = @import("array.sig").Shape;
         /// Largest text form of one cell (codec buffers).
         pub const format_bytes: usize = @as(usize, @max(config.text_bytes * 8, numeric.format_bytes)) + 64;
@@ -350,8 +360,12 @@ pub fn Io(comptime config: types.Config) type {
                 .pg_lsn => |value| catalog_ids.formatLsn(value, buffer),
                 .xid8 => |value| catalog_ids.formatXid8(value, buffer),
                 .array => |*value| try ArrayText.format(value.slice(), session, buffer),
+                .range => |*value| try RangeText.format(value.slice(), session, buffer),
             };
         }
+
+        /// Range text I/O and constructors (range_text.sig).
+        pub const RangeText = range_text.RangeText(config, @This());
 
         /// Array text I/O and element-wise casts (array_text.sig).
         pub const ArrayText = array_text.ArrayText(config, @This());
@@ -438,6 +452,7 @@ pub fn Io(comptime config: types.Config) type {
                 .money => .{ .money = try money.parse(input) },
                 .pg_lsn => .{ .pg_lsn = try catalog_ids.parseLsn(input) },
                 .xid8 => .{ .xid8 = try catalog_ids.parseXid8(input) },
+                .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => try RangeText.parse(ty, input, session),
                 // array_in applies the typmod to every element itself.
                 _ => return ArrayText.parse(types.elementType(ty) orelse return error.UndefinedFunction, typmod, input, session),
             };
@@ -780,6 +795,11 @@ pub fn Io(comptime config: types.Config) type {
                     .text => |*value| try parse(to, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
+                .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => switch (cell) {
+                    .range => cell,
+                    .text => |*value| try parse(to, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
                 // Arrays from text by array_in (array -> array is above).
                 _ => switch (cell) {
                     .text => |*value| try parse(to, -1, value.slice(), session),
@@ -822,6 +842,7 @@ pub fn Io(comptime config: types.Config) type {
             if (try timeArithmetic(op, left, right)) |cell| return cell;
             if (try moneyArithmetic(op, left, right)) |cell| return cell;
             if (try lsnArithmetic(op, left, right)) |cell| return cell;
+            if (left.* == .range and right.* == .range) return rangeArithmetic(op, left, right);
             switch (left.*) {
                 .integer => |a| switch (right.*) {
                     .integer => |b| {
@@ -939,6 +960,19 @@ pub fn Io(comptime config: types.Config) type {
             const raw = rounded.coef();
             if ((rounded.negative and raw != 0) or raw > 0xffffffffffffffff) return error.NumericValueOutOfRange;
             return .{ .pg_lsn = @intCast(raw) };
+        }
+
+        /// range + range (union), * (intersection) and - (difference).
+        fn rangeArithmetic(op: ast.Op, left: *const V.Cell, right: *const V.Cell) Error!V.Cell {
+            const a = V.Ranges.decode(left.range.slice());
+            const b = V.Ranges.decode(right.range.slice());
+            const result = switch (op) {
+                .add => try V.Ranges.merge(&a, &b),
+                .mul => try V.Ranges.intersect(&a, &b),
+                .sub => try V.Ranges.minus(&a, &b),
+                else => return error.UndefinedFunction,
+            };
+            return RangeText.encoded(&result);
         }
 
         fn lsnNumeric(value: u64) Error!numeric.Numeric {

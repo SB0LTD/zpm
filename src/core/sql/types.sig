@@ -9,6 +9,7 @@ const uuid = @import("uuid.sig");
 const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
 const array_module = @import("array.sig");
+const range_module = @import("range.sig");
 
 pub const Config = struct {
     /// Caller supplies row/version/index buffers and query reference workspace.
@@ -352,12 +353,12 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -394,6 +395,36 @@ pub fn isArray(ty: Type) bool {
     return elementType(ty) != null;
 }
 
+/// The subtype of a built-in range type (null otherwise).
+pub fn rangeSubtype(ty: Type) ?Type {
+    return switch (ty) {
+        .int4range => .int4,
+        .int8range => .int8,
+        .numrange => .numeric,
+        .daterange => .date,
+        .tsrange => .timestamp,
+        .tstzrange => .timestamptz,
+        else => null,
+    };
+}
+
+/// The range type over a subtype stored as `subtype` (one per subtype).
+pub fn rangeOfData(subtype: DataType) ?DataType {
+    return switch (subtype) {
+        .integer32 => .int4range,
+        .integer => .int8range,
+        .numeric => .numrange,
+        .date => .daterange,
+        .timestamp => .tsrange,
+        .timestamptz => .tstzrange,
+        else => null,
+    };
+}
+
+pub fn isRange(ty: Type) bool {
+    return rangeSubtype(ty) != null;
+}
+
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
         .int2 => .smallint,
@@ -423,6 +454,12 @@ pub fn dataTypeOf(ty: Type) DataType {
         .money => .money,
         .pg_lsn => .pg_lsn,
         .xid8 => .xid8,
+        .int4range => .int4range,
+        .int8range => .int8range,
+        .numrange => .numrange,
+        .daterange => .daterange,
+        .tsrange => .tsrange,
+        .tstzrange => .tstzrange,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -456,6 +493,12 @@ pub fn typeOfData(data_type: DataType) Type {
         .money => .money,
         .pg_lsn => .pg_lsn,
         .xid8 => .xid8,
+        .int4range => .int4range,
+        .int8range => .int8range,
+        .numrange => .numrange,
+        .daterange => .daterange,
+        .tsrange => .tsrange,
+        .tstzrange => .tstzrange,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -517,6 +560,12 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .money => .{ .oid = 790, .name = "money", .len = 8, .category = 'N', .array = 791 },
         .pg_lsn => .{ .oid = 3220, .name = "pg_lsn", .len = 8, .category = 'U', .array = 3221 },
         .xid8 => .{ .oid = 5069, .name = "xid8", .len = 8, .category = 'U', .array = 271 },
+        .int4range => .{ .oid = 3904, .name = "int4range", .len = -1, .category = 'R', .array = 3905 },
+        .int8range => .{ .oid = 3926, .name = "int8range", .len = -1, .category = 'R', .array = 3927 },
+        .numrange => .{ .oid = 3906, .name = "numrange", .len = -1, .category = 'R', .array = 3907 },
+        .daterange => .{ .oid = 3912, .name = "daterange", .len = -1, .category = 'R', .array = 3913 },
+        .tsrange => .{ .oid = 3908, .name = "tsrange", .len = -1, .category = 'R', .array = 3909 },
+        .tstzrange => .{ .oid = 3910, .name = "tstzrange", .len = -1, .category = 'R', .array = 3911 },
         _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
@@ -562,6 +611,12 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .money => "money",
         .pg_lsn => "pg_lsn",
         .xid8 => "xid8",
+        .int4range => "int4range",
+        .int8range => "int8range",
+        .numrange => "numrange",
+        .daterange => "daterange",
+        .tsrange => "tsrange",
+        .tstzrange => "tstzrange",
         _ => "",
     };
 }
@@ -596,6 +651,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .money => "cash_in",
         .pg_lsn => "pg_lsn_in",
         .xid8 => "xid8in",
+        .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => "range_in",
         _ => "array_in",
     };
 }
@@ -739,7 +795,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -771,7 +827,12 @@ pub fn Values(comptime config: Config) type {
             xid8: u64,
             /// Arrays of every element type (array.sig layout).
             array: Text,
+            /// Built-in ranges (range.sig layout).
+            range: Text,
         };
+
+        /// Range values of these cells (range.sig).
+        pub const Ranges = range_module.Ranges(@This());
 
         /// Array values of these cells (array.sig).
         pub const Arrays = array_module.Arrays(@This());
@@ -816,6 +877,7 @@ pub fn Values(comptime config: Config) type {
                 .money => .money,
                 .pg_lsn => .pg_lsn,
                 .xid8 => .xid8,
+                .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => .range,
                 _ => .array,
             };
         }
@@ -852,6 +914,7 @@ pub fn Values(comptime config: Config) type {
                 .pg_lsn => |value| order(u64, value, right.pg_lsn),
                 .xid8 => |value| order(u64, value, right.xid8),
                 .array => |*value| Arrays.compare(value.slice(), right.array.slice()),
+                .range => |*value| Ranges.compare(value.slice(), right.range.slice()),
             };
         }
 
@@ -912,6 +975,7 @@ pub fn Values(comptime config: Config) type {
                 .timestamp, .timestamptz, .time, .money => |us| return wordHash(@bitCast(us), tag),
                 .pg_lsn, .xid8 => |word| return wordHash(word, tag),
                 .array => |*items| return wordHash(Arrays.hash(items.slice()), tag),
+                .range => |*span| return wordHash(Ranges.hash(span.slice()), tag),
                 .timetz => |time| {
                     mix(&code, tag);
                     mix(&code, @bitCast(time.us));
@@ -961,6 +1025,11 @@ pub fn Values(comptime config: Config) type {
                 return;
             }
             if (@as(CellTag, value.*) != cellTag(column.data_type)) return error.TypeMismatch;
+            if (value.* == .range) {
+                const subtype = typeOfData(Ranges.subtypeOf(value.range.slice()));
+                if (rangeSubtype(typeOfData(column.data_type)) != subtype) return error.TypeMismatch;
+                return;
+            }
             if (value.* == .array) {
                 // The element type and every element's own checks (CHAR(n),
                 // VARCHAR(n) and BIT(n) lengths apply to elements).

@@ -722,7 +722,7 @@ pub fn Parser(comptime config: types.Config) type {
             return switch (token.keyword) {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
-                .pg_lsn, .xid8 => true,
+                .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => true,
                 else => false,
             };
         }
@@ -874,6 +874,12 @@ pub fn Parser(comptime config: types.Config) type {
                 .money => .{ .ty = .money },
                 .pg_lsn => .{ .ty = .pg_lsn },
                 .xid8 => .{ .ty = .xid8 },
+                .int4range => .{ .ty = .int4range },
+                .int8range => .{ .ty = .int8range },
+                .numrange => .{ .ty = .numrange },
+                .daterange => .{ .ty = .daterange },
+                .tsrange => .{ .ty = .tsrange },
+                .tstzrange => .{ .ty = .tstzrange },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };
@@ -1972,6 +1978,9 @@ pub fn Parser(comptime config: types.Config) type {
                     .shift_left => .shift_left,
                     .shift_right => .shift_right,
                     .overlap => .overlap,
+                    .over_left => .over_left,
+                    .over_right => .over_right,
+                    .adjacent => .adjacent,
                     else => break,
                 };
                 try self.advance();

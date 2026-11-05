@@ -18,6 +18,7 @@ const bytea_module = @import("bytea.sig");
 const builtins = @import("functions_eval.sig");
 const stats = @import("aggregates_stat.sig");
 const array_eval = @import("array_eval.sig");
+const range_eval = @import("range_eval.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -665,10 +666,13 @@ pub fn Eval(comptime config: types.Config) type {
                         const right = try operandRef(ctx, n.b, &right_value);
                         return compareOp(n.op, left, right);
                     }
-                    if (n.op == .contains or n.op == .contained or n.op == .exists or n.op == .overlap) {
+                    if (n.op == .contains or n.op == .contained or n.op == .exists or n.op == .overlap or n.op == .over_left or n.op == .over_right or n.op == .adjacent or
+                        ((n.op == .shift_left or n.op == .shift_right) and n.ty == .boolean))
+                    {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return null;
+                        if (left == .range or right == .range) return try range_eval.RangeEval(config, @This()).predicate(n.op, &left, &right);
                         if (left == .array) return try array_eval.ArrayEval(config, @This()).containment(n.op, &left, &right, ctx.session);
                         return switch (n.op) {
                             .contains => J.contains(left.jsonb.slice(), right.jsonb.slice()),
@@ -797,7 +801,7 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.negate(&value, n.ty);
                 },
                 .binary => switch (n.op) {
-                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap => return boolCell(try truth(ctx, id)),
+                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap, .over_left, .over_right, .adjacent => return boolCell(try truth(ctx, id)),
                     .concat => {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
@@ -829,6 +833,8 @@ pub fn Eval(comptime config: types.Config) type {
                         return .{ .text = text };
                     },
                     .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => {
+                        // Range << and >> are boolean predicates.
+                        if (n.ty == .boolean) return boolCell(try truth(ctx, id));
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return .null_value;
@@ -1025,6 +1031,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .normalize, .is_normalized => return builtins.Builtins(config, @This()).call(ctx, n),
                     .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
                     .array_append, .array_prepend, .array_cat, .array_to_string => return array_eval.ArrayEval(config, @This()).call(ctx, n),
+                    .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
                     .aggregate_pair => {
                         // Both inputs are evaluated; NULL skips the row (strict).
                         const y = try eval(ctx, n.b);

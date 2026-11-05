@@ -52,6 +52,8 @@
 //!   | 18 money i64 cents | 19 pg_lsn u64 | 20 xid8 u64
 //!   | 21 array {element type OID u32, ndim u8, ndim x (dim u32, lbound
 //!   i32), every element as a value (0 for NULL) in row-major order}.
+//!   | 22 range {subtype OID u32, flags u8 (PostgreSQL's range flags), the
+//!   finite bounds as values}.
 //!   Array type OIDs (1007, ...) name a column's array type. Every value is
 //!   checked against the column's type OID (create_table) before anything
 //!   applies.
@@ -75,6 +77,7 @@ const character = @import("character.sig");
 const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
 const array = @import("array.sig");
+const range = @import("range.sig");
 const Error = types.Error;
 
 pub const format_version: u16 = 1;
@@ -298,6 +301,14 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 .xid8 => |value| {
                     try writer.int(u8, 20);
                     try writer.int(u64, value);
+                },
+                .range => |*span| {
+                    const value = V.Ranges.decode(span.slice());
+                    try writer.int(u8, 22);
+                    try writer.int(u32, types.typeOid(value.subtype));
+                    try writer.int(u8, span.bytes[1]);
+                    if (!value.empty and !value.lower.infinite) try encodeValue(writer, &value.lower.value);
+                    if (!value.empty and !value.upper.infinite) try encodeValue(writer, &value.upper.value);
                 },
                 .array => |*items| {
                     const shape = V.Arrays.shape(items.slice());
@@ -762,6 +773,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 19 => .{ .pg_lsn = try reader.int(u64) },
                 20 => .{ .xid8 = try reader.int(u64) },
                 21 => try decodeArray(reader),
+                22 => try decodeRange(reader),
                 17 => blk: {
                     const bits = try reader.int(u32);
                     if (bits > V.BitString.max_bits) return error.ChangeRecordConflict;
@@ -805,6 +817,32 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 writer.append(&item) catch |err| return if (err == error.TextCapacity) error.ChangeRecordConflict else error.InvalidChangeRecord;
             }
             return .{ .array = result };
+        }
+
+        /// Value tag 22: a range subtype, known flags and its finite bounds
+        /// of the subtype's cell kind; the range is remade (validated and
+        /// canonical) before it is accepted.
+        fn decodeRange(reader: *Reader) Error!V.Cell {
+            const subtype = types.typeFromOid(try reader.int(u32)) orelse return error.InvalidChangeRecord;
+            if (types.rangeOfData(subtype) == null) return error.InvalidChangeRecord;
+            const flags = try reader.int(u8);
+            if (flags & ~@as(u8, 0x1f) != 0) return error.InvalidChangeRecord;
+            const R = V.Ranges;
+            var lower: R.Bound = .{ .lower = true, .inclusive = flags & range.lower_inclusive_flag != 0 };
+            var upper: R.Bound = .{ .lower = false, .inclusive = flags & range.upper_inclusive_flag != 0 };
+            const empty = flags & range.empty_flag != 0;
+            for ([_]*R.Bound{ &lower, &upper }, [_]u8{ range.lower_infinite_flag, range.upper_infinite_flag }) |bound, infinite| {
+                if (empty or flags & infinite != 0) continue;
+                if (reader.position < reader.bytes.len and (reader.bytes[reader.position] == 21 or reader.bytes[reader.position] == 22)) return error.InvalidChangeRecord;
+                const cell = (try decodeValue(reader)).cell;
+                if (@as(V.CellTag, cell) != V.cellTag(subtype)) return error.InvalidChangeRecord;
+                bound.value = cell;
+                bound.infinite = false;
+            }
+            const made = R.make(subtype, lower, upper, empty) catch return error.InvalidChangeRecord;
+            var out: V.Text = .{};
+            R.encode(&made, &out) catch return error.ChangeRecordConflict;
+            return .{ .range = out };
         }
 
         fn valueAt(record: []const u8, offset: u32) Error!V.Cell {

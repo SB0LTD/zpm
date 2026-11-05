@@ -692,6 +692,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (context.node(n.a).ty == .unknown and context.node(n.b).ty == .unknown) return error.AmbiguousFunction;
             if (context.node(n.a).ty == .money or context.node(n.b).ty == .money) return moneyArithmetic(context, n);
             if (context.node(n.a).ty == .pg_lsn or context.node(n.b).ty == .pg_lsn) return lsnArithmetic(context, n);
+            if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) return rangeOperator(context, n);
             if (timeType(context.node(n.a).ty) or timeType(context.node(n.b).ty)) return timeArithmetic(context, n);
             var left = context.node(n.a).ty;
             var right = context.node(n.b).ty;
@@ -914,6 +915,13 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "array_lower", .func = .array_lower },   .{ .name = "array_upper", .func = .array_upper },
                 .{ .name = "array_append", .func = .array_append }, .{ .name = "array_prepend", .func = .array_prepend },
                 .{ .name = "array_cat", .func = .array_cat },       .{ .name = "array_to_string", .func = .array_to_string },
+                // Range constructors and functions (B11 advanced types).
+                .{ .name = "int4range", .func = .range_constructor }, .{ .name = "int8range", .func = .range_constructor },
+                .{ .name = "numrange", .func = .range_constructor }, .{ .name = "daterange", .func = .range_constructor },
+                .{ .name = "tsrange", .func = .range_constructor }, .{ .name = "tstzrange", .func = .range_constructor },
+                .{ .name = "isempty", .func = .isempty },           .{ .name = "lower_inc", .func = .lower_inc },
+                .{ .name = "upper_inc", .func = .upper_inc },       .{ .name = "lower_inf", .func = .lower_inf },
+                .{ .name = "upper_inf", .func = .upper_inf },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -1329,6 +1337,8 @@ pub fn Binder(comptime config: types.Config) type {
                 try typeExpr(context, scope, item);
                 count += 1;
             }
+            // lower(anyrange) / upper(anyrange) beside the string functions.
+            if ((n.func == .lower or n.func == .upper) and count == 1 and types.isRange(context.node(n.b).ty)) n.func = if (n.func == .lower) .range_lower else .range_upper;
             switch (n.func) {
                 .grouping => {
                     if(!scope.aggregates) return error.GroupingError;
@@ -1483,7 +1493,77 @@ pub fn Binder(comptime config: types.Config) type {
                 .to_timestamp => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.float8} else &[_]ast.Type{ .text, .text }, .timestamptz, true),
                 .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
                 .array_append, .array_prepend, .array_cat, .array_to_string => try typeArrayFunction(context, n, count),
+                .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => try typeRangeFunction(context, n, count),
             }
+        }
+
+        // ---- ranges (B11 advanced types) ------------------------------------
+
+        fn rangeNamed(context: *const Context, n: *const ast.Node) ?ast.Type {
+            const name = toName(context, n.name);
+            for ([_]ast.Type{ .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange }) |ty| {
+                if (types.same(name.slice(), types.typeInfo(types.dataTypeOf(ty)).name)) return ty;
+            }
+            return null;
+        }
+
+        fn typeRangeFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            if (n.func == .range_constructor) {
+                // range(lower, upper [, flags]): bounds in the subtype.
+                const range_type = rangeNamed(context, n) orelse return error.UndefinedFunction;
+                const subtype = types.rangeSubtype(range_type).?;
+                if (count != 2 and count != 3) return error.UndefinedFunction;
+                var first = n.b;
+                var second = context.node(first).next;
+                var third = context.node(second).next;
+                first = try convert(context, first, subtype, -1, .implicit);
+                second = try convert(context, second, subtype, -1, .implicit);
+                if (third != none) third = try convert(context, third, .text, -1, .implicit);
+                if (third != none and !value.stringType(context.node(third).ty)) return error.UndefinedFunction;
+                context.node(first).next = second;
+                context.node(second).next = third;
+                if (third != none) context.node(third).next = none;
+                n.b = first;
+                n.ty = range_type;
+                n.constant = listConstant(context, n.b);
+                return;
+            }
+            if (count != 1) return error.UndefinedFunction;
+            const ty = context.node(n.b).ty;
+            if (ty == .unknown) return error.TypeMismatch;
+            const subtype = types.rangeSubtype(ty) orelse return error.UndefinedFunction;
+            n.ty = switch (n.func) {
+                .range_lower, .range_upper => subtype,
+                else => .boolean,
+            };
+            n.constant = isConstant(context, n.b);
+        }
+
+        /// Range operators: both operands one range type (an untyped side
+        /// takes the other's); @> and <@ also take an element of the
+        /// subtype. + * - give the range type, the others boolean.
+        fn rangeOperator(context: *const Context, n: *ast.Node) Error!void {
+            const left = context.node(n.a).ty;
+            const right = context.node(n.b).ty;
+            if (n.op == .contains and types.isRange(left) and right != .unknown and !types.isRange(right)) {
+                n.b = try convert(context, n.b, types.rangeSubtype(left).?, -1, .implicit);
+                n.ty = .boolean;
+                return;
+            }
+            if (n.op == .contained and types.isRange(right) and left != .unknown and !types.isRange(left)) {
+                n.a = try convert(context, n.a, types.rangeSubtype(right).?, -1, .implicit);
+                n.ty = .boolean;
+                return;
+            }
+            if (left == .unknown) try coerce(context, n.a, right);
+            if (right == .unknown) try coerce(context, n.b, left);
+            const ty = context.node(n.a).ty;
+            if (!types.isRange(ty) or context.node(n.b).ty != ty) return error.UndefinedFunction;
+            n.ty = switch (n.op) {
+                .add, .sub, .mul => ty,
+                .contains, .contained, .overlap, .shift_left, .shift_right, .over_left, .over_right, .adjacent => .boolean,
+                else => return error.UndefinedFunction,
+            };
         }
 
         // ---- arrays (B11 advanced types) ------------------------------------
@@ -2747,10 +2827,12 @@ pub fn Binder(comptime config: types.Config) type {
                             if (!value.stringType(context.node(n.a).ty) and !value.stringType(context.node(n.b).ty)) return error.UndefinedFunction;
                             n.ty = .text;
                         },
-                        .contains, .contained => if (types.isArray(context.node(n.a).ty) or types.isArray(context.node(n.b).ty)) try arrayContainment(context, n) else try jsonOperator(context, n),
-                        .overlap => try arrayContainment(context, n),
+                        .contains, .contained => if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else if (types.isArray(context.node(n.a).ty) or types.isArray(context.node(n.b).ty)) try arrayContainment(context, n) else try jsonOperator(context, n),
+                        .overlap => if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else try arrayContainment(context, n),
+                        .over_left, .over_right, .adjacent => try rangeOperator(context, n),
                         .arrow, .arrow_text, .path, .path_text, .exists => try jsonOperator(context, n),
-                        .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => try bitwiseType(context, n),
+                        .shift_left, .shift_right => if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else try bitwiseType(context, n),
+                        .bit_and, .bit_or, .bit_xor => try bitwiseType(context, n),
                         .neg, .pos, .bit_not => unreachable,
                     }
                 },

@@ -110,6 +110,7 @@ fn sqlstate(err: anyerror, wanted: []const u8) !void {
         .{ .name = "TextCapacity", .state = "54000" },
         .{ .name = "IndeterminateDatatype", .state = "42P18" },
         .{ .name = "ArraySubscriptError", .state = "2202E" },
+        .{ .name = "DataException", .state = "22000" },
     };
     var state: []const u8 = "?";
     for (table) |entry| {
@@ -526,9 +527,117 @@ fn arrays() !void {
     try meta(3, 1015, 6);
 }
 
+// ---- ranges ------------------------------------------------------------------
+
+fn ranges() !void {
+    // oracle: PG.TYPE.RANGE.
+    try exec("CREATE TABLE tdd_type(v INT4RANGE)");
+    try exec("INSERT INTO tdd_type VALUES('[1,3)'),(NULL)");
+    try rows("SELECT v FROM tdd_type ORDER BY v NULLS LAST", "[1,3);NULL");
+    try meta(0, 3904, -1);
+    try exec("DROP TABLE tdd_type");
+
+    // range_in forms; discrete subtypes canonicalize to [lower, upper).
+    try rows("SELECT '[1,3]'::int4range, '(1,3)'::int4range, '(1,3]'::int4range, '[1,1)'::int4range, '[3,3]'::int4range, ' empty '::int4range, '(,5)'::int4range, '[,]'::int4range",
+        "[1,4)|[2,3)|[2,4)|empty|[3,4)|empty|(,5)|(,)");
+    try rows("SELECT '[1.5,2.5]'::numrange, '(1.5,1.5]'::numrange, '[2026-01-01,2026-01-03]'::daterange, '[ 1, 3)'::int4range, '[\"1\",\"3\")'::int8range",
+        "[1.5,2.5]|empty|[2026-01-01,2026-01-04)|[1,3)|[1,3)");
+    try rows("SELECT '[2026-01-01 10:00,2026-01-01 11:00)'::tsrange, '[2026-01-01 10:00+00,)'::tstzrange", "[\"2026-01-01 10:00:00\",\"2026-01-01 11:00:00\")|[\"2026-01-01 10:00:00+00\",)");
+    try meta(0, 3908, -1);
+    try meta(1, 3910, -1);
+    for ([_][]const u8{
+        "SELECT '1,3'::int4range",       "SELECT '[1,3'::int4range",     "SELECT '[1,3)x'::int4range",
+        "SELECT '[1,2,3)'::int4range",   "SELECT '[a,3)'::int4range",    "SELECT ''::int4range",
+        "SELECT 'emptyx'::int4range",    "SELECT '[1\"'::int4range",
+    }) |source| try rejects(source, error.InvalidTextRepresentation);
+    try rejects("SELECT '[3,1)'::int4range", error.DataException);
+    try sqlstate(error.DataException, "22000");
+    try rejects("SELECT '[1,2147483647]'::int4range", error.IntegerOverflow);
+
+    // Constructors: (lower, upper [, bounds]), NULL bounds are infinite.
+    try rows("SELECT int4range(1, 3), int4range(1, 3, '[]'), numrange(1.5, NULL, '()'), int8range(NULL, NULL), daterange('2026-01-01', '2026-01-02', '(]'), int4range(5, 5)",
+        "[1,3)|[1,4)|(1.5,)|(,)|[2026-01-02,2026-01-03)|empty");
+    try meta(0, 3904, -1);
+    try meta(2, 3906, -1);
+    try named(0, "int4range");
+    try rejects("SELECT int4range(1, 3, 'x')", error.Syntax);
+    try rejects("SELECT int4range(3, 1)", error.DataException);
+    try rejects("SELECT int4range(1, 'x')", error.InvalidTextRepresentation);
+
+    // Accessors.
+    try rows("SELECT lower(int4range(1, 3)), upper(int4range(1, 3)), lower('(,3)'::int4range), isempty('empty'::int4range), lower_inc('[1,3)'::numrange), upper_inc('[1,3]'::numrange), lower_inf('(,3)'::int4range), upper_inf('empty'::int4range)",
+        "1|3|NULL|t|t|t|t|f");
+    try meta(0, 23, -1);
+    try rows("SELECT upper('[1.5,2]'::numrange), lower('empty'::numrange)", "2|NULL");
+    try meta(0, 1700, -1);
+
+    // Operators.
+    try rows("SELECT int4range(1, 5) @> 3, int4range(1, 5) @> 5, 3 <@ int4range(1, 5), int4range(1, 5) @> int4range(2, 3), int4range(2, 3) <@ int4range(1, 5), int4range(1, 5) @> 'empty'::int4range, 'empty'::int4range @> int4range(1, 2)",
+        "t|f|t|t|t|t|f");
+    try rows("SELECT int4range(1, 5) && int4range(4, 9), int4range(1, 5) && int4range(5, 9), int4range(1, 5) << int4range(5, 9), int4range(5, 9) >> int4range(1, 5), int4range(1, 5) -|- int4range(5, 9), numrange(1, 2) -|- numrange(2, 3, '()'), int4range(1, 5) &< int4range(1, 6), int4range(1, 5) &> int4range(0, 6)",
+        "t|f|t|t|t|f|t|t");
+    try rows("SELECT int4range(1, 5) + int4range(5, 9), int4range(1, 5) * int4range(3, 9), int4range(1, 9) - int4range(5, 12), int4range(1, 5) * int4range(6, 9), numrange(1, 5) - numrange(3, 9)",
+        "[1,9)|[3,5)|[1,5)|empty|[1,3)");
+    try rejects("SELECT int4range(1, 3) + int4range(5, 9)", error.DataException);
+    try rejects("SELECT int4range(1, 9) - int4range(3, 5)", error.DataException);
+    try rejects("SELECT int4range(1, 3) @> 'x'", error.InvalidTextRepresentation);
+    try rejects("SELECT int4range(1, 3) = numrange(1, 3)", error.UndefinedFunction);
+
+    // Ordering (empty first, then bounds), equality after canonicalization,
+    // grouping and hash consistency.
+    try exec("CREATE TABLE g(id INT PRIMARY KEY, r INT4RANGE, d DATERANGE)");
+    try exec("INSERT INTO g VALUES(1, '[1,5)', '[2026-01-01,2026-02-01)'), (2, '[1,4]', NULL), (3, 'empty', 'empty'), (4, '(,3)', NULL), (5, '[1,3)', '(,)'), (6, NULL, NULL), (7, '[0,)', NULL)");
+    try rows("SELECT r FROM g ORDER BY r NULLS LAST", "empty;(,3);[0,);[1,3);[1,5);[1,5);NULL");
+    try rows("SELECT r, COUNT(*) FROM g GROUP BY r ORDER BY r", "empty|1;(,3)|1;[0,)|1;[1,3)|1;[1,5)|2;NULL|1");
+    try rows("SELECT COUNT(DISTINCT r) FROM g", "5");
+    try rows("SELECT id FROM g WHERE r = '[1,4]' ORDER BY id", "1;2");
+    try rows("SELECT id FROM g WHERE r @> 4 ORDER BY id", "1;2;7");
+    try rows("SELECT id FROM g WHERE d @> '2026-01-15'::date ORDER BY id", "1;5");
+    try rows("SELECT x.id, y.id FROM g x JOIN g y ON x.r = y.r AND x.id < y.id", "1|2");
+    try rows("SELECT d FROM g WHERE id IN (1, 3, 5) ORDER BY d", "empty;(,);[2026-01-01,2026-02-01)");
+    try rows("SELECT data_type FROM information_schema.columns WHERE table_name = 'g' AND column_name = 'r'", "int4range");
+    try rows("SELECT typname, typlen, typcategory, typarray, typinput FROM pg_type WHERE oid IN (3904, 3912) ORDER BY oid", "int4range|-1|R|3905|range_in;daterange|-1|R|3913|range_in");
+    try rows("SELECT format_type(3906, NULL), 'tstzrange'::regtype::oid, 3926::regtype::text", "numrange|3910|int8range");
+    // Assignment and atomicity.
+    try rejects("INSERT INTO g(id, r) VALUES(8, '[1,3)'), (9, '[5,2)')", error.DataException);
+    try rejects("INSERT INTO g(id, r) VALUES(8, numrange(1, 3))", error.TypeMismatch);
+    try rejects("UPDATE g SET r = r + int4range(100, 101) WHERE id = 1", error.DataException);
+    try rows("SELECT COUNT(*) FROM g", "7");
+    try rows("SELECT r::text, '[1,2)'::text::int4range, ARRAY['[1,2)'::int4range, 'empty'] FROM g WHERE id = 1", "[1,5)|[1,2)|{\"[1,2)\",empty}");
+    try rejects("SELECT 1::int4range", error.CannotCoerce);
+    try exec("DROP TABLE g");
+
+    // Wire: range_send (flags byte, then length-prefixed bound values).
+    try exec("SELECT int4range(1, 3), 'empty'::int4range, numrange(NULL, 2.5, '(]')");
+    const finite = [_]u8{ 0x02, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 3 };
+    const int4range = result.column_types[0];
+    try check(Wire.oid(int4range) == 3904 and Wire.length(int4range) == -1);
+    try sendText(&result.rows[0].cells[0], "[1,3)");
+    try sendBinary(&result.rows[0].cells[0], int4range, &finite);
+    try sendBinary(&result.rows[0].cells[1], int4range, &.{0x01});
+    try sendBinary(&result.rows[0].cells[2], result.column_types[2], &.{ 0x0c, 0, 0, 0, 12, 0, 2, 0, 0, 0, 0, 0, 1, 0, 2, 0x13, 0x88 });
+    try receive(&finite, int4range, "[1,3)");
+    try receive(&.{0x01}, int4range, "empty");
+    try literal(&finite, 3904, 1, "'[1,3)'::int4range");
+    var out: [64]u8 = undefined;
+    try check(if (Wire.receiveText(finite[0..16], int4range, &out)) |_| false else |err| err == error.ProtocolViolation);
+    try check(if (Wire.receiveText(&.{ 0x02, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 1 }, int4range, &out)) |_| false else |err| err == error.ProtocolViolation);
+
+    // Durability: change-record value tag 22.
+    try replay(&.{
+        "CREATE TABLE r(id INT PRIMARY KEY, a INT4RANGE, n NUMRANGE, t TSTZRANGE)",
+        "INSERT INTO r VALUES(1, '[1,10]', '(1.5,)', '[2026-01-01 00:00+00,2026-01-02 00:00+00)'), (2, 'empty', NULL, '(,)'), (3, NULL, 'empty', NULL)",
+        "UPDATE r SET a = a * int4range(5, 20) WHERE id = 1",
+    }, &.{"r"}, "SELECT * FROM r ORDER BY id");
+    try shown("replica", "1|[5,11)|(1.5,)|[\"2026-01-01 00:00:00+00\",\"2026-01-02 00:00:00+00\");2|empty|NULL|(,);3|NULL|empty|NULL");
+    try meta(1, 3904, -1);
+    try meta(2, 3906, -1);
+}
+
 pub fn main(init: std.process.Init) !void {
     try catalogIds();
     try arrays();
+    try ranges();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-types-advanced\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

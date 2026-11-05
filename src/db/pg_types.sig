@@ -12,7 +12,9 @@
 //! {i32 bit length, packed bits}, MONEY i64 cents and pg_lsn/xid8 u64.
 //! Arrays use array_send/array_recv: {i32 ndim, i32 has-NULL flag, element
 //! type OID, ndim x (i32 dim, i32 lower bound), then per element an i32
-//! length (-1 for NULL) and the element's binary form}.
+//! length (-1 for NULL) and the element's binary form}. Ranges use
+//! range_send/range_recv: {flags byte, then each finite bound as an i32
+//! length and the subtype's binary form}.
 //! Parameters are rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
@@ -130,6 +132,17 @@ pub fn Types(comptime Result: type) type {
                 },
                 .money => |value| try putInt(i64, out, &at, value),
                 .pg_lsn, .xid8 => |value| try putInt(u64, out, &at, value),
+                .range => |*span| {
+                    const value = Io.Ranges.decode(span.slice());
+                    try put(out, &at, &.{span.bytes[1]});
+                    for ([_]*const @TypeOf(value.lower){ &value.lower, &value.upper }) |bound| {
+                        if (value.empty or bound.infinite) continue;
+                        if (out.len - at < 4) return error.BufferTooSmall;
+                        const size = try sendBinary(&bound.value, value.subtype, session, out[at + 4 ..]);
+                        try putInt(i32, out, &at, @intCast(size));
+                        at += size;
+                    }
+                },
                 .array => |*items| {
                     const element = Io.elementData(data_type) orelse return error.UnsupportedBinaryType;
                     const shape = Io.Arrays.shape(items.slice());
@@ -296,8 +309,38 @@ pub fn Types(comptime Result: type) type {
             return .{ .array = result };
         }
 
+        /// range_recv: known flags only, each finite bound with an exact
+        /// length; the range is made (validated, canonicalized) like input.
+        fn decodeRange(bytes: []const u8, data_type: DataType) Error!Cell {
+            const subtype = Io.rangeSubtype(Io.typeOfData(data_type)) orelse return error.UnsupportedBinaryType;
+            if (bytes.len < 1 or bytes[0] & ~@as(u8, 0x1f) != 0) return error.ProtocolViolation;
+            const flags = bytes[0];
+            const utc: Session = .{};
+            var text: [Io.format_bytes]u8 = undefined;
+            var at: usize = 1;
+            var lower: Cell = .null_value;
+            var upper: Cell = .null_value;
+            const empty = flags & 0x01 != 0;
+            for ([_]*Cell{ &lower, &upper }, [_]u8{ 0x08, 0x10 }) |slot, infinite| {
+                if (empty or flags & infinite != 0) continue;
+                if (bytes.len - at < 4) return error.ProtocolViolation;
+                const size = getInt(i32, bytes[at..][0..4]);
+                at += 4;
+                if (size < 0 or bytes.len - at < @as(usize, @intCast(size))) return error.ProtocolViolation;
+                const end = at + @as(usize, @intCast(size));
+                const rendered = try receiveText(bytes[at..end], Io.dataTypeOf(subtype), &text);
+                slot.* = Io.parse(subtype, -1, rendered, &utc) catch return error.ProtocolViolation;
+                at = end;
+            }
+            if (at != bytes.len) return error.ProtocolViolation;
+            if (empty) return Io.RangeText.encoded(&.{ .subtype = Io.dataTypeOf(subtype), .empty = true }) catch error.BufferTooSmall;
+            const flag_text = [2]u8{ if (flags & 0x02 != 0) '[' else '(', if (flags & 0x04 != 0) ']' else ')' };
+            return Io.RangeText.construct(Io.typeOfData(data_type), &lower, &upper, &flag_text) catch error.ProtocolViolation;
+        }
+
         fn decodeBinary(bytes: []const u8, data_type: DataType) Error!Cell {
             if (Io.elementData(data_type) != null) return decodeArray(bytes, data_type);
+            if (Io.rangeSubtype(Io.typeOfData(data_type)) != null) return decodeRange(bytes, data_type);
             const need: usize = switch (data_type) {
                 .smallint => 2,
                 .integer32, .oid, .real, .date => 4,

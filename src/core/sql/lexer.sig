@@ -215,6 +215,12 @@ pub const Keyword = enum {
     // Advanced types (B11 advanced types lane).
     pg_lsn,
     xid8,
+    int4range,
+    int8range,
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
 };
 
 /// Words that cannot be unquoted identifiers.
@@ -296,6 +302,10 @@ pub const Symbol = enum {
     rbracket,
     colon,
     overlap,
+    // Ranges: &< &> -|-.
+    over_left,
+    over_right,
+    adjacent,
 };
 
 pub const Token = struct {
@@ -567,6 +577,9 @@ pub const Tokenizer = struct {
             '-' => if (following == '>') blk: {
                 width = if (third == '>') 3 else 2;
                 break :blk if (third == '>') Symbol.arrow_text else Symbol.arrow;
+            } else if (following == '|' and third == '-') blk: {
+                width = 3;
+                break :blk Symbol.adjacent;
             } else .minus,
             '<' => if (following == '=') blk: {
                 width = 2;
@@ -599,6 +612,12 @@ pub const Tokenizer = struct {
             '&' => if (following == '&') blk: {
                 width = 2;
                 break :blk Symbol.overlap;
+            } else if (following == '<') blk: {
+                width = 2;
+                break :blk Symbol.over_left;
+            } else if (following == '>') blk: {
+                width = 2;
+                break :blk Symbol.over_right;
             } else .ampersand,
             '[' => .lbracket,
             ']' => .rbracket,
