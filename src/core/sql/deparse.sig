@@ -251,7 +251,7 @@ pub fn Deparse(comptime config: types.Config) type {
                 },
                 .binary => {
                     const regex_text: []const u8 = if (n.negated) (if (n.insensitive) " !~* " else " !~ ") else (if (n.insensitive) " ~* " else " ~ ");
-                    const op = if (n.op == .regex_match) regex_text else opText(n.op) orelse return error.UnsupportedStatement;
+                    const op = if (n.op == .regex_match) regex_text else if (n.op == .text_match) " @@ " else opText(n.op) orelse return error.UnsupportedStatement;
                     try w.bytes("(");
                     try expression(context, n.a, w);
                     try w.bytes(op);

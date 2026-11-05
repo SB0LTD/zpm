@@ -129,6 +129,7 @@ fn sqlstate(err: anyerror, wanted: []const u8) !void {
         .{ .name = "InvalidEscapeSequence", .state = "22025" },
         .{ .name = "InvalidParameterValue", .state = "22023" },
         .{ .name = "CheckViolation", .state = "23514" },
+        .{ .name = "Syntax", .state = "42601" },
     };
     var state: []const u8 = "?";
     for (table) |entry| {
@@ -450,15 +451,21 @@ fn stateOf(err: anyerror) []const u8 {
         .{ "InvalidRegularExpression", "2201B" }, .{ "InvalidParameterValue", "22023" },     .{ "UnsupportedStatement", "0A000" },
         .{ "InvalidEscapeSequence", "22025" },    .{ "InvalidEscapeCharacterUse", "2200C" }, .{ "UndefinedFunction", "42883" },
         .{ "ProgramLimitExceeded", "54000" },     .{ "InvalidTextRepresentation", "22P02" },
+        .{ "Syntax", "42601" },                   .{ "UndefinedObject", "42704" },
     };
     for (table) |entry| if (std.mem.eql(u8, entry[0], @errorName(err))) return entry[1];
     return @errorName(err);
 }
 
 /// One single-value query: `want` is its text output, NULL, or `!` and
-/// the SQLSTATE of the error it raises (statement atomicity checked).
+/// the five-character SQLSTATE of the error it raises (statement
+/// atomicity checked).
 fn single(source: []const u8, want: []const u8) !void {
-    if (want[0] != '!') return rows(source, want);
+    var state_marker = want.len == 6 and want[0] == '!';
+    if (state_marker) for (want[1..]) |byte| {
+        if (!((byte >= '0' and byte <= '9') or (byte >= 'A' and byte <= 'Z'))) state_marker = false;
+    };
+    if (!state_marker) return rows(source, want);
     try exec("SELECT 4242");
     if (db.execute(source, &result)) |_| {
         std.debug.print("accepted: {s}\n", .{source});
@@ -894,11 +901,453 @@ fn regularExpressions() !void {
     try exec("DROP TABLE rx");
 }
 
+// ---- full text search ----------------------------------------------------------
+
+/// Matched one by one against a local PostgreSQL 18.3 (LOCALE 'C'):
+/// to_tsvector('simple') over every token type of the default parser,
+/// tsvector and tsquery input/output, to_tsquery / plainto_tsquery /
+/// phraseto_tsquery, configuration names and @@; then 120 generated
+/// parser inputs.
+const fts_battery = [_][2][]const u8{
+    .{ "SELECT to_tsvector('simple', 'one two')", "'one':1 'two':2" },
+    .{ "SELECT to_tsvector('simple', 'one two one')", "'one':1,3 'two':2" },
+    .{ "SELECT to_tsvector('simple', 'Hello. World')", "'hello':1 'world':2" },
+    .{ "SELECT to_tsvector('simple', 'foo_bar')", "'bar':2 'foo':1" },
+    .{ "SELECT to_tsvector('simple', 'foo-bar')", "'bar':3 'foo':2 'foo-bar':1" },
+    .{ "SELECT to_tsvector('simple', 'foo-bar-baz')", "'bar':3 'baz':4 'foo':2 'foo-bar-baz':1" },
+    .{ "SELECT to_tsvector('simple', 'foo-123')", "'-123':2 'foo':1" },
+    .{ "SELECT to_tsvector('simple', '123-456')", "'-456':2 '123':1" },
+    .{ "SELECT to_tsvector('simple', '-5 +6 5.5 .5')", "'+6':2 '-5':1 '5':4 '5.5':3" },
+    .{ "SELECT to_tsvector('simple', 'a.b')", "'a.b':1" },
+    .{ "SELECT to_tsvector('simple', 'x@y.com')", "'x@y.com':1" },
+    .{ "SELECT to_tsvector('simple', 'don''t stop')", "'don':1 'stop':3 't':2" },
+    .{ "SELECT to_tsvector('simple', 'Café Über ÄÖ')", "'café':1 'ÄÖ':3 'Über':2" },
+    .{ "SELECT to_tsvector('simple', 'abc123 123abc')", "'123abc':2 'abc123':1" },
+    .{ "SELECT to_tsvector('simple', 'foo.bar baz@qux.com http://x.org/a/b <b>tag</b> &amp; -5 +6 1.5e3 1.2.3 /usr/bin ~/x.txt a_b')", "'+6':8 '-5':7 '/a/b':5 '/usr/bin':11 '/x.txt':12 '1.2.3':10 '1.5e3':9 'a':13 'b':14 'baz@qux.com':2 'foo.bar':1 'tag':6 'x.org':4 'x.org/a/b':3" },
+    .{ "SELECT to_tsvector('simple', 'The quick brown fox')", "'brown':3 'fox':4 'quick':2 'the':1" },
+    .{ "SELECT to_tsvector('simple', 'UPPER lower MiXeD')", "'lower':2 'mixed':3 'upper':1" },
+    .{ "SELECT to_tsvector('simple', '')", "" },
+    .{ "SELECT to_tsvector('simple', '   ')", "" },
+    .{ "SELECT to_tsvector('simple', '!!!')", "" },
+    .{ "SELECT to_tsvector('simple', 'a')", "'a':1" },
+    .{ "SELECT to_tsvector('simple', 'é')", "'é':1" },
+    .{ "SELECT to_tsvector('simple', E'x\\x0ay\\x09z')", "'x':1 'y':2 'z':3" },
+    .{ "SELECT to_tsvector('simple', 'v1.2 1.2.3.4 192.168.0.1')", "'1.2.3.4':2 '192.168.0.1':3 'v1.2':1" },
+    .{ "SELECT to_tsvector('simple', 'www.example.com/path?q=1')", "'/path?q=1':3 'www.example.com':2 'www.example.com/path?q=1':1" },
+    .{ "SELECT to_tsvector('simple', 'mailto:me@x.org')", "'mailto':1 'me@x.org':2" },
+    .{ "SELECT to_tsvector('simple', 'file.txt')", "'file.txt':1" },
+    .{ "SELECT to_tsvector('simple', '/path/to/file.txt')", "'/path/to/file.txt':1" },
+    .{ "SELECT to_tsvector('simple', 'ftp://ftp.x.org')", "'ftp.x.org':1" },
+    .{ "SELECT to_tsvector('simple', '<script>hidden</script> shown')", "'shown':1" },
+    .{ "SELECT to_tsvector('simple', '<!-- comment --> visible')", "'visible':1" },
+    .{ "SELECT to_tsvector('simple', 'a-b-c-d')", "'a':2 'a-b-c-d':1 'b':3 'c':4 'd':5" },
+    .{ "SELECT to_tsvector('simple', 'co-operate')", "'co':2 'co-operate':1 'operate':3" },
+    .{ "SELECT to_tsvector('simple', 'self-service')", "'self':2 'self-service':1 'service':3" },
+    .{ "SELECT to_tsvector('simple', 'e-mail')", "'e':2 'e-mail':1 'mail':3" },
+    .{ "SELECT to_tsvector('simple', '3.14159')", "'3.14159':1" },
+    .{ "SELECT to_tsvector('simple', '1e10')", "'1e10':1" },
+    .{ "SELECT to_tsvector('simple', '-1.5e-3')", "'-1.5e-3':1" },
+    .{ "SELECT to_tsvector('simple', '1,000')", "'000':2 '1':1" },
+    .{ "SELECT to_tsvector('simple', '$100')", "'100':1" },
+    .{ "SELECT to_tsvector('simple', '50%')", "'50':1" },
+    .{ "SELECT to_tsvector('simple', 'C++ C#')", "'c':1,2" },
+    .{ "SELECT to_tsvector('simple', 'foo--bar')", "'bar':2 'foo':1" },
+    .{ "SELECT to_tsvector('simple', 'über-cool')", "'cool':3 'über':2 'über-cool':1" },
+    .{ "SELECT to_tsvector('simple', 'naïve café')", "'café':2 'naïve':1" },
+    .{ "SELECT to_tsvector('simple', 'Ελληνικά κείμενο')", "'Ελληνικά':1 'κείμενο':2" },
+    .{ "SELECT to_tsvector('simple', '日本語 テキスト')", "'テキスト':2 '日本語':1" },
+    .{ "SELECT to_tsvector('simple', 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')", "'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx':1" },
+    .{ "SELECT to_tsvector('simple', 'w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w')", "'w':1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30" },
+    .{ "SELECT to_tsvector('simple', 'http://user@host.com:8080/x')", "'/x':2 'user@host.com:8080':1" },
+    .{ "SELECT to_tsvector('simple', 'https://a.b.c/d.e?f=g#h')", "'a.b.c/d.e':1 'f':2 'g':3 'h':4" },
+    .{ "SELECT to_tsvector('simple', 'a@b')", "'a':1 'b':2" },
+    .{ "SELECT to_tsvector('simple', 'a.b.c@d.e')", "'a.b.c':1 'd.e':2" },
+    .{ "SELECT to_tsvector('simple', '-')", "" },
+    .{ "SELECT to_tsvector('simple', '--')", "" },
+    .{ "SELECT to_tsvector('simple', '+')", "" },
+    .{ "SELECT to_tsvector('simple', '<a href=\"x\">link</a>')", "'link':1" },
+    .{ "SELECT to_tsvector('simple', '&#123; &x;')", "" },
+    .{ "SELECT to_tsvector('simple', '&nbsp;x')", "'x':1" },
+    .{ "SELECT 'a:1 b:2A'::tsvector", "'a':1 'b':2A" },
+    .{ "SELECT 'b a a'::tsvector", "'a' 'b'" },
+    .{ "SELECT '''a b'':1 c'::tsvector", "'a b':1 'c'" },
+    .{ "SELECT '''it''''s'':3'::tsvector", "'it''s':3" },
+    .{ "SELECT 'a:3,1,2'::tsvector", "'a':1,2,3" },
+    .{ "SELECT 'a:1A,1B'::tsvector", "'a':1A" },
+    .{ "SELECT 'a:1,1'::tsvector", "'a':1" },
+    .{ "SELECT 'x:16383 y:20000'::tsvector", "'x':16383 'y':16383" },
+    .{ "SELECT 'a:1C b:2D c:3*'::tsvector", "'a':1C 'b':2 'c':3A" },
+    .{ "SELECT 'a\\ b'::tsvector", "'a b'" },
+    .{ "SELECT '''a\\''b'''::tsvector", "'a''b'" },
+    .{ "SELECT ''::tsvector", "" },
+    .{ "SELECT '  '::tsvector", "" },
+    .{ "SELECT 'a b:1'::tsvector", "'a' 'b':1" },
+    .{ "SELECT 'a:1 a:2 a:1B'::tsvector", "'a':1B,2" },
+    .{ "SELECT 'a:0'::tsvector", "!42601" },
+    .{ "SELECT 'a:'::tsvector", "!42601" },
+    .{ "SELECT ''''::tsvector", "!42601" },
+    .{ "SELECT '''a'::tsvector", "!42601" },
+    .{ "SELECT 'a:1x'::tsvector", "!42601" },
+    .{ "SELECT 'a:1,'::tsvector", "!42601" },
+    .{ "SELECT ':1'::tsvector", "':1'" },
+    .{ "SELECT 'a :1'::tsvector", "':1' 'a'" },
+    .{ "SELECT 'a:1AB'::tsvector", "!42601" },
+    .{ "SELECT ''''''::tsvector", "!42601" },
+    .{ "SELECT 'é:1 è:2'::tsvector", "'è':2 'é':1" },
+    .{ "SELECT 'a'::tsquery", "'a'" },
+    .{ "SELECT 'a & b'::tsquery", "'a' & 'b'" },
+    .{ "SELECT 'a | b'::tsquery", "'a' | 'b'" },
+    .{ "SELECT '!a'::tsquery", "!'a'" },
+    .{ "SELECT 'a & b | c'::tsquery", "'a' & 'b' | 'c'" },
+    .{ "SELECT 'a | b & c'::tsquery", "'a' | 'b' & 'c'" },
+    .{ "SELECT '(a | b) & c'::tsquery", "( 'a' | 'b' ) & 'c'" },
+    .{ "SELECT 'a <-> b'::tsquery", "'a' <-> 'b'" },
+    .{ "SELECT 'a <2> b'::tsquery", "'a' <2> 'b'" },
+    .{ "SELECT 'a <0> b'::tsquery", "'a' <0> 'b'" },
+    .{ "SELECT 'a <-> (b | c)'::tsquery", "'a' <-> ( 'b' | 'c' )" },
+    .{ "SELECT '(a <-> b) <-> c'::tsquery", "'a' <-> 'b' <-> 'c'" },
+    .{ "SELECT 'a <-> (b <-> c)'::tsquery", "'a' <-> ( 'b' <-> 'c' )" },
+    .{ "SELECT '!(a & b)'::tsquery", "!( 'a' & 'b' )" },
+    .{ "SELECT '!a & !b'::tsquery", "!'a' & !'b'" },
+    .{ "SELECT '!!a'::tsquery", "!!'a'" },
+    .{ "SELECT 'a:*'::tsquery", "'a':*" },
+    .{ "SELECT 'a:AB'::tsquery", "'a':AB" },
+    .{ "SELECT 'a:*AB'::tsquery", "'a':*AB" },
+    .{ "SELECT 'a:ab*'::tsquery", "'a':*AB" },
+    .{ "SELECT '''a b'''::tsquery", "'a b'" },
+    .{ "SELECT '''it''''s'''::tsquery", "'it''s'" },
+    .{ "SELECT 'a & (b | (c & d))'::tsquery", "'a' & ( 'b' | 'c' & 'd' )" },
+    .{ "SELECT 'a & b & c'::tsquery", "'a' & 'b' & 'c'" },
+    .{ "SELECT 'a <-> b & c'::tsquery", "'a' <-> 'b' & 'c'" },
+    .{ "SELECT '!a <-> b'::tsquery", "!'a' <-> 'b'" },
+    .{ "SELECT '(a & b) <-> c'::tsquery", "( 'a' & 'b' ) <-> 'c'" },
+    .{ "SELECT 'a | b <-> c'::tsquery", "'a' | 'b' <-> 'c'" },
+    .{ "SELECT ''::tsquery", "" },
+    .{ "SELECT ' '::tsquery", "" },
+    .{ "SELECT 'a b'::tsquery", "!42601" },
+    .{ "SELECT 'a &'::tsquery", "!42601" },
+    .{ "SELECT '& a'::tsquery", "!42601" },
+    .{ "SELECT '(a'::tsquery", "!42601" },
+    .{ "SELECT 'a)'::tsquery", "!42601" },
+    .{ "SELECT 'a <16385> b'::tsquery", "!22023" },
+    .{ "SELECT 'a <-1> b'::tsquery", "!42601" },
+    .{ "SELECT 'a <x> b'::tsquery", "!42601" },
+    .{ "SELECT '()'::tsquery", "!42601" },
+    .{ "SELECT 'a:z'::tsquery", "!42601" },
+    .{ "SELECT '''a'':A'::tsquery", "'a':A" },
+    .{ "SELECT 'a <16384> b'::tsquery", "'a' <16384> 'b'" },
+    .{ "SELECT 'A & B'::tsquery", "'A' & 'B'" },
+    .{ "SELECT to_tsquery('simple', 'one')", "'one'" },
+    .{ "SELECT to_tsquery('simple', 'one & two')", "'one' & 'two'" },
+    .{ "SELECT to_tsquery('simple', 'foo-bar')", "'foo-bar' <-> 'foo' <-> 'bar'" },
+    .{ "SELECT to_tsquery('simple', 'The Fat Rats')", "!42601" },
+    .{ "SELECT to_tsquery('simple', 'a:*')", "'a':*" },
+    .{ "SELECT to_tsquery('simple', 'a & -')", "'a'" },
+    .{ "SELECT to_tsquery('simple', '-')", "" },
+    .{ "SELECT to_tsquery('simple', '')", "" },
+    .{ "SELECT to_tsquery('simple', 'x@y.com')", "'x@y.com'" },
+    .{ "SELECT to_tsquery('simple', 'one <-> two')", "'one' <-> 'two'" },
+    .{ "SELECT to_tsquery('simple', '(a | b) & c')", "( 'a' | 'b' ) & 'c'" },
+    .{ "SELECT to_tsquery('simple', 'a b')", "!42601" },
+    .{ "SELECT to_tsquery('simple', 'a:B & b:*A')", "'a':B & 'b':*A" },
+    .{ "SELECT to_tsquery('simple', 'Über alles')", "!42601" },
+    .{ "SELECT to_tsquery('simple', 'a & - & b')", "'a' & 'b'" },
+    .{ "SELECT to_tsquery('simple', 'a <-> - <-> b')", "'a' <2> 'b'" },
+    .{ "SELECT to_tsquery('simple', '!-')", "" },
+    .{ "SELECT to_tsquery('simple', 'a | (- & b)')", "'a' | 'b'" },
+    .{ "SELECT plainto_tsquery('simple', 'one')", "'one'" },
+    .{ "SELECT plainto_tsquery('simple', 'one & two')", "'one' & 'two'" },
+    .{ "SELECT plainto_tsquery('simple', 'foo-bar')", "'foo-bar' & 'foo' & 'bar'" },
+    .{ "SELECT plainto_tsquery('simple', 'The Fat Rats')", "'the' & 'fat' & 'rats'" },
+    .{ "SELECT plainto_tsquery('simple', 'a:*')", "'a'" },
+    .{ "SELECT plainto_tsquery('simple', 'a & -')", "'a'" },
+    .{ "SELECT plainto_tsquery('simple', '-')", "" },
+    .{ "SELECT plainto_tsquery('simple', '')", "" },
+    .{ "SELECT plainto_tsquery('simple', 'x@y.com')", "'x@y.com'" },
+    .{ "SELECT plainto_tsquery('simple', 'one <-> two')", "'one' & 'two'" },
+    .{ "SELECT plainto_tsquery('simple', '(a | b) & c')", "'a' & 'b' & 'c'" },
+    .{ "SELECT plainto_tsquery('simple', 'a b')", "'a' & 'b'" },
+    .{ "SELECT plainto_tsquery('simple', 'a:B & b:*A')", "'a' & 'b' & 'b' & 'a'" },
+    .{ "SELECT plainto_tsquery('simple', 'Über alles')", "'Über' & 'alles'" },
+    .{ "SELECT plainto_tsquery('simple', 'a & - & b')", "'a' & 'b'" },
+    .{ "SELECT plainto_tsquery('simple', 'a <-> - <-> b')", "'a' & 'b'" },
+    .{ "SELECT plainto_tsquery('simple', '!-')", "" },
+    .{ "SELECT plainto_tsquery('simple', 'a | (- & b)')", "'a' & 'b'" },
+    .{ "SELECT phraseto_tsquery('simple', 'one')", "'one'" },
+    .{ "SELECT phraseto_tsquery('simple', 'one & two')", "'one' <-> 'two'" },
+    .{ "SELECT phraseto_tsquery('simple', 'foo-bar')", "'foo-bar' <-> 'foo' <-> 'bar'" },
+    .{ "SELECT phraseto_tsquery('simple', 'The Fat Rats')", "'the' <-> 'fat' <-> 'rats'" },
+    .{ "SELECT phraseto_tsquery('simple', 'a:*')", "'a'" },
+    .{ "SELECT phraseto_tsquery('simple', 'a & -')", "'a'" },
+    .{ "SELECT phraseto_tsquery('simple', '-')", "" },
+    .{ "SELECT phraseto_tsquery('simple', '')", "" },
+    .{ "SELECT phraseto_tsquery('simple', 'x@y.com')", "'x@y.com'" },
+    .{ "SELECT phraseto_tsquery('simple', 'one <-> two')", "'one' <-> 'two'" },
+    .{ "SELECT phraseto_tsquery('simple', '(a | b) & c')", "'a' <-> 'b' <-> 'c'" },
+    .{ "SELECT phraseto_tsquery('simple', 'a b')", "'a' <-> 'b'" },
+    .{ "SELECT phraseto_tsquery('simple', 'a:B & b:*A')", "'a' <-> 'b' <-> 'b' <-> 'a'" },
+    .{ "SELECT phraseto_tsquery('simple', 'Über alles')", "'Über' <-> 'alles'" },
+    .{ "SELECT phraseto_tsquery('simple', 'a & - & b')", "'a' <-> 'b'" },
+    .{ "SELECT phraseto_tsquery('simple', 'a <-> - <-> b')", "'a' <-> 'b'" },
+    .{ "SELECT phraseto_tsquery('simple', '!-')", "" },
+    .{ "SELECT phraseto_tsquery('simple', 'a | (- & b)')", "'a' <-> 'b'" },
+    .{ "SELECT to_tsvector('Simple', 'x')", "'x':1" },
+    .{ "SELECT to_tsvector(' simple', 'x')", "'x':1" },
+    .{ "SELECT to_tsvector('pg_catalog.simple', 'x')", "'x':1" },
+    .{ "SELECT to_tsvector('PG_CATALOG.SIMPLE', 'x')", "'x':1" },
+    .{ "SELECT to_tsvector('\"simple\"', 'x')", "'x':1" },
+    .{ "SELECT to_tsvector('\"Simple\"', 'x')", "!42704" },
+    .{ "SELECT to_tsvector('nope', 'x')", "!42704" },
+    .{ "SELECT to_tsvector('public.simple', 'x')", "!42704" },
+    .{ "SELECT to_tsvector('simple.x', 'x')", "!42704" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', 'one')", "t" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', 'three')", "f" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', 'one & two')", "t" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', 'one & three')", "f" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', 'one | three')", "t" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', '!three')", "t" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', '!one')", "f" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', 'one <-> two')", "t" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', 'two <-> one')", "f" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', 'one <2> two')", "f" },
+    .{ "SELECT to_tsvector('simple', 'one x two') @@ to_tsquery('simple', 'one <2> two')", "t" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', 'on:*')", "t" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', 'tw:* <-> o:*')", "f" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', 'one <0> one')", "t" },
+    .{ "SELECT to_tsvector('simple', 'fat rat') @@ to_tsquery('simple', 'fat <-> !cat')", "t" },
+    .{ "SELECT to_tsvector('simple', 'fat cat') @@ to_tsquery('simple', 'fat <-> !cat')", "f" },
+    .{ "SELECT to_tsvector('simple', 'fat cat rat') @@ to_tsquery('simple', 'fat <-> (cat | rat)')", "t" },
+    .{ "SELECT to_tsvector('simple', 'fat rat') @@ to_tsquery('simple', 'fat <-> (cat | rat)')", "t" },
+    .{ "SELECT to_tsvector('simple', 'a b c') @@ to_tsquery('simple', 'a <-> (b <-> c)')", "t" },
+    .{ "SELECT to_tsvector('simple', 'a b c') @@ to_tsquery('simple', '(a <-> b) <-> c')", "t" },
+    .{ "SELECT to_tsvector('simple', 'a b c') @@ to_tsquery('simple', 'a <2> c & b')", "t" },
+    .{ "SELECT to_tsvector('simple', 'a b c') @@ to_tsquery('simple', '!a <-> b')", "f" },
+    .{ "SELECT to_tsvector('simple', 'x b c') @@ to_tsquery('simple', '!a <-> b')", "t" },
+    .{ "SELECT to_tsvector('simple', 'a b') @@ to_tsquery('simple', '(a & b) <-> b')", "f" },
+    .{ "SELECT to_tsvector('simple', 'a a b') @@ to_tsquery('simple', 'a <-> a <-> b')", "t" },
+    .{ "SELECT to_tsvector('simple', 'one two') @@ to_tsquery('simple', 'ONE')", "t" },
+    .{ "SELECT to_tsvector('simple', 'foo-bar') @@ to_tsquery('simple', 'foo-bar')", "t" },
+    .{ "SELECT to_tsvector('simple', 'foo-bar') @@ to_tsquery('simple', 'foo <-> bar')", "t" },
+    .{ "SELECT to_tsvector('simple', 'a b') @@ to_tsquery('simple', '!(a <-> c)')", "t" },
+    .{ "SELECT to_tsvector('simple', 'a b') @@ to_tsquery('simple', '!(a <-> b)')", "f" },
+    .{ "SELECT 'a:1A b:2'::tsvector @@ 'a:A'::tsquery", "t" },
+    .{ "SELECT 'a:1A b:2'::tsvector @@ 'a:B'::tsquery", "f" },
+    .{ "SELECT 'a:1A b:2'::tsvector @@ 'b:D'::tsquery", "t" },
+    .{ "SELECT 'a b'::tsvector @@ 'a <-> b'::tsquery", "f" },
+    .{ "SELECT 'a b'::tsvector @@ 'a & b'::tsquery", "t" },
+    .{ "SELECT 'a b'::tsvector @@ 'a:A'::tsquery", "t" },
+    .{ "SELECT 'a:1 b:3'::tsvector @@ 'a <2> b'::tsquery", "t" },
+    .{ "SELECT 'a'::tsquery @@ 'a b'::tsvector", "t" },
+    .{ "SELECT 'a'::tsvector @@ ''::tsquery", "f" },
+    .{ "SELECT NULL::tsvector @@ 'a'::tsquery", "NULL" },
+    .{ "SELECT 'abc:1 abd:2'::tsvector @@ 'ab:* <-> abd'::tsquery", "t" },
+    .{ "SELECT 'abc:1 abd:3'::tsvector @@ 'ab:* <-> abd'::tsquery", "f" },
+    .{ "SELECT 'x:1A y:2'::tsvector @@ 'x:A <-> y'::tsquery", "t" },
+    .{ "SELECT 'x:1B y:2'::tsvector @@ 'x:A <-> y'::tsquery", "f" },
+    .{ "SELECT to_tsvector('simple', 'a') @@ 'a'", "t" },
+    .{ "SELECT 'a'::tsvector @@ 'a'::text", "!42883" },
+    .{ "SELECT to_tsvector('simple', 'x')::text", "'x':1" },
+    .{ "SELECT 'x y'::text::tsvector", "'x' 'y'" },
+    .{ "SELECT pg_typeof('a'::tsvector)", "tsvector" },
+    .{ "SELECT pg_typeof(plainto_tsquery('simple','a'))", "tsquery" },
+    .{ "SELECT to_tsvector('simple', NULL)", "NULL" },
+    .{ "SELECT to_tsquery(NULL, 'a')", "NULL" },
+    .{ "SELECT to_tsvector('simple', '''-://.mailtowww?9日wwwx''-<z')", "'/.mailtowww':1 '9日wwwx':2 'z':3" },
+    .{ "SELECT to_tsvector('simple', '%z&üyA<bawww?-~>%')", "'bawww':3 'z':1 'üya':2" },
+    .{ "SELECT to_tsvector('simple', 'org--.-')", "'org':1" },
+    .{ "SELECT to_tsvector('simple', '0=1.5a>btxtAscriptftpe3=comxv2')", "'0':1 '1.5':2 'a':3 'btxtascriptftpe3':4 'comxv2':5" },
+    .{ "SELECT to_tsvector('simple', '0\"0.>/9-=zA://')", "'/9-':3 '0':1,2" },
+    .{ "SELECT to_tsvector('simple', 'txté.y//y_y ')", "'/y_y':3 'txté':1 'y':2" },
+    .{ "SELECT to_tsvector('simple', 'style日0script;日0b')", "'style日0script':1 '日0b':2" },
+    .{ "SELECT to_tsvector('simple', '>by>yv20;\"%ba=azorg')", "'azorg':4 'ba':3 'by':1 'yv20':2" },
+    .{ "SELECT to_tsvector('simple', ';''ω://com@Béa')", "'/com':2 'béa':3 'ω':1" },
+    .{ "SELECT to_tsvector('simple', '-; /:1.5-=e3scriptc~')", "'1.5':1 'e3scriptc':2" },
+    .{ "SELECT to_tsvector('simple', '//_=é c')", "'/_':1 'c':3 'é':2" },
+    .{ "SELECT to_tsvector('simple', 'c~>b?b~scriptB')", "'b':2,3 'c':1 '~scriptb':4" },
+    .{ "SELECT to_tsvector('simple', 'v2-//aω.v2日9@txt--httpü;')", "'/a':2 'httpü':6 'txt':5 'v2':1 'v2日9':4 'ω':3" },
+    .{ "SELECT to_tsvector('simple', '_orgtxt>&bze3~bcomce30日')", "'bze3':2 'orgtxt':1 '~bcomce30':3 '日':4" },
+    .{ "SELECT to_tsvector('simple', ' éz <9:=_1日éorg=www?B')", "'1日éorg':3 '9':2 'b':5 'www':4 'éz':1" },
+    .{ "SELECT to_tsvector('simple', 'style--?\";\"Ahttp0bscriptmailto#//org:')", "'/org':3 'ahttp0bscriptmailto':2 'style':1" },
+    .{ "SELECT to_tsvector('simple', '!1.59ω日scriptv2')", "'1.59':1 'ω日scriptv2':2" },
+    .{ "SELECT to_tsvector('simple', '&-amp00:')", "'amp00':1" },
+    .{ "SELECT to_tsvector('simple', '1.50httpv2+://;-\"wwwü\"style')", "'1.50':1 'httpv2':2 'style':4 'wwwü':3" },
+    .{ "SELECT to_tsvector('simple', 'styleA0''')", "'stylea0':1" },
+    .{ "SELECT to_tsvector('simple', '&!!')", "" },
+    .{ "SELECT to_tsvector('simple', 'ac.+?9http')", "'9http':2 'ac':1" },
+    .{ "SELECT to_tsvector('simple', '?-;:B9?e3+..')", "'b9':1 'e3':2" },
+    .{ "SELECT to_tsvector('simple', '>ax')", "'ax':1" },
+    .{ "SELECT to_tsvector('simple', '>?ω://_?borg')", "'/_':2 'borg':3 'ω':1" },
+    .{ "SELECT to_tsvector('simple', '?-aftp;ü日A')", "'aftp':1 'ü日a':2" },
+    .{ "SELECT to_tsvector('simple', 'yc99ωxé日><~<<x9')", "'x9':2 'yc99ωxé日':1" },
+    .{ "SELECT to_tsvector('simple', '=e3x&x\"/org''xB1.5_#')", "'/org':3 'e3x':1 'x':2 'xb1.5_':4" },
+    .{ "SELECT to_tsvector('simple', 'v2%:%日00org>#-/x-ca!')", "'/x-ca':3 'v2':1 '日00org':2" },
+    .{ "SELECT to_tsvector('simple', 'A')", "'a':1" },
+    .{ "SELECT to_tsvector('simple', 'y9+#e30y ')", "'e30y':2 'y9':1" },
+    .{ "SELECT to_tsvector('simple', ':1&.+''z')", "'1':1 'z':2" },
+    .{ "SELECT to_tsvector('simple', '//''aampzé&1e3B ~>@日v2b?')", "'1e3':2 'aampzé':1 'b':3 '日v2b':4" },
+    .{ "SELECT to_tsvector('simple', '+ωstyle--<@ωmailto!mailtoz~&')", "'mailtoz':3 'ωmailto':2 'ωstyle':1" },
+    .{ "SELECT to_tsvector('simple', 'script1.5x')", "'script1.5x':1" },
+    .{ "SELECT to_tsvector('simple', '日'';;éyc#=''ba%1style=')", "'1style':4 'ba':3 'éyc':2 '日':1" },
+    .{ "SELECT to_tsvector('simple', '=<xB1.')", "'xb1':1" },
+    .{ "SELECT to_tsvector('simple', 'bc')", "'bc':1" },
+    .{ "SELECT to_tsvector('simple', 'style/\"@~>\"é;z@')", "'style':1 'z':3 'é':2" },
+    .{ "SELECT to_tsvector('simple', 'script=日x/\" %9&://ftpx')", "'/ftpx':4 '9':3 'script':1 '日x':2" },
+    .{ "SELECT to_tsvector('simple', '.scriptz日//')", "'scriptz日':1" },
+    .{ "SELECT to_tsvector('simple', '://-z 1.59>?mailtoy0txtBa\"')", "'1.59':2 'mailtoy0txtba':3 'z':1" },
+    .{ "SELECT to_tsvector('simple', 'Ba_1=>?z')", "'1':2 'ba':1 'z':3" },
+    .{ "SELECT to_tsvector('simple', 'txt;~;=script0.txt')", "'script0.txt':2 'txt':1" },
+    .{ "SELECT to_tsvector('simple', 'zwww')", "'zwww':1" },
+    .{ "SELECT to_tsvector('simple', '!y!01=')", "'01':2 'y':1" },
+    .{ "SELECT to_tsvector('simple', '%?&/日e3mailtoA_<9ω@ü-日')", "'9ω':2 'ü':4 'ü-日':3 '日':5 '日e3mailtoa':1" },
+    .{ "SELECT to_tsvector('simple', 'b-01.5;v2B')", "'-01.5':2 'b':1 'v2b':3" },
+    .{ "SELECT to_tsvector('simple', '0com:e3Ba+v2.y?script=b1.5')", "'0com':1 'b1.5':5 'e3ba':2 'script':4 'v2.y':3" },
+    .{ "SELECT to_tsvector('simple', '://?://x;www1é\"%é''%B日')", "'/x':1 'b日':4 'www1é':2 'é':3" },
+    .{ "SELECT to_tsvector('simple', '!bx!&>y--txt\"日')", "'bx':1 'txt':3 'y':2 '日':4" },
+    .{ "SELECT to_tsvector('simple', '?y+%91.5yscript')", "'91.5':2 'y':1 'yscript':3" },
+    .{ "SELECT to_tsvector('simple', '''xby')", "'xby':1" },
+    .{ "SELECT to_tsvector('simple', '日#@http&é//-xv2bamp/www>')", "'http':2 'xv2bamp/www':4 'é':3 '日':1" },
+    .{ "SELECT to_tsvector('simple', '~0 9mailtoamp/<+日日')", "'9mailtoamp':2 '~0':1 '日日':3" },
+    .{ "SELECT to_tsvector('simple', '.~comy日wwwmailto!')", "'comy日wwwmailto':1" },
+    .{ "SELECT to_tsvector('simple', 'ampftpb')", "'ampftpb':1" },
+    .{ "SELECT to_tsvector('simple', '1c=//com+')", "'/com':2 '1c':1" },
+    .{ "SELECT to_tsvector('simple', 'cü日ωstyle1.5--:/ω//')", "'cü日ωstyle1.5--':1 'ω':2" },
+    .{ "SELECT to_tsvector('simple', 'www.b!:bstyleω/')", "'bstyleω':2 'www.b':1" },
+    .{ "SELECT to_tsvector('simple', '1.5e3日é://')", "'1.5e3':1 '日é':2" },
+    .{ "SELECT to_tsvector('simple', '/--1.5_cscript')", "'-1.5':1 'cscript':2" },
+    .{ "SELECT to_tsvector('simple', '日c1.51mailto')", "'日c1.51mailto':1" },
+    .{ "SELECT to_tsvector('simple', 'y@B/z+_txtx.?_xv2style?')", "'b/z':2 'txtx':3 'xv2style':4 'y':1" },
+    .{ "SELECT to_tsvector('simple', '>é._%ftp~')", "'ftp':2 'é':1" },
+    .{ "SELECT to_tsvector('simple', ':')", "" },
+    .{ "SELECT to_tsvector('simple', '_+v2xBe3 txt日>/-scriptmailto\"0:')", "'0':4 'scriptmailto':3 'txt日':2 'v2xbe3':1" },
+    .{ "SELECT to_tsvector('simple', '=ampω?://@v2_http\">')", "'ampω':1 'http':3 'v2':2" },
+    .{ "SELECT to_tsvector('simple', '_#+')", "" },
+    .{ "SELECT to_tsvector('simple', ':1.5//txt<~txtstyle')", "'/txt':2 '1.5':1 'txtstyle':3" },
+    .{ "SELECT to_tsvector('simple', '/;1:>bBy~//>&')", "'1':1 'bby':2" },
+    .{ "SELECT to_tsvector('simple', 'www+:.=+ampx%')", "'ampx':2 'www':1" },
+    .{ "SELECT to_tsvector('simple', 'com =script~+bamp:/ωa//z')", "'/z':5 'bamp':3 'com':1 'script':2 'ωa':4" },
+    .{ "SELECT to_tsvector('simple', ';A&_99//<<ω/.0y>--\"1.5')", "'/.0y':4 '1.5':5 '99':2 'a':1 'ω':3" },
+    .{ "SELECT to_tsvector('simple', 'ftp?:&amp0%0~0mailtostyle\"0~?')", "'0':3,5 'amp0':2 'ftp':1 '~0mailtostyle':4" },
+    .{ "SELECT to_tsvector('simple', '0org-ωBb\"com<1.5=_1')", "'0org':2 '0org-ωbb':1 '1':6 '1.5':5 'com':4 'ωbb':3" },
+    .{ "SELECT to_tsvector('simple', 'org:!e3~1?@amp:1mailtoa//amp')", "'/amp':6 '1mailtoa':5 'amp':4 'e3':2 'org':1 '~1':3" },
+    .{ "SELECT to_tsvector('simple', '%?_:< xhttpωcomb>--amp')", "'amp':2 'xhttpωcomb':1" },
+    .{ "SELECT to_tsvector('simple', 'a:é')", "'a':1 'é':2" },
+    .{ "SELECT to_tsvector('simple', 'ωA\"%bscripttxtü+ ~e3:')", "'bscripttxtü':2 'e3':3 'ωa':1" },
+    .{ "SELECT to_tsvector('simple', 'stylescript_orgv2!txt?ampstyleA')", "'ampstylea':4 'orgv2':2 'stylescript':1 'txt':3" },
+    .{ "SELECT to_tsvector('simple', '@.y&#atxtxv2!B')", "'atxtxv2':2 'b':3 'y':1" },
+    .{ "SELECT to_tsvector('simple', '''''==')", "" },
+    .{ "SELECT to_tsvector('simple', 'ü日 c&--:&//?scriptéstyle1A:www:')", "'c':2 'scriptéstyle1a':3 'www':4 'ü日':1" },
+    .{ "SELECT to_tsvector('simple', '''http-/--éyxy1.www@B=--y')", "'b':3 'http':1 'y':4 'éyxy1.www':2" },
+    .{ "SELECT to_tsvector('simple', '_&-')", "" },
+    .{ "SELECT to_tsvector('simple', '!;~_.9''ftpv2#a_+%com!%0')", "'0':5 '9':1 'a':3 'com':4 'ftpv2':2" },
+    .{ "SELECT to_tsvector('simple', 'org%org<z''//% +<~a/v2ftp~')", "'a/v2ftp':4 'org':1,2 'z':3" },
+    .{ "SELECT to_tsvector('simple', 'orgA_v2http#b1+://x')", "'/x':4 'b1':3 'orga':1 'v2http':2" },
+    .{ "SELECT to_tsvector('simple', '?@By?__1')", "'1':2 'by':1" },
+    .{ "SELECT to_tsvector('simple', 'zftp\"B1v2b1.5ωAüy0ü</1.5')", "'/1.5':4 'b1v2b1.5':2 'zftp':1 'ωaüy0ü':3" },
+    .{ "SELECT to_tsvector('simple', 'amp9''orgü://orgaorg=://?mailtoωc')", "'/orgaorg':3 'amp9':1 'mailtoωc':4 'orgü':2" },
+    .{ "SELECT to_tsvector('simple', 'zorg%éscriptüA>:com\"!B')", "'b':4 'com':3 'zorg':1 'éscriptüa':2" },
+    .{ "SELECT to_tsvector('simple', '日://')", "'日':1" },
+    .{ "SELECT to_tsvector('simple', '?Ac\"日é+Av2++_x')", "'ac':1 'av2':3 'x':4 '日é':2" },
+    .{ "SELECT to_tsvector('simple', 'org#comftp!+<Ax;script')", "'ax':3 'comftp':2 'org':1 'script':4" },
+    .{ "SELECT to_tsvector('simple', '<//com;b')", "'/com':1 'b':2" },
+    .{ "SELECT to_tsvector('simple', 'a\"ycom0 B')", "'a':1 'b':3 'ycom0':2" },
+    .{ "SELECT to_tsvector('simple', 'y#B?B_e3Bftpc=//=\"style')", "'b':2,3 'e3bftpc':4 'style':5 'y':1" },
+    .{ "SELECT to_tsvector('simple', 'v2#日 ''1?éftp%:')", "'1':3 'v2':1 'éftp':4 '日':2" },
+    .{ "SELECT to_tsvector('simple', ':_y')", "'y':1" },
+    .{ "SELECT to_tsvector('simple', '1.5''Borgüc#é1#Ascriptamp#amp++mailto')", "'1.5':1 'amp':5 'ascriptamp':4 'borgüc':2 'mailto':6 'é1':3" },
+    .{ "SELECT to_tsvector('simple', 'v2ftp<0y<ütxtscript')", "'0y':2 'v2ftp':1 'ütxtscript':3" },
+    .{ "SELECT to_tsvector('simple', '9:!')", "'9':1" },
+    .{ "SELECT to_tsvector('simple', 'ω--#ü#yByaorgv21')", "'ybyaorgv21':3 'ü':2 'ω':1" },
+    .{ "SELECT to_tsvector('simple', 'y1.5')", "'y1.5':1" },
+    .{ "SELECT to_tsvector('simple', '日!.v2-')", "'v2':2 '日':1" },
+    .{ "SELECT to_tsvector('simple', 'é//commailto')", "'/commailto':2 'é':1" },
+    .{ "SELECT to_tsvector('simple', '~ω1b&z9cmailto')", "'z9cmailto':2 'ω1b':1" },
+    .{ "SELECT to_tsvector('simple', 'b1日zcom_@;txtx')", "'b1日zcom':1 'txtx':2" },
+    .{ "SELECT to_tsvector('simple', 'v2;#/%script--;ftp')", "'ftp':3 'script':2 'v2':1" },
+    .{ "SELECT to_tsvector('simple', 'bx://_/züampscript#com=%@_<y')", "'/z':1 'com':3 'y':4 'üampscript':2" },
+    .{ "SELECT to_tsvector('simple', 'awwwy9amp//&0e3-x''B1y#')", "'0e3':2 'awwwy9amp':1 'b1y':4 'x':3" },
+    .{ "SELECT to_tsvector('simple', 'e3org')", "'e3org':1" },
+    .{ "SELECT to_tsvector('simple', 'ω 日zxmailtoüe3A')", "'ω':1 '日zxmailtoüe3a':2" },
+    .{ "SELECT to_tsvector('simple', '''é-//b?<style_b')", "'/b':2 'b':4 'style':3 'é':1" },
+    .{ "SELECT to_tsvector('simple', 'éy.9c+:&')", "'9c':2 'éy':1" },
+    .{ "SELECT to_tsvector('simple', '%''éstyle<&')", "'éstyle':1" },
+    .{ "SELECT to_tsvector('simple', '?e3AaBüa?')", "'e3aabüa':1" },
+    .{ "SELECT to_tsvector('simple', '''e3\"script~xwwwtxt:')", "'e3':1 'script':2 '~xwwwtxt':3" },
+};
+
+fn textSearch() !void {
+    // oracle: PG.TEXT.SEARCH.
+    try rows("SELECT to_tsvector('simple','one two') @@ to_tsquery('simple','one')", "t");
+    try meta(0, "?column?", 16, -1);
+    try rows("SELECT to_tsvector('simple','one two'), to_tsquery('simple','one'), plainto_tsquery('simple','one two'), phraseto_tsquery('simple','one two')", "'one':1 'two':2|'one'|'one' & 'two'|'one' <-> 'two'");
+    try meta(0, "to_tsvector", 3614, -1);
+    try meta(1, "to_tsquery", 3615, -1);
+    try meta(2, "plainto_tsquery", 3615, -1);
+    try meta(3, "phraseto_tsquery", 3615, -1);
+    try rows("SELECT 'a:1 b'::tsvector, 'a & b'::tsquery", "'a':1 'b'|'a' & 'b'");
+    try meta(0, "tsvector", 3614, -1);
+    try meta(1, "tsquery", 3615, -1);
+    for (fts_battery) |case| try single(case[0], case[1]);
+
+    // Not here (0A000): the Snowball configurations, and the forms that
+    // use default_text_search_config (pg_catalog.english).
+    for ([_][]const u8{
+        "SELECT to_tsvector('english', 'x')",     "SELECT to_tsvector('x')",
+        "SELECT to_tsquery('x')",                 "SELECT plainto_tsquery('x')",
+        "SELECT 'a' @@ to_tsquery('simple', 'a')", "SELECT 'a b' @@ 'a b'",
+    }) |source| try rejects(source, error.UnsupportedStatement);
+    try rejects("SELECT to_tsvector('nope', 'x')", error.UndefinedObject);
+    try rejects("SELECT 'a <16385> b'::tsquery", error.InvalidParameterValue);
+    try rejects("SELECT 'a:0'::tsvector", error.Syntax);
+    // A non-literal configuration has no regconfig to resolve.
+    try rejects("SELECT to_tsvector(name, 'x') FROM (VALUES ('simple')) v(name)", error.UndefinedFunction);
+
+    // No comparison, ordering or grouping operators here (42883).
+    try exec("CREATE TABLE docs(id INT PRIMARY KEY, body TEXT, tsv TSVECTOR, q TSQUERY)");
+    try exec("INSERT INTO docs VALUES (1, 'The fat cat', to_tsvector('simple', 'The fat cat'), 'fat & cat'), (2, 'A lean rat', to_tsvector('simple', 'A lean rat'), to_tsquery('simple', 'rat <-> !cat')), (3, NULL, NULL, NULL)");
+    try rows("SELECT id, tsv FROM docs ORDER BY id", "1|'cat':3 'fat':2 'the':1;2|'a':1 'lean':2 'rat':3;3|NULL");
+    try rows("SELECT id FROM docs WHERE tsv @@ to_tsquery('simple', 'fat | rat') ORDER BY id", "1;2");
+    try rows("SELECT a.id, b.id FROM docs a, docs b WHERE a.tsv @@ b.q ORDER BY a.id, b.id", "1|1;2|2");
+    try rows("SELECT id, q @@ tsv, to_tsvector('simple', body) @@ 'cat:*' FROM docs ORDER BY id", "1|t|t;2|t|f;3|NULL|NULL");
+    try rows("SELECT tsv::text, q::text FROM docs WHERE id = 2", "'a':1 'lean':2 'rat':3|'rat' <-> !'cat'");
+    try rows("SELECT data_type FROM information_schema.columns WHERE table_name = 'docs' AND column_name IN ('tsv', 'q') ORDER BY column_name", "tsquery;tsvector");
+    try rows("SELECT typname, typlen, typcategory, typarray FROM pg_type WHERE oid IN (3614, 3615) ORDER BY oid", "tsvector|-1|U|3643;tsquery|-1|U|3645");
+    try rejects("SELECT tsv FROM docs ORDER BY tsv", error.UndefinedFunction);
+    try rejects("SELECT DISTINCT q FROM docs", error.UndefinedFunction);
+    try rejects("SELECT tsv = tsv FROM docs", error.UndefinedFunction);
+    try rejects("INSERT INTO docs VALUES (4, 'x', 'a:0', NULL)", error.Syntax);
+    try rejects("INSERT INTO docs VALUES (4, 'x', NULL, 'a &'), (5, 'y', NULL, NULL)", error.Syntax);
+    try rejects("INSERT INTO docs VALUES (4, 'x', 'a'::text, NULL)", error.TypeMismatch);
+    try rows("SELECT COUNT(*) FROM docs", "3");
+
+    // Parsing and matching are budgeted and cancellable.
+    try controlled("SELECT to_tsvector('simple', 'alpha beta-gamma http://x.org/a 1.2.3 x@y.com') @@ to_tsquery('simple', 'beta <-> gamma | x.org')", "t");
+    try controlled("SELECT id FROM docs WHERE tsv @@ to_tsquery('simple', '(fat & !rat) | (lean <-> rat)') ORDER BY id", "1;2");
+
+    // Wire: text both ways; binary forms are not provided (0A000).
+    try exec("SELECT 'a:1 b'::tsvector, 'a & b'::tsquery");
+    try check(Wire.oid(.tsvector) == 3614 and Wire.oid(.tsquery) == 3615 and Wire.length(.tsvector) == -1);
+    try sendText(&result.rows[0].cells[0], "'a':1 'b'");
+    try sendText(&result.rows[0].cells[1], "'a' & 'b'");
+    var out: [64]u8 = undefined;
+    try check(if (Wire.sendBinary(&result.rows[0].cells[0], .tsvector, &db.session, &out)) |_| false else |err| err == error.UnsupportedBinaryType);
+
+    // Durability: change-record value tags 28 (tsvector) and 29 (tsquery)
+    // carry the canonical text, re-read on replay.
+    try replay(&.{
+        "CREATE TABLE ft(id INT PRIMARY KEY, tsv TSVECTOR, q TSQUERY)",
+        "INSERT INTO ft VALUES (1, to_tsvector('simple', 'Hello world, hello'), to_tsquery('simple', 'hello & !bye')), (2, NULL, 'a:*B <2> b')",
+        "UPDATE ft SET tsv = 'z:1A'::tsvector WHERE id = 2",
+    }, &.{"ft"}, "SELECT id, tsv, q, tsv @@ q FROM ft ORDER BY id");
+    try replicaShows("1|'hello':1,3 'world':2|'hello' & !'bye'|t;2|'z':1A|'a':*B <2> 'b'|f");
+    try exec("DROP TABLE docs");
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try discovery();
     try collations();
     try regularExpressions();
+    try textSearch();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-text\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

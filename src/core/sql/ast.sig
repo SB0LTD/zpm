@@ -55,7 +55,9 @@ pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, n
     // POSIX regular expression match (B11 text): ~ ~* !~ !~* with the
     // node's `insensitive` / `negated`. A `.like` node with this op is
     // SIMILAR TO (its pattern converted by similar_to_escape).
-    regex_match };
+    regex_match,
+    // Full text search @@ (tsvector @@ tsquery, either order).
+    text_match };
 
 /// Built-in functions bound by name.
 pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least,
@@ -127,7 +129,10 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // `integer`, set by the binder) and pg_get_serial_sequence.
     pg_typeof, pg_get_serial_sequence,
     // Regular expressions (B11 text lane, regex.sig).
-    regexp_like, similar_to_escape };
+    regexp_like, similar_to_escape,
+    // Full text search (B11 text lane, text_search.sig): the first argument
+    // is the regconfig name.
+    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -210,6 +215,7 @@ pub fn immutableBuiltin(func: Func) bool {
         // to_json / to_jsonb are STABLE (timestamptz output).
         .to_json, .to_jsonb => false,
         .regexp_like, .similar_to_escape => true,
+        .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
         else => jsonFunction(func),
     };
 }
@@ -236,6 +242,7 @@ pub fn strictFunction(func: Func) bool {
         .jsonb_set_lax => false,
         .pg_get_serial_sequence => true,
         .regexp_like, .similar_to_escape => true,
+        .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
         else => jsonFunction(func),
     };
 }

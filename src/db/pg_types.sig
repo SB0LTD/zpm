@@ -148,6 +148,8 @@ pub fn Types(comptime Result: type) type {
                 .xml => at += try sendText(cell, session, out),
                 // regtypesend is oidsend.
                 .regtype => |value| try putInt(u32, out, &at, value),
+                // tsvectorsend / tsquerysend binary forms are not provided.
+                .tsvector, .tsquery => return error.UnsupportedBinaryType,
                 .point => |value| {
                     try putInt(u64, out, &at, @bitCast(value.x));
                     try putInt(u64, out, &at, @bitCast(value.y));
@@ -384,6 +386,7 @@ pub fn Types(comptime Result: type) type {
                     if (bytes.len != 4) return error.ProtocolViolation;
                     return .{ .regtype = getInt(u32, bytes) };
                 },
+                .tsvector, .tsquery => return error.UnsupportedBinaryType,
                 .xml => {
                     var text: Io.Text = .{};
                     if (bytes.len > text.bytes.len) return error.ProtocolViolation;

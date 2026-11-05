@@ -814,6 +814,14 @@ pub fn Eval(comptime config: types.Config) type {
                     };
                 },
                 .binary => {
+                    if (n.op == .text_match) {
+                        const left = try eval(ctx, n.a);
+                        const right = try eval(ctx, n.b);
+                        if (left == .null_value or right == .null_value) return null;
+                        const vector = if (left == .tsvector) left.tsvector.slice() else right.tsvector.slice();
+                        const query = if (left == .tsquery) left.tsquery.slice() else right.tsquery.slice();
+                        return try Io.TextSearch.matches(vector, query, ctx.session.control);
+                    }
                     if (n.op == .regex_match) {
                         const subject = try eval(ctx, n.a);
                         const pattern = try eval(ctx, n.b);
@@ -994,7 +1002,7 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.negate(&value, n.ty);
                 },
                 .binary => switch (n.op) {
-                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap, .over_left, .over_right, .adjacent, .within_eq, .contains_eq, .same, .regex_match => return boolCell(try truth(ctx, id)),
+                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap, .over_left, .over_right, .adjacent, .within_eq, .contains_eq, .same, .regex_match, .text_match => return boolCell(try truth(ctx, id)),
                     .distance => {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
@@ -1221,6 +1229,25 @@ pub fn Eval(comptime config: types.Config) type {
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out => return catalogValue(ctx, n),
                     .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
+                    .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {
+                        const config_cell = try eval(ctx, n.b);
+                        const input = try eval(ctx, ctx.pool.nodes[n.b].next);
+                        if (config_cell == .null_value or input == .null_value) return .null_value;
+                        const TS = Io.TextSearch;
+                        _ = try TS.configByName(config_cell.text.slice());
+                        var out: TS.Out = .{};
+                        const text = input.text.slice();
+                        switch (n.func) {
+                            .to_tsvector => {
+                                try TS.toVector(text, &out, ctx.session.control);
+                                return .{ .tsvector = (try textCell(out.slice())).text };
+                            },
+                            .to_tsquery => try TS.toQuery(text, .to, &out),
+                            .plainto_tsquery => try TS.toQuery(text, .plain, &out),
+                            else => try TS.toQuery(text, .phrase, &out),
+                        }
+                        return .{ .tsquery = (try textCell(out.slice())).text };
+                    },
                     .regexp_like => {
                         const subject = try eval(ctx, n.b);
                         const pattern = try eval(ctx, ctx.pool.nodes[n.b].next);

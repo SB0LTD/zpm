@@ -787,6 +787,8 @@ pub fn Binder(comptime config: types.Config) type {
             if (left == .json or right == .json or left == .jsonpath or right == .jsonpath) return error.UndefinedFunction;
             // point and box have no ordinary comparison operators here.
             if (geometricType(left) or geometricType(right) or left == .xml or right == .xml) return error.UndefinedFunction;
+            // tsvector / tsquery comparison operators are not provided.
+            if (left == .tsvector or right == .tsvector or left == .tsquery or right == .tsquery) return error.UndefinedFunction;
             if (left == right) return;
             if (value.integral(left) and value.integral(right)) return;
             if (context.legacy) {
@@ -1049,6 +1051,44 @@ pub fn Binder(comptime config: types.Config) type {
             n.ty = .boolean;
         }
 
+        fn textSearchType(ty: ast.Type) bool {
+            return ty == .tsvector or ty == .tsquery;
+        }
+
+        /// @@: tsvector @@ tsquery and tsquery @@ tsvector (an untyped side
+        /// takes the other operand type). text @@ tsquery and text @@ text
+        /// use default_text_search_config (pg_catalog.english): 0A000.
+        fn textMatchOperator(context: *const Context, n: *ast.Node) Error!void {
+            const left = context.node(n.a).ty;
+            const right = context.node(n.b).ty;
+            if (left == .tsvector or right == .tsquery) {
+                if (left == .unknown) return error.UnsupportedStatement;
+                try coerce(context, n.b, .tsquery);
+            }
+            if (left == .tsquery) try coerce(context, n.b, .tsvector);
+            const a = context.node(n.a).ty;
+            const b = context.node(n.b).ty;
+            if ((a == .tsvector and b == .tsquery) or (a == .tsquery and b == .tsvector)) {
+                n.ty = .boolean;
+                return;
+            }
+            if ((value.characterType(a) or a == .unknown) and (b == .tsquery or value.characterType(b) or b == .unknown)) return error.UnsupportedStatement;
+            return error.UndefinedFunction;
+        }
+
+        /// to_tsvector / to_tsquery / plainto_tsquery / phraseto_tsquery
+        /// (regconfig, text). The configuration is an untyped literal
+        /// (regconfig input, checked now when constant); the one-argument
+        /// forms use default_text_search_config (english): 0A000.
+        fn typeTextSearchFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            if (count == 1) return error.UnsupportedStatement;
+            if (count != 2) return error.UndefinedFunction;
+            const config_node = context.node(n.b);
+            if (config_node.ty != .unknown) return error.UndefinedFunction;
+            if (config_node.kind == .text_literal) _ = try Io.TextSearch.configByName(E.literalText(context.source, config_node.text).slice());
+            try bindSignature(context, n, &[_]ast.Type{ .text, .text }, if (n.func == .to_tsvector) .tsvector else .tsquery, true);
+        }
+
         /// int2/int4/int8 & | # (common integer type) and << >> (int4 count).
         fn bitwiseType(context: *const Context, n: *ast.Node) Error!void {
             const left = context.node(n.a).ty;
@@ -1299,6 +1339,11 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "shobj_description", .func = .shobj_description },
                 // Regular expressions (B11 text lane).
                 .{ .name = "regexp_like", .func = .regexp_like },
+                // Full text search (B11 text lane).
+                .{ .name = "to_tsvector", .func = .to_tsvector },
+                .{ .name = "to_tsquery", .func = .to_tsquery },
+                .{ .name = "plainto_tsquery", .func = .plainto_tsquery },
+                .{ .name = "phraseto_tsquery", .func = .phraseto_tsquery },
                 .{ .name = "similar_to_escape", .func = .similar_to_escape },
                 // Discovery functions (B11 text lane).
                 .{ .name = "pg_typeof", .func = .pg_typeof },
@@ -2221,6 +2266,7 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = false;
                 },
                 .pg_get_serial_sequence => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .text, true),
+                .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => try typeTextSearchFunction(context, n, count),
                 .regexp_like => try bindSignature(context, n, if (count == 2) &[_]ast.Type{ .text, .text } else &[_]ast.Type{ .text, .text, .text }, .boolean, true),
                 .similar_to_escape => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.text} else &[_]ast.Type{ .text, .text }, .text, true),
                 .point_constructor => try bindSignature(context, n, &[_]ast.Type{ .float8, .float8 }, .point, true),
@@ -3676,7 +3722,11 @@ pub fn Binder(comptime config: types.Config) type {
                         .exists_any => try jsonOperatorCall(context, n, .jsonb_exists_any_op),
                         .exists_all => try jsonOperatorCall(context, n, .jsonb_exists_all_op),
                         .path_exists => try jsonOperatorCall(context, n, .jsonb_path_exists_op),
-                        .path_match => try jsonOperatorCall(context, n, .jsonb_path_match_op),
+                        // @@ is also tsvector @@ tsquery (either order).
+                        .path_match => if (textSearchType(context.node(n.a).ty) or textSearchType(context.node(n.b).ty)) {
+                            n.op = .text_match;
+                            try textMatchOperator(context, n);
+                        } else try jsonOperatorCall(context, n, .jsonb_path_match_op),
                         .concat => {
                             const left_ty = context.node(n.a).ty;
                             const right_ty = context.node(n.b).ty;
@@ -3716,6 +3766,7 @@ pub fn Binder(comptime config: types.Config) type {
                         .shift_left, .shift_right => if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else if (networkType(context.node(n.a).ty) or networkType(context.node(n.b).ty)) try networkOperator(context, n) else try bitwiseType(context, n),
                         .bit_and, .bit_or, .bit_xor => try bitwiseType(context, n),
                         .regex_match => try regexOperator(context, n),
+                        .text_match => try textMatchOperator(context, n),
                         .neg, .pos, .bit_not => unreachable,
                     }
                 },
@@ -5453,7 +5504,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (ty == .json) return error.UndefinedFunction;
             // No btree or hash operator classes (could not identify an
             // ordering/equality operator: 42883).
-            if (ty == .point or ty == .box or ty == .xml or ty == .jsonpath) return error.UndefinedFunction;
+            if (ty == .point or ty == .box or ty == .xml or ty == .jsonpath or ty == .tsvector or ty == .tsquery) return error.UndefinedFunction;
         }
 
         fn bindSetOp(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv) Error!u16 {

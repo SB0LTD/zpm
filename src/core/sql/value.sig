@@ -28,6 +28,7 @@ const network = @import("network.sig");
 const geometric = @import("geometric.sig");
 const xml = @import("xml.sig");
 const jsonpath = @import("jsonpath.sig");
+const text_search = @import("text_search.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -186,6 +187,12 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         if (from == .xml) return characterType(to) and context != .implicit;
         return characterType(from) and context == .explicit;
     }
+    if (from == .tsvector or to == .tsvector or from == .tsquery or to == .tsquery) {
+        // No pg_cast entries: strings by I/O conversion only.
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
     if (from == .regtype or to == .regtype) {
         // pg_cast: oid/int4 <-> regtype binary and int2/int8 -> regtype
         // implicit; regtype -> int4/int8 by assignment; strings by I/O
@@ -317,8 +324,8 @@ pub fn comparisonType(a: Type, b: Type) ?Type {
     // point has no = operator and box compares only by area: neither has
     // ordinary comparison operators here.
     if (a == .point or b == .point or a == .box or b == .box) return null;
-    // xml and jsonpath have no comparison operators.
-    if (a == .xml or b == .xml or a == .jsonpath or b == .jsonpath) return null;
+    // xml and jsonpath have no comparison operators; tsvector/tsquery have none here.
+    if (a == .xml or b == .xml or a == .jsonpath or b == .jsonpath or a == .tsvector or b == .tsvector or a == .tsquery or b == .tsquery) return null;
     // anyarray operators need the same array type on both sides.
     if (a != b and (types.isArray(a) or types.isArray(b))) return null;
     if (a != b and numericCategory(a) and numericCategory(b) and (a == .float4 or b == .float4)) return .float8;
@@ -383,7 +390,9 @@ pub fn Io(comptime config: types.Config) type {
     const V = types.Values(config);
     const N = numeric.Ops(config.numeric_digits);
     const J = jsonb.Jsonb(config.text_bytes, config.json_depth, config.numeric_digits);
+    const TS = text_search.TextSearch(config.text_bytes, config.expr_depth);
     return struct {
+        pub const TextSearch = TS;
         pub const Text = V.Text;
         pub const Cell = V.Cell;
         pub const Numerics = N;
@@ -468,6 +477,8 @@ pub fn Io(comptime config: types.Config) type {
                 .xml => |*value| xml.output(value.slice(), buffer),
                 // regtypeout: the type's SQL name, or the number.
                 .regtype => |oid| if (types.regtypeName(oid)) |name| copy(buffer, name) else integerText(oid, buffer),
+                // Stored as their canonical output text.
+                .tsvector, .tsquery => |*value| copy(buffer, value.slice()),
             };
         }
 
@@ -575,6 +586,12 @@ pub fn Io(comptime config: types.Config) type {
                     break :blk try textCell(try jsonpath.Engine(config).canonical(input, &buffer, session.control));
                 },
                 .regtype => .{ .regtype = try types.regtypeInput(input) },
+                .tsvector, .tsquery => blk: {
+                    var out: TS.Out = .{};
+                    if (ty == .tsvector) try TS.vectorIn(input, &out) else try TS.queryIn(input, &out);
+                    const text = (try textCell(out.slice())).text;
+                    break :blk if (ty == .tsvector) V.Cell{ .tsvector = text } else V.Cell{ .tsquery = text };
+                },
                 // array_in applies the typmod to every element itself.
                 _ => return ArrayText.parse(types.elementType(ty) orelse return error.UndefinedFunction, typmod, input, session),
             };
@@ -964,6 +981,11 @@ pub fn Io(comptime config: types.Config) type {
                 },
                 .jsonpath => switch (cell) {
                     .text => |*value| try parse(.jsonpath, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .tsvector, .tsquery => switch (cell) {
+                    .tsvector, .tsquery => cell,
+                    .text => |*value| try parse(to, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
                 // Integers and text are converted above.

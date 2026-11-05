@@ -79,7 +79,9 @@
 //!   finite bounds as values} | 23 inet/cidr {family u8 (4/6), bits u8,
 //!   cidr u8, 16 address bytes} | 24 macaddr 6 bytes | 25 point {x, y as
 //!   f64 bits u64} | 26 box {high x, high y, low x, low y as f64 bits}
-//!   | 27 xml len u32 + the stored text | 30 regtype OID u32.
+//!   | 27 xml len u32 + the stored text | 28 tsvector / 29 tsquery len u32
+//!   + canonical output text (re-read and checked on replay) | 30 regtype
+//!   OID u32.
 //!    70 object_create / 71 object_drop: catalog objects (roles, grants,
 //!                     policies, comments, wrappers, servers, publications);
 //!                     layout in catalog_objects.sig (B11 wave 3)
@@ -110,6 +112,7 @@ const range = @import("range.sig");
 const network = @import("network.sig");
 const routine_catalog = @import("routine_catalog.sig");
 const catalog_objects = @import("catalog_objects.sig");
+const text_search = @import("text_search.sig");
 const Error = types.Error;
 
 fn std_zero(bytes: []const u8) bool {
@@ -370,6 +373,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 .regtype => |oid| {
                     try writer.int(u8, 30);
                     try writer.int(u32, oid);
+                },
+                .tsvector, .tsquery => |*text| {
+                    try writer.int(u8, if (cell.* == .tsvector) 28 else 29);
+                    try writer.int(u32, @intCast(text.len));
+                    try writer.bytes(text.slice());
                 },
                 .point => |value| {
                     try writer.int(u8, 25);
@@ -983,6 +991,20 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 },
                 24 => .{ .macaddr = (try reader.take(6))[0..6].* },
                 30 => .{ .regtype = try reader.int(u32) },
+                28, 29 => blk: {
+                    const len = try reader.int(u32);
+                    if (len > config.text_bytes) return error.ChangeRecordConflict;
+                    var text: V.Text = .{ .len = len };
+                    @memcpy(text.bytes[0..len], try reader.take(len));
+                    // Only canonical text (what the engine writes) replays.
+                    const TS = text_search.TextSearch(config.text_bytes, config.expr_depth);
+                    if (tag == 28) {
+                        if (!TS.canonicalVector(text.slice())) return error.InvalidChangeRecord;
+                        break :blk .{ .tsvector = text };
+                    }
+                    if (!TS.canonicalQuery(text.slice())) return error.InvalidChangeRecord;
+                    break :blk .{ .tsquery = text };
+                },
                 27 => blk: {
                     const len = try reader.int(u32);
                     if (len > config.text_bytes) return error.ChangeRecordConflict;

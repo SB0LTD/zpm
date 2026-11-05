@@ -229,6 +229,8 @@ pub const Keyword = enum {
     xml,
     // SQL/JSON path type (B11 json-agg lane).
     jsonpath,
+    tsvector,
+    tsquery,
 };
 
 /// Words that cannot be unquoted identifiers.

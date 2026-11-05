@@ -1354,7 +1354,7 @@ pub fn Parser(comptime config: types.Config) type {
             return switch (token.keyword) {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
-                .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath => true,
+                .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath, .tsvector, .tsquery => true,
                 else => false,
             };
         }
@@ -1519,6 +1519,8 @@ pub fn Parser(comptime config: types.Config) type {
                 .box => .{ .ty = .box },
                 .xml => .{ .ty = .xml },
                 .jsonpath => .{ .ty = .jsonpath },
+                .tsvector => .{ .ty = .tsvector },
+                .tsquery => .{ .ty = .tsquery },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };
