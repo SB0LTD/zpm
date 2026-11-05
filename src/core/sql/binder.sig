@@ -186,7 +186,44 @@ pub fn Binder(comptime config: types.Config) type {
             update: Update = .{ .table = 0, .values = @splat(none), .where = none, .key = none },
             /// No conflict target: DO NOTHING arbitrates every unique index.
             inferred: bool = false,
+            /// The arbiter: the single-column primary key, a UNIQUE or
+            /// composite PRIMARY KEY constraint (constraint index), a UNIQUE
+            /// secondary index (index number), or every unique index.
+            arbiter: Arbiter = .primary,
         };
+
+        pub const Arbiter = union(enum) { primary, constraint: usize, index: usize, any };
+
+        /// The unique index whose key columns are exactly `used` (42P10 when
+        /// none); deferrable constraints are not arbiters (42809).
+        fn inferArbiter(entry: *const S.Table, used: *const [config.columns]bool) Error!Arbiter {
+            if (entry.primary_column) |primary| {
+                var exact = true;
+                for (used, 0..) |flag, column| exact = exact and flag == (column == primary);
+                if (exact) return .primary;
+            }
+            for (entry.constraints[0..entry.constraint_count], 0..) |*constraint, index| {
+                if (!S.scannedUnique(entry, constraint)) continue;
+                if (!sameColumnSet(constraint.keyColumns(), used)) continue;
+                if (constraint.deferrable) return error.WrongObjectType;
+                return .{ .constraint = index };
+            }
+            for (entry.indexes[0..entry.index_count], 0..) |*index, which| {
+                if (!index.unique or !sameColumnSet(index.keyColumns(), used)) continue;
+                return .{ .index = which };
+            }
+            return error.InvalidColumnReference;
+        }
+
+        fn sameColumnSet(columns: []const u8, used: *const [config.columns]bool) bool {
+            var count: usize = 0;
+            for (used) |flag| {
+                if (flag) count += 1;
+            }
+            if (count != columns.len) return false;
+            for (columns) |column| if (column == S.expression_key or !used[column]) return false;
+            return true;
+        }
 
         pub const Bound = union(enum) {
             noop: types.CommandTag,
@@ -2589,15 +2626,29 @@ pub fn Binder(comptime config: types.Config) type {
         fn bindConflict(context: *const Context, index: usize, entry: *const S.Table, table_alias: ?ast.Ident, conflict: *const Ast.OnConflict, out: *Conflict) Error!void {
             if (conflict.constraint) |ident| {
                 const wanted = toName(context, ident);
-                if (entry.primary_column == null) return error.UndefinedObject;
-                const name = try primaryKeyName(entry);
-                if (!types.same(wanted.slice(), name.slice())) return error.UndefinedObject;
+                out.arbiter = blk: {
+                    if (entry.primary_column != null) {
+                        const name = try primaryKeyName(entry);
+                        if (types.same(wanted.slice(), name.slice())) break :blk .primary;
+                    }
+                    for (entry.constraints[0..entry.constraint_count], 0..) |*constraint, position| {
+                        if (!types.same(wanted.slice(), constraint.name.slice())) continue;
+                        if (!S.scannedUnique(entry, constraint)) return error.UndefinedObject;
+                        if (constraint.deferrable) return error.WrongObjectType;
+                        break :blk .{ .constraint = position };
+                    }
+                    for (entry.indexes[0..entry.index_count], 0..) |*candidate, which| {
+                        if (types.same(wanted.slice(), candidate.name.slice()) and candidate.unique) break :blk .{ .index = which };
+                    }
+                    return error.UndefinedObject;
+                };
             } else if (conflict.column_count != 0) {
                 var used: [config.columns]bool = @splat(false);
                 for (conflict.columns[0..conflict.column_count]) |ident| used[try columnIndex(context, entry, ident)] = true;
-                const primary = entry.primary_column orelse return error.InvalidColumnReference;
-                for (used, 0..) |flag, column| if (flag != (column == primary)) return error.InvalidColumnReference;
-            } else if (conflict.action == .update) return error.Syntax;
+                out.arbiter = try inferArbiter(entry, &used);
+            } else if (conflict.action == .update) return error.Syntax else {
+                out.arbiter = .any;
+            }
             out.action = conflict.action;
             out.inferred = conflict.constraint == null and conflict.column_count == 0;
             if (conflict.action != .update) return;

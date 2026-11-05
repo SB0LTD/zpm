@@ -357,8 +357,85 @@ fn indexCapacity() !void {
     try check(result.rows[0].cells[0].integer == 1);
 }
 
+// ---- ON CONFLICT on non-primary unique keys (PG.DML.UPSERT_UNIQUE) ----------
+
+const upsert_probes = [_][]const u8{
+    "SELECT id, v, n FROM up ORDER BY id",
+    "SELECT a, b, c FROM pair ORDER BY a, b, c",
+};
+
+fn upsertUnique() !void {
+    reset();
+    try run("CREATE TABLE up (id INT PRIMARY KEY, v INT UNIQUE, n INT)");
+    try run("INSERT INTO up VALUES (1, 2, 0)");
+    // The oracle program: the UNIQUE (v) arbiter updates the PRIMARY KEY.
+    const result = try replicate("INSERT INTO up (id, v) VALUES (3, 2) ON CONFLICT (v) DO UPDATE SET id = EXCLUDED.id RETURNING id, v");
+    try check(result.command == .insert and result.affected_rows == 1);
+    try same(try render(&result), "3|2");
+    try expect("SELECT id, v FROM up", "3|2");
+    // Named arbiter; DO NOTHING; an unconflicted row inserts.
+    try run("INSERT INTO up VALUES (4, 2, 1) ON CONFLICT ON CONSTRAINT up_v_key DO UPDATE SET n = up.n + EXCLUDED.n");
+    try run("INSERT INTO up VALUES (5, 2, 9) ON CONFLICT (v) DO NOTHING");
+    try run("INSERT INTO up VALUES (6, 6, 6) ON CONFLICT (v) DO NOTHING");
+    try expect("SELECT id, v, n FROM up ORDER BY id", "3|2|1;6|6|6");
+    // A conflict on another unique index is still 23505, and a WHERE that
+    // fails leaves the row; 21000 when one statement hits a row twice.
+    try rejects("INSERT INTO up VALUES (3, 7, 0) ON CONFLICT (v) DO NOTHING", error.PrimaryKeyViolation, upsert_probes[0], "3|2|1;6|6|6");
+    try run("INSERT INTO up VALUES (8, 6, 0) ON CONFLICT (v) DO UPDATE SET n = 99 WHERE up.n > 100");
+    try rejects("INSERT INTO up VALUES (9, 2, 0), (10, 2, 0) ON CONFLICT (v) DO UPDATE SET n = 5", error.CardinalityViolation, upsert_probes[0], "3|2|1;6|6|6");
+    // Arbiter inference: 42P10 without a matching unique index, 42704 for
+    // an unknown name, 42601 for DO UPDATE without a target.
+    try rejects("INSERT INTO up VALUES (9, 9, 9) ON CONFLICT (n) DO NOTHING", error.InvalidColumnReference, upsert_probes[0], "3|2|1;6|6|6");
+    try rejects("INSERT INTO up VALUES (9, 9, 9) ON CONFLICT (v, n) DO NOTHING", error.InvalidColumnReference, upsert_probes[0], "3|2|1;6|6|6");
+    try rejects("INSERT INTO up VALUES (9, 9, 9) ON CONFLICT ON CONSTRAINT nope DO NOTHING", error.UndefinedObject, upsert_probes[0], "3|2|1;6|6|6");
+    try rejects("INSERT INTO up VALUES (9, 9, 9) ON CONFLICT DO UPDATE SET n = 1", error.Syntax, upsert_probes[0], "3|2|1;6|6|6");
+    // Composite UNIQUE and a UNIQUE index are arbiters too; NULL keys never
+    // conflict (NULLS DISTINCT).
+    try run("CREATE TABLE pair (a INT, b INT, c INT, UNIQUE (a, b))");
+    try run("INSERT INTO pair VALUES (1, 1, 0), (1, NULL, 0)");
+    try run("INSERT INTO pair VALUES (1, 1, 5) ON CONFLICT (b, a) DO UPDATE SET c = EXCLUDED.c");
+    try run("INSERT INTO pair VALUES (1, NULL, 7) ON CONFLICT (a, b) DO UPDATE SET c = EXCLUDED.c");
+    try run("CREATE UNIQUE INDEX pair_c ON pair (c)");
+    try run("INSERT INTO pair VALUES (2, 2, 5) ON CONFLICT (c) DO UPDATE SET a = 3");
+    try run("INSERT INTO pair VALUES (4, 4, 7) ON CONFLICT ON CONSTRAINT pair_c DO NOTHING");
+    try expect("SELECT a, b, c FROM pair ORDER BY a, b, c", "1|NULL|0;1|NULL|7;3|1|5");
+    // A deferrable constraint is not an arbiter (42809).
+    try run("CREATE TABLE late (k INT UNIQUE DEFERRABLE)");
+    try rejects("INSERT INTO late VALUES (1) ON CONFLICT (k) DO NOTHING", error.WrongObjectType, "SELECT COUNT(*) FROM late", "0");
+    try sameState(&upsert_probes);
+    // Races: the second upsert waits for the first writer of the key, then
+    // updates its committed row, or inserts after its abort.
+    const first = try db.begin();
+    const second = try db.begin();
+    try statement(first, "INSERT INTO up VALUES (20, 7, 1) ON CONFLICT (v) DO UPDATE SET n = up.n + 1");
+    try parks(second, "INSERT INTO up VALUES (21, 7, 1) ON CONFLICT (v) DO UPDATE SET n = up.n + 10");
+    try commit(first);
+    try same(try resumed(second, "INSERT INTO up VALUES (21, 7, 1) ON CONFLICT (v) DO UPDATE SET n = up.n + 10"), "");
+    try commit(second);
+    try expect("SELECT id, v, n FROM up WHERE v = 7", "20|7|11");
+    const third = try db.begin();
+    const fourth = try db.begin();
+    try statement(third, "INSERT INTO up VALUES (30, 8, 1) ON CONFLICT (v) DO NOTHING");
+    try parks(fourth, "INSERT INTO up VALUES (31, 8, 2) ON CONFLICT (v) DO NOTHING");
+    db.abort(third);
+    _ = try resumed(fourth, "INSERT INTO up VALUES (31, 8, 2) ON CONFLICT (v) DO NOTHING");
+    try commit(fourth);
+    try expect("SELECT id, v, n FROM up WHERE v = 8", "31|8|2");
+    // A conflicting row deleted by a live transaction is waited for too.
+    const deleter = try db.begin();
+    try statement(deleter, "DELETE FROM up WHERE v = 6");
+    const upserter = try db.begin();
+    try parks(upserter, "INSERT INTO up VALUES (40, 6, 4) ON CONFLICT (v) DO UPDATE SET n = 0");
+    try commit(deleter);
+    _ = try resumed(upserter, "INSERT INTO up VALUES (40, 6, 4) ON CONFLICT (v) DO UPDATE SET n = 0");
+    try commit(upserter);
+    try expect("SELECT id, v, n FROM up WHERE v = 6", "40|6|4");
+    try sameState(&upsert_probes);
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
+    try upsertUnique();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

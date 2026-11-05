@@ -2502,25 +2502,54 @@ pub fn Database(comptime config: Config) type {
             const table_index = insert.table;
             const table = &self.tables[table_index];
             const cells = try D.insertedRow(ctx, table, values, derived);
+            // ON CONFLICT: the arbiter is checked first (PostgreSQL's
+            // speculative pre-check); other unique indexes still raise 23505.
+            const conflict = &insert.conflict;
+            if (conflict.action != .none) if (try self.arbiterTaken(slot, table_index, conflict.arbiter, &cells, snap)) |version| switch (conflict.action) {
+                .nothing, .none => return 0,
+                .update => return self.conflictUpdate(slot, ctx, table_index, &conflict.update, version, &cells, snap),
+            };
             if (table.primary_column) |column| switch (D.keyCheck(table, &cells[column], 0xffffffff, snap)) {
                 .free => {},
-                .taken => |version| switch (insert.conflict.action) {
-                    .none => return error.PrimaryKeyViolation,
-                    .nothing => return 0,
-                    .update => return self.conflictUpdate(slot, ctx, table_index, &insert.conflict.update, version, &cells, snap),
-                },
+                .taken => return error.PrimaryKeyViolation,
                 .wait => |owner| {
                     var waits: L.Set = .{};
                     waits.add(owner);
                     return self.park(slot, waits);
                 },
             };
-            if (try self.uniqueTaken(slot, table_index, &cells, 0xffffffff, null, snap)) |_| {
-                if (insert.conflict.action == .nothing and insert.conflict.inferred) return 0;
-                return error.PrimaryKeyViolation;
-            }
+            if (try self.uniqueTaken(slot, table_index, &cells, 0xffffffff, null, snap)) |_| return error.PrimaryKeyViolation;
             try self.appendRow(slot, table_index, &cells, snap);
             return 1;
+        }
+
+        /// The conflicting version of an ON CONFLICT arbiter, null when the
+        /// key is free; a live writer of the key parks the statement.
+        fn arbiterTaken(self: *Self, slot: u16, table_index: usize, arbiter: B.Arbiter, cells: *const E.Row, snap: Snapshot) Error!?u32 {
+            const table = &self.tables[table_index];
+            const state: S.KeyState = switch (arbiter) {
+                .primary, .any => blk: {
+                    const column = table.primary_column orelse break :blk .free;
+                    break :blk switch (D.keyCheck(table, &cells[column], 0xffffffff, snap)) {
+                        .free => .free,
+                        .taken => |version| .{ .taken = version },
+                        .wait => |owner| .{ .wait = owner },
+                    };
+                },
+                .constraint => |index| S.uniqueCheck(table, &table.constraints[index], cells, 0xffffffff, snap),
+                .index => |which| S.indexUniqueCheck(table, which, cells, 0xffffffff, snap),
+            };
+            switch (state) {
+                .free => {},
+                .taken => |version| return version,
+                .wait => |owner| {
+                    var waits: L.Set = .{};
+                    waits.add(owner);
+                    return self.park(slot, waits);
+                },
+            }
+            if (arbiter == .any) return self.uniqueTaken(slot, table_index, cells, 0xffffffff, null, snap);
+            return null;
         }
 
         /// UNIQUE and composite PRIMARY KEY checks after the key index
