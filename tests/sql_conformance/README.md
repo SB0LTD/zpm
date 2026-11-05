@@ -106,7 +106,7 @@ component is missing. The annotations below separate those cases.
 | PG.TYPE.XML | XML | pass (B11 candidate); well-formedness subset, XPath/xmltable/publishing functions open |
 | PG.TYPE.ARRAY | Arrays | pass (B11 candidate); unnest, element assignment and array aggregates open |
 | PG.TYPE.RANGE | Range/multirange | pass (B11 candidate); built-in ranges only, multiranges open |
-| PG.TYPE.ENUM_DOMAIN_COMPOSITE | User-defined types | Syntax; not implemented (oracle expects database-local OIDs 18673/18682) |
+| PG.TYPE.ENUM_DOMAIN_COMPOSITE | User-defined types | Syntax; not implemented (oracle OIDs 18673/18682 come from the native cluster's OID history; see docs/SQL_CATALOG_SECURITY.md) |
 | PG.TYPE.CATALOG_IDS | Additional catalog identifiers | pass (B11 candidate); pg_lsn/xid8, closure incomplete |
 | PG.JSON.OPS | JSON operators | qualified smoke pass; lexical extraction, broader JSON closure incomplete |
 | PG.JSONB.MODIFY | Remaining JSONB operations | pass (B11 candidate); jsonb_set/_lax/insert, - and #-, ?| ?&, strip_nulls, pretty, to_json[b]; subscript assignment open |
@@ -133,19 +133,19 @@ component is missing. The annotations below separate those cases.
 | PG.SQL_PREPARE | SQL prepared statements | pass (B11 candidate); declared parameter types only (no inference) |
 | PG.SESSION.SETTINGS | General settings/search_path | pass (B11 candidate); transactional SET/SET LOCAL, placeholders, current_setting/set_config; search_path limited to public |
 | PG.SESSION.NOTIFY | Notifications | pass (B11 candidate); delivered at commit, NotificationResponse on the wire; pg_notify() open |
-| PG.SECURITY.ROLE | Roles/privileges | Syntax |
-| PG.SECURITY.RLS | Row-level security | UnsupportedStatement |
+| PG.SECURITY.ROLE | Roles/privileges | pass (B11 candidate); roles, membership, table GRANT/REVOKE with 42501 checks, SET ROLE; column/schema/sequence privileges and passwords open |
+| PG.SECURITY.RLS | Row-level security | pass (B11 candidate); policies filter reads/UPDATE/DELETE, WITH CHECK 42501; subqueries in policies, COPY FROM/MERGE/ON CONFLICT under RLS open |
 | PG.ROUTINE.FUNCTION | SQL functions | pass (B11 candidate); SQL / PL/pgSQL functions, overloads, STRICT; SQL bodies beyond one SELECT expression open (docs/SQL_ROUTINES.md) |
 | PG.ROUTINE.PROCEDURE | Procedures/DO | pass (B11 candidate); CALL, DO, statements with INTO, EXCEPTION blocks; transaction control open |
 | PG.ROUTINE.TRIGGER | Triggers | pass (B11 candidate); BEFORE/AFTER ROW/STATEMENT, WHEN, UPDATE OF; INSTEAD OF and statements in trigger functions open |
 | PG.ROUTINE.RULE | Rewrite rules | pass (B11 candidate); DO [ALSO|INSTEAD] NOTHING with qualifications; rule actions open |
-| PG.CATALOG | Catalog expansion | RowShapeMismatch |
+| PG.CATALOG | Catalog expansion | pass (B11 candidate); pg_toast listed (always empty) |
 | PG.UTILITY.EXPLAIN | Explain/analyze plans | UnexecutedScopeOrComparator |
 | PG.UTILITY.MAINTENANCE | Maintenance commands | UnexecutedScopeOrComparator |
-| PG.UTILITY.COMMENT | Object comments | UnsupportedStatement |
-| PG.INTEGRATION.EXTENSION | Extension catalog visibility only; lifecycle remains untested | TableNotFound |
-| PG.INTEGRATION.FOREIGN | Foreign server objects | Syntax |
-| PG.INTEGRATION.REPLICATION | Publication catalog visibility only; replication remains untested | TableNotFound |
+| PG.UTILITY.COMMENT | Object comments | pass (B11 candidate); durable comments on relations, columns, schemas, roles, policies, wrappers, servers, publications; indexes/functions open |
+| PG.INTEGRATION.EXTENSION | Extension catalog visibility only; lifecycle remains untested | pass (B11 candidate); plpgsql row only, CREATE/DROP EXTENSION of others 0A000 |
+| PG.INTEGRATION.FOREIGN | Foreign server objects | pass (B11 candidate); catalog-only wrappers and servers; handlers, options, user mappings, foreign tables open |
+| PG.INTEGRATION.REPLICATION | Publication catalog visibility only; replication remains untested | pass (B11 candidate); catalog-only publications (FOR ALL TABLES, publish options); FOR TABLE, logical decoding, subscriptions open |
 | PG.COPY.OPTIONS | COPY WHERE/options | UnexecutedScopeOrComparator |
 | MYSQL.IDENTIFIERS | Backtick identifiers | UnexecutedScopeOrComparator |
 | MYSQL.TYPES | Native unsigned types | UnexecutedScopeOrComparator |
