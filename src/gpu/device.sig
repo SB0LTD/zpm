@@ -74,7 +74,18 @@ pub const Kind = enum {
     host,
     /// CPU writes (write-combined on discrete: BAR1 VRAM), GPU reads
     upload,
+    /// Memory mapped for the GPU by someone else (an app's dma-buf, shared
+    /// in the device's context): the caller builds the Buffer (.gpu its
+    /// address there, .cpu a CPU view or empty) and frees it its own way,
+    /// after the last run that reads it. free, toDevice and fromDevice
+    /// leave it alone; a dispatch binds it like any buffer.
+    external,
 };
+
+/// A Buffer over memory already mapped for the GPU (Kind.external).
+pub fn external(gpu_va: u64, bytes: u64, cpu: []u8) Buffer {
+    return .{ .gpu = gpu_va, .cpu = cpu, .bytes = bytes, .handle = 0, .kind = .external };
+}
 
 pub const Buffer = struct {
     gpu: u64 = 0,
@@ -166,6 +177,73 @@ pub const Hazards = struct {
     }
 };
 
+test "device: an external buffer is the caller's: free, toDevice and fromDevice leave it alone" {
+    const Count = struct {
+        var calls: u32 = 0;
+        fn alloc(ctx: *anyopaque, bytes: u64, kind: Kind) ?Buffer {
+            _ = ctx;
+            _ = bytes;
+            _ = kind;
+            return null;
+        }
+        fn free(ctx: *anyopaque, b: Buffer) void {
+            _ = ctx;
+            _ = b;
+            calls += 1;
+        }
+        fn import(ctx: *anyopaque, cpu: []u8) ?Buffer {
+            _ = ctx;
+            _ = cpu;
+            return null;
+        }
+        fn cache(ctx: *anyopaque, b: Buffer, off: u64, len: u64) void {
+            _ = ctx;
+            _ = b;
+            _ = off;
+            _ = len;
+            calls += 1;
+        }
+        fn load(ctx: *anyopaque, bin: *const Binary) Error!Program {
+            _ = ctx;
+            _ = bin;
+            return error.Unsupported;
+        }
+        fn unload(ctx: *anyopaque, p: *const Program) void {
+            _ = ctx;
+            _ = p;
+        }
+        fn run(ctx: *anyopaque, ds: []const Dispatch) Error!Fence {
+            _ = ctx;
+            _ = ds;
+            return error.Unsupported;
+        }
+        fn wait(ctx: *anyopaque, f: Fence, t: u64) Error!void {
+            _ = ctx;
+            _ = f;
+            _ = t;
+        }
+        fn done(ctx: *anyopaque, f: Fence) bool {
+            _ = ctx;
+            _ = f;
+            return true;
+        }
+        fn ns(ctx: *anyopaque) u64 {
+            _ = ctx;
+            return 0;
+        }
+    };
+    const vt = Device.VTable{ .alloc = Count.alloc, .free = Count.free, .import = Count.import, .toDevice = Count.cache, .fromDevice = Count.cache, .load = Count.load, .unload = Count.unload, .run = Count.run, .wait = Count.wait, .done = Count.done, .lastRunNs = Count.ns };
+    var dummy: u8 = 0;
+    const d = Device{ .ctx = &dummy, .vtable = &vt, .caps = interp_caps };
+    const x = external(0x7000_0000, 4096, &.{});
+    d.free(x);
+    d.toDevice(x, 0, 4096);
+    d.fromDevice(x, 0, 4096);
+    try std.testing.expectEqual(@as(u32, 0), Count.calls);
+    d.free(.{ .gpu = 0x1000, .bytes = 16, .kind = .host });
+    try std.testing.expectEqual(@as(u32, 1), Count.calls);
+}
+
 test "device: barriers only where a dispatch meets what came before" {
     const prog_rw = Program{ .bin = .{ .target = .interp, .code = &.{}, .regs = 1, .shared_bytes = 0, .group = .{ 1, 1, 1 }, .bindings = 2, .param_words = 0, .writes = 0b10 }, .code = .{} };
     const prog_all = Program{ .bin = .{ .target = .interp, .code = &.{}, .regs = 1, .shared_bytes = 0, .group = .{ 1, 1, 1 }, .bindings = 2, .param_words = 0 }, .code = .{} };
@@ -233,6 +311,7 @@ pub const Device = struct {
         return d.vtable.alloc(d.ctx, bytes, kind) orelse error.OutOfMemory;
     }
     pub fn free(d: Device, b: Buffer) void {
+        if (b.kind == .external) return;
         d.vtable.free(d.ctx, b);
     }
     /// CPU memory mapped for the GPU without a copy; null when the device
@@ -243,10 +322,12 @@ pub const Device = struct {
     }
     /// Make CPU writes to b[off..off+len] visible to the GPU.
     pub fn toDevice(d: Device, b: Buffer, off: u64, len: u64) void {
+        if (b.kind == .external) return;
         d.vtable.toDevice(d.ctx, b, off, len);
     }
     /// Make GPU writes to b[off..off+len] visible to the CPU.
     pub fn fromDevice(d: Device, b: Buffer, off: u64, len: u64) void {
+        if (b.kind == .external) return;
         d.vtable.fromDevice(d.ctx, b, off, len);
     }
     pub fn load(d: Device, bin: *const Binary) Error!Program {

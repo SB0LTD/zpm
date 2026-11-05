@@ -39,6 +39,9 @@ pub const MemoryModel = device.MemoryModel;
 pub const Caps = device.Caps;
 pub const Kind = device.Kind;
 pub const Buffer = device.Buffer;
+/// A Buffer over memory someone else mapped for the GPU (Kind.external).
+pub const external = device.external;
+pub const Hazards = device.Hazards;
 pub const Binary = device.Binary;
 pub const Program = device.Program;
 pub const Dispatch = device.Dispatch;
