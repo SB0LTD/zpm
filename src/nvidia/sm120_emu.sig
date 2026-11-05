@@ -357,6 +357,8 @@ const Op = struct {
     lut: [2]u8 = .{ 0, 0 },
     unsigned: bool = false,
     ftz: bool = false,
+    /// F2I's .NTZ: NaN to 0 (without it NaN is the integer indefinite).
+    ntz: bool = false,
     sat: bool = false,
     rnd: Round = .rn,
     hi: bool = false,
@@ -1018,7 +1020,8 @@ fn body(op: *Op, in: *const Instr, name: []const u8, o: []const Operand, given: 
         }
         if (op.ty[1] == .bf16) return error.Unsupported;
         op.rnd = rndOf(in);
-        op.ftz = in.has("FTZ") or in.has("NTZ");
+        op.ftz = in.has("FTZ");
+        op.ntz = in.has("NTZ");
         op.d[0] = try dstOf(o[0]);
         op.s[0] = try srcOf(o[1], .f32);
     } else if (eql(name, "F2F")) {
@@ -2112,10 +2115,13 @@ fn putFloat(c: *Ctx, wi: u32, t: u32, op: *const Op, ty: Ty, hi: f64, lo: f64) v
     }
 }
 
-fn f2int(x: f64, ty: Ty, r: Round) u64 {
-    if (std.math.isNan(x)) return 0;
-    const v = roundInt(x, r);
+/// F2I's result: rounded, saturated; NaN 0 under .NTZ, else the most
+/// negative signed value's bits, signed or not (the RTX 5070 gave
+/// F2I.U32's NaN as 0x80000000 on legion20).
+fn f2int(x: f64, ty: Ty, r: Round, ntz: bool) u64 {
     const bits = tyBits(ty);
+    if (std.math.isNan(x)) return if (ntz) 0 else @as(u64, 1) << @intCast(bits - 1);
+    const v = roundInt(x, r);
     if (isSigned(ty)) {
         const lim = std.math.ldexp(@as(f64, 1), @as(i32, bits) - 1);
         const max: i128 = (@as(i128, 1) << @intCast(bits - 1)) - 1;
@@ -2319,7 +2325,7 @@ fn lane(c: *Ctx, wi: u32, t: u32, op: *const Op) Error!void {
         },
         .f2i => {
             const x = floatIn(c, wi, t, s[0], op.ty[1], op.ftz);
-            const v = f2int(x, op.ty[0], op.rnd);
+            const v = f2int(x, op.ty[0], op.rnd, op.ntz);
             if (tyBits(op.ty[0]) == 64) put64(c, wi, t, d, v) else put(c, wi, t, d, @truncate(v & 0xffff_ffff));
         },
         .f2f => {
@@ -2687,6 +2693,39 @@ test "floats: FFMA, FADD's directed rounding, FMNMX, FSETP, FTZ, MUFU, conversio
     try testing.expectEqual(@as(u32, 0x0000_ba00), out[11]); // (1*1-1, 0.5*0.5-1)
     try testing.expectEqual(@as(f32, 1), f32of(out[12])); // the high half to f32
     try testing.expectEqual(@as(u32, 0), out[13]); // (unsigned: saturates at 0)
+}
+
+test "F2I: NaN is 0x80000000 without .NTZ, as the RTX 5070 gave it (legion20); .NTZ is not .FTZ" {
+    var out = [_]u32{0} ** 8;
+    const regions = [_]Region{.{ .va = 0x2000, .bytes = std.mem.sliceAsBytes(&out) }};
+    var cb: [qmd.CBUF0_WORDS]u32 = undefined;
+    const p = [_]u64{0x2000};
+    const l = try launchOf(&cb, .{ 1, 1, 1 }, std.mem.asBytes(&p));
+    _ = try runText(
+        \\LDC.64 R2, c[0x0][0x380]
+        \\LDCU.64 UR4, c[0x0][0x358]
+        \\MOV R4, 0x7fc00000
+        \\MOV R5, 0x80000001
+        \\F2I.U32 R6, R4
+        \\F2I R7, R4
+        \\F2I.U32.NTZ R8, R4
+        \\F2I.U32.TRUNC.NTZ R9, R4
+        \\F2I.TRUNC.NTZ R10, R4
+        \\F2I.FLOOR.NTZ R11, R5
+        \\F2I.FTZ.FLOOR.NTZ R12, R5
+        \\F2I.U32.CEIL.NTZ R13, R5
+        \\STG.E.128 desc[UR4][R2.64], R6
+        \\STG.E.128 desc[UR4][R2.64+0x10], R10
+        \\EXIT
+    , &l, &regions);
+    try testing.expectEqual(@as(u32, 0x80000000), out[0]); // unsigned, no .NTZ
+    try testing.expectEqual(@as(u32, 0x80000000), out[1]); // signed, no .NTZ
+    try testing.expectEqual(@as(u32, 0), out[2]);
+    try testing.expectEqual(@as(u32, 0), out[3]);
+    try testing.expectEqual(@as(u32, 0), out[4]);
+    try testing.expectEqual(@as(u32, 0xffffffff), out[5]); // floor(-denormal): kept
+    try testing.expectEqual(@as(u32, 0), out[6]); // flushed first
+    try testing.expectEqual(@as(u32, 0), out[7]); // ceil(-denormal) = -0: 0
 }
 
 test "divergence reconverges; a loop; BAR.SYNC; shared memory; SHFL.BFLY; VOTE" {

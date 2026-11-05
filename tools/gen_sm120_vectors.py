@@ -14,7 +14,7 @@ text into exactly the words next to it.
 (src/nvidia/sm120_vectors.txt is made from every file in
 src/nvidia/testdata/, Galaxy's probe kernels first:
 galaxy_m4.ptx galaxy_m5.ptx coverage.ptx lfm3_quant.ptx lfm3_layers.ptx
-galaxy_draw.ptx sm120_ops.ptx.)
+galaxy_draw.ptx sm120_ops.ptx sm120_cvt.ptx.)
 
 Each kernel becomes a block:
 
