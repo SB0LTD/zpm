@@ -223,17 +223,25 @@ underflow (rounded to nearest even from c's significand and its sticky bit,
 c's remainder ≠ 0), overflow, the special values, then flushing if the caps
 ask for it.
 
-Run on the fast path, in KIR instructions (about 13 of each are bit-cast
-`mov`s and if/endif pairs that all lanes skip; backends coalesce the movs
-and branch over the blocks):
+Every register is written once. A block's values are picked by a select
+after it, and a lane that skipped the block reads whatever its registers
+hold, which the select drops. A register written twice would live through
+every loop around it in a backend's allocation (ir3's), so an expansion in a
+loop would hold its registers for the whole loop. A GLSL fragment shader runs
+inside the raster's triangle loop, where 48 divisions once took all of the
+Adreno's registers.
+
+Run on the fast path, in KIR instructions (about 16 of each are bit-cast
+`mov`s, the selects after the blocks, and if/endif pairs that all lanes
+skip; backends coalesce the movs and branch over the blocks):
 
 | Expansion | fused | mul/add |
 |---|---|---|
-| fdiv | 39 | 74 |
-| fsqrt | 32 | 60 |
+| fdiv | 42 | 77 |
+| fsqrt | 33 | 61 |
 
 The whole expansion, both paths, is 111 or 146 instructions for fdiv and
-62 or 90 for fsqrt. For comparison, NVIDIA's own fast path (MUFU.RCP plus 7
+61 or 89 for fsqrt. For comparison, NVIDIA's own fast path (MUFU.RCP plus 7
 FFMA, behind FCHK) is about 10 instructions; it relies on MUFU.RCP's known
 accuracy. A target whose reciprocal is proven tight enough for Markstein's
 last step could add that variant as an option; it would then be tested
