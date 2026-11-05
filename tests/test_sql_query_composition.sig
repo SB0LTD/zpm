@@ -330,11 +330,60 @@ fn valuesAndTable() !void {
     try controlled("TABLE tdd_a ORDER BY id", "1|1|10;2|1|20;3|2|30;4|2|NULL");
 }
 
+// ---- PG.QUERY.LIMIT_EXPR --------------------------------------------------
+
+fn limitExpressions() !void {
+    // oracle
+    try expectTyped("SELECT id FROM tdd_a ORDER BY id LIMIT (1+1) OFFSET (1+0)", "id:23", "2;3");
+    // Constant expressions fold; untyped and NULL counts.
+    try expect("SELECT id FROM tdd_a ORDER BY id LIMIT 2*1 OFFSET 3-2", "2;3");
+    try expect("SELECT id FROM tdd_a ORDER BY id LIMIT '2'", "1;2");
+    try expect("SELECT id FROM tdd_a ORDER BY id LIMIT NULL::int OFFSET NULL::bigint", "1;2;3;4");
+    try expect("SELECT id FROM tdd_a ORDER BY id LIMIT 1::smallint+1::smallint", "1;2");
+    // Subqueries are evaluated once per execution of the query block.
+    try expect("SELECT id FROM tdd_a ORDER BY id OFFSET (SELECT 3)", "4");
+    try expect("SELECT id FROM tdd_a ORDER BY id LIMIT (SELECT COUNT(*) FROM tdd_b)-1", "1;2");
+    try expect("SELECT id FROM tdd_a ORDER BY id LIMIT (SELECT NULL::int)", "1;2;3;4");
+    try expect("SELECT id FROM tdd_a ORDER BY id LIMIT (SELECT 0)", "");
+    // Correlated counts follow the outer row.
+    try expect("SELECT o.id,(SELECT COUNT(*) FROM (SELECT i.id FROM tdd_a i ORDER BY i.id LIMIT o.id) s) FROM tdd_a o ORDER BY o.id", "1|1;2|2;3|3;4|4");
+    try expect("SELECT o.g,(SELECT SUM(v) FROM (SELECT v FROM tdd_b ORDER BY id OFFSET o.g) s) FROM tdd_a o WHERE o.id IN (1,3) ORDER BY o.g", "1|88;2|55");
+    // A volatile count is evaluated exactly once.
+    try run("CREATE SEQUENCE ls");
+    try expect("SELECT id FROM tdd_a ORDER BY id LIMIT nextval('ls')", "1");
+    try expect("SELECT currval('ls')", "1");
+    // Set operations, VALUES and FETCH counts.
+    try expect("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 ORDER BY 1 LIMIT 1+1 OFFSET 1", "2;3");
+    try expect("VALUES (1),(2),(3) LIMIT (SELECT 1)", "1");
+    try expect("SELECT id FROM tdd_a ORDER BY id FETCH FIRST (1+1) ROWS ONLY", "1;2");
+    try expect("SELECT id FROM tdd_a ORDER BY id OFFSET (1) ROWS FETCH NEXT (SELECT 2) ROWS ONLY", "2;3");
+    try expect("SELECT id FROM tdd_a ORDER BY id FETCH FIRST NULL ROWS ONLY", "1;2;3;4");
+    try expect("SELECT g,COUNT(*) FROM tdd_a GROUP BY g ORDER BY g LIMIT (SELECT 1) OFFSET 1-0", "2|2");
+    // Literal forms keep their behavior.
+    try expect("SELECT id FROM tdd_a ORDER BY id LIMIT (2)", "1;2");
+    try rejects("SELECT id FROM tdd_a LIMIT (-1)", error.InvalidRowCountInLimit);
+    // Errors (PostgreSQL transformLimitClause / ExecLimit).
+    try rejects("SELECT id FROM tdd_a LIMIT 1-2", error.InvalidRowCountInLimit);
+    try rejects("SELECT id FROM tdd_a OFFSET 1-2 LIMIT 1-2", error.InvalidRowCountInResultOffset);
+    try rejects("SELECT id FROM tdd_a LIMIT (SELECT -1)", error.InvalidRowCountInLimit);
+    try rejects("SELECT id FROM tdd_a OFFSET (SELECT -1)", error.InvalidRowCountInResultOffset);
+    try rejects("SELECT id FROM tdd_a LIMIT id", error.InvalidColumnReference);
+    try rejects("SELECT id FROM tdd_a LIMIT COUNT(*)", error.GroupingError);
+    try rejects("SELECT id FROM tdd_a LIMIT 1.5", error.TypeMismatch);
+    try rejects("SELECT id FROM tdd_a LIMIT true", error.TypeMismatch);
+    try rejects("SELECT id FROM tdd_a LIMIT 'x'", error.InvalidTextRepresentation);
+    try rejects("SELECT id FROM tdd_a LIMIT 1/0", error.DivisionByZero);
+    try rejects("SELECT id FROM tdd_a LIMIT (SELECT 1 UNION SELECT 2)", error.CardinalityViolation);
+    try rejects("SELECT id FROM tdd_a LIMIT (SELECT id)", error.UnsupportedStatement);
+    try controlled("SELECT id FROM tdd_a ORDER BY id LIMIT (SELECT COUNT(*) FROM tdd_b) OFFSET (SELECT 1)", "2;3;4");
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try naturalJoins();
     try joinTrees();
     try valuesAndTable();
+    try limitExpressions();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-query-composition\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

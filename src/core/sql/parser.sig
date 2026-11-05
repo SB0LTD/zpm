@@ -1896,17 +1896,18 @@ pub fn Parser(comptime config: types.Config) type {
             while (true) {
                 if (!limited and try self.takeWord("LIMIT")) {
                     limited = true;block.limit_present=true;
-                    if (!(try self.takeWord("ALL")) and !(try self.takeWord("NULL"))) try self.countValue(&block.limit, &block.negative_limit);
+                    if (!(try self.takeWord("ALL")) and !(self.mode != .standard and try self.takeWord("NULL"))) try self.countClause(&block.limit, &block.negative_limit, &block.limit_expr);
                 } else if (!offset_seen and self.mode == .standard and try self.takeWord("OFFSET")) {
                     offset_seen = true;block.offset_present=true;
                     self.pool.complex = true;
-                    try self.countValue(&block.offset, &block.negative_offset);
+                    try self.countClause(&block.offset, &block.negative_offset, &block.offset_expr);
                     _ = (try self.takeWord("ROW")) or (try self.takeWord("ROWS"));
                 } else if (!limited and self.mode == .standard and try self.takeWord("FETCH")) {
                     limited = true;block.limit_present=true;
                     if (!(try self.takeWord("FIRST"))) try self.expectWord("NEXT");
                     block.limit = 1;
-                    if (self.current.kind == .integer or self.isSymbol(.minus) or self.isSymbol(.lparen) or self.current.kind == .decimal) try self.countValue(&block.limit, &block.negative_limit);
+                    if (self.current.kind == .integer or self.isSymbol(.minus) or self.isSymbol(.lparen) or self.current.kind == .decimal or
+                        (self.mode == .standard and (self.current.kind == .parameter or self.isWord("NULL")))) try self.countClause(&block.limit, &block.negative_limit, &block.limit_expr);
                     if (!(try self.takeWord("ROW"))) try self.expectWord("ROWS");
                     try self.expectWord("ONLY");
                 } else break;
@@ -2233,6 +2234,35 @@ pub fn Parser(comptime config: types.Config) type {
             item.alias = try self.bareAlias();
             out.items[out.item_count] = item;
             out.item_count += 1;
+        }
+
+        /// A LIMIT/OFFSET/FETCH count. The integer forms of countValue keep
+        /// their exact behavior; any other expression (`(1+1)`, `'5'`, a
+        /// subquery or an outer reference) is kept in `expression` for the
+        /// binder (B11), which folds constants and otherwise evaluates it
+        /// once per execution of the query block.
+        fn countClause(self: *Self, value: *u64, negative: *bool, expr_out: *u16) Error!void {
+            const saved_tokens = self.tokens;
+            const saved_current = self.current;
+            const saved_peeked = self.peeked;
+            const saved_after = self.after_peek;
+            const saved_has = self.has_peek;
+            const saved_value = value.*;
+            const saved_negative = negative.*;
+            if (self.countValue(value, negative)) |_| {
+                if (!(self.mode == .standard and self.current.kind == .symbol and self.current.symbol != .rparen and self.current.symbol != .semicolon and self.current.symbol != .comma)) return;
+            } else |err| {
+                if (err != error.Syntax or self.mode != .standard) return err;
+            }
+            self.tokens = saved_tokens;
+            self.current = saved_current;
+            self.peeked = saved_peeked;
+            self.after_peek = saved_after;
+            self.has_peek = saved_has;
+            value.* = saved_value;
+            negative.* = saved_negative;
+            expr_out.* = try self.expression();
+            self.pool.complex = true;
         }
 
         /// A LIMIT/OFFSET/FETCH count; negative counts are reported by the

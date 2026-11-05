@@ -241,12 +241,40 @@ pub fn Exec(comptime config: types.Config) type {
 
             pub fn run(self: *Query, plan_id: u16, outer: ?*const E.Context) Error!List {
                 const p = &self.plans.items[plan_id];
+                if (p.limit_expr != none or p.offset_expr != none) try self.resolveCounts(p, outer);
                 // Binding already validates live planning diagnostics. LIMIT 0
                 // must not start an aggregate, sort, window or set input at runtime.
                 if(p.limit==0) {try self.session.checkpoint();return .{};}
                 if (p.set_op != .none) return self.setOperation(p, outer);
                 if (p.values != none) return self.valuesRows(p, outer);
                 return self.core(p, outer);
+            }
+
+            /// Evaluates non-constant LIMIT / OFFSET expressions once for this
+            /// execution of the plan, OFFSET first as PostgreSQL ExecLimit
+            /// does, and stores them in the plan's statement-scoped count
+            /// fields (plan storage is the statement's mutable workspace).
+            fn resolveCounts(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!void {
+                const plan: *B.Plan = @constCast(p);
+                var ctx = self.context(outer);
+                if (p.offset_expr != none) {
+                    const cell = try E.eval(&ctx, p.offset_expr);
+                    if (cell == .null_value) {
+                        plan.offset = 0;
+                    } else {
+                        if (cell.integer < 0) return error.InvalidRowCountInResultOffset;
+                        plan.offset = @intCast(cell.integer);
+                    }
+                }
+                if (p.limit_expr != none) {
+                    const cell = try E.eval(&ctx, p.limit_expr);
+                    if (cell == .null_value) {
+                        plan.limit = 0xffffffffffffffff;
+                    } else {
+                        if (cell.integer < 0) return error.InvalidRowCountInLimit;
+                        plan.limit = @intCast(cell.integer);
+                    }
+                }
             }
 
             /// A VALUES block: each row's items in order, then ORDER BY /

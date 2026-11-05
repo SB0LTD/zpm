@@ -474,6 +474,10 @@ pub fn Binder(comptime config: types.Config) type {
             /// Standalone VALUES rows (values_row nodes linked by `next`),
             /// each item already converted to its column's common type.
             values: u16 = none,
+            /// LIMIT / OFFSET count expressions evaluated once per execution
+            /// (Exec.resolveCounts); constant ones are folded into limit/offset.
+            limit_expr: u16 = none,
+            offset_expr: u16 = none,
         };
 
         pub const CteDef = struct {
@@ -4183,6 +4187,7 @@ pub fn Binder(comptime config: types.Config) type {
                 p.order_count += 1;
             }
             try checkCounts(q, p);
+            try bindCounts(context, &scope, q, p);
             return id;
         }
 
@@ -4261,6 +4266,71 @@ pub fn Binder(comptime config: types.Config) type {
             if (q.negative_limit) return error.InvalidRowCountInLimit;
         }
 
+        /// LIMIT / OFFSET expressions (PostgreSQL transformLimitClause): no
+        /// column of this query level (42P10), no aggregate (42803) or window
+        /// call (42P20); the value is bigint through implicit coercion only
+        /// (42804). Constants fold now (negative: 2201W / 2201X, NULL: no
+        /// limit / zero offset); the rest is evaluated at execution.
+        fn bindCounts(context: *const Context, scope: *Scope, q: *const Ast.Select, p: *Plan) Error!void {
+            for ([_]u16{ q.offset_expr, q.limit_expr }, 0..) |id, position| {
+                if (id == none) continue;
+                const is_limit = position == 1;
+                var inner = scope.*;
+                inner.aggregates = false;
+                inner.windows = false;
+                inner.saw_aggregate = null;
+                try typeExpr(context, &inner, id);
+                if (referencesLevel(context, id, 0)) return error.InvalidColumnReference;
+                // A correlated sublink would need this level's row (0A000).
+                if (correlatedSublink(context, id)) return error.UnsupportedStatement;
+                const ty = context.node(id).ty;
+                if (ty == .unknown) {
+                    try coerce(context, id, .int8);
+                } else if (!value.integral(ty)) return error.TypeMismatch;
+                if (try foldableScalar(context, id)) {
+                    const cell = try generatedValue(context, id);
+                    if (is_limit) {
+                        if (cell == .null_value) p.limit = 0xffffffffffffffff else if (cell.integer < 0) return error.InvalidRowCountInLimit else p.limit = @intCast(cell.integer);
+                    } else {
+                        if (cell == .null_value) p.offset = 0 else if (cell.integer < 0) return error.InvalidRowCountInResultOffset else p.offset = @intCast(cell.integer);
+                    }
+                    continue;
+                }
+                // Window demand is planned against a known LIMIT.
+                if (p.window_count != 0) return error.UnsupportedStatement;
+                if (is_limit) p.limit_expr = id else p.offset_expr = id;
+            }
+        }
+
+        fn correlatedSublink(context: *const Context, id: u16) bool {
+            if (id == none) return false;
+            const n = context.node(id);
+            if (n.kind == .scalar_subquery or n.kind == .exists_subquery or n.kind == .in_subquery) {
+                if (plansOf(context).items[@intCast(n.integer)].correlated) return true;
+            }
+            if (correlatedSublink(context, n.a) or correlatedSublink(context, n.c)) return true;
+            if (listOwner(n.kind)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) if (correlatedSublink(context, item)) return true;
+                return false;
+            }
+            return correlatedSublink(context, n.b);
+        }
+
+        /// Whether expression `id` reads a column `level` query levels up.
+        fn referencesLevel(context: *const Context, id: u16, level: u8) bool {
+            if (id == none) return false;
+            const n = context.node(id);
+            if (n.kind == .column) return n.level == level;
+            if (referencesLevel(context, n.a, level) or referencesLevel(context, n.c, level)) return true;
+            if (listOwner(n.kind)) {
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) if (referencesLevel(context, item, level)) return true;
+                return false;
+            }
+            return referencesLevel(context, n.b, level);
+        }
+
         fn sortableType(ty: ast.Type) Error!void {
             if (ty == .json) return error.UndefinedFunction;
             // No btree or hash operator classes (could not identify an
@@ -4318,6 +4388,8 @@ pub fn Binder(comptime config: types.Config) type {
                 p.order_count += 1;
             }
             try checkCounts(q, p);
+            var count_scope: Scope = .{ .parent = parent, .plan = id, .ctes = env };
+            try bindCounts(context, &count_scope, q, p);
             return id;
         }
 
@@ -5030,6 +5102,7 @@ pub fn Binder(comptime config: types.Config) type {
                 for (order[0..order_count]) |key| appendKey(p, key);
             }
             try checkCounts(q, p);
+            try bindCounts(context, &scope, q, p);
             p.constant_source_safe=!q.distinct and q.order_count==0 and !q.limit_present and !q.offset_present;
             try lowerWindows(context,id);
             return id;
@@ -5365,7 +5438,7 @@ pub fn Binder(comptime config: types.Config) type {
             var conservative=bound.*!=.query;
             for(plans.items[0..plans.len]) |*p| conservative=conservative or p.correlated;
             // B11 composition plans keep every output (no demand pruning).
-            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join;
+            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none;
             for(plans.items[0..plans.len]) |*p| {p.demanded=conservative;p.required=@splat(conservative);p.aggregate_required=@splat(conservative);}
             if(conservative) return;
             var cte_references:[config.ctes]usize=@splat(0);
