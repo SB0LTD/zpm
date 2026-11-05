@@ -225,11 +225,12 @@ ask for it.
 
 Every register is written once. A block's values are picked by a select
 after it, and a lane that skipped the block reads whatever its registers
-hold, which the select drops. A register written twice would live through
-every loop around it in a backend's allocation (ir3's), so an expansion in a
-loop would hold its registers for the whole loop. A GLSL fragment shader runs
-inside the raster's triangle loop, where 48 divisions once took all of the
-Adreno's registers.
+hold, which the select drops. A backend that can't tell whether a loop
+carries a register written twice keeps it live through the whole loop. ir3's
+allocator once did, and a GLSL fragment shader (inside the raster's triangle
+loop) with 48 divisions took all of the Adreno's registers. ir3 now tells
+(see the backend's allocation below), and writing once costs nothing either
+way.
 
 Run on the fast path, in KIR instructions (about 16 of each are bit-cast
 `mov`s, the selects after the blocks, and if/endif pairs that all lanes
@@ -298,7 +299,14 @@ A new GPU is a KIR backend plus a device adapter. Nothing else changes.
    - start from `kir.expand(k, caps, storage)`, so that `fdiv` and `fsqrt`
      arrive as the shared exact expansions;
    - expand `dot4` itself when `!caps.dot4`;
-   - allocate registers using liveness over the structured flow;
+   - allocate registers using liveness over the structured flow. A
+     register written more than once inside a loop lives through the loop
+     only when the loop carries it. ir3 decides this by region: the
+     then-part, else-part and loop body record their instruction spans. A
+     register stays local when its first access writes it at the top level
+     of its innermost region and every later access lies in that region:
+     each pass writes it before reading it. Registers live into or out of
+     a loop, and ones read before they are written, still live through it;
    - legalize: `ffma` only with a native fused FMA; `fmad` as the hardware's
      mad; `fneg`/`fabs` as sign-bit ops or as modifiers on ops that flush
      anyway;

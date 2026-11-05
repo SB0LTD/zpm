@@ -463,6 +463,87 @@ test "exact fdiv and fsqrt in a loop: their temporaries live only as long as the
     try std.testing.expect(run.stats.full_regs <= 48);
 }
 
+test "registers written in a branch inside a loop live only as long as they are used" {
+    // 200 values a pass, each written, then rewritten in a branch, then
+    // used at once: none is read across passes, so none lives through the
+    // loop (200 would fit no group)
+    var k = newKernel("branch-written in a loop", .{ 64, 1, 1 });
+    const ba = k.binding();
+    const bo = k.binding();
+    const off = k.op2(.shl, .u32, r(k.tid(0)), u(2));
+    const a = k.load(.u32, kir.global(ba, 32), r(off));
+    const acc = k.reg(.u32);
+    k.set(acc, .mov, u(0), no, no);
+    const i = k.reg(.u32);
+    k.set(i, .mov, u(0), no, no);
+    k.loop();
+    {
+        k.brk(r(k.cmp(.u32, .ge, r(i), u(3))));
+        for (0..200) |j| {
+            const v = k.reg(.u32);
+            k.set(v, .iadd, r(a), r(k.op2(.imul, .u32, r(i), u(@intCast(j + 1)))), no);
+            k.ifp(r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(v), u(@intCast(1 + j % 7)))), u(0))));
+            k.set(v, .xor, r(v), u(@intCast(0x9e37 * (j + 1))), no);
+            k.endif();
+            k.set(acc, .iadd, r(acc), r(v), no);
+        }
+        k.set(i, .iadd, r(i), u(1), no);
+    }
+    k.endloop();
+    k.store(.u32, kir.global(bo, 32), r(off), r(acc));
+    var av = zeros(64 * 4);
+    for (0..64) |n| std.mem.writeInt(u32, av[n * 4 ..][0..4], @intCast(n * 2654435761 % 4294967291), .little);
+    var out = zeros(64 * 4);
+    const run = try both(&k, .{ 1, 1, 1 }, &.{ &av, &out }, &.{});
+    try std.testing.expect(run.stats.full_regs <= 48);
+}
+
+test "registers a loop carries still live through it: read before written, written in a branch, past a continue" {
+    var k = newKernel("carried in a loop", .{ 64, 1, 1 });
+    const ba = k.binding();
+    const bo = k.binding();
+    const off = k.op2(.shl, .u32, r(k.tid(0)), u(3));
+    const a = k.load(.u32, kir.global(ba, 32), r(off));
+    // carried: read at the top of a pass, written in a branch later
+    const carried = k.reg(.u32);
+    k.set(carried, .mov, u(5), no, no);
+    // carried too: written only in a branch, read after it (the last
+    // pass's value where the branch is not taken)
+    const sticky = k.reg(.u32);
+    k.set(sticky, .mov, u(0), no, no);
+    const acc = k.reg(.u32);
+    k.set(acc, .mov, u(0), no, no);
+    const i = k.reg(.u32);
+    k.set(i, .mov, u(0), no, no);
+    k.loop();
+    {
+        k.brk(r(k.cmp(.u32, .ge, r(i), u(9))));
+        k.set(i, .iadd, r(i), u(1), no);
+        k.set(acc, .iadd, r(acc), r(carried), no);
+        // (odd passes go on at once: past the writes below)
+        k.cont(r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(i), u(1))), u(0))));
+        // local: written at the top of the pass, rewritten in a branch
+        const v = k.reg(.u32);
+        k.set(v, .imul, r(a), r(i), no);
+        k.ifp(r(k.cmp(.u32, .gt, r(v), u(1000))));
+        k.set(v, .shr, r(v), u(3), no);
+        k.set(sticky, .iadd, r(i), r(a), no);
+        k.els();
+        k.set(carried, .iadd, r(carried), r(v), no);
+        k.endif();
+        k.set(acc, .xor, r(acc), r(k.op2(.iadd, .u32, r(v), r(sticky))), no);
+    }
+    k.endloop();
+    k.store(.u32, kir.global(bo, 32), r(off), r(acc));
+    var m = kir.global(bo, 32);
+    m.imm = 4;
+    k.store(.u32, m, r(off), r(k.op2(.iadd, .u32, r(carried), r(sticky))));
+    var av = zeros(64 * 8);
+    for (0..64) |n| std.mem.writeInt(u32, av[n * 8 ..][0..4], @intCast(n * n * 37 + 3), .little);
+    var out = zeros(64 * 8);
+    _ = try both(&k, .{ 1, 1, 1 }, &.{ &av, &out }, &.{});
+}
+
 test "selects, predicates and conversions" {
     try checkOp(.{ .name = "sel.u32", .op = .sel, .ty = .u32, .ta = .u32, .tb = .u32, .tc = .pred, .nc = 1, .dst = .u32 });
     try checkOp(.{ .name = "sel.f32", .op = .sel, .ty = .f32, .ta = .f32, .tb = .f32, .tc = .pred, .nc = 1, .dst = .f32, .float_pool = true });
