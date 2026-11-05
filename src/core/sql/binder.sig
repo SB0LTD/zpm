@@ -323,6 +323,9 @@ pub fn Binder(comptime config: types.Config) type {
             /// Binding a data-modifying WITH entry (B11): plans of the
             /// enclosing statement stay in place.
             nested_dml: bool = false,
+            /// Declared parameter types of an EXECUTEd SQL prepared
+            /// statement ($n nodes; their values are in the session).
+            params: ?*const Parameters = null,
 
             fn node(self: *const Context, id: u16) *ast.Node {
                 return &self.pool.nodes[id];
@@ -332,6 +335,29 @@ pub fn Binder(comptime config: types.Config) type {
                 return self.legacy or self.dialect != .postgres;
             }
         };
+
+        /// $1..$n of a SQL prepared statement (tx-session lane).
+        pub const Parameters = struct {
+            count: usize = 0,
+            types: [config.statement_parameters]ast.Type = undefined,
+        };
+
+        /// Binds the EXECUTE arguments (a `next` list from `head`) with no
+        /// FROM scope and coerces each to its parameter type in assignment
+        /// context, as PostgreSQL's EvaluateParams. Returns the bound ids.
+        pub fn bindArguments(context: *const Context, head: u16, params: *const Parameters, out: *[config.statement_parameters]u16) Error!void {
+            const empty: Scope = .{};
+            var item = head;
+            var index: usize = 0;
+            while (item != none) : (index += 1) {
+                if (index == params.count) return error.Syntax;
+                const next = context.node(item).next;
+                try typeExpr(context, &empty, item);
+                out[index] = try convert(context, item, params.types[index], -1, .assignment);
+                item = next;
+            }
+            if (index != params.count) return error.Syntax;
+        }
 
         pub const no_cte: u8 = 0xff;
         pub const group_relation = ast.groupRelation(config);
@@ -600,7 +626,7 @@ pub fn Binder(comptime config: types.Config) type {
                     .rollback, .rollback_to => .rollback,
                     .savepoint => .savepoint,
                     .release => .release,
-                    .set => .set,
+                    .set, .set_session_characteristics => .set,
                     .show => .show,
                     .reset => .reset,
                 },
@@ -1114,6 +1140,16 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "xml_is_well_formed", .func = .xml_is_well_formed },
                 .{ .name = "xml_is_well_formed_document", .func = .xml_is_well_formed_document },
                 .{ .name = "xml_is_well_formed_content", .func = .xml_is_well_formed_content },
+                // Session functions (tx-session lane).
+                .{ .name = "current_setting", .func = .current_setting },
+                .{ .name = "set_config", .func = .set_config },
+                .{ .name = "pg_try_advisory_lock", .func = .pg_try_advisory_lock },
+                .{ .name = "pg_try_advisory_lock_shared", .func = .pg_try_advisory_lock_shared },
+                .{ .name = "pg_try_advisory_xact_lock", .func = .pg_try_advisory_xact_lock },
+                .{ .name = "pg_try_advisory_xact_lock_shared", .func = .pg_try_advisory_xact_lock_shared },
+                .{ .name = "pg_advisory_unlock", .func = .pg_advisory_unlock },
+                .{ .name = "pg_advisory_unlock_shared", .func = .pg_advisory_unlock_shared },
+                .{ .name = "pg_backend_pid", .func = .pg_backend_pid },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -1706,6 +1742,23 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = isConstant(context, n.b);
                 },
                 .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => try bindSignature(context, n, &[_]ast.Type{.text}, .boolean, true),
+                // Session functions (tx-session lane): volatile.
+                .current_setting => {
+                    if (count == 2) try bindSignature(context, n, &[_]ast.Type{ .text, .boolean }, .text, true) else try bindSignature(context, n, &[_]ast.Type{.text}, .text, true);
+                    n.constant = false;
+                },
+                .set_config => {
+                    try bindSignature(context, n, &[_]ast.Type{ .text, .text, .boolean }, .text, false);
+                    n.constant = false;
+                },
+                .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared => {
+                    if (count == 2) try bindSignature(context, n, &[_]ast.Type{ .int4, .int4 }, .boolean, true) else try bindSignature(context, n, &[_]ast.Type{.int8}, .boolean, true);
+                    n.constant = false;
+                },
+                .pg_backend_pid => {
+                    try bindSignature(context, n, &[_]ast.Type{}, .int4, true);
+                    n.constant = false;
+                },
                 .point_constructor => try bindSignature(context, n, &[_]ast.Type{ .float8, .float8 }, .point, true),
                 .box_constructor => try bindSignature(context, n, &[_]ast.Type{ .point, .point }, .box, true),
                 .area, .width, .height => try bindSignature(context, n, &[_]ast.Type{.box}, .float8, true),
@@ -3046,7 +3099,15 @@ pub fn Binder(comptime config: types.Config) type {
                     _ = try Io.parse(.numeric, -1, n.name.span.slice(context.source), context.session);
                     n.ty = .numeric;
                 },
-                .param => return error.UndefinedParameter,
+                .param => {
+                    const params = context.params orelse return error.UndefinedParameter;
+                    // PREPARE without a declared type for $n (PostgreSQL
+                    // infers one from context; not here): 42P18.
+                    if (n.integer < 1 or n.integer > params.count) return error.IndeterminateDatatype;
+                    n.ty = params.types[@intCast(n.integer - 1)];
+                    n.typmod = -1;
+                    n.constant = false;
+                },
                 // DEFAULT outside an INSERT VALUES item or SET value (42601).
                 .values_row, .default_value => return error.Syntax,
                 .row_constructor => return error.UnsupportedStatement,
@@ -3869,6 +3930,14 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn bindSelect(context: *const Context, select: *const Ast.Select) Error!Select {
             const scope = try scopeFor(context, select.from);
+            // FOR ... OF names a FROM item (42P01 otherwise; single-table locking).
+            if (select.lock.strength != .none and select.lock.of_set) {
+                if (scope.rel_count == 0) return error.TableNotFound;
+                for ([_]?ast.Ident{ select.lock.of, if (select.lock.of_other_set) select.lock.of_other else null }) |maybe| {
+                    const wanted = maybe orelse continue;
+                    if (!types.same(toName(context, wanted).slice(), scope.rels[0].name.slice())) return error.TableNotFound;
+                }
+            }
             var out: Select = .{ .table = singleTable(&scope), .targets = undefined, .names = undefined, .types = undefined, .count = 0, .where = none, .key = none, .order = undefined, .order_count = 0, .limit = select.limit, .lock = select.lock };
             for (select.targets[0..select.count]) |*target| {
                 if (target.star) {
@@ -6449,6 +6518,8 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .delete = out };
                 },
                 .control => |control| return .{ .control = control },
+                // Session commands run in Database (session.sig), never bound here.
+                .session => return error.UnsupportedStatement,
                 // COPY runs through Database.copyInfo/copyBegin, never as a statement.
                 .copy => return error.UnsupportedStatement,
                 .truncate => |*truncate| return .{ .truncate = try bindTruncate(context, truncate) },

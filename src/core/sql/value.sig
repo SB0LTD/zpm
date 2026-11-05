@@ -44,6 +44,12 @@ pub const Session = struct {
     /// current_database(): the session's startup database.
     database: []const u8 = "postgres",
     control: ?*types.ExecutionControl = null,
+    /// Values of $1..$n while an EXECUTEd SQL prepared statement runs
+    /// ([Config.statement_parameters]Cell of the Database; tx-session lane).
+    params: ?*const anyopaque = null,
+    /// Session functions (current_setting, set_config, advisory locks,
+    /// pg_notify, pg_backend_pid); set by the Database per statement.
+    engine: ?*const SessionHook = null,
 
     pub fn checkpoint(self: *const Session) Error!void {
         if (self.control) |control| try control.checkpoint();
@@ -64,6 +70,19 @@ pub const SequenceHook = struct {
     call: *const fn (ptr: *anyopaque, kind: SequenceCall, name: []const u8, oid: u32, value: i64, called: bool) Error!i64,
     /// regclass output: the relation named by `oid`, if any.
     relation_name: *const fn (ptr: *anyopaque, oid: u32, out: *[64]u8) ?usize,
+};
+
+pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid };
+
+/// Advisory call flags: 1 shared, 2 transaction-level, 4 two int4 keys;
+/// current_setting / set_config: 1 missing_ok / is_local.
+pub const SessionReply = struct { integer: i64 = 0, len: usize = 0, null_value: bool = false };
+
+/// Engine session functions: text arguments `a`/`b`, integer keys `x`/`y`,
+/// text results written to `out` (`len`), booleans/integers in `integer`.
+pub const SessionHook = struct {
+    ptr: *anyopaque,
+    call: *const fn (ptr: *anyopaque, kind: SessionCall, a: []const u8, b: []const u8, x: i64, y: i64, flags: u8, out: []u8) Error!SessionReply,
 };
 
 pub const default_session: Session = .{};

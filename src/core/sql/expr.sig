@@ -489,6 +489,65 @@ pub fn Eval(comptime config: types.Config) type {
             return .{ .integer = try hook.call(hook.ptr, if (n.func == .nextval) .nextval else .currval, name, oid, 0, false) };
         }
 
+        /// Session functions through the Database's session hook
+        /// (tx-session lane). current_setting and the advisory functions
+        /// are strict; set_config's NULL value resets the setting.
+        fn sessionFunction(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const hook = ctx.session.engine orelse return error.UnsupportedStatement;
+            var args: [3]V.Cell = @splat(.null_value);
+            var count: usize = 0;
+            var item = n.b;
+            while (item != ast.none and count < args.len) : (item = ctx.pool.nodes[item].next) {
+                args[count] = try eval(ctx, item);
+                count += 1;
+            }
+            var out: V.Text = .{};
+            switch (n.func) {
+                .pg_backend_pid => {
+                    const reply = try hook.call(hook.ptr, .backend_pid, "", "", 0, 0, 0, &out.bytes);
+                    return .{ .integer = reply.integer };
+                },
+                .current_setting => {
+                    if (args[0] == .null_value or (count == 2 and args[1] == .null_value)) return .null_value;
+                    const missing_ok = count == 2 and args[1].boolean;
+                    const reply = try hook.call(hook.ptr, .current_setting, args[0].text.slice(), "", 0, 0, if (missing_ok) 1 else 0, &out.bytes);
+                    if (reply.null_value) return .null_value;
+                    out.len = reply.len;
+                    return .{ .text = out };
+                },
+                .set_config => {
+                    if (args[0] == .null_value) return error.InvalidParameterValue;
+                    const local = args[2] != .null_value and args[2].boolean;
+                    var flags: u8 = if (local) 1 else 0;
+                    if (args[1] == .null_value) flags |= 2;
+                    const value = if (args[1] == .null_value) "" else args[1].text.slice();
+                    const reply = try hook.call(hook.ptr, .set_config, args[0].text.slice(), value, 0, 0, flags, &out.bytes);
+                    if (reply.null_value) return .null_value;
+                    out.len = reply.len;
+                    return .{ .text = out };
+                },
+                else => {},
+            }
+            for (args[0..count]) |arg| if (arg == .null_value) return .null_value;
+            var flags: u8 = 0;
+            switch (n.func) {
+                .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock_shared => flags |= 1,
+                else => {},
+            }
+            switch (n.func) {
+                .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared => flags |= 2,
+                else => {},
+            }
+            if (count == 2) flags |= 4;
+            const kind: value_module.SessionCall = switch (n.func) {
+                .pg_advisory_unlock, .pg_advisory_unlock_shared => .advisory_unlock,
+                else => .advisory_try_lock,
+            };
+            const second: i64 = if (count == 2) args[1].integer else 0;
+            const reply = try hook.call(hook.ptr, kind, "", "", args[0].integer, second, flags, &out.bytes);
+            return .{ .boolean = reply.integer != 0 };
+        }
+
         pub fn literalText(source: []const u8, quoted: lexer.Quoted) V.Text {
             var text: V.Text = .{ .len = quoted.len };
             lexer.decodeQuoted(source, quoted, &text.bytes);
@@ -1054,6 +1113,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
                     .array_append, .array_prepend, .array_cat, .array_to_string => return array_eval.ArrayEval(config, @This()).call(ctx, n),
                     .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
+                    .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid => return sessionFunction(ctx, n),
                     .xmlparse, .xmlserialize, .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => {
                         const argument = try eval(ctx, n.b);
                         if (argument == .null_value) return .null_value;
@@ -1132,7 +1192,14 @@ pub fn Eval(comptime config: types.Config) type {
                     },
                     .none => unreachable,
                 },
-                .param, .when_arm => unreachable,
+                // $n of an EXECUTEd SQL prepared statement (tx-session lane).
+                .param => {
+                    const raw = ctx.session.params orelse return error.UndefinedParameter;
+                    const values: *const [config.statement_parameters]V.Cell = @ptrCast(@alignCast(raw));
+                    if (n.integer < 1 or n.integer > config.statement_parameters) return error.UndefinedParameter;
+                    return values[@intCast(n.integer - 1)];
+                },
+                .when_arm => unreachable,
             }
         }
     };

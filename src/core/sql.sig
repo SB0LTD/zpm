@@ -56,8 +56,13 @@
 //! transactional through the versioned catalog (catalog.sig). A statement
 //! that meets a lock held by a live transaction returns WouldBlock with its
 //! work kept; re-delivering it resumes with the same snapshot and command id
-//! (EvalPlanQual re-checks on every remaining target). REPEATABLE READ and
-//! SERIALIZABLE are not provided (callers reject them). execute(),
+//! (EvalPlanQual re-checks on every remaining target). REPEATABLE READ keeps
+//! the snapshot of the transaction's first query for every statement and
+//! raises 40001 where READ COMMITTED would re-check a row a concurrent
+//! transaction changed; SERIALIZABLE adds relation-granularity SSI
+//! (ssi.sig); READ ONLY (25006), DEFERRABLE and the session state of the
+//! tx-session lane (settings, cursors, SQL prepared statements, LOCK
+//! TABLE, advisory locks, LISTEN/NOTIFY) are in session.sig. execute(),
 //! executeWithCommit() and executeChanges() are single-statement autocommit
 //! conveniences over the same machinery.
 //!
@@ -106,6 +111,8 @@ const sort_module = @import("sql/sort.sig");
 const sequence_module = @import("sql/sequence.sig");
 const deparse_module = @import("sql/deparse.sig");
 const range_eval_module = @import("sql/range_eval.sig");
+const session_module = @import("sql/session.sig");
+const ssi_module = @import("sql/ssi.sig");
 
 /// The canonical SQL tokenizer, also used by wire parameter binding.
 /// Source and token spans remain caller-owned; tokenization allocates nothing.
@@ -137,6 +144,7 @@ pub const DataType = types.DataType;
 pub const CommandTag = types.CommandTag;
 pub const ParseMode = parser_module.Mode;
 pub const Isolation = ast.Isolation;
+pub const Characteristics = ast.Characteristics;
 pub const typeOid = types.typeOid;
 pub const CopyFormat = ast.CopyFormat;
 pub const CopyHeader = ast.CopyHeader;
@@ -165,7 +173,7 @@ pub const SettingValueKind = enum { default, word, string, number };
 pub const Control = union(enum) {
     /// An ordinary SQL statement.
     none: void,
-    begin: Isolation,
+    begin: Characteristics,
     commit: void,
     rollback: void,
     savepoint: ControlText,
@@ -173,11 +181,13 @@ pub const Control = union(enum) {
     rollback_to: ControlText,
     /// `name` is lower case; TIME ZONE is "timezone".
     set: struct { local: bool, name: ControlText, kind: SettingValueKind, value: ControlText },
-    set_transaction: Isolation,
+    set_transaction: Characteristics,
     /// TRANSACTION ISOLATION LEVEL is "transaction_isolation".
     show: ControlText,
     /// null = RESET ALL.
     reset: ?ControlText,
+    /// SET SESSION CHARACTERISTICS AS TRANSACTION (default_transaction_*).
+    set_session_characteristics: Characteristics,
 };
 
 pub const StatementOptions = struct {
@@ -189,6 +199,9 @@ pub const StatementOptions = struct {
     /// Leave a mutation's affected count and tag out of `result` (see
     /// Database.lastOutcome); the caller writes them after commit.
     hold_result: bool = false,
+    /// The statement runs in an implicit (autocommit) transaction: LOCK
+    /// TABLE and DECLARE without WITH HOLD are 25P01 there.
+    implicit: bool = false,
 };
 
 pub fn Database(comptime config: Config) type {
@@ -214,6 +227,8 @@ pub fn Database(comptime config: Config) type {
     const K = catalog_module.Catalog(config);
     const Q = sequence_module.Sequences(config);
     const G = deparse_module.Deparse(config);
+    const Sess = session_module.Sessions(config);
+    const SSI = ssi_module.Ssi(config);
 
     return struct {
         const Self = @This();
@@ -249,6 +264,12 @@ pub fn Database(comptime config: Config) type {
         pub const sequence_capacity = config.sequences;
         /// Receives the complete change record before the statement publishes.
         pub const RecordCommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
+        /// A connection's engine session state (session.sig): install it as
+        /// `session_state` before every call, like `sequence_session`.
+        pub const SessionState = Sess.State;
+        /// A committed notification (takeNotification).
+        pub const Notification = Sess.Note;
+        pub const cursor_capacity = config.cursors;
 
         /// Text I/O, casts and JSONB/NUMERIC helpers for this configuration.
         pub const Io = value_module.Io(config);
@@ -819,6 +840,36 @@ pub fn Database(comptime config: Config) type {
         /// call like `dialect`. Not database state.
         session: value_module.Session = .{},
         workspace: Workspace = .{},
+        /// Tx-session lane: the caller's session state for the next call
+        /// (null: default_session_state), cursors and notifications of every
+        /// session, SERIALIZABLE records and EXECUTE parameter values.
+        session_state: ?*Sess.State = null,
+        default_session_state: Sess.State = .{},
+        session_counter: u64 = 0,
+        cursors: Sess.Cursors = .{},
+        notify: Sess.Notify = .{},
+        ssi: SSI = .{},
+        session_hook: value_module.SessionHook = undefined,
+        param_values: [config.statement_parameters]Cell = undefined,
+        active_params: ?*const B.Parameters = null,
+        statement_implicit: bool = false,
+        /// Settings before the running statement's first set_config (a
+        /// failed statement restores them).
+        statement_settings: Sess.Values = .{},
+        statement_base: Sess.Values = .{},
+        statement_settings_cid: ?u32 = null,
+        /// Settings provider for parameters the caller implements (the
+        /// store's TimeZone, timeouts ...): current_setting / set_config.
+        settings_provider: ?SettingsProvider = null,
+
+        /// current_setting / set_config of caller-owned parameters: `show`
+        /// writes the value (null: unknown name); `set` applies it (false:
+        /// unknown name).
+        pub const SettingsProvider = struct {
+            context: ?*anyopaque = null,
+            show: *const fn (?*anyopaque, []const u8, []u8) ?usize,
+            set: *const fn (?*anyopaque, []const u8, []const u8, bool, bool) Error!bool,
+        };
 
         const BackingLayout = struct {
             offsets: [config.tables][9]usize,
@@ -1062,6 +1113,15 @@ pub fn Database(comptime config: Config) type {
             self.outcome = .{};
             self.dialect = .postgres;
             self.session = .{};
+            self.session_state = null;
+            self.default_session_state = .{};
+            self.session_counter = 0;
+            self.cursors.slots = @splat(.{});
+            self.cursors.used_rows = 0;
+            self.notify = .{};
+            self.ssi = .{};
+            self.active_params = null;
+            self.settings_provider = null;
             if (comptime config.external_storage) {
                 const refs = self.workspace.query.refs;
                 const cells = if (comptime config.external_workspace) self.workspace.query.cells else {};
@@ -1184,7 +1244,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn writeOutcome(self: *const Self, result: *Result) void {
-            if (self.outcome.command == .select) return;
+            if (self.outcome.command == .select or self.outcome.command == .fetch or self.outcome.command == .show) return;
             result.clear(self.outcome.affected);
             result.command = self.outcome.command;
             const returned = &self.outcome.returning;
@@ -1223,6 +1283,15 @@ pub fn Database(comptime config: Config) type {
                 tx.deferred_checks = false;
                 tx.constraints_all = null;
                 tx.constraint_mode_count = 0;
+                const state = self.sessionState();
+                tx.isolation = state.values.isolation;
+                tx.read_only = state.values.read_only;
+                tx.deferrable = state.values.deferrable;
+                tx.snapshot_csn = null;
+                tx.snapshot_cid = 0;
+                tx.session = state.id;
+                tx.ssi = null;
+                state.beginTransaction(tx.epoch);
                 return @intCast(slot);
             };
             return error.TransactionCapacity;
@@ -1258,6 +1327,7 @@ pub fn Database(comptime config: Config) type {
                 M.stamp(self, slot, csn);
                 self.csn = csn;
             }
+            self.endSessionTransaction(slot, true);
             M.releaseLocks(self, slot, 0);
             self.free(slot);
             if (wrote) {
@@ -1279,6 +1349,7 @@ pub fn Database(comptime config: Config) type {
             M.abortSlice(self, slot, 0, 0);
             self.seq_carried.merge(&tx.seq_dirty);
             tx.seq_dirty = .{};
+            self.endSessionTransaction(slot, false);
             self.free(slot);
         }
 
@@ -1310,6 +1381,7 @@ pub fn Database(comptime config: Config) type {
                 lock_start = tx.subs[tx.sub_len - 1].lock_start;
             }
             M.abortSlice(self, slot, start, lock_start);
+            self.sessionRollback(slot, tx.userSavepoints(), true);
             self.wake_epoch +%= 1;
         }
 
@@ -1328,7 +1400,17 @@ pub fn Database(comptime config: Config) type {
                 const sub = tx.subs[tx.sub_len - 1];
                 M.abortSlice(self, slot, sub.write_start, sub.lock_start);
                 tx.sub_len -= 1;
+                // The failed statement's NOTIFY entries and set_config calls.
+                self.notify.discard(slot, tx.epoch, 0, tx.cid);
+                if (self.statement_settings_cid) |cid| if (cid == tx.cid) {
+                    const state = self.sessionState();
+                    if (state.tx_epoch == tx.epoch) {
+                        state.values = self.statement_settings;
+                        state.base = self.statement_base;
+                    }
+                };
             }
+            self.statement_settings_cid = null;
             tx.copy_table = null;
             tx.copy_rows = 0;
             tx.running_snap = null;
@@ -1374,6 +1456,7 @@ pub fn Database(comptime config: Config) type {
             @memcpy(sub.name.bytes[0..name.len], name);
             tx.subs[tx.sub_len] = sub;
             tx.sub_len += 1;
+            if (self.ownSession(slot)) |state| state.savepoint();
         }
 
         fn findSavepoint(self: *const Self, slot: u16, name: []const u8) Error!usize {
@@ -1392,6 +1475,7 @@ pub fn Database(comptime config: Config) type {
         pub fn release(self: *Self, slot: u16, name: []const u8) Error!usize {
             const index = try self.findSavepoint(slot, name);
             self.txs[slot].sub_len = index;
+            if (self.ownSession(slot)) |state| state.release(index);
             return index;
         }
 
@@ -1402,6 +1486,8 @@ pub fn Database(comptime config: Config) type {
             const sub = tx.subs[index];
             M.abortSlice(self, slot, sub.write_start, sub.lock_start);
             tx.sub_len = index + 1;
+            self.sessionRollback(slot, index + 1, false);
+            if (self.ownSession(slot)) |state| state.rollbackTo(index);
             self.wake_epoch +%= 1;
             return index;
         }
@@ -1431,8 +1517,15 @@ pub fn Database(comptime config: Config) type {
                 const pinned = tx.pin orelse return error.QueryCanceled;
                 snap = pinned;
                 // A wait before any data access (table lock, catalog) takes a
-                // fresh snapshot, as PostgreSQL locks before snapshotting.
-                if (tx.fresh) snap.csn = self.csn;
+                // fresh snapshot, as PostgreSQL locks before snapshotting
+                // (the transaction snapshot too, when this statement took it).
+                if (tx.fresh) {
+                    if (tx.snapshot_csn != null and tx.snapshot_cid == tx.cid) {
+                        tx.snapshot_csn = self.csn;
+                        if (tx.ssi) |index| self.ssi.records[index].snapshot = self.csn;
+                    }
+                    snap.csn = if (transactionSnapshot(tx.isolation) and tx.snapshot_csn != null) tx.snapshot_csn.? else self.csn;
+                }
                 tx.pin = null;
                 tx.fresh = false;
             } else {
@@ -1441,11 +1534,20 @@ pub fn Database(comptime config: Config) type {
                 tx.cid +%= 1;
                 tx.progress = 0;
                 tx.progress_affected = 0;
-                self.modifying[slot] = .{};
-                snap = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
+                self.modifying[slot] = .{};                snap = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
+                // The first statement that needs a snapshot fixes the
+                // transaction snapshot (REPEATABLE READ / SERIALIZABLE use it).
+                if (needsSnapshot(&parsed)) {
+                    if (tx.snapshot_csn == null) {
+                        tx.snapshot_csn = self.csn;
+                        tx.snapshot_cid = tx.cid;
+                    }
+                    if (transactionSnapshot(tx.isolation)) snap.csn = tx.snapshot_csn.?;
+                }
                 tx.subs[tx.sub_len] = .{ .statement = true, .write_start = @intCast(tx.write_len), .lock_start = @intCast(tx.lock_len) };
                 tx.sub_len += 1;
             }
+            self.statement_implicit = options.implicit;
             tx.running_snap = snap;
             defer tx.running_snap = null;
             const start = tx.subs[tx.sub_len - 1].write_start;
@@ -1492,7 +1594,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn bindContext(self: *Self, source: []const u8, mode: ParseMode, snap: Snapshot) B.Context {
-            return .{ .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans };
+            return .{ .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params };
         }
 
         fn evalContext(self: *const Self, source: []const u8) E.Context {
@@ -1502,18 +1604,31 @@ pub fn Database(comptime config: Config) type {
         fn body(self: *Self, slot: u16, original: []const u8, parsed: *const A.Statement, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
             self.workspace.query.read_stats = .{};
             try self.session.checkpoint();
+            switch (parsed.*) {
+                .control => |command| return self.runControl(slot, original, command, result),
+                .session => |*command| return self.runSession(slot, original, command, snap, result, mode),
+                else => {},
+            }
+            try self.serializableSnapshot(slot);
             var statement_copy = parsed.*;
             const source = try expandRelations(self, &self.workspace, original, snap, &statement_copy);
             const context = self.bindContext(source, mode, snap);
             const bound = try B.bind(&context, &statement_copy);
+            if (self.txs[slot].read_only) try readOnlyCheck(&bound, &self.workspace.plans);
             switch (bound) {
                 .control => return error.UnsupportedStatement,
                 .select => |*select| {
                     self.outcome = .{ .affected = 0, .command = .select };
-                    if (select.table) |table| try self.lockTable(slot, table, .access_share);
+                    if (select.table) |table| try self.lockTable(slot, table, if (select.lock.strength == .none) .access_share else .row_share);
                     if (select.lock.strength == .none)
                         return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, X.NoLock{}, &self.session, self.txs[slot].write_len == 0, &self.workspace.query.read_stats, &self.workspace.query);
-                    const locker: RowLocker = .{ .db = self, .slot = slot, .snap = snap, .mode = if (select.lock.strength == .update) .update else .share, .wait = select.lock.wait };
+                    const row_mode: locks_module.RowMode = switch (select.lock.strength) {
+                        .update, .none => .update,
+                        .no_key_update => .no_key_update,
+                        .share => .share,
+                        .key_share => .key_share,
+                    };
+                    const locker: RowLocker = .{ .db = self, .slot = slot, .snap = snap, .mode = row_mode, .wait = select.lock.wait };
                     return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, locker, &self.session, self.txs[slot].write_len == 0, &self.workspace.query.read_stats, &self.workspace.query);
                 },
                 .query => |root| {
@@ -1559,16 +1674,19 @@ pub fn Database(comptime config: Config) type {
                 },
                 .insert => |*insert| blk: {
                     try self.lockTable(slot, insert.table, .row_exclusive);
+                    if (insert.conflict.action != .none) try self.ssiRead(slot, insert.table);
                     try self.lockSources(slot);
                     break :blk try self.insertRows(slot, source, insert, snap);
                 },
                 .update => |*update| blk: {
                     try self.lockTable(slot, update.table, .row_exclusive);
+                    try self.ssiRead(slot, update.table);
                     try self.lockSources(slot);
                     break :blk try self.updateRows(slot, source, update, snap);
                 },
                 .delete => |*delete| blk: {
                     try self.lockTable(slot, delete.table, .row_exclusive);
+                    try self.ssiRead(slot, delete.table);
                     try self.lockSources(slot);
                     break :blk try self.deleteRows(slot, source, delete, snap);
                 },
@@ -1600,6 +1718,7 @@ pub fn Database(comptime config: Config) type {
                 .refresh_view => |*refresh| try self.refreshView(slot, refresh, source, snap),
                 .merge => |*merge| blk: {
                     try self.lockTable(slot, merge.table, .row_exclusive);
+                    try self.ssiRead(slot, merge.table);
                     try self.lockSources(slot);
                     break :blk try self.mergeRows(slot, source, merge, snap);
                 },
@@ -1757,6 +1876,9 @@ pub fn Database(comptime config: Config) type {
             for (&self.txs) |*tx| if (tx.active) {
                 if (tx.running_snap) |snap| out = @min(out, snap.csn);
                 if (tx.copy_table != null) out = @min(out, tx.copy_snap.csn);
+                if (transactionSnapshot(tx.isolation)) if (tx.snapshot_csn) |csn| {
+                    out = @min(out, csn);
+                };
                 if (!tx.fresh) if (tx.pin) |pin| { out = @min(out, pin.csn); };
             };
             return out;
@@ -2118,6 +2240,8 @@ pub fn Database(comptime config: Config) type {
             const index = if (kind == .identity) try self.identitySequence(oid, @intCast(amount)) else if (oid != 0) try self.sequenceByOid(oid) else try self.sequenceByName(name);
             const seq = &self.seqs[index];
             const tx = &self.txs[self.seq_slot];
+            // nextval/setval write the sequence: 25006 in a READ ONLY transaction.
+            if (kind != .currval and tx.active and tx.read_only) return error.ReadOnlyTransaction;
             if (kind != .currval and seq.pending_drop and seq.creator != self.seq_slot and self.active(seq.creator)) {
                 // Another transaction is replacing or dropping it: wait, as
                 // nextval/setval wait for PostgreSQL's sequence lock.
@@ -2515,12 +2639,23 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn tableConflict(a: locks_module.TableMode, b: locks_module.TableMode) bool {
-            return a == .access_exclusive or b == .access_exclusive;
+            return locks_module.tableConflicts(a) & @intFromEnum(b) != 0;
         }
 
         /// Table lock held to transaction end; conflicts and FIFO waiters
         /// ahead of us park the statement (fresh snapshot on resume).
+        /// SERIALIZABLE records the read (AccessShare, RowShare) or write.
         fn lockTable(self: *Self, slot: u16, table: usize, mode: locks_module.TableMode) Error!void {
+            if (self.txs[slot].ssi != null) switch (mode) {
+                .access_share, .row_share => try self.ssiRead(slot, table),
+                .row_exclusive, .access_exclusive => try self.ssiWrite(slot, table),
+                else => {},
+            };
+            return self.lockTableMode(slot, table, mode, false);
+        }
+
+        /// The table lock alone (LOCK TABLE); `nowait` is 55P03 on conflict.
+        fn lockTableMode(self: *Self, slot: u16, table: usize, mode: locks_module.TableMode, nowait: bool) Error!void {
             const tx = &self.txs[slot];
             if (self.locks.holdsTableMode(table, slot, mode)) return;
             var waits: L.Set = .{};
@@ -2534,6 +2669,7 @@ pub fn Database(comptime config: Config) type {
                 }
             }
             if (waits.any()) {
+                if (nowait) return error.LockNotAvailable;
                 if (tx.table_wait == null) {
                     self.wait_counter += 1;
                     tx.table_wait = .{ .table = @intCast(table), .mode = mode, .seq = self.wait_counter };
@@ -2549,13 +2685,18 @@ pub fn Database(comptime config: Config) type {
 
         /// EvalPlanQual: from the snapshot-visible version, follow committed
         /// successors to the newest version and report what blocks it.
-        fn target(self: *Self, slot: u16, table_index: usize, version: u32, snap: Snapshot, mode: locks_module.RowMode, waits: *L.Set) Target {
+        /// REPEATABLE READ / SERIALIZABLE: a version changed by a
+        /// transaction that committed after the snapshot is 40001
+        /// ("could not serialize access due to concurrent update").
+        fn target(self: *Self, slot: u16, table_index: usize, version: u32, snap: Snapshot, mode: locks_module.RowMode, waits: *L.Set) Error!Target {
             const table = &self.tables[table_index];
             var current = version;
+            const strict = transactionSnapshot(self.txs[slot].isolation);
             while (true) {
                 const entry = &table.versions[current];
                 if (entry.xmax.epoch != 0) {
                     if (entry.xmax_csn != 0) {
+                        if (strict and entry.xmax_csn > snap.csn) return error.SerializationFailure;
                         current = S.successor(table, current) orelse return .skip;
                         continue;
                     }
@@ -2580,7 +2721,7 @@ pub fn Database(comptime config: Config) type {
             pub fn lock(self: RowLocker, table_index: usize, version: u32) Error!?u32 {
                 const db = self.db;
                 var waits: L.Set = .{};
-                switch (db.target(self.slot, table_index, version, self.snap, self.mode, &waits)) {
+                switch (try db.target(self.slot, table_index, version, self.snap, self.mode, &waits)) {
                     .skip, .authored => return null,
                     .wait => switch (self.wait) {
                         .nowait => return error.LockNotAvailable,
@@ -3020,11 +3161,14 @@ pub fn Database(comptime config: Config) type {
             const entry = &table.versions[version];
             if (entry.xmin_csn == 0 and snap.own(entry.xmin) and entry.xmin_cid == snap.cid) return error.CardinalityViolation;
             var waits: L.Set = .{};
-            const goal = switch (self.target(slot, table_index, version, snap, .write, &waits)) {
+            const goal = switch (try self.target(slot, table_index, version, snap, .write, &waits)) {
                 .wait => return self.park(slot, waits),
                 .ready => |newest| newest,
                 .skip, .authored => return error.CardinalityViolation,
             };
+            // REPEATABLE READ: the conflicting row must be visible to the
+            // snapshot (ExecCheckTupleVisible).
+            if (transactionSnapshot(self.txs[slot].isolation) and !snap.own(table.versions[goal].xmin) and table.versions[goal].xmin_csn > snap.csn) return error.SerializationFailure;
             const row = table.versions[goal].row - 1;
             ctx.tuple[1] = proposed;
             if (!try X.keep(ctx, update.where, &table.versions[goal].cells)) {
@@ -3268,7 +3412,7 @@ pub fn Database(comptime config: Config) type {
                 } else {
                     if (entry.xmax.epoch != 0 and (entry.xmax_csn != 0 or snap.own(entry.xmax))) continue;
                     var waits: L.Set = .{};
-                    switch (self.target(slot, child_index, version, snap, .write, &waits)) {
+                    switch (try self.target(slot, child_index, version, snap, .write, &waits)) {
                         .wait => return self.park(slot, waits),
                         .skip, .authored => continue,
                         .ready => |newest| goal = newest,
@@ -3403,6 +3547,8 @@ pub fn Database(comptime config: Config) type {
         /// conflicting version of another live transaction is left to that
         /// transaction's own check, which then sees this commit.
         pub fn deferredViolation(self: *const Self, slot: u16) Error!void {
+            // SERIALIZABLE: a doomed transaction or pivot cannot commit.
+            if (self.active(slot)) if (self.txs[slot].ssi) |index| try self.ssi.check(index);
             return self.deferredCheck(slot, 0, false);
         }
 
@@ -3844,6 +3990,12 @@ pub fn Database(comptime config: Config) type {
                 if (tx.sub_len >= M.sub_capacity) return error.SavepointCapacity;
                 tx.cid +%= 1;
                 snap = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
+                if (tx.read_only) return error.ReadOnlyTransaction;
+                if (tx.snapshot_csn == null) {
+                    tx.snapshot_csn = self.csn;
+                    tx.snapshot_cid = tx.cid;
+                }
+                if (transactionSnapshot(tx.isolation)) snap.csn = tx.snapshot_csn.?;
                 tx.subs[tx.sub_len] = .{ .statement = true, .write_start = @intCast(tx.write_len), .lock_start = @intCast(tx.lock_len) };
                 tx.sub_len += 1;
             }
@@ -3888,6 +4040,8 @@ pub fn Database(comptime config: Config) type {
             self.seq_slot = slot;
             self.seq_snap = snap;
             self.workspace.query.views = .{ .ptr = self, .rows = &viewRows };
+            self.session_hook = .{ .ptr = self, .call = &sessionCall };
+            self.session.engine = &self.session_hook;
         }
 
         /// One COPY FROM data row: `fields[p]` is field p's text (null =
@@ -4054,7 +4208,7 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[merge.table];
             var chosen: ?*const B.MergeWhen = null;
             var waits: L.Set = .{};
-            const plan = self.target(slot, merge.table, version, snap, .write, &waits);
+            const plan = try self.target(slot, merge.table, version, snap, .write, &waits);
             const goal = switch (plan) {
                 .wait => return self.park(slot, waits),
                 .authored => return error.CardinalityViolation,
@@ -4153,7 +4307,7 @@ pub fn Database(comptime config: Config) type {
             if (table.rows[row].newest == 0) return 0;
             const version = S.visibleAt(table, row, snap) orelse return 0;
             var waits: L.Set = .{};
-            const plan = self.target(slot, update.table, version, snap, .write, &waits);
+            const plan = try self.target(slot, update.table, version, snap, .write, &waits);
             if (plan == .authored) return 1;
             if (!try self.keepJoined(ctx, update.where, joined, &table.versions[version].cells)) return 0;
             const goal = switch (plan) {
@@ -4215,7 +4369,7 @@ pub fn Database(comptime config: Config) type {
             if (table.rows[row].newest == 0) return 0;
             const version = S.visibleAt(table, row, snap) orelse return 0;
             var waits: L.Set = .{};
-            const plan = self.target(slot, delete.table, version, snap, .write, &waits);
+            const plan = try self.target(slot, delete.table, version, snap, .write, &waits);
             if (plan == .authored) return 1;
             if (!try self.keepJoined(ctx, delete.where, joined, &table.versions[version].cells)) return 0;
             const goal = switch (plan) {
@@ -4277,6 +4431,898 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
+        // ---- tx-session lane (session.sig, ssi.sig) ----------------------
+        //
+        // Transaction modes, engine settings, cursors, SQL prepared
+        // statements, LOCK TABLE, advisory locks and LISTEN/NOTIFY. Session
+        // state belongs to the caller's connection (session_state).
+
+        fn transactionSnapshot(level: M.Level) bool {
+            return level == .repeatable_read or level == .serializable;
+        }
+
+        /// PostgreSQL's PlannedStmtRequiresSnapshot: transaction control,
+        /// SET/SHOW/RESET, LOCK TABLE, SET CONSTRAINTS, FETCH/MOVE and
+        /// LISTEN/NOTIFY/UNLISTEN run without taking the first snapshot.
+        fn needsSnapshot(parsed: *const A.Statement) bool {
+            return switch (parsed.*) {
+                .control, .set_constraints => false,
+                .session => |*command| switch (command.*) {
+                    .lock_table, .fetch, .listen, .unlisten, .notify => false,
+                    else => true,
+                },
+                else => true,
+            };
+        }
+
+        fn levelOf(isolation: ast.Isolation, current: M.Level) M.Level {
+            return switch (isolation) {
+                .default => current,
+                .read_uncommitted => .read_uncommitted,
+                .read_committed => .read_committed,
+                .repeatable_read => .repeatable_read,
+                .serializable => .serializable,
+            };
+        }
+
+        fn levelName(level: M.Level) []const u8 {
+            return switch (level) {
+                .read_committed => "read committed",
+                .read_uncommitted => "read uncommitted",
+                .repeatable_read => "repeatable read",
+                .serializable => "serializable",
+            };
+        }
+
+        fn parseLevel(text: []const u8) ?M.Level {
+            if (Sess.sameInsensitive(text, "read committed")) return .read_committed;
+            if (Sess.sameInsensitive(text, "read uncommitted")) return .read_uncommitted;
+            if (Sess.sameInsensitive(text, "repeatable read")) return .repeatable_read;
+            if (Sess.sameInsensitive(text, "serializable")) return .serializable;
+            return null;
+        }
+
+        /// PostgreSQL parse_bool: on/off, true/false, yes/no, 1/0 and unique
+        /// prefixes of true/false/yes/no.
+        fn parseBool(text: []const u8) ?bool {
+            if (text.len == 0) return null;
+            if (Sess.sameInsensitive(text, "on") or Sess.sameInsensitive(text, "1")) return true;
+            if (Sess.sameInsensitive(text, "0")) return false;
+            if (text.len >= 2 and text.len <= 3 and Sess.sameInsensitive(text, "off"[0..text.len])) return false;
+            for ([_][]const u8{ "true", "yes" }) |word| if (text.len <= word.len and Sess.sameInsensitive(text, word[0..text.len])) return true;
+            for ([_][]const u8{ "false", "no" }) |word| if (text.len <= word.len and Sess.sameInsensitive(text, word[0..text.len])) return false;
+            return null;
+        }
+
+        fn onOff(value: bool) []const u8 {
+            return if (value) "on" else "off";
+        }
+
+        fn sessionState(self: *Self) *Sess.State {
+            const state = self.session_state orelse &self.default_session_state;
+            if (state.id == 0) {
+                self.session_counter += 1;
+                state.id = self.session_counter;
+            }
+            return state;
+        }
+
+        /// The installed session state when it follows transaction `slot`.
+        fn ownSession(self: *Self, slot: u16) ?*Sess.State {
+            const state = self.sessionState();
+            const tx = &self.txs[slot];
+            if (state.id != tx.session or state.tx_epoch != tx.epoch) return null;
+            return state;
+        }
+
+        /// Transaction end for the lane: SERIALIZABLE record, committed
+        /// LISTEN/UNLISTEN and NOTIFY (in that order, so a session sees its
+        /// own notifications), cursors and the settings stack.
+        fn endSessionTransaction(self: *Self, slot: u16, committed: bool) void {
+            const tx = &self.txs[slot];
+            if (tx.ssi) |index| {
+                if (committed) self.ssi.commit(index, self.csn) else self.ssi.abort(index);
+                tx.ssi = null;
+            }
+            const state = self.ownSession(slot);
+            if (committed) {
+                if (state) |owner| self.notify.applyListen(owner);
+                self.notify.publish(slot, tx.epoch);
+            } else self.notify.discard(slot, tx.epoch, 0, null);
+            self.cursors.endTransaction(slot, tx.epoch, committed);
+            if (state) |owner| owner.endTransaction(committed);
+            self.statement_settings_cid = null;
+        }
+
+        /// ROLLBACK TO (min_depth = savepoint index + 1) or a failed scope
+        /// (min_depth = savepoint count, `fail`): cursors, NOTIFY entries and
+        /// LISTEN actions taken inside it are dropped.
+        fn sessionRollback(self: *Self, slot: u16, min_depth: usize, fail: bool) void {
+            const tx = &self.txs[slot];
+            self.cursors.rollbackTo(slot, tx.epoch, min_depth);
+            self.notify.discard(slot, tx.epoch, min_depth, null);
+            if (self.ownSession(slot)) |state| {
+                state.discardListen(min_depth);
+                if (fail) state.failScope();
+            }
+        }
+
+        /// SERIALIZABLE: the statement that took the transaction snapshot
+        /// registers the SSI record; READ ONLY DEFERRABLE instead waits for a
+        /// safe snapshot (no active SERIALIZABLE read-write transaction
+        /// holds a snapshot) and then runs untracked.
+        fn serializableSnapshot(self: *Self, slot: u16) Error!void {
+            const tx = &self.txs[slot];
+            if (tx.isolation != .serializable or tx.ssi != null) return;
+            const csn = tx.snapshot_csn orelse return;
+            if (tx.snapshot_cid != tx.cid) return;
+            if (tx.read_only and tx.deferrable) {
+                var waits: L.Set = .{};
+                for (&self.txs, 0..) |*other, index| {
+                    if (index != slot and other.active and other.isolation == .serializable and !other.read_only and other.snapshot_csn != null) waits.add(index);
+                }
+                if (waits.any()) {
+                    tx.fresh = true;
+                    return self.park(slot, waits);
+                }
+                return;
+            }
+            tx.ssi = self.ssi.register(slot, tx.epoch, csn) catch |err| {
+                tx.snapshot_csn = null;
+                return err;
+            };
+        }
+
+        fn ssiRead(self: *Self, slot: u16, table: usize) Error!void {
+            if (self.txs[slot].ssi) |index| try self.ssi.read(index, table);
+        }
+
+        fn ssiWrite(self: *Self, slot: u16, table: usize) Error!void {
+            if (self.txs[slot].ssi) |index| try self.ssi.write(index, table);
+        }
+
+        /// READ ONLY transactions (25006 before anything runs): only plain
+        /// queries and SET CONSTRAINTS.
+        fn readOnlyCheck(bound: *const B.Bound, plans: *const B.Plans) Error!void {
+            switch (bound.*) {
+                .select => |*select| if (select.lock.strength != .none) return error.ReadOnlyTransaction,
+                .query => if (plans.dml_len != 0) return error.ReadOnlyTransaction,
+                .set_constraints, .control => {},
+                else => return error.ReadOnlyTransaction,
+            }
+        }
+
+        /// BEGIN / SET TRANSACTION modes with PostgreSQL's check hooks
+        /// (25001 after the first query or inside a subtransaction).
+        fn applyModes(self: *Self, slot: u16, modes: ast.Characteristics, from_begin: bool) Error!void {
+            const tx = &self.txs[slot];
+            const in_sub = tx.userSavepoints() != 0;
+            const started = tx.snapshot_csn != null;
+            const level = levelOf(modes.isolation, tx.isolation);
+            if (!from_begin and level != tx.isolation and (started or in_sub)) return error.ActiveSqlTransaction;
+            var read_only = tx.read_only;
+            if (modes.read_only) |value| {
+                if (!from_begin and !value and tx.read_only and (started or in_sub)) return error.ActiveSqlTransaction;
+                read_only = value;
+            }
+            var deferrable = tx.deferrable;
+            if (modes.deferrable) |value| {
+                if (!from_begin and (started or in_sub)) return error.ActiveSqlTransaction;
+                deferrable = value;
+            }
+            tx.isolation = level;
+            tx.read_only = read_only;
+            tx.deferrable = deferrable;
+        }
+
+        const SettingKind = enum { search_path, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom };
+
+        fn settingKind(name: []const u8) ?SettingKind {
+            inline for (@typeInfo(SettingKind).@"enum".field_names) |field| {
+                if (!types.same(field, "custom") and Sess.sameInsensitive(name, field)) return @field(SettingKind, field);
+            }
+            // Placeholder variables: prefix.name of identifier characters.
+            var dot = false;
+            if (name.len == 0 or name[0] == '.' or name[name.len - 1] == '.') return null;
+            for (name) |byte| {
+                if (byte == '.') {
+                    dot = true;
+                } else if (!(types.letter(byte) or types.digit(byte) or byte == '$' or byte >= 0x80)) return null;
+            }
+            return if (dot) .custom else null;
+        }
+
+        /// Settings PostgreSQL has that the caller (Store) implements.
+        fn callerSetting(name: []const u8) bool {
+            for ([_][]const u8{ "timezone", "datestyle", "intervalstyle", "application_name", "client_encoding", "statement_timeout", "lock_timeout", "deadlock_timeout", "standard_conforming_strings", "server_version", "server_encoding", "integer_datetimes" }) |known| {
+                if (Sess.sameInsensitive(name, known)) return true;
+            }
+            return false;
+        }
+
+        /// True when the engine owns setting `name` (callers route SET,
+        /// SHOW and RESET of it here).
+        pub fn engineSetting(name: []const u8) bool {
+            return settingKind(name) != null;
+        }
+
+        fn lowerInto(out: *Sess.SettingText, text: []const u8) Error!void {
+            try out.set(text);
+            for (out.bytes[0..out.len]) |*byte| byte.* = types.lower(byte.*);
+        }
+
+        /// quote_identifier: plain lower-case identifiers stay bare.
+        fn appendIdentifier(out: []u8, used: *usize, name: []const u8) Error!void {
+            var plain = name.len != 0 and (types.lower(name[0]) == name[0]) and (types.letter(name[0]));
+            for (name) |byte| plain = plain and (byte == '_' or types.digit(byte) or (byte >= 'a' and byte <= 'z'));
+            if (plain) {
+                var tokens: lexer.Tokenizer = .{ .source = name, .text_limit = config.text_bytes };
+                const token = tokens.next() catch return error.InvalidSettingValue;
+                plain = token.kind == .word and !lexer.reserved(token.keyword);
+            }
+            const extra: usize = if (plain) 0 else 2;
+            var quotes: usize = 0;
+            for (name) |byte| if (byte == '"') {
+                quotes += 1;
+            };
+            if (name.len + quotes + extra > out.len - used.*) return error.SessionCapacity;
+            if (!plain) {
+                out[used.*] = '"';
+                used.* += 1;
+            }
+            for (name) |byte| {
+                out[used.*] = byte;
+                used.* += 1;
+                if (byte == '"') {
+                    out[used.*] = '"';
+                    used.* += 1;
+                }
+            }
+            if (!plain) {
+                out[used.*] = '"';
+                used.* += 1;
+            }
+        }
+
+        /// search_path as PostgreSQL flattens it (GUC_LIST_QUOTE). Name
+        /// resolution here is fixed (pg_catalog, then public), so only lists
+        /// that resolve the same way are accepted: `public` plus any of
+        /// "$user", pg_catalog and pg_temp (0A000 otherwise).
+        fn searchPath(raw: []const u8, kind: SettingValueKind, out: *Sess.SettingText) Error!void {
+            var buffer: [config.setting_bytes]u8 = undefined;
+            var used: usize = 0;
+            var public = false;
+            var elements: usize = 0;
+            var element: [128]u8 = undefined;
+            if (kind == .string) {
+                if (raw.len > element.len) return error.SessionCapacity;
+                @memcpy(element[0..raw.len], raw);
+                try pathElement(element[0..raw.len], &buffer, &used, &elements, &public);
+            } else {
+                var tokens: lexer.Tokenizer = .{ .source = raw, .text_limit = config.text_bytes };
+                var expect = true;
+                while (true) {
+                    const token = tokens.next() catch return error.InvalidSettingValue;
+                    if (token.kind == .end) break;
+                    if (!expect) {
+                        if (token.kind != .symbol or token.symbol != .comma) return error.InvalidSettingValue;
+                        expect = true;
+                        continue;
+                    }
+                    if (token.len > element.len) return error.SessionCapacity;
+                    switch (token.kind) {
+                        .word => for (token.raw(raw), 0..) |byte, index| {
+                            element[index] = types.lower(byte);
+                        },
+                        .quoted_word => lexer.decodeQuotedWith(raw, .{ .start = token.start, .end = token.end, .len = token.len }, '"', &element),
+                        .string => lexer.decodeQuoted(raw, token.quoted(), &element),
+                        else => return error.InvalidSettingValue,
+                    }
+                    try pathElement(element[0..token.len], &buffer, &used, &elements, &public);
+                    expect = false;
+                }
+                if (expect and elements != 0) return error.InvalidSettingValue;
+            }
+            if (!public) return error.UnsupportedStatement;
+            try out.set(buffer[0..used]);
+        }
+
+        fn pathElement(name: []const u8, buffer: []u8, used: *usize, elements: *usize, public: *bool) Error!void {
+            if (types.same(name, "public")) {
+                public.* = true;
+            } else if (!(types.same(name, "$user") or types.same(name, "pg_catalog") or types.same(name, "pg_temp"))) return error.UnsupportedStatement;
+            if (elements.* != 0) {
+                if (buffer.len - used.* < 2) return error.SessionCapacity;
+                buffer[used.*] = ',';
+                buffer[used.* + 1] = ' ';
+                used.* += 2;
+            }
+            try appendIdentifier(buffer, used, name);
+            elements.* += 1;
+        }
+
+        fn assignSetting(into: *Sess.Values, which: SettingKind, name: []const u8, kind: SettingValueKind, value: []const u8) Error!void {
+            switch (which) {
+                .search_path => try searchPath(value, kind, &into.search_path),
+                .default_transaction_isolation => into.isolation = parseLevel(value) orelse return error.InvalidSettingValue,
+                .default_transaction_read_only => into.read_only = parseBool(value) orelse return error.InvalidSettingValue,
+                .default_transaction_deferrable => into.deferrable = parseBool(value) orelse return error.InvalidSettingValue,
+                .custom => {
+                    const index = into.findCustom(name) orelse blk: {
+                        for (&into.custom, 0..) |*entry, candidate| if (!entry.used) {
+                            entry.* = .{ .used = true };
+                            try lowerInto(&entry.name, name);
+                            break :blk candidate;
+                        };
+                        return error.SessionCapacity;
+                    };
+                    if (kind == .word) try lowerInto(&into.custom[index].value, value) else try into.custom[index].value.set(value);
+                },
+                .transaction_isolation, .transaction_read_only, .transaction_deferrable => return error.UnsupportedStatement,
+            }
+        }
+
+        /// Copies one setting from `source` into `target`.
+        fn copySetting(into: *Sess.Values, source: *const Sess.Values, which: SettingKind, name: []const u8) Error!void {
+            switch (which) {
+                .search_path => into.search_path = source.search_path,
+                .default_transaction_isolation => into.isolation = source.isolation,
+                .default_transaction_read_only => into.read_only = source.read_only,
+                .default_transaction_deferrable => into.deferrable = source.deferrable,
+                .custom => {
+                    if (source.findCustom(name)) |index| {
+                        try assignSetting(into, .custom, name, .string, source.custom[index].value.slice());
+                    } else if (into.findCustom(name)) |index| {
+                        // A reset placeholder stays defined, empty.
+                        into.custom[index].value.len = 0;
+                    }
+                },
+                .transaction_isolation, .transaction_read_only, .transaction_deferrable => {},
+            }
+        }
+
+        /// SET [LOCAL] name {TO|=} value | DEFAULT, and set_config. `slot`
+        /// is null outside a transaction block (SET LOCAL then has no
+        /// effect, as PostgreSQL warns).
+        fn setSetting(self: *Self, slot: ?u16, local: bool, name: []const u8, kind: SettingValueKind, value: []const u8) Error!void {
+            const which = settingKind(name) orelse {
+                if (self.settings_provider) |provider| {
+                    if (try provider.set(provider.context, name, value, local, kind == .default)) return;
+                }
+                return if (callerSetting(name)) error.UnsupportedStatement else error.UndefinedSetting;
+            };
+            const state = self.sessionState();
+            switch (which) {
+                .transaction_isolation, .transaction_read_only, .transaction_deferrable => {
+                    const owner = slot orelse return;
+                    var modes: ast.Characteristics = .{};
+                    switch (which) {
+                        .transaction_isolation => {
+                            const level = if (kind == .default) state.values.isolation else parseLevel(value) orelse return error.InvalidSettingValue;
+                            modes.isolation = switch (level) {
+                                .read_committed => .read_committed,
+                                .read_uncommitted => .read_uncommitted,
+                                .repeatable_read => .repeatable_read,
+                                .serializable => .serializable,
+                            };
+                        },
+                        .transaction_read_only => modes.read_only = if (kind == .default) state.values.read_only else parseBool(value) orelse return error.InvalidSettingValue,
+                        else => modes.deferrable = if (kind == .default) state.values.deferrable else parseBool(value) orelse return error.InvalidSettingValue,
+                    }
+                    return self.applyModes(owner, modes, false);
+                },
+                else => {},
+            }
+            var next = state.values;
+            if (kind == .default) try copySetting(&next, &state.startup, which, name) else try assignSetting(&next, which, name, kind, value);
+            if (slot != null) try state.preserve();
+            if (local) {
+                if (slot != null) state.values = next;
+                return;
+            }
+            if (slot == null) {
+                state.values = next;
+                state.base = next;
+                return;
+            }
+            var base = state.base;
+            try copySetting(&base, &next, which, name);
+            state.values = next;
+            state.base = base;
+        }
+
+        /// RESET ALL of the engine settings (transaction modes excepted).
+        fn resetSettings(self: *Self, slot: ?u16) Error!void {
+            const state = self.sessionState();
+            if (slot != null) try state.preserve();
+            state.values = state.startup;
+            state.base = state.startup;
+        }
+
+        /// The current text of setting `name` (engine, else the provider).
+        fn settingText(self: *Self, slot: ?u16, name: []const u8, out: []u8) Error!usize {
+            const which = settingKind(name) orelse {
+                if (self.settings_provider) |provider| {
+                    if (provider.show(provider.context, name, out)) |length| return length;
+                }
+                return if (callerSetting(name)) error.UnsupportedStatement else error.UndefinedSetting;
+            };
+            const state = self.sessionState();
+            const tx: ?*const M.Tx = if (slot) |owner| (if (self.active(owner)) &self.txs[owner] else null) else null;
+            const text: []const u8 = switch (which) {
+                .search_path => state.values.search_path.slice(),
+                .default_transaction_isolation => levelName(state.values.isolation),
+                .default_transaction_read_only => onOff(state.values.read_only),
+                .default_transaction_deferrable => onOff(state.values.deferrable),
+                .transaction_isolation => levelName(if (tx) |t| t.isolation else state.values.isolation),
+                .transaction_read_only => onOff(if (tx) |t| t.read_only else state.values.read_only),
+                .transaction_deferrable => onOff(if (tx) |t| t.deferrable else state.values.deferrable),
+                .custom => blk: {
+                    const index = state.values.findCustom(name) orelse return error.UndefinedSetting;
+                    break :blk state.values.custom[index].value.slice();
+                },
+            };
+            if (text.len > out.len) return error.TextCapacity;
+            @memcpy(out[0..text.len], text);
+            return text.len;
+        }
+
+        /// SHOW name: one text column named after the setting.
+        fn showSetting(self: *Self, slot: ?u16, name: []const u8, result: *Result) Error!void {
+            var text: Text = .{};
+            text.len = try self.settingText(slot, name, &text.bytes);
+            if (comptime config.external_results) if (result.rows.len == 0) return error.RowCapacity;
+            const length = @min(name.len, config.name_bytes);
+            result.clear(0);
+            result.command = .show;
+            result.column_count = 1;
+            result.column_names[0] = .{ .len = length };
+            @memcpy(result.column_names[0].bytes[0..length], name[0..length]);
+            for (result.column_names[0].bytes[0..length]) |*byte| byte.* = types.lower(byte.*);
+            result.column_types[0] = .text;
+            result.column_typmods[0] = -1;
+            result.row_count = 1;
+            result.rows[0].cells[0] = .{ .text = text };
+        }
+
+        fn setCharacteristics(self: *Self, slot: ?u16, modes: ast.Characteristics) Error!void {
+            if (modes.isolation != .default) try self.setSetting(slot, false, "default_transaction_isolation", .string, levelName(levelOf(modes.isolation, .read_committed)));
+            if (modes.read_only) |value| try self.setSetting(slot, false, "default_transaction_read_only", .word, onOff(value));
+            if (modes.deferrable) |value| try self.setSetting(slot, false, "default_transaction_deferrable", .word, onOff(value));
+        }
+
+        /// Settings before the running statement's first set_config.
+        fn saveStatementSettings(self: *Self, slot: u16) void {
+            const tx = &self.txs[slot];
+            if (self.statement_settings_cid) |cid| if (cid == tx.cid) return;
+            const state = self.sessionState();
+            self.statement_settings = state.values;
+            self.statement_base = state.base;
+            self.statement_settings_cid = tx.cid;
+        }
+
+        // ---- public session API (Store.Connection) -----------------------
+
+        /// SET of an engine setting; `slot` is the open transaction block.
+        pub fn sessionSet(self: *Self, slot: ?u16, local: bool, name: []const u8, kind: SettingValueKind, value: []const u8) Error!void {
+            return self.setSetting(slot, local, name, kind, value);
+        }
+
+        pub fn sessionShow(self: *Self, slot: ?u16, name: []const u8, result: *Result) Error!void {
+            return self.showSetting(slot, name, result);
+        }
+
+        /// Writes the current text of an engine setting into `out`.
+        pub fn sessionSettingText(self: *Self, slot: ?u16, name: []const u8, out: []u8) Error!usize {
+            return self.settingText(slot, name, out);
+        }
+
+        /// RESET name, or RESET ALL (null).
+        pub fn sessionReset(self: *Self, slot: ?u16, name: ?[]const u8) Error!void {
+            if (name) |text| return self.setSetting(slot, false, text, .default, "");
+            try self.resetSettings(slot);
+        }
+
+        /// BEGIN / START TRANSACTION modes of a block just begun.
+        pub fn beginModes(self: *Self, slot: u16, modes: ast.Characteristics) Error!void {
+            return self.applyModes(slot, modes, true);
+        }
+
+        /// SET TRANSACTION in a block.
+        pub fn setTransaction(self: *Self, slot: u16, modes: ast.Characteristics) Error!void {
+            return self.applyModes(slot, modes, false);
+        }
+
+        /// SET SESSION CHARACTERISTICS AS TRANSACTION (default_transaction_*).
+        pub fn sessionCharacteristics(self: *Self, slot: ?u16, modes: ast.Characteristics) Error!void {
+            return self.setCharacteristics(slot, modes);
+        }
+
+        /// The next notification for the installed session (call between
+        /// transactions, as PostgreSQL delivers them).
+        pub fn takeNotification(self: *Self, out: *Notification) bool {
+            const state = self.sessionState();
+            return self.notify.take(state.id, out);
+        }
+
+        /// Session end: its cursors, LISTEN registration, session-level
+        /// advisory locks and prepared statements go.
+        pub fn endSession(self: *Self) void {
+            const state = self.sessionState();
+            self.cursors.closeSession(state.id);
+            self.notify.removeListener(state.id);
+            self.locks.releaseAdvisoryAll(state.id);
+            self.wake_epoch +%= 1;
+            const id = state.id;
+            state.* = .{};
+            state.id = id;
+        }
+
+        pub const SessionUsage = struct { cursors: usize, cursor_rows: usize, listeners: usize, pending_notifications: usize, queued_notifications: u64, advisory_locks: usize, serializable_records: usize };
+
+        pub fn sessionUsage(self: *const Self) SessionUsage {
+            var listeners: usize = 0;
+            for (&self.notify.listeners) |*listener| if (listener.used) {
+                listeners += 1;
+            };
+            return .{ .cursors = self.cursors.openCount(), .cursor_rows = self.cursors.used_rows, .listeners = listeners, .pending_notifications = self.notify.pendingCount(), .queued_notifications = self.notify.head - self.notify.tail(), .advisory_locks = self.locks.advisoryUsed(), .serializable_records = self.ssi.used() };
+        }
+
+        // ---- statements --------------------------------------------------
+
+        fn runControl(self: *Self, slot: u16, source: []const u8, command: ast.Control, result: *Result) Error!void {
+            switch (command) {
+                // Already in a transaction block: PostgreSQL warns and ignores it.
+                .begin => self.outcome = .{ .command = .begin },
+                .commit, .rollback, .savepoint, .release, .rollback_to => return error.UnsupportedStatement,
+                .set => |set| {
+                    var name: ControlText = .{};
+                    try settingName(source, set.name, &name);
+                    var value: ControlText = .{};
+                    const kind = try settingValue(source, set.value, &value);
+                    try self.setSetting(slot, set.local, name.slice(), kind, value.slice());
+                    self.outcome = .{ .command = .set };
+                },
+                .set_transaction => |modes| {
+                    try self.applyModes(slot, modes, false);
+                    self.outcome = .{ .command = .set };
+                },
+                .set_session_characteristics => |modes| {
+                    try self.setCharacteristics(slot, modes);
+                    self.outcome = .{ .command = .set };
+                },
+                .show => |setting| {
+                    var name: ControlText = .{};
+                    try settingName(source, setting, &name);
+                    try self.showSetting(slot, name.slice(), result);
+                    self.outcome = .{ .command = .show };
+                },
+                .reset => |setting| {
+                    if (setting) |which| {
+                        var name: ControlText = .{};
+                        try settingName(source, which, &name);
+                        try self.setSetting(slot, false, name.slice(), .default, "");
+                    } else try self.resetSettings(slot);
+                    self.outcome = .{ .command = .reset };
+                },
+            }
+        }
+
+        fn runSession(self: *Self, slot: u16, source: []const u8, command: *const A.SessionCommand, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
+            const tx = &self.txs[slot];
+            const state = self.sessionState();
+            const depth = tx.userSavepoints();
+            switch (command.*) {
+                .lock_table => |*lock| {
+                    try self.lockTables(slot, source, lock, snap);
+                    self.outcome = .{ .command = .lock_table };
+                },
+                .declare => |*declare| try self.declareCursor(slot, source, declare, snap, result, mode),
+                .fetch => |*fetch| try self.fetchCursor(source, fetch, result),
+                .close => |close| {
+                    if (close.all) {
+                        self.cursors.closeSession(state.id);
+                    } else {
+                        var name: ControlText = .{};
+                        try decodeIdent(source, close.name, &name);
+                        const index = self.cursors.find(state.id, name.slice()) orelse return error.PortalNotFound;
+                        self.cursors.close(index);
+                    }
+                    self.outcome = .{ .command = .close_cursor };
+                },
+                .prepare => |*prepare| try self.prepareStatement(source, prepare, snap, mode),
+                .execute => |*run| try self.executePrepared(slot, source, run, snap, result, mode),
+                .deallocate => |deallocate| {
+                    if (deallocate.all) {
+                        for (&state.prepared) |*entry| entry.used = false;
+                    } else {
+                        var name: ControlText = .{};
+                        try decodeIdent(source, deallocate.name, &name);
+                        const index = state.findPrepared(name.slice()) orelse return error.StatementNotFound;
+                        state.prepared[index].used = false;
+                    }
+                    self.outcome = .{ .command = .deallocate };
+                },
+                .listen => |ident| {
+                    var name: ControlText = .{};
+                    try decodeIdent(source, ident, &name);
+                    if (!self.notify.listenRoom(state, name.slice())) return error.SessionCapacity;
+                    try state.pushListen(.listen, name.slice(), depth);
+                    self.outcome = .{ .command = .listen };
+                },
+                .unlisten => |unlisten| {
+                    if (unlisten.all) {
+                        try state.pushListen(.unlisten_all, "", depth);
+                    } else {
+                        var name: ControlText = .{};
+                        try decodeIdent(source, unlisten.name, &name);
+                        try state.pushListen(.unlisten, name.slice(), depth);
+                    }
+                    self.outcome = .{ .command = .unlisten };
+                },
+                .notify => |notify| {
+                    var channel: ControlText = .{};
+                    try decodeIdent(source, notify.channel, &channel);
+                    var payload: Text = .{};
+                    if (notify.payload) |quoted| {
+                        if (quoted.len > payload.bytes.len) return error.TextCapacity;
+                        lexer.decodeQuoted(source, quoted, &payload.bytes);
+                        payload.len = quoted.len;
+                    }
+                    try self.notify.enqueue(slot, tx.epoch, depth, tx.cid, channel.slice(), payload.slice(), state.pid);
+                    self.outcome = .{ .command = .notify };
+                },
+            }
+        }
+
+        /// LOCK TABLE: each listed table (and, without ONLY, its
+        /// inheritance children and partitions) in `mode`, waiting in FIFO
+        /// order like any table lock (NOWAIT: 55P03). Only in a transaction
+        /// block (25P01); modes above ROW EXCLUSIVE are 25006 in a READ ONLY
+        /// transaction. Views are 0A000, sequences 42809.
+        fn lockTables(self: *Self, slot: u16, source: []const u8, lock: anytype, snap: Snapshot) Error!void {
+            if (self.statement_implicit) return error.NoActiveTransaction;
+            if (self.txs[slot].read_only and @intFromEnum(lock.mode) > @intFromEnum(ast.TableLockMode.row_exclusive)) return error.ReadOnlyTransaction;
+            const mode: locks_module.TableMode = switch (lock.mode) {
+                .access_share => .access_share,
+                .row_share => .row_share,
+                .row_exclusive => .row_exclusive,
+                .share_update_exclusive => .share_update_exclusive,
+                .share => .share,
+                .share_row_exclusive => .share_row_exclusive,
+                .exclusive => .exclusive,
+                .access_exclusive => .access_exclusive,
+            };
+            for (lock.tables[0..lock.count], lock.only[0..lock.count]) |reference, only| {
+                const schema_name = if (reference.schema) |qualifier| identName(source, qualifier) else Name{};
+                const namespace = namespaceFor(&self.catalog, if (reference.schema != null) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
+                const found = self.catalog.findIn(namespace, identName(source, reference.name).slice(), snap) orelse return error.TableNotFound;
+                switch (found.kind) {
+                    'r', 'p' => {},
+                    'v', 'm' => return error.UnsupportedStatement,
+                    else => return error.WrongObjectType,
+                }
+                var members: [config.tables]usize = undefined;
+                members[0] = found.slot;
+                var count: usize = 1;
+                if (!only) {
+                    var relations: [K.relation_rows]K.Found = undefined;
+                    const relation_count = self.catalog.visibleRelations(snap, &relations);
+                    var next: usize = 0;
+                    while (next < count) : (next += 1) {
+                        const oid = self.tables[members[next]].oid;
+                        for (relations[0..relation_count]) |relation| {
+                            if (relation.kind == 'S' or self.tables[relation.slot].parent != oid or count == members.len) continue;
+                            members[count] = relation.slot;
+                            count += 1;
+                        }
+                    }
+                }
+                for (members[0..count]) |member| try self.lockTableMode(slot, member, mode, lock.nowait);
+            }
+        }
+
+        /// DECLARE: runs the query under the statement snapshot and keeps its
+        /// rows in the shared cursor pool.
+        fn declareCursor(self: *Self, slot: u16, source: []const u8, declare: anytype, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
+            const tx = &self.txs[slot];
+            if (!declare.hold and self.statement_implicit) return error.NoActiveTransaction;
+            if (declare.binary) return error.UnsupportedStatement;
+            const state = self.sessionState();
+            var name: ControlText = .{};
+            try decodeIdent(source, declare.name, &name);
+            if (name.len > config.name_bytes) return error.NameCapacity;
+            if (self.cursors.find(state.id, name.slice()) != null) return error.DuplicatePortal;
+            const index = self.cursors.free() orelse return error.SessionCapacity;
+            const inner_source = source[declare.body..];
+            const inner = try P.parse(inner_source, &self.workspace.nodes, mode);
+            const locking = switch (inner) {
+                .select, .query => |query| self.workspace.nodes.queries[query].lock.strength != .none,
+                else => return error.Syntax,
+            };
+            // PostgreSQL: FOR UPDATE/SHARE cursors cannot be SCROLL or WITH HOLD.
+            if (locking and ((declare.scroll orelse false) or declare.hold)) return error.UnsupportedStatement;
+            try self.body(slot, inner_source, &inner, snap, result, mode);
+            const rows = result.row_count;
+            if (rows > Sess.cursor_row_capacity - self.cursors.used_rows) return error.SessionCapacity;
+            const columns = result.column_count;
+            const cursor = &self.cursors.slots[index];
+            cursor.* = .{ .used = true, .session = state.id, .hold = declare.hold, .scroll = declare.scroll orelse true, .epoch = tx.epoch, .slot = slot, .depth = tx.userSavepoints(), .column_count = columns, .base = self.cursors.used_rows, .count = rows };
+            @memcpy(cursor.name.bytes[0..name.len], name.slice());
+            cursor.name.len = name.len;
+            @memcpy(cursor.names[0..columns], result.column_names[0..columns]);
+            @memcpy(cursor.column_types[0..columns], result.column_types[0..columns]);
+            @memcpy(cursor.typmods[0..columns], result.column_typmods[0..columns]);
+            for (0..rows) |row| @memcpy(self.cursors.rows[cursor.base + row].cells[0..columns], result.rows[row].cells[0..columns]);
+            self.cursors.used_rows += rows;
+            result.clear(0);
+            self.outcome = .{ .command = .declare_cursor };
+        }
+
+        /// FETCH / MOVE (PostgreSQL's cursor positions: 0 before the first
+        /// row, count + 1 after the last). A NO SCROLL cursor never moves
+        /// backward (55000, "cursor can only scan forward").
+        fn fetchCursor(self: *Self, source: []const u8, fetch: anytype, result: *Result) Error!void {
+            const state = self.sessionState();
+            var name: ControlText = .{};
+            try decodeIdent(source, fetch.name, &name);
+            const index = self.cursors.find(state.id, name.slice()) orelse return error.PortalNotFound;
+            const cursor = &self.cursors.slots[index];
+            const total = cursor.count;
+            const position = cursor.position;
+            const step: Sess.Move = switch (fetch.direction) {
+                .absolute => Sess.absoluteMove(total, fetch.count),
+                .relative => Sess.relativePosition(position, total, fetch.count),
+                .forward, .backward => blk: {
+                    var forward = fetch.direction == .forward;
+                    if (fetch.all) break :blk Sess.relativeMove(position, total, forward, 0xffffffffffffffff);
+                    if (fetch.count == 0) break :blk Sess.relativePosition(position, total, 0);
+                    if (fetch.count < 0) forward = !forward;
+                    break :blk Sess.relativeMove(position, total, forward, @abs(fetch.count));
+                },
+            };
+            if (!cursor.scroll and ((step.rows != 0 and step.first <= position) or step.position < position)) return error.ObjectNotInPrerequisiteState;
+            if (fetch.move) {
+                cursor.position = step.position;
+                self.outcome = .{ .affected = step.rows, .command = .move };
+                return;
+            }
+            if (step.rows > result.rows.len) return error.RowCapacity;
+            const columns = cursor.column_count;
+            result.clear(0);
+            result.command = .fetch;
+            result.column_count = columns;
+            @memcpy(result.column_names[0..columns], cursor.names[0..columns]);
+            @memcpy(result.column_types[0..columns], cursor.column_types[0..columns]);
+            @memcpy(result.column_typmods[0..columns], cursor.typmods[0..columns]);
+            for (0..step.rows) |row| {
+                const at = if (step.backward) step.first - row else step.first + row;
+                @memcpy(result.rows[row].cells[0..columns], self.cursors.rows[cursor.base + at - 1].cells[0..columns]);
+            }
+            result.row_count = step.rows;
+            cursor.position = step.position;
+            self.outcome = .{ .command = .fetch };
+        }
+
+        fn prepareStatement(self: *Self, source: []const u8, prepare: anytype, snap: Snapshot, mode: ParseMode) Error!void {
+            const state = self.sessionState();
+            var name: ControlText = .{};
+            try decodeIdent(source, prepare.name, &name);
+            if (name.len > config.name_bytes) return error.NameCapacity;
+            if (state.findPrepared(name.slice()) != null) return error.DuplicateStatement;
+            var text = source[prepare.body..];
+            while (text.len != 0 and (text[text.len - 1] == ';' or text[text.len - 1] == ' ' or text[text.len - 1] == '\n' or text[text.len - 1] == '\r' or text[text.len - 1] == '\t')) text = text[0 .. text.len - 1];
+            if (text.len > config.prepared_bytes) return error.SessionCapacity;
+            var slot_index: ?usize = null;
+            for (&state.prepared, 0..) |*entry, index| if (!entry.used) {
+                slot_index = index;
+                break;
+            };
+            const index = slot_index orelse return error.SessionCapacity;
+            var params: B.Parameters = .{ .count = prepare.count };
+            for (0..prepare.count) |position| params.types[position] = prepare.types[position];
+            // Parse analysis now, as PostgreSQL's PREPARE (42P01, 42703 ...).
+            const inner = try P.parse(text, &self.workspace.nodes, mode);
+            self.active_params = &params;
+            defer self.active_params = null;
+            var copy = inner;
+            const expanded = try expandRelations(self, &self.workspace, text, snap, &copy);
+            var context = self.bindContext(expanded, mode, snap);
+            context.describe_only = true;
+            _ = try B.bind(&context, &copy);
+            const entry = &state.prepared[index];
+            entry.* = .{ .used = true, .count = prepare.count };
+            @memcpy(entry.name.bytes[0..name.len], name.slice());
+            entry.name.len = name.len;
+            @memcpy(entry.text[0..text.len], text);
+            entry.len = text.len;
+            for (0..prepare.count) |position| {
+                entry.types[position] = prepare.types[position];
+                entry.typmods[position] = prepare.typmods[position];
+            }
+            self.outcome = .{ .command = .prepare };
+        }
+
+        /// EXECUTE: the arguments are bound without FROM, coerced to the
+        /// declared types (assignment) and evaluated; the stored statement
+        /// then runs as this statement with them as $1..$n.
+        fn executePrepared(self: *Self, slot: u16, source: []const u8, command: anytype, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
+            const state = self.sessionState();
+            var name: ControlText = .{};
+            try decodeIdent(source, command.name, &name);
+            const index = state.findPrepared(name.slice()) orelse return error.StatementNotFound;
+            const prepared = &state.prepared[index];
+            // "wrong number of parameters for prepared statement" (42601).
+            if (command.count != prepared.count) return error.Syntax;
+            var params: B.Parameters = .{ .count = prepared.count };
+            for (0..prepared.count) |position| params.types[position] = prepared.types[position];
+            if (prepared.count != 0) {
+                var context = self.bindContext(source, mode, snap);
+                context.plans = null;
+                var ids: [config.statement_parameters]u16 = undefined;
+                try B.bindArguments(&context, command.args, &params, &ids);
+                const eval_context = self.evalContext(source);
+                for (0..prepared.count) |position| {
+                    var cell = try E.eval(&eval_context, ids[position]);
+                    const ty = self.workspace.nodes.nodes[ids[position]].ty;
+                    if (cell != .null_value and ty != params.types[position]) cell = try Io.cast(cell, ty, params.types[position], -1, &self.session);
+                    self.param_values[position] = cell;
+                }
+            }
+            const text = prepared.source();
+            const inner = try P.parse(text, &self.workspace.nodes, mode);
+            self.active_params = &params;
+            self.session.params = @ptrCast(&self.param_values);
+            defer {
+                self.active_params = null;
+                self.session.params = null;
+            }
+            try self.body(slot, text, &inner, snap, result, mode);
+        }
+
+        /// current_setting / set_config / advisory locks / pg_backend_pid
+        /// for the running statement (Session.engine).
+        fn sessionCall(ptr: *anyopaque, kind: value_module.SessionCall, a: []const u8, b: []const u8, x: i64, y: i64, flags: u8, out: []u8) Error!value_module.SessionReply {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const slot = self.seq_slot;
+            switch (kind) {
+                .backend_pid => return .{ .integer = self.sessionState().pid },
+                .current_setting => {
+                    const length = self.settingText(slot, a, out) catch |err| {
+                        if (err == error.UndefinedSetting and flags & 1 != 0) return .{ .null_value = true };
+                        return err;
+                    };
+                    return .{ .len = length };
+                },
+                .set_config => {
+                    if (a.len == 0) return error.InvalidParameterValue;
+                    self.saveStatementSettings(slot);
+                    try self.setSetting(slot, flags & 1 != 0, a, if (flags & 2 != 0) .default else .string, b);
+                    return .{ .len = try self.settingText(slot, a, out) };
+                },
+                .advisory_try_lock, .advisory_unlock => {
+                    const raw: u64 = if (flags & 4 != 0) (@as(u64, @bitCast(x)) << 32) | (@as(u64, @bitCast(y)) & 0xffffffff) else @bitCast(x);
+                    const key: locks_module.AdvisoryKey = .{ .key = @bitCast(raw), .pair = flags & 4 != 0 };
+                    const state = self.sessionState();
+                    const exclusive = flags & 1 == 0;
+                    if (kind == .advisory_unlock) {
+                        const released = self.locks.releaseAdvisorySession(key, state.id, exclusive);
+                        if (released) self.wake_epoch +%= 1;
+                        return .{ .integer = if (released) 1 else 0 };
+                    }
+                    const xact = flags & 2 != 0;
+                    var waits: L.Set = .{};
+                    var conflict = false;
+                    self.locks.advisoryHolders(key, state.id, exclusive, &.{}, &.{}, &waits, &conflict);
+                    if (conflict) return .{ .integer = 0 };
+                    const index = try self.locks.grantAdvisory(key, state.id, slot, xact, exclusive);
+                    if (xact) try M.recordLock(self, slot, .{ .kind = .advisory, .table = 0, .mode = if (exclusive) 1 else 0, .index = @intCast(index) });
+                    return .{ .integer = 1 };
+                },
+                else => return error.UnsupportedStatement,
+            }
+        }
+
         // ---- control commands and description ---------------------------
 
         fn decodeIdent(source: []const u8, ident: ast.Ident, out: *ControlText) Error!void {
@@ -4301,6 +5347,14 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn settingValue(source: []const u8, value: ast.SettingValue, out: *ControlText) Error!SettingValueKind {
+            if (value.list_end != 0) {
+                // A list (search_path TO a, b): the raw text, normalized by the setting.
+                const raw = source[value.list_start..value.list_end];
+                if (raw.len > out.bytes.len) return error.InvalidSettingValue;
+                out.len = raw.len;
+                @memcpy(out.bytes[0..raw.len], raw);
+                return .word;
+            }
             switch (value.kind) {
                 .default => out.len = 0,
                 .word, .number => {
@@ -4352,7 +5406,7 @@ pub fn Database(comptime config: Config) type {
             };
             var out: Control = .none;
             switch (command) {
-                .begin => |level| out = .{ .begin = level },
+                .begin => |modes| out = .{ .begin = modes },
                 .commit => out = .commit,
                 .rollback => out = .rollback,
                 .savepoint => |name| {
@@ -4372,7 +5426,8 @@ pub fn Database(comptime config: Config) type {
                     try settingName(source, set.name, &out.set.name);
                     out.set.kind = try settingValue(source, set.value, &out.set.value);
                 },
-                .set_transaction => |level| out = .{ .set_transaction = level },
+                .set_transaction => |modes| out = .{ .set_transaction = modes },
+                .set_session_characteristics => |modes| out = .{ .set_session_characteristics = modes },
                 .show => |name| {
                     out = .{ .show = .{} };
                     try settingName(source, name, &out.show);

@@ -142,6 +142,38 @@ pub const Config = struct {
     /// IndexCapacity (54000) and memory plans are unchanged. bindStorage
     /// callers bind any count per table through Backing.index_slots.
     external_indexes: usize = 0,
+    /// Tx-session lane (session.sig). Every limit below is SessionCapacity
+    /// (54000) when exceeded, with nothing changed.
+    /// Declared parameters of one SQL prepared statement (PREPARE).
+    statement_parameters: usize = 16,
+    /// SQL prepared statements per session and the text bytes of each.
+    prepared_statements: usize = 8,
+    prepared_bytes: usize = 1024,
+    /// Open cursors of all sessions, and the materialized rows they share
+    /// (inline in the Database; 0 selects result_rows).
+    cursors: usize = 4,
+    cursor_rows: usize = 64,
+    /// Placeholder (`prefix.name`) settings per session, and the bytes of
+    /// an engine setting name or value (search_path, placeholders).
+    custom_settings: usize = 4,
+    setting_bytes: usize = 64,
+    /// Savepoint levels of one transaction that can change engine
+    /// settings (each keeps the level's starting values).
+    setting_snapshots: usize = 4,
+    /// LISTEN channels per session (also its pending LISTEN/UNLISTEN
+    /// actions), listening sessions, committed notifications not yet read
+    /// by every listener, uncommitted NOTIFY entries of all transactions
+    /// and the payload bytes of one notification.
+    listen_channels: usize = 8,
+    listeners: usize = 8,
+    notify_queue: usize = 32,
+    notify_pending: usize = 16,
+    notify_payload_bytes: usize = 256,
+    /// Advisory-lock keys held or awaited at once (all sessions).
+    advisory_locks: usize = 32,
+    /// SERIALIZABLE transaction records (active, and committed ones that
+    /// overlap an active one); 0 selects 2 x transactions.
+    serializable_transactions: usize = 0,
 };
 
 pub fn workRows(comptime config: Config) usize {
@@ -345,6 +377,20 @@ pub const Error = error{
     InvalidTablesampleArgument,
     /// SQLSTATE 2202G: NULL TABLESAMPLE REPEATABLE seed (B11).
     InvalidTablesampleRepeat,
+    /// SQLSTATE 25001: a transaction mode set after the first query or in
+    /// a subtransaction.
+    ActiveSqlTransaction,
+    /// SQLSTATE 26000: no such SQL prepared statement.
+    StatementNotFound,
+    /// SQLSTATE 34000: no such cursor.
+    PortalNotFound,
+    /// SQLSTATE 42P05: the prepared statement name is taken.
+    DuplicateStatement,
+    /// SQLSTATE 42P03: the cursor name is taken.
+    DuplicatePortal,
+    /// SQLSTATE 54000: a tx-session capacity (cursors, prepared statements,
+    /// settings, LISTEN, NOTIFY queue, advisory locks, SERIALIZABLE records).
+    SessionCapacity,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -815,7 +861,7 @@ pub fn typeFromOid(oid: u32) ?DataType {
 pub const DefaultKind = enum(u8) { none = 0, default = 1, identity_always = 2, identity_by_default = 3, generated = 4 };
 
 /// Statement kind of a completed (or described) statement.
-pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_index, drop_index, create_view, drop_view, create_materialized_view, drop_materialized_view, refresh_materialized_view, merge, set_constraints, create_table_as };
+pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_index, drop_index, create_view, drop_view, create_materialized_view, drop_materialized_view, refresh_materialized_view, merge, set_constraints, create_table_as, lock_table, declare_cursor, fetch, move, close_cursor, prepare, deallocate, listen, notify, unlisten };
 
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;

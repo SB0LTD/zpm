@@ -500,13 +500,39 @@ pub fn Session(comptime DB: type) type {
         }
         fn ready(self: *Self, db: *DB, w: *Writer) !void {
             _ = self;
-            // Changed reported settings precede ReadyForQuery, as PostgreSQL's
-            // ReportChangedGUCOptions.
+            // Committed notifications for this session (between transactions,
+            // as PostgreSQL's ProcessCompletedNotifies), then changed reported
+            // settings, before ReadyForQuery.
+            try writeNotifications(db, w);
             if (@hasDecl(DB, "takeParameterChanges")) try reportParameters(db, w, db.takeParameterChanges());
             const p = try w.begin('Z');
             try w.byte(if (@hasDecl(DB, "transactionStatus")) db.transactionStatus() else 'I');
             w.end(p);
         }
+        /// NotificationResponse ('A'): sender pid, channel, payload.
+        fn writeNotifications(db: *DB, w: *Writer) !void {
+            if (!@hasDecl(DB, "takeNotification")) return;
+            var note: DB.Notification = undefined;
+            while (db.takeNotification(&note)) {
+                const p = try w.begin('A');
+                try w.u32be(note.pid);
+                try w.string(note.channel.slice());
+                try w.string(note.payloadSlice());
+                w.end(p);
+            }
+        }
+
+        /// Notifications committed while the client is idle (PostgreSQL
+        /// sends them asynchronously): call when the connection has no
+        /// pending input. Returns the bytes written.
+        pub fn notifications(self: *Self, db: *DB, output: []u8) error{BufferTooSmall}!usize {
+            if (!self.startup or self.copy.mode != .none) return 0;
+            if (@hasDecl(DB, "transactionStatus")) if (db.transactionStatus() != 'I') return 0;
+            var w: Writer = .{ .bytes = output };
+            writeNotifications(db, &w) catch return error.BufferTooSmall;
+            return w.at;
+        }
+
         fn dispatch(self: *Self, db: *DB, tag: u8, body: []const u8, w: *Writer) !bool {
             var r: Reader = .{ .bytes = body };
             switch (tag) {
@@ -647,6 +673,7 @@ pub fn Session(comptime DB: type) type {
             self.result.affected_rows = 0;
             if (@hasField(DB.Result, "command")) self.result.command = .none;
             self.commit_rolled_back = false;
+            if (@hasDecl(DB, "setBackendPid")) db.setBackendPid(self.backend_pid);
             const command_source = trim(source);
             if (keyword(command_source, "begin") or keyword(command_source, "begin work") or keyword(command_source, "begin transaction") or keyword(command_source, "start transaction")) {
                 if (@hasDecl(DB, "transactionStatus") and db.transactionStatus() == 'E') return error.TransactionFailed;
@@ -658,7 +685,13 @@ pub fn Session(comptime DB: type) type {
                 if (@hasDecl(DB, "rollbackTransaction")) try db.rollbackTransaction() else return error.UnsupportedStatement;
             } else if (word(source, "deallocate")) {
                 if (@hasDecl(DB, "transactionStatus") and db.transactionStatus() == 'E') return error.TransactionFailed;
-                try self.deallocate(source);
+                // Protocol-level statements first; SQL PREPARE names (and
+                // DEALLOCATE ALL) belong to the engine too.
+                const forward = self.deallocate(source) catch |err| switch (err) {
+                    error.StatementNotFound => if (@hasDecl(DB, "takeNotification")) true else return err,
+                    else => return err,
+                };
+                if (forward and @hasDecl(DB, "takeNotification")) try db.execute(source, &self.result);
             } else {
                 try db.execute(source, &self.result);
                 // ROLLBACK TO closes portals created after the savepoint.
@@ -1067,7 +1100,10 @@ pub fn Session(comptime DB: type) type {
             try db.describe(source, &self.result);
         }
 
-        fn deallocate(self: *Self, source: []const u8) !void {
+        /// Returns true when the engine should see the command as well
+        /// (DEALLOCATE ALL); a name that is no protocol statement is
+        /// StatementNotFound.
+        fn deallocate(self: *Self, source: []const u8) !bool {
             var tokens: Tokens = .{ .source = source };
             if (!keyword(try tokens.next(), "deallocate")) return error.Syntax;
             var name = try tokens.next();
@@ -1078,7 +1114,7 @@ pub fn Session(comptime DB: type) type {
             if (next.len != 0) return error.Syntax;
             if (keyword(name, "all")) {
                 for (&self.statements) |*s| s.live = false;
-                return;
+                return true;
             }
             var unquoted: [64]u8 = undefined;
             if (name[0] == '"') {
@@ -1098,6 +1134,7 @@ pub fn Session(comptime DB: type) type {
             } else if (!identifier(name)) return error.Syntax;
             const s = try self.statement(name);
             s.live = false;
+            return false;
         }
         fn statement(self: *Self, name: []const u8) !*Statement {
             for (&self.statements) |*s| if (s.live and equal(s.name.slice(), name)) return s;
@@ -1389,6 +1426,16 @@ pub fn Session(comptime DB: type) type {
                 .set => "set",
                 .show => "show",
                 .reset => "reset",
+                .lock_table => "lock_table",
+                .declare_cursor => "declare_cursor",
+                .fetch => "fetch",
+                .move => "move",
+                .close_cursor => "close_cursor",
+                .prepare => "prepare",
+                .deallocate => "deallocate",
+                .listen => "listen",
+                .notify => "notify",
+                .unlisten => "unlisten",
                 else => "",
             };
         }
@@ -1397,7 +1444,29 @@ pub fn Session(comptime DB: type) type {
         }
         fn commandFor(w: *Writer, source: []const u8, completed_command: []const u8, row_count: usize, affected: usize, rolled_back: bool) !void {
             const p = try w.begin('C');
-            if (equal(completed_command, "create_sequence")) {
+            if (equal(completed_command, "lock_table")) {
+                try w.append("LOCK TABLE");
+            } else if (equal(completed_command, "declare_cursor")) {
+                try w.append("DECLARE CURSOR");
+            } else if (equal(completed_command, "fetch")) {
+                try w.append("FETCH ");
+                try w.number(@intCast(row_count));
+            } else if (equal(completed_command, "move")) {
+                try w.append("MOVE ");
+                try w.number(@intCast(affected));
+            } else if (equal(completed_command, "close_cursor")) {
+                try w.append("CLOSE CURSOR");
+            } else if (equal(completed_command, "prepare")) {
+                try w.append("PREPARE");
+            } else if (equal(completed_command, "deallocate")) {
+                try w.append(if (deallocateAll(source)) "DEALLOCATE ALL" else "DEALLOCATE");
+            } else if (equal(completed_command, "listen")) {
+                try w.append("LISTEN");
+            } else if (equal(completed_command, "notify")) {
+                try w.append("NOTIFY");
+            } else if (equal(completed_command, "unlisten")) {
+                try w.append("UNLISTEN");
+            } else if (equal(completed_command, "create_sequence")) {
                 try w.append("CREATE SEQUENCE");
             } else if (equal(completed_command, "drop_sequence")) {
                 try w.append("DROP SEQUENCE");
@@ -1428,6 +1497,11 @@ pub fn Session(comptime DB: type) type {
             w.end(p);
         }
     };
+}
+
+fn deallocateAll(source: []const u8) bool {
+    const text = trim(source);
+    return text.len >= 3 and keyword(text[text.len - 3 ..], "all") and (text.len == 3 or text[text.len - 4] == ' ' or text[text.len - 4] == '\t' or text[text.len - 4] == '\n');
 }
 
 fn parameter(w: *Writer, key: []const u8, value: []const u8) !void {
@@ -1568,6 +1642,8 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "DuplicateStatement")) return "42P05";
     if (equal(name, "DuplicatePortal")) return "42P03";
     if (equal(name, "TransactionFailed")) return "25P02";
+    if (equal(name, "ActiveSqlTransaction")) return "25001";
+    if (equal(name, "SessionCapacity")) return "54000";
     if (equal(name, "DatabaseBusy")) return "55P03";
     if (equal(name, "SerializationFailure")) return "40001";
     if (equal(name, "DeadlockDetected")) return "40P01";
