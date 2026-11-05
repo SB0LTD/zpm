@@ -465,6 +465,37 @@ fn groupingSets() !void {
     try check(small_result.row_count == 1 and small_result.rows[0].cells[0].integer == 123);
 }
 
+fn groupingCube() !void {
+    // oracle
+    try expectTyped("SELECT g,v,COUNT(*) FROM tdd_a GROUP BY CUBE(g,v) ORDER BY GROUPING(g,v),g NULLS LAST,v NULLS LAST", "g:23,v:23,count:20",
+        "1|10|1;1|20|1;2|30|1;2|NULL|1;1|NULL|2;2|NULL|2;NULL|10|1;NULL|20|1;NULL|30|1;NULL|NULL|1;NULL|NULL|4");
+    try expect("SELECT g+1,COUNT(*) FROM tdd_a GROUP BY CUBE(g+1) ORDER BY 1", "2|2;3|2;NULL|4");
+    try expect("SELECT g,COUNT(*) FROM tdd_a GROUP BY CUBE(g) HAVING COUNT(*)>2", "NULL|4");
+    try expect("SELECT g,COUNT(DISTINCT v) FROM tdd_a GROUP BY CUBE(g) ORDER BY GROUPING(g),g", "1|2;2|1;NULL|3");
+    try expect("SELECT g,a.v,COUNT(*) FROM tdd_a a JOIN tdd_b b USING (id) GROUP BY CUBE(g,a.v) ORDER BY GROUPING(g,a.v),g,a.v", "1|10|1;2|30|1;1|NULL|1;2|NULL|1;NULL|10|1;NULL|30|1;NULL|NULL|2");
+    // Composite items and a CUBE crossed with plain keys.
+    try expect("SELECT g,v,COUNT(*) FROM tdd_a GROUP BY CUBE((g,v)) ORDER BY GROUPING(g,v),g,v", "1|10|1;1|20|1;2|30|1;2|NULL|1;NULL|NULL|4");
+    try expect("SELECT g,v,COUNT(*) FROM tdd_a GROUP BY g,CUBE(v) ORDER BY g,GROUPING(v),v NULLS FIRST", "1|10|1;1|20|1;1|NULL|2;2|NULL|1;2|30|1;2|NULL|2");
+    try expectBag("SELECT COUNT(*) FROM tdd_a GROUP BY CUBE(g,g)", "2;2;2;2;2;2;4");
+    // Empty input and a column named cube.
+    try expect("SELECT g,COUNT(*),GROUPING(g) FROM tdd_a WHERE false GROUP BY CUBE(g)", "NULL|0|1");
+    try expect("SELECT cube,COUNT(*) FROM (SELECT g AS cube FROM tdd_a) c GROUP BY cube ORDER BY cube", "1|2;2|2");
+    // Volatile input once per row.
+    try expect("SELECT GROUPING(g),SUM(nextval('gs')) FROM tdd_a GROUP BY CUBE(g) ORDER BY 1,2", "0|11;0|15;1|26");
+    // Errors: PostgreSQL limits CUBE to 12 elements (54000); 4096 sets
+    // exceed the expression-node budget here (54001).
+    try rejects("SELECT GROUPING(v) FROM tdd_a GROUP BY CUBE(g)", error.GroupingError);
+    try rejects("SELECT COUNT(*) FROM tdd_a GROUP BY CUBE()", error.Syntax);
+    try rejects("SELECT COUNT(*) FROM tdd_a GROUP BY CUBE(())", error.Syntax);
+    try rejects("SELECT COUNT(*) FROM tdd_a GROUP BY CUBE(id,g,v,id+1,g+1,v+1,id+2,g+2,v+2,id+3,g+3,v+3,id+4)", error.ProgramLimitExceeded);
+    try rejects("SELECT COUNT(*) FROM tdd_a GROUP BY CUBE(id,g,v,id+1,g+1,v+1,id+2,g+2,v+2,id+3,g+3,v+3)", error.StatementTooComplex);
+    try rejects("SELECT g,COUNT(DISTINCT v+1) FROM tdd_a GROUP BY CUBE(g)", error.UnsupportedStatement);
+    try controlled("SELECT g,v,COUNT(*) FROM tdd_a GROUP BY CUBE(g,v) ORDER BY GROUPING(g,v),g NULLS LAST,v NULLS LAST",
+        "1|10|1;1|20|1;2|30|1;2|NULL|1;1|NULL|2;2|NULL|2;NULL|10|1;NULL|20|1;NULL|30|1;NULL|NULL|1;NULL|NULL|4");
+    if (small.execute("SELECT k,COUNT(*) FROM t GROUP BY CUBE(k)", &small_result)) |_| return error.ExpectedCapacity else |err| try check(err == error.WorkspaceCapacity);
+    try check(small_result.row_count == 1 and small_result.rows[0].cells[0].integer == 123);
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try naturalJoins();
@@ -473,6 +504,7 @@ pub fn main(init: std.process.Init) !void {
     try limitExpressions();
     try fetchTies();
     try groupingSets();
+    try groupingCube();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-query-composition\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

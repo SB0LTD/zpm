@@ -2036,6 +2036,7 @@ pub fn Parser(comptime config: types.Config) type {
             const lparen = next.kind == .symbol and next.symbol == .lparen;
             if (self.isSymbol(.lparen) and next.kind == .symbol and next.symbol == .rparen) return .empty;
             if (self.isWord("ROLLUP") and lparen) return .rollup;
+            if (self.rawWord("cube") and lparen) return .cube;
             if (self.rawWord("grouping") and wordIs(self.source, next, "sets")) return .sets;
             return .expression;
         }
