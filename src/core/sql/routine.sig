@@ -756,7 +756,7 @@ pub fn Routines(comptime config: types.Config) type {
             /// FOUND's variable index.
             found: usize = 0,
             row_count: usize = 0,
-            eframe: E.Frame = .{ .cells = undefined },
+            eframe: E.Frame = undefined,
 
             pub fn evalFrame(self: *Frame) *const E.Frame {
                 self.eframe = .{ .cells = &self.cells, .count = self.variables.count, .new = self.new, .old = self.old };
