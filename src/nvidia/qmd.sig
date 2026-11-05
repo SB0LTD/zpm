@@ -233,38 +233,43 @@ pub fn build(q: *[QMD_WORDS]u32, s: Shape) Error!void {
     if (s.prog_va & 0xff != 0 or s.cbuf_va & 0x3f != 0) return error.OutOfRange;
     const shared = try sharedTotal(s.shared_bytes);
     const cfg = try smConfig(shared);
-    @memset(q, 0);
-    put(q, F.QMD_GROUP_ID, 0x3f);
-    put(q, F.QMD_TYPE, QMD_TYPE_GRID_CTA);
-    put(q, F.SASS_VERSION, s.sass);
-    put(q, F.API_VISIBLE_CALL_LIMIT, 1); // NO_CHECK
-    put(q, F.SAMPLER_INDEX, 1); // VIA_HEADER_INDEX
-    put(q, F.QMD_MAJOR_VERSION, 5); // (minor 0)
-    put(q, F.INVALIDATES, 0xf);
-    put(q, F.CWD_MEMBAR_TYPE, CWD_MEMBAR_L1_SYSMEMBAR);
-    put(q, F.PROGRAM_ADDRESS_LOWER_SHIFTED4, (s.prog_va >> 4) & 0xffff_ffff);
-    put(q, F.PROGRAM_ADDRESS_UPPER_SHIFTED4, s.prog_va >> 36);
-    put(q, F.PROGRAM_PREFETCH_SIZE, @min(s.prog_bytes >> 8, 0x1ff));
-    put(q, F.CTA_THREAD_DIMENSION0, s.block[0]);
-    put(q, F.CTA_THREAD_DIMENSION1, s.block[1]);
-    put(q, F.CTA_THREAD_DIMENSION2, s.block[2]);
-    put(q, F.REGISTER_COUNT, s.registers);
-    put(q, F.BARRIER_COUNT, 1);
-    put(q, F.SHARED_MEMORY_SIZE_SHIFTED7, shared >> 7);
-    put(q, F.MIN_SM_CONFIG_SHARED_MEM_SIZE, cfg);
-    put(q, F.MAX_SM_CONFIG_SHARED_MEM_SIZE, SM_CONFIG_MAX);
-    put(q, F.TARGET_SM_CONFIG_SHARED_MEM_SIZE, cfg);
-    put(q, F.SHADER_LOCAL_MEMORY_HIGH_SIZE_SHIFTED4, s.local_bytes >> 4);
-    put(q, F.GRID_WIDTH, s.grid[0]);
-    put(q, F.GRID_HEIGHT, s.grid[1]);
-    put(q, F.GRID_DEPTH, s.grid[2]);
-    put(q, F.cbAddrLower(0), (s.cbuf_va >> 6) & 0xffff_ffff);
-    put(q, F.cbAddrUpper(0), s.cbuf_va >> 38);
-    put(q, F.cbSize(0), CBUF0_BYTES >> 4);
-    put(q, F.cbValid(0), 1);
-    put(q, F.cbInvalidate(0), 1);
-    put(q, F.PROGRAM_PREFETCH_ADDR_LOWER_SHIFTED, (s.prog_va >> 8) & 0xffff_ffff);
-    put(q, F.PROGRAM_PREFETCH_ADDR_UPPER_SHIFTED, s.prog_va >> 40);
+    // (built here, then stored whole: q is often a slot in VRAM through
+    // BAR1, where the bit fields' read-modify-writes would each read the
+    // word back uncached, ~1 us: 64 us a launch, 24 ms of a 37 ms decode
+    // step of lfm3-any on legion22)
+    var t: [QMD_WORDS]u32 = @splat(0);
+    put(&t, F.QMD_GROUP_ID, 0x3f);
+    put(&t, F.QMD_TYPE, QMD_TYPE_GRID_CTA);
+    put(&t, F.SASS_VERSION, s.sass);
+    put(&t, F.API_VISIBLE_CALL_LIMIT, 1); // NO_CHECK
+    put(&t, F.SAMPLER_INDEX, 1); // VIA_HEADER_INDEX
+    put(&t, F.QMD_MAJOR_VERSION, 5); // (minor 0)
+    put(&t, F.INVALIDATES, 0xf);
+    put(&t, F.CWD_MEMBAR_TYPE, CWD_MEMBAR_L1_SYSMEMBAR);
+    put(&t, F.PROGRAM_ADDRESS_LOWER_SHIFTED4, (s.prog_va >> 4) & 0xffff_ffff);
+    put(&t, F.PROGRAM_ADDRESS_UPPER_SHIFTED4, s.prog_va >> 36);
+    put(&t, F.PROGRAM_PREFETCH_SIZE, @min(s.prog_bytes >> 8, 0x1ff));
+    put(&t, F.CTA_THREAD_DIMENSION0, s.block[0]);
+    put(&t, F.CTA_THREAD_DIMENSION1, s.block[1]);
+    put(&t, F.CTA_THREAD_DIMENSION2, s.block[2]);
+    put(&t, F.REGISTER_COUNT, s.registers);
+    put(&t, F.BARRIER_COUNT, 1);
+    put(&t, F.SHARED_MEMORY_SIZE_SHIFTED7, shared >> 7);
+    put(&t, F.MIN_SM_CONFIG_SHARED_MEM_SIZE, cfg);
+    put(&t, F.MAX_SM_CONFIG_SHARED_MEM_SIZE, SM_CONFIG_MAX);
+    put(&t, F.TARGET_SM_CONFIG_SHARED_MEM_SIZE, cfg);
+    put(&t, F.SHADER_LOCAL_MEMORY_HIGH_SIZE_SHIFTED4, s.local_bytes >> 4);
+    put(&t, F.GRID_WIDTH, s.grid[0]);
+    put(&t, F.GRID_HEIGHT, s.grid[1]);
+    put(&t, F.GRID_DEPTH, s.grid[2]);
+    put(&t, F.cbAddrLower(0), (s.cbuf_va >> 6) & 0xffff_ffff);
+    put(&t, F.cbAddrUpper(0), s.cbuf_va >> 38);
+    put(&t, F.cbSize(0), CBUF0_BYTES >> 4);
+    put(&t, F.cbValid(0), 1);
+    put(&t, F.cbInvalidate(0), 1);
+    put(&t, F.PROGRAM_PREFETCH_ADDR_LOWER_SHIFTED, (s.prog_va >> 8) & 0xffff_ffff);
+    put(&t, F.PROGRAM_PREFETCH_ADDR_UPPER_SHIFTED, s.prog_va >> 40);
+    q.* = t;
 }
 
 /// A release when the grid is done: `payload` (32 bits) written to `va`
