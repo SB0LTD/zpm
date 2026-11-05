@@ -346,7 +346,7 @@ pub fn Binder(comptime config: types.Config) type {
         };
 
         /// USING column merged from the relations joined before `right`.
-        const Using = struct { ident: ast.Ident, left: u8, left_column: u16, right: u8, right_column: u16, join: ast.JoinKind };
+        const Using = struct { name: V.Name, left: u8, left_column: u16, right: u8, right_column: u16, join: ast.JoinKind, item: u8 = 0 };
 
         /// CTE names visible to a query block (innermost WITH first).
         const CteEnv = struct {
@@ -358,6 +358,9 @@ pub fn Binder(comptime config: types.Config) type {
         const Scope = struct {
             rels: [config.relations]Relation = undefined,
             rel_count: usize = 0,
+            /// First visible FROM item: a parenthesized join operand's ON
+            /// and LATERAL items see only the items of their own group.
+            rel_first: usize = 0,
             using: [config.columns]Using = undefined,
             using_count: usize = 0,
             /// Enclosing query block (correlated column references).
@@ -389,6 +392,12 @@ pub fn Binder(comptime config: types.Config) type {
             /// Expression over earlier items equal to this table's primary
             /// key (nested-loop index probe), or none.
             probe: u16 = none,
+            // Query composition (B11).
+            /// A LATERAL derived table / table function, re-run per left row.
+            lateral: bool = false,
+            /// This item starts a parenthesized right operand ending at item
+            /// group_end; its `on` joins the whole operand.
+            group_end: u16 = none,
         };
 
         pub const Window=struct {
@@ -458,6 +467,10 @@ pub fn Binder(comptime config: types.Config) type {
             offset: u64 = 0,
             /// References a column of an enclosing block (re-run per row).
             correlated: bool = false,
+            // Query composition (B11).
+            /// LATERAL items or parenthesized right operands: the nested-loop
+            /// join tree runs in Exec.joinGeneral (no probes, no fast paths).
+            general_join: bool = false,
         };
 
         pub const CteDef = struct {
@@ -3918,7 +3931,21 @@ pub fn Binder(comptime config: types.Config) type {
                     const head = try convertList(context, left, target);
                     n.* = .{ .kind = .coalesce, .b = head, .ty = target, .next = next, .name = name, .depth = 3 };
                 },
-                else => bindColumn(context, scope, n, owner, level, entry.left, entry.left_column),
+                else => {
+                    // PostgreSQL types the merged column with the operands'
+                    // common type (buildMergedJoinVar): int4 USING int8 is int8.
+                    const right = entry.join == .right;
+                    bindColumn(context, scope, n, owner, level, if (right) entry.right else entry.left, if (right) entry.right_column else entry.left_column);
+                    const other = relationColumnType(context, &owner.rels[if (right) entry.left else entry.right], if (right) entry.left_column else entry.right_column);
+                    const target = value.common(n.ty, other) orelse return;
+                    if (target == n.ty) return;
+                    const next = n.next;
+                    const column = try context.pool.add(n.*);
+                    context.node(column).next = none;
+                    const converted = try convert(context, column, target, -1, .implicit);
+                    n.* = context.node(converted).*;
+                    n.next = next;
+                },
             }
         }
 
@@ -3936,7 +3963,7 @@ pub fn Binder(comptime config: types.Config) type {
                     level += 1;
                 }
                 if (qualifier) |q| {
-                    for (s.rels[0..s.rel_count], 0..) |*rel, index| {
+                    for (s.rels[s.rel_first..s.rel_count], s.rel_first..) |*rel, index| {
                         if (!types.same(rel.name.slice(), q.slice())) continue;
                         const column = findColumn(context, rel, wanted.slice()) orelse return error.ColumnNotFound;
                         return bindColumn(context, scope, n, s, level, index, column);
@@ -3947,11 +3974,11 @@ pub fn Binder(comptime config: types.Config) type {
                 while (position != 0) {
                     position -= 1;
                     const entry = &s.using[position];
-                    const name = toName(context, entry.ident);
-                    if (types.same(name.slice(), wanted.slice())) return bindUsing(context, scope, n, s, level, entry);
+                    if (entry.right < s.rel_first) continue;
+                    if (types.same(entry.name.slice(), wanted.slice())) return bindUsing(context, scope, n, s, level, entry);
                 }
                 var found: ?[2]usize = null;
-                for (s.rels[0..s.rel_count], 0..) |*rel, index| {
+                for (s.rels[s.rel_first..s.rel_count], s.rel_first..) |*rel, index| {
                     const column = findColumn(context, rel, wanted.slice()) orelse continue;
                     if (found != null) return error.AmbiguousColumn;
                     found = .{ index, column };
@@ -4229,8 +4256,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn inputHas(context: *const Context, scope: *const Scope, wanted: []const u8) bool {
             for (scope.using[0..scope.using_count]) |*entry| {
-                const name = toName(context, entry.ident);
-                if (types.same(name.slice(), wanted)) return true;
+                if (types.same(entry.name.slice(), wanted)) return true;
             }
             for (scope.rels[0..scope.rel_count]) |*rel| if (findColumn(context, rel, wanted) != null) return true;
             return false;
@@ -4433,7 +4459,7 @@ pub fn Binder(comptime config: types.Config) type {
             } else try groupify(context, p, n.b);
         }
 
-        fn expandStar(context: *const Context, scope: *const Scope, p: *Plan, target: *const Ast.Target) Error!void {
+        fn expandStar(context: *const Context, scope: *const Scope, q: *const Ast.Select, p: *Plan, target: *const Ast.Target) Error!void {
             var only: ?usize = null;
             if (target.expr != none) {
                 const qualifier = toName(context, context.node(target.expr).qualifier);
@@ -4444,26 +4470,51 @@ pub fn Binder(comptime config: types.Config) type {
                 if (only == null) return error.TableNotFound;
             } else {
                 if (scope.rel_count == 0) return error.Syntax;
-                for (scope.using[0..scope.using_count]) |*entry| {
-                    const id = try context.pool.add(.{ .kind = .column, .name = entry.ident });
-                    try typeExpr(context, scope, id);
-                    try addTarget(context, p, id, toName(context, entry.ident));
-                }
+                // A joined table lists each join's merged columns, then its
+                // left and right operands' remaining columns (PostgreSQL).
+                if (scope.using_count != 0) return starOperand(context, scope, q, p, 0, scope.rel_count - 1);
             }
             for (scope.rels[0..scope.rel_count], 0..) |*rel, index| {
                 if (only) |wanted| if (wanted != index) continue;
-                columns: for (0..relationWidth(context, rel)) |column| {
-                    if (only == null) for (scope.using[0..scope.using_count]) |*entry| {
-                        if ((entry.left == index and entry.left_column == column) or (entry.right == index and entry.right_column == column)) continue :columns;
-                    };
-                    const id = try columnNode(context, scope, index, column);
-                    var name: V.Name = .{};
-                    const raw = relationColumnName(context, rel, column);
-                    name.len = raw.len;
-                    @memcpy(name.bytes[0..raw.len], raw);
-                    try addTarget(context, p, id, name);
-                }
+                try starColumns(context, scope, p, index, rel, only == null);
             }
+        }
+
+        fn starColumns(context: *const Context, scope: *const Scope, p: *Plan, index: usize, rel: *const Relation, skip_merged: bool) Error!void {
+            columns: for (0..relationWidth(context, rel)) |column| {
+                if (skip_merged) for (scope.using[0..scope.using_count]) |*entry| {
+                    if ((entry.left == index and entry.left_column == column) or (entry.right == index and entry.right_column == column)) continue :columns;
+                };
+                const id = try columnNode(context, scope, index, column);
+                try addTarget(context, p, id, literalName(relationColumnName(context, rel, column)));
+            }
+        }
+
+        /// Star columns of the joined operand made of items first..last.
+        /// Recursion is bounded by the FROM item count.
+        fn starOperand(context: *const Context, scope: *const Scope, q: *const Ast.Select, p: *Plan, first: usize, last: usize) Error!void {
+            var join: ?usize = null;
+            var next = first + 1;
+            while (next <= last) {
+                join = next;
+                const end = if (next < q.item_count) q.items[next].group_end else none;
+                next = (if (end != none) end else next) + 1;
+            }
+            const k = join orelse return starColumns(context, scope, p, first, &scope.rels[first], true);
+            for (scope.using[0..scope.using_count], 0..) |*entry, position| {
+                if (entry.item != k) continue;
+                // A later join that merges this column again lists it instead.
+                var consumed = false;
+                for (scope.using[position + 1 .. scope.using_count]) |*later| {
+                    if (later.item != k and later.left == entry.left and later.left_column == entry.left_column) consumed = true;
+                }
+                if (consumed) continue;
+                const id = try context.pool.add(.{ .kind = .column });
+                try bindUsing(context, scope, context.node(id), scope, 0, entry);
+                try addTarget(context, p, id, entry.name);
+            }
+            try starOperand(context, scope, q, p, first, k - 1);
+            try starOperand(context, scope, q, p, k, last);
         }
 
         fn addTarget(context: *const Context, p: *Plan, id: u16, name: V.Name) Error!void {
@@ -4477,39 +4528,123 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// JOIN ... USING (columns): records merged columns and returns the
         /// equality condition.
-        fn bindUsingClause(context: *const Context, scope: *Scope, item: *const Ast.FromItem, index: usize) Error!u16 {
+        fn bindUsingClause(context: *const Context, scope: *Scope, item: *const Ast.FromItem, index: usize, last: usize) Error!u16 {
             var condition: u16 = none;
-            for (item.using[0..item.using_count]) |ident| {
+            for (item.using[0..item.using_count], 0..) |ident, position| {
                 const wanted = toName(context, ident);
-                const right = findColumn(context, &scope.rels[index], wanted.slice()) orelse return error.ColumnNotFound;
-                var left: ?[2]usize = null;
-                var position = scope.using_count;
-                while (position != 0) {
-                    position -= 1;
-                    const entry = &scope.using[position];
-                    const name = toName(context, entry.ident);
-                    if (types.same(name.slice(), wanted.slice())) {
-                        left = .{ entry.left, entry.left_column };
-                        break;
-                    }
-                }
-                if (left == null) for (scope.rels[0..index], 0..) |*rel, rel_index| {
-                    const column = findColumn(context, rel, wanted.slice()) orelse continue;
-                    if (left != null) return error.AmbiguousColumn;
-                    left = .{ rel_index, column };
-                };
-                const hit = left orelse return error.ColumnNotFound;
-                if (scope.using_count == config.columns) return error.ColumnCapacity;
-                scope.using[scope.using_count] = .{ .ident = ident, .left = @intCast(hit[0]), .left_column = @intCast(hit[1]), .right = @intCast(index), .right_column = @intCast(right), .join = item.join };
-                scope.using_count += 1;
-                const a = try columnNode(context, scope, hit[0], hit[1]);
-                const b = try columnNode(context, scope, index, right);
-                const eq = try context.pool.add(.{ .kind = .binary, .op = .eq, .a = a, .b = b, .ty = .boolean });
-                const node = context.node(eq);
-                try comparable(context, &node.a, &node.b);
-                condition = if (condition == none) eq else try context.pool.add(.{ .kind = .and_op, .a = condition, .b = eq, .ty = .boolean });
+                // USING (a, a): PostgreSQL 42701, specified more than once.
+                for (item.using[0..position]) |earlier| if (types.same(toName(context, earlier).slice(), wanted.slice())) return error.DuplicateColumn;
+                condition = try usingColumn(context, scope, item.join, wanted, index, last, condition);
             }
             return condition;
+        }
+
+        /// One merged column `wanted` between the left operand (visible items
+        /// before `index`) and the right operand (items index..last). The
+        /// right operand must list the name exactly once (42703 / 42702).
+        fn usingColumn(context: *const Context, scope: *Scope, join: ast.JoinKind, wanted: V.Name, index: usize, last: usize, condition: u16) Error!u16 {
+            var right: ?[2]usize = null;
+            for (scope.rels[index .. last + 1], index..) |*rel, rel_index| {
+                const column = findColumn(context, rel, wanted.slice()) orelse continue;
+                if (right != null or countColumn(context, rel, wanted.slice()) > 1) return error.AmbiguousColumn;
+                right = .{ rel_index, column };
+            }
+            const right_hit = right orelse return error.ColumnNotFound;
+            var left: ?[2]usize = null;
+            var position = scope.using_count;
+            while (position != 0) {
+                position -= 1;
+                const entry = &scope.using[position];
+                if (entry.right < scope.rel_first or entry.right >= index) continue;
+                if (types.same(entry.name.slice(), wanted.slice())) {
+                    left = .{ entry.left, entry.left_column };
+                    break;
+                }
+            }
+            if (left == null) for (scope.rels[scope.rel_first..index], scope.rel_first..) |*rel, rel_index| {
+                const column = findColumn(context, rel, wanted.slice()) orelse continue;
+                if (left != null) return error.AmbiguousColumn;
+                left = .{ rel_index, column };
+            };
+            const hit = left orelse return error.ColumnNotFound;
+            if (scope.using_count == config.columns) return error.ColumnCapacity;
+            scope.using[scope.using_count] = .{ .name = wanted, .left = @intCast(hit[0]), .left_column = @intCast(hit[1]), .right = @intCast(right_hit[0]), .right_column = @intCast(right_hit[1]), .join = join, .item = @intCast(index) };
+            scope.using_count += 1;
+            const a = try columnNode(context, scope, hit[0], hit[1]);
+            const b = try columnNode(context, scope, right_hit[0], right_hit[1]);
+            const eq = try context.pool.add(.{ .kind = .binary, .op = .eq, .a = a, .b = b, .ty = .boolean });
+            const node = context.node(eq);
+            try comparable(context, &node.a, &node.b);
+            return if (condition == none) eq else try context.pool.add(.{ .kind = .and_op, .a = condition, .b = eq, .ty = .boolean });
+        }
+
+        fn countColumn(context: *const Context, rel: *const Relation, wanted: []const u8) usize {
+            var count: usize = 0;
+            for (0..relationWidth(context, rel)) |column| {
+                if (types.same(relationColumnName(context, rel, column), wanted)) count += 1;
+            }
+            return count;
+        }
+
+        /// Whether column `column` of item `index` is merged by a USING /
+        /// NATURAL join inside items first..last.
+        fn mergedIn(scope: *const Scope, first: usize, last: usize, index: usize, column: usize) bool {
+            for (scope.using[0..scope.using_count]) |*entry| {
+                if (entry.left < first or entry.right > last) continue;
+                if ((entry.left == index and entry.left_column == column) or (entry.right == index and entry.right_column == column)) return true;
+            }
+            return false;
+        }
+
+        /// How often `wanted` names a column of the joined operand made of
+        /// items first..last (merged columns once, then the others).
+        fn operandHas(context: *const Context, scope: *const Scope, first: usize, last: usize, wanted: []const u8) usize {
+            var count: usize = 0;
+            for (scope.using[0..scope.using_count]) |*entry| {
+                if (entry.left < first or entry.right > last) continue;
+                if (types.same(entry.name.slice(), wanted)) count += 1;
+            }
+            for (scope.rels[first .. last + 1], first..) |*rel, index| {
+                for (0..relationWidth(context, rel)) |column| {
+                    if (mergedIn(scope, first, last, index, column)) continue;
+                    if (types.same(relationColumnName(context, rel, column), wanted)) count += 1;
+                }
+            }
+            return count;
+        }
+
+        /// NATURAL join: USING over the names both operands share, in the
+        /// left operand's column order (PostgreSQL transformFromClauseItem).
+        /// A shared name listed twice on either side is 42702; without a
+        /// shared name the join has no condition (a cross product).
+        fn bindNaturalClause(context: *const Context, scope: *Scope, item: *const Ast.FromItem, index: usize, last: usize) Error!u16 {
+            const first = scope.rel_first;
+            var names: [config.columns]V.Name = undefined;
+            var count: usize = 0;
+            for (scope.using[0..scope.using_count]) |*entry| {
+                if (entry.left < first or entry.right >= index) continue;
+                try naturalCandidate(context, scope, index, last, entry.name, &names, &count);
+            }
+            for (scope.rels[first..index], first..) |*rel, rel_index| {
+                for (0..relationWidth(context, rel)) |column| {
+                    if (mergedIn(scope, first, index - 1, rel_index, column)) continue;
+                    try naturalCandidate(context, scope, index, last, literalName(relationColumnName(context, rel, column)), &names, &count);
+                }
+            }
+            var condition: u16 = none;
+            for (names[0..count]) |name| {
+                if (operandHas(context, scope, first, index - 1, name.slice()) > 1) return error.AmbiguousColumn;
+                condition = try usingColumn(context, scope, item.join, name, index, last, condition);
+            }
+            return condition;
+        }
+
+        fn naturalCandidate(context: *const Context, scope: *const Scope, index: usize, last: usize, name: V.Name, names: *[config.columns]V.Name, count: *usize) Error!void {
+            for (names[0..count.*]) |*seen| if (types.same(seen.slice(), name.slice())) return;
+            if (operandHas(context, scope, index, last, name.slice()) == 0) return;
+            if (count.* == config.columns) return error.ColumnCapacity;
+            names[count.*] = name;
+            count.* += 1;
         }
 
         fn refsBelow(context: *const Context, id: u16, index: usize) bool {
@@ -4555,13 +4690,49 @@ pub fn Binder(comptime config: types.Config) type {
             return none;
         }
 
+        /// The first item of the innermost parenthesized join operand that
+        /// contains item `k` after its start (0: the whole FROM list).
+        fn enclosingGroup(q: *const Ast.Select, k: usize) usize {
+            var group = k;
+            while (group != 0) {
+                group -= 1;
+                const end = q.items[group].group_end;
+                if (end != none and end >= k) return group;
+            }
+            return 0;
+        }
+
+        /// Binds item k's join condition (ON, USING or NATURAL) once items
+        /// k..last (its right operand) are in scope; only the items of the
+        /// enclosing operand are visible.
+        fn bindJoinCondition(context: *const Context, scope: *Scope, q: *const Ast.Select, plan_id: u16, k: usize, last: usize) Error!void {
+            const item = &q.items[k];
+            const p = &plansOf(context).items[plan_id];
+            const saved = scope.rel_first;
+            scope.rel_first = enclosingGroup(q, k);
+            defer scope.rel_first = saved;
+            var on: u16 = none;
+            if (item.natural) {
+                on = try bindNaturalClause(context, scope, item, k, last);
+            } else if (item.using_count != 0) {
+                on = try bindUsingClause(context, scope, item, k, last);
+            } else if (item.on != none) on = try bindWhere(context, scope, item.on);
+            p.sources[k].on = on;
+            if (p.sources[k].table) |table| if ((item.join == .inner or item.join == .left) and last == k and !p.general_join) {
+                p.sources[k].probe = joinProbe(context, table, on, k);
+            };
+        }
+
         fn bindCore(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv, branch: bool) Error!u16 {
             const plans = plansOf(context);
             const id = try plans.add();
             var scope: Scope = .{ .parent = parent, .plan = id, .ctes = env, .window_defs=q.window_defs };
+            for (q.items[0..q.item_count]) |*item| if (item.group_end != none or item.lateral) {
+                plans.items[id].general_join = true;
+            };
             for (q.items[0..q.item_count], 0..) |*item, index| {
                 var rel: Relation = .{};
-                var source: Source = .{ .join = item.join };
+                var source: Source = .{ .join = item.join, .group_end = item.group_end };
                 if (item.query != none) {
                     // Derived tables are not LATERAL: they see enclosing blocks
                     // only; an expanded view sees neither (it is a stored query).
@@ -4590,13 +4761,16 @@ pub fn Binder(comptime config: types.Config) type {
                 if (item.alias) |alias| rel.name = toName(context, alias);
                 scope.rels[index] = rel;
                 scope.rel_count = index + 1;
-                if (item.using_count != 0) {
-                    source.on = try bindUsingClause(context, &scope, item, index);
-                } else if (item.on != none) source.on = try bindWhere(context, &scope, item.on);
-                if (source.table) |table| if (item.join == .inner or item.join == .left) {
-                    source.probe = joinProbe(context, table, source.on, index);
-                };
                 plans.items[id].sources[index] = source;
+                // A parenthesized right operand's own condition waits for
+                // its last item; then every group ending here closes,
+                // innermost (latest start) first.
+                if (item.group_end == none) try bindJoinCondition(context, &scope, q, id, index, index);
+                var group = index;
+                while (group != 0) {
+                    group -= 1;
+                    if (q.items[group].group_end == index) try bindJoinCondition(context, &scope, q, id, group, index);
+                }
             }
             const p = &plans.items[id];
             p.source_count = q.item_count;
@@ -4614,7 +4788,7 @@ pub fn Binder(comptime config: types.Config) type {
             while(window_def!=none) : (window_def=context.pool.windows[window_def].next) try typeWindowSpec(context,&scope,&context.pool.windows[window_def]);
             for (q.targets[0..q.count]) |*target| {
                 if (target.star) {
-                    try expandStar(context, &scope, p, target);
+                    try expandStar(context, &scope, q, p, target);
                     continue;
                 }
                 if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);

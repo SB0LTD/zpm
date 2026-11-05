@@ -2066,39 +2066,63 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.fromItem(out, .cross);
                     continue;
                 }
-                var kind: ast.JoinKind = .inner;
-                if (try self.takeWord("JOIN")) {
-                    kind = .inner;
-                } else if (try self.takeWord("INNER")) {
-                    try self.expectWord("JOIN");
-                } else if (try self.takeWord("CROSS")) {
-                    try self.expectWord("JOIN");
-                    kind = .cross;
-                } else if (self.isWord("LEFT") or self.isWord("RIGHT") or self.isWord("FULL")) {
-                    kind = if (self.isWord("LEFT")) .left else if (self.isWord("RIGHT")) .right else .full;
-                    try self.advance();
-                    _ = try self.takeWord("OUTER");
-                    try self.expectWord("JOIN");
-                } else break;
-                try self.fromItem(out, kind);
-                if (kind == .cross) continue;
-                const item = &out.items[out.item_count - 1];
-                if (try self.takeWord("ON")) {
-                    item.on = try self.expression();
-                } else if (try self.takeWord("USING")) {
-                    try self.expectSymbol(.lparen);
-                    while (true) {
-                        if (item.using_count == config.columns) return error.ColumnCapacity;
-                        item.using[item.using_count] = try self.identifier();
-                        item.using_count += 1;
-                        if (!try self.takeSymbol(.comma)) break;
-                    }
-                    try self.expectSymbol(.rparen);
-                } else return error.Syntax;
+                if (!try self.joinClause(out)) break;
             }
-            if (out.item_count == 1 and out.items[0].query == none) {
+            if (out.item_count == 1 and out.items[0].query == none and plainItem(&out.items[0])) {
                 out.from = .{ .schema = out.items[0].schema, .name = out.items[0].name, .alias = out.items[0].alias };
             } else self.pool.complex = true;
+        }
+
+        /// A FROM item the simple single-table path can scan as written.
+        fn plainItem(item: *const Ast.FromItem) bool {
+            return item.function == none and item.sample_method == 0 and item.column_aliases == none and item.group_end == none;
+        }
+
+        /// One `[NATURAL] [INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN operand
+        /// [ON e | USING (c, ...)]`; false when no join keyword follows. The
+        /// condition belongs to the operand's first item (a parenthesized
+        /// group's start). NATURAL takes neither ON nor USING (42601).
+        fn joinClause(self: *Self, out: *Ast.Select) Error!bool {
+            const natural = try self.takeWord("NATURAL");
+            var kind: ast.JoinKind = .inner;
+            if (try self.takeWord("JOIN")) {
+                kind = .inner;
+            } else if (try self.takeWord("INNER")) {
+                try self.expectWord("JOIN");
+            } else if (!natural and try self.takeWord("CROSS")) {
+                try self.expectWord("JOIN");
+                kind = .cross;
+            } else if (self.isWord("LEFT") or self.isWord("RIGHT") or self.isWord("FULL")) {
+                kind = if (self.isWord("LEFT")) .left else if (self.isWord("RIGHT")) .right else .full;
+                try self.advance();
+                _ = try self.takeWord("OUTER");
+                try self.expectWord("JOIN");
+            } else {
+                if (natural) return error.Syntax;
+                return false;
+            }
+            const start = out.item_count;
+            try self.fromItem(out, kind);
+            if (kind == .cross) return true;
+            const item = &out.items[start];
+            if (natural) {
+                item.natural = true;
+                self.pool.complex = true;
+                return true;
+            }
+            if (try self.takeWord("ON")) {
+                item.on = try self.expression();
+            } else if (try self.takeWord("USING")) {
+                try self.expectSymbol(.lparen);
+                while (true) {
+                    if (item.using_count == config.columns) return error.ColumnCapacity;
+                    item.using[item.using_count] = try self.identifier();
+                    item.using_count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                try self.expectSymbol(.rparen);
+            } else return error.Syntax;
+            return true;
         }
 
         fn fromItem(self: *Self, out: *Ast.Select, kind: ast.JoinKind) Error!void {

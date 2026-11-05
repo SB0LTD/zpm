@@ -615,6 +615,24 @@ pub fn Ast(comptime config: types.Config) type {
             only: bool = false,
             /// A derived table expanded from a stored view definition.
             view: bool = false,
+            // Query composition (B11). NATURAL join: USING over every common
+            // column name of the two operands.
+            natural: bool = false,
+            /// LATERAL derived table: it sees the FROM items before it.
+            lateral: bool = false,
+            /// This item starts a parenthesized right join operand that ends
+            /// at item `group_end`; `join`/`on` join that whole group.
+            group_end: u16 = none,
+            /// `AS alias (c1, c2, ...)`: column nodes linked by `next`.
+            column_aliases: u16 = none,
+            /// Table function call (function node) in FROM, WITH ORDINALITY.
+            function: u16 = none,
+            ordinality: bool = false,
+            /// TABLESAMPLE method (0 none, 1 BERNOULLI, 2 SYSTEM), its
+            /// percentage argument and REPEATABLE seed expressions.
+            sample_method: u8 = 0,
+            sample_percent: u16 = none,
+            sample_seed: u16 = none,
         };
 
         pub const Cte = struct {
@@ -622,6 +640,39 @@ pub fn Ast(comptime config: types.Config) type {
             columns: [config.columns]Ident = undefined,
             column_count: usize = 0,
             query: u16 = none,
+            // Query composition (B11).
+            /// [NOT] MATERIALIZED as written (0 default, 1 MATERIALIZED,
+            /// 2 NOT MATERIALIZED). Results are identical: the engine always
+            /// materializes, and PostgreSQL never inlines volatile bodies.
+            materialized: u8 = 0,
+            /// Data-modifying body (INSERT/UPDATE/DELETE ... RETURNING):
+            /// statement kind and the source offset of its first keyword.
+            dml: DmlKind = .none,
+            dml_start: usize = 0,
+            /// SEARCH {DEPTH|BREADTH} FIRST BY columns SET name.
+            search: SearchClause = .{},
+            /// CYCLE columns SET mark [TO value DEFAULT value] USING path.
+            cycle: CycleClause = .{},
+        };
+
+        pub const DmlKind = enum { none, insert, update, delete };
+
+        pub const SearchClause = struct {
+            present: bool = false,
+            breadth: bool = false,
+            /// Column nodes (names only) linked by `next`.
+            columns: u16 = none,
+            set: Ident = .{},
+        };
+
+        pub const CycleClause = struct {
+            present: bool = false,
+            columns: u16 = none,
+            mark: Ident = .{},
+            /// TO / DEFAULT values (none: boolean true / false).
+            mark_value: u16 = none,
+            mark_default: u16 = none,
+            path: Ident = .{},
         };
 
         /// A query block: a SELECT core, or a set operation over the
@@ -660,6 +711,20 @@ pub fn Ast(comptime config: types.Config) type {
             ctes: [config.ctes]Cte = undefined,
             cte_count: usize = 0,
             recursive: bool = false,
+            // Query composition (B11).
+            /// GROUPING SETS / CUBE / composite ROLLUP: int_literal nodes
+            /// linked by `next`, each a bit mask over `group` positions.
+            grouping_sets: u16 = none,
+            /// GROUP BY DISTINCT: duplicate grouping sets are removed.
+            group_distinct: bool = false,
+            /// LIMIT / OFFSET / FETCH count expressions (none: the constant
+            /// `limit` / `offset` fields apply).
+            limit_expr: u16 = none,
+            offset_expr: u16 = none,
+            /// FETCH FIRST n ROWS WITH TIES.
+            with_ties: bool = false,
+            /// Standalone VALUES block: values_row nodes linked by `next`.
+            values: u16 = none,
         };
 
         pub const Assignment = struct {
