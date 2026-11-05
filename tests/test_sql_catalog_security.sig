@@ -115,9 +115,9 @@ fn rejects(source: []const u8, wanted: anyerror, probe: []const u8, unchanged: [
         try check(err == wanted);
     }
     try check(used == 0);
-    const role = db.session.role;
-    db.session.role = 10;
-    defer db.session.role = role;
+    const role = currentRole();
+    forceRole(0);
+    defer forceRole(role);
     try same(try query(&db, probe), unchanged);
     try same(try query(&replica, probe), unchanged);
     try check(db.usage().transactions == 0 and db.usage().pending_versions == 0 and db.usage().table_locks == 0);
@@ -215,9 +215,9 @@ const state_probes = [_][]const u8{
 
 /// Every probe answers identically on the primary and the replay.
 fn sameState() !void {
-    const role = db.session.role;
-    db.session.role = 10;
-    defer db.session.role = role;
+    const role = currentRole();
+    forceRole(0);
+    defer forceRole(role);
     for (state_probes) |probe| {
         const left = try query(&db, probe);
         var copy: [16384]u8 = undefined;
@@ -242,15 +242,33 @@ fn reset() !void {
 fn roleOid(name: []const u8) !u32 {
     var source_buffer: [128]u8 = undefined;
     const source = try std.fmt.bufPrint(&source_buffer, "SELECT oid FROM pg_roles WHERE rolname = '{s}'", .{name});
-    const role = db.session.role;
-    db.session.role = 10;
-    defer db.session.role = role;
+    const role = currentRole();
+    forceRole(0);
+    defer forceRole(role);
     const text = try query(&db, source);
     return std.fmt.parseInt(u32, text, 10);
 }
 
+/// SET ROLE as the session's setting (RESET ROLE for the bootstrap user).
 fn as(name: []const u8) !void {
-    db.session.role = if (std.mem.eql(u8, name, "ramsql")) 10 else try roleOid(name);
+    var source_buffer: [96]u8 = undefined;
+    const source = if (std.mem.eql(u8, name, "ramsql")) "RESET ROLE" else try std.fmt.bufPrint(&source_buffer, "SET ROLE {s}", .{name});
+    var result: DB.Result = .{};
+    db.execute(source, &result) catch |err| {
+        std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
+        return err;
+    };
+    try check(result.command == .set or result.command == .reset);
+}
+
+/// The session's SET ROLE value, set directly around probes.
+fn currentRole() u32 {
+    return db.default_session_state.values.role;
+}
+
+fn forceRole(role: u32) void {
+    db.default_session_state.values.role = role;
+    db.default_session_state.base.role = role;
 }
 
 /// Column names, type OIDs and typmods of a result.
@@ -485,9 +503,37 @@ fn roles() !void {
     try check(revoked.command == .revoke_role);
     try expect(members, "r_group|r_plain|f");
     try sameState();
-    // current_user follows the session role (session_user stays).
+    // current_user follows SET ROLE (session_user stays); SHOW role and
+    // current_setting('role') report it; RESET / NONE return to the
+    // session user. SET ROLE is transactional like other settings.
     try as("r_plain");
     try expect("SELECT current_user, session_user", "r_plain|ramsql");
+    try expect("SELECT current_setting('role')", "r_plain");
+    try as("ramsql");
+    try expect("SELECT current_user, current_setting('role')", "ramsql|none");
+    try run("SET ROLE \"r_plain\"");
+    try run("SET ROLE NONE");
+    try expect("SELECT current_user", "ramsql");
+    const in_tx = try db.begin();
+    try statement(in_tx, "SET ROLE r_plain");
+    try same(try rows(in_tx, "SELECT current_user"), "r_plain");
+    db.abort(in_tx);
+    try expect("SELECT current_user", "ramsql");
+    const local_tx = try db.begin();
+    try statement(local_tx, "SET LOCAL ROLE r_admin");
+    try same(try rows(local_tx, "SELECT current_user"), "r_admin");
+    try commit(local_tx);
+    try expect("SELECT current_user", "ramsql");
+    try fails("SET ROLE nosuch", error.InvalidSettingValue);
+    // The session user must be a member of the role it becomes.
+    db.default_session_state.session_role = try roleOid("r_plain");
+    try as("r_group");
+    try expect("SELECT current_user, session_user", "r_group|r_plain");
+    try fails("SET ROLE r_admin", error.InsufficientPrivilege);
+    try as("ramsql");
+    try expect("SELECT current_user", "r_plain");
+    db.default_session_state.session_role = 10;
+    try as("r_plain");
     // Non-superusers: CREATE ROLE needs CREATEROLE (42501).
     try rejects("CREATE ROLE r_denied", error.InsufficientPrivilege, count, "6");
     try as("r_admin");
@@ -504,11 +550,9 @@ fn roles() !void {
     try run("GRANT SELECT ON tdd_a TO r_renamed");
     try rejects("DROP ROLE r_renamed", error.DependentObjects, count, "6");
     try run("REVOKE SELECT ON tdd_a FROM r_renamed");
-    db.session.role = try roleOid("r_admin");
-    db.session.session_role = db.session.role;
+    db.default_session_state.session_role = try roleOid("r_admin");
     try rejects("DROP ROLE r_admin", error.ObjectInUse, count, "6");
-    db.session.role = 10;
-    db.session.session_role = 10;
+    db.default_session_state.session_role = 10;
     // Dropping a role drops its memberships.
     try run("DROP ROLE r_group, r_renamed");
     try expect(members, "");

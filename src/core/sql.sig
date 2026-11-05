@@ -5281,6 +5281,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn openCopy(self: *Self, slot: u16, source: []const u8, snap: Snapshot) Error!CopyInfo {
+            self.installRole();
             const tx = &self.txs[slot];
             const copy = try self.parseCopy(source);
             const context = self.bindContext(source, .standard, snap);
@@ -5322,6 +5323,7 @@ pub fn Database(comptime config: Config) type {
             self.routine_frame = null;
             self.routine_depth = 0;
             self.routine_nested = 0;
+            self.installRole();
         }
 
         /// One COPY FROM data row: `fields[p]` is field p's text (null =
@@ -5918,7 +5920,7 @@ pub fn Database(comptime config: Config) type {
             tx.deferrable = deferrable;
         }
 
-        const SettingKind = enum { search_path, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom };
+        const SettingKind = enum { search_path, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
 
         fn settingKind(name: []const u8) ?SettingKind {
             inline for (@typeInfo(SettingKind).@"enum".field_names) |field| {
@@ -6062,6 +6064,8 @@ pub fn Database(comptime config: Config) type {
                     if (kind == .word) try lowerInto(&into.custom[index].value, value) else try into.custom[index].value.set(value);
                 },
                 .transaction_isolation, .transaction_read_only, .transaction_deferrable => return error.UnsupportedStatement,
+                // SET ROLE resolves against the catalog (setSetting).
+                .role => return error.UnsupportedStatement,
             }
         }
 
@@ -6081,6 +6085,7 @@ pub fn Database(comptime config: Config) type {
                     }
                 },
                 .transaction_isolation, .transaction_read_only, .transaction_deferrable => {},
+                .role => into.role = source.role,
             }
         }
 
@@ -6117,7 +6122,11 @@ pub fn Database(comptime config: Config) type {
                 else => {},
             }
             var next = state.values;
-            if (kind == .default) try copySetting(&next, &state.startup, which, name) else try assignSetting(&next, which, name, kind, value);
+            if (kind == .default) {
+                try copySetting(&next, &state.startup, which, name);
+            } else if (which == .role) {
+                next.role = try self.roleSetting(slot, kind, value);
+            } else try assignSetting(&next, which, name, kind, value);
             if (slot != null) try state.preserve();
             if (local) {
                 if (slot != null) state.values = next;
@@ -6132,6 +6141,53 @@ pub fn Database(comptime config: Config) type {
             try copySetting(&base, &next, which, name);
             state.values = next;
             state.base = base;
+        }
+
+        /// The snapshot a setting reads the catalog under: the running
+        /// statement's, else the committed state.
+        fn settingSnapshot(self: *const Self, slot: ?u16) Snapshot {
+            if (slot) |owner| if (self.active(owner)) {
+                if (self.txs[owner].running_snap) |snap| return snap;
+            };
+            return .{ .csn = self.csn };
+        }
+
+        /// SET ROLE name (variable.c check_role): NONE, or a role the
+        /// session user is a member of (any membership; superusers may
+        /// become any role). An unknown role is 22023, a role the session
+        /// user may not become 42501.
+        fn roleSetting(self: *Self, slot: ?u16, kind: SettingValueKind, value: []const u8) Error!u32 {
+            var folded: [64]u8 = undefined;
+            if (value.len > folded.len) return error.InvalidSettingValue;
+            var length: usize = 0;
+            if (kind == .word and value.len >= 2 and value[0] == '"') {
+                // A quoted identifier keeps its case; "" is one quote.
+                var index: usize = 1;
+                while (index + 1 < value.len) : (index += 1) {
+                    folded[length] = value[index];
+                    length += 1;
+                    if (value[index] == '"') index += 1;
+                }
+                if (length == 0) return error.InvalidSettingValue;
+            } else {
+                for (value, 0..) |byte, index| folded[index] = if (kind == .word) types.lower(byte) else byte;
+                length = value.len;
+                if (kind == .word and types.same(folded[0..length], "none")) return 0;
+            }
+            const name = folded[0..length];
+            const snap = self.settingSnapshot(slot);
+            const oid = self.catalog_objects.roleByName(name, snap) orelse return error.InvalidSettingValue;
+            const session_role = self.sessionState().session_role;
+            if (!self.catalog_objects.superuser(session_role, snap) and !self.catalog_objects.memberOf(session_role, oid, false, snap)) return error.InsufficientPrivilege;
+            return oid;
+        }
+
+        /// current_user / session_user of the next statement, from the
+        /// session state (SET ROLE).
+        fn installRole(self: *Self) void {
+            const state = self.session_state orelse &self.default_session_state;
+            self.session.session_role = state.session_role;
+            self.session.role = if (state.values.role != 0) state.values.role else state.session_role;
         }
 
         /// RESET ALL of the engine settings (transaction modes excepted).
@@ -6164,6 +6220,7 @@ pub fn Database(comptime config: Config) type {
                     const index = state.values.findCustom(name) orelse return error.UndefinedSetting;
                     break :blk state.values.custom[index].value.slice();
                 },
+                .role => if (state.values.role == 0) "none" else self.catalog_objects.roleName(state.values.role, self.settingSnapshot(slot)) orelse "none",
             };
             if (text.len > out.len) return error.TextCapacity;
             @memcpy(out[0..text.len], text);

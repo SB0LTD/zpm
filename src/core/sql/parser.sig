@@ -965,6 +965,18 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.finish();
                     return .{ .set = .{ .local = local, .name = .{ .special = .time_zone }, .value = value } };
                 }
+                // SET [LOCAL | SESSION] ROLE { name | NONE } (gram.y; the
+                // catalog-security lane resolves it as the `role` setting).
+                if (self.rawWord("role")) {
+                    const after = try self.peek();
+                    if (!after.isWord("TO") and !(after.kind == .symbol and after.symbol == .eq)) {
+                        const role_name = try self.settingLabel();
+                        const value = try self.settingValue();
+                        if (value.kind == .default or value.kind == .number) return error.Syntax;
+                        try self.finish();
+                        return .{ .set = .{ .local = local, .name = .{ .ident = role_name }, .value = value } };
+                    }
+                }
                 const name: ast.SettingName = .{ .ident = try self.settingLabel() };
                 if (!try self.takeWord("TO")) try self.expectSymbol(.eq);
                 const first = self.current;
