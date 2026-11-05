@@ -3665,6 +3665,7 @@ pub fn Exec(comptime config: types.Config) type {
                     return self.run(definition.plan, outer);
                 }
                 const width = p.count;
+                if (definition.search or definition.cycle) return self.searchCycleCte(id, outer);
                 if (!definition.recursive) {
                     const at = self.mark();
                     const list = try self.run(definition.plan, outer);
@@ -3698,6 +3699,152 @@ pub fn Exec(comptime config: types.Config) type {
                 state.rows = result;
                 state.state = .done;
                 return result;
+            }
+
+            /// WITH RECURSIVE ... SEARCH / CYCLE (B11). Iterates like
+            /// materializeCte; every new row gets its sequence key (depth-
+            /// first: the parent's key plus this row's search columns;
+            /// breadth-first: depth then the columns) and its cycle mark (an
+            /// ancestor, the parent included, equal on every cycle column).
+            /// Marked rows are emitted but never expanded, so CYCLE ends on
+            /// any finite graph; otherwise the workspace bounds the recursion
+            /// (54000). Each iteration and ancestor step is a checkpoint.
+            fn searchCycleCte(self: *Query, id: u8, outer: ?*const E.Context) Error!List {
+                const state = &self.work.ctes[id];
+                const definition = &self.plans.ctes[id];
+                const p = &self.plans.items[definition.plan];
+                const width = p.count;
+                const compared = width - 1;
+                var at = self.mark();
+                var seed = try self.run(p.left, outer);
+                try self.searchCycleRows(definition, seed, true);
+                if (!p.set_all) seed = try self.fresh(.{}, seed, compared);
+                var result = try self.persist(seed, width);
+                self.release(at);
+                self.selfHandles(definition, result);
+                var working = result;
+                while (true) {
+                    state.state = .iterating;
+                    try self.session.checkpoint();
+                    at = self.mark();
+                    var expand: List = .{ .start = @intCast(self.work.ref_low) };
+                    for (self.handles(working)) |handle| {
+                        if (definition.cycle) {
+                            const flag = &self.work.cells[handle + definition.mark_column];
+                            if (flag.* == .null_value or V.compare(flag, &definition.mark_value) == 0) continue;
+                        }
+                        try self.push(&expand, handle);
+                    }
+                    state.working = expand;
+                    var step = try self.run(p.right, outer);
+                    try self.searchCycleRows(definition, step, false);
+                    if (!p.set_all) step = try self.fresh(result, step, compared);
+                    if (step.count == 0) {
+                        self.release(at);
+                        break;
+                    }
+                    const added = try self.persist(step, width);
+                    self.release(at);
+                    self.selfHandles(definition, added);
+                    result = try self.concatPersistent(result, added);
+                    working = added;
+                }
+                state.rows = result;
+                state.state = .done;
+                return result;
+            }
+
+            fn selfHandles(self: *Query, definition: *const B.CteDef, rows: List) void {
+                for (self.handles(rows)) |handle| self.work.cells[handle + definition.self_column] = .{ .integer = handle };
+            }
+
+            /// Sequence keys and cycle marks for new rows (`seed`: no parent).
+            fn searchCycleRows(self: *Query, definition: *const B.CteDef, rows: List, seed: bool) Error!void {
+                for (self.handles(rows)) |handle| {
+                    try self.session.checkpoint();
+                    const row_cells = self.work.cells[handle..];
+                    const parent: ?u32 = if (seed or row_cells[definition.path_column] == .null_value or !definition.cycle and !definition.search) null else @intCast(row_cells[definition.path_column].integer);
+                    if (definition.cycle) {
+                        var cycle = false;
+                        var ancestor = parent;
+                        while (ancestor) |up| {
+                            try self.session.checkpoint();
+                            var equal = true;
+                            for (definition.cycle_columns[0..definition.cycle_count]) |column| {
+                                if (E.compareOp(.eq, &row_cells[column], &self.work.cells[up + column]) != true) {
+                                    equal = false;
+                                    break;
+                                }
+                            }
+                            if (equal) {
+                                cycle = true;
+                                break;
+                            }
+                            const link = &self.work.cells[up + definition.path_column];
+                            ancestor = if (link.* == .null_value) null else @intCast(link.integer);
+                        }
+                        row_cells[definition.mark_column] = if (cycle) definition.mark_value else definition.mark_default;
+                    }
+                    if (definition.search) {
+                        var key: V.Text = .{};
+                        if (definition.breadth) {
+                            var depth: i64 = 0;
+                            if (parent) |up| {
+                                const above = &self.work.cells[up + definition.ord_column].text;
+                                depth = decodeDepth(above.slice()) + 1;
+                            }
+                            try appendKeyCell(&key, &.{ .integer = depth });
+                        } else if (parent) |up| {
+                            const above = &self.work.cells[up + definition.ord_column].text;
+                            try appendKeyBytes(&key, above.slice());
+                        }
+                        for (definition.search_columns[0..definition.search_count]) |column| try appendKeyCell(&key, &row_cells[column]);
+                        row_cells[definition.ord_column] = .{ .text = key };
+                    }
+                    if (definition.cycle and seed) row_cells[definition.path_column] = .null_value;
+                }
+            }
+
+            fn decodeDepth(bytes: []const u8) i64 {
+                if (bytes.len < 9) return 0;
+                var raw: u64 = 0;
+                for (bytes[1..9]) |byte| raw = (raw << 8) | byte;
+                return @bitCast(raw ^ (@as(u64, 1) << 63));
+            }
+
+            fn appendKeyBytes(key: *V.Text, bytes: []const u8) Error!void {
+                if (key.len + bytes.len > key.bytes.len) return error.TextCapacity;
+                @memcpy(key.bytes[key.len..][0..bytes.len], bytes);
+                key.len += bytes.len;
+            }
+
+            /// Order-preserving, self-delimiting key bytes: bytewise order of
+            /// the keys equals PostgreSQL's record (NULL last) / array order.
+            fn appendKeyCell(key: *V.Text, cell: *const V.Cell) Error!void {
+                if (cell.* == .null_value) return appendKeyBytes(key, &.{0x02});
+                try appendKeyBytes(key, &.{0x01});
+                const integer: ?i64 = switch (cell.*) {
+                    .integer => |value| value,
+                    .date => |value| value,
+                    .timestamp, .timestamptz => |value| value,
+                    .boolean => |value| @intFromBool(value),
+                    else => null,
+                };
+                if (integer) |value| {
+                    const raw: u64 = @as(u64, @bitCast(value)) ^ (@as(u64, 1) << 63);
+                    var bytes: [8]u8 = undefined;
+                    for (0..8) |index| bytes[index] = @truncate(raw >> @intCast(56 - index * 8));
+                    return appendKeyBytes(key, &bytes);
+                }
+                switch (cell.*) {
+                    .text => |*text| {
+                        for (text.slice()) |byte| {
+                            if (byte == 0) try appendKeyBytes(key, &.{ 0x00, 0x01 }) else try appendKeyBytes(key, &.{byte});
+                        }
+                        try appendKeyBytes(key, &.{ 0x00, 0x00 });
+                    },
+                    else => return error.UnsupportedStatement,
+                }
             }
 
             // ---- subqueries --------------------------------------------

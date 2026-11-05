@@ -1874,6 +1874,7 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectSymbol(.lparen);
                     cte.query = try self.query();
                     try self.expectSymbol(.rparen);
+                    if (self.mode == .standard) try self.searchCycle(&cte);
                     ctes[cte_count] = cte;
                     cte_count += 1;
                     if (!try self.takeSymbol(.comma)) break;
@@ -1942,6 +1943,52 @@ pub fn Parser(comptime config: types.Config) type {
                 if (!limited and try self.takeWord("LIMIT")) try self.countValue(&block.limit, &block.negative_limit);
             }
             return top;
+        }
+
+        /// [SEARCH {DEPTH|BREADTH} FIRST BY c, ... SET seq]
+        /// [CYCLE c, ... SET mark [TO value DEFAULT value] USING path]
+        /// after a WITH entry (B11). Columns are name-only nodes.
+        fn searchCycle(self: *Self, cte: *Ast.Cte) Error!void {
+            if (self.rawWord("search")) {
+                try self.advance();
+                if (self.rawWord("breadth")) {
+                    cte.search.breadth = true;
+                } else if (!self.rawWord("depth")) return error.Syntax;
+                try self.advance();
+                try self.expectWord("FIRST");
+                try self.expectWord("BY");
+                cte.search.columns = try self.nameList();
+                try self.expectWord("SET");
+                cte.search.set = try self.identifier();
+                cte.search.present = true;
+            }
+            if (self.isWord("CYCLE")) {
+                try self.advance();
+                cte.cycle.columns = try self.nameList();
+                try self.expectWord("SET");
+                cte.cycle.mark = try self.identifier();
+                if (try self.takeWord("TO")) {
+                    cte.cycle.mark_value = try self.primary();
+                    try self.expectWord("DEFAULT");
+                    cte.cycle.mark_default = try self.primary();
+                }
+                try self.expectWord("USING");
+                cte.cycle.path = try self.identifier();
+                cte.cycle.present = true;
+            }
+        }
+
+        /// `name, ...` as column nodes linked by `next`.
+        fn nameList(self: *Self) Error!u16 {
+            var head: u16 = none;
+            var last: u16 = none;
+            while (true) {
+                const node = try self.pool.add(.{ .kind = .column, .name = try self.identifier() });
+                if (last == none) head = node else self.pool.nodes[last].next = node;
+                last = node;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            return head;
         }
 
         /// UNION/EXCEPT (left-associative) over INTERSECT terms.

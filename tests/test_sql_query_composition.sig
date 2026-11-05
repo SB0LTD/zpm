@@ -619,6 +619,56 @@ fn tableFunctions() !void {
     try controlled("SELECT x,n FROM GENERATE_SERIES(1,3) WITH ORDINALITY AS t(x,n) ORDER BY n", "1|1;2|2;3|3");
 }
 
+// ---- PG.QUERY.RECURSIVE_SEARCH --------------------------------------------
+
+fn recursiveSearch() !void {
+    // oracle
+    try expectTyped("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SEARCH DEPTH FIRST BY n SET ord CYCLE n SET cyc USING path SELECT n,cyc FROM t ORDER BY n", "n:23,cyc:16", "1|f;2|f;3|f");
+    // A graph with the cycle 1->2->3->1 and the branch 1->4->5.
+    try run("CREATE TABLE edge(src INT,dst INT)");
+    try run("INSERT INTO edge VALUES(1,2),(2,3),(3,1),(1,4),(4,5)");
+    const graph = "WITH RECURSIVE r(node) AS (SELECT 1 UNION ALL SELECT e.dst FROM r JOIN edge e ON e.src=r.node) ";
+    // CYCLE emits the first repeated node marked and never expands it.
+    try expect(graph ++ "CYCLE node SET looped USING trail SELECT node,looped FROM r ORDER BY node,looped", "1|f;1|t;2|f;3|f;4|f;5|f");
+    try expect(graph ++ "SEARCH DEPTH FIRST BY node SET ord CYCLE node SET looped USING trail SELECT node FROM r ORDER BY ord", "1;2;3;1;4;5");
+    try expect(graph ++ "SEARCH BREADTH FIRST BY node SET ord CYCLE node SET looped USING trail SELECT node FROM r ORDER BY ord", "1;2;4;3;5;1");
+    try expect(graph ++ "SEARCH DEPTH FIRST BY node SET ord CYCLE node SET looped USING trail SELECT node FROM r ORDER BY ord DESC", "5;4;1;3;2;1");
+    try expectTyped(graph ++ "CYCLE node SET looped TO 'Y' DEFAULT 'N' USING trail SELECT node,looped FROM r WHERE looped='Y'", "node:23,looped:25", "1|Y");
+    try expect(graph ++ "CYCLE node SET looped TO 1 DEFAULT 0 USING trail SELECT SUM(looped),COUNT(*) FROM r", "1|6");
+    try expect(graph ++ "CYCLE node SET looped USING trail SELECT COUNT(*) FROM r", "6");
+    try expect("WITH RECURSIVE r(node) AS (SELECT 1 UNION SELECT e.dst FROM r JOIN edge e ON e.src=r.node) CYCLE node SET looped USING trail SELECT COUNT(*) FROM r", "6");
+    // SEARCH alone (a tree) and several search / cycle columns.
+    try expect("WITH RECURSIVE r(node) AS (SELECT 4 UNION ALL SELECT e.dst FROM r JOIN edge e ON e.src=r.node) SEARCH DEPTH FIRST BY node SET ord SELECT node FROM r ORDER BY ord", "4;5");
+    try expect("WITH RECURSIVE r(a,b) AS (SELECT 1,0 UNION ALL SELECT e.dst,b+1 FROM r JOIN edge e ON e.src=r.a WHERE b<6) CYCLE a,b SET c USING p SELECT COUNT(*) FROM r WHERE c", "0");
+    try expect("WITH RECURSIVE r(a,s) AS (SELECT 1,'x' UNION ALL SELECT a+1,s||'y' FROM r WHERE a<3) SEARCH BREADTH FIRST BY s,a SET o SELECT a,s FROM r ORDER BY o", "1|x;2|xy;3|xyy");
+    // NULL cycle values never equal, so they never close a cycle.
+    try expect("WITH RECURSIVE t(n,k) AS (SELECT 1,NULL::int UNION ALL SELECT n+1,k FROM t WHERE n<3) CYCLE k SET c USING p SELECT n,c FROM t ORDER BY n", "1|f;2|f;3|f");
+    try expect("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) CYCLE n SET c USING p SELECT COUNT(*) FROM t WHERE false", "0");
+    // The record-typed sequence and path columns are not exposed (0A000).
+    try rejects(graph ++ "SEARCH DEPTH FIRST BY node SET ord SELECT ord FROM r", error.UnsupportedStatement);
+    try rejects(graph ++ "CYCLE node SET looped USING trail SELECT trail FROM r", error.UnsupportedStatement);
+    try rejects(graph ++ "CYCLE node SET looped USING trail SELECT * FROM r", error.UnsupportedStatement);
+    try rejects(graph ++ "SEARCH DEPTH FIRST BY node SET ord SELECT node FROM r WHERE ord IS NULL", error.UnsupportedStatement);
+    // Errors.
+    try rejects("WITH t(n) AS (SELECT 1) SEARCH DEPTH FIRST BY n SET o SELECT 1", error.Syntax);
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1) CYCLE n SET c USING p SELECT 1", error.Syntax);
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SEARCH DEPTH FIRST BY z SET o SELECT 1", error.Syntax);
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SEARCH DEPTH FIRST BY n,n SET o SELECT 1", error.DuplicateColumn);
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SEARCH DEPTH FIRST BY n SET n SELECT 1", error.Syntax);
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) CYCLE n SET c USING c SELECT 1", error.Syntax);
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SEARCH DEPTH FIRST BY n SET o CYCLE n SET o USING p SELECT 1", error.Syntax);
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) CYCLE n SET c TO 1 DEFAULT true USING p SELECT 1", error.TypeMismatch);
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1.5 UNION ALL SELECT n+1 FROM t WHERE n<3) SEARCH DEPTH FIRST BY n SET o SELECT 1", error.UnsupportedStatement);
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SEARCH WIDTH FIRST BY n SET o SELECT 1", error.Syntax);
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) CYCLE n SET c USING SELECT 1", error.Syntax);
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT MAX(n)+1 FROM t) CYCLE n SET c USING p SELECT 1", error.UnsupportedStatement);
+    // Budgets: an acyclic infinite recursion exhausts the workspace, a
+    // deep depth-first key its text capacity (both 54000).
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t) CYCLE n SET c USING p SELECT COUNT(*) FROM t", error.WorkspaceCapacity);
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<20) SEARCH DEPTH FIRST BY n SET o SELECT COUNT(*) FROM t", error.TextCapacity);
+    try controlled(graph ++ "SEARCH DEPTH FIRST BY node SET ord CYCLE node SET looped USING trail SELECT node,looped FROM r ORDER BY ord", "1|f;2|f;3|f;1|t;4|f;5|f");
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try naturalJoins();
@@ -631,6 +681,7 @@ pub fn main(init: std.process.Init) !void {
     try cteMaterialization();
     try lateralJoins();
     try tableFunctions();
+    try recursiveSearch();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-query-composition\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
