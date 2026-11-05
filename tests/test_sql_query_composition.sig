@@ -496,6 +496,33 @@ fn groupingCube() !void {
     try check(small_result.row_count == 1 and small_result.rows[0].cells[0].integer == 123);
 }
 
+// ---- PG.QUERY.CTE_MATERIALIZATION -----------------------------------------
+
+fn cteMaterialization() !void {
+    // oracle
+    try expectTyped("WITH x AS NOT MATERIALIZED (SELECT id FROM tdd_a) SELECT * FROM x ORDER BY id", "id:23", "1;2;3;4");
+    try expect("WITH x AS MATERIALIZED (SELECT id FROM tdd_a) SELECT * FROM x ORDER BY id", "1;2;3;4");
+    try expect("WITH x(a) AS MATERIALIZED (SELECT id FROM tdd_a WHERE id<3), y AS NOT MATERIALIZED (SELECT a*10 AS b FROM x) SELECT a,b FROM x JOIN y ON b=a*10 ORDER BY a", "1|10;2|20");
+    try expect("WITH RECURSIVE r(n) AS MATERIALIZED (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<3) SELECT * FROM r", "1;2;3");
+    try expect("WITH RECURSIVE r(n) AS NOT MATERIALIZED (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<3) SELECT COUNT(*) FROM r", "3");
+    // A volatile body is never inlined: every reference sees one evaluation.
+    try run("CREATE SEQUENCE ms");
+    try expect("WITH s AS NOT MATERIALIZED (SELECT nextval('ms') AS n) SELECT a.n,b.n FROM s a,s b", "1|1");
+    try expect("WITH s AS MATERIALIZED (SELECT nextval('ms') AS n) SELECT a.n=b.n FROM s a,s b", "t");
+    try expect("SELECT currval('ms')", "2");
+    // Duplicates, NULLs and empty bodies pass through unchanged.
+    try expect("WITH x AS NOT MATERIALIZED (SELECT v FROM tdd_a UNION ALL SELECT v FROM tdd_a WHERE v IS NULL) SELECT v FROM x ORDER BY v NULLS FIRST", "NULL;NULL;10;20;30");
+    try expect("WITH x AS MATERIALIZED (SELECT id FROM tdd_a WHERE false) SELECT COUNT(*) FROM x", "0");
+    // An unreferenced CTE is not executed.
+    try expect("WITH x AS NOT MATERIALIZED (SELECT 1/0) SELECT 1", "1");
+    // Errors.
+    try rejects("WITH x AS NOT (SELECT 1) SELECT 1", error.Syntax);
+    try rejects("WITH x AS MATERIALIZED SELECT 1", error.Syntax);
+    try rejects("WITH x AS MATERIALIZED MATERIALIZED (SELECT 1) SELECT 1", error.Syntax);
+    try rejects("WITH x AS NOT MATERIALIZED (SELECT 1), x AS (SELECT 2) SELECT 1", error.Syntax);
+    try controlled("WITH x AS NOT MATERIALIZED (SELECT id FROM tdd_a) SELECT * FROM x ORDER BY id", "1;2;3;4");
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try naturalJoins();
@@ -505,6 +532,7 @@ pub fn main(init: std.process.Init) !void {
     try fetchTies();
     try groupingSets();
     try groupingCube();
+    try cteMaterialization();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-query-composition\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

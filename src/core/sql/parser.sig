@@ -1860,6 +1860,17 @@ pub fn Parser(comptime config: types.Config) type {
                         try self.expectSymbol(.rparen);
                     }
                     try self.expectWord("AS");
+                    // [NOT] MATERIALIZED (B11): the engine always materializes
+                    // once; PostgreSQL never inlines volatile bodies, so rows
+                    // are the same either way.
+                    if (self.rawWord("materialized")) {
+                        try self.advance();
+                        cte.materialized = 1;
+                    } else if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "materialized")) {
+                        try self.advance();
+                        try self.advance();
+                        cte.materialized = 2;
+                    }
                     try self.expectSymbol(.lparen);
                     cte.query = try self.query();
                     try self.expectSymbol(.rparen);
