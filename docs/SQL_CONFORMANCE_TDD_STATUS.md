@@ -1,5 +1,31 @@
 # SQL conformance TDD checkpoint
 
+## Routines candidate (lane B11, wave 3) - 5 November 2026
+
+Branch `b11/routines` (rebased on f505a80) closes four smoke programs
+test-first: PG.ROUTINE.FUNCTION, PG.ROUTINE.PROCEDURE, PG.ROUTINE.TRIGGER
+and PG.ROUTINE.RULE. The unchanged driver moves from 79 passes to 83; it
+still exits 1 SqlConformanceIncomplete and no other program changed.
+`contract-sql-routines` (tests/test_sql_routines.sig, 663 assertions)
+covers values, column names and OIDs, command tags, exact SQLSTATEs (42883,
+42725, 42723, 42P13, 42809, 42P17, 42710, 42704, 42601, 42703, 42702,
+2BP01, 0A000, P0001, P0002, P0003, 2F005, 20000, 22004, 22005, 22012,
+22P02, 23502, 23505, 54000, 54001, 57014), statement atomicity, two-
+transaction schedules (pending CREATE / DROP FUNCTION visibility and waits,
+CREATE TRIGGER against a writer, a DO block restarted after a lock wait),
+work budgets and cancellation inside routine loops, capacities, crafted
+change records and replay of every committed record into a replica that
+must answer, and fire its triggers and rules, like the primary. Only the
+four oracle programs are native-verified; every other expectation is
+pending native verification. Details, limits and open items:
+docs/SQL_ROUTINES.md.
+
+Durability: routines, triggers and rules are their own MVCC catalog objects
+with change-record ops 60-65 (60/61 create/drop routine, 62/63 trigger,
+64/65 rule; 66-69 reserved), each a length-prefixed payload validated
+before anything applies. Existing records and the definition format are
+unchanged.
+
 ## Transaction and session candidate (lane B11, wave 3) - 5 November 2026
 
 Branch `b11/tx-session` (on 20e7528) closes eight smoke programs

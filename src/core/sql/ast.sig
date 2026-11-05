@@ -87,7 +87,13 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     xmlparse, xmlserialize, xml_is_well_formed, xml_is_well_formed_document, xml_is_well_formed_content,
     // Session functions (tx-session lane, Database session hook; volatile).
     current_setting, set_config, pg_try_advisory_lock, pg_try_advisory_lock_shared, pg_try_advisory_xact_lock, pg_try_advisory_xact_lock_shared,
-    pg_advisory_unlock, pg_advisory_unlock_shared, pg_backend_pid };
+    pg_advisory_unlock, pg_advisory_unlock_shared, pg_backend_pid,
+    // Routines (B11 wave 3, routine_catalog.sig): a call of a user function
+    // (`integer` its routine slot; arguments `b` -> next, converted to the
+    // parameter types) and a bound routine variable (`relation` 0 a
+    // parameter / PL/pgSQL variable `integer`, 1 NEW.`column`, 2
+    // OLD.`column`), read from the evaluation frame.
+    routine, routine_param };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,

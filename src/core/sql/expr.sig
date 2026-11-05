@@ -301,7 +301,57 @@ pub fn Eval(comptime config: types.Config) type {
             /// Enclosing block's context (correlated columns, `level` > 0).
             outer: ?*const Context = null,
             hook: ?*const Hook = null,
+            /// Routine frame (B11 wave 3) read by routine_param nodes; the
+            /// innermost context with one wins, else Session.routine_frame.
+            frame: ?*const Frame = null,
         };
+
+        /// Values of a running routine: parameters / PL/pgSQL variables and
+        /// the NEW and OLD rows of a trigger (null: a NULL record).
+        pub const Frame = struct {
+            cells: [*]const V.Cell,
+            count: usize = 0,
+            new: ?*const Row = null,
+            old: ?*const Row = null,
+        };
+
+        fn routineFrame(ctx: *const Context) ?*const Frame {
+            var current: ?*const Context = ctx;
+            while (current) |entry| : (current = entry.outer) {
+                if (entry.frame) |frame| return frame;
+            }
+            const shared = ctx.session.routine_frame orelse return null;
+            return @ptrCast(@alignCast(shared));
+        }
+
+        fn routineValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const frame = routineFrame(ctx) orelse return error.UnsupportedStatement;
+            switch (n.relation) {
+                0 => {
+                    if (n.integer < 0 or n.integer >= frame.count) return error.UnsupportedStatement;
+                    return frame.cells[@intCast(n.integer)];
+                },
+                1 => return if (frame.new) |row| row[n.column] else .null_value,
+                else => return if (frame.old) |row| row[n.column] else .null_value,
+            }
+        }
+
+        /// A user function call through the session's routine hook; every
+        /// argument is evaluated once, left to right.
+        fn routineCall(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const hook = ctx.session.routines orelse return error.UnsupportedStatement;
+            var args: [config.routine_args]V.Cell = undefined;
+            var count: usize = 0;
+            var item = n.b;
+            while (item != none) : (item = node(ctx, item).next) {
+                if (count == args.len) return error.ColumnCapacity;
+                args[count] = try eval(ctx, item);
+                count += 1;
+            }
+            var out: V.Cell = .null_value;
+            try hook.call(hook.ptr, @intCast(n.integer), &args, count, &out);
+            return out;
+        }
 
         const null_cell: V.Cell = .null_value;
 
@@ -1190,6 +1240,8 @@ pub fn Eval(comptime config: types.Config) type {
                             return .{ .text = pair };
                         }
                     },
+                    .routine => return routineCall(ctx, n),
+                    .routine_param => return routineValue(ctx, n),
                     .none => unreachable,
                 },
                 // $n of an EXECUTEd SQL prepared statement (tx-session lane).

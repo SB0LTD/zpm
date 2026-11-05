@@ -24,6 +24,7 @@ const value = @import("value.sig");
 const sequence = @import("sequence.sig");
 const parser = @import("parser.sig");
 const array_module = @import("array.sig");
+const routine_catalog = @import("routine_catalog.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -35,6 +36,7 @@ pub fn Binder(comptime config: types.Config) type {
     const E = expr.Eval(config);
     const Io = value.Io(config);
     const P = parser.Parser(config);
+    const RC = routine_catalog.Catalog(config);
     return struct {
         /// INTEGER outside the PostgreSQL dialect and in legacy replay.
         pub const integer_type: types.DataType = if (config.integer_bits == 32) .integer32 else .integer;
@@ -326,6 +328,12 @@ pub fn Binder(comptime config: types.Config) type {
             /// Declared parameter types of an EXECUTEd SQL prepared
             /// statement ($n nodes; their values are in the session).
             params: ?*const Parameters = null,
+            // Routines (B11 wave 3).
+            /// User functions resolvable by name; null: none.
+            routines: ?*const RC.Set = null,
+            /// Variables of the running routine (parameters, PL/pgSQL
+            /// variables, NEW/OLD): names that no column binds read them.
+            variables: ?*const RoutineVariables = null,
 
             fn node(self: *const Context, id: u16) *ast.Node {
                 return &self.pool.nodes[id];
@@ -361,6 +369,43 @@ pub fn Binder(comptime config: types.Config) type {
 
         pub const no_cte: u8 = 0xff;
         pub const group_relation = ast.groupRelation(config);
+
+        /// One routine variable visible to expressions (B11 wave 3).
+        pub const RoutineVariable = struct { name: V.Name = .{}, ty: ast.Type = .int4, typmod: i32 = -1 };
+
+        /// The variables of a routine frame, in frame order.
+        pub const RoutineVariables = struct {
+            items: [config.routine_variables]RoutineVariable = undefined,
+            count: usize = 0,
+            /// PL/pgSQL (variable_conflict = error): a name that is both a
+            /// column and a variable is 42702. SQL routines prefer the column.
+            conflict_error: bool = false,
+            /// Trigger NEW / OLD: the rowtype of this table (null: none).
+            record_table: ?*const S.Table = null,
+            /// `routine.parameter` qualifies a parameter (SQL functions).
+            routine_name: V.Name = .{},
+            /// Parameters of the routine (the first `parameters` items).
+            parameters: usize = 0,
+            /// Only nodes in pool[node_low..node_high] (the routine's own
+            /// statement or expression) see the variables; view texts and
+            /// stored expressions bound with it never do.
+            node_low: usize = 0,
+            node_high: usize = 0,
+
+            pub fn covers(self: *const RoutineVariables, pool: *const Ast.Pool, n: *const ast.Node) bool {
+                const index = (@intFromPtr(n) - @intFromPtr(&pool.nodes[0])) / @sizeOf(ast.Node);
+                return index >= self.node_low and index < self.node_high;
+            }
+
+            pub fn find(self: *const RoutineVariables, name: []const u8) ?usize {
+                var index = self.count;
+                while (index != 0) {
+                    index -= 1;
+                    if (types.same(self.items[index].name.slice(), name)) return index;
+                }
+                return null;
+            }
+        };
 
         /// A FROM item visible to expressions: a base table, or the result
         /// of a derived table / CTE plan.
@@ -1554,6 +1599,11 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = false;
                     return;
                 },
+                // Bound routine calls and variables (B11 wave 3).
+                .routine, .routine_param => {
+                    n.constant = false;
+                    return;
+                },
                 // Built by typePairAggregate with typed arguments.
                 .aggregate_pair => return,
                 else => {},
@@ -1580,7 +1630,8 @@ pub fn Binder(comptime config: types.Config) type {
                     if(scope.saw_aggregate) |flag| flag.*=true;
                 },
                 .window_call => unreachable,
-                .none => return error.UndefinedFunction,
+                .routine, .routine_param => {},
+                .none => return bindRoutineCall(context, n, count),
                 .greatest, .least => {
                     if (count == 0) return error.Syntax;
                     var target: ast.Type = .unknown;
@@ -3100,6 +3151,14 @@ pub fn Binder(comptime config: types.Config) type {
                     n.ty = .numeric;
                 },
                 .param => {
+                    // `$n` of a routine body is its n-th parameter (B11 wave 3).
+                    if (context.variables) |variables| if (variables.covers(context.pool, n)) {
+                        if (n.integer < 1 or n.integer > variables.parameters) return error.UndefinedParameter;
+                        const index: usize = @intCast(n.integer - 1);
+                        const item = &variables.items[index];
+                        bindVariableNode(n, 0, index, 0, item.ty, item.typmod);
+                        return;
+                    };
                     const params = context.params orelse return error.UndefinedParameter;
                     // PREPARE without a declared type for $n (PostgreSQL
                     // infers one from context; not here): 42P18.
@@ -4094,9 +4153,176 @@ pub fn Binder(comptime config: types.Config) type {
         /// Resolves a column through the scope chain: qualified names match
         /// a FROM item's alias (else table/CTE name), unqualified names
         /// must be unique among the block's items (42702).
+        // ---- routines (B11 wave 3) -------------------------------------------
+
+        /// A user function call: the visible functions of that name whose
+        /// parameters accept the argument types (an exact type counts more
+        /// than an implicit cast); several equally good ones are 42725.
+        /// Arguments are converted to the parameter types; the routine hook
+        /// evaluates the body when the call runs.
+        fn bindRoutineCall(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const set = context.routines orelse return error.UndefinedFunction;
+            const name = toName(context, n.name);
+            var best: ?usize = null;
+            var best_exact: usize = 0;
+            var ambiguous = false;
+            for (&set.routines, 0..) |*routine, index| {
+                if (!routine.live or routine.namespace != catalog.public_namespace or !routine.stamp.visible(context.snapshot)) continue;
+                if (!types.same(routine.name.slice(), name.slice()) or routine.arg_count != count) continue;
+                var exact: usize = 0;
+                var accepted = true;
+                var item = n.b;
+                var position: usize = 0;
+                while (item != none) : ({
+                    item = context.node(item).next;
+                    position += 1;
+                }) {
+                    const from = context.node(item).ty;
+                    const data = types.typeFromOid(routine.arg_oids[position]) orelse {
+                        accepted = false;
+                        break;
+                    };
+                    const to = types.typeOfData(data);
+                    // An exact type counts most; an untyped literal prefers
+                    // the string category's preferred type (text).
+                    if (from == to) {
+                        exact += 2;
+                    } else if (from == .unknown) {
+                        if (to == .text) exact += 1;
+                    } else if (!value.castable(from, to, .implicit)) {
+                        accepted = false;
+                        break;
+                    }
+                }
+                if (!accepted) continue;
+                if (best == null or exact > best_exact) {
+                    best = index;
+                    best_exact = exact;
+                    ambiguous = false;
+                } else if (exact == best_exact) ambiguous = true;
+            }
+            const chosen = best orelse return error.UndefinedFunction;
+            if (ambiguous) return error.AmbiguousFunction;
+            const routine = &set.routines[chosen];
+            // A procedure is CALLed (42809); trigger functions only fire (0A000).
+            if (routine.kind == 'p') return error.WrongObjectType;
+            if (routine.return_oid == routine_catalog.trigger_oid) return error.UnsupportedStatement;
+            const result = types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
+            var head: u16 = none;
+            var tail: u16 = none;
+            var item = n.b;
+            var position: usize = 0;
+            while (item != none) : (position += 1) {
+                const next = context.node(item).next;
+                const to = types.typeOfData(types.typeFromOid(routine.arg_oids[position]) orelse return error.UndefinedFunction);
+                const converted = try convert(context, item, to, -1, .implicit);
+                context.node(converted).next = none;
+                if (tail == none) head = converted else context.node(tail).next = converted;
+                tail = converted;
+                item = next;
+            }
+            n.b = head;
+            n.func = .routine;
+            n.integer = @intCast(chosen);
+            n.ty = types.typeOfData(result);
+            n.typmod = routine.return_typmod;
+            n.constant = false;
+        }
+
+        /// A column reference that names a routine variable: `name` (a
+        /// parameter or PL/pgSQL variable), `routine.parameter`, or
+        /// `new.column` / `old.column` in a trigger. PL/pgSQL rejects a name
+        /// that is also a visible column (42702); SQL routines let the column
+        /// win. Returns false when the name is not a variable.
+        fn resolveVariable(context: *const Context, scope: *const Scope, variables: *const RoutineVariables, n: *ast.Node, wanted: V.Name, qualifier: ?V.Name) Error!bool {
+            if (!variables.covers(context.pool, n)) return false;
+            if (qualifier) |q| {
+                const record: u8 = if (types.same(q.slice(), "new")) 1 else if (types.same(q.slice(), "old")) 2 else 0;
+                if (record != 0) if (variables.record_table) |table| {
+                    if (relationNamed(scope, q.slice())) return false;
+                    for (table.columns[0..table.column_count], 0..) |*column, index| {
+                        if (!types.same(column.name.slice(), wanted.slice())) continue;
+                        bindVariableNode(n, record, 0, @intCast(index), types.typeOfData(column.data_type), column.typmod);
+                        return true;
+                    }
+                    return error.ColumnNotFound;
+                };
+                if (variables.routine_name.len != 0 and types.same(q.slice(), variables.routine_name.slice())) {
+                    if (relationNamed(scope, q.slice())) return false;
+                    const index = variables.find(wanted.slice()) orelse return false;
+                    if (index >= variables.parameters) return false;
+                    const item = &variables.items[index];
+                    bindVariableNode(n, 0, index, 0, item.ty, item.typmod);
+                    return true;
+                }
+                return false;
+            }
+            const index = variables.find(wanted.slice()) orelse return false;
+            if (columnVisible(context, scope, wanted.slice())) {
+                if (variables.conflict_error) return error.AmbiguousColumn;
+                return false;
+            }
+            const item = &variables.items[index];
+            bindVariableNode(n, 0, index, 0, item.ty, item.typmod);
+            return true;
+        }
+
+        fn bindVariableNode(n: *ast.Node, record: u8, index: usize, column: u16, ty: ast.Type, typmod: i32) void {
+            n.kind = .function;
+            n.func = .routine_param;
+            n.relation = record;
+            n.integer = @intCast(index);
+            n.column = column;
+            n.ty = ty;
+            n.typmod = typmod;
+            n.level = 0;
+            n.constant = false;
+            n.a = none;
+            n.b = none;
+            n.c = none;
+        }
+
+        fn relationNamed(scope: *const Scope, name: []const u8) bool {
+            var current: ?*const Scope = scope;
+            while (current) |s| : (current = s.parent) {
+                for (s.rels[s.rel_first..s.rel_count]) |*rel| if (types.same(rel.name.slice(), name)) return true;
+            }
+            return false;
+        }
+
+        fn columnVisible(context: *const Context, scope: *const Scope, name: []const u8) bool {
+            var current: ?*const Scope = scope;
+            while (current) |s| : (current = s.parent) {
+                for (s.rels[s.rel_first..s.rel_count]) |*rel| if (findColumn(context, rel, name) != null) return true;
+                for (s.using[0..s.using_count]) |*entry| if (types.same(entry.name.slice(), name)) return true;
+            }
+            return false;
+        }
+
+        /// Binds a standalone routine expression (a PL/pgSQL expression or a
+        /// SQL function's result expression) parsed into the pool: names
+        /// resolve to `context.variables` only (no FROM item); subqueries
+        /// need `context.plans`. With `target` the value is converted like
+        /// an assignment to it (PL/pgSQL assignment, RETURN, conditions).
+        pub fn bindRoutineExpression(context: *const Context, id: u16, target: ?*const V.Column) Error!u16 {
+            const scope: Scope = .{};
+            try typeExpr(context, &scope, id);
+            const n = context.node(id);
+            if (n.kind == .aggregate) return error.GroupingError;
+            if (n.kind == .function and n.window != none) return error.WindowingError;
+            const column = target orelse {
+                if (n.ty == .unknown) try coerce(context, id, .text);
+                return id;
+            };
+            const bound = try assignment(context, id, column);
+            if (column.data_type == .boolean and context.node(bound).ty != .boolean) return error.TypeMismatch;
+            return bound;
+        }
+
         fn resolveColumn(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
             const wanted = toName(context, n.name);
             const qualifier: ?V.Name = if (n.qualifier.len != 0) toName(context, n.qualifier) else null;
+            if (context.variables) |variables| if (try resolveVariable(context, scope, variables, n, wanted, qualifier)) return;
             var current: ?*const Scope = scope;
             var level: u8 = 0;
             while (current) |s| {

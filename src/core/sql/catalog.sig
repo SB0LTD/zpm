@@ -44,7 +44,9 @@ pub const information_namespace: u32 = 13000;
 /// table under the statement snapshot. Columns PostgreSQL declares as
 /// "char", regproc, int2vector, character_data or yes_or_no are text here;
 /// sql_identifier columns are name (OID 19), cardinal_number int4.
-pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_index, pg_attrdef, pg_sequence, schemata, tables, columns, table_constraints, key_column_usage, pg_indexes, pg_views, pg_matviews, pg_inherits };
+pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_index, pg_attrdef, pg_sequence, schemata, tables, columns, table_constraints, key_column_usage, pg_indexes, pg_views, pg_matviews, pg_inherits,
+    // Routines, triggers and rules (B11 wave 3).
+    pg_proc, pg_trigger, pg_rewrite, pg_rules };
 
 pub const ViewColumn = struct { name: []const u8, ty: types.Type };
 
@@ -67,6 +69,11 @@ const pg_indexes_columns = [_]ViewColumn{ col("schemaname", .name), col("tablena
 const pg_views_columns = [_]ViewColumn{ col("schemaname", .name), col("viewname", .name), col("viewowner", .name), col("definition", .text) };
 const pg_matviews_columns = [_]ViewColumn{ col("schemaname", .name), col("matviewname", .name), col("matviewowner", .name), col("tablespace", .name), col("hasindexes", .boolean), col("ispopulated", .boolean), col("definition", .text) };
 const pg_inherits_columns = [_]ViewColumn{ col("inhrelid", .oid), col("inhparent", .oid), col("inhseqno", .int4), col("inhdetachpending", .boolean) };
+// pg_proc.prolang is shown as the language name (its OID is per database).
+const pg_proc_columns = [_]ViewColumn{ col("oid", .oid), col("proname", .name), col("pronamespace", .oid), col("prokind", .text), col("prolang", .name), col("provolatile", .text), col("proisstrict", .boolean), col("pronargs", .int2), col("prorettype", .oid), col("proargtypes", .text), col("prosrc", .text) };
+const pg_trigger_columns = [_]ViewColumn{ col("oid", .oid), col("tgrelid", .oid), col("tgname", .name), col("tgfoid", .oid), col("tgtype", .int2), col("tgenabled", .text), col("tgisinternal", .boolean), col("tgnargs", .int2) };
+const pg_rewrite_columns = [_]ViewColumn{ col("oid", .oid), col("rulename", .name), col("ev_class", .oid), col("ev_type", .text), col("ev_enabled", .text), col("is_instead", .boolean) };
+const pg_rules_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("rulename", .name), col("definition", .text) };
 const key_column_usage_columns = [_]ViewColumn{ col("constraint_catalog", .name), col("constraint_schema", .name), col("constraint_name", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4) };
 
 pub fn viewColumns(view: View) []const ViewColumn {
@@ -87,13 +94,17 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_views => &pg_views_columns,
         .pg_matviews => &pg_matviews_columns,
         .pg_inherits => &pg_inherits_columns,
+        .pg_proc => &pg_proc_columns,
+        .pg_trigger => &pg_trigger_columns,
+        .pg_rewrite => &pg_rewrite_columns,
+        .pg_rules => &pg_rules_columns,
     };
 }
 
 /// pg_catalog views resolve unqualified (pg_catalog is searched first);
 /// information_schema views only when qualified.
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
-    const catalog_views = [_]View{ .pg_type, .pg_namespace, .pg_class, .pg_attribute, .pg_index, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits };
+    const catalog_views = [_]View{ .pg_type, .pg_namespace, .pg_class, .pg_attribute, .pg_index, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;

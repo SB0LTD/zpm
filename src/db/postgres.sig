@@ -1436,6 +1436,16 @@ pub fn Session(comptime DB: type) type {
                 .listen => "listen",
                 .notify => "notify",
                 .unlisten => "unlisten",
+                .create_function => "CREATE FUNCTION",
+                .drop_function => "DROP FUNCTION",
+                .create_procedure => "CREATE PROCEDURE",
+                .drop_procedure => "DROP PROCEDURE",
+                .call => "CALL",
+                .do_block => "DO",
+                .create_trigger => "CREATE TRIGGER",
+                .drop_trigger => "DROP TRIGGER",
+                .create_rule => "CREATE RULE",
+                .drop_rule => "DROP RULE",
                 else => "",
             };
         }
@@ -1466,6 +1476,8 @@ pub fn Session(comptime DB: type) type {
                 try w.append("NOTIFY");
             } else if (equal(completed_command, "unlisten")) {
                 try w.append("UNLISTEN");
+            } else if (completed_command.len != 0 and completed_command[0] >= 'A' and completed_command[0] <= 'Z') {
+                try w.append(completed_command);
             } else if (equal(completed_command, "create_sequence")) {
                 try w.append("CREATE SEQUENCE");
             } else if (equal(completed_command, "drop_sequence")) {
@@ -1634,6 +1646,17 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "NotAnXmlDocument")) return "2200L";
     if (equal(name, "InvalidTablesampleArgument")) return "2202H";
     if (equal(name, "InvalidTablesampleRepeat")) return "2202G";
+    // Routines, triggers and rules (B11 wave 3).
+    if (equal(name, "DuplicateFunction")) return "42723";
+    if (equal(name, "InvalidFunctionDefinition")) return "42P13";
+    if (equal(name, "RaiseException")) return "P0001";
+    if (equal(name, "NoDataFound")) return "P0002";
+    if (equal(name, "TooManyRows")) return "P0003";
+    if (equal(name, "FunctionExecutedNoReturn")) return "2F005";
+    if (equal(name, "CaseNotFound")) return "20000";
+    if (equal(name, "StackDepthExceeded")) return "54001";
+    if (equal(name, "NullValueNotAllowed")) return "22004";
+    if (equal(name, "ErrorInAssignment")) return "22005";
     if (equal(name, "TypeMismatch")) return "42804";
     if (equal(name, "IntegerOverflow")) return "22003";
     if (equal(name, "ProtocolViolation")) return "08P01";

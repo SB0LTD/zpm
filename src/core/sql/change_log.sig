@@ -41,6 +41,13 @@
 //!                     is_called u8 (options and state after ALTER SEQUENCE)
 //!    15 create_schema oid u32, name
 //!    16 drop_schema   oid u32 (the schema holds no table at that point)
+//!    60-65 routines, triggers and rules (B11 wave 3): payload_len u32 +
+//!                     payload, decoded by routine_catalog.sig: 60
+//!                     create_routine, 61 drop_routine, 62 create_trigger,
+//!                     63 drop_trigger, 64 create_rule, 65 drop_rule (66-69
+//!                     reserved). A dropped table's triggers and rules are
+//!                     dropped by their own ops first; a dropped routine has
+//!                     no trigger left.
 //!   Definitions (ops 1 and 12) use expr_format_version 3 only when they
 //!   need it (older definitions stay byte-identical): column flags bit 5
 //!   VIRTUAL; constraint kinds 4 FOREIGN KEY (then ref_oid u32, one
@@ -98,6 +105,7 @@ const bit_string = @import("bit_string.sig");
 const array = @import("array.sig");
 const range = @import("range.sig");
 const network = @import("network.sig");
+const routine_catalog = @import("routine_catalog.sig");
 const Error = types.Error;
 
 fn std_zero(bytes: []const u8) bool {
@@ -117,7 +125,7 @@ pub const definition_format_version: u16 = 2;
 /// definitions keep versions 1 and 2 byte for byte).
 pub const extensions_format_version: u16 = 3;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16 };
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65 };
 
 fn Unsigned(comptime T: type) type {
     return switch (T) {
@@ -235,8 +243,16 @@ pub fn ChangeLog(comptime config: types.Config) type {
         while (capacity < entries * 4) capacity *= 2;
         break :blk capacity;
     };
+    const RC = routine_catalog.Catalog(config);
     return struct {
         // ----- encoding -------------------------------------------------
+
+        /// An object op (B11 wave 3): tag, payload length u32, payload.
+        pub fn encodeObject(writer: *Writer, tag: Op, payload: []const u8) Error!void {
+            try writer.op(tag);
+            try writer.int(u32, @intCast(payload.len));
+            try writer.bytes(payload);
+        }
 
         pub fn encodeValue(writer: *Writer, cell: *const V.Cell) Error!void {
             switch (cell.*) {
@@ -615,7 +631,30 @@ pub fn ChangeLog(comptime config: types.Config) type {
             tables: [config.tables]VTable = undefined,
             seqs: [config.sequences]VSeq = undefined,
             schemas: [config.schemas]VSchema = undefined,
+            /// Routines, triggers and rules (B11 wave 3).
+            objects: RC.Overlay = .{},
         };
+
+        /// What object ops (routine_catalog.validateOp) may ask the overlay.
+        fn ObjectChecks(comptime D: type) type {
+            return struct {
+                db: D,
+                scratch: *Scratch,
+
+                pub fn oidTaken(self: @This(), oid: u32) bool {
+                    return oidTakenIn(self.db, self.scratch, oid, 1);
+                }
+
+                pub fn tableLive(self: @This(), oid: u32) bool {
+                    _ = findVTable(self.scratch, oid) catch return false;
+                    return true;
+                }
+
+                pub fn namespaceKnown(self: @This(), namespace: u32) bool {
+                    return knownNamespace(self.scratch, namespace);
+                }
+            };
+        }
 
         const SequenceDefinition = struct { oid: u32, name: V.Name, spec: sequence.Spec, owner: u32, owner_column: u8 };
 
@@ -692,6 +731,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
         /// still holds: a table and its primary-key index (oid + 1), or a
         /// sequence. Database slots count until reclaimed, even uncommitted.
         fn oidTaken(db: anytype, scratch: *const Scratch, oid: u32, width: u32) bool {
+            for (&scratch.objects.objects) |*object| if (object.live and overlaps(object.oid, 1, oid, width)) return true;
+            return oidTakenIn(db, scratch, oid, width);
+        }
+
+        fn oidTakenIn(db: anytype, scratch: *const Scratch, oid: u32, width: u32) bool {
             for (&scratch.tables) |*vt| if (vt.live) {
                 if (overlaps(vt.oid, 1 + @as(u32, @intFromBool(vt.keyed)), oid, width)) return true;
                 for (vt.index_oids[0..vt.index_count]) |index_oid| if (overlaps(index_oid, 1, oid, width)) return true;
@@ -1341,6 +1385,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             for (&scratch.schemas, &db.schemas) |*vs, *schema| {
                 vs.* = .{ .live = schema.live and !schema.pending_create and schema.dead_csn == 0, .oid = schema.oid, .name = schema.name };
             }
+            RC.beginOverlay(&scratch.objects, &db.objects);
             var next_oid: u32 = first_oid + db.oid_counter;
             var reader = Reader{ .bytes = record };
             var row: V.Row = .{};
@@ -1528,6 +1573,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const index = try findVSchema(scratch, try reader.int(u32));
                         for (&scratch.tables) |*vt| if (vt.live and vt.namespace == scratch.schemas[index].oid) return error.ChangeRecordConflict;
                         scratch.schemas[index].live = false;
+                    },
+                    @intFromEnum(Op.create_routine)...@intFromEnum(Op.drop_rule) => {
+                        const payload = try reader.take(try reader.int(u32));
+                        const checks: ObjectChecks(@TypeOf(db)) = .{ .db = db, .scratch = scratch };
+                        if (try RC.validateOp(&scratch.objects, tag, payload, checks)) |oid| next_oid = @max(next_oid, oid + 1);
                     },
                     @intFromEnum(Op.create_sequence), @intFromEnum(Op.create_sequence_cached) => {
                         var definition = try decodeCreateSequence(&reader);
@@ -1755,6 +1805,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             schema.live = false;
                             break;
                         };
+                    },
+                    @intFromEnum(Op.create_routine)...@intFromEnum(Op.drop_rule) => {
+                        const payload = try reader.take(try reader.int(u32));
+                        try db.replayObject(tag, payload, csn);
                     },
                     @intFromEnum(Op.create_sequence), @intFromEnum(Op.create_sequence_cached) => {
                         var definition = try decodeCreateSequence(&reader);
