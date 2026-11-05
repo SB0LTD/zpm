@@ -323,5 +323,5 @@ test "ptxas's kernels from their listings (Galaxy's probes, the coverage and LFM
         try testing.expectEqual(try want.field(head, "params"), k.params);
         n += 1;
     }
-    try testing.expectEqual(@as(usize, 25), n);
+    try testing.expectEqual(@as(usize, 26), n);
 }

@@ -887,7 +887,7 @@ test "ptxas's kernels without their fields: scheduled, checked, compared with pt
         try testing.expectEqual(@as(u32, 0), bad);
         n_kernels += 1;
     }
-    try testing.expectEqual(@as(usize, 25), n_kernels);
+    try testing.expectEqual(@as(usize, 26), n_kernels);
 }
 
 test "stalls past 15 cycles: NOPs after the instruction" {

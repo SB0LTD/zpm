@@ -54,7 +54,7 @@
 //! .fused on sm_120) are IEEE binary32, round to nearest even; with
 //! Caps.denormals == .flush every float op carries .FTZ. fmin/fmax are
 //! FMNMX (IEEE minNum/maxNum, -0 below +0). ffloor .. frne are FRND.
-//! cvt to an integer is F2I (saturating, NaN to 0), from one I2FP or I2F
+//! cvt to an integer is F2I...NTZ (saturating, NaN to 0), from one I2FP or I2F
 //! with the rounding; f32 to f16 F2FP (nearest even) or F2F (directed),
 //! f16 to f32 HADD2.F32 (exact). The approximate ops are MUFU (sin and cos
 //! of the angle times 1/2pi, as ptxas does).
@@ -1741,11 +1741,13 @@ const Ctx = struct {
         if (from == .f32 and intTy.is(to)) {
             const u = to == .u32;
             const fz = c.ftz();
+            // (.NTZ: NaN to 0, as ptxas has every cvt to an integer;
+            // without it the RTX gives NaN as 0x80000000, signed or not)
             const name: []const u8 = switch (cv.round) {
-                .rz => if (u) (if (fz) "F2I.FTZ.U32.TRUNC" else "F2I.U32.TRUNC") else (if (fz) "F2I.FTZ.TRUNC" else "F2I.TRUNC"),
-                .rd => if (u) (if (fz) "F2I.FTZ.U32.FLOOR" else "F2I.U32.FLOOR") else (if (fz) "F2I.FTZ.FLOOR" else "F2I.FLOOR"),
-                .ru => if (u) (if (fz) "F2I.FTZ.U32.CEIL" else "F2I.U32.CEIL") else (if (fz) "F2I.FTZ.CEIL" else "F2I.CEIL"),
-                .rne => if (u) (if (fz) "F2I.FTZ.U32" else "F2I.U32") else (if (fz) "F2I.FTZ" else "F2I"),
+                .rz => if (u) (if (fz) "F2I.FTZ.U32.TRUNC.NTZ" else "F2I.U32.TRUNC.NTZ") else (if (fz) "F2I.FTZ.TRUNC.NTZ" else "F2I.TRUNC.NTZ"),
+                .rd => if (u) (if (fz) "F2I.FTZ.U32.FLOOR.NTZ" else "F2I.U32.FLOOR.NTZ") else (if (fz) "F2I.FTZ.FLOOR.NTZ" else "F2I.FLOOR.NTZ"),
+                .ru => if (u) (if (fz) "F2I.FTZ.U32.CEIL.NTZ" else "F2I.U32.CEIL.NTZ") else (if (fz) "F2I.FTZ.CEIL.NTZ" else "F2I.CEIL.NTZ"),
+                .rne => if (u) (if (fz) "F2I.FTZ.U32.NTZ" else "F2I.U32.NTZ") else (if (fz) "F2I.FTZ.NTZ" else "F2I.NTZ"),
             };
             return c.ins(name, 1, &.{ d, c.fsrc(in.a) });
         }
