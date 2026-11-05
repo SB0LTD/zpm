@@ -172,6 +172,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-index-external", "tests/test_sql_index_external.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-routines", "tests/test_sql_routines.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-json-agg", "tests/test_sql_json_agg.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-catalog-security", "tests/test_sql_catalog_security.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try ctx.addModule("packed_integer", "src/core/packed_integer.sig");
     const test_packed = try ctx.addStep("test-packed-integer", "Execute immutable packed integer column contracts", &noopStep);
     try ctx.addDependency(test_all, test_packed);

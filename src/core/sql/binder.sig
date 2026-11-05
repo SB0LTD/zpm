@@ -1275,6 +1275,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "jsonb_path_exists", .func = .jsonb_path_exists }, .{ .name = "jsonb_path_match", .func = .jsonb_path_match },
                 .{ .name = "jsonb_path_query_array", .func = .jsonb_path_query_array }, .{ .name = "jsonb_path_query_first", .func = .jsonb_path_query_first },
                 .{ .name = "jsonb_exists_any", .func = .jsonb_exists_any }, .{ .name = "jsonb_exists_all", .func = .jsonb_exists_all },
+                // Comments (B11 wave 3).
+                .{ .name = "obj_description", .func = .obj_description },
+                .{ .name = "col_description", .func = .col_description },
+                .{ .name = "shobj_description", .func = .shobj_description },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -2157,6 +2161,25 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .pg_backend_pid => {
                     try bindSignature(context, n, &[_]ast.Type{}, .int4, true);
+                    n.constant = false;
+                },
+                // obj_description(oid [, name]), col_description(oid, int4),
+                // shobj_description(oid, name): STABLE catalog reads (text).
+                .obj_description => {
+                    if (count == 1) try bindSignature(context, n, &[_]ast.Type{.oid}, .text, true) else try bindSignature(context, n, &[_]ast.Type{ .oid, .name }, .text, true);
+                    n.constant = false;
+                },
+                .col_description => {
+                    try bindSignature(context, n, &[_]ast.Type{ .oid, .int4 }, .text, true);
+                    n.constant = false;
+                },
+                .shobj_description => {
+                    try bindSignature(context, n, &[_]ast.Type{ .oid, .name }, .text, true);
+                    n.constant = false;
+                },
+                .current_user, .session_user => {
+                    if (count != 0) return error.UndefinedFunction;
+                    n.ty = .name;
                     n.constant = false;
                 },
                 .point_constructor => try bindSignature(context, n, &[_]ast.Type{ .float8, .float8 }, .point, true),
@@ -3078,6 +3101,12 @@ pub fn Binder(comptime config: types.Config) type {
             try booleanArgument(&sub, id);
             markStoredSources(&sub, id, -1);
             return id;
+        }
+
+        /// A row-security policy expression over table `table`'s row: bound
+        /// like a CHECK constraint (boolean, no subqueries or aggregates).
+        pub fn bindPolicyText(context: *const Context, text: []const u8, table: usize) Error!u16 {
+            return bindCheckText(context, text, table);
         }
 
         /// Every CHECK constraint of the table, by constraint index.
@@ -6997,7 +7026,7 @@ pub fn Binder(comptime config: types.Config) type {
                     const table_name = toName(context, create.name);
                     const namespace = try qualifierNamespace(context, create.schema);
                     // pg_catalog / information_schema are not writable here.
-                    if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace) return error.UnsupportedStatement;
+                    if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace or namespace == catalog.toast_namespace) return error.UnsupportedStatement;
                     if (context.catalog.findIn(namespace, table_name.slice(), context.snapshot) != null) {
                         if (create.if_not_exists) return .{ .noop = .create_table };
                         return error.TableExists;
@@ -7217,6 +7246,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .control => |control| return .{ .control = control },
                 // Session commands run in Database (session.sig), never bound here.
                 .session => return error.UnsupportedStatement,
+                // Catalog objects run in the Database facade (catalog_objects.sig).
+                .catalog_object => return error.UnsupportedStatement,
                 // COPY runs through Database.copyInfo/copyBegin, never as a statement.
                 .copy => return error.UnsupportedStatement,
                 .truncate => |*truncate| return .{ .truncate = try bindTruncate(context, truncate) },
@@ -8052,7 +8083,7 @@ pub fn Binder(comptime config: types.Config) type {
         fn bindCreateView(context: *const Context, create: *const Ast.CreateView) Error!Bound {
             const name = toName(context, create.name.name);
             const namespace = try qualifierNamespace(context, create.name.schema);
-            if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace) return error.UnsupportedStatement;
+            if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace or namespace == catalog.toast_namespace) return error.UnsupportedStatement;
             const tag: types.CommandTag = if (create.materialized) .create_materialized_view else .create_view;
             if (relationNameTaken(context, namespace, name.slice())) {
                 if (create.if_not_exists) return .{ .noop = tag };

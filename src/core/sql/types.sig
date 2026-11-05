@@ -200,6 +200,16 @@ pub const Config = struct {
     /// ProgramLimitExceeded, 54000).
     jsonpath_nodes: usize = 128,
     jsonpath_items: usize = 128,
+    /// Catalog object versions (catalog_objects.sig): roles, memberships,
+    /// table grants, table owners/RLS flags, policies, comments, foreign-data
+    /// wrappers, servers and publications, including uncommitted and dead
+    /// versions until reclaimed. More raise TableCapacity (54000).
+    catalog_objects: usize = 32,
+    /// Inline text of one catalog object (a comment, or a policy's USING
+    /// plus WITH CHECK canonical text). Longer is TextCapacity (54000).
+    object_text_bytes: usize = 256,
+    /// Roles one policy names (TO ...). More raise ProgramLimitExceeded (54000).
+    policy_roles: usize = 4,
 };
 
 pub fn workRows(comptime config: Config) usize {
@@ -462,6 +472,15 @@ pub const Error = error{
     MoreThanOneSqlJsonItem,
     /// SQLSTATE 22035: a column path returned no item (ERROR ON EMPTY).
     NoSqlJsonItem,
+    /// SQLSTATE 42501: missing privilege, ownership or role attribute, or a
+    /// new row violating a row-level security policy (B11 wave 3).
+    InsufficientPrivilege,
+    /// SQLSTATE 42939: a reserved role name (public, none, pg_*).
+    ReservedName,
+    /// SQLSTATE 55006: the object is in use (DROP ROLE of the current user).
+    ObjectInUse,
+    /// SQLSTATE 0LP01: a role grant that would make a role its own member.
+    InvalidGrantOperation,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -937,7 +956,10 @@ pub fn typeFromOid(oid: u32) ?DataType {
 pub const DefaultKind = enum(u8) { none = 0, default = 1, identity_always = 2, identity_by_default = 3, generated = 4 };
 
 /// Statement kind of a completed (or described) statement.
-pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_index, drop_index, create_view, drop_view, create_materialized_view, drop_materialized_view, refresh_materialized_view, merge, set_constraints, create_table_as, lock_table, declare_cursor, fetch, move, close_cursor, prepare, deallocate, listen, notify, unlisten, create_function, drop_function, create_procedure, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule };
+pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_index, drop_index, create_view, drop_view, create_materialized_view, drop_materialized_view, refresh_materialized_view, merge, set_constraints, create_table_as, lock_table, declare_cursor, fetch, move, close_cursor, prepare, deallocate, listen, notify, unlisten, create_function, drop_function, create_procedure, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule,
+    // Catalog objects (B11 wave 3).
+    create_role, alter_role, drop_role, grant, revoke, grant_role, revoke_role, create_policy, alter_policy, drop_policy, comment,
+    create_foreign_data_wrapper, drop_foreign_data_wrapper, create_server, drop_server, create_publication, drop_publication, create_extension };
 
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;

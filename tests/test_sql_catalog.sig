@@ -90,7 +90,7 @@ fn types() !void {
     try expect("SELECT format_type(1700, 655366), format_type(1184, 3), format_type(23, -1), format_type(99999, NULL)", "numeric(10,2)|timestamp(3) with time zone|integer|???");
     try rejects("SELECT 'nope'::regtype", error.UndefinedObject);
     try expect("SELECT current_database(), current_schema()", "postgres|public");
-    try expect("SELECT nspname FROM pg_namespace ORDER BY oid", "pg_catalog;public;information_schema");
+    try expect("SELECT nspname FROM pg_namespace ORDER BY oid", "pg_catalog;pg_toast;public;information_schema");
     try expect("SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'public'", "public");
     try expect(public_tables, "");
 }

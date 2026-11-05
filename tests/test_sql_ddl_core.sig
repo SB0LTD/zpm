@@ -1093,7 +1093,7 @@ fn schemas() !void {
     try run("DELETE FROM tdd_schema.t WHERE id = 3");
     try run("ALTER TABLE tdd_schema.t ADD COLUMN w INT DEFAULT 5");
     try expect(schema_probes[4], "1|uno|5;2|two|5");
-    try expect(schema_probes[0], "information_schema;pg_catalog;public;tdd_schema");
+    try expect(schema_probes[0], "information_schema;pg_catalog;pg_toast;public;tdd_schema");
     try expect(schema_probes[2] ++ "", "public|t;tdd_schema|t");
     try expect("SELECT relname FROM pg_class WHERE oid = 'tdd_schema.t'::regclass", "t");
     try expect("SELECT table_schema, column_name FROM information_schema.columns WHERE table_schema = 'tdd_schema' ORDER BY ordinal_position", "tdd_schema|id;tdd_schema|v;tdd_schema|w");
@@ -1104,8 +1104,8 @@ fn schemas() !void {
     try sameState(&schema_probes);
     // 42P06 for an existing schema (IF NOT EXISTS skips), 3F000 creating in
     // a missing one, 42P01 reading through one, 42P07 for a taken name.
-    try rejects("CREATE SCHEMA tdd_schema", error.DuplicateSchema, schema_probes[0], "information_schema;pg_catalog;public;tdd_schema");
-    try rejects("CREATE SCHEMA public", error.DuplicateSchema, schema_probes[0], "information_schema;pg_catalog;public;tdd_schema");
+    try rejects("CREATE SCHEMA tdd_schema", error.DuplicateSchema, schema_probes[0], "information_schema;pg_catalog;pg_toast;public;tdd_schema");
+    try rejects("CREATE SCHEMA public", error.DuplicateSchema, schema_probes[0], "information_schema;pg_catalog;pg_toast;public;tdd_schema");
     try run("CREATE SCHEMA IF NOT EXISTS tdd_schema");
     try rejects("CREATE TABLE nosuch.t (id INT)", error.UndefinedSchema, schema_probes[2], "public|t;tdd_schema|t");
     try rejects("SELECT * FROM nosuch.t", error.TableNotFound, schema_probes[2], "public|t;tdd_schema|t");
@@ -1113,14 +1113,14 @@ fn schemas() !void {
     try rejects("CREATE TABLE tdd_schema.t (id INT)", error.TableExists, schema_probes[2], "public|t;tdd_schema|t");
     try rejects("SELECT * FROM tdd_schema.missing", error.TableNotFound, schema_probes[2], "public|t;tdd_schema|t");
     // DROP SCHEMA: RESTRICT with tables is 2BP01, CASCADE drops them.
-    try rejects("DROP SCHEMA tdd_schema", error.DependentObjects, schema_probes[0], "information_schema;pg_catalog;public;tdd_schema");
-    try rejects("DROP SCHEMA nosuch", error.UndefinedSchema, schema_probes[0], "information_schema;pg_catalog;public;tdd_schema");
+    try rejects("DROP SCHEMA tdd_schema", error.DependentObjects, schema_probes[0], "information_schema;pg_catalog;pg_toast;public;tdd_schema");
+    try rejects("DROP SCHEMA nosuch", error.UndefinedSchema, schema_probes[0], "information_schema;pg_catalog;pg_toast;public;tdd_schema");
     try run("DROP SCHEMA IF EXISTS nosuch");
     try run("CREATE SCHEMA empty_one");
     try run("DROP SCHEMA empty_one RESTRICT");
     const dropped = try replicate("DROP SCHEMA tdd_schema CASCADE");
     try check(dropped.command == .drop_schema);
-    try expect(schema_probes[0], "information_schema;pg_catalog;public");
+    try expect(schema_probes[0], "information_schema;pg_catalog;pg_toast;public");
     try expect(schema_probes[2], "public|t");
     try expect("SELECT * FROM t", "9");
     try sameState(&schema_probes[0..4].*);
@@ -1129,7 +1129,7 @@ fn schemas() !void {
     try run("CREATE SCHEMA s2");
     try run("CREATE SCHEMA s3");
     try run("CREATE SCHEMA s4");
-    try rejects("CREATE SCHEMA s5", error.TableCapacity, schema_probes[0], "information_schema;pg_catalog;public;s1;s2;s3;s4");
+    try rejects("CREATE SCHEMA s5", error.TableCapacity, schema_probes[0], "information_schema;pg_catalog;pg_toast;public;s1;s2;s3;s4");
     try run("DROP SCHEMA s4");
     try run("CREATE SCHEMA s5");
     try sameState(&schema_probes[0..4].*);
@@ -1144,7 +1144,7 @@ fn schemaTransactions() !void {
     try statement(tx, "INSERT INTO tdd_schema.t VALUES (1)");
     try same(try rows(tx, "SELECT * FROM tdd_schema.t"), "1");
     db.abort(tx);
-    try expect(schema_probes[0], "information_schema;pg_catalog;public");
+    try expect(schema_probes[0], "information_schema;pg_catalog;pg_toast;public");
     try check(db.usage().pending_versions == 0);
     // An uncommitted CREATE SCHEMA makes a second creator wait; it then
     // fails with 42P06.

@@ -80,6 +80,9 @@
 //!   cidr u8, 16 address bytes} | 24 macaddr 6 bytes | 25 point {x, y as
 //!   f64 bits u64} | 26 box {high x, high y, low x, low y as f64 bits}
 //!   | 27 xml len u32 + the stored text.
+//!    70 object_create / 71 object_drop: catalog objects (roles, grants,
+//!                     policies, comments, wrappers, servers, publications);
+//!                     layout in catalog_objects.sig (B11 wave 3)
 //!   Array type OIDs (1007, ...) name a column's array type. Every value is
 //!   checked against the column's type OID (create_table) before anything
 //!   applies.
@@ -106,6 +109,7 @@ const array = @import("array.sig");
 const range = @import("range.sig");
 const network = @import("network.sig");
 const routine_catalog = @import("routine_catalog.sig");
+const catalog_objects = @import("catalog_objects.sig");
 const Error = types.Error;
 
 fn std_zero(bytes: []const u8) bool {
@@ -125,7 +129,7 @@ pub const definition_format_version: u16 = 2;
 /// definitions keep versions 1 and 2 byte for byte).
 pub const extensions_format_version: u16 = 3;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65 };
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71 };
 
 fn Unsigned(comptime T: type) type {
     return switch (T) {
@@ -244,6 +248,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
         break :blk capacity;
     };
     const RC = routine_catalog.Catalog(config);
+    const O = catalog_objects.Objects(config);
     return struct {
         // ----- encoding -------------------------------------------------
 
@@ -633,6 +638,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
             schemas: [config.schemas]VSchema = undefined,
             /// Routines, triggers and rules (B11 wave 3).
             objects: RC.Overlay = .{},
+            /// Catalog objects (catalog-security lane, catalog_objects.sig).
+            object_overlay: O.Overlay = .{},
         };
 
         /// What object ops (routine_catalog.validateOp) may ask the overlay.
@@ -652,6 +659,43 @@ pub fn ChangeLog(comptime config: types.Config) type {
 
                 pub fn namespaceKnown(self: @This(), namespace: u32) bool {
                     return knownNamespace(self.scratch, namespace);
+                }
+            };
+        }
+
+        /// What catalog-object validation asks of the record so far.
+        fn ObjectCheck(comptime DB: type) type {
+            return struct {
+                db: DB,
+                scratch: *Scratch,
+                next_oid: *u32,
+
+                pub fn objectOidTaken(self: *const @This(), oid: u32) bool {
+                    return oidTaken(self.db, self.scratch, oid, 1);
+                }
+
+                pub fn noteObjectOid(self: *const @This(), oid: u32) void {
+                    self.next_oid.* = @max(self.next_oid.*, oid + 1);
+                }
+
+                pub fn objectTableLive(self: *const @This(), oid: u32) bool {
+                    return self.objectTableColumns(oid) != null;
+                }
+
+                pub fn objectTableColumns(self: *const @This(), oid: u32) ?usize {
+                    for (&self.scratch.tables) |*vt| if (vt.live and vt.oid == oid) return vt.column_count;
+                    return null;
+                }
+
+                pub fn objectSequenceLive(self: *const @This(), oid: u32) bool {
+                    for (&self.scratch.seqs) |*vs| if (vs.live and vs.oid == oid) return true;
+                    return false;
+                }
+
+                pub fn objectSchemaLive(self: *const @This(), oid: u32) bool {
+                    if (oid == 11 or oid == 99 or oid == public_namespace or oid == 13000) return true;
+                    for (&self.scratch.schemas) |*vs| if (vs.live and vs.oid == oid) return true;
+                    return false;
                 }
             };
         }
@@ -748,6 +792,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             for (&db.seqs) |*seq| if (seq.live and overlaps(seq.oid, 1, oid, width)) return true;
             for (&scratch.schemas) |*vs| if (vs.live and overlaps(vs.oid, 1, oid, width)) return true;
             for (&db.schemas) |*schema| if (schema.live and overlaps(schema.oid, 1, oid, width)) return true;
+            if (scratch.object_overlay.oidTaken(oid, width)) return true;
             return false;
         }
 
@@ -1388,7 +1433,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 vs.* = .{ .live = schema.live and !schema.pending_create and schema.dead_csn == 0, .oid = schema.oid, .name = schema.name };
             }
             RC.beginOverlay(&scratch.objects, &db.objects);
+            scratch.object_overlay.init(&db.catalog_objects);
             var next_oid: u32 = first_oid + db.oid_counter;
+            const object_check: ObjectCheck(@TypeOf(db)) = .{ .db = db, .scratch = scratch, .next_oid = &next_oid };
             var reader = Reader{ .bytes = record };
             var row: V.Row = .{};
             for (0..count) |_| {
@@ -1610,10 +1657,20 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         _ = try reader.int(i64);
                         if (try reader.int(u8) > 1) return error.InvalidChangeRecord;
                     },
+                    @intFromEnum(Op.object_create) => {
+                        const object = try O.decodeCreate(record, &reader.position);
+                        try scratch.object_overlay.create(&object, &object_check);
+                    },
+                    @intFromEnum(Op.object_drop) => {
+                        const key = try O.decodeDrop(record, &reader.position);
+                        try scratch.object_overlay.drop(&key);
+                    },
                     else => return error.UnsupportedLogVersion,
                 }
             }
             if (reader.position != record.len) return error.InvalidChangeRecord;
+            // Objects never outlive the tables, roles and objects they name.
+            try scratch.object_overlay.finish(&object_check);
         }
 
         /// Version-3 definition parts against the overlay: new secondary
@@ -1832,6 +1889,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const last_value = try reader.int(i64);
                         const called = try reader.int(u8) == 1;
                         sequence.Sequences(config).restore(&db.seqs[index], last_value, called);
+                    },
+                    @intFromEnum(Op.object_create) => {
+                        const object = try O.decodeCreate(record, &reader.position);
+                        db.catalog_objects.applyCreate(&object, db.epoch, db.cid, csn);
+                        if (catalog_objects.ownsOid(object.kind)) db.oid_counter = @max(db.oid_counter, object.oid + 1 - first_oid);
+                    },
+                    @intFromEnum(Op.object_drop) => {
+                        const key = try O.decodeDrop(record, &reader.position);
+                        db.catalog_objects.applyDrop(&key);
                     },
                     else => return error.UnsupportedLogVersion,
                 }

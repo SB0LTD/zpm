@@ -1399,7 +1399,39 @@ pub fn Session(comptime DB: type) type {
             }
         }
         fn command(self: *Self, w: *Writer, source: []const u8) !void {
+            if (self.objectTag()) |tag| {
+                const p = try w.begin('C');
+                try w.append(tag);
+                try w.byte(0);
+                w.end(p);
+                return;
+            }
             try commandFor(w, source, self.completed(), self.result.row_count, self.result.affected_rows, self.commit_rolled_back);
+        }
+        /// Command tags of the catalog-object statements (B11 wave 3).
+        fn objectTag(self: *const Self) ?[]const u8 {
+            if (!@hasField(DB.Result, "command")) return null;
+            return switch (self.result.command) {
+                .create_role => "CREATE ROLE",
+                .alter_role => "ALTER ROLE",
+                .drop_role => "DROP ROLE",
+                .grant => "GRANT",
+                .revoke => "REVOKE",
+                .grant_role => "GRANT ROLE",
+                .revoke_role => "REVOKE ROLE",
+                .create_policy => "CREATE POLICY",
+                .alter_policy => "ALTER POLICY",
+                .drop_policy => "DROP POLICY",
+                .comment => "COMMENT",
+                .create_foreign_data_wrapper => "CREATE FOREIGN DATA WRAPPER",
+                .drop_foreign_data_wrapper => "DROP FOREIGN DATA WRAPPER",
+                .create_server => "CREATE SERVER",
+                .drop_server => "DROP SERVER",
+                .create_publication => "CREATE PUBLICATION",
+                .drop_publication => "DROP PUBLICATION",
+                .create_extension => "CREATE EXTENSION",
+                else => null,
+            };
         }
         /// The engine's own command tag for the last statement, when it has one.
         fn completed(self: *const Self) []const u8 {
@@ -1668,6 +1700,11 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "SqlJsonItemCannotBeCast")) return "2203G";
     if (equal(name, "MoreThanOneSqlJsonItem")) return "22034";
     if (equal(name, "NoSqlJsonItem")) return "22035";
+    // Catalog objects (B11 wave 3).
+    if (equal(name, "InsufficientPrivilege")) return "42501";
+    if (equal(name, "ReservedName")) return "42939";
+    if (equal(name, "ObjectInUse")) return "55006";
+    if (equal(name, "InvalidGrantOperation")) return "0LP01";
     if (equal(name, "TypeMismatch")) return "42804";
     if (equal(name, "IntegerOverflow")) return "22003";
     if (equal(name, "ProtocolViolation")) return "08P01";

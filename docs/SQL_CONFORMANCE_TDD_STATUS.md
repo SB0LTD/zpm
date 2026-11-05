@@ -1,5 +1,38 @@
 # SQL conformance TDD checkpoint
 
+## Catalog and security candidate (lane B11, wave 3) - 5 November 2026
+
+Branch `b11/catalog-security` (rebased on 4c028a6) closes seven smoke programs
+test-first: PG.CATALOG, PG.SECURITY.ROLE, PG.SECURITY.RLS,
+PG.UTILITY.COMMENT, PG.INTEGRATION.EXTENSION, PG.INTEGRATION.FOREIGN and
+PG.INTEGRATION.REPLICATION. The unchanged driver moves from 89 passes to
+96; it still exits 1 SqlConformanceIncomplete and no other program
+changed. `contract-sql-catalog-security`
+(tests/test_sql_catalog_security.sig) covers values, column names, OIDs
+and typmods, exact SQLSTATEs (42501, 42939, 55006, 0LP01, 42710, 42704,
+2BP01, 42P01, 42703, 42809, 3F000, 42601, 42804, 0A000, 22023, 54000),
+statement atomicity, waits on uncommitted objects and table locks, SET ROLE
+in the tx-session settings, and replay of every committed record into a
+replica plus crafted records that must fail closed. Only the seven oracle
+programs are native-verified; every other expectation is pending native
+verification. Details, limits and open items: docs/SQL_CATALOG_SECURITY.md.
+
+Durability: change-record ops 70 object_create and 71 object_drop (72-79
+reserved, unused); value tags 36-41 and table definition format 4 unused;
+existing records replay unchanged. Roles, grants, owners and RLS flags,
+policies, comments, wrappers, servers and publications are versions in one
+catalog-object store (Config.catalog_objects, object_text_bytes,
+policy_roles). Roles are SQL-level: RAMSQL's single SCRAM user runs as the
+bootstrap superuser `ramsql` (OID 10); created roles have no passwords and
+are entered with SET ROLE. Wrappers, servers and publications are catalog
+entries only (no foreign scans, no logical replication).
+
+PG.TYPE.ENUM_DOMAIN_COMPOSITE remains open: its oracle OIDs 18673 / 18682
+are the native cluster's OID counter after the earlier programs of the
+oracle run (a fresh database would give OIDs about 2,278 lower, and ZPM
+allocates two OIDs per keyed table where PostgreSQL allocates five), so
+passing it would mean seeding the counter with the expected value.
+
 ## JSON and aggregates candidate (lane B11, wave 3) - 5 November 2026
 
 Branch `b11/json-agg` (on 6f32405) closes six smoke programs test-first:

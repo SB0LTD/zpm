@@ -115,6 +115,8 @@ const session_module = @import("sql/session.sig");
 const ssi_module = @import("sql/ssi.sig");
 const routine_catalog = @import("sql/routine_catalog.sig");
 const routine_module = @import("sql/routine.sig");
+const CO = @import("sql/catalog_objects.sig");
+const array_module = @import("sql/array.sig");
 
 /// The canonical SQL tokenizer, also used by wire parameter binding.
 /// Source and token spans remain caller-owned; tokenization allocates nothing.
@@ -233,6 +235,7 @@ pub fn Database(comptime config: Config) type {
     const SSI = ssi_module.Ssi(config);
     const RC = routine_catalog.Catalog(config);
     const R = routine_module.Routines(config);
+    const O = CO.Objects(config);
 
     return struct {
         const Self = @This();
@@ -415,6 +418,12 @@ pub fn Database(comptime config: Config) type {
             /// them as dependencies).
             expanded: [config.tables]u32 = undefined,
             expanded_count: usize = 0,
+            /// Row-security WITH CHECK of the statement's INSERT / UPDATE
+            /// target (B11 wave 3): bound over expansion[start..][0..len].
+            security_check: u16 = ast.none,
+            security_start: usize = 0,
+            security_len: usize = 0,
+            security_table: usize = 0,
         };
 
         /// A decoded identifier (quoted names keep case, others fold).
@@ -533,7 +542,9 @@ pub fn Database(comptime config: Config) type {
             return false;
         }
 
-        fn expandRelations(db: *const Self, workspace: *Workspace, source: []const u8, snap: Snapshot, bound_statement: *A.Statement) Error![]const u8 {
+        fn expandRelations(db: *const Self, workspace: *Workspace, source: []const u8, snap: Snapshot, bound_statement: *A.Statement, role: u32) Error![]const u8 {
+            // Privileges and row security apply to roles other than superusers (B11 wave 3).
+            const privileged = role == CO.bootstrap_role or db.catalog_objects.superuser(role, snap);
             const tables = &db.tables;
             const catalog = &db.catalog;
             workspace.expanded_count = 0;
@@ -564,9 +575,24 @@ pub fn Database(comptime config: Config) type {
                         if (cte) continue;
                     }
                     const schema_name = if (item.schema) |qualifier| identName(text, qualifier) else Name{};
-                    if (catalog_module.findView(if (item.schema != null) schema_name.slice() else null, name.slice()) != null) continue;
+                    if (catalog_module.findView(if (item.schema != null) schema_name.slice() else null, name.slice())) |view| {
+                        if (view == .pg_authid and !privileged) return error.InsufficientPrivilege;
+                        continue;
+                    }
                     const namespace = namespaceFor(catalog, if (item.schema != null) schema_name.slice() else null, snap) orelse continue;
                     const found = catalog.findIn(namespace, name.slice(), snap) orelse continue;
+                    // Items the statement names (not view or expansion texts).
+                    if (!privileged and item.name.span.start < source.len) {
+                        const secured = try secureItem(db, workspace, &length, source, role, found, snap);
+                        if (secured != ast.none) {
+                            item.query = secured;
+                            item.view = true;
+                            if (item.alias == null) item.alias = item.name;
+                            q.from = null;
+                            pool.complex = true;
+                            continue;
+                        }
+                    }
                     if (found.kind != 'v') {
                         if (item.only or found.kind == 'S') continue;
                         const table = &tables[found.slot];
@@ -714,7 +740,7 @@ pub fn Database(comptime config: Config) type {
                 self.session.sequences=null;
                 var parsed=try P.parse(source,&self.workspace.nodes,.standard);
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
-                const expanded=try Self.expandRelations(db,&self.workspace,source,snapshot,&parsed);
+                const expanded=try Self.expandRelations(db,&self.workspace,source,snapshot,&parsed,self.session.role);
                 try self.session.checkpoint();
                 for(self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |query| {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
@@ -726,6 +752,8 @@ pub fn Database(comptime config: Config) type {
                 if(self.workspace.plans.dml_len!=0) return error.UnsupportedStatement;
                 for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
                     .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
+                    // Catalog-object text needs the serialized database hook.
+                    .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
                     else=>{},
                 };
                 self.prepared=switch(bound){.select=>|select| .{.simple=select},.query=>|root| .{.general=root},else=>return error.UnsupportedStatement};
@@ -804,6 +832,9 @@ pub fn Database(comptime config: Config) type {
         /// User schemas (Config.schemas); visibility is the catalog's.
         schemas: [config.schemas]Schema = @splat(.{}),
         catalog: K = .{},
+        /// Roles, grants, policies, comments, wrappers, servers and
+        /// publications (catalog_objects.sig, B11 wave 3).
+        catalog_objects: O = .{},
         /// Sequence slots (Config.sequences); values are non-transactional.
         seqs: [config.sequences]Q.Seq = @splat(.{}),
         /// Globally pending log-ahead values, including live owners. Any
@@ -1115,6 +1146,7 @@ pub fn Database(comptime config: Config) type {
             self.cid = source.cid;
             self.epoch = source.epoch;
             self.catalog = source.catalog;
+            self.catalog_objects = source.catalog_objects;
             self.seqs = source.seqs;
             self.schemas = source.schemas;
             for (&self.schemas) |*schema| {
@@ -1644,11 +1676,20 @@ pub fn Database(comptime config: Config) type {
                 else => {},
             }
             try self.serializableSnapshot(slot);
+            self.workspace.security_check = ast.none;
+            // Catalog objects (B11 wave 3); a READ ONLY transaction writes none (25006).
+            if (parsed.* == .catalog_object) {
+                if (self.txs[slot].read_only) return error.ReadOnlyTransaction;
+                return self.catalogObject(slot, original, &parsed.catalog_object, snap);
+            }
             var statement_copy = parsed.*;
-            const source = try expandRelations(self, &self.workspace, original, snap, &statement_copy);
+            const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role);
+            const source = try self.secureTarget(&statement_copy, expanded, original, snap);
             const context = self.bindContext(source, mode, snap);
             const bound = try B.bind(&context, &statement_copy);
             if (self.txs[slot].read_only) try readOnlyCheck(&bound, &self.workspace.plans);
+            try self.checkPrivileges(&bound, snap);
+            try self.secureNewRows(&bound, source, snap);
             switch (bound) {
                 .control => return error.UnsupportedStatement,
                 .select => |*select| {
@@ -2014,6 +2055,7 @@ pub fn Database(comptime config: Config) type {
             var waits: L.Set = .{};
             if (schema.pending_drop and schema.creator != slot) waits.add(schema.creator);
             if (self.catalog.namespaceCreator(drop.oid, snap)) |other| waits.add(other);
+            if (self.catalog_objects.pendingReference(drop.oid, snap)) |other| waits.add(other);
             if (waits.any()) {
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
@@ -2032,6 +2074,7 @@ pub fn Database(comptime config: Config) type {
             var changes: [K.max_changes]K.Change = undefined;
             const changed = self.catalog.dropSchema(drop.slot, snap, tx.ref(slot), snap.cid, 0, &changes);
             for (changes[0..changed]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
+            try self.dropObjectsOf(slot, drop.oid, snap);
         }
 
         /// Schema name of a namespace OID for the system views.
@@ -2039,6 +2082,1143 @@ pub fn Database(comptime config: Config) type {
             for (catalog_module.namespaces) |namespace| if (namespace.oid == oid) return namespace.name;
             for (&self.schemas) |*schema| if (schema.live and schema.oid == oid) return schema.name.slice();
             return "";
+        }
+
+        // ---- catalog objects (B11 wave 3, catalog_objects.sig) --------------
+
+        fn objectIdent(ident: CO.Ident) ast.Ident {
+            return .{ .span = .{ .start = ident.span.start, .len = ident.span.len }, .quoted = ident.quoted, .len = ident.len };
+        }
+
+        fn objectName(source: []const u8, ident: CO.Ident) Name {
+            return identName(source, objectIdent(ident));
+        }
+
+        /// The current role holds every privilege (bootstrap or superuser).
+        fn privilegedRole(self: *const Self, snap: Snapshot) bool {
+            return self.session.role == CO.bootstrap_role or self.catalog_objects.superuser(self.session.role, snap);
+        }
+
+        fn actorFlags(self: *const Self, snap: Snapshot) u32 {
+            return self.catalog_objects.roleFlags(self.session.role, snap) orelse 0;
+        }
+
+        /// A role named in GRANT / policies / OWNER TO (PUBLIC is 0; 42704
+        /// for an unknown name).
+        fn objectRole(self: *const Self, source: []const u8, grantee: CO.Grantee, snap: Snapshot) Error!u32 {
+            return switch (grantee.kind) {
+                .public => CO.public_role,
+                .current_user, .current_role => self.session.role,
+                .session_user => self.session.session_role,
+                .name => self.catalog_objects.roleByName(objectName(source, grantee.name).slice(), snap) orelse error.UndefinedObject,
+            };
+        }
+
+        /// `role` holds ADMIN OPTION on `group` (or is a superuser).
+        fn roleAdmin(self: *const Self, role: u32, group: u32, snap: Snapshot) bool {
+            if (self.catalog_objects.superuser(role, snap)) return true;
+            const key: O.Object = .{ .kind = .member, .target = group, .grantee = role };
+            const index = self.catalog_objects.findKey(&key, snap) orelse return false;
+            return self.catalog_objects.items[index].grant_flags & 1 != 0;
+        }
+
+        fn objectPark(self: *Self, slot: u16, other: u16) Error {
+            const tx = &self.txs[slot];
+            var waits: L.Set = .{};
+            waits.add(other);
+            tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+            return self.park(slot, waits);
+        }
+
+        /// Writes a new object version for the statement (writes reserved
+        /// by the caller); `fresh_oid` takes the next OID.
+        fn objectInsert(self: *Self, slot: u16, value: *O.Object, fresh_oid: bool, snap: Snapshot) Error!usize {
+            const index = try self.catalog_objects.allocate(self.horizon());
+            if (fresh_oid) {
+                if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
+                value.oid = change_log.first_oid + self.oid_counter;
+                self.oid_counter += 1;
+            }
+            const tx = &self.txs[slot];
+            self.catalog_objects.insert(index, value, tx.ref(slot), snap.cid, 0);
+            tx.push(.{ .kind = .object_insert, .table = @intFromBool(fresh_oid), .new = @intCast(index) }) catch unreachable;
+            return index;
+        }
+
+        fn objectDelete(self: *Self, slot: u16, index: usize, snap: Snapshot) void {
+            const tx = &self.txs[slot];
+            self.catalog_objects.mark(index, tx.ref(slot), snap.cid);
+            tx.push(.{ .kind = .object_delete, .table = 0, .old = @intCast(index) }) catch unreachable;
+        }
+
+        /// Objects that die with `oid` (a table: its grants, owner/RLS
+        /// entry, policies and comments; a sequence, schema, policy,
+        /// wrapper, server, publication or role: its comment). Another
+        /// transaction's uncommitted object naming it is waited for.
+        fn objectDependent(o: *const O.Object, oid: u32) bool {
+            return switch (o.kind) {
+                .acl, .relation, .policy => o.target == oid,
+                .comment => o.target == oid,
+                else => false,
+            };
+        }
+
+        fn dropObjectsOf(self: *Self, slot: u16, oid: u32, snap: Snapshot) Error!void {
+            if (self.catalog_objects.pendingReference(oid, snap)) |other| return self.objectPark(slot, other);
+            var count: usize = 0;
+            for (&self.catalog_objects.items) |*o| {
+                if (!O.visible(o, snap) or o.xmax.epoch != 0) continue;
+                if (objectDependent(o, oid)) count += 1;
+                // Comments on the table's policies go with them.
+                if (o.kind == .policy and o.target == oid) {
+                    for (&self.catalog_objects.items) |*c| if (c.kind == .comment and c.grantee == CO.class_policy and c.target == o.oid and O.visible(c, snap) and c.xmax.epoch == 0) {
+                        count += 1;
+                    };
+                }
+            }
+            if (count == 0) return;
+            try self.reserveWrites(slot, count);
+            for (&self.catalog_objects.items, 0..) |*o, index| {
+                if (!O.visible(o, snap) or o.xmax.epoch != 0) continue;
+                if (o.kind == .policy and o.target == oid) {
+                    for (&self.catalog_objects.items, 0..) |*c, position| if (c.kind == .comment and c.grantee == CO.class_policy and c.target == o.oid and O.visible(c, snap) and c.xmax.epoch == 0) {
+                        self.objectDelete(slot, position, snap);
+                    };
+                }
+                if (objectDependent(o, oid)) self.objectDelete(slot, index, snap);
+            }
+        }
+
+        /// ALTER TABLE moved or dropped columns: column comments follow
+        /// their column (`sources[new] = old`), or go with it.
+        fn remapColumnComments(self: *Self, slot: u16, oid: u32, sources: []const u8, snap: Snapshot) Error!void {
+            var count: usize = 0;
+            for (&self.catalog_objects.items) |*o| {
+                if (o.kind != .comment or o.grantee != CO.class_relation or o.target != oid or o.sub == 0 or !O.visible(o, snap) or o.xmax.epoch != 0) continue;
+                count += 1;
+            }
+            if (count == 0) return;
+            try self.reserveWrites(slot, 2 * count);
+            for (0..self.catalog_objects.items.len) |index| {
+                const o = &self.catalog_objects.items[index];
+                if (o.kind != .comment or o.grantee != CO.class_relation or o.target != oid or o.sub == 0 or !O.visible(o, snap) or o.xmax.epoch != 0) continue;
+                // Only versions that existed before this statement move.
+                if (o.xmin_csn == 0 and o.xmin_cid == snap.cid) continue;
+                var moved: ?usize = null;
+                for (sources, 0..) |origin, position| if (origin != 0xff and @as(i32, origin) + 1 == o.sub) {
+                    moved = position;
+                };
+                if (moved) |position| if (@as(i32, @intCast(position)) + 1 == o.sub) continue;
+                var next = o.*;
+                self.objectDelete(slot, index, snap);
+                if (moved) |position| {
+                    next.sub = @intCast(position + 1);
+                    _ = try self.objectInsert(slot, &next, false, snap);
+                }
+            }
+        }
+
+        /// A table, view or materialized view named by a catalog-object
+        /// statement (42P01), locked in `mode`; null with IF EXISTS.
+        fn objectTable(self: *Self, slot: u16, source: []const u8, name: CO.Qualified, mode: locks_module.TableMode, snap: Snapshot) Error!usize {
+            const schema_name = if (name.has_schema) objectName(source, name.schema) else Name{};
+            const namespace = namespaceFor(&self.catalog, if (name.has_schema) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
+            const found = self.catalog.findIn(namespace, objectName(source, name.name).slice(), snap) orelse return error.TableNotFound;
+            if (found.kind == 'S') return error.WrongObjectType;
+            try self.lockTable(slot, found.slot, mode);
+            return found.slot;
+        }
+
+        fn catalogObject(self: *Self, slot: u16, source: []const u8, object_statement: *const CO.Statement, snap: Snapshot) Error!void {
+            const command: CommandTag = switch (object_statement.*) {
+                .create_role => |*spec| blk: {
+                    try self.createRole(slot, source, spec, snap);
+                    break :blk .create_role;
+                },
+                .alter_role => |*spec| blk: {
+                    try self.alterRole(slot, source, spec, snap);
+                    break :blk .alter_role;
+                },
+                .drop_role => |*drop| blk: {
+                    try self.dropRoles(slot, source, drop, snap);
+                    break :blk .drop_role;
+                },
+                .grant => |*grant| blk: {
+                    if (grant.membership) try self.grantMembership(slot, source, grant, false, snap) else try self.grantTables(slot, source, grant, false, snap);
+                    break :blk if (grant.membership) .grant_role else .grant;
+                },
+                .revoke => |*grant| blk: {
+                    if (grant.membership) try self.grantMembership(slot, source, grant, true, snap) else try self.grantTables(slot, source, grant, true, snap);
+                    break :blk if (grant.membership) .revoke_role else .revoke;
+                },
+                .create_policy => |*policy| blk: {
+                    try self.createPolicy(slot, source, policy, snap);
+                    break :blk .create_policy;
+                },
+                .alter_policy => |*policy| blk: {
+                    try self.alterPolicy(slot, source, policy, snap);
+                    break :blk .alter_policy;
+                },
+                .drop_policy => |*policy| blk: {
+                    try self.dropPolicy(slot, source, policy, snap);
+                    break :blk .drop_policy;
+                },
+                .table_security => |*security| blk: {
+                    try self.tableSecurity(slot, source, security, snap);
+                    break :blk .alter_table;
+                },
+                .comment => |*comment| blk: {
+                    try self.commentOn(slot, source, comment, snap);
+                    break :blk .comment;
+                },
+                .create_fdw => |*named| blk: {
+                    try self.createNamed(slot, source, .fdw, named.name, named.if_not_exists, null, snap);
+                    break :blk .create_foreign_data_wrapper;
+                },
+                .create_server => |*server| blk: {
+                    try self.createNamed(slot, source, .server, server.name, server.if_not_exists, server, snap);
+                    break :blk .create_server;
+                },
+                .create_publication => |*publication| blk: {
+                    try self.createPublication(slot, source, publication, snap);
+                    break :blk .create_publication;
+                },
+                .drop_fdw => |*drop| blk: {
+                    try self.dropNamed(slot, source, .fdw, drop, snap);
+                    break :blk .drop_foreign_data_wrapper;
+                },
+                .drop_server => |*drop| blk: {
+                    try self.dropNamed(slot, source, .server, drop, snap);
+                    break :blk .drop_server;
+                },
+                .drop_publication => |*drop| blk: {
+                    try self.dropNamed(slot, source, .publication, drop, snap);
+                    break :blk .drop_publication;
+                },
+                .create_extension => |*named| blk: {
+                    // plpgsql is the only extension, installed in every database.
+                    if (!types.same(objectName(source, named.name).slice(), "plpgsql")) return error.UnsupportedStatement;
+                    if (!named.if_not_exists) return error.DuplicateObject;
+                    break :blk .create_extension;
+                },
+            };
+            self.outcome = .{ .affected = 0, .command = command };
+        }
+
+        // -- roles ---------------------------------------------------------
+
+        /// CREATE ROLE: superusers, or CREATEROLE roles for roles without
+        /// SUPERUSER (and REPLICATION / BYPASSRLS only when they hold them).
+        fn createRole(self: *Self, slot: u16, source: []const u8, spec: *const CO.RoleSpec, snap: Snapshot) Error!void {
+            const name = objectName(source, spec.name);
+            if (CO.reservedRoleName(name.slice())) return error.ReservedName;
+            const actor = self.actorFlags(snap);
+            const superuser = actor & CO.role_superuser != 0;
+            if (!superuser and actor & CO.role_createrole == 0) return error.InsufficientPrivilege;
+            const flags = (CO.role_inherit | spec.set) & ~spec.clear;
+            if (!superuser and (flags & CO.role_superuser != 0 or flags & ~actor & (CO.role_replication | CO.role_bypassrls) != 0)) return error.InsufficientPrivilege;
+            var role: O.Object = .{ .kind = .role, .flags = flags, .grant_flags = @bitCast(spec.connlimit) };
+            try role.setName(name.slice());
+            if (self.catalog_objects.pendingConflict(&role, snap)) |other| return self.objectPark(slot, other);
+            if (self.catalog_objects.roleByName(name.slice(), snap) != null) return error.DuplicateObject;
+            var groups: [CO.list_capacity]u32 = undefined;
+            for (spec.in_roles[0..spec.in_count], 0..) |group, index| {
+                groups[index] = self.catalog_objects.roleByName(objectName(source, group).slice(), snap) orelse return error.UndefinedObject;
+                if (!self.roleAdmin(self.session.role, groups[index], snap)) return error.InsufficientPrivilege;
+                if (self.catalog_objects.superuser(groups[index], snap) and !superuser) return error.InsufficientPrivilege;
+            }
+            try self.reserveWrites(slot, 1 + spec.in_count);
+            const index = try self.objectInsert(slot, &role, true, snap);
+            const oid = self.catalog_objects.items[index].oid;
+            for (groups[0..spec.in_count]) |group| {
+                var member: O.Object = .{ .kind = .member, .target = group, .grantee = oid, .owner = if (superuser) CO.bootstrap_role else self.session.role };
+                _ = try self.objectInsert(slot, &member, true, snap);
+            }
+        }
+
+        fn alterRole(self: *Self, slot: u16, source: []const u8, spec: *const CO.RoleSpec, snap: Snapshot) Error!void {
+            const oid = self.catalog_objects.roleByName(objectName(source, spec.name).slice(), snap) orelse return error.UndefinedObject;
+            // The bootstrap superuser is built in.
+            if (oid == CO.bootstrap_role) return error.UnsupportedStatement;
+            const index = self.catalog_objects.byOid(.role, oid, snap) orelse return error.UndefinedObject;
+            const current = &self.catalog_objects.items[index];
+            const actor = self.actorFlags(snap);
+            const superuser = actor & CO.role_superuser != 0;
+            if (!superuser) {
+                if (current.flags & CO.role_superuser != 0 or actor & CO.role_createrole == 0 or !self.roleAdmin(self.session.role, oid, snap)) return error.InsufficientPrivilege;
+                if (spec.set & CO.role_superuser != 0 or spec.set & ~actor & (CO.role_replication | CO.role_bypassrls) != 0) return error.InsufficientPrivilege;
+            }
+            var next = current.*;
+            if (spec.rename) {
+                const new_name = objectName(source, spec.new_name);
+                // Renaming the session or current user is 0A000.
+                if (oid == self.session.session_role or oid == self.session.role) return error.UnsupportedStatement;
+                if (CO.reservedRoleName(new_name.slice())) return error.ReservedName;
+                if (self.catalog_objects.roleByName(new_name.slice(), snap) != null) return error.DuplicateObject;
+                try next.setName(new_name.slice());
+            } else {
+                next.flags = (next.flags | spec.set) & ~spec.clear;
+                if (spec.connlimit_set) next.grant_flags = @bitCast(spec.connlimit);
+            }
+            if (self.catalog_objects.pendingConflict(current, snap)) |other| return self.objectPark(slot, other);
+            if (self.catalog_objects.pendingConflict(&next, snap)) |other| return self.objectPark(slot, other);
+            try self.reserveWrites(slot, 2);
+            self.objectDelete(slot, index, snap);
+            _ = try self.objectInsert(slot, &next, false, snap);
+        }
+
+        /// DROP ROLE: never the current, session or bootstrap user (55006 /
+        /// 2BP01); 2BP01 while it owns objects, holds grants or is named by
+        /// a policy. Its memberships and comment go with it.
+        fn dropRoles(self: *Self, slot: u16, source: []const u8, drop: *const CO.Drop, snap: Snapshot) Error!void {
+            var roles: [CO.list_capacity]u32 = undefined;
+            var count: usize = 0;
+            var writes: usize = 0;
+            const actor = self.actorFlags(snap);
+            const superuser = actor & CO.role_superuser != 0;
+            for (drop.names[0..drop.count]) |ident| {
+                const oid = self.catalog_objects.roleByName(objectName(source, ident).slice(), snap) orelse {
+                    if (drop.if_exists) continue;
+                    return error.UndefinedObject;
+                };
+                if (oid == self.session.role or oid == self.session.session_role) return error.ObjectInUse;
+                if (oid == CO.bootstrap_role) return error.DependentObjects;
+                if (!superuser and (actor & CO.role_createrole == 0 or self.catalog_objects.superuser(oid, snap) or !self.roleAdmin(self.session.role, oid, snap))) return error.InsufficientPrivilege;
+                var known = false;
+                for (roles[0..count]) |seen| known = known or seen == oid;
+                if (known) continue;
+                if (self.catalog_objects.pendingReference(oid, snap)) |other| return self.objectPark(slot, other);
+                for (&self.catalog_objects.items) |*o| {
+                    if (!O.visible(o, snap)) continue;
+                    switch (o.kind) {
+                        .member => {
+                            if (o.target == oid or o.grantee == oid) {
+                                writes += 1;
+                            } else if (o.owner == oid) return error.DependentObjects;
+                        },
+                        .comment => if (o.grantee == CO.class_authid and o.target == oid) {
+                            writes += 1;
+                        },
+                        .acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
+                        .policy => {
+                            for (o.roleList()) |listed| {
+                                if (listed == oid) return error.DependentObjects;
+                            }
+                        },
+                        .relation, .fdw, .server, .publication => if (o.owner == oid) return error.DependentObjects,
+                        else => {},
+                    }
+                }
+                roles[count] = oid;
+                count += 1;
+                writes += 1;
+            }
+            try self.reserveWrites(slot, writes);
+            for (roles[0..count]) |oid| {
+                for (&self.catalog_objects.items, 0..) |*o, index| {
+                    if (!O.visible(o, snap) or o.xmax.epoch != 0) continue;
+                    const dies = switch (o.kind) {
+                        .role => o.oid == oid,
+                        .member => o.target == oid or o.grantee == oid,
+                        .comment => o.grantee == CO.class_authid and o.target == oid,
+                        else => false,
+                    };
+                    if (dies) self.objectDelete(slot, index, snap);
+                }
+            }
+        }
+
+        /// GRANT / REVOKE role membership. Granting needs ADMIN OPTION on
+        /// the role (superusers have it); a grant that would make a role a
+        /// member of itself is 0LP01.
+        fn grantMembership(self: *Self, slot: u16, source: []const u8, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
+            const actor = self.session.role;
+            const superuser = self.privilegedRole(snap);
+            var groups: [CO.list_capacity]u32 = undefined;
+            var members: [CO.list_capacity]u32 = undefined;
+            for (grant.granted[0..grant.granted_count], 0..) |ident, index| {
+                groups[index] = self.catalog_objects.roleByName(objectName(source, ident).slice(), snap) orelse return error.UndefinedObject;
+                if (!self.roleAdmin(actor, groups[index], snap)) return error.InsufficientPrivilege;
+                if (!superuser and self.catalog_objects.superuser(groups[index], snap)) return error.InsufficientPrivilege;
+            }
+            for (grant.grantees[0..grant.grantee_count], 0..) |grantee, index| {
+                if (grantee.kind == .public) return error.UndefinedObject;
+                members[index] = try self.objectRole(source, grantee, snap);
+            }
+            var writes: usize = 0;
+            for (groups[0..grant.granted_count]) |group| {
+                for (members[0..grant.grantee_count]) |member| {
+                    if (!revoke and (group == member or self.catalog_objects.memberOf(group, member, false, snap))) return error.InvalidGrantOperation;
+                    const key: O.Object = .{ .kind = .member, .target = group, .grantee = member };
+                    if (self.catalog_objects.pendingConflict(&key, snap)) |other| return self.objectPark(slot, other);
+                    writes += 2;
+                }
+            }
+            try self.reserveWrites(slot, writes);
+            for (0..grant.granted_count * grant.grantee_count) |pair| {
+                const group = groups[pair / grant.grantee_count];
+                const member = members[pair % grant.grantee_count];
+                const key: O.Object = .{ .kind = .member, .target = group, .grantee = member };
+                const existing = self.catalog_objects.findKey(&key, snap);
+                if (existing) |index| if (self.catalog_objects.items[index].xmax.epoch != 0) continue;
+                if (revoke) {
+                    const index = existing orelse continue;
+                    var next = self.catalog_objects.items[index];
+                    self.objectDelete(slot, index, snap);
+                    // REVOKE ADMIN OPTION FOR keeps the membership.
+                    if (grant.option) {
+                        next.grant_flags = 0;
+                        _ = try self.objectInsert(slot, &next, false, snap);
+                    }
+                    continue;
+                }
+                if (existing) |index| {
+                    if (!grant.option or self.catalog_objects.items[index].grant_flags & 1 != 0) continue;
+                    var next = self.catalog_objects.items[index];
+                    next.grant_flags = 1;
+                    self.objectDelete(slot, index, snap);
+                    _ = try self.objectInsert(slot, &next, false, snap);
+                    continue;
+                }
+                var member_object: O.Object = .{ .kind = .member, .target = group, .grantee = member, .grant_flags = @intFromBool(grant.option), .owner = if (superuser) CO.bootstrap_role else actor };
+                _ = try self.objectInsert(slot, &member_object, true, snap);
+            }
+        }
+
+        /// GRANT / REVOKE table privileges: the owner (or a superuser) or a
+        /// holder of the grant options (42501 otherwise). One aclitem per
+        /// table and grantee; its grantor is the table owner.
+        fn grantTables(self: *Self, slot: u16, source: []const u8, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
+            const actor = self.session.role;
+            var slots: [CO.list_capacity]usize = undefined;
+            var grantees: [CO.list_capacity]u32 = undefined;
+            for (grant.tables[0..grant.table_count], 0..) |name, index| {
+                slots[index] = try self.objectTable(slot, source, name, .access_share, snap);
+                const oid = self.tables[slots[index]].oid;
+                if (!self.catalog_objects.grantOptions(actor, oid, grant.privileges, snap)) return error.InsufficientPrivilege;
+            }
+            for (grant.grantees[0..grant.grantee_count], 0..) |grantee, index| grantees[index] = try self.objectRole(source, grantee, snap);
+            var writes: usize = 0;
+            for (0..grant.table_count * grant.grantee_count) |pair| {
+                const key: O.Object = .{ .kind = .acl, .target = self.tables[slots[pair / grant.grantee_count]].oid, .grantee = grantees[pair % grant.grantee_count] };
+                if (self.catalog_objects.pendingConflict(&key, snap)) |other| return self.objectPark(slot, other);
+                writes += 2;
+            }
+            try self.reserveWrites(slot, writes);
+            for (0..grant.table_count * grant.grantee_count) |pair| {
+                const grantee = grantees[pair % grant.grantee_count];
+                const oid = self.tables[slots[pair / grant.grantee_count]].oid;
+                const key: O.Object = .{ .kind = .acl, .target = oid, .grantee = grantee };
+                var next: O.Object = .{ .kind = .acl, .target = oid, .grantee = grantee, .owner = self.catalog_objects.owner(oid, snap) };
+                const existing = self.catalog_objects.findKey(&key, snap);
+                if (existing) |index| {
+                    if (self.catalog_objects.items[index].xmax.epoch != 0) continue;
+                    next.flags = self.catalog_objects.items[index].flags;
+                    next.grant_flags = self.catalog_objects.items[index].grant_flags;
+                }
+                if (revoke) {
+                    next.grant_flags &= ~grant.privileges;
+                    if (!grant.option) next.flags &= ~grant.privileges;
+                } else {
+                    next.flags |= grant.privileges;
+                    if (grant.option) next.grant_flags |= grant.privileges;
+                }
+                if (existing) |index| {
+                    const old = &self.catalog_objects.items[index];
+                    if (old.flags == next.flags and old.grant_flags == next.grant_flags) continue;
+                    self.objectDelete(slot, index, snap);
+                } else if (next.flags == 0) continue;
+                if (next.flags != 0) _ = try self.objectInsert(slot, &next, false, snap);
+            }
+        }
+
+        // -- row-level security ------------------------------------------------
+
+        /// Canonical text of a policy expression over table `table_slot`
+        /// (bound like a CHECK constraint: boolean, no subqueries).
+        fn policyText(self: *Self, table_slot: usize, text: []const u8, snap: Snapshot, out: *Text) Error!void {
+            const context = self.bindContext(text, .standard, snap);
+            const id = try B.bindPolicyText(&context, text, table_slot);
+            try G.column(&self.workspace.nodes, text, id, .boolean, out);
+        }
+
+        /// The policy expressions a policy command allows (42601 otherwise).
+        fn policyShape(command: CO.Command, has_using: bool, has_check: bool) Error!void {
+            if (command == .insert and has_using) return error.Syntax;
+            if ((command == .select or command == .delete) and has_check) return error.Syntax;
+        }
+
+        fn policyRoles(self: *const Self, source: []const u8, policy: *const CO.Policy, out: *O.Object, snap: Snapshot) Error!void {
+            if (policy.role_count > O.role_capacity) return error.ProgramLimitExceeded;
+            out.role_count = 0;
+            for (policy.roles[0..policy.role_count]) |grantee| {
+                out.roles[out.role_count] = try self.objectRole(source, grantee, snap);
+                out.role_count += 1;
+            }
+            if (out.role_count == 0) {
+                out.roles[0] = CO.public_role;
+                out.role_count = 1;
+            }
+        }
+
+        fn policyExpressions(self: *Self, source: []const u8, table_slot: usize, policy: *const CO.Policy, out: *O.Object, snap: Snapshot) Error!void {
+            var using: Text = .{};
+            var check: Text = .{};
+            if (policy.has_using) try self.policyText(table_slot, source[policy.using.start..][0..policy.using.len], snap, &using);
+            if (policy.has_check) try self.policyText(table_slot, source[policy.check.start..][0..policy.check.len], snap, &check);
+            // Unchanged expressions keep their stored text (ALTER POLICY).
+            var buffer: [O.text_capacity]u8 = undefined;
+            const using_bytes = if (policy.has_using) using.slice() else out.usingText();
+            if (using_bytes.len > buffer.len) return error.TextCapacity;
+            @memcpy(buffer[0..using_bytes.len], using_bytes);
+            const check_bytes = if (policy.has_check) check.slice() else out.checkText();
+            if (check_bytes.len > buffer.len - using_bytes.len) return error.TextCapacity;
+            @memcpy(buffer[using_bytes.len..][0..check_bytes.len], check_bytes);
+            if (policy.has_using) out.flags |= CO.policy_using;
+            if (policy.has_check) out.flags |= CO.policy_check;
+            try out.setText(buffer[0..using_bytes.len], buffer[using_bytes.len..][0..check_bytes.len]);
+        }
+
+        /// CREATE POLICY: the table owner (42501), a new name on the table
+        /// (42710); USING / WITH CHECK bound over the table's row.
+        fn createPolicy(self: *Self, slot: u16, source: []const u8, policy: *const CO.Policy, snap: Snapshot) Error!void {
+            const table_slot = try self.objectTable(slot, source, policy.table, .access_exclusive, snap);
+            const table = &self.tables[table_slot];
+            if (table.relkind != 'r' and table.relkind != 'p') return error.WrongObjectType;
+            if (!self.catalog_objects.ownsTable(self.session.role, table.oid, snap)) return error.InsufficientPrivilege;
+            try policyShape(policy.command, policy.has_using, policy.has_check);
+            var object: O.Object = .{ .kind = .policy, .target = table.oid, .flags = @intFromEnum(policy.command) | (if (policy.permissive) CO.policy_permissive else 0) };
+            try object.setName(objectName(source, policy.name).slice());
+            if (self.catalog_objects.byName(.policy, table.oid, object.name.slice(), snap) != null) return error.DuplicateObject;
+            if (self.catalog_objects.pendingConflict(&object, snap)) |other| return self.objectPark(slot, other);
+            try self.policyRoles(source, policy, &object, snap);
+            try self.policyExpressions(source, table_slot, policy, &object, snap);
+            try self.reserveWrites(slot, 1);
+            _ = try self.objectInsert(slot, &object, true, snap);
+        }
+
+        fn findPolicy(self: *Self, slot: u16, source: []const u8, policy: *const CO.Policy, snap: Snapshot) Error!?struct { table: usize, index: usize } {
+            const table_slot = try self.objectTable(slot, source, policy.table, .access_exclusive, snap);
+            const table = &self.tables[table_slot];
+            const index = self.catalog_objects.byName(.policy, table.oid, objectName(source, policy.name).slice(), snap) orelse {
+                if (policy.if_exists) return null;
+                return error.UndefinedObject;
+            };
+            if (!self.catalog_objects.ownsTable(self.session.role, table.oid, snap)) return error.InsufficientPrivilege;
+            if (self.catalog_objects.pendingConflict(&self.catalog_objects.items[index], snap)) |other| return self.objectPark(slot, other);
+            return .{ .table = table_slot, .index = index };
+        }
+
+        fn alterPolicy(self: *Self, slot: u16, source: []const u8, policy: *const CO.Policy, snap: Snapshot) Error!void {
+            const found = (try self.findPolicy(slot, source, policy, snap)).?;
+            var next = self.catalog_objects.items[found.index];
+            if (policy.rename) {
+                const new_name = objectName(source, policy.new_name);
+                if (self.catalog_objects.byName(.policy, next.target, new_name.slice(), snap) != null) return error.DuplicateObject;
+                try next.setName(new_name.slice());
+                if (self.catalog_objects.pendingConflict(&next, snap)) |other| return self.objectPark(slot, other);
+            } else {
+                const command: CO.Command = @enumFromInt(@as(u8, @truncate(next.flags)));
+                try policyShape(command, policy.has_using, policy.has_check);
+                if (policy.role_count != 0) try self.policyRoles(source, policy, &next, snap);
+                try self.policyExpressions(source, found.table, policy, &next, snap);
+            }
+            try self.reserveWrites(slot, 2);
+            self.objectDelete(slot, found.index, snap);
+            _ = try self.objectInsert(slot, &next, false, snap);
+        }
+
+        fn dropPolicy(self: *Self, slot: u16, source: []const u8, policy: *const CO.Policy, snap: Snapshot) Error!void {
+            const found = (try self.findPolicy(slot, source, policy, snap)) orelse return;
+            const oid = self.catalog_objects.items[found.index].oid;
+            if (self.catalog_objects.pendingReference(oid, snap)) |other| return self.objectPark(slot, other);
+            try self.reserveWrites(slot, 2);
+            self.objectDelete(slot, found.index, snap);
+            const comment: O.Object = .{ .kind = .comment, .grantee = CO.class_policy, .target = oid };
+            if (self.catalog_objects.findKey(&comment, snap)) |index| self.objectDelete(slot, index, snap);
+        }
+
+        /// ALTER TABLE ... ENABLE / DISABLE / [NO] FORCE ROW LEVEL SECURITY
+        /// (the owner) and OWNER TO (superusers): the table's relation entry.
+        fn tableSecurity(self: *Self, slot: u16, source: []const u8, security: *const CO.TableSecurity, snap: Snapshot) Error!void {
+            const table_slot = self.objectTable(slot, source, security.table, .access_exclusive, snap) catch |err| {
+                if (err == error.TableNotFound and security.if_exists) return;
+                return err;
+            };
+            const table = &self.tables[table_slot];
+            const oid = table.oid;
+            if (security.action != .owner and table.relkind != 'r' and table.relkind != 'p') return error.WrongObjectType;
+            if (!self.catalog_objects.ownsTable(self.session.role, oid, snap)) return error.InsufficientPrivilege;
+            const key: O.Object = .{ .kind = .relation, .target = oid };
+            if (self.catalog_objects.pendingConflict(&key, snap)) |other| return self.objectPark(slot, other);
+            const existing = self.catalog_objects.relation(oid, snap);
+            const old_owner = self.catalog_objects.owner(oid, snap);
+            var owner = old_owner;
+            var flags = self.catalog_objects.securityFlags(oid, snap);
+            switch (security.action) {
+                .enable => flags |= CO.rls_enabled,
+                .disable => flags &= ~CO.rls_enabled,
+                .force => flags |= CO.rls_forced,
+                .no_force => flags &= ~CO.rls_forced,
+                .owner => {
+                    if (!self.privilegedRole(snap)) return error.InsufficientPrivilege;
+                    owner = try self.objectRole(source, security.owner, snap);
+                },
+            }
+            if (owner == old_owner and flags == self.catalog_objects.securityFlags(oid, snap)) return;
+            // Grants recorded by the old owner move to the new one (aclnewowner).
+            var grants: usize = 0;
+            if (owner != old_owner) {
+                for (&self.catalog_objects.items) |*o| {
+                    if (o.kind == .acl and o.target == oid and o.owner == old_owner and O.visible(o, snap)) grants += 1;
+                }
+            }
+            try self.reserveWrites(slot, 2 + 2 * grants);
+            if (existing) |index| self.objectDelete(slot, index, snap);
+            if (owner != CO.bootstrap_role or flags != 0) {
+                var next: O.Object = .{ .kind = .relation, .target = oid, .owner = owner, .flags = flags };
+                _ = try self.objectInsert(slot, &next, false, snap);
+            }
+            if (grants != 0) {
+                for (0..self.catalog_objects.items.len) |index| {
+                    const o = &self.catalog_objects.items[index];
+                    if (o.kind != .acl or o.target != oid or o.owner != old_owner or !O.visible(o, snap) or o.xmax.epoch != 0) continue;
+                    if (o.xmin_csn == 0 and o.xmin_cid == snap.cid) continue;
+                    var next = o.*;
+                    next.owner = owner;
+                    self.objectDelete(slot, index, snap);
+                    _ = try self.objectInsert(slot, &next, false, snap);
+                }
+            }
+        }
+
+        // -- comments ----------------------------------------------------------
+
+        /// COMMENT ON ... IS 'text' | NULL (an empty text removes it too).
+        fn commentOn(self: *Self, slot: u16, source: []const u8, comment: *const CO.Comment, snap: Snapshot) Error!void {
+            var key: O.Object = .{ .kind = .comment };
+            const role = self.session.role;
+            const privileged = self.privilegedRole(snap);
+            switch (comment.target) {
+                .table, .view, .materialized_view, .column => {
+                    const table_slot = try self.objectTable(slot, source, comment.object, .access_share, snap);
+                    const table = &self.tables[table_slot];
+                    const kind_ok = switch (comment.target) {
+                        .table => table.relkind == 'r' or table.relkind == 'p',
+                        .view => table.relkind == 'v',
+                        .materialized_view => table.relkind == 'm',
+                        else => true,
+                    };
+                    if (!kind_ok) return error.WrongObjectType;
+                    if (!self.catalog_objects.ownsTable(role, table.oid, snap)) return error.InsufficientPrivilege;
+                    key.grantee = CO.class_relation;
+                    key.target = table.oid;
+                    if (comment.target == .column) {
+                        const column_name = objectName(source, comment.column);
+                        var position: ?usize = null;
+                        for (table.columns[0..table.column_count], 0..) |*column, index| {
+                            if (types.same(column.name.slice(), column_name.slice())) position = index;
+                        }
+                        key.sub = @intCast((position orelse return error.ColumnNotFound) + 1);
+                    }
+                },
+                .sequence => {
+                    const schema_name = if (comment.object.has_schema) objectName(source, comment.object.schema) else Name{};
+                    const namespace = namespaceFor(&self.catalog, if (comment.object.has_schema) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
+                    const found = self.catalog.findIn(namespace, objectName(source, comment.object.name).slice(), snap) orelse return error.TableNotFound;
+                    if (found.kind != 'S') return error.WrongObjectType;
+                    if (!privileged) return error.InsufficientPrivilege;
+                    key.grantee = CO.class_relation;
+                    key.target = self.seqs[found.slot].oid;
+                },
+                .index, .extension => return error.UnsupportedStatement,
+                .foreign_table => return error.TableNotFound,
+                .schema => {
+                    key.grantee = CO.class_namespace;
+                    key.target = namespaceFor(&self.catalog, objectName(source, comment.object.name).slice(), snap) orelse return error.UndefinedSchema;
+                    if (!privileged) return error.InsufficientPrivilege;
+                },
+                .role => {
+                    key.grantee = CO.class_authid;
+                    key.target = self.catalog_objects.roleByName(objectName(source, comment.object.name).slice(), snap) orelse return error.UndefinedObject;
+                    if (!privileged and (self.actorFlags(snap) & CO.role_createrole == 0 or !self.roleAdmin(role, key.target, snap))) return error.InsufficientPrivilege;
+                },
+                .policy => {
+                    const table_slot = try self.objectTable(slot, source, comment.on, .access_share, snap);
+                    const table = &self.tables[table_slot];
+                    const index = self.catalog_objects.byName(.policy, table.oid, objectName(source, comment.object.name).slice(), snap) orelse return error.UndefinedObject;
+                    if (!self.catalog_objects.ownsTable(role, table.oid, snap)) return error.InsufficientPrivilege;
+                    key.grantee = CO.class_policy;
+                    key.target = self.catalog_objects.items[index].oid;
+                },
+                .fdw, .server, .publication => {
+                    const kind: CO.Kind = switch (comment.target) {
+                        .fdw => .fdw,
+                        .server => .server,
+                        else => .publication,
+                    };
+                    const index = self.catalog_objects.byName(kind, 0, objectName(source, comment.object.name).slice(), snap) orelse return error.UndefinedObject;
+                    if (!privileged and !self.catalog_objects.memberOf(role, self.catalog_objects.items[index].owner, true, snap)) return error.InsufficientPrivilege;
+                    key.grantee = switch (kind) {
+                        .fdw => CO.class_fdw,
+                        .server => CO.class_server,
+                        else => CO.class_publication,
+                    };
+                    key.target = self.catalog_objects.items[index].oid;
+                },
+            }
+            if (comment.has_text) {
+                if (comment.text.len > O.text_capacity) return error.TextCapacity;
+                lexer.decodeQuoted(source, comment.text, key.text[0..comment.text.len]);
+                key.text_len = @intCast(comment.text.len);
+            }
+            if (self.catalog_objects.pendingConflict(&key, snap)) |other| return self.objectPark(slot, other);
+            if (key.grantee != CO.class_relation and key.grantee != CO.class_namespace) {
+                if (self.catalog_objects.pendingReference(key.target, snap)) |other| return self.objectPark(slot, other);
+            }
+            try self.reserveWrites(slot, 2);
+            if (self.catalog_objects.findKey(&key, snap)) |index| {
+                if (self.catalog_objects.items[index].xmax.epoch == 0) self.objectDelete(slot, index, snap);
+            }
+            if (key.text_len != 0) _ = try self.objectInsert(slot, &key, false, snap);
+        }
+
+        // -- foreign-data wrappers, servers, publications ------------------------
+
+        /// CREATE FOREIGN DATA WRAPPER (superusers) / CREATE SERVER (USAGE on
+        /// the wrapper: its owner or a superuser). Catalog entries only:
+        /// there are no handlers, user mappings or foreign tables.
+        fn createNamed(self: *Self, slot: u16, source: []const u8, kind: CO.Kind, ident: CO.Ident, if_not_exists: bool, server: ?*const CO.Server, snap: Snapshot) Error!void {
+            var object: O.Object = .{ .kind = kind, .owner = self.session.role };
+            try object.setName(objectName(source, ident).slice());
+            if (self.catalog_objects.byName(kind, 0, object.name.slice(), snap) != null) {
+                if (if_not_exists) return;
+                return error.DuplicateObject;
+            }
+            if (kind == .fdw and !self.privilegedRole(snap)) return error.InsufficientPrivilege;
+            if (server) |spec| {
+                const fdw = self.catalog_objects.byName(.fdw, 0, objectName(source, spec.fdw).slice(), snap) orelse return error.UndefinedObject;
+                object.target = self.catalog_objects.items[fdw].oid;
+                if (!self.privilegedRole(snap) and !self.catalog_objects.memberOf(self.session.role, self.catalog_objects.items[fdw].owner, true, snap)) return error.InsufficientPrivilege;
+                var first: Text = .{};
+                var second: Text = .{};
+                if (spec.has_type) {
+                    if (spec.server_type.len > config.text_bytes) return error.TextCapacity;
+                    lexer.decodeQuoted(source, spec.server_type, first.bytes[0..spec.server_type.len]);
+                    first.len = spec.server_type.len;
+                    object.flags |= CO.server_type;
+                }
+                if (spec.has_version) {
+                    if (spec.version.len > config.text_bytes) return error.TextCapacity;
+                    lexer.decodeQuoted(source, spec.version, second.bytes[0..spec.version.len]);
+                    second.len = spec.version.len;
+                    object.flags |= CO.server_version;
+                }
+                // srvtype / srvversion may be empty strings: never ambiguous
+                // with NULL because the flags say which are present.
+                try object.setText(first.slice(), second.slice());
+                if (self.catalog_objects.pendingReference(object.target, snap)) |other| return self.objectPark(slot, other);
+            }
+            if (self.catalog_objects.pendingConflict(&object, snap)) |other| return self.objectPark(slot, other);
+            try self.reserveWrites(slot, 1);
+            _ = try self.objectInsert(slot, &object, true, snap);
+        }
+
+        /// CREATE PUBLICATION (superusers: the database's CREATE privilege
+        /// belongs to its owner). Catalog entry only: no logical decoding.
+        fn createPublication(self: *Self, slot: u16, source: []const u8, publication: *const CO.Publication, snap: Snapshot) Error!void {
+            if (!self.privilegedRole(snap)) return error.InsufficientPrivilege;
+            var object: O.Object = .{ .kind = .publication, .owner = self.session.role, .flags = publication.flags };
+            try object.setName(objectName(source, publication.name).slice());
+            if (self.catalog_objects.byName(.publication, 0, object.name.slice(), snap) != null) return error.DuplicateObject;
+            if (self.catalog_objects.pendingConflict(&object, snap)) |other| return self.objectPark(slot, other);
+            try self.reserveWrites(slot, 1);
+            _ = try self.objectInsert(slot, &object, true, snap);
+        }
+
+        /// DROP FOREIGN DATA WRAPPER / SERVER / PUBLICATION: the owner or a
+        /// superuser; a wrapper with servers is 2BP01 unless CASCADE.
+        fn dropNamed(self: *Self, slot: u16, source: []const u8, kind: CO.Kind, drop: *const CO.Drop, snap: Snapshot) Error!void {
+            var victims: [CO.list_capacity]usize = undefined;
+            var count: usize = 0;
+            var writes: usize = 0;
+            for (drop.names[0..drop.count]) |ident| {
+                const index = self.catalog_objects.byName(kind, 0, objectName(source, ident).slice(), snap) orelse {
+                    if (drop.if_exists) continue;
+                    return error.UndefinedObject;
+                };
+                const o = &self.catalog_objects.items[index];
+                if (!self.privilegedRole(snap) and !self.catalog_objects.memberOf(self.session.role, o.owner, true, snap)) return error.InsufficientPrivilege;
+                var known = false;
+                for (victims[0..count]) |seen| known = known or seen == index;
+                if (known) continue;
+                if (self.catalog_objects.pendingConflict(o, snap)) |other| return self.objectPark(slot, other);
+                if (self.catalog_objects.pendingReference(o.oid, snap)) |other| return self.objectPark(slot, other);
+                for (&self.catalog_objects.items) |*other| {
+                    if (!O.visible(other, snap)) continue;
+                    if (other.kind == .comment and other.target == o.oid) writes += 1;
+                    if (kind == .fdw and other.kind == .server and other.target == o.oid) {
+                        if (!drop.cascade) return error.DependentObjects;
+                        if (self.catalog_objects.pendingReference(other.oid, snap)) |waiter| return self.objectPark(slot, waiter);
+                        writes += 2;
+                    }
+                }
+                victims[count] = index;
+                count += 1;
+                writes += 1;
+            }
+            try self.reserveWrites(slot, writes);
+            for (victims[0..count]) |index| {
+                const oid = self.catalog_objects.items[index].oid;
+                for (&self.catalog_objects.items, 0..) |*other, position| {
+                    if (!O.visible(other, snap) or other.xmax.epoch != 0) continue;
+                    if (kind == .fdw and other.kind == .server and other.target == oid) {
+                        const server_oid = other.oid;
+                        self.objectDelete(slot, position, snap);
+                        for (&self.catalog_objects.items, 0..) |*c, at| if (c.kind == .comment and c.target == server_oid and O.visible(c, snap) and c.xmax.epoch == 0) {
+                            self.objectDelete(slot, at, snap);
+                        };
+                    }
+                }
+                for (&self.catalog_objects.items, 0..) |*c, at| if (c.kind == .comment and c.target == oid and O.visible(c, snap) and c.xmax.epoch == 0) {
+                    self.objectDelete(slot, at, snap);
+                };
+                self.objectDelete(slot, index, snap);
+            }
+        }
+
+        // -- privileges and row security of ordinary statements ---------------
+
+        fn needTable(self: *const Self, table_slot: usize, wanted: u32, snap: Snapshot) Error!void {
+            if (!self.catalog_objects.tablePrivileges(self.session.role, self.tables[table_slot].oid, wanted, snap)) return error.InsufficientPrivilege;
+        }
+
+        fn needOwner(self: *const Self, table_slot: usize, snap: Snapshot) Error!void {
+            if (!self.catalog_objects.ownsTable(self.session.role, self.tables[table_slot].oid, snap)) return error.InsufficientPrivilege;
+        }
+
+        fn insertPrivileges(self: *const Self, insert: *const B.Insert, snap: Snapshot) Error!void {
+            var wanted: u32 = CO.priv_insert;
+            if (insert.returning.count != 0) wanted |= CO.priv_select;
+            if (insert.conflict.action == .update) wanted |= CO.priv_update;
+            try self.needTable(insert.table, wanted, snap);
+        }
+
+        /// UPDATE / DELETE read the rows they change when they filter or
+        /// return them (SELECT privilege, as column reads in PostgreSQL).
+        fn changePrivileges(self: *const Self, table_slot: usize, privilege: u32, where: u16, returning: usize, snap: Snapshot) Error!void {
+            var wanted = privilege;
+            if (where != ast.none or returning != 0) wanted |= CO.priv_select;
+            try self.needTable(table_slot, wanted, snap);
+        }
+
+        /// Table privileges of a bound statement for a role that is not a
+        /// superuser (FROM items were checked while expanding relations).
+        /// Creating objects needs CREATE on a schema, which only superusers
+        /// hold here (PostgreSQL 15+ public schema); altering or dropping a
+        /// relation needs its ownership.
+        fn checkPrivileges(self: *const Self, bound: *const B.Bound, snap: Snapshot) Error!void {
+            if (self.privilegedRole(snap)) return;
+            switch (bound.*) {
+                .insert => |*insert| try self.insertPrivileges(insert, snap),
+                .update => |*update| try self.changePrivileges(update.table, CO.priv_update, update.where, update.returning.count, snap),
+                .delete => |*delete| try self.changePrivileges(delete.table, CO.priv_delete, delete.where, delete.returning.count, snap),
+                .query => {
+                    const plans = &self.workspace.plans;
+                    for (plans.dml[0..plans.dml_len]) |*dml| switch (dml.*) {
+                        .insert => |*insert| try self.insertPrivileges(insert, snap),
+                        .update => |*update| try self.changePrivileges(update.table, CO.priv_update, update.where, update.returning.count, snap),
+                        .delete => |*delete| try self.changePrivileges(delete.table, CO.priv_delete, delete.where, delete.returning.count, snap),
+                    };
+                },
+                .truncate => |*truncate| {
+                    for (truncate.tables[0..truncate.count]) |table_slot| try self.needTable(table_slot, CO.priv_truncate, snap);
+                },
+                .merge => |*merge| {
+                    var wanted: u32 = CO.priv_select;
+                    for (merge.whens[0..merge.when_count]) |*when| wanted |= switch (when.action) {
+                        .update => CO.priv_update,
+                        .delete => CO.priv_delete,
+                        .insert => CO.priv_insert,
+                        .nothing => 0,
+                    };
+                    try self.needTable(merge.table, wanted, snap);
+                },
+                .drop_table => |table_slot| try self.needOwner(table_slot, snap),
+                .drop_relation => |*drop| try self.needOwner(drop.slot, snap),
+                .alter_table => |*alter| try self.needOwner(alter.table, snap),
+                .refresh_view => |*refresh| try self.needOwner(refresh.slot, snap),
+                .create_table, .create_sequence, .drop_sequence, .alter_sequence, .create_schema, .drop_schema => return error.InsufficientPrivilege,
+                else => {},
+            }
+        }
+
+        /// The workspace copy of the statement (after its expansions),
+        /// with room to append row-security text.
+        fn securedSource(self: *Self, source: []const u8, original: []const u8, length: *usize) Error!void {
+            if (source.ptr == &self.workspace.expansion) {
+                length.* = source.len;
+                return;
+            }
+            if (original.len > self.workspace.expansion.len) return error.TextCapacity;
+            @memcpy(self.workspace.expansion[0..original.len], original);
+            length.* = original.len;
+        }
+
+        /// UPDATE / DELETE targets under row security: the command's USING
+        /// expressions (and SELECT's when the statement reads the rows) are
+        /// AND-ed into WHERE before binding.
+        fn secureTarget(self: *Self, statement_copy: *A.Statement, source: []const u8, original: []const u8, snap: Snapshot) Error![]const u8 {
+            const role = self.session.role;
+            if (self.privilegedRole(snap)) return source;
+            const goal: struct { schema: ?ast.Ident, table: ast.Ident, where: *u16, command: CO.Command, reads: bool } = switch (statement_copy.*) {
+                .update => |*update| .{ .schema = update.schema, .table = update.table, .where = &update.where, .command = .update, .reads = update.where != ast.none or update.returning.count != 0 },
+                .delete => |*delete| .{ .schema = delete.schema, .table = delete.table, .where = &delete.where, .command = .delete, .reads = delete.where != ast.none or delete.returning.count != 0 },
+                else => return source,
+            };
+            const schema_name = if (goal.schema) |qualifier| identName(source, qualifier) else Name{};
+            const namespace = namespaceFor(&self.catalog, if (goal.schema != null) schema_name.slice() else null, snap) orelse return source;
+            const found = self.catalog.findIn(namespace, identName(source, goal.table).slice(), snap) orelse return source;
+            if (found.kind != 'r' and found.kind != 'p') return source;
+            const table = &self.tables[found.slot];
+            if (!self.catalog_objects.rowSecurity(role, table.oid, snap)) return source;
+            if (table.relkind == 'p' or self.hasChildren(table.oid, snap)) return error.UnsupportedStatement;
+            var length: usize = 0;
+            try self.securedSource(source, original, &length);
+            var text: CO.Appender = .{ .out = &self.workspace.expansion, .len = &length };
+            try text.add(" ");
+            const start = length;
+            try self.catalog_objects.securityText(role, table.oid, goal.command, false, snap, &self.workspace.expansion, &length);
+            if (goal.reads) {
+                try text.add(" AND ");
+                try self.catalog_objects.securityText(role, table.oid, .select, false, snap, &self.workspace.expansion, &length);
+            }
+            const id = try P.parseExpressionAt(self.workspace.expansion[0..length], start, length, &self.workspace.nodes);
+            goal.where.* = if (goal.where.* == ast.none) id else try self.workspace.nodes.add(.{ .kind = .and_op, .a = id, .b = goal.where.* });
+            return self.workspace.expansion[0..length];
+        }
+
+        /// INSERT / UPDATE new rows under row security: the WITH CHECK
+        /// expressions (USING where a policy has none) bound over the
+        /// table's row, checked for every new row (42501 unless true).
+        fn secureNewRows(self: *Self, bound: *const B.Bound, source: []const u8, snap: Snapshot) Error!void {
+            self.workspace.security_check = ast.none;
+            const role = self.session.role;
+            if (self.privilegedRole(snap)) return;
+            const goal: struct { table: usize, command: CO.Command } = switch (bound.*) {
+                .insert => |*insert| .{ .table = insert.table, .command = .insert },
+                .update => |*update| .{ .table = update.table, .command = .update },
+                .merge => |*merge| {
+                    if (self.catalog_objects.rowSecurity(role, self.tables[merge.table].oid, snap)) return error.UnsupportedStatement;
+                    return;
+                },
+                .query => {
+                    const plans = &self.workspace.plans;
+                    for (plans.dml[0..plans.dml_len]) |*dml| {
+                        const table_slot = switch (dml.*) {
+                            .insert => |*insert| insert.table,
+                            .update => |*update| update.table,
+                            .delete => |*delete| delete.table,
+                        };
+                        if (self.catalog_objects.rowSecurity(role, self.tables[table_slot].oid, snap)) return error.UnsupportedStatement;
+                    }
+                    return;
+                },
+                else => return,
+            };
+            const oid = self.tables[goal.table].oid;
+            if (!self.catalog_objects.rowSecurity(role, oid, snap)) return;
+            if (bound.* == .insert and bound.insert.conflict.action != .none) return error.UnsupportedStatement;
+            var length: usize = 0;
+            try self.securedSource(source, source, &length);
+            const start = length;
+            try self.catalog_objects.securityText(role, oid, goal.command, true, snap, &self.workspace.expansion, &length);
+            const text = self.workspace.expansion[start..length];
+            const context = self.bindContext(text, .standard, snap);
+            self.workspace.security_check = try B.bindPolicyText(&context, text, goal.table);
+            self.workspace.security_start = start;
+            self.workspace.security_len = length - start;
+            self.workspace.security_table = goal.table;
+        }
+
+        /// The new row of the statement's INSERT / UPDATE target passes its
+        /// row-security WITH CHECK expression.
+        fn securityCheck(self: *Self, ctx: *const E.Context, table_slot: usize, cells: *const E.Row) Error!void {
+            const id = self.workspace.security_check;
+            if (id == ast.none or table_slot != self.workspace.security_table) return;
+            var sub = ctx.*;
+            sub.source = self.workspace.expansion[self.workspace.security_start..][0..self.workspace.security_len];
+            sub.row = cells;
+            const verdict = try E.eval(&sub, id);
+            if (verdict != .boolean or !verdict.boolean) return error.InsufficientPrivilege;
+        }
+
+        /// SELECT privilege and row security of one FROM item the statement
+        /// names (not one a view or an expansion introduced: those run with
+        /// the view owner's rights, the bootstrap superuser). Returns the
+        /// derived query replacing it under row security, or none.
+        fn secureItem(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, role: u32, found: K.Found, snap: Snapshot) Error!u16 {
+            if (found.kind == 'S') return error.InsufficientPrivilege;
+            const table = &db.tables[found.slot];
+            if (!db.catalog_objects.tablePrivileges(role, table.oid, CO.priv_select, snap)) return error.InsufficientPrivilege;
+            if (table.relkind != 'r' and table.relkind != 'p') return ast.none;
+            if (!db.catalog_objects.rowSecurity(role, table.oid, snap)) return ast.none;
+            if (table.relkind == 'p' or db.hasChildren(table.oid, snap)) return error.UnsupportedStatement;
+            if (length.* == 0) {
+                if (source.len > workspace.expansion.len) return error.TextCapacity;
+                @memcpy(workspace.expansion[0..source.len], source);
+                length.* = source.len;
+            }
+            var text: CO.Appender = .{ .out = &workspace.expansion, .len = length };
+            try text.add(" ");
+            const start = length.*;
+            try text.add("SELECT * FROM ONLY ");
+            try text.quoted(db.namespaceName(table.namespace));
+            try text.add(".");
+            try text.quoted(table.name.slice());
+            try text.add(" WHERE ");
+            try db.catalog_objects.securityText(role, table.oid, .select, false, snap, &workspace.expansion, length);
+            return P.parseQueryAt(workspace.expansion[0..length.*], start, length.*, &workspace.nodes);
+        }
+
+        /// catalog_text hook: comments and role names under the statement
+        /// snapshot.
+        fn catalogText(ptr: *anyopaque, kind: value_module.CatalogText, object: u32, classoid: u32, sub: i32, out: []u8) Error!?usize {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const snap = self.seq_snap;
+            const text: []const u8 = switch (kind) {
+                .role_name => self.catalog_objects.roleName(object, snap) orelse return null,
+                .description => self.catalog_objects.description(object, classoid, sub, snap) orelse return null,
+                .shared_description => if (classoid == CO.class_authid) self.catalog_objects.description(object, classoid, 0, snap) orelse return null else return null,
+            };
+            if (text.len > out.len) return error.TextCapacity;
+            @memcpy(out[0..text.len], text);
+            return text.len;
+        }
+
+        /// Rows of the catalog-object system views.
+        fn catalogObjectRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!void {
+            const database = session_values.database;
+            switch (view) {
+                .pg_roles, .pg_authid => {
+                    // The bootstrap superuser first, then roles in catalog order.
+                    var bootstrap: O.Object = .{ .kind = .role, .oid = CO.bootstrap_role, .flags = CO.role_attributes, .grant_flags = @bitCast(@as(i32, -1)) };
+                    bootstrap.setName(CO.bootstrap_name) catch {};
+                    try self.roleRow(view, &bootstrap, sink);
+                    for (&self.catalog_objects.items) |*o| if (o.kind == .role and O.visible(o, snapshot)) try self.roleRow(view, o, sink);
+                },
+                .pg_auth_members => for (&self.catalog_objects.items) |*o| if (o.kind == .member and O.visible(o, snapshot)) {
+                    try sink.add(&.{ intCell(o.oid), intCell(o.target), intCell(o.grantee), intCell(o.owner), boolCell(o.grant_flags & 1 != 0), boolCell(true), boolCell(true) });
+                },
+                .pg_policy, .pg_policies => for (&self.catalog_objects.items) |*o| if (o.kind == .policy and O.visible(o, snapshot)) {
+                    const command: CO.Command = @enumFromInt(@as(u8, @truncate(o.flags)));
+                    const qual: Cell = if (o.flags & CO.policy_using != 0) try objectTextCell(o.usingText()) else .null_value;
+                    const check: Cell = if (o.flags & CO.policy_check != 0) try objectTextCell(o.checkText()) else .null_value;
+                    if (view == .pg_policy) {
+                        const code: []const u8 = switch (command) {
+                            .all => "*",
+                            .select => "r",
+                            .insert => "a",
+                            .update => "w",
+                            .delete => "d",
+                        };
+                        try sink.add(&.{ intCell(o.oid), nameCell(o.name.slice()), intCell(o.target), nameCell(code), boolCell(o.flags & CO.policy_permissive != 0), try self.roleArray(o, false, snapshot), qual, check });
+                        continue;
+                    }
+                    const table_slot = self.visibleTableSlot(o.target, snapshot) orelse continue;
+                    const table = &self.tables[table_slot];
+                    const cmd: []const u8 = switch (command) {
+                        .all => "ALL",
+                        .select => "SELECT",
+                        .insert => "INSERT",
+                        .update => "UPDATE",
+                        .delete => "DELETE",
+                    };
+                    try sink.add(&.{ nameCell(self.namespaceName(table.namespace)), nameCell(table.name.slice()), nameCell(o.name.slice()), nameCell(if (o.flags & CO.policy_permissive != 0) "PERMISSIVE" else "RESTRICTIVE"), try self.roleArray(o, true, snapshot), nameCell(cmd), qual, check });
+                },
+                .pg_description, .pg_shdescription => for (&self.catalog_objects.items) |*o| if (o.kind == .comment and O.visible(o, snapshot)) {
+                    const shared = o.grantee == CO.class_authid;
+                    if (shared != (view == .pg_shdescription)) continue;
+                    const text = try objectTextCell(o.textSlice());
+                    if (shared) try sink.add(&.{ intCell(o.target), intCell(o.grantee), text }) else try sink.add(&.{ intCell(o.target), intCell(o.grantee), intCell(o.sub), text });
+                },
+                .pg_foreign_data_wrapper => for (&self.catalog_objects.items) |*o| if (o.kind == .fdw and O.visible(o, snapshot)) {
+                    try sink.add(&.{ intCell(o.oid), nameCell(o.name.slice()), intCell(o.owner), intCell(0), intCell(0), .null_value, .null_value });
+                },
+                .pg_foreign_server => for (&self.catalog_objects.items) |*o| if (o.kind == .server and O.visible(o, snapshot)) {
+                    const server_type: Cell = if (o.flags & CO.server_type != 0) nameCell(o.usingText()) else .null_value;
+                    const version: Cell = if (o.flags & CO.server_version != 0) nameCell(o.checkText()) else .null_value;
+                    try sink.add(&.{ intCell(o.oid), nameCell(o.name.slice()), intCell(o.owner), intCell(o.target), server_type, version, .null_value, .null_value });
+                },
+                .pg_publication => for (&self.catalog_objects.items) |*o| if (o.kind == .publication and O.visible(o, snapshot)) {
+                    const flags = o.flags;
+                    try sink.add(&.{ intCell(o.oid), nameCell(o.name.slice()), intCell(o.owner), boolCell(flags & CO.pub_all_tables != 0), boolCell(flags & CO.pub_insert != 0), boolCell(flags & CO.pub_update != 0), boolCell(flags & CO.pub_delete != 0), boolCell(flags & CO.pub_truncate != 0), boolCell(flags & CO.pub_via_root != 0), nameCell("n") });
+                },
+                .pg_extension => try sink.add(&.{ intCell(CO.plpgsql_extension_oid), nameCell("plpgsql"), intCell(CO.bootstrap_role), intCell(catalog_module.catalog_namespace), boolCell(false), nameCell("1.0"), .null_value, .null_value }),
+                .pg_tables, .table_privileges => {
+                    var relations: [K.relation_rows]K.Found = undefined;
+                    const count = self.catalog.visibleRelations(snapshot, &relations);
+                    for (relations[0..count]) |found| {
+                        if (found.kind == 'S') continue;
+                        const table = &self.tables[found.slot];
+                        if (table.relkind != 'r' and table.relkind != 'p' and view == .pg_tables) continue;
+                        const owner = self.catalog_objects.owner(table.oid, snapshot);
+                        const owner_name = self.catalog_objects.roleName(owner, snapshot) orelse "";
+                        const schema_name = self.namespaceName(table.namespace);
+                        if (view == .pg_tables) {
+                            try sink.add(&.{ nameCell(schema_name), nameCell(table.name.slice()), nameCell(owner_name), .null_value, boolCell(S.keyed(table) or table.index_count != 0), boolCell(false), boolCell(false), boolCell(self.catalog_objects.securityFlags(table.oid, snapshot) & CO.rls_enabled != 0) });
+                            continue;
+                        }
+                        // aclexplode(coalesce(relacl, acldefault)): the owner's
+                        // privileges, then each grant, in privilege-bit order.
+                        try self.privilegeRows(database, schema_name, table, owner_name, owner_name, CO.table_privileges, CO.table_privileges, sink);
+                        for (&self.catalog_objects.items) |*o| if (o.kind == .acl and o.target == table.oid and O.visible(o, snapshot)) {
+                            const grantor = self.catalog_objects.roleName(o.owner, snapshot) orelse "";
+                            const grantee = if (o.grantee == CO.public_role) "PUBLIC" else self.catalog_objects.roleName(o.grantee, snapshot) orelse "";
+                            try self.privilegeRows(database, schema_name, table, grantor, grantee, o.flags, o.grant_flags, sink);
+                        };
+                    }
+                },
+                else => {},
+            }
+        }
+
+        /// Object text as a cell (54000 TextCapacity past Config.text_bytes).
+        fn objectTextCell(bytes: []const u8) Error!Cell {
+            if (bytes.len > config.text_bytes) return error.TextCapacity;
+            return nameCell(bytes);
+        }
+
+        fn privilegeRows(self: *const Self, database: []const u8, schema_name: []const u8, table: *const S.Table, grantor: []const u8, grantee: []const u8, flags: u32, grant_flags: u32, sink: *X.RowSink) Error!void {
+            _ = self;
+            for (CO.privilege_bits, CO.privilege_sql) |bit, spelling| {
+                if (flags & bit == 0) continue;
+                try sink.add(&.{ nameCell(grantor), nameCell(grantee), nameCell(database), nameCell(schema_name), nameCell(table.name.slice()), nameCell(spelling), nameCell(if (grant_flags & bit != 0) "YES" else "NO"), nameCell(if (bit == CO.priv_select) "YES" else "NO") });
+            }
+        }
+
+        fn roleRow(self: *const Self, view: catalog_module.View, o: *const O.Object, sink: *X.RowSink) Error!void {
+            _ = self;
+            const flags = o.flags;
+            const connlimit: i32 = @bitCast(o.grant_flags);
+            if (view == .pg_roles) {
+                try sink.add(&.{ nameCell(o.name.slice()), boolCell(flags & CO.role_superuser != 0), boolCell(flags & CO.role_inherit != 0), boolCell(flags & CO.role_createrole != 0), boolCell(flags & CO.role_createdb != 0), boolCell(flags & CO.role_login != 0), boolCell(flags & CO.role_replication != 0), intCell(connlimit), .null_value, .null_value, boolCell(flags & CO.role_bypassrls != 0), .null_value, intCell(o.oid) });
+            } else {
+                try sink.add(&.{ intCell(o.oid), nameCell(o.name.slice()), boolCell(flags & CO.role_superuser != 0), boolCell(flags & CO.role_inherit != 0), boolCell(flags & CO.role_createrole != 0), boolCell(flags & CO.role_createdb != 0), boolCell(flags & CO.role_login != 0), boolCell(flags & CO.role_replication != 0), boolCell(flags & CO.role_bypassrls != 0), intCell(connlimit), .null_value, .null_value });
+            }
+        }
+
+        /// polroles (oid[], 0 for PUBLIC) or pg_policies.roles (name[]).
+        fn roleArray(self: *const Self, o: *const O.Object, names: bool, snap: Snapshot) Error!Cell {
+            var out: Text = .{};
+            var layout: array_module.Shape = .{ .element = if (names) .name else .oid, .ndim = 1 };
+            layout.dims[0] = o.role_count;
+            var writer = try V.Arrays.Writer.begin(&out, &layout);
+            for (o.roleList()) |role| {
+                const cell: Cell = if (!names) intCell(role) else if (role == CO.public_role) nameCell("public") else nameCell(self.catalog_objects.roleName(role, snap) orelse "");
+                try writer.append(&cell);
+            }
+            return .{ .array = out };
         }
 
         // ---- sequences (design §4.11) ---------------------------------------
@@ -2088,6 +3268,7 @@ pub fn Database(comptime config: Config) type {
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
             }
+            if (self.catalog_objects.pendingReference(seq.oid, snap)) |other| return self.objectPark(slot, other);
             try self.reserveWrites(slot, 3);
             seq.pending_drop = true;
             seq.creator = slot;
@@ -2095,6 +3276,7 @@ pub fn Database(comptime config: Config) type {
             var changes: [K.max_changes]K.Change = undefined;
             const count = self.catalog.dropSequence(index, snap, tx.ref(slot), snap.cid, 0, &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
+            try self.dropObjectsOf(slot, seq.oid, snap);
         }
 
         /// The identity sequence of a table column visible to the statement.
@@ -2440,6 +3622,7 @@ pub fn Database(comptime config: Config) type {
                         try sink.add(&.{ intCell(array_info.oid), nameCell(array_info.name), intCell(catalog_module.catalog_namespace), intCell(array_info.len), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell(types.typeInputName(array_type)) });
                     }
                 },
+                .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),
                 .pg_namespace, .schemata => {
                     for (catalog_module.namespaces) |namespace| {
                         if (view == .pg_namespace) try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name) }) else try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
@@ -2939,6 +4122,8 @@ pub fn Database(comptime config: Config) type {
             const tx = &self.txs[slot];
             const table = &self.tables[index];
             if (table.pending_drop) return 0;
+            // Grants, policies or comments another transaction is writing.
+            if (self.catalog_objects.pendingReference(table.oid, snap)) |other| return self.objectPark(slot, other);
             // Its triggers and rules go with it (B11 wave 3).
             try self.dropTableObjects(slot, table.oid, snap);
             // Dependents (pg_depend): other tables' foreign keys, views that
@@ -2988,6 +4173,7 @@ pub fn Database(comptime config: Config) type {
             var changes: [K.max_changes]K.Change = undefined;
             const count = self.catalog.drop(index, table.column_count, snap, tx.ref(slot), snap.cid, 0, &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
+            try self.dropObjectsOf(slot, table.oid, snap);
             return 0;
         }
 
@@ -3111,6 +4297,7 @@ pub fn Database(comptime config: Config) type {
                 created.oid = change_log.first_oid + self.oid_counter;
                 self.oid_counter += 1;
             };
+            try self.remapColumnComments(slot, source.oid, alter.sources[0..alter.count], snap);
         }
 
         /// Existing rows against the constraints ALTER TABLE added or
@@ -3261,6 +4448,8 @@ pub fn Database(comptime config: Config) type {
                 try D.finishRow(ctx, &self.tables[insert.table], derived, &cells);
                 if (table_index != insert.table) try self.partitionBound(table_index, &cells, snap);
             }
+            // Row security checks the row the triggers produced (B11 wave 3).
+            try self.securityCheck(ctx, insert.table, &cells);
             const table = &self.tables[table_index];
             // ON CONFLICT: the arbiter is checked first (PostgreSQL's
             // speculative pre-check); other unique indexes still raise 23505.
@@ -4092,11 +5281,17 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn openCopy(self: *Self, slot: u16, source: []const u8, snap: Snapshot) Error!CopyInfo {
+            self.installRole();
             const tx = &self.txs[slot];
             const copy = try self.parseCopy(source);
             const context = self.bindContext(source, .standard, snap);
             const bound = try B.bindCopy(&context, &copy, false);
             try self.lockTable(slot, bound.table, .row_exclusive);
+            if (!self.privilegedRole(snap)) {
+                try self.needTable(bound.table, CO.priv_insert, snap);
+                // COPY FROM is not supported with row-level security (0A000).
+                if (self.catalog_objects.rowSecurity(self.session.role, self.tables[bound.table].oid, snap)) return error.UnsupportedStatement;
+            }
             var info: CopyInfo = .{ .direction = .from, .options = try copyOptions(&copy.options, .from), .count = bound.count };
             const table = &self.tables[bound.table];
             for (bound.mapping[0..bound.count], 0..) |column, field| {
@@ -4113,7 +5308,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
@@ -4128,6 +5323,7 @@ pub fn Database(comptime config: Config) type {
             self.routine_frame = null;
             self.routine_depth = 0;
             self.routine_nested = 0;
+            self.installRole();
         }
 
         /// One COPY FROM data row: `fields[p]` is field p's text (null =
@@ -4418,6 +5614,7 @@ pub fn Database(comptime config: Config) type {
                 if (!try self.beforeRow(update.table, routine_catalog.tg_update, &cells, &table.versions[old].cells, &update.values, snap)) return false;
                 try D.finishRow(ctx, table, derived, &cells);
             }
+            try self.securityCheck(ctx, update.table, &cells);
             try self.partitionBound(update.table, &cells, snap);
             if (table.primary_column) |column| {
                 if (update.values[column] != ast.none) switch (D.keyCheck(table, &cells[column], row, snap)) {
@@ -4517,6 +5714,14 @@ pub fn Database(comptime config: Config) type {
                     },
                     .catalog_insert, .catalog_delete => {},
                     .create_object, .drop_object => try self.encodeObject(writer, entry.kind == .create_object, @enumFromInt(entry.new), entry.table),
+                    .object_insert => {
+                        try writer.op(.object_create);
+                        try O.encodeCreate(writer, &self.catalog_objects.items[entry.new]);
+                    },
+                    .object_delete => {
+                        try writer.op(.object_drop);
+                        try O.encodeDrop(writer, &self.catalog_objects.items[entry.old]);
+                    },
                 }
             }
             // At most one log-ahead value per sequence: this transaction's
@@ -4715,7 +5920,7 @@ pub fn Database(comptime config: Config) type {
             tx.deferrable = deferrable;
         }
 
-        const SettingKind = enum { search_path, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom };
+        const SettingKind = enum { search_path, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
 
         fn settingKind(name: []const u8) ?SettingKind {
             inline for (@typeInfo(SettingKind).@"enum".field_names) |field| {
@@ -4859,6 +6064,8 @@ pub fn Database(comptime config: Config) type {
                     if (kind == .word) try lowerInto(&into.custom[index].value, value) else try into.custom[index].value.set(value);
                 },
                 .transaction_isolation, .transaction_read_only, .transaction_deferrable => return error.UnsupportedStatement,
+                // SET ROLE resolves against the catalog (setSetting).
+                .role => return error.UnsupportedStatement,
             }
         }
 
@@ -4878,6 +6085,7 @@ pub fn Database(comptime config: Config) type {
                     }
                 },
                 .transaction_isolation, .transaction_read_only, .transaction_deferrable => {},
+                .role => into.role = source.role,
             }
         }
 
@@ -4914,7 +6122,11 @@ pub fn Database(comptime config: Config) type {
                 else => {},
             }
             var next = state.values;
-            if (kind == .default) try copySetting(&next, &state.startup, which, name) else try assignSetting(&next, which, name, kind, value);
+            if (kind == .default) {
+                try copySetting(&next, &state.startup, which, name);
+            } else if (which == .role) {
+                next.role = try self.roleSetting(slot, kind, value);
+            } else try assignSetting(&next, which, name, kind, value);
             if (slot != null) try state.preserve();
             if (local) {
                 if (slot != null) state.values = next;
@@ -4929,6 +6141,53 @@ pub fn Database(comptime config: Config) type {
             try copySetting(&base, &next, which, name);
             state.values = next;
             state.base = base;
+        }
+
+        /// The snapshot a setting reads the catalog under: the running
+        /// statement's, else the committed state.
+        fn settingSnapshot(self: *const Self, slot: ?u16) Snapshot {
+            if (slot) |owner| if (self.active(owner)) {
+                if (self.txs[owner].running_snap) |snap| return snap;
+            };
+            return .{ .csn = self.csn };
+        }
+
+        /// SET ROLE name (variable.c check_role): NONE, or a role the
+        /// session user is a member of (any membership; superusers may
+        /// become any role). An unknown role is 22023, a role the session
+        /// user may not become 42501.
+        fn roleSetting(self: *Self, slot: ?u16, kind: SettingValueKind, value: []const u8) Error!u32 {
+            var folded: [64]u8 = undefined;
+            if (value.len > folded.len) return error.InvalidSettingValue;
+            var length: usize = 0;
+            if (kind == .word and value.len >= 2 and value[0] == '"') {
+                // A quoted identifier keeps its case; "" is one quote.
+                var index: usize = 1;
+                while (index + 1 < value.len) : (index += 1) {
+                    folded[length] = value[index];
+                    length += 1;
+                    if (value[index] == '"') index += 1;
+                }
+                if (length == 0) return error.InvalidSettingValue;
+            } else {
+                for (value, 0..) |byte, index| folded[index] = if (kind == .word) types.lower(byte) else byte;
+                length = value.len;
+                if (kind == .word and types.same(folded[0..length], "none")) return 0;
+            }
+            const name = folded[0..length];
+            const snap = self.settingSnapshot(slot);
+            const oid = self.catalog_objects.roleByName(name, snap) orelse return error.InvalidSettingValue;
+            const session_role = self.sessionState().session_role;
+            if (!self.catalog_objects.superuser(session_role, snap) and !self.catalog_objects.memberOf(session_role, oid, false, snap)) return error.InsufficientPrivilege;
+            return oid;
+        }
+
+        /// current_user / session_user of the next statement, from the
+        /// session state (SET ROLE).
+        fn installRole(self: *Self) void {
+            const state = self.session_state orelse &self.default_session_state;
+            self.session.session_role = state.session_role;
+            self.session.role = if (state.values.role != 0) state.values.role else state.session_role;
         }
 
         /// RESET ALL of the engine settings (transaction modes excepted).
@@ -4961,6 +6220,7 @@ pub fn Database(comptime config: Config) type {
                     const index = state.values.findCustom(name) orelse return error.UndefinedSetting;
                     break :blk state.values.custom[index].value.slice();
                 },
+                .role => if (state.values.role == 0) "none" else self.catalog_objects.roleName(state.values.role, self.settingSnapshot(slot)) orelse "none",
             };
             if (text.len > out.len) return error.TextCapacity;
             @memcpy(out[0..text.len], text);
@@ -5339,7 +6599,8 @@ pub fn Database(comptime config: Config) type {
             self.active_params = &params;
             defer self.active_params = null;
             var copy = inner;
-            const expanded = try expandRelations(self, &self.workspace, text, snap, &copy);
+            // Parse analysis checks no privileges (EXECUTE does).
+            const expanded = try expandRelations(self, &self.workspace, text, snap, &copy, CO.bootstrap_role);
             var context = self.bindContext(expanded, mode, snap);
             context.describe_only = true;
             _ = try B.bind(&context, &copy);
@@ -5610,7 +6871,8 @@ pub fn Database(comptime config: Config) type {
             }
             self.workspace.query.read_stats = .{};
             try self.session.checkpoint();
-            const source = try expandRelations(self, &self.workspace, text, snap, parsed);
+            // Routine statements run with the invoker's privileges (SECURITY INVOKER).
+            const source = try expandRelations(self, &self.workspace, text, snap, parsed, self.session.role);
             const context = self.bindContext(source, .standard, snap);
             const bound = try B.bind(&context, parsed);
             const root = switch (bound) {
@@ -5860,7 +7122,8 @@ pub fn Database(comptime config: Config) type {
                 frame.variables.node_low = 0;
                 frame.variables.node_high = self.workspace.nodes.len;
                 self.routine_frame = frame;
-                const source = try expandRelations(self, &self.workspace, text, snap, &parsed);
+                // Body analysis checks no privileges (calls do).
+                const source = try expandRelations(self, &self.workspace, text, snap, &parsed, CO.bootstrap_role);
                 const context = self.bindContext(source, .standard, snap);
                 const bound = try B.bind(&context, &parsed);
                 self.routine_frame = saved_frame;
@@ -6838,8 +8101,14 @@ pub fn Database(comptime config: Config) type {
             if (slot) |owner| if (self.active(owner)) {
                 snap = .{ .csn = self.csn, .slot = owner, .epoch = self.txs[owner].epoch, .cid = self.txs[owner].cid +% 1 };
             };
+            // Catalog-object statements return no rows (B11 wave 3).
+            if (parsed == .catalog_object) {
+                result.clear(0);
+                return;
+            }
             var statement_copy = parsed;
-            const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy);
+            // Describing checks no privileges (execution does), as parse analysis.
+            const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy, CO.bootstrap_role);
             var context = self.bindContext(expanded, .standard, snap);
             context.describe_only=true;
             const bound = try B.bind(&context, &statement_copy);
@@ -6985,6 +8254,7 @@ pub fn Database(comptime config: Config) type {
                 freed += S.vacuum(table, at);
             };
             self.reclaimTables(at);
+            freed += self.catalog_objects.vacuum(at);
             return freed + self.catalog.vacuum(at);
         }
 
@@ -6993,7 +8263,7 @@ pub fn Database(comptime config: Config) type {
         pub const Usage = struct { transactions: usize, row_locks: usize, table_locks: usize, pending_versions: usize };
 
         pub fn usage(self: *const Self) Usage {
-            var out: Usage = .{ .transactions = 0, .row_locks = self.locks.rowLocksUsed(), .table_locks = self.locks.tableLocksHeld(), .pending_versions = self.catalog.pending() + self.objects.pending() };
+            var out: Usage = .{ .transactions = 0, .row_locks = self.locks.rowLocksUsed(), .table_locks = self.locks.tableLocksHeld(), .pending_versions = self.catalog.pending() + self.objects.pending() + self.catalog_objects.pending() };
             for (&self.txs) |*tx| if (tx.active) {
                 out.transactions += 1;
             };

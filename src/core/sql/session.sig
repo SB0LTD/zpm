@@ -82,6 +82,9 @@ pub fn Sessions(comptime config: types.Config) type {
             deferrable: bool = false,
             search_path: SettingText = SettingText.literal("\"$user\", public"),
             custom: [config.custom_settings]Custom = @splat(.{}),
+            /// SET ROLE (catalog-security lane): the role OID, 0 for NONE
+            /// (current_user is then the session user).
+            role: u32 = 0,
 
             pub fn findCustom(self: *const Values, name: []const u8) ?usize {
                 for (&self.custom, 0..) |*entry, index| {
@@ -122,6 +125,9 @@ pub fn Sessions(comptime config: types.Config) type {
             tx_start: Values = .{},
             /// RESET / DEFAULT restore these.
             startup: Values = .{},
+            /// session_user as a role OID (catalog-security lane): the
+            /// bootstrap superuser (10) unless the caller installs another.
+            session_role: u32 = 10,
             /// Savepoint level of the open transaction and the settings saved
             /// for levels that changed them (Config.setting_snapshots).
             level: usize = 0,

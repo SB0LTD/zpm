@@ -589,6 +589,11 @@ pub fn Store(comptime Raw: type) type {
                 return &self.db().session;
             }
             pub fn detachedReadEligible(self:*const Connection) bool {
+                // Detached reads run as the bootstrap superuser: a session
+                // after SET ROLE keeps the serialized (privilege-checked) path.
+                if (comptime has_engine_session) {
+                    if (self.engine_session.values.role != 0 or self.engine_session.session_role != 10) return false;
+                }
                 return self.id!=0 and !self.failed and self.autocommit and !self.in_transaction and self.tx==null and
                     !self.pending.active and !self.running_statement and self.read_context==null;
             }
