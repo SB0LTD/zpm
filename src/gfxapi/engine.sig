@@ -280,7 +280,7 @@ pub const Pool = struct {
 /// Threads per group (a row of pixels: one thread each).
 pub const GROUP = 64;
 
-const Prog = enum(u8) { fill, fill_masked, copy, bin };
+const Prog = enum(u8) { fill, fill_masked, copy, bin, blit };
 const N_PROGS = @typeInfo(Prog).@"enum".field_names.len;
 /// A program's code as the backend emits it (ir3, sm_120 or KIR's own).
 pub const CODE_BYTES = 16 * 1024;
@@ -384,6 +384,185 @@ fn copyKernel(s: kir.Storage) kir.Kernel {
     k.endif();
     return k;
 }
+
+// blit's parameters
+const B_DX0 = 0; // the destination's first pixel (GL's x), first row (GL's y), width
+const B_DY0 = 1;
+const B_W = 2;
+const B_DSTRIDE = 3; // bytes
+const B_DBPP = 4;
+const B_DROW = 5; // the first row's memory row, and the step (i32: +1, or -1 top-down)
+const B_DSTEP = 6;
+const B_SSTRIDE = 7;
+const B_SBPP = 8;
+const B_STOPDOWN = 9;
+const B_SHEIGHT = 10;
+const B_SWIDTH = 11;
+const B_MAPX = 12; // x: the destination rectangle's x0 (i32), the source's (f32), the scale (f32)
+const B_MAPY = 15; // y: the same
+const B_LINEAR = 18;
+const B_SSWAP = 19; // the source is BGRA8: R and B to RGBA8's places
+const B_DSWAP = 20;
+const B_SET = 21; // bits every source pixel gets (an opaque alpha where it has none)
+const B_WMASK = 22; // the destination's bits written (depth, stencil: the rest kept)
+const BLIT_PARAMS = 23;
+
+fn swapRBk(k: *kir.Kernel, v: kir.V) kir.V {
+    const lo = k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(v), u(16))), u(0xff));
+    const hi = k.op2(.@"and", .u32, r(k.op2(.shl, .u32, r(v), u(16))), u(0xff_0000));
+    return k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(v), u(0xff00_ff00))), r(k.op2(.@"or", .u32, r(lo), r(hi))));
+}
+
+/// blit (glBlitFramebuffer): each destination pixel of a rectangle (a
+/// thread each, a group row a row) takes the source at its center mapped
+/// back, x = x0' + (x - x0 + 1/2) * scale: nearest (left alone where that
+/// falls outside the source image), or bilinear (taps clamped to the
+/// image's edge), in exact float operations. Pixels are converted as
+/// copy's are (as RGBA8's bytes between; what a source lacks is 0, alpha
+/// opaque). bindings: 0 source, 1 destination (written).
+fn blitKernel(s: kir.Storage) kir.Kernel {
+    var k = kir.Kernel.init(s, "gfx_blit", .{ GROUP, 1, 1 });
+    const src = k.binding();
+    const dst = k.binding();
+    const xi = k.op3(.imad, .u32, r(k.gid(0)), u(GROUP), r(k.tid(0)));
+    k.ifp(r(k.cmp(.u32, .lt, r(xi), r(k.param(.u32, B_W)))));
+    {
+        const x = k.op2(.iadd, .i32, r(k.param(.i32, B_DX0)), r(xi));
+        const y = k.op2(.iadd, .i32, r(k.param(.i32, B_DY0)), r(k.gid(1)));
+        const sbpp = k.param(.u32, B_SBPP);
+        const sw = k.param(.i32, B_SWIDTH);
+        const sh = k.param(.i32, B_SHEIGHT);
+        const sstride = k.param(.u32, B_SSTRIDE);
+        const s_td = k.cmp(.u32, .ne, r(k.param(.u32, B_STOPDOWN)), u(0));
+        const map = struct {
+            fn f_(kk: *kir.Kernel, at: kir.V, w0: u16) kir.V {
+                const rel = kk.cvt(.i32, .f32, .rne, r(kk.op2(.isub, .i32, r(at), r(kk.param(.i32, w0)))));
+                const c = kk.op2(.fadd, .f32, r(rel), kir.f(0.5));
+                return kk.op2(.fadd, .f32, r(kk.param(.f32, w0 + 1)), r(kk.op2(.fmul, .f32, r(c), r(kk.param(.f32, w0 + 2)))));
+            }
+        }.f_;
+        const fx = map(&k, x, B_MAPX);
+        const fy = map(&k, y, B_MAPY);
+        // a source pixel (in the image) as RGBA8's bytes
+        const texel = struct {
+            fn f_(kk: *kir.Kernel, b: u8, ix: kir.V, iy: kir.V, bpp: kir.V, stride: kir.V, td: kir.V, hh: kir.V) kir.V {
+                const row = kk.sel(.i32, r(td), r(kk.op2(.isub, .i32, r(kk.op2(.isub, .i32, r(hh), kir.i(1))), r(iy))), r(iy));
+                const off = kk.op3(.imad, .u32, r(row), r(stride), r(kk.op2(.imul, .u32, r(ix), r(bpp))));
+                var v = pixelLoad(kk, b, bpp, off);
+                v = kk.sel(.u32, r(kk.cmp(.u32, .ne, r(kk.param(.u32, B_SSWAP)), u(0))), r(swapRBk(kk, v)), r(v));
+                return kk.op2(.@"or", .u32, r(v), r(kk.param(.u32, B_SET)));
+            }
+        }.f_;
+        const out = k.reg(.u32);
+        k.set(out, .mov, u(0), kir.no, kir.no);
+        const have = k.reg(.pred);
+        k.set(have, .mov, u(0), kir.no, kir.no);
+        k.ifp(r(k.cmp(.u32, .ne, r(k.param(.u32, B_LINEAR)), u(0))));
+        {
+            // bilinear: the four texels round (x - 1/2, y - 1/2), clamped
+            const gx = k.op2(.fsub, .f32, r(fx), kir.f(0.5));
+            const gy = k.op2(.fsub, .f32, r(fy), kir.f(0.5));
+            const flx = k.op1(.ffloor, .f32, r(gx));
+            const fly = k.op1(.ffloor, .f32, r(gy));
+            const ax = k.op2(.fsub, .f32, r(gx), r(flx));
+            const ay = k.op2(.fsub, .f32, r(gy), r(fly));
+            const clampI = struct {
+                fn f_(kk: *kir.Kernel, v: kir.V, hi: kir.V) kir.V {
+                    return kk.op2(.imin, .i32, r(kk.op2(.imax, .i32, r(v), kir.i(0))), r(kk.op2(.isub, .i32, r(hi), kir.i(1))));
+                }
+            }.f_;
+            const x0 = k.cvt(.f32, .i32, .rz, r(flx));
+            const y0 = k.cvt(.f32, .i32, .rz, r(fly));
+            const xa = clampI(&k, x0, sw);
+            const xb = clampI(&k, k.op2(.iadd, .i32, r(x0), kir.i(1)), sw);
+            const ya = clampI(&k, y0, sh);
+            const yb = clampI(&k, k.op2(.iadd, .i32, r(y0), kir.i(1)), sh);
+            const t00 = texel(&k, src, xa, ya, sbpp, sstride, s_td, sh);
+            const t10 = texel(&k, src, xb, ya, sbpp, sstride, s_td, sh);
+            const t01 = texel(&k, src, xa, yb, sbpp, sstride, s_td, sh);
+            const t11 = texel(&k, src, xb, yb, sbpp, sstride, s_td, sh);
+            const bx = k.op2(.fsub, .f32, kir.f(1), r(ax));
+            const by = k.op2(.fsub, .f32, kir.f(1), r(ay));
+            const w00 = k.op2(.fmul, .f32, r(bx), r(by));
+            const w10 = k.op2(.fmul, .f32, r(ax), r(by));
+            const w01 = k.op2(.fmul, .f32, r(bx), r(ay));
+            const w11 = k.op2(.fmul, .f32, r(ax), r(ay));
+            var acc = k.mov(.u32, u(0));
+            for (0..4) |ch| {
+                const sh8: u32 = @intCast(8 * ch);
+                const byteF = struct {
+                    fn f_(kk: *kir.Kernel, t: kir.V, s8: u32) kir.V {
+                        return kk.cvt(.u32, .f32, .rne, r(kk.op3(.bfe, .u32, r(t), u(s8), u(8))));
+                    }
+                }.f_;
+                var v = k.op2(.fmul, .f32, r(byteF(&k, t00, sh8)), r(w00));
+                v = k.op2(.fadd, .f32, r(v), r(k.op2(.fmul, .f32, r(byteF(&k, t10, sh8)), r(w10))));
+                v = k.op2(.fadd, .f32, r(v), r(k.op2(.fmul, .f32, r(byteF(&k, t01, sh8)), r(w01))));
+                v = k.op2(.fadd, .f32, r(v), r(k.op2(.fmul, .f32, r(byteF(&k, t11, sh8)), r(w11))));
+                const b8 = k.cvt(.f32, .u32, .rne, r(k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(v), kir.f(0))), kir.f(255))));
+                acc = k.op2(.@"or", .u32, r(acc), r(k.op2(.shl, .u32, r(b8), u(sh8))));
+            }
+            k.set(out, .mov, r(acc), kir.no, kir.no);
+            k.set(have, .mov, u(1), kir.no, kir.no);
+        }
+        k.els();
+        {
+            // nearest: the texel the center falls in, if in the image
+            const ix = k.cvt(.f32, .i32, .rz, r(k.op1(.ffloor, .f32, r(fx))));
+            const iy = k.cvt(.f32, .i32, .rz, r(k.op1(.ffloor, .f32, r(fy))));
+            var in = k.op2(.pand, .pred, r(k.cmp(.f32, .ge, r(fx), kir.f(0))), r(k.cmp(.f32, .ge, r(fy), kir.f(0))));
+            in = k.op2(.pand, .pred, r(in), r(k.cmp(.i32, .lt, r(ix), r(sw))));
+            in = k.op2(.pand, .pred, r(in), r(k.cmp(.i32, .lt, r(iy), r(sh))));
+            k.ifp(r(in));
+            k.set(out, .mov, r(texel(&k, src, ix, iy, sbpp, sstride, s_td, sh)), kir.no, kir.no);
+            k.set(have, .mov, u(1), kir.no, kir.no);
+            k.endif();
+        }
+        k.endif();
+        k.ifp(r(have));
+        {
+            const dbpp = k.param(.u32, B_DBPP);
+            const drow = k.op3(.imad, .i32, r(k.gid(1)), r(k.param(.i32, B_DSTEP)), r(k.param(.i32, B_DROW)));
+            const doff = k.op3(.imad, .u32, r(drow), r(k.param(.u32, B_DSTRIDE)), r(k.op2(.imul, .u32, r(x), r(dbpp))));
+            var v = k.sel(.u32, r(k.cmp(.u32, .ne, r(k.param(.u32, B_DSWAP)), u(0))), r(swapRBk(&k, out)), r(out));
+            const wmask = k.param(.u32, B_WMASK);
+            const partial = k.cmp(.u32, .ne, r(wmask), u(0xffff_ffff));
+            const merged = k.reg(.u32);
+            k.set(merged, .mov, r(v), kir.no, kir.no);
+            k.ifp(r(partial));
+            {
+                const old = pixelLoad(&k, dst, dbpp, doff);
+                k.set(merged, .@"or", r(k.op2(.@"and", .u32, r(old), r(k.op1(.not, .u32, r(wmask))))), r(k.op2(.@"and", .u32, r(v), r(wmask))), kir.no);
+            }
+            k.endif();
+            v = merged;
+            pixelStore(&k, dst, dbpp, doff, v);
+        }
+        k.endif();
+    }
+    k.endif();
+    return k;
+}
+
+/// What a blit maps: the destination rectangle (GL's coordinates, inside
+/// the destination; x0 > x1 for a flip is in the scale), and each axis's
+/// map from destination to source.
+pub const Blit = struct {
+    /// the destination pixels written (clipped, x0 <= x1)
+    rect: Rect,
+    /// x: the destination rectangle's first edge, the source's, and the
+    /// source's extent over the destination's (negative: flipped)
+    dx0: i32,
+    sx0: f32,
+    scale_x: f32,
+    dy0: i32,
+    sy0: f32,
+    scale_y: f32,
+    linear: bool = false,
+    /// the destination's bits written (all; depth's 0x00ffffff, stencil's
+    /// 0xff000000)
+    wmask: u32 = 0xffff_ffff,
+};
 
 /// The bits a read or copy of img sets: an opaque alpha without one.
 fn setOf(img: *const Image) u32 {
@@ -538,6 +717,7 @@ pub const Engine = struct {
                 .fill_masked => fillKernel(s, true),
                 .copy => copyKernel(s),
                 .bin => raster.binKernel(s),
+                .blit => blitKernel(s),
             };
             try k.finish();
             var w = gpu.Work.init(work_mem);
@@ -765,7 +945,7 @@ pub const Engine = struct {
 
     // ── Draws ──────────────────────────────────────────────────────────────
 
-    const Stage = enum(u2) { vertex, setup, raster, bin };
+    const Stage = enum(u3) { vertex, setup, raster, bin, blit };
 
     fn build(e: *Engine, st: Stage, p: *const raster.Pipeline) kir.Kernel {
         const s = kir.Storage{ .insts = &e.kir_insts, .tys = &e.kir_tys };
@@ -774,6 +954,7 @@ pub const Engine = struct {
             .setup => raster.setupKernel(s, p),
             .raster => raster.rasterKernel(s, p),
             .bin => raster.binKernel(s),
+            .blit => blitKernel(s),
         };
     }
 
@@ -933,6 +1114,55 @@ pub const Engine = struct {
 
     // ── Ops ────────────────────────────────────────────────────────────────
 
+    /// glBlitFramebuffer's pixels from src into dst (see blitKernel): on
+    /// the GPU, or the same kernel on the CPU. False when it can run
+    /// nowhere (the CPU has no scratch). src and dst must be apart.
+    pub fn blit(e: *Engine, src: *Image, dst: *Image, b: Blit) bool {
+        const a = b.rect.meet(dst.bounds());
+        if (a.empty()) return true;
+        const color = src.format.renderable() and dst.format.renderable();
+        const d0: i32 = @intCast(dst.rowOf(a.y0));
+        var p: [BLIT_PARAMS]u32 = undefined;
+        p[B_DX0] = a.x0;
+        p[B_DY0] = a.y0;
+        p[B_W] = a.width();
+        p[B_DSTRIDE] = dst.stride;
+        p[B_DBPP] = dst.format.bytes();
+        p[B_DROW] = @bitCast(d0);
+        p[B_DSTEP] = @bitCast(@as(i32, if (dst.top_down) -1 else 1));
+        p[B_SSTRIDE] = src.stride;
+        p[B_SBPP] = src.format.bytes();
+        p[B_STOPDOWN] = @intFromBool(src.top_down);
+        p[B_SHEIGHT] = src.height;
+        p[B_SWIDTH] = src.width;
+        p[B_MAPX] = @bitCast(b.dx0);
+        p[B_MAPX + 1] = @bitCast(b.sx0);
+        p[B_MAPX + 2] = @bitCast(b.scale_x);
+        p[B_MAPY] = @bitCast(b.dy0);
+        p[B_MAPY + 1] = @bitCast(b.sy0);
+        p[B_MAPY + 2] = @bitCast(b.scale_y);
+        p[B_LINEAR] = @intFromBool(b.linear);
+        p[B_SSWAP] = @intFromBool(color and src.format == .bgra8);
+        p[B_DSWAP] = @intFromBool(color and dst.format == .bgra8);
+        p[B_SET] = if (color and (setOf(src) != 0 or src.format.channels() < 4)) 0xff00_0000 else 0;
+        p[B_WMASK] = b.wmask;
+        const groups = [3]u32{ divUp(a.width(), GROUP), a.height(), 1 };
+        if (e.gpuUsable(src) and e.gpuUsable(dst)) {
+            const bufs = [_]*Image{ src, dst };
+            e.recordProg(&e.progs[@intFromEnum(Prog.blit)], groups, &bufs, 0b10, &p, null);
+            return true;
+        }
+        if (e.cpu_work.len == 0) return false;
+        e.fetchAll(src);
+        e.fetchAll(dst);
+        e.stats.cpu_ops += 1;
+        const views = [_][]u8{ src.buf.cpu, dst.buf.cpu };
+        // (a pipeline the blit kernel ignores)
+        if (!e.runCpu(.blit, undefined, groups, &views, &p)) return false;
+        e.wrote(dst, 0, dst.buf.cpu.len);
+        return true;
+    }
+
     /// Pixels of `rect` (GL's coordinates, inside img) become
     /// (pixel & keep) | (value & ~keep).
     pub fn fill(e: *Engine, img: *Image, rect: Rect, value: u32, keep: u32) void {
@@ -1015,7 +1245,7 @@ pub const Engine = struct {
         const db = want.bytes();
         // (opaque: an image without alpha, or one of fewer channels read
         // as RGBA; read as itself, its bytes alone are kept)
-        const set: u32 = if (setOf(img) != 0 or img.format.channels() < 4) 0xff00_0000 else 0;
+        const set: u32 = if (img.format.renderable() and (setOf(img) != 0 or img.format.channels() < 4)) 0xff00_0000 else 0;
         for (0..h) |j| {
             const row = img.rowOf(y + @as(u32, @intCast(j)));
             const off = @as(usize, row) * img.stride + @as(usize, x) * sb;
@@ -1046,6 +1276,19 @@ pub const Engine = struct {
         e.settle(img);
         if (img.gpuWrote()) e.fromDevice(img, off, len);
         return img.buf.cpu[off..][0..len];
+    }
+
+    /// The same at once, whatever batches in flight use img (GL's
+    /// MAP_UNSYNCHRONIZED_BIT: the caller keeps off what they use).
+    pub fn hostViewNow(e: *Engine, img: *Image, off: usize, len: usize) []u8 {
+        if (img.gpuWrote()) e.fromDevice(img, off, len);
+        return img.buf.cpu[off..][0..len];
+    }
+
+    /// Whether a batch not known done uses img.
+    pub fn busy(e: *Engine, img: *const Image) bool {
+        e.poll();
+        return img.lastBatch() > e.done_upto;
     }
 
     /// The CPU wrote img's bytes [off, off + len) (in a hostView): handed

@@ -118,7 +118,23 @@ pub const Buf = struct {
     store: Image = .{},
     size: usize = 0,
     usage: u32 = g.STATIC_DRAW,
+    /// glMapBufferRange's: the range the CPU has (none: not mapped)
+    map: ?[]u8 = null,
+    map_off: usize = 0,
+    map_access: u32 = 0,
+
+    pub fn mapped(b: *const Buf) bool {
+        return b.map != null;
+    }
 };
+
+/// glMapBufferRange's access bits.
+const MAP_READ = 0x1;
+const MAP_WRITE = 0x2;
+const MAP_INVALIDATE_RANGE = 0x4;
+const MAP_INVALIDATE_BUFFER = 0x8;
+const MAP_FLUSH_EXPLICIT = 0x10;
+const MAP_UNSYNCHRONIZED = 0x20;
 
 pub const Rb = struct {
     named: bool = false,
@@ -132,11 +148,18 @@ pub const Rb = struct {
 
 /// A share group's objects (every context created sharing with another
 /// holds the same Objects).
+/// GL sync objects a share group may have at once.
+pub const MAX_SYNCS = 1024;
+
+/// A fence: the engine's mark after the work before it.
+pub const Sync = struct { used: bool = false, mark: u64 = 0 };
+
 pub const Objects = struct {
     tex: [MAX_TEXTURES]Tex = undefined,
     bufs: [MAX_BUFFERS]Buf = undefined,
     rbs: [MAX_RENDERBUFFERS]Rb = undefined,
     samplers: [MAX_SAMPLERS]Smp = undefined,
+    syncs: [MAX_SYNCS]Sync = undefined,
     /// contexts holding it
     users: u32 = 0,
 
@@ -145,6 +168,7 @@ pub const Objects = struct {
         for (&o.bufs) |*b| b.* = .{};
         for (&o.rbs) |*b| b.* = .{};
         for (&o.samplers) |*s| s.* = .{};
+        for (&o.syncs) |*s| s.* = .{};
         o.users = 0;
     }
 
@@ -860,6 +884,8 @@ pub const Context = struct {
             g.STENCIL_BITS => int(if (c.view(c.draw_fb, false).stencil != null) 8 else 0),
             g.GENERATE_MIPMAP_HINT => int(c.hint_mipmap),
             g.FRAGMENT_SHADER_DERIVATIVE_HINT => int(c.hint_derivative),
+            // (glWaitSync waits for nothing: no timeout but TIMEOUT_IGNORED)
+            g.MAX_SERVER_WAIT_TIMEOUT => int(0),
             else => null,
         };
     }
@@ -1138,6 +1164,7 @@ pub const Context = struct {
         var pbo: ?*Buf = null;
         const dst: []u8 = if (c.bufs.pack != 0) blk: {
             const b = madeIn(Buf, &c.objs.bufs, c.bufs.pack) orelse return c.fail(g.INVALID_OPERATION);
+            if (!c.notMapped(b)) return;
             const off = addr(pixels);
             if (off > b.size or span > b.size - off) return c.fail(g.INVALID_OPERATION);
             pbo = b;
@@ -1295,6 +1322,7 @@ pub const Context = struct {
                 c.fail(g.INVALID_OPERATION);
                 return null;
             };
+            if (!c.notMapped(b)) return null;
             const off = addr(pixels);
             if (off > b.size or span > b.size - off) {
                 c.fail(g.INVALID_OPERATION);
@@ -1496,6 +1524,81 @@ pub const Context = struct {
         c.eng.copy(src, @intCast(x0), @intCast(y0), dst, @intCast(dx + (x0 - x)), @intCast(dy + (y0 - y)), @intCast(x1 - x0), @intCast(y1 - y0));
     }
 
+    /// glBlitFramebuffer: the read framebuffer's rectangle onto the draw
+    /// framebuffer's, scaled and flipped as the rectangles say, inside
+    /// the scissor box: color (the read buffer into each draw buffer,
+    /// converted as copies convert; NEAREST or LINEAR), depth and stencil
+    /// (NEAREST). Color masks and the depth and stencil write masks do
+    /// not apply (GL: only the scissor test does).
+    pub fn blitFramebuffer(c: *Context, sx0: i32, sy0: i32, sx1: i32, sy1: i32, dx0: i32, dy0: i32, dx1: i32, dy1: i32, mask: u32, filter: u32) void {
+        const ds = g.DEPTH_BUFFER_BIT | g.STENCIL_BUFFER_BIT;
+        if (mask & ~(g.COLOR_BUFFER_BIT | ds) != 0) return c.fail(g.INVALID_VALUE);
+        if (filter != g.NEAREST and filter != g.LINEAR) return c.fail(g.INVALID_ENUM);
+        if (filter == g.LINEAR and mask & ds != 0) return c.fail(g.INVALID_OPERATION);
+        const rv = c.view(c.read_fb, true);
+        var dv = c.view(c.draw_fb, false);
+        if (rv.status != g.FRAMEBUFFER_COMPLETE or dv.status != g.FRAMEBUFFER_COMPLETE) return c.fail(g.INVALID_FRAMEBUFFER_OPERATION);
+        // (an image both read and drawn)
+        if (mask & g.COLOR_BUFFER_BIT != 0) {
+            if (rv.read) |s| {
+                for (dv.color) |d| {
+                    if (d == s) return c.fail(g.INVALID_OPERATION);
+                }
+            }
+        }
+        if (mask & g.DEPTH_BUFFER_BIT != 0 and rv.depth != null and rv.depth == dv.depth) return c.fail(g.INVALID_OPERATION);
+        if (mask & g.STENCIL_BUFFER_BIT != 0 and rv.stencil != null and rv.stencil == dv.stencil) return c.fail(g.INVALID_OPERATION);
+        if (sx0 == sx1 or sy0 == sy1 or dx0 == dx1 or dy0 == dy1 or mask == 0) return;
+        const cap = struct {
+            fn f(x: i32) u32 {
+                return @intCast(std.math.clamp(x, 0, MAX_SIZE));
+            }
+        }.f;
+        const dst_rect = Rect{ .x0 = cap(@min(dx0, dx1)), .y0 = cap(@min(dy0, dy1)), .x1 = cap(@max(dx0, dx1)), .y1 = cap(@max(dy0, dy1)) };
+        const a = dst_rect.meet(c.clearRect(&dv));
+        if (a.empty()) return;
+        const scale = struct {
+            fn f(s0: i32, s1: i32, d0: i32, d1: i32) f32 {
+                return @floatCast(@as(f64, @floatFromInt(@as(i64, s1) - s0)) / @as(f64, @floatFromInt(@as(i64, d1) - d0)));
+            }
+        }.f;
+        var b = engine.Blit{
+            .rect = a,
+            .dx0 = dx0,
+            .sx0 = @floatFromInt(sx0),
+            .scale_x = scale(sx0, sx1, dx0, dx1),
+            .dy0 = dy0,
+            .sy0 = @floatFromInt(sy0),
+            .scale_y = scale(sy0, sy1, dy0, dy1),
+            .linear = filter == g.LINEAR,
+        };
+        if (mask & g.COLOR_BUFFER_BIT != 0) {
+            if (rv.read) |s| {
+                for (dv.color) |d| {
+                    const img = d orelse continue;
+                    if (!c.eng.blit(s, img, b)) return c.fail(g.OUT_OF_MEMORY);
+                }
+            }
+        }
+        // depth and stencil: the 24 and 8 bits of their images (one blit
+        // where both are one image each side)
+        b.linear = false;
+        const want_d = mask & g.DEPTH_BUFFER_BIT != 0 and rv.depth != null and dv.depth != null;
+        const want_s = mask & g.STENCIL_BUFFER_BIT != 0 and rv.stencil != null and dv.stencil != null;
+        if (want_d and want_s and rv.depth == rv.stencil and dv.depth == dv.stencil) {
+            if (!c.eng.blit(rv.depth.?, dv.depth.?, b)) return c.fail(g.OUT_OF_MEMORY);
+            return;
+        }
+        if (want_d) {
+            b.wmask = 0x00ff_ffff;
+            if (!c.eng.blit(rv.depth.?, dv.depth.?, b)) return c.fail(g.OUT_OF_MEMORY);
+        }
+        if (want_s) {
+            b.wmask = 0xff00_0000;
+            if (!c.eng.blit(rv.stencil.?, dv.stencil.?, b)) return c.fail(g.OUT_OF_MEMORY);
+        }
+    }
+
     /// A copy from a framebuffer of `from` into a texture of `to`: both
     /// renderable, `to` of `from`'s channels or fewer (ES 3.0).
     fn copyable(from: Format, to: Format) bool {
@@ -1578,6 +1681,7 @@ pub const Context = struct {
         if (!validUsage(usage)) return c.fail(g.INVALID_ENUM);
         const b = c.boundBuf(target) orelse return;
         const n: usize = @intCast(size);
+        c.unmap(b);
         // (new storage: what the GPU may still read of the old goes once it is done)
         c.eng.freeImage(&b.store);
         b.size = 0;
@@ -1595,8 +1699,114 @@ pub const Context = struct {
         const off: usize = @intCast(offset);
         const n: usize = @intCast(size);
         if (off > b.size or n > b.size - off) return c.fail(g.INVALID_VALUE);
+        if (b.mapped()) return c.fail(g.INVALID_OPERATION);
         const p = data orelse return;
         c.eng.writeBytes(&b.store, off, @as([*]const u8, @ptrCast(p))[0..n]);
+    }
+
+    /// glMapBufferRange: the buffer's bytes [offset, offset + length) for
+    /// the CPU, in its memory (no copy). A synchronized map waits for the
+    /// GPU's use of the buffer; MAP_UNSYNCHRONIZED_BIT does not; and
+    /// MAP_INVALIDATE_BUFFER_BIT on a buffer the GPU uses gives it new
+    /// storage instead of waiting (the old goes once the GPU is done).
+    pub fn mapBufferRange(c: *Context, target: u32, offset: isize, length: isize, access: u32) ?*anyopaque {
+        if (c.bindingOf(target) == null) {
+            c.fail(g.INVALID_ENUM);
+            return null;
+        }
+        const b = c.boundBuf(target) orelse return null;
+        if (offset < 0 or length < 0 or access & ~@as(u32, 0x3f) != 0) {
+            c.fail(g.INVALID_VALUE);
+            return null;
+        }
+        const off: usize = @intCast(offset);
+        const n: usize = @intCast(length);
+        if (off > b.size or n > b.size - off) {
+            c.fail(g.INVALID_VALUE);
+            return null;
+        }
+        const read = access & MAP_READ != 0;
+        const write = access & MAP_WRITE != 0;
+        const bad = n == 0 or b.mapped() or (!read and !write) or
+            (read and access & (MAP_INVALIDATE_RANGE | MAP_INVALIDATE_BUFFER | MAP_UNSYNCHRONIZED) != 0) or
+            (access & MAP_FLUSH_EXPLICIT != 0 and !write);
+        if (bad) {
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        }
+        if (access & MAP_INVALIDATE_BUFFER != 0 and c.eng.busy(&b.store)) {
+            const fresh = c.eng.newBuffer(b.size) orelse {
+                c.fail(g.OUT_OF_MEMORY);
+                return null;
+            };
+            c.eng.freeImage(&b.store);
+            b.store = fresh;
+        }
+        const span = if (access & MAP_UNSYNCHRONIZED != 0) c.eng.hostViewNow(&b.store, off, n) else c.eng.hostView(&b.store, off, n);
+        b.map = span;
+        b.map_off = off;
+        b.map_access = access;
+        return span.ptr;
+    }
+
+    /// glUnmapBuffer: what a write map wrote goes to the GPU (all of it,
+    /// or with MAP_FLUSH_EXPLICIT_BIT what was flushed).
+    pub fn unmapBuffer(c: *Context, target: u32) bool {
+        if (c.bindingOf(target) == null) {
+            c.fail(g.INVALID_ENUM);
+            return false;
+        }
+        const b = c.boundBuf(target) orelse return false;
+        if (!b.mapped()) {
+            c.fail(g.INVALID_OPERATION);
+            return false;
+        }
+        c.unmap(b);
+        return true;
+    }
+
+    fn unmap(c: *Context, b: *Buf) void {
+        const m = b.map orelse return;
+        if (b.map_access & MAP_WRITE != 0 and b.map_access & MAP_FLUSH_EXPLICIT == 0) c.eng.wrote(&b.store, b.map_off, m.len);
+        b.map = null;
+        b.map_off = 0;
+        b.map_access = 0;
+    }
+
+    /// glFlushMappedBufferRange: [offset, offset + length) of the map (a
+    /// MAP_FLUSH_EXPLICIT_BIT one) goes to the GPU.
+    pub fn flushMappedBufferRange(c: *Context, target: u32, offset: isize, length: isize) void {
+        if (c.bindingOf(target) == null) return c.fail(g.INVALID_ENUM);
+        const b = c.boundBuf(target) orelse return;
+        if (offset < 0 or length < 0) return c.fail(g.INVALID_VALUE);
+        const m = b.map orelse return c.fail(g.INVALID_OPERATION);
+        if (b.map_access & MAP_FLUSH_EXPLICIT == 0) return c.fail(g.INVALID_OPERATION);
+        const off: usize = @intCast(offset);
+        const n: usize = @intCast(length);
+        if (off > m.len or n > m.len - off) return c.fail(g.INVALID_VALUE);
+        c.eng.wrote(&b.store, b.map_off + off, n);
+    }
+
+    /// glGetBufferPointerv(BUFFER_MAP_POINTER).
+    pub fn getBufferPointer(c: *Context, target: u32, pname: u32) ?*anyopaque {
+        if (pname != g.BUFFER_MAP_POINTER) {
+            c.fail(g.INVALID_ENUM);
+            return null;
+        }
+        if (c.bindingOf(target) == null) {
+            c.fail(g.INVALID_ENUM);
+            return null;
+        }
+        const b = c.boundBuf(target) orelse return null;
+        return if (b.map) |m| m.ptr else null;
+    }
+
+    /// A buffer a command reads or writes is not mapped (else
+    /// INVALID_OPERATION).
+    fn notMapped(c: *Context, b: *const Buf) bool {
+        if (!b.mapped()) return true;
+        c.fail(g.INVALID_OPERATION);
+        return false;
     }
 
     pub fn getBufferParameter(c: *Context, target: u32, pname: u32) ?i64 {
@@ -1604,7 +1814,10 @@ pub const Context = struct {
         return switch (pname) {
             g.BUFFER_SIZE => @intCast(b.size),
             g.BUFFER_USAGE => b.usage,
-            g.BUFFER_MAPPED, g.BUFFER_ACCESS_FLAGS, g.BUFFER_MAP_LENGTH, g.BUFFER_MAP_OFFSET => 0,
+            g.BUFFER_MAPPED => @intFromBool(b.mapped()),
+            g.BUFFER_ACCESS_FLAGS => b.map_access,
+            g.BUFFER_MAP_LENGTH => @intCast(if (b.map) |m| m.len else 0),
+            g.BUFFER_MAP_OFFSET => @intCast(b.map_off),
             else => {
                 c.fail(g.INVALID_ENUM);
                 return null;
@@ -1627,9 +1840,91 @@ pub const Context = struct {
             for (&va.attrs) |*a| {
                 if (a.buffer == name) a.buffer = 0;
             }
+            c.unmap(b);
             c.eng.freeImage(&b.store);
             b.* = .{};
         }
+    }
+
+    // ── Sync objects ───────────────────────────────────────────────────────
+    //
+    // A fence is the engine's mark after the work recorded before it (that
+    // work is run then). A GLsync is the share group's slot, plus one.
+
+    fn syncOf(c: *Context, h: ?*const anyopaque) ?*Sync {
+        const x = @intFromPtr(h);
+        if (x == 0 or x > MAX_SYNCS) return null;
+        const s = &c.objs.syncs[x - 1];
+        return if (s.used) s else null;
+    }
+
+    /// glFenceSync; null (no error) when the share group has no room.
+    pub fn fenceSync(c: *Context, condition: u32, flags: u32) ?*anyopaque {
+        if (condition != g.SYNC_GPU_COMMANDS_COMPLETE) {
+            c.fail(g.INVALID_ENUM);
+            return null;
+        }
+        if (flags != 0) {
+            c.fail(g.INVALID_VALUE);
+            return null;
+        }
+        for (&c.objs.syncs, 0..) |*s, ix| {
+            if (s.used) continue;
+            s.* = .{ .used = true, .mark = c.eng.mark() };
+            return @ptrFromInt(ix + 1);
+        }
+        return null;
+    }
+
+    /// glClientWaitSync: ALREADY_SIGNALED, CONDITION_SATISFIED (done while
+    /// waiting), TIMEOUT_EXPIRED, or WAIT_FAILED (with an error).
+    pub fn clientWaitSync(c: *Context, h: ?*const anyopaque, flags: u32, timeout_ns: u64) u32 {
+        const s = c.syncOf(h) orelse {
+            c.fail(g.INVALID_VALUE);
+            return g.WAIT_FAILED;
+        };
+        if (flags & ~g.SYNC_FLUSH_COMMANDS_BIT != 0) {
+            c.fail(g.INVALID_VALUE);
+            return g.WAIT_FAILED;
+        }
+        if (c.eng.markDone(s.mark)) return g.ALREADY_SIGNALED;
+        if (timeout_ns == 0) return g.TIMEOUT_EXPIRED;
+        const us = timeout_ns / 1000 + @intFromBool(timeout_ns % 1000 != 0);
+        return if (c.eng.waitMark(s.mark, us)) g.CONDITION_SATISFIED else g.TIMEOUT_EXPIRED;
+    }
+
+    /// glWaitSync: the GPU's ring runs in order, so nothing to wait for.
+    pub fn waitSync(c: *Context, h: ?*const anyopaque, flags: u32, timeout: u64) void {
+        _ = c.syncOf(h) orelse return c.fail(g.INVALID_VALUE);
+        if (flags != 0 or timeout != g.TIMEOUT_IGNORED) return c.fail(g.INVALID_VALUE);
+    }
+
+    pub fn deleteSync(c: *Context, h: ?*const anyopaque) void {
+        if (h == null) return;
+        const s = c.syncOf(h) orelse return c.fail(g.INVALID_VALUE);
+        s.* = .{};
+    }
+
+    pub fn isSync(c: *Context, h: ?*const anyopaque) bool {
+        return c.syncOf(h) != null;
+    }
+
+    /// glGetSynciv's value, or null (with an error).
+    pub fn getSync(c: *Context, h: ?*const anyopaque, pname: u32) ?i32 {
+        const s = c.syncOf(h) orelse {
+            c.fail(g.INVALID_VALUE);
+            return null;
+        };
+        return switch (pname) {
+            g.OBJECT_TYPE => g.SYNC_FENCE,
+            g.SYNC_STATUS => if (c.eng.markDone(s.mark)) g.SIGNALED else g.UNSIGNALED,
+            g.SYNC_CONDITION => g.SYNC_GPU_COMMANDS_COMPLETE,
+            g.SYNC_FLAGS => 0,
+            else => {
+                c.fail(g.INVALID_ENUM);
+                return null;
+            },
+        };
     }
 
     // ── Renderbuffers ──────────────────────────────────────────────────────
@@ -2090,6 +2385,7 @@ pub const Context = struct {
             // packed types: not drawn yet)
             const b = madeIn(Buf, &c.objs.bufs, a.buffer) orelse return c.fail(g.INVALID_OPERATION);
             if (!b.store.live() and b.store.buf.cpu.len == 0) return c.fail(g.INVALID_OPERATION);
+            if (!c.notMapped(b)) return;
             const t = attrType(a.ty) orelse return c.fail(g.INVALID_OPERATION);
             if (a.divisor > 1) return c.fail(g.INVALID_OPERATION);
             d.attrs[j] = .{
@@ -2108,6 +2404,7 @@ pub const Context = struct {
         if (index_ty != 0) {
             const b = madeIn(Buf, &c.objs.bufs, va.element) orelse return c.fail(g.INVALID_OPERATION);
             if (b.store.buf.cpu.len == 0) return c.fail(g.INVALID_OPERATION);
+            if (!c.notMapped(b)) return;
             d.index = &b.store;
             d.index_offset = @intCast(offset);
             d.index_size = switch (index_ty) {

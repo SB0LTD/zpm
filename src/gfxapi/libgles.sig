@@ -365,6 +365,52 @@ pub export fn glGetBufferParameteri64v(target: u32, pname: u32, params: ?[*]i64)
     const v = c.getBufferParameter(target, pname) orelse return;
     if (params) |p| p[0] = v;
 }
+pub export fn glMapBufferRange(target: u32, offset: isize, length: isize, access: u32) callconv(.c) ?*anyopaque {
+    const c = cur() orelse return null;
+    return c.mapBufferRange(target, offset, length, access);
+}
+pub export fn glUnmapBuffer(target: u32) callconv(.c) u8 {
+    const c = cur() orelse return 0;
+    return @intFromBool(c.unmapBuffer(target));
+}
+pub export fn glFlushMappedBufferRange(target: u32, offset: isize, length: isize) callconv(.c) void {
+    if (cur()) |c| c.flushMappedBufferRange(target, offset, length);
+}
+pub export fn glGetBufferPointerv(target: u32, pname: u32, params: ?*?*anyopaque) callconv(.c) void {
+    const c = cur() orelse return;
+    const v = c.getBufferPointer(target, pname);
+    if (params) |p| p.* = v;
+}
+
+pub export fn glBlitFramebuffer(src_x0: i32, src_y0: i32, src_x1: i32, src_y1: i32, dst_x0: i32, dst_y0: i32, dst_x1: i32, dst_y1: i32, mask: u32, filter: u32) callconv(.c) void {
+    if (cur()) |c| c.blitFramebuffer(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask, filter);
+}
+
+pub export fn glFenceSync(condition: u32, flags: u32) callconv(.c) ?*anyopaque {
+    const c = cur() orelse return null;
+    return c.fenceSync(condition, flags);
+}
+pub export fn glClientWaitSync(sync: ?*anyopaque, flags: u32, timeout: u64) callconv(.c) u32 {
+    const c = cur() orelse return g.WAIT_FAILED;
+    return c.clientWaitSync(sync, flags, timeout);
+}
+pub export fn glWaitSync(sync: ?*anyopaque, flags: u32, timeout: u64) callconv(.c) void {
+    if (cur()) |c| c.waitSync(sync, flags, timeout);
+}
+pub export fn glDeleteSync(sync: ?*anyopaque) callconv(.c) void {
+    if (cur()) |c| c.deleteSync(sync);
+}
+pub export fn glIsSync(sync: ?*anyopaque) callconv(.c) u8 {
+    const c = cur() orelse return 0;
+    return @intFromBool(c.isSync(sync));
+}
+pub export fn glGetSynciv(sync: ?*anyopaque, pname: u32, buf_size: i32, length: ?*i32, values: ?[*]i32) callconv(.c) void {
+    const c = cur() orelse return;
+    const v = c.getSync(sync, pname) orelse return;
+    if (buf_size < 1) return;
+    if (values) |p| p[0] = v;
+    if (length) |l| l.* = 1;
+}
 
 pub export fn glGenRenderbuffers(n: i32, out: ?[*]u32) callconv(.c) void {
     const c = cur() orelse return;

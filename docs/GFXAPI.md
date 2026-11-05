@@ -40,7 +40,20 @@ Unmodified Firefox and Chromium (Alpine's and Flatpak's) are the first targets. 
 
 ### GLES
 
-Textures, buffers, renderbuffers and sampler objects live in an `Objects` table held by a share group's contexts. Framebuffer objects and vertex array objects belong to each context. Every table is fixed, in memory the caller owns.
+Textures, buffers, renderbuffers, sampler objects and sync objects live in an `Objects` table held by a share group's contexts. Framebuffer objects and vertex array objects belong to each context. Every table is fixed, in memory the caller owns.
+
+- **Mapped buffers** (`glMapBufferRange`, as WebRender uploads through pixel buffers). A map is the buffer's own memory, with no copy:
+  - A synchronized map waits for the GPU's use of the buffer.
+  - `MAP_UNSYNCHRONIZED_BIT` doesn't wait.
+  - `MAP_INVALIDATE_BUFFER_BIT` on a buffer the GPU still uses gives it new storage instead of waiting; the old storage goes once the GPU is done.
+  - What a write map wrote goes to the GPU at `glUnmapBuffer`, or at `glFlushMappedBufferRange` with `MAP_FLUSH_EXPLICIT_BIT`.
+  - A mapped buffer can't be drawn from, uploaded from, read into or written by `glBufferSubData`. `glBufferData` and deletion unmap it.
+- **Sync objects** (`glFenceSync` and the rest). A fence is the engine's mark after the work before it, and that work is run when the fence is made. `glClientWaitSync` waits for it, up to its timeout. `glWaitSync` waits for nothing, since the GPU's ring runs in order. A share group holds 1024 at once; past that `glFenceSync` gives null.
+- **Blits** (`glBlitFramebuffer`): one engine kernel, run on the GPU or by KIR's interpreter.
+  - Each destination pixel takes the source at its center, mapped back through the two rectangles. Flips and scaling are in the map, computed in exact float operations.
+  - NEAREST leaves alone a pixel whose source falls outside the read buffer. LINEAR blends four texels clamped to the edge.
+  - Color converts as copies do: RGBA8, BGRA8, RG8 and R8 in either direction. Depth and stencil are the 24 and 8 bits of their images.
+  - Only the scissor test applies, as GL says.
 
 ### Draws
 
@@ -106,9 +119,9 @@ A link keeps copies of its shaders' sources and makes the program's pipeline. It
 - **Loops** are KIR loops. A `for` with a `continue` runs its step at the top of each pass but the first, so `continue` (KIR's cont) still steps. A switch is a loop that `break` leaves, its cases a flag that falls through. A `continue` inside a switch leaves it and continues the loop around.
 - **`discard`** drops the fragment (the raster's discard pred). In main it also returns.
 - **Integer division** is exact: shifts for powers of two, else 32 steps of long division.
-- **Built-ins:** every one of the checker's. Approximate ones use KIR's approximate ops: `sin`, `cos`, `exp2`, `log2`, `inversesqrt`, `normalize`, and what is built of them. `atan` is a polynomial with an error of about 1e-5. `sqrt`, `length` and divisions are exact. Half floats are packed in integer arithmetic, exactly.
+- **Built-ins:** every one of the checker's. Approximate ones use KIR's approximate ops: `sin`, `cos`, `exp2`, `log2`, `inversesqrt`, `normalize`, and what is built of them. `atan` is a polynomial with an error of about 1e-5. `sqrt` and `length` are `frsq`'s seed with one Newton step, times x; 0 and infinity are their own roots. Half floats are packed in integer arithmetic, exactly.
 - **Samplers** are their texture slots, as immediates, so they pass to functions as values. A texture function reads its slot through `texture.sig`.
-- **Divisions:** `/` by a power of two is a multiplication, which gives the same result. Each other division is KIR's exact `fdiv`. On ir3 its expansion's temporaries stay live through the raster's triangle loop, so a fragment shader affords about 35 of them.
+- **Divisions** are within GLSL's precision (2.5 ulp), as GPUs divide. Mesa's ir3 multiplies by `rcp`. A division by a power of two is a multiplication, giving the same result; by another constant, a multiplication by its reciprocal. Otherwise it is `frcp`'s seed, one Newton step, then a multiply: 5 to 7 instructions, where KIR's exact `fdiv` takes 77 on the Adreno, which has no fused multiply-add. A division by 0 keeps its infinity. On ir3 this halves the code of WebRender's largest shaders (a 119 KB fragment kernel is now 55 KB). It also fits its border shader, which the exact expansions made too long. The draw kernels' own divisions (1/w, unorm bytes) stay exact. A seed's last bit may differ between GPUs, as with the other approximate built-ins, so a GLSL program's frame may too. The tests compare the CPU with the emulated Adreno, whose seeds agree.
 - **Derivatives** are shuffles with the quad's neighbour (see Draws). The link notes a fragment shader that takes them, and its draws run whole quads.
   - GL leaves a derivative undefined in control flow that is not uniform; here it is 0. A shuffle there could read a lane that isn't running: a trap in KIR's interpreter, garbage on a GPU.
   - After the fragment code is generated, a check finds where its control flow may differ between lanes. That is an `if` on a value that differs between pixels, the rest of a loop's pass after a break or continue on one, the whole of a loop left that way that runs more than one pass, and what follows a `return` or `discard` that some pixels take. It is a fixpoint over KIR: thread ids, shuffles and what they reach are divergent.
@@ -166,13 +179,13 @@ Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
 
 ### The C ABI
 
-The library is `libgalaxy-gl.so`, with 58 `egl*` and 198 `gl*` entry points. It is packaged as `libEGL.so.1` and `libGLESv2.so.2`, both links to the one file. The dynamic linker loads a file once, whatever name finds it, so EGL and GL share their state.
+The library is `libgalaxy-gl.so`, with 58 `egl*` and 209 `gl*` entry points. It is packaged as `libEGL.so.1` and `libGLESv2.so.2`, both links to the one file. The dynamic linker loads a file once, whatever name finds it, so EGL and GL share their state.
 
 Each context is current per thread. The current context is kept in a fixed table keyed by the thread pointer (`TPIDR_EL0` on AArch64, `%fs:0` on x86-64), so the library needs no thread-local storage and no C library.
 
 The library's panic handler prints one line and exits, as a failed assertion in a C driver does. It needs neither TLS nor a stack walk. EGL's tables, and the render node's, are filled at first use, so they take no room in the file.
 
-As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library has no `DT_NEEDED` entries and no TLS segment. Its only undefined symbols are the weak `dlsym` and `dl_iterate_phdr`, which the dynamic linker binds from the program's C library. It is 1364 KB on aarch64 and 1408 KB on x86_64: the CPU fallback carries KIR's interpreter and the draw kernels' builders, and the GLSL compiler adds about 310 KB. Its tables (EGL's, the engine's kernel space, the compile scratch, the code generator's, the text pool, the programs) are bss, about 49 MB of address space, touched only as used.
+As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library has no `DT_NEEDED` entries and no TLS segment. Its only undefined symbols are the weak `dlsym` and `dl_iterate_phdr`, which the dynamic linker binds from the program's C library. It is 1407 KB on aarch64 and 1448 KB on x86_64: the CPU fallback carries KIR's interpreter and the draw kernels' builders, and the GLSL compiler adds about 310 KB. Its tables (EGL's, the engine's kernel space, the compile scratch, the code generator's, the text pool, the programs) are bss, about 49 MB of address space, touched only as used.
 
 ## What is done
 
@@ -220,8 +233,14 @@ That makes 187 GL entry points.
 - R8 and RG8 render targets: draws, clears, color masks, copies and reads;
 - derivatives: quads with helper pixels, and 0 in control flow that is not uniform.
 
+**Stage 5f, what WebRender asks:**
+- WebRender's shaders: every variant a GLES device builds (46) compiles and links, and every draw kernel compiles for the Adreno (`test-gfxapi-webrender`);
+- GLSL's division and square root as GPUs do them (above);
+- the ir3 allocator's loop rule from SB0LTD/zpm#136 (a register lives through a loop only when the loop carries it): without it, six of WebRender's fragment kernels run out of registers;
+- WebRender's GL calls past the draws: mapped buffers, sync objects and blits. There are 11 new GL entry points, 209 in all.
+
 **Not yet:**
-- uniform blocks, transform feedback, queries, GL sync objects;
+- uniform blocks, transform feedback, queries;
 - points and lines;
 - clipping: a triangle with a vertex at w ≤ 0, or past a guard band of 24576 pixels, is dropped;
 - stencil tests, several color attachments, depth-only drawing;
@@ -264,6 +283,15 @@ sig build test-gfxapi
 
   A second scene is larger than a bin: 256 half-transparent triangles all over a 200×136 target (their order shows), big ones across bins under a scissor box off the bins' grid, and a thin strip. Binned, unbinned, and with lists of 24 that run over, it gives the same bytes on the CPU. `EmuDevice` (lists that run over) and the emulated Adreno (binned) give them too.
 - `test-gfxapi-targets`: R8 and RG8 targets on the CPU, on `EmuDevice` and on the emulated Adreno (ir3), the same bytes and the values GL says. An R8 texture is cleared, drawn into with additive blending, drawn into under a color mask that keeps its red, and given a corner copied from an RGBA8 framebuffer's red. It is read back as RED (its read format) and as RGBA. An RG8 texture is cleared, half drawn over, and read back as RG. An RG8 renderbuffer is complete and gives its sizes. A program samples both masks into an RGBA8 target.
+- `test-gfxapi-xfer`: transfers on the CPU, on `EmuDevice` and on the emulated Adreno (ir3), the same bytes and the values GL says.
+  - A texture uploaded through a mapped unpack buffer; rows rewritten through an unsynchronized map and an explicitly flushed one; a pack buffer mapped for reading.
+  - Blits: 1:1, flipped and scaled 2×, a bilinear 2:1 downscale, under a scissor box, into BGRA8 and R8, depth and stencil together and depth alone.
+  - Fences waited on and queried.
+  - The errors GL gives for each.
+- `test-gfxapi-webrender`: WebRender's shaders, read from a Firefox checkout's `gfx/wr/webrender/res` (`GFXAPI_WR_RES`; skipped without it, since Mozilla's sources stay out of zpm).
+  - The 46 variants a GLES device builds are assembled as `webrender_build` assembles them (its defines, its `#include`s), then compiled and linked through GL's program objects.
+  - Each program's vertex, setup and tile kernels are compiled for the Adreno's ir3. All must succeed.
+  - sm_120 is tried and only reported. Its backend takes up to 4096 KIR instructions after expansions, and 45 of WebRender's kernels are larger. The PC comes with stage 10.
 - `test-gfxapi-deriv`: a program with derivatives on the CPU, on `EmuDevice` and on the emulated Adreno (ir3), the same bytes and the values GL says. It draws four quads, one a mode:
   - steps of 1 across and up, the triangles' shared diagonal too, and a product's `fwidth`;
   - a circle's edge antialiased over a pixel with `fwidth`, as WebRender's clip shaders do;
@@ -304,7 +332,8 @@ sig build test-gfxapi
 | 5c | Done: GLSL to KIR, the vertex and fragment code draws run; the same bytes on the CPU and the emulated Adreno | zpm |
 | 5d | Done: textures. GL ES 3.0's formats (R8, RG8, the float and integer ones, the legacy ones), sampled reads (nearest, bilinear, every wrap), `texelFetch`, sampler objects, in both stages; the same bytes on the CPU and the emulated Adreno | zpm |
 | 5e | Done: triangles binned to tiles; render targets in R8 and RG8 (WebRender's masks); helper pixels for derivatives; the same bytes on the CPU and the emulated Adreno | zpm |
-| 5f | What WebRender asks beyond that (its shaders compiled and linked, mipmaps, what they find), until Firefox's WebRender draws on the GPU | zpm |
+| 5f | Done: WebRender's shaders compiled and linked (all 46 GLES variants, every kernel compiling for the Adreno); GLSL's division and roots as GPUs do them; mapped buffers, sync objects and blits | zpm |
+| 5g | Mipmaps and the implicit LOD derivatives give; then Firefox's WebRender drawing on the Surface's GPU, and what that finds | zpm + Galaxy |
 | 6 | Chromium through ANGLE on GLES | zpm |
 | 7 | `libgbm.so.1` | zpm |
 | 8 | Packaging: the libraries in Galaxy's root under Mesa's names; `mesa-*` provided by Galaxy; a Flatpak GL extension | Galaxy |

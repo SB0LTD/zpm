@@ -392,3 +392,29 @@ pub const TEXTURE_MIN_LOD: u32 = 0x813A;
 pub const TEXTURE_MAX_LOD: u32 = 0x813B;
 pub const SAMPLER_BINDING: u32 = 0x8919;
 pub const LEQUAL: u32 = 0x0203;
+
+// buffer mapping
+pub const BUFFER_MAP_POINTER: u32 = 0x88BD;
+pub const MAP_READ_BIT: u32 = 0x0001;
+pub const MAP_WRITE_BIT: u32 = 0x0002;
+pub const MAP_INVALIDATE_RANGE_BIT: u32 = 0x0004;
+pub const MAP_INVALIDATE_BUFFER_BIT: u32 = 0x0008;
+pub const MAP_FLUSH_EXPLICIT_BIT: u32 = 0x0010;
+pub const MAP_UNSYNCHRONIZED_BIT: u32 = 0x0020;
+
+// sync objects
+pub const MAX_SERVER_WAIT_TIMEOUT: u32 = 0x9111;
+pub const OBJECT_TYPE: u32 = 0x9112;
+pub const SYNC_CONDITION: u32 = 0x9113;
+pub const SYNC_STATUS: u32 = 0x9114;
+pub const SYNC_FLAGS: u32 = 0x9115;
+pub const SYNC_FENCE: u32 = 0x9116;
+pub const SYNC_GPU_COMMANDS_COMPLETE: u32 = 0x9117;
+pub const UNSIGNALED: u32 = 0x9118;
+pub const SIGNALED: u32 = 0x9119;
+pub const ALREADY_SIGNALED: u32 = 0x911A;
+pub const TIMEOUT_EXPIRED: u32 = 0x911B;
+pub const CONDITION_SATISFIED: u32 = 0x911C;
+pub const WAIT_FAILED: u32 = 0x911D;
+pub const SYNC_FLUSH_COMMANDS_BIT: u32 = 0x0001;
+pub const TIMEOUT_IGNORED: u64 = 0xFFFF_FFFF_FFFF_FFFF;

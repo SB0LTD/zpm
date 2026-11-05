@@ -671,13 +671,46 @@ const Gen = struct {
             };
             if (z) |v| return f(v);
         }
-        // x / 2^k is x * 2^-k exactly (the same real number, rounded once)
-        if (op == .fdiv and b == .imm) {
-            const y: f32 = @bitCast(b.imm);
-            const e = (b.imm >> 23) & 0xff;
-            if (b.imm & 0x7f_ffff == 0 and e > 1 and e < 253 and y != 0) return r(g.k.op2(.fmul, .f32, a, f(1.0 / y)));
+        if (op == .fdiv) {
+            // x / 2^k is x * 2^-k exactly (the same real number, rounded
+            // once); by another constant, x times its reciprocal (1.5 ulp)
+            if (b == .imm) {
+                const y: f32 = @bitCast(b.imm);
+                return r(g.k.op2(.fmul, .f32, a, f(1.0 / y)));
+            }
+            const y = g.recip(b);
+            if (a == .imm and a.imm == @as(u32, @bitCast(@as(f32, 1)))) return y;
+            return r(g.k.op2(.fmul, .f32, a, y));
         }
         return r(g.k.op2(op, .f32, a, b));
+    }
+
+    /// 1 / b within GLSL's precision (2 ulp; a division x / b is x times
+    /// it, 2.5 ulp as GLSL allows): frcp's seed (2^-21) and one Newton
+    /// step, as GPUs divide (Mesa's ir3: rcp, then a multiply), not KIR's
+    /// exact fdiv, which takes some 40 to 80 instructions. 0 and inf keep
+    /// the seed's inf and 0.
+    fn recip(g: *Gen, b: Arg) Arg {
+        const k = g.k;
+        const y0 = k.op1(.frcp, .f32, b);
+        const t = k.op2(.fmul, .f32, b, r(y0));
+        const y1 = k.op2(.fmul, .f32, r(y0), r(k.op2(.fsub, .f32, f(2), r(t))));
+        // (b 0 or inf: b * y0 is NaN)
+        return r(k.sel(.f32, r(k.cmp(.f32, .eq, r(t), r(t))), r(y1), r(y0)));
+    }
+
+    /// sqrt(x) within GLSL's precision (1 / inversesqrt's): frsq's seed and
+    /// one Newton step, times x; 0 and inf themselves, < 0 NaN.
+    fn sqrtOf(g: *Gen, x: Arg) Arg {
+        if (x == .imm) return f(@sqrt(@as(f32, @bitCast(x.imm))));
+        const k = g.k;
+        const r0 = k.op1(.frsq, .f32, x);
+        const h = k.op2(.fmul, .f32, x, f(0.5));
+        const e = k.op2(.fsub, .f32, f(1.5), r(k.op2(.fmul, .f32, r(h), r(k.op2(.fmul, .f32, r(r0), r(r0))))));
+        const s = k.op2(.fmul, .f32, x, r(k.op2(.fmul, .f32, r(r0), r(e))));
+        // (0 and inf make NaN above: they are their own roots; < 0 NaN)
+        const fallback = k.sel(.f32, r(k.cmp(.f32, .lt, x, f(0))), u(0x7fc0_0000), x);
+        return r(k.sel(.f32, r(k.cmp(.f32, .eq, r(s), r(s))), r(s), r(fallback)));
     }
 
     fn fop1(g: *Gen, op: kir.Op, a: Arg) Arg {
@@ -1547,7 +1580,7 @@ const Gen = struct {
                 };
                 for (0..n) |ix| g.put(at, @intCast(ix), g.fop1(op, g.ca(v[0], @intCast(ix))));
             },
-            .sqrt => for (0..n) |ix| g.put(at, @intCast(ix), r(g.k.sqrt(g.ca(v[0], @intCast(ix))))),
+            .sqrt => for (0..n) |ix| g.put(at, @intCast(ix), g.sqrtOf(g.ca(v[0], @intCast(ix)))),
             .inversesqrt => for (0..n) |ix| g.put(at, @intCast(ix), g.fop1(.frsq, g.ca(v[0], @intCast(ix)))),
             .tan => for (0..n) |ix| {
                 const x = g.ca(v[0], @intCast(ix));
@@ -1562,7 +1595,7 @@ const Gen = struct {
             },
             .asin, .acos => for (0..n) |ix| {
                 const x = g.ca(v[0], @intCast(ix));
-                const c = r(g.k.sqrt(g.fop2(.fsub, f(1), g.fop2(.fmul, x, x))));
+                const c = g.sqrtOf(g.fop2(.fsub, f(1), g.fop2(.fmul, x, x)));
                 g.put(at, @intCast(ix), if (which == .asin) g.atan2(x, c) else g.atan2(c, x));
             },
             .sinh, .cosh, .tanh => for (0..n) |ix| {
@@ -1585,10 +1618,10 @@ const Gen = struct {
                 const res = switch (which) {
                     .asinh => blk: {
                         const ax = g.fop1(.fabs, x);
-                        const l = g.fop2(.fmul, g.fop1(.flog2, g.fop2(.fadd, ax, r(g.k.sqrt(g.fop2(.fadd, g.fop2(.fmul, x, x), f(1)))))), ln2);
+                        const l = g.fop2(.fmul, g.fop1(.flog2, g.fop2(.fadd, ax, g.sqrtOf(g.fop2(.fadd, g.fop2(.fmul, x, x), f(1))))), ln2);
                         break :blk g.sel(.f32, r(g.k.cmp(.f32, .lt, x, f(0))), g.fop1(.fneg, l), l);
                     },
-                    .acosh => g.fop2(.fmul, g.fop1(.flog2, g.fop2(.fadd, x, r(g.k.sqrt(g.fop2(.fsub, g.fop2(.fmul, x, x), f(1)))))), ln2),
+                    .acosh => g.fop2(.fmul, g.fop1(.flog2, g.fop2(.fadd, x, g.sqrtOf(g.fop2(.fsub, g.fop2(.fmul, x, x), f(1))))), ln2),
                     else => g.fop2(.fmul, g.fop1(.flog2, g.fop2(.fdiv, g.fop2(.fadd, f(1), x), g.fop2(.fsub, f(1), x))), f(0.5 * std.math.ln2)),
                 };
                 g.put(at, @intCast(ix), res);
@@ -1699,7 +1732,7 @@ const Gen = struct {
                     const sq = g.fop2(.fmul, x, x);
                     s = if (ix == 0) sq else g.fop2(.fadd, s, sq);
                 }
-                g.put(at, 0, r(g.k.sqrt(s)));
+                g.put(at, 0, g.sqrtOf(s));
             },
             .dot => g.put(at, 0, g.dot(v[0], v[1])),
             .cross => {
@@ -1731,7 +1764,7 @@ const Gen = struct {
                 const d = g.dot(v[1], v[0]);
                 const kk = g.fop2(.fsub, f(1), g.fop2(.fmul, g.fop2(.fmul, eta, eta), g.fop2(.fsub, f(1), g.fop2(.fmul, d, d))));
                 const neg = r(g.k.cmp(.f32, .lt, kk, f(0)));
-                const m = g.fop2(.fadd, g.fop2(.fmul, eta, d), r(g.k.sqrt(kk)));
+                const m = g.fop2(.fadd, g.fop2(.fmul, eta, d), g.sqrtOf(kk));
                 for (0..n) |ix| {
                     const x = g.fop2(.fsub, g.fop2(.fmul, eta, g.cp(v[0].at, @intCast(ix))), g.fop2(.fmul, m, g.cp(v[1].at, @intCast(ix))));
                     g.put(at, @intCast(ix), g.sel(.f32, neg, f(0), x));
