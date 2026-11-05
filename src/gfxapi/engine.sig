@@ -133,6 +133,9 @@ pub const Rect = struct {
     }
 };
 
+/// Mipmap levels an image may hold (8192 pixels down to 1).
+pub const MAX_LEVELS = 14;
+
 pub const Image = struct {
     buf: gpu.Buffer = .{},
     width: u32 = 0,
@@ -154,6 +157,21 @@ pub const Image = struct {
     /// a color image without alpha (an XRGB surface's): read, and copied
     /// from, as opaque whatever its top byte holds
     no_alpha: bool = false,
+    /// mipmap levels held (newImageChain), each after the one before: level
+    /// l is levelWidth(l) x levelHeight(l), rows levelStride(l) bytes
+    /// apart, from byte level_at[l]; level 0 is the image itself
+    levels: u8 = 1,
+    level_at: [MAX_LEVELS]u32 = [_]u32{0} ** MAX_LEVELS,
+
+    pub fn levelWidth(img: *const Image, l: u32) u32 {
+        return @max(img.width >> @intCast(l), 1);
+    }
+    pub fn levelHeight(img: *const Image, l: u32) u32 {
+        return @max(img.height >> @intCast(l), 1);
+    }
+    pub fn levelStride(img: *const Image, l: u32) u32 {
+        return if (l == 0) img.stride else std.mem.alignForward(u32, img.levelWidth(l) * img.format.bytes(), 4);
+    }
 
     pub fn bounds(img: *const Image) Rect {
         return .{ .x0 = 0, .y0 = 0, .x1 = img.width, .y1 = img.height };
@@ -280,7 +298,7 @@ pub const Pool = struct {
 /// Threads per group (a row of pixels: one thread each).
 pub const GROUP = 64;
 
-const Prog = enum(u8) { fill, fill_masked, copy, bin, blit };
+const Prog = enum(u8) { fill, fill_masked, copy, bin, blit, mip };
 const N_PROGS = @typeInfo(Prog).@"enum".field_names.len;
 /// A program's code as the backend emits it (ir3, sm_120 or KIR's own).
 pub const CODE_BYTES = 16 * 1024;
@@ -544,6 +562,52 @@ fn blitKernel(s: kir.Storage) kir.Kernel {
     return k;
 }
 
+/// mip: a level from the one before, a thread a texel (a group row a
+/// row): texels (2x, 2y), (2x + 1, 2y), (2x, 2y + 1), (2x + 1, 2y + 1)
+/// (clamped to the level before: an odd edge's last one twice) averaged
+/// byte by byte, rounded. params: 0 the level before's byte offset, 1 its
+/// width, 2 height, 3 stride; 4..7 the same of the level made; 8 bytes a
+/// texel (1, 2, 4).
+fn mipKernel(s: kir.Storage) kir.Kernel {
+    var k = kir.Kernel.init(s, "gfx_mip", .{ GROUP, 1, 1 });
+    const img = k.binding();
+    const x = k.op3(.imad, .u32, r(k.gid(0)), u(GROUP), r(k.tid(0)));
+    k.ifp(r(k.cmp(.u32, .lt, r(x), r(k.param(.u32, 5)))));
+    {
+        const y = k.gid(1);
+        const bpp = k.param(.u32, 8);
+        const sw1 = k.op2(.isub, .u32, r(k.param(.u32, 1)), u(1));
+        const sh1 = k.op2(.isub, .u32, r(k.param(.u32, 2)), u(1));
+        const xa = k.op2(.imin, .u32, r(k.op2(.shl, .u32, r(x), u(1))), r(sw1));
+        const xb = k.op2(.imin, .u32, r(k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(x), u(1))), u(1))), r(sw1));
+        const ya = k.op2(.imin, .u32, r(k.op2(.shl, .u32, r(y), u(1))), r(sh1));
+        const yb = k.op2(.imin, .u32, r(k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(y), u(1))), u(1))), r(sh1));
+        const at = struct {
+            fn f_(kk: *kir.Kernel, base: kir.V, stride: kir.V, xx: kir.V, yy: kir.V, b: kir.V) kir.V {
+                return kk.op2(.iadd, .u32, r(base), r(kk.op3(.imad, .u32, r(yy), r(stride), r(kk.op2(.imul, .u32, r(xx), r(b))))));
+            }
+        }.f_;
+        const sb = k.param(.u32, 0);
+        const ss = k.param(.u32, 3);
+        const t = [4]kir.V{
+            pixelLoad(&k, img, bpp, at(&k, sb, ss, xa, ya, bpp)),
+            pixelLoad(&k, img, bpp, at(&k, sb, ss, xb, ya, bpp)),
+            pixelLoad(&k, img, bpp, at(&k, sb, ss, xa, yb, bpp)),
+            pixelLoad(&k, img, bpp, at(&k, sb, ss, xb, yb, bpp)),
+        };
+        var v = k.mov(.u32, u(0));
+        for (0..4) |ch| {
+            const sh8: u32 = @intCast(8 * ch);
+            var sum = k.mov(.u32, u(2));
+            for (t) |tx| sum = k.op2(.iadd, .u32, r(sum), r(k.op3(.bfe, .u32, r(tx), u(sh8), u(8))));
+            v = k.op2(.@"or", .u32, r(v), r(k.op2(.shl, .u32, r(k.op2(.shr, .u32, r(sum), u(2))), u(sh8))));
+        }
+        pixelStore(&k, img, bpp, at(&k, k.param(.u32, 4), k.param(.u32, 7), x, y, bpp), v);
+    }
+    k.endif();
+    return k;
+}
+
 /// What a blit maps: the destination rectangle (GL's coordinates, inside
 /// the destination; x0 > x1 for a flip is in the scale), and each axis's
 /// map from destination to source.
@@ -718,6 +782,7 @@ pub const Engine = struct {
                 .copy => copyKernel(s),
                 .bin => raster.binKernel(s),
                 .blit => blitKernel(s),
+                .mip => mipKernel(s),
             };
             try k.finish();
             var w = gpu.Work.init(work_mem);
@@ -806,6 +871,52 @@ pub const Engine = struct {
             if (sh.refs == 0) e.freeBytes(sh.buf, sh.pooled, sh.track.last);
         } else if (img.own and img.buf.cpu.len != 0) e.freeBytes(img.buf, img.pooled, img.track.last);
         img.* = .{};
+    }
+
+    /// An image of `levels` mipmap levels (one buffer, level after level),
+    /// or null when there is no memory for it.
+    pub fn newImageChain(e: *Engine, width: u32, height: u32, format: Format, levels: u32) ?Image {
+        if (width == 0 or height == 0 or levels == 0 or levels > MAX_LEVELS) return null;
+        var img = Image{ .width = width, .height = height, .format = format, .levels = @intCast(levels) };
+        img.stride = std.mem.alignForward(u32, width * format.bytes(), 4);
+        var at: usize = 0;
+        for (0..levels) |l| {
+            img.level_at[l] = @intCast(at);
+            at += @as(usize, img.levelStride(@intCast(l))) * img.levelHeight(@intCast(l));
+        }
+        const m = e.allocBytes(at) orelse return null;
+        img.buf = m.buf;
+        img.own = true;
+        img.pooled = m.pooled;
+        return img;
+    }
+
+    /// Levels base + 1 .. last of img made from the one before each (2 x 2
+    /// texels averaged, rounded; an odd edge's last texel taken twice):
+    /// glGenerateMipmap, for 1-, 2- and 4-byte unorm images. On the GPU, or
+    /// the same kernel on the CPU.
+    pub fn mipmap(e: *Engine, img: *Image, base: u32, last: u32) bool {
+        var l = base;
+        while (l < last) : (l += 1) {
+            const p = [_]u32{
+                img.level_at[l],      img.levelWidth(l),     img.levelHeight(l),     img.levelStride(l),
+                img.level_at[l + 1],  img.levelWidth(l + 1), img.levelHeight(l + 1), img.levelStride(l + 1),
+                img.format.bytes(),
+            };
+            const groups = [3]u32{ divUp(img.levelWidth(l + 1), GROUP), img.levelHeight(l + 1), 1 };
+            if (e.gpuUsable(img)) {
+                const bufs = [_]*Image{img};
+                e.recordProg(&e.progs[@intFromEnum(Prog.mip)], groups, &bufs, 1, &p, null);
+                continue;
+            }
+            if (e.cpu_work.len == 0) return false;
+            e.fetchAll(img);
+            e.stats.cpu_ops += 1;
+            const views = [_][]u8{img.buf.cpu};
+            if (!e.runCpu(.mip, undefined, groups, &views, &p)) return false;
+            e.wrote(img, 0, img.buf.cpu.len);
+        }
+        return true;
     }
 
     /// Storage for a GL buffer object of `bytes` (zeros).
@@ -945,7 +1056,7 @@ pub const Engine = struct {
 
     // ── Draws ──────────────────────────────────────────────────────────────
 
-    const Stage = enum(u3) { vertex, setup, raster, bin, blit };
+    const Stage = enum(u3) { vertex, setup, raster, bin, blit, mip };
 
     fn build(e: *Engine, st: Stage, p: *const raster.Pipeline) kir.Kernel {
         const s = kir.Storage{ .insts = &e.kir_insts, .tys = &e.kir_tys };
@@ -955,6 +1066,7 @@ pub const Engine = struct {
             .raster => raster.rasterKernel(s, p),
             .bin => raster.binKernel(s),
             .blit => blitKernel(s),
+            .mip => mipKernel(s),
         };
     }
 

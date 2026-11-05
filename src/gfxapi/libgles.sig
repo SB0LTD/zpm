@@ -1216,10 +1216,13 @@ test "libgles: texture formats and sampler objects through the C entry points" {
     try E(g.INVALID_OPERATION, glGetError());
     glTexImage2D(g.TEXTURE_2D, 0, 0x1234, 1, 1, 0, g.RGBA, g.UNSIGNED_BYTE, &r8);
     try E(g.INVALID_VALUE, glGetError());
-    // mipmap levels past 0: taken
+    // a level past a 1 x 1 texture's: taken, not stored; mipmaps of a
+    // float texture: refused (ES 3.0 makes them for what it renders, and
+    // floats are not rendered here)
     glTexImage2D(g.TEXTURE_2D, 1, @intCast(g.RGBA8), 1, 1, 0, g.RGBA, g.UNSIGNED_BYTE, &r8);
-    glGenerateMipmap(g.TEXTURE_2D);
     try E(g.NO_ERROR, glGetError());
+    glGenerateMipmap(g.TEXTURE_2D);
+    try E(g.INVALID_OPERATION, glGetError());
     glTexParameteri(g.TEXTURE_2D, g.TEXTURE_SWIZZLE_A, @intCast(g.ONE));
     var v: i32 = 0;
     glGetTexParameteriv(g.TEXTURE_2D, g.TEXTURE_SWIZZLE_A, @ptrCast(&v));

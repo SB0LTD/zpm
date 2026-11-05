@@ -267,6 +267,9 @@ fn secondHalf(c: *gles.Context, out: *Out, t_grid: u32, uRect: i32, uMode: i32, 
     var smp: [1]u32 = undefined;
     c.genSamplers(&smp);
     c.samplerParameteri(smp[0], g.TEXTURE_MAG_FILTER, g.LINEAR);
+    // (its minification filter too: a mipmap one, the default, would
+    // leave the one-level texture incomplete)
+    c.samplerParameteri(smp[0], g.TEXTURE_MIN_FILTER, g.LINEAR);
     c.samplerParameteri(smp[0], g.TEXTURE_WRAP_S, g.CLAMP_TO_EDGE);
     c.samplerParameteri(smp[0], g.TEXTURE_WRAP_T, g.CLAMP_TO_EDGE);
     c.bindSampler(0, smp[0]);

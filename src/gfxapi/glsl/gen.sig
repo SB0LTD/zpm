@@ -35,7 +35,11 @@
 //!   of long division.
 //! - Samplers are their texture slots (immediates, so passed to functions
 //!   as values); a texture function reads the slot's binding through its
-//!   descriptor (texture.sig).
+//!   descriptor (texture.sig). A fragment shader's implicit level of
+//!   detail comes from its coordinates' derivatives (so such a program
+//!   runs whole quads), plus a bias if given; textureLod's and
+//!   textureGrad's are their arguments'; a vertex shader's is the base
+//!   level.
 //! - Derivatives (dFdx, dFdy, fwidth) are differences with the quad's
 //!   neighbour pixel, through a shuffle: the raster runs whole quads for a
 //!   program that takes them (FragmentIO.quads). In control flow that is
@@ -1886,6 +1890,35 @@ const Gen = struct {
         textureCubeGradEXT,
     };
 
+    /// A texture function's level of detail: given (the *Lod ones), its
+    /// gradients (the *Grad ones), or implicit: in a fragment shader the
+    /// derivatives of (s, t) through the quad, plus the bias argument if
+    /// there is one; elsewhere the base level.
+    fn lodOf(g: *Gen, which: TexFn, args: []Val, s: Arg, t: Arg, kind: texture.Kind) texture.Lod {
+        if (kind != .float) return .base;
+        switch (which) {
+            .textureLod, .textureLodOffset, .textureProjLod, .textureProjLodOffset, .texture2DLod, .texture2DProjLod, .texture2DLodEXT, .texture2DProjLodEXT => {
+                return .{ .level = if (args.len > 2) g.cp(g.rv(args[2]).at, 0) else f(0) };
+            },
+            .textureGrad, .textureGradOffset, .textureProjGrad, .textureProjGradOffset, .texture2DGradEXT, .texture2DProjGradEXT => {
+                if (args.len < 4) return .base;
+                const dx = g.rv(args[2]);
+                const dy = g.rv(args[3]);
+                return .{ .grad = .{ .dsdx = g.cp(dx.at, 0), .dtdx = g.cp(dx.at, 1), .dsdy = g.cp(dy.at, 0), .dtdy = g.cp(dy.at, 1), .bias = f(0) } };
+            },
+            else => {},
+        }
+        if (g.stage != .fragment) return .base;
+        const bias_at: usize = switch (which) {
+            .textureOffset, .textureProjOffset => 3,
+            else => 2,
+        };
+        const bias = if (bias_at < args.len) g.cp(g.rv(args[bias_at]).at, 0) else f(0);
+        // (the program runs whole quads: derivatives are its neighbours')
+        g.derivatives = true;
+        return .{ .grad = .{ .dsdx = g.deriv(s, false), .dtdx = g.deriv(t, false), .dsdy = g.deriv(s, true), .dtdy = g.deriv(t, true), .bias = bias } };
+    }
+
     /// A constant ivec2 argument (an offset): its two ints.
     fn offsetOf(g: *Gen, v: Val) [2]i32 {
         const a = g.rv(v);
@@ -1935,7 +1968,8 @@ const Gen = struct {
             .texelFetch, .texelFetchOffset => {
                 const p = g.rv(args[1]);
                 const off = if (which == .texelFetchOffset) g.offsetOf(args[3]) else [2]i32{ 0, 0 };
-                res = texture.fetch(k, ts, g.cp(p.at, 0), g.cp(p.at, 1), kind, off);
+                const lod = if (args.len > 2) g.cp(g.rv(args[2]).at, 0) else u(0);
+                res = texture.fetch(k, ts, g.cp(p.at, 0), g.cp(p.at, 1), kind, off, lod);
             },
             else => {
                 const p = g.rv(args[1]);
@@ -1958,7 +1992,7 @@ const Gen = struct {
                     else => null,
                 };
                 const off = if (off_at) |ix| (if (ix < args.len) g.offsetOf(args[ix]) else [2]i32{ 0, 0 }) else [2]i32{ 0, 0 };
-                res = texture.sample(k, ts, s, tt, kind, off);
+                res = texture.sample(k, ts, s, tt, kind, off, g.lodOf(which, args, s, tt, kind));
             },
         }
         for (0..@min(n, 4)) |ix| g.put(at, @intCast(ix), res[ix]);

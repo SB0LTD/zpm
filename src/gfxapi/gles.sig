@@ -104,6 +104,8 @@ pub const Tex = struct {
     img: Image = .{},
     internal: u32 = 0,
     levels: u32 = 0,
+    /// the levels specified (bit l: level l), stored in img's chain
+    defined: u16 = 0,
     immutable: bool = false,
     params: TexParams = .{},
     /// GL's R, G, B, A as the stored texel's channels (LUMINANCE ...),
@@ -1250,6 +1252,7 @@ pub const Context = struct {
         t.img = engine.alias(src);
         t.internal = if (src.format == .bgra8) g.BGRA8_EXT else g.RGBA8;
         t.levels = 1;
+        t.defined = 1;
         t.fswz = .{ 0, 1, 2, 3 };
         t.srgb = false;
     }
@@ -1293,20 +1296,53 @@ pub const Context = struct {
         t.* = .{};
     }
 
-    /// The texture's level 0 becomes w x h of `fmt` (none for 0 x 0).
+    /// The texture's level 0 becomes w x h of `fmt` (none for 0 x 0); its
+    /// other levels stay if its size and format do.
     fn defineTex(c: *Context, t: *Tex, w: u32, h: u32, fmt: Format, internal: u32) bool {
         if (t.img.live() and t.img.width == w and t.img.height == h and t.img.format == fmt) {
             t.internal = internal;
+            t.defined |= 1;
             return true;
         }
         c.eng.freeImage(&t.img);
         t.internal = internal;
         t.levels = 1;
+        t.defined = 0;
         if (w == 0 or h == 0) return true;
         t.img = c.eng.newImage(w, h, fmt) orelse {
             c.fail(g.OUT_OF_MEMORY);
             return false;
         };
+        t.defined = 1;
+        return true;
+    }
+
+    /// Levels a full chain from level 0 has: log2 of the larger side, + 1.
+    fn fullLevels(img: *const Image) u32 {
+        return std.math.log2_int(u32, @max(img.width, img.height)) + 1;
+    }
+
+    /// The texture's image holds `n` levels at least: a chain made, its
+    /// levels so far copied in (an EGLImage's memory cannot grow one).
+    fn growChain(c: *Context, t: *Tex, n: u32) bool {
+        if (t.img.levels >= n) return true;
+        if (t.img.share != null or t.img.top_down) {
+            c.fail(g.INVALID_OPERATION);
+            return false;
+        }
+        var img = c.eng.newImageChain(t.img.width, t.img.height, t.img.format, n) orelse {
+            c.fail(g.OUT_OF_MEMORY);
+            return false;
+        };
+        for (0..t.img.levels) |l| {
+            const lv: u32 = @intCast(l);
+            const len = @as(usize, t.img.levelStride(lv)) * t.img.levelHeight(lv);
+            const from = c.eng.hostView(&t.img, t.img.level_at[l], len);
+            @memcpy(c.eng.hostView(&img, img.level_at[l], len), from);
+            c.eng.wrote(&img, img.level_at[l], len);
+        }
+        c.eng.freeImage(&t.img);
+        t.img = img;
         return true;
     }
 
@@ -1335,12 +1371,14 @@ pub const Context = struct {
         return .{ .bytes = @as([*]const u8, @ptrCast(p))[l.first..span], .row = l.row };
     }
 
-    /// Rows of client texels into img at (x, y), converted as `up` says.
-    fn uploadRows(c: *Context, img: *Image, up: texfmt.Upload, x: u32, y: u32, w: u32, h: u32, src: []const u8, row: usize) void {
+    /// Rows of client texels into level `level` of img at (x, y), converted
+    /// as `up` says.
+    fn uploadRows(c: *Context, img: *Image, level: u32, up: texfmt.Upload, x: u32, y: u32, w: u32, h: u32, src: []const u8, row: usize) void {
         const bpp: usize = img.format.bytes();
         for (0..h) |j| {
-            const mrow = img.rowOf(y + @as(u32, @intCast(j)));
-            const off = @as(usize, mrow) * img.stride + @as(usize, x) * bpp;
+            const gy = y + @as(u32, @intCast(j));
+            const mrow = if (level == 0) img.rowOf(gy) else gy;
+            const off = img.level_at[level] + @as(usize, mrow) * img.levelStride(level) + @as(usize, x) * bpp;
             const len = @as(usize, w) * bpp;
             const dst = c.eng.hostView(img, off, len);
             texfmt.convert(up, src[j * row ..], dst, w);
@@ -1348,36 +1386,50 @@ pub const Context = struct {
         }
     }
 
-    /// glTexImage2D. Levels past 0 are taken and not stored (draws read
-    /// level 0).
+    /// glTexImage2D. A level past 0 is stored in the texture's chain when
+    /// level 0 is there, of its format, and the level's size is level 0's
+    /// halved; otherwise it is taken and not stored (a texture that needs
+    /// it is incomplete).
     pub fn texImage2D(c: *Context, target: u32, level: i32, internal: i32, w: i32, h: i32, border: i32, format: u32, ty: u32, pixels: ?*const anyopaque) void {
         const t = c.boundTex2D(target) orelse return;
-        if (level < 0 or w < 0 or h < 0 or w > MAX_SIZE or h > MAX_SIZE or border != 0) return c.fail(g.INVALID_VALUE);
+        if (level < 0 or level >= engine.MAX_LEVELS or w < 0 or h < 0 or w > MAX_SIZE or h > MAX_SIZE or border != 0) return c.fail(g.INVALID_VALUE);
         const ifmt: u32 = @bitCast(internal);
         const up = switch (texfmt.upload(ifmt, format, ty)) {
             .ok => |x| x,
             .err => |e| return c.fail(e),
         };
         if (t.immutable) return c.fail(g.INVALID_OPERATION);
-        if (level > 0) return;
         const uw: u32 = @intCast(w);
         const uh: u32 = @intCast(h);
+        const l: u32 = @intCast(level);
+        if (l > 0) {
+            const bit = @as(u16, 1) << @intCast(l);
+            t.defined &= ~bit;
+            const fits = t.img.live() and up.store == t.img.format and l < fullLevels(&t.img) and uw == t.img.levelWidth(l) and uh == t.img.levelHeight(l);
+            if (!fits or t.img.share != null) return;
+            if (!c.growChain(t, fullLevels(&t.img))) return;
+            t.defined |= bit;
+            const src = c.unpackSource(pixels, uw, uh, up.client_bytes) orelse return;
+            c.uploadRows(&t.img, l, up, 0, 0, uw, uh, src.bytes, src.row);
+            return;
+        }
         if (!c.defineTex(t, uw, uh, up.store, ifmt)) return;
         t.fswz = up.swizzle;
         t.srgb = up.srgb;
         const src = c.unpackSource(pixels, uw, uh, up.client_bytes) orelse return;
-        c.uploadRows(&t.img, up, 0, 0, uw, uh, src.bytes, src.row);
+        c.uploadRows(&t.img, 0, up, 0, 0, uw, uh, src.bytes, src.row);
     }
 
     pub fn texSubImage2D(c: *Context, target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, pixels: ?*const anyopaque) void {
         const t = c.boundTex2D(target) orelse return;
-        if (level < 0 or x < 0 or y < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
-        if (level > 0) return;
-        if (@as(i64, x) + w > t.img.width or @as(i64, y) + h > t.img.height) return c.fail(g.INVALID_VALUE);
+        if (level < 0 or level >= engine.MAX_LEVELS or x < 0 or y < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
+        const l: u32 = @intCast(level);
+        if (l > 0 and t.defined & (@as(u16, 1) << @intCast(l)) == 0) return c.fail(g.INVALID_OPERATION);
+        if (@as(i64, x) + w > t.img.levelWidth(l) or @as(i64, y) + h > t.img.levelHeight(l)) return c.fail(g.INVALID_VALUE);
         const up = texfmt.subUpload(t.img.format, format, ty) orelse return c.fail(if (texfmt.known(format, ty)) g.INVALID_OPERATION else g.INVALID_ENUM);
         if (w == 0 or h == 0) return;
         const src = c.unpackSource(pixels, @intCast(w), @intCast(h), up.client_bytes) orelse return;
-        c.uploadRows(&t.img, up, @intCast(x), @intCast(y), @intCast(w), @intCast(h), src.bytes, src.row);
+        c.uploadRows(&t.img, l, up, @intCast(x), @intCast(y), @intCast(w), @intCast(h), src.bytes, src.row);
     }
 
     pub fn texStorage2D(c: *Context, target: u32, levels: i32, internal: u32, w: i32, h: i32) void {
@@ -1388,17 +1440,33 @@ pub const Context = struct {
         if (levels > most) return c.fail(g.INVALID_OPERATION);
         if (t.immutable or t == &c.default_tex) return c.fail(g.INVALID_OPERATION);
         if (!c.defineTex(t, @intCast(w), @intCast(h), up.store, internal)) return;
+        if (levels > 1 and !c.growChain(t, @intCast(levels))) return;
         t.fswz = up.swizzle;
         t.srgb = up.srgb;
-        // (levels past 0 are counted, not stored: draws read level 0)
         t.levels = @intCast(levels);
+        t.defined = @intCast((@as(u32, 1) << @intCast(levels)) - 1);
         t.immutable = true;
     }
 
-    /// glGenerateMipmap: nothing stored (draws read level 0).
+    /// glGenerateMipmap: the levels past the base, to the last a complete
+    /// texture has (MAX_LEVEL, or the immutable texture's), made from the
+    /// base (the engine's mip kernel: 2 x 2 texels averaged). Unorm
+    /// textures of 1, 2 or 4 bytes a texel (what ES 3.0 lets filter and
+    /// render); others INVALID_OPERATION.
     pub fn generateMipmap(c: *Context, target: u32) void {
         const t = c.boundTex2D(target) orelse return;
         if (!t.img.live()) return c.fail(g.INVALID_OPERATION);
+        const base: u32 = @intCast(@max(t.params.base_level, 0));
+        if (base >= engine.MAX_LEVELS or t.defined & (@as(u16, 1) << @intCast(base)) == 0) return c.fail(g.INVALID_OPERATION);
+        if (!t.img.format.renderable()) return c.fail(g.INVALID_OPERATION);
+        const full = fullLevels(&t.img);
+        var last: u32 = @min(full - 1, @as(u32, @intCast(@max(t.params.max_level, 0))));
+        if (t.immutable) last = @min(last, t.levels - 1);
+        if (last <= base) return;
+        if (!t.immutable and !c.growChain(t, full)) return;
+        if (!c.eng.mipmap(&t.img, base, last)) return c.fail(g.OUT_OF_MEMORY);
+        var l = base;
+        while (l <= last) : (l += 1) t.defined |= @as(u16, 1) << @intCast(l);
     }
 
     pub fn texParameteri(c: *Context, target: u32, pname: u32, param: i32) void {
@@ -1476,10 +1544,32 @@ pub const Context = struct {
         const t: *Tex = if (name == 0) (if (sl.external) &c.default_ext else &c.default_tex) else (madeIn(Tex, &c.objs.tex, name) orelse return .{});
         if (!t.img.live()) return .{};
         const p: *const TexParams = if (c.smp[unit] != 0) (if (madeIn(Smp, &c.objs.samplers, c.smp[unit])) |s| &s.params else &t.params) else &t.params;
+        // the levels read, and completeness (GL ES 3.0 3.8.13): the base
+        // level there; with a mipmap filter, every level to the last
+        const mip: texture.Mip = switch (p.min) {
+            g.NEAREST_MIPMAP_NEAREST, g.LINEAR_MIPMAP_NEAREST => .nearest,
+            g.NEAREST_MIPMAP_LINEAR, g.LINEAR_MIPMAP_LINEAR => .linear,
+            else => .none,
+        };
+        var base: u32 = @intCast(@max(t.params.base_level, 0));
+        if (t.immutable) base = @min(base, t.levels - 1);
+        if (base >= engine.MAX_LEVELS or t.defined & (@as(u16, 1) << @intCast(base)) == 0) return .{};
+        var last = base;
+        if (mip != .none) {
+            const top = base + std.math.log2_int(u32, @max(t.img.levelWidth(base), t.img.levelHeight(base)));
+            if (t.params.max_level < base) return .{};
+            last = @min(top, @as(u32, @intCast(t.params.max_level)));
+            if (t.immutable) last = @min(last, t.levels - 1);
+            if (last >= t.img.levels) return .{};
+            var l = base;
+            while (l <= last) : (l += 1) {
+                if (t.defined & (@as(u16, 1) << @intCast(l)) == 0) return .{};
+            }
+        }
         // GL's R, G, B, A as the stored channels: bgra8's bytes are B, G, R, A
-        const base: [4]u3 = if (t.img.format == .bgra8) .{ 2, 1, 0, 3 } else .{ 0, 1, 2, 3 };
+        const order: [4]u3 = if (t.img.format == .bgra8) .{ 2, 1, 0, 3 } else .{ 0, 1, 2, 3 };
         var rgba: [4]u3 = undefined;
-        for (t.fswz, 0..) |s, i| rgba[i] = if (s < 4) base[s] else s;
+        for (t.fswz, 0..) |s, i| rgba[i] = if (s < 4) order[s] else s;
         var swz: [4]u3 = undefined;
         for (t.params.swizzle, 0..) |s, i| swz[i] = switch (s) {
             g.RED => rgba[0],
@@ -1496,6 +1586,12 @@ pub const Context = struct {
             .wrap_s = wrapOf(p.wrap_s),
             .wrap_t = wrapOf(p.wrap_t),
             .linear = p.mag == g.LINEAR,
+            .min_linear = p.min == g.LINEAR or p.min == g.LINEAR_MIPMAP_NEAREST or p.min == g.LINEAR_MIPMAP_LINEAR,
+            .mip = mip,
+            .base = @intCast(base),
+            .last = @intCast(last),
+            .min_lod = @floatFromInt(p.min_lod),
+            .max_lod = @floatFromInt(p.max_lod),
         };
     }
 
