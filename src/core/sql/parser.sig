@@ -194,6 +194,29 @@ pub fn Parser(comptime config: types.Config) type {
             return id;
         }
 
+        /// An expression spanning exactly source[start..end] (a PL/pgSQL
+        /// expression or routine argument, B11 wave 3), parsed into the pool
+        /// without resetting it; spans stay absolute in `source`.
+        pub fn parseExpressionAt(source: []const u8, start: usize, end: usize, pool: *Ast.Pool) Error!u16 {
+            var self = Self{ .tokens = .{ .source = source[0..end], .position = start, .text_limit = config.text_bytes }, .pool = pool, .source = source[0..end], .mode = .standard };
+            try self.advance();
+            const id = try self.expression();
+            if (self.current.kind != .end) return error.Syntax;
+            return id;
+        }
+
+        pub const TypeAt = struct { spec: TypeSpec, end: usize };
+
+        /// A type name starting at `start` (routine argument and variable
+        /// declarations); returns it and the offset after it.
+        pub fn parseTypeAt(source: []const u8, start: usize, pool: *Ast.Pool) Error!TypeAt {
+            var self = Self{ .tokens = .{ .source = source, .position = start, .text_limit = config.text_bytes }, .pool = pool, .source = source, .mode = .standard };
+            try self.advance();
+            const spec = try self.typeName();
+            const end = if (self.current.kind == .end) source.len else self.current.start - self.current.prefix;
+            return .{ .spec = spec, .end = end };
+        }
+
         fn statement(self: *Self) Error!Ast.Statement {
             if (try self.takeWord("CREATE")) {
                 if (self.mode == .standard) if (try self.schemaObject()) |object| return object;

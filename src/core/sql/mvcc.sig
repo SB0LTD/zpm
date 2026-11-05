@@ -41,7 +41,9 @@ pub fn Mvcc(comptime config: types.Config) type {
         /// `alter_sequence`: ALTER SEQUENCE copied sequence slot `old` into
         /// slot `table` (same OID, new options/state).
         /// `create_schema` / `drop_schema`: schema slot `table`.
-        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate, alter_table, alter_sequence, create_schema, drop_schema };
+        /// `create_object` / `drop_object` (B11 wave 3): routine, trigger or
+        /// rule slot `table` of class `new` (routine_catalog.Class).
+        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_object, drop_object };
 
         /// `table` is the table slot (catalog relation, sequence slot);
         /// `old`/`new` are version indices.
@@ -230,6 +232,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                         if (db.oid_counter + types_first_oid == schema.oid + 1) db.oid_counter -= 1;
                     },
                     .drop_schema => db.schemas[entry.table].pending_drop = false,
+                    .create_object, .drop_object => db.undoObject(entry.kind == .create_object, entry.new, entry.table),
                 }
             }
             tx.write_len = start;
@@ -344,6 +347,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                         schema.pending_drop = false;
                         schema.dead_csn = csn;
                     },
+                    .create_object, .drop_object => db.stampObject(entry.kind == .create_object, entry.new, entry.table, csn),
                 }
             }
         }

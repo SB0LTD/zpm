@@ -50,6 +50,12 @@ pub const Session = struct {
     /// Session functions (current_setting, set_config, advisory locks,
     /// pg_notify, pg_backend_pid); set by the Database per statement.
     engine: ?*const SessionHook = null,
+    /// User function calls (B11 wave 3; set by the Database for each
+    /// statement); null rejects them (0A000).
+    routines: ?*const RoutineHook = null,
+    /// The routine frame (Exec's ExprFrame) that routine variables of a
+    /// statement run by a procedure or DO block read; null outside one.
+    routine_frame: ?*const anyopaque = null,
 
     pub fn checkpoint(self: *const Session) Error!void {
         if (self.control) |control| try control.checkpoint();
@@ -83,6 +89,14 @@ pub const SessionReply = struct { integer: i64 = 0, len: usize = 0, null_value: 
 pub const SessionHook = struct {
     ptr: *anyopaque,
     call: *const fn (ptr: *anyopaque, kind: SessionCall, a: []const u8, b: []const u8, x: i64, y: i64, flags: u8, out: []u8) Error!SessionReply,
+};
+
+/// A user function call: `routine` is the routine slot, `args` the
+/// evaluated argument cells (Values(config).Cell) and `out` receives the
+/// result cell. The Database runs the body (B11 wave 3).
+pub const RoutineHook = struct {
+    ptr: *anyopaque,
+    call: *const fn (ptr: *anyopaque, routine: usize, args: *const anyopaque, count: usize, out: *anyopaque) Error!void,
 };
 
 pub const default_session: Session = .{};

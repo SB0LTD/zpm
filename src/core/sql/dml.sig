@@ -145,6 +145,53 @@ pub fn Dml(comptime config: types.Config) type {
             return cells;
         }
 
+        // ---- rows with BEFORE triggers or rules (B11 wave 3) -------------
+
+        /// store() without the NOT NULL check, which PostgreSQL applies
+        /// after BEFORE ROW triggers (ExecConstraints).
+        pub fn storeRelaxed(column: *const V.Column, evaluated: V.Cell, session: *const value.Session) Error!V.Cell {
+            var relaxed = column.*;
+            relaxed.not_null = false;
+            return store(&relaxed, evaluated, session);
+        }
+
+        /// insertedRow up to the BEFORE ROW triggers: values and defaults
+        /// stored, NOT NULL, generated columns and CHECKs left to finishRow.
+        pub fn insertedRowDeferred(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16, derived: Derived) Error!E.Row {
+            var cells: E.Row = @splat(.null_value);
+            ctx.row = null;
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                if (column.default_kind == .generated) continue;
+                const evaluated: V.Cell = if (isDefault(ctx, values[index])) try defaultCell(ctx, table, derived, index) else try E.eval(ctx, values[index]);
+                cells[index] = try storeRelaxed(column, evaluated, ctx.session);
+            }
+            return cells;
+        }
+
+        /// updatedRow up to the BEFORE ROW triggers (see insertedRowDeferred).
+        pub fn updatedRowDeferred(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16, derived: Derived, old: *const E.Row) Error!E.Row {
+            var cells = old.*;
+            ctx.row = old;
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                if (values[index] == none or column.default_kind == .generated) continue;
+                const evaluated: V.Cell = if (isDefault(ctx, values[index])) try defaultCell(ctx, table, derived, index) else try E.eval(ctx, values[index]);
+                cells[index] = try storeRelaxed(column, evaluated, ctx.session);
+            }
+            ctx.row = old;
+            return cells;
+        }
+
+        /// After the BEFORE ROW triggers: NOT NULL, stored generated
+        /// columns, then CHECK constraints (PostgreSQL's order).
+        pub fn finishRow(ctx: *const E.Context, table: *const S.Table, derived: Derived, cells: *E.Row) Error!void {
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                if (column.default_kind == .generated) continue;
+                if (cells[index] == .null_value and column.not_null) return error.NotNullViolation;
+            }
+            try computeGenerated(ctx, table, derived, cells);
+            try checkConstraints(ctx, table, derived, cells);
+        }
+
         /// `taken` is the conflicting (newest committed or own) version.
         pub const KeyState = union(enum) { free, taken: u32, wait: u16 };
 

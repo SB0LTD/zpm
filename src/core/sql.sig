@@ -113,6 +113,8 @@ const deparse_module = @import("sql/deparse.sig");
 const range_eval_module = @import("sql/range_eval.sig");
 const session_module = @import("sql/session.sig");
 const ssi_module = @import("sql/ssi.sig");
+const routine_catalog = @import("sql/routine_catalog.sig");
+const routine_module = @import("sql/routine.sig");
 
 /// The canonical SQL tokenizer, also used by wire parameter binding.
 /// Source and token spans remain caller-owned; tokenization allocates nothing.
@@ -229,6 +231,8 @@ pub fn Database(comptime config: Config) type {
     const G = deparse_module.Deparse(config);
     const Sess = session_module.Sessions(config);
     const SSI = ssi_module.Ssi(config);
+    const RC = routine_catalog.Catalog(config);
+    const R = routine_module.Routines(config);
 
     return struct {
         const Self = @This();
@@ -716,7 +720,7 @@ pub fn Database(comptime config: Config) type {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
                 }
                 const context:B.Context=.{.source=expanded,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
-                    .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only};
+                    .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only,.routines=&db.objects};
                 const bound=try B.bind(&context,&parsed);
                 // Detached reads never mutate: no data-modifying WITH (B11).
                 if(self.workspace.plans.dml_len!=0) return error.UnsupportedStatement;
@@ -870,6 +874,23 @@ pub fn Database(comptime config: Config) type {
             show: *const fn (?*anyopaque, []const u8, []u8) ?usize,
             set: *const fn (?*anyopaque, []const u8, []const u8, bool, bool) Error!bool,
         };
+        // Routines, triggers and rules (B11 wave 3, routine_catalog.sig).
+        /// Function / procedure, trigger and rule versions.
+        objects: RC.Set = .{},
+        /// The running statement's routine context: its transaction slot,
+        /// snapshot and result, the frame its statements' variables read,
+        /// routine nesting depth (54001 beyond Config.routine_depth) and
+        /// expression / trigger nesting (no statement may run inside one).
+        routine_hook: value_module.RoutineHook = undefined,
+        routine_slot: u16 = 0,
+        routine_snap: Snapshot = .{ .csn = 0 },
+        routine_result: ?*Result = null,
+        routine_frame: ?*R.Frame = null,
+        routine_depth: usize = 0,
+        routine_nested: usize = 0,
+        /// Write-set index where the running statement's writes begin (its
+        /// AFTER ROW triggers read them); kept across a park.
+        statement_start: usize = 0,
 
         const BackingLayout = struct {
             offsets: [config.tables][9]usize,
@@ -1101,6 +1122,13 @@ pub fn Database(comptime config: Config) type {
                 schema.pending_drop = false;
             }
             self.seq_carried = source.seq_carried;
+            self.objects = source.objects;
+            self.routine_slot = 0;
+            self.routine_snap = .{ .csn = 0 };
+            self.routine_result = null;
+            self.routine_frame = null;
+            self.routine_depth = 0;
+            self.routine_nested = 0;
             // A logical copy has fresh session/execution state. In particular,
             // never copy caller-owned interrupt or sequence-hook pointers.
             self.sequence_session = null;
@@ -1508,7 +1536,9 @@ pub fn Database(comptime config: Config) type {
             if (comptime config.external_storage) if (self.workspace.query.refs.len == 0) return error.InvalidParameterValue;
             if (!self.active(slot)) return error.NoActiveTransaction;
             const tx = &self.txs[slot];
-            const parsed = P.parse(source, &self.workspace.nodes, options.mode) catch |err| {
+            // Routine statements (B11 wave 3) have their own grammar.
+            const routine = options.mode == .standard and R.classify(source) != null;
+            const parsed: A.Statement = if (routine) .{ .control = .commit } else P.parse(source, &self.workspace.nodes, options.mode) catch |err| {
                 if (options.@"resume") self.dropStatement(slot);
                 return legacy(options.mode, err);
             };
@@ -1552,7 +1582,10 @@ pub fn Database(comptime config: Config) type {
             defer tx.running_snap = null;
             const start = tx.subs[tx.sub_len - 1].write_start;
             self.statementHooks(slot, snap);
-            self.body(slot, source, &parsed, snap, result, options.mode) catch |err| {
+            self.routine_result = result;
+            self.statement_start = start;
+            const ran = if (routine) self.routineBody(slot, source, snap, result) else self.body(slot, source, &parsed, snap, result, options.mode);
+            ran catch |err| {
                 if (err == error.WouldBlock) {
                     tx.pin = snap;
                     return err;
@@ -1594,7 +1627,8 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn bindContext(self: *Self, source: []const u8, mode: ParseMode, snap: Snapshot) B.Context {
-            return .{ .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params };
+            return .{ .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
+                .routines = &self.objects, .variables = if (self.routine_frame) |frame| &frame.variables else null };
         }
 
         fn evalContext(self: *const Self, source: []const u8) E.Context {
@@ -1641,7 +1675,10 @@ pub fn Database(comptime config: Config) type {
                         self.workspace.query.pinned_cells = 0;
                         self.workspace.query.pinned_refs = 0;
                     }
-                    if (plans.dml_len != 0) try self.modifyingCtes(slot, source, snap);
+                    if (plans.dml_len != 0) {
+                        try self.modifyingCtes(slot, source, snap);
+                        try self.afterTriggers(slot, self.statement_start, null, snap);
+                    }
                     return X.runQuery(&self.tables, source, &self.workspace.nodes, plans, root, snap, result, &self.session, &self.workspace.query, self.txs[slot].write_len == 0);
                 },
                 else => {},
@@ -1676,19 +1713,38 @@ pub fn Database(comptime config: Config) type {
                     try self.lockTable(slot, insert.table, .row_exclusive);
                     if (insert.conflict.action != .none) try self.ssiRead(slot, insert.table);
                     try self.lockSources(slot);
-                    break :blk try self.insertRows(slot, source, insert, snap);
+                    // Rules and triggers (B11 wave 3).
+                    const upsert = insert.conflict.action == .update;
+                    if (insert.conflict.action != .none and (self.ruleKind(insert.table, '3', snap) != .none or self.ruleKind(insert.table, '2', snap) != .none)) return error.UnsupportedStatement;
+                    if (try self.insteadNothing(insert.table, '3', insert.returning.count != 0, snap)) break :blk 0;
+                    const events: []const u8 = if (upsert) &.{ routine_catalog.tg_insert, routine_catalog.tg_update } else &.{routine_catalog.tg_insert};
+                    try self.statementTriggers(insert.table, routine_catalog.tg_before, events, snap);
+                    const affected = try self.insertRows(slot, source, insert, snap);
+                    try self.afterTriggers(slot, self.statement_start, if (upsert) &insert.conflict.update.values else null, snap);
+                    try self.statementTriggers(insert.table, 0, events, snap);
+                    break :blk affected;
                 },
                 .update => |*update| blk: {
                     try self.lockTable(slot, update.table, .row_exclusive);
                     try self.ssiRead(slot, update.table);
                     try self.lockSources(slot);
-                    break :blk try self.updateRows(slot, source, update, snap);
+                    if (try self.insteadNothing(update.table, '2', update.returning.count != 0, snap)) break :blk 0;
+                    try self.statementTriggers(update.table, routine_catalog.tg_before, &.{routine_catalog.tg_update}, snap);
+                    const affected = try self.updateRows(slot, source, update, snap);
+                    try self.afterTriggers(slot, self.statement_start, &update.values, snap);
+                    try self.statementTriggers(update.table, 0, &.{routine_catalog.tg_update}, snap);
+                    break :blk affected;
                 },
                 .delete => |*delete| blk: {
                     try self.lockTable(slot, delete.table, .row_exclusive);
                     try self.ssiRead(slot, delete.table);
                     try self.lockSources(slot);
-                    break :blk try self.deleteRows(slot, source, delete, snap);
+                    if (try self.insteadNothing(delete.table, '4', delete.returning.count != 0, snap)) break :blk 0;
+                    try self.statementTriggers(delete.table, routine_catalog.tg_before, &.{routine_catalog.tg_delete}, snap);
+                    const affected = try self.deleteRows(slot, source, delete, snap);
+                    try self.afterTriggers(slot, self.statement_start, null, snap);
+                    try self.statementTriggers(delete.table, 0, &.{routine_catalog.tg_delete}, snap);
+                    break :blk affected;
                 },
                 .truncate => |*truncate| blk: {
                     try self.truncateTables(slot, truncate, snap);
@@ -1720,7 +1776,11 @@ pub fn Database(comptime config: Config) type {
                     try self.lockTable(slot, merge.table, .row_exclusive);
                     try self.ssiRead(slot, merge.table);
                     try self.lockSources(slot);
-                    break :blk try self.mergeRows(slot, source, merge, snap);
+                    // MERGE is not supported for relations with rules (0A000).
+                    if (self.anyRule(merge.table, snap)) return error.UnsupportedStatement;
+                    const affected = try self.mergeRows(slot, source, merge, snap);
+                    try self.afterTriggers(slot, self.statement_start, null, snap);
+                    break :blk affected;
                 },
                 .select, .query, .control => unreachable,
             };
@@ -1768,6 +1828,8 @@ pub fn Database(comptime config: Config) type {
                     .update => |*update| .{ update.table, &update.returning },
                     .delete => |*delete| .{ delete.table, &delete.returning },
                 };
+                // Rules are not supported for data-modifying WITH (0A000).
+                if (self.anyRule(table_index, snap)) return error.UnsupportedStatement;
                 self.runModifying(slot, source, dml, snap) catch |err| {
                     state.progress[k] = tx.progress;
                     state.affected[k] = tx.progress_affected;
@@ -1901,6 +1963,7 @@ pub fn Database(comptime config: Config) type {
                 schema.dead_csn = 0;
                 freed = true;
             };
+            if (self.objects.reclaim(at)) freed = true;
             if (freed) _ = self.catalog.vacuum(at);
         }
 
@@ -2361,6 +2424,7 @@ pub fn Database(comptime config: Config) type {
             const count = self.catalog.visibleRelations(snapshot, &relations);
             const public: i64 = catalog_module.public_namespace;
             switch (view) {
+                .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => return self.objectViewRows(snapshot, view, sink),
                 .pg_type => inline for (@typeInfo(DataType).@"enum".field_names) |field| {
                     const data_type = @field(DataType, field);
                     const info = types.typeInfo(data_type);
@@ -2871,6 +2935,8 @@ pub fn Database(comptime config: Config) type {
             const tx = &self.txs[slot];
             const table = &self.tables[index];
             if (table.pending_drop) return 0;
+            // Its triggers and rules go with it (B11 wave 3).
+            try self.dropTableObjects(slot, table.oid, snap);
             // Dependents (pg_depend): other tables' foreign keys, views that
             // read it and inheritance children / partitions. RESTRICT is
             // 2BP01; CASCADE drops the views and children and removes the
@@ -3175,14 +3241,22 @@ pub fn Database(comptime config: Config) type {
                 if (try self.locks.grantRow(table_index, table.rows[row].rowid, slot, .update)) |granted| try M.recordLock(self, slot, granted);
                 return 0;
             }
-            try self.updateOne(slot, ctx, update, row, goal, snap);
-            return 1;
+            return @intFromBool(try self.updateOne(slot, ctx, update, row, goal, snap));
         }
 
         fn insertOne(self: *Self, slot: u16, ctx: *E.Context, insert: *const B.Insert, values: *const [config.columns]u16, derived: D.Derived, snap: Snapshot) Error!usize {
-            const cells = try D.insertedRow(ctx, &self.tables[insert.table], values, derived);
+            // BEFORE ROW triggers and conditional rules see the row before
+            // NOT NULL, generated columns and CHECKs (B11 wave 3).
+            const hooked = self.insertHooks(insert.table, snap);
+            var cells = if (hooked) try D.insertedRowDeferred(ctx, &self.tables[insert.table], values, derived) else try D.insertedRow(ctx, &self.tables[insert.table], values, derived);
+            if (hooked and try self.ruleSkips(insert.table, '3', &cells, null, snap)) return 0;
             // A partitioned table routes the row to its partition.
             const table_index = try self.routeRow(slot, insert.table, &cells, snap);
+            if (hooked) {
+                if (!try self.beforeRow(table_index, routine_catalog.tg_insert, &cells, null, null, snap)) return 0;
+                try D.finishRow(ctx, &self.tables[insert.table], derived, &cells);
+                if (table_index != insert.table) try self.partitionBound(table_index, &cells, snap);
+            }
             const table = &self.tables[table_index];
             // ON CONFLICT: the arbiter is checked first (PostgreSQL's
             // speculative pre-check); other unique indexes still raise 23505.
@@ -4042,6 +4116,14 @@ pub fn Database(comptime config: Config) type {
             self.workspace.query.views = .{ .ptr = self, .rows = &viewRows };
             self.session_hook = .{ .ptr = self, .call = &sessionCall };
             self.session.engine = &self.session_hook;
+            self.routine_hook = .{ .ptr = self, .call = &routineHookCall };
+            self.session.routines = &self.routine_hook;
+            self.session.routine_frame = null;
+            self.routine_slot = slot;
+            self.routine_snap = snap;
+            self.routine_frame = null;
+            self.routine_depth = 0;
+            self.routine_nested = 0;
         }
 
         /// One COPY FROM data row: `fields[p]` is field p's text (null =
@@ -4227,9 +4309,10 @@ pub fn Database(comptime config: Config) type {
             switch (when.action) {
                 .update => {
                     const update: B.Update = .{ .table = merge.table, .values = when.values, .where = ast.none, .key = ast.none, .defaults = when.defaults, .generated = when.generated, .checks = merge.checks };
-                    try self.updateOne(slot, ctx, &update, row, goal, snap);
+                    if (!try self.updateOne(slot, ctx, &update, row, goal, snap)) return;
                 },
                 .delete => {
+                    if (self.rowHooks(merge.table, routine_catalog.tg_delete, '4', snap) and !try self.beforeRow(merge.table, routine_catalog.tg_delete, null, cells, null, snap)) return;
                     try self.referencedChange(slot, merge.table, cells, null, snap);
                     if (table.versions[goal].xmax.epoch == 0) {
                         try self.reserveWrites(slot, 1);
@@ -4316,14 +4399,21 @@ pub fn Database(comptime config: Config) type {
                 .ready => |newest| newest,
             };
             if (goal != version and !try self.keepJoined(ctx, update.where, joined, &table.versions[goal].cells)) return 0;
-            try self.updateOne(slot, ctx, update, row, goal, snap);
-            return 1;
+            return @intFromBool(try self.updateOne(slot, ctx, update, row, goal, snap));
         }
 
-        fn updateOne(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, row: u32, old: u32, snap: Snapshot) Error!void {
+        /// Returns false when a BEFORE ROW trigger or a rule skipped the row.
+        fn updateOne(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, row: u32, old: u32, snap: Snapshot) Error!bool {
             const tx = &self.txs[slot];
             const table = &self.tables[update.table];
-            const cells = try D.updatedRow(ctx, table, &update.values, .{ .defaults = &update.defaults, .generated = &update.generated, .checks = &update.checks }, &table.versions[old].cells);
+            const derived: D.Derived = .{ .defaults = &update.defaults, .generated = &update.generated, .checks = &update.checks };
+            const hooked = self.rowHooks(update.table, routine_catalog.tg_update, '2', snap);
+            var cells = if (hooked) try D.updatedRowDeferred(ctx, table, &update.values, derived, &table.versions[old].cells) else try D.updatedRow(ctx, table, &update.values, derived, &table.versions[old].cells);
+            if (hooked) {
+                if (try self.ruleSkips(update.table, '2', &cells, &table.versions[old].cells, snap)) return false;
+                if (!try self.beforeRow(update.table, routine_catalog.tg_update, &cells, &table.versions[old].cells, &update.values, snap)) return false;
+                try D.finishRow(ctx, table, derived, &cells);
+            }
             try self.partitionBound(update.table, &cells, snap);
             if (table.primary_column) |column| {
                 if (update.values[column] != ast.none) switch (D.keyCheck(table, &cells[column], row, snap)) {
@@ -4341,9 +4431,10 @@ pub fn Database(comptime config: Config) type {
             try self.checkReferences(slot, update.table, &cells, &table.versions[old].cells, snap);
             try self.referencedChange(slot, update.table, &table.versions[old].cells, &cells, snap);
             // A referential action of this statement may have replaced it.
-            if (table.versions[old].xmax.epoch != 0) return;
+            if (table.versions[old].xmax.epoch != 0) return true;
             _ = tx;
             try self.placeUpdate(slot, update.table, row, old, &cells, snap);
+            return true;
         }
 
         fn deleteRows(self: *Self, slot: u16, source: []const u8, delete: *const B.Delete, snap: Snapshot) Error!usize {
@@ -4378,6 +4469,10 @@ pub fn Database(comptime config: Config) type {
                 .ready => |newest| newest,
             };
             if (goal != version and !try self.keepJoined(ctx, delete.where, joined, &table.versions[goal].cells)) return 0;
+            if (self.rowHooks(delete.table, routine_catalog.tg_delete, '4', snap)) {
+                if (try self.ruleSkips(delete.table, '4', null, &table.versions[goal].cells, snap)) return 0;
+                if (!try self.beforeRow(delete.table, routine_catalog.tg_delete, null, &table.versions[goal].cells, null, snap)) return 0;
+            }
             try self.referencedChange(slot, delete.table, &table.versions[goal].cells, null, snap);
             // A self-referencing CASCADE of this statement already deleted it.
             if (table.versions[goal].xmax.epoch != 0) return 1;
@@ -4417,6 +4512,7 @@ pub fn Database(comptime config: Config) type {
                         try C.encodeAlter(writer, table, self.alters[entry.table].sources[0..table.column_count], self.alters[entry.table].fills[0..table.column_count]);
                     },
                     .catalog_insert, .catalog_delete => {},
+                    .create_object, .drop_object => try self.encodeObject(writer, entry.kind == .create_object, @enumFromInt(entry.new), entry.table),
                 }
             }
             // At most one log-ahead value per sequence: this transaction's
@@ -5331,6 +5427,1263 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
+        // ---- routines, triggers and rules (B11 wave 3) ------------------
+
+        const Interp = R.Interpreter(Self);
+        const tg = routine_catalog;
+
+        /// Statement-pool state a routine expression restores.
+        const PoolMark = struct { len: usize, query_len: usize, window_len: usize, complex: bool, discarded: bool, planned: bool };
+
+        fn poolMark(pool: *const A.Pool) PoolMark {
+            return .{ .len = pool.len, .query_len = pool.query_len, .window_len = pool.window_len, .complex = pool.complex, .discarded = pool.discarded_row_constants, .planned = pool.planned_nulls };
+        }
+
+        fn poolRestore(pool: *A.Pool, mark: PoolMark) void {
+            pool.len = mark.len;
+            pool.query_len = mark.query_len;
+            pool.window_len = mark.window_len;
+            pool.complex = mark.complex;
+            pool.discarded_row_constants = mark.discarded;
+            pool.planned_nulls = mark.planned;
+        }
+
+        /// Write-set and lock-list watermark of an EXCEPTION block.
+        pub const RoutineMark = struct { writes: usize, locks: usize };
+
+        pub fn routineCheckpoint(self: *Self) Error!void {
+            return self.session.checkpoint();
+        }
+
+        pub fn routineSession(self: *const Self) *const value_module.Session {
+            return &self.session;
+        }
+
+        pub fn routineType(self: *Self, source: []const u8, start: usize) Error!P.TypeAt {
+            return P.parseTypeAt(source, start, &self.workspace.nodes);
+        }
+
+        /// Syntax of a routine expression (CREATE FUNCTION / DO validation).
+        pub fn routineCheck(self: *Self, source: []const u8, start: usize, end: usize) Error!void {
+            const pool = &self.workspace.nodes;
+            const mark = poolMark(pool);
+            defer poolRestore(pool, mark);
+            _ = try P.parseExpressionAt(source, start, end, pool);
+        }
+
+        /// Syntax of a statement inside a routine body.
+        pub fn routineCheckStatement(self: *Self, text: []const u8) Error!void {
+            if (R.classify(text) != null) {
+                var routine: R.Statement = undefined;
+                return R.parse(text, &self.workspace.nodes, &routine);
+            }
+            if (self.routine_nested != 0) return error.UnsupportedStatement;
+            _ = try P.parse(text, &self.workspace.nodes, .standard);
+        }
+
+        /// Parses, binds (names read `frame`'s variables) and evaluates an
+        /// expression at the top of the statement pool, then restores it.
+        pub fn routineEvaluate(self: *Self, frame: *R.Frame, source: []const u8, start: usize, end: usize, goal: ?*const V.Column) Error!V.Cell {
+            const pool = &self.workspace.nodes;
+            const mark = poolMark(pool);
+            defer poolRestore(pool, mark);
+            const id = try P.parseExpressionAt(source, start, end, pool);
+            return self.routineValue(frame, source, id, mark.len, goal);
+        }
+
+        fn routineValue(self: *Self, frame: *R.Frame, source: []const u8, id: u16, low: usize, goal: ?*const V.Column) Error!V.Cell {
+            frame.variables.node_low = low;
+            frame.variables.node_high = self.workspace.nodes.len;
+            var context = self.bindContext(source, .standard, self.routine_snap);
+            context.plans = null;
+            context.variables = &frame.variables;
+            const bound = try B.bindRoutineExpression(&context, id, goal);
+            var ctx = self.evalContext(source);
+            ctx.frame = frame.evalFrame();
+            return E.eval(&ctx, bound);
+        }
+
+        /// `(left) = (right)` (simple CASE statement arms).
+        pub fn routineCompare(self: *Self, frame: *R.Frame, source: []const u8, left: R.Span, right: R.Span) Error!bool {
+            const pool = &self.workspace.nodes;
+            const mark = poolMark(pool);
+            defer poolRestore(pool, mark);
+            const a = try P.parseExpressionAt(source, left.start, left.end, pool);
+            const b = try P.parseExpressionAt(source, right.start, right.end, pool);
+            const id = try pool.add(.{ .kind = .binary, .op = .eq, .a = a, .b = b });
+            const column: V.Column = .{ .data_type = .boolean };
+            const cell = try self.routineValue(frame, source, id, mark.len, &column);
+            return cell == .boolean and cell.boolean;
+        }
+
+        pub fn routineMark(self: *Self) RoutineMark {
+            const tx = &self.txs[self.routine_slot];
+            return .{ .writes = tx.write_len, .locks = tx.lock_len };
+        }
+
+        /// An EXCEPTION handler caught an error: undo the block's writes.
+        pub fn routineRollback(self: *Self, mark: RoutineMark) void {
+            M.abortSlice(self, self.routine_slot, mark.writes, mark.locks);
+            self.wake_epoch +%= 1;
+        }
+
+        fn enterRoutine(self: *Self) Error!void {
+            if (self.routine_depth >= config.routine_depth) return error.StackDepthExceeded;
+            self.routine_depth += 1;
+        }
+
+        /// A statement of a procedure or DO block: a new command id and
+        /// snapshot (READ COMMITTED), its variables bound through `frame`.
+        /// Only routines started by CALL / DO run statements: inside an
+        /// expression or a trigger they are 0A000. Returns the rows it
+        /// processed; `capture` takes its first row (INTO).
+        pub fn routineStatement(self: *Self, frame: *R.Frame, text: []const u8, capture: ?*R.Capture) Error!usize {
+            if (self.routine_nested != 0) return error.UnsupportedStatement;
+            const slot = self.routine_slot;
+            const tx = &self.txs[slot];
+            tx.cid +%= 1;
+            tx.progress = 0;
+            tx.progress_affected = 0;
+            self.modifying[slot] = .{};
+            const snap: Snapshot = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
+            const start = tx.write_len;
+            const saved_snap = self.routine_snap;
+            const saved_frame = self.routine_frame;
+            const saved_shared = self.session.routine_frame;
+            const saved_start = self.statement_start;
+            const saved_sequences = self.seq_snap;
+            defer {
+                self.routine_snap = saved_snap;
+                self.routine_frame = saved_frame;
+                self.session.routine_frame = saved_shared;
+                self.statement_start = saved_start;
+                self.seq_snap = saved_sequences;
+            }
+            self.routine_snap = snap;
+            self.seq_snap = snap;
+            self.routine_frame = frame;
+            self.session.routine_frame = frame.evalFrame();
+            self.statement_start = start;
+            if (R.classify(text) != null) {
+                try self.routineBody(slot, text, snap, self.routine_result orelse return error.UnsupportedStatement);
+                return 0;
+            }
+            var parsed = try P.parse(text, &self.workspace.nodes, .standard);
+            frame.variables.node_low = 0;
+            frame.variables.node_high = self.workspace.nodes.len;
+            const rows = try self.subStatement(slot, text, &parsed, snap, capture);
+            try self.deferredCheck(slot, start, true);
+            return rows;
+        }
+
+        fn subStatement(self: *Self, slot: u16, text: []const u8, parsed: *A.Statement, snap: Snapshot, capture: ?*R.Capture) Error!usize {
+            if (parsed.* == .select) {
+                const top = parsed.select;
+                parsed.* = .{ .query = top };
+                self.workspace.nodes.complex = true;
+            }
+            if (parsed.* != .query) {
+                const result = self.routine_result orelse return error.UnsupportedStatement;
+                try self.body(slot, text, parsed, snap, result, .standard);
+                const outcome = self.outcome;
+                if (capture) |out| {
+                    const returned = &outcome.returning;
+                    out.rows = if (returned.count != 0) returned.rows else 0;
+                    out.count = returned.count;
+                    if (returned.count != 0 and returned.rows != 0) {
+                        for (0..returned.count) |column| {
+                            out.cells[column] = self.workspace.query.cells[returned.base + column];
+                            out.tys[column] = types.typeOfData(returned.types[column]);
+                        }
+                    }
+                }
+                return outcome.affected;
+            }
+            self.workspace.query.read_stats = .{};
+            try self.session.checkpoint();
+            const source = try expandRelations(self, &self.workspace, text, snap, parsed);
+            const context = self.bindContext(source, .standard, snap);
+            const bound = try B.bind(&context, parsed);
+            const root = switch (bound) {
+                .query => |root| root,
+                else => return error.UnsupportedStatement,
+            };
+            const plans = &self.workspace.plans;
+            for (plans.items[0..plans.len]) |*plan| {
+                for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| try self.lockTable(slot, table, .access_share);
+            }
+            defer {
+                self.workspace.query.pinned_cells = 0;
+                self.workspace.query.pinned_refs = 0;
+            }
+            if (plans.dml_len != 0) {
+                try self.modifyingCtes(slot, source, snap);
+                try self.afterTriggers(slot, self.statement_start, null, snap);
+            }
+            const work = &self.workspace.query;
+            const list = try X.queryRows(&self.tables, source, &self.workspace.nodes, plans, root, snap, &self.session, work);
+            if (capture) |out| {
+                const plan = &plans.items[root];
+                out.rows = list.count;
+                out.count = plan.count;
+                if (list.count != 0) {
+                    const row = X.rowAt(work, list, 0);
+                    for (0..plan.count) |column| {
+                        out.cells[column] = row[column];
+                        out.tys[column] = plan.tys[column];
+                    }
+                }
+            }
+            self.outcome = .{ .affected = 0, .command = .select };
+            return list.count;
+        }
+
+        /// CREATE / DROP FUNCTION, PROCEDURE, TRIGGER, RULE, CALL and DO.
+        fn routineBody(self: *Self, slot: u16, source: []const u8, snap: Snapshot, result: *Result) Error!void {
+            self.workspace.query.read_stats = .{};
+            try self.session.checkpoint();
+            var statement_value: R.Statement = undefined;
+            try R.parse(source, &self.workspace.nodes, &statement_value);
+            const kind: R.Kind = statement_value;
+            const saved_result = self.routine_result;
+            defer self.routine_result = saved_result;
+            self.routine_result = result;
+            switch (statement_value) {
+                .create_function, .create_procedure => |*definition| try self.createRoutine(slot, definition, snap),
+                .drop_function, .drop_procedure => |*drop| try self.dropRoutine(slot, drop, snap),
+                .call => |*call| try self.restartable(slot, snap, call, source),
+                .do_block => |*block| try self.restartable(slot, snap, block, source),
+                .create_trigger => |*definition| try self.createTrigger(slot, source, definition, snap),
+                .drop_trigger => |*drop| try self.dropTrigger(slot, drop, snap),
+                .create_rule => |*definition| try self.createRule(slot, source, definition, snap),
+                .drop_rule => |*drop| try self.dropRule(slot, drop, snap),
+            }
+            self.outcome = .{ .affected = 0, .command = R.command(kind), .noop = kind == .call or kind == .do_block };
+        }
+
+        /// CALL and DO. A statement inside that must wait for a lock undoes
+        /// the routine's writes and parks it; the re-delivered statement runs
+        /// the routine again from its start (docs/SQL_ROUTINES.md).
+        fn restartable(self: *Self, slot: u16, snap: Snapshot, routine: anytype, source: []const u8) Error!void {
+            const tx = &self.txs[slot];
+            const top = self.routine_nested == 0 and tx.sub_len != 0 and tx.subs[tx.sub_len - 1].statement;
+            const write_start = tx.write_len;
+            const lock_start = tx.lock_len;
+            const run = if (@TypeOf(routine.*) == R.Call) self.callProcedure(slot, source, routine, snap) else self.doBlock(routine);
+            run catch |err| {
+                if (err == error.WouldBlock and top and self.routine_depth == 0) {
+                    M.abortSlice(self, slot, write_start, lock_start);
+                    tx.fresh = true;
+                }
+                return err;
+            };
+        }
+
+        fn takeOid(self: *Self) Error!u32 {
+            if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
+            const oid = change_log.first_oid + self.oid_counter;
+            self.oid_counter += 1;
+            return oid;
+        }
+
+        fn objectSlot(self: *Self, class: tg.Class) Error!usize {
+            for (0..2) |attempt| {
+                switch (class) {
+                    .routine => for (&self.objects.routines, 0..) |*item, index| {
+                        if (!item.live) return index;
+                    },
+                    .trigger => for (&self.objects.triggers, 0..) |*item, index| {
+                        if (!item.live) return index;
+                    },
+                    .rule => for (&self.objects.rules, 0..) |*item, index| {
+                        if (!item.live) return index;
+                    },
+                }
+                if (attempt == 0) self.reclaimTables(self.horizon());
+            }
+            return error.TableCapacity;
+        }
+
+        /// Waits for another transaction's uncommitted CREATE / DROP.
+        fn waitObject(self: *Self, slot: u16, other: u16) Error {
+            const tx = &self.txs[slot];
+            var waits: L.Set = .{};
+            waits.add(other);
+            tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+            return self.park(slot, waits);
+        }
+
+        /// Marks object version `index` deleted by this statement.
+        fn dropObject(self: *Self, slot: u16, class: tg.Class, index: usize, snap: Snapshot) Error!void {
+            try self.reserveWrites(slot, 1);
+            const tx = &self.txs[slot];
+            const stamp = self.objects.stampOf(class, index);
+            stamp.xmax = tx.ref(slot);
+            stamp.xmax_cid = snap.cid;
+            stamp.xmax_csn = 0;
+            tx.push(.{ .kind = .drop_object, .table = @intCast(index), .new = @intFromEnum(class) }) catch unreachable;
+        }
+
+        fn createdObject(self: *Self, slot: u16, class: tg.Class, index: usize, snap: Snapshot) void {
+            const tx = &self.txs[slot];
+            self.objects.stampOf(class, index).* = .{ .xmin = tx.ref(slot), .xmin_cid = snap.cid };
+            self.objects.liveOf(class, index).* = true;
+            tx.push(.{ .kind = .create_object, .table = @intCast(index), .new = @intFromEnum(class) }) catch unreachable;
+        }
+
+        fn columnOfOid(oid: u32, typmod: i32) V.Column {
+            const data = types.typeFromOid(oid) orelse .text;
+            return .{ .data_type = data, .typmod = typmod };
+        }
+
+        fn typeOfOid(oid: u32) types.Type {
+            return types.typeOfData(types.typeFromOid(oid) orelse .text);
+        }
+
+        /// Parameters (and FOUND for PL/pgSQL) of a routine frame.
+        fn routineParameters(frame: *R.Frame, names: []const V.Name, oids: []const u32, typmods: []const i32, routine_name: V.Name, plpgsql: bool) Error!void {
+            for (names, oids, typmods) |*name, oid, typmod| _ = try frame.declare(name.slice(), typeOfOid(oid), typmod);
+            frame.variables.parameters = names.len;
+            frame.variables.routine_name = routine_name;
+            frame.variables.conflict_error = plpgsql;
+            if (plpgsql) {
+                frame.found = try frame.declare("found", .boolean, -1);
+                frame.cells[frame.found] = .{ .boolean = false };
+            }
+        }
+
+        /// CREATE [OR REPLACE] FUNCTION / PROCEDURE: validates the body
+        /// (SQL: every statement parsed, analyzable ones bound and the final
+        /// result checked; PL/pgSQL: syntax of every statement), then writes
+        /// a new version (the replaced one is marked deleted, same OID).
+        fn createRoutine(self: *Self, slot: u16, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
+            var oid_buffer: [config.routine_args]u32 = undefined;
+            const args = definition.argOids(&oid_buffer);
+            const namespace = catalog_module.public_namespace;
+            const name = definition.name.slice();
+            if (self.objects.routineWriter(namespace, name, args, snap)) |other| return self.waitObject(slot, other);
+            const existing = self.objects.findRoutine(namespace, name, args, snap);
+            const kind: u8 = if (definition.procedure) 'p' else 'f';
+            if (existing) |index| {
+                if (!definition.replace) return error.DuplicateFunction;
+                const old = &self.objects.routines[index];
+                if (old.kind != kind) return error.WrongObjectType;
+                if (old.return_oid != definition.return_oid or old.return_typmod != definition.return_typmod) return error.InvalidFunctionDefinition;
+                for (0..old.arg_count) |position| {
+                    if (!types.same(old.arg_names[position].slice(), definition.args[position].name.slice())) return error.InvalidFunctionDefinition;
+                }
+            }
+            if (definition.return_oid == tg.trigger_oid and (definition.language == 0 or definition.arg_count != 0)) return error.InvalidFunctionDefinition;
+            try self.validateRoutine(definition, snap);
+            try self.reserveWrites(slot, 2);
+            const index = try self.objectSlot(.routine);
+            const oid = if (existing) |old| self.objects.routines[old].oid else try self.takeOid();
+            if (existing) |old| try self.dropObject(slot, .routine, old, snap);
+            const item = &self.objects.routines[index];
+            item.* = .{ .oid = oid, .namespace = namespace, .name = definition.name, .kind = kind, .language = definition.language, .volatility = definition.volatility, .strict = definition.strict, .arg_count = definition.arg_count, .return_oid = definition.return_oid, .return_typmod = definition.return_typmod, .body = definition.body };
+            for (definition.args[0..definition.arg_count], 0..) |arg, position| {
+                item.arg_names[position] = arg.name;
+                item.arg_oids[position] = arg.oid;
+                item.arg_typmods[position] = arg.typmod;
+            }
+            self.createdObject(slot, .routine, index, snap);
+        }
+
+        fn validateRoutine(self: *Self, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
+            var frame: R.Frame = .{};
+            var names: [config.routine_args]V.Name = undefined;
+            var oids: [config.routine_args]u32 = undefined;
+            var typmods: [config.routine_args]i32 = undefined;
+            for (definition.args[0..definition.arg_count], 0..) |arg, position| {
+                names[position] = arg.name;
+                oids[position] = arg.oid;
+                typmods[position] = arg.typmod;
+            }
+            const count = definition.arg_count;
+            const plpgsql = definition.language == 1;
+            try routineParameters(&frame, names[0..count], oids[0..count], typmods[0..count], definition.name, plpgsql);
+            if (plpgsql) {
+                const purpose: R.Purpose = if (definition.procedure) .procedure else if (definition.return_oid == tg.trigger_oid) .trigger else .function;
+                if (purpose == .trigger) try triggerVariableNames(&frame);
+                var interpreter: Interp = .{ .host = self, .source = definition.body.slice(), .frame = &frame, .purpose = purpose, .void_result = definition.return_oid == tg.void_oid };
+                return interpreter.execute(.check);
+            }
+            return self.validateSql(definition, &frame, snap);
+        }
+
+        /// The statements of a SQL routine body (PostgreSQL's
+        /// check_function_bodies): analyzed until a utility statement.
+        fn validateSql(self: *Self, definition: *const R.CreateRoutine, frame: *R.Frame, snap: Snapshot) Error!void {
+            const text_body = definition.body.slice();
+            var statements: R.Statements = .{ .source = text_body };
+            var analyzable = true;
+            var final_type: ?types.Type = null;
+            var final_count: usize = 0;
+            var final_seen = false;
+            const saved_frame = self.routine_frame;
+            defer self.routine_frame = saved_frame;
+            while (try statements.next()) |span| {
+                const text = text_body[span.start..span.end];
+                final_seen = true;
+                final_type = null;
+                final_count = 0;
+                if (R.classify(text) != null) {
+                    var routine: R.Statement = undefined;
+                    try R.parse(text, &self.workspace.nodes, &routine);
+                    analyzable = false;
+                    continue;
+                }
+                var parsed = try P.parse(text, &self.workspace.nodes, .standard);
+                switch (parsed) {
+                    .control, .copy => return error.UnsupportedStatement,
+                    .select, .query, .insert, .update, .delete, .merge => {},
+                    else => {
+                        analyzable = false;
+                        continue;
+                    },
+                }
+                if (!analyzable) continue;
+                if (parsed == .select) {
+                    const top = parsed.select;
+                    parsed = .{ .query = top };
+                    self.workspace.nodes.complex = true;
+                }
+                frame.variables.node_low = 0;
+                frame.variables.node_high = self.workspace.nodes.len;
+                self.routine_frame = frame;
+                const source = try expandRelations(self, &self.workspace, text, snap, &parsed);
+                const context = self.bindContext(source, .standard, snap);
+                const bound = try B.bind(&context, &parsed);
+                self.routine_frame = saved_frame;
+                switch (bound) {
+                    .query => |root| {
+                        const plan = &self.workspace.plans.items[root];
+                        final_count = plan.count;
+                        if (plan.count != 0) final_type = plan.tys[0];
+                    },
+                    .insert => |*insert| if (insert.returning.count != 0) {
+                        final_count = insert.returning.count;
+                        final_type = types.typeOfData(insert.returning.types[0]);
+                    },
+                    .update => |*update| if (update.returning.count != 0) {
+                        final_count = update.returning.count;
+                        final_type = types.typeOfData(update.returning.types[0]);
+                    },
+                    .delete => |*delete| if (delete.returning.count != 0) {
+                        final_count = delete.returning.count;
+                        final_type = types.typeOfData(delete.returning.types[0]);
+                    },
+                    else => {},
+                }
+            }
+            if (definition.procedure or definition.return_oid == tg.void_oid) return;
+            if (!final_seen) return error.InvalidFunctionDefinition;
+            if (!analyzable) return;
+            // The final statement returns one column of the result type
+            // (an assignment-coercible one).
+            const result = final_type orelse return error.InvalidFunctionDefinition;
+            if (final_count != 1) return error.InvalidFunctionDefinition;
+            const wanted = typeOfOid(definition.return_oid);
+            if (result != wanted and result != .unknown and !value_module.castable(result, wanted, .assignment) and !(value_module.integral(result) and value_module.integral(wanted)))
+                return error.InvalidFunctionDefinition;
+        }
+
+        /// DROP FUNCTION / PROCEDURE: the routine with the given argument
+        /// types (or the only one of that name); triggers using a function
+        /// are 2BP01 unless CASCADE drops them.
+        fn dropRoutine(self: *Self, slot: u16, drop: *const R.DropRoutine, snap: Snapshot) Error!void {
+            const namespace = catalog_module.public_namespace;
+            const name = drop.name.slice();
+            var found: ?usize = null;
+            if (drop.has_args) {
+                if (self.objects.routineWriter(namespace, name, drop.args[0..drop.arg_count], snap)) |other| return self.waitObject(slot, other);
+                found = self.objects.findRoutine(namespace, name, drop.args[0..drop.arg_count], snap);
+            } else {
+                for (&self.objects.routines, 0..) |*item, index| {
+                    if (!item.live or item.namespace != namespace or !item.stamp.visible(snap) or !types.same(item.name.slice(), name)) continue;
+                    if (found != null) return error.AmbiguousFunction;
+                    found = index;
+                }
+                if (found) |index| if (self.objects.routines[index].stamp.deleterOther(snap)) |other| return self.waitObject(slot, other);
+            }
+            const index = found orelse {
+                if (drop.if_exists) return;
+                return error.UndefinedFunction;
+            };
+            const routine = &self.objects.routines[index];
+            if ((routine.kind == 'p') != drop.procedure) return error.WrongObjectType;
+            for (&self.objects.triggers, 0..) |*trigger, position| {
+                if (!trigger.live or trigger.function_oid != routine.oid or !trigger.stamp.visible(snap)) continue;
+                if (!drop.cascade) return error.DependentObjects;
+                try self.dropObject(slot, .trigger, position, snap);
+            }
+            try self.dropObject(slot, .routine, index, snap);
+        }
+
+        /// A routine argument value and its type (an untyped literal stays
+        /// unknown for the resolution and is read as text).
+        const Argument = struct { cell: V.Cell, ty: types.Type, unknown: bool };
+
+        fn evaluateArgument(self: *Self, source: []const u8, span: R.Span) Error!Argument {
+            const pool = &self.workspace.nodes;
+            const mark = poolMark(pool);
+            defer poolRestore(pool, mark);
+            const id = try P.parseExpressionAt(source, span.start, span.end, pool);
+            const kind = pool.nodes[id].kind;
+            const unknown = kind == .text_literal or kind == .null_literal;
+            var empty: R.Frame = .{};
+            const frame = self.routine_frame orelse &empty;
+            frame.variables.node_low = mark.len;
+            frame.variables.node_high = pool.len;
+            var context = self.bindContext(source, .standard, self.routine_snap);
+            context.plans = null;
+            context.variables = &frame.variables;
+            const bound = try B.bindRoutineExpression(&context, id, null);
+            var ctx = self.evalContext(source);
+            ctx.frame = frame.evalFrame();
+            const cell = try E.eval(&ctx, bound);
+            return .{ .cell = cell, .ty = pool.nodes[bound].ty, .unknown = unknown };
+        }
+
+        /// CALL: the visible procedure whose parameters accept the
+        /// arguments (42809 when only a function matches), then its body.
+        fn callProcedure(self: *Self, slot: u16, source: []const u8, call: *const R.Call, snap: Snapshot) Error!void {
+            _ = slot;
+            var args: [config.routine_args]Argument = undefined;
+            for (call.args[0..call.arg_count], 0..) |span, position| args[position] = try self.evaluateArgument(source, span);
+            const name = call.name.slice();
+            var best: ?usize = null;
+            var best_exact: usize = 0;
+            var ambiguous = false;
+            var function = false;
+            for (&self.objects.routines, 0..) |*routine, index| {
+                if (!routine.live or routine.namespace != catalog_module.public_namespace or !routine.stamp.visible(snap)) continue;
+                if (!types.same(routine.name.slice(), name) or routine.arg_count != call.arg_count) continue;
+                if (routine.kind != 'p') {
+                    function = true;
+                    continue;
+                }
+                var exact: usize = 0;
+                var accepted = true;
+                for (args[0..call.arg_count], routine.arg_oids[0..call.arg_count]) |arg, oid| {
+                    const to = typeOfOid(oid);
+                    if (arg.unknown) continue;
+                    if (arg.ty == to) {
+                        exact += 1;
+                    } else if (!value_module.castable(arg.ty, to, .implicit)) accepted = false;
+                }
+                if (!accepted) continue;
+                if (best == null or exact > best_exact) {
+                    best = index;
+                    best_exact = exact;
+                    ambiguous = false;
+                } else if (exact == best_exact) ambiguous = true;
+            }
+            const chosen = best orelse return if (function) error.WrongObjectType else error.UndefinedFunction;
+            if (ambiguous) return error.AmbiguousFunction;
+            const routine = &self.objects.routines[chosen];
+            var cells: [config.routine_args]V.Cell = undefined;
+            for (args[0..call.arg_count], 0..) |arg, position| {
+                const to = typeOfOid(routine.arg_oids[position]);
+                cells[position] = arg.cell;
+                if (arg.cell == .null_value) continue;
+                const from: types.Type = if (arg.unknown) .text else arg.ty;
+                if (from != to) cells[position] = try E.cast(arg.cell, from, to, routine.arg_typmods[position], &self.session);
+            }
+            try self.enterRoutine();
+            defer self.routine_depth -= 1;
+            var frame: R.Frame = .{};
+            try routineParameters(&frame, routine.arg_names[0..routine.arg_count], routine.arg_oids[0..routine.arg_count], routine.arg_typmods[0..routine.arg_count], routine.name, routine.language == 1);
+            for (cells[0..call.arg_count], 0..) |cell, position| frame.cells[position] = cell;
+            const text_body = routine.body.slice();
+            if (routine.language == 1) {
+                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .procedure, .void_result = true };
+                return interpreter.execute(.run);
+            }
+            var statements: R.Statements = .{ .source = text_body };
+            while (try statements.next()) |span| {
+                try self.session.checkpoint();
+                _ = try self.routineStatement(&frame, text_body[span.start..span.end], null);
+            }
+        }
+
+        /// DO: the whole block is checked first, then run.
+        fn doBlock(self: *Self, block: *const R.DoBlock) Error!void {
+            try self.enterRoutine();
+            defer self.routine_depth -= 1;
+            var frame: R.Frame = .{};
+            try routineParameters(&frame, &.{}, &.{}, &.{}, .{}, true);
+            var checker: Interp = .{ .host = self, .source = block.body.slice(), .frame = &frame, .purpose = .do_block, .void_result = true };
+            try checker.execute(.check);
+            var interpreter: Interp = .{ .host = self, .source = block.body.slice(), .frame = &frame, .purpose = .do_block, .void_result = true };
+            return interpreter.execute(.run);
+        }
+
+        /// A user function called from an expression (Session.routines):
+        /// STRICT gives NULL for a NULL argument; a SQL body is one SELECT
+        /// of one expression without FROM (others are 0A000); PL/pgSQL runs
+        /// without statements of its own.
+        fn routineHookCall(ptr: *anyopaque, index: usize, args_ptr: *const anyopaque, count: usize, out_ptr: *anyopaque) Error!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const args: [*]const V.Cell = @ptrCast(@alignCast(args_ptr));
+            const out: *V.Cell = @ptrCast(@alignCast(out_ptr));
+            if (index >= config.routines) return error.UndefinedFunction;
+            const routine = &self.objects.routines[index];
+            if (routine.strict) for (args[0..count]) |*cell| {
+                if (cell.* == .null_value) {
+                    out.* = .null_value;
+                    return;
+                }
+            };
+            try self.enterRoutine();
+            defer self.routine_depth -= 1;
+            self.routine_nested += 1;
+            defer self.routine_nested -= 1;
+            var frame: R.Frame = .{};
+            try routineParameters(&frame, routine.arg_names[0..routine.arg_count], routine.arg_oids[0..routine.arg_count], routine.arg_typmods[0..routine.arg_count], routine.name, routine.language == 1);
+            for (args[0..count], 0..) |cell, position| frame.cells[position] = cell;
+            const result_column = columnOfOid(routine.return_oid, routine.return_typmod);
+            const text_body = routine.body.slice();
+            if (routine.language == 1) {
+                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column };
+                try interpreter.execute(.run);
+                out.* = interpreter.result;
+                return;
+            }
+            var statements: R.Statements = .{ .source = text_body };
+            const span = (try statements.next()) orelse return error.UnsupportedStatement;
+            if ((try statements.next()) != null) return error.UnsupportedStatement;
+            const pool = &self.workspace.nodes;
+            const mark = poolMark(pool);
+            defer poolRestore(pool, mark);
+            const query_index = P.parseQueryAt(text_body, span.start, span.end, pool) catch return error.UnsupportedStatement;
+            const q = &pool.queries[query_index];
+            if (q.count != 1 or q.targets[0].star or q.item_count != 0 or q.from != null or q.where != ast.none or q.group_count != 0 or
+                q.having != ast.none or q.order_count != 0 or q.limit_present or q.offset_present or q.set_op != .none or q.cte_count != 0 or
+                q.distinct or q.values != ast.none or q.window_defs != ast.none or q.grouping_sets != ast.none) return error.UnsupportedStatement;
+            const value = try self.routineValue(&frame, text_body, q.targets[0].expr, mark.len, &result_column);
+            out.* = try D.store(&result_column, value, &self.session);
+        }
+
+        // ---- triggers -------------------------------------------------------
+
+        const tg_names = [_][]const u8{ "tg_name", "tg_when", "tg_level", "tg_op", "tg_relid", "tg_relname", "tg_table_name", "tg_table_schema", "tg_nargs" };
+        const tg_types = [_]types.Type{ .name, .text, .text, .text, .oid, .name, .name, .name, .int4 };
+
+        /// FOUND is declared already; the TG_* variables follow it.
+        fn triggerVariableNames(frame: *R.Frame) Error!void {
+            for (tg_names, tg_types) |name, ty| _ = try frame.declare(name, ty, -1);
+        }
+
+        fn textValue(bytes: []const u8) V.Cell {
+            var text: V.Text = .{};
+            const length = @min(bytes.len, config.text_bytes);
+            @memcpy(text.bytes[0..length], bytes[0..length]);
+            text.len = length;
+            return .{ .text = text };
+        }
+
+        /// Triggers of table `index` and of the partitioned tables above it
+        /// (their triggers are cloned onto partitions), in name order.
+        fn rowTriggerList(self: *const Self, index: usize, snap: Snapshot, out: *[config.triggers]u8) usize {
+            var count = self.objects.tableTriggers(self.tables[index].oid, snap, out);
+            var current = index;
+            var guard: usize = 0;
+            while (guard < config.tables) : (guard += 1) {
+                const table = &self.tables[current];
+                if (table.parent == 0 or table.partition.bound == .none) break;
+                const parent = self.visibleTableSlot(table.parent, snap) orelse break;
+                var more: [config.triggers]u8 = undefined;
+                const extra = self.objects.tableTriggers(self.tables[parent].oid, snap, &more);
+                for (more[0..extra]) |trigger| {
+                    if (count == out.len) break;
+                    var at = count;
+                    while (at > 0 and types.bytesOrder(self.objects.triggers[out[at - 1]].name.slice(), self.objects.triggers[trigger].name.slice()) > 0) : (at -= 1) out[at] = out[at - 1];
+                    out[at] = trigger;
+                    count += 1;
+                }
+                current = parent;
+            }
+            return count;
+        }
+
+        fn triggerMatches(trigger: *const RC.Trigger, timing: u8, row: bool, event: u8) bool {
+            const kind = trigger.tgtype;
+            if ((kind & tg.tg_row != 0) != row) return false;
+            if (kind & event == 0) return false;
+            return kind & (tg.tg_before | tg.tg_instead) == timing;
+        }
+
+        fn sameCell(a: *const V.Cell, b: *const V.Cell) bool {
+            if (a.* == .null_value or b.* == .null_value) return a.* == .null_value and b.* == .null_value;
+            if (@as(V.CellTag, a.*) != @as(V.CellTag, b.*)) return false;
+            return V.compare(a, b) == 0;
+        }
+
+        /// UPDATE OF columns: one of them is a SET target (or, without the
+        /// statement's SET list, changed its value).
+        fn updateOfFires(trigger: *const RC.Trigger, event: u8, assigned: ?*const [config.columns]u16, new: ?*const E.Row, old: ?*const E.Row) bool {
+            if (event != tg.tg_update or trigger.column_count == 0) return true;
+            for (trigger.columns[0..trigger.column_count]) |column| {
+                if (assigned) |set| {
+                    if (set[column] != ast.none) return true;
+                } else if (new != null and old != null and !sameCell(&new.?[column], &old.?[column])) return true;
+            }
+            return false;
+        }
+
+        fn triggerWhen(self: *Self, trigger: *const RC.Trigger, table_index: usize, new: ?*E.Row, old: ?*E.Row) Error!bool {
+            if (trigger.when.len == 0) return true;
+            var frame: R.Frame = .{};
+            frame.variables.record_table = &self.tables[table_index];
+            frame.new = new;
+            frame.old = old;
+            const column: V.Column = .{ .data_type = .boolean };
+            const text = trigger.when.slice();
+            const cell = try self.routineEvaluate(&frame, text, 0, text.len, &column);
+            return cell == .boolean and cell.boolean;
+        }
+
+        /// Runs a trigger's function (PL/pgSQL, no statements of its own)
+        /// with NEW / OLD and the TG_* variables; returns what it RETURNed.
+        fn callTrigger(self: *Self, trigger: *const RC.Trigger, table_index: usize, timing: u8, row: bool, event: u8, new: ?*E.Row, old: ?*E.Row, snap: Snapshot) Error!R.Record {
+            const function = self.objects.routineByOid(trigger.function_oid, snap) orelse return error.UndefinedFunction;
+            const routine = &self.objects.routines[function];
+            if (routine.language != 1 or routine.return_oid != tg.trigger_oid) return error.UnsupportedStatement;
+            try self.enterRoutine();
+            defer self.routine_depth -= 1;
+            self.routine_nested += 1;
+            defer self.routine_nested -= 1;
+            var frame: R.Frame = .{};
+            try routineParameters(&frame, &.{}, &.{}, &.{}, routine.name, true);
+            try triggerVariableNames(&frame);
+            const table = &self.tables[table_index];
+            frame.variables.record_table = table;
+            frame.new = new;
+            frame.old = old;
+            const first = frame.found + 1;
+            frame.cells[first] = textValue(trigger.name.slice());
+            frame.cells[first + 1] = textValue(if (timing == tg.tg_before) "BEFORE" else if (timing == tg.tg_instead) "INSTEAD OF" else "AFTER");
+            frame.cells[first + 2] = textValue(if (row) "ROW" else "STATEMENT");
+            frame.cells[first + 3] = textValue(switch (event) {
+                tg.tg_insert => "INSERT",
+                tg.tg_update => "UPDATE",
+                tg.tg_delete => "DELETE",
+                else => "TRUNCATE",
+            });
+            frame.cells[first + 4] = .{ .integer = table.oid };
+            frame.cells[first + 5] = textValue(table.name.slice());
+            frame.cells[first + 6] = textValue(table.name.slice());
+            frame.cells[first + 7] = textValue(self.namespaceName(table.namespace));
+            frame.cells[first + 8] = .{ .integer = @intCast(trigger.nargs) };
+            var interpreter: Interp = .{ .host = self, .source = routine.body.slice(), .frame = &frame, .purpose = .trigger };
+            try interpreter.execute(.run);
+            return interpreter.record;
+        }
+
+        fn anyTrigger(self: *const Self, timing: u8, row: bool, event: u8, snap: Snapshot) bool {
+            for (&self.objects.triggers) |*trigger| {
+                if (trigger.live and trigger.stamp.visible(snap) and triggerMatches(trigger, timing, row, event)) return true;
+            }
+            return false;
+        }
+
+        /// BEFORE ROW triggers of a row: NEW changes in place; false when a
+        /// trigger returned NULL (the row is skipped).
+        fn beforeRow(self: *Self, table_index: usize, event: u8, new: ?*E.Row, old: ?*const E.Row, assigned: ?*const [config.columns]u16, snap: Snapshot) Error!bool {
+            var list: [config.triggers]u8 = undefined;
+            const count = self.rowTriggerList(table_index, snap, &list);
+            for (list[0..count]) |position| {
+                const trigger = &self.objects.triggers[position];
+                if (!triggerMatches(trigger, tg.tg_before, true, event)) continue;
+                if (!updateOfFires(trigger, event, assigned, new, old)) continue;
+                var old_copy: E.Row = undefined;
+                if (old) |row| old_copy = row.*;
+                const old_row: ?*E.Row = if (old != null) &old_copy else null;
+                if (!try self.triggerWhen(trigger, table_index, new, old_row)) continue;
+                switch (try self.callTrigger(trigger, table_index, tg.tg_before, true, event, new, old_row, snap)) {
+                    .new => if (new == null) return false,
+                    .old => {
+                        const row = old_row orelse return false;
+                        if (new) |target_row| target_row.* = row.*;
+                    },
+                    .null_row, .none => return false,
+                }
+            }
+            return true;
+        }
+
+        /// Statement-level triggers of the named table for each event.
+        fn statementTriggers(self: *Self, table_index: usize, timing: u8, events: []const u8, snap: Snapshot) Error!void {
+            var list: [config.triggers]u8 = undefined;
+            const count = self.objects.tableTriggers(self.tables[table_index].oid, snap, &list);
+            if (count == 0) return;
+            for (events) |event| for (list[0..count]) |position| {
+                const trigger = &self.objects.triggers[position];
+                if (!triggerMatches(trigger, timing, false, event)) continue;
+                if (!try self.triggerWhen(trigger, table_index, null, null)) continue;
+                _ = try self.callTrigger(trigger, table_index, timing, false, event, null, null, snap);
+            };
+        }
+
+        /// AFTER ROW triggers of every row the statement wrote since
+        /// `start`, in write order (PostgreSQL's after-trigger queue fires
+        /// at statement end). `assigned`: the statement's SET list for
+        /// UPDATE OF on its own target.
+        fn afterTriggers(self: *Self, slot: u16, start: usize, assigned: ?*const [config.columns]u16, snap: Snapshot) Error!void {
+            if (!self.anyTrigger(0, true, tg.tg_insert, snap) and !self.anyTrigger(0, true, tg.tg_update, snap) and !self.anyTrigger(0, true, tg.tg_delete, snap)) return;
+            const tx = &self.txs[slot];
+            var index = start;
+            while (index < tx.write_len) : (index += 1) {
+                const entry = tx.writes[index];
+                const event: u8 = switch (entry.kind) {
+                    .insert => tg.tg_insert,
+                    .update => tg.tg_update,
+                    .delete => tg.tg_delete,
+                    else => continue,
+                };
+                var list: [config.triggers]u8 = undefined;
+                const count = self.rowTriggerList(entry.table, snap, &list);
+                if (count == 0) continue;
+                const table = &self.tables[entry.table];
+                var new_row: E.Row = undefined;
+                var old_row: E.Row = undefined;
+                if (entry.kind != .delete) new_row = table.versions[entry.new].cells;
+                if (entry.kind != .insert) old_row = table.versions[entry.old].cells;
+                const new: ?*E.Row = if (entry.kind != .delete) &new_row else null;
+                const old: ?*E.Row = if (entry.kind != .insert) &old_row else null;
+                for (list[0..count]) |position| {
+                    try self.session.checkpoint();
+                    const trigger = &self.objects.triggers[position];
+                    if (!triggerMatches(trigger, 0, true, event)) continue;
+                    if (!updateOfFires(trigger, event, assigned, new, old)) continue;
+                    if (!try self.triggerWhen(trigger, entry.table, new, old)) continue;
+                    _ = try self.callTrigger(trigger, entry.table, 0, true, event, new, old, snap);
+                }
+            }
+        }
+
+        fn insertHooks(self: *const Self, table_index: usize, snap: Snapshot) bool {
+            return self.anyTrigger(tg.tg_before, true, tg.tg_insert, snap) or self.ruleKind(table_index, '3', snap) == .conditional;
+        }
+
+        fn rowHooks(self: *const Self, table_index: usize, event: u8, rule_event: u8, snap: Snapshot) bool {
+            var list: [config.triggers]u8 = undefined;
+            const count = self.rowTriggerList(table_index, snap, &list);
+            for (list[0..count]) |position| {
+                if (triggerMatches(&self.objects.triggers[position], tg.tg_before, true, event)) return true;
+            }
+            return self.ruleKind(table_index, rule_event, snap) == .conditional;
+        }
+
+        /// CREATE [OR REPLACE] TRIGGER (AccessExclusive on the table; the
+        /// function must exist, take no arguments and return trigger).
+        fn createTrigger(self: *Self, slot: u16, source: []const u8, definition: *const R.CreateTrigger, snap: Snapshot) Error!void {
+            const table_index = try self.namedTable(&definition.table, snap);
+            try self.lockTable(slot, table_index, .access_exclusive);
+            const table = &self.tables[table_index];
+            const kind = definition.tgtype;
+            const row = kind & tg.tg_row != 0;
+            // INSTEAD OF triggers (views) are outside the subset.
+            if (kind & tg.tg_instead != 0) return error.UnsupportedStatement;
+            if (table.relkind == 'm' or table.relkind == 'S') return error.WrongObjectType;
+            if (table.relkind == 'v' and row) return error.WrongObjectType;
+            if (kind & tg.tg_truncate != 0 and row) return error.UnsupportedStatement;
+            var columns: [config.columns]u8 = undefined;
+            for (definition.columns[0..definition.column_count], 0..) |*column_name, position| {
+                var found: ?usize = null;
+                for (table.columns[0..table.column_count], 0..) |*column, index| {
+                    if (types.same(column.name.slice(), column_name.slice())) found = index;
+                }
+                columns[position] = @intCast(found orelse return error.ColumnNotFound);
+            }
+            var function: ?usize = null;
+            for (&self.objects.routines, 0..) |*routine, index| {
+                if (!routine.live or !routine.stamp.visible(snap) or routine.arg_count != 0 or routine.namespace != catalog_module.public_namespace) continue;
+                if (types.same(routine.name.slice(), definition.function.slice())) function = index;
+            }
+            const routine_index = function orelse return error.UndefinedFunction;
+            const routine = &self.objects.routines[routine_index];
+            if (routine.return_oid != tg.trigger_oid or routine.kind != 'f') return error.InvalidObjectDefinition;
+            const when = source[definition.when.start..definition.when.end];
+            if (when.len > config.routine_bytes) return error.TextCapacity;
+            if (when.len != 0) try self.validateRecordCondition(table_index, when, kind, row, true);
+            if (self.objects.triggerWriter(table.oid, definition.name.slice(), snap)) |other| return self.waitObject(slot, other);
+            const existing = self.objects.findTrigger(table.oid, definition.name.slice(), snap);
+            if (existing != null and !definition.replace) return error.DuplicateObject;
+            try self.reserveWrites(slot, 2);
+            const index = try self.objectSlot(.trigger);
+            const oid = try self.takeOid();
+            if (existing) |old| try self.dropObject(slot, .trigger, old, snap);
+            const item = &self.objects.triggers[index];
+            item.* = .{ .oid = oid, .name = definition.name, .table_oid = table.oid, .function_oid = routine.oid, .tgtype = kind, .column_count = definition.column_count, .nargs = definition.nargs, .args_len = definition.args_len };
+            @memcpy(item.columns[0..definition.column_count], columns[0..definition.column_count]);
+            @memcpy(item.args[0..definition.args_len], definition.args[0..definition.args_len]);
+            try item.when.set(when);
+            self.createdObject(slot, .trigger, index, snap);
+        }
+
+        /// A trigger WHEN or rule WHERE condition: binds over NEW / OLD;
+        /// statement-level conditions cannot read them, INSERT not OLD and
+        /// DELETE not NEW (42P17); subqueries are 0A000.
+        fn validateRecordCondition(self: *Self, table_index: usize, text: []const u8, events: u8, row: bool, trigger: bool) Error!void {
+            const pool = &self.workspace.nodes;
+            const mark = poolMark(pool);
+            defer poolRestore(pool, mark);
+            const id = try P.parseExpressionAt(text, 0, text.len, pool);
+            var frame: R.Frame = .{};
+            frame.variables.record_table = &self.tables[table_index];
+            frame.variables.node_low = mark.len;
+            frame.variables.node_high = pool.len;
+            var context = self.bindContext(text, .standard, self.routine_snap);
+            context.plans = null;
+            context.variables = &frame.variables;
+            const column: V.Column = .{ .data_type = .boolean };
+            _ = try B.bindRoutineExpression(&context, id, &column);
+            var uses_new = false;
+            var uses_old = false;
+            for (pool.nodes[mark.len..pool.len]) |*n| {
+                if (n.kind != .function or n.func != .routine_param) continue;
+                if (n.relation == 1) uses_new = true;
+                if (n.relation == 2) uses_old = true;
+            }
+            if (!row and (uses_new or uses_old)) return error.InvalidObjectDefinition;
+            const inserts = if (trigger) events & tg.tg_insert != 0 else events == '3';
+            const deletes = if (trigger) events & tg.tg_delete != 0 else events == '4';
+            if (inserts and uses_old) return error.InvalidObjectDefinition;
+            if (deletes and uses_new) return error.InvalidObjectDefinition;
+        }
+
+        /// A table or view named by a trigger / rule statement.
+        fn namedTable(self: *Self, name: *const R.TableName, snap: Snapshot) Error!usize {
+            const namespace = namespaceFor(&self.catalog, if (name.schema.len != 0) name.schema.slice() else null, snap) orelse return error.UndefinedSchema;
+            const found = self.catalog.findIn(namespace, name.name.slice(), snap) orelse return error.TableNotFound;
+            if (found.kind == 'S') return error.WrongObjectType;
+            return found.slot;
+        }
+
+        fn dropTrigger(self: *Self, slot: u16, drop: *const R.DropObject, snap: Snapshot) Error!void {
+            const table_index = self.namedTable(&drop.table, snap) catch |err| {
+                if (drop.if_exists and err == error.TableNotFound) return;
+                return err;
+            };
+            try self.lockTable(slot, table_index, .access_exclusive);
+            const oid = self.tables[table_index].oid;
+            if (self.objects.triggerWriter(oid, drop.name.slice(), snap)) |other| return self.waitObject(slot, other);
+            const index = self.objects.findTrigger(oid, drop.name.slice(), snap) orelse {
+                if (drop.if_exists) return;
+                return error.UndefinedObject;
+            };
+            try self.dropObject(slot, .trigger, index, snap);
+        }
+
+        // ---- rules ------------------------------------------------------------
+
+        const RuleKind = enum { none, conditional, everything };
+
+        /// The INSTEAD NOTHING rules of a table for one event: none, some
+        /// with a qualification (rows matching it are skipped), or an
+        /// unconditional one (the statement does nothing).
+        fn ruleKind(self: *const Self, table_index: usize, event: u8, snap: Snapshot) RuleKind {
+            var list: [config.rules]u8 = undefined;
+            const count = self.objects.tableRules(self.tables[table_index].oid, event, snap, &list);
+            var out: RuleKind = .none;
+            for (list[0..count]) |position| {
+                const rule = &self.objects.rules[position];
+                if (!rule.instead) continue;
+                if (rule.where.len == 0) return .everything;
+                out = .conditional;
+            }
+            return out;
+        }
+
+        fn anyRule(self: *const Self, table_index: usize, snap: Snapshot) bool {
+            for ([_]u8{ '2', '3', '4' }) |event| {
+                var list: [config.rules]u8 = undefined;
+                if (self.objects.tableRules(self.tables[table_index].oid, event, snap, &list) != 0) return true;
+            }
+            return false;
+        }
+
+        /// A conditional INSTEAD NOTHING rule whose qualification is TRUE
+        /// for this row (PostgreSQL adds `qual IS NOT TRUE` to the query).
+        fn ruleSkips(self: *Self, table_index: usize, event: u8, new: ?*E.Row, old: ?*const E.Row, snap: Snapshot) Error!bool {
+            var list: [config.rules]u8 = undefined;
+            const count = self.objects.tableRules(self.tables[table_index].oid, event, snap, &list);
+            for (list[0..count]) |position| {
+                const rule = &self.objects.rules[position];
+                if (!rule.instead or rule.where.len == 0) continue;
+                var frame: R.Frame = .{};
+                var old_copy: E.Row = undefined;
+                if (old) |row| old_copy = row.*;
+                frame.variables.record_table = &self.tables[table_index];
+                frame.new = new;
+                frame.old = if (old != null) &old_copy else null;
+                const column: V.Column = .{ .data_type = .boolean };
+                const text = rule.where.slice();
+                const cell = try self.routineEvaluate(&frame, text, 0, text.len, &column);
+                if (cell == .boolean and cell.boolean) return true;
+            }
+            return false;
+        }
+
+        /// A data-modifying statement's rules before it runs: true when an
+        /// unconditional INSTEAD NOTHING rule replaces it with nothing.
+        fn insteadNothing(self: *const Self, table_index: usize, event: u8, returning: bool, snap: Snapshot) Error!bool {
+            const kind = self.ruleKind(table_index, event, snap);
+            if (kind == .none) return false;
+            // INSTEAD rules need their own RETURNING (0A000 in PostgreSQL).
+            if (returning) return error.UnsupportedStatement;
+            return kind == .everything;
+        }
+
+        /// CREATE [OR REPLACE] RULE ... DO [ALSO | INSTEAD] NOTHING
+        /// (AccessExclusive on the table, as PostgreSQL).
+        fn createRule(self: *Self, slot: u16, source: []const u8, definition: *const R.CreateRule, snap: Snapshot) Error!void {
+            const table_index = try self.namedTable(&definition.table, snap);
+            try self.lockTable(slot, table_index, .access_exclusive);
+            const table = &self.tables[table_index];
+            // Rules on views and materialized views are outside the subset.
+            if (table.relkind != 'r' and table.relkind != 'p') return error.UnsupportedStatement;
+            const where = source[definition.where.start..definition.where.end];
+            if (where.len > config.routine_bytes) return error.TextCapacity;
+            if (where.len != 0) try self.validateRecordCondition(table_index, where, definition.event, true, false);
+            if (self.objects.ruleWriter(table.oid, definition.name.slice(), snap)) |other| return self.waitObject(slot, other);
+            const existing = self.objects.findRule(table.oid, definition.name.slice(), snap);
+            if (existing != null and !definition.replace) return error.DuplicateObject;
+            try self.reserveWrites(slot, 2);
+            const index = try self.objectSlot(.rule);
+            const oid = if (existing) |old| self.objects.rules[old].oid else try self.takeOid();
+            if (existing) |old| try self.dropObject(slot, .rule, old, snap);
+            const item = &self.objects.rules[index];
+            item.* = .{ .oid = oid, .name = definition.name, .table_oid = table.oid, .event = definition.event, .instead = definition.instead };
+            try item.where.set(where);
+            self.createdObject(slot, .rule, index, snap);
+        }
+
+        fn dropRule(self: *Self, slot: u16, drop: *const R.DropObject, snap: Snapshot) Error!void {
+            const table_index = self.namedTable(&drop.table, snap) catch |err| {
+                if (drop.if_exists and err == error.TableNotFound) return;
+                return err;
+            };
+            try self.lockTable(slot, table_index, .access_exclusive);
+            const oid = self.tables[table_index].oid;
+            if (self.objects.ruleWriter(oid, drop.name.slice(), snap)) |other| return self.waitObject(slot, other);
+            const index = self.objects.findRule(oid, drop.name.slice(), snap) orelse {
+                if (drop.if_exists) return;
+                return error.UndefinedObject;
+            };
+            try self.dropObject(slot, .rule, index, snap);
+        }
+
+        /// DROP TABLE takes the table's triggers and rules along (their
+        /// drops are encoded before the table's).
+        fn dropTableObjects(self: *Self, slot: u16, oid: u32, snap: Snapshot) Error!void {
+            for (&self.objects.triggers, 0..) |*trigger, index| {
+                if (!trigger.live or trigger.table_oid != oid or !trigger.stamp.visible(snap)) continue;
+                if (trigger.stamp.deleterOther(snap)) |other| return self.waitObject(slot, other);
+                try self.dropObject(slot, .trigger, index, snap);
+            }
+            for (&self.objects.rules, 0..) |*rule, index| {
+                if (!rule.live or rule.table_oid != oid or !rule.stamp.visible(snap)) continue;
+                if (rule.stamp.deleterOther(snap)) |other| return self.waitObject(slot, other);
+                try self.dropObject(slot, .rule, index, snap);
+            }
+        }
+
+        // ---- durability -------------------------------------------------------
+
+        fn encodeObject(self: *const Self, writer: *change_log.Writer, creation: bool, class: tg.Class, index: usize) Error!void {
+            var buffer: [RC.payload_bytes]u8 = undefined;
+            var payload: RC.Payload = .{ .buffer = &buffer };
+            if (!creation) {
+                try payload.int(u32, self.objects.oidOf(class, index));
+                const tag: change_log.Op = switch (class) {
+                    .routine => .drop_routine,
+                    .trigger => .drop_trigger,
+                    .rule => .drop_rule,
+                };
+                return C.encodeObject(writer, tag, buffer[0..payload.used]);
+            }
+            const tag: change_log.Op = switch (class) {
+                .routine => .create_routine,
+                .trigger => .create_trigger,
+                .rule => .create_rule,
+            };
+            switch (class) {
+                .routine => try RC.encodeRoutine(&payload, &self.objects.routines[index]),
+                .trigger => try RC.encodeTrigger(&payload, &self.objects.triggers[index]),
+                .rule => try RC.encodeRule(&payload, &self.objects.rules[index]),
+            }
+            return C.encodeObject(writer, tag, buffer[0..payload.used]);
+        }
+
+        fn oidInUse(self: *const Self, oid: u32) bool {
+            for (&self.objects.routines) |*item| if (item.live and item.oid == oid) return true;
+            for (&self.objects.triggers) |*item| if (item.live and item.oid == oid) return true;
+            for (&self.objects.rules) |*item| if (item.live and item.oid == oid) return true;
+            return false;
+        }
+
+        /// Mvcc.abortSlice: undo an object creation or deletion mark.
+        pub fn undoObject(self: *Self, creation: bool, class_value: u32, index: u8) void {
+            const class: tg.Class = @enumFromInt(class_value);
+            const stamp = self.objects.stampOf(class, index);
+            if (creation) {
+                self.objects.liveOf(class, index).* = false;
+                const oid = self.objects.oidOf(class, index);
+                if (!self.oidInUse(oid) and self.oid_counter + change_log.first_oid == oid + 1) self.oid_counter -= 1;
+            } else {
+                stamp.xmax = .{};
+                stamp.xmax_cid = 0;
+                stamp.xmax_csn = 0;
+            }
+        }
+
+        /// Mvcc.stamp: publish an object creation or deletion.
+        pub fn stampObject(self: *Self, creation: bool, class_value: u32, index: u8, csn: u64) void {
+            const stamp = self.objects.stampOf(@enumFromInt(class_value), index);
+            if (creation) stamp.xmin_csn = csn else stamp.xmax_csn = csn;
+        }
+
+        /// Replay hook (change_log.apply) of a validated object op.
+        pub fn replayObject(self: *Self, tag: u8, payload: []const u8, csn: u64) Error!void {
+            const stamp: tg.Stamp = .{ .xmin = .{ .epoch = self.epoch }, .xmin_cid = self.cid, .xmin_csn = csn };
+            var oid: u32 = 0;
+            switch (tag) {
+                @intFromEnum(change_log.Op.create_routine) => {
+                    const index = try self.replaySlot(.routine);
+                    const item = &self.objects.routines[index];
+                    try RC.decodeRoutine(payload, item);
+                    item.live = true;
+                    item.stamp = stamp;
+                    oid = item.oid;
+                },
+                @intFromEnum(change_log.Op.create_trigger) => {
+                    const index = try self.replaySlot(.trigger);
+                    const item = &self.objects.triggers[index];
+                    try RC.decodeTrigger(payload, item);
+                    item.live = true;
+                    item.stamp = stamp;
+                    oid = item.oid;
+                },
+                @intFromEnum(change_log.Op.create_rule) => {
+                    const index = try self.replaySlot(.rule);
+                    const item = &self.objects.rules[index];
+                    try RC.decodeRule(payload, item);
+                    item.live = true;
+                    item.stamp = stamp;
+                    oid = item.oid;
+                },
+                else => {
+                    const target_oid = try RC.decodeOid(payload);
+                    const class: tg.Class = switch (tag) {
+                        @intFromEnum(change_log.Op.drop_routine) => .routine,
+                        @intFromEnum(change_log.Op.drop_trigger) => .trigger,
+                        else => .rule,
+                    };
+                    const count: usize = switch (class) {
+                        .routine => config.routines,
+                        .trigger => config.triggers,
+                        .rule => config.rules,
+                    };
+                    for (0..count) |index| {
+                        if (!self.objects.liveOf(class, index).* or self.objects.oidOf(class, index) != target_oid) continue;
+                        // Replay has no snapshot: the slot is free at once.
+                        self.objects.liveOf(class, index).* = false;
+                        return;
+                    }
+                    return error.ChangeRecordConflict;
+                },
+            }
+            self.oid_counter = @max(self.oid_counter, oid + 1 - change_log.first_oid);
+        }
+
+        fn replaySlot(self: *Self, class: tg.Class) Error!usize {
+            switch (class) {
+                .routine => for (&self.objects.routines, 0..) |*item, index| {
+                    if (!item.live) return index;
+                },
+                .trigger => for (&self.objects.triggers, 0..) |*item, index| {
+                    if (!item.live) return index;
+                },
+                .rule => for (&self.objects.rules, 0..) |*item, index| {
+                    if (!item.live) return index;
+                },
+            }
+            return error.ChangeRecordConflict;
+        }
+
+        // ---- catalogs ---------------------------------------------------------
+
+        /// pg_proc, pg_trigger, pg_rewrite and pg_rules rows.
+        fn objectViewRows(self: *const Self, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!void {
+            switch (view) {
+                .pg_proc => for (&self.objects.routines) |*routine| {
+                    if (!routine.live or !routine.stamp.visible(snapshot)) continue;
+                    var argtypes: [12 * config.routine_args]u8 = undefined;
+                    var at: usize = 0;
+                    for (routine.args(), 0..) |oid, position| {
+                        if (position != 0) {
+                            argtypes[at] = ' ';
+                            at += 1;
+                        }
+                        var digits: [10]u8 = undefined;
+                        var length: usize = 0;
+                        var rest = oid;
+                        while (true) {
+                            digits[digits.len - 1 - length] = @intCast('0' + rest % 10);
+                            length += 1;
+                            rest /= 10;
+                            if (rest == 0) break;
+                        }
+                        @memcpy(argtypes[at..][0..length], digits[digits.len - length ..]);
+                        at += length;
+                    }
+                    const kind = [1]u8{routine.kind};
+                    const volatility = [1]u8{routine.volatility};
+                    try sink.add(&.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), nameCell(&kind), nameCell(if (routine.language == 0) "sql" else "plpgsql"), nameCell(&volatility), boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()) });
+                },
+                .pg_trigger => for (&self.objects.triggers) |*trigger| {
+                    if (!trigger.live or !trigger.stamp.visible(snapshot)) continue;
+                    try sink.add(&.{ intCell(trigger.oid), intCell(trigger.table_oid), nameCell(trigger.name.slice()), intCell(trigger.function_oid), intCell(trigger.tgtype), nameCell("O"), boolCell(false), intCell(@intCast(trigger.nargs)) });
+                },
+                .pg_rewrite => for (&self.objects.rules) |*rule| {
+                    if (!rule.live or !rule.stamp.visible(snapshot)) continue;
+                    const event = [1]u8{rule.event};
+                    try sink.add(&.{ intCell(rule.oid), nameCell(rule.name.slice()), intCell(rule.table_oid), nameCell(&event), nameCell("O"), boolCell(rule.instead) });
+                },
+                .pg_rules => for (&self.objects.rules) |*rule| {
+                    if (!rule.live or !rule.stamp.visible(snapshot)) continue;
+                    const table_index = self.visibleTableSlot(rule.table_oid, snapshot) orelse continue;
+                    const table = &self.tables[table_index];
+                    const schema_name = self.namespaceName(table.namespace);
+                    var text: [512]u8 = undefined;
+                    var definition: Writer512 = .{ .out = &text };
+                    definition.add("CREATE RULE ");
+                    definition.add(rule.name.slice());
+                    definition.add(" AS\n    ON ");
+                    definition.add(switch (rule.event) {
+                        '2' => "UPDATE",
+                        '3' => "INSERT",
+                        else => "DELETE",
+                    });
+                    definition.add(" TO ");
+                    definition.add(schema_name);
+                    definition.add(".");
+                    definition.add(table.name.slice());
+                    if (rule.where.len != 0) {
+                        definition.add("\n  WHERE (");
+                        definition.add(rule.where.slice());
+                        definition.add(")");
+                    }
+                    definition.add(if (rule.instead) " DO INSTEAD NOTHING;" else " DO NOTHING;");
+                    try sink.add(&.{ nameCell(schema_name), nameCell(table.name.slice()), nameCell(rule.name.slice()), nameCell(definition.slice()) });
+                },
+                else => {},
+            }
+        }
+
         // ---- control commands and description ---------------------------
 
         fn decodeIdent(source: []const u8, ident: ast.Ident, out: *ControlText) Error!void {
@@ -5460,6 +6813,13 @@ pub fn Database(comptime config: Config) type {
         }
 
         pub fn describeIn(self: *Self, slot: ?u16, source: []const u8, result: *Result) Error!void {
+            if (R.classify(source)) |kind| {
+                var routine: R.Statement = undefined;
+                try R.parse(source, &self.workspace.nodes, &routine);
+                result.clear(0);
+                result.command = R.command(kind);
+                return;
+            }
             const parsed = try P.parse(source, &self.workspace.nodes, .standard);
             var snap: Snapshot = .{ .csn = self.csn };
             if (slot) |owner| if (self.active(owner)) {
@@ -5620,7 +6980,7 @@ pub fn Database(comptime config: Config) type {
         pub const Usage = struct { transactions: usize, row_locks: usize, table_locks: usize, pending_versions: usize };
 
         pub fn usage(self: *const Self) Usage {
-            var out: Usage = .{ .transactions = 0, .row_locks = self.locks.rowLocksUsed(), .table_locks = self.locks.tableLocksHeld(), .pending_versions = self.catalog.pending() };
+            var out: Usage = .{ .transactions = 0, .row_locks = self.locks.rowLocksUsed(), .table_locks = self.locks.tableLocksHeld(), .pending_versions = self.catalog.pending() + self.objects.pending() };
             for (&self.txs) |*tx| if (tx.active) {
                 out.transactions += 1;
             };

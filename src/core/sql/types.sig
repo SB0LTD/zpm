@@ -174,6 +174,25 @@ pub const Config = struct {
     /// SERIALIZABLE transaction records (active, and committed ones that
     /// overlap an active one); 0 selects 2 x transactions.
     serializable_transactions: usize = 0,
+    // Routines, triggers and rules (B11 wave 3, routine_catalog.sig).
+    /// Function and procedure versions (CREATE [OR REPLACE] FUNCTION /
+    /// PROCEDURE); more are TableCapacity (54000).
+    routines: usize = 8,
+    /// Trigger versions (CREATE TRIGGER); more are TableCapacity (54000).
+    triggers: usize = 8,
+    /// Rewrite-rule versions (CREATE RULE); more are TableCapacity (54000).
+    rules: usize = 4,
+    /// Arguments per routine and CALL (more are ColumnCapacity, 54000).
+    routine_args: usize = 8,
+    /// A routine body, trigger WHEN condition or rule qualification
+    /// (decoded text); longer ones are TextCapacity (54000).
+    routine_bytes: usize = 1024,
+    /// Nested routine calls and trigger firings (functions calling
+    /// functions, triggers fired by routines); deeper is 54001.
+    routine_depth: usize = 16,
+    /// PL/pgSQL variables per routine frame (parameters, DECLAREd
+    /// variables, FOUND, loop variables, TG_*); more are ColumnCapacity.
+    routine_variables: usize = 24,
 };
 
 pub fn workRows(comptime config: Config) usize {
@@ -391,6 +410,27 @@ pub const Error = error{
     /// SQLSTATE 54000: a tx-session capacity (cursors, prepared statements,
     /// settings, LISTEN, NOTIFY queue, advisory locks, SERIALIZABLE records).
     SessionCapacity,
+    // Routines, triggers and rules (B11 wave 3).
+    /// SQLSTATE 42723: a function or procedure with this signature exists.
+    DuplicateFunction,
+    /// SQLSTATE 42P13: invalid function definition (return type, body).
+    InvalidFunctionDefinition,
+    /// SQLSTATE P0001: PL/pgSQL RAISE EXCEPTION.
+    RaiseException,
+    /// SQLSTATE P0002: SELECT ... INTO STRICT found no row.
+    NoDataFound,
+    /// SQLSTATE P0003: SELECT ... INTO STRICT found more than one row.
+    TooManyRows,
+    /// SQLSTATE 2F005: control reached the end of a function without RETURN.
+    FunctionExecutedNoReturn,
+    /// SQLSTATE 20000: CASE statement without a matching branch or ELSE.
+    CaseNotFound,
+    /// SQLSTATE 54001: routine or trigger nesting beyond Config.routine_depth.
+    StackDepthExceeded,
+    /// SQLSTATE 22004: NULL assigned to a NOT NULL PL/pgSQL variable.
+    NullValueNotAllowed,
+    /// SQLSTATE 22005: assignment to a CONSTANT PL/pgSQL variable.
+    ErrorInAssignment,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -861,7 +901,7 @@ pub fn typeFromOid(oid: u32) ?DataType {
 pub const DefaultKind = enum(u8) { none = 0, default = 1, identity_always = 2, identity_by_default = 3, generated = 4 };
 
 /// Statement kind of a completed (or described) statement.
-pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_index, drop_index, create_view, drop_view, create_materialized_view, drop_materialized_view, refresh_materialized_view, merge, set_constraints, create_table_as, lock_table, declare_cursor, fetch, move, close_cursor, prepare, deallocate, listen, notify, unlisten };
+pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_index, drop_index, create_view, drop_view, create_materialized_view, drop_materialized_view, refresh_materialized_view, merge, set_constraints, create_table_as, lock_table, declare_cursor, fetch, move, close_cursor, prepare, deallocate, listen, notify, unlisten, create_function, drop_function, create_procedure, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule };
 
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;
