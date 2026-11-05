@@ -44,7 +44,7 @@ pub const information_namespace: u32 = 13000;
 /// table under the statement snapshot. Columns PostgreSQL declares as
 /// "char", regproc, int2vector, character_data or yes_or_no are text here;
 /// sql_identifier columns are name (OID 19), cardinal_number int4.
-pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_index, pg_attrdef, pg_sequence, schemata, tables, columns, table_constraints, key_column_usage };
+pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_index, pg_attrdef, pg_sequence, schemata, tables, columns, table_constraints, key_column_usage, pg_indexes, pg_views, pg_matviews, pg_inherits };
 
 pub const ViewColumn = struct { name: []const u8, ty: types.Type };
 
@@ -63,6 +63,10 @@ const schemata_columns = [_]ViewColumn{ col("catalog_name", .name), col("schema_
 const tables_columns = [_]ViewColumn{ col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("table_type", .text) };
 const columns_columns = [_]ViewColumn{ col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4), col("column_default", .text), col("is_nullable", .text), col("data_type", .text), col("character_maximum_length", .int4), col("numeric_precision", .int4), col("numeric_precision_radix", .int4), col("numeric_scale", .int4), col("datetime_precision", .int4), col("is_identity", .text), col("identity_generation", .text), col("is_generated", .text), col("generation_expression", .text) };
 const table_constraints_columns = [_]ViewColumn{ col("constraint_catalog", .name), col("constraint_schema", .name), col("constraint_name", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("constraint_type", .text) };
+const pg_indexes_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("indexname", .name), col("tablespace", .name), col("indexdef", .text) };
+const pg_views_columns = [_]ViewColumn{ col("schemaname", .name), col("viewname", .name), col("viewowner", .name), col("definition", .text) };
+const pg_matviews_columns = [_]ViewColumn{ col("schemaname", .name), col("matviewname", .name), col("matviewowner", .name), col("tablespace", .name), col("hasindexes", .boolean), col("ispopulated", .boolean), col("definition", .text) };
+const pg_inherits_columns = [_]ViewColumn{ col("inhrelid", .oid), col("inhparent", .oid), col("inhseqno", .int4), col("inhdetachpending", .boolean) };
 const key_column_usage_columns = [_]ViewColumn{ col("constraint_catalog", .name), col("constraint_schema", .name), col("constraint_name", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4) };
 
 pub fn viewColumns(view: View) []const ViewColumn {
@@ -79,13 +83,17 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .columns => &columns_columns,
         .table_constraints => &table_constraints_columns,
         .key_column_usage => &key_column_usage_columns,
+        .pg_indexes => &pg_indexes_columns,
+        .pg_views => &pg_views_columns,
+        .pg_matviews => &pg_matviews_columns,
+        .pg_inherits => &pg_inherits_columns,
     };
 }
 
 /// pg_catalog views resolve unqualified (pg_catalog is searched first);
 /// information_schema views only when qualified.
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
-    const catalog_views = [_]View{ .pg_type, .pg_namespace, .pg_class, .pg_attribute, .pg_index, .pg_attrdef, .pg_sequence };
+    const catalog_views = [_]View{ .pg_type, .pg_namespace, .pg_class, .pg_attribute, .pg_index, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
@@ -298,7 +306,8 @@ pub fn Catalog(comptime config: types.Config) type {
             var count: usize = 0;
             errdefer for (out[0..count]) |change| SC.reclaimVersion(self.relation(change.relation), change.version);
             const oid: i64 = table.oid;
-            const relation_cells = [_]CV.Cell{ int(oid), text(table.name.slice()), text("r"), int(table.namespace), int(@intCast(slot)) };
+            const kind = [1]u8{table.relkind};
+            const relation_cells = [_]CV.Cell{ int(oid), text(table.name.slice()), text(&kind), int(table.namespace), int(@intCast(slot)) };
             out[count] = .{ .relation = .relations, .version = try self.addVersion(.relations, slot + 1, &relation_cells, xmin, cid, csn, horizon) };
             count += 1;
             for (table.columns[0..table.column_count], 0..) |*column, index| {
@@ -347,7 +356,7 @@ pub fn Catalog(comptime config: types.Config) type {
         /// Table slot whose relation row named `name` is visible to `snap`.
         pub fn lookup(self: *const Self, name: []const u8, snap: storage.Snapshot) ?usize {
             const found = self.find(name, snap) orelse return null;
-            return if (found.kind == 'r') found.slot else null;
+            return if (found.kind == 'r' or found.kind == 'm' or found.kind == 'p' or found.kind == 'v') found.slot else null;
         }
 
         /// A live transaction other than the snapshot's own that has an

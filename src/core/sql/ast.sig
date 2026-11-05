@@ -354,6 +354,8 @@ pub fn Ast(comptime config: types.Config) type {
             sequence: sequence.Options = .{},
             /// SERIAL family: the owned sequence's AS type OID (0: none).
             serial: u32 = 0,
+            /// GENERATED ALWAYS AS (expr) VIRTUAL (or without STORED).
+            virtual: bool = false,
         };
 
         /// ALTER SEQUENCE [IF EXISTS] name options (RESTART included).
@@ -363,7 +365,10 @@ pub fn Ast(comptime config: types.Config) type {
             options: sequence.Options = .{},
         };
 
-        pub const ConstraintKind = enum { check, unique, primary };
+        pub const ConstraintKind = enum { check, unique, primary, foreign, exclusion };
+
+        /// FOREIGN KEY ON DELETE / ON UPDATE actions.
+        pub const ForeignAction = enum(u8) { no_action = 0, restrict = 1, cascade = 2, set_null = 3, set_default = 4 };
 
         /// A CHECK, UNIQUE or PRIMARY KEY constraint as written, at column
         /// or table level. Column-level UNIQUE / PRIMARY KEY list their own
@@ -377,6 +382,40 @@ pub fn Ast(comptime config: types.Config) type {
             columns: [config.columns]Ident = undefined,
             column_count: usize = 0,
             nulls_not_distinct: bool = false,
+            deferrable: bool = false,
+            initially_deferred: bool = false,
+            /// FOREIGN KEY: REFERENCES table [(columns)] and actions.
+            ref_table: TableRef = .{},
+            ref_columns: [config.columns]Ident = undefined,
+            ref_count: usize = 0,
+            on_delete: ForeignAction = .no_action,
+            on_update: ForeignAction = .no_action,
+            /// EXCLUDE: operator per element (1 `=`, 2 `&&`).
+            operators: [config.columns]u8 = undefined,
+        };
+
+        /// LIKE source [INCLUDING | EXCLUDING option ...] inside CREATE TABLE:
+        /// `position` is the column index its columns take.
+        pub const Like = struct {
+            table: TableRef = .{},
+            position: usize = 0,
+            defaults: bool = false,
+            constraints: bool = false,
+            indexes: bool = false,
+            identity: bool = false,
+            generated: bool = false,
+        };
+
+        pub const PartitionStrategy = enum { none, range, list };
+
+        /// FOR VALUES FROM (...) TO (...) | IN (...) | DEFAULT: expression
+        /// nodes (MINVALUE / MAXVALUE are `minvalue` / `maxvalue` flags).
+        pub const PartitionBound = struct {
+            kind: enum { none, range, list, default } = .none,
+            values: [4]u16 = @splat(none),
+            count: usize = 0,
+            minvalue: bool = false,
+            maxvalue: bool = false,
         };
 
         pub const CreateTable = struct {
@@ -388,6 +427,90 @@ pub fn Ast(comptime config: types.Config) type {
             count: usize = 0,
             constraints: [config.table_constraints]ConstraintDef = undefined,
             constraint_count: usize = 0,
+            /// CREATE TEMP / TEMPORARY (an ordinary table in this engine).
+            temporary: bool = false,
+            like: ?Like = null,
+            inherits: ?TableRef = null,
+            partition_by: PartitionStrategy = .none,
+            partition_key: Ident = .{},
+            /// PARTITION OF parent FOR VALUES ...
+            partition_of: ?TableRef = null,
+            bound: PartitionBound = .{},
+            /// CREATE TABLE ... AS query [WITH [NO] DATA]: Pool.queries index.
+            as_query: u16 = none,
+            as_columns: [config.columns]Ident = undefined,
+            as_column_count: usize = 0,
+            with_data: bool = true,
+        };
+
+        /// CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON table [USING m]
+        /// (element [ASC|DESC] [NULLS FIRST|LAST], ...) [INCLUDE (columns)]
+        /// [NULLS [NOT] DISTINCT] [WHERE predicate]. An element is a column
+        /// (`column`) or an expression (`expression` source span).
+        pub const IndexElement = struct { column: ?Ident = null, expression: Span = .{}, node: u16 = none, descending: bool = false, nulls_first: ?bool = null };
+        pub const CreateIndex = struct {
+            unique: bool = false,
+            if_not_exists: bool = false,
+            name: ?Ident = null,
+            table: TableRef = .{},
+            elements: [config.columns]IndexElement = undefined,
+            count: usize = 0,
+            includes: [config.columns]Ident = undefined,
+            include_count: usize = 0,
+            nulls_not_distinct: bool = false,
+            predicate: Span = .{},
+            predicate_node: u16 = none,
+        };
+
+        /// CREATE [OR REPLACE] [TEMP] VIEW / CREATE MATERIALIZED VIEW name
+        /// [(columns)] AS query [WITH [NO] DATA].
+        pub const CreateView = struct {
+            materialized: bool = false,
+            if_not_exists: bool = false,
+            name: TableRef = .{},
+            columns: [config.columns]Ident = undefined,
+            column_count: usize = 0,
+            query: u16 = none,
+            text: Span = .{},
+            with_data: bool = true,
+        };
+
+        /// MERGE INTO target [AS alias] USING source ON condition WHEN ...
+        pub const MergeAction = enum { update, delete, insert, nothing };
+        pub const MergeWhen = struct {
+            matched: bool = true,
+            /// WHEN NOT MATCHED BY SOURCE.
+            by_source: bool = false,
+            condition: u16 = none,
+            action: MergeAction = .nothing,
+            assignments: [config.columns]Assignment = undefined,
+            count: usize = 0,
+            columns: [config.columns]Ident = undefined,
+            column_count: usize = 0,
+            /// INSERT VALUES row (a values_row node) or none (DEFAULT VALUES).
+            values: u16 = none,
+        };
+        /// WHEN clauses per MERGE (more are StatementTooComplex, 54001).
+        pub const merge_clauses: usize = 8;
+        pub const Merge = struct {
+            table: TableRef = .{},
+            /// USING items (a FROM-list query block, SELECT *).
+            source: u16 = none,
+            on: u16 = none,
+            whens: [merge_clauses]MergeWhen = undefined,
+            when_count: usize = 0,
+        };
+
+        /// REFRESH MATERIALIZED VIEW name [WITH [NO] DATA]; `query` is the
+        /// stored definition parsed into the statement pool by the facade.
+        pub const Refresh = struct { name: TableRef = .{}, with_data: bool = true, query: u16 = none };
+
+        /// SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }.
+        pub const SetConstraints = struct {
+            all: bool = false,
+            names: [8]Ident = undefined,
+            count: usize = 0,
+            deferred: bool = false,
         };
 
         pub const CreateSequence = struct {
@@ -396,7 +519,7 @@ pub fn Ast(comptime config: types.Config) type {
             options: sequence.Options = .{},
         };
 
-        pub const Drop = struct { name: Ident, if_exists: bool = false, schema: ?Ident = null };
+        pub const Drop = struct { name: Ident, if_exists: bool = false, schema: ?Ident = null, cascade: bool = false };
 
         /// CREATE SCHEMA [IF NOT EXISTS] name.
         pub const CreateSchema = struct { name: Ident = .{}, if_not_exists: bool = false };
@@ -488,6 +611,10 @@ pub fn Ast(comptime config: types.Config) type {
             on: u16 = none,
             using: [config.columns]Ident = undefined,
             using_count: usize = 0,
+            /// FROM ONLY name: no inheritance children.
+            only: bool = false,
+            /// A derived table expanded from a stored view definition.
+            view: bool = false,
         };
 
         pub const Cte = struct {
@@ -541,6 +668,8 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const Update = struct {
+            /// UPDATE ONLY: no inheritance children.
+            only: bool = false,
             schema: ?Ident = null,
             table: Ident = .{},
             assignments: [config.columns]Assignment = undefined,
@@ -554,6 +683,7 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const Delete = struct {
+            only: bool = false,
             schema: ?Ident = null,
             table: Ident = .{},
             where: u16 = none,
@@ -625,6 +755,14 @@ pub fn Ast(comptime config: types.Config) type {
             alter_sequence: AlterSequence,
             create_schema: CreateSchema,
             drop_schema: DropSchema,
+            create_index: CreateIndex,
+            drop_index: Drop,
+            create_view: CreateView,
+            /// DROP VIEW / DROP MATERIALIZED VIEW (`materialized`).
+            drop_view: struct { drop: Drop, materialized: bool },
+            refresh_view: Refresh,
+            merge: Merge,
+            set_constraints: SetConstraints,
         };
     };
 }

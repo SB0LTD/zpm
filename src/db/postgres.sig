@@ -1543,6 +1543,11 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "PrimaryKeyViolation")) return "23505";
     if (equal(name, "NotNullViolation")) return "23502";
     if (equal(name, "CheckViolation")) return "23514";
+    if (equal(name, "ForeignKeyViolation")) return "23503";
+    if (equal(name, "ExclusionViolation")) return "23P01";
+    if (equal(name, "IndexCapacity")) return "54000";
+    if (equal(name, "InvalidForeignKey")) return "42830";
+    if (equal(name, "ObjectNotInPrerequisiteState")) return "55000";
     if (equal(name, "DuplicateObject")) return "42710";
     if (equal(name, "InvalidTableDefinition")) return "42P16";
     if (equal(name, "UndefinedSchema")) return "3F000";

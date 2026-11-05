@@ -57,6 +57,9 @@ pub fn Mvcc(comptime config: types.Config) type {
 
         pub const TableWait = struct { table: u8, mode: locks.TableMode, seq: u64 };
 
+        /// A SET CONSTRAINTS name: the table OID and constraint name.
+        pub const ConstraintMode = struct { oid: u32, name: V.Name, deferred: bool };
+
         pub const Tx = struct {
             active: bool = false,
             epoch: u32 = 0,
@@ -92,6 +95,14 @@ pub fn Mvcc(comptime config: types.Config) type {
             copy_table: ?u8 = null,
             copy_snap: storage.Snapshot = .{ .csn = 0 },
             copy_rows: usize = 0,
+            /// A deferred constraint skipped a check: COMMIT (or SET
+            /// CONSTRAINTS ... IMMEDIATE) re-checks this transaction's rows.
+            deferred_checks: bool = false,
+            /// SET CONSTRAINTS ALL mode (null: each constraint's INITIALLY).
+            constraints_all: ?bool = null,
+            /// SET CONSTRAINTS name modes, newest last.
+            constraint_modes: [config.constraint_modes]ConstraintMode = undefined,
+            constraint_mode_count: usize = 0,
 
             pub fn ref(self: *const Tx, slot: usize) storage.TxRef {
                 return .{ .slot = @intCast(slot), .epoch = self.epoch, .sub = @intCast(self.sub_len) };
@@ -173,6 +184,16 @@ pub fn Mvcc(comptime config: types.Config) type {
                     },
                     .alter_table => {
                         const copy = &db.tables[entry.table];
+                        // Index OIDs this ALTER took, when still the tail.
+                        var position = copy.index_count;
+                        while (position > 0) {
+                            position -= 1;
+                            const taken = copy.indexes[position].oid;
+                            var kept = false;
+                            const old = &db.tables[entry.old];
+                            for (old.indexes[0..old.index_count]) |*existing| kept = kept or existing.oid == taken;
+                            if (taken != 0 and !kept and db.oid_counter + types_first_oid == taken + 1) db.oid_counter -= 1;
+                        }
                         copy.live = false;
                         copy.pending_create = false;
                         db.tables[entry.old].pending_drop = false;

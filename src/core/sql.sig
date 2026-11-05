@@ -105,6 +105,7 @@ const float_module = @import("sql/float_text.sig");
 const sort_module = @import("sql/sort.sig");
 const sequence_module = @import("sql/sequence.sig");
 const deparse_module = @import("sql/deparse.sig");
+const range_eval_module = @import("sql/range_eval.sig");
 
 /// The canonical SQL tokenizer, also used by wire parameter binding.
 /// Source and token spans remain caller-owned; tokenization allocates nothing.
@@ -383,7 +384,213 @@ pub fn Database(comptime config: Config) type {
             nodes: A.Pool = .{},
             plans: B.Plans = .{},
             query: X.Work = .{},
+            /// Statement text followed by the view texts it expands.
+            expansion: [config.expansion_bytes]u8 = undefined,
+            /// OIDs of the views a statement expanded (CREATE VIEW records
+            /// them as dependencies).
+            expanded: [config.tables]u32 = undefined,
+            expanded_count: usize = 0,
         };
+
+        /// A decoded identifier (quoted names keep case, others fold).
+        fn identName(source: []const u8, ident: ast.Ident) Name {
+            var out: Name = .{};
+            var text: ControlText = .{};
+            decodeIdent(source, ident, &text) catch return out;
+            const length = @min(text.len, config.name_bytes);
+            @memcpy(out.bytes[0..length], text.bytes[0..length]);
+            out.len = length;
+            return out;
+        }
+
+        /// The namespace OID of a schema name (public when null).
+        fn namespaceFor(catalog: *const K, schema: ?[]const u8, snap: Snapshot) ?u32 {
+            const wanted = schema orelse return catalog_module.public_namespace;
+            for (catalog_module.namespaces) |known| if (types.same(known.name, wanted)) return known.oid;
+            return if (catalog.findSchema(wanted, snap)) |found| found.oid else null;
+        }
+
+        /// Appends a stored query text to the workspace copy of the statement
+        /// (copying the statement first) and parses it with absolute spans.
+        fn appendQuery(workspace: *Workspace, length: *usize, source: []const u8, text: []const u8) Error!u16 {
+            if (length.* == 0) {
+                if (source.len > workspace.expansion.len) return error.TextCapacity;
+                @memcpy(workspace.expansion[0..source.len], source);
+                length.* = source.len;
+            }
+            if (text.len + 1 > workspace.expansion.len - length.*) return error.TextCapacity;
+            workspace.expansion[length.*] = ' ';
+            const start = length.* + 1;
+            @memcpy(workspace.expansion[start..][0..text.len], text);
+            length.* = start + text.len;
+            return P.parseQueryAt(workspace.expansion[0..length.*], start, length.*, &workspace.nodes);
+        }
+
+        /// Views are stored definitions expanded at bind time: every FROM
+        /// item naming a view (not a CTE or system view) becomes a derived
+        /// table over the view's text, appended to the statement text in
+        /// the workspace (Config.expansion_bytes, TextCapacity beyond) and
+        /// parsed with absolute spans, recursively for views over views.
+        /// Returns the source to bind and execute with.
+        /// Inheritance parents and partitioned tables read as the UNION ALL
+        /// of `ONLY` each member (the parent and every descendant; a
+        /// partitioned table's leaf partitions), over the parent's columns.
+        fn appendFamily(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, root: usize, snap: Snapshot) Error!u16 {
+            if (length.* == 0) {
+                if (source.len > workspace.expansion.len) return error.TextCapacity;
+                @memcpy(workspace.expansion[0..source.len], source);
+                length.* = source.len;
+            }
+            var members: [config.tables]usize = undefined;
+            members[0] = root;
+            var count: usize = 1;
+            var relations: [K.relation_rows]K.Found = undefined;
+            const relation_count = db.catalog.visibleRelations(snap, &relations);
+            var next: usize = 0;
+            while (next < count) : (next += 1) {
+                const oid = db.tables[members[next]].oid;
+                for (relations[0..relation_count]) |found| {
+                    if (found.kind == 'S' or db.tables[found.slot].parent != oid or count == members.len) continue;
+                    members[count] = found.slot;
+                    count += 1;
+                }
+            }
+            var text: Expansion = .{ .buffer = &workspace.expansion, .len = length.* };
+            try text.add(" ");
+            const start = text.len;
+            const parent = &db.tables[root];
+            var first = true;
+            for (members[0..count]) |slot| {
+                const member = &db.tables[slot];
+                if (member.relkind == 'p' and count > 1) continue;
+                if (!first) try text.add(" UNION ALL ");
+                first = false;
+                try text.add("SELECT ");
+                for (parent.columns[0..parent.column_count], 0..) |*column, position| {
+                    if (position != 0) try text.add(", ");
+                    try text.quoted(column.name.slice());
+                }
+                try text.add(" FROM ONLY ");
+                try text.quoted(db.namespaceName(member.namespace));
+                try text.add(".");
+                try text.quoted(member.name.slice());
+            }
+            length.* = text.len;
+            return P.parseQueryAt(workspace.expansion[0..length.*], start, length.*, &workspace.nodes);
+        }
+
+        /// Bounded writer into the workspace expansion buffer (TextCapacity).
+        const Expansion = struct {
+            buffer: *[config.expansion_bytes]u8,
+            len: usize,
+            fn add(self: *Expansion, bytes: []const u8) Error!void {
+                if (bytes.len > self.buffer.len - self.len) return error.TextCapacity;
+                @memcpy(self.buffer[self.len..][0..bytes.len], bytes);
+                self.len += bytes.len;
+            }
+            fn quoted(self: *Expansion, name: []const u8) Error!void {
+                try self.add("\"");
+                for (name) |byte| {
+                    try self.add(&[1]u8{byte});
+                    if (byte == '"') try self.add("\"");
+                }
+                try self.add("\"");
+            }
+        };
+
+        /// A visible table inheriting from (or partitioning) `oid`.
+        fn hasChildren(self: *const Self, oid: u32, snap: Snapshot) bool {
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind != 'S' and self.tables[found.slot].parent == oid) return true;
+            }
+            return false;
+        }
+
+        fn expandRelations(db: *const Self, workspace: *Workspace, source: []const u8, snap: Snapshot, bound_statement: *A.Statement) Error![]const u8 {
+            const tables = &db.tables;
+            const catalog = &db.catalog;
+            workspace.expanded_count = 0;
+            const pool = &workspace.nodes;
+            var length: usize = 0;
+            // REFRESH MATERIALIZED VIEW reads the stored query the same way.
+            if (bound_statement.* == .refresh_view) {
+                const refresh = &bound_statement.refresh_view;
+                const schema_name = if (refresh.name.schema) |qualifier| identName(source, qualifier) else Name{};
+                if (namespaceFor(catalog, if (refresh.name.schema != null) schema_name.slice() else null, snap)) |namespace| {
+                    if (catalog.findIn(namespace, identName(source, refresh.name.name).slice(), snap)) |found| {
+                        if (found.kind == 'm') refresh.query = try appendQuery(workspace, &length, source, tables[found.slot].query.slice());
+                    }
+                }
+            }
+            var block: usize = 0;
+            while (block < pool.query_len) : (block += 1) {
+                const q = &pool.queries[block];
+                for (q.items[0..q.item_count]) |*item| {
+                    if (item.query != ast.none) continue;
+                    const text = if (length == 0) source else workspace.expansion[0..length];
+                    const name = identName(text, item.name);
+                    if (item.schema == null) {
+                        var cte = false;
+                        for (pool.queries[0..pool.query_len]) |*other| for (other.ctes[0..other.cte_count]) |*definition| {
+                            if (types.same(identName(text, definition.name).slice(), name.slice())) cte = true;
+                        };
+                        if (cte) continue;
+                    }
+                    const schema_name = if (item.schema) |qualifier| identName(text, qualifier) else Name{};
+                    if (catalog_module.findView(if (item.schema != null) schema_name.slice() else null, name.slice()) != null) continue;
+                    const namespace = namespaceFor(catalog, if (item.schema != null) schema_name.slice() else null, snap) orelse continue;
+                    const found = catalog.findIn(namespace, name.slice(), snap) orelse continue;
+                    if (found.kind != 'v') {
+                        if (item.only or found.kind == 'S') continue;
+                        const table = &tables[found.slot];
+                        if (table.relkind != 'p' and !db.hasChildren(table.oid, snap)) continue;
+                        item.query = try appendFamily(db, workspace, &length, source, found.slot, snap);
+                        item.view = true;
+                        if (item.alias == null) item.alias = item.name;
+                        q.from = null;
+                        pool.complex = true;
+                        continue;
+                    }
+                    const view = &tables[found.slot];
+                    const parsed = try appendQuery(workspace, &length, source, view.query.slice());
+                    // View columns keep the names CREATE VIEW gave them.
+                    const top = &pool.queries[parsed];
+                    if (top.set_op == .none) {
+                        var star = false;
+                        for (top.targets[0..top.count]) |*output| star = star or output.star;
+                        if (!star and top.count == view.column_count) {
+                            for (top.targets[0..top.count], view.columns[0..top.count]) |*output, *column| {
+                                const label = column.name.slice();
+                                if (label.len + 3 > workspace.expansion.len - length) return error.TextCapacity;
+                                workspace.expansion[length] = ' ';
+                                workspace.expansion[length + 1] = '"';
+                                @memcpy(workspace.expansion[length + 2 ..][0..label.len], label);
+                                workspace.expansion[length + 2 + label.len] = '"';
+                                output.alias = .{ .span = .{ .start = length + 2, .len = label.len }, .quoted = true, .len = label.len };
+                                length += label.len + 3;
+                            }
+                        }
+                    }
+                    item.query = parsed;
+                    item.view = true;
+                    if (item.alias == null) item.alias = item.name;
+                    q.from = null;
+                    pool.complex = true;
+                    if (workspace.expanded_count < workspace.expanded.len) {
+                        workspace.expanded[workspace.expanded_count] = view.oid;
+                        workspace.expanded_count += 1;
+                    }
+                }
+            }
+            if (length == 0) return source;
+            if (bound_statement.* == .select) {
+                const top = bound_statement.select;
+                bound_statement.* = .{ .query = top };
+            }
+            return workspace.expansion[0..length];
+        }
         /// Independent parser/binder/executor state over shared immutable table
         /// storage. The caller excludes ALL database/schema mutations until the
         /// call returns (or between prepare/run), and owns every scratch/result
@@ -398,6 +605,8 @@ pub fn Database(comptime config: Config) type {
             preparation_error:?Error=null,
             database:?*const Self=null,
             source:[]const u8=&.{},
+            /// `source` plus expanded view texts (inside the workspace).
+            effective:[]const u8=&.{},
             snapshot:Snapshot=.{.csn=0},
 
             pub fn backingBytes(rows:usize) Error!usize {
@@ -478,13 +687,14 @@ pub fn Database(comptime config: Config) type {
             }
             fn prepareBody(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool) Error!void {
                 self.session.sequences=null;
-                const parsed=try P.parse(source,&self.workspace.nodes,.standard);
+                var parsed=try P.parse(source,&self.workspace.nodes,.standard);
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
+                const expanded=try Self.expandRelations(db,&self.workspace,source,snapshot,&parsed);
                 try self.session.checkpoint();
                 for(self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |query| {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
                 }
-                const context:B.Context=.{.source=source,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
+                const context:B.Context=.{.source=expanded,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
                     .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only};
                 const bound=try B.bind(&context,&parsed);
                 for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
@@ -492,7 +702,7 @@ pub fn Database(comptime config: Config) type {
                     else=>{},
                 };
                 self.prepared=switch(bound){.select=>|select| .{.simple=select},.query=>|root| .{.general=root},else=>return error.UnsupportedStatement};
-                self.database=db;self.source=source;self.snapshot=snapshot;
+                self.database=db;self.source=source;self.effective=expanded;self.snapshot=snapshot;
             }
             pub fn run(self:*Context,result:*Result) Error!void {
                 const db=self.database orelse return error.InvalidParameterValue;
@@ -503,9 +713,9 @@ pub fn Database(comptime config: Config) type {
                 self.workspace.query.views=.{.ptr=self,.rows=readViewRows};
                 self.workspace.query.read_stats=.{};
                 switch(plan) {
-                    .simple=>|*select| try X.select(&db.tables,self.source,&self.workspace.nodes,select,self.snapshot,result,X.NoLock{},
+                    .simple=>|*select| try X.select(&db.tables,self.effective,&self.workspace.nodes,select,self.snapshot,result,X.NoLock{},
                         &self.session,self.snapshot.epoch==0,&self.workspace.query.read_stats,&self.workspace.query),
-                    .general=>|root| try X.runQuery(&db.tables,self.source,&self.workspace.nodes,&self.workspace.plans,root,self.snapshot,result,
+                    .general=>|root| try X.runQuery(&db.tables,self.effective,&self.workspace.nodes,&self.workspace.plans,root,self.snapshot,result,
                         &self.session,&self.workspace.query,self.snapshot.epoch==0),
                 }
             }
@@ -943,9 +1153,15 @@ pub fn Database(comptime config: Config) type {
                 self.abort(slot);
                 return err;
             };
+            // Deferred constraints are checked as the transaction commits.
+            self.deferredViolation(slot) catch |err| {
+                self.abort(slot);
+                return err;
+            };
             // The hook may observe the database (read-only), which reuses
             // `outcome`; keep this statement's own.
             const outcome = self.outcome;
+
             sink.before(self, slot, (outcome.command == .select or outcome.noop) and self.readOnly(slot)) catch |err| {
                 self.abort(slot);
                 return err;
@@ -992,6 +1208,9 @@ pub fn Database(comptime config: Config) type {
                 tx.seq_dirty = .{};
                 tx.copy_table = null;
                 tx.copy_rows = 0;
+                tx.deferred_checks = false;
+                tx.constraints_all = null;
+                tx.constraint_mode_count = 0;
                 return @intCast(slot);
             };
             return error.TransactionCapacity;
@@ -1011,6 +1230,7 @@ pub fn Database(comptime config: Config) type {
         /// Encodes the transaction's change record into `buffer`. Fallible,
         /// changes nothing (overflow is TransactionLogCapacity).
         pub fn prepareCommit(self: *const Self, slot: u16, buffer: []u8) Error![]const u8 {
+            try self.deferredViolation(slot);
             var writer = try change_log.Writer.init(buffer, 0);
             try self.encodeWrites(&writer, slot);
             return buffer[0..try writer.finish()];
@@ -1226,6 +1446,12 @@ pub fn Database(comptime config: Config) type {
                 self.wake_epoch +%= 1;
                 return legacy(options.mode, err);
             };
+            // DEFERRABLE constraints in IMMEDIATE mode: end of statement.
+            self.deferredCheck(slot, start, true) catch |err| {
+                self.dropStatement(slot);
+                self.wake_epoch +%= 1;
+                return err;
+            };
             if (!options.writes and tx.write_len > start) {
                 self.dropStatement(slot);
                 return error.ReadOnlyTransaction;
@@ -1260,11 +1486,13 @@ pub fn Database(comptime config: Config) type {
             return .{ .source = source, .pool = &self.workspace.nodes, .session = &self.session };
         }
 
-        fn body(self: *Self, slot: u16, source: []const u8, parsed: *const A.Statement, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
+        fn body(self: *Self, slot: u16, original: []const u8, parsed: *const A.Statement, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
             self.workspace.query.read_stats = .{};
             try self.session.checkpoint();
+            var statement_copy = parsed.*;
+            const source = try expandRelations(self, &self.workspace, original, snap, &statement_copy);
             const context = self.bindContext(source, mode, snap);
-            const bound = try B.bind(&context, parsed);
+            const bound = try B.bind(&context, &statement_copy);
             switch (bound) {
                 .control => return error.UnsupportedStatement,
                 .select => |*select| {
@@ -1287,8 +1515,21 @@ pub fn Database(comptime config: Config) type {
             }
             const affected: usize = switch (bound) {
                 .noop => 0,
-                .create_table => |*create| try self.createTable(slot, create, snap),
-                .drop_table => |index| try self.dropTable(slot, index, snap),
+                .create_table => |*create| blk: {
+                    var definition = create.*;
+                    // Views depend on the views they expanded, too.
+                    if (definition.extras.relkind == 'v' or definition.extras.relkind == 'm') {
+                        for (self.workspace.expanded[0..self.workspace.expanded_count]) |oid| {
+                            var known = false;
+                            for (definition.extras.depends[0..definition.extras.depend_count]) |existing| known = known or existing == oid;
+                            if (known or definition.extras.depend_count == config.tables) continue;
+                            definition.extras.depends[definition.extras.depend_count] = oid;
+                            definition.extras.depend_count += 1;
+                        }
+                    }
+                    break :blk try self.createTable(slot, &definition, snap, source);
+                },
+                .drop_table => |index| try self.dropTable(slot, index, false, snap),
                 .create_sequence => |*create| blk: {
                     try self.createSequence(slot, create.name, create.spec, 0, 0, snap);
                     break :blk 0;
@@ -1333,6 +1574,17 @@ pub fn Database(comptime config: Config) type {
                     try self.dropSchema(slot, drop, snap);
                     break :blk 0;
                 },
+                .drop_relation => |*drop| try self.dropTable(slot, drop.slot, drop.cascade, snap),
+                .set_constraints => |*set| blk: {
+                    try self.setConstraints(slot, set);
+                    break :blk 0;
+                },
+                .refresh_view => |*refresh| try self.refreshView(slot, refresh, source, snap),
+                .merge => |*merge| blk: {
+                    try self.lockTable(slot, merge.table, .row_exclusive);
+                    try self.lockSources(slot);
+                    break :blk try self.mergeRows(slot, source, merge, snap);
+                },
                 .select, .query, .control => unreachable,
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound), .noop = bound == .noop };
@@ -1354,7 +1606,7 @@ pub fn Database(comptime config: Config) type {
             const start = tx.subs[tx.sub_len - 1].write_start;
             const writes = tx.writes[start..tx.write_len];
             var count: usize = 0;
-            for (writes) |entry| if (rowWrite(entry.kind) and entry.table == table_index) {
+            for (writes) |entry| if (rowWrite(entry.kind) and (entry.table == table_index or self.descends(entry.table, table_index))) {
                 count += 1;
             };
             if (count > result_capacity) return error.RowCapacity;
@@ -1363,10 +1615,10 @@ pub fn Database(comptime config: Config) type {
             const width = list.count;
             const base = try X.stageCells(work, count * width);
             var ctx = self.evalContext(source);
-            const table = &self.tables[table_index];
             var row: usize = 0;
             for (writes) |entry| {
-                if (!rowWrite(entry.kind) or entry.table != table_index) continue;
+                if (!rowWrite(entry.kind) or (entry.table != table_index and !self.descends(entry.table, table_index))) continue;
+                const table = &self.tables[entry.table];
                 ctx.row = &table.versions[if (entry.kind == .delete) entry.old else entry.new].cells;
                 for (list.targets[0..width], 0..) |id, column| work.cells[base + row * width + column] = try E.eval(&ctx, id);
                 row += 1;
@@ -1466,7 +1718,7 @@ pub fn Database(comptime config: Config) type {
             for (relations[0..count]) |found| {
                 if (found.kind != 'r' or self.tables[found.slot].namespace != drop.oid) continue;
                 if (!drop.cascade) return error.DependentObjects;
-                _ = try self.dropTable(slot, found.slot, snap);
+                _ = try self.dropTable(slot, found.slot, true, snap);
             }
             try self.reserveWrites(slot, 2);
             schema.pending_drop = true;
@@ -1908,21 +2160,74 @@ pub fn Database(comptime config: Config) type {
                     const pkey = indexName(table) catch Name{};
                     var key_columns: [config.columns]u8 = undefined;
                     const primary_columns = primaryColumns(table, &key_columns);
+                    const relkind = [1]u8{table.relkind};
                     switch (view) {
                         .pg_class => {
-                            try sink.add(&.{ intCell(oid), nameCell(name), intCell(table.namespace), nameCell("r"), intCell(@intCast(table.column_count)) });
+                            try sink.add(&.{ intCell(oid), nameCell(name), intCell(table.namespace), nameCell(&relkind), intCell(@intCast(table.column_count)) });
                             if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), nameCell(pkey.slice()), intCell(table.namespace), nameCell("i"), intCell(@intCast(primary_columns.len)) });
+                            for (table.indexes[0..table.index_count]) |*index| {
+                                if (index.oid == 0) continue;
+                                try sink.add(&.{ intCell(index.oid), nameCell(index.name.slice()), intCell(table.namespace), nameCell("i"), intCell(@intCast(index.key_count + index.include_count)) });
+                            }
                         },
-                        .tables => try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(name), nameCell("BASE TABLE") }),
-                        .pg_index => if (S.keyed(table)) {
+                        .tables => if (table.relkind != 'm') {
+                            try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(name), nameCell(if (table.relkind == 'v') "VIEW" else "BASE TABLE") });
+                        },
+                        .pg_index => {
                             var key: [4 * config.columns]u8 = undefined;
-                            try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)) });
+                            if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)) });
+                            for (table.indexes[0..table.index_count]) |*index| {
+                                if (index.oid == 0) continue;
+                                try sink.add(&.{ intCell(index.oid), intCell(oid), boolCell(false), boolCell(index.unique), nameCell(indexKey(index.keyColumns(), &key)) });
+                            }
+                        },
+                        .pg_indexes => {
+                            var text: [512]u8 = undefined;
+                            if (S.keyed(table)) try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(pkey.slice()), .null_value, nameCell(indexDefinition(table, schema_name, pkey.slice(), true, primary_columns, &text)) });
+                            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                                if (constraint.kind != .unique) continue;
+                                try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(constraint.name.slice()), .null_value, nameCell(indexDefinition(table, schema_name, constraint.name.slice(), true, constraint.keyColumns(), &text)) });
+                            }
+                            for (table.indexes[0..table.index_count]) |*index| {
+                                try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(index.name.slice()), .null_value, nameCell(secondaryDefinition(table, schema_name, index, &text)) });
+                            }
+                            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                                if (constraint.kind != .exclusion) continue;
+                                var definition: Writer512 = .{ .out = &text };
+                                definition.add("CREATE INDEX ");
+                                definition.add(constraint.name.slice());
+                                definition.add(" ON ");
+                                definition.add(schema_name);
+                                definition.add(".");
+                                definition.add(name);
+                                definition.add(" USING gist (");
+                                for (constraint.keyColumns(), 0..) |column, position| {
+                                    if (position != 0) definition.add(", ");
+                                    definition.add(table.columns[column].name.slice());
+                                }
+                                definition.add(")");
+                                try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(constraint.name.slice()), .null_value, nameCell(definition.slice()) });
+                            }
+                        },
+                        .pg_views => if (table.relkind == 'v') {
+                            try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell("ramsql"), nameCell(table.query.slice()) });
+                        },
+                        .pg_matviews => if (table.relkind == 'm') {
+                            try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell("ramsql"), .null_value, boolCell(table.index_count != 0), boolCell(table.populated), nameCell(table.query.slice()) });
+                        },
+                        .pg_inherits => if (table.parent != 0) {
+                            try sink.add(&.{ intCell(oid), intCell(table.parent), intCell(1), boolCell(false) });
                         },
                         .table_constraints => {
                             if (S.keyed(table)) try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(pkey.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell("PRIMARY KEY") });
                             for (table.constraints[0..table.constraint_count]) |*constraint| {
-                                if (constraint.kind == .primary) continue;
-                                try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(constraint.name.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(if (constraint.kind == .check) "CHECK" else "UNIQUE") });
+                                const kind: []const u8 = switch (constraint.kind) {
+                                    .primary, .exclusion => continue,
+                                    .check => "CHECK",
+                                    .unique => "UNIQUE",
+                                    .foreign => "FOREIGN KEY",
+                                };
+                                try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(constraint.name.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(kind) });
                             }
                         },
                         .key_column_usage => {
@@ -1930,7 +2235,7 @@ pub fn Database(comptime config: Config) type {
                                 try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(pkey.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
                             }
                             for (table.constraints[0..table.constraint_count]) |*constraint| {
-                                if (constraint.kind != .unique) continue;
+                                if (constraint.kind != .unique and constraint.kind != .foreign) continue;
                                 for (constraint.keyColumns(), 0..) |column, position| {
                                     try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(constraint.name.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
                                 }
@@ -1946,7 +2251,7 @@ pub fn Database(comptime config: Config) type {
                             };
                             const has_expression = kind == .default or kind == .generated;
                             switch (view) {
-                                .pg_attribute => try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(types.typeOid(column.data_type)), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), nameCell(identity), nameCell(if (kind == .generated) "s" else ""), boolCell(has_expression) }),
+                                .pg_attribute => try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(types.typeOid(column.data_type)), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), nameCell(identity), nameCell(if (kind != .generated) "" else if (column.virtual) "v" else "s"), boolCell(has_expression) }),
                                 .pg_attrdef => if (has_expression) {
                                     try sink.add(&.{ intCell(oid), intCell(attnum), expressionTextWithPool(pool,column) });
                                 },
@@ -1969,6 +2274,85 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
+        /// pg_indexes.indexdef of a primary key or UNIQUE constraint index.
+        fn indexDefinition(table: *const S.Table, schema_name: []const u8, index_name: []const u8, unique: bool, columns: []const u8, out: *[512]u8) []const u8 {
+            var text: Writer512 = .{ .out = out };
+            text.add(if (unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
+            text.add(index_name);
+            text.add(" ON ");
+            text.add(schema_name);
+            text.add(".");
+            text.add(table.name.slice());
+            text.add(" USING btree (");
+            for (columns, 0..) |column, position| {
+                if (position != 0) text.add(", ");
+                text.add(table.columns[column].name.slice());
+            }
+            text.add(")");
+            return text.slice();
+        }
+
+        /// pg_indexes.indexdef of a secondary index (expression elements and
+        /// the predicate are their stored source texts).
+        fn secondaryDefinition(table: *const S.Table, schema_name: []const u8, index: *const S.Index, out: *[512]u8) []const u8 {
+            var text: Writer512 = .{ .out = out };
+            text.add(if (index.unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
+            text.add(index.name.slice());
+            text.add(" ON ");
+            text.add(schema_name);
+            text.add(".");
+            text.add(table.name.slice());
+            text.add(" USING btree (");
+            var at: usize = 0;
+            const expressions = index.expressions.slice();
+            for (index.keyColumns(), 0..) |column, position| {
+                if (position != 0) text.add(", ");
+                if (column == S.expression_key) {
+                    var end = at;
+                    while (end < expressions.len and expressions[end] != 0) end += 1;
+                    text.add("(");
+                    text.add(expressions[at..end]);
+                    text.add(")");
+                    at = end + 1;
+                } else text.add(table.columns[column].name.slice());
+                const descending = index.options[position] & 1 != 0;
+                const nulls_first = index.options[position] & 2 != 0;
+                if (descending) text.add(" DESC");
+                if (nulls_first and !descending) text.add(" NULLS FIRST");
+                if (!nulls_first and descending) text.add(" NULLS LAST");
+            }
+            text.add(")");
+            if (index.include_count != 0) {
+                text.add(" INCLUDE (");
+                for (index.includes[0..index.include_count], 0..) |column, position| {
+                    if (position != 0) text.add(", ");
+                    text.add(table.columns[column].name.slice());
+                }
+                text.add(")");
+            }
+            if (index.nulls_not_distinct) text.add(" NULLS NOT DISTINCT");
+            if (index.predicate.len != 0) {
+                text.add(" WHERE (");
+                text.add(index.predicate.slice());
+                text.add(")");
+            }
+            return text.slice();
+        }
+
+        /// Bounded text assembly (truncates at 512 bytes).
+        const Writer512 = struct {
+            out: *[512]u8,
+            len: usize = 0,
+            fn add(self: *Writer512, bytes: []const u8) void {
+                const take = @min(bytes.len, self.out.len - self.len);
+                @memcpy(self.out[self.len..][0..take], bytes[0..take]);
+                self.len += take;
+            }
+            fn slice(self: *const Writer512) []const u8 {
+                return self.out[0..self.len];
+            }
+        };
+
         /// Primary-key columns in key order (empty without a primary key).
         fn primaryColumns(table: *const S.Table, out: *[config.columns]u8) []const u8 {
             if (table.primary_column) |column| {
@@ -1990,7 +2374,7 @@ pub fn Database(comptime config: Config) type {
                     at += 1;
                 }
                 var digits: [4]u8 = undefined;
-                const text = formatSmall(@as(usize, column) + 1, &digits);
+                const text = formatSmall(if (column == S.expression_key) 0 else @as(usize, column) + 1, &digits);
                 @memcpy(out[at..][0..text.len], text);
                 at += text.len;
             }
@@ -2101,8 +2485,11 @@ pub fn Database(comptime config: Config) type {
             if (M.write_capacity - self.txs[slot].write_len < count) return error.WriteSetCapacity;
         }
 
-        fn createTable(self: *Self, slot: u16, create: *const B.Create, snap: Snapshot) Error!usize {
+        fn createTable(self: *Self, slot: u16, create: *const B.Create, snap: Snapshot, source: []const u8) Error!usize {
             const tx = &self.txs[slot];
+            // CREATE TABLE AS / MATERIALIZED VIEW read their sources first,
+            // so a lock wait parks before anything is written.
+            if (create.plan != ast.none) try self.lockSources(slot);
             if (self.catalog.creator(create.name.slice(), snap)) |owner| {
                 var waits: L.Set = .{};
                 waits.add(owner);
@@ -2132,6 +2519,11 @@ pub fn Database(comptime config: Config) type {
             S.reset(table, change_log.first_oid + self.oid_counter, create.name, create.columns[0..create.count]);
             table.namespace = create.namespace;
             S.setConstraints(table, create.constraints[0..create.constraint_count]);
+            S.setExtras(table, &create.extras);
+            // A foreign key to the table itself takes its OID now.
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if (constraint.kind == .foreign and constraint.ref_oid == 0) constraint.ref_oid = table.oid;
+            }
             table.live = true;
             table.pending_create = true;
             // A primary key's index owns the next OID (pg_class relkind i).
@@ -2145,13 +2537,117 @@ pub fn Database(comptime config: Config) type {
             const generated_context = self.bindContext("", .standard, snap);
             try B.validateGenerated(&generated_context, index);
             try B.validateConstraints(&generated_context, index);
+            // Referenced tables cannot be dropped while this one is created.
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if (constraint.kind != .foreign or constraint.ref_oid == table.oid) continue;
+                try self.lockTable(slot, self.visibleTableSlot(constraint.ref_oid, snap) orelse return error.TableNotFound, .access_share);
+            }
+            for (table.depends[0..table.depend_count]) |oid| {
+                if (self.visibleTableSlot(oid, snap)) |read| try self.lockTable(slot, read, .access_share);
+            }
+            // Indexes copied by LIKE ... INCLUDING INDEXES take their OIDs.
+            for (table.indexes[0..table.index_count]) |*created| if (created.oid == 0) {
+                if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
+                created.oid = change_log.first_oid + self.oid_counter;
+                self.oid_counter += 1;
+            };
+            if (create.plan != ast.none) return self.fillFromPlan(slot, index, source, create.plan, snap);
             return 0;
         }
 
-        fn dropTable(self: *Self, slot: u16, index: usize, snap: Snapshot) Error!usize {
+        /// Inserts the rows of a bound query into table `index` (CREATE
+        /// TABLE AS, CREATE / REFRESH MATERIALIZED VIEW); returns the count.
+        fn fillFromPlan(self: *Self, slot: u16, index: usize, source: []const u8, root: u16, snap: Snapshot) Error!usize {
+            const work = &self.workspace.query;
+            const list = try X.queryRows(&self.tables, source, &self.workspace.nodes, &self.workspace.plans, root, snap, &self.session, work);
+            const table = &self.tables[index];
+            for (0..list.count) |position| {
+                try self.session.checkpoint();
+                const row = X.rowAt(work, list, position);
+                var cells: E.Row = @splat(.null_value);
+                for (table.columns[0..table.column_count], 0..) |*column, column_index| cells[column_index] = try D.store(column, row[column_index], &self.session);
+                try self.appendRow(slot, index, &cells, snap);
+            }
+            return list.count;
+        }
+
+        /// REFRESH MATERIALIZED VIEW: AccessExclusive, every row marked
+        /// deleted in place (one truncate entry), then the query's rows under
+        /// the statement snapshot. A change of populated state rewrites the
+        /// definition first (ALTER TABLE copy, durable op 12).
+        fn refreshView(self: *Self, slot: u16, refresh: *const B.Refresh, source: []const u8, snap: Snapshot) Error!usize {
+            try self.lockTable(slot, refresh.slot, .access_exclusive);
+            if (refresh.with_data) try self.lockSources(slot);
+            var index = refresh.slot;
+            if (self.tables[index].populated != refresh.with_data) {
+                const context = self.bindContext("", .standard, snap);
+                var alter = B.identityAlter(&context, index);
+                alter.extras.populated = refresh.with_data;
+                alter.command = .refresh_materialized_view;
+                try self.alterTable(slot, &alter, snap);
+                index = self.visibleTableSlot(self.tables[index].oid, .{ .csn = snap.csn, .slot = snap.slot, .epoch = snap.epoch, .cid = snap.cid +% 1 }) orelse return error.TableNotFound;
+            }
+            try self.truncateSlot(slot, index, snap);
+            if (!refresh.with_data) return 0;
+            return self.fillFromPlan(slot, index, source, refresh.plan, snap);
+        }
+
+        /// Marks every row version of `index` visible to `snap` deleted in
+        /// place with one truncate write entry (the caller locked it).
+        fn truncateSlot(self: *Self, slot: u16, index: usize, snap: Snapshot) Error!void {
+            try self.reserveWrites(slot, 1);
+            const tx = &self.txs[slot];
+            const table = &self.tables[index];
+            for (0..table.row_high) |row| {
+                if (table.rows[row].newest == 0) continue;
+                const version = S.visibleAt(table, row, snap) orelse continue;
+                const entry = &table.versions[version];
+                entry.xmax = tx.ref(slot);
+                entry.xmax_cid = snap.cid;
+            }
+            tx.push(.{ .kind = .truncate, .table = @intCast(index), .old = snap.cid }) catch unreachable;
+        }
+
+        fn dropTable(self: *Self, slot: u16, index: usize, cascade: bool, snap: Snapshot) Error!usize {
             try self.lockTable(slot, index, .access_exclusive);
             const tx = &self.txs[slot];
             const table = &self.tables[index];
+            if (table.pending_drop) return 0;
+            // Dependents (pg_depend): other tables' foreign keys, views that
+            // read it and inheritance children / partitions. RESTRICT is
+            // 2BP01; CASCADE drops the views and children and removes the
+            // foreign keys from the referencing tables.
+            var relations: [K.relation_rows]K.Found = undefined;
+            const relation_count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..relation_count]) |found| {
+                if (found.kind == 'S' or found.slot == index) continue;
+                const other = &self.tables[found.slot];
+                if (other.pending_drop) continue;
+                // Partitions are part of their table: dropped with it.
+                if (other.parent == table.oid and other.partition.bound != .none) {
+                    _ = try self.dropTable(slot, found.slot, true, snap);
+                    continue;
+                }
+                var depends = other.parent == table.oid;
+                for (other.depends[0..other.depend_count]) |oid| depends = depends or oid == table.oid;
+                var references = false;
+                for (other.constraints[0..other.constraint_count]) |*constraint| references = references or (constraint.kind == .foreign and constraint.ref_oid == table.oid);
+                if ((depends or references) and !cascade) return error.DependentObjects;
+                if (depends) {
+                    _ = try self.dropTable(slot, found.slot, true, snap);
+                } else if (references) {
+                    const context = self.bindContext("", .standard, snap);
+                    var alter = B.identityAlter(&context, found.slot);
+                    var kept: usize = 0;
+                    for (alter.constraints[0..alter.constraint_count]) |constraint| {
+                        if (constraint.kind == .foreign and constraint.ref_oid == table.oid) continue;
+                        alter.constraints[kept] = constraint;
+                        kept += 1;
+                    }
+                    alter.constraint_count = kept;
+                    try self.alterTable(slot, &alter, snap);
+                }
+            }
             // Owned identity sequences go with the table (DROP ... CASCADE of
             // the dependency), encoded before the table.
             for (&self.seqs, 0..) |*seq, seq_index| {
@@ -2176,6 +2672,22 @@ pub fn Database(comptime config: Config) type {
         /// RESTART IDENTITY is not provided (0A000).
         fn truncateTables(self: *Self, slot: u16, truncate: *const B.Truncate, snap: Snapshot) Error!void {
             for (truncate.tables[0..truncate.count]) |index| try self.lockTable(slot, index, .access_exclusive);
+            // A table referenced by a foreign key of a table outside the
+            // list cannot be truncated (0A000; CASCADE is outside the subset).
+            var relations: [K.relation_rows]K.Found = undefined;
+            const relation_count = self.catalog.visibleRelations(snap, &relations);
+            for (truncate.tables[0..truncate.count]) |index| {
+                for (relations[0..relation_count]) |found| {
+                    if (found.kind == 'S') continue;
+                    var listed = false;
+                    for (truncate.tables[0..truncate.count]) |other| listed = listed or other == found.slot;
+                    if (listed) continue;
+                    const other = &self.tables[found.slot];
+                    for (other.constraints[0..other.constraint_count]) |*constraint| {
+                        if (constraint.kind == .foreign and constraint.ref_oid == self.tables[index].oid) return error.UnsupportedStatement;
+                    }
+                }
+            }
             try self.reserveWrites(slot, truncate.count);
             // RESTART IDENTITY: every sequence a column of the table owns
             // (identity, SERIAL) restarts, transactionally (ALTER SEQUENCE).
@@ -2247,9 +2759,11 @@ pub fn Database(comptime config: Config) type {
                 const value = try E.eval(&ctx, alter.fills[position]);
                 if (value != .null_value) fills[position] = try D.store(column, value, &self.session);
             }
+            if (alter.extras.index_count != 0 and source.version_used > S.index_entry_capacity) return error.IndexCapacity;
             S.reset(copy, source.oid, alter.name, alter.columns[0..alter.count]);
             copy.namespace = source.namespace;
             S.setConstraints(copy, alter.constraints[0..alter.constraint_count]);
+            S.setExtras(copy, &alter.extras);
             S.copyRelayout(copy, source, alter.sources[0..alter.count], fills[0..alter.count]);
             copy.live = true;
             copy.pending_create = true;
@@ -2262,6 +2776,13 @@ pub fn Database(comptime config: Config) type {
             count = try self.catalog.create(index, copy, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
             try self.validateAltered(slot, index, alter, snap);
+            // CREATE INDEX: OIDs are taken last, so a failed statement
+            // leaves the counter as it was (abort restores a tail OID).
+            for (copy.indexes[0..copy.index_count]) |*created| if (created.oid == 0) {
+                if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
+                created.oid = change_log.first_oid + self.oid_counter;
+                self.oid_counter += 1;
+            };
         }
 
         /// Existing rows against the constraints ALTER TABLE added or
@@ -2284,6 +2805,21 @@ pub fn Database(comptime config: Config) type {
                     if (alter.check_not_null[column] and cells[column] == .null_value) return error.NotNullViolation;
                 }
                 try D.checkRow(&ctx, table, &checks, cells);
+                // An added EXCLUDE constraint over the existing rows.
+                for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
+                    if (constraint.kind != .exclusion or !alter.check_constraint[position]) continue;
+                    switch (try exclusionCheck(table, constraint, cells, @intCast(row), snap)) {
+                        .free, .wait => {},
+                        .taken => return error.ExclusionViolation,
+                    }
+                }
+                // An added FOREIGN KEY: every existing row must reference a row.
+                for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
+                    if (constraint.kind != .foreign or !alter.check_constraint[position]) continue;
+                    var has_null = false;
+                    for (constraint.keyColumns()) |column| has_null = has_null or cells[column] == .null_value;
+                    if (!has_null) try self.referencedRow(slot, index, constraint, cells, snap);
+                }
                 for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
                     if (!alter.check_constraint[position] or !S.scannedUnique(table, constraint)) continue;
                     switch (S.uniqueCheck(table, constraint, cells, @intCast(row), snap)) {
@@ -2296,6 +2832,15 @@ pub fn Database(comptime config: Config) type {
                         },
                     }
                 }
+                if (alter.check_index) |which| switch (S.indexUniqueCheck(table, which, cells, @intCast(row), snap)) {
+                    .free => {},
+                    .taken => return error.PrimaryKeyViolation,
+                    .wait => |owner| {
+                        var waits: L.Set = .{};
+                        waits.add(owner);
+                        return self.park(slot, waits);
+                    },
+                };
             }
         }
 
@@ -2374,28 +2919,540 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn insertOne(self: *Self, slot: u16, ctx: *E.Context, insert: *const B.Insert, values: *const [config.columns]u16, derived: D.Derived, snap: Snapshot) Error!usize {
-            const table_index = insert.table;
+            const cells = try D.insertedRow(ctx, &self.tables[insert.table], values, derived);
+            // A partitioned table routes the row to its partition.
+            const table_index = try self.routeRow(slot, insert.table, &cells, snap);
             const table = &self.tables[table_index];
-            const cells = try D.insertedRow(ctx, table, values, derived);
+            // ON CONFLICT: the arbiter is checked first (PostgreSQL's
+            // speculative pre-check); other unique indexes still raise 23505.
+            const conflict = &insert.conflict;
+            if (conflict.action != .none) if (try self.arbiterTaken(slot, table_index, conflict.arbiter, &cells, snap)) |version| switch (conflict.action) {
+                .nothing, .none => return 0,
+                .update => return self.conflictUpdate(slot, ctx, table_index, &conflict.update, version, &cells, snap),
+            };
             if (table.primary_column) |column| switch (D.keyCheck(table, &cells[column], 0xffffffff, snap)) {
                 .free => {},
-                .taken => |version| switch (insert.conflict.action) {
-                    .none => return error.PrimaryKeyViolation,
-                    .nothing => return 0,
-                    .update => return self.conflictUpdate(slot, ctx, table_index, &insert.conflict.update, version, &cells, snap),
-                },
+                .taken => return error.PrimaryKeyViolation,
                 .wait => |owner| {
                     var waits: L.Set = .{};
                     waits.add(owner);
                     return self.park(slot, waits);
                 },
             };
-            if (try self.uniqueTaken(slot, table_index, &cells, 0xffffffff, null, snap)) |_| {
-                if (insert.conflict.action == .nothing and insert.conflict.inferred) return 0;
-                return error.PrimaryKeyViolation;
-            }
+            if (try self.uniqueTaken(slot, table_index, &cells, 0xffffffff, null, snap)) |_| return error.PrimaryKeyViolation;
+            try self.exclusionTaken(slot, table_index, &cells, 0xffffffff, null, snap);
+            try self.checkReferences(slot, table_index, &cells, null, snap);
             try self.appendRow(slot, table_index, &cells, snap);
             return 1;
+        }
+
+        // ---- exclusion constraints -----------------------------------------
+
+        /// EXCLUDE constraints of a new or updated row (23P01) with the
+        /// dirty-snapshot rules of UNIQUE: a committed or own row matching
+        /// every element conflicts; another live writer's is waited for.
+        /// NULL elements never conflict; deferrable ones are checked later.
+        fn exclusionTaken(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, own_slot: u32, old: ?*const E.Row, snap: Snapshot) Error!void {
+            const table = &self.tables[table_index];
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if (constraint.kind != .exclusion) continue;
+                if (old) |previous| if (!S.keyChanged(constraint, previous, cells)) continue;
+                if (constraint.deferrable) {
+                    self.txs[slot].deferred_checks = true;
+                    continue;
+                }
+                switch (try exclusionCheck(table, constraint, cells, own_slot, snap)) {
+                    .free => {},
+                    .taken => return error.ExclusionViolation,
+                    .wait => |owner| {
+                        var waits: L.Set = .{};
+                        waits.add(owner);
+                        return self.park(slot, waits);
+                    },
+                }
+            }
+        }
+
+        fn exclusionCheck(table: *const S.Table, constraint: *const S.Constraint, cells: *const E.Row, own_slot: u32, snap: Snapshot) Error!S.KeyState {
+            for (constraint.keyColumns()) |column| if (cells[column] == .null_value) return .free;
+            var waiting: ?u16 = null;
+            for (table.versions[0..table.version_high], 0..) |*version, index| {
+                if (version.row == 0 or version.row - 1 == own_slot) continue;
+                var all = true;
+                for (constraint.keyColumns(), constraint.operators[0..constraint.column_count]) |column, operator| {
+                    if (!all) break;
+                    all = try exclusionMatch(operator, &version.cells[column], &cells[column]);
+                }
+                if (!all) continue;
+                if (S.classify(version, index, snap, &waiting)) |state| return state;
+            }
+            return if (waiting) |owner| .{ .wait = owner } else .free;
+        }
+
+        fn exclusionMatch(operator: S.ExclusionOperator, left: *const V.Cell, right: *const V.Cell) Error!bool {
+            if (left.* == .null_value or right.* == .null_value) return false;
+            return switch (operator) {
+                .equal => V.compare(left, right) == 0,
+                .overlap => range_eval_module.RangeEval(config, E).predicate(.overlap, left, right),
+            };
+        }
+
+        // ---- foreign keys -------------------------------------------------
+
+        /// The table slot with `oid` visible to `snap` (ALTER keeps the OID
+        /// across slots), if any.
+        fn visibleTableSlot(self: *const Self, oid: u32, snap: Snapshot) ?usize {
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind != 'S' and self.tables[found.slot].oid == oid) return found.slot;
+            }
+            return null;
+        }
+
+        const KeyLookup = union(enum) { found: u32, missing, wait: u16 };
+
+        /// The newest live version of `table` whose `columns` equal
+        /// `key[key_columns]` (PostgreSQL's RI check under the latest state):
+        /// a committed live row or one this transaction wrote; another
+        /// transaction's uncommitted insert is invisible, a row it is
+        /// deleting or updating means waiting for it.
+        fn liveKey(table: *const S.Table, columns: []const u8, key: *const E.Row, key_columns: []const u8, snap: Snapshot) KeyLookup {
+            var waiting: ?u16 = null;
+            for (table.versions[0..table.version_high], 0..) |*version, index| {
+                if (version.row == 0) continue;
+                var equal = true;
+                for (columns, key_columns) |column, source| {
+                    if (version.cells[column] == .null_value or V.compare(&version.cells[column], &key[source]) != 0) equal = false;
+                }
+                if (!equal) continue;
+                if (version.xmin_csn == 0) {
+                    if (!snap.own(version.xmin)) continue;
+                    if (version.xmax.epoch != 0 and snap.own(version.xmax)) continue;
+                    return .{ .found = @intCast(index) };
+                }
+                if (version.xmax.epoch == 0) return .{ .found = @intCast(index) };
+                if (version.xmax_csn != 0 or snap.own(version.xmax)) continue;
+                if (waiting == null) waiting = version.xmax.slot;
+            }
+            return if (waiting) |slot| .{ .wait = slot } else .missing;
+        }
+
+        /// FOREIGN KEY checks of a new or updated referencing row (MATCH
+        /// SIMPLE: a NULL member skips the check): the referenced row must be
+        /// live (23503); it is share-locked so its DELETE or key UPDATE waits
+        /// for this transaction. A row may reference itself. Deferred
+        /// constraints are checked at COMMIT instead.
+        fn checkReferences(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, old: ?*const E.Row, snap: Snapshot) Error!void {
+            const table = &self.tables[table_index];
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if (constraint.kind != .foreign) continue;
+                if (old) |previous| if (!S.keyChanged(constraint, previous, cells)) continue;
+                var has_null = false;
+                for (constraint.keyColumns()) |column| has_null = has_null or cells[column] == .null_value;
+                if (has_null) continue;
+                if (constraint.deferrable) {
+                    self.txs[slot].deferred_checks = true;
+                    continue;
+                }
+                try self.referencedRow(slot, table_index, constraint, cells, snap);
+            }
+        }
+
+        fn referencedRow(self: *Self, slot: u16, table_index: usize, constraint: *const S.Constraint, cells: *const E.Row, snap: Snapshot) Error!void {
+            const table = &self.tables[table_index];
+            if (constraint.ref_oid == table.oid) {
+                // A row referencing its own key.
+                var own = true;
+                for (constraint.keyColumns(), constraint.refColumns()) |child, key| {
+                    if (V.compare(&cells[child], &cells[key]) != 0) own = false;
+                }
+                if (own) return;
+            }
+            const parent_index = if (constraint.ref_oid == table.oid) table_index else (self.visibleTableSlot(constraint.ref_oid, snap) orelse return error.ForeignKeyViolation);
+            if (parent_index != table_index) try self.lockTable(slot, parent_index, .access_share);
+            const parent = &self.tables[parent_index];
+            switch (liveKey(parent, constraint.refColumns(), cells, constraint.keyColumns(), snap)) {
+                .missing => return error.ForeignKeyViolation,
+                .wait => |owner| {
+                    var waits: L.Set = .{};
+                    waits.add(owner);
+                    return self.park(slot, waits);
+                },
+                .found => |version| {
+                    if (parent.versions[version].xmin_csn == 0) return;
+                    const rowid = parent.rows[parent.versions[version].row - 1].rowid;
+                    var waits: L.Set = .{};
+                    self.locks.rowHolders(parent_index, rowid, slot, .share, &waits);
+                    if (waits.any()) return self.park(slot, waits);
+                    if (try self.locks.grantRow(parent_index, rowid, slot, .share)) |granted| try M.recordLock(self, slot, granted);
+                },
+            }
+        }
+
+        /// ON DELETE (`new` null) or ON UPDATE of referenced key `old` in
+        /// table `table_index`: every live referencing row is handled by its
+        /// constraint's action. NO ACTION / RESTRICT: 23503. CASCADE deletes
+        /// it (or copies the new key), SET NULL / SET DEFAULT update its
+        /// columns; cascaded rows are checked and cascade further. Rows of
+        /// live writers are waited for; nothing is written before every wait
+        /// of this row has passed (a resumed statement re-runs it).
+        fn referencedChange(self: *Self, slot: u16, table_index: usize, old: *const E.Row, new: ?*const E.Row, snap: Snapshot) Error!void {
+            const parent = &self.tables[table_index];
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                const child_index = found.slot;
+                const child = &self.tables[child_index];
+                for (child.constraints[0..child.constraint_count]) |*constraint| {
+                    if (constraint.kind != .foreign or constraint.ref_oid != parent.oid) continue;
+                    var has_null = false;
+                    for (constraint.refColumns()) |column| has_null = has_null or old[column] == .null_value;
+                    if (has_null) continue;
+                    if (new) |cells| {
+                        var changed = false;
+                        for (constraint.refColumns()) |column| {
+                            if (@as(V.CellTag, old[column]) != @as(V.CellTag, cells[column]) or V.compare(&old[column], &cells[column]) != 0) changed = true;
+                        }
+                        if (!changed) continue;
+                    }
+                    const action = if (new == null) constraint.on_delete else constraint.on_update;
+                    if (action == .no_action and constraint.deferrable) {
+                        self.txs[slot].deferred_checks = true;
+                        continue;
+                    }
+                    try self.referencingRows(slot, child_index, constraint, action, old, new, snap);
+                }
+            }
+        }
+
+        fn referencingRows(self: *Self, slot: u16, child_index: usize, constraint: *const S.Constraint, action: S.ForeignAction, old: *const E.Row, new: ?*const E.Row, snap: Snapshot) Error!void {
+            const child = &self.tables[child_index];
+            const tx = &self.txs[slot];
+            if (action == .no_action or action == .restrict) try self.lockTable(slot, child_index, .access_share) else try self.lockTable(slot, child_index, .row_exclusive);
+            var version: u32 = 0;
+            while (version < child.version_high) : (version += 1) {
+                const entry = &child.versions[version];
+                if (entry.row == 0) continue;
+                var equal = true;
+                for (constraint.keyColumns(), constraint.refColumns()) |column, key| {
+                    if (entry.cells[column] == .null_value or V.compare(&entry.cells[column], &old[key]) != 0) equal = false;
+                }
+                if (!equal) continue;
+                var goal = version;
+                if (entry.xmin_csn == 0) {
+                    if (!snap.own(entry.xmin)) {
+                        var waits: L.Set = .{};
+                        waits.add(entry.xmin.slot);
+                        return self.park(slot, waits);
+                    }
+                    if (entry.xmax.epoch != 0 and snap.own(entry.xmax)) continue;
+                } else {
+                    if (entry.xmax.epoch != 0 and (entry.xmax_csn != 0 or snap.own(entry.xmax))) continue;
+                    var waits: L.Set = .{};
+                    switch (self.target(slot, child_index, version, snap, .write, &waits)) {
+                        .wait => return self.park(slot, waits),
+                        .skip, .authored => continue,
+                        .ready => |newest| goal = newest,
+                    }
+                }
+                switch (action) {
+                    .no_action, .restrict => return error.ForeignKeyViolation,
+                    .cascade => if (new) |cells| {
+                        var updated = child.versions[goal].cells;
+                        for (constraint.keyColumns(), constraint.refColumns()) |column, key| updated[column] = try D.store(&child.columns[column], cells[key], &self.session);
+                        try self.cascadeUpdate(slot, child_index, goal, &updated, .none, snap);
+                    } else {
+                        try self.referencedChange(slot, child_index, &child.versions[goal].cells, null, snap);
+                        if (child.versions[goal].xmax.epoch != 0) continue;
+                        try self.reserveWrites(slot, 1);
+                        child.versions[goal].xmax = tx.ref(slot);
+                        child.versions[goal].xmax_cid = snap.cid;
+                        tx.push(.{ .kind = .delete, .table = @intCast(child_index), .old = goal }) catch unreachable;
+                    },
+                    .set_null, .set_default => {
+                        var updated = child.versions[goal].cells;
+                        for (constraint.keyColumns()) |column| {
+                            updated[column] = .null_value;
+                            if (action == .set_default) {
+                                const context = self.bindContext("", .standard, snap);
+                                const id = try B.columnDefault(&context, child_index, column);
+                                if (id != ast.none) {
+                                    var ctx = self.evalContext(child.columns[column].expression.slice());
+                                    updated[column] = try D.store(&child.columns[column], try E.eval(&ctx, id), &self.session);
+                                }
+                            }
+                            try V.validate(&child.columns[column], &updated[column]);
+                        }
+                        // A default equal to the removed key references nothing.
+                        var still = true;
+                        for (constraint.keyColumns(), constraint.refColumns()) |column, key| {
+                            if (updated[column] == .null_value or V.compare(&updated[column], &old[key]) != 0) still = false;
+                        }
+                        if (still) return error.ForeignKeyViolation;
+                        try self.cascadeUpdate(slot, child_index, goal, &updated, if (action == .set_default) .all else .changed, snap);
+                    },
+                }
+            }
+        }
+
+        /// A referencing row rewritten by a referential action: CHECK and
+        /// unique constraints of its table, its own foreign keys and the
+        /// rows that reference it, then the new version.
+        const ReferenceCheck = enum { none, changed, all };
+
+        /// `check`: none for ON UPDATE CASCADE (the new key is the parent's
+        /// own new key, written by this statement), the changed foreign keys,
+        /// or all of them (SET DEFAULT).
+        fn cascadeUpdate(self: *Self, slot: u16, table_index: usize, old: u32, cells: *const E.Row, check: ReferenceCheck, snap: Snapshot) Error!void {
+            const table = &self.tables[table_index];
+            const context = self.bindContext("", .standard, snap);
+            var flags: [config.table_constraints]bool = @splat(true);
+            var checks: [config.table_constraints]u16 = @splat(ast.none);
+            try B.bindFlaggedChecks(&context, table_index, &flags, &checks);
+            var ctx = self.evalContext("");
+            try D.checkRow(&ctx, table, &checks, cells);
+            const row = table.versions[old].row - 1;
+            if (table.primary_column) |column| if (V.compare(&cells[column], &table.versions[old].cells[column]) != 0) switch (D.keyCheck(table, &cells[column], row, snap)) {
+                .free => {},
+                .taken => return error.PrimaryKeyViolation,
+                .wait => |owner| {
+                    var waits: L.Set = .{};
+                    waits.add(owner);
+                    return self.park(slot, waits);
+                },
+            };
+            if ((try self.uniqueTaken(slot, table_index, cells, row, &table.versions[old].cells, snap)) != null) return error.PrimaryKeyViolation;
+            try self.exclusionTaken(slot, table_index, cells, row, &table.versions[old].cells, snap);
+            if (check != .none) try self.checkReferences(slot, table_index, cells, if (check == .all) null else &table.versions[old].cells, snap);
+            try self.referencedChange(slot, table_index, &table.versions[old].cells, cells, snap);
+            if (table.versions[old].xmax.epoch != 0) return;
+            try self.placeUpdate(slot, table_index, row, old, cells, snap);
+        }
+
+        /// Writes the new version of `row` over `old` (checks done).
+        fn placeUpdate(self: *Self, slot: u16, table_index: usize, row: u32, old: u32, cells: *const E.Row, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            const table = &self.tables[table_index];
+            try self.reserveWrites(slot, 1);
+            try S.ensureVersions(table, 1, self.horizon());
+            const version = S.allocVersion(table);
+            table.versions[version] = .{ .row = row + 1, .xmin = tx.ref(slot), .xmin_cid = snap.cid, .older = old + 1, .cells = cells.* };
+            table.rows[row].newest = version + 1;
+            table.versions[old].xmax = tx.ref(slot);
+            table.versions[old].xmax_cid = snap.cid;
+            S.indexKey(table, version);
+            tx.push(.{ .kind = .update, .table = @intCast(table_index), .old = old, .new = version }) catch unreachable;
+        }
+
+        /// SET CONSTRAINTS: the transaction's ALL or per-name modes. Setting
+        /// IMMEDIATE checks every outstanding deferred row first; a
+        /// violation keeps the previous modes and fails the statement.
+        fn setConstraints(self: *Self, slot: u16, set: *const B.SetConstraints) Error!void {
+            const tx = &self.txs[slot];
+            const saved_all = tx.constraints_all;
+            const saved_count = tx.constraint_mode_count;
+            const saved = tx.constraint_modes;
+            errdefer {
+                tx.constraints_all = saved_all;
+                tx.constraint_mode_count = saved_count;
+                tx.constraint_modes = saved;
+            }
+            if (set.all) {
+                tx.constraints_all = set.deferred;
+                tx.constraint_mode_count = 0;
+            } else for (set.names[0..set.count]) |reference| {
+                const mode: M.ConstraintMode = .{ .oid = reference.oid, .name = reference.name, .deferred = set.deferred };
+                for (tx.constraint_modes[0..tx.constraint_mode_count]) |*existing| {
+                    if (existing.oid == mode.oid and types.same(existing.name.slice(), mode.name.slice())) {
+                        existing.deferred = mode.deferred;
+                        break;
+                    }
+                } else {
+                    if (tx.constraint_mode_count == config.constraint_modes) return error.TableCapacity;
+                    tx.constraint_modes[tx.constraint_mode_count] = mode;
+                    tx.constraint_mode_count += 1;
+                }
+            }
+            if (!set.deferred) try self.deferredCheck(slot, 0, true);
+        }
+
+        /// The deferred checks of a transaction (COMMIT, SET CONSTRAINTS
+        /// IMMEDIATE) over the newest state, without waiting: every live
+        /// row it wrote satisfies its deferrable UNIQUE (23505) and FOREIGN
+        /// KEY (23503) constraints, and no live row references a key it
+        /// removed under a deferrable NO ACTION foreign key (23503). A
+        /// conflicting version of another live transaction is left to that
+        /// transaction's own check, which then sees this commit.
+        pub fn deferredViolation(self: *const Self, slot: u16) Error!void {
+            return self.deferredCheck(slot, 0, false);
+        }
+
+        /// Writes from `start`; `immediate_only` skips constraints whose
+        /// mode is DEFERRED now (statement end, SET CONSTRAINTS IMMEDIATE).
+        fn deferredCheck(self: *const Self, slot: u16, start: usize, immediate_only: bool) Error!void {
+            const tx = &self.txs[slot];
+            if (!tx.active or !tx.deferred_checks) return;
+            const snap: Snapshot = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid +% 1 };
+            for (tx.writes[start..tx.write_len]) |entry| {
+                if (entry.kind != .insert and entry.kind != .update and entry.kind != .delete) continue;
+                const table = &self.tables[entry.table];
+                if (!table.live or table.pending_drop) continue;
+                if (entry.kind != .delete) {
+                    const version = &table.versions[entry.new];
+                    if (version.row != 0 and version.xmax.epoch == 0) try self.deferredRow(slot, table, &version.cells, version.row - 1, immediate_only, snap);
+                }
+                if (entry.kind != .insert) try self.deferredParent(slot, table, &table.versions[entry.old].cells, immediate_only, snap);
+            }
+        }
+
+        fn deferredRow(self: *const Self, slot: u16, table: *const S.Table, cells: *const E.Row, row: u32, immediate_only: bool, snap: Snapshot) Error!void {
+            for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
+                if (!constraint.deferrable or (immediate_only and self.deferredNow(slot, table, position))) continue;
+                switch (constraint.kind) {
+                    .unique, .primary => switch (S.uniqueCheck(table, constraint, cells, row, snap)) {
+                        .taken => return error.PrimaryKeyViolation,
+                        .free, .wait => {},
+                    },
+                    .exclusion => switch (try exclusionCheck(table, constraint, cells, row, snap)) {
+                        .taken => return error.ExclusionViolation,
+                        .free, .wait => {},
+                    },
+                    .foreign => {
+                        var has_null = false;
+                        for (constraint.keyColumns()) |column| has_null = has_null or cells[column] == .null_value;
+                        if (has_null) continue;
+                        const parent_index = self.visibleTableSlot(constraint.ref_oid, snap) orelse return error.ForeignKeyViolation;
+                        if (liveKey(&self.tables[parent_index], constraint.refColumns(), cells, constraint.keyColumns(), snap) == .missing) return error.ForeignKeyViolation;
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        /// A key this transaction removed or changed in `table`: unless the
+        /// key is live again, no live row may reference it through a
+        /// deferrable foreign key.
+        fn deferredParent(self: *const Self, slot: u16, table: *const S.Table, old: *const E.Row, immediate_only: bool, snap: Snapshot) Error!void {
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                const child = &self.tables[found.slot];
+                for (child.constraints[0..child.constraint_count], 0..) |*constraint, position| {
+                    if (constraint.kind != .foreign or !constraint.deferrable or constraint.ref_oid != table.oid) continue;
+                    if (immediate_only and self.deferredNow(slot, child, position)) continue;
+                    var has_null = false;
+                    for (constraint.refColumns()) |column| has_null = has_null or old[column] == .null_value;
+                    if (has_null) continue;
+                    if (liveKey(table, constraint.refColumns(), old, constraint.refColumns(), snap) != .missing) continue;
+                    if (liveKey(child, constraint.keyColumns(), old, constraint.refColumns(), snap) != .missing) return error.ForeignKeyViolation;
+                }
+            }
+        }
+
+        /// Whether constraint `position` of `table` is deferred now in the
+        /// transaction (SET CONSTRAINTS, else INITIALLY DEFERRED).
+        fn deferredNow(self: *const Self, slot: u16, table: *const S.Table, position: usize) bool {
+            const constraint = &table.constraints[position];
+            if (!constraint.deferrable) return false;
+            const tx = &self.txs[slot];
+            for (tx.constraint_modes[0..tx.constraint_mode_count]) |mode| {
+                if (mode.oid == table.oid and types.same(mode.name.slice(), constraint.name.slice())) return mode.deferred;
+            }
+            if (tx.constraints_all) |deferred| return deferred;
+            return constraint.initially_deferred;
+        }
+
+        /// The partition (leaf) of a partitioned table that admits the row
+        /// (else its DEFAULT partition, else 23514), row-exclusive locked;
+        /// any partition's own bound is checked (23514).
+        fn routeRow(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, snap: Snapshot) Error!usize {
+            var current = table_index;
+            var depth: usize = 0;
+            while (self.tables[current].relkind == 'p') : (depth += 1) {
+                if (depth == config.tables) return error.CheckViolation;
+                const parent = &self.tables[current];
+                const key = &cells[parent.partition.key];
+                var chosen: ?usize = null;
+                var fallback: ?usize = null;
+                var relations: [K.relation_rows]K.Found = undefined;
+                const count = self.catalog.visibleRelations(snap, &relations);
+                for (relations[0..count]) |found| {
+                    if (found.kind == 'S') continue;
+                    const child = &self.tables[found.slot];
+                    if (child.parent != parent.oid) continue;
+                    if (child.partition.bound == .default) fallback = found.slot else if (S.partitionContains(&child.partition, key)) chosen = found.slot;
+                }
+                current = chosen orelse fallback orelse return error.CheckViolation;
+                try self.lockTable(slot, current, .row_exclusive);
+            }
+            try self.partitionBound(current, cells, snap);
+            return current;
+        }
+
+        /// A row of partition `index` must satisfy its bound (a DEFAULT
+        /// partition: no sibling's bound) - 23514.
+        fn partitionBound(self: *const Self, index: usize, cells: *const E.Row, snap: Snapshot) Error!void {
+            const table = &self.tables[index];
+            if (table.parent == 0 or table.partition.bound == .none) return;
+            const parent_slot = self.visibleTableSlot(table.parent, snap) orelse return;
+            const key = &cells[self.tables[parent_slot].partition.key];
+            if (table.partition.bound != .default) {
+                if (!S.partitionContains(&table.partition, key)) return error.CheckViolation;
+                return;
+            }
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S' or found.slot == index) continue;
+                const sibling = &self.tables[found.slot];
+                if (sibling.parent == table.parent and S.partitionContains(&sibling.partition, key)) return error.CheckViolation;
+            }
+        }
+
+        /// Whether table `slot` is a partition (at any depth) of `ancestor`.
+        fn descends(self: *const Self, slot: usize, ancestor: usize) bool {
+            var current = slot;
+            for (0..config.tables) |_| {
+                const parent = self.tables[current].parent;
+                if (parent == 0) return false;
+                if (parent == self.tables[ancestor].oid) return true;
+                current = for (&self.tables, 0..) |*table, position| {
+                    if (table.live and !table.pending_drop and table.oid == parent) break position;
+                } else return false;
+            }
+            return false;
+        }
+
+        /// The conflicting version of an ON CONFLICT arbiter, null when the
+        /// key is free; a live writer of the key parks the statement.
+        fn arbiterTaken(self: *Self, slot: u16, table_index: usize, arbiter: B.Arbiter, cells: *const E.Row, snap: Snapshot) Error!?u32 {
+            const table = &self.tables[table_index];
+            const state: S.KeyState = switch (arbiter) {
+                .primary, .any => blk: {
+                    const column = table.primary_column orelse break :blk .free;
+                    break :blk switch (D.keyCheck(table, &cells[column], 0xffffffff, snap)) {
+                        .free => .free,
+                        .taken => |version| .{ .taken = version },
+                        .wait => |owner| .{ .wait = owner },
+                    };
+                },
+                .constraint => |index| S.uniqueCheck(table, &table.constraints[index], cells, 0xffffffff, snap),
+                .index => |which| S.indexUniqueCheck(table, which, cells, 0xffffffff, snap),
+            };
+            switch (state) {
+                .free => {},
+                .taken => |version| return version,
+                .wait => |owner| {
+                    var waits: L.Set = .{};
+                    waits.add(owner);
+                    return self.park(slot, waits);
+                },
+            }
+            if (arbiter == .any) return self.uniqueTaken(slot, table_index, cells, 0xffffffff, null, snap);
+            return null;
         }
 
         /// UNIQUE and composite PRIMARY KEY checks after the key index
@@ -2404,9 +3461,16 @@ pub fn Database(comptime config: Config) type {
         /// key does. An UPDATE (`old`) skips constraints whose key it keeps.
         fn uniqueTaken(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, own_slot: u32, old: ?*const E.Row, snap: Snapshot) Error!?u32 {
             const table = &self.tables[table_index];
-            for (table.constraints[0..table.constraint_count]) |*constraint| {
+            for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
                 if (!S.scannedUnique(table, constraint)) continue;
                 if (old) |previous| if (!S.keyChanged(constraint, previous, cells)) continue;
+                // A DEFERRABLE constraint is checked at the end of the
+                // statement (IMMEDIATE) or at COMMIT (DEFERRED).
+                _ = position;
+                if (constraint.deferrable) {
+                    self.txs[slot].deferred_checks = true;
+                    continue;
+                }
                 switch (S.uniqueCheck(table, constraint, cells, own_slot, snap)) {
                     .free => {},
                     .taken => |version| return version,
@@ -2417,7 +3481,61 @@ pub fn Database(comptime config: Config) type {
                     },
                 }
             }
+            // UNIQUE indexes (CREATE UNIQUE INDEX) probe their own entries.
+            for (table.indexes[0..table.index_count], 0..) |*index, which| {
+                if (!index.unique) continue;
+                if (old) |previous| {
+                    var changed = false;
+                    for (index.keyColumns()) |column| {
+                        if (@as(V.CellTag, previous[column]) != @as(V.CellTag, cells[column]) or V.compare(&previous[column], &cells[column]) != 0) changed = true;
+                    }
+                    if (!changed) continue;
+                }
+                switch (S.indexUniqueCheck(table, which, cells, own_slot, snap)) {
+                    .free => {},
+                    .taken => |version| return version,
+                    .wait => |owner| {
+                        var waits: L.Set = .{};
+                        waits.add(owner);
+                        return self.park(slot, waits);
+                    },
+                }
+            }
             return null;
+        }
+
+        /// Secondary index probe of a committed table by index name, for
+        /// contracts that compare the index path with a scan: the number of
+        /// rows visible to the committed view whose plain key columns equal
+        /// `key` (in index key order), from the index (`probe`) or a scan.
+        pub fn indexMatches(self: *const Self, table_name: []const u8, index_name: []const u8, key: []const Cell, probe: bool) ?usize {
+            const index = self.committedIndex(table_name) orelse return null;
+            const table = &self.tables[index];
+            for (table.indexes[0..table.index_count], 0..) |*definition, which| {
+                if (!types.same(definition.name.slice(), index_name)) continue;
+                var cells: E.Row = @splat(.null_value);
+                var position: usize = 0;
+                for (definition.keyColumns()) |column| {
+                    if (column == S.expression_key) continue;
+                    if (position == key.len) return null;
+                    cells[column] = key[position];
+                    position += 1;
+                }
+                var found: [64]u32 = undefined;
+                return if (probe) S.indexLookup(table, which, &cells, storage.committed_view, &found) else S.scanLookup(table, which, &cells, storage.committed_view, &found);
+            }
+            return null;
+        }
+
+        /// Index entries of every secondary index of a table, and whether
+        /// each equals the table's allocated versions (no stale entry).
+        pub fn indexConsistent(self: *const Self, table_name: []const u8) ?bool {
+            const index = self.committedIndex(table_name) orelse return null;
+            const table = &self.tables[index];
+            for (0..table.index_count) |which| {
+                if (S.indexEntries(table, which) != table.version_used) return false;
+            }
+            return true;
         }
 
         /// Places a new row version (key already checked). Capacity errors
@@ -2710,6 +3828,15 @@ pub fn Database(comptime config: Config) type {
                 if (err == error.WouldBlock) tx.pin = snap;
                 return err;
             }
+            self.exclusionTaken(slot, table_index, &row.cells, 0xffffffff, null, snap) catch |err| {
+                if (err == error.WouldBlock) tx.pin = snap;
+                return err;
+            };
+            self.checkReferences(slot, table_index, &row.cells, null, snap) catch |err| {
+                if (err == error.WouldBlock) tx.pin = snap;
+                return err;
+            };
+            try self.partitionBound(table_index, &row.cells, snap);
             try self.appendRow(slot, table_index, &row.cells, snap);
             tx.copy_rows += 1;
         }
@@ -2744,6 +3871,118 @@ pub fn Database(comptime config: Config) type {
             const plans = &self.workspace.plans;
             for (plans.items[0..plans.len]) |*plan| {
                 for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| try self.lockTable(slot, table, .access_share);
+            }
+        }
+
+        /// MERGE (PostgreSQL ExecMerge under READ COMMITTED): the source rows
+        /// are materialized once under the statement snapshot; for each, every
+        /// target row the ON condition matches takes the first WHEN MATCHED
+        /// clause whose condition holds (UPDATE, DELETE or DO NOTHING), and a
+        /// source row with no match the first WHEN NOT MATCHED clause (INSERT
+        /// or DO NOTHING); then target rows no source row matched take the
+        /// first WHEN NOT MATCHED BY SOURCE clause. A target row changed twice
+        /// is 21000. Live writers are waited for (EvalPlanQual re-checks ON on
+        /// the newest version; a row that no longer matches is left alone).
+        /// A resumed statement continues after the source rows it handled.
+        fn mergeRows(self: *Self, slot: u16, source: []const u8, merge: *const B.Merge, snap: Snapshot) Error!usize {
+            const tx = &self.txs[slot];
+            const done = tx.progress;
+            const table = &self.tables[merge.table];
+            var ctx = self.evalContext(source);
+            const joined = (try self.joinedRows(source, merge.source, &merge.offsets, snap)) orelse return 0;
+            const work = &self.workspace.query;
+            var position: usize = 0;
+            for (0..joined.list.count) |index| {
+                defer position += 1;
+                if (position < done) continue;
+                try self.session.checkpoint();
+                const row = X.rowAt(work, joined.list, index);
+                for (1..config.relations) |relation| ctx.tuple[relation] = row + joined.offsets[relation];
+                var matched = false;
+                for (0..table.row_high) |target_row| {
+                    if (table.rows[target_row].newest == 0) continue;
+                    const version = S.visibleAt(table, target_row, snap) orelse continue;
+                    if (!try X.keep(&ctx, merge.on, &table.versions[version].cells)) continue;
+                    matched = true;
+                    try self.mergeMatched(slot, &ctx, merge, @intCast(target_row), version, false, snap);
+                }
+                if (!matched) try self.mergeInsert(slot, &ctx, merge, snap);
+                tx.progress = position + 1;
+            }
+            var by_source = false;
+            for (merge.whens[0..merge.when_count]) |*when| by_source = by_source or when.by_source;
+            if (by_source) for (0..table.row_high) |target_row| {
+                defer position += 1;
+                if (position < done) continue;
+                try self.session.checkpoint();
+                if (table.rows[target_row].newest == 0) continue;
+                const version = S.visibleAt(table, target_row, snap) orelse continue;
+                var matched = false;
+                for (0..joined.list.count) |index| {
+                    const row = X.rowAt(work, joined.list, index);
+                    for (1..config.relations) |relation| ctx.tuple[relation] = row + joined.offsets[relation];
+                    if (try X.keep(&ctx, merge.on, &table.versions[version].cells)) matched = true;
+                }
+                if (!matched) {
+                    for (1..config.relations) |relation| ctx.tuple[relation] = null;
+                    try self.mergeMatched(slot, &ctx, merge, @intCast(target_row), version, true, snap);
+                }
+                tx.progress = position + 1;
+            };
+            return tx.progress_affected;
+        }
+
+        fn mergeMatched(self: *Self, slot: u16, ctx: *E.Context, merge: *const B.Merge, row: u32, version: u32, by_source: bool, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            const table = &self.tables[merge.table];
+            var chosen: ?*const B.MergeWhen = null;
+            var waits: L.Set = .{};
+            const plan = self.target(slot, merge.table, version, snap, .write, &waits);
+            const goal = switch (plan) {
+                .wait => return self.park(slot, waits),
+                .authored => return error.CardinalityViolation,
+                .skip => return,
+                .ready => |newest| newest,
+            };
+            const cells = &table.versions[goal].cells;
+            if (!by_source and goal != version and !try X.keep(ctx, merge.on, cells)) return;
+            for (merge.whens[0..merge.when_count]) |*when| {
+                if (!when.matched or when.by_source != by_source) continue;
+                if (when.condition != ast.none and !try X.keep(ctx, when.condition, cells)) continue;
+                chosen = when;
+                break;
+            }
+            const when = chosen orelse return;
+            switch (when.action) {
+                .update => {
+                    const update: B.Update = .{ .table = merge.table, .values = when.values, .where = ast.none, .key = ast.none, .defaults = when.defaults, .generated = when.generated, .checks = merge.checks };
+                    try self.updateOne(slot, ctx, &update, row, goal, snap);
+                },
+                .delete => {
+                    try self.referencedChange(slot, merge.table, cells, null, snap);
+                    if (table.versions[goal].xmax.epoch == 0) {
+                        try self.reserveWrites(slot, 1);
+                        table.versions[goal].xmax = tx.ref(slot);
+                        table.versions[goal].xmax_cid = snap.cid;
+                        tx.push(.{ .kind = .delete, .table = @intCast(merge.table), .old = goal }) catch unreachable;
+                    }
+                },
+                .nothing, .insert => return,
+            }
+            tx.progress_affected += 1;
+        }
+
+        fn mergeInsert(self: *Self, slot: u16, ctx: *E.Context, merge: *const B.Merge, snap: Snapshot) Error!void {
+            const nulls: E.Row = @splat(.null_value);
+            for (merge.whens[0..merge.when_count]) |*when| {
+                if (when.matched) continue;
+                if (when.condition != ast.none and !try X.keep(ctx, when.condition, &nulls)) continue;
+                if (when.action != .insert) return;
+                const insert: B.Insert = .{ .table = merge.table, .defaults = when.defaults, .generated = when.generated, .checks = merge.checks };
+                const derived: D.Derived = .{ .defaults = &when.defaults, .generated = &when.generated, .checks = &merge.checks };
+                const affected = try self.insertOne(slot, ctx, &insert, &when.values, derived, snap);
+                self.txs[slot].progress_affected += affected;
+                return;
             }
         }
 
@@ -2814,6 +4053,7 @@ pub fn Database(comptime config: Config) type {
             const tx = &self.txs[slot];
             const table = &self.tables[update.table];
             const cells = try D.updatedRow(ctx, table, &update.values, .{ .defaults = &update.defaults, .generated = &update.generated, .checks = &update.checks }, &table.versions[old].cells);
+            try self.partitionBound(update.table, &cells, snap);
             if (table.primary_column) |column| {
                 if (update.values[column] != ast.none) switch (D.keyCheck(table, &cells[column], row, snap)) {
                     .free => {},
@@ -2826,15 +4066,13 @@ pub fn Database(comptime config: Config) type {
                 };
             }
             if ((try self.uniqueTaken(slot, update.table, &cells, row, &table.versions[old].cells, snap)) != null) return error.PrimaryKeyViolation;
-            try self.reserveWrites(slot, 1);
-            try S.ensureVersions(table, 1, self.horizon());
-            const version = S.allocVersion(table);
-            table.versions[version] = .{ .row = row + 1, .xmin = tx.ref(slot), .xmin_cid = snap.cid, .older = old + 1, .cells = cells };
-            table.rows[row].newest = version + 1;
-            table.versions[old].xmax = tx.ref(slot);
-            table.versions[old].xmax_cid = snap.cid;
-            S.indexKey(table, version);
-            tx.push(.{ .kind = .update, .table = @intCast(update.table), .old = old, .new = version }) catch unreachable;
+            try self.exclusionTaken(slot, update.table, &cells, row, &table.versions[old].cells, snap);
+            try self.checkReferences(slot, update.table, &cells, &table.versions[old].cells, snap);
+            try self.referencedChange(slot, update.table, &table.versions[old].cells, &cells, snap);
+            // A referential action of this statement may have replaced it.
+            if (table.versions[old].xmax.epoch != 0) return;
+            _ = tx;
+            try self.placeUpdate(slot, update.table, row, old, &cells, snap);
         }
 
         fn deleteRows(self: *Self, slot: u16, source: []const u8, delete: *const B.Delete, snap: Snapshot) Error!usize {
@@ -2869,6 +4107,9 @@ pub fn Database(comptime config: Config) type {
                 .ready => |newest| newest,
             };
             if (goal != version and !try self.keepJoined(ctx, delete.where, joined, &table.versions[goal].cells)) return 0;
+            try self.referencedChange(slot, delete.table, &table.versions[goal].cells, null, snap);
+            // A self-referencing CASCADE of this statement already deleted it.
+            if (table.versions[goal].xmax.epoch != 0) return 1;
             try self.reserveWrites(slot, 1);
             table.versions[goal].xmax = tx.ref(slot);
             table.versions[goal].xmax_cid = snap.cid;
@@ -3044,9 +4285,11 @@ pub fn Database(comptime config: Config) type {
             if (slot) |owner| if (self.active(owner)) {
                 snap = .{ .csn = self.csn, .slot = owner, .epoch = self.txs[owner].epoch, .cid = self.txs[owner].cid +% 1 };
             };
-            var context = self.bindContext(source, .standard, snap);
+            var statement_copy = parsed;
+            const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy);
+            var context = self.bindContext(expanded, .standard, snap);
             context.describe_only=true;
-            const bound = try B.bind(&context, &parsed);
+            const bound = try B.bind(&context, &statement_copy);
             result.clear(0);
             result.command = B.command(&bound);
             const returning: ?*const B.Returning = switch (bound) {

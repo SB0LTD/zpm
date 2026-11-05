@@ -114,6 +114,25 @@ pub const Config = struct {
     /// User schemas (CREATE SCHEMA) beyond pg_catalog, public and
     /// information_schema. More raise TableCapacity (54000).
     schemas: usize = 4,
+    /// Secondary indexes per table (CREATE INDEX). More raise IndexCapacity
+    /// (54000) and change nothing.
+    table_indexes: usize = 4,
+    /// Entries one secondary index can hold: every row version of its table
+    /// (pending and dead ones until reclaimed). 0 selects the version arena
+    /// capacity (versions_per_table) with inline storage, and no secondary
+    /// index storage at all with external_storage (CREATE INDEX is then
+    /// IndexCapacity). A write past it, after reclamation, is IndexCapacity
+    /// (54000) with the statement rolled back. Entries live inline in the
+    /// table: table_indexes x 2 x index_entries u32 per table (power of two).
+    index_entries: usize = 0,
+    /// Statement text plus the view, inheritance and partition expansions
+    /// it reads, copied into the statement workspace. A statement that reads
+    /// a view, an inheritance parent or a partitioned table and needs more
+    /// is TextCapacity (54000).
+    expansion_bytes: usize = 4096,
+    /// SET CONSTRAINTS name lists remembered per transaction (names beyond
+    /// it are TableCapacity, 54000).
+    constraint_modes: usize = 8,
 };
 
 pub fn workRows(comptime config: Config) usize {
@@ -301,6 +320,18 @@ pub const Error = error{
     InvalidXmlDocument,
     /// SQLSTATE 2200L: XMLSERIALIZE(DOCUMENT ...) of a value that is not one.
     NotAnXmlDocument,
+    /// SQLSTATE 23503: a row violates a FOREIGN KEY constraint.
+    ForeignKeyViolation,
+    /// SQLSTATE 23P01: a row conflicts with an EXCLUDE constraint.
+    ExclusionViolation,
+    /// SQLSTATE 54000: a table's secondary indexes (Config.table_indexes)
+    /// or a secondary index's entries (Config.index_entries) are full.
+    IndexCapacity,
+    /// SQLSTATE 42830: a FOREIGN KEY whose referenced columns are not a
+    /// primary key or unique constraint of the referenced table.
+    InvalidForeignKey,
+    /// SQLSTATE 55000: a materialized view that has not been populated.
+    ObjectNotInPrerequisiteState,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -771,7 +802,7 @@ pub fn typeFromOid(oid: u32) ?DataType {
 pub const DefaultKind = enum(u8) { none = 0, default = 1, identity_always = 2, identity_by_default = 3, generated = 4 };
 
 /// Statement kind of a completed (or described) statement.
-pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy, truncate, alter_table, alter_sequence, create_schema, drop_schema };
+pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_index, drop_index, create_view, drop_view, create_materialized_view, drop_materialized_view, refresh_materialized_view, merge, set_constraints, create_table_as };
 
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;
@@ -898,6 +929,10 @@ pub fn Values(comptime config: Config) type {
             default_kind: DefaultKind = .none,
             /// Source text of the DEFAULT or generation expression.
             expression: Text = .{},
+            /// GENERATED ALWAYS AS (expr) VIRTUAL (default_kind generated):
+            /// catalogs report 'v'. The immutable expression is evaluated
+            /// when a row is written, so reads equal evaluation on read.
+            virtual: bool = false,
         };
 
         pub fn cellTag(data_type: DataType) CellTag {

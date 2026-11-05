@@ -1,5 +1,55 @@
 # SQL conformance TDD checkpoint
 
+## Schema-object candidate (lane B11, wave 2) - 5 November 2026
+
+Branch `b11/schema-objects` (rebased on d91020c) closes the thirteen
+schema-object smoke programs test-first: PG.INDEX.SECONDARY,
+PG.INDEX.ADVANCED, PG.DML.UPSERT_UNIQUE, PG.CONSTRAINT.FK,
+PG.CONSTRAINT.DEFERRED, PG.CONSTRAINT.EXCLUSION, PG.VIEW.ORDINARY,
+PG.VIEW.MATERIALIZED, PG.DDL.CREATE_VARIANTS, PG.DML.MERGE,
+PG.DDL.VIRTUAL, PG.DDL.INHERITANCE and PG.DDL.PARTITION. The unchanged
+driver moves from 45 passes (d91020c) to 58; it still exits 1
+SqlConformanceIncomplete and no other program changed.
+`contract-sql-schema-objects` (tests/test_sql_schema_objects.sig) covers
+values, exact SQLSTATEs (23503, 23505, 23514, 23P01, 23502, 2BP01, 42P07,
+42P01, 42703, 42704, 42701, 42804, 42809, 42830, 42P10, 42P16, 42P17,
+55000, 21000, 428C9, 0A000, 54000), statement atomicity, concurrent
+schedules (unique-index and upsert races, FOREIGN KEY insert against parent
+delete, exclusion waits, deferred commits, MERGE EvalPlanQual and source
+locks, DROP against view creators) and replay of every committed record
+into a replica that must answer like the primary. Only the thirteen oracle
+programs are native-verified; every other expectation is pending native
+verification.
+
+Durability: no new change-record op was needed. Every new object rides on
+the existing table definition ops (1 create_table, 12 alter_table, 2
+drop_table, 11 truncate, 3/4/5 rows) with definition format version 3,
+written only when a definition needs it (version-1/2 records stay byte
+identical and still replay): column flag bit 5 VIRTUAL; constraint kinds 4
+FOREIGN KEY and 5 EXCLUDE with DEFERRABLE / INITIALLY DEFERRED flags;
+relkind ('r', 'v', 'm', 'p'), secondary indexes with their OIDs, view query
+text and dependencies, the inheritance / partition parent and the partition
+strategy and bound. CREATE / DROP INDEX and REFRESH ... [NO] DATA rewrite
+the table through op 12; views and materialized views are op 1 / op 2;
+REFRESH logs op 11 plus inserts.
+
+Limits: Config.table_indexes (4) secondary indexes per table and
+Config.index_entries entries per index (0: the version arena; no storage
+with external_storage), IndexCapacity 54000; Config.expansion_bytes (4096)
+for a statement plus its expanded views / inheritance / partition texts,
+TextCapacity 54000; Config.constraint_modes (8) SET CONSTRAINTS names;
+8 MERGE WHEN clauses. CREATE / DROP INDEX and REFRESH WITH [NO] DATA copy
+the table slot like ALTER TABLE (AccessExclusive, a free slot until
+commit). Indexes are hash multimaps over plain key columns (equality only);
+expression elements and predicates are definitions. UNIQUE / FOREIGN KEY /
+EXCLUDE checks scan the version arena. Views are read-only; UPDATE/DELETE
+through an inheritance parent with children and keys on partitioned tables
+are 0A000; TEMP tables are ordinary durable tables. Non-deferrable foreign
+keys are checked per row (PostgreSQL checks NO ACTION at statement end);
+deferred checks never wait for another live writer (that writer's own
+check sees the commit). No SQL family, production or native parity claim
+follows from these smokes.
+
 ## Advanced types candidate (lane B11) - 5 November 2026
 
 Branch `b11/types-advanced` (on 8458d77) closes six smoke programs
