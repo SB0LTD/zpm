@@ -140,22 +140,22 @@ pub const Layout = struct {
 
 // ── The builder ─────────────────────────────────────────────────────────────
 
-fn R(v: V) Arg {
+pub fn R(v: V) Arg {
     return .{ .reg = v };
 }
-fn U(x: u32) Arg {
+pub fn U(x: u32) Arg {
     return .{ .imm = x };
 }
-fn F(x: f32) Arg {
+pub fn F(x: f32) Arg {
     return .{ .imm = @bitCast(x) };
 }
-fn I(x: i32) Arg {
+pub fn I(x: i32) Arg {
     return .{ .imm = @bitCast(x) };
 }
-const NO: Arg = kir.no;
+pub const NO: Arg = kir.no;
 
 /// The `i`th register of a vector `v` (Kernel.vec).
-fn at(v: V, i: usize) V {
+pub fn at(v: V, i: usize) V {
     return @enumFromInt(@intFromEnum(v) + @as(u16, @intCast(i)));
 }
 
@@ -163,7 +163,7 @@ fn isInt(t: Ty) bool {
     return t == .u32 or t == .i32;
 }
 
-fn log2(x: u32) u5 {
+pub fn log2(x: u32) u5 {
     return @intCast(std.math.log2_int(u32, x));
 }
 
@@ -171,7 +171,8 @@ fn log2(x: u32) u5 {
 pub const DD = struct { hi: V, lo: V };
 
 /// Kernel text the way these kernels write it: SSA values (a fresh register
-/// each), `set` for what a loop carries.
+/// each), `set` for what a loop carries. Public, with R, U, F, I, NO, at,
+/// begin and expGgml: other kernel files (lfm3_kir_codec) build with it.
 pub const Builder = struct {
     k: *kir.Kernel,
     caps: Caps,
@@ -649,7 +650,7 @@ pub const Builder = struct {
     }
 };
 
-fn begin(s: kir.Storage, name: []const u8, threads: u32) kir.Kernel {
+pub fn begin(s: kir.Storage, name: []const u8, threads: u32) kir.Kernel {
     return kir.Kernel.init(s, name, .{ threads, 1, 1 });
 }
 
@@ -1999,7 +2000,7 @@ pub fn copy(s: kir.Storage, caps: Caps) Error!kir.Kernel {
 // on every GPU.
 
 /// a * b + c, as the CPU's @mulAdd where the GPU fuses.
-fn mulAdd(b: *Builder, a: Arg, x: Arg, c: Arg) V {
+pub fn mulAdd(b: *Builder, a: Arg, x: Arg, c: Arg) V {
     return b.fma(a, x, c);
 }
 
