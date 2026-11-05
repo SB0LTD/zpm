@@ -403,7 +403,9 @@ fn upsertUnique() !void {
     try run("INSERT INTO pair VALUES (1, NULL, 7) ON CONFLICT (a, b) DO UPDATE SET c = EXCLUDED.c");
     try run("CREATE UNIQUE INDEX pair_c ON pair (c)");
     try run("INSERT INTO pair VALUES (2, 2, 5) ON CONFLICT (c) DO UPDATE SET a = 3");
-    try run("INSERT INTO pair VALUES (4, 4, 7) ON CONFLICT ON CONSTRAINT pair_c DO NOTHING");
+    // A unique index is an inferred arbiter, but not a constraint (42704).
+    try rejects("INSERT INTO pair VALUES (4, 4, 7) ON CONFLICT ON CONSTRAINT pair_c DO NOTHING", error.UndefinedObject, "SELECT a, b, c FROM pair ORDER BY a, b, c", "1|NULL|0;1|NULL|7;3|1|5");
+    try run("INSERT INTO pair VALUES (4, 4, 7) ON CONFLICT (c) DO NOTHING");
     try expect("SELECT a, b, c FROM pair ORDER BY a, b, c", "1|NULL|0;1|NULL|7;3|1|5");
     // A deferrable constraint is not an arbiter (42809).
     try run("CREATE TABLE late (k INT UNIQUE DEFERRABLE)");
