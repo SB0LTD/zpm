@@ -821,7 +821,8 @@ fn link(p: *Program, log: *glsl.pp.Log) bool {
     // the sources kept, the code checked, the pipeline made
     p.vs_src = poolDup(&objs[p.vs - 1].source) orelse return outOfPool(log);
     p.fs_src = poolDup(&objs[p.fs - 1].source) orelse return outOfPool(log);
-    if (!checkCode(p, log)) return false;
+    var quads = false;
+    if (!checkCode(p, log, &quads)) return false;
     var attrs: u32 = 0;
     for (l.attribs[0..l.nattribs]) |a| attrs = @max(attrs, a.loc + slotsOf(a.ty));
     var flat: u64 = 0;
@@ -829,7 +830,7 @@ fn link(p: *Program, log: *glsl.pp.Log) bool {
         if (!v.flat) continue;
         for (0..wordsOf(v.ty)) |w| flat |= @as(u64, 1) << @intCast(v.word + w);
     }
-    p.pipe = raster.Pipeline.init(.{ .ctx = p, .attrs = @intCast(attrs), .varyings = @intCast(l.vary_words), .flat = flat, .textures = @intCast(l.nslots), .vertex = emitVertex, .fragment = emitFragment });
+    p.pipe = raster.Pipeline.init(.{ .ctx = p, .attrs = @intCast(attrs), .varyings = @intCast(l.vary_words), .flat = flat, .textures = @intCast(l.nslots), .quads = quads, .vertex = emitVertex, .fragment = emitFragment });
     p.has_pipe = true;
     return true;
 }
@@ -942,8 +943,9 @@ var check_insts: [engine.MAX_KIR]kir.Inst = undefined;
 var check_tys: [engine.MAX_KIR]kir.Ty = undefined;
 
 /// Both shaders generated once, into a kernel of their own, and verified:
-/// what cannot be generated fails the link, not a draw.
-fn checkCode(p: *const Program, log: *glsl.pp.Log) bool {
+/// what cannot be generated fails the link, not a draw. `quads`: the
+/// fragment shader takes derivatives (its draws run whole quads).
+fn checkCode(p: *const Program, log: *glsl.pp.Log, quads: *bool) bool {
     const st = kir.Storage{ .insts = &check_insts, .tys = &check_tys };
     {
         var k = kir.Kernel.init(st, "glsl_vertex", .{ raster.VERTEX_GROUP, 1, 1 });
@@ -970,8 +972,12 @@ fn checkCode(p: *const Program, log: *glsl.pp.Log) bool {
         for (&io.varying) |*v| v.* = k.reg(.f32);
         for (&io.frag_coord) |*v| v.* = k.reg(.f32);
         io.front_facing = k.reg(.pred);
+        io.quads = true;
+        io.odd_x = k.reg(.pred);
+        io.odd_y = k.reg(.pred);
         if (!scratch.compile(poolText(p.fs_src), .fragment)) return codeFailed(log, "fragment", "it no longer compiles");
         if (!glsl.gen.fragment(&scratch, layoutOf(p), &k, &io, log)) return codeFailed(log, "fragment", "");
+        quads.* = io.derivatives;
         for (io.color) |v| {
             if (v != .none) k.store(.f32, kir.global(io.uniforms, 32), kir.u(0), kir.r(v));
         }

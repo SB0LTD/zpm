@@ -11,7 +11,7 @@ Unmodified Firefox and Chromium (Alpine's and Flatpak's) are the first targets. 
 | `gfxapi.sig` | The module root (`gfxapi` in zpm's build). |
 | `engine.sig` | Images in GPU memory, filled and copied by KIR kernels through any `gpu.Device`. It batches work, waits only where needed, keeps the caches in step, and falls back to the CPU. |
 | `gles.sig` | OpenGL ES 3.0's objects and state: what the C entry points call. |
-| `raster.sig` | Drawing: GL's draws as three KIR kernels (vertices, triangle setup, tiles), the same on every GPU and on the CPU. |
+| `raster.sig` | Drawing: GL's draws as KIR kernels (vertices, triangle setup, bins, tiles), the same on every GPU and on the CPU. |
 | `glenum.sig` | GL's enum values. |
 | `texture.sig` | Texture reads in KIR: `texelFetch`, sampled reads (nearest or bilinear; repeat, clamp, mirrored repeat), `textureSize`, one code for every format. |
 | `texfmt.sig` | GL ES's texture formats as the engine stores them: each upload GL allows, its conversion and its swizzle. |
@@ -44,7 +44,7 @@ Textures, buffers, renderbuffers and sampler objects live in an `Objects` table 
 
 ### Draws
 
-A draw is three KIR kernels, recorded as three dispatches in the engine's open batch:
+A draw is three KIR kernels of its pipeline's and one every pipeline shares, recorded as dispatches in the engine's open batch:
 
 1. **Vertices**, a thread per vertex of each instance.
    - Attributes are fetched in any of GL's integer and float formats, normalized or not, or taken from `glVertexAttrib*` where an array is off, or per instance (divisor 1).
@@ -54,14 +54,23 @@ A draw is three KIR kernels, recorded as three dispatches in the engine's open b
    - It takes a topology's vertices (lists, strips, fans; the last vertex provokes).
    - It computes the signed area exactly in 64 bits, culls, and turns the triangle counter-clockwise.
    - It records the triangle's pixel box, three integer edge equations with a tie rule, and plane equations for depth, 1/w and the varyings.
-3. **Tiles**, a group per 8×8 pixels.
-   - The tile's pixels and depth are loaded once, then every triangle is drawn in GL's order.
-   - A tile outside a triangle's box, or wholly outside one edge, skips it. Otherwise each edge's constant for the tile is computed in 64 bits, then each pixel's coverage in 32.
+3. **Bins**, a group per 64×64 pixels (8×8 tiles), shared by every pipeline.
+   - Its 64 threads test 64 triangles' boxes against the bin at a time. The hits are compacted in GL's order through a scan in shared memory and listed after the triangle records.
+   - A list holds up to 2048 triangles (fewer when the draw has fewer). Past that, the bin's tiles go through every triangle.
+   - A draw whose rectangle is one bin is not binned.
+4. **Tiles**, a group per 8×8 pixels.
+   - The tile's pixels and depth are loaded once. Then the triangles of its bin's list (or all of them, unbinned) are culled 64 at a time: each thread tests one triangle's box against the tile, and the hits are compacted in order into shared memory. The group draws them in GL's order.
+   - A tile wholly outside one of a triangle's edges skips it. Otherwise each edge's constant for the tile is computed in 64 bits, then each pixel's coverage in 32.
    - Then come the depth test, perspective-correct varyings, the shader's fragment code, and blending (every GL factor and equation, `SRC_ALPHA_SATURATE` too), with color masks and scissor. The pixels and depth are stored once.
 
-Coverage is integer arithmetic, and every float operation is one KIR defines bit for bit, so a frame is the same bytes on the Adreno, the RTX and the CPU. A pixel on an edge two triangles share is drawn exactly once.
+Coverage is integer arithmetic, and every float operation is one KIR defines bit for bit, so a frame is the same bytes on the Adreno, the RTX and the CPU. A pixel on an edge two triangles share is drawn exactly once. Binning changes no pixel: binned, unbinned and with lists that run over, a frame is the same bytes as before it.
 
-On the CPU (no GPU, or it is lost), KIR's interpreter runs the same three kernels on the images' memory.
+Culling 64 triangles at a time and binning cut the work a tile does for the triangles that miss it. On a 200×136 scene of 262 triangles, KIR's interpreter runs 167 million thread-instructions with the kernels before binning, 49 million unbinned and 43 million binned. Most of what remains is shading. Binning saves more as a target and its triangle count grow.
+
+- **Color targets** are RGBA8, BGRA8, RG8 and R8 (WebRender's masks): 4, 2 or 1 bytes a pixel, loaded and stored at their width. An RG8 or R8 pixel's channels are RGBA8's first bytes: what it lacks reads 0, and alpha 1. Clears, color masks, copies and reads take them too.
+- **Derivatives.** A fragment shader that takes them (`dFdx`, `dFdy`, `fwidth`) runs whole 2×2 quads. A quad with a pixel to draw runs the code in all four, and the pixels not drawn are helpers. A derivative is the difference with the quad's neighbour, through a shuffle. The tile's lanes are its pixels in order, so the neighbours are lanes `xor 1` and `xor 8`. Programs without derivatives run covered pixels alone.
+
+On the CPU (no GPU, or it is lost), KIR's interpreter runs the same kernels on the images' memory.
 
 Shaders are KIR emitters (`raster.Shaders`): a GLSL program's (below), or the driver's own (`usePipeline`). A draw has up to 60 scalar varyings (GL ES's 15 vectors). A flat varying keeps the provoking vertex's bits, so an integer's survive.
 
@@ -100,11 +109,15 @@ A link keeps copies of its shaders' sources and makes the program's pipeline. It
 - **Built-ins:** every one of the checker's. Approximate ones use KIR's approximate ops: `sin`, `cos`, `exp2`, `log2`, `inversesqrt`, `normalize`, and what is built of them. `atan` is a polynomial with an error of about 1e-5. `sqrt`, `length` and divisions are exact. Half floats are packed in integer arithmetic, exactly.
 - **Samplers** are their texture slots, as immediates, so they pass to functions as values. A texture function reads its slot through `texture.sig`.
 - **Divisions:** `/` by a power of two is a multiplication, which gives the same result. Each other division is KIR's exact `fdiv`. On ir3 its expansion's temporaries stay live through the raster's triangle loop, so a fragment shader affords about 35 of them.
-- **Not yet:** cube, 3D, array and shadow samplers (they read 0), a sampler chosen at run time, derivatives (0: the raster has no helper pixels yet), `gl_FragDepth`, `gl_PointSize`, and color attachments past the first.
+- **Derivatives** are shuffles with the quad's neighbour (see Draws). The link notes a fragment shader that takes them, and its draws run whole quads.
+  - GL leaves a derivative undefined in control flow that is not uniform; here it is 0. A shuffle there could read a lane that isn't running: a trap in KIR's interpreter, garbage on a GPU.
+  - After the fragment code is generated, a check finds where its control flow may differ between lanes. That is an `if` on a value that differs between pixels, the rest of a loop's pass after a break or continue on one, the whole of a loop left that way that runs more than one pass, and what follows a `return` or `discard` that some pixels take. It is a fixpoint over KIR: thread ids, shuffles and what they reach are divergent.
+  - A derivative's shuffle at such a place becomes a copy of the pixel's own value, so the derivative is 0.
+- **Not yet:** cube, 3D, array and shadow samplers (they read 0), a sampler chosen at run time, `gl_FragDepth`, `gl_PointSize`, and color attachments past the first.
 
 ### Textures
 
-- **Formats.** A texture's image is in one of the engine's formats. Draws write RGBA8 and BGRA8. Draws only read the sampling formats: R8, RG8, f32, i32 and u32 with 1, 2 or 4 channels. `texfmt.sig` maps every upload GL ES 3.0 takes to them:
+- **Formats.** A texture's image is in one of the engine's formats. Draws write RGBA8, BGRA8, RG8 and R8. Draws only read the other sampling formats: f32, i32 and u32 with 1, 2 or 4 channels. `texfmt.sig` maps every upload GL ES 3.0 takes to them:
   - the sized formats (RGBA8, SRGB8_ALPHA8, RGB8, RGB565, RGBA4, RGB5_A1, R8, RG8, the 16F and 32F ones, and the 8-, 16- and 32-bit integer ones);
   - ES 2.0's unsized ones, LUMINANCE, ALPHA and LUMINANCE_ALPHA included;
   - `OES_texture_float` and `_half_float`, and BGRA.
@@ -120,7 +133,8 @@ A link keeps copies of its shaders' sources and makes the program's pipeline. It
   - Integer samplers read nearest. A unit with no complete texture reads (0, 0, 0, 1).
 
   Every operation but sRGB's is one KIR defines bit for bit, so a sample is the same bytes on every GPU and on the CPU.
-- **Not yet:** mipmaps, cube, 3D and array textures, depth textures and shadow comparisons, compressed formats, RGB10_A2, R11F_G11F_B10F and RGB9_E5, norm16. Render targets other than RGBA8 and BGRA8 (WebRender's R8 masks) come with stage 5e. Every float sample reads four texels, nearest ones too, and loads four words a texel. A sampler's code specialized to its texture's format and filter is for later.
+- **Render targets.** A texture is color-renderable when its internal format is (ES 3.0's table: RGBA8, RGB8, the 16-bit packed ones, R8, RG8, BGRA8, and the unsized RGBA and RGB) and it is stored as a format draws write. LUMINANCE and ALPHA aren't renderable, and sRGB isn't yet. `glReadPixels` takes RGBA, BGRA, and the framebuffer's own format: RED for R8, RG for RG8 (`IMPLEMENTATION_COLOR_READ_FORMAT`). `glCopyTex*Image2D` copies into a texture of the source's channels or fewer.
+- **Not yet:** mipmaps, cube, 3D and array textures, depth textures and shadow comparisons, compressed formats, RGB10_A2, R11F_G11F_B10F and RGB9_E5, norm16, float and integer render targets. Every float sample reads four texels, nearest ones too, and loads four words a texel. A sampler's code specialized to its texture's format and filter is for later.
 
 Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
 
@@ -158,7 +172,7 @@ Each context is current per thread. The current context is kept in a fixed table
 
 The library's panic handler prints one line and exits, as a failed assertion in a C driver does. It needs neither TLS nor a stack walk. EGL's tables, and the render node's, are filled at first use, so they take no room in the file.
 
-As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library has no `DT_NEEDED` entries and no TLS segment. Its only undefined symbols are the weak `dlsym` and `dl_iterate_phdr`, which the dynamic linker binds from the program's C library. It is 1324 KB on aarch64 and 1370 KB on x86_64: the CPU fallback carries KIR's interpreter and the draw kernels' builders, and the GLSL compiler adds about 310 KB. Its tables (EGL's, the engine's kernel space, the compile scratch, the code generator's, the text pool, the programs) are bss, about 49 MB of address space, touched only as used.
+As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library has no `DT_NEEDED` entries and no TLS segment. Its only undefined symbols are the weak `dlsym` and `dl_iterate_phdr`, which the dynamic linker binds from the program's C library. It is 1364 KB on aarch64 and 1408 KB on x86_64: the CPU fallback carries KIR's interpreter and the draw kernels' builders, and the GLSL compiler adds about 310 KB. Its tables (EGL's, the engine's kernel space, the compile scratch, the code generator's, the text pool, the programs) are bss, about 49 MB of address space, touched only as used.
 
 ## What is done
 
@@ -201,13 +215,17 @@ That makes 187 GL entry points.
 
 **Stage 5d, textures:** the formats, uploads, reads and sampler objects above. Both stages read textures, so vertex texture fetch works too. There are 11 new GL entry points (sampler objects, `glGenerateMipmap`), 198 in all.
 
+**Stage 5e:**
+- binning: a bin kernel lists each 64×64 pixels' triangles, and tiles cull 64 at a time in shared memory;
+- R8 and RG8 render targets: draws, clears, color masks, copies and reads;
+- derivatives: quads with helper pixels, and 0 in control flow that is not uniform.
+
 **Not yet:**
-- derivatives, uniform blocks, transform feedback, queries, GL sync objects;
+- uniform blocks, transform feedback, queries, GL sync objects;
 - points and lines;
 - clipping: a triangle with a vertex at w ≤ 0, or past a guard band of 24576 pixels, is dropped;
 - stencil tests, several color attachments, depth-only drawing;
 - half-float and packed attribute formats, divisors past 1, attribute arrays in client memory;
-- binning triangles to tiles, which every tile now visits in turn;
 - texture levels above 0, other texture targets, the texture formats listed under Textures;
 - multisampling;
 - EGLImages of GL textures (`EGL_KHR_gl_texture_2D_image`) and dma-buf export (`EGL_MESA_image_dma_buf_export`), with `libgbm` (stage 7);
@@ -243,6 +261,16 @@ sig build test-gfxapi
   - scissor with a color mask, flat shading, and a fan on the window's top-down buffer.
 
   With the tie rule broken, the check fails.
+
+  A second scene is larger than a bin: 256 half-transparent triangles all over a 200×136 target (their order shows), big ones across bins under a scissor box off the bins' grid, and a thin strip. Binned, unbinned, and with lists of 24 that run over, it gives the same bytes on the CPU. `EmuDevice` (lists that run over) and the emulated Adreno (binned) give them too.
+- `test-gfxapi-targets`: R8 and RG8 targets on the CPU, on `EmuDevice` and on the emulated Adreno (ir3), the same bytes and the values GL says. An R8 texture is cleared, drawn into with additive blending, drawn into under a color mask that keeps its red, and given a corner copied from an RGBA8 framebuffer's red. It is read back as RED (its read format) and as RGBA. An RG8 texture is cleared, half drawn over, and read back as RG. An RG8 renderbuffer is complete and gives its sizes. A program samples both masks into an RGBA8 target.
+- `test-gfxapi-deriv`: a program with derivatives on the CPU, on `EmuDevice` and on the emulated Adreno (ir3), the same bytes and the values GL says. It draws four quads, one a mode:
+  - steps of 1 across and up, the triangles' shared diagonal too, and a product's `fwidth`;
+  - a circle's edge antialiased over a pixel with `fwidth`, as WebRender's clip shaders do;
+  - a derivative under an `if` that splits quads (0), and one after it (1 again);
+  - one after a `discard` that splits quads (0).
+
+  Without the flow check, the CPU run traps on a shuffle from a lane that isn't running.
 - `test-gfxapi-egl`: EGL on a fake Wayland compositor that answers as Galaxy's bridge does, with the engine on `EmuDevice`. It checks:
   - the display's queue and binding;
   - each frame's dma-buf (fd, stride, modifier), `create_immed`'s size and format, and attach, damage, frame, commit and flush;
@@ -275,7 +303,8 @@ sig build test-gfxapi
 | 5b | Done: the GLSL ES 1.00 and 3.00 front end (the preprocessor, parser, types and built-ins); shader and program objects, linking, uniforms and attributes by name | zpm |
 | 5c | Done: GLSL to KIR, the vertex and fragment code draws run; the same bytes on the CPU and the emulated Adreno | zpm |
 | 5d | Done: textures. GL ES 3.0's formats (R8, RG8, the float and integer ones, the legacy ones), sampled reads (nearest, bilinear, every wrap), `texelFetch`, sampler objects, in both stages; the same bytes on the CPU and the emulated Adreno | zpm |
-| 5e | Triangles binned to tiles; render targets in R8 (WebRender's masks); helper pixels for derivatives; then what WebRender asks beyond that, until Firefox's WebRender draws on the GPU | zpm |
+| 5e | Done: triangles binned to tiles; render targets in R8 and RG8 (WebRender's masks); helper pixels for derivatives; the same bytes on the CPU and the emulated Adreno | zpm |
+| 5f | What WebRender asks beyond that (its shaders compiled and linked, mipmaps, what they find), until Firefox's WebRender draws on the GPU | zpm |
 | 6 | Chromium through ANGLE on GLES | zpm |
 | 7 | `libgbm.so.1` | zpm |
 | 8 | Packaging: the libraries in Galaxy's root under Mesa's names; `mesa-*` provided by Galaxy; a Flatpak GL extension | Galaxy |

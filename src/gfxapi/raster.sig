@@ -1,5 +1,6 @@
-//! @zpm/gfxapi raster — GL's draws as three KIR kernels per pipeline, the
-//! same on every GPU (ir3, sm_120) and on the CPU (KIR's interpreter):
+//! @zpm/gfxapi raster — GL's draws as three KIR kernels per pipeline and
+//! one for every pipeline, the same on every GPU (ir3, sm_120) and on the
+//! CPU (KIR's interpreter):
 //!
 //! 1. **vertex** (a thread per vertex of each instance): the attributes
 //!    fetched (any of GL's formats, a constant where an array is off, an
@@ -13,10 +14,15 @@
 //!    box, three edge equations in integers with a tie rule (a pixel on
 //!    an edge two triangles share is drawn by exactly one), and plane
 //!    equations for depth, 1/w and each varying.
-//! 3. **raster** (a group per TILE x TILE pixels, a thread per pixel): the
-//!    tile's pixels and depth loaded once, then every triangle in order
-//!    (GL's order: blending is right): a tile outside its box or one of
-//!    its edges skipped; coverage exact (each edge's constant for the tile
+//! 3. **bin** (a group per BIN x BIN pixels, a thread per triangle at a
+//!    time): the triangles whose boxes meet the bin, listed in order; a
+//!    draw whose rectangle is one bin has none.
+//! 4. **raster** (a group per TILE x TILE pixels, a thread per pixel): the
+//!    tile's pixels and depth loaded once, then its bin's triangles in
+//!    order (GL's order: blending is right), 64 at a time: each thread
+//!    tests one's box against the tile and the hits are compacted in
+//!    shared memory; a tile outside one of a triangle's edges is skipped;
+//!    coverage exact (each edge's constant for the tile
 //!    in 64 bits, then 32-bit per pixel); depth interpolated, clipped to
 //!    the depth range, tested; the varyings interpolated and divided by
 //!    the interpolated 1/w; the shader's fragment code; blending (every
@@ -27,10 +33,13 @@
 //! multiply-add), so a frame is the same bytes on the Adreno, the RTX and
 //! the CPU.
 //!
+//! Color targets: RGBA8, BGRA8, RG8 and R8 (WebRender's masks).
+//!
 //! Not yet: points and lines; clipping (a triangle with a vertex at w <= 0,
 //! or beyond GUARD pixels, is dropped: a guard band); multisampling;
-//! several color attachments; stencil tests. Shaders are KIR emitters
-//! (`Shaders`): GLSL programs' (glsl/gen.sig), or Sig code.
+//! several color attachments; stencil tests; float and integer targets.
+//! Shaders are KIR emitters (`Shaders`): GLSL programs' (glsl/gen.sig), or
+//! Sig code.
 //!
 //! Allocation-free: kernels are built into the caller's storage.
 
@@ -65,6 +74,22 @@ const LIMIT: u32 = 1 << 29;
 
 pub const VERTEX_GROUP = 64;
 pub const SETUP_GROUP = 64;
+/// Tiles a side of a bin: the bin kernel lists, for each BIN x BIN pixels,
+/// the triangles whose boxes meet them (in order), and a tile goes
+/// through its bin's list alone.
+pub const BIN_TILES = 8;
+const BIN_SHIFT = 3;
+pub const BIN = TILE * BIN_TILES;
+/// Triangles a bin's list holds at most (Engine.bin_cap may lower it);
+/// past it, the bin's tiles go through every triangle.
+pub const BIN_CAP = 2048;
+/// Triangles a group culls at once: a tile's threads, and the bin
+/// kernel's group, one triangle each.
+const CULL = TILE * TILE;
+
+comptime {
+    std.debug.assert(BIN_TILES == 1 << BIN_SHIFT and CULL == 64);
+}
 
 // ── What a pipeline's shaders are ──────────────────────────────────────────
 
@@ -83,7 +108,19 @@ pub const VertexIO = struct {
     varying: [MAX_VARYINGS]V = [_]V{.none} ** MAX_VARYINGS,
 };
 
+/// A lane's quad neighbours (KIR's lanes are a group's threads in order,
+/// x fastest: a tile's pixel (x, y) is lane y * TILE + x): xor these.
+pub const QUAD_X = 1;
+pub const QUAD_Y = TILE;
+
 pub const FragmentIO = struct {
+    /// whole 2 x 2 quads run the code (pixels not drawn among them as
+    /// helpers): a derivative is a difference with the quad's neighbour,
+    /// through a shuffle (lane xor QUAD_X, QUAD_Y)
+    quads: bool = false,
+    /// (quads) preds: the pixel is its quad's right one, its top one
+    odd_x: V = .none,
+    odd_y: V = .none,
     varying: [MAX_VARYINGS]V = undefined,
     /// gl_FragCoord: x + 0.5, y + 0.5, depth, 1/w
     frag_coord: [4]V = undefined,
@@ -95,6 +132,8 @@ pub const FragmentIO = struct {
     /// drops the fragment (discard), if the shader sets one
     color: [4]V = .{ .none, .none, .none, .none },
     discard: V = .none,
+    /// the code takes derivatives (set by the fragment emitter)
+    derivatives: bool = false,
 };
 
 /// The shaders: KIR emitters (what GLSL compiles to, or Sig code).
@@ -108,6 +147,9 @@ pub const Shaders = struct {
     /// textures both stages may read (texture.sig), bound after each
     /// kernel's own buffers
     textures: u8 = 0,
+    /// the fragment code takes derivatives: the raster runs it for whole
+    /// quads (FragmentIO.quads)
+    quads: bool = false,
     vertex: *const fn (?*const anyopaque, *kir.Kernel, *VertexIO) void,
     fragment: *const fn (?*const anyopaque, *kir.Kernel, *FragmentIO) void,
 };
@@ -266,6 +308,67 @@ fn sub64(k: *kir.Kernel, x: W64, y: W64) W64 {
     const lo = k.op2(.isub, .u32, r(x.lo), r(y.lo));
     const borrow = k.sel(.u32, r(k.cmp(.u32, .lt, r(x.lo), r(y.lo))), u(1), u(0));
     return .{ .lo = lo, .hi = k.op2(.isub, .i32, r(k.op2(.isub, .i32, r(x.hi), r(y.hi))), r(borrow)) };
+}
+
+// ── Culling a group's triangles at once ────────────────────────────────────
+
+fn shAt(off: u32) kir.Mem {
+    var m = kir.shared(32);
+    m.imm = @intCast(off);
+    return m;
+}
+
+/// Two arrays of CULL words in shared memory: a scan's.
+const Scan = struct { a: u32, b: u32 };
+
+fn scanAlloc(k: *kir.Kernel) Scan {
+    return .{ .a = k.sharedAlloc(CULL * 4, 4), .b = k.sharedAlloc(CULL * 4, 4) };
+}
+
+/// Ordered compaction over the group's CULL threads (`t` is the thread's
+/// linear index): its place among the threads before it that have `hit`,
+/// and how many have it. A scan in shared memory, its barriers included:
+/// call it where the whole group is, never under divergence.
+fn compact(k: *kir.Kernel, sc: Scan, t: V, hit: V) struct { pos: V, total: V } {
+    const x = k.sel(.u32, r(hit), u(1), u(0));
+    const t4 = k.op2(.shl, .u32, r(t), u(2));
+    k.store(.u32, shAt(sc.a), r(t4), r(x));
+    k.barrier();
+    var cur = sc.a;
+    var nxt = sc.b;
+    var d: u32 = 1;
+    while (d < CULL) : (d *= 2) {
+        const v = k.load(.u32, shAt(cur), r(t4));
+        const has = k.cmp(.u32, .ge, r(t), u(d));
+        const o4 = k.sel(.u32, r(has), r(k.op2(.isub, .u32, r(t4), u(4 * d))), r(t4));
+        const p = k.load(.u32, shAt(cur), r(o4));
+        k.store(.u32, shAt(nxt), r(t4), r(k.op2(.iadd, .u32, r(v), r(k.sel(.u32, r(has), r(p), u(0))))));
+        k.barrier();
+        const sw = cur;
+        cur = nxt;
+        nxt = sw;
+    }
+    const incl = k.load(.u32, shAt(cur), r(t4));
+    const total = k.load(.u32, shAt(cur), u(4 * (CULL - 1)));
+    // (every read done before the next scan writes)
+    k.barrier();
+    return .{ .pos = k.op2(.isub, .u32, r(incl), r(x)), .total = total };
+}
+
+/// Whether triangle record `base`'s pixel box meets [x0, x1] x [y0, y1]
+/// (inclusive) and the triangle is drawn.
+fn meets(k: *kir.Kernel, b: u8, base: V, x0: V, y0: V, x1: V, y1: V) V {
+    const ld = struct {
+        fn w(kk: *kir.Kernel, bb: u8, bs: V, word: u32, ty: kir.Ty) V {
+            return kk.load(ty, memAt(bb, word * 4), r(bs));
+        }
+    }.w;
+    const valid = ld(k, b, base, S_VALID, .u32);
+    var hit = k.cmp(.u32, .ne, r(valid), u(0));
+    hit = k.op2(.pand, .pred, r(hit), r(k.cmp(.i32, .ge, r(ld(k, b, base, S_BOX + 2, .i32)), r(x0))));
+    hit = k.op2(.pand, .pred, r(hit), r(k.cmp(.i32, .le, r(ld(k, b, base, S_BOX, .i32)), r(x1))));
+    hit = k.op2(.pand, .pred, r(hit), r(k.cmp(.i32, .ge, r(ld(k, b, base, S_BOX + 3, .i32)), r(y0))));
+    return k.op2(.pand, .pred, r(hit), r(k.cmp(.i32, .le, r(ld(k, b, base, S_BOX + 1, .i32)), r(y1))));
 }
 
 // ── Kernel 1: vertices ─────────────────────────────────────────────────────
@@ -598,15 +701,110 @@ pub fn setupKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     return k;
 }
 
+// ── Kernel 2b: bins ────────────────────────────────────────────────────────
+
+const B_NTRI = 0; // every instance's triangles
+const B_SSTRIDE = 1;
+const B_RECT = 2; // x0, y0 (the first bin's corner)
+const B_BINS_X = 4;
+const B_BASE = 5; // the bins' first word in the triangle buffer
+const B_CAP = 6;
+pub const BIN_PARAMS = 7;
+
+/// A group per bin (BIN x BIN pixels from the draw's corner): the
+/// triangles whose boxes meet it, in order, CULL at a time. A bin's words
+/// in the triangle buffer: how many (more than its cap: the list ran
+/// over), then the list.
+///   binding: 0 the triangle records, then the bins (written)
+/// The same for every pipeline (records are laid out alike).
+pub fn binKernel(s: kir.Storage) kir.Kernel {
+    var k = kir.Kernel.init(s, "gl_bin", .{ CULL, 1, 1 });
+    const b_t = k.binding();
+    const t = k.tid(0);
+    const ntri = k.param(.u32, B_NTRI);
+    const sstride = k.param(.u32, B_SSTRIDE);
+    const cap = k.param(.u32, B_CAP);
+    const x0 = k.op3(.imad, .i32, r(k.gid(0)), u(BIN), r(k.param(.i32, B_RECT)));
+    const y0 = k.op3(.imad, .i32, r(k.gid(1)), u(BIN), r(k.param(.i32, B_RECT + 1)));
+    const x1 = k.op2(.iadd, .i32, r(x0), i(BIN - 1));
+    const y1 = k.op2(.iadd, .i32, r(y0), i(BIN - 1));
+    const bin = k.op3(.imad, .u32, r(k.gid(1)), r(k.param(.u32, B_BINS_X)), r(k.gid(0)));
+    const bbase = k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(bin), r(k.op2(.iadd, .u32, r(cap), u(1))), r(k.param(.u32, B_BASE)))), u(2));
+    const sc = scanAlloc(&k);
+    const count = k.reg(.u32);
+    k.set(count, .mov, u(0), no, no);
+    const chunk = k.reg(.u32);
+    k.set(chunk, .mov, u(0), no, no);
+    const last = k.op2(.isub, .u32, r(ntri), u(1));
+    k.loop();
+    {
+        k.brk(r(k.cmp(.u32, .ge, r(chunk), r(ntri))));
+        const j = k.op2(.iadd, .u32, r(chunk), r(t));
+        k.set(chunk, .iadd, r(chunk), u(CULL), no);
+        // (past the end: the last triangle read, and not kept)
+        const jj = k.op2(.imin, .u32, r(j), r(last));
+        const base = k.op2(.shl, .u32, r(k.op2(.imul, .u32, r(jj), r(sstride))), u(2));
+        const in = k.cmp(.u32, .lt, r(j), r(ntri));
+        const hit = k.op2(.pand, .pred, r(in), r(meets(&k, b_t, base, x0, y0, x1, y1)));
+        const c = compact(&k, sc, t, hit);
+        const at = k.op2(.iadd, .u32, r(count), r(c.pos));
+        k.ifp(r(k.op2(.pand, .pred, r(hit), r(k.cmp(.u32, .lt, r(at), r(cap))))));
+        k.store(.u32, memAt(b_t, 4), r(k.op3(.imad, .u32, r(at), u(4), r(bbase))), r(j));
+        k.endif();
+        k.set(count, .iadd, r(count), r(c.total), no);
+    }
+    k.endloop();
+    k.ifp(r(k.cmp(.u32, .eq, r(t), u(0))));
+    k.store(.u32, memAt(b_t, 0), r(bbase), r(count));
+    k.endif();
+    return k;
+}
+
+/// How a draw's triangles are binned: none when the draw's rectangle is
+/// one bin (its tiles go through every triangle).
+pub const Bins = struct {
+    on: bool = false,
+    x: u32 = 1,
+    y: u32 = 1,
+    /// the first bin's word in the triangle buffer, and a bin's list's room
+    base: u32 = 0,
+    cap: u32 = 0,
+
+    /// Words the bins take after the triangle records.
+    pub fn words(b: Bins) usize {
+        return if (b.on) @as(usize, b.x) * b.y * (b.cap + 1) else 0;
+    }
+};
+
+pub fn binsOf(d: *const Draw, cap_limit: u32) Bins {
+    const w = d.rect.width();
+    const h = d.rect.height();
+    if (w <= BIN and h <= BIN) return .{};
+    const ntri = d.triangles() * d.instances;
+    return .{
+        .on = true,
+        .x = (w + BIN - 1) / BIN,
+        .y = (h + BIN - 1) / BIN,
+        .base = ntri * d.pipe.sstride,
+        .cap = @min(ntri, cap_limit),
+    };
+}
+
+pub fn binParams(d: *const Draw, b: Bins, out: []u32) []u32 {
+    const p = [_]u32{ d.triangles() * d.instances, d.pipe.sstride, d.rect.x0, d.rect.y0, b.x, b.base, b.cap };
+    @memcpy(out[0..p.len], &p);
+    return out[0..p.len];
+}
+
 // ── Kernel 3: tiles ────────────────────────────────────────────────────────
 
 const R_RECT = 0; // x0, y0, x1, y1 (exclusive)
 const R_NTRI = 4;
 const R_SSTRIDE = 5;
-const R_C_STRIDE = 6; // the color image: words a row, top-down, height
+const R_C_STRIDE = 6; // the color image: bytes a row, top-down, height
 const R_C_TOPDOWN = 7;
 const R_C_HEIGHT = 8;
-const R_SHIFT_R = 9; // byte shifts of red and blue (rgba8: 0, 16; bgra8: 16, 0)
+const R_SHIFT_R = 9; // byte shifts of red and blue (bgra8: 16, 0; else 0, 16)
 const R_SHIFT_B = 10;
 const R_KEEP = 11;
 const R_NO_ALPHA = 12;
@@ -626,7 +824,12 @@ const R_SRC_RGB = 25; // c (3), ks, kd, ksa, kda
 const R_DST_RGB = 32;
 const R_SRC_A = 39; // c, ks, kd, ksa, kda
 const R_DST_A = 44;
-pub const RASTER_PARAMS = 49;
+const R_BINNED = 49; // the triangles binned: bins a row, their first word, cap
+const R_BINS_X = 50;
+const R_BIN_BASE = 51;
+const R_BIN_CAP = 52;
+const R_BPP = 53; // the color image's bytes a pixel: 4 (RGBA8, BGRA8), 2 (RG8), 1 (R8)
+pub const RASTER_PARAMS = 54;
 
 /// bindings: 0 color (written), 1 depth (written when on), 2 triangle
 /// records, 3 uniforms, then the textures
@@ -641,6 +844,8 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     for (0..sh.textures) |_| _ = k.binding();
     const lx = k.tid(0);
     const ly = k.tid(1);
+    const odd_x: V = if (sh.quads) k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(lx), u(1))), u(0)) else .none;
+    const odd_y: V = if (sh.quads) k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(ly), u(1))), u(0)) else .none;
     const tx0 = k.op3(.imad, .i32, r(k.gid(0)), u(TILE), r(k.param(.i32, R_RECT)));
     const ty0 = k.op3(.imad, .i32, r(k.gid(1)), u(TILE), r(k.param(.i32, R_RECT + 1)));
     const px = k.op2(.iadd, .i32, r(tx0), r(lx));
@@ -653,7 +858,12 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
             return kk.sel(.i32, r(kk.cmp(.u32, .ne, r(kk.param(.u32, td)), u(0))), r(flipped), r(y));
         }
     }.f_;
-    const c_off = k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(rowOf(&k, py, R_C_TOPDOWN, R_C_HEIGHT)), r(k.param(.u32, R_C_STRIDE)), r(px))), u(2));
+    // (a pixel of 4, 2 or 1 bytes: R8 and RG8 too, its channels from byte
+    // 0 as RGBA8's; what it lacks reads 0, alpha 1)
+    const bpp = k.param(.u32, R_BPP);
+    const wide = k.cmp(.u32, .eq, r(bpp), u(4));
+    const pair = k.cmp(.u32, .eq, r(bpp), u(2));
+    const c_off = k.op3(.imad, .u32, r(rowOf(&k, py, R_C_TOPDOWN, R_C_HEIGHT)), r(k.param(.u32, R_C_STRIDE)), r(k.op2(.imul, .u32, r(px), r(bpp))));
     const d_on = k.cmp(.u32, .ne, r(k.param(.u32, R_DEPTH)), u(0));
     const d_off = k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(rowOf(&k, py, R_D_TOPDOWN, R_D_HEIGHT)), r(k.param(.u32, R_D_STRIDE)), r(px))), u(2));
     // the pixel and its depth, loaded once
@@ -662,7 +872,15 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     k.set(old_c, .mov, u(0), no, no);
     k.set(old_d, .mov, u(0), no, no);
     k.ifp(r(inside));
+    k.ifp(r(wide));
     k.setAux(old_c, .ld, r(c_off), no, no, @bitCast(kir.global(b_c, 32)));
+    k.els();
+    k.ifp(r(pair));
+    k.setAux(old_c, .ld, r(c_off), no, no, @bitCast(kir.global(b_c, 16)));
+    k.els();
+    k.setAux(old_c, .ld, r(c_off), no, no, @bitCast(kir.global(b_c, 8)));
+    k.endif();
+    k.endif();
     k.ifp(r(d_on));
     k.setAux(old_d, .ld, r(d_off), no, no, @bitCast(kir.global(b_d, 32)));
     k.endif();
@@ -694,112 +912,148 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     const tcy = k.op2(.iadd, .i32, r(k.op2(.shl, .i32, r(ty0), u(4))), i(SUB / 2));
     const tx1 = k.op2(.iadd, .i32, r(tx0), i(TILE - 1));
     const ty1 = k.op2(.iadd, .i32, r(ty0), i(TILE - 1));
-    const tri = k.reg(.u32);
-    k.set(tri, .mov, u(0), no, no);
+    // The triangles that may reach the tile: its bin's list, or every
+    // triangle (unbinned, or the bin's list ran over), CULL at a time:
+    // each thread tests one triangle's box against the tile, the hits are
+    // compacted in order into shared memory, and the group goes through
+    // them (GL's order kept: blending is right).
+    const t = k.op3(.imad, .u32, r(ly), u(TILE), r(lx));
+    const sc = scanAlloc(&k);
+    const list = k.sharedAlloc(CULL * 4, 4);
+    const cap = k.param(.u32, R_BIN_CAP);
+    const bin = k.op3(.imad, .u32, r(k.op2(.shr, .u32, r(k.gid(1)), u(BIN_SHIFT))), r(k.param(.u32, R_BINS_X)), r(k.op2(.shr, .u32, r(k.gid(0)), u(BIN_SHIFT))));
+    const bbase = k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(bin), r(k.op2(.iadd, .u32, r(cap), u(1))), r(k.param(.u32, R_BIN_BASE)))), u(2));
+    const n = k.reg(.u32);
+    k.set(n, .mov, r(ntri), no, no);
+    const listed = k.reg(.pred);
+    k.set(listed, .mov, u(0), no, no);
+    k.ifp(r(k.cmp(.u32, .ne, r(k.param(.u32, R_BINNED)), u(0))));
+    {
+        const cnt = k.load(.u32, kir.global(b_t, 32), r(bbase));
+        const fits = k.cmp(.u32, .le, r(cnt), r(cap));
+        k.set(listed, .mov, r(fits), no, no);
+        k.set(n, .sel, r(cnt), r(ntri), r(fits));
+    }
+    k.endif();
+    const chunk = k.reg(.u32);
+    k.set(chunk, .mov, u(0), no, no);
     k.loop();
     {
-        k.brk(r(k.cmp(.u32, .ge, r(tri), r(ntri))));
-        const tc = k.mov(.u32, r(tri));
-        k.set(tri, .iadd, r(tri), u(1), no);
-        const base = k.op2(.shl, .u32, r(k.op2(.imul, .u32, r(tc), r(sstride))), u(2));
-        const ld = struct {
-            fn w(kk: *kir.Kernel, b: u8, bs: V, word: u32, ty: kir.Ty) V {
-                return kk.load(ty, memAt(b, word * 4), r(bs));
-            }
-        }.w;
-        // a triangle not drawn, or whose box misses the tile: the next
-        // (the same for the whole group)
-        const valid = ld(&k, b_t, base, S_VALID, .u32);
-        const bx0 = ld(&k, b_t, base, S_BOX, .i32);
-        const by0 = ld(&k, b_t, base, S_BOX + 1, .i32);
-        const bx1 = ld(&k, b_t, base, S_BOX + 2, .i32);
-        const by1 = ld(&k, b_t, base, S_BOX + 3, .i32);
-        var miss = k.cmp(.u32, .eq, r(valid), u(0));
-        miss = k.op2(.por, .pred, r(miss), r(k.cmp(.i32, .lt, r(bx1), r(tx0))));
-        miss = k.op2(.por, .pred, r(miss), r(k.cmp(.i32, .gt, r(bx0), r(tx1))));
-        miss = k.op2(.por, .pred, r(miss), r(k.cmp(.i32, .lt, r(by1), r(ty0))));
-        miss = k.op2(.por, .pred, r(miss), r(k.cmp(.i32, .gt, r(by0), r(ty1))));
-        k.cont(r(miss));
-        // coverage: each edge's value at the tile's first center in 64
-        // bits; a tile wholly outside one edge, the next triangle; else
-        // clamped, and each pixel's in 32 bits
-        var covered = inside;
-        var out_tile = k.mov(.pred, u(0));
-        for (0..3) |e| {
-            const w0: u32 = @intCast(S_EDGE + 5 * e);
-            const A = ld(&k, b_t, base, w0, .i32);
-            const B = ld(&k, b_t, base, w0 + 1, .i32);
-            const ax = ld(&k, b_t, base, w0 + 2, .i32);
-            const ay = ld(&k, b_t, base, w0 + 3, .i32);
-            const bias = ld(&k, b_t, base, w0 + 4, .i32);
-            const c64 = add64(&k, mul64(&k, r(A), r(k.op2(.isub, .i32, r(tcx), r(ax)))), mul64(&k, r(B), r(k.op2(.isub, .i32, r(tcy), r(ay)))));
-            const above = k.op2(.por, .pred, r(k.cmp(.i32, .gt, r(c64.hi), i(0))), r(k.op2(.pand, .pred, r(k.cmp(.i32, .eq, r(c64.hi), i(0))), r(k.cmp(.u32, .gt, r(c64.lo), u(LIMIT))))));
-            const below = k.op2(.por, .pred, r(k.cmp(.i32, .lt, r(c64.hi), i(-1))), r(k.op2(.pand, .pred, r(k.cmp(.i32, .eq, r(c64.hi), i(-1))), r(k.cmp(.u32, .lt, r(c64.lo), u(@as(u32, 0) -% LIMIT))))));
-            out_tile = k.op2(.por, .pred, r(out_tile), r(below));
-            const c32 = k.sel(.i32, r(above), u(LIMIT), r(c64.lo));
-            const ev = k.op2(.iadd, .i32, r(k.op2(.iadd, .i32, r(c32), r(k.op2(.imul, .i32, r(A), r(lx16))))), r(k.op2(.imul, .i32, r(B), r(ly16))));
-            covered = k.op2(.pand, .pred, r(covered), r(k.cmp(.i32, .ge, r(k.op2(.iadd, .i32, r(ev), r(bias))), i(0))));
-        }
-        k.cont(r(out_tile));
-        k.ifp(r(covered));
+        k.brk(r(k.cmp(.u32, .ge, r(chunk), r(n))));
+        const jt = k.op2(.iadd, .u32, r(chunk), r(t));
+        k.set(chunk, .iadd, r(chunk), u(CULL), no);
+        // (past the end: the last one read, and not kept; unlisted: the
+        // list's address is the first record's, a word always there)
+        const jj = k.op2(.imin, .u32, r(jt), r(k.op2(.isub, .u32, r(n), u(1))));
+        const lat = k.sel(.u32, r(listed), r(k.op3(.imad, .u32, r(jj), u(4), r(bbase))), u(0));
+        const entry = k.load(.u32, memAt(b_t, 4), r(lat));
+        const tj = k.sel(.u32, r(listed), r(entry), r(jj));
+        const jbase = k.op2(.shl, .u32, r(k.op2(.imul, .u32, r(tj), r(sstride))), u(2));
+        const hit = k.op2(.pand, .pred, r(k.cmp(.u32, .lt, r(jt), r(n))), r(meets(&k, b_t, jbase, tx0, ty0, tx1, ty1)));
+        const cut = compact(&k, sc, t, hit);
+        k.ifp(r(hit));
+        k.store(.u32, shAt(list), r(k.op2(.shl, .u32, r(cut.pos), u(2))), r(tj));
+        k.endif();
+        k.barrier();
+        const ix = k.reg(.u32);
+        k.set(ix, .mov, u(0), no, no);
+        k.loop();
         {
-            const X = k.op2(.fadd, .f32, r(k.cvt(.i32, .f32, .rne, r(px))), f(0.5));
-            const Y = k.op2(.fadd, .f32, r(k.cvt(.i32, .f32, .rne, r(py))), f(0.5));
-            const dX = k.op2(.fsub, .f32, r(X), r(ld(&k, b_t, base, S_XY, .f32)));
-            const dY = k.op2(.fsub, .f32, r(Y), r(ld(&k, b_t, base, S_XY + 1, .f32)));
-            const plane = struct {
-                fn at(kk: *kir.Kernel, b: u8, bs: V, word: u32, dx: V, dy: V) V {
-                    const a0 = kk.load(.f32, memAt(b, word * 4), r(bs));
-                    const gx = kk.load(.f32, memAt(b, (word + 1) * 4), r(bs));
-                    const gy = kk.load(.f32, memAt(b, (word + 2) * 4), r(bs));
-                    return kk.op2(.fadd, .f32, r(kk.op2(.fadd, .f32, r(a0), r(kk.op2(.fmul, .f32, r(gx), r(dx))))), r(kk.op2(.fmul, .f32, r(gy), r(dy))));
+            k.brk(r(k.cmp(.u32, .ge, r(ix), r(cut.total))));
+            const tc = k.load(.u32, shAt(list), r(k.op2(.shl, .u32, r(ix), u(2))));
+            k.set(ix, .iadd, r(ix), u(1), no);
+            const base = k.op2(.shl, .u32, r(k.op2(.imul, .u32, r(tc), r(sstride))), u(2));
+            const ld = struct {
+                fn w(kk: *kir.Kernel, b: u8, bs: V, word: u32, ty: kir.Ty) V {
+                    return kk.load(ty, memAt(b, word * 4), r(bs));
                 }
-            }.at;
-            const z = plane(&k, b_t, base, S_Z, dX, dY);
-            // (outside the depth range: clipped)
-            var pass = k.op2(.pand, .pred, r(k.cmp(.f32, .ge, r(z), r(k.param(.f32, R_ZMIN)))), r(k.cmp(.f32, .le, r(z), r(k.param(.f32, R_ZMAX)))));
-            const dz = k.cvt(.f32, .u32, .rne, r(k.op2(.fmul, .f32, r(k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(z), f(0))), f(1))), f(16777215.0))));
-            const func = k.param(.u32, R_DFUNC);
-            const bitOn = struct {
-                fn f_(kk: *kir.Kernel, w: V, bit: u32) V {
-                    return kk.cmp(.u32, .ne, r(kk.op2(.@"and", .u32, r(w), u(bit))), u(0));
-                }
-            }.f_;
-            const lt = k.op2(.pand, .pred, r(k.cmp(.u32, .lt, r(dz), r(depth))), r(bitOn(&k, func, 1)));
-            const eq = k.op2(.pand, .pred, r(k.cmp(.u32, .eq, r(dz), r(depth))), r(bitOn(&k, func, 2)));
-            const gt = k.op2(.pand, .pred, r(k.cmp(.u32, .gt, r(dz), r(depth))), r(bitOn(&k, func, 4)));
-            const dpass = k.op2(.por, .pred, r(k.op2(.por, .pred, r(lt), r(eq))), r(gt));
-            pass = k.op2(.pand, .pred, r(pass), r(k.sel(.pred, r(d_on), r(dpass), u(1))));
-            k.ifp(r(pass));
+            }.w;
+            // coverage: each edge's value at the tile's first center in 64
+            // bits; a tile wholly outside one edge, the next triangle; else
+            // clamped, and each pixel's in 32 bits
+            var covered = inside;
+            var out_tile = k.mov(.pred, u(0));
+            for (0..3) |e| {
+                const w0: u32 = @intCast(S_EDGE + 5 * e);
+                const A = ld(&k, b_t, base, w0, .i32);
+                const B = ld(&k, b_t, base, w0 + 1, .i32);
+                const ax = ld(&k, b_t, base, w0 + 2, .i32);
+                const ay = ld(&k, b_t, base, w0 + 3, .i32);
+                const bias = ld(&k, b_t, base, w0 + 4, .i32);
+                const c64 = add64(&k, mul64(&k, r(A), r(k.op2(.isub, .i32, r(tcx), r(ax)))), mul64(&k, r(B), r(k.op2(.isub, .i32, r(tcy), r(ay)))));
+                const above = k.op2(.por, .pred, r(k.cmp(.i32, .gt, r(c64.hi), i(0))), r(k.op2(.pand, .pred, r(k.cmp(.i32, .eq, r(c64.hi), i(0))), r(k.cmp(.u32, .gt, r(c64.lo), u(LIMIT))))));
+                const below = k.op2(.por, .pred, r(k.cmp(.i32, .lt, r(c64.hi), i(-1))), r(k.op2(.pand, .pred, r(k.cmp(.i32, .eq, r(c64.hi), i(-1))), r(k.cmp(.u32, .lt, r(c64.lo), u(@as(u32, 0) -% LIMIT))))));
+                out_tile = k.op2(.por, .pred, r(out_tile), r(below));
+                const c32 = k.sel(.i32, r(above), u(LIMIT), r(c64.lo));
+                const ev = k.op2(.iadd, .i32, r(k.op2(.iadd, .i32, r(c32), r(k.op2(.imul, .i32, r(A), r(lx16))))), r(k.op2(.imul, .i32, r(B), r(ly16))));
+                covered = k.op2(.pand, .pred, r(covered), r(k.cmp(.i32, .ge, r(k.op2(.iadd, .i32, r(ev), r(bias))), i(0))));
+            }
+            k.cont(r(out_tile));
+            // (quads: every lane computes, and a quad with a pixel to draw
+            // runs the fragment code whole; else covered pixels alone)
+            if (!sh.quads) k.ifp(r(covered));
             {
-                const iw = plane(&k, b_t, base, S_W, dX, dY);
-                const wv = k.div(f(1), r(iw));
-                var io = FragmentIO{ .uniforms = b_uni, .textures = b_tex };
-                for (0..sh.varyings) |j| {
-                    const w0: u32 = @intCast(SREC + 3 * j);
-                    // (flat: the provoking vertex's bits, untouched: an integer's too)
-                    io.varying[j] = if (sh.flat & (@as(u64, 1) << @intCast(j)) != 0) ld(&k, b_t, base, w0, .f32) else k.op2(.fmul, .f32, r(plane(&k, b_t, base, w0, dX, dY)), r(wv));
-                }
-                io.frag_coord = .{ X, Y, z, iw };
-                io.front_facing = k.cmp(.u32, .ne, r(ld(&k, b_t, base, S_FRONT, .u32)), u(0));
-                sh.fragment(sh.ctx, &k, &io);
-                const live = if (io.discard == .none) k.mov(.pred, u(1)) else k.op1(.pnot, .pred, r(io.discard));
-                k.ifp(r(live));
+                const X = k.op2(.fadd, .f32, r(k.cvt(.i32, .f32, .rne, r(px))), f(0.5));
+                const Y = k.op2(.fadd, .f32, r(k.cvt(.i32, .f32, .rne, r(py))), f(0.5));
+                const dX = k.op2(.fsub, .f32, r(X), r(ld(&k, b_t, base, S_XY, .f32)));
+                const dY = k.op2(.fsub, .f32, r(Y), r(ld(&k, b_t, base, S_XY + 1, .f32)));
+                const plane = struct {
+                    fn at(kk: *kir.Kernel, b: u8, bs: V, word: u32, dx: V, dy: V) V {
+                        const a0 = kk.load(.f32, memAt(b, word * 4), r(bs));
+                        const gx = kk.load(.f32, memAt(b, (word + 1) * 4), r(bs));
+                        const gy = kk.load(.f32, memAt(b, (word + 2) * 4), r(bs));
+                        return kk.op2(.fadd, .f32, r(kk.op2(.fadd, .f32, r(a0), r(kk.op2(.fmul, .f32, r(gx), r(dx))))), r(kk.op2(.fmul, .f32, r(gy), r(dy))));
+                    }
+                }.at;
+                const z = plane(&k, b_t, base, S_Z, dX, dY);
+                // (outside the depth range: clipped)
+                var pass = k.op2(.pand, .pred, r(k.cmp(.f32, .ge, r(z), r(k.param(.f32, R_ZMIN)))), r(k.cmp(.f32, .le, r(z), r(k.param(.f32, R_ZMAX)))));
+                const dz = k.cvt(.f32, .u32, .rne, r(k.op2(.fmul, .f32, r(k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(z), f(0))), f(1))), f(16777215.0))));
+                const func = k.param(.u32, R_DFUNC);
+                const bitOn = struct {
+                    fn f_(kk: *kir.Kernel, w: V, bit: u32) V {
+                        return kk.cmp(.u32, .ne, r(kk.op2(.@"and", .u32, r(w), u(bit))), u(0));
+                    }
+                }.f_;
+                const lt = k.op2(.pand, .pred, r(k.cmp(.u32, .lt, r(dz), r(depth))), r(bitOn(&k, func, 1)));
+                const eq = k.op2(.pand, .pred, r(k.cmp(.u32, .eq, r(dz), r(depth))), r(bitOn(&k, func, 2)));
+                const gt = k.op2(.pand, .pred, r(k.cmp(.u32, .gt, r(dz), r(depth))), r(bitOn(&k, func, 4)));
+                const dpass = k.op2(.por, .pred, r(k.op2(.por, .pred, r(lt), r(eq))), r(gt));
+                pass = k.op2(.pand, .pred, r(pass), r(k.sel(.pred, r(d_on), r(dpass), u(1))));
+                if (sh.quads) pass = k.op2(.pand, .pred, r(pass), r(covered));
+                k.ifp(r(if (sh.quads) quadAny(&k, pass) else pass));
                 {
-                    var src: [4]V = undefined;
-                    for (0..4) |c| src[c] = k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(io.color[c]), f(0))), f(1));
-                    const out = blend(&k, src, dst);
-                    for (0..4) |c| k.set(dst[c], .mov, r(out[c]), no, no);
-                    k.set(touched, .mov, u(1), no, no);
-                    k.ifp(r(k.op2(.pand, .pred, r(d_on), r(k.cmp(.u32, .ne, r(k.param(.u32, R_DWRITE)), u(0))))));
-                    k.set(depth, .mov, r(dz), no, no);
+                    const iw = plane(&k, b_t, base, S_W, dX, dY);
+                    const wv = k.div(f(1), r(iw));
+                    var io = FragmentIO{ .uniforms = b_uni, .textures = b_tex, .quads = sh.quads, .odd_x = odd_x, .odd_y = odd_y };
+                    for (0..sh.varyings) |j| {
+                        const w0: u32 = @intCast(SREC + 3 * j);
+                        // (flat: the provoking vertex's bits, untouched: an integer's too)
+                        io.varying[j] = if (sh.flat & (@as(u64, 1) << @intCast(j)) != 0) ld(&k, b_t, base, w0, .f32) else k.op2(.fmul, .f32, r(plane(&k, b_t, base, w0, dX, dY)), r(wv));
+                    }
+                    io.frag_coord = .{ X, Y, z, iw };
+                    io.front_facing = k.cmp(.u32, .ne, r(ld(&k, b_t, base, S_FRONT, .u32)), u(0));
+                    sh.fragment(sh.ctx, &k, &io);
+                    var live = if (io.discard == .none) k.mov(.pred, u(1)) else k.op1(.pnot, .pred, r(io.discard));
+                    if (sh.quads) live = k.op2(.pand, .pred, r(live), r(pass));
+                    k.ifp(r(live));
+                    {
+                        var src: [4]V = undefined;
+                        for (0..4) |c| src[c] = k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(io.color[c]), f(0))), f(1));
+                        const out = blend(&k, src, dst);
+                        for (0..4) |c| k.set(dst[c], .mov, r(out[c]), no, no);
+                        k.set(touched, .mov, u(1), no, no);
+                        k.ifp(r(k.op2(.pand, .pred, r(d_on), r(k.cmp(.u32, .ne, r(k.param(.u32, R_DWRITE)), u(0))))));
+                        k.set(depth, .mov, r(dz), no, no);
+                        k.endif();
+                    }
                     k.endif();
                 }
                 k.endif();
             }
-            k.endif();
+            if (!sh.quads) k.endif();
         }
-        k.endif();
+        k.endloop();
     }
     k.endloop();
     // the pixel and its depth, stored once (the masked channels kept)
@@ -816,13 +1070,30 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
         word = k.op2(.@"or", .u32, r(word), r(pack(&k, dst[3], u(24))));
         const keep = k.param(.u32, R_KEEP);
         const merged = k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(old_c), r(keep))), r(k.op2(.@"and", .u32, r(word), r(k.op1(.not, .u32, r(keep))))));
+        k.ifp(r(wide));
         k.store(.u32, kir.global(b_c, 32), r(c_off), r(merged));
+        k.els();
+        k.ifp(r(pair));
+        k.store(.u32, kir.global(b_c, 16), r(c_off), r(merged));
+        k.els();
+        k.store(.u32, kir.global(b_c, 8), r(c_off), r(merged));
+        k.endif();
+        k.endif();
         k.ifp(r(k.op2(.pand, .pred, r(d_on), r(k.cmp(.u32, .ne, r(k.param(.u32, R_DWRITE)), u(0))))));
         k.store(.u32, kir.global(b_d, 32), r(d_off), r(k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(old_d), u(0xff00_0000))), r(depth))));
         k.endif();
     }
     k.endif();
     return k;
+}
+
+/// Whether any pixel of the lane's quad has `p` (every lane of the group
+/// there).
+fn quadAny(k: *kir.Kernel, p: V) V {
+    var q = k.sel(.u32, r(p), u(1), u(0));
+    q = k.op2(.@"or", .u32, r(q), r(k.shfl(.u32, .xor, r(q), u(QUAD_X))));
+    q = k.op2(.@"or", .u32, r(q), r(k.shfl(.u32, .xor, r(q), u(QUAD_Y))));
+    return k.cmp(.u32, .ne, r(q), u(0));
 }
 
 /// GL's blending of `src` over `dst` (both clamped to 0..1): every factor
@@ -942,8 +1213,12 @@ fn factorWords(fc: Factor, rgb: bool, out: []u32) void {
     }
 }
 
-pub fn rasterParams(d: *const Draw, out: []u32) []u32 {
+pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
     @memset(out[0..RASTER_PARAMS], 0);
+    out[R_BINNED] = @intFromBool(bins.on);
+    out[R_BINS_X] = bins.x;
+    out[R_BIN_BASE] = bins.base;
+    out[R_BIN_CAP] = bins.cap;
     const rect = d.rect;
     out[R_RECT] = rect.x0;
     out[R_RECT + 1] = rect.y0;
@@ -951,13 +1226,14 @@ pub fn rasterParams(d: *const Draw, out: []u32) []u32 {
     out[R_RECT + 3] = rect.y1;
     out[R_NTRI] = d.triangles() * d.instances;
     out[R_SSTRIDE] = d.pipe.sstride;
-    out[R_C_STRIDE] = d.color.stride / 4;
+    out[R_C_STRIDE] = d.color.stride;
+    out[R_BPP] = d.color.format.bytes();
     out[R_C_TOPDOWN] = @intFromBool(d.color.top_down);
     out[R_C_HEIGHT] = d.color.height;
     out[R_SHIFT_R] = if (d.color.format == .bgra8) 16 else 0;
     out[R_SHIFT_B] = if (d.color.format == .bgra8) 0 else 16;
     out[R_KEEP] = d.keep;
-    out[R_NO_ALPHA] = @intFromBool(d.color.no_alpha);
+    out[R_NO_ALPHA] = @intFromBool(d.color.no_alpha or d.color.format.channels() < 4);
     if (d.depth) |dp| {
         out[R_DEPTH] = @intFromBool(d.depth_test);
         out[R_D_STRIDE] = dp.stride / 4;

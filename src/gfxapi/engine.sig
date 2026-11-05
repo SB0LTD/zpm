@@ -25,8 +25,9 @@
 //!   memory (`Shared`): what the GPU has pending on it is tracked once,
 //!   for every name, and it is freed with the last of them.
 //!
-//! Images draws write are 32 bits a pixel; textures may be in other
-//! formats, which draws only read (Format). Rectangles are in GL's
+//! Images draws write are RGBA8, BGRA8, RG8 or R8 (4, 2, 1 bytes a
+//! pixel); textures may be in other formats, which draws only read
+//! (Format). Rectangles are in GL's
 //! coordinates, y from the bottom; an image whose row 0 is its top (a
 //! window's buffer) says so (`top_down`) and the engine flips rows.
 //!
@@ -67,9 +68,15 @@ pub const Format = enum(u8) {
     rg32ui,
     rgba32ui,
 
-    /// A color format draws, clears and copies write (four bytes a pixel).
+    /// A color format of four bytes a pixel (RGBA8, BGRA8).
     pub fn isColor(f: Format) bool {
         return f == .rgba8 or f == .bgra8;
+    }
+
+    /// A color format draws, clears and copies write: the four-byte ones,
+    /// RG8 and R8 (their channels from byte 0, as RGBA8's).
+    pub fn renderable(f: Format) bool {
+        return f.isColor() or f == .r8 or f == .rg8;
     }
 
     pub fn bytes(f: Format) u32 {
@@ -273,7 +280,7 @@ pub const Pool = struct {
 /// Threads per group (a row of pixels: one thread each).
 pub const GROUP = 64;
 
-const Prog = enum(u8) { fill, fill_masked, copy };
+const Prog = enum(u8) { fill, fill_masked, copy, bin };
 const N_PROGS = @typeInfo(Prog).@"enum".field_names.len;
 /// A program's code as the backend emits it (ir3, sm_120 or KIR's own).
 pub const CODE_BYTES = 16 * 1024;
@@ -287,10 +294,38 @@ pub const MAX_KIR = 65536;
 /// Bytes of a pipeline kernel's code as the backend emits it.
 pub const PIPE_CODE = 1024 * 1024;
 
+/// A pixel of 4, 2 or 1 bytes (`bpp`) at byte `off`: loaded (zero
+/// extended), or stored (its low bytes).
+fn pixelLoad(k: *kir.Kernel, b: u8, bpp: kir.V, off: kir.V) kir.V {
+    const v = k.reg(.u32);
+    k.ifp(r(k.cmp(.u32, .eq, r(bpp), u(4))));
+    k.setAux(v, .ld, r(off), kir.no, kir.no, @bitCast(kir.global(b, 32)));
+    k.els();
+    k.ifp(r(k.cmp(.u32, .eq, r(bpp), u(2))));
+    k.setAux(v, .ld, r(off), kir.no, kir.no, @bitCast(kir.global(b, 16)));
+    k.els();
+    k.setAux(v, .ld, r(off), kir.no, kir.no, @bitCast(kir.global(b, 8)));
+    k.endif();
+    k.endif();
+    return v;
+}
+
+fn pixelStore(k: *kir.Kernel, b: u8, bpp: kir.V, off: kir.V, v: kir.V) void {
+    k.ifp(r(k.cmp(.u32, .eq, r(bpp), u(4))));
+    k.store(.u32, kir.global(b, 32), r(off), r(v));
+    k.els();
+    k.ifp(r(k.cmp(.u32, .eq, r(bpp), u(2))));
+    k.store(.u32, kir.global(b, 16), r(off), r(v));
+    k.els();
+    k.store(.u32, kir.global(b, 8), r(off), r(v));
+    k.endif();
+    k.endif();
+}
+
 /// fill: rows y0.. (memory rows, one group row each), pixels x0..x0+w:
-///   params 0 x0, 1 y0, 2 w, 3 stride (words), 4 value, and for
-///   fill_masked 5 keep: the bits of each pixel kept (value has none of
-///   them): pixel = (pixel & keep) | value.
+///   params 0 x0, 1 y0, 2 w, 3 stride (bytes), 4 value, 5 keep (for
+///   fill_masked: the bits of each pixel kept, value has none of them:
+///   pixel = (pixel & keep) | value), 6 bytes a pixel (4, 2, 1).
 fn fillKernel(s: kir.Storage, masked: bool) kir.Kernel {
     var k = kir.Kernel.init(s, if (masked) "gfx_fill_masked" else "gfx_fill", .{ GROUP, 1, 1 });
     const img = k.binding();
@@ -299,18 +334,18 @@ fn fillKernel(s: kir.Storage, masked: bool) kir.Kernel {
     const w = k.param(.u32, 2);
     const stride = k.param(.u32, 3);
     const value = k.param(.u32, 4);
+    const bpp = k.param(.u32, 6);
     const x = k.op3(.imad, .u32, r(k.gid(0)), u(GROUP), r(k.tid(0)));
     k.ifp(r(k.cmp(.u32, .lt, r(x), r(w))));
     const row = k.op2(.iadd, .u32, r(y0), r(k.gid(1)));
-    const at = k.op3(.imad, .u32, r(row), r(stride), r(k.op2(.iadd, .u32, r(x0), r(x))));
-    const off = k.op2(.shl, .u32, r(at), u(2));
+    const off = k.op3(.imad, .u32, r(row), r(stride), r(k.op2(.imul, .u32, r(k.op2(.iadd, .u32, r(x0), r(x))), r(bpp))));
     var v = value;
     if (masked) {
         const keep = k.param(.u32, 5);
-        const old = k.load(.u32, kir.global(img, 32), r(off));
+        const old = pixelLoad(&k, img, bpp, off);
         v = k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(old), r(keep))), r(value));
     }
-    k.store(.u32, kir.global(img, 32), r(off), r(v));
+    pixelStore(&k, img, bpp, off, v);
     k.endif();
     return k;
 }
@@ -319,10 +354,13 @@ fn fillKernel(s: kir.Storage, masked: bool) kir.Kernel {
 /// row sy0 + y * sstep (pixels sx0..) to destination row dy0 + y * dstep
 /// (pixels dx0..); steps are +1 or -1 (a flip between the images' row
 /// orders). Bytes 0 and 2 of each pixel swap where `keep` lacks them (R
-/// and B between rgba8 and bgra8): pixel = (v & keep) | (swapped(v) & ~keep).
-///   params 0 sx0, 1 sy0, 2 sstep (i32), 3 sstride, 4 dx0, 5 dy0,
-///   6 dstep (i32), 7 dstride, 8 w, 9 keep, 10 ~keep, 11 bits set in
-///   every pixel (an opaque alpha, from an image without one).
+/// and B between bgra8 and the others): pixel = (v & keep) |
+/// (swapped(v) & ~keep); a destination of fewer bytes keeps the low ones
+/// (R8 from RGBA8: red).
+///   params 0 sx0, 1 sy0, 2 sstep (i32), 3 sstride (bytes), 4 dx0, 5 dy0,
+///   6 dstep (i32), 7 dstride (bytes), 8 w, 9 keep, 10 ~keep, 11 bits set
+///   in every pixel (an opaque alpha, from an image without one), 12 the
+///   source's bytes a pixel, 13 the destination's.
 fn copyKernel(s: kir.Storage) kir.Kernel {
     var k = kir.Kernel.init(s, "gfx_copy", .{ GROUP, 1, 1 });
     const src = k.binding();
@@ -330,17 +368,19 @@ fn copyKernel(s: kir.Storage) kir.Kernel {
     const x = k.op3(.imad, .u32, r(k.gid(0)), u(GROUP), r(k.tid(0)));
     k.ifp(r(k.cmp(.u32, .lt, r(x), r(k.param(.u32, 8)))));
     const y = k.gid(1);
+    const sbpp = k.param(.u32, 12);
+    const dbpp = k.param(.u32, 13);
     const srow = k.op3(.imad, .i32, r(y), r(k.param(.i32, 2)), r(k.param(.i32, 1)));
     const drow = k.op3(.imad, .i32, r(y), r(k.param(.i32, 6)), r(k.param(.i32, 5)));
-    const sat = k.op3(.imad, .u32, r(srow), r(k.param(.u32, 3)), r(k.op2(.iadd, .u32, r(k.param(.u32, 0)), r(x))));
-    const dat = k.op3(.imad, .u32, r(drow), r(k.param(.u32, 7)), r(k.op2(.iadd, .u32, r(k.param(.u32, 4)), r(x))));
-    const v = k.load(.u32, kir.global(src, 32), r(k.op2(.shl, .u32, r(sat), u(2))));
+    const sat = k.op3(.imad, .u32, r(srow), r(k.param(.u32, 3)), r(k.op2(.imul, .u32, r(k.op2(.iadd, .u32, r(k.param(.u32, 0)), r(x))), r(sbpp))));
+    const dat = k.op3(.imad, .u32, r(drow), r(k.param(.u32, 7)), r(k.op2(.imul, .u32, r(k.op2(.iadd, .u32, r(k.param(.u32, 4)), r(x))), r(dbpp))));
+    const v = pixelLoad(&k, src, sbpp, sat);
     const lo = k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(v), u(16))), u(0xff));
     const hi = k.op2(.@"and", .u32, r(k.op2(.shl, .u32, r(v), u(16))), u(0xff_0000));
     const swapped = k.op2(.@"and", .u32, r(k.op2(.@"or", .u32, r(lo), r(hi))), r(k.param(.u32, 10)));
     const kept = k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(v), r(k.param(.u32, 9)))), r(swapped));
     const out = k.op2(.@"or", .u32, r(kept), r(k.param(.u32, 11)));
-    k.store(.u32, kir.global(dst, 32), r(k.op2(.shl, .u32, r(dat), u(2))), r(out));
+    pixelStore(&k, dst, dbpp, dat, out);
     k.endif();
     return k;
 }
@@ -358,9 +398,21 @@ fn swapRB(v: u32) u32 {
     return (v & 0xff00_ff00) | ((v >> 16) & 0xff) | ((v & 0xff) << 16);
 }
 
-/// The bits `copy` keeps of each pixel from `from` to `to`.
+/// The bits `copy` keeps of each pixel from `from` to `to`: all but R and
+/// B between BGRA8 and the others (RGBA8's order: R8 and RG8 too).
 fn keepOf(from: Format, to: Format) u32 {
-    return if (from != to and from.isColor() and to.isColor()) 0xff00_ff00 else 0xffff_ffff;
+    return if (from.renderable() and to.renderable() and (from == .bgra8) != (to == .bgra8)) 0xff00_ff00 else 0xffff_ffff;
+}
+
+/// A pixel's bytes as a word (little-endian, zero extended), and back.
+fn getPixel(b: []const u8, bpp: u32) u32 {
+    var v: u32 = 0;
+    for (0..bpp) |n| v |= @as(u32, b[n]) << @intCast(8 * n);
+    return v;
+}
+
+fn putPixel(b: []u8, bpp: u32, v: u32) void {
+    for (0..bpp) |n| b[n] = @truncate(v >> @intCast(8 * n));
 }
 
 // ── The engine ─────────────────────────────────────────────────────────────
@@ -404,6 +456,8 @@ pub const Stats = struct {
     dispatches: u64 = 0,
     cpu_ops: u64 = 0,
     waits: u64 = 0,
+    /// thread-instructions KIR's interpreter ran for draws on the CPU
+    cpu_lane_ops: u64 = 0,
 };
 
 pub const Engine = struct {
@@ -445,6 +499,11 @@ pub const Engine = struct {
     doomed: [MAX_DOOMED]Doomed = undefined,
     n_doomed: usize = 0,
     stats: Stats = .{},
+    /// Triangles a bin's list holds at most (raster.BIN_CAP; tests lower
+    /// it to make lists run over).
+    bin_cap: u32 = raster.BIN_CAP,
+    /// Off: no draw is binned (every tile goes through every triangle).
+    binning: bool = true,
 
     const Doomed = struct { buf: gpu.Buffer, batch: u64 };
     /// (the images as they were when the op was recorded: a batch done
@@ -471,13 +530,14 @@ pub const Engine = struct {
         var loaded: usize = 0;
         errdefer for (e.progs[0..loaded]) |*p| d.unload(p);
         for (0..N_PROGS) |i| {
-            var insts: [96]kir.Inst = undefined;
-            var tys: [96]kir.Ty = undefined;
+            var insts: [512]kir.Inst = undefined;
+            var tys: [512]kir.Ty = undefined;
             const s = kir.Storage{ .insts = &insts, .tys = &tys };
             var k = switch (@as(Prog, @enumFromInt(i))) {
                 .fill => fillKernel(s, false),
                 .fill_masked => fillKernel(s, true),
                 .copy => copyKernel(s),
+                .bin => raster.binKernel(s),
             };
             try k.finish();
             var w = gpu.Work.init(work_mem);
@@ -705,7 +765,7 @@ pub const Engine = struct {
 
     // ── Draws ──────────────────────────────────────────────────────────────
 
-    const Stage = enum(u2) { vertex, setup, raster };
+    const Stage = enum(u2) { vertex, setup, raster, bin };
 
     fn build(e: *Engine, st: Stage, p: *const raster.Pipeline) kir.Kernel {
         const s = kir.Storage{ .insts = &e.kir_insts, .tys = &e.kir_tys };
@@ -713,6 +773,7 @@ pub const Engine = struct {
             .vertex => raster.vertexKernel(s, p),
             .setup => raster.setupKernel(s, p),
             .raster => raster.rasterKernel(s, p),
+            .bin => raster.binKernel(s),
         };
     }
 
@@ -766,7 +827,9 @@ pub const Engine = struct {
         const p = d.pipe;
         var verts = e.newBuffer(@as(usize, d.instances) * d.count * p.vstride * 4) orelse return false;
         defer e.freeImage(&verts);
-        var tris = e.newBuffer(@as(usize, d.instances) * ntri * p.sstride * 4) orelse return false;
+        // (the triangle records, then the bins' lists)
+        const bins: raster.Bins = if (e.binning) raster.binsOf(d, e.bin_cap) else .{};
+        var tris = e.newBuffer((@as(usize, d.instances) * ntri * p.sstride + bins.words()) * 4) orelse return false;
         defer e.freeImage(&tris);
         var uni = e.newBuffer(@max(d.uniforms.len * 4, 16)) orelse return false;
         defer e.freeImage(&uni);
@@ -774,9 +837,13 @@ pub const Engine = struct {
         var vp: [MAX_PARAMS]u32 = undefined;
         var sp: [MAX_PARAMS]u32 = undefined;
         var rp: [MAX_PARAMS]u32 = undefined;
+        var bp: [MAX_PARAMS]u32 = undefined;
         const vparams = raster.vertexParams(d, &vp);
         const sparams = raster.setupParams(d, &sp);
-        const rparams = raster.rasterParams(d, &rp);
+        const rparams = raster.rasterParams(d, bins, &rp);
+        const bparams = raster.binParams(d, bins, &bp);
+        const tb = [_]*Image{&tris};
+        const groups_b = [3]u32{ bins.x, bins.y, 1 };
         // the bindings: vertex (records, uniforms, element array,
         // attributes, textures), setup (triangles, vertices), raster
         // (color, depth, triangles, uniforms, textures)
@@ -810,6 +877,7 @@ pub const Engine = struct {
             const rw: u32 = if (d.depth != null and d.depth_test and d.depth_write) 0b11 else 0b01;
             e.recordProg(&p.progs[0].?, groups_v, vb, 1, vparams, null);
             e.recordProg(&p.progs[1].?, groups_s, &sb, 1, sparams, null);
+            if (bins.on) e.recordProg(&e.progs[@intFromEnum(Prog.bin)], groups_b, &tb, 1, bparams, null);
             e.recordProg(&p.progs[2].?, groups_r, rb, rw, rparams, null);
             return true;
         }
@@ -823,6 +891,8 @@ pub const Engine = struct {
         if (!e.runCpu(.vertex, p, groups_v, views[0..vb.len], vparams)) return false;
         const sv = [_][]u8{ tris.buf.cpu, verts.buf.cpu };
         if (!e.runCpu(.setup, p, groups_s, &sv, sparams)) return false;
+        const bv = [_][]u8{tris.buf.cpu};
+        if (bins.on and !e.runCpu(.bin, p, groups_b, &bv, bparams)) return false;
         var rv: [4 + texture.MAX_TEX][]u8 = undefined;
         for (rb, 0..) |img, j| rv[j] = img.buf.cpu;
         if (!e.runCpu(.raster, p, groups_r, rv[0..rb.len], rparams)) return false;
@@ -857,6 +927,7 @@ pub const Engine = struct {
             e.trap = trap;
             return false;
         };
+        e.stats.cpu_lane_ops += stats.lane_ops;
         return true;
     }
 
@@ -875,16 +946,14 @@ pub const Engine = struct {
         // (memory rows: a top-down image's GL rows are flipped)
         const y0 = if (img.top_down) img.height - a.y1 else a.y0;
         const groups = [3]u32{ std.math.divCeil(u32, a.width(), GROUP) catch unreachable, a.height(), 1 };
-        const p = [_]u32{ a.x0, y0, a.width(), img.stride / 4, value & ~keep, keep };
-        if (keep == 0)
-            e.record(.fill, groups, &.{img}, p[0..5], op)
-        else
-            e.record(.fill_masked, groups, &.{img}, &p, op);
+        const p = [_]u32{ a.x0, y0, a.width(), img.stride, value & ~keep, keep, img.format.bytes() };
+        e.record(if (keep == 0) .fill else .fill_masked, groups, &.{img}, &p, op);
     }
 
     /// w x h pixels from (sx, sy) in src to (dx, dy) in dst (GL's
     /// coordinates; both inside their images), converted between rgba8
-    /// and bgra8. src and dst may be the same image only apart.
+    /// and bgra8, or to fewer channels (R8 and RG8 from either). src and
+    /// dst may be the same image only apart.
     pub fn copy(e: *Engine, src: *Image, sx: u32, sy: u32, dst: *Image, dx: u32, dy: u32, w: u32, h: u32) void {
         if (w == 0 or h == 0) return;
         std.debug.assert(sx + w <= src.width and sy + h <= src.height and dx + w <= dst.width and dy + h <= dst.height);
@@ -899,7 +968,7 @@ pub const Engine = struct {
         const d0: i32 = @intCast(dst.rowOf(dy));
         const ss: i32 = if (src.top_down) -1 else 1;
         const ds: i32 = if (dst.top_down) -1 else 1;
-        const p = [_]u32{ sx, @bitCast(s0), @bitCast(ss), src.stride / 4, dx, @bitCast(d0), @bitCast(ds), dst.stride / 4, w, keep, ~keep, setOf(src) };
+        const p = [_]u32{ sx, @bitCast(s0), @bitCast(ss), src.stride, dx, @bitCast(d0), @bitCast(ds), dst.stride, w, keep, ~keep, setOf(src), src.format.bytes(), dst.format.bytes() };
         e.record(.copy, .{ std.math.divCeil(u32, w, GROUP) catch unreachable, h, 1 }, &.{ src, dst }, &p, op);
     }
 
@@ -935,22 +1004,36 @@ pub const Engine = struct {
     }
 
     /// Rows of img's rectangle (GL's coordinates, inside img) to the CPU:
-    /// GL row y + j at `dst[j * dst_stride ..]`, in `want` (converted).
+    /// GL row y + j at `dst[j * dst_stride ..]`, in `want`: RGBA8 or
+    /// BGRA8 (converted: what an R8 or RG8 image lacks is 0, alpha 1), or
+    /// img's own format.
     pub fn read(e: *Engine, img: *Image, x: u32, y: u32, w: u32, h: u32, dst: []u8, dst_stride: usize, want: Format) void {
         if (w == 0 or h == 0) return;
         e.settle(img);
         const swap = keepOf(img.format, want) != 0xffff_ffff;
-        const set = setOf(img);
-        const sw = img.words();
+        const sb = img.format.bytes();
+        const db = want.bytes();
+        // (opaque: an image without alpha, or one of fewer channels read
+        // as RGBA; read as itself, its bytes alone are kept)
+        const set: u32 = if (setOf(img) != 0 or img.format.channels() < 4) 0xff00_0000 else 0;
         for (0..h) |j| {
             const row = img.rowOf(y + @as(u32, @intCast(j)));
-            const off = @as(usize, row) * img.stride + @as(usize, x) * 4;
-            if (img.gpuWrote()) e.fromDevice(img, off, @as(usize, w) * 4);
-            const d = dst[j * dst_stride ..][0 .. @as(usize, w) * 4];
-            const base = off / 4;
+            const off = @as(usize, row) * img.stride + @as(usize, x) * sb;
+            if (img.gpuWrote()) e.fromDevice(img, off, @as(usize, w) * sb);
+            const s = img.buf.cpu[off..][0 .. @as(usize, w) * sb];
+            const d = dst[j * dst_stride ..][0 .. @as(usize, w) * db];
+            if (sb == 4 and db == 4) {
+                // (words, as most reads are)
+                const sw = img.words()[off / 4 ..][0..w];
+                for (sw, 0..) |word, i| {
+                    const v = word | set;
+                    std.mem.writeInt(u32, d[i * 4 ..][0..4], if (swap) swapRB(v) else v, .little);
+                }
+                continue;
+            }
             for (0..w) |i| {
-                const v = sw[base + i] | set;
-                std.mem.writeInt(u32, d[i * 4 ..][0..4], if (swap) swapRB(v) else v, .little);
+                const v = getPixel(s[i * sb ..], sb) | set;
+                putPixel(d[i * db ..], db, if (swap) swapRB(v) else v);
             }
         }
         e.stats.cpu_ops += 1;
@@ -1006,36 +1089,50 @@ pub const Engine = struct {
         switch (op) {
             .fill => |*f| {
                 const img = &f.img;
-                const w = img.words();
+                const bpp = img.format.bytes();
                 var y = f.rect.y0;
                 while (y < f.rect.y1) : (y += 1) {
-                    const off = @as(usize, img.rowOf(y)) * img.stride + @as(usize, f.rect.x0) * 4;
-                    const len = @as(usize, f.rect.width()) * 4;
+                    const off = @as(usize, img.rowOf(y)) * img.stride + @as(usize, f.rect.x0) * bpp;
+                    const len = @as(usize, f.rect.width()) * bpp;
                     // (the GPU's writes first, the CPU's after: a lost GPU
                     // leaves its memory as it was)
                     if (img.gpuWrote()) e.fromDevice(img, off, len);
-                    const row = w[off / 4 ..][0..f.rect.width()];
-                    for (row) |*p| p.* = (p.* & f.keep) | f.value;
+                    if (bpp == 4) {
+                        const row = img.words()[off / 4 ..][0..f.rect.width()];
+                        for (row) |*p| p.* = (p.* & f.keep) | f.value;
+                    } else {
+                        const row = img.buf.cpu[off..][0..len];
+                        for (0..f.rect.width()) |i| {
+                            const px = row[i * bpp ..];
+                            putPixel(px, bpp, (getPixel(px, bpp) & f.keep) | f.value);
+                        }
+                    }
                     e.toDevice(img, off, len);
                 }
             },
             .copy => |*c| {
                 const swap = keepOf(c.src.format, c.dst.format) != 0xffff_ffff;
                 const set = setOf(&c.src);
-                const sw = c.src.words();
-                const dw = c.dst.words();
+                const sb = c.src.format.bytes();
+                const db = c.dst.format.bytes();
                 for (0..c.h) |j| {
                     const jj: u32 = @intCast(j);
-                    const so = @as(usize, c.src.rowOf(c.sy + jj)) * c.src.stride + @as(usize, c.sx) * 4;
-                    const do_ = @as(usize, c.dst.rowOf(c.dy + jj)) * c.dst.stride + @as(usize, c.dx) * 4;
-                    const len = @as(usize, c.w) * 4;
-                    if (c.src.gpuWrote()) e.fromDevice(&c.src, so, len);
-                    if (c.dst.gpuWrote()) e.fromDevice(&c.dst, do_, len);
-                    for (0..c.w) |i| {
-                        const v = sw[so / 4 + i] | set;
-                        dw[do_ / 4 + i] = if (swap) swapRB(v) else v;
+                    const so = @as(usize, c.src.rowOf(c.sy + jj)) * c.src.stride + @as(usize, c.sx) * sb;
+                    const do_ = @as(usize, c.dst.rowOf(c.dy + jj)) * c.dst.stride + @as(usize, c.dx) * db;
+                    if (c.src.gpuWrote()) e.fromDevice(&c.src, so, @as(usize, c.w) * sb);
+                    if (c.dst.gpuWrote()) e.fromDevice(&c.dst, do_, @as(usize, c.w) * db);
+                    if (sb == 4 and db == 4) {
+                        const sw = c.src.words();
+                        const dw = c.dst.words();
+                        for (0..c.w) |i| {
+                            const v = sw[so / 4 + i] | set;
+                            dw[do_ / 4 + i] = if (swap) swapRB(v) else v;
+                        }
+                    } else for (0..c.w) |i| {
+                        const v = getPixel(c.src.buf.cpu[so + i * sb ..], sb) | set;
+                        putPixel(c.dst.buf.cpu[do_ + i * db ..], db, if (swap) swapRB(v) else v);
                     }
-                    e.toDevice(&c.dst, do_, len);
+                    e.toDevice(&c.dst, do_, @as(usize, c.w) * db);
                 }
             },
         }

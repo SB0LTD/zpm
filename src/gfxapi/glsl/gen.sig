@@ -36,8 +36,14 @@
 //! - Samplers are their texture slots (immediates, so passed to functions
 //!   as values); a texture function reads the slot's binding through its
 //!   descriptor (texture.sig).
+//! - Derivatives (dFdx, dFdy, fwidth) are differences with the quad's
+//!   neighbour pixel, through a shuffle: the raster runs whole quads for a
+//!   program that takes them (FragmentIO.quads). In control flow that is
+//!   not uniform (an if, a loop's exit, a return or discard on a value
+//!   that differs between pixels) GL leaves them undefined: here they
+//!   are 0 (`flattenDerivs`).
 //! - Not yet: cube, 3D, array and shadow samplers (they read 0), a sampler
-//!   chosen at run time, derivatives (0), gl_FragDepth, gl_PointSize.
+//!   chosen at run time, gl_FragDepth, gl_PointSize.
 //!
 //! Allocation-free: its tables are the Scratch's (Store).
 
@@ -91,6 +97,11 @@ const NO_SLOT: u32 = 0xffff;
 pub const MAX_COMPS = 1 << 18;
 pub const MAX_VARS = 4096;
 pub const MAX_FUNCS = 512;
+/// Shuffles derivatives make in a shader (a vector's take one a component).
+pub const MAX_DERIVS = 1024;
+/// Instructions and registers the derivatives' flow check covers (a kernel
+/// past them: every derivative 0).
+const FLOW_BITS = 65536;
 const MAX_FRAMES = 32;
 const MAX_LOOPS = 64;
 const MAX_SCOPES = 256;
@@ -118,6 +129,15 @@ pub const Store = struct {
     funcs: [MAX_FUNCS]u32 = undefined,
     /// registers variables live in (written with `set`), a bit each
     mut: [65536 / 8]u8 = undefined,
+    /// the derivatives' shuffles (instruction indices), and whether each
+    /// is in control flow that is not uniform
+    derivs: [MAX_DERIVS]u32 = undefined,
+    deriv_div: [MAX_DERIVS]bool = undefined,
+    /// flattenDerivs': divergent registers; loops left in divergent flow;
+    /// loops that run one pass (each a bit, by instruction)
+    div: [FLOW_BITS / 8]u8 = undefined,
+    loop_div: [FLOW_BITS / 8]u8 = undefined,
+    one_pass: [FLOW_BITS / 8]u8 = undefined,
 };
 
 /// A value: `ncand` candidates of size(ty) operands at comps[at..] (a
@@ -178,6 +198,14 @@ const Gen = struct {
     nloops: u32 = 0,
     discard: V = .none,
     failed: bool = false,
+    /// fragment: whole quads run (derivatives are shuffles), and each
+    /// pixel's place in its quad
+    quads: bool = false,
+    odd_x: V = .none,
+    odd_y: V = .none,
+    nderivs: u32 = 0,
+    /// a derivative was generated
+    derivatives: bool = false,
 
     fn node(g: *Gen, i: u32) *Node {
         return &g.s.parser.nodes[i];
@@ -1750,10 +1778,47 @@ const Gen = struct {
                 g.put(at, 0, acc);
             },
             .not => for (0..n) |ix| g.put(at, @intCast(ix), g.pnot(g.cp(v[0].at, @intCast(ix)))),
-            // (no helper pixels yet: the raster runs covered pixels only)
-            .dFdx, .dFdy, .fwidth => for (0..n) |ix| g.put(at, @intCast(ix), f(0)),
+            .dFdx, .dFdy, .fwidth => {
+                g.derivatives = true;
+                for (0..n) |ix| {
+                    const x = g.cp(v[0].at, @intCast(ix));
+                    const d = switch (which) {
+                        .dFdx => g.deriv(x, false),
+                        .dFdy => g.deriv(x, true),
+                        else => g.fadd(g.fabs(g.deriv(x, false)), g.fabs(g.deriv(x, true))),
+                    };
+                    g.put(at, @intCast(ix), d);
+                }
+            },
         }
         return out;
+    }
+
+    /// x's difference with the quad's neighbour pixel's x, across (or
+    /// up): the right one's less the left one's, for both. 0 where the
+    /// raster runs pixels alone, and for an immediate.
+    fn deriv(g: *Gen, x: Arg, up: bool) Arg {
+        if (!g.quads or x == .imm) return f(0);
+        if (g.nderivs == MAX_DERIVS) {
+            g.fail(0, "more than {d} derivatives", .{MAX_DERIVS});
+            return f(0);
+        }
+        const k = g.k;
+        const xv = asF32(g, x);
+        const o = k.shfl(.f32, .xor, r(xv), u(if (up) raster.QUAD_Y else raster.QUAD_X));
+        g.st.derivs[g.nderivs] = @intCast(k.n - 1);
+        g.nderivs += 1;
+        const odd = if (up) g.odd_y else g.odd_x;
+        return r(k.sel(.f32, r(odd), r(k.op2(.fsub, .f32, r(xv), r(o))), r(k.op2(.fsub, .f32, r(o), r(xv)))));
+    }
+
+    fn fabs(g: *Gen, x: Arg) Arg {
+        if (x == .imm) return f(@abs(@as(f32, @bitCast(x.imm))));
+        return r(g.k.op1(.fabs, .f32, x));
+    }
+
+    fn fadd(g: *Gen, a: Arg, b: Arg) Arg {
+        return r(g.k.op2(.fadd, .f32, a, b));
     }
 
     // ── Textures ───────────────────────────────────────────────────────────
@@ -2393,7 +2458,11 @@ pub fn vertex(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.VertexI
 /// The fragment shader in the scratch (compiled) as the raster kernel's
 /// fragment code: io's color (location 0) and discard set.
 pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.FragmentIO, log: *pp.Log) bool {
+    const lo = k.n;
     var g = begin(s, lay, k, log, .fragment, io.uniforms, io.textures);
+    g.quads = io.quads and io.odd_x != .none and io.odd_y != .none;
+    g.odd_x = io.odd_x;
+    g.odd_y = io.odd_y;
     const v4 = sema.vecT(.float, 4);
     g.declare(.{ .name = "gl_FragCoord", .ty = v4, .at = g.imms(v4, &.{ r(io.frag_coord[0]), r(io.frag_coord[1]), r(io.frag_coord[2]), r(io.frag_coord[3]) }).at, .ro = true });
     g.declare(.{ .name = "gl_FrontFacing", .ty = BOOL, .at = g.imms(BOOL, &.{if (io.front_facing == .none) u(1) else r(io.front_facing)}).at, .ro = true });
@@ -2431,5 +2500,156 @@ pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
     }
     for (0..4) |c| io.color[c] = asF32(&g, color[c]);
     io.discard = g.discard;
+    io.derivatives = g.derivatives;
+    if (g.nderivs > 0) flattenDerivs(k, lo, g.st, g.st.derivs[0..g.nderivs]);
     return !g.failed;
+}
+
+// ── Derivatives in control flow that is not uniform ────────────────────────
+
+fn bitOf(set: []const u8, n: usize) bool {
+    return set[n >> 3] & (@as(u8, 1) << @intCast(n & 7)) != 0;
+}
+
+fn setBit(set: []u8, n: usize) void {
+    set[n >> 3] |= @as(u8, 1) << @intCast(n & 7);
+}
+
+/// GL leaves a derivative undefined in control flow that is not uniform;
+/// here it is 0. A quad's lanes enter the fragment code together (the
+/// raster runs it for whole quads), and stay together only while its
+/// control flow is uniform: a shuffle elsewhere could read a lane that is
+/// not there (a trap in KIR's interpreter, garbage on a GPU). So each of
+/// the derivatives' shuffles (`derivs`) at a place in the code from `lo`
+/// (the shader's) where a lane may have left, or not come, becomes a copy
+/// of the lane's own value.
+///
+/// Uniform values are alike in every lane of the group: immediates,
+/// parameters, group ids, a load from a uniform address, what is computed
+/// from uniform values where every lane runs. Divergent: thread and lane
+/// ids, atomics, shuffles, what is computed from a divergent value or
+/// written in divergent flow. Flow from `lo` on is divergent under an if
+/// on a divergent value; after a break or continue on one (or under one)
+/// to the end of that pass of its loop; through the whole of a loop left
+/// that way that runs more than one pass; after a return. A fixpoint: a
+/// register once divergent stays so (every write of it counts, wherever).
+fn flattenDerivs(k: *kir.Kernel, lo: usize, st: *Store, derivs: []const u32) void {
+    const insts = k.insts[0..k.n];
+    if (insts.len > FLOW_BITS) {
+        for (derivs) |at| flatten(k, at);
+        return;
+    }
+    @memset(&st.div, 0);
+    @memset(&st.loop_div, 0);
+    @memset(&st.one_pass, 0);
+    const Fr = struct { loop: bool, start: u32, div: bool, has_cont: bool = false };
+    var frames: [256]Fr = undefined;
+    // the loops that run one pass: no continue, a break last
+    {
+        var depth: usize = 0;
+        for (insts, 0..) |in, ix| {
+            switch (in.op) {
+                .loop, .@"if" => {
+                    if (depth == frames.len) return for (derivs) |at| flatten(k, at);
+                    frames[depth] = .{ .loop = in.op == .loop, .start = @intCast(ix), .div = false };
+                    depth += 1;
+                },
+                .cont => {
+                    var f_ = depth;
+                    while (f_ > 0) : (f_ -= 1) {
+                        if (frames[f_ - 1].loop) {
+                            frames[f_ - 1].has_cont = true;
+                            break;
+                        }
+                    }
+                },
+                .endif => depth -|= 1,
+                .endloop => {
+                    if (depth == 0) continue;
+                    depth -= 1;
+                    const prev = insts[ix - 1];
+                    const last_brk = prev.op == .brk and prev.a == .imm and prev.a.imm != 0;
+                    if (last_brk and !frames[depth].has_cont) setBit(&st.one_pass, frames[depth].start);
+                },
+                else => {},
+            }
+        }
+    }
+    const isDiv = struct {
+        fn f_(set: []const u8, a: Arg) bool {
+            return a == .reg and a.reg != .none and bitOf(set, @intFromEnum(a.reg));
+        }
+    }.f_;
+    var changed = true;
+    var rounds: u32 = 0;
+    while (changed and rounds < 64) : (rounds += 1) {
+        changed = false;
+        var depth: usize = 0;
+        var after_ret = false;
+        var dp: usize = 0;
+        for (insts, 0..) |in, ix| {
+            const region = ix >= lo;
+            var cd = after_ret;
+            for (frames[0..depth]) |fr| cd = cd or fr.div;
+            if (dp < derivs.len and derivs[dp] == ix) {
+                st.deriv_div[dp] = cd;
+                dp += 1;
+            }
+            switch (in.op) {
+                .@"if" => {
+                    frames[depth] = .{ .loop = false, .start = @intCast(ix), .div = region and isDiv(&st.div, in.a) };
+                    depth += 1;
+                },
+                .loop => {
+                    const again = !bitOf(&st.one_pass, ix) and bitOf(&st.loop_div, ix);
+                    frames[depth] = .{ .loop = true, .start = @intCast(ix), .div = region and again };
+                    depth += 1;
+                },
+                .@"else" => {},
+                .endif, .endloop => depth -|= 1,
+                .brk, .cont => if (region) {
+                    // the loop it leaves (or goes round), and whether some
+                    // lanes may take it and others not
+                    var l = depth;
+                    while (l > 0 and !frames[l - 1].loop) l -= 1;
+                    if (l == 0) continue;
+                    var inner = isDiv(&st.div, in.a);
+                    for (frames[l..depth]) |fr| inner = inner or fr.div;
+                    if (inner) {
+                        frames[l - 1].div = true;
+                        if (!bitOf(&st.loop_div, frames[l - 1].start)) {
+                            setBit(&st.loop_div, frames[l - 1].start);
+                            changed = true;
+                        }
+                    }
+                },
+                .ret => after_ret = after_ret or region,
+                else => {
+                    if (in.dst == .none) continue;
+                    const d: bool = switch (in.op) {
+                        .tid, .lane, .atom, .shfl => true,
+                        .gid, .gsize, .subgroup, .param, .vote => cd and region,
+                        else => (region and cd) or isDiv(&st.div, in.a) or isDiv(&st.div, in.b) or isDiv(&st.div, in.c),
+                    };
+                    if (!d) continue;
+                    const nregs: usize = if (in.op == .ld) kir.memRegs(@bitCast(in.aux)) else 1;
+                    for (0..nregs) |j| {
+                        const v = @as(usize, @intFromEnum(in.dst)) + j;
+                        if (v >= FLOW_BITS or bitOf(&st.div, v)) continue;
+                        setBit(&st.div, v);
+                        changed = true;
+                    }
+                },
+            }
+        }
+    }
+    for (derivs, 0..) |at, j| {
+        if (changed or st.deriv_div[j]) flatten(k, at);
+    }
+}
+
+/// A derivative's shuffle becomes a copy of the lane's own value.
+fn flatten(k: *kir.Kernel, at: u32) void {
+    const in = k.insts[at];
+    k.insts[at] = .{ .op = .mov, .ty = in.ty, .dst = in.dst, .a = in.a, .b = no, .c = no, .aux = 0 };
 }

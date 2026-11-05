@@ -289,6 +289,8 @@ fn packColor(fmt: Format, c: [4]f32) u32 {
     return switch (fmt) {
         .rgba8 => r | gr << 8 | b << 16 | a << 24,
         .bgra8 => b | gr << 8 | r << 16 | a << 24,
+        .rg8 => r | gr << 8,
+        .r8 => r,
         else => unreachable,
     };
 }
@@ -296,13 +298,13 @@ fn packColor(fmt: Format, c: [4]f32) u32 {
 /// The bits of a `fmt` pixel the color mask keeps (masked off).
 fn colorKeep(fmt: Format, m: [4]bool) u32 {
     const chan = switch (fmt) {
-        .rgba8 => [4]u5{ 0, 8, 16, 24 },
         .bgra8 => [4]u5{ 16, 8, 0, 24 },
+        .rgba8, .rg8, .r8 => [4]u5{ 0, 8, 16, 24 },
         else => unreachable,
     };
     var keep: u32 = 0;
-    for (m, chan) |on, sh| {
-        if (!on) keep |= @as(u32, 0xff) << sh;
+    for (m, chan, 0..) |on, sh, n| {
+        if (!on and n < fmt.channels()) keep |= @as(u32, 0xff) << sh;
     }
     return keep;
 }
@@ -313,6 +315,9 @@ fn clientFormat(format: u32, ty: u32) union(enum) { ok: Format, err: u32 } {
     if (ty == g.UNSIGNED_BYTE) {
         if (format == g.RGBA) return .{ .ok = .rgba8 };
         if (format == g.BGRA_EXT) return .{ .ok = .bgra8 };
+        // (an R8 or RG8 framebuffer's own: its read format)
+        if (format == g.RED) return .{ .ok = .r8 };
+        if (format == g.RG) return .{ .ok = .rg8 };
     }
     const known_format = switch (format) {
         g.RGBA, g.BGRA_EXT, g.RGB, g.ALPHA, g.LUMINANCE, g.LUMINANCE_ALPHA, g.RED, g.RG, g.RGBA_INTEGER, g.DEPTH_COMPONENT, g.DEPTH_STENCIL => true,
@@ -330,8 +335,20 @@ fn rbFormat(internal: u32) ?Format {
     return switch (internal) {
         g.RGBA8 => .rgba8,
         g.BGRA8_EXT => .bgra8,
+        g.R8 => .r8,
+        g.RG8 => .rg8,
         g.DEPTH_COMPONENT16, g.DEPTH_COMPONENT24, g.DEPTH24_STENCIL8, g.STENCIL_INDEX8 => .d24s8,
         else => null,
+    };
+}
+
+/// A texture's internal format is color-renderable (ES 3.0's table, the
+/// ones stored as a renderable format: RGBA8's 16-bit forms are widened
+/// to it; sRGB is not drawn into yet).
+fn renderableInternal(internal: u32) bool {
+    return switch (internal) {
+        g.RGBA8, g.RGBA, g.RGB8, g.RGB, g.RGB565, g.RGBA4, g.RGB5_A1, g.BGRA8_EXT, g.BGRA_EXT, g.R8, g.RG8 => true,
+        else => false,
     };
 }
 
@@ -829,11 +846,16 @@ pub const Context = struct {
             g.IMPLEMENTATION_COLOR_READ_FORMAT => blk: {
                 const v = c.view(c.read_fb, true);
                 const img = v.read orelse break :blk int(g.RGBA);
-                break :blk int(if (img.format == .bgra8) g.BGRA_EXT else g.RGBA);
+                break :blk int(switch (img.format) {
+                    .bgra8 => g.BGRA_EXT,
+                    .r8 => g.RED,
+                    .rg8 => g.RG,
+                    else => g.RGBA,
+                });
             },
             g.IMPLEMENTATION_COLOR_READ_TYPE => int(g.UNSIGNED_BYTE),
-            g.RED_BITS, g.GREEN_BITS, g.BLUE_BITS => int(if (c.view(c.draw_fb, false).color[0] != null) 8 else 0),
-            g.ALPHA_BITS => int(if (c.view(c.draw_fb, false).color[0]) |img| (if (img.no_alpha) 0 else 8) else 0),
+            g.RED_BITS, g.GREEN_BITS, g.BLUE_BITS => int(if (c.view(c.draw_fb, false).color[0]) |img| (if (img.format.channels() > pname - g.RED_BITS) 8 else 0) else 0),
+            g.ALPHA_BITS => int(if (c.view(c.draw_fb, false).color[0]) |img| (if (img.no_alpha or img.format.channels() < 4) 0 else 8) else 0),
             g.DEPTH_BITS => int(if (c.view(c.draw_fb, false).depth != null) 24 else 0),
             g.STENCIL_BITS => int(if (c.view(c.draw_fb, false).stencil != null) 8 else 0),
             g.GENERATE_MIPMAP_HINT => int(c.hint_mipmap),
@@ -877,11 +899,6 @@ pub const Context = struct {
 
     // ── Framebuffers as operations see them ────────────────────────────────
 
-    fn texImage(c: *Context, name: u32) ?*Image {
-        const t = slotIn(Tex, &c.objs.tex, name) orelse return null;
-        return if (t.img.live()) &t.img else null;
-    }
-
     fn rbOf(c: *Context, name: u32) ?*Rb {
         return slotIn(Rb, &c.objs.rbs, name);
     }
@@ -892,14 +909,16 @@ pub const Context = struct {
         switch (a.kind) {
             .none => return .{ .img = null, .ok = true },
             .tex => {
-                const img = c.texImage(a.name) orelse return .{ .img = null, .ok = false };
-                return .{ .img = img, .ok = want == .color and img.format.isColor() };
+                const t = slotIn(Tex, &c.objs.tex, a.name) orelse return .{ .img = null, .ok = false };
+                if (!t.img.live()) return .{ .img = null, .ok = false };
+                const ok = want == .color and t.img.format.renderable() and !t.srgb and renderableInternal(t.internal);
+                return .{ .img = &t.img, .ok = ok };
             },
             .rb => {
                 const rb = c.rbOf(a.name) orelse return .{ .img = null, .ok = false };
                 if (!rb.img.live()) return .{ .img = null, .ok = false };
                 const ok = switch (want) {
-                    .color => rb.img.format.isColor(),
+                    .color => rb.img.format.renderable(),
                     .depth => hasDepth(rb.internal),
                     .stencil => hasStencil(rb.internal),
                 };
@@ -1108,10 +1127,13 @@ pub const Context = struct {
         const v = c.view(c.read_fb, true);
         if (v.status != g.FRAMEBUFFER_COMPLETE) return c.fail(g.INVALID_FRAMEBUFFER_OPERATION);
         const src = v.read orelse return c.fail(g.INVALID_OPERATION);
+        // (RED and RG: only as the framebuffer is, its read format)
+        if (!want.isColor() and want != src.format) return c.fail(g.INVALID_OPERATION);
+        const bpp = want.bytes();
         const uw: u32 = @intCast(w);
         const uh: u32 = @intCast(h);
-        const l = c.pack.layout(uw, 4);
-        const span = spanOf(l.first, l.row, uw, uh, 4);
+        const l = c.pack.layout(uw, bpp);
+        const span = spanOf(l.first, l.row, uw, uh, bpp);
         if (span == 0) return;
         var pbo: ?*Buf = null;
         const dst: []u8 = if (c.bufs.pack != 0) blk: {
@@ -1130,7 +1152,7 @@ pub const Context = struct {
         const x1: i64 = @min(@as(i64, x) + w, v.width);
         const y1: i64 = @min(@as(i64, y) + h, v.height);
         if (x1 <= x0 or y1 <= y0) return;
-        const at = l.first + @as(usize, @intCast(y0 - y)) * l.row + @as(usize, @intCast(x0 - x)) * 4;
+        const at = l.first + @as(usize, @intCast(y0 - y)) * l.row + @as(usize, @intCast(x0 - x)) * bpp;
         c.eng.read(src, @intCast(x0), @intCast(y0), @intCast(x1 - x0), @intCast(y1 - y0), dst[at..], l.row, want);
         if (pbo) |b| c.eng.wrote(&b.store, addr(pixels), span);
     }
@@ -1474,13 +1496,18 @@ pub const Context = struct {
         c.eng.copy(src, @intCast(x0), @intCast(y0), dst, @intCast(dx + (x0 - x)), @intCast(dy + (y0 - y)), @intCast(x1 - x0), @intCast(y1 - y0));
     }
 
+    /// A copy from a framebuffer of `from` into a texture of `to`: both
+    /// renderable, `to` of `from`'s channels or fewer (ES 3.0).
+    fn copyable(from: Format, to: Format) bool {
+        return from.renderable() and to.renderable() and to.channels() <= from.channels();
+    }
+
     pub fn copyTexSubImage2D(c: *Context, target: u32, level: i32, dx: i32, dy: i32, x: i32, y: i32, w: i32, h: i32) void {
         const t = c.boundTex2D(target) orelse return;
         if (level != 0 or dx < 0 or dy < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
         if (@as(i64, dx) + w > t.img.width or @as(i64, dy) + h > t.img.height) return c.fail(g.INVALID_VALUE);
         const s = c.readSource() orelse return;
-        if (!s.img.format.isColor() or !t.img.format.isColor()) return c.fail(g.INVALID_OPERATION);
-        if (s.img == &t.img) return c.fail(g.INVALID_OPERATION);
+        if (!copyable(s.img.format, t.img.format) or t.srgb or s.img == &t.img) return c.fail(g.INVALID_OPERATION);
         c.copyFrom(s.img, s.v, x, y, w, h, &t.img, dx, dy);
     }
 
@@ -1490,12 +1517,14 @@ pub const Context = struct {
         const fmt: Format = switch (internal) {
             g.RGBA, g.RGBA8 => .rgba8,
             g.BGRA_EXT, g.BGRA8_EXT => .bgra8,
+            g.R8 => .r8,
+            g.RG8 => .rg8,
             g.RGB, g.ALPHA, g.LUMINANCE, g.LUMINANCE_ALPHA, g.RGB8, g.RGB565, g.RGBA4, g.RGB5_A1 => return c.fail(g.INVALID_OPERATION),
             else => return c.fail(g.INVALID_ENUM),
         };
         if (t.immutable) return c.fail(g.INVALID_OPERATION);
         const s = c.readSource() orelse return;
-        if (!s.img.format.isColor() or s.img == &t.img) return c.fail(g.INVALID_OPERATION);
+        if (!copyable(s.img.format, fmt) or s.img == &t.img) return c.fail(g.INVALID_OPERATION);
         if (!c.defineTex(t, @intCast(w), @intCast(h), fmt, internal)) return;
         t.fswz = .{ 0, 1, 2, 3 };
         t.srgb = false;
@@ -1641,13 +1670,13 @@ pub const Context = struct {
             c.fail(g.INVALID_OPERATION);
             return null;
         };
-        const color = rb.img.live() and rb.img.format.isColor();
+        const chans: u32 = if (rb.img.live() and rb.img.format.renderable()) rb.img.format.channels() else 0;
         return switch (pname) {
             g.RENDERBUFFER_WIDTH => @intCast(rb.img.width),
             g.RENDERBUFFER_HEIGHT => @intCast(rb.img.height),
             g.RENDERBUFFER_INTERNAL_FORMAT => @bitCast(rb.internal),
             g.RENDERBUFFER_SAMPLES => @intCast(rb.samples),
-            g.RENDERBUFFER_RED_SIZE, g.RENDERBUFFER_RED_SIZE + 1, g.RENDERBUFFER_RED_SIZE + 2, g.RENDERBUFFER_RED_SIZE + 3 => if (color) 8 else 0,
+            g.RENDERBUFFER_RED_SIZE, g.RENDERBUFFER_RED_SIZE + 1, g.RENDERBUFFER_RED_SIZE + 2, g.RENDERBUFFER_RED_SIZE + 3 => if (chans > pname - g.RENDERBUFFER_RED_SIZE) 8 else 0,
             g.RENDERBUFFER_RED_SIZE + 4 => if (rb.img.live() and hasDepth(rb.internal)) 24 else 0,
             g.RENDERBUFFER_STENCIL_SIZE => if (rb.img.live() and hasStencil(rb.internal)) 8 else 0,
             else => {

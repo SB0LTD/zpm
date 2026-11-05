@@ -10,6 +10,10 @@
 //! per-instance attribute, scissor and color mask, flat shading, a fan on
 //! the window's top-down buffer. The shaders are KIR emitters, as the
 //! GLSL compiler will make them.
+//!
+//! A second scene is larger than a bin (raster.BIN): blended triangles all
+//! over, big ones across bins under a scissor, a thin strip. Binned, not
+//! binned, and binned with lists that run over must give the same bytes.
 
 const std = @import("std");
 const gpu = @import("gpu");
@@ -96,7 +100,7 @@ fn quad(x0: f32, y0: f32, x1: f32, y1: f32, z: f32, col: [4]f32) [6]Vert {
     return .{ v(x0, y0, z, col), v(x1, y0, z, col), v(x1, y1, z, col), v(x0, y0, z, col), v(x1, y1, z, col), v(x0, y1, z, col) };
 }
 
-fn noErr(c: *gles.Context, out: *Out) void {
+fn noErr(c: *gles.Context, out: anytype) void {
     if (c.getError() != g.NO_ERROR) out.errors += 1;
 }
 
@@ -372,6 +376,165 @@ test "draw: the scene on the emulated Adreno (ir3) gives the CPU's bytes" {
     try std.testing.expectEqualSlices(u8, &want.win, &out_a.win);
     // (every draw's three kernels ran on the GPU, compiled to ir3)
     try std.testing.expect(eng_a.stats.dispatches >= 3 * 9);
+    eng_a.deinit();
+    a_gpu.close();
+}
+
+// ── Bins: a target of several bins ─────────────────────────────────────────
+
+const BW = 200;
+const BH = 136;
+
+const BinOut = struct {
+    fbo: [BW * BH * 4]u8 = undefined,
+    errors: u32 = 0,
+};
+
+fn bv(x: f32, y: f32, col: [4]f32) Vert {
+    return .{ .x = nx(x, BW), .y = nx(y, BH), .z = 0, .w = 1, .r = col[0], .g = col[1], .b = col[2], .a = col[3] };
+}
+
+const N_SMALL = 256;
+var bin_verts: [3 * N_SMALL]Vert = undefined;
+
+/// A number in [0, n) from the generator's state.
+fn rnd(state: *u32, n: u32) f32 {
+    state.* = state.* *% 1664525 +% 1013904223;
+    return @floatFromInt((state.* >> 8) % n);
+}
+
+fn binScene(eng: *engine.Engine, out: *BinOut) !void {
+    objs.init();
+    const c = &ctx;
+    c.init(eng, &objs);
+    defer c.deinit();
+    defer eng.unloadPipeline(&colored);
+    var tex: [1]u32 = undefined;
+    c.genTextures(&tex);
+    c.bindTexture(g.TEXTURE_2D, tex[0]);
+    c.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, BW, BH);
+    var fb: [1]u32 = undefined;
+    c.genFramebuffers(&fb);
+    c.bindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    c.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex[0], 0);
+    if (c.checkFramebufferStatus(g.FRAMEBUFFER) != g.FRAMEBUFFER_COMPLETE) return error.Incomplete;
+    c.viewportSet(0, 0, BW, BH);
+    c.clearColor(0.1, 0.2, 0.3, 1);
+    c.clear(g.COLOR_BUFFER_BIT);
+    var vao: [1]u32 = undefined;
+    c.genVertexArrays(&vao);
+    c.bindVertexArray(vao[0]);
+    var bufs: [1]u32 = undefined;
+    c.genBuffers(&bufs);
+    c.usePipeline(&colored, &.{});
+    c.enable(g.BLEND, true);
+    c.blendFunc(g.SRC_ALPHA, g.ONE_MINUS_SRC_ALPHA, g.ONE, g.ONE_MINUS_SRC_ALPHA);
+    // 1. small triangles all over, half transparent, each over the ones
+    // before it (their order shows)
+    var state: u32 = 12345;
+    for (0..N_SMALL) |n| {
+        const x = rnd(&state, BW);
+        const y = rnd(&state, BH);
+        const size = 3 + rnd(&state, 18);
+        const col = [4]f32{ rnd(&state, 256) / 255, rnd(&state, 256) / 255, rnd(&state, 256) / 255, 0.5 };
+        bin_verts[3 * n] = bv(x, y, col);
+        bin_verts[3 * n + 1] = bv(x + size, y + rnd(&state, 7), col);
+        bin_verts[3 * n + 2] = bv(x + rnd(&state, 9), y + size, col);
+    }
+    drawVerts(c, bufs[0], &bin_verts, g.TRIANGLES);
+    noErr(c, out);
+    // 2. big triangles across bins, under a scissor box off the bins'
+    // grid (the bins start at its corner)
+    c.enable(g.SCISSOR_TEST, true);
+    c.scissorSet(13, 7, 150, 120);
+    const a = [4]f32{ 1, 0.5, 0, 0.5 };
+    const b = [4]f32{ 0, 0.5, 1, 0.75 };
+    drawVerts(c, bufs[0], &.{ bv(-20, -10, a), bv(220, 40, b), bv(90, 150, a), bv(0, 130, b), bv(10, 0, a), bv(200, 70, b) }, g.TRIANGLES);
+    c.enable(g.SCISSOR_TEST, false);
+    noErr(c, out);
+    // 3. a thin strip across the whole width
+    drawVerts(c, bufs[0], &.{ bv(0, 60, a), bv(0, 63, b), bv(200, 61, a), bv(200, 64.5, b) }, g.TRIANGLE_STRIP);
+    c.readPixels(0, 0, BW, BH, g.RGBA, g.UNSIGNED_BYTE, &out.fbo);
+    noErr(c, out);
+    c.finish();
+}
+
+var bins_pool: [8 << 20]u8 align(64) = undefined;
+var eng_bins: engine.Engine = undefined;
+/// on the CPU: unbinned, binned, binned with lists of 24 at most
+var bins_cpu: [3]BinOut = .{ .{}, .{}, .{} };
+var bins_done = false;
+
+fn binsCpu() !*const [3]BinOut {
+    if (!bins_done) {
+        for (&bins_cpu, 0..) |*o, m| {
+            eng_bins.init(.{ .pool = &bins_pool, .cpu_work = &cpu_work });
+            eng_bins.binning = m != 0;
+            if (m == 2) eng_bins.bin_cap = 24;
+            try binScene(&eng_bins, o);
+            if (eng_bins.why_pipe) |e| std.debug.print("cpu bins: {s} at pc {d}\n", .{ @errorName(e), eng_bins.trap.pc });
+            eng_bins.deinit();
+        }
+        bins_done = true;
+    }
+    return &bins_cpu;
+}
+
+fn checkBins(o: *const BinOut) !void {
+    try std.testing.expectEqual(@as(u32, 0), o.errors);
+    // drawn over in places, the clear color left in others
+    const clear_px = [4]u8{ 26, 51, 77, 255 };
+    var drawn: usize = 0;
+    var bare: usize = 0;
+    for (0..BH) |y| {
+        for (0..BW) |x| {
+            if (std.mem.eql(u8, &px(&o.fbo, BW, x, y), &clear_px)) bare += 1 else drawn += 1;
+        }
+    }
+    try std.testing.expect(drawn > BW * BH / 4 and bare > BW * BH / 10);
+}
+
+test "draw: bins: binned, unbinned, and lists that run over give the same bytes on the CPU" {
+    const o = try binsCpu();
+    try std.testing.expectEqualSlices(u8, &o[0].fbo, &o[1].fbo);
+    try std.testing.expectEqualSlices(u8, &o[0].fbo, &o[2].fbo);
+    try checkBins(&o[0]);
+}
+
+test "draw: bins on EmuDevice (lists that run over) give the CPU's bytes" {
+    const want = try binsCpu();
+    var caps = gpu.interp_caps;
+    caps.coherent = false;
+    emu = gpu.EmuDevice.init(caps, &emu_mem, &emu_work);
+    emu.shadow = &emu_shadow;
+    eng_emu.init(.{ .dev = emu.device(), .work = &compile_mem, .cpu_work = &cpu_work });
+    eng_emu.bin_cap = 24;
+    try std.testing.expect(eng_emu.onGpu());
+    var out: BinOut = .{};
+    try binScene(&eng_emu, &out);
+    if (eng_emu.why_pipe) |e| std.debug.print("emu pipeline: {s}\n", .{@errorName(e)});
+    try std.testing.expect(eng_emu.why_pipe == null and !eng_emu.lost);
+    try std.testing.expectEqualSlices(u8, &want[0].fbo, &out.fbo);
+    // (four dispatches a binned draw)
+    try std.testing.expect(eng_emu.stats.dispatches >= 4 * 3);
+    eng_emu.deinit();
+}
+
+test "draw: bins on the emulated Adreno (ir3) give the CPU's bytes" {
+    const want = try binsCpu();
+    a_emu = .{ .arena = &a_arena, .gpu_view = &a_view, .guard = 0 };
+    a_fake = .{ .emu = &a_emu };
+    a_gpu = .{ .node = .{ .sys = &a_fake } };
+    const d = try a_gpu.open();
+    eng_a.init(.{ .dev = d, .compiler = AGpu.compile, .work = &ir3_work, .cpu_work = &cpu_work });
+    try std.testing.expect(eng_a.onGpu());
+    var out: BinOut = .{};
+    try binScene(&eng_a, &out);
+    if (eng_a.why_pipe) |e| std.debug.print("adreno pipeline: {s}\n", .{@errorName(e)});
+    if (a_emu.last_error) |e| std.debug.print("ir3_emu: {s}: {s}\n", .{ @errorName(e), a_emu.fault.text() });
+    try std.testing.expect(eng_a.why_pipe == null and !eng_a.lost);
+    try std.testing.expectEqualSlices(u8, &want[0].fbo, &out.fbo);
+    try std.testing.expect(eng_a.stats.dispatches >= 4 * 3);
     eng_a.deinit();
     a_gpu.close();
 }
